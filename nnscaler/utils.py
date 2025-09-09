@@ -112,6 +112,27 @@ def get_member_by_name(model: torch.nn.Module, name: str) -> Any:
     return model_attr
 
 
+def set_member_by_name(model: Any, name: str, value: Any) -> None:
+    """
+    Set the member of the model by its full name.
+    """
+    if not name:
+        raise ValueError("Name cannot be empty")
+    class _ValueHolder:
+        """
+        A value holder.
+        In python you can't call `setattr` on object, but you can call it on its subclasses.
+        """
+        pass
+    sliced_names = name.split(".")
+    model_attr = model
+    for sliced_name in sliced_names[:-1]:
+        if not hasattr(model_attr, sliced_name):
+            setattr(model_attr, sliced_name, _ValueHolder())
+        model_attr = getattr(model_attr, sliced_name)
+    setattr(model_attr, sliced_names[-1], value)
+
+
 def get_shared_params(model: torch.nn.Module) -> List[List[str]]:
     paramid2name = defaultdict(set)
     for name in model.state_dict().keys():
@@ -325,6 +346,20 @@ def fields(model: TDataClass, /) -> TDataClass:
     return cast(TDataClass, _GetFields(model))
 
 
+class _UncheckedFields:
+    def __getattr__(self, item: str) -> Any:
+        return item
+
+
+TUncheckedClass = TypeVar("TAnyClass")
+def unchecked_fields(_: TUncheckedClass, /) -> TUncheckedClass:
+    """
+    This function is used to get the field names(in str) of any object without checking
+    This is a workaround for the lack of `__name__` of member.
+    """
+    return cast(TUncheckedClass, _UncheckedFields())
+
+
 @cache
 def load_type(type_name: str):
     """
@@ -461,7 +496,7 @@ class accum_mode:
 
 
 class AdamOptState(TypedDict):
-    step: int
+    step: torch.Tensor
     exp_avg: torch.Tensor
     exp_avg_sq: torch.Tensor
 

@@ -93,17 +93,19 @@ def trainer_worker(save_dir, use_zero):
             assert_equal(x['model'], y['model'])
             assert_equal(x['optimizer'], y['optimizer'])
 
-    trainer = Trainer([
+    # train with different config
+    trainer_config = [
         '-f', config_path,
         '--compute_config.plan_ngpus', '2',
         '--pas_policy', 'tp',
         '--max_train_steps', '30',
         '--checkpoint.resume_from.checkpoint', 'last',
-        '--checkpoint.resume_from.with_merged', True,
+        '--checkpoint.resume_from.with_merged', str(True),
         '--gen_savedir', str(gen_savedir),
         '--checkpoint.save_dir', str(ckpt0_savedir),
         '--compute_config.use_zero', str(not use_zero),
-    ])
+    ]
+    trainer = Trainer(trainer_config)
     trainer.run()
     torch.distributed.barrier()
     if torch.distributed.get_rank() == 0:
@@ -113,17 +115,36 @@ def trainer_worker(save_dir, use_zero):
 
     torch.distributed.barrier()
 
-    # trainer = Trainer([
-    #     '-f', config_path,
-    #     '--compute_config.plan_ngpus', '1',
-    #     '--max_train_steps', '40',
-    #     '--checkpoint.resume_from.checkpoint', 'last',
-    #     '--checkpoint.resume_from.with_merged', True,
-    #     '--gen_savedir', str(gen_savedir),
-    #     '--checkpoint.save_dir', str(ckpt0_savedir),
-    # ])
-    # trainer.run()
-    # torch.distributed.barrier()
+    from subprocess import check_call as _call
+    from functools import partial
+    call = partial(_call, shell=True)
+
+    if torch.distributed.get_rank() == 0:
+        call(f"python -m nnscaler.cli.checkpoint distribute {ckpt1_savedir}/last {ckpt1_savedir}/sharded {' '.join(trainer_config)} --compute_config.runtime_ngpus {torch.distributed.get_world_size()}")
+
+    torch.distributed.barrier()
+
+    trainer = Trainer([
+        '-f', config_path,
+        '--compute_config.plan_ngpus', '2',
+        '--pas_policy', 'tp',
+        '--max_train_steps', '30',
+        '--checkpoint.resume_from.checkpoint', f'{ckpt1_savedir}/sharded',
+        '--checkpoint.resume_from.with_merged', str(False),
+        '--gen_savedir', str(gen_savedir),
+        '--checkpoint.save_dir', str(ckpt1_savedir),
+        '--compute_config.use_zero', str(not use_zero),
+    ])
+    trainer.run()
+
+    if torch.distributed.get_rank() == 0:
+        for i in range(2):
+            x = torch.load(ckpt0_savedir / 'last' / f'{i}.ckpt', weights_only=False)
+            y = torch.load(ckpt1_savedir / 'last' / f'{i}.ckpt', weights_only=False)
+            assert_equal(x['model'], y['model'])
+            assert_equal(x['optimizer'], y['optimizer'])
+
+    torch.distributed.barrier()
 
 
 @pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.device_count() < 2, reason='lack of gpu devices')

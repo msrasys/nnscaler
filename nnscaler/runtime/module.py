@@ -27,7 +27,7 @@ from nnscaler.runtime.utils import microbatches
 
 from nnscaler import __version__ as runtime_version
 from nnscaler.flags import CompileFlag
-from nnscaler.utils import accum_mode, classproperty
+from nnscaler.utils import accum_mode, classproperty, unchecked_fields
 
 if TYPE_CHECKING:
     from nnscaler.parallel import ComputeConfig
@@ -223,7 +223,7 @@ class CubeModule(torch.nn.Module):
 
     def get_opt_params(self, prefix='', classify_param_cls_fn: Callable[[str], Any]=None) -> dict[torch.nn.Parameter, Any]:
         """
-        Get all parameters and their classifications
+        Get all parameters and their classifications. Parameters in reducers come first.
 
         Args:
             prefix (str): The prefix of this module,
@@ -232,7 +232,6 @@ class CubeModule(torch.nn.Module):
 
         Returns:
             dict[torch.nn.Parameter, Any]: A dictionary mapping parameters to their classifications.
-
         """
         params = {}
         reducer_pids = set()
@@ -945,7 +944,12 @@ class ParallelModule(CubeModule):
         # track whether all the parames (especially the non-persistent buffers) have been initialized
         self._non_presistent_buffers_inited = False
 
-    def __init_subclass__(cls, **kwargs):
+    def __init_subclass__(cls, skip_init=False, **kwargs):
+        # special case when we just fake a ParallelModule class
+        # In this case, you should also use object.__new__ instead of __init__
+        if skip_init:
+            return
+
         from nnscaler.parallel import ComputeConfig
 
         super().__init_subclass__(**kwargs)
@@ -1423,18 +1427,60 @@ class ParallelModule(CubeModule):
         Raises:
             RuntimeError: if strict=True and there are missing keys.
         """
-
-        dist2param = self.dist_param_map
-        orig_param_names = list(dist2param.values())  # param names in original module (without prefix)
         non_persistent_buffers = self.get_non_persistent_buffers()
 
         with torch.no_grad():
             # avoid checking the non-persistent buffers
             attr_names = set([attr for attr in self._fullmap.keys() if attr not in non_persistent_buffers])
 
-            origname_tid_map = {meta.orig_name: meta.tid for meta in self._fullmap.values()}
+            for prefix_attr, content in self.trim_merged_state_dict(self.rank, state_dict, prefix).items():
+                attr = prefix_attr[len(prefix):]
+                tensor: torch.Tensor = getattr(self, attr)
+                tensor.copy_(content)
+                attr_names.remove(attr)
+
+            missing_keys = [prefix + self._fullmap[attr].orig_name for attr in attr_names]
+            if len(attr_names) != 0:
+                erro_msg = f'Missing key(s) in state_dict: {missing_keys}.'
+                if strict:
+                    raise RuntimeError(erro_msg)
+                else:
+                    _logger.warning(erro_msg)
+
+        self._warn_uninitialized_non_persistent_buffers()
+        return missing_keys
+
+    @classmethod
+    def trim_merged_state_dict(
+            cls,
+            rank,
+            state_dict: Dict[str, Any],
+            prefix: str = '',
+            *,
+            device=None,
+    ) -> Dict[str, Any]:
+        """
+        Trim the merged state dict to only keep the parameters needed for the module.
+        Please note we don't check missing/unexpected keys.
+
+        Args:
+            state_dict (Dict[str, Any]): the merged state dict
+            prefix (str): the prefix of the model state dict in the merged state dict
+
+        Returns:
+            Dict[str, Any]: the trimmed state dict
+        """
+        device = device or torch.cuda.current_device()
+        trimmed_state_dict = {}
+
+        dist2param = cls.dist_param_map
+        orig_param_names = list(dist2param.values())  # param names in original module (without prefix)
+        attr_meta_map = cls.get_attr_meta_map(rank)
+        with torch.no_grad():
+            # avoid checking the non-persistent buffers
+            origname_tid_map = {meta.orig_name: meta.tid for meta in attr_meta_map.values()}
             tid_info = defaultdict(list)
-            for attr, meta in self._fullmap.items():
+            for attr, meta in attr_meta_map.items():
                 tid_info[meta.tid].append((attr, meta.slicers, meta.val_chunks))  # multiple params may share the same tid
 
             for orig_param_name in orig_param_names:
@@ -1447,20 +1493,61 @@ class ParallelModule(CubeModule):
                 param_value = state_dict[orig_param_name_with_prefix]
                 tid = origname_tid_map[orig_param_name]
                 for attr, slicer, nchunks in tid_info[tid]:
-                    tensor: torch.Tensor = getattr(self, attr)
                     content = param_value[slicer]
                     if nchunks != 1:
                         content = content / nchunks
-                    tensor.copy_(content)
-                    attr_names.remove(attr)
+                    trimmed_state_dict[prefix + attr] = content.to(device)
 
-            missing_keys = [prefix + self._fullmap[attr].orig_name for attr in attr_names]
-            if len(attr_names) != 0:
-                erro_msg = f'Missing key(s) in state_dict: {missing_keys}.'
-                if strict:
-                    raise RuntimeError(erro_msg)
-                else:
-                    _logger.warning(erro_msg)
+        return trimmed_state_dict
 
-        self._warn_uninitialized_non_persistent_buffers()
-        return missing_keys
+    def _pack(
+        self,
+    ):
+        """
+        Get a packed information of the ParallelModule, so it can be sent to other ranks.
+        """
+        param_map: dict[torch.nn.Parameter, torch.nn.Parameter] = {}
+        for p in self.parameters():
+            param_map[p] = torch.nn.Parameter(
+                torch.empty_like(p, device='meta')) if p is not None else None
+        for b in self.buffers():
+            param_map[b] = torch.empty_like(
+                b, device='meta') if b is not None else None
+        state = {}
+        fields = unchecked_fields(self)
+        state[fields._parameters] = {n: param_map[p] for n, p in self._parameters.items()}
+        state[fields._buffers] = {n: param_map[b] for n, b in self._buffers.items()}
+        state[fields._reducers] = [reducer._pack(param_map) for reducer in self._reducers]
+        state[fields._zero_metadata] = self._zero_metadata
+        state[fields._fullmap] = self._fullmap
+
+        for cv in ParallelModule.__annotations__:
+            state[cv] = getattr(self, cv)
+        return state
+
+    @classmethod
+    def _unpack(cls, state: dict):
+        """
+        Unpack the information and return a fake ParallelModule that carries the same information.
+        """
+        class GenModelX(ParallelModule, skip_init=True):
+            pass
+        pm = object.__new__(GenModelX)
+        fields = unchecked_fields(pm)
+        object.__setattr__(pm, fields._parameters, state[fields._parameters])
+        object.__setattr__(pm, fields._buffers, state[fields._buffers])
+        object.__setattr__(pm, fields._reducers, [Reducer._unpack(reducer) for reducer in state[fields._reducers]])
+        object.__setattr__(pm, fields._zero_metadata, state[fields._zero_metadata])
+        object.__setattr__(pm, fields._fullmap, state[fields._fullmap])
+
+        def named_parameters(
+            prefix: str = "", recurse: bool = True, remove_duplicate: bool = True
+        ):
+            assert prefix == "" and recurse is True, "Only support default arguments"
+            return pm._parameters.items()
+
+        pm.named_parameters = named_parameters
+
+        for cv in ParallelModule.__annotations__:
+            setattr(GenModelX, cv, state[cv])
+        return pm

@@ -403,6 +403,11 @@ class ResumeOptions:
     # `None` means will load the sharded checkpoint files if the world size is not changed.
     #    and will load merged checkpoint if the world size is changed.
     with_merged: Optional[bool] = None
+    # If the memory is limited, we can save memory by only loading merged state dict in GPU 0 of each node
+    # and broadcast trimmed state dict to other ranks in the same node
+    # although this will be slower
+    # Only used when resuming from a merged checkpoint.
+    save_memory: bool = True
 
 
 @dataclass

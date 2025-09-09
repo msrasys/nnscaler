@@ -11,6 +11,7 @@ from torch.utils.hooks import RemovableHandle
 from nnscaler.runtime.device import DeviceGroup
 from nnscaler.profiler.timer import CudaTimer
 from nnscaler.flags import RuntimeFlag
+from nnscaler.utils import unchecked_fields
 
 _logger = logging.getLogger(__name__)
 
@@ -407,6 +408,52 @@ class Bucket:
         self._hooks = []
         self.register_hooks()
 
+    def _pack(
+        self,
+        param_map: dict[torch.nn.Parameter, torch.nn.Parameter],
+    ):
+        """
+        Get the information of the bucket.
+        """
+        state = self.__dict__.copy()
+
+        fields = unchecked_fields(self)
+        state[fields._params] = [param_map[p] for p in self._params]
+        state[fields._pofset] = {param_map[p]: ofst for p, ofst in self._pofset.items()}
+        state[fields._param_for_optimizer] = torch.nn.Parameter(torch.empty_like(self._param_for_optimizer, device='meta'))
+        state[fields._contiguous_params] = torch.empty_like(self._contiguous_params, device='meta')
+        state[fields._contiguous_grads] = torch.empty_like(self._contiguous_grads, device='meta')
+
+        # remove torch handles
+        state.pop(fields._group, None)
+        state.pop(fields._async_handle, None)
+        state.pop(fields._async_param_cnt, None)
+        state.pop(fields._zero_subgroup, None)
+        state.pop(fields._zero_crossgroup, None)
+
+        # remove hooks
+        state.pop(fields._hooks, None)
+        state.pop(fields._pre_hooks, None)
+        state.pop(fields._post_hooks, None)
+
+        return state
+
+    @classmethod
+    def _unpack(cls, state: dict):
+        """
+        Return a fake bucket that carries the same information.
+        """
+        bucket = object.__new__(cls)
+        bucket.__dict__.update(state)
+
+        for param in bucket._params:
+            assert param.device.type == 'meta'
+        assert bucket._contiguous_grads.device.type == 'meta'
+        assert bucket._contiguous_grads.device.type == 'meta'
+        assert bucket._param_for_optimizer.device.type == 'meta'
+
+        return bucket
+
 
 class Reducer:
     # the default bucket cap for async reducer in megabytes
@@ -593,11 +640,14 @@ class Reducer:
         Typically this will be called when building optimizer when multiple optimizers/param groups are used.
         And we will put parameters with different optimizer or different param groups into different buckets.
         """
-        self._param_clss = param_clss or {}
-        # sort parameters by their class
-        # which can help bucket building
-        if self._param_clss:
+        self._param_clss = {}
+        if param_clss:
+            # only keep parameters that are in self._params
+            self._param_clss = {p: param_clss[p] for p in self._params}
+            # sort parameters by their class
+            # which can help bucket building
             self._params.sort(key=lambda p: self._param_clss[p])
+
         for bucket in self._buckets:
             # rebuild bucket should be done before any hooks registered.
             if bucket._pre_hooks or bucket._post_hooks:
@@ -842,3 +892,58 @@ class Reducer:
                 self._contiguous_params[start:stop],
                 self._contiguous_grads[start:stop],
             )
+
+    def _pack(
+        self,
+        param_map: dict[torch.nn.Parameter, torch.nn.Parameter],
+    ):
+        """
+        Get the information of the bucket.
+        """
+        state = self.__dict__.copy()
+        fields = unchecked_fields(self)
+
+        state[fields._params] = [param_map[p] for p in self._params]
+        state[fields._param_clss] = {param_map[p]: param_cls for p, param_cls in self._param_clss.items()}
+        state[fields._contiguous_params] = torch.empty_like(self._contiguous_params, device='meta')
+        state[fields._contiguous_grads] = torch.empty_like(self._contiguous_grads, device='meta')
+
+        state[fields._buckets] = [
+            bucket._pack(param_map)
+            for bucket in self._buckets
+        ]
+
+        # remove torch handles
+        state.pop(fields._group, None)
+        state.pop(fields._zero_subgroup, None)
+        state.pop(fields._zero_crossgroup, None)
+
+        # remove unuseful information
+        state.pop(fields._param_ids, None)
+        state.pop(fields.seq_buckets, None)
+
+        return state
+
+    @classmethod
+    def _unpack(cls, state: dict):
+        """
+        Return a fake bucket that carries the same information.
+        """
+        reducer = object.__new__(cls)
+        fields = unchecked_fields(reducer)
+
+        buckets = state.pop(fields._buckets)
+        reducer._buckets = [
+            Bucket._unpack(bucket) for bucket in buckets
+        ]
+        reducer.__dict__.update(state)
+        for param in reducer._params:
+            assert param.device.type == 'meta'
+
+        for param in reducer._param_clss.keys():
+            assert param.device.type == 'meta'
+
+        assert reducer._contiguous_grads.device.type == 'meta'
+        assert reducer._contiguous_params.device.type == 'meta'
+
+        return reducer
