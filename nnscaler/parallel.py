@@ -1270,7 +1270,7 @@ HybridOptimizerT = TypeVar('HybridOptimizer', bound=torch.optim.Optimizer)
 
 def hybrid(
     params: list[torch.nn.Parameter],
-    param_clss_fn: Callable[[str], tuple[int, int]],
+    param_clss: dict[torch.nn.Parameter, tuple[int, int]],
     **kwargs,
 ) -> HybridOptimizerT:
     """
@@ -1280,9 +1280,9 @@ def hybrid(
     def __init__(self, params, param_clss, **kwargs):
        ...
     ```
-    But when you pass arguments to `build_optimizer`
-    You must replace `param_clss` with `param_clss_fn`,
-    And `build_optimizer` will automatically replace `param_clss_fn` with the actual `param_clss`.
+    When you pass arguments to `build_optimizer`
+    You must pass `param_clss_fn`,
+    and `build_optimizer` will automatically pass `param_clss` to its constructor.
     """
     ...
 hybrid.is_hybrid = True  # mark this function as hybrid optimizer factory
@@ -1292,6 +1292,7 @@ def build_optimizer(
     module: torch.nn.Module,
     optimizer_fn: Union[Type[OptimizerT], Callable[..., OptimizerT]],
     compute_config: Optional[ComputeConfig] = None,
+    param_clss_fn: Optional[Callable[[str], Any]] = None,
     **kwargs,
 ) -> Union[OptimizerT, ParallelOptimizer]:
     """
@@ -1319,6 +1320,11 @@ def build_optimizer(
         compute_config (Optional[ComputeConfig]):
             The config will be used to generate communication reducer.
             If it is None, Default configuration will be used when creating reducer for non-parallel modules.
+        param_clss_fn (Optional[Callable[[str], Any]]):
+            A function that maps original full qualified parameter names to their class IDs.
+            If you are using a hybrid optimizer,
+            you must specify this function
+            and the return value of this function must be a tuple[int, int] of (optimizer_index, param_group_index).
         **kwargs: the kwargs for optimizer constructor
 
     Returns:
@@ -1327,9 +1333,6 @@ def build_optimizer(
         and will be patched with the methods in ParallelModule class to support parallelized module.
         Please note the type annotation of the returned optimizer (`Union[OptimizerT, ParallelOptimizer]`) is just for intellisense.
     """
-
-    PARAM_CLSS_FN_NAME = 'param_clss_fn'
-
     if isinstance(module, CubeModule) and not isinstance(module, ParallelModule):
         raise RuntimeError("Old style CubeModule is not supported")
 
@@ -1337,13 +1340,9 @@ def build_optimizer(
     if any(m != module and isinstance(m, ParallelModule) and  m.compute_config.use_end2end for m in module.modules()):
         raise RuntimeError("End2End module cannot be nested in another module")
 
-    is_hybrid = False
-    if getattr(optimizer_fn, 'is_hybrid', False):
-        if PARAM_CLSS_FN_NAME not in kwargs:
-            raise ValueError("param_clss_fn must be provided when using hybrid optimizer")
-        # syntax sugar
-        kwargs[PARAM_CLSS_FN_NAME] = load_type(kwargs[PARAM_CLSS_FN_NAME])
-        is_hybrid = True
+    is_hybrid = getattr(optimizer_fn, 'is_hybrid', False)
+    if is_hybrid and param_clss_fn is None:
+        raise ValueError("param_clss_fn must be provided when using hybrid optimizer")
 
     RuntimeFlag.skip_reducer = True
     RuntimeFlag.skip_zero_grad = False
@@ -1374,8 +1373,9 @@ def build_optimizer(
                 f'{module_prefix}.{original_name}' if module_prefix else original_name
         else:
             param_original_names[p] = n
-    if is_hybrid:
-        param_clss = {p: kwargs[PARAM_CLSS_FN_NAME](n) for p, n in param_original_names.items()}
+
+    if param_clss_fn:
+        param_clss = {p: param_clss_fn(n) for p, n in param_original_names.items()}
     else:
         param_clss = {}
 
@@ -1410,7 +1410,7 @@ def build_optimizer(
             non_parallel_module_reducer.add_param(param)
         non_parallel_module_reducer.build_buckets(param_clss=param_clss)
 
-    if is_hybrid:
+    if param_clss_fn:
         for pm in parallel_modules:
             pm.build_buckets(param_clss=param_clss)
             for reducer in pm.reducers:
@@ -1449,8 +1449,8 @@ def build_optimizer(
 
     if is_hybrid:
         optimizer = optimizer_fn(_local_parameters(module),
-            param_clss=param_clss,
-            **{k: v for k, v in kwargs.items() if k != PARAM_CLSS_FN_NAME}
+            param_clss,
+            **kwargs
         )
     else:
         optimizer: torch.optim.Optimizer = optimizer_fn(_local_parameters(module), **kwargs)

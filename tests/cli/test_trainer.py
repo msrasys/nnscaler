@@ -694,8 +694,8 @@ def trainer_correctness_worker(save_dir, parallel_type=0, async_reducer=False, h
 
     optimizer_config = {
         'type': 'nnscaler.HybridOptimizer',
+        'param_clss_fn': param_clss_fn,
         'args': {
-            'param_clss_fn': param_clss_fn,
             'config': {
                 'optimizers':[
                     {

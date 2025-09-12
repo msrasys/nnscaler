@@ -163,7 +163,7 @@ class Trainer:
         pmodel = parallelize_model(
             self.train_args, self.dummy_input,
             load_module=not compile_only,
-            build_buckets=not self.train_args.is_hybrid_optimizer()
+            build_buckets=not self.train_args.should_delay_bucket_building()
         )
         if compile_only:
             return

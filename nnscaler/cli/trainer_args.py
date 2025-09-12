@@ -20,7 +20,7 @@ import yaml
 import torch
 
 import nnscaler
-from nnscaler.utils import fields, transform_recursively, load_type
+from nnscaler.utils import fields, fn_field, transform_recursively, load_type
 from nnscaler.parallel import ComputeConfig, build_optimizer, ReuseType, BroadcastGenFilesStrategy, _PREDEFINED_POLICIES
 from nnscaler.runtime.module import ParallelModule
 
@@ -314,6 +314,7 @@ class OptimizerConfig:
     args: Dict[str, Any] = field(default_factory=dict)
     clip_gnorm: float = 0.0
 
+    param_clss_fn: Optional[Callable[[str], Any]] = fn_field(default=None)
     # loss reduction method
     # mean: average the loss over all micro-batches
     # sum: sum the loss of all micro-batches
@@ -868,13 +869,17 @@ class TrainerArgs(PrecisionMixin, PolicyMixin):
         kwargs = self.create_kwarg(self.model.args)
         return self.model_type(**kwargs)
 
-    def is_hybrid_optimizer(self) -> bool:
-        return getattr(load_type(self.optimizer.type), 'is_hybrid', False)
+    def should_delay_bucket_building(self) -> bool:
+        return self.optimizer.param_clss_fn is not None
 
     def create_parallel_optimizer(self, parallel_model: torch.nn.Module):
         kwargs = self.create_kwarg(self.optimizer.args)
         optimizer_class = load_type(self.optimizer.type)
-        return build_optimizer(parallel_model, optimizer_class, self.compute_config, **kwargs)
+        return build_optimizer(
+            parallel_model, optimizer_class, self.compute_config,
+            self.optimizer.param_clss_fn,
+            **kwargs
+        )
 
     def create_dataset(self, stage='train'):
         dataset_args = getattr(self.dataset, f'{stage}_args')
