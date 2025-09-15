@@ -458,6 +458,10 @@ class CheckpointConfig:
         return load_type(self.resume_from.convert_fn)
 
     def __post_init__(self):
+        # backward compatibility
+        if isinstance(self.resume_from, str):
+            self.resume_from = ResumeOptions(checkpoint=self.resume_from)
+
         if self.resume_from and self.resume_from.checkpoint:
             if self.resume_from.checkpoint in ['last', 'best']:
                 if not self.save_dir:
