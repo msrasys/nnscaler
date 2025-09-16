@@ -40,7 +40,7 @@ class TidReplicaInfo:
 
 
 def _calc_grad_shape(slicers_list):
-    # caculate the shape of each full parameters/grads
+    # calculate the shape of each full parameters/grads
     tid2shape = {}
     for rank_slicers in slicers_list:
         for tid, slicers in rank_slicers.items():
@@ -50,7 +50,7 @@ def _calc_grad_shape(slicers_list):
                 # slicer: (start, end, step)
                 if slicer.stop > tid2shape[tid][i]:
                     tid2shape[tid][i] = slicer.stop
-    # caculate the number of replicas of each model parameter
+    # calculate the number of replicas of each model parameter
     tid2nreplicas = {}
     for rank_slicers in slicers_list:
         for tid, slicers in rank_slicers.items():
@@ -117,7 +117,7 @@ def _calc_grad_replicas(tid2ranks_list: List[Dict[int, Tuple[int]]]) -> Dict[int
     Returns:
         tid2nreplicas: dict, tid -> TidReplicaInfo
     """
-    # caculate the number of replicas of each model parameter
+    # calculate the number of replicas of each model parameter
     tid2nreplicas = {}
     tid2ranksset = defaultdict(set)
     for tid2ranks in tid2ranks_list:
@@ -241,7 +241,8 @@ def calcuate_gnorm(params: List[torch.Tensor], device: Optional[torch.device] = 
     elif len(grads) == 1:
         total_norm = torch.norm(grads[0], p=2, dtype=torch.float32)
     else:
-        if multi_tensor_l2norm_available:
+        dtypes = set([g.dtype for g in grads])
+        if multi_tensor_l2norm_available and len(dtypes) == 1:
             total_norm = _multi_tensor_total_norm(grads).to(device)
         else:
             # torch.nn.utils.clip_grad_norm_ way to calculate the norm
