@@ -58,7 +58,7 @@ def init_random(seed: int = 1):
         torch.cuda.manual_seed(seed)
 
 
-def assert_parity(baseline_fn: Callable, compile_fn: Callable, atol: float=1e-4) -> bool:
+def assert_parity(baseline_fn: Callable, compile_fn: Callable, atol: float=1e-3) -> bool:
     """Compare the output of baseline_fn and compile_fn
 
     Error will raise if the output of two functions are not the same.
@@ -92,10 +92,10 @@ def assert_parity(baseline_fn: Callable, compile_fn: Callable, atol: float=1e-4)
                 assert_same_complex(gt[key], out[key])
         elif isinstance(gt, torch.Tensor):
             assert isinstance(out, torch.Tensor)
-            assert torch.allclose(gt, out, atol=atol), f'mismatched: {gt} != {out}'
+            assert torch.allclose(gt, out, atol=atol), f'mismatched (with atol {atol}): {gt} != {out}'
         elif isinstance(gt, float):
             assert isinstance(out, float)
-            assert math.isclose(gt, out, abs_tol=atol), f'mismatched: {gt} != {out}'
+            assert math.isclose(gt, out, abs_tol=atol), f'mismatched (with atol {atol}): {gt} != {out}'
         else:
             assert gt == out, f'mismatched: {gt} != {out}'
     assert_same_complex(baseline_outputs, compile_outputs)

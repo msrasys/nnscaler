@@ -111,7 +111,7 @@ class FxModuleParser:
         #   it should be wrapped into an IRObject
         for idx, placeholder in enumerate(placeholders):
             if not isinstance(inputs[idx], IRObject):
-                obj = IRObject(name=placeholder.name, value=inputs[idx], is_constant=False)
+                obj = IRObject(name=placeholder.target, value=inputs[idx], is_constant=False)
                 inputs[idx] = obj
                 frame.set_var(placeholder.name, obj)
 
@@ -160,9 +160,13 @@ class FxModuleParser:
 
         assert hasattr(node, 'meta') and 'tensor_meta' in node.meta, f"Node {node} should have tensor_meta"
         meta = node.meta['tensor_meta']
-        val = IR.new(node.name, meta,
+        val = IR.new(
+            # node.target is necesssary for input
+            # its name will be used to align with model forward args when generating code.
+            node.target if node.op == 'placeholder' else node.name,
+            meta,
             tensor_types=(TensorMetadata,),
-            is_constant=is_constant
+            is_constant=is_constant,
         )
         frame.add_var(node.name, val)
 

@@ -665,51 +665,22 @@ def _gen_graph(
         node.target: forward_args_default.get(node.target, inspect.Parameter.empty)
         for node in fx_input_nodes
     }
-    ir_dummy_inputs = []
-    for node in fx_input_nodes:
-        if node.target.startswith('*'):  # *args or **kwargs
-            if node.target.strip('*') in dummy_forward_args:
-                raise ValueError(f"Input {node.target}: *args or **kwargs is not suppported")
-            ir_dummy_inputs.append(None)  # always set None to *args/**kwargs
-        elif node.target in dummy_forward_args:
-            ir_dummy_inputs.append(dummy_forward_args[node.target])
-        elif forward_args[node.target] is not inspect.Parameter.empty:
-            ir_dummy_inputs.append(forward_args[node.target])
-        else:
-            raise ValueError(f"Input {node.target} not in dummy forward args, nor has default value.")
-    for i in range(len(ir_dummy_inputs)):
-        # note: we will always set tensor to require gradient, which may
-        # generate backward communications in adapter. However, as long as
-        # the data doesn't require gradient in real runtime, the backward
-        # communication will not be triggered.
-        ir_dummy_inputs[i] = IR.new(
-            fx_input_nodes[i].target, ir_dummy_inputs[i],
-            requires_grad=True,
-            tosub=True,
-            is_constant=False,
-        )
-        # if the input is a complex type, we should wrap it with IRObject
-        if not isinstance(ir_dummy_inputs[i], IRObject):
-            ir_dummy_inputs[i] = IRObject(fx_input_nodes[i].target, value=ir_dummy_inputs[i], is_constant=False)
 
-    # generate complete ir graph
-    ir_dummy_outputs = graph(*ir_dummy_inputs)
     if end2end_mode:
         # in end2end mode, we must use dataloader as the first argument of forward
         # we assume the first argument of forward is the data sample (which is a requirement in our doc)
         graph.use_dataloader_input()
 
         # we require the first output is the loss
-        if isinstance(ir_dummy_outputs, (list, tuple)):
-            ir_loss = ir_dummy_outputs[0]
-        else:
-            ir_loss = ir_dummy_outputs
+        ir_loss = graph.output(0)
         if not isinstance(ir_loss, IRTensor) or ir_loss.shape != (1,):
             # internally scalar tensor will be reshaped to (1,) in IRGraph
             raise RuntimeError(f"Loss can only be scalar tensor but got {ir_loss.shape if isinstance(ir_loss, IRTensor) else ir_loss}")
     else:
         ir_loss = None
 
+    # we generate backward nodes and setup gradient tensors here
+    # forward nodes are done when we trace the model
     if not inference_only:
         graph.backward(ir_loss)
     else:

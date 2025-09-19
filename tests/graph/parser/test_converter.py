@@ -52,9 +52,9 @@ def test_to_graph():
         assert ir_graph.name == 'MyModule'
         inputs = ir_graph.inputs()
         assert len(inputs) == 2
-        assert inputs[0].name == nodes[0].name
+        assert inputs[0].name == nodes[0].target
         assert isinstance(inputs[0], IRTensor)
-        assert inputs[1].name == nodes[1].name
+        assert inputs[1].name == nodes[1].target
         assert isinstance(inputs[1], IRObject)
 
         outputs = ir_graph.outputs()
