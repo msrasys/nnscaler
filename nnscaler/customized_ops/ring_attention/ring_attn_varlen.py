@@ -110,7 +110,7 @@ def emit_ring(node: IRDimops, args: List[str], kwargs: Dict[str, str], runtime_d
     signature = node.signature
 
     offset = (runtime_devid // plan_ndevs) * plan_ndevs
-    scale_unit_dev_ids = [local_rank + offset for local_rank in range(plan_ndevs)]
+    remainder = runtime_devid % plan_ndevs
 
     kw_pairs = list()
     for key, val in kwargs.items():
@@ -119,15 +119,17 @@ def emit_ring(node: IRDimops, args: List[str], kwargs: Dict[str, str], runtime_d
 
     sub_input = node.inputs()[0]
     full_input = sub_input.parent
-    partition_dims = [i for i, (s, f) in enumerate(zip(sub_input.shape, full_input.shape)) if s != f]
+    partition_dims = [(i, f // s) for i, (s, f) in enumerate(zip(sub_input.shape, full_input.shape)) if s != f]
     assert len(partition_dims) <= 1, f"support no more than one partition dim, but got {partition_dims}"
     if not partition_dims:
         kw_pairs.append("process_group=None")
     else:
-        if partition_dims[0] == 0: # partition on sequence dim
+        if partition_dims[0][0] == 0: # partition on sequence dim
             # the synchronization should occur across scaleunits
+            num = partition_dims[0][1]
+            scale_unit_dev_ids = [local_rank + offset for local_rank in range(remainder // num * num, (remainder // num + 1) * num)]
             kw_pairs.append(f"process_group={scale_unit_dev_ids}")
-        elif partition_dims[0] == 1:
+        elif partition_dims[0][0] == 1:
             # partition the head dim, use local flash_attn_func
             kw_pairs.append("process_group=None")
         else:
