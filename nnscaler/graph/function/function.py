@@ -34,7 +34,7 @@ import math
 import logging
 from collections.abc import Iterable
 
-from nnscaler.ir.cten import IRTensor, IRObject, IR
+from nnscaler.ir.cten import IRTensor, IRObject, IR, ValueTrack
 from nnscaler.ir.tensor import IRSubTensor, IRFullTensor
 from nnscaler.graph.function.pyfunc import IRPyFunc
 from nnscaler.graph.function.dimops import DimopSplit, ShapeAnno, OpAnno, IRDimops, TransformRule
@@ -270,7 +270,21 @@ def CubeArange(start: Union[int, IRObject], end: Union[int, IRObject], step: Uni
     size = (math.ceil((end_val-start_val)/step_val),)
     anno, rules = _get_creator_anno_rules(
         tuple(dim.value if isinstance(dim, IRObject) else dim for dim in size), False)
-    return IRDimops(CubeArange, 'arange', signature, [anno], [], rules, **kwargs)
+
+    # Output will be replaced in Parser,
+    # Here we just pass the value tracks out
+    output = IRFullTensor(size)
+    if not isinstance(start, IRObject) and start == 0 \
+        and not isinstance(step, IRObject) and step == 1 \
+        and isinstance(end, IRObject):
+        # a special case for arange(0, end), which is very common in practice
+        # we can directly use end's value track
+        output.dim_tracks = [end.value_track]
+    else:
+        output.dim_tracks = [ValueTrack.new([start, end, step])]
+    ret = IRDimops(CubeArange, 'arange', signature, [anno], [], rules, **kwargs)
+    ret.set_output(0, output)
+    return ret
 
 
 def Arange(*args, start=None, end=None, step=None, out=None, dtype=None, layout=None,
@@ -2355,12 +2369,15 @@ def Size(tensor, dim=None, signature = None) -> Union[List[int], IRPyFunc]:
     torch.Tensor.size(tensor, dim=None)
     """
     assert isinstance(tensor, IRTensor)
-    val = tensor.shape[dim] if isinstance(dim, int) else tensor.shape
-    assert val is not None
-    if dim is None:
-        return IRPyFunc(signature, [tensor], [IRObject(name='size', value=val)])
+    if isinstance(dim, int):
+        val = IRObject(name='size', value=tensor.shape[dim], value_track=tensor.dim_tracks[dim])
     else:
-        return IRPyFunc(signature, [tensor], [IRObject(name='size', value=val)], dim=dim)
+        val = tuple(IRObject('size', value=s, value_track=t) for s, t in zip(tensor.shape, tensor.dim_tracks))
+
+    if dim is None:
+        return IRPyFunc(signature, [tensor], [val])
+    else:
+        return IRPyFunc(signature, [tensor], [val], dim=dim)
 
 
 def Dim(tensor, signature=None) -> Union[List[int], IRPyFunc]:
@@ -2617,7 +2634,7 @@ def GetAttr(instance: object, field: str, signature = None) -> Union[List[int], 
     if isinstance(obj, IRTensor):
         if name == 'shape':
             assert isinstance(obj, IRFullTensor), f"type {type(obj)} is not supported"
-            shape = IRObject('shape', value=obj.shape)
+            shape = tuple(IRObject('shape', value=s, value_track=t) for s, t in zip(obj.shape, obj.dim_tracks))
             return IRPyFunc(signature, [instance, field], [shape])
         if name == 'dtype':
             assert isinstance(obj, IRFullTensor), f"type {type(obj)} is not supported"

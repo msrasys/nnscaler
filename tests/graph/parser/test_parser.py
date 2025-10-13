@@ -166,7 +166,7 @@ def test_num_outputs(tmp_path, output_list):
     ir_graph = to_ir_graph(fx_graph, dummy_input, attr_savedir=tmp_path, constant_folding=False)
     print(ir_graph.extra_repr())
 
-    assert len(ir_graph.nodes()) == 5
+    assert len(ir_graph.nodes()) == 4
     assert len(ir_graph.nodes()[0].outputs()) == 3
     assert len(ir_graph.outputs()) == 1
     assert isinstance(ir_graph.output(0), list)

@@ -232,6 +232,7 @@ def rank_zero_only(fn: Callable[..., None]) -> Callable[..., None]:
 _DICT_ITEMS_TYPE = type({}.items())
 _DICT_KEYS_TYPE = type({}.keys())
 _DICT_VALUES_TYPE = type({}.values())
+TRANSFORM_SUPPORTED_COLLECTION_TYPES = (tuple, list, dict, set, slice, _DICT_ITEMS_TYPE, _DICT_KEYS_TYPE, _DICT_VALUES_TYPE)
 
 
 def transform_recursively(data: Any, fn: Callable[[Any], Any],
@@ -240,14 +241,18 @@ def transform_recursively(data: Any, fn: Callable[[Any], Any],
 ) -> Any:
     """
     Transform the data with the given function, will recursively apply the function to the nested data.
+    Currently supported collection types is SUPPORTED_COLLECTION_TYPES.
     Args:
         data: the data to be transformed.
         fn: the function to apply.
         target_types: the target types to apply the function.
         collection_types: the collection types to apply the function to the nested data.
+            Will handle all supported types if None.
         skip_dict_keys: whether to skip the dict keys (for types dict, _DICT_ITEMS_TYPE).
             _DICT_KEYS_TYPE is not skipped, if you want to skip it, just remove it from the collection_types.
     """
+    if collection_types is None:
+        collection_types = TRANSFORM_SUPPORTED_COLLECTION_TYPES
     if isinstance(data, collection_types):
         if isinstance(data, tuple):
             return tuple(transform_recursively(t, fn, target_types, collection_types) for t in data)

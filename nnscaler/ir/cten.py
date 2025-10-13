@@ -18,8 +18,9 @@ If an IRTensor is the output of Cell, then Cell.device == IRTensor.device
 
 from __future__ import annotations
 
+from dataclasses import dataclass, field
 from functools import lru_cache
-from typing import ClassVar, List, Tuple, Union, Optional, Any, Dict, Callable
+from typing import ClassVar, Iterable, List, Set, Tuple, Union, Optional, Any, Dict, Callable
 from collections import OrderedDict
 import copy
 import torch
@@ -29,7 +30,7 @@ from nnscaler.ir.dtype import DTypeInfo
 from nnscaler.utils import _DICT_ITEMS_TYPE, _DICT_VALUES_TYPE
 
 
-NestedVarOrStatic = Any
+NestedVarOrStatic = Union[Any, 'IRObject', List['IRObject'], 'IRTensor']
 
 
 class IRCell:
@@ -459,6 +460,73 @@ class IRCell:
         return val
 
 
+@dataclass
+class ValueTrack:
+    """
+    Track the value of an IRObject or a dimension of IRTensor.
+    Currently only implemented for dimension via IRDimops annotation.
+
+    Example:
+    `l (2 h) m -> l h (2 m)`:
+    Input Tensor Tracks (2/5 is external dependencies for illustration):
+        dim 0: ValueTrack(value_id=10, dependencies=[])  # l
+        dim 1: ValueTrack(value_id=20, dependencies=[])   # (2 h)
+        dim 2: ValueTrack(value_id=30, dependencies=[2, 5])   # m
+    Then we can infer the output Tensor Tracks:
+    Output Tensor Tracks:
+        dim 0: ValueTrack(value_id=10, dependencies=[])  # reuse input dim 0, since they are the same
+        dim 1: ValueTrack(value_id=40, dependencies=[20])   # it depends on input dim 1: (2 h)
+        dim 2: ValueTrack(value_id=50, dependencies=[30])   # it depends on input dim 2: m
+    """
+    value_id: int = field(default_factory=IDGenerator().gen_value_id)
+    # None: unknown dependencies
+    # []: no dependencies
+    deps: Optional[list[int]] = None
+
+    def with_no_dep(self) -> 'ValueTrack':
+        """
+        Initialize this ValueTrack with no dependencies.
+        """
+        self.with_dep(None)
+        return self
+
+    def with_dep(self, dep: Union[None, 'ValueTrack', 'IRObject'] = None) -> 'ValueTrack':
+        """
+        Initialize or add a dependency to the ValueTrack.
+        If dep is None, just initialize an empty dependency list, which means no dependencies.
+        If dep is not IRObject or ValueTrack, do nothing.
+        """
+        if self.deps is None:
+            self.deps = []
+
+        if not isinstance(dep, (ValueTrack, IRObject)):
+            return self
+
+        if isinstance(dep, IRTensor):
+            raise TypeError("Cannot directly add IRTensor as dependency.")
+
+        dep = dep.value_track if isinstance(dep, IRObject) else dep
+        dep_value_id = dep.value_id
+        if dep_value_id not in self.deps:
+            self.deps.append(dep_value_id)
+
+        return self
+
+    def merge_deps(self, other: ValueTrack) -> 'ValueTrack':
+        if self.deps is None:
+            self.deps = other.deps
+        else:
+            self.deps.extend(other.deps or [])
+            self.deps = list(set(self.deps))
+
+    @classmethod
+    def new(cls, deps: Iterable[Union[Any, 'ValueTrack', 'IRObject']]) -> 'ValueTrack':
+        vt = cls()
+        for dep in deps:
+            vt.with_dep(dep)
+        return vt
+
+
 class IRObject:
     """
     IRObject serves as general data of IRGraph edge
@@ -466,7 +534,15 @@ class IRObject:
     # will be set after class definition
     missing: ClassVar['IRObject'] = None
 
-    def __init__(self, name: Optional[str] = None, tid: Optional[int] = None, value: Optional[None] = None, is_constant: bool = True):
+    def __init__(
+        self,
+        name: Optional[str] = None,
+        tid: Optional[int] = None,
+        value: Optional[None] = None,
+        is_constant: bool = True,
+        *,
+        value_track: Optional[ValueTrack] = None,
+    ) -> None:
         """
         Args:
             name (str): object name
@@ -486,6 +562,7 @@ class IRObject:
         self._is_attr: bool = False
         self._value: Optional[Any] = value
         self._is_constant: bool = is_constant
+        self._value_track: ValueTrack = value_track or ValueTrack()
 
     def __hash__(self) -> int:
         return self._id
@@ -539,6 +616,15 @@ class IRObject:
         return self._value
 
     @property
+    def value_track(self) -> ValueTrack:
+        """Get value track info"""
+        return self._value_track
+
+    @value_track.setter
+    def value_track(self, val: ValueTrack):
+        self._value_track = val
+
+    @property
     def is_constant(self) -> bool:
         return self._is_constant
 
@@ -555,7 +641,7 @@ class IRObject:
         """Copy this object but remove the cell information"""
         if self is IRObject.missing:  # missing object is singleton
             return IRObject.missing
-        return IRObject(self.name, self._id, self._value, self._is_constant)
+        return IRObject(self.name, self._id, self._value, self._is_constant, value_track=self._value_track)
 
     def as_attr(self):
         """
@@ -651,7 +737,10 @@ class IR:
                     new_ir_tensor._value = obj.value
                     return new_ir_tensor, True
                 else:
-                    return IRObject(name, value=obj.value, is_constant=is_constant), False
+                    return IRObject(
+                        name, value=obj.value,
+                        is_constant=is_constant, value_track=obj.value_track
+                    ), False
 
             if isinstance(obj, tensor_types):
                 if requires_grad is None:
@@ -907,11 +996,12 @@ class IRTensor(IRObject):
     You can get the original shape with `origin_shape` property.
     """
     def __init__(self, shape=None, name='tensor', dtype=None, tid=None, *,
-        is_attr=False, is_grad=False, requires_grad=False, persistent=False
+        is_attr=False, is_grad=False, requires_grad=False, persistent=False,
     ):
         super().__init__(name, tid, is_constant=False)
         self._is_scalar_tensor: bool = True
-        self._shape: Tuple[int] = ()
+        self._shape: Tuple[int, ...] = ()
+        self._dim_tracks: Tuple[ValueTrack, ...] = ()
         self._dtype: Optional[torch.dtype] = None
         # tensor gradient
         self._is_grad: bool = False
@@ -946,7 +1036,9 @@ class IRTensor(IRObject):
         if shape is not None:
             self._is_scalar_tensor = not shape
             # will always convert scalar tensor to 1-d tensor
-            self._shape: Tuple[int] = (1,) if not shape else tuple(shape)
+            self._shape: Tuple[int, ...] = (1,) if not shape else tuple(shape)
+            # reset dim tracks
+            self._dim_tracks = tuple(ValueTrack() for _ in self._shape)
         if name is not None or self.name is None:
             self.name = name
         if dtype is not None:
@@ -1039,11 +1131,30 @@ class IRTensor(IRObject):
         return self.shape if not self.is_scalar_tensor() else ()
 
     @property
-    def shape(self) -> Tuple[int]:
+    def shape(self) -> Tuple[int, ...]:
         # NOTE: here return a tuple but not a real torch.Size obj may have risk, here is an example:
         # (torch.Size + tuple -> torch.Size) will change to (tuple + tuple -> tuple), is ok.
         # (torch.Size + list -> torch.Size) will change to (tuple + list -> error), is wrong.
         return self._shape
+
+    @property
+    def dim_tracks(self) -> Tuple[ValueTrack, ...]:
+        """
+        Get the track of each dimension
+        """
+        return self._dim_tracks
+
+    @dim_tracks.setter
+    def dim_tracks(self, val: Tuple[Optional[ValueTrack], ...]):
+        """
+        Set the unique id of each dimension
+        """
+        if not isinstance(val, (list, tuple)):
+            raise ValueError("dim_tracks must be a list or tuple")
+        if len(val) != len(self._shape):
+            raise ValueError("dim_tracks length must be equal to shape length")
+        # None means starting a new dim track
+        self._dim_tracks = tuple(v if v is not None else ValueTrack() for v in val)
 
     def nelement(self) -> int:
         """

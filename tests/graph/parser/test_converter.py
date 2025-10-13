@@ -44,7 +44,6 @@ def test_to_graph():
     assert any(node.op == 'call_function' and node.target == torch.nn.functional.linear for node in nodes)
 
     with tempfile.TemporaryDirectory() as tempdir:
-        to_ir_graph(fx_graph, dummy_input, attr_savedir=tempdir, constant_folding=False)
         ir_graph = to_ir_graph(fx_graph, dummy_input, attr_savedir=tempdir, constant_folding=False)
         assert ir_graph is not None
         assert (Path(tempdir) / FxModuleParser.ATTR_MAP_FILE).exists()
@@ -54,11 +53,43 @@ def test_to_graph():
         assert len(inputs) == 2
         assert inputs[0].name == nodes[0].target
         assert isinstance(inputs[0], IRTensor)
+        assert inputs[0].value_track.deps == None
+        # inputs has no dependency
+        assert all(dt.deps == [] for dt in inputs[0].dim_tracks)
         assert inputs[1].name == nodes[1].target
         assert isinstance(inputs[1], IRObject)
+        assert inputs[1].value_track.deps == []
+
+        assert len(ir_graph.nodes()) == 1
+        linear_node = ir_graph.nodes()[0]
+        assert len(linear_node.inputs()) == 3  # x, weight, bias
+
+        assert all(isinstance(i, IRTensor) for i in linear_node.inputs())
+        # from its annotation, a k^, n k^, n -> a n
+        # we can check the value_track and dim_track dependencies
+
+        # the same with graph inputs
+        assert all(linear_node.input(0).dim_tracks[i] is inputs[0].dim_tracks[i] for i in range(len(inputs[0].dim_tracks)))
+        # weights has no dependency
+        assert linear_node.input(1).dim_tracks[0].deps == []
+        # the `k` dimension
+        assert linear_node.input(1).dim_tracks[1] is inputs[0].dim_tracks[1]
+        # the `n` dimension
+        assert linear_node.input(2).dim_tracks[0] is linear_node.input(1).dim_tracks[0]
+
+        assert len(linear_node.outputs()) == 1
+        assert isinstance(linear_node.outputs()[0], IRTensor)
+        # `a`
+        assert linear_node.output(0).dim_tracks[0] is inputs[0].dim_tracks[0]
+        # `n`
+        assert linear_node.output(0).dim_tracks[1] is linear_node.input(1).dim_tracks[0]
 
         outputs = ir_graph.outputs()
         assert len(outputs) == 1
+        # `a`
+        assert outputs[0].dim_tracks[0] is inputs[0].dim_tracks[0]
+        # `n`
+        assert outputs[0].dim_tracks[1] is linear_node.input(1).dim_tracks[0]
 
         nodes = list(ir_graph.nodes())
         assert any(node.signature == 'torch.nn.functional.linear' for node in nodes)

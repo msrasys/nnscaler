@@ -72,7 +72,7 @@ import string
 import logging
 from itertools import dropwhile
 
-from nnscaler.ir.cten import IRTensor, IRObject
+from nnscaler.ir.cten import IRTensor, IRObject, ValueTrack
 from nnscaler.ir.operator import IRFwOperation
 
 
@@ -753,7 +753,7 @@ class IRDimops(IRFwOperation):
         @return dim_annos ShapeAnno: a tuple that each element is a dimension annotation
         """
         assert index < len(self.inputs()), "index out of boudary"
-        return tuple(self._iannos[index])
+        return self._iannos[index]
 
     def oanno(self, index: int) -> ShapeAnno:
         """!
