@@ -11,8 +11,9 @@ from nnscaler.utils import fields
 from nnscaler.graph.tracer.metadata import OpContext
 from nnscaler.ir.operator import IRFwOperation
 from nnscaler.ir.tensor import IRFullTensor
-from nnscaler.ir.cten import IRObject, IRCell, IRTensor, IR
+from nnscaler.ir.cten import IRObject, IRCell, IRTensor, IR, ValueTrack
 from nnscaler.graph.parser.frame import Frame
+from nnscaler.graph.parser.value_tracker import ValueTracker
 from nnscaler.graph.parser.mapping import SignFx2Op
 from nnscaler.graph.function.pyfunc import IRPyFunc
 from nnscaler.graph.function.dimops import IRDimops
@@ -104,15 +105,20 @@ class FxModuleParser:
                 tuple_val = tuple(IRObject(name=node.name, value=v, is_constant=val.is_constant) for v in val.value)
                 frame.set_var(node.name, tuple_val)
 
+        value_tracker = ValueTracker()
+
         # get graph inputs
         placeholders = [n for n in module.graph.nodes if n.op == 'placeholder']
         inputs = [frame.get_var(n.name) for n in placeholders]
+        value_tracker.track_values(inputs)
         # - if the graph inputs contain nested strcuture,
         #   it should be wrapped into an IRObject
         for idx, placeholder in enumerate(placeholders):
             if not isinstance(inputs[idx], IRObject):
-                obj = IRObject(name=placeholder.name, value=inputs[idx], is_constant=False)
+                obj = IRObject(name=placeholder.target, value=inputs[idx], is_constant=False)
+                obj.value_track.with_no_dep()
                 inputs[idx] = obj
+                value_tracker.track_values([obj])
                 frame.set_var(placeholder.name, obj)
 
         # parse graph nodes
@@ -120,6 +126,8 @@ class FxModuleParser:
         for node in module.graph.nodes:
             ir_nodes = FxModuleParser.parse_node(node, module, constant_folding, frame)
             all_ir_nodes += ir_nodes
+
+        value_tracker.track_nodes(all_ir_nodes)
 
         # get graph outputs
         outputs = [frame.get_var(node.name) for node in module.graph.nodes if node.op == 'output']
@@ -160,10 +168,26 @@ class FxModuleParser:
 
         assert hasattr(node, 'meta') and 'tensor_meta' in node.meta, f"Node {node} should have tensor_meta"
         meta = node.meta['tensor_meta']
-        val = IR.new(node.name, meta,
+        val = IR.new(
+            # node.target is necesssary for input
+            # its name will be used to align with model forward args when generating code.
+            node.target if node.op == 'placeholder' else node.name,
+            meta,
             tensor_types=(TensorMetadata,),
-            is_constant=is_constant
+            is_constant=is_constant,
         )
+
+        if node.op == 'placeholder':
+            def set_no_dep(x: IRObject):
+                if isinstance(x, IRTensor):
+                    # let's the value_track of tensor stay None(unknown)
+                    # because we don't care about it.
+                    for dt in x.dim_tracks:
+                        dt.with_no_dep()
+                else:
+                    x.value_track.with_no_dep()
+            IR.modify_objects(val, set_no_dep)
+
         frame.add_var(node.name, val)
 
     @staticmethod
@@ -311,7 +335,7 @@ class FxModuleParser:
             # if the function has no output, just return
             return [ir_node]
 
-        vals = frame.get_var(node.name)
+        vals: Union[Any, IRObject, List[IRObject], IRTensor, List[IRTensor]] = frame.get_var(node.name)
         if len(ir_node.outputs()) == 1:
             vals = [vals]
         elif IR.is_object(vals):
@@ -337,6 +361,13 @@ class FxModuleParser:
                 # 1. output tensors are not set in function.py
                 # 2. IRObject output from some functions (registered functions/getattr) are not set
                 # For above two cases, we need to set them with values from frame.
+                if isinstance(ir_node.output(i), IRTensor):
+                    assert isinstance(vals[i], IRTensor), f'Expect tensor for output {i}, but got {type(vals[i])}'
+                    assert ir_node.output(i).shape == vals[i].shape, f'Expect shape {ir_node.output(i).shape} for output {i}, but got {vals[i].shape}'
+                    # We need to copy dim tracks
+                    # As we will use frame version as node output, instead of the placeholder created in function.py
+                    for dim in range(len(vals[i].shape)):
+                        vals[i].dim_tracks[dim].merge_deps(ir_node.output(i).dim_tracks[dim])
                 ir_node.set_output(i, vals[i])
 
         # update frame with ir output
@@ -378,16 +409,13 @@ class FxModuleParser:
             # use a white list instead of a black list
             return isinstance(val, (int, float, bool, type(None), str, type(Ellipsis)))
 
-        # Note when it is not IRObject as a whole, we will not fold it
         if constant_folding and ir_node.constant_foldable \
             and len(ir_node.outputs()) == 1 \
-            and isinstance(ir_node.output(0), IRObject) \
-            and not isinstance(ir_node.output(0), IRTensor) \
             and not contains_undefined_output \
             and not ir_node.signature.startswith(nnscaler.runtime.function.__name__ + '.')\
-            and ir_node.output(0).is_constant \
-            and _is_primitive_type(ir_node.output(0).value):
-            frame.set_var(node.name, ir_node.output(0).value)
+            and not IR.contains_object(ir_node.output(0), lambda x: isinstance(x, IRTensor) or not x.is_constant) \
+            and _is_primitive_type(cval := IR.try_unwrap(ir_node.output(0))):
+            frame.set_var(node.name, cval)
             return []
         else:
             return [ir_node]
@@ -410,7 +438,7 @@ class FxModuleParser:
             exist_tensor = frame.get_attr_var(concrete_value)
             # the case that the parameter is the first time used by getattr
             if not exist_tensor:
-                tensor = frame.get_var(node.name)
+                tensor: IRFullTensor = frame.get_var(node.name)
                 # set tensor name same with the name in original model
                 tensor.name = node.target
                 if tensor.requires_grad:
@@ -422,6 +450,11 @@ class FxModuleParser:
                         direct_module = getattr(direct_module, name)
                     persistent = full_qualified_name[-1] not in direct_module._non_persistent_buffers_set
                     tensor.as_buffer(persistent=persistent)
+
+                # Parameters and buffers have no dependency on other values
+                for dt in tensor.dim_tracks:
+                    dt.with_no_dep()
+
                 frame.add_attr(tensor, concrete_value, node.target)
             # the case that the parameter is consumed multiple times and registered previously
             else:
@@ -431,7 +464,10 @@ class FxModuleParser:
             # in sub modules, the target is full qualified name (for example `embeddings.dropout.training`)
             if node.target.split('.')[-1] == 'training':
                 # Let's just support `self.training` and ignore all other cases for now
-                output = IRObject(name=node.name, value=frame.get_var(node.name), is_constant=False)
+                if isinstance(output := frame.get_var(node.name), IRObject):
+                    output.is_constant = False
+                else:
+                    output = IRObject(name=node.name, value=output, is_constant=False)
                 ir_node = IRPyFunc(SELF_GETATTR_SIG, ['training'], [output])
                 FxModuleParser._set_node_meta(node, ir_node)
                 frame.set_var(node.name, output)

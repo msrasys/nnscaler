@@ -21,8 +21,8 @@ model:
 
 optimizer:
   type: nnscaler.HybridOptimizer
+  param_clss_fn: tests.runtime.test_hybrid_optimizer.param_clss_fn
   args:
-    param_clss_fn: tests.runtime.test_hybrid_optimizer.param_clss_fn
     config:
       optimizers:
         - type: torch.optim.Adam

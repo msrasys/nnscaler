@@ -14,7 +14,7 @@ from contextlib import contextmanager
 import logging
 import copy
 import os
-from collections import OrderedDict
+from collections import OrderedDict, defaultdict
 
 import torch
 import torch.distributed
@@ -49,7 +49,14 @@ from nnscaler.runtime.module import AttrMeta, CubeModule, ParallelModule, Origin
 from nnscaler.flags import CompileFlag, RuntimeFlag
 import nnscaler.policies as policies
 from nnscaler.program import disable_global_graph
-from nnscaler.utils import get_member_by_name, load_type, setup_stride_broadcast_group, get_shared_params
+from nnscaler.utils import (
+    get_member_by_name,
+    load_type,
+    set_member_by_name,
+    setup_stride_broadcast_group,
+    get_shared_params,
+    OptStateDict,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -658,51 +665,22 @@ def _gen_graph(
         node.target: forward_args_default.get(node.target, inspect.Parameter.empty)
         for node in fx_input_nodes
     }
-    ir_dummy_inputs = []
-    for node in fx_input_nodes:
-        if node.target.startswith('*'):  # *args or **kwargs
-            if node.target.strip('*') in dummy_forward_args:
-                raise ValueError(f"Input {node.target}: *args or **kwargs is not suppported")
-            ir_dummy_inputs.append(None)  # always set None to *args/**kwargs
-        elif node.target in dummy_forward_args:
-            ir_dummy_inputs.append(dummy_forward_args[node.target])
-        elif forward_args[node.target] is not inspect.Parameter.empty:
-            ir_dummy_inputs.append(forward_args[node.target])
-        else:
-            raise ValueError(f"Input {node.target} not in dummy forward args, nor has default value.")
-    for i in range(len(ir_dummy_inputs)):
-        # note: we will always set tensor to require gradient, which may
-        # generate backward communications in adapter. However, as long as
-        # the data doesn't require gradient in real runtime, the backward
-        # communication will not be triggered.
-        ir_dummy_inputs[i] = IR.new(
-            fx_input_nodes[i].target, ir_dummy_inputs[i],
-            requires_grad=True,
-            tosub=True,
-            is_constant=False,
-        )
-        # if the input is a complex type, we should wrap it with IRObject
-        if not isinstance(ir_dummy_inputs[i], IRObject):
-            ir_dummy_inputs[i] = IRObject(fx_input_nodes[i].target, value=ir_dummy_inputs[i], is_constant=False)
 
-    # generate complete ir graph
-    ir_dummy_outputs = graph(*ir_dummy_inputs)
     if end2end_mode:
         # in end2end mode, we must use dataloader as the first argument of forward
         # we assume the first argument of forward is the data sample (which is a requirement in our doc)
         graph.use_dataloader_input()
 
         # we require the first output is the loss
-        if isinstance(ir_dummy_outputs, (list, tuple)):
-            ir_loss = ir_dummy_outputs[0]
-        else:
-            ir_loss = ir_dummy_outputs
+        ir_loss = graph.output(0)
         if not isinstance(ir_loss, IRTensor) or ir_loss.shape != (1,):
             # internally scalar tensor will be reshaped to (1,) in IRGraph
             raise RuntimeError(f"Loss can only be scalar tensor but got {ir_loss.shape if isinstance(ir_loss, IRTensor) else ir_loss}")
     else:
         ir_loss = None
 
+    # we generate backward nodes and setup gradient tensors here
+    # forward nodes are done when we trace the model
     if not inference_only:
         graph.backward(ir_loss)
     else:
@@ -1263,7 +1241,7 @@ HybridOptimizerT = TypeVar('HybridOptimizer', bound=torch.optim.Optimizer)
 
 def hybrid(
     params: list[torch.nn.Parameter],
-    param_clss_fn: Callable[[str], tuple[int, int]],
+    param_clss: dict[torch.nn.Parameter, tuple[int, int]],
     **kwargs,
 ) -> HybridOptimizerT:
     """
@@ -1273,9 +1251,9 @@ def hybrid(
     def __init__(self, params, param_clss, **kwargs):
        ...
     ```
-    But when you pass arguments to `build_optimizer`
-    You must replace `param_clss` with `param_clss_fn`,
-    And `build_optimizer` will automatically replace `param_clss_fn` with the actual `param_clss`.
+    When you pass arguments to `build_optimizer`
+    You must pass `param_clss_fn`,
+    and `build_optimizer` will automatically pass `param_clss` to its constructor.
     """
     ...
 hybrid.is_hybrid = True  # mark this function as hybrid optimizer factory
@@ -1285,6 +1263,7 @@ def build_optimizer(
     module: torch.nn.Module,
     optimizer_fn: Union[Type[OptimizerT], Callable[..., OptimizerT]],
     compute_config: Optional[ComputeConfig] = None,
+    param_clss_fn: Optional[Callable[[str], Any]] = None,
     **kwargs,
 ) -> Union[OptimizerT, ParallelOptimizer]:
     """
@@ -1312,6 +1291,11 @@ def build_optimizer(
         compute_config (Optional[ComputeConfig]):
             The config will be used to generate communication reducer.
             If it is None, Default configuration will be used when creating reducer for non-parallel modules.
+        param_clss_fn (Optional[Callable[[str], Any]]):
+            A function that maps original full qualified parameter names to their class IDs.
+            If you are using a hybrid optimizer,
+            you must specify this function
+            and the return value of this function must be a tuple[int, int] of (optimizer_index, param_group_index).
         **kwargs: the kwargs for optimizer constructor
 
     Returns:
@@ -1320,9 +1304,6 @@ def build_optimizer(
         and will be patched with the methods in ParallelModule class to support parallelized module.
         Please note the type annotation of the returned optimizer (`Union[OptimizerT, ParallelOptimizer]`) is just for intellisense.
     """
-
-    PARAM_CLSS_FN_NAME = 'param_clss_fn'
-
     if isinstance(module, CubeModule) and not isinstance(module, ParallelModule):
         raise RuntimeError("Old style CubeModule is not supported")
 
@@ -1330,13 +1311,9 @@ def build_optimizer(
     if any(m != module and isinstance(m, ParallelModule) and  m.compute_config.use_end2end for m in module.modules()):
         raise RuntimeError("End2End module cannot be nested in another module")
 
-    is_hybrid = False
-    if getattr(optimizer_fn, 'is_hybrid', False):
-        if PARAM_CLSS_FN_NAME not in kwargs:
-            raise ValueError("param_clss_fn must be provided when using hybrid optimizer")
-        # syntax sugar
-        kwargs[PARAM_CLSS_FN_NAME] = load_type(kwargs[PARAM_CLSS_FN_NAME])
-        is_hybrid = True
+    is_hybrid = getattr(optimizer_fn, 'is_hybrid', False)
+    if is_hybrid and param_clss_fn is None:
+        raise ValueError("param_clss_fn must be provided when using hybrid optimizer")
 
     RuntimeFlag.skip_reducer = True
     RuntimeFlag.skip_zero_grad = False
@@ -1367,8 +1344,9 @@ def build_optimizer(
                 f'{module_prefix}.{original_name}' if module_prefix else original_name
         else:
             param_original_names[p] = n
-    if is_hybrid:
-        param_clss = {p: kwargs[PARAM_CLSS_FN_NAME](n) for p, n in param_original_names.items()}
+
+    if param_clss_fn:
+        param_clss = {p: param_clss_fn(n) for p, n in param_original_names.items()}
     else:
         param_clss = {}
 
@@ -1403,7 +1381,7 @@ def build_optimizer(
             non_parallel_module_reducer.add_param(param)
         non_parallel_module_reducer.build_buckets(param_clss=param_clss)
 
-    if is_hybrid:
+    if param_clss_fn:
         for pm in parallel_modules:
             pm.build_buckets(param_clss=param_clss)
             for reducer in pm.reducers:
@@ -1442,8 +1420,8 @@ def build_optimizer(
 
     if is_hybrid:
         optimizer = optimizer_fn(_local_parameters(module),
-            param_clss=param_clss,
-            **{k: v for k, v in kwargs.items() if k != PARAM_CLSS_FN_NAME}
+            param_clss,
+            **kwargs
         )
     else:
         optimizer: torch.optim.Optimizer = optimizer_fn(_local_parameters(module), **kwargs)
@@ -1948,68 +1926,94 @@ def load_merged_state_dict(
     module.to(device)
 
     if optimizer is not None and optimizer_state_dict is not None:
-        if not _is_supported_optimizer(optimizer._extra_state.name):
-            raise ValueError("Only Adam-like optimizers are supported.")
-
-        # handle non-paralleled module parameters
-        # make sure the order of the parameters
-        pm_name_locs: Dict[str, ModuleParameterLocation] = dict(sorted(optimizer._extra_state.parallel_module_locs.items(), key=lambda x: x[1].offset))
-        pm_modules: List[torch.nn.Module] = []
-        pm_locs = list(pm_name_locs.values())
-        for name in pm_name_locs:
-            m = get_member_by_name(module, name)
-            if not isinstance(m, ParallelModule):
-                raise ValueError(f"Module {name} is not a ParallelModule")
-            pm_modules.append(m)
-
-        merged_cur = 0  # the current index of the merged state dict
-        pm_cur = 0      # the current index of the parallel module in pm_locs
-        new_states: Dict[int, Dict[str, Any]] = {}
-        new_cur = 0     # the current index of the new state dict
-        assert len(optimizer_state_dict['param_groups']) == 1
-        effective_state_len = len(optimizer_state_dict['param_groups'][0]['params'])
-        while merged_cur < effective_state_len:
-            # N: non-paralleled module parameters, P: paralleled module (will have multiple parameters)
-            # The parameter list would look like: NNPNPPPN
-            # []: the current processing parameter
-            # <>: the current processing parallel module
-            if (
-                pm_cur >= len(pm_modules)  # NNPNPPP[N]:  the ending parameters, no current parallel module
-                or new_cur < pm_locs[pm_cur].offset  # [N]N<P>NPPPN: other parameters
-            ):
-                # non-parallel module
-                if merged_cur in optimizer_state_dict['state']:
-                    new_states[new_cur] = optimizer_state_dict['state'][merged_cur]
-                merged_cur += 1
-                new_cur += 1
-            else:
-                # NNPN<[P]PP>N: the current parallel module
-                # parallel module
-                pm_param_count = len(pm_modules[pm_cur].origin_module_metadata.origin_param_names)
-                # will map `pm_param_count` parameters in merge state dict
-                # to `pm_locs[pm_cur].count` in optimizer state.
-                cur_states = {}
-                for i in range(pm_param_count):
-                    if merged_cur + i in optimizer_state_dict['state']:
-                        cur_states[i] =optimizer_state_dict['state'][merged_cur + i]
-                pm_new_states = _opt_load_merged_state_dict(pm_modules[pm_cur], cur_states)
-                for idx, value in pm_new_states.items():
-                    new_states[new_cur + idx] = value
-                new_cur += pm_locs[pm_cur].count
-                merged_cur += pm_param_count
-                pm_cur += 1
-
-        # move the new states to the device if needed
-        for idx, state in new_states.items():
-            for key, value in state.items():
-                if isinstance(value, torch.Tensor):
-                    new_states[idx][key] = value.to(device)
-
-        new_optimizer_state_dict = {}
-        new_optimizer_state_dict['state'] = new_states
-        new_optimizer_state_dict['param_groups'] = copy.deepcopy(optimizer_state_dict['param_groups'])
-        new_optimizer_state_dict['param_groups'][0]['params'] = list(range(new_cur))
+        new_optimizer_state_dict = _trim_optimizer_merged_state_dict(module, optimizer._extra_state, optimizer_state_dict, device=device)
         optimizer.load_state_dict(new_optimizer_state_dict)
+
+
+def _trim_optimizer_merged_state_dict(
+    module: torch.nn.Module,
+    opt_extra_state: OptimizerExtraState,
+    optimizer_state_dict: Dict[str, Any],
+    *,
+    device: Union[str, torch.device] = None
+) -> Dict[str, Any]:
+    """
+    Trim the merged state dict to only keep the states needed for the optimizer.
+
+    Args:
+        module (torch.nn.Module): the module to be loaded
+        opt_extra_state (OptimizerExtraState): the extra state of the optimizer
+        optimizer_state_dict (Dict[str, Any]): the merged optimizer state dict
+        device (Union[str, torch.device]): the device to put the optimizer state dict.
+
+    Returns:
+        Dict[str, Any]: the trimmed optimizer state dict
+    """
+    if not _is_supported_optimizer(opt_extra_state.name):
+        raise ValueError("Only Adam-like optimizers are supported.")
+
+    device = device or torch.cuda.current_device()
+
+    # handle non-paralleled module parameters
+    # make sure the order of the parameters
+    pm_name_locs: Dict[str, ModuleParameterLocation] = dict(sorted(opt_extra_state.parallel_module_locs.items(), key=lambda x: x[1].offset))
+    pm_modules: List[ParallelModule] = []
+    pm_locs = list(pm_name_locs.values())
+    for name in pm_name_locs:
+        m = get_member_by_name(module, name)
+        if not isinstance(m, ParallelModule):
+            raise ValueError(f"Module {name} is not a ParallelModule")
+        pm_modules.append(m)
+
+    merged_cur = 0  # the current index of the merged state dict
+    pm_cur = 0      # the current index of the parallel module in pm_locs
+    new_states: Dict[int, Dict[str, Any]] = {}
+    new_cur = 0     # the current index of the new state dict
+    assert len(optimizer_state_dict['param_groups']) == 1
+    effective_state_len = len(optimizer_state_dict['param_groups'][0]['params'])
+    while merged_cur < effective_state_len:
+        # N: non-paralleled module parameters, P: paralleled module (will have multiple parameters)
+        # The parameter list would look like: NNPNPPPN
+        # []: the current processing parameter
+        # <>: the current processing parallel module
+        if (
+            pm_cur >= len(pm_modules)  # NNPNPPP[N]:  the ending parameters, no current parallel module
+            or new_cur < pm_locs[pm_cur].offset  # [N]N<P>NPPPN: other parameters
+        ):
+            # non-parallel module
+            if merged_cur in optimizer_state_dict['state']:
+                new_states[new_cur] = optimizer_state_dict['state'][merged_cur]
+            merged_cur += 1
+            new_cur += 1
+        else:
+            # NNPN<[P]PP>N: the current parallel module
+            # parallel module
+            pm_param_count = len(pm_modules[pm_cur].origin_module_metadata.origin_param_names)
+            # will map `pm_param_count` parameters in merge state dict
+            # to `pm_locs[pm_cur].count` in optimizer state.
+            cur_states = {}
+            for i in range(pm_param_count):
+                if merged_cur + i in optimizer_state_dict['state']:
+                    cur_states[i] =optimizer_state_dict['state'][merged_cur + i]
+            pm_new_states = _opt_load_merged_state_dict(pm_modules[pm_cur], cur_states)
+            for idx, value in pm_new_states.items():
+                new_states[new_cur + idx] = value
+            new_cur += pm_locs[pm_cur].count
+            merged_cur += pm_param_count
+            pm_cur += 1
+
+    # move the new states to the device if needed
+    for idx, state in new_states.items():
+        for key, value in state.items():
+            if isinstance(value, torch.Tensor):
+                new_states[idx][key] = value.to(device)
+
+    new_optimizer_state_dict = {}
+    new_optimizer_state_dict['state'] = new_states
+    new_optimizer_state_dict['param_groups'] = copy.deepcopy(optimizer_state_dict['param_groups'])
+    new_optimizer_state_dict['param_groups'][0]['params'] = list(range(new_cur))
+
+    return new_optimizer_state_dict
 
 
 def _opt_load_merged_state_dict(module: ParallelModule, states: Dict[int, Dict[str, Any]]):
@@ -2475,11 +2479,9 @@ def load_deduped_state_dict(
     # - broadcast parallel modules weights from 1st scale unit to other units
     broadcast_weights(module)
 
-    if optimizer is not None:
+    if optimizer is not None and optimizer_state_dict is not None:
         if not _is_supported_optimizer(optimizer._extra_state.name):
             raise ValueError("Only Adam-like optimizers are supported.")
-        if optimizer_state_dict is None:
-            raise ValueError("optimizer_state_dict should be provided when optimizer is not None.")
 
         for idx, state in optimizer_state_dict['state'].items():
             for key, value in state.items():
@@ -2658,9 +2660,11 @@ def load_sharded_state_dict(
     device = device or torch.cuda.current_device()
     module.load_state_dict(module_state_dict)
     module.to(device)
-    if optimizer:
-        if optimizer_state_dict is None:
-            raise ValueError("optimizer_state_dict should be provided when optimizer is not None.")
+    if optimizer and optimizer_state_dict:
+        for idx, state in optimizer_state_dict.get('state', {}).items():
+            for key, value in state.items():
+                if isinstance(value, torch.Tensor):
+                    optimizer_state_dict['state'][idx][key] = value.to(device)
         optimizer.load_state_dict(optimizer_state_dict)
 
 
@@ -2694,3 +2698,387 @@ def sync_grad_when(cond: bool):
         cond (bool): whether to synchronize gradients.
     """
     return _runtime_flags(skip_reducer=not cond)
+
+
+def _construct_parallel_module_stub(metadata):
+    pmodules = {prefix: ParallelModule._unpack(minfo) for prefix, minfo in metadata.items()}
+
+    # whole parallel module
+    if len(pmodules) == 1 and list(pmodules.keys())[0] == '':
+        module = pmodules['']
+    else:
+        module = torch.nn.Module()
+        for prefix, pmodule in pmodules.items():
+            set_member_by_name(module, prefix, pmodule)
+
+    # mock `named_modules` to list parallel modules in stub module
+    def named_modules(
+        memo=None,
+        prefix: str = "",
+        remove_duplicate: bool = True,
+    ):
+        assert memo is None and prefix == '' and remove_duplicate is True, \
+            "Only support default arguments"
+        return pmodules.items()
+
+    module.named_modules = named_modules
+
+    return module
+
+
+def _trim_module_merged_state_dict(
+    module: torch.nn.Module,
+    module_state_dict: Dict[str, Any],
+    *,
+    device: Union[str, torch.device] = None,
+):
+    device = device or torch.cuda.current_device()
+
+    parallel_modules = {module_path: m for module_path, m in module.named_modules() if isinstance(m, ParallelModule)}
+
+    trimmed_state_dict = {}
+    # collect non-parallel module parameters
+    for key, tensor in module_state_dict.items():
+        parts = key.split('.')
+        if not any('.'.join(parts[:i]) in parallel_modules for i in range(0, len(parts))):
+            trimmed_state_dict[key] = tensor.to(device)
+
+    for module_path, pmodule in parallel_modules.items():
+        prefix = module_path + '.' if module_path else ''
+        trimmed_state_dict.update(
+            pmodule.trim_merged_state_dict(
+                pmodule.rank, module_state_dict, prefix=prefix,
+                device=device
+            )
+        )
+    return trimmed_state_dict
+
+
+def _send_trimmed_module_state_dict(
+    trimmed_state_dict: Dict[str, torch.Tensor],
+    group: torch.distributed.ProcessGroup,
+    dst_rank: int,
+):
+    """
+    Send the trimmed state dict to the specified destination rank.
+
+    Args:
+        trimmed_state_dict (Dict[str, torch.Tensor]): the trimmed state dict to send.
+        dst_rank (int): the destination rank to send the state dict to.
+    """
+    # send trimmed state dict to rank
+    # one tensor each time
+    keys = list(trimmed_state_dict.keys())
+    shape_dtypes = [(tensor.shape, tensor.dtype) for tensor in trimmed_state_dict.values()]
+    torch.distributed.send_object_list([keys, shape_dtypes], group=group, dst=dst_rank)
+    for key in keys:
+        tensor = trimmed_state_dict[key]
+        # NOTE: send is broken if the tensor is not contiguous
+        torch.distributed.send(tensor.contiguous(), group=group, dst=dst_rank)
+
+
+def _receive_trimmed_module_state_dict(
+    src_rank: int,
+    group: torch.distributed.ProcessGroup,
+    device: Union[str, torch.device] = None,
+):
+    """
+    Receive the trimmed state dict from the specified source rank.
+
+    Args:
+        src_rank (int): the source rank to receive the state dict from.
+    """
+    device = device or torch.cuda.current_device()
+
+    # receive trimmed state dict from rank
+    # one at a time
+    keys_shape_dtypes=[None, None]
+    torch.distributed.recv_object_list(keys_shape_dtypes, group=group, src=src_rank)
+    keys: list[str] = keys_shape_dtypes[0]
+    shape_dtypes: list[tuple[torch.Size, torch.dtype]] = keys_shape_dtypes[1]
+
+    trimmed_state_dict = {}
+    for key, shape_dtype in zip(keys, shape_dtypes):
+        tensor = torch.zeros(shape_dtype[0], dtype=shape_dtype[1], device=device)
+        torch.distributed.recv(tensor, group=group, src=src_rank)
+        trimmed_state_dict[key] = tensor
+    return trimmed_state_dict
+
+
+def _send_trimmed_opt_state_dict(
+    trimmed_opt_state_dict: OptStateDict,
+    group: torch.distributed.ProcessGroup,
+    dst_rank: int,
+):
+    """
+    Send the trimmed optimizer state dict to the specified destination rank.
+
+    Args:
+        trimmed_opt_state_dict (OptStateDict): the trimmed optimizer state dict to send.
+        dst_rank (int): the destination rank to send the state dict to.
+    """
+    # send trimmed optimizer state dict to rank
+    # one tensor each time
+
+    # broadcast param groups and state keys/shapes/dtypes via broadcast_object_list
+    state_info = {}
+    state_keys = list(trimmed_opt_state_dict['state'].keys())
+    param_group = trimmed_opt_state_dict['param_groups']
+    for idx in state_keys:
+        state_info[idx] = {key: (value.shape, value.dtype) for key, value in trimmed_opt_state_dict['state'][idx].items()}
+    sent = [state_keys, state_info, param_group]
+    torch.distributed.send_object_list(sent, group=group, dst=dst_rank)
+
+    # broadcast step in stack
+    if 'step' in trimmed_opt_state_dict['state'][state_keys[0]]:
+        step_stack = torch.stack(
+            [trimmed_opt_state_dict['state'][k]['step'] for k in state_keys]
+        )
+        torch.distributed.send(step_stack, group=group, dst=dst_rank)
+
+    # broadcast other states
+    # TODO: can be slow?
+    for k in state_keys:
+        keys = sorted(trimmed_opt_state_dict['state'][k].keys())
+        if 'step' in keys:
+            keys.remove('step')  # we have done step in previous.
+        for key in keys:
+            value = trimmed_opt_state_dict['state'][k][key]
+            torch.distributed.send(value.data, group=group, dst=dst_rank)
+
+
+def _receive_trimmed_opt_state_dict(
+    src_rank: int,
+    group: torch.distributed.ProcessGroup,
+    device: Union[str, torch.device] = None,
+ ) -> OptStateDict:
+    """
+    Receive the trimmed optimizer state dict from the specified source rank.
+
+    Args:
+        src_rank (int): the source rank to receive the state dict from.
+    """
+    device = device or torch.cuda.current_device()
+
+    # receive trimmed optimizer state dict from rank
+    # one at a time
+    state_dict_info = [None, None, None]
+    torch.distributed.recv_object_list(state_dict_info, group=group, src=src_rank)
+    state_keys: list[str] = state_dict_info[0]
+    state_info: list[tuple[torch.Size, torch.dtype]] = state_dict_info[1]
+    param_group = state_dict_info[2]
+
+    trimmed_opt_state_dict = {
+        'state': {},
+        'param_groups': param_group
+    }
+    for key in state_keys:
+        trimmed_opt_state_dict['state'][key] = {
+            k: torch.zeros(v[0], dtype=v[1], device=device)
+            for k, v in state_info[key].items()
+        }
+
+    # receive steps
+    if 'step' in trimmed_opt_state_dict['state'][state_keys[0]]:
+        step_stack = torch.zeros(
+            len(state_keys),
+            dtype=trimmed_opt_state_dict['state'][state_keys[0]]['step'].dtype,
+            device=device
+        )
+        torch.distributed.recv(step_stack, group=group, src=src_rank)
+        for k, v in zip(state_keys, step_stack):
+            trimmed_opt_state_dict['state'][k]['step'].copy_(v)
+
+    # receive other states
+    for k in state_keys:
+        keys = sorted(trimmed_opt_state_dict['state'][k].keys())
+        if 'step' in keys:
+            keys.remove('step')  # we have done step in previous.
+        for key in keys:
+            value = trimmed_opt_state_dict['state'][k][key]
+            torch.distributed.recv(value.data, group=group, src=src_rank)
+
+    return trimmed_opt_state_dict
+
+
+def trimmed_broadcast_merged_state_dict(
+    module: torch.nn.Module,
+    module_state_dict: Optional[Dict[str, Any]] = None,
+    optimizer: Optional[Union[torch.optim.Optimizer, ParallelOptimizer]] = None,
+    optimizer_state_dict: Optional[Dict[str, Any]] = None,
+    *,
+    src_rank: int = 0,
+    dst_ranks: Optional[list[int]] = None,
+    device: Union[str, torch.device] = None,
+) -> Tuple[Dict[str, Any], Optional[Dict[str, Any]]]:
+    """
+    trim merged state dict and broadcast to each rank.
+
+    Args:
+        module (torch.nn.Module): the module to be loaded
+        module_state_dict (Dict[str, Any]): the merged model state dict
+        optimizer (Optional[torch.optim.Optimizer]): the optimizer to be loaded
+        optimizer_state_dict (Optional[Dict[str, Any]]): the merged optimizer state dict
+        device (Union[str, torch.device]): the device to put the module and optimizer state dicts.
+            Use torch.cuda.current_device() if it is None.
+        src_rank (int): the source rank to load the merged state dict from.
+        dst_ranks (Optional[list[int]]): the destination ranks to load the merged state dict to.
+
+    Returns:
+        Tuple[Dict[str, Any], Optional[Dict[str, Any]]]:
+            the trimmed state dicts for the module and optimizer
+    """
+    device = device or torch.cuda.current_device()
+    world_size = torch.distributed.get_world_size()
+    dst_ranks = dst_ranks or list(range(world_size))
+    cur_rank = torch.distributed.get_rank()
+
+    if cur_rank not in dst_ranks or src_rank not in dst_ranks:
+        raise ValueError(
+            f"Invalid rank configuration. Both current rank ({cur_rank}) and source rank ({src_rank}) "
+            f"must be in the destination ranks {dst_ranks}."
+        )
+
+    pg = DeviceGroup().get_group(dst_ranks)
+
+    if cur_rank == src_rank:
+        if optimizer_state_dict and not optimizer:
+            raise ValueError("Optimizer must be provided when loading optimizer state dict.")
+    else:
+        if optimizer_state_dict or module_state_dict:
+            raise ValueError("Only the source rank can provide the merged state dicts.")
+
+    rank_metadata = (
+        {module_path: m._pack() for module_path, m in module.named_modules() if isinstance(m, ParallelModule)},
+        optimizer._extra_state if optimizer else None,
+    )
+
+    rank_metadatas = [None] * len(dst_ranks) if cur_rank == src_rank else None
+    torch.distributed.gather_object(rank_metadata, rank_metadatas, group=pg, dst=src_rank)
+
+    if cur_rank == src_rank:
+        will_load_opt_state = [optimizer_state_dict is not None]
+    else:
+        will_load_opt_state = [None]
+    torch.distributed.broadcast_object_list(will_load_opt_state, group=pg, src=src_rank)
+    will_load_opt_state = will_load_opt_state[0]
+    if will_load_opt_state and not optimizer:
+        raise ValueError("Optimizer must be provided when loading optimizer state dict.")
+
+    ret = None
+
+    if cur_rank == src_rank:
+        pmodule_stubs = [_construct_parallel_module_stub(r[0]) for r in rank_metadatas]
+        opt_extra_states = [r[1] for r in rank_metadatas]
+        for rank in dst_ranks:
+            if rank != cur_rank:
+                logger.info(f'At rank {src_rank}: Trimming module state dict for rank {rank}')
+                trimmed_module_state_dict = _trim_module_merged_state_dict(
+                    pmodule_stubs[rank],
+                    module_state_dict,
+                    device=device,
+                )
+                logger.info(f'At rank {src_rank}: Sending trimmed module state dict for rank {rank}')
+                _send_trimmed_module_state_dict(trimmed_module_state_dict, dst_rank=rank, group=pg)
+                del trimmed_module_state_dict
+
+                if will_load_opt_state:
+                    logger.info(f'At rank {src_rank}: Trimming optimizer state dict for rank {rank}')
+                    trimmed_opt_state_dict = _trim_optimizer_merged_state_dict(
+                        pmodule_stubs[rank],
+                        opt_extra_states[rank],
+                        optimizer_state_dict,
+                        device=device,
+                    )
+                    logger.info(f'At rank {src_rank}: Sending trimmed optimizer state dict for rank {rank}')
+                    _send_trimmed_opt_state_dict(trimmed_opt_state_dict, dst_rank=rank, group=pg)
+                    del trimmed_opt_state_dict
+
+            torch.distributed.barrier(group=pg)
+
+        # load for self after state dict for all other ranks are sent
+        # this can lower gpu memory peak
+        logger.info(f'At rank {src_rank}: Trimming module state dict for self rank {cur_rank}')
+        trimmed_module_state_dict = _trim_module_merged_state_dict(
+                pmodule_stubs[cur_rank],
+                module_state_dict,
+                device=device,
+            )
+        if will_load_opt_state:
+            logger.info(f'At rank {src_rank}: Trimming optimizer state dict for self rank {cur_rank}')
+            trimmed_opt_state_dict = _trim_optimizer_merged_state_dict(
+                pmodule_stubs[cur_rank],
+                opt_extra_states[cur_rank],
+                optimizer_state_dict,
+                device=device,
+            )
+        else:
+            trimmed_opt_state_dict = None
+        ret = (trimmed_module_state_dict, trimmed_opt_state_dict)
+    else:
+        for rank in dst_ranks:
+            if rank == cur_rank:
+                # receive state dict from src_rank
+                logger.info(f'At rank {cur_rank}: Receiving trimmed module state dict from rank {src_rank}')
+                trimmed_module_state_dict = _receive_trimmed_module_state_dict(src_rank, group=pg)
+
+                if will_load_opt_state:
+                    logger.info(f'At rank {cur_rank}: Receiving trimmed optimizer state dict from rank {src_rank}')
+                    trimmed_opt_state_dict = _receive_trimmed_opt_state_dict(src_rank, group=pg)
+                else:
+                    trimmed_opt_state_dict = None
+
+                ret = (trimmed_module_state_dict, trimmed_opt_state_dict)
+
+            torch.distributed.barrier(group=pg)
+
+    assert ret is not None
+    # make it a sharded state dict.
+    for module_path, m in module.named_modules():
+        prefix = module_path + '.' if module_path else ''
+        if isinstance(m, ParallelModule):
+            m._add_extra_state(ret[0], prefix)
+    return ret
+
+
+def load_merged_state_dict_from_rank(
+    module: torch.nn.Module,
+    module_state_dict: Optional[Dict[str, Any]] = None,
+    optimizer: Optional[Union[torch.optim.Optimizer, ParallelOptimizer]] = None,
+    optimizer_state_dict: Optional[Dict[str, Any]] = None,
+    *,
+    src_rank: int = 0,
+    dst_ranks: Optional[list[int]] = None,
+    device: Union[str, torch.device] = None,
+):
+    """
+    load the merged state dict from rank.
+
+    Only src_rank will load merged state dict to memory (for saving memory),
+    and dst_ranks will receive the sharded state dict from src_rank via communication.
+
+    Args:
+        module (torch.nn.Module): the module to be loaded
+        module_state_dict (Dict[str, Any]): the merged model state dict
+        optimizer (Optional[torch.optim.Optimizer]): the optimizer to be loaded
+        optimizer_state_dict (Optional[Dict[str, Any]]): the merged optimizer state dict
+        device (Union[str, torch.device]): the device to put the module and optimizer state dicts.
+            Use torch.cuda.current_device() if it is None.
+        src_rank (int): the source rank to load the merged state dict from.
+        dst_ranks (Optional[list[int]]): the destination ranks to load the merged state dict to.
+
+    Returns:
+        None
+    """
+    trimmed_module_state_dict, trimmed_opt_state_dict = trimmed_broadcast_merged_state_dict(
+        module,
+        module_state_dict,
+        optimizer,
+        optimizer_state_dict,
+        device=device,
+        src_rank=src_rank,
+        dst_ranks=dst_ranks,
+    )
+    module.load_state_dict(trimmed_module_state_dict)
+    if trimmed_opt_state_dict:
+        optimizer.load_state_dict(trimmed_opt_state_dict)

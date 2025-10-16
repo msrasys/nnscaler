@@ -16,6 +16,8 @@ from .parallel import (
     broadcast_weights,
     load_sharded_state_dict,
     sync_grad_when,
+    trimmed_broadcast_merged_state_dict,
+    load_merged_state_dict_from_rank,
 )
 from nnscaler.graph.parser.register import register_op
 from nnscaler.runtime.function.function import (

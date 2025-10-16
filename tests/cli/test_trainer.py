@@ -694,8 +694,8 @@ def trainer_correctness_worker(save_dir, parallel_type=0, async_reducer=False, h
 
     optimizer_config = {
         'type': 'nnscaler.HybridOptimizer',
+        'param_clss_fn': param_clss_fn,
         'args': {
-            'param_clss_fn': param_clss_fn,
             'config': {
                 'optimizers':[
                     {
@@ -987,19 +987,45 @@ def trainer_resumable_dataloader(save_dir):
     torch.distributed.barrier()
 
     # resume for merged
-    trainer = Trainer([
-        '-f', config_path_streaming,
-        '--precision', 'bf16',
-        '--optimizer.type', optimizer_type,
-        '--enable_progress_bar', 'false',
-        '--gen_savedir', str(gen_savedir),
-        '--checkpoint.save_type', save_type,
-        '--checkpoint.save_dir', str(ckpt2_savedir),
-        '--checkpoint.resume_from', str(ckpt2_savedir / 'merged.pt'),
-        '--checkpoint.keep_last_n_checkpoints', '30',
-    ])
-    trainer.run()
-    assert trainer.dataloader_resumed
+    with catch_log(logger) as log:
+        trainer = Trainer([
+            '-f', config_path_streaming,
+            '--precision', 'bf16',
+            '--optimizer.type', optimizer_type,
+            '--enable_progress_bar', 'false',
+            '--gen_savedir', str(gen_savedir),
+            '--checkpoint.save_type', save_type,
+            '--checkpoint.save_dir', str(ckpt2_savedir),
+            '--checkpoint.resume_from.checkpoint', str(ckpt2_savedir / 'merged.pt'),
+            '--checkpoint.resume_from.save_memory', False,
+            '--checkpoint.keep_last_n_checkpoints', '30',
+        ])
+        trainer.run()
+        assert trainer.dataloader_resumed
+        assert 'Broadcasting trimmed checkpoint to all ranks.' not in log.getvalue()  # no warning about dataloader states
+
+    torch.distributed.barrier()
+
+
+    ckpt2_1_savedir = save_dir / 'ckpt2_1'
+    ckpt2_1_savedir.mkdir(parents=True, exist_ok=True)
+    # resume for merged
+    with catch_log(logger) as log:
+        trainer = Trainer([
+            '-f', config_path_streaming,
+            '--precision', 'bf16',
+            '--optimizer.type', optimizer_type,
+            '--enable_progress_bar', 'false',
+            '--gen_savedir', str(gen_savedir),
+            '--checkpoint.save_type', save_type,
+            '--checkpoint.save_dir', str(ckpt2_1_savedir),
+            '--checkpoint.resume_from.checkpoint', str(ckpt2_savedir / 'merged.pt'),
+            '--checkpoint.resume_from.save_memory', True,
+            '--checkpoint.keep_last_n_checkpoints', '30',
+        ])
+        trainer.run()
+        assert trainer.dataloader_resumed
+        assert 'Broadcasting trimmed checkpoint to all ranks.' in log.getvalue()  # no warning about dataloader states
 
     torch.distributed.barrier()
 
@@ -1032,11 +1058,33 @@ def trainer_resumable_dataloader(save_dir):
             '--checkpoint.save_dir', str(ckpt4_savedir),
             '--checkpoint.resume_from.checkpoint', str(ckpt1_savedir / '0002-0035'),
             '--checkpoint.resume_from.with_merged', True,
+            '--checkpoint.resume_from.save_memory', False,
             '--checkpoint.keep_last_n_checkpoints', '30',
         ])
         trainer.run()
         assert trainer.dataloader_resumed
         assert 'Broadcasting merged checkpoint to all ranks.' in log.getvalue()  # no warning about dataloader states
+
+    # resume from auto-merged with save_memory
+    ckpt5_savedir = save_dir / 'ckpt5'
+    with catch_log(logger) as log:
+        trainer = Trainer([
+            '-f', config_path_streaming,
+            '--precision', 'bf16',
+            '--optimizer.type', optimizer_type,
+            '--enable_progress_bar', 'false',
+            '--gen_savedir', str(gen_savedir),
+            '--checkpoint.save_type', save_type,
+            '--checkpoint.save_dir', str(ckpt5_savedir),
+            '--checkpoint.resume_from.checkpoint', str(ckpt1_savedir / '0002-0035'),
+            '--checkpoint.resume_from.with_merged', True,
+            '--checkpoint.resume_from.save_memory', True,
+            '--checkpoint.keep_last_n_checkpoints', '30',
+        ])
+        trainer.run()
+        assert trainer.dataloader_resumed
+        assert 'Broadcasting trimmed checkpoint to all ranks.' in log.getvalue()  # no warning about dataloader states
+
 
     if torch.distributed.get_rank() == 0:
         for i in range(4):
@@ -1044,8 +1092,10 @@ def trainer_resumable_dataloader(save_dir):
             x = torch.load(ckpt0_savedir / 'last' / f'{i}.ckpt', weights_only=False)
             y = torch.load(ckpt1_savedir / 'last' / f'{i}.ckpt', weights_only=False)
             z = torch.load(ckpt2_savedir / 'last' / f'{i}.ckpt', weights_only=False)
+            z_1 = torch.load(ckpt2_1_savedir / 'last' / f'{i}.ckpt', weights_only=False)
             w = torch.load(ckpt3_savedir / 'last' / f'{i}.ckpt', weights_only=False)
             v = torch.load(ckpt4_savedir / 'last' / f'{i}.ckpt', weights_only=False)
+            u = torch.load(ckpt5_savedir / 'last' / f'{i}.ckpt', weights_only=False)
             assert 'dataloader' not in g
             assert 'dataloader' in x
             for key in ['model', 'optimizer', 'lr_scheduler', 'dataloader']:
@@ -1053,6 +1103,8 @@ def trainer_resumable_dataloader(save_dir):
                 assert_equal(x[key], z[key])
                 assert_equal(x[key], w[key])
                 assert_equal(x[key], v[key])
+                assert_equal(x[key], u[key])
+                assert_equal(x[key], z_1[key])
                 if key != 'dataloader':
                     assert_equal(g[key], x[key])
 

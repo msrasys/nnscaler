@@ -79,8 +79,6 @@ class HybridOptimizer(torch.optim.Optimizer, TrainHookHost):
         Args:
             params (Iterable[torch.nn.Parameter]): The parameters to optimize.
             param_clss (dict[torch.nn.Parameter, tuple[int, int]]): The parameter classes for each parameter.
-                Please replace this argument with `param_clss_fn` (Callable[[str], tuple[int, int]])
-                when you use creating it with `nnscaler.build_optimizer` (including cli trainer).
             config (Union[HybridOptConfig, dict[str, Any]]): The configuration for the hybrid optimizer.
         """
         params = list(params)

@@ -22,6 +22,7 @@ import psutil
 from tqdm import tqdm
 
 import nnscaler
+from nnscaler.runtime.device import DeviceGroup
 from nnscaler.utils import enforce_zero_num_worker, is_running_distributed
 
 from .trainer_args import AggregatedOutputs, TrainerArgs, fix_input
@@ -142,7 +143,7 @@ class Trainer:
     def _setup(self):
         if is_running_distributed():
             nnscaler.init()
-            if torch.distributed.get_rank() == 0:
+            if DeviceGroup().local_rank == 0:
                 logging.getLogger().setLevel(logging.INFO)
             else:
                 logging.getLogger().setLevel(logging.WARNING)
@@ -162,7 +163,7 @@ class Trainer:
         pmodel = parallelize_model(
             self.train_args, self.dummy_input,
             load_module=not compile_only,
-            build_buckets=not self.train_args.is_hybrid_optimizer()
+            build_buckets=not self.train_args.should_delay_bucket_building()
         )
         if compile_only:
             return
@@ -190,6 +191,17 @@ class Trainer:
         self.local_world_size = int(os.environ.get('LOCAL_WORLD_SIZE'))
         self.local_rank = int(os.environ.get('LOCAL_RANK'))
         self.node_rank = int(os.environ.get('GROUP_RANK'))
+        assert self.rank // self.local_world_size == self.node_rank
+        self.local_ranks = list(
+            range(
+                self.node_rank * self.local_world_size,
+                (self.node_rank + 1) * self.local_world_size
+            )
+        )
+        self.local_rank0 = self.local_ranks[0]
+        # create local process groups
+        for local_rank0 in range(0, self.world_size, self.local_world_size):
+            DeviceGroup().get_group(list(range(local_rank0, local_rank0 + self.local_world_size)))
 
         self.total_train_steps_per_epoch = len(self.dataloader['train']) // self.train_args.update_freq
         if len(self.dataloader['train']) % self.train_args.update_freq != 0:
@@ -291,47 +303,56 @@ class Trainer:
         }
         return merged_state_dict
 
-    def _broadcast_merged_state_dict(self, state_dict: Dict[str, Any]):
+    def _broadcast_merged_state_dict(
+        self,
+        state_dict: Dict[str, Any],
+        src_rank: int = 0,
+        dst_ranks: Optional[list[int]] = None,
+    ):
         """
         Broadcast the merged state dict to all ranks.
         We can't broadcast the whole state_dict at once, because it may be too large, and leads to OOM.
         Here we will break the model and optimizer state_dict into smaller pieces and broadcast them one by one.
         Please note we use `torch.distributed.broadcast_object_list` to broadcast the state_dict (including tensors inside).
         """
+        dst_ranks = dst_ranks or list(range(torch.distributed.get_world_size()))
+        if src_rank not in dst_ranks or self.rank not in dst_ranks:
+            raise ValueError(f"src_rank and current rank must be in dst_ranks: {dst_ranks}")
+        pg = DeviceGroup().get_group(dst_ranks)
 
-        def _broadcast_keys(sdict: Dict[str, Any], set_keys=True):
-            if self.rank == 0:
-                state_keys = list(sdict.keys())
-            else:
-                state_keys = None
-            state_key_list = [state_keys]
-            torch.distributed.broadcast_object_list(state_key_list, src=0)
-            state_keys = state_key_list[0]
-            if set_keys and self.rank != 0:
-                for key in state_keys:
-                    sdict[key] = {}  # assume the values are empty dicts
-            return state_keys
-
-        def _broadcast_value(sdict, key):
-            if self.rank == 0:
-                value_list = [sdict[key]]
-            else:
-                value_list = [None]
-            torch.distributed.broadcast_object_list(value_list, src=0)
-            if self.rank != 0:
-                sdict[key] = value_list[0]
-
-        def _broadcast_values(sdict, keys):
-            for key in keys:
-                _broadcast_value(sdict, key)
-
-        if self.rank == 0:
+        if self.rank == src_rank:
             if state_dict is None:
                 raise ValueError("state_dict should not be None in rank 0 when broadcasting")
         else:
             if state_dict is not None:
                 raise ValueError("state_dict should be None in other ranks when broadcasting")
             state_dict = {}
+
+        def _broadcast_keys(sdict: Dict[str, Any], set_keys=True):
+            if self.rank == src_rank:
+                state_keys = list(sdict.keys())
+            else:
+                state_keys = None
+            state_key_list = [state_keys]
+            torch.distributed.broadcast_object_list(state_key_list, src=src_rank, group=pg)
+            state_keys = state_key_list[0]
+            if set_keys and self.rank != src_rank:
+                for key in state_keys:
+                    sdict[key] = {}  # assume the values are empty dicts
+            return state_keys
+
+        def _broadcast_value(sdict, key):
+            if self.rank == src_rank:
+                value_list = [sdict[key]]
+            else:
+                value_list = [None]
+            torch.distributed.broadcast_object_list(value_list, src=src_rank, group=pg)
+            if self.rank != src_rank:
+                sdict[key] = value_list[0]
+
+        def _broadcast_values(sdict, keys):
+            for key in keys:
+                _broadcast_value(sdict, key)
 
         state_keys = _broadcast_keys(state_dict)
 
@@ -377,11 +398,19 @@ class Trainer:
         if not resume_from:
             return
         logger.info(f"Resuming from {resume_from}")
+        trimmed_broadcast_required = False
+        load_from_merged = False
+
         if resume_from.is_file():
-            resume_from = resume_from   # when we load from merged checkpoint
-            state_dict = torch.load(resume_from, map_location='cpu', weights_only=False)
-            if convert_fn := self.train_args.checkpoint.resolved_convert_fn:
-                state_dict = convert_fn(state_dict)
+            # when we load from merged checkpoint
+            load_from_merged = True
+            trimmed_broadcast_required = self.train_args.checkpoint.resume_from.save_memory
+            if not self.train_args.checkpoint.resume_from.save_memory or self.local_rank == 0:
+                state_dict = torch.load(resume_from, map_location='cpu', weights_only=False)
+                if convert_fn := self.train_args.checkpoint.resolved_convert_fn:
+                    state_dict = convert_fn(state_dict)
+            else:
+                state_dict = None
         else:
             ckpt_files = list(resume_from.glob('*.ckpt'))
             rank_ckpt_files = {int(f.stem): f for f in ckpt_files if f.stem.isdigit()}
@@ -394,14 +423,20 @@ class Trainer:
             if len(rank_ckpt_files) != self.world_size or self.train_args.checkpoint.resume_from.with_merged:
                 # merge the checkpoint files from all ranks and broadcast to all ranks
                 torch.distributed.barrier()
-                if self.rank == 0:
+                if self.local_rank == 0:
                     logger.info(f"Merging checkpoint files from {resume_from}")
                     state_dict = self._merge_checkpoint(list(rank_ckpt_files.values()))
                 else:
                     state_dict = None
-                logger.info(f"Broadcasting merged checkpoint to all ranks.")
-                state_dict = self._broadcast_merged_state_dict(state_dict)
-                logger.info(f"Broadcasted merged checkpoint to all ranks.")
+
+                load_from_merged = True
+                trimmed_broadcast_required = self.train_args.checkpoint.resume_from.save_memory
+                if not self.train_args.checkpoint.resume_from.save_memory:
+                    logger.info(f"Broadcasting merged checkpoint to all ranks.")
+                    state_dict = self._broadcast_merged_state_dict(
+                        state_dict, src_rank=self.local_rank0, dst_ranks=self.local_ranks
+                    )
+                    logger.info(f"Broadcasted merged checkpoint to all ranks.")
             else:
                 resume_from = resume_from / f'{self.rank}.ckpt'
                 state_dict = torch.load(resume_from, map_location='cpu', weights_only=False)
@@ -411,12 +446,37 @@ class Trainer:
                         f"If it fails, please try with merged checkpoint."
                     )
 
+        if trimmed_broadcast_required:
+            logger.info("Broadcasting trimmed checkpoint to all ranks.")
+            state_dict = state_dict or {}
+            state_dict['model'], state_dict['optimizer'] = nnscaler.trimmed_broadcast_merged_state_dict(
+                self.model,
+                state_dict['model'] if self.local_rank == 0 else None,
+                self.optimizer,
+                state_dict['optimizer'] if self.local_rank == 0 else None,
+                src_rank=self.local_rank0,
+                dst_ranks=self.local_ranks,
+            )
+            remaining_state_dict = self._broadcast_merged_state_dict(
+                {k: v for k, v in state_dict.items() if k not in ('model', 'optimizer')}
+                if self.local_rank == 0 else None,
+                src_rank=self.local_rank0,
+                dst_ranks=self.local_ranks,
+            )
+            if self.local_rank != 0:
+                state_dict.update(remaining_state_dict)
+            logger.info("Broadcasted trimmed checkpoint to all ranks.")
+
+            # trimmed checkpoint is sharded
+            ckpt_save_type = 'sharded'
+        else:
+            # if it is not a well-formed state_dict (from third party)
+            # we will treat it as a merged state_dict
+            ckpt_save_type = state_dict.get('train_args', {}) \
+                .get('checkpoint', {}) \
+                .get('save_type', 'merged')
+
         self.hook.on_load_checkpoint(self, state_dict)
-        # if it is not a well-formed state_dict (from third party)
-        # we will treat it as a merged state_dict
-        ckpt_save_type = state_dict.get('train_args', {}) \
-            .get('checkpoint', {}) \
-            .get('save_type', 'merged')
 
         if ckpt_save_type == 'merged': # it is a merged state dict
             nnscaler.load_merged_state_dict(
@@ -441,10 +501,11 @@ class Trainer:
                 raise ValueError("lr_scheduler is not set in the current trainer")
             if self.lr_scheduler:
                 self.lr_scheduler.load_state_dict(state_dict['lr_scheduler'])
+
         if 'dataloader' in state_dict and state_dict['dataloader'] is not None:
             if not self._is_resumable_dataloader():
                 raise ValueError("dataloader is not resumable, but checkpoint contains dataloader state")
-            if ckpt_save_type == 'merged':
+            if load_from_merged:
                 dataloader_states = state_dict['dataloader']
                 # only load dataloader state when all ranks have the same state
                 # TODO: is this reasonable?
@@ -464,7 +525,7 @@ class Trainer:
             self.train_status = TrainStatus(**state_dict['train_status'])
 
         # we don't resume rng states when loading merged checkpoint,
-        if ckpt_save_type != 'merged':
+        if not load_from_merged:
             self.rng_states_from_resume = state_dict.get('rng_states')  # resumed in _global_batch_iterator()
         else:
             logger.warning("RNG states are not resumed when loading merged checkpoint.")

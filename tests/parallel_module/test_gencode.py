@@ -453,8 +453,13 @@ def test_codegen_getitem():
             gen_savedir=tempdir,
             load_module=False,
         )
-        assert _gencode_contains(tempdir, GetItemModule, 0, r'_operator.getitem\(.*, slice\(None, 2, None\)\)')
-        assert _gencode_contains(tempdir, GetItemModule, 1, r'_operator.getitem\(.*, slice\(None, 2, None\)\)')
+
+        assert _gencode_contains(tempdir, GetItemModule, 0, r"_operator.getitem\(batched_data.*, 'x'\)")
+        assert _gencode_contains(tempdir, GetItemModule, 1, r"_operator.getitem\(batched_data.*, 'x'\)")
+        # data_x.size() will be expanded to a list of ir objects,
+        # so no slice operation will be generated.
+        assert not _gencode_contains(tempdir, GetItemModule, 0, r'_operator.getitem\(.*, slice\(None, 2, None\)\)')
+        assert not _gencode_contains(tempdir, GetItemModule, 1, r'_operator.getitem\(.*, slice\(None, 2, None\)\)')
         assert m_new is None
 
 
@@ -1658,7 +1663,7 @@ def test_constant_folding_context(tmp_path):
         for name in names:
             code = add_codes.pop(0)
             if name in not_folded_names:
-                assert re.match(r'\s*add_.* = torch\.add\((linear|add)_.*, getitem_.*, alpha=1\)', code)
+                assert re.match(r'\s*add_.* = torch\.add\((linear|add)_.*, get.*, alpha=1\)', code)
             else:
                 assert re.match(r'\s*add_.* = torch\.add\((linear|add)_.*, 2, alpha=1\)', code)
 
@@ -1727,7 +1732,7 @@ def test_fold_constant(tmp_path, fold_input):
     else:
         # add_27 = torch.add(linear_30, getitem_20, alpha=1)
         assert _gencode_contains(tmp_path, CCFModule2, 0,
-                                 r'add_.* = torch\.add\(linear_.*, getitem_.*, alpha=1\)')
+                                 r'add_.* = torch\.add\(linear_.*, get.*, alpha=1\)')
         # b  = b * ashape3
         # mul_2_51 = torch.mul(mul_1_57, add_38)
         assert _gencode_contains(tmp_path, CCFModule2, 0,

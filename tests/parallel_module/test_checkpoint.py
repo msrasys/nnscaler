@@ -17,11 +17,18 @@ from torch.utils.data.distributed import DistributedSampler
 
 import numpy as np
 
-from nnscaler.parallel import ComputeConfig, parallelize, build_optimizer, merge_state_dicts, load_merged_state_dict
+from nnscaler.parallel import (
+    ComputeConfig, parallelize,
+    build_optimizer,
+    merge_state_dicts,
+    load_merged_state_dict,
+    load_merged_state_dict_from_rank,
+    trimmed_broadcast_merged_state_dict,
+)
 from nnscaler.runtime.module import ParallelModule, ExtraState
 from nnscaler.runtime.gnorm import calcuate_gnorm
 
-from .common import CubeLinear, init_random, init_distributed, PASMegatron
+from .common import CubeLinear, init_random, init_distributed, PASMegatron, assert_equal
 from ..launch_torchrun import launch_torchrun, clone_to_cpu_recursively
 from ..utils import replace_all_device_with, clear_dir_on_rank0
 
@@ -344,6 +351,23 @@ def _train(model: torch.nn.Module, num_replicas, rank, start, end, ckpt_dir, inf
             model_from_merged, merged_model_state_dict,
             optimizer_from_merged, merged_opt_state_dict,
         )
+
+        model_from_merged_rank = type(model)()
+        optimizer_from_merged_rank = build_optimizer(model_from_merged_rank, torch.optim.Adam, lr=0.01)
+        load_merged_state_dict_from_rank(
+            model_from_merged_rank, merged_model_state_dict if torch.distributed.get_rank() == 0 else None,
+            optimizer_from_merged_rank, merged_opt_state_dict if torch.distributed.get_rank() == 0 else None,
+        )
+        assert_equal(model_from_merged.state_dict(), model_from_merged_rank.state_dict())
+        assert_equal(optimizer_from_merged.state_dict(), optimizer_from_merged_rank.state_dict())
+
+        trimmed_model_state_dict, trimmed_opt_state_dict = trimmed_broadcast_merged_state_dict(
+            model_from_merged_rank, merged_model_state_dict if torch.distributed.get_rank() == 0 else None,
+            optimizer_from_merged_rank, merged_opt_state_dict if torch.distributed.get_rank() == 0 else None,
+        )
+        assert_equal(dict(model_from_merged.state_dict()), trimmed_model_state_dict)
+        assert_equal(optimizer_from_merged.state_dict()['state'], trimmed_opt_state_dict['state'])
+        assert_equal(optimizer_from_merged.state_dict()['param_groups'], trimmed_opt_state_dict['param_groups'])
 
         # check merged model
         result_orig_model_state_dict = model.state_dict()

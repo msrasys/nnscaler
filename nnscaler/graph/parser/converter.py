@@ -30,8 +30,11 @@ class no_save_tensor_hook(saved_tensors_hooks):
     """skip saving tensors for backward since tracer only traces forward"""
     def __init__(self):
         def pack(x):
-            return None
+            return (x.shape, x.dtype, x.device)
         def unpack(x):
+            # in pytorch 2.4.0-, torch.compile will call backward when tracing graph
+            if torch.__version__ < (2, 4, 0):
+                return torch.empty(x[0], dtype=x[1], device=x[2])
             raise RuntimeError("not expecting backward to be called on this tensor")
         super().__init__(pack, unpack)
 

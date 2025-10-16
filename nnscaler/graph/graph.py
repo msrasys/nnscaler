@@ -65,11 +65,10 @@ class IRGraph(IRSegment):
         """
         return self.forward(*args)
 
-    def forward(self, *args: Tuple[IRObject]) -> Union[IRTensor, Tuple[IRTensor]]:
+    def forward(self, *args: IRObject) -> Union[IRTensor, Tuple[IRTensor]]:
         """Forward the IRGraph to add model nodes into program.
-
         Args:
-            args (Tuple[IRObject]): input IRObjects
+            args (Tuple[IRObject, ...]): input IRObjects
 
         Returns:
             Any: output that can be nested structure of IRObjects

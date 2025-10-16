@@ -112,6 +112,27 @@ def get_member_by_name(model: torch.nn.Module, name: str) -> Any:
     return model_attr
 
 
+def set_member_by_name(model: Any, name: str, value: Any) -> None:
+    """
+    Set the member of the model by its full name.
+    """
+    if not name:
+        raise ValueError("Name cannot be empty")
+    class _ValueHolder:
+        """
+        A value holder.
+        In python you can't call `setattr` on object, but you can call it on its subclasses.
+        """
+        pass
+    sliced_names = name.split(".")
+    model_attr = model
+    for sliced_name in sliced_names[:-1]:
+        if not hasattr(model_attr, sliced_name):
+            setattr(model_attr, sliced_name, _ValueHolder())
+        model_attr = getattr(model_attr, sliced_name)
+    setattr(model_attr, sliced_names[-1], value)
+
+
 def get_shared_params(model: torch.nn.Module) -> List[List[str]]:
     paramid2name = defaultdict(set)
     for name in model.state_dict().keys():
@@ -211,6 +232,7 @@ def rank_zero_only(fn: Callable[..., None]) -> Callable[..., None]:
 _DICT_ITEMS_TYPE = type({}.items())
 _DICT_KEYS_TYPE = type({}.keys())
 _DICT_VALUES_TYPE = type({}.values())
+TRANSFORM_SUPPORTED_COLLECTION_TYPES = (tuple, list, dict, set, slice, _DICT_ITEMS_TYPE, _DICT_KEYS_TYPE, _DICT_VALUES_TYPE)
 
 
 def transform_recursively(data: Any, fn: Callable[[Any], Any],
@@ -219,14 +241,18 @@ def transform_recursively(data: Any, fn: Callable[[Any], Any],
 ) -> Any:
     """
     Transform the data with the given function, will recursively apply the function to the nested data.
+    Currently supported collection types is SUPPORTED_COLLECTION_TYPES.
     Args:
         data: the data to be transformed.
         fn: the function to apply.
         target_types: the target types to apply the function.
         collection_types: the collection types to apply the function to the nested data.
+            Will handle all supported types if None.
         skip_dict_keys: whether to skip the dict keys (for types dict, _DICT_ITEMS_TYPE).
             _DICT_KEYS_TYPE is not skipped, if you want to skip it, just remove it from the collection_types.
     """
+    if collection_types is None:
+        collection_types = TRANSFORM_SUPPORTED_COLLECTION_TYPES
     if isinstance(data, collection_types):
         if isinstance(data, tuple):
             return tuple(transform_recursively(t, fn, target_types, collection_types) for t in data)
@@ -323,6 +349,20 @@ def fields(model: TDataClass, /) -> TDataClass:
     This is a workaround for the lack of `__name__` of dataclass field.
     """
     return cast(TDataClass, _GetFields(model))
+
+
+class _UncheckedFields:
+    def __getattr__(self, item: str) -> Any:
+        return item
+
+
+TUncheckedClass = TypeVar("TAnyClass")
+def unchecked_fields(_: TUncheckedClass, /) -> TUncheckedClass:
+    """
+    This function is used to get the field names(in str) of any object without checking
+    This is a workaround for the lack of `__name__` of member.
+    """
+    return cast(TUncheckedClass, _UncheckedFields())
 
 
 @cache
@@ -461,7 +501,7 @@ class accum_mode:
 
 
 class AdamOptState(TypedDict):
-    step: int
+    step: torch.Tensor
     exp_avg: torch.Tensor
     exp_avg_sq: torch.Tensor
 
