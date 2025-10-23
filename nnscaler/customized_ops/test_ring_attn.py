@@ -20,7 +20,7 @@ class TestModule(torch.nn.Module):
         super(TestModule, self).__init__()
 
     def forward(self, q, k, v):
-        out = wrap_ring_attn_func(q, k, v)
+        out = wrap_ring_attn_func(q, k, v, causal=True)
         return out
 
 
@@ -56,7 +56,7 @@ if __name__ == "__main__":
     world_size = dist.get_world_size()
 
     set_seed(rank_id)
-    bsz = 1
+    bsz = 4
     seqlen = 8192
     nheads = 24
     d = 128
@@ -77,7 +77,7 @@ if __name__ == "__main__":
     k.requires_grad = True
     v.requires_grad = True
 
-    single_out = wrap_ring_attn_func(q, k, v)
+    single_out = wrap_ring_attn_func(q, k, v, causal=True)
     single_out.retain_grad()
     single_loss = single_out.sum()
     single_loss.backward()

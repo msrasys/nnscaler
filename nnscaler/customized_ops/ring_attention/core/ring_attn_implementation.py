@@ -4,7 +4,7 @@
 import torch
 import torch.distributed as dist
 from flash_attn.flash_attn_interface import _flash_attn_forward, _flash_attn_backward
-from .utils import shuffle_input, recover_output, GlobalMemoryBuffer, get_default_args
+from .utils import shuffle_input, recover_output, GlobalMemoryBuffer, get_default_args, all_gather, reduce_scatter
 
 
 _GLOBAL_MEMORY_BUFFER = GlobalMemoryBuffer()
@@ -120,8 +120,11 @@ def ring_flash_attn_backward(
     if causal:
         up_k = k[:, :(up_rank + 1) * block_len]
         up_v = v[:, :(up_rank + 1) * block_len]
+        up_dk = dk_buffer[:, :(up_rank + 1) * block_len]
+        up_dv = dv_buffer[:, :(up_rank + 1) * block_len]
     else:
         up_k, up_v = k, v
+        up_dk, up_dv = dk_buffer, dv_buffer
 
     params = get_default_args(_flash_attn_backward).copy()
     params.update(
@@ -133,8 +136,8 @@ def ring_flash_attn_backward(
             "out": up_out,
             "softmax_lse": up_lse,
             "dq": dq[:, :block_len],
-            "dk": dk_buffer[:, :(up_rank + 1) * block_len],
-            "dv": dv_buffer[:, :(up_rank + 1) * block_len],
+            "dk": up_dk,
+            "dv": up_dv,
             "dropout_p": dropout_p,
             "softmax_scale": softmax_scale,
             "causal": causal,
@@ -164,8 +167,11 @@ def ring_flash_attn_backward(
     if causal:
         down_k = k[:, :(down_rank + 1) * block_len]
         down_v = v[:, :(down_rank + 1) * block_len]
+        down_dk = down_dk_buffer[:, :(down_rank + 1) * block_len]
+        down_dv = down_dv_buffer[:, :(down_rank + 1) * block_len]
     else:
         down_k, down_v = k, v
+        down_dk, down_dv = down_dk_buffer, down_dv_buffer
 
     params = get_default_args(_flash_attn_backward).copy()
     params.update(
@@ -177,8 +183,8 @@ def ring_flash_attn_backward(
             "out": down_out,
             "softmax_lse": down_lse,
             "dq": dq[:, block_len:],
-            "dk": down_dk_buffer[:, :(down_rank + 1) * block_len],
-            "dv": down_dv_buffer[:, :(down_rank + 1) * block_len],
+            "dk": down_dk,
+            "dv": down_dv,
             "dropout_p": dropout_p,
             "softmax_scale": softmax_scale,
             "causal": causal,
@@ -199,12 +205,17 @@ def ring_flash_attn_backward(
     dk_buffer.add_(down_dk_buffer)
     dv_buffer.add_(down_dv_buffer)
 
-    dim_size = list(k.size())
-    dim_size[1] = dim_size[1] // world_size
-    dk = torch.empty(dim_size, dtype=k.dtype, device=k.device)
-    dv = torch.empty(dim_size, dtype=v.dtype, device=v.device)
-    dist.reduce_scatter_tensor(dk, dk_buffer, group=process_group)
-    dist.reduce_scatter_tensor(dv, dv_buffer, group=process_group)
+    bsz = q.size(0)
+    if bsz == 1:
+        dim_size = list(k.size())
+        dim_size[1] = dim_size[1] // world_size
+        dk = torch.empty(dim_size, dtype=k.dtype, device=k.device)
+        dv = torch.empty(dim_size, dtype=v.dtype, device=v.device)
+        dist.reduce_scatter_tensor(dk, dk_buffer, group=process_group)
+        dist.reduce_scatter_tensor(dv, dv_buffer, group=process_group)
+    else:
+        dk = reduce_scatter(dk_buffer, dim=1, process_group=process_group)
+        dv = reduce_scatter(dv_buffer, dim=1, process_group=process_group)
     
     return dq, dk, dv
 
@@ -237,14 +248,22 @@ class RingFlashAttnFunc(torch.autograd.Function):
             softmax_scale = q.shape[-1] ** (-0.5)
         assert alibi_slopes is None
 
+        bsz = q.size(0)
         q = shuffle_input(to_send=q, process_group=group)
+        k = k.contiguous()
+        v = v.contiguous()
         world_size = dist.get_world_size(group)
         dim_size = list(k.size())
         dim_size[1] = dim_size[1] * world_size
-        k_buffer = _GLOBAL_MEMORY_BUFFER.get_tensor(dim_size, k.dtype, "fwd_k")
-        v_buffer = _GLOBAL_MEMORY_BUFFER.get_tensor(dim_size, v.dtype, "fwd_v")
-        torch.distributed.all_gather_into_tensor(k_buffer, k, group=group)
-        torch.distributed.all_gather_into_tensor(v_buffer, v, group=group)
+        if bsz == 1:
+            k_buffer = _GLOBAL_MEMORY_BUFFER.get_tensor(dim_size, k.dtype, "fwd_k")
+            v_buffer = _GLOBAL_MEMORY_BUFFER.get_tensor(dim_size, v.dtype, "fwd_v")
+            # torch.distributed._all_gather_base function requires that the k and v tensors are contiguous.
+            torch.distributed.all_gather_into_tensor(k_buffer, k, group=group)
+            torch.distributed.all_gather_into_tensor(v_buffer, v, group=group)
+        else:
+            k_buffer = all_gather(k, dim=1, process_group=group)
+            v_buffer = all_gather(v, dim=1, process_group=group)
 
         out, up_lse, down_lse = ring_flash_attn_forward(
             group,
@@ -274,13 +293,18 @@ class RingFlashAttnFunc(torch.autograd.Function):
     def backward(ctx, dout, *args):
         dout = shuffle_input(to_send=dout, process_group=ctx.group)
         q, k, v, out, up_lse, down_lse = ctx.saved_tensors
+        bsz = q.size(0)
         world_size = dist.get_world_size(ctx.group)
         dim_size = list(k.size())
         dim_size[1] = dim_size[1] * world_size
-        k_buffer = _GLOBAL_MEMORY_BUFFER.get_tensor(dim_size, k.dtype, "fwd_k")
-        v_buffer = _GLOBAL_MEMORY_BUFFER.get_tensor(dim_size, v.dtype, "fwd_v")
-        torch.distributed.all_gather_into_tensor(k_buffer, k, group=ctx.group)
-        torch.distributed.all_gather_into_tensor(v_buffer, v, group=ctx.group)
+        if bsz == 1:
+            k_buffer = _GLOBAL_MEMORY_BUFFER.get_tensor(dim_size, k.dtype, "fwd_k")
+            v_buffer = _GLOBAL_MEMORY_BUFFER.get_tensor(dim_size, v.dtype, "fwd_v")
+            torch.distributed.all_gather_into_tensor(k_buffer, k, group=ctx.group)
+            torch.distributed.all_gather_into_tensor(v_buffer, v, group=ctx.group)
+        else:
+            k_buffer = all_gather(k, dim=1, process_group=ctx.group)
+            v_buffer = all_gather(v, dim=1, process_group=ctx.group)
 
         dq, dk, dv = ring_flash_attn_backward(
             ctx.group,
