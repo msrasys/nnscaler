@@ -191,7 +191,7 @@ class TorchFXPatcher:
         return TorchFXPatcher.format_import_statement_ori(name, obj, importer)
 
     @staticmethod
-    def is_impure_new(node: fx_node.Node):
+    def is_impure_new(node: fx_node.Node, impure_random: bool = True) -> bool:
         """
         Returns whether this op is impure, i.e. if its op is a placeholder or
         output, or if a call_function or call_module which is impure.
@@ -208,6 +208,39 @@ class TorchFXPatcher:
 
         # Check if an impure function.
         if node.op == "call_function":
+            schema = getattr(node.target, "_schema", None)
+            if schema is not None and schema.is_mutable:
+                # impure since it mutates inputs
+                return True
+
+            if impure_random:
+                if getattr(node.target, "_nondeterministic_seeded", False):
+                    # impure since it mutates RNG state
+                    return True
+
+            # Handle Python random functions that don't have _nondeterministic_seeded
+            # but still affect global RNG state (issue #151524)
+            # These should be impure regardless of impure_random setting to maintain
+            # consistency between eager and compiled execution
+            _random_functions = {
+                torch.rand,
+                torch.randn,
+                torch.randint,
+                torch.randperm,
+                torch.rand_like,
+                torch.randn_like,
+                torch.randint_like,
+                torch.normal,
+                torch.poisson,
+                torch.bernoulli,
+                torch.multinomial,
+            }
+
+            if node.target in _random_functions:
+                # All random operations are impure to ensure consistent behavior
+                # between eager and compiled execution, regardless of generator usage
+                return True
+
             return node.target in _side_effectful_functions
 
         # NOTE by nnscaler: we assume all method end with "_" is inplace operation,

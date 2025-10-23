@@ -1,10 +1,11 @@
 #  Copyright (c) Microsoft Corporation.
 #  Licensed under the MIT License.
 
-from typing import Tuple, List, Dict
+from typing import Tuple, List, Dict, Optional
 import torch
 from torch import Tensor
 import torch.distributed as dist
+import warnings
 
 from nnscaler.graph.parser.register import register_op
 from nnscaler.graph.function.dimops import IRDimops
@@ -13,6 +14,90 @@ from nnscaler.runtime.device import DeviceGroup
 from flash_attn import flash_attn_varlen_func
 from .core.ring_attn_varlen_implementation import llama3_flash_attn_prepare_cu_seqlens, llama3_flash_attn_varlen_func
 from .core.utils import gen_head_anno
+from .varlen_utils import shuffle_varlen, unshuffle_varlen
+
+# Try to import TransformerEngine with version check
+_HAS_TRANSFORMER_ENGINE = False
+_TE_VERSION_OK = False
+attn_forward_func_with_cp = None
+
+try:
+    import transformer_engine
+    _HAS_TRANSFORMER_ENGINE = True
+    
+    # Check version - require 2.2.0+
+    try:
+        from packaging import version
+        te_version = version.parse(transformer_engine.__version__)
+        required_version = version.parse("2.2.0")
+        _TE_VERSION_OK = te_version >= required_version
+        
+        if _TE_VERSION_OK:
+            # Try different import paths for different versions
+            try:
+                # For v2.5.0+
+                from transformer_engine.pytorch.attention.dot_product_attention.context_parallel import attn_forward_func_with_cp
+            except ImportError:
+                try:
+                    # For v2.2.0-v2.4.x
+                    from transformer_engine.pytorch.attention import attn_forward_func_with_cp
+                except ImportError:
+                    warnings.warn(
+                        "TransformerEngine attention module not available or incompatible. "
+                        "Falling back to basic ring attention implementation."
+                    )
+        else:
+            warnings.warn(
+                f"TransformerEngine version {transformer_engine.__version__} is too old. "
+                f"Require 2.2.0+. Falling back to basic ring attention implementation."
+            )
+    except ImportError:
+        # packaging not available, try to import anyway
+        try:
+            # Try different import paths for different versions
+            try:
+                # For v2.5.0+
+                from transformer_engine.pytorch.attention.dot_product_attention.context_parallel import attn_forward_func_with_cp
+            except ImportError:
+                # For v2.2.0-v2.4.x
+                from transformer_engine.pytorch.attention import attn_forward_func_with_cp
+            _TE_VERSION_OK = True
+        except (ImportError, AttributeError):
+            warnings.warn(
+                "TransformerEngine attention module not available or incompatible. "
+                "Falling back to basic ring attention implementation."
+            )
+            
+except ImportError:
+    warnings.warn(
+        "TransformerEngine not found. Falling back to basic ring attention implementation. "
+        "For better performance with context parallelism, install TransformerEngine 2.2.0+."
+    )
+
+
+def get_transformer_engine_info() -> Dict[str, any]:
+    """Get information about TransformerEngine availability and version."""
+    return {
+        "has_transformer_engine": _HAS_TRANSFORMER_ENGINE,
+        "version_ok": _TE_VERSION_OK,
+        "has_cp_function": attn_forward_func_with_cp is not None,
+        "version": getattr(transformer_engine, "__version__", None) if _HAS_TRANSFORMER_ENGINE else None,
+        "required_version": "2.2.0+",
+    }
+
+
+def print_transformer_engine_status():
+    """Print TransformerEngine status for debugging."""
+    info = get_transformer_engine_info()
+    print("TransformerEngine Status:")
+    print(f"  - Available: {info['has_transformer_engine']}")
+    if info['has_transformer_engine']:
+        print(f"  - Version: {info['version']}")
+        print(f"  - Version OK (>= 2.2.0): {info['version_ok']}")
+        print(f"  - CP Function Available: {info['has_cp_function']}")
+    else:
+        print(f"  - Required Version: {info['required_version']}")
+    print(f"  - Will use TE CP: {info['has_transformer_engine'] and info['version_ok'] and info['has_cp_function']}")
 
 
 def wrap_ring_attn_varlen_func(
@@ -68,6 +153,60 @@ def wrap_ring_attn_varlen_func(
     local_process_group = DeviceGroup().get_group(process_group)
     local_rank = dist.get_rank(local_process_group)
     local_world_size = dist.get_world_size(local_process_group)
+    assert local_world_size == len(process_group), "local_world_size should be the same with process_group size"
+
+    if local_process_group is None:
+        local_process_group = dist.group.WORLD
+
+    if window_size == (-1, -1):
+        # Use TransformerEngine with context parallelism if available and version is OK
+        if _HAS_TRANSFORMER_ENGINE and _TE_VERSION_OK and attn_forward_func_with_cp is not None:
+            shuffled_q = shuffle_varlen(q, cu_seqlens_q, process_group, local_process_group)
+            shuffled_k = shuffle_varlen(k, cu_seqlens_k, process_group, local_process_group)
+            shuffled_v = shuffle_varlen(v, cu_seqlens_k, process_group, local_process_group)
+
+            te_cu_seqlens_q = cu_seqlens_q.clone()
+            te_cu_seqlens_k = cu_seqlens_k.clone()
+            te_cu_seqlens_q = torch.cat(
+                [
+                    te_cu_seqlens_q,
+                    torch.tensor([cu_seqlens_q[-1].item()], dtype=te_cu_seqlens_q.dtype, device=te_cu_seqlens_q.device)
+                ]
+            )
+            te_cu_seqlens_k = torch.cat(
+                [
+                    te_cu_seqlens_k,
+                    torch.tensor([cu_seqlens_k[-1].item()], dtype=te_cu_seqlens_k.dtype, device=te_cu_seqlens_k.device)
+                ]
+            )
+            shuffled_output = attn_forward_func_with_cp(
+                True,
+                shuffled_q,
+                shuffled_k,
+                shuffled_v,
+                te_cu_seqlens_q,
+                te_cu_seqlens_k,
+                max_seqlen_q,
+                max_seqlen_k,
+                te_cu_seqlens_q,
+                te_cu_seqlens_k,
+                dropout_p,
+                local_process_group,
+                process_group,
+                # TODO: optimize the stream usage
+                torch.cuda.current_stream(),
+                "p2p", # "all_gather" version cannot work with thd format
+                qkv_format="thd",
+                attn_mask_type="padding_causal" if causal else "padding",
+            )
+            output = unshuffle_varlen(shuffled_output, cu_seqlens_q, process_group, local_process_group)
+            return output
+        else:
+            # Fallback to basic ring attention implementation
+            warnings.warn(
+                "TransformerEngine not available or version incompatible. "
+                "Using basic ring attention implementation which may be slower."
+            )
 
     (
         local_cu_seqlens_q,
@@ -139,7 +278,7 @@ def emit_ring(node: IRDimops, args: List[str], kwargs: Dict[str, str], runtime_d
     return f"{signature}({args})"
 
 
-def flash_attention_anno(query_states, key_states, value_states, cu_seq_lens_q, cu_seq_lens_k, alibi_slopes, *args, **kwargs) -> str:
+def flash_attention_anno(query_states, key_states, value_states, cu_seqlens_q, cu_seqlens_k, alibi_slopes, *args, **kwargs) -> str:
     q_anno, kv_anno = gen_head_anno(query_states, key_states, value_states, head_pos=1)
     if isinstance(alibi_slopes, IRTensor):
         return f'l {q_anno} hd^, l {kv_anno} hd^, l {kv_anno} vd^, e^, e^, {q_anno} -> l {q_anno} vd^'
