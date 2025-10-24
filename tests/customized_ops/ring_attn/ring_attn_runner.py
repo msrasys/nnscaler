@@ -25,8 +25,8 @@ class TestModule(torch.nn.Module):
     def forward(self, q, k, v):
         result = wrap_ring_attn_func(
             q, k, v,
-            # causal=self.causal,
-            # window_size=self.window_size
+            causal=self.causal,
+            window_size=self.window_size
         )
         return result
 
@@ -79,8 +79,11 @@ class RingAttnRunner(RingAttnRunnerBase):
     def run_single_gpu_reference(self, inputs, config):
         """Run single GPU reference implementation"""
         # Run single GPU version (this should call flash_attn internally when no process_group)
-        single_out = wrap_ring_attn_func(inputs['q'], inputs['k'], inputs['v'])
-        # single_out = wrap_ring_attn_func(inputs['q'], inputs['k'], inputs['v'], causal=config.causal, window_size=config.window_size)
+        single_out = wrap_ring_attn_func(
+            inputs['q'], inputs['k'], inputs['v'],
+            causal=config.causal,
+            window_size=config.window_size
+        )
         return single_out, [inputs['q'], inputs['k'], inputs['v']]
 
     def get_dummy_forward_args(self, inputs):

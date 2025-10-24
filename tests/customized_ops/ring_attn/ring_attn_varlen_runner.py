@@ -16,11 +16,17 @@ from nnscaler.customized_ops.ring_attention import wrap_ring_attn_varlen_func
 
 
 class TestModule(torch.nn.Module):
-    def __init__(self):
+    def __init__(self, causal=True, window_size=(-1, -1)):
         super(TestModule, self).__init__()
+        self.causal = causal
+        self.window_size = window_size
 
     def forward(self, q, k, v, cu_seqlens_q, cu_seqlens_k):
-        out = wrap_ring_attn_varlen_func(q, k, v, cu_seqlens_q, cu_seqlens_k, None)
+        out = wrap_ring_attn_varlen_func(
+            q, k, v, cu_seqlens_q, cu_seqlens_k, None,
+            causal=self.causal,
+            window_size=self.window_size
+        )
         return out
 
 
@@ -36,7 +42,7 @@ class RingAttnVarlenRunner(RingAttnRunnerBase):
         return 'ring_attn_varlen_func'
 
     def create_test_module(self, config) -> torch.nn.Module:
-        return TestModule()
+        return TestModule(causal=config.causal, window_size=config.window_size)
 
     def prepare_inputs(self, config, device, torch_dtype):
         """Prepare variable length inputs with cu_seqlens"""
@@ -60,7 +66,9 @@ class RingAttnVarlenRunner(RingAttnRunnerBase):
         """Run single GPU reference implementation"""
         single_out = wrap_ring_attn_varlen_func(
             inputs['q'], inputs['k'], inputs['v'],
-            inputs['cu_seqlens_q'], inputs['cu_seqlens_k'], None
+            inputs['cu_seqlens_q'], inputs['cu_seqlens_k'], None,
+            causal=config.causal,
+            window_size=config.window_size
         )
         single_out.retain_grad()
         return single_out, [inputs['q'], inputs['k'], inputs['v']]
