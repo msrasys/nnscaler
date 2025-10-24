@@ -2,7 +2,7 @@
 #  Licensed under the MIT License.
 
 """
-Ring Attention Variable Length Performance Benchmark
+Ring Attention Performance Benchmark
 Uses the shared benchmark framework to reduce code duplication.
 """
 
@@ -15,7 +15,7 @@ import torch
 from benchmark_base import RingAttnBenchmarkBase
 
 # Import ring attention implementation
-from nnscaler.customized_ops.ring_attention import wrap_ring_attn_varlen_func
+from nnscaler.customized_ops.ring_attention import wrap_ring_attn_func
 from nnscaler.customized_ops.ring_attention.core.utils import set_seed
 
 # Import test configuration (via the base class path setup)
@@ -24,29 +24,29 @@ sys.path.insert(0, tests_dir)
 from configs import DEFAULT_PERFORMANCE_CONFIGS
 
 
-class RingAttnVarlenBenchmark(RingAttnBenchmarkBase):
-    """Benchmark for Ring Attention Variable Length"""
+class RingAttnBenchmark(RingAttnBenchmarkBase):
+    """Benchmark for standard Ring Attention"""
 
     @property
     def function_signature(self) -> str:
-        return 'nnscaler.customized_ops.ring_attention.ring_attn_varlen.wrap_ring_attn_varlen_func'
+        return 'nnscaler.customized_ops.ring_attention.ring_attn.wrap_ring_attn_func'
 
     @property
     def function_name(self) -> str:
-        return "ring_attn_varlen"
+        return "ring_attn"
 
     def get_benchmark_name(self) -> str:
-        return "Ring Attention Variable Length"
+        return "Ring Attention"
 
     def create_test_module(self, config) -> torch.nn.Module:
-        """Create test module for variable length ring attention."""
+        """Create test module for standard ring attention."""
         class TestModule(torch.nn.Module):
             def __init__(self):
                 super(TestModule, self).__init__()
 
-            def forward(self, q, k, v, cu_seqlens_q, cu_seqlens_k):
-                return wrap_ring_attn_varlen_func(
-                    q, k, v, cu_seqlens_q, cu_seqlens_k, None,
+            def forward(self, q, k, v):
+                return wrap_ring_attn_func(
+                    q, k, v,
                     causal=getattr(config, 'causal', True),
                     window_size=getattr(config, 'window_size', (-1, -1))
                 )
@@ -54,41 +54,29 @@ class RingAttnVarlenBenchmark(RingAttnBenchmarkBase):
         return TestModule()
 
     def prepare_inputs(self, config, device, torch_dtype):
-        """Prepare input tensors for variable length sequence attention."""
+        """Prepare input tensors for standard ring attention."""
         set_seed(42)
         
-        # Get cu_seqlens from config or create default
-        if hasattr(config, 'cu_seqlens'):
-            cu_seqlens = config.cu_seqlens
-        else:
-            # Create default variable length sequences
-            seqlen = config.max_seqlen
-            cu_seqlens = [0, seqlen // 8, seqlen // 4, seqlen // 2, seqlen]
-
-        cu_seqlens_tensor = torch.tensor(cu_seqlens, dtype=torch.int32, device=device)
-        total_tokens = cu_seqlens[-1]
-
-        # Create input tensors
-        q = torch.randn(total_tokens, config.num_heads, config.head_dim, device=device, dtype=torch_dtype)
-        k = torch.randn(total_tokens, config.num_heads, config.head_dim, device=device, dtype=torch_dtype)
-        v = torch.randn(total_tokens, config.num_heads, config.head_dim, device=device, dtype=torch_dtype)
+        # Create input tensors with standard batch format
+        q = torch.randn(config.batch_size, config.max_seqlen, config.num_heads, config.head_dim, 
+                       device=device, dtype=torch_dtype)
+        k = torch.randn(config.batch_size, config.max_seqlen, config.num_heads, config.head_dim, 
+                       device=device, dtype=torch_dtype)
+        v = torch.randn(config.batch_size, config.max_seqlen, config.num_heads, config.head_dim, 
+                       device=device, dtype=torch_dtype)
 
         return {
             'q': q,
             'k': k, 
-            'v': v,
-            'cu_seqlens_q': cu_seqlens_tensor,
-            'cu_seqlens_k': cu_seqlens_tensor
+            'v': v
         }
 
     def run_single_gpu_reference(self, inputs, config):
         """Run single GPU reference implementation."""
         q, k, v = inputs['q'], inputs['k'], inputs['v']
-        cu_seqlens_q = inputs['cu_seqlens_q']
-        cu_seqlens_k = inputs['cu_seqlens_k']
         
-        output = wrap_ring_attn_varlen_func(
-            q, k, v, cu_seqlens_q, cu_seqlens_k, None,
+        output = wrap_ring_attn_func(
+            q, k, v,
             causal=getattr(config, 'causal', True),
             window_size=getattr(config, 'window_size', (-1, -1))
         )
@@ -109,29 +97,25 @@ class RingAttnVarlenBenchmark(RingAttnBenchmarkBase):
         return dummy_args
 
     def _create_legacy_config(self, **kwargs):
-        """Create a legacy configuration from individual parameters for varlen."""
-        class LegacyVarlenConfig:
+        """Create a legacy configuration from individual parameters for standard ring attention."""
+        class LegacyRingAttnConfig:
             def __init__(self, **kwargs):
-                self.name = "legacy_varlen_custom"
+                self.name = "legacy_ring_attn_custom"
                 self.max_seqlen = kwargs.get('seqlen', 16384)
                 self.num_heads = kwargs.get('nheads', 24)
                 self.head_dim = kwargs.get('head_dim', 128)
                 self.batch_size = kwargs.get('batch_size', 4)
+                self.total_tokens = self.batch_size * self.max_seqlen
                 self.dtype = "bf16"
                 self.causal = True
                 self.window_size = (-1, -1)
-                
-                # Create variable length sequences
-                seqlen = self.max_seqlen
-                self.cu_seqlens = kwargs.get('cu_seqlens', [0, seqlen // 8, seqlen // 4, seqlen // 2, seqlen])
-                self.total_tokens = self.cu_seqlens[-1]
 
-        return LegacyVarlenConfig(**kwargs)
+        return LegacyRingAttnConfig(**kwargs)
 
 
 def main():
     """Main entry point for the benchmark."""
-    parser = argparse.ArgumentParser(description="Ring Attention Variable Length Performance Benchmark")
+    parser = argparse.ArgumentParser(description="Ring Attention Performance Benchmark")
     parser.add_argument(
         "--config",
         type=str,
@@ -155,7 +139,7 @@ def main():
         "--seqlen",
         type=int,
         default=None,
-        help="Total sequence length (overridden by --config)",
+        help="Sequence length (overridden by --config)",
     )
     parser.add_argument(
         "--nheads",
@@ -173,7 +157,7 @@ def main():
         "--batch-size",
         type=int,
         default=None,
-        help="Batch size (number of sequences) (overridden by --config)",
+        help="Batch size (overridden by --config)",
     )
     # Timing parameters
     parser.add_argument(
@@ -199,7 +183,7 @@ def main():
     args = parser.parse_args()
 
     # Create benchmark instance
-    benchmark = RingAttnVarlenBenchmark()
+    benchmark = RingAttnBenchmark()
 
     if args.list_configs:
         benchmark.list_configurations()
