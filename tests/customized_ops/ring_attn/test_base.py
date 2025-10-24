@@ -39,6 +39,15 @@ class RingAttnTestBase(ABC):
         """Return the prefix for test names (e.g., 'ring_attn' or 'ring_attn_varlen')"""
         pass
 
+    def _check_gpu_availability(self, required_gpus: int):
+        """Check if enough GPUs are available and skip test if not"""
+        if not torch.cuda.is_available():
+            pytest.skip("CUDA is not available")
+        
+        available_gpus = torch.cuda.device_count()
+        if available_gpus < required_gpus:
+            pytest.skip(f"Test requires {required_gpus} GPUs, but only {available_gpus} available")
+
     def _get_project_root(self):
         """Get the absolute path to nnscaler root directory"""
         current_dir = os.path.dirname(__file__)  # tests/customized_ops/ring_attn/
@@ -66,8 +75,8 @@ class RingAttnTestBase(ABC):
 
     def run_test_subprocess(self, num_gpus: int, **kwargs):
         """Run test using subprocess with the configured runner script"""
-        if num_gpus > torch.cuda.device_count():
-            pytest.skip(f"Test requires {num_gpus} GPUs, but found {torch.cuda.device_count()}")
+        # Check GPU availability before running subprocess
+        self._check_gpu_availability(num_gpus)
 
         subprocess.run(
             self.get_bash_arguments(

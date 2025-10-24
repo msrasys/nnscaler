@@ -79,8 +79,19 @@ class RingAttnRunnerBase(ABC):
 
     def initialize_distributed(self):
         """Initialize distributed environment"""
+        # Check CUDA availability first
+        if not torch.cuda.is_available():
+            print("ERROR: CUDA is not available")
+            sys.exit(1)
+        
         rank = int(os.getenv("RANK", "0"))
         world_size = int(os.getenv("WORLD_SIZE", "1"))
+        
+        # Check if we have enough GPUs
+        available_gpus = torch.cuda.device_count()
+        if available_gpus < world_size:
+            print(f"ERROR: Test requires {world_size} GPUs, but only {available_gpus} available")
+            sys.exit(1)
 
         if dist.is_initialized():
             world_size = dist.get_world_size()
@@ -88,10 +99,19 @@ class RingAttnRunnerBase(ABC):
         else:
             device_count = torch.cuda.device_count()
             device = rank % device_count
-            torch.cuda.set_device(device)
+            try:
+                torch.cuda.set_device(device)
+            except Exception as e:
+                print(f"ERROR: Failed to set CUDA device {device}: {e}")
+                sys.exit(1)
 
-        print(f"[INFO] world_size:{world_size}, rank:{rank}")
-        dist.init_process_group(backend="nccl", world_size=world_size, rank=rank)
+        print(f"[INFO] world_size:{world_size}, rank:{rank}, available_gpus:{available_gpus}")
+        
+        try:
+            dist.init_process_group(backend="nccl", world_size=world_size, rank=rank)
+        except Exception as e:
+            print(f"ERROR: Failed to initialize process group: {e}")
+            sys.exit(1)
 
         # Initialize nnscaler
         nnscaler.init()

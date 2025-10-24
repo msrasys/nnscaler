@@ -20,7 +20,7 @@ class RingAttnTest(RingAttnTestBase):
 
     @property
     def runner_script_name(self) -> str:
-        return "run_ring_attn_correctness.py"
+        return "ring_attn_runner.py"
 
     @property
     def test_name_prefix(self) -> str:
