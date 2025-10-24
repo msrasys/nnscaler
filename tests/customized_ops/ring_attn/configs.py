@@ -162,6 +162,16 @@ GQA_CONFIGS = {
 
 # MQA is already covered by medium/large configs, so removed duplicate MQA_CONFIGS
 
+# Zigzag attention configurations (only supports causal=True and window_size=(-1, -1))
+ZIGZAG_CONFIGS = {
+    "zigzag_tiny": RingAttnConfig(2, 8, 64, 1024, "bf16", "zigzag_tiny", causal=True, window_size=(-1, -1)),
+    "zigzag_small": RingAttnConfig(4, 12, 128, 4096, "bf16", "zigzag_small", causal=True, window_size=(-1, -1)),
+    "zigzag_medium": RingAttnConfig(4, 24, 128, 8192, "bf16", "zigzag_medium", causal=True, window_size=(-1, -1)),
+    "zigzag_large": RingAttnConfig(4, 32, 128, 16384, "bf16", "zigzag_large", causal=True, window_size=(-1, -1)),
+    "zigzag_fp16": RingAttnConfig(4, 12, 128, 4096, "fp16", "zigzag_fp16", causal=True, window_size=(-1, -1)),
+    "zigzag_gqa": RingAttnConfig(4, 32, 128, 8192, "bf16", "zigzag_gqa", num_kv_heads=8, causal=True, window_size=(-1, -1)),
+}
+
 # All configurations combined
 ALL_CONFIGS = {
     **SMALL_CONFIGS,
@@ -169,6 +179,7 @@ ALL_CONFIGS = {
     **LARGE_CONFIGS,
     **MODEL_CONFIGS,
     **GQA_CONFIGS,
+    **ZIGZAG_CONFIGS,
 }
 
 # Default configurations for different test types
@@ -176,6 +187,7 @@ DEFAULT_CORRECTNESS_CONFIGS = ["tiny", "small", "medium"]
 DEFAULT_PERFORMANCE_CONFIGS = ["medium", "large"]
 DEFAULT_MULTI_GPU_CONFIGS = ["small", "medium"]
 DEFAULT_GQA_CONFIGS = ["qwen3_4b", "qwen3_14b", "qwen3_32b"]
+DEFAULT_ZIGZAG_CONFIGS = ["zigzag_tiny", "zigzag_small", "zigzag_medium"]
 
 
 def get_config(name: str) -> RingAttnConfig:
@@ -200,6 +212,8 @@ def list_configs(category: str = "all") -> List[str]:
         return list(MODEL_CONFIGS.keys())
     elif category == "gqa":
         return list(GQA_CONFIGS.keys())
+    elif category == "zigzag":
+        return list(ZIGZAG_CONFIGS.keys())
     elif category == "correctness":
         return DEFAULT_CORRECTNESS_CONFIGS
     elif category == "performance":
@@ -208,6 +222,8 @@ def list_configs(category: str = "all") -> List[str]:
         return DEFAULT_MULTI_GPU_CONFIGS
     elif category == "gqa_default":
         return DEFAULT_GQA_CONFIGS
+    elif category == "zigzag_default":
+        return DEFAULT_ZIGZAG_CONFIGS
     else:
         raise ValueError(f"Unknown category: {category}")
 
@@ -233,13 +249,20 @@ def get_mha_configs() -> dict:
     return {name: config for name, config in ALL_CONFIGS.items() if not config.is_gqa}
 
 
+def get_zigzag_configs() -> dict:
+    """Get all Zigzag attention configurations"""
+    return ZIGZAG_CONFIGS
+
+
 def filter_configs_by_attention_type(attention_type: str) -> dict:
-    """Filter configurations by attention type: 'mha', 'gqa', or 'mqa'"""
+    """Filter configurations by attention type: 'mha', 'gqa', 'mqa', or 'zigzag'"""
     if attention_type.lower() == "mha":
         return get_mha_configs()
     elif attention_type.lower() == "gqa":
         return get_gqa_configs()
     elif attention_type.lower() == "mqa":
         return get_mqa_configs()  # Will return empty dict since no dedicated MQA configs
+    elif attention_type.lower() == "zigzag":
+        return get_zigzag_configs()
     else:
-        raise ValueError(f"Unknown attention type: {attention_type}. Supported: 'mha', 'gqa', 'mqa'")
+        raise ValueError(f"Unknown attention type: {attention_type}. Supported: 'mha', 'gqa', 'mqa', 'zigzag'")

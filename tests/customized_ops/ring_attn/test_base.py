@@ -89,7 +89,7 @@ class RingAttnTestBase(ABC):
 
     # Common test methods that can be used by both ring_attn and ring_attn_varlen
 
-    def test_correctness_basic(self, dtype: str, config_name: str):
+    def run_correctness_basic(self, dtype: str, config_name: str):
         """Test correctness with different configurations"""
         num_gpus = 2  # Default to 2 GPUs for correctness tests
         config = get_config(config_name)
@@ -100,7 +100,7 @@ class RingAttnTestBase(ABC):
             config_name=config_name,
         )
 
-    def test_multi_gpu_scaling(self, num_gpus: int, config_name: str):
+    def run_multi_gpu_scaling(self, num_gpus: int, config_name: str):
         """Test with different numbers of GPUs"""
         self.run_test_subprocess(
             num_gpus=num_gpus,
@@ -108,7 +108,7 @@ class RingAttnTestBase(ABC):
             config_name=config_name,
         )
 
-    def test_comprehensive_configs(self, dtype: str):
+    def run_comprehensive_configs(self, dtype: str):
         """Test all available configurations (comprehensive test)"""
         num_gpus = 2
 
@@ -127,7 +127,7 @@ class RingAttnTestBase(ABC):
                 config_name=config_name,
             )
 
-    def test_gqa_correctness(self, dtype: str, config_name: str):
+    def run_gqa_correctness(self, dtype: str, config_name: str):
         """Test GQA correctness with Qwen model configurations"""
         num_gpus = 2
         config = get_config(config_name)
@@ -142,7 +142,7 @@ class RingAttnTestBase(ABC):
             config_name=config_name,
         )
 
-    def test_sliding_window(self, dtype: str, config_name: str):
+    def run_sliding_window(self, dtype: str, config_name: str):
         """Test with sliding window configurations"""
         num_gpus = 2
         config = get_config(config_name)
@@ -169,7 +169,7 @@ def create_parametrized_tests(test_class: RingAttnTestBase):
     def test_correctness(dtype, config_name):
         """Test correctness with different configurations"""
         instance = test_class()
-        instance.test_correctness_basic(dtype, config_name)
+        instance.run_correctness_basic(dtype, config_name)
 
     # Multi-GPU tests
     @pytest.mark.parametrize("num_gpus", [2, 4])
@@ -177,14 +177,14 @@ def create_parametrized_tests(test_class: RingAttnTestBase):
     def test_multi_gpu(num_gpus, config_name):
         """Test with different numbers of GPUs"""
         instance = test_class()
-        instance.test_multi_gpu_scaling(num_gpus, config_name)
+        instance.run_multi_gpu_scaling(num_gpus, config_name)
 
     # Comprehensive tests
     @pytest.mark.parametrize("dtype", ["bf16", "fp16"])
     def test_all_configs(dtype):
         """Test all available configurations (comprehensive test)"""
         instance = test_class()
-        instance.test_comprehensive_configs(dtype)
+        instance.run_comprehensive_configs(dtype)
 
     # GQA tests
     @pytest.mark.parametrize("dtype", ["bf16"])
@@ -192,7 +192,7 @@ def create_parametrized_tests(test_class: RingAttnTestBase):
     def test_gqa_correctness(dtype, config_name):
         """Test GQA correctness with Qwen model configurations"""
         instance = test_class()
-        instance.test_gqa_correctness(dtype, config_name)
+        instance.run_gqa_correctness(dtype, config_name)
 
     # Sliding window tests
     @pytest.mark.parametrize("dtype", ["bf16"])
@@ -200,7 +200,7 @@ def create_parametrized_tests(test_class: RingAttnTestBase):
     def test_sliding_window(dtype, config_name):
         """Test with sliding window configurations"""
         instance = test_class()
-        instance.test_sliding_window(dtype, config_name)
+        instance.run_sliding_window(dtype, config_name)
 
     return {
         f'test_{test_class().test_name_prefix}_correctness': test_correctness,

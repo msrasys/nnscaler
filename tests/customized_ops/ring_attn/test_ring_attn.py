@@ -41,10 +41,10 @@ test_ring_attn_sliding_window = test_functions['test_ring_attn_sliding_window']
 if __name__ == "__main__":
     # Run specific test if called directly
     test_instance = RingAttnTest()
-    test_instance.test_correctness_basic("bf16", "small")
+    test_instance.run_correctness_basic("bf16", "small")
 
     # Example of running GQA test
-    # test_instance.test_gqa_correctness("bf16", "qwen3_4b")
+    # test_instance.run_gqa_correctness("bf16", "qwen3_4b")
 
     # Example of running sliding window test
-    # test_instance.test_sliding_window("bf16", "small_window")
+    # test_instance.run_sliding_window("bf16", "small_window")

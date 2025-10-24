@@ -41,7 +41,7 @@ test_ring_attn_varlen_sliding_window = test_functions['test_ring_attn_varlen_sli
 if __name__ == "__main__":
     # Run specific test if called directly
     test_instance = RingAttnVarlenTest()
-    test_instance.test_correctness_basic("bf16", "small")
+    test_instance.run_correctness_basic("bf16", "small")
 
     # Example of running GQA test
-    # test_instance.test_gqa_correctness("bf16", "qwen3_4b")
+    # test_instance.run_gqa_correctness("bf16", "qwen3_4b")
