@@ -51,10 +51,6 @@ def wrap_ring_attn_func(q: Tensor, k: Tensor, v: Tensor, softmax_scale: Tensor=N
 
     local_process_group = DeviceGroup().get_group(process_group)
 
-    # In the RingFlashAttnFunc.apply function, the torch.distributed._all_gather_base function 
-    # requires that the k and v tensors be contiguous.
-    k = k.contiguous()
-    v = v.contiguous()
     output = RingFlashAttnFunc.apply(
         q,
         k,
@@ -67,7 +63,7 @@ def wrap_ring_attn_func(q: Tensor, k: Tensor, v: Tensor, softmax_scale: Tensor=N
         deterministic,
         return_attn_probs,
         local_process_group,
-    ).contiguous()
+    )
 
     return output
 

@@ -48,11 +48,11 @@ def log(msg, a, rank0_only=False):
         dist.barrier()
 
 
-def gen_head_anno(query_states, key_states, value_states):
-    if query_states.shape[2] != key_states.shape[2]:
-        assert query_states.shape[2] % key_states.shape[2] == 0
-        group_size = query_states.shape[2] // key_states.shape[2]
-        assert query_states.shape[2] == value_states.shape[2] * group_size
+def gen_head_anno(query_states, key_states, value_states, head_pos=2):
+    if query_states.shape[head_pos] != key_states.shape[head_pos]:
+        assert query_states.shape[head_pos] % key_states.shape[head_pos] == 0
+        group_size = query_states.shape[head_pos] // key_states.shape[head_pos]
+        assert query_states.shape[head_pos] == value_states.shape[head_pos] * group_size
         q_anno = f'(group_num {group_size})'
         kv_anno = 'group_num'
     else:
@@ -321,3 +321,23 @@ def recover_output(to_send: torch.Tensor,
         to_send_f[:, block_seq_len:] = res
         
     return to_send_f.contiguous()
+
+
+def all_gather(tensor: torch.Tensor, dim: int, process_group: dist.ProcessGroup):
+    tensor = tensor.contiguous() if not tensor.is_contiguous() else tensor
+    world_size = dist.get_world_size(process_group)
+    tensor_list = [torch.empty_like(tensor) for _ in range(world_size)]
+    tensor_list[torch.distributed.get_rank(process_group)] = tensor.data
+    torch.distributed.all_gather(tensor_list, tensor, group=process_group)
+    otensor = torch.concat(tuple(tensor_list), dim=dim)
+    return otensor
+
+
+def reduce_scatter(tensor: torch.Tensor, dim: int, process_group: dist.ProcessGroup):
+    world_size = dist.get_world_size(process_group)
+    itensors = list(tensor.chunk(world_size, dim))
+    for idx, t in enumerate(itensors):
+        itensors[idx] = t.contiguous() if not t.is_contiguous() else t
+    otensor = torch.empty_like(itensors[0], requires_grad=False)
+    torch.distributed.reduce_scatter(otensor, itensors, group=process_group)
+    return otensor
