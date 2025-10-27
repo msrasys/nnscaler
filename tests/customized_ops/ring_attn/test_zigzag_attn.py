@@ -13,6 +13,13 @@ Usage:
 """
 
 import pytest
+
+# Skip all tests if flash_attn_func is not available
+try:
+    from flash_attn import flash_attn_func
+except ImportError:
+    pytest.skip("flash_attn_func not available", allow_module_level=True)
+
 from test_base import RingAttnTestBase
 
 

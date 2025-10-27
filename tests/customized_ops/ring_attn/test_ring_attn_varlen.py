@@ -11,6 +11,12 @@ It uses the shared test base framework to avoid code duplication.
 import pytest
 import torch
 
+# Skip all tests if flash_attn_varlen_func is not available
+try:
+    from flash_attn import flash_attn_varlen_func
+except ImportError:
+    pytest.skip("flash_attn_varlen_func not available", allow_module_level=True)
+
 from test_base import RingAttnTestBase, create_parametrized_tests
 from configs import DEFAULT_CORRECTNESS_CONFIGS, DEFAULT_MULTI_GPU_CONFIGS, DEFAULT_GQA_CONFIGS
 
