@@ -171,7 +171,11 @@ class ProxyCallTransformer(TrackedTransformer):
             self.modified = True
             return self.generic_visit(ast.Call(
                 func=ast.Name(id=self.proxy_call_name, ctx=ast.Load()),
-                args=[node.func, *node.args],
+                args=[
+                    node.func,
+                    ast.fix_missing_locations(ast.Constant(value=ast.unparse(node))),
+                    *node.args
+                ],
                 keywords=node.keywords,
             ))
         else:
@@ -311,7 +315,7 @@ class OperatorPatcher:
                     # use func.__code__.co_filename to make the new function easily debuggable.
                     compile(new_tree, func_inner.__code__.co_filename, 'exec'),
                     {
-                        self.proxy_call_name: OperatorPatcherContext.patch_run,
+                        self.proxy_call_name: OperatorPatcherContext._patch_run,
                         **func_inner.__globals__,
                         **closure_dict,
                     },
@@ -346,10 +350,19 @@ class OperatorPatcherContext:
         return exc_type is None
 
     @staticmethod
-    def patch_run(func, *args, **kwargs):
+    def _patch_run(func, expr, *args, **kwargs):
         assert OperatorPatcherContext.ctx_tracer is not None
         assert OperatorPatcherContext.ctx_patcher is not None
         with wrap_utils.do_temp_call_origin():
-            OperatorPatcherContext.ctx_tracer.on_function_call(func)
+            OperatorPatcherContext.ctx_tracer.on_function_call(func, expr)
             new_func = OperatorPatcherContext.ctx_patcher.patch_func_or_module(func)
-        return new_func(*args, **kwargs)
+
+        ret = new_func(*args, **kwargs)
+
+        with wrap_utils.do_temp_call_origin():
+            OperatorPatcherContext.ctx_tracer.on_function_call_end()
+        return ret
+
+    @staticmethod
+    def patch_run(func, *args, **kwargs):
+        return OperatorPatcherContext._patch_run(func, '', *args, **kwargs)

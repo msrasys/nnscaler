@@ -1001,6 +1001,10 @@ def parallelize(
         if not pas_policy in _PREDEFINED_POLICIES:
             raise ValueError(f"Invalid pas_policy: {pas_policy}")
         pas_policy = _PREDEFINED_POLICIES[pas_policy]
+    else:
+        if not callable(pas_policy):
+            raise ValueError("pas_policy should be a callable or a predefined policy name")
+        pas_policy = partial(policies.fn, policy=pas_policy)
 
     is_module_class = inspect.isclass(module_or_module_class)
     module_class = module_or_module_class if is_module_class else module_or_module_class.__class__

@@ -90,6 +90,7 @@ class ConcreteTracer(TracerBase):
         self.scope = Scope("", None)
         self.module_stack = collections.OrderedDict()
         self.node_name_to_scope = {}
+        self.call_expr_stack = []
         self.strategy = TRACE_STRATEGY[strategy](self)
         self.record_frames = record_frames
         self.patcher = FunctionPatcher()
@@ -155,9 +156,13 @@ class ConcreteTracer(TracerBase):
                 break
             func = getattr(func, '__wrapped__', None)
 
-    def on_function_call(self, func):
+    def on_function_call(self, func, expr):
+        self.call_expr_stack.append(expr)
         self._track_cache_wrapped_function(func)
         self._check_torch_compile_function(func)
+
+    def on_function_call_end(self):
+        self.call_expr_stack.pop()
 
     @contextmanager
     def do_temp_call_origin(self):
@@ -208,6 +213,15 @@ class ConcreteTracer(TracerBase):
             node.meta['nn_module_stack'] = copy.copy(self.module_stack)
         else:
             node.meta['nn_module_stack'] = collections.OrderedDict()
+
+        if self.call_expr_stack:
+            last_call_expr = None
+            for item in reversed(self.call_expr_stack):
+                # if not found, leave last_call_expr as None
+                if item:
+                    last_call_expr = item
+                    break
+            node.meta['call_expr'] = last_call_expr
 
         def unwrap_nested_proxy(proxy: ep.ConcreteProxy):
             return pytree_utils.tree_map_only(ep.ConcreteProxy, unwrap_nested_proxy, proxy.value)

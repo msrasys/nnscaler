@@ -27,7 +27,7 @@ import torch
 
 from nnscaler.ir.unique import IDGenerator
 from nnscaler.ir.dtype import DTypeInfo
-from nnscaler.utils import _DICT_ITEMS_TYPE, _DICT_VALUES_TYPE
+from nnscaler.utils import _DICT_ITEMS_TYPE, _DICT_VALUES_TYPE, load_type
 
 
 NestedVarOrStatic = Union[Any, 'IRObject', List['IRObject'], 'IRTensor']
@@ -78,6 +78,13 @@ class IRCell:
         self._comment: Optional[str] = None
         # the module stack that preserves the hierarchy information
         self._module_stack: Optional[OrderedDict[str, Any]] = None
+        # the original call expression
+        # Note:
+        # 1. some cells may not have call expression if the cell is not from function call (e.g., __getitem__)
+        # 2. call_expr can be inaccurate when function call happens
+        # inside pytorch official module (like in torch.nn namespace) forward,
+        # (e.g., F.linear inside nn.Linear), in this case, call_expr will be module call expression.
+        self._call_expr: Optional[str] = None
         # the operation context information
         self._op_context: Optional[Dict[str, Any]] = None
 
@@ -378,6 +385,22 @@ class IRCell:
 
     @property
     def module_stack(self) -> Optional[OrderedDict[str, Any]]:
+        """
+        Get the module stack, which preserves the hierarchy information
+        of modules this cell belongs to.
+        For example, if this cell is from model.submodule.layers.0.block0.conv2d,
+        then the module stack will be:
+            OrderedDict([
+                ('model.submodule', <submodule class>),
+                ('model.submodule.layers.0.block0', <block0 class>),
+                ('model.submodule.layers.0.block0.conv2d', <conv2d class>),
+            ])
+
+        Please note
+        1. Root module (e.g., model) is not included in the stack.
+        2. Only modules that have `.forward` function are included in the stack,
+        so in above example, `torch.nn.ModuleList` is not included.
+        """
         return self._module_stack
 
     @module_stack.setter
@@ -386,6 +409,48 @@ class IRCell:
         Set the module stack
         """
         self._module_stack = stack
+
+    @property
+    def module_class_chain(self) -> list[type[torch.nn.Module]]:
+        """
+        Get the module chains the IRCell belongs to.
+        If module stack is None or empty, return [].
+        """
+        if not self._module_stack:
+            return []
+        return list(self._module_stack.values())
+
+    @property
+    def fqn(self) -> str:
+        """
+        Get the fully qualified module name the IRCell belongs to.
+        If module stack is None or empty, return ''.
+        """
+        if not self._module_stack:
+            return ''
+        return list(self._module_stack.keys())[-1]
+
+    @property
+    def call_expr(self) -> Optional[str]:
+        return self._call_expr
+
+    @call_expr.setter
+    def call_expr(self, expr: Optional[str]):
+        self._call_expr = expr
+
+    @property
+    def fn(self) -> Optional[Callable]:
+        """
+        Get the function of this cell based on its signature.
+        Return None if the function cannot be loaded. (e.g. virtual ops like `self_getattr`)
+
+        Returns:
+            Callable: the function object
+        """
+        try:
+            return load_type(self.signature)
+        except Exception as e:
+            return None
 
     @property
     def op_context(self) -> Optional[Dict[str, Any]]:
