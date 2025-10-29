@@ -120,9 +120,9 @@ def test_from_complex(tosub, requires_grad):
     assert type(obj[2]) == tensor_type and obj[2].parent.tid != obj_tensor_item.tid
 
     t1 = TensorMetadata(shape=(), dtype=torch.float, requires_grad=False,
-        stride=None, memory_format=None, is_quantized=None, qparams=None)
+        stride=None, memory_format=None, is_quantized=None, qparams=None, dynamic_dims=set())
     t2 = TensorMetadata(shape=(2,), dtype=torch.float, requires_grad=True,
-        stride=None, memory_format=None, is_quantized=None, qparams=None)
+        stride=None, memory_format=None, is_quantized=None, qparams=None, dynamic_dims=set())
 
     obj = IR.new('n', {'a': t1, 'b': t2}.values(),
         tensor_types=(TensorMetadata,),

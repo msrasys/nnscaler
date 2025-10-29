@@ -27,7 +27,7 @@ import torch
 
 from nnscaler.ir.unique import IDGenerator
 from nnscaler.ir.dtype import DTypeInfo
-from nnscaler.utils import _DICT_ITEMS_TYPE, _DICT_VALUES_TYPE, load_type
+from nnscaler.utils import _DICT_ITEMS_TYPE, _DICT_VALUES_TYPE, load_type, get_dynamic
 
 
 NestedVarOrStatic = Union[Any, 'IRObject', List['IRObject'], 'IRTensor']
@@ -544,6 +544,10 @@ class ValueTrack:
         dim 2: ValueTrack(value_id=50, dependencies=[30])   # it depends on input dim 2: m
     """
     value_id: int = field(default_factory=IDGenerator().gen_value_id)
+    # By default, we consider the value is constant
+    # unless it is set to not constant
+    # via mark_dynamic or it is from input or explicitly set in function.py
+    is_constant: bool = True
     # None: unknown dependencies
     # []: no dependencies
     deps: Optional[list[int]] = None
@@ -552,13 +556,12 @@ class ValueTrack:
         """
         Initialize this ValueTrack with no dependencies.
         """
-        self.with_dep(None)
+        self.deps = []
         return self
 
-    def with_dep(self, dep: Union[None, 'ValueTrack', 'IRObject'] = None) -> 'ValueTrack':
+    def add_dep(self, dep: Union[Any, 'ValueTrack', 'IRObject']) -> 'ValueTrack':
         """
         Initialize or add a dependency to the ValueTrack.
-        If dep is None, just initialize an empty dependency list, which means no dependencies.
         If dep is not IRObject or ValueTrack, do nothing.
         """
         if self.deps is None:
@@ -570,41 +573,76 @@ class ValueTrack:
         if isinstance(dep, IRTensor):
             raise TypeError("Cannot directly add IRTensor as dependency.")
 
-        dep = dep.value_track if isinstance(dep, IRObject) else dep
+        dep: ValueTrack = dep.value_track if isinstance(dep, IRObject) else dep
         dep_value_id = dep.value_id
         if dep_value_id not in self.deps:
             self.deps.append(dep_value_id)
+            self.is_constant = self.is_constant and dep.is_constant
 
         return self
 
-    def merge_deps(self, other: ValueTrack) -> 'ValueTrack':
+    def merge(self, other: ValueTrack) -> 'ValueTrack':
+        """
+        Merge another ValueTrack into this one.
+        The merged ValueTrack will have dependencies from both ValueTracks.
+        """
         if self.deps is None:
             self.deps = other.deps
         else:
             self.deps.extend(other.deps or [])
+
+        if self.deps is not None:
             self.deps = list(set(self.deps))
 
+        self.is_constant = self.is_constant and other.is_constant
+        return self
+
     @classmethod
-    def new(cls, deps: Iterable[Union[Any, 'ValueTrack', 'IRObject']]) -> 'ValueTrack':
+    def new(cls, deps: Iterable[Union[Any, 'ValueTrack', 'IRObject']], is_constant: Optional[bool] = None) -> 'ValueTrack':
         vt = cls()
+        if is_constant is not None:
+            vt.is_constant = is_constant
+        vt.deps = []
         for dep in deps:
-            vt.with_dep(dep)
+            vt.add_dep(dep)
         return vt
 
+    def mark_as_input(self) -> 'ValueTrack':
+        """
+        Mark this ValueTrack as graph input, which should be not constant and have no dependencies.
+        """
+        self.is_constant = False
+        self.deps = []
+        return self
+
+
+_missing_value = object()
 
 class IRObject:
     """
     IRObject serves as general data of IRGraph edge
+
+    There are two special IRObject for lazy evaluation:
+        1. IRObject.missing: a singleton object to represent missing object
+           It is used to tell parser that we don't know the real object yet.
+           The parser is supposed to create a new IRObject to replace it.
+           For example, all custom ops will have missing outputs.It relies on parser to set them.
+        2. IRObject(..., value=missing_value, ...): an object with unknown value
+           It is used to tell parser that we don't know the real value yet.
+           The parser is supposed to set the value.
+           We have this because we want ops to pass out `value_track` even when the value is unknown.
+           For example, `Item()` op in `function.py` will create such object.
     """
     # will be set after class definition
     missing: ClassVar['IRObject'] = None
+    missing_value: ClassVar[object] = _missing_value
 
     def __init__(
         self,
         name: Optional[str] = None,
         tid: Optional[int] = None,
-        value: Optional[None] = None,
-        is_constant: bool = True,
+        value: Any = _missing_value,
+        is_constant: Optional[bool] = None,
         *,
         value_track: Optional[ValueTrack] = None,
     ) -> None:
@@ -620,14 +658,19 @@ class IRObject:
                     2. val is model input, or is the result of a non-torch operation on another not constant IRObject
                 Please note is_constant flag is only used in parser,
                 so after parser, you can totally ignore this flag.
+                We keep this flag in IRObject for backward compatibility.
+                If both is_constant and value_track are provided,
+                `value_track.is_constant` will be overrided by this flag.
+            value_track (ValueTrack): the value track info of this object
         """
         self._id: int = tid if isinstance(tid, int) else IDGenerator().gen_tensor_id()
         self.name: str = name if name else 'obj'
         self._cell: Optional[IRCell] = None
         self._is_attr: bool = False
-        self._value: Optional[Any] = value
-        self._is_constant: bool = is_constant
+        self._value: Any = value
         self._value_track: ValueTrack = value_track or ValueTrack()
+        if is_constant is not None:
+            self._value_track.is_constant = is_constant
 
     def __hash__(self) -> int:
         return self._id
@@ -680,6 +723,14 @@ class IRObject:
         """Get example value"""
         return self._value
 
+    @value.setter
+    def value(self, val: Any):
+        self._value = val
+
+    def is_value_missing(self) -> bool:
+        """Check if the value is missing"""
+        return self._value is IRObject.missing_value
+
     @property
     def value_track(self) -> ValueTrack:
         """Get value track info"""
@@ -691,11 +742,11 @@ class IRObject:
 
     @property
     def is_constant(self) -> bool:
-        return self._is_constant
+        return self._value_track.is_constant
 
     @is_constant.setter
     def is_constant(self, val: bool):
-        self._is_constant = val
+        self._value_track.is_constant = val
 
     def __eq__(self, obj) -> bool:
         if not isinstance(obj, IRObject):
@@ -706,7 +757,7 @@ class IRObject:
         """Copy this object but remove the cell information"""
         if self is IRObject.missing:  # missing object is singleton
             return IRObject.missing
-        return IRObject(self.name, self._id, self._value, self._is_constant, value_track=self._value_track)
+        return IRObject(self.name, self._id, self._value, self.is_constant, value_track=self._value_track)
 
     def as_attr(self):
         """
@@ -821,6 +872,10 @@ class IR:
                     dtype=obj.dtype,
                     requires_grad=rg,
                 )
+
+                for dyn_idx in get_dynamic(obj):
+                    tensor.dim_tracks[dyn_idx].is_constant = False
+
                 if tosub:
                     tensor = tensor.tosub()
                 tensor._value = obj  # is required in SemanticModel.forward
@@ -1220,6 +1275,30 @@ class IRTensor(IRObject):
             raise ValueError("dim_tracks length must be equal to shape length")
         # None means starting a new dim track
         self._dim_tracks = tuple(v if v is not None else ValueTrack() for v in val)
+
+    def set_dim_track(self, dim: int, track: ValueTrack):
+        """
+        Set the track of a specific dimension
+        """
+        if dim < 0 or dim >= len(self._shape):
+            raise IndexError("dim out of range")
+        dim_tracks = list(self._dim_tracks)
+        dim_tracks[dim] = track
+        self._dim_tracks = tuple(dim_tracks)
+
+    def dim_constant(self, dim: int) -> bool:
+        """
+        Check if a dim is constant
+        """
+        if dim < 0 or dim >= len(self._shape):
+            raise IndexError("dim out of range")
+        return self._dim_tracks[dim].is_constant
+
+    def dims_constant(self) -> bool:
+        """
+        Check if all dims are constant
+        """
+        return all(track.is_constant for track in self._dim_tracks)
 
     def nelement(self) -> int:
         """

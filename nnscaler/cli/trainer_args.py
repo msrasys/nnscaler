@@ -20,7 +20,7 @@ import yaml
 import torch
 
 import nnscaler
-from nnscaler.utils import fields, fn_field, transform_recursively, load_type
+from nnscaler.utils import fields, fn_field, transform_recursively, load_type, copy_dynamic
 from nnscaler.parallel import ComputeConfig, build_optimizer, ReuseType, BroadcastGenFilesStrategy, _PREDEFINED_POLICIES
 from nnscaler.runtime.module import ParallelModule
 
@@ -123,9 +123,9 @@ def fix_input(input, input_dtype=None):
         return tuple(fix_input(v, input_dtype) for v in input)
     elif isinstance(input, torch.Tensor):
         if input.is_floating_point() and input_dtype is not None:
-            return input.to(input_dtype).cuda()
+            return copy_dynamic(input, input.to(input_dtype).cuda())
         else:
-            return input.cuda()
+            return copy_dynamic(input, input.cuda())
     return input
 
 
@@ -238,9 +238,17 @@ class ModuleParallelizeConfig:
     # we can parallelize submodules instead of creating whole model.
     # This is useful sometimes.
     args: Optional[Dict[str, Any]] = None
-    # the full qualified name of the function to generate dummy forward args
-    # Its type should be `Callable[[TrainerArgs],Dict[str, Any]]`
-    forward_args_gen_fn: str = None
+    # the full qualified name of the function to generate dummy inputs for forward
+    # Its type should be `Callable[[TrainerArgs], dict[str, Any]]`
+    # where the output dict is the kwargs for forward function of the module
+    # The tensors in the sample will be moved to GPU and converted to input_dtype by trainer.
+    forward_args_gen_fn: Optional[Callable[['TrainerArgs'], dict[str, Any]]] = fn_field(default=None)
+    # the full qualified name of the function to post process the dummy inputs for forward
+    # Note the tensors in the inputs have been moved to GPU and converted to input_dtype
+    # But you can still further process the sample,
+    # for example, mark some dims of tensors as dynamic
+    # (you can do it in `forward_args_gen_fn` as well)
+    forward_args_post_process_fn: Optional[Callable[['TrainerArgs', dict[str, Any]], dict[str, Any]]] = fn_field(default=None)
     # the model state dict file for tracing.
     # It is only used in tracing to serve as the initial state dict of the model.
     tracing_from_weights: str = None
@@ -289,8 +297,7 @@ class ModuleParallelizeConfig:
         return self.model_type(*args, **kwargs)
 
     def create_dummy_forward_args(self, trainer_args: 'TrainerArgs') -> dict[str, Any]:
-        forward_args_gen_fn = load_type(self.forward_args_gen_fn)
-        return forward_args_gen_fn(trainer_args)
+        return self.forward_args_gen_fn(trainer_args)
 
 
 @dataclass
@@ -605,9 +612,16 @@ class TrainerArgs(PrecisionMixin, PolicyMixin):
     # compile: compile the model but not training
     # run: compile and run the model
     run_mode: str = 'run'
-    # the full qualified name of the function to generate dummy sample for forward
+    # the full qualified name of the function to generate dummy sample
     # Its type should be `Callable[[TrainerArgs], Any]`
-    dummy_sample_gen_fn: str = None
+    # The tensors in the sample will be moved to GPU and converted to input_dtype by trainer.
+    dummy_sample_gen_fn: Optional[Callable[['TrainerArgs'], Any]] = fn_field(default=None)
+    # the full qualified name of the function to post process the dummy sample
+    # Note the tensors in the sample have been moved to GPU and converted to input_dtype
+    # But you can still further process the sample,
+    # for example, you can use this function to mark some dims of tensors as dynamic
+    # when you don't use `dummy_sample_gen_fn` or don't handle dynamic dims in it,
+    dummy_sample_post_process_fn: Optional[Callable[['TrainerArgs', Any], Any]] = fn_field(default=None)
     # the model state dict file for tracing.
     # It is only used in tracing to serve as the initial state dict of the model.
     tracing_from_weights: str = None
@@ -822,12 +836,6 @@ class TrainerArgs(PrecisionMixin, PolicyMixin):
         return load_type(self.optimizer.aggregate_outputs_fn)
 
     @property
-    def resolved_dummy_sample_gen_fn(self):
-        if not self.dummy_sample_gen_fn:
-            return None
-        return load_type(self.dummy_sample_gen_fn)
-
-    @property
     def scaling_factor(self):
         return self.compute_config.runtime_ngpus // self.compute_config.plan_ngpus
 
@@ -856,7 +864,7 @@ class TrainerArgs(PrecisionMixin, PolicyMixin):
         init_env_fn = load_type(self.init_env_fn)
         init_env_fn(trainer)
 
-    def get_resolved_var(self, fqn: str) -> Any:
+    def get_resolved_var(self, fqn: str, *, default: Any = None) -> Any:
         """
         Get a resolved variable from the vars dictionary.
         The fqn is a full qualified name of the variable, e.g. 'x.y.z'.
@@ -865,7 +873,7 @@ class TrainerArgs(PrecisionMixin, PolicyMixin):
         var = self._vars
         for part in parts:
             if part not in var:
-                raise ValueError(f"Variable {fqn} not found in vars")
+                return default
             var = var[part]
         return var
 

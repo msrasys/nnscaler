@@ -130,7 +130,7 @@ class FxModuleParser:
         for idx, placeholder in enumerate(placeholders):
             if not isinstance(inputs[idx], IRObject):
                 obj = IRObject(name=placeholder.target, value=inputs[idx], is_constant=False)
-                obj.value_track.with_no_dep()
+                obj.value_track.mark_as_input()
                 inputs[idx] = obj
                 self.value_tracker.track_values([obj])
                 self.frame.set_var(placeholder.name, obj)
@@ -141,7 +141,7 @@ class FxModuleParser:
             ir_nodes = self._parse_node(node)
             all_ir_nodes += ir_nodes
 
-        self.value_tracker.track_nodes(all_ir_nodes)
+        self.value_tracker.complete_tracking(all_ir_nodes)
 
         # get graph outputs
         outputs = [self.frame.get_var(node.name) for node in self.module.graph.nodes if node.op == 'output']
@@ -189,15 +189,15 @@ class FxModuleParser:
         )
 
         if node.op == 'placeholder':
-            def set_no_dep(x: IRObject):
+            def mark_as_input(x: IRObject):
                 if isinstance(x, IRTensor):
                     # let's the value_track of tensor stay None(unknown)
                     # because we don't care about it.
                     for dt in x.dim_tracks:
                         dt.with_no_dep()
                 else:
-                    x.value_track.with_no_dep()
-            IR.modify_objects(val, set_no_dep)
+                    x.value_track.mark_as_input()
+            IR.modify_objects(val, mark_as_input)
 
         self.frame.add_var(node.name, val)
 
@@ -374,8 +374,33 @@ class FxModuleParser:
                     # We need to copy dim tracks
                     # As we will use frame version as node output, instead of the placeholder created in function.py
                     for dim in range(len(vals[i].shape)):
-                        vals[i].dim_tracks[dim].merge_deps(ir_node.output(i).dim_tracks[dim])
+                        vals[i].dim_tracks[dim].merge(ir_node.output(i).dim_tracks[dim])
                 ir_node.set_output(i, vals[i])
+            elif isinstance(ir_node.output(i), IRObject) and ir_node.output(i).is_value_missing():
+                # output is IRObject with missing value
+                # we need to set it with the value from frame
+                assert not IR.contains_object(vals[i], lambda x: isinstance(x, IRTensor)), \
+                    f'Output {i} of node {node} is expected to be IRObject, but got tensor: {vals[i]}'
+                ir_node.output(i).value = IR.try_unwrap(vals[i])
+            else:
+                # Currently we don't support missing-value IRObject in tuple/list/dict/...
+                # TODO: add support when needed
+                assert not IR.contains_object(ir_node.output(i), lambda x: not isinstance(x, IRTensor) and x.is_value_missing()), \
+                    f'Output {i} of node {node} contains missing value: {ir_node.output(i)}'
+
+        # per-op value tracking via its annotation
+        # TODO:
+        # This may be not accurate because many ops in function.py are not properly annotated their value deps
+        # Two ways to improve it:
+        # 1. add value deps annotation for those ops in function.py
+        # 2. use global data flow analysis to track value deps
+        #    a. add all nodes without folding
+        #    b. use value_tracker.track_nodes to analyze value deps for all nodes
+        #    c. remove nodes that can be folded.
+        # It is not easy because some op logic in function.py works differently
+        # when its inputs are constant or not.
+        # For now, we just use per-op value tracking for simplicity.
+        self.value_tracker.track_nodes([ir_node])
 
         # update frame with ir output
         # Please note when there is only one output, we will unwrap it from `ir_node.outputs()` here
@@ -423,7 +448,17 @@ class FxModuleParser:
             and not ir_node.signature.startswith(nnscaler.runtime.function.__name__ + '.')\
             and not IR.contains_object(ir_node.output(0), lambda x: isinstance(x, IRTensor) or not x.is_constant) \
             and _is_primitive_type(cval := IR.try_unwrap(ir_node.output(0))):
+            # TODO:
+            # This will break the value tracking graph
+            # for example, if not folded:
+            #  value1 -> op1 -> value2 -> op2 -> value3 -> op3
+            # if op2 is folded, then op3 will not know the value1 dependency
+            # So the value tracking becomes:
+            #  value1 -> op1     value3 -> op3
+            # In many cases, op1 and op3 can be connected by other ops,
+            # But when this becomes a problem, we need to fix it by using global data flow analysis.
             self.frame.set_var(node.name, cval)
+            self.value_tracker.untrack_node(ir_node)
             return []
         else:
             return [ir_node]
@@ -460,6 +495,7 @@ class FxModuleParser:
 
                 # Parameters and buffers have no dependency on other values
                 for dt in tensor.dim_tracks:
+                    dt.is_constant = True
                     dt.with_no_dep()
 
                 self.frame.add_attr(tensor, concrete_value, node.target)
@@ -483,6 +519,7 @@ class FxModuleParser:
             else:
                 self.frame.set_var(node.name, concrete_value)
 
+        self.value_tracker.track_nodes(ir_nodes)
         return ir_nodes
 
     def _parse_prim_output_node(self, node: torch.fx.Node) -> List[IRCell]:

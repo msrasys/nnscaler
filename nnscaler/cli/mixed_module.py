@@ -166,17 +166,22 @@ class ModuleParallelizeConfigAdapter(PrecisionMixin, PolicyMixin):
 
     def create_dummy_forward_args(self, dummy_input) -> dict[str, Any]:
         if self.parallel_module:
-            return self.fix_input(
+            forward_args = self.fix_input(
                 self.parallel_module.create_dummy_forward_args(self.trainer_args)
             )
-
-        # forward args of whole model
-        arg_names = list(
-            inspect.signature(
-                inspect.unwrap(getattr(self.model_type, 'forward'))
-            ).parameters.keys()
-        )
-        return {arg_names[1]: self.fix_input(dummy_input)}  # arg_names[0] is self
+            if self.parallel_module.forward_args_post_process_fn:
+                forward_args = self.parallel_module.forward_args_post_process_fn(self.trainer_args, forward_args)
+            return forward_args
+        else:
+            # forward args of whole model
+            arg_names = list(
+                inspect.signature(
+                    inspect.unwrap(getattr(self.model_type, 'forward'))
+                ).parameters.keys()
+            )
+            # dummy input is already fixed and post processed by trainer
+            forward_args = {arg_names[1]: dummy_input}  # arg_names[0] is self
+            return forward_args
 
     def resolve_compute_config(self):
         compute_config = copy.deepcopy(self.compute_config)

@@ -121,6 +121,8 @@ def pas_tp(graph: IRGraph, cfg: 'ComputeConfig'):
                 random.shuffle(configs)
                 for (idx, dim) in configs:
                     if node.input(idx).shape[dim] % len(devs) != 0: continue
+                    # only partition when all input tensors are constant on this dim
+                    if not node.input(idx).dim_tracks[dim].is_constant: continue
                     if node.algorithm('dim').satisfy(idx=idx, dim=dim, num=len(devs)):
                         _tp(graph, node, devs, idx, dim)
                         break

@@ -9,49 +9,101 @@ from nnscaler.ir.operator import IRFwOperation
 
 
 class ValueTracker:
+    """
+    Example:
+    >>> vt = ValueTracker()
+    >>> vt.track_value(input1)
+    >>> vt.track_value(input2)
+    >>> ...
+    >>> vt.track_nodes([node1])
+    >>> vt.track_nodes([node2])
+    >>> vt.untrack_node(node2)  # when node2 is folded
+    >>> vt.track_nodes([node3])
+    >>> ...
+    >>> vt.complete_tracking([node1, node3, ...])  # pass all tracked nodes here
+    """
     def __init__(self):
         # value_id -> ValueTrack
         # Please note some ValueTracks may be merged together (from annotation)
         # So the key can be different from the id of the ValueTrack
         self._vtm: dict[int, ValueTrack] = {}
-        self._equiv_value_ids: dict[int, set] = {}
+        self._equiv_value_ids: dict[int, set[int]] = {}
+        # store removed value ids
+        # used to delay the removal of value tracks in deps
+        self._removed_value_ids: set[int] = set()
 
-    def track_values(self, objs: list[Any]):
+    def _add_track_value(self, value: ValueTrack):
+        if value.value_id not in self._vtm:
+            # always use the updated value track in self._vtm
+            self._vtm[value.value_id] = value
+
+        if value.value_id not in self._equiv_value_ids:
+            self._equiv_value_ids[value.value_id] = {value.value_id}
+
+    def track_values(self, objs: list[Any]) -> set[int]:
+        """
+        Track the value tracks of the given objects.
+        Args:
+            objs (list[Any]): the objects to be tracked
+        Returns:
+            set[int]: the set of value ids tracked
+        """
+        value_ids = set()
         for obj in objs:
-            self.track_value(obj)
+            value_ids.update(self._track_value(obj))
+        return value_ids
 
-    def track_value(self, obj: Any):
-        for item in IR.get_objects(obj):
-            if isinstance(item, IRTensor):
-                for dt in item.dim_tracks:
-                    self._vtm[dt.value_id] = dt
-            elif isinstance(item, IRObject):
-                self._vtm[item.value_track.value_id] = item.value_track
+    def _track_value(self, value: Any):
+        for obj in IR.get_objects(value):
+            if isinstance(obj, IRTensor):
+                for dt in obj.dim_tracks:
+                    self._add_track_value(dt)
+                    yield dt.value_id
+            else:
+                assert isinstance(obj, IRObject)
+                self._add_track_value(obj.value_track)
+                yield obj.value_track.value_id
 
-    def _update_track_value(self, obj: Any):
+    def _update_track_value(self, obj: IRObject):
         if isinstance(obj, IRTensor):
             new_dim_tracks = []
             for dt in obj.dim_tracks:
                 new_dim_tracks.append(self._vtm[dt.value_id])
             obj.dim_tracks = new_dim_tracks
-        elif isinstance(obj, IRObject):
+        else:
+            assert isinstance(obj, IRObject)
             obj.value_track = self._vtm[obj.value_track.value_id]
+
+    def _update_constness(self, obj: IRObject):
+        if isinstance(obj, IRTensor):
+            for dt in obj.dim_tracks:
+                dt.is_constant = dt.is_constant and all(self._vtm[dep].is_constant for dep in dt.deps or [])
+        else:
+            assert isinstance(obj, IRObject)
+            obj.value_track.is_constant = obj.value_track.is_constant and all(self._vtm[dep].is_constant for dep in obj.value_track.deps or [])
 
     def track_nodes(self, nodes: list[IRFwOperation]):
         """
         Track the value tracks of the input and output objects in the given nodes.
         Here we assume the nodes are topologically sorted.
+
+        Please note we only update the tracks of nodes in arguments.
+        For nodes not in arguments, their tracks are not updated.
+
+        Args:
+            nodes (list[IRFwOperation]): the nodes to be tracked
         """
         # collect all value tracks from nodes
+        if not nodes:
+            return
+
+        # collect all involved value ids from nodes
+        node_value_ids = set()
         for node in nodes:
             for obj in node.iobjs():
-                self.track_value(obj)
+                node_value_ids.update(self._track_value(obj))
             for obj in node.oobjs():
-                self.track_value(obj)
-
-        # init equivalence classes
-        for vt in self._vtm.values():
-            self._equiv_value_ids[vt.value_id] = {vt.value_id}
+                node_value_ids.update(self._track_value(obj))
 
         # collect extra value tracks from dimops
         for node in nodes:
@@ -59,37 +111,117 @@ class ValueTracker:
                 self._track_dims(node)
 
         # merge equivalent value tracks together
-        for value_id, equiv_ids in self._equiv_value_ids.items():
+        done_value_ids = set()
+        for value_id in node_value_ids:
+            equiv_ids = self._equiv_value_ids[value_id]
+
             min_value_id = min(equiv_ids)
-            if value_id != min_value_id:
+            if min_value_id in done_value_ids:
                 continue
+            done_value_ids.add(min_value_id)
 
             # use the smallest id as the representative
             rep_one = self._vtm[min_value_id]
             for vid in equiv_ids:
-                if vid == min_value_id:
+                if vid == min_value_id or self._vtm[vid] is rep_one:
                     continue
                 # TODO: how we merge dependencies?
                 # current we take union (Union may be too strict)
                 if rep_one.deps is None:
                     rep_one.deps = self._vtm[vid].deps
                 elif self._vtm[vid].deps is not None:
-                    rep_one.deps = list(set(rep_one.deps).union(set(self._vtm[vid].deps)))
+                    # deps can still have duplicates here
+                    # because merging of the rest value tracks haven't been done yet
+                    # NOTE:
+                    # 1. this duplication is temporary,
+                    # Duplicated value ids will be removed when we touch the same value track again
+                    # in future track_nodes call.
+                    # 2. duplication is not harmful for correctness
+                    rep_one.deps = list(
+                        set(rep_one.deps)
+                        .union(self._vtm[vid].deps)
+                        .difference(self._removed_value_ids)
+                    )
                 self._vtm[vid] = rep_one
 
-        # dedup dependencies
-        # Here we will replace dependencies with their representative value tracks
+        self._propagate_tracks(nodes)
+
+    def untrack_node(self, node: IRFwOperation):
+        """
+        Untrack the value tracks of output objects in the given node.
+        This function is used when we fold a node from the graph.
+
+        Args:
+            node (IRFwOperation): the node to be untracked
+        """
+        input_value_ids = set()
+        for obj in node.iobjs():
+            if isinstance(obj, IRTensor):
+                for dt in obj.dim_tracks:
+                    input_value_ids.add(dt.value_id)
+            else:
+                assert isinstance(obj, IRObject)
+                input_value_ids.add(obj.value_track.value_id)
+
+        for obj in node.oobjs():
+            # we can only remove value tracks that are not used by inputs
+            if isinstance(obj, IRTensor):
+                for dt in obj.dim_tracks:
+                    if dt.value_id not in input_value_ids:
+                        self._removed_value_ids.add(dt.value_id)
+            else:
+                assert isinstance(obj, IRObject)
+                if obj.value_track.value_id not in input_value_ids:
+                    self._removed_value_ids.add(obj.value_track.value_id)
+
+    def complete_tracking(self, nodes: list[IRFwOperation]):
+        """
+        Complete the tracking process.
+        Should be called after all nodes are tracked.
+        """
+        # remove all removed value ids for vtm
+        # note we don't remove them from equivalence classes
+        for removed_id in self._removed_value_ids:
+            if self._vtm[removed_id].value_id == removed_id \
+                and (new_equiv_cls := self._equiv_value_ids[removed_id].difference(self._removed_value_ids)):
+                # change the representative value id of this equivalence class
+                # NOTE:
+                # In current usage, code should not reach here.
+                # As we remove value tracks only for constant irobjects,
+                # and all equivalent value tracks should be removed together.
+                self._vtm[removed_id].value_id = min(new_equiv_cls)
+            self._vtm.pop(removed_id, None)
+
+        # replace dependencies with their representative value tracks
         # which can introduce some duplicates
+        # So we use `set` to further dedup dependencies
         for vt in self._vtm.values():
             if vt.deps is not None:
-                vt.deps = list(set(self._vtm[d].value_id for d in vt.deps))
+                vt.deps = list(set(
+                    self._vtm[d].value_id for d in vt.deps
+                    if d not in self._removed_value_ids
+                ))
 
+        self._propagate_tracks(nodes)
+
+    def _propagate_tracks(self, nodes: list[IRFwOperation]):
+        """
+        Update value tracks and constantness information of the input and output objects
+        in the given nodes.
+        """
         # propagate the merged value tracks back to nodes
         for node in nodes:
             for obj in node.iobjs():
                 self._update_track_value(obj)
             for obj in node.oobjs():
                 self._update_track_value(obj)
+
+        # propagate the constantness information back to nodes
+        for node in nodes:
+            for obj in node.iobjs():
+                self._update_constness(obj)
+            for obj in node.oobjs():
+                self._update_constness(obj)
 
     def _track_dims(self, node: IRDimops):
         """

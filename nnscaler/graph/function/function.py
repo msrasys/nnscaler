@@ -377,11 +377,36 @@ def creation_function_size_check(op_name, size, *arg_size) -> Tuple[Union[int, I
             raise ValueError(f"get illegal input size={size}, arg_size={arg_size} in {op_name}")
         # convert scalar to shape (1,) tensor, nnscaler don't support empty shape [] now.
         if len(size_val) == 0:
-            _logger.warn(f"detect tensor creation function {op_name} create a scalar, force it to create a shape [1] tensor instead")
+            _logger.warning(f"detect tensor creation function {op_name} create a scalar, force it to create a shape [1] tensor instead")
             size = (1,)
     else:
         raise ValueError(f"get unknown input type size={size} in {op_name}")
     return size
+
+
+def creation_function_dim_track(resolved_size: Union[IRObject, tuple[Union[int, IRObject]]]) -> list[ValueTrack]:
+    if isinstance(resolved_size, IRObject):
+        assert isinstance(resolved_size.value, (tuple, list))
+        # all dims dependent on resolved_size
+        return [ValueTrack.new([resolved_size]) for _ in resolved_size.value]
+
+    dim_tracks = []
+    for dim in resolved_size:
+        if isinstance(dim, IRObject):
+            dim_tracks.append(ValueTrack.new([dim]))
+        else:
+            # no dim dependency when dim is not IRObject
+            dim_tracks.append(ValueTrack.new([]))
+    return dim_tracks
+
+
+def creation_function_set_dim_tracks(op: IRDimops, resolved_size: Union[IRObject, tuple[Union[int, IRObject]]]) -> IRDimops:
+    # Output will be replaced in Parser,
+    # Here we just pass the value tracks out
+    output = IRFullTensor(_unwrap_value(resolved_size))
+    output.dim_tracks = creation_function_dim_track(resolved_size)
+    op.set_output(0, output)
+    return op
 
 
 def Empty(size, *arg_size, out=None, dtype=None, layout=None, device=None, requires_grad=False,
@@ -399,7 +424,10 @@ def Empty(size, *arg_size, out=None, dtype=None, layout=None, device=None, requi
     kwargs = {'size': size, 'requires_grad': requires_grad,
               'dtype': dtype, 'pin_memory': pin_memory}
     anno, rules = _get_creator_anno_rules(_unwrap_value(size), True)
-    return IRDimops(Empty, 'empty', signature, [anno], [], rules, **kwargs)
+    return creation_function_set_dim_tracks(
+        IRDimops(Empty, 'empty', signature, [anno], [], rules, **kwargs),
+        size
+    )
 
 
 def Zeros(size, *arg_size, out=None, dtype=None, layout=None,
@@ -415,7 +443,10 @@ def Zeros(size, *arg_size, out=None, dtype=None, layout=None,
     size = creation_function_size_check('torch.zeros', size, *arg_size)
     kwargs = {'size': size, 'requires_grad': requires_grad, 'dtype': dtype}
     anno, rules = _get_creator_anno_rules(_unwrap_value(size), True)
-    return IRDimops(Zeros, 'zeros', signature, [anno], [], rules, **kwargs)
+    return creation_function_set_dim_tracks(
+        IRDimops(Zeros, 'zeros', signature, [anno], [], rules, **kwargs),
+        size
+    )
 
 
 def Ones(size, *arg_size, out=None, dtype=None, layout=None,
@@ -431,7 +462,10 @@ def Ones(size, *arg_size, out=None, dtype=None, layout=None,
     size = creation_function_size_check('torch.ones', size, *arg_size)
     kwargs = {'size': size, 'requires_grad': requires_grad, 'dtype': dtype}
     anno, rules = _get_creator_anno_rules(_unwrap_value(size), True)
-    return IRDimops(Ones, 'ones', signature, [anno], [], rules, **kwargs)
+    return creation_function_set_dim_tracks(
+        IRDimops(Ones, 'ones', signature, [anno], [], rules, **kwargs),
+        size
+    )
 
 
 def Rand(size, *arg_size, out=None, dtype=None, layout=None, device=None, requires_grad=False,
@@ -449,7 +483,10 @@ def Rand(size, *arg_size, out=None, dtype=None, layout=None, device=None, requir
     kwargs = {'size': size, 'requires_grad': requires_grad,
               'dtype': dtype, 'pin_memory': pin_memory}
     anno, rules = _get_creator_anno_rules(_unwrap_value(size), True)
-    return IRDimops(Rand, 'rand', signature, [anno], [], rules, **kwargs)
+    return creation_function_set_dim_tracks(
+        IRDimops(Rand, 'rand', signature, [anno], [], rules, **kwargs),
+        size
+    )
 
 
 def Randn(size, *arg_size, generator=None, out=None, dtype=None, layout=None, device=None, requires_grad=False,
@@ -467,7 +504,10 @@ def Randn(size, *arg_size, generator=None, out=None, dtype=None, layout=None, de
     kwargs = {'size': size, 'requires_grad': requires_grad,
               'dtype': dtype, 'pin_memory': pin_memory}
     anno, rules = _get_creator_anno_rules(_unwrap_value(size), True)
-    return IRDimops(Randn, 'randn', signature, [anno], [], rules, **kwargs)
+    return creation_function_set_dim_tracks(
+        IRDimops(Randn, 'randn', signature, [anno], [], rules, **kwargs),
+        size
+    )
 
 
 def Full(size, fill_value, *, out=None, dtype=None, layout=None,
@@ -482,8 +522,11 @@ def Full(size, fill_value, *, out=None, dtype=None, layout=None,
     signature = 'nnscaler.runtime.function.full'
     size = creation_function_size_check('torch.full', size)
     anno, rules = _get_creator_anno_rules(_unwrap_value(size), True)
-    return IRDimops(Full, 'full', signature, [anno], [], rules,
-                     size=size, fill_value=fill_value, dtype=dtype, requires_grad=requires_grad)
+    return creation_function_set_dim_tracks(
+        IRDimops(Full, 'full', signature, [anno], [], rules,
+                     size=size, fill_value=fill_value, dtype=dtype, requires_grad=requires_grad),
+        size
+    )
 
 
 def NewTensor(data, *, dtype=None, device=None,
@@ -1863,7 +1906,7 @@ def Stack(tensors, dim=0, out=None, signature = None):
     return CubeStack(*tensors, dim=dim, signature=signature)
 
 
-def Chunk(input, chunks, dim=0, signature = None):
+def Chunk(input: IRTensor, chunks, dim=0, signature = None):
     """
     torch.chunk(input, chunks, dim=0)
     """
@@ -1874,7 +1917,18 @@ def Chunk(input, chunks, dim=0, signature = None):
     for oanno in oannos:
         oanno[dim] = str(input.shape[dim] // chunks)
     anno = OpAnno.create_op_str(iannos, oannos)
-    return IRDimops(Chunk, 'chunk', signature, [anno], [input], chunks=chunks, dim=dim)
+    ret = IRDimops(Chunk, 'chunk', signature, [anno], [input], chunks=chunks, dim=dim)
+
+    # set proper value tracks for outputs
+    output_shape = list(input.shape)
+    output_shape[dim] = input.shape[dim] // chunks
+    dim_vt = ValueTrack.new([chunks, input.dim_tracks[dim]])
+    for d in range(chunks):
+        output = IRFullTensor(output_shape)
+        output.set_dim_track(dim, dim_vt)
+        ret.set_output(d, output)
+
+    return ret
 
 
 def Select(input, dim, index, signature = None):
@@ -3423,10 +3477,14 @@ def Item(input, signature = None):
     """
     torch.Tensor.item()
     """
-    # set output to IRObject.missing,
+    # set output value to IRObject.missing_value,
     # because the output is unknown here.
     # It will be filled with real value in parser.
-    return IRPyFunc(signature, inputs=[input], outputs=[IRObject.missing], constant_foldable=False)
+    return IRPyFunc(
+        signature, inputs=[input],
+        outputs=[IRObject('item', value=IRObject.missing_value, is_constant=False)],
+        constant_foldable=False
+    )
 
 
 def DictKeys(o: Union[Dict, IRObject], signature=None):

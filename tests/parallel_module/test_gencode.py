@@ -6,6 +6,7 @@ import tempfile
 import re
 from contextlib import nullcontext
 from typing import Union
+from functools import partial
 
 import torch
 import torch.nn.functional as F
@@ -17,7 +18,8 @@ import nnscaler.graph.function.dimops
 from nnscaler.graph.function.pyfunc import IRPyFunc
 from nnscaler.graph.parser.mapping import SignFx2Op
 from nnscaler.ir.cten import IR, IRObject
-from nnscaler.parallel import parallelize, ComputeConfig, CubeModule, _gen_graph
+from nnscaler.parallel import _load_parallel_module_class, parallelize, ComputeConfig, CubeModule, _gen_graph
+from nnscaler.utils import mark_dynamic
 
 from .common import init_distributed
 from ..launch_torchrun import launch_torchrun
@@ -394,11 +396,11 @@ def print_gencode(cubesave_dir, module_class, index=0):
     print(filecontent)
 
 
-def _gencode_contains(cubesave_dir, module_class, index, search_re):
+def _gencode_contains(cubesave_dir, module_class, index, search_re, *, instance_name=None):
     from nnscaler.parallel import _PARALLEL_MODULE_NAMESPACE, _get_full_qualified_name, _DEFAULT_INSTANCE_NAME
     from pathlib import Path
     import re
-    namespace = f'{_PARALLEL_MODULE_NAMESPACE}.{_get_full_qualified_name(module_class)}.{_DEFAULT_INSTANCE_NAME}'
+    namespace = f'{_PARALLEL_MODULE_NAMESPACE}.{_get_full_qualified_name(module_class)}.{instance_name or _DEFAULT_INSTANCE_NAME}'
     outdir: Path = cubesave_dir / Path(namespace.replace('.', '/').strip('/'))
     filecontent = (outdir /f'gencode{index}.py').read_text()
     matches = re.findall(search_re, filecontent)
@@ -657,6 +659,37 @@ def test_codegen_dictget():
         assert _gencode_contains(tempdir, DictGetModule, 0, r"dict.get\(\w+, 'y', \w+\)")
         assert _gencode_contains(tempdir, DictGetModule, 1, r"dict.get\(\w+, 'y', \w+\)")
         assert m_new is None
+
+
+class NonConstModule(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, x):
+        shape = x.shape
+        z = torch.randn(shape)
+        shape = z.shape
+        return z + shape[0]
+
+
+@replace_all_device_with('cpu')
+@pytest.mark.parametrize('dynamic_dims', [[], [0]])
+def test_codegen_nonconst(dynamic_dims):
+    with tempfile.TemporaryDirectory() as tempdir:
+        m_new = parallelize(
+            NonConstModule(),
+            {'x': mark_dynamic(torch.tensor([[[1.0], [2.0], [3.0], [6.0]]]), dynamic_dims)}, # shape 1/4/1
+            'dp',
+            ComputeConfig(1, 1, constant_folding=True),
+            gen_savedir=tempdir,
+            load_module=False
+        )
+        if not dynamic_dims:
+            # shape[0] is constant 1, so can be folded to constant 1
+            assert _gencode_contains(tempdir, NonConstModule, 0, r'torch.add\(.*, 1, alpha=1\)')
+        else:
+            # shape[0] is dynamic, so cannot be folded to constant 1
+            assert not _gencode_contains(tempdir, NonConstModule, 0, r'torch.add\(.*, 1, alpha=1\)')
 
 
 class CloneModule(torch.nn.Module):
@@ -1969,3 +2002,112 @@ def test_codegen_forward_error_compile(tmp_path):
 @pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.device_count() < 2, reason='lack of GPU devices')
 def test_codegen_forward_error(tmp_path):
     launch_torchrun(2, _gencode_forward_error_worker, tmp_path)
+
+
+class WeightModel(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.weights = torch.nn.Parameter(torch.randn(4, 4))
+
+    def forward(self, input):
+        input = input + self.weights
+        out = input @ self.weights
+        return out
+
+
+class WeightModel2(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.weights = WeightModel()
+
+    def forward(self, input):
+        return self.weights(input)
+
+
+def pas_weight(graph, cfg, with_auto_multiref=True):
+    from nnscaler.ir import IRFwOperation, IRDataOperation
+    from nnscaler.policies import _tp, _replica, auto_multiref
+    ngpus = cfg.plan_ngpus
+    if with_auto_multiref:
+        auto_multiref(graph)
+    for node in graph.select(ntype=(IRFwOperation, IRDataOperation)):
+        if node.name == 'add':
+            _tp(graph, node, list(range(ngpus)), 1, 0)
+        elif node.name == 'matmul':
+            _tp(graph, node, list(range(ngpus)), 1, 0)
+        else:
+            _replica(graph, node, list(range(ngpus)))
+    return graph
+
+
+@replace_all_device_with('cpu')
+@pytest.mark.parametrize('with_auto_multiref', [True, False])
+def test_weight_partition(tmp_path, with_auto_multiref):
+    """
+    If auto_multiref is not applied, the weight will correctly partitioned
+    If auto_multiref is applied, the weight will be replicated as a whole
+    """
+    input = torch.randn((4, 4))
+    instance_name = f'with_auto_multiref_{with_auto_multiref}'
+
+    dummy_input = {'input': input}
+
+    m = WeightModel2()
+    m.train()
+
+    parallelize(
+        m,
+        dummy_input,
+        partial(pas_weight, with_auto_multiref=with_auto_multiref),
+        ComputeConfig(2, 2),
+        gen_savedir=tmp_path,
+        load_module=False,
+        reuse='override',
+        instance_name=instance_name,
+    )
+
+    module_class = _load_parallel_module_class(WeightModel2, gen_savedir=tmp_path, instance_name=instance_name, rank=0)
+
+    if with_auto_multiref:
+        for rank in range(2):
+            fullmap = module_class.attr_meta_maps[rank]
+            assert fullmap[list(fullmap.keys())[0]].sub_shape == (4, 4)
+    else:
+        for rank in range(2):
+            fullmap = module_class.attr_meta_maps[rank]
+            assert fullmap[list(fullmap.keys())[0]].sub_shape == (2, 4)
+
+class DynamicInputModel(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.weights = torch.nn.Parameter(torch.randn(1, 1))
+
+    def forward(self, input):
+        return input + self.weights
+
+
+@replace_all_device_with('cpu')
+@pytest.mark.parametrize('dynamic_dims', [[], [0, 1]])
+def test_dynamic_dim_partition(tmp_path, dynamic_dims):
+    input = mark_dynamic(torch.randn((4, 4)), dynamic_dims)
+    dummy_input = {'input': input}
+    instance_name=f'{"no" if not dynamic_dims else ""}_dynamic_dims'
+
+    m = DynamicInputModel()
+    m.train()
+
+    parallelize(
+        m,
+        dummy_input,
+        'tp',
+        ComputeConfig(2, 2),
+        gen_savedir=tmp_path,
+        load_module=False,
+        reuse='override',
+        instance_name=instance_name,
+    )
+    if dynamic_dims:
+        # no partition for dynamic input
+        assert not _gencode_contains(tmp_path, DynamicInputModel, 0, r'nnscaler.runtime.adapter.nn.split_allgather', instance_name=instance_name)
+    else:
+        assert _gencode_contains(tmp_path, DynamicInputModel, 0, r'nnscaler.runtime.adapter.nn.split_allgather', instance_name=instance_name)

@@ -287,6 +287,7 @@ class IRGraph(IRSegment):
         # IRDataOperation. Since we already know the output of the dataloader,
         # we don't need to set the value for it.
         ir_root_obj = IRObject(name='dataloader', value=None, is_constant=False)
+        ir_root_obj.value_track.with_no_dep()
         data_op = IRDataOperation(ir_root_obj, self.inputs())
         # add the data operation to the graph, which will use `next` to get data.
         self.insert(data_op, 0)

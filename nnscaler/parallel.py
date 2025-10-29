@@ -56,6 +56,7 @@ from nnscaler.utils import (
     setup_stride_broadcast_group,
     get_shared_params,
     OptStateDict,
+    copy_dynamic
 )
 
 logger = logging.getLogger(__name__)
@@ -357,7 +358,7 @@ def _to_cpu(val: Any):
         return {_to_cpu(t) for t in val}
     if isinstance(val, torch.Tensor):
         requires_grad = val.is_floating_point() or val.is_complex()
-        return val.detach().clone().cpu().requires_grad_(requires_grad)
+        return copy_dynamic(val, val.detach().clone().cpu().requires_grad_(requires_grad))
     return val
 
 
