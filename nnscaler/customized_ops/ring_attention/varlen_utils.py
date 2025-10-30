@@ -144,7 +144,7 @@ def unshuffle_varlen(t: Tensor, cu_seqlens_padded: Tensor, cp_ranks: List[int], 
                 current_seq_dim = 0
             else:
                 raise ValueError(
-                    "Make sure the inputs are in THD format and padded correctly."
+                    f"Make sure the inputs are in THD format and padded correctly. cu_seqlens_padded: {cu_seqlens_padded}, val.shape: {val.shape}."
                 )
         else:
             raise ValueError("Tensor must be at least 1D")

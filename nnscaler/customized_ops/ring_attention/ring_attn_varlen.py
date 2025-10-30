@@ -3,6 +3,7 @@
 
 from typing import Tuple, List, Dict, Optional
 import torch
+import os
 from torch import Tensor
 import torch.distributed as dist
 import warnings
@@ -16,10 +17,16 @@ from .core.ring_attn_varlen_implementation import llama3_flash_attn_prepare_cu_s
 from .core.utils import gen_head_anno
 from .varlen_utils import shuffle_varlen, unshuffle_varlen
 
-# Try to import TransformerEngine with version check
+# Try to import TransformerEngine with version check and optional CP enable via env var.
+# Usage control:
+#   Set environment variable ENABLE_TE_CP=1 to enable TransformerEngine context-parallel (CP) attention.
+#   Default (unset or 0) will disable CP usage even if TE is installed.
 _HAS_TRANSFORMER_ENGINE = False
 _TE_VERSION_OK = False
 attn_forward_func_with_cp = None
+
+# Read environment variable switch (string compare to '1').
+_ENABLE_TE_CP = os.getenv("ENABLE_TE_CP", "0") == "1"
 
 try:
     import transformer_engine
@@ -80,7 +87,8 @@ def get_transformer_engine_info() -> Dict[str, any]:
     return {
         "has_transformer_engine": _HAS_TRANSFORMER_ENGINE,
         "version_ok": _TE_VERSION_OK,
-        "has_cp_function": attn_forward_func_with_cp is not None,
+    "has_cp_function": attn_forward_func_with_cp is not None,
+    "env_enable_cp": _ENABLE_TE_CP,
         "version": getattr(transformer_engine, "__version__", None) if _HAS_TRANSFORMER_ENGINE else None,
         "required_version": "2.2.0+",
     }
@@ -97,7 +105,8 @@ def print_transformer_engine_status():
         print(f"  - CP Function Available: {info['has_cp_function']}")
     else:
         print(f"  - Required Version: {info['required_version']}")
-    print(f"  - Will use TE CP: {info['has_transformer_engine'] and info['version_ok'] and info['has_cp_function']}")
+    print(f"  - Env ENABLE_TE_CP=1: {info['env_enable_cp']}")
+    print(f"  - Will use TE CP: {info['has_transformer_engine'] and info['version_ok'] and info['has_cp_function'] and info['env_enable_cp']}")
 
 
 def wrap_ring_attn_varlen_func(
@@ -160,7 +169,8 @@ def wrap_ring_attn_varlen_func(
 
     if window_size == (-1, -1):
         # Use TransformerEngine with context parallelism if available and version is OK
-        if _HAS_TRANSFORMER_ENGINE and _TE_VERSION_OK and attn_forward_func_with_cp is not None:
+        # Only use TransformerEngine CP path if env flag is enabled
+        if _ENABLE_TE_CP and _HAS_TRANSFORMER_ENGINE and _TE_VERSION_OK and attn_forward_func_with_cp is not None:
             shuffled_q = shuffle_varlen(q, cu_seqlens_q, process_group, local_process_group)
             shuffled_k = shuffle_varlen(k, cu_seqlens_k, process_group, local_process_group)
             shuffled_v = shuffle_varlen(v, cu_seqlens_k, process_group, local_process_group)
@@ -203,10 +213,13 @@ def wrap_ring_attn_varlen_func(
             return output
         else:
             # Fallback to basic ring attention implementation
-            warnings.warn(
-                "TransformerEngine not available or version incompatible. "
-                "Using basic ring attention implementation which may be slower."
-            )
+            if _ENABLE_TE_CP:
+                # User requested CP but TE unavailable/incompatible
+                warnings.warn(
+                    "ENABLE_TE_CP=1 set but TransformerEngine CP attention unavailable (missing or incompatible). "
+                    "Falling back to basic ring attention implementation."
+                )
+            # If not enabled, remain silent (no warning spam) unless TE missing earlier already warned.
 
     (
         local_cu_seqlens_q,
