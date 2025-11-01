@@ -128,7 +128,7 @@ class Trainer:
         return fix_input(input, self.train_args.input_dtype)
 
     def _load_dummy_input(self):
-        if dummy_sample_gen_fn := self.train_args.resolved_dummy_sample_gen_fn:
+        if dummy_sample_gen_fn := self.train_args.dummy_sample_gen_fn:
             return dummy_sample_gen_fn(self.train_args)
 
         with enforce_zero_num_worker(DataLoader):
@@ -159,6 +159,8 @@ class Trainer:
         # load a dummy input from training dataset
         self.dummy_input = self._load_dummy_input()
         self.dummy_input = self._fix_input(self.dummy_input)
+        if self.train_args.dummy_sample_post_process_fn:
+            self.dummy_input = self.train_args.dummy_sample_post_process_fn(self.train_args, self.dummy_input)
 
         pmodel = parallelize_model(
             self.train_args, self.dummy_input,

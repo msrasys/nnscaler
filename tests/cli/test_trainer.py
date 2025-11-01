@@ -2,6 +2,7 @@
 #  Licensed under the MIT License.
 
 from pathlib import Path
+import re
 import shutil
 
 import torch
@@ -1112,3 +1113,102 @@ def trainer_resumable_dataloader(save_dir):
 @pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.device_count() < 4, reason='lack of gpu devices')
 def test_trainer_resumable_dataloader(tmp_path):
     launch_torchrun(4, trainer_resumable_dataloader, tmp_path)
+
+
+@replace_all_device_with('cpu')
+def test_trainer_dynamic_worker(tmp_path):
+
+    def check_match(code_dir: Path, should_exist: bool):
+        gencode_files = list(code_dir.glob('**/*.py'))
+        assert set(f.name for f in gencode_files) == set(['gencode0.py', 'gencode1.py', 'gencode2.py', 'gencode3.py'])
+        for gencode_file in gencode_files:
+            filecontent = gencode_file.read_text()
+            matches = re.findall(r'B, T, C = x\.size\(\)', filecontent)
+            if should_exist:
+                assert matches
+            else:
+                assert not matches
+
+        shutil.rmtree(code_dir)
+
+    save_dir = Path(tmp_path)
+    config_path = str(Path(__file__).with_name('trainer_args_csa.yaml').resolve())
+    gen_savedir = save_dir / 'gen'
+    # compile only
+    trainer = Trainer([
+        '-f', config_path,
+        '--vars.dynamic_dims', '[1]',
+        '--max_epochs', '2',
+        '--gen_savedir', str(gen_savedir),
+        '--compute_config.plan_ngpus', '2',
+        '--compute_config.runtime_ngpus', '4',
+        '--checkpoint.no_save', 'true',
+        '--run_mode', 'compile',
+        '--broadcast_strategy', 'none',
+    ])
+    trainer.run()
+    check_match(gen_savedir, should_exist=True)
+
+    gen_savedir = save_dir / 'gen0'
+    # compile only
+    trainer = Trainer([
+        '-f', config_path,
+        '--vars.dynamic_dims', '[]',
+        '--max_epochs', '2',
+        '--gen_savedir', str(gen_savedir),
+        '--compute_config.plan_ngpus', '2',
+        '--compute_config.runtime_ngpus', '4',
+        '--checkpoint.no_save', 'true',
+        '--run_mode', 'compile',
+        '--broadcast_strategy', 'none',
+    ])
+    trainer.run()
+    check_match(gen_savedir, should_exist=False)
+
+    # mixed compile
+    gen_savedir = save_dir / 'gen1'
+    # compile only
+    trainer = Trainer([
+        '-f', config_path,
+        '--vars.dynamic_dims', '[1]',
+        '--max_epochs', '2',
+        '--gen_savedir', str(gen_savedir),
+        '--compute_config.plan_ngpus', '2',
+        '--compute_config.runtime_ngpus', '4',
+        '--checkpoint.no_save', 'true',
+        '--run_mode', 'compile',
+        '--broadcast_strategy', 'none',
+
+        '--model.parallel_modules.0.type', 'tests.cli.common.CausalSelfAttention',
+        '--model.parallel_modules.0.args.n_embd', '$(model.args.n_embd)',
+        '--model.parallel_modules.0.args.n_head', '$(model.args.n_head)',
+        '--model.parallel_modules.0.args.dropout', '$(model.args.dropout)',
+        '--model.parallel_modules.0.forward_args_gen_fn', 'tests.cli.common.csa_forward_args_gen_fn',
+        '--model.parallel_modules.0.forward_args_post_process_fn', 'tests.cli.common.post_csa_forward_args_gen_fn',
+    ])
+    trainer.run()
+    check_match(gen_savedir, should_exist=True)
+
+    # mixed compile
+    gen_savedir = save_dir / 'gen2'
+    # compile only
+    trainer = Trainer([
+        '-f', config_path,
+        '--vars.dynamic_dims', '[]',
+        '--max_epochs', '2',
+        '--gen_savedir', str(gen_savedir),
+        '--compute_config.plan_ngpus', '2',
+        '--compute_config.runtime_ngpus', '4',
+        '--checkpoint.no_save', 'true',
+        '--run_mode', 'compile',
+        '--broadcast_strategy', 'none',
+
+        '--model.parallel_modules.0.type', 'tests.cli.common.CausalSelfAttention',
+        '--model.parallel_modules.0.args.n_embd', '$(model.args.n_embd)',
+        '--model.parallel_modules.0.args.n_head', '$(model.args.n_head)',
+        '--model.parallel_modules.0.args.dropout', '$(model.args.dropout)',
+        '--model.parallel_modules.0.forward_args_gen_fn', 'tests.cli.common.csa_forward_args_gen_fn',
+        '--model.parallel_modules.0.forward_args_post_process_fn', 'tests.cli.common.post_csa_forward_args_gen_fn',
+    ])
+    trainer.run()
+    check_match(gen_savedir, should_exist=False)

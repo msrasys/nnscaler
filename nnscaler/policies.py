@@ -18,8 +18,10 @@ Note the steps 1, 2, 3 must be finished before any graph partition.
 IRDataOperation is recommended to be replicated to all devices.
 """
 
+import ast
+from dataclasses import dataclass, field
 import logging
-from typing import List, Optional, TYPE_CHECKING
+from typing import List, Literal, Optional, TYPE_CHECKING, Callable, Iterable, Union
 import random
 
 import torch
@@ -30,9 +32,12 @@ from nnscaler.autodist.autodist_config import AutoDistConfig
 from nnscaler.graph import IRGraph
 from nnscaler.graph.function.anchor import IRGraphAnchor
 from nnscaler.graph.function.dimops import IRDimops
+from nnscaler.graph.function.pyfunc import IRPyFunc
 from nnscaler.graph.segment import IRSegment
-from nnscaler.ir.operator import IRDataOperation, IRFwOperation
+from nnscaler.ir.operator import IRBpOperation, IRDataOperation, IRFwOperation
 from nnscaler.ir import IRCell, IRSubTensor, IRFullTensor
+from nnscaler.ir.cten import IR
+from nnscaler.runtime.function import identity, multiref
 
 
 if TYPE_CHECKING:
@@ -116,6 +121,8 @@ def pas_tp(graph: IRGraph, cfg: 'ComputeConfig'):
                 random.shuffle(configs)
                 for (idx, dim) in configs:
                     if node.input(idx).shape[dim] % len(devs) != 0: continue
+                    # only partition when all input tensors are constant on this dim
+                    if not node.input(idx).dim_tracks[dim].is_constant: continue
                     if node.algorithm('dim').satisfy(idx=idx, dim=dim, num=len(devs)):
                         _tp(graph, node, devs, idx, dim)
                         break
@@ -347,3 +354,427 @@ def pas_autodist(graph: IRGraph, cfg: 'ComputeConfig') -> IRGraph:
     )
 
     return parallelize_graph(graph, autodist_cfg)
+
+
+@dataclass(unsafe_hash=True, frozen=True)
+class OpPartition:
+    """
+    OpPartition represents a partition plan for an operator dimension.
+    """
+    input: int
+    dim: int
+
+
+@dataclass
+class OpPlan:
+    """
+    OpPlan represents the distributed plan for an operator.
+    """
+    op: IRFwOperation
+    recompute_id: int = -1  # -1 means no recompute
+    stage_id: int = -1       # pipeline stage id, -1 means following the previous op's stage
+
+    # OpPartition: user specified partition plan
+    #   You only need to specify one partition plan here.
+    #   For example, torch.matmul has annotation of `m k+, k+ n -> m n`,
+    #   If you want to partition the matmul on the k dimension,
+    #   you can set OpPartition(input=0, dim=1) or OpPartition(input=1, dim=0).
+    #   They are equivalent.
+    # None: replicated
+    # 'auto': auto partition based on the input tensor partition info
+    #   1. if any of the input tensors is value partitioned, we replicate the op
+    #      TODO: is it too strict?
+    #   2. if any of the input tensors is partitioned on a dim,
+    #      we will try to partition the op on the same dim first,
+    #      if the partition is invalid, we replicate the op
+    #   3. if all the input tensor is replicated, we replicate the op
+    partition: OpPartition | None | Literal['auto'] = None  # partition plan
+    # for future extension
+    # don't use it now.
+    partitions: List[OpPartition | None] = field(default_factory=list)  # multiple partition plans
+
+    def __post_init__(self):
+        if self.partition is not None and len(self.partitions) > 0:
+            raise ValueError("Only one of partition and partitions can be set")
+
+        if len(self.partitions) > 1:
+            raise NotImplementedError("Multiple partitions are not supported yet")
+
+        if len(self.partitions) == 1:
+            self.partition = self.partitions[0]
+            self.partitions = []
+
+
+def get_layer_index(fqn: str) -> int:
+    """
+    Extract the layer index from full qualified name.
+    If there are multiple integers in the name, raise ValueError.
+    """
+    nums = [int(s) for s in fqn.split(".") if s.isdigit()]
+    if len(nums) != 1:
+        raise ValueError(f"Name {fqn} should only contain one integer")
+    return nums[0]
+
+
+def get_called_self_module_name(node_call_expr: str) -> str:
+    """
+    Get the called module name from the node's call expr by ast.
+    For example:
+    self.up_proj(x) -> up_proj
+    self.act_fn(self.gate_proj(x)) -> act_fn
+    self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x)) -> down_proj
+    torch.tanh(x) -> ''  # because it's not called from self
+    self.up_proj(x).transpose() -> '' # because it's an attribute call
+
+    Other cases return empty string.
+
+    NOTE: regex is not easy to make it work
+
+    """
+
+    if not node_call_expr:
+        return ''
+    call_expr: ast.Call = ast.parse(node_call_expr, mode='eval').body  # type: ignore
+    if isinstance(call_expr, ast.Call):  # self.up_proj(x)
+        if isinstance(call_expr.func, ast.Attribute):  # self.up_proj
+            if isinstance(call_expr.func.value, ast.Name) and call_expr.func.value.id == 'self':
+                return call_expr.func.attr  # up_proj
+    return ''
+
+
+def get_pas_ops(graph: IRGraph) -> List[IRFwOperation]:
+    """
+    Get all operators in the graph that can set operator plan.
+    When we write a policy, only ops returned from this function need to be considered.
+
+    Args:
+        graph: the input IRGraph
+
+    Returns:
+        List[IRFwOperation]: list of IRFwOperation nodes
+    """
+    return graph.select(ntype=IRFwOperation)
+
+
+def fn(
+        graph: IRGraph, cfg: 'ComputeConfig',
+        policy: Union[
+            Callable[[IRGraph, 'ComputeConfig'], IRGraph],
+            Callable[[IRGraph, 'ComputeConfig'], Iterable[OpPlan]],
+        ]
+) -> IRGraph:
+    """
+    General policy function based on user-defined policy.
+    The user-defined policy can either return the final IRGraph, or
+    return a list of OpPlan to describe the distributed plan for each operator.
+
+    To write a new-style policy, the most important part is to locate the operator node in the graph.
+    Here are some tips:
+    1. use `node.name` to get the operator name.
+    2. use `node.fn` to get the operator function.
+    3. use `node.module_stack` to get the module stack info.
+    4. use `node.module_class_chain` to get the module class chain.
+    5. use `node.call_expr` to get the call expression string. And you can user `ast.parse` to parse it.
+    6. use `get_layer_index` to get the layer index in a torch.nn.ModuleList.
+    7. use `get_called_self_module_name` to get the called self module name from the call expression.
+    8. use `node.inputs()` the get the input tensors of the operator.
+        We can further check whether the input tensor is a parameter by `tensor.is_param`,
+        or get the full name of the parameter by `tensor.name`, etc.
+    9. insert anchors in code with `nnscaler.anchor` to help locate the operator (intrusive way).
+
+    A good way to locate the operator will be like:
+    1. Locate the module first by module_class_chain (`target_module in node.module_class_chain`)
+    2. If the module are used multiple times (e.g., in ModuleList),
+       locate further by layer index (`get_layer_index`) or `node.fqn`.
+    3. Once the module is located,
+       we can further locate the operator by
+       `node.name`,`node.call_expr`, `node.fn`, `node.inputs()` (especially the `is_param`/`name` of input)
+       or other properties.
+
+    Args:
+        graph: the input IRGraph
+        cfg: the compute config
+        policy: the user-defined policy function. It can either return the final IRGraph,
+                or return an iterable of OpPlan for each operator.
+
+    Returns:
+        the distributed IRGraph
+    """
+    result = policy(graph, cfg)
+    if isinstance(result, IRGraph):  # traditional policy
+        return result
+
+    op_plans = {r.op: r for r in result}
+    ngpus: int = cfg.plan_ngpus
+
+    recompute_groups: dict[int, list[IRFwOperation]] = {}
+    recompute_last_id: int = -1
+    recompute_group_stages: dict[int, int] = {}
+
+    pp_stages: list[list[IRFwOperation]] = [[]]
+    pp_cur_stage_id = 0
+
+    # key: IRFullTensor
+    # value:
+    #   key: stage_id
+    #   value: set of OpPartition in this stage
+    tensor_splits: dict[IRFullTensor, dict[int, set[OpPartition]]] = {}
+    # store the last split info for each tensor to help handle auto partition
+    # None: replicated
+    # 'value': value partitioned
+    # int: the partitioned dim
+    output_tensor_last_split: dict[IRFullTensor, int | None | Literal['value']] = {}
+
+    fw_nodes = dict.fromkeys(graph.select(ntype=IRFwOperation))
+
+    for node in fw_nodes:
+        if node not in op_plans:
+            op_plans[node] = OpPlan(op=node)  # default: no partition, stage 0, no recompute
+
+        op_plan = op_plans[node]
+
+        # set pipeline stage id if not set
+        if op_plan.stage_id == -1:
+            op_plan.stage_id = pp_cur_stage_id
+
+        # currently we only support partition for IRDimops
+        if not isinstance(op_plan.op, IRDimops):
+            if op_plan.partition == 'auto':
+                op_plan.partition = None
+            if op_plan.partition is not None:
+                raise ValueError("Only IRDimops can be partitioned.")
+
+        # list of partitions for the op
+        # [] means no partition(replicated)
+        op_partitions = [op_plan.partition] if op_plan.partition is not None else []
+
+        if op_partitions == ['auto']:
+            # auto partition based on input tensor partition info
+            op_partitions = []  # reset to collect partitions
+            for idx, input in enumerate(op_plan.op.inputs()):
+                if not isinstance(input, IRSubTensor):
+                    continue
+                ftensor = input.parent
+                last_partition_dim = output_tensor_last_split.get(ftensor, None)
+                if last_partition_dim == 'value':
+                    # value partitioned input, replicate the op
+                    op_partitions = []
+                    break
+                elif last_partition_dim is not None:
+                    op_partitions.append(OpPartition(input=idx, dim=last_partition_dim))
+
+        # final partition plan for the op
+        # key: input idx, value: partitioned dim
+        op_partition_map: dict[int, int] = {}
+        if op_partitions:
+            # we partition the op based on the first partition plan
+            # and then check the rest partitions are satisfied or not
+            op_first_partition = op_partitions[0]
+            partitioned_nodes = op_plan.op.algorithm('dim')\
+                .instantiate(idx=op_first_partition.input, dim=op_first_partition.dim, num=ngpus)
+            subnode = partitioned_nodes[0]  # first subnode carries all necessary partition info
+
+            # collect input partition info
+            # key: input idx, value: partitioned dim
+            result_partitions: dict[int, int] = {}
+            for idx, input in enumerate(subnode.inputs()):
+                if not isinstance(input, IRSubTensor):
+                    continue
+                split_dims = input.splitdims()
+                assert len(split_dims) <= 1, "Internal Error: multiple splitdims in one input"
+                if split_dims:
+                    result_partitions[idx] = split_dims[0]
+
+            # check the rest partitions
+            # Note if we only have one partition plan, the check is skipped, we can always partition it
+            # In fact, if `auto` is not specified, we always have at most one partition plan
+            for op_partition in op_partitions[1:]:
+                if op_partition.input not in result_partitions or \
+                        result_partitions[op_partition.input] != op_partition.dim:
+                    _logger.warning(
+                        f"Operator {op_plan.op} cannot be partitioned as specified: {op_partition}"
+                        f", replicate it instead."
+                    )
+                    op_partitions = []
+                    op_partition_map = {}
+                    break
+            else:
+                # all partitions are satisfied
+                # then we can update input/output partition info
+
+                # make sure the first item in op_partition_map is the first partition plan
+                op_partition_map[op_first_partition.input] = op_first_partition.dim
+                op_partition_map.update(result_partitions)
+
+                for output in subnode.outputs():
+                    if not isinstance(output, IRSubTensor):
+                        continue
+                    ftensor = output.parent
+                    if output.valmap != (0, 1):
+                        output_tensor_last_split[ftensor] = 'value'
+                    else:
+                        split_dims = output.splitdims()
+                        assert len(split_dims) <= 1, "Internal Error: multiple splitdims in one output"
+                        if split_dims:
+                            output_tensor_last_split[ftensor] = split_dims[0]
+
+        if op_plan.partition == 'auto':
+            if not op_partition_map:
+                op_plan.partition = None
+            else:
+                # use the first partition plan,
+                # which is consistent with the logic above
+                first_input_idx = list(op_partition_map.keys())[0]
+                op_plan.partition = OpPartition(
+                    input=first_input_idx,
+                    dim=op_partition_map[first_input_idx]
+                )
+
+        # update tensor_splits for input tensors
+        for idx, input in enumerate(op_plan.op.inputs()):
+            if not isinstance(input, IRSubTensor):
+                continue
+            ftensor = input.parent
+            if ftensor not in tensor_splits:
+                tensor_splits[ftensor] = {}
+            if idx not in op_partition_map:
+                tensor_splits[ftensor].setdefault(op_plan.stage_id, set()).add(None)
+            else:
+                tensor_splits[ftensor].setdefault(op_plan.stage_id, set()).add(
+                    OpPartition(input=idx, dim=op_partition_map[idx]))
+
+        if op_plan.recompute_id != -1:
+            if op_plan.recompute_id in recompute_group_stages:
+                if recompute_group_stages[op_plan.recompute_id] != op_plan.stage_id:
+                    raise ValueError("All ops in a recompute group must be in the same stage")
+            else:
+                recompute_group_stages[op_plan.recompute_id] = op_plan.stage_id
+
+            if op_plan.recompute_id != recompute_last_id and op_plan.recompute_id in recompute_groups:
+                raise ValueError("Nodes in a recompute group must be continuous.")
+
+            recompute_groups.setdefault(op_plan.recompute_id, []).append(op_plan.op)
+
+        recompute_last_id = op_plan.recompute_id
+
+        # update pipeline stages
+        if op_plan.stage_id == pp_cur_stage_id:
+            pp_stages[pp_cur_stage_id].append(op_plan.op)
+        elif op_plan.stage_id == pp_cur_stage_id + 1:
+            pp_cur_stage_id += 1
+            pp_stages.append([op_plan.op])
+        else:
+            raise ValueError("Pipeline stage ids must be continuous integers starting from 0")
+
+    if len(op_plans) != len(fw_nodes):
+        assert len(op_plans) > len(fw_nodes)
+        for op_plan in op_plans.values():
+            if op_plan.op not in fw_nodes:
+                raise ValueError(f"OpPlan contains operator {op_plan.op} not in the graph or not a forward operator")
+
+    pp_segs = [graph]
+    nstages = len(pp_stages)
+    pp_enabled = nstages > 1
+    # not all schedulers support pp_size < nstages
+    pp_size = cfg.pas_config.get('pipeline_size', nstages)
+    nmicros = cfg.pas_config.get('pipeline_nmicros', None)
+    scheduler = cfg.pas_config.get('pipeline_scheduler', '1f1b')
+    tp_size = ngpus // pp_size
+
+    if pp_enabled:
+        if not cfg.use_end2end:
+            raise ValueError("Pipeline parallelism requires use_end2end to be True")
+        if pp_size <= 1:
+            raise ValueError("pipeline_size must be greater than 1 when pipeline is enabled")
+        if not nmicros:
+            raise ValueError("nmicros must be set when pipeline is enabled")
+        if nstages % pp_size != 0:
+            raise ValueError(f'invalid pipeline_size {pp_size} for nstages {nstages}')
+        if ngpus % pp_size != 0:
+            raise ValueError(f'invalid pipeline_size {pp_size} for ngpus {ngpus}')
+    else:
+        if pp_size != 1:
+            raise ValueError("pipeline_size must be 1 when pipeline is disabled")
+
+    # set recompute groups
+    for group in recompute_groups.values():
+        if len(group) <= 1:
+            continue
+        graph.recompute(group)
+
+    # add multiref for shared parameters across stages
+    # note that we have constrained that shared parameters cannot be partitioned in SPMDSolver, other input tensors
+    # belonging to the same operator can be partitioned. For example, in some LLMs, the embedding matrix is shared
+    # with the output layer. In this case, the batch dim / seq dim of the activation tensor can be partitioned.
+    for ftensor, stage_info in tensor_splits.items():
+        if not ftensor.is_param():
+            continue
+        splits = set(k.dim if k is not None else None for v in stage_info.values() for k in v)
+        find_replicated = None in splits
+        splits = list(splits)
+        # For safety, we will add multiref when detecting shared param are all replicated for pipeline parallelism.
+        # The reason is that stages may have different number of devices, it is hard to synchronize gradients directly
+        # by inserting reducers although weights are all REPLICAED.
+        if len(splits) > 1 or (pp_enabled and find_replicated):
+            _logger.info(f'add multiref for shared param {ftensor}')
+            graph.multiref(ftensor, comment='shared param')
+
+    # set pipeline stages
+    if pp_enabled:
+        graph.staging([s[0] for s in pp_stages])
+        pp_segs: list[IRSegment] = graph.select(ntype=IRSegment, flatten=False)
+
+        for stage_id, stage in enumerate(pp_segs):
+            for node in stage.select(ntype=IRFwOperation):
+                if node in fw_nodes:
+                    continue
+                if node.fn == multiref: # skip multiref nodes
+                    continue
+                assert node.fn == identity, "Internal Error: non-identity node added in staging"
+                # force identity nodes to be replicated
+                # these nodes are usually added for data transfer between stages in graph.staging
+                # TODO: is it possible to have TP here?
+                op_plans[node] = OpPlan(op=node, stage_id=stage_id, partition=None)
+
+    # add multiref to an activation tensor when the states of the tensor and its grad are different
+    # among consumers and current segment's outputs
+    for ftensor, stage_info in tensor_splits.items():
+        # Parameter are already handled above
+        if ftensor.is_grad() or ftensor.is_param():
+            continue
+
+        # check if this tensor is in the output of each stage
+        is_seg_output: dict[int, bool] = {}
+        for idx, stage in enumerate(pp_segs):
+            is_seg_output[idx] = IR.contains_object(
+                stage.outputs(),
+                lambda x: isinstance(x, IRSubTensor) and x.parent == ftensor
+            )
+
+        for idx, splits in stage_info.items():
+            stage = pp_segs[idx]
+            split_list = list(splits)
+            if len(split_list) > 1 or (
+                is_seg_output[idx] and split_list[0] is not None # treat segment output as a consumer
+            ):
+                _logger.debug(f'add multiref for {ftensor} in stage {stage}')
+                stage.multiref(ftensor, comment='activation')
+
+    # stage-wise tensor parallelism
+    curr_devices = list(range(ngpus))
+    for op_plan in op_plans.values():
+        idx = op_plan.stage_id % pp_size
+        devs = curr_devices[idx * tp_size: (idx + 1)* tp_size]
+        if op_plan.partition is not None:
+            _tp(graph, op_plan.op, devs, idx=op_plan.partition.input, dim=op_plan.partition.dim)
+        else:
+            _replica(graph, op_plan.op, devs)
+
+    # replicate dataloader
+    for dl in graph.select(ntype=IRDataOperation):
+        _replica(graph, dl, devs=list(range(ngpus)))
+
+    if pp_enabled:
+        cfg.apply_pipeline_scheduler(graph, nstages, nmicros, scheduler)
+
+    return graph

@@ -563,7 +563,7 @@ class IRSubTensor(IRTensor):
     def as_attr(self):
         raise RuntimeError("as_attr is not allowed for SubTensor")
 
-    def splitdims(self) -> Tuple[int]:
+    def splitdims(self) -> Tuple[int, ...]:
         """!
         Get partitioned dimensions
 

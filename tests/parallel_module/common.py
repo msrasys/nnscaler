@@ -107,6 +107,19 @@ class CubeLinear(nn.Module):
         return x
 
 
+class FFN(nn.Module):
+    def __init__(self, hidden_size, intermediate_size):
+        super().__init__()
+        self.gate_proj = nn.Linear(hidden_size, intermediate_size, bias=False)
+        self.up_proj = nn.Linear(hidden_size, intermediate_size, bias=False)
+        self.down_proj = nn.Linear(intermediate_size, hidden_size, bias=False)
+        self.act_fn = torch.nn.Tanh()
+
+    def forward(self, x):
+        down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
+        return down_proj
+
+
 def init_distributed():
     torch.distributed.init_process_group(backend='nccl')
     rank = torch.distributed.get_rank()

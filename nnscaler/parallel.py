@@ -56,6 +56,7 @@ from nnscaler.utils import (
     setup_stride_broadcast_group,
     get_shared_params,
     OptStateDict,
+    copy_dynamic
 )
 
 logger = logging.getLogger(__name__)
@@ -357,7 +358,7 @@ def _to_cpu(val: Any):
         return {_to_cpu(t) for t in val}
     if isinstance(val, torch.Tensor):
         requires_grad = val.is_floating_point() or val.is_complex()
-        return val.detach().clone().cpu().requires_grad_(requires_grad)
+        return copy_dynamic(val, val.detach().clone().cpu().requires_grad_(requires_grad))
     return val
 
 
@@ -1001,6 +1002,10 @@ def parallelize(
         if not pas_policy in _PREDEFINED_POLICIES:
             raise ValueError(f"Invalid pas_policy: {pas_policy}")
         pas_policy = _PREDEFINED_POLICIES[pas_policy]
+    else:
+        if not callable(pas_policy):
+            raise ValueError("pas_policy should be a callable or a predefined policy name")
+        pas_policy = partial(policies.fn, policy=pas_policy)
 
     is_module_class = inspect.isclass(module_or_module_class)
     module_class = module_or_module_class if is_module_class else module_or_module_class.__class__

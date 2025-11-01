@@ -520,3 +520,37 @@ def fn_field(**kwargs):
     metadata = kwargs.pop('metadata', {})
     metadata['deserialize'] = lambda t: None if t is None else load_type(t)
     return field(**kwargs, metadata=metadata)
+
+
+TENSOR_DYNAMIC_DIMS_FIELD_NAME = '_nnscaler_dynamic_dims'
+# for nnscaler custom class (TensorMetadata)
+NNSCALER_DYNAMIC_DIMS_NAME = 'dynamic_dims'
+
+
+def mark_dynamic(tensor: torch.Tensor, dims: int | list[int] | tuple[int]) -> torch.Tensor:
+    """
+    Mark the dim of a tensor as dynamic, which means it can be changed in the future.
+    This is the same with `torch._dynamo.mark_dynamic`
+    """
+    setattr(tensor, TENSOR_DYNAMIC_DIMS_FIELD_NAME, set(dims) if dims else set())
+    return tensor
+
+
+def copy_dynamic(src: torch.Tensor, tensor: torch.Tensor) -> torch.Tensor:
+    """
+    Copy the dynamic dims from src to tensor, and return the tensor.
+    """
+    if hasattr(src, TENSOR_DYNAMIC_DIMS_FIELD_NAME):
+        setattr(tensor, TENSOR_DYNAMIC_DIMS_FIELD_NAME, getattr(src, TENSOR_DYNAMIC_DIMS_FIELD_NAME))
+    return tensor
+
+
+def get_dynamic(tensor: Any) -> set[int]:
+    """
+    Get the dynamic dims of a tensor.
+    It also works when tensor is not an instance of torch.Tensor
+    """
+    if isinstance(tensor, torch.Tensor):
+        return getattr(tensor, TENSOR_DYNAMIC_DIMS_FIELD_NAME, set())
+    else:
+        return getattr(tensor, NNSCALER_DYNAMIC_DIMS_NAME, set())
