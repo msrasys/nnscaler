@@ -1,6 +1,7 @@
 #  Copyright (c) Microsoft Corporation.
 #  Licensed under the MIT License.
 
+import inspect
 from typing import Generator, Iterable, List, Any, Optional, Tuple, Dict
 import logging
 
@@ -225,8 +226,35 @@ class FuncEmission(CodeEmission):
         emit_rule = self._emit_rules.map(signature)
         body = emit_rule(node, inputs, kwargs, runtime_devid, plan_ndevs, runtime_ndevs)
 
+        def _to_tuple_str(names: List[str]) -> str:
+            if len(names) == 1:
+                return f'({names[0]}, )'
+            return '(' + ', '.join(names) + ')'
+
+        def _insert_hook(outputs=None, is_pre: bool=False, output_len: int = 0):
+            hook = node.pre_hook if is_pre else node.post_hook
+            if not hook:
+                return
+            module_path = inspect.getmodule(hook).__name__
+            fsig = f'{module_path}.{hook.__name__}'
+            kw_pairs = list()
+            for key, val in kwargs.items():
+                code = f'{key}={val}'
+                kw_pairs.append(code)
+            codes.append(
+                f'{fsig}(self, ' +
+                    repr(node.hook_meta) + ', ' +
+                    f"{_to_tuple_str(inputs)}, " +
+                    f"dict({', '.join(kw_pairs)})" +
+                    ('' if is_pre else ', ' + outputs) +
+                ')'
+            )
+
+        _insert_hook(is_pre=True)
+
         if len(node.outputs()) == 0:
             codes.append(body)
+            _insert_hook(is_pre=False, outputs='None')
         else:
             irobj_path = {}
             def r(t, current_path):
@@ -245,8 +273,12 @@ class FuncEmission(CodeEmission):
             if all(len(x) == 1 for x in irobj_path.values()):
                 # if all IRObjects are leafs, we can directly assign the output
                 outputs = [self.tensor_name(t) for t in node.outputs()]
-                outputs = ', '.join(outputs)
-                codes.append(f'{outputs} = {body}')
+                outputs_str = ', '.join(outputs)
+                codes.append(f'{outputs_str} = {body}')
+                _insert_hook(
+                    outputs=outputs_str if len(node.outputs()) == 1 else _to_tuple_str(outputs),
+                    is_pre=False
+                )
             else:
                 outputs = []
                 im_outputs = []
@@ -258,7 +290,12 @@ class FuncEmission(CodeEmission):
                         im_ouptut = self.tensor_name(IRObject('im_output'))
                         im_outputs.append(im_ouptut)
                         outputs.append(im_ouptut)
-                codes.append(f'{", ".join(outputs)} = {body}')
+                outputs_str = ', '.join(outputs)
+                codes.append(f'{outputs_str} = {body}')
+                _insert_hook(
+                    outputs=outputs_str if len(node.outputs()) == 1 else _to_tuple_str(outputs),
+                    is_pre=False
+                )
 
                 for t, path in irobj_path.items():
                     if len(path) == 1: # immediate output, skip
