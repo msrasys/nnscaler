@@ -2973,7 +2973,7 @@ def trimmed_broadcast_merged_state_dict(
     ret = None
 
     if cur_rank == src_rank:
-        pmodule_stubs = [_construct_parallel_module_stub(r[0]) for r in rank_metadatas]
+        pmodule_stubs = {rank : _construct_parallel_module_stub(r[0]) for rank, r in zip(dst_ranks, rank_metadatas)}
         opt_extra_states = [r[1] for r in rank_metadatas]
         for rank in dst_ranks:
             if rank != cur_rank:
