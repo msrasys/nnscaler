@@ -1765,10 +1765,10 @@ def merge_state_dicts(
         sorted_state_dicts =[None] * len(state_dicts)
         for state_dict in state_dicts:
             rank = _get_state_dict_rank(state_dict)
-            if sorted_state_dicts[rank] is not None:
-                raise ValueError(f"Duplicate rank {rank} in state_dicts.")
             if rank >= len(state_dicts):
                 raise ValueError(f"Invalid rank {rank} in state_dicts.")
+            if sorted_state_dicts[rank] is not None:
+                raise ValueError(f"Duplicate rank {rank} in state_dicts.")
             sorted_state_dicts[rank] = state_dict
         return sorted_state_dicts
 
