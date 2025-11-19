@@ -1015,9 +1015,9 @@ class Trainer:
             self.optimizer.zero_grad()
             self.hook.after_zero_grad(self)
 
-            self.hook.on_train_step_start(self, batches[:num_batches])
+            self.hook.on_train_step_start(self, batches, num_batches)
             losses = self.model.train_step(batches, is_dummy_batch)
-            self.hook.on_train_step_end(self, losses[:num_batches])
+            self.hook.on_train_step_end(self, losses, num_batches)
 
             aggregate_outputs = self.train_args.resolved_aggregate_outputs_fn or self.aggregate_outputs
             aggregated_outputs = aggregate_outputs(losses[:num_batches], self.sync_group)

@@ -122,6 +122,7 @@ def wrap_ring_attn_varlen_func(
         window_size: Tuple[int] = (-1, -1),
         deterministic: bool = False,
         return_attn_probs: bool = False,
+        enable_ring: bool = True,
         process_group: Tuple[int] = None,
 ):
     '''
@@ -135,7 +136,7 @@ def wrap_ring_attn_varlen_func(
     max_seqlen_q = (cu_seqlens_q[1:] - cu_seqlens_q[:-1]).max().item()
     max_seqlen_k = (cu_seqlens_k[1:] - cu_seqlens_k[:-1]).max().item()
 
-    if process_group is None or len(process_group) == 1:
+    if process_group is None or len(process_group) == 1 or not enable_ring:
         output = flash_attn_varlen_func(
             q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k,
             dropout_p=dropout_p,

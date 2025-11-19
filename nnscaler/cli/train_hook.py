@@ -81,19 +81,21 @@ class TrainHook:
             aggregated_outputs: the aggregated outputs of the current step
         """
 
-    def on_train_step_start(self, trainer: 'Trainer', batches: List[Any]) -> None:
+    def on_train_step_start(self, trainer: 'Trainer', batches: List[Any], num_batches: int) -> None:
         """
         Called at the beginning of each training step
         Please note one train step may contain multiple batches
         Args:
             batches: the current batches
+            num_batches: the number of batches in the current train step
         """
 
-    def on_train_step_end(self, trainer: 'Trainer', outputs: List[Any]) -> None:
+    def on_train_step_end(self, trainer: 'Trainer', outputs: List[Any], num_batches: int) -> None:
         """
         Called at the end of each training step
         Args:
             outputs: the outputs of the train_step
+            num_batches: the number of batches in the current train step
         """
 
     def on_val_step_start(self, trainer: 'Trainer', batches: List[Any]) -> None:
@@ -258,13 +260,13 @@ class AggregatedTrainHook(TrainHook):
         for hook in self.hooks:
             hook.on_step_end(trainer, epoch, idx, step_metrics, aggregated_outputs)
 
-    def on_train_step_start(self, trainer: 'Trainer', batches: List[Any]) -> None:
+    def on_train_step_start(self, trainer: 'Trainer', batches: List[Any], num_batches: int) -> None:
         for hook in self.hooks:
-            hook.on_train_step_start(trainer, batches)
+            hook.on_train_step_start(trainer, batches, num_batches)
 
-    def on_train_step_end(self, trainer: 'Trainer', outputs: List[Any]) -> None:
+    def on_train_step_end(self, trainer: 'Trainer', outputs: List[Any], num_batches: int) -> None:
         for hook in self.hooks:
-            hook.on_train_step_end(trainer, outputs)
+            hook.on_train_step_end(trainer, outputs, num_batches)
 
     def on_val_step_start(self, trainer: 'Trainer', batches: List[Any]) -> None:
         for hook in self.hooks:
