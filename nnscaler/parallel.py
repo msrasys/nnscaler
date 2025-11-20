@@ -1765,10 +1765,10 @@ def merge_state_dicts(
         sorted_state_dicts =[None] * len(state_dicts)
         for state_dict in state_dicts:
             rank = _get_state_dict_rank(state_dict)
+            if rank >= len(state_dicts):
+                raise ValueError(f"Invalid rank {rank} in state_dicts with length {len(state_dicts)}.")
             if sorted_state_dicts[rank] is not None:
                 raise ValueError(f"Duplicate rank {rank} in state_dicts.")
-            if rank >= len(state_dicts):
-                raise ValueError(f"Invalid rank {rank} in state_dicts.")
             sorted_state_dicts[rank] = state_dict
         return sorted_state_dicts
 
@@ -2973,8 +2973,8 @@ def trimmed_broadcast_merged_state_dict(
     ret = None
 
     if cur_rank == src_rank:
-        pmodule_stubs = [_construct_parallel_module_stub(r[0]) for r in rank_metadatas]
-        opt_extra_states = [r[1] for r in rank_metadatas]
+        pmodule_stubs = {rank : _construct_parallel_module_stub(r[0]) for rank, r in zip(dst_ranks, rank_metadatas)}
+        opt_extra_states = {rank : r[1] for rank, r in zip(dst_ranks, rank_metadatas)}
         for rank in dst_ranks:
             if rank != cur_rank:
                 logger.info(f'At rank {src_rank}: Trimming module state dict for rank {rank}')
