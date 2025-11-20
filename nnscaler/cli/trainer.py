@@ -281,10 +281,10 @@ class Trainer:
             [s['model'] for s in state_dicts],
             [s['optimizer'] for s in state_dicts] if not model_only else None,
         )
-        if model_only:
-            return {'model': module_state_dict}
         train_args = copy.deepcopy(state_dicts[0]['train_args'])
         train_args['checkpoint']['save_type'] = 'merged'
+        if model_only:
+            return {'model': module_state_dict, 'train_args': train_args}
 
         global_keys = {
             'model', 'optimizer', 'train_args',
