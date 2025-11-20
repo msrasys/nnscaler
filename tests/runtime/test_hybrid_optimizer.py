@@ -25,7 +25,7 @@ def param_clss_fn(param_name: str) -> tuple[int, int]:
         return 1, 0
 
 _lr_history = []
-def on_train_step_start(trainer: 'Trainer', batches, num_batches) -> None:
+def on_train_step_start(trainer: 'Trainer', batches) -> None:
     _lr_history.append((
         trainer.optimizer.optimizers[0].param_groups[0]['lr'],
         trainer.optimizer.optimizers[0].param_groups[1]['lr'],
