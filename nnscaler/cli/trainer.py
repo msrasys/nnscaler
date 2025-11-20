@@ -264,11 +264,11 @@ class Trainer:
         self.hook.after_setup(self)
 
     @classmethod
-    def _merge_checkpoint(cls, checkpoint_files: List[str], keep_opt: bool = True):
+    def _merge_checkpoint(cls, checkpoint_files: List[str], *, model_only: bool = False):
         state_dicts = []
         for f in checkpoint_files:
             state_dict = torch.load(f, map_location='cpu', weights_only=False)
-            if not keep_opt:
+            if model_only:
                 state_dict.pop('optimizer', None)
             state_dicts.append(state_dict)
         for i in range(1, len(state_dicts)):
@@ -279,8 +279,10 @@ class Trainer:
 
         module_state_dict, opt_state_dict = nnscaler.merge_state_dicts(
             [s['model'] for s in state_dicts],
-            [s['optimizer'] for s in state_dicts] if keep_opt else None,
+            [s['optimizer'] for s in state_dicts] if not model_only else None,
         )
+        if model_only:
+            return {'model': module_state_dict}
         train_args = copy.deepcopy(state_dicts[0]['train_args'])
         train_args['checkpoint']['save_type'] = 'merged'
 
@@ -383,8 +385,8 @@ class Trainer:
         return state_dict
 
     @classmethod
-    def merge_checkpoint(cls, checkpoint_files: List[str], output_file: str, keep_opt: bool = True):
-        merged_state_dict = cls._merge_checkpoint(checkpoint_files, keep_opt=keep_opt)
+    def merge_checkpoint(cls, checkpoint_files: List[str], output_file: str, *, model_only: bool = False):
+        merged_state_dict = cls._merge_checkpoint(checkpoint_files, model_only=model_only)
         torch.save(merged_state_dict, output_file)
 
     def _log_finalize(self):
@@ -1015,9 +1017,9 @@ class Trainer:
             self.optimizer.zero_grad()
             self.hook.after_zero_grad(self)
 
-            self.hook.on_train_step_start(self, batches, num_batches)
+            self.hook.on_train_step_start(self, batches[:num_batches])
             losses = self.model.train_step(batches, is_dummy_batch)
-            self.hook.on_train_step_end(self, losses, num_batches)
+            self.hook.on_train_step_end(self, losses[:num_batches])
 
             aggregate_outputs = self.train_args.resolved_aggregate_outputs_fn or self.aggregate_outputs
             aggregated_outputs = aggregate_outputs(losses[:num_batches], self.sync_group)
