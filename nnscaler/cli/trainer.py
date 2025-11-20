@@ -264,8 +264,13 @@ class Trainer:
         self.hook.after_setup(self)
 
     @classmethod
-    def _merge_checkpoint(cls, checkpoint_files: List[str]):
-        state_dicts = [torch.load(f, map_location='cpu', weights_only=False) for f in checkpoint_files]
+    def _merge_checkpoint(cls, checkpoint_files: List[str], keep_opt: bool = True):
+        state_dicts = []
+        for f in checkpoint_files:
+            state_dict = torch.load(f, map_location='cpu', weights_only=False)
+            if not keep_opt:
+                state_dict.pop('optimizer', None)
+            state_dicts.append(state_dict)
         for i in range(1, len(state_dicts)):
             if state_dicts[i]['train_args'] != state_dicts[0]['train_args']:
                 raise ValueError(f"train_args in {checkpoint_files[i]} is different from {checkpoint_files[0]}")
@@ -274,7 +279,7 @@ class Trainer:
 
         module_state_dict, opt_state_dict = nnscaler.merge_state_dicts(
             [s['model'] for s in state_dicts],
-            [s['optimizer'] for s in state_dicts]
+            [s['optimizer'] for s in state_dicts] if keep_opt else None,
         )
         train_args = copy.deepcopy(state_dicts[0]['train_args'])
         train_args['checkpoint']['save_type'] = 'merged'
@@ -378,8 +383,8 @@ class Trainer:
         return state_dict
 
     @classmethod
-    def merge_checkpoint(cls, checkpoint_files: List[str], output_file: str):
-        merged_state_dict = cls._merge_checkpoint(checkpoint_files)
+    def merge_checkpoint(cls, checkpoint_files: List[str], output_file: str, keep_opt: bool = True):
+        merged_state_dict = cls._merge_checkpoint(checkpoint_files, keep_opt=keep_opt)
         torch.save(merged_state_dict, output_file)
 
     def _log_finalize(self):
@@ -859,7 +864,7 @@ class Trainer:
         torch.cuda.reset_peak_memory_stats()
 
         if self.train_status.finished_train_steps >= self.max_train_steps:
-            logger.info(f"Training is skipped: already done.")
+            logger.info(f"Training is skipped: already done, finished_train_steps={self.train_status.finished_train_steps} >= max_train_steps={self.max_train_steps}.")
             return
 
         start_epoch = self.train_status.finished_train_steps // self.total_train_steps_per_epoch
@@ -1010,9 +1015,9 @@ class Trainer:
             self.optimizer.zero_grad()
             self.hook.after_zero_grad(self)
 
-            self.hook.on_train_step_start(self, batches[:num_batches])
+            self.hook.on_train_step_start(self, batches, num_batches)
             losses = self.model.train_step(batches, is_dummy_batch)
-            self.hook.on_train_step_end(self, losses[:num_batches])
+            self.hook.on_train_step_end(self, losses, num_batches)
 
             aggregate_outputs = self.train_args.resolved_aggregate_outputs_fn or self.aggregate_outputs
             aggregated_outputs = aggregate_outputs(losses[:num_batches], self.sync_group)

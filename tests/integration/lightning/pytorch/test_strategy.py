@@ -199,7 +199,7 @@ def after_aggregate_train_step_outputs(trainer: Trainer, aggregated_outputs, tra
     _correctnes_worker_train_loss_history.append(train_loss)
 
 
-def on_train_step_end(trainer: 'Trainer', outputs) -> None:
+def on_train_step_end(trainer: 'Trainer', outputs, num_batches) -> None:
     _correctnes_worker_single_loss_history.append(outputs[0].item())
 
 
