@@ -686,6 +686,7 @@ class SPMDSolver:
                     bw_comm_time = 0
                 intra_time = micro_batch_num * (fw_comm_time + bw_comm_time)
                 # double check the follow chain
+                # if `intra_time` (forward + backward) is 0, we assume both partitions are in the same follow chain
                 if self.get_father_id(op_idx) == self.get_father_id(producer) and intra_time == 0:
                     if src_p.operator.ir_cell.mirror is not None and tgt_p.operator.ir_cell.mirror is not None:
                         if self.p_fathers[op_idx][partition_idx] != self.p_fathers[producer][k]:

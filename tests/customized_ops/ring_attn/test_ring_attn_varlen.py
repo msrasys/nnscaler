@@ -17,8 +17,8 @@ try:
 except ImportError:
     pytest.skip("flash_attn_varlen_func not available", allow_module_level=True)
 
-from test_base import RingAttnTestBase, create_parametrized_tests
-from configs import DEFAULT_CORRECTNESS_CONFIGS, DEFAULT_MULTI_GPU_CONFIGS, DEFAULT_GQA_CONFIGS
+from .test_base import RingAttnTestBase, create_parametrized_tests
+from .configs import DEFAULT_CORRECTNESS_CONFIGS, DEFAULT_MULTI_GPU_CONFIGS, DEFAULT_GQA_CONFIGS
 
 
 class RingAttnVarlenTest(RingAttnTestBase):
@@ -27,6 +27,10 @@ class RingAttnVarlenTest(RingAttnTestBase):
     @property
     def runner_script_name(self) -> str:
         return "ring_attn_varlen_runner.py"
+
+    @property
+    def test_function_name(self) -> str:
+        return "ring_attn_varlen_test"
 
     @property
     def test_name_prefix(self) -> str:

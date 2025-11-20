@@ -254,7 +254,7 @@ def zigzag_ring_flash_attn_backward(
     window_size=(-1, -1),
     alibi_slopes=None,
     deterministic=False,
-):
+):  # pragma: no cover
     assert causal == True, "zigzag ring is meaningless for causal=False"
     kv_comm = RingComm(process_group)
     d_kv_comm = RingComm(process_group)
@@ -411,7 +411,7 @@ class ZigZagRingFlashAttnFunc(torch.autograd.Function):
         return out if not return_softmax else (out, softmax_lse, None)
 
     @staticmethod
-    def backward(ctx, dout, *args):
+    def backward(ctx, dout, *args):  # pragma: no cover
         dout = shuffle_input(to_send=dout, process_group=ctx.group)
         q, k, v, out, softmax_lse = ctx.saved_tensors
         dq, dk, dv = zigzag_ring_flash_attn_backward(

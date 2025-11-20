@@ -8,20 +8,22 @@ This module provides common functionality for both ring_attn and ring_attn_varle
 
 import os
 import sys
-import subprocess
 from abc import ABC, abstractmethod
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Tuple
+from functools import partial
 
 import pytest
 import torch
 
-from configs import (
+from .configs import (
     DEFAULT_CORRECTNESS_CONFIGS,
     DEFAULT_MULTI_GPU_CONFIGS,
     DEFAULT_GQA_CONFIGS,
     get_config,
     list_configs
 )
+
+from ...launch_torchrun import torchrun
 
 
 class RingAttnTestBase(ABC):
@@ -39,11 +41,17 @@ class RingAttnTestBase(ABC):
         """Return the prefix for test names (e.g., 'ring_attn' or 'ring_attn_varlen')"""
         pass
 
+    @property
+    @abstractmethod
+    def test_function_name(self) -> str:
+        """Return the name of the test function to import (e.g., 'zigzag_attn_test')"""
+        pass
+
     def _check_gpu_availability(self, required_gpus: int):
         """Check if enough GPUs are available and skip test if not"""
         if not torch.cuda.is_available():
             pytest.skip("CUDA is not available")
-        
+
         available_gpus = torch.cuda.device_count()
         if available_gpus < required_gpus:
             pytest.skip(f"Test requires {required_gpus} GPUs, but only {available_gpus} available")
@@ -54,7 +62,11 @@ class RingAttnTestBase(ABC):
         return os.path.abspath(os.path.join(current_dir, "../../../"))
 
     def get_bash_arguments(self, num_gpus_per_node: int, **kwargs) -> List[str]:
-        """Generate command line arguments for running the test script"""
+        """Generate command line arguments for running the test script
+
+        Deprecated: This method is kept for backward compatibility.
+        The new implementation uses launch_torchrun directly.
+        """
         args = [
             "python3",
             "-m",
@@ -73,19 +85,37 @@ class RingAttnTestBase(ABC):
             args.append(f"{k}={v}")
         return args
 
+    def _get_test_function(self):
+        """Get the test function for this test"""
+        # Add the script directory to sys.path to allow imports
+        project_root = self._get_project_root()
+        script_dir = os.path.join(project_root, "tests", "customized_ops", "ring_attn")
+        if script_dir not in sys.path:
+            sys.path.insert(0, script_dir)
+
+        # Import the module and get the test function
+        module_name = self.runner_script_name.replace('.py', '')
+        module = __import__(module_name)
+
+        if hasattr(module, self.test_function_name):
+            return getattr(module, self.test_function_name)
+        else:
+            raise ImportError(f"Could not find function '{self.test_function_name}' in {module_name}")
+
     def run_test_subprocess(self, num_gpus: int, **kwargs):
-        """Run test using subprocess with the configured runner script"""
-        # Check GPU availability before running subprocess
+        """Run test using torchrun with the configured test function"""
+        # Check GPU availability before running test
         self._check_gpu_availability(num_gpus)
 
-        subprocess.run(
-            self.get_bash_arguments(
-                num_gpus_per_node=num_gpus,
-                **kwargs
-            ),
-            check=True,
-            cwd=self._get_project_root()
-        )
+        # Get the test function and use torchrun to execute it
+        test_function = self._get_test_function()
+
+        # Extract common parameters
+        dtype = kwargs.get('dtype', 'bf16')
+        config_name = kwargs.get('config_name', 'tiny')
+
+        # Use partial with positional arguments like test_gnorm.py
+        return partial(torchrun, num_gpus, test_function, dtype, config_name)()
 
     # Common test methods that can be used by both ring_attn and ring_attn_varlen
 

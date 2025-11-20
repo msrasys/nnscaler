@@ -88,6 +88,20 @@ class IRCell:
         # the operation context information
         self._op_context: Optional[Dict[str, Any]] = None
 
+        # function to be called before the op is executed
+        # which will be inserted in the runtime code before the op call.
+        # op's inputs will be passed to the hook.
+        # The signature will be like
+        # def pre_hook(module: ParallelModule, meta: Any, inputs: Tuple[Any, ...], kwargs: Dict[str, Any]) -> None:
+        self._pre_hook: Optional[Callable[..., None]] = None
+        # function to be called after the op is executed
+        # which will be inserted in the runtime code after the op call.
+        # op's inputs and outputs will be passed to the hook.
+        # the signature will be like
+        # def post_hook(module: ParallelModule, meta: Any, inputs: Tuple[Any, ...], kwargs: Dict[str, Any], output: Any) -> None:
+        self._post_hook: Optional[Callable[..., None]] = None
+        self._hook_meta: Any = None
+
     @property
     def cid(self) -> int:
         """
@@ -451,6 +465,30 @@ class IRCell:
             return load_type(self.signature)
         except Exception as e:
             return None
+
+    @property
+    def pre_hook(self) -> Optional[Callable[..., None]]:
+        return self._pre_hook
+
+    @pre_hook.setter
+    def pre_hook(self, hook: Optional[Callable[..., None]]):
+        self._pre_hook = hook
+
+    @property
+    def post_hook(self) -> Optional[Callable[..., None]]:
+        return self._post_hook
+
+    @post_hook.setter
+    def post_hook(self, hook: Optional[Callable[..., None]]):
+        self._post_hook = hook
+
+    @property
+    def hook_meta(self) -> Any:
+        return self._hook_meta
+
+    @hook_meta.setter
+    def hook_meta(self, meta: Any):
+        self._hook_meta = meta
 
     @property
     def op_context(self) -> Optional[Dict[str, Any]]:

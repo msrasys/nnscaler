@@ -21,7 +21,7 @@ IRDataOperation is recommended to be replicated to all devices.
 import ast
 from dataclasses import dataclass, field
 import logging
-from typing import List, Literal, Optional, TYPE_CHECKING, Callable, Iterable, Union
+from typing import Any, List, Literal, Optional, TYPE_CHECKING, Callable, Iterable, Union
 import random
 
 import torch
@@ -41,7 +41,7 @@ from nnscaler.runtime.function import identity, multiref
 
 
 if TYPE_CHECKING:
-    from nnscaler.parallel import ComputeConfig
+    from nnscaler.parallel import ComputeConfig, ParallelModule
 
 
 _logger = logging.getLogger(__name__)
@@ -374,6 +374,25 @@ class OpPlan:
     recompute_id: int = -1  # -1 means no recompute
     stage_id: int = -1       # pipeline stage id, -1 means following the previous op's stage
 
+    # user defined meta data for hooks
+    # which will be passed to the pre_hook and post_hook functions
+    # Note: Only types that can be safely `repr`-ed can be used here. (e.g., str, int, float, tuple, list, dict)
+    hook_meta: Any = None
+
+    # function to be called before the op is executed
+    # which will be inserted in the runtime code before the op call.
+    # op's inputs will be passed to the hook.
+    # The signature will be like
+    # def pre_hook(module: ParallelModule, meta: Any, inputs: Tuple[Any, ...], kwargs: Dict[str, Any]) -> None:
+    pre_hook: Optional[Callable[['ParallelModule', Any, tuple[Any, ...], dict[str, Any]], None]] = None
+
+    # function to be called after the op is executed
+    # which will be inserted in the runtime code after the op call.
+    # op's inputs and outputs will be passed to the hook.
+    # the signature will be like
+    # def post_hook(module: ParallelModule, meta: Any, inputs: Tuple[Any, ...], kwargs: Dict[str, Any], output: Any) -> None:
+    post_hook: Optional[Callable[['ParallelModule', Any, tuple[Any, ...], dict[str, Any], Any], None]] = None
+
     # OpPartition: user specified partition plan
     #   You only need to specify one partition plan here.
     #   For example, torch.matmul has annotation of `m k+, k+ n -> m n`,
@@ -530,6 +549,10 @@ def fn(
     for node in fw_nodes:
         if node not in op_plans:
             op_plans[node] = OpPlan(op=node)  # default: no partition, stage 0, no recompute
+
+        node.hook_meta = op_plans[node].hook_meta
+        node.pre_hook = op_plans[node].pre_hook
+        node.post_hook = op_plans[node].post_hook
 
         op_plan = op_plans[node]
 

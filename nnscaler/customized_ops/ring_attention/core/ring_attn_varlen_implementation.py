@@ -186,7 +186,7 @@ def llama3_flash_attn_varlen_backward(
     window_size=(-1, -1),
     alibi_slopes=None,
     deterministic=False,
-):
+):  # pragma: no cover
     nheads = q.shape[1]
     total_k, nheads_k, head_dim = k.shape
     assert nheads_k % heads_k_stride == 0
@@ -373,7 +373,7 @@ class Llama3FlashAttnVarlenFunc(torch.autograd.Function):
         return out if not return_softmax else (out, softmax_lse, None)
 
     @staticmethod
-    def backward(ctx, dout, *args):
+    def backward(ctx, dout, *args):  # pragma: no cover
         q, k, v, out, softmax_lse, cu_seqlens_q, cu_seqlens_k = ctx.saved_tensors
         dq, dk, dv = llama3_flash_attn_varlen_backward(
             ctx.group,

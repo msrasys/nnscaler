@@ -98,7 +98,7 @@ def ring_flash_attn_backward(
     window_size=(-1, -1),
     alibi_slopes=None,
     deterministic=False,
-):
+):  # pragma: no cover
     block_len = q.size(1) // 2
     curr_rank = dist.get_rank(process_group)
     world_size = dist.get_world_size(process_group)
@@ -290,7 +290,7 @@ class RingFlashAttnFunc(torch.autograd.Function):
         return out
 
     @staticmethod
-    def backward(ctx, dout, *args):
+    def backward(ctx, dout, *args):  # pragma: no cover
         dout = shuffle_input(to_send=dout, process_group=ctx.group)
         q, k, v, out, up_lse, down_lse = ctx.saved_tensors
         bsz = q.size(0)

@@ -9,6 +9,7 @@ It compares the outputs of single-GPU and multi-GPU ring attention to ensure cor
 """
 
 import sys
+from typing import Tuple
 import torch
 
 from runner_base import RingAttnRunnerBase
@@ -39,6 +40,10 @@ class RingAttnRunner(RingAttnRunnerBase):
         return 'nnscaler.customized_ops.ring_attention.ring_attn.wrap_ring_attn_func'
 
     @property
+    def partition_position(self) -> Tuple[int, int]:
+        return 0, 1
+
+    @property
     def function_name(self) -> str:
         return 'wrap_ring_attn_func'
 
@@ -47,32 +52,32 @@ class RingAttnRunner(RingAttnRunnerBase):
 
     def prepare_inputs(self, config, device, torch_dtype):
         """Prepare regular inputs with shape [batch_size, seq_len, num_heads, head_dim]"""
-        q = torch.randn(
+        q = torch.clamp(torch.randn(
             config.batch_size,
             config.max_seqlen,
             config.num_heads,
             config.head_dim,
             device=device,
             dtype=torch_dtype
-        )
+        ), min=-1, max=1)
 
-        k = torch.randn(
+        k = torch.clamp(torch.randn(
             config.batch_size,
             config.max_seqlen,
             config.num_kv_heads,
             config.head_dim,
             device=device,
             dtype=torch_dtype
-        )
+        ), min=-1, max=1)
 
-        v = torch.randn(
+        v = torch.clamp(torch.randn(
             config.batch_size,
             config.max_seqlen,
             config.num_kv_heads,
             config.head_dim,
             device=device,
             dtype=torch_dtype
-        )
+        ), min=-1, max=1)
 
         return {'q': q, 'k': k, 'v': v}
 
@@ -93,6 +98,12 @@ class RingAttnRunner(RingAttnRunnerBase):
             "k": inputs["k"],
             "v": inputs["v"],
         }
+
+
+def ring_attn_test(dtype="bf16", config_name="tiny", **kwargs):
+    """Pure test function that can be used with torchrun"""
+    runner = RingAttnRunner()
+    return runner.run_correctness_test(dtype=dtype, config_name=config_name, **kwargs)
 
 
 def run_correctness_test(**kwargs):

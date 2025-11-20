@@ -139,6 +139,18 @@ class ModuleCodeGen(FuncEmission):
             # self.init_code.append('@torch.jit.script')
             self.init_code.append(op_impl)
             self.init_code += ['']
+
+        # hooks
+        hook_imports = set()
+        for node in execplan.graph.select(ntype=IRFwOperation):
+            if node.pre_hook is not None:
+                hook_imports.add(inspect.getmodule(node.pre_hook).__name__)
+            if node.post_hook is not None:
+                hook_imports.add(inspect.getmodule(node.post_hook).__name__)
+        for modname in hook_imports:
+            self.init_code.append(f'import {modname}')
+            self.init_code += ['']
+
         # module init code
         self.model_init_statements: List[str] = list()
         # module method bodies for forward computations, e.g. Segments, Adapters.

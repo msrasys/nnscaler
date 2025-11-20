@@ -10,7 +10,8 @@ import torch.nn as nn
 
 from nnscaler.parallel import ComputeConfig, _load_parallel_module_class, parallelize
 from nnscaler.policies import get_called_self_module_name, get_pas_ops
-from tests.parallel_module.common import FFN
+from tests.launch_torchrun import launch_torchrun
+from tests.parallel_module.common import FFN, init_distributed
 from tests.parallel_module.test_gencode import _gencode_contains, print_gencode
 
 from .utils import init_random, replace_all_device_with
@@ -871,3 +872,114 @@ def test_codegen_fn_pipeline2(tmp_path):
     )
     # should successfully generate code without error
     assert True
+
+
+class HookModule(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.linear = torch.nn.Linear(4, 4)
+
+    def forward(self, x):
+        a, b = x.size()[:2]
+        r = torch.randn(a * 2, b)
+        r = r.chunk(2, dim=0)[0]
+        return self.linear(x) + r
+
+
+
+def hello(module, meta, *args, **kwargs):
+    print(f'hello: {meta}')
+
+
+def policy_hook(graph, cfg):
+    from nnscaler.policies import OpPlan, OpPartition
+    # add hook to all ops
+    def _hook(op_plan: OpPlan):
+        op_plan.pre_hook = hello
+        op_plan.post_hook = hello
+        op_plan.hook_meta = op_plan.op.name
+        return op_plan
+
+    for node in get_pas_ops(graph):
+        if node.fn == torch.nn.functional.linear:
+            yield _hook(OpPlan(node, partition=OpPartition(input=1, dim=0)))
+        else:
+            yield _hook(OpPlan(node))
+
+
+@replace_all_device_with('cpu')
+def test_codegen_fn_with_hook(tmp_path):
+    parallelize(
+        HookModule(),
+        {'x': torch.randn(4, 4)},
+        policy_hook,
+        ComputeConfig(2, 4),
+        gen_savedir=tmp_path,
+        load_module=False
+    )
+    # should successfully generate code without error
+    # and hooks are inserted
+    for rank in range(4):
+        assert _gencode_contains(tmp_path, HookModule, rank, r'tests.test_policies.hello\(self,')
+
+    # Generated code of rank 0 looks like:
+    # def segment64(self, x_32):
+    #     x_32 = nnscaler.runtime.adapter.nn.identity_allreduce(x_32, ranks=[0, 1])
+    #     # File "/home/weijiangxu/MagicCube/tests/test_policies.py", line 883, in forward,  a, b = x.size()[:2]
+    #     tests.test_policies.hello(self, 'size', (x_32, ), dict())
+    #     im_output_63 = torch.Tensor.size(x_32)
+    #     tests.test_policies.hello(self, 'size', (x_32, ), dict(), im_output_63)
+    #     size_26 = im_output_63[0]
+    #     size_27 = im_output_63[1]
+    #     del im_output_63
+    #     # File "/home/weijiangxu/MagicCube/tests/test_policies.py", line 884, in forward,  r = torch.randn(a * 2, b)
+    #     tests.test_policies.hello(self, 'mul', (size_26, 2), dict())
+    #     mul_28 = _operator.mul(size_26, 2)
+    #     tests.test_policies.hello(self, 'mul', (size_26, 2), dict(), mul_28)
+    #     # File "/home/weijiangxu/MagicCube/tests/test_policies.py", line 884, in forward,  r = torch.randn(a * 2, b)
+    #     tests.test_policies.hello(self, 'randn', (), dict(size=(mul_28, size_27), requires_grad=False, dtype=torch.float32, pin_memory=False))
+    #     randn_34 = nnscaler.runtime.function.randn(size=(mul_28, size_27), requires_grad=False, dtype=torch.float32, pin_memory=False)
+    #     tests.test_policies.hello(self, 'randn', (), dict(size=(mul_28, size_27), requires_grad=False, dtype=torch.float32, pin_memory=False), randn_34)
+    #     # File "/home/weijiangxu/MagicCube/tests/test_policies.py", line 885, in forward,  r = r.chunk(2, dim=0)[0]
+    #     tests.test_policies.hello(self, 'chunk', (randn_34, ), dict(chunks=2, dim=0))
+    #     chunk_35, chunk_36 = torch.chunk(randn_34, chunks=2, dim=0)
+    #     tests.test_policies.hello(self, 'chunk', (randn_34, ), dict(chunks=2, dim=0), (chunk_35, chunk_36))
+    #     del randn_34, chunk_36
+    #     # File "/home/weijiangxu/MagicCube/tests/test_policies.py", line 886, in forward,  return self.linear(x) + r
+    #     tests.test_policies.hello(self, 'linear', (x_32, self.linear_weight_45, self.linear_bias_47), dict())
+    #     linear_49 = torch.nn.functional.linear(x_32, self.linear_weight_45, self.linear_bias_47)
+    #     tests.test_policies.hello(self, 'linear', (x_32, self.linear_weight_45, self.linear_bias_47), dict(), linear_49)
+    #     del x_32
+    #     linear_39 = nnscaler.runtime.adapter.nn.allgather_split(linear_49, dim=1, ranks=[0, 1])
+    #     del linear_49
+    #     # File "/home/weijiangxu/MagicCube/tests/test_policies.py", line 886, in forward,  return self.linear(x) + r
+    #     tests.test_policies.hello(self, 'add', (linear_39, chunk_35), dict(alpha=1))
+    #     add_33 = torch.add(linear_39, chunk_35, alpha=1)
+    #     tests.test_policies.hello(self, 'add', (linear_39, chunk_35), dict(alpha=1), add_33)
+    #     del chunk_35, linear_39
+    #     return add_33
+
+
+def _gencode_unused_args_worker(tempdir):
+    init_distributed()
+    m_new = parallelize(
+        HookModule(),
+        {'x': torch.randn(4, 4)},
+        policy_hook,
+        ComputeConfig(2, 2),
+        gen_savedir=tempdir,
+        load_module=True
+    )
+    assert m_new is not None
+    m_new(torch.randn(4, 4))
+    # should successfully run without error
+    assert True
+
+
+@pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.device_count() < 2, reason='lack of gpu devices')
+def test_run_codegen_fn_with_hook():
+    """
+    Verify the generated code can run correctly.
+    """
+    with tempfile.TemporaryDirectory() as tempdir:
+        launch_torchrun(2, _gencode_unused_args_worker, tempdir)
