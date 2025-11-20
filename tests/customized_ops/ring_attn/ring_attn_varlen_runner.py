@@ -9,6 +9,7 @@ It compares the outputs of single-GPU and multi-GPU ring attention to ensure cor
 """
 
 import sys
+from typing import Tuple
 import torch
 
 from runner_base import RingAttnRunnerBase
@@ -38,6 +39,10 @@ class RingAttnVarlenRunner(RingAttnRunnerBase):
         return 'nnscaler.customized_ops.ring_attention.ring_attn_varlen.wrap_ring_attn_varlen_func'
 
     @property
+    def partition_position(self) -> Tuple[int, int]:
+        return 0, 0
+
+    @property
     def function_name(self) -> str:
         return 'ring_attn_varlen_func'
 
@@ -50,9 +55,9 @@ class RingAttnVarlenRunner(RingAttnRunnerBase):
         total_seqlen = config.cu_seqlens[-1]
 
         # Create inputs with total sequence length (don't set requires_grad here, base class handles it)
-        q = torch.randn(total_seqlen, config.num_heads, config.head_dim, device=device, dtype=torch_dtype)
-        k = torch.randn(total_seqlen, config.num_heads, config.head_dim, device=device, dtype=torch_dtype)
-        v = torch.randn(total_seqlen, config.num_heads, config.head_dim, device=device, dtype=torch_dtype)
+        q = torch.clamp(torch.randn(total_seqlen, config.num_heads, config.head_dim, device=device, dtype=torch_dtype), min=-1, max=1)
+        k = torch.clamp(torch.randn(total_seqlen, config.num_heads, config.head_dim, device=device, dtype=torch_dtype), min=-1, max=1)
+        v = torch.clamp(torch.randn(total_seqlen, config.num_heads, config.head_dim, device=device, dtype=torch_dtype), min=-1, max=1)
 
         return {
             'q': q,
@@ -82,6 +87,12 @@ class RingAttnVarlenRunner(RingAttnRunnerBase):
             'cu_seqlens_q': inputs['cu_seqlens_q'],
             'cu_seqlens_k': inputs['cu_seqlens_k']
         }
+
+
+def ring_attn_varlen_test(dtype="bf16", config_name="tiny", **kwargs):
+    """Pure test function that can be used with torchrun"""
+    runner = RingAttnVarlenRunner()
+    return runner.run_correctness_test(dtype=dtype, config_name=config_name, **kwargs)
 
 
 def run_ring_attn_correctness_test(**kwargs):

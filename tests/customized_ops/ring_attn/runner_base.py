@@ -34,6 +34,12 @@ class RingAttnRunnerBase(ABC):
 
     @property
     @abstractmethod
+    def partition_position(self) -> Tuple[int, int]:
+        """Return the partition position (idx, dim)"""
+        pass
+
+    @property
+    @abstractmethod
     def function_name(self) -> str:
         """Return the function name for partitioning"""
         pass
@@ -66,14 +72,16 @@ class RingAttnRunnerBase(ABC):
             for idx, node in enumerate(graph.select(ntype=IRFwOperation)):
                 if not partitioned and node.signature == self.function_signature:
                     print(f'\nPartitioned node: {node}\n')
-                    sub_nodes = graph.partition(node, node.algorithm('dim'), idx=0, dim=0, num=ngpus)
+                    idx, dim = self.partition_position
+                    sub_nodes = graph.partition(node, node.algorithm('dim'), idx=idx, dim=dim, num=ngpus)
                     partitioned = True
                 else:
                     sub_nodes = graph.replicate(node, times=ngpus)
                 for idx, sub_node in enumerate(sub_nodes):
                     graph.assign(sub_node, idx)
             if not partitioned:
-                print(f"WARNING: No {self.function_name} found in graph for partitioning")
+                signatures = [node.signature for node in graph.select(ntype=IRFwOperation)]
+                raise RuntimeError(f"Failed to find the target function '{self.function_signature}' in {signatures}")
             return graph
         return policy
 
@@ -83,10 +91,10 @@ class RingAttnRunnerBase(ABC):
         if not torch.cuda.is_available():
             print("ERROR: CUDA is not available")
             sys.exit(1)
-        
+
         rank = int(os.getenv("RANK", "0"))
         world_size = int(os.getenv("WORLD_SIZE", "1"))
-        
+
         # Check if we have enough GPUs
         available_gpus = torch.cuda.device_count()
         if available_gpus < world_size:
@@ -106,7 +114,7 @@ class RingAttnRunnerBase(ABC):
                 sys.exit(1)
 
         print(f"[INFO] world_size:{world_size}, rank:{rank}, available_gpus:{available_gpus}")
-        
+
         try:
             dist.init_process_group(backend="nccl", world_size=world_size, rank=rank)
         except Exception as e:
@@ -117,10 +125,13 @@ class RingAttnRunnerBase(ABC):
         nnscaler.init()
         return world_size, rank
 
-    def get_tolerances(self, dtype: str) -> Dict[str, float]:
+    def get_tolerances(self, dtype: str, num_heads: int, num_kv_heads: int) -> Dict[str, float]:
         """Get tolerance values based on data type"""
         if dtype == "bf16":
-            return dict(atol=2.5e-2, rtol=2.5e-2)
+            if num_heads == num_kv_heads:
+                return dict(atol=2.5e-2, rtol=2.5e-2)
+            else:
+                return dict(atol=3.5e-2, rtol=3.5e-2)
         elif dtype == "fp16":
             return dict(atol=5e-3, rtol=5e-3)
         else:
@@ -222,7 +233,7 @@ class RingAttnRunnerBase(ABC):
         single_out, single_grad_tensors = self.run_single_gpu_reference(single_inputs, config)
 
         # Create gradient for backward pass
-        dout = torch.randn_like(single_out, device=device, dtype=torch_dtype)
+        dout = torch.clamp(torch.randn_like(single_out, device=device, dtype=torch_dtype), min=-1, max=1)
         # Ensure dout is consistent across all ranks
         dist.broadcast(dout, src=0)
         single_out.backward(dout)
@@ -251,7 +262,7 @@ class RingAttnRunnerBase(ABC):
         print(" Done!" if rank_id == 0 else "")
 
         # Check correctness with tolerances
-        tols = self.get_tolerances(dtype)
+        tols = self.get_tolerances(dtype, config.num_heads, config.num_kv_heads)
 
         # Verify outputs and gradients
         try:

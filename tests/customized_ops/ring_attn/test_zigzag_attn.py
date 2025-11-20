@@ -20,7 +20,7 @@ try:
 except ImportError:
     pytest.skip("flash_attn_func not available", allow_module_level=True)
 
-from test_base import RingAttnTestBase
+from .test_base import RingAttnTestBase
 
 
 class TestZigzagAttn(RingAttnTestBase):
@@ -29,6 +29,10 @@ class TestZigzagAttn(RingAttnTestBase):
     @property
     def runner_script_name(self) -> str:
         return "zigzag_attn_runner.py"
+
+    @property
+    def test_function_name(self) -> str:
+        return "zigzag_attn_test"
 
     @property
     def test_name_prefix(self) -> str:

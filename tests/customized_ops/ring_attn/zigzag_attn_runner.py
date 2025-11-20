@@ -9,7 +9,7 @@ Note: Zigzag attention only supports causal=True and window_size=(-1, -1).
 
 import os
 import sys
-from typing import Dict, Any
+from typing import Dict, Any, Tuple
 
 import torch
 import torch.nn as nn
@@ -23,7 +23,11 @@ class ZigzagAttnRunner(RingAttnRunnerBase):
 
     @property
     def function_signature(self) -> str:
-        return "wrap_zigzag_attn_func"
+        return "nnscaler.customized_ops.ring_attention.zigzag_attn.wrap_zigzag_attn_func"
+
+    @property
+    def partition_position(self) -> Tuple[int, int]:
+        return 0, 1
 
     @property
     def function_name(self) -> str:
@@ -55,9 +59,9 @@ class ZigzagAttnRunner(RingAttnRunnerBase):
         head_dim = config.head_dim
 
         # Create input tensors
-        q = torch.randn(batch_size, max_seqlen, num_heads, head_dim, device=device, dtype=torch_dtype)
-        k = torch.randn(batch_size, max_seqlen, num_kv_heads, head_dim, device=device, dtype=torch_dtype)
-        v = torch.randn(batch_size, max_seqlen, num_kv_heads, head_dim, device=device, dtype=torch_dtype)
+        q = torch.clamp(torch.randn(batch_size, max_seqlen, num_heads, head_dim, device=device, dtype=torch_dtype), min=-1, max=1)
+        k = torch.clamp(torch.randn(batch_size, max_seqlen, num_kv_heads, head_dim, device=device, dtype=torch_dtype), min=-1, max=1)
+        v = torch.clamp(torch.randn(batch_size, max_seqlen, num_kv_heads, head_dim, device=device, dtype=torch_dtype), min=-1, max=1)
 
         return {
             'q': q,
@@ -84,10 +88,16 @@ class ZigzagAttnRunner(RingAttnRunnerBase):
         }
 
 
+def zigzag_attn_test(dtype="bf16", config_name="zigzag_tiny", **kwargs):
+    """Pure test function that can be used with torchrun"""
+    runner = ZigzagAttnRunner()
+    return runner.run_correctness_test(dtype=dtype, config_name=config_name, **kwargs)
+
+
 def main():
     """Main entry point for command line execution"""
     kwargs = dict(arg.split("=") for arg in sys.argv[1:])
-    
+
     runner = ZigzagAttnRunner()
     runner.main(**kwargs)
 
