@@ -269,6 +269,7 @@ class Trainer:
         for f in checkpoint_files:
             state_dict = torch.load(f, map_location='cpu', weights_only=False)
             if model_only:
+                # we pop optimizer state to save cpu memory
                 state_dict.pop('optimizer', None)
             state_dicts.append(state_dict)
         for i in range(1, len(state_dicts)):
