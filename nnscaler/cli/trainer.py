@@ -864,7 +864,7 @@ class Trainer:
         torch.cuda.reset_peak_memory_stats()
 
         if self.train_status.finished_train_steps >= self.max_train_steps:
-            logger.info(f"Training is skipped: already done.")
+            logger.info(f"Training is skipped: already done, finished_train_steps={self.train_status.finished_train_steps} >= max_train_steps={self.max_train_steps}.")
             return
 
         start_epoch = self.train_status.finished_train_steps // self.total_train_steps_per_epoch
