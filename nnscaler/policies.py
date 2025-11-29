@@ -279,6 +279,7 @@ def pas_autodist(graph: IRGraph, cfg: 'ComputeConfig') -> IRGraph:
     save_plan_path = pas_cfg.get('save_plan_path', None)
     partition_constraints_path = pas_cfg.get('partition_constraints_path', '')
     recompute_modules = pas_cfg.get('recompute_modules', '')
+    recompute_ratio = pas_cfg.get('recompute_ratio', 1.0)
     pipeline_pivots = pas_cfg.get('pipeline_pivots', '')
     max_pipeline_bubble_ratio = pas_cfg.get('max_pipeline_bubble_ratio', 0.2)
     max_pipeline_unbalance_ratio = pas_cfg.get('max_pipeline_unbalance_ratio', 0.5)
@@ -341,6 +342,7 @@ def pas_autodist(graph: IRGraph, cfg: 'ComputeConfig') -> IRGraph:
         re_profile=re_profile,
         world_size=cfg.runtime_ngpus,
         recompute_modules=recompute_modules,
+        recompute_ratio=recompute_ratio,
         zero_stage=zero_stage,
         zero_ngroups=zero_ngroups,
         load_plan_path=load_plan_path,

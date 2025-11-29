@@ -72,6 +72,12 @@ class AutoDistConfig:
         `x.module1` will match `x.module1` but not `y.module1`.
         Due to constraint of the tracer, you can pass `ROOT` to recompute_modules if you want the whole module to
         be recomputed.
+    - recompute_ratio ('float`, *optional*, defaults to `1.0`):
+        When `recompute_modules` only contains one name (excluding `ROOT`), this specify the ratio of modules
+        to be recomputed. For example, if `module1` is specified in `recompute_modules` and `recompute_ratio` is `0.8`,
+        only 80% of `module1` instances will be recomputed.
+        If there are multiple module names in `recompute_modules`, this field will be ignored and all specified modules
+        will be recomputed.
     - memory_constraint (`float`, *optional*, defaults to `32`):
         The memory constraint in each device in GB.
     - memory_granularity (`int`, *optional*, defaults to `1`):
@@ -133,6 +139,7 @@ class AutoDistConfig:
                  mesh_row=1,
                  mesh_col=1,
                  recompute_modules='',
+                 recompute_ratio=1.0,
                  memory_constraint=32,
                  memory_granularity=1,
                  micro_batch_size=1,
@@ -166,6 +173,7 @@ class AutoDistConfig:
         self.is_train = is_train
         self.mesh_desc = MeshDesc(mesh_row, mesh_col)
         self.recompute_modules = recompute_modules
+        self.recompute_ratio = recompute_ratio
         # from GB to Byte
         self.memory_constraint = int(memory_constraint * 1024 * 1024 * 1024)
         self.memory_granularity = memory_granularity
