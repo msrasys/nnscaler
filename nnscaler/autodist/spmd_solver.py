@@ -261,6 +261,9 @@ class SPMDSolver:
             if len(consumers) == 1:
                 continue
             _logger.info(f'find shared parameter {param} in {consumers}')
+            if self.autodist_config.disable_shared_param_constraint:
+                _logger.info(f'disable shared parameter constraint for {param}')
+                continue
             for consumer in consumers:
                 if not isinstance(consumer, IRDimops):
                     # always replicate non-dimops

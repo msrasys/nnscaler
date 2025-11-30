@@ -286,6 +286,7 @@ def pas_autodist(graph: IRGraph, cfg: 'ComputeConfig') -> IRGraph:
     use_apex_fused_adam_v2 = pas_cfg.get('use_apex_fused_adam_v2', False)
     parallel_profile = pas_cfg.get('parallel_profile', True)
     transient_mem_coef = pas_cfg.get('transient_mem_coef', 2)
+    disable_shared_param_constraint = pas_cfg.get('disable_shared_param_constraint', False)
 
     task_name = f'{task_name}_{cfg.plan_ngpus}gpus_{update_freq}update_freq'
     if memory_constraint == -1:
@@ -353,6 +354,7 @@ def pas_autodist(graph: IRGraph, cfg: 'ComputeConfig') -> IRGraph:
         max_pipeline_unbalance_ratio=max_pipeline_unbalance_ratio,
         parallel_profile=parallel_profile,
         transient_mem_coef=transient_mem_coef,
+        disable_shared_param_constraint=disable_shared_param_constraint,
     )
 
     return parallelize_graph(graph, autodist_cfg)

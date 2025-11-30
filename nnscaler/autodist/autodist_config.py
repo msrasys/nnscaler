@@ -121,6 +121,10 @@ class AutoDistConfig:
         `transient_mem_size = opt_transient_coef * (1st_largest_infer_mem + 2nd_largest_infer_mem)`. This formula
         is useful in many cases, but it may be too strict when some operators consume or generate a large tensor
         (>= 4GB). In this case, you can set `transient_mem_coef` to a smaller value to relax the constraint.
+    - disable_shared_param_constraint (`bool`, *optional*, defaults to `False`):
+        Whether to disable the shared parameter constraint in spmd solver. When a parameter is shared by multiple modules,
+        the spmd solver will force the parameter to be replicated to complicated adapter generation. However, user can disable
+        it and provide customized partition constraints for those shared parameters.
     """
 
     def __init__(self,
@@ -157,6 +161,7 @@ class AutoDistConfig:
                  solver='dp',
                  parallel_profile=True,
                  transient_mem_coef=2,
+                 disable_shared_param_constraint=False,
                  **kwargs):
         self.pc_path = partition_constraints_path
         self.profile_dir = profile_dir
@@ -200,6 +205,7 @@ class AutoDistConfig:
             self.solver = 'dp'
         self.parallel_profile = parallel_profile
         self.transient_mem_coef = transient_mem_coef
+        self.disable_shared_param_constraint = disable_shared_param_constraint
 
         ignored_keys = list(kwargs.keys())
         if ignored_keys:
