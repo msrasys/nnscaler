@@ -466,8 +466,10 @@ class IRAdapterGener:
 
                 # insert forward adapter
                 # graph.insert(fadapter, max(producers) + 1)
+                skip_recompute = False
                 if len(fconsumers) > 0:
                     fidx = min(graph.multi_index(fconsumers))
+                    skip_recompute = not any([consumer.recompute is not None for consumer in fconsumers])
                 else:
                     # no consumer: find the last forward node
                     for fidx, node in enumerate(graph.nodes()[::-1]):
@@ -476,7 +478,7 @@ class IRAdapterGener:
                             break
                 graph.insert(fadapter, fidx)
                 # setup recompute
-                if allow_recompute:
+                if allow_recompute and not skip_recompute:
                     if fidx > CellPosition(tuple([0])):
                         prev_node = graph.node(fidx-1)
                         if isinstance(prev_node, (IRFwOperation, IRAdapter)):
