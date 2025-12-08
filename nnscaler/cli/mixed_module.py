@@ -34,6 +34,15 @@ def fork_rng():
         return torch.random.fork_rng()
 
 
+def calc_function_hash(func: Any) -> str:
+    if isinstance(func, str):
+        return func
+
+    func_code = inspect.getsource(inspect.unwrap(func)).encode('utf-8')
+    import hashlib
+    return hashlib.md5(func_code).hexdigest()
+
+
 class ModuleParallelizeConfigAdapter(PrecisionMixin, PolicyMixin):
     """
     Adapter for ModuleParallelizeConfig and TrainerArgs
@@ -185,7 +194,7 @@ class ModuleParallelizeConfigAdapter(PrecisionMixin, PolicyMixin):
 
     def resolve_compute_config(self):
         compute_config = copy.deepcopy(self.compute_config)
-        compute_config.pas_config['__pas_name'] = self.pas_policy
+        compute_config.pas_config['__pas_name'] = calc_function_hash(self.pas_policy)
         # autodist configs
         compute_config.pas_config['update_freq'] = self.trainer_args.update_freq
         compute_config.pas_config['use_bf16'] = self.param_dtype == torch.bfloat16
