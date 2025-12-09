@@ -618,7 +618,8 @@ class CubeModule(torch.nn.Module):
                         opt_states_1d[key][offset:] = bucket_states[end_rank_id][key][:end_offset]
 
             if 'step' in bucket_states[0]:
-                opt_states['step'] = bucket_states[0]['step']
+                # make sure all steps are different tensors (with same value)
+                opt_states['step'] = bucket_states[0]['step'].clone()
             return opt_states
 
         def _merge_opt_zero(worker_idx, param_idx):

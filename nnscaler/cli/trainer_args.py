@@ -32,6 +32,7 @@ from .arg_parser import (
 )
 from .loggers.logger_base import LoggerBase
 from .train_hook import TrainHook
+from .serialization import Checkpointer
 
 if TYPE_CHECKING:
     from .trainer import Trainer
@@ -423,6 +424,11 @@ class CheckpointConfig:
     save_dir: str = './checkpoints'
     no_save: bool = False
 
+    # `"pt"`: PyTorch native format
+    # `"safetensors"`: Safetensors format
+    # You can also register new formats via `nnscaler.cli.serialization.register_format`
+    format: str = 'pt'
+
     # `"sharded"`: Each rank saves its shard of weights and optimizer states to a file. The checkpoint is
     #   a folder with as many files as the world size.
     # `"deduped"`: Each rank saves its deduped shard of weights and optimizer states to a file. The checkpoint is
@@ -484,6 +490,9 @@ class CheckpointConfig:
             raise ValueError(f"Invalid save_type {self.save_type}")
         if not self.save_dir:
             raise ValueError("save_dir is required")
+
+        if self.format not in Checkpointer.SUFFIX_MAP:
+            raise ValueError(f"Invalid format {self.format}")
 
         if self.every_n_epochs is not None and self.every_n_train_steps is not None:
             raise ValueError("Cannot specify both every_n_epochs and every_n_train_steps")
@@ -972,3 +981,6 @@ class TrainerArgs(PrecisionMixin, PolicyMixin):
             return ArgsTrainHook(hook_config)
         else:
             raise ValueError(f"Invalid hook_config {hook_config}")
+
+    def create_checkpointer(self) -> Checkpointer:
+        return Checkpointer(self.checkpoint.format)

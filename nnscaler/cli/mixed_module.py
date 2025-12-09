@@ -19,6 +19,7 @@ from .trainer_args import (
     TrainerArgs, PrecisionMixin, PolicyMixin, ModuleParallelizeConfig, ComputeConfig,
     load_type
 )
+from .serialization import Checkpointer
 
 
 logger = logging.getLogger(__name__)
@@ -132,10 +133,10 @@ class ModuleParallelizeConfigAdapter(PrecisionMixin, PolicyMixin):
             # try to reuse the weights from the tracing weights
             tracing_weights = self.tracing_weights
             if self.tracing_from_weights and tracing_weights is None:
-                tracing_weights = torch.load(self.tracing_from_weights)
+                tracing_weights = Checkpointer.load(self.tracing_from_weights)
         else:
             if self.tracing_from_weights:
-                tracing_weights = torch.load(self.tracing_from_weights)
+                tracing_weights = Checkpointer.load(self.tracing_from_weights)
             elif self.parallel_module.tracing_from_weights_prefix:
                 leading_key = self.parallel_module.tracing_from_weights_prefix + '.'
                 tracing_weights = {}
@@ -185,7 +186,10 @@ class ModuleParallelizeConfigAdapter(PrecisionMixin, PolicyMixin):
 
     def resolve_compute_config(self):
         compute_config = copy.deepcopy(self.compute_config)
-        compute_config.pas_config['__pas_name'] = self.pas_policy
+        compute_config.pas_config['__pas_name'] = \
+            self.pas_policy \
+            if not callable(self.pas_policy) \
+            else f'{self.pas_policy.__module__}.{self.pas_policy.__qualname__}'
         # autodist configs
         compute_config.pas_config['update_freq'] = self.trainer_args.update_freq
         compute_config.pas_config['use_bf16'] = self.param_dtype == torch.bfloat16
@@ -288,7 +292,7 @@ def mixin_module(model: torch.nn.Module, optimizer: torch.optim.Optimizer):
 def parallelize_model(trainer_args: TrainerArgs, dummy_input: dict[str, Any], load_module: bool, build_buckets: bool):
     tracing_weights = None
     if trainer_args.tracing_from_weights:
-        tracing_weights = torch.load(trainer_args.tracing_from_weights)
+        tracing_weights = Checkpointer.load(trainer_args.tracing_from_weights)
 
     def _new_adapter(parallel_module=None):
         return ModuleParallelizeConfigAdapter(

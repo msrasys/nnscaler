@@ -449,6 +449,25 @@ def _train(model: torch.nn.Module, num_replicas, rank, start, end, ckpt_dir, inf
             'model': merged_model_state_dicts,
             'optimizer': merged_optimizer_state_dict
         }, ckpt_merged_file)
+        from nnscaler.runtime.serialization import convert, load
+        from contextlib import ExitStack
+        ckpt_st_file_template = 'ckpt_{rank}_{start}.safetensors'
+        ckpt_st_files = [ckpt_dir / ckpt_st_file_template.format(rank=i, start=end) for i in range(torch.distributed.get_world_size())]
+        for pt, st in zip(ckpt_files, ckpt_st_files):
+            convert(pt, st, src_format='pt', dst_format='safetensors')
+        ckpt_st_state_dict_loaders = [load(f, lazy=True) for f in ckpt_st_files]
+        with ExitStack() as stack:
+            ckpt_st_state_dicts = []
+            for f in ckpt_st_state_dict_loaders:
+                ckpt_st_state_dicts.append(stack.enter_context(f).get_lazy_data())
+            model_st_state_dicts = [ckpt['model'] for ckpt in ckpt_st_state_dicts]
+            optimizer_st_state_dicts = [ckpt['optimizer'] for ckpt in ckpt_st_state_dicts]
+            merged_model_st_state_dicts, merged_optimizer_st_state_dict = merge_state_dicts(
+                model_st_state_dicts, optimizer_st_state_dicts
+            )
+            assert_equal(merged_model_state_dicts, merged_model_st_state_dicts)
+            assert_equal(merged_optimizer_state_dict, merged_optimizer_st_state_dict)
+
     torch.distributed.barrier()
     return results
 

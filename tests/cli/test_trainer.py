@@ -4,12 +4,14 @@
 from pathlib import Path
 import re
 import shutil
+from typing import Any
 
 import torch
 import pytest
 import torch.distributed
 
 from nnscaler import merge_state_dicts
+from nnscaler.cli.serialization import Checkpointer
 from nnscaler.cli.trainer import Trainer, logger
 from nnscaler.cli.trainer_args import AggregatedOutputs, TrainerArgs
 from tests.parallel_module.common import assert_equal, assert_close
@@ -119,6 +121,11 @@ def trainer_resume_worker(save_dir, save_type, bf16, parallel_type=0):
         if bf16 == 'Mixed' \
         else 'torch.optim.Adam'
     use_zero = save_type == 'sharded'
+    format = 'safetensors' if parallel_type % 2 else 'pt'
+    rev_format = 'pt' if format == 'safetensors' else 'safetensors'
+
+    def list_ckpt_files(dir):
+        return set(dir.glob('**/*.ckpt')) | set(dir.glob('**/*.safetensors'))
 
     if parallel_type == 0:
         additional_args = []
@@ -192,10 +199,11 @@ def trainer_resume_worker(save_dir, save_type, bf16, parallel_type=0):
         '--checkpoint.save_dir', str(ckpt_savedir),
         '--checkpoint.resume_from', 'last',
         '--checkpoint.keep_last_n_checkpoints', '30',
+        '--checkpoint.format', format,
         *additional_args,
     ])
     trainer.run()
-    ckpt_files = set(ckpt_savedir.glob('**/*.ckpt'))
+    ckpt_files = list_ckpt_files(ckpt_savedir)
     assert len(ckpt_files)/4 == min(30, trainer.total_train_steps_per_epoch * 4) + 2 # 2 for best/last
 
     torch.distributed.barrier()
@@ -216,10 +224,11 @@ def trainer_resume_worker(save_dir, save_type, bf16, parallel_type=0):
         '--checkpoint.save_dir', str(ckpt0_savedir),
         '--checkpoint.resume_from', 'last',
         '--checkpoint.keep_last_n_checkpoints', '30',
+        '--checkpoint.format', format,
         *additional_args,
     ])
     trainer.run()
-    ckpt0_files0 = {f: f.stat().st_mtime_ns for f in ckpt0_savedir.glob('**/*.ckpt')}
+    ckpt0_files0 = {f: f.stat().st_mtime_ns for f in list_ckpt_files(ckpt0_savedir)}
     assert len(ckpt0_files0)/4 == min(30, trainer.total_train_steps_per_epoch * 2) + 2 # 2 for best/last
 
     # resume from last without update max_epochs
@@ -237,18 +246,20 @@ def trainer_resume_worker(save_dir, save_type, bf16, parallel_type=0):
         '--checkpoint.save_dir', str(ckpt0_savedir),
         '--checkpoint.resume_from', 'last',
         '--checkpoint.keep_last_n_checkpoints', '30',
+        '--checkpoint.format', rev_format,
         *additional_args,
     ])
     trainer.run()
-    ckpt0_files0_x = {f: f.stat().st_mtime_ns for f in ckpt0_savedir.glob('**/*.ckpt')}
+    ckpt0_files0_x = {f: f.stat().st_mtime_ns for f in list_ckpt_files(ckpt0_savedir)}
     # nothing should be updated in this case.
     assert ckpt0_files0 == ckpt0_files0_x
 
     # create merged checkpoint
     ckpt1_savedir = save_dir / 'ckpt1'
     ckpt1_savedir.mkdir(parents=True, exist_ok=True)
+    merged_file_name = f'merged{Checkpointer.SUFFIX_MAP[format]}'
     if trainer.rank == 0:
-        Trainer.merge_checkpoint(list((ckpt0_savedir / 'last').glob('*.ckpt')), ckpt1_savedir / 'merged.pt')
+        Trainer.merge_checkpoint(Checkpointer.list_checkpoints(ckpt0_savedir / 'last'), ckpt1_savedir / merged_file_name)
 
     torch.distributed.barrier()
     # continue with the last two epochs (resume for sharded/deduped checkpoint)
@@ -265,6 +276,7 @@ def trainer_resume_worker(save_dir, save_type, bf16, parallel_type=0):
         '--checkpoint.save_type', save_type,
         '--checkpoint.save_dir', str(ckpt0_savedir),
         '--checkpoint.resume_from', 'last',
+        '--checkpoint.format', rev_format,
         '--checkpoint.keep_last_n_checkpoints', '30',
         *additional_args,
     ])
@@ -277,7 +289,7 @@ def trainer_resume_worker(save_dir, save_type, bf16, parallel_type=0):
     for f, s in left_files.items(): # make sure the old checkpoints are not overwritten
         assert ckpt0_files0[f] == s
 
-    ckpt0_files1 = set(ckpt0_savedir.glob('**/*.ckpt'))
+    ckpt0_files1 = list_ckpt_files(ckpt0_savedir)
     assert len(ckpt0_files1)/4 == min(30, trainer.total_train_steps_per_epoch * 4) + 2 # 2 for best/last
 
     torch.distributed.barrier()
@@ -294,7 +306,8 @@ def trainer_resume_worker(save_dir, save_type, bf16, parallel_type=0):
         '--compute_config.use_zero', str(use_zero),
         '--checkpoint.save_type', save_type,
         '--checkpoint.save_dir', str(ckpt1_savedir),
-        '--checkpoint.resume_from', str(ckpt1_savedir / 'merged.pt'),
+        '--checkpoint.format', rev_format,
+        '--checkpoint.resume_from', str(ckpt1_savedir / merged_file_name),
         '--checkpoint.keep_last_n_checkpoints', '30',
         *additional_args,
     ])
@@ -307,7 +320,7 @@ def trainer_resume_worker(save_dir, save_type, bf16, parallel_type=0):
     for f, s in left_files.items(): # make sure the old checkpoints are not overwritten
         assert ckpt0_files0[f] == s
 
-    ckpt0_files1 = set(ckpt0_savedir.glob('**/*.ckpt'))
+    ckpt0_files1 = list_ckpt_files(ckpt0_savedir)
     assert len(ckpt0_files1)/4 == min(30, trainer.total_train_steps_per_epoch * 4) + 2 # 2 for best/last
 
     torch.distributed.barrier()
@@ -315,9 +328,9 @@ def trainer_resume_worker(save_dir, save_type, bf16, parallel_type=0):
     if torch.distributed.get_rank() == 0:
         assert {f.parent.name for f in ckpt_files} == {f.parent.name for f in ckpt0_files1}
         for i in range(4):
-            x = torch.load(ckpt_savedir / 'last' / f'{i}.ckpt', weights_only=False)
-            y = torch.load(ckpt0_savedir / 'last' / f'{i}.ckpt', weights_only=False)
-            z = torch.load(ckpt1_savedir / 'last' / f'{i}.ckpt', weights_only=False)
+            x = Checkpointer.load_for_rank(ckpt_savedir / 'last', i)
+            y = Checkpointer.load_for_rank(ckpt0_savedir / 'last', i)
+            z = Checkpointer.load_for_rank(ckpt1_savedir / 'last', i)
             assert_equal(x['model'], y['model'])
             assert_equal(x['optimizer'], y['optimizer'])
             assert_equal(x['lr_scheduler'], y['lr_scheduler'])
@@ -325,12 +338,13 @@ def trainer_resume_worker(save_dir, save_type, bf16, parallel_type=0):
             assert_equal(x['optimizer'], z['optimizer'])
             assert_equal(x['lr_scheduler'], z['lr_scheduler'])
 
+        suffix = Checkpointer.SUFFIX_MAP[format]
         if save_type == 'deduped':
-            assert (ckpt_savedir / 'last/0.ckpt').stat().st_size > (ckpt_savedir / 'last/2.ckpt').stat().st_size
-            assert (ckpt_savedir / 'last/1.ckpt').stat().st_size > (ckpt_savedir / 'last/3.ckpt').stat().st_size
+            assert (ckpt_savedir / f'last/0{suffix}').stat().st_size > (ckpt_savedir / f'last/2{suffix}').stat().st_size
+            assert (ckpt_savedir / f'last/1{suffix}').stat().st_size > (ckpt_savedir / f'last/3{suffix}').stat().st_size
         else:
-            assert (ckpt_savedir / 'last/0.ckpt').stat().st_size == (ckpt_savedir / 'last/2.ckpt').stat().st_size
-            assert (ckpt_savedir / 'last/1.ckpt').stat().st_size == (ckpt_savedir / 'last/3.ckpt').stat().st_size
+            assert (ckpt_savedir / f'last/0{suffix}').stat().st_size == (ckpt_savedir / f'last/2{suffix}').stat().st_size
+            assert (ckpt_savedir / f'last/1{suffix}').stat().st_size == (ckpt_savedir / f'last/3{suffix}').stat().st_size
 
 
 @pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.device_count() < 4, reason='lack of gpu devices')
@@ -1212,3 +1226,116 @@ def test_trainer_dynamic_worker(tmp_path):
     ])
     trainer.run()
     check_match(gen_savedir, should_exist=False)
+
+
+def trainer_checkpointer_worker(save_dir):
+    save_dir = Path(save_dir)
+    config_path = str(Path(__file__).with_name('trainer_args.yaml').resolve())
+    gen_savedir = save_dir / 'gen'
+    ckpt_savedir = save_dir / 'ckpt'
+    from nnscaler.cli import register_format
+
+    load_triggered = False
+
+    def save(obj: Any, f: Path) -> None:
+        obj['test'] = True
+        return torch.save(obj, f)
+
+    def load(f: str | Path, *, device='cpu') -> Any:
+        x = torch.load(f, map_location=device, weights_only=False)
+        assert x['test'] is True
+        nonlocal load_triggered
+        load_triggered = True
+        return x
+
+    register_format('test_format', '.testpt', save, load)
+
+    # train 1 epcho in one time
+    trainer = Trainer([
+        '-f', config_path,
+        '--max_epochs', '1',
+        '--gen_savedir', str(gen_savedir),
+        '--checkpoint.save_dir', str(ckpt_savedir),
+        '--checkpoint.format', 'test_format',
+        '--compute_config.plan_ngpus', '1',
+        '--compute_config.runtime_ngpus', '1',
+    ])
+    trainer.run()
+
+    files0 = list(ckpt_savedir.glob('**/*.testpt'))
+    assert files0, 'No checkpoint files saved with custom format.'
+
+    # train 1 epcho in one time
+    trainer = Trainer([
+        '-f', config_path,
+        '--max_epochs', '2',
+        '--gen_savedir', str(gen_savedir),
+        '--checkpoint.save_dir', str(ckpt_savedir),
+        '--checkpoint.format', 'test_format',
+        '--checkpoint.resume_from', 'last',
+        '--compute_config.plan_ngpus', '1',
+        '--compute_config.runtime_ngpus', '1',
+    ])
+    trainer.run()
+    assert load_triggered, 'Custom load function not triggered when resuming.'
+
+    files1 = list(ckpt_savedir.glob('**/*.testpt'))
+    assert len(files1) > len(files0), 'Checkpoint files not updated after resuming.'
+    assert all(f in files1 for f in files0), 'Some checkpoint files missing after resuming.'
+    assert files1, 'No checkpoint files saved with custom format.'
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason='lack of gpu devices')
+def test_custom_checkpointer(tmp_path):
+    launch_torchrun(1, trainer_checkpointer_worker, tmp_path)
+
+
+def trainer_pas_worker(save_dir):
+    save_dir = Path(save_dir)
+    config_path = str(Path(__file__).with_name('trainer_args.yaml').resolve())
+    gen_savedir = save_dir / 'gen'
+    ckpt_savedir = save_dir / 'ckpt'
+
+    from nnscaler.policies import pas_dp
+    from nnscaler.cli import TrainerArgs
+    called = False
+
+    def custom_pas(graph, cfg):
+        nonlocal called
+        called = True
+        return pas_dp(graph, cfg)
+
+    args = TrainerArgs.from_cli([
+        '-f', config_path,
+        '--max_epochs', '1',
+        '--gen_savedir', str(gen_savedir),
+        '--checkpoint.save_dir', str(ckpt_savedir),
+        '--compute_config.plan_ngpus', '1',
+        '--compute_config.runtime_ngpus', '1',
+    ])
+    args.pas_policy = custom_pas
+    # train 1 epcho in one time
+    trainer = Trainer(train_args=args)
+    trainer.run()
+
+    assert called, 'Custom PAS policy not called.'
+
+    gen_savedir = save_dir / 'gen2'
+    # train 1 epcho in one time
+    trainer = Trainer([
+        '-f', config_path,
+        '--max_epochs', '2',
+        '--pas-policy', 'nnscaler.policies.pas_dp',  # use full qualified name of pas policy
+        '--gen_savedir', str(gen_savedir),
+        '--checkpoint.save_dir', str(ckpt_savedir),
+        '--compute_config.plan_ngpus', '1',
+        '--compute_config.runtime_ngpus', '1',
+    ])
+    trainer.run()
+
+    assert True
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason='lack of gpu devices')
+def test_custom_pas(tmp_path):
+    launch_torchrun(1, trainer_pas_worker, tmp_path)

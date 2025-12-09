@@ -235,6 +235,123 @@ _DICT_VALUES_TYPE = type({}.values())
 TRANSFORM_SUPPORTED_COLLECTION_TYPES = (tuple, list, dict, set, slice, _DICT_ITEMS_TYPE, _DICT_KEYS_TYPE, _DICT_VALUES_TYPE)
 
 
+def _transform_recursively(data: Any, fn: Callable[[Any], Any],
+    target_types: Union[Callable[[Any], bool], Type, Tuple[Type, ...]],
+    collection_types = (tuple, list, dict), skip_dict_keys = True
+) -> tuple[bool, Any]:
+    if collection_types is None:
+        collection_types = TRANSFORM_SUPPORTED_COLLECTION_TYPES
+    if isinstance(data, collection_types):
+        if isinstance(data, tuple):
+            result = tuple(_transform_recursively(t, fn, target_types, collection_types, skip_dict_keys) for t in data)
+            changed = any(c for c, _ in result)
+            if changed:
+                return True, tuple(v for _, v in result)
+            else:
+                return False, data
+        if isinstance(data, list):
+            result = [_transform_recursively(t, fn, target_types, collection_types, skip_dict_keys) for t in data]
+            changed = any(c for c, _ in result)
+            if changed:
+                return True, [v for _, v in result]
+            else:
+                return False, data
+        if isinstance(data, set):
+            result = [_transform_recursively(t, fn, target_types, collection_types, skip_dict_keys) for t in data]
+            changed = any(c for c, _ in result)
+            if changed:
+                return True, {v for _, v in result}
+            else:
+                return False, data
+        if isinstance(data, dict):
+            if skip_dict_keys:
+                keys = {k: (False, k) for k in data.keys()}
+            else:
+                keys = {
+                    k: _transform_recursively(k, fn, target_types, collection_types, skip_dict_keys)
+                    for k in data.keys()
+                }
+            changed = any(c for c, _ in keys.values())
+            result = {
+                k: _transform_recursively(v, fn, target_types, collection_types, skip_dict_keys)
+                for k, v in data.items()
+            }
+            changed = changed or any(c for c, _ in result.values())
+            if changed:
+                return True, {
+                    keys[k][1]: v for k, (_, v) in result.items()
+                }
+            else:
+                return False, data
+        if isinstance(data, _DICT_ITEMS_TYPE):
+            if skip_dict_keys:
+                keys = {k: (False, k) for k, _ in data}
+            else:
+                keys = {
+                    k: _transform_recursively(k, fn, target_types, collection_types, skip_dict_keys)
+                    for k, _ in data
+                }
+
+            changed = any(c for c, _ in keys.values())
+            result = {
+                k: _transform_recursively(v, fn, target_types, collection_types, skip_dict_keys)
+                for k, v in data
+            }
+            changed = changed or any(c for c, _ in result.values())
+            if changed:
+                return True, {
+                    keys[k][1]: v for k, (_, v) in result.items()
+                }.items()
+            else:
+                return False, data
+        if isinstance(data, _DICT_KEYS_TYPE):
+            result = [
+                _transform_recursively(k, fn, target_types, collection_types, skip_dict_keys)
+                for k in data
+            ]
+            changed = any(c for c, _ in result)
+            if changed:
+                return True, {
+                    v: i for i, (_, v) in enumerate(result)
+                }.keys()
+            else:
+                return False, data
+        if isinstance(data, _DICT_VALUES_TYPE):
+            result = {
+                i: _transform_recursively(v, fn, target_types, collection_types, skip_dict_keys)
+                for i, v in enumerate(data)
+            }
+            changed = any(c for c, _ in result.values())
+            if changed:
+                return True, {
+                    i: v for i, (_, v) in result.items()
+                }.values()
+            else:
+                return False, data
+        if isinstance(data, slice):
+            result = (
+                _transform_recursively(data.start, fn, target_types, collection_types, skip_dict_keys),
+                _transform_recursively(data.stop, fn, target_types, collection_types, skip_dict_keys),
+                _transform_recursively(data.step, fn, target_types, collection_types, skip_dict_keys),
+            )
+            if any(c for c, _ in result):
+                return True, slice(
+                    result[0][1],
+                    result[1][1],
+                    result[2][1]
+                )
+            else:
+                return False, data
+        raise ValueError(f"Unsupported collection type: {type(data)}")
+    elif isinstance(target_types, (tuple, list)) or inspect.isclass(target_types):
+        if isinstance(data, target_types):
+            return True, fn(data)
+    elif callable(target_types):  # not a class, but callable. treat as a check function.
+        if target_types(data):
+            return True, fn(data)
+    return False, data
+
+
 def transform_recursively(data: Any, fn: Callable[[Any], Any],
     target_types: Union[Callable[[Any], bool], Type, Tuple[Type, ...]],
     collection_types = (tuple, list, dict), skip_dict_keys = True
@@ -251,51 +368,61 @@ def transform_recursively(data: Any, fn: Callable[[Any], Any],
         skip_dict_keys: whether to skip the dict keys (for types dict, _DICT_ITEMS_TYPE).
             _DICT_KEYS_TYPE is not skipped, if you want to skip it, just remove it from the collection_types.
     """
+    _, result = _transform_recursively(data, fn, target_types, collection_types, skip_dict_keys)
+    return result
+
+
+def check_recursively(data, fn: Callable[[Any], bool],
+    collection_types = (tuple, list, dict),
+    skip_dict_keys = True
+) -> bool:
+    """
+    Check the data with the given function, will recursively apply the function to the nested data.
+    Args:
+        data: the data to be checked.
+        fn: the function to check.
+        collection_types: the collection types to apply the function to the nested data.
+        skip_dict_keys: whether to skip the dict keys (for types dict, _DICT_ITEMS_TYPE).
+            _DICT_KEYS_TYPE is not skipped, if you want to skip it, just remove it from the collection_types.
+
+    """
     if collection_types is None:
         collection_types = TRANSFORM_SUPPORTED_COLLECTION_TYPES
+
     if isinstance(data, collection_types):
-        if isinstance(data, tuple):
-            return tuple(transform_recursively(t, fn, target_types, collection_types) for t in data)
-        if isinstance(data, list):
-            return list(transform_recursively(t, fn, target_types, collection_types) for t in data)
-        if isinstance(data, set):
-            return set(transform_recursively(t, fn, target_types, collection_types) for t in data)
+        if isinstance(data, (list, tuple, set, _DICT_KEYS_TYPE, _DICT_VALUES_TYPE)):
+            return any(check_recursively(t, fn, collection_types) for t in data)
         if isinstance(data, dict):
-            return {
-                k if skip_dict_keys else transform_recursively(k, fn, target_types, collection_types):
-                transform_recursively(v, fn, target_types, collection_types)
-                for k, v in data.items()
-        }
+            if skip_dict_keys:
+                return any(
+                    check_recursively(v, fn, collection_types)
+                    for v in data.values()
+                )
+            else:
+                return any(
+                    check_recursively(k, fn, collection_types) or check_recursively(v, fn, collection_types)
+                    for k, v in data.items()
+                )
         if isinstance(data, _DICT_ITEMS_TYPE):
-            return {
-                k if skip_dict_keys else transform_recursively(k, fn, target_types, collection_types):
-                transform_recursively(v, fn, target_types, collection_types)
-                for k, v in data
-            }.items()
-        if isinstance(data, _DICT_KEYS_TYPE):
-            return {
-                    transform_recursively(k, fn, target_types, collection_types): i
-                    for i, k in enumerate(data)
-            }.keys()
-        if isinstance(data, _DICT_VALUES_TYPE):
-            return {
-                i: transform_recursively(v, fn, target_types, collection_types)
-                for i, v in enumerate(data)
-            }.values()
+            if skip_dict_keys:
+                return any(
+                    check_recursively(v, fn, collection_types)
+                    for _, v in data
+                )
+            else:
+                return any(
+                    check_recursively(k, fn, collection_types) or check_recursively(v, fn, collection_types)
+                    for k, v in data
+                )
         if isinstance(data, slice):
-            return slice(
-                transform_recursively(data.start, fn, target_types, collection_types),
-                transform_recursively(data.stop, fn, target_types, collection_types),
-                transform_recursively(data.step, fn, target_types, collection_types)
-            )
+            return any((
+                check_recursively(data.start, fn, collection_types),
+                check_recursively(data.stop, fn, collection_types),
+                check_recursively(data.step, fn, collection_types)
+            ))
         raise ValueError(f"Unsupported collection type: {type(data)}")
-    elif isinstance(target_types, (tuple, list)) or inspect.isclass(target_types):
-        if isinstance(data, target_types):
-            return fn(data)
-    elif callable(target_types):  # not a class, but callable. treat as a check function.
-        if target_types(data):
-            return fn(data)
-    return data
+
+    return fn(data)
 
 
 def is_running_distributed() -> bool:
