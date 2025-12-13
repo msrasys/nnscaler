@@ -469,7 +469,7 @@ class IRAdapterGener:
                 skip_recompute = False
                 if len(fconsumers) > 0:
                     fidx = min(graph.multi_index(fconsumers))
-                    skip_recompute = not any([consumer.recompute is not None for consumer in fconsumers])
+                    skip_recompute = not any([consumer.recompute is not None for consumer in fconsumers if not isinstance(consumer, IRSegment)])
                 else:
                     # no consumer: find the last forward node
                     for fidx, node in enumerate(graph.nodes()[::-1]):
