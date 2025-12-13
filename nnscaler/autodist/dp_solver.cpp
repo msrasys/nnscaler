@@ -370,6 +370,7 @@ public:
           if (!has_found_follow && !follow_candidates.empty()) {
             cur_ir.push_back(*follow_candidates.rbegin());
           }
+          cur_ir.push_back(std::make_pair(node->id - 1, 0));
         } else if (pre_node->father_id == pre_node->id) {
           assert(follow_candidates.rbegin()->first == pre_node->id);
           cur_ir.push_back(*follow_candidates.rbegin());
