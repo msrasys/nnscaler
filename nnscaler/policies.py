@@ -287,6 +287,7 @@ def pas_autodist(graph: IRGraph, cfg: 'ComputeConfig') -> IRGraph:
     parallel_profile = pas_cfg.get('parallel_profile', True)
     transient_mem_coef = pas_cfg.get('transient_mem_coef', 2)
     disable_shared_param_constraint = pas_cfg.get('disable_shared_param_constraint', False)
+    solver = pas_cfg.get('solver', 'dp')
 
     task_name = f'{task_name}_{cfg.plan_ngpus}gpus_{update_freq}update_freq'
     if memory_constraint == -1:
@@ -355,6 +356,7 @@ def pas_autodist(graph: IRGraph, cfg: 'ComputeConfig') -> IRGraph:
         parallel_profile=parallel_profile,
         transient_mem_coef=transient_mem_coef,
         disable_shared_param_constraint=disable_shared_param_constraint,
+        solver=solver,
     )
 
     return parallelize_graph(graph, autodist_cfg)
