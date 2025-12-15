@@ -151,10 +151,10 @@ def assert_close(a: Any, b: Any, atol=1e-6, rtol=1e-6):
     elif isinstance(a, dict):
         assert len(a) == len(b)
         for k in a.keys():
-            assert_close(a[k], b[k])
+            assert_close(a[k], b[k], atol=atol, rtol=rtol)
     elif isinstance(a, (list, tuple)):
         assert len(a) == len(b)
         for i in range(len(a)):
-            assert_close(a[i], b[i])
+            assert_close(a[i], b[i], atol=atol, rtol=rtol)
     else:
-        raise ValueError(f'unsupported type {type(a)}')
+        assert a == b, f"Values are not equal: {a} != {b}"

@@ -8,7 +8,7 @@ please following the assumption:
 """
 
 from contextlib import contextmanager
-from typing import Optional, List, Tuple, Union, Any
+from typing import Callable, Optional, List, Tuple, Union, Any
 import torch
 import torch.nn.functional as TorchF
 import operator
@@ -367,3 +367,23 @@ def print_time(content: str):
     if torch.cuda.is_available():
         torch.cuda.synchronize()
     print(f"line timer: {rank} - {datetime.datetime.now()} - {content}")
+
+
+class _BackwardHook(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x: torch.Tensor, backward_hook: Callable[[], None]):
+        ctx.save_for_backward()
+        ctx.backward_hook = backward_hook
+        return x
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        ctx.backward_hook()
+        return grad_output, None
+
+
+def insert_backward_hook(x: torch.Tensor, backward_hook: Optional[Callable[[], None]]) -> torch.Tensor:
+    if backward_hook is None:
+        # no need to add hook
+        return x
+    return _BackwardHook.apply(x, backward_hook)

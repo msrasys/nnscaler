@@ -593,7 +593,7 @@ def _gpu_merge_worker():
     init_distributed()
     with clear_dir_on_rank0(Path(tempfile.gettempdir()) / 'cube_test_ckpt_merge') as tempdir:
         compiled_module = _create_cube_module('data',
-            ComputeConfig(2, 2, use_zero=True),
+            ComputeConfig(2, 4, use_zero=True),
             tempdir,
             'whole',
         )
@@ -608,6 +608,6 @@ def _gpu_merge_worker():
         )
 
 
-@pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.device_count() < 2, reason='lack of gpu devices')
+@pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.device_count() < 24, reason='lack of gpu devices')
 def test_checkpoint_merge():
-    launch_torchrun(2, _gpu_merge_worker)
+    launch_torchrun(4, _gpu_merge_worker)

@@ -10,7 +10,7 @@ import numpy as np
 import inspect
 import pickle
 
-from nnscaler.ir.cten import IRCell
+from nnscaler.ir.cten import IRCell, IRTensor
 from nnscaler.ir.tensor import IRFullTensor, IRSubTensor
 from nnscaler.ir.operator import IRBpOperation, IRDataOperation, IRFwOperation
 from nnscaler.ir.adapter import IRWeightReducer, IRAdapter
@@ -24,7 +24,7 @@ from nnscaler.execplan import ExecutionPlan
 from nnscaler.execplan.execplan import ExeReuseCell
 
 from nnscaler.codegen.syntax.symtable import SymbolTable
-from nnscaler.codegen.syntax.blocks import ClassBlock, FunctionBlock, Block
+from nnscaler.codegen.syntax.blocks import ClassBlock, ForBlock, FunctionBlock, Block
 
 from nnscaler.codegen.emit import FuncEmission
 from nnscaler.codegen.module.autograd import AutogradAdapterCodeGen
@@ -127,6 +127,7 @@ class ModuleCodeGen(FuncEmission):
             'from pathlib import Path',
             'import torch', 'import torch.utils.checkpoint as ckpt',
             'import nnscaler', 'import nnscaler.flags',
+            'import nnscaler.runtime.function',
             'import _operator', 'from numpy import inf', 'import builtins', '',
             f'runtime_version = {runtime_version!r}', '', ''
         ]
@@ -551,7 +552,10 @@ class ModuleCodeGen(FuncEmission):
                 if isinstance(node, IRSegment):
                     segment_idxs.append(idx)
 
-                with FunctionBlock(func_name=name, args=input_args) as fb:
+                saved_tensors_hooks_needed = isinstance(node, IRSegment) and CompileFlag.use_zero > 1
+                func_name = name + '_impl' if saved_tensors_hooks_needed else name
+
+                with FunctionBlock(func_name=func_name, args=input_args) as fb:
                     fb.insert_body(forward_code)
                     # generate output
                     outputs = [self.tensor_name(t) for t in node.outputs()]
@@ -563,6 +567,16 @@ class ModuleCodeGen(FuncEmission):
                 if CompileFlag.use_jit and name.startswith('segment'):
                     cb.insert_body('@torch.jit.script_method')
                 cb.insert_body(fb.code)
+
+                if saved_tensors_hooks_needed:
+                    with FunctionBlock(func_name=name, args=input_args) as fb:
+                        # call segment under save_params_hooks context
+                        save_context_code = f'with self.save_params_hooks():'
+                        with Block(save_context_code) as cblock:
+                            cblock.insert_body(f'return self.{func_name}({", ".join(node_args[idx])})')
+                        fb.insert_body(cblock.code)
+                    cb.insert_body('')
+                    cb.insert_body(fb.code)
 
             if as_parallel_module:
                 if not segment_idxs:
@@ -650,8 +664,11 @@ class ModuleCodeGen(FuncEmission):
             outputs = self.return_name(node.outputs(), skip_attr=True)
             call_code = f'{outputs} = self.{self.node_name(node)}({", ".join(inputs)})'
             # be sure the user doesn't specify unused args.
-            for unused_arg in unused_args:
-                fb.insert_body(f'if {unused_arg} is not None: raise ValueError("{unused_arg} is not used in graph tracing, so it must be None when running forward.")')
+            # but sometimes this can cause issues
+            # (for example, the value is used in an `if` condition in the original forward function),
+            # so we disable it for now.
+            # for unused_arg in unused_args:
+            #     fb.insert_body(f'if {unused_arg} is not None: raise ValueError("{unused_arg} is not used in graph tracing, so it must be None when running forward.")')
             fb.insert_body(call_code)
             return_code = f'return {self.return_name_complex(self.execplan.graph.outputs())}'
             fb.insert_body(return_code)
@@ -667,6 +684,11 @@ class ModuleCodeGen(FuncEmission):
         - `model_init_statements`
         """
         sign = 'self.init_group(ranks={ranks})'
+        # create single rank communication group
+        self.model_init_statements.append('# single rank communication groups')
+        with ForBlock(var='rank', iters=f'range({self.runtime_ndevs})') as fb:
+            fb.insert_body(sign.format(ranks='[rank]'))
+        self.model_init_statements.extend(fb.code)
         # create communication group
         self.model_init_statements.append('# communication groups')
         for ranks in self.comm_groups:
@@ -915,12 +937,57 @@ class ModuleCodeGen(FuncEmission):
                 code = "with " + ", ".join(ctx_managers) + ":"
                 return code
 
-        def emit_node(node):
+        def emit_node(node, node_idx):
             node_code = []
             # execute
             if isinstance(node, IRFwOperation):
+                param_inputs = [
+                    self.tensor_name(t, prefix_attr='self.') for t in node.iobjs()
+                    if isinstance(t, IRTensor) and t.is_param()
+                ]
                 code = self.emit_fnode(node, runtime_devid=runtime_devid, plan_ndevs=len(self.devices), runtime_ndevs=self.runtime_ndevs, prefix_attr='self.')
-                node_code += code
+
+                if not param_inputs or CompileFlag.use_zero <= 1:
+                    node_code += code
+                else:
+                    activation_inputs = [
+                        self.tensor_name(t) for t in node.iobjs()
+                        if isinstance(t, IRTensor) and not t.is_attr() and t.requires_grad
+                    ]
+                    activation_outputs = [
+                        self.tensor_name(t) for t in node.oobjs()
+                        if isinstance(t, IRTensor) and t.requires_grad
+                    ]
+
+                    # insert param prefetch before each fnode for zero3
+                    for t in param_inputs:
+                        node_code.append(f'self.prefetch_param({t})')
+                        # The backward hook here is not reliable,
+                        # 1. there can be no activation input requiring grad,
+                        # 2. some inputs may not be used.
+                        # so, to maximize the chance of triggering backward hook
+                        # let's hook to every input requiring grad
+                        # We also add evict logic in AccumulateGrad hook in bucket implementation,
+                        # which can make sure params are evicted after backward use.
+                        for q in activation_inputs:
+                            node_code.append(f'{q} = self.backward_postevict_param({q}, {t}, {node_idx})')
+
+                    node_code += code
+
+                    # insert zero param release after each fnode
+                    for t in param_inputs:
+                        node_code.append(f'self.postevict_param({t})')
+
+                    # insert backward hook for activation outputs to fetch params in backward
+                    for t in activation_outputs:
+                        # we don't know which activation output will be used in backward
+                        # (DCE may not work 100% correctly),
+                        # so we add hook to all activation outputs for all input params
+                        for p in param_inputs:
+                            node_code.append(
+                                f'{t} = self.backward_prefetch_param({t}, {p}, {node_idx})'
+                            )
+
             elif isinstance(node, IRAdapter):
                 # for adapters inside an IRSegment, we don't apply async communication to it
                 # as it is mostly in critical path.
@@ -946,15 +1013,15 @@ class ModuleCodeGen(FuncEmission):
         node_codes = []
         current_context_manager_code = ""
         current_codes = []
-        for node in nodes:
+        for node_idx, node in enumerate(nodes):
             if has_op_context_info(node):
                 new_context_manager_code = emit_context_manager(node)
                 if current_context_manager_code != new_context_manager_code:
                     node_codes += insert_codes_under_ctx(current_context_manager_code, current_codes)
-                    current_codes = emit_node(node)
+                    current_codes = emit_node(node, node_idx)
                     current_context_manager_code = new_context_manager_code
                 else:
-                    current_codes.extend(emit_node(node))
+                    current_codes.extend(emit_node(node, node_idx))
             else:
                 # Node without op context infortmation means it is inserted by nnscaler, not convert from original fx graph,
                 # for example, multiref node and adapter node, currently for nodes inserted by nnscaler we have the following assumption:
@@ -1008,7 +1075,7 @@ class ModuleCodeGen(FuncEmission):
                 #
                 # TODO: all inserted nodes should have its op context field.
                 node_codes += insert_codes_under_ctx(current_context_manager_code, current_codes)
-                node_codes += emit_node(node)
+                node_codes += emit_node(node, node_idx)
                 current_codes = []
         node_codes += insert_codes_under_ctx(current_context_manager_code, current_codes)
 

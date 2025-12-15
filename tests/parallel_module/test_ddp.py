@@ -17,7 +17,7 @@ from torch.utils.data.distributed import DistributedSampler
 
 import numpy as np
 
-from nnscaler.parallel import ComputeConfig, parallelize, build_optimizer
+from nnscaler.parallel import ComputeConfig, parallelize, build_optimizer, merge_state_dicts
 from nnscaler.runtime.module import ParallelModule
 from nnscaler.runtime.gnorm import calcuate_gnorm
 
@@ -260,6 +260,36 @@ def _compare_weights(orig0, compiled0, compiled1, fc1_fullmap, fc2_fullmap, fc1_
     for k, v in itertools.chain(merged_fc1_fixed.items(), merged_fc2_fixed.items(), compiled0.items()):
         # print(f'key: {k}, max diff: {torch.max(torch.abs(orig0[k] - v))}')
         assert torch.allclose(v, orig0[k], rtol=1e-4, atol=1e-4)
+
+@pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.device_count() < 2, reason='lack of gpu devices')
+@pytest.mark.parametrize('update_freq', [1, 2, 4])
+def test_zero3(update_freq):
+    zero3_results = launch_torchrun(2, _gpu_worker_cube, 'dp', 1, 2, update_freq, 3)
+    zero1_results = launch_torchrun(2, _gpu_worker_cube, 'dp', 1, 2, update_freq, 1)
+    no_zero_results = launch_torchrun(2, _gpu_worker_cube, 'dp', 1, 2, update_freq, 0)
+
+    zero3_results0: List[StepResult]
+    zero3_results1: List[StepResult]
+    zero1_results0: List[StepResult]
+    zero1_results1: List[StepResult]
+    no_zero_results0: List[StepResult]
+    no_zero_results1: List[StepResult]
+
+    zero3_results0, zero3_results1 = zero3_results[0][0], zero3_results[1][0]
+    zero1_results0, zero1_results1 = zero1_results[0][0], zero1_results[1][0]
+    no_zero_results0, no_zero_results1 = no_zero_results[0][0], no_zero_results[1][0]
+
+    for r0, r1 in [
+        (zero3_results0, zero1_results0), (zero1_results0, no_zero_results0),
+        (zero3_results1, zero1_results1), (zero1_results1, no_zero_results1),
+    ]:
+        # have the same input
+        assert len(r0) == len(r1)  # iteration count
+        for i in range(len(r0)):
+            a, b = r0[i], r1[i]
+            assert torch.equal(a.pred, b.pred)  # pred
+            assert torch.equal(a.loss, b.loss)  # loss
+            assert torch.equal(a.gnorm, b.gnorm)  # gnorm
 
 
 @pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.device_count() < 4, reason='lack of gpu devices')

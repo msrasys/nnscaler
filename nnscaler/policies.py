@@ -38,6 +38,7 @@ from nnscaler.ir.operator import IRBpOperation, IRDataOperation, IRFwOperation
 from nnscaler.ir import IRCell, IRSubTensor, IRFullTensor
 from nnscaler.ir.cten import IR
 from nnscaler.runtime.function import identity, multiref
+from nnscaler.utils import load_type
 
 
 if TYPE_CHECKING:
@@ -801,3 +802,50 @@ def fn(
         cfg.apply_pipeline_scheduler(graph, nstages, nmicros, scheduler)
 
     return graph
+
+
+def pas_fsdp(graph, cfg: 'ComputeConfig'):
+    """
+    A simple FSDP policy:
+    1. all operators are replicated
+    2. user specified modules with `cfg.pas_config.recompute_modules` are recomputed
+    3. shard policy is configured in cfg.use_zero and cfg.zero_ngroups
+    4. CPU offload is not supported
+    """
+    if cfg.plan_ngpus != 1:
+        raise ValueError("FSDP policy only supports 1 plan GPU")
+    if not cfg.use_zero:
+        raise ValueError("FSDP policy requires use_zero to be 1/3")
+
+    recompute_modules = cfg.pas_config.get('recompute_modules', '')
+    # parse recompute_modules
+    # user can also provide a list of Module classes.
+    if isinstance(recompute_modules, str):
+        recompute_modules = recompute_modules.strip()
+        if not recompute_modules:
+            recompute_modules = []
+        else:
+            recompute_modules = [m.strip() for m in recompute_modules.split(',')]
+
+    if recompute_modules:
+        recompute_modules = [load_type(rm) for rm in recompute_modules]
+    else:
+        recompute_modules = []
+
+    cur_recompute_id = -1
+    cur_recompute_module_fqn = None
+    for node in get_pas_ops(graph):
+        recompute_module: torch.nn.Module
+        for rm in recompute_modules:
+            if rm in node.module_class_chain:
+                recompute_module = rm
+                break
+        else:
+            cur_recompute_module_fqn = None
+            continue
+
+        mod_fqn = node.get_module_fqn(recompute_module)
+        if cur_recompute_module_fqn is None or cur_recompute_module_fqn != mod_fqn:
+            cur_recompute_id += 1
+            cur_recompute_module_fqn = mod_fqn
+        yield OpPlan(node, recompute_id=cur_recompute_id)
