@@ -374,18 +374,28 @@ def _runtime_flags(**kwargs):
     return _flags(RuntimeFlag, **kwargs)
 
 
-def _to_cpu(val: Any):
-    """Complex to CPU"""
+def _to_cpu(val: Any, requires_grad: Optional[bool] = None) -> Any:
+    """
+    Complex to CPU
+    Recursively move the input to CPU.
+    Args:
+        val (Any): the input value
+        requires_grad (Optional[bool]): whether the returned tensor requires grad.
+            If it is None, will keep the same as the input tensor.
+    """
     if isinstance(val, tuple):
-        return tuple(_to_cpu(t) for t in val)
+        return tuple(_to_cpu(t, requires_grad) for t in val)
     if isinstance(val, list):
-        return list(_to_cpu(t) for t in val)
+        return list(_to_cpu(t, requires_grad) for t in val)
     if isinstance(val, dict):
-        return {_to_cpu(key):_to_cpu(val) for key, val in val.items()}
+        return {_to_cpu(key, requires_grad):_to_cpu(val, requires_grad) for key, val in val.items()}
     if isinstance(val, set):
-        return {_to_cpu(t) for t in val}
+        return {_to_cpu(t, requires_grad) for t in val}
     if isinstance(val, torch.Tensor):
-        requires_grad = val.is_floating_point() or val.is_complex()
+        if requires_grad is None:
+            requires_grad = val.requires_grad
+        else:
+            requires_grad = requires_grad and (val.is_floating_point() or val.is_complex())
         return copy_dynamic(val, val.detach().clone().cpu().requires_grad_(requires_grad))
     return val
 
@@ -677,7 +687,13 @@ def _gen_graph(
             raise ValueError(f"Default value type {type(v)} of forward args is not supported.")
 
     # generate fx graph
-    dummy_forward_args = _to_cpu(dummy_forward_args)
+    dummy_forward_args = _to_cpu(
+        dummy_forward_args,
+        # in end2end mode, we don't need gradients for inputs
+        # in normal mode, we assume all inputs require gradients
+        # so it can connect to other parts of the graph correctly
+        requires_grad=not end2end_mode
+    )
     fx_graph = parser.to_fx_graph(module, dummy_forward_args)
 
     # generate ir logic graph

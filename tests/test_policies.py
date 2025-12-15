@@ -293,11 +293,17 @@ def test_codegen_fn_pipeline(tmp_path):
 
         # will generate two communication ops
         # one for ffn input
-        assert _gencode_contains(tmp_path, FnPolicyModuleList, rank, f'nnscaler.runtime.adapter.nn.identity_allreduce')
+        if tp_idx == 0:
+            assert not _gencode_contains(tmp_path, FnPolicyModuleList, rank, f'nnscaler.runtime.adapter.nn.identity_allreduce')
+        else:
+            assert _gencode_contains(tmp_path, FnPolicyModuleList, rank, f'nnscaler.runtime.adapter.nn.identity_allreduce')
         # one for ffn output
         assert _gencode_contains(tmp_path, FnPolicyModuleList, rank, f'nnscaler.runtime.adapter.nn.allreduce_identity')
 
-        assert len(_gencode_contains(tmp_path, FnPolicyModuleList, rank, f'nnscaler.runtime.adapter.nn.')) == 2
+        if tp_idx == 0:
+            assert len(_gencode_contains(tmp_path, FnPolicyModuleList, rank, f'nnscaler.runtime.adapter.nn.')) == 1
+        else:
+            assert len(_gencode_contains(tmp_path, FnPolicyModuleList, rank, f'nnscaler.runtime.adapter.nn.')) == 2
         assert len(_gencode_contains(tmp_path, FnPolicyModuleList, rank, r'ckpt.checkpoint\(recompute')) == 1
         assert len(_gencode_contains(tmp_path, FnPolicyModuleList, rank, r'def recompute\(')) == 1
 

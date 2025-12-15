@@ -167,7 +167,11 @@ def policy_nograd(graph: IRGraph, cfg: ComputeConfig) -> IRGraph:
     else:
         fc1_node = graph.nodes()[0]
         func_node = graph.nodes()[1]
-    assert fc1_node.inputs()[0].requires_grad and fc1_node.inputs()[0].grad
+    if cfg.use_end2end:
+        assert not fc1_node.inputs()[0].requires_grad and not fc1_node.inputs()[0].grad
+    else:
+        assert fc1_node.inputs()[0].requires_grad and fc1_node.inputs()[0].grad
+
     assert fc1_node.inputs()[1].requires_grad and fc1_node.inputs()[1].grad
     assert fc1_node.outputs()[0].requires_grad and fc1_node.outputs()[0].grad
     assert func_node.inputs()[0].requires_grad and not func_node.inputs()[0].grad
