@@ -67,7 +67,7 @@ void ThreadPool::waitFinished() {
   cv_finished.wait(lock, [this]() { return tasks.empty() && (busy == 0); });
 }
 
-const int MAX_CONCURRENCY = std::thread::hardware_concurrency();
+int MAX_CONCURRENCY = std::thread::hardware_concurrency();
 ThreadPool pool(MAX_CONCURRENCY);
 
 std::vector<std::pair<int, int>> split_work(int num, int base) {
@@ -118,6 +118,11 @@ public:
     queries.clear();
     id2node.clear();
     search_results.clear();
+    if (verbose) {
+      MAX_CONCURRENCY = 1;
+      std::cout << "set MAX_CONCURRENCY to 1 for verbose mode"
+                << std::endl;
+    }
   }
 
   void add_interval(int start, int end) {
@@ -227,6 +232,31 @@ public:
         dp_node->in_edges.clear();
         dp_node->state.clear();
       }
+    }
+  }
+
+  int encode_ir(const std::vector<std::pair<int, int>> &cur_ir) {
+      int val = 0;
+      for (std::size_t j = 0; j < cur_ir.size(); ++j) {
+        val += cur_ir[j].second;
+        if (j + 1 < cur_ir.size()) {
+          val *= id2node[cur_ir[j + 1].first]->p_num;
+        }
+      }
+      return val;
+  }
+
+  void print_ir(const std::vector<std::pair<int, int>> &cur_ir) {
+    for (std::size_t j = 0; j < cur_ir.size(); ++j) {
+      std::cout << "(" << cur_ir[j].first << ", " << cur_ir[j].second << ") ";
+    }
+    std::cout << std::endl;
+  }
+
+  void print_states(DPNode *dp_node) {
+    for (std::size_t i = 0; i < dp_node->state.size(); ++i) {
+      UnitDPState state = dp_node->state[i];
+      std::cout << "state " << i << ": " << state.to_string() << std::endl;
     }
   }
 
@@ -361,16 +391,14 @@ public:
           break;
         }
       }
+      bool need_add_pre_node = false;
       if (!find_pre_id) {
         Node *pre_node = id2node[node->id - 1];
         if (pre_node->father_id != node->father_id) {
-          // do nothing, means the pre_node's output is not used
-          // we select the 1st partition of the pre_node
-          // need to be careful when the graph has multiple outputs
           if (!has_found_follow && !follow_candidates.empty()) {
             cur_ir.push_back(*follow_candidates.rbegin());
           }
-          cur_ir.push_back(std::make_pair(node->id - 1, 0));
+          need_add_pre_node = true;
         } else if (pre_node->father_id == pre_node->id) {
           assert(follow_candidates.rbegin()->first == pre_node->id);
           cur_ir.push_back(*follow_candidates.rbegin());
@@ -392,15 +420,36 @@ public:
         }
       }
       std::sort(cur_ir.begin(), cur_ir.end());
-      val = 0;
-      for (std::size_t j = 0; j < cur_ir.size(); ++j) {
-        val += cur_ir[j].second;
-        if (j + 1 < cur_ir.size()) {
-          val *= id2node[cur_ir[j + 1].first]->p_num;
+      if (verbose) {
+        std::cout << "need_add_pre_node: " << need_add_pre_node << std::endl;
+      }
+      if (need_add_pre_node) {
+        // means the pre_node's output is not used by later nodes,
+        // so we need to enumerate all the partition states of pre_node
+        if (verbose) {
+          std::cout << "p_num " << id2node[node->id - 1]->p_num << std::endl;
+        }
+        for (int pred_p = 0; pred_p < id2node[node->id - 1]->p_num;
+             ++pred_p) {
+          cur_ir.push_back(std::make_pair(node->id - 1, pred_p));
+          int val = encode_ir(cur_ir);
+          dp_node->in_edges.push_back(
+              std::make_pair(id2node[node->id - 1]->dp_nodes[val], cost));
+          if (verbose) {
+            print_ir(cur_ir);
+            print_states(id2node[node->id - 1]->dp_nodes[val]);
+          }
+          cur_ir.pop_back();
+        }
+      } else {
+        int val = encode_ir(cur_ir);
+        dp_node->in_edges.push_back(
+            std::make_pair(id2node[node->id - 1]->dp_nodes[val], cost));
+        if (verbose) {
+          print_ir(cur_ir);
+          print_states(id2node[node->id - 1]->dp_nodes[val]);
         }
       }
-      dp_node->in_edges.push_back(
-          std::make_pair(id2node[node->id - 1]->dp_nodes[val], cost));
     }
   }
 
@@ -415,6 +464,9 @@ public:
       return;
     }
 
+    if (verbose) {
+      std::cout << "before update, cur_p " << cur_p << std::endl;
+    }
     // storing edges takes space, so we build edges when needed
     buildInEdges(dp_node);
     if (dp_node->in_edges.empty()) {
@@ -468,6 +520,10 @@ public:
           dp_node->state.push_back(cur_state);
         }
       }
+    }
+    if (verbose) {
+      std::cout << "after update" << std::endl;
+      print_states(dp_node);
     }
   }
 
