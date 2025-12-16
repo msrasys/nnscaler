@@ -945,6 +945,13 @@ class ModuleCodeGen(FuncEmission):
                     self.tensor_name(t, prefix_attr='self.') for t in node.iobjs()
                     if isinstance(t, IRTensor) and t.is_param()
                 ]
+
+                # for multiref node under zero3, we need to clone the params to avoid in-place modification issue
+                if param_inputs and CompileFlag.use_zero > 1 and node.name == 'multiref':
+                    _logger.warning(f'Node {node} is a multiref node with param inputs under ZeRO-3, '
+                                    f'we set clone_level=1 to avoid in-place modification issue.')
+                    node.kwargs['clone_level'] = 1
+
                 code = self.emit_fnode(node, runtime_devid=runtime_devid, plan_ndevs=len(self.devices), runtime_ndevs=self.runtime_ndevs, prefix_attr='self.')
 
                 if not param_inputs or CompileFlag.use_zero <= 1:

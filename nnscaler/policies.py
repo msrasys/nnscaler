@@ -816,8 +816,9 @@ def pas_fsdp(graph, cfg: 'ComputeConfig'):
         raise ValueError("FSDP policy only supports 1 plan GPU")
     if not cfg.use_zero:
         raise ValueError("FSDP policy requires use_zero to be 1/3")
-
-    recompute_modules = cfg.pas_config.get('recompute_modules', '')
+    # use 'recomputes' instead of 'recompute_modules'
+    # to avoid confliction with autodist config
+    recompute_modules = cfg.pas_config.get('recomputes', '')
     # parse recompute_modules
     # user can also provide a list of Module classes.
     if isinstance(recompute_modules, str):

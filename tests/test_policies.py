@@ -1002,7 +1002,7 @@ def test_codegen_fsdp(tmp_path):
             use_end2end=True,
             use_zero=3,
             pas_config={
-                'recompute_modules': [FFNDropout],
+                'recomputes': [FFNDropout],
             }
         ),
         gen_savedir=tmp_path,

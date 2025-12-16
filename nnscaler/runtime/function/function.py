@@ -81,11 +81,24 @@ def fold_constant(a: Any) -> Any:
     return a
 
 
-def multiref(tensor: torch.Tensor, times: int) -> Tuple[torch.Tensor]:
+def multiref(tensor: torch.Tensor, times: int, *, clone_level: int = 0) -> Union[torch.Tensor, Tuple[torch.Tensor]]:
     """
     identity forward. Create multiple same tensor.
+    Args:
+        tensor (torch.Tensor): input tensor
+        times (int): number of same tensor to create
+        clone_level (int): 0: no clone, 1: clone once for all, 2: clone each time
+    Returns:
+        Union[torch.Tensor, Tuple[torch.Tensor]]:
+            if times==1, return tensor; else return tuple of tensors
     """
-    return tensor if times == 1 else tuple([tensor] * times)
+    if clone_level == 0:
+        return tensor if times == 1 else tuple([tensor] * times)
+    elif clone_level == 1:
+        cloned_tensor = tensor.clone()
+        return cloned_tensor if times == 1 else tuple([cloned_tensor] * times)
+    else:  # clone_level == 2
+        return tensor.clone() if times == 1 else tuple([tensor.clone() for _ in range(times)])
 
 
 def to(tensor: torch.Tensor, dtype_or_device: Union[torch.device, torch.dtype]) -> torch.Tensor:
