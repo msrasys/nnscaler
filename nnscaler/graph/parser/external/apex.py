@@ -86,4 +86,4 @@ try:
     _logger.info("apex ops registered successfully.")
 
 except:
-    _logger.warning('skip apex ops as it is not installed.')
+    _logger.debug('skip apex ops as it is not installed.')

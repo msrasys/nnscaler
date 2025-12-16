@@ -105,4 +105,4 @@ try:
     _logger.info("HF flash attention registered successfully.")
 
 except Exception as e:
-    _logger.warning(f"HF flash attention will not be registered: {e}")
+    _logger.debug(f"HF flash attention will not be registered: {e}")

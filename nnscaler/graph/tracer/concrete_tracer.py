@@ -544,7 +544,11 @@ class ConcreteTracer(TracerBase):
                             path = sys.modules.get(func.__module__[1:], sys.modules[func.__module__])
                         else:
                             path = sys.modules[func.__module__]
-                        path = getattr(path, func.__qualname__.split('.')[0])
+                        try:
+                            path = getattr(path, func.__qualname__.split('.')[0])
+                        except AttributeError:
+                            print(f'Warning: can not get the class path of method {func} {func.__qualname__}!')
+                            continue
                         locations = (*locations, wrap_utils.Location(path, func.__name__))
                     if len(locations) == 0:
                         _logger.warning(f'Can not find location of {func}, skip wrap it.')
