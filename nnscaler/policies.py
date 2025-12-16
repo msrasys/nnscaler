@@ -226,6 +226,8 @@ def pas_hybrid(graph: IRGraph, cfg: 'ComputeConfig'):
 
 
 def pas_autodist(graph: IRGraph, cfg: 'ComputeConfig') -> IRGraph:
+    from nnscaler.autodist.util import get_default_profile_path
+
     pas_cfg = cfg.pas_config
 
     update_freq = pas_cfg.get('update_freq', 1)
@@ -273,6 +275,7 @@ def pas_autodist(graph: IRGraph, cfg: 'ComputeConfig') -> IRGraph:
     use_memory_efficient_bf16 = pas_cfg.get('use_memory_efficient_bf16', False)
     use_fp16 = pas_cfg.get('use_fp16', use_memory_efficient_fp16)
     use_bf16 = pas_cfg.get('use_bf16', use_memory_efficient_bf16)
+    profile_dir = pas_cfg.get('profile_dir', get_default_profile_path())
     re_profile = pas_cfg.get('re_profile', False)
     verbose = pas_cfg.get('verbose', False)
     load_plan_path = pas_cfg.get('load_plan_path', None)
@@ -342,6 +345,7 @@ def pas_autodist(graph: IRGraph, cfg: 'ComputeConfig') -> IRGraph:
         opt_transient_coef=opt_transient_coef,
         verbose=verbose,
         re_profile=re_profile,
+        profile_dir=profile_dir,
         world_size=cfg.runtime_ngpus,
         recompute_modules=recompute_modules,
         recompute_ratio=recompute_ratio,
