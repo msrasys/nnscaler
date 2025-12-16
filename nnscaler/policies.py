@@ -275,7 +275,9 @@ def pas_autodist(graph: IRGraph, cfg: 'ComputeConfig') -> IRGraph:
     use_memory_efficient_bf16 = pas_cfg.get('use_memory_efficient_bf16', False)
     use_fp16 = pas_cfg.get('use_fp16', use_memory_efficient_fp16)
     use_bf16 = pas_cfg.get('use_bf16', use_memory_efficient_bf16)
-    profile_dir = pas_cfg.get('profile_dir', get_default_profile_path())
+    profile_dir = pas_cfg.get('profile_dir', None)
+    if profile_dir is None:
+        profile_dir = get_default_profile_path()
     re_profile = pas_cfg.get('re_profile', False)
     verbose = pas_cfg.get('verbose', False)
     load_plan_path = pas_cfg.get('load_plan_path', None)
