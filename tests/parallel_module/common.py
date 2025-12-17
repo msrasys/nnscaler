@@ -128,7 +128,8 @@ def init_distributed():
 
 
 def assert_equal(a: Any, b: Any):
-    assert type(a) == type(b)
+    # treat dict and OrderedDict as same for comparison
+    assert type(a) == type(b) or (isinstance(a, dict) and isinstance(b, dict)), f'{type(a)} != {type(b)}'
     if isinstance(a, torch.Tensor):
         assert torch.equal(a.cpu(), b.cpu()), torch.max(torch.abs(a.cpu() - b.cpu()))
     elif isinstance(a, dict):

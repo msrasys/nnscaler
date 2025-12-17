@@ -57,10 +57,11 @@ class MixedPrecisionF16OptimizerMixin(TrainHook):
     def build_fp32_params(cls, params):
         # create FP32 copy of parameters and grads
         fp32_params = []
-        for p in params:
-            p32 = torch.nn.Parameter(p.data.float())
-            p32.grad = torch.zeros_like(p32.data)
-            fp32_params.append(p32)
+        with torch.no_grad():
+            for p in params:
+                p32 = torch.nn.Parameter(p.data.clone().float())
+                p32.grad = torch.zeros_like(p32.data)
+                fp32_params.append(p32)
         return fp32_params
 
     def step(self, closure=None):

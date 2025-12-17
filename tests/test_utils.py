@@ -1,11 +1,15 @@
 #  Copyright (c) Microsoft Corporation.
 #  Licensed under the MIT License.
 
+from collections import OrderedDict
 from dataclasses import dataclass
 import pytest
 import torch
 
-from nnscaler.utils import select_many, classproperty, fields, set_member_by_name, unchecked_fields
+from nnscaler.utils import (
+    select_many, classproperty, fields, set_member_by_name, unchecked_fields,
+    transform_recursively,
+)
 
 
 def test_select_many():
@@ -92,3 +96,85 @@ def test_set_member_by_name():
     set_member_by_name(model, 'x.y.z', 45)
     assert model.x.y == child_module
     assert model.x.y.z == 45
+
+
+def test_transform_recursively():
+    data = {
+        'a': torch.tensor([1]),
+        'b': [torch.tensor(4), {'c': torch.tensor([5])}],
+        'd': (7, torch.tensor(8)),
+        'e': {1: 9, 2: torch.tensor(10)}.keys(),
+        'f': {1: 9, 2: torch.tensor(11)}.items(),
+        'g': {1: 9, 2: torch.tensor(12)}.values(),
+        'h': {1: 9, 2: torch.tensor(13)},
+        'i': slice(0, 10, None),
+        'j': torch.Size([11, 12]),
+        'k': OrderedDict({1: 9, 2: 10}),
+        'l': {1: 9, 2: 10}.values(),
+        'm': [1, 2, 3],
+        'n': slice(0, 10, torch.tensor(2)),
+        'o': {torch.tensor(1): 9, torch.tensor(2): 10},
+        'p': {torch.tensor(1): 9, torch.tensor(2): 10}.items(),
+        'q': {torch.tensor(1): 9, torch.tensor(2): 10}.keys()
+    }
+
+    def fn(x):
+        if isinstance(x, torch.Tensor):
+            return x.item()
+        return x
+
+    result1 = transform_recursively(
+        data, fn,
+        target_types=torch.Tensor,
+        collection_types=None,
+        skip_dict_keys=True,
+    )
+
+    result2 = transform_recursively(
+        data, fn,
+        target_types=torch.Tensor,
+        collection_types=None,
+        skip_dict_keys=False,
+    )
+    target = {
+        'a': 1,
+        'b': [4, {'c': 5}],
+        'd': (7, 8),
+        'e': {1: 1, 2: 2}.keys(),
+        'f': dict([(1, 9), (2, 11)]).items(),
+        'g': {1: 9, 2: 12}.values(),
+        'h': {1: 9, 2: 13},
+        'i': slice(0, 10, None),
+        'j': torch.Size([11, 12]),
+        'k': OrderedDict({1: 9, 2: 10}),
+        'l': data['l'],
+        'm': [1, 2, 3],
+        'n': slice(0, 10, 2),
+    }
+    # dict values are not comparable.
+    assert list(target['g']) == list(result1.pop('g'))
+    assert list(target['g']) == list(result2.pop('g'))
+    target.pop('g')
+
+
+    skip_key_target = {
+        **target,
+        'o': {torch.tensor(1): 9, torch.tensor(2): 10},
+        'p': {torch.tensor(1): 9, torch.tensor(2): 10}.items(),
+        'q': {1: 9, 2: 10}.keys()
+    }
+    noskip_key_target = {
+        **target,
+        'o': {1: 9, 2: 10},
+        'p': dict([(1, 9), (2, 10)]).items(),
+        'q': {1: 9, 2: 10}.keys()
+    }
+
+    from tests.parallel_module.common import assert_equal
+
+    assert_equal(list(skip_key_target.pop('o')), list(result1.pop('o')))
+    assert_equal(list(skip_key_target.pop('p')), list(result1.pop('p')))
+    assert_equal(list(skip_key_target.pop('q')), list(result1.pop('q')))
+
+    assert_equal(result1, skip_key_target)
+    assert_equal(result2, noskip_key_target)

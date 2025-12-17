@@ -17,4 +17,6 @@ from nnscaler.cli.trainer_args import (
     AggregatedOutputs,
 )
 
+from nnscaler.cli.serialization import register_format
+
 from nnscaler.parallel import ComputeConfig
