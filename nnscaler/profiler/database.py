@@ -347,6 +347,10 @@ class ProfileDataBase:
         profiled_metrics = ProfiledMetrics(in_mem_info, param_mem_info, buffer_mem_info,
                                            fw_span, bw_span, infer_memory,
                                            train_mem_info, train_mem2in_idx)
+
+        if CustomizedOps.kOpProfilePostProc.get(node.signature, None) is not None:
+            profiled_metrics = CustomizedOps.kOpProfilePostProc[node.signature](node, profiled_metrics)
+
         return profiled_metrics
 
     def insert(self, name: str, key: str, profiled_metrics: ProfiledMetrics):

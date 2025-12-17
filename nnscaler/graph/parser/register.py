@@ -5,7 +5,8 @@
 Register cutomized function
 """
 
-from typing import Dict, Callable, Optional, Union, List, Tuple
+from __future__ import annotations
+from typing import Dict, Callable, Optional, Union, List, Tuple, TYPE_CHECKING
 from functools import partial
 import inspect
 import logging
@@ -15,7 +16,10 @@ from torch import ScriptFunction
 
 from nnscaler.graph.function.dimops import IRDimops, OpAnno, TransformRule
 from nnscaler.graph.tracer.wrap_utils import is_autograd_apply, is_autograd_op
-from nnscaler.ir.operator import IRTensor, IRFwOperation
+from nnscaler.ir.operator import IRTensor
+if TYPE_CHECKING:
+    from nnscaler.ir.operator import IRFwOperation
+    from nnscaler.profiler.database import ProfiledMetrics
 
 _logger = logging.getLogger(__name__)
 
@@ -37,6 +41,7 @@ class CustomizedOps:
     # It accepts the IRFwOperation as input and returns the list of input tensors, which is used
     # during operator profiling.
     kOpInputGen: Dict[str, Callable[[IRFwOperation], List[torch.Tensor]]] = {}
+    kOpProfilePostProc: Dict[str, Callable[[IRFwOperation, ProfiledMetrics], ProfiledMetrics]] = {}
 
     @staticmethod
     def map(signature: str) -> Callable:
@@ -60,7 +65,9 @@ class CustomizedOps:
     @staticmethod
     def register(signature: str, op_create_fn: Callable, code: str, runtime_fn: Callable,
                  emit_fn: Callable[[IRFwOperation, List[str], Dict[str, str], int, int, int], str] = None,
-                 input_gen_fn: Callable[[IRFwOperation], List[torch.Tensor]] = None) -> None:
+                 input_gen_fn: Callable[[IRFwOperation], List[torch.Tensor]] = None,
+                 profile_post_proc_fn: Callable[[IRFwOperation, ProfiledMetrics], ProfiledMetrics] = None,
+                 ):
         """Register an operator
 
         Args:
@@ -73,6 +80,9 @@ class CustomizedOps:
                                 as input and returns the generated code.
             input_gen_fn (Callable): input generator function for profiler, will use default input generator function
                                      if input_gen_fn is None. kwargs are same as that in the input node.
+            profile_post_proc_fn (Callable): post processing function for profiled metrics, will not do any post processing
+                                             if profile_post_proc_fn is None. It accepts the IRFwOperation and the profiled
+                                             metrics as input and returns the processed profiled metrics.
 
         Returns:
             None
@@ -88,13 +98,17 @@ class CustomizedOps:
             CustomizedOps.kOpEmit[signature] = emit_fn
         if input_gen_fn is not None:
             CustomizedOps.kOpInputGen[signature] = input_gen_fn
+        if profile_post_proc_fn is not None:
+            CustomizedOps.kOpProfilePostProc[signature] = profile_post_proc_fn
 
 
 def register_op(annotation: Union[str, Callable], name: Optional[str] = None,
                 code_impl_pattern: str = 'import',
                 emit_fn: Callable[[IRFwOperation, List[str], Dict[str, str], int, int, int], str] = None,
                 transform_rules: Tuple[TransformRule] = None,
-                input_gen_fn: Callable[[IRFwOperation], List[torch.Tensor]] = None) -> Callable:
+                input_gen_fn: Callable[[IRFwOperation], List[torch.Tensor]] = None,
+                profile_post_proc_fn: Callable[[IRFwOperation, ProfiledMetrics], ProfiledMetrics] = None,
+                ) -> Callable:
     """
     Register a function with IRDimops annotations.
 
@@ -160,6 +174,11 @@ def register_op(annotation: Union[str, Callable], name: Optional[str] = None,
             profiler will use `torch.rand` for floating point data types and `torch.zeros` for special types like `torch.int64` and `torch.bool`.
             However, input tensors' contents may influence the speed dramatically. The mask in attention and dispatched expert index in MoE
             are real examples. To handle this scenario, user can provide the customized `input_gen_fn`.
+            Default: None.
+        profile_post_proc_fn (Callable): post processing function for profiled metrics, it accepts the IRFwOperation and the profiled
+            metrics as input and returns the processed profiled metrics. By default, no post processing will be applied. However, in some scenarios,
+            user may want to adjust the profiled metrics before storing them into the database. For example, in MoE operator, user may want to
+            adjust the profiled metrics based on the actual number of tokens dispatched to each expert. To handle this scenario, user can provide the customized `profile_post_proc_fn`.
             Default: None.
 
     Returns:
@@ -270,7 +289,7 @@ def register_op(annotation: Union[str, Callable], name: Optional[str] = None,
 
         # step 4. register in CustomizedOps
         _logger.info(f'registering op {fsig}...')
-        CustomizedOps.register(fsig, udfop, code, fn, emit_fn, input_gen_fn)
+        CustomizedOps.register(fsig, udfop, code, fn, emit_fn, input_gen_fn, profile_post_proc_fn)
         return fn
 
     return decorator
