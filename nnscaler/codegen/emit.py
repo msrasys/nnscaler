@@ -36,7 +36,10 @@ class IRValue:
         return self.name
 
 
-def _safe_repr_value(val: Any, prefix_attr: Optional[str] = None) -> Any:
+def _safe_repr_value(val: Any, prefix_attr: Optional[str] = None,
+    *,
+    strip_star: bool = True,
+) -> Any:
     """
     Return repr-able value of a tensor or value.
     For tensor, return IRValue({prefix}{tensor.name}_{tensor.tid})
@@ -45,6 +48,7 @@ def _safe_repr_value(val: Any, prefix_attr: Optional[str] = None) -> Any:
     Args:
         val (Any): tensor or non-tensor value
         prefix_attr (str): prefix to the tensor name if the tensor is an attribute
+        strip_star (bool): whether to strip leading * for *args and **kwargs
     Returns:
         the val that can be repr safely
     """
@@ -52,20 +56,22 @@ def _safe_repr_value(val: Any, prefix_attr: Optional[str] = None) -> Any:
         return val
     if isinstance(val, IRObject):
         tensor_name = val.name
+        if strip_star:
+            tensor_name = tensor_name.lstrip('*')
         tensor_name = tensor_name.replace('.', '_')
         name = '_'.join([tensor_name, str(val.tid)])
         if prefix_attr is not None and val.is_attr():
             name = prefix_attr + name
         return IRValue(name)
     elif isinstance(val, slice):
-        return slice(_safe_repr_value(val.start, prefix_attr), _safe_repr_value(val.stop, prefix_attr), _safe_repr_value(val.step, prefix_attr))
+        return slice(_safe_repr_value(val.start, prefix_attr, strip_star=strip_star), _safe_repr_value(val.stop, prefix_attr, strip_star=strip_star), _safe_repr_value(val.step, prefix_attr, strip_star=strip_star))
     elif isinstance(val, dict):
-        return {_safe_repr_value(k, prefix_attr): _safe_repr_value(v, prefix_attr) for k, v in val.items()}
+        return {_safe_repr_value(k, prefix_attr, strip_star=strip_star): _safe_repr_value(v, prefix_attr, strip_star=strip_star) for k, v in val.items()}
     elif isinstance(val, list):
-        return [_safe_repr_value(v, prefix_attr) for v in val]
+        return [_safe_repr_value(v, prefix_attr, strip_star=strip_star) for v in val]
     elif isinstance(val, tuple):
         # TODO: support subclasses of tuple, like torch.Size?
-        return tuple(_safe_repr_value(v, prefix_attr) for v in val)
+        return tuple(_safe_repr_value(v, prefix_attr, strip_star=strip_star) for v in val)
     elif isinstance(val, (int, str, bool, float, type(None), bytes, type(Ellipsis), torch.dtype)):
         return val
     elif isinstance(val, torch.device):
@@ -90,7 +96,10 @@ class CodeEmission:
     def node_name(self, node: IRCell) -> str:
         return f"{node.name}{node.cid}"
 
-    def tensor_name(self, val: Any, prefix_attr: Optional[str] = None) -> str:
+    def tensor_name(self, val: Any, prefix_attr: Optional[str] = None,
+        *,
+        strip_star: bool = True,
+    ) -> str:
         """
         Return representation of a value or a tensor.
         For tensor, return the {prefix}{tensor.name}_{tensor.tid}
@@ -99,10 +108,13 @@ class CodeEmission:
         Args:
             val (Any): tensor or non-tensor value
             prefix_attr (Optional[str]): prefix to the tensor name if the tensor is an attribute
+            strip_star (bool): whether to strip leading * for *args and **kwargs
+                You should set it to False when you want to generate code for
+                function arguments.
         Returns:
             representation of the val in str
         """
-        return repr(_safe_repr_value(val, prefix_attr))
+        return repr(_safe_repr_value(val, prefix_attr, strip_star=strip_star))
 
     def complex_name(self, val: Any, prefix_attr: Optional[str]=None) -> str:
         """

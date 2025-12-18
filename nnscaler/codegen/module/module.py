@@ -500,9 +500,9 @@ class ModuleCodeGen(FuncEmission):
             for t in node.inputs():
                 if isinstance(t, IRSubTensor):
                     if not t.is_attr():
-                        args.append(self.tensor_name(t))
+                        args.append(self.tensor_name(t, strip_star=False))
                 else:
-                    args.append(self.tensor_name(t))
+                    args.append(self.tensor_name(t, strip_star=False))
             node_args.append(args)
 
         if outfile_attr_meta_map:
