@@ -113,6 +113,8 @@ class ComputeConfig:
     # None/0 means using the default value. (25MB for async, no limit for sync)
     reducer_bucket_cap_mb: Optional[float] = None
 
+    reducer_pre_divisor: Optional[float] = None
+
     # PAS policy settings
     # you can also put any other settings that can affect code generation here.
     # but please prefix the keys with `_` to avoid conflicts with predefined keys.

@@ -222,7 +222,7 @@ class Trainer:
         # (see `train_args.optimizer.grad_reduction`` handling in `train_epoch`).
         # This is useful to avoid overflow when the gradients are large.
         def reducer_pre_hook(reducer, grad):
-            grad.div_(self.train_args.scaling_factor)
+            grad.div_(self.train_args.compute_config.reducer_pre_divisor or self.train_args.scaling_factor)
         self.optimizer.register_reducer_pre_hook(reducer_pre_hook)
         # Currently we never pass `last_epoch` to its constructor
         self.lr_scheduler = self.train_args.create_lr_scheduler(self.optimizer)
@@ -1040,7 +1040,7 @@ class Trainer:
             self.hook.after_sync_grad(self)
 
             # scale gradients
-            multiplier = self.train_args.scaling_factor
+            multiplier = self.train_args.compute_config.reducer_pre_divisor or self.train_args.scaling_factor
             if self.train_args.optimizer.grad_reduction == 'sum':
                 # do nothing. `multiplier` is already correct
                 pass
