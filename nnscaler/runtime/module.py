@@ -704,7 +704,12 @@ class CubeModule(torch.nn.Module):
             return opt_states
 
         def _merge_opt_zero(param_shape, worker_idx, param_idx):
-            model_idx2opt_idx, opt_idx2ranks, zero_version = zero_idx_maps[worker_idx]
+            if len(zero_idx_maps[worker_idx]) == 3:
+                model_idx2opt_idx, opt_idx2ranks, zero_version = zero_idx_maps[worker_idx]
+            else:  # backward compatibility
+                assert len(zero_idx_maps[worker_idx]) == 2
+                model_idx2opt_idx, opt_idx2ranks = zero_idx_maps[worker_idx]
+                zero_version = 1  # default to ZeRO-1
             opt_idx = model_idx2opt_idx[param_idx]
             if isinstance(opt_idx, int):
                 # the param without reducer
