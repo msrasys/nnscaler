@@ -240,6 +240,10 @@ class HybridOptimizer(torch.optim.Optimizer, TrainHookHost):
         for child_state_dict, opt in zip(child_state_dicts, self.optimizers):
             opt.load_state_dict(child_state_dict)
 
+        self.param_groups = []
+        for optimizer in self.optimizers:
+            self.param_groups.extend(optimizer.param_groups)
+
     def add_param_group(self, param_group: dict[str, Any]) -> None:
         # no-op to avoid creating new parameter groups
         # all parameter groups are managed by the individual optimizers

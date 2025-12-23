@@ -58,7 +58,7 @@ class MixedPrecisionF16OptimizerMixin(TrainHook):
             trainer.optimizer.scale_grads = self.overrided_scale_grads
         else:
             if not hasattr(trainer.optimizer, 'f16_setup_done'):
-                print('Setting up MixedPrecisionF16OptimizerMixin for HybridOptimizer...')
+                logger.info('Setting up MixedPrecisionF16OptimizerMixin for HybridOptimizer...')
                 for opt in trainer.optimizer.optimizers:
                     if not isinstance(opt, MixedPrecisionF16OptimizerMixin):
                         raise TypeError(f'All optimizers inside HybridOptimizer must be MixedPrecisionF16OptimizerMixin, but got {type(opt)}')
