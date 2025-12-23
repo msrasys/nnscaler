@@ -775,13 +775,15 @@ class ModuleCodeGen(FuncEmission):
         zero = CompileFlag.use_zero
         zero_ngroups = CompileFlag.zero_ngroups
         reduce_op = f"'{CompileFlag.reducer_op}'"
+        accumulate_allreduce_grads_in_fp32 = CompileFlag.accumulate_allreduce_grads_in_fp32
         # reducer init interface
         reducer_init = (
             "{reducer} = nnscaler.runtime.adapter.Reducer("
             "ranks={ranks}, reduce_op={reduce_op}, "
             "async_op={async_op}, zero={zero}, max_bucket_size_bytes={max_nbytes}, "
             "zero_use_reduce_scatter={zero_use_reduce_scatter}, "
-            "zero_ngroups={zero_ngroups})"
+            "zero_ngroups={zero_ngroups}, "
+            "accumulate_allreduce_grads_in_fp32={accumulate_allreduce_grads_in_fp32})"
         )
         reducer_add = 'self.add_reducer({reducer})'
         add_param = '{reducer}.add_param({weight})'
@@ -793,7 +795,8 @@ class ModuleCodeGen(FuncEmission):
         init_code = reducer_init.format(
             reducer=reducer_name, ranks=ranks, reduce_op=reduce_op,
             async_op=async_op, zero=zero, max_nbytes=max_nbytes,
-            zero_ngroups=zero_ngroups, zero_use_reduce_scatter=zero_use_reduce_scatter
+            zero_ngroups=zero_ngroups, zero_use_reduce_scatter=zero_use_reduce_scatter,
+            accumulate_allreduce_grads_in_fp32=accumulate_allreduce_grads_in_fp32
         )
         self.model_init_statements.append(init_code)
         # sort weights by first used time (which is gradient all-reduce time in reverse order)

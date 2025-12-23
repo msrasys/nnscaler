@@ -88,7 +88,6 @@ class MixedPrecisionF16OptimizerMixin(TrainHook):
         with torch.no_grad():
             for p in params:
                 p32 = torch.nn.Parameter(p.data.clone().float())
-                p32.grad = torch.zeros_like(p32.data)
                 fp32_params.append(p32)
         return fp32_params
 
@@ -108,8 +107,7 @@ class MixedPrecisionF16OptimizerMixin(TrainHook):
         for p in self.f16_params:
             p.grad = None
         for p32 in self.fp32_params:
-            if p32.grad is not None:
-                p32.grad.zero_()
+            p32.grad = None
 
     def state_dict(self):
         """Return the optimizer's state dict."""
@@ -166,7 +164,10 @@ class MixedPrecisionF16OptimizerMixin(TrainHook):
                 continue
             if p.grad is not None:
                 if p32.grad is None:
-                    p32.grad = p.grad.data.float()
+                    if p.grad.data.dtype == torch.float32:
+                        p32.grad = p.grad.data
+                    else:
+                        p32.grad = p.grad.data.float()
                 else:
                     p32.grad.data.copy_(p.grad.data)
             else:

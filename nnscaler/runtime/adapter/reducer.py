@@ -68,6 +68,7 @@ class Bucket:
                  zero_subgroup: torch.distributed.ProcessGroup = None,
                  zero_crossgroup: torch.distributed.ProcessGroup = None,
                  zero_use_reduce_scatter: bool = False,
+                 accumulate_allreduce_grads_in_fp32: bool = False,
                  align_size: int = ALIGNED_BYTES,
                  param_cls: Any = None,
     ):
@@ -88,6 +89,7 @@ class Bucket:
             zero_subgroup (torch.distributed.ProcessGroup): the subgroup for zero optimization the current rank belongs to
             zero_crossgroup (torch.distributed.ProcessGroup): the communication group for cross zero group allreduce when reduce scatter is enabled
             zero_use_reduce_scatter (bool): whether to use reduce scatter for zero optimization
+            accumulate_allreduce_grads_in_fp32 (bool): whether to accumulate allreduce grads in fp32
             align_size (int): the alignment size in bytes for each parameter
             param_cls (Any): the class of the parameters
         """
@@ -105,6 +107,7 @@ class Bucket:
         self._async: bool = async_op
         self._zero: bool = zero
         self._zero_use_reduce_scatter = zero_use_reduce_scatter
+        self._accumulate_allreduce_grads_in_fp32 = accumulate_allreduce_grads_in_fp32
         self._contiguous_params = param_buffer
         self._contiguous_grads = grad_buffer
         assert grad_buffer.size() == param_buffer.size()
@@ -203,6 +206,8 @@ class Bucket:
         # build parameter for optimizer (shared storage).
         # Its gradient will be updated everytime calling `self.sync_grads()`
         self._param_for_optimizer = torch.nn.Parameter(self._get_opt_param_data())
+        if self._accumulate_allreduce_grads_in_fp32:
+            self._param_for_optimizer.grad_dtype = torch.float32
 
     def register_hooks(self):
         """
@@ -465,6 +470,7 @@ class Reducer:
                  reduce_op: str = 'sum', async_op: bool = False,
                  zero: bool = False, zero_ngroups: int = 1,
                  zero_use_reduce_scatter: bool = False,
+                 accumulate_allreduce_grads_in_fp32: bool = False,
                  align_size: int = ALIGNED_BYTES
     ):
         """
@@ -483,6 +489,7 @@ class Reducer:
             zero (bool): whether to apply ZeRO optimization on gradients
             zero_ngroups (int): number of ZeRO subgroups in the original ZeRO group
             zero_use_reduce_scatter (bool): whether to use reduce scatter for zero optimization
+            accumulate_allreduce_grads_in_fp32 (bool): whether to accumulate allreduce grads in fp32
             align_size (int): the alignment size in bytes for each parameter
         """
         # the parameters with same class will be consecutive in the list.
@@ -504,6 +511,7 @@ class Reducer:
         self._async: bool = async_op
         self._zero: bool = zero
         self._zero_use_reduce_scatter = zero_use_reduce_scatter
+        self._accumulate_allreduce_grads_in_fp32 = accumulate_allreduce_grads_in_fp32
         self._align_size: int = align_size
         if self._align_size % ALIGNED_BYTES != 0:
             raise ValueError(f"align_size {self._align_size} must be divisible by {ALIGNED_BYTES}")
@@ -609,7 +617,7 @@ class Reducer:
     def _allocate_buffers(self):
         # gradient buffer
         self._contiguous_grads: torch.Tensor = torch.zeros(
-            (self.buffer_length,), dtype=self._params[0].dtype,
+            (self.buffer_length,), dtype=torch.float32 if self._accumulate_allreduce_grads_in_fp32 else self._params[0].dtype,
             device=torch.cuda.current_device(), requires_grad=False)
         # parameter buffer
         self._contiguous_params: torch.Tensor = torch.zeros(
@@ -728,6 +736,7 @@ class Reducer:
                 self._zero_subgroup,
                 self._zero_crossgroup,
                 self._zero_use_reduce_scatter,
+                self._accumulate_allreduce_grads_in_fp32,
                 self._align_size,
                 param_cls=param_cls,
             )

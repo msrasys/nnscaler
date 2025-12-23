@@ -66,6 +66,10 @@ class CompileFlag:
     #    hence break the consistency of `.data` and `.grad` of parameters. Need to be careful when using optimizer.
     # 2) `reduce_scatter`` doesn't significantly improve performance comparing with `allreduce`.
     zero_use_reduce_scatter = _to_bool('ZERO_USE_REDUCE_SCATTER')
+    # when accumulate_allreduce_grads_in_fp32 is True, the gradients will be accumulated in fp32
+    # and attach to the parameter's `main_grad` field. This leads to more stable training but
+    # with slower speed.
+    accumulate_allreduce_grads_in_fp32 = _to_bool('ACCUMULATE_ALLREDUCE_GRADS_IN_FP32')
 
     # use automate mixture precision training, where weights, gradients
     # and optimizer status are kept in its original data type (can be float32),

@@ -94,6 +94,8 @@ class ComputeConfig:
     # 1. this only works when `use_zero` is True and `zero_ngroups` is 1.
     # 2. In some cases, it can introduce parity issue. So use it with caution.
     zero_use_reduce_scatter: bool = False
+    # whether to accumulate allreduce grads in fp32
+    accumulate_allreduce_grads_in_fp32: bool = False
 
     # whether the generated code is for inference only
     inference_only: bool = False
@@ -341,6 +343,7 @@ def _compile_flags(compute_config: ComputeConfig):
         zero_ngroups=compute_config.zero_ngroups,
         zero_use_reduce_scatter=compute_config.zero_use_reduce_scatter,
         trace_strategy=compute_config.trace_strategy,
+        accumulate_allreduce_grads_in_fp32=compute_config.accumulate_allreduce_grads_in_fp32,
     )
 
 
@@ -1321,6 +1324,11 @@ def build_optimizer(
     is_hybrid = getattr(optimizer_fn, 'is_hybrid', False)
     if is_hybrid and param_clss_fn is None:
         raise ValueError("param_clss_fn must be provided when using hybrid optimizer")
+
+    if compute_config.accumulate_allreduce_grads_in_fp32:
+        for param in module.parameters():
+            if param.requires_grad:
+                param.grad_dtype = torch.float32
 
     RuntimeFlag.skip_reducer = True
     RuntimeFlag.skip_zero_grad = False
