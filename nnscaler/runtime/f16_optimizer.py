@@ -5,6 +5,7 @@
 
 import logging
 from typing import Optional, TYPE_CHECKING
+import types
 
 import torch
 
@@ -48,10 +49,37 @@ class MixedPrecisionF16OptimizerMixin(TrainHook):
         Assumption:
         `clip_gnorm` is called immediately after `scale_grads` in training loop.
         """
-        trainer.optimizer._clip_gnorm = trainer.optimizer.clip_gnorm
-        trainer.optimizer.clip_gnorm = self.overrided_clip_gnorm
-        trainer.optimizer._scale_grads = trainer.optimizer.scale_grads
-        trainer.optimizer.scale_grads = self.overrided_scale_grads
+        from nnscaler.runtime.hybrid_optimizer import HybridOptimizer
+
+        if not isinstance(trainer.optimizer, HybridOptimizer):
+            trainer.optimizer._clip_gnorm = trainer.optimizer.clip_gnorm
+            trainer.optimizer.clip_gnorm = self.overrided_clip_gnorm
+            trainer.optimizer._scale_grads = trainer.optimizer.scale_grads
+            trainer.optimizer.scale_grads = self.overrided_scale_grads
+        else:
+            if not hasattr(trainer.optimizer, 'f16_setup_done'):
+                print('Setting up MixedPrecisionF16OptimizerMixin for HybridOptimizer...')
+                for opt in trainer.optimizer.optimizers:
+                    if not isinstance(opt, MixedPrecisionF16OptimizerMixin):
+                        raise TypeError(f'All optimizers inside HybridOptimizer must be MixedPrecisionF16OptimizerMixin, but got {type(opt)}')
+
+                def multi_scale_grads(cls, scale: float) -> None:
+                    for opt in cls.optimizers:
+                        opt.overrided_scale_grads(scale)
+                trainer.optimizer._scale_grads = trainer.optimizer.scale_grads
+                trainer.optimizer.scale_grads = types.MethodType(multi_scale_grads, trainer.optimizer)
+
+                def multi_clip_gnorm(cls, max_norm: Optional[float] = None) -> float:
+                    # self._clip_gnorm() is ParallelOptimizer.clip_gnorm
+                    grad_norm = cls.optimizers[0].multiply_factor * cls._clip_gnorm()
+                    if max_norm is not None and max_norm > 0.0:
+                        clip_coef = (max_norm / (grad_norm + 1e-6)).clamp(max=1.0)
+                        cls.scale_grads(clip_coef)
+                    return grad_norm
+                trainer.optimizer._clip_gnorm = trainer.optimizer.clip_gnorm
+                trainer.optimizer.clip_gnorm = types.MethodType(multi_clip_gnorm, trainer.optimizer)
+
+                trainer.optimizer.f16_setup_done = True
 
     @classmethod
     def build_fp32_params(cls, params):
@@ -90,6 +118,11 @@ class MixedPrecisionF16OptimizerMixin(TrainHook):
         # move fp32_params to the same level with 'exp_avg' and 'exp_avg_sq'
         # we do this to handle the merge of sharded checkpoint in nnscaler
         assert 'state' in state_dict, f'state not found in state_dict: {state_dict.keys()}'
+
+        # may called from hybrid optimizer
+        if not state_dict['state']:
+            return state_dict
+
         assert isinstance(state_dict['state'], dict), f'state is not a dict: {type(state_dict["state"])}'
         assert len(self.fp32_params) == len(state_dict['state']), \
                 f'len(fp32_params) != len(state[state]): {len(self.fp32_params)} != {len(state_dict["state"])}'
@@ -184,16 +217,33 @@ class MixedPrecisionF16OptimizerMixin(TrainHook):
             self._multiply_factor *= clip_coef
         return grad_norm
 
+    @property
+    def multiply_factor(self) -> float:
+        return self._multiply_factor
+
+
+def _process_params(params):
+    params = list(params)
+    assert params, "optimizer got an empty parameter list"
+    if isinstance(params[0], torch.nn.Parameter):
+        return params
+    elif isinstance(params[0], dict) and 'params' in params[0]:
+        if len(params) > 1:
+            raise NotImplementedError("MixedPrecisionF16OptimizerMixin only supports one param group")
+        return list(params[0]['params'])
+    else:
+        raise ValueError(f"Unsupported params type: {type(params[0])}")
+
 
 class MixedPrecisionAdam(MixedPrecisionF16OptimizerMixin, torch.optim.Adam):
     def __init__(self, params, **kwargs):
-        self.f16_params = list(params)
+        self.f16_params = _process_params(params)
         self.fp32_params = self.build_fp32_params(self.f16_params)
         super().__init__(self.fp32_params, **kwargs)
 
 
 class MixedPrecisionAdamW(MixedPrecisionF16OptimizerMixin, torch.optim.AdamW):
     def __init__(self, params, **kwargs):
-        self.f16_params = list(params)
+        self.f16_params = _process_params(params)
         self.fp32_params = self.build_fp32_params(self.f16_params)
         super().__init__(self.fp32_params, **kwargs)
