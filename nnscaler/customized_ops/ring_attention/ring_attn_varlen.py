@@ -17,6 +17,12 @@ from .core.ring_attn_varlen_implementation import llama3_flash_attn_prepare_cu_s
 from .core.utils import gen_head_anno
 from .varlen_utils import shuffle_varlen, unshuffle_varlen
 
+try:
+    from flash_attn.cute import flash_attn_varlen_func as flash_attn_cute_varlen_func
+except ImportError as e:
+    print(f"flash_attn.cute not available: {e}")
+    flash_attn_cute_varlen_func = None
+
 # Try to import TransformerEngine with version check and optional CP enable via env var.
 # Usage control:
 #   Set environment variable ENABLE_TE_CP=1 to enable TransformerEngine context-parallel (CP) attention.
@@ -123,6 +129,7 @@ def wrap_ring_attn_varlen_func(
         deterministic: bool = False,
         return_attn_probs: bool = False,
         enable_ring: bool = True,
+        use_cute:  bool = False,
         process_group: Tuple[int] = None,
 ):
     '''
@@ -137,16 +144,29 @@ def wrap_ring_attn_varlen_func(
     max_seqlen_k = (cu_seqlens_k[1:] - cu_seqlens_k[:-1]).max().item()
 
     if process_group is None or len(process_group) == 1 or not enable_ring:
-        output = flash_attn_varlen_func(
-            q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k,
-            dropout_p=dropout_p,
-            softmax_scale=softmax_scale,
-            causal=causal,
-            window_size=window_size,
-            alibi_slopes=alibi_slopes,
-            deterministic=deterministic,
-            return_attn_probs=False,
-        )
+        if use_cute:
+            assert flash_attn_cute_varlen_func is not None, "flash_attn.cute is not available"
+            output = flash_attn_cute_varlen_func(
+                q, k, v,
+                cu_seqlens_q=cu_seqlens_q,
+                cu_seqlens_k=cu_seqlens_k,
+                softmax_scale=softmax_scale,
+                causal=causal,
+                window_size=window_size,
+                deterministic=deterministic,
+            )
+            return output
+        else:
+            output = flash_attn_varlen_func(
+                q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k,
+                dropout_p=dropout_p,
+                softmax_scale=softmax_scale,
+                causal=causal,
+                window_size=window_size,
+                alibi_slopes=alibi_slopes,
+                deterministic=deterministic,
+                return_attn_probs=False,
+            )
         return output
 
     assert len(q.shape) == 3, "q must have shape [total_q, qh, dim]"
