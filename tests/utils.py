@@ -114,6 +114,7 @@ def replace_all_device_with(device='cpu', force=False):
     orig_to = torch.Tensor.to
     orig_cuda = torch.Tensor.cuda
     orig_cpu = torch.Tensor.cpu
+    orig_is_cuda = torch.Tensor.is_cuda
 
     def patch_tensor_constructor(fn):
         orig_func = getattr(fn, '__cube_orig_func__', fn)  # to support nested patching
@@ -158,6 +159,8 @@ def replace_all_device_with(device='cpu', force=False):
     }
 
     def patched_to(self, *args, **kwargs):
+        if device == 'meta':
+            return self
         if len(args) > 0 and isinstance(args[0], (torch.device, str)):
             return orig_to(self, device, *args[1:], **kwargs)
         if 'device' in kwargs:
@@ -166,15 +169,20 @@ def replace_all_device_with(device='cpu', force=False):
         return orig_to(self, *args, **kwargs)
 
     def patched_cuda(self, *args, **kwargs):
+        if device == 'meta':
+            return self
         return orig_to(self, device)
 
     def patched_cpu(self, *args, **kwargs):
+        if device == 'meta':
+            return self
         return orig_to(self, device)
 
     try:
         torch.Tensor.to = patched_to
         torch.Tensor.cuda = patched_cuda
         torch.Tensor.cpu = patched_cpu
+        torch.Tensor.is_cuda = property(lambda self: True)
         # patch tensor constructors
         for tf_name, fn in old_tensor_constructors.items():
             setattr(torch, tf_name, patched_tensor_constructors[tf_name])
@@ -205,6 +213,7 @@ def replace_all_device_with(device='cpu', force=False):
         torch.Tensor.to = orig_to
         torch.Tensor.cuda = orig_cuda
         torch.Tensor.cpu = orig_cpu
+        torch.Tensor.is_cuda = orig_is_cuda
 
 
 # mock process group is from pytorch testing code

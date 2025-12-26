@@ -8,7 +8,7 @@ please following the assumption:
 """
 
 from contextlib import contextmanager
-from typing import Optional, List, Tuple, Union, Any
+from typing import Callable, Optional, List, Tuple, Union, Any
 import torch
 import torch.nn.functional as TorchF
 import operator
@@ -81,11 +81,24 @@ def fold_constant(a: Any) -> Any:
     return a
 
 
-def multiref(tensor: torch.Tensor, times: int) -> Tuple[torch.Tensor]:
+def multiref(tensor: torch.Tensor, times: int, *, clone_level: int = 0) -> Union[torch.Tensor, Tuple[torch.Tensor]]:
     """
     identity forward. Create multiple same tensor.
+    Args:
+        tensor (torch.Tensor): input tensor
+        times (int): number of same tensor to create
+        clone_level (int): 0: no clone, 1: clone once for all, 2: clone each time
+    Returns:
+        Union[torch.Tensor, Tuple[torch.Tensor]]:
+            if times==1, return tensor; else return tuple of tensors
     """
-    return tensor if times == 1 else tuple([tensor] * times)
+    if clone_level == 0:
+        return tensor if times == 1 else tuple([tensor] * times)
+    elif clone_level == 1:
+        cloned_tensor = tensor.clone()
+        return cloned_tensor if times == 1 else tuple([cloned_tensor] * times)
+    else:  # clone_level == 2
+        return tensor.clone() if times == 1 else tuple([tensor.clone() for _ in range(times)])
 
 
 def to(tensor: torch.Tensor, dtype_or_device: Union[torch.device, torch.dtype]) -> torch.Tensor:
@@ -367,3 +380,23 @@ def print_time(content: str):
     if torch.cuda.is_available():
         torch.cuda.synchronize()
     print(f"line timer: {rank} - {datetime.datetime.now()} - {content}")
+
+
+class _BackwardHook(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x: torch.Tensor, backward_hook: Callable[[], None]):
+        ctx.save_for_backward()
+        ctx.backward_hook = backward_hook
+        return x
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        ctx.backward_hook()
+        return grad_output, None
+
+
+def insert_backward_hook(x: torch.Tensor, backward_hook: Optional[Callable[[], None]]) -> torch.Tensor:
+    if backward_hook is None:
+        # no need to add hook
+        return x
+    return _BackwardHook.apply(x, backward_hook)

@@ -461,7 +461,6 @@ class ConcreteTracer(TracerBase):
             return self.create_proxy('placeholder', name, default_arg, {})
         args.extend(proxy_placeholder(names) for names in arg_names)
 
-
         if hasattr(co, 'co_kwonlyargcount') and (
             co.co_kwonlyargcount > 0 or co.co_flags & HAS_VARSTUFF):
             # TODO: type annotations for *args and **kwargs
@@ -471,6 +470,13 @@ class ConcreteTracer(TracerBase):
                 more_args = proxy_placeholder(name)
             if co.co_flags & inspect.CO_VARKEYWORDS:
                 name = '**' + next(names_iter)
+                if name not in concrete_args:
+                    # auto pack the additional kwargs
+                    kwargs_val = {}
+                    for cc_name in concrete_args:
+                        if cc_name not in arg_names and not cc_name.startswith('*'):
+                            kwargs_val[cc_name] = concrete_args[cc_name]
+                    concrete_args[name] = kwargs_val
                 default_args[name] = {}
                 kwargs = proxy_placeholder(name)
 

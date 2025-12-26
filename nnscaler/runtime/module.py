@@ -1,6 +1,7 @@
 #  Copyright (c) Microsoft Corporation.
 #  Licensed under the MIT License.
 
+import functools
 import pickle
 from typing import Callable, List, Set, Dict, Tuple, Optional, TYPE_CHECKING, Any, Union, ClassVar
 from typing_extensions import Self
@@ -16,6 +17,7 @@ from collections import defaultdict
 import torch
 import torch.distributed as dist
 from torch import device
+from torch.autograd.graph import saved_tensors_hooks
 
 from nnscaler.graph.parser import FxModuleParser
 
@@ -24,6 +26,7 @@ from nnscaler.runtime.adapter.reducer import Reducer
 from nnscaler.runtime.executor import Executor
 from nnscaler.runtime.gnorm import ParamsInfo
 from nnscaler.runtime.utils import microbatches
+from nnscaler.runtime.function import insert_backward_hook
 
 from nnscaler import __version__ as runtime_version
 from nnscaler.flags import CompileFlag
@@ -56,6 +59,23 @@ class AttrMeta:
     # shape of the sub tensor
     # it should be the shape of full_tensor[slicers]
     sub_shape: Tuple[int, ...]
+
+
+@dataclass
+class Zero3AttrMeta:
+    """
+    Used for loading merged state dict
+    """
+    # original name in the module
+    orig_name: str
+    # name in the module
+    attr_name: str
+    # start index of the sub tensor
+    start: int
+    # end index of the sub tensor
+    end: int
+    # chunk size of the sub tensor, can be bigger than end - start due to padding
+    chunk_size: int
 
 
 def dedup_attrs(rank2attr_area_map: Dict[int, Dict[str, Dict[str, AttrMeta]]]) -> Dict[int, Dict[str, Dict[str, AttrMeta]]]:
@@ -417,6 +437,7 @@ class CubeModule(torch.nn.Module):
         fullmaps: List[Dict[str, AttrMeta]]
     ):
         """Merge model states from multiple shard into a single-model state.
+        Here we assume the order of state_dicts and fullmaps are aligned, and is the same as the rank order.
 
         Note:
             Users only need to provide as fewer local model states as necessary to
@@ -438,6 +459,11 @@ class CubeModule(torch.nn.Module):
         # Here we expand slice to (start, step, stop) tuple,
         # because before python 3.12, slice object is not hashable
         state_dict_merge_track: Dict[str, Set[Tuple[Tuple[Any, Any, Any], ...]]] = {}
+        # the fill progress of zero3 parameters
+        #  key: param name
+        #  value: Dict[ tuple(start, step, stop) , filled size]
+        #  used to track how many elements have been filled for each zero3 parameter
+        zero3_current_filled: Dict[str, Dict[Tuple[Tuple[int, int, int], ...], int]] = {}
         # gather param/buffer full tensor
         for rank, (model_state_dict, local_fullmap) in enumerate(zip(state_dicts, fullmaps)):
             for local_name, meta in local_fullmap.items():
@@ -457,13 +483,40 @@ class CubeModule(torch.nn.Module):
                     raise NotImplementedError("Not support of partitioning parameter / buffer at value dimension")
 
                 state_dict_merge_track_id = tuple((i.start, i.step, i.stop) for i in meta.slicers)
-                if state_dict_merge_track_id in state_dict_merge_track[meta.orig_name]:
-                    if not CubeModule._safe_tensor_equal(full_model_state_dict[meta.orig_name][meta.slicers], partial_tensor):
-                        raise ValueError(f"Conflict in merging {meta.orig_name} from rank {rank}")
+                dest_tensor = full_model_state_dict[meta.orig_name][meta.slicers]
+                if dest_tensor.shape == partial_tensor.shape and state_dict_merge_track_id in state_dict_merge_track[meta.orig_name]:
+                    if not CubeModule._safe_tensor_equal(dest_tensor, partial_tensor):
+                            raise ValueError(f"Conflict in merging {meta.orig_name} from rank {rank}")
                     _logger.debug(f'rank {rank}: skip merging duplicated model state for param {meta.orig_name} with slicers {meta.slicers}')
                 else:
                     state_dict_merge_track[meta.orig_name].add(state_dict_merge_track_id)
-                    full_model_state_dict[meta.orig_name][meta.slicers] = partial_tensor
+                    if dest_tensor.shape == partial_tensor.shape:
+                        dest_tensor.copy_(partial_tensor)
+                    else:
+                        # we assume zero3 is on when dest_tensor.shape != partial_tensor.shape
+                        if len(partial_tensor.shape) != 1:
+                            raise ValueError("Invalid tensor as a ZeRO3 parameter, expected a 1D tensor.")
+                        fill_start = zero3_current_filled.setdefault(meta.orig_name, {}).setdefault(state_dict_merge_track_id, 0)
+                        fill_len = partial_tensor.numel()
+                        if fill_start >= dest_tensor.numel():
+                            # already filled, let's check consistency
+                            fill_start = fill_start % dest_tensor.numel()
+                            if fill_start + fill_len > dest_tensor.numel():
+                                # remove padding part
+                                fill_len = dest_tensor.numel() - fill_start
+                            if not CubeModule._safe_tensor_equal(dest_tensor.view(-1)[fill_start: fill_start + fill_len], partial_tensor[0:fill_len]):
+                                raise ValueError(f"Conflict in merging {meta.orig_name} from rank {rank}")
+                        else:
+                            if fill_start + fill_len > dest_tensor.numel():
+                                # remove padding part
+                                fill_len = dest_tensor.numel() - fill_start
+                            old_shape = dest_tensor.shape
+                            dest_tensor = dest_tensor.reshape(-1)
+                            dest_tensor[fill_start: fill_start + fill_len] = partial_tensor[0: fill_len]
+                            full_model_state_dict[meta.orig_name][meta.slicers] = dest_tensor.view(old_shape)
+
+                        zero3_current_filled[meta.orig_name][state_dict_merge_track_id] += fill_len
+
         return full_model_state_dict
 
     @staticmethod
@@ -584,7 +637,7 @@ class CubeModule(torch.nn.Module):
             return all(bucket_state[key].shape == bucket_state[opt_state_keys[0]].shape
                         for key in opt_state_keys)
 
-        def _retrieve_param_opt_state(bucket_states, pstart, pend, pshape, bucket_size):
+        def _retrieve_param_opt_state(bucket_states, pstart, pend, pshape, bucket_size, zero_version):
             assert bucket_size % len(bucket_states) == 0
             opt_state_keys = list(bucket_states[0].keys())
             if 'step' in bucket_states[0]:
@@ -593,37 +646,70 @@ class CubeModule(torch.nn.Module):
             # NOTE: only support adam for now
             assert 'exp_avg' in opt_state_keys
             assert 'exp_avg_sq' in opt_state_keys
-            chunk_size = bucket_size // len(bucket_states)
-            start_rank_id, start_offset = pstart // chunk_size, pstart % chunk_size
-            end_rank_id, end_offset = pend // chunk_size, pend % chunk_size
+
             opt_states, opt_states_1d = {}, {}
             for key in opt_state_keys:
                 opt_states[key] = torch.zeros(pshape, dtype=bucket_states[0][key].dtype,
                                                 device=bucket_states[0][key].device, requires_grad=False)
                 opt_states_1d[key] = opt_states[key].view(-1)
 
-            if start_rank_id == end_rank_id:
-                for key in opt_state_keys:
-                    opt_states_1d[key][:] = bucket_states[start_rank_id][key][start_offset:end_offset]
-            else:
-                offset = chunk_size-start_offset
-                for key in opt_state_keys:
-                    opt_states_1d[key][:offset] = bucket_states[start_rank_id][key][start_offset:]
-                for i in range(start_rank_id+1, end_rank_id):
+            if zero_version == 1:
+                chunk_size = bucket_size // len(bucket_states)
+                start_rank_id, start_offset = pstart // chunk_size, pstart % chunk_size
+                end_rank_id, end_offset = pend // chunk_size, pend % chunk_size
+                if start_rank_id == end_rank_id:
                     for key in opt_state_keys:
-                        opt_states_1d[key][offset:offset+chunk_size] = bucket_states[i][key][:]
-                    offset += chunk_size
-                if end_offset:  # skip if end_offset == 0, because it is a no-op
+                        opt_states_1d[key][:] = bucket_states[start_rank_id][key][start_offset:end_offset]
+                else:
+                    offset = chunk_size-start_offset
                     for key in opt_state_keys:
-                        opt_states_1d[key][offset:] = bucket_states[end_rank_id][key][:end_offset]
+                        opt_states_1d[key][:offset] = bucket_states[start_rank_id][key][start_offset:]
+                    for i in range(start_rank_id+1, end_rank_id):
+                        for key in opt_state_keys:
+                            opt_states_1d[key][offset:offset+chunk_size] = bucket_states[i][key][:]
+                        offset += chunk_size
+                    if end_offset:  # skip if end_offset == 0, because it is a no-op
+                        for key in opt_state_keys:
+                            opt_states_1d[key][offset:] = bucket_states[end_rank_id][key][:end_offset]
+            else:  # zero_version == 3
+                assert zero_version > 1, f'unsupported zero version {zero_version}'
+                for key in opt_state_keys:
+                    fill_start = 0
+                    fill_len = pend - pstart
+                    param_numel = opt_states_1d[key].numel()
+                    for bstate in bucket_states:
+                        if fill_start >= param_numel:
+                            # from current implementation, code never goes here
+                            # because we have used model_idx2opt_idx to filter out unnecessary ranks
+                            # but let's keep the logic here for safety
+                            fill_start = fill_start % param_numel
+                            if fill_start + fill_len > param_numel:
+                                fill_len = param_numel - fill_start
+                            # check consistency for the already filled part
+                            if not CubeModule._safe_tensor_equal(
+                                opt_states_1d[key][fill_start: fill_start + fill_len],
+                                bstate[key][pstart: pstart+fill_len]
+                            ):
+                                raise ValueError(f"Conflict in merging optimizer state for param with shape {pshape}")
+                        else:
+                            if fill_start + fill_len > param_numel:
+                                fill_len = param_numel - fill_start
+                            # remove padding part
+                            opt_states_1d[key][fill_start: fill_start + fill_len] = bstate[key][pstart: pstart+fill_len]
+                        fill_start += fill_len
 
             if 'step' in bucket_states[0]:
                 # make sure all steps are different tensors (with same value)
                 opt_states['step'] = bucket_states[0]['step'].clone()
             return opt_states
 
-        def _merge_opt_zero(worker_idx, param_idx):
-            model_idx2opt_idx, opt_idx2ranks = zero_idx_maps[worker_idx]
+        def _merge_opt_zero(param_shape, worker_idx, param_idx):
+            if len(zero_idx_maps[worker_idx]) == 3:
+                model_idx2opt_idx, opt_idx2ranks, zero_version = zero_idx_maps[worker_idx]
+            else:  # backward compatibility
+                assert len(zero_idx_maps[worker_idx]) == 2
+                model_idx2opt_idx, opt_idx2ranks = zero_idx_maps[worker_idx]
+                zero_version = 1  # default to ZeRO-1
             opt_idx = model_idx2opt_idx[param_idx]
             if isinstance(opt_idx, int):
                 # the param without reducer
@@ -632,14 +718,19 @@ class CubeModule(torch.nn.Module):
             else:
                 # the param in reducer bucket
                 opt_idx, pstart, pend, pshape = opt_idx
+                if zero_version == 1:
+                    assert param_shape == pshape, f'param shape {param_shape} vs pshape {pshape}'
                 ranks, bucket_size = opt_idx2ranks[opt_idx]
+                # parameters in reducer come first, so we can directly use opt_idx to index.
                 bucket_states = [optim_state_dicts[rank]['state'][opt_idx] for rank in ranks]
                 return _retrieve_param_opt_state(
                     bucket_states,
                     pstart,
                     pend,
-                    pshape,
-                    bucket_size)
+                    param_shape,
+                    bucket_size,
+                    zero_version
+                )
 
         # full_index: param IDs in the full optimizer state
         for full_index, param_name in enumerate(origin_parameter_names):
@@ -682,7 +773,7 @@ class CubeModule(torch.nn.Module):
                             # As ZeRO is applied, the optimizer state of this parameter (a shard)
                             # may not be stored locally in its optimizer state.
                             # _merge_opt_zero is for recovering the optimizer state corresponding to this parameter shard.
-                            states: Dict[str, torch.Tensor] = _merge_opt_zero(work_idx, local_index)
+                            states: Dict[str, torch.Tensor] = _merge_opt_zero(meta.sub_shape, work_idx, local_index)
                             zero_done_track.add(track_id)
                         else:
                             _logger.debug(f'rank {work_idx}: skip merging duplicated optimizer state for param {full_index} with slicers {meta.slicers}')
@@ -870,6 +961,11 @@ class ZeroMetadata:
     model_idx2opt_idx: Optional[Dict] = None
     # a mapping from optimizer_index to the related bucket information (sub_ranks, bucket_size)
     opt_idx2ranks: Optional[Dict] = None
+    # the level of zero optimization
+    # 0: no zero optimization
+    # 1: zero1
+    # > 1: zero3
+    zero: int = 0
 
 
 @dataclass
@@ -944,6 +1040,16 @@ class ParallelModule(CubeModule):
         self._nreplicas2localparams: Optional[Dict[int, List[torch.nn.Parameter]]] = None
         # track whether all the parames (especially the non-persistent buffers) have been initialized
         self._non_presistent_buffers_inited = False
+        # track the params that have been prefetched in backward
+        # this is only used for zero3
+        # The reason is the eviction of prefetched params in backward
+        # relies on the input.requires_grad flag to be True
+        # If all the inputs do not require grad,
+        # the eviction logic will not be triggered
+        # In that case, we will delay the eviction until next backward hook.
+        self._backward_prefetched_params: dict[torch.nn.Parameter, int] = {}
+        # the params that have been prefetched in forward
+        self._forward_prefetched_params: set[torch.nn.Parameter] = set()
 
     def __init_subclass__(cls, skip_init=False, **kwargs):
         # special case when we just fake a ParallelModule class
@@ -1029,7 +1135,7 @@ class ParallelModule(CubeModule):
         """
         Build buckets for the model reducers.
 
-        You can call this method multiple times to rebuild the buckets.
+        You should call this method exactly once before using this module.
         Typically this will be called when building optimizer when multiple optimizers/param groups are used.
         And we will put parameters with different optimizer or different param groups into different buckets.
 
@@ -1038,10 +1144,122 @@ class ParallelModule(CubeModule):
         1. setting `build_buckets=False` when calling constructor in `nnscaler.parallelize`.
         2. manually calling `build_buckets()` later in `nnscaler.build_optimizer`
         """
-        for reducer in self.reducers:
+        # needs all parameters to be in cuda memory before building buckets
+        self.cuda()
+        self._param_reducer_map: dict[torch.nn.Parameter, int] = {}
+        model_params = {p: n for n, p in self.named_parameters()}
+        # key: attr name of the parameter
+        # value: Zero3AttrMeta
+        self._zero3_param_metadata: dict[str, Zero3AttrMeta] = {}
+        for idx, reducer in enumerate(self.reducers):
             reducer.build_buckets(param_clss)
+            for param in reducer.params:
+                self._param_reducer_map[param] = idx
+                attr_name = model_params[param]
+                param_attr = self._fullmap[attr_name]
+                zero3_info = reducer.get_z3_info(param)
+                self._zero3_param_metadata[attr_name] = Zero3AttrMeta(
+                    attr_name=attr_name,
+                    orig_name=param_attr.orig_name,
+                    start = zero3_info.start,
+                    end = zero3_info.end,
+                    chunk_size=zero3_info.numel_with_padding(),
+                ) if zero3_info is not None else None
 
         self._zero_metadata = self._get_zero_metadata()
+
+    def get_zero3_attr_meta(self, attr_name: str) -> Optional[Zero3AttrMeta]:
+        """
+        Get the Zero3AttrMeta for the given attribute name.
+
+        Args:
+            attr_name (str): the attribute name of the parameter
+        Returns:
+            Optional[Zero3AttrMeta]: the Zero3AttrMeta for the given attribute name
+        """
+        return self._zero3_param_metadata.get(attr_name, None)
+
+    @torch.no_grad()
+    def prefetch_param(self, param: torch.nn.Parameter):
+        """
+        Gather the full parameter tensor for FSDP.
+
+        Args:
+            param (torch.nn.Parameter): the local parameter to gather
+        """
+        reducer = self._reducers[self._param_reducer_map[param]]
+        reducer.prefetch_param(param)
+        self._forward_prefetched_params.add(param)
+
+    @torch.no_grad()
+    def postevict_param(self, param: torch.nn.Parameter):
+        """
+        Release the full parameter tensor for zero3.
+
+        Args:
+            param (torch.nn.Parameter): the local parameter
+        """
+        reducer = self._reducers[self._param_reducer_map[param]]
+        reducer.postevict_param(param)
+        self._forward_prefetched_params.discard(param)
+
+    def _backward_evict_leftover_params(self, order: int):
+        for p in [p for p, o in self._backward_prefetched_params.items() if o > order]:
+            self.postevict_param(p)
+            self._backward_prefetched_params.pop(p, None)
+
+    def backward_postevict_param(self, input: torch.Tensor, param: torch.nn.Parameter, order: int):
+        """
+        Here we need an input tensor to register the backward hook.
+        """
+        if not input.requires_grad:
+            # if input does not require grad, we cannot register backward hook on it
+            return input
+
+        @torch.no_grad()
+        def _postevict_param(param): # pragma: no cover
+            self.postevict_param(param)
+            self._backward_prefetched_params.pop(param, None)
+            self._backward_evict_leftover_params(order)
+
+        return insert_backward_hook(input, functools.partial(_postevict_param, param))
+
+    def backward_prefetch_param(self, activation: torch.Tensor, param: torch.nn.Parameter, order: int):
+        """
+        Here we need an activation tensor to register the backward hook.
+        """
+        if not activation.requires_grad:
+            # if activation does not require grad, we cannot register backward hook on it
+            return activation
+
+        @torch.no_grad()
+        def _prefetch_param(param): # pragma: no cover
+            self.prefetch_param(param)
+            self._backward_prefetched_params[param] = order
+            self._backward_evict_leftover_params(order)
+
+        return insert_backward_hook(activation, functools.partial(_prefetch_param, param))
+
+    def save_params_hooks(self) -> saved_tensors_hooks:
+        """
+        A hook to save tensors during forward pass.
+        This is used to avoid parameters being saved for activation checkpointing.
+
+        Returns:
+            saved_tensors_hooks: the saved tensors hooks
+        """
+        def pack(x: torch.Tensor):
+            for param in self._forward_prefetched_params:
+                if x.untyped_storage() == param.untyped_storage():
+                    return (param, x.shape, x.stride(), x.storage_offset())
+            return x
+
+        def unpack(x):
+            if isinstance(x, tuple) and len(x) == 4:
+                return torch.as_strided(x[0], x[1], x[2], x[3])
+            return x
+
+        return saved_tensors_hooks(pack, unpack)
 
     @classmethod
     def get_attr_meta_map(cls, rank=None):
@@ -1062,7 +1280,22 @@ class ParallelModule(CubeModule):
         self._warn_uninitialized_non_persistent_buffers(raise_error=True)
         if self.training:
             self._sync_grad_required = True  # mark sync_grad() can be called again
-        return self._forward_impl(*args, **kwargs)
+        # all prefetched params should have been evicted
+        # please note the param can be evicted in Reducer,
+        # which is not tracked in self._backward_prefetched_params
+        # so we just check the shape to make sure the param is evicted
+        for param in self._backward_prefetched_params.keys():
+            old_shape = param.shape
+            self.postevict_param(param)
+            assert param.shape == old_shape, \
+                f'Param {param} is not properly evicted in backward'
+        self._backward_prefetched_params.clear()
+
+        ret = self._forward_impl(*args, **kwargs)
+
+        assert not self._forward_prefetched_params, \
+            f'All forward prefetched params should have been evicted in forward'
+        return ret
 
     def _forward_impl(self, *args, **kwargs):
         """
@@ -1307,6 +1540,7 @@ class ParallelModule(CubeModule):
         return ZeroMetadata(
             model_idx2opt_idx=model_idx2opt_idx,
             opt_idx2ranks=opt_idx2ranks,
+            zero=self.compute_config.use_zero
         )
 
     def _get_zero_subranks(self, reducer: Reducer) -> Tuple[int, List[int]]:
@@ -1434,7 +1668,7 @@ class ParallelModule(CubeModule):
             # avoid checking the non-persistent buffers
             attr_names = set([attr for attr in self._fullmap.keys() if attr not in non_persistent_buffers])
 
-            for prefix_attr, content in self.trim_merged_state_dict(self.rank, state_dict, prefix).items():
+            for prefix_attr, content in self.trim_merged_state_dict(state_dict, prefix).items():
                 attr = prefix_attr[len(prefix):]
                 tensor: torch.Tensor = getattr(self, attr)
                 tensor.copy_(content)
@@ -1451,10 +1685,8 @@ class ParallelModule(CubeModule):
         self._warn_uninitialized_non_persistent_buffers()
         return missing_keys
 
-    @classmethod
     def trim_merged_state_dict(
-            cls,
-            rank,
+            self,
             state_dict: Dict[str, Any],
             prefix: str = '',
             *,
@@ -1474,9 +1706,9 @@ class ParallelModule(CubeModule):
         device = device or torch.cuda.current_device()
         trimmed_state_dict = {}
 
-        dist2param = cls.dist_param_map
+        dist2param = self.dist_param_map
         orig_param_names = list(dist2param.values())  # param names in original module (without prefix)
-        attr_meta_map = cls.get_attr_meta_map(rank)
+        attr_meta_map = self.get_attr_meta_map(self.rank)
         with torch.no_grad():
             # avoid checking the non-persistent buffers
             origname_tid_map = {meta.orig_name: meta.tid for meta in attr_meta_map.values()}
@@ -1494,10 +1726,23 @@ class ParallelModule(CubeModule):
                 param_value = state_dict[orig_param_name_with_prefix]
                 tid = origname_tid_map[orig_param_name]
                 for attr, slicer, nchunks in tid_info[tid]:
-                    content = param_value[slicer]
+                    content: torch.Tensor = param_value[slicer]
                     if nchunks != 1:
                         content = content / nchunks
-                    trimmed_state_dict[prefix + attr] = content.to(device)
+                    if self.compute_config.use_zero <= 1 or self._zero3_param_metadata.get(attr, None) is None:
+                        trimmed_state_dict[prefix + attr] = content.to(device)
+                    else:
+                        z3_info = self._zero3_param_metadata[attr]
+                        start, end, chunk_size = z3_info.start, z3_info.end, z3_info.chunk_size
+                        if end - start < chunk_size:
+                            # need padding
+                            padding = chunk_size - (end - start)
+                            trimmed_state_dict[prefix + attr] = torch.cat([
+                                content.view(-1)[start:end],
+                                torch.zeros(padding, dtype=content.dtype, device=content.device)
+                            ], dim=0).to(device)
+                        else:
+                            trimmed_state_dict[prefix + attr] = content.reshape(-1)[start:end].to(device)
 
         return trimmed_state_dict
 
@@ -1521,6 +1766,10 @@ class ParallelModule(CubeModule):
         state[fields._reducers] = [reducer._pack(param_map) for reducer in self._reducers]
         state[fields._zero_metadata] = self._zero_metadata
         state[fields._fullmap] = self._fullmap
+        state[fields._param_reducer_map] = {
+            param_map[p]: rid for p, rid in self._param_reducer_map.items()
+        }
+        state[fields._zero3_param_metadata] = self._zero3_param_metadata
 
         for cv in ParallelModule.__annotations__:
             state[cv] = getattr(self, cv)
@@ -1540,6 +1789,8 @@ class ParallelModule(CubeModule):
         object.__setattr__(pm, fields._reducers, [Reducer._unpack(reducer) for reducer in state[fields._reducers]])
         object.__setattr__(pm, fields._zero_metadata, state[fields._zero_metadata])
         object.__setattr__(pm, fields._fullmap, state[fields._fullmap])
+        object.__setattr__(pm, fields._param_reducer_map, state[fields._param_reducer_map])
+        object.__setattr__(pm, fields._zero3_param_metadata, state[fields._zero3_param_metadata])
 
         def named_parameters(
             prefix: str = "", recurse: bool = True, remove_duplicate: bool = True

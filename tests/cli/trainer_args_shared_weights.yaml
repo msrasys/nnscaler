@@ -1,0 +1,32 @@
+compute_config:
+  plan_ngpus: 2
+  runtime_ngpus: 4
+  constant_folding: false
+  use_zero: 3
+  use_end2end: true
+
+run_mode: run
+pas_policy: tp
+micro_batch_size: 1
+grad_accumulation_steps: 4
+max_train_steps: 10
+enable_progress_bar: false
+log_progress_every_n_train_steps: 10
+precision: bf16
+seed: 1
+
+model:
+  type: tests.cli.test_trainer2.SharedWeightsModule
+
+optimizer:
+  type: torch.optim.AdamW
+  args:
+    betas: (0.9, 0.95)
+    eps: 1e-08
+    weight_decay: 0.1
+    lr: 0.0001
+    fused: true
+  clip_gnorm: 2.0
+
+dataset:
+  type: tests.cli.test_trainer2.SharedWeightsDataset

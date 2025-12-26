@@ -659,6 +659,7 @@ def mark_dynamic(tensor: torch.Tensor, dims: int | list[int] | tuple[int]) -> to
     Mark the dim of a tensor as dynamic, which means it can be changed in the future.
     This is the same with `torch._dynamo.mark_dynamic`
     """
+    dims = [dims] if isinstance(dims, int) else dims
     setattr(tensor, TENSOR_DYNAMIC_DIMS_FIELD_NAME, set(dims) if dims else set())
     return tensor
 

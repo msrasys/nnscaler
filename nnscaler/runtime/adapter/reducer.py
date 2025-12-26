@@ -3,6 +3,7 @@
 
 from typing import List, Dict, Tuple, Any, Callable, Optional, Set, Sequence
 from functools import partial
+from dataclasses import dataclass
 import math
 import logging
 import torch
@@ -60,11 +61,26 @@ def _get_reduce_op(reduce_op: str) -> torch.distributed.ReduceOp:
     raise KeyError(f"Unsupported reduce op {reduce_op}. Supported reduce op: {supported}")
 
 
+@dataclass
+class _Z3ParamInfo:
+    shape: torch.Size  # original shape of the parameter
+    start: int
+    end: int
+    param_buffer_start: int = -1
+    param_buffer_end: int = -1
+
+    def numel(self) -> int:
+        return self.end - self.start
+
+    def numel_with_padding(self) -> int:
+        return self.param_buffer_end - self.param_buffer_start
+
+
 class Bucket:
-    def __init__(self, params: List[torch.nn.Parameter],
+    def __init__(self, reducer: 'Reducer', params: List[torch.nn.Parameter],
                  param_buffer: torch.Tensor, grad_buffer: torch.Tensor,
                  reduce_op: torch.distributed.ReduceOp,
-                 group: torch.distributed.ProcessGroup, async_op: bool, zero: bool,
+                 group: torch.distributed.ProcessGroup, async_op: bool, zero: int,
                  zero_subgroup: torch.distributed.ProcessGroup = None,
                  zero_crossgroup: torch.distributed.ProcessGroup = None,
                  zero_use_reduce_scatter: bool = False,
@@ -85,7 +101,8 @@ class Bucket:
             reduce_op (torch.distributed.ReduceOp): the reduce op used by collectives
             group (torch.distributed.ProcessGroup): communication group
             async_op (bool): whether to use asynchronous operation
-            zero (bool): whether to use zero optimization on gradients
+            zero (int): whether to use zero optimization on gradients, currently only 0/1/3 are supported
+                zero=2 will be treated as zero=3
             zero_subgroup (torch.distributed.ProcessGroup): the subgroup for zero optimization the current rank belongs to
             zero_crossgroup (torch.distributed.ProcessGroup): the communication group for cross zero group allreduce when reduce scatter is enabled
             zero_use_reduce_scatter (bool): whether to use reduce scatter for zero optimization
@@ -105,7 +122,7 @@ class Bucket:
         self._hooks: List[Tuple[Any, RemovableHandle]] = []
 
         self._async: bool = async_op
-        self._zero: bool = zero
+        self._zero: int = zero
         self._zero_use_reduce_scatter = zero_use_reduce_scatter
         self._accumulate_allreduce_grads_in_fp32 = accumulate_allreduce_grads_in_fp32
         self._contiguous_params = param_buffer
@@ -130,6 +147,9 @@ class Bucket:
         self._pre_hooks: List[Callable] = []
         self._post_hooks: List[Callable] = []
 
+        self._z3 = self._zero > 1
+        self._reducer = reducer
+
         # only async will enable contiguous gradient
         self.build()
         self.register_hooks()
@@ -153,6 +173,11 @@ class Bucket:
     def zero(self) -> bool:
         """Whether enable zero for this bucket"""
         return self._zero
+
+    @property
+    def zero3(self) -> bool:
+        """Whether enable zero3 for this bucket"""
+        return self._z3
 
     def get_aligned_numel(self, param) -> int:
         """
@@ -181,9 +206,11 @@ class Bucket:
                 op=self._reduce_op, group=self._zero_subgroup)
 
     def _get_opt_param_data(self):
-        if not self._zero:
+        if not self._zero or self._zero > 1:
+            # when zero3 is used, the parameters are already sharded in reducer
             opt = self._contiguous_params
         else:
+            assert self._zero == 1
             rank = torch.distributed.get_rank(group=self._zero_subgroup)
             assert len(self._contiguous_params) % self._zgroup_sz == 0
             # Note:
@@ -222,12 +249,40 @@ class Bucket:
         """
 
         @torch.no_grad()
-        def post_grad_hook(param: torch.nn.Parameter, *unused):
+        def post_grad_hook(param: torch.nn.Parameter, *unused): # pragma: no cover
             # stream = DeviceGroup().get_stream('reducer')
             ofst = self._pofset[param]
+            rank = torch.distributed.get_rank()
             # TODO: need to handle sparse gradients in torch.nn.Embedding
-            self._contiguous_grads[ofst:ofst+param.numel()].add_(param.grad.data.view(-1))
+            if self._z3:
+                z3_info = self._reducer.get_z3_info(param)
+                grad = param.grad.data.view(-1)
+                padded_numel = z3_info.numel_with_padding() * self._zgroup_sz
+                if grad.numel() < padded_numel:
+                    # add padding
+                    grad = torch.cat(
+                        [grad,
+                        torch.zeros(padded_numel - grad.numel(), device=grad.device, dtype=grad.dtype)]
+                    )
+                output = torch.zeros(z3_info.numel_with_padding(), device=grad.device, dtype=grad.dtype)
+                torch.distributed.reduce_scatter_tensor(
+                    output,
+                    grad,
+                    op=self._reduce_op,
+                    group=self._zero_subgroup
+                )
+                # accumulate the param grad in zero3 way
+                self._contiguous_grads[ofst:ofst+z3_info.numel()]\
+                    .add_(output[0:z3_info.end-z3_info.start])
+            else:
+                self._contiguous_grads[ofst:ofst+param.numel()].add_(param.grad.data.view(-1))
+
             param.grad = None
+
+            if self._z3:
+                # in most cases, it is not necessary to post-evict here,
+                # let's add it for safety
+                self._reducer.postevict_param(param)
 
             if RuntimeFlag.skip_reducer: return
             self._async_param_cnt += 1
@@ -242,7 +297,9 @@ class Bucket:
                     # apply pre hooks
                     self._apply_pre_hooks()
                     # communication
-                    if self._zero and self._zero_use_reduce_scatter:
+                    if self._zero == 1 and self._zero_use_reduce_scatter:
+                        # when zero3 is used, the parameters and gradients are already sharded in reducer
+                        # so only allreduce is needed
                         if self._zgroup_sz == self._wsz:
                             rank = torch.distributed.get_rank(group=self._group)
                             shards = list(self._contiguous_grads.chunk(self._wsz, dim=0))
@@ -253,9 +310,13 @@ class Bucket:
                                 group=self._group, async_op=True)
                         else:
                             assert False, "group zero + reducescatter is not supported in async mode, " \
-                                          "because the two steps (allreduce, reducescatter) use " \
-                                          "two communication groups, which may induce deadlock."
+                                            "because the two steps (allreduce, reducescatter) use " \
+                                            "two communication groups, which may induce deadlock."
                             self._group_reduce_scatter()
+                    elif self._zero > 1:
+                        self._async_handle = torch.distributed.all_reduce(
+                            self._contiguous_grads, op=self._reduce_op,
+                            group=self._zero_crossgroup, async_op=True)
                     else:
                         self._async_handle = torch.distributed.all_reduce(
                             self._contiguous_grads, op=self._reduce_op,
@@ -264,20 +325,23 @@ class Bucket:
         for param in self._params:
             # same trick with FSDP and Megatron
             # reference: https://github.com/pytorch/pytorch/blob/v1.13.1/torch/distributed/fsdp/fully_sharded_data_parallel.py#L3177-L3188
-            param_tmp = param.expand_as(param)
+            if self._z3:
+                old_param_data = param.data
+                # here we need the full parameter to build the computation graph
+                # let's create a temporary parameter with full shape to fake it.
+                param.data = torch.empty(self._reducer.get_z3_info(param).shape, dtype=param.dtype, device=param.device)
+                param_tmp = param.expand_as(param)
+                param.data = old_param_data
+            else:
+                param_tmp = param.expand_as(param)
+
             # gets its AccumulateGrad object
             grad_acc = param_tmp.grad_fn.next_functions[0][0]
             hook = grad_acc.register_hook(partial(post_grad_hook, param))
             # grad_acc must keep, otherwise the hook won't take effect
             self._hooks.append((grad_acc, hook))
 
-    def unregister_hooks(self):
-        """
-        Unregister all post-backward hook to parameters.
-        """
-        for _, hook in self._hooks:
-            hook.remove()
-        self._hooks.clear()
+        torch.cuda.empty_cache()
 
     def sync_grads(self):
         """
@@ -299,8 +363,14 @@ class Bucket:
             # apply pre-hooks
             self._apply_pre_hooks()
             # synchrnoize gradients
-            if self._zero and self._zero_use_reduce_scatter:
+            if self._zero == 1 and self._zero_use_reduce_scatter:
                 self._group_reduce_scatter()
+            elif self._zero > 1:
+                torch.distributed.all_reduce(
+                    self._contiguous_grads,
+                    op=self._reduce_op,
+                    group=self._zero_crossgroup
+                )
             else:
                 torch.distributed.all_reduce(
                     self._contiguous_grads, op=self._reduce_op, group=self._group)
@@ -309,10 +379,16 @@ class Bucket:
         for param in self._params:
             assert param.grad is None
             pofst = self._pofset[param]
+            if self._z3:
+                z3_info = self._reducer.get_z3_info(param)
+                # the param should have been evicted
+                assert z3_info.numel_with_padding() == param.numel() and len(param.shape) == 1, \
+                    f"internal error: zero3 param size mismatch, " \
+                    f"expect {[z3_info.numel_with_padding()]} got {param.shape}"
             param.grad = self._contiguous_grads[pofst:pofst+param.numel()].view(param.size())
 
         # setup gradient for optimizer parameters
-        if self._zero:
+        if self._zero == 1:
             rank = torch.distributed.get_rank(group=self._zero_subgroup)
             grad = self._contiguous_grads.chunk(self._zgroup_sz, dim=0)[rank]
             self._param_for_optimizer.grad = grad
@@ -326,7 +402,7 @@ class Bucket:
         """
         All-gather parameters
         """
-        assert self._zero, "gathering paramters is only for zero optimization."
+        assert self._zero == 1, "gathering paramters is only for zero1 optimization."
         rank = torch.distributed.get_rank(group=self._zero_subgroup)
         CudaTimer().start(field_name='comm', predefined=True)
         src_tensor = self._contiguous_params.chunk(self._zgroup_sz, dim=0)[rank]
@@ -441,15 +517,19 @@ class Bucket:
         state.pop(fields._pre_hooks, None)
         state.pop(fields._post_hooks, None)
 
+        # remove reducer reference
+        state.pop(fields._reducer, None)
+
         return state
 
     @classmethod
-    def _unpack(cls, state: dict):
+    def _unpack(cls, state: dict, reducer: 'Reducer'):
         """
         Return a fake bucket that carries the same information.
         """
         bucket = object.__new__(cls)
         bucket.__dict__.update(state)
+        bucket._reducer = reducer
 
         for param in bucket._params:
             assert param.device.type == 'meta'
@@ -466,12 +546,14 @@ class Reducer:
     # https://github.com/pytorch/pytorch/blob/4fd16dd8aa259cd75c9a6d2ddcd8171cd1ee8e28/torch/nn/parallel/distributed.py#L548
     _DEFAULT_BUCKET_CAP_MB = 25  # 25MB, the same as pytorch
 
-    def __init__(self, ranks: List[int], max_bucket_size_bytes: Optional[int] = None,
-                 reduce_op: str = 'sum', async_op: bool = False,
-                 zero: bool = False, zero_ngroups: int = 1,
-                 zero_use_reduce_scatter: bool = False,
-                 accumulate_allreduce_grads_in_fp32: bool = False,
-                 align_size: int = ALIGNED_BYTES
+    def __init__(self, ranks: List[int],
+        *,
+        max_bucket_size_bytes: Optional[int] = None,
+        reduce_op: str = 'sum', async_op: bool = False,
+        zero: int = 0, zero_ngroups: int = 1,
+        zero_use_reduce_scatter: bool = False,
+        accumulate_allreduce_grads_in_fp32: bool = False,
+        align_size: int = ALIGNED_BYTES,
     ):
         """
         Create a reducer applied on a set of weights for weight reduction
@@ -486,7 +568,8 @@ class Reducer:
                 Default is `None`
             reduce_op (str): reduce operation, can be 'sum', 'avg', 'max' or 'min' (default 'sum')
             async_op (bool): whether to overlap with backward computation (default False)
-            zero (bool): whether to apply ZeRO optimization on gradients
+            zero (int): whether to use zero optimization on gradients, currently only 0/1/3 are supported
+                zero=2 will be treated as zero=3
             zero_ngroups (int): number of ZeRO subgroups in the original ZeRO group
             zero_use_reduce_scatter (bool): whether to use reduce scatter for zero optimization
             accumulate_allreduce_grads_in_fp32 (bool): whether to accumulate allreduce grads in fp32
@@ -509,7 +592,7 @@ class Reducer:
         # buckets stands for a transission unit
         self._buckets: List[Bucket] = list()
         self._async: bool = async_op
-        self._zero: bool = zero
+        self._zero: int = int(zero)
         self._zero_use_reduce_scatter = zero_use_reduce_scatter
         self._accumulate_allreduce_grads_in_fp32 = accumulate_allreduce_grads_in_fp32
         self._align_size: int = align_size
@@ -562,8 +645,17 @@ class Reducer:
         else:
             assert zero_ngroups == 1, f"ZeRO number of groups must be 1, but got {zero_ngroups}"
             self._zero_subgroup = self._group
-            self._zero_crossgroup = None
+            # trivial crossgroup for single rank
+            self._zero_crossgroup = DeviceGroup().get_group([torch.distributed.get_rank()])
+
         self._zero_ngroups = zero_ngroups
+
+        self._z3_size = torch.distributed.get_world_size(group=self._zero_subgroup)
+        if self._z3_size == 1:
+            self._zero = 0  # disable zero when only one rank in subgroup
+        self._z3 = self._zero > 1
+        self._z3_rank = torch.distributed.get_rank(group=self._zero_subgroup)
+        self._z3_params_info: dict[torch.nn.Parameter, _Z3ParamInfo] = dict()
 
     @property
     def zero_ngroups(self) -> int:
@@ -586,6 +678,11 @@ class Reducer:
     def zero(self) -> bool:
         """Whether to apply zero optimization on gradients"""
         return self._zero
+
+    @property
+    def zero3(self) -> bool:
+        """Whether to apply ZeRO3"""
+        return self._zero > 1
 
     @property
     def buckets(self) -> Tuple[Bucket, ...]:
@@ -631,7 +728,12 @@ class Reducer:
             for param in params:
                 with torch.no_grad():
                     self._contiguous_params[ofst:ofst+param.numel()].copy_(param.data.view(-1))
-                    param.data = self._contiguous_params[ofst:ofst+param.numel()].view(param.size())
+                    if self._z3:
+                        param.data = self._contiguous_params[ofst:ofst+param.numel()]
+                        self._z3_params_info[param].param_buffer_start = ofst
+                        self._z3_params_info[param].param_buffer_end = ofst + param.numel()
+                    else:
+                        param.data = self._contiguous_params[ofst:ofst+param.numel()].view(param.size())
                 aligned_nelements = _aligned_nelement(param.nelement(), param.element_size(), self._align_size)
                 ofst += aligned_nelements
 
@@ -643,10 +745,6 @@ class Reducer:
         and each bucket contains at least one parameter.
         If the bucket contains more than 2 parameters, than the total size is samller
         than the max_bucket_size_bytes.
-
-        You can call this method multiple times to rebuild the buckets.
-        Typically this will be called when building optimizer when multiple optimizers/param groups are used.
-        And we will put parameters with different optimizer or different param groups into different buckets.
         """
         self._param_clss = {}
         if param_clss:
@@ -656,12 +754,29 @@ class Reducer:
             # which can help bucket building
             self._params.sort(key=lambda p: self._param_clss[p])
 
-        for bucket in self._buckets:
-            # rebuild bucket should be done before any hooks registered.
-            if bucket._pre_hooks or bucket._post_hooks:
-                raise RuntimeError("Cannot rebuild buckets while pre/post hooks are registered.")
-            bucket.unregister_hooks()
-        self._buckets.clear()
+        # step 0: param split for zero3
+        if self._z3:
+            for param in self._params:
+                if not param.requires_grad:
+                    continue
+
+                chunk_size = (param.numel() + self._z3_size - 1) // self._z3_size
+                start = self._z3_rank * chunk_size
+                end = min(start + chunk_size, param.numel())
+                self._z3_params_info[param] = _Z3ParamInfo(shape=param.shape, start=start, end=end)
+                # clone the data so original param can be released
+                # this padding is required
+                # to make sure all ranks in the zero subgroup have the same bucket layout.
+                if end - start < chunk_size:
+                    padding = chunk_size - (end - start)
+                    param.data = torch.cat([
+                        param.data.view(-1)[start:end].clone(),
+                        torch.zeros(padding, dtype=param.dtype, device=param.device)
+                    ], dim=0)
+                else:
+                    param.data = param.data.view(-1)[start:end].clone()
+
+            torch.cuda.empty_cache()
 
         # step 1: build bucket for overlapping gradient synchronization
         # self._numel * 8 + 1 here is to make sure
@@ -726,6 +841,7 @@ class Reducer:
         for params, param_cls, start, stop in zip(self.seq_buckets, seq_buckets_cls, self.starts, self.stops):
             # initialize buckets
             bucket = Bucket(
+                self,
                 params,
                 self._contiguous_params[start:stop],
                 self._contiguous_grads[start:stop],
@@ -758,12 +874,58 @@ class Reducer:
         for bucket in self._buckets:
             bucket.sync_grads()
 
+    def get_z3_info(self, param: torch.nn.Parameter) -> _Z3ParamInfo:
+        """
+        Get zero3 param info
+        if the param is not in zero3, return None
+        """
+        return self._z3_params_info.get(param, None)
+
+    @torch.no_grad()
+    def prefetch_param(self, param: torch.nn.Parameter):
+        """Prefetch parameter before forward and backward.
+
+        This is required when zero3 is used.
+        """
+        if not self._z3:
+            raise RuntimeError("postevict_param is only for zero3 optimization.")
+        if param not in self._z3_params_info:
+            raise ValueError(f"parameter {param} not found in zero3 params info.")
+
+        info = self._z3_params_info[param]
+        if param.shape == info.shape:
+            # no need to gather
+            return
+
+        full_data = torch.zeros(info.numel_with_padding() * self._z3_size, dtype=param.dtype,
+                                device=torch.cuda.current_device())
+        torch.distributed.all_gather_into_tensor(
+            full_data,
+            param.data,
+            group=self._zero_subgroup
+        )
+        param.data = full_data[0:math.prod(info.shape)].view(info.shape).contiguous()
+
+    @torch.no_grad()
+    def postevict_param(self, param: torch.nn.Parameter):
+        """Release parameter after forward and backward.
+
+        This is required when zero3 is used.
+        """
+        if not self._z3:
+            raise RuntimeError("postevict_param is only for zero3 optimization.")
+        if param not in self._z3_params_info:
+            raise ValueError(f"parameter {param} not found in zero3 params info.")
+        info = self._z3_params_info[param]
+        param.data = self._contiguous_params[info.param_buffer_start:info.param_buffer_end]
+
     def gather_params(self):
         """Gather parameters with Zero optimizations after `optimizer.step()`.
 
         This is required when zero optimization is turned on.
         """
         if not self._zero: return
+        if self._z3: return # in zero3 mode, no need to gather params
         for bucket in self._buckets:
             bucket.gather_params()
 
@@ -913,6 +1075,7 @@ class Reducer:
         fields = unchecked_fields(self)
 
         state[fields._params] = [param_map[p] for p in self._params]
+        state[fields._z3_params_info] = {param_map[p]: info for p, info in self._z3_params_info.items()}
         state[fields._param_clss] = {param_map[p]: param_cls for p, param_cls in self._param_clss.items()}
         state[fields._contiguous_params] = torch.empty_like(self._contiguous_params, device='meta')
         state[fields._contiguous_grads] = torch.empty_like(self._contiguous_grads, device='meta')
@@ -943,7 +1106,7 @@ class Reducer:
 
         buckets = state.pop(fields._buckets)
         reducer._buckets = [
-            Bucket._unpack(bucket) for bucket in buckets
+            Bucket._unpack(bucket, reducer) for bucket in buckets
         ]
         reducer.__dict__.update(state)
         for param in reducer._params:

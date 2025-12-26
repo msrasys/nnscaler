@@ -379,7 +379,7 @@ class Trainer:
     @classmethod
     def merge_checkpoint(cls, checkpoint_files: List[str], output_file: str, *, model_only: bool = False):
         merged_state_dict = cls._merge_checkpoint(checkpoint_files, model_only=model_only)
-        torch.save(merged_state_dict, output_file)
+        Checkpointer.save(merged_state_dict, output_file)
 
     def _log_finalize(self):
         for logger in self.loggers:

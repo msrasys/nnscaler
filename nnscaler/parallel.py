@@ -41,10 +41,10 @@ from nnscaler.ir.operator import IRBpOperation, IRDataOperation
 from nnscaler.ir.tensor import IRFullTensor
 from nnscaler.ir.unique import IDGenerator
 
-from nnscaler.runtime.adapter.reducer import Reducer
+from nnscaler.runtime.adapter.reducer import Bucket, Reducer
 from nnscaler.runtime.device import DeviceGroup
 from nnscaler.runtime.gnorm import calcuate_gnorm, clip_grads
-from nnscaler.runtime.module import AttrMeta, CubeModule, ParallelModule, OriginModuleMetadata, ExtraState, dedup_attrs
+from nnscaler.runtime.module import AttrMeta, Zero3AttrMeta, CubeModule, ParallelModule, OriginModuleMetadata, ExtraState, dedup_attrs
 
 from nnscaler.flags import CompileFlag, RuntimeFlag
 import nnscaler.policies as policies
@@ -87,11 +87,17 @@ class ComputeConfig:
     # how to execute the functions during trace
     trace_strategy: str = 'cuda_run_cpu_offload'
 
-    use_zero: bool = False
+    # Only support 0/1/3 for now
+    # If you set use_zero to 2, ZeRO stage 3 will be used internally.
+    # 0: no zero
+    # 1: ZeRO stage 1
+    # 2: ZeRO stage 3
+    # 3: ZeRO stage 3
+    use_zero: int = 0
     zero_ngroups: int = 1
     # whether to use reduce scatter for zero
     # Please note
-    # 1. this only works when `use_zero` is True and `zero_ngroups` is 1.
+    # 1. this only works when `use_zero` is not 0 and `zero_ngroups` is 1.
     # 2. In some cases, it can introduce parity issue. So use it with caution.
     zero_use_reduce_scatter: bool = False
     # whether to accumulate allreduce grads in fp32
@@ -162,15 +168,33 @@ class ComputeConfig:
             raise ValueError(f"runtime_ngpus {self.runtime_ngpus} must be > 0")
         if self.runtime_ngpus % self.plan_ngpus != 0:
             raise ValueError(f"runtime_ngpus {self.runtime_ngpus} must be a multiple of plan_ngpus {self.plan_ngpus}")
+
+        if self.reducer_bucket_cap_mb and self.reducer_bucket_cap_mb < 0:
+            raise ValueError(f"reducer_bucket_cap_mb {self.reducer_bucket_cap_mb} should not be negative.")
+
+        # for backward compatibility, convert bool to int
+        super().__setattr__('use_zero', int(self.use_zero))
+        if self.use_zero not in (0, 1, 2, 3):
+            raise ValueError(f"use_zero {self.use_zero} must be 0, 1, 2 or 3.")
+        if self.use_zero == 2:
+            logger.warning("use_zero=2 is not supported. ZeRO stage 3 will be used instead.")
+            super().__setattr__('use_zero', 3)
+
+        num_scale_units = self.runtime_ngpus // self.plan_ngpus
+        if self.use_zero:
+            if num_scale_units % self.zero_ngroups != 0:
+                raise ValueError(f"zero_ngroups {self.zero_ngroups} must be a divisor of runtime_ngpus/plan_ngpus {num_scale_units}.")
+            if num_scale_units == self.zero_ngroups:
+                logger.warning(f"zero_ngroups {self.zero_ngroups} equals to runtime_ngpus/plan_ngpus {num_scale_units}. Zero optimization is disabled.")
+                super().__setattr__('use_zero', 0)
+
         if self.use_zero and self.zero_ngroups <= 0:
             raise ValueError(f"zero_ngroups {self.zero_ngroups} must be > 0")
+
         if not self.use_zero and self.zero_ngroups != 1:
             logger.warning(f"use_zero is False, but zero_ngroups is {self.zero_ngroups}. Will set zero_ngroups to 1.")
             # have to use __setattr__ for frozen dataclass
             super().__setattr__('zero_ngroups', 1)
-
-        if self.reducer_bucket_cap_mb and self.reducer_bucket_cap_mb < 0:
-            raise ValueError(f"reducer_bucket_cap_mb {self.reducer_bucket_cap_mb} should not be negative.")
 
         # TODO: Please note in current implementation of Bucket,
         # zero_use_reduce_scatter still works when zero_ngroups > 1 in sync mode
@@ -228,7 +252,11 @@ class ComputeConfig:
         """
         Get the size of the deduplication group of the model state dict, which is `plan_ngpus`.
         """
-        return self.plan_ngpus
+        if self.use_zero > 1:
+            # for zero3
+            return self.runtime_ngpus // self.zero_ngroups
+        else:
+            return self.plan_ngpus
 
     @property
     def optimizer_dedup_group_size(self) -> int:
@@ -351,18 +379,28 @@ def _runtime_flags(**kwargs):
     return _flags(RuntimeFlag, **kwargs)
 
 
-def _to_cpu(val: Any):
-    """Complex to CPU"""
+def _to_cpu(val: Any, requires_grad: Optional[bool] = None) -> Any:
+    """
+    Complex to CPU
+    Recursively move the input to CPU.
+    Args:
+        val (Any): the input value
+        requires_grad (Optional[bool]): whether the returned tensor requires grad.
+            If it is None, will keep the same as the input tensor.
+    """
     if isinstance(val, tuple):
-        return tuple(_to_cpu(t) for t in val)
+        return tuple(_to_cpu(t, requires_grad) for t in val)
     if isinstance(val, list):
-        return list(_to_cpu(t) for t in val)
+        return list(_to_cpu(t, requires_grad) for t in val)
     if isinstance(val, dict):
-        return {_to_cpu(key):_to_cpu(val) for key, val in val.items()}
+        return {_to_cpu(key, requires_grad):_to_cpu(val, requires_grad) for key, val in val.items()}
     if isinstance(val, set):
-        return {_to_cpu(t) for t in val}
+        return {_to_cpu(t, requires_grad) for t in val}
     if isinstance(val, torch.Tensor):
-        requires_grad = val.is_floating_point() or val.is_complex()
+        if requires_grad is None:
+            requires_grad = val.requires_grad
+        else:
+            requires_grad = requires_grad and (val.is_floating_point() or val.is_complex())
         return copy_dynamic(val, val.detach().clone().cpu().requires_grad_(requires_grad))
     return val
 
@@ -393,7 +431,7 @@ def _add_gen_savedir_to_syspath(gen_savedir: str) -> Path:
     gen_savedir = Path(gen_savedir).resolve()
     gen_savedir.mkdir(parents=True, exist_ok=True)
     if str(gen_savedir) not in sys.path:
-        sys.path.append(str(gen_savedir))
+        sys.path.insert(0, str(gen_savedir))
     return gen_savedir
 
 
@@ -654,7 +692,13 @@ def _gen_graph(
             raise ValueError(f"Default value type {type(v)} of forward args is not supported.")
 
     # generate fx graph
-    dummy_forward_args = _to_cpu(dummy_forward_args)
+    dummy_forward_args = _to_cpu(
+        dummy_forward_args,
+        # in end2end mode, we don't need gradients for inputs
+        # in normal mode, we assume all inputs require gradients
+        # so it can connect to other parts of the graph correctly
+        requires_grad=not end2end_mode
+    )
     fx_graph = parser.to_fx_graph(module, dummy_forward_args)
 
     # generate ir logic graph
@@ -1006,7 +1050,7 @@ def parallelize(
     if isinstance(pas_policy, str):
         if not pas_policy in _PREDEFINED_POLICIES:
             raise ValueError(f"Invalid pas_policy: {pas_policy}")
-        pas_policy = _PREDEFINED_POLICIES[pas_policy]
+        pas_policy = partial(policies.fn, policy=_PREDEFINED_POLICIES[pas_policy])
     else:
         if not callable(pas_policy):
             raise ValueError("pas_policy should be a callable or a predefined policy name")
@@ -1386,7 +1430,9 @@ def build_optimizer(
         if compute_config:
             reducer_config = {
                 'async_op': compute_config.use_async_reducer,
-                'zero': compute_config.use_zero,
+                # zero3 can't be used in non-parallel module reducer
+                # because we are unable to insert hooks to prefetch/postevict params
+                'zero': 1 if compute_config.use_zero else 0,
                 'max_bucket_size_bytes': compute_config.max_bucket_size_bytes,
                 'zero_use_reduce_scatter': compute_config.zero_use_reduce_scatter,
                 'zero_ngroups': compute_config.zero_ngroups,
@@ -1810,7 +1856,7 @@ def merge_state_dicts(
         module_prefix = '.'.join(k)
         opt_state_dicts_for_merge = None if opt_state_dicts is None else opt_state_dicts[module_prefix]
 
-        merge_partial_states_zero_idx_maps = [(e.model_idx2opt_idx, e.opt_idx2ranks) for e in extra_states]
+        merge_partial_states_zero_idx_maps = [(e.model_idx2opt_idx, e.opt_idx2ranks, e.zero) for e in extra_states]
         if not extra_states[0].compute_config.use_zero: # all ranks should have the same use_zero
             merge_partial_states_zero_idx_maps = None
         merged_state_dict, merged_opt_state_dict = ParallelModule.merge_state_dicts(
@@ -2032,8 +2078,16 @@ def _trim_optimizer_merged_state_dict(
 
 
 def _opt_load_merged_state_dict(module: ParallelModule, states: Dict[int, Dict[str, Any]]):
+    """
+    Args:
+        module (ParallelModule): the parallel module
+        states (Dict[int, Dict[str, Any]]): the merged optimizer state dict for a parallel module
+            key: optimizer parameter index in the merged state dict
+            value: the state dict for each attribute, e.g. 'step', 'exp_avg', 'exp_avg_sq' are keys
+    """
     with torch.no_grad():
         # orig_name -> state
+        # state: Dict[str, Any], e.g. 'step', 'exp_avg', 'exp_avg_sq' are keys
         orig_param_dict: Dict[str, Dict[str, Any]] = {}
         cnt = 0
         origin_param_names = module.origin_module_metadata.origin_param_names
@@ -2042,16 +2096,80 @@ def _opt_load_merged_state_dict(module: ParallelModule, states: Dict[int, Dict[s
                 orig_param_dict[name] = states[cnt]
             cnt = cnt + 1
 
-        if module.compute_config.use_zero:
+        if module.compute_config.use_zero == 1:
             return _construct_optim_state_zero(module, orig_param_dict)
+        elif module.compute_config.use_zero > 1:
+            return _construct_optim_state_zero3(module, orig_param_dict)
         else:
             return _construct_optim_state_nonzero(module, orig_param_dict)
+
+
+def _construct_optim_state_zero3(
+        module: ParallelModule,
+        orig_param_dict: Dict[str, Dict[str, Any]]
+):
+    # state for each parameter in the parallel module
+    new_states = _construct_optim_state_nonzero(module, orig_param_dict)
+    param_state_map = {p: new_states[idx] for idx, p in enumerate(module.parameters())}
+
+    state_dict, opt_param_idx = {}, 0
+    opt_param = module.parameters_for_optimizer()
+    # first load the params' optimizer state for the reducers's flattened params
+    for reducer in module.reducers:
+        for bucket in reducer.buckets:
+            bucket: Bucket
+            # one bucket corresponds to one flattened param
+            assert len(opt_param[opt_param_idx].shape) == 1
+            chunk_size = bucket._contiguous_params.shape[0]
+            opt_states = {}
+            offset = 0
+            for param in bucket.params:
+                sliced_new_val = param_state_map[param]
+                param_numel = bucket.get_aligned_numel(param)
+                # init the optimizer state
+                if not opt_states:
+                    for key in sliced_new_val.keys():
+                        if key == 'step':
+                            opt_states[key] = sliced_new_val[key]
+                        else:
+                            opt_states[key] = torch.zeros(
+                                [chunk_size], dtype=sliced_new_val[key].dtype,
+                                device=sliced_new_val[key].device, requires_grad=False
+                            )
+                # copy the param's slices to the optimizer's chunk
+                for key in opt_states.keys():
+                    if key == 'step':
+                        continue
+                    opt_states[key][offset:offset+sliced_new_val[key].numel()] = sliced_new_val[key]
+
+                offset += param_numel
+            state_dict[opt_param_idx] = opt_states
+            opt_param_idx += 1
+
+    # load the params' optimizer state that are not in reducers
+    reducer_pids = set()
+    for reducer in module.reducers:
+        reducer_pids.update(id(p) for p in reducer.params)
+    for param in module.parameters():
+        if id(param) not in reducer_pids:
+            state_dict[opt_param_idx] = param_state_map[param]
+            opt_param_idx += 1
+
+    return state_dict
 
 
 def _construct_optim_state_zero(
         module: ParallelModule,
         orig_param_dict: Dict[str, Dict[str, Any]],
 ):
+    """
+    Construct the optimizer state for a ParallelModule with ZeRO optimization.
+    Args:
+        module (ParallelModule): the parallel module
+        orig_param_dict (Dict[str, Dict[str, Any]]): the original parameter optimizer state
+            key: original parameter name
+            value: the state dict for each attribute, e.g. 'step', 'exp_avg', 'exp_avg_sq' are keys
+    """
     dist_param_map = module.dist_param_map  # name in parallel module (without tid suffix) -> name in origin module
     param_area_map = module.fullmap         # str -> AttrMeta
     def _get_optimizer_state_of_param(param, param_ids, local_names):
@@ -2168,9 +2286,12 @@ def _construct_optim_state_nonzero(
     dist_param_map = module.dist_param_map  # name in parallel module (without tid suffix) -> name in origin module
     param_area_map = module.fullmap         # str -> AttrMeta
 
-    new_states = {}
+    new_states: dict[int, dict[str, torch.Tensor]] = {}
     for index, (local_name, _) in enumerate(module.named_parameters()):
-        new_states[index] = _extract_new_state(local_name, orig_param_dict, dist_param_map, param_area_map)
+        new_states[index] = _extract_new_state(
+            local_name, orig_param_dict, dist_param_map, param_area_map,
+            module.get_zero3_attr_meta(local_name)
+        )
 
     return new_states
 
@@ -2180,7 +2301,8 @@ def _extract_new_state(
         orig_param_dict: Dict[str, Dict[str, Any]],
         dist_param_map: Dict[str, str],
         param_area_map: Dict[str, AttrMeta],
-):
+        zero3_info: Optional[Zero3AttrMeta] = None
+) -> Dict[str, torch.Tensor]:
     name = '_'.join(local_name.split('_')[:-1]) # remove the integer suffix
     assert name in dist_param_map
     attr_meta = param_area_map[local_name]
@@ -2191,6 +2313,18 @@ def _extract_new_state(
             sliced_new_val[key] = new_val[key]
         else:
             sliced_new_val[key] = new_val[key][attr_meta.slicers] / attr_meta.val_chunks
+            if zero3_info is not None:
+                sliced_new_val[key] = sliced_new_val[key].view(-1)[zero3_info.start:zero3_info.end]
+                if sliced_new_val[key].numel() < zero3_info.chunk_size:
+                    # padding if needed
+                    sliced_new_val[key] = torch.cat(
+                        [sliced_new_val[key],
+                         torch.zeros(
+                             zero3_info.chunk_size - sliced_new_val[key].numel(),
+                             dtype=sliced_new_val[key].dtype,
+                             device=sliced_new_val[key].device
+                         )], dim=0
+                    )
     return sliced_new_val
 
 
@@ -2302,7 +2436,7 @@ def _broadcast_gen_files(
 
 def _collect_dedup_info(parallel_modules: Dict[str, ParallelModule]) -> Tuple[
     Dict[int, Dict[str, Dict[str, AttrMeta]]],
-    int,
+    Dict[str, int],
     Dict[int, Dict[str, Dict[str, AttrMeta]]]
 ]:
     """
@@ -2313,17 +2447,12 @@ def _collect_dedup_info(parallel_modules: Dict[str, ParallelModule]) -> Tuple[
     Returns:
         A tuple containing:
             - rank2deduped_fullmap: a mapping from rank id to deduplicated attribute information
-            - dedup_group_size: the size of the deduplication group
+            - dedup_group_size: the size of the deduplication group for each parallel module
             - global_fullmaps: a mapping from rank id to full attribute information
     """
-    dedup_group_size = None
+    dedup_group_size = {}
     for prefix, parallel_module in parallel_modules.items():
-        if dedup_group_size is None:
-            dedup_group_size = parallel_module.module_dedup_group_size
-        else:
-            assert dedup_group_size == parallel_module.module_dedup_group_size, \
-                f'dedup_group_size mismatch {dedup_group_size} vs {parallel_module.module_dedup_group_size}'
-    dedup_group_size = dedup_group_size or 1
+        dedup_group_size[prefix] = parallel_module.module_dedup_group_size
 
     world_size = torch.distributed.get_world_size()
     global_fullmaps: Dict[
@@ -2339,8 +2468,9 @@ def _collect_dedup_info(parallel_modules: Dict[str, ParallelModule]) -> Tuple[
     # `dedup_attrs` is a deterministic algorithm, so it produces same results across different ranks
     rank2deduped_fullmap = dedup_attrs(global_fullmaps)
 
-    for rank in range(dedup_group_size, world_size):
-        assert len(rank2deduped_fullmap[rank]) == 0, f'Rank {rank} has non-empty deduped_fullmap: {rank2deduped_fullmap[rank]}'
+    for prefix, group_size in dedup_group_size.items():
+        for rank in range(group_size, world_size):
+            assert len(rank2deduped_fullmap[rank].get(prefix, {})) == 0, f'Rank {rank} has non-empty deduped_fullmap: {rank2deduped_fullmap[rank]}'
 
     return rank2deduped_fullmap, dedup_group_size, global_fullmaps
 
@@ -2380,7 +2510,12 @@ def deduped_state_dict(
         split_names = key.split('.')
         prefix = '.'.join(split_names[:-1]) # remove the last part of the key
         if prefix in parallel_modules:
-            if prefix not in cur_deduped_fullmap or split_names[-1] not in cur_deduped_fullmap[prefix]:
+            if parallel_modules[prefix].compute_config.use_zero > 1:
+                # for zero3, we don't use advanced deduplication.
+                # TODO: handle zero3 case
+                if cur_rank >= parallel_modules[prefix].module_dedup_group_size:
+                    module_state_dict.pop(key, None)
+            elif prefix not in cur_deduped_fullmap or split_names[-1] not in cur_deduped_fullmap[prefix]:
                 module_state_dict.pop(key, None)
         # since replicated non-parallel modules, we only keep weights on rank 0
         elif cur_rank >= 1:
@@ -2442,16 +2577,25 @@ def load_deduped_state_dict(
     logger.debug(f'At rank {cur_rank}, state_dict keys: {module_state_dict.keys()}.')
     logger.debug(f'At rank {cur_rank}, missing_keys: {missing_keys}, unexpected_keys: {unexpected_keys}.')
 
-    # step 2: broadcast deduped weights inside 1st scale unit
-    parallel_modules = {prefix: m for prefix, m in module.named_modules() if isinstance(m, ParallelModule)}
-    rank2deduped_fullmap, dedup_group_size, global_tensor_meta = _collect_dedup_info(parallel_modules)
-    broadcast_group = DeviceGroup().get_group(list(range(dedup_group_size)))
-    logger.debug(f'At rank {cur_rank}, dedup_group_size: {dedup_group_size}, rank2deduped_fullmap: {rank2deduped_fullmap}.')
-    if cur_rank < dedup_group_size:
+    # step 2: broadcast deduped weights inside 1st scale unit for non-zero3 parallel modules
+    # for zero3 modules, the weights are already complete after step 1
+    # TODO: refine zero3 modules support
+    parallel_modules = {
+        prefix: m
+        for prefix, m in module.named_modules()
+        if isinstance(m, ParallelModule) and m.compute_config.use_zero <= 1
+    }
+    if parallel_modules:
+        rank2deduped_fullmap, dedup_group_size, global_tensor_meta = _collect_dedup_info(parallel_modules)
+        logger.debug(f'At rank {cur_rank}, dedup_group_size: {dedup_group_size}, rank2deduped_fullmap: {rank2deduped_fullmap}.')
+
         # broadcast weights in parallel modules
         for rank, deduped_fullmap in rank2deduped_fullmap.items():
             logger.debug(f'At rank {cur_rank}, process rank: {rank}.')
             for prefix, fullmap in deduped_fullmap.items():
+                if cur_rank >= dedup_group_size[prefix]:
+                    break
+                broadcast_group = DeviceGroup().get_group(list(range(dedup_group_size[prefix])))
                 for local_name, attr_meta in fullmap.items():
                     key = f'{prefix}.{local_name}' if prefix else local_name
                     assert prefix in parallel_modules, f'Prefix {prefix} not found in parallel_modules: {list(parallel_modules.keys())}.'
@@ -2482,7 +2626,7 @@ def load_deduped_state_dict(
         for key in missing_keys:
             split_names = key.split('.')
             prefix = '.'.join(split_names[:-1]) # remove the last part of the key
-            assert prefix not in parallel_modules, f'At rank {cur_rank}, the missing key {key} should be in non-parallel modules.'
+            assert prefix not in parallel_modules or cur_rank >= dedup_group_size[prefix], f'At rank {cur_rank}, the missing key {key} should be in non-parallel modules.'
 
     # At this point
     # - All parallel modules in first scale unit should be complete.
@@ -2762,7 +2906,7 @@ def _trim_module_merged_state_dict(
         prefix = module_path + '.' if module_path else ''
         trimmed_state_dict.update(
             pmodule.trim_merged_state_dict(
-                pmodule.rank, module_state_dict, prefix=prefix,
+                module_state_dict, prefix=prefix,
                 device=device
             )
         )

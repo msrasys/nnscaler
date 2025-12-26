@@ -47,7 +47,7 @@ class CompileFlag:
     # use zero optimization on optimizer status.
     # to cooperate with zero, user needs to call `model.parameters_for_optimizer()`
     # to get parameters for optimizer, and `model.gather_params()` after `optimizer.step()`
-    use_zero = _to_bool('USE_ZERO')
+    use_zero = _to_int('USE_ZERO')
     # use async communication to overlap gradient synchronization and backward computation
     async_reducer = _to_bool('ASYNC_REDUCER')  # use async reducer
     # maximal reducer weight bytes for one allreduce (only effective for async):

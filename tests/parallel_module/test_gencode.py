@@ -69,6 +69,7 @@ class SliceModule(torch.nn.Module):
     def forward(self, x):
         return x[:2]
 
+
 @replace_all_device_with('cpu')
 def test_codegen_slice():
     with tempfile.TemporaryDirectory() as tempdir:
@@ -210,9 +211,8 @@ def _gencode_unused_args_worker(tempdir):
         m_new(torch.tensor([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]), m=1)
     )
 
-    with pytest.raises(ValueError):
-        # y must be None
-        m_new(torch.tensor([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]), 1)
+    # if y is not None, we will not raise error now.
+    m_new(torch.tensor([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]), 1)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason='lack of gpu devices')
@@ -258,9 +258,6 @@ def _gencode_unused_args_worker2(tempdir):
     with pytest.raises(TypeError, match='.*must be Tensor, not NoneType.*'):
         # raise by torch.add, as m is None
         m_new(torch.tensor([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]))
-    with pytest.raises(ValueError):
-        # y must be None
-        m_new(torch.tensor([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]), 1)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason='lack of gpu devices')
@@ -2111,3 +2108,194 @@ def test_dynamic_dim_partition(tmp_path, dynamic_dims):
         assert not _gencode_contains(tmp_path, DynamicInputModel, 0, r'nnscaler.runtime.adapter.nn.split_allgather', instance_name=instance_name)
     else:
         assert _gencode_contains(tmp_path, DynamicInputModel, 0, r'nnscaler.runtime.adapter.nn.split_allgather', instance_name=instance_name)
+
+
+@replace_all_device_with('cpu')
+def test_zero3_normal(tmp_path):
+    from tests.parallel_module.test_end2end import MLP
+    m = MLP(2, 2)
+    dummy_input = {
+        'data': torch.randn(
+            2, 2),
+        'target': torch.rand(
+            2, 2)
+    }
+    m.train()
+    parallelize(
+        m,
+        {'data': dummy_input},
+        'dp',
+        ComputeConfig(1, 2, use_zero=3),
+        gen_savedir=tmp_path,
+        load_module=False,
+        reuse='override',
+    )
+    # code looks like:
+    assert _gencode_contains(tmp_path, MLP, 0,
+        r'self\.prefetch_param\(self\.layers_0_weight_\d+\)')
+    assert _gencode_contains(tmp_path, MLP, 0,
+        r'self\.postevict_param\(self\.layers_0_weight_\d+\)')
+    assert _gencode_contains(tmp_path, MLP, 0,
+        r'self\.backward_postevict_param\(.*, self\.layers_0_weight_\d+, 1\)')
+    assert _gencode_contains(tmp_path, MLP, 0,
+        r'self\.backward_prefetch_param\(.*, self\.layers_0_weight_\d+, 1\)')
+
+    # def segment35_impl(self, data_23):
+    #     # File "/home/weijiangxu/MagicCube/tests/parallel_module/test_end2end.py", line 46, in forward,  x = data['data']
+    #     getitem_25 = _operator.getitem(data_23, 'data')
+    #     self.prefetch_param(self.layers_0_weight_26)
+    #     getitem_25 = self.backward_postevict_param(getitem_25, self.layers_0_weight_26, 1)
+    #     # File "/home/weijiangxu/MagicCube/tests/parallel_module/test_end2end.py", line 48, in forward,  x = layer(x)
+    #     linear_27 = torch.nn.functional.linear(getitem_25, self.layers_0_weight_26, bias=None)
+    #     self.postevict_param(self.layers_0_weight_26)
+    #     linear_27 = self.backward_prefetch_param(linear_27, self.layers_0_weight_26, 1)
+    #     del getitem_25
+    #     self.prefetch_param(self.layers_1_weight_28)
+    #     linear_27 = self.backward_postevict_param(linear_27, self.layers_1_weight_28, 2)
+    #     # File "/home/weijiangxu/MagicCube/tests/parallel_module/test_end2end.py", line 48, in forward,  x = layer(x)
+    #     linear_1_29 = torch.nn.functional.linear(linear_27, self.layers_1_weight_28, bias=None)
+    #     self.postevict_param(self.layers_1_weight_28)
+    #     linear_1_29 = self.backward_prefetch_param(linear_1_29, self.layers_1_weight_28, 2)
+    #     del linear_27
+    #     # File "/home/weijiangxu/MagicCube/tests/parallel_module/test_end2end.py", line 49, in forward,  x = torch.sigmoid(x)
+    #     sigmoid_30 = torch.sigmoid(linear_1_29)
+    #     del linear_1_29
+    #     # File "/home/weijiangxu/MagicCube/tests/parallel_module/test_end2end.py", line 50, in forward,  loss = self.loss_fn(x, data['target'])
+    #     getitem_1_31 = _operator.getitem(data_23, 'target')
+    #     # File "/home/weijiangxu/MagicCube/tests/parallel_module/test_end2end.py", line 50, in forward,  loss = self.loss_fn(x, data['target'])
+    #     binary_cross_entropy_24 = torch.nn.functional.binary_cross_entropy(sigmoid_30, getitem_1_31, weight=None, reduction='mean')
+    #     del sigmoid_30, getitem_1_31
+    #     return binary_cross_entropy_24
+
+    # def segment35(self, data_23):
+    #     with self.save_params_hooks():
+    #         return self.segment35_impl(data_23)
+
+
+class SoloOpModule(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.scale = torch.nn.Parameter(torch.randn(4, 4))
+        self.p = torch.nn.Parameter(torch.randn(4, 4))
+
+    def forward(self, x):
+        x = self.scale.sum() + x + self.p
+        return torch.sum(x)
+
+
+def launch_zero3_run_solo_param(tmp_path):
+    init_distributed()
+    m = SoloOpModule()
+    dummy_input = torch.randn(4, 4)
+    m.train()
+    m_new = parallelize(
+        m,
+        {'x': dummy_input},
+        'dp',
+        ComputeConfig(1, 2, use_zero=3),
+        gen_savedir=tmp_path,
+        load_module=True,
+        reuse='override',
+    )
+    loss = m_new(dummy_input)
+    loss.backward()
+    # scale can't be evicited with backward hook
+    assert len(m_new._backward_prefetched_params) == 1
+    # but it should have been evicted in reducer.
+    assert list(m_new._backward_prefetched_params.keys())[0].shape == (8,)
+    assert not _gencode_contains(tmp_path, SoloOpModule, 0,
+        r'self\.backward_postevict_param\(.*, self\.scale_\d+, \d+\)')
+    assert _gencode_contains(tmp_path, SoloOpModule, 0,
+        r'self\.backward_postevict_param\(.*, self\.p_\d+, \d+\)')
+    # code looks like:
+    # def segment32_impl(self, x_17):
+    #     self.prefetch_param(self.scale_19)
+    #     # File "/home/weijiangxu/MagicCube/tests/parallel_module/test_gencode.py", line 2186, in forward,  x = self.scale.sum() + x + self.p
+    #     sum_1_20 = torch.sum(self.scale_19)
+    #     self.postevict_param(self.scale_19)
+    #     sum_1_20 = self.backward_prefetch_param(sum_1_20, self.scale_19, 0)
+    #     # File "/home/weijiangxu/MagicCube/tests/parallel_module/test_gencode.py", line 2186, in forward,  x = self.scale.sum() + x + self.p
+    #     add_21 = torch.add(sum_1_20, x_17, alpha=1)
+    #     del x_17, sum_1_20
+    #     self.prefetch_param(self.p_22)
+    #     add_21 = self.backward_postevict_param(add_21, self.p_22, 2)
+    #     # File "/home/weijiangxu/MagicCube/tests/parallel_module/test_gencode.py", line 2186, in forward,  x = self.scale.sum() + x + self.p
+    #     add_1_23 = torch.add(add_21, self.p_22, alpha=1)
+    #     self.postevict_param(self.p_22)
+    #     add_1_23 = self.backward_prefetch_param(add_1_23, self.p_22, 2)
+    #     del add_21
+    #     # File "/home/weijiangxu/MagicCube/tests/parallel_module/test_gencode.py", line 2187, in forward,  return torch.sum(x)
+    #     sum_2_18 = torch.sum(add_1_23)
+    #     del add_1_23
+    #     return sum_2_18
+
+    # def segment32(self, x_17):
+    #     with self.save_params_hooks():
+    #         return self.segment32_impl(x_17)
+    assert True
+
+
+@pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.device_count() < 2, reason='lack of GPU devices')
+def test_zero3_run_solo_param(tmp_path):
+    launch_torchrun(2, launch_zero3_run_solo_param, tmp_path)
+
+
+@nnscaler.register_op('*, *, *, * -> *, *, *, *')
+def _zero3_multi_inout(x, y, z, w):
+    return x + 1, y + 1, z + 1, w + 1
+
+
+class Zero3MultiInoutModule(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.p = torch.nn.Parameter(torch.randn(4, 4))
+        self.q = torch.nn.Parameter(torch.randn(4, 4))
+
+    def forward(self, x, y):
+        return _zero3_multi_inout(x, y, self.p, self.q)
+
+
+@replace_all_device_with('cpu')
+def test_zero3_multi_inout(tmp_path):
+    m = Zero3MultiInoutModule()
+    m.train()
+    m_new = parallelize(
+        m,
+        {'x': torch.randn(4, 4), 'y': torch.randn(4, 4)},
+        'dp',
+        ComputeConfig(1, 2, use_zero=3),
+        gen_savedir=tmp_path,
+        load_module=False,
+        reuse='override',
+    )
+    assert len(_gencode_contains(tmp_path, Zero3MultiInoutModule, 0,
+        'self.backward_prefetch_param')) == 8
+    assert len(_gencode_contains(tmp_path, Zero3MultiInoutModule, 0,
+        'self.backward_postevict_param')) == 4
+    # code looks like:
+    # def segment34_impl(self, x_25, y_26):
+    #     self.prefetch_param(self.p_31)
+    #     x_25 = self.backward_postevict_param(x_25, self.p_31, 0)
+    #     y_26 = self.backward_postevict_param(y_26, self.p_31, 0)
+    #     self.prefetch_param(self.q_32)
+    #     x_25 = self.backward_postevict_param(x_25, self.q_32, 0)
+    #     y_26 = self.backward_postevict_param(y_26, self.q_32, 0)
+    #     # File "/home/weijiangxu/MagicCube/tests/parallel_module/test_gencode.py", line 2259, in forward,  return _zero3_multi_inout(x, y, self.p, self.q)
+    #     _zero3_multi_inout_27, _zero3_multi_inout_28, _zero3_multi_inout_29, _zero3_multi_inout_30 = tests.parallel_module.test_gencode._zero3_multi_inout(x_25, y_26, self.p_31, self.q_32)
+    #     self.postevict_param(self.p_31)
+    #     self.postevict_param(self.q_32)
+    #     _zero3_multi_inout_27 = self.backward_prefetch_param(_zero3_multi_inout_27, self.p_31, 0)
+    #     _zero3_multi_inout_27 = self.backward_prefetch_param(_zero3_multi_inout_27, self.q_32, 0)
+    #     _zero3_multi_inout_28 = self.backward_prefetch_param(_zero3_multi_inout_28, self.p_31, 0)
+    #     _zero3_multi_inout_28 = self.backward_prefetch_param(_zero3_multi_inout_28, self.q_32, 0)
+    #     _zero3_multi_inout_29 = self.backward_prefetch_param(_zero3_multi_inout_29, self.p_31, 0)
+    #     _zero3_multi_inout_29 = self.backward_prefetch_param(_zero3_multi_inout_29, self.q_32, 0)
+    #     _zero3_multi_inout_30 = self.backward_prefetch_param(_zero3_multi_inout_30, self.p_31, 0)
+    #     _zero3_multi_inout_30 = self.backward_prefetch_param(_zero3_multi_inout_30, self.q_32, 0)
+    #     del x_25, y_26
+    #     return _zero3_multi_inout_27, _zero3_multi_inout_28, _zero3_multi_inout_29, _zero3_multi_inout_30
+
+    # def segment34(self, x_25, y_26):
+    #     with self.save_params_hooks():
+    #         return self.segment34_impl(x_25, y_26)
+    assert True

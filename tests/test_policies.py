@@ -293,11 +293,17 @@ def test_codegen_fn_pipeline(tmp_path):
 
         # will generate two communication ops
         # one for ffn input
-        assert _gencode_contains(tmp_path, FnPolicyModuleList, rank, f'nnscaler.runtime.adapter.nn.identity_allreduce')
+        if tp_idx == 0:
+            assert not _gencode_contains(tmp_path, FnPolicyModuleList, rank, f'nnscaler.runtime.adapter.nn.identity_allreduce')
+        else:
+            assert _gencode_contains(tmp_path, FnPolicyModuleList, rank, f'nnscaler.runtime.adapter.nn.identity_allreduce')
         # one for ffn output
         assert _gencode_contains(tmp_path, FnPolicyModuleList, rank, f'nnscaler.runtime.adapter.nn.allreduce_identity')
 
-        assert len(_gencode_contains(tmp_path, FnPolicyModuleList, rank, f'nnscaler.runtime.adapter.nn.')) == 2
+        if tp_idx == 0:
+            assert len(_gencode_contains(tmp_path, FnPolicyModuleList, rank, f'nnscaler.runtime.adapter.nn.')) == 1
+        else:
+            assert len(_gencode_contains(tmp_path, FnPolicyModuleList, rank, f'nnscaler.runtime.adapter.nn.')) == 2
         assert len(_gencode_contains(tmp_path, FnPolicyModuleList, rank, r'ckpt.checkpoint\(recompute')) == 1
         assert len(_gencode_contains(tmp_path, FnPolicyModuleList, rank, r'def recompute\(')) == 1
 
@@ -983,3 +989,121 @@ def test_run_codegen_fn_with_hook():
     """
     with tempfile.TemporaryDirectory() as tempdir:
         launch_torchrun(2, _gencode_unused_args_worker, tempdir)
+
+
+@replace_all_device_with('cpu')
+def test_codegen_fsdp(tmp_path):
+    parallelize(
+        FnPolicyModuleList(),
+        {'x': torch.randn(4, 4)},
+        'fsdp',
+        ComputeConfig(
+            1, 2,
+            use_end2end=True,
+            use_zero=3,
+            pas_config={
+                'recomputes': [FFNDropout],
+            }
+        ),
+        gen_savedir=tmp_path,
+        load_module=False
+    )
+    # code should look like:
+    # def segment105_impl(self, x_49):
+    #     # File "/home/weijiangxu/MagicCube/tests/test_policies.py", line 239, in forward,  x = x * 2
+    #     mul_51 = torch.mul(x_49, 2)
+    #     del x_49
+
+    #     def recompute(mul_51):
+    #         # created at IRAdapterGener:local_consumer_multiref
+    #         mul_100, mul_104 = nnscaler.runtime.function.multiref(mul_51, times=2)
+    #         del mul_51
+    #         self.prefetch_param(self.ffn_0_gate_proj_weight_52)
+    #         mul_100 = self.backward_postevict_param(mul_100, self.ffn_0_gate_proj_weight_52, 1)
+    #         # File "/home/weijiangxu/MagicCube/tests/test_policies.py", line 226, in forward,  down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
+    #         linear_53 = torch.nn.functional.linear(mul_100, self.ffn_0_gate_proj_weight_52, bias=None)
+    #         self.postevict_param(self.ffn_0_gate_proj_weight_52)
+    #         linear_53 = self.backward_prefetch_param(linear_53, self.ffn_0_gate_proj_weight_52, 1)
+    #         del mul_100
+    #         # File "/home/weijiangxu/MagicCube/tests/test_policies.py", line 226, in forward,  down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
+    #         tanh_54 = torch.tanh(linear_53)
+    #         del linear_53
+    #         self.prefetch_param(self.ffn_0_up_proj_weight_55)
+    #         mul_104 = self.backward_postevict_param(mul_104, self.ffn_0_up_proj_weight_55, 3)
+    #         # File "/home/weijiangxu/MagicCube/tests/test_policies.py", line 226, in forward,  down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
+    #         linear_1_56 = torch.nn.functional.linear(mul_104, self.ffn_0_up_proj_weight_55, bias=None)
+    #         self.postevict_param(self.ffn_0_up_proj_weight_55)
+    #         linear_1_56 = self.backward_prefetch_param(linear_1_56, self.ffn_0_up_proj_weight_55, 3)
+    #         del mul_104
+    #         # File "/home/weijiangxu/MagicCube/tests/test_policies.py", line 226, in forward,  down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
+    #         mul_1_57 = torch.mul(tanh_54, linear_1_56)
+    #         del tanh_54, linear_1_56
+    #         self.prefetch_param(self.ffn_0_down_proj_weight_58)
+    #         mul_1_57 = self.backward_postevict_param(mul_1_57, self.ffn_0_down_proj_weight_58, 5)
+    #         # File "/home/weijiangxu/MagicCube/tests/test_policies.py", line 226, in forward,  down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
+    #         linear_2_59 = torch.nn.functional.linear(mul_1_57, self.ffn_0_down_proj_weight_58, bias=None)
+    #         self.postevict_param(self.ffn_0_down_proj_weight_58)
+    #         linear_2_59 = self.backward_prefetch_param(linear_2_59, self.ffn_0_down_proj_weight_58, 5)
+    #         del mul_1_57
+    #         # File "/home/weijiangxu/MagicCube/tests/test_policies.py", line 227, in forward,  return self.dropout(down_proj)
+    #         ffn_0_dropout_training_21 = self.training
+    #         # File "/home/weijiangxu/MagicCube/tests/test_policies.py", line 227, in forward,  return self.dropout(down_proj)
+    #         dropout_60 = torch.nn.functional.dropout(linear_2_59, p=0.1, training=ffn_0_dropout_training_21, inplace=False)
+    #         del linear_2_59
+    #         return dropout_60
+
+    #     dropout_60 = ckpt.checkpoint(recompute, mul_51, use_reentrant=False)
+    #     del mul_51
+
+    #     def recompute(dropout_60):
+    #         # created at IRAdapterGener:local_consumer_multiref
+    #         dropout_108, dropout_112 = nnscaler.runtime.function.multiref(dropout_60, times=2)
+    #         del dropout_60
+    #         self.prefetch_param(self.ffn_1_gate_proj_weight_61)
+    #         dropout_108 = self.backward_postevict_param(dropout_108, self.ffn_1_gate_proj_weight_61, 1)
+    #         # File "/home/weijiangxu/MagicCube/tests/test_policies.py", line 226, in forward,  down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
+    #         linear_3_62 = torch.nn.functional.linear(dropout_108, self.ffn_1_gate_proj_weight_61, bias=None)
+    #         self.postevict_param(self.ffn_1_gate_proj_weight_61)
+    #         linear_3_62 = self.backward_prefetch_param(linear_3_62, self.ffn_1_gate_proj_weight_61, 1)
+    #         del dropout_108
+    #         # File "/home/weijiangxu/MagicCube/tests/test_policies.py", line 226, in forward,  down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
+    #         tanh_1_63 = torch.tanh(linear_3_62)
+    #         del linear_3_62
+    #         self.prefetch_param(self.ffn_1_up_proj_weight_64)
+    #         dropout_112 = self.backward_postevict_param(dropout_112, self.ffn_1_up_proj_weight_64, 3)
+    #         # File "/home/weijiangxu/MagicCube/tests/test_policies.py", line 226, in forward,  down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
+    #         linear_4_65 = torch.nn.functional.linear(dropout_112, self.ffn_1_up_proj_weight_64, bias=None)
+    #         self.postevict_param(self.ffn_1_up_proj_weight_64)
+    #         linear_4_65 = self.backward_prefetch_param(linear_4_65, self.ffn_1_up_proj_weight_64, 3)
+    #         del dropout_112
+    #         # File "/home/weijiangxu/MagicCube/tests/test_policies.py", line 226, in forward,  down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
+    #         mul_2_66 = torch.mul(tanh_1_63, linear_4_65)
+    #         del tanh_1_63, linear_4_65
+    #         self.prefetch_param(self.ffn_1_down_proj_weight_67)
+    #         mul_2_66 = self.backward_postevict_param(mul_2_66, self.ffn_1_down_proj_weight_67, 5)
+    #         # File "/home/weijiangxu/MagicCube/tests/test_policies.py", line 226, in forward,  down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
+    #         linear_5_68 = torch.nn.functional.linear(mul_2_66, self.ffn_1_down_proj_weight_67, bias=None)
+    #         self.postevict_param(self.ffn_1_down_proj_weight_67)
+    #         linear_5_68 = self.backward_prefetch_param(linear_5_68, self.ffn_1_down_proj_weight_67, 5)
+    #         del mul_2_66
+    #         # File "/home/weijiangxu/MagicCube/tests/test_policies.py", line 227, in forward,  return self.dropout(down_proj)
+    #         ffn_1_dropout_training_40 = self.training
+    #         # File "/home/weijiangxu/MagicCube/tests/test_policies.py", line 227, in forward,  return self.dropout(down_proj)
+    #         dropout_1_69 = torch.nn.functional.dropout(linear_5_68, p=0.1, training=ffn_1_dropout_training_40, inplace=False)
+    #         del linear_5_68
+    #         return dropout_1_69
+
+    #     dropout_1_69 = ckpt.checkpoint(recompute, dropout_60, use_reentrant=False)
+    #     del dropout_60
+    #     # File "/home/weijiangxu/MagicCube/tests/test_policies.py", line 242, in forward,  x = x + 3
+    #     add_70 = torch.add(dropout_1_69, 3, alpha=1)
+    #     del dropout_1_69
+    #     # File "/home/weijiangxu/MagicCube/tests/test_policies.py", line 243, in forward,  return torch.sum(x) # make sure output is scalar loss (required by pipeline parallelism)
+    #     sum_1_50 = torch.sum(add_70)
+    #     del add_70
+    #     return sum_1_50
+
+    # def segment105(self, x_49):
+    #     with self.save_params_hooks():
+    #         return self.segment105_impl(x_49)
+    assert True

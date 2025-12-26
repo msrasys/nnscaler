@@ -37,6 +37,7 @@ def test_dp_solver():
     # the optimal plan is each operator's first partition
     assert best.path == [(0, 0), (1, 0), (2, 0)]
 
+
 def test_dp_solver_mem():
     solver = dp_solver.DPSolver(True, 100, 1)
     solver.add_interval(0, 4)
@@ -73,6 +74,7 @@ def test_dp_solver_mem():
     assert best.path == [(0, 0), (1, 0), (2, 0), (3, 0), (4, 0)]
     assert best.memory == 71
 
+
 def test_dp_solver_build_in_edges():
     # mock following code
     # dropout_rate = self.attention_dropout if self.training else 0.0
@@ -102,6 +104,7 @@ def test_dp_solver_build_in_edges():
     best = ans[0]
     assert best.path == [(0, 0), (1, 0), (2, 0)]
 
+
 def test_dp_solver_mem_bound():
     solver = dp_solver.DPSolver(True, 10, 1)
     solver.add_interval(0, 2)
@@ -119,3 +122,26 @@ def test_dp_solver_mem_bound():
 
     ans = solver.get_results(0, 2)
     assert len(ans) == 0
+
+
+def test_dp_solver_output():
+    solver = dp_solver.DPSolver(True, 1024, 1)
+    solver.add_interval(0, 2)
+
+    solver.add_node(0, 0, [0], [], 2, False, False, False)
+    solver.add_partition(0, 0, 10, 16, 0, 0, 0, 0, 0, [[]])
+    solver.add_partition(0, 1, 5, 8, 0, 0, 0, 0, 1, [[]])
+
+    solver.add_node(1, 1, [0, 1], [], 2, False, False, False)
+    solver.add_partition(1, 0, 4, 6, 0, 0, 0, 0, 0, [[]])
+    solver.add_partition(1, 1, 2, 3, 0, 0, 0, 0, 1, [[]])
+
+    solver.add_node(2, 2, [2], [0], 1, False, False, False)
+    solver.add_partition(2, 0, 0, 0, 0, 0, 0, 0, 0, [[0, 0]])
+
+    solver.solve()
+    ans = solver.get_results(0, 2)
+    best = ans[0]
+    assert best.all_time == 7
+    assert best.path == [(0, 1), (1, 1), (2, 0)]
+    assert best.memory == 11

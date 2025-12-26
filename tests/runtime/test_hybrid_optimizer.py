@@ -103,7 +103,7 @@ def trainer_worker(save_dir, use_zero):
         '--checkpoint.resume_from.with_merged', str(True),
         '--gen_savedir', str(gen_savedir),
         '--checkpoint.save_dir', str(ckpt0_savedir),
-        '--compute_config.use_zero', str(not use_zero),
+        '--compute_config.use_zero', str(1 - use_zero),
     ]
     trainer = Trainer(trainer_config)
     trainer.run()
@@ -133,7 +133,7 @@ def trainer_worker(save_dir, use_zero):
         '--checkpoint.resume_from.with_merged', str(False),
         '--gen_savedir', str(gen_savedir),
         '--checkpoint.save_dir', str(ckpt1_savedir),
-        '--compute_config.use_zero', str(not use_zero),
+        '--compute_config.use_zero', str(1 - use_zero),
     ])
     trainer.run()
 
@@ -148,6 +148,6 @@ def trainer_worker(save_dir, use_zero):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.device_count() < 2, reason='lack of gpu devices')
-@pytest.mark.parametrize('use_zero', [True, False])
+@pytest.mark.parametrize('use_zero', [0, 1])
 def test_hybrid_optimizer(tmp_path, use_zero):
     launch_torchrun(2, trainer_worker, tmp_path, use_zero)

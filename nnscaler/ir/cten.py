@@ -20,7 +20,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from functools import lru_cache
-from typing import ClassVar, Iterable, List, Set, Tuple, Union, Optional, Any, Dict, Callable
+from typing import ClassVar, Iterable, List, Set, Tuple, Type, Union, Optional, Any, Dict, Callable
 from collections import OrderedDict
 import copy
 import torch
@@ -443,6 +443,31 @@ class IRCell:
         if not self._module_stack:
             return ''
         return list(self._module_stack.keys())[-1]
+
+    def get_module_fqn(
+            self, module_class: Type[torch.nn.Module],
+            *,
+            include_subclass: bool = False
+    ) -> str:
+        """
+        Get the first fully qualified module name for the given module class
+        in the module stack. If not found, return ''.
+
+        Args:
+            module_class (Type[torch.nn.Module]): the module class to find
+            include_subclass (bool): whether to include subclass of the module_class
+
+        Returns:
+            str: the fully qualified module name
+        """
+        if not self._module_stack:
+            return ''
+        for fqn, mod_cls in self._module_stack.items():
+            if mod_cls == module_class or (
+                include_subclass and issubclass(mod_cls, module_class)
+            ):
+                return fqn
+        return ''
 
     @property
     def call_expr(self) -> Optional[str]:
@@ -1223,7 +1248,7 @@ class IRTensor(IRObject):
 
     def is_param(self) -> bool:
         """!
-        Check if the tensor is parameter
+        Check if the tensor is parameter (with requires_grad = True).
 
         @return is_param boolean: True if is parameter.
         """

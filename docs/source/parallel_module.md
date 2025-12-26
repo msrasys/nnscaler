@@ -7,7 +7,7 @@ Currently, we support three kinds of parallelism: data parallelism, tensor paral
 Data parallelism and tensor parallelism can be supported for any module, but pipeline parallelism is only supported for end2end modules for scheduling reason.
 
 An end2end module is a module which satisfies:
-- the first argument of `module.forward` is the data sample, and every other argument should have default value, and use its default value in `module.forward` function.
+- the first argument of `module.forward` is the data sample, and other arguments should have default value, and should never be used in `module.forward` function.
 - the first return value of `module.forward` is the loss (scalar tensor)
 
 The above restrictions are necessary for the pipeline parallelism to work. Of course, you can still use the parallel module without pipeline parallelism for end2end modules.

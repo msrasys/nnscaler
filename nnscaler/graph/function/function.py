@@ -3516,7 +3516,7 @@ def DictValues(o: Union[Dict, IRObject], signature=None):
 
 
 def DictItems(o: Union[Dict, IRObject], signature=None):
-    signature = 'nnscaler.runtime.function.dict_values'
+    signature = 'nnscaler.runtime.function.dict_items'
 
     if not isinstance(o, dict) and not (isinstance(o, IRObject) and isinstance(o.value, dict)):
          raise ValueError(f'the input should be a dict or an IRObject with dict value, but get {o}')
