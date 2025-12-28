@@ -240,6 +240,9 @@ class HybridOptimizer(torch.optim.Optimizer, TrainHookHost):
         for child_state_dict, opt in zip(child_state_dicts, self.optimizers):
             opt.load_state_dict(child_state_dict)
 
+        # after loading from state dict, the param_groups of optimizers are reassigned
+        # (instead of updated inplace), so we need to gather them again (as we have done
+        # in the constructor).
         self.param_groups = []
         for optimizer in self.optimizers:
             self.param_groups.extend(optimizer.param_groups)

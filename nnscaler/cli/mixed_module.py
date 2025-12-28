@@ -42,7 +42,8 @@ class ModuleParallelizeConfigAdapter(PrecisionMixin, PolicyMixin):
     def __init__(
             self, trainer_args: TrainerArgs,
             parallel_module: Optional[ModuleParallelizeConfig] = None,
-            tracing_weights: Optional[dict[str, Any]] = None
+            tracing_weights: Optional[dict[str, Any]] = None,
+            checkpointer: Optional[Checkpointer] = None,
     ):
         """
         Args:
@@ -53,6 +54,7 @@ class ModuleParallelizeConfigAdapter(PrecisionMixin, PolicyMixin):
         self.trainer_args = trainer_args
         self.parallel_module = parallel_module
         self.tracing_weights = tracing_weights
+        self.checkpointer = checkpointer or Checkpointer()
 
         # we don't want to load the tracing weights every time
         # It should be loaded only once outside, and passed to the adapter
@@ -133,10 +135,10 @@ class ModuleParallelizeConfigAdapter(PrecisionMixin, PolicyMixin):
             # try to reuse the weights from the tracing weights
             tracing_weights = self.tracing_weights
             if self.tracing_from_weights and tracing_weights is None:
-                tracing_weights = Checkpointer.load(self.tracing_from_weights)
+                tracing_weights = self.checkpointer.load(self.tracing_from_weights)
         else:
             if self.tracing_from_weights:
-                tracing_weights = Checkpointer.load(self.tracing_from_weights)
+                tracing_weights = self.checkpointer.load(self.tracing_from_weights)
             elif self.parallel_module.tracing_from_weights_prefix:
                 leading_key = self.parallel_module.tracing_from_weights_prefix + '.'
                 tracing_weights = {}
@@ -289,15 +291,23 @@ def mixin_module(model: torch.nn.Module, optimizer: torch.optim.Optimizer):
     return model
 
 
-def parallelize_model(trainer_args: TrainerArgs, dummy_input: dict[str, Any], load_module: bool, build_buckets: bool):
+def parallelize_model(
+    trainer_args: TrainerArgs,
+    dummy_input: dict[str, Any],
+    load_module: bool,
+    build_buckets: bool,
+    checkpointer: Checkpointer
+):
     tracing_weights = None
+    checkpointer = checkpointer or Checkpointer()
     if trainer_args.tracing_from_weights:
-        tracing_weights = Checkpointer.load(trainer_args.tracing_from_weights)
+        tracing_weights = checkpointer.load(trainer_args.tracing_from_weights)
 
     def _new_adapter(parallel_module=None):
         return ModuleParallelizeConfigAdapter(
             trainer_args, parallel_module,
-            tracing_weights=tracing_weights
+            tracing_weights=tracing_weights,
+            checkpointer=checkpointer,
         )
 
     if not trainer_args.model.parallel_modules:

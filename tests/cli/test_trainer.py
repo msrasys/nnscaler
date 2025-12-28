@@ -260,9 +260,9 @@ def trainer_resume_worker(save_dir, save_type, bf16, parallel_type=0):
     # create merged checkpoint
     ckpt1_savedir = save_dir / 'ckpt1'
     ckpt1_savedir.mkdir(parents=True, exist_ok=True)
-    merged_file_name = f'merged{Checkpointer.SUFFIX_MAP[format]}'
+    merged_file_name = f'merged{Checkpointer.NAME_MAP[format]}'
     if trainer.rank == 0:
-        Trainer.merge_checkpoint(Checkpointer.list_checkpoints(ckpt0_savedir / 'last'), ckpt1_savedir / merged_file_name)
+        Trainer.merge_checkpoint(trainer.checkpointer.list_checkpoints(ckpt0_savedir / 'last'), ckpt1_savedir / merged_file_name)
 
     torch.distributed.barrier()
     # continue with the last two epochs (resume for sharded/deduped checkpoint)
@@ -331,9 +331,9 @@ def trainer_resume_worker(save_dir, save_type, bf16, parallel_type=0):
     if torch.distributed.get_rank() == 0:
         assert {f.parent.name for f in ckpt_files} == {f.parent.name for f in ckpt0_files1}
         for i in range(4):
-            x = Checkpointer.load_for_rank(ckpt_savedir / 'last', i)
-            y = Checkpointer.load_for_rank(ckpt0_savedir / 'last', i)
-            z = Checkpointer.load_for_rank(ckpt1_savedir / 'last', i)
+            x = trainer.checkpointer.load_for_rank(ckpt_savedir / 'last', i)
+            y = trainer.checkpointer.load_for_rank(ckpt0_savedir / 'last', i)
+            z = trainer.checkpointer.load_for_rank(ckpt1_savedir / 'last', i)
             assert_equal(x['model'], y['model'])
             assert_equal(x['optimizer'], y['optimizer'])
             assert_equal(x['lr_scheduler'], y['lr_scheduler'])
@@ -341,7 +341,7 @@ def trainer_resume_worker(save_dir, save_type, bf16, parallel_type=0):
             assert_equal(x['optimizer'], z['optimizer'])
             assert_equal(x['lr_scheduler'], z['lr_scheduler'])
 
-        suffix = Checkpointer.SUFFIX_MAP[format]
+        suffix = Checkpointer.NAME_MAP[format]
         if save_type == 'deduped':
             assert (ckpt_savedir / f'last/0{suffix}').stat().st_size > (ckpt_savedir / f'last/2{suffix}').stat().st_size
             assert (ckpt_savedir / f'last/1{suffix}').stat().st_size > (ckpt_savedir / f'last/3{suffix}').stat().st_size
@@ -1415,18 +1415,24 @@ def trainer_checkpointer_worker(save_dir):
 
     load_triggered = False
 
-    def save(obj: Any, f: Path) -> None:
-        obj['test'] = True
-        return torch.save(obj, f)
+    class TestFormat:
+        name: str = 'test_format'
+        suffix: str = '.testpt'
 
-    def load(f: str | Path, *, device='cpu') -> Any:
-        x = torch.load(f, map_location=device, weights_only=False)
-        assert x['test'] is True
-        nonlocal load_triggered
-        load_triggered = True
-        return x
+        @classmethod
+        def save(cls, obj: Any, f: Path) -> None:
+            obj['test'] = True
+            return torch.save(obj, f)
 
-    register_format('test_format', '.testpt', save, load)
+        @classmethod
+        def load(cls, f: str | Path, *, device='cpu') -> Any:
+            x = torch.load(f, map_location=device, weights_only=False)
+            assert x['test'] is True
+            nonlocal load_triggered
+            load_triggered = True
+            return x
+
+    register_format(TestFormat)
 
     # train 1 epcho in one time
     trainer = Trainer([

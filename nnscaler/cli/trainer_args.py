@@ -3,7 +3,7 @@
 
 from dataclasses import asdict, dataclass, field, replace
 import importlib
-from typing import Any, Callable, Dict, List, Literal, Optional, TYPE_CHECKING, Union, TypeVar
+from typing import Any, Callable, Dict, List, Literal, Optional, TYPE_CHECKING, Type, Union, TypeVar
 from typing_extensions import get_args
 from pathlib import Path
 import logging
@@ -420,6 +420,23 @@ class ResumeOptions:
 
 
 @dataclass
+class SerializerOptions:
+    # the serialization runner to be used
+    # It should be a name of registered SerializationRunners
+    name: str = ''
+
+    # the full qualified name of the function to create the serialization runner
+    # Currently we do not support this way
+    # to make sure all serialization runners are registered and can be used in other places
+    # (like nnscaler.cli.Trainer.merge_checkpoint)
+    # type: str = None
+
+    # arguments for the serialization runner
+    # Note You should be able to load for any arguments
+    args: Dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
 class CheckpointConfig:
     save_dir: str = './checkpoints'
     no_save: bool = False
@@ -427,7 +444,15 @@ class CheckpointConfig:
     # `"pt"`: PyTorch native format
     # `"safetensors"`: Safetensors format
     # You can also register new formats via `nnscaler.cli.serialization.register_format`
+    # or specify a custom format here by providing a CheckpointFormat subclass
     format: str = 'pt'
+
+    # the serialization runner to be used
+    # It should be a name of registered SerializationRunners
+    # If None, the default serializer will be used
+    serializer: Optional[SerializerOptions] = field(default=None, metadata={
+        'normalize': lambda x: {'name': x} if isinstance(x, str) else x
+    })
 
     # `"sharded"`: Each rank saves its shard of weights and optimizer states to a file. The checkpoint is
     #   a folder with as many files as the world size.
@@ -475,6 +500,9 @@ class CheckpointConfig:
         if isinstance(self.resume_from, str):
             self.resume_from = ResumeOptions(checkpoint=self.resume_from)
 
+        if isinstance(self.serializer, str):
+            self.serializer = SerializerOptions(name=self.serializer)
+
         if self.resume_from and self.resume_from.checkpoint:
             if self.resume_from.checkpoint in ['last', 'best']:
                 if not self.save_dir:
@@ -491,8 +519,11 @@ class CheckpointConfig:
         if not self.save_dir:
             raise ValueError("save_dir is required")
 
-        if self.format not in Checkpointer.SUFFIX_MAP:
+        if self.format not in Checkpointer.NAME_MAP:
             raise ValueError(f"Invalid format {self.format}")
+
+        if self.serializer and self.serializer.name not in Checkpointer.REGISTERED_RUNNERS:
+            raise ValueError(f"Invalid Serialization runner {self.serializer.name}")
 
         if self.every_n_epochs is not None and self.every_n_train_steps is not None:
             raise ValueError("Cannot specify both every_n_epochs and every_n_train_steps")
@@ -983,4 +1014,10 @@ class TrainerArgs(PrecisionMixin, PolicyMixin):
             raise ValueError(f"Invalid hook_config {hook_config}")
 
     def create_checkpointer(self) -> Checkpointer:
+        if self.checkpoint.serializer:
+            return Checkpointer(
+                self.checkpoint.format,
+                self.checkpoint.serializer.name,
+                self.checkpoint.serializer.args
+            )
         return Checkpointer(self.checkpoint.format)
