@@ -718,6 +718,9 @@ class ModelGraph:
             modules = [self.scope_tree_root]
         else:
             modules = fetch_module(self.scope_tree_root, [])
+            if len(recompute_modules) == 1 and self.autodist_config.recompute_ratio < 1.0:
+                boundary = max(1, int(len(modules) * self.autodist_config.recompute_ratio))
+                modules = modules[:boundary]
 
         train_mem = 0
         for module in modules:
