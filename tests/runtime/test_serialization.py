@@ -2,6 +2,7 @@ import torch
 import pytest
 
 from nnscaler.runtime.serialization import load, save, convert
+from nnscaler.cli.serialization import convert_format
 
 from tests.parallel_module.common import assert_equal
 
@@ -20,8 +21,14 @@ def test_normal(tmp_path):
     loaded = load(tmp_path / "model.safetensors", lazy=False)
     assert_equal(tensors, loaded)
     convert(tmp_path / "model.safetensors", tmp_path / "model.pt")
+    convert_format(
+        src=str(tmp_path / "model.safetensors"),
+        dst=str(tmp_path / "model2.ckpt"),
+    )
     loaded_pt = torch.load(tmp_path / "model.pt")
     assert_equal(tensors, loaded_pt)
+    loaded_pt2 = torch.load(tmp_path / "model2.ckpt")
+    assert_equal(tensors, loaded_pt2)
 
 
 def test_shared_params(tmp_path):

@@ -102,6 +102,8 @@ class Trainer:
             if not self.train_args.compile_mode:
                 self._train()
         finally:
+            if self.checkpointer:
+                self.checkpointer.flush()
             for stage in ['train', 'val', 'test']:
                 if self.dataloader[stage] is not None and (close_fn := getattr(self.dataloader[stage], 'close', None)):
                     close_fn()
@@ -139,6 +141,7 @@ class Trainer:
                 logging.getLogger().setLevel(logging.WARNING)
 
         self.train_args.init_env(self)
+        self.checkpointer = self.train_args.create_checkpointer()
 
         # make sure all ranks are synchronized after init_env
         if is_running_distributed():
@@ -155,7 +158,8 @@ class Trainer:
         pmodel = parallelize_model(
             self.train_args, self.dummy_input,
             load_module=not compile_only,
-            build_buckets=not self.train_args.should_delay_bucket_building()
+            build_buckets=not self.train_args.should_delay_bucket_building(),
+            checkpointer=self.checkpointer,
         )
         if compile_only:
             return
@@ -227,7 +231,6 @@ class Trainer:
         # Currently we never pass `last_epoch` to its constructor
         self.lr_scheduler = self.train_args.create_lr_scheduler(self.optimizer)
         self.loggers = self.train_args.create_loggers()
-        self.checkpointer = self.train_args.create_checkpointer()
 
         supported_hook_components = [
             self.model,
@@ -255,10 +258,15 @@ class Trainer:
         self.hook.after_setup(self)
 
     @classmethod
-    def _merge_checkpoint(cls, checkpoint_files: List[str], *, model_only: bool = False):
+    def _merge_checkpoint(cls, checkpoint_files: List[str],
+        *,
+        model_only: bool = False,
+        checkpointer: Optional[Checkpointer] = None,
+    ):
+        checkpointer = checkpointer or Checkpointer()
         state_dicts = []
         for f in checkpoint_files:
-            state_dict = Checkpointer.load(f)
+            state_dict = checkpointer.load(f)
             if model_only:
                 # we pop optimizer state to save cpu memory
                 state_dict.pop('optimizer', None)
@@ -377,9 +385,26 @@ class Trainer:
         return state_dict
 
     @classmethod
-    def merge_checkpoint(cls, checkpoint_files: List[str], output_file: str, *, model_only: bool = False):
-        merged_state_dict = cls._merge_checkpoint(checkpoint_files, model_only=model_only)
-        Checkpointer.save(merged_state_dict, output_file)
+    def merge_checkpoint(cls, checkpoint_files: List[str], output_file: str,
+        *,
+        model_only: bool = False,
+        checkpointer: Optional[Checkpointer] = None,
+        serializer: Optional[str] = None,
+        serializer_args: Optional[dict[str, Any]] = None,
+    ):
+        if checkpointer is not None:
+            if serializer is not None or serializer_args is not None:
+                raise ValueError("serializer and serializer_args should not be specified when checkpointer is given")
+        else:
+            checkpointer = Checkpointer(serializer=serializer, serializer_args=serializer_args)
+
+        merged_state_dict = cls._merge_checkpoint(
+            checkpoint_files,
+            model_only=model_only,
+            checkpointer=checkpointer,
+        )
+        checkpointer.save(merged_state_dict, output_file)
+        checkpointer.flush()
 
     def _log_finalize(self):
         for logger in self.loggers:
@@ -426,7 +451,7 @@ class Trainer:
                 torch.distributed.barrier()
                 if self.local_rank == 0:
                     logger.info(f"Merging checkpoint files from {resume_from}")
-                    state_dict = self._merge_checkpoint(list(rank_ckpt_files.values()))
+                    state_dict = self._merge_checkpoint(list(rank_ckpt_files.values()), checkpointer=self.checkpointer)
                 else:
                     state_dict = None
 
@@ -641,16 +666,12 @@ class Trainer:
                 save_dir / self.checkpointer.get_last_dir_name(),
                 self.rank
             )
-            last_file = save_dir / self.checkpointer.get_last_checkpoint_file_path(
-                rank=self.rank
+            self.checkpointer.copy_for_rank(
+                ckpt_file.parent,
+                save_dir / self.checkpointer.get_last_dir_name(),
+                self.rank,
+                checkpoint_config.symlink_best_and_last
             )
-            last_file.parent.mkdir(parents=True, exist_ok=True)
-            if checkpoint_config.symlink_best_and_last:
-                # symblink as relative path
-                last_file.symlink_to(Path('..') / ckpt_file.parent.name / ckpt_file.name)
-                # last_file.symlink_to(ckpt_file)
-            else:
-                shutil.copy(ckpt_file, last_file)
 
         # save best
         if checkpoint_config.save_best and loss <= self.train_status.best_loss:
@@ -662,16 +683,12 @@ class Trainer:
                 save_dir / self.checkpointer.get_best_dir_name(),
                 self.rank
             )
-            best_file = save_dir / self.checkpointer.get_best_checkpoint_file_path(
-                rank=self.rank,
+            self.checkpointer.copy_for_rank(
+                ckpt_file.parent,
+                save_dir / self.checkpointer.get_best_dir_name(),
+                self.rank,
+                checkpoint_config.symlink_best_and_last
             )
-            best_file.parent.mkdir(parents=True, exist_ok=True)
-            if checkpoint_config.symlink_best_and_last:
-                # symblink as relative path
-                best_file.symlink_to(Path('..') / ckpt_file.parent.name / ckpt_file.name)
-                # best_file.symlink_to(ckpt_file)
-            else:
-                shutil.copy(ckpt_file, best_file)
 
         torch.distributed.barrier()
         # remove old checkpoints

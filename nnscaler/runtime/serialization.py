@@ -215,8 +215,11 @@ def load(f, *, device="cpu", format="safetensors", lazy=False) -> LazyLoader | A
     if not lazy:
         with LazyLoader(f, device=device) as loader:
             data = loader.get_lazy_data()
-            assert isinstance(data, _LazyContainer)
-            return data.load_all()
+            if isinstance(data, _LazyContainer):
+                return data.load_all()
+            else:
+                # pure data without any tensors
+                return data
     return LazyLoader(f, device=device)
 
 

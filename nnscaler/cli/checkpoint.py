@@ -2,7 +2,14 @@
 #  Licensed under the MIT License.
 
 """
-Only for command line
+This script provides functionality to convert a merged checkpoint or directory containing per-rank checkpoints into sharded checkpoints
+suitable for distributed training with multiple GPUs.
+Run this script with:
+    python -m nnscaler.cli.checkpoint distribute <from> <to> -f <trainer args yml> <optional other trainer args>
+where <from> is the path to the merged checkpoint file or directory containing per-rank checkpoints,
+and <to> is the directory to save the sharded checkpoints.
+
+This script only for command line.
 """
 
 import logging
@@ -114,21 +121,24 @@ def _distribute_checkpoint(train_args: TrainerArgs, from_: str, to_: str):
     resume_from = Path(from_)
     save_to = Path(to_)
     save_to.mkdir(parents=True, exist_ok=True)
+    checkpointer = train_args.create_checkpointer()
 
     if resume_from.is_file():
-        state_dict = torch.load(resume_from, map_location='cpu', weights_only=False)
+        state_dict = checkpointer.load(resume_from, device='cpu')
         if convert_fn := train_args.checkpoint.resolved_convert_fn:
             state_dict = convert_fn(state_dict)
     else:
-        ckpt_files = list(resume_from.glob('*.ckpt'))
+        ckpt_files = checkpointer.list_checkpoints(resume_from)
         rank_ckpt_files = {int(f.stem): f for f in ckpt_files if f.stem.isdigit()}
         if set(rank_ckpt_files.keys()) != set(range(len(rank_ckpt_files))):
             raise ValueError(f"Checkpoint files in {resume_from} are not complete: {rank_ckpt_files.keys()}")
-        state_dict = Trainer._merge_checkpoint(list(rank_ckpt_files.values()))
+        state_dict = Trainer._merge_checkpoint(list(rank_ckpt_files.values()), checkpointer=checkpointer)
 
     for i in range(train_args.compute_config.runtime_ngpus):
         sharded_state_dict = _trim_merged_checkpoint(train_args, state_dict, i)
-        torch.save(sharded_state_dict, save_to / f"{i}.ckpt")
+        checkpointer.save_for_rank(sharded_state_dict, save_to, i)
+
+    checkpointer.flush()
 
 
 if __name__ == '__main__':
