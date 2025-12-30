@@ -310,10 +310,10 @@ class Checkpointer:
         for suffix in suffixes:
             f = Path(dir) / f"{rank}{suffix}"
             if f.is_symlink() or f.exists():
-                logger.warning(f"Removing checkpoint file: {f}")
+                logger.warning(f"IN REMOVE_FOR_RANK: Removing checkpoint file: {f}")
                 f.unlink()
             for extra_file in Path(dir).glob(f"{rank}{suffix}.*"):
-                logger.warning(f"Removing extra checkpoint file: {extra_file}")
+                logger.warning(f"IN REMOVE_FOR_RANK: Removing extra checkpoint file: {extra_file}")
                 extra_file.unlink()
 
     def copy_for_rank(self, src: str | Path, dst: str | Path, rank: int, symlink: bool = False) -> None:
@@ -349,13 +349,13 @@ class Checkpointer:
 
         if symlink:
             if dst_f.exists() or dst_f.is_symlink():
-                logger.warning(f"Removing existing checkpoint file: {dst_f}")
+                logger.warning(f"In COPY_FOR_RANK: Removing existing checkpoint file: {dst_f}")
                 dst_f.unlink()
             dst_f.symlink_to(Path('..') / src.name / src_f.name)
             for extra_file in src.glob(f"{rank}{self.suffix}.*"):
                 dst_extra_file = Path(dst) / extra_file.name
                 if dst_extra_file.exists() or dst_extra_file.is_symlink():
-                    logger.warning(f"Removing existing extra checkpoint file: {dst_extra_file}")
+                    logger.warning(f"In COPY_FOR_RANK: Removing existing extra checkpoint file: {dst_extra_file}")
                     dst_extra_file.unlink()
                 dst_extra_file.symlink_to(Path('..') / src.name / extra_file.name)
         else:

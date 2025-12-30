@@ -644,7 +644,6 @@ class Trainer:
         # save last
         if checkpoint_config.save_last:
             logger.info(f"Saving checkpoint as the last checkpoint.")
-
             # remove the old symlink or file
             self.checkpointer.remove_for_rank(
                 save_dir / self.checkpointer.get_last_dir_name(),
