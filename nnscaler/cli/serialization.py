@@ -312,6 +312,8 @@ class Checkpointer:
             if f.is_symlink() or f.exists():
                 logger.warning(f"IN REMOVE_FOR_RANK: Removing checkpoint file: {f}")
                 f.unlink()
+            else:
+                logger.warning(f"IN REMOVE_FOR_RANK: No checkpoint file found to remove: {f}")
             for extra_file in Path(dir).glob(f"{rank}{suffix}.*"):
                 logger.warning(f"IN REMOVE_FOR_RANK: Removing extra checkpoint file: {extra_file}")
                 extra_file.unlink()
