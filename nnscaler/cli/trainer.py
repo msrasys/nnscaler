@@ -119,19 +119,6 @@ class Trainer:
     def _fix_input(self, input):
         return fix_input(input, self.train_args.input_dtype)
 
-    def _load_dummy_input(self):
-        if dummy_sample_gen_fn := self.train_args.dummy_sample_gen_fn:
-            return dummy_sample_gen_fn(self.train_args)
-
-        with enforce_zero_num_worker(DataLoader):
-            dataset = self.train_args.create_dataset('train')
-            dataloader = self.train_args.create_dataloader('train', dataset)
-            assert dataloader.num_workers == 0, "The dataloader must have `num_workers=0`."
-            value = next(iter(dataloader))
-            if close_fn := getattr(dataloader, 'close', None):
-                close_fn()
-            return value
-
     def _setup(self):
         if is_running_distributed():
             nnscaler.init()
@@ -150,10 +137,7 @@ class Trainer:
         compile_only = self.train_args.compile_mode
 
         # load a dummy input from training dataset
-        self.dummy_input = self._load_dummy_input()
-        self.dummy_input = self._fix_input(self.dummy_input)
-        if self.train_args.dummy_sample_post_process_fn:
-            self.dummy_input = self.train_args.dummy_sample_post_process_fn(self.train_args, self.dummy_input)
+        self.dummy_input = self.train_args.dummy_input
 
         pmodel = parallelize_model(
             self.train_args, self.dummy_input,
