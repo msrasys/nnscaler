@@ -302,7 +302,8 @@ class Checkpointer:
         """
         self.flush()
 
-        for suffix in self.NAME_MAP.values():
+        suffixes = set(list(self.NAME_MAP.values()) + [self.suffix])
+        for suffix in suffixes:
             f = Path(dir) / f"{rank}{suffix}"
             if f.exists():
                 f.unlink()
