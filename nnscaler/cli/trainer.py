@@ -645,10 +645,10 @@ class Trainer:
         if checkpoint_config.save_last:
             logger.info(f"Saving checkpoint as the last checkpoint.")
             # remove the old symlink or file
-            self.checkpointer.remove_for_rank(
-                save_dir / self.checkpointer.get_last_dir_name(),
-                self.rank
-            )
+            # self.checkpointer.remove_for_rank(
+            #     save_dir / self.checkpointer.get_last_dir_name(),
+            #     self.rank
+            # )
             self.checkpointer.copy_for_rank(
                 ckpt_file.parent,
                 save_dir / self.checkpointer.get_last_dir_name(),
@@ -662,10 +662,10 @@ class Trainer:
             logger.info(f"Saving checkpoint as the best checkpoint.")
 
             # remove the old symlink or file
-            self.checkpointer.remove_for_rank(
-                save_dir / self.checkpointer.get_best_dir_name(),
-                self.rank
-            )
+            # self.checkpointer.remove_for_rank(
+            #     save_dir / self.checkpointer.get_best_dir_name(),
+            #     self.rank
+            # )
             self.checkpointer.copy_for_rank(
                 ckpt_file.parent,
                 save_dir / self.checkpointer.get_best_dir_name(),
