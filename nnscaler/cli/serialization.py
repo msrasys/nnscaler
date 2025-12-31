@@ -5,6 +5,7 @@ from typing import Any, Callable, Protocol, Type
 from pathlib import Path
 import shutil
 import logging
+import time
 
 import torch
 
@@ -309,14 +310,16 @@ class Checkpointer:
         suffixes = set(list(self.NAME_MAP.values()) + [self.suffix])
         for suffix in suffixes:
             f = Path(dir) / f"{rank}{suffix}"
-            if f.is_symlink() or f.exists():
-                logger.warning(f"IN REMOVE_FOR_RANK: Removing checkpoint file: {f}")
-                f.unlink()
-            else:
-                logger.warning(f"IN REMOVE_FOR_RANK: No checkpoint file found to remove: {f}")
+            self._delete_file_with_retry(f)
+            # if f.is_symlink() or f.exists():
+            #     logger.warning(f"IN REMOVE_FOR_RANK: Removing checkpoint file: {f}")
+            #     f.unlink()
+            # else:
+            #     logger.warning(f"IN REMOVE_FOR_RANK: No checkpoint file found to remove: {f}")
             for extra_file in Path(dir).glob(f"{rank}{suffix}.*"):
-                logger.warning(f"IN REMOVE_FOR_RANK: Removing extra checkpoint file: {extra_file}")
-                extra_file.unlink()
+                # logger.warning(f"IN REMOVE_FOR_RANK: Removing extra checkpoint file: {extra_file}")
+                # extra_file.unlink()
+                self._delete_file_with_retry(extra_file)
 
     def copy_for_rank(self, src: str | Path, dst: str | Path, rank: int, symlink: bool = False) -> None:
         """
@@ -350,21 +353,35 @@ class Checkpointer:
                 raise ValueError("Cannot create symlink when source and destination are not in the same directory.")
 
         if symlink:
-            if dst_f.exists() or dst_f.is_symlink():
-                logger.warning(f"In COPY_FOR_RANK: Still existing: checkpoint file: {dst_f}")
-            # dst_f.symlink_to(Path('..') / src.name / src_f.name)
-            self._replace_symlink(Path('..') / src.name / src_f.name, dst_f)
+            # if dst_f.exists() or dst_f.is_symlink():
+            #     logger.warning(f"In COPY_FOR_RANK: Still existing: checkpoint file: {dst_f}")
+            self._delete_file_with_retry(dst_f)
+            dst_f.symlink_to(Path('..') / src.name / src_f.name)
+            # self._replace_symlink(Path('..') / src.name / src_f.name, dst_f)
             for extra_file in src.glob(f"{rank}{self.suffix}.*"):
                 dst_extra_file = Path(dst) / extra_file.name
-                if dst_extra_file.exists() or dst_extra_file.is_symlink():
-                    logger.warning(f"In COPY_FOR_RANK: Still existing: extra checkpoint file: {dst_extra_file}")
-                # dst_extra_file.symlink_to(Path('..') / src.name / extra_file.name)
-                self._replace_symlink(Path('..') / src.name / extra_file.name, dst_extra_file)
+                # if dst_extra_file.exists() or dst_extra_file.is_symlink():
+                #     logger.warning(f"In COPY_FOR_RANK: Still existing: extra checkpoint file: {dst_extra_file}")
+                self._delete_file_with_retry(dst_extra_file)
+                dst_extra_file.symlink_to(Path('..') / src.name / extra_file.name)
+                # self._replace_symlink(Path('..') / src.name / extra_file.name, dst_extra_file)
         else:
             shutil.copy2(src_f, dst_f)
             for extra_file in src.glob(f"{rank}{self.suffix}.*"):
                 dst_extra_file = Path(dst) / extra_file.name
                 shutil.copy2(extra_file, dst_extra_file)
+
+    @classmethod
+    def _delete_file_with_retry(cls, f: str | Path) -> None:
+        f = Path(f)
+        f.unlink(missing_ok=True)
+
+        while f.is_symlink() or f.exists():
+            logger.warning(f"Deleting file {f} doesn't take effect. Retrying...")
+            f.unlink(missing_ok=True)
+            time.sleep(0.1)
+
+        logger.info(f"File {f} deleted.")
 
     @classmethod
     def _replace_symlink(cls, src: str | Path, dst: str | Path) -> None:
