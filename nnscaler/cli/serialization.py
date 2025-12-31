@@ -355,21 +355,37 @@ class Checkpointer:
         if symlink:
             # if dst_f.exists() or dst_f.is_symlink():
             #     logger.warning(f"In COPY_FOR_RANK: Still existing: checkpoint file: {dst_f}")
-            self._delete_file_with_retry(dst_f)
-            dst_f.symlink_to(Path('..') / src.name / src_f.name)
-            # self._replace_symlink(Path('..') / src.name / src_f.name, dst_f)
+            # self._delete_file_with_retry(dst_f)
+            # dst_f.symlink_to(Path('..') / src.name / src_f.name)
+            self._create_symlink_with_retry(Path('..') / src.name / src_f.name, dst_f)
             for extra_file in src.glob(f"{rank}{self.suffix}.*"):
                 dst_extra_file = Path(dst) / extra_file.name
                 # if dst_extra_file.exists() or dst_extra_file.is_symlink():
                 #     logger.warning(f"In COPY_FOR_RANK: Still existing: extra checkpoint file: {dst_extra_file}")
-                self._delete_file_with_retry(dst_extra_file)
-                dst_extra_file.symlink_to(Path('..') / src.name / extra_file.name)
-                # self._replace_symlink(Path('..') / src.name / extra_file.name, dst_extra_file)
+                # self._delete_file_with_retry(dst_extra_file)
+                # dst_extra_file.symlink_to(Path('..') / src.name / extra_file.name)
+                self._create_symlink_with_retry(Path('..') / src.name / extra_file.name, dst_extra_file)
         else:
             shutil.copy2(src_f, dst_f)
             for extra_file in src.glob(f"{rank}{self.suffix}.*"):
                 dst_extra_file = Path(dst) / extra_file.name
                 shutil.copy2(extra_file, dst_extra_file)
+
+    @classmethod
+    def _create_symlink_with_retry(cls, src: str | Path, dst: str | Path) -> None:
+        dst = Path(dst)
+        dst.unlink(missing_ok=True)
+
+        while True:
+            try:
+                dst.symlink_to(Path(src))
+                break
+            except FileExistsError:
+                logger.warning(f"Creating symlink {dst} failed. Retrying...")
+                dst.unlink(missing_ok=True)
+                time.sleep(0.1)
+
+        logger.info(f"Symlink {dst} created.")
 
     @classmethod
     def _delete_file_with_retry(cls, f: str | Path) -> None:
