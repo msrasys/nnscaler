@@ -1,6 +1,7 @@
 vars:
   dim: 16
   drop_last: true
+
 compute_config:
   plan_ngpus: 4
   runtime_ngpus: 100

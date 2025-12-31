@@ -18,18 +18,19 @@ If an IRTensor is the output of Cell, then Cell.device == IRTensor.device
 
 from __future__ import annotations
 
+from dataclasses import dataclass, field
 from functools import lru_cache
-from typing import ClassVar, List, Tuple, Union, Optional, Any, Dict, Callable
+from typing import ClassVar, Iterable, List, Set, Tuple, Type, Union, Optional, Any, Dict, Callable
 from collections import OrderedDict
 import copy
 import torch
 
 from nnscaler.ir.unique import IDGenerator
 from nnscaler.ir.dtype import DTypeInfo
-from nnscaler.utils import _DICT_ITEMS_TYPE, _DICT_VALUES_TYPE
+from nnscaler.utils import _DICT_ITEMS_TYPE, _DICT_VALUES_TYPE, load_type, get_dynamic
 
 
-NestedVarOrStatic = Any
+NestedVarOrStatic = Union[Any, 'IRObject', List['IRObject'], 'IRTensor']
 
 
 class IRCell:
@@ -77,8 +78,29 @@ class IRCell:
         self._comment: Optional[str] = None
         # the module stack that preserves the hierarchy information
         self._module_stack: Optional[OrderedDict[str, Any]] = None
+        # the original call expression
+        # Note:
+        # 1. some cells may not have call expression if the cell is not from function call (e.g., __getitem__)
+        # 2. call_expr can be inaccurate when function call happens
+        # inside pytorch official module (like in torch.nn namespace) forward,
+        # (e.g., F.linear inside nn.Linear), in this case, call_expr will be module call expression.
+        self._call_expr: Optional[str] = None
         # the operation context information
         self._op_context: Optional[Dict[str, Any]] = None
+
+        # function to be called before the op is executed
+        # which will be inserted in the runtime code before the op call.
+        # op's inputs will be passed to the hook.
+        # The signature will be like
+        # def pre_hook(module: ParallelModule, meta: Any, inputs: Tuple[Any, ...], kwargs: Dict[str, Any]) -> None:
+        self._pre_hook: Optional[Callable[..., None]] = None
+        # function to be called after the op is executed
+        # which will be inserted in the runtime code after the op call.
+        # op's inputs and outputs will be passed to the hook.
+        # the signature will be like
+        # def post_hook(module: ParallelModule, meta: Any, inputs: Tuple[Any, ...], kwargs: Dict[str, Any], output: Any) -> None:
+        self._post_hook: Optional[Callable[..., None]] = None
+        self._hook_meta: Any = None
 
     @property
     def cid(self) -> int:
@@ -377,6 +399,22 @@ class IRCell:
 
     @property
     def module_stack(self) -> Optional[OrderedDict[str, Any]]:
+        """
+        Get the module stack, which preserves the hierarchy information
+        of modules this cell belongs to.
+        For example, if this cell is from model.submodule.layers.0.block0.conv2d,
+        then the module stack will be:
+            OrderedDict([
+                ('model.submodule', <submodule class>),
+                ('model.submodule.layers.0.block0', <block0 class>),
+                ('model.submodule.layers.0.block0.conv2d', <conv2d class>),
+            ])
+
+        Please note
+        1. Root module (e.g., model) is not included in the stack.
+        2. Only modules that have `.forward` function are included in the stack,
+        so in above example, `torch.nn.ModuleList` is not included.
+        """
         return self._module_stack
 
     @module_stack.setter
@@ -385,6 +423,97 @@ class IRCell:
         Set the module stack
         """
         self._module_stack = stack
+
+    @property
+    def module_class_chain(self) -> list[type[torch.nn.Module]]:
+        """
+        Get the module chains the IRCell belongs to.
+        If module stack is None or empty, return [].
+        """
+        if not self._module_stack:
+            return []
+        return list(self._module_stack.values())
+
+    @property
+    def fqn(self) -> str:
+        """
+        Get the fully qualified module name the IRCell belongs to.
+        If module stack is None or empty, return ''.
+        """
+        if not self._module_stack:
+            return ''
+        return list(self._module_stack.keys())[-1]
+
+    def get_module_fqn(
+            self, module_class: Type[torch.nn.Module],
+            *,
+            include_subclass: bool = False
+    ) -> str:
+        """
+        Get the first fully qualified module name for the given module class
+        in the module stack. If not found, return ''.
+
+        Args:
+            module_class (Type[torch.nn.Module]): the module class to find
+            include_subclass (bool): whether to include subclass of the module_class
+
+        Returns:
+            str: the fully qualified module name
+        """
+        if not self._module_stack:
+            return ''
+        for fqn, mod_cls in self._module_stack.items():
+            if mod_cls == module_class or (
+                include_subclass and issubclass(mod_cls, module_class)
+            ):
+                return fqn
+        return ''
+
+    @property
+    def call_expr(self) -> Optional[str]:
+        return self._call_expr
+
+    @call_expr.setter
+    def call_expr(self, expr: Optional[str]):
+        self._call_expr = expr
+
+    @property
+    def fn(self) -> Optional[Callable]:
+        """
+        Get the function of this cell based on its signature.
+        Return None if the function cannot be loaded. (e.g. virtual ops like `self_getattr`)
+
+        Returns:
+            Callable: the function object
+        """
+        try:
+            return load_type(self.signature)
+        except Exception as e:
+            return None
+
+    @property
+    def pre_hook(self) -> Optional[Callable[..., None]]:
+        return self._pre_hook
+
+    @pre_hook.setter
+    def pre_hook(self, hook: Optional[Callable[..., None]]):
+        self._pre_hook = hook
+
+    @property
+    def post_hook(self) -> Optional[Callable[..., None]]:
+        return self._post_hook
+
+    @post_hook.setter
+    def post_hook(self, hook: Optional[Callable[..., None]]):
+        self._post_hook = hook
+
+    @property
+    def hook_meta(self) -> Any:
+        return self._hook_meta
+
+    @hook_meta.setter
+    def hook_meta(self, meta: Any):
+        self._hook_meta = meta
 
     @property
     def op_context(self) -> Optional[Dict[str, Any]]:
@@ -459,14 +588,127 @@ class IRCell:
         return val
 
 
+@dataclass
+class ValueTrack:
+    """
+    Track the value of an IRObject or a dimension of IRTensor.
+    Currently only implemented for dimension via IRDimops annotation.
+
+    Example:
+    `l (2 h) m -> l h (2 m)`:
+    Input Tensor Tracks (2/5 is external dependencies for illustration):
+        dim 0: ValueTrack(value_id=10, dependencies=[])  # l
+        dim 1: ValueTrack(value_id=20, dependencies=[])   # (2 h)
+        dim 2: ValueTrack(value_id=30, dependencies=[2, 5])   # m
+    Then we can infer the output Tensor Tracks:
+    Output Tensor Tracks:
+        dim 0: ValueTrack(value_id=10, dependencies=[])  # reuse input dim 0, since they are the same
+        dim 1: ValueTrack(value_id=40, dependencies=[20])   # it depends on input dim 1: (2 h)
+        dim 2: ValueTrack(value_id=50, dependencies=[30])   # it depends on input dim 2: m
+    """
+    value_id: int = field(default_factory=IDGenerator().gen_value_id)
+    # By default, we consider the value is constant
+    # unless it is set to not constant
+    # via mark_dynamic or it is from input or explicitly set in function.py
+    is_constant: bool = True
+    # None: unknown dependencies
+    # []: no dependencies
+    deps: Optional[list[int]] = None
+
+    def with_no_dep(self) -> 'ValueTrack':
+        """
+        Initialize this ValueTrack with no dependencies.
+        """
+        self.deps = []
+        return self
+
+    def add_dep(self, dep: Union[Any, 'ValueTrack', 'IRObject']) -> 'ValueTrack':
+        """
+        Initialize or add a dependency to the ValueTrack.
+        If dep is not IRObject or ValueTrack, do nothing.
+        """
+        if self.deps is None:
+            self.deps = []
+
+        if not isinstance(dep, (ValueTrack, IRObject)):
+            return self
+
+        if isinstance(dep, IRTensor):
+            raise TypeError("Cannot directly add IRTensor as dependency.")
+
+        dep: ValueTrack = dep.value_track if isinstance(dep, IRObject) else dep
+        dep_value_id = dep.value_id
+        if dep_value_id not in self.deps:
+            self.deps.append(dep_value_id)
+            self.is_constant = self.is_constant and dep.is_constant
+
+        return self
+
+    def merge(self, other: ValueTrack) -> 'ValueTrack':
+        """
+        Merge another ValueTrack into this one.
+        The merged ValueTrack will have dependencies from both ValueTracks.
+        """
+        if self.deps is None:
+            self.deps = other.deps
+        else:
+            self.deps.extend(other.deps or [])
+
+        if self.deps is not None:
+            self.deps = list(set(self.deps))
+
+        self.is_constant = self.is_constant and other.is_constant
+        return self
+
+    @classmethod
+    def new(cls, deps: Iterable[Union[Any, 'ValueTrack', 'IRObject']], is_constant: Optional[bool] = None) -> 'ValueTrack':
+        vt = cls()
+        if is_constant is not None:
+            vt.is_constant = is_constant
+        vt.deps = []
+        for dep in deps:
+            vt.add_dep(dep)
+        return vt
+
+    def mark_as_input(self) -> 'ValueTrack':
+        """
+        Mark this ValueTrack as graph input, which should be not constant and have no dependencies.
+        """
+        self.is_constant = False
+        self.deps = []
+        return self
+
+
+_missing_value = object()
+
 class IRObject:
     """
     IRObject serves as general data of IRGraph edge
+
+    There are two special IRObject for lazy evaluation:
+        1. IRObject.missing: a singleton object to represent missing object
+           It is used to tell parser that we don't know the real object yet.
+           The parser is supposed to create a new IRObject to replace it.
+           For example, all custom ops will have missing outputs.It relies on parser to set them.
+        2. IRObject(..., value=missing_value, ...): an object with unknown value
+           It is used to tell parser that we don't know the real value yet.
+           The parser is supposed to set the value.
+           We have this because we want ops to pass out `value_track` even when the value is unknown.
+           For example, `Item()` op in `function.py` will create such object.
     """
     # will be set after class definition
     missing: ClassVar['IRObject'] = None
+    missing_value: ClassVar[object] = _missing_value
 
-    def __init__(self, name: Optional[str] = None, tid: Optional[int] = None, value: Optional[None] = None, is_constant: bool = True):
+    def __init__(
+        self,
+        name: Optional[str] = None,
+        tid: Optional[int] = None,
+        value: Any = _missing_value,
+        is_constant: Optional[bool] = None,
+        *,
+        value_track: Optional[ValueTrack] = None,
+    ) -> None:
         """
         Args:
             name (str): object name
@@ -479,13 +721,19 @@ class IRObject:
                     2. val is model input, or is the result of a non-torch operation on another not constant IRObject
                 Please note is_constant flag is only used in parser,
                 so after parser, you can totally ignore this flag.
+                We keep this flag in IRObject for backward compatibility.
+                If both is_constant and value_track are provided,
+                `value_track.is_constant` will be overrided by this flag.
+            value_track (ValueTrack): the value track info of this object
         """
         self._id: int = tid if isinstance(tid, int) else IDGenerator().gen_tensor_id()
         self.name: str = name if name else 'obj'
         self._cell: Optional[IRCell] = None
         self._is_attr: bool = False
-        self._value: Optional[Any] = value
-        self._is_constant: bool = is_constant
+        self._value: Any = value
+        self._value_track: ValueTrack = value_track or ValueTrack()
+        if is_constant is not None:
+            self._value_track.is_constant = is_constant
 
     def __hash__(self) -> int:
         return self._id
@@ -538,13 +786,30 @@ class IRObject:
         """Get example value"""
         return self._value
 
+    @value.setter
+    def value(self, val: Any):
+        self._value = val
+
+    def is_value_missing(self) -> bool:
+        """Check if the value is missing"""
+        return self._value is IRObject.missing_value
+
+    @property
+    def value_track(self) -> ValueTrack:
+        """Get value track info"""
+        return self._value_track
+
+    @value_track.setter
+    def value_track(self, val: ValueTrack):
+        self._value_track = val
+
     @property
     def is_constant(self) -> bool:
-        return self._is_constant
+        return self._value_track.is_constant
 
     @is_constant.setter
     def is_constant(self, val: bool):
-        self._is_constant = val
+        self._value_track.is_constant = val
 
     def __eq__(self, obj) -> bool:
         if not isinstance(obj, IRObject):
@@ -555,7 +820,7 @@ class IRObject:
         """Copy this object but remove the cell information"""
         if self is IRObject.missing:  # missing object is singleton
             return IRObject.missing
-        return IRObject(self.name, self._id, self._value, self._is_constant)
+        return IRObject(self.name, self._id, self._value, self.is_constant, value_track=self._value_track)
 
     def as_attr(self):
         """
@@ -651,7 +916,10 @@ class IR:
                     new_ir_tensor._value = obj.value
                     return new_ir_tensor, True
                 else:
-                    return IRObject(name, value=obj.value, is_constant=is_constant), False
+                    return IRObject(
+                        name, value=obj.value,
+                        is_constant=is_constant, value_track=obj.value_track
+                    ), False
 
             if isinstance(obj, tensor_types):
                 if requires_grad is None:
@@ -667,6 +935,10 @@ class IR:
                     dtype=obj.dtype,
                     requires_grad=rg,
                 )
+
+                for dyn_idx in get_dynamic(obj):
+                    tensor.dim_tracks[dyn_idx].is_constant = False
+
                 if tosub:
                     tensor = tensor.tosub()
                 tensor._value = obj  # is required in SemanticModel.forward
@@ -907,11 +1179,12 @@ class IRTensor(IRObject):
     You can get the original shape with `origin_shape` property.
     """
     def __init__(self, shape=None, name='tensor', dtype=None, tid=None, *,
-        is_attr=False, is_grad=False, requires_grad=False, persistent=False
+        is_attr=False, is_grad=False, requires_grad=False, persistent=False,
     ):
         super().__init__(name, tid, is_constant=False)
         self._is_scalar_tensor: bool = True
-        self._shape: Tuple[int] = ()
+        self._shape: Tuple[int, ...] = ()
+        self._dim_tracks: Tuple[ValueTrack, ...] = ()
         self._dtype: Optional[torch.dtype] = None
         # tensor gradient
         self._is_grad: bool = False
@@ -946,7 +1219,9 @@ class IRTensor(IRObject):
         if shape is not None:
             self._is_scalar_tensor = not shape
             # will always convert scalar tensor to 1-d tensor
-            self._shape: Tuple[int] = (1,) if not shape else tuple(shape)
+            self._shape: Tuple[int, ...] = (1,) if not shape else tuple(shape)
+            # reset dim tracks
+            self._dim_tracks = tuple(ValueTrack() for _ in self._shape)
         if name is not None or self.name is None:
             self.name = name
         if dtype is not None:
@@ -973,7 +1248,7 @@ class IRTensor(IRObject):
 
     def is_param(self) -> bool:
         """!
-        Check if the tensor is parameter
+        Check if the tensor is parameter (with requires_grad = True).
 
         @return is_param boolean: True if is parameter.
         """
@@ -1039,11 +1314,54 @@ class IRTensor(IRObject):
         return self.shape if not self.is_scalar_tensor() else ()
 
     @property
-    def shape(self) -> Tuple[int]:
+    def shape(self) -> Tuple[int, ...]:
         # NOTE: here return a tuple but not a real torch.Size obj may have risk, here is an example:
         # (torch.Size + tuple -> torch.Size) will change to (tuple + tuple -> tuple), is ok.
         # (torch.Size + list -> torch.Size) will change to (tuple + list -> error), is wrong.
         return self._shape
+
+    @property
+    def dim_tracks(self) -> Tuple[ValueTrack, ...]:
+        """
+        Get the track of each dimension
+        """
+        return self._dim_tracks
+
+    @dim_tracks.setter
+    def dim_tracks(self, val: Tuple[Optional[ValueTrack], ...]):
+        """
+        Set the unique id of each dimension
+        """
+        if not isinstance(val, (list, tuple)):
+            raise ValueError("dim_tracks must be a list or tuple")
+        if len(val) != len(self._shape):
+            raise ValueError("dim_tracks length must be equal to shape length")
+        # None means starting a new dim track
+        self._dim_tracks = tuple(v if v is not None else ValueTrack() for v in val)
+
+    def set_dim_track(self, dim: int, track: ValueTrack):
+        """
+        Set the track of a specific dimension
+        """
+        if dim < 0 or dim >= len(self._shape):
+            raise IndexError("dim out of range")
+        dim_tracks = list(self._dim_tracks)
+        dim_tracks[dim] = track
+        self._dim_tracks = tuple(dim_tracks)
+
+    def dim_constant(self, dim: int) -> bool:
+        """
+        Check if a dim is constant
+        """
+        if dim < 0 or dim >= len(self._shape):
+            raise IndexError("dim out of range")
+        return self._dim_tracks[dim].is_constant
+
+    def dims_constant(self) -> bool:
+        """
+        Check if all dims are constant
+        """
+        return all(track.is_constant for track in self._dim_tracks)
 
     def nelement(self) -> int:
         """

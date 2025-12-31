@@ -7,6 +7,7 @@ from functools import reduce
 from operator import add
 from nnscaler.graph.function.dimops import IRDimops, OpAnno
 import nnscaler.graph.function.function as F
+from nnscaler.graph.parser.value_tracker import ValueTracker
 from nnscaler.ir.cten import IR, IRObject, IRTensor
 
 import pytest
@@ -45,6 +46,21 @@ def test_Full():
 
     op = F.Full([], 1.)
     assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == ' -> 1'
+
+
+def test_Randn():
+    op = F.Randn(IRObject(value=[2, 3, 4]))
+    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == ' -> 2 3 4'
+
+    for dim_track in op.output(0).dim_tracks:
+        assert dim_track.deps == [op.kwargs['size'].value_track.value_id]
+
+    op = F.Randn(2, IRObject(value=3), IRObject(value=4))
+    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == ' -> 2 3 4'
+
+    assert op.output(0).dim_tracks[0].deps == []
+    assert op.output(0).dim_tracks[1].deps == [op.kwargs['size'][1].value_track.value_id]
+    assert op.output(0).dim_tracks[2].deps == [op.kwargs['size'][2].value_track.value_id]
 
 
 def test_Expand():
@@ -1147,3 +1163,43 @@ def test_dict_keys_values_items():
     # key will never be wrapped with IRObject
     # IRFullTensor will be reconstructed, so their ids are different
     assert all(x[0] == y[0] and x[1].shape == y[1].shape and x[1] != y[1] for x, y in zip(r.output(0), d.items()))
+
+def test_Stack():
+    op = F.Stack([IRTensor([2, 3]), IRTensor([2, 3]), IRTensor([2, 3])], dim=0)
+    expected_annotation = 'a b, a b, a b -> 3 a b'
+    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == expected_annotation, "Annotation mismatch for Stack."
+    op = F.Stack([IRTensor([2, 3]), IRTensor([2, 3]), IRTensor([2, 3])], dim=1)
+    expected_annotation = 'a b, a b, a b -> a 3 b'
+    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == expected_annotation, "Annotation mismatch for Stack."
+    op = F.Stack([IRTensor([2, 3]), IRTensor([2, 3]), IRTensor([2, 3])], dim=2)
+    expected_annotation = 'a b, a b, a b -> a b 3'
+    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == expected_annotation, "Annotation mismatch for Stack."
+
+    op = F.Stack([IRTensor([]), IRTensor([]), IRTensor([])], dim=0)
+    expected_annotation = '1, 1, 1 -> 3'
+    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == expected_annotation, "Annotation mismatch for Stack."
+
+
+def test_Dot():
+    op = F.Dot(IRTensor([4]), IRTensor([4]))
+    expected_annotation = 'k+, k+ -> 1'
+    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == expected_annotation, "Annotation mismatch for Dot."
+
+
+def test_chunk():
+    op = F.Chunk(IRTensor([8, 10]), chunks=4, dim=0)
+    expected_annotation = '8 b -> 2 b, 2 b, 2 b, 2 b'
+    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == expected_annotation
+    value_tracker = ValueTracker()
+    value_tracker.track_nodes([op])
+    value_tracker.complete_tracking([op])
+    input_dim_tracks = op.input(0).dim_tracks
+    output_dim_tracks = [out.dim_tracks for out in op.outputs()]
+    # all dim 1 tracks should be the same
+    assert output_dim_tracks[0][1] is input_dim_tracks[1]
+    # output dim 0 tracks should depend on input dim 0 track
+    assert output_dim_tracks[0][0].deps == [input_dim_tracks[0].value_id]
+    for output_dim_track in output_dim_tracks[1:]:
+        assert output_dim_track[0] is output_dim_tracks[0][0]
+        assert output_dim_track[1] is output_dim_tracks[0][1]
+    assert True

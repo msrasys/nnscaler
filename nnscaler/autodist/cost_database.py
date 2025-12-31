@@ -119,27 +119,37 @@ def _load_comm_data(profile_dir: Path, plan_ngpus: int) -> Dict[str, Dict[str, L
     load intra_2.json, intra_4.json, and intra_8.json from the profile directory. If any of the files is not
     found, we will use the default data as well.
     '''
-    def loader(path: Path):
+    def loader(path: Path, strict: bool):
         if not os.path.exists(path):
             return False, None
         info = {}
         dev = 2
+        prev_info = None
         while dev <= plan_ngpus:
             fname = f'intra_{dev}.json'
             if not (path / fname).exists():
-                return False, None
-            with open(path / fname, 'r') as f:
-                info[fname] = json.load(f)
+                if strict or prev_info is None:
+                    return False, None
+                else:
+                    content = prev_info
+                    _logger.warning(f'{dev} devices communication profile data not found, using previous data')
+            else:
+                with open(path / fname, 'r') as f:
+                    content = json.load(f)
+            prev_info = content
+            info[fname] = content
             dev *= 2
         return True, info
 
     comm_path = profile_dir / 'comm'
-    success, comm_info = loader(comm_path)
+    success, comm_info = loader(comm_path, strict=True)
     if not success:
+        # When communication profile data is not found, use the default data. If the input `plan_ngpus` is greater
+        # than the devices in the profile data, the data with largest device count (16 for mi200) will be used. This
+        # is helpful when user wants to generate a distributed plan spanning over multiple nodes.
         _logger.warning(f'Communication profile data not found, using default data at {_DEFAULT_COMM_DATA_PATH}')
-        success, comm_info = loader(Path(_DEFAULT_COMM_DATA_PATH))
-    if not success:
-        raise RuntimeError(f'Communication profile data is not compatible with plan_ngpus {plan_ngpus}')
+        success, comm_info = loader(Path(_DEFAULT_COMM_DATA_PATH), strict=False)
+        assert success, f'Failed to load default communication profile data from {_DEFAULT_COMM_DATA_PATH}, please check nnscaler\'s installation'
     return comm_info
 
 
@@ -337,10 +347,14 @@ class CostDatabase:
         from .op_partition import OpPartition
         from .cube_operator import CubeOperator
         if isinstance(obj, OpPartition):
-            masks = self.gen_masks(obj.operator)
+            query_obj = obj.operator
         else:
             assert isinstance(obj, CubeOperator)
-            masks = self.gen_masks(obj)
+            query_obj = obj
+        try:
+            masks = self.gen_masks(query_obj)
+        except Exception as e:
+            raise RuntimeError(f"Failed to generate masks for {query_obj} with {self.query_profiled_metrics(query_obj)}: {e}")
         if memory_type == 'full_weight' and isinstance(obj, OpPartition):
             profiled_metrics = self.query_profiled_metrics(obj.operator)
         else:

@@ -107,6 +107,19 @@ class CubeLinear(nn.Module):
         return x
 
 
+class FFN(nn.Module):
+    def __init__(self, hidden_size, intermediate_size):
+        super().__init__()
+        self.gate_proj = nn.Linear(hidden_size, intermediate_size, bias=False)
+        self.up_proj = nn.Linear(hidden_size, intermediate_size, bias=False)
+        self.down_proj = nn.Linear(intermediate_size, hidden_size, bias=False)
+        self.act_fn = torch.nn.Tanh()
+
+    def forward(self, x):
+        down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
+        return down_proj
+
+
 def init_distributed():
     torch.distributed.init_process_group(backend='nccl')
     rank = torch.distributed.get_rank()
@@ -115,9 +128,10 @@ def init_distributed():
 
 
 def assert_equal(a: Any, b: Any):
-    assert type(a) == type(b)
+    # treat dict and OrderedDict as same for comparison
+    assert type(a) == type(b) or (isinstance(a, dict) and isinstance(b, dict)), f'{type(a)} != {type(b)}'
     if isinstance(a, torch.Tensor):
-        assert torch.equal(a.cpu(), b.cpu())
+        assert torch.equal(a.cpu(), b.cpu()), torch.max(torch.abs(a.cpu() - b.cpu()))
     elif isinstance(a, dict):
         assert len(a) == len(b)
         for k in a.keys():
@@ -127,7 +141,7 @@ def assert_equal(a: Any, b: Any):
         for i in range(len(a)):
             assert_equal(a[i], b[i])
     else:
-        assert a == b
+        assert a == b, f"Values are not equal: {a} != {b}"
 
 
 def assert_close(a: Any, b: Any, atol=1e-6, rtol=1e-6):
@@ -137,10 +151,10 @@ def assert_close(a: Any, b: Any, atol=1e-6, rtol=1e-6):
     elif isinstance(a, dict):
         assert len(a) == len(b)
         for k in a.keys():
-            assert_close(a[k], b[k])
+            assert_close(a[k], b[k], atol=atol, rtol=rtol)
     elif isinstance(a, (list, tuple)):
         assert len(a) == len(b)
         for i in range(len(a)):
-            assert_close(a[i], b[i])
+            assert_close(a[i], b[i], atol=atol, rtol=rtol)
     else:
-        raise ValueError(f'unsupported type {type(a)}')
+        assert a == b, f"Values are not equal: {a} != {b}"

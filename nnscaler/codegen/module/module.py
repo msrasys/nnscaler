@@ -8,8 +8,9 @@ import copy
 import torch
 import numpy as np
 import inspect
+import pickle
 
-from nnscaler.ir.cten import IRCell
+from nnscaler.ir.cten import IRCell, IRTensor
 from nnscaler.ir.tensor import IRFullTensor, IRSubTensor
 from nnscaler.ir.operator import IRBpOperation, IRDataOperation, IRFwOperation
 from nnscaler.ir.adapter import IRWeightReducer, IRAdapter
@@ -23,7 +24,7 @@ from nnscaler.execplan import ExecutionPlan
 from nnscaler.execplan.execplan import ExeReuseCell
 
 from nnscaler.codegen.syntax.symtable import SymbolTable
-from nnscaler.codegen.syntax.blocks import ClassBlock, FunctionBlock, Block
+from nnscaler.codegen.syntax.blocks import ClassBlock, ForBlock, FunctionBlock, Block
 
 from nnscaler.codegen.emit import FuncEmission
 from nnscaler.codegen.module.autograd import AutogradAdapterCodeGen
@@ -126,6 +127,7 @@ class ModuleCodeGen(FuncEmission):
             'from pathlib import Path',
             'import torch', 'import torch.utils.checkpoint as ckpt',
             'import nnscaler', 'import nnscaler.flags',
+            'import nnscaler.runtime.function',
             'import _operator', 'from numpy import inf', 'import builtins', '',
             f'runtime_version = {runtime_version!r}', '', ''
         ]
@@ -138,6 +140,18 @@ class ModuleCodeGen(FuncEmission):
             # self.init_code.append('@torch.jit.script')
             self.init_code.append(op_impl)
             self.init_code += ['']
+
+        # hooks
+        hook_imports = set()
+        for node in execplan.graph.select(ntype=IRFwOperation):
+            if node.pre_hook is not None:
+                hook_imports.add(inspect.getmodule(node.pre_hook).__name__)
+            if node.post_hook is not None:
+                hook_imports.add(inspect.getmodule(node.post_hook).__name__)
+        for modname in hook_imports:
+            self.init_code.append(f'import {modname}')
+            self.init_code += ['']
+
         # module init code
         self.model_init_statements: List[str] = list()
         # module method bodies for forward computations, e.g. Segments, Adapters.
@@ -317,7 +331,8 @@ class ModuleCodeGen(FuncEmission):
         *,
         as_parallel_module: bool = False,
         end2end_mode: bool = False,
-        forward_args: Optional[Dict[str, Any]] = None
+        forward_args: Optional[Dict[str, Any]] = None,
+        outfile_attr_meta_map: Optional[str] = None,
     ) -> str:
         """
         Generate model implementation code based on the given graph.
@@ -406,6 +421,7 @@ class ModuleCodeGen(FuncEmission):
                 This is used only in parallel module.
             forward_args (Dict[str, Any]): argument names and their default values of forward function, if None, use node inputs.
                 This is used only in parallel module.
+            outfile_attr_meta_map (str): output file path for parameter mapping. None if don't save
 
         Returns:
             generated code
@@ -451,6 +467,7 @@ class ModuleCodeGen(FuncEmission):
                     if k not in param_first_used_pos:
                         param_first_used_pos[k] = (i, v)
 
+        attr_meta_map = {}
         # emit code
         for node in sequence:
             if isinstance(node, IRSegment):
@@ -472,7 +489,7 @@ class ModuleCodeGen(FuncEmission):
 
             # emit node tensor declaration into `__init__`
             # typically it's about the `nn.Parameter`
-            self.init_attributes(node)
+            attr_meta_map.update(self.init_attributes(node))
 
             # emit node code
             # codes : List[str]
@@ -483,10 +500,14 @@ class ModuleCodeGen(FuncEmission):
             for t in node.inputs():
                 if isinstance(t, IRSubTensor):
                     if not t.is_attr():
-                        args.append(self.tensor_name(t))
+                        args.append(self.tensor_name(t, strip_star=False))
                 else:
-                    args.append(self.tensor_name(t))
+                    args.append(self.tensor_name(t, strip_star=False))
             node_args.append(args)
+
+        if outfile_attr_meta_map:
+            with open(outfile_attr_meta_map, 'wb') as f:
+                pickle.dump(attr_meta_map, f)
 
         # generate full code
         with ClassBlock(
@@ -499,6 +520,7 @@ class ModuleCodeGen(FuncEmission):
 
             if as_parallel_module:
                 cb.insert_body(f'rank = {device}')  # save rank in class level
+                cb.insert_body(f'world_size = {self.runtime_ndevs}')  # save world size in class level
                 # async_op, max_bucket_size_bytes and zero_use_reduce_scatter
                 # parameters are for testing purpose
                 # and will not expose to user
@@ -506,15 +528,17 @@ class ModuleCodeGen(FuncEmission):
                     args=[
                         'self',
                         'init_params=True',
-                        '*',
+                        'build_buckets=True',
+                        '*args',
                         f'async_op={CompileFlag.async_reducer}',
                         f'max_bucket_size_bytes={CompileFlag.max_reducer_bucket}',
                         f'zero_use_reduce_scatter={CompileFlag.zero_use_reduce_scatter}',
+                        f'**kwargs',
                     ]
                 ) as ib:
                     ib.insert_body(self.model_init_statements)
                     ib.insert_body('')
-                    ib.insert_body('self._post_init(init_params)')
+                    ib.insert_body('self._post_init(init_params, build_buckets)')
             else:
                 with FunctionBlock(func_name='__init__', args=['self']) as ib:
                     ib.insert_body(self.model_init_statements)
@@ -528,7 +552,10 @@ class ModuleCodeGen(FuncEmission):
                 if isinstance(node, IRSegment):
                     segment_idxs.append(idx)
 
-                with FunctionBlock(func_name=name, args=input_args) as fb:
+                saved_tensors_hooks_needed = isinstance(node, IRSegment) and CompileFlag.use_zero > 1
+                func_name = name + '_impl' if saved_tensors_hooks_needed else name
+
+                with FunctionBlock(func_name=func_name, args=input_args) as fb:
                     fb.insert_body(forward_code)
                     # generate output
                     outputs = [self.tensor_name(t) for t in node.outputs()]
@@ -540,6 +567,16 @@ class ModuleCodeGen(FuncEmission):
                 if CompileFlag.use_jit and name.startswith('segment'):
                     cb.insert_body('@torch.jit.script_method')
                 cb.insert_body(fb.code)
+
+                if saved_tensors_hooks_needed:
+                    with FunctionBlock(func_name=name, args=input_args) as fb:
+                        # call segment under save_params_hooks context
+                        save_context_code = f'with self.save_params_hooks():'
+                        with Block(save_context_code) as cblock:
+                            cblock.insert_body(f'return self.{func_name}({", ".join(node_args[idx])})')
+                        fb.insert_body(cblock.code)
+                    cb.insert_body('')
+                    cb.insert_body(fb.code)
 
             if as_parallel_module:
                 if not segment_idxs:
@@ -627,8 +664,11 @@ class ModuleCodeGen(FuncEmission):
             outputs = self.return_name(node.outputs(), skip_attr=True)
             call_code = f'{outputs} = self.{self.node_name(node)}({", ".join(inputs)})'
             # be sure the user doesn't specify unused args.
-            for unused_arg in unused_args:
-                fb.insert_body(f'if {unused_arg} is not None: raise ValueError("{unused_arg} is not used in graph tracing, so it must be None when running forward.")')
+            # but sometimes this can cause issues
+            # (for example, the value is used in an `if` condition in the original forward function),
+            # so we disable it for now.
+            # for unused_arg in unused_args:
+            #     fb.insert_body(f'if {unused_arg} is not None: raise ValueError("{unused_arg} is not used in graph tracing, so it must be None when running forward.")')
             fb.insert_body(call_code)
             return_code = f'return {self.return_name_complex(self.execplan.graph.outputs())}'
             fb.insert_body(return_code)
@@ -644,6 +684,11 @@ class ModuleCodeGen(FuncEmission):
         - `model_init_statements`
         """
         sign = 'self.init_group(ranks={ranks})'
+        # create single rank communication group
+        self.model_init_statements.append('# single rank communication groups')
+        with ForBlock(var='rank', iters=f'range({self.runtime_ndevs})') as fb:
+            fb.insert_body(sign.format(ranks='[rank]'))
+        self.model_init_statements.extend(fb.code)
         # create communication group
         self.model_init_statements.append('# communication groups')
         for ranks in self.comm_groups:
@@ -651,7 +696,7 @@ class ModuleCodeGen(FuncEmission):
             self.model_init_statements.append(code)
         self.model_init_statements.append(' ')
 
-    def init_attributes(self, node: IRCell):
+    def init_attributes(self, node: IRCell) -> dict[str, dict[str, Any]]:
         """
         Emit tensor declaration code
 
@@ -660,10 +705,18 @@ class ModuleCodeGen(FuncEmission):
 
         This method also populates `self.symbols : SymbolTable` to record
         the names of the variables for the tensors ever encountered.
+
+        Returns:
+            dict[str, dict[str, Any]]: A mapping of tensor names to their attributes.
         """
+        attr_meta_map = {}
+        self._init_attributes(node, attr_meta_map)
+        return attr_meta_map
+
+    def _init_attributes(self, node: IRCell, attr_meta_map: Dict[str, Any]):
         psign = "self.register_parameter('{name}', torch.nn.Parameter(torch.empty({shape}, dtype={dtype})))"
         bsign = "self.register_buffer('{name}', torch.empty({shape}, dtype={dtype}), persistent={persistent})"
-        map_sign = "self.add_full_map('{attr}', {tid}, {is_param}, '{orig_name}', {full_shape}, {slicers}, {val_chunks})"
+        map_sign = "self.add_full_map('{attr}', {tid}, {is_param}, '{orig_name}', {shape}, {slicers}, {val_chunks})"
         if not isinstance(node, IRSegment):
             for itensor in node.inputs():
                 name = self.tensor_name(itensor, prefix_attr='self.')
@@ -691,14 +744,24 @@ class ModuleCodeGen(FuncEmission):
                             assert len(slicers) == 1 and slicers[0] == slice(0, 1), f"Unexpected slicers {slicers} for scalar tensor."
                             slicers = '...'  # Ellipsis slicer for scalar tensor, x[...] is equivalent to x
                         val_chunks = itensor.valmap[1]
-                        code = map_sign.format(
-                            attr=self.tensor_name(itensor),
+                        attr_name = self.tensor_name(itensor)
+                        attr_props = dict(
                             tid=itensor.parent.tid,
                             is_param=itensor.is_param(),
                             orig_name=itensor.parent.name,
-                            full_shape=tuple(itensor.parent.origin_shape),
-                            slicers=str(slicers),
-                            val_chunks=val_chunks
+                            shape=tuple(itensor.parent.origin_shape), # full tensor shape
+                            slicers=slicers,
+                            val_chunks=val_chunks,
+                        )
+                        attr_meta_map[attr_name] = dict(
+                            **attr_props,
+                            dtype=itensor.dtype,
+                            sub_shape=tuple(itensor.shape)
+                        )
+
+                        code = map_sign.format(
+                            attr=attr_name,
+                            **attr_props
                         )
                         self.model_init_statements.append(code)
                         self.model_init_statements.append('')
@@ -710,7 +773,7 @@ class ModuleCodeGen(FuncEmission):
                 self.symbols.create(self.tensor_name(output, prefix_attr='self.'))
         else:
             for sub_node in node.nodes():
-                self.init_attributes(sub_node)
+                self._init_attributes(sub_node, attr_meta_map)
         return
 
     def init_reducer(self,
@@ -874,12 +937,64 @@ class ModuleCodeGen(FuncEmission):
                 code = "with " + ", ".join(ctx_managers) + ":"
                 return code
 
-        def emit_node(node):
+        def emit_node(node, node_idx):
             node_code = []
             # execute
             if isinstance(node, IRFwOperation):
+                param_inputs = [
+                    self.tensor_name(t, prefix_attr='self.') for t in node.iobjs()
+                    if isinstance(t, IRTensor) and t.is_param()
+                ]
+
+                # for multiref node under zero3, we need to clone the params to avoid in-place modification issue
+                if param_inputs and CompileFlag.use_zero > 1 and node.name == 'multiref':
+                    _logger.warning(f'Node {node} is a multiref node with param inputs under ZeRO-3, '
+                                    f'we set clone_level=1 to avoid in-place modification issue.')
+                    node.kwargs['clone_level'] = 1
+
                 code = self.emit_fnode(node, runtime_devid=runtime_devid, plan_ndevs=len(self.devices), runtime_ndevs=self.runtime_ndevs, prefix_attr='self.')
-                node_code += code
+
+                if not param_inputs or CompileFlag.use_zero <= 1:
+                    node_code += code
+                else:
+                    activation_inputs = [
+                        self.tensor_name(t) for t in node.iobjs()
+                        if isinstance(t, IRTensor) and not t.is_attr() and t.requires_grad
+                    ]
+                    activation_outputs = [
+                        self.tensor_name(t) for t in node.oobjs()
+                        if isinstance(t, IRTensor) and t.requires_grad
+                    ]
+
+                    # insert param prefetch before each fnode for zero3
+                    for t in param_inputs:
+                        node_code.append(f'self.prefetch_param({t})')
+                        # The backward hook here is not reliable,
+                        # 1. there can be no activation input requiring grad,
+                        # 2. some inputs may not be used.
+                        # so, to maximize the chance of triggering backward hook
+                        # let's hook to every input requiring grad
+                        # We also add evict logic in AccumulateGrad hook in bucket implementation,
+                        # which can make sure params are evicted after backward use.
+                        for q in activation_inputs:
+                            node_code.append(f'{q} = self.backward_postevict_param({q}, {t}, {node_idx})')
+
+                    node_code += code
+
+                    # insert zero param release after each fnode
+                    for t in param_inputs:
+                        node_code.append(f'self.postevict_param({t})')
+
+                    # insert backward hook for activation outputs to fetch params in backward
+                    for t in activation_outputs:
+                        # we don't know which activation output will be used in backward
+                        # (DCE may not work 100% correctly),
+                        # so we add hook to all activation outputs for all input params
+                        for p in param_inputs:
+                            node_code.append(
+                                f'{t} = self.backward_prefetch_param({t}, {p}, {node_idx})'
+                            )
+
             elif isinstance(node, IRAdapter):
                 # for adapters inside an IRSegment, we don't apply async communication to it
                 # as it is mostly in critical path.
@@ -905,15 +1020,15 @@ class ModuleCodeGen(FuncEmission):
         node_codes = []
         current_context_manager_code = ""
         current_codes = []
-        for node in nodes:
+        for node_idx, node in enumerate(nodes):
             if has_op_context_info(node):
                 new_context_manager_code = emit_context_manager(node)
                 if current_context_manager_code != new_context_manager_code:
                     node_codes += insert_codes_under_ctx(current_context_manager_code, current_codes)
-                    current_codes = emit_node(node)
+                    current_codes = emit_node(node, node_idx)
                     current_context_manager_code = new_context_manager_code
                 else:
-                    current_codes.extend(emit_node(node))
+                    current_codes.extend(emit_node(node, node_idx))
             else:
                 # Node without op context infortmation means it is inserted by nnscaler, not convert from original fx graph,
                 # for example, multiref node and adapter node, currently for nodes inserted by nnscaler we have the following assumption:
@@ -967,7 +1082,7 @@ class ModuleCodeGen(FuncEmission):
                 #
                 # TODO: all inserted nodes should have its op context field.
                 node_codes += insert_codes_under_ctx(current_context_manager_code, current_codes)
-                node_codes += emit_node(node)
+                node_codes += emit_node(node, node_idx)
                 current_codes = []
         node_codes += insert_codes_under_ctx(current_context_manager_code, current_codes)
 

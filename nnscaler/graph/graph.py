@@ -65,11 +65,10 @@ class IRGraph(IRSegment):
         """
         return self.forward(*args)
 
-    def forward(self, *args: Tuple[IRObject]) -> Union[IRTensor, Tuple[IRTensor]]:
+    def forward(self, *args: IRObject) -> Union[IRTensor, Tuple[IRTensor]]:
         """Forward the IRGraph to add model nodes into program.
-
         Args:
-            args (Tuple[IRObject]): input IRObjects
+            args (Tuple[IRObject, ...]): input IRObjects
 
         Returns:
             Any: output that can be nested structure of IRObjects
@@ -288,6 +287,7 @@ class IRGraph(IRSegment):
         # IRDataOperation. Since we already know the output of the dataloader,
         # we don't need to set the value for it.
         ir_root_obj = IRObject(name='dataloader', value=None, is_constant=False)
+        ir_root_obj.value_track.with_no_dep()
         data_op = IRDataOperation(ir_root_obj, self.inputs())
         # add the data operation to the graph, which will use `next` to get data.
         self.insert(data_op, 0)
@@ -1212,7 +1212,8 @@ class IRGraph(IRSegment):
     def copy_node_meta_info(src_node: Union[IRFwOperation, IRDataOperation], dest_node: Union[IRFwOperation, IRDataOperation]):
         """
         Copy meta information from src_node to dest_node.
-        Current copy fields: ['recompute', 'comment', 'op_context', 'module_stack', 'device']
+        Current copy fields: ['recompute', 'comment', 'op_context', 'module_stack', 'device',
+        'hook_meta', 'pre_hook', 'post_hook']
         """
         if isinstance(src_node, IRFwOperation):
             dest_node.recompute = src_node.recompute
@@ -1222,3 +1223,6 @@ class IRGraph(IRSegment):
             dest_node.op_context = src_node.op_context
         dest_node.module_stack = src_node.module_stack
         dest_node.device = src_node.device
+        dest_node.hook_meta = src_node.hook_meta
+        dest_node.pre_hook = src_node.pre_hook
+        dest_node.post_hook = src_node.post_hook

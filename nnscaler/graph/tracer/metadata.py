@@ -8,6 +8,7 @@ import torch
 from torch.fx.node import Node
 
 from . import pytree_utils
+from nnscaler.utils import get_dynamic
 
 DICT_KEYS_TYPE = type({}.keys())
 DICT_VALUES_TYPE= type({}.values())
@@ -95,6 +96,9 @@ class TensorMetadata(NamedTuple):
     is_quantized : bool
     qparams: Dict[str, Any]
 
+    # all dynamic dimensions in shape
+    dynamic_dims: set[int]
+
 
 def _extract_tensor_metadata(result: torch.Tensor) -> TensorMetadata:
     """
@@ -134,7 +138,7 @@ def _extract_tensor_metadata(result: torch.Tensor) -> TensorMetadata:
             qparams["zero_point"] = result.q_per_channel_zero_points().tolist()  # type: ignore[assignment]
             qparams["axis"] = result.q_per_channel_axis()  # type: ignore[assignment]
 
-    return TensorMetadata(shape, dtype, requires_grad, stride, memory_format, is_quantized, qparams)
+    return TensorMetadata(shape, dtype, requires_grad, stride, memory_format, is_quantized, qparams, get_dynamic(result))
 
 
 def extract_metadata(results: Any, node: Node):

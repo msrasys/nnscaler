@@ -19,6 +19,7 @@ from .trainer_args import (
     TrainerArgs, PrecisionMixin, PolicyMixin, ModuleParallelizeConfig, ComputeConfig,
     load_type
 )
+from .serialization import Checkpointer
 
 
 logger = logging.getLogger(__name__)
@@ -41,7 +42,8 @@ class ModuleParallelizeConfigAdapter(PrecisionMixin, PolicyMixin):
     def __init__(
             self, trainer_args: TrainerArgs,
             parallel_module: Optional[ModuleParallelizeConfig] = None,
-            tracing_weights: Optional[dict[str, Any]] = None
+            tracing_weights: Optional[dict[str, Any]] = None,
+            checkpointer: Optional[Checkpointer] = None,
     ):
         """
         Args:
@@ -52,6 +54,7 @@ class ModuleParallelizeConfigAdapter(PrecisionMixin, PolicyMixin):
         self.trainer_args = trainer_args
         self.parallel_module = parallel_module
         self.tracing_weights = tracing_weights
+        self.checkpointer = checkpointer or Checkpointer()
 
         # we don't want to load the tracing weights every time
         # It should be loaded only once outside, and passed to the adapter
@@ -132,10 +135,10 @@ class ModuleParallelizeConfigAdapter(PrecisionMixin, PolicyMixin):
             # try to reuse the weights from the tracing weights
             tracing_weights = self.tracing_weights
             if self.tracing_from_weights and tracing_weights is None:
-                tracing_weights = torch.load(self.tracing_from_weights)
+                tracing_weights = self.checkpointer.load(self.tracing_from_weights)
         else:
             if self.tracing_from_weights:
-                tracing_weights = torch.load(self.tracing_from_weights)
+                tracing_weights = self.checkpointer.load(self.tracing_from_weights)
             elif self.parallel_module.tracing_from_weights_prefix:
                 leading_key = self.parallel_module.tracing_from_weights_prefix + '.'
                 tracing_weights = {}
@@ -166,21 +169,29 @@ class ModuleParallelizeConfigAdapter(PrecisionMixin, PolicyMixin):
 
     def create_dummy_forward_args(self, dummy_input) -> dict[str, Any]:
         if self.parallel_module:
-            return self.fix_input(
+            forward_args = self.fix_input(
                 self.parallel_module.create_dummy_forward_args(self.trainer_args)
             )
-
-        # forward args of whole model
-        arg_names = list(
-            inspect.signature(
-                inspect.unwrap(getattr(self.model_type, 'forward'))
-            ).parameters.keys()
-        )
-        return {arg_names[1]: self.fix_input(dummy_input)}  # arg_names[0] is self
+            if self.parallel_module.forward_args_post_process_fn:
+                forward_args = self.parallel_module.forward_args_post_process_fn(self.trainer_args, forward_args)
+            return forward_args
+        else:
+            # forward args of whole model
+            arg_names = list(
+                inspect.signature(
+                    inspect.unwrap(getattr(self.model_type, 'forward'))
+                ).parameters.keys()
+            )
+            # dummy input is already fixed and post processed by trainer
+            forward_args = {arg_names[1]: dummy_input}  # arg_names[0] is self
+            return forward_args
 
     def resolve_compute_config(self):
         compute_config = copy.deepcopy(self.compute_config)
-        compute_config.pas_config['__pas_name'] = self.pas_policy
+        compute_config.pas_config['__pas_name'] = \
+            self.pas_policy \
+            if not callable(self.pas_policy) \
+            else f'{self.pas_policy.__module__}.{self.pas_policy.__qualname__}'
         # autodist configs
         compute_config.pas_config['update_freq'] = self.trainer_args.update_freq
         compute_config.pas_config['use_bf16'] = self.param_dtype == torch.bfloat16
@@ -197,6 +208,7 @@ class ModuleParallelizeConfigAdapter(PrecisionMixin, PolicyMixin):
     def parallelize(self,
         dummy_input: Optional[dict[str, Any]] = None, *,
         load_module: bool = True,
+        build_buckets: bool = True,
         module_args: Optional[tuple[tuple, dict]] = None
     ):
         pmodel_class = nnscaler.parallelize(
@@ -212,7 +224,7 @@ class ModuleParallelizeConfigAdapter(PrecisionMixin, PolicyMixin):
             load_module=load_module,
         )
         if load_module:
-            return pmodel_class()
+            return pmodel_class(build_buckets=build_buckets)
         return pmodel_class
 
 
@@ -279,24 +291,32 @@ def mixin_module(model: torch.nn.Module, optimizer: torch.optim.Optimizer):
     return model
 
 
-def parallelize_model(trainer_args: TrainerArgs, dummy_input: dict[str, Any], load_module: bool):
+def parallelize_model(
+    trainer_args: TrainerArgs,
+    dummy_input: dict[str, Any],
+    load_module: bool,
+    build_buckets: bool,
+    checkpointer: Checkpointer
+):
     tracing_weights = None
+    checkpointer = checkpointer or Checkpointer()
     if trainer_args.tracing_from_weights:
-        tracing_weights = torch.load(trainer_args.tracing_from_weights)
+        tracing_weights = checkpointer.load(trainer_args.tracing_from_weights)
 
     def _new_adapter(parallel_module=None):
         return ModuleParallelizeConfigAdapter(
             trainer_args, parallel_module,
-            tracing_weights=tracing_weights
+            tracing_weights=tracing_weights,
+            checkpointer=checkpointer,
         )
 
     if not trainer_args.model.parallel_modules:
         # parallelize the whole model
-        return _new_adapter().parallelize(dummy_input, load_module=load_module)
+        return _new_adapter().parallelize(dummy_input, load_module=load_module, build_buckets=build_buckets)
 
     if not load_module and all(pm.args is not None for pm in trainer_args.model.parallel_modules):
         for m in trainer_args.model.parallel_modules:
-            _new_adapter(m).parallelize(dummy_input, load_module=False)
+            _new_adapter(m).parallelize(dummy_input, load_module=False, build_buckets=build_buckets)
         return
 
     parallel_sub_modules = {
@@ -346,7 +366,7 @@ def parallelize_model(trainer_args: TrainerArgs, dummy_input: dict[str, Any], lo
                 # This is a trade-off to make sure the parallelized module is consistent.
                 # Maybe we can use torch.distributed.broadcast to sync the random state in all devices.
                 with fork_rng():
-                    return adapter.parallelize(dummy_input, load_module=load_module, module_args=(args, kwargs))
+                    return adapter.parallelize(dummy_input, load_module=load_module, build_buckets=build_buckets, module_args=(args, kwargs))
         finally:
             _patch_new()
 

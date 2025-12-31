@@ -34,7 +34,7 @@ import math
 import logging
 from collections.abc import Iterable
 
-from nnscaler.ir.cten import IRTensor, IRObject, IR
+from nnscaler.ir.cten import IRTensor, IRObject, IR, ValueTrack
 from nnscaler.ir.tensor import IRSubTensor, IRFullTensor
 from nnscaler.graph.function.pyfunc import IRPyFunc
 from nnscaler.graph.function.dimops import DimopSplit, ShapeAnno, OpAnno, IRDimops, TransformRule
@@ -150,6 +150,16 @@ def Accum(*inputs, signature = None):
     return IRDimops(Cat, 'accum', signature, [anno], inputs)
 
 
+def Dot(input, tensor, *, out=None, signature = None):
+    """
+    torch.dot(input, tensor, *, out=None) -> Tensor
+    """
+    assert out is None
+    signature = 'torch.dot'
+    annos = ['k+, k+ -> 1',]
+    return IRDimops(Dot, 'dot', signature, annos, [input, tensor])
+
+
 def Linear(input, weight, bias=None, signature = None):
     signature = 'torch.nn.functional.linear'
     assert isinstance(input, IRTensor) and isinstance(weight, IRTensor)
@@ -194,6 +204,7 @@ def CubeEinSum(*operands, equation=None, signature = None):
             lhs = lhs.replace(dim, f'{dim}+')
     anno = f'{lhs} -> {rhs}'
     return IRDimops(CubeEinSum, 'einsum', signature, [anno], operands, equation=equation)
+
 
 def EinSum(equation: str, *operands, signature = None):
     return CubeEinSum(*operands, equation=equation, signature=signature)
@@ -259,7 +270,21 @@ def CubeArange(start: Union[int, IRObject], end: Union[int, IRObject], step: Uni
     size = (math.ceil((end_val-start_val)/step_val),)
     anno, rules = _get_creator_anno_rules(
         tuple(dim.value if isinstance(dim, IRObject) else dim for dim in size), False)
-    return IRDimops(CubeArange, 'arange', signature, [anno], [], rules, **kwargs)
+
+    # Output will be replaced in Parser,
+    # Here we just pass the value tracks out
+    output = IRFullTensor(size)
+    if not isinstance(start, IRObject) and start == 0 \
+        and not isinstance(step, IRObject) and step == 1 \
+        and isinstance(end, IRObject):
+        # a special case for arange(0, end), which is very common in practice
+        # we can directly use end's value track
+        output.dim_tracks = [end.value_track]
+    else:
+        output.dim_tracks = [ValueTrack.new([start, end, step])]
+    ret = IRDimops(CubeArange, 'arange', signature, [anno], [], rules, **kwargs)
+    ret.set_output(0, output)
+    return ret
 
 
 def Arange(*args, start=None, end=None, step=None, out=None, dtype=None, layout=None,
@@ -352,11 +377,36 @@ def creation_function_size_check(op_name, size, *arg_size) -> Tuple[Union[int, I
             raise ValueError(f"get illegal input size={size}, arg_size={arg_size} in {op_name}")
         # convert scalar to shape (1,) tensor, nnscaler don't support empty shape [] now.
         if len(size_val) == 0:
-            _logger.warn(f"detect tensor creation function {op_name} create a scalar, force it to create a shape [1] tensor instead")
+            _logger.warning(f"detect tensor creation function {op_name} create a scalar, force it to create a shape [1] tensor instead")
             size = (1,)
     else:
         raise ValueError(f"get unknown input type size={size} in {op_name}")
     return size
+
+
+def creation_function_dim_track(resolved_size: Union[IRObject, tuple[Union[int, IRObject]]]) -> list[ValueTrack]:
+    if isinstance(resolved_size, IRObject):
+        assert isinstance(resolved_size.value, (tuple, list))
+        # all dims dependent on resolved_size
+        return [ValueTrack.new([resolved_size]) for _ in resolved_size.value]
+
+    dim_tracks = []
+    for dim in resolved_size:
+        if isinstance(dim, IRObject):
+            dim_tracks.append(ValueTrack.new([dim]))
+        else:
+            # no dim dependency when dim is not IRObject
+            dim_tracks.append(ValueTrack.new([]))
+    return dim_tracks
+
+
+def creation_function_set_dim_tracks(op: IRDimops, resolved_size: Union[IRObject, tuple[Union[int, IRObject]]]) -> IRDimops:
+    # Output will be replaced in Parser,
+    # Here we just pass the value tracks out
+    output = IRFullTensor(_unwrap_value(resolved_size))
+    output.dim_tracks = creation_function_dim_track(resolved_size)
+    op.set_output(0, output)
+    return op
 
 
 def Empty(size, *arg_size, out=None, dtype=None, layout=None, device=None, requires_grad=False,
@@ -374,7 +424,10 @@ def Empty(size, *arg_size, out=None, dtype=None, layout=None, device=None, requi
     kwargs = {'size': size, 'requires_grad': requires_grad,
               'dtype': dtype, 'pin_memory': pin_memory}
     anno, rules = _get_creator_anno_rules(_unwrap_value(size), True)
-    return IRDimops(Empty, 'empty', signature, [anno], [], rules, **kwargs)
+    return creation_function_set_dim_tracks(
+        IRDimops(Empty, 'empty', signature, [anno], [], rules, **kwargs),
+        size
+    )
 
 
 def Zeros(size, *arg_size, out=None, dtype=None, layout=None,
@@ -390,7 +443,10 @@ def Zeros(size, *arg_size, out=None, dtype=None, layout=None,
     size = creation_function_size_check('torch.zeros', size, *arg_size)
     kwargs = {'size': size, 'requires_grad': requires_grad, 'dtype': dtype}
     anno, rules = _get_creator_anno_rules(_unwrap_value(size), True)
-    return IRDimops(Zeros, 'zeros', signature, [anno], [], rules, **kwargs)
+    return creation_function_set_dim_tracks(
+        IRDimops(Zeros, 'zeros', signature, [anno], [], rules, **kwargs),
+        size
+    )
 
 
 def Ones(size, *arg_size, out=None, dtype=None, layout=None,
@@ -406,7 +462,10 @@ def Ones(size, *arg_size, out=None, dtype=None, layout=None,
     size = creation_function_size_check('torch.ones', size, *arg_size)
     kwargs = {'size': size, 'requires_grad': requires_grad, 'dtype': dtype}
     anno, rules = _get_creator_anno_rules(_unwrap_value(size), True)
-    return IRDimops(Ones, 'ones', signature, [anno], [], rules, **kwargs)
+    return creation_function_set_dim_tracks(
+        IRDimops(Ones, 'ones', signature, [anno], [], rules, **kwargs),
+        size
+    )
 
 
 def Rand(size, *arg_size, out=None, dtype=None, layout=None, device=None, requires_grad=False,
@@ -424,7 +483,10 @@ def Rand(size, *arg_size, out=None, dtype=None, layout=None, device=None, requir
     kwargs = {'size': size, 'requires_grad': requires_grad,
               'dtype': dtype, 'pin_memory': pin_memory}
     anno, rules = _get_creator_anno_rules(_unwrap_value(size), True)
-    return IRDimops(Rand, 'rand', signature, [anno], [], rules, **kwargs)
+    return creation_function_set_dim_tracks(
+        IRDimops(Rand, 'rand', signature, [anno], [], rules, **kwargs),
+        size
+    )
 
 
 def Randn(size, *arg_size, generator=None, out=None, dtype=None, layout=None, device=None, requires_grad=False,
@@ -442,7 +504,10 @@ def Randn(size, *arg_size, generator=None, out=None, dtype=None, layout=None, de
     kwargs = {'size': size, 'requires_grad': requires_grad,
               'dtype': dtype, 'pin_memory': pin_memory}
     anno, rules = _get_creator_anno_rules(_unwrap_value(size), True)
-    return IRDimops(Randn, 'randn', signature, [anno], [], rules, **kwargs)
+    return creation_function_set_dim_tracks(
+        IRDimops(Randn, 'randn', signature, [anno], [], rules, **kwargs),
+        size
+    )
 
 
 def Full(size, fill_value, *, out=None, dtype=None, layout=None,
@@ -457,8 +522,11 @@ def Full(size, fill_value, *, out=None, dtype=None, layout=None,
     signature = 'nnscaler.runtime.function.full'
     size = creation_function_size_check('torch.full', size)
     anno, rules = _get_creator_anno_rules(_unwrap_value(size), True)
-    return IRDimops(Full, 'full', signature, [anno], [], rules,
-                     size=size, fill_value=fill_value, dtype=dtype, requires_grad=requires_grad)
+    return creation_function_set_dim_tracks(
+        IRDimops(Full, 'full', signature, [anno], [], rules,
+                     size=size, fill_value=fill_value, dtype=dtype, requires_grad=requires_grad),
+        size
+    )
 
 
 def NewTensor(data, *, dtype=None, device=None,
@@ -1809,14 +1877,18 @@ def CubeStack(*tensors, dim=0, signature=None):
     assert all(isinstance(tensor, IRTensor) for tensor in tensors), f'but got {tensors}'
     assert isinstance(dim, int), f"but not {dim}"
     signature = 'nnscaler.runtime.function.stack'
-    iannos = [ShapeAnno.create_shape_str(t.shape) for t in tensors]
-    oanno = [None for i in range(len(tensors[0].shape) + 1)]
-    oanno[dim] = f'{len(tensors)}^'
-    offset = 0
-    for i in range(len(oanno)):
-        if oanno[i] is None:
-            oanno[i] = copy.copy(iannos[-1][offset])
-            offset += 1
+    if tensors[0].is_scalar_tensor():
+        iannos = ['1' for _ in tensors]
+        oanno = [f'{len(tensors)}']
+    else:
+        iannos = [ShapeAnno.create_shape_str(t.shape) for t in tensors]
+        oanno = [None for i in range(len(tensors[0].shape) + 1)]
+        oanno[dim] = f'{len(tensors)}'
+        offset = 0
+        for i in range(len(oanno)):
+            if oanno[i] is None:
+                oanno[i] = copy.copy(iannos[-1][offset])
+                offset += 1
     anno = OpAnno.create_op_str(iannos, [oanno])
     return IRDimops(CubeStack, 'stack', signature, [anno], tensors, dim=dim)
 
@@ -1834,7 +1906,7 @@ def Stack(tensors, dim=0, out=None, signature = None):
     return CubeStack(*tensors, dim=dim, signature=signature)
 
 
-def Chunk(input, chunks, dim=0, signature = None):
+def Chunk(input: IRTensor, chunks, dim=0, signature = None):
     """
     torch.chunk(input, chunks, dim=0)
     """
@@ -1845,7 +1917,18 @@ def Chunk(input, chunks, dim=0, signature = None):
     for oanno in oannos:
         oanno[dim] = str(input.shape[dim] // chunks)
     anno = OpAnno.create_op_str(iannos, oannos)
-    return IRDimops(Chunk, 'chunk', signature, [anno], [input], chunks=chunks, dim=dim)
+    ret = IRDimops(Chunk, 'chunk', signature, [anno], [input], chunks=chunks, dim=dim)
+
+    # set proper value tracks for outputs
+    output_shape = list(input.shape)
+    output_shape[dim] = input.shape[dim] // chunks
+    dim_vt = ValueTrack.new([chunks, input.dim_tracks[dim]])
+    for d in range(chunks):
+        output = IRFullTensor(output_shape)
+        output.set_dim_track(dim, dim_vt)
+        ret.set_output(d, output)
+
+    return ret
 
 
 def Select(input, dim, index, signature = None):
@@ -2340,12 +2423,15 @@ def Size(tensor, dim=None, signature = None) -> Union[List[int], IRPyFunc]:
     torch.Tensor.size(tensor, dim=None)
     """
     assert isinstance(tensor, IRTensor)
-    val = tensor.shape[dim] if isinstance(dim, int) else tensor.shape
-    assert val is not None
-    if dim is None:
-        return IRPyFunc(signature, [tensor], [IRObject(name='size', value=val)])
+    if isinstance(dim, int):
+        val = IRObject(name='size', value=tensor.shape[dim], value_track=tensor.dim_tracks[dim])
     else:
-        return IRPyFunc(signature, [tensor], [IRObject(name='size', value=val)], dim=dim)
+        val = tuple(IRObject('size', value=s, value_track=t) for s, t in zip(tensor.shape, tensor.dim_tracks))
+
+    if dim is None:
+        return IRPyFunc(signature, [tensor], [val])
+    else:
+        return IRPyFunc(signature, [tensor], [val], dim=dim)
 
 
 def Dim(tensor, signature=None) -> Union[List[int], IRPyFunc]:
@@ -2602,7 +2688,7 @@ def GetAttr(instance: object, field: str, signature = None) -> Union[List[int], 
     if isinstance(obj, IRTensor):
         if name == 'shape':
             assert isinstance(obj, IRFullTensor), f"type {type(obj)} is not supported"
-            shape = IRObject('shape', value=obj.shape)
+            shape = tuple(IRObject('shape', value=s, value_track=t) for s, t in zip(obj.shape, obj.dim_tracks))
             return IRPyFunc(signature, [instance, field], [shape])
         if name == 'dtype':
             assert isinstance(obj, IRFullTensor), f"type {type(obj)} is not supported"
@@ -3391,10 +3477,14 @@ def Item(input, signature = None):
     """
     torch.Tensor.item()
     """
-    # set output to IRObject.missing,
+    # set output value to IRObject.missing_value,
     # because the output is unknown here.
     # It will be filled with real value in parser.
-    return IRPyFunc(signature, inputs=[input], outputs=[IRObject.missing], constant_foldable=False)
+    return IRPyFunc(
+        signature, inputs=[input],
+        outputs=[IRObject('item', value=IRObject.missing_value, is_constant=False)],
+        constant_foldable=False
+    )
 
 
 def DictKeys(o: Union[Dict, IRObject], signature=None):
@@ -3426,7 +3516,7 @@ def DictValues(o: Union[Dict, IRObject], signature=None):
 
 
 def DictItems(o: Union[Dict, IRObject], signature=None):
-    signature = 'nnscaler.runtime.function.dict_values'
+    signature = 'nnscaler.runtime.function.dict_items'
 
     if not isinstance(o, dict) and not (isinstance(o, IRObject) and isinstance(o.value, dict)):
          raise ValueError(f'the input should be a dict or an IRObject with dict value, but get {o}')

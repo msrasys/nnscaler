@@ -1,0 +1,76 @@
+compute_config:
+  plan_ngpus: 1
+  constant_folding: true
+  use_zero: true
+  use_end2end: true
+
+run_mode: run
+pas_policy: autodist
+micro_batch_size: 2
+global_batch_size: 8
+max_train_steps: 10
+enable_progress_bar: false
+precision: bf16
+instance_name: p$(compute_config.plan_ngpus)
+
+model:
+  type: tests.cli.common.MLP
+  args:
+    dim: 16
+    nlayers: 16
+
+optimizer:
+  type: nnscaler.HybridOptimizer
+  param_clss_fn: tests.runtime.test_hybrid_optimizer.param_clss_fn
+  args:
+    config:
+      optimizers:
+        - type: torch.optim.Adam
+          options:
+            lr: 0.02
+          param_groups:
+            - options:
+                lr: 0.04
+            - options:
+                lr: 0.06
+        - type: torch.optim.AdamW
+          options:
+            lr: 0.04
+
+lr_scheduler:
+  type: nnscaler.HybridLRScheduler
+  args:
+    config:
+      schedulers:
+        - type: torch.optim.lr_scheduler.ConstantLR
+          options:
+            factor: 0.5
+            total_iters: 5
+        - type: torch.optim.lr_scheduler.ConstantLR
+          options:
+            factor: 0.2
+            total_iters: 5
+  interval: step
+
+dataset:
+  type: tests.cli.common.SimpleDataset
+  train_args:
+    dim: 16
+    size: 100
+  val_args:
+    dim: 16
+    size: 10
+
+dataloader:
+  train_args:
+    drop_last: true
+  val_args:
+    drop_last: true
+
+checkpoint:
+  keep_last_n_checkpoints: 30
+  every_n_train_steps: 1
+  save_type: deduped
+
+hook:
+  on_train_step_start: tests.runtime.test_hybrid_optimizer.on_train_step_start

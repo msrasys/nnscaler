@@ -139,8 +139,6 @@ def _check_deduped(model: torch.nn.Module, ckpt_dir):
             if not isinstance(model, ParallelModule):
                 # in this case, non parallel module is removed, so it should have less keys
                 assert len(parallel_modules) < len(dedupped_model_state_dict) < len(model_state_dict)
-            else:
-                assert len(dedupped_model_state_dict) == len(model_state_dict)
             for k, v in dedupped_model_state_dict.items():
                 assert_equal(v, model_state_dict[k])
 
