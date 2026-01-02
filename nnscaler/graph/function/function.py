@@ -571,9 +571,9 @@ def Eye(n: int, m: Optional[int] = None, *, dtype=None, device=None,
     signature = 'nnscaler.runtime.function.eye'
     if m is None:
         m = n
-    size = (n, m)
+    size = (creation_function_size_check('torch.eye', n), creation_function_size_check('torch.eye', m))
     kwargs = {'n': n, 'm': m, 'requires_grad': requires_grad, 'dtype': dtype}
-    anno, rules = _get_creator_anno_rules(size, False)
+    anno, rules = _get_creator_anno_rules((_unwrap_value(n), _unwrap_value(m)), False)
     return IRDimops(Eye, 'eye', signature, [anno], [], rules, **kwargs)
 
 
