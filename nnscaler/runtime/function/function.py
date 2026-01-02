@@ -325,6 +325,10 @@ def linspace(start: Union[int, torch.Tensor], end: Union[int, torch.Tensor],
                           device=torch.cuda.current_device())
 
 
+def eye(n: int, m: Optional[int]=None, requires_grad=False, dtype: torch.dtype=torch.float32) -> torch.Tensor:
+    return torch.eye(n, m=m, dtype=dtype, device=torch.cuda.current_device(), requires_grad=requires_grad)
+
+
 def index_select(input: torch.Tensor, index: torch.Tensor, dim: int) -> torch.Tensor:
     return torch.index_select(input, dim, index)
 

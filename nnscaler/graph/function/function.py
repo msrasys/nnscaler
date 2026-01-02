@@ -560,6 +560,23 @@ def NewTensor(data, *, dtype=None, device=None,
     return IRDimops(NewTensor, 'tensor', signature, [anno], [], rules, **kwargs)
 
 
+def Eye(n: int, m: Optional[int] = None, *, dtype=None, device=None,
+        requires_grad=False, signature=None):
+    """
+    torch.eye(n, m=None, *, out=None, dtype=None, layout=torch.strided, device=None, requires_grad=False) → Tensor
+    """
+    dtype = dtype if dtype is not None else torch.get_default_dtype()
+    creation_function_args_check('torch.eye', dtype=dtype, device=device)
+
+    signature = 'nnscaler.runtime.function.eye'
+    if m is None:
+        m = n
+    size = (n, m)
+    kwargs = {'n': n, 'm': m, 'requires_grad': requires_grad, 'dtype': dtype}
+    anno, rules = _get_creator_anno_rules(size, False)
+    return IRDimops(Eye, 'eye', signature, [anno], [], rules, **kwargs)
+
+
 def _handle_broadcast(lhs: IRTensor, rhs: IRTensor) -> Tuple[List[str]]:
     """Create shape annotations for element wise operator following broadcastable rules:
     https://pytorch.org/docs/stable/notes/broadcasting.html
@@ -2702,6 +2719,10 @@ def GetAttr(instance: object, field: str, signature = None) -> Union[List[int], 
             assert isinstance(obj, IRFullTensor), f"type {type(obj)} is not supported"
             _logger.warning("getattr of 'layout' will always return torch.strided")
             return torch.strided
+        if name == 'T':
+            assert isinstance(obj, IRFullTensor), f"type {type(obj)} is not supported"
+            assert len(obj.shape) == 2, "only 2-dim tensor support .T operation"
+            return Transpose(obj, 0, 1, signature='torch.transpose')
     if isinstance(obj, torch.finfo):
         return getattr(obj, name)
     return IRPyFunc(signature, [instance, field], [IRObject.missing])
