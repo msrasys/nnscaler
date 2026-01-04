@@ -324,3 +324,23 @@ def test_non_tensor_multiple_outputs4(tmp_path):
     # so the output number is 1 for now.
     # Will be fixed later.
     assert len(ir_graph.outputs()) == 1
+
+
+@replace_all_device_with('cpu')
+def test_T(tmp_path):
+    class MyModule(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+
+        def forward(self, x):
+            return torch.matmul(x, x.T)
+
+    dummy_input = {'x': torch.randn(4, 8)}
+    module = MyModule()
+    fx_graph = to_fx_graph(module, dummy_input)
+
+    print(fx_graph.graph)
+    ir_graph = to_ir_graph(fx_graph, dummy_input, attr_savedir=tmp_path, constant_folding=False)
+    print(ir_graph.extra_repr())
+
+    assert ir_graph.nodes()[0].signature == 'torch.transpose'

@@ -63,6 +63,20 @@ def test_Randn():
     assert op.output(0).dim_tracks[2].deps == [op.kwargs['size'][2].value_track.value_id]
 
 
+def test_Eye():
+    op = F.Eye(IRObject(value=3))
+    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == ' -> 3^ 3^'
+
+    op = F.Eye(IRObject(value=3), IRObject(value=4))
+    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == ' -> 3^ 4^'
+
+    op = F.Eye(3, IRObject(value=4))
+    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == ' -> 3^ 4^'
+
+    op = F.Eye(IRObject(value=3), 4)
+    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == ' -> 3^ 4^'
+
+
 def test_Expand():
     inp = IRTensor([10, 1])
     out = IRTensor([10, 2])
