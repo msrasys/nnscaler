@@ -337,6 +337,13 @@ class OptimizerConfig:
     # per-token-mean: average the gradients over all tokens
     #    you must specify `aggregate_outputs_fn` and return the number of tokens
     grad_reduction: str = 'mean'
+    # the divisor applied to gradients before all-reduce. If not set, the default
+    # divisor is `runtime_ngpus / plan_ngpus`. We divide the gradients to avoid overflow.
+    # However, if the gradients are in high precision or the user has known the range of
+    # the gradients, he/she can set a smaller divisor to improve the accuracy. Note that
+    # the gradients will be recovered by multiplying the divisor after all-reduce and before
+    # optimizer step.
+    grad_reduce_divisor: Optional[float] = None
     # the function to aggregate the outputs from all micro-batches
     # inputs: (list of local outputs, torch group)
     # output: AggregateOutputs
