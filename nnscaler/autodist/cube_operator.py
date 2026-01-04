@@ -108,7 +108,7 @@ class CubeOperator:
             for idx_dim, dim_anno in enumerate(shape_anno.dims):
                 for idx_id, identifier in enumerate(dim_anno.identifiers):
                     reduce_type = dim_anno.reduces[idx_id]
-                    if reduce_type != DimAnno.ReduceType.Freeze:
+                    if reduce_type != DimAnno.ReduceType.Freeze and self.ir_cell.input(idx_shape).dim_tracks[idx_dim].is_constant:
                         self.parallelable_dims.add(identifier)
                     if reduce_type == DimAnno.ReduceType.Sum:
                         self._has_sum_dim = True
