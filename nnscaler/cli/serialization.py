@@ -4,10 +4,15 @@
 from typing import Any, Callable, Protocol, Type
 from pathlib import Path
 import shutil
+import time
+import logging
 
 import torch
 
 from nnscaler.runtime.serialization import load, save
+
+
+logger = logging.getLogger(__name__)
 
 
 class _LoadProc(Protocol):
@@ -300,14 +305,12 @@ class Checkpointer:
             rank (`int`):
                 The rank of the checkpoint file to remove.
         """
-        self.flush()
-
-        for suffix in self.NAME_MAP.values():
+        suffixes = set(list(self.NAME_MAP.values()) + [self.suffix])
+        for suffix in suffixes:
             f = Path(dir) / f"{rank}{suffix}"
-            if f.exists():
-                f.unlink()
+            f.unlink(missing_ok=True)
             for extra_file in Path(dir).glob(f"{rank}{suffix}.*"):
-                extra_file.unlink()
+                extra_file.unlink(missing_ok=True)
 
     def copy_for_rank(self, src: str | Path, dst: str | Path, rank: int, symlink: bool = False) -> None:
         """
@@ -322,8 +325,8 @@ class Checkpointer:
             symlink (`bool`, *optional*, defaults to `False`):
                 Whether to create a symbolic link instead of copying the file.
         """
+        self.remove_for_rank(dst, rank)
 
-        self.flush()
         src = Path(src).resolve()
         dst = Path(dst).resolve()
         dst.mkdir(parents=True, exist_ok=True)
@@ -341,15 +344,33 @@ class Checkpointer:
                 raise ValueError("Cannot create symlink when source and destination are not in the same directory.")
 
         if symlink:
-            dst_f.symlink_to(Path('..') / src.name / src_f.name)
+            self._create_symlink_with_retry(Path('..') / src.name / src_f.name, dst_f)
             for extra_file in src.glob(f"{rank}{self.suffix}.*"):
                 dst_extra_file = Path(dst) / extra_file.name
-                dst_extra_file.symlink_to(Path('..') / src.name / extra_file.name)
+                self._create_symlink_with_retry(Path('..') / src.name / extra_file.name, dst_extra_file)
         else:
             shutil.copy2(src_f, dst_f)
             for extra_file in src.glob(f"{rank}{self.suffix}.*"):
                 dst_extra_file = Path(dst) / extra_file.name
                 shutil.copy2(extra_file, dst_extra_file)
+
+    @classmethod
+    def _create_symlink_with_retry(cls, src: str | Path, dst: str | Path) -> None:
+        dst = Path(dst)
+        dst.unlink(missing_ok=True)
+
+        # deletion in blobfuse is not immediate sometimes
+        # so we retry until success
+        while True:
+            try:
+                dst.symlink_to(Path(src))
+                break
+            except FileExistsError:
+                logger.warning(f"Creating symlink {dst} failed. Retrying...")
+                dst.unlink(missing_ok=True)
+                time.sleep(0.1)
+
+        logger.info(f"Symlink {dst} created.")
 
     def list_checkpoints(self, dir: str | Path) -> list[Path]:
         """
@@ -361,8 +382,6 @@ class Checkpointer:
             (`list[Path]`):
                 The list of checkpoint files in the directory.
         """
-        self.flush()
-
         p = Path(dir)
         files = []
         for suffix in self.NAME_MAP.values():

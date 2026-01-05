@@ -15,12 +15,12 @@ import builtins
 import torch
 import torch.utils
 import torch.utils.data
-import torch.utils.data.dataloader
+from torch.utils.data.dataloader import DataLoader
 import yaml
 import torch
 
 import nnscaler
-from nnscaler.utils import fields, fn_field, transform_recursively, load_type, copy_dynamic
+from nnscaler.utils import enforce_zero_num_worker, fields, fn_field, transform_recursively, load_type, copy_dynamic
 from nnscaler.parallel import ComputeConfig, build_optimizer, ReuseType, BroadcastGenFilesStrategy, _PREDEFINED_POLICIES
 from nnscaler.runtime.module import ParallelModule
 
@@ -615,6 +615,7 @@ class HookMapConfig:
     on_load_checkpoint: str = None
     after_load_checkpoint: str = None
     on_save_checkpoint: str = None
+    on_expire_checkpoint: str = None
 
 
 class ArgsTrainHook(TrainHook):
@@ -794,6 +795,10 @@ class TrainerArgs(PrecisionMixin, PolicyMixin):
             )
 
         self._vars = self.create_kwarg(self.vars)
+        # will be initialized lazily
+        # because it is heavy, and may not be used in some cases
+        # and it looks weird to initialize it eagerly in __post_init__
+        self._dummy_input = None
 
     @classmethod
     def from_cli(cls, argv: List[str]) -> 'TrainerArgs':
@@ -923,6 +928,28 @@ class TrainerArgs(PrecisionMixin, PolicyMixin):
                 return default
             var = var[part]
         return var
+
+    @property
+    def dummy_input(self):
+        if self._dummy_input is None:
+            self._dummy_input = self._load_dummy_input()
+            self._dummy_input = fix_input(self._dummy_input, self.input_dtype)
+            if self.dummy_sample_post_process_fn:
+                self._dummy_input = self.dummy_sample_post_process_fn(self, self._dummy_input)
+        return self._dummy_input
+
+    def _load_dummy_input(self):
+        if self.dummy_sample_gen_fn:
+            return self.dummy_sample_gen_fn(self)
+
+        with enforce_zero_num_worker(DataLoader):
+            dataset = self.create_dataset('train')
+            dataloader = self.create_dataloader('train', dataset)
+            assert dataloader.num_workers == 0, "The dataloader must have `num_workers=0`."
+            value = next(iter(dataloader))
+            if close_fn := getattr(dataloader, 'close', None):
+                close_fn()
+            return value
 
     def create_model(self) -> torch.nn.Module:
         kwargs = self.create_kwarg(self.model.args)

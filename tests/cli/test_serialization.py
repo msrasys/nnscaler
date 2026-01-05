@@ -137,6 +137,8 @@ def trainer_split_serializer_worker(tmp_path, symblink):
         '--checkpoint.symlink_best_and_last', str(symblink),
     ])
     trainer.run()
+    torch.distributed.barrier()
+
     ckpt_files = list_ckpt_files(ckpt_savedir)
     assert len(ckpt_files)/4 == min(10, trainer.total_train_steps_per_epoch * 4) + 2 # 2 for best/last
 
@@ -169,6 +171,7 @@ def trainer_split_serializer_worker(tmp_path, symblink):
     ])
     trainer.run()
 
+    torch.distributed.barrier()
     # create merged checkpoint
     ckpt1_savedir = save_dir / 'ckpt1'
     ckpt1_savedir.mkdir(parents=True, exist_ok=True)
@@ -221,6 +224,9 @@ def trainer_split_serializer_worker(tmp_path, symblink):
         '--checkpoint.symlink_best_and_last', str(symblink),
     ])
     trainer.run()
+
+    torch.distributed.barrier()
+
     ckpt0_files1 = list_ckpt_files(ckpt0_savedir)
 
     torch.distributed.barrier()
