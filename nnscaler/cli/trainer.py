@@ -606,7 +606,7 @@ class Trainer:
             current_epoch -= 1
 
         if checkpoint_config.save_type == 'sharded':
-            model_state_dict= self.model.state_dict()
+            model_state_dict = self.model.state_dict()
             optimizer_state_dict = self.optimizer.state_dict()
         elif checkpoint_config.save_type == 'deduped':
             model_state_dict, optimizer_state_dict = nnscaler.deduped_state_dict(

@@ -1846,7 +1846,7 @@ def merge_state_dicts(
         module_prefix = '.'.join(k)
         opt_state_dicts_for_merge = None if opt_state_dicts is None else opt_state_dicts[module_prefix]
 
-        merge_partial_states_zero_idx_maps = [(e.model_idx2opt_idx, e.opt_idx2ranks, e.zero) for e in extra_states]
+        merge_partial_states_zero_idx_maps = [(e.model_idx2opt_idx, e.opt_idx2ranks, e.zero, e.zero3_param_metadata) for e in extra_states]
         if not extra_states[0].compute_config.use_zero: # all ranks should have the same use_zero
             merge_partial_states_zero_idx_maps = None
         merged_state_dict, merged_opt_state_dict = ParallelModule.merge_state_dicts(

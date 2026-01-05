@@ -100,6 +100,8 @@ def pas_tp(graph: IRGraph, cfg: 'ComputeConfig'):
     random tensor parallelism inside a scale unit, and dp across scale units
     """
     ngpus = cfg.plan_ngpus
+    pas_cfg = cfg.pas_config
+    enable_random_replicated = pas_cfg.get('enable_random_replicated', False)
     # get the current random state
     state = random.getstate()
 
@@ -114,7 +116,7 @@ def pas_tp(graph: IRGraph, cfg: 'ComputeConfig'):
             continue
         if isinstance(node, IRDimops):
             configs = node.transform_space()
-            if len(configs) == 0:
+            if len(configs) == 0 or (enable_random_replicated and random.random() < 0.5):
                 _replica(graph, node, devs)
             else:
                 configs = sorted(configs, reverse=True,
