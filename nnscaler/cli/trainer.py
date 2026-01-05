@@ -119,19 +119,6 @@ class Trainer:
     def _fix_input(self, input):
         return fix_input(input, self.train_args.input_dtype)
 
-    def _load_dummy_input(self):
-        if dummy_sample_gen_fn := self.train_args.dummy_sample_gen_fn:
-            return dummy_sample_gen_fn(self.train_args)
-
-        with enforce_zero_num_worker(DataLoader):
-            dataset = self.train_args.create_dataset('train')
-            dataloader = self.train_args.create_dataloader('train', dataset)
-            assert dataloader.num_workers == 0, "The dataloader must have `num_workers=0`."
-            value = next(iter(dataloader))
-            if close_fn := getattr(dataloader, 'close', None):
-                close_fn()
-            return value
-
     def _setup(self):
         if is_running_distributed():
             nnscaler.init()
@@ -150,10 +137,7 @@ class Trainer:
         compile_only = self.train_args.compile_mode
 
         # load a dummy input from training dataset
-        self.dummy_input = self._load_dummy_input()
-        self.dummy_input = self._fix_input(self.dummy_input)
-        if self.train_args.dummy_sample_post_process_fn:
-            self.dummy_input = self.train_args.dummy_sample_post_process_fn(self.train_args, self.dummy_input)
+        self.dummy_input = self.train_args.dummy_input
 
         pmodel = parallelize_model(
             self.train_args, self.dummy_input,
@@ -226,7 +210,7 @@ class Trainer:
         # (see `train_args.optimizer.grad_reduction`` handling in `train_epoch`).
         # This is useful to avoid overflow when the gradients are large.
         def reducer_pre_hook(reducer, grad):
-            grad.div_(self.train_args.scaling_factor)
+            grad.div_(self.train_args.optimizer.grad_reduce_divisor or self.train_args.scaling_factor)
         self.optimizer.register_reducer_pre_hook(reducer_pre_hook)
         # Currently we never pass `last_epoch` to its constructor
         self.lr_scheduler = self.train_args.create_lr_scheduler(self.optimizer)
@@ -236,6 +220,7 @@ class Trainer:
             self.model,
             self.optimizer,
             self.lr_scheduler,
+            self.checkpointer,
         ]
         component_hooks = []
         for component in supported_hook_components:
@@ -621,7 +606,7 @@ class Trainer:
             current_epoch -= 1
 
         if checkpoint_config.save_type == 'sharded':
-            model_state_dict= self.model.state_dict()
+            model_state_dict = self.model.state_dict()
             optimizer_state_dict = self.optimizer.state_dict()
         elif checkpoint_config.save_type == 'deduped':
             model_state_dict, optimizer_state_dict = nnscaler.deduped_state_dict(
@@ -661,11 +646,6 @@ class Trainer:
         if checkpoint_config.save_last:
             logger.info(f"Saving checkpoint as the last checkpoint.")
 
-            # remove the old symlink or file
-            self.checkpointer.remove_for_rank(
-                save_dir / self.checkpointer.get_last_dir_name(),
-                self.rank
-            )
             self.checkpointer.copy_for_rank(
                 ckpt_file.parent,
                 save_dir / self.checkpointer.get_last_dir_name(),
@@ -678,11 +658,6 @@ class Trainer:
             logger.info(f"Best loss updated: {self.train_status.best_loss:.3f} -> {loss:.3f}")
             logger.info(f"Saving checkpoint as the best checkpoint.")
 
-            # remove the old symlink or file
-            self.checkpointer.remove_for_rank(
-                save_dir / self.checkpointer.get_best_dir_name(),
-                self.rank
-            )
             self.checkpointer.copy_for_rank(
                 ckpt_file.parent,
                 save_dir / self.checkpointer.get_best_dir_name(),
@@ -701,6 +676,14 @@ class Trainer:
 
         torch.distributed.barrier()
 
+    @classmethod
+    def _get_dependent_dirs(cls, ckpt_dir):
+        target_dirs = set()
+        for p in Path(ckpt_dir).glob('*'):
+            if p.is_symlink():
+                target_dirs.add(p.resolve().parent.name)
+        return target_dirs
+
     def _expire_checkpoints(self):
         if not self.train_args.checkpoint.keep_last_n_checkpoints:  # keep all
             return
@@ -718,6 +701,8 @@ class Trainer:
 
         # (step, ckpt_name) pairs
         checkpoint_info = [(int(p.split('-')[1]), p) for p in checkpoints]
+        # map from ckpt_name to step
+        checkpoint_info_map = {p[1]: p[0] for p in checkpoint_info}
         checkpoint_info.sort()
         expire_list = [c[1] for c in checkpoint_info[:-self.train_args.checkpoint.keep_last_n_checkpoints]]
 
@@ -726,17 +711,21 @@ class Trainer:
         for ckpt_dir in [best_ckpt, last_ckpt]:
             if not ckpt_dir.exists():
                 continue
-            for p in self.checkpointer.list_checkpoints(ckpt_dir):
-                if p.is_symlink():
-                    ckpt_name = p.resolve().parent.name
-                    if ckpt_name in expire_list:
-                        expire_list.remove(ckpt_name)
-                        logger.info('Keep old checkpoint `%s` because it is symbol linked in best or last.', ckpt_name)
-                break # just check the first file is enough
+            for ckpt_name in self._get_dependent_dirs(ckpt_dir):
+                if ckpt_name in expire_list:
+                    expire_list.remove(ckpt_name)
+                    logger.info('Keep old checkpoint `%s` because it is symbol linked in best or last.', ckpt_name)
 
         for ckpt_name in expire_list:
             logger.info('Removing old checkpoint: %s', ckpt_name)
-            shutil.rmtree(save_dir / ckpt_name)
+            self.hook.on_expire_checkpoint(self, checkpoint_info_map[ckpt_name], save_dir / ckpt_name)
+            try:
+                shutil.rmtree(save_dir / ckpt_name)
+            except FileNotFoundError:
+                # may have been removed by other processes (when the storage is shared)
+                pass
+            except Exception as e:
+                logger.warning('Error when expiring checkpoint `%s`: %s. Will try later.', ckpt_name, e)
 
     def _global_batch_iterator(self, num_skip_first=0, stage='train'):
         if stage == 'train':
@@ -1057,7 +1046,7 @@ class Trainer:
             self.hook.after_sync_grad(self)
 
             # scale gradients
-            multiplier = self.train_args.scaling_factor
+            multiplier = self.train_args.optimizer.grad_reduce_divisor or self.train_args.scaling_factor
             if self.train_args.optimizer.grad_reduction == 'sum':
                 # do nothing. `multiplier` is already correct
                 pass

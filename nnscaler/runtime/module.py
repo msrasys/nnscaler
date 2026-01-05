@@ -434,7 +434,8 @@ class CubeModule(torch.nn.Module):
     @staticmethod
     def merge_model_state_dicts(
         state_dicts: List[Dict],
-        fullmaps: List[Dict[str, AttrMeta]]
+        fullmaps: List[Dict[str, AttrMeta]],
+        zero_idx_maps: Optional[List[Dict]] = None
     ):
         """Merge model states from multiple shard into a single-model state.
         Here we assume the order of state_dicts and fullmaps are aligned, and is the same as the rank order.
@@ -446,6 +447,7 @@ class CubeModule(torch.nn.Module):
         Args:
             state_dicts (List[Dict[str, torch.Tensor]]): per-rank local model state dict from model.state_dict()
             fullmaps (List[Dict[str, AttrMeta]]): per-rank fullmap
+            zero_idx_maps (Optional[List[Dict]]): zero information for the model, `None` if zero is not enabled
 
         Returns:
             full_state_dicts (List[Dict[str, torch.Tensor]]): Full model state dict
@@ -461,11 +463,12 @@ class CubeModule(torch.nn.Module):
         state_dict_merge_track: Dict[str, Set[Tuple[Tuple[Any, Any, Any], ...]]] = {}
         # the fill progress of zero3 parameters
         #  key: param name
-        #  value: Dict[ tuple(start, step, stop) , filled size]
+        #  value: Dict[ tuple(start, step, stop) , filled chunk]
         #  used to track how many elements have been filled for each zero3 parameter
-        zero3_current_filled: Dict[str, Dict[Tuple[Tuple[int, int, int], ...], int]] = {}
+        zero3_current_filled: Dict[str, Dict[Tuple[Tuple[int, int, int], ...], List[Tuple[int, int]]]] = {}
+        zero3_param_metadatas = [info[-1] for info in zero_idx_maps] if zero_idx_maps is not None else [None] * len(state_dicts)
         # gather param/buffer full tensor
-        for rank, (model_state_dict, local_fullmap) in enumerate(zip(state_dicts, fullmaps)):
+        for rank, (model_state_dict, local_fullmap, zero3_param_metadata) in enumerate(zip(state_dicts, fullmaps, zero3_param_metadatas)):
             for local_name, meta in local_fullmap.items():
                 if local_name not in model_state_dict:
                     # the parameter may not in model_state_dict (deduped with optimization)
@@ -496,27 +499,33 @@ class CubeModule(torch.nn.Module):
                         # we assume zero3 is on when dest_tensor.shape != partial_tensor.shape
                         if len(partial_tensor.shape) != 1:
                             raise ValueError("Invalid tensor as a ZeRO3 parameter, expected a 1D tensor.")
-                        fill_start = zero3_current_filled.setdefault(meta.orig_name, {}).setdefault(state_dict_merge_track_id, 0)
-                        fill_len = partial_tensor.numel()
-                        if fill_start >= dest_tensor.numel():
+                        curr_filled = zero3_current_filled.setdefault(meta.orig_name, {}).setdefault(state_dict_merge_track_id, [])
+                        curr_z3_info = zero3_param_metadata[local_name]
+                        curr_start, curr_end = curr_z3_info['start'], curr_z3_info['end']
+                        fill_len = curr_end - curr_start
+                        if (curr_start, curr_end) in curr_filled:
                             # already filled, let's check consistency
-                            fill_start = fill_start % dest_tensor.numel()
-                            if fill_start + fill_len > dest_tensor.numel():
-                                # remove padding part
-                                fill_len = dest_tensor.numel() - fill_start
-                            if not CubeModule._safe_tensor_equal(dest_tensor.view(-1)[fill_start: fill_start + fill_len], partial_tensor[0:fill_len]):
+                            if not CubeModule._safe_tensor_equal(dest_tensor.view(-1)[curr_start: curr_end], partial_tensor[0:fill_len]):
                                 raise ValueError(f"Conflict in merging {meta.orig_name} from rank {rank}")
                         else:
-                            if fill_start + fill_len > dest_tensor.numel():
-                                # remove padding part
-                                fill_len = dest_tensor.numel() - fill_start
                             old_shape = dest_tensor.shape
                             dest_tensor = dest_tensor.reshape(-1)
-                            dest_tensor[fill_start: fill_start + fill_len] = partial_tensor[0: fill_len]
+                            dest_tensor[curr_start: curr_end] = partial_tensor[0: fill_len]
                             full_model_state_dict[meta.orig_name][meta.slicers] = dest_tensor.view(old_shape)
+                            zero3_current_filled[meta.orig_name][state_dict_merge_track_id].append((curr_start, curr_end))
 
-                        zero3_current_filled[meta.orig_name][state_dict_merge_track_id] += fill_len
-
+        if zero3_current_filled:
+            # verify all zero3 parameters are fully filled
+            for param_name, slicers2filled in zero3_current_filled.items():
+                for slicers, filled_chunks in slicers2filled.items():
+                    full_size = 1
+                    for s in slicers:
+                        full_size *= s[-1] - s[0]
+                    covered_size = 0
+                    for start, end in filled_chunks:
+                        covered_size += end - start
+                    if full_size != covered_size:
+                        raise ValueError(f'Uncovered ZeRO3 parameter {param_name} with slicers {slicers}, full size {full_size}, covered size {covered_size}')
         return full_model_state_dict
 
     @staticmethod
@@ -599,7 +608,7 @@ class CubeModule(torch.nn.Module):
         # help understand the whole logic. In other words, the real plan_ngpus is <= len(model_state_dicts).
         plan_ngpus = len(model_state_dicts)
         # gather model states
-        full_model_state_dict = CubeModule.merge_model_state_dicts(model_state_dicts, fullmaps[0: plan_ngpus])
+        full_model_state_dict = CubeModule.merge_model_state_dicts(model_state_dicts, fullmaps[0: plan_ngpus], zero_idx_maps)
         _logger.info('finish merge model states')
         if optim_state_dicts is None:
             return full_model_state_dict, None
@@ -704,7 +713,9 @@ class CubeModule(torch.nn.Module):
             return opt_states
 
         def _merge_opt_zero(param_shape, worker_idx, param_idx):
-            if len(zero_idx_maps[worker_idx]) == 3:
+            if len(zero_idx_maps[worker_idx]) == 4:
+                model_idx2opt_idx, opt_idx2ranks, zero_version, _ = zero_idx_maps[worker_idx]
+            elif len(zero_idx_maps[worker_idx]) == 3:  # backward compatibility
                 model_idx2opt_idx, opt_idx2ranks, zero_version = zero_idx_maps[worker_idx]
             else:  # backward compatibility
                 assert len(zero_idx_maps[worker_idx]) == 2
@@ -966,6 +977,7 @@ class ZeroMetadata:
     # 1: zero1
     # > 1: zero3
     zero: int = 0
+    zero3_param_metadata: Optional[Dict[str, Dict]] = None
 
 
 @dataclass
@@ -1540,7 +1552,8 @@ class ParallelModule(CubeModule):
         return ZeroMetadata(
             model_idx2opt_idx=model_idx2opt_idx,
             opt_idx2ranks=opt_idx2ranks,
-            zero=self.compute_config.use_zero
+            zero=self.compute_config.use_zero,
+            zero3_param_metadata=self._zero3_param_metadata,
         )
 
     def _get_zero_subranks(self, reducer: Reducer) -> Tuple[int, List[int]]:
