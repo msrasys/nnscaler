@@ -261,6 +261,9 @@ class SPMDSolver:
             if len(consumers) == 1:
                 continue
             _logger.info(f'find shared parameter {param} in {consumers}')
+            if self.autodist_config.disable_shared_param_constraint:
+                _logger.info(f'disable shared parameter constraint for {param}')
+                continue
             for consumer in consumers:
                 if not isinstance(consumer, IRDimops):
                     # always replicate non-dimops
@@ -358,10 +361,15 @@ class SPMDSolver:
                             if not selected_pc.replica_allowed:
                                 return False
                         else:
-                            allowed_pids = [
-                                operator.pos2dim_id(pos)
-                                for pos in selected_pc.allowed_partition_dims
-                            ]
+                            allowed_pids = list()
+                            for pos in selected_pc.allowed_partition_dims:
+                                # When allowed dims in provided partition constraints are not correct generate warning
+                                # If there is no valid partitions for the operator, the solver will throw exception later.
+                                try:
+                                    cur_allowed_pid = operator.pos2dim_id(pos)
+                                    allowed_pids.append(cur_allowed_pid)
+                                except Exception as e:
+                                    _logger.warning(f"Failed to get allowed partition id for {selected_pc}'s {pos}: {e}")
                             if u not in allowed_pids:
                                 return False
 
@@ -681,11 +689,10 @@ class SPMDSolver:
                     bw_comm_time = 0
                 intra_time = micro_batch_num * (fw_comm_time + bw_comm_time)
                 # double check the follow chain
-                if self.get_father_id(op_idx) == self.get_father_id(
-                        producer) and intra_time == 0:
-                    if src_p.operator.ir_cell.mirror is not None:
-                        if self.p_fathers[op_idx][
-                                partition_idx] != self.p_fathers[producer][k]:
+                # if `intra_time` (forward + backward) is 0, we assume both partitions are in the same follow chain
+                if self.get_father_id(op_idx) == self.get_father_id(producer) and intra_time == 0:
+                    if src_p.operator.ir_cell.mirror is not None and tgt_p.operator.ir_cell.mirror is not None:
+                        if self.p_fathers[op_idx][partition_idx] != self.p_fathers[producer][k]:
                             _logger.warning(
                                 f'Unexpected comm cost, set to inf: {src_p.ir_cell} to {tgt_p.ir_cell}'
                             )

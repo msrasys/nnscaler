@@ -3,6 +3,7 @@
 
 import os
 import copy
+import logging
 
 from typing import List, Optional, Tuple, Dict, Any, Union
 from dataclasses import dataclass, field, is_dataclass, asdict
@@ -16,6 +17,7 @@ try:
 except ImportError:
     UnionType = None  # for python < 3.10
 
+logger = logging.getLogger(__name__)
 
 _TYPE_KEY = '__type'
 _VALUE_TYPE_KEY = '__value_type'
@@ -390,6 +392,8 @@ def _deserialize_object(value, value_type):
             else:
                 raise ValueError(f"Failed to deserialize {value} to {value_type}")
         if _is_primitive_type(value_type):
+            if callable(value):
+                logger.warning(f'{value} is callable, converting to {value_type} may not work as expected.')
             return value_type(value)
     except Exception as ex:
         raise ValueError(f"Failed to deserialize {value} to {value_type}") from ex

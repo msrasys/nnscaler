@@ -55,6 +55,7 @@ class SignFx2Op:
 
     kOpMap = {
         # __tnmtemplate('Dropout'): function.nnDropout,
+        __ttemplate('dot'): function.Dot,
         __fcntemplate('linear'): function.Linear,
         __ftemplate('dropout') : function.Dropout,
         __ttemplate('sum'): function.Sum,
@@ -180,6 +181,7 @@ class SignFx2Op:
         __ttemplate('rand_like'): function.RandLike,
         __ttemplate('randn'): function.Randn,
         __ttemplate('randn_like'): function.RandnLike,
+        __ttemplate('eye'): function.Eye,
         __ttemplate('clone'): function.Clone,
 
         '_operator.is_': function.Is,

@@ -1,6 +1,7 @@
 #  Copyright (c) Microsoft Corporation.
 #  Licensed under the MIT License.
 
+import inspect
 from typing import Generator, Iterable, List, Any, Optional, Tuple, Dict
 import logging
 
@@ -35,7 +36,10 @@ class IRValue:
         return self.name
 
 
-def _safe_repr_value(val: Any, prefix_attr: Optional[str] = None) -> Any:
+def _safe_repr_value(val: Any, prefix_attr: Optional[str] = None,
+    *,
+    strip_star: bool = True,
+) -> Any:
     """
     Return repr-able value of a tensor or value.
     For tensor, return IRValue({prefix}{tensor.name}_{tensor.tid})
@@ -44,6 +48,7 @@ def _safe_repr_value(val: Any, prefix_attr: Optional[str] = None) -> Any:
     Args:
         val (Any): tensor or non-tensor value
         prefix_attr (str): prefix to the tensor name if the tensor is an attribute
+        strip_star (bool): whether to strip leading * for *args and **kwargs
     Returns:
         the val that can be repr safely
     """
@@ -51,20 +56,22 @@ def _safe_repr_value(val: Any, prefix_attr: Optional[str] = None) -> Any:
         return val
     if isinstance(val, IRObject):
         tensor_name = val.name
+        if strip_star:
+            tensor_name = tensor_name.lstrip('*')
         tensor_name = tensor_name.replace('.', '_')
         name = '_'.join([tensor_name, str(val.tid)])
         if prefix_attr is not None and val.is_attr():
             name = prefix_attr + name
         return IRValue(name)
     elif isinstance(val, slice):
-        return slice(_safe_repr_value(val.start, prefix_attr), _safe_repr_value(val.stop, prefix_attr), _safe_repr_value(val.step, prefix_attr))
+        return slice(_safe_repr_value(val.start, prefix_attr, strip_star=strip_star), _safe_repr_value(val.stop, prefix_attr, strip_star=strip_star), _safe_repr_value(val.step, prefix_attr, strip_star=strip_star))
     elif isinstance(val, dict):
-        return {_safe_repr_value(k, prefix_attr): _safe_repr_value(v, prefix_attr) for k, v in val.items()}
+        return {_safe_repr_value(k, prefix_attr, strip_star=strip_star): _safe_repr_value(v, prefix_attr, strip_star=strip_star) for k, v in val.items()}
     elif isinstance(val, list):
-        return [_safe_repr_value(v, prefix_attr) for v in val]
+        return [_safe_repr_value(v, prefix_attr, strip_star=strip_star) for v in val]
     elif isinstance(val, tuple):
         # TODO: support subclasses of tuple, like torch.Size?
-        return tuple(_safe_repr_value(v, prefix_attr) for v in val)
+        return tuple(_safe_repr_value(v, prefix_attr, strip_star=strip_star) for v in val)
     elif isinstance(val, (int, str, bool, float, type(None), bytes, type(Ellipsis), torch.dtype)):
         return val
     elif isinstance(val, torch.device):
@@ -89,7 +96,10 @@ class CodeEmission:
     def node_name(self, node: IRCell) -> str:
         return f"{node.name}{node.cid}"
 
-    def tensor_name(self, val: Any, prefix_attr: Optional[str] = None) -> str:
+    def tensor_name(self, val: Any, prefix_attr: Optional[str] = None,
+        *,
+        strip_star: bool = True,
+    ) -> str:
         """
         Return representation of a value or a tensor.
         For tensor, return the {prefix}{tensor.name}_{tensor.tid}
@@ -98,10 +108,13 @@ class CodeEmission:
         Args:
             val (Any): tensor or non-tensor value
             prefix_attr (Optional[str]): prefix to the tensor name if the tensor is an attribute
+            strip_star (bool): whether to strip leading * for *args and **kwargs
+                You should set it to False when you want to generate code for
+                function arguments.
         Returns:
             representation of the val in str
         """
-        return repr(_safe_repr_value(val, prefix_attr))
+        return repr(_safe_repr_value(val, prefix_attr, strip_star=strip_star))
 
     def complex_name(self, val: Any, prefix_attr: Optional[str]=None) -> str:
         """
@@ -225,8 +238,35 @@ class FuncEmission(CodeEmission):
         emit_rule = self._emit_rules.map(signature)
         body = emit_rule(node, inputs, kwargs, runtime_devid, plan_ndevs, runtime_ndevs)
 
+        def _to_tuple_str(names: List[str]) -> str:
+            if len(names) == 1:
+                return f'({names[0]}, )'
+            return '(' + ', '.join(names) + ')'
+
+        def _insert_hook(outputs=None, is_pre: bool=False, output_len: int = 0):
+            hook = node.pre_hook if is_pre else node.post_hook
+            if not hook:
+                return
+            module_path = inspect.getmodule(hook).__name__
+            fsig = f'{module_path}.{hook.__name__}'
+            kw_pairs = list()
+            for key, val in kwargs.items():
+                code = f'{key}={val}'
+                kw_pairs.append(code)
+            codes.append(
+                f'{fsig}(self, ' +
+                    repr(node.hook_meta) + ', ' +
+                    f"{_to_tuple_str(inputs)}, " +
+                    f"dict({', '.join(kw_pairs)})" +
+                    ('' if is_pre else ', ' + outputs) +
+                ')'
+            )
+
+        _insert_hook(is_pre=True)
+
         if len(node.outputs()) == 0:
             codes.append(body)
+            _insert_hook(is_pre=False, outputs='None')
         else:
             irobj_path = {}
             def r(t, current_path):
@@ -245,8 +285,12 @@ class FuncEmission(CodeEmission):
             if all(len(x) == 1 for x in irobj_path.values()):
                 # if all IRObjects are leafs, we can directly assign the output
                 outputs = [self.tensor_name(t) for t in node.outputs()]
-                outputs = ', '.join(outputs)
-                codes.append(f'{outputs} = {body}')
+                outputs_str = ', '.join(outputs)
+                codes.append(f'{outputs_str} = {body}')
+                _insert_hook(
+                    outputs=outputs_str if len(node.outputs()) == 1 else _to_tuple_str(outputs),
+                    is_pre=False
+                )
             else:
                 outputs = []
                 im_outputs = []
@@ -258,7 +302,12 @@ class FuncEmission(CodeEmission):
                         im_ouptut = self.tensor_name(IRObject('im_output'))
                         im_outputs.append(im_ouptut)
                         outputs.append(im_ouptut)
-                codes.append(f'{", ".join(outputs)} = {body}')
+                outputs_str = ', '.join(outputs)
+                codes.append(f'{outputs_str} = {body}')
+                _insert_hook(
+                    outputs=outputs_str if len(node.outputs()) == 1 else _to_tuple_str(outputs),
+                    is_pre=False
+                )
 
                 for t, path in irobj_path.items():
                     if len(path) == 1: # immediate output, skip

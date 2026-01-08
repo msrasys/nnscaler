@@ -17,11 +17,18 @@ from torch.utils.data.distributed import DistributedSampler
 
 import numpy as np
 
-from nnscaler.parallel import ComputeConfig, parallelize, build_optimizer, merge_state_dicts, load_merged_state_dict
+from nnscaler.parallel import (
+    ComputeConfig, parallelize,
+    build_optimizer,
+    merge_state_dicts,
+    load_merged_state_dict,
+    load_merged_state_dict_from_rank,
+    trimmed_broadcast_merged_state_dict,
+)
 from nnscaler.runtime.module import ParallelModule, ExtraState
 from nnscaler.runtime.gnorm import calcuate_gnorm
 
-from .common import CubeLinear, init_random, init_distributed, PASMegatron
+from .common import CubeLinear, init_random, init_distributed, PASMegatron, assert_equal
 from ..launch_torchrun import launch_torchrun, clone_to_cpu_recursively
 from ..utils import replace_all_device_with, clear_dir_on_rank0
 
@@ -345,6 +352,23 @@ def _train(model: torch.nn.Module, num_replicas, rank, start, end, ckpt_dir, inf
             optimizer_from_merged, merged_opt_state_dict,
         )
 
+        model_from_merged_rank = type(model)()
+        optimizer_from_merged_rank = build_optimizer(model_from_merged_rank, torch.optim.Adam, lr=0.01)
+        load_merged_state_dict_from_rank(
+            model_from_merged_rank, merged_model_state_dict if torch.distributed.get_rank() == 0 else None,
+            optimizer_from_merged_rank, merged_opt_state_dict if torch.distributed.get_rank() == 0 else None,
+        )
+        assert_equal(model_from_merged.state_dict(), model_from_merged_rank.state_dict())
+        assert_equal(optimizer_from_merged.state_dict(), optimizer_from_merged_rank.state_dict())
+
+        trimmed_model_state_dict, trimmed_opt_state_dict = trimmed_broadcast_merged_state_dict(
+            model_from_merged_rank, merged_model_state_dict if torch.distributed.get_rank() == 0 else None,
+            optimizer_from_merged_rank, merged_opt_state_dict if torch.distributed.get_rank() == 0 else None,
+        )
+        assert_equal(dict(model_from_merged.state_dict()), trimmed_model_state_dict)
+        assert_equal(optimizer_from_merged.state_dict()['state'], trimmed_opt_state_dict['state'])
+        assert_equal(optimizer_from_merged.state_dict()['param_groups'], trimmed_opt_state_dict['param_groups'])
+
         # check merged model
         result_orig_model_state_dict = model.state_dict()
         result_merged_model_state_dict = model_from_merged.state_dict()
@@ -425,6 +449,25 @@ def _train(model: torch.nn.Module, num_replicas, rank, start, end, ckpt_dir, inf
             'model': merged_model_state_dicts,
             'optimizer': merged_optimizer_state_dict
         }, ckpt_merged_file)
+        from nnscaler.runtime.serialization import convert, load
+        from contextlib import ExitStack
+        ckpt_st_file_template = 'ckpt_{rank}_{start}.safetensors'
+        ckpt_st_files = [ckpt_dir / ckpt_st_file_template.format(rank=i, start=end) for i in range(torch.distributed.get_world_size())]
+        for pt, st in zip(ckpt_files, ckpt_st_files):
+            convert(pt, st, src_format='pt', dst_format='safetensors')
+        ckpt_st_state_dict_loaders = [load(f, lazy=True) for f in ckpt_st_files]
+        with ExitStack() as stack:
+            ckpt_st_state_dicts = []
+            for f in ckpt_st_state_dict_loaders:
+                ckpt_st_state_dicts.append(stack.enter_context(f).get_lazy_data())
+            model_st_state_dicts = [ckpt['model'] for ckpt in ckpt_st_state_dicts]
+            optimizer_st_state_dicts = [ckpt['optimizer'] for ckpt in ckpt_st_state_dicts]
+            merged_model_st_state_dicts, merged_optimizer_st_state_dict = merge_state_dicts(
+                model_st_state_dicts, optimizer_st_state_dicts
+            )
+            assert_equal(merged_model_state_dicts, merged_model_st_state_dicts)
+            assert_equal(merged_optimizer_state_dict, merged_optimizer_st_state_dict)
+
     torch.distributed.barrier()
     return results
 
@@ -550,7 +593,7 @@ def _gpu_merge_worker():
     init_distributed()
     with clear_dir_on_rank0(Path(tempfile.gettempdir()) / 'cube_test_ckpt_merge') as tempdir:
         compiled_module = _create_cube_module('data',
-            ComputeConfig(2, 2, use_zero=True),
+            ComputeConfig(2, 4, use_zero=True),
             tempdir,
             'whole',
         )
@@ -565,6 +608,6 @@ def _gpu_merge_worker():
         )
 
 
-@pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.device_count() < 2, reason='lack of gpu devices')
+@pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.device_count() < 24, reason='lack of gpu devices')
 def test_checkpoint_merge():
-    launch_torchrun(2, _gpu_merge_worker)
+    launch_torchrun(4, _gpu_merge_worker)

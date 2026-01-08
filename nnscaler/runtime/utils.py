@@ -13,7 +13,7 @@ class MicroBatchDataLoader:
     """
     MicroBatchDataLoader is used for scenarios of gradient accumulation,
     where a training iteration will have multiple data samples and perform
-    multiple forward and backward on each sample (i.e., each refers to 
+    multiple forward and backward on each sample (i.e., each refers to
     as a micro-batch).
 
     To support more flexible training patterns, e.g., pipeline parallelism,
@@ -25,7 +25,7 @@ class MicroBatchDataLoader:
     ```python
     # compilation phase
     dataloader = MicroBatchDataLoader([(input1,),]) # only need one micro-batch
-    
+
     @nnscaler.compile(model, dataloader, ...)
     def train_iter(model, dataloader):
         input1 = next(dataloader)
@@ -36,9 +36,9 @@ class MicroBatchDataLoader:
     ...
 
     # runtime phase
-    
+
     for mini_batch_samples in iter(dataloader):
-        # mini_batch_samples are sample list for 
+        # mini_batch_samples are sample list for
         # all micro-batches in one iteration.
         dl = MicroBatchDataLoader(mini_batch_samples)
         loss =train_iter(model, dl)
@@ -68,7 +68,7 @@ class MicroBatchDataLoader:
     def __iter__(self):
         self._idx = 0
         return self
-    
+
     def __next__(self):
         if self._idx == self.nmicros:
             raise StopIteration
@@ -77,10 +77,10 @@ class MicroBatchDataLoader:
         if self.cycle:
             self._idx = self._idx % self.nmicros
         return batch
-    
+
     def __len__(self):
         return self.nmicros
-    
+
     def get_micro_batch(self, idx: int):
         idx = idx % self.nmicros if self.cycle else idx
         return self.samples[idx]

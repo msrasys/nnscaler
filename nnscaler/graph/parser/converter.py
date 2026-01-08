@@ -12,7 +12,7 @@ from nnscaler.graph.parser.register import CustomizedOps
 from nnscaler.graph import IRGraph
 from nnscaler.flags import CompileFlag
 
-from nnscaler.graph.parser import FxModuleParser
+from nnscaler.graph.parser import parse_fx_module
 from nnscaler.graph.tracer import concrete_trace
 from nnscaler.graph.tracer.wrap_utils import Location, is_autograd_apply, LeafWrapInfo
 from nnscaler.graph.tracer.torch_fx_patcher import side_effectful_inplace_ops
@@ -30,8 +30,11 @@ class no_save_tensor_hook(saved_tensors_hooks):
     """skip saving tensors for backward since tracer only traces forward"""
     def __init__(self):
         def pack(x):
-            return None
+            return (x.shape, x.dtype, x.device)
         def unpack(x):
+            # in pytorch 2.4.0-, torch.compile will call backward when tracing graph
+            if torch.__version__ < (2, 4, 0):
+                return torch.empty(x[0], dtype=x[1], device=x[2])
             raise RuntimeError("not expecting backward to be called on this tensor")
         super().__init__(pack, unpack)
 
@@ -146,7 +149,7 @@ def to_ir_graph(
     _logger.info(f"constant folding {'enabled' if constant_folding else 'disabled'} to parse graph")
 
     with no_save_tensor_hook():
-        inputs, nodes, outputs = FxModuleParser.parse(
+        inputs, nodes, outputs = parse_fx_module(
             traced_model, dummy_input,
             attr_savedir=attr_savedir,
             constant_folding=constant_folding,

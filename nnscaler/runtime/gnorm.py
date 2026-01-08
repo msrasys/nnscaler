@@ -40,7 +40,7 @@ class TidReplicaInfo:
 
 
 def _calc_grad_shape(slicers_list):
-    # caculate the shape of each full parameters/grads
+    # calculate the shape of each full parameters/grads
     tid2shape = {}
     for rank_slicers in slicers_list:
         for tid, slicers in rank_slicers.items():
@@ -50,7 +50,7 @@ def _calc_grad_shape(slicers_list):
                 # slicer: (start, end, step)
                 if slicer.stop > tid2shape[tid][i]:
                     tid2shape[tid][i] = slicer.stop
-    # caculate the number of replicas of each model parameter
+    # calculate the number of replicas of each model parameter
     tid2nreplicas = {}
     for rank_slicers in slicers_list:
         for tid, slicers in rank_slicers.items():
@@ -117,7 +117,7 @@ def _calc_grad_replicas(tid2ranks_list: List[Dict[int, Tuple[int]]]) -> Dict[int
     Returns:
         tid2nreplicas: dict, tid -> TidReplicaInfo
     """
-    # caculate the number of replicas of each model parameter
+    # calculate the number of replicas of each model parameter
     tid2nreplicas = {}
     tid2ranksset = defaultdict(set)
     for tid2ranks in tid2ranks_list:
@@ -135,7 +135,7 @@ def _calc_grad_replicas(tid2ranks_list: List[Dict[int, Tuple[int]]]) -> Dict[int
     return tid2nreplicas
 
 
-def prepare_for_grad_clip(cube_model: 'CubeModule', is_zero: bool) -> Dict[int, List[torch.nn.Parameter]]:
+def prepare_for_grad_clip(cube_model: 'CubeModule', use_zero: int) -> Dict[int, List[torch.nn.Parameter]]:
     params_info_for_gnorm = cube_model.parameters_for_calc_gnorm()
     tid2ranks = {}
     tid2info_list_seq = {}
@@ -174,7 +174,7 @@ def prepare_for_grad_clip(cube_model: 'CubeModule', is_zero: bool) -> Dict[int, 
         # multiplied by the number of ZeRO groups. Multiplying the number of pure replicated is easy
         # to understand. Multiplying the number of ZeRO groups is because the gradients of each ZeRO group
         # are full model gradients, so the number of ZeRO groups is the number of gradient replicas of the full model.
-        if not is_zero:
+        if not use_zero:
             nreplicas = replicated_info.nranks
         else:
             nreplicas = replicated_info.nreplicated * params_info.zero_ngroups
@@ -241,7 +241,8 @@ def calcuate_gnorm(params: List[torch.Tensor], device: Optional[torch.device] = 
     elif len(grads) == 1:
         total_norm = torch.norm(grads[0], p=2, dtype=torch.float32)
     else:
-        if multi_tensor_l2norm_available:
+        dtypes = set([g.dtype for g in grads])
+        if multi_tensor_l2norm_available and len(dtypes) == 1:
             total_norm = _multi_tensor_total_norm(grads).to(device)
         else:
             # torch.nn.utils.clip_grad_norm_ way to calculate the norm

@@ -4,16 +4,16 @@
 import builtins
 import importlib
 from contextlib import contextmanager
-from functools import wraps
+from functools import wraps, cache
 from typing import (
     Generator, Optional, Tuple, Callable, Dict, List, Set, Any,
-    Iterable, Type, Union, Protocol, ClassVar, cast, TypeVar
+    Iterable, Type, TypedDict, Union, Protocol, ClassVar, cast, TypeVar
 )
 import logging
 from pathlib import Path
 import sys
 from collections import defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import inspect
 import os
 
@@ -110,6 +110,27 @@ def get_member_by_name(model: torch.nn.Module, name: str) -> Any:
     for sliced_name in sliced_names:
         model_attr = getattr(model_attr, sliced_name)
     return model_attr
+
+
+def set_member_by_name(model: Any, name: str, value: Any) -> None:
+    """
+    Set the member of the model by its full name.
+    """
+    if not name:
+        raise ValueError("Name cannot be empty")
+    class _ValueHolder:
+        """
+        A value holder.
+        In python you can't call `setattr` on object, but you can call it on its subclasses.
+        """
+        pass
+    sliced_names = name.split(".")
+    model_attr = model
+    for sliced_name in sliced_names[:-1]:
+        if not hasattr(model_attr, sliced_name):
+            setattr(model_attr, sliced_name, _ValueHolder())
+        model_attr = getattr(model_attr, sliced_name)
+    setattr(model_attr, sliced_names[-1], value)
 
 
 def get_shared_params(model: torch.nn.Module) -> List[List[str]]:
@@ -211,6 +232,124 @@ def rank_zero_only(fn: Callable[..., None]) -> Callable[..., None]:
 _DICT_ITEMS_TYPE = type({}.items())
 _DICT_KEYS_TYPE = type({}.keys())
 _DICT_VALUES_TYPE = type({}.values())
+TRANSFORM_SUPPORTED_COLLECTION_TYPES = (tuple, list, dict, set, slice, _DICT_ITEMS_TYPE, _DICT_KEYS_TYPE, _DICT_VALUES_TYPE)
+
+
+def _transform_recursively(data: Any, fn: Callable[[Any], Any],
+    target_types: Union[Callable[[Any], bool], Type, Tuple[Type, ...]],
+    collection_types = (tuple, list, dict), skip_dict_keys = True
+) -> tuple[bool, Any]:
+    if collection_types is None:
+        collection_types = TRANSFORM_SUPPORTED_COLLECTION_TYPES
+    if isinstance(data, collection_types):
+        if isinstance(data, tuple):
+            result = tuple(_transform_recursively(t, fn, target_types, collection_types, skip_dict_keys) for t in data)
+            changed = any(c for c, _ in result)
+            if changed:
+                return True, tuple(v for _, v in result)
+            else:
+                return False, data
+        if isinstance(data, list):
+            result = [_transform_recursively(t, fn, target_types, collection_types, skip_dict_keys) for t in data]
+            changed = any(c for c, _ in result)
+            if changed:
+                return True, [v for _, v in result]
+            else:
+                return False, data
+        if isinstance(data, set):
+            result = [_transform_recursively(t, fn, target_types, collection_types, skip_dict_keys) for t in data]
+            changed = any(c for c, _ in result)
+            if changed:
+                return True, {v for _, v in result}
+            else:
+                return False, data
+        if isinstance(data, dict):
+            if skip_dict_keys:
+                keys = {k: (False, k) for k in data.keys()}
+            else:
+                keys = {
+                    k: _transform_recursively(k, fn, target_types, collection_types, skip_dict_keys)
+                    for k in data.keys()
+                }
+            changed = any(c for c, _ in keys.values())
+            result = {
+                k: _transform_recursively(v, fn, target_types, collection_types, skip_dict_keys)
+                for k, v in data.items()
+            }
+            changed = changed or any(c for c, _ in result.values())
+            if changed:
+                return True, {
+                    keys[k][1]: v for k, (_, v) in result.items()
+                }
+            else:
+                return False, data
+        if isinstance(data, _DICT_ITEMS_TYPE):
+            if skip_dict_keys:
+                keys = {k: (False, k) for k, _ in data}
+            else:
+                keys = {
+                    k: _transform_recursively(k, fn, target_types, collection_types, skip_dict_keys)
+                    for k, _ in data
+                }
+
+            changed = any(c for c, _ in keys.values())
+            result = {
+                k: _transform_recursively(v, fn, target_types, collection_types, skip_dict_keys)
+                for k, v in data
+            }
+            changed = changed or any(c for c, _ in result.values())
+            if changed:
+                return True, {
+                    keys[k][1]: v for k, (_, v) in result.items()
+                }.items()
+            else:
+                return False, data
+        if isinstance(data, _DICT_KEYS_TYPE):
+            result = [
+                _transform_recursively(k, fn, target_types, collection_types, skip_dict_keys)
+                for k in data
+            ]
+            changed = any(c for c, _ in result)
+            if changed:
+                return True, {
+                    v: i for i, (_, v) in enumerate(result)
+                }.keys()
+            else:
+                return False, data
+        if isinstance(data, _DICT_VALUES_TYPE):
+            result = {
+                i: _transform_recursively(v, fn, target_types, collection_types, skip_dict_keys)
+                for i, v in enumerate(data)
+            }
+            changed = any(c for c, _ in result.values())
+            if changed:
+                return True, {
+                    i: v for i, (_, v) in result.items()
+                }.values()
+            else:
+                return False, data
+        if isinstance(data, slice):
+            result = (
+                _transform_recursively(data.start, fn, target_types, collection_types, skip_dict_keys),
+                _transform_recursively(data.stop, fn, target_types, collection_types, skip_dict_keys),
+                _transform_recursively(data.step, fn, target_types, collection_types, skip_dict_keys),
+            )
+            if any(c for c, _ in result):
+                return True, slice(
+                    result[0][1],
+                    result[1][1],
+                    result[2][1]
+                )
+            else:
+                return False, data
+        raise ValueError(f"Unsupported collection type: {type(data)}")
+    elif isinstance(target_types, (tuple, list)) or inspect.isclass(target_types):
+        if isinstance(data, target_types):
+            return True, fn(data)
+    elif callable(target_types):  # not a class, but callable. treat as a check function.
+        if target_types(data):
+            return True, fn(data)
+    return False, data
 
 
 def transform_recursively(data: Any, fn: Callable[[Any], Any],
@@ -219,57 +358,71 @@ def transform_recursively(data: Any, fn: Callable[[Any], Any],
 ) -> Any:
     """
     Transform the data with the given function, will recursively apply the function to the nested data.
+    Currently supported collection types is SUPPORTED_COLLECTION_TYPES.
     Args:
         data: the data to be transformed.
         fn: the function to apply.
         target_types: the target types to apply the function.
         collection_types: the collection types to apply the function to the nested data.
+            Will handle all supported types if None.
         skip_dict_keys: whether to skip the dict keys (for types dict, _DICT_ITEMS_TYPE).
             _DICT_KEYS_TYPE is not skipped, if you want to skip it, just remove it from the collection_types.
     """
+    _, result = _transform_recursively(data, fn, target_types, collection_types, skip_dict_keys)
+    return result
+
+
+def check_recursively(data, fn: Callable[[Any], bool],
+    collection_types = (tuple, list, dict),
+    skip_dict_keys = True
+) -> bool:
+    """
+    Check the data with the given function, will recursively apply the function to the nested data.
+    Args:
+        data: the data to be checked.
+        fn: the function to check.
+        collection_types: the collection types to apply the function to the nested data.
+        skip_dict_keys: whether to skip the dict keys (for types dict, _DICT_ITEMS_TYPE).
+            _DICT_KEYS_TYPE is not skipped, if you want to skip it, just remove it from the collection_types.
+
+    """
+    if collection_types is None:
+        collection_types = TRANSFORM_SUPPORTED_COLLECTION_TYPES
+
     if isinstance(data, collection_types):
-        if isinstance(data, tuple):
-            return tuple(transform_recursively(t, fn, target_types, collection_types) for t in data)
-        if isinstance(data, list):
-            return list(transform_recursively(t, fn, target_types, collection_types) for t in data)
-        if isinstance(data, set):
-            return set(transform_recursively(t, fn, target_types, collection_types) for t in data)
+        if isinstance(data, (list, tuple, set, _DICT_KEYS_TYPE, _DICT_VALUES_TYPE)):
+            return any(check_recursively(t, fn, collection_types) for t in data)
         if isinstance(data, dict):
-            return {
-                k if skip_dict_keys else transform_recursively(k, fn, target_types, collection_types):
-                transform_recursively(v, fn, target_types, collection_types)
-                for k, v in data.items()
-        }
+            if skip_dict_keys:
+                return any(
+                    check_recursively(v, fn, collection_types)
+                    for v in data.values()
+                )
+            else:
+                return any(
+                    check_recursively(k, fn, collection_types) or check_recursively(v, fn, collection_types)
+                    for k, v in data.items()
+                )
         if isinstance(data, _DICT_ITEMS_TYPE):
-            return {
-                k if skip_dict_keys else transform_recursively(k, fn, target_types, collection_types):
-                transform_recursively(v, fn, target_types, collection_types)
-                for k, v in data
-            }.items()
-        if isinstance(data, _DICT_KEYS_TYPE):
-            return {
-                    transform_recursively(k, fn, target_types, collection_types): i
-                    for i, k in enumerate(data)
-            }.keys()
-        if isinstance(data, _DICT_VALUES_TYPE):
-            return {
-                i: transform_recursively(v, fn, target_types, collection_types)
-                for i, v in enumerate(data)
-            }.values()
+            if skip_dict_keys:
+                return any(
+                    check_recursively(v, fn, collection_types)
+                    for _, v in data
+                )
+            else:
+                return any(
+                    check_recursively(k, fn, collection_types) or check_recursively(v, fn, collection_types)
+                    for k, v in data
+                )
         if isinstance(data, slice):
-            return slice(
-                transform_recursively(data.start, fn, target_types, collection_types),
-                transform_recursively(data.stop, fn, target_types, collection_types),
-                transform_recursively(data.step, fn, target_types, collection_types)
-            )
+            return any((
+                check_recursively(data.start, fn, collection_types),
+                check_recursively(data.stop, fn, collection_types),
+                check_recursively(data.step, fn, collection_types)
+            ))
         raise ValueError(f"Unsupported collection type: {type(data)}")
-    elif isinstance(target_types, (tuple, list)) or inspect.isclass(target_types):
-        if isinstance(data, target_types):
-            return fn(data)
-    elif callable(target_types):  # not a class, but callable. treat as a check function.
-        if target_types(data):
-            return fn(data)
-    return data
+
+    return fn(data)
 
 
 def is_running_distributed() -> bool:
@@ -325,6 +478,21 @@ def fields(model: TDataClass, /) -> TDataClass:
     return cast(TDataClass, _GetFields(model))
 
 
+class _UncheckedFields:
+    def __getattr__(self, item: str) -> Any:
+        return item
+
+
+TUncheckedClass = TypeVar("TAnyClass")
+def unchecked_fields(_: TUncheckedClass, /) -> TUncheckedClass:
+    """
+    This function is used to get the field names(in str) of any object without checking
+    This is a workaround for the lack of `__name__` of member.
+    """
+    return cast(TUncheckedClass, _UncheckedFields())
+
+
+@cache
 def load_type(type_name: str):
     """
     Load function/class from its full qualified name
@@ -457,3 +625,60 @@ class accum_mode:
             RuntimeFlag.skip_reducer = (not (step == nsteps - 1))
             yield step
         RuntimeFlag.skip_zero_grad, RuntimeFlag.skip_reducer = old
+
+
+class AdamOptState(TypedDict):
+    step: torch.Tensor
+    exp_avg: torch.Tensor
+    exp_avg_sq: torch.Tensor
+
+
+class OptStateParamGroup(TypedDict):
+    params: list[int]
+    lr: int
+
+
+class OptStateDict(TypedDict):
+    state: dict[int, AdamOptState | dict[str, Any]]
+    param_groups: list[OptStateParamGroup | dict[str, Any]]
+
+
+def fn_field(**kwargs):
+    metadata = kwargs.pop('metadata', {})
+    metadata['deserialize'] = lambda t: None if t is None else load_type(t)
+    return field(**kwargs, metadata=metadata)
+
+
+TENSOR_DYNAMIC_DIMS_FIELD_NAME = '_nnscaler_dynamic_dims'
+# for nnscaler custom class (TensorMetadata)
+NNSCALER_DYNAMIC_DIMS_NAME = 'dynamic_dims'
+
+
+def mark_dynamic(tensor: torch.Tensor, dims: int | list[int] | tuple[int]) -> torch.Tensor:
+    """
+    Mark the dim of a tensor as dynamic, which means it can be changed in the future.
+    This is the same with `torch._dynamo.mark_dynamic`
+    """
+    dims = [dims] if isinstance(dims, int) else dims
+    setattr(tensor, TENSOR_DYNAMIC_DIMS_FIELD_NAME, set(dims) if dims else set())
+    return tensor
+
+
+def copy_dynamic(src: torch.Tensor, tensor: torch.Tensor) -> torch.Tensor:
+    """
+    Copy the dynamic dims from src to tensor, and return the tensor.
+    """
+    if hasattr(src, TENSOR_DYNAMIC_DIMS_FIELD_NAME):
+        setattr(tensor, TENSOR_DYNAMIC_DIMS_FIELD_NAME, getattr(src, TENSOR_DYNAMIC_DIMS_FIELD_NAME))
+    return tensor
+
+
+def get_dynamic(tensor: Any) -> set[int]:
+    """
+    Get the dynamic dims of a tensor.
+    It also works when tensor is not an instance of torch.Tensor
+    """
+    if isinstance(tensor, torch.Tensor):
+        return getattr(tensor, TENSOR_DYNAMIC_DIMS_FIELD_NAME, set())
+    else:
+        return getattr(tensor, NNSCALER_DYNAMIC_DIMS_NAME, set())

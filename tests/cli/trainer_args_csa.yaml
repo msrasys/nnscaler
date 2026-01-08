@@ -1,0 +1,53 @@
+vars:
+  dynamic_dims: [1]
+  dim: 16
+  drop_last: true
+compute_config:
+  plan_ngpus: 4
+  runtime_ngpus: 100
+  constant_folding: true
+  use_zero: true
+  use_end2end: true
+
+run_mode: run
+pas_policy: tp
+micro_batch_size: 2
+global_batch_size: 8
+max_epochs: 4
+max_train_steps: 100
+seed: 0
+dummy_sample_gen_fn: tests.cli.common.transformer_dummy_sample_gen_fn
+
+model:
+  type: tests.cli.common.SimpleTransformerModel
+  args:
+    n_embd: 1024
+    n_head: 8
+    dropout: 0.001
+    nlayers: 2
+    vocab_size: 10000
+
+optimizer:
+  type: torch.optim.Adam
+  args:
+    lr: 0.01
+
+dataset:
+  type: tests.cli.common.SimpleDataset
+  train_args:
+    dim: $(vars.dim)
+    size: 100
+  val_args:
+    dim: $(vars.dim)
+    size: 10
+
+dataloader:
+  train_args:
+    drop_last: $(vars.drop_last)
+  val_args:
+    drop_last: $(vars.drop_last)
+
+checkpoint:
+  keep_last_n_checkpoints: 30
+  every_n_train_steps: 1
+  save_type: deduped

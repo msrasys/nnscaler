@@ -511,7 +511,10 @@ class ProfileDataBase:
             if filename.endswith('.json'):
                 with open(os.path.join(folder, filename)) as f:
                     signature = filename[:-len('.json')]
-                    loaded_json = json.load(f)
+                    try:
+                        loaded_json = json.load(f)
+                    except json.JSONDecodeError:
+                        raise RuntimeError(f'fail to load profiling data from {filename}, please check the file content')
                     self._data[signature] = {key: ProfiledMetrics(**value) for key, value in loaded_json.items()}
 
     def __repr__(self) -> str:

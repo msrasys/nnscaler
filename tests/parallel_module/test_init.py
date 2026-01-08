@@ -72,13 +72,13 @@ def test_empty_weights(model_class, tp):
             model_class,
             {'x': torch.tensor([[1.0, 2.0, 3.0, 4.0], [1.0, 2.0, 3.0, 4.0]])},
             'tp',
-            ComputeConfig(2, 4, use_zero=True, zero_ngroups=2),
+            ComputeConfig(2, 8, use_zero=True, zero_ngroups=2),
             gen_savedir=tempdir,
             reuse='match',
             load_module=False,
             instance_name=instance_name,
         )
-        for i in range(4):
+        for i in range(8):
             module_class = _load_parallel_module_class(model_class, gen_savedir=tempdir, instance_name=instance_name, rank=i)
             m = new_empty(module_class)
             assert m.rank == i
@@ -86,9 +86,9 @@ def test_empty_weights(model_class, tp):
                 assert p.device == torch.device('meta')
             for r in m.reducers:
                 if tp:
-                    assert r.ranks == ((0, 2) if i in (0, 2) else (1, 3))
+                    assert r.ranks == ((0, 2, 4, 6) if i in (0, 2, 4, 6) else (1, 3, 5, 7))
                 else:
-                    assert r.ranks == (0, 1, 2, 3)
+                    assert r.ranks == (0, 1, 2, 3, 4, 5, 6, 7)
                 assert len(r.buckets) == 1
                 assert r.zero
                 assert r.zero_ngroups == 2

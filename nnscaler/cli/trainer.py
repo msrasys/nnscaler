@@ -22,26 +22,16 @@ import psutil
 from tqdm import tqdm
 
 import nnscaler
+from nnscaler.runtime.device import DeviceGroup
 from nnscaler.utils import enforce_zero_num_worker, is_running_distributed
 
 from .trainer_args import AggregatedOutputs, TrainerArgs, fix_input
-from .train_hook import AggregatedTrainHook, TrainHook
+from .train_hook import AggregatedTrainHook, TrainHook, TrainHookHost
 from .mixed_module import parallelize_model, mixin_module
+from .serialization import Checkpointer
 
 
 logger = logging.getLogger(__name__)
-
-
-# the format of the checkpoint file
-# keys: epoch, step, rank
-# currently it is not configurable
-# TODO: make it configurable
-CHECKPOINT_FILE_FORMAT: str = '{epoch:04d}-{step:04d}/{rank}.ckpt'
-CHECKPOINT_LAST_DIR_NAME: str = 'last'
-CHECKPOINT_BEST_DIR_NAME: str = 'best'
-CHECKPOINT_MERGED_FILE_NAME: str = 'merged.ckpt'
-CHECKPOINT_LAST_FILE_FORMAT: str = 'last/{rank}.ckpt'
-CHECKPOINT_BEST_FILE_FORMAT: str = 'best/{rank}.ckpt'
 
 
 @dataclass
@@ -102,6 +92,7 @@ class Trainer:
         self.max_train_steps = None
         self.loggers = []
         self.hook = None
+        self.checkpointer = None
         # RNG states pending resume; reset to None after resuming
         self.rng_states_from_resume: dict[str, torch.Tensor] | None = None
 
@@ -111,6 +102,8 @@ class Trainer:
             if not self.train_args.compile_mode:
                 self._train()
         finally:
+            if self.checkpointer:
+                self.checkpointer.flush()
             for stage in ['train', 'val', 'test']:
                 if self.dataloader[stage] is not None and (close_fn := getattr(self.dataloader[stage], 'close', None)):
                     close_fn()
@@ -126,28 +119,16 @@ class Trainer:
     def _fix_input(self, input):
         return fix_input(input, self.train_args.input_dtype)
 
-    def _load_dummy_input(self):
-        if dummy_sample_gen_fn := self.train_args.resolved_dummy_sample_gen_fn:
-            return dummy_sample_gen_fn(self.train_args)
-
-        with enforce_zero_num_worker(DataLoader):
-            dataset = self.train_args.create_dataset('train')
-            dataloader = self.train_args.create_dataloader('train', dataset)
-            assert dataloader.num_workers == 0, "The dataloader must have `num_workers=0`."
-            value = next(iter(dataloader))
-            if close_fn := getattr(dataloader, 'close', None):
-                close_fn()
-            return value
-
     def _setup(self):
         if is_running_distributed():
             nnscaler.init()
-            if torch.distributed.get_rank() == 0:
+            if DeviceGroup().local_rank == 0:
                 logging.getLogger().setLevel(logging.INFO)
             else:
                 logging.getLogger().setLevel(logging.WARNING)
 
         self.train_args.init_env(self)
+        self.checkpointer = self.train_args.create_checkpointer()
 
         # make sure all ranks are synchronized after init_env
         if is_running_distributed():
@@ -156,10 +137,14 @@ class Trainer:
         compile_only = self.train_args.compile_mode
 
         # load a dummy input from training dataset
-        self.dummy_input = self._load_dummy_input()
-        self.dummy_input = self._fix_input(self.dummy_input)
+        self.dummy_input = self.train_args.dummy_input
 
-        pmodel = parallelize_model(self.train_args, self.dummy_input, load_module=not compile_only)
+        pmodel = parallelize_model(
+            self.train_args, self.dummy_input,
+            load_module=not compile_only,
+            build_buckets=not self.train_args.should_delay_bucket_building(),
+            checkpointer=self.checkpointer,
+        )
         if compile_only:
             return
 
@@ -186,6 +171,17 @@ class Trainer:
         self.local_world_size = int(os.environ.get('LOCAL_WORLD_SIZE'))
         self.local_rank = int(os.environ.get('LOCAL_RANK'))
         self.node_rank = int(os.environ.get('GROUP_RANK'))
+        assert self.rank // self.local_world_size == self.node_rank
+        self.local_ranks = list(
+            range(
+                self.node_rank * self.local_world_size,
+                (self.node_rank + 1) * self.local_world_size
+            )
+        )
+        self.local_rank0 = self.local_ranks[0]
+        # create local process groups
+        for local_rank0 in range(0, self.world_size, self.local_world_size):
+            DeviceGroup().get_group(list(range(local_rank0, local_rank0 + self.local_world_size)))
 
         self.total_train_steps_per_epoch = len(self.dataloader['train']) // self.train_args.update_freq
         if len(self.dataloader['train']) % self.train_args.update_freq != 0:
@@ -214,8 +210,9 @@ class Trainer:
         # (see `train_args.optimizer.grad_reduction`` handling in `train_epoch`).
         # This is useful to avoid overflow when the gradients are large.
         def reducer_pre_hook(reducer, grad):
-            grad.div_(self.train_args.scaling_factor)
+            grad.div_(self.train_args.optimizer.grad_reduce_divisor or self.train_args.scaling_factor)
         self.optimizer.register_reducer_pre_hook(reducer_pre_hook)
+        # Currently we never pass `last_epoch` to its constructor
         self.lr_scheduler = self.train_args.create_lr_scheduler(self.optimizer)
         self.loggers = self.train_args.create_loggers()
 
@@ -223,9 +220,20 @@ class Trainer:
             self.model,
             self.optimizer,
             self.lr_scheduler,
+            self.checkpointer,
         ]
+        component_hooks = []
+        for component in supported_hook_components:
+            if isinstance(component, TrainHook):
+                component_hooks.append(component)
+            if isinstance(component, TrainHookHost):
+                component_hooks.extend(component.get_hooks())
+
+        # dedup hooks
+        component_hooks = list({id(hook): hook for hook in component_hooks}.values())
+
         self.hook = AggregatedTrainHook(
-            [x for x in supported_hook_components if isinstance(x, TrainHook)]
+            component_hooks
             + [self.train_args.create_hook()]
         )
 
@@ -235,8 +243,19 @@ class Trainer:
         self.hook.after_setup(self)
 
     @classmethod
-    def _merge_checkpoint(cls, checkpoint_files: List[str]):
-        state_dicts = [torch.load(f, map_location='cpu', weights_only=False) for f in checkpoint_files]
+    def _merge_checkpoint(cls, checkpoint_files: List[str],
+        *,
+        model_only: bool = False,
+        checkpointer: Optional[Checkpointer] = None,
+    ):
+        checkpointer = checkpointer or Checkpointer()
+        state_dicts = []
+        for f in checkpoint_files:
+            state_dict = checkpointer.load(f)
+            if model_only:
+                # we pop optimizer state to save cpu memory
+                state_dict.pop('optimizer', None)
+            state_dicts.append(state_dict)
         for i in range(1, len(state_dicts)):
             if state_dicts[i]['train_args'] != state_dicts[0]['train_args']:
                 raise ValueError(f"train_args in {checkpoint_files[i]} is different from {checkpoint_files[0]}")
@@ -245,14 +264,16 @@ class Trainer:
 
         module_state_dict, opt_state_dict = nnscaler.merge_state_dicts(
             [s['model'] for s in state_dicts],
-            [s['optimizer'] for s in state_dicts]
+            [s['optimizer'] for s in state_dicts] if not model_only else None,
         )
+        if model_only:
+            return {'model': module_state_dict}
         train_args = copy.deepcopy(state_dicts[0]['train_args'])
         train_args['checkpoint']['save_type'] = 'merged'
 
         global_keys = {
             'model', 'optimizer', 'train_args',
-            'train_status', 'lr_scheduler', 'rank'
+            'train_status', 'lr_scheduler', 'rank', 'nnscaler'
         }
         # for extra keys (including `dataloader` and `rng_states`), we will not merge them.
         # Intead we will collect them from all state_dicts
@@ -271,51 +292,61 @@ class Trainer:
             'lr_scheduler': state_dicts[0].get('lr_scheduler', None),
             'train_status': state_dicts[0]['train_status'],
             'train_args': train_args,
+            'nnscaler': state_dicts[0]['nnscaler'],
             **extra_keys,
         }
         return merged_state_dict
 
-    def _broadcast_merged_state_dict(self, state_dict: Dict[str, Any]):
+    def _broadcast_merged_state_dict(
+        self,
+        state_dict: Dict[str, Any],
+        src_rank: int = 0,
+        dst_ranks: Optional[list[int]] = None,
+    ):
         """
         Broadcast the merged state dict to all ranks.
         We can't broadcast the whole state_dict at once, because it may be too large, and leads to OOM.
         Here we will break the model and optimizer state_dict into smaller pieces and broadcast them one by one.
         Please note we use `torch.distributed.broadcast_object_list` to broadcast the state_dict (including tensors inside).
         """
+        dst_ranks = dst_ranks or list(range(torch.distributed.get_world_size()))
+        if src_rank not in dst_ranks or self.rank not in dst_ranks:
+            raise ValueError(f"src_rank and current rank must be in dst_ranks: {dst_ranks}")
+        pg = DeviceGroup().get_group(dst_ranks)
 
-        def _broadcast_keys(sdict: Dict[str, Any], set_keys=True):
-            if self.rank == 0:
-                state_keys = list(sdict.keys())
-            else:
-                state_keys = None
-            state_key_list = [state_keys]
-            torch.distributed.broadcast_object_list(state_key_list, src=0)
-            state_keys = state_key_list[0]
-            if set_keys and self.rank != 0:
-                for key in state_keys:
-                    sdict[key] = {}  # assume the values are empty dicts
-            return state_keys
-
-        def _broadcast_value(sdict, key):
-            if self.rank == 0:
-                value_list = [sdict[key]]
-            else:
-                value_list = [None]
-            torch.distributed.broadcast_object_list(value_list, src=0)
-            if self.rank != 0:
-                sdict[key] = value_list[0]
-
-        def _broadcast_values(sdict, keys):
-            for key in keys:
-                _broadcast_value(sdict, key)
-
-        if self.rank == 0:
+        if self.rank == src_rank:
             if state_dict is None:
                 raise ValueError("state_dict should not be None in rank 0 when broadcasting")
         else:
             if state_dict is not None:
                 raise ValueError("state_dict should be None in other ranks when broadcasting")
             state_dict = {}
+
+        def _broadcast_keys(sdict: Dict[str, Any], set_keys=True):
+            if self.rank == src_rank:
+                state_keys = list(sdict.keys())
+            else:
+                state_keys = None
+            state_key_list = [state_keys]
+            torch.distributed.broadcast_object_list(state_key_list, src=src_rank, group=pg)
+            state_keys = state_key_list[0]
+            if set_keys and self.rank != src_rank:
+                for key in state_keys:
+                    sdict[key] = {}  # assume the values are empty dicts
+            return state_keys
+
+        def _broadcast_value(sdict, key):
+            if self.rank == src_rank:
+                value_list = [sdict[key]]
+            else:
+                value_list = [None]
+            torch.distributed.broadcast_object_list(value_list, src=src_rank, group=pg)
+            if self.rank != src_rank:
+                sdict[key] = value_list[0]
+
+        def _broadcast_values(sdict, keys):
+            for key in keys:
+                _broadcast_value(sdict, key)
 
         state_keys = _broadcast_keys(state_dict)
 
@@ -339,9 +370,26 @@ class Trainer:
         return state_dict
 
     @classmethod
-    def merge_checkpoint(cls, checkpoint_files: List[str], output_file: str):
-        merged_state_dict = cls._merge_checkpoint(checkpoint_files)
-        torch.save(merged_state_dict, output_file)
+    def merge_checkpoint(cls, checkpoint_files: List[str], output_file: str,
+        *,
+        model_only: bool = False,
+        checkpointer: Optional[Checkpointer] = None,
+        serializer: Optional[str] = None,
+        serializer_args: Optional[dict[str, Any]] = None,
+    ):
+        if checkpointer is not None:
+            if serializer is not None or serializer_args is not None:
+                raise ValueError("serializer and serializer_args should not be specified when checkpointer is given")
+        else:
+            checkpointer = Checkpointer(serializer=serializer, serializer_args=serializer_args)
+
+        merged_state_dict = cls._merge_checkpoint(
+            checkpoint_files,
+            model_only=model_only,
+            checkpointer=checkpointer,
+        )
+        checkpointer.save(merged_state_dict, output_file)
+        checkpointer.flush()
 
     def _log_finalize(self):
         for logger in self.loggers:
@@ -361,13 +409,21 @@ class Trainer:
         if not resume_from:
             return
         logger.info(f"Resuming from {resume_from}")
+        trimmed_broadcast_required = False
+        load_from_merged = False
+
         if resume_from.is_file():
-            resume_from = resume_from   # when we load from merged checkpoint
-            state_dict = torch.load(resume_from, map_location='cpu', weights_only=False)
-            if convert_fn := self.train_args.checkpoint.resolved_convert_fn:
-                state_dict = convert_fn(state_dict)
+            # when we load from merged checkpoint
+            load_from_merged = True
+            trimmed_broadcast_required = self.train_args.checkpoint.resume_from.save_memory
+            if not self.train_args.checkpoint.resume_from.save_memory or self.local_rank == 0:
+                state_dict = self.checkpointer.load(resume_from)
+                if convert_fn := self.train_args.checkpoint.resolved_convert_fn:
+                    state_dict = convert_fn(state_dict)
+            else:
+                state_dict = None
         else:
-            ckpt_files = list(resume_from.glob('*.ckpt'))
+            ckpt_files = self.checkpointer.list_checkpoints(resume_from)
             rank_ckpt_files = {int(f.stem): f for f in ckpt_files if f.stem.isdigit()}
             if set(rank_ckpt_files.keys()) != set(range(len(rank_ckpt_files))):
                 raise ValueError(f"Checkpoint files in {resume_from} are not complete: {rank_ckpt_files.keys()}")
@@ -378,24 +434,59 @@ class Trainer:
             if len(rank_ckpt_files) != self.world_size or self.train_args.checkpoint.resume_from.with_merged:
                 # merge the checkpoint files from all ranks and broadcast to all ranks
                 torch.distributed.barrier()
-                if self.rank == 0:
+                if self.local_rank == 0:
                     logger.info(f"Merging checkpoint files from {resume_from}")
-                    state_dict = self._merge_checkpoint(list(rank_ckpt_files.values()))
+                    state_dict = self._merge_checkpoint(list(rank_ckpt_files.values()), checkpointer=self.checkpointer)
                 else:
                     state_dict = None
-                logger.info(f"Broadcasting merged checkpoint to all ranks.")
-                state_dict = self._broadcast_merged_state_dict(state_dict)
-                logger.info(f"Broadcasted merged checkpoint to all ranks.")
+
+                load_from_merged = True
+                trimmed_broadcast_required = self.train_args.checkpoint.resume_from.save_memory
+                if not self.train_args.checkpoint.resume_from.save_memory:
+                    logger.info(f"Broadcasting merged checkpoint to all ranks.")
+                    state_dict = self._broadcast_merged_state_dict(
+                        state_dict, src_rank=self.local_rank0, dst_ranks=self.local_ranks
+                    )
+                    logger.info(f"Broadcasted merged checkpoint to all ranks.")
             else:
-                resume_from = resume_from / f'{self.rank}.ckpt'
-                state_dict = torch.load(resume_from, map_location='cpu', weights_only=False)
+                state_dict = self.checkpointer.load_for_rank(resume_from, self.rank)
+                if state_dict['train_args']['compute_config'] != asdict(self.train_args.compute_config):
+                    logger.warning(
+                        f"compute_config is changed, and loading checkpoint may fail. "
+                        f"If it fails, please try with merged checkpoint."
+                    )
+
+        if trimmed_broadcast_required:
+            logger.info("Broadcasting trimmed checkpoint to all ranks.")
+            state_dict = state_dict or {}
+            state_dict['model'], state_dict['optimizer'] = nnscaler.trimmed_broadcast_merged_state_dict(
+                self.model,
+                state_dict['model'] if self.local_rank == 0 else None,
+                self.optimizer,
+                state_dict['optimizer'] if self.local_rank == 0 else None,
+                src_rank=self.local_rank0,
+                dst_ranks=self.local_ranks,
+            )
+            remaining_state_dict = self._broadcast_merged_state_dict(
+                {k: v for k, v in state_dict.items() if k not in ('model', 'optimizer')}
+                if self.local_rank == 0 else None,
+                src_rank=self.local_rank0,
+                dst_ranks=self.local_ranks,
+            )
+            if self.local_rank != 0:
+                state_dict.update(remaining_state_dict)
+            logger.info("Broadcasted trimmed checkpoint to all ranks.")
+
+            # trimmed checkpoint is sharded
+            ckpt_save_type = 'sharded'
+        else:
+            # if it is not a well-formed state_dict (from third party)
+            # we will treat it as a merged state_dict
+            ckpt_save_type = state_dict.get('train_args', {}) \
+                .get('checkpoint', {}) \
+                .get('save_type', 'merged')
 
         self.hook.on_load_checkpoint(self, state_dict)
-        # if it is not a well-formed state_dict (from third party)
-        # we will treat it as a merged state_dict
-        ckpt_save_type = state_dict.get('train_args', {}) \
-            .get('checkpoint', {}) \
-            .get('save_type', 'merged')
 
         if ckpt_save_type == 'merged': # it is a merged state dict
             nnscaler.load_merged_state_dict(
@@ -420,10 +511,11 @@ class Trainer:
                 raise ValueError("lr_scheduler is not set in the current trainer")
             if self.lr_scheduler:
                 self.lr_scheduler.load_state_dict(state_dict['lr_scheduler'])
+
         if 'dataloader' in state_dict and state_dict['dataloader'] is not None:
             if not self._is_resumable_dataloader():
                 raise ValueError("dataloader is not resumable, but checkpoint contains dataloader state")
-            if ckpt_save_type == 'merged':
+            if load_from_merged:
                 dataloader_states = state_dict['dataloader']
                 # only load dataloader state when all ranks have the same state
                 # TODO: is this reasonable?
@@ -443,7 +535,7 @@ class Trainer:
             self.train_status = TrainStatus(**state_dict['train_status'])
 
         # we don't resume rng states when loading merged checkpoint,
-        if ckpt_save_type != 'merged':
+        if not load_from_merged:
             self.rng_states_from_resume = state_dict.get('rng_states')  # resumed in _global_batch_iterator()
         else:
             logger.warning("RNG states are not resumed when loading merged checkpoint.")
@@ -514,7 +606,7 @@ class Trainer:
             current_epoch -= 1
 
         if checkpoint_config.save_type == 'sharded':
-            model_state_dict= self.model.state_dict()
+            model_state_dict = self.model.state_dict()
             optimizer_state_dict = self.optimizer.state_dict()
         elif checkpoint_config.save_type == 'deduped':
             model_state_dict, optimizer_state_dict = nnscaler.deduped_state_dict(
@@ -541,50 +633,37 @@ class Trainer:
 
         self.hook.on_save_checkpoint(self, state_dict)
 
-        ckpt_file = save_dir / CHECKPOINT_FILE_FORMAT.format(
+        ckpt_file = save_dir / self.checkpointer.get_checkpoint_file_path(
             epoch=current_epoch,
             step=self.train_status.finished_train_steps,
             rank=self.rank,
         )
         logger.info(f"Saving checkpoint to {str(ckpt_file.parent)}")
         ckpt_file.parent.mkdir(parents=True, exist_ok=True)
-        torch.save(state_dict, ckpt_file)
+        self.checkpointer.save(state_dict, ckpt_file)
 
         # save last
         if checkpoint_config.save_last:
             logger.info(f"Saving checkpoint as the last checkpoint.")
-            last_file = save_dir / CHECKPOINT_LAST_FILE_FORMAT.format(
-                rank=self.rank
+
+            self.checkpointer.copy_for_rank(
+                ckpt_file.parent,
+                save_dir / self.checkpointer.get_last_dir_name(),
+                self.rank,
+                checkpoint_config.symlink_best_and_last
             )
-            last_file.parent.mkdir(parents=True, exist_ok=True)
-            if checkpoint_config.symlink_best_and_last:
-                # remove the old symlink or file
-                if last_file.is_symlink() or last_file.exists():
-                    last_file.unlink()
-                # symblink as relative path
-                last_file.symlink_to(Path('..') / ckpt_file.parent.name / ckpt_file.name)
-                # last_file.symlink_to(ckpt_file)
-            else:
-                shutil.copy(ckpt_file, last_file)
 
         # save best
         if checkpoint_config.save_best and loss <= self.train_status.best_loss:
             logger.info(f"Best loss updated: {self.train_status.best_loss:.3f} -> {loss:.3f}")
             logger.info(f"Saving checkpoint as the best checkpoint.")
-            best_file = save_dir / CHECKPOINT_BEST_FILE_FORMAT.format(
-                epoch=current_epoch,
-                step=self.train_status.finished_train_steps,
-                rank=self.rank,
+
+            self.checkpointer.copy_for_rank(
+                ckpt_file.parent,
+                save_dir / self.checkpointer.get_best_dir_name(),
+                self.rank,
+                checkpoint_config.symlink_best_and_last
             )
-            best_file.parent.mkdir(parents=True, exist_ok=True)
-            if checkpoint_config.symlink_best_and_last:
-                # symblink as relative path
-                if best_file.is_symlink() or best_file.exists():
-                    best_file.unlink()
-                best_file.symlink_to(Path('..') / ckpt_file.parent.name / ckpt_file.name)
-                # best_file.symlink_to(ckpt_file)
-            else:
-                shutil.copy(ckpt_file, best_file)
 
         torch.distributed.barrier()
         # remove old checkpoints
@@ -597,6 +676,14 @@ class Trainer:
 
         torch.distributed.barrier()
 
+    @classmethod
+    def _get_dependent_dirs(cls, ckpt_dir):
+        target_dirs = set()
+        for p in Path(ckpt_dir).glob('*'):
+            if p.is_symlink():
+                target_dirs.add(p.resolve().parent.name)
+        return target_dirs
+
     def _expire_checkpoints(self):
         if not self.train_args.checkpoint.keep_last_n_checkpoints:  # keep all
             return
@@ -604,36 +691,46 @@ class Trainer:
         save_dir = Path(self.train_args.checkpoint.save_dir)
         checkpoints = [
             p.name for p in save_dir.glob('*')
-            if p.is_dir() and p.name not in [CHECKPOINT_BEST_DIR_NAME, CHECKPOINT_LAST_DIR_NAME]
+            if p.is_dir() and p.name not in [
+                self.checkpointer.get_best_dir_name(),
+                self.checkpointer.get_last_dir_name()
+            ]
         ]
         if len(checkpoints) <= self.train_args.checkpoint.keep_last_n_checkpoints:
             return
 
         # (step, ckpt_name) pairs
         checkpoint_info = [(int(p.split('-')[1]), p) for p in checkpoints]
+        # map from ckpt_name to step
+        checkpoint_info_map = {p[1]: p[0] for p in checkpoint_info}
         checkpoint_info.sort()
         expire_list = [c[1] for c in checkpoint_info[:-self.train_args.checkpoint.keep_last_n_checkpoints]]
 
-        best_ckpt = save_dir / CHECKPOINT_BEST_DIR_NAME
-        last_ckpt = save_dir / CHECKPOINT_LAST_DIR_NAME
+        best_ckpt = save_dir / self.checkpointer.get_best_dir_name()
+        last_ckpt = save_dir / self.checkpointer.get_last_dir_name()
         for ckpt_dir in [best_ckpt, last_ckpt]:
             if not ckpt_dir.exists():
                 continue
-            for p in ckpt_dir.glob('*.ckpt'):
-                if p.is_symlink():
-                    ckpt_name = p.resolve().parent.name
-                    if ckpt_name in expire_list:
-                        expire_list.remove(ckpt_name)
-                        logger.info('Keep old checkpoint `%s` because it is symbol linked in best or last.', ckpt_name)
-                break # just check the first file is enough
+            for ckpt_name in self._get_dependent_dirs(ckpt_dir):
+                if ckpt_name in expire_list:
+                    expire_list.remove(ckpt_name)
+                    logger.info('Keep old checkpoint `%s` because it is symbol linked in best or last.', ckpt_name)
 
         for ckpt_name in expire_list:
             logger.info('Removing old checkpoint: %s', ckpt_name)
-            shutil.rmtree(save_dir / ckpt_name)
+            self.hook.on_expire_checkpoint(self, checkpoint_info_map[ckpt_name], save_dir / ckpt_name)
+            try:
+                shutil.rmtree(save_dir / ckpt_name)
+            except FileNotFoundError:
+                # may have been removed by other processes (when the storage is shared)
+                pass
+            except Exception as e:
+                logger.warning('Error when expiring checkpoint `%s`: %s. Will try later.', ckpt_name, e)
 
     def _global_batch_iterator(self, num_skip_first=0, stage='train'):
         if stage == 'train':
             if self.dataloader_resumed or num_skip_first == 0:
+                logger.info(f'Trainer resumes dataloader directly.')
                 # if the checkpoint stops at the end of an epoch,
                 # the rng states must be resumed before creating iterator
                 # because `DataLoader.__iter__()` uses the rng (dunno why),
@@ -641,6 +738,7 @@ class Trainer:
                 self._try_resume_rng_states()
                 it = iter(self.dataloader[stage])
             else:  # dry run until reach the desired batch.
+                logger.info(f'Trainer try to resume dataloader for {stage} stage with {num_skip_first}.')
                 it = iter(self.dataloader[stage])
                 for _ in range(num_skip_first * self.train_args.update_freq):
                     _sample = next(it)
@@ -773,7 +871,7 @@ class Trainer:
         torch.cuda.reset_peak_memory_stats()
 
         if self.train_status.finished_train_steps >= self.max_train_steps:
-            logger.info(f"Training is skipped: already done.")
+            logger.info(f"Training is skipped: already done, finished_train_steps={self.train_status.finished_train_steps} >= max_train_steps={self.max_train_steps}.")
             return
 
         start_epoch = self.train_status.finished_train_steps // self.total_train_steps_per_epoch
@@ -948,7 +1046,7 @@ class Trainer:
             self.hook.after_sync_grad(self)
 
             # scale gradients
-            multiplier = self.train_args.scaling_factor
+            multiplier = self.train_args.optimizer.grad_reduce_divisor or self.train_args.scaling_factor
             if self.train_args.optimizer.grad_reduction == 'sum':
                 # do nothing. `multiplier` is already correct
                 pass
@@ -977,7 +1075,7 @@ class Trainer:
             step_stat.gnorm = step_stat.gnorm.item()
 
             # update parameters
-            step_stat.lr = self.optimizer.param_groups[0]['lr']
+            step_stat.lr = self.optimizer.param_groups[0]['lr']  # only log the first group's lr
             self.hook.before_optimizer_step(self)
             self.optimizer.step()
             self.hook.after_optimizer_step(self)

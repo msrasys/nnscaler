@@ -57,7 +57,7 @@ def cal_wnorm_cube(model: CubeModule):
     for p in model.parameters_for_optimizer():
         p.grad = p.data
         # p.grad.copy_(p.data)
-    nreplicas2localparams = prepare_for_grad_clip(model, is_zero=CompileFlag.use_zero)
+    nreplicas2localparams = prepare_for_grad_clip(model, use_zero=CompileFlag.use_zero)
     wnorm, _ = clip_gnorm(nreplicas2localparams, None)
     # maps = {tid: [t.size() for t in ts] for tid, ts in nreplicas2localparams.items()}
     # print(f'cube nrepicas len: {maps}')

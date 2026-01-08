@@ -2,6 +2,7 @@
 #  Licensed under the MIT License.
 
 from typing import Any, Dict, List, TYPE_CHECKING, Literal, TypedDict, Optional
+from pathlib import Path
 
 import torch
 
@@ -213,6 +214,18 @@ class TrainHook:
             checkpoint: the checkpoint to be saved
         """
 
+    def on_expire_checkpoint(self, trainer: 'Trainer', step: int, checkpoint_dir: Path) -> None:
+        """
+        Called before expiring (deleting) checkpoint.
+        If you want to do something before a checkpoint is deleted, you can do it here.
+
+        Note: only local-rank 0 will call this hook.
+
+        Args:
+            step: the overall training step of the checkpoint to be expired
+            checkpoint_dir: the directory that holds the checkpoint to be expired
+        """
+
 
 class AggregatedTrainHook(TrainHook):
     def __init__(self, hooks: List[TrainHook]):
@@ -333,3 +346,35 @@ class AggregatedTrainHook(TrainHook):
     def on_save_checkpoint(self, trainer: 'Trainer', checkpoint: Dict[str, Any]) -> None:
         for hook in self.hooks:
             hook.on_save_checkpoint(trainer, checkpoint)
+
+    def on_expire_checkpoint(self, trainer: 'Trainer', step: int, checkpoint_dir: Path) -> None:
+        for hook in self.hooks:
+            hook.on_expire_checkpoint(trainer, step, checkpoint_dir)
+
+
+class TrainHookHost:
+    def _get_hook_objects(self) -> List[Any]:
+        """
+        Return a list of objects that can be hooks (but not necessarily hooks)
+        """
+        ...
+
+    def get_hooks(self) -> List[TrainHook]:
+        """
+        Return a list of TrainHook objects
+        """
+        hooks = {}
+        visited = set()
+        def _get_hooks(obj):
+            if id(obj) in visited:
+                return
+            visited.add(id(obj))
+
+            if isinstance(obj, TrainHook):
+                hooks[id(obj)] = obj
+            if isinstance(obj, TrainHookHost):
+                for o in obj._get_hook_objects():
+                    _get_hooks(o)
+
+        _get_hooks(self)
+        return list(hooks.values())

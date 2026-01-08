@@ -7,7 +7,7 @@ Currently, we support three kinds of parallelism: data parallelism, tensor paral
 Data parallelism and tensor parallelism can be supported for any module, but pipeline parallelism is only supported for end2end modules for scheduling reason.
 
 An end2end module is a module which satisfies:
-- the first argument of `module.forward` is the data sample, and every other argument should have default value, and use its default value in `module.forward` function.
+- the first argument of `module.forward` is the data sample, and other arguments should have default value, and should never be used in `module.forward` function.
 - the first return value of `module.forward` is the loss (scalar tensor)
 
 The above restrictions are necessary for the pipeline parallelism to work. Of course, you can still use the parallel module without pipeline parallelism for end2end modules.
@@ -473,7 +473,7 @@ Please note the `device` parameter. If it is None, we will use `torch.cuda.curre
 
 #### `deduped_state_dicts`
 
-In parallel training, a lot of weights/state in the module and the optimizer will be the same in the ranks. So we can save a lot of space by deduping the state dicts before saving them to the disk.
+In parallel training, a lot of weights/state in the module and the optimizer will be the same in the ranks. So we can save a lot of space by deduping the state dicts before saving them to the disk. Note each part of a logical tensor is saved at the first rank it appears.
 
 ```python
 def deduped_state_dict(
@@ -483,6 +483,8 @@ def deduped_state_dict(
 ```
 
 #### `load_deduped_state_dict`
+
+This is a reverse process of `deduped_state_dicts`. It assumes the distributed plan is unchanged. For weights, the loading process is divided into 3 steps: 1. each rank read its own state_dict 2. replicated weight is broadcasted inside the first scale unit so that it contains the full parameters 3. the 1st scale unit broadcast weights to other units.
 
 ```python
 def load_deduped_state_dict(

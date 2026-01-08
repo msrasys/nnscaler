@@ -11,8 +11,9 @@ from nnscaler.utils import fields
 from nnscaler.graph.tracer.metadata import OpContext
 from nnscaler.ir.operator import IRFwOperation
 from nnscaler.ir.tensor import IRFullTensor
-from nnscaler.ir.cten import IRObject, IRCell, IRTensor, IR
+from nnscaler.ir.cten import IRObject, IRCell, IRTensor, IR, ValueTrack
 from nnscaler.graph.parser.frame import Frame
+from nnscaler.graph.parser.value_tracker import ValueTracker
 from nnscaler.graph.parser.mapping import SignFx2Op
 from nnscaler.graph.function.pyfunc import IRPyFunc
 from nnscaler.graph.function.dimops import IRDimops
@@ -38,14 +39,14 @@ class FxModuleParser:
     ATTR_CONTENT_FILE_FORMAT = '{stem}.{idx}'
     ATTR_MAP_FILE = 'dist_param_map.pt'
 
-    @staticmethod
-    def parse(module: torch.fx.GraphModule,
+    def __init__(self,
+              module: torch.fx.GraphModule,
               dummy_inputs: Dict[str, Any],
               attr_savedir='./',
               *,
               save_content: bool = True,
               constant_folding: bool = False
-        ) -> Tuple[List[IRObject], List[IRFwOperation], List[IRObject]]:
+        ):
         """Parse torch.fx module into cube IR
 
         The overall entry to parse a torch.fx graph module
@@ -56,6 +57,24 @@ class FxModuleParser:
             attr_savedir (str): the directory to save the attribute content
             save_content (bool): whether to save the content of the module
             constant_folding (bool): whether to parse the module with constant folding
+        """
+
+        self.module = module
+
+        self.dummy_inputs = dummy_inputs
+        assert isinstance(dummy_inputs, dict), f"Expected dummy inputs to parse module, but got {dummy_inputs} of type {type(dummy_inputs)}"
+
+        self.attr_savedir = attr_savedir
+        self.save_content = save_content
+        self.constant_folding = constant_folding
+
+        self.frame = Frame()
+        self.value_tracker = ValueTracker()
+
+    def parse(self) -> Tuple[List[IRObject], List[IRFwOperation], List[IRObject]]:
+        """Parse torch.fx module into cube IR
+
+        The overall entry to parse a torch.fx graph module
 
         Returns:
             inputs (List[IRObject]): the input IRObjects
@@ -67,12 +86,10 @@ class FxModuleParser:
         # (Those ops creators include user registered function, all functions returning tensors and more)
         # We will connect the real op outputs (saved in frame) to all ir op outputs and inputs later.
 
-        frame = Frame()
-        frame.push_var()
+        self.frame.push_var()
 
         # shape propagation
-        assert isinstance(dummy_inputs, dict), f"Expected dummy inputs to parse module, but got {dummy_inputs} of type {type(dummy_inputs)}"
-        output_nodes = [node for node in module.graph.nodes if node.op == 'output']
+        output_nodes = [node for node in self.module.graph.nodes if node.op == 'output']
         # currently fx graph always has only one output
         # even if a tuple/list is returned, it is still just one output
         assert len(output_nodes) == 1, f"Expect only one output, but got {len(output_nodes)}"
@@ -81,11 +98,11 @@ class FxModuleParser:
         assert len(output_node.args) == 1 and len(output_node.kwargs) == 0
 
         # create IRObjects and IRTensors
-        for node in module.graph.nodes:
+        for node in self.module.graph.nodes:
             if node.op == 'placeholder':
-                FxModuleParser.init_objects(node, module, frame, is_constant=False)
+                self._init_objects(node, is_constant=False)
             else:
-                FxModuleParser.init_objects(node, module, frame, is_constant=True)
+                self._init_objects(node, is_constant=True)
 
             # note the output node will be reset later by `parse_prim_output_node`
             # with the help of `parse_complex`
@@ -98,76 +115,93 @@ class FxModuleParser:
             # to make sure the IRGraph has the correct output number
             # see `IRGrpah.from_logic_graph`
 
-            val = frame.get_var(node.name)
+            val = self.frame.get_var(node.name)
             if node == output_node.args[0] \
                 and IR.is_object(val) and isinstance(val.value, tuple):
                 tuple_val = tuple(IRObject(name=node.name, value=v, is_constant=val.is_constant) for v in val.value)
-                frame.set_var(node.name, tuple_val)
+                self.frame.set_var(node.name, tuple_val)
 
         # get graph inputs
-        placeholders = [n for n in module.graph.nodes if n.op == 'placeholder']
-        inputs = [frame.get_var(n.name) for n in placeholders]
+        placeholders = [n for n in self.module.graph.nodes if n.op == 'placeholder']
+        inputs = [self.frame.get_var(n.name) for n in placeholders]
+        self.value_tracker.track_values(inputs)
         # - if the graph inputs contain nested strcuture,
         #   it should be wrapped into an IRObject
         for idx, placeholder in enumerate(placeholders):
             if not isinstance(inputs[idx], IRObject):
-                obj = IRObject(name=placeholder.name, value=inputs[idx], is_constant=False)
+                obj = IRObject(name=placeholder.target, value=inputs[idx], is_constant=False)
+                obj.value_track.mark_as_input()
                 inputs[idx] = obj
-                frame.set_var(placeholder.name, obj)
+                self.value_tracker.track_values([obj])
+                self.frame.set_var(placeholder.name, obj)
 
         # parse graph nodes
         all_ir_nodes = []
-        for node in module.graph.nodes:
-            ir_nodes = FxModuleParser.parse_node(node, module, constant_folding, frame)
+        for node in self.module.graph.nodes:
+            ir_nodes = self._parse_node(node)
             all_ir_nodes += ir_nodes
 
+        self.value_tracker.complete_tracking(all_ir_nodes)
+
         # get graph outputs
-        outputs = [frame.get_var(node.name) for node in module.graph.nodes if node.op == 'output']
+        outputs = [self.frame.get_var(node.name) for node in self.module.graph.nodes if node.op == 'output']
         # currently fx graph always has only one output
         # even if a tuple/list is returned, it is still just one output
         assert len(outputs) == 1, f"Expect only one output, but got {len(outputs)}"
 
-        if save_content:
-            attr_savedir = Path(attr_savedir)
-            frame.save_attr_content(attr_savedir / FxModuleParser.ATTR_CONTENT_FILE_STEM)
-            frame.save_attr_map(attr_savedir / FxModuleParser.ATTR_MAP_FILE)
+        if self.save_content:
+            attr_savedir = Path(self.attr_savedir)
+            self.frame.save_attr_content(attr_savedir / self.ATTR_CONTENT_FILE_STEM)
+            self.frame.save_attr_map(attr_savedir / self.ATTR_MAP_FILE)
 
-        frame.pop_var()
+        self.frame.pop_var()
         return inputs, all_ir_nodes, outputs
 
-    @staticmethod
-    def parse_node(node: torch.fx.Node, module, constant_folding: bool, frame: Frame) -> List[IRFwOperation]:
+    def _parse_node(self, node: torch.fx.Node) -> List[IRFwOperation]:
         """
         Parse the node and return the IRFwOperation nodes
         """
         if node.op == 'placeholder':
             return []
         if node.op == 'output':
-            return FxModuleParser.parse_prim_output_node(node, module, frame)
+            return self._parse_prim_output_node(node)
         if node.op in ('call_function', 'call_method'):
-            return FxModuleParser.parse_prim_function_method(node, module, constant_folding, frame)
+            return self._parse_prim_function_method(node)
         if node.op == 'get_attr':
-            return FxModuleParser.parse_prim_get_attr_node(node, module, frame)
+            return self._parse_prim_get_attr_node(node)
         if node.op == 'call_module':
-            return FxModuleParser.parse_prim_module(node, module, frame)
+            return self._parse_prim_module(node)
         else:
             raise TypeError(f"Unknown node kind {node.op}")
 
-    @staticmethod
-    def init_objects(node: torch.fx.Node, module: torch.fx.GraphModule,
-                     frame: Frame, is_constant: bool = True):
+    def _init_objects(self, node: torch.fx.Node, is_constant: bool = True):
         assert isinstance(node, torch.fx.Node)
 
         assert hasattr(node, 'meta') and 'tensor_meta' in node.meta, f"Node {node} should have tensor_meta"
         meta = node.meta['tensor_meta']
-        val = IR.new(node.name, meta,
+        val = IR.new(
+            # node.target is necesssary for input
+            # its name will be used to align with model forward args when generating code.
+            node.target if node.op == 'placeholder' else node.name,
+            meta,
             tensor_types=(TensorMetadata,),
-            is_constant=is_constant
+            is_constant=is_constant,
         )
-        frame.add_var(node.name, val)
 
-    @staticmethod
-    def parse_complex(val: Any, frame: Frame) -> Any:
+        if node.op == 'placeholder':
+            def mark_as_input(x: IRObject):
+                if isinstance(x, IRTensor):
+                    # let's the value_track of tensor stay None(unknown)
+                    # because we don't care about it.
+                    for dt in x.dim_tracks:
+                        dt.with_no_dep()
+                else:
+                    x.value_track.mark_as_input()
+            IR.modify_objects(val, mark_as_input)
+
+        self.frame.add_var(node.name, val)
+
+    def _parse_complex(self, val: Any) -> Any:
         """parse complex fx.Node into IRObject
 
         The val is usually from a node's input or output, can be fx.Node nested
@@ -183,28 +217,28 @@ class FxModuleParser:
         # to support more nested types, we can refer to the implementation of
         # https://github.com/pytorch/pytorch/blob/main/torch/utils/_pytree.py
         if isinstance(val, tuple):
-            return tuple(FxModuleParser.parse_complex(t, frame) for t in val)
+            return tuple(self._parse_complex(t) for t in val)
         if isinstance(val, list):
-            return list(FxModuleParser.parse_complex(t, frame) for t in val)
+            return list(self._parse_complex(t) for t in val)
         if isinstance(val, dict):
-            return {key: FxModuleParser.parse_complex(val, frame) for key, val in val.items()}
+            return {key: self._parse_complex(val) for key, val in val.items()}
         # TODO: Currently slice/DICT_VALUES_TYPE/DICT_ITEMS_TYPE cases are never found.
         # We need to find some examples to test them.
         if isinstance(val, slice):
-            return slice(FxModuleParser.parse_complex(val.start, frame),
-                         FxModuleParser.parse_complex(val.stop, frame),
-                         FxModuleParser.parse_complex(val.step, frame))
+            return slice(self._parse_complex(val.start),
+                         self._parse_complex(val.stop),
+                         self._parse_complex(val.step))
         # because fx node cannot be a dict key, so skip DICT_KEYS_TYPE here
         if isinstance(val, DICT_VALUES_TYPE):
-            return tuple(FxModuleParser.parse_complex(x, frame) for x in val)
+            return tuple(self._parse_complex(x) for x in val)
         if isinstance(val, DICT_ITEMS_TYPE):
-            return tuple((i, FxModuleParser.parse_complex(x, frame)) for i, x in val)
+            return tuple((i, self._parse_complex(x)) for i, x in val)
         if isinstance(val, torch.fx.Node):
-            return frame.get_var(val.name)
+            return self.frame.get_var(val.name)
         return val
 
-    @staticmethod
-    def fetch_attr(mod: torch.fx.GraphModule, target: str):
+    @classmethod
+    def _fetch_attr(cls, mod: torch.fx.GraphModule, target: str):
         target_atoms = target.split('.')
         attr_itr = mod
         for i, atom in enumerate(target_atoms):
@@ -213,23 +247,19 @@ class FxModuleParser:
             attr_itr = getattr(attr_itr, atom)
         return attr_itr
 
-    @staticmethod
-    def parse_prim_module(node: torch.fx.Node, module: torch.fx.GraphModule, frame: Frame) -> List[IRFwOperation]:
-        prim_module = FxModuleParser.fetch_attr(module, node.target)
+    def _parse_prim_module(self, node: torch.fx.Node) -> List[IRFwOperation]:
+        prim_module = self._fetch_attr(self.module, node.target)
         if prim_module.__class__.__module__.startswith('torch.nn.modules'):
             raise RuntimeError(f'{prim_module.__class__.__module__} can not be parsed as leaf nodes')
         else:
             raise RuntimeError(f'unknown module: {prim_module.__class__.__module__}')
 
-    @staticmethod
-    def parse_prim_function_method(node: torch.fx.Node, module: torch.fx.GraphModule, constant_folding: bool, frame: Frame) -> List[IRFwOperation]:
+    def _parse_prim_function_method(self, node: torch.fx.Node) -> List[IRFwOperation]:
         """
         Convert `call_function`/`call_method` op to IRFwOperation.
 
         Args:
             node (torch.fx.Node): the node to be parsed
-            module (torch.fx.GraphModule): the module containing the node
-            constant_folding (bool): global setting of whether to fold the constant
 
         Returns:
             List[IRFwOperation]: the IRFwOperation nodes.
@@ -238,10 +268,10 @@ class FxModuleParser:
 
         """
         # get signature
-        fsig = FxModuleParser._get_qualified_name(node.target, node)
+        fsig = self._get_qualified_name(node.target, node)
         # get inputs
-        input_vals = FxModuleParser.parse_complex(list(node.args), frame)
-        kwargs = FxModuleParser.parse_complex(node.kwargs, frame)
+        input_vals = self._parse_complex(list(node.args))
+        kwargs = self._parse_complex(node.kwargs)
 
         # use context constant_folding if set
         # Please note constant_folding only controls the output of the op
@@ -249,6 +279,7 @@ class FxModuleParser:
         # when we enter the code block with different constant folding setting
         # as a workaround,
         # you can use `nnscaler.runtime.function.fold_constant` to fold inputs if needed
+        constant_folding = self.constant_folding
         op_context: Optional[Dict[str, Any]] = node.meta.get('op_context')
         if op_context is not None and op_context.get(fields(OpContext).constant_folding) is not None:
             constant_folding = op_context[fields(OpContext).constant_folding]
@@ -258,12 +289,12 @@ class FxModuleParser:
         else:
             # FIXME: handle cases for IRObject in kwargs
             # case1: unknown torch operator
-            if FxModuleParser._is_torch_autograd_op(node, frame, fsig):
+            if self._is_torch_autograd_op(node, fsig):
                 _logger.warning(f'Find unknown pytorch operation: {fsig}')
                 fname = fsig.split('.')[-1] if '.' in fsig else fsig
                 ir_node = IRFwOperation(fname, fsig, input_vals, 1, **kwargs)
             # case2: custom autograd function
-            elif FxModuleParser._is_custom_autograd_op(node):
+            elif self._is_custom_autograd_op(node):
                 # custom autograd function
                 _logger.warning(f'Find unknown custom autograd operation: {fsig}. You should register it with nnscaler.register_op')
                 ir_node = IRFwOperation(fsig, fsig, input_vals, 1, **kwargs)
@@ -276,7 +307,7 @@ class FxModuleParser:
                             'You can register it as a customized function using nnscaler.register_op to remove this warning'
                     _logger.warning(warning_msg)
                     is_constant = False
-                output = frame.get_var(node.name)
+                output = self.frame.get_var(node.name)
                 if not isinstance(output, IRObject):
                     # avoid nested IRObject
                     output = IRObject(name=node.name, value=output, is_constant=is_constant)
@@ -292,10 +323,10 @@ class FxModuleParser:
             # As node is deleted, we must set concrete value or IRTensor/IRObject into framework.
 
             # TODO: check the value saved in frame should equal to the value returned by the op
-            frame.set_var(node.name, ir_node)
+            self.frame.set_var(node.name, ir_node)
             return []
 
-        FxModuleParser._set_node_meta(node, ir_node)
+        self._set_node_meta(node, ir_node)
 
         # step 1: align the node output with the value in frame
 
@@ -307,11 +338,11 @@ class FxModuleParser:
             # but its output is used in other nodes.
             # By removing from frame,
             # we can catch the case earlier
-            frame.del_val(node.name)
+            self.frame.del_val(node.name)
             # if the function has no output, just return
             return [ir_node]
 
-        vals = frame.get_var(node.name)
+        vals: Union[Any, IRObject, List[IRObject], IRTensor, List[IRTensor]] = self.frame.get_var(node.name)
         if len(ir_node.outputs()) == 1:
             vals = [vals]
         elif IR.is_object(vals):
@@ -324,7 +355,7 @@ class FxModuleParser:
             if not isinstance(vals, (list, tuple)):
                 raise RuntimeError(f'Expect list or tuple for multiple outputs, but got {type(vals)}')
             vals = type(vals)(IRObject(name=node.name, value=v, is_constant=is_constant) for v in vals)
-            frame.set_var(node.name, vals)
+            self.frame.set_var(node.name, vals)
 
         # verify the inferred shape are consistent with actual output
         if isinstance(ir_node, IRFwOperation):
@@ -337,11 +368,43 @@ class FxModuleParser:
                 # 1. output tensors are not set in function.py
                 # 2. IRObject output from some functions (registered functions/getattr) are not set
                 # For above two cases, we need to set them with values from frame.
+                if isinstance(ir_node.output(i), IRTensor):
+                    assert isinstance(vals[i], IRTensor), f'Expect tensor for output {i}, but got {type(vals[i])}'
+                    assert ir_node.output(i).shape == vals[i].shape, f'Expect shape {ir_node.output(i).shape} for output {i}, but got {vals[i].shape}'
+                    # We need to copy dim tracks
+                    # As we will use frame version as node output, instead of the placeholder created in function.py
+                    for dim in range(len(vals[i].shape)):
+                        vals[i].dim_tracks[dim].merge(ir_node.output(i).dim_tracks[dim])
                 ir_node.set_output(i, vals[i])
+            elif isinstance(ir_node.output(i), IRObject) and ir_node.output(i).is_value_missing():
+                # output is IRObject with missing value
+                # we need to set it with the value from frame
+                assert not IR.contains_object(vals[i], lambda x: isinstance(x, IRTensor)), \
+                    f'Output {i} of node {node} is expected to be IRObject, but got tensor: {vals[i]}'
+                ir_node.output(i).value = IR.try_unwrap(vals[i])
+            else:
+                # Currently we don't support missing-value IRObject in tuple/list/dict/...
+                # TODO: add support when needed
+                assert not IR.contains_object(ir_node.output(i), lambda x: not isinstance(x, IRTensor) and x.is_value_missing()), \
+                    f'Output {i} of node {node} contains missing value: {ir_node.output(i)}'
+
+        # per-op value tracking via its annotation
+        # TODO:
+        # This may be not accurate because many ops in function.py are not properly annotated their value deps
+        # Two ways to improve it:
+        # 1. add value deps annotation for those ops in function.py
+        # 2. use global data flow analysis to track value deps
+        #    a. add all nodes without folding
+        #    b. use value_tracker.track_nodes to analyze value deps for all nodes
+        #    c. remove nodes that can be folded.
+        # It is not easy because some op logic in function.py works differently
+        # when its inputs are constant or not.
+        # For now, we just use per-op value tracking for simplicity.
+        self.value_tracker.track_nodes([ir_node])
 
         # update frame with ir output
         # Please note when there is only one output, we will unwrap it from `ir_node.outputs()` here
-        frame.set_var(
+        self.frame.set_var(
             node.name,
             type(vals)(ir_node.outputs()) if len(ir_node.outputs()) > 1 else ir_node.output(0)
         )
@@ -349,6 +412,7 @@ class FxModuleParser:
         # update the name of output tensors
         # Note assignment is not allowed in lambda
         # so we use a helper function to update the name
+
         def _update_name(x: IRObject):
             x.name = node.name
         IR.modify_objects_inplace(ir_node.outputs(), _update_name)
@@ -378,22 +442,28 @@ class FxModuleParser:
             # use a white list instead of a black list
             return isinstance(val, (int, float, bool, type(None), str, type(Ellipsis)))
 
-        # Note when it is not IRObject as a whole, we will not fold it
         if constant_folding and ir_node.constant_foldable \
             and len(ir_node.outputs()) == 1 \
-            and isinstance(ir_node.output(0), IRObject) \
-            and not isinstance(ir_node.output(0), IRTensor) \
             and not contains_undefined_output \
             and not ir_node.signature.startswith(nnscaler.runtime.function.__name__ + '.')\
-            and ir_node.output(0).is_constant \
-            and _is_primitive_type(ir_node.output(0).value):
-            frame.set_var(node.name, ir_node.output(0).value)
+            and not IR.contains_object(ir_node.output(0), lambda x: isinstance(x, IRTensor) or not x.is_constant) \
+            and _is_primitive_type(cval := IR.try_unwrap(ir_node.output(0))):
+            # TODO:
+            # This will break the value tracking graph
+            # for example, if not folded:
+            #  value1 -> op1 -> value2 -> op2 -> value3 -> op3
+            # if op2 is folded, then op3 will not know the value1 dependency
+            # So the value tracking becomes:
+            #  value1 -> op1     value3 -> op3
+            # In many cases, op1 and op3 can be connected by other ops,
+            # But when this becomes a problem, we need to fix it by using global data flow analysis.
+            self.frame.set_var(node.name, cval)
+            self.value_tracker.untrack_node(ir_node)
             return []
         else:
             return [ir_node]
 
-    @staticmethod
-    def parse_prim_get_attr_node(node: torch.fx.Node, module: torch.fx.GraphModule, frame: Frame) -> List[IRFwOperation]:
+    def _parse_prim_get_attr_node(self, node: torch.fx.Node) -> List[IRFwOperation]:
         """
         There are two types of get_attr, one is `FxNodeKind.PrimGetAttr` which is dealt with in this function.
         The other is `FxNodeKind.PrimCallFunction ` (i.e., <built-in function getattr>)
@@ -403,74 +473,84 @@ class FxModuleParser:
         node.target is the attribute name of the object.
         """
         ir_nodes = []
-        concrete_value = FxModuleParser.fetch_attr(module, node.target)
+        concrete_value = self._fetch_attr(self.module, node.target)
         if isinstance(concrete_value, torch.Tensor):
             assert isinstance(concrete_value, torch.Tensor), \
                 f"GetAttrPrim: expect tensor but got {type(concrete_value)}"
-            exist_tensor = frame.get_attr_var(concrete_value)
+            exist_tensor = self.frame.get_attr_var(concrete_value)
             # the case that the parameter is the first time used by getattr
             if not exist_tensor:
-                tensor = frame.get_var(node.name)
+                tensor: IRFullTensor = self.frame.get_var(node.name)
                 # set tensor name same with the name in original model
                 tensor.name = node.target
                 if tensor.requires_grad:
                     tensor.as_param()
                 else:
-                    direct_module = module
+                    direct_module = self.module
                     full_qualified_name = node.target.split('.')
                     for name in full_qualified_name[:-1]:  # last one is the attribute name
                         direct_module = getattr(direct_module, name)
                     persistent = full_qualified_name[-1] not in direct_module._non_persistent_buffers_set
                     tensor.as_buffer(persistent=persistent)
-                frame.add_attr(tensor, concrete_value, node.target)
+
+                # Parameters and buffers have no dependency on other values
+                for dt in tensor.dim_tracks:
+                    dt.is_constant = True
+                    dt.with_no_dep()
+
+                self.frame.add_attr(tensor, concrete_value, node.target)
             # the case that the parameter is consumed multiple times and registered previously
             else:
-                frame.set_var(node.name, exist_tensor)
+                self.frame.set_var(node.name, exist_tensor)
         else:
             assert isinstance(node.target, str), f"GetAttrPrim: expect `node.target` to be str but got {type(node.target)}"
             # in sub modules, the target is full qualified name (for example `embeddings.dropout.training`)
             if node.target.split('.')[-1] == 'training':
                 # Let's just support `self.training` and ignore all other cases for now
-                output = IRObject(name=node.name, value=frame.get_var(node.name), is_constant=False)
+                if isinstance(output := self.frame.get_var(node.name), IRObject):
+                    output.is_constant = False
+                else:
+                    output = IRObject(name=node.name, value=output, is_constant=False)
                 ir_node = IRPyFunc(SELF_GETATTR_SIG, ['training'], [output])
-                FxModuleParser._set_node_meta(node, ir_node)
-                frame.set_var(node.name, output)
+                self._set_node_meta(node, ir_node)
+                self.frame.set_var(node.name, output)
                 # never fold the IRPyFunc node
                 ir_nodes.append(ir_node)
             else:
-                frame.set_var(node.name, concrete_value)
+                self.frame.set_var(node.name, concrete_value)
 
+        self.value_tracker.track_nodes(ir_nodes)
         return ir_nodes
 
-    @staticmethod
-    def parse_prim_output_node(node: torch.fx.Node, module: torch.fx.GraphModule, frame: Frame) -> List[IRCell]:
+    def _parse_prim_output_node(self, node: torch.fx.Node) -> List[IRCell]:
         assert len(node.args) == 1 and len(node.kwargs) == 0
-        output = FxModuleParser.parse_complex(node.args[0], frame)
-        frame.set_var(node.name, output)
+        output = self._parse_complex(node.args[0])
+        self.frame.set_var(node.name, output)
         return []
 
-    @staticmethod
-    def _set_node_meta(node: torch.fx.Node, ir_node: Union[IRCell, Any]):
+    @classmethod
+    def _set_node_meta(cls, node: torch.fx.Node, ir_node: Union[IRCell, Any]):
         if not isinstance(ir_node, IRCell):
             return
 
         ir_node.op_context = node.meta.get('op_context')
         module_stack = node.meta.get('nn_module_stack')
         ir_node.module_stack = module_stack
+        ir_node.call_expr = node.meta.get('call_expr')
         comment = str(node.meta.get('frame_record', ''))
         if comment:
             ir_node.comment = comment
 
-    @staticmethod
-    def _get_qualified_name(node_target: Union[str, Callable[..., Any]], node: torch.fx.Node = None) -> str:
+    @classmethod
+    def _get_qualified_name(cls, node_target: Union[str, Callable[..., Any]], node: torch.fx.Node = None) -> str:
         if isinstance(node_target, str):
             assert node is not None
-            return FxModuleParser._get_qualified_name_of_call_method(node_target, node)
+            return cls._get_qualified_name_of_call_method(node_target, node)
         else:
-            return FxModuleParser._get_qualified_name_of_call_function(node_target)
+            return cls._get_qualified_name_of_call_function(node_target)
 
-    @staticmethod
-    def _get_qualified_name_of_call_function(node_target: Callable[..., Any]) -> str:
+    @classmethod
+    def _get_qualified_name_of_call_function(cls, node_target: Callable[..., Any]) -> str:
         """
         The target field of call_function node must be an callable object.
         """
@@ -480,12 +560,12 @@ class FxModuleParser:
         # TODO(yizhu1): find a general solution
         assert callable(node_target)
         name = node_target.__name__
-        module = FxModuleParser._find_module_of_method(node_target)
+        module = cls._find_module_of_method(node_target)
         module = module.replace('torch._ops', 'torch.ops')  # WAR for bug in how torch.ops assigns module
         return f'{module}.{name}'
 
-    @staticmethod
-    def _get_qualified_name_of_call_method(node_target: str, node: torch.fx.Node) -> str:
+    @classmethod
+    def _get_qualified_name_of_call_method(cls, node_target: str, node: torch.fx.Node) -> str:
         """
         The target field of call_method node must be a string.
         """
@@ -513,8 +593,8 @@ class FxModuleParser:
         else:
             return f'{in_type.__module__}.{in_type.__name__}.{node_target}'
 
-    @staticmethod
-    def _find_module_of_method(orig_method: Callable[..., Any]) -> str:
+    @classmethod
+    def _find_module_of_method(cls, orig_method: Callable[..., Any]) -> str:
         if getattr(orig_method, '__name__', None) == 'apply' and isinstance(getattr(orig_method, '__self__', None), Type) \
             and issubclass(orig_method.__self__, torch.autograd.Function):
             # for torch.autograd.Function
@@ -547,18 +627,49 @@ class FxModuleParser:
                 return guess.__name__
         raise RuntimeError(f'cannot find module for {orig_method}')
 
-    @staticmethod
-    def _is_torch_autograd_op(node: torch.fx.Node, frame: Frame, signature: str) -> bool:
+    def _is_torch_autograd_op(self, node: torch.fx.Node, signature: str) -> bool:
         """Check whether the node is of a pytorch autograd operation."""
         # note: some python operations like torch.Tensor.size() doesn't return
         # an IRTensor, thus cannot be considered as a pytorch autograd operator.
         return signature.startswith('torch.') and \
-               isinstance(frame.get_var(node.name), IRFullTensor)
+               isinstance(self.frame.get_var(node.name), IRFullTensor)
 
-    @staticmethod
-    def _is_custom_autograd_op(node: torch.fx.Node) -> bool:
+    @classmethod
+    def _is_custom_autograd_op(cls, node: torch.fx.Node) -> bool:
         node_target = node.target
         return callable(node_target) \
             and getattr(node_target, '__name__', None) == 'apply' \
             and isinstance(getattr(node_target, '__self__', None), Type) \
             and issubclass(node_target.__self__, torch.autograd.Function)
+
+
+def parse_fx_module(
+    module: torch.fx.GraphModule,
+    dummy_inputs: Dict[str, Any],
+    attr_savedir='./',
+    *,
+    save_content: bool = True,
+    constant_folding: bool = False
+) -> Tuple[List[IRObject], List[IRFwOperation], List[IRObject]]:
+    """Parse torch.fx module into cube IR
+
+    The overall entry to parse a torch.fx graph module
+
+    Args:
+        module (torch.fx.GraphModule): the torch.fx module
+        dummy_inputs (Dict[str, Any]): the dummy inputs to run the module
+        attr_savedir (str): the directory to save the attribute content
+        constant_folding (bool): whether to parse the module with constant folding
+
+    Returns:
+        inputs (List[IRObject]): the input IRObjects
+        all_ir_nodes (List[IRFwOperation]): the IRFwOperation nodes
+        outputs (List[IRObject]): the output IRObjects
+    """
+    return FxModuleParser(
+        module,
+        dummy_inputs,
+        attr_savedir,
+        save_content=save_content,
+        constant_folding=constant_folding
+    ).parse()

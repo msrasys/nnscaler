@@ -27,10 +27,10 @@ can be
     3) gradient of parameters
 """
 
-from typing import List, Optional, Union, Tuple, NewType, Dict, Any
+from typing import List, Optional, Set, Union, Tuple, NewType, Dict, Any
 import torch
 
-from nnscaler.ir.cten import IRTensor
+from nnscaler.ir.cten import IRTensor, ValueTrack
 
 StartEnd = NewType('[start:end)', Tuple[int, int])
 IdxChunk = NewType('(index, chunks)', Tuple[int, int])
@@ -260,14 +260,17 @@ class IRFullTensor(IRTensor):
     """
 
     def __init__(self, shape=None, name='tensor', requires_grad=False, dtype=None, *,
-        is_attr=False, is_grad=False, persistent=False, is_loss=False
+        is_attr=False, is_grad=False, persistent=False, is_loss=False,
     ):
         self._is_loss: bool = False
         # record all created sub_tensors
         self._subtensors : Dict[(ValueMap, IndexMap), int] = dict()
         self._grad: Optional[IRFullTensor] = None
 
-        super().__init__(shape, name, dtype, requires_grad=requires_grad, is_attr=is_attr, is_grad=is_grad, persistent=persistent)
+        super().__init__(
+            shape, name, dtype, requires_grad=requires_grad,
+            is_attr=is_attr, is_grad=is_grad, persistent=persistent,
+        )
         self._update(
             is_loss=is_loss,
         )
@@ -334,6 +337,7 @@ class IRFullTensor(IRTensor):
             self.origin_shape, self.name, self._requires_grad,
             self._dtype, is_loss=self._is_loss
         )
+        tensor.dim_tracks = self.dim_tracks
         return tensor
 
     def like_grad(self):
@@ -346,6 +350,7 @@ class IRFullTensor(IRTensor):
             self.origin_shape, 'g' + self.name,
             requires_grad=False, dtype=self.dtype
         ).as_grad(self._is_attr)
+        grad.dim_tracks = self.dim_tracks
         return grad
 
     @property
@@ -363,6 +368,7 @@ class IRFullTensor(IRTensor):
             assert self._requires_grad, f"Cannot assign {val} to no grad-required tensor"
             assert val.origin_shape == self.origin_shape
             assert val.is_attr() == self.is_attr()
+            val.dim_tracks = self.dim_tracks
         # TODO: we should check the grad-required here
         # it is very common in current code that we assign None to grad
         # so currently it is impossible to check the grad-required here
@@ -507,6 +513,7 @@ class IRSubTensor(IRTensor):
         del self._is_grad
         del self._requires_grad
         del self._persistent
+        del self._dim_tracks
 
         self.cell = None
         # the index from full_tensor
@@ -556,7 +563,7 @@ class IRSubTensor(IRTensor):
     def as_attr(self):
         raise RuntimeError("as_attr is not allowed for SubTensor")
 
-    def splitdims(self) -> Tuple[int]:
+    def splitdims(self) -> Tuple[int, ...]:
         """!
         Get partitioned dimensions
 
@@ -676,6 +683,10 @@ class IRSubTensor(IRTensor):
     def dtype(self) -> Optional[torch.dtype]:
         """Tensor data type"""
         return self.parent.dtype
+
+    @property
+    def dim_tracks(self) -> Tuple[ValueTrack, ...]:
+        return self.parent.dim_tracks
 
     @IRTensor.shape.setter
     def shape(self, val: Tuple[int]):

@@ -3,7 +3,7 @@
 
 from dataclasses import asdict, dataclass, field, replace
 import importlib
-from typing import Any, Callable, Dict, List, Literal, Optional, TYPE_CHECKING, Union, TypeVar
+from typing import Any, Callable, Dict, List, Literal, Optional, TYPE_CHECKING, Type, Union, TypeVar
 from typing_extensions import get_args
 from pathlib import Path
 import logging
@@ -15,12 +15,12 @@ import builtins
 import torch
 import torch.utils
 import torch.utils.data
-import torch.utils.data.dataloader
+from torch.utils.data.dataloader import DataLoader
 import yaml
 import torch
 
 import nnscaler
-from nnscaler.utils import fields, transform_recursively, load_type
+from nnscaler.utils import enforce_zero_num_worker, fields, fn_field, transform_recursively, load_type, copy_dynamic
 from nnscaler.parallel import ComputeConfig, build_optimizer, ReuseType, BroadcastGenFilesStrategy, _PREDEFINED_POLICIES
 from nnscaler.runtime.module import ParallelModule
 
@@ -32,6 +32,7 @@ from .arg_parser import (
 )
 from .loggers.logger_base import LoggerBase
 from .train_hook import TrainHook
+from .serialization import Checkpointer
 
 if TYPE_CHECKING:
     from .trainer import Trainer
@@ -123,9 +124,9 @@ def fix_input(input, input_dtype=None):
         return tuple(fix_input(v, input_dtype) for v in input)
     elif isinstance(input, torch.Tensor):
         if input.is_floating_point() and input_dtype is not None:
-            return input.to(input_dtype).cuda()
+            return copy_dynamic(input, input.to(input_dtype).cuda())
         else:
-            return input.cuda()
+            return copy_dynamic(input, input.cuda())
     return input
 
 
@@ -238,9 +239,17 @@ class ModuleParallelizeConfig:
     # we can parallelize submodules instead of creating whole model.
     # This is useful sometimes.
     args: Optional[Dict[str, Any]] = None
-    # the full qualified name of the function to generate dummy forward args
-    # Its type should be `Callable[[TrainerArgs],Dict[str, Any]]`
-    forward_args_gen_fn: str = None
+    # the full qualified name of the function to generate dummy inputs for forward
+    # Its type should be `Callable[[TrainerArgs], dict[str, Any]]`
+    # where the output dict is the kwargs for forward function of the module
+    # The tensors in the sample will be moved to GPU and converted to input_dtype by trainer.
+    forward_args_gen_fn: Optional[Callable[['TrainerArgs'], dict[str, Any]]] = fn_field(default=None)
+    # the full qualified name of the function to post process the dummy inputs for forward
+    # Note the tensors in the inputs have been moved to GPU and converted to input_dtype
+    # But you can still further process the sample,
+    # for example, mark some dims of tensors as dynamic
+    # (you can do it in `forward_args_gen_fn` as well)
+    forward_args_post_process_fn: Optional[Callable[['TrainerArgs', dict[str, Any]], dict[str, Any]]] = fn_field(default=None)
     # the model state dict file for tracing.
     # It is only used in tracing to serve as the initial state dict of the model.
     tracing_from_weights: str = None
@@ -289,8 +298,7 @@ class ModuleParallelizeConfig:
         return self.model_type(*args, **kwargs)
 
     def create_dummy_forward_args(self, trainer_args: 'TrainerArgs') -> dict[str, Any]:
-        forward_args_gen_fn = load_type(self.forward_args_gen_fn)
-        return forward_args_gen_fn(trainer_args)
+        return self.forward_args_gen_fn(trainer_args)
 
 
 @dataclass
@@ -314,6 +322,7 @@ class OptimizerConfig:
     args: Dict[str, Any] = field(default_factory=dict)
     clip_gnorm: float = 0.0
 
+    param_clss_fn: Optional[Callable[[str], Any]] = fn_field(default=None)
     # loss reduction method
     # mean: average the loss over all micro-batches
     # sum: sum the loss of all micro-batches
@@ -328,6 +337,13 @@ class OptimizerConfig:
     # per-token-mean: average the gradients over all tokens
     #    you must specify `aggregate_outputs_fn` and return the number of tokens
     grad_reduction: str = 'mean'
+    # the divisor applied to gradients before all-reduce. If not set, the default
+    # divisor is `runtime_ngpus / plan_ngpus`. We divide the gradients to avoid overflow.
+    # However, if the gradients are in high precision or the user has known the range of
+    # the gradients, he/she can set a smaller divisor to improve the accuracy. Note that
+    # the gradients will be recovered by multiplying the divisor after all-reduce and before
+    # optimizer step.
+    grad_reduce_divisor: Optional[float] = None
     # the function to aggregate the outputs from all micro-batches
     # inputs: (list of local outputs, torch group)
     # output: AggregateOutputs
@@ -403,12 +419,47 @@ class ResumeOptions:
     # `None` means will load the sharded checkpoint files if the world size is not changed.
     #    and will load merged checkpoint if the world size is changed.
     with_merged: Optional[bool] = None
+    # If the memory is limited, we can save memory by only loading merged state dict in GPU 0 of each node
+    # and broadcast trimmed state dict to other ranks in the same node
+    # although this will be slower
+    # Only used when resuming from a merged checkpoint.
+    save_memory: bool = True
+
+
+@dataclass
+class SerializerOptions:
+    # the serialization runner to be used
+    # It should be a name of registered SerializationRunners
+    name: str = ''
+
+    # the full qualified name of the function to create the serialization runner
+    # Currently we do not support this way
+    # to make sure all serialization runners are registered and can be used in other places
+    # (like nnscaler.cli.Trainer.merge_checkpoint)
+    # type: str = None
+
+    # arguments for the serialization runner
+    # Note You should be able to load for any arguments
+    args: Dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
 class CheckpointConfig:
     save_dir: str = './checkpoints'
     no_save: bool = False
+
+    # `"pt"`: PyTorch native format
+    # `"safetensors"`: Safetensors format
+    # You can also register new formats via `nnscaler.cli.serialization.register_format`
+    # or specify a custom format here by providing a CheckpointFormat subclass
+    format: str = 'pt'
+
+    # the serialization runner to be used
+    # It should be a name of registered SerializationRunners
+    # If None, the default serializer will be used
+    serializer: Optional[SerializerOptions] = field(default=None, metadata={
+        'normalize': lambda x: {'name': x} if isinstance(x, str) else x
+    })
 
     # `"sharded"`: Each rank saves its shard of weights and optimizer states to a file. The checkpoint is
     #   a folder with as many files as the world size.
@@ -452,6 +503,13 @@ class CheckpointConfig:
         return load_type(self.resume_from.convert_fn)
 
     def __post_init__(self):
+        # backward compatibility
+        if isinstance(self.resume_from, str):
+            self.resume_from = ResumeOptions(checkpoint=self.resume_from)
+
+        if isinstance(self.serializer, str):
+            self.serializer = SerializerOptions(name=self.serializer)
+
         if self.resume_from and self.resume_from.checkpoint:
             if self.resume_from.checkpoint in ['last', 'best']:
                 if not self.save_dir:
@@ -467,6 +525,12 @@ class CheckpointConfig:
             raise ValueError(f"Invalid save_type {self.save_type}")
         if not self.save_dir:
             raise ValueError("save_dir is required")
+
+        if self.format not in Checkpointer.NAME_MAP:
+            raise ValueError(f"Invalid format {self.format}")
+
+        if self.serializer and self.serializer.name not in Checkpointer.REGISTERED_RUNNERS:
+            raise ValueError(f"Invalid Serialization runner {self.serializer.name}")
 
         if self.every_n_epochs is not None and self.every_n_train_steps is not None:
             raise ValueError("Cannot specify both every_n_epochs and every_n_train_steps")
@@ -551,6 +615,7 @@ class HookMapConfig:
     on_load_checkpoint: str = None
     after_load_checkpoint: str = None
     on_save_checkpoint: str = None
+    on_expire_checkpoint: str = None
 
 
 class ArgsTrainHook(TrainHook):
@@ -595,9 +660,16 @@ class TrainerArgs(PrecisionMixin, PolicyMixin):
     # compile: compile the model but not training
     # run: compile and run the model
     run_mode: str = 'run'
-    # the full qualified name of the function to generate dummy sample for forward
+    # the full qualified name of the function to generate dummy sample
     # Its type should be `Callable[[TrainerArgs], Any]`
-    dummy_sample_gen_fn: str = None
+    # The tensors in the sample will be moved to GPU and converted to input_dtype by trainer.
+    dummy_sample_gen_fn: Optional[Callable[['TrainerArgs'], Any]] = fn_field(default=None)
+    # the full qualified name of the function to post process the dummy sample
+    # Note the tensors in the sample have been moved to GPU and converted to input_dtype
+    # But you can still further process the sample,
+    # for example, you can use this function to mark some dims of tensors as dynamic
+    # when you don't use `dummy_sample_gen_fn` or don't handle dynamic dims in it,
+    dummy_sample_post_process_fn: Optional[Callable[['TrainerArgs', Any], Any]] = fn_field(default=None)
     # the model state dict file for tracing.
     # It is only used in tracing to serve as the initial state dict of the model.
     tracing_from_weights: str = None
@@ -723,6 +795,10 @@ class TrainerArgs(PrecisionMixin, PolicyMixin):
             )
 
         self._vars = self.create_kwarg(self.vars)
+        # will be initialized lazily
+        # because it is heavy, and may not be used in some cases
+        # and it looks weird to initialize it eagerly in __post_init__
+        self._dummy_input = None
 
     @classmethod
     def from_cli(cls, argv: List[str]) -> 'TrainerArgs':
@@ -812,12 +888,6 @@ class TrainerArgs(PrecisionMixin, PolicyMixin):
         return load_type(self.optimizer.aggregate_outputs_fn)
 
     @property
-    def resolved_dummy_sample_gen_fn(self):
-        if not self.dummy_sample_gen_fn:
-            return None
-        return load_type(self.dummy_sample_gen_fn)
-
-    @property
     def scaling_factor(self):
         return self.compute_config.runtime_ngpus // self.compute_config.plan_ngpus
 
@@ -846,7 +916,7 @@ class TrainerArgs(PrecisionMixin, PolicyMixin):
         init_env_fn = load_type(self.init_env_fn)
         init_env_fn(trainer)
 
-    def get_resolved_var(self, fqn: str) -> Any:
+    def get_resolved_var(self, fqn: str, *, default: Any = None) -> Any:
         """
         Get a resolved variable from the vars dictionary.
         The fqn is a full qualified name of the variable, e.g. 'x.y.z'.
@@ -855,18 +925,47 @@ class TrainerArgs(PrecisionMixin, PolicyMixin):
         var = self._vars
         for part in parts:
             if part not in var:
-                raise ValueError(f"Variable {fqn} not found in vars")
+                return default
             var = var[part]
         return var
+
+    @property
+    def dummy_input(self):
+        if self._dummy_input is None:
+            self._dummy_input = self._load_dummy_input()
+            self._dummy_input = fix_input(self._dummy_input, self.input_dtype)
+            if self.dummy_sample_post_process_fn:
+                self._dummy_input = self.dummy_sample_post_process_fn(self, self._dummy_input)
+        return self._dummy_input
+
+    def _load_dummy_input(self):
+        if self.dummy_sample_gen_fn:
+            return self.dummy_sample_gen_fn(self)
+
+        with enforce_zero_num_worker(DataLoader):
+            dataset = self.create_dataset('train')
+            dataloader = self.create_dataloader('train', dataset)
+            assert dataloader.num_workers == 0, "The dataloader must have `num_workers=0`."
+            value = next(iter(dataloader))
+            if close_fn := getattr(dataloader, 'close', None):
+                close_fn()
+            return value
 
     def create_model(self) -> torch.nn.Module:
         kwargs = self.create_kwarg(self.model.args)
         return self.model_type(**kwargs)
 
+    def should_delay_bucket_building(self) -> bool:
+        return self.optimizer.param_clss_fn is not None
+
     def create_parallel_optimizer(self, parallel_model: torch.nn.Module):
         kwargs = self.create_kwarg(self.optimizer.args)
         optimizer_class = load_type(self.optimizer.type)
-        return build_optimizer(parallel_model, optimizer_class, self.compute_config, **kwargs)
+        return build_optimizer(
+            parallel_model, optimizer_class, self.compute_config,
+            self.optimizer.param_clss_fn,
+            **kwargs
+        )
 
     def create_dataset(self, stage='train'):
         dataset_args = getattr(self.dataset, f'{stage}_args')
@@ -947,3 +1046,12 @@ class TrainerArgs(PrecisionMixin, PolicyMixin):
             return ArgsTrainHook(hook_config)
         else:
             raise ValueError(f"Invalid hook_config {hook_config}")
+
+    def create_checkpointer(self) -> Checkpointer:
+        if self.checkpoint.serializer:
+            return Checkpointer(
+                self.checkpoint.format,
+                self.checkpoint.serializer.name,
+                self.checkpoint.serializer.args
+            )
+        return Checkpointer(self.checkpoint.format)

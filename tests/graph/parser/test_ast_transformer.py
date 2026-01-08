@@ -164,12 +164,12 @@ def test_proxy_call_transform():
     assert modified
     assert '\n'.join(line for line in ast.unparse(new_ast).split('\n') if line.strip()) == dedent('''
         def f(func_name, type: int, /, *args, **kwargs):
-            return patched_run(func_name, type, *args, **kwargs)
+            return patched_run(func_name, 'func_name(type, *args, **kwargs)', type, *args, **kwargs)
         def g():
-            return patched_run(x + y, a, b)
+            return patched_run(x + y, '(x + y)(a, b)', a, b)
         class A:
             def f(self) -> None:
-                patched_run(patched_run(super).f)
+                patched_run(patched_run(super, 'super()').f, 'super().f()')
         ''').strip()
 
 
@@ -188,10 +188,10 @@ def test_transform_combine():
     modified, new_ast  = transform(tree, transfomers)
     assert modified
     assert '\n'.join(line for line in ast.unparse(new_ast).split('\n') if line.strip()) == dedent('''
-        x = patched_run(not_, True)
+        x = patched_run(not_, 'not_(True)', True)
         def f(func_name, type: int, /, *args, **kwargs):
-            return patched_run(func_name, type, *args, **kwargs)
+            return patched_run(func_name, 'func_name(type, *args, **kwargs)', type, *args, **kwargs)
         class A:
             def __init__(self) -> None:
-                patched_run(super(self.__class__, self).__init__)
+                patched_run(super(self.__class__, self).__init__, 'super(self.__class__, self).__init__()')
         ''').strip()
