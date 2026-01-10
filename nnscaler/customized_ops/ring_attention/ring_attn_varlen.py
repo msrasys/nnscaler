@@ -146,13 +146,14 @@ def wrap_ring_attn_varlen_func(
     if process_group is None or len(process_group) == 1 or not enable_ring:
         if use_cute:
             assert flash_attn_cute_varlen_func is not None, "flash_attn.cute is not available"
+            cute_window_size = tuple(None if w == -1 else w for w in window_size)
             output, _ = flash_attn_cute_varlen_func(
                 q, k, v,
                 cu_seqlens_q=cu_seqlens_q,
                 cu_seqlens_k=cu_seqlens_k,
                 softmax_scale=softmax_scale,
                 causal=causal,
-                window_size=window_size,
+                window_size=cute_window_size,
                 deterministic=deterministic,
             )
             return output
