@@ -15,6 +15,7 @@ import logging
 import copy
 import os
 from collections import OrderedDict, defaultdict
+from concurrent.futures import ThreadPoolExecutor
 
 import torch
 import torch.distributed
@@ -2345,6 +2346,278 @@ def _get_valid_name_from_merged_model(
     return None
 
 
+def plan_batches(
+    src_file_list: List[str],
+    dst_file_list: List[str],
+    buffer_size: int,
+) -> List[Tuple[int, int, int]]:
+    """
+    Plan how to batch files for transfer.
+    
+    Files are assumed to be sorted by size (ascending).
+    Small files are merged into batches up to buffer_size.
+    Large files (> buffer_size) are sent alone.
+    
+    Args:
+        file_sizes: List of file sizes in bytes (sorted ascending)
+        buffer_size: Maximum buffer size for batching files
+        
+    Returns:
+        List of (start_idx, end_idx, total_size) tuples
+    """
+    file_info = []  # (size, src_path, dst_path)
+    for src, dst in zip(src_file_list, dst_file_list):
+        size = os.path.getsize(src)
+        file_info.append((size, src, dst))
+    
+    # Sort by size (ascending), then by src path for determinism
+    file_info.sort(key=lambda x: (x[0], x[1]))
+    
+    # Build sorted lists
+    sorted_sizes = [info[0] for info in file_info]
+    sorted_src = [info[1] for info in file_info]
+    sorted_dst = [info[2] for info in file_info]
+
+    num_files = len(sorted_sizes)
+    
+    batches = []
+    i = 0
+    
+    while i < num_files:
+        batch_start = i
+        batch_size = 0
+        
+        while i < num_files:
+            file_size = sorted_sizes[i]
+            
+            if file_size > buffer_size:
+                # Large file: if batch is empty, take it alone; otherwise end batch here
+                if batch_size == 0:
+                    batches.append((i, i + 1, file_size))
+                    i += 1
+                break
+            elif batch_size + file_size <= buffer_size:
+                batch_size += file_size
+                i += 1
+            else:
+                # Can't fit, end current batch
+                break
+        
+        # Record batch if we accumulated files
+        if batch_start < i and (not batches or batches[-1][0] != batch_start):
+            batches.append((batch_start, i, batch_size))
+    
+    return {
+        'sorted_sizes': sorted_sizes,
+        'sorted_src': sorted_src,
+        'sorted_dst': sorted_dst,
+        'batches': batches,
+    }
+
+
+def broadcast_file_from_rank(rank, file_path, to_file_path, from_rank, device, file_size, max_chunk_size=250 * 1024 * 1024, group=None):
+    if file_size == 0:
+        if rank != from_rank:
+            with open(to_file_path, "wb") as f:
+                f.write(b"")
+        return
+
+    if group is None:
+        group = torch.distributed.group.WORLD
+    pinned_cpu_tensor = torch.empty(min(max_chunk_size, file_size), dtype=torch.uint8).pin_memory()
+
+    for offset in range(0, file_size, max_chunk_size):
+        read_size = min(max_chunk_size, file_size - offset)
+        if rank == from_rank:
+            with open(file_path, "rb") as f:
+                f.seek(offset)
+                data = f.read(read_size)
+            tensor = torch.frombuffer(data, dtype=torch.uint8).contiguous().pin_memory()
+            tensor = tensor.to(device)
+            torch.cuda.synchronize()
+            torch.distributed.broadcast(tensor, src=from_rank, group=group, async_op=True)
+        else:
+            tensor = torch.empty(read_size, dtype=torch.uint8, device=device)
+            torch.distributed.broadcast(tensor, src=from_rank, group=group)
+            torch.cuda.synchronize()
+
+            file_dir = os.path.dirname(to_file_path)
+            if not os.path.exists(file_dir):
+                os.makedirs(file_dir, exist_ok=True)
+
+            with open(to_file_path, "ab" if offset > 0 else "wb") as f:
+                pinned_cpu_tensor[:read_size].copy_(tensor)
+                np_array = pinned_cpu_tensor.numpy()[:read_size]
+                np_array.tofile(f)
+
+
+def broadcast_concat_files_from_rank(
+    rank: int,
+    file_paths: List[str],
+    file_sizes: List[int],
+    to_file_paths: List[str],
+    from_rank: int,
+    device: torch.device,
+    group: Optional[torch.distributed.ProcessGroup] = None,
+    num_io_workers: int = 8,
+):
+    """
+    Broadcast multiple files concatenated together from from_rank to all other ranks.
+    Files are read in parallel on from_rank, concatenated, then broadcast once.
+    Receivers split the data back into individual files.
+    
+    Args:
+        rank: Current process rank
+        file_paths: List of source file paths to read and concatenate (used on from_rank)
+        file_sizes: List of file sizes corresponding to file_paths
+        to_file_paths: List of destination file paths (one-to-one with file_paths)
+        from_rank: Source rank to broadcast from
+        device: Device for tensors (cuda or cpu)
+        max_chunk_size: Maximum buffer size (default: 250MB, total_size must be <= this)
+        group: Process group for communication (default: None, uses WORLD)
+        num_io_workers: Number of parallel threads for reading files (default: 8)
+    """
+    if group is None:
+        group = torch.distributed.group.WORLD
+    
+    total_size = sum(file_sizes)
+    
+    # Prepare pinned memory buffer for efficient CPU<->GPU transfer
+    pinned_cpu_tensor = torch.empty(total_size, dtype=torch.uint8).pin_memory()
+    
+    if rank == from_rank:
+        # Read all files in parallel
+        def read_file(args):
+            idx, fpath = args
+            with open(fpath, 'rb') as f:
+                return idx, f.read()
+        
+        with ThreadPoolExecutor(max_workers=num_io_workers) as executor:
+            results = list(executor.map(read_file, enumerate(file_paths)))
+        
+        # Sort by index and concatenate
+        results.sort(key=lambda x: x[0])
+        concat_data = bytearray()
+        for _, data in results:
+            concat_data.extend(data)
+        
+        # Convert to tensor and move to device
+        tensor = torch.frombuffer(bytes(concat_data), dtype=torch.uint8).contiguous().pin_memory()
+        tensor = tensor.to(device)
+        if device.type == 'cuda':
+            torch.cuda.synchronize()
+        torch.distributed.broadcast(tensor, src=from_rank, group=group)
+    else:
+        # Receive concatenated data
+        tensor = torch.empty(total_size, dtype=torch.uint8, device=device)
+        torch.distributed.broadcast(tensor, src=from_rank, group=group)
+        if device.type == 'cuda':
+            torch.cuda.synchronize()
+        
+        # Copy to CPU
+        pinned_cpu_tensor.copy_(tensor)
+        concat_data = bytes(pinned_cpu_tensor.numpy())
+        
+        # Create all directories first
+        for to_path in to_file_paths:
+            file_dir = os.path.dirname(to_path)
+            if file_dir and not os.path.exists(file_dir):
+                os.makedirs(file_dir, exist_ok=True)
+        
+        # Split and write files in parallel
+        def write_file(args):
+            idx, to_path, offset, size = args
+            with open(to_path, 'wb') as f:
+                f.write(concat_data[offset:offset+size])
+        
+        # Build offset list
+        offset = 0
+        write_tasks = []
+        for idx, (to_path, fsize) in enumerate(zip(to_file_paths, file_sizes)):
+            write_tasks.append((idx, to_path, offset, fsize))
+            offset += fsize
+        
+        # Write files in parallel
+        with ThreadPoolExecutor(max_workers=num_io_workers) as executor:
+            list(executor.map(write_file, write_tasks))
+
+
+def sync_files(
+    src_file_list: List[str],
+    dst_file_list: List[str],
+    rank: int,
+    local_world_size: int = None,
+    buffer_size: int = 250 * 1024 * 1024,  # 250MB
+    device: Optional[torch.device] = None,
+) -> int:
+    if device is None:
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    if local_world_size is None:
+        local_world_size = int(os.environ.get('LOCAL_WORLD_SIZE', default=1))
+    
+    # ===== Phase 1: src_rank collects metadata, plans batches, broadcasts all at once =====
+    if rank == 0:
+        # Prepare metadata to broadcast
+        metadata = plan_batches(
+            src_file_list=src_file_list,
+            dst_file_list=dst_file_list,
+            buffer_size=buffer_size,
+        )
+    else:
+        metadata = None
+    
+    # Broadcast metadata using broadcast_object_list
+    metadata_list = [metadata]
+    torch.distributed.broadcast_object_list(metadata_list, src=0)
+    metadata = metadata_list[0]
+    
+    # Unpack metadata on all ranks
+    sorted_sizes = metadata['sorted_sizes']
+    sorted_src = metadata['sorted_src']
+    sorted_dst = metadata['sorted_dst']
+    batches = metadata['batches']
+    num_batches = len(batches)
+    
+    sub_groups = []
+    world_size = torch.distributed.get_world_size()
+    for sub_rank in range(local_world_size):
+        if sub_rank >= num_batches:
+            break
+
+        ranks = list(range(sub_rank, world_size, local_world_size))
+        sub_groups.append(DeviceGroup().get_group(ranks=ranks))
+    
+    for batch_idx in range(num_batches):
+        from_rank = batch_idx % local_world_size
+        if rank % local_world_size != from_rank:
+            continue
+        group = sub_groups[from_rank]
+        start, end, batch_total_size = batches[batch_idx]
+        if start + 1 == end:
+            broadcast_file_from_rank(
+                rank=rank,
+                file_path=sorted_src[start],
+                to_file_path=sorted_dst[start],
+                from_rank=from_rank,
+                device=device,
+                file_size=sorted_sizes[start],
+                group=group,
+            )
+        else:
+            broadcast_concat_files_from_rank(
+                rank=rank,
+                file_paths=sorted_src[start:end],
+                file_sizes=sorted_sizes[start:end],
+                to_file_paths=sorted_dst[start:end],
+                from_rank=from_rank,
+                device=device,
+                group=group,
+            )
+    
+    torch.distributed.barrier(group=group)
+    return len(sorted_sizes)
+
+
 def _broadcast_gen_files(
     module_class: Type[torch.nn.Module],
     *,
@@ -2382,53 +2655,37 @@ def _broadcast_gen_files(
     ranks = list(range(0, world_size, local_world_size))
     group = DeviceGroup().get_group(ranks)
 
-    # use the first rank of each node to broadcast
-    if  curr_rank % local_world_size == 0:
-        _, outdir = _prepare_namespace(gen_savedir, module_class, instance_name)
-        files: List[str] = []
-        # send file list
-        if curr_rank == 0:
-            for file in outdir.glob('*'):
-                if file.is_file() and (
-                    broadcast_strategy == BroadcastGenFilesStrategy.ALL or
-                    (
-                        broadcast_strategy == BroadcastGenFilesStrategy.NO_WEIGHTS
-                        and not file.name.startswith(FxModuleParser.ATTR_CONTENT_FILE_STEM)
-                    ) or
-                    (
-                        # broadcast code files and compute config file
-                        # please note the compute config file can be updated
-                        # even when the graph is reused.
-                        broadcast_strategy == BroadcastGenFilesStrategy.CODE
-                        and (file.suffix  == '.py' or file.name == ParallelModule.COMPUTE_CONFIG_FILE)
-                    )
-                ):
-                    files.append(file.name)
-            sent_obj = [files]
-        else:
-            sent_obj = [None]
-        torch.distributed.broadcast_object_list(
-            sent_obj,
-            src=0,
-            group=group,
-        )
-        # get file list
-        if curr_rank != 0:
-            files = sent_obj[0]
+    _, outdir = _prepare_namespace(gen_savedir, module_class, instance_name)
+    files: List[str] = []
+    for file in outdir.glob('*'):
+        if file.is_file() and (
+            broadcast_strategy == BroadcastGenFilesStrategy.ALL or
+            (
+                broadcast_strategy == BroadcastGenFilesStrategy.NO_WEIGHTS
+                and not file.name.startswith(FxModuleParser.ATTR_CONTENT_FILE_STEM)
+            ) or
+            (
+                # broadcast code files and compute config file
+                # please note the compute config file can be updated
+                # even when the graph is reused.
+                broadcast_strategy == BroadcastGenFilesStrategy.CODE
+                and (file.suffix  == '.py' or file.name == ParallelModule.COMPUTE_CONFIG_FILE)
+            )
+        ):
+            files.append(file.name)
 
-        logger.info(f'File list broadcasted ({len(files)} in total).')
-        # send file content one by one
-        for fname in files:
-            if curr_rank == 0:
-                with open(outdir / fname, 'rb') as f:
-                    data = [f.read()]
-            else:
-                data = [None]
-            torch.distributed.broadcast_object_list(data, src=0, group=group)
-            if curr_rank != 0:
-                with open(outdir / fname, 'wb') as f:
-                    f.write(data[0])
-            logger.info(f'File {fname} broadcasted.')
+    logger.info(f'File list broadcasted ({len(files)} in total).')
+
+    sync_files(
+        src_file_list=[str(outdir / fname) for fname in files],
+        dst_file_list=[str(outdir / fname) for fname in files],
+        rank=curr_rank,
+        local_world_size=local_world_size,
+        buffer_size=250 * 1024 * 1024,  # 250MB
+        device=torch.device('cuda' if torch.cuda.is_available() else 'cpu'),
+    )
+
+    logger.info(f'Rank {curr_rank} finished broadcasting generated files.')
 
     # wait for all nodes to finish
     torch.distributed.barrier()
