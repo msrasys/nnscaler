@@ -2622,7 +2622,6 @@ def sync_files(
                 group=group,
             )
     
-    torch.distributed.barrier(group=group)
     return len(sorted_sizes)
 
 
