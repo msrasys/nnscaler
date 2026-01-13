@@ -17,11 +17,15 @@ from dataclasses import dataclass, field
 import inspect
 import os
 import warnings
+from concurrent.futures import ThreadPoolExecutor
+import itertools
+import ast
 
 import nnscaler
 from nnscaler.flags import RuntimeFlag, CompileFlag
 
 import torch
+
 
 _logger = logging.getLogger(__name__)
 
@@ -692,48 +696,46 @@ def suppress_warnings(message):
         yield
 
 
-# this warning is caused by torch.frombuffer when the buffer is not writable
-# we can ignore it here
-@suppress_warnings('.*The given buffer is not writable.*')
 def broadcast_files(
     file_groups: List[List[Union[str, Path]]],
     *,
-    src: int = 0,
-    async_op: bool = False,
-    group: Optional[torch.distributed.ProcessGroup] = None
+    max_workers: int = 8,
 ):
-    """Broadcast files from src to all other ranks. Files are grouped into file_groups,
+    """Broadcast files from src to all other nodes. Files are grouped into file_groups,
     and each group of files are broadcasted together to get better performance.
 
     Args:
         files (List[List[str | Path]]): List of file groups to be broadcasted.
             Note that the file names should be the same across all ranks.
-        src (int, optional): Source rank. Defaults to 0.
-        async_op (bool, optional): Whether to use async operation. Defaults to False.
-        group (torch.distributed.ProcessGroup, optional): The process group to use. Defaults to None.
     """
-    curr_rank = torch.distributed.get_rank(group=group)
+    from nnscaler.runtime.device import DeviceGroup
+
+    # filter out empty file groups
+    file_groups = [
+        fg for fg in file_groups if fg
+    ]
+
+    curr_rank = torch.distributed.get_rank()
+    local_world_size = DeviceGroup().local_world_size
+    world_size = torch.distributed.get_world_size()
+    local_rank = curr_rank % local_world_size
+
+    # create groups
+    for i in range(local_world_size):
+        group_ranks = list(range(i, world_size, local_world_size))
+        DeviceGroup().get_group(group_ranks)
 
     # collect file sizes and broadcast
-    group_flat_sizes: List[int] =[]
-    if curr_rank == src:
-        for files in file_groups:
-            for file in files:
-                file_size = os.path.getsize(file)
-                group_flat_sizes.append(file_size)
-
-        group_flat_sizes_tensor = torch.tensor(group_flat_sizes, dtype=torch.long, device='cuda')
+    if curr_rank == 0:
+        file_group_sizes: List[List[int]] = [
+            [os.path.getsize(file) for file in files] for files in file_groups
+        ]
+        exchange_objects = [file_group_sizes]
     else:
-        group_flat_sizes_tensor = torch.empty(sum(len(files) for files in file_groups), dtype=torch.long, device='cuda')
+        exchange_objects = [None]
 
-    torch.distributed.broadcast(group_flat_sizes_tensor, src=src, group=group)
-    group_flat_sizes = group_flat_sizes_tensor.cpu().tolist()
-    file_group_sizes = []
-    idx = 0
-    for files in file_groups:
-        group_sizes = group_flat_sizes[idx: idx + len(files)]
-        idx += len(files)
-        file_group_sizes.append(group_sizes)
+    torch.distributed.broadcast_object_list(exchange_objects, src=0)
+    file_group_sizes = exchange_objects[0]
 
     # sort file_groups by size descending to improve overlapping
     file_groups_sizes_pairs = list(zip(file_groups, file_group_sizes))
@@ -741,53 +743,51 @@ def broadcast_files(
     file_groups = [pair[0] for pair in file_groups_sizes_pairs]
     file_group_sizes = [pair[1] for pair in file_groups_sizes_pairs]
 
-    def _write_files(last_files, last_file_sizes, last_file_buffer):
-        last_file_buffer = last_file_buffer.cpu()
-        if curr_rank != src:
-            cur_pos = 0
-            for file, size in zip(last_files, last_file_sizes):
-                _logger.info(f'Writing file {file} of size {size} bytes.')
-                with open(file, 'wb') as f:
-                    f.write(last_file_buffer[cur_pos: cur_pos + size].numpy().tobytes())
-                    cur_pos += size
+    def _write_file(file: Union[str, Path], buffer, start, size):
+        _logger.info(f'Rank {curr_rank}: Writing file {file} of size {size} bytes.')
+        with open(file, 'wb') as f:
+            f.write(buffer[start: start + size].numpy().tobytes())
 
-    last_work: Optional[torch.distributed.Work] = None
-    last_files = None
-    last_file_sizes = None
-    last_file_buffer = None
+    # this warning is caused by torch.frombuffer when the buffer is not writable
+    # we can ignore it here
+    @suppress_warnings('.*The given buffer is not writable.*')
+    def _read_file(file, buffer, start, size):
+        _logger.info(f'Rank {curr_rank}: Reading file {file} of size {size} bytes.')
+        with open(file, 'rb') as f:
+            buffer[start: start + size] = torch.frombuffer(f.read(), dtype=torch.uint8)
 
-    # here we only overlap one broadcast with file read
-    # because broadcast is usually much faster than file read
-    # so overlapping broadcast with both read and write won't help much
-    for files, file_sizes in zip(file_groups, file_group_sizes):
-        _logger.info(f'Broadcasting {len(files)} files, total size {sum(file_sizes)} bytes.')
+    def _write_files(buffer, files, file_sizes):
+        buffer = buffer.cpu()
+        file_starts = itertools.accumulate([0] + file_sizes[:-1])
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            executor.map(
+                lambda args: _write_file(args[0], buffer, args[1], args[2]),
+                zip(files, file_starts, file_sizes)
+            )
+
+    def _send_file_group(src, files, file_sizes):
         total_size = sum(file_sizes)
 
-        if curr_rank == src:
-            cur_pos = 0
+        ranks = list(range(src, world_size, local_world_size))
+        group = DeviceGroup().get_group(ranks)
+        torch.distributed.barrier(group=group)
+
+        if curr_rank < local_world_size:
+            file_starts = itertools.accumulate([0] + file_sizes[:-1])
             file_buffer = torch.empty(total_size, dtype=torch.uint8, device='cpu')
-            for file, size in zip(files, file_sizes):
-                with open(file, 'rb') as f:
-                    file_buffer[cur_pos: cur_pos + size] =  torch.frombuffer(f.read(), dtype=torch.uint8)
-                    cur_pos += size
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                executor.map(
+                    lambda args: _read_file(args[0], file_buffer, args[1], args[2]),
+                    zip(files, file_starts, file_sizes)
+                )
             file_buffer = file_buffer.cuda()
         else:
             file_buffer = torch.empty(total_size, dtype=torch.uint8, device='cuda')
 
-        if last_work is not None:
-            last_work.wait()
-            _write_files(last_files, last_file_sizes, last_file_buffer)
-            last_work = None
+        torch.distributed.broadcast(file_buffer, src=src, group=group)
 
-        last_work = torch.distributed.broadcast(file_buffer, src=src, async_op=async_op, group=group)
+        if curr_rank >= local_world_size:
+            _write_files(file_buffer, files, file_sizes)
 
-        if not async_op:
-            _write_files(files, file_sizes, file_buffer)
-        else:
-            last_files = files
-            last_file_sizes = file_sizes
-            last_file_buffer = file_buffer
-
-    if last_work is not None:
-        last_work.wait()
-        _write_files(last_files, last_file_sizes, last_file_buffer)
+    for i in range(local_rank, len(file_groups), local_world_size):
+        _send_file_group(local_rank, file_groups[i], file_group_sizes[i])

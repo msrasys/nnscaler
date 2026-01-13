@@ -43,11 +43,13 @@ def _to_cube_model(module, compute_config, cube_savedir,
 
 def _gpu_worker():
     init_distributed()
+    world_size = torch.distributed.get_world_size()
+    local_world_size = world_size // 2
     # fake two machines, as we use different cube_savedir for each worker
-    os.environ['LOCAL_WORLD_SIZE'] = '1'
+    os.environ['LOCAL_WORLD_SIZE'] = str(local_world_size)
     p = lambda t, b, i, load_module=True, **kwargs: _to_cube_model(
             Module(),
-            ComputeConfig(1, 2),
+            ComputeConfig(1, world_size),
             t,
             load_module=load_module,
             broadcast_strategy=b,
@@ -123,7 +125,11 @@ def _gpu_worker():
         m = p(tempdir, 'all', '_6', load_module=True, reuse='override')
 
 
-
 @pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.device_count() < 2, reason='lack of gpu devices')
 def test_broadcast():
     launch_torchrun(2, _gpu_worker)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.device_count() < 4, reason='lack of gpu devices')
+def test_broadcast4():
+    launch_torchrun(4, _gpu_worker)
