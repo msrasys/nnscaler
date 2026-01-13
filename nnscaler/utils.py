@@ -16,6 +16,7 @@ from collections import defaultdict
 from dataclasses import dataclass, field
 import inspect
 import os
+import warnings
 
 import nnscaler
 from nnscaler.flags import RuntimeFlag, CompileFlag
@@ -682,3 +683,111 @@ def get_dynamic(tensor: Any) -> set[int]:
         return getattr(tensor, TENSOR_DYNAMIC_DIMS_FIELD_NAME, set())
     else:
         return getattr(tensor, NNSCALER_DYNAMIC_DIMS_NAME, set())
+
+
+@contextmanager
+def suppress_warnings(message):
+    with warnings.catch_warnings():
+        warnings.filterwarnings('ignore', message=message)
+        yield
+
+
+# this warning is caused by torch.frombuffer when the buffer is not writable
+# we can ignore it here
+@suppress_warnings('.*The given buffer is not writable.*')
+def broadcast_files(
+    file_groups: List[List[Union[str, Path]]],
+    *,
+    src: int = 0,
+    async_op: bool = False,
+    group: Optional[torch.distributed.ProcessGroup] = None
+):
+    """Broadcast files from src to all other ranks. Files are grouped into file_groups,
+    and each group of files are broadcasted together to get better performance.
+
+    Args:
+        files (List[List[str | Path]]): List of file groups to be broadcasted.
+            Note that the file names should be the same across all ranks.
+        src (int, optional): Source rank. Defaults to 0.
+        async_op (bool, optional): Whether to use async operation. Defaults to False.
+        group (torch.distributed.ProcessGroup, optional): The process group to use. Defaults to None.
+    """
+    curr_rank = torch.distributed.get_rank(group=group)
+
+    # collect file sizes and broadcast
+    group_flat_sizes: List[int] =[]
+    if curr_rank == src:
+        for files in file_groups:
+            for file in files:
+                file_size = os.path.getsize(file)
+                group_flat_sizes.append(file_size)
+
+        group_flat_sizes_tensor = torch.tensor(group_flat_sizes, dtype=torch.long, device='cuda')
+    else:
+        group_flat_sizes_tensor = torch.empty(sum(len(files) for files in file_groups), dtype=torch.long, device='cuda')
+
+    torch.distributed.broadcast(group_flat_sizes_tensor, src=src, group=group)
+    group_flat_sizes = group_flat_sizes_tensor.cpu().tolist()
+    file_group_sizes = []
+    idx = 0
+    for files in file_groups:
+        group_sizes = group_flat_sizes[idx: idx + len(files)]
+        idx += len(files)
+        file_group_sizes.append(group_sizes)
+
+    # sort file_groups by size descending to improve overlapping
+    file_groups_sizes_pairs = list(zip(file_groups, file_group_sizes))
+    file_groups_sizes_pairs.sort(key=lambda x: sum(x[1]), reverse=True)
+    file_groups = [pair[0] for pair in file_groups_sizes_pairs]
+    file_group_sizes = [pair[1] for pair in file_groups_sizes_pairs]
+
+    def _write_files(last_files, last_file_sizes, last_file_buffer):
+        last_file_buffer = last_file_buffer.cpu()
+        if curr_rank != src:
+            cur_pos = 0
+            for file, size in zip(last_files, last_file_sizes):
+                _logger.info(f'Writing file {file} of size {size} bytes.')
+                with open(file, 'wb') as f:
+                    f.write(last_file_buffer[cur_pos: cur_pos + size].numpy().tobytes())
+                    cur_pos += size
+
+    last_work: Optional[torch.distributed.Work] = None
+    last_files = None
+    last_file_sizes = None
+    last_file_buffer = None
+
+    # here we only overlap one broadcast with file read
+    # because broadcast is usually much faster than file read
+    # so overlapping broadcast with both read and write won't help much
+    for files, file_sizes in zip(file_groups, file_group_sizes):
+        _logger.info(f'Broadcasting {len(files)} files, total size {sum(file_sizes)} bytes.')
+        total_size = sum(file_sizes)
+
+        if curr_rank == src:
+            cur_pos = 0
+            file_buffer = torch.empty(total_size, dtype=torch.uint8, device='cpu')
+            for file, size in zip(files, file_sizes):
+                with open(file, 'rb') as f:
+                    file_buffer[cur_pos: cur_pos + size] =  torch.frombuffer(f.read(), dtype=torch.uint8)
+                    cur_pos += size
+            file_buffer = file_buffer.cuda()
+        else:
+            file_buffer = torch.empty(total_size, dtype=torch.uint8, device='cuda')
+
+        if last_work is not None:
+            last_work.wait()
+            _write_files(last_files, last_file_sizes, last_file_buffer)
+            last_work = None
+
+        last_work = torch.distributed.broadcast(file_buffer, src=src, async_op=async_op, group=group)
+
+        if not async_op:
+            _write_files(files, file_sizes, file_buffer)
+        else:
+            last_files = files
+            last_file_sizes = file_sizes
+            last_file_buffer = file_buffer
+
+    if last_work is not None:
+        last_work.wait()
+        _write_files(last_files, last_file_sizes, last_file_buffer)

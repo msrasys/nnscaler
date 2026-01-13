@@ -56,7 +56,8 @@ from nnscaler.utils import (
     setup_stride_broadcast_group,
     get_shared_params,
     OptStateDict,
-    copy_dynamic
+    copy_dynamic,
+    broadcast_files,
 )
 
 logger = logging.getLogger(__name__)
@@ -2407,18 +2408,15 @@ def _broadcast_gen_files(
             files = sent_obj[0]
 
         logger.info(f'File list broadcasted ({len(files)} in total).')
-        # send file content one by one
+
+        grouped_files = [[]] # 0th groups for small files (attribute content files excluded)
         for fname in files:
-            if curr_rank == 0:
-                with open(outdir / fname, 'rb') as f:
-                    data = [f.read()]
+            if not fname.startswith(FxModuleParser.ATTR_CONTENT_FILE_STEM):
+                grouped_files[0].append(outdir / fname)
             else:
-                data = [None]
-            torch.distributed.broadcast_object_list(data, src=0, group=group)
-            if curr_rank != 0:
-                with open(outdir / fname, 'wb') as f:
-                    f.write(data[0])
-            logger.info(f'File {fname} broadcasted.')
+                grouped_files.append([outdir / fname])
+
+        broadcast_files(grouped_files, src=0, group=group, async_op=False)
 
     # wait for all nodes to finish
     torch.distributed.barrier()
