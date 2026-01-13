@@ -2425,6 +2425,9 @@ def broadcast_file_from_rank(rank, file_path, to_file_path, from_rank, device, f
     if group is None:
         group = torch.distributed.group.WORLD
     pinned_cpu_tensor = torch.empty(min(max_chunk_size, file_size), dtype=torch.uint8).pin_memory()
+    # 这里是给接收的 rank 提前预分配的内存空间，因为 tensor 还是挺大的，python 中分配大块内存所耗费的时间比 broadcast 高很多
+    # 这里提前分配好，并且可以循环使用以减少分配内存的开销。 这里的加速还挺明显的
+    # .pin_memory() 加上 pinned memory 可以加速 GPU 到 CPU 的传输速度 https://docs.pytorch.org/tutorials/intermediate/pinmem_nonblock.html#pin-memory
 
     for offset in range(0, file_size, max_chunk_size):
         read_size = min(max_chunk_size, file_size - offset)
@@ -2433,13 +2436,17 @@ def broadcast_file_from_rank(rank, file_path, to_file_path, from_rank, device, f
                 f.seek(offset)
                 data = f.read(read_size)
             tensor = torch.frombuffer(data, dtype=torch.uint8).contiguous().pin_memory()
+            # 这里读取 block size 的数据到 pinned memory 中，再传输到 GPU 上，也能加速 内存 到 显存的传输速度
             tensor = tensor.to(device)
-            torch.cuda.synchronize()
+            torch.cuda.synchronize() # 确保数据传输到 GPU 上完成
             torch.distributed.broadcast(tensor, src=from_rank, group=group, async_op=True)
+            # async_op=True 开启异步传输，和文件读取可以重叠
         else:
             tensor = torch.empty(read_size, dtype=torch.uint8, device=device)
+            # GPU 上分配内存效率很高，所以这里没有预先分配
             torch.distributed.broadcast(tensor, src=from_rank, group=group)
             torch.cuda.synchronize()
+            # 确保数据传输到 CPU 上完成
 
             file_dir = os.path.dirname(to_file_path)
             if not os.path.exists(file_dir):
@@ -2449,6 +2456,7 @@ def broadcast_file_from_rank(rank, file_path, to_file_path, from_rank, device, f
                 pinned_cpu_tensor[:read_size].copy_(tensor)
                 np_array = pinned_cpu_tensor.numpy()[:read_size]
                 np_array.tofile(f)
+                # 这里用 numpy 的 tofile 方法写文件效率更高一些
 
 
 def broadcast_concat_files_from_rank(
