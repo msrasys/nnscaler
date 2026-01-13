@@ -2585,6 +2585,9 @@ def sync_files(
     sorted_dst = metadata['sorted_dst']
     batches = metadata['batches']
     num_batches = len(batches)
+    if rank == 0:
+        logger.info(f'Syncing {len(sorted_sizes)} files in {num_batches} batches among {torch.distributed.get_world_size()} ranks.')
+        logger.info(f"file list: {sorted_src}")
     
     sub_groups = []
     world_size = torch.distributed.get_world_size()
