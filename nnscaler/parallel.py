@@ -180,9 +180,13 @@ class ComputeConfig:
         if self.use_zero:
             if num_scale_units % self.zero_ngroups != 0:
                 raise ValueError(f"zero_ngroups {self.zero_ngroups} must be a divisor of runtime_ngpus/plan_ngpus {num_scale_units}.")
-            if num_scale_units == self.zero_ngroups:
-                logger.warning(f"zero_ngroups {self.zero_ngroups} equals to runtime_ngpus/plan_ngpus {num_scale_units}. Zero optimization is disabled.")
-                super().__setattr__('use_zero', 0)
+            # NOTE:
+            # we can't disable zero optimization when num_scale_units == zero_ngroups here
+            # because some ops are replicated inside a scale unit,
+            # and those ops can still utilize zero optimization.
+            # if num_scale_units == self.zero_ngroups:
+            #     logger.warning(f"zero_ngroups {self.zero_ngroups} equals to runtime_ngpus/plan_ngpus {num_scale_units}. Zero optimization is disabled.")
+            #     super().__setattr__('use_zero', 0)
 
         if self.use_zero and self.zero_ngroups <= 0:
             raise ValueError(f"zero_ngroups {self.zero_ngroups} must be > 0")
