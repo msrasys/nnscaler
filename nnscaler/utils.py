@@ -19,7 +19,7 @@ import os
 import warnings
 from concurrent.futures import ThreadPoolExecutor
 import itertools
-import ast
+import numpy as np
 
 import nnscaler
 from nnscaler.flags import RuntimeFlag, CompileFlag
@@ -748,13 +748,10 @@ def broadcast_files(
         # have better performance than open + write
         buffer[start: start + size].numpy().tofile(file)
 
-    # this warning is caused by torch.frombuffer when the buffer is not writable
-    # we can ignore it here
-    @suppress_warnings('.*The given buffer is not writable.*')
     def _read_file(file, buffer, start, size):
         _logger.info(f'Rank {curr_rank}: Reading file {file} of size {size} bytes.')
-        with open(file, 'rb') as f:
-            buffer[start: start + size] = torch.frombuffer(f.read(), dtype=torch.uint8)
+        # slightly faster than open + read
+        buffer[start: start + size] = torch.from_numpy(np.fromfile(file, dtype=np.uint8))
 
     def _write_files(buffer, files, file_sizes):
         buffer = buffer.cpu()
