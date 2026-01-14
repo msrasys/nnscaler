@@ -767,22 +767,23 @@ def broadcast_files(
 
         ranks = list(range(src, world_size, local_world_size))
         group = DeviceGroup().get_group(ranks)
+        file_buffer = torch.empty(total_size, dtype=torch.uint8, device='cpu').pin_memory()
 
         if curr_rank < local_world_size:
             file_starts = itertools.accumulate([0] + file_sizes[:-1])
-            file_buffer = torch.empty(total_size, dtype=torch.uint8, device='cpu')
             with ThreadPoolExecutor(max_workers=max_workers) as executor:
                 executor.map(
                     lambda args: _read_file(args[0], file_buffer, args[1], args[2]),
                     zip(files, file_starts, file_sizes)
                 )
-            file_buffer = file_buffer.cuda()
+            broadcast_tensor = file_buffer.cuda()
         else:
-            file_buffer = torch.empty(total_size, dtype=torch.uint8, device='cuda')
+            broadcast_tensor = torch.empty(total_size, dtype=torch.uint8, device='cuda')
 
-        torch.distributed.broadcast(file_buffer, src=src, group=group)
+        torch.distributed.broadcast(broadcast_tensor, src=src, group=group)
 
         if curr_rank >= local_world_size:
+            file_buffer.copy_(broadcast_tensor)
             _write_files(file_buffer, files, file_sizes)
 
     # we split the file groups among local ranks
