@@ -745,8 +745,8 @@ def broadcast_files(
 
     def _write_file(file: Union[str, Path], buffer, start, size):
         _logger.info(f'Rank {curr_rank}: Writing file {file} of size {size} bytes.')
-        with open(file, 'wb') as f:
-            f.write(buffer[start: start + size].numpy().tobytes())
+        # have better performance than open + write
+        buffer[start: start + size].numpy().tofile(file)
 
     # this warning is caused by torch.frombuffer when the buffer is not writable
     # we can ignore it here
@@ -788,5 +788,7 @@ def broadcast_files(
         if curr_rank >= local_world_size:
             _write_files(file_buffer, files, file_sizes)
 
+    # we split the file groups among local ranks
+    # each local rank sends its assigned file groups (in round robin fashion)
     for i in range(local_rank, len(file_groups), local_world_size):
         _send_file_group(local_rank, file_groups[i], file_group_sizes[i])
