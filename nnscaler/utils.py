@@ -16,11 +16,16 @@ from collections import defaultdict
 from dataclasses import dataclass, field
 import inspect
 import os
+import warnings
+from concurrent.futures import ThreadPoolExecutor
+import itertools
+import numpy as np
 
 import nnscaler
 from nnscaler.flags import RuntimeFlag, CompileFlag
 
 import torch
+
 
 _logger = logging.getLogger(__name__)
 
@@ -682,3 +687,106 @@ def get_dynamic(tensor: Any) -> set[int]:
         return getattr(tensor, TENSOR_DYNAMIC_DIMS_FIELD_NAME, set())
     else:
         return getattr(tensor, NNSCALER_DYNAMIC_DIMS_NAME, set())
+
+
+@contextmanager
+def suppress_warnings(message):
+    with warnings.catch_warnings():
+        warnings.filterwarnings('ignore', message=message)
+        yield
+
+
+def broadcast_files(
+    file_groups: List[List[Union[str, Path]]],
+    *,
+    max_workers: int = 8,
+):
+    """Broadcast files from src to all other nodes. Files are grouped into file_groups,
+    and each group of files are broadcasted together to get better performance.
+
+    Args:
+        files (List[List[str | Path]]): List of file groups to be broadcasted.
+            Note that the file names should be the same across all ranks.
+    """
+    from nnscaler.runtime.device import DeviceGroup
+
+    # filter out empty file groups
+    file_groups = [
+        fg for fg in file_groups if fg
+    ]
+
+    curr_rank = torch.distributed.get_rank()
+    local_world_size = DeviceGroup().local_world_size
+    world_size = torch.distributed.get_world_size()
+    local_rank = curr_rank % local_world_size
+
+    # create groups, make sure all groups are created correctly
+    for i in range(local_world_size):
+        group_ranks = list(range(i, world_size, local_world_size))
+        DeviceGroup().get_group(group_ranks)
+
+    # collect file sizes and broadcast
+    if curr_rank == 0:
+        file_group_sizes: List[List[int]] = [
+            [os.path.getsize(file) for file in files] for files in file_groups
+        ]
+        exchange_objects = [file_group_sizes]
+    else:
+        exchange_objects = [None]
+
+    torch.distributed.broadcast_object_list(exchange_objects, src=0)
+    file_group_sizes = exchange_objects[0]
+
+    # sort file_groups by size descending to improve overlapping
+    file_groups_sizes_pairs = list(zip(file_groups, file_group_sizes))
+    file_groups_sizes_pairs.sort(key=lambda x: sum(x[1]), reverse=True)
+    file_groups = [pair[0] for pair in file_groups_sizes_pairs]
+    file_group_sizes = [pair[1] for pair in file_groups_sizes_pairs]
+
+    def _write_file(file: Union[str, Path], buffer, start, size):
+        _logger.info(f'Rank {curr_rank}: Writing file {file} of size {size} bytes.')
+        # have better performance than open + write
+        buffer[start: start + size].numpy().tofile(file)
+
+    def _read_file(file, buffer, start, size):
+        _logger.info(f'Rank {curr_rank}: Reading file {file} of size {size} bytes.')
+        # slightly faster than open + read
+        buffer[start: start + size] = torch.from_numpy(np.fromfile(file, dtype=np.uint8))
+
+    def _write_files(buffer, files, file_sizes):
+        buffer = buffer.cpu()
+        file_starts = itertools.accumulate([0] + file_sizes[:-1])
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            executor.map(
+                lambda args: _write_file(args[0], buffer, args[1], args[2]),
+                zip(files, file_starts, file_sizes)
+            )
+
+    def _send_file_group(src, files, file_sizes):
+        total_size = sum(file_sizes)
+
+        ranks = list(range(src, world_size, local_world_size))
+        group = DeviceGroup().get_group(ranks)
+        file_buffer = torch.empty(total_size, dtype=torch.uint8, device='cpu').pin_memory()
+
+        if curr_rank < local_world_size:
+            file_starts = itertools.accumulate([0] + file_sizes[:-1])
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                executor.map(
+                    lambda args: _read_file(args[0], file_buffer, args[1], args[2]),
+                    zip(files, file_starts, file_sizes)
+                )
+            broadcast_tensor = file_buffer.cuda()
+        else:
+            broadcast_tensor = torch.empty(total_size, dtype=torch.uint8, device='cuda')
+
+        torch.distributed.broadcast(broadcast_tensor, src=src, group=group)
+
+        if curr_rank >= local_world_size:
+            file_buffer.copy_(broadcast_tensor)
+            _write_files(file_buffer, files, file_sizes)
+
+    # we split the file groups among local ranks
+    # each local rank sends its assigned file groups (in round robin fashion)
+    for i in range(local_rank, len(file_groups), local_world_size):
+        _send_file_group(local_rank, file_groups[i], file_group_sizes[i])

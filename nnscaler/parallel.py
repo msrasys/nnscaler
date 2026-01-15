@@ -56,7 +56,8 @@ from nnscaler.utils import (
     setup_stride_broadcast_group,
     get_shared_params,
     OptStateDict,
-    copy_dynamic
+    copy_dynamic,
+    broadcast_files,
 )
 
 logger = logging.getLogger(__name__)
@@ -2373,56 +2374,49 @@ def _broadcast_gen_files(
         return
 
     curr_rank = torch.distributed.get_rank()
-    ranks = list(range(0, world_size, local_world_size))
-    group = DeviceGroup().get_group(ranks)
 
-    # use the first rank of each node to broadcast
-    if  curr_rank % local_world_size == 0:
-        _, outdir = _prepare_namespace(gen_savedir, module_class, instance_name)
-        files: List[str] = []
-        # send file list
-        if curr_rank == 0:
-            for file in outdir.glob('*'):
-                if file.is_file() and (
-                    broadcast_strategy == BroadcastGenFilesStrategy.ALL or
-                    (
-                        broadcast_strategy == BroadcastGenFilesStrategy.NO_WEIGHTS
-                        and not file.name.startswith(FxModuleParser.ATTR_CONTENT_FILE_STEM)
-                    ) or
-                    (
-                        # broadcast code files and compute config file
-                        # please note the compute config file can be updated
-                        # even when the graph is reused.
-                        broadcast_strategy == BroadcastGenFilesStrategy.CODE
-                        and (file.suffix  == '.py' or file.name == ParallelModule.COMPUTE_CONFIG_FILE)
-                    )
-                ):
-                    files.append(file.name)
-            sent_obj = [files]
+    # use all ranks of each node to broadcast
+    _, outdir = _prepare_namespace(gen_savedir, module_class, instance_name)
+    files: List[str] = []
+    # send file list
+    if curr_rank == 0:
+        for file in outdir.glob('*'):
+            if file.is_file() and (
+                broadcast_strategy == BroadcastGenFilesStrategy.ALL or
+                (
+                    broadcast_strategy == BroadcastGenFilesStrategy.NO_WEIGHTS
+                    and not file.name.startswith(FxModuleParser.ATTR_CONTENT_FILE_STEM)
+                ) or
+                (
+                    # broadcast code files and compute config file
+                    # please note the compute config file can be updated
+                    # even when the graph is reused.
+                    broadcast_strategy == BroadcastGenFilesStrategy.CODE
+                    and (file.suffix  == '.py' or file.name == ParallelModule.COMPUTE_CONFIG_FILE)
+                )
+            ):
+                files.append(file.name)
+        sent_obj = [files]
+    else:
+        sent_obj = [None]
+    torch.distributed.broadcast_object_list(
+        sent_obj,
+        src=0,
+    )
+    # get file list
+    if curr_rank != 0:
+        files = sent_obj[0]
+
+    logger.info(f'File list broadcasted ({len(files)} in total).')
+
+    grouped_files = [[]] # 0th groups for small files (attribute content files excluded)
+    for fname in files:
+        if not fname.startswith(FxModuleParser.ATTR_CONTENT_FILE_STEM):
+            grouped_files[0].append(outdir / fname)
         else:
-            sent_obj = [None]
-        torch.distributed.broadcast_object_list(
-            sent_obj,
-            src=0,
-            group=group,
-        )
-        # get file list
-        if curr_rank != 0:
-            files = sent_obj[0]
+            grouped_files.append([outdir / fname])
 
-        logger.info(f'File list broadcasted ({len(files)} in total).')
-        # send file content one by one
-        for fname in files:
-            if curr_rank == 0:
-                with open(outdir / fname, 'rb') as f:
-                    data = [f.read()]
-            else:
-                data = [None]
-            torch.distributed.broadcast_object_list(data, src=0, group=group)
-            if curr_rank != 0:
-                with open(outdir / fname, 'wb') as f:
-                    f.write(data[0])
-            logger.info(f'File {fname} broadcasted.')
+    broadcast_files(grouped_files)
 
     # wait for all nodes to finish
     torch.distributed.barrier()
