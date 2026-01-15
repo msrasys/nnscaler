@@ -970,15 +970,19 @@ def gather_mixed_data(
             assert all(tensor.device.type != 'meta' for tensor in tensors), \
                 f"Tensors should not be on meta device on rank {rank}."
 
-        for i in range(len(tensors)):
-            if rank == 0:
-                tensor = torch.empty_like(tensors[i], device='cuda')
-                torch.distributed.recv(tensor, src=sender)
-                tensors[i] = tensor.to(device)
-            else:
-                torch.distributed.send(tensors[i].cuda(), dst=0)
+        if rank == src_rank:
+            cuda_tensors = [torch.empty_like(tensor, device='cuda') for tensor in tensors]
+        else:
+            cuda_tensors = [tensor.cuda() for tensor in tensors]
 
-        if rank == 0:
+        for i in range(len(tensors)):
+            if rank == src_rank:
+                torch.distributed.recv(cuda_tensors[i], src=sender)
+            else:
+                torch.distributed.send(cuda_tensors[i], dst=src_rank)
+
+        if rank == src_rank:
+            tensors = [tensor.to(device, non_blocking=True) for tensor in cuda_tensors]
             return transform_recursively(
                 skel,
                 lambda idx: tensors[idx.index],
@@ -987,7 +991,7 @@ def gather_mixed_data(
         else:
             return None  # only rank 0 needs the recovered state dict
 
-    if rank == 0:
+    if rank == src_rank:
         # TODO: It may have performance issue if the number of ranks is large
         for i in range(1, world_size):
             result[i] = _send_recv_tensors(i, gathered_sent[i][0], gathered_sent[i][1])
