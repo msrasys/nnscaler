@@ -608,6 +608,40 @@ def _gpu_merge_worker():
         )
 
 
-@pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.device_count() < 24, reason='lack of gpu devices')
+@pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.device_count() < 4, reason='lack of gpu devices')
 def test_checkpoint_merge():
     launch_torchrun(4, _gpu_merge_worker)
+
+
+def _gather_full_model_state_dict_worker(tmp_path, use_zero):
+    from .test_end2end import MLP, dummy_data
+    from nnscaler.parallel import gather_full_model_state_dict, merge_state_dicts
+    init_distributed()
+
+    model = MLP()
+    model = parallelize(
+        model,
+        {'data': dummy_data()},
+        pas_policy='tp',
+        compute_config= ComputeConfig(
+            2, 4,
+            use_end2end=True,
+            use_zero=use_zero,
+        ),
+        gen_savedir=tmp_path
+    )
+    model.cuda()
+    rank = torch.distributed.get_rank()
+    torch.save(model.state_dict(), tmp_path / f'{rank}.pt')
+    torch.distributed.barrier()
+    merged_state_dict = merge_state_dicts(
+        [torch.load(tmp_path / f'{i}.pt', weights_only=False) for i in range(torch.distributed.get_world_size())]
+    )
+    full_state_dict = gather_full_model_state_dict(model)
+    assert_equal(merged_state_dict, full_state_dict)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.device_count() < 4, reason='lack of gpu devices')
+@pytest.mark.parametrize('use_zero', [0, 1, 3])
+def test_gather_full_model_state_dict(tmp_path, use_zero):
+    launch_torchrun(4, _gather_full_model_state_dict_worker, tmp_path, use_zero)
