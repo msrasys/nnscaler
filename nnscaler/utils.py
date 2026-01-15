@@ -790,3 +790,211 @@ def broadcast_files(
     # each local rank sends its assigned file groups (in round robin fashion)
     for i in range(local_rank, len(file_groups), local_world_size):
         _send_file_group(local_rank, file_groups[i], file_group_sizes[i])
+
+
+def broadcast_tensor_list(
+    tensors: List[torch.Tensor],
+    *,
+    src_rank: int = 0,
+    max_batch_size: Optional[int] = None,
+    group: Optional[torch.distributed.ProcessGroup] = None,
+):
+    """
+    Broadcast a list of tensors from src_rank to all other ranks.
+    Small tensors are broadcasted in batches with upper size `max_batch_size` to improve performance.
+
+    Args:
+        tensors (List[torch.Tensor]): The list of tensors to be broadcasted.
+        src_rank (int): The source rank to broadcast from. Default: 0.
+        max_batch_size (int, optional): The maximum batch size for broadcasting.
+        group (torch.distributed.ProcessGroup, optional): The process group to use for broadcasting.
+            If None, the default process group will be used. Default: None.
+    """
+
+
+class _TensorIndex:
+    def __init__(self, index: int):
+        self.index = index
+
+    def __repr__(self):
+        return f"_TensorIndex({self.index})"
+
+
+def extract_tensors(data: Dict[str, Any]) -> Tuple[Dict[str, Any], List[torch.Tensor]]:
+    """
+    Extract tensors from a collection, and return the skeleton (by replacing tensors with _TensorIndex) and the list of tensors.
+    Args:
+        data (Dict[str, Any]): The collection to be extracted.
+    Returns:
+        Tuple[Dict[str, Any], List[torch.Tensor]]: The skeleton and the list of tensors.
+    """
+    skeleton = {}
+    tensors = []
+
+    # used to deduplicate tensors
+    # TODO: Consider more robust way to identify tensors
+    # key: (tensor.data_ptr(), tensor.shape, tensor.stride()), value: _Index
+    tensor_ids: dict[tuple[int, tuple[int, ...], tuple[int, ...]], _TensorIndex] = {}
+    def transform_fn(o: torch.Tensor) -> Any:
+        key = (o.data_ptr(), o.shape, o.stride())
+        if key in tensor_ids:
+            idx = tensor_ids[key]
+        else:
+            idx = _TensorIndex(len(tensors))
+            tensor_ids[key] = idx
+            tensors.append(o)
+        return idx
+    skeleton = transform_recursively(data, transform_fn, target_types=(torch.Tensor,))
+
+    return skeleton, tensors
+
+
+def refill_tensors(skeleton: Dict[str, Any], tensors: List[torch.Tensor]) -> Dict[str, Any]:
+    """
+    Refill tensors into the skeleton, and return the data.
+    This is the inverse operation of `extract_tensors`.
+
+    Args:
+        skeleton (Dict[str, Any]): The skeleton to be refilled.
+        tensors (List[torch.Tensor]): The list of tensors to be refilled.
+    Returns:
+        Dict[str, Any]: The data.
+    """
+    def transform_fn(o: _TensorIndex) -> Any:
+        return tensors[o.index]
+    state_dict = transform_recursively(skeleton, transform_fn, target_types=_TensorIndex)
+    return state_dict
+
+
+def broadcast_mixed_data(
+    data: Optional[dict] = None,
+    *,
+    src_rank: int = 0,
+    group: Optional[torch.distributed.ProcessGroup] = None,
+):
+    """
+    Broadcast the data (containing tensors) from src_rank to all other ranks.
+
+    Args:
+        data (Optional[dict]): The data to be broadcasted.
+            for non-src ranks, this must be None.
+        src_rank (int): The source rank to broadcast from. Default: 0.
+        group (torch.distributed.ProcessGroup, optional): The process group to use for broadcasting.
+            If None, the default process group will be used. Default: None.
+
+    Returns:
+        dict: The broadcasted data.
+            For src_rank, it is the same as the input data.
+            For non-src ranks, it is the broadcasted data. the device of tensors will be cuda.
+    """
+    rank = torch.distributed.get_rank(group=group)
+
+    # share the structure and tensor shapes
+    if rank == src_rank:
+        if data is None:
+            raise ValueError("data must not be None in src_rank")
+        skeleton, tensors = extract_tensors(data)
+        meta_tensors = [t.to('meta') for t in tensors]
+        sent = [(skeleton, meta_tensors)]
+    else:
+        if data is not None:
+            raise ValueError("data must be None in non-src ranks")
+        skeleton, tensors, meta_tensors = None, None, None
+        sent = [None]
+
+    torch.distributed.broadcast_object_list(sent, src=src_rank, group=group)
+    skeleton, meta_tensors = sent[0]
+    if rank != src_rank:
+        tensors = [torch.empty_like(mt, device='cuda') for mt in meta_tensors]
+    else:
+        # make sure tensors are in cuda
+        tensors = [t.cuda() for t in tensors]
+
+    # broadcast tensor data
+    for i in range(len(tensors)):
+        torch.distributed.broadcast(tensors[i], src=src_rank, group=group)
+
+    # refill tensors
+    if rank != src_rank:
+        return refill_tensors(skeleton, tensors)
+    else:
+        return data
+
+
+def gather_mixed_data(
+    data: dict,
+    *,
+    src_rank: int = 0,
+    group: Optional[torch.distributed.ProcessGroup] = None,
+    device: Optional[Union[str, torch.device]] = None,
+):
+    """
+    Gather the data (containing tensors) from all ranks to src_rank.
+
+    Args:
+        data (dict): The data to be gathered.
+        src_rank (int): The source rank to gather to. Default: 0.
+        group (torch.distributed.ProcessGroup, optional): The process group to use for gathering.
+            If None, the default process group will be used. Default: None.
+        device (str or torch.device, optional): The device to use for receiving tensors on src_rank.
+            If None, the current cuda device will be used. Default: None.
+            If you want to save memory, you can set it to 'cpu' to move tensors to cpu after receiving.
+    Returns:
+        dict: The gathered data.
+            For src_rank, it is the gathered data from all ranks.
+            For non-src ranks, it is None.
+    """
+    device = torch.cuda.current_device() if device is None else device
+
+    rank = torch.distributed.get_rank(group=group)
+    world_size = torch.distributed.get_world_size(group=group)
+    result = [None] * world_size
+    result[rank] = data
+
+    skeleton, tensors = extract_tensors(data)
+    sent = (skeleton, [t.to('meta') for t in tensors])
+
+    # Gather metadata from all ranks
+    gathered_sent = [None for _ in range(world_size)]
+    torch.distributed.all_gather_object(gathered_sent, sent, group=group)
+
+    def _send_recv_tensors(
+        sender: int,
+        skel: Dict[str, Any],
+        tensors: list[torch.Tensor]
+    ) -> Dict[str, Any]:
+        if rank == src_rank:
+            assert all(tensor.device.type == 'meta' for tensor in tensors), \
+                "Tensors should be on meta device on rank 0."
+        if rank != src_rank:
+            assert all(tensor.device.type != 'meta' for tensor in tensors), \
+                f"Tensors should not be on meta device on rank {rank}."
+
+        for i in range(len(tensors)):
+            if rank == 0:
+                tensor = torch.empty_like(tensors[i], device='cuda')
+                torch.distributed.recv(tensor, src=sender)
+                tensors[i] = tensor.to(device)
+            else:
+                torch.distributed.send(tensors[i].cuda(), dst=0)
+
+        if rank == 0:
+            return transform_recursively(
+                skel,
+                lambda idx: tensors[idx.index],
+                target_types=_TensorIndex,
+            )
+        else:
+            return None  # only rank 0 needs the recovered state dict
+
+    if rank == 0:
+        # TODO: It may have performance issue if the number of ranks is large
+        for i in range(1, world_size):
+            result[i] = _send_recv_tensors(i, gathered_sent[i][0], gathered_sent[i][1])
+    else:
+        _send_recv_tensors(rank, skeleton, tensors)
+
+    if rank == src_rank:
+        return result
+    else:
+        return None

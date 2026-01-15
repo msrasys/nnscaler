@@ -58,6 +58,9 @@ from nnscaler.utils import (
     OptStateDict,
     copy_dynamic,
     broadcast_files,
+    transform_recursively,
+    broadcast_mixed_data,
+    gather_mixed_data,
 )
 
 logger = logging.getLogger(__name__)
@@ -3229,3 +3232,48 @@ def load_merged_state_dict_from_rank(
     module.load_state_dict(trimmed_module_state_dict)
     if trimmed_opt_state_dict:
         optimizer.load_state_dict(trimmed_opt_state_dict)
+
+
+@torch.no_grad()
+def gather_full_model_state_dict(
+    module: torch.nn.Module,
+) -> Dict[str, Any]:
+    """
+    Gather model state dicts from all ranks,
+    And merge them into a single merged model state dict in all ranks.
+
+    Args:
+        module (torch.nn.Module): the module to gather state dicts from
+
+    Returns:
+        Dict[str, Any]: the merged model state dict
+    """
+
+    rank = torch.distributed.get_rank()
+    parallel_modules = [m for m in module.modules() if isinstance(m, ParallelModule)]
+    if not parallel_modules:
+        raise ValueError("No ParallelModule found in the module.")
+    parallel_module = parallel_modules[0]
+    compute_config = parallel_module.compute_config
+    num_involved_ranks = compute_config.module_dedup_group_size
+    involved_group = DeviceGroup().get_group(list(range(num_involved_ranks)))
+
+    logger.info(f'Gathering full model state dict from ranks {list(range(num_involved_ranks))}')
+
+    if rank < num_involved_ranks:
+        local_state_dict, _ = deduped_state_dict(module, optimizer=None)
+        logger.info(f'Rank {rank}: gathering state dict')
+        state_dicts = gather_mixed_data(local_state_dict, src_rank=0, group=involved_group, device='cpu')
+        if rank == 0:
+            logger.info(f'Rank {rank}: merging gathered state dicts')
+            merge_state_dict = merge_state_dicts(state_dicts)
+        else:
+            merge_state_dict = None
+    else:
+        merge_state_dict = None
+
+    logger.info(f'Rank {rank}: Broadcasting merged state dict to all ranks')
+    merge_state_dict = broadcast_mixed_data(merge_state_dict, src_rank=0)
+    logger.info(f'Rank {rank}: Finished gathering full model state dict')
+    torch.distributed.barrier()
+    return merge_state_dict
