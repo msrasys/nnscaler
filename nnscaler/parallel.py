@@ -58,7 +58,6 @@ from nnscaler.utils import (
     OptStateDict,
     copy_dynamic,
     broadcast_files,
-    transform_recursively,
     broadcast_mixed_data,
     gather_mixed_data,
 )

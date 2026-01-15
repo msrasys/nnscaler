@@ -808,7 +808,6 @@ def extract_tensors(data: Dict[str, Any]) -> Tuple[Dict[str, Any], List[torch.Te
     Returns:
         Tuple[Dict[str, Any], List[torch.Tensor]]: The skeleton and the list of tensors.
     """
-    skeleton = {}
     tensors = []
 
     # used to deduplicate tensors
