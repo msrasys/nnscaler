@@ -792,26 +792,6 @@ def broadcast_files(
         _send_file_group(local_rank, file_groups[i], file_group_sizes[i])
 
 
-def broadcast_tensor_list(
-    tensors: List[torch.Tensor],
-    *,
-    src_rank: int = 0,
-    max_batch_size: Optional[int] = None,
-    group: Optional[torch.distributed.ProcessGroup] = None,
-):
-    """
-    Broadcast a list of tensors from src_rank to all other ranks.
-    Small tensors are broadcasted in batches with upper size `max_batch_size` to improve performance.
-
-    Args:
-        tensors (List[torch.Tensor]): The list of tensors to be broadcasted.
-        src_rank (int): The source rank to broadcast from. Default: 0.
-        max_batch_size (int, optional): The maximum batch size for broadcasting.
-        group (torch.distributed.ProcessGroup, optional): The process group to use for broadcasting.
-            If None, the default process group will be used. Default: None.
-    """
-
-
 class _TensorIndex:
     def __init__(self, index: int):
         self.index = index
