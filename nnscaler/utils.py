@@ -970,12 +970,15 @@ def gather_mixed_data(
         else:
             return None  # only rank 0 needs the recovered state dict
 
-    if rank == src_rank:
-        # TODO: It may have performance issue if the number of ranks is large
-        for i in range(1, world_size):
+    # TODO: It may have performance issue if the number of ranks is large
+    for i in range(0, world_size):
+        if i == src_rank:
+            continue
+        if rank == src_rank:
             result[i] = _send_recv_tensors(i, gathered_sent[i][0], gathered_sent[i][1])
-    else:
-        _send_recv_tensors(rank, skeleton, tensors)
+        elif rank == i:
+            _send_recv_tensors(rank, skeleton, tensors)
+        torch.distributed.barrier(group=group)
 
     if rank == src_rank:
         return result
