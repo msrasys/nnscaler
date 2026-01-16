@@ -956,9 +956,9 @@ def gather_mixed_data(
 
         for i in range(len(tensors)):
             if rank == src_rank:
-                torch.distributed.recv(cuda_tensors[i], src=sender)
+                torch.distributed.recv(cuda_tensors[i], group_src=sender, group=group)
             else:
-                torch.distributed.send(cuda_tensors[i], dst=src_rank)
+                torch.distributed.send(cuda_tensors[i], group_dst=src_rank, group=group)
 
         if rank == src_rank:
             tensors = [tensor.to(device, non_blocking=True) for tensor in cuda_tensors]
