@@ -2607,7 +2607,7 @@ def load_deduped_state_dict(
                             if key in missing_keys:
                                 missing_keys.remove(key)
                             else:
-                                # the tensor is already loaded, we need to check if they are equal after broadcast
+                                # the tensor is already loaded, we need to check if they are equal
                                 existing_tensor = broadcast_tensor.cpu()
                         else:
                             logger.info(f'At rank {cur_rank}, skip to load: {key} from rank {rank}, not found in the module.')
