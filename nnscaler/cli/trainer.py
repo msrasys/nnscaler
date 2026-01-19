@@ -308,6 +308,7 @@ class Trainer:
         We can't broadcast the whole state_dict at once, because it may be too large, and leads to OOM.
         Here we will break the model and optimizer state_dict into smaller pieces and broadcast them one by one.
         Please note we use `torch.distributed.broadcast_object_list` to broadcast the state_dict (including tensors inside).
+        TODO: optimize the broadcast by sending tensors separately.
         """
         dst_ranks = dst_ranks or list(range(torch.distributed.get_world_size()))
         if src_rank not in dst_ranks or self.rank not in dst_ranks:
