@@ -2540,7 +2540,7 @@ def load_deduped_state_dict(
     module: torch.nn.Module,
     module_state_dict: Dict[str, Any],
     optimizer: Optional[Union[torch.optim.Optimizer, ParallelOptimizer]] = None,
-    optimizer_state_dict: Optional[Dict[str, Any]] = None,
+    optimizer_state_dict: Optional[OptStateDict] = None,
     *,
     device: Union[str, torch.device] = None
 ) -> None:
@@ -2597,21 +2597,30 @@ def load_deduped_state_dict(
                         broadcast_tensor = getattr(pm, local_name)
                         logger.info(f'Broadcast: {key} from {cur_rank}.')
                     else:
-                        broadcast_tensor = torch.empty(shape, device=device, requires_grad=False, dtype=dtype)
-                    torch.distributed.broadcast(broadcast_tensor, src=rank, group=broadcast_group)
-                    if rank != cur_rank:
                         # in pipeline parallelism, the local_name may not be found in the module
+                        existing_tensor = None
                         if hasattr(pm, local_name):
                             logger.info(f'At rank {cur_rank}, try to load: {key} from rank {rank}.')
                             attr = getattr(pm, local_name)
+
+                            broadcast_tensor = attr.data
                             if key in missing_keys:
-                                attr.data.copy_(broadcast_tensor)
                                 missing_keys.remove(key)
                             else:
-                                assert torch.equal(attr, broadcast_tensor), \
-                                    f'At rank {cur_rank}, the attribute {key} is already loaded, but not equal to the broadcasted tensor from rank {rank}.'
+                                # the tensor is already loaded, we need to check if they are equal after broadcast
+                                existing_tensor = broadcast_tensor.cpu()
                         else:
                             logger.info(f'At rank {cur_rank}, skip to load: {key} from rank {rank}, not found in the module.')
+                            # we still need to create a tensor to receive the broadcasted data
+                            # TODO: this rank should be removed from the broadcast group
+                            broadcast_tensor = torch.empty(shape, device=device, requires_grad=False, dtype=dtype)
+
+                    torch.distributed.broadcast(broadcast_tensor, src=rank, group=broadcast_group)
+
+                    if rank != cur_rank:
+                        if existing_tensor is not None:
+                            assert torch.equal(existing_tensor, broadcast_tensor.cpu()), \
+                                    f'At rank {cur_rank}, the attribute {key} is already loaded, but not equal to the broadcasted tensor from rank {rank}.'
 
         for key in missing_keys:
             split_names = key.split('.')
@@ -2631,11 +2640,6 @@ def load_deduped_state_dict(
     if optimizer is not None and optimizer_state_dict is not None:
         if not _is_supported_optimizer(optimizer._extra_state.name):
             raise ValueError("Only Adam-like optimizers are supported.")
-
-        for idx, state in optimizer_state_dict['state'].items():
-            for key, value in state.items():
-                if isinstance(value, torch.Tensor):
-                    optimizer_state_dict['state'][idx][key] = value.to(device)
 
         # get the locations of non-parallel module parameters
         # by removing the parallel module locations
@@ -2657,12 +2661,19 @@ def load_deduped_state_dict(
 
         for bg in opt_broadcast_groups:
             _broadcast_opt_state(optimizer_state_dict, *bg)
+
+        # make sure all tensors are in the target device
+        for idx, state in optimizer_state_dict['state'].items():
+            for key, value in state.items():
+                if isinstance(value, torch.Tensor):
+                    optimizer_state_dict['state'][idx][key] = value.to(device)
+
         optimizer.load_state_dict(optimizer_state_dict)
 
         torch.distributed.barrier()
 
 
-def _broadcast_opt_state(optimizer_state_dict, state_indexes: List[int], dedup_group_size: int):
+def _broadcast_opt_state(optimizer_state_dict: OptStateDict, state_indexes: List[int], dedup_group_size: int):
     if not state_indexes:
         return
 
@@ -2691,6 +2702,10 @@ def _broadcast_opt_state(optimizer_state_dict, state_indexes: List[int], dedup_g
                 key: torch.zeros(value[0], dtype=value[1], device=torch.cuda.current_device())
                 for key, value in v.items()
             }
+    else:
+        for idx in state_indexes:
+           for key, value in optimizer_state_dict['state'][idx].items():
+               optimizer_state_dict['state'][idx][key] = optimizer_state_dict['state'][idx][key].cuda()
 
     # broadcast step
     # step is too small, so we can just broadcast all of them all together

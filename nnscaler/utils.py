@@ -640,12 +640,12 @@ class AdamOptState(TypedDict):
 
 class OptStateParamGroup(TypedDict):
     params: list[int]
-    lr: int
+    lr: float
 
 
 class OptStateDict(TypedDict):
-    state: dict[int, AdamOptState | dict[str, Any]]
-    param_groups: list[OptStateParamGroup | dict[str, Any]]
+    state: dict[int, AdamOptState | dict[str, Union[Any, torch.Tensor]]]
+    param_groups: list[OptStateParamGroup | dict[str, Union[Any, torch.Tensor]]]
 
 
 def fn_field(**kwargs):
