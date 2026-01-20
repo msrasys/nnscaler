@@ -2580,7 +2580,7 @@ def load_deduped_state_dict(
         rank2deduped_fullmap, dedup_group_size, _ = _collect_dedup_info(no_zero3_pms)
         logger.debug(f'At rank {cur_rank}, dedup_group_size: {dedup_group_size}, rank2deduped_fullmap: {rank2deduped_fullmap}.')
 
-        # collect dedup info from dedup information
+        # collect dedup info from attr meta maps
         # Key: (prefix, local_name)
         # Value: list[rank]: a list of ranks that have the local_name
         local_name2ranks: Dict[tuple[str, str], list[int]] = {}
@@ -2627,6 +2627,7 @@ def load_deduped_state_dict(
                         missing_keys.remove(key)
                     else:
                         # the tensor is already loaded, we need to check if they are equal
+                        # it should not come here if _collect_dedup_info is strict
                         existing_tensor = broadcast_tensor.cpu()
 
                 torch.distributed.broadcast(broadcast_tensor, src=ranks[0], group=broadcast_group)
