@@ -2583,26 +2583,27 @@ def load_deduped_state_dict(
         # collect dedup info from dedup information
         # Key: (prefix, local_name)
         # Value: list[rank]: a list of ranks that have the local_name
-        local_name2rank_attr_map: Dict[tuple[str, str], list[int]] = {}
-        for rank in range(world_size):
-            for prefix, m in no_zero3_pms.items():
-                if rank >= dedup_group_size[prefix]:
-                    continue
+        local_name2ranks: Dict[tuple[str, str], list[int]] = {}
+
+        for prefix, m in no_zero3_pms.items():
+            for rank in range(dedup_group_size[prefix]):
                 for local_name, _ in m.get_attr_meta_map(rank).items():
                     key = (prefix, local_name)
-                    if key not in local_name2rank_attr_map:
-                        local_name2rank_attr_map[key] = []
-                    local_name2rank_attr_map[key].append(rank)
+                    if key not in local_name2ranks:
+                        local_name2ranks[key] = []
+                    local_name2ranks[key].append(rank)
 
         # create process groups for broadcasting
-        for key, ranks in local_name2rank_attr_map.items():
+        for key, ranks in local_name2ranks.items():
             if len(ranks) <= 1:
                 continue
+            # should have sorted.
             ranks.sort()
             DeviceGroup().get_group(ranks)
 
-        # broadcast weights in parallel modules
-        for key_name, ranks in local_name2rank_attr_map.items():
+        # broadcast weights in parallel modules inside dedup group (most time it is the 1st scale unit)
+        # Implementation of `deduped_state_dict` can guarantee that the first rank in each rank group always has the weights
+        for key_name, ranks in local_name2ranks.items():
             if len(ranks) <= 1:
                 continue
             prefix, local_name = key_name
@@ -2631,6 +2632,8 @@ def load_deduped_state_dict(
                 torch.distributed.broadcast(broadcast_tensor, src=ranks[0], group=broadcast_group)
 
                 if cur_rank != ranks[0]:
+                    # it should not come here if _collect_dedup_info is strict
+                    # anyway, we add an assertion here to make sure
                     if existing_tensor is not None:
                         assert torch.equal(existing_tensor, broadcast_tensor.cpu()), \
                                 f'At rank {cur_rank}, the attribute {key} is already loaded, ' \
