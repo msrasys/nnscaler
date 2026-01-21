@@ -2684,12 +2684,6 @@ def load_deduped_state_dict(
         for bg in opt_broadcast_groups:
             _broadcast_opt_state(optimizer_state_dict, *bg)
 
-        # make sure all tensors are in the target device
-        for idx, state in optimizer_state_dict['state'].items():
-            for key, value in state.items():
-                if isinstance(value, torch.Tensor):
-                    optimizer_state_dict['state'][idx][key] = value.to(device)
-
         optimizer.load_state_dict(optimizer_state_dict)
 
         torch.distributed.barrier()
@@ -2847,10 +2841,6 @@ def load_sharded_state_dict(
     module.load_state_dict(module_state_dict)
     module.to(device)
     if optimizer and optimizer_state_dict:
-        for idx, state in optimizer_state_dict.get('state', {}).items():
-            for key, value in state.items():
-                if isinstance(value, torch.Tensor):
-                    optimizer_state_dict['state'][idx][key] = value.to(device)
         optimizer.load_state_dict(optimizer_state_dict)
 
 
