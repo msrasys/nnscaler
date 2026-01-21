@@ -1,12 +1,12 @@
-# Autodist Constraints Guide
+# Partition Constraints Guide
 
-Autodist allows users to guide the parallelization strategy by specifying constraints. This is useful when you have specific knowledge about how certain operators should be partitioned or if you want to enforce specific behaviors like recomputation or pipeline stages.
+Nnscaler allows users to guide the parallelization strategy by specifying constraints. This is useful when you have specific knowledge about how certain operators should be partitioned or if you want to enforce specific behaviors like recomputation or pipeline stages.
 
 There are two primary ways to provide constraints, only one of them can be used at a time:
-1.  **YAML Configuration**: Using `allowed_partition_dims` to define valid partition dimensions for specific operators.
+1.  **Autodist YAML Configuration**: Using `allowed_partition_dims` to define valid partition dimensions for specific operators.
 2.  **Python Policy Generator**: providing a generator function that yields `OpPlan` objects to explicitly define the plan for operators.
 
-## Method 1: YAML Configuration
+## Method 1: Autodist YAML Configuration
 
 You can use a YAML file to specify which dimensions are allowed for partitioning for specific operators. This is often used to prevent Autodist from partitioning certain operators in ways that are known to be inefficient or problematic (e.g., forcing replication).
 
@@ -59,7 +59,7 @@ cfg = AutoDistConfig(
 
 ## Method 2: Python Policy Generator (`OpPlan`)
 
-For fine-grained control, you can provide a Python generator function (the `policy` argument in `parallelize` or `autodist_wrapper`). This function yields `OpPlan` objects which tell Autodist exactly how to handle specific nodes.
+For fine-grained control, you can provide a Python generator function (the `policy` argument in `parallelize` or `autodist_wrapper`). This function yields `OpPlan` objects which explicitly specify the partitioning strategy for specific nodes.
 
 ### Usage
 
@@ -82,13 +82,15 @@ class OpPlan:
 *   **`op`**: The graph node (`IRFwOperation`) this plan applies to.
 *   **`partition`**: define the partitioning strategy.
     *   `OpPartition(input=i, dim=d)`: Partition the operator based on the `d`-th dimension of its `i`-th input tensor.
-    *   `'auto'` (default): Let Autodist automatically infer the best partitioning strategy.
+    *   `'auto'` (default): Tries to follow the partition of its inputs. If no input is partitioned, it just replicate the operator.
     *   `None`: Force the operator to be replicated (no partitioning).
 *   **`recompute_id`** (default: -1):
-    *   Used to group operators for Rematerialization (Gradient Checkpointing).
+    *   Used to group operators for Recompute (Gradient Checkpointing).
     *   Operators with the same non-negative `recompute_id` will be grouped into a single recomputation block.
+    *   These non-negative `recompute_id`s should be consecutive.
 *   **`stage_id`** (default: -1):
     *   Used for Pipeline Parallelism assignment.
+    *   These non-negative `stage_id`s should be consecutive.
 *   **`pre_hook` / `post_hook`**:
     *   You can attach custom Python functions to be executed before or after the operator. See source code for signature details.
 
