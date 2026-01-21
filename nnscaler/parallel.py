@@ -2599,6 +2599,7 @@ def load_deduped_state_dict(
                 continue
             # should have sorted.
             ranks.sort()
+            logger.debug(f'At rank {cur_rank}, create groups for ranks: {ranks}.')
             DeviceGroup().get_group(ranks)
 
         # broadcast weights in parallel modules inside dedup group (most time it is the 1st scale unit)
@@ -2630,6 +2631,7 @@ def load_deduped_state_dict(
                         # it should not come here if _collect_dedup_info is strict
                         existing_tensor = broadcast_tensor.cpu()
 
+                logger.debug(f'At rank {cur_rank}, broadcast from {ranks[0]} to {ranks} for `{key}`.')
                 torch.distributed.broadcast(broadcast_tensor, src=ranks[0], group=broadcast_group)
 
                 if cur_rank != ranks[0]:
