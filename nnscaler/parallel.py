@@ -2559,7 +2559,6 @@ def load_deduped_state_dict(
     """
     device = device or torch.cuda.current_device()
     cur_rank = torch.distributed.get_rank()
-    world_size = torch.distributed.get_world_size()
 
     # step 1: load deduped state dict at each rank
     missing_keys, unexpected_keys = module.load_state_dict(module_state_dict, strict=False)
@@ -2686,7 +2685,7 @@ def load_deduped_state_dict(
 
         optimizer.load_state_dict(optimizer_state_dict)
 
-        torch.distributed.barrier()
+    torch.distributed.barrier()
 
 
 def _broadcast_opt_state(optimizer_state_dict: OptStateDict, state_indexes: List[int], dedup_group_size: int):
