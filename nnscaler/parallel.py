@@ -2601,6 +2601,8 @@ def load_deduped_state_dict(
             logger.debug(f'At rank {cur_rank}, create groups for ranks: {ranks}.')
             DeviceGroup().get_group(ranks)
 
+        torch.distributed.barrier()
+
         # broadcast weights in parallel modules inside dedup group (most time it is the 1st scale unit)
         # Implementation of `deduped_state_dict` can guarantee that the first rank in each rank group always has the weights
         for key_name, ranks in local_name2ranks.items():
