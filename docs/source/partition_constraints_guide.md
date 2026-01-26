@@ -2,13 +2,13 @@
 
 Nnscaler allows users to guide the parallelization strategy by specifying constraints. This is useful when you have specific knowledge about how certain operators should be partitioned or if you want to enforce specific behaviors like recomputation or pipeline stages.
 
-There are two primary ways to provide constraints, only one of them can be used at a time:
-1.  **Autodist YAML Configuration**: Using `allowed_partition_dims` to define valid partition dimensions for specific operators.
-2.  **Python Policy Generator**: providing a generator function that yields `OpPlan` objects to explicitly define the plan for operators.
+There are two scenarios for providing constraints, they cannot be used at the same time:
+1.  **Partition constraints in Autodist**: When using autodist, you can use **Autodist YAML Configuration** to define valid partition dimensions for specific operators.
+2.  **Partition constraints in Function Policy**: You can provide a **Function Policy** that yields `OpPlan` objects to explicitly define the plan for operators. There are no auto search for partitioning except for your definition.
 
-## Method 1: Autodist YAML Configuration
+## Method 1: Partition constraints in Autodist
 
-You can use a YAML file to specify which dimensions are allowed for partitioning for specific operators. This is often used to prevent Autodist from partitioning certain operators in ways that are known to be inefficient or problematic (e.g., forcing replication).
+You can use a **Autodist YAML Configuration** file to specify which dimensions are allowed for partitioning for specific operators. This is often used to prevent Autodist from partitioning certain operators in ways that are known to be inefficient or problematic (e.g., forcing replication).
 
 ### Configuration Format
 
@@ -57,9 +57,9 @@ cfg = AutoDistConfig(
 ```
 
 
-## Method 2: Python Policy Generator (`OpPlan`)
+## Method 2: Partition constraints in Function Policy
 
-For fine-grained control, you can provide a Python generator function (the `policy` argument in `parallelize` or `autodist_wrapper`). This function yields `OpPlan` objects which explicitly specify the partitioning strategy for specific nodes.
+For fine-grained control, you can provide a **Function Policy** (the `policy` argument in `parallelize` or `autodist_wrapper`). This function yields `OpPlan` objects which explicitly specify the partitioning strategy for specific nodes.
 
 ### Usage
 
