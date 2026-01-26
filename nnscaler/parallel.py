@@ -2540,7 +2540,7 @@ def load_deduped_state_dict(
     module: torch.nn.Module,
     module_state_dict: Dict[str, Any],
     optimizer: Optional[Union[torch.optim.Optimizer, ParallelOptimizer]] = None,
-    optimizer_state_dict: Optional[Dict[str, Any]] = None,
+    optimizer_state_dict: Optional[OptStateDict] = None,
     *,
     device: Union[str, torch.device] = None
 ) -> None:
@@ -2570,53 +2570,85 @@ def load_deduped_state_dict(
     # step 2: broadcast deduped weights inside 1st scale unit for non-zero3 parallel modules
     # for zero3 modules, the weights are already complete after step 1
     # TODO: refine zero3 modules support
-    parallel_modules = {
+    no_zero3_pms = {
         prefix: m
         for prefix, m in module.named_modules()
         if isinstance(m, ParallelModule) and m.compute_config.use_zero <= 1
     }
-    if parallel_modules:
-        rank2deduped_fullmap, dedup_group_size, global_tensor_meta = _collect_dedup_info(parallel_modules)
+    if no_zero3_pms:
+        rank2deduped_fullmap, dedup_group_size, _ = _collect_dedup_info(no_zero3_pms)
         logger.debug(f'At rank {cur_rank}, dedup_group_size: {dedup_group_size}, rank2deduped_fullmap: {rank2deduped_fullmap}.')
 
-        # broadcast weights in parallel modules
-        for rank, deduped_fullmap in rank2deduped_fullmap.items():
-            logger.debug(f'At rank {cur_rank}, process rank: {rank}.')
-            for prefix, fullmap in deduped_fullmap.items():
-                if cur_rank >= dedup_group_size[prefix]:
-                    break
-                broadcast_group = DeviceGroup().get_group(list(range(dedup_group_size[prefix])))
-                for local_name, attr_meta in fullmap.items():
-                    key = f'{prefix}.{local_name}' if prefix else local_name
-                    assert prefix in parallel_modules, f'Prefix {prefix} not found in parallel_modules: {list(parallel_modules.keys())}.'
-                    pm = parallel_modules[prefix]
-                    attr_meta = global_tensor_meta[rank][prefix][local_name]
-                    shape, dtype = attr_meta.sub_shape, attr_meta.dtype
-                    if rank == cur_rank:
-                        assert hasattr(pm, local_name), f'Local name {local_name} not found in {pm}.'
-                        broadcast_tensor = getattr(pm, local_name)
-                        logger.info(f'Broadcast: {key} from {cur_rank}.')
+        # collect dedup info from attr meta maps
+        # Key: (prefix, local_name)
+        # Value: list[rank]: a list of ranks that have the local_name
+        local_name2ranks: Dict[tuple[str, str], list[int]] = {}
+
+        for prefix, m in no_zero3_pms.items():
+            for rank in range(dedup_group_size[prefix]):
+                for local_name, _ in m.get_attr_meta_map(rank).items():
+                    key = (prefix, local_name)
+                    if key not in local_name2ranks:
+                        local_name2ranks[key] = []
+                    local_name2ranks[key].append(rank)
+
+        # create process groups for broadcasting
+        for key, ranks in local_name2ranks.items():
+            if len(ranks) <= 1:
+                continue
+            # should have sorted.
+            ranks.sort()
+            logger.debug(f'At rank {cur_rank}, create groups for ranks: {ranks}.')
+            DeviceGroup().get_group(ranks)
+
+        torch.distributed.barrier()
+
+        # broadcast weights in parallel modules inside dedup group (most time it is the 1st scale unit)
+        # Implementation of `deduped_state_dict` can guarantee that the first rank in each rank group always has the weights
+        for key_name, ranks in local_name2ranks.items():
+            if len(ranks) <= 1:
+                continue
+            prefix, local_name = key_name
+            if cur_rank in ranks:
+                key = f'{prefix}.{local_name}' if prefix else local_name
+                broadcast_group = DeviceGroup().get_group(ranks)
+                assert prefix in no_zero3_pms, f'Prefix {prefix} not found in parallel_modules: {list(no_zero3_pms.keys())}.'
+                pm = no_zero3_pms[prefix]
+                assert hasattr(pm, local_name), f'Local name {local_name} not found in {pm}.'
+                # the shared tensor will always store in the smallest rank in the dedup group
+                if cur_rank == ranks[0]:
+                    broadcast_tensor = getattr(pm, local_name)
+                    logger.info(f'Broadcast: {key} from {cur_rank}.')
+                else:
+                    existing_tensor = None
+                    logger.info(f'At rank {cur_rank}, try to load: {key} from rank {ranks[0]}.')
+                    attr = getattr(pm, local_name)
+
+                    broadcast_tensor = attr.data
+                    if key in missing_keys:
+                        missing_keys.remove(key)
                     else:
-                        broadcast_tensor = torch.empty(shape, device=device, requires_grad=False, dtype=dtype)
-                    torch.distributed.broadcast(broadcast_tensor, src=rank, group=broadcast_group)
-                    if rank != cur_rank:
-                        # in pipeline parallelism, the local_name may not be found in the module
-                        if hasattr(pm, local_name):
-                            logger.info(f'At rank {cur_rank}, try to load: {key} from rank {rank}.')
-                            attr = getattr(pm, local_name)
-                            if key in missing_keys:
-                                attr.data.copy_(broadcast_tensor)
-                                missing_keys.remove(key)
-                            else:
-                                assert torch.equal(attr, broadcast_tensor), \
-                                    f'At rank {cur_rank}, the attribute {key} is already loaded, but not equal to the broadcasted tensor from rank {rank}.'
-                        else:
-                            logger.info(f'At rank {cur_rank}, skip to load: {key} from rank {rank}, not found in the module.')
+                        # the tensor is already loaded, we need to check if they are equal
+                        # it should not come here if _collect_dedup_info is strict
+                        existing_tensor = broadcast_tensor.cpu()
+
+                logger.debug(f'At rank {cur_rank}, broadcast from {ranks[0]} to {ranks} for `{key}`.')
+                torch.distributed.broadcast(broadcast_tensor, src=ranks[0], group=broadcast_group)
+
+                if cur_rank != ranks[0]:
+                    # it should not come here if _collect_dedup_info is strict
+                    # anyway, we add an assertion here to make sure
+                    if existing_tensor is not None:
+                        assert torch.equal(existing_tensor, broadcast_tensor.cpu()), \
+                                f'At rank {cur_rank}, the attribute {key} is already loaded, ' \
+                                f'but not equal to the broadcasted tensor from rank {ranks[0]}.'
+
+            torch.distributed.barrier()
 
         for key in missing_keys:
             split_names = key.split('.')
             prefix = '.'.join(split_names[:-1]) # remove the last part of the key
-            assert prefix not in parallel_modules or cur_rank >= dedup_group_size[prefix], f'At rank {cur_rank}, the missing key {key} should be in non-parallel modules.'
+            assert prefix not in no_zero3_pms or cur_rank >= dedup_group_size[prefix], f'At rank {cur_rank}, the missing key {key} should be in non-parallel modules.'
 
     # At this point
     # - All parallel modules in first scale unit should be complete.
@@ -2631,11 +2663,6 @@ def load_deduped_state_dict(
     if optimizer is not None and optimizer_state_dict is not None:
         if not _is_supported_optimizer(optimizer._extra_state.name):
             raise ValueError("Only Adam-like optimizers are supported.")
-
-        for idx, state in optimizer_state_dict['state'].items():
-            for key, value in state.items():
-                if isinstance(value, torch.Tensor):
-                    optimizer_state_dict['state'][idx][key] = value.to(device)
 
         # get the locations of non-parallel module parameters
         # by removing the parallel module locations
@@ -2657,12 +2684,13 @@ def load_deduped_state_dict(
 
         for bg in opt_broadcast_groups:
             _broadcast_opt_state(optimizer_state_dict, *bg)
+
         optimizer.load_state_dict(optimizer_state_dict)
 
-        torch.distributed.barrier()
+    torch.distributed.barrier()
 
 
-def _broadcast_opt_state(optimizer_state_dict, state_indexes: List[int], dedup_group_size: int):
+def _broadcast_opt_state(optimizer_state_dict: OptStateDict, state_indexes: List[int], dedup_group_size: int):
     if not state_indexes:
         return
 
@@ -2691,6 +2719,10 @@ def _broadcast_opt_state(optimizer_state_dict, state_indexes: List[int], dedup_g
                 key: torch.zeros(value[0], dtype=value[1], device=torch.cuda.current_device())
                 for key, value in v.items()
             }
+    else:
+        for idx in state_indexes:
+           for key, value in optimizer_state_dict['state'][idx].items():
+               optimizer_state_dict['state'][idx][key] = optimizer_state_dict['state'][idx][key].cuda()
 
     # broadcast step
     # step is too small, so we can just broadcast all of them all together
@@ -2810,10 +2842,6 @@ def load_sharded_state_dict(
     module.load_state_dict(module_state_dict)
     module.to(device)
     if optimizer and optimizer_state_dict:
-        for idx, state in optimizer_state_dict.get('state', {}).items():
-            for key, value in state.items():
-                if isinstance(value, torch.Tensor):
-                    optimizer_state_dict['state'][idx][key] = value.to(device)
         optimizer.load_state_dict(optimizer_state_dict)
 
 
