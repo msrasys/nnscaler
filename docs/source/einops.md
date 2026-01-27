@@ -5,7 +5,7 @@ Tracing einops Functions are challenging due to their dynamic nature and heavy r
 
 To make things easier, we skip tracing the internal logic of einops functions and directly use the resolved transformation recipes.
 
-This is done by skipping tracing for two internal einops functions: `_prepare_transformation_recipe`. In future, if einops changes their internal implementation, we may need to update our patching logic accordingly.
+This is done by skipping tracing internal einops function: `_prepare_transformation_recipe`. In future, if einops changes their internal implementation, we may need to update our patching logic accordingly.
 
 For nnscaler, we may skip more functions in the future if needed. For exmaple, `_reconstruct_from_shape_uncached` and `_reconstruct_from_shape` are also candidates for skipping tracing, but currently we haven't found issues without skipping them. Once we find issues related to them, we will skip tracing them as well.
 
