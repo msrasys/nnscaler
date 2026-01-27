@@ -850,6 +850,7 @@ def broadcast_mixed_data(
     *,
     src_rank: int = 0,
     group: Optional[torch.distributed.ProcessGroup] = None,
+    device: Optional[Union[str, torch.device]] = None,
 ):
     """
     Broadcast the data (containing tensors) from src_rank to all other ranks.
@@ -860,12 +861,18 @@ def broadcast_mixed_data(
         src_rank (int): The source rank to broadcast from. Default: 0.
         group (torch.distributed.ProcessGroup, optional): The process group to use for broadcasting.
             If None, the default process group will be used. Default: None.
+        device (str or torch.device, optional): The device to use for receiving tensors on non-src ranks.
+            If None, the current cuda device will be used. Default: None.
 
     Returns:
         dict: The broadcasted data.
             For src_rank, it is the same as the input data.
             For non-src ranks, it is the broadcasted data. the device of tensors will be cuda.
     """
+    device = device or torch.cuda.current_device()
+    if isinstance(device, str):
+        # need to compare device later, so convert to torch.device
+        device = torch.device(device)
     rank = torch.distributed.get_rank(group=group)
 
     # share the structure and tensor shapes
@@ -884,20 +891,29 @@ def broadcast_mixed_data(
     torch.distributed.broadcast_object_list(sent, src=src_rank, group=group)
     skeleton, meta_tensors = sent[0]
     if rank != src_rank:
-        tensors = [torch.empty_like(mt, device='cuda') for mt in meta_tensors]
-    else:
-        # make sure tensors are in cuda
-        tensors = [t.cuda() for t in tensors]
+        tensors = [None] * len(meta_tensors)
 
     # broadcast tensor data
     for i in range(len(tensors)):
-        torch.distributed.broadcast(tensors[i], src=src_rank, group=group)
+        if rank != src_rank:
+            tensor = torch.empty_like(meta_tensors[i], device='cuda')
+        else:
+            # make sure tensors are in cuda
+            tensor = tensors[i].cuda()
+
+        torch.distributed.broadcast(tensor, src=src_rank, group=group)
+
+        if rank != src_rank:
+            tensors[i] = tensor.to(device, non_blocking=True)
+        else:
+            # try to reuse the existing tensors if device matches
+            if tensor.device == device:
+                tensors[i] = tensor
+            else:
+                tensors[i] = tensors[i].to(device, non_blocking=True)
 
     # refill tensors
-    if rank != src_rank:
-        return refill_tensors(skeleton, tensors)
-    else:
-        return data
+    return refill_tensors(skeleton, tensors)
 
 
 def gather_mixed_data(
