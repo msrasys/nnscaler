@@ -15,6 +15,13 @@ from functools import partial
 from tests.launch_torchrun import torchrun
 
 
+# Skip all tests if flash_attn_func is not available
+try:
+    from flash_attn import flash_attn_func
+except ImportError:
+    pytest.skip("flash_attn_func not available", allow_module_level=True)
+
+
 @dataclass
 class ShuffleVarlenConfig:
     """Simple test configuration"""

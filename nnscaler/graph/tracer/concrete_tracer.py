@@ -30,6 +30,8 @@ from torch.fx.node import Target, Node, Argument
 from torch.fx.proxy import TracerBase, Scope
 from torch.fx.operator_schemas import check_for_mutable_operation
 
+from nnscaler.utils import transform_recursively
+
 dict_keys_type = type(dict().keys())
 dict_values_type = type(dict().values())
 dict_items_type = type(dict().items())
@@ -717,8 +719,14 @@ class ConcreteTracer(TracerBase):
         def wrap_never_wrap_function(func, *args, **kwargs):
             if self.patcher.patch_mode:
                 with self.patcher.revert():
+                     # unwrap all proxy in args/kwargs
+                    args = transform_recursively(args, lambda x: x.value, target_types=ep.ConcreteProxy)
+                    kwargs = transform_recursively(kwargs, lambda x: x.value, target_types=ep.ConcreteProxy)
                     return func(*args, **kwargs)
             else:
+                # unwrap all proxy in args/kwargs
+                args = transform_recursively(args, lambda x: x.value, target_types=ep.ConcreteProxy)
+                kwargs = transform_recursively(kwargs, lambda x: x.value, target_types=ep.ConcreteProxy)
                 return func(*args, **kwargs)
 
         try:
