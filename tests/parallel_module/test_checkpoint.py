@@ -382,7 +382,7 @@ def _train(model: torch.nn.Module, num_replicas, rank, start, end, ckpt_dir, inf
         assert set(result_orig_opt_state_dict['state']) == set(result_merged_opt_state_dict['state'])
         for index in result_orig_opt_state_dict['state']:
             for key in ('step', 'exp_avg', 'exp_avg_sq'):
-                assert torch.equal(result_orig_opt_state_dict['state'][index][key], result_merged_opt_state_dict['state'][index][key])
+                assert_equal(result_orig_opt_state_dict['state'][index][key], result_merged_opt_state_dict['state'][index][key])
     torch.distributed.barrier()
     data = gendata(model, DATA_SIZE, start, end, rank, num_replicas)
     results = []

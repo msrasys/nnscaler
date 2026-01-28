@@ -77,7 +77,7 @@ def check_ctx_manager_codegen(tempdir):
         #     use_scheduler = False
         #     nmicros_per_scheduler_step = 1
         #     rank = 0
-            
+
         #     def __init__(self, init_params=True, *, async_op=False, max_bucket_size_bytes=None, zero_use_reduce_scatter=False):
         #         super().__init__()
         #         # communication groups
@@ -85,17 +85,17 @@ def check_ctx_manager_codegen(tempdir):
         #         self.init_group(ranks=[1, 3])
         #         self.init_group(ranks=[0, 1])
         #         self.init_group(ranks=[2, 3])
-                
+
         #         self.register_parameter('param_1_62', torch.nn.Parameter(torch.empty((16, 16), dtype=torch.float32)))
         #         self.add_full_map('param_1_62', 5, True, 'param_1', (16, 16), (slice(0, 16, None), slice(0, 16, None)), 1)
-                
-                
+
+
         #         self.wreducer312 = nnscaler.runtime.adapter.Reducer(ranks=[0, 2], reduce_op='sum', async_op=async_op, zero=False, max_bucket_size_bytes=max_bucket_size_bytes, zero_use_reduce_scatter=zero_use_reduce_scatter, zero_ngroups=1)
         #         self.wreducer312.add_param(self.param_1_62)
         #         self.add_reducer(self.wreducer312)
-                
+
         #         self._post_init(init_params)
-            
+
         #     def segment308(self, x_75, y_78):
         #         # auto_multiref
         #         param_1_106, param_1_107, param_1_108, param_1_109, param_1_110 = nnscaler.runtime.function.multiref(self.param_1_62, times=5)
@@ -117,12 +117,12 @@ def check_ctx_manager_codegen(tempdir):
         #         # create at IRAdapterGener:autoref, comment before transformation: auto_multiref
         #         matmul_1_202, matmul_1_228 = nnscaler.runtime.function.multiref(matmul_1_182, times=2)
         #         del matmul_1_182
-                
+
         #         with torch.no_grad():
         #             # File "/scratch/nishang/MagicCube/tests/parallel_module/test_gencode_ctx_manager.py", line 24, in forward,  r_3 = torch.matmul(r_1, self.param_1)
         #             matmul_2_196 = torch.matmul(matmul_194, param_1_106)
         #             del param_1_106, matmul_194
-                
+
         #         # create at IRAdapterGener:autoref, comment before transformation: auto_multiref
         #         matmul_2_216, matmul_2_242 = nnscaler.runtime.function.multiref(matmul_2_196, times=2)
         #         del matmul_2_196
@@ -133,12 +133,12 @@ def check_ctx_manager_codegen(tempdir):
         #         # create at IRAdapterGener:autoref, comment before transformation: auto_multiref
         #         matmul_3_252, matmul_3_218 = nnscaler.runtime.function.multiref(matmul_3_204, times=2)
         #         del matmul_3_204
-                
+
         #         with torch.no_grad(), torch.autocast(device_type='cuda', dtype=torch.float16, enabled=True, cache_enabled=True):
         #             # File "/scratch/nishang/MagicCube/tests/parallel_module/test_gencode_ctx_manager.py", line 28, in forward,  r_5 = r_3 * r_4
         #             mul_220 = torch.mul(matmul_2_216, matmul_3_218)
         #             del matmul_2_216, matmul_3_218
-                
+
         #         # File "/scratch/nishang/MagicCube/tests/parallel_module/test_gencode_ctx_manager.py", line 29, in forward,  r = r_1 * r_2 * r_3 * r_4 * r_5
         #         mul_1_230 = torch.mul(matmul_226, matmul_1_228)
         #         del matmul_226, matmul_1_228
@@ -161,11 +161,11 @@ def check_ctx_manager_codegen(tempdir):
         #         norm_61 = torch.norm(matmul_4_72, p='fro', dim=None, keepdim=False, out=None, dtype=None)
         #         del matmul_4_72
         #         return norm_61
-            
+
         #     def reducer312(self):
         #         self.wreducer312.sync_grads()
-        #         return 
-            
+        #         return
+
         #     def _forward_impl(self, x, y):
         #         norm_61 = self.segment308(x, y)
         #         return norm_61
@@ -301,12 +301,12 @@ def _train_ga(model, update_freq, data_size):
 @pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.device_count() < 2, reason='lack of gpu devices')
 def test_loss_scaling():
     torch.cuda.set_device(0)
-    torch.set_default_device(f'cuda:0')
     init_random()
-    model = CtxManagerModel()
-    ga4_result = _train_ga(model, 1, 1)
-    assert len(ga4_result) == 1
-    ga4_grads = ga4_result[0][0]
+    with torch.device('cuda:0'):
+        model = CtxManagerModel()
+        ga4_result = _train_ga(model, 1, 1)
+        assert len(ga4_result) == 1
+        ga4_grads = ga4_result[0][0]
 
     cube2_results = launch_torchrun(2, gpu_worker_cube_one_sample)
     cube2_result = merge_cube_result({k: v for k, v in cube2_results.items()})

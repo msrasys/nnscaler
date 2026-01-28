@@ -23,7 +23,7 @@ from tqdm import tqdm
 
 import nnscaler
 from nnscaler.runtime.device import DeviceGroup
-from nnscaler.utils import enforce_zero_num_worker, is_running_distributed
+from nnscaler.utils import broadcast_mixed_data, is_running_distributed
 
 from .trainer_args import AggregatedOutputs, TrainerArgs, fix_input
 from .train_hook import AggregatedTrainHook, TrainHook, TrainHookHost
@@ -305,10 +305,6 @@ class Trainer:
     ):
         """
         Broadcast the merged state dict to all ranks.
-        We can't broadcast the whole state_dict at once, because it may be too large, and leads to OOM.
-        Here we will break the model and optimizer state_dict into smaller pieces and broadcast them one by one.
-        Please note we use `torch.distributed.broadcast_object_list` to broadcast the state_dict (including tensors inside).
-        TODO: optimize the broadcast by sending tensors separately.
         """
         dst_ranks = dst_ranks or list(range(torch.distributed.get_world_size()))
         if src_rank not in dst_ranks or self.rank not in dst_ranks:
@@ -321,54 +317,8 @@ class Trainer:
         else:
             if state_dict is not None:
                 raise ValueError("state_dict should be None in other ranks when broadcasting")
-            state_dict = {}
 
-        def _broadcast_keys(sdict: Dict[str, Any], set_keys=True):
-            if self.rank == src_rank:
-                state_keys = list(sdict.keys())
-            else:
-                state_keys = None
-            state_key_list = [state_keys]
-            torch.distributed.broadcast_object_list(state_key_list, src=src_rank, group=pg)
-            state_keys = state_key_list[0]
-            if set_keys and self.rank != src_rank:
-                for key in state_keys:
-                    sdict[key] = {}  # assume the values are empty dicts
-            return state_keys
-
-        def _broadcast_value(sdict, key):
-            if self.rank == src_rank:
-                value_list = [sdict[key]]
-            else:
-                value_list = [None]
-            torch.distributed.broadcast_object_list(value_list, src=src_rank, group=pg)
-            if self.rank != src_rank:
-                sdict[key] = value_list[0]
-
-        def _broadcast_values(sdict, keys):
-            for key in keys:
-                _broadcast_value(sdict, key)
-
-        state_keys = _broadcast_keys(state_dict)
-
-        for skey in state_keys:
-            logger.info(f"Broadcasting {skey}.")
-            if skey == 'optimizer':
-                opt_keys = _broadcast_keys(state_dict['optimizer'])
-                opt_keys_without_state = [
-                    k for k in opt_keys if k != 'state'
-                ]
-                _broadcast_values(state_dict['optimizer'], opt_keys_without_state)
-                idxs = _broadcast_keys(state_dict['optimizer']['state'])
-                for idx in idxs:
-                    idx_keys = _broadcast_keys(state_dict['optimizer']['state'][idx])
-                    _broadcast_values(state_dict['optimizer']['state'][idx], idx_keys)
-            elif skey == 'model':
-                model_keys = _broadcast_keys(state_dict['model'])
-                _broadcast_values(state_dict['model'], model_keys)
-            else:
-                _broadcast_value(state_dict, skey)
-        return state_dict
+        return broadcast_mixed_data(state_dict, src_rank=src_rank, group=pg, device='cpu')
 
     @classmethod
     def merge_checkpoint(cls, checkpoint_files: List[str], output_file: str,

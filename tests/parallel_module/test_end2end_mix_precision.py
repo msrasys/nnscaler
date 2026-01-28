@@ -171,12 +171,12 @@ def gpu_worker_cube(use_zero=False, async_reducer=False, use_bucket=False):
 @pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.device_count() < 4, reason='lack of gpu devices')
 def test_mixed_precision():
     torch.cuda.set_device(0)
-    torch.set_default_device(f'cuda:0')
     init_random()
-    model = MPModule()
-    torch.save(model.state_dict(), 'model.pth')
-    ga4_result = _train_ga(model, 4)  # micro_batch_size = 4
-    assert len(ga4_result) == 4
+    with torch.device('cuda:0'):
+        model = MPModule()
+        torch.save(model.state_dict(), 'model.pth')
+        ga4_result = _train_ga(model, 4)  # micro_batch_size = 4
+        assert len(ga4_result) == 4
 
     cube2_results_non_pipeline = {}
     for use_async_reducer in [False, True]:

@@ -255,9 +255,11 @@ class Bucket:
                 padded_numel = z3_info.numel_with_padding() * self._zgroup_sz
                 if grad.numel() < padded_numel:
                     # add padding
-                    grad = torch.cat(
-                        [grad,
-                        torch.zeros(padded_numel - grad.numel(), device=grad.device, dtype=grad.dtype)]
+                    grad = torch.nn.functional.pad(
+                        grad,
+                        (0, padded_numel - grad.numel()),
+                        mode='constant',
+                        value=0.0,
                     )
                 output = torch.zeros(z3_info.numel_with_padding(), device=grad.device, dtype=grad.dtype)
                 torch.distributed.reduce_scatter_tensor(
@@ -761,10 +763,12 @@ class Reducer:
                 # to make sure all ranks in the zero subgroup have the same bucket layout.
                 if end - start < chunk_size:
                     padding = chunk_size - (end - start)
-                    param.data = torch.cat([
-                        param.data.view(-1)[start:end].clone(),
-                        torch.zeros(padding, dtype=param.dtype, device=param.device)
-                    ], dim=0)
+                    param.data = torch.nn.functional.pad(
+                        param.data.view(-1)[start:end],
+                        (0, padding),
+                        mode='constant',
+                        value=0.0,
+                    )
                 else:
                     param.data = param.data.view(-1)[start:end].clone()
 

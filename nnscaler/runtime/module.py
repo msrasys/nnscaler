@@ -479,7 +479,7 @@ class CubeModule(torch.nn.Module):
                 partial_tensor = model_state_dict[local_name]
                 if meta.orig_name not in full_model_state_dict:
                     full_model_state_dict[meta.orig_name] = torch.empty(
-                        meta.shape, dtype=partial_tensor.dtype)
+                        meta.shape, dtype=partial_tensor.dtype, device='cpu')
                     state_dict_merge_track[meta.orig_name] = set()
                 # assign partial tensor
                 if meta.val_chunks > 1:
@@ -659,7 +659,7 @@ class CubeModule(torch.nn.Module):
             opt_states, opt_states_1d = {}, {}
             for key in opt_state_keys:
                 opt_states[key] = torch.zeros(pshape, dtype=bucket_states[0][key].dtype,
-                                                device=bucket_states[0][key].device, requires_grad=False)
+                                                device='cpu', requires_grad=False)
                 opt_states_1d[key] = opt_states[key].view(-1)
 
             if zero_version == 1:
@@ -709,7 +709,7 @@ class CubeModule(torch.nn.Module):
 
             if 'step' in bucket_states[0]:
                 # make sure all steps are different tensors (with same value)
-                opt_states['step'] = bucket_states[0]['step'].clone()
+                opt_states['step'] = bucket_states[0]['step'].cpu().clone()
             return opt_states
 
         def _merge_opt_zero(param_shape, worker_idx, param_idx):
@@ -798,7 +798,7 @@ class CubeModule(torch.nn.Module):
                                 if not CubeModule._safe_tensor_equal(full_states[full_index][state_name], value):
                                     raise ValueError(f"Conflict in merging {param_name}.{state_name} from rank {work_idx}")
                             else:
-                                full_states[full_index][state_name] = value
+                                full_states[full_index][state_name] = value.cpu()
                             continue
 
                         # for non-tensor states
@@ -813,7 +813,7 @@ class CubeModule(torch.nn.Module):
                         else:
                             # create optimizer state tensor
                             if state_name not in full_states[full_index]:
-                                full_states[full_index][state_name] = torch.empty(meta.shape, dtype=value.dtype)
+                                full_states[full_index][state_name] = torch.empty(meta.shape, dtype=value.dtype, device='cpu')
 
                             if track_id in state_merge_track:
                                 if not CubeModule._safe_tensor_equal(full_states[full_index][state_name][meta.slicers], value):
@@ -1681,7 +1681,7 @@ class ParallelModule(CubeModule):
             # avoid checking the non-persistent buffers
             attr_names = set([attr for attr in self._fullmap.keys() if attr not in non_persistent_buffers])
 
-            for prefix_attr, content in self.trim_merged_state_dict(state_dict, prefix).items():
+            for prefix_attr, content in self.trim_merged_state_dict(state_dict, prefix, device='cpu').items():
                 attr = prefix_attr[len(prefix):]
                 tensor: torch.Tensor = getattr(self, attr)
                 tensor.copy_(content)
@@ -1750,10 +1750,12 @@ class ParallelModule(CubeModule):
                         if end - start < chunk_size:
                             # need padding
                             padding = chunk_size - (end - start)
-                            trimmed_state_dict[prefix + attr] = torch.cat([
-                                content.view(-1)[start:end],
-                                torch.zeros(padding, dtype=content.dtype, device=content.device)
-                            ], dim=0).to(device)
+                            trimmed_state_dict[prefix + attr] = torch.nn.functional.pad(
+                                content.view(-1)[start:end].to(device),
+                                (0, padding),
+                                mode='constant',
+                                value=0.0,
+                            )
                         else:
                             trimmed_state_dict[prefix + attr] = content.reshape(-1)[start:end].to(device)
 

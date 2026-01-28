@@ -204,14 +204,14 @@ def allclose(a, b, atol=1e-6, rtol=1e-6):
 @pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.device_count() < 4, reason='lack of gpu devices')
 def test_end2end():
     torch.cuda.set_device(0)
-    torch.set_default_device(f'cuda:0')
-    model = MLP()
-    ga4_result = _train_ga(model, 4)  # micro_batch_size = 4
-    assert len(ga4_result) == 16
-    # will be used for comparision when zero_use_reduce_scatter is True
-    ga4_result_without_grads = []
-    for i in range(len(ga4_result)):
-        ga4_result_without_grads.append([ga4_result[i][1], ga4_result[i][2]])
+    with torch.device('cuda:0'):
+        model = MLP()
+        ga4_result = _train_ga(model, 4)  # micro_batch_size = 4
+        assert len(ga4_result) == 16
+        # will be used for comparision when zero_use_reduce_scatter is True
+        ga4_result_without_grads = []
+        for i in range(len(ga4_result)):
+            ga4_result_without_grads.append([ga4_result[i][1], ga4_result[i][2]])
 
     cube2_results = launch_torchrun(4, gpu_worker_cube, 4, 2, 'hybrid') # micro_batch_size = 4
     for _, v in cube2_results.items():
@@ -311,14 +311,14 @@ class MLPShared(End2EndMLP):
 @pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.device_count() < 4, reason='lack of gpu devices')
 def test_pipeline_shared():
     torch.cuda.set_device(0)
-    torch.set_default_device(f'cuda:0')
-    model = MLPShared()
-    ga4_result = _train_ga(model, 4)  # micro_batch_size = 4
-    assert len(ga4_result) == 16
-    for step in range(len(ga4_result)):
-        # fake shared weights for later compare
-        ga4_result[step][0]['layers.5.weight'] = ga4_result[step][0]['layers.0.weight']
-        ga4_result[step][1]['layers.5.weight'] = ga4_result[step][1]['layers.0.weight']
+    with torch.device('cuda:0'):
+        model = MLPShared()
+        ga4_result = _train_ga(model, 4)  # micro_batch_size = 4
+        assert len(ga4_result) == 16
+        for step in range(len(ga4_result)):
+            # fake shared weights for later compare
+            ga4_result[step][0]['layers.5.weight'] = ga4_result[step][0]['layers.0.weight']
+            ga4_result[step][1]['layers.5.weight'] = ga4_result[step][1]['layers.0.weight']
 
     with pytest.raises(ValueError, match='is not supported in training mode'):
         ComputeConfig(
@@ -356,10 +356,10 @@ def test_pipeline_shared():
 @pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.device_count() < 8, reason='lack of gpu devices')
 def test_pipeline():
     torch.cuda.set_device(0)
-    torch.set_default_device(f'cuda:0')
-    model = MLP()
-    ga4_result = _train_ga(model, 4)  # micro_batch_size = 4
-    assert len(ga4_result) == 16
+    with torch.device('cuda:0'):
+        model = MLP()
+        ga4_result = _train_ga(model, 4)  # micro_batch_size = 4
+        assert len(ga4_result) == 16
 
     # pp_size = 2
     # tp_size = 2
@@ -441,12 +441,12 @@ def gpu_worker_cube_one_sample():
 @pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.device_count() < 2, reason='lack of gpu devices')
 def test_loss_scaling():
     torch.cuda.set_device(0)
-    torch.set_default_device(f'cuda:0')
-    model = MLP()
-    ga4_result = _train_ga(model, 1, 1)
-    assert len(ga4_result) == 1
-    ga4_grads = ga4_result[0][0]
-    scaled_ga4_grads = {n: g * 2.0 for n, g in ga4_grads.items()}
+    with torch.device('cuda:0'):
+        model = MLP()
+        ga4_result = _train_ga(model, 1, 1)
+        assert len(ga4_result) == 1
+        ga4_grads = ga4_result[0][0]
+        scaled_ga4_grads = {n: g * 2.0 for n, g in ga4_grads.items()}
 
     cube2_results = launch_torchrun(2, gpu_worker_cube_one_sample)
     cube2_result = merge_cube_result({k: v for k, v in cube2_results.items()})

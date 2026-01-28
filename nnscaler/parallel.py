@@ -1790,11 +1790,8 @@ def merge_state_dicts(
     Please Note:
 
     We don't garantee the devices of tensors are the same in the merged state dict.
-    You can assume the device of the tensors in the merged state dict can be one of the following:
-
-    1. the current device when running this function
-    2. the current cuda device when running this function
-    3. the device of the tensor in the original state dict
+    You can assume the device of the tensors in the merged state dict
+    can be 'cpu' or the device of the tensor in the original state dict.
 
     When you load the state dict from file, you can just use `torch.load(..., map_location='...')` to unify the device of the tensors.
 
@@ -1971,6 +1968,8 @@ def load_merged_state_dict(
     """
     device = device or torch.cuda.current_device()
 
+    module.to(device)
+
     # non ParallelModule parameters will be loaded here
     # there will be mismatched keys if the module is a ParallelModule or contains ParallelModule
     # so we need to ignore the mismatched keys
@@ -1981,10 +1980,8 @@ def load_merged_state_dict(
             prefix = name + '.' if name else ''
             child_module.load_merged_state_dict(module_state_dict, prefix=prefix)
 
-    module.to(device)
-
     if optimizer is not None and optimizer_state_dict is not None:
-        new_optimizer_state_dict = _trim_optimizer_merged_state_dict(module, optimizer._extra_state, optimizer_state_dict, device=device)
+        new_optimizer_state_dict = _trim_optimizer_merged_state_dict(module, optimizer._extra_state, optimizer_state_dict, device='cpu')
         optimizer.load_state_dict(new_optimizer_state_dict)
 
 
@@ -2131,7 +2128,7 @@ def _construct_optim_state_zero3(
                         else:
                             opt_states[key] = torch.zeros(
                                 [chunk_size], dtype=sliced_new_val[key].dtype,
-                                device=sliced_new_val[key].device, requires_grad=False
+                                device='cpu', requires_grad=False
                             )
                 # copy the param's slices to the optimizer's chunk
                 for key in opt_states.keys():
@@ -2212,7 +2209,7 @@ def _construct_optim_state_zero(
                         opt_state_keys.remove('step')
                     for key in opt_state_keys:
                         opt_states[key] = torch.zeros([chunk_size], dtype=sliced_new_val[key].dtype,
-                                                        device=sliced_new_val[key].device, requires_grad=False)
+                                                        device='cpu', requires_grad=False)
                 # copy the param's slices to the optimizer's chunk
                 for key in opt_state_keys:
                     sliced_new_val[key] = sliced_new_val[key].view(-1)
@@ -2314,13 +2311,11 @@ def _extract_new_state(
                 sliced_new_val[key] = sliced_new_val[key].view(-1)[zero3_info.start:zero3_info.end]
                 if sliced_new_val[key].numel() < zero3_info.chunk_size:
                     # padding if needed
-                    sliced_new_val[key] = torch.cat(
-                        [sliced_new_val[key],
-                         torch.zeros(
-                             zero3_info.chunk_size - sliced_new_val[key].numel(),
-                             dtype=sliced_new_val[key].dtype,
-                             device=sliced_new_val[key].device
-                         )], dim=0
+                    sliced_new_val[key] = torch.nn.functional.pad(
+                        sliced_new_val[key].cpu(),
+                        (0, zero3_info.chunk_size - sliced_new_val[key].numel()),
+                        mode='constant',
+                        value=0.0
                     )
     return sliced_new_val
 
@@ -2560,9 +2555,10 @@ def load_deduped_state_dict(
     device = device or torch.cuda.current_device()
     cur_rank = torch.distributed.get_rank()
 
+    module.to(device)
+
     # step 1: load deduped state dict at each rank
     missing_keys, unexpected_keys = module.load_state_dict(module_state_dict, strict=False)
-    module.to(device)
     torch.distributed.barrier()
     logger.debug(f'At rank {cur_rank}, state_dict keys: {module_state_dict.keys()}.')
     logger.debug(f'At rank {cur_rank}, missing_keys: {missing_keys}, unexpected_keys: {unexpected_keys}.')
@@ -2839,8 +2835,9 @@ def load_sharded_state_dict(
     """
 
     device = device or torch.cuda.current_device()
-    module.load_state_dict(module_state_dict)
     module.to(device)
+
+    module.load_state_dict(module_state_dict)
     if optimizer and optimizer_state_dict:
         optimizer.load_state_dict(optimizer_state_dict)
 
@@ -2951,7 +2948,7 @@ def _send_trimmed_module_state_dict(
     for key in keys:
         tensor = trimmed_state_dict[key]
         # NOTE: send is broken if the tensor is not contiguous
-        torch.distributed.send(tensor.contiguous(), group=group, dst=dst_rank)
+        torch.distributed.send(tensor.cuda().contiguous(), group=group, dst=dst_rank)
 
 
 def _receive_trimmed_module_state_dict(
@@ -2976,9 +2973,9 @@ def _receive_trimmed_module_state_dict(
 
     trimmed_state_dict = {}
     for key, shape_dtype in zip(keys, shape_dtypes):
-        tensor = torch.zeros(shape_dtype[0], dtype=shape_dtype[1], device=device)
+        tensor = torch.zeros(shape_dtype[0], dtype=shape_dtype[1], device='cuda')
         torch.distributed.recv(tensor, group=group, src=src_rank)
-        trimmed_state_dict[key] = tensor
+        trimmed_state_dict[key] = tensor.to(device)
     return trimmed_state_dict
 
 
@@ -3011,7 +3008,7 @@ def _send_trimmed_opt_state_dict(
         step_stack = torch.stack(
             [trimmed_opt_state_dict['state'][k]['step'] for k in state_keys]
         )
-        torch.distributed.send(step_stack, group=group, dst=dst_rank)
+        torch.distributed.send(step_stack.cuda(), group=group, dst=dst_rank)
 
     # broadcast other states
     # TODO: can be slow?
@@ -3021,7 +3018,7 @@ def _send_trimmed_opt_state_dict(
             keys.remove('step')  # we have done step in previous.
         for key in keys:
             value = trimmed_opt_state_dict['state'][k][key]
-            torch.distributed.send(value.data, group=group, dst=dst_rank)
+            torch.distributed.send(value.data.cuda(), group=group, dst=dst_rank)
 
 
 def _receive_trimmed_opt_state_dict(
@@ -3060,7 +3057,7 @@ def _receive_trimmed_opt_state_dict(
         step_stack = torch.zeros(
             len(state_keys),
             dtype=trimmed_opt_state_dict['state'][state_keys[0]]['step'].dtype,
-            device=device
+            device='cuda'
         )
         torch.distributed.recv(step_stack, group=group, src=src_rank)
         for k, v in zip(state_keys, step_stack):
@@ -3072,8 +3069,9 @@ def _receive_trimmed_opt_state_dict(
         if 'step' in keys:
             keys.remove('step')  # we have done step in previous.
         for key in keys:
-            value = trimmed_opt_state_dict['state'][k][key]
-            torch.distributed.recv(value.data, group=group, src=src_rank)
+            value = trimmed_opt_state_dict['state'][k][key].cuda()
+            torch.distributed.recv(value, group=group, src=src_rank)
+            trimmed_opt_state_dict['state'][k][key] = value.to(device)
 
     return trimmed_opt_state_dict
 
@@ -3247,12 +3245,14 @@ def load_merged_state_dict_from_rank(
     Returns:
         None
     """
+    device = device or torch.cuda.current_device()
+    module.to(device)
     trimmed_module_state_dict, trimmed_opt_state_dict = trimmed_broadcast_merged_state_dict(
         module,
         module_state_dict,
         optimizer,
         optimizer_state_dict,
-        device=device,
+        device='cpu',
         src_rank=src_rank,
         dst_ranks=dst_ranks,
     )
@@ -3300,7 +3300,7 @@ def gather_full_model_state_dict(
         merge_state_dict = None
 
     logger.info(f'Rank {rank}: Broadcasting merged state dict to all ranks')
-    merge_state_dict = broadcast_mixed_data(merge_state_dict, src_rank=0)
+    merge_state_dict = broadcast_mixed_data(merge_state_dict, src_rank=0, device='cpu')
     logger.info(f'Rank {rank}: Finished gathering full model state dict')
     torch.distributed.barrier()
     return merge_state_dict
