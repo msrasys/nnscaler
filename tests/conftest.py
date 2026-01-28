@@ -32,18 +32,9 @@ def clean_generated_files():
 
 
 def pytest_collection_modifyitems(session, config, items):
-    def _f(item):
-        # if item.path.name == 'test_gencode_ctx_manager.py':
-        #     return 0
-        # if item.path.name == 'test_pipeline_nstages.py':
-        #     return 1
-        if 'runtime' in str(item.path):  # very fast and easy to fail
-            return 10
-        if 'cli' in str(item.path):  # very important and easy to fail
-            return 11
-        if 'parallel_module' in str(item.path):  # very important and easy to fail but a bit slow
-            return 12
-        if 'customized_ops' in str(item.path):  # too slow and very stable.
-            return 100
-        return 50
-    items.sort(key=_f)
+    def policy_first(item):
+        # it is very easy to break policy related tests, so run them first
+        if item.fspath.basename == 'test_policies.py':
+            return 0
+        return 1
+    items.sort(key=policy_first)
