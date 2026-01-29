@@ -25,12 +25,8 @@ jobs:
         with:
           enable-cache: true
 
-      - name: Set up Python
-        run: uv python install 3.10
-
-      - name: Install tox with uv plugin
-        run: |
-          uv pip install tox tox-uv
+      - name: Install tox
+        run: uv tool install tox --with tox-uv
 
       - name: Run unit tests
-        run: uv run tox
+        run: tox
