@@ -2,9 +2,9 @@ name: CI Pipeline
 
 on:
   push:
-    branches: [ main ]
+    branches: [ yileiyang/ci_cd ]
   pull_request:
-    branches: [ main ]
+    branches: [ yileiyang/ci_cd ]
 
 jobs:
   test:
@@ -15,17 +15,24 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Set up uv
-        uses: astral-sh/setup-uv@v5
-        with:
-          enable-cache: true
+      - name: Install system build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential python3-dev
 
-      - name: Set up Python
-        run: uv python install 3.12
+      - name: Set up Miniconda
+        uses: conda-incubator/setup-miniconda@v3
+        with:
+          python-version: "3.10"
+          activate-environment: github-ci-unit-test-env
+          use-mamba: true
+          auto-activate-base: false
 
       - name: Install dependencies
+        shell: bash -l {0}
         run: |
-          uv pip install tox tox-uv
+          conda install -y tox tox-conda
 
       - name: Run unit tests
-        run: uv run tox
+        shell: bash -l {0}
+        run: tox
