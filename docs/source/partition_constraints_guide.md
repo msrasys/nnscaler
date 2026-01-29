@@ -59,15 +59,17 @@ cfg = AutoDistConfig(
 
 ## Method 2: Partition constraints in Function Policy
 
-For fine-grained control, you can provide a **Function Policy** (the `policy` argument in `parallelize` or `autodist_wrapper`). This function yields `OpPlan` objects which explicitly specify the partitioning strategy for specific nodes.
+For fine-grained control, you can provide a **Function Policy** (the `pas_policy` argument in `parallelize` or `pas_policy` argument in `TrainerArgs`). This function yields `OpPlan` objects which explicitly specify the partitioning strategy for specific nodes.
 
 ### Usage
 
 Define a function `policy(graph, cfg)` that iterates over the graph nodes and yields `OpPlan` objects.
 
 **Important Considerations:**
-If you choose to manually partition operators (especially for complex communication patterns), you often need to define `OpPlan` for **all connected operators** that share the partition logic (e.g., cast ops like `float`, `to`, or element-wise ops). If you miss them, Autodist might fail to infer valid partitionings for those intermediate nodes.
-
+If you choose to manually partition operators (especially for complex communication patterns), you often need to define `OpPlan` for **all connected operators** that share the partition logic, this means:
+1. you must define OpPlans for all ops you want to partition.
+2. the default OpPlans is replicated  if you don't define `OpPlan` for ops.
+3. The only exception is when you define `OpPlan.partition` to `auto`, which will try to partition the op based on its input partitions.
 
 ### `OpPlan` Parameters
 
@@ -87,10 +89,10 @@ class OpPlan:
 *   **`recompute_id`** (default: -1):
     *   Used to group operators for Recompute (Gradient Checkpointing).
     *   Operators with the same non-negative `recompute_id` will be grouped into a single recomputation block.
-    *   These non-negative `recompute_id`s should be consecutive.
+    *   These operators with the same `recompute_id` should be consecutive in the graph.
 *   **`stage_id`** (default: -1):
     *   Used for Pipeline Parallelism assignment.
-    *   These non-negative `stage_id`s should be consecutive.
+    *   These operators with the same `stage_id` should be consecutive in the graph.    
 *   **`pre_hook` / `post_hook`**:
     *   You can attach custom Python functions to be executed before or after the operator. See source code for signature details.
 
