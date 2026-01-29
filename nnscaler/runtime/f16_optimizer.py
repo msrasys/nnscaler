@@ -4,11 +4,12 @@
 # CREDITS: This implementation is inspired by Fairseq https://github.com/facebookresearch/fairseq/blob/main/fairseq/optim/fp16_optimizer.py
 
 import logging
-from typing import Optional, TYPE_CHECKING
+import types
+from typing import TYPE_CHECKING
 
 import torch
 
-from nnscaler.cli.train_hook import TrainHook
+from nnscaler.runtime.hybrid_optimizer import ScaleDelayedOptimizerMixin
 
 if TYPE_CHECKING:
     from nnscaler.cli.trainer import Trainer
@@ -16,7 +17,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-class MixedPrecisionF16OptimizerMixin(TrainHook):
+class MixedPrecisionF16OptimizerMixin(ScaleDelayedOptimizerMixin):
     """
     A mixin class for mixed precision optimizer.
     Support both FP16 and BF16 parameters.
@@ -31,7 +32,6 @@ class MixedPrecisionF16OptimizerMixin(TrainHook):
     def __init__(self, *args, **kwargs):
         # forward __init__ call to the next class in mro(method resolution order)
         super().__init__(*args, **kwargs)
-        self._multiply_factor = 1.0
         # This flag is used to indicate whether fp32_params are loaded from checkpoint.
         # If not, we will sync from fp16 params to fp32 params in after_load_checkpoint.
         # If the model is trained from scratch, this flag will be None.
@@ -48,17 +48,25 @@ class MixedPrecisionF16OptimizerMixin(TrainHook):
         Assumption:
         `clip_gnorm` is called immediately after `scale_grads` in training loop.
         """
-        trainer.optimizer._clip_gnorm = trainer.optimizer.clip_gnorm
-        trainer.optimizer.clip_gnorm = self.overrided_clip_gnorm
-        trainer.optimizer._scale_grads = trainer.optimizer.scale_grads
-        trainer.optimizer.scale_grads = self.overrided_scale_grads
+        if trainer.optimizer is self:
+            # don't override when using HybridOptimizer
+            trainer.optimizer._clip_gnorm = trainer.optimizer.clip_gnorm
+            trainer.optimizer.clip_gnorm = self.overrided_clip_gnorm
+            trainer.optimizer._scale_grads = trainer.optimizer.scale_grads
+            trainer.optimizer.scale_grads = self.overrided_scale_grads
+
+        # step method is overrided below to apply the scaling factor
 
     @classmethod
-    def build_fp32_params(cls, params):
+    def build_fp32_params(cls, params: list[torch.nn.Parameter]) -> list[torch.nn.Parameter]:
         # create FP32 copy of parameters and grads
         fp32_params = []
         for p in params:
-            p32 = torch.nn.Parameter(p.data.float())
+            if p.data.dtype != torch.float32:
+                p32 = torch.nn.Parameter(p.data.float())
+            else:
+                # make sure the storage is not shared with original parameter
+                p32 = torch.nn.Parameter(p.data.clone())
             p32.grad = torch.zeros_like(p32.data)
             fp32_params.append(p32)
         return fp32_params
@@ -74,17 +82,21 @@ class MixedPrecisionF16OptimizerMixin(TrainHook):
     def zero_grad(self, set_to_none: bool = True):
         """
         Clears the gradients of all optimized parameters.
-        Will ignore `set_to_none` and always set fp16 grads to None, and fp32 grads to zero.
+        Will ignore `set_to_none` and always set fp16 grads and fp32 grads to None.
         """
         for p in self.f16_params:
             p.grad = None
         for p32 in self.fp32_params:
-            if p32.grad is not None:
-                p32.grad.zero_()
+            p32.grad = None
 
     def state_dict(self):
         """Return the optimizer's state dict."""
         state_dict = super().state_dict()
+
+        # called from hybrid optimizer before call `.step` (to get the param_groups of the wrapped optimizer)
+        # In this case, state_dict['state'] is empty.
+        if not state_dict['state']:
+            return state_dict
 
         # move fp32_params to the same level with 'exp_avg' and 'exp_avg_sq'
         # we do this to handle the merge of sharded checkpoint in nnscaler
@@ -165,34 +177,36 @@ class MixedPrecisionF16OptimizerMixin(TrainHook):
             self._sync_fp16_params_to_fp32()
             self._fp32_params_loaded = True
 
-    def overrided_scale_grads(self, scale: float):
-        """
-        Scale the gradients by a factor.
-        Will override the original scale_grads method in ParallelOptimizer.
-        """
-        self._multiply_factor *= scale
+    def _unfold_params(self, params) -> tuple[list[torch.nn.Parameter], dict]:
+        params = list(params)
+        if not params:
+            raise ValueError("optimizer got an empty parameter list")
 
-    def overrided_clip_gnorm(self, max_norm: Optional[float] = None) -> float:
-        """
-        Will override the original clip_gnorm method in ParallelOptimizer.
-        """
-        # self._clip_gnorm() is ParallelOptimizer.clip_gnorm
-        grad_norm = self._multiply_factor * self._clip_gnorm()
-        if max_norm is not None and max_norm > 0.0:
-            clip_coef = (max_norm / (grad_norm + 1e-6)).clamp(max=1.0)
-            self._multiply_factor *= clip_coef
-        return grad_norm
+        if isinstance(params[0], dict):
+            if len(params) > 1:
+                raise ValueError("MixedPrecisionF16OptimizerMixin only supports one param group")
+            unfolded_params = list(params[0]['params'])
+            unfolded_kwargs = {k: v for k, v in params[0].items() if k != 'params'}
+        else:
+            if not all(isinstance(p, torch.nn.Parameter) for p in params):
+                raise ValueError("optimizer params should be either a list of Parameters or a dict with 'params' key")
+            unfolded_params = params
+            unfolded_kwargs = {}
+
+        return unfolded_params, unfolded_kwargs
 
 
 class MixedPrecisionAdam(MixedPrecisionF16OptimizerMixin, torch.optim.Adam):
     def __init__(self, params, **kwargs):
-        self.f16_params = list(params)
+        self.f16_params, unfolded_kwargs = self._unfold_params(params)
         self.fp32_params = self.build_fp32_params(self.f16_params)
+        kwargs = {**unfolded_kwargs, **kwargs}
         super().__init__(self.fp32_params, **kwargs)
 
 
 class MixedPrecisionAdamW(MixedPrecisionF16OptimizerMixin, torch.optim.AdamW):
     def __init__(self, params, **kwargs):
-        self.f16_params = list(params)
+        self.f16_params, unfolded_kwargs = self._unfold_params(params)
         self.fp32_params = self.build_fp32_params(self.f16_params)
+        kwargs = {**unfolded_kwargs, **kwargs}
         super().__init__(self.fp32_params, **kwargs)
