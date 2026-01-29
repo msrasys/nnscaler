@@ -2,9 +2,9 @@ name: CI Pipeline
 
 on:
   push:
-    branches: [ yileiyang/ci_cd ]
+    branches: [ main ]
   pull_request:
-    branches: [ yileiyang/ci_cd ]
+    branches: [ main ]
 
 jobs:
   test:
