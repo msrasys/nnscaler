@@ -13,7 +13,7 @@ sphinx
 sphinxcontrib-napoleon
 tabulate
 tox
-tox-conda
+tox-uv
 yapf
 wandb
 tensorboard
