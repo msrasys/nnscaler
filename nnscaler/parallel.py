@@ -1793,6 +1793,13 @@ def merge_state_dicts(
     You can assume the device of the tensors in the merged state dict
     can be 'cpu' or the device of the tensor in the original state dict.
 
+    Quick Explanation:
+        In current implementation,
+        For non-parallel modules, we directly take the tensor from input state dicts
+        For parallel modules, we will create new tensors from cpu, and copy/merge the tensors from input state dicts to it.
+            (this may be optimized later as we can avoid copying for replicated tensors.)
+        So in summary, the devices of the tensors in output state dicts can be either 'cpu' or the device in original state dict.
+
     When you load the state dict from file, you can just use `torch.load(..., map_location='...')` to unify the device of the tensors.
 
     Args:
