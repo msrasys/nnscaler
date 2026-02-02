@@ -4,7 +4,7 @@
 
 name: Llama 3 8B 128K
 train:
-  path: MagicCube/examples/llama
+  path: nnscaler/examples/llama
   output: ./merged.ckpt
   commands:
     - rm -rf .nnscaler ./checkpoints ./merged.ckpt

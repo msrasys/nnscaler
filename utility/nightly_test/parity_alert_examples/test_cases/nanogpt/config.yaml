@@ -1,6 +1,6 @@
 name: nanoGPT lightning
 train:
-  path: MagicCube/examples/nanogpt
+  path: nnscaler/examples/nanogpt
   output: _merge/merged.pt
   commands:
     - rm -rf .nnscaler

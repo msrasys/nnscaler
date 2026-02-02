@@ -2,7 +2,7 @@
 
 name: Llama 3 demo
 train:
-  path: MagicCube/examples/llama3_demo
+  path: nnscaler/examples/llama3_demo
   output: checkpoints/merged.ckpt
   commands:
     - rm -rf .nnscaler ./checkpoints
