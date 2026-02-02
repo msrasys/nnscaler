@@ -1,0 +1,12 @@
+# NOTE: Must set HF_TOKEN
+
+name: Llama 3 demo
+train:
+  path: MagicCube/examples/llama3_demo
+  output: checkpoints/merged.ckpt
+  commands:
+    - rm -rf .nnscaler ./checkpoints
+    - pip install -r requirements.txt
+    - python train.py --prepare_data --mini
+    - torchrun --nproc_per_node=4 train.py --mini --max_train_steps=50
+    - python train.py --merge_checkpoint=./checkpoints/last

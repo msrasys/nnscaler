@@ -1,0 +1,13 @@
+name: nanoGPT lightning
+train:
+  path: MagicCube/examples/nanogpt
+  output: _merge/merged.pt
+  commands:
+    - rm -rf .nnscaler
+    - rm -rf lightning_logs _merge
+    - pip install -r requirements.txt
+    - python nanoGPT/data/shakespeare_char/prepare.py
+    - torchrun --nproc_per_node=2 train_nnscaler.py nanoGPT/config/train_shakespeare_char.py --max_iters=100
+    - mkdir _merge
+    - cp lightning_logs/version_0/checkpoints/*/*.pt _merge
+    - python -c "from nnscaler.integration.lightning.pytorch import NnScalerStrategy ; NnScalerStrategy.merge_checkpoint(['_merge/0.pt', '_merge/1.pt'], '_merge/merged.pt')"

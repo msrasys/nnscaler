@@ -1,0 +1,16 @@
+# NOTE:
+# Must set HF_TOKEN
+# Must install apex and flash-attn manually
+
+name: Llama 3 8B 128K
+train:
+  path: MagicCube/examples/llama
+  output: ./merged.ckpt
+  commands:
+    - rm -rf .nnscaler ./checkpoints ./merged.ckpt
+    - pip install -r requirements.txt
+    - python bookcorpus.py --data_path_or_name bookcorpus/bookcorpus --tokenizer_path_or_name meta-llama/Meta-Llama-3-8B-Instruct --save_path ./bookcorpus_llama3_4K --sequence_length 4096
+    - python create_mini_model.py --model_id meta-llama/Meta-Llama-3-8B-Instruct --output_id ./llama3_mini
+    - python train.py --run_mode compile --plan_ngpus 4 --runtime_ngpus 4 --name llama3_debug --model_id ./llama3_mini --attn_implementation sdpa --dataset_path ./bookcorpus_llama3_4K --max_train_steps 50 --pipeline_pivots LlamaDecoderLayer --pipeline_nstages 2
+    - torchrun --nproc_per_node=4 train.py --plan_ngpus 4 --runtime_ngpus 4 --name llama3_debug --model_id ./llama3_mini --attn_implementation sdpa --dataset_path ./bookcorpus_llama3_4K --max_train_steps 50 --pipeline_pivots LlamaDecoderLayer --pipeline_nstages 2
+    - python ckpt_merger.py --ckpt_dir ./checkpoints/last --output_fname ./merged.ckpt
