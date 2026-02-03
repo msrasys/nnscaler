@@ -239,8 +239,11 @@ class HybridOptimizer(torch.optim.Optimizer, TrainHookHost, TrainHook):
         for opt in self.optimizers:
             if not isinstance(opt, ScaleDelayedOptimizerMixin):
                 ScaleDelayedOptimizerMixin.apply_mixin(opt)
+            # after_setup of non-scale-delayed optimizers can't be called automatically by Trainer
+            # we need to call it here manually
+            # For consistency, let's call all optimizers' after_setup manually here (including scale-delayed ones)
             opt.after_setup(trainer)
-            # disable after_setup for child optimizers
+            # disable after_setup for sub optimizers
             # as we have already handled it here
             opt.after_setup = lambda *args, **kwargs: None
 
