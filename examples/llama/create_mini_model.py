@@ -3,9 +3,11 @@
 
 import argparse
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
+import torch
 
 
 def main(args):
+    torch.manual_seed(0)  # Ensure deterministic initialization
     config = AutoConfig.from_pretrained(args.model_id)
     config.num_hidden_layers = 4
     config.use_cache = False
