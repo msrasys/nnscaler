@@ -3,7 +3,8 @@
 
 from collections import defaultdict
 from dataclasses import dataclass, field
-from typing import Any, Callable, Iterable, Type, Union
+import types
+from typing import Any, Callable, Iterable, Type, Union, TYPE_CHECKING, Optional
 
 import torch
 from torch.optim import Optimizer
@@ -13,6 +14,9 @@ from torch.utils.hooks import RemovableHandle
 from nnscaler.cli.arg_parser import deserialize_dataclass
 from nnscaler.cli.train_hook import TrainHookHost, TrainHook
 from nnscaler.utils import fn_field, OptStateDict
+
+if TYPE_CHECKING:
+    from nnscaler.cli.trainer import Trainer
 
 
 @dataclass
@@ -55,7 +59,77 @@ class HybridRemovableHandle:
         self.remove()
 
 
-class HybridOptimizer(torch.optim.Optimizer, TrainHookHost):
+class ScaleDelayedOptimizerMixin(TrainHook):
+    """
+    A mixin class to add scale-delayed optimization support to an optimizer.
+    This mixin overrides the `scale_grads`, `clip_gnorm`, and `step` methods
+    of the optimizer to delay the scaling of gradients until the `step` method is called.
+    """
+    def __init__(self, *args, **kwargs):
+        # forward __init__ call to the next class in mro(method resolution order)
+        super().__init__(*args, **kwargs)
+        self._multiply_factor = 1.0
+
+    def after_setup(self, trainer: 'Trainer') -> None:
+        if trainer.optimizer is self:
+            # do nothing if we are in the hybrid optimizer,
+            # who is responsible for overriding these methods.
+            trainer.optimizer._clip_gnorm =  trainer.optimizer.clip_gnorm
+            trainer.optimizer.clip_gnorm = self.overrided_clip_gnorm
+            trainer.optimizer._scale_grads = trainer.optimizer.scale_grads
+            trainer.optimizer.scale_grads = self.overrided_scale_grads
+
+        # we need to override the step method to apply the scaling factor
+        # hybrid optimizer will also call `step` of child optimizers,
+        self._step = self.step
+        self.step = self.override_step
+
+    def overrided_scale_grads(self, scale: float):
+        """
+        Scale the gradients by a factor.
+        Will override the original scale_grads method in ParallelOptimizer.
+        """
+        self._multiply_factor *= scale
+
+    def overrided_clip_gnorm(self, max_norm: Optional[float] = None) -> float:
+        """
+        Will override the original clip_gnorm method in ParallelOptimizer.
+        """
+        # self._clip_gnorm() is ParallelOptimizer.clip_gnorm
+        grad_norm = self._multiply_factor * self._clip_gnorm()
+        if max_norm is not None and max_norm > 0.0:
+            clip_coef = (max_norm / (grad_norm + 1e-6)).clamp(max=1.0)
+            self._multiply_factor *= clip_coef
+        return grad_norm
+
+    def override_step(self, closure=None):
+        """
+        Performs a single optimization step.
+        """
+        # apply the accumulated multiply factor to grads
+        if self._multiply_factor != 1.0:
+            for pg_idx in range(len(self.param_groups)):
+                for p in self.param_groups[pg_idx]['params']:
+                    if p.grad is not None:
+                        p.grad.mul_(self._multiply_factor)
+            self._multiply_factor = 1.0
+        # can't use super() here because we need to support applying this mixin to existing optimizers
+        self._step(closure)
+
+    @classmethod
+    def apply_mixin(cls, obj: Any) -> Any:
+        """Apply this mixin to an existing object."""
+        obj._multiply_factor = 1.0
+        # bind the new methods
+        obj.after_setup = types.MethodType(cls.after_setup, obj)
+        obj.overrided_scale_grads = types.MethodType(cls.overrided_scale_grads, obj)
+        obj.overrided_clip_gnorm = types.MethodType(cls.overrided_clip_gnorm, obj)
+        obj.override_step = types.MethodType(cls.override_step, obj)
+
+        return obj
+
+
+class HybridOptimizer(torch.optim.Optimizer, TrainHookHost, TrainHook):
     """
     A hybrid optimizer that combines multiple optimizers/multiple param groups
     into a single optimizer.
@@ -147,6 +221,49 @@ class HybridOptimizer(torch.optim.Optimizer, TrainHookHost):
         self.param_groups = []
         for optimizer in self.optimizers:
             self.param_groups.extend(optimizer.param_groups)
+
+        # to support scale-delayed optimizers like mixed-precision f16 optimizer
+        self._has_scale_delayed = any(isinstance(opt, ScaleDelayedOptimizerMixin) for opt in self.optimizers)
+
+    def after_setup(self, trainer: 'Trainer') -> None:
+        if not self._has_scale_delayed:
+            return
+
+        assert trainer.optimizer is self, "HybridOptimizer should not be nested inside another optimizer"
+        trainer.optimizer._clip_gnorm = trainer.optimizer.clip_gnorm
+        trainer.optimizer._scale_grads = trainer.optimizer.scale_grads
+
+        # if any one of the optimizers is scale-delayed,
+        # we must apply the mixin to make sure all optimizers are scale-delayed
+        # this is the only way to calculate gnorm correctly.
+        for opt in self.optimizers:
+            if not isinstance(opt, ScaleDelayedOptimizerMixin):
+                ScaleDelayedOptimizerMixin.apply_mixin(opt)
+            # after_setup of non-scale-delayed optimizers can't be called automatically by Trainer
+            # we need to call it here manually
+            # For consistency, let's call all optimizers' after_setup manually here (including scale-delayed ones)
+            opt.after_setup(trainer)
+            # disable after_setup for sub optimizers
+            # as we have already handled it here
+            opt.after_setup = lambda *args, **kwargs: None
+
+        def overrided_scale_grads(self, scale: float) -> None:
+            for optimizer in self.optimizers:
+                optimizer.overrided_scale_grads(scale)
+
+        self.scale_grads = types.MethodType(overrided_scale_grads, self)
+
+        def override_clip_gnorm(self, max_norm: Optional[float] = None) -> float:
+            # self._clip_gnorm() is ParallelOptimizer.clip_gnorm
+            # all optimizers have the same `multiply_factor`
+            grad_norm = self.optimizers[0]._multiply_factor * self._clip_gnorm()
+            if max_norm is not None and max_norm > 0.0:
+                clip_coef = (max_norm / (grad_norm + 1e-6)).clamp(max=1.0)
+                # will update all optimizers' multiply_factor
+                self.scale_grads(clip_coef)
+            return grad_norm
+
+        self.clip_gnorm = types.MethodType(override_clip_gnorm, self)
 
     def _get_hook_objects(self):
         return self.optimizers
