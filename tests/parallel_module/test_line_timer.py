@@ -13,7 +13,7 @@ from nnscaler.flags import CompileFlag
 
 from .common import init_distributed
 from ..launch_torchrun import launch_torchrun
-from ..utils import catch_stdout, clear_dir_on_rank0
+from ..utils import catch_stdout, clear_dir_on_rank0, PYTEST_RUN_ID
 
 
 class Net(torch.nn.Module):
@@ -43,7 +43,7 @@ def _gpu_worker():
     compute_config = ComputeConfig(1, 1, use_zero=False)
     try:
         CompileFlag.line_timer = True
-        with clear_dir_on_rank0(Path(tempfile.gettempdir()) / 'cube_test_line_timer') as tempdir:
+        with clear_dir_on_rank0(Path(tempfile.gettempdir()) / f'cube_test_line_timer_{PYTEST_RUN_ID}') as tempdir:
             net = _to_cube_model(Net(), compute_config, tempdir, 'net', (128, 64))
             x = torch.randn(128, 64).cuda()
 

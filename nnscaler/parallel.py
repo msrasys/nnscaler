@@ -1686,7 +1686,9 @@ def _get_parallel_module_state_dict_info(
 
 def _is_supported_optimizer(name: str):
     from nnscaler.runtime.hybrid_optimizer import HybridOptimizer
-    return ('adam' in name.lower()) or name == HybridOptimizer.__name__
+    return ('adam' in name.lower()) \
+        or ('muon' in name.lower()) \
+        or name == HybridOptimizer.__name__
 
 
 def _get_optimizer_state_dict_info(
@@ -1746,7 +1748,7 @@ def _get_optimizer_state_dict_info(
     for opt_state_dict in optimizer_state_dicts:
         opt_extra_state = OptimizerExtraState(**opt_state_dict[ParallelModule.EXTRA_STATE_KEY])
         if not _is_supported_optimizer(opt_extra_state.name):
-            raise ValueError("Only Adam-like optimizers are supported.")
+            raise ValueError("Only Adam-like or Muon-like optimizers are supported.")
         opt_extra_states[opt_extra_state.rank] = opt_extra_state
 
         for module_prefix, loc in opt_extra_state.parallel_module_locs.items():
@@ -2012,7 +2014,7 @@ def _trim_optimizer_merged_state_dict(
         Dict[str, Any]: the trimmed optimizer state dict
     """
     if not _is_supported_optimizer(opt_extra_state.name):
-        raise ValueError("Only Adam-like optimizers are supported.")
+        raise ValueError("Only Adam-like or Muon-like optimizers are supported.")
 
     device = device or torch.cuda.current_device()
 
@@ -2665,7 +2667,7 @@ def load_deduped_state_dict(
 
     if optimizer is not None and optimizer_state_dict is not None:
         if not _is_supported_optimizer(optimizer._extra_state.name):
-            raise ValueError("Only Adam-like optimizers are supported.")
+            raise ValueError("Only Adam-like or Muon-like optimizers are supported.")
 
         # get the locations of non-parallel module parameters
         # by removing the parallel module locations
@@ -2731,20 +2733,28 @@ def _broadcast_opt_state(optimizer_state_dict: OptStateDict, state_indexes: List
     # step is too small, so we can just broadcast all of them all together
     # some adam/adamw optimizers may not have step in their state dict
     # so we need to check if 'step' is in the state dict
-    if 'step' in optimizer_state_dict['state'][state_indexes[0]]:
+    step_state_indexes = [k for k in state_indexes if 'step' in optimizer_state_dict['state'][k]]
+    if step_state_indexes:
+        assert all(
+            optimizer_state_dict['state'][k]['step'].dtype ==
+            optimizer_state_dict['state'][step_state_indexes[0]]['step'].dtype and
+            optimizer_state_dict['state'][k]['step'].shape ==
+            optimizer_state_dict['state'][step_state_indexes[0]]['step'].shape
+            for k in step_state_indexes
+        )
         if rank == src_rank:
             step_stack = torch.stack(
-                [optimizer_state_dict['state'][k]['step'] for k in state_indexes]
+                [optimizer_state_dict['state'][k]['step'] for k in step_state_indexes]
             )
         else:
             step_stack = torch.zeros(
-                len(state_indexes),
-                dtype=optimizer_state_dict['state'][state_indexes[0]]['step'].dtype,
+                len(step_state_indexes),
+                dtype=optimizer_state_dict['state'][step_state_indexes[0]]['step'].dtype,
                 device=torch.cuda.current_device()
             )
         torch.distributed.broadcast(step_stack, src=src_rank, group=curr_parallel_group)
         if rank != src_rank:
-            for k, v in zip(state_indexes, step_stack):
+            for k, v in zip(step_state_indexes, step_stack):
                 optimizer_state_dict['state'][k]['step'].copy_(v)
 
     # broadcast other states
@@ -3011,9 +3021,17 @@ def _send_trimmed_opt_state_dict(
     torch.distributed.send_object_list(sent, group=group, dst=dst_rank)
 
     # broadcast step in stack
-    if 'step' in trimmed_opt_state_dict['state'][state_keys[0]]:
+    step_state_keys = [k for k in state_keys if 'step' in trimmed_opt_state_dict['state'][k]]
+    if step_state_keys:
+        assert all(
+            trimmed_opt_state_dict['state'][k]['step'].dtype ==
+            trimmed_opt_state_dict['state'][step_state_keys[0]]['step'].dtype and
+            trimmed_opt_state_dict['state'][k]['step'].shape ==
+            trimmed_opt_state_dict['state'][step_state_keys[0]]['step'].shape
+            for k in step_state_keys
+        )
         step_stack = torch.stack(
-            [trimmed_opt_state_dict['state'][k]['step'] for k in state_keys]
+            [trimmed_opt_state_dict['state'][k]['step'] for k in step_state_keys]
         )
         torch.distributed.send(step_stack.cuda(), group=group, dst=dst_rank)
 
@@ -3060,14 +3078,22 @@ def _receive_trimmed_opt_state_dict(
         }
 
     # receive steps
-    if 'step' in trimmed_opt_state_dict['state'][state_keys[0]]:
+    step_state_keys = [k for k in state_keys if 'step' in trimmed_opt_state_dict['state'][k]]
+    if step_state_keys:
+        assert all(
+            trimmed_opt_state_dict['state'][k]['step'].dtype ==
+            trimmed_opt_state_dict['state'][step_state_keys[0]]['step'].dtype and
+            trimmed_opt_state_dict['state'][k]['step'].shape ==
+            trimmed_opt_state_dict['state'][step_state_keys[0]]['step'].shape
+            for k in step_state_keys
+        )
         step_stack = torch.zeros(
-            len(state_keys),
-            dtype=trimmed_opt_state_dict['state'][state_keys[0]]['step'].dtype,
+            len(step_state_keys),
+            dtype=trimmed_opt_state_dict['state'][step_state_keys[0]]['step'].dtype,
             device='cuda'
         )
         torch.distributed.recv(step_stack, group=group, src=src_rank)
-        for k, v in zip(state_keys, step_stack):
+        for k, v in zip(step_state_keys, step_stack):
             trimmed_opt_state_dict['state'][k]['step'].copy_(v)
 
     # receive other states

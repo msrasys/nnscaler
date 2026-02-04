@@ -13,7 +13,7 @@ from nnscaler.parallel import build_optimizer, sync_grad_when, merge_state_dicts
 from tests.launch_torchrun import launch_torchrun
 from tests.launch_torchrun import clone_to_cpu_recursively
 from tests.parallel_module.common import assert_equal, init_distributed
-from tests.utils import clear_dir_on_rank0, init_random
+from tests.utils import clear_dir_on_rank0, init_random, PYTEST_RUN_ID
 from .test_wholemodule import FcRelu_4_4
 
 
@@ -88,7 +88,7 @@ def _train(model: ParallelModule, update_freq):
 
 def _gpu_worker(pas, ngpus, update_freq):
     init_distributed()
-    with clear_dir_on_rank0(Path(tempfile.gettempdir()) / 'cube_test_async') as tempdir:
+    with clear_dir_on_rank0(Path(tempfile.gettempdir()) / f'cube_test_async_{PYTEST_RUN_ID}') as tempdir:
         whole_module_async, sub_module_async = _create_modules(
             pas, ComputeConfig(
                 1, ngpus, use_async_reducer=True,
@@ -203,7 +203,7 @@ def _train_pp(model: ParallelModule, num_replicas, rank):
 
 def _gpu_worker_pp(pas, pp_ngpus, runtime_ngpus, update_freq):
     init_distributed()
-    with clear_dir_on_rank0(Path(tempfile.gettempdir()) / 'cube_test_pp_async') as tempdir:
+    with clear_dir_on_rank0(Path(tempfile.gettempdir()) / f'cube_test_pp_async_{PYTEST_RUN_ID}') as tempdir:
         init_random()
         whole_module_async = parallelize(
             OrigModuleEnd2End(), {

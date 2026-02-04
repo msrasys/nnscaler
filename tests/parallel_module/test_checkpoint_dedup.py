@@ -17,7 +17,7 @@ from nnscaler.runtime.module import ParallelModule
 from .common import PASMegatron, CubeLinear, init_random, init_distributed, assert_equal
 from ..launch_torchrun import launch_torchrun
 from .test_checkpoint import gendata, train_step, End2EndMLP, End2EndMLPWithUnusedAndShared
-from ..utils import clear_dir_on_rank0
+from ..utils import clear_dir_on_rank0, PYTEST_RUN_ID
 
 
 class FcRelu(nn.Module):
@@ -179,7 +179,7 @@ def _check_deduped(model: torch.nn.Module, ckpt_dir):
 
 def _gpu_worker(pas, cc1, cc2):
     init_distributed()
-    with clear_dir_on_rank0(Path(tempfile.gettempdir()) / 'cube_test_ckpt_compact') as tempdir:
+    with clear_dir_on_rank0(Path(tempfile.gettempdir()) / f'cube_test_ckpt_compact_{PYTEST_RUN_ID}') as tempdir:
         _train(_create_cube_module(pas, cc1, cc2, tempdir), tempdir)
         torch.distributed.barrier()
         _check_deduped(
@@ -202,7 +202,7 @@ def test_checkpoint_compact(use_zero):
 
 def _gpu_worker_pipeline(cc):
     init_distributed()
-    with clear_dir_on_rank0(Path(tempfile.gettempdir()) / 'cube_test_ckpt_compact_pipeline') as tempdir:
+    with clear_dir_on_rank0(Path(tempfile.gettempdir()) / f'cube_test_ckpt_compact_pipeline_{PYTEST_RUN_ID}') as tempdir:
         for model_cls in [End2EndMLP, End2EndMLPWithUnusedAndShared]:
             pipeline_moule_cls = model_cls.to_pipeline_module(cc, tempdir)
             _train(pipeline_moule_cls().cuda(), tempdir)

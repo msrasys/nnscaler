@@ -23,7 +23,7 @@ from nnscaler.runtime.module import ParallelModule
 from nnscaler.parallel import ComputeConfig, build_optimizer, parallelize, merge_state_dicts
 from .common import assert_equal, init_distributed, PASMegatron, init_random
 from ..launch_torchrun import clone_to_cpu_recursively, launch_torchrun
-from ..utils import replace_all_device_with, clear_dir_on_rank0
+from ..utils import replace_all_device_with, clear_dir_on_rank0, PYTEST_RUN_ID
 
 from .test_checkpoint import End2EndMLP
 
@@ -111,7 +111,7 @@ def gpu_worker_cube_general(runtime_ngpus, plan_ngpus, policy, nstages=None, nmi
     init_random()
     nstages = nstages or plan_ngpus
     nmicros = nmicros or plan_ngpus
-    with clear_dir_on_rank0(Path(tempfile.gettempdir()) / 'cube_test_end2end') as tempdir:
+    with clear_dir_on_rank0(Path(tempfile.gettempdir()) / f'cube_test_end2end_{PYTEST_RUN_ID}') as tempdir:
         init_random()
         model = model_cls()
         model = parallelize(
@@ -416,7 +416,7 @@ def _train_cube_one_sample(model: ParallelModule, mbs):
 def gpu_worker_cube_one_sample():
     init_distributed()
     init_random()
-    with clear_dir_on_rank0(Path(tempfile.gettempdir()) / 'cube_test_end2end') as tempdir:
+    with clear_dir_on_rank0(Path(tempfile.gettempdir()) / f'cube_test_end2end_{PYTEST_RUN_ID}') as tempdir:
         init_random()
         model = MLP()
         model = parallelize(

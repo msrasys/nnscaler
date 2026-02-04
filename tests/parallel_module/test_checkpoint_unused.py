@@ -24,7 +24,7 @@ from nnscaler.runtime.gnorm import calcuate_gnorm
 from .common import CubeLinear, init_random, init_distributed
 from ..launch_torchrun import launch_torchrun, clone_to_cpu_recursively
 from .test_checkpoint_shared import _train_raw, _load_merged
-from ..utils import clear_dir_on_rank0
+from ..utils import clear_dir_on_rank0, PYTEST_RUN_ID
 
 
 class FcReluWithUnused(nn.Module):
@@ -113,7 +113,7 @@ def _gpu_worker(use_zero, pas, plan_ngpus, runtime_ngpus):
     #   d. compare the full state dict in step a and the merged state dict in step c. They should be the same.
     init_distributed()
     compute_config = ComputeConfig(plan_ngpus, runtime_ngpus, use_zero=use_zero)
-    with clear_dir_on_rank0(Path(tempfile.gettempdir()) / 'cube_test_ckpt') as tempdir:
+    with clear_dir_on_rank0(Path(tempfile.gettempdir()) / f'cube_test_ckpt_{PYTEST_RUN_ID}') as tempdir:
         if torch.distributed.get_rank() == 0:
             tempdir.mkdir(parents=True, exist_ok=True)
             _train_raw(_create_cube_module(pas, compute_config, tempdir, 'raw'), tempdir)

@@ -17,7 +17,7 @@ from nnscaler.runtime.module import ParallelModule
 
 from .common import CubeLinear, init_random, init_distributed
 from ..launch_torchrun import launch_torchrun, clone_to_cpu_recursively
-from ..utils import clear_dir_on_rank0
+from ..utils import clear_dir_on_rank0, PYTEST_RUN_ID
 
 
 class FcRelu(nn.Module):
@@ -118,7 +118,7 @@ def _train(model, update_freq, is_cube):
 
 def _gpu_worker(pas, ngpus, update_freq):
     init_distributed()
-    with clear_dir_on_rank0(Path(tempfile.gettempdir()) / 'cube_test') as tempdir:
+    with clear_dir_on_rank0(Path(tempfile.gettempdir()) / f'cube_test_{PYTEST_RUN_ID}') as tempdir:
         orig_module, compiled_module = _create_modules(pas, ComputeConfig(ngpus, ngpus), tempdir)
         orig_results = _train(orig_module, update_freq, False)
         compiled_results = _train(compiled_module, update_freq, True)

@@ -26,6 +26,10 @@ from nnscaler.runtime.module import ParallelModule
 from nnscaler.runtime.device import DeviceGroup, CompileFlag
 
 
+MASTER_PORT = os.environ.get("MASTER_PORT", "29401")
+PYTEST_RUN_ID = MASTER_PORT
+
+
 def init_parameter(model: torch.nn.Module, seed: int = 0):
     """
     Initialize a model's parameters with truncated normal distribution.

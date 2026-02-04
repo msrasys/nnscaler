@@ -12,7 +12,7 @@ from nnscaler.parallel import parallelize, ComputeConfig, ParallelModule, build_
 from .common import init_distributed, init_random
 from .test_end2end import merge_cube_result
 from ..launch_torchrun import launch_torchrun, clone_to_cpu_recursively
-from ..utils import clear_dir_on_rank0
+from ..utils import clear_dir_on_rank0, PYTEST_RUN_ID
 
 
 class CtxManagerModel(torch.nn.Module):
@@ -257,7 +257,7 @@ def _train_cube_one_sample(model: ParallelModule, mbs):
 def gpu_worker_cube_one_sample():
     init_distributed()
     init_random()
-    with clear_dir_on_rank0(Path(tempfile.gettempdir()) / 'cube_test_ctx_manager') as tempdir:
+    with clear_dir_on_rank0(Path(tempfile.gettempdir()) / f'cube_test_ctx_manager_{PYTEST_RUN_ID}') as tempdir:
         init_random()
         model = CtxManagerModel()
         model = parallelize(

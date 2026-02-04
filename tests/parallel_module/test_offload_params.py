@@ -14,7 +14,7 @@ from nnscaler.graph import IRGraph
 
 from .common import PASMegatron, CubeLinear, init_random, init_distributed, assert_equal
 from ..launch_torchrun import launch_torchrun
-from ..utils import clear_dir_on_rank0
+from ..utils import clear_dir_on_rank0, PYTEST_RUN_ID
 
 
 class SimpleMLP(nn.Module):
@@ -68,7 +68,7 @@ def _mem_worker():
         plan_ngpus=1,
         runtime_ngpus=2,
     )
-    with clear_dir_on_rank0(Path(tempfile.gettempdir()) / 'nnscaler_test_offload_mem') as tempdir:
+    with clear_dir_on_rank0(Path(tempfile.gettempdir()) / f'nnscaler_test_offload_mem_{PYTEST_RUN_ID}') as tempdir:
         module = SimpleMLP(dim, dim, dim)
         p_module = parallelize(
             module,
@@ -106,12 +106,12 @@ def _correctness_worker():
         plan_ngpus=1,
         runtime_ngpus=2,
     )
-    
-    with clear_dir_on_rank0(Path(tempfile.gettempdir()) / 'nnscaler_test_offload_correctness') as tempdir:
+
+    with clear_dir_on_rank0(Path(tempfile.gettempdir()) / f'nnscaler_test_offload_correctness_{PYTEST_RUN_ID}') as tempdir:
         # Create test data
         torch.manual_seed(42 + torch.distributed.get_rank())
         test_data = [torch.randn(bsz, dim).cuda() for _ in range(num_steps)]
-        
+
         # Test 1: Normal execution without offload/load
         init_random()
         module1 = SimpleMLP(dim, dim, dim)
@@ -124,7 +124,7 @@ def _correctness_worker():
             instance_name='normal'
         )
         optimizer1 = build_optimizer(p_module1, torch.optim.Adam, lr=0.01)
-        
+
         results_normal = []
         for step, x in enumerate(test_data):
             p_module1.train()
@@ -133,16 +133,16 @@ def _correctness_worker():
             loss.backward()
             optimizer1.step()
             optimizer1.zero_grad()
-            
+
             # Save intermediate results for comparison
             results_normal.append({
                 'loss': loss.detach().cpu(),
                 'output': output.detach().cpu(),
                 'params': {name: param.detach().cpu().clone() for name, param in p_module1.named_parameters()}
             })
-        
+
         torch.distributed.barrier()
-        
+
         # Test 2: Execution with offload/load
         init_random()
         module2 = SimpleMLP(dim, dim, dim)
@@ -155,50 +155,50 @@ def _correctness_worker():
             instance_name='offload'
         )
         optimizer2 = build_optimizer(p_module2, torch.optim.Adam, lr=0.01)
-        
+
         # First offload to initialize the buffer_shape
         p_module2.sleep()
-        
+
         results_offload = []
         for step, x in enumerate(test_data):
             # Load params at the beginning of each step
             p_module2.wake_up()
-            
+
             p_module2.train()
             output = p_module2(x)
             loss = output.sum()
             loss.backward()
             optimizer2.step()
             optimizer2.zero_grad()
-            
+
             # Save intermediate results for comparison
             results_offload.append({
                 'loss': loss.detach().cpu(),
                 'output': output.detach().cpu(),
                 'params': {name: param.detach().cpu().clone() for name, param in p_module2.named_parameters()}
             })
-            
+
             # Offload params at the end of each step
             p_module2.sleep()
-        
+
         torch.distributed.barrier()
-        
+
         # Compare results
         for step in range(num_steps):
             normal_result = results_normal[step]
             offload_result = results_offload[step]
-            
+
             # Compare loss
             assert torch.equal(normal_result['loss'], offload_result['loss']), \
                 f"Loss mismatch at step {step}: {normal_result['loss']} vs {offload_result['loss']}"
-            
+
             # Compare output
             assert torch.equal(normal_result['output'], offload_result['output']), \
                 f"Output mismatch at step {step}"
-            
+
             # Compare parameters
             for param_name in normal_result['params']:
-                assert torch.equal(normal_result['params'][param_name], 
+                assert torch.equal(normal_result['params'][param_name],
                                  offload_result['params'][param_name]), \
                     f"Parameter {param_name} mismatch at step {step}"
 

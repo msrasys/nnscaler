@@ -26,7 +26,7 @@ from ..launch_torchrun import clone_to_cpu_recursively, launch_torchrun
 
 from .test_checkpoint import End2EndMLP
 from .test_end2end import allclose, merge_cube_result
-from ..utils import init_parameter, clear_dir_on_rank0
+from ..utils import init_parameter, clear_dir_on_rank0, PYTEST_RUN_ID
 
 
 DATA_SIZE = 16
@@ -136,7 +136,7 @@ def gpu_worker_cube(use_zero=False, async_reducer=False, use_bucket=False):
     plan_ngpus = 2
     runtime_ngpus = 4
     nmicros = plan_ngpus
-    with clear_dir_on_rank0(Path(tempfile.gettempdir()) / 'cube_test_end2end_mp') as tempdir:
+    with clear_dir_on_rank0(Path(tempfile.gettempdir()) / f'cube_test_end2end_mp_{PYTEST_RUN_ID}') as tempdir:
         init_random()
         model = MPModule()
         model = parallelize(

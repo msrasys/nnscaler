@@ -19,7 +19,7 @@ from nnscaler.parallel import ComputeConfig, parallelize, build_optimizer
 from nnscaler.ir.operator import IRFwOperation, IRDataOperation
 from nnscaler.graph.segment import IRSegment
 from nnscaler.graph.schedule.predefined import PredefinedSched
-from tests.utils import clear_dir_on_rank0, init_random
+from tests.utils import clear_dir_on_rank0, init_random, PYTEST_RUN_ID
 from tests.launch_torchrun import torchrun
 from tests.parallel_module.test_gencode import _gencode_contains
 
@@ -94,7 +94,7 @@ def worker_pipeline_2x2(model_cls):
         torch.cuda.manual_seed(0)
     trace_data = torch.randn([2048, 4096], dtype=torch.float32, device=torch.cuda.current_device())
 
-    with clear_dir_on_rank0(Path(tempfile.gettempdir()) / 'test_detach_loss_pp_2x2') as tempdir:
+    with clear_dir_on_rank0(Path(tempfile.gettempdir()) / f'test_detach_loss_pp_2x2_{PYTEST_RUN_ID}') as tempdir:
         pm = parallelize(
                 m,
                 {'x': trace_data},
@@ -159,7 +159,7 @@ def worker_pipeline_2(model_cls):
         torch.cuda.manual_seed(0)
     trace_data = torch.randn([2048, 4096], dtype=torch.float32, device=torch.cuda.current_device())
 
-    with clear_dir_on_rank0(Path(tempfile.gettempdir()) / 'test_detach_loss_pp_2') as tempdir:
+    with clear_dir_on_rank0(Path(tempfile.gettempdir()) / f'test_detach_loss_pp_2_{PYTEST_RUN_ID}') as tempdir:
         pm = parallelize(
                 m,
                 {'x': trace_data},
