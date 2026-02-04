@@ -18,7 +18,7 @@ from nnscaler.ir.adapter import IRAdapter
 from nnscaler.parallel import ComputeConfig, parallelize, build_optimizer
 from nnscaler.ir.operator import IRFwOperation, IRDataOperation
 from tests.parallel_module.test_gencode import _gencode_contains, print_gencode
-from ..utils import replace_all_device_with, clear_dir_on_rank0, init_random
+from ..utils import replace_all_device_with, clear_dir_on_rank0, init_random, PYTEST_RUN_ID
 from ..launch_torchrun import torchrun
 
 
@@ -119,7 +119,7 @@ def worker_a():
     m.train()
     trace_data = torch.randn([2, 2, 2, 8], dtype=torch.float32, device=torch.cuda.current_device())
     data = torch.randn([2, 2, 2, 8], dtype=torch.float32, device=torch.cuda.current_device())
-    with clear_dir_on_rank0(Path(tempfile.gettempdir()) / 'test_infer_grad_pyfunc') as tempdir:
+    with clear_dir_on_rank0(Path(tempfile.gettempdir()) / f'test_infer_grad_pyfunc_{PYTEST_RUN_ID}') as tempdir:
         pm = parallelize(
             m,
             {'q': trace_data,},
@@ -211,7 +211,7 @@ def worker_b(use_end2end):
     init_random()
     trace_data = torch.randn([2, 2, 2, 8], dtype=torch.float32, device=torch.cuda.current_device())
     data = torch.randn([2, 2, 2, 8], dtype=torch.float32, device=torch.cuda.current_device())
-    with clear_dir_on_rank0(Path(tempfile.gettempdir()) / 'test_infer_grad_no_grad') as tempdir:
+    with clear_dir_on_rank0(Path(tempfile.gettempdir()) / f'test_infer_grad_no_grad_{PYTEST_RUN_ID}') as tempdir:
         pm = parallelize(
             m,
             {'q': trace_data,},

@@ -20,7 +20,7 @@ from nnscaler.runtime.module import dedup_attrs
 
 from .common import init_distributed, assert_equal
 from ..launch_torchrun import launch_torchrun
-from ..utils import clear_dir_on_rank0
+from ..utils import clear_dir_on_rank0, PYTEST_RUN_ID
 
 
 class Net(torch.nn.Module):
@@ -55,7 +55,7 @@ def pas(graph: IRGraph, config: ComputeConfig):
 
 def _gpu_worker_spmd(cc: ComputeConfig):
     init_distributed()
-    with clear_dir_on_rank0(Path(tempfile.gettempdir()) / 'nnscaler_test_dedup_attr') as tempdir:
+    with clear_dir_on_rank0(Path(tempfile.gettempdir()) / f'nnscaler_test_dedup_attr_{PYTEST_RUN_ID}') as tempdir:
         module = parallelize(
             Net(),
             {'x': torch.tensor([[1.0, 2.0, 3.0, 4.0], [1.0, 2.0, 3.0, 4.0]])},

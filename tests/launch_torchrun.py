@@ -4,11 +4,12 @@
 from typing import Callable
 import uuid
 import torch
+import os
 
 from torch.distributed.run import elastic_launch, LaunchConfig
 from torch.distributed.elastic.multiprocessing.errors import ChildFailedError
 
-from .utils import retry
+from .utils import retry, MASTER_PORT
 
 
 @retry(ChildFailedError, delay=10, match='The server socket has failed to listen on any local network address.')
@@ -18,7 +19,7 @@ def launch_torchrun(nproc_per_node, worker_fn, *args, **kwargs):
         max_nodes=1,
         nproc_per_node=nproc_per_node,
         rdzv_backend = "c10d",
-        rdzv_endpoint = "localhost:29401",
+        rdzv_endpoint = f"localhost:{MASTER_PORT}",
         run_id = str(uuid.uuid4()),
         monitor_interval=0.1,
         max_restarts=0,

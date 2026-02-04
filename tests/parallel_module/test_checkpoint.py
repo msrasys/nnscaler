@@ -30,7 +30,7 @@ from nnscaler.runtime.gnorm import calcuate_gnorm
 
 from .common import CubeLinear, init_random, init_distributed, PASMegatron, assert_equal
 from ..launch_torchrun import launch_torchrun, clone_to_cpu_recursively
-from ..utils import replace_all_device_with, clear_dir_on_rank0
+from ..utils import replace_all_device_with, clear_dir_on_rank0, PYTEST_RUN_ID
 
 
 class FcRelu(nn.Module):
@@ -475,7 +475,7 @@ def _train(model: torch.nn.Module, num_replicas, rank, start, end, ckpt_dir, inf
 def _gpu_worker(module_type, use_zero, pas, plan_ngpus, runtime_ngpus, per_resume_update_count, resume_count, check_module=None):
     init_distributed()
     compiled_results = []
-    with clear_dir_on_rank0(Path(tempfile.gettempdir()) / 'cube_test_ckpt') as tempdir:
+    with clear_dir_on_rank0(Path(tempfile.gettempdir()) / f'cube_test_ckpt_{PYTEST_RUN_ID}') as tempdir:
         for i in range(resume_count):
             start = i * per_resume_update_count
             end = (i + 1) * per_resume_update_count
@@ -591,7 +591,7 @@ def test_checkpoint_intra_reducer(module_type, use_zero):
 
 def _gpu_merge_worker():
     init_distributed()
-    with clear_dir_on_rank0(Path(tempfile.gettempdir()) / 'cube_test_ckpt_merge') as tempdir:
+    with clear_dir_on_rank0(Path(tempfile.gettempdir()) / f'cube_test_ckpt_merge_{PYTEST_RUN_ID}') as tempdir:
         compiled_module = _create_cube_module('data',
             ComputeConfig(2, 4, use_zero=True),
             tempdir,

@@ -13,7 +13,7 @@ from nnscaler.parallel import ComputeConfig, parallelize
 
 from .common import CubeLinear, init_distributed, init_random
 from ..launch_torchrun import torchrun
-from ..utils import clear_dir_on_rank0
+from ..utils import clear_dir_on_rank0, PYTEST_RUN_ID
 
 
 class FcRelu(nn.Module):
@@ -62,7 +62,7 @@ def _inference_worker(ngpus, inference_only):
     init_distributed()
     init_random()
 
-    with clear_dir_on_rank0(Path(tempfile.gettempdir()) / 'cube_inference_test') as tempdir:
+    with clear_dir_on_rank0(Path(tempfile.gettempdir()) / f'cube_inference_test_{PYTEST_RUN_ID}') as tempdir:
         model = Module()
         model.eval()
 
