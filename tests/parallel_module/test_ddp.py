@@ -23,7 +23,7 @@ from nnscaler.runtime.gnorm import calcuate_gnorm
 
 from .common import CubeLinear, init_random, init_distributed
 from ..launch_torchrun import launch_torchrun, clone_to_cpu_recursively
-from ..utils import clear_dir_on_rank0
+from ..utils import clear_dir_on_rank0, PYTEST_RUN_ID
 
 
 class FcRelu(nn.Module):
@@ -206,7 +206,7 @@ def _gpu_worker_ddp(update_freq):
 
 def _gpu_worker_cube(pas, plan_ngpus, runtime_ngpus, update_freq, use_zero):
     init_distributed()
-    with clear_dir_on_rank0(Path(tempfile.gettempdir()) / 'cube_test') as tempdir:
+    with clear_dir_on_rank0(Path(tempfile.gettempdir()) / f'cube_test_{PYTEST_RUN_ID}') as tempdir:
         compiled_module = _create_cube_module(pas,
             ComputeConfig(plan_ngpus, runtime_ngpus, use_zero=use_zero),
             tempdir

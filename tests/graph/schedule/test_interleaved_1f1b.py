@@ -21,7 +21,7 @@ from nnscaler.parallel import ComputeConfig, parallelize, build_optimizer
 from nnscaler.ir.operator import IRFwOperation, IRDataOperation
 from nnscaler.graph.segment import IRSegment
 from nnscaler.graph.schedule.predefined import PredefinedSched
-from tests.utils import clear_dir_on_rank0, init_random
+from tests.utils import clear_dir_on_rank0, init_random, PYTEST_RUN_ID
 from tests.launch_torchrun import torchrun
 from tests.parallel_module.common import assert_equal
 from tests.parallel_module.test_gencode import _gencode_contains
@@ -131,7 +131,7 @@ def worker_pipeline_2(n_micro_batches):
     trace_data = torch.randn([2, 32], dtype=torch.float32, device=torch.cuda.current_device())
     cfg = ComputeConfig(2, 2, use_end2end=True, pas_config=dict(n_micro_batches=n_micro_batches))
 
-    with clear_dir_on_rank0(Path(tempfile.gettempdir()) / 'test_1f1b_interleaved') as tempdir:
+    with clear_dir_on_rank0(Path(tempfile.gettempdir()) / f'test_1f1b_interleaved_{PYTEST_RUN_ID}') as tempdir:
         pm_1f1b = parallelize(
                 m,
                 {'x': trace_data},

@@ -12,7 +12,7 @@ from nnscaler.parallel import parallelize, ComputeConfig, merge_state_dicts, loa
 
 from .common import CubeLinear, init_random, init_distributed
 from ..launch_torchrun import launch_torchrun
-from ..utils import catch_log, clear_dir_on_rank0
+from ..utils import catch_log, clear_dir_on_rank0, PYTEST_RUN_ID
 
 
 class Net1(torch.nn.Module):
@@ -63,7 +63,7 @@ def _to_cube_model(module, compute_config, cube_savedir, instance_name, input_sh
 def _gpu_worker():
     init_distributed()
     compute_config = ComputeConfig(1, 1, use_zero=False)
-    with clear_dir_on_rank0(Path(tempfile.gettempdir()) / 'cube_test_ckpt') as tempdir:
+    with clear_dir_on_rank0(Path(tempfile.gettempdir()) / f'cube_test_ckpt_{PYTEST_RUN_ID}') as tempdir:
         net1 = _to_cube_model(Net1(), compute_config, tempdir, 'net1', (128, 64))
         cube_state_dict = net1.state_dict()
         assert not any(key.startswith('buffer') for key in cube_state_dict)
@@ -129,7 +129,7 @@ def _gpu_worker_broadcast():
     init_distributed()
     compute_config = ComputeConfig(1, 2, use_zero=False)
     rank = torch.distributed.get_rank()
-    with clear_dir_on_rank0(Path(tempfile.gettempdir()) / 'cube_test_ckpt_broadcast_fail') as tempdir:
+    with clear_dir_on_rank0(Path(tempfile.gettempdir()) / f'cube_test_ckpt_broadcast_fail_{PYTEST_RUN_ID}') as tempdir:
         net1 = _to_cube_model(Net1(), compute_config, tempdir, 'net1', (128, 64), init_module_params=False)
         with pytest.raises(RuntimeError, match="Non-persistent buffers haven't been initialized."):
             broadcast_weights(net1)

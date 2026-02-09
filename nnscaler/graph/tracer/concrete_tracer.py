@@ -542,7 +542,10 @@ class ConcreteTracer(TracerBase):
                         method_name=func.__name__,
                     )
                 elif func.__name__ != func.__qualname__ and func.__qualname__ != 'boolean_dispatch.<locals>.fn' \
-                    and not func.__qualname__.startswith('PyCapsule'):
+                    and not func.__qualname__.startswith('PyCapsule') \
+                    and not func.__qualname__.startswith('pybind11_detail_function_'):
+                    # this branch is for method/functions originally not defined in module level.
+                    # in torch >= 2.9, we found pybind11_builtins are included in torch namespace.
                     # method
                     # in torch >= 2.2, we found two functions under torch._C has no __module__:
                     #   <built-in method _make_subclass of torch._C._TensorMeta>
@@ -552,8 +555,11 @@ class ConcreteTracer(TracerBase):
                             path = sys.modules.get(func.__module__[1:], sys.modules[func.__module__])
                         else:
                             path = sys.modules[func.__module__]
-                        path = getattr(path, func.__qualname__.split('.')[0])
-                        locations = (*locations, wrap_utils.Location(path, func.__name__))
+                        try:
+                            path = getattr(path, func.__qualname__.split('.')[0])
+                            locations = (*locations, wrap_utils.Location(path, func.__name__))
+                        except AttributeError:
+                            _logger.warning(f'Can not get the class path of method {func} {func.__qualname__}!')
                     if len(locations) == 0:
                         _logger.warning(f'Can not find location of {func}, skip wrap it.')
                         continue

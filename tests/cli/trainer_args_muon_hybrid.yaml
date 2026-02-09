@@ -1,0 +1,60 @@
+vars:
+  dim: 16
+  drop_last: true
+
+compute_config:
+  plan_ngpus: 1
+  runtime_ngpus: 2
+  constant_folding: true
+  use_zero: 0
+  use_end2end: true
+
+run_mode: run
+pas_policy: dp
+micro_batch_size: 2
+global_batch_size: 8
+max_epochs: 4
+max_train_steps: 100
+seed: 0
+precision: bf16
+enable_progress_bar: false
+
+model:
+  type: tests.cli.common.MLP
+  args:
+    dim: $(vars.dim)
+    nlayers: 16
+
+
+optimizer:
+  type: nnscaler.HybridOptimizer
+  param_clss_fn: tests.cli.test_trainer_muon.param_clss_fn
+  args:
+    config:
+      optimizers:
+        - type: nnscaler.runtime.f16_optimizer.MixedPrecisionAdamW
+          options:
+            lr: 0.01
+        - type: torch.optim.Muon
+          options:
+            lr: 0.01
+
+dataset:
+  type: tests.cli.common.SimpleDataset
+  train_args:
+    dim: $(vars.dim)
+    size: 100
+  val_args:
+    dim: $(vars.dim)
+    size: 10
+
+dataloader:
+  train_args:
+    drop_last: $(vars.drop_last)
+  val_args:
+    drop_last: $(vars.drop_last)
+
+checkpoint:
+  keep_last_n_checkpoints: 5
+  every_n_train_steps: 1
+  save_type: deduped

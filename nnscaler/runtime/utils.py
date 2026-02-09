@@ -5,6 +5,7 @@ r"""Runtime Utilities"""
 
 from typing import Any, List
 import logging
+import heapq
 
 _logger = logging.getLogger(__name__)
 
@@ -104,3 +105,125 @@ def microbatches(samples: List[Any], cycle: bool = False) -> MicroBatchDataLoade
         MicroBatchDataLoader: a micro-batch data loader.
     """
     return MicroBatchDataLoader(samples, cycle=cycle)
+
+
+def split_array_min_max(nums: list[int], g: int, *, keep_order: bool = True) -> tuple[list[list[int]], list[list[int]]]:
+    """
+    Split the array nums into g continuous subarrays such that the maximum sum
+    of the subarrays is minimized.
+
+    Args:
+        nums (list[int]): The input array of integers.
+        g (int): The number of groups to split the array into.
+        keep_order (bool): Whether to keep the order of elements in the subarrays.
+            If True, the order of elements in the original array is preserved
+            in the subarrays. If False, the order can be changed.
+    Returns:
+        tuple[list[list[int]], list[list[int]]]:
+            A tuple containing a list of g subarrays and their corresponding indices.
+    """
+    if g <= 0 or g > len(nums):
+        raise ValueError("g must be in the range [1, len(nums)]")
+
+    if not keep_order:
+        return _split_array_min_max_out_of_order(nums, g)
+
+    def _check(limit):
+        count = 1
+        count_sum = nums[0]
+        for x in nums[1:]:
+            if count_sum + x > limit:
+                count += 1
+                count_sum = x
+            else:
+                count_sum += x
+        return count <= g
+
+    # 1. Binary search to find the "minimum maximum sum" (Target Limit)
+    left = max(nums)
+    right = sum(nums)
+    target_limit = right
+
+    while left <= right:
+        mid = (left + right) // 2
+        if _check(mid):
+            target_limit = mid
+            right = mid - 1
+        else:
+            left = mid + 1
+
+    # 2. Reconstruct the result based on the calculated target_limit
+    # Note: A special greedy strategy is needed here to ensure exactly g groups
+    # A simple greedy approach may result in fewer than g groups (although the maximum sum meets the condition, the number of groups is insufficient)
+
+    result = [[nums[0]]]
+    result_idx = [[0]]
+    current_sum = nums[0]
+
+    # We process in forward order, or forcefully reserve enough elements for the remaining groups during forward processing
+    # Here we use forward iteration with a "remaining quota" check
+    for i, x in enumerate(nums[1:], start=1):
+        # Remaining groups needed
+        groups_needed = g - len(result)
+        # Remaining elements not yet processed
+        elements_left = len(nums) - i
+        if elements_left == groups_needed:
+            # Each element must form a separate group
+            result.append([x])
+            result_idx.append([i])
+            current_sum = x
+            continue
+
+        if current_sum + x > target_limit:
+            result.append([x])
+            result_idx.append([i])
+            current_sum = x
+        else:
+            result[-1].append(x)
+            result_idx[-1].append(i)
+            current_sum += x
+
+    return result, result_idx
+
+
+def _split_array_min_max_out_of_order(nums: list[int], g: int) -> tuple[list[list[int]], list[list[int]]]:
+    """
+    Split the array nums into g subarrays (order of elements can be changed)
+    This problem (multi-way number partitioning) is NP-hard. We use a greedy approximation algorithm here.
+
+    For more information, see https://en.wikipedia.org/wiki/Greedy_number_partitioning
+    QUOTE:
+        An improved greedy algorithm is called [LPT scheduling].
+        It processes the inputs by descending order of value, from large to small.
+
+        Since it needs to pre-order the inputs, it can be used only as an [offline algorithm].
+        It guarantees that the largest sum is at most (4k-1)/3k  times the optimal (minimum) largest sum,
+        and the smallest sum is at least  (3k-1)/(4k-2) times the optimal (maximum) smallest sum.
+
+        See [LPT scheduling](https://en.wikipedia.org/wiki/LPT_scheduling) for more details.
+    """
+    # 1. Sort numbers in descending order
+    nums_with_indices = list((nun, i) for i, nun in enumerate(nums))
+    sorted_nums = sorted(nums_with_indices, reverse=True)
+
+    # 2. Initialize heap
+    heap = [(0, i) for i in range(g)]
+
+    # groups to save results
+    groups = [[] for _ in range(g)]
+    group_idx = [[] for _ in range(g)]
+
+    # 3. greedy assignment
+    for num, idx in sorted_nums:
+        # Pop the bucket with the smallest current sum
+        current_sum, gidx = heapq.heappop(heap)
+
+        # Add the number to this bucket
+        groups[gidx].append(num)
+        group_idx[gidx].append(idx)
+
+        # Update the sum of this bucket and push it back to the heap
+        new_sum = current_sum + num
+        heapq.heappush(heap, (new_sum, gidx))
+
+    return groups, group_idx
