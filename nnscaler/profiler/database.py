@@ -260,7 +260,7 @@ def profile(node: IRFwOperation, func: Callable, shapes: Shapes, dtypes: DTypes,
     # warmup
     warmup_cnt = 0
     tic = time.perf_counter()
-    while time.perf_counter() - tic < warmup_sec:
+    while time.perf_counter() - tic < warmup_sec and warmup_cnt < prof_times:
         run_step(func, tensors, train_kwargs, backward=require_backward)
         torch.cuda.synchronize()
         warmup_cnt += 1
