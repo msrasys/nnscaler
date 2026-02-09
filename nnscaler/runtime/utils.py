@@ -190,6 +190,17 @@ def _split_array_min_max_out_of_order(nums: list[int], g: int) -> tuple[list[lis
     """
     Split the array nums into g subarrays (order of elements can be changed)
     This problem (multi-way number partitioning) is NP-hard. We use a greedy approximation algorithm here.
+
+    For more information, see https://en.wikipedia.org/wiki/Greedy_number_partitioning
+    QUOTE:
+        An improved greedy algorithm is called [LPT scheduling].
+        It processes the inputs by descending order of value, from large to small.
+
+        Since it needs to pre-order the inputs, it can be used only as an [offline algorithm].
+        It guarantees that the largest sum is at most (4k-1)/3k  times the optimal (minimum) largest sum,
+        and the smallest sum is at least  (3k-1)/(4k-2) times the optimal (maximum) smallest sum.
+
+        See [LPT scheduling](https://en.wikipedia.org/wiki/LPT_scheduling) for more details.
     """
     # 1. Sort numbers in descending order
     nums_with_indices = list((nun, i) for i, nun in enumerate(nums))
