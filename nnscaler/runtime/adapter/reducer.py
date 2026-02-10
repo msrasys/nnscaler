@@ -10,9 +10,10 @@ import torch
 from torch.utils.hooks import RemovableHandle
 
 from nnscaler.runtime.device import DeviceGroup
+from nnscaler.runtime.utils import split_array_min_max, set_fparam_meta
 from nnscaler.profiler.timer import CudaTimer
 from nnscaler.flags import RuntimeFlag
-from nnscaler.utils import unchecked_fields
+from nnscaler.utils import unchecked_fields, first
 
 _logger = logging.getLogger(__name__)
 
@@ -62,19 +63,143 @@ def _get_reduce_op(reduce_op: str) -> torch.distributed.ReduceOp:
 
 
 @dataclass
-class _Z3ParamInfo:
+class ReducerParamInfo:
     shape: torch.Size  # original shape of the parameter
     start: int
     end: int
+    # p.flatten()[start:end] is reducer._contiguous_params[param_buffer_start:param_buffer_end]
     param_buffer_start: int = -1
     param_buffer_end: int = -1
+    # p.flatten()[start:end] is bucket._contiguous_params[bucket_param_buffer_start:bucket_param_buffer_end]
+    bucket_param_buffer_start: int = -1
+    bucket_param_buffer_end: int = -1
 
     def numel(self) -> int:
         return self.end - self.start
 
     def numel_with_padding(self) -> int:
+        """
+        Get the number of elements with padding in param buffer.
+        This is only used when zero3 is used.
+        When zero3 is not used, numel_with_padding() == numel()
+        """
         return self.param_buffer_end - self.param_buffer_start
 
+
+@dataclass
+class FlattenParamInfo:
+    zero: int        # 0, 1, 3
+    params_info: Dict[torch.nn.Parameter, ReducerParamInfo]
+    opt_numel: int       # number of elements in the flattened parameter for optimizer
+    opt_num_chunks: int  # number of chunks, see `Bucket._get_opt_param_data`
+    opt_chunk_index: int # index of the chunk
+
+    @property
+    def opt_chunk_size(self) -> int:
+        """
+        Get the chunk size for optimizer
+        """
+        assert self.opt_numel % self.opt_num_chunks == 0, \
+            "internal error: flattened parameter numel is not chunkable"
+        return self.opt_numel // self.opt_num_chunks
+
+    def get_embeded_params(self) -> List[torch.nn.Parameter]:
+        """
+        Get the parameters embedded in this flattened parameter
+        """
+        opt_start = self.opt_chunk_index * self.opt_chunk_size
+        opt_end = (self.opt_chunk_index + 1) * self.opt_chunk_size
+        params = []
+        for p, info in self.params_info.items():
+            if info.bucket_param_buffer_start >= opt_start and info.bucket_param_buffer_end <= opt_end:
+                params.append(p)
+            if info.bucket_param_buffer_start < opt_start < info.bucket_param_buffer_end:
+                raise ValueError(
+                    f"Parameter {p} is partially included in chunk {self.opt_chunk_index}, "
+                    f"which is not supported.")
+            if info.bucket_param_buffer_start < opt_end < info.bucket_param_buffer_end:
+                raise ValueError(
+                    f"Parameter {p} is partially included in chunk {self.opt_chunk_index}, "
+                    f"which is not supported.")
+        return params
+
+    def flatten(self, tensors: list[Optional[torch.Tensor]], *, device=None) -> torch.Tensor:
+        """
+        Flatten the given tensors into a single tensor
+        Args:
+            tensors (list[Optional[torch.Tensor]]): the tensors to be flattened.
+                Note these tensors must be in the same order as `self.get_embeded_params()`
+                or None for missing tensors.
+            device: the device of the result flattened tensor,
+                if None, use the device of the first non-None tensor
+        """
+        if tensors is None or len(tensors) == 0 or all(t is None for t in tensors):
+            raise ValueError("tensors should not be empty or all None")
+
+        non_none_tensor = first(tensors, lambda t: t is not None)
+        if device is None:
+            device = non_none_tensor.device
+        flat_tensors = torch.zeros(self.opt_chunk_size, dtype=non_none_tensor.dtype, device=device, pin_memory=True)
+
+        opt_start = self.opt_chunk_index * self.opt_chunk_size
+        opt_end = (self.opt_chunk_index + 1) * self.opt_chunk_size
+        cur_tensor_idx = 0
+
+        for info in self.params_info.values():
+            if info.bucket_param_buffer_start >= opt_start and info.bucket_param_buffer_end <= opt_end:
+                tensor = tensors[cur_tensor_idx]
+                cur_tensor_idx += 1
+                if tensor is None:
+                    continue
+
+                if tensor.shape != info.shape:
+                    raise ValueError(
+                        f"Tensor shape {tensor.shape} does not match the expected shape {info.shape}"
+                    )
+                flat_tensors[
+                    info.bucket_param_buffer_start - opt_start:
+                    info.bucket_param_buffer_start - opt_start + tensor.numel()
+                ].copy_(tensor.view(-1), non_blocking=True)
+
+        # non-blocking copy may need synchronization
+        torch.cuda.synchronize()
+        return flat_tensors
+
+    def unflatten(self, tensor: torch.Tensor, *, device=None) -> list[torch.Tensor]:
+        """
+        Unflatten the given tensor into a list of tensors
+        Args:
+            tensor (torch.Tensor): the tensor to be unflattened.
+                Note this tensor must be in the same order as `self.get_embeded_params()`
+            device: the device of the result tensors,
+                if None, use the device of the input tensor
+        """
+        if tensor is None:
+            raise ValueError("tensor should not be None")
+        if tensor.numel() != self.opt_chunk_size:
+            raise ValueError("tensor numel does not match the expected size")
+        if device is None:
+            device = tensor.device
+
+        tensors = []
+        opt_start = self.opt_chunk_index * self.opt_chunk_size
+        opt_end = (self.opt_chunk_index + 1) * self.opt_chunk_size
+
+        for info in self.params_info.values():
+            if info.bucket_param_buffer_start >= opt_start and info.bucket_param_buffer_end <= opt_end:
+                param_tensor = torch.empty(info.shape, dtype=tensor.dtype, device=device, pin_memory=True)
+                param_tensor.view(-1).copy_(
+                    tensor[
+                        info.bucket_param_buffer_start - opt_start:
+                        info.bucket_param_buffer_start - opt_start + param_tensor.numel()
+                    ],
+                    non_blocking=True
+                )
+                tensors.append(param_tensor)
+
+        # non-blocking copy may need synchronization
+        torch.cuda.synchronize()
+        return tensors
 
 class Bucket:
     def __init__(self, reducer: 'Reducer', params: List[torch.nn.Parameter],
@@ -86,6 +211,7 @@ class Bucket:
                  zero_use_reduce_scatter: bool = False,
                  align_size: int = ALIGNED_BYTES,
                  param_cls: Any = None,
+                 params_info: Dict[torch.nn.Parameter, ReducerParamInfo] = None,
     ):
         """
         Create a communication unit for parameter allreduce.
@@ -111,7 +237,12 @@ class Bucket:
 
         self._params: List[torch.nn.Parameter] = params
         self._param_cls: Any = param_cls
-        self._pofset: Dict[torch.nn.Parameter, int] = {}
+        self._params_info: Dict[torch.nn.Parameter, ReducerParamInfo] = {
+            p: params_info[p] for p in self._params
+        }
+        self._pofset: Dict[torch.nn.Parameter, int] = {
+            p: info.bucket_param_buffer_start for p, info in self._params_info.items()
+        }
         self._reduce_op = reduce_op
         self._group = group
         self._wsz: int = torch.distributed.get_world_size(group=self._group)
@@ -146,6 +277,7 @@ class Bucket:
 
         self._z3 = self._zero > 1
         self._reducer = reducer
+        self._flatten_param_info: FlattenParamInfo = self._get_flatten_param_info()
 
         # only async will enable contiguous gradient
         self.build()
@@ -202,20 +334,33 @@ class Bucket:
                 partial_tensor, self._contiguous_grads,
                 op=self._reduce_op, group=self._zero_subgroup)
 
-    def _get_opt_param_data(self):
+    def _get_flatten_param_info(self):
         if not self._zero or self._zero > 1:
-            # when zero3 is used, the parameters are already sharded in reducer
+            # no need to shard the parameter for zero3
+            num_chunks = 1
+            chunk_index = 0
+        else:
+            num_chunks = self._zgroup_sz
+            chunk_index = torch.distributed.get_rank(group=self._zero_subgroup)
+
+        return FlattenParamInfo(
+            zero=self._zero,
+            opt_num_chunks=num_chunks,
+            opt_numel=self._contiguous_params.numel(),
+            opt_chunk_index=chunk_index,
+            params_info=self._params_info,
+        )
+
+    def _get_opt_param_data(self) -> torch.Tensor:
+        if self._flatten_param_info.opt_num_chunks == 1:
             opt = self._contiguous_params
         else:
-            assert self._zero == 1
-            rank = torch.distributed.get_rank(group=self._zero_subgroup)
-            assert len(self._contiguous_params) % self._zgroup_sz == 0
             # Note:
             #  There may be paddings both in the middle and at the end of the contiguous buffer
             #  When there are paddings in the middle or end of the contiguous buffer,
             #  the calculation of gnorm is not affected as long as the paddings are all 0.
             #   So for now, it looks harmless.
-            opt = self._contiguous_params.chunk(self._zgroup_sz)[rank]
+            opt = self._contiguous_params.chunk(self._flatten_param_info.opt_num_chunks)[self._flatten_param_info.opt_chunk_index]
         return opt
 
     def build(self):
@@ -223,13 +368,10 @@ class Bucket:
         Build offset for each parameter
         This should only be called once during the construction of bucket.
         """
-        ofst = 0
-        for param in self._params:
-            self._pofset[param] = ofst
-            ofst += _aligned_nelement(param.nelement(), param.element_size(), self._align_size)
         # build parameter for optimizer (shared storage).
         # Its gradient will be updated everytime calling `self.sync_grads()`
         self._param_for_optimizer = torch.nn.Parameter(self._get_opt_param_data())
+        set_fparam_meta(self._param_for_optimizer, self._flatten_param_info)
 
     def register_hooks(self):
         """
@@ -497,6 +639,8 @@ class Bucket:
 
         fields = unchecked_fields(self)
         state[fields._params] = [param_map[p] for p in self._params]
+        state[fields._params_info] = {param_map[p]: info for p, info in self._params_info.items()}
+        state[fields._flatten_param_info].params_info = state[fields._params_info]
         state[fields._pofset] = {param_map[p]: ofst for p, ofst in self._pofset.items()}
         state[fields._param_for_optimizer] = torch.nn.Parameter(torch.empty_like(self._param_for_optimizer, device='meta'))
         state[fields._contiguous_params] = torch.empty_like(self._contiguous_params, device='meta')
@@ -527,6 +671,7 @@ class Bucket:
         bucket = object.__new__(cls)
         bucket.__dict__.update(state)
         bucket._reducer = reducer
+        set_fparam_meta(bucket._param_for_optimizer, bucket._flatten_param_info)
 
         for param in bucket._params:
             assert param.device.type == 'meta'
@@ -549,6 +694,7 @@ class Reducer:
         reduce_op: str = 'sum', async_op: bool = False,
         zero: int = 0, zero_ngroups: int = 1,
         zero_use_reduce_scatter: bool = False,
+        zero_param_level_sharding: bool = False,
         align_size: int = ALIGNED_BYTES,
     ):
         """
@@ -568,6 +714,8 @@ class Reducer:
                 zero=2 will be treated as zero=3
             zero_ngroups (int): number of ZeRO subgroups in the original ZeRO group
             zero_use_reduce_scatter (bool): whether to use reduce scatter for zero optimization
+            zero_param_level_sharding (bool): whether to use parameter-level sharding in ZeRO
+                This flag is required when use parameter-level optimizers(like Muon)
             align_size (int): the alignment size in bytes for each parameter
         """
         # the parameters with same class will be consecutive in the list.
@@ -589,6 +737,7 @@ class Reducer:
         self._async: bool = async_op
         self._zero: int = int(zero)
         self._zero_use_reduce_scatter = zero_use_reduce_scatter
+        self._zero_param_level_sharding = zero_param_level_sharding and self._zero > 0
         self._align_size: int = align_size
         if self._align_size % ALIGNED_BYTES != 0:
             raise ValueError(f"align_size {self._align_size} must be divisible by {ALIGNED_BYTES}")
@@ -603,6 +752,7 @@ class Reducer:
         # bucket start and stop pos in buffer
         self.starts, self.stops = [], []
         self.buffer_length: int = 0
+        self._params_info: dict[torch.nn.Parameter, ReducerParamInfo] = dict()
 
         # build the subgroup of zero the current rank belongs to.
         # When zero_ngroups is larger than 1, the number of ranks
@@ -644,12 +794,11 @@ class Reducer:
 
         self._zero_ngroups = zero_ngroups
 
-        self._z3_size = torch.distributed.get_world_size(group=self._zero_subgroup)
-        if self._z3_size == 1:
+        self._zero_size = torch.distributed.get_world_size(group=self._zero_subgroup)
+        if self._zero_size == 1:
             self._zero = 0  # disable zero when only one rank in subgroup
         self._z3 = self._zero > 1
         self._z3_rank = torch.distributed.get_rank(group=self._zero_subgroup)
-        self._z3_params_info: dict[torch.nn.Parameter, _Z3ParamInfo] = dict()
 
     @property
     def zero_ngroups(self) -> int:
@@ -716,20 +865,13 @@ class Reducer:
             device=torch.cuda.current_device(), requires_grad=False)
 
     def _bind_params(self):
-        for params, start, stop in zip(self.seq_buckets, self.starts, self.stops):
+        for params in self.seq_buckets:
             # replace underlying parameter content using shared storage from parameter
-            ofst = start
             for param in params:
                 with torch.no_grad():
-                    self._contiguous_params[ofst:ofst+param.numel()].copy_(param.data.view(-1))
-                    if self._z3:
-                        param.data = self._contiguous_params[ofst:ofst+param.numel()]
-                        self._z3_params_info[param].param_buffer_start = ofst
-                        self._z3_params_info[param].param_buffer_end = ofst + param.numel()
-                    else:
-                        param.data = self._contiguous_params[ofst:ofst+param.numel()].view(param.size())
-                aligned_nelements = _aligned_nelement(param.nelement(), param.element_size(), self._align_size)
-                ofst += aligned_nelements
+                    param_info = self._params_info[param]
+                    self._contiguous_params[param_info.param_buffer_start:param_info.param_buffer_end].copy_(param.data.view(-1))
+                    param.data = self._contiguous_params[param_info.param_buffer_start:param_info.param_buffer_end].view(param.size())
 
     def build_buckets(self, param_clss: Optional[dict[torch.nn.Parameter, Any]]=None):
         """
@@ -754,10 +896,10 @@ class Reducer:
                 if not param.requires_grad:
                     continue
 
-                chunk_size = (param.numel() + self._z3_size - 1) // self._z3_size
+                chunk_size = (param.numel() + self._zero_size - 1) // self._zero_size
                 start = self._z3_rank * chunk_size
                 end = min(start + chunk_size, param.numel())
-                self._z3_params_info[param] = _Z3ParamInfo(shape=param.shape, start=start, end=end)
+                self._params_info[param] = ReducerParamInfo(shape=param.shape, start=start, end=end)
                 # clone the data so original param can be released
                 # this padding is required
                 # to make sure all ranks in the zero subgroup have the same bucket layout.
@@ -773,6 +915,11 @@ class Reducer:
                     param.data = param.data.view(-1)[start:end].clone()
 
             torch.cuda.empty_cache()
+        else:
+            for param in self._params:
+                if not param.requires_grad:
+                    continue
+                self._params_info[param] = ReducerParamInfo(shape=param.shape, start=0, end=param.numel())
 
         # step 1: build bucket for overlapping gradient synchronization
         # self._numel * 8 + 1 here is to make sure
@@ -818,12 +965,48 @@ class Reducer:
         # the start of each bucket will be padded to the next multiple of `len(self.ranks)`
         for params in self.seq_buckets:
             self.starts.append(self.buffer_length)
-            numel = sum(_aligned_nelement(p.nelement(), p.element_size(), self._align_size) for p in params)
-            # this pad is for zero, which needs numels in each Bucket can be divided by the number of ranks in this group * _align_size
-            # so that each chunck during zero can be divided by _align_size
-            align_nelements = self._align_size // params[0].element_size() * len(self._ranks)
-            padding = (align_nelements - numel % align_nelements) % len(self._ranks)
-            self.buffer_length += numel + padding
+            param_sizes = [_aligned_nelement(p.nelement(), p.element_size(), self._align_size) for p in params]
+            if self._zero_param_level_sharding and len(params) >= self._zero_size:
+                groups, group_idx = split_array_min_max(param_sizes, self._zero_size, keep_order=False)
+                max_group_size = max(sum(sizes) for sizes in groups)
+                new_param_order = []
+                for i in range(len(group_idx)):
+                    chunk_start = max_group_size * i
+                    chunk_offset = 0
+                    for pidx in group_idx[i]:
+                        param = params[pidx]
+                        param_size = param_sizes[pidx]
+                        new_param_order.append(param)
+                        self._params_info[param].param_buffer_start = self.starts[-1] + chunk_start + chunk_offset
+                        self._params_info[param].param_buffer_end = self._params_info[param].param_buffer_start + param.numel()
+                        self._params_info[param].bucket_param_buffer_start = chunk_start + chunk_offset
+                        self._params_info[param].bucket_param_buffer_end = self._params_info[param].bucket_param_buffer_start + param.numel()
+                        chunk_offset += param_size
+
+                # reorder params according to group idx
+                params[:] = new_param_order
+                self.buffer_length += max_group_size * len(self._ranks)
+            else:
+                if self._zero_param_level_sharding:
+                    _logger.warning(
+                        f"the number of parameters in the bucket {len(params)} is smaller than "
+                        f"the number of ranks in the zero group {self._zero_size}, "
+                        f"ZeRO parameter-level sharding is skipped for this bucket."
+                    )
+                chunk_offset = 0
+                for idx, ps in enumerate(param_sizes):
+                    param = params[idx]
+                    self._params_info[param].param_buffer_start = self.starts[-1] + chunk_offset
+                    self._params_info[param].param_buffer_end = self._params_info[param].param_buffer_start + param.numel()
+                    self._params_info[param].bucket_param_buffer_start = chunk_offset
+                    self._params_info[param].bucket_param_buffer_end = self._params_info[param].bucket_param_buffer_start + param.numel()
+                    chunk_offset += ps
+                numel = sum(param_sizes)
+                # this pad is for zero, which needs numels in each Bucket can be divided by the number of ranks in this group * _align_size
+                # so that each chunck during zero can be divided by _align_size
+                align_nelements = self._align_size // params[0].element_size() * len(self._ranks)
+                padding = (align_nelements - numel % align_nelements) % len(self._ranks)
+                self.buffer_length += numel + padding
             self.stops.append(self.buffer_length)
 
         # step 3: allocate memory
@@ -850,6 +1033,7 @@ class Reducer:
                 self._zero_use_reduce_scatter,
                 self._align_size,
                 param_cls=param_cls,
+                params_info=self._params_info,
             )
             buckets.append(bucket)
         torch.cuda.empty_cache()
@@ -869,12 +1053,20 @@ class Reducer:
         for bucket in self._buckets:
             bucket.sync_grads()
 
-    def get_z3_info(self, param: torch.nn.Parameter) -> _Z3ParamInfo:
+    def get_z3_info(self, param: torch.nn.Parameter) -> ReducerParamInfo:
         """
         Get zero3 param info
         if the param is not in zero3, return None
         """
-        return self._z3_params_info.get(param, None)
+        if self._z3:
+            return self._params_info.get(param, None)
+        return None
+
+    def get_param_info(self, param: torch.nn.Parameter) -> ReducerParamInfo:
+        """
+        Get param info
+        """
+        return self._params_info.get(param, None)
 
     @torch.no_grad()
     def prefetch_param(self, param: torch.nn.Parameter):
@@ -884,15 +1076,15 @@ class Reducer:
         """
         if not self._z3:
             raise RuntimeError("postevict_param is only for zero3 optimization.")
-        if param not in self._z3_params_info:
+        if param not in self._params_info:
             raise ValueError(f"parameter {param} not found in zero3 params info.")
 
-        info = self._z3_params_info[param]
+        info = self._params_info[param]
         if param.shape == info.shape:
             # no need to gather
             return
 
-        full_data = torch.zeros(info.numel_with_padding() * self._z3_size, dtype=param.dtype,
+        full_data = torch.zeros(info.numel_with_padding() * self._zero_size, dtype=param.dtype,
                                 device=torch.cuda.current_device())
         torch.distributed.all_gather_into_tensor(
             full_data,
@@ -909,9 +1101,9 @@ class Reducer:
         """
         if not self._z3:
             raise RuntimeError("postevict_param is only for zero3 optimization.")
-        if param not in self._z3_params_info:
+        if param not in self._params_info:
             raise ValueError(f"parameter {param} not found in zero3 params info.")
-        info = self._z3_params_info[param]
+        info = self._params_info[param]
         param.data = self._contiguous_params[info.param_buffer_start:info.param_buffer_end]
 
     def gather_params(self):
@@ -1070,7 +1262,7 @@ class Reducer:
         fields = unchecked_fields(self)
 
         state[fields._params] = [param_map[p] for p in self._params]
-        state[fields._z3_params_info] = {param_map[p]: info for p, info in self._z3_params_info.items()}
+        state[fields._params_info] = {param_map[p]: info for p, info in self._params_info.items()}
         state[fields._param_clss] = {param_map[p]: param_cls for p, param_cls in self._param_clss.items()}
         state[fields._contiguous_params] = torch.empty_like(self._contiguous_params, device='meta')
         state[fields._contiguous_grads] = torch.empty_like(self._contiguous_grads, device='meta')

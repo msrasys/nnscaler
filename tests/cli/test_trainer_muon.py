@@ -17,11 +17,27 @@ except ImportError:
 
 
 
-def trainer_muon_worker(save_dir, config_file):
+def trainer_muon_worker(save_dir, config_file, zero=False):
     save_dir = Path(save_dir)
-    config_path = str(Path(__file__).with_name(config_file).resolve())
-    gen_savedir = save_dir / 'gen'
-    ckpt_savedir = save_dir / 'ckpt'
+    config_path = Path(__file__).with_name(config_file).resolve()
+    work_dir = save_dir / str(zero)
+    gen_savedir = work_dir / 'gen'
+    ckpt_savedir = work_dir / 'ckpt'
+
+    zero_options = []
+    if zero:
+        zero_options = [
+            '--compute_config.zero_param_level_sharding', True,
+            '--compute_config.use_zero', 1,
+        ]
+        if 'hybrid' in config_file:
+            zero_options += [
+                '--optimizer.args.config.optimizers.1.type', 'nnscaler.runtime.muon_optimizer.Muon',
+            ]
+        else:
+            zero_options += [
+                '--optimizer.type', 'nnscaler.runtime.muon_optimizer.Muon',
+            ]
 
     # train first epoch
     trainer = Trainer([
@@ -29,6 +45,7 @@ def trainer_muon_worker(save_dir, config_file):
         '--max_epochs', '1',
         '--gen_savedir', str(gen_savedir),
         '--checkpoint.save_dir', str(ckpt_savedir),
+        *zero_options,
     ])
     trainer.run()
     torch.distributed.barrier()
@@ -46,6 +63,7 @@ def trainer_muon_worker(save_dir, config_file):
         '--gen_savedir', str(gen_savedir),
         '--checkpoint.save_dir', str(ckpt_savedir),
         '--checkpoint.resume_from', str(ckpt_savedir / 'merged.pt'),
+        *zero_options,
     ])
     trainer.run()
 
@@ -59,6 +77,7 @@ def trainer_muon_worker(save_dir, config_file):
         '--checkpoint.save_dir', str(ckpt_savedir),
         '--checkpoint.resume_from', 'last',
         '--checkpoint.save_type', 'sharded',
+        *zero_options,
     ])
     trainer.run()
 
@@ -71,6 +90,7 @@ def trainer_muon_worker(save_dir, config_file):
         '--gen_savedir', str(gen_savedir),
         '--checkpoint.save_dir', str(ckpt_savedir),
         '--checkpoint.resume_from', 'last',
+        *zero_options,
     ])
     trainer.run()
 
@@ -83,6 +103,7 @@ def trainer_muon_worker(save_dir, config_file):
         '--max_epochs', '4',
         '--gen_savedir', str(gen_savedir),
         '--checkpoint.save_dir', str(ckpt1_savedir),
+        *zero_options,
     ])
     trainer.run()
 
@@ -95,13 +116,23 @@ def trainer_muon_worker(save_dir, config_file):
             for key in ['model', 'optimizer']:
                 assert_equal(x[key], y[key])
 
+    if trainer.rank == 0:
+        Trainer.merge_checkpoint(list((ckpt_savedir / 'last').glob('*.ckpt')), work_dir / 'result.pt')
+
     torch.distributed.barrier()
 
 
 @pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.device_count() < 2, reason='lack of gpu devices')
 @pytest.mark.parametrize('config_file', ['trainer_args_muon.yaml', 'trainer_args_muon_hybrid.yaml'])
 def test_trainer_muon_resume_correctness(tmp_path, config_file):
-    launch_torchrun(2, trainer_muon_worker, tmp_path, config_file)
+    launch_torchrun(2, trainer_muon_worker, tmp_path, config_file, False)
+    launch_torchrun(2, trainer_muon_worker, tmp_path, config_file, True)
+
+    zero0_ckpt = torch.load(tmp_path / 'False' / 'result.pt', weights_only=False)
+    zero1_ckpt = torch.load(tmp_path / 'True' / 'result.pt', weights_only=False)
+
+    assert_equal(zero0_ckpt['model'], zero1_ckpt['model'])
+    assert_equal(zero0_ckpt['optimizer']['state'], zero1_ckpt['optimizer']['state'])
 
 
 def param_clss_fn(param_name: str) -> tuple[int, int]:
