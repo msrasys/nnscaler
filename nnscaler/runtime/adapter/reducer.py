@@ -118,14 +118,13 @@ class FlattenParamInfo:
         for p, info in self.params_info.items():
             if info.bucket_param_buffer_start >= opt_start and info.bucket_param_buffer_end <= opt_end:
                 params.append(p)
-            if info.bucket_param_buffer_start < opt_start < info.bucket_param_buffer_end:
+            elif info.bucket_param_buffer_start >= opt_end or info.bucket_param_buffer_end <= opt_start:
+                continue
+            else:
                 raise ValueError(
                     f"Parameter {p} is partially included in chunk {self.opt_chunk_index}, "
-                    f"which is not supported.")
-            if info.bucket_param_buffer_start < opt_end < info.bucket_param_buffer_end:
-                raise ValueError(
-                    f"Parameter {p} is partially included in chunk {self.opt_chunk_index}, "
-                    f"which is not supported.")
+                    f"which is not supported."
+                )
         return params
 
     def flatten(self, tensors: list[Optional[torch.Tensor]], *, device=None) -> torch.Tensor:
@@ -353,7 +352,7 @@ class Bucket:
 
     def _get_flatten_param_info(self):
         if not self._zero or self._zero > 1:
-            # no need to shard the parameter for zero3
+            # when zero3 is used, the parameters are already sharded in reducer
             num_chunks = 1
             chunk_index = 0
         else:
@@ -1017,7 +1016,7 @@ class Reducer:
 
                 # reorder params according to group idx
                 params[:] = new_param_order
-                self.buffer_length += max_group_size * len(self._zero_size)
+                self.buffer_length += max_group_size * self._zero_size
             else:
                 if zero_param_level_sharding:
                     _logger.warning(
