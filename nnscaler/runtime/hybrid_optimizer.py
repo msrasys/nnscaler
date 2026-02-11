@@ -17,6 +17,7 @@ from nnscaler.utils import fn_field, OptStateDict
 
 if TYPE_CHECKING:
     from nnscaler.cli.trainer import Trainer
+    from nnscaler.parallel import PARAM_CLASS_TYPE
 
 
 @dataclass
@@ -144,7 +145,7 @@ class HybridOptimizer(torch.optim.Optimizer, TrainHookHost, TrainHook):
     def __init__(
             self,
             params: Iterable[torch.nn.Parameter],
-            param_clss: dict[torch.nn.Parameter, tuple[int, int]],
+            param_clss: dict[torch.nn.Parameter, 'PARAM_CLASS_TYPE'],
             config: Union[HybridOptConfig, dict[str, Any]]
     ):
         """
@@ -152,7 +153,7 @@ class HybridOptimizer(torch.optim.Optimizer, TrainHookHost, TrainHook):
 
         Args:
             params (Iterable[torch.nn.Parameter]): The parameters to optimize.
-            param_clss (dict[torch.nn.Parameter, tuple[int, int]]): The parameter classes for each parameter.
+            param_clss (dict[torch.nn.Parameter, PARAM_CLASS_TYPE]): The parameter classes for each parameter.
             config (Union[HybridOptConfig, dict[str, Any]]): The configuration for the hybrid optimizer.
         """
         params = list(params)
@@ -166,7 +167,7 @@ class HybridOptimizer(torch.optim.Optimizer, TrainHookHost, TrainHook):
         param_loc = {}
 
         for idx, param in enumerate(params):
-            param_cls = param_clss[param]
+            param_cls = param_clss[param][:2]
             assert param_cls[0] < len(self.config.optimizers)
             classified_params[param_cls].append(param)
 

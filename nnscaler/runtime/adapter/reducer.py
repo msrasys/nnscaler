@@ -1,7 +1,7 @@
 #  Copyright (c) Microsoft Corporation.
 #  Licensed under the MIT License.
 
-from typing import List, Dict, Tuple, Any, Callable, Optional, Set, Sequence
+from typing import List, Dict, Tuple, Any, Callable, Optional, Set, Sequence, TYPE_CHECKING
 from functools import partial
 from dataclasses import dataclass
 import math
@@ -14,6 +14,11 @@ from nnscaler.runtime.utils import split_array_min_max, set_fparam_meta
 from nnscaler.profiler.timer import CudaTimer
 from nnscaler.flags import RuntimeFlag
 from nnscaler.utils import unchecked_fields, first
+
+
+if TYPE_CHECKING:
+    from nnscaler.parallel import PARAM_CLASS_TYPE
+
 
 _logger = logging.getLogger(__name__)
 
@@ -200,6 +205,18 @@ class FlattenParamInfo:
         # non-blocking copy may need synchronization
         torch.cuda.synchronize()
         return tensors
+
+
+@dataclass
+class ParamZeroConfig:
+    zero_param_level_sharding: Optional[bool] = None
+
+    def resolve(self, zero_param_level_sharding: bool):
+        return ParamZeroConfig(
+            zero_param_level_sharding=zero_param_level_sharding
+                if self.zero_param_level_sharding is None else self.zero_param_level_sharding
+        )
+
 
 class Bucket:
     def __init__(self, reducer: 'Reducer', params: List[torch.nn.Parameter],
@@ -873,7 +890,7 @@ class Reducer:
                     self._contiguous_params[param_info.param_buffer_start:param_info.param_buffer_end].copy_(param.data.view(-1))
                     param.data = self._contiguous_params[param_info.param_buffer_start:param_info.param_buffer_end].view(param.size())
 
-    def build_buckets(self, param_clss: Optional[dict[torch.nn.Parameter, Any]]=None):
+    def build_buckets(self, param_clss: Optional[dict[torch.nn.Parameter, 'PARAM_CLASS_TYPE']]=None):
         """
         Build buckets the reducer.
 
@@ -882,10 +899,24 @@ class Reducer:
         If the bucket contains more than 2 parameters, than the total size is samller
         than the max_bucket_size_bytes.
         """
-        self._param_clss = {}
+        self._param_clss: dict[torch.nn.Parameter, tuple[int, int, ParamZeroConfig]] = {}
         if param_clss:
+            def _fix_param_cls(x: 'PARAM_CLASS_TYPE'):
+                if len(x) == 3:
+                    if isinstance(x[2], dict):
+                        pzc = ParamZeroConfig(**x[2])
+                    else:
+                        assert isinstance(x[2], ParamZeroConfig)
+                        pzc = x[2]
+
+                    return tuple(x[:2]) + (
+                        pzc.resolve(self._zero_param_level_sharding),
+                    )
+                if len(x) == 2:
+                    return tuple(x) + (ParamZeroConfig(zero_param_level_sharding=self._zero_param_level_sharding),)
+
             # only keep parameters that are in self._params
-            self._param_clss = {p: param_clss[p] for p in self._params}
+            self._param_clss = {p: _fix_param_cls(param_clss[p]) for p in self._params}
             # sort parameters by their class
             # which can help bucket building
             self._params.sort(key=lambda p: self._param_clss[p])
@@ -932,7 +963,7 @@ class Reducer:
         #       (used in pytorch, with a couple percentage improvement)
         bucket_size = self._numel * 8 + 1 if not self._bucket_size else self._bucket_size
 
-        seq_buckets_cls: List[Any] = []
+        seq_buckets_cls: List[Optional[Tuple[int, int, ParamZeroConfig]]] = []
         last_bucket_size = None
         last_bucket_cls = None
 
@@ -963,10 +994,11 @@ class Reducer:
 
         # step 2: build meta data for the offset of each bucket
         # the start of each bucket will be padded to the next multiple of `len(self.ranks)`
-        for params in self.seq_buckets:
+        for params, param_cls in zip(self.seq_buckets, seq_buckets_cls):
             self.starts.append(self.buffer_length)
+            zero_param_level_sharding = param_cls[2].zero_param_level_sharding if param_cls else self._zero_param_level_sharding
             param_sizes = [_aligned_nelement(p.nelement(), p.element_size(), self._align_size) for p in params]
-            if self._zero_param_level_sharding and len(params) >= self._zero_size:
+            if zero_param_level_sharding and len(params) >= self._zero_size:
                 groups, group_idx = split_array_min_max(param_sizes, self._zero_size, keep_order=False)
                 max_group_size = max(sum(sizes) for sizes in groups)
                 new_param_order = []
@@ -985,9 +1017,9 @@ class Reducer:
 
                 # reorder params according to group idx
                 params[:] = new_param_order
-                self.buffer_length += max_group_size * len(self._ranks)
+                self.buffer_length += max_group_size * len(self._zero_size)
             else:
-                if self._zero_param_level_sharding:
+                if zero_param_level_sharding:
                     _logger.warning(
                         f"the number of parameters in the bucket {len(params)} is smaller than "
                         f"the number of ranks in the zero group {self._zero_size}, "

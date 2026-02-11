@@ -41,7 +41,7 @@ from nnscaler.ir.operator import IRBpOperation, IRDataOperation
 from nnscaler.ir.tensor import IRFullTensor
 from nnscaler.ir.unique import IDGenerator
 
-from nnscaler.runtime.adapter.reducer import Bucket, Reducer
+from nnscaler.runtime.adapter.reducer import Bucket, Reducer, ParamZeroConfig
 from nnscaler.runtime.device import DeviceGroup
 from nnscaler.runtime.gnorm import calcuate_gnorm, clip_grads
 from nnscaler.runtime.module import AttrMeta, Zero3AttrMeta, CubeModule, ParallelModule, OriginModuleMetadata, ExtraState, dedup_attrs
@@ -1303,11 +1303,15 @@ class ParallelOptimizer(torch.optim.Optimizer):
 
 OptimizerT = TypeVar('OptimizerT', bound=torch.optim.Optimizer)
 HybridOptimizerT = TypeVar('HybridOptimizer', bound=torch.optim.Optimizer)
+PARAM_CLASS_TYPE = Union[
+    Tuple[int, int],  # (optimizer_index, param_group_index)
+    Tuple[int, int, ParamZeroConfig],  # (optimizer_index, param_group_index, extra_info)
+]
 
 
 def hybrid(
     params: list[torch.nn.Parameter],
-    param_clss: dict[torch.nn.Parameter, tuple[int, int]],
+    param_clss: dict[torch.nn.Parameter, PARAM_CLASS_TYPE],
     **kwargs,
 ) -> HybridOptimizerT:
     """
