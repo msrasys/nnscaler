@@ -1306,6 +1306,7 @@ HybridOptimizerT = TypeVar('HybridOptimizer', bound=torch.optim.Optimizer)
 PARAM_CLASS_TYPE = Union[
     Tuple[int, int],  # (optimizer_index, param_group_index)
     Tuple[int, int, ParamZeroConfig],  # (optimizer_index, param_group_index, extra_info)
+    Tuple[int, int, dict[str, Any]],  # (optimizer_index, param_group_index, extra_info as dict)
 ]
 
 

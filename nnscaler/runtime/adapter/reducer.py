@@ -210,10 +210,12 @@ class FlattenParamInfo:
 class ParamZeroConfig:
     zero_param_level_sharding: Optional[bool] = None
 
-    def resolve(self, zero_param_level_sharding: bool):
+    def resolve(self, zero: int, zero_param_level_sharding: bool):
         return ParamZeroConfig(
-            zero_param_level_sharding=zero_param_level_sharding
-                if self.zero_param_level_sharding is None else self.zero_param_level_sharding
+            zero_param_level_sharding=zero > 0 and (zero_param_level_sharding
+                if self.zero_param_level_sharding is None
+                else self.zero_param_level_sharding
+            )
         )
 
 
@@ -909,7 +911,7 @@ class Reducer:
                         pzc = x[2]
 
                     return tuple(x[:2]) + (
-                        pzc.resolve(self._zero_param_level_sharding),
+                        pzc.resolve(self._zero, self._zero_param_level_sharding),
                     )
                 if len(x) == 2:
                     return tuple(x) + (ParamZeroConfig(zero_param_level_sharding=self._zero_param_level_sharding),)
