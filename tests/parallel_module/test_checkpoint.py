@@ -24,6 +24,7 @@ from nnscaler.parallel import (
     load_merged_state_dict,
     load_merged_state_dict_from_rank,
     trimmed_broadcast_merged_state_dict,
+    gather_full_model_state_dict_from_files,
 )
 from nnscaler.runtime.module import ParallelModule, ExtraState
 from nnscaler.runtime.gnorm import calcuate_gnorm
@@ -628,7 +629,7 @@ def _gather_full_model_state_dict_worker(tmp_path, use_zero):
             use_end2end=True,
             use_zero=use_zero,
         ),
-        gen_savedir=tmp_path
+        gen_savedir=tmp_path,
     )
     model.cuda()
     rank = torch.distributed.get_rank()
@@ -645,3 +646,658 @@ def _gather_full_model_state_dict_worker(tmp_path, use_zero):
 @pytest.mark.parametrize('use_zero', [0, 1, 3])
 def test_gather_full_model_state_dict(tmp_path, use_zero):
     launch_torchrun(4, _gather_full_model_state_dict_worker, tmp_path, use_zero)
+
+
+def _perf_gather_full_model_state_dict_worker(tmp_path, use_zero, warmup_iters, bench_iters):
+    import time
+    from .test_end2end import MLP, dummy_data
+    from nnscaler.parallel import (
+        gather_full_model_state_dict, merge_state_dicts,
+        deduped_state_dict,
+    )
+    from nnscaler.utils import gather_mixed_data, broadcast_mixed_data
+    from nnscaler.runtime.module import ParallelModule
+    from nnscaler.runtime.device import DeviceGroup
+    init_distributed()
+
+    model = MLP()
+    model = parallelize(
+        model,
+        {'data': dummy_data()},
+        pas_policy='tp',
+        compute_config=ComputeConfig(
+            2, 4,
+            use_end2end=True,
+            use_zero=use_zero,
+        ),
+        gen_savedir=tmp_path,
+    )
+    model.cuda()
+
+    rank = torch.distributed.get_rank()
+
+    # Resolve groups (same logic as gather_full_model_state_dict)
+    parallel_modules = [m for m in model.modules() if isinstance(m, ParallelModule)]
+    compute_config = parallel_modules[0].compute_config
+    num_involved_ranks = compute_config.module_dedup_group_size
+    involved_group = DeviceGroup().get_group(list(range(num_involved_ranks)))
+
+    # --- warmup ---
+    for _ in range(warmup_iters):
+        gather_full_model_state_dict(model)
+        torch.distributed.barrier()
+
+    torch.cuda.synchronize()
+    torch.distributed.barrier()
+
+    # --- per-phase benchmark ---
+    phase_times = {
+        'deduped_state_dict': [],
+        'gather_mixed_data': [],
+        'merge_state_dicts': [],
+        'broadcast_mixed_data': [],
+        'barrier_final': [],
+        'total': [],
+    }
+    full_state_dict = None
+
+    for _ in range(bench_iters):
+        torch.cuda.synchronize()
+        torch.distributed.barrier()
+
+        t_total_start = time.perf_counter()
+
+        # Phase 1: deduped_state_dict
+        t0 = time.perf_counter()
+        if rank < num_involved_ranks:
+            local_state_dict, _ = deduped_state_dict(model, optimizer=None)
+        t1 = time.perf_counter()
+        phase_times['deduped_state_dict'].append(t1 - t0)
+
+        # Phase 2: gather_mixed_data
+        t0 = time.perf_counter()
+        if rank < num_involved_ranks:
+            state_dicts = gather_mixed_data(local_state_dict, src_rank=0, group=involved_group, device='cpu')
+        t1 = time.perf_counter()
+        phase_times['gather_mixed_data'].append(t1 - t0)
+
+        # Phase 3: merge_state_dicts (rank 0 only)
+        t0 = time.perf_counter()
+        if rank < num_involved_ranks and rank == 0:
+            merge_state_dict = merge_state_dicts(state_dicts)
+        else:
+            merge_state_dict = None
+        t1 = time.perf_counter()
+        phase_times['merge_state_dicts'].append(t1 - t0)
+
+        # Phase 4: broadcast_mixed_data
+        t0 = time.perf_counter()
+        full_state_dict = broadcast_mixed_data(merge_state_dict, src_rank=0, device='cpu')
+        t1 = time.perf_counter()
+        phase_times['broadcast_mixed_data'].append(t1 - t0)
+
+        # Phase 5: final barrier
+        t0 = time.perf_counter()
+        torch.distributed.barrier()
+        t1 = time.perf_counter()
+        phase_times['barrier_final'].append(t1 - t0)
+
+        t_total_end = time.perf_counter()
+        phase_times['total'].append(t_total_end - t_total_start)
+
+    # --- compute full_state_dict size ---
+    full_state_dict_bytes = 0
+    full_state_dict_num_keys = 0
+    # merge_state_dicts returns (model_dict, optimizer_dict), so full_state_dict is a tuple
+    model_state_dict_result = full_state_dict[0] if isinstance(full_state_dict, tuple) else full_state_dict
+    if model_state_dict_result is not None:
+        full_state_dict_num_keys = len(model_state_dict_result)
+        for v in model_state_dict_result.values():
+            if isinstance(v, torch.Tensor):
+                full_state_dict_bytes += v.nelement() * v.element_size()
+
+    # --- file-based merge_state_dicts baseline (rank 0 only) ---
+    torch.save(model.state_dict(), tmp_path / f'{rank}.pt')
+    torch.distributed.barrier()
+
+    file_merge_times = []
+    if rank == 0:
+        all_state_dicts = [
+            torch.load(tmp_path / f'{i}.pt', weights_only=False)
+            for i in range(torch.distributed.get_world_size())
+        ]
+        for _ in range(warmup_iters):
+            merge_state_dicts(all_state_dicts)
+        for _ in range(bench_iters):
+            t0 = time.perf_counter()
+            merge_state_dicts(all_state_dicts)
+            t1 = time.perf_counter()
+            file_merge_times.append(t1 - t0)
+
+    torch.distributed.barrier()
+
+    # Build per-phase stats
+    phase_stats = {}
+    for phase, times in phase_times.items():
+        phase_stats[phase] = {
+            'mean': float(np.mean(times)),
+            'std': float(np.std(times)),
+            'min': float(np.min(times)),
+            'max': float(np.max(times)),
+            'times': times,
+        }
+
+    return {
+        'rank': rank,
+        'use_zero': use_zero,
+        'full_state_dict_bytes': full_state_dict_bytes,
+        'full_state_dict_num_keys': full_state_dict_num_keys,
+        'phase_stats': phase_stats,
+        'file_merge_times': file_merge_times,
+        'file_merge_mean': float(np.mean(file_merge_times)) if file_merge_times else None,
+    }
+
+
+@pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.device_count() < 4, reason='lack of gpu devices')
+@pytest.mark.parametrize('use_zero', [0, 1, 3])
+def test_perf_gather_full_model_state_dict(tmp_path, use_zero):
+    """Performance test for gather_full_model_state_dict with per-phase breakdown."""
+    warmup_iters = 2
+    bench_iters = 5
+    results = launch_torchrun(
+        4, _perf_gather_full_model_state_dict_worker,
+        tmp_path, use_zero, warmup_iters, bench_iters,
+    )
+
+    # Print full_state_dict size from rank 0
+    rank0_res = results[0]
+    size_bytes = rank0_res['full_state_dict_bytes']
+    num_keys = rank0_res['full_state_dict_num_keys']
+    if size_bytes >= 1 << 20:
+        size_str = f"{size_bytes / (1 << 20):.2f} MB"
+    elif size_bytes >= 1 << 10:
+        size_str = f"{size_bytes / (1 << 10):.2f} KB"
+    else:
+        size_str = f"{size_bytes} B"
+    print(f"\n[use_zero={use_zero}] full_state_dict: {num_keys} keys, {size_str} ({size_bytes} bytes)")
+
+    # Print per-phase breakdown for each rank
+    phase_order = ['deduped_state_dict', 'gather_mixed_data', 'merge_state_dicts', 'broadcast_mixed_data', 'barrier_final', 'total']
+    for rank in sorted(results.keys()):
+        res = results[rank]
+        print(f"\n[use_zero={use_zero}] rank {rank} phase breakdown (mean over {bench_iters} iters):")
+        total_mean = res['phase_stats']['total']['mean']
+        for phase in phase_order:
+            s = res['phase_stats'][phase]
+            pct = (s['mean'] / total_mean * 100) if total_mean > 0 else 0
+            print(f"  {phase:30s}  mean={s['mean']:.6f}s  std={s['std']:.6f}s  "
+                  f"min={s['min']:.6f}s  max={s['max']:.6f}s  ({pct:5.1f}%)")
+        if res['file_merge_mean'] is not None:
+            print(f"  {'file-based merge (baseline)':30s}  mean={res['file_merge_mean']:.6f}s")
+
+    # Sanity: all total times should be positive and finite
+    for res in results.values():
+        for t in res['phase_stats']['total']['times']:
+            assert t > 0 and np.isfinite(t)
+
+
+def _perf_gather_roundrobin_worker(tmp_path, use_zero, warmup_iters, bench_iters):
+    """Worker that benchmarks gather_full_model_state_dict_roundrobin end-to-end."""
+    import time
+    from .test_end2end import MLP, dummy_data
+    from nnscaler.parallel import (
+        gather_full_model_state_dict,
+        gather_full_model_state_dict_roundrobin,
+    )
+    init_distributed()
+
+    model = MLP()
+    model = parallelize(
+        model,
+        {'data': dummy_data()},
+        pas_policy='tp',
+        compute_config=ComputeConfig(
+            2, 4,
+            use_end2end=True,
+            use_zero=use_zero,
+        ),
+        gen_savedir=tmp_path,
+    )
+    model.cuda()
+
+    rank = torch.distributed.get_rank()
+
+    # --- warmup both variants ---
+    for _ in range(warmup_iters):
+        gather_full_model_state_dict(model)
+        torch.distributed.barrier()
+    for _ in range(warmup_iters):
+        gather_full_model_state_dict_roundrobin(model)
+        torch.distributed.barrier()
+
+    torch.cuda.synchronize()
+    torch.distributed.barrier()
+
+    # --- benchmark original ---
+    orig_times = []
+    for _ in range(bench_iters):
+        torch.cuda.synchronize()
+        torch.distributed.barrier()
+        t0 = time.perf_counter()
+        orig_result = gather_full_model_state_dict(model)
+        torch.distributed.barrier()
+        t1 = time.perf_counter()
+        orig_times.append(t1 - t0)
+
+    # --- benchmark roundrobin ---
+    rr_times = []
+    for _ in range(bench_iters):
+        torch.cuda.synchronize()
+        torch.distributed.barrier()
+        t0 = time.perf_counter()
+        rr_result = gather_full_model_state_dict_roundrobin(model)
+        torch.distributed.barrier()
+        t1 = time.perf_counter()
+        rr_times.append(t1 - t0)
+
+    # --- correctness check ---
+    orig_model_dict = orig_result[0] if isinstance(orig_result, tuple) else orig_result
+    rr_model_dict = rr_result[0] if isinstance(rr_result, tuple) else rr_result
+
+    keys_match = set(orig_model_dict.keys()) == set(rr_model_dict.keys())
+    values_match = True
+    if keys_match:
+        for k in orig_model_dict:
+            if isinstance(orig_model_dict[k], torch.Tensor) and isinstance(rr_model_dict[k], torch.Tensor):
+                if not torch.equal(orig_model_dict[k].cpu(), rr_model_dict[k].cpu()):
+                    values_match = False
+                    break
+
+    return {
+        'rank': rank,
+        'orig_times': orig_times,
+        'orig_mean': float(np.mean(orig_times)),
+        'rr_times': rr_times,
+        'rr_mean': float(np.mean(rr_times)),
+        'keys_match': keys_match,
+        'values_match': values_match,
+        'num_keys': len(orig_model_dict),
+    }
+
+
+@pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.device_count() < 4, reason='lack of gpu devices')
+@pytest.mark.parametrize('use_zero', [0, 1, 3])
+def test_perf_gather_roundrobin(tmp_path, use_zero):
+    """Benchmark gather_full_model_state_dict_roundrobin vs original."""
+    warmup_iters = 2
+    bench_iters = 5
+    results = launch_torchrun(
+        4, _perf_gather_roundrobin_worker,
+        tmp_path, use_zero, warmup_iters, bench_iters,
+    )
+
+    print(f"\n[use_zero={use_zero}] gather_full_model_state_dict: original vs round-robin")
+    for rank in sorted(results.keys()):
+        res = results[rank]
+        speedup = res['orig_mean'] / res['rr_mean'] if res['rr_mean'] > 0 else float('inf')
+        print(f"  rank {rank}: orig={res['orig_mean']:.6f}s  rr={res['rr_mean']:.6f}s  "
+              f"speedup={speedup:.2f}x  keys_match={res['keys_match']}  values_match={res['values_match']}")
+
+    # Assert correctness on all ranks
+    for rank, res in results.items():
+        assert res['keys_match'], f"Rank {rank}: key mismatch between original and round-robin"
+        assert res['values_match'], f"Rank {rank}: value mismatch between original and round-robin"
+
+
+# ---------------------------------------------------------------------------
+# gather_full_model_state_dict_from_files tests
+# ---------------------------------------------------------------------------
+
+def _gather_from_files_worker(tmp_path, use_zero):
+    """
+    Worker: parallelise a small MLP, save per-rank deduped state dicts to
+    files, then call gather_full_model_state_dict_from_files and verify the
+    result matches a live gather_full_model_state_dict.
+    """
+    import os
+    from .test_end2end import MLP, dummy_data
+    from nnscaler.parallel import (
+        gather_full_model_state_dict,
+        deduped_state_dict,
+    )
+    init_distributed()
+
+    model = MLP()
+    model = parallelize(
+        model,
+        {'data': dummy_data()},
+        pas_policy='tp',
+        compute_config=ComputeConfig(
+            2, 4,
+            use_end2end=True,
+            use_zero=use_zero,
+        ),
+        gen_savedir=tmp_path,
+    )
+    model.cuda()
+
+    rank = torch.distributed.get_rank()
+
+    # --- Reference: gather from live model ---
+    ref_result = gather_full_model_state_dict(model)
+    ref_dict = ref_result[0] if isinstance(ref_result, tuple) else ref_result
+
+    # --- Save per-rank deduped state dict to files ---
+    ckpt_dir = os.path.join(tmp_path, 'ckpt_files')
+    os.makedirs(ckpt_dir, exist_ok=True)
+    local_sd, _ = deduped_state_dict(model, optimizer=None)
+    torch.save(local_sd, os.path.join(ckpt_dir, f'{rank}.ckpt.model'))
+    torch.distributed.barrier()
+
+    # --- Gather from files ---
+    file_result = gather_full_model_state_dict_from_files(ckpt_dir)
+    file_dict = file_result[0] if isinstance(file_result, tuple) else file_result
+
+    # --- Correctness check ---
+    keys_match = set(ref_dict.keys()) == set(file_dict.keys())
+    values_match = True
+    mismatched_keys = []
+    if keys_match:
+        for k in ref_dict:
+            if isinstance(ref_dict[k], torch.Tensor) and isinstance(file_dict[k], torch.Tensor):
+                if not torch.equal(ref_dict[k].cpu(), file_dict[k].cpu()):
+                    values_match = False
+                    mismatched_keys.append(k)
+            elif not isinstance(ref_dict[k], torch.Tensor) and not isinstance(file_dict[k], torch.Tensor):
+                pass  # skip non-tensor keys (CUBE_EXTRA_STATE etc.)
+    else:
+        ref_only = set(ref_dict.keys()) - set(file_dict.keys())
+        file_only = set(file_dict.keys()) - set(ref_dict.keys())
+        mismatched_keys = list(ref_only | file_only)
+
+    return {
+        'rank': rank,
+        'keys_match': keys_match,
+        'values_match': values_match,
+        'mismatched_keys': mismatched_keys,
+        'num_ref_keys': len(ref_dict),
+        'num_file_keys': len(file_dict),
+    }
+
+
+@pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.device_count() < 4, reason='lack of gpu devices')
+@pytest.mark.parametrize('use_zero', [0, 1, 3])
+def test_gather_from_files(tmp_path, use_zero):
+    """Correctness test: gather_full_model_state_dict_from_files vs live gather."""
+    results = launch_torchrun(4, _gather_from_files_worker, tmp_path, use_zero)
+    for rank in sorted(results.keys()):
+        res = results[rank]
+        print(f"  rank {rank}: keys={res['num_ref_keys']}/{res['num_file_keys']} "
+              f"keys_match={res['keys_match']} values_match={res['values_match']}")
+        if res['mismatched_keys']:
+            print(f"    mismatched: {res['mismatched_keys'][:5]}")
+    for rank, res in results.items():
+        assert res['keys_match'], f"Rank {rank}: key mismatch (ref={res['num_ref_keys']}, file={res['num_file_keys']})"
+        assert res['values_match'], f"Rank {rank}: value mismatch on keys {res['mismatched_keys'][:5]}"
+
+
+# ---------------------------------------------------------------------------
+# Real .ckpt.model file test
+# ---------------------------------------------------------------------------
+
+CKPT_MODEL_DIR = 'tmp/0000-129375'
+
+def _gather_from_ckpt_model_worker(ckpt_dir):
+    """
+    Worker: each rank loads {rank}.ckpt.model from *ckpt_dir*,
+    then gather_full_model_state_dict_from_files merges them.
+    """
+    import time
+    init_distributed()
+
+    rank = torch.distributed.get_rank()
+
+    t0 = time.perf_counter()
+    result = gather_full_model_state_dict_from_files(ckpt_dir)
+    t1 = time.perf_counter()
+
+    model_dict = result[0] if isinstance(result, tuple) else result
+
+    # Compute summary stats
+    num_keys = len(model_dict)
+    num_tensors = sum(1 for v in model_dict.values() if isinstance(v, torch.Tensor))
+    total_bytes = sum(
+        v.nelement() * v.element_size()
+        for v in model_dict.values()
+        if isinstance(v, torch.Tensor)
+    )
+
+    return {
+        'rank': rank,
+        'elapsed': t1 - t0,
+        'num_keys': num_keys,
+        'num_tensors': num_tensors,
+        'total_bytes': total_bytes,
+    }
+
+
+@pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.device_count() < 4, reason='lack of gpu devices')
+def test_gather_from_ckpt_model_files():
+    """
+    Load per-rank .ckpt.model files and gather/merge into a full model state dict.
+
+    Uses tmp/0000-129375/ which contains 512 .ckpt.model files
+    (plan_ngpus=8, runtime_ngpus=512).
+    With 4 GPUs, rank 0 loads the extra files (ranks 4-7) locally.
+    """
+    import os
+    ckpt_dir = os.path.join(os.path.dirname(__file__), '..', '..', CKPT_MODEL_DIR)
+    ckpt_dir = os.path.abspath(ckpt_dir)
+    if not os.path.isdir(ckpt_dir):
+        pytest.skip(f"Checkpoint directory not found: {ckpt_dir}")
+
+    # Check that at least file 0 exists
+    if not os.path.exists(os.path.join(ckpt_dir, '0.ckpt.model')):
+        pytest.skip(f"No 0.ckpt.model in {ckpt_dir}")
+
+    nproc = min(torch.cuda.device_count(), 4)
+    results = launch_torchrun(nproc, _gather_from_ckpt_model_worker, ckpt_dir)
+
+    def _fmt_bytes(b):
+        for unit in ('B', 'KB', 'MB', 'GB', 'TB'):
+            if b < 1024:
+                return f'{b:.2f} {unit}'
+            b /= 1024
+        return f'{b:.2f} PB'
+
+    print(f"\n[test_gather_from_ckpt_model_files] nproc={nproc}")
+    for rank in sorted(results.keys()):
+        res = results[rank]
+        print(f"  rank {rank}: elapsed={res['elapsed']:.2f}s  "
+              f"keys={res['num_keys']}  tensors={res['num_tensors']}  "
+              f"size={_fmt_bytes(res['total_bytes'])}")
+
+    # Basic sanity: all ranks should get the same number of keys
+    all_keys = [results[r]['num_keys'] for r in results]
+    assert len(set(all_keys)) == 1, f"Key count mismatch across ranks: {all_keys}"
+    assert all_keys[0] > 0, "Merged state dict is empty"
+
+
+# ---------------------------------------------------------------------------
+# Profile gather_full_model_state_dict_from_files on real .ckpt.model files
+# ---------------------------------------------------------------------------
+
+def _profile_gather_from_files_worker(ckpt_dir, suffix='.ckpt.model'):
+    """
+    Worker: profile each phase of gather_full_model_state_dict_from_files
+    separately so we can identify bottlenecks.
+
+    Phases:
+      1. load_own_file   – torch.load of rank's own .ckpt.model
+      2. gather           – gather_mixed_data (send local dicts to rank 0)
+      3. load_extra_files – rank 0 loads files for ranks [world_size..num_involved)
+      4. merge            – merge_state_dicts on rank 0
+      5. broadcast        – broadcast_mixed_data from rank 0
+      6. barrier          – final barrier
+    """
+    import time
+    from pathlib import Path
+    from nnscaler.parallel import (
+        merge_state_dicts,
+        _sanitize_extra_state_in_state_dict,
+        ComputeConfig,
+    )
+    from nnscaler.utils import gather_mixed_data, broadcast_mixed_data
+    from nnscaler.runtime.module import ParallelModule, ExtraState
+    from nnscaler.runtime.device import DeviceGroup
+
+    init_distributed()
+
+    ckpt_dir = Path(ckpt_dir)
+    rank = torch.distributed.get_rank()
+    world_size = torch.distributed.get_world_size()
+
+    def _load_ckpt(path):
+        sd = torch.load(path, map_location='cpu', weights_only=False)
+        return _sanitize_extra_state_in_state_dict(sd)
+
+    torch.cuda.synchronize()
+    torch.distributed.barrier()
+
+    # ------ Phase 1: load own file ------
+    t0 = time.perf_counter()
+    ckpt_file = ckpt_dir / f'{rank}{suffix}'
+    local_state_dict = _load_ckpt(ckpt_file)
+    t_load_own = time.perf_counter() - t0
+
+    # Parse metadata
+    extra_state_key = None
+    for k in local_state_dict:
+        if k.split('.')[-1] == ParallelModule.EXTRA_STATE_KEY:
+            extra_state_key = k
+            break
+    extra_state = ExtraState(**local_state_dict[extra_state_key])
+    num_involved_ranks = extra_state.compute_config.module_dedup_group_size
+
+    local_bytes = sum(
+        v.nelement() * v.element_size()
+        for v in local_state_dict.values()
+        if isinstance(v, torch.Tensor)
+    )
+
+    torch.cuda.synchronize()
+    torch.distributed.barrier()
+
+    # ------ Phase 2: gather_mixed_data ------
+    t0 = time.perf_counter()
+    state_dicts = gather_mixed_data(
+        local_state_dict, src_rank=0, group=None, device='cpu',
+    )
+    torch.cuda.synchronize()
+    t_gather = time.perf_counter() - t0
+
+    # ------ Phase 3: load extra files (rank 0 only) ------
+    t0 = time.perf_counter()
+    if rank == 0 and world_size < num_involved_ranks:
+        for i in range(world_size, num_involved_ranks):
+            state_dicts.append(_load_ckpt(ckpt_dir / f'{i}{suffix}'))
+    t_load_extra = time.perf_counter() - t0
+
+    torch.distributed.barrier()
+
+    # ------ Phase 4: merge_state_dicts (rank 0 only) ------
+    t0 = time.perf_counter()
+    if rank == 0:
+        merge_result = merge_state_dicts(state_dicts)
+    else:
+        merge_result = None
+    t_merge = time.perf_counter() - t0
+
+    torch.distributed.barrier()
+
+    # ------ Phase 5: broadcast_mixed_data ------
+    t0 = time.perf_counter()
+    merge_result = broadcast_mixed_data(merge_result, src_rank=0, device='cpu')
+    torch.cuda.synchronize()
+    t_broadcast = time.perf_counter() - t0
+
+    # ------ Phase 6: barrier ------
+    t0 = time.perf_counter()
+    torch.distributed.barrier()
+    t_barrier = time.perf_counter() - t0
+
+    # Summarize result
+    model_dict = merge_result[0] if isinstance(merge_result, tuple) else merge_result
+    merged_bytes = sum(
+        v.nelement() * v.element_size()
+        for v in model_dict.values()
+        if isinstance(v, torch.Tensor)
+    )
+
+    total = t_load_own + t_gather + t_load_extra + t_merge + t_broadcast + t_barrier
+
+    return {
+        'rank': rank,
+        'world_size': world_size,
+        'num_involved_ranks': num_involved_ranks,
+        'local_keys': len(local_state_dict),
+        'local_bytes': local_bytes,
+        'merged_keys': len(model_dict),
+        'merged_bytes': merged_bytes,
+        'phases': {
+            'load_own_file': t_load_own,
+            'gather': t_gather,
+            'load_extra_files': t_load_extra,
+            'merge': t_merge,
+            'broadcast': t_broadcast,
+            'barrier': t_barrier,
+        },
+        'total': total,
+    }
+
+
+@pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.device_count() < 4, reason='lack of gpu devices')
+def test_profile_gather_from_ckpt_model_files():
+    """Profile each phase of gather_full_model_state_dict_from_files on real data."""
+    import os
+    ckpt_dir = os.path.join(os.path.dirname(__file__), '..', '..', CKPT_MODEL_DIR)
+    ckpt_dir = os.path.abspath(ckpt_dir)
+    if not os.path.isdir(ckpt_dir):
+        pytest.skip(f"Checkpoint directory not found: {ckpt_dir}")
+    if not os.path.exists(os.path.join(ckpt_dir, '0.ckpt.model')):
+        pytest.skip(f"No 0.ckpt.model in {ckpt_dir}")
+
+    nproc = min(torch.cuda.device_count(), 4)
+    results = launch_torchrun(nproc, _profile_gather_from_files_worker, ckpt_dir)
+
+    def _fmt(b):
+        for u in ('B', 'KB', 'MB', 'GB', 'TB'):
+            if b < 1024:
+                return f'{b:.2f} {u}'
+            b /= 1024
+        return f'{b:.2f} PB'
+
+    print(f"\n{'='*80}")
+    print(f"Profile: gather_full_model_state_dict_from_files")
+    print(f"  ckpt_dir = {ckpt_dir}")
+    print(f"  nproc = {nproc}")
+    print(f"{'='*80}")
+
+    for rank in sorted(results.keys()):
+        r = results[rank]
+        print(f"\n--- Rank {rank} ---")
+        print(f"  local: {r['local_keys']} keys, {_fmt(r['local_bytes'])}")
+        print(f"  merged: {r['merged_keys']} keys, {_fmt(r['merged_bytes'])}")
+        print(f"  num_involved_ranks: {r['num_involved_ranks']}")
+        print(f"  {'Phase':<20s} {'Time (s)':>10s} {'% Total':>8s}")
+        print(f"  {'-'*40}")
+        for phase, t in r['phases'].items():
+            pct = 100.0 * t / r['total'] if r['total'] > 0 else 0
+            print(f"  {phase:<20s} {t:>10.2f}  {pct:>7.1f}%")
+        print(f"  {'-'*40}")
+        print(f"  {'TOTAL':<20s} {r['total']:>10.2f}")
+
+    # Sanity checks
+    all_keys = [results[r]['merged_keys'] for r in results]
+    assert len(set(all_keys)) == 1, f"Key count mismatch: {all_keys}"
+    assert all_keys[0] > 0
