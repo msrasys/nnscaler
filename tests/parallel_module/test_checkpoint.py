@@ -1301,3 +1301,501 @@ def test_profile_gather_from_ckpt_model_files():
     all_keys = [results[r]['merged_keys'] for r in results]
     assert len(set(all_keys)) == 1, f"Key count mismatch: {all_keys}"
     assert all_keys[0] > 0
+
+
+# ---------------------------------------------------------------------------
+# Profile broadcast_mixed_data internals on real .ckpt.model files
+# ---------------------------------------------------------------------------
+
+def _profile_broadcast_worker(ckpt_dir, suffix='.ckpt.model'):
+    """
+    Worker: load & merge state dicts, then profile broadcast_mixed_data
+    broken down into its internal phases:
+
+      1. extract_tensors     – separate skeleton from tensors
+      2. broadcast_object    – broadcast skeleton + meta tensors
+      3. tensor_h2d          – .cuda() copy on src rank (cumulative)
+      4. tensor_broadcast    – dist.broadcast per tensor (cumulative)
+      5. tensor_d2h          – .to(device) on receivers (cumulative)
+      6. cuda_sync           – final torch.cuda.synchronize()
+      7. refill              – refill_tensors
+
+    Also reports per-tensor size distribution and top-N slowest tensors.
+    """
+    import time
+    from pathlib import Path
+    from collections import defaultdict
+    from nnscaler.parallel import merge_state_dicts, _sanitize_extra_state_in_state_dict
+    from nnscaler.utils import (
+        extract_tensors, refill_tensors, gather_mixed_data,
+    )
+    from nnscaler.runtime.module import ParallelModule, ExtraState
+    from nnscaler.runtime.device import DeviceGroup
+
+    init_distributed()
+
+    ckpt_dir = Path(ckpt_dir)
+    rank = torch.distributed.get_rank()
+    world_size = torch.distributed.get_world_size()
+
+    def _load_ckpt(path):
+        sd = torch.load(path, map_location='cpu', weights_only=False)
+        return _sanitize_extra_state_in_state_dict(sd)
+
+    # --- Prepare data: load, gather, merge (same as real pipeline) ---
+    local_sd = _load_ckpt(ckpt_dir / f'{rank}{suffix}')
+    extra_key = next(k for k in local_sd if k.split('.')[-1] == ParallelModule.EXTRA_STATE_KEY)
+    extra_state = ExtraState(**local_sd[extra_key])
+    num_involved = extra_state.compute_config.module_dedup_group_size
+
+    state_dicts = gather_mixed_data(local_sd, src_rank=0, device='cpu')
+    if rank == 0 and world_size < num_involved:
+        for i in range(world_size, num_involved):
+            state_dicts.append(_load_ckpt(ckpt_dir / f'{i}{suffix}'))
+
+    if rank == 0:
+        merge_result = merge_state_dicts(state_dicts)
+    else:
+        merge_result = None
+
+    torch.distributed.barrier()
+
+    # --- Now profile broadcast_mixed_data internals ---
+    device = torch.device('cpu')
+
+    # Phase 1: extract_tensors
+    torch.cuda.synchronize()
+    t0 = time.perf_counter()
+    if rank == 0:
+        skeleton, tensors = extract_tensors(merge_result)
+        meta_tensors = [t.to('meta') for t in tensors]
+        sent = [(skeleton, meta_tensors)]
+    else:
+        skeleton, tensors, meta_tensors = None, None, None
+        sent = [None]
+    t_extract = time.perf_counter() - t0
+
+    # Phase 2: broadcast_object_list (metadata)
+    torch.cuda.synchronize()
+    torch.distributed.barrier()
+    t0 = time.perf_counter()
+    torch.distributed.broadcast_object_list(sent, src=0)
+    torch.cuda.synchronize()
+    t_bcast_obj = time.perf_counter() - t0
+
+    skeleton, meta_tensors = sent[0]
+    if rank != 0:
+        tensors = [None] * len(meta_tensors)
+
+    n_tensors = len(meta_tensors)
+
+    # Collect per-tensor timings
+    per_tensor_h2d = []      # src only
+    per_tensor_bcast = []    # all ranks
+    per_tensor_d2h = []      # receiver only
+    per_tensor_sizes = []    # bytes
+
+    torch.cuda.synchronize()
+    torch.distributed.barrier()
+    t_loop_start = time.perf_counter()
+
+    for i in range(n_tensors):
+        nbytes = meta_tensors[i].numel() * meta_tensors[i].element_size()
+        per_tensor_sizes.append(nbytes)
+
+        # H2D (src rank)
+        torch.cuda.synchronize()
+        t0 = time.perf_counter()
+        if rank != 0:
+            tensor = torch.empty_like(meta_tensors[i], device='cuda')
+        else:
+            tensor = tensors[i].cuda()
+        torch.cuda.synchronize()
+        t_h2d = time.perf_counter() - t0
+        per_tensor_h2d.append(t_h2d)
+
+        # Broadcast
+        torch.cuda.synchronize()
+        t0 = time.perf_counter()
+        torch.distributed.broadcast(tensor, src=0)
+        torch.cuda.synchronize()
+        t_bc = time.perf_counter() - t0
+        per_tensor_bcast.append(t_bc)
+
+        # D2H / device placement
+        torch.cuda.synchronize()
+        t0 = time.perf_counter()
+        if rank != 0:
+            tensors[i] = tensor.to(device, non_blocking=True)
+        else:
+            if tensor.device == device:
+                tensors[i] = tensor
+            else:
+                tensors[i] = tensors[i].to(device, non_blocking=True)
+        # no sync yet – non_blocking
+        per_tensor_d2h.append(time.perf_counter() - t0)
+
+    # Phase 6: final cuda sync
+    t0 = time.perf_counter()
+    torch.cuda.synchronize()
+    t_cuda_sync = time.perf_counter() - t0
+
+    t_loop_total = time.perf_counter() - t_loop_start
+
+    # Phase 7: refill
+    t0 = time.perf_counter()
+    result = refill_tensors(skeleton, tensors)
+    t_refill = time.perf_counter() - t0
+
+    # --- Aggregate stats ---
+    total_h2d = sum(per_tensor_h2d)
+    total_bcast = sum(per_tensor_bcast)
+    total_d2h = sum(per_tensor_d2h)
+    total_bytes = sum(per_tensor_sizes)
+    grand_total = t_extract + t_bcast_obj + t_loop_total + t_cuda_sync + t_refill
+
+    # Size distribution buckets
+    size_buckets = defaultdict(lambda: {'count': 0, 'bytes': 0, 'h2d': 0.0, 'bcast': 0.0, 'd2h': 0.0})
+    bucket_names = ['<1KB', '1KB-1MB', '1MB-100MB', '100MB-1GB', '>1GB']
+    bucket_bounds = [1024, 1024**2, 100*1024**2, 1024**3, float('inf')]
+    for i in range(n_tensors):
+        sz = per_tensor_sizes[i]
+        for bname, bbound in zip(bucket_names, bucket_bounds):
+            if sz < bbound:
+                b = size_buckets[bname]
+                b['count'] += 1
+                b['bytes'] += sz
+                b['h2d'] += per_tensor_h2d[i]
+                b['bcast'] += per_tensor_bcast[i]
+                b['d2h'] += per_tensor_d2h[i]
+                break
+
+    # Top-10 slowest by (h2d + bcast) time
+    combined = [(per_tensor_h2d[i] + per_tensor_bcast[i], per_tensor_sizes[i],
+                 per_tensor_h2d[i], per_tensor_bcast[i], per_tensor_d2h[i], i)
+                for i in range(n_tensors)]
+    combined.sort(reverse=True)
+    top_slow = combined[:10]
+
+    return {
+        'rank': rank,
+        'n_tensors': n_tensors,
+        'total_bytes': total_bytes,
+        'phases': {
+            'extract_tensors': t_extract,
+            'broadcast_object': t_bcast_obj,
+            'loop_h2d': total_h2d,
+            'loop_broadcast': total_bcast,
+            'loop_d2h': total_d2h,
+            'loop_total': t_loop_total,
+            'cuda_sync': t_cuda_sync,
+            'refill': t_refill,
+        },
+        'grand_total': grand_total,
+        'size_buckets': dict(size_buckets),
+        'top_slow': top_slow,
+    }
+
+
+@pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.device_count() < 4, reason='lack of gpu devices')
+def test_profile_broadcast_mixed_data():
+    """Profile broadcast_mixed_data internals on real checkpoint data."""
+    import os
+    ckpt_dir = os.path.join(os.path.dirname(__file__), '..', '..', CKPT_MODEL_DIR)
+    ckpt_dir = os.path.abspath(ckpt_dir)
+    if not os.path.isdir(ckpt_dir):
+        pytest.skip(f"Checkpoint directory not found: {ckpt_dir}")
+    if not os.path.exists(os.path.join(ckpt_dir, '0.ckpt.model')):
+        pytest.skip(f"No 0.ckpt.model in {ckpt_dir}")
+
+    nproc = min(torch.cuda.device_count(), 4)
+    results = launch_torchrun(nproc, _profile_broadcast_worker, ckpt_dir)
+
+    def _fmt(b):
+        for u in ('B', 'KB', 'MB', 'GB', 'TB'):
+            if b < 1024:
+                return f'{b:.2f} {u}'
+            b /= 1024
+        return f'{b:.2f} PB'
+
+    for rank_id in sorted(results.keys()):
+        r = results[rank_id]
+        print(f"\n{'='*80}")
+        print(f"Rank {rank_id}: broadcast_mixed_data profile")
+        print(f"  {r['n_tensors']} tensors, {_fmt(r['total_bytes'])} total")
+        print(f"{'='*80}")
+        print(f"  {'Phase':<22s} {'Time (s)':>10s} {'%':>7s}")
+        print(f"  {'-'*42}")
+        for phase, t in r['phases'].items():
+            pct = 100.0 * t / r['grand_total'] if r['grand_total'] > 0 else 0
+            print(f"  {phase:<22s} {t:>10.3f}  {pct:>6.1f}%")
+        print(f"  {'-'*42}")
+        print(f"  {'GRAND TOTAL':<22s} {r['grand_total']:>10.3f}")
+
+        # Size distribution
+        print(f"\n  Size distribution:")
+        print(f"  {'Bucket':<14s} {'Count':>6s} {'Bytes':>12s} {'H2D (s)':>10s} {'Bcast (s)':>10s} {'D2H (s)':>10s}")
+        for bname in ['<1KB', '1KB-1MB', '1MB-100MB', '100MB-1GB', '>1GB']:
+            if bname in r['size_buckets']:
+                b = r['size_buckets'][bname]
+                print(f"  {bname:<14s} {b['count']:>6d} {_fmt(b['bytes']):>12s} "
+                      f"{b['h2d']:>10.3f} {b['bcast']:>10.3f} {b['d2h']:>10.3f}")
+
+        # Top-10 slowest tensors
+        print(f"\n  Top-10 slowest tensors (by h2d + bcast):")
+        print(f"  {'Idx':>5s} {'Size':>12s} {'H2D (s)':>10s} {'Bcast (s)':>10s} {'D2H (s)':>10s} {'Total (s)':>10s}")
+        for total_t, sz, h2d, bcast, d2h, idx in r['top_slow']:
+            print(f"  {idx:>5d} {_fmt(sz):>12s} {h2d:>10.4f} {bcast:>10.4f} {d2h:>10.4f} {total_t:>10.4f}")
+
+
+# ---------------------------------------------------------------------------
+# Compare broadcast_mixed_data (NCCL) vs broadcast_mixed_data_gloo (gloo)
+# ---------------------------------------------------------------------------
+
+def _bench_broadcast_gloo_worker(ckpt_dir, suffix='.ckpt.model'):
+    """
+    Worker: prepare real merged state_dict, then run both
+    broadcast_mixed_data (NCCL) and broadcast_mixed_data_gloo (gloo)
+    and report timings.
+    """
+    import time
+    from pathlib import Path
+    from nnscaler.parallel import merge_state_dicts, _sanitize_extra_state_in_state_dict
+    from nnscaler.utils import (
+        broadcast_mixed_data, broadcast_mixed_data_gloo,
+        gather_mixed_data,
+    )
+    from nnscaler.runtime.module import ParallelModule, ExtraState
+
+    init_distributed()
+
+    ckpt_dir = Path(ckpt_dir)
+    rank = torch.distributed.get_rank()
+    world_size = torch.distributed.get_world_size()
+
+    def _load_ckpt(path):
+        sd = torch.load(path, map_location='cpu', weights_only=False)
+        return _sanitize_extra_state_in_state_dict(sd)
+
+    # --- Prepare data: load, gather, merge ---
+    local_sd = _load_ckpt(ckpt_dir / f'{rank}{suffix}')
+    extra_key = next(k for k in local_sd if k.split('.')[-1] == ParallelModule.EXTRA_STATE_KEY)
+    extra_state = ExtraState(**local_sd[extra_key])
+    num_involved = extra_state.compute_config.module_dedup_group_size
+
+    state_dicts = gather_mixed_data(local_sd, src_rank=0, device='cpu')
+    if rank == 0 and world_size < num_involved:
+        for i in range(world_size, num_involved):
+            state_dicts.append(_load_ckpt(ckpt_dir / f'{i}{suffix}'))
+
+    if rank == 0:
+        merge_result = merge_state_dicts(state_dicts)
+    else:
+        merge_result = None
+
+    torch.distributed.barrier()
+
+    # --- Benchmark 1: original NCCL broadcast ---
+    torch.cuda.synchronize()
+    torch.distributed.barrier()
+    t0 = time.perf_counter()
+    result_nccl = broadcast_mixed_data(merge_result, src_rank=0, device='cpu')
+    torch.cuda.synchronize()
+    t_nccl = time.perf_counter() - t0
+
+    # Verify and get stats
+    model_nccl = result_nccl[0] if isinstance(result_nccl, tuple) else result_nccl
+    nccl_keys = len(model_nccl)
+    nccl_bytes = sum(v.nelement() * v.element_size() for v in model_nccl.values() if isinstance(v, torch.Tensor))
+    del result_nccl, model_nccl
+
+    torch.distributed.barrier()
+
+    # --- Benchmark 2: gloo broadcast ---
+    torch.cuda.synchronize()
+    torch.distributed.barrier()
+    t0 = time.perf_counter()
+    result_gloo = broadcast_mixed_data_gloo(merge_result, src_rank=0, device='cpu')
+    t_gloo = time.perf_counter() - t0
+
+    model_gloo = result_gloo[0] if isinstance(result_gloo, tuple) else result_gloo
+    gloo_keys = len(model_gloo)
+    gloo_bytes = sum(v.nelement() * v.element_size() for v in model_gloo.values() if isinstance(v, torch.Tensor))
+    del result_gloo, model_gloo
+
+    speedup = t_nccl / t_gloo if t_gloo > 0 else float('inf')
+
+    return {
+        'rank': rank,
+        't_nccl': t_nccl,
+        't_gloo': t_gloo,
+        'speedup': speedup,
+        'nccl_keys': nccl_keys,
+        'nccl_bytes': nccl_bytes,
+        'gloo_keys': gloo_keys,
+        'gloo_bytes': gloo_bytes,
+    }
+
+
+@pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.device_count() < 4, reason='lack of gpu devices')
+def test_bench_broadcast_gloo():
+    """Benchmark broadcast_mixed_data (NCCL) vs broadcast_mixed_data_gloo."""
+    import os
+    ckpt_dir = os.path.join(os.path.dirname(__file__), '..', '..', CKPT_MODEL_DIR)
+    ckpt_dir = os.path.abspath(ckpt_dir)
+    if not os.path.isdir(ckpt_dir):
+        pytest.skip(f"Checkpoint directory not found: {ckpt_dir}")
+    if not os.path.exists(os.path.join(ckpt_dir, '0.ckpt.model')):
+        pytest.skip(f"No 0.ckpt.model in {ckpt_dir}")
+
+    nproc = min(torch.cuda.device_count(), 4)
+    results = launch_torchrun(nproc, _bench_broadcast_gloo_worker, ckpt_dir)
+
+    def _fmt(b):
+        for u in ('B', 'KB', 'MB', 'GB', 'TB'):
+            if b < 1024:
+                return f'{b:.2f} {u}'
+            b /= 1024
+        return f'{b:.2f} PB'
+
+    print(f"\n{'='*70}")
+    print(f"Benchmark: broadcast_mixed_data (NCCL) vs gloo")
+    print(f"{'='*70}")
+    print(f"  {'Rank':>4s}  {'NCCL (s)':>10s}  {'Gloo (s)':>10s}  {'Speedup':>8s}  {'Keys':>6s}  {'Size':>12s}")
+    print(f"  {'-'*56}")
+    for rank_id in sorted(results.keys()):
+        r = results[rank_id]
+        print(f"  {r['rank']:>4d}  {r['t_nccl']:>10.2f}  {r['t_gloo']:>10.2f}  "
+              f"{r['speedup']:>7.2f}x  {r['gloo_keys']:>6d}  {_fmt(r['gloo_bytes']):>12s}")
+
+    # Correctness: both should produce same number of keys and bytes
+    for rank_id in results:
+        r = results[rank_id]
+        assert r['nccl_keys'] == r['gloo_keys'], f"Rank {rank_id}: key mismatch {r['nccl_keys']} vs {r['gloo_keys']}"
+        assert r['nccl_bytes'] == r['gloo_bytes'], f"Rank {rank_id}: byte mismatch"
+
+
+# ---------------------------------------------------------------------------
+# Compare broadcast_mixed_data (NCCL per-tensor) vs coalesced NCCL
+# ---------------------------------------------------------------------------
+
+def _bench_broadcast_coalesced_worker(ckpt_dir, suffix='.ckpt.model'):
+    """
+    Worker: prepare real merged state_dict, then benchmark
+    broadcast_mixed_data (per-tensor NCCL) vs broadcast_mixed_data_coalesced.
+    """
+    import time
+    from pathlib import Path
+    from nnscaler.parallel import merge_state_dicts, _sanitize_extra_state_in_state_dict
+    from nnscaler.utils import (
+        broadcast_mixed_data, broadcast_mixed_data_coalesced,
+        gather_mixed_data,
+    )
+    from nnscaler.runtime.module import ParallelModule, ExtraState
+
+    init_distributed()
+
+    ckpt_dir = Path(ckpt_dir)
+    rank = torch.distributed.get_rank()
+    world_size = torch.distributed.get_world_size()
+
+    def _load_ckpt(path):
+        sd = torch.load(path, map_location='cpu', weights_only=False)
+        return _sanitize_extra_state_in_state_dict(sd)
+
+    # --- Prepare: load, gather, merge ---
+    local_sd = _load_ckpt(ckpt_dir / f'{rank}{suffix}')
+    extra_key = next(k for k in local_sd if k.split('.')[-1] == ParallelModule.EXTRA_STATE_KEY)
+    extra_state = ExtraState(**local_sd[extra_key])
+    num_involved = extra_state.compute_config.module_dedup_group_size
+
+    state_dicts = gather_mixed_data(local_sd, src_rank=0, device='cpu')
+    if rank == 0 and world_size < num_involved:
+        for i in range(world_size, num_involved):
+            state_dicts.append(_load_ckpt(ckpt_dir / f'{i}{suffix}'))
+
+    if rank == 0:
+        merge_result = merge_state_dicts(state_dicts)
+    else:
+        merge_result = None
+
+    torch.distributed.barrier()
+
+    # --- Benchmark 1: original per-tensor NCCL broadcast ---
+    torch.cuda.synchronize()
+    torch.distributed.barrier()
+    t0 = time.perf_counter()
+    result_orig = broadcast_mixed_data(merge_result, src_rank=0, device='cpu')
+    torch.cuda.synchronize()
+    t_orig = time.perf_counter() - t0
+
+    model_orig = result_orig[0] if isinstance(result_orig, tuple) else result_orig
+    orig_keys = len(model_orig)
+    orig_bytes = sum(v.nelement() * v.element_size() for v in model_orig.values() if isinstance(v, torch.Tensor))
+    del result_orig, model_orig
+
+    torch.distributed.barrier()
+
+    # --- Benchmark 2: coalesced NCCL broadcast ---
+    torch.cuda.synchronize()
+    torch.distributed.barrier()
+    t0 = time.perf_counter()
+    result_coal = broadcast_mixed_data_coalesced(merge_result, src_rank=0, device='cpu')
+    torch.cuda.synchronize()
+    t_coal = time.perf_counter() - t0
+
+    model_coal = result_coal[0] if isinstance(result_coal, tuple) else result_coal
+    coal_keys = len(model_coal)
+    coal_bytes = sum(v.nelement() * v.element_size() for v in model_coal.values() if isinstance(v, torch.Tensor))
+    del result_coal, model_coal
+
+    speedup = t_orig / t_coal if t_coal > 0 else float('inf')
+
+    return {
+        'rank': rank,
+        't_orig': t_orig,
+        't_coalesced': t_coal,
+        'speedup': speedup,
+        'orig_keys': orig_keys,
+        'orig_bytes': orig_bytes,
+        'coal_keys': coal_keys,
+        'coal_bytes': coal_bytes,
+    }
+
+
+@pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.device_count() < 4, reason='lack of gpu devices')
+def test_bench_broadcast_coalesced():
+    """Benchmark per-tensor NCCL vs coalesced NCCL broadcast."""
+    import os
+    ckpt_dir = os.path.join(os.path.dirname(__file__), '..', '..', CKPT_MODEL_DIR)
+    ckpt_dir = os.path.abspath(ckpt_dir)
+    if not os.path.isdir(ckpt_dir):
+        pytest.skip(f"Checkpoint directory not found: {ckpt_dir}")
+    if not os.path.exists(os.path.join(ckpt_dir, '0.ckpt.model')):
+        pytest.skip(f"No 0.ckpt.model in {ckpt_dir}")
+
+    nproc = min(torch.cuda.device_count(), 4)
+    results = launch_torchrun(nproc, _bench_broadcast_coalesced_worker, ckpt_dir)
+
+    def _fmt(b):
+        for u in ('B', 'KB', 'MB', 'GB', 'TB'):
+            if b < 1024:
+                return f'{b:.2f} {u}'
+            b /= 1024
+        return f'{b:.2f} PB'
+
+    print(f"\n{'='*70}")
+    print(f"Benchmark: broadcast_mixed_data (per-tensor) vs coalesced NCCL")
+    print(f"{'='*70}")
+    print(f"  {'Rank':>4s}  {'Original (s)':>12s}  {'Coalesced (s)':>13s}  {'Speedup':>8s}  {'Size':>12s}")
+    print(f"  {'-'*56}")
+    for rank_id in sorted(results.keys()):
+        r = results[rank_id]
+        print(f"  {r['rank']:>4d}  {r['t_orig']:>12.2f}  {r['t_coalesced']:>13.2f}  "
+              f"{r['speedup']:>7.2f}x  {_fmt(r['coal_bytes']):>12s}")
+
+    # Correctness
+    for rank_id in results:
+        r = results[rank_id]
+        assert r['orig_keys'] == r['coal_keys'], f"Rank {rank_id}: key mismatch"
+        assert r['orig_bytes'] == r['coal_bytes'], f"Rank {rank_id}: byte mismatch"
