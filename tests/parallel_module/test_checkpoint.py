@@ -33,6 +33,9 @@ from .common import CubeLinear, init_random, init_distributed, PASMegatron, asse
 from ..launch_torchrun import launch_torchrun, clone_to_cpu_recursively
 from ..utils import replace_all_device_with, clear_dir_on_rank0, PYTEST_RUN_ID
 
+# Number of GPUs used by tests. Change this to match your node (e.g. 8).
+NUM_GPUS = 4
+
 
 class FcRelu(nn.Module):
     def __init__(self, in_features, out_features, bias=True):
@@ -502,14 +505,14 @@ def _gpu_worker(module_type, use_zero, pas, plan_ngpus, runtime_ngpus, per_resum
         return compiled_results
 
 
-@pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.device_count() < 4, reason='lack of gpu devices')
+@pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.device_count() < NUM_GPUS, reason='lack of gpu devices')
 @pytest.mark.parametrize('module_type', ['sub', 'whole', 'start', 'end', 'small', 'pipeline'])
 @pytest.mark.parametrize('use_zero', [True, False])
 def test_checkpoint(module_type, use_zero):
-    plan_ngpus = 2
-    runtime_ngpus = 4
-    cube_results = launch_torchrun(4, _gpu_worker, module_type, use_zero, 'tp', plan_ngpus, runtime_ngpus, 32, 1)
-    rcube_results = launch_torchrun(4, _gpu_worker, module_type, use_zero, 'tp', plan_ngpus, runtime_ngpus, 16, 2)
+    plan_ngpus = NUM_GPUS // 2
+    runtime_ngpus = NUM_GPUS
+    cube_results = launch_torchrun(NUM_GPUS, _gpu_worker, module_type, use_zero, 'tp', plan_ngpus, runtime_ngpus, 32, 1)
+    rcube_results = launch_torchrun(NUM_GPUS, _gpu_worker, module_type, use_zero, 'tp', plan_ngpus, runtime_ngpus, 16, 2)
 
     results0, results1,  results2, results3 = cube_results[0], cube_results[1], cube_results[2], cube_results[3]
     rresults0, rresults1,  rresults2, rresults3 = rcube_results[0], rcube_results[1], rcube_results[2], rcube_results[3]
@@ -594,7 +597,7 @@ def _gpu_merge_worker():
     init_distributed()
     with clear_dir_on_rank0(Path(tempfile.gettempdir()) / f'cube_test_ckpt_merge_{PYTEST_RUN_ID}') as tempdir:
         compiled_module = _create_cube_module('data',
-            ComputeConfig(2, 4, use_zero=True),
+            ComputeConfig(NUM_GPUS // 2, NUM_GPUS, use_zero=True),
             tempdir,
             'whole',
         )
@@ -609,9 +612,9 @@ def _gpu_merge_worker():
         )
 
 
-@pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.device_count() < 4, reason='lack of gpu devices')
+@pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.device_count() < NUM_GPUS, reason='lack of gpu devices')
 def test_checkpoint_merge():
-    launch_torchrun(4, _gpu_merge_worker)
+    launch_torchrun(NUM_GPUS, _gpu_merge_worker)
 
 
 def _gather_full_model_state_dict_worker(tmp_path, use_zero):
@@ -625,7 +628,7 @@ def _gather_full_model_state_dict_worker(tmp_path, use_zero):
         {'data': dummy_data()},
         pas_policy='tp',
         compute_config= ComputeConfig(
-            2, 4,
+            NUM_GPUS // 2, NUM_GPUS,
             use_end2end=True,
             use_zero=use_zero,
         ),
@@ -642,10 +645,10 @@ def _gather_full_model_state_dict_worker(tmp_path, use_zero):
     assert_equal(merged_state_dict, full_state_dict)
 
 
-@pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.device_count() < 4, reason='lack of gpu devices')
+@pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.device_count() < NUM_GPUS, reason='lack of gpu devices')
 @pytest.mark.parametrize('use_zero', [0, 1, 3])
 def test_gather_full_model_state_dict(tmp_path, use_zero):
-    launch_torchrun(4, _gather_full_model_state_dict_worker, tmp_path, use_zero)
+    launch_torchrun(NUM_GPUS, _gather_full_model_state_dict_worker, tmp_path, use_zero)
 
 
 def _perf_gather_full_model_state_dict_worker(tmp_path, use_zero, warmup_iters, bench_iters):
@@ -666,7 +669,7 @@ def _perf_gather_full_model_state_dict_worker(tmp_path, use_zero, warmup_iters, 
         {'data': dummy_data()},
         pas_policy='tp',
         compute_config=ComputeConfig(
-            2, 4,
+            NUM_GPUS // 2, NUM_GPUS,
             use_end2end=True,
             use_zero=use_zero,
         ),
@@ -798,14 +801,14 @@ def _perf_gather_full_model_state_dict_worker(tmp_path, use_zero, warmup_iters, 
     }
 
 
-@pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.device_count() < 4, reason='lack of gpu devices')
+@pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.device_count() < NUM_GPUS, reason='lack of gpu devices')
 @pytest.mark.parametrize('use_zero', [0, 1, 3])
 def test_perf_gather_full_model_state_dict(tmp_path, use_zero):
     """Performance test for gather_full_model_state_dict with per-phase breakdown."""
     warmup_iters = 2
     bench_iters = 5
     results = launch_torchrun(
-        4, _perf_gather_full_model_state_dict_worker,
+        NUM_GPUS, _perf_gather_full_model_state_dict_worker,
         tmp_path, use_zero, warmup_iters, bench_iters,
     )
 
@@ -857,7 +860,7 @@ def _perf_gather_roundrobin_worker(tmp_path, use_zero, warmup_iters, bench_iters
         {'data': dummy_data()},
         pas_policy='tp',
         compute_config=ComputeConfig(
-            2, 4,
+            NUM_GPUS // 2, NUM_GPUS,
             use_end2end=True,
             use_zero=use_zero,
         ),
@@ -925,14 +928,14 @@ def _perf_gather_roundrobin_worker(tmp_path, use_zero, warmup_iters, bench_iters
     }
 
 
-@pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.device_count() < 4, reason='lack of gpu devices')
+@pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.device_count() < NUM_GPUS, reason='lack of gpu devices')
 @pytest.mark.parametrize('use_zero', [0, 1, 3])
 def test_perf_gather_roundrobin(tmp_path, use_zero):
     """Benchmark gather_full_model_state_dict_roundrobin vs original."""
     warmup_iters = 2
     bench_iters = 5
     results = launch_torchrun(
-        4, _perf_gather_roundrobin_worker,
+        NUM_GPUS, _perf_gather_roundrobin_worker,
         tmp_path, use_zero, warmup_iters, bench_iters,
     )
 
@@ -973,7 +976,7 @@ def _gather_from_files_worker(tmp_path, use_zero):
         {'data': dummy_data()},
         pas_policy='tp',
         compute_config=ComputeConfig(
-            2, 4,
+            NUM_GPUS // 2, NUM_GPUS,
             use_end2end=True,
             use_zero=use_zero,
         ),
@@ -1025,11 +1028,11 @@ def _gather_from_files_worker(tmp_path, use_zero):
     }
 
 
-@pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.device_count() < 4, reason='lack of gpu devices')
+@pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.device_count() < NUM_GPUS, reason='lack of gpu devices')
 @pytest.mark.parametrize('use_zero', [0, 1, 3])
 def test_gather_from_files(tmp_path, use_zero):
     """Correctness test: gather_full_model_state_dict_from_files vs live gather."""
-    results = launch_torchrun(4, _gather_from_files_worker, tmp_path, use_zero)
+    results = launch_torchrun(NUM_GPUS, _gather_from_files_worker, tmp_path, use_zero)
     for rank in sorted(results.keys()):
         res = results[rank]
         print(f"  rank {rank}: keys={res['num_ref_keys']}/{res['num_file_keys']} "
@@ -1081,7 +1084,7 @@ def _gather_from_ckpt_model_worker(ckpt_dir):
     }
 
 
-@pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.device_count() < 4, reason='lack of gpu devices')
+@pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.device_count() < NUM_GPUS, reason='lack of gpu devices')
 def test_gather_from_ckpt_model_files():
     """
     Load per-rank .ckpt.model files and gather/merge into a full model state dict.
@@ -1100,7 +1103,7 @@ def test_gather_from_ckpt_model_files():
     if not os.path.exists(os.path.join(ckpt_dir, '0.ckpt.model')):
         pytest.skip(f"No 0.ckpt.model in {ckpt_dir}")
 
-    nproc = min(torch.cuda.device_count(), 4)
+    nproc = min(torch.cuda.device_count(), NUM_GPUS)
     results = launch_torchrun(nproc, _gather_from_ckpt_model_worker, ckpt_dir)
 
     def _fmt_bytes(b):
@@ -1256,7 +1259,7 @@ def _profile_gather_from_files_worker(ckpt_dir, suffix='.ckpt.model'):
     }
 
 
-@pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.device_count() < 4, reason='lack of gpu devices')
+@pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.device_count() < NUM_GPUS, reason='lack of gpu devices')
 def test_profile_gather_from_ckpt_model_files():
     """Profile each phase of gather_full_model_state_dict_from_files on real data."""
     import os
@@ -1267,7 +1270,7 @@ def test_profile_gather_from_ckpt_model_files():
     if not os.path.exists(os.path.join(ckpt_dir, '0.ckpt.model')):
         pytest.skip(f"No 0.ckpt.model in {ckpt_dir}")
 
-    nproc = min(torch.cuda.device_count(), 4)
+    nproc = min(torch.cuda.device_count(), NUM_GPUS)
     results = launch_torchrun(nproc, _profile_gather_from_files_worker, ckpt_dir)
 
     def _fmt(b):
@@ -1497,7 +1500,7 @@ def _profile_broadcast_worker(ckpt_dir, suffix='.ckpt.model'):
     }
 
 
-@pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.device_count() < 4, reason='lack of gpu devices')
+@pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.device_count() < NUM_GPUS, reason='lack of gpu devices')
 def test_profile_broadcast_mixed_data():
     """Profile broadcast_mixed_data internals on real checkpoint data."""
     import os
@@ -1508,7 +1511,7 @@ def test_profile_broadcast_mixed_data():
     if not os.path.exists(os.path.join(ckpt_dir, '0.ckpt.model')):
         pytest.skip(f"No 0.ckpt.model in {ckpt_dir}")
 
-    nproc = min(torch.cuda.device_count(), 4)
+    nproc = min(torch.cuda.device_count(), NUM_GPUS)
     results = launch_torchrun(nproc, _profile_broadcast_worker, ckpt_dir)
 
     def _fmt(b):
@@ -1637,7 +1640,7 @@ def _bench_broadcast_gloo_worker(ckpt_dir, suffix='.ckpt.model'):
     }
 
 
-@pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.device_count() < 4, reason='lack of gpu devices')
+@pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.device_count() < NUM_GPUS, reason='lack of gpu devices')
 def test_bench_broadcast_gloo():
     """Benchmark broadcast_mixed_data (NCCL) vs broadcast_mixed_data_gloo."""
     import os
@@ -1648,7 +1651,7 @@ def test_bench_broadcast_gloo():
     if not os.path.exists(os.path.join(ckpt_dir, '0.ckpt.model')):
         pytest.skip(f"No 0.ckpt.model in {ckpt_dir}")
 
-    nproc = min(torch.cuda.device_count(), 4)
+    nproc = min(torch.cuda.device_count(), NUM_GPUS)
     results = launch_torchrun(nproc, _bench_broadcast_gloo_worker, ckpt_dir)
 
     def _fmt(b):
@@ -1763,7 +1766,7 @@ def _bench_broadcast_coalesced_worker(ckpt_dir, suffix='.ckpt.model'):
     }
 
 
-@pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.device_count() < 4, reason='lack of gpu devices')
+@pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.device_count() < NUM_GPUS, reason='lack of gpu devices')
 def test_bench_broadcast_coalesced():
     """Benchmark per-tensor NCCL vs coalesced NCCL broadcast."""
     import os
@@ -1774,7 +1777,7 @@ def test_bench_broadcast_coalesced():
     if not os.path.exists(os.path.join(ckpt_dir, '0.ckpt.model')):
         pytest.skip(f"No 0.ckpt.model in {ckpt_dir}")
 
-    nproc = min(torch.cuda.device_count(), 4)
+    nproc = min(torch.cuda.device_count(), NUM_GPUS)
     results = launch_torchrun(nproc, _bench_broadcast_coalesced_worker, ckpt_dir)
 
     def _fmt(b):
@@ -1799,3 +1802,624 @@ def test_bench_broadcast_coalesced():
         r = results[rank_id]
         assert r['orig_keys'] == r['coal_keys'], f"Rank {rank_id}: key mismatch"
         assert r['orig_bytes'] == r['coal_bytes'], f"Rank {rank_id}: byte mismatch"
+
+
+# ---------------------------------------------------------------------------
+# Profile broadcast_mixed_data without H2D / D2H copies
+# ---------------------------------------------------------------------------
+
+def _profile_broadcast_no_copy_worker(ckpt_dir, suffix='.ckpt.model'):
+    """
+    Worker: profile broadcast_mixed_data using three strategies:
+
+      A) Original (baseline) — H2D → NCCL broadcast → D2H
+      B) GPU-resident         — H2D → NCCL broadcast → keep on GPU (no D2H)
+      C) CPU-only (Gloo)      — per-tensor gloo broadcast on CPU (no H2D, no D2H)
+
+    Strategies B and C avoid the costly D2H copy that dominates the original
+    broadcast (~59 % of wall time).
+    """
+    import time, gc
+    from pathlib import Path
+    from nnscaler.parallel import merge_state_dicts, _sanitize_extra_state_in_state_dict
+    from nnscaler.utils import (
+        extract_tensors, refill_tensors, gather_mixed_data,
+        _get_gloo_group,
+    )
+    from nnscaler.runtime.module import ParallelModule, ExtraState
+
+    init_distributed()
+
+    ckpt_dir = Path(ckpt_dir)
+    rank = torch.distributed.get_rank()
+    world_size = torch.distributed.get_world_size()
+
+    def _load_ckpt(path):
+        sd = torch.load(path, map_location='cpu', weights_only=False)
+        return _sanitize_extra_state_in_state_dict(sd)
+
+    # --- Prepare data: load, gather, merge ---
+    local_sd = _load_ckpt(ckpt_dir / f'{rank}{suffix}')
+    extra_key = next(k for k in local_sd if k.split('.')[-1] == ParallelModule.EXTRA_STATE_KEY)
+    extra_state = ExtraState(**local_sd[extra_key])
+    num_involved = extra_state.compute_config.module_dedup_group_size
+
+    state_dicts = gather_mixed_data(local_sd, src_rank=0, device='cpu')
+    del local_sd
+    if rank == 0 and world_size < num_involved:
+        for i in range(world_size, num_involved):
+            state_dicts.append(_load_ckpt(ckpt_dir / f'{i}{suffix}'))
+
+    if rank == 0:
+        merge_result = merge_state_dicts(state_dicts)
+    else:
+        merge_result = None
+    del state_dicts
+    gc.collect()
+    torch.distributed.barrier()
+
+    # =================================================================
+    # Helper: extract + broadcast_object (shared by strategy A & B)
+    # =================================================================
+    def _prepare(data):
+        """Extract tensors, broadcast skeleton, return (skeleton, tensors, meta_tensors, n)."""
+        if rank == 0:
+            skel, tens = extract_tensors(data)
+            metas = [t.to('meta') for t in tens]
+            sent = [(skel, metas)]
+        else:
+            skel, tens, metas = None, None, None
+            sent = [None]
+        torch.distributed.broadcast_object_list(sent, src=0)
+        skel, metas = sent[0]
+        if rank != 0:
+            tens = [None] * len(metas)
+        return skel, tens, metas, len(metas)
+
+    # =================================================================
+    # Strategy A: Original — H2D → NCCL → D2H
+    # =================================================================
+    torch.cuda.synchronize()
+    torch.distributed.barrier()
+
+    t0 = time.perf_counter()
+    skel_a, tens_a, metas_a, n = _prepare(merge_result)
+
+    phase_a = {'h2d': 0.0, 'broadcast': 0.0, 'd2h': 0.0}
+    for i in range(n):
+        # H2D
+        torch.cuda.synchronize()
+        ta = time.perf_counter()
+        if rank == 0:
+            tensor = tens_a[i].cuda()
+        else:
+            tensor = torch.empty_like(metas_a[i], device='cuda')
+        torch.cuda.synchronize()
+        phase_a['h2d'] += time.perf_counter() - ta
+
+        # broadcast
+        torch.cuda.synchronize()
+        ta = time.perf_counter()
+        torch.distributed.broadcast(tensor, src=0)
+        torch.cuda.synchronize()
+        phase_a['broadcast'] += time.perf_counter() - ta
+
+        # D2H
+        torch.cuda.synchronize()
+        ta = time.perf_counter()
+        tens_a[i] = tensor.to('cpu', non_blocking=True)
+        phase_a['d2h'] += time.perf_counter() - ta
+
+    torch.cuda.synchronize()
+    result_a = refill_tensors(skel_a, tens_a)
+    t_a = time.perf_counter() - t0
+
+    model_a = result_a[0] if isinstance(result_a, tuple) else result_a
+    a_keys = len(model_a)
+    a_bytes = sum(v.nelement() * v.element_size() for v in model_a.values() if isinstance(v, torch.Tensor))
+    del result_a, model_a, skel_a, tens_a, metas_a
+    torch.cuda.empty_cache()
+    gc.collect()
+    torch.distributed.barrier()
+
+    # =================================================================
+    # Strategy B: GPU-resident — H2D → NCCL only (no D2H)
+    #   Model is too large for a single GPU, so we discard each tensor
+    #   right after broadcast to avoid OOM.  This purely measures the
+    #   H2D + NCCL broadcast cost without any D2H overhead.
+    # =================================================================
+    torch.cuda.synchronize()
+    torch.distributed.barrier()
+
+    t0 = time.perf_counter()
+    skel_b, tens_b, metas_b, n = _prepare(merge_result)
+
+    phase_b = {'h2d': 0.0, 'broadcast': 0.0}
+    for i in range(n):
+        # H2D
+        torch.cuda.synchronize()
+        ta = time.perf_counter()
+        if rank == 0:
+            tensor = tens_b[i].cuda()
+        else:
+            tensor = torch.empty_like(metas_b[i], device='cuda')
+        torch.cuda.synchronize()
+        phase_b['h2d'] += time.perf_counter() - ta
+
+        # broadcast
+        torch.cuda.synchronize()
+        ta = time.perf_counter()
+        torch.distributed.broadcast(tensor, src=0)
+        torch.cuda.synchronize()
+        phase_b['broadcast'] += time.perf_counter() - ta
+
+        # discard GPU tensor immediately to avoid OOM
+        del tensor
+
+    torch.cuda.synchronize()
+    t_b = time.perf_counter() - t0
+
+    b_keys = a_keys   # same model
+    b_bytes = a_bytes
+    del skel_b, tens_b, metas_b
+    torch.cuda.empty_cache()
+    gc.collect()
+    torch.distributed.barrier()
+
+    # =================================================================
+    # Strategy C: CPU-only Gloo per-tensor — no GPU at all
+    # =================================================================
+    gloo_grp = _get_gloo_group()
+
+    torch.cuda.synchronize()
+    torch.distributed.barrier()
+
+    t0 = time.perf_counter()
+    skel_c, tens_c, metas_c, n = _prepare(merge_result)
+
+    phase_c = {'broadcast': 0.0}
+    for i in range(n):
+        ta = time.perf_counter()
+        if rank == 0:
+            tensor = tens_c[i].contiguous()
+        else:
+            tensor = torch.empty(metas_c[i].shape, dtype=metas_c[i].dtype, device='cpu')
+        torch.distributed.broadcast(tensor, src=0, group=gloo_grp)
+        phase_c['broadcast'] += time.perf_counter() - ta
+        tens_c[i] = tensor
+
+    result_c = refill_tensors(skel_c, tens_c)
+    t_c = time.perf_counter() - t0
+
+    model_c = result_c[0] if isinstance(result_c, tuple) else result_c
+    c_keys = len(model_c)
+    c_bytes = sum(v.nelement() * v.element_size() for v in model_c.values() if isinstance(v, torch.Tensor))
+    del result_c, model_c, skel_c, tens_c, metas_c
+    gc.collect()
+    torch.distributed.barrier()
+
+    total_bytes = a_bytes  # same across all strategies
+
+    return {
+        'rank': rank,
+        'n_tensors': n,
+        'total_bytes': total_bytes,
+        # Strategy A (original)
+        't_a': t_a,
+        'phase_a': phase_a,
+        'a_keys': a_keys,
+        'a_bytes': a_bytes,
+        # Strategy B (GPU-resident)
+        't_b': t_b,
+        'phase_b': phase_b,
+        'b_keys': b_keys,
+        'b_bytes': b_bytes,
+        # Strategy C (CPU gloo)
+        't_c': t_c,
+        'phase_c': phase_c,
+        'c_keys': c_keys,
+        'c_bytes': c_bytes,
+    }
+
+
+@pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.device_count() < NUM_GPUS, reason='lack of gpu devices')
+def test_profile_broadcast_no_copy():
+    """
+    Profile broadcast_mixed_data with three strategies:
+      A) Original (H2D → NCCL → D2H)
+      B) GPU-resident (H2D → NCCL, keep on GPU)
+      C) CPU-only (Gloo per-tensor broadcast, no GPU)
+    """
+    import os
+    ckpt_dir = os.path.join(os.path.dirname(__file__), '..', '..', CKPT_MODEL_DIR)
+    ckpt_dir = os.path.abspath(ckpt_dir)
+    if not os.path.isdir(ckpt_dir):
+        pytest.skip(f"Checkpoint directory not found: {ckpt_dir}")
+    if not os.path.exists(os.path.join(ckpt_dir, '0.ckpt.model')):
+        pytest.skip(f"No 0.ckpt.model in {ckpt_dir}")
+
+    nproc = min(torch.cuda.device_count(), NUM_GPUS)
+    results = launch_torchrun(nproc, _profile_broadcast_no_copy_worker, ckpt_dir)
+
+    def _fmt(b):
+        for u in ('B', 'KB', 'MB', 'GB', 'TB'):
+            if b < 1024:
+                return f'{b:.2f} {u}'
+            b /= 1024
+        return f'{b:.2f} PB'
+
+    print(f"\n{'='*78}")
+    print(f"Profile: broadcast without H2D / D2H copies")
+    print(f"{'='*78}")
+
+    for rank_id in sorted(results.keys()):
+        r = results[rank_id]
+        print(f"\n--- Rank {rank_id} ({r['n_tensors']} tensors, {_fmt(r['total_bytes'])}) ---")
+        print()
+
+        # Strategy A
+        print(f"  [A] Original (H2D -> NCCL -> D2H): {r['t_a']:.2f}s")
+        for p, t in r['phase_a'].items():
+            print(f"      {p:<12s} {t:>8.2f}s")
+
+        # Strategy B
+        speedup_b = r['t_a'] / r['t_b'] if r['t_b'] > 0 else float('inf')
+        print(f"  [B] NCCL only (no D2H, discard):  {r['t_b']:.2f}s  ({speedup_b:.2f}x vs A)")
+        for p, t in r['phase_b'].items():
+            print(f"      {p:<12s} {t:>8.2f}s")
+
+        # Strategy C
+        speedup_c = r['t_a'] / r['t_c'] if r['t_c'] > 0 else float('inf')
+        print(f"  [C] CPU gloo (no GPU at all):     {r['t_c']:.2f}s  ({speedup_c:.2f}x vs A)")
+        for p, t in r['phase_c'].items():
+            print(f"      {p:<12s} {t:>8.2f}s")
+
+    print(f"\n{'='*78}")
+    print(f"Summary across all ranks:")
+    print(f"  {'Rank':>4s}  {'A (orig)':>10s}  {'B (no D2H)':>12s}  {'B speedup':>10s}  {'C (Gloo)':>10s}  {'C speedup':>10s}")
+    print(f"  {'-'*64}")
+    for rank_id in sorted(results.keys()):
+        r = results[rank_id]
+        sb = r['t_a'] / r['t_b'] if r['t_b'] > 0 else float('inf')
+        sc = r['t_a'] / r['t_c'] if r['t_c'] > 0 else float('inf')
+        print(f"  {rank_id:>4d}  {r['t_a']:>10.2f}  {r['t_b']:>10.2f}  {sb:>9.2f}x  {r['t_c']:>10.2f}  {sc:>9.2f}x")
+
+    # Correctness: strategies A and C should produce the same number of keys
+    # (B only measures timing, tensors are discarded)
+    for rank_id in results:
+        r = results[rank_id]
+        assert r['a_keys'] == r['c_keys'], \
+            f"Rank {rank_id}: key count mismatch A={r['a_keys']} C={r['c_keys']}"
+        assert r['a_keys'] > 0
+
+
+# ---------------------------------------------------------------------------
+# gather_full_model_state_dict_gpu: correctness test (live model)
+# ---------------------------------------------------------------------------
+
+def _gather_full_model_state_dict_gpu_worker(tmp_path, use_zero):
+    """
+    Worker: compare gather_full_model_state_dict (CPU) vs
+    gather_full_model_state_dict_gpu (GPU-resident).
+    The GPU variant should produce the same keys and values.
+    """
+    from .test_end2end import MLP, dummy_data
+    from nnscaler.parallel import (
+        gather_full_model_state_dict,
+        gather_full_model_state_dict_gpu,
+    )
+    init_distributed()
+
+    model = MLP()
+    model = parallelize(
+        model,
+        {'data': dummy_data()},
+        pas_policy='tp',
+        compute_config=ComputeConfig(
+            NUM_GPUS // 2, NUM_GPUS,
+            use_end2end=True,
+            use_zero=use_zero,
+        ),
+        gen_savedir=tmp_path,
+    )
+    model.cuda()
+
+    rank = torch.distributed.get_rank()
+
+    # --- CPU reference ---
+    ref = gather_full_model_state_dict(model)
+    ref_dict = ref[0] if isinstance(ref, tuple) else ref
+
+    # --- GPU variant ---
+    gpu_result = gather_full_model_state_dict_gpu(model)
+    gpu_dict = gpu_result[0] if isinstance(gpu_result, tuple) else gpu_result
+
+    # --- Correctness ---
+    keys_match = set(ref_dict.keys()) == set(gpu_dict.keys())
+    values_match = True
+    mismatched = []
+    if keys_match:
+        for k in ref_dict:
+            ref_v = ref_dict[k]
+            gpu_v = gpu_dict[k]
+            if isinstance(ref_v, torch.Tensor):
+                # GPU variant tensors should be on CUDA
+                assert gpu_v.is_cuda, f"Rank {rank}: tensor {k} not on CUDA"
+                if not torch.equal(ref_v.to(gpu_v.device), gpu_v):
+                    mismatched.append(k)
+                    values_match = False
+            else:
+                if ref_v != gpu_v:
+                    mismatched.append(k)
+                    values_match = False
+
+    return {
+        'rank': rank,
+        'keys_match': keys_match,
+        'values_match': values_match,
+        'mismatched': mismatched,
+        'num_keys': len(ref_dict),
+    }
+
+
+@pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.device_count() < NUM_GPUS, reason='lack of gpu devices')
+@pytest.mark.parametrize('use_zero', [0, 1, 3])
+def test_gather_full_model_state_dict_gpu(tmp_path, use_zero):
+    """Correctness: gather_full_model_state_dict_gpu vs CPU baseline."""
+    results = launch_torchrun(NUM_GPUS, _gather_full_model_state_dict_gpu_worker, tmp_path, use_zero)
+    for rank in sorted(results.keys()):
+        r = results[rank]
+        print(f"  Rank {rank}: keys_match={r['keys_match']}, values_match={r['values_match']}, "
+              f"num_keys={r['num_keys']}, mismatched={r['mismatched']}")
+    for rank, r in results.items():
+        assert r['keys_match'], f"Rank {rank}: key sets differ"
+        assert r['values_match'], f"Rank {rank}: values differ for {r['mismatched']}"
+
+
+# ---------------------------------------------------------------------------
+# gather_full_model_state_dict_from_files_gpu: correctness test (MLP files)
+# ---------------------------------------------------------------------------
+
+def _gather_from_files_gpu_worker(tmp_path, use_zero):
+    """
+    Worker: save per-rank deduped state dicts to files, then compare
+    gather_full_model_state_dict_from_files (CPU) vs
+    gather_full_model_state_dict_from_files_gpu (GPU-resident).
+    """
+    import os
+    from .test_end2end import MLP, dummy_data
+    from nnscaler.parallel import (
+        gather_full_model_state_dict_from_files,
+        gather_full_model_state_dict_from_files_gpu,
+        deduped_state_dict,
+    )
+    init_distributed()
+
+    model = MLP()
+    model = parallelize(
+        model,
+        {'data': dummy_data()},
+        pas_policy='tp',
+        compute_config=ComputeConfig(
+            NUM_GPUS // 2, NUM_GPUS,
+            use_end2end=True,
+            use_zero=use_zero,
+        ),
+        gen_savedir=tmp_path,
+    )
+    model.cuda()
+
+    rank = torch.distributed.get_rank()
+
+    # Save per-rank checkpoint files
+    ckpt_dir = os.path.join(tmp_path, 'ckpt_gpu_test')
+    os.makedirs(ckpt_dir, exist_ok=True)
+    local_sd, _ = deduped_state_dict(model, optimizer=None)
+    torch.save(local_sd, os.path.join(ckpt_dir, f'{rank}.ckpt.model'))
+    torch.distributed.barrier()
+
+    # CPU reference
+    ref = gather_full_model_state_dict_from_files(ckpt_dir)
+    ref_dict = ref[0] if isinstance(ref, tuple) else ref
+
+    # GPU variant
+    gpu_result = gather_full_model_state_dict_from_files_gpu(ckpt_dir)
+    gpu_dict = gpu_result[0] if isinstance(gpu_result, tuple) else gpu_result
+
+    # Correctness
+    keys_match = set(ref_dict.keys()) == set(gpu_dict.keys())
+    values_match = True
+    mismatched = []
+    if keys_match:
+        for k in ref_dict:
+            ref_v = ref_dict[k]
+            gpu_v = gpu_dict[k]
+            if isinstance(ref_v, torch.Tensor):
+                assert gpu_v.is_cuda, f"Rank {rank}: tensor {k} not on CUDA"
+                if not torch.equal(ref_v.to(gpu_v.device), gpu_v):
+                    mismatched.append(k)
+                    values_match = False
+            else:
+                if ref_v != gpu_v:
+                    mismatched.append(k)
+                    values_match = False
+
+    return {
+        'rank': rank,
+        'keys_match': keys_match,
+        'values_match': values_match,
+        'mismatched': mismatched,
+        'num_ref_keys': len(ref_dict),
+        'num_gpu_keys': len(gpu_dict),
+    }
+
+
+@pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.device_count() < NUM_GPUS, reason='lack of gpu devices')
+@pytest.mark.parametrize('use_zero', [0, 1, 3])
+def test_gather_from_files_gpu(tmp_path, use_zero):
+    """Correctness: gather_full_model_state_dict_from_files_gpu vs CPU baseline."""
+    results = launch_torchrun(NUM_GPUS, _gather_from_files_gpu_worker, tmp_path, use_zero)
+    for rank in sorted(results.keys()):
+        r = results[rank]
+        print(f"  Rank {rank}: keys_match={r['keys_match']}, values_match={r['values_match']}, "
+              f"ref_keys={r['num_ref_keys']}, gpu_keys={r['num_gpu_keys']}")
+    for rank, r in results.items():
+        assert r['keys_match'], f"Rank {rank}: key sets differ"
+        assert r['values_match'], f"Rank {rank}: values differ for {r['mismatched']}"
+
+
+# ---------------------------------------------------------------------------
+# Benchmark: gather_from_files vs gather_from_files_gpu on real .ckpt.model
+# ---------------------------------------------------------------------------
+
+def _bench_gather_gpu_worker(ckpt_dir, suffix='.ckpt.model'):
+    """
+    Worker: benchmark gather_full_model_state_dict_from_files (CPU broadcast)
+    vs gather_full_model_state_dict_from_files_gpu (GPU-resident broadcast)
+    on real checkpoint data.
+
+    If the merged model exceeds GPU capacity, the GPU variant is skipped and
+    reported as OOM.
+    """
+    import time, gc
+    from pathlib import Path
+    from nnscaler.parallel import (
+        gather_full_model_state_dict_from_files,
+        gather_full_model_state_dict_from_files_gpu,
+    )
+
+    init_distributed()
+    rank = torch.distributed.get_rank()
+
+    # --- CPU variant ---
+    torch.cuda.synchronize()
+    torch.distributed.barrier()
+    t0 = time.perf_counter()
+    result_cpu = gather_full_model_state_dict_from_files(ckpt_dir, suffix=suffix)
+    torch.cuda.synchronize()
+    t_cpu = time.perf_counter() - t0
+
+    model_cpu = result_cpu[0] if isinstance(result_cpu, tuple) else result_cpu
+    cpu_keys = len(model_cpu)
+    cpu_bytes = sum(
+        v.nelement() * v.element_size()
+        for v in model_cpu.values() if isinstance(v, torch.Tensor)
+    )
+    del result_cpu, model_cpu
+    gc.collect()
+    torch.distributed.barrier()
+
+    # --- Check if model fits in GPU memory ---
+    gpu_mem = torch.cuda.get_device_properties(torch.cuda.current_device()).total_memory
+    gpu_free = gpu_mem - torch.cuda.memory_allocated()
+    model_fits = cpu_bytes < gpu_free * 0.9  # 90% to leave headroom
+
+    t_gpu = None
+    gpu_keys = None
+    gpu_bytes = None
+    n_cuda = None
+    n_tensors = None
+    gpu_oom = False
+
+    if model_fits:
+        # --- GPU variant ---
+        torch.cuda.synchronize()
+        torch.distributed.barrier()
+        try:
+            t0 = time.perf_counter()
+            result_gpu = gather_full_model_state_dict_from_files_gpu(ckpt_dir, suffix=suffix)
+            torch.cuda.synchronize()
+            t_gpu = time.perf_counter() - t0
+
+            model_gpu = result_gpu[0] if isinstance(result_gpu, tuple) else result_gpu
+            gpu_keys = len(model_gpu)
+            gpu_bytes = sum(
+                v.nelement() * v.element_size()
+                for v in model_gpu.values() if isinstance(v, torch.Tensor)
+            )
+            n_cuda = sum(1 for v in model_gpu.values() if isinstance(v, torch.Tensor) and v.is_cuda)
+            n_tensors = sum(1 for v in model_gpu.values() if isinstance(v, torch.Tensor))
+            del result_gpu, model_gpu
+            torch.cuda.empty_cache()
+        except torch.cuda.OutOfMemoryError:
+            gpu_oom = True
+            torch.cuda.empty_cache()
+    else:
+        gpu_oom = True
+
+    gc.collect()
+    torch.distributed.barrier()
+
+    speedup = (t_cpu / t_gpu) if (t_gpu is not None and t_gpu > 0) else None
+
+    return {
+        'rank': rank,
+        't_cpu': t_cpu,
+        't_gpu': t_gpu,
+        'speedup': speedup,
+        'cpu_keys': cpu_keys,
+        'cpu_bytes': cpu_bytes,
+        'gpu_keys': gpu_keys,
+        'gpu_bytes': gpu_bytes,
+        'n_cuda': n_cuda,
+        'n_tensors': n_tensors,
+        'gpu_oom': gpu_oom,
+        'gpu_free': gpu_free,
+    }
+
+
+@pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.device_count() < NUM_GPUS, reason='lack of gpu devices')
+def test_bench_gather_gpu():
+    """Benchmark: gather_from_files (CPU) vs gather_from_files_gpu (GPU) on real data."""
+    import os
+    ckpt_dir = os.path.join(os.path.dirname(__file__), '..', '..', CKPT_MODEL_DIR)
+    ckpt_dir = os.path.abspath(ckpt_dir)
+    if not os.path.isdir(ckpt_dir):
+        pytest.skip(f"Checkpoint directory not found: {ckpt_dir}")
+    if not os.path.exists(os.path.join(ckpt_dir, '0.ckpt.model')):
+        pytest.skip(f"No 0.ckpt.model in {ckpt_dir}")
+
+    nproc = min(torch.cuda.device_count(), NUM_GPUS)
+    results = launch_torchrun(nproc, _bench_gather_gpu_worker, ckpt_dir)
+
+    def _fmt(b):
+        for u in ('B', 'KB', 'MB', 'GB', 'TB'):
+            if b < 1024:
+                return f'{b:.2f} {u}'
+            b /= 1024
+        return f'{b:.2f} PB'
+
+    print(f"\n{'='*72}")
+    print(f"Benchmark: gather_from_files (CPU) vs gather_from_files_gpu (GPU)")
+    print(f"{'='*72}")
+
+    any_oom = any(results[r]['gpu_oom'] for r in results)
+
+    if any_oom:
+        r0 = results[0]
+        print(f"\n  GPU variant SKIPPED: model ({_fmt(r0['cpu_bytes'])}) exceeds "
+              f"GPU free memory ({_fmt(r0['gpu_free'])})")
+        print(f"\n  CPU-only results:")
+        print(f"  {'Rank':>4s}  {'CPU (s)':>10s}  {'Keys':>6s}  {'Size':>12s}")
+        print(f"  {'-'*36}")
+        for rank_id in sorted(results.keys()):
+            r = results[rank_id]
+            print(f"  {r['rank']:>4d}  {r['t_cpu']:>10.2f}  {r['cpu_keys']:>6d}  "
+                  f"{_fmt(r['cpu_bytes']):>12s}")
+    else:
+        print(f"  {'Rank':>4s}  {'CPU (s)':>10s}  {'GPU (s)':>10s}  {'Speedup':>8s}  "
+              f"{'Keys':>6s}  {'Size':>12s}  {'CUDA tensors':>13s}")
+        print(f"  {'-'*68}")
+        for rank_id in sorted(results.keys()):
+            r = results[rank_id]
+            print(f"  {r['rank']:>4d}  {r['t_cpu']:>10.2f}  {r['t_gpu']:>10.2f}  "
+                  f"{r['speedup']:>7.2f}x  {r['gpu_keys']:>6d}  {_fmt(r['gpu_bytes']):>12s}  "
+                  f"{r['n_cuda']:>5d}/{r['n_tensors']:<5d}")
+
+        # Correctness checks (only when GPU ran)
+        for rank_id in results:
+            r = results[rank_id]
+            assert r['cpu_keys'] == r['gpu_keys'], \
+                f"Rank {rank_id}: key count mismatch CPU={r['cpu_keys']} GPU={r['gpu_keys']}"
+            assert r['n_cuda'] == r['n_tensors'], \
+                f"Rank {rank_id}: not all tensors on CUDA ({r['n_cuda']}/{r['n_tensors']})"
