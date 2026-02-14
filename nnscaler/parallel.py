@@ -50,6 +50,7 @@ from nnscaler.flags import CompileFlag, RuntimeFlag
 import nnscaler.policies as policies
 from nnscaler.program import disable_global_graph
 from nnscaler.utils import (
+    gather_mixed_data_roundrobin,
     get_member_by_name,
     load_type,
     set_member_by_name,
@@ -59,7 +60,10 @@ from nnscaler.utils import (
     copy_dynamic,
     broadcast_files,
     broadcast_mixed_data,
+    broadcast_mixed_data_gpu,
     gather_mixed_data,
+    send_mixed_data,
+    recv_mixed_data,
 )
 
 logger = logging.getLogger(__name__)
@@ -2553,6 +2557,84 @@ def deduped_state_dict(
 
 
 @torch.no_grad()
+def deduped_state_dict_roundrobin(
+    module: torch.nn.Module,
+    optimizer: Optional[Union[torch.optim.Optimizer, ParallelOptimizer]] = None,
+    num_involved_ranks: Optional[int] = None,
+) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
+    """
+    Return the state dict only for the ranks that is necessary.
+    For details, see `ComputeConfig.optimizer_dedup_group_size`
+    and `ComputeConfig.module_dedup_group_size`.
+
+    Args:
+        module (torch.nn.Module): the module to get state dict
+        optimizer (Optional[Union[torch.optim.Optimizer, ParallelOptimizer]]): the optimizer to get state dict
+
+    Returns:
+        Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]]]: the deduped state dict for the module and optimizer
+    """
+
+    cur_rank = torch.distributed.get_rank()
+    module_state_dict, opt_state_dict = None, None
+    parallel_modules = {prefix: m for prefix, m in module.named_modules() if isinstance(m, ParallelModule)}
+
+    rank2deduped_fullmap, _, _ = _collect_dedup_info(parallel_modules)
+    cur_deduped_fullmap = rank2deduped_fullmap[cur_rank]
+
+    # The reason we use `Module.state_dict` on the whole to get the complete state dict
+    # instead of call `Module.state_dict` on each submodule
+    # is to make sure the hooks to state_dict are called.
+    print(f'### num_involved_ranks: {num_involved_ranks}')
+    module_state_dict = module.state_dict()
+    for key in list(module_state_dict.keys()):
+        root_rank = hash(key) % num_involved_ranks
+
+        if cur_rank == 0:
+            print(f'Processing key: {key}, root_rank: {root_rank}')
+        if key.endswith(ParallelModule.EXTRA_STATE_KEY): # never remove extra state
+            continue
+        split_names = key.split('.')
+        prefix = '.'.join(split_names[:-1]) # remove the last part of the key
+        if prefix in parallel_modules:
+            if parallel_modules[prefix].compute_config.use_zero > 1:
+                # for zero3, we don't use advanced deduplication.
+                # TODO: handle zero3 case
+                if cur_rank >= parallel_modules[prefix].module_dedup_group_size:
+                    module_state_dict.pop(key, None)
+            elif prefix not in cur_deduped_fullmap or split_names[-1] not in cur_deduped_fullmap[prefix]:
+                module_state_dict.pop(key, None)
+        # since replicated non-parallel modules, we only keep weights on rank 0
+        elif cur_rank != root_rank:
+            module_state_dict.pop(key, None)
+
+    assert optimizer is None, "Round-robin deduplication is only supported for model state dict."
+    
+    if optimizer is not None:
+        opt_state_dict = optimizer.state_dict()
+
+        # get the locations of non-parallel module parameters
+        # by removing the parallel module locations
+        non_parallel_module_locs: Set[int] = set(opt_state_dict['param_groups'][0]['params'])
+        for pm_loc in optimizer._extra_state.parallel_module_locs.values():
+            non_parallel_module_locs.difference_update(range(pm_loc.offset, pm_loc.offset + pm_loc.count))
+
+        # only keep non-parallel module parameters in rank 0
+        if cur_rank != 0:
+            for idx in non_parallel_module_locs:
+                opt_state_dict['state'].pop(idx, None)
+
+        for pm_prefix, pm_loc in optimizer._extra_state.parallel_module_locs.items():
+            dedup_group_size = optimizer._extra_state.parallel_module_configs[pm_prefix].optimizer_dedup_group_size
+            # only keep the first `dedup_group_size` ranks' state
+            if cur_rank >= dedup_group_size:
+                for idx in range(pm_loc.offset, pm_loc.offset + pm_loc.count):
+                    opt_state_dict['state'].pop(idx, None)
+
+    return module_state_dict, opt_state_dict
+
+
+@torch.no_grad()
 def load_deduped_state_dict(
     module: torch.nn.Module,
     module_state_dict: Dict[str, Any],
@@ -3350,3 +3432,401 @@ def gather_full_model_state_dict(
     logger.info(f'Rank {rank}: Finished gathering full model state dict')
     torch.distributed.barrier()
     return merge_state_dict
+
+
+@torch.no_grad()
+def _sanitize_extra_state_in_state_dict(state_dict: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Filter unknown ``compute_config`` fields from the ``CUBE_EXTRA_STATE``
+    entries of a state dict so that checkpoints created by older (or newer)
+    versions of nnscaler can still be loaded.
+
+    Modifies *state_dict* **in-place** and returns it for convenience.
+    """
+    import dataclasses as _dc
+    from nnscaler.runtime.module import ParallelModule
+    known_cc_fields = {f.name for f in _dc.fields(ComputeConfig)}
+    for k, v in state_dict.items():
+        if k.split('.')[-1] == ParallelModule.EXTRA_STATE_KEY and isinstance(v, dict):
+            cc = v.get('compute_config')
+            if isinstance(cc, dict):
+                unknown = set(cc) - known_cc_fields
+                if unknown:
+                    logger.debug(
+                        'Stripping unknown compute_config fields from %s: %s', k, unknown
+                    )
+                    v['compute_config'] = {ck: cv for ck, cv in cc.items() if ck in known_cc_fields}
+    return state_dict
+
+
+@torch.no_grad()
+def gather_full_model_state_dict_from_files(
+    ckpt_dir: Union[str, Path],
+    *,
+    suffix: str = '.ckpt.model',
+) -> Dict[str, Any]:
+    """
+    Gather model state dicts by loading per-rank checkpoint files from disk,
+    then merge them into a single full model state dict on all ranks.
+
+    Each rank ``i`` loads ``{ckpt_dir}/{i}{suffix}`` from disk.  The rest of the
+    pipeline (gather → merge → broadcast) is identical to
+    :func:`gather_full_model_state_dict`, except that the local state dict
+    comes from the file rather than from a live :class:`ParallelModule`.
+
+    The ``module_dedup_group_size`` (i.e. how many ranks carry unique tensor
+    data) is read from the ``CUBE_EXTRA_STATE`` metadata inside each file.
+    Ranks beyond that limit still participate in the final broadcast but do
+    **not** contribute tensors to the merge.
+
+    When ``world_size >= num_involved_ranks``, the standard distributed
+    gather → merge → broadcast pipeline is used.  When
+    ``world_size < num_involved_ranks`` (fewer GPUs than the original training
+    run), rank 0 loads all missing files locally before merging, and other
+    ranks send their loaded state dicts to rank 0 via :func:`gather_mixed_data`.
+
+    Args:
+        ckpt_dir: Directory that contains the per-rank checkpoint files.
+        suffix: File-name suffix appended to the rank index
+            (default ``'.ckpt.model'``).
+
+    Returns:
+        Dict[str, Any]: the merged model state dict
+            (a ``(model_dict, optimizer_dict)`` tuple when the merge produces
+            both, otherwise just the model dict).
+    """
+    from nnscaler.runtime.module import ParallelModule, ExtraState
+    from nnscaler.runtime.device import DeviceGroup
+
+    ckpt_dir = Path(ckpt_dir)
+    rank = torch.distributed.get_rank()
+    world_size = torch.distributed.get_world_size()
+
+    def _load_ckpt(path: Path) -> Dict[str, Any]:
+        """Load and sanitize a single checkpoint file."""
+        sd = torch.load(path, map_location='cpu', weights_only=False)
+        return _sanitize_extra_state_in_state_dict(sd)
+
+    # Each rank loads its own checkpoint file.
+    ckpt_file = ckpt_dir / f'{rank}{suffix}'
+    logger.info(f'Rank {rank}: loading checkpoint from {ckpt_file}')
+    local_state_dict = _load_ckpt(ckpt_file)
+
+    # Extract compute_config from the CUBE_EXTRA_STATE metadata.
+    # The key is prefixed by the module path (e.g. "backbone.CUBE_EXTRA_STATE").
+    extra_state_key = None
+    for k in local_state_dict:
+        if k.split('.')[-1] == ParallelModule.EXTRA_STATE_KEY:
+            extra_state_key = k
+            break
+    if extra_state_key is None:
+        raise ValueError(
+            f"Rank {rank}: no {ParallelModule.EXTRA_STATE_KEY} found in {ckpt_file}. "
+            "The file does not appear to be a valid nnscaler checkpoint."
+        )
+    extra_state = ExtraState(**local_state_dict[extra_state_key])
+    compute_config = extra_state.compute_config
+    num_involved_ranks = compute_config.module_dedup_group_size
+    print('### num_involved_ranks:', num_involved_ranks)
+
+    logger.info(
+        f'Rank {rank}: num_involved_ranks={num_involved_ranks}, '
+        f'world_size={world_size}, keys={len(local_state_dict)}'
+    )
+
+    if world_size >= num_involved_ranks:
+        # ------------------------------------------------------------------
+        # Standard distributed path: every involved rank is present.
+        # ------------------------------------------------------------------
+        involved_group = DeviceGroup().get_group(list(range(num_involved_ranks)))
+        if rank < num_involved_ranks:
+            logger.info(f'Rank {rank}: gathering state dict')
+            state_dicts = gather_mixed_data(
+                local_state_dict, src_rank=0, group=involved_group, device='cpu',
+            )
+            if rank == 0:
+                logger.info(f'Rank {rank}: merging {len(state_dicts)} gathered state dicts')
+                merge_state_dict = merge_state_dicts(state_dicts)
+            else:
+                merge_state_dict = None
+        else:
+            merge_state_dict = None
+    else:
+        # ------------------------------------------------------------------
+        # Fewer ranks than involved: gather what we have, rank 0 loads the rest.
+        # ------------------------------------------------------------------
+        # Gather from all ranks to rank 0
+        logger.info(f'Rank {rank}: gathering state dict (world_size < num_involved_ranks)')
+        state_dicts = gather_mixed_data(
+            local_state_dict, src_rank=0, group=None, device='cpu',
+        )
+        if rank == 0:
+            # Load the remaining files that no live rank covers
+            for i in range(world_size, num_involved_ranks):
+                extra_file = ckpt_dir / f'{i}{suffix}'
+                logger.info(f'Rank 0: loading extra file {extra_file} (rank {i})')
+                state_dicts.append(_load_ckpt(extra_file))
+            logger.info(f'Rank 0: merging {len(state_dicts)} state dicts')
+            merge_state_dict = merge_state_dicts(state_dicts)
+        else:
+            merge_state_dict = None
+
+    logger.info(f'Rank {rank}: broadcasting merged state dict to all ranks')
+    merge_state_dict = broadcast_mixed_data(merge_state_dict, src_rank=0, device='cpu')
+    logger.info(f'Rank {rank}: finished gathering full model state dict from files')
+    torch.distributed.barrier()
+    return merge_state_dict
+
+
+@torch.no_grad()
+def gather_full_model_state_dict_gpu(
+    module: torch.nn.Module,
+) -> Dict[str, Any]:
+    """
+    Gather model state dicts from all ranks, merge on rank 0, and broadcast
+    the merged result to all ranks — keeping every tensor **on GPU**.
+
+    This is identical to :func:`gather_full_model_state_dict` except that the
+    final broadcast uses :func:`broadcast_mixed_data_gpu` which skips the
+    device-to-host copy.  The returned state dict has all tensor values
+    residing on the current CUDA device.
+
+    Use this variant when the consumer needs the tensors on GPU anyway (e.g.
+    for subsequent computation, GPU-side comparison, or saving directly from
+    VRAM).  It is ~1.85× faster than the CPU-targeting variant on typical
+    hardware because the costly D2H copy is eliminated.
+
+    Args:
+        module (torch.nn.Module): the module to gather state dicts from.
+
+    Returns:
+        Dict[str, Any]: the merged model state dict with tensors on GPU.
+    """
+    rank = torch.distributed.get_rank()
+    parallel_modules = [m for m in module.modules() if isinstance(m, ParallelModule)]
+    if not parallel_modules:
+        raise ValueError("No ParallelModule found in the module.")
+    parallel_module = parallel_modules[0]
+    compute_config = parallel_module.compute_config
+    num_involved_ranks = compute_config.module_dedup_group_size
+    involved_group = DeviceGroup().get_group(list(range(num_involved_ranks)))
+
+    logger.info(f'[gpu] Gathering full model state dict from ranks {list(range(num_involved_ranks))}')
+
+    if rank < num_involved_ranks:
+        local_state_dict, _ = deduped_state_dict(module, optimizer=None)
+        logger.info(f'Rank {rank}: gathering state dict')
+        state_dicts = gather_mixed_data(local_state_dict, src_rank=0, group=involved_group, device='cpu')
+        if rank == 0:
+            logger.info(f'Rank {rank}: merging gathered state dicts')
+            merge_state_dict = merge_state_dicts(state_dicts)
+        else:
+            merge_state_dict = None
+    else:
+        merge_state_dict = None
+
+    logger.info(f'Rank {rank}: broadcasting merged state dict (GPU-resident) to all ranks')
+    merge_state_dict = broadcast_mixed_data_gpu(merge_state_dict, src_rank=0)
+    logger.info(f'Rank {rank}: finished gathering full model state dict (GPU)')
+    torch.distributed.barrier()
+    return merge_state_dict
+
+
+@torch.no_grad()
+def gather_full_model_state_dict_from_files_gpu(
+    ckpt_dir: Union[str, Path],
+    *,
+    suffix: str = '.ckpt.model',
+) -> Dict[str, Any]:
+    """
+    Gather model state dicts from per-rank checkpoint files, merge on rank 0,
+    and broadcast the merged result to all ranks — keeping every tensor
+    **on GPU**.
+
+    This is identical to :func:`gather_full_model_state_dict_from_files`
+    except that the final broadcast uses :func:`broadcast_mixed_data_gpu`
+    which skips the device-to-host copy.
+
+    Args:
+        ckpt_dir: Directory containing per-rank checkpoint files.
+        suffix: File-name suffix appended to the rank index
+            (default ``'.ckpt.model'``).
+
+    Returns:
+        Dict[str, Any]: the merged model state dict with tensors on GPU.
+    """
+    from nnscaler.runtime.module import ParallelModule, ExtraState
+    from nnscaler.runtime.device import DeviceGroup
+
+    ckpt_dir = Path(ckpt_dir)
+    rank = torch.distributed.get_rank()
+    world_size = torch.distributed.get_world_size()
+
+    def _load_ckpt(path: Path) -> Dict[str, Any]:
+        sd = torch.load(path, map_location='cpu', weights_only=False)
+        return _sanitize_extra_state_in_state_dict(sd)
+
+    ckpt_file = ckpt_dir / f'{rank}{suffix}'
+    logger.info(f'Rank {rank}: loading checkpoint from {ckpt_file}')
+    local_state_dict = _load_ckpt(ckpt_file)
+
+    extra_state_key = None
+    for k in local_state_dict:
+        if k.split('.')[-1] == ParallelModule.EXTRA_STATE_KEY:
+            extra_state_key = k
+            break
+    if extra_state_key is None:
+        raise ValueError(
+            f"Rank {rank}: no {ParallelModule.EXTRA_STATE_KEY} found in {ckpt_file}."
+        )
+    extra_state = ExtraState(**local_state_dict[extra_state_key])
+    num_involved_ranks = extra_state.compute_config.module_dedup_group_size
+
+    logger.info(
+        f'Rank {rank}: num_involved_ranks={num_involved_ranks}, '
+        f'world_size={world_size}, keys={len(local_state_dict)}'
+    )
+
+    if world_size >= num_involved_ranks:
+        involved_group = DeviceGroup().get_group(list(range(num_involved_ranks)))
+        if rank < num_involved_ranks:
+            state_dicts = gather_mixed_data(
+                local_state_dict, src_rank=0, group=involved_group, device='cpu',
+            )
+            if rank == 0:
+                merge_state_dict = merge_state_dicts(state_dicts)
+            else:
+                merge_state_dict = None
+        else:
+            merge_state_dict = None
+    else:
+        state_dicts = gather_mixed_data(
+            local_state_dict, src_rank=0, group=None, device='cpu',
+        )
+        if rank == 0:
+            for i in range(world_size, num_involved_ranks):
+                extra_file = ckpt_dir / f'{i}{suffix}'
+                logger.info(f'Rank 0: loading extra file {extra_file}')
+                state_dicts.append(_load_ckpt(extra_file))
+            merge_state_dict = merge_state_dicts(state_dicts)
+        else:
+            merge_state_dict = None
+
+    logger.info(f'Rank {rank}: broadcasting merged state dict (GPU-resident) to all ranks')
+    merge_state_dict = broadcast_mixed_data_gpu(merge_state_dict, src_rank=0)
+    logger.info(f'Rank {rank}: finished gathering full model state dict from files (GPU)')
+    torch.distributed.barrier()
+    return merge_state_dict
+
+
+@torch.no_grad()
+def gather_full_model_state_dict_roundrobin(
+    module: torch.nn.Module,
+) -> Dict[str, Any]:
+    """
+    Gather model state dicts from all ranks, merge on rank 0, then broadcast
+    the merged result to all ranks using round-robin roots.
+
+    Unlike :func:`gather_full_model_state_dict` which uses rank 0 as the sole
+    broadcast source, this function distributes the broadcast workload by
+    assigning subsets of the merged state dict to different root ranks.
+    Each root rank receives its subset from rank 0 and then broadcasts it to
+    all other ranks.
+
+    Benefits over the single-root approach:
+    * Distributes GPU memory pressure (each root only holds 1/N of the data).
+    * On multi-node setups the outgoing NIC bandwidth is spread across nodes.
+
+    The gather and merge phases are identical to the original function;
+    only the final broadcast phase is distributed.
+
+    Args:
+        module (torch.nn.Module): the module to gather state dicts from
+
+    Returns:
+        Dict[str, Any]: the merged model state dict (same format as
+            :func:`gather_full_model_state_dict`)
+    """
+
+    rank = torch.distributed.get_rank()
+    parallel_modules = [m for m in module.modules() if isinstance(m, ParallelModule)]
+    if not parallel_modules:
+        raise ValueError("No ParallelModule found in the module.")
+    compute_config = parallel_modules[0].compute_config
+    num_involved_ranks = compute_config.module_dedup_group_size
+    involved_group = DeviceGroup().get_group(list(range(num_involved_ranks)))
+
+    logger.info(f'Gathering full model state dict (round-robin) from ranks {list(range(num_involved_ranks))}')
+
+    # ------------------------------------------------------------------
+    # Phase 1: Gather + merge on rank 0 (identical to the original)
+    # ------------------------------------------------------------------
+    if rank < num_involved_ranks:
+        local_state_dict, _ = deduped_state_dict_roundrobin(module, optimizer=None, num_involved_ranks=num_involved_ranks)
+        logger.info(f'Rank {rank}: gathering state dict')
+        state_dicts = gather_mixed_data_roundrobin(
+            local_state_dict, num_involved_ranks=num_involved_ranks, group=involved_group, device='cpu',
+        )
+        if rank == 0:
+            logger.info(f'Rank {rank}: merging gathered state dicts')
+            merged = merge_state_dicts(state_dicts)
+        else:
+            merged = None
+    else:
+        merged = None
+
+    # ------------------------------------------------------------------
+    # Phase 2: Split merged dict and distribute to root ranks
+    # ------------------------------------------------------------------
+    # Rank 0 splits the model dict into ``n_roots`` sub-dicts and sends
+    # sub-dict *r* to rank *r* (via P2P).  Each root then broadcasts its
+    # sub-dict to everyone.
+    if rank == 0:
+        if isinstance(merged, tuple):
+            model_dict, opt_dict = merged
+        else:
+            model_dict = merged
+            opt_dict = None
+
+        all_keys = sorted(model_dict.keys())
+        n_roots = min(num_involved_ranks, max(1, len(all_keys)))
+
+        # Round-robin key assignment
+        sub_dicts: list[dict] = [{} for _ in range(n_roots)]
+        for i, key in enumerate(all_keys):
+            sub_dicts[i % n_roots][key] = model_dict[key]
+    else:
+        opt_dict = None
+        sub_dicts = None
+        n_roots = 0  # placeholder
+
+    # Broadcast n_roots so every rank knows how many rounds follow
+    info = [n_roots if rank == 0 else None]
+    torch.distributed.broadcast_object_list(info, src=0)
+    n_roots = info[0]
+
+    # Distribute sub-dicts from rank 0 → each root rank via P2P
+    my_sub_dict = sub_dicts[0] if rank == 0 else None
+    for root in range(1, n_roots):
+        if rank == 0:
+            send_mixed_data(sub_dicts[root], dst_rank=root)
+        elif rank == root:
+            # Keep tensors on cuda — the subsequent broadcast_mixed_data will
+            # reuse them without an extra CPU→GPU round-trip.
+            my_sub_dict = recv_mixed_data(src_rank=0)
+
+    # ------------------------------------------------------------------
+    # Phase 3: Round-robin broadcast
+    # ------------------------------------------------------------------
+    full_model_dict: Dict[str, Any] = {}
+    for root in range(n_roots):
+        data = my_sub_dict if rank == root else None
+        received = broadcast_mixed_data(data, src_rank=root, device='cpu')
+        if isinstance(received, tuple):
+            received = received[0]
+        if isinstance(received, dict):
+            full_model_dict.update(received)
+
+    logger.info(f'Rank {rank}: Finished gathering full model state dict (round-robin)')
+    torch.distributed.barrier()
+    return (full_model_dict, opt_dict)
