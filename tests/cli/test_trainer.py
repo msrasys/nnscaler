@@ -637,6 +637,7 @@ def trainer_correctness_worker(save_dir, parallel_type=0, async_reducer=False, h
     config_path = str(Path(__file__).with_name('trainer_args.yaml').resolve())
     gen_savedir = save_dir / 'gen'
     ckpt_savedir = save_dir / 'ckpt'
+    instance_name = f'pt_parallel_type{parallel_type}_async{async_reducer}_hybrid{hybrid_opt}_usezero{use_zero}_zpls{zero_param_level_sharding}_reducercap{int(reducer_bucket_cap_mb)}'
 
     if parallel_type == 0:
         # parallelize the whole MixedModule
@@ -742,6 +743,7 @@ def trainer_correctness_worker(save_dir, parallel_type=0, async_reducer=False, h
     # train 4 epcho in one time
     trainer = Trainer([
         '-f', config_path,
+        '--instance_name', instance_name,
         '--precision', 'fp32',
         '--max_epochs', '2',
         '--enable_progress_bar', 'false',

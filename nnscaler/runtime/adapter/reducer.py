@@ -1,7 +1,7 @@
 #  Copyright (c) Microsoft Corporation.
 #  Licensed under the MIT License.
 
-from typing import List, Dict, Tuple, Any, Callable, Optional, Set, Sequence, TYPE_CHECKING
+from typing import List, Dict, Tuple, Any, Callable, Optional, Set, Union, TYPE_CHECKING
 from functools import partial
 from dataclasses import dataclass
 import math
@@ -900,21 +900,30 @@ class Reducer:
         If the bucket contains more than 2 parameters, than the total size is samller
         than the max_bucket_size_bytes.
         """
-        self._param_clss: dict[torch.nn.Parameter, tuple[int, int, ParamZeroConfig]] = {}
+        self._param_clss: dict[torch.nn.Parameter, Union[
+            tuple[int, int, ParamZeroConfig],
+            tuple[int, ParamZeroConfig],
+            tuple[ParamZeroConfig],
+        ]] = {}
         if param_clss:
             def _fix_param_cls(x: 'PARAM_CLASS_TYPE'):
-                if len(x) == 3:
-                    if isinstance(x[2], dict):
-                        pzc = ParamZeroConfig(**x[2])
-                    else:
-                        assert isinstance(x[2], ParamZeroConfig)
-                        pzc = x[2]
+                if not isinstance(x, tuple):
+                    x = (x,)
 
-                    return tuple(x[:2]) + (
+                if not all(isinstance(i, int) for i in x[:-1]) or not isinstance(x[-1], (int, dict, ParamZeroConfig)):
+                    raise ValueError(f"Parameter class should be tuple of ints + optional ParamZeroConfig, but got {x}")
+
+                if isinstance(x[-1], (dict, ParamZeroConfig)):
+                    if isinstance(x[-1], dict):
+                        pzc = ParamZeroConfig(**x[-1])
+                    else:
+                        assert isinstance(x[-1], ParamZeroConfig)
+                        pzc = x[-1]
+                    return tuple(x[:-1]) + (
                         pzc.resolve(self._zero, self._zero_param_level_sharding),
                     )
-                if len(x) == 2:
-                    return tuple(x) + (ParamZeroConfig(zero_param_level_sharding=self._zero_param_level_sharding),)
+
+                return tuple(x) + (ParamZeroConfig(zero_param_level_sharding=self._zero_param_level_sharding),)
 
             # only keep parameters that are in self._params
             self._param_clss = {p: _fix_param_cls(param_clss[p]) for p in self._params}
@@ -997,7 +1006,7 @@ class Reducer:
         # the start of each bucket will be padded to the next multiple of `len(self.ranks)`
         for params, param_cls in zip(self.seq_buckets, seq_buckets_cls):
             self.starts.append(self.buffer_length)
-            zero_param_level_sharding = param_cls[2].zero_param_level_sharding if param_cls else self._zero_param_level_sharding
+            zero_param_level_sharding = param_cls[-1].zero_param_level_sharding if param_cls else self._zero_param_level_sharding
             param_sizes = [_aligned_nelement(p.nelement(), p.element_size(), self._align_size) for p in params]
             if zero_param_level_sharding and len(params) >= self._zero_size:
                 groups, group_idx = split_array_min_max(param_sizes, self._zero_size, keep_order=False)
