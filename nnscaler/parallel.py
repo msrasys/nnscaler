@@ -41,7 +41,7 @@ from nnscaler.ir.operator import IRBpOperation, IRDataOperation
 from nnscaler.ir.tensor import IRFullTensor
 from nnscaler.ir.unique import IDGenerator
 
-from nnscaler.runtime.adapter.reducer import Bucket, Reducer
+from nnscaler.runtime.adapter.reducer import Bucket, Reducer, ParamZeroConfig
 from nnscaler.runtime.device import DeviceGroup
 from nnscaler.runtime.gnorm import calcuate_gnorm, clip_grads
 from nnscaler.runtime.module import AttrMeta, Zero3AttrMeta, CubeModule, ParallelModule, OriginModuleMetadata, ExtraState, dedup_attrs
@@ -103,6 +103,15 @@ class ComputeConfig:
     # 1. this only works when `use_zero` is not 0 and `zero_ngroups` is 1.
     # 2. In some cases, it can introduce parity issue. So use it with caution.
     zero_use_reduce_scatter: bool = False
+    # whether to use parameter level sharding in zero (default False).
+    # This option controls the granularity of sharding parameters in ZeRO.
+    # If set to True, gradients/parameters/optimizer states will be sharded at parameter level.
+    # If set to False, they will be sharded at element level.
+    # NOTE: parameter level sharding may introduce paddings
+    # to make sure all devices have the same size of tensor, which may waste some memory.
+
+    # You must set it to True when Muon optimizer is used.
+    zero_param_level_sharding: bool = False
 
     # whether the generated code is for inference only
     inference_only: bool = False
@@ -374,6 +383,7 @@ def _compile_flags(compute_config: ComputeConfig):
         zero_ngroups=compute_config.zero_ngroups,
         zero_use_reduce_scatter=compute_config.zero_use_reduce_scatter,
         trace_strategy=compute_config.trace_strategy,
+        zero_param_level_sharding=compute_config.zero_param_level_sharding,
     )
 
 
@@ -1293,11 +1303,25 @@ class ParallelOptimizer(torch.optim.Optimizer):
 
 OptimizerT = TypeVar('OptimizerT', bound=torch.optim.Optimizer)
 HybridOptimizerT = TypeVar('HybridOptimizer', bound=torch.optim.Optimizer)
+PARAM_CLASS_TYPE = Union[
+    # for hybrid optimizer, param_clss can be:
+    Tuple[int, int],  # (optimizer_index, param_group_index)
+    Tuple[int, int, ParamZeroConfig],  # (optimizer_index, param_group_index, extra_info)
+    Tuple[int, int, dict[str, Any]],  # (optimizer_index, param_group_index, extra_info as dict)
+    # for non-hybrid optimizer with param zero, param_clss can be:
+    Tuple[int, ParamZeroConfig],      # (reducer_bucket_sort, extra_info)
+    Tuple[int, dict[str, Any]],       # (reducer_bucket_sort, extra_info as dict)
+    Tuple[ParamZeroConfig],           # (extra_info)
+    Tuple[dict[str, Any]],            # (extra_info as dict)
+    int,                              # reducer_bucket_sort
+    ParamZeroConfig,                  # extra_info
+    dict[str, Any],                   # extra_info as dict
+]
 
 
 def hybrid(
     params: list[torch.nn.Parameter],
-    param_clss: dict[torch.nn.Parameter, tuple[int, int]],
+    param_clss: dict[torch.nn.Parameter, PARAM_CLASS_TYPE],
     **kwargs,
 ) -> HybridOptimizerT:
     """
@@ -1429,7 +1453,8 @@ def build_optimizer(
                 'async_op': compute_config.use_async_reducer,
                 # zero3 can't be used in non-parallel module reducer
                 # because we are unable to insert hooks to prefetch/postevict params
-                'zero': 1 if compute_config.use_zero else 0,
+                # TODO: to support zero1, we need to revise the state_dict logic
+                'zero': 0,
                 'max_bucket_size_bytes': compute_config.max_bucket_size_bytes,
                 'zero_use_reduce_scatter': compute_config.zero_use_reduce_scatter,
                 'zero_ngroups': compute_config.zero_ngroups,
@@ -2125,10 +2150,9 @@ def _construct_optim_state_zero3(
             assert len(opt_param[opt_param_idx].shape) == 1
             chunk_size = bucket._contiguous_params.shape[0]
             opt_states = {}
-            offset = 0
             for param in bucket.params:
                 sliced_new_val = param_state_map[param]
-                param_numel = bucket.get_aligned_numel(param)
+                offset = reducer.get_param_info(param).bucket_param_buffer_start
                 # init the optimizer state
                 if not opt_states:
                     for key in sliced_new_val.keys():
@@ -2145,7 +2169,6 @@ def _construct_optim_state_zero3(
                         continue
                     opt_states[key][offset:offset+sliced_new_val[key].numel()] = sliced_new_val[key]
 
-                offset += param_numel
             state_dict[opt_param_idx] = opt_states
             opt_param_idx += 1
 
@@ -2202,10 +2225,10 @@ def _construct_optim_state_zero(
             # NOTE: assume the traverse order of params is consistent
             # with them in contiguous buffer.
             # param_offset: the param's start offset in the contiguous buffer
-            # chunk_offset: the current offset of the current rank corresponding chunk
-            param_offset, chunk_offset = 0, 0
+            # chunk_offset: the offset of the current rank corresponding chunk
             step, opt_states, opt_state_keys = None, {}, None
             for param in bucket.params:
+                param_offset = reducer.get_param_info(param).bucket_param_buffer_start
                 sliced_new_val = _get_optimizer_state_of_param(param, param_ids, local_names)
                 # there are padding in the chunk, so `param.numel()` doesn't work here
                 param_numel = bucket.get_aligned_numel(param)
@@ -2232,38 +2255,37 @@ def _construct_optim_state_zero(
                     # case: < [ > ]
                     copy_size = param_offset + param_numel - bucket_chunk_start
                     copy_size_without_padding = param_offset + param.numel() - bucket_chunk_start
+                    chunk_offset = 0
                     if copy_size_without_padding > 0:
                         for key in opt_state_keys:
                             opt_states[key][chunk_offset:chunk_offset+copy_size_without_padding] = sliced_new_val[key][-copy_size_without_padding:]
-                    chunk_offset += copy_size
                 elif bucket_chunk_start <= param_offset < bucket_chunk_end \
                     and bucket_chunk_start <= param_offset + param_numel < bucket_chunk_end:
                     # case: [ <  > ]
+                    chunk_offset = param_offset - bucket_chunk_start
                     for key in opt_state_keys:
                         opt_states[key][chunk_offset:chunk_offset+param.numel()] = sliced_new_val[key][:]
-                    chunk_offset += param_numel
                 elif bucket_chunk_start <= param_offset < bucket_chunk_end \
                     and param_offset + param_numel >= bucket_chunk_end:
                     # case: [ < ] >
                     copy_size = bucket_chunk_end - param_offset
                     copy_size_without_padding = min(copy_size, param.numel())
+                    chunk_offset = param_offset - bucket_chunk_start
                     for key in opt_state_keys:
                         opt_states[key][chunk_offset:chunk_offset+copy_size_without_padding] = sliced_new_val[key][:copy_size_without_padding]
-                    chunk_offset += copy_size
                 elif param_offset < bucket_chunk_start \
                     and param_offset + param_numel >= bucket_chunk_end:
                     # case: < [ ] >
                     copy_size = bucket_chunk_end - bucket_chunk_start
                     copy_size_without_padding = min(copy_size, param_offset + param.numel() - bucket_chunk_start)
+                    chunk_offset = 0
                     if copy_size_without_padding > 0:
                         for key in opt_state_keys:
                             opt_states[key][chunk_offset:chunk_offset + copy_size_without_padding] \
                                 = sliced_new_val[key][bucket_chunk_start-param_offset:bucket_chunk_start-param_offset + copy_size_without_padding]
-                    chunk_offset += copy_size
                 else:
                     # case: [] <>, <> []
                     logger.debug(f'Skipped: parameter range({param_offset},{param_offset + param_numel}) vs. bucket range({bucket_chunk_start},{bucket_chunk_end})')
-                param_offset += param_numel
 
             if step is not None:
                 opt_states['step'] = step

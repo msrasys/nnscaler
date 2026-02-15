@@ -533,6 +533,7 @@ class ModuleCodeGen(FuncEmission):
                         f'async_op={CompileFlag.async_reducer}',
                         f'max_bucket_size_bytes={CompileFlag.max_reducer_bucket}',
                         f'zero_use_reduce_scatter={CompileFlag.zero_use_reduce_scatter}',
+                        f'zero_param_level_sharding={CompileFlag.zero_param_level_sharding}',
                         f'**kwargs',
                     ]
                 ) as ib:
@@ -793,6 +794,7 @@ class ModuleCodeGen(FuncEmission):
         max_nbytes = CompileFlag.max_reducer_bucket if not as_parallel_module else 'max_bucket_size_bytes'
         async_op = CompileFlag.async_reducer if not as_parallel_module else 'async_op'
         zero_use_reduce_scatter = CompileFlag.zero_use_reduce_scatter if not as_parallel_module else 'zero_use_reduce_scatter'
+        zero_param_level_sharding = CompileFlag.zero_param_level_sharding if not as_parallel_module else 'zero_param_level_sharding'
 
         zero = CompileFlag.use_zero
         zero_ngroups = CompileFlag.zero_ngroups
@@ -803,6 +805,7 @@ class ModuleCodeGen(FuncEmission):
             "ranks={ranks}, reduce_op={reduce_op}, "
             "async_op={async_op}, zero={zero}, max_bucket_size_bytes={max_nbytes}, "
             "zero_use_reduce_scatter={zero_use_reduce_scatter}, "
+            "zero_param_level_sharding={zero_param_level_sharding},"
             "zero_ngroups={zero_ngroups})"
         )
         reducer_add = 'self.add_reducer({reducer})'
@@ -815,7 +818,8 @@ class ModuleCodeGen(FuncEmission):
         init_code = reducer_init.format(
             reducer=reducer_name, ranks=ranks, reduce_op=reduce_op,
             async_op=async_op, zero=zero, max_nbytes=max_nbytes,
-            zero_ngroups=zero_ngroups, zero_use_reduce_scatter=zero_use_reduce_scatter
+            zero_ngroups=zero_ngroups, zero_use_reduce_scatter=zero_use_reduce_scatter,
+            zero_param_level_sharding=zero_param_level_sharding
         )
         self.model_init_statements.append(init_code)
         # sort weights by first used time (which is gradient all-reduce time in reverse order)

@@ -66,6 +66,15 @@ class CompileFlag:
     #    hence break the consistency of `.data` and `.grad` of parameters. Need to be careful when using optimizer.
     # 2) `reduce_scatter`` doesn't significantly improve performance comparing with `allreduce`.
     zero_use_reduce_scatter = _to_bool('ZERO_USE_REDUCE_SCATTER')
+    # whether to use parameter level sharding in zero (default False).
+    # This option controls the granularity of sharding parameters in ZeRO.
+    # If set to True, gradients/parameters/optimizer states will be sharded at parameter level.
+    # If set to False, they will be sharded at element level.
+    # NOTE: parameter level sharding may introduce paddings
+    # to make sure all devices have the same size of tensor, which may waste some memory.
+
+    # You must set it to True when Muon optimizer is used.
+    zero_param_level_sharding = _to_bool('ZERO_PARAM_LEVEL_SHARDING')
 
     # use automate mixture precision training, where weights, gradients
     # and optimizer status are kept in its original data type (can be float32),

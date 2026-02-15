@@ -632,11 +632,12 @@ def trainer_grad_sync_check(save_dir, use_bf16, zero_ngroups, runtime_ngpus):
     torch.distributed.barrier()
 
 
-def trainer_correctness_worker(save_dir, parallel_type=0, async_reducer=False, hybrid_opt=False, use_zero=0):
+def trainer_correctness_worker(save_dir, parallel_type=0, async_reducer=False, hybrid_opt=False, use_zero=0, zero_param_level_sharding=False, reducer_bucket_cap_mb=1e-6):
     save_dir = Path(save_dir)
     config_path = str(Path(__file__).with_name('trainer_args.yaml').resolve())
     gen_savedir = save_dir / 'gen'
     ckpt_savedir = save_dir / 'ckpt'
+    instance_name = f'pt_parallel_type{parallel_type}_async{async_reducer}_hybrid{hybrid_opt}_usezero{use_zero}_zpls{zero_param_level_sharding}_reducercap{int(reducer_bucket_cap_mb)}'
 
     if parallel_type == 0:
         # parallelize the whole MixedModule
@@ -742,6 +743,7 @@ def trainer_correctness_worker(save_dir, parallel_type=0, async_reducer=False, h
     # train 4 epcho in one time
     trainer = Trainer([
         '-f', config_path,
+        '--instance_name', instance_name,
         '--precision', 'fp32',
         '--max_epochs', '2',
         '--enable_progress_bar', 'false',
@@ -750,7 +752,8 @@ def trainer_correctness_worker(save_dir, parallel_type=0, async_reducer=False, h
         '--compute_config.plan_ngpus', '1',
         '--compute_config.runtime_ngpus', '2',
         '--compute_config.use_async_reducer', str(async_reducer),
-        '--compute_config.reducer_bucket_cap_mb', '1e-6',
+        '--compute_config.reducer_bucket_cap_mb', str(reducer_bucket_cap_mb),
+        '--compute_config.zero_param_level_sharding', str(zero_param_level_sharding),
         '--checkpoint.save_dir', str(ckpt_savedir),
         '--checkpoint.resume_from', 'last',
         '--checkpoint.keep_last_n_checkpoints', '5',
@@ -776,9 +779,16 @@ def trainer_correctness_worker_aggregate(tmp_path, use_zero):
     for parallel_type in range(5):
         for async_reducer in [False, True]:
             for hybrid_opt in [True, False]:
-                print(f'parallel_type={parallel_type}, async_reducer={async_reducer}, hybrid_opt={hybrid_opt}')
-                save_dir = tmp_path/f'{parallel_type}-{async_reducer}-{hybrid_opt}'
-                trainer_correctness_worker(save_dir, parallel_type, async_reducer, hybrid_opt, use_zero)
+                print(f'parallel_type={parallel_type}, async_reducer={async_reducer}, hybrid_opt={hybrid_opt}, zero_param_level_sharding=True')
+                save_dir = tmp_path/f'{parallel_type}-{async_reducer}-{hybrid_opt}-True'
+                trainer_correctness_worker(save_dir, parallel_type, async_reducer, hybrid_opt, use_zero, True, 0)
+
+    for parallel_type in range(5):
+        for async_reducer in [False, True]:
+            for hybrid_opt in [True, False]:
+                print(f'parallel_type={parallel_type}, async_reducer={async_reducer}, hybrid_opt={hybrid_opt}, zero_param_level_sharding=False')
+                save_dir = tmp_path/f'{parallel_type}-{async_reducer}-{hybrid_opt}-False'
+                trainer_correctness_worker(save_dir, parallel_type, async_reducer, hybrid_opt, use_zero, False)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.device_count() < 2, reason='lack of gpu devices')
@@ -789,8 +799,9 @@ def test_trainer_correctness(tmp_path, use_zero):
     for parallel_type in range(5):
         for async_reducer in [False, True]:
             for hybrid_opt in [True, False]:
-                save_dir = tmp_path/f'{parallel_type}-{async_reducer}-{hybrid_opt}'
-                merged_ckpts[(parallel_type, async_reducer, hybrid_opt)] = torch.load(save_dir/'merged.pt')
+                for zero_param_level_sharding in [False, True]:
+                    save_dir = tmp_path/f'{parallel_type}-{async_reducer}-{hybrid_opt}-{zero_param_level_sharding}'
+                    merged_ckpts[(parallel_type, async_reducer, hybrid_opt, zero_param_level_sharding)] = torch.load(save_dir/'merged.pt')
 
     if use_zero == 3:
         assert_fn = assert_close
@@ -800,21 +811,22 @@ def test_trainer_correctness(tmp_path, use_zero):
     for parallel_type in range(5):
         for async_reducer in [False, True]:
             for hybrid_opt in [True, False]:
-                assert_fn(
-                    merged_ckpts[(parallel_type, async_reducer, hybrid_opt)]['model'],
-                    merged_ckpts[(0, False, False)]['model']
-                )
-                if not hybrid_opt:
+                for zero_param_level_sharding in [False, True]:
                     assert_fn(
-                        merged_ckpts[(parallel_type, async_reducer, hybrid_opt)]['optimizer'],
-                        merged_ckpts[(0, False, False)]['optimizer']
+                        merged_ckpts[(parallel_type, async_reducer, hybrid_opt, zero_param_level_sharding)]['model'],
+                        merged_ckpts[(0, False, False, False)]['model']
                     )
-                else:
-                    # param_groups are different when using hybrid optimizer.
-                    assert_fn(
-                        merged_ckpts[(parallel_type, async_reducer, hybrid_opt)]['optimizer']['state'],
-                        merged_ckpts[(0, False, False)]['optimizer']['state']
-                    )
+                    if not hybrid_opt:
+                        assert_fn(
+                            merged_ckpts[(parallel_type, async_reducer, hybrid_opt, zero_param_level_sharding)]['optimizer'],
+                            merged_ckpts[(0, False, False, False)]['optimizer']
+                        )
+                    else:
+                        # param_groups are different when using hybrid optimizer.
+                        assert_fn(
+                            merged_ckpts[(parallel_type, async_reducer, hybrid_opt, zero_param_level_sharding)]['optimizer']['state'],
+                            merged_ckpts[(0, False, False, False)]['optimizer']['state']
+                        )
 
 
 def tracing_from_weights_worker(tmp_path):

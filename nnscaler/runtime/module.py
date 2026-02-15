@@ -25,7 +25,7 @@ from nnscaler.runtime.device import DeviceGroup
 from nnscaler.runtime.adapter.reducer import Reducer
 from nnscaler.runtime.executor import Executor
 from nnscaler.runtime.gnorm import ParamsInfo
-from nnscaler.runtime.utils import microbatches
+from nnscaler.runtime.utils import microbatches, set_dparam_meta
 from nnscaler.runtime.function import insert_backward_hook
 
 from nnscaler import __version__ as runtime_version
@@ -653,8 +653,8 @@ class CubeModule(torch.nn.Module):
                 opt_state_keys.remove('step')
             assert _check_state_size(opt_state_keys, bucket_states[0]), f'the keys {opt_state_keys} have different shape'
             # NOTE: only support adam for now
-            assert 'exp_avg' in opt_state_keys
-            assert 'exp_avg_sq' in opt_state_keys
+            # assert 'exp_avg' in opt_state_keys
+            # assert 'exp_avg_sq' in opt_state_keys
 
             opt_states, opt_states_1d = {}, {}
             for key in opt_state_keys:
@@ -1140,6 +1140,9 @@ class ParallelModule(CubeModule):
         # add load_state_dict pre hook to pop extra state to prevent warning
         self._register_load_state_dict_pre_hook(ParallelModule._pre_load_state_dict_hook, with_module=True)
 
+        for n, p in self.named_parameters():
+            set_dparam_meta(p, self._fullmap[n])
+
         if build_buckets:
             self.build_buckets()
 
@@ -1526,10 +1529,9 @@ class ParallelModule(CubeModule):
         for reducer in self.reducers:
             _, sub_ranks = self._get_zero_subranks(reducer)
             for bucket in reducer.buckets:
-                pstart, pend = 0, 0
                 for param in bucket.params:
-                    pstart = pend
-                    pend = pstart + bucket.get_aligned_numel(param)
+                    param_info = reducer.get_param_info(param)
+                    pstart = param_info.bucket_param_buffer_start
                     pend_without_padding = pstart + param.numel()
                     model_idx = model_params_id.index(id(param))
                     model_idx2opt_idx[model_idx] = (opt_idx, pstart, pend_without_padding, param.shape)
@@ -1814,6 +1816,8 @@ class ParallelModule(CubeModule):
             return pm._parameters.items()
 
         pm.named_parameters = named_parameters
+        for n, p in pm.named_parameters():
+            set_dparam_meta(p, pm._fullmap[n])
 
         for cv in ParallelModule.__annotations__:
             setattr(GenModelX, cv, state[cv])

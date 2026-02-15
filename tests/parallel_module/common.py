@@ -133,11 +133,11 @@ def assert_equal(a: Any, b: Any):
     if isinstance(a, torch.Tensor):
         assert torch.equal(a.cpu(), b.cpu()), torch.max(torch.abs(a.cpu() - b.cpu()))
     elif isinstance(a, dict):
-        assert len(a) == len(b)
+        assert len(a) == len(b), (a.keys(), b.keys())
         for k in a.keys():
             assert_equal(a[k], b[k])
     elif isinstance(a, (list, tuple)):
-        assert len(a) == len(b)
+        assert len(a) == len(b), (a, b)
         for i in range(len(a)):
             assert_equal(a[i], b[i])
     else:
@@ -149,11 +149,11 @@ def assert_close(a: Any, b: Any, atol=1e-6, rtol=1e-6):
     if isinstance(a, torch.Tensor):
         assert torch.allclose(a.cpu(), b.cpu(), atol=atol, rtol=rtol)
     elif isinstance(a, dict):
-        assert len(a) == len(b)
+        assert len(a) == len(b), (a.keys(), b.keys())
         for k in a.keys():
             assert_close(a[k], b[k], atol=atol, rtol=rtol)
     elif isinstance(a, (list, tuple)):
-        assert len(a) == len(b)
+        assert len(a) == len(b), (a, b)
         for i in range(len(a)):
             assert_close(a[i], b[i], atol=atol, rtol=rtol)
     else:

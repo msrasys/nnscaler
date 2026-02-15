@@ -3,9 +3,16 @@
 
 r"""Runtime Utilities"""
 
-from typing import Any, List
+from typing import Any, List, TYPE_CHECKING, Optional
 import logging
 import heapq
+
+import torch
+
+if TYPE_CHECKING:
+    from nnscaler.runtime.adapter.reducer import FlattenParamInfo
+    from nnscaler.runtime.module import AttrMeta
+
 
 _logger = logging.getLogger(__name__)
 
@@ -227,3 +234,51 @@ def _split_array_min_max_out_of_order(nums: list[int], g: int) -> tuple[list[lis
         heapq.heappush(heap, (new_sum, gidx))
 
     return groups, group_idx
+
+
+FLATTEN_META_KEY = '__nnscaler_flattened_meta__'
+DISTRIBUTED_PARAM_META_KEY = '__nnscaler_distributed_meta__'
+
+
+def is_fparam(param: torch.nn.Parameter) -> bool:
+    """
+    Check if a parameter is a flattened parameter.
+    """
+    return hasattr(param, FLATTEN_META_KEY)
+
+
+def get_fparam_meta(param: torch.nn.Parameter) -> Optional['FlattenParamInfo']:
+    """
+    Get the meta information of a flattened parameter.
+    None if the parameter is not a flattened parameter.
+    """
+    return getattr(param, FLATTEN_META_KEY, None)
+
+
+def set_fparam_meta(param: torch.nn.Parameter, meta: 'FlattenParamInfo'):
+    """
+    Set the meta information of a flattened parameter.
+    """
+    setattr(param, FLATTEN_META_KEY, meta)
+
+
+def is_dparam(param: torch.nn.Parameter) -> bool:
+    """
+    Check if a parameter is a distributed parameter.
+    """
+    return hasattr(param, DISTRIBUTED_PARAM_META_KEY)
+
+
+def get_dparam_meta(param: torch.nn.Parameter) -> Optional['AttrMeta']:
+    """
+    Get the distributed meta information of a parameter.
+    None if the parameter does not have distributed meta.
+    """
+    return getattr(param, DISTRIBUTED_PARAM_META_KEY, None)
+
+
+def set_dparam_meta(param: torch.nn.Parameter, meta: 'AttrMeta'):
+    """
+    Set the distributed meta information of a parameter.
+    """
+    setattr(param, DISTRIBUTED_PARAM_META_KEY, meta)
