@@ -189,7 +189,7 @@ def wrap_ring_attn_varlen_func(
     if local_process_group is None:
         local_process_group = dist.group.WORLD
 
-    if window_size == (-1, -1):
+    if window_size == (-1, -1) and not use_cute:
         # Use TransformerEngine with context parallelism if available and version is OK
         # Only use TransformerEngine CP path if env flag is enabled
         if _ENABLE_TE_CP and _HAS_TRANSFORMER_ENGINE and _TE_VERSION_OK and attn_forward_func_with_cp is not None:
@@ -273,6 +273,7 @@ def wrap_ring_attn_varlen_func(
         deterministic=deterministic,
         return_attn_probs=False,
         group=local_process_group,
+        use_cute=use_cute,
     )
 
     return output

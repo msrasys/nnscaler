@@ -11,6 +11,12 @@ from flash_attn.flash_attn_interface import (
 )
 from .utils import get_default_args, AllGatherComm as Comm
 
+try:
+    from flash_attn.cute.interface import _flash_attn_fwd, _flash_attn_bwd
+except ImportError as e:
+    print(f"flash_attn.cute not available: {e}")
+    _flash_attn_fwd = None
+    _flash_attn_bwd = None
 
 def llama3_flash_attn_prepare_cu_seqlens(
     cu_seqlens: torch.Tensor, causal: bool, rank: int, world_size: int
@@ -81,6 +87,7 @@ def llama3_flash_attn_varlen_forward(
     window_size=(-1, -1),
     alibi_slopes=None,
     deterministic=False,
+    use_cute=False,
 ):
     out_list = []
     lse_list = []
@@ -126,38 +133,58 @@ def llama3_flash_attn_varlen_forward(
         else:
             cur_alibi_slopes = alibi_slopes[i * nheads // nheads_k : (i + heads_k_stride) * nheads // nheads_k]
 
-        params = get_default_args(_flash_attn_varlen_forward).copy()
-        params.update(
-            {
-                "q": q_i,
-                "k": k_i,
-                "v": v_i,
-                "cu_seqlens_q": cu_seqlens_q,
-                "cu_seqlens_k": cu_seqlens_k,
-                "max_seqlen_q": max_seqlen_q,
-                "max_seqlen_k": max_seqlen_k,
-                "dropout_p": dropout_p,
-                "softmax_scale": softmax_scale,
-                "causal": causal,
-                "alibi_slopes": cur_alibi_slopes,
-                "return_softmax": True and dropout_p > 0,
-            }
-        )
-        if "window_size" in params:
-            params.update({"window_size": window_size})
-        else:
+        if use_cute:
+            params = get_default_args(_flash_attn_fwd).copy()
+            window_size_cute = tuple(None if w == -1 else w for w in window_size)
             params.update(
                 {
-                    "window_size_left": window_size[0],
-                    "window_size_right": window_size[1],
+                    "q": q_i,
+                    "k": k_i,
+                    "v": v_i,
+                    "cu_seqlens_q": cu_seqlens_q,
+                    "cu_seqlens_k": cu_seqlens_k,
+                    "max_seqlen_q": max_seqlen_q,
+                    "max_seqlen_k": max_seqlen_k,
+                    "softmax_scale": softmax_scale,
+                    "causal": causal,
+                    "window_size_left": window_size_cute[0],
+                    "window_size_right": window_size_cute[1],
                 }
             )
-        outputs = _flash_attn_varlen_forward(**params)
-        if len(outputs) == 8:
-            out, _, _, _, _, lse, _, _ = outputs
+            out, lse = _flash_attn_fwd(**params)
         else:
-            assert len(outputs) == 4
-            out, lse, _, _ = outputs
+            params = get_default_args(_flash_attn_varlen_forward).copy()
+            params.update(
+                {
+                    "q": q_i,
+                    "k": k_i,
+                    "v": v_i,
+                    "cu_seqlens_q": cu_seqlens_q,
+                    "cu_seqlens_k": cu_seqlens_k,
+                    "max_seqlen_q": max_seqlen_q,
+                    "max_seqlen_k": max_seqlen_k,
+                    "dropout_p": dropout_p,
+                    "softmax_scale": softmax_scale,
+                    "causal": causal,
+                    "alibi_slopes": cur_alibi_slopes,
+                    "return_softmax": True and dropout_p > 0,
+                }
+            )
+            if "window_size" in params:
+                params.update({"window_size": window_size})
+            else:
+                params.update(
+                    {
+                        "window_size_left": window_size[0],
+                        "window_size_right": window_size[1],
+                    }
+                )
+            outputs = _flash_attn_varlen_forward(**params)
+            if len(outputs) == 8:
+                out, _, _, _, _, lse, _, _ = outputs
+            else:
+                assert len(outputs) == 4
+                out, lse, _, _ = outputs
         out_list.append(out)
         lse_list.append(lse)
 
@@ -186,6 +213,7 @@ def llama3_flash_attn_varlen_backward(
     window_size=(-1, -1),
     alibi_slopes=None,
     deterministic=False,
+    use_cute=False,
 ):  # pragma: no cover
     nheads = q.shape[1]
     total_k, nheads_k, head_dim = k.shape
@@ -260,39 +288,66 @@ def llama3_flash_attn_varlen_backward(
         else:
             cur_alibi_slopes = alibi_slopes[i * nheads // nheads_k : (i + heads_k_stride) * nheads // nheads_k]
 
-        params = get_default_args(_flash_attn_varlen_backward).copy()
-        params.update(
-            {
-                "dout": dout_i,
-                "q": q_i,
-                "k": k_i,
-                "v": v_i,
-                "out": out_i,
-                "softmax_lse": lse_i,
-                "dq": dq_i,
-                "dk": dk_i,
-                "dv": dv_i,
-                "cu_seqlens_q": cu_seqlens_q,
-                "cu_seqlens_k": cu_seqlens_k,
-                "max_seqlen_q": max_seqlen_q,
-                "max_seqlen_k": max_seqlen_k,
-                "dropout_p": dropout_p,
-                "softmax_scale": softmax_scale,
-                "causal": causal,
-                "alibi_slopes": cur_alibi_slopes,
-                "deterministic": deterministic,
-            }
-        )
-        if "window_size" in params:
-            params.update({"window_size": window_size})
-        else:
+        if use_cute:
+            params = get_default_args(_flash_attn_bwd).copy()
+            window_size_cute = tuple(None if w == -1 else w for w in window_size)
             params.update(
                 {
-                    "window_size_left": window_size[0],
-                    "window_size_right": window_size[1],
+                    "dout": dout_i,
+                    "q": q_i,
+                    "k": k_i,
+                    "v": v_i,
+                    "out": out_i,
+                    "lse": lse_i,
+                    "dq": dq_i,
+                    "dk": dk_i,
+                    "dv": dv_i,
+                    "cu_seqlens_q": cu_seqlens_q,
+                    "cu_seqlens_k": cu_seqlens_k,
+                    "max_seqlen_q": max_seqlen_q,
+                    "max_seqlen_k": max_seqlen_k,
+                    "softmax_scale": softmax_scale,
+                    "causal": causal,
+                    "window_size_left": window_size_cute[0],
+                    "window_size_right": window_size_cute[1],
+                    "deterministic": deterministic,
                 }
             )
-        _flash_attn_varlen_backward(**params)
+            _flash_attn_bwd(**params)
+        else:
+            params = get_default_args(_flash_attn_varlen_backward).copy()
+            params.update(
+                {
+                    "dout": dout_i,
+                    "q": q_i,
+                    "k": k_i,
+                    "v": v_i,
+                    "out": out_i,
+                    "softmax_lse": lse_i,
+                    "dq": dq_i,
+                    "dk": dk_i,
+                    "dv": dv_i,
+                    "cu_seqlens_q": cu_seqlens_q,
+                    "cu_seqlens_k": cu_seqlens_k,
+                    "max_seqlen_q": max_seqlen_q,
+                    "max_seqlen_k": max_seqlen_k,
+                    "dropout_p": dropout_p,
+                    "softmax_scale": softmax_scale,
+                    "causal": causal,
+                    "alibi_slopes": cur_alibi_slopes,
+                    "deterministic": deterministic,
+                }
+            )
+            if "window_size" in params:
+                params.update({"window_size": window_size})
+            else:
+                params.update(
+                    {
+                        "window_size_left": window_size[0],
+                        "window_size_right": window_size[1],
+                    }
+                )
+            _flash_attn_varlen_backward(**params)
 
         if heads_k_stride != nheads_k:
             # reduce_scatter needs contiguous buffer
@@ -333,6 +388,7 @@ class Llama3FlashAttnVarlenFunc(torch.autograd.Function):
         deterministic,
         return_softmax,
         group,
+        use_cute,
     ):
         if softmax_scale is None:
             softmax_scale = q.shape[-1] ** (-0.5)
@@ -356,6 +412,7 @@ class Llama3FlashAttnVarlenFunc(torch.autograd.Function):
             window_size=window_size,
             alibi_slopes=alibi_slopes,
             deterministic=False,
+            use_cute=use_cute,
         )
         # this should be out_padded
         ctx.save_for_backward(q, k, v, out, softmax_lse, cu_seqlens_q, cu_seqlens_k)
@@ -370,6 +427,7 @@ class Llama3FlashAttnVarlenFunc(torch.autograd.Function):
         ctx.alibi_slopes = alibi_slopes
         ctx.deterministic = deterministic
         ctx.group = group
+        ctx.use_cute = use_cute
         return out if not return_softmax else (out, softmax_lse, None)
 
     @staticmethod
@@ -395,8 +453,9 @@ class Llama3FlashAttnVarlenFunc(torch.autograd.Function):
             window_size=ctx.window_size,
             alibi_slopes=ctx.alibi_slopes,
             deterministic=ctx.deterministic,
+            use_cute=ctx.use_cute,
         )
-        return (dq, dk, dv) + (None,) * 15
+        return (dq, dk, dv) + (None,) * 16
 
 
 def llama3_flash_attn_varlen_qkvpacked_func(
@@ -415,6 +474,7 @@ def llama3_flash_attn_varlen_qkvpacked_func(
     deterministic=False,
     return_attn_probs=False,
     group=None,
+    use_cute=False,
 ):
     return Llama3FlashAttnVarlenFunc.apply(
         qkv[:, 0],
@@ -434,6 +494,7 @@ def llama3_flash_attn_varlen_qkvpacked_func(
         deterministic,
         return_attn_probs,
         group,
+        use_cute,
     )
 
 
@@ -454,6 +515,7 @@ def llama3_flash_attn_varlen_kvpacked_func(
     deterministic=False,
     return_attn_probs=False,
     group=None,
+    use_cute=False,
 ):
     return Llama3FlashAttnVarlenFunc.apply(
         q,
@@ -473,6 +535,7 @@ def llama3_flash_attn_varlen_kvpacked_func(
         deterministic,
         return_attn_probs,
         group,
+        use_cute,
     )
 
 
@@ -494,6 +557,7 @@ def llama3_flash_attn_varlen_func(
     deterministic=False,
     return_attn_probs=False,
     group=None,
+    use_cute=False,
 ):
     return Llama3FlashAttnVarlenFunc.apply(
         q,
@@ -513,4 +577,5 @@ def llama3_flash_attn_varlen_func(
         deterministic,
         return_attn_probs,
         group,
+        use_cute,
     )
