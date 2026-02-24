@@ -104,6 +104,7 @@ class ComputeConfig:
     # 2. In some cases, it can introduce parity issue. So use it with caution.
     zero_use_reduce_scatter: bool = False
     # whether to use parameter level sharding in zero (default False).
+    # This option only works when `use_zero` is not 0.
     # This option controls the granularity of sharding parameters in ZeRO.
     # If set to True, gradients/parameters/optimizer states will be sharded at parameter level.
     # If set to False, they will be sharded at element level.

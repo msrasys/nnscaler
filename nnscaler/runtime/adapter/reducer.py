@@ -1009,7 +1009,10 @@ class Reducer:
             zero_param_level_sharding = param_cls[-1].zero_param_level_sharding if param_cls else self._zero_param_level_sharding
             param_sizes = [_aligned_nelement(p.nelement(), p.element_size(), self._align_size) for p in params]
             if zero_param_level_sharding and len(params) >= self._zero_size:
-                groups, group_idx = split_array_min_max(param_sizes, self._zero_size, keep_order=False)
+                # TODO: set keep_order=False for less padding
+                # 1. async doesn't work well with keep_order=False
+                # 2. hard to write test cases.
+                groups, group_idx = split_array_min_max(param_sizes, self._zero_size, keep_order=True)
                 max_group_size = max(sum(sizes) for sizes in groups)
                 new_param_order = []
                 for i in range(len(group_idx)):
