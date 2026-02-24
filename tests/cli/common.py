@@ -200,3 +200,25 @@ class SimpleIterDataset(StreamingDataset):
                 'data': torch.tensor(item['data']),
                 'target': torch.tensor(item['target'])
             }
+
+
+class MLP2(nn.Module):
+    def __init__(self, input_dim: int, feature_dim: int, output_dim: int, nlayers: int):
+        init_random_fn()
+        super().__init__()
+        self.input_proj = nn.Linear(input_dim, feature_dim, bias=False)
+        self.layers = torch.nn.ModuleList([])
+        for _ in range(nlayers):
+            self.layers.append(nn.Linear(feature_dim, feature_dim, bias=False))
+        self.output_proj = nn.Linear(feature_dim, output_dim, bias=False)
+        self.loss_fn = nn.BCELoss()
+
+    def forward(self, data: Dict[str, torch.Tensor]):
+        x = data['data']
+        x = self.input_proj(x)
+        for layer in self.layers:
+            x = layer(x)
+        x = self.output_proj(x)
+        x = torch.sigmoid(x)
+        loss = self.loss_fn(x, data['target'])
+        return loss

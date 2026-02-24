@@ -20,9 +20,11 @@ precision: fp32
 enable_progress_bar: false
 
 model:
-  type: tests.cli.common.MLP
+  type: tests.cli.common.MLP2
   args:
-    dim: $(vars.dim)
+    input_dim: $(vars.dim)
+    feature_dim: 24
+    output_dim: $(vars.dim)
     nlayers: 16
 
 

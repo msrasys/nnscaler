@@ -206,15 +206,17 @@ def test_trainer_muon_resume_correctness_zero_ngroups(tmp_path):
 @pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.device_count() < 4, reason='lack of gpu devices')
 def test_trainer_muon_resume_correctness_zero_ngroups_hybrid_param_config(tmp_path):
     config_file = 'trainer_args_muon_hybrid.yaml'
-    launch_torchrun(4, trainer_muon_worker, tmp_path, config_file, '2', [
+
+    launch_torchrun(4, trainer_muon_worker, tmp_path, config_file, '1', [
         '--compute_config.use_zero', 1,
-        '--compute_config.zero_ngroups', 2,
         '--compute_config.runtime_ngpus', 4,
         '--optimizer.args.config.optimizers.1.type', 'nnscaler.runtime.muon_optimizer.Muon',
         '--optimizer.param_clss_fn', 'tests.cli.test_trainer_muon.param_clss_fn2',
     ])
-    launch_torchrun(4, trainer_muon_worker, tmp_path, config_file, '1', [
+
+    launch_torchrun(4, trainer_muon_worker, tmp_path, config_file, '2', [
         '--compute_config.use_zero', 1,
+        '--compute_config.zero_ngroups', 2,
         '--compute_config.runtime_ngpus', 4,
         '--optimizer.args.config.optimizers.1.type', 'nnscaler.runtime.muon_optimizer.Muon',
         '--optimizer.param_clss_fn', 'tests.cli.test_trainer_muon.param_clss_fn2',
