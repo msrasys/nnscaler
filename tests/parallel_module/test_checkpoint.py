@@ -636,7 +636,7 @@ def _gather_full_model_state_dict_worker(tmp_path, use_zero):
     torch.distributed.barrier()
     merged_state_dict = merge_state_dicts(
         [torch.load(tmp_path / f'{i}.pt', weights_only=False) for i in range(torch.distributed.get_world_size())]
-    )
+    )[0]
     full_state_dict = gather_full_model_state_dict(model)
     assert_equal(merged_state_dict, full_state_dict)
 

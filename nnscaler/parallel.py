@@ -3348,7 +3348,7 @@ def gather_full_model_state_dict(
         state_dicts = gather_mixed_data(local_state_dict, src_rank=0, group=involved_group, device='cpu')
         if rank == 0:
             logger.info(f'Rank {rank}: merging gathered state dicts')
-            merge_state_dict = merge_state_dicts(state_dicts)
+            merge_state_dict = merge_state_dicts(state_dicts)[0]
         else:
             merge_state_dict = None
     else:
