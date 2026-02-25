@@ -31,10 +31,12 @@ def clean_generated_files():
         f.unlink()
 
 
-def pytest_collection_modifyitems(session, config, items):
-    def policy_first(item):
-        # it is very easy to break policy related tests, so run them first
+def pytest_collection_modifyitems(session, config, items: list[pytest.Function]):
+    def policy_first(item: pytest.Function):
+        # it is very easy to break the following tests, so run them first
         if item.fspath.basename == 'test_policies.py':
             return 0
-        return 1
+        if item.fspath.basename == 'test_trainer.py':
+            return 1
+        return 2
     items.sort(key=policy_first)
