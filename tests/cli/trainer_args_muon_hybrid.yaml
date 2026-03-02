@@ -16,13 +16,15 @@ global_batch_size: 8
 max_epochs: 4
 max_train_steps: 100
 seed: 0
-precision: bf16
+precision: fp32
 enable_progress_bar: false
 
 model:
-  type: tests.cli.common.MLP
+  type: tests.cli.common.MLP2
   args:
-    dim: $(vars.dim)
+    input_dim: $(vars.dim)
+    feature_dim: 24
+    output_dim: $(vars.dim)
     nlayers: 16
 
 

@@ -5,7 +5,7 @@ mock
 myst-parser
 pre-commit
 pytest
-pytest-cov
+pytest-cov<7.0.0
 pytest-mock
 scikit-learn
 lightning==2.5.1.post0

@@ -444,6 +444,27 @@ def select_many(data: Iterable[Any], fn: Callable[[Any], Iterable[Any]]) -> Iter
         yield from fn(item)
 
 
+def first(data: Iterable[Any], fn: Optional[Callable[[Any], bool]]) -> Any:
+    """Get the first element from the iterable that satisfies the given function."""
+    fn = fn or (lambda x: x)
+    for item in data:
+        if fn(item):
+            return item
+    raise ValueError("No element satisfies the condition.")
+
+
+def first_or(data: Iterable[Any], fn: Optional[Callable[[Any], bool]], *, default=None) -> Optional[Any]:
+    """
+    Get the first element from the iterable that satisfies the given function,
+    or return default value.
+    """
+    fn = fn or (lambda x: x)
+    for item in data:
+        if fn(item):
+            return item
+    return default
+
+
 # ref: https://stackoverflow.com/questions/128573/using-property-on-classmethods
 class classproperty(property):
     """
@@ -638,14 +659,18 @@ class AdamOptState(TypedDict):
     exp_avg_sq: torch.Tensor
 
 
+class MuonOptState(TypedDict):
+    momentum_buffer: torch.Tensor
+
+
 class OptStateParamGroup(TypedDict):
     params: list[int]
     lr: float
 
 
 class OptStateDict(TypedDict):
-    state: dict[int, AdamOptState | dict[str, Union[Any, torch.Tensor]]]
-    param_groups: list[OptStateParamGroup | dict[str, Union[Any, torch.Tensor]]]
+    state: dict[int, AdamOptState | MuonOptState]
+    param_groups: list[OptStateParamGroup]
 
 
 def fn_field(**kwargs):
@@ -912,6 +937,7 @@ def broadcast_mixed_data(
             else:
                 tensors[i] = tensors[i].to(device, non_blocking=True)
 
+    torch.cuda.synchronize()
     # refill tensors
     return refill_tensors(skeleton, tensors)
 
@@ -995,6 +1021,8 @@ def gather_mixed_data(
         elif rank == i:
             _send_recv_tensors(rank, skeleton, tensors)
         torch.distributed.barrier(group=group)
+
+    torch.cuda.synchronize()
 
     if rank == src_rank:
         return result
