@@ -870,6 +870,26 @@ def refill_tensors(skeleton: Dict[str, Any], tensors: List[torch.Tensor]) -> Dic
     return state_dict
 
 
+# Pre-allocated pinned buffer cache for broadcast_mixed_data.
+# Keyed by dtype; each value is a 1-D pinned CPU tensor that grows as needed.
+_pinned_buf_cache: dict[torch.dtype, torch.Tensor] = {}
+
+
+def _get_pinned_buffer(numel: int, dtype: torch.dtype) -> torch.Tensor:
+    """Return a pinned CPU buffer of at least *numel* elements.
+
+    The buffer is cached and reused across calls.  It is grown (but never
+    shrunk) when a larger size is requested.
+    """
+    buf = _pinned_buf_cache.get(dtype)
+    if buf is None or buf.numel() < numel:
+        # Over-allocate by 25 % to reduce future re-allocations
+        alloc = max(numel, int(numel * 1.25))
+        buf = torch.empty(alloc, dtype=dtype, device='cpu', pin_memory=True)
+        _pinned_buf_cache[dtype] = buf
+    return buf[:numel]
+
+
 def broadcast_mixed_data(
     data: Optional[dict] = None,
     *,
@@ -925,6 +945,7 @@ def broadcast_mixed_data(
         else:
             # make sure tensors are in cuda
             tensor = tensors[i].cuda()
+            # print(f'meta_tensors.size = {tensor.size()}')
 
         torch.distributed.broadcast(tensor, src=src_rank, group=group)
 
@@ -942,6 +963,387 @@ def broadcast_mixed_data(
     return refill_tensors(skeleton, tensors)
 
 
+def broadcast_mixed_data_gpu(
+    data: Optional[dict] = None,
+    *,
+    src_rank: int = 0,
+    group: Optional[torch.distributed.ProcessGroup] = None,
+):
+    """
+    Broadcast the data (containing tensors) from *src_rank* to all other ranks,
+    keeping every tensor **on GPU** after the NCCL broadcast — no device-to-host
+    copy is performed, which saves ~50 % wall time compared to
+    :func:`broadcast_mixed_data` with ``device='cpu'``.
+
+    Use this variant when the consumer will subsequently need the tensors on
+    GPU anyway (e.g. for further computation or saving to a CUDA-backed
+    storage).
+
+    The non-tensor skeleton (dict keys, shapes, dtypes, scalar values, etc.)
+    is still transferred via ``broadcast_object_list`` and lives on CPU.
+
+    Args:
+        data (Optional[dict]): The data to be broadcasted.
+            For non-src ranks this **must** be ``None``.
+        src_rank (int): The source rank to broadcast from.  Default: ``0``.
+        group (torch.distributed.ProcessGroup, optional): The process group
+            to use for broadcasting.  ``None`` → default process group.
+
+    Returns:
+        dict: The broadcasted data with all tensors residing on the current
+        CUDA device.
+    """
+    rank = torch.distributed.get_rank(group=group)
+
+    # ---- share the structure and tensor shapes ----
+    if rank == src_rank:
+        if data is None:
+            raise ValueError("data must not be None on src_rank")
+        skeleton, tensors = extract_tensors(data)
+        meta_tensors = [t.to('meta') for t in tensors]
+        sent = [(skeleton, meta_tensors)]
+    else:
+        if data is not None:
+            raise ValueError("data must be None on non-src ranks")
+        skeleton, tensors, meta_tensors = None, None, None
+        sent = [None]
+
+    torch.distributed.broadcast_object_list(sent, src=src_rank, group=group)
+    skeleton, meta_tensors = sent[0]
+    if rank != src_rank:
+        tensors = [None] * len(meta_tensors)
+
+    # ---- broadcast tensor data (keep on GPU) ----
+    for i in range(len(meta_tensors)):
+        if rank == src_rank:
+            tensor = tensors[i].cuda()
+        else:
+            tensor = torch.empty_like(meta_tensors[i], device='cuda')
+
+        torch.distributed.broadcast(tensor, src=src_rank, group=group)
+        tensors[i] = tensor          # keep on GPU — no .to('cpu')
+
+    torch.cuda.synchronize()
+    return refill_tensors(skeleton, tensors)
+
+
+def broadcast_mixed_data_coalesced(
+    data: Optional[dict] = None,
+    *,
+    src_rank: int = 0,
+    group: Optional[torch.distributed.ProcessGroup] = None,
+    device: Optional[Union[str, torch.device]] = None,
+    gpu_chunk_bytes: int = 40 * (1024 ** 3),  # 40 GB default
+):
+    """Broadcast data (containing tensors) using coalesced NCCL broadcasts.
+
+    Instead of one ``dist.broadcast`` per tensor, tensors are grouped by dtype
+    and concatenated into flat GPU buffers that are broadcast in bulk. Each
+    buffer is capped at *gpu_chunk_bytes* to stay within GPU memory.  The D2H
+    copy uses pinned CPU memory for higher throughput.
+
+    Args:
+        data: The data to broadcast.  Must be a dict on *src_rank*, ``None``
+            on all other ranks.
+        src_rank: Source rank.  Default ``0``.
+        group: NCCL process group.  ``None`` uses the default group.
+        device: Target device for tensors after broadcast.  Default ``'cpu'``.
+        gpu_chunk_bytes: Maximum bytes per coalesced GPU buffer.
+
+    Returns:
+        dict: The broadcasted data.
+    """
+    device = device or torch.cuda.current_device()
+    if isinstance(device, str):
+        device = torch.device(device)
+    rank = torch.distributed.get_rank(group=group)
+
+    # --- 1. share skeleton + meta tensors ---
+    if rank == src_rank:
+        if data is None:
+            raise ValueError("data must not be None on src_rank")
+        skeleton, tensors = extract_tensors(data)
+        meta_tensors = [t.to('meta') for t in tensors]
+        sent = [(skeleton, meta_tensors)]
+    else:
+        if data is not None:
+            raise ValueError("data must be None on non-src ranks")
+        skeleton, tensors, meta_tensors = None, None, None
+        sent = [None]
+
+    torch.distributed.broadcast_object_list(sent, src=src_rank, group=group)
+    skeleton, meta_tensors = sent[0]
+
+    if not meta_tensors:
+        return refill_tensors(skeleton, [])
+
+    n = len(meta_tensors)
+    out_tensors: list[Optional[torch.Tensor]] = [None] * n
+
+    # --- 2. group by dtype ---
+    dtype_groups: dict[torch.dtype, list[int]] = defaultdict(list)
+    for i, mt in enumerate(meta_tensors):
+        dtype_groups[mt.dtype].append(i)
+
+    # --- 3. broadcast coalesced chunks per dtype ---
+    for dtype, indices in dtype_groups.items():
+        elem_size = torch.tensor([], dtype=dtype).element_size()
+
+        # split indices into chunks that fit in GPU memory
+        chunks: list[list[int]] = []
+        cur_chunk: list[int] = []
+        cur_bytes = 0
+        for i in indices:
+            nbytes = meta_tensors[i].numel() * elem_size
+            if cur_bytes + nbytes > gpu_chunk_bytes and cur_chunk:
+                chunks.append(cur_chunk)
+                cur_chunk = []
+                cur_bytes = 0
+            cur_chunk.append(i)
+            cur_bytes += nbytes
+        if cur_chunk:
+            chunks.append(cur_chunk)
+
+        for chunk_idx_list in chunks:
+            total_numel = sum(meta_tensors[i].numel() for i in chunk_idx_list)
+
+            # Build GPU flat buffer
+            if rank == src_rank:
+                flat_gpu = torch.cat(
+                    [tensors[i].reshape(-1) for i in chunk_idx_list]
+                ).cuda()
+            else:
+                flat_gpu = torch.empty(total_numel, dtype=dtype, device='cuda')
+
+            # NCCL broadcast (one call for the whole chunk)
+            torch.distributed.broadcast(flat_gpu, src=src_rank, group=group)
+
+            # D2H: copy to CPU target
+            if device.type == 'cpu':
+                # Use pinned buffer for faster D2H
+                pinned = _get_pinned_buffer(total_numel, dtype)
+                pinned.copy_(flat_gpu, non_blocking=True)
+                torch.cuda.synchronize()
+                # Free GPU memory before splitting
+                del flat_gpu
+                # Split back from pinned CPU buffer
+                offset = 0
+                for i in chunk_idx_list:
+                    numel_i = meta_tensors[i].numel()
+                    # .clone() so the tensor owns its memory (not a view of the big pinned buf)
+                    out_tensors[i] = pinned[offset:offset + numel_i].reshape(meta_tensors[i].shape).clone()
+                    offset += numel_i
+            else:
+                # Target is GPU – just split in-place
+                offset = 0
+                for i in chunk_idx_list:
+                    numel_i = meta_tensors[i].numel()
+                    t = flat_gpu[offset:offset + numel_i].reshape(meta_tensors[i].shape)
+                    if t.device != device:
+                        t = t.to(device)
+                    out_tensors[i] = t
+                    offset += numel_i
+                del flat_gpu
+
+    return refill_tensors(skeleton, out_tensors)
+
+
+# Cache for the gloo process group (created once, reused).
+_gloo_group_cache: dict[tuple, torch.distributed.ProcessGroup] = {}
+
+
+def _get_gloo_group(group: Optional[torch.distributed.ProcessGroup] = None) -> torch.distributed.ProcessGroup:
+    """Return a gloo process group that mirrors *group* (or the default group).
+
+    The gloo group is created once and cached for subsequent calls.
+    """
+    if group is None:
+        world_size = torch.distributed.get_world_size()
+        ranks = tuple(range(world_size))
+    else:
+        ranks = tuple(torch.distributed.get_process_group_ranks(group))
+
+    if ranks not in _gloo_group_cache:
+        _gloo_group_cache[ranks] = torch.distributed.new_group(
+            ranks=list(ranks), backend='gloo',
+        )
+    return _gloo_group_cache[ranks]
+
+
+def broadcast_mixed_data_gloo(
+    data: Optional[dict] = None,
+    *,
+    src_rank: int = 0,
+    group: Optional[torch.distributed.ProcessGroup] = None,
+    device: Optional[Union[str, torch.device]] = None,
+):
+    """Broadcast data (containing tensors) using gloo backend on CPU.
+
+    This avoids the CPU→GPU→broadcast→GPU→CPU round-trip of the NCCL-based
+    ``broadcast_mixed_data`` when the final destination is CPU.  Tensors are
+    coalesced by dtype into flat CPU buffers for fewer broadcast calls.
+
+    Args:
+        data (Optional[dict]): The data to be broadcasted.
+            For non-src ranks this must be None.
+        src_rank (int): The source rank. Default: 0.
+        group (torch.distributed.ProcessGroup, optional): The *NCCL* group
+            whose ranks should be mirrored.  A matching gloo group is
+            created/cached automatically.
+        device (str or torch.device, optional): Target device for tensors.
+            Default: ``'cpu'``.
+
+    Returns:
+        dict: The broadcasted data with tensors on *device*.
+    """
+    device = device or 'cpu'
+    if isinstance(device, str):
+        device = torch.device(device)
+
+    gloo_grp = _get_gloo_group(group)
+    rank = torch.distributed.get_rank(group=group)
+
+    # ---- Step 1: share skeleton + tensor metadata ----
+    if rank == src_rank:
+        if data is None:
+            raise ValueError("data must not be None on src_rank")
+        skeleton, tensors = extract_tensors(data)
+        meta_tensors = [t.to('meta') for t in tensors]
+        sent = [(skeleton, meta_tensors)]
+    else:
+        if data is not None:
+            raise ValueError("data must be None on non-src ranks")
+        skeleton, tensors, meta_tensors = None, None, None
+        sent = [None]
+
+    torch.distributed.broadcast_object_list(sent, src=src_rank, group=gloo_grp)
+    skeleton, meta_tensors = sent[0]
+
+    if not meta_tensors:
+        return refill_tensors(skeleton, [])
+
+    # ---- Step 2: coalesce tensors by dtype ----
+    dtype_groups: dict[torch.dtype, list[int]] = defaultdict(list)
+    for i, mt in enumerate(meta_tensors):
+        dtype_groups[mt.dtype].append(i)
+
+    if rank == src_rank:
+        out_tensors = tensors          # will be overwritten in-place for device
+    else:
+        out_tensors = [None] * len(meta_tensors)
+
+    # ---- Step 3: broadcast coalesced flat buffers on CPU via gloo ----
+    for dtype, indices in dtype_groups.items():
+        total_numel = sum(meta_tensors[i].numel() for i in indices)
+
+        if rank == src_rank:
+            # Build flat buffer from source tensors (already on CPU)
+            flat = torch.cat([tensors[i].reshape(-1).contiguous() for i in indices])
+        else:
+            flat = torch.empty(total_numel, dtype=dtype, device='cpu')
+
+        torch.distributed.broadcast(flat, src=src_rank, group=gloo_grp)
+
+        # Split back
+        offset = 0
+        for i in indices:
+            n = meta_tensors[i].numel()
+            t = flat[offset:offset + n].reshape(meta_tensors[i].shape)
+            if t.device != device:
+                t = t.to(device)
+            out_tensors[i] = t
+            offset += n
+
+    return refill_tensors(skeleton, out_tensors)
+
+
+def send_mixed_data(
+    data: dict,
+    *,
+    dst_rank: int,
+    group: Optional[torch.distributed.ProcessGroup] = None,
+):
+    """
+    Send mixed data (containing tensors) to dst_rank via point-to-point communication.
+
+    Tensor data is coalesced by dtype into flat buffers for fewer NCCL calls.
+
+    Args:
+        data (dict): The data to be sent.
+        dst_rank (int): The destination rank to send to.
+        group (torch.distributed.ProcessGroup, optional): The process group to use.
+            If None, the default process group will be used.
+    """
+    skeleton, tensors = extract_tensors(data)
+    meta_tensors = [t.to('meta') for t in tensors]
+    torch.distributed.send_object_list([(skeleton, meta_tensors)], dst=dst_rank, group=group)
+
+    if not tensors:
+        return
+
+    # Coalesce by dtype for fewer P2P calls
+    from collections import defaultdict
+    dtype_groups: dict[torch.dtype, list[int]] = defaultdict(list)
+    for i, t in enumerate(tensors):
+        dtype_groups[t.dtype].append(i)
+
+    for dtype, indices in dtype_groups.items():
+        flat_buf = torch.cat([tensors[i].reshape(-1) for i in indices]).cuda()
+        torch.distributed.send(flat_buf, dst=dst_rank, group=group)
+
+
+def recv_mixed_data(
+    *,
+    src_rank: int,
+    group: Optional[torch.distributed.ProcessGroup] = None,
+    device: Optional[Union[str, torch.device]] = None,
+) -> dict:
+    """
+    Receive mixed data (containing tensors) from src_rank via point-to-point communication.
+
+    Args:
+        src_rank (int): The source rank to receive from.
+        group (torch.distributed.ProcessGroup, optional): The process group to use.
+            If None, the default process group will be used.
+        device (str or torch.device, optional): The target device for received tensors.
+            If None, tensors are kept on cuda (useful when the data will be broadcast
+            immediately afterwards to avoid an extra CPU→GPU round-trip).
+
+    Returns:
+        dict: The received data.
+    """
+    received = [None]
+    torch.distributed.recv_object_list(received, src=src_rank, group=group)
+    skeleton, meta_tensors = received[0]
+
+    if not meta_tensors:
+        return refill_tensors(skeleton, [])
+
+    from collections import defaultdict
+    dtype_groups: dict[torch.dtype, list[int]] = defaultdict(list)
+    for i, mt in enumerate(meta_tensors):
+        dtype_groups[mt.dtype].append(i)
+
+    tensors = [None] * len(meta_tensors)
+    for dtype, indices in dtype_groups.items():
+        total_numel = sum(meta_tensors[i].numel() for i in indices)
+        flat_buf = torch.empty(total_numel, dtype=dtype, device='cuda')
+        torch.distributed.recv(flat_buf, src=src_rank, group=group)
+        offset = 0
+        for i in indices:
+            n = meta_tensors[i].numel()
+            t = flat_buf[offset:offset + n].reshape(meta_tensors[i].shape)
+            if device is not None and t.device != torch.device(device):
+                tensors[i] = t.to(device, non_blocking=True)
+            else:
+                tensors[i] = t
+            offset += n
+
+    if device is not None and str(device) not in ('cuda', str(torch.cuda.current_device())):
+        torch.cuda.synchronize()
+    return refill_tensors(skeleton, tensors)
+
+
 def gather_mixed_data(
     data: dict,
     *,
@@ -955,6 +1357,95 @@ def gather_mixed_data(
     Args:
         data (dict): The data to be gathered.
         src_rank (int): The source rank to gather to. Default: 0.
+        group (torch.distributed.ProcessGroup, optional): The process group to use for gathering.
+            If None, the default process group will be used. Default: None.
+        device (str or torch.device, optional): The device to use for receiving tensors on src_rank.
+            If None, the current cuda device will be used. Default: None.
+            If you want to save memory, you can set it to 'cpu' to move tensors to cpu after receiving.
+    Returns:
+        dict: The gathered data.
+            For src_rank, it is the gathered data from all ranks.
+            For non-src ranks, it is None.
+    """
+    device = torch.cuda.current_device() if device is None else device
+
+    rank = torch.distributed.get_rank(group=group)
+    world_size = torch.distributed.get_world_size(group=group)
+    result = [None] * world_size
+    result[rank] = data
+
+    skeleton, tensors = extract_tensors(data)
+    sent = (skeleton, [t.to('meta') for t in tensors])
+
+    # Gather metadata from all ranks
+    gathered_sent = [None for _ in range(world_size)]
+    torch.distributed.all_gather_object(gathered_sent, sent, group=group)
+
+    def _send_recv_tensors(
+        sender: int,
+        skel: Dict[str, Any],
+        tensors: list[torch.Tensor]
+    ) -> Dict[str, Any]:
+        if rank == src_rank:
+            assert all(tensor.device.type == 'meta' for tensor in tensors), \
+                "Tensors should be on meta device on rank 0."
+        if rank != src_rank:
+            assert all(tensor.device.type != 'meta' for tensor in tensors), \
+                f"Tensors should not be on meta device on rank {rank}."
+
+        if rank == src_rank:
+            cuda_tensors = [torch.empty_like(tensor, device='cuda') for tensor in tensors]
+        else:
+            cuda_tensors = [tensor.cuda() for tensor in tensors]
+
+        for i in range(len(tensors)):
+            if rank == src_rank:
+                torch.distributed.recv(cuda_tensors[i], group_src=sender, group=group)
+            else:
+                torch.distributed.send(cuda_tensors[i], group_dst=src_rank, group=group)
+
+        if rank == src_rank:
+            tensors = [tensor.to(device, non_blocking=True) for tensor in cuda_tensors]
+            return transform_recursively(
+                skel,
+                lambda idx: tensors[idx.index],
+                target_types=_TensorIndex,
+            )
+        else:
+            return None  # only rank 0 needs the recovered state dict
+
+    # TODO: It may have performance issue if the number of ranks is large
+    for i in range(0, world_size):
+        if i == src_rank:
+            continue
+        if rank == src_rank:
+            result[i] = _send_recv_tensors(i, gathered_sent[i][0], gathered_sent[i][1])
+        elif rank == i:
+            _send_recv_tensors(rank, skeleton, tensors)
+        torch.distributed.barrier(group=group)
+
+    torch.cuda.synchronize()
+
+    if rank == src_rank:
+        return result
+    else:
+        return None
+
+
+
+def gather_mixed_data_roundrobin(
+    data: dict,
+    *,
+    num_involved_ranks: int = -1,
+    group: Optional[torch.distributed.ProcessGroup] = None,
+    device: Optional[Union[str, torch.device]] = None,
+):
+    """
+    Gather the data (containing tensors) from all ranks to src_rank.
+
+    Args:
+        data (dict): The data to be gathered.
+        num_involved_ranks (int): The number of ranks involved in gathering. Default: -1 (all ranks).
         group (torch.distributed.ProcessGroup, optional): The process group to use for gathering.
             If None, the default process group will be used. Default: None.
         device (str or torch.device, optional): The device to use for receiving tensors on src_rank.
