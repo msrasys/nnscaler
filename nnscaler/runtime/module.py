@@ -652,9 +652,6 @@ class CubeModule(torch.nn.Module):
             if 'step' in bucket_states[0]:
                 opt_state_keys.remove('step')
             assert _check_state_size(opt_state_keys, bucket_states[0]), f'the keys {opt_state_keys} have different shape'
-            # NOTE: only support adam for now
-            # assert 'exp_avg' in opt_state_keys
-            # assert 'exp_avg_sq' in opt_state_keys
 
             opt_states, opt_states_1d = {}, {}
             for key in opt_state_keys:
