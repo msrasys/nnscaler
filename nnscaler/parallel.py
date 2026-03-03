@@ -3320,17 +3320,63 @@ def load_merged_state_dict_from_rank(
 @torch.no_grad()
 def gather_full_model_state_dict(
     module: torch.nn.Module,
+    *,
+    device: Union[str, torch.device] = None,
 ) -> Dict[str, Any]:
     """
-    Gather model state dicts from all ranks,
-    And merge them into a single merged model state dict in all ranks.
+    Gather model state dicts from all ranks for all ranks.
+    It will firstly try to use a fast way (only support tp with zero0/zero1)
+        to gather the state dicts,
+        and if it fails, it will fallback to the naive gather/merge/broadcast approach.
 
     Args:
         module (torch.nn.Module): the module to gather state dicts from
+        device: the device to put the merged state dict.
+            Use torch.cuda.current_device() if it is None.
 
     Returns:
         Dict[str, Any]: the merged model state dict
     """
+    device = device or torch.cuda.current_device()
+
+    merged_state_dict = {}
+    for module_path, module in module.named_modules():
+        if not isinstance(module, ParallelModule):
+            state_dict = module.state_dict()
+        else:
+            try:
+                state_dict = module.gather_state_dict(device=device)
+            except Exception as e:
+                logger.warning(f'Failed to gather parallel module {module.__class__.__name__} at `{module_path}`, Fallback to naive implementation.'
+                               f'\nError: {e}')
+                state_dict = _gather_full_model_state_dict(module, device=device)
+
+        for key, value in state_dict.items():
+            merged_state_dict[f'{module_path}.{key}' if module_path else key] = value.to(device, non_blocking=True)
+
+    torch.cuda.synchronize()
+
+    return merged_state_dict
+
+
+@torch.no_grad()
+def _gather_full_model_state_dict(
+    module: torch.nn.Module,
+    *,
+    device=None,
+) -> Dict[str, Any]:
+    """
+    Gather model state dicts from all ranks using naive gather/merge/broadcast approach.
+
+    Args:
+        module (torch.nn.Module): the module to gather state dicts from
+        device: the device to put the merged state dict.
+            Use torch.cuda.current_device() if it is None.
+
+    Returns:
+        Dict[str, Any]: the merged model state dict
+    """
+    device = device or torch.cuda.current_device()
 
     rank = torch.distributed.get_rank()
     parallel_modules = [m for m in module.modules() if isinstance(m, ParallelModule)]
@@ -3346,7 +3392,7 @@ def gather_full_model_state_dict(
     if rank < num_involved_ranks:
         local_state_dict, _ = deduped_state_dict(module, optimizer=None)
         logger.info(f'Rank {rank}: gathering state dict')
-        state_dicts = gather_mixed_data(local_state_dict, src_rank=0, group=involved_group, device='cpu')
+        state_dicts = gather_mixed_data(local_state_dict, src_rank=0, group=involved_group, device=device)
         if rank == 0:
             logger.info(f'Rank {rank}: merging gathered state dicts')
             merge_state_dict = merge_state_dicts(state_dicts)[0]
@@ -3356,7 +3402,7 @@ def gather_full_model_state_dict(
         merge_state_dict = None
 
     logger.info(f'Rank {rank}: Broadcasting merged state dict to all ranks')
-    merge_state_dict = broadcast_mixed_data(merge_state_dict, src_rank=0, device='cpu')
+    merge_state_dict = broadcast_mixed_data(merge_state_dict, src_rank=0, device=device)
     logger.info(f'Rank {rank}: Finished gathering full model state dict')
     torch.distributed.barrier()
     return merge_state_dict

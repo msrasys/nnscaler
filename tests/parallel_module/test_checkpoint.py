@@ -30,7 +30,7 @@ from nnscaler.runtime.gnorm import calcuate_gnorm
 
 from .common import CubeLinear, init_random, init_distributed, PASMegatron, assert_equal
 from ..launch_torchrun import launch_torchrun, clone_to_cpu_recursively
-from ..utils import replace_all_device_with, clear_dir_on_rank0, PYTEST_RUN_ID
+from ..utils import replace_all_device_with, clear_dir_on_rank0, PYTEST_RUN_ID, catch_log
 
 
 class FcRelu(nn.Module):
@@ -615,7 +615,8 @@ def test_checkpoint_merge():
 
 def _gather_full_model_state_dict_worker(tmp_path, use_zero):
     from .test_end2end import MLP, dummy_data
-    from nnscaler.parallel import gather_full_model_state_dict, merge_state_dicts
+    from nnscaler.parallel import gather_full_model_state_dict, merge_state_dicts, _gather_full_model_state_dict
+    from nnscaler.parallel import logger as p_logger
     init_distributed()
 
     model = MLP()
@@ -637,8 +638,24 @@ def _gather_full_model_state_dict_worker(tmp_path, use_zero):
     merged_state_dict = merge_state_dicts(
         [torch.load(tmp_path / f'{i}.pt', weights_only=False) for i in range(torch.distributed.get_world_size())]
     )[0]
-    full_state_dict = gather_full_model_state_dict(model)
-    assert_equal(merged_state_dict, full_state_dict)
+
+    if use_zero > 1:
+        with catch_log(p_logger, 'WARNING') as logs:
+            full_state_dict = gather_full_model_state_dict(model)
+        assert 'Zero3 is not supported.' in logs.getvalue()
+        assert_equal(merged_state_dict, full_state_dict)
+        with pytest.raises(ValueError):
+             model.gather_state_dict()
+    else:
+        with catch_log(p_logger, 'WARNING') as logs:
+            full_state_dict = gather_full_model_state_dict(model)
+        assert 'Failed to gather parallel module' not in logs.getvalue()
+        assert_equal(merged_state_dict, full_state_dict)
+        f1 = model.gather_state_dict()
+        assert_equal(merged_state_dict, f1)
+
+    f2 = _gather_full_model_state_dict(model)
+    assert_equal(merged_state_dict, f2)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.device_count() < 4, reason='lack of gpu devices')

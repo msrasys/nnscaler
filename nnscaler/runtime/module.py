@@ -60,6 +60,13 @@ class AttrMeta:
     # it should be the shape of full_tensor[slicers]
     sub_shape: Tuple[int, ...]
 
+    def get_partitioned_dims(self):
+        partitioned_dims = []
+        for dim, (sub, orig) in enumerate(zip(self.sub_shape, self.shape)):
+            if sub != orig:
+                partitioned_dims.append(dim)
+        return partitioned_dims
+
 
 @dataclass
 class Zero3AttrMeta:
@@ -1759,6 +1766,100 @@ class ParallelModule(CubeModule):
                             trimmed_state_dict[prefix + attr] = content.reshape(-1)[start:end].to(device)
 
         return trimmed_state_dict
+
+    @torch.no_grad()
+    def gather_state_dict(
+        self,
+        *,
+        device: Union[str, torch.device] = None,
+    ) -> Dict[str, Any]:
+        """
+        Gather model state dicts from all ranks involved in the parallel module,
+        And merge them into a single merged model state dict in all ranks.
+
+        TODO: More general implementation for more complex partitioning strategy
+        (e.g. pipeline parallelism, zero3, partition on multiple dimensions, uneven partition),
+        currently we only support single-dimension even partition.
+
+        Args:
+            device: the device to put the merged state dict.
+                Use torch.cuda.current_device() if it is None.
+        Returns:
+            Dict[str, Any]: the merged model state dict
+        """
+        if self.compute_config.use_zero > 1:
+            raise ValueError("Zero3 is not supported.")
+
+        device = device or torch.cuda.current_device()
+        rank = torch.distributed.get_rank()
+        compute_config = self.compute_config
+
+        # dg -> dedup group
+        dg_size = compute_config.module_dedup_group_size
+        dg_index = torch.distributed.get_rank() // dg_size
+        dg_ranks = list(range(dg_index * dg_size, (dg_index + 1) * dg_size))
+
+        attr_metas = [self.get_attr_meta_map(rank) for rank in dg_ranks]
+        # key: orig attr name,
+        # value: list of (local attr name, attr meta) for each rank in the dedup group
+        attr_pas: dict[str, list[tuple[str, AttrMeta]]] = {}
+        for rank, attr_meta in enumerate(attr_metas):
+            for attr_name, meta in attr_meta.items():
+                if meta.orig_name not in attr_pas:
+                    attr_pas[meta.orig_name] = [None] * dg_size
+                attr_pas[meta.orig_name][rank] = (attr_name, meta)
+
+        # verify we can handle this module
+        for key, pas in attr_pas.items():
+            metas = [pa[1] for pa in pas]
+            if any(meta is None for meta in metas):
+                raise ValueError(f'Attribute {key} is missing in some ranks: {metas}. NOTE: Pipeline Parallelism is not supported.')
+
+            if not all(meta.sub_shape == metas[0].sub_shape for meta in metas):
+                raise ValueError(f'Attribute {key} has inconsistent sub shapes across ranks: {metas}.')
+
+            partitioned_dims = metas[0].get_partitioned_dims()
+            if len(partitioned_dims) > 1:
+                raise ValueError(f'Attribute {key} is partitioned on multiple dimensions: {metas}. NOTE: Only single-dimension partition is supported.')
+
+        _logger.info(f'Rank {rank}: Gathering model state dict from ranks {dg_ranks} for parallel module {self.__class__.__name__}')
+
+        dedup_group = DeviceGroup().get_group(dg_ranks)
+        dg_rank = torch.distributed.get_rank(dedup_group)
+
+        state_dict: dict[str, torch.Tensor] = self.state_dict()
+        merged_state_dict = {}
+        for key, pas in attr_pas.items():
+            metas = [pa[1] for pa in pas]
+            # Skip non-persistent buffers (e.g. rope_cos_sin_cache) that appear in
+            # attr_meta_map but are not included in state_dict.
+            if pas[dg_rank][0] not in state_dict:
+                _logger.debug(f'Rank {rank}: Skipping attribute {key} (local name {pas[dg_rank][0]}) — not in state_dict (likely a non-persistent buffer).')
+                continue
+
+            partitioned_dims = metas[0].get_partitioned_dims()
+            if not partitioned_dims: # replicated tensor, just take from state dict
+                merged_state_dict[key] = state_dict[pas[dg_rank][0]].to(device, non_blocking=True)
+            else:
+                # partitioned tensor, need to all gather
+                # Use GPU for the collective, then immediately move to target device
+                # and delete GPU temporaries to keep peak memory low.
+                local_tensor = state_dict[pas[dg_rank][0]].cuda()
+                dest = [
+                    torch.empty(metas[0].sub_shape, dtype=metas[0].dtype, device='cuda')
+                    for _ in metas
+                ]
+                # all_gather_into_tensor is not used here
+                # because the partitioned dimension may not be the first dimension,
+                # and all_gather_into_tensor only supports gathering on the first dimension.
+                torch.distributed.all_gather(dest, local_tensor, group=dedup_group)
+                merged_state_dict[key] = torch.cat(dest, dim=partitioned_dims[0]).to(device, non_blocking=True)
+                del dest, local_tensor
+
+        _logger.info(f'Rank {rank}: Finished gathering model state dict')
+        torch.cuda.synchronize()
+        torch.distributed.barrier()
+        return merged_state_dict
 
     def _pack(
         self,
