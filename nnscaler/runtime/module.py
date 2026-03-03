@@ -13,6 +13,7 @@ import warnings
 from pathlib import Path
 from dataclasses import dataclass, asdict
 from collections import defaultdict
+import math
 
 import torch
 import torch.distributed as dist
@@ -59,6 +60,12 @@ class AttrMeta:
     # shape of the sub tensor
     # it should be the shape of full_tensor[slicers]
     sub_shape: Tuple[int, ...]
+
+    def get_local_numel(self):
+        return math.prod(self.sub_shape)
+
+    def get_full_numel(self):
+        return math.prod(self.shape)
 
     def get_partitioned_dims(self):
         partitioned_dims = []
@@ -1787,9 +1794,6 @@ class ParallelModule(CubeModule):
         Returns:
             Dict[str, Any]: the merged model state dict
         """
-        if self.compute_config.use_zero > 1:
-            raise ValueError("Zero3 is not supported.")
-
         device = device or torch.cuda.current_device()
         rank = torch.distributed.get_rank()
         compute_config = self.compute_config
