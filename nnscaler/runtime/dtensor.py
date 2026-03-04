@@ -14,25 +14,25 @@ class DTensor:
         rank: int,
         local_tensor: Optional[torch.Tensor],
         attr_metas: list['AttrMeta'],
-        zero3_attr_metas: list['Zero3AttrMeta']
+        zero3_subgroup: Optional[list[int]]
     ):
         """
         Args:
             rank (int): The rank of the current process.
             local_tensor (Optional[torch.Tensor]): The local tensor in the current rank.
             attr_metas (list[AttrMeta]): A list of metadatas for attributes for each rank.
-            zero3_attr_metas (list[Zero3AttrMeta]): A list of metadatas for ZeRO3 attributes for each rank.
+            zero3_subgroup (Optional[list[int]]): A list of ranks for the ZeRO3 subgroup.
         """
         self.rank = rank
         self.local_tensor = local_tensor
         self.attr_metas = attr_metas
-        self.zero3_attr_metas = zero3_attr_metas
 
         self.attr_meta = attr_metas[rank]
-        self.zero3_attr_meta = zero3_attr_metas[rank] if zero3_attr_metas else None
 
-        self.z3_groups = self._get_zero3_groups()
-        self.z3_pg, self.z3_ranks = self._create_pgs(self.z3_groups)
+        if zero3_subgroup is not None:
+            self.z3_pg, self.z3_ranks = DeviceGroup().get_group(zero3_subgroup), zero3_subgroup
+        else:
+            self.z3_pg, self.z3_ranks = None, None
 
         self.tp_groups, self.partitioned_dim = self._get_tp_groups()
         self.tp_pg, self.tp_ranks = self._create_pgs(self.tp_groups)
@@ -55,48 +55,22 @@ class DTensor:
                 ret_ranks = g
         return ret_pg, ret_ranks
 
-    def _get_zero3_groups(self):
-        if self.zero3_attr_meta is None:
-            return None
-
-        zero3_groups: list[list[int]] = []
-        last_end = -1
-        chunk_size = -1
-        for i, meta in enumerate(self.zero3_attr_metas):
-            if meta is None:
-                continue
-
-            assert self.attr_meta is not None, "ZeRO3 attributes should also have attr metadata."
-            if chunk_size == -1:
-                chunk_size = meta.chunk_size
-            assert meta.chunk_size == chunk_size, "All ZeRO3 attributes should have the same chunk size."
-
-            if meta.start == 0:
-                zero3_groups.append([i])
-                last_end = meta.end
-            else:
-                assert meta.start == last_end, "ZeRO3 groups should be non-overlapping and cover the full tensor."
-                zero3_groups[-1].append(i)
-                last_end = meta.end
-
-        assert all(len(group) == len(zero3_groups[0]) for group in zero3_groups), "All ZeRO3 groups should have the same number of ranks."
-        return zero3_groups
-
     def _gather_zero3(self, local_tensor: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
         # For ZeRO3 partitioned parameters, we need to gather the tensor on the current rank using ZeRO3 metadata.
-        if self.z3_pg is None:
+        if self.z3_ranks is None or len(self.z3_ranks) <= 1:
             return local_tensor
 
         local_tensor = local_tensor.cuda(non_blocking=True)
+        assert len(local_tensor.shape) == 1, 'zero3 partitioned tensor should be 1D.'
         dest_tensor = torch.empty(
-            self.zero3_attr_meta.chunk_size * len(self.z3_ranks),
+            local_tensor.numel() * len(self.z3_ranks),
             dtype=self.attr_meta.dtype,
             device='cuda'
         )
         torch.distributed.all_gather_into_tensor(dest_tensor, local_tensor, group=self.z3_pg)
         del local_tensor
         # The gathered tensor may have extra padding elements, so we need to slice it to the full size and reshape it.
-        return dest_tensor[:self.attr_meta.get_full_numel()].reshape(self.attr_meta.shape).contiguous()
+        return dest_tensor[:self.attr_meta.get_local_numel()].reshape(self.attr_meta.sub_shape).contiguous()
 
     def _get_tp_groups(self):
         if self.attr_meta is None:
@@ -127,7 +101,7 @@ class DTensor:
         return tp_groups, partitioned_dim
 
     def _gather_tp(self, local_tensor: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
-        if self.tp_pg is None:
+        if self.tp_ranks is None or len(self.tp_ranks) <= 1:
             return local_tensor
 
         local_tensor = local_tensor.cuda(non_blocking=True)
@@ -162,12 +136,16 @@ class DTensor:
         return pp_groups
 
     def _gather_pp(self, local_tensor: Optional[torch.Tensor]) -> torch.Tensor:
-        if self.pp_pg is None:
-            assert local_tensor is not None, "Full tensor should be available on all ranks when pp_pg is None."
+        if self.pp_ranks is None or len(self.pp_ranks) <= 1:
+            assert local_tensor is not None, "Full tensor should be available on all ranks when pp_ranks is None."
             return local_tensor
 
+        attr_metas = [self.attr_metas[t] for t in self.pp_ranks if self.attr_metas[t] is not None]
+        assert attr_metas, "There should be at least one valid attr_meta for PP broadcast."
+        attr_meta = attr_metas[0]
+
         if local_tensor is None:
-            local_tensor = torch.empty(self.attr_meta.shape, dtype=self.attr_meta.dtype, device='cuda')
+            local_tensor = torch.empty(attr_meta.shape, dtype=attr_meta.dtype, device='cuda')
         else:
             local_tensor = local_tensor.cuda(non_blocking=True)
 
@@ -181,19 +159,22 @@ class DTensor:
         torch.distributed.broadcast(local_tensor, src=src_rank, group=self.pp_pg)
         return local_tensor
 
-    def full_tensor(self, *, device=None) -> torch.Tensor:
+    def full_tensor(self) -> torch.Tensor:
         """
         Gather the full tensor for the current attribute, regardless of whether it is partitioned or replicated.
         Here we take 3 steps to gather the full tensor:
         1. zero3 partitioned tensor: gather the tensor (may be sharded) on the current rank using ZeRO3 metadata.
         2. tp partitioned tensor: gather the tensor on the current rank using TP metadata.
         3. pp: broadcast the full tensor to ranks in the same PP group.
-        """
-        device = device or torch.cuda.current_device()
 
+        Returns:
+            The full tensor for the current attribute.
+            The shape and dtype of the returned tensor are the same as the original full tensor before partitioning.
+            The device of the returned tensor is 'cuda' if the local tensor is sharded,
+            otherwise local tensor is returned as is.
+        """
         ftensor = self._gather_zero3(self.local_tensor)
         ftensor = self._gather_tp(ftensor)
         ftensor = self._gather_pp(ftensor)
-        ftensor = ftensor.to(device, non_blocking=True)
 
         return ftensor
