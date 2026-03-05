@@ -618,7 +618,7 @@ def test_checkpoint_merge():
     launch_torchrun(4, _gpu_merge_worker)
 
 
-def _gather_full_model_state_dict_worker(tmp_path, use_zero):
+def _gather_full_model_state_dict_worker(tmp_path, use_zero, pas_policy='tp', plan_ngpus=2, runtime_ngpus=4):
     from .test_end2end import MLP, dummy_data
     init_distributed()
 
@@ -626,11 +626,17 @@ def _gather_full_model_state_dict_worker(tmp_path, use_zero):
     model = parallelize(
         model,
         {'data': dummy_data()},
-        pas_policy='tp',
+        pas_policy=pas_policy,
+        instance_name=f'gather_full_model_state_dict_{pas_policy}_{use_zero}_{plan_ngpus}_{runtime_ngpus}',
         compute_config= ComputeConfig(
-            2, 4,
+            plan_ngpus, runtime_ngpus,
             use_end2end=True,
             use_zero=use_zero,
+            pas_config={
+                'pipeline_nmicros': 2,
+                'pipeline_nstages': 2,
+                'pipeline_scheduler': '1f1b'
+            }
         ),
         gen_savedir=tmp_path
     )
@@ -649,4 +655,5 @@ def _gather_full_model_state_dict_worker(tmp_path, use_zero):
 @pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.device_count() < 4, reason='lack of gpu devices')
 @pytest.mark.parametrize('use_zero', [0, 1, 3])
 def test_gather_full_model_state_dict(tmp_path, use_zero):
+    launch_torchrun(4, _gather_full_model_state_dict_worker, tmp_path, use_zero, 'hybrid', 4, 4)
     launch_torchrun(4, _gather_full_model_state_dict_worker, tmp_path, use_zero)

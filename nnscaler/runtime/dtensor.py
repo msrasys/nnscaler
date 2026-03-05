@@ -119,20 +119,40 @@ class DTensor:
         return ret
 
     def _get_pp_groups(self):
-        # collect all param names
-        num_replicated = 0
-        for meta in self.attr_metas:
-            if meta is not None:
-                num_replicated += 1
-
-        if num_replicated == len(self.attr_metas):
-            # all ranks have the full tensor, no need to gather
+        if all(meta is not None for meta in self.attr_metas):
+            # all ranks have tensor,
+            # PP is not involved in this case, so we can skip the PP group creation and broadcasting.
             return None
 
-        assert len(self.attr_metas) % num_replicated == 0, "The number of replicated ranks should be divisible by the total number of ranks."
+        param_ranks: list[int] = [i for i, meta in enumerate(self.attr_metas) if meta is not None]
+
+        tp_groups: list[list[int]] = [[param_ranks[0]]]
+        for r in param_ranks[1:]:
+            # tp in the same pp groups have consecutive rank ids
+            if r - tp_groups[-1][-1] == 1:
+                tp_groups[-1].append(r)
+            else:
+                tp_groups.append([r])
+        assert len(tp_groups) > 0, "There should be at least one TP group for PP group creation."
+        assert all(len(g) == len(tp_groups[0]) for g in tp_groups), "All TP groups should have the same number of ranks for PP group creation."
+        tp_size = len(tp_groups[0])
+        dp_num = len(tp_groups)
+        dp_size = len(self.attr_metas) // dp_num
+        # pp_size = len(self.attr_metas) // (tp_size * dp_size)
+
+        # if we have 8 ranks, tp_size=2, dp_size=2, pp_size=2
+        # the dp groups will be [0, 1, 2, 3] and [4, 5, 6, 7]
+        # inside each dp group,
+        # tp groups will be [0, 1] and [2, 3] for the first dp group,
+        # and [4, 5] and [6, 7] for the second dp group
+        # the pp group will be [0, 2] and [1, 3] for the first dp group,
+        # and [4, 6] and [5, 7] for the second dp group.
+        # We will broadcast the full tensor inside each PP group
         pp_groups: list[list[int]] = []
-        for i in range(0, len(self.attr_metas), num_replicated):
-            pp_groups.append(list(range(i, i + num_replicated)))
+        for i in range(0, len(self.attr_metas), dp_size):
+            for j in range(0, tp_size):
+                pp_group = list(range(i + j, i + dp_size, tp_size))
+                pp_groups.append(pp_group)
         return pp_groups
 
     def _gather_pp(self, local_tensor: Optional[torch.Tensor]) -> torch.Tensor:
@@ -140,22 +160,20 @@ class DTensor:
             assert local_tensor is not None, "Full tensor should be available on all ranks when pp_ranks is None."
             return local_tensor
 
-        attr_metas = [self.attr_metas[t] for t in self.pp_ranks if self.attr_metas[t] is not None]
-        assert attr_metas, "There should be at least one valid attr_meta for PP broadcast."
-        attr_meta = attr_metas[0]
+        src_rank = None
+        for r in self.pp_ranks:
+            if self.attr_metas[r] is not None:
+                assert src_rank is None, "There should be only one source rank for PP broadcast."
+                src_rank = r
+        assert src_rank is not None, "There should be exactly one source rank for PP broadcast."
+
+        attr_meta = self.attr_metas[src_rank]
 
         if local_tensor is None:
             local_tensor = torch.empty(attr_meta.shape, dtype=attr_meta.dtype, device='cuda')
         else:
             local_tensor = local_tensor.cuda(non_blocking=True)
 
-        src_rank = None
-        for r in self.pp_ranks:
-            if self.attr_metas[r] is not None:
-                assert src_rank is None, "There should be only one source rank for PP broadcast."
-                src_rank = r
-
-        assert src_rank is not None, "There should be at least one source rank for PP broadcast."
         torch.distributed.broadcast(local_tensor, src=src_rank, group=self.pp_pg)
         return local_tensor
 
