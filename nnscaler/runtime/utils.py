@@ -269,7 +269,7 @@ def is_dparam(param: torch.nn.Parameter) -> bool:
     return hasattr(param, DISTRIBUTED_PARAM_META_KEY)
 
 
-def get_dparam_meta(param: torch.nn.Parameter) -> Optional['DAttrMeta']:
+def get_dparam_meta(param: torch.nn.Parameter) -> Optional['AttrMeta']:
     """
     Get the distributed meta information of a parameter.
     None if the parameter does not have distributed meta.
@@ -277,7 +277,7 @@ def get_dparam_meta(param: torch.nn.Parameter) -> Optional['DAttrMeta']:
     return getattr(param, DISTRIBUTED_PARAM_META_KEY, None)
 
 
-def set_dparam_meta(param: torch.nn.Parameter, meta: 'DAttrMeta'):
+def set_dparam_meta(param: torch.nn.Parameter, meta: 'AttrMeta'):
     """
     Set the distributed meta information of a parameter.
     """
