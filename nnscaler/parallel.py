@@ -1458,7 +1458,7 @@ def build_optimizer(
                 'zero': 0,
                 'max_bucket_size_bytes': compute_config.max_bucket_size_bytes,
                 'zero_use_reduce_scatter': compute_config.zero_use_reduce_scatter,
-                'zero_ngroups': compute_config.zero_ngroups,
+                'zero_ngroups': 1, # compute_config.zero_ngroups,
             }
         non_parallel_module_reducer = Reducer(group, **reducer_config)
         for param in non_parallel_parameters:
