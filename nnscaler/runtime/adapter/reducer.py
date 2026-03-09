@@ -798,17 +798,21 @@ class Reducer:
             if len(sub_ranks) > 1:
                 assert DeviceGroup().group_exists(sub_ranks), f"zero subgroup {sub_ranks} does not exist in comm groups"
             self._zero_subgroup = DeviceGroup().get_group(sub_ranks)
+            self._zero_subranks = sub_ranks
             # crossgroup is for the allreduce across zero subgroups, it is only used when
             # reduce scatter is enabled and the number of zero subgroups is larger than 1.
             start_rank = curr_rank % zgroup_sz
             cross_ranks = ranks[start_rank::zgroup_sz]
             assert len(cross_ranks) == zero_ngroups
             self._zero_crossgroup = DeviceGroup().get_group(cross_ranks)
+            self._zero_crossranks = cross_ranks
         else:
             assert zero_ngroups == 1, f"ZeRO number of groups must be 1, but got {zero_ngroups}"
             self._zero_subgroup = self._group
+            self._zero_subranks = ranks
             # trivial crossgroup for single rank
             self._zero_crossgroup = DeviceGroup().get_group([torch.distributed.get_rank()])
+            self._zero_crossranks = [torch.distributed.get_rank()]
 
         self._zero_ngroups = zero_ngroups
 

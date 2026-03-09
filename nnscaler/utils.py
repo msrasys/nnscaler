@@ -438,13 +438,17 @@ def is_running_distributed() -> bool:
     return 'TORCHELASTIC_RUN_ID' in os.environ
 
 
-def select_many(data: Iterable[Any], fn: Callable[[Any], Iterable[Any]]) -> Iterable[Any]:
+ItemT = TypeVar('ItemT')
+ItemU = TypeVar('ItemU')
+
+
+def select_many(data: Iterable[ItemT], fn: Callable[[ItemT], Iterable[ItemU]]) -> Iterable[ItemU]:
     """Select many elements from the iterable with the given function."""
     for item in data:
         yield from fn(item)
 
 
-def first(data: Iterable[Any], fn: Optional[Callable[[Any], bool]]) -> Any:
+def first(data: Iterable[ItemT], fn: Optional[Callable[[ItemT], bool]] = None) -> ItemT:
     """Get the first element from the iterable that satisfies the given function."""
     fn = fn or (lambda x: x)
     for item in data:
@@ -453,7 +457,7 @@ def first(data: Iterable[Any], fn: Optional[Callable[[Any], bool]]) -> Any:
     raise ValueError("No element satisfies the condition.")
 
 
-def first_or(data: Iterable[Any], fn: Optional[Callable[[Any], bool]], *, default=None) -> Optional[Any]:
+def first_or(data: Iterable[ItemT], fn: Optional[Callable[[ItemT], bool]] = None, *, default=None) -> Optional[ItemT]:
     """
     Get the first element from the iterable that satisfies the given function,
     or return default value.
