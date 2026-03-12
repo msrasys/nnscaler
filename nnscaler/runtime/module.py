@@ -1937,8 +1937,8 @@ class NonParallelModule(ParallelModule, skip_init=True):
         self.world_size: int = ref_pm.world_size
         self.runtime_version: str = ref_pm.runtime_version
 
-        self.params = params
-        self.reducers = [reducer]
+        self._parameters = params
+        self._reducers = [reducer]
 
         self.attr_meta_maps: list[dict[str, AttrMeta]] = [
             {
@@ -1955,6 +1955,7 @@ class NonParallelModule(ParallelModule, skip_init=True):
             }
             for _ in range(self.world_size)
         ]
+        self._fullmap = self.attr_meta_maps[self.rank]
         # the directory of the module located
         self.module_dir: Path = Path(__file__).parent
         self.dist_param_map: dict[str, str] = {
@@ -1972,14 +1973,14 @@ class NonParallelModule(ParallelModule, skip_init=True):
         self._zero_metadata = self._get_zero_metadata()
 
     def parameters(self, recurse: bool = True):
-        return self.params.values()
+        return self._parameters.values()
 
     def named_parameters(self, prefix = "", recurse = True, remove_duplicate = True):
         assert prefix == "" and recurse is True, "Only support default arguments"
-        return self.params.items()
+        return self._parameters.items()
 
     def parameters_for_optimizer(self):
-        return self.reducers[0].parameters_for_optimizer()
+        return self._reducers[0].parameters_for_optimizer()
 
     def get_extra_state(
         self,
@@ -1993,7 +1994,7 @@ class NonParallelModule(ParallelModule, skip_init=True):
                 compute_config=self.compute_config,
                 dist_param_map=self.dist_param_map,
                 param_area_map=self.attr_meta_maps[self.rank],
-                cube_param_names=list(self.params.keys()),
+                cube_param_names=list(self._parameters.keys()),
                 **asdict(self.origin_module_metadata),
                 **asdict(self._zero_metadata),
             )
@@ -2010,7 +2011,7 @@ class NonParallelModule(ParallelModule, skip_init=True):
         param_map: dict[torch.nn.Parameter, torch.nn.Parameter] = {}
         fields = unchecked_fields(self)
 
-        for p in self.params:
+        for p in self.parameters():
             param_map[p] = torch.nn.Parameter(
                 torch.empty_like(p, device='meta')) if p is not None else None
 
@@ -2019,7 +2020,8 @@ class NonParallelModule(ParallelModule, skip_init=True):
             fields.rank: self.rank,
             fields.world_size: self.world_size,
             fields.runtime_version: self.runtime_version,
-            fields.params: self.params,
+            fields._parameters: {n: param_map[p] for n, p in self._parameters.items()},
+            fields._fullmap: self._fullmap,
             fields.attr_meta_maps: self.attr_meta_maps,
             fields.module_dir: self.module_dir,
             fields.dist_param_map: self.dist_param_map,
@@ -2043,7 +2045,8 @@ class NonParallelModule(ParallelModule, skip_init=True):
         object.__setattr__(pm, fields.rank, state[fields.rank])
         object.__setattr__(pm, fields.world_size, state[fields.world_size])
         object.__setattr__(pm, fields.runtime_version, state[fields.runtime_version])
-        object.__setattr__(pm, fields.params, state[fields.params])
+        object.__setattr__(pm, fields._parameters, state[fields._parameters])
+        object.__setattr__(pm, fields._fullmap, state[fields._fullmap])
         object.__setattr__(pm, fields.attr_meta_maps, state[fields.attr_meta_maps])
         object.__setattr__(pm, fields.module_dir, state[fields.module_dir])
         object.__setattr__(pm, fields.dist_param_map, state[fields.dist_param_map])
@@ -2052,6 +2055,6 @@ class NonParallelModule(ParallelModule, skip_init=True):
         object.__setattr__(pm, fields._zero3_param_metadata, state[fields._zero3_param_metadata])
         object.__setattr__(pm, fields._zero_metadata, state[fields._zero_metadata])
 
-        object.__setattr__(pm, fields.reducers, [Reducer._unpack(reducer) for reducer in state[fields.reducers]])
+        object.__setattr__(pm, fields._reducers, [Reducer._unpack(reducer) for reducer in state[fields._reducers]])
 
         return pm

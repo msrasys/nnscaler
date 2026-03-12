@@ -897,13 +897,16 @@ class Reducer:
 
     def build_buckets(self, param_clss: Optional[dict[torch.nn.Parameter, 'PARAM_CLASS_TYPE']]=None):
         """
-        Build buckets the reducer.
+        Build buckets in the reducer.
 
         The parameters in each bucket have consistent data types and classes,
         and each bucket contains at least one parameter.
         If the bucket contains more than 2 parameters, than the total size is samller
         than the max_bucket_size_bytes.
         """
+        if self._buckets:
+            raise RuntimeError("Buckets have already been built, cannot build again.")
+
         self._param_clss: dict[torch.nn.Parameter, Union[
             tuple[int, int, ParamZeroConfig],
             tuple[int, ParamZeroConfig],

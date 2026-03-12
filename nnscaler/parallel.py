@@ -1507,7 +1507,8 @@ def build_optimizer(
             compute_config or compute_configs[0],
             use_zero=reducer_config['zero'],
             use_async_reducer=reducer_config['async_op'],
-            max_bucket_size_bytes=reducer_config['max_bucket_size_bytes'],
+            reducer_bucket_cap_mb=reducer_config['max_bucket_size_bytes'] / (1024 * 1024)
+                if reducer_config['max_bucket_size_bytes'] else None,
             zero_use_reduce_scatter=reducer_config['zero_use_reduce_scatter'],
             zero_ngroups=reducer_config['zero_ngroups'],
         )
@@ -1530,6 +1531,8 @@ def build_optimizer(
             pm.build_buckets(param_clss=param_clss)
             for reducer in pm.reducers:
                 param_clss.update(reducer.get_opt_params())
+        if non_parallel_module_reducer:
+            param_clss.update(non_parallel_module_reducer.get_opt_params())
 
     opt_module_locs: Dict[str, ModuleParameterLocation] = {}
     opt_module_configs = {
@@ -2016,12 +2019,43 @@ def merge_state_dicts(
             #     assert opt_module_locs[i] == opt_module_locs[0]
             opt_new_pm_states[opt_module_locs[0]] = (merged_opt_state_dict['state'], module_prefix, extra_states[0].origin_param_names)
 
-    # opt_new_pm_states doesn't contain the state dict for non-parallel parameters
     if opt_new_pm_states:
         pm_orig_param_names: Dict[str, List[str]] = {}
         for k, extra_states in pm_extra_states.items():
             module_prefix = '.'.join(k)
             pm_orig_param_names[module_prefix] = ParallelModule.get_origin_parameter_names([e.param_area_map for e in extra_states])
+
+        # add non-parallel parameters state dict to opt_new_pm_states
+        if _NON_PARALLEL_MODULE_ATTR_NAME in opt_state_dicts:
+            assert _NON_PARALLEL_MODULE_ATTR_NAME in opt_extra_states[0].parallel_module_locs
+
+            # we also need to merge the state dict for non-parallel parameters when zero is on
+            npp_merged_opt_state_dict = ParallelModule.merge_opt_state_dicts(
+                [e.non_parallel_extra_state.param_area_map for e in opt_extra_states],
+                opt_state_dicts[_NON_PARALLEL_MODULE_ATTR_NAME],
+                [
+                    (e.non_parallel_extra_state.model_idx2opt_idx,
+                    e.non_parallel_extra_state.opt_idx2ranks,
+                    e.non_parallel_extra_state.zero,
+                    e.non_parallel_extra_state.zero3_param_metadata)
+                    for e in opt_extra_states
+                ],
+            )
+
+            opt_new_pm_states[
+                opt_extra_states[0].parallel_module_locs[_NON_PARALLEL_MODULE_ATTR_NAME]
+            ] = (
+                npp_merged_opt_state_dict['state'],
+                _NON_PARALLEL_MODULE_ATTR_NAME,
+                opt_extra_states[0].non_parallel_extra_state.origin_param_names,
+            )
+
+            pm_orig_param_names[_NON_PARALLEL_MODULE_ATTR_NAME] \
+                = ParallelModule.get_origin_parameter_names([
+                    e.non_parallel_extra_state.param_area_map
+                    for e in opt_extra_states
+            ])
+
         # now we can construct the merged state of optimizer from any rank
         # as said previously, the merge will be based on rank0's data
         orig_states: Dict[int, Any] = optimizer_state_dicts[0]['state']
@@ -2059,36 +2093,26 @@ def merge_state_dicts(
                 orig_cur_index += pm_loc.count
                 sorted_pm_locs_cur_index += 1
 
-        # handle non-parallel parameters
+        # reorder non-parallel parameters
         if opt_state_dicts is not None and _NON_PARALLEL_MODULE_ATTR_NAME in opt_state_dicts:
-            npp_opt_state_dicts = opt_state_dicts[_NON_PARALLEL_MODULE_ATTR_NAME]
-
             # all ranks should have the same non_parallel_param_locs
             npp_locs = opt_extra_states[0].non_parallel_param_locs
             assert all(e.non_parallel_param_locs == npp_locs for e in opt_extra_states), \
                 "All ranks should have the same non_parallel_param_locs in optimizer extra state."
 
-            # we also need to merge the state dict for non-parallel parameters when zero is on
-            npp_merged_opt_state_dict = ParallelModule.merge_opt_state_dicts(
-                [e.non_parallel_extra_state.param_area_map for e in opt_extra_states],
-                npp_opt_state_dicts,
-                [
-                    (e.non_parallel_extra_state.model_idx2opt_idx,
-                    e.non_parallel_extra_state.opt_idx2ranks,
-                    e.non_parallel_extra_state.zero,
-                    e.non_parallel_extra_state.zero3_param_metadata)
-                    for e in opt_extra_states
-                ],
-            )['state']
-            assert len(npp_merged_opt_state_dict) == len(npp_locs), \
-                "The number of non-parallel parameters in optimizer state dict should be the same with the number of non-parallel parameters in model state dict."
-            # merge back npp_merged_opt_state_dict to ret_states, the location is determined by non_parallel_param_locs
+            num_npp = len(npp_locs)
+            npp_start = ret_states_cur_index - num_npp
+            npp_states = {}
+            for loc in range(npp_start, ret_states_cur_index):
+                npp_states[loc - npp_start] = ret_states.pop(loc)
+
+            # merge back npp_states to ret_states, the location is determined by non_parallel_param_locs
             ret_new_states = {}
             npp_inserted = 0
-            for i in range(ret_states_cur_index + len(npp_merged_opt_state_dict)):
+            for i in range(ret_states_cur_index):
                 if npp_inserted < len(npp_locs) and i == npp_locs[npp_inserted]:
                     # the position for non-parallel parameters
-                    ret_new_states[i] = npp_merged_opt_state_dict[npp_inserted]
+                    ret_new_states[i] = npp_states[npp_inserted]
                     npp_inserted += 1
                 elif i - npp_inserted in ret_states:
                     # as `npp_inserted` non-parallel parameters are inserted
