@@ -446,8 +446,9 @@ class CubeModule(torch.nn.Module):
         else:
             return torch.equal(tensor1.cpu(), tensor2.cpu())
 
-    @staticmethod
+    @classmethod
     def merge_model_state_dicts(
+        cls,
         state_dicts: List[Dict],
         fullmaps: List[Dict[str, AttrMeta]],
         zero_idx_maps: Optional[List[Dict]] = None
@@ -503,7 +504,7 @@ class CubeModule(torch.nn.Module):
                 state_dict_merge_track_id = tuple((i.start, i.step, i.stop) for i in meta.slicers)
                 dest_tensor = full_model_state_dict[meta.orig_name][meta.slicers]
                 if dest_tensor.shape == partial_tensor.shape and state_dict_merge_track_id in state_dict_merge_track[meta.orig_name]:
-                    if not CubeModule._safe_tensor_equal(dest_tensor, partial_tensor):
+                    if not cls._safe_tensor_equal(dest_tensor, partial_tensor):
                             raise ValueError(f"Conflict in merging {meta.orig_name} from rank {rank}")
                     _logger.debug(f'rank {rank}: skip merging duplicated model state for param {meta.orig_name} with slicers {meta.slicers}')
                 else:
@@ -520,7 +521,7 @@ class CubeModule(torch.nn.Module):
                         fill_len = curr_end - curr_start
                         if (curr_start, curr_end) in curr_filled:
                             # already filled, let's check consistency
-                            if not CubeModule._safe_tensor_equal(dest_tensor.view(-1)[curr_start: curr_end], partial_tensor[0:fill_len]):
+                            if not cls._safe_tensor_equal(dest_tensor.view(-1)[curr_start: curr_end], partial_tensor[0:fill_len]):
                                 raise ValueError(f"Conflict in merging {meta.orig_name} from rank {rank}")
                         else:
                             old_shape = dest_tensor.shape
@@ -543,8 +544,8 @@ class CubeModule(torch.nn.Module):
                         raise ValueError(f'Uncovered ZeRO3 parameter {param_name} with slicers {slicers}, full size {full_size}, covered size {covered_size}')
         return full_model_state_dict
 
-    @staticmethod
-    def get_origin_parameter_names(fullmaps: List[Dict[str, AttrMeta]]):
+    @classmethod
+    def get_origin_parameter_names(cls, fullmaps: List[Dict[str, AttrMeta]]):
         """
         Get a list of original parameter names from the fullmaps.
         `merge_partial_states` will use this list to build the parameter order
@@ -560,8 +561,8 @@ class CubeModule(torch.nn.Module):
                     origin_parameter_names.append(meta.orig_name)
         return origin_parameter_names
 
-    @staticmethod
-    def merge_partial_states(state_dicts: List,
+    @classmethod
+    def merge_partial_states(cls, state_dicts: List,
                              zero_idx_maps=None):
         """Merge model and optimizer states from different shard into a single-model state.
 
@@ -584,15 +585,16 @@ class CubeModule(torch.nn.Module):
         """
         # the filtering below is to be compatible with fairseq
         # which will set some model_state_dicts/optim_state_dicts to None for deduplication
-        return CubeModule.merge_state_dicts(
+        return cls.merge_state_dicts(
             [state_dict[-1] for state_dict in state_dicts],
             [state_dict[0] for state_dict in state_dicts if state_dict[0] is not None],
             [state_dict[1] for state_dict in state_dicts if state_dict[1] is not None],
             zero_idx_maps
         )
 
-    @staticmethod
+    @classmethod
     def merge_state_dicts(
+        cls,
         fullmaps: List[Dict[str, AttrMeta]],
         model_state_dicts: List[Dict[str, torch.Tensor]],
         optim_state_dicts: Optional[List[Dict[str, Any]]] = None,
@@ -623,11 +625,21 @@ class CubeModule(torch.nn.Module):
         # help understand the whole logic. In other words, the real plan_ngpus is <= len(model_state_dicts).
         plan_ngpus = len(model_state_dicts)
         # gather model states
-        full_model_state_dict = CubeModule.merge_model_state_dicts(model_state_dicts, fullmaps[0: plan_ngpus], zero_idx_maps)
+        full_model_state_dict = cls.merge_model_state_dicts(model_state_dicts, fullmaps[0: plan_ngpus], zero_idx_maps)
         _logger.info('finish merge model states')
         if optim_state_dicts is None:
             return full_model_state_dict, None
+        else:
+            return full_model_state_dict, cls.merge_opt_state_dicts(fullmaps, optim_state_dicts, zero_idx_maps)
 
+    @classmethod
+    def merge_opt_state_dicts(
+        cls,
+        fullmaps: List[Dict[str, AttrMeta]],
+        optim_state_dicts: Optional[List[Dict[str, Any]]] = None,
+        zero_idx_maps: Optional[List[Dict]] = None
+    ):
+        plan_ngpus = len(optim_state_dicts)
         # gather optimizer states
         full_optim_state_dict: Dict[str, Any] = {}  # param_id -> Dict[state_name, value]
 
@@ -637,7 +649,7 @@ class CubeModule(torch.nn.Module):
         # both parameters and buffers, we need to remove the buffers from the list.
         # More details refer to the implementation:
         # https://pytorch.org/docs/stable/_modules/torch/nn/modules/module.html#Module._save_to_state_dict
-        origin_parameter_names: List[str] = CubeModule.get_origin_parameter_names(fullmaps)
+        origin_parameter_names: List[str] = cls.get_origin_parameter_names(fullmaps)
 
         # handle 'state' in optimizer state dict
         # NOTE: each rank may have its local optimizer state working on a sub-set
@@ -707,7 +719,7 @@ class CubeModule(torch.nn.Module):
                             if fill_start + fill_len > param_numel:
                                 fill_len = param_numel - fill_start
                             # check consistency for the already filled part
-                            if not CubeModule._safe_tensor_equal(
+                            if not cls._safe_tensor_equal(
                                 opt_states_1d[key][fill_start: fill_start + fill_len],
                                 bstate[key][pstart: pstart+fill_len]
                             ):
@@ -807,7 +819,7 @@ class CubeModule(torch.nn.Module):
                         # special handle for step: scalar tensor type
                         if state_name == 'step':
                             if state_name in full_states[full_index]:
-                                if not CubeModule._safe_tensor_equal(full_states[full_index][state_name], value):
+                                if not cls._safe_tensor_equal(full_states[full_index][state_name], value):
                                     raise ValueError(f"Conflict in merging {param_name}.{state_name} from rank {work_idx}")
                             else:
                                 full_states[full_index][state_name] = value.cpu()
@@ -828,7 +840,7 @@ class CubeModule(torch.nn.Module):
                                 full_states[full_index][state_name] = torch.empty(meta.shape, dtype=value.dtype, device='cpu')
 
                             if track_id in state_merge_track:
-                                if not CubeModule._safe_tensor_equal(full_states[full_index][state_name][meta.slicers], value):
+                                if not cls._safe_tensor_equal(full_states[full_index][state_name][meta.slicers], value):
                                     raise ValueError(f"Conflict in merging {param_name}.{state_name} from rank {work_idx}")
                             else:
                                 # assign with partial tensor
@@ -850,10 +862,10 @@ class CubeModule(torch.nn.Module):
         if 'param_groups' in full_optim_state_dict:  # for backward compatibility
             full_optim_state_dict['param_groups'][0]['params'] = list(range(len(origin_parameter_names)))
 
-        return full_model_state_dict, full_optim_state_dict
+        return full_optim_state_dict
 
-    @staticmethod
-    def merge_checkpoints(filename_prefix='dist_checkpoint'):
+    @classmethod
+    def merge_checkpoints(cls, filename_prefix='dist_checkpoint'):
         ckpts = {}
         for rank in range(DeviceGroup().world_size):
             filename = f"{filename_prefix}-{rank}.ckpt"
@@ -868,7 +880,7 @@ class CubeModule(torch.nn.Module):
             optimizer_state_dict = ckpt['optim_state_dict']
             state_dicts.push(model_state_dict, optimizer_state_dict, dist_param_map, param_area_map, )
 
-        merged_model_state_dict, merged_optimizer_state_dict = CubeModule.merge_partial_states(state_dicts)
+        merged_model_state_dict, merged_optimizer_state_dict = cls.merge_partial_states(state_dicts)
 
         # dump to ckpt
         torch.save({'state_dict': merged_model_state_dict,
@@ -1901,4 +1913,145 @@ class ParallelModule(CubeModule):
 
         for cv in ParallelModule.__annotations__:
             setattr(GenModelX, cv, state[cv])
+        return pm
+
+
+class NonParallelModule(ParallelModule, skip_init=True):
+    """
+    A wrapper module for a reducer for non-parallel module
+    This is used to unify the interface of parallel module and non-parallel module,
+    so that we can use the same code to handle both cases, especially the state_dict related code.
+    """
+
+    def __init__(
+        self,
+        reducer: Reducer,
+        params: dict[str, torch.nn.Parameter],
+        compute_config: 'ComputeConfig',
+        ref_pm: ParallelModule,
+    ):
+        self.use_scheduler: bool = False
+        self.nmicros_per_scheduler_step: int = 1
+
+        self.rank: int = ref_pm.rank
+        self.world_size: int = ref_pm.world_size
+        self.runtime_version: str = ref_pm.runtime_version
+
+        self.params = params
+        self.reducers = [reducer]
+
+        self.attr_meta_maps: list[dict[str, AttrMeta]] = [
+            {
+                n: AttrMeta(
+                    tid=None,
+                    is_param=True,
+                    orig_name=n,
+                    shape = p.shape,
+                    slicers=tuple( slice(0, s) for s in p.shape),
+                    sub_shape=p.shape,
+                    dtype=p.dtype,
+                    val_chunks=1,
+                ) for n, p in params.items()
+            }
+            for _ in range(self.world_size)
+        ]
+        # the directory of the module located
+        self.module_dir: Path = Path(__file__).parent
+        self.dist_param_map: dict[str, str] = {
+            n: n for n in params.keys()
+        }
+        self.compute_config: 'ComputeConfig' = compute_config
+        self.origin_module_metadata = OriginModuleMetadata(
+            origin_param_names=list(params.keys()),
+            origin_state_dict_names=list(params.keys()),
+            origin_shared_param_names=[],  # TODO: shared param support
+        )
+        self._zero3_param_metadata: dict[str, Zero3AttrMeta] = {
+            n: None for n in params.keys()
+        }
+        self._zero_metadata = self._get_zero_metadata()
+
+    def parameters(self, recurse: bool = True):
+        return self.params.values()
+
+    def named_parameters(self, prefix = "", recurse = True, remove_duplicate = True):
+        assert prefix == "" and recurse is True, "Only support default arguments"
+        return self.params.items()
+
+    def parameters_for_optimizer(self):
+        return self.reducers[0].parameters_for_optimizer()
+
+    def get_extra_state(
+        self,
+    ) -> ExtraState:
+        """
+        This is a helper function to create the extra state for a reducer,
+        which is used for merging state dict
+        """
+        return ExtraState(
+                rank=self.rank,
+                compute_config=self.compute_config,
+                dist_param_map=self.dist_param_map,
+                param_area_map=self.attr_meta_maps[self.rank],
+                cube_param_names=list(self.params.keys()),
+                **asdict(self.origin_module_metadata),
+                **asdict(self._zero_metadata),
+            )
+
+    def _forward_impl(self, *args, **kwargs):
+        raise RuntimeError("NonParallelModule is a virtual module, and `forward` should not be called.")
+
+    def _pack(
+        self,
+    ):
+        """
+        Get a packed information of the NonParallelModule, so it can be sent to other ranks.
+        """
+        param_map: dict[torch.nn.Parameter, torch.nn.Parameter] = {}
+        fields = unchecked_fields(self)
+
+        for p in self.params:
+            param_map[p] = torch.nn.Parameter(
+                torch.empty_like(p, device='meta')) if p is not None else None
+
+        state = {
+            fields.nmicros_per_scheduler_step: self.nmicros_per_scheduler_step,
+            fields.rank: self.rank,
+            fields.world_size: self.world_size,
+            fields.runtime_version: self.runtime_version,
+            fields.params: self.params,
+            fields.attr_meta_maps: self.attr_meta_maps,
+            fields.module_dir: self.module_dir,
+            fields.dist_param_map: self.dist_param_map,
+            fields.compute_config: self.compute_config,
+            fields.origin_module_metadata: self.origin_module_metadata,
+            fields._zero3_param_metadata: self._zero3_param_metadata,
+            fields._zero_metadata: self._zero_metadata
+        }
+        state[fields.reducers] = [reducer._pack(param_map) for reducer in self._reducers]
+
+        return state
+
+    @classmethod
+    def _unpack(cls, state: dict):
+        """
+        Unpack the information and return a fake ParallelModule that carries the same information.
+        """
+        pm = object.__new__(cls)
+        fields = unchecked_fields(pm)
+        object.__setattr__(pm, fields.nmicros_per_scheduler_step, state[fields.nmicros_per_scheduler_step])
+        object.__setattr__(pm, fields.rank, state[fields.rank])
+        object.__setattr__(pm, fields.world_size, state[fields.world_size])
+        object.__setattr__(pm, fields.runtime_version, state[fields.runtime_version])
+        object.__setattr__(pm, fields.params, state[fields.params])
+        object.__setattr__(pm, fields.attr_meta_maps, state[fields.attr_meta_maps])
+        object.__setattr__(pm, fields.module_dir, state[fields.module_dir])
+        object.__setattr__(pm, fields.dist_param_map, state[fields.dist_param_map])
+        object.__setattr__(pm, fields.compute_config, state[fields.compute_config])
+        object.__setattr__(pm, fields.origin_module_metadata, state[fields.origin_module_metadata])
+        object.__setattr__(pm, fields._zero3_param_metadata, state[fields._zero3_param_metadata])
+        object.__setattr__(pm, fields._zero_metadata, state[fields._zero_metadata])
+
+        object.__setattr__(pm, fields.reducers, [Reducer._unpack(reducer) for reducer in state[fields.reducers]])
+
         return pm
