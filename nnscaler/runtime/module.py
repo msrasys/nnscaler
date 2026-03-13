@@ -1937,30 +1937,40 @@ class NonParallelModule(ParallelModule, skip_init=True):
         self.world_size: int = ref_pm.world_size
         self.runtime_version: str = ref_pm.runtime_version
 
-        self._parameters = params
+        # fake local attr names and dist names
+        tid = 0
+        local_name2params = {}
+        local_name2info: dict[str, tuple[int, str]] = {}
+        self.dist_param_map: dict[str, str] = {}
+        for n, p in params.items():
+            dist_name = n.replace('.', '_')
+            local_name = dist_name + f'_{tid}'
+            local_name2params[local_name] = p
+            local_name2info[local_name] = (tid, n)
+            self.dist_param_map[dist_name] = n
+            tid += 1
+
+        self._parameters = local_name2params
         self._reducers = [reducer]
 
         self.attr_meta_maps: list[dict[str, AttrMeta]] = [
             {
                 n: AttrMeta(
-                    tid=None,
+                    tid=local_name2info[n][0],
                     is_param=True,
-                    orig_name=n,
-                    shape = p.shape,
+                    orig_name=local_name2info[n][1],
+                    shape=p.shape,
                     slicers=tuple( slice(0, s) for s in p.shape),
                     sub_shape=p.shape,
                     dtype=p.dtype,
                     val_chunks=1,
-                ) for n, p in params.items()
+                ) for n, p in local_name2params.items()
             }
             for _ in range(self.world_size)
         ]
         self._fullmap = self.attr_meta_maps[self.rank]
         # the directory of the module located
         self.module_dir: Path = Path(__file__).parent
-        self.dist_param_map: dict[str, str] = {
-            n: n for n in params.keys()
-        }
         self.compute_config: 'ComputeConfig' = compute_config
         self.origin_module_metadata = OriginModuleMetadata(
             origin_param_names=list(params.keys()),
@@ -1968,7 +1978,7 @@ class NonParallelModule(ParallelModule, skip_init=True):
             origin_shared_param_names=[],  # TODO: shared param support
         )
         self._zero3_param_metadata: dict[str, Zero3AttrMeta] = {
-            n: None for n in params.keys()
+            n: None for n in local_name2params.keys()
         }
         self._zero_metadata = self._get_zero_metadata()
 
@@ -2030,7 +2040,7 @@ class NonParallelModule(ParallelModule, skip_init=True):
             fields._zero3_param_metadata: self._zero3_param_metadata,
             fields._zero_metadata: self._zero_metadata
         }
-        state[fields.reducers] = [reducer._pack(param_map) for reducer in self._reducers]
+        state[fields._reducers] = [reducer._pack(param_map) for reducer in self._reducers]
 
         return state
 

@@ -2207,13 +2207,13 @@ def _trim_optimizer_merged_state_dict(
     if _NON_PARALLEL_MODULE_ATTR_NAME in pm_name_locs:
         # it should be the last loc
         assert list(pm_name_locs.keys())[-1] == _NON_PARALLEL_MODULE_ATTR_NAME
-        npm_loc = pm_name_locs[_NON_PARALLEL_MODULE_ATTR_NAME]
-        # the count should match
-        assert npm_loc.count == len(opt_extra_state.non_parallel_param_locs)
         reordered_opt_state_dict = {}
         max_opt_state_idx = max(opt_state_dict.keys())
         npp_removed = 0
 
+        # remove non-parallel parameters
+        # then add non-parallel parameters at the end of the state dict
+        # 1. remove
         for i in range(max_opt_state_idx + 1):
             if npp_removed < len(opt_extra_state.non_parallel_param_locs) \
                 and i == opt_extra_state.non_parallel_param_locs[npp_removed]:
@@ -2221,8 +2221,14 @@ def _trim_optimizer_merged_state_dict(
             else:
                 reordered_opt_state_dict[i - npp_removed] = opt_state_dict[i]
 
+        # 2. append
+        # the location of non-parallel parameters in the merged state dict should be after all parallel module parameters
+        start_idx = sum(
+            len(pmm.origin_module_metadata.origin_param_names)
+            for pmm in pm_modules[:-1]  # the last one is non-parallel module
+        )
         for i, loc in enumerate(opt_extra_state.non_parallel_param_locs):
-            reordered_opt_state_dict[i + npm_loc.offset] = opt_state_dict[loc]
+            reordered_opt_state_dict[i + start_idx] = opt_state_dict[loc]
 
         opt_state_dict = reordered_opt_state_dict
 
@@ -2503,6 +2509,8 @@ def _extract_new_state(
     name = '_'.join(local_name.split('_')[:-1]) # remove the integer suffix
     assert name in dist_param_map
     attr_meta = param_area_map[local_name]
+    if dist_param_map[name] not in orig_param_dict:
+        print(name)
     new_val = orig_param_dict[dist_param_map[name]]
     sliced_new_val = {}
     for key in new_val:
@@ -3086,7 +3094,12 @@ def sync_grad_when(cond: bool):
 
 
 def _construct_parallel_module_stub(metadata):
-    pmodules = {prefix: ParallelModule._unpack(minfo) for prefix, minfo in metadata.items()}
+    pmodules = {
+        prefix:
+            ParallelModule._unpack(minfo) if prefix != _NON_PARALLEL_MODULE_ATTR_NAME
+            else NonParallelModule._unpack(minfo)
+        for prefix, minfo in metadata.items()
+    }
     real_pmodules = {prefix: m for prefix, m in pmodules.items() if prefix != _NON_PARALLEL_MODULE_ATTR_NAME}
 
     # whole parallel module
