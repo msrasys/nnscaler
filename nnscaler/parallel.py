@@ -1390,13 +1390,56 @@ def build_optimizer(
     4. backward():
        you need to call optimizer.sync_shard_grad() manually if you want to read the gradients of the module before optimizer.step().
 
+    Non-parallel module (mixed module) is also supported given it contains any sub `ParallelModule`.
+    `compute_config` argument is used when we creating the reducer
+    for parameters in non-parallel modules.
+
+    When zero1 is used, we will create a mocked parallel module (`NonParallelModule`)
+    to simplify state dicts related logic.
+
+    The basic idea is we move all non-parallel parameters (`npp`) to the end of optimizer states,
+    Here is an example:
+
+    Before move (0/3/4/6 are npp, 1/2 belong to one parallel module, 5 belongs to another parellel module)
+    ---------------------------------------------------------
+    name | opt state idx | is npp
+    ---------------------------------------------------------
+    p0 | 0   | Y
+    p1 | 1   | N
+    p2 | 2   | N
+    p3 | 3   | Y
+    p4 | 4   | Y
+    p5 | 5   | N
+    p6 | 6   | Y
+    After Move
+    ---------------------------------------------------------
+    name | opt state idx | is npp
+    ---------------------------------------------------------
+    p1 | 0   | N
+    p2 | 1   | N
+    p5 | 2   | N
+    p0 | 3   | Y
+    p3 | 4   | Y
+    p4 | 5   | Y
+    p6 | 6   | Y
+    The original locations of npp will be saved in `OptimizerExtraState.non_parallel_param_locs`,
+    and the locations of non-parallel parameter reducer will also be saved in `OptimizerExtraState.parallel_module_locs`
+    with a special module prefix (`_nnscaler_non_parallel_module_`) to distinguish it from real parallel modules.
+
+    The information will be used when we merge state dict/load merged state dict.
+
+    Here are some details about the support of non-parallel parameters:
+    1. Zero3 is not supported. As we can't inject code to prefetch/postevict parameters during forward/backwawrd
+       So we will use Zero1 when Zero3 is specified for non-parallel parameters.
+    2.
+
     Args:
         module (torch.nn.Module): the module to be optimized
         optimizer_fn (Union[Type[torch.optim.Optimizer], Callable[..., torch.optim.Optimizer]]):
             It can be the optimizer class or optimizer factory function.
             The first parameter of the optimizer_fn should be the parameters of the module.
         compute_config (Optional[ComputeConfig]):
-            The config will be used to generate communication reducer.
+            The config will be used to generate communication reducer for parameters in non-parallel modules.
             If it is None, Default configuration will be used when creating reducer for non-parallel modules.
         param_clss_fn (Optional[Callable[[str], Any]]):
             A function that maps original full qualified parameter names to their class IDs.

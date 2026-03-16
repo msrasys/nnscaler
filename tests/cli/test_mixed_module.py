@@ -15,10 +15,11 @@ def mixed1_worker(save_dir, config_file):
     gen_savedir = save_dir /  f'gen_{stem}'
     ckpt_savedir = save_dir / f'ckpt_{stem}'
 
-    # ground truth: train 6 epcho in one time
+    # ground truth: train 6 epcho in one time with zero 0
     trainer = Trainer([
         '-f', config_path,
         '--max_epochs', '6',
+        '--compute_config.use_zero', '0',
         '--enable_progress_bar', False,
         '--gen_savedir', str(gen_savedir),
         '--dataset_sampler.train_args.shuffle', False,
@@ -39,6 +40,8 @@ def mixed1_worker(save_dir, config_file):
         '--max_epochs', '1',
         '--enable_progress_bar', 'false',
         '--gen_savedir', str(gen0_savedir),
+        '--dataset_sampler.train_args.shuffle', False,
+        '--dataloader.train_args.shuffle', False,
         '--checkpoint.save_type', 'deduped',
         '--checkpoint.save_dir', str(ckpt0_savedir),
         '--checkpoint.resume_from', 'last',
@@ -52,6 +55,8 @@ def mixed1_worker(save_dir, config_file):
         '--max_epochs', '2',
         '--enable_progress_bar', 'false',
         '--gen_savedir', str(gen0_savedir),
+        '--dataset_sampler.train_args.shuffle', False,
+        '--dataloader.train_args.shuffle', False,
         '--checkpoint.save_type', 'sharded',
         '--checkpoint.save_dir', str(ckpt0_savedir),
         '--checkpoint.resume_from', 'last',
@@ -69,6 +74,8 @@ def mixed1_worker(save_dir, config_file):
         '--max_epochs', '3',
         '--enable_progress_bar', 'false',
         '--gen_savedir', str(gen0_savedir),
+        '--dataset_sampler.train_args.shuffle', False,
+        '--dataloader.train_args.shuffle', False,
         '--checkpoint.save_type', 'deduped',
         '--checkpoint.save_dir', str(ckpt0_savedir),
         '--checkpoint.resume_from.checkpoint', str(ckpt0_savedir / 'merged2.pt'),
@@ -87,6 +94,8 @@ def mixed1_worker(save_dir, config_file):
         '--max_epochs', '4',
         '--enable_progress_bar', 'false',
         '--gen_savedir', str(gen0_savedir),
+        '--dataset_sampler.train_args.shuffle', False,
+        '--dataloader.train_args.shuffle', False,
         '--checkpoint.save_type', 'deduped',
         '--checkpoint.save_dir', str(ckpt0_savedir),
         '--checkpoint.resume_from.checkpoint', str(ckpt0_savedir / 'merged3.pt'),
@@ -101,6 +110,8 @@ def mixed1_worker(save_dir, config_file):
         '--max_epochs', '5',
         '--enable_progress_bar', 'false',
         '--gen_savedir', str(gen0_savedir),
+        '--dataset_sampler.train_args.shuffle', False,
+        '--dataloader.train_args.shuffle', False,
         '--checkpoint.save_type', 'deduped',
         '--checkpoint.save_dir', str(ckpt0_savedir),
         '--checkpoint.resume_from.checkpoint', 'last',
@@ -115,12 +126,16 @@ def mixed1_worker(save_dir, config_file):
         '--max_epochs', '6',
         '--enable_progress_bar', 'false',
         '--gen_savedir', str(gen0_savedir),
+        '--dataset_sampler.train_args.shuffle', False,
+        '--dataloader.train_args.shuffle', False,
         '--checkpoint.save_type', 'deduped',
         '--checkpoint.save_dir', str(ckpt0_savedir),
         '--checkpoint.resume_from.checkpoint', 'last',
         '--checkpoint.resume_from.save_memory', False,
     ])
     trainer.run()
+
+    torch.distributed.barrier()
 
     if torch.distributed.get_rank() == 0:
         Trainer.merge_checkpoint(list((ckpt0_savedir / 'last').glob('*.ckpt')), ckpt0_savedir / 'merged.pt')
