@@ -44,11 +44,17 @@ dataset:
     dim: $(vars.dim)
     size: 10
 
+dataset_sampler:
+  train_args:
+    shuffle: false
+
 dataloader:
   train_args:
     drop_last: $(vars.drop_last)
+    shuffle: false
   val_args:
     drop_last: $(vars.drop_last)
+    shuffle: false
 
 checkpoint:
   keep_last_n_checkpoints: 30
