@@ -1636,12 +1636,8 @@ def build_optimizer(
             name=type(optimizer).__name__,
             parallel_module_locs=opt_module_locs,
             parallel_module_configs=opt_module_configs,
-            non_parallel_extra_state=
-                NonParallelModule(
-                    non_parallel_module_reducer,
-                    {param_original_names[p]: p for p in non_parallel_parameters},
-                    non_parallel_module_reducer_config,
-                    parallel_modules[0],
+            non_parallel_extra_state=getattr(
+                    module, _NON_PARALLEL_MODULE_ATTR_NAME
                 ).get_extra_state() if non_parallel_module_use_zero else None,
             non_parallel_param_locs=
                 list(non_parallel_parameter_locs.values())
