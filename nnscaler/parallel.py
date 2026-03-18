@@ -1428,11 +1428,6 @@ def build_optimizer(
 
     The information will be used when we merge state dict/load merged state dict.
 
-    Here are some details about the support of non-parallel parameters:
-    1. Zero3 is not supported. As we can't inject code to prefetch/postevict parameters during forward/backwawrd
-       So we will use Zero1 when Zero3 is specified for non-parallel parameters.
-    2.
-
     Args:
         module (torch.nn.Module): the module to be optimized
         optimizer_fn (Union[Type[torch.optim.Optimizer], Callable[..., torch.optim.Optimizer]]):
