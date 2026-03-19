@@ -1531,7 +1531,7 @@ def build_optimizer(
                 'zero': 1 if compute_config.use_zero else 0,
                 'max_bucket_size_bytes': compute_config.max_bucket_size_bytes,
                 'zero_use_reduce_scatter': compute_config.zero_use_reduce_scatter,
-                'zero_ngroups': 1, # compute_config.zero_ngroups,
+                'zero_ngroups': compute_config.zero_ngroups,
             }
         else:
             reducer_config = {
