@@ -24,6 +24,7 @@ from nnscaler.parallel import (
     load_merged_state_dict,
     load_merged_state_dict_from_rank,
     trimmed_broadcast_merged_state_dict,
+    gather_full_model_state_dict,
 )
 from nnscaler.runtime.module import ParallelModule, ExtraState
 from nnscaler.runtime.gnorm import calcuate_gnorm
@@ -421,6 +422,9 @@ def _train(model: torch.nn.Module, num_replicas, rank, start, end, ckpt_dir, inf
         'optimizer': optimizer_state_dict
     }, ckpt_file)
     torch.distributed.barrier()
+
+    full_state_dict = gather_full_model_state_dict(model)
+
     if torch.distributed.get_rank() == 0:
         ckpt_files = [ckpt_dir / ckpt_file_template.format(rank=i, start=end) for i in range(torch.distributed.get_world_size())]
         ckpt_state_dicts = [torch.load(f, weights_only=False) for f in ckpt_files]
@@ -445,6 +449,7 @@ def _train(model: torch.nn.Module, num_replicas, rank, start, end, ckpt_dir, inf
             _logger.setLevel(old)
         else:
             merged_model_state_dicts, merged_optimizer_state_dict = merge_state_dicts(model_state_dicts, optimizer_state_dicts)
+        assert_equal(full_state_dict, merged_model_state_dicts)
         torch.save({
             'model': merged_model_state_dicts,
             'optimizer': merged_optimizer_state_dict
@@ -613,21 +618,25 @@ def test_checkpoint_merge():
     launch_torchrun(4, _gpu_merge_worker)
 
 
-def _gather_full_model_state_dict_worker(tmp_path, use_zero):
+def _gather_full_model_state_dict_worker(tmp_path, use_zero, pas_policy='tp', plan_ngpus=2, runtime_ngpus=4):
     from .test_end2end import MLP, dummy_data
-    from nnscaler.parallel import gather_full_model_state_dict, merge_state_dicts, _gather_full_model_state_dict
-    from nnscaler.parallel import logger as p_logger
     init_distributed()
 
     model = MLP()
     model = parallelize(
         model,
         {'data': dummy_data()},
-        pas_policy='tp',
+        pas_policy=pas_policy,
+        instance_name=f'gather_full_model_state_dict_{pas_policy}_{use_zero}_{plan_ngpus}_{runtime_ngpus}',
         compute_config= ComputeConfig(
-            2, 4,
+            plan_ngpus, runtime_ngpus,
             use_end2end=True,
             use_zero=use_zero,
+            pas_config={
+                'pipeline_nmicros': 2,
+                'pipeline_nstages': 2,
+                'pipeline_scheduler': '1f1b'
+            }
         ),
         gen_savedir=tmp_path
     )
@@ -639,26 +648,12 @@ def _gather_full_model_state_dict_worker(tmp_path, use_zero):
         [torch.load(tmp_path / f'{i}.pt', weights_only=False) for i in range(torch.distributed.get_world_size())]
     )[0]
 
-    if use_zero > 1:
-        with catch_log(p_logger, 'WARNING') as logs:
-            full_state_dict = gather_full_model_state_dict(model)
-        assert 'Zero3 is not supported.' in logs.getvalue()
-        assert_equal(merged_state_dict, full_state_dict)
-        with pytest.raises(ValueError):
-             model.gather_state_dict()
-    else:
-        with catch_log(p_logger, 'WARNING') as logs:
-            full_state_dict = gather_full_model_state_dict(model)
-        assert 'Failed to gather parallel module' not in logs.getvalue()
-        assert_equal(merged_state_dict, full_state_dict)
-        f1 = model.gather_state_dict()
-        assert_equal(merged_state_dict, f1)
-
-    f2 = _gather_full_model_state_dict(model)
-    assert_equal(merged_state_dict, f2)
+    full_state_dict = gather_full_model_state_dict(model)
+    assert_equal(merged_state_dict, full_state_dict)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.device_count() < 4, reason='lack of gpu devices')
 @pytest.mark.parametrize('use_zero', [0, 1, 3])
 def test_gather_full_model_state_dict(tmp_path, use_zero):
+    launch_torchrun(4, _gather_full_model_state_dict_worker, tmp_path, use_zero, 'hybrid', 4, 4)
     launch_torchrun(4, _gather_full_model_state_dict_worker, tmp_path, use_zero)
