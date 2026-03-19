@@ -2543,8 +2543,6 @@ def _extract_new_state(
     name = '_'.join(local_name.split('_')[:-1]) # remove the integer suffix
     assert name in dist_param_map
     attr_meta = param_area_map[local_name]
-    if dist_param_map[name] not in orig_param_dict:
-        print(name)
     new_val = orig_param_dict[dist_param_map[name]]
     sliced_new_val = {}
     for key in new_val:
