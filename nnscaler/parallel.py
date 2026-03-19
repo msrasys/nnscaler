@@ -3346,11 +3346,13 @@ def gather_full_model_state_dict(
             for key, value in pm_state_dict.items():
                 state_dict[f'{prefix}{key}'] = value
             return state_dict
-
-        module._save_to_state_dict(state_dict, prefix, False)
-        for name, m in module._modules.items():
-            state_dict.update(_state_dict(m, f'{prefix}{name}.'))
-        return state_dict
+        else:
+            # contain the state of the module, but not its descendants
+            module._save_to_state_dict(state_dict, prefix, False)
+            # recursively save all states in its descendants.
+            for name, m in module._modules.items():
+                state_dict.update(_state_dict(m, f'{prefix}{name}.'))
+            return state_dict
 
     merged_state_dict = _state_dict(model, '')
     for key in merged_state_dict:

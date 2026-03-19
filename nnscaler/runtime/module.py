@@ -1785,6 +1785,8 @@ class ParallelModule(CubeModule):
         Gather model state dicts from all ranks involved in the parallel module,
         And merge them into a single merged model state dict in all ranks.
 
+        TODO: multiple dimensional parititions/uneven partition are not supported.
+
         Args:
             device: the device to put the merged state dict.
                 Use torch.cuda.current_device() if it is None.
