@@ -11,9 +11,9 @@ from torch.optim import Optimizer
 from torch.optim.lr_scheduler import LRScheduler
 from torch.utils.hooks import RemovableHandle
 
-from nnscaler.cli.arg_parser import deserialize_dataclass
+from nnscaler.cli.arg_parser import deserialize_dataclass, fn_field
 from nnscaler.cli.train_hook import TrainHookHost, TrainHook
-from nnscaler.utils import fn_field, OptStateDict
+from nnscaler.utils import OptStateDict
 
 if TYPE_CHECKING:
     from nnscaler.cli.trainer import Trainer

@@ -20,7 +20,7 @@ import yaml
 import torch
 
 import nnscaler
-from nnscaler.utils import enforce_zero_num_worker, fields, fn_field, transform_recursively, load_type, copy_dynamic
+from nnscaler.utils import enforce_zero_num_worker, fields, transform_recursively, load_type, copy_dynamic
 from nnscaler.parallel import ComputeConfig, build_optimizer, ReuseType, BroadcastGenFilesStrategy, _PREDEFINED_POLICIES
 from nnscaler.runtime.module import ParallelModule
 
@@ -28,7 +28,8 @@ from .arg_parser import (
     deserialize_dataclass,
     merge_args, parse_args,
     _TYPE_KEY, _VALUE_TYPE_KEY, _VALUE_KEY,
-    resolve_args
+    resolve_args, fn_field, factory_field,
+    deserialize_value_type,
 )
 from .loggers.logger_base import LoggerBase
 from .train_hook import TrainHook
@@ -102,17 +103,6 @@ def _resolve_precision(precision: Union[str, Dict[_TENSOR_TYPE, _PRECISION_TYPE]
         raise ValueError(f"Invalid tensor type found in {precision.keys()}")
 
     return precision
-
-
-def _factory_normalize(value):
-    if isinstance(value, dict) and _TYPE_KEY in value:
-        kwargs = {
-            k: v for k, v in value.items()
-            if k != _TYPE_KEY
-        }
-        return load_type(value[_TYPE_KEY])(**kwargs)
-    else:
-        return value
 
 
 def fix_input(input, input_dtype=None):
@@ -265,9 +255,7 @@ class ModuleParallelizeConfig:
     # sometimes you want to dynamically set the instance name
     # for example, you can set it to the hash of related files
     # In that case, we can pass a dict with callable __type field.
-    instance_name: Optional[str] = field(default=None, metadata={
-        'normalize': _factory_normalize
-    })
+    instance_name: Optional[str] = factory_field(default=None)
     precision: Optional[Dict[_TENSOR_TYPE, _PRECISION_TYPE]] = field(default=None, metadata={
         'skip_deserialization': True,
     })
@@ -402,9 +390,7 @@ class LRSchedulerConfig:
 class ResumeOptions:
     # sometimes you want to dynamically set checkpoint path
     # for example, you can set it to finetune model if no `last` checkpoint exists
-    checkpoint: str = field(default='last', metadata={
-        'normalize': _factory_normalize
-    })
+    checkpoint: str = factory_field(default='last')
     # the full qualified name of the function to
     # convert the checkpoint to nnscaler format
     # It should be `Callable[[Dict[str, Any]], Dict[str, Any]]`
@@ -654,9 +640,7 @@ class TrainerArgs(PrecisionMixin, PolicyMixin):
     # sometimes you want to dynamically set the instance name
     # for example, you can set it to the hash of related files
     # In that case, we can pass a dict with callable __type field.
-    instance_name: Optional[str] = field(default=None, metadata={
-        'normalize': _factory_normalize
-    })
+    instance_name: Optional[str] = factory_field(default=None)
     # compile: compile the model but not training
     # run: compile and run the model
     run_mode: str = 'run'
@@ -840,15 +824,7 @@ class TrainerArgs(PrecisionMixin, PolicyMixin):
                 value_type = load_type(value.pop(_TYPE_KEY))
                 return value_type(**value)
             elif _VALUE_TYPE_KEY in value:
-                if _VALUE_KEY not in value:
-                    raise ValueError(f"`{_VALUE_KEY}` is required when `{_VALUE_TYPE_KEY}` is present")
-                value_type = value.pop(_VALUE_TYPE_KEY)
-                if value_type == 'function':  # when type is function, the value should be the full qualified name of the function
-                    return load_type(value[_VALUE_KEY])
-                else:
-                    # call its __init__ function
-                    value_type = load_type(value_type)
-                    return value_type(value[_VALUE_KEY])
+                return deserialize_value_type(value)
             else:
                 return value
         elif isinstance(value, list):

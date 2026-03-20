@@ -5,11 +5,14 @@ import os
 import copy
 import logging
 
-from typing import List, Optional, Tuple, Dict, Any, Union
+from typing import List, Optional, Tuple, Dict, Any, Union, TypeVar
 from dataclasses import dataclass, field, is_dataclass, asdict
+import collections
 import enum
 import ast
 import regex
+
+from nnscaler.utils import load_type
 
 
 try:
@@ -40,6 +43,46 @@ SKIP_DESERIALIZATION_KEY = 'skip_deserialization'
 
 class _KeyNotFoundError(KeyError):
     pass
+
+
+def deserialize_value_type(v: dict[str, Any]):
+    if _VALUE_KEY not in v or _VALUE_TYPE_KEY not in v:
+        raise ValueError(f"`{_VALUE_KEY}` and `{_VALUE_TYPE_KEY}` is required.")
+
+    if v[_VALUE_TYPE_KEY] == 'function':
+        v = load_type(v[_VALUE_KEY])
+    else:
+        # call its __init__ function
+        v = load_type(v[_VALUE_TYPE_KEY])(v[_VALUE_KEY])
+
+    return v
+
+
+def fn_deserialize(value):
+    return None if value is None else load_type(value)
+
+
+def fn_field(**kwargs):
+    metadata = kwargs.pop('metadata', {})
+    metadata[DESERIALIZE_KEY] = fn_deserialize
+    return field(**kwargs, metadata=metadata)
+
+
+def factory_normalize(value):
+    if isinstance(value, dict) and _TYPE_KEY in value:
+        kwargs = {
+            k: v for k, v in value.items()
+            if k != _TYPE_KEY
+        }
+        return load_type(value[_TYPE_KEY])(**kwargs)
+    else:
+        return value
+
+
+def factory_field(**kwargs):
+    metadata = kwargs.pop('metadata', {})
+    metadata[NORMALIZE_KEY] = factory_normalize
+    return field(**kwargs, metadata=metadata)
 
 
 def parse_args(argv: List[str]) -> dict:
@@ -279,6 +322,40 @@ class _TypeInfo:
     metadata: dict = field(default_factory=dict)
 
 
+class _TypeCategory(enum.Enum):
+    FUNCTION = enum.auto()
+    PRIMITIVE = enum.auto()
+    UNKNOWN = enum.auto()
+
+
+def _get_type_category(type_info):
+    def _get_types(type_info):
+        # unwrap union/optional
+        if getattr(type_info, '__origin__', None) == Union \
+            or (UnionType and isinstance(type_info, UnionType)):
+            args = getattr(type_info, '__args__', None)
+            for arg in args:
+                yield from _get_types(arg)
+        elif type_info is None or type_info == type(None):
+            # ignore all None types
+            yield from []
+        else:
+            yield from [type_info]
+
+    types = list(_get_types(type_info))
+    if not types or all(t is None or t == type(None) or _is_primitive_type(t) for t in types):
+        return _TypeCategory.PRIMITIVE
+    elif all(
+        t == type or
+            getattr(t, '__origin__', None) in [type, collections.abc.Callable]
+        for t in types
+    ):
+        # type, type[T], Callable, Callable[T]
+        return _TypeCategory.FUNCTION
+    else:
+        return _TypeCategory.UNKNOWN
+
+
 def _get_type_info_from_annotation(type_info):
     type_info = _fix_type(type_info, False)
     if type_info is None or type_info == Any:
@@ -320,10 +397,23 @@ def _get_type_info(dataclass_type) -> Dict[str, _TypeInfo]:
             # if the field is marked as skip_deserialization,
             # or if it has a custom deserialize function,
             # we don't need to extract the type information
-            type_dict[k] = _TypeInfo(type=None)
+            type_dict[k] = _TypeInfo(type=None, metadata=v.metadata)
         else:
-            type_dict[k] = _get_type_info_from_annotation(v.type)
-        type_dict[k].metadata = v.metadata
+            # add predefined deserialization process for some types.
+            type_cat = _get_type_category(v.type)
+            metadata = {**v.metadata} if v.metadata else {}
+            if type_cat == _TypeCategory.FUNCTION:
+                metadata[DESERIALIZE_KEY] = fn_deserialize
+                type_dict[k] = _TypeInfo(type=None, metadata=metadata)
+            else:
+                if type_cat == _TypeCategory.PRIMITIVE:
+                    # don't overwrite existing one.
+                    if NORMALIZE_KEY not in metadata:
+                        metadata[NORMALIZE_KEY] = factory_normalize
+
+                type_dict[k] = _get_type_info_from_annotation(v.type)
+                type_dict[k].metadata = metadata
+
     return type_dict
 
 
@@ -404,7 +494,10 @@ def _deserialize_object(value, value_type):
     return value
 
 
-def deserialize_dataclass(value, value_type):
+TDataClass = TypeVar("TDataClass", bound=dataclass)
+
+
+def deserialize_dataclass(value: dict, value_type: TDataClass) -> TDataClass:
     if not isinstance(value, dict):
         raise ValueError(f"Expecting dict, but got {value}")
     if not is_dataclass(value_type):
@@ -423,6 +516,11 @@ def deserialize_dataclass(value, value_type):
 
         if deserialize_func := ti.metadata.get(DESERIALIZE_KEY, None):
             v = deserialize_func(v)
+            member_values[key] = v
+            continue
+
+        if isinstance(v, dict) and _VALUE_TYPE_KEY in v:
+            v = deserialize_value_type(v)
             member_values[key] = v
             continue
 

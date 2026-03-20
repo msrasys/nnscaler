@@ -2,7 +2,7 @@
 #  Licensed under the MIT License.
 
 from dataclasses import asdict, dataclass, field
-from typing import List, Optional, Tuple, Dict, Any, Union
+from typing import Callable, List, Optional, Tuple, Dict, Any, Union
 import sys
 
 import pytest
@@ -186,7 +186,7 @@ def test_deserialize_value_type():
 
     x = parse_args(['--p.__value_type=int', '--p.value=1'])
     y = deserialize_dataclass(x, A)
-    assert y.p == {'__value_type': 'int', 'value': '1'}
+    assert y.p == 1
 
     x = parse_args(['--p.value=1'])
     y = deserialize_dataclass(x, A)
@@ -405,3 +405,24 @@ def test_missing_resolve_args():
     }
     with pytest.raises(_KeyNotFoundError):
         resolve_args(data)
+
+
+def test_resume_options():
+    from nnscaler.cli.trainer_args import CheckpointConfig
+    @dataclass
+    class CC(CheckpointConfig):
+        c_fn: Union[
+            Callable[[Dict[str, Any]], Dict[str, Any]],
+            Callable[[int], Dict[str, Any]],
+            None,
+        ] = None
+    data = {
+        'keep_last_n_checkpoints': 30,
+        'every_n_train_steps': 1,
+        'save_type': 'deduped',
+        'resume_from': 'last',
+        'c_fn': 'tests.cli.test_trainer_muon.param_clss_fn'
+    }
+    p = deserialize_dataclass(data, CC)
+    assert p.resume_from.checkpoint == 'last'
+    assert callable(p.c_fn)
