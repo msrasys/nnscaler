@@ -807,6 +807,8 @@ class Reducer:
             self._zero_crossgroup = DeviceGroup().get_group(cross_ranks)
             self._zero_crossranks = cross_ranks
         else:
+            if zero_ngroups != 1:
+                _logger.warning(f'zero_ngroups is set to {zero_ngroups} but will be forced to 1 since zero optimization is not used.')
             zero_ngroups = 1  # we force zero_ngroups to 1 when zero is not used
             self._zero_subgroup = self._group
             self._zero_subranks = ranks
