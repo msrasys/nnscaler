@@ -5,7 +5,7 @@ import os
 import copy
 import logging
 
-from typing import List, Optional, Tuple, Dict, Any, Union, TypeVar
+from typing import ClassVar, List, Optional, Protocol, Tuple, Dict, Any, Union, Type, TypeVar, runtime_checkable
 from dataclasses import dataclass, field, is_dataclass, asdict
 import collections
 import enum
@@ -494,10 +494,16 @@ def _deserialize_object(value, value_type):
     return value
 
 
-TDataClass = TypeVar("TDataClass", bound=dataclass)
+@runtime_checkable
+class _DataclassProtocol(Protocol):
+    """Protocol that matches any dataclass instance (has ``__dataclass_fields__``)."""
+    __dataclass_fields__: ClassVar[dict]
 
 
-def deserialize_dataclass(value: dict, value_type: TDataClass) -> TDataClass:
+TDataClass = TypeVar("TDataClass", bound=_DataclassProtocol)
+
+
+def deserialize_dataclass(value: dict, value_type: Type[TDataClass]) -> TDataClass:
     if not isinstance(value, dict):
         raise ValueError(f"Expecting dict, but got {value}")
     if not is_dataclass(value_type):
