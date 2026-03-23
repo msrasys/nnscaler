@@ -202,7 +202,7 @@ class BranchedSimpleDataset(Dataset):
     def __init__(self, dim: int, size: int = 100):
         torch.manual_seed(0)
         if size % 2 != 0:
-            raise ValueError("size should be even for SimpleDataset")
+            raise ValueError(f"size should be even for BranchedSimpleDataset, got {size}")
         self.data1 = torch.randn(size // 2, dim)
         self.data2 = torch.randn(size // 2, dim)
         self.target = torch.rand(size, dim)

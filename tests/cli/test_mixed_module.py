@@ -15,7 +15,7 @@ def mixed1_worker(save_dir, config_file):
     gen_savedir = save_dir /  f'gen_{stem}'
     ckpt_savedir = save_dir / f'ckpt_{stem}'
 
-    # ground truth: train 6 epcho in one time with zero 0
+    # ground truth: train 6 epoches in one time with zero 0
     trainer = Trainer([
         '-f', config_path,
         '--max_epochs', '6',
@@ -29,7 +29,7 @@ def mixed1_worker(save_dir, config_file):
     trainer.run()
     torch.distributed.barrier()
 
-    # train 6 epcho in 6 times, each time resume from last checkpoint
+    # train 6 epoches in 6 times, each time resume from last checkpoint
     # 1
     ckpt0_savedir = save_dir / f'ckpt0_{stem}'
     gen0_savedir = save_dir / f'gen0_{stem}'  # use a different gen_savedir for resumable dataloader

@@ -1614,6 +1614,11 @@ def build_optimizer(
                     opt_module_locs[name].count += 1
             yield param
 
+        if not opt_module_locs:
+            raise RuntimeError(
+                "No parameter found from ParallelModule for optimizer. Please make sure the module contains parameters and they require grad."
+            )
+
         if non_parallel_module_use_zero:
             for param in non_parallel_module_reducer.parameters_for_optimizer():
                 yield param
