@@ -2252,7 +2252,7 @@ def _trim_optimizer_merged_state_dict(
             if npp_removed < len(opt_extra_state.non_parallel_param_locs) \
                 and i == opt_extra_state.non_parallel_param_locs[npp_removed]:
                 npp_removed += 1
-            else:
+            elif i in opt_state_dict:
                 reordered_opt_state_dict[i - npp_removed] = opt_state_dict[i]
 
         # 2. append
@@ -2262,7 +2262,8 @@ def _trim_optimizer_merged_state_dict(
             for pmm in pm_modules[:-1]  # the last one is non-parallel module
         )
         for i, loc in enumerate(opt_extra_state.non_parallel_param_locs):
-            reordered_opt_state_dict[i + start_idx] = opt_state_dict[loc]
+            if loc in opt_state_dict:
+                reordered_opt_state_dict[i + start_idx] = opt_state_dict[loc]
 
         opt_state_dict = reordered_opt_state_dict
 
