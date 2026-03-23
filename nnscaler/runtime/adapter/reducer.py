@@ -807,7 +807,9 @@ class Reducer:
             self._zero_crossgroup = DeviceGroup().get_group(cross_ranks)
             self._zero_crossranks = cross_ranks
         else:
-            assert zero_ngroups == 1, f"ZeRO number of groups must be 1, but got {zero_ngroups}"
+            if zero_ngroups != 1:
+                _logger.warning(f'zero_ngroups is set to {zero_ngroups} but will be forced to 1 since zero optimization is not used.')
+            zero_ngroups = 1  # we force zero_ngroups to 1 when zero is not used
             self._zero_subgroup = self._group
             self._zero_subranks = ranks
             # trivial crossgroup for single rank
@@ -897,13 +899,16 @@ class Reducer:
 
     def build_buckets(self, param_clss: Optional[dict[torch.nn.Parameter, 'PARAM_CLASS_TYPE']]=None):
         """
-        Build buckets the reducer.
+        Build buckets in the reducer.
 
         The parameters in each bucket have consistent data types and classes,
         and each bucket contains at least one parameter.
         If the bucket contains more than 2 parameters, than the total size is samller
         than the max_bucket_size_bytes.
         """
+        if self._buckets:
+            raise RuntimeError("Buckets have already been built, cannot build again.")
+
         self._param_clss: dict[torch.nn.Parameter, Union[
             tuple[int, int, ParamZeroConfig],
             tuple[int, ParamZeroConfig],

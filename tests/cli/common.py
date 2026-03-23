@@ -153,6 +153,26 @@ class MixedModule(torch.nn.Module):
         return self.mlploss(x, target)
 
 
+class BranchedMixedModule(torch.nn.Module):
+    def __init__(self, dim: int, nlayers: int, init_random: bool = True):
+        super().__init__()
+        self.mlp0 = MixModuleMLP(dim, nlayers, init_random=init_random)
+        self.mlp1 = MixModuleMLP2(dim, nlayers, init_random=init_random)
+        self.mlp2 = MixModuleMLP3(dim, nlayers, init_random=init_random)
+        self.mlploss = MixModuleMLPWithLoss(dim, nlayers, init_random=init_random)
+
+    def forward(self, data: Dict[str, torch.Tensor]):
+        target = data['target']
+        if 'data1' in data:
+            x = data['data1']
+            x = self.mlp0(x)
+        else:
+            x = data['data2']
+            x = self.mlp1(x)
+        x = self.mlp2(x)
+        return self.mlploss(x, target)
+
+
 def forward_args_gen_fn(trainer_args: TrainerArgs):
     return {
         'input':
@@ -176,6 +196,31 @@ class SimpleDataset(Dataset):
 
     def __len__(self):
         return len(self.data)
+
+
+class BranchedSimpleDataset(Dataset):
+    def __init__(self, dim: int, size: int = 100):
+        torch.manual_seed(0)
+        if size % 2 != 0:
+            raise ValueError(f"size should be even for BranchedSimpleDataset, got {size}")
+        self.data1 = torch.randn(size // 2, dim)
+        self.data2 = torch.randn(size // 2, dim)
+        self.target = torch.rand(size, dim)
+
+    def __getitem__(self, idx: int):
+        if idx % 2 == 0:
+            return {
+                'data1': self.data1[idx // 2],
+                'target': self.target[idx]
+            }
+        else:
+            return {
+                'data2': self.data2[idx // 2],
+                'target': self.target[idx]
+            }
+
+    def __len__(self):
+        return len(self.target)
 
 
 class SimpleIterDataset(StreamingDataset):

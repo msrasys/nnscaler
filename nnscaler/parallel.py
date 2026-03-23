@@ -4,12 +4,12 @@
 from enum import Enum
 from functools import partial
 import types
-from typing import Callable, Any, Dict, Optional, Tuple, Type, Union, TypeVar, List, Set, Literal
+from typing import Callable, Any, Dict, Iterator, Optional, Tuple, Type, Union, TypeVar, List, Set, Literal
 from pathlib import Path
 import inspect
 import sys
 import importlib
-from dataclasses import dataclass, asdict, field
+from dataclasses import dataclass, asdict, field, replace
 from contextlib import contextmanager
 import logging
 import copy
@@ -44,7 +44,16 @@ from nnscaler.ir.unique import IDGenerator
 from nnscaler.runtime.adapter.reducer import Bucket, Reducer, ParamZeroConfig
 from nnscaler.runtime.device import DeviceGroup
 from nnscaler.runtime.gnorm import calcuate_gnorm, clip_grads
-from nnscaler.runtime.module import AttrMeta, Zero3AttrMeta, CubeModule, ParallelModule, OriginModuleMetadata, ExtraState, dedup_attrs
+from nnscaler.runtime.module import (
+    AttrMeta,
+    Zero3AttrMeta,
+    CubeModule,
+    ParallelModule,
+    OriginModuleMetadata,
+    ExtraState,
+    dedup_attrs,
+    NonParallelModule,
+)
 
 from nnscaler.flags import CompileFlag, RuntimeFlag
 import nnscaler.policies as policies
@@ -1215,11 +1224,23 @@ class OptimizerExtraState:
             the prefix of `submodule1_1` is `submodule1_1`.
             the prefix of `submodule2_1` is `submodule1_1.submodule2_1`.
             etc.
+        parallel_module_configs: the compute config for each parallel module, which will be used when loading state dict to determine whether the state dict is compatible with current module.
+            the key is the same module prefix as parallel_module_locs.
+
+        NOTE: when zero is used for non-parallel parameters,
+        non_parallel parameters will become a virtual ParallelModule,
+        and its information will also be saved in `parallel_module_locs` and `parallel_module_configs`
+
+        non_parallel_extra_state: the extra state for non-parallel modules
+            (equivalent to the data saved as key `ParallelModule.EXTRA_STATE_KEY` in state dict)
+        non_parallel_param_locs: the parameter locations for non-parallel parameters.
     """
     rank: int
     name: str
     parallel_module_locs: Dict[str, ModuleParameterLocation]
     parallel_module_configs: Dict[str, ComputeConfig]
+    non_parallel_extra_state: Optional[ExtraState] = None
+    non_parallel_param_locs: Optional[List[int]] = None
 
     def __post_init__(self):
         self.parallel_module_locs = {
@@ -1230,6 +1251,8 @@ class OptimizerExtraState:
             k: ComputeConfig(**v) if isinstance(v, dict) else v
             for k, v in self.parallel_module_configs.items()
         }
+        if self.non_parallel_extra_state is not None and isinstance(self.non_parallel_extra_state, dict):
+            self.non_parallel_extra_state = ExtraState(**self.non_parallel_extra_state)
 
 
 class ParallelOptimizer(torch.optim.Optimizer):
@@ -1340,6 +1363,9 @@ def hybrid(
 hybrid.is_hybrid = True  # mark this function as hybrid optimizer factory
 
 
+_NON_PARALLEL_MODULE_ATTR_NAME = '_nnscaler_non_parallel_module_'
+
+
 def build_optimizer(
     module: torch.nn.Module,
     optimizer_fn: Union[Type[OptimizerT], Callable[..., OptimizerT]],
@@ -1364,13 +1390,51 @@ def build_optimizer(
     4. backward():
        you need to call optimizer.sync_shard_grad() manually if you want to read the gradients of the module before optimizer.step().
 
+    Non-parallel module (mixed module) is also supported given it contains any sub `ParallelModule`.
+    `compute_config` argument is used when we creating the reducer
+    for parameters in non-parallel modules.
+
+    When zero1 is used, we will create a mocked parallel module (`NonParallelModule`)
+    to simplify state dicts related logic.
+
+    The basic idea is we move all non-parallel parameters (`npp`) to the end of optimizer states,
+    Here is an example:
+
+    Before move (0/3/4/6 are npp, 1/2 belong to one parallel module, 5 belongs to another parellel module)
+    ---------------------------------------------------------
+    name | opt state idx | is npp
+    ---------------------------------------------------------
+    p0 | 0   | Y
+    p1 | 1   | N
+    p2 | 2   | N
+    p3 | 3   | Y
+    p4 | 4   | Y
+    p5 | 5   | N
+    p6 | 6   | Y
+    After Move
+    ---------------------------------------------------------
+    name | opt state idx | is npp
+    ---------------------------------------------------------
+    p1 | 0   | N
+    p2 | 1   | N
+    p5 | 2   | N
+    p0 | 3   | Y
+    p3 | 4   | Y
+    p4 | 5   | Y
+    p6 | 6   | Y
+    The original locations of npp will be saved in `OptimizerExtraState.non_parallel_param_locs`,
+    and the locations of non-parallel parameter reducer will also be saved in `OptimizerExtraState.parallel_module_locs`
+    with a special module prefix (`_nnscaler_non_parallel_module_`) to distinguish it from real parallel modules.
+
+    The information will be used when we merge state dict/load merged state dict.
+
     Args:
         module (torch.nn.Module): the module to be optimized
         optimizer_fn (Union[Type[torch.optim.Optimizer], Callable[..., torch.optim.Optimizer]]):
             It can be the optimizer class or optimizer factory function.
             The first parameter of the optimizer_fn should be the parameters of the module.
         compute_config (Optional[ComputeConfig]):
-            The config will be used to generate communication reducer.
+            The config will be used to generate communication reducer for parameters in non-parallel modules.
             If it is None, Default configuration will be used when creating reducer for non-parallel modules.
         param_clss_fn (Optional[Callable[[str], Any]]):
             A function that maps original full qualified parameter names to their class IDs.
@@ -1399,7 +1463,7 @@ def build_optimizer(
     RuntimeFlag.skip_reducer = True
     RuntimeFlag.skip_zero_grad = False
 
-    non_parallel_module_reducer = None
+    non_parallel_module_reducer: Optional[Reducer] = None
     non_parallel_modules = [m for m in module.modules() if not isinstance(m, ParallelModule)]
     parallel_modules = [m for m in module.modules() if isinstance(m, ParallelModule)]
     parallel_modules_prefix = {prefix: m for prefix, m in module.named_modules() if isinstance(m, ParallelModule)}
@@ -1413,6 +1477,14 @@ def build_optimizer(
             if param is not None and param.requires_grad:
                 non_parallel_parameters_dict[param] = None
     non_parallel_parameters = list(non_parallel_parameters_dict.keys())
+
+    non_parallel_parameter_locs: Dict[torch.nn.Parameter, int] = {}
+    for idx, p in enumerate(module.parameters()):
+        # the order of parameters in module.parameters() is the same
+        # with the order of parameters in optimizer.param_groups[0]['params']
+        # NOTE: the parameter dedup is done in `module.parameters()`
+        if p in non_parallel_parameters_dict:
+            non_parallel_parameter_locs[p] = idx
 
     param_original_names = {}
     for n, p in module.named_parameters():
@@ -1439,43 +1511,79 @@ def build_optimizer(
     if compute_config and compute_config.gpu_config != compute_configs[0].gpu_config:
         raise RuntimeError("All ParallelModules should have the same gpu_config.")
     plan_ngpus, runtime_ngpus = compute_configs[0].plan_ngpus, compute_configs[0].runtime_ngpus
+    non_parallel_module_reducer_config = None
 
     # we need to add all parameters of non-parallel modules to a reducer to reduce grads
     # if there are non-parallel parameters
     if plan_ngpus != runtime_ngpus and non_parallel_modules and any(p.numel() for m in non_parallel_modules for p in m.parameters(False)):
         # For non-parallel modules, we use a Reducer to reduce the gradients.
         # Please note here we still follow the original compute_config,
+        # (NOTE: the following gnorm calculation is using that assumption)
         # although we can use a different compute_config for non-parallel modules.
         # for example, we can always use plan_ngpus=1, and that may lead better gpu memory usage whe zero is ON.
         group, _ = compute_configs[0].get_sync_group()
-        reducer_config = {}
+
         if compute_config:
             reducer_config = {
                 'async_op': compute_config.use_async_reducer,
                 # zero3 can't be used in non-parallel module reducer
                 # because we are unable to insert hooks to prefetch/postevict params
-                # TODO: to support zero1, we need to revise the state_dict logic
-                'zero': 0,
+                'zero': 1 if compute_config.use_zero else 0,
                 'max_bucket_size_bytes': compute_config.max_bucket_size_bytes,
                 'zero_use_reduce_scatter': compute_config.zero_use_reduce_scatter,
-                'zero_ngroups': 1, # compute_config.zero_ngroups,
+                'zero_ngroups': compute_config.zero_ngroups,
             }
+        else:
+            reducer_config = {
+                'async_op': False,
+                'zero': 0,
+                'max_bucket_size_bytes': None,
+                'zero_use_reduce_scatter': False,
+                'zero_ngroups': 1,
+            }
+        non_parallel_module_reducer_config = replace(
+            compute_config or compute_configs[0],
+            use_zero=reducer_config['zero'],
+            use_async_reducer=reducer_config['async_op'],
+            reducer_bucket_cap_mb=reducer_config['max_bucket_size_bytes'] / (1024 * 1024)
+                if reducer_config['max_bucket_size_bytes'] else None,
+            zero_use_reduce_scatter=reducer_config['zero_use_reduce_scatter'],
+            zero_ngroups=reducer_config['zero_ngroups'],
+        )
         non_parallel_module_reducer = Reducer(group, **reducer_config)
         for param in non_parallel_parameters:
             non_parallel_module_reducer.add_param(param)
         non_parallel_module_reducer.build_buckets(param_clss=param_clss)
+
+    non_parallel_module_use_zero = non_parallel_module_reducer_config and non_parallel_module_reducer_config.use_zero
+    if non_parallel_module_use_zero:
+        object.__setattr__(module, _NON_PARALLEL_MODULE_ATTR_NAME, NonParallelModule(
+            non_parallel_module_reducer,
+            {param_original_names[p]: p for p in non_parallel_parameters},
+            non_parallel_module_reducer_config,
+            parallel_modules[0],
+        ))
 
     if param_clss_fn:
         for pm in parallel_modules:
             pm.build_buckets(param_clss=param_clss)
             for reducer in pm.reducers:
                 param_clss.update(reducer.get_opt_params())
+        if non_parallel_module_reducer:
+            param_clss.update(non_parallel_module_reducer.get_opt_params())
 
     opt_module_locs: Dict[str, ModuleParameterLocation] = {}
+    opt_module_configs = {
+        name: m.compute_config
+        for name, m in module.named_modules()
+        if isinstance(m, ParallelModule)
+    }
+
     def _local_parameters(module: torch.nn.Module):
         pm_suffix = "_PARALLEL_MODULE_PARAM_SUFFIX"
-        gen = module._named_members(
-            lambda m: [
+        def _p_gen(m: torch.nn.Module) -> list[tuple[str, torch.nn.Parameter]]:
+            if isinstance(m, ParallelModule):
+                return [
                     (pm_suffix, p)  # (pm_suffix, p) to meet _named_members requirement
                     for p in (
                         m.parameters_for_optimizer() if m.compute_config.use_zero
@@ -1483,13 +1591,17 @@ def build_optimizer(
                     )
                     if p is not None and p.requires_grad
                 ]
-                if isinstance(m, ParallelModule)
-                else [
+            if not non_parallel_module_use_zero:
+                return [
                     (name, p)
                     for name, p in m._parameters.items()
                     if p is not None and p.requires_grad
                 ]
-        )
+            # will handle non-parallel parameters with reducer later
+            return []
+
+        gen = module._named_members(_p_gen)
+
         for idx, (name, param) in enumerate(gen):
             if name.endswith(pm_suffix):  # is a parameter of ParallelModule
                 # -1 for removing the dot
@@ -1501,6 +1613,20 @@ def build_optimizer(
                 else:
                     opt_module_locs[name].count += 1
             yield param
+
+        if not opt_module_locs:
+            raise RuntimeError(
+                "No parameter found from ParallelModule for optimizer. Please make sure the module contains parameters and they require grad."
+            )
+
+        if non_parallel_module_use_zero:
+            for param in non_parallel_module_reducer.parameters_for_optimizer():
+                yield param
+            opt_module_locs[_NON_PARALLEL_MODULE_ATTR_NAME] = ModuleParameterLocation(
+                idx + 1,
+                len(non_parallel_module_reducer.parameters_for_optimizer())
+            )
+            opt_module_configs[_NON_PARALLEL_MODULE_ATTR_NAME] = non_parallel_module_reducer_config
 
     if is_hybrid:
         optimizer = optimizer_fn(_local_parameters(module),
@@ -1514,11 +1640,13 @@ def build_optimizer(
             rank=torch.distributed.get_rank(),
             name=type(optimizer).__name__,
             parallel_module_locs=opt_module_locs,
-            parallel_module_configs={
-                name: m.compute_config
-                for name, m in module.named_modules()
-                if isinstance(m, ParallelModule)
-            }
+            parallel_module_configs=opt_module_configs,
+            non_parallel_extra_state=getattr(
+                    module, _NON_PARALLEL_MODULE_ATTR_NAME
+                ).get_extra_state() if non_parallel_module_use_zero else None,
+            non_parallel_param_locs=
+                list(non_parallel_parameter_locs.values())
+                    if non_parallel_module_use_zero else None,
     )
 
     orig_step = optimizer.step
@@ -1659,7 +1787,7 @@ def build_optimizer(
 
 
 def _get_parallel_module_state_dict_info(
-        model_state_dicts: List[Dict[str, Any]]
+    model_state_dicts: List[Dict[str, Any]]
 ) -> Tuple[
     Dict[Tuple[str, ...], List[ExtraState]],    # parallel module extrastate for each rank
     Dict[Tuple[str,...], List[Dict[str, Any]]], # parallel module state dict for each rank
@@ -1877,8 +2005,8 @@ def merge_state_dicts(
         opt_extra_states, opt_state_dicts, ret_opt_state_dict, opt_new_pm_states = None, None, None, None
 
     # merging parallel module state dicts,
-    # non parallel module parts have been handled at _get_parallel_module_state_dict_info
-    # and _get_optimizer_state_dict_info
+    # non parallel module parts for module state dict have been handled at _get_parallel_module_state_dict_info
+    # NOTE: `pm_state_dicts` doesn't contain _NON_PARALLEL_MODULE_ATTR_NAME
     # every loop will merge one ParallelModule
     for k, state_dicts_for_merge in pm_state_dicts.items():
         extra_states = pm_extra_states[k]
@@ -1935,6 +2063,38 @@ def merge_state_dicts(
         for k, extra_states in pm_extra_states.items():
             module_prefix = '.'.join(k)
             pm_orig_param_names[module_prefix] = ParallelModule.get_origin_parameter_names([e.param_area_map for e in extra_states])
+
+        # add non-parallel parameters state dict to opt_new_pm_states
+        if _NON_PARALLEL_MODULE_ATTR_NAME in opt_state_dicts:
+            assert _NON_PARALLEL_MODULE_ATTR_NAME in opt_extra_states[0].parallel_module_locs
+
+            # we also need to merge the state dict for non-parallel parameters when zero is on
+            npp_merged_opt_state_dict = ParallelModule.merge_opt_state_dicts(
+                [e.non_parallel_extra_state.param_area_map for e in opt_extra_states],
+                opt_state_dicts[_NON_PARALLEL_MODULE_ATTR_NAME],
+                [
+                    (e.non_parallel_extra_state.model_idx2opt_idx,
+                    e.non_parallel_extra_state.opt_idx2ranks,
+                    e.non_parallel_extra_state.zero,
+                    e.non_parallel_extra_state.zero3_param_metadata)
+                    for e in opt_extra_states
+                ],
+            )
+
+            opt_new_pm_states[
+                opt_extra_states[0].parallel_module_locs[_NON_PARALLEL_MODULE_ATTR_NAME]
+            ] = (
+                npp_merged_opt_state_dict['state'],
+                _NON_PARALLEL_MODULE_ATTR_NAME,
+                opt_extra_states[0].non_parallel_extra_state.origin_param_names,
+            )
+
+            pm_orig_param_names[_NON_PARALLEL_MODULE_ATTR_NAME] \
+                = ParallelModule.get_origin_parameter_names([
+                    e.non_parallel_extra_state.param_area_map
+                    for e in opt_extra_states
+            ])
+
         # now we can construct the merged state of optimizer from any rank
         # as said previously, the merge will be based on rank0's data
         orig_states: Dict[int, Any] = optimizer_state_dicts[0]['state']
@@ -1971,6 +2131,33 @@ def merge_state_dicts(
                 ret_states_cur_index += len(orignal_param_names)
                 orig_cur_index += pm_loc.count
                 sorted_pm_locs_cur_index += 1
+
+        # reorder non-parallel parameters
+        if opt_state_dicts is not None and _NON_PARALLEL_MODULE_ATTR_NAME in opt_state_dicts:
+            # all ranks should have the same non_parallel_param_locs
+            npp_locs = opt_extra_states[0].non_parallel_param_locs
+            assert all(e.non_parallel_param_locs == npp_locs for e in opt_extra_states), \
+                "All ranks should have the same non_parallel_param_locs in optimizer extra state."
+
+            num_npp = len(npp_locs)
+            npp_start = ret_states_cur_index - num_npp
+            npp_states = {}
+            for loc in range(npp_start, ret_states_cur_index):
+                npp_states[loc - npp_start] = ret_states.pop(loc)
+
+            # merge back npp_states to ret_states, the location is determined by non_parallel_param_locs
+            ret_new_states = {}
+            npp_inserted = 0
+            for i in range(ret_states_cur_index):
+                if npp_inserted < len(npp_locs) and i == npp_locs[npp_inserted]:
+                    # the position for non-parallel parameters
+                    ret_new_states[i] = npp_states[npp_inserted]
+                    npp_inserted += 1
+                elif i - npp_inserted in ret_states:
+                    # as `npp_inserted` non-parallel parameters are inserted
+                    # we need to add an offset to `ret_states`
+                    ret_new_states[i] = ret_states[i - npp_inserted]
+            ret_states = ret_new_states
 
         ret_opt_state_dict['state'] = ret_states
         ret_opt_state_dict['param_groups'][0]['params'] = list(range(ret_states_cur_index))
@@ -2055,6 +2242,36 @@ def _trim_optimizer_merged_state_dict(
             raise ValueError(f"Module {name} is not a ParallelModule")
         pm_modules.append(m)
 
+    opt_state_dict = optimizer_state_dict['state']
+    if opt_state_dict and _NON_PARALLEL_MODULE_ATTR_NAME in pm_name_locs:
+        # it should be the last loc
+        assert list(pm_name_locs.keys())[-1] == _NON_PARALLEL_MODULE_ATTR_NAME
+        reordered_opt_state_dict = {}
+        max_opt_state_idx = max(opt_state_dict.keys())
+        npp_removed = 0
+
+        # remove non-parallel parameters
+        # then add non-parallel parameters at the end of the state dict
+        # 1. remove
+        for i in range(max_opt_state_idx + 1):
+            if npp_removed < len(opt_extra_state.non_parallel_param_locs) \
+                and i == opt_extra_state.non_parallel_param_locs[npp_removed]:
+                npp_removed += 1
+            elif i in opt_state_dict:
+                reordered_opt_state_dict[i - npp_removed] = opt_state_dict[i]
+
+        # 2. append
+        # the location of non-parallel parameters in the merged state dict should be after all parallel module parameters
+        start_idx = sum(
+            len(pmm.origin_module_metadata.origin_param_names)
+            for pmm in pm_modules[:-1]  # the last one is non-parallel module
+        )
+        for i, loc in enumerate(opt_extra_state.non_parallel_param_locs):
+            if loc in opt_state_dict:
+                reordered_opt_state_dict[i + start_idx] = opt_state_dict[loc]
+
+        opt_state_dict = reordered_opt_state_dict
+
     merged_cur = 0  # the current index of the merged state dict
     pm_cur = 0      # the current index of the parallel module in pm_locs
     new_states: Dict[int, Dict[str, Any]] = {}
@@ -2071,8 +2288,8 @@ def _trim_optimizer_merged_state_dict(
             or new_cur < pm_locs[pm_cur].offset  # [N]N<P>NPPPN: other parameters
         ):
             # non-parallel module
-            if merged_cur in optimizer_state_dict['state']:
-                new_states[new_cur] = optimizer_state_dict['state'][merged_cur]
+            if merged_cur in opt_state_dict:
+                new_states[new_cur] = opt_state_dict[merged_cur]
             merged_cur += 1
             new_cur += 1
         else:
@@ -2083,8 +2300,8 @@ def _trim_optimizer_merged_state_dict(
             # to `pm_locs[pm_cur].count` in optimizer state.
             cur_states = {}
             for i in range(pm_param_count):
-                if merged_cur + i in optimizer_state_dict['state']:
-                    cur_states[i] =optimizer_state_dict['state'][merged_cur + i]
+                if merged_cur + i in opt_state_dict:
+                    cur_states[i] = opt_state_dict[merged_cur + i]
             pm_new_states = _opt_load_merged_state_dict(pm_modules[pm_cur], cur_states)
             for idx, value in pm_new_states.items():
                 new_states[new_cur + idx] = value
@@ -2915,7 +3132,13 @@ def sync_grad_when(cond: bool):
 
 
 def _construct_parallel_module_stub(metadata):
-    pmodules = {prefix: ParallelModule._unpack(minfo) for prefix, minfo in metadata.items()}
+    pmodules = {
+        prefix:
+            ParallelModule._unpack(minfo) if prefix != _NON_PARALLEL_MODULE_ATTR_NAME
+            else NonParallelModule._unpack(minfo)
+        for prefix, minfo in metadata.items()
+    }
+    real_pmodules = {prefix: m for prefix, m in pmodules.items() if prefix != _NON_PARALLEL_MODULE_ATTR_NAME}
 
     # whole parallel module
     if len(pmodules) == 1 and list(pmodules.keys())[0] == '':
@@ -2923,6 +3146,7 @@ def _construct_parallel_module_stub(metadata):
     else:
         module = torch.nn.Module()
         for prefix, pmodule in pmodules.items():
+            # will also set NonParallelModule
             set_member_by_name(module, prefix, pmodule)
 
     # mock `named_modules` to list parallel modules in stub module
@@ -2933,7 +3157,7 @@ def _construct_parallel_module_stub(metadata):
     ):
         assert memo is None and prefix == '' and remove_duplicate is True, \
             "Only support default arguments"
-        return pmodules.items()
+        return real_pmodules.items()
 
     module.named_modules = named_modules
 
@@ -3183,6 +3407,8 @@ def trimmed_broadcast_merged_state_dict(
         {module_path: m._pack() for module_path, m in module.named_modules() if isinstance(m, ParallelModule)},
         optimizer._extra_state if optimizer else None,
     )
+    if hasattr(module, _NON_PARALLEL_MODULE_ATTR_NAME):
+        rank_metadata[0][_NON_PARALLEL_MODULE_ATTR_NAME] = getattr(module, _NON_PARALLEL_MODULE_ATTR_NAME)._pack()
 
     rank_metadatas = [None] * len(dst_ranks) if cur_rank == src_rank else None
     torch.distributed.gather_object(rank_metadata, rank_metadatas, group=pg, dst=src_rank)
