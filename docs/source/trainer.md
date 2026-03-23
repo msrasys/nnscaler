@@ -1036,16 +1036,21 @@ following fields:
 @dataclass(frozen=True)
 class ComputeConfig:
     plan_ngpus: int
-    runtime_ngpus: int
+    runtime_ngpus: Optional[int] = None
 
     constant_folding: bool = False
     trace_strategy: Literal['cpu', 'cuda', 'meta', 'cuda_run_cpu_offload', 'reuse_cache'] = 'cuda_run_cpu_offload'
 
-    use_zero: bool = False
+    use_zero: int = 0
     zero_ngroups: int = 1
+    zero_use_reduce_scatter: bool = False
+    zero_param_level_sharding: bool = False
 
-    inference_only : bool = False
+    inference_only: bool = False
     use_end2end: bool = False
+
+    use_async_reducer: bool = False
+    reducer_bucket_cap_mb: Optional[float] = None
 
     pas_config: Dict[str, Any] = field(default_factory=dict)
     user_config: Dict[str, Any] = field(default_factory=dict)
@@ -1093,25 +1098,23 @@ We can categorize the fields into 4 categories:
           <https://pytorch.org/docs/stable/meta.html>.
       4.  `cuda_run_cpu_offload`: Try to execute all functions on cuda,
           and retry to execute the function on cpu as backup if OOM is
-          catched, model weights and intermediate results are on cpu.
-          This strategy is recommanded for most case if the model is too
+          caught, model weights and intermediate results are on cpu.
+          This strategy is recommended for most cases if the model is too
           large to inference on single gpu.
       5.  `reuse_cache`: Compared to `cuda_run_cpu_offload` strategy,
           maintains a map from function signatures to output values. The
           cached output is returned when the signature of the function
           that generates it has been executed. Same signature means the
-          funtions are the same and have almost the same inputs (for
+          functions are the same and have almost the same inputs (for
           tensor type input, just check if they have same tensor meta
-          data[shape, dtyep, requires_grad, stride, memory_format,
+          data[shape, dtype, requires_grad, stride, memory_format,
           ...], and don't check the value). This strategy is an
           experimental strategy to speedup the large-model-large-input
-          case, and have risk to trace an incorrect graph if the
-          signature defined here can not distinguish the differnet
+          case, and has risk of tracing an incorrect graph if the
+          signature defined here cannot distinguish different
           functions used in the model, for example, torch.nonzero will
-          always return the same result if the input have same meta data
-          but different value. We have plan to continue improve this
-          strategy to handle most these kind of data dependence cases,
-          but please note that the risk is still inevitable.
+          always return the same result if the input has same meta data
+          but different value.
 2.  Compute environment configuration
     - `plan_ngpus`: the number of gpus to be used as a unit. The model
       is partitioned (TP or PP) within a unit, and then data parallelism
@@ -1121,32 +1124,39 @@ We can categorize the fields into 4 categories:
       1.  if `rank1 // plan_gpus == rank2 // plan_ngpus`, then they are
           in the same unit.
       2.  If `rank1 % plan_ngpus == rank2 % plan_ngpus`, then the
-          portion of model hold on both gpus are exactly the same.
+          portion of model held on both gpus are exactly the same.
     - `runtime_ngpus`: the number of gpus to be used in runtime. It
       should be a multiple of `plan_ngpus`, which means we have
       `runtime_ngpus // plan_ngpus` units in runtime, and the data
       parallelism is `runtime_ngpus // plan_ngpus`. Please note all
       modules must have the same `plan_ngpus` and `runtime_ngpus`.
+      If not set, it defaults to the value of the `WORLD_SIZE` environment variable.
 3.  Code generation feature configuration
-    - `use_zero`: whether to use zero. If it is true, the generated code
-      will use zero1 to do distributed training.
-    - `zero_ngroups`: the number of groups to be used in zero.
+    - `use_zero`: the ZeRO optimization level. Supported values:
+      - `0`: no ZeRO optimization.
+      - `1`: ZeRO stage 1 (optimizer state sharding).
+      - `3`: ZeRO stage 3 (optimizer state + gradient + parameter sharding).
+      (Passing `2` is also accepted and is treated as ZeRO stage 3.)
+    - `zero_ngroups`: the number of ZeRO groups. Default is `1`.
+    - `zero_use_reduce_scatter`: whether to use reduce-scatter for ZeRO. Only effective when `use_zero != 0` and `zero_ngroups == 1`. May introduce parity issues in some cases; use with caution. Default is `False`.
+    - `zero_param_level_sharding`: whether to shard parameters at parameter level (instead of element level) in ZeRO. Only effective when `use_zero != 0`. Must be set to `True` when using the Muon optimizer. May introduce padding. Default is `False`.
     - `inference_only`: whether to generate code for inference only. If
-      it is true, the generated code can not be used to train the model.
+      it is true, the generated code cannot be used to train the model.
     - `use_end2end`: whether to use end2end training. For the
       requirement of end2end, see the description above.
+    - `use_async_reducer`: whether to use async all-reduce for gradients. Only effective when `use_end2end` is `True`. Default is `False`.
+    - `reducer_bucket_cap_mb`: the maximum reducer bucket size in megabytes for one all-reduce call. Also effective for sync reducers. `None`/`0` uses the default (25 MB for async, no limit for sync). Default is `None`.
     - `pas_config`: the configuration for the PAS policy
       (partition-assign-schedule policy, which describes how to place
       all computations across devices. For details, please refer to
       `PAS Policies`. It is
       a dictionary, and will be used by the PAS policy. Please note
-      different PAS will have different configurations, You can also put
-      any other settings that can affect code generation here. but
+      different PAS will have different configurations. You can also put
+      any other settings that can affect code generation here, but
       please prefix the keys with `_` to avoid conflicts with PAS
       configurations.
     - `user_config`: the user configuration, which is used to decide
-      whether skipping compiling and reusing the previously traced
-      graph.
+      whether to skip compiling and reuse the previously traced graph.
 
 Note:
 
@@ -1192,7 +1202,7 @@ Note:
       }
       ```
 
-2.  If some settings doesn't affect tracing/graph generation, but do
+2.  If some settings don't affect tracing/graph generation, but do
     affect code generation, you can put them in `pas_config`. Please
     prefix the keys with `_` to avoid conflicts with predefined PAS
     configurations. One typical example is you can put the name of

@@ -4,7 +4,7 @@
 from enum import Enum
 from functools import partial
 import types
-from typing import Callable, Any, Dict, Iterator, Optional, Tuple, Type, Union, TypeVar, List, Set, Literal
+from typing import Callable, Any, Dict, Iterable, Optional, Tuple, Type, Union, TypeVar, List, Set, Literal
 from pathlib import Path
 import inspect
 import sys
@@ -959,7 +959,11 @@ def _load_parallel_module_class(
 def parallelize(
     module_or_module_class: Union[torch.nn.Module, Type[torch.nn.Module]],
     dummy_forward_args: Dict[str, Any],
-    pas_policy: Union[str, Callable[[IRGraph, ComputeConfig], IRGraph]],
+    pas_policy: Union[
+        str,
+        Callable[[IRGraph, ComputeConfig], IRGraph],
+        Callable[[IRGraph, ComputeConfig], Iterable[policies.OpPlan]]
+    ],
     compute_config: ComputeConfig,
     *,
     gen_savedir: Union[str, Path] = './.nnscaler',
@@ -1029,7 +1033,11 @@ def parallelize(
     Args:
         module_or_module_class (Union[torch.nn.Module, Type[torch.nn.Module]]): the module or module class to be compiled
         dummy_forward_args (Dict[str, Any]): the dummy input for the module forward
-        pas_policy (Union[str, Callable[[IRGraph, ComputeConfig], IRGraph]]): the pas policy,
+        pas_policy (Union[
+            str,
+            Callable[[IRGraph, ComputeConfig], IRGraph],
+            Callable[[IRGraph, ComputeConfig], Iterable[OpPlan]]]
+        ): the pas policy,
             it can be a name of builtin policies, or a custom policy function.
         compute_config (ComputeConfig): the environment resource
         reuse (ReuseType): specify which part can be reused.
