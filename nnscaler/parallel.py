@@ -2243,7 +2243,7 @@ def _trim_optimizer_merged_state_dict(
         pm_modules.append(m)
 
     opt_state_dict = optimizer_state_dict['state']
-    if _NON_PARALLEL_MODULE_ATTR_NAME in pm_name_locs:
+    if opt_state_dict and _NON_PARALLEL_MODULE_ATTR_NAME in pm_name_locs:
         # it should be the last loc
         assert list(pm_name_locs.keys())[-1] == _NON_PARALLEL_MODULE_ATTR_NAME
         reordered_opt_state_dict = {}
