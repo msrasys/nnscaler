@@ -136,6 +136,15 @@ def test_deserialize():
     # since the type info is lost after asdict, u will be deserialized to dict.
     assert deserialize_dataclass(asdict(y), A).u == {'h': 6}
 
+    x = parse_args(['--a=1', '--b', '0', '--c.d=3', '--c.e', '4', '--f.g.h=5',
+                        '--v.a=10', '--v.b=20',
+                        '--z.u.__type', 'tests.cli.test_arg_parser.GConfig',
+                        '--z.u.h=6', '--z.u.w=x'
+        ])
+    y = deserialize_dataclass(x, A)
+    # u is not a member of a dataclass, so it will be deserialized to dict instead of GConfig.
+    assert y.z == {'u': {'__type': 'tests.cli.test_arg_parser.GConfig', 'h': 6, 'w': 'x'}}
+
 
 def test_deserialize_list():
     @dataclass

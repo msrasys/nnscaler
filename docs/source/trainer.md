@@ -149,6 +149,9 @@ instance_name: {
 }
 ```
 
+For non-dataclass arguments, `__type` and `__value_type` will not be processed except for the arguments of components(model/optimizer/etc) and their arguments.
+
+
 ### Component Configs
 
 - `model` (`ModelConfig`): The model to be trained. You need to provide
