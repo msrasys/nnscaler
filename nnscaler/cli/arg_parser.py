@@ -1,6 +1,7 @@
 #  Copyright (c) Microsoft Corporation.
 #  Licensed under the MIT License.
 
+import collections
 import os
 import copy
 import logging
@@ -11,6 +12,7 @@ import enum
 import ast
 import regex
 
+from nnscaler.utils import load_type, TDataClass
 
 try:
     from types import UnionType
@@ -40,6 +42,47 @@ SKIP_DESERIALIZATION_KEY = 'skip_deserialization'
 
 class _KeyNotFoundError(KeyError):
     pass
+
+
+def deserialize_value_type(v: dict[str, Any]):
+    if _VALUE_KEY not in v or _VALUE_TYPE_KEY not in v or len(v) != 2:
+        raise ValueError(f"`{_VALUE_KEY}` and `{_VALUE_TYPE_KEY}` are required, and no extra keys are allowed for value type object, but got {v}")
+
+    if v[_VALUE_TYPE_KEY] == 'function':
+        v = load_type(v[_VALUE_KEY])
+    else:
+        # call its __init__ function
+        v = load_type(v[_VALUE_TYPE_KEY])(v[_VALUE_KEY])
+
+    return v
+
+
+def fn_deserialize(value):
+    return None if value is None else load_type(value)
+
+
+def factory_normalize(value):
+    if isinstance(value, dict) and _VALUE_TYPE_KEY in value:
+        return deserialize_value_type(value)
+
+    if isinstance(value, dict) and _TYPE_KEY in value:
+        value_type = load_type(value[_TYPE_KEY])
+        kwargs = {
+            k: v for k, v in value.items()
+            if k != _TYPE_KEY
+        }
+        if is_dataclass(value_type):
+            return deserialize_dataclass(kwargs, value_type)
+        else:
+            return value_type(**kwargs)
+
+    return value
+
+
+def fn_field(**kwargs):
+    metadata = kwargs.pop('metadata', {})
+    metadata[DESERIALIZE_KEY] = fn_deserialize
+    return field(**kwargs, metadata=metadata)
 
 
 def parse_args(argv: List[str]) -> dict:
@@ -140,8 +183,13 @@ def resolve_args(args: dict):
     Substitute the args with the value from the args.
     For example, if args is {'a': '$(b)', 'b': 'c'}, then
     it will be updated to {'a': 'c', 'b': 'c'}.
+
+    Use $$ to escape variable references
+    For example, $$(b) produces the literal string $(b) instead of a variable reference.
     """
-    pattern = r'(\$\{[^}]+\}|\$\([^)]+\))'
+    # $${...} and $$(...) are consumed as a literal ${...} and $(...) respectively
+    # ${...} and $(...) are variable references.
+    pattern = r'\$\$\{[^}]+\}|\$\$\([^}]+\)|\$\{[^}]+\}|\$\([^)]+\)'
 
     def _is_variable(var_path):
         return isinstance(var_path, str) and (
@@ -151,36 +199,34 @@ def resolve_args(args: dict):
 
     def _get_variable(var_path: Any) -> Optional[str]:
         if not _is_variable(var_path):
-            return None
+            raise ValueError(f"{var_path} is not a valid variable reference")
         return var_path[2:-1]
 
     def _get_variables(var_path: str) -> List[str]:
         """
-        Get all variables in the var_path.
+        Get all variable references in the var_path (excluding $$ escape sequences).
         For example, if var_path is 'a$(a.b.c)b$(c.d)c', it will return ['a.b.c', 'c.d'].
         """
-        # use regex to find all variables in the var_path
         matches = regex.findall(pattern, var_path)
-        return [_get_variable(m) for m in matches]
+        return [_get_variable(m) for m in matches if not m.startswith('$$')]
 
     def _resolve_variables(var_path: Any, resolved_vars: dict[str, str]) -> str | Any:
         """
-        Resolve all variables in the var_path by replacing them with their values.
+        Resolve all variable references and unescape $$.
         For example, if var_path is 'a$(b.c)d$(e.f)g', and resolved_vars is {'b.c': 'x', 'e.f': 'y'},
         it will return 'axdyg'.
         """
-        # special case, this will keep the type of the variable
+        # special case: preserve the original type when the entire string is one variable ref
         if _is_variable(var_path):
             return resolved_vars[_get_variable(var_path)]
 
-        # always return a string
-        var_path = regex.sub(
-            pattern,
-            lambda m: str(resolved_vars[_get_variable(m.group(0))]),
-            var_path
-        )
-        var_path = var_path.replace(r'$\(', '$(').replace(r'$\{', '${')  # escape the variable syntax
-        return var_path
+        def _replace(m):
+            s = m.group(0)
+            if s.startswith('$$'):
+                return s[1:]  # unescape $$ -> $
+            return str(resolved_vars[_get_variable(s)])
+
+        return regex.sub(pattern, _replace, var_path)
 
     def _get_value(data, var_path: list[Any]):
         for key in var_path:
@@ -320,10 +366,25 @@ def _get_type_info(dataclass_type) -> Dict[str, _TypeInfo]:
             # if the field is marked as skip_deserialization,
             # or if it has a custom deserialize function,
             # we don't need to extract the type information
-            type_dict[k] = _TypeInfo(type=None)
+            type_dict[k] = _TypeInfo(type=None, metadata=v.metadata)
         else:
-            type_dict[k] = _get_type_info_from_annotation(v.type)
-        type_dict[k].metadata = v.metadata
+            # add predefined deserialization process for function types.
+            metadata = {**v.metadata} if v.metadata else {}
+            if _is_function_type(v.type):
+                metadata[DESERIALIZE_KEY] = fn_deserialize
+                type_dict[k] = _TypeInfo(type=None, metadata=metadata)
+            else:
+                type_dict[k] = _get_type_info_from_annotation(v.type)
+
+                if NORMALIZE_KEY not in metadata:
+                    metadata[NORMALIZE_KEY] = factory_normalize
+                else:
+                    # combine the normalize function if there is already a user defined one.
+                    user_normalize = metadata[NORMALIZE_KEY]
+                    # closure magic
+                    metadata[NORMALIZE_KEY] = lambda v, u=user_normalize: u(factory_normalize(v))
+
+                type_dict[k].metadata = metadata
     return type_dict
 
 
@@ -332,6 +393,32 @@ def _is_primitive_type(data_type):
     We only support int, str, bool, float as primitive types.
     """
     return data_type in (int, str, bool, float)
+
+
+def _is_function_type(type_info):
+    def _get_types(type_info):
+        # unwrap union/optional
+        if getattr(type_info, '__origin__', None) == Union \
+            or (UnionType and isinstance(type_info, UnionType)):
+            args = getattr(type_info, '__args__', None)
+            for arg in args:
+                yield from _get_types(arg)
+        elif type_info is None or type_info == type(None):
+            # ignore all None types
+            yield from []
+        else:
+            yield from [type_info]
+
+    types = list(_get_types(type_info))
+    if types and all(
+        t == type or
+            getattr(t, '__origin__', None) in [type, collections.abc.Callable]
+        for t in types
+    ):
+        # type, type[T], Callable, Callable[T]
+        return True
+    else:
+        return False
 
 
 def _guess_deserialize_object(value):
@@ -404,7 +491,7 @@ def _deserialize_object(value, value_type):
     return value
 
 
-def deserialize_dataclass(value, value_type):
+def deserialize_dataclass(value: dict, value_type: TDataClass):
     if not isinstance(value, dict):
         raise ValueError(f"Expecting dict, but got {value}")
     if not is_dataclass(value_type):

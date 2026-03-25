@@ -677,12 +677,6 @@ class OptStateDict(TypedDict):
     param_groups: list[OptStateParamGroup]
 
 
-def fn_field(**kwargs):
-    metadata = kwargs.pop('metadata', {})
-    metadata['deserialize'] = lambda t: None if t is None else load_type(t)
-    return field(**kwargs, metadata=metadata)
-
-
 TENSOR_DYNAMIC_DIMS_FIELD_NAME = '_nnscaler_dynamic_dims'
 # for nnscaler custom class (TensorMetadata)
 NNSCALER_DYNAMIC_DIMS_NAME = 'dynamic_dims'
