@@ -2,14 +2,14 @@
 #  Licensed under the MIT License.
 
 from dataclasses import asdict, dataclass, field
-from typing import Callable, List, Optional, Tuple, Dict, Any, Union
+from typing import Callable, List, Optional, Tuple, Type, Dict, Any, Union
 import sys
 
 import pytest
 
 from nnscaler.cli.arg_parser import (
     _KeyNotFoundError, parse_args, deserialize_dataclass, _fix_type,
-    resolve_args, merge_args
+    resolve_args, merge_args, _is_function_type
 )
 
 
@@ -438,3 +438,78 @@ def test_resume_options():
     assert p.resume_from.checkpoint == 'last'
     assert p.save_type == 'deduped'
     assert callable(p.c_fn)
+
+
+def test_is_function_type():
+    # `type` itself should be recognized as a function type
+    assert _is_function_type(type) is True
+
+    # typing.Type and typing.Type[T]
+    assert _is_function_type(Type) is True
+    assert _is_function_type(Type[int]) is True
+    assert _is_function_type(Type[str]) is True
+    assert _is_function_type(Optional[Type[int]]) is True
+    assert _is_function_type(Union[Type[int], Callable]) is True
+    assert _is_function_type(Union[Type[int], Callable, None]) is True
+
+    if sys.version_info >= (3, 9):
+        # type[int], type[str] etc. (Python 3.9+ builtin generic syntax)
+        assert _is_function_type(type[int]) is True
+        assert _is_function_type(type[str]) is True
+
+    # bare Callable and parameterized Callable
+    assert _is_function_type(Callable) is True
+    assert _is_function_type(Callable[..., Any]) is True
+    assert _is_function_type(Callable[[int, str], bool]) is True
+
+    # Optional[Callable] = Union[Callable, None], should be True
+    assert _is_function_type(Optional[Callable]) is True
+    assert _is_function_type(Optional[Callable[..., Any]]) is True
+    assert _is_function_type(Union[Callable, None]) is True
+
+    # Optional[type] = Union[type, None], should be True
+    assert _is_function_type(Optional[type]) is True
+    assert _is_function_type(Union[type, None]) is True
+
+    # Union of multiple function types (all are type/Callable) should be True
+    assert _is_function_type(Union[type, Callable]) is True
+    assert _is_function_type(Union[type, Callable, None]) is True
+    assert _is_function_type(Union[Callable[..., Any], Callable[[int], str], None]) is True
+
+    # Primitive types should NOT be function types
+    assert _is_function_type(int) is False
+    assert _is_function_type(str) is False
+    assert _is_function_type(float) is False
+    assert _is_function_type(bool) is False
+
+    # User defined dataclasses should NOT be function types
+    from nnscaler.cli.trainer_args import CheckpointConfig
+    assert _is_function_type(CheckpointConfig) is False
+
+    # None and NoneType should NOT be function types
+    # (empty types list -> returns False)
+    assert _is_function_type(None) is False
+    assert _is_function_type(type(None)) is False
+
+    # Container types should NOT be function types
+    assert _is_function_type(list) is False
+    assert _is_function_type(dict) is False
+    assert _is_function_type(List[int]) is False
+    assert _is_function_type(Dict[str, int]) is False
+
+    # Optional[int] etc. should NOT be function types
+    assert _is_function_type(Optional[int]) is False
+    assert _is_function_type(Union[str, None]) is False
+
+    # Union of function types and non-function types should NOT be function type
+    assert _is_function_type(Union[Callable, int]) is False
+    assert _is_function_type(Union[type, str]) is False
+    assert _is_function_type(Union[Callable, int, None]) is False
+
+    if sys.version_info >= (3, 10):
+        # Python 3.10+ pipe union syntax
+        assert _is_function_type(Callable | None) is True
+        assert _is_function_type(type | None) is True
+        assert _is_function_type(type | Callable | None) is True
+        assert _is_function_type(Callable | int) is False
+        assert _is_function_type(int | None) is False

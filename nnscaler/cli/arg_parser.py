@@ -189,7 +189,7 @@ def resolve_args(args: dict):
     """
     # $${...} and $$(...) are consumed as a literal ${...} and $(...) respectively
     # ${...} and $(...) are variable references.
-    pattern = r'\$\$\{[^}]+\}|\$\$\([^}]+\)|\$\{[^}]+\}|\$\([^)]+\)'
+    pattern = r'\$\$\{[^}]+\}|\$\$\([^)]+\)|\$\{[^}]+\}|\$\([^)]+\)'
 
     def _is_variable(var_path):
         return isinstance(var_path, str) and (
