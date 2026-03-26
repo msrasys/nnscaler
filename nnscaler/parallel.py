@@ -25,6 +25,7 @@ from nnscaler.codegen.schedule.schedule import ScheduleCodeGen
 from nnscaler.execplan import ExecutionPlan
 from nnscaler.execplan.planpass.fusion import DiffFusion
 from nnscaler.execplan.planpass.grouping import Grouping
+from nnscaler.execplan.graphdump import save_execution_plan, dump_execution_graph
 
 from nnscaler.graph import IRGraph
 from nnscaler.graph import parser
@@ -885,6 +886,11 @@ def _gencode(
     # plan pass for computation grouping
     if not graph.sched:
         execplan = Grouping.apply(execplan)
+
+    # dump execution plan if requested
+    execplan_dump = outdir / 'execplan.pkl'
+    save_execution_plan(execplan, str(execplan_dump), save_json=True)
+    logger.info(f'Execution plan saved to {execplan_dump}')
 
     # code generation
     assert len(execplan.graph.device) == compute_config.plan_ngpus, f"{execplan.graph.device}"

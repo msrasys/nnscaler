@@ -24,6 +24,7 @@ from nnscaler.graph.schedule.schedplan import SchedulePlan
 from nnscaler.execplan import ExecutionPlan
 from nnscaler.execplan.planpass.fusion import DiffFusion
 from nnscaler.execplan.planpass.grouping import Grouping
+from nnscaler.execplan.graphdump import dump_execution_graph, save_execution_plan
 
 from nnscaler.codegen import ModuleCodeGen, ScheduleCodeGen
 
@@ -46,7 +47,8 @@ def compile(model: Union[torch.nn.Module, SemanticModel], *args,
             comm_cost_fn: Optional[Callable] = None,
             override = True,
             load_content = True,
-            scale: Union[bool, int] = False) -> Callable:
+            scale: Union[bool, int] = False,
+            dump_graph_file: Optional[str] = None) -> Callable:
     """Cube compile entry
 
     Examples:
@@ -79,6 +81,10 @@ def compile(model: Union[torch.nn.Module, SemanticModel], *args,
         scale (Union[bool, int]): If true, will scale the generated code to the
             total launched number of GPUs. If int, will scale to the specified number.
             Default False, no scaling.
+        dump_graph_file (Optional[str]): If provided, dump the complete execution
+            graph (forward, backward, communication, weight reduction) to this JSON
+            file before code generation. The graph captures all computation and
+            communication dependencies for analysis.
 
     Returns:
         Callable: compiled training iteration
@@ -257,6 +263,15 @@ def compile(model: Union[torch.nn.Module, SemanticModel], *args,
 
             # execplan.graph.reset_dependency()
             # execplan.analyze(outfile='execplan.png')
+
+            # dump execution graph before code generation
+            if dump_graph_file is not None:
+                start = time.time()
+                # Save full execution plan (dill) for later code regeneration,
+                # plus a companion JSON for human-readable analysis.
+                save_execution_plan(execplan, outfile=dump_graph_file, save_json=True)
+                span = time.time() - start
+                _logger.info('finish saving execution plan to {}: {:.2f} s'.format(dump_graph_file, span))
 
             start = time.time()
             local_world_size = DeviceGroup().local_world_size

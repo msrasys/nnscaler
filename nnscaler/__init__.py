@@ -28,6 +28,13 @@ from nnscaler.runtime.function.function import (
 )
 from nnscaler.runtime.f16_optimizer import MixedPrecisionAdam, MixedPrecisionAdamW
 from nnscaler.runtime.hybrid_optimizer import HybridLRScheduler, HybridOptimizer
+from nnscaler.execplan.graphdump import (
+    dump_execution_graph,
+    save_execution_plan,
+    load_execution_plan,
+    gencode_from_execution_plan,
+    gencode_from_file,
+)
 from nnscaler.utils import (
     mark_dynamic,
     get_dynamic,

@@ -266,6 +266,71 @@ class ExecutionPlan:
             raise TypeError("Expected a list of outputs")
         self._outputs = outputs
 
+    def dump_graph(self, outfile: Optional[str] = None) -> dict:
+        """Dump the complete execution graph to a dict (and optionally a JSON file).
+
+        Includes forward, backward, communication, and weight reduction nodes
+        with their data dependencies in execution order per device.
+
+        Args:
+            outfile: Optional path to write JSON file.
+
+        Returns:
+            A dict representing the execution graph.
+        """
+        from nnscaler.execplan.graphdump import dump_execution_graph
+        return dump_execution_graph(self, outfile=outfile)
+
+    def save(self, outfile: str, save_json: bool = True) -> None:
+        """Save the full execution plan to a dill file for later code generation.
+
+        Args:
+            outfile: Path for the dill dump (e.g. ``execplan.pkl``).
+            save_json: If True, also write a companion ``.json`` analysis file.
+        """
+        from nnscaler.execplan.graphdump import save_execution_plan
+        save_execution_plan(self, outfile=outfile, save_json=save_json)
+
+    @staticmethod
+    def load(infile: str) -> 'ExecutionPlan':
+        """Load an execution plan from a dill dump.
+
+        Args:
+            infile: Path to the dill file created by :meth:`save`.
+
+        Returns:
+            The restored ExecutionPlan.
+        """
+        from nnscaler.execplan.graphdump import load_execution_plan
+        return load_execution_plan(infile)
+
+    def gencode(
+        self,
+        num_ranks: int,
+        outdir: str = '.',
+        filename_pattern: str = 'gencode{rank}.py',
+        runtime_ndevs: Optional[int] = None,
+    ) -> List[str]:
+        """Generate distributed code files from this execution plan.
+
+        Args:
+            num_ranks: Number of rank files to generate.
+            outdir: Directory for output files.
+            filename_pattern: Output filename pattern with ``{rank}`` placeholder.
+            runtime_ndevs: Optional data-parallel scaling target.
+
+        Returns:
+            List of generated file paths.
+        """
+        from nnscaler.execplan.graphdump import gencode_from_execution_plan
+        return gencode_from_execution_plan(
+            self,
+            num_ranks=num_ranks,
+            outdir=outdir,
+            filename_pattern=filename_pattern,
+            runtime_ndevs=runtime_ndevs,
+        )
+
     def visualize(self, outfile: str,
                   map2time: Optional[Callable] = None,
                   map2mem: Optional[Callable] = None,

@@ -60,6 +60,24 @@ python train.py --run_mode compile --model_id deepseek-ai/DeepSeek-Coder-V2-Lite
 torchrun --nproc_per_node=8 train.py --model_id deepseek-ai/DeepSeek-Coder-V2-Lite-Base --dataset_path ./bookcorpus_2k --plan_ngpus=4 --runtime_ngpus=8 2>&1 | tee run.log
 ```
 
+### Inspect & Regenerate Execution Graph
+
+After compilation, nnScaler saves the full execution plan alongside the generated code. You can use `dump_and_gencode.py` to inspect the computation/communication graph or regenerate distributed code without recompilation:
+
+```bash
+# Quick demo with a tiny MLP (no DeepSeek dependencies needed)
+python dump_and_gencode.py demo
+
+# After compiling the DeepSeek model, inspect the execution graph
+python dump_and_gencode.py inspect \
+    --plan_dir .nnscaler/_parallel_modules/<module_path> -v
+
+# Regenerate code from the saved plan (e.g., for a different number of ranks)
+python dump_and_gencode.py gencode \
+    --plan_dir .nnscaler/_parallel_modules/<module_path> \
+    --num_ranks 8 --outdir ./regenerated_code
+```
+
 ## Performance
 
 We have tested the training script on 8xH100 and each step takes about 2s. A step is composed of 128K tokens and the number of activated params is about 2.65B. Combining them together, the MFU is about 13% (attention's FLOPs is omitted since the sequence is short in this ). The root cause is the low utilization rate of the MoE part. We collect statistics for the grouped gemm in the table below. Note that in deepseek coder v2 lite, there are 64 experts with hidden size = 2048, intermediate size = 1408, each token will be dispatched to 8 experts.
