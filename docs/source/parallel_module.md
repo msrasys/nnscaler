@@ -169,10 +169,15 @@ def train(model: ParallelizedPipelinedLLM, data):
         optimizer.zero_grad()
 ```
 
-### BroadcastGenFilesStrategy
+## BroadcastGenFilesStrategy
 
 The broadcast strategy for new generated files.
-Please note we never broadcast reused files (i.e., specified by `ReuseType`.).
+Please note reused files (i.e., matched by `ReuseType`) are never broadcasted.
+
+The generated files include:
+1. config file: compute config (`compute_config.pt`)
+2. trace files: graph dump (`graph.ckp`), forward args dump (`forward_args.pkl`), origin module metadata (`origin_module_metadata.pt`), init weights (`fullmodel.pt.*`), param name mapping (`dist_param_map.pt`)
+3. code: generated code files (`gencode*.py`)
 
 ```python
 class BroadcastGenFilesStrategy(Enum):
@@ -182,43 +187,42 @@ class BroadcastGenFilesStrategy(Enum):
     CODE = 'code'
 ```
 
-1. `None`:  nothing will be broadcasted.
+1. `NONE`: nothing will be broadcasted.
 
-    You need to do it by yourself or the generated files are save in a shared directory (like azure blob).
+    You need to do it by yourself or the generated files are saved in a shared directory (like azure blob).
 
-2. `ALL`: broadcast all the generated files to all nodes (Recommended).
+2. `ALL`: broadcast all new generated files to all nodes (Recommended).
 
     This is useful when you want to run the same code on all nodes.
-    please note the init weight files can be huge.
+    Please note the init weight files can be huge.
 
-3. `NO_WEIGHTS`: broadcast all except init weights (Only for experts).
+3. `NO_WEIGHTS`: broadcast all new generated files except init weights (`fullmodel.pt.*`) (Only for experts).
 
     Without weights, you can only construct the parallel module with `init_params=False`.
-    You can then
-    - Safe way: you can use `broadcast_weights` to get the weights from the workers who have init weights. By default rank 0 will run the `parallelize` and store all the generated files. So if local world size is bigger than plan_ngpus, you can use `broadcast_weights` to get the weights from workers on node0.
-    - Risk Way: Load the weights from a checkpoint file with `module.load_state_dict`, `load_merged_state_dict` or `load_deduped_state_dict`.
+    You can then:
+    - Safe way: use `broadcast_weights` to get the weights from the workers who have init weights. By default rank 0 will run the `parallelize` and store all the generated files. So if local world size is bigger than `plan_ngpus`, you can use `broadcast_weights` to get the weights from workers on node 0.
+    - Risky way: load the weights from a checkpoint file with `module.load_state_dict`, `load_merged_state_dict` or `load_deduped_state_dict`.
 
     Please note: the non-persistent buffers will remain uninitialized after loading the checkpoints,
     because they are not saved in the state dict.
-    To make sure all the buffers are initialized,  you still need to set `init_params=True` to make sure non-persistent buffers are initialized if you want to initialize weights by loading a checkpoint.
+    You still need to set `init_params=True` to make sure non-persistent buffers are initialized if you want to initialize weights by loading a checkpoint.
 
-4. `CODE`: broadcast the new generated code only (Not recommeneded)
-    It's your responsibility to make sure other necessary files are available on all nodes.
+4. `CODE`: broadcast the new generated code (`gencode*.py`) and `compute_config.pt` only. It's your responsibility to make sure other necessary files are available on all nodes.
 
 Here are some guidelines to choose the strategy:
 
-1. When restarting a training and there is a successful previous run: As we have a previous run, the compiling process has been done before. So there will be no new generated files and no broadcast will happen no matter what this option is. Please be sure the reuse flag of `parallelize` is `MATCH`, so we can make sure the generated code is the same with the previous run.
+1. When restarting a training and there is a successful previous run: As we have a previous run, the compiling process has been done before. So there will be no new generated files and no broadcast will happen no matter what this option is. Please make sure the reuse flag of `parallelize` is `MATCH`, so we can ensure the generated code is the same as the previous run.
 
 2. When training a model from scratch. If there is only one node, `none` is good enough.
 If there are multiple nodes, here are some strategies:
 
-a. If use `none`, the user should run `parallelize(..., load_module=False, ..)`, and then copy all files to all nodes manually, so all nodes have the same files. Then the user load the module by running `parallelize(..., load_module=True, ..)`.
+a. If use `none`, the user should run `parallelize(..., load_module=False, ..)`, and then copy all files to all nodes manually, so all nodes have the same files. Then the user loads the module by running `parallelize(..., load_module=True, ..)`.
 
-b. if they are using a NAS-like device to save generated files, and the upload/download speed is fast in the cluster, they can also use `none`, and just run `parallelize(..., load_module=True, ..)` to do the training.
+b. If they are using a NAS-like device to save generated files, and the upload/download speed is fast in the cluster, they can also use `none`, and just run `parallelize(..., load_module=True, ..)` to do the training.
 
-c. If use `all`, then user can just run `parallelize(..., load_module=True, ..)` safely. (remember to set `nccl` communication timeout to a very big value to tolerate the duration of this `nccl` broadcast). This is the most recommended way.
+c. If use `all`, then user can just run `parallelize(..., load_module=True, ..)` safely. (Remember to set `nccl` communication timeout to a very large value to tolerate the duration of this `nccl` broadcast). This is the most recommended way.
 
-d. If use `no_weights`. then user can run `parallelize(..., load_module=True, init_module_params=rank<plan_ngpus, ..)`. After module is loaded, the user should call `broadcast_weights(plan_ngpus)` manually to synchronize the module weights before training (Note all submodules have the same `plan_ngpus`). Here is an example:
+d. If use `no_weights`, then user can run `parallelize(..., load_module=True, init_module_params=rank<plan_ngpus, ..)`. After the module is loaded, the user should call `broadcast_weights(plan_ngpus)` manually to synchronize the module weights before training (note all submodules have the same `plan_ngpus`). Here is an example:
 ```python
 class Module(torch.nn.Module):
     ...
@@ -237,23 +241,24 @@ when there are non-persistent buffers in the module.
 
 e. Currently `code` option is provided just for completeness. Do not suggest users to use.
 
-### Module Parallelization
+## Module Parallelization
 
-We have `parallelize` function to Convert a torch.nn.Module to a ParallelModule.
+We have `parallelize` function to convert a `torch.nn.Module` to a `ParallelModule`.
 ```python
 def parallelize(
     module_or_module_class: Union[torch.nn.Module, Type[torch.nn.Module]],
     dummy_forward_args: Dict[str, Any],
-    pas_policy: Callable[[IRGraph, ComputeConfig], IRGraph],
+    pas_policy: Union[str, Callable[[IRGraph, ComputeConfig], IRGraph], Callable[[IRGraph, ComputeConfig], Iterable[OpPlan]]],
     compute_config: ComputeConfig,
     *,
     gen_savedir: Union[str, Path] = './.nnscaler',
     reuse: Union[ReuseType, str] = ReuseType.MATCH,
     instance_name: Optional[str] = None,
     load_module: bool = True,
-    module_dtype:  Optional[torch.dtype] = None,
+    module_dtype: Optional[torch.dtype] = None,
     module_fn: Optional[Callable[[], torch.nn.Module]] = None,
     init_module_params: bool = True,
+    build_module_buckets: bool = True,
     broadcast_strategy: Union[str, BroadcastGenFilesStrategy] = 'none',
 ) -> Union[None, ParallelModule, Type[ParallelModule]]:
 ```
@@ -265,10 +270,11 @@ It has the following parameters:
 The keys are the argument names of `Module.forward` function,
 and the values are the dummy input for the arguments.
 The dummy forward args will be used to trace the module.
-Please note the module can't be parallelize if `Module.forward` has positional-only arguments.
+Please note the module can't be parallelized if `Module.forward` has positional-only arguments.
 
-- `pas_policy` (`Union[str, Callable[[IRGraph, ComputeConfig], IRGraph]]`): the pas (partition-assign-schedule) policy, which describes how to place all computations across devices.
-You need either pass a builtin PAS policy name or a a custom policy function which should take an `IRGraph` and a `ComputeConfig` as input, and return a new `IRGraph` with the PAS policy applied.
+- `pas_policy` (`Union[str, Callable[[IRGraph, ComputeConfig], IRGraph], Callable[[IRGraph, ComputeConfig], Iterable[OpPlan]]]`): the pas (partition-assign-schedule) policy, which describes how to place all computations across devices.
+You need either pass a builtin PAS policy name or a custom policy function which should take an `IRGraph` and a `ComputeConfig` as input, and return a new `IRGraph` or an iterable of `OpPlan`.
+
  We have 6 builtin PAS policies: `dp`, `tp`, `pp`, `data`, `hybrid`, and `autodist`. Please note all builtin PAS policies except `autodist` are only for test purpose. The `autodist` policy is the recommended policy for most cases.
  For details, please refer to [PAS Policies](./trainer) section.
 
@@ -283,11 +289,18 @@ You need either pass a builtin PAS policy name or a a custom policy function whi
 - `load_module` (`bool`): whether to load the generated module or module class after parallelization is done.
 Currently the module can only be loaded in `torchrun` environment. So you can do the parallelization in any environment (with `load_module` unset), and load the module in `torchrun` environment.
 
-- `init_module_params` (`bool`): If true, when we construct the module, all its parameters are initialized with the same value with when we traced.
-Otherwise, they will be empty tensor.
+- `init_module_params` (`bool`): If true, when we construct the module, all its parameters are initialized with the same value as when we traced.
+Otherwise, they will be empty tensors.
 This parameter will be passed to the module constructor,
 so it is only used when `module_or_module_class` is a module object, and `load_module` is true.
 See more details in the `ParallelModule APIs` section.
+
+- `build_module_buckets` (`bool`): For parallel module, parameters that need to synchronize will be grouped into buckets for more efficient communication.
+If true, the grouping process will be done in `__init__`.
+If false, you should call `build_buckets()` manually before using the module.
+This parameter will be passed to the module constructor,
+so it is only used when `module_or_module_class` is a module object, and `load_module` is true.
+Leave it as true unless you have a specific reason to defer bucket building (e.g., when using a hybrid optimizer with `param_clss_fn`).
 
 - `module_dtype` (`Optional[torch.dtype]`): the dtype of the module. Keep the module as it is if it is None.
 
@@ -310,10 +323,10 @@ you can specify the `instance_name` to distinguish them.
 4. if `reuse` is not set to `ReuseType.MATCH`,
 the generated code in outdir will be removed EVEN IF the code generation fails in this call.
 
-5. For `broadcast_strategy`, Please note that the broadcast will only be done in `torchrun` environment, and will throw an error if `torch.distributed` is not initialized and `broadcast_strategy` is not `NONE`.
+5. For `broadcast_strategy`, please note that the broadcast will only be done in `torchrun` environment, and will throw an error if `torch.distributed` is not initialized and `broadcast_strategy` is not `NONE`.
 
 
-### Optimizer Creation
+## Optimizer Creation
 
 We have `build_optimizer` to build an optimizer for distributed training.
 ```python
@@ -321,6 +334,7 @@ def build_optimizer(
     module: torch.nn.Module,
     optimizer_fn: Union[Type[OptimizerT], Callable[..., OptimizerT]],
     compute_config: Optional[ComputeConfig] = None,
+    param_clss_fn: Optional[Callable[[str], Any]] = None,
     **kwargs,
 ) -> OptimizerT:
 ```
@@ -329,10 +343,13 @@ It has the following parameters:
 - `optimizer_fn` (`Union[Type[torch.optim.Optimizer], Callable[..., torch.optim.Optimizer]]`):
     It can be the optimizer class or optimizer factory function.
     The first parameter of the `optimizer_fn` should be the module parameters.
-- compute_config (Optional[ComputeConfig]):
+- `compute_config` (`Optional[ComputeConfig]`):
     The config will be used to generate communication reducer.
-    If it is None, Default configuration will be used when creating reducer for non-parallel modules.
-- **kwargs: the kwargs will pass to `optimizer_fn`.
+    If it is None, default configuration will be used when creating reducer for non-parallel modules.
+- `param_clss_fn` (`Optional[Callable[[str], Any]]`):
+    A function that maps original full-qualified parameter names to their class IDs.
+    Required when using a hybrid optimizer; the return value must be a `tuple[int, int]` of `(optimizer_index, param_group_index)`.
+- `**kwargs`: the kwargs will be passed to `optimizer_fn`.
 
 To support distributed training, in the function we need to hook 4 places (which we have done for you in `build_optimizer`. That's why you should use `build_optimizer` to create optimizer):
 
@@ -373,26 +390,27 @@ optimizer.register_reducer_post_hook(lambda reducer, grad: grad.mul_(num_scale_u
 
 5. `_non_parallel_module_reducer`: The reducer for the modules which are not parallelized. It is used to sync the parameters in those modules across units.
 
-### ParallelModule APIs
+## ParallelModule APIs
 
 The `ParallelModule` is a subclass of `torch.nn.Module`. It has the following APIs:
 
-1. constructor
+1.constructor
 ```python
-def __init__(self, init_params=True):
+def __init__(self, init_params=True, build_buckets=True):
     ...
 ```
-You can use `init_params` to control whether to initialize the module parameters with the module parameters' values when we trace it. You can set it to `False` if you don't want to.
+- `init_params` (`bool`): whether to initialize the module parameters with the values they had at trace time. Set to `False` if you plan to load from a checkpoint instead.
+- `build_buckets` (`bool`): whether to build communication buckets immediately. Set to `False` when you need to call `build_buckets()` manually later (e.g., for hybrid optimizers with `param_clss_fn`).
 
-As noted before, in most cases, you still need to set `init_params=True` to make sure non-persistent buffers are initialized if you want to initialize weights by loading a checkpoint.
+As noted before, in most cases you still need to set `init_params=True` to make sure non-persistent buffers are initialized if you want to initialize weights by loading a checkpoint.
 
 
-2. `train_step`
+2.`train_step`
 ```python
 def train_step(self,
     samples: List[Any],
-    is_dummy_batch: Optional[List[bool]],
-    scale_fn: Optional[Callable[[torch.Tensor], torch.Tensor]]
+    is_dummy_batch: Optional[List[bool]] = None,
+    scale_fn: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
 ) -> List[Any]:
     ...
 ```
@@ -401,79 +419,104 @@ Please note:
     1. This function is only supported in end2end mode.
     2. Gradient accumulation is done in this function.
         You shouldn't do it outside this function,
-        because `zero_grad` will be called in the beginning of this function
+        because gradients will be cleared at the beginning of this function.
 
 It has the following arguments:
 - `samples` (`List[Any]`): a list of samples.
-        if pipeline is used, it must have the same length as configured to pas policy.
-- `is_dummy_batch` (`Optional[List[bool]]`): indicates whether the each micro-batch is dummy
-- `scale_fn` (`Optional[Callable[[torch.Tensor], torch.Tensor]]`): the function to scale the loss
+        If pipeline is used, it must have the same length as configured in the pas policy.
+- `is_dummy_batch` (`Optional[List[bool]]`): indicates whether each micro-batch is dummy.
+- `scale_fn` (`Optional[Callable[[torch.Tensor], torch.Tensor]]`): the function to scale the loss.
 
-And it will return a list of outputs for the samples.
+Returns a list of outputs for the samples.
 
-3. `infer_step`
+3.`infer_step`
 ```python
 def infer_step(self, samples: List[Any]) -> List[Any]:
     ...
 ```
 The inference step function. It should be called in the inference loop.
-The input is a list of samples, and returns a list of outputs for the samples. If pipeline is used, it must have the same length as configured to pas policy.
+Only supported in end2end mode.
+The input is a list of samples, and returns a list of outputs for the samples. If pipeline is used, it must have the same length as configured in the pas policy.
 
-### Checkpoint support
+4.`build_buckets`
+```python
+def build_buckets(self, param_clss: Optional[dict[torch.nn.Parameter, Any]] = None):
+    ...
+```
+Build communication buckets for the model reducers. Must be called exactly once before using the module if `build_module_buckets=False` was passed to `parallelize()`.
+
+- `param_clss` (`Optional[dict[torch.nn.Parameter, Any]]`): parameter-to-class mapping produced by `param_clss_fn`. Used to put parameters with different optimizer or param groups into separate buckets.
+
+5.`sleep`
+```python
+def sleep(self) -> Self:
+    ...
+```
+Move all parameters and buffers to CPU and release contiguous reducer memory. Unlike `nn.Module.cpu()`, attribute references are unchanged. Useful for temporarily freeing GPU memory when the module is not in use.
+
+6.`wake_up`
+```python
+def wake_up(self, device: Optional[Union[int, torch.device]] = None) -> Self:
+    ...
+```
+Move all parameters and buffers back to GPU and reallocate reducer memory. This is the reverse of `sleep()`.
+
+## Checkpoint support
 
 You can save/load the checkpoints for parallel modules.
-Each rank will save/load its own checkpoint just like the normal module.
+Each rank will save/load its own checkpoint just like a normal module.
 
 Note: The only exception is the non-persistent buffers, which will remain uninitialized after loading the checkpoints, because they are not saved in the state dict. To make sure all the buffers are initialized, you must initialize the module with `init_params=True`.
 
-You can also merge the checkpoints from different ranks to a single checkpoint.
-We call it a merged checkpoint. The merged checkpoint can be loaded by original module directly.
+You can also merge the checkpoints from different ranks into a single checkpoint.
+We call it a merged checkpoint. The merged checkpoint can be loaded by the original module directly.
 So you can easily share the checkpoint with the original module.
 
-On the other hand, a lot of weights/state in the module and the optimizer will be the same in the ranks in parallel training. So we can save a lot of space by deduping the state dicts before saving them to the disk.
+On the other hand, a lot of weights/state in the module and the optimizer will be the same across ranks in parallel training. So we can save a lot of space by deduplicating the state dicts before saving them to disk.
 
 We provide two functions to help you save/load the merged checkpoint for the parallel module,
 and two other functions to help you save/load the deduped state dicts for the parallel module.
 
-#### `merge_state_dicts`
+### `merge_state_dicts`
 ```python
 def merge_state_dicts(
     module_state_dicts: List[Dict[str, Any]],
-    optimizer_state_dicts: Optional[List[Dict[str, Any]]],
-) -> Tuple[Dict[str, Any], Optional[List[Dict[str, Any]]]]:
+    optimizer_state_dicts: Optional[List[Dict[str, Any]]] = None,
+) -> Tuple[Dict[str, Any], Optional[Dict[str, Any]]]:
 ```
 
-Merge a list of shard state dicts (one for each rank) to a single full state dict
-Note: Only Adam-like optimizers are supported for merging
+Merge a list of per-rank state dicts into a single full state dict.
+Note: Only Adam/Muon-like optimizers are supported for merging.
+
+The state dicts do not need to be in rank order; the function will sort them internally using the rank stored in each state dict.
 
 Please Note:
-    We don't guarantee the devices of tensors are the same in the merged state dict.
-    You can assume the device of the tensors in the merged state dict can be one of the following:
-        1. the current device when running this function
-        2. the current cuda device when running this function
-        3. the device of the tensor in the original state dict
-    When you load the state dict from file, you can just use `torch.load(..., map_location='...')` to unify the device of the tensors.
+    We don't guarantee the devices of tensors in the merged state dict will be uniform.
+    The device of each tensor can be one of:
+        1. `'cpu'` (for tensors originating from parallel module merging)
+        2. the device of the tensor in the original state dict (for non-parallel module tensors)
+    When loading state dicts from file, use `torch.load(..., map_location='...')` to unify devices.
 
 
-#### `load_merged_state_dicts`
+### `load_merged_state_dict`
 ```python
-def load_merged_state_dicts(
-        module: torch.nn.Module,
-        module_state_dict: Dict[str, Any],
-        optimizer: Optional[Union[torch.optim.Optimizer, ParallelOptimizer]] = None,
-        optimizer_state_dict: Optional[Dict[str, Any]] = None,
-        *,
-        device: Union[str, torch.device] = None
+def load_merged_state_dict(
+    module: torch.nn.Module,
+    module_state_dict: Dict[str, Any],
+    optimizer: Optional[Union[torch.optim.Optimizer, ParallelOptimizer]] = None,
+    optimizer_state_dict: Optional[Dict[str, Any]] = None,
+    *,
+    device: Union[str, torch.device] = None
 ) -> None:
 ```
-Load the merged state dicts to the module, and optionally the optimizer to a specified device.
+Load the merged state dicts to the module, and optionally the optimizer, to a specified device.
 
-Please note the `device` parameter. If it is None, we will use `torch.cuda.current_device()` to get the current device. If you want to load the state dict to a specific device, you can set it to the device you want.
+Please note the `device` parameter. If it is None, `torch.cuda.current_device()` will be used. If you want to load the state dict to a specific device, you can set it to the device you want.
 
 
-#### `deduped_state_dicts`
+### `deduped_state_dict`
 
-In parallel training, a lot of weights/state in the module and the optimizer will be the same in the ranks. So we can save a lot of space by deduping the state dicts before saving them to the disk. Note each part of a logical tensor is saved at the first rank it appears.
+In parallel training, many weights/states in the module and optimizer are identical across ranks. We can save significant disk space by deduplicating state dicts before saving. Each part of a logical tensor is saved only at the first rank it appears.
 
 ```python
 def deduped_state_dict(
@@ -482,9 +525,14 @@ def deduped_state_dict(
 ) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
 ```
 
-#### `load_deduped_state_dict`
+Returns the deduped `(module_state_dict, optimizer_state_dict)` for the current rank. Ranks that are not responsible for a particular shard will have those entries omitted.
 
-This is a reverse process of `deduped_state_dicts`. It assumes the distributed plan is unchanged. For weights, the loading process is divided into 3 steps: 1. each rank read its own state_dict 2. replicated weight is broadcasted inside the first scale unit so that it contains the full parameters 3. the 1st scale unit broadcast weights to other units.
+### `load_deduped_state_dict`
+
+This is the reverse of `deduped_state_dict`. It assumes the distributed plan is unchanged. The loading process is:
+1. Each rank reads its own (partial) state dict.
+2. Replicated weights are broadcasted inside the dedup group so that each group has the full parameters.
+3. The first scale unit broadcasts weights to other units via `broadcast_weights`.
 
 ```python
 def load_deduped_state_dict(
@@ -497,7 +545,7 @@ def load_deduped_state_dict(
 ) -> None:
 ```
 
-### Dataset
+## Dataset
 
 We use the same dataset/dataloader as pytorch. For example, you can use `torch.utils.data.DistributedSampler` to create a distributed sampler.
 
@@ -514,7 +562,7 @@ def create_distributed_sampler(dataset):
     )
 ```
 
-### self.training support
+## self.training support
 
 To parallelize the training process, we firstly need to trace the module and get a static computational graph.
 

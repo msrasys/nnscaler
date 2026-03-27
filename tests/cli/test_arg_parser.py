@@ -2,14 +2,14 @@
 #  Licensed under the MIT License.
 
 from dataclasses import asdict, dataclass, field
-from typing import List, Optional, Tuple, Dict, Any, Union
+from typing import Callable, List, Optional, Tuple, Type, Dict, Any, Union
 import sys
 
 import pytest
 
 from nnscaler.cli.arg_parser import (
     _KeyNotFoundError, parse_args, deserialize_dataclass, _fix_type,
-    resolve_args, merge_args
+    resolve_args, merge_args, _is_function_type
 )
 
 
@@ -99,6 +99,7 @@ def test_deserialize():
         x: Dict[str, Any] = None
         y: List[F] = None
         z: Dict[str, Any] = None
+        u: Any = None
 
     x = parse_args(['--a=1', '--b', '--c.d=3', '--c.e', '4', '--f.g.h=5', '--v.a=10', '--v.b=20', '--k=[10,12]'])
     y = deserialize_dataclass(x, A)
@@ -116,36 +117,33 @@ def test_deserialize():
     with pytest.raises(ValueError):
         y = deserialize_dataclass(x, A)
 
+    with pytest.raises(ValueError):
+        x = parse_args(['--a=1', '--b', '0', '--c.d=3', '--c.e', '4', '--f.g.h=5',
+                        '--v.a=10', '--v.b=20',
+                        '--z.__type', 'tests.cli.test_arg_parser.GConfig',
+                        '--z.h=6', '--z.y=hello',
+        ])
+        y = deserialize_dataclass(x, A)
+
     x = parse_args(['--a=1', '--b', '0', '--c.d=3', '--c.e', '4', '--f.g.h=5',
-                    '--v.a=10', '--v.b=20',
-                    '--z.__type=tests.cli.test_arg_parser.GConfig',
-                    '--z.h=6', '--z.y=hello',
-                    '--z.x=True',
-                    '--z.array=[1,2,3,4,5]',
-                    '--z.badarry=[1,b]',
-                    '--z.dict={"a": 1, "b": 2}',
-                    '--z.baddict={a:1,b:2}',
-                    '--z.nest_dict.__type=tests.cli.test_arg_parser.GConfig',
-                    '--z.nest_dict.h=7',
-    ])
+                        '--v.a=10', '--v.b=20',
+                        '--u.__type', 'tests.cli.test_arg_parser.GConfig',
+                        '--u.h=6'
+        ])
     y = deserialize_dataclass(x, A)
     assert y == A(a=1, b=False, c=C(d=3, e=4), f=F(g=G(h=5)), v={'a': 10, 'b': 20},
-                  z={
-                      'h': 6,
-                      '__type': 'tests.cli.test_arg_parser.GConfig',
-                      'y': 'hello',
-                      'x': True,
-                      'array': [1, 2, 3, 4, 5],
-                      'badarry': '[1,b]',
-                      'dict': {'a': 1, 'b': 2},
-                      'baddict': '{a:1,b:2}',
-                      'nest_dict': {
-                            'h': 7,
-                            '__type': 'tests.cli.test_arg_parser.GConfig'
-                      }
-                }
-    )
-    assert deserialize_dataclass(asdict(y), A) == y
+                  u=GConfig(h=6))
+    # since the type info is lost after asdict, u will be deserialized to dict.
+    assert deserialize_dataclass(asdict(y), A).u == {'h': 6}
+
+    x = parse_args(['--a=1', '--b', '0', '--c.d=3', '--c.e', '4', '--f.g.h=5',
+                        '--v.a=10', '--v.b=20',
+                        '--z.u.__type', 'tests.cli.test_arg_parser.GConfig',
+                        '--z.u.h=6', '--z.u.w=x'
+        ])
+    y = deserialize_dataclass(x, A)
+    # u is not a member of a dataclass, so it will be deserialized to dict instead of GConfig.
+    assert y.z == {'u': {'__type': 'tests.cli.test_arg_parser.GConfig', 'h': 6, 'w': 'x'}}
 
 
 def test_deserialize_list():
@@ -186,7 +184,7 @@ def test_deserialize_value_type():
 
     x = parse_args(['--p.__value_type=int', '--p.value=1'])
     y = deserialize_dataclass(x, A)
-    assert y.p == {'__value_type': 'int', 'value': '1'}
+    assert y.p == 1
 
     x = parse_args(['--p.value=1'])
     y = deserialize_dataclass(x, A)
@@ -356,7 +354,7 @@ def test_resolve_args2():
         'k': ['$(f.g.h)', {'x': 20}, {'y': '$(c.e)'}],
         'm': '${k.0}1',
         'n': '${m}2$(x.y)',
-        'o': r'$\{k.0}1$(x.y)2$\(x.y)',
+        'o': r'$${k.0}1$(x.y)2$$(x.y)',
     }
     resolve_args(data)
     assert data == {
@@ -405,3 +403,113 @@ def test_missing_resolve_args():
     }
     with pytest.raises(_KeyNotFoundError):
         resolve_args(data)
+
+
+def _get_save_type()->str:
+    return 'deduped'
+
+
+def _get_resume_from()->str:
+    from nnscaler.cli.trainer_args import ResumeOptions
+    return ResumeOptions(checkpoint='last')
+
+
+def test_resume_options():
+    from nnscaler.cli.trainer_args import CheckpointConfig
+    @dataclass
+    class CC(CheckpointConfig):
+        c_fn: Union[
+            Callable[[Dict[str, Any]], Dict[str, Any]],
+            Callable[[int], Dict[str, Any]],
+            None,
+        ] = None
+    data = {
+        'keep_last_n_checkpoints': 30,
+        'every_n_train_steps': 1,
+        'save_type': {
+            '__type': 'tests.cli.test_arg_parser._get_save_type'
+        },
+        'resume_from': {
+            '__type': 'tests.cli.test_arg_parser._get_resume_from'
+        },
+        'c_fn': 'tests.cli.test_trainer_muon.param_clss_fn'
+    }
+    p = deserialize_dataclass(data, CC)
+    assert p.resume_from.checkpoint == 'last'
+    assert p.save_type == 'deduped'
+    assert callable(p.c_fn)
+
+
+def test_is_function_type():
+    # `type` itself should be recognized as a function type
+    assert _is_function_type(type) is True
+
+    # typing.Type and typing.Type[T]
+    assert _is_function_type(Type) is True
+    assert _is_function_type(Type[int]) is True
+    assert _is_function_type(Type[str]) is True
+    assert _is_function_type(Optional[Type[int]]) is True
+    assert _is_function_type(Union[Type[int], Callable]) is True
+    assert _is_function_type(Union[Type[int], Callable, None]) is True
+
+    if sys.version_info >= (3, 9):
+        # type[int], type[str] etc. (Python 3.9+ builtin generic syntax)
+        assert _is_function_type(type[int]) is True
+        assert _is_function_type(type[str]) is True
+
+    # bare Callable and parameterized Callable
+    assert _is_function_type(Callable) is True
+    assert _is_function_type(Callable[..., Any]) is True
+    assert _is_function_type(Callable[[int, str], bool]) is True
+
+    # Optional[Callable] = Union[Callable, None], should be True
+    assert _is_function_type(Optional[Callable]) is True
+    assert _is_function_type(Optional[Callable[..., Any]]) is True
+    assert _is_function_type(Union[Callable, None]) is True
+
+    # Optional[type] = Union[type, None], should be True
+    assert _is_function_type(Optional[type]) is True
+    assert _is_function_type(Union[type, None]) is True
+
+    # Union of multiple function types (all are type/Callable) should be True
+    assert _is_function_type(Union[type, Callable]) is True
+    assert _is_function_type(Union[type, Callable, None]) is True
+    assert _is_function_type(Union[Callable[..., Any], Callable[[int], str], None]) is True
+
+    # Primitive types should NOT be function types
+    assert _is_function_type(int) is False
+    assert _is_function_type(str) is False
+    assert _is_function_type(float) is False
+    assert _is_function_type(bool) is False
+
+    # User defined dataclasses should NOT be function types
+    from nnscaler.cli.trainer_args import CheckpointConfig
+    assert _is_function_type(CheckpointConfig) is False
+
+    # None and NoneType should NOT be function types
+    # (empty types list -> returns False)
+    assert _is_function_type(None) is False
+    assert _is_function_type(type(None)) is False
+
+    # Container types should NOT be function types
+    assert _is_function_type(list) is False
+    assert _is_function_type(dict) is False
+    assert _is_function_type(List[int]) is False
+    assert _is_function_type(Dict[str, int]) is False
+
+    # Optional[int] etc. should NOT be function types
+    assert _is_function_type(Optional[int]) is False
+    assert _is_function_type(Union[str, None]) is False
+
+    # Union of function types and non-function types should NOT be function type
+    assert _is_function_type(Union[Callable, int]) is False
+    assert _is_function_type(Union[type, str]) is False
+    assert _is_function_type(Union[Callable, int, None]) is False
+
+    if sys.version_info >= (3, 10):
+        # Python 3.10+ pipe union syntax
+        assert _is_function_type(Callable | None) is True
+        assert _is_function_type(type | None) is True
+        assert _is_function_type(type | Callable | None) is True
+        assert _is_function_type(Callable | int) is False
+        assert _is_function_type(int | None) is False

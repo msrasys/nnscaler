@@ -45,12 +45,21 @@ def test_arg_merge_resolve():
     args = TrainerArgs.from_cli(['-f', config_path,
         '--vars.dim', '22',
         '--vars.hello', '$(compute_config.plan_ngpus)',
-        '--global_batch_size!'
+        '--global_batch_size!',
+        '--vars.vr_0', '$$(vars.dim)',
+        '--vars.vr_1', '$$x',
+        '--vars.vr_3', '$$!(vars.dim)',
+        '--vars.vr_4', '$$!y',
     ])
+    assert args.vars['vr_0'] == '$(vars.dim)'
+    assert args.vars['vr_1'] == '$$x'
+    assert args.vars['vr_3'] == '$$!(vars.dim)'
+    assert args.vars['vr_4'] == '$$!y'
     assert args.vars['dim'] == 22
     assert args.dataset.train_args['dim'] == 22
     assert args.dataset.val_args['dim'] == 22
     assert args.vars['hello'] == args.compute_config.plan_ngpus
+
 
 
 def gen_instance_name(stem):
