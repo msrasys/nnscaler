@@ -429,6 +429,7 @@ def test_codegen_fn_pipeline(tmp_path):
 class FnPolicyModuleSharedWeight(torch.nn.Module):
     def __init__(self):
         super().__init__()
+        self.pre_input_projection = torch.nn.Linear(4, 4, bias=False)
         self.input_projection = torch.nn.Linear(4, 4, bias=False)
         self.ffn = torch.nn.ModuleList([
             FFNDropout(4, 8),
@@ -438,12 +439,12 @@ class FnPolicyModuleSharedWeight(torch.nn.Module):
         self.output_projection.weight = self.input_projection.weight  # share weight
 
     def forward(self, x):
+        x = self.pre_input_projection(x)
         x = self.input_projection(x)
         for ffn in self.ffn:
             x = ffn(x)
         x = self.output_projection(x)
         return torch.sum(x) # make sure output is scalar loss (required by pipeline parallelism)
-
 
 
 @replace_all_device_with('cpu')
@@ -465,6 +466,8 @@ def test_codegen_fn_pipeline_shared_weight(tmp_path):
     for rank in range(2):
         # the input projection is multiref'ed
         assert _gencode_contains(tmp_path, FnPolicyModuleSharedWeight, rank, r'nnscaler.runtime.function.multiref\(self.input_projection')
+        # pre_input_projection is not multiref'ed since it's not shared
+        assert not _gencode_contains(tmp_path, FnPolicyModuleSharedWeight, rank, r'nnscaler.runtime.function.multiref\(self.pre_input_projection')
 
     for rank in range(2, 4):
         # receive shared weight projection via identity
@@ -483,6 +486,9 @@ def test_codegen_fn_pipeline_shared_weight(tmp_path):
     #         self.init_group(ranks=[0, 1])
     #         self.init_group(ranks=[2, 3])
 
+    #         self.register_parameter('pre_input_projection_weight_58', torch.nn.Parameter(torch.empty((4, 4), dtype=torch.float32)))
+    #         self.add_full_map('pre_input_projection_weight_58', 2, True, 'pre_input_projection.weight', (4, 4), (slice(0, 4, None), slice(0, 4, None)), 1)
+
     #         self.register_parameter('input_projection_weight_55', torch.nn.Parameter(torch.empty((4, 4), dtype=torch.float32)))
     #         self.add_full_map('input_projection_weight_55', 3, True, 'input_projection.weight', (4, 4), (slice(0, 4, None), slice(0, 4, None)), 1)
 
@@ -497,10 +503,14 @@ def test_codegen_fn_pipeline_shared_weight(tmp_path):
     #         self._post_init(init_params, build_buckets)
 
     #     def segment83(self, x_53):
+    #         File "/data/weijiangxu/nnscaler/tests/test_policies.py", line 442, in forward,  x = self.pre_input_projection(x)
+    #         linear_59 = torch.nn.functional.linear(x_56, self.pre_input_projection_weight_58, bias=None)
+    #         del x_56
+
     #         # shared param
     #         input_projection_weight_173, input_projection_weight_174 = nnscaler.runtime.function.multiref(self.input_projection_weight_55, times=2)
     #         # File "/home/weijiangxu/MagicCube/tests/test_policies.py", line 441, in forward,  x = self.input_projection(x)
-    #         linear_56 = torch.nn.functional.linear(x_53, input_projection_weight_173, bias=None)
+    #         linear_56 = torch.nn.functional.linear(linear_59, input_projection_weight_173, bias=None)
     #         del x_53, input_projection_weight_173
     #         linear_56 = nnscaler.runtime.adapter.nn.identity_allreduce(linear_56, ranks=[0, 1])
 
