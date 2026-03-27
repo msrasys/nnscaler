@@ -754,13 +754,13 @@ def fn(
         # The reason is that stages may have different number of devices, it is hard to synchronize gradients directly
         # by inserting reducers although weights are all REPLICAED.
 
-        # A further exlanation:
+        # A further explanation:
         # 1. len(splits) > 1: the param is partitioned in different ways in its different consumers.
         #    this can also happen when pipeline parallelism is not used
         #    this `multiref` is necessary to make gen_weight happy (see `IRAdapterGener.gen_weight` in `nnscaler/graph/gener/gen.py`)
         # 2. len(stage_info) > 1: the param is shared across stages
         # 3. find_replicated: is replicated in at least one stage.
-        # 4. (2) and (3): if the param is shared across stages and is all replicated in all stages
+        # 4. (2) and (3): if the param is shared across stages and is replicated in at least one stage.
         #    Note: the case when some is replicated and some is partitioned is handled by (1).
 
         if len(splits) > 1 or (len(stage_info) > 1 and find_replicated):
