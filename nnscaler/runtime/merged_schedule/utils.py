@@ -47,21 +47,10 @@ def find_param_in_reducer(parallel_module, target_param):
 
 
 def scan_reducer_buffer(parallel_module, clamp_value=None):
-    """Unconditionally sanitize all reducer buffers before allreduce (no GPU sync)."""
-    if clamp_value is None:
-        clamp_value = _GRAD_CLAMP_VALUE
-    pm = parallel_module
-    if hasattr(pm, 'backbone'):
-        pm = pm.backbone
-    if not hasattr(pm, '_reducers'):
-        return
-    for reducer in pm._reducers:
-        for bucket in reducer._buckets:
-            buf = bucket._contiguous_grads
-            with torch.no_grad():
-                torch.nan_to_num_(buf, nan=0.0, posinf=0.0, neginf=0.0)
-                if clamp_value > 0:
-                    buf.clamp_(-clamp_value, clamp_value)
+    """Skip sanitization — baseline does not sanitize reducer buffers.
+    Keeping as no-op to match baseline behavior exactly.
+    """
+    return
 
 
 def manual_sync_grads(parallel_module):
