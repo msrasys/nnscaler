@@ -1140,6 +1140,11 @@ class MergedScheduler:
                 if n.checkpoint:
                     n.output = None
 
+            # Sync COMM→COMP: fwd_combine ran on COMM stream producing fwd_h_out.
+            # The next merged step's fwd_attn will consume fwd_h_out on COMP stream,
+            # so COMP must wait for COMM to finish.
+            self._sync_comm_to_comp()
+
         # Restore event protocol for sequential backward use (cooldown)
         for n in fwd_nodes:
             n._skip_event = False
