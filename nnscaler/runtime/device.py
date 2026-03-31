@@ -93,8 +93,10 @@ class _DeviceGroup:
         Get stream by name. If name doesn't exist,
         will create a new one.
         """
-        return self.streams.setdefault(
-            name, torch.cuda.Stream())
+        if name not in self.streams:
+            stream = torch.cuda.Stream()
+            self.streams[name] = stream
+        return self.streams[name]
 
     def create_hybrid(self, group_num: List[int]) -> List[List[int]]:
         """

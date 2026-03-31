@@ -16,7 +16,7 @@ from nnscaler.execplan.execplan import ExecutionPlan, ExeReuseCell
 from nnscaler.codegen.emit import FuncEmission
 from nnscaler.codegen.syntax.symtable import SymbolTable
 from nnscaler.codegen.lifecycle import LifeCycle
-from nnscaler.codegen.syntax.blocks import FunctionBlock
+from nnscaler.codegen.syntax.blocks import FunctionBlock, Block
 from nnscaler.flags import CompileFlag
 
 
@@ -193,6 +193,9 @@ class ScheduleCodeGen(FuncEmission):
 
         unwrap_node = node.cell if isinstance(node, ExeReuseCell) else node
         name = self.node_name(unwrap_node)
+        stream_context = unwrap_node.get_op_context('stream_context')
+        if not stream_context and isinstance(unwrap_node, IRWeightReducer):
+            stream_context = self.execplan.weight_reducer_stream_context
 
         if isinstance(unwrap_node, IRSegment):
             # emit forward segment
@@ -260,6 +263,18 @@ class ScheduleCodeGen(FuncEmission):
 
         if CompileFlag.line_timer:
             type_str = type(unwrap_node).__name__
-            return [f'nnscaler.runtime.function.print_time({repr(type_str)})'] + codes
-        else:
-            return codes
+            codes = [f'nnscaler.runtime.function.print_time({repr(type_str)})'] + codes
+
+        if stream_context:
+            stream_name = stream_context.stream
+            wait_streams = stream_context.wait_streams
+            with Block(f'with torch.cuda.stream(nnscaler.runtime.device.get_stream({repr(stream_name)})):' ) as stream_block:
+                for wait_stream in wait_streams:
+                    stream_block.insert_body(
+                        f'torch.cuda.current_stream().wait_stream(nnscaler.runtime.device.get_stream({repr(wait_stream)}))'
+                    )
+                stream_block.insert_body(codes)
+            codes = stream_block.code
+
+        return codes
+

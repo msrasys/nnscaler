@@ -10,6 +10,8 @@ import torch.nn as nn
 
 from nnscaler.parallel import ComputeConfig, _load_parallel_module_class, parallelize
 from nnscaler.policies import get_called_self_module_name, get_pas_ops
+from nnscaler.graph.graph import IRGraph, IRSegment
+from nnscaler.graph.schedule.schedplan import SchedulePlan
 from tests.launch_torchrun import launch_torchrun
 from tests.parallel_module.common import FFN, init_distributed
 from tests.parallel_module.test_gencode import _gencode_contains, print_gencode
@@ -228,11 +230,10 @@ class FFNDropout(torch.nn.Module):
 
 
 class FnPolicyModuleList(torch.nn.Module):
-    def __init__(self):
+    def __init__(self, ffn_layers=2):
         super().__init__()
         self.ffn = torch.nn.ModuleList([
-            FFNDropout(4, 8),
-            FFNDropout(4, 8),
+            FFNDropout(4, 8) for _ in range(ffn_layers)
         ])
 
     def forward(self, x):
@@ -426,6 +427,58 @@ def test_codegen_fn_pipeline(tmp_path):
     assert True
 
 
+def sched_1f1b_overlap(graph: IRGraph, num_microbatches: int, num_stages: int) -> SchedulePlan:
+    if num_microbatches <= 0:
+        raise ValueError(f"expected num_microbatches > 0, but got {num_microbatches} ")
+    segments: List[IRSegment] = graph.select(ntype=IRSegment, flatten=False)
+    fsegs = [seg for seg in segments if seg.isfw()]
+    assert len(fsegs) == num_stages, f"Mismatch of forward segment number ({len(fsegs)}) with num_stages ({num_stages})"
+
+    # describe schedule
+    sched = SchedulePlan(graph, num_microbatches)
+    sched.set_dataloader_stream('comp', 'comm')
+    sched.set_comm_stream_config(0, 'comm', 'comp')
+
+    wait_steps = [sid for sid in range(num_stages)]
+    bw_ofst = [num_stages - 1 - sid for sid in range(num_stages)]
+    total_steps = num_microbatches * 2 + (num_stages - 1) * 2
+
+    for step in range(total_steps):
+        for sid in range(num_stages):
+            ofst = wait_steps[sid]
+            if step < ofst: continue
+            fw_idx = (step - ofst) // 2
+            # forward or backward segment
+            segment = fsegs[sid] if (step - ofst) % 2 == 0 else fsegs[sid].mirror
+            mb_idx = fw_idx if (step - ofst) % 2 == 0 else fw_idx - bw_ofst[sid]
+            # append for execution
+            if mb_idx < 0 or mb_idx >= num_microbatches: continue
+            sched.add_segment(segment, mb_idx, step)
+            sched.set_segment_stream(segment, 'comp', 'comm')
+    sched.finish()
+    return sched
+
+
+@replace_all_device_with('cpu')
+def test_codegen_fn_pipeline_overlap(tmp_path):
+    parallelize(
+        FnPolicyModuleList(),
+        {'x': torch.randn(4, 4)},
+        # 'pp',
+        megatron_ffn_policy_list,
+        ComputeConfig(4, 8, use_end2end=True,
+            pas_config={
+                'pipeline_nmicros': 2,
+                'pipeline_size': 2,
+                'pipeline_scheduler': sched_1f1b_overlap,
+            }
+        ),
+        gen_savedir=tmp_path,
+        load_module=False
+    )
+    assert True
+
+
 class FnPolicyModuleSharedWeight(torch.nn.Module):
     def __init__(self):
         super().__init__()
@@ -454,7 +507,7 @@ def test_codegen_fn_pipeline_shared_weight(tmp_path):
         {'x': torch.randn(4, 4)},
         # 'pp',
         megatron_ffn_policy_list,
-        ComputeConfig(4, 4, use_end2end=True,
+        ComputeConfig(2, 4, use_end2end=True,
             pas_config={
                 'pipeline_nmicros': 2,
                 'pipeline_size': 2,

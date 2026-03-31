@@ -34,9 +34,38 @@ This implementation may be improved in the future, since
   Dependencies are materialized by inserting send and recv adapters between blocks. As a result,
   a block may start as soon as its input data is ready, rather than strictly following the start
   time in the schedule plan.
+
+
+Multiple Stream Support:
+In the current implementation, we also support users to specify stream configuration
+for different types of communication
+(e.g., inter-segment communication, result broadcasting, gradient reduction)
+by `set_comm_stream_config` interface.
+The stream configuration will be attached to the corresponding adapters,
+and can be used in codegen to generate stream context manager for the adapters.
+This can help to achieve better performance in pipeline parallelism
+by separating compute and communication to different streams.
+
+Some implementation details:
+- Stream information is attached to Segments/Adapters via `op_context` field,
+    which is a dict that can be used to store any information for codegen.
+    The key for stream context is 'stream_context', and the value is a `StreamContext` dataclass that contains the stream name and wait stream names.
+- Stream information for WeightReducers is stored in `SchedulePlan._adapter_stream_context`
+    with key `CommunicationType.GRAD_REDUCE`,
+    and will be passed to `ExecutionPlan`
+    and finally attached to the WeightReducer adapters in scheduler codegen.
+
+How to create a SchedulePlan for users:
+1) Create a SchedulePlan with the graph and number of micro-batches.
+2) Add segments to the plan by `add_segment` or `insert_step` interface.
+4) Call `set_segment_stream` and/or `set_comm_stream_config` to set stream configuration for segments and adapters.
+3) Call `finish` to mark done.
+
 """
 
-from typing import Dict, List,  Optional, Tuple, Set
+from typing import Dict, List,  Optional, Tuple, Set, Union
+from dataclasses import dataclass, asdict
+from enum import IntEnum
 
 from nnscaler.ir.cten import IRCell
 from nnscaler.ir.adapter import IRAdapter
@@ -137,6 +166,34 @@ class ScheduleDependency:
         return prev.mid == next.mid and self.graph.depends(prev.content, next.content)
 
 
+@dataclass
+class StreamContext:
+    """
+    StreamContext is a dataclass that holds the stream context of an operation.
+    Currently, all stream context information is ignored when tracing.
+    But we can set it in codegen to improve the performance of the generated code.
+    One example is we can seperate compute and communication to different streams
+    to achieve better performance in pipeline parallelism.
+
+    Args:
+        stream: The stream name that the operation is executed on.
+        wait_streams: The stream names that the operation needs to wait for before execution.
+    """
+    stream: Optional[str] = None
+    wait_streams: Optional[list[str]] = None
+
+
+class CommunicationType(IntEnum):
+    """
+    CommunicationType contains constants that represent the type of communication in schedule.
+    It is used to identify the type of adapter
+    """
+    ALL = 0  # all communication, which is usually implemented by broadcast adapter
+    INTER_SEGMENT = 1  # communication between segments, which is usually implemented by send and recv adapters
+    RESULT_BROADCAST = 2  # communication for broadcasting results
+    GRAD_REDUCE = 4  # communication for reducing gradients
+
+
 class PlanBase:
 
     def __init__(self, graph: IRGraph, _dependency: Optional[ScheduleDependency] = None):
@@ -157,6 +214,11 @@ class PlanBase:
         self._dependency = _dependency if _dependency is not None \
             else ScheduleDependency(graph)
 
+        # stream context for different adapters,
+        # which can be used in codegen to generate stream context manager for the adapters.
+        self._adapter_stream_context: dict[int, StreamContext] = {}
+        self._dataloader_stream_context: Optional[StreamContext] = None
+
         # topological sequence
         self._seqs: List[IRCell] = []
 
@@ -174,6 +236,32 @@ class PlanBase:
         for devs in self._step_devices:
             device.update(devs)
         return tuple(device)
+
+    def set_comm_stream_config(self, comm_type: Union[CommunicationType, int], stream: str, *wait_streams: str):
+        if isinstance(comm_type, int):
+            comm_type = CommunicationType(comm_type)
+        if comm_type == CommunicationType.ALL:
+            for ctype in CommunicationType:
+                if ctype == CommunicationType.ALL: continue
+                self._adapter_stream_context[ctype.value] = StreamContext(stream=stream, wait_streams=list(wait_streams))
+        else:
+            self._adapter_stream_context[comm_type.value] = StreamContext(stream=stream, wait_streams=list(wait_streams))
+
+    def get_comm_stream_config(self, comm_type: CommunicationType) -> Optional[StreamContext]:
+        return self._adapter_stream_context.get(comm_type.value, None)
+
+    def _set_adapter_stream(self, adapter: IRAdapter, comm_type: CommunicationType):
+        if stream_context := self._adapter_stream_context.get(comm_type.value):
+            adapter.set_op_context('stream_context', stream_context)
+
+    def _set_node_stream(self, node: IRCell, stream_context: StreamContext):
+        node.set_op_context('stream_context', stream_context)
+
+    def set_segment_stream(self, segment: IRSegment, stream: str, *wait_streams: str):
+        self._set_node_stream(segment, StreamContext(stream=stream, wait_streams=list(wait_streams)))
+
+    def set_dataloader_stream(self, stream: str, *wait_streams: str):
+        self._dataloader_stream_context = StreamContext(stream=stream, wait_streams=list(wait_streams))
 
     def nodes(self) -> Tuple[Block]:
         return tuple(self._seqs)
@@ -331,6 +419,7 @@ class PlanBase:
 
         # insert dataloaders to its devices before the first required segment
         for dl in self._dependency.dataloaders:
+            self._set_node_stream(dl, self._dataloader_stream_context)
             inserted_mids = set()
             for step in range(self.nsteps):
                 blocks = self.start_blocks(step)
@@ -445,9 +534,12 @@ class SchedulePlan(PlanBase):
             # These adapters don't have any dependent recver segment,
             # and will be placed at the end of the plan to not block the schedule execution.
             if adapter not in self._dependency.recvers:
+                self._set_adapter_stream(adapter, CommunicationType.RESULT_BROADCAST)
                 for mid in range(self._num_microbatches):
                     self._step_adapters[self.nsteps-1].append(Block(adapter, mid, 1))
                 continue
+
+            self._set_adapter_stream(adapter, CommunicationType.INTER_SEGMENT)
 
             # find sender step and insert adapter
             for step in range(self.nsteps):

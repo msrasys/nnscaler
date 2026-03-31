@@ -11,7 +11,7 @@ from nnscaler.ir.tensor import IRSubTensor, IRFullTensor
 from nnscaler.ir.adapter import IRAdapter, IRWeightReducer
 from nnscaler.ir.operator import IRBpOperation, IRFwOperation, IRDataOperation
 from nnscaler.graph.graph import IRGraph, IRSegment
-from nnscaler.graph.schedule.schedplan import SchedulePlan, Block
+from nnscaler.graph.schedule.schedplan import SchedulePlan, Block, CommunicationType, StreamContext
 
 
 class ExeReuseCell(IRCell):
@@ -163,6 +163,7 @@ class ExecutionPlan:
 
         execplan = ExecutionPlan(schedplan.graph, topo_seqs)
         execplan.set_outputs(outputs)
+        execplan.weight_reducer_stream_context = schedplan.get_comm_stream_config(CommunicationType.GRAD_REDUCE)
 
         return execplan
 
@@ -173,6 +174,7 @@ class ExecutionPlan:
         self._topo_seqs = topo_seqs
         self._seq: Dict[int, List[IRCell]] = {}
         self._outputs = list(graph.outputs())
+        self._weight_reducer_stream_context: Optional[StreamContext] = None
 
         for node in self._topo_seqs:
             assert len(node.device) > 0, f"Node device not set: {node}"
@@ -207,6 +209,14 @@ class ExecutionPlan:
     @property
     def inference(self) -> bool:
         return not self._graph.train
+
+    @property
+    def weight_reducer_stream_context(self) -> Optional[StreamContext]:
+        return self._weight_reducer_stream_context
+
+    @weight_reducer_stream_context.setter
+    def weight_reducer_stream_context(self, stream_context: StreamContext):
+        self._weight_reducer_stream_context = stream_context
 
     def outputs(self) -> List[Any]:
         """Get execution plan return outputs"""

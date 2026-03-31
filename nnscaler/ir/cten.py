@@ -523,6 +523,22 @@ class IRCell:
     def op_context(self, context: Optional[Dict[str, Any]]):
         self._op_context = context
 
+    def set_op_context(self, name: str, value: Any):
+        """
+        Set a key-value pair in the op context.
+        """
+        if self._op_context is None:
+            self._op_context = {}
+        self._op_context[name] = value
+
+    def get_op_context(self, name: str, default=None) -> Any:
+        """
+        Get a value from the op context with the key name.
+        """
+        if self._op_context is None:
+            return default
+        return self._op_context.get(name, default)
+
     def __repr__(self) -> str:
         """
         Cell string presentation
