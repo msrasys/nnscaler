@@ -156,7 +156,17 @@ def parallelize_graph(graph: IRGraph,
         # For safety, we will add multiref when detecting shared param are all replicated for pipeline parallelism.
         # The reason is that stages may have different number of devices, it is hard to synchronize gradients directly
         # by inserting reducers although weights are all REPLICAED.
-        if len(splits) > 1 or (len(pp_desc.spmd_descs) > 1 and find_replicated):
+
+        # A further explanation:
+        # 1. len(splits) > 1: the param is partitioned in different ways in its different consumers.
+        #    this can also happen when pipeline parallelism is not used
+        #    this `multiref` is necessary to make gen_weight happy (see `IRAdapterGener.gen_weight` in `nnscaler/graph/gener/gen.py`)
+        # 2. len(stage_info) > 1: the param is shared across stages
+        # 3. find_replicated: is replicated in at least one stage.
+        # 4. (2) and (3): the param is shared across stages and is replicated in at least one of them.
+        #    Note: the case when some is replicated and some is partitioned is handled by (1).
+
+        if len(splits) > 1 or (len(stage_info) > 1 and find_replicated):
             _logger.info(f'add multiref for shared param {ftensor}')
             graph.multiref(ftensor, comment='shared param')
 
