@@ -64,7 +64,7 @@ How to create a SchedulePlan for users:
 """
 
 from typing import Dict, List,  Optional, Tuple, Set, Union
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, field
 from enum import IntEnum
 
 from nnscaler.ir.cten import IRCell
@@ -166,7 +166,7 @@ class ScheduleDependency:
         return prev.mid == next.mid and self.graph.depends(prev.content, next.content)
 
 
-@dataclass
+@dataclass(frozen=True)
 class StreamContext:
     """
     StreamContext is a dataclass that holds the stream context of an operation.
@@ -183,15 +183,28 @@ class StreamContext:
     wait_streams: Optional[list[str]] = None
 
 
-class CommunicationType(IntEnum):
+@dataclass
+class StreamConfig:
     """
-    CommunicationType contains constants that represent the type of communication in schedule.
-    It is used to identify the type of adapter
+    StreamConfig is a dataclass that holds the stream configuration
+    for different types of operations.
+
+    Args:
+        dataloader: The stream context for dataloader operations.
+        zero_grad: The stream context for zero_grad operations.
+        inter_segment_move: The stream context for inter-segment communication adapters, which
+            are used to transfer data between consecutive segment.
+        result_broadcast: The stream context for result broadcast adapters,
+            which are used to broadcast results to all ranks in the same scale unit after forward pass.
+        grad_reduce: The stream context for gradient reduction adapters,
+            which are used to reduce gradients across ranks.
     """
-    ALL = 0  # all communication, which is usually implemented by broadcast adapter
-    INTER_SEGMENT = 1  # communication between segments, which is usually implemented by send and recv adapters
-    RESULT_BROADCAST = 2  # communication for broadcasting results
-    GRAD_REDUCE = 4  # communication for reducing gradients
+
+    dataloader: Optional[StreamContext] = None
+    zero_grad: Optional[StreamContext] = None
+    inter_segment_move: Optional[StreamContext] = None
+    result_broadcast: Optional[StreamContext] = None
+    grad_reduce: Optional[StreamContext] = None
 
 
 class PlanBase:
@@ -216,8 +229,7 @@ class PlanBase:
 
         # stream context for different adapters,
         # which can be used in codegen to generate stream context manager for the adapters.
-        self._adapter_stream_context: dict[int, StreamContext] = {}
-        self._dataloader_stream_context: Optional[StreamContext] = None
+        self._stream_config: StreamConfig = StreamConfig()
 
         # topological sequence
         self._seqs: List[IRCell] = []
@@ -237,31 +249,20 @@ class PlanBase:
             device.update(devs)
         return tuple(device)
 
-    def set_comm_stream_config(self, comm_type: Union[CommunicationType, int], stream: str, *wait_streams: str):
-        if isinstance(comm_type, int):
-            comm_type = CommunicationType(comm_type)
-        if comm_type == CommunicationType.ALL:
-            for ctype in CommunicationType:
-                if ctype == CommunicationType.ALL: continue
-                self._adapter_stream_context[ctype.value] = StreamContext(stream=stream, wait_streams=list(wait_streams))
-        else:
-            self._adapter_stream_context[comm_type.value] = StreamContext(stream=stream, wait_streams=list(wait_streams))
+    @property
+    def stream_config(self) -> StreamConfig:
+        return self._stream_config
 
-    def get_comm_stream_config(self, comm_type: CommunicationType) -> Optional[StreamContext]:
-        return self._adapter_stream_context.get(comm_type.value, None)
-
-    def _set_adapter_stream(self, adapter: IRAdapter, comm_type: CommunicationType):
-        if stream_context := self._adapter_stream_context.get(comm_type.value):
-            adapter.set_op_context('stream_context', stream_context)
+    @stream_config.setter
+    def stream_config(self, stream_config: StreamConfig):
+        self._stream_config = stream_config
 
     def _set_node_stream(self, node: IRCell, stream_context: StreamContext):
-        node.set_op_context('stream_context', stream_context)
+        if stream_context is not None:
+            node.set_op_context('stream_context', stream_context)
 
-    def set_segment_stream(self, segment: IRSegment, stream: str, *wait_streams: str):
-        self._set_node_stream(segment, StreamContext(stream=stream, wait_streams=list(wait_streams)))
-
-    def set_dataloader_stream(self, stream: str, *wait_streams: str):
-        self._dataloader_stream_context = StreamContext(stream=stream, wait_streams=list(wait_streams))
+    def set_segment_stream(self, segment: IRSegment, stream_context: StreamContext):
+        self._set_node_stream(segment, stream_context)
 
     def nodes(self) -> Tuple[Block]:
         return tuple(self._seqs)
@@ -419,7 +420,7 @@ class PlanBase:
 
         # insert dataloaders to its devices before the first required segment
         for dl in self._dependency.dataloaders:
-            self._set_node_stream(dl, self._dataloader_stream_context)
+            self._set_node_stream(dl, self._stream_config.dataloader)
             inserted_mids = set()
             for step in range(self.nsteps):
                 blocks = self.start_blocks(step)
@@ -534,12 +535,12 @@ class SchedulePlan(PlanBase):
             # These adapters don't have any dependent recver segment,
             # and will be placed at the end of the plan to not block the schedule execution.
             if adapter not in self._dependency.recvers:
-                self._set_adapter_stream(adapter, CommunicationType.RESULT_BROADCAST)
+                self._set_node_stream(adapter, self._stream_config.result_broadcast)
                 for mid in range(self._num_microbatches):
                     self._step_adapters[self.nsteps-1].append(Block(adapter, mid, 1))
                 continue
 
-            self._set_adapter_stream(adapter, CommunicationType.INTER_SEGMENT)
+            self._set_node_stream(adapter, self._stream_config.inter_segment_move)
 
             # find sender step and insert adapter
             for step in range(self.nsteps):

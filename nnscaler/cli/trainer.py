@@ -974,7 +974,11 @@ class Trainer:
             self.hook.after_zero_grad(self)
 
             self.hook.on_train_step_start(self, batches[:num_batches])
+            # wrap train_step with `torch.cuda.synchronize`
+            # to support multiple cuda streams in train_step.
+            torch.cuda.synchronize()
             losses = self.model.train_step(batches, is_dummy_batch)
+            torch.cuda.synchronize()
             self.hook.on_train_step_end(self, losses[:num_batches])
 
             aggregate_outputs = self.train_args.resolved_aggregate_outputs_fn or self.aggregate_outputs

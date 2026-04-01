@@ -92,6 +92,7 @@ class _DeviceGroup:
         """
         Get stream by name. If name doesn't exist,
         will create a new one.
+        if name is 'default', the default stream will be returned.
         """
         if name not in self.streams:
             stream = torch.cuda.Stream()

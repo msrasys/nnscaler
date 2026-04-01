@@ -1407,11 +1407,9 @@ def build_optimizer(
     4. backward():
        you need to call optimizer.sync_shard_grad() manually if you want to read the gradients of the module before optimizer.step().
 
-    To support multiple cuda streams, we also need to make sure the synchronization is done in the right way.
-    `torch.cuda.synchronize()` is called after `sync_shard_grad` and `gather_params`,
-    which means there are barriers before entering and after exiting optimizer related code.
-
-    So even if you are using multiple cuda streams, optimizer can read the correct gradients
+    All operations are done in default stream. To support multiple cuda streams,
+    The caller is responsible to make sure the synchronization is done in the right way,
+    so optimizer can read the correct gradients
     and correct parameters can be correctly read from any streams.
 
     Non-parallel module (mixed module) is also supported given it contains any sub `ParallelModule`.
@@ -1688,9 +1686,6 @@ def build_optimizer(
         if non_parallel_module_reducer:
             non_parallel_module_reducer.gather_params()
 
-        # make sure all communication is finished before we access the parameters
-        torch.cuda.synchronize()
-
     optimizer.step = types.MethodType(_patched_step, optimizer)
 
     orig_zero_grad = optimizer.zero_grad
@@ -1739,9 +1734,6 @@ def build_optimizer(
 
                 if non_parallel_module_reducer:
                     non_parallel_module_reducer.sync_grads()
-
-        # make sure allreduce is finished before we access the gradients
-        torch.cuda.synchronize()
 
     optimizer.sync_shard_grad = types.MethodType(_sync_shard_grad, optimizer)
 
