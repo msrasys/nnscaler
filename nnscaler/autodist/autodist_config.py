@@ -4,6 +4,7 @@
 from pathlib import Path
 import argparse
 import logging
+from typing import Optional, Union, Dict, Any, List
 from .descs import MeshDesc
 from .util import get_default_profile_path
 
@@ -162,6 +163,8 @@ class AutoDistConfig:
                  parallel_profile=True,
                  transient_mem_coef=2,
                  disable_shared_param_constraint=False,
+                 constraints=None,
+                 constraints_path='',
                  **kwargs):
         self.pc_path = partition_constraints_path
         self.profile_dir = profile_dir
@@ -207,6 +210,16 @@ class AutoDistConfig:
         self.transient_mem_coef = transient_mem_coef
         self.disable_shared_param_constraint = disable_shared_param_constraint
 
+        # --- V2 constraint system ---
+        # Priority: constraints (object/dict) > constraints_path > legacy pc_path
+        self.constraints: Optional['ConstraintSet'] = None
+        self.constraints_path = constraints_path
+        if constraints is not None:
+            self.constraints = self._resolve_constraints(constraints)
+        elif constraints_path:
+            from .constraints import ConstraintSet
+            self.constraints = ConstraintSet.from_yaml_file(constraints_path)
+
         ignored_keys = list(kwargs.keys())
         if ignored_keys:
             warning_msg = f'autodist config got unknown config keys: {ignored_keys}'
@@ -214,9 +227,30 @@ class AutoDistConfig:
 
         self._validate_config()
 
+    @staticmethod
+    def _resolve_constraints(value) -> 'ConstraintSet':
+        """Resolve *constraints* from a ConstraintSet, dict, or file path."""
+        from .constraints import ConstraintSet
+        if isinstance(value, ConstraintSet):
+            return value
+        if isinstance(value, dict):
+            return ConstraintSet.from_yaml(value)
+        if isinstance(value, (str, Path)) and str(value):
+            return ConstraintSet.from_yaml_file(str(value))
+        raise TypeError(
+            f'constraints must be a ConstraintSet, dict, or file path; '
+            f'got {type(value).__name__}'
+        )
+
     def _validate_config(self):
         if self.pc_path:
             _validate_file_path(self.pc_path)
+
+        if self.constraints_path:
+            _validate_file_path(self.constraints_path)
+
+        if self.constraints is not None:
+            self.constraints.validate_all()
 
         if not Path(self.profile_dir).exists():
             _logger.info(f'create folder: {self.profile_dir}')
