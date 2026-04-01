@@ -7,6 +7,8 @@ from .descs import *
 from .cost_database import CostDatabase
 from .autodist_config import AutoDistConfig
 from .op_partition import OpPartition, generate_partitions
+from .constraints import ConstraintSet, PartitionConstraintV2
+from .constraint_validator import validate_constraints
 from nnscaler.graph.function.dimops import IRDimops
 from nnscaler.ir import IRTensor
 
@@ -168,7 +170,11 @@ class SPMDSolver:
         self.graph = graph
         self.pcs: Dict[str, Dict[str, PartitionConstraint]] = dict()
         self.non_used_pcs: Set[PartitionConstraint] = set()
-        if autodist_config.pc_path:
+        # V2 constraint system (takes priority over legacy pc_path)
+        self._constraint_set = autodist_config.constraints
+        if self._constraint_set is not None:
+            _logger.info('using V2 constraint system')
+        elif autodist_config.pc_path:
             self._load_partition_constraints(autodist_config.pc_path)
         else:
             _logger.info('no partition constraint is loaded')
@@ -207,6 +213,87 @@ class SPMDSolver:
                 self.pcs = dict()
         else:
             _logger.warning(f'pc path {pc_path} does not exist')
+
+    # ---- V2 constraint helpers -------------------------------------------
+
+    def _get_v2_constraints_for_op(
+        self, operator: CubeOperator,
+    ) -> List[PartitionConstraintV2]:
+        """Return V2 constraints matching *operator*, or empty list."""
+        if self._constraint_set is None:
+            return []
+        import re as _re
+        from .constraint_validator import _extract_layer_index
+        module_stack = (
+            operator.ir_cell.module_stack
+            if isinstance(operator.ir_cell, IRDimops) else {}
+        )
+        param_fqns = []
+        for item in operator.ir_cell.inputs():
+            if isinstance(item, IRTensor) and item.is_param():
+                if hasattr(item, 'name'):
+                    param_fqns.append(item.name)
+        layer_index = _extract_layer_index(module_stack)
+        return self._constraint_set.get_matching_constraints(
+            operator.op_name, module_stack, layer_index, param_fqns,
+        )
+
+    def _v2_partition_allowed(
+        self,
+        constraints: List[PartitionConstraintV2],
+        operator: CubeOperator,
+        p_ids: List[Any],
+        p_nums: List[int],
+    ) -> bool:
+        """Check whether a partition is allowed by V2 constraints.
+
+        Returns ``True`` if the partition passes all matching constraints.
+        """
+        if not constraints:
+            return True
+
+        for c in constraints:
+            # force_replicate: only replicated partition is allowed
+            if c.force_replicate:
+                if p_ids[0] != -1:
+                    return False
+
+            # max_partition_degree
+            if c.max_partition_degree is not None and p_ids[0] != -1:
+                if p_nums[0] > c.max_partition_degree:
+                    return False
+
+            if p_ids[0] != -1 and isinstance(operator.ir_cell, IRDimops):
+                p_idx, p_dim = operator.dim_id2pos(p_ids[0])
+
+                # allowed_dims: (input_idx, dim_idx) whitelist
+                if c.allowed_dims is not None:
+                    if (p_idx, p_dim) not in c.allowed_dims:
+                        return False
+
+                # forbidden_dims: (input_idx, dim_idx) blacklist
+                if c.forbidden_dims is not None:
+                    if (p_idx, p_dim) in c.forbidden_dims:
+                        return False
+
+        return True
+
+    def _run_v2_validation(self) -> None:
+        """Run validation and log results (best-effort, non-blocking)."""
+        if self._constraint_set is None:
+            return
+        try:
+            result = validate_constraints(
+                self._constraint_set, self.graph, self.device_num,
+            )
+            unmatched = self._constraint_set.get_unmatched_constraints()
+            if unmatched:
+                _logger.warning(
+                    f'V2 constraints: {len(unmatched)} constraint(s) '
+                    f'did not match any operator'
+                )
+        except Exception:
+            _logger.exception('V2 constraint validation failed (non-fatal)')
 
     def get_operator(self, idx: int) -> CubeOperator:
         return self.graph.operator_list[idx]
@@ -373,6 +460,13 @@ class SPMDSolver:
                             if u not in allowed_pids:
                                 return False
 
+            # V2 constraint check (applied when V2 constraints are active)
+            if self._constraint_set is not None:
+                v2_matches = self._get_v2_constraints_for_op(operator)
+                if v2_matches:
+                    if not self._v2_partition_allowed(v2_matches, operator, p_ids, p_nums):
+                        return False
+
             if p_ids[0] != -1:
                 if not operator.ir_cell.algorithm('dim').satisfy(
                         p_idx, p_dim, p_nums[0]):
@@ -430,6 +524,9 @@ class SPMDSolver:
             _logger.warning(
                 f'find unused partition constraints {self.non_used_pcs}')
         _logger.info('finish building op partitions')
+
+        # Run V2 constraint validation (non-blocking, logging only)
+        self._run_v2_validation()
 
     # use a union-find set to find the oldest operator in a following chain
     def get_father_id(self, i):
