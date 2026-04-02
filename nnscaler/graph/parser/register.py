@@ -198,7 +198,8 @@ def register_op(annotation: Union[str, Callable], name: Optional[str] = None,
 
         # TODO: add support for autograd function in the future
         if fake_fn is not None and is_autograd_op(fn):
-            raise ValueError("Autograd function cannot have fake runtime function")
+            raise ValueError("Autograd function cannot have fake runtime function. "
+                             "Please wrap the autograd function and register the wrapper function instead.")
 
         if inspect.isclass(fn) and is_autograd_op(fn):
             _ = decorator(fn.apply)  # register `apply` method of the autograd function
