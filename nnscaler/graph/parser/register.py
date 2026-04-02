@@ -25,8 +25,11 @@ class CustomizedOps:
 
     # signature -> IRDimop creation function
     kOpMap: Dict[str, Callable] = {}
-    # singature -> runtime function
+    # signature -> runtime function
     kOpRuntime: Dict[str, Callable] = {}
+    # signature -> fake runtime function
+    # TODO: autograd function cannot have fake runtime function now
+    kOpFakeRuntime: Dict[str, Callable] = {}
     # signature -> runtime function implementation code
     kOpCodeDef: Dict[str, str] = {}
     # signature -> special emit function, will not store if emit_fn is None
@@ -58,9 +61,13 @@ class CustomizedOps:
         return signature in CustomizedOps.kOpMap
 
     @staticmethod
-    def register(signature: str, op_create_fn: Callable, code: str, runtime_fn: Callable,
-                 emit_fn: Callable[[IRFwOperation, List[str], Dict[str, str], int, int, int], str] = None,
-                 input_gen_fn: Callable[[IRFwOperation], List[torch.Tensor]] = None) -> None:
+    def register(
+        signature: str, op_create_fn: Callable, code: str, runtime_fn: Callable,
+        *,
+        emit_fn: Callable[[IRFwOperation, List[str], Dict[str, str], int, int, int], str] = None,
+        input_gen_fn: Callable[[IRFwOperation], List[torch.Tensor]] = None,
+        fake_fn: Optional[Callable] = None
+    ) -> None:
         """Register an operator
 
         Args:
@@ -73,7 +80,11 @@ class CustomizedOps:
                                 as input and returns the generated code.
             input_gen_fn (Callable): input generator function for profiler, will use default input generator function
                                      if input_gen_fn is None. kwargs are same as that in the input node.
-
+            fake_fn (Callable): a fake function for simulating runtime_fn execution,
+                it accepts the same inputs as runtime_fn and returns the same outputs as runtime_fn,
+                If fake_fn is None, we will use runtime_fn for meta tensor execution,
+                which may cause error if runtime_fn contains some operations
+                that cannot be executed in tracing (for example, distributed communication ops).
         Returns:
             None
         """
@@ -83,6 +94,7 @@ class CustomizedOps:
         assert signature not in CustomizedOps.kOpMap, f"function {signature} is already registered"
         CustomizedOps.kOpMap[signature] = op_create_fn
         CustomizedOps.kOpRuntime[signature] = runtime_fn
+        CustomizedOps.kOpFakeRuntime[signature] = fake_fn
         CustomizedOps.kOpCodeDef[signature] = code
         if emit_fn is not None:
             CustomizedOps.kOpEmit[signature] = emit_fn
@@ -92,9 +104,12 @@ class CustomizedOps:
 
 def register_op(annotation: Union[str, Callable], name: Optional[str] = None,
                 code_impl_pattern: str = 'import',
+                *,
                 emit_fn: Callable[[IRFwOperation, List[str], Dict[str, str], int, int, int], str] = None,
                 transform_rules: Tuple[TransformRule] = None,
-                input_gen_fn: Callable[[IRFwOperation], List[torch.Tensor]] = None) -> Callable:
+                input_gen_fn: Callable[[IRFwOperation], List[torch.Tensor]] = None,
+                fake_fn: Optional[Callable] = None,
+    ) -> Callable:
     """
     Register a function with IRDimops annotations.
 
@@ -161,6 +176,12 @@ def register_op(annotation: Union[str, Callable], name: Optional[str] = None,
             However, input tensors' contents may influence the speed dramatically. The mask in attention and dispatched expert index in MoE
             are real examples. To handle this scenario, user can provide the customized `input_gen_fn`.
             Default: None.
+        fake_fn (Callable): a fake function for simulating runtime_fn execution,
+            it accepts the same inputs as runtime_fn and returns the same outputs as runtime_fn.
+            If fake_fn is None, we will use runtime_fn for meta tensor execution,
+            which may cause error if runtime_fn contains some operations
+            that cannot be executed in tracing (for example, distributed communication ops).
+            Default: None.
 
     Returns:
         fn (Callable): the runtime function
@@ -171,6 +192,13 @@ def register_op(annotation: Union[str, Callable], name: Optional[str] = None,
 
         if not callable(fn):
             raise TypeError("Expected a runtime function")
+
+        if fake_fn is not None and not callable(fake_fn):
+            raise TypeError("Expected a fake function")
+
+        # TODO: add support for autograd function in the future
+        if fake_fn is not None and is_autograd_op(fn):
+            raise ValueError("Autograd function cannot have fake runtime function")
 
         if inspect.isclass(fn) and is_autograd_op(fn):
             _ = decorator(fn.apply)  # register `apply` method of the autograd function
@@ -270,7 +298,12 @@ def register_op(annotation: Union[str, Callable], name: Optional[str] = None,
 
         # step 4. register in CustomizedOps
         _logger.info(f'registering op {fsig}...')
-        CustomizedOps.register(fsig, udfop, code, fn, emit_fn, input_gen_fn)
+        CustomizedOps.register(
+            fsig, udfop, code, fn,
+            emit_fn=emit_fn,
+            input_gen_fn=input_gen_fn,
+            fake_fn=fake_fn
+        )
         return fn
 
     return decorator

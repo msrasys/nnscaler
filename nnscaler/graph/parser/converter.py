@@ -81,10 +81,14 @@ def to_fx_graph(model: torch.nn.Module, dummy_input) -> torch.fx.GraphModule:
     """
     # get user registered functions, and treat them as leaf functions
     # torch function/operators/builtins/... are automatically handled as leaf functions by concrete trace
-    autowrap_funcs = [CustomizedOps.kOpRuntime[sign] for sign in CustomizedOps.kOpMap]
     # filter out torch.autograd.Function.apply as concrete trace already treats them as leaf function
-    autowrap_funcs = [fn for fn in autowrap_funcs if not is_autograd_apply(fn)]
-    leaf_functions = {func: LeafWrapInfo([], True, None) for func in autowrap_funcs if func is not None}
+    leaf_functions = {
+        CustomizedOps.kOpRuntime[sign]: LeafWrapInfo(
+            [], True, CustomizedOps.kOpFakeRuntime[sign], False
+        )
+        for sign in CustomizedOps.kOpMap
+        if CustomizedOps.kOpRuntime[sign] and not is_autograd_apply(CustomizedOps.kOpRuntime[sign])
+    }
 
     # importlib functions
     # currently only import_module is handled in the code

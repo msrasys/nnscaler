@@ -243,7 +243,8 @@ class ConcreteTracer(TracerBase):
     @compatibility(is_backward_compatible=True)
     def create_proxy(self, kind: str, target: Target, args: Tuple[Any, ...], kwargs: Dict[str, Any],
                     name: Optional[str] = None, type_expr: Optional[Any] = None,
-                    proxy_factory_fn: Optional[Callable[[Node], Any]] = None):
+                    proxy_factory_fn: Optional[Callable[[Node], Any]] = None,
+                    node_target: Optional[Target] = None):
         """
         similar to _symbolic_trace.Tracer.create_proxy.
         use the 'run_target' to actually execute the code, and store the value in 'value' field.
@@ -275,7 +276,7 @@ class ConcreteTracer(TracerBase):
             assert isinstance(args_, tuple)
             assert isinstance(kwargs_, dict)
 
-        node = self.create_node(kind, target, args_, kwargs_, name, type_expr, node_result)
+        node = self.create_node(kind, node_target or target, args_, kwargs_, name, type_expr, node_result)
 
         if self.record_frames and kind != 'placeholder':
             with wrap_utils.do_temp_call_origin():
@@ -523,6 +524,7 @@ class ConcreteTracer(TracerBase):
                         default_tracer=self if wrap_info.is_force_trace else None,
                         is_method=True,
                         method_name=func.__name__,
+                        replace_traced_code=wrap_info.replace_traced_code,
                     )
                 elif func.__qualname__.startswith('_VariableFunctionsClass'):
                     if hasattr(torch, func.__name__) and getattr(torch, func.__name__) == func:
@@ -532,6 +534,7 @@ class ConcreteTracer(TracerBase):
                         func,
                         replace_func=wrap_info.replacement,
                         default_tracer=self if wrap_info.is_force_trace else None,
+                        replace_traced_code=wrap_info.replace_traced_code,
                     )
                 elif isinstance(func, (MethodDescriptorType, MethodWrapperType)):
                     wrapped = wrap_utils.create_wrapped_leaf_func(
@@ -540,6 +543,7 @@ class ConcreteTracer(TracerBase):
                         default_tracer=self if wrap_info.is_force_trace else None,
                         is_method=True,
                         method_name=func.__name__,
+                        replace_traced_code=wrap_info.replace_traced_code,
                     )
                 elif func.__name__ != func.__qualname__ and func.__qualname__ != 'boolean_dispatch.<locals>.fn' \
                     and not func.__qualname__.startswith('PyCapsule') \
@@ -569,6 +573,7 @@ class ConcreteTracer(TracerBase):
                         default_tracer=self if wrap_info.is_force_trace else None,
                         is_method=True,
                         method_name=func.__name__,
+                        replace_traced_code=wrap_info.replace_traced_code,
                     )
                 else:
                     # common function
@@ -588,6 +593,7 @@ class ConcreteTracer(TracerBase):
                         func,
                         replace_func=wrap_info.replacement,
                         default_tracer=self if wrap_info.is_force_trace else None,
+                        replace_traced_code=wrap_info.replace_traced_code,
                     )
             wrapped_leaf_leaves[func] = (locations, wrapped)
 

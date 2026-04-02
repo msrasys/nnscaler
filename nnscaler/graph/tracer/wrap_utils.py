@@ -58,12 +58,14 @@ class LeafWrapInfo:
     extra_locs: The place the function is imported.
     is_force_trace: If set to false, the function will only be traced if inputs include proxy.
         Such as 'torch.rand', we should trace it even if it doesn't have proxy as input, so it should be force traced.
-    replacement: If not `None`, we will use it to replace the original function/class in traced code.
+    replacement: If not `None`, we will use it to run this function instead of the original function/class when tracing
         Such as ModuleList.__getitem__, we can use operator.getitem to replace it.
+    replace_traced_code: If set to true, we will replace the traced code of this function/class too.
     """
     extra_locs: List[Location] = field(default_factory=list)
     is_force_trace: bool = False
     replacement: Union[None, Callable, Type] = None
+    replace_traced_code: bool = True
 
 
 default_autowrap_leaf_function: Dict[Any, LeafWrapInfo] = {
@@ -183,7 +185,7 @@ wrapped_cls_to_orig_cls: Dict[Type, Type] = {}
 
 
 def create_wrapped_leaf_func(func: Callable, *, replace_func: Optional[Callable]=None, default_tracer: Optional['ConcreteTracer']=None,
-                             is_method: bool=False, method_name: Optional[str]=None):
+                             is_method: bool=False, method_name: Optional[str]=None, replace_traced_code: bool = True):
     """
     Create a wrapped function/method that will generate a call_function/call_method node when call `func` if there has proxy in the inputs.
 
@@ -226,7 +228,10 @@ def create_wrapped_leaf_func(func: Callable, *, replace_func: Optional[Callable]
                     else:
                         return tracer.create_proxy('call_function', func, args, kwargs)
                 else:
-                    return tracer.create_proxy('call_function', replace_func, args, kwargs)
+                    return tracer.create_proxy(
+                        'call_function', replace_func, args, kwargs,
+                        node_target=replace_func if replace_traced_code else func
+                    )
 
     return func_wrapper
 

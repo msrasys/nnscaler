@@ -278,3 +278,34 @@ def test_kw_args():
         for node, p_name in zip(ir_graph.nodes(), ['linear', 'linear', 'mock_add']):
             profile_name = get_func(node)[0].__qualname__
             assert profile_name == p_name, f'{profile_name} should be {p_name}'
+
+
+def fake_add_xy(x: torch.Tensor, y: torch.Tensor):
+    return x
+
+
+@nnscaler.register_op('*, * -> *', fake_fn=fake_add_xy)
+def add_xy(x: torch.Tensor, y: torch.Tensor):
+    raise NotImplementedError("This function should not be called since it's replaced by fake_add_xy in tracing")
+
+
+class FakeFnModel(torch.nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.fc = torch.nn.Linear(10, 10)
+
+    def forward(self, x, y):
+        x, y = self.fc(x), self.fc(y)
+        return add_xy(x, y)
+
+
+@replace_all_device_with('cpu')
+def test_register_fake_fn():
+    model = FakeFnModel()
+    with tempfile.TemporaryDirectory() as tempdir:
+        ir_graph = convert_model(model, {'x': torch.rand(10, 10), 'y': torch.rand(10, 10)}, tempdir, False)
+
+        # test profiler.database
+        for node, p_name in zip(ir_graph.nodes(), ['linear', 'linear', 'add_xy']):
+            profile_name = get_func(node)[0].__qualname__
+            assert profile_name == p_name, f'{profile_name} should be {p_name}'
