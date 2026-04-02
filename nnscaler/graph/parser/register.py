@@ -29,7 +29,7 @@ class CustomizedOps:
     kOpRuntime: Dict[str, Callable] = {}
     # signature -> fake runtime function
     # TODO: autograd function cannot have fake runtime function now
-    kOpFakeRuntime: Dict[str, Callable] = {}
+    kOpFakeRuntime: Dict[str, Optional[Callable]] = {}
     # signature -> runtime function implementation code
     kOpCodeDef: Dict[str, str] = {}
     # signature -> special emit function, will not store if emit_fn is None

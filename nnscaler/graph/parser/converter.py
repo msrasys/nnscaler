@@ -84,7 +84,8 @@ def to_fx_graph(model: torch.nn.Module, dummy_input) -> torch.fx.GraphModule:
     # filter out torch.autograd.Function.apply as concrete trace already treats them as leaf function
     leaf_functions = {
         CustomizedOps.kOpRuntime[sign]: LeafWrapInfo(
-            [], True, CustomizedOps.kOpFakeRuntime[sign], False
+            [], True, CustomizedOps.kOpFakeRuntime[sign],
+            replace_traced_code=False,
         )
         for sign in CustomizedOps.kOpMap
         if CustomizedOps.kOpRuntime[sign] and not is_autograd_apply(CustomizedOps.kOpRuntime[sign])
