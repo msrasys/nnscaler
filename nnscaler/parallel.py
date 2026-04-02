@@ -1130,6 +1130,7 @@ def parallelize(
                 regen_status = RegenStatus.NONE
                 logger.info(f"Reuse generated code in {outdir}")
     except Exception as e:
+        logger.exception(f"Error during code generation: {e}")
         regen_status = RegenStatus.ERROR
         regen_exception = e
     else:
