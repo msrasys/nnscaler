@@ -36,7 +36,7 @@ class OverlapDataset(Dataset):
     def __init__(self):
         torch.manual_seed(0)
         self.data = []
-        for _ in range(num_micro):
+        for _ in range(num_micro*100):
             ids = torch.randint(0, vocab, (seq_len,))
             tgt = torch.randint(0, vocab, (seq_len,))
             self.data.append({'input_ids': ids, 'targets': tgt})

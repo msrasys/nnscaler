@@ -12,7 +12,8 @@ compute_config:
 run_mode: run
 pas_policy: tests.cli.test_trainer_overlap.toy_policy
 micro_batch_size: 4
-max_train_steps: 1
+global_batch_size: 16
+max_train_steps: 10
 seed: 0
 
 model:
