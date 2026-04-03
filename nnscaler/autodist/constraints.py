@@ -75,6 +75,7 @@ class PartitionConstraintV2:
     allowed_dims: Optional[List[Tuple[int, int]]] = None
     forbidden_dims: Optional[List[Tuple[int, int]]] = None
     force_replicate: bool = False
+    forbid_replicate: bool = False
     max_partition_degree: Optional[int] = None
 
     # -- Assignment constraints ---------------------------------------------
@@ -110,6 +111,11 @@ class PartitionConstraintV2:
             errors.append(
                 'force_replicate=True conflicts with allowed_dims '
                 '(replicated ops cannot be partitioned)'
+            )
+
+        if self.force_replicate and self.forbid_replicate:
+            errors.append(
+                'force_replicate=True conflicts with forbid_replicate=True'
             )
 
         if self.allowed_dims and self.forbidden_dims:
@@ -217,6 +223,8 @@ class PartitionConstraintV2:
             kw['forbidden_dims'] = [_parse_dim(d) for d in content['forbidden_dims']]
         if 'force_replicate' in content:
             kw['force_replicate'] = bool(content['force_replicate'])
+        if 'forbid_replicate' in content:
+            kw['forbid_replicate'] = bool(content['forbid_replicate'])
         if 'max_partition_degree' in content:
             kw['max_partition_degree'] = int(content['max_partition_degree'])
 
@@ -246,6 +254,8 @@ class PartitionConstraintV2:
             out['forbidden_dims'] = [f'{d[0]},{d[1]}' for d in self.forbidden_dims]
         if self.force_replicate:
             out['force_replicate'] = True
+        if self.forbid_replicate:
+            out['forbid_replicate'] = True
         if self.max_partition_degree is not None:
             out['max_partition_degree'] = self.max_partition_degree
 
@@ -262,7 +272,8 @@ class PartitionConstraintV2:
             self.param_name_pattern,
             tuple(self.allowed_dims) if self.allowed_dims else None,
             tuple(self.forbidden_dims) if self.forbidden_dims else None,
-            self.force_replicate, self.max_partition_degree,
+            self.force_replicate, self.forbid_replicate,
+            self.max_partition_degree,
             self.stage_id, self.recompute,
         ))
 
@@ -395,6 +406,15 @@ class ConstraintSet:
     def get_unmatched_constraints(self) -> List[PartitionConstraintV2]:
         return [pc for pc in self.partition_constraints if not pc.is_matched]
 
+    def reset_matched(self) -> None:
+        """Reset the matched state of all partition constraints.
+
+        Call this before reusing the same ConstraintSet across multiple solver
+        invocations (e.g., different pipeline stages).
+        """
+        for pc in self.partition_constraints:
+            pc._matched = False
+
     def get_coverage_report(self, total_ops: int) -> Dict[str, Any]:
         matched = sum(1 for pc in self.partition_constraints if pc.is_matched)
         return {
@@ -477,9 +497,7 @@ def convert_legacy_constraints(
 
         replica_allowed = lc.get('replica_allowed', True)
         if not replica_allowed:
-            # Legacy semantics: replica_allowed=False means the op *must*
-            # be partitioned along one of the allowed dims.
-            pass  # Handled downstream in the solver filtering.
+            kw['forbid_replicate'] = True
 
         pcs.append(PartitionConstraintV2(**kw))
 

@@ -192,10 +192,18 @@ def _estimate_search_space(
                 if c.force_replicate:
                     effective = 1
                     break
+                if c.forbid_replicate:
+                    # Remove replicate option (the +1 above)
+                    effective = max(1, effective - 1)
                 if c.allowed_dims is not None:
-                    effective = min(effective, len(c.allowed_dims) + 1)
+                    effective = min(effective, len(c.allowed_dims) + (0 if c.forbid_replicate else 1))
                 if c.forbidden_dims is not None:
                     effective = max(1, effective - len(c.forbidden_dims))
+                if c.max_partition_degree is not None:
+                    # Caps the number of valid partition strategies
+                    # Each dim can be split into factors of device_num up to max_partition_degree
+                    # Approximation: reduces effective choices
+                    effective = max(1, min(effective, c.max_partition_degree))
             constrained_log += _safe_log(effective)
         else:
             constrained_log += _safe_log(n_dims)

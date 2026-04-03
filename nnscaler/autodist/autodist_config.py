@@ -220,6 +220,9 @@ class AutoDistConfig:
             from .constraints import ConstraintSet
             self.constraints = ConstraintSet.from_yaml_file(constraints_path)
 
+        # Apply SchedulerConstraint overrides from V2 constraint set
+        self._apply_scheduler_constraint()
+
         ignored_keys = list(kwargs.keys())
         if ignored_keys:
             warning_msg = f'autodist config got unknown config keys: {ignored_keys}'
@@ -242,6 +245,37 @@ class AutoDistConfig:
             f'got {type(value).__name__}'
         )
 
+    def _apply_scheduler_constraint(self):
+        """Apply SchedulerConstraint fields from the V2 constraint set."""
+        if self.constraints is None or self.constraints.scheduler_constraint is None:
+            return
+        sc = self.constraints.scheduler_constraint
+        if sc.allowed_schedulers is not None:
+            if self.pipeline_scheduler not in sc.allowed_schedulers:
+                raise ValueError(
+                    f'pipeline_scheduler {self.pipeline_scheduler!r} is not in '
+                    f'allowed_schedulers {sc.allowed_schedulers}'
+                )
+        if sc.max_bubble_ratio < self.max_pipeline_bubble_ratio:
+            _logger.info(
+                f'SchedulerConstraint: overriding max_pipeline_bubble_ratio '
+                f'{self.max_pipeline_bubble_ratio} -> {sc.max_bubble_ratio}'
+            )
+            self.max_pipeline_bubble_ratio = sc.max_bubble_ratio
+        if sc.max_stages is not None:
+            if self.pipeline_nstages == 'auto' or self.pipeline_nstages > sc.max_stages:
+                _logger.info(
+                    f'SchedulerConstraint: capping pipeline_nstages to {sc.max_stages}'
+                )
+                if self.pipeline_nstages != 'auto':
+                    self.pipeline_nstages = min(self.pipeline_nstages, sc.max_stages)
+        if sc.min_microbatches is not None:
+            if self.update_freq < sc.min_microbatches:
+                raise ValueError(
+                    f'update_freq {self.update_freq} is less than '
+                    f'min_microbatches {sc.min_microbatches} from SchedulerConstraint'
+                )
+
     def _validate_config(self):
         if self.pc_path:
             _validate_file_path(self.pc_path)
@@ -251,6 +285,11 @@ class AutoDistConfig:
 
         if self.constraints is not None:
             self.constraints.validate_all()
+            if self.pc_path:
+                _logger.warning(
+                    'Both V2 constraints and legacy partition_constraints_path are set. '
+                    'V2 constraints take priority; legacy constraints will be ignored.'
+                )
 
         if not Path(self.profile_dir).exists():
             _logger.info(f'create folder: {self.profile_dir}')

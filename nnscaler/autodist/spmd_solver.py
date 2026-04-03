@@ -173,6 +173,7 @@ class SPMDSolver:
         # V2 constraint system (takes priority over legacy pc_path)
         self._constraint_set = autodist_config.constraints
         if self._constraint_set is not None:
+            self._constraint_set.reset_matched()
             _logger.info('using V2 constraint system')
         elif autodist_config.pc_path:
             self._load_partition_constraints(autodist_config.pc_path)
@@ -188,6 +189,7 @@ class SPMDSolver:
     def initialize(self):
         self.build_cut_ops()
         self.init_op_partitions()
+        self._apply_v2_recompute_constraints()
         self.build_following_relationships()
         self.calc_partition_info()
 
@@ -258,22 +260,44 @@ class SPMDSolver:
                 if p_ids[0] != -1:
                     return False
 
+            # forbid_replicate: replication is not allowed
+            if c.forbid_replicate:
+                if p_ids[0] == -1:
+                    return False
+
             # max_partition_degree
             if c.max_partition_degree is not None and p_ids[0] != -1:
                 if p_nums[0] > c.max_partition_degree:
                     return False
 
             if p_ids[0] != -1 and isinstance(operator.ir_cell, IRDimops):
-                p_idx, p_dim = operator.dim_id2pos(p_ids[0])
+                # Convert allowed/forbidden dim positions to dim_ids for comparison.
+                # A dimension (like 'k') can appear in multiple inputs, so
+                # dim_id2pos only returns the first position. Instead, we convert
+                # each allowed/forbidden position to a dim_id and check against
+                # the partition's dim_id.
+                dim_id = p_ids[0]
 
                 # allowed_dims: (input_idx, dim_idx) whitelist
                 if c.allowed_dims is not None:
-                    if (p_idx, p_dim) not in c.allowed_dims:
+                    allowed_dim_ids = set()
+                    for pos in c.allowed_dims:
+                        try:
+                            allowed_dim_ids.add(operator.pos2dim_id(pos))
+                        except Exception:
+                            pass  # invalid position for this operator
+                    if dim_id not in allowed_dim_ids:
                         return False
 
                 # forbidden_dims: (input_idx, dim_idx) blacklist
                 if c.forbidden_dims is not None:
-                    if (p_idx, p_dim) in c.forbidden_dims:
+                    forbidden_dim_ids = set()
+                    for pos in c.forbidden_dims:
+                        try:
+                            forbidden_dim_ids.add(operator.pos2dim_id(pos))
+                        except Exception:
+                            pass
+                    if dim_id in forbidden_dim_ids:
                         return False
 
         return True
@@ -294,6 +318,25 @@ class SPMDSolver:
                 )
         except Exception:
             _logger.exception('V2 constraint validation failed (non-fatal)')
+
+    def _apply_v2_recompute_constraints(self) -> None:
+        """Apply recompute overrides from V2 constraints to operators."""
+        if self._constraint_set is None:
+            return
+        for i, operator in enumerate(self.graph.operator_list):
+            v2_matches = self._get_v2_constraints_for_op(operator)
+            for c in v2_matches:
+                if c.recompute is not None:
+                    if c.recompute and not operator.recompute:
+                        _logger.info(
+                            f'V2 constraint: enabling recompute for {operator.op_name}'
+                        )
+                        operator.recompute = True
+                    elif not c.recompute and operator.recompute:
+                        _logger.info(
+                            f'V2 constraint: disabling recompute for {operator.op_name}'
+                        )
+                        operator.recompute = False
 
     def get_operator(self, idx: int) -> CubeOperator:
         return self.graph.operator_list[idx]

@@ -412,3 +412,86 @@ class TestValidationResult:
         assert 'FAILED' in s
         assert 'bad stage_id' in s
         assert 'unused constraint' in s
+
+
+# =========================================================================
+# New: forbid_replicate
+# =========================================================================
+
+class TestForbidReplicate:
+
+    def test_valid_forbid_replicate(self):
+        pc = PartitionConstraintV2(
+            op_name='linear',
+            forbid_replicate=True,
+            allowed_dims=[(0, 1)],
+        )
+        assert pc.forbid_replicate is True
+
+    def test_force_and_forbid_conflict_raises(self):
+        with pytest.raises(ConstraintValidationError, match='force_replicate.*conflicts.*forbid_replicate'):
+            PartitionConstraintV2(
+                op_name='linear',
+                force_replicate=True,
+                forbid_replicate=True,
+            )
+
+    def test_forbid_replicate_yaml_roundtrip(self):
+        original = PartitionConstraintV2(
+            op_name='linear',
+            forbid_replicate=True,
+        )
+        yaml_dict = original.to_yaml()
+        assert yaml_dict['forbid_replicate'] is True
+        restored = PartitionConstraintV2.from_yaml(yaml_dict)
+        assert restored.forbid_replicate is True
+
+    def test_legacy_conversion_replica_allowed_false(self):
+        legacy = [{
+            'name': 'torch.sum',
+            'allowed_partition_dims': ['0,0'],
+            'replica_allowed': False,
+        }]
+        cs = convert_legacy_constraints(legacy)
+        assert cs.partition_constraints[0].forbid_replicate is True
+
+    def test_legacy_conversion_replica_allowed_true(self):
+        legacy = [{
+            'name': 'torch.sum',
+            'allowed_partition_dims': ['0,0'],
+            'replica_allowed': True,
+        }]
+        cs = convert_legacy_constraints(legacy)
+        assert cs.partition_constraints[0].forbid_replicate is False
+
+
+# =========================================================================
+# New: reset_matched
+# =========================================================================
+
+class TestResetMatched:
+
+    def test_reset_clears_state(self):
+        cs = ConstraintSet(partition_constraints=[
+            PartitionConstraintV2(op_name='linear'),
+            PartitionConstraintV2(op_name='relu'),
+        ])
+        # Simulate matching
+        cs.partition_constraints[0].mark_matched()
+        assert len(cs.get_unmatched_constraints()) == 1
+
+        cs.reset_matched()
+        assert len(cs.get_unmatched_constraints()) == 2
+
+    def test_reset_then_rematch(self):
+        cs = ConstraintSet(partition_constraints=[
+            PartitionConstraintV2(op_name='linear'),
+        ])
+        cs.get_matching_constraints('linear', {})
+        assert len(cs.get_unmatched_constraints()) == 0
+
+        cs.reset_matched()
+        assert len(cs.get_unmatched_constraints()) == 1
+
+        cs.get_matching_constraints('linear', {})
+        assert len(cs.get_unmatched_constraints()) == 0
