@@ -65,6 +65,7 @@ class ExeReuseCell(IRCell):
             outputs.append(t)
         reuse = ExeReuseCell(self._cell.dispatch(devid), inputs, outputs)
         reuse._id = self._id
+        reuse._op_context = self._op_context
         if _mirror and self.mirror is not None:
             mreuse = self.mirror.dispatch(devid, _mirror=False)
             IRCell.make_pair(reuse, mreuse)
@@ -127,6 +128,10 @@ class ExecutionPlan:
 
         micro_fcells: Dict[(int, IRCell), ExeReuseCell] = {}
         def block2reuse(node: Block) -> ExeReuseCell:
+            # Note: we set op_context for forward and backward seperately.
+            # But as forward/backward are paired
+            # (e.g., forward and backward of a same micro-batch are used, which is always true in training),
+            # both forward and backward will have the stream_context set correctly.
             if node.content.isfw():
                 key = (node.mid, node.content)
                 if key in micro_fcells:
@@ -134,6 +139,8 @@ class ExecutionPlan:
                 inputs = [get(t, node.mid) for t in node.content.inputs()]
                 outputs = [get(t, node.mid) for t in node.content.outputs()]
                 cell = ExeReuseCell(node.content, inputs, outputs)
+                if node.stream_context is not None:
+                    cell.set_op_context('stream_context', node.stream_context)
                 if isinstance(node.content.mirror, IRCell):
                     minputs = [get(t, node.mid) for t in node.content.mirror.inputs()]
                     moutputs = [get(t, node.mid) for t in node.content.mirror.outputs()]
@@ -143,6 +150,8 @@ class ExecutionPlan:
                 return cell
             else:
                 mcell = block2reuse(Block(node.content.mirror, node.mid, node.span))
+                if node.stream_context is not None:
+                    mcell.mirror.set_op_context('stream_context', node.stream_context)
                 return mcell.mirror
 
         topo_seqs: List[IRCell] = []

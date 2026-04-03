@@ -209,9 +209,14 @@ class ScheduleCodeGen(FuncEmission):
 
     def _get_node_stream_context(self, node: IRCell):
         unwrap_node = node.cell if isinstance(node, ExeReuseCell) else node
-        stream_context = unwrap_node.get_op_context('stream_context')
+        stream_context = node.get_op_context('stream_context')
+
+        if not stream_context and isinstance(node, ExeReuseCell):
+            stream_context = node.cell.get_op_context('stream_context')
+
         if not stream_context and isinstance(unwrap_node, IRWeightReducer):
             stream_context = self.execplan.weight_reducer_stream_context
+
         return stream_context
 
     def _get_node_stream(self, node: IRCell) -> Optional[str]:

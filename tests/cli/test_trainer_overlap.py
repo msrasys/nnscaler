@@ -224,10 +224,8 @@ def sched_overlap(graph: IRGraph, num_microbatches: int, num_stages: int) -> Sch
     )
     # warm up: full forward of mb 0
     for sid in range(num_stages):
-        sched.add_segment(fsegs[sid], 0, step=sid)
-        sched.set_segment_stream(
-            fsegs[sid],
-            StreamContext(stream='comp',wait_streams=['comm'], record_event=forward_event)
+        sched.add_segment(fsegs[sid], 0, step=sid,
+            stream_context=StreamContext(stream='comp',wait_streams=['comm'], record_event=forward_event)
             if sid == 0 else
             StreamContext(stream=fseg_stream_name[sid], wait_events=[forward_event], record_event=forward_event)
         )
@@ -236,33 +234,29 @@ def sched_overlap(graph: IRGraph, num_microbatches: int, num_stages: int) -> Sch
     for micro_idx in range(1, num_microbatches):
         # Phase 1: fwd_seg0 alone on comp_stream
         sid += 1
-        sched.add_segment(fsegs[0], micro_idx, step=sid)
-        sched.set_segment_stream(
-            fsegs[0], StreamContext(stream='comp',wait_streams=['comm'], record_event=forward_event)
+        sched.add_segment(fsegs[0], micro_idx, step=sid,
+            stream_context=StreamContext(stream='comp',wait_streams=['comm'], record_event=forward_event)
         )
 
         # Phase 2-5: overlapping pairs with GPU barrier between them
         for fwd_s, bwd_s in [(1, 4), (2, 3), (3, 2), (4, 1)]:
             sid += 1
-            sched.add_segment(fsegs[fwd_s], micro_idx, step=sid)
-            sched.set_segment_stream(
-                fsegs[fwd_s], StreamContext(
+            sched.add_segment(fsegs[fwd_s], micro_idx, step=sid,
+                    stream_context=StreamContext(
                     stream=fseg_stream_name[fwd_s], record_event=forward_event, wait_events=[forward_event]
                 )
             )
             sid += 1
-            sched.add_segment(fsegs[bwd_s].mirror, micro_idx - 1, step=sid)
-            sched.set_segment_stream(
-                fsegs[bwd_s].mirror, StreamContext(
+            sched.add_segment(fsegs[bwd_s].mirror, micro_idx - 1, step=sid,
+                    stream_context=StreamContext(
                     stream=fseg_stream_name[bwd_s], record_event=backward_event, wait_events=[backward_event]
                 )
             )
 
         # Phase 6: bwd_seg0 alone on comp_stream
         sid += 1
-        sched.add_segment(fsegs[0].mirror, micro_idx - 1, step=sid)
-        sched.set_segment_stream(
-            fsegs[0].mirror, StreamContext(
+        sched.add_segment(fsegs[0].mirror, micro_idx - 1, step=sid,
+                stream_context=StreamContext(
                 stream=fseg_stream_name[0], record_event=backward_event, wait_events=[backward_event]
             )
         )
@@ -270,12 +264,11 @@ def sched_overlap(graph: IRGraph, num_microbatches: int, num_stages: int) -> Sch
     # Cooldown: backward last mb
     for stage in reversed(range(num_stages)):
         sid += 1
-        sched.add_segment(fsegs[stage].mirror, num_microbatches - 1, step=sid)
-        sched.set_segment_stream(
-            fsegs[stage].mirror,
-            StreamContext(stream='comp',wait_streams=['comm'], record_event=backward_event)
-            if stage == num_stages - 1 else
-            StreamContext(stream=fseg_stream_name[stage], wait_events=[backward_event], record_event=backward_event)
+        sched.add_segment(fsegs[stage].mirror, num_microbatches - 1, step=sid,
+            stream_context=
+                StreamContext(stream='comp',wait_streams=['comm'], record_event=backward_event)
+                if stage == num_stages - 1 else
+                StreamContext(stream=fseg_stream_name[stage], wait_events=[backward_event], record_event=backward_event)
         )
 
     sched.finish()

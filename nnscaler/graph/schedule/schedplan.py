@@ -77,13 +77,34 @@ from nnscaler.graph.segment import IRSegment
 from nnscaler.flags import CompileFlag
 
 
+@dataclass(frozen=True)
+class StreamContext:
+    """
+    StreamContext is a dataclass that holds the stream context of an operation.
+    Currently, all stream context information is ignored when tracing.
+    But we can set it in codegen to improve the performance of the generated code.
+    One example is we can seperate compute and communication to different streams
+    to achieve better performance in pipeline parallelism.
+
+    Args:
+        stream: The stream name that the operation is executed on.
+        wait_streams: The stream names that the operation needs to wait for before execution.
+        record_event: The event name that the operation needs to record after execution.
+        wait_events: The event names that the operation needs to wait for before execution.
+    """
+    stream: Optional[str] = None
+    wait_streams: Optional[list[str]] = None
+    record_event: Optional[str] = None
+    wait_events: Optional[list[str]] = None
+
+
 class Block:
     """
     A block is a node in SchedulePlan, representing an IRCell
     that is executed with input data of a given micro-batch index.
     """
 
-    def __init__(self, cell: IRCell, micro_batch_id: int, span: int) -> None:
+    def __init__(self, cell: IRCell, micro_batch_id: int, span: int, stream_context: Optional[StreamContext] = None) -> None:
         """Create an execution block with IRCell on microbatch index. The
         block will take `span` steps to finish execution.
         """
@@ -91,6 +112,7 @@ class Block:
         self._content: IRCell = cell
         self._micro_batch_id: int = micro_batch_id
         self._span = span
+        self._stream_context: Optional[StreamContext] = stream_context
 
     def __eq__(self, other):
         if isinstance(other, Block):
@@ -116,8 +138,9 @@ class Block:
     def span(self) -> int:
         return self._span
 
-    def dispatch(self, devid: int):
-        return Block(self._content.dispatch(devid), self._micro_batch_id)
+    @property
+    def stream_context(self) -> Optional['StreamContext']:
+        return self._stream_context
 
     def __repr__(self) -> str:
         return f"{self._content.cid}{'f' if self.content.isfw() else 'b'}{self._micro_batch_id}"
@@ -164,27 +187,6 @@ class ScheduleDependency:
 
     def depends(self, prev: Block, next: Block) -> bool:
         return prev.mid == next.mid and self.graph.depends(prev.content, next.content)
-
-
-@dataclass(frozen=True)
-class StreamContext:
-    """
-    StreamContext is a dataclass that holds the stream context of an operation.
-    Currently, all stream context information is ignored when tracing.
-    But we can set it in codegen to improve the performance of the generated code.
-    One example is we can seperate compute and communication to different streams
-    to achieve better performance in pipeline parallelism.
-
-    Args:
-        stream: The stream name that the operation is executed on.
-        wait_streams: The stream names that the operation needs to wait for before execution.
-        record_event: The event name that the operation needs to record after execution.
-        wait_events: The event names that the operation needs to wait for before execution.
-    """
-    stream: Optional[str] = None
-    wait_streams: Optional[list[str]] = None
-    record_event: Optional[str] = None
-    wait_events: Optional[list[str]] = None
 
 
 @dataclass
@@ -265,9 +267,6 @@ class PlanBase:
         if stream_context is not None:
             node.set_op_context('stream_context', stream_context)
 
-    def set_segment_stream(self, segment: IRSegment, stream_context: StreamContext):
-        self._set_node_stream(segment, stream_context)
-
     def nodes(self) -> Tuple[Block]:
         return tuple(self._seqs)
 
@@ -288,8 +287,12 @@ class PlanBase:
         self._blocks.append(block)
         return block
 
-    def add_segment(self, seg: IRSegment, micro_batch_id: int,
-                    step: int, span: Optional[int] = 1) -> Block:
+    def add_segment(
+        self,
+        seg: IRSegment, micro_batch_id: int,
+        step: int, span: Optional[int] = 1,
+        stream_context: Optional[StreamContext] = None,
+    ) -> Block:
         """Add a segment to be executed with micro_batch_id data at step.
 
         The segments after `step` will keep unchanged.
@@ -303,11 +306,16 @@ class PlanBase:
         Returns:
             block (Block): the block representing the segment
         """
-        block = Block(seg, micro_batch_id, span)
+        block = Block(seg, micro_batch_id, span, stream_context)
         self.add_block(block, step)
         return block
 
-    def insert_step(self, step: int, seg: IRSegment, micro_batch_id: int, span: Optional[int] = 1) -> Block:
+    def insert_step(
+        self,
+        step: int, seg: IRSegment,
+        micro_batch_id: int, span: Optional[int] = 1,
+        stream_context: Optional[StreamContext] = None,
+    ) -> Block:
         """Insert `span` steps at current `step`.
 
         The segments after `step` will be pushed `span` time step for execution。
@@ -331,7 +339,7 @@ class PlanBase:
                 raise NotImplementedError(
                     f"Cannot shift the block {block} that is in execution on step {step}")
         # insert
-        block = Block(seg, micro_batch_id, span)
+        block = Block(seg, micro_batch_id, span, stream_context)
         for _ in range(span):
             self._step_blocks.insert(step, [block])
             self._step_devices.insert(step, set(seg.device))
