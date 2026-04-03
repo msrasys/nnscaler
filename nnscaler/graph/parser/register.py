@@ -80,11 +80,12 @@ class CustomizedOps:
                                 as input and returns the generated code.
             input_gen_fn (Callable): input generator function for profiler, will use default input generator function
                                      if input_gen_fn is None. kwargs are same as that in the input node.
-            fake_fn (Callable): a fake function for simulating runtime_fn execution,
-                it accepts the same inputs as runtime_fn and returns the same outputs as runtime_fn,
-                If fake_fn is None, we will use runtime_fn for meta tensor execution,
-                which may cause error if runtime_fn contains some operations
-                that cannot be executed in tracing (for example, distributed communication ops).
+            fake_fn (Callable): a lightweight substitute for runtime_fn during tracing.
+                It must have the same signature (inputs and outputs) as runtime_fn so that
+                the two are interchangeable.
+                If fake_fn is None, runtime_fn will be used,
+                which may cause errors if runtime_fn contains operations
+                that cannot run during tracing (e.g., distributed communication ops).
         Returns:
             None
         """
@@ -176,11 +177,12 @@ def register_op(annotation: Union[str, Callable], name: Optional[str] = None,
             However, input tensors' contents may influence the speed dramatically. The mask in attention and dispatched expert index in MoE
             are real examples. To handle this scenario, user can provide the customized `input_gen_fn`.
             Default: None.
-        fake_fn (Callable): a fake function for simulating runtime_fn execution,
-            it accepts the same inputs as runtime_fn and returns the same outputs as runtime_fn.
-            If fake_fn is None, we will use runtime_fn for meta tensor execution,
-            which may cause error if runtime_fn contains some operations
-            that cannot be executed in tracing (for example, distributed communication ops).
+        fake_fn (Callable): a lightweight substitute for runtime_fn during tracing.
+            It must have the same signature (inputs and outputs) as runtime_fn so that
+            the two are interchangeable.
+            If fake_fn is None, runtime_fn will be used directly,
+            which may cause errors if runtime_fn contains operations
+            that cannot run during tracing (e.g., distributed communication ops).
             Default: None.
 
     Returns:
