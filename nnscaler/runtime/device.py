@@ -54,6 +54,7 @@ class _DeviceGroup:
         self.groups: Dict = { '1'*self.world_size: None }
         self.streams: Dict[str, torch.cuda.Stream] = {
             'default': torch.cuda.default_stream()}
+        self.events: Dict[str, torch.cuda.Event] = {}
 
     def close(self):
         if self._is_pg_initer:
@@ -98,6 +99,16 @@ class _DeviceGroup:
             stream = torch.cuda.Stream()
             self.streams[name] = stream
         return self.streams[name]
+
+    def get_event(self, name: str) -> torch.cuda.Event:
+        """
+        Get event by name. If name doesn't exist,
+        will create a new one.
+        """
+        if name not in self.events:
+            event = torch.cuda.Event()
+            self.events[name] = event
+        return self.events[name]
 
     def create_hybrid(self, group_num: List[int]) -> List[List[int]]:
         """

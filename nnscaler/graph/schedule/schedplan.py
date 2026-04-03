@@ -178,9 +178,13 @@ class StreamContext:
     Args:
         stream: The stream name that the operation is executed on.
         wait_streams: The stream names that the operation needs to wait for before execution.
+        record_event: The event name that the operation needs to record after execution.
+        wait_events: The event names that the operation needs to wait for before execution.
     """
     stream: Optional[str] = None
     wait_streams: Optional[list[str]] = None
+    record_event: Optional[str] = None
+    wait_events: Optional[list[str]] = None
 
 
 @dataclass

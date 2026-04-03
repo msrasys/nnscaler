@@ -83,42 +83,37 @@ class ScheduleCodeGen(FuncEmission):
 
         args = ['model'] + [self.tensor_name(t) for t in self.execplan.graph.inputs()]
 
-        last_stream_context = None
+        last_stream = None
         buffered_codes = []
 
-        def _get_codes_with_stream_context(codes: List[str], stream_context):
-            if stream_context is None:
-                return codes
+        def _get_codes_with_stream_context(codes: List[str], stream: Optional[str]) -> List[str]:
+            if stream is None:
+                return codes + ['']
             else:
-                stream_name = stream_context.stream
-                wait_streams = stream_context.wait_streams
-                with Block(f'with torch.cuda.stream(nnscaler.runtime.device.DeviceGroup().get_stream({repr(stream_name)})):' ) as stream_block:
-                    for wait_stream in wait_streams:
-                        stream_block.insert_body(
-                            f'torch.cuda.current_stream().wait_stream(nnscaler.runtime.device.DeviceGroup().get_stream({repr(wait_stream)}))'
-                        )
+                with Block(f'with torch.cuda.stream(nnscaler.runtime.device.DeviceGroup().get_stream({repr(stream)})):' ) as stream_block:
                     stream_block.insert_body(codes)
-                return stream_block.code
+                return stream_block.code + ['']
 
-        def _append_code(fb: FunctionBlock, code: Union[List[str], str], stream_context=None, force_flush=False):
+        def _append_code(fb: FunctionBlock, code: Union[List[str], str], stream: Optional[str] = None, force_flush=False):
             codes = code if isinstance(code, list) else [code]
 
-            nonlocal last_stream_context, buffered_codes
-            if stream_context is None or stream_context == last_stream_context:
+            nonlocal last_stream, buffered_codes
+
+            if last_stream == stream:
                 buffered_codes.extend(codes)
             else:
                 if buffered_codes:
-                    fb.insert_body(_get_codes_with_stream_context(buffered_codes, last_stream_context))
+                    fb.insert_body(_get_codes_with_stream_context(buffered_codes, last_stream))
 
-                last_stream_context = stream_context
+                last_stream = stream
                 buffered_codes.clear()
                 buffered_codes.extend(codes)
 
             if force_flush:
                 if buffered_codes:
-                    fb.insert_body(_get_codes_with_stream_context(buffered_codes, last_stream_context))
+                    fb.insert_body(_get_codes_with_stream_context(buffered_codes, last_stream))
                 buffered_codes.clear()
-                last_stream_context = None
+                last_stream = None
 
         with FunctionBlock(func_name='_train_step',
                            args=args) as fb:
@@ -126,7 +121,12 @@ class ScheduleCodeGen(FuncEmission):
 
             if use_scheduler:
                 _append_code(fb, 'nnscaler.flags.RuntimeFlag.skip_zero_grad = False')
-            _append_code(fb, 'model.zero_grad()', self.execplan.zero_grad_stream_context)
+            _append_code(
+                fb,
+                self._emit_stream_context(self.execplan.zero_grad_stream_context, ['model.zero_grad()']),
+                self.execplan.zero_grad_stream_context.stream
+                    if self.execplan.zero_grad_stream_context else None
+            )
 
             # body code
             if len(device_nodes) == 0:
@@ -160,7 +160,7 @@ class ScheduleCodeGen(FuncEmission):
                             f'{id(node) not in last_backward_node_oids !r}'
                         )
                     codes = self.emit_node(node)
-                    _append_code(fb, codes, self._get_node_stream_context(node))
+                    _append_code(fb, codes, self._get_node_stream(node))
                     # release
                     tensors = lifetime.release_tensors_after_line(line)
                     if len(tensors) > 0 : # not necessarily to have one after each line
@@ -187,7 +187,7 @@ class ScheduleCodeGen(FuncEmission):
                     if not node.isfw(): continue  # skip backward segments and adapters
                     # execute
                     codes = self.emit_node(node, force_no_grad=True)
-                    _append_code(fb, codes, self._get_node_stream_context(node))
+                    _append_code(fb, codes, self._get_node_stream(node))
                     # release
                     tensors = lifetime.release_tensors_after_line(line)
                     tensors = [t for t in tensors if isinstance(t, IRTensor) and not t.is_grad()]
@@ -214,6 +214,31 @@ class ScheduleCodeGen(FuncEmission):
             stream_context = self.execplan.weight_reducer_stream_context
         return stream_context
 
+    def _get_node_stream(self, node: IRCell) -> Optional[str]:
+        stream_context = self._get_node_stream_context(node)
+        if stream_context:
+            return stream_context.stream
+        else:
+            return None
+
+    def _emit_stream_context(self, stream_context, codes: List[str]) -> List[str]:
+        wait_stream_codes = []
+        if stream_context and stream_context.wait_streams:
+            for wait_stream in stream_context.wait_streams:
+                wait_stream_codes.append(f'torch.cuda.current_stream().wait_stream(nnscaler.runtime.device.DeviceGroup().get_stream({repr(wait_stream)}))')
+
+        wait_event_codes = []
+        if stream_context and stream_context.wait_events:
+            for wait_event in stream_context.wait_events:
+                wait_event_codes.append(f'nnscaler.runtime.device.DeviceGroup().get_event({repr(wait_event)}).wait()')
+
+        record_event_codes = []
+        if stream_context and stream_context.record_event:
+            record_event_codes.append(f'nnscaler.runtime.device.DeviceGroup().get_event({repr(stream_context.record_event)}).record()')
+
+        return wait_stream_codes + wait_event_codes + codes + record_event_codes
+
+
     def emit_detach(self, tensor: IRTensor) -> str:
         """
         Emit detach code
@@ -238,6 +263,7 @@ class ScheduleCodeGen(FuncEmission):
 
         unwrap_node = node.cell if isinstance(node, ExeReuseCell) else node
         name = self.node_name(unwrap_node)
+        stream_context = self._get_node_stream_context(node)
 
         if isinstance(unwrap_node, IRSegment):
             # emit forward segment
@@ -307,5 +333,4 @@ class ScheduleCodeGen(FuncEmission):
             type_str = type(unwrap_node).__name__
             codes = [f'nnscaler.runtime.function.print_time({repr(type_str)})'] + codes
 
-        return codes
-
+        return self._emit_stream_context(stream_context, codes)
