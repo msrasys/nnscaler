@@ -33,7 +33,8 @@ import nnscaler
 from .utils import sanitize_grad
 
 # Suppress AccumulateGrad stream mismatch warning in dual-stream mode.
-torch.autograd.graph.set_warn_on_accumulate_grad_stream_mismatch(False)
+if hasattr(torch.autograd.graph, 'set_warn_on_accumulate_grad_stream_mismatch'):
+    torch.autograd.graph.set_warn_on_accumulate_grad_stream_mismatch(False)
 
 _logger = logging.getLogger(__name__)
 
