@@ -131,6 +131,8 @@ def wrap_ring_attn_varlen_func(
         enable_ring: bool = True,
         use_cute:  bool = False,
         process_group: Tuple[int] = None,
+        max_seqlen_q: Optional[int] = None,
+        max_seqlen_k: Optional[int] = None,
 ):
     '''
     wrap the ring_attn_varlen_func to support the distributed training in nnScaler.
@@ -140,8 +142,10 @@ def wrap_ring_attn_varlen_func(
     required communications.
     '''
     assert not return_attn_probs, "return_attn_probs is not supported in ring-attention"
-    max_seqlen_q = (cu_seqlens_q[1:] - cu_seqlens_q[:-1]).max().item()
-    max_seqlen_k = (cu_seqlens_k[1:] - cu_seqlens_k[:-1]).max().item()
+    if max_seqlen_q is None:
+        max_seqlen_q = (cu_seqlens_q[1:] - cu_seqlens_q[:-1]).max().item()
+    if max_seqlen_k is None:
+        max_seqlen_k = (cu_seqlens_k[1:] - cu_seqlens_k[:-1]).max().item()
 
     if process_group is None or len(process_group) == 1 or not enable_ring:
         if use_cute:

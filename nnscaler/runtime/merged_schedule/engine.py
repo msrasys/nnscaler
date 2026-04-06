@@ -120,6 +120,10 @@ def _profile_report():
         _profile_data.clear()
         return
 
+    sequential = _profile_data[0].get('sequential', False)
+    phase_names = ['P1(b_combine||f_attn)', 'P2(b_expert||f_dispatch)',
+                   'P3(b_dispatch||f_expert)', 'P4(b_attn||f_combine)']
+
     # Compute timings from stored events
     records = []
     for raw in _profile_data:
@@ -127,45 +131,59 @@ def _profile_report():
         phases = []
         for pi in range(4):
             comp_ms = ce[pi].elapsed_time(ce[pi + 1])
-            comm_ms = me[pi].elapsed_time(me[pi + 1])
-            wall_ms = max(comp_ms, comm_ms)
-            phases.append({'comp_ms': comp_ms, 'comm_ms': comm_ms, 'wall_ms': wall_ms})
-        total_comp = sum(p['comp_ms'] for p in phases)
-        total_comm = sum(p['comm_ms'] for p in phases)
-        total_wall = max(ce[0].elapsed_time(ce[4]), me[0].elapsed_time(me[4]))
-        records.append({
-            'wall_ms': total_wall, 'comp_ms': total_comp, 'comm_ms': total_comm,
-            'phases': phases
-        })
+            if sequential:
+                # Both streams are the same; comp_ms == serialized total for this phase
+                phases.append({'total_ms': comp_ms})
+            else:
+                comm_ms = me[pi].elapsed_time(me[pi + 1])
+                wall_ms = max(comp_ms, comm_ms)
+                phases.append({'comp_ms': comp_ms, 'comm_ms': comm_ms, 'wall_ms': wall_ms})
+        if sequential:
+            total = sum(p['total_ms'] for p in phases)
+            records.append({'total_ms': total, 'phases': phases})
+        else:
+            total_comp = sum(p['comp_ms'] for p in phases)
+            total_comm = sum(p['comm_ms'] for p in phases)
+            total_wall = max(ce[0].elapsed_time(ce[4]), me[0].elapsed_time(me[4]))
+            records.append({
+                'wall_ms': total_wall, 'comp_ms': total_comp, 'comm_ms': total_comm,
+                'phases': phases
+            })
 
     n = len(records)
-    total_wall = sum(r['wall_ms'] for r in records)
-    total_comp = sum(r['comp_ms'] for r in records)
-    total_comm = sum(r['comm_ms'] for r in records)
-    avg_wall = total_wall / n
-    avg_comp = total_comp / n
-    avg_comm = total_comm / n
-    # Overlap = (comp + comm - wall) / wall; positive means streams overlap
-    avg_overlap_pct = (avg_comp + avg_comm - avg_wall) / avg_wall * 100 if avg_wall > 0 else 0
-    _logger.info(
-        f"[PROFILE] 4-phase merged step (n={n}): "
-        f"wall={avg_wall:.2f}ms, comp={avg_comp:.2f}ms, comm={avg_comm:.2f}ms, "
-        f"overlap={avg_overlap_pct:.1f}%"
-    )
-    # Per-phase breakdown
-    phase_names = ['P1(b_combine||f_attn)', 'P2(b_expert||f_dispatch)',
-                   'P3(b_dispatch||f_expert)', 'P4(b_attn||f_combine)']
-    for pi in range(4):
-        comp_times = [r['phases'][pi]['comp_ms'] for r in records]
-        comm_times = [r['phases'][pi]['comm_ms'] for r in records]
-        wall_times = [r['phases'][pi]['wall_ms'] for r in records]
-        ac = sum(comp_times) / n
-        am = sum(comm_times) / n
-        aw = sum(wall_times) / n
-        op = (ac + am - aw) / aw * 100 if aw > 0 else 0
+
+    if sequential:
+        avg_total = sum(r['total_ms'] for r in records) / n
         _logger.info(
-            f"  {phase_names[pi]}: wall={aw:.2f}ms comp={ac:.2f}ms comm={am:.2f}ms overlap={op:.1f}%"
+            f"[PROFILE-SEQ] merged step (n={n}): total={avg_total:.2f}ms (serialized, no overlap)"
         )
+        for pi in range(4):
+            avg_phase = sum(r['phases'][pi]['total_ms'] for r in records) / n
+            _logger.info(f"  {phase_names[pi]}: total={avg_phase:.2f}ms")
+    else:
+        total_wall = sum(r['wall_ms'] for r in records)
+        total_comp = sum(r['comp_ms'] for r in records)
+        total_comm = sum(r['comm_ms'] for r in records)
+        avg_wall = total_wall / n
+        avg_comp = total_comp / n
+        avg_comm = total_comm / n
+        avg_overlap_pct = (avg_comp + avg_comm - avg_wall) / avg_wall * 100 if avg_wall > 0 else 0
+        _logger.info(
+            f"[PROFILE] 4-phase merged step (n={n}): "
+            f"wall={avg_wall:.2f}ms, comp={avg_comp:.2f}ms, comm={avg_comm:.2f}ms, "
+            f"measured_overlap={avg_overlap_pct:.1f}%"
+        )
+        for pi in range(4):
+            comp_times = [r['phases'][pi]['comp_ms'] for r in records]
+            comm_times = [r['phases'][pi]['comm_ms'] for r in records]
+            wall_times = [r['phases'][pi]['wall_ms'] for r in records]
+            ac = sum(comp_times) / n
+            am = sum(comm_times) / n
+            aw = sum(wall_times) / n
+            op = (ac + am - aw) / aw * 100 if aw > 0 else 0
+            _logger.info(
+                f"  {phase_names[pi]}: wall={aw:.2f}ms comp={ac:.2f}ms comm={am:.2f}ms measured_overlap={op:.1f}%"
+            )
     _profile_data.clear()
 
 
@@ -1053,7 +1071,7 @@ class MergedScheduler:
         fwd_nodes = self._create_nodes_4(fwd_lc, fwd_event)
         fwd_attn, fwd_dispatch, fwd_expert, fwd_combine = fwd_nodes
 
-        profiling = _PROFILE_OVERLAP and not self.sequential_mode
+        profiling = bool(_PROFILE_OVERLAP)
         if profiling:
             comp_s, comm_s = get_comp_stream(), get_comm_stream()
             # 5 boundaries × 2 streams = 10 events (enable_timing for elapsed_time)
@@ -1153,7 +1171,7 @@ class MergedScheduler:
         if profiling:
             # Don't synchronize here - just store events for later analysis.
             # _profile_report() will be called after torch.cuda.synchronize() in run().
-            _profile_data.append({'ce': ce, 'me': me})
+            _profile_data.append({'ce': ce, 'me': me, 'sequential': self.sequential_mode})
 
         return fwd_h_out, grad_x, ('layer4', fwd_nodes)
 
