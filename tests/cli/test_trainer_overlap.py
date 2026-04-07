@@ -70,10 +70,13 @@ class AllToAllFunction(Function):
         return torch.cat(out, dim=0), None
 
 
-@register_op('*^ -> *^', 'all_to_all')
-def all_to_all(x: torch.Tensor) -> torch.Tensor:
+def all_to_all_fake(x: torch.Tensor) -> torch.Tensor:
     return x
-    # return AllToAllFunction.apply(x)
+
+
+@register_op('*^ -> *^', 'all_to_all', fake_fn=all_to_all_fake)
+def all_to_all(x: torch.Tensor) -> torch.Tensor:
+    return AllToAllFunction.apply(x)
 
 
 # ============================================================================
@@ -136,7 +139,7 @@ class OutputHead(nn.Module):
 # ============================================================================
 #  Segmented model wrapper
 # ============================================================================
-class TonyModel(nn.Module):
+class ToyModel(nn.Module):
     def __init__(self):
         super().__init__()
         # manually define segments for simplicity
@@ -163,6 +166,9 @@ def toy_policy(graph, cfg):
     Segment assignment for the toy model.
     """
     from nnscaler.policies import OpPlan
+
+    if cfg.use_async_reducer:
+        raise ValueError("Overlapping does not support async reducer.")
 
     for node in get_pas_ops(graph):
         if InputProj in node.module_class_chain or not node.module_class_chain:
@@ -238,7 +244,7 @@ def sched_overlap(graph: IRGraph, num_microbatches: int, num_stages: int) -> Sch
             stream_context=StreamContext(stream='comp',wait_streams=['comm'], record_event=forward_event)
         )
 
-        # Phase 2-5: overlapping pairs with GPU barrier between them
+        # Phase 2-5: overlapping pairs
         for fwd_s, bwd_s in [(1, 4), (2, 3), (3, 2), (4, 1)]:
             sid += 1
             sched.add_segment(fsegs[fwd_s], micro_idx, step=sid,
