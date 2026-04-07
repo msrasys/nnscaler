@@ -696,14 +696,19 @@ class MergedScheduler:
 
             _logger.info(f"[MERGED] bwd(mb{mb_i}) + fwd(mb{mb_i+1})")
 
+            # Launch embed on COMM — overlaps with loss_bwd on COMP.
+            # embed_fn only reads sample data + embedding weight, independent of COMP.
+            with torch.cuda.stream(get_comm_stream()):
+                fwd_h = embed_fn(fwd_sample)
+
+            # Loss backward on COMP — overlaps with embed on COMM
             with nnscaler.sync_grad_when(False):
                 grad_h = prev_loss_node.backward(loss_grad)
 
             prev_loss_node._release()
             tb.mark(f"mb{mb_i}_loss_bwd")
 
-            with torch.cuda.stream(get_comp_stream()):
-                fwd_h = embed_fn(fwd_sample)
+            # Create layer callables (CPU work, overlaps with GPU)
             fwd_lc_list = []
             for si in range(num_steps):
                 fwd_lc_list.append(layer_callables_fn(si, fwd_sample))
@@ -715,6 +720,9 @@ class MergedScheduler:
 
             bwd_idx = num_steps - 1
             fwd_idx = 0
+
+            # (4) Sync COMM→COMP: embed result available for forward layers
+            self._sync_comm_to_comp()
 
             while fwd_idx < num_steps and bwd_idx >= 0:
                 fwd_lc = fwd_lc_list[fwd_idx]
