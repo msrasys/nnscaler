@@ -36,6 +36,7 @@ def wrap_sliding_window_attn_func(
         window_size: Tuple[int] = (-1, -1),
         deterministic: bool = False,
         return_attn_probs: bool = False,
+        enable_ring: bool = True,
         use_cute: bool = False,
         process_group: Tuple[int] = None,
 ):
@@ -55,7 +56,7 @@ def wrap_sliding_window_attn_func(
     max_seqlen_q = (cu_seqlens_q[1:] - cu_seqlens_q[:-1]).max().item()
     max_seqlen_k = (cu_seqlens_k[1:] - cu_seqlens_k[:-1]).max().item()
 
-    if process_group is None or len(process_group) == 1:
+    if process_group is None or len(process_group) == 1 or not enable_ring:
         if use_cute:
             assert flash_attn_cute_varlen_func is not None, "flash_attn.cute is not available"
             cute_window_size = tuple(None if w == -1 else w for w in window_size)

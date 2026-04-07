@@ -37,6 +37,7 @@ def wrap_zigzag_allgather_attn_varlen_func(
     window_size: Tuple[int] = (-1, -1),
     deterministic: bool = False,
     return_attn_probs: bool = False,
+    enable_ring: bool = True,
     use_cute: bool = False,
     process_group: Tuple[int] = None,
 ):
@@ -45,7 +46,7 @@ def wrap_zigzag_allgather_attn_varlen_func(
     max_seqlen_q = (cu_seqlens_q[1:] - cu_seqlens_q[:-1]).max().item()
     max_seqlen_k = (cu_seqlens_k[1:] - cu_seqlens_k[:-1]).max().item()
 
-    if process_group is None or len(process_group) == 1:
+    if process_group is None or len(process_group) == 1 or not enable_ring:
         if use_cute:
             assert flash_attn_cute_varlen_func is not None, "flash_attn.cute is not available"
             output, _ = flash_attn_cute_varlen_func(
@@ -78,17 +79,13 @@ def wrap_zigzag_allgather_attn_varlen_func(
             return_attn_probs=False,
         )
 
-    local_process_group = DeviceGroup().get_group(process_group)
-    if local_process_group is None:
-        local_process_group = dist.group.WORLD
-
     return zigzag_allgather_attn_varlen_func(
         q,
         k,
         v,
         cu_seqlens_q,
         cu_seqlens_k,
-        process_group=local_process_group,
+        process_group=process_group,
         dropout_p=dropout_p,
         softmax_scale=softmax_scale,
         causal=causal,
