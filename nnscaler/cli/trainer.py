@@ -259,9 +259,9 @@ class Trainer:
         if check_status:
             for i in range(1, len(state_dicts)):
                 if state_dicts[i]['train_args'] != state_dicts[0]['train_args']:
-                    raise ValueError(f"train_args in {checkpoint_files[i]} is different from {checkpoint_files[0]}")
+                    print(f"train_args in {checkpoint_files[i]} is different from {checkpoint_files[0]}")
                 if state_dicts[i].get('lr_scheduler', None) != state_dicts[0].get('lr_scheduler', None):
-                    raise ValueError(f"lr_scheduler state in {checkpoint_files[i]} is different from {checkpoint_files[0]}")
+                    print(f"lr_scheduler state in {checkpoint_files[i]} is different from {checkpoint_files[0]}")
 
         module_state_dict, opt_state_dict = nnscaler.merge_state_dicts(
             [s['model'] for s in state_dicts],
