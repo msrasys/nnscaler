@@ -21,6 +21,7 @@ Dense layers use 2 ScheduleNodes (attn, ffn) both on COMP stream.
 
 import logging
 import os
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Callable
@@ -42,10 +43,16 @@ _COMP_STREAM = None   # computation stream (default stream)
 _COMM_STREAM = None   # communication stream (side stream)
 _IN_RECOMPUTE = False  # Flag: True when inside ScheduleNode checkpoint recompute
 _SEQUENTIAL_MODE = False  # Flag: skip stream/event ops in sequential mode
-_PROFILE_OVERLAP = bool(os.environ.get('PROFILE_OVERLAP'))
+_PROFILE_OVERLAP = os.environ.get('PROFILE_OVERLAP', '0') not in ('0', '')
 _profile_data = []  # collected per merged-step timing records
-_TIMING_BREAKDOWN = bool(os.environ.get('TIMING_BREAKDOWN'))
+_TIMING_BREAKDOWN = os.environ.get('TIMING_BREAKDOWN', '0') not in ('0', '')
 _LAYER_CHECKSUM = bool(os.environ.get('LAYER_CHECKSUM'))
+
+# Layer-level torch profiler: only profile specified layers
+_PROFILE_LAYERS = set()
+_pl_str = os.environ.get('TORCH_PROFILE_LAYERS', '')
+if _pl_str:
+    _PROFILE_LAYERS = {int(x.strip()) for x in _pl_str.split(',') if x.strip()}
 
 
 def _log_checksum(tag, tensor):
@@ -58,6 +65,44 @@ def _log_checksum(tag, tensor):
         n = t.norm().item()
         mx = t.abs().max().item()
     _logger.info(f"[CHECKSUM] {tag} sum={s:.15e} norm={n:.15e} max={mx:.15e}")
+
+
+class _LayerProfiler:
+    """Per-layer torch profiler.  Each start/stop pair produces one trace file."""
+
+    def __init__(self, target_layers, output_dir):
+        self.target_layers = target_layers
+        self.output_dir = output_dir
+        self._prof = None
+        self._tag = None
+
+    def should_profile(self, layer_idx):
+        return layer_idx in self.target_layers
+
+    def start(self, tag):
+        os.makedirs(self.output_dir, exist_ok=True)
+        self._tag = tag
+        self._prof = torch.profiler.profile(
+            activities=[
+                torch.profiler.ProfilerActivity.CPU,
+                torch.profiler.ProfilerActivity.CUDA,
+            ],
+            record_shapes=True,
+            with_stack=True,
+            with_flops=True,
+        )
+        self._prof.__enter__()
+
+    def stop(self):
+        if self._prof is None:
+            return
+        self._prof.__exit__(None, None, None)
+        import torch.distributed as _dist
+        rank = _dist.get_rank() if _dist.is_initialized() else 0
+        path = os.path.join(self.output_dir, f"{self._tag}_rank{rank}.json")
+        self._prof.export_chrome_trace(path)
+        _logger.info(f"[LAYER_PROFILE] {path}")
+        self._prof = None
 
 
 class _TimingCtx:
@@ -543,6 +588,13 @@ class MergedScheduler:
         self.use_checkpoint = use_checkpoint
         self._use_4node = True
 
+        # Async overlap: launch COMM and COMP ops from separate CPU threads
+        # so their kernel launches can interleave, enabling true GPU overlap.
+        # Controlled by ASYNC_4PHASE env var (default=1, set 0 to disable).
+        _async_on = (not sequential_mode
+                     and os.environ.get('ASYNC_4PHASE', '1') not in ('0', ''))
+        self._async_pool = ThreadPoolExecutor(max_workers=1) if _async_on else None
+
         # Pre-allocate CUDA events for cross-stream synchronization.
         # Using separate events per barrier slot avoids re-recording while
         # a previous wait may still be pending (undefined behavior per CUDA spec).
@@ -590,6 +642,22 @@ class MergedScheduler:
         num_steps = self.num_layers
         events = [torch.cuda.Event() for _ in range(num_mbs)]
         results = [None] * num_mbs
+
+        # Layer-level profiler: only active on target step + target layers
+        self._layer_profiler = None
+        if _PROFILE_LAYERS:
+            self._run_count = getattr(self, '_run_count', 0) + 1
+            _target_step = int(os.environ.get('TORCH_PROFILE_STEP', '0'))
+            if _target_step > 0 and self._run_count == _target_step:
+                import torch.distributed as _dist
+                rank = _dist.get_rank() if _dist.is_initialized() else 0
+                if rank == 0:
+                    self._layer_profiler = _LayerProfiler(
+                        _PROFILE_LAYERS,
+                        os.environ.get('TORCH_PROFILE_DIR', '/tmp/torch_profile'))
+                    _logger.info(
+                        f"[LAYER_PROFILE] Step {_target_step}: profiling layers "
+                        f"{sorted(_PROFILE_LAYERS)}")
 
         _logger.info("Warmup: forward mb0")
         with torch.cuda.stream(get_comp_stream()):
@@ -675,9 +743,19 @@ class MergedScheduler:
                     continue
 
                 with nnscaler.sync_grad_when(False):
+                    lp = self._layer_profiler
+                    _do_lp = lp and (lp.should_profile(fwd_idx) or lp.should_profile(bwd_idx))
+                    if _do_lp:
+                        torch.cuda.synchronize()
+                        lp.start(f"merged_mb{mb_i}_fwd{fwd_idx}_bwd{bwd_idx}")
+
                     fwd_h, grad_h, fwd_entry = self._merged_step_general(
                         bwd_entry, fwd_lc, fwd_event, grad_h, fwd_h,
                         fwd_layer_idx=fwd_idx, bwd_layer_idx=bwd_idx)
+
+                    if _do_lp:
+                        torch.cuda.synchronize()
+                        lp.stop()
 
                 prev_all_nodes[bwd_idx] = None
 
@@ -768,7 +846,15 @@ class MergedScheduler:
                     continue
                 if entry is None:
                     continue
+                lp = self._layer_profiler
+                _do_lp = lp and lp.should_profile(i)
+                if _do_lp:
+                    torch.cuda.synchronize()
+                    lp.start(f"cooldown_bwd_layer{i}")
                 grad_h = self._backward_entry(entry, grad_h)
+                if _do_lp:
+                    torch.cuda.synchronize()
+                    lp.stop()
         tb.mark("cooldown_bwd")
 
         if _PROFILE_OVERLAP:
@@ -796,6 +882,8 @@ class MergedScheduler:
                 )
 
         del prev_all_nodes, prev_loss_node
+
+        self._layer_profiler = None
 
         tb.report("MERGED SCHEDULER BREAKDOWN")
 
@@ -908,6 +996,12 @@ class MergedScheduler:
         expert_probs = []
 
         for si, lc in enumerate(lc_list):
+            lp = self._layer_profiler
+            _do_lp = lp and lp.should_profile(si)
+            if _do_lp:
+                torch.cuda.synchronize()
+                lp.start(f"warmup_fwd_layer{si}")
+
             if lc.is_special:
                 # Sync COMM→COMP: previous MoE layer's combine ran on COMM,
                 # special_forward runs on COMP and needs the COMM-produced h.
@@ -915,6 +1009,9 @@ class MergedScheduler:
                 with torch.cuda.stream(get_comp_stream()):
                     h, special_data = lc.special_forward(h)
                 all_nodes.append(('special', lc))
+                if _do_lp:
+                    torch.cuda.synchronize()
+                    lp.stop()
                 continue
 
             if lc.is_moe and self._use_4node:
@@ -939,6 +1036,10 @@ class MergedScheduler:
 
             _log_checksum(f"merged layer={si}", h)
             all_nodes.append(entry)
+
+            if _do_lp:
+                torch.cuda.synchronize()
+                lp.stop()
 
         return h, all_nodes, routing_maps, expert_probs
 
@@ -1066,10 +1167,16 @@ class MergedScheduler:
         Phase 2: b_expert    (COMP) || f_dispatch (COMM)
         Phase 3: f_expert    (COMP) || b_dispatch (COMM)
         Phase 4: b_attn      (COMP) || f_combine  (COMM)
+
+        Async overlap: COMM and COMP ops within each phase are launched from
+        separate CPU threads so their kernel launches interleave, enabling
+        true GPU-side overlap instead of CPU-serialized submission.
         """
         bwd_attn, bwd_dispatch, bwd_expert, bwd_combine = bwd_nodes
         fwd_nodes = self._create_nodes_4(fwd_lc, fwd_event)
         fwd_attn, fwd_dispatch, fwd_expert, fwd_combine = fwd_nodes
+
+        pool = self._async_pool  # None in sequential mode
 
         profiling = bool(_PROFILE_OVERLAP)
         if profiling:
@@ -1101,12 +1208,18 @@ class MergedScheduler:
                 ce[0].record(comp_s)
                 me[0].record(comm_s)
 
-            # Phase 1: COMM || COMP (submit COMM first for GPU head start)
-            # COMM: queue combine backward (quick to submit, starts on GPU immediately)
-            # COMP: queue attention + gate + routing + D2H precompute (D2H blocks host,
-            #       but COMM kernels are already running on GPU during the wait)
-            combine_grads = bwd_combine.backward(grad_h)
-            fwd_attn_out = fwd_attn.forward((fwd_h,))
+            # Phase 1: COMM(b_combine) || COMP(f_attn_router)
+            # Launch COMM backward in background thread, main thread does COMP forward.
+            # torch.cuda.stream() is thread-local so each thread targets its own stream.
+            # GIL is released during CUDA kernel launches (C++ layer), enabling true
+            # concurrent kernel submission to different streams.
+            if pool is not None:
+                fut_combine = pool.submit(bwd_combine.backward, grad_h)
+                fwd_attn_out = fwd_attn.forward((fwd_h,))
+                combine_grads = fut_combine.result()
+            else:
+                combine_grads = bwd_combine.backward(grad_h)
+                fwd_attn_out = fwd_attn.forward((fwd_h,))
             fwd_h_residual, fwd_h_ln, fwd_routing_probs = fwd_attn_out
 
             if profiling:
@@ -1117,9 +1230,14 @@ class MergedScheduler:
             # Phase 2 COMM needs COMP output (attn_out + precomputed metadata)
             self._cross_stream_barrier(slot=0)
 
-            # Phase 2: COMM || COMP (submit COMM first)
-            fwd_dispatch_out = fwd_dispatch.forward((fwd_h_ln, fwd_routing_probs))
-            expert_grads = bwd_expert.backward(combine_grads[0])
+            # Phase 2: COMM(f_dispatch) || COMP(b_expert)
+            if pool is not None:
+                fut_dispatch = pool.submit(fwd_dispatch.forward, (fwd_h_ln, fwd_routing_probs))
+                expert_grads = bwd_expert.backward(combine_grads[0])
+                fwd_dispatch_out = fut_dispatch.result()
+            else:
+                fwd_dispatch_out = fwd_dispatch.forward((fwd_h_ln, fwd_routing_probs))
+                expert_grads = bwd_expert.backward(combine_grads[0])
 
             if profiling:
                 ce[2].record(comp_s)
@@ -1129,9 +1247,14 @@ class MergedScheduler:
             # Phase 3 COMM needs COMP output (expert_grads)
             self._cross_stream_barrier(slot=1)
 
-            # Phase 3: COMM || COMP (submit COMM first)
-            dispatch_grads = bwd_dispatch.backward(expert_grads)
-            fwd_expert_out = fwd_expert.forward(fwd_dispatch_out)
+            # Phase 3: COMM(b_dispatch) || COMP(f_expert)
+            if pool is not None:
+                fut_dispatch_bwd = pool.submit(bwd_dispatch.backward, expert_grads)
+                fwd_expert_out = fwd_expert.forward(fwd_dispatch_out)
+                dispatch_grads = fut_dispatch_bwd.result()
+            else:
+                dispatch_grads = bwd_dispatch.backward(expert_grads)
+                fwd_expert_out = fwd_expert.forward(fwd_dispatch_out)
 
             if profiling:
                 ce[3].record(comp_s)
@@ -1141,14 +1264,22 @@ class MergedScheduler:
             # Phase 4 COMM needs COMP output (expert_out)
             self._cross_stream_barrier(slot=2)
 
-            # Phase 4: COMM || COMP (submit COMM first)
-            # COMM combine doesn't need grad computation, submit immediately
-            fwd_h_out = fwd_combine.forward((fwd_expert_out, fwd_h_residual, fwd_h_ln))
-            # Record COMM-produced grads for direct COMP-side access (outside ScheduleNode)
-            self._record_for_comp(dispatch_grads)
-            self._record_for_comp(combine_grads)
-            grad_h_ln_total = dispatch_grads[0] + combine_grads[2]
-            grad_x = bwd_attn.backward((combine_grads[1], grad_h_ln_total, dispatch_grads[1]))
+            # Phase 4: COMM(f_combine) || COMP(b_attn)
+            if pool is not None:
+                fut_combine_fwd = pool.submit(fwd_combine.forward,
+                                              (fwd_expert_out, fwd_h_residual, fwd_h_ln))
+                # Prep for bwd_attn while combine runs in background
+                self._record_for_comp(dispatch_grads)
+                self._record_for_comp(combine_grads)
+                grad_h_ln_total = dispatch_grads[0] + combine_grads[2]
+                grad_x = bwd_attn.backward((combine_grads[1], grad_h_ln_total, dispatch_grads[1]))
+                fwd_h_out = fut_combine_fwd.result()
+            else:
+                fwd_h_out = fwd_combine.forward((fwd_expert_out, fwd_h_residual, fwd_h_ln))
+                self._record_for_comp(dispatch_grads)
+                self._record_for_comp(combine_grads)
+                grad_h_ln_total = dispatch_grads[0] + combine_grads[2]
+                grad_x = bwd_attn.backward((combine_grads[1], grad_h_ln_total, dispatch_grads[1]))
 
             if profiling:
                 ce[4].record(comp_s)
