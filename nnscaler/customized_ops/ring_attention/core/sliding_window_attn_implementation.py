@@ -154,10 +154,12 @@ def _all_to_all_varlen(
 ) -> torch.Tensor:
     """All-to-all with variable split sizes along dim 0."""
     output_size = sum(output_split_sizes)
-    output = tensor.new_empty(output_size, *tensor.shape[1:])
-    dist.all_to_all(
-        list(output.split(output_split_sizes)),
-        list(tensor.split(input_split_sizes)),
+    output = tensor.new_empty(output_size, *tensor.shape[1:]).contiguous()
+    dist.all_to_all_single(
+        output,
+        tensor.contiguous(),
+        output_split_sizes=output_split_sizes,
+        input_split_sizes=input_split_sizes,
         group=group,
     )
     return output
