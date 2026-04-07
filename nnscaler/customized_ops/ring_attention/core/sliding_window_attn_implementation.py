@@ -142,7 +142,7 @@ def _p2p_communicate_kv(
     v: torch.Tensor,
     metadata: SlidingWindowMetadata,
     group: dist.ProcessGroup,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     P2P send/recv of KV tokens between neighboring ranks.
 
@@ -280,7 +280,7 @@ def sliding_window_forward(
     alibi_slopes: Optional[torch.Tensor] = None,
     deterministic: bool = False,
     use_cute: bool = False,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Forward pass for sliding window CP attention.
 
@@ -342,15 +342,15 @@ def sliding_window_forward(
             assert len(outputs) == 4
             out, lse, _, _ = outputs
 
-    return out, lse
+    return out, lse, extended_k, extended_v
 
 
 def sliding_window_backward(
     process_group: dist.ProcessGroup,
     dout: torch.Tensor,
     q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
+    extended_k: torch.Tensor,
+    extended_v: torch.Tensor,
     out: torch.Tensor,
     softmax_lse: torch.Tensor,
     metadata: SlidingWindowMetadata,
@@ -364,16 +364,13 @@ def sliding_window_backward(
     """
     Backward pass for sliding window CP attention.
 
-    1. Re-do P2P to reconstruct extended K/V.
-    2. flash_attn backward → dq, dk_extended, dv_extended.
+    1. Reuse extended K/V cached from forward.
+    2. flash_attn backward -> dq, dk_extended, dv_extended.
     3. P2P send dk_recv back to prev rank, recv dk_from_next from next rank.
     4. Accumulate gradient for sent tokens.
     """
     recv_size = metadata.recv_size
     send_size = metadata.send_size
-
-    # Step 1: Re-communicate KV
-    extended_k, extended_v = _p2p_communicate_kv(k, v, metadata, process_group)
 
     cu_seqlens_q = metadata.cu_seqlens_q
     cu_seqlens_k = metadata.cu_seqlens_k
@@ -484,7 +481,7 @@ class SlidingWindowAttnFunc(torch.autograd.Function):
         k = k.contiguous()
         v = v.contiguous()
 
-        out, softmax_lse = sliding_window_forward(
+        out, softmax_lse, extended_k, extended_v = sliding_window_forward(
             group,
             q,
             k,
@@ -498,8 +495,8 @@ class SlidingWindowAttnFunc(torch.autograd.Function):
             use_cute=use_cute,
         )
 
-        ctx.save_for_backward(q, k, v, out, softmax_lse, cu_seqlens_q, cu_seqlens_k)
-        ctx.metadata = metadata
+        ctx.save_for_backward(q, extended_k, extended_v, out, softmax_lse)
+        ctx.attn_metadata = metadata
         ctx.dropout_p = dropout_p
         ctx.softmax_scale = softmax_scale
         ctx.window_size = window_size
@@ -511,16 +508,16 @@ class SlidingWindowAttnFunc(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, dout, *args):  # pragma: no cover
-        q, k, v, out, softmax_lse, cu_seqlens_q, cu_seqlens_k = ctx.saved_tensors
+        q, extended_k, extended_v, out, softmax_lse = ctx.saved_tensors
         dq, dk, dv = sliding_window_backward(
             ctx.group,
             dout,
             q,
-            k,
-            v,
+            extended_k,
+            extended_v,
             out,
             softmax_lse,
-            ctx.metadata,
+            ctx.attn_metadata,
             softmax_scale=ctx.softmax_scale,
             dropout_p=ctx.dropout_p,
             window_size=ctx.window_size,
