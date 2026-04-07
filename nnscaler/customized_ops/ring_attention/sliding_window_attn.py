@@ -41,7 +41,7 @@ def wrap_sliding_window_attn_func(
         process_group: Tuple[int] = None,
 ):
     '''
-    Context parallel sliding window attention using single-hop P2P communication.
+    Context parallel sliding window attention using single-hop A2A communication.
 
     Only fetches min(offset_in_seq, window_size_left) KV tokens from the
     previous rank instead of all_gather, then performs a single flash_attn
@@ -50,7 +50,7 @@ def wrap_sliding_window_attn_func(
     Constraints:
     - causal must be True
     - window_size[0] > 0 (must have a left sliding window)
-    - window_size[0] <= length_per_rank (single-hop P2P)
+    - window_size[0] <= length_per_rank (single-hop communication)
     '''
     assert not return_attn_probs, "return_attn_probs is not supported"
     max_seqlen_q = (cu_seqlens_q[1:] - cu_seqlens_q[:-1]).max().item()

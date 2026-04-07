@@ -6,13 +6,13 @@ Context Parallel Sliding Window Attention Implementation.
 
 Key insight: For causal sliding window attention, each rank only needs
 min(offset_in_seq, window_size_left) KV tokens from the previous rank,
-not a full all_gather. This enables efficient single-hop P2P communication
+not a full all_gather. This enables efficient single-hop A2A communication
 and a single flash_attn computation (no ring loop).
 """
 
 from dataclasses import dataclass
 from collections import OrderedDict
-from typing import Tuple, Optional
+from typing import Tuple, Optional, List
 
 import torch
 import torch.distributed as dist
@@ -36,8 +36,8 @@ class SlidingWindowMetadata:
     cu_seqlens_k: torch.Tensor
     max_seqlen_q: int
     max_seqlen_k: int
-    recv_size: int   # tokens to receive from prev rank
-    send_size: int   # tokens to send to next rank
+    input_split_sizes: List[int]   # forward A2A send splits
+    output_split_sizes: List[int]  # forward A2A recv splits
 
 
 # Global cache: avoids recomputing metadata every layer
@@ -65,7 +65,7 @@ def prepare_sliding_window_metadata(
 
     Returns:
         SlidingWindowMetadata with local cu_seqlens_q, cu_seqlens_k,
-        and communication sizes.
+        and cached A2A split sizes.
     """
     cache_key = _make_cache_key(cu_seqlens, window_size_left, rank, world_size)
     if cache_key in _METADATA_CACHE:
@@ -78,7 +78,7 @@ def prepare_sliding_window_metadata(
     length_per_rank = total_length // world_size
     assert window_size_left <= length_per_rank, (
         f"window_size_left {window_size_left} must be <= length_per_rank {length_per_rank}. "
-        f"Multi-hop P2P is not supported."
+        f"Multi-hop communication is not supported."
     )
 
     chunk_start = rank * length_per_rank
@@ -120,6 +120,15 @@ def prepare_sliding_window_metadata(
             offset_in_seq = next_chunk_start - cu_seqlens[right_idx - 1].item()
             send_size = min(offset_in_seq, window_size_left)
 
+    prev_rank = rank - 1 if rank > 0 else None
+    next_rank = rank + 1 if rank < world_size - 1 else None
+    input_split_sizes = [0] * world_size
+    output_split_sizes = [0] * world_size
+    if send_size > 0 and next_rank is not None:
+        input_split_sizes[next_rank] = send_size
+    if recv_size > 0 and prev_rank is not None:
+        output_split_sizes[prev_rank] = recv_size
+
     max_seqlen_q = (cu_seqlens_q[1:] - cu_seqlens_q[:-1]).max().item()
     max_seqlen_k = (cu_seqlens_k[1:] - cu_seqlens_k[:-1]).max().item()
 
@@ -128,8 +137,8 @@ def prepare_sliding_window_metadata(
         cu_seqlens_k=cu_seqlens_k,
         max_seqlen_q=max_seqlen_q,
         max_seqlen_k=max_seqlen_k,
-        recv_size=recv_size,
-        send_size=send_size,
+        input_split_sizes=input_split_sizes,
+        output_split_sizes=output_split_sizes,
     )
     if len(_METADATA_CACHE) >= _METADATA_CACHE_MAXSIZE:
         _METADATA_CACHE.popitem(last=False)
@@ -137,14 +146,31 @@ def prepare_sliding_window_metadata(
     return metadata
 
 
-def _p2p_communicate_kv(
+def _all_to_all_varlen(
+    tensor: torch.Tensor,
+    input_split_sizes: List[int],
+    output_split_sizes: List[int],
+    group: dist.ProcessGroup,
+) -> torch.Tensor:
+    """All-to-all with variable split sizes along dim 0."""
+    output_size = sum(output_split_sizes)
+    output = tensor.new_empty(output_size, *tensor.shape[1:])
+    dist.all_to_all(
+        list(output.split(output_split_sizes)),
+        list(tensor.split(input_split_sizes)),
+        group=group,
+    )
+    return output
+
+
+def _a2a_communicate_kv(
     k: torch.Tensor,
     v: torch.Tensor,
     metadata: SlidingWindowMetadata,
     group: dist.ProcessGroup,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
-    P2P send/recv of KV tokens between neighboring ranks.
+    A2A send/recv of KV tokens between neighboring ranks.
 
     - Sends last send_size tokens of k/v to next rank.
     - Receives recv_size tokens of k/v from prev rank.
@@ -152,51 +178,21 @@ def _p2p_communicate_kv(
     Returns:
         (extended_k, extended_v) with received tokens prepended.
     """
-    rank = dist.get_rank(group)
-    world_size = dist.get_world_size(group)
-    recv_size = metadata.recv_size
-    send_size = metadata.send_size
-
-    # Compute absolute ranks for P2P (handle process group rank → global rank)
-    offset = (dist.get_rank() // world_size) * world_size
-    prev_rank = rank - 1 + offset if rank > 0 else None
-    next_rank = rank + 1 + offset if rank < world_size - 1 else None
-
-    # Prepare recv buffers
-    if recv_size > 0:
-        recv_k = torch.empty(
-            (recv_size, k.shape[1], k.shape[2]),
-            dtype=k.dtype, device=k.device,
-        )
-        recv_v = torch.empty(
-            (recv_size, v.shape[1], v.shape[2]),
-            dtype=v.dtype, device=v.device,
-        )
-    else:
-        recv_k = None
-        recv_v = None
+    input_split_sizes = metadata.input_split_sizes
+    output_split_sizes = metadata.output_split_sizes
+    send_size = sum(input_split_sizes)
+    recv_size = sum(output_split_sizes)
 
     # Prepare send buffers
     if send_size > 0:
         send_k = k[-send_size:].contiguous()
         send_v = v[-send_size:].contiguous()
     else:
-        send_k = None
-        send_v = None
+        send_k = k.new_empty((0, k.shape[1], k.shape[2]))
+        send_v = v.new_empty((0, v.shape[1], v.shape[2]))
 
-    # Batch P2P operations
-    ops = []
-    if send_size > 0 and next_rank is not None:
-        ops.append(dist.P2POp(dist.isend, send_k, next_rank, group=group))
-        ops.append(dist.P2POp(dist.isend, send_v, next_rank, group=group))
-    if recv_size > 0 and prev_rank is not None:
-        ops.append(dist.P2POp(dist.irecv, recv_k, prev_rank, group=group))
-        ops.append(dist.P2POp(dist.irecv, recv_v, prev_rank, group=group))
-
-    if ops:
-        reqs = dist.batch_isend_irecv(ops)
-        for req in reqs:
-            req.wait()
+    recv_k = _all_to_all_varlen(send_k, input_split_sizes, output_split_sizes, group)
+    recv_v = _all_to_all_varlen(send_v, input_split_sizes, output_split_sizes, group)
 
     # Construct extended K/V
     if recv_size > 0:
@@ -209,7 +205,7 @@ def _p2p_communicate_kv(
     return extended_k, extended_v
 
 
-def _p2p_communicate_grad(
+def _a2a_communicate_grad(
     dk_recv: Optional[torch.Tensor],
     dv_recv: Optional[torch.Tensor],
     dk_local: torch.Tensor,
@@ -218,7 +214,7 @@ def _p2p_communicate_grad(
     group: dist.ProcessGroup,
 ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
     """
-    P2P send/recv of KV gradients (reverse direction from forward).
+    A2A send/recv of KV gradients (reverse direction from forward).
 
     - Sends dk_recv/dv_recv back to prev rank (gradient for received tokens).
     - Receives dk_sent/dv_sent from next rank (gradient for sent tokens).
@@ -226,44 +222,25 @@ def _p2p_communicate_grad(
     Returns:
         (dk_from_next, dv_from_next) or (None, None) if send_size == 0.
     """
-    rank = dist.get_rank(group)
-    world_size = dist.get_world_size(group)
-    recv_size = metadata.recv_size
-    send_size = metadata.send_size
+    # Backward direction is reverse of forward:
+    # send grad-for-recv to prev, recv grad-for-send from next.
+    input_split_sizes = metadata.output_split_sizes
+    output_split_sizes = metadata.input_split_sizes
+    recv_size = sum(input_split_sizes)
+    send_size = sum(output_split_sizes)
 
-    offset = (dist.get_rank() // world_size) * world_size
-    prev_rank = rank - 1 + offset if rank > 0 else None
-    next_rank = rank + 1 + offset if rank < world_size - 1 else None
-
-    # Prepare recv buffers for gradients coming from next rank
-    # Use dk_local's dtype/device as reference (always available)
-    if send_size > 0:
-        dk_from_next = torch.empty(
-            (send_size, dk_local.shape[1], dk_local.shape[2]),
-            dtype=dk_local.dtype, device=dk_local.device,
-        )
-        dv_from_next = torch.empty(
-            (send_size, dv_local.shape[1], dv_local.shape[2]),
-            dtype=dv_local.dtype, device=dv_local.device,
-        )
+    if recv_size > 0 and dk_recv is not None:
+        send_dk = dk_recv.contiguous()
+        send_dv = dv_recv.contiguous()
     else:
+        send_dk = dk_local.new_empty((0, dk_local.shape[1], dk_local.shape[2]))
+        send_dv = dv_local.new_empty((0, dv_local.shape[1], dv_local.shape[2]))
+
+    dk_from_next = _all_to_all_varlen(send_dk, input_split_sizes, output_split_sizes, group)
+    dv_from_next = _all_to_all_varlen(send_dv, input_split_sizes, output_split_sizes, group)
+    if send_size == 0:
         dk_from_next = None
         dv_from_next = None
-
-    ops = []
-    # Send gradients for received tokens back to prev rank
-    if recv_size > 0 and prev_rank is not None and dk_recv is not None:
-        ops.append(dist.P2POp(dist.isend, dk_recv.contiguous(), prev_rank, group=group))
-        ops.append(dist.P2POp(dist.isend, dv_recv.contiguous(), prev_rank, group=group))
-    # Receive gradients for sent tokens from next rank
-    if send_size > 0 and next_rank is not None:
-        ops.append(dist.P2POp(dist.irecv, dk_from_next, next_rank, group=group))
-        ops.append(dist.P2POp(dist.irecv, dv_from_next, next_rank, group=group))
-
-    if ops:
-        reqs = dist.batch_isend_irecv(ops)
-        for req in reqs:
-            req.wait()
 
     return dk_from_next, dv_from_next
 
@@ -284,11 +261,11 @@ def sliding_window_forward(
     """
     Forward pass for sliding window CP attention.
 
-    1. P2P communicate KV with neighboring ranks.
+    1. A2A communicate KV with neighboring ranks.
     2. Single flash_attn_varlen call with extended K/V.
     """
-    # Step 1: P2P communication
-    extended_k, extended_v = _p2p_communicate_kv(k, v, metadata, process_group)
+    # Step 1: A2A communication
+    extended_k, extended_v = _a2a_communicate_kv(k, v, metadata, process_group)
 
     cu_seqlens_q = metadata.cu_seqlens_q
     cu_seqlens_k = metadata.cu_seqlens_k
@@ -366,11 +343,11 @@ def sliding_window_backward(
 
     1. Reuse extended K/V cached from forward.
     2. flash_attn backward -> dq, dk_extended, dv_extended.
-    3. P2P send dk_recv back to prev rank, recv dk_from_next from next rank.
+    3. A2A send dk_recv back to prev rank, recv dk_from_next from next rank.
     4. Accumulate gradient for sent tokens.
     """
-    recv_size = metadata.recv_size
-    send_size = metadata.send_size
+    recv_size = sum(metadata.output_split_sizes)
+    send_size = sum(metadata.input_split_sizes)
 
     cu_seqlens_q = metadata.cu_seqlens_q
     cu_seqlens_k = metadata.cu_seqlens_k
@@ -443,8 +420,8 @@ def sliding_window_backward(
     dv_recv = dv_extended[:recv_size] if recv_size > 0 else None
     dv_local = dv_extended[recv_size:]
 
-    # Step 4: P2P gradient communication (reverse direction)
-    dk_from_next, dv_from_next = _p2p_communicate_grad(
+    # Step 4: A2A gradient communication (reverse direction)
+    dk_from_next, dv_from_next = _a2a_communicate_grad(
         dk_recv, dv_recv, dk_local, dv_local, metadata, process_group,
     )
 
