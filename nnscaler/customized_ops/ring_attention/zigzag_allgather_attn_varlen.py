@@ -79,13 +79,17 @@ def wrap_zigzag_allgather_attn_varlen_func(
             return_attn_probs=False,
         )
 
+    local_process_group = DeviceGroup().get_group(process_group)
+    if local_process_group is None:
+        local_process_group = dist.group.WORLD
+
     return zigzag_allgather_attn_varlen_func(
         q,
         k,
         v,
         cu_seqlens_q,
         cu_seqlens_k,
-        process_group=process_group,
+        process_group=local_process_group,
         dropout_p=dropout_p,
         softmax_scale=softmax_scale,
         causal=causal,
@@ -139,8 +143,8 @@ def emit_ring(
 def flash_attention_anno(query_states, key_states, value_states, cu_seqlens_q, cu_seqlens_k, alibi_slopes, *args, **kwargs) -> str:
     q_anno, kv_anno = gen_head_anno(query_states, key_states, value_states, head_pos=1)
     if isinstance(alibi_slopes, IRTensor):
-        return f"l {q_anno} hd^, l^ {kv_anno} hd^, l^ {kv_anno} vd^, e^, e^, {q_anno} -> l {q_anno} vd^"
-    return f"l {q_anno} hd^, l^ {kv_anno} hd^, l^ {kv_anno} vd^, e^, e^, ? -> l {q_anno} vd^"
+        return f"l {q_anno} hd^, al^ {kv_anno} hd^, al^ {kv_anno} vd^, e^, e^, {q_anno} -> l {q_anno} vd^"
+    return f"l {q_anno} hd^, al^ {kv_anno} hd^, al^ {kv_anno} vd^, e^, e^, ? -> l {q_anno} vd^"
 
 
 def input_gen_fn(node: IRDimops):
