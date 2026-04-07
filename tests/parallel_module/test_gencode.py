@@ -2299,3 +2299,52 @@ def test_zero3_multi_inout(tmp_path):
     #     with self.save_params_hooks():
     #         return self.segment34_impl(x_25, y_26)
     assert True
+
+
+def fake_add_xy(x: torch.Tensor, y: torch.Tensor):
+    return x
+
+
+@nnscaler.register_op('*, * -> *', fake_fn=fake_add_xy)
+def add_xy(x: torch.Tensor, y: torch.Tensor):
+    raise NotImplementedError("This function should not be called since it's replaced by fake_add_xy in tracing")
+
+
+class FakeFnModel(torch.nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.fc = torch.nn.Linear(10, 10)
+
+    def forward(self, x, y):
+        x, y = self.fc(x), self.fc(y)
+        return add_xy(x, y)
+
+
+@replace_all_device_with('cpu')
+def test_fake_fn(tmp_path):
+    m = FakeFnModel()
+    m.train()
+    m_new = parallelize(
+        m,
+        {'x': torch.randn(10, 10), 'y': torch.randn(10, 10)},
+        'dp',
+        ComputeConfig(1, 2),
+        gen_savedir=tmp_path,
+        load_module=False,
+        reuse='override',
+    )
+    assert _gencode_contains(tmp_path, FakeFnModel, 0, 'add_xy')
+    assert not _gencode_contains(tmp_path, FakeFnModel, 0, 'fake_add_xy')
+
+    # code looks like:
+    # def segment31(self, x_21, y_22):
+    #     # File "/data/weijiangxu/nnscaler/tests/parallel_module/test_gencode.py", line 2319, in forward,  x, y = self.fc(x), self.fc(y)
+    #     linear_26 = torch.nn.functional.linear(x_21, self.fc_weight_24, self.fc_bias_25)
+    #     del x_21
+    #     # File "/data/weijiangxu/nnscaler/tests/parallel_module/test_gencode.py", line 2319, in forward,  x, y = self.fc(x), self.fc(y)
+    #     linear_1_27 = torch.nn.functional.linear(y_22, self.fc_weight_24, self.fc_bias_25)
+    #     del y_22
+    #     # File "/data/weijiangxu/nnscaler/tests/parallel_module/test_gencode.py", line 2320, in forward,  return add_xy(x, y)
+    #     add_xy_23 = tests.parallel_module.test_gencode.add_xy(linear_26, linear_1_27)
+    #     del linear_26, linear_1_27
+    #     return add_xy_23
