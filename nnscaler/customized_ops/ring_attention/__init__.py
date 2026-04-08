@@ -11,4 +11,4 @@ from .sliding_window_attn import wrap_sliding_window_attn_func
 
 from .zigzag_allgather_attn_varlen import wrap_zigzag_allgather_attn_varlen_func
 
-from .allgather_attn_varlen import wrap_allgather_attn_varlen_func
+from .maybe_shuffle import wrap_maybe_shuffle, wrap_maybe_unshuffle

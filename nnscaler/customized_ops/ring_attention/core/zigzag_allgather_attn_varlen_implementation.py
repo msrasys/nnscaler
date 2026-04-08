@@ -14,9 +14,6 @@ try:
 except ImportError:
     flash_attn_cute_varlen_func = None
 
-from ..varlen_utils import shuffle_varlen, unshuffle_varlen
-
-
 @dataclass
 class ZigZagAllGatherVarlenMetadata:
     cu_seqlens_q_front: torch.Tensor
@@ -234,8 +231,6 @@ def zigzag_allgather_attn_varlen_func(
     
     rank = dist.get_rank(process_group)
     world_size = dist.get_world_size(process_group)
-    cp_ranks = _get_cp_ranks(process_group)
-
     metadata = prepare_zigzag_allgather_attn_varlen_metadata(
         cu_seqlens_q,
         cu_seqlens_k,
@@ -243,8 +238,7 @@ def zigzag_allgather_attn_varlen_func(
         rank=rank,
     )
 
-    shuffled_q = shuffle_varlen(q, cu_seqlens_q, cp_ranks, process_group)
-    q_front, q_end = _split_shuffled_q(shuffled_q, metadata.slice_sizes)
+    q_front, q_end = _split_shuffled_q(q, metadata.slice_sizes)
 
     front_output = _run_flash_attn_varlen(
         q_front,
@@ -279,9 +273,8 @@ def zigzag_allgather_attn_varlen_func(
         window_size,
     )
 
-    shuffled_output = _merge_shuffled_output(
+    return _merge_shuffled_output(
         front_output,
         end_output,
         metadata.slice_sizes,
     )
-    return unshuffle_varlen(shuffled_output, cu_seqlens_q, cp_ranks, process_group)
