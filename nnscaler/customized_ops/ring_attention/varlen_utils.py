@@ -89,6 +89,10 @@ def _compute_a2a_metadata(cu_seqlens_padded: Tensor, cp_size: int, cp_rank: int,
 
     total_slices = 2 * cp_size
     seq_lens = cu_seqlens_padded[1:] - cu_seqlens_padded[:-1]
+    assert torch.all(seq_lens % total_slices == 0), (
+        f"Each sequence length must be divisible by 2*cp_size={total_slices}. "
+        f"Got seq_lens={seq_lens.tolist()}"
+    )
     slice_sizes = seq_lens // total_slices
     total_tokens = cu_seqlens_padded[-1].item()
     chunk_size = total_tokens // cp_size
@@ -106,6 +110,16 @@ def _compute_a2a_metadata(cu_seqlens_padded: Tensor, cp_size: int, cp_rank: int,
 
     # slice i → dest rank i (front) if i < cp_size, else dest rank (total_slices-1-i) (end)
     dest_rank = torch.where(slice_idx < cp_size, slice_idx, total_slices - 1 - slice_idx)
+
+    assert dest_rank.min().item() >= 0, (
+        f"Negative dest_rank detected (min={dest_rank.min().item()}). "
+        f"This usually means sequence lengths are not divisible by 2*cp_size={total_slices}. "
+        f"seq_lens={seq_lens.tolist()}, cp_rank={cp_rank}"
+    )
+    assert dest_rank.max().item() < cp_size, (
+        f"dest_rank out of range (max={dest_rank.max().item()}, cp_size={cp_size}). "
+        f"seq_lens={seq_lens.tolist()}, cp_rank={cp_rank}"
+    )
 
     shuffle_send_perm = torch.argsort(dest_rank, stable=True)
     shuffle_inv_send_perm = torch.empty_like(shuffle_send_perm)

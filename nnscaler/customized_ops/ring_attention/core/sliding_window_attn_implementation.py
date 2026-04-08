@@ -193,6 +193,14 @@ def _a2a_communicate_kv(
         send_k = k.new_empty((0, k.shape[1], k.shape[2]))
         send_v = v.new_empty((0, v.shape[1], v.shape[2]))
 
+    assert send_k.shape[0] == sum(input_split_sizes), (
+        f"forward KV send buffer size mismatch: send_k.shape[0]={send_k.shape[0]} "
+        f"vs sum(input_split_sizes)={sum(input_split_sizes)}, "
+        f"input_split_sizes={input_split_sizes}"
+    )
+    assert all(s >= 0 for s in input_split_sizes), f"negative input_split_sizes: {input_split_sizes}"
+    assert all(s >= 0 for s in output_split_sizes), f"negative output_split_sizes: {output_split_sizes}"
+
     recv_k = _all_to_all_varlen(send_k, input_split_sizes, output_split_sizes, group)
     recv_v = _all_to_all_varlen(send_v, input_split_sizes, output_split_sizes, group)
 
@@ -238,6 +246,14 @@ def _a2a_communicate_grad(
         send_dk = dk_local.new_empty((0, dk_local.shape[1], dk_local.shape[2]))
         send_dv = dv_local.new_empty((0, dv_local.shape[1], dv_local.shape[2]))
 
+    assert send_dk.shape[0] == sum(input_split_sizes), (
+        f"backward grad send buffer size mismatch: send_dk.shape[0]={send_dk.shape[0]} "
+        f"vs sum(input_split_sizes)={sum(input_split_sizes)}, "
+        f"input_split_sizes={input_split_sizes}"
+    )
+    assert all(s >= 0 for s in input_split_sizes), f"negative input_split_sizes: {input_split_sizes}"
+    assert all(s >= 0 for s in output_split_sizes), f"negative output_split_sizes: {output_split_sizes}"
+
     dk_from_next = _all_to_all_varlen(send_dk, input_split_sizes, output_split_sizes, group)
     dv_from_next = _all_to_all_varlen(send_dv, input_split_sizes, output_split_sizes, group)
     if send_size == 0:
@@ -268,6 +284,12 @@ def sliding_window_forward(
     """
     # Step 1: A2A communication
     extended_k, extended_v = _a2a_communicate_kv(k, v, metadata, process_group)
+
+    assert extended_k.shape[0] == cu_seqlens_k[-1].item(), (
+        f"extended_k size mismatch: extended_k.shape[0]={extended_k.shape[0]} "
+        f"vs cu_seqlens_k[-1]={cu_seqlens_k[-1].item()}, "
+        f"rank={dist.get_rank(process_group)}"
+    )
 
     cu_seqlens_q = metadata.cu_seqlens_q
     cu_seqlens_k = metadata.cu_seqlens_k
