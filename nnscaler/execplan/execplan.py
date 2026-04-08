@@ -186,7 +186,8 @@ class ExecutionPlan:
                 return True
 
             for block in schedplan.nodes():
-                if (stream_context := block.stream_context) is not None:
+                # check segment stream context (all segments are wrapped in blocks)
+                if isinstance(block, Block) and (stream_context := block.stream_context) is not None:
                     if stream_context.stream:
                         return True
                     if stream_context.wait_streams:
