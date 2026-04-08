@@ -40,7 +40,7 @@ Multiple Stream Support:
 In the current implementation, we also support users to specify stream configuration
 for different types of communication
 (e.g., inter-segment communication, result broadcasting, gradient reduction)
-by `set_comm_stream_config` interface.
+by setting its `stream_config` property.
 The stream configuration will be attached to the corresponding adapters,
 and can be used in codegen to generate stream context manager for the adapters.
 This can help to achieve better performance in pipeline parallelism
@@ -50,15 +50,13 @@ Some implementation details:
 - Stream information is attached to Segments/Adapters via `op_context` field,
     which is a dict that can be used to store any information for codegen.
     The key for stream context is 'stream_context', and the value is a `StreamContext` dataclass that contains the stream name and wait stream names.
-- Stream information for WeightReducers is stored in `SchedulePlan._adapter_stream_context`
-    with key `CommunicationType.GRAD_REDUCE`,
-    and will be passed to `ExecutionPlan`
-    and finally attached to the WeightReducer adapters in scheduler codegen.
+- Stream information for other operations including WeightReducers, dataloaders, and zero_grad will be passed to `ExecutionPlan`
+    and finally attached to those operations in scheduler codegen.
 
 How to create a SchedulePlan for users:
 1) Create a SchedulePlan with the graph and number of micro-batches.
-2) Add segments to the plan by `add_segment` or `insert_step` interface.
-3) Call `set_segment_stream` and/or `set_comm_stream_config` to set stream configuration for segments and adapters.
+2) Add segments to the plan by `add_segment` or `insert_step` interface, and specify stream context for each segment if needed.
+3) Set `stream_config` property to set stream configuration for other operations.
 4) Call `finish` to mark done.
 
 """
