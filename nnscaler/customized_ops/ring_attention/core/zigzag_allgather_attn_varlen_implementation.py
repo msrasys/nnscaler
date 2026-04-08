@@ -255,7 +255,7 @@ def zigzag_allgather_attn_varlen_func(
         window_size,
     )
 
-    output = torch.empty_like(q)
+    output = front_output.new_empty((q.shape[0],) + front_output.shape[1:])
     output[metadata.q_front_idx] = front_output
     output[metadata.q_end_idx] = end_output
     return output
