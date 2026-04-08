@@ -4,13 +4,9 @@ compute_config:
   constant_folding: true
   use_zero: true
   use_end2end: true
-  pas_config:
-    pipeline_nmicros: 4
-    pipeline_size: 1
-    pipeline_scheduler: tests.cli.test_trainer_overlap.sched_overlap
 
 run_mode: run
-pas_policy: tests.cli.test_trainer_overlap.toy_policy
+pas_policy: dp
 micro_batch_size: 4
 global_batch_size: 32
 max_train_steps: 10
