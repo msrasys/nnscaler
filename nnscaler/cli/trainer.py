@@ -977,8 +977,10 @@ class Trainer:
 
             # wrap train_step with `torch.cuda.synchronize`
             # to support multiple cuda streams in train_step.
-            # We never need this for mixed model.
-            cuda_sync_required = isinstance(self.model, nnscaler.ParallelModule) and self.model.cuda_sync_required
+            # We never need this for mixed model nor non-pipeline models.
+            cuda_sync_required = isinstance(self.model, nnscaler.ParallelModule) \
+                  and getattr(self.model, 'cuda_sync_required', False)
+
             if cuda_sync_required:
                 torch.cuda.synchronize()
 
