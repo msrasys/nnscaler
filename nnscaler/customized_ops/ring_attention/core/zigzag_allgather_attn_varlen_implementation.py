@@ -3,7 +3,7 @@
 
 from dataclasses import dataclass
 from collections import OrderedDict
-from typing import List, Optional, Tuple
+from typing import Optional, Tuple
 
 import torch
 import torch.distributed as dist
@@ -23,47 +23,12 @@ class ZigZagAllGatherVarlenMetadata:
     max_seqlen_q: int
     max_seqlen_k_front: int
     max_seqlen_k_end: int
-    slice_sizes: torch.Tensor
+    q_front_idx: torch.Tensor
+    q_end_idx: torch.Tensor
 
 
 _METADATA_CACHE_MAXSIZE = 128
 _METADATA_CACHE = OrderedDict()
-
-
-def _get_cp_ranks(process_group) -> List[int]:
-    world_size = dist.get_world_size(process_group)
-    return [dist.get_global_rank(process_group, rank) for rank in range(world_size)]
-
-
-def _split_shuffled_q(
-    shuffled_q: torch.Tensor,
-    slice_sizes: torch.Tensor,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    q_front_slices = []
-    q_end_slices = []
-    offset = 0
-    for slice_size in slice_sizes.tolist():
-        q_front_slices.append(shuffled_q[offset : offset + slice_size])
-        offset += slice_size
-        q_end_slices.append(shuffled_q[offset : offset + slice_size])
-        offset += slice_size
-    return torch.cat(q_front_slices, dim=0), torch.cat(q_end_slices, dim=0)
-
-
-def _merge_shuffled_output(
-    front_output: torch.Tensor,
-    end_output: torch.Tensor,
-    slice_sizes: torch.Tensor,
-) -> torch.Tensor:
-    output = []
-    front_offset = 0
-    end_offset = 0
-    for slice_size in slice_sizes.tolist():
-        output.append(front_output[front_offset : front_offset + slice_size])
-        front_offset += slice_size
-        output.append(end_output[end_offset : end_offset + slice_size])
-        end_offset += slice_size
-    return torch.cat(output, dim=0)
 
 
 def _build_branch_cu_seqlens(
@@ -91,6 +56,20 @@ def _build_branch_cu_seqlens(
     max_seqlen_q = q_lens.max().item()
     max_seqlen_k = k_entries.max().item()
     return cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k
+
+
+def _build_q_split_indices(
+    slice_sizes: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    q_front_idx = []
+    q_end_idx = []
+    offset = 0
+    for slice_size in slice_sizes.tolist():
+        q_front_idx.append(torch.arange(offset, offset + slice_size, device=slice_sizes.device))
+        offset += slice_size
+        q_end_idx.append(torch.arange(offset, offset + slice_size, device=slice_sizes.device))
+        offset += slice_size
+    return torch.cat(q_front_idx), torch.cat(q_end_idx)
 
 
 def prepare_zigzag_allgather_attn_varlen_metadata(
@@ -143,6 +122,7 @@ def prepare_zigzag_allgather_attn_varlen_metadata(
         cu_seqlens_q.dtype,
         cu_seqlens_q.device,
     )
+    q_front_idx, q_end_idx = _build_q_split_indices(slice_sizes)
 
     metadata = ZigZagAllGatherVarlenMetadata(
         cu_seqlens_q_front=cu_seqlens_q_front,
@@ -152,7 +132,8 @@ def prepare_zigzag_allgather_attn_varlen_metadata(
         max_seqlen_q=max_seqlen_q,
         max_seqlen_k_front=max_seqlen_k_front,
         max_seqlen_k_end=max_seqlen_k_end,
-        slice_sizes=slice_sizes,
+        q_front_idx=q_front_idx,
+        q_end_idx=q_end_idx,
     )
     if len(_METADATA_CACHE) >= _METADATA_CACHE_MAXSIZE:
         _METADATA_CACHE.popitem(last=False)
@@ -238,7 +219,8 @@ def zigzag_allgather_attn_varlen_func(
         rank=rank,
     )
 
-    q_front, q_end = _split_shuffled_q(q, metadata.slice_sizes)
+    q_front = q[metadata.q_front_idx]
+    q_end = q[metadata.q_end_idx]
 
     front_output = _run_flash_attn_varlen(
         q_front,
@@ -273,8 +255,7 @@ def zigzag_allgather_attn_varlen_func(
         window_size,
     )
 
-    return _merge_shuffled_output(
-        front_output,
-        end_output,
-        metadata.slice_sizes,
-    )
+    output = torch.empty_like(q)
+    output[metadata.q_front_idx] = front_output
+    output[metadata.q_end_idx] = end_output
+    return output
