@@ -58,8 +58,8 @@ Some implementation details:
 How to create a SchedulePlan for users:
 1) Create a SchedulePlan with the graph and number of micro-batches.
 2) Add segments to the plan by `add_segment` or `insert_step` interface.
-4) Call `set_segment_stream` and/or `set_comm_stream_config` to set stream configuration for segments and adapters.
-3) Call `finish` to mark done.
+3) Call `set_segment_stream` and/or `set_comm_stream_config` to set stream configuration for segments and adapters.
+4) Call `finish` to mark done.
 
 """
 
@@ -93,9 +93,9 @@ class StreamContext:
         wait_events: The event names that the operation needs to wait for before execution.
     """
     stream: Optional[str] = None
-    wait_streams: Optional[list[str]] = None
+    wait_streams: Optional[List[str]] = None
     record_event: Optional[str] = None
-    wait_events: Optional[list[str]] = None
+    wait_events: Optional[List[str]] = None
 
 
 class Block:
@@ -204,6 +204,7 @@ class StreamConfig:
             which are used to broadcast results to all ranks in the same scale unit after forward pass.
         grad_reduce: The stream context for gradient reduction adapters,
             which are used to reduce gradients across ranks.
+        cuda_sync_required: Whether to call `torch.cuda.synchronize()` before and after train_step
     """
 
     dataloader: Optional[StreamContext] = None
@@ -211,6 +212,7 @@ class StreamConfig:
     inter_segment_move: Optional[StreamContext] = None
     result_broadcast: Optional[StreamContext] = None
     grad_reduce: Optional[StreamContext] = None
+    cuda_sync_required: bool = True
 
 
 class PlanBase:
@@ -235,7 +237,7 @@ class PlanBase:
 
         # stream context for different adapters,
         # which can be used in codegen to generate stream context manager for the adapters.
-        self._stream_config: StreamConfig = StreamConfig()
+        self._stream_config: StreamConfig = StreamConfig(cuda_sync_required=False)
 
         # topological sequence
         self._seqs: List[IRCell] = []

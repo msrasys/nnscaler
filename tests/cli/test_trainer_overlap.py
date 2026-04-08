@@ -238,6 +238,7 @@ def sched_overlap(graph: IRGraph, num_microbatches: int, num_stages: int) -> Sch
         )
 
     # 1F1B: forward(i) + backward(i-1)
+    backward_event_recorded = False
     for micro_idx in range(1, num_microbatches):
         # Phase 1: fwd_seg0 alone on comp_stream
         sid += 1
@@ -256,9 +257,12 @@ def sched_overlap(graph: IRGraph, num_microbatches: int, num_stages: int) -> Sch
             sid += 1
             sched.add_segment(fsegs[bwd_s].mirror, micro_idx - 1, step=sid,
                     stream_context=StreamContext(
-                    stream=fseg_stream_name[bwd_s], record_event=backward_event, wait_events=[backward_event]
+                    stream=fseg_stream_name[bwd_s],
+                    record_event=backward_event,
+                    wait_events=[backward_event] if backward_event_recorded else []
                 )
             )
+            backward_event_recorded = True
 
         # Phase 6: bwd_seg0 alone on comp_stream
         sid += 1
@@ -316,3 +320,311 @@ def test_trainer_overlap(tmp_path):
 
     assert_equal(overlap_ckpt['model'], gt_ckpt['model'])
     assert_equal(overlap_ckpt['optimizer']['state'], gt_ckpt['optimizer']['state'])
+
+    # overlapped train_step looks like:
+    # InputProj(vocab, hidden),         # 0  compute
+    # CommGather(),                     # 1  comm
+    # ExpertFFN(hidden, expert_dim),    # 2  compute
+    # CommScatter(),                    # 3  comm
+    # OutputHead(hidden, vocab),        # 4  compute
+    # def _train_step(model, dataloader_86):
+    #     _ = None
+    #     nnscaler.flags.RuntimeFlag.skip_zero_grad = False
+
+    #     with torch.cuda.stream(nnscaler.runtime.device.DeviceGroup().get_stream('comp')):
+    #         torch.cuda.current_stream().wait_stream(nnscaler.runtime.device.DeviceGroup().get_stream('comm'))
+    #         model.zero_grad()
+    #         torch.cuda.current_stream().wait_stream(nnscaler.runtime.device.DeviceGroup().get_stream('comm'))
+    #         data_57 = next(*(dataloader_86, ))
+    #         torch.cuda.current_stream().wait_stream(nnscaler.runtime.device.DeviceGroup().get_stream('comm'))
+    #         getitem_1_64, linear_69 = nnscaler.runtime.executor.fexecute('InputProj_Segment', model.InputProj_Segment, *(data_57, ), requires_grad=True)
+    #         nnscaler.runtime.device.DeviceGroup().get_event('forward').record()
+
+    #     with torch.cuda.stream(nnscaler.runtime.device.DeviceGroup().get_stream('comm')):
+    #         nnscaler.runtime.device.DeviceGroup().get_event('forward').wait()
+    #         all_to_all_71, getitem_1_109 = nnscaler.runtime.executor.fexecute('CommGather_Segment', model.CommGather_Segment, *(getitem_1_64, linear_69, ), requires_grad=True)
+    #         nnscaler.runtime.device.DeviceGroup().get_event('forward').record()
+
+    #     del getitem_1_64
+
+    #     with torch.cuda.stream(nnscaler.runtime.device.DeviceGroup().get_stream('comp')):
+    #         nnscaler.runtime.device.DeviceGroup().get_event('forward').wait()
+    #         linear_2_78, getitem_1_111 = nnscaler.runtime.executor.fexecute('ExpertFFN_Segment', model.ExpertFFN_Segment, *(all_to_all_71, getitem_1_109, ), requires_grad=True)
+    #         nnscaler.runtime.device.DeviceGroup().get_event('forward').record()
+
+    #     del getitem_1_109
+
+    #     with torch.cuda.stream(nnscaler.runtime.device.DeviceGroup().get_stream('comm')):
+    #         nnscaler.runtime.device.DeviceGroup().get_event('forward').wait()
+    #         all_to_all_1_79, getitem_1_113 = nnscaler.runtime.executor.fexecute('CommScatter_Segment', model.CommScatter_Segment, *(linear_2_78, getitem_1_111, ), requires_grad=True)
+    #         nnscaler.runtime.device.DeviceGroup().get_event('forward').record()
+
+    #     del getitem_1_111
+
+    #     with torch.cuda.stream(nnscaler.runtime.device.DeviceGroup().get_stream('comp')):
+    #         nnscaler.runtime.device.DeviceGroup().get_event('forward').wait()
+    #         cross_entropy_62 = nnscaler.runtime.executor.fexecute('OutputHead_Segment', model.OutputHead_Segment, *(all_to_all_1_79, getitem_1_113, ), requires_grad=True)
+    #         nnscaler.runtime.device.DeviceGroup().get_event('forward').record()
+
+    #     del getitem_1_113
+
+    #     with torch.cuda.stream(nnscaler.runtime.device.DeviceGroup().get_stream('comp')):
+    #         torch.cuda.current_stream().wait_stream(nnscaler.runtime.device.DeviceGroup().get_stream('comm'))
+    #         data_132 = next(*(dataloader_86, ))
+    #         torch.cuda.current_stream().wait_stream(nnscaler.runtime.device.DeviceGroup().get_stream('comm'))
+    #         getitem_1_135, linear_138 = nnscaler.runtime.executor.fexecute('InputProj_Segment', model.InputProj_Segment, *(data_132, ), requires_grad=True)
+    #         nnscaler.runtime.device.DeviceGroup().get_event('forward').record()
+
+    #     with torch.cuda.stream(nnscaler.runtime.device.DeviceGroup().get_stream('comm')):
+    #         nnscaler.runtime.device.DeviceGroup().get_event('forward').wait()
+    #         all_to_all_146, getitem_1_149 = nnscaler.runtime.executor.fexecute('CommGather_Segment', model.CommGather_Segment, *(getitem_1_135, linear_138, ), requires_grad=True)
+    #         nnscaler.runtime.device.DeviceGroup().get_event('forward').record()
+
+    #     del getitem_1_135
+    #     nnscaler.flags.RuntimeFlag.skip_reducer = True
+
+    #     with torch.cuda.stream(nnscaler.runtime.device.DeviceGroup().get_stream('comp')):
+    #         gall_to_all_1_102 = nnscaler.runtime.executor.backward('OutputHead_Segment', (all_to_all_1_79, ), (cross_entropy_62, ), (None, ))
+    #         cross_entropy_62 = cross_entropy_62.detach()
+    #         nnscaler.runtime.device.DeviceGroup().get_event('backward').record()
+    #         nnscaler.runtime.device.DeviceGroup().get_event('forward').wait()
+    #         linear_2_157, getitem_1_160 = nnscaler.runtime.executor.fexecute('ExpertFFN_Segment', model.ExpertFFN_Segment, *(all_to_all_146, getitem_1_149, ), requires_grad=True)
+    #         nnscaler.runtime.device.DeviceGroup().get_event('forward').record()
+
+    #     del getitem_1_149
+    #     nnscaler.flags.RuntimeFlag.skip_reducer = True
+
+    #     with torch.cuda.stream(nnscaler.runtime.device.DeviceGroup().get_stream('comm')):
+    #         nnscaler.runtime.device.DeviceGroup().get_event('backward').wait()
+    #         glinear_2_101 = nnscaler.runtime.executor.backward('CommScatter_Segment', (linear_2_78, ), (all_to_all_1_79, ), (gall_to_all_1_102, ))
+    #         nnscaler.runtime.device.DeviceGroup().get_event('backward').record()
+
+    #     del all_to_all_1_79, gall_to_all_1_102
+
+    #     with torch.cuda.stream(nnscaler.runtime.device.DeviceGroup().get_stream('comm')):
+    #         nnscaler.runtime.device.DeviceGroup().get_event('forward').wait()
+    #         all_to_all_1_168, getitem_1_171 = nnscaler.runtime.executor.fexecute('CommScatter_Segment', model.CommScatter_Segment, *(linear_2_157, getitem_1_160, ), requires_grad=True)
+    #         nnscaler.runtime.device.DeviceGroup().get_event('forward').record()
+
+    #     del getitem_1_160
+    #     nnscaler.flags.RuntimeFlag.skip_reducer = True
+
+    #     with torch.cuda.stream(nnscaler.runtime.device.DeviceGroup().get_stream('comp')):
+    #         nnscaler.runtime.device.DeviceGroup().get_event('backward').wait()
+    #         gall_to_all_94 = nnscaler.runtime.executor.backward('ExpertFFN_Segment', (all_to_all_71, ), (linear_2_78, ), (glinear_2_101, ))
+    #         nnscaler.runtime.device.DeviceGroup().get_event('backward').record()
+
+    #     del linear_2_78, glinear_2_101
+
+    #     with torch.cuda.stream(nnscaler.runtime.device.DeviceGroup().get_stream('comp')):
+    #         nnscaler.runtime.device.DeviceGroup().get_event('forward').wait()
+    #         cross_entropy_179 = nnscaler.runtime.executor.fexecute('OutputHead_Segment', model.OutputHead_Segment, *(all_to_all_1_168, getitem_1_171, ), requires_grad=True)
+    #         nnscaler.runtime.device.DeviceGroup().get_event('forward').record()
+
+    #     del getitem_1_171
+    #     nnscaler.flags.RuntimeFlag.skip_reducer = True
+
+    #     with torch.cuda.stream(nnscaler.runtime.device.DeviceGroup().get_stream('comm')):
+    #         nnscaler.runtime.device.DeviceGroup().get_event('backward').wait()
+    #         glinear_92 = nnscaler.runtime.executor.backward('CommGather_Segment', (linear_69, ), (all_to_all_71, ), (gall_to_all_94, ))
+    #         nnscaler.runtime.device.DeviceGroup().get_event('backward').record()
+
+    #     del all_to_all_71, gall_to_all_94
+    #     nnscaler.flags.RuntimeFlag.skip_reducer = True
+
+    #     with torch.cuda.stream(nnscaler.runtime.device.DeviceGroup().get_stream('comp')):
+    #         nnscaler.runtime.device.DeviceGroup().get_event('backward').wait()
+    #         _ = nnscaler.runtime.executor.backward('InputProj_Segment', (), (linear_69, ), (glinear_92, ))
+    #         nnscaler.runtime.device.DeviceGroup().get_event('backward').record()
+
+    #     del linear_69, glinear_92
+
+    #     with torch.cuda.stream(nnscaler.runtime.device.DeviceGroup().get_stream('comp')):
+    #         torch.cuda.current_stream().wait_stream(nnscaler.runtime.device.DeviceGroup().get_stream('comm'))
+    #         data_183 = next(*(dataloader_86, ))
+    #         torch.cuda.current_stream().wait_stream(nnscaler.runtime.device.DeviceGroup().get_stream('comm'))
+    #         getitem_1_186, linear_189 = nnscaler.runtime.executor.fexecute('InputProj_Segment', model.InputProj_Segment, *(data_183, ), requires_grad=True)
+    #         nnscaler.runtime.device.DeviceGroup().get_event('forward').record()
+
+    #     with torch.cuda.stream(nnscaler.runtime.device.DeviceGroup().get_stream('comm')):
+    #         nnscaler.runtime.device.DeviceGroup().get_event('forward').wait()
+    #         all_to_all_197, getitem_1_200 = nnscaler.runtime.executor.fexecute('CommGather_Segment', model.CommGather_Segment, *(getitem_1_186, linear_189, ), requires_grad=True)
+    #         nnscaler.runtime.device.DeviceGroup().get_event('forward').record()
+
+    #     del getitem_1_186
+    #     nnscaler.flags.RuntimeFlag.skip_reducer = True
+
+    #     with torch.cuda.stream(nnscaler.runtime.device.DeviceGroup().get_stream('comp')):
+    #         nnscaler.runtime.device.DeviceGroup().get_event('backward').wait()
+    #         gall_to_all_1_169 = nnscaler.runtime.executor.backward('OutputHead_Segment', (all_to_all_1_168, ), (cross_entropy_179, ), (None, ))
+    #         cross_entropy_179 = cross_entropy_179.detach()
+    #         nnscaler.runtime.device.DeviceGroup().get_event('backward').record()
+    #         nnscaler.runtime.device.DeviceGroup().get_event('forward').wait()
+    #         linear_2_208, getitem_1_211 = nnscaler.runtime.executor.fexecute('ExpertFFN_Segment', model.ExpertFFN_Segment, *(all_to_all_197, getitem_1_200, ), requires_grad=True)
+    #         nnscaler.runtime.device.DeviceGroup().get_event('forward').record()
+
+    #     del getitem_1_200
+    #     nnscaler.flags.RuntimeFlag.skip_reducer = True
+
+    #     with torch.cuda.stream(nnscaler.runtime.device.DeviceGroup().get_stream('comm')):
+    #         nnscaler.runtime.device.DeviceGroup().get_event('backward').wait()
+    #         glinear_2_158 = nnscaler.runtime.executor.backward('CommScatter_Segment', (linear_2_157, ), (all_to_all_1_168, ), (gall_to_all_1_169, ))
+    #         nnscaler.runtime.device.DeviceGroup().get_event('backward').record()
+
+    #     del all_to_all_1_168, gall_to_all_1_169
+
+    #     with torch.cuda.stream(nnscaler.runtime.device.DeviceGroup().get_stream('comm')):
+    #         nnscaler.runtime.device.DeviceGroup().get_event('forward').wait()
+    #         all_to_all_1_219, getitem_1_222 = nnscaler.runtime.executor.fexecute('CommScatter_Segment', model.CommScatter_Segment, *(linear_2_208, getitem_1_211, ), requires_grad=True)
+    #         nnscaler.runtime.device.DeviceGroup().get_event('forward').record()
+
+    #     del getitem_1_211
+    #     nnscaler.flags.RuntimeFlag.skip_reducer = True
+
+    #     with torch.cuda.stream(nnscaler.runtime.device.DeviceGroup().get_stream('comp')):
+    #         nnscaler.runtime.device.DeviceGroup().get_event('backward').wait()
+    #         gall_to_all_147 = nnscaler.runtime.executor.backward('ExpertFFN_Segment', (all_to_all_146, ), (linear_2_157, ), (glinear_2_158, ))
+    #         nnscaler.runtime.device.DeviceGroup().get_event('backward').record()
+
+    #     del linear_2_157, glinear_2_158
+
+    #     with torch.cuda.stream(nnscaler.runtime.device.DeviceGroup().get_stream('comp')):
+    #         nnscaler.runtime.device.DeviceGroup().get_event('forward').wait()
+    #         cross_entropy_230 = nnscaler.runtime.executor.fexecute('OutputHead_Segment', model.OutputHead_Segment, *(all_to_all_1_219, getitem_1_222, ), requires_grad=True)
+    #         nnscaler.runtime.device.DeviceGroup().get_event('forward').record()
+
+    #     del getitem_1_222
+    #     nnscaler.flags.RuntimeFlag.skip_reducer = True
+
+    #     with torch.cuda.stream(nnscaler.runtime.device.DeviceGroup().get_stream('comm')):
+    #         nnscaler.runtime.device.DeviceGroup().get_event('backward').wait()
+    #         glinear_139 = nnscaler.runtime.executor.backward('CommGather_Segment', (linear_138, ), (all_to_all_146, ), (gall_to_all_147, ))
+    #         nnscaler.runtime.device.DeviceGroup().get_event('backward').record()
+
+    #     del all_to_all_146, gall_to_all_147
+    #     nnscaler.flags.RuntimeFlag.skip_reducer = True
+
+    #     with torch.cuda.stream(nnscaler.runtime.device.DeviceGroup().get_stream('comp')):
+    #         nnscaler.runtime.device.DeviceGroup().get_event('backward').wait()
+    #         _ = nnscaler.runtime.executor.backward('InputProj_Segment', (), (linear_138, ), (glinear_139, ))
+    #         nnscaler.runtime.device.DeviceGroup().get_event('backward').record()
+
+    #     del linear_138, glinear_139
+
+    #     with torch.cuda.stream(nnscaler.runtime.device.DeviceGroup().get_stream('comp')):
+    #         torch.cuda.current_stream().wait_stream(nnscaler.runtime.device.DeviceGroup().get_stream('comm'))
+    #         data_234 = next(*(dataloader_86, ))
+    #         torch.cuda.current_stream().wait_stream(nnscaler.runtime.device.DeviceGroup().get_stream('comm'))
+    #         getitem_1_237, linear_240 = nnscaler.runtime.executor.fexecute('InputProj_Segment', model.InputProj_Segment, *(data_234, ), requires_grad=True)
+    #         nnscaler.runtime.device.DeviceGroup().get_event('forward').record()
+
+    #     with torch.cuda.stream(nnscaler.runtime.device.DeviceGroup().get_stream('comm')):
+    #         nnscaler.runtime.device.DeviceGroup().get_event('forward').wait()
+    #         all_to_all_248, getitem_1_251 = nnscaler.runtime.executor.fexecute('CommGather_Segment', model.CommGather_Segment, *(getitem_1_237, linear_240, ), requires_grad=True)
+    #         nnscaler.runtime.device.DeviceGroup().get_event('forward').record()
+
+    #     del getitem_1_237
+    #     nnscaler.flags.RuntimeFlag.skip_reducer = True
+
+    #     with torch.cuda.stream(nnscaler.runtime.device.DeviceGroup().get_stream('comp')):
+    #         nnscaler.runtime.device.DeviceGroup().get_event('backward').wait()
+    #         gall_to_all_1_220 = nnscaler.runtime.executor.backward('OutputHead_Segment', (all_to_all_1_219, ), (cross_entropy_230, ), (None, ))
+    #         cross_entropy_230 = cross_entropy_230.detach()
+    #         nnscaler.runtime.device.DeviceGroup().get_event('backward').record()
+    #         nnscaler.runtime.device.DeviceGroup().get_event('forward').wait()
+    #         linear_2_259, getitem_1_262 = nnscaler.runtime.executor.fexecute('ExpertFFN_Segment', model.ExpertFFN_Segment, *(all_to_all_248, getitem_1_251, ), requires_grad=True)
+    #         nnscaler.runtime.device.DeviceGroup().get_event('forward').record()
+
+    #     del getitem_1_251
+    #     nnscaler.flags.RuntimeFlag.skip_reducer = True
+
+    #     with torch.cuda.stream(nnscaler.runtime.device.DeviceGroup().get_stream('comm')):
+    #         nnscaler.runtime.device.DeviceGroup().get_event('backward').wait()
+    #         glinear_2_209 = nnscaler.runtime.executor.backward('CommScatter_Segment', (linear_2_208, ), (all_to_all_1_219, ), (gall_to_all_1_220, ))
+    #         nnscaler.runtime.device.DeviceGroup().get_event('backward').record()
+
+    #     del all_to_all_1_219, gall_to_all_1_220
+
+    #     with torch.cuda.stream(nnscaler.runtime.device.DeviceGroup().get_stream('comm')):
+    #         nnscaler.runtime.device.DeviceGroup().get_event('forward').wait()
+    #         all_to_all_1_270, getitem_1_273 = nnscaler.runtime.executor.fexecute('CommScatter_Segment', model.CommScatter_Segment, *(linear_2_259, getitem_1_262, ), requires_grad=True)
+    #         nnscaler.runtime.device.DeviceGroup().get_event('forward').record()
+
+    #     del getitem_1_262
+    #     nnscaler.flags.RuntimeFlag.skip_reducer = True
+
+    #     with torch.cuda.stream(nnscaler.runtime.device.DeviceGroup().get_stream('comp')):
+    #         nnscaler.runtime.device.DeviceGroup().get_event('backward').wait()
+    #         gall_to_all_198 = nnscaler.runtime.executor.backward('ExpertFFN_Segment', (all_to_all_197, ), (linear_2_208, ), (glinear_2_209, ))
+    #         nnscaler.runtime.device.DeviceGroup().get_event('backward').record()
+
+    #     del linear_2_208, glinear_2_209
+
+    #     with torch.cuda.stream(nnscaler.runtime.device.DeviceGroup().get_stream('comp')):
+    #         nnscaler.runtime.device.DeviceGroup().get_event('forward').wait()
+    #         cross_entropy_281 = nnscaler.runtime.executor.fexecute('OutputHead_Segment', model.OutputHead_Segment, *(all_to_all_1_270, getitem_1_273, ), requires_grad=True)
+    #         nnscaler.runtime.device.DeviceGroup().get_event('forward').record()
+
+    #     del getitem_1_273
+    #     nnscaler.flags.RuntimeFlag.skip_reducer = True
+
+    #     with torch.cuda.stream(nnscaler.runtime.device.DeviceGroup().get_stream('comm')):
+    #         nnscaler.runtime.device.DeviceGroup().get_event('backward').wait()
+    #         glinear_190 = nnscaler.runtime.executor.backward('CommGather_Segment', (linear_189, ), (all_to_all_197, ), (gall_to_all_198, ))
+    #         nnscaler.runtime.device.DeviceGroup().get_event('backward').record()
+
+    #     del all_to_all_197, gall_to_all_198
+    #     nnscaler.flags.RuntimeFlag.skip_reducer = True
+
+    #     with torch.cuda.stream(nnscaler.runtime.device.DeviceGroup().get_stream('comp')):
+    #         nnscaler.runtime.device.DeviceGroup().get_event('backward').wait()
+    #         _ = nnscaler.runtime.executor.backward('InputProj_Segment', (), (linear_189, ), (glinear_190, ))
+    #         nnscaler.runtime.device.DeviceGroup().get_event('backward').record()
+
+    #     del linear_189, glinear_190
+    #     nnscaler.flags.RuntimeFlag.skip_reducer = False
+
+    #     with torch.cuda.stream(nnscaler.runtime.device.DeviceGroup().get_stream('comp')):
+    #         torch.cuda.current_stream().wait_stream(nnscaler.runtime.device.DeviceGroup().get_stream('comm'))
+    #         gall_to_all_1_271 = nnscaler.runtime.executor.backward('OutputHead_Segment', (all_to_all_1_270, ), (cross_entropy_281, ), (None, ))
+    #         cross_entropy_281 = cross_entropy_281.detach()
+    #         nnscaler.runtime.device.DeviceGroup().get_event('backward').record()
+
+    #     nnscaler.flags.RuntimeFlag.skip_reducer = False
+
+    #     with torch.cuda.stream(nnscaler.runtime.device.DeviceGroup().get_stream('comm')):
+    #         nnscaler.runtime.device.DeviceGroup().get_event('backward').wait()
+    #         glinear_2_260 = nnscaler.runtime.executor.backward('CommScatter_Segment', (linear_2_259, ), (all_to_all_1_270, ), (gall_to_all_1_271, ))
+    #         nnscaler.runtime.device.DeviceGroup().get_event('backward').record()
+
+    #     del all_to_all_1_270, gall_to_all_1_271
+    #     nnscaler.flags.RuntimeFlag.skip_reducer = False
+
+    #     with torch.cuda.stream(nnscaler.runtime.device.DeviceGroup().get_stream('comp')):
+    #         nnscaler.runtime.device.DeviceGroup().get_event('backward').wait()
+    #         gall_to_all_249 = nnscaler.runtime.executor.backward('ExpertFFN_Segment', (all_to_all_248, ), (linear_2_259, ), (glinear_2_260, ))
+    #         nnscaler.runtime.device.DeviceGroup().get_event('backward').record()
+
+    #     del linear_2_259, glinear_2_260
+    #     nnscaler.flags.RuntimeFlag.skip_reducer = False
+
+    #     with torch.cuda.stream(nnscaler.runtime.device.DeviceGroup().get_stream('comm')):
+    #         nnscaler.runtime.device.DeviceGroup().get_event('backward').wait()
+    #         glinear_241 = nnscaler.runtime.executor.backward('CommGather_Segment', (linear_240, ), (all_to_all_248, ), (gall_to_all_249, ))
+    #         nnscaler.runtime.device.DeviceGroup().get_event('backward').record()
+
+    #     del all_to_all_248, gall_to_all_249
+    #     nnscaler.flags.RuntimeFlag.skip_reducer = False
+
+    #     with torch.cuda.stream(nnscaler.runtime.device.DeviceGroup().get_stream('comp')):
+    #         nnscaler.runtime.device.DeviceGroup().get_event('backward').wait()
+    #         _ = nnscaler.runtime.executor.backward('InputProj_Segment', (), (linear_240, ), (glinear_241, ))
+    #         nnscaler.runtime.device.DeviceGroup().get_event('backward').record()
+
+    #     del linear_240, glinear_241
+
+    #     with torch.cuda.stream(nnscaler.runtime.device.DeviceGroup().get_stream('comm')):
+    #         torch.cuda.current_stream().wait_stream(nnscaler.runtime.device.DeviceGroup().get_stream('comp'))
+    #         _ = nnscaler.runtime.executor.aexecute(model.reducer263, *(), requires_grad=False)
+
+    #     return cross_entropy_62, cross_entropy_179, cross_entropy_230, cross_entropy_281

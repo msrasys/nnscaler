@@ -196,6 +196,18 @@ class CubeModule(torch.nn.Module):
     # 1 if no scheduler is used.
     # will be assigned in the generated subclasses
     nmicros_per_scheduler_step: int
+    # whether to use multi stream for communication and computation overlapping
+    # this is a hint of overlapping
+    # will be assigned in the generated subclasses
+    use_multi_streams: bool
+    # whether synchronization is required before/after forward and backward
+    # when using multi streams
+    # If False, we will not synchronize the streams before/after forward and backward,
+    # which means the correctness relies on the proper overlapping design in your scheduler
+    # If True, we will insert stream synchronization before/after forward and backward
+    # to ensure the correctness,
+    # will be assigned in the generated subclasses
+    cuda_sync_required: bool
 
     def __init__(self):
         super().__init__()
@@ -1388,6 +1400,10 @@ class ParallelModule(CubeModule):
         if not is_dummy_batch and not scale_fn:
             return
 
+        # count the micro-batches for the current training step
+        # we only update this counter when we find the loss
+        # because backward pre hook might be called multiple times for each micro-batch
+        # (for example, in an overlapped pipeline or 1f1b_interleaved pipeline)
         accum_idx = 0
         def cube_scale(ins, outs, grads):
             nonlocal accum_idx

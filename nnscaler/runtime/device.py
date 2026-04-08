@@ -100,13 +100,19 @@ class _DeviceGroup:
             self.streams[name] = stream
         return self.streams[name]
 
-    def get_event(self, name: str) -> torch.cuda.Event:
+    def get_event(self, name: str, *, enable_timing: bool = False) -> torch.cuda.Event:
         """
         Get event by name. If name doesn't exist,
         will create a new one.
+
+        Args:
+            name: The name of the event.
+            enable_timing: Whether to enable timing for the event. Default is False.
+                This is only used when the event is created for the first time.
+                If the event already exists, this argument will be ignored.
         """
         if name not in self.events:
-            event = torch.cuda.Event()
+            event = torch.cuda.Event(enable_timing=enable_timing)
             self.events[name] = event
         return self.events[name]
 

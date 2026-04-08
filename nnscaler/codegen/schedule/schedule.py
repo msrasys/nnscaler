@@ -78,6 +78,7 @@ class ScheduleCodeGen(FuncEmission):
 
         assert all(not isinstance(n, IRFwOperation) for n in device_nodes), \
             "Expected all forward operators have been grouped into IRSegment"
+        self._validate_events(device_nodes)
 
         lifetime = LifeCycle(device_nodes, [], self.execplan.outputs())
 
@@ -174,6 +175,8 @@ class ScheduleCodeGen(FuncEmission):
 
         gencode += ['', '']
 
+        last_stream = None
+        buffered_codes.clear()
         # infer code
         if not any(not node.isfw() for node in device_nodes):
             gencode += ['_infer_step = _train_step']
@@ -243,6 +246,20 @@ class ScheduleCodeGen(FuncEmission):
 
         return wait_stream_codes + wait_event_codes + codes + record_event_codes
 
+    def _validate_events(self, nodes):
+        """
+        Validate that all events waited by nodes are recorded by some previous nodes in the graph
+        """
+        events = set()
+        for node in nodes:
+            stream_context = self._get_node_stream_context(node)
+            if stream_context:
+                if stream_context.wait_events:
+                    for wait_event in stream_context.wait_events:
+                        if wait_event not in events:
+                            raise ValueError(f'Event `{wait_event}` is waited but has not been recorded')
+                if stream_context.record_event:
+                    events.add(stream_context.record_event)
 
     def emit_detach(self, tensor: IRTensor) -> str:
         """

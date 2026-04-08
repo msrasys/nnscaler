@@ -172,8 +172,32 @@ class ExecutionPlan:
 
         execplan = ExecutionPlan(schedplan.graph, topo_seqs)
         execplan.set_outputs(outputs)
+
+        def _is_cuda_stream_used() -> bool:
+            if schedplan.stream_config.dataloader and schedplan.stream_config.dataloader.stream:
+                return True
+            if schedplan.stream_config.inter_segment_move and schedplan.stream_config.inter_segment_move.stream:
+                return True
+            if schedplan.stream_config.result_broadcast and schedplan.stream_config.result_broadcast.stream:
+                return True
+            if schedplan.stream_config.grad_reduce and schedplan.stream_config.grad_reduce.stream:
+                return True
+            if schedplan.stream_config.zero_grad and schedplan.stream_config.zero_grad.stream:
+                return True
+
+            for block in schedplan.nodes():
+                if (stream_context := block.stream_context) is not None:
+                    if stream_context.stream:
+                        return True
+                    if stream_context.wait_streams:
+                        return True
+            return False
+
+
         execplan.weight_reducer_stream_context = schedplan.stream_config.grad_reduce
         execplan.zero_grad_stream_context = schedplan.stream_config.zero_grad
+        execplan.use_multi_streams = _is_cuda_stream_used()
+        execplan.cuda_sync_required = execplan.use_multi_streams and schedplan.stream_config.cuda_sync_required
 
         return execplan
 
@@ -186,6 +210,8 @@ class ExecutionPlan:
         self._outputs = list(graph.outputs())
         self._weight_reducer_stream_context: Optional[StreamContext] = None
         self._zero_grad_stream_context: Optional[StreamContext] = None
+        self._use_multi_streams = False
+        self._cuda_sync_required = False
 
         for node in self._topo_seqs:
             assert len(node.device) > 0, f"Node device not set: {node}"
@@ -236,6 +262,22 @@ class ExecutionPlan:
     @zero_grad_stream_context.setter
     def zero_grad_stream_context(self, stream_context: StreamContext):
         self._zero_grad_stream_context = stream_context
+
+    @property
+    def use_multi_streams(self) -> bool:
+        return self._use_multi_streams
+
+    @use_multi_streams.setter
+    def use_multi_streams(self, value: bool):
+        self._use_multi_streams = value
+
+    @property
+    def cuda_sync_required(self) -> bool:
+        return self._cuda_sync_required
+
+    @cuda_sync_required.setter
+    def cuda_sync_required(self, value: bool):
+        self._cuda_sync_required = value
 
     def outputs(self) -> List[Any]:
         """Get execution plan return outputs"""

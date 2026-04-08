@@ -520,8 +520,11 @@ class ModuleCodeGen(FuncEmission):
             derived=[f'nnscaler.runtime.module.{"ParallelModule" if as_parallel_module else "CubeModule"}']
         ) as cb:
             graph_sched = self.execplan.graph.sched
+
             cb.insert_body(f'use_scheduler = {graph_sched is not None}')
             cb.insert_body(f'nmicros_per_scheduler_step = {graph_sched.nmicros if graph_sched is not None else 1}')
+            cb.insert_body(f'use_multi_streams = {self.execplan.use_multi_streams}')
+            cb.insert_body(f'cuda_sync_required = {self.execplan.cuda_sync_required}')
 
             if as_parallel_module:
                 cb.insert_body(f'rank = {device}')  # save rank in class level
