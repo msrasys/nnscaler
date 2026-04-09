@@ -1,16 +1,15 @@
 #  Copyright (c) Microsoft Corporation.
 #  Licensed under the MIT License.
 
-from dataclasses import asdict, dataclass, field, replace
+from dataclasses import asdict, dataclass, field
 import importlib
-from typing import Any, Callable, Dict, List, Literal, Optional, TYPE_CHECKING, Type, Union, TypeVar
+from typing import Any, Callable, Dict, List, Literal, Optional, TYPE_CHECKING, Protocol, Type, Union, TypeVar
 from typing_extensions import get_args
 from pathlib import Path
 import logging
 import inspect
-import copy
+import contextlib
 import os
-import builtins
 
 import torch
 import torch.utils
@@ -22,7 +21,6 @@ import torch
 import nnscaler
 from nnscaler.utils import enforce_zero_num_worker, fields, transform_recursively, load_type, copy_dynamic
 from nnscaler.parallel import ComputeConfig, build_optimizer, ReuseType, BroadcastGenFilesStrategy, _PREDEFINED_POLICIES
-from nnscaler.runtime.module import ParallelModule
 
 from .arg_parser import (
     deserialize_dataclass,
@@ -545,12 +543,157 @@ class LogConfig:
 
 
 @dataclass
+class ProfileScheduleConfig:
+    # schedule configuration for the profiler.
+    # The profiler will skip
+    # the first ``skip_first`` steps, then wait for ``wait`` steps,
+    # then do the warmup for the next ``warmup`` steps,
+    # then do the active recording for the next ``active`` steps and then repeat the cycle starting with ``wait`` steps.
+    # The optional number of cycles is specified with the ``repeat`` parameter, the zero value means that
+    # the cycles will continue until the profiling is finished.
+
+    # The ``skip_first_wait`` parameter controls whether the first ``wait`` stage should be skipped.
+    # This can be useful if a user wants to wait longer than ``skip_first`` between cycles, but not
+    # for the first profile. For example, if ``skip_first`` is 10 and ``wait`` is 20, the first cycle will
+    # wait 10 + 20 = 30 steps before warmup if ``skip_first_wait`` is zero, but will wait only 10
+    # steps if ``skip_first_wait`` is non-zero. All subsequent cycles will then wait 20 steps between the
+    # last active and warmup.
+
+    wait: int = 0
+    warmup: int = 0
+    active: int = 0
+    repeat: int = 0
+    skip_first: int = 0
+    skip_first_wait: int = 0
+
+
+@dataclass
+class ProfileDefaultTraceHandlerArgs:
+    # the file to save chrome trace,
+    # must contain `{step_num}`/`{rank}` to avoid overwriting traces of different steps/ranks
+    export_chrome_trace: Optional[str] = None
+    # the file to save stacks
+    # must contain `{step_num}`/`{rank}` to avoid overwriting stacks of different steps/ranks
+    # this option will be ignore if `with_stack` is False, as stacks will not be recorded in that case
+    export_stacks: Optional[str] = None
+    export_stacks_metric: str = 'self_cuda_time_total'
+
+    def __post_init__(self):
+        if self.export_chrome_trace:
+            if '{step_num}' not in self.export_chrome_trace:
+                raise ValueError("export_chrome_trace must contain '{step_num}' to avoid overwriting traces")
+            if '{rank}' not in self.export_chrome_trace:
+                raise ValueError("export_chrome_trace must contain '{rank}' to avoid overwriting traces.")
+        if self.export_stacks:
+            if self.export_stacks_metric not in (
+                    "self_cpu_time_total",
+                    "self_cuda_time_total",
+                    "self_xpu_time_total",
+            ):
+                raise ValueError(f"export_stacks_metric must be one of 'self_cpu_time_total', 'self_cuda_time_total', or 'self_xpu_time_total', but got {self.export_stacks_metric}")
+            if '{step_num}' not in self.export_stacks:
+                raise ValueError("export_stacks must contain '{step_num}' to avoid overwriting traces")
+            if '{rank}' not in self.export_stacks:
+                raise ValueError("export_stacks must contain '{rank}' to avoid overwriting traces.")
+
+
+@dataclass
+class ProfileTensorBoardTraceHandlerArgs:
+    dir_name: str
+    worker_name: Optional[str] = None
+    use_gzip: bool = False
+
+    def __post_init__(self):
+        if not self.dir_name:
+            raise ValueError("dir_name is required for ProfileTensorBoardTraceHandlerArgs")
+
+        if self.worker_name and '{rank}' not in self.worker_name:
+            raise ValueError('worker_name must contain "{rank}" to make it unique across different ranks')
+
+
+@dataclass
+class ProfileTraceHandlerConfig:
+    # currently we support two trace handlers:
+    # "default": the default trace handler that can export chrome trace and stacks
+    # "tensorboard": the trace handler that can export trace to tensorboard
+    name: str = 'default'
+    args: Union[ProfileDefaultTraceHandlerArgs, ProfileTensorBoardTraceHandlerArgs, None] = None
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> 'ProfileTraceHandlerConfig':
+        if not data:
+            data = {}
+        if 'name' not in data:
+            data['name'] = 'default'
+
+        name = data['name']
+        if name == 'default':
+            return cls(
+                name=name,
+                args=deserialize_dataclass(data.get('args', {}), ProfileDefaultTraceHandlerArgs)
+            )
+        elif name == 'tensorboard':
+            return cls(
+                name=name,
+                args=deserialize_dataclass(data.get('args', {}), ProfileTensorBoardTraceHandlerArgs)
+            )
+        else:
+            raise ValueError(f"Unsupported trace handler {name}")
+
+@dataclass
+class ProfileConfig:
+    # list of activity groups (CPU, CUDA, XPU) to use in profiling
+    activities: List[str] = field(default_factory=list)
+
+    schedule: ProfileScheduleConfig = field(default_factory=ProfileScheduleConfig)
+
+    # whether to record tensor shapes
+    record_shapes: bool = True
+    # whether to profile memory usage
+    profile_memory: bool = True
+    # whether to add stack traces
+    with_stack: bool = False
+    # whether to calculate FLOPs.
+    with_flops: bool = False
+    # record module hierarchy (including function names) corresponding to the callstack of the op
+    with_modules: bool = False
+
+    trace_handler: ProfileTraceHandlerConfig = field(
+        default_factory=lambda: ProfileTraceHandlerConfig(name='default'),
+        metadata={
+            'deserialize': ProfileTraceHandlerConfig.from_dict
+        }
+    )
+
+    def resolve_activities(self):
+        activity_map = {
+            'CPU': torch.profiler.ProfilerActivity.CPU,
+            'CUDA': torch.profiler.ProfilerActivity.CUDA,
+            'XPU': torch.profiler.ProfilerActivity.XPU,
+        }
+        activities = []
+        for a in self.activities or []:
+            a = a.upper()
+            if a not in activity_map:
+                raise ValueError(f"Unsupported activity {a} in ProfileConfig.activities")
+            activities.append(activity_map[a])
+        if not activities:
+            return None
+        return activities
+
+    def __post_init__(self):
+        if self.activities and any(a.upper() not in ('CPU', 'CUDA', 'XPU') for a in self.activities):
+            raise ValueError(f"Invalid activity found in activities {self.activities}")
+
+@dataclass
 class DebugConfig:
      # before gradient clip norm, check the gradient sync for the same parameter is consistent cross devices,
      # if ZeRO is enabled, will check the gradient cross each ZeRO group,
      # if ZeRO is not enabled, will check the gradient cross each nnscaler scale unit.
      # this helps to find bugs related to gradient updates during training.
     check_gradient_sync_cross_devices: bool = True
+    # profiling configuration using torch.profiler.profile
+    profile: Optional[ProfileConfig] = None
 
 
 @dataclass
@@ -622,6 +765,11 @@ def _deserialize_hook_config(hook) -> Union[HookConfig, HookMapConfig]:
             # because hooks can be functions (not str)
             return HookMapConfig(**hook)
     raise ValueError(f"Invalid hook config {hook}.")
+
+
+class _StepableContext(contextlib.AbstractContextManager):
+    def step(self):
+        ...
 
 
 @dataclass
@@ -1034,3 +1182,67 @@ class TrainerArgs(PrecisionMixin, PolicyMixin):
                 self.checkpoint.serializer.args
             )
         return Checkpointer(self.checkpoint.format)
+
+    def create_profiler(self) -> _StepableContext:
+        """Create a torch.profiler.profile context manager based on DebugConfig.profile settings.
+
+        Returns a profiler context manager if profiling is enabled, otherwise a contextlib.nullcontext.
+        """
+        profile_config = self.debug.profile
+        if not profile_config:
+            nc = contextlib.nullcontext()
+            nc.step = lambda: None  # add a dummy step method to avoid checking in the training loop
+            return nc
+
+        trace_handler_config = profile_config.trace_handler
+        schedule_config = profile_config.schedule
+        rank = int(os.environ.get('RANK', 0))
+
+        def _trace_handler(prof: torch.profiler.profile):
+            if trace_handler_config.args.export_chrome_trace:
+                trace_file = trace_handler_config.args.export_chrome_trace.format(
+                    step_num=prof.step_num,
+                    rank=rank
+                )
+                prof.export_chrome_trace(trace_file)
+            if profile_config.with_stack and trace_handler_config.args.export_stacks:
+                stacks_file = trace_handler_config.args.export_stacks.format(
+                    step_num=prof.step_num,
+                    rank=rank
+                )
+                prof.export_stacks(stacks_file, metric=trace_handler_config.args.export_stacks_metric)
+            return _trace_handler
+
+        def _get_trace_handler():
+            if trace_handler_config.name == 'default':
+                return _trace_handler
+            elif trace_handler_config.name == 'tensorboard':
+                args: ProfileTensorBoardTraceHandlerArgs = trace_handler_config.args
+                return torch.profiler.tensorboard_trace_handler(
+                    args.dir_name,
+                    worker_name=args.worker_name.format(rank=rank),
+                    use_gzip=args.use_gzip,
+                )
+            else:
+                raise ValueError(f"Unsupported trace handler {trace_handler_config.name}")
+
+        schedule = torch.profiler.schedule(
+            skip_first=schedule_config.skip_first,
+            skip_first_wait=schedule_config.skip_first_wait,
+            wait=schedule_config.wait,
+            warmup=schedule_config.warmup,
+            active=schedule_config.active,
+            repeat=schedule_config.repeat,
+        )
+
+        profiler = torch.profiler.profile(
+            activities=profile_config.resolve_activities(),
+            schedule=schedule,
+            on_trace_ready=_get_trace_handler(),
+            record_shapes=profile_config.record_shapes,
+            profile_memory=profile_config.profile_memory,
+            with_stack=profile_config.with_stack,
+            with_flops=profile_config.with_flops,
+            with_modules=profile_config.with_modules,
+        )
+        return profiler

@@ -95,6 +95,7 @@ class Trainer:
         self.checkpointer = None
         # RNG states pending resume; reset to None after resuming
         self.rng_states_from_resume: dict[str, torch.Tensor] | None = None
+        self.profiler = None
 
     def run(self):
         try:
@@ -215,6 +216,7 @@ class Trainer:
         # Currently we never pass `last_epoch` to its constructor
         self.lr_scheduler = self.train_args.create_lr_scheduler(self.optimizer)
         self.loggers = self.train_args.create_loggers()
+        self.profiler = self.train_args.create_profiler()
 
         supported_hook_components = [
             self.model,
@@ -829,29 +831,30 @@ class Trainer:
 
         self.hook.on_train_start(self)
 
-        for epoch in range(start_epoch, self.train_args.max_epochs or sys.maxsize):
-            # TODO: make sure set_epoch doesn't have negative effect when called multiple times (i.e. when resuming)
-            if hasattr(self.dataloader['train'], 'set_epoch'):
-                self.dataloader['train'].set_epoch(epoch)
-            elif hasattr(self.dataloader['train'].sampler, 'set_epoch'):
-                self.dataloader['train'].sampler.set_epoch(epoch)
+        with self.profiler:
+            for epoch in range(start_epoch, self.train_args.max_epochs or sys.maxsize):
+                # TODO: make sure set_epoch doesn't have negative effect when called multiple times (i.e. when resuming)
+                if hasattr(self.dataloader['train'], 'set_epoch'):
+                    self.dataloader['train'].set_epoch(epoch)
+                elif hasattr(self.dataloader['train'].sampler, 'set_epoch'):
+                    self.dataloader['train'].sampler.set_epoch(epoch)
 
-            torch.distributed.barrier()
+                torch.distributed.barrier()
 
-            self.hook.on_epoch_start(self, epoch)
-            self._train_epoch(epoch)
-            self.hook.on_epoch_end(self, epoch)
+                self.hook.on_epoch_start(self, epoch)
+                self._train_epoch(epoch)
+                self.hook.on_epoch_end(self, epoch)
 
-            if self.lr_scheduler and self.train_args.lr_scheduler.interval == 'epoch':
-                self.lr_scheduler.step()
+                if self.lr_scheduler and self.train_args.lr_scheduler.interval == 'epoch':
+                    self.lr_scheduler.step()
 
-            if self.train_args.max_train_steps and self.train_status.finished_train_steps >= self.train_args.max_train_steps:
-                logger.info(f"Reached max train steps({self.train_args.max_train_steps}): Training is done.")
-                break
+                if self.train_args.max_train_steps and self.train_status.finished_train_steps >= self.train_args.max_train_steps:
+                    logger.info(f"Reached max train steps({self.train_args.max_train_steps}): Training is done.")
+                    break
 
-        else:  # not break from for loop, which means not finished with max_train_steps
-            # finished with max_epochs
-            logger.info(f"Reached max_epochs({self.train_args.max_epochs}): Training is done.")
+            else:  # not break from for loop, which means not finished with max_train_steps
+                # finished with max_epochs
+                logger.info(f"Reached max_epochs({self.train_args.max_epochs}): Training is done.")
 
         self._log_finalize()
         self.hook.on_train_end(self)
@@ -1048,6 +1051,9 @@ class Trainer:
                     step_metrics = {}
 
             self.hook.on_step_end(self, epoch, idx, step_metrics, aggregated_outputs)
+
+            # step the profiler before validation and checkpointing
+            self.profiler.step()
 
             # validate and save checkpoint
             if self.train_args.checkpoint.every_n_train_steps and \

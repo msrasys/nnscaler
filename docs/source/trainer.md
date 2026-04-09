@@ -889,6 +889,7 @@ Please note
 @dataclass
 class DebugConfig:
     check_gradient_sync_cross_devices: bool = True
+    profile: Optional[ProfileConfig] = None
 ```
 
 - `check_gradient_sync_cross_devices` (`bool`): Before gradient clip
@@ -897,6 +898,158 @@ class DebugConfig:
   each ZeRO group; if ZeRO is not enabled, will check the gradient
   across each nnscaler scale unit. This helps to find bugs related to
   gradient updates during training. Default is `True`.
+- `profile` (`Optional[ProfileConfig]`): Profiling configuration using
+  `torch.profiler.profile`. Set to `None` (default) to disable profiling.
+  When set, the profiler will wrap the training loop and call `profiler.step()`
+  after each training step.
+
+### Profile Config
+
+``` python
+@dataclass
+class ProfileConfig:
+    activities: List[str] = field(default_factory=list)
+    schedule: ProfileScheduleConfig = field(default_factory=ProfileScheduleConfig)
+    record_shapes: bool = True
+    profile_memory: bool = True
+    with_stack: bool = False
+    with_flops: bool = False
+    with_modules: bool = False
+    trace_handler: ProfileTraceHandlerConfig = field(
+        default_factory=lambda: ProfileTraceHandlerConfig(name='default'),
+    )
+```
+
+- `activities` (`List[str]`): List of activity groups to profile.
+  Supported values: `"CPU"`, `"CUDA"`, `"XPU"`. If empty, PyTorch will
+  use a default set of activities.
+- `schedule` (`ProfileScheduleConfig`): Controls the profiler schedule
+  (see below).
+- `record_shapes` (`bool`): Whether to record tensor shapes. Default is `True`.
+- `profile_memory` (`bool`): Whether to profile memory usage. Default is `True`.
+- `with_stack` (`bool`): Whether to record source information (file and
+  line number) for ops. Default is `False`.
+- `with_flops` (`bool`): Whether to estimate FLOPs. Default is `False`.
+- `with_modules` (`bool`): Whether to record module hierarchy corresponding
+  to the callstack of the op. Default is `False`.
+- `trace_handler` (`ProfileTraceHandlerConfig`): Controls how profiler
+  traces are exported (see below).
+
+### Profile Schedule Config
+
+``` python
+@dataclass
+class ProfileScheduleConfig:
+    wait: int = 0
+    warmup: int = 0
+    active: int = 0
+    repeat: int = 0
+    skip_first: int = 0
+    skip_first_wait: int = 0
+```
+
+The profiler schedule works as follows: skip the first `skip_first` steps,
+then repeat cycles of `wait` → `warmup` → `active`. The `repeat` parameter
+controls the number of cycles (0 means repeat until training ends).
+
+- `wait` (`int`): Number of steps to wait (no profiling) at the start
+  of each cycle. Default is `0`.
+- `warmup` (`int`): Number of warmup steps (profiler is active but
+  results are discarded). Default is `0`.
+- `active` (`int`): Number of steps to actively record. Default is `0`.
+- `repeat` (`int`): Number of cycles. `0` means continuous until done.
+  Default is `0`.
+- `skip_first` (`int`): Number of steps to skip before the first cycle.
+  Default is `0`.
+- `skip_first_wait` (`int`): If non-zero, skip the first `wait` stage
+  in the first cycle. Default is `0`.
+
+### Profile Trace Handler Config
+
+``` python
+@dataclass
+class ProfileTraceHandlerConfig:
+    name: str = 'default'
+    args: Union[ProfileDefaultTraceHandlerArgs, ProfileTensorBoardTraceHandlerArgs, None] = None
+```
+
+Two trace handlers are supported:
+
+**`default`** — Exports Chrome trace and/or flame graph stacks to files.
+
+``` python
+@dataclass
+class ProfileDefaultTraceHandlerArgs:
+    export_chrome_trace: Optional[str] = None
+    export_stacks: Optional[str] = None
+    export_stacks_metric: str = 'self_cuda_time_total'
+```
+
+- `export_chrome_trace` (`Optional[str]`): File path pattern for Chrome
+  traces. Must contain `{step_num}` and `{rank}` placeholders. Example:
+  `"./traces/trace_rank{rank}_step{step_num}.json"`. View the output with
+  `chrome://tracing` or [Perfetto UI](https://ui.perfetto.dev/).
+- `export_stacks` (`Optional[str]`): File path pattern for flame graph
+  stacks. Must contain `{step_num}` and `{rank}`. Only effective when
+  `with_stack` is `True`.
+- `export_stacks_metric` (`str`): Metric for stacks export. One of
+  `"self_cpu_time_total"`, `"self_cuda_time_total"`,
+  `"self_xpu_time_total"`. Default is `"self_cuda_time_total"`.
+
+**`tensorboard`** — Exports traces to TensorBoard format.
+
+``` python
+@dataclass
+class ProfileTensorBoardTraceHandlerArgs:
+    dir_name: str
+    worker_name: Optional[str] = None
+    use_gzip: bool = False
+```
+
+- `dir_name` (`str`): Directory to save TensorBoard trace files.
+- `worker_name` (`Optional[str]`): Worker name. Must contain `{rank}`
+  if specified, to make it unique across ranks.
+- `use_gzip` (`bool`): Whether to compress traces with gzip. Default is `False`.
+
+#### Example: Profiling with Chrome Trace
+
+``` yaml
+debug:
+  profile:
+    activities:
+      - CPU
+      - CUDA
+    schedule:
+      skip_first: 2
+      wait: 0
+      warmup: 1
+      active: 3
+    record_shapes: true
+    profile_memory: true
+    trace_handler:
+      name: default
+      args:
+        export_chrome_trace: ./profiler_traces/trace_rank{rank}_step{step_num}.json
+```
+
+#### Example: Profiling with TensorBoard
+
+``` yaml
+debug:
+  profile:
+    activities:
+      - CPU
+      - CUDA
+    schedule:
+      skip_first: 2
+      warmup: 1
+      active: 3
+    trace_handler:
+      name: tensorboard
+      args:
+        dir_name: ./tb_profiler_logs
+        worker_name: worker_{rank}
+```
 
 ## CLI
 
