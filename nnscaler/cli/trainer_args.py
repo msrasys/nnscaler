@@ -574,7 +574,7 @@ class ProfileDefaultTraceHandlerArgs:
     export_chrome_trace: Optional[str] = None
     # the file to save stacks
     # must contain `{step_num}`/`{rank}` to avoid overwriting stacks of different steps/ranks
-    # this option will be ignore if `with_stack` is False, as stacks will not be recorded in that case
+    # this option will be ignored if `with_stack` is False, as stacks will not be recorded in that case
     export_stacks: Optional[str] = None
     export_stacks_metric: str = 'self_cuda_time_total'
 
@@ -617,7 +617,9 @@ class ProfileTraceHandlerConfig:
     # "default": the default trace handler that can export chrome trace and stacks
     # "tensorboard": the trace handler that can export trace to tensorboard
     name: str = 'default'
-    args: Union[ProfileDefaultTraceHandlerArgs, ProfileTensorBoardTraceHandlerArgs, None] = None
+    args: Union[ProfileDefaultTraceHandlerArgs, ProfileTensorBoardTraceHandlerArgs] = field(
+        default_factory=ProfileDefaultTraceHandlerArgs,
+    )
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> 'ProfileTraceHandlerConfig':
@@ -640,6 +642,17 @@ class ProfileTraceHandlerConfig:
         else:
             raise ValueError(f"Unsupported trace handler {name}")
 
+    def __post_init__(self):
+        if self.name not in ('default', 'tensorboard'):
+            raise ValueError(f"Unsupported trace handler {self.name}")
+
+        if self.name == 'default' and not isinstance(self.args, ProfileDefaultTraceHandlerArgs):
+            raise ValueError("args must be of type ProfileDefaultTraceHandlerArgs when name is 'default'")
+
+        if self.name == 'tensorboard' and not isinstance(self.args, ProfileTensorBoardTraceHandlerArgs):
+            raise ValueError("args must be of type ProfileTensorBoardTraceHandlerArgs when name is 'tensorboard'")
+
+
 @dataclass
 class ProfileConfig:
     # list of activity groups (CPU, CUDA, XPU) to use in profiling
@@ -659,7 +672,7 @@ class ProfileConfig:
     with_modules: bool = False
 
     trace_handler: ProfileTraceHandlerConfig = field(
-        default_factory=lambda: ProfileTraceHandlerConfig(name='default'),
+        default_factory=ProfileTraceHandlerConfig,
         metadata={
             'deserialize': ProfileTraceHandlerConfig.from_dict
         }
@@ -767,7 +780,11 @@ def _deserialize_hook_config(hook) -> Union[HookConfig, HookMapConfig]:
     raise ValueError(f"Invalid hook config {hook}.")
 
 
-class _StepableContext(contextlib.AbstractContextManager):
+class _StepableContext(Protocol):
+    def __enter__(self):
+        ...
+    def __exit__(self, exc_type, exc_value, traceback):
+        ...
     def step(self):
         ...
 
@@ -1204,14 +1221,15 @@ class TrainerArgs(PrecisionMixin, PolicyMixin):
                     step_num=prof.step_num,
                     rank=rank
                 )
+                Path(trace_file).parent.mkdir(parents=True, exist_ok=True)
                 prof.export_chrome_trace(trace_file)
             if profile_config.with_stack and trace_handler_config.args.export_stacks:
                 stacks_file = trace_handler_config.args.export_stacks.format(
                     step_num=prof.step_num,
                     rank=rank
                 )
+                Path(stacks_file).parent.mkdir(parents=True, exist_ok=True)
                 prof.export_stacks(stacks_file, metric=trace_handler_config.args.export_stacks_metric)
-            return _trace_handler
 
         def _get_trace_handler():
             if trace_handler_config.name == 'default':
@@ -1220,7 +1238,7 @@ class TrainerArgs(PrecisionMixin, PolicyMixin):
                 args: ProfileTensorBoardTraceHandlerArgs = trace_handler_config.args
                 return torch.profiler.tensorboard_trace_handler(
                     args.dir_name,
-                    worker_name=args.worker_name.format(rank=rank),
+                    worker_name=None if args.worker_name is None else args.worker_name.format(rank=rank),
                     use_gzip=args.use_gzip,
                 )
             else:
