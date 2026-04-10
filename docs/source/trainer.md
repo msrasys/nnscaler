@@ -915,9 +915,7 @@ class ProfileConfig:
     with_stack: bool = False
     with_flops: bool = False
     with_modules: bool = False
-    trace_handler: ProfileTraceHandlerConfig = field(
-        default_factory=lambda: ProfileTraceHandlerConfig(name='default'),
-    )
+    trace_handler: ProfileTraceHandlerConfig,
 ```
 
 - `activities` (`List[str]`): List of activity groups to profile.
@@ -970,7 +968,7 @@ controls the number of cycles (0 means repeat until training ends).
 @dataclass
 class ProfileTraceHandlerConfig:
     name: str = 'default'
-    args: Union[ProfileDefaultTraceHandlerArgs, ProfileTensorBoardTraceHandlerArgs, None] = None
+    args: Union[ProfileDefaultTraceHandlerArgs, ProfileTensorBoardTraceHandlerArgs]
 ```
 
 Two trace handlers are supported:
