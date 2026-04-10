@@ -44,7 +44,8 @@ dataloader:
     drop_last: $(vars.drop_last)
 
 checkpoint:
-  no_save: true
+  every_n_train_steps: 100
+  save_type: deduped
 
 debug:
   profile:
