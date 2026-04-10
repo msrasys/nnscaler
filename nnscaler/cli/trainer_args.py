@@ -698,6 +698,7 @@ class ProfileConfig:
         if self.activities and any(a.upper() not in ('CPU', 'CUDA', 'XPU') for a in self.activities):
             raise ValueError(f"Invalid activity found in activities {self.activities}")
 
+
 @dataclass
 class DebugConfig:
      # before gradient clip norm, check the gradient sync for the same parameter is consistent cross devices,
