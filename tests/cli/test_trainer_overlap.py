@@ -68,7 +68,7 @@ class AllToAllFunction(Function):
         chunks = [t.contiguous() for t in grad.chunk(ws, dim=0)]
         out = [torch.empty_like(c) for c in chunks]
         dist.all_to_all(out, chunks)
-        return torch.cat(out, dim=0), None
+        return torch.cat(out, dim=0)
 
 
 def all_to_all_fake(x: torch.Tensor) -> torch.Tensor:
