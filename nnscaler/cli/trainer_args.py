@@ -566,6 +566,20 @@ class ProfileScheduleConfig:
     skip_first: int = 0
     skip_first_wait: int = 0
 
+    def __post_init__(self):
+        if self.wait < 0:
+            raise ValueError("wait must be non-negative")
+        if self.warmup < 0:
+            raise ValueError("warmup must be non-negative")
+        if self.active < 0:
+            raise ValueError("active must be non-negative")
+        if self.repeat < 0:
+            raise ValueError("repeat must be non-negative")
+        if self.skip_first < 0:
+            raise ValueError("skip_first must be non-negative")
+        if self.skip_first_wait < 0:
+            raise ValueError("skip_first_wait must be non-negative")
+
 
 @dataclass
 class ProfileDefaultTraceHandlerArgs:
@@ -595,6 +609,9 @@ class ProfileDefaultTraceHandlerArgs:
                 raise ValueError("export_stacks must contain '{step_num}' to avoid overwriting traces")
             if '{rank}' not in self.export_stacks:
                 raise ValueError("export_stacks must contain '{rank}' to avoid overwriting traces.")
+
+        if not self.export_chrome_trace and not self.export_stacks:
+            raise ValueError("At least one of export_chrome_trace and export_stacks must be specified")
 
 
 @dataclass
