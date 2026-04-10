@@ -577,9 +577,9 @@ Please note that user code is flattened and transformed into a single `ParallelM
 
 There are two ways to use `ParallelModule` with Trainer:
 
-1. Pipeline Parallelism with End2End Module (DP/TP can also be used here): You must use `ParallelModule.train_step` and `ParallelModule.infer_step` (which are wrappers of `_train_step`/`_infer_step` from gencode of `ExecutionPlan`) to train/infer the module. The PAS policy must have pipeline parallelism, and the compute config must set `use_end2end=True`.
+1. Pipeline Parallelism with End2End Module (Data Parallelism/Tensor Parallelism can also be used here): You must use `ParallelModule.train_step` and `ParallelModule.infer_step` (which are wrappers of `_train_step`/`_infer_step` from gencode of `ExecutionPlan`) to train/infer the module. The PAS policy must have pipeline parallelism, and the compute config must set `use_end2end=True`.
 
-2. Pure Non-Pipeline (DP/TP) Parallelism: You can use `ParallelModule` just like a normal `torch.nn.Module`, i.e., call `ParallelModule.forward` to do forward, and use `build_optimizer` to create optimizer for the module. `ParallelModule.train_step` and `ParallelModule.infer_step` are also available, which are just a wrapper of `ParallelModule.forward`. The PAS policy must not have pipeline parallelism.
+2. Pure Non-Pipeline Parallelism (Data Parallelism/Tensor Parallelism) : You can use `ParallelModule` just like a normal `torch.nn.Module`, i.e., call `ParallelModule.forward` to do forward, and use `build_optimizer` to create optimizer for the module. `ParallelModule.train_step` and `ParallelModule.infer_step` are also available, which are just a wrapper of `ParallelModule.forward`. The PAS policy must not have pipeline parallelism.
 
 We can distinguish the above two ways by checking `ParallelModule.use_scheduler` flag.
 
