@@ -48,11 +48,6 @@ _profile_data = []  # collected per merged-step timing records
 _TIMING_BREAKDOWN = os.environ.get('TIMING_BREAKDOWN', '0') not in ('0', '')
 _LAYER_CHECKSUM = bool(os.environ.get('LAYER_CHECKSUM'))
 
-# Layer-level torch profiler: only profile specified layers
-_PROFILE_LAYERS = set()
-_pl_str = os.environ.get('TORCH_PROFILE_LAYERS', '')
-if _pl_str:
-    _PROFILE_LAYERS = {int(x.strip()) for x in _pl_str.split(',') if x.strip()}
 
 
 def _log_checksum(tag, tensor):
@@ -67,88 +62,61 @@ def _log_checksum(tag, tensor):
     _logger.info(f"[CHECKSUM] {tag} sum={s:.15e} norm={n:.15e} max={mx:.15e}")
 
 
-class _LayerProfiler:
-    """Per-layer torch profiler.  Each start/stop pair produces one trace file."""
-
-    def __init__(self, target_layers, output_dir):
-        self.target_layers = target_layers
-        self.output_dir = output_dir
-        self._prof = None
-        self._tag = None
-
-    def should_profile(self, layer_idx):
-        return layer_idx in self.target_layers
-
-    def start(self, tag):
-        os.makedirs(self.output_dir, exist_ok=True)
-        self._tag = tag
-        self._prof = torch.profiler.profile(
-            activities=[
-                torch.profiler.ProfilerActivity.CPU,
-                torch.profiler.ProfilerActivity.CUDA,
-            ],
-            record_shapes=True,
-            with_stack=True,
-            with_flops=True,
-        )
-        self._prof.__enter__()
-
-    def stop(self):
-        if self._prof is None:
-            return
-        self._prof.__exit__(None, None, None)
-        import torch.distributed as _dist
-        rank = _dist.get_rank() if _dist.is_initialized() else 0
-        path = os.path.join(self.output_dir, f"{self._tag}_rank{rank}.json")
-        self._prof.export_chrome_trace(path)
-        _logger.info(f"[LAYER_PROFILE] {path}")
-        self._prof = None
-
 
 class _TimingCtx:
-    """Lightweight timing context for run() breakdown.
+    """Lightweight timing context for run() breakdown using CUDA events.
+
+    Uses CUDA events with enable_timing=True instead of torch.cuda.synchronize()
+    + perf_counter. This avoids ~15 device-wide syncs per step that distort
+    profiling results and make overlap debugging impossible.
+
+    Only one synchronize happens: inside report(), after all work is done.
 
     Usage:
         tb = _TimingCtx(enabled)
         tb.start()
         ... code ...
-        tb.mark('phase_name')  # records elapsed since last mark/start
+        tb.mark('phase_name')  # records a CUDA event (no sync)
         ... more code ...
         tb.mark('next_phase')
-        tb.report()
+        tb.report()             # single sync + elapsed_time() for all segments
     """
 
     def __init__(self, enabled):
         self.enabled = enabled
-        self.records = []  # [(name, seconds)]
-        self._t = 0.0
+        self._events = []       # [(name, start_event, end_event)]
+        self._last_event = None
 
     def start(self):
         if not self.enabled:
             return
-        torch.cuda.synchronize()
-        import time as _time
-        self._t = _time.perf_counter()
+        ev = torch.cuda.Event(enable_timing=True)
+        ev.record()
+        self._last_event = ev
 
     def mark(self, name):
         if not self.enabled:
             return
-        torch.cuda.synchronize()
-        import time as _time
-        now = _time.perf_counter()
-        self.records.append((name, now - self._t))
-        self._t = now
+        ev = torch.cuda.Event(enable_timing=True)
+        ev.record()
+        self._events.append((name, self._last_event, ev))
+        self._last_event = ev
 
     def report(self, label="TIMING BREAKDOWN"):
-        if not self.enabled or not self.records:
+        if not self.enabled or not self._events:
             return
+        torch.cuda.synchronize()
         import torch.distributed as dist
         rank = dist.get_rank() if dist.is_initialized() else 0
         if rank != 0:
             return
-        total = sum(t for _, t in self.records)
+        records = []
+        for name, start_ev, end_ev in self._events:
+            ms = start_ev.elapsed_time(end_ev)
+            records.append((name, ms / 1000.0))
+        total = sum(t for _, t in records)
         lines = [f"=== {label} ==="]
-        for name, t in self.records:
+        for name, t in records:
             pct = t / total * 100 if total > 0 else 0
             lines.append(f"  {name:30s}: {t:8.3f}s  ({pct:5.1f}%)")
         lines.append(f"  {'TOTAL':30s}: {total:8.3f}s")
@@ -643,23 +611,10 @@ class MergedScheduler:
         events = [torch.cuda.Event() for _ in range(num_mbs)]
         results = [None] * num_mbs
 
-        # Layer-level profiler: only active on target step + target layers
-        self._layer_profiler = None
-        if _PROFILE_LAYERS:
-            self._run_count = getattr(self, '_run_count', 0) + 1
-            _target_step = int(os.environ.get('TORCH_PROFILE_STEP', '0'))
-            if _target_step > 0 and self._run_count == _target_step:
-                import torch.distributed as _dist
-                rank = _dist.get_rank() if _dist.is_initialized() else 0
-                if rank == 0:
-                    self._layer_profiler = _LayerProfiler(
-                        _PROFILE_LAYERS,
-                        os.environ.get('TORCH_PROFILE_DIR', '/tmp/torch_profile'))
-                    _logger.info(
-                        f"[LAYER_PROFILE] Step {_target_step}: profiling layers "
-                        f"{sorted(_PROFILE_LAYERS)}")
+        # Layer-level profiler: removed (synchronize-based profiling destroys
+        # dual-stream overlap; use PROFILE_OVERLAP or nsys instead)
 
-        _logger.info("Warmup: forward mb0")
+        _logger.debug("Warmup: forward mb0")
         with torch.cuda.stream(get_comp_stream()):
             h0 = embed_fn(samples[0])
         _log_checksum("merged embed mb=0", h0)
@@ -694,7 +649,7 @@ class MergedScheduler:
             fwd_sample = samples[mb_i + 1]
             fwd_event = events[mb_i + 1]
 
-            _logger.info(f"[MERGED] bwd(mb{mb_i}) + fwd(mb{mb_i+1})")
+            _logger.debug(f"[MERGED] bwd(mb{mb_i}) + fwd(mb{mb_i+1})")
 
             # Launch embed on COMM — overlaps with loss_bwd on COMP.
             # embed_fn only reads sample data + embedding weight, independent of COMP.
@@ -751,19 +706,9 @@ class MergedScheduler:
                     continue
 
                 with nnscaler.sync_grad_when(False):
-                    lp = self._layer_profiler
-                    _do_lp = lp and (lp.should_profile(fwd_idx) or lp.should_profile(bwd_idx))
-                    if _do_lp:
-                        torch.cuda.synchronize()
-                        lp.start(f"merged_mb{mb_i}_fwd{fwd_idx}_bwd{bwd_idx}")
-
                     fwd_h, grad_h, fwd_entry = self._merged_step_general(
                         bwd_entry, fwd_lc, fwd_event, grad_h, fwd_h,
                         fwd_layer_idx=fwd_idx, bwd_layer_idx=bwd_idx)
-
-                    if _do_lp:
-                        torch.cuda.synchronize()
-                        lp.stop()
 
                 prev_all_nodes[bwd_idx] = None
 
@@ -841,7 +786,7 @@ class MergedScheduler:
             del fwd_lc_list
             tb.mark(f"mb{mb_i}_loss_fwd")
 
-        _logger.info(f"Cooldown: backward mb{num_mbs-1}")
+        _logger.debug(f"Cooldown: backward mb{num_mbs-1}")
         with nnscaler.sync_grad_when(False):
             grad_h = prev_loss_node.backward(loss_grad)
             for i in reversed(range(num_steps)):
@@ -854,15 +799,7 @@ class MergedScheduler:
                     continue
                 if entry is None:
                     continue
-                lp = self._layer_profiler
-                _do_lp = lp and lp.should_profile(i)
-                if _do_lp:
-                    torch.cuda.synchronize()
-                    lp.start(f"cooldown_bwd_layer{i}")
                 grad_h = self._backward_entry(entry, grad_h)
-                if _do_lp:
-                    torch.cuda.synchronize()
-                    lp.stop()
         tb.mark("cooldown_bwd")
 
         if _PROFILE_OVERLAP:
@@ -891,7 +828,6 @@ class MergedScheduler:
 
         del prev_all_nodes, prev_loss_node
 
-        self._layer_profiler = None
 
         tb.report("MERGED SCHEDULER BREAKDOWN")
 
@@ -1004,12 +940,6 @@ class MergedScheduler:
         expert_probs = []
 
         for si, lc in enumerate(lc_list):
-            lp = self._layer_profiler
-            _do_lp = lp and lp.should_profile(si)
-            if _do_lp:
-                torch.cuda.synchronize()
-                lp.start(f"warmup_fwd_layer{si}")
-
             if lc.is_special:
                 # Sync COMM→COMP: previous MoE layer's combine ran on COMM,
                 # special_forward runs on COMP and needs the COMM-produced h.
@@ -1017,9 +947,6 @@ class MergedScheduler:
                 with torch.cuda.stream(get_comp_stream()):
                     h, special_data = lc.special_forward(h)
                 all_nodes.append(('special', lc))
-                if _do_lp:
-                    torch.cuda.synchronize()
-                    lp.stop()
                 continue
 
             if lc.is_moe and self._use_4node:
@@ -1044,10 +971,6 @@ class MergedScheduler:
 
             _log_checksum(f"merged layer={si}", h)
             all_nodes.append(entry)
-
-            if _do_lp:
-                torch.cuda.synchronize()
-                lp.stop()
 
         return h, all_nodes, routing_maps, expert_probs
 
