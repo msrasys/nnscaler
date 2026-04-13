@@ -75,7 +75,7 @@ from nnscaler.graph.segment import IRSegment
 from nnscaler.flags import CompileFlag
 
 
-@dataclass(frozen=True)
+@dataclass
 class StreamContext:
     """
     StreamContext is a dataclass that holds the stream context of an operation.
@@ -87,13 +87,21 @@ class StreamContext:
     Args:
         stream: The stream name that the operation is executed on.
         wait_streams: The stream names that the operation needs to wait for before execution.
-        record_event: The event name that the operation needs to record after execution.
+        record_events: The event names that the operation needs to record after execution.
         wait_events: The event names that the operation needs to wait for before execution.
     """
     stream: Optional[str] = None
     wait_streams: Optional[List[str]] = None
-    record_event: Optional[str] = None
+    record_events: Optional[List[str]] = None
     wait_events: Optional[List[str]] = None
+
+    def __post_init__(self):
+        if isinstance(self.wait_streams, str):
+            self.wait_streams = [self.wait_streams]
+        if isinstance(self.record_events, str):
+            self.record_events = [self.record_events]
+        if isinstance(self.wait_events, str):
+            self.wait_events = [self.wait_events]
 
 
 class Block:

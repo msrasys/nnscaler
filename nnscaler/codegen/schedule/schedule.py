@@ -241,8 +241,9 @@ class ScheduleCodeGen(FuncEmission):
                 wait_event_codes.append(f'nnscaler.runtime.device.DeviceGroup().get_event({repr(wait_event)}).wait()')
 
         record_event_codes = []
-        if stream_context and stream_context.record_event:
-            record_event_codes.append(f'nnscaler.runtime.device.DeviceGroup().get_event({repr(stream_context.record_event)}).record()')
+        if stream_context and stream_context.record_events:
+            for record_event in stream_context.record_events:
+                record_event_codes.append(f'nnscaler.runtime.device.DeviceGroup().get_event({repr(record_event)}).record()')
 
         return wait_stream_codes + wait_event_codes + codes + record_event_codes
 
@@ -258,8 +259,9 @@ class ScheduleCodeGen(FuncEmission):
                     for wait_event in stream_context.wait_events:
                         if wait_event not in events:
                             raise ValueError(f'Event `{wait_event}` is waited but has not been recorded')
-                if stream_context.record_event:
-                    events.add(stream_context.record_event)
+                if stream_context.record_events:
+                    for record_event in stream_context.record_events:
+                        events.add(record_event)
 
     def emit_detach(self, tensor: IRTensor) -> str:
         """
