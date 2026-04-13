@@ -137,27 +137,50 @@ def _profile_report():
     phase_names = ['P1(b_combine||f_attn)', 'P2(b_expert||f_dispatch)',
                    'P3(b_dispatch||f_expert)', 'P4(b_attn||f_combine)']
 
-    # Compute timings from stored events
+    # Compute timings from stored events.
+    # Events are recorded BEFORE cross-stream barriers, so the faster stream's
+    # measurement for the NEXT phase includes its barrier wait.
+    # Decontamination: subtract the barrier wait (= gap between the two streams
+    # in the previous phase) from the stream that waited.
     records = []
     for raw in _profile_data:
         ce, me = raw['ce'], raw['me']
-        phases = []
-        for pi in range(4):
-            comp_ms = ce[pi].elapsed_time(ce[pi + 1])
-            if sequential:
-                # Both streams are the same; comp_ms == serialized total for this phase
-                phases.append({'total_ms': comp_ms})
-            else:
-                comm_ms = me[pi].elapsed_time(me[pi + 1])
-                wall_ms = max(comp_ms, comm_ms)
-                phases.append({'comp_ms': comp_ms, 'comm_ms': comm_ms, 'wall_ms': wall_ms})
         if sequential:
+            phases = []
+            for pi in range(4):
+                phases.append({'total_ms': ce[pi].elapsed_time(ce[pi + 1])})
             total = sum(p['total_ms'] for p in phases)
             records.append({'total_ms': total, 'phases': phases})
         else:
-            total_comp = sum(p['comp_ms'] for p in phases)
-            total_comm = sum(p['comm_ms'] for p in phases)
-            total_wall = max(ce[0].elapsed_time(ce[4]), me[0].elapsed_time(me[4]))
+            # Collect raw (contaminated) measurements
+            raw_comp = [ce[pi].elapsed_time(ce[pi + 1]) for pi in range(4)]
+            raw_comm = [me[pi].elapsed_time(me[pi + 1]) for pi in range(4)]
+
+            # Decontaminate: P1 is clean; for P2-P4, remove barrier wait leakage
+            act_comp = [0.0] * 4
+            act_comm = [0.0] * 4
+            act_comp[0] = raw_comp[0]
+            act_comm[0] = raw_comm[0]
+            for pi in range(1, 4):
+                barrier_wait = abs(act_comp[pi - 1] - act_comm[pi - 1])
+                if act_comp[pi - 1] < act_comm[pi - 1]:
+                    # COMP was faster → COMP waited at barrier → its next measurement is inflated
+                    act_comp[pi] = raw_comp[pi] - barrier_wait
+                    act_comm[pi] = raw_comm[pi]
+                else:
+                    act_comp[pi] = raw_comp[pi]
+                    act_comm[pi] = raw_comm[pi] - barrier_wait
+
+            phases = []
+            for pi in range(4):
+                wall_ms = max(act_comp[pi], act_comm[pi])
+                phases.append({
+                    'comp_ms': act_comp[pi], 'comm_ms': act_comm[pi], 'wall_ms': wall_ms,
+                    'raw_comp_ms': raw_comp[pi], 'raw_comm_ms': raw_comm[pi],
+                })
+            total_comp = sum(act_comp)
+            total_comm = sum(act_comm)
+            total_wall = sum(p['wall_ms'] for p in phases)
             records.append({
                 'wall_ms': total_wall, 'comp_ms': total_comp, 'comm_ms': total_comm,
                 'phases': phases
@@ -184,18 +207,21 @@ def _profile_report():
         _logger.info(
             f"[PROFILE] 4-phase merged step (n={n}): "
             f"wall={avg_wall:.2f}ms, comp={avg_comp:.2f}ms, comm={avg_comm:.2f}ms, "
-            f"measured_overlap={avg_overlap_pct:.1f}%"
+            f"overlap={avg_overlap_pct:.1f}%"
         )
         for pi in range(4):
-            comp_times = [r['phases'][pi]['comp_ms'] for r in records]
-            comm_times = [r['phases'][pi]['comm_ms'] for r in records]
-            wall_times = [r['phases'][pi]['wall_ms'] for r in records]
-            ac = sum(comp_times) / n
-            am = sum(comm_times) / n
-            aw = sum(wall_times) / n
+            ac = sum(r['phases'][pi]['comp_ms'] for r in records) / n
+            am = sum(r['phases'][pi]['comm_ms'] for r in records) / n
+            aw = sum(r['phases'][pi]['wall_ms'] for r in records) / n
+            rc = sum(r['phases'][pi]['raw_comp_ms'] for r in records) / n
+            rm = sum(r['phases'][pi]['raw_comm_ms'] for r in records) / n
             op = (ac + am - aw) / aw * 100 if aw > 0 else 0
+            raw_note = ""
+            if abs(rc - ac) > 0.01 or abs(rm - am) > 0.01:
+                raw_note = f" (raw: comp={rc:.2f} comm={rm:.2f})"
             _logger.info(
-                f"  {phase_names[pi]}: wall={aw:.2f}ms comp={ac:.2f}ms comm={am:.2f}ms measured_overlap={op:.1f}%"
+                f"  {phase_names[pi]}: wall={aw:.2f}ms comp={ac:.2f}ms comm={am:.2f}ms "
+                f"overlap={op:.1f}%{raw_note}"
             )
     _profile_data.clear()
 
@@ -518,7 +544,7 @@ class LayerCallables:
     attn_fn: Callable = None          # (h) -> (h, h_ln) for MoE, (h) -> h for dense
     dispatch_fn: Callable = None      # (h_ln) -> (sorted_tokens, sorted_probs)
     expert_fn: Callable = None        # (sorted_tokens, sorted_probs) -> expert_outs
-    combine_fn: Callable = None       # (expert_outs, h, h_ln) -> h_out
+    combine_fn: Callable = None       # (expert_outs, h, shared_expert_out) -> h_out
 
     # Dense-only:
     body_fn: Callable = None          # (h) -> h_out (wraps FFN)
@@ -990,15 +1016,21 @@ class MergedScheduler:
         return h, ('layer2', nodes)
 
     def _forward_single_layer_4node(self, h, lc, event):
-        """Forward a single MoE layer through 4 nodes."""
+        """Forward a single MoE layer through 4 nodes.
+
+        expert_fn now includes shared expert: takes (sorted_tokens, sorted_probs, h_ln),
+        returns (expert_outs, shared_expert_out). combine_fn takes shared_expert_out
+        directly, keeping combine (COMM) as pure communication.
+        """
         nodes = self._create_nodes_4(lc, event)
         attn_n, dispatch_n, expert_n, combine_n = nodes
 
         attn_out = attn_n.forward((h,))
         h_residual, h_ln, routing_probs = attn_out
         dispatch_out = dispatch_n.forward((h_ln, routing_probs))
-        expert_out = expert_n.forward(dispatch_out)
-        h_out = combine_n.forward((expert_out, h_residual, h_ln))
+        expert_result = expert_n.forward((*dispatch_out, h_ln))
+        expert_out, shared_expert_out = expert_result
+        h_out = combine_n.forward((expert_out, h_residual, shared_expert_out))
 
         for n in nodes:
             if n.checkpoint:
@@ -1023,22 +1055,30 @@ class MergedScheduler:
         return grad_x
 
     def _backward_layer_4node(self, nodes, grad_h):
-        """Backward through a 4-node MoE layer: combine→expert→dispatch→attn."""
+        """Backward through a 4-node MoE layer: combine→expert→dispatch→attn.
+
+        expert_fn includes shared expert, so expert backward produces grad_h_ln
+        as its 3rd output gradient (for the h_ln input).
+        """
         attn_n, dispatch_n, expert_n, combine_n = nodes
         # Ensure grad addition and sanitize_grad run on COMP stream,
         # not the default stream (which has no sync with COMP/COMM in overlap mode).
         with torch.cuda.stream(get_comp_stream()):
             self._sync_comp_to_comm()
 
+            # combine_grads: (grad_expert_outs, grad_h_residual, grad_shared_expert_out)
             combine_grads = combine_n.backward(grad_h)
-            expert_grads = expert_n.backward(combine_grads[0])
-            dispatch_grads = dispatch_n.backward(expert_grads)
+            # expert backward needs grads for both outputs: expert_outs and shared_expert_out
+            expert_grads = expert_n.backward((combine_grads[0], combine_grads[2]))
+            # expert_grads: (grad_sorted_tokens, grad_sorted_probs, grad_h_ln)
+            dispatch_grads = dispatch_n.backward((expert_grads[0], expert_grads[1]))
 
             self._sync_comm_to_comp()
             # Record COMM-produced grads for COMP-side addition and attn backward.
             self._record_for_comp(dispatch_grads)
             self._record_for_comp(combine_grads)
-            grad_h_ln_total = dispatch_grads[0] + combine_grads[2]
+
+            grad_h_ln_total = dispatch_grads[0] + expert_grads[2]
 
             grad_x = attn_n.backward((combine_grads[1], grad_h_ln_total, dispatch_grads[1]))
             grad_x = sanitize_grad(grad_x, self.grad_clamp_value)
@@ -1094,14 +1134,13 @@ class MergedScheduler:
         would serialize all operations). Instead, we use explicit cross-stream
         barriers at phase boundaries to enforce data dependencies.
 
-        Phase 1: f_attn_router(COMP) || b_combine(COMM)
-        Phase 2: b_expert    (COMP) || f_dispatch (COMM)
-        Phase 3: f_expert    (COMP) || b_dispatch (COMM)
+        Phase 1: f_attn_router(COMP) || b_combine(COMM)   [combine = pure comm]
+        Phase 2: b_expert    (COMP) || f_dispatch (COMM)   [expert includes shared expert bwd]
+        Phase 3: f_expert    (COMP) || b_dispatch (COMM)   [expert includes shared expert fwd]
         Phase 4: b_attn      (COMP) || f_combine  (COMM)
 
-        Async overlap: COMM and COMP ops within each phase are launched from
-        separate CPU threads so their kernel launches interleave, enabling
-        true GPU-side overlap instead of CPU-serialized submission.
+        Shared expert is merged into expert_fn (COMP stream), keeping
+        combine_fn (COMM stream) as pure communication.
         """
         bwd_attn, bwd_dispatch, bwd_expert, bwd_combine = bwd_nodes
         fwd_nodes = self._create_nodes_4(fwd_lc, fwd_event)
@@ -1118,7 +1157,7 @@ class MergedScheduler:
             me = [torch.cuda.Event(enable_timing=True) for _ in range(5)]  # COMM
 
         # --- Skip per-node event protocol during merged step ---
-        # The default shared event serializes all 4 nodes (COMP waits for COMM
+        # The default shared event serializes all nodes (COMP waits for COMM
         # and vice versa), preventing within-phase parallelism. By setting
         # _skip_event=True, each node still switches to its own stream and
         # does record_stream for allocator safety, but does not wait/record
@@ -1140,10 +1179,7 @@ class MergedScheduler:
                 me[0].record(comm_s)
 
             # Phase 1: COMM(b_combine) || COMP(f_attn_router)
-            # Launch COMM backward in background thread, main thread does COMP forward.
-            # torch.cuda.stream() is thread-local so each thread targets its own stream.
-            # GIL is released during CUDA kernel launches (C++ layer), enabling true
-            # concurrent kernel submission to different streams.
+            # b_combine is pure communication (shared expert merged into expert).
             if pool is not None:
                 fut_combine = pool.submit(bwd_combine.backward, grad_h)
                 fwd_attn_out = fwd_attn.forward((fwd_h,))
@@ -1162,13 +1198,16 @@ class MergedScheduler:
             self._cross_stream_barrier(slot=0)
 
             # Phase 2: COMM(f_dispatch) || COMP(b_expert)
+            # expert backward includes shared expert backward (both on COMP).
+            # combine_grads: (grad_expert_outs, grad_h_residual, grad_shared_expert_out)
             if pool is not None:
                 fut_dispatch = pool.submit(fwd_dispatch.forward, (fwd_h_ln, fwd_routing_probs))
-                expert_grads = bwd_expert.backward(combine_grads[0])
+                expert_grads = bwd_expert.backward((combine_grads[0], combine_grads[2]))
                 fwd_dispatch_out = fut_dispatch.result()
             else:
                 fwd_dispatch_out = fwd_dispatch.forward((fwd_h_ln, fwd_routing_probs))
-                expert_grads = bwd_expert.backward(combine_grads[0])
+                expert_grads = bwd_expert.backward((combine_grads[0], combine_grads[2]))
+            # expert_grads: (grad_sorted_tokens, grad_sorted_probs, grad_h_ln)
 
             if profiling:
                 ce[2].record(comp_s)
@@ -1179,37 +1218,38 @@ class MergedScheduler:
             self._cross_stream_barrier(slot=1)
 
             # Phase 3: COMM(b_dispatch) || COMP(f_expert)
+            # expert forward includes shared expert (takes h_ln, returns tuple).
             if pool is not None:
-                fut_dispatch_bwd = pool.submit(bwd_dispatch.backward, expert_grads)
-                fwd_expert_out = fwd_expert.forward(fwd_dispatch_out)
+                fut_dispatch_bwd = pool.submit(bwd_dispatch.backward, (expert_grads[0], expert_grads[1]))
+                fwd_expert_result = fwd_expert.forward((*fwd_dispatch_out, fwd_h_ln))
                 dispatch_grads = fut_dispatch_bwd.result()
             else:
-                dispatch_grads = bwd_dispatch.backward(expert_grads)
-                fwd_expert_out = fwd_expert.forward(fwd_dispatch_out)
+                dispatch_grads = bwd_dispatch.backward((expert_grads[0], expert_grads[1]))
+                fwd_expert_result = fwd_expert.forward((*fwd_dispatch_out, fwd_h_ln))
+            fwd_expert_out, fwd_shared_expert_out = fwd_expert_result
 
             if profiling:
                 ce[3].record(comp_s)
                 me[3].record(comm_s)
 
             # Phase boundary: Phase 4 COMP needs COMM output (dispatch_grads),
-            # Phase 4 COMM needs COMP output (expert_out)
+            # Phase 4 COMM needs COMP output (expert_out + shared_expert_out)
             self._cross_stream_barrier(slot=2)
 
             # Phase 4: COMM(f_combine) || COMP(b_attn)
             if pool is not None:
                 fut_combine_fwd = pool.submit(fwd_combine.forward,
-                                              (fwd_expert_out, fwd_h_residual, fwd_h_ln))
-                # Prep for bwd_attn while combine runs in background
+                                              (fwd_expert_out, fwd_h_residual, fwd_shared_expert_out))
                 self._record_for_comp(dispatch_grads)
                 self._record_for_comp(combine_grads)
-                grad_h_ln_total = dispatch_grads[0] + combine_grads[2]
+                grad_h_ln_total = dispatch_grads[0] + expert_grads[2]
                 grad_x = bwd_attn.backward((combine_grads[1], grad_h_ln_total, dispatch_grads[1]))
                 fwd_h_out = fut_combine_fwd.result()
             else:
-                fwd_h_out = fwd_combine.forward((fwd_expert_out, fwd_h_residual, fwd_h_ln))
+                fwd_h_out = fwd_combine.forward((fwd_expert_out, fwd_h_residual, fwd_shared_expert_out))
                 self._record_for_comp(dispatch_grads)
                 self._record_for_comp(combine_grads)
-                grad_h_ln_total = dispatch_grads[0] + combine_grads[2]
+                grad_h_ln_total = dispatch_grads[0] + expert_grads[2]
                 grad_x = bwd_attn.backward((combine_grads[1], grad_h_ln_total, dispatch_grads[1]))
 
             if profiling:
