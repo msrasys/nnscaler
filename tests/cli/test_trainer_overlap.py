@@ -337,33 +337,41 @@ def test_trainer_overlap(tmp_path):
     #         torch.cuda.current_stream().wait_stream(nnscaler.runtime.device.DeviceGroup().get_stream('comm'))
     #         data_57 = next(*(dataloader_86, ))
     #         torch.cuda.current_stream().wait_stream(nnscaler.runtime.device.DeviceGroup().get_stream('comm'))
-    #         getitem_1_64, linear_69 = nnscaler.runtime.executor.fexecute('InputProj_Segment', model.InputProj_Segment, *(data_57, ), requires_grad=True)
+    #         getitem_1_64, linear_69 = nnscaler.runtime.executor.fexecute('InputProj', model.InputProj, *(data_57, ), requires_grad=True)
     #         nnscaler.runtime.device.DeviceGroup().get_event('forward').record()
 
     #     with torch.cuda.stream(nnscaler.runtime.device.DeviceGroup().get_stream('comm')):
     #         nnscaler.runtime.device.DeviceGroup().get_event('forward').wait()
-    #         all_to_all_71, getitem_1_109 = nnscaler.runtime.executor.fexecute('CommGather_Segment', model.CommGather_Segment, *(getitem_1_64, linear_69, ), requires_grad=True)
+    #         getitem_1_64.record_stream(torch.cuda.current_stream())
+    #         linear_69.record_stream(torch.cuda.current_stream())
+    #         all_to_all_71, getitem_1_109 = nnscaler.runtime.executor.fexecute('CommGather', model.CommGather, *(getitem_1_64, linear_69, ), requires_grad=True)
     #         nnscaler.runtime.device.DeviceGroup().get_event('forward').record()
 
     #     del getitem_1_64
 
     #     with torch.cuda.stream(nnscaler.runtime.device.DeviceGroup().get_stream('comp')):
     #         nnscaler.runtime.device.DeviceGroup().get_event('forward').wait()
-    #         linear_2_78, getitem_1_111 = nnscaler.runtime.executor.fexecute('ExpertFFN_Segment', model.ExpertFFN_Segment, *(all_to_all_71, getitem_1_109, ), requires_grad=True)
+    #         all_to_all_71.record_stream(torch.cuda.current_stream())
+    #         getitem_1_109.record_stream(torch.cuda.current_stream())
+    #         linear_2_78, getitem_1_111 = nnscaler.runtime.executor.fexecute('ExpertFFN', model.ExpertFFN, *(all_to_all_71, getitem_1_109, ), requires_grad=True)
     #         nnscaler.runtime.device.DeviceGroup().get_event('forward').record()
 
     #     del getitem_1_109
 
     #     with torch.cuda.stream(nnscaler.runtime.device.DeviceGroup().get_stream('comm')):
     #         nnscaler.runtime.device.DeviceGroup().get_event('forward').wait()
-    #         all_to_all_1_79, getitem_1_113 = nnscaler.runtime.executor.fexecute('CommScatter_Segment', model.CommScatter_Segment, *(linear_2_78, getitem_1_111, ), requires_grad=True)
+    #         linear_2_78.record_stream(torch.cuda.current_stream())
+    #         getitem_1_111.record_stream(torch.cuda.current_stream())
+    #         all_to_all_1_79, getitem_1_113 = nnscaler.runtime.executor.fexecute('CommScatter', model.CommScatter, *(linear_2_78, getitem_1_111, ), requires_grad=True)
     #         nnscaler.runtime.device.DeviceGroup().get_event('forward').record()
 
     #     del getitem_1_111
 
     #     with torch.cuda.stream(nnscaler.runtime.device.DeviceGroup().get_stream('comp')):
     #         nnscaler.runtime.device.DeviceGroup().get_event('forward').wait()
-    #         cross_entropy_62 = nnscaler.runtime.executor.fexecute('OutputHead_Segment', model.OutputHead_Segment, *(all_to_all_1_79, getitem_1_113, ), requires_grad=True)
+    #         all_to_all_1_79.record_stream(torch.cuda.current_stream())
+    #         getitem_1_113.record_stream(torch.cuda.current_stream())
+    #         cross_entropy_62 = nnscaler.runtime.executor.fexecute('OutputHead', model.OutputHead, *(all_to_all_1_79, getitem_1_113, ), requires_grad=True)
     #         nnscaler.runtime.device.DeviceGroup().get_event('forward').record()
 
     #     del getitem_1_113
@@ -372,23 +380,29 @@ def test_trainer_overlap(tmp_path):
     #         torch.cuda.current_stream().wait_stream(nnscaler.runtime.device.DeviceGroup().get_stream('comm'))
     #         data_132 = next(*(dataloader_86, ))
     #         torch.cuda.current_stream().wait_stream(nnscaler.runtime.device.DeviceGroup().get_stream('comm'))
-    #         getitem_1_135, linear_138 = nnscaler.runtime.executor.fexecute('InputProj_Segment', model.InputProj_Segment, *(data_132, ), requires_grad=True)
+    #         getitem_1_135, linear_138 = nnscaler.runtime.executor.fexecute('InputProj', model.InputProj, *(data_132, ), requires_grad=True)
     #         nnscaler.runtime.device.DeviceGroup().get_event('forward').record()
 
     #     with torch.cuda.stream(nnscaler.runtime.device.DeviceGroup().get_stream('comm')):
     #         nnscaler.runtime.device.DeviceGroup().get_event('forward').wait()
-    #         all_to_all_146, getitem_1_149 = nnscaler.runtime.executor.fexecute('CommGather_Segment', model.CommGather_Segment, *(getitem_1_135, linear_138, ), requires_grad=True)
+    #         getitem_1_135.record_stream(torch.cuda.current_stream())
+    #         linear_138.record_stream(torch.cuda.current_stream())
+    #         all_to_all_146, getitem_1_149 = nnscaler.runtime.executor.fexecute('CommGather', model.CommGather, *(getitem_1_135, linear_138, ), requires_grad=True)
     #         nnscaler.runtime.device.DeviceGroup().get_event('forward').record()
 
     #     del getitem_1_135
     #     nnscaler.flags.RuntimeFlag.skip_reducer = True
 
     #     with torch.cuda.stream(nnscaler.runtime.device.DeviceGroup().get_stream('comp')):
-    #         gall_to_all_1_102 = nnscaler.runtime.executor.backward('OutputHead_Segment', (all_to_all_1_79, ), (cross_entropy_62, ), (None, ))
+    #         all_to_all_1_79.record_stream(torch.cuda.current_stream())
+    #         cross_entropy_62.record_stream(torch.cuda.current_stream())
+    #         gall_to_all_1_102 = nnscaler.runtime.executor.backward('OutputHead', (all_to_all_1_79, ), (cross_entropy_62, ), (None, ))
     #         cross_entropy_62 = cross_entropy_62.detach()
     #         nnscaler.runtime.device.DeviceGroup().get_event('backward').record()
     #         nnscaler.runtime.device.DeviceGroup().get_event('forward').wait()
-    #         linear_2_157, getitem_1_160 = nnscaler.runtime.executor.fexecute('ExpertFFN_Segment', model.ExpertFFN_Segment, *(all_to_all_146, getitem_1_149, ), requires_grad=True)
+    #         all_to_all_146.record_stream(torch.cuda.current_stream())
+    #         getitem_1_149.record_stream(torch.cuda.current_stream())
+    #         linear_2_157, getitem_1_160 = nnscaler.runtime.executor.fexecute('ExpertFFN', model.ExpertFFN, *(all_to_all_146, getitem_1_149, ), requires_grad=True)
     #         nnscaler.runtime.device.DeviceGroup().get_event('forward').record()
 
     #     del getitem_1_149
@@ -396,14 +410,19 @@ def test_trainer_overlap(tmp_path):
 
     #     with torch.cuda.stream(nnscaler.runtime.device.DeviceGroup().get_stream('comm')):
     #         nnscaler.runtime.device.DeviceGroup().get_event('backward').wait()
-    #         glinear_2_101 = nnscaler.runtime.executor.backward('CommScatter_Segment', (linear_2_78, ), (all_to_all_1_79, ), (gall_to_all_1_102, ))
+    #         linear_2_78.record_stream(torch.cuda.current_stream())
+    #         all_to_all_1_79.record_stream(torch.cuda.current_stream())
+    #         gall_to_all_1_102.record_stream(torch.cuda.current_stream())
+    #         glinear_2_101 = nnscaler.runtime.executor.backward('CommScatter', (linear_2_78, ), (all_to_all_1_79, ), (gall_to_all_1_102, ))
     #         nnscaler.runtime.device.DeviceGroup().get_event('backward').record()
 
     #     del all_to_all_1_79, gall_to_all_1_102
 
     #     with torch.cuda.stream(nnscaler.runtime.device.DeviceGroup().get_stream('comm')):
     #         nnscaler.runtime.device.DeviceGroup().get_event('forward').wait()
-    #         all_to_all_1_168, getitem_1_171 = nnscaler.runtime.executor.fexecute('CommScatter_Segment', model.CommScatter_Segment, *(linear_2_157, getitem_1_160, ), requires_grad=True)
+    #         linear_2_157.record_stream(torch.cuda.current_stream())
+    #         getitem_1_160.record_stream(torch.cuda.current_stream())
+    #         all_to_all_1_168, getitem_1_171 = nnscaler.runtime.executor.fexecute('CommScatter', model.CommScatter, *(linear_2_157, getitem_1_160, ), requires_grad=True)
     #         nnscaler.runtime.device.DeviceGroup().get_event('forward').record()
 
     #     del getitem_1_160
@@ -411,14 +430,19 @@ def test_trainer_overlap(tmp_path):
 
     #     with torch.cuda.stream(nnscaler.runtime.device.DeviceGroup().get_stream('comp')):
     #         nnscaler.runtime.device.DeviceGroup().get_event('backward').wait()
-    #         gall_to_all_94 = nnscaler.runtime.executor.backward('ExpertFFN_Segment', (all_to_all_71, ), (linear_2_78, ), (glinear_2_101, ))
+    #         all_to_all_71.record_stream(torch.cuda.current_stream())
+    #         linear_2_78.record_stream(torch.cuda.current_stream())
+    #         glinear_2_101.record_stream(torch.cuda.current_stream())
+    #         gall_to_all_94 = nnscaler.runtime.executor.backward('ExpertFFN', (all_to_all_71, ), (linear_2_78, ), (glinear_2_101, ))
     #         nnscaler.runtime.device.DeviceGroup().get_event('backward').record()
 
     #     del linear_2_78, glinear_2_101
 
     #     with torch.cuda.stream(nnscaler.runtime.device.DeviceGroup().get_stream('comp')):
     #         nnscaler.runtime.device.DeviceGroup().get_event('forward').wait()
-    #         cross_entropy_179 = nnscaler.runtime.executor.fexecute('OutputHead_Segment', model.OutputHead_Segment, *(all_to_all_1_168, getitem_1_171, ), requires_grad=True)
+    #         all_to_all_1_168.record_stream(torch.cuda.current_stream())
+    #         getitem_1_171.record_stream(torch.cuda.current_stream())
+    #         cross_entropy_179 = nnscaler.runtime.executor.fexecute('OutputHead', model.OutputHead, *(all_to_all_1_168, getitem_1_171, ), requires_grad=True)
     #         nnscaler.runtime.device.DeviceGroup().get_event('forward').record()
 
     #     del getitem_1_171
@@ -426,7 +450,10 @@ def test_trainer_overlap(tmp_path):
 
     #     with torch.cuda.stream(nnscaler.runtime.device.DeviceGroup().get_stream('comm')):
     #         nnscaler.runtime.device.DeviceGroup().get_event('backward').wait()
-    #         glinear_92 = nnscaler.runtime.executor.backward('CommGather_Segment', (linear_69, ), (all_to_all_71, ), (gall_to_all_94, ))
+    #         linear_69.record_stream(torch.cuda.current_stream())
+    #         all_to_all_71.record_stream(torch.cuda.current_stream())
+    #         gall_to_all_94.record_stream(torch.cuda.current_stream())
+    #         glinear_92 = nnscaler.runtime.executor.backward('CommGather', (linear_69, ), (all_to_all_71, ), (gall_to_all_94, ))
     #         nnscaler.runtime.device.DeviceGroup().get_event('backward').record()
 
     #     del all_to_all_71, gall_to_all_94
@@ -434,7 +461,9 @@ def test_trainer_overlap(tmp_path):
 
     #     with torch.cuda.stream(nnscaler.runtime.device.DeviceGroup().get_stream('comp')):
     #         nnscaler.runtime.device.DeviceGroup().get_event('backward').wait()
-    #         _ = nnscaler.runtime.executor.backward('InputProj_Segment', (), (linear_69, ), (glinear_92, ))
+    #         linear_69.record_stream(torch.cuda.current_stream())
+    #         glinear_92.record_stream(torch.cuda.current_stream())
+    #         _ = nnscaler.runtime.executor.backward('InputProj', (), (linear_69, ), (glinear_92, ))
     #         nnscaler.runtime.device.DeviceGroup().get_event('backward').record()
 
     #     del linear_69, glinear_92
@@ -443,12 +472,14 @@ def test_trainer_overlap(tmp_path):
     #         torch.cuda.current_stream().wait_stream(nnscaler.runtime.device.DeviceGroup().get_stream('comm'))
     #         data_183 = next(*(dataloader_86, ))
     #         torch.cuda.current_stream().wait_stream(nnscaler.runtime.device.DeviceGroup().get_stream('comm'))
-    #         getitem_1_186, linear_189 = nnscaler.runtime.executor.fexecute('InputProj_Segment', model.InputProj_Segment, *(data_183, ), requires_grad=True)
+    #         getitem_1_186, linear_189 = nnscaler.runtime.executor.fexecute('InputProj', model.InputProj, *(data_183, ), requires_grad=True)
     #         nnscaler.runtime.device.DeviceGroup().get_event('forward').record()
 
     #     with torch.cuda.stream(nnscaler.runtime.device.DeviceGroup().get_stream('comm')):
     #         nnscaler.runtime.device.DeviceGroup().get_event('forward').wait()
-    #         all_to_all_197, getitem_1_200 = nnscaler.runtime.executor.fexecute('CommGather_Segment', model.CommGather_Segment, *(getitem_1_186, linear_189, ), requires_grad=True)
+    #         getitem_1_186.record_stream(torch.cuda.current_stream())
+    #         linear_189.record_stream(torch.cuda.current_stream())
+    #         all_to_all_197, getitem_1_200 = nnscaler.runtime.executor.fexecute('CommGather', model.CommGather, *(getitem_1_186, linear_189, ), requires_grad=True)
     #         nnscaler.runtime.device.DeviceGroup().get_event('forward').record()
 
     #     del getitem_1_186
@@ -456,11 +487,15 @@ def test_trainer_overlap(tmp_path):
 
     #     with torch.cuda.stream(nnscaler.runtime.device.DeviceGroup().get_stream('comp')):
     #         nnscaler.runtime.device.DeviceGroup().get_event('backward').wait()
-    #         gall_to_all_1_169 = nnscaler.runtime.executor.backward('OutputHead_Segment', (all_to_all_1_168, ), (cross_entropy_179, ), (None, ))
+    #         all_to_all_1_168.record_stream(torch.cuda.current_stream())
+    #         cross_entropy_179.record_stream(torch.cuda.current_stream())
+    #         gall_to_all_1_169 = nnscaler.runtime.executor.backward('OutputHead', (all_to_all_1_168, ), (cross_entropy_179, ), (None, ))
     #         cross_entropy_179 = cross_entropy_179.detach()
     #         nnscaler.runtime.device.DeviceGroup().get_event('backward').record()
     #         nnscaler.runtime.device.DeviceGroup().get_event('forward').wait()
-    #         linear_2_208, getitem_1_211 = nnscaler.runtime.executor.fexecute('ExpertFFN_Segment', model.ExpertFFN_Segment, *(all_to_all_197, getitem_1_200, ), requires_grad=True)
+    #         all_to_all_197.record_stream(torch.cuda.current_stream())
+    #         getitem_1_200.record_stream(torch.cuda.current_stream())
+    #         linear_2_208, getitem_1_211 = nnscaler.runtime.executor.fexecute('ExpertFFN', model.ExpertFFN, *(all_to_all_197, getitem_1_200, ), requires_grad=True)
     #         nnscaler.runtime.device.DeviceGroup().get_event('forward').record()
 
     #     del getitem_1_200
@@ -468,14 +503,19 @@ def test_trainer_overlap(tmp_path):
 
     #     with torch.cuda.stream(nnscaler.runtime.device.DeviceGroup().get_stream('comm')):
     #         nnscaler.runtime.device.DeviceGroup().get_event('backward').wait()
-    #         glinear_2_158 = nnscaler.runtime.executor.backward('CommScatter_Segment', (linear_2_157, ), (all_to_all_1_168, ), (gall_to_all_1_169, ))
+    #         linear_2_157.record_stream(torch.cuda.current_stream())
+    #         all_to_all_1_168.record_stream(torch.cuda.current_stream())
+    #         gall_to_all_1_169.record_stream(torch.cuda.current_stream())
+    #         glinear_2_158 = nnscaler.runtime.executor.backward('CommScatter', (linear_2_157, ), (all_to_all_1_168, ), (gall_to_all_1_169, ))
     #         nnscaler.runtime.device.DeviceGroup().get_event('backward').record()
 
     #     del all_to_all_1_168, gall_to_all_1_169
 
     #     with torch.cuda.stream(nnscaler.runtime.device.DeviceGroup().get_stream('comm')):
     #         nnscaler.runtime.device.DeviceGroup().get_event('forward').wait()
-    #         all_to_all_1_219, getitem_1_222 = nnscaler.runtime.executor.fexecute('CommScatter_Segment', model.CommScatter_Segment, *(linear_2_208, getitem_1_211, ), requires_grad=True)
+    #         linear_2_208.record_stream(torch.cuda.current_stream())
+    #         getitem_1_211.record_stream(torch.cuda.current_stream())
+    #         all_to_all_1_219, getitem_1_222 = nnscaler.runtime.executor.fexecute('CommScatter', model.CommScatter, *(linear_2_208, getitem_1_211, ), requires_grad=True)
     #         nnscaler.runtime.device.DeviceGroup().get_event('forward').record()
 
     #     del getitem_1_211
@@ -483,14 +523,19 @@ def test_trainer_overlap(tmp_path):
 
     #     with torch.cuda.stream(nnscaler.runtime.device.DeviceGroup().get_stream('comp')):
     #         nnscaler.runtime.device.DeviceGroup().get_event('backward').wait()
-    #         gall_to_all_147 = nnscaler.runtime.executor.backward('ExpertFFN_Segment', (all_to_all_146, ), (linear_2_157, ), (glinear_2_158, ))
+    #         all_to_all_146.record_stream(torch.cuda.current_stream())
+    #         linear_2_157.record_stream(torch.cuda.current_stream())
+    #         glinear_2_158.record_stream(torch.cuda.current_stream())
+    #         gall_to_all_147 = nnscaler.runtime.executor.backward('ExpertFFN', (all_to_all_146, ), (linear_2_157, ), (glinear_2_158, ))
     #         nnscaler.runtime.device.DeviceGroup().get_event('backward').record()
 
     #     del linear_2_157, glinear_2_158
 
     #     with torch.cuda.stream(nnscaler.runtime.device.DeviceGroup().get_stream('comp')):
     #         nnscaler.runtime.device.DeviceGroup().get_event('forward').wait()
-    #         cross_entropy_230 = nnscaler.runtime.executor.fexecute('OutputHead_Segment', model.OutputHead_Segment, *(all_to_all_1_219, getitem_1_222, ), requires_grad=True)
+    #         all_to_all_1_219.record_stream(torch.cuda.current_stream())
+    #         getitem_1_222.record_stream(torch.cuda.current_stream())
+    #         cross_entropy_230 = nnscaler.runtime.executor.fexecute('OutputHead', model.OutputHead, *(all_to_all_1_219, getitem_1_222, ), requires_grad=True)
     #         nnscaler.runtime.device.DeviceGroup().get_event('forward').record()
 
     #     del getitem_1_222
@@ -498,7 +543,10 @@ def test_trainer_overlap(tmp_path):
 
     #     with torch.cuda.stream(nnscaler.runtime.device.DeviceGroup().get_stream('comm')):
     #         nnscaler.runtime.device.DeviceGroup().get_event('backward').wait()
-    #         glinear_139 = nnscaler.runtime.executor.backward('CommGather_Segment', (linear_138, ), (all_to_all_146, ), (gall_to_all_147, ))
+    #         linear_138.record_stream(torch.cuda.current_stream())
+    #         all_to_all_146.record_stream(torch.cuda.current_stream())
+    #         gall_to_all_147.record_stream(torch.cuda.current_stream())
+    #         glinear_139 = nnscaler.runtime.executor.backward('CommGather', (linear_138, ), (all_to_all_146, ), (gall_to_all_147, ))
     #         nnscaler.runtime.device.DeviceGroup().get_event('backward').record()
 
     #     del all_to_all_146, gall_to_all_147
@@ -506,7 +554,9 @@ def test_trainer_overlap(tmp_path):
 
     #     with torch.cuda.stream(nnscaler.runtime.device.DeviceGroup().get_stream('comp')):
     #         nnscaler.runtime.device.DeviceGroup().get_event('backward').wait()
-    #         _ = nnscaler.runtime.executor.backward('InputProj_Segment', (), (linear_138, ), (glinear_139, ))
+    #         linear_138.record_stream(torch.cuda.current_stream())
+    #         glinear_139.record_stream(torch.cuda.current_stream())
+    #         _ = nnscaler.runtime.executor.backward('InputProj', (), (linear_138, ), (glinear_139, ))
     #         nnscaler.runtime.device.DeviceGroup().get_event('backward').record()
 
     #     del linear_138, glinear_139
@@ -515,12 +565,14 @@ def test_trainer_overlap(tmp_path):
     #         torch.cuda.current_stream().wait_stream(nnscaler.runtime.device.DeviceGroup().get_stream('comm'))
     #         data_234 = next(*(dataloader_86, ))
     #         torch.cuda.current_stream().wait_stream(nnscaler.runtime.device.DeviceGroup().get_stream('comm'))
-    #         getitem_1_237, linear_240 = nnscaler.runtime.executor.fexecute('InputProj_Segment', model.InputProj_Segment, *(data_234, ), requires_grad=True)
+    #         getitem_1_237, linear_240 = nnscaler.runtime.executor.fexecute('InputProj', model.InputProj, *(data_234, ), requires_grad=True)
     #         nnscaler.runtime.device.DeviceGroup().get_event('forward').record()
 
     #     with torch.cuda.stream(nnscaler.runtime.device.DeviceGroup().get_stream('comm')):
     #         nnscaler.runtime.device.DeviceGroup().get_event('forward').wait()
-    #         all_to_all_248, getitem_1_251 = nnscaler.runtime.executor.fexecute('CommGather_Segment', model.CommGather_Segment, *(getitem_1_237, linear_240, ), requires_grad=True)
+    #         getitem_1_237.record_stream(torch.cuda.current_stream())
+    #         linear_240.record_stream(torch.cuda.current_stream())
+    #         all_to_all_248, getitem_1_251 = nnscaler.runtime.executor.fexecute('CommGather', model.CommGather, *(getitem_1_237, linear_240, ), requires_grad=True)
     #         nnscaler.runtime.device.DeviceGroup().get_event('forward').record()
 
     #     del getitem_1_237
@@ -528,11 +580,15 @@ def test_trainer_overlap(tmp_path):
 
     #     with torch.cuda.stream(nnscaler.runtime.device.DeviceGroup().get_stream('comp')):
     #         nnscaler.runtime.device.DeviceGroup().get_event('backward').wait()
-    #         gall_to_all_1_220 = nnscaler.runtime.executor.backward('OutputHead_Segment', (all_to_all_1_219, ), (cross_entropy_230, ), (None, ))
+    #         all_to_all_1_219.record_stream(torch.cuda.current_stream())
+    #         cross_entropy_230.record_stream(torch.cuda.current_stream())
+    #         gall_to_all_1_220 = nnscaler.runtime.executor.backward('OutputHead', (all_to_all_1_219, ), (cross_entropy_230, ), (None, ))
     #         cross_entropy_230 = cross_entropy_230.detach()
     #         nnscaler.runtime.device.DeviceGroup().get_event('backward').record()
     #         nnscaler.runtime.device.DeviceGroup().get_event('forward').wait()
-    #         linear_2_259, getitem_1_262 = nnscaler.runtime.executor.fexecute('ExpertFFN_Segment', model.ExpertFFN_Segment, *(all_to_all_248, getitem_1_251, ), requires_grad=True)
+    #         all_to_all_248.record_stream(torch.cuda.current_stream())
+    #         getitem_1_251.record_stream(torch.cuda.current_stream())
+    #         linear_2_259, getitem_1_262 = nnscaler.runtime.executor.fexecute('ExpertFFN', model.ExpertFFN, *(all_to_all_248, getitem_1_251, ), requires_grad=True)
     #         nnscaler.runtime.device.DeviceGroup().get_event('forward').record()
 
     #     del getitem_1_251
@@ -540,14 +596,19 @@ def test_trainer_overlap(tmp_path):
 
     #     with torch.cuda.stream(nnscaler.runtime.device.DeviceGroup().get_stream('comm')):
     #         nnscaler.runtime.device.DeviceGroup().get_event('backward').wait()
-    #         glinear_2_209 = nnscaler.runtime.executor.backward('CommScatter_Segment', (linear_2_208, ), (all_to_all_1_219, ), (gall_to_all_1_220, ))
+    #         linear_2_208.record_stream(torch.cuda.current_stream())
+    #         all_to_all_1_219.record_stream(torch.cuda.current_stream())
+    #         gall_to_all_1_220.record_stream(torch.cuda.current_stream())
+    #         glinear_2_209 = nnscaler.runtime.executor.backward('CommScatter', (linear_2_208, ), (all_to_all_1_219, ), (gall_to_all_1_220, ))
     #         nnscaler.runtime.device.DeviceGroup().get_event('backward').record()
 
     #     del all_to_all_1_219, gall_to_all_1_220
 
     #     with torch.cuda.stream(nnscaler.runtime.device.DeviceGroup().get_stream('comm')):
     #         nnscaler.runtime.device.DeviceGroup().get_event('forward').wait()
-    #         all_to_all_1_270, getitem_1_273 = nnscaler.runtime.executor.fexecute('CommScatter_Segment', model.CommScatter_Segment, *(linear_2_259, getitem_1_262, ), requires_grad=True)
+    #         linear_2_259.record_stream(torch.cuda.current_stream())
+    #         getitem_1_262.record_stream(torch.cuda.current_stream())
+    #         all_to_all_1_270, getitem_1_273 = nnscaler.runtime.executor.fexecute('CommScatter', model.CommScatter, *(linear_2_259, getitem_1_262, ), requires_grad=True)
     #         nnscaler.runtime.device.DeviceGroup().get_event('forward').record()
 
     #     del getitem_1_262
@@ -555,14 +616,19 @@ def test_trainer_overlap(tmp_path):
 
     #     with torch.cuda.stream(nnscaler.runtime.device.DeviceGroup().get_stream('comp')):
     #         nnscaler.runtime.device.DeviceGroup().get_event('backward').wait()
-    #         gall_to_all_198 = nnscaler.runtime.executor.backward('ExpertFFN_Segment', (all_to_all_197, ), (linear_2_208, ), (glinear_2_209, ))
+    #         all_to_all_197.record_stream(torch.cuda.current_stream())
+    #         linear_2_208.record_stream(torch.cuda.current_stream())
+    #         glinear_2_209.record_stream(torch.cuda.current_stream())
+    #         gall_to_all_198 = nnscaler.runtime.executor.backward('ExpertFFN', (all_to_all_197, ), (linear_2_208, ), (glinear_2_209, ))
     #         nnscaler.runtime.device.DeviceGroup().get_event('backward').record()
 
     #     del linear_2_208, glinear_2_209
 
     #     with torch.cuda.stream(nnscaler.runtime.device.DeviceGroup().get_stream('comp')):
     #         nnscaler.runtime.device.DeviceGroup().get_event('forward').wait()
-    #         cross_entropy_281 = nnscaler.runtime.executor.fexecute('OutputHead_Segment', model.OutputHead_Segment, *(all_to_all_1_270, getitem_1_273, ), requires_grad=True)
+    #         all_to_all_1_270.record_stream(torch.cuda.current_stream())
+    #         getitem_1_273.record_stream(torch.cuda.current_stream())
+    #         cross_entropy_281 = nnscaler.runtime.executor.fexecute('OutputHead', model.OutputHead, *(all_to_all_1_270, getitem_1_273, ), requires_grad=True)
     #         nnscaler.runtime.device.DeviceGroup().get_event('forward').record()
 
     #     del getitem_1_273
@@ -570,7 +636,10 @@ def test_trainer_overlap(tmp_path):
 
     #     with torch.cuda.stream(nnscaler.runtime.device.DeviceGroup().get_stream('comm')):
     #         nnscaler.runtime.device.DeviceGroup().get_event('backward').wait()
-    #         glinear_190 = nnscaler.runtime.executor.backward('CommGather_Segment', (linear_189, ), (all_to_all_197, ), (gall_to_all_198, ))
+    #         linear_189.record_stream(torch.cuda.current_stream())
+    #         all_to_all_197.record_stream(torch.cuda.current_stream())
+    #         gall_to_all_198.record_stream(torch.cuda.current_stream())
+    #         glinear_190 = nnscaler.runtime.executor.backward('CommGather', (linear_189, ), (all_to_all_197, ), (gall_to_all_198, ))
     #         nnscaler.runtime.device.DeviceGroup().get_event('backward').record()
 
     #     del all_to_all_197, gall_to_all_198
@@ -578,7 +647,9 @@ def test_trainer_overlap(tmp_path):
 
     #     with torch.cuda.stream(nnscaler.runtime.device.DeviceGroup().get_stream('comp')):
     #         nnscaler.runtime.device.DeviceGroup().get_event('backward').wait()
-    #         _ = nnscaler.runtime.executor.backward('InputProj_Segment', (), (linear_189, ), (glinear_190, ))
+    #         linear_189.record_stream(torch.cuda.current_stream())
+    #         glinear_190.record_stream(torch.cuda.current_stream())
+    #         _ = nnscaler.runtime.executor.backward('InputProj', (), (linear_189, ), (glinear_190, ))
     #         nnscaler.runtime.device.DeviceGroup().get_event('backward').record()
 
     #     del linear_189, glinear_190
@@ -586,7 +657,9 @@ def test_trainer_overlap(tmp_path):
 
     #     with torch.cuda.stream(nnscaler.runtime.device.DeviceGroup().get_stream('comp')):
     #         torch.cuda.current_stream().wait_stream(nnscaler.runtime.device.DeviceGroup().get_stream('comm'))
-    #         gall_to_all_1_271 = nnscaler.runtime.executor.backward('OutputHead_Segment', (all_to_all_1_270, ), (cross_entropy_281, ), (None, ))
+    #         all_to_all_1_270.record_stream(torch.cuda.current_stream())
+    #         cross_entropy_281.record_stream(torch.cuda.current_stream())
+    #         gall_to_all_1_271 = nnscaler.runtime.executor.backward('OutputHead', (all_to_all_1_270, ), (cross_entropy_281, ), (None, ))
     #         cross_entropy_281 = cross_entropy_281.detach()
     #         nnscaler.runtime.device.DeviceGroup().get_event('backward').record()
 
@@ -594,7 +667,10 @@ def test_trainer_overlap(tmp_path):
 
     #     with torch.cuda.stream(nnscaler.runtime.device.DeviceGroup().get_stream('comm')):
     #         nnscaler.runtime.device.DeviceGroup().get_event('backward').wait()
-    #         glinear_2_260 = nnscaler.runtime.executor.backward('CommScatter_Segment', (linear_2_259, ), (all_to_all_1_270, ), (gall_to_all_1_271, ))
+    #         linear_2_259.record_stream(torch.cuda.current_stream())
+    #         all_to_all_1_270.record_stream(torch.cuda.current_stream())
+    #         gall_to_all_1_271.record_stream(torch.cuda.current_stream())
+    #         glinear_2_260 = nnscaler.runtime.executor.backward('CommScatter', (linear_2_259, ), (all_to_all_1_270, ), (gall_to_all_1_271, ))
     #         nnscaler.runtime.device.DeviceGroup().get_event('backward').record()
 
     #     del all_to_all_1_270, gall_to_all_1_271
@@ -602,7 +678,10 @@ def test_trainer_overlap(tmp_path):
 
     #     with torch.cuda.stream(nnscaler.runtime.device.DeviceGroup().get_stream('comp')):
     #         nnscaler.runtime.device.DeviceGroup().get_event('backward').wait()
-    #         gall_to_all_249 = nnscaler.runtime.executor.backward('ExpertFFN_Segment', (all_to_all_248, ), (linear_2_259, ), (glinear_2_260, ))
+    #         all_to_all_248.record_stream(torch.cuda.current_stream())
+    #         linear_2_259.record_stream(torch.cuda.current_stream())
+    #         glinear_2_260.record_stream(torch.cuda.current_stream())
+    #         gall_to_all_249 = nnscaler.runtime.executor.backward('ExpertFFN', (all_to_all_248, ), (linear_2_259, ), (glinear_2_260, ))
     #         nnscaler.runtime.device.DeviceGroup().get_event('backward').record()
 
     #     del linear_2_259, glinear_2_260
@@ -610,7 +689,10 @@ def test_trainer_overlap(tmp_path):
 
     #     with torch.cuda.stream(nnscaler.runtime.device.DeviceGroup().get_stream('comm')):
     #         nnscaler.runtime.device.DeviceGroup().get_event('backward').wait()
-    #         glinear_241 = nnscaler.runtime.executor.backward('CommGather_Segment', (linear_240, ), (all_to_all_248, ), (gall_to_all_249, ))
+    #         linear_240.record_stream(torch.cuda.current_stream())
+    #         all_to_all_248.record_stream(torch.cuda.current_stream())
+    #         gall_to_all_249.record_stream(torch.cuda.current_stream())
+    #         glinear_241 = nnscaler.runtime.executor.backward('CommGather', (linear_240, ), (all_to_all_248, ), (gall_to_all_249, ))
     #         nnscaler.runtime.device.DeviceGroup().get_event('backward').record()
 
     #     del all_to_all_248, gall_to_all_249
@@ -618,7 +700,9 @@ def test_trainer_overlap(tmp_path):
 
     #     with torch.cuda.stream(nnscaler.runtime.device.DeviceGroup().get_stream('comp')):
     #         nnscaler.runtime.device.DeviceGroup().get_event('backward').wait()
-    #         _ = nnscaler.runtime.executor.backward('InputProj_Segment', (), (linear_240, ), (glinear_241, ))
+    #         linear_240.record_stream(torch.cuda.current_stream())
+    #         glinear_241.record_stream(torch.cuda.current_stream())
+    #         _ = nnscaler.runtime.executor.backward('InputProj', (), (linear_240, ), (glinear_241, ))
     #         nnscaler.runtime.device.DeviceGroup().get_event('backward').record()
 
     #     del linear_240, glinear_241

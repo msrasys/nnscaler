@@ -5,7 +5,7 @@ from typing import List, Optional, Tuple, Union
 import copy
 import logging
 
-from nnscaler.ir.cten import IRCell, IRTensor
+from nnscaler.ir.cten import IRCell, IRTensor, IR
 from nnscaler.ir.operator import IRDataOperation, IRFwOperation
 from nnscaler.ir.tensor import IRSubTensor
 from nnscaler.ir.adapter import IRWeightReducer, IRAdapter
@@ -278,6 +278,8 @@ class ScheduleCodeGen(FuncEmission):
         bsign = '{input_grads} = nnscaler.runtime.executor.backward({name}, {input_tensors}, {output_tensors}, {output_grads})'
 
         node_inputs, node_outputs = node.inputs(), node.outputs()
+        # the real inputs in gencode
+        gen_inputs = node_inputs
         req_grad = any(t.requires_grad for t in node.outputs() if isinstance(t, IRTensor))
         req_grad = False if force_no_grad else req_grad
 
@@ -303,6 +305,7 @@ class ScheduleCodeGen(FuncEmission):
                 # get gradient computation arguments
                 input_tensors, output_tensors, output_grads, input_grads = \
                         self.get_backward_callsite_io_tensors(node)
+                gen_inputs = (input_tensors, output_tensors, output_grads)
                 # special handle for loss
                 for idx, tensor in enumerate(output_grads):
                     if isinstance(tensor, IRSubTensor) and tensor.is_loss():
@@ -352,6 +355,25 @@ class ScheduleCodeGen(FuncEmission):
 
         else:
             raise RuntimeError(f"Unspported node type: {type(unwrap_node)}")
+
+        if stream_context and stream_context.stream:
+            # register all input tensors to the current stream
+            # to avoid cross-stream premature deallocation issue
+            # see `Tensor.record_stream` in PyTorch for more details
+
+            # NOTE: The dataloader output is not considered here. Two reasons:
+            # 1) Dataloader output is wrapped in an IRObject, and internal IRTensors cannot be accessed here easily.
+            # 2) Dataloader output is used as input of the first forward segment immediately after data loading
+            # 3) Dataloader output is never del'ed. (its lifetime is not managed here due to #1)
+            input_tensor_name = [
+                self.tensor_name(t) for t in IR.get_objects(gen_inputs)
+                if isinstance(t, IRTensor) and not t.is_attr()
+            ]
+            record_stream_codes = []
+            for t in input_tensor_name:
+                record_stream_codes.append(f'{t}.record_stream(torch.cuda.current_stream())')
+
+            codes = record_stream_codes + codes
 
         if CompileFlag.line_timer:
             type_str = type(unwrap_node).__name__
