@@ -46,6 +46,7 @@ _SEQUENTIAL_MODE = False  # Flag: skip stream/event ops in sequential mode
 _PROFILE_OVERLAP = os.environ.get('PROFILE_OVERLAP', '0') not in ('0', '')
 _profile_data = []  # collected per merged-step timing records
 _TIMING_BREAKDOWN = os.environ.get('TIMING_BREAKDOWN', '0') not in ('0', '')
+_sequential_comm_events = []  # [(start_ev, end_ev)] for COMM ops in non-overlap phases
 _LAYER_CHECKSUM = bool(os.environ.get('LAYER_CHECKSUM'))
 
 
@@ -126,11 +127,13 @@ class _TimingCtx:
 def _profile_report():
     """Log overlap profiling summary. Called after torch.cuda.synchronize()."""
     if not _profile_data:
+        _sequential_comm_events.clear()
         return
     import torch.distributed as dist
     rank = dist.get_rank() if dist.is_initialized() else 0
     if rank != 0:
         _profile_data.clear()
+        _sequential_comm_events.clear()
         return
 
     sequential = _profile_data[0].get('sequential', False)
@@ -216,13 +219,44 @@ def _profile_report():
             rc = sum(r['phases'][pi]['raw_comp_ms'] for r in records) / n
             rm = sum(r['phases'][pi]['raw_comm_ms'] for r in records) / n
             op = (ac + am - aw) / aw * 100 if aw > 0 else 0
+            # per-phase comm hiding: Σmin(comp,comm) / Σcomm across records
+            ph = sum(min(r['phases'][pi]['comp_ms'], r['phases'][pi]['comm_ms']) for r in records)
+            pc = sum(r['phases'][pi]['comm_ms'] for r in records)
+            ch = ph / pc * 100 if pc > 0 else 0
             raw_note = ""
             if abs(rc - ac) > 0.01 or abs(rm - am) > 0.01:
                 raw_note = f" (raw: comp={rc:.2f} comm={rm:.2f})"
             _logger.info(
                 f"  {phase_names[pi]}: wall={aw:.2f}ms comp={ac:.2f}ms comm={am:.2f}ms "
-                f"overlap={op:.1f}%{raw_note}"
+                f"overlap={op:.1f}% comm_hiding={ch:.1f}%{raw_note}"
             )
+
+        # --- Communication hiding rate ---
+        # COMM_hidden: comm time in merged loop that runs concurrently with comp
+        # = sum of min(comp_i, comm_i) per phase across all merged steps
+        comm_hidden_ms = 0.0
+        comm_merged_ms = 0.0
+        for r in records:
+            for p in r['phases']:
+                comm_hidden_ms += max(0.0, min(p['comp_ms'], p['comm_ms']))
+                comm_merged_ms += max(0.0, p['comm_ms'])
+
+        # COMM_sequential: comm time in non-overlap phases (warmup/cooldown/remaining)
+        comm_sequential_ms = 0.0
+        for (s_ev, e_ev) in _sequential_comm_events:
+            comm_sequential_ms += s_ev.elapsed_time(e_ev)
+
+        comm_total_ms = comm_merged_ms + comm_sequential_ms
+        hiding_rate = comm_hidden_ms / comm_total_ms * 100 if comm_total_ms > 0 else 0
+
+        _logger.info(
+            f"[PROFILE-COMM] hiding_rate={hiding_rate:.1f}% "
+            f"COMM_hidden={comm_hidden_ms:.1f}ms "
+            f"COMM_total={comm_total_ms:.1f}ms "
+            f"(merged={comm_merged_ms:.1f}ms sequential={comm_sequential_ms:.1f}ms)"
+        )
+
+    _sequential_comm_events.clear()
     _profile_data.clear()
 
 
@@ -308,6 +342,7 @@ class ScheduleNode:
         self.inputs = None
         self.output = None
         self._skip_event = False  # When True, skip event wait/record in _stream_ctx
+        self._collect_exec_time = False  # When True, record exec time events for COMM profiling
 
     def forward(self, inputs=()):
         if not isinstance(inputs, tuple):
@@ -362,6 +397,9 @@ class ScheduleNode:
                 else:
                     self.inputs.append(inp)
 
+            if self._collect_exec_time:
+                _ev_s = torch.cuda.Event(enable_timing=True); _ev_s.record()
+
             if self.checkpoint:
                 with torch.no_grad():
                     data = self.forward_func(*self.inputs)
@@ -375,6 +413,10 @@ class ScheduleNode:
                     )
             else:
                 data = self.forward_func(*self.inputs)
+
+            if self._collect_exec_time:
+                _ev_e = torch.cuda.Event(enable_timing=True); _ev_e.record()
+                _sequential_comm_events.append((_ev_s, _ev_e))
 
             self.output = data
 
@@ -437,6 +479,9 @@ class ScheduleNode:
                 g.record_stream(self.stream)
 
         with self._stream_ctx(f"{self.name} bwd"):
+            if self._collect_exec_time:
+                _ev_s = torch.cuda.Event(enable_timing=True); _ev_s.record()
+
             if self.checkpoint:
                 _IN_RECOMPUTE = True
                 try:
@@ -468,6 +513,10 @@ class ScheduleNode:
                 if tensor_outputs:
                     self.backward_func(tuple(tensor_outputs), tuple(tensor_grads),
                                        retain_graph=retain_graph)
+
+            if self._collect_exec_time:
+                _ev_e = torch.cuda.Event(enable_timing=True); _ev_e.record()
+                _sequential_comm_events.append((_ev_s, _ev_e))
 
         grads = self.get_grad()
         self._release()
@@ -643,6 +692,7 @@ class MergedScheduler:
         _logger.debug("Warmup: forward mb0")
         with torch.cuda.stream(get_comp_stream()):
             h0 = embed_fn(samples[0])
+        _embed_h_list = [h0]  # Save embedding outputs for backward
         _log_checksum("merged embed mb=0", h0)
         tb.mark("warmup_embed")
 
@@ -681,6 +731,7 @@ class MergedScheduler:
             # embed_fn only reads sample data + embedding weight, independent of COMP.
             with torch.cuda.stream(get_comm_stream()):
                 fwd_h = embed_fn(fwd_sample)
+            _embed_h_list.append(fwd_h)
 
             # Loss backward on COMP — overlaps with embed on COMM
             with nnscaler.sync_grad_when(False):
@@ -792,6 +843,9 @@ class MergedScheduler:
                 bwd_idx -= 1
 
             del prev_all_nodes
+            # Propagate gradient through embedding graph to tok_embed weight
+            with nnscaler.sync_grad_when(False):
+                _embed_h_list[mb_i].backward(grad_h)
             tb.mark(f"mb{mb_i}_remaining_fwd_bwd")
 
             # Sync COMM→COMP: last fwd node may be on COMM (MoE combine),
@@ -826,6 +880,8 @@ class MergedScheduler:
                 if entry is None:
                     continue
                 grad_h = self._backward_entry(entry, grad_h)
+            # Propagate gradient through embedding graph to tok_embed weight
+            _embed_h_list[-1].backward(grad_h)
         tb.mark("cooldown_bwd")
 
         if _PROFILE_OVERLAP:
@@ -1025,12 +1081,20 @@ class MergedScheduler:
         nodes = self._create_nodes_4(lc, event)
         attn_n, dispatch_n, expert_n, combine_n = nodes
 
+        if _PROFILE_OVERLAP:
+            dispatch_n._collect_exec_time = True
+            combine_n._collect_exec_time = True
+
         attn_out = attn_n.forward((h,))
         h_residual, h_ln, routing_probs = attn_out
         dispatch_out = dispatch_n.forward((h_ln, routing_probs))
         expert_result = expert_n.forward((*dispatch_out, h_ln))
         expert_out, shared_expert_out = expert_result
         h_out = combine_n.forward((expert_out, h_residual, shared_expert_out))
+
+        if _PROFILE_OVERLAP:
+            dispatch_n._collect_exec_time = False
+            combine_n._collect_exec_time = False
 
         for n in nodes:
             if n.checkpoint:
@@ -1061,6 +1125,11 @@ class MergedScheduler:
         as its 3rd output gradient (for the h_ln input).
         """
         attn_n, dispatch_n, expert_n, combine_n = nodes
+
+        if _PROFILE_OVERLAP:
+            combine_n._collect_exec_time = True
+            dispatch_n._collect_exec_time = True
+
         # Ensure grad addition and sanitize_grad run on COMP stream,
         # not the default stream (which has no sync with COMP/COMM in overlap mode).
         with torch.cuda.stream(get_comp_stream()):
@@ -1082,6 +1151,11 @@ class MergedScheduler:
 
             grad_x = attn_n.backward((combine_grads[1], grad_h_ln_total, dispatch_grads[1]))
             grad_x = sanitize_grad(grad_x, self.grad_clamp_value)
+
+        if _PROFILE_OVERLAP:
+            combine_n._collect_exec_time = False
+            dispatch_n._collect_exec_time = False
+
         return grad_x
 
     def _backward_entry(self, entry, grad_h):
