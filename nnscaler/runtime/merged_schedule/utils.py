@@ -11,23 +11,7 @@ from torch.utils.checkpoint import checkpoint as torch_checkpoint
 
 _logger = logging.getLogger(__name__)
 
-_GRAD_CLAMP_VALUE = 1e4
 _VOCAB_GRAD_CHUNK = 25088  # rows per chunk; 25088 * 1024 * 4 = 98 MiB
-
-
-def sanitize_grad(grad_h, clamp_value=None):
-    """Replace NaN/Inf in grad_h with zero, and clamp extreme magnitudes.
-    Uses unconditional GPU ops (no CPU-GPU sync) for performance.
-    """
-    if clamp_value is None:
-        clamp_value = _GRAD_CLAMP_VALUE
-    if grad_h is None or not isinstance(grad_h, torch.Tensor):
-        return grad_h
-    with torch.no_grad():
-        torch.nan_to_num_(grad_h, nan=0.0, posinf=0.0, neginf=0.0)
-        if clamp_value > 0:
-            grad_h.clamp_(-clamp_value, clamp_value)
-    return grad_h
 
 
 def find_param_in_reducer(parallel_module, target_param):
@@ -44,13 +28,6 @@ def find_param_in_reducer(parallel_module, target_param):
             if target_param in bucket._pofset:
                 return bucket._contiguous_grads, bucket._pofset[target_param]
     return None, None
-
-
-def scan_reducer_buffer(parallel_module, clamp_value=None):
-    """Skip sanitization — baseline does not sanitize reducer buffers.
-    Keeping as no-op to match baseline behavior exactly.
-    """
-    return
 
 
 def manual_sync_grads(parallel_module):

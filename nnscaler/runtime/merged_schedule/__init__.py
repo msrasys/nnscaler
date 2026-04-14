@@ -10,10 +10,8 @@ from .engine import (
     get_comm_stream,
 )
 from .utils import (
-    sanitize_grad,
-    find_param_in_reducer,
-    scan_reducer_buffer,
     manual_sync_grads,
+    find_param_in_reducer,
     make_chunked_output_linear,
     chunked_linear_cross_entropy,
     merged_chunk_linear_cross_entropy,
