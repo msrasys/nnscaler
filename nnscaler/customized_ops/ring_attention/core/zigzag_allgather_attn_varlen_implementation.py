@@ -9,6 +9,8 @@ import torch
 import torch.distributed as dist
 from flash_attn import flash_attn_varlen_func
 
+from .utils import apply_sink_gate
+
 try:
     from flash_attn.cute import flash_attn_varlen_func as flash_attn_cute_varlen_func
 except ImportError:
@@ -156,22 +158,38 @@ def _run_flash_attn_varlen(
     deterministic: bool,
     use_cute: bool,
     window_size: Tuple[int, int],
+    return_lse: bool = False,
 ) -> torch.Tensor:
     if use_cute:
         assert flash_attn_cute_varlen_func is not None, "flash_attn.cute is not available"
         cute_window_size = tuple(None if w == -1 else w for w in window_size)
-        out, _ = flash_attn_cute_varlen_func(
-            q,
-            k,
-            v,
-            cu_seqlens_q=cu_seqlens_q,
-            cu_seqlens_k=cu_seqlens_k,
-            softmax_scale=softmax_scale,
-            causal=causal,
-            window_size=cute_window_size,
-            deterministic=deterministic,
-        )
-        return out
+        if return_lse:
+            out, lse = flash_attn_cute_varlen_func(
+                q,
+                k,
+                v,
+                cu_seqlens_q=cu_seqlens_q,
+                cu_seqlens_k=cu_seqlens_k,
+                softmax_scale=softmax_scale,
+                causal=causal,
+                window_size=cute_window_size,
+                deterministic=deterministic,
+                return_lse=True,
+            )
+            return out, lse
+        else:
+            out, _ = flash_attn_cute_varlen_func(
+                q,
+                k,
+                v,
+                cu_seqlens_q=cu_seqlens_q,
+                cu_seqlens_k=cu_seqlens_k,
+                softmax_scale=softmax_scale,
+                causal=causal,
+                window_size=cute_window_size,
+                deterministic=deterministic,
+            )
+            return out
 
     return flash_attn_varlen_func(
         q,
@@ -205,6 +223,7 @@ def zigzag_allgather_attn_varlen_func(
     deterministic: bool = False,
     use_cute: bool = False,
     window_size: Tuple[int, int] = (-1, -1),
+    learnable_sink: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     assert process_group is not None and dist.get_world_size(process_group) > 1, (
         "zigzag_allgather_attn_varlen_func only handles the multi-GPU CP branch"
@@ -222,7 +241,7 @@ def zigzag_allgather_attn_varlen_func(
     q_front = q[metadata.q_front_idx]
     q_end = q[metadata.q_end_idx]
 
-    front_output = _run_flash_attn_varlen(
+    front_output, front_lse = _run_flash_attn_varlen(
         q_front,
         k,
         v,
@@ -237,8 +256,9 @@ def zigzag_allgather_attn_varlen_func(
         deterministic,
         use_cute,
         window_size,
+        return_lse=True,
     )
-    end_output = _run_flash_attn_varlen(
+    end_output, end_lse = _run_flash_attn_varlen(
         q_end,
         k,
         v,
@@ -253,9 +273,18 @@ def zigzag_allgather_attn_varlen_func(
         deterministic,
         use_cute,
         window_size,
+        return_lse=True,
     )
 
     output = front_output.new_empty((q.shape[0],) + front_output.shape[1:])
     output[metadata.q_front_idx] = front_output
     output[metadata.q_end_idx] = end_output
+
+    if learnable_sink is not None:
+        nheads = front_lse.shape[0]
+        lse = front_lse.new_empty(nheads, q.shape[0])
+        lse[:, metadata.q_front_idx] = front_lse
+        lse[:, metadata.q_end_idx] = end_lse
+        output = apply_sink_gate(output, lse, learnable_sink)
+
     return output

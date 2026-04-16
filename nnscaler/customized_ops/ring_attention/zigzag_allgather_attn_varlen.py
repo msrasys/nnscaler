@@ -14,6 +14,7 @@ from nnscaler.ir import IRTensor
 from nnscaler.runtime.device import DeviceGroup
 
 from .core.utils import gen_head_anno
+from .core.utils import apply_sink_gate
 from .core.zigzag_allgather_attn_varlen_implementation import (
     zigzag_allgather_attn_varlen_func,
 )
@@ -31,6 +32,7 @@ def wrap_zigzag_allgather_attn_varlen_func(
     cu_seqlens_q: Tensor,
     cu_seqlens_k: Tensor,
     alibi_slopes: Tensor,
+    learnable_sink: Tensor = None,
     dropout_p: float = 0.0,
     softmax_scale: Tensor = None,
     causal: bool = False,
@@ -42,6 +44,8 @@ def wrap_zigzag_allgather_attn_varlen_func(
     process_group: Tuple[int] = None,
 ):
     assert not return_attn_probs, "return_attn_probs is not supported"
+    if learnable_sink is not None:
+        assert use_cute, "learnable_sink requires use_cute=True"
 
     max_seqlen_q = (cu_seqlens_q[1:] - cu_seqlens_q[:-1]).max().item()
     max_seqlen_k = (cu_seqlens_k[1:] - cu_seqlens_k[:-1]).max().item()
@@ -49,17 +53,19 @@ def wrap_zigzag_allgather_attn_varlen_func(
     if process_group is None or len(process_group) == 1 or not enable_ring:
         if use_cute:
             assert flash_attn_cute_varlen_func is not None, "flash_attn.cute is not available"
-            output, _ = flash_attn_cute_varlen_func(
-                q,
-                k,
-                v,
+            cute_window_size = tuple(None if w == -1 else w for w in window_size)
+            output, lse = flash_attn_cute_varlen_func(
+                q, k, v,
                 cu_seqlens_q=cu_seqlens_q,
                 cu_seqlens_k=cu_seqlens_k,
                 softmax_scale=softmax_scale,
                 causal=causal,
-                window_size=(None, None),
+                window_size=cute_window_size,
                 deterministic=deterministic,
+                return_lse=True,
             )
+            if learnable_sink is not None:
+                output = apply_sink_gate(output, lse, learnable_sink)
             return output
 
         return flash_attn_varlen_func(
@@ -97,6 +103,7 @@ def wrap_zigzag_allgather_attn_varlen_func(
         alibi_slopes=alibi_slopes,
         deterministic=deterministic,
         use_cute=use_cute,
+        learnable_sink=learnable_sink,
     )
 
 
@@ -140,11 +147,11 @@ def emit_ring(
     return f"{signature}({args})"
 
 
-def flash_attention_anno(query_states, key_states, value_states, cu_seqlens_q, cu_seqlens_k, alibi_slopes, *args, **kwargs) -> str:
+def flash_attention_anno(query_states, key_states, value_states, cu_seqlens_q, cu_seqlens_k, alibi_slopes, learnable_sink=None, *args, **kwargs) -> str:
     q_anno, kv_anno = gen_head_anno(query_states, key_states, value_states, head_pos=1)
-    if isinstance(alibi_slopes, IRTensor):
-        return f"l {q_anno} hd^, al^ {kv_anno} hd^, al^ {kv_anno} vd^, e^, e^, {q_anno} -> l {q_anno} vd^"
-    return f"l {q_anno} hd^, al^ {kv_anno} hd^, al^ {kv_anno} vd^, e^, e^, ? -> l {q_anno} vd^"
+    alibi_anno = f'{q_anno}' if isinstance(alibi_slopes, IRTensor) else '?'
+    sink_anno = f'{q_anno}' if isinstance(learnable_sink, IRTensor) else '?'
+    return f"l {q_anno} hd^, al^ {kv_anno} hd^, al^ {kv_anno} vd^, e^, e^, {alibi_anno}, {sink_anno} -> l {q_anno} vd^"
 
 
 def input_gen_fn(node: IRDimops):
@@ -156,7 +163,7 @@ def input_gen_fn(node: IRDimops):
             inputs.append(torch.randn(t.shape, dtype=t.dtype, device=device, requires_grad=t.requires_grad))
         elif i in [3, 4]:
             inputs.append(torch.Tensor([0, seqlen]).to(torch.int32).to(device))
-        elif i == 5:
+        elif i in [5, 6]:  # optional alibi_slopes, learnable_sink
             if isinstance(t, IRTensor):
                 inputs.append(torch.randn(t.shape, dtype=t.dtype, device=device, requires_grad=t.requires_grad))
             else:

@@ -16,6 +16,7 @@ from .core.sliding_window_attn_implementation import (
     sliding_window_attn_func,
 )
 from .core.utils import gen_head_anno
+from .core.utils import apply_sink_gate
 
 try:
     from flash_attn.cute import flash_attn_varlen_func as flash_attn_cute_varlen_func
@@ -30,6 +31,7 @@ def wrap_sliding_window_attn_func(
         cu_seqlens_q: Tensor,
         cu_seqlens_k: Tensor,
         alibi_slopes: Tensor,
+        learnable_sink: Tensor = None,
         dropout_p: float = 0.0,
         softmax_scale: Tensor = None,
         causal: bool = True,
@@ -53,6 +55,8 @@ def wrap_sliding_window_attn_func(
     - window_size[0] <= length_per_rank (single-hop communication)
     '''
     assert not return_attn_probs, "return_attn_probs is not supported"
+    if learnable_sink is not None:
+        assert use_cute, "learnable_sink requires use_cute=True"
     max_seqlen_q = (cu_seqlens_q[1:] - cu_seqlens_q[:-1]).max().item()
     max_seqlen_k = (cu_seqlens_k[1:] - cu_seqlens_k[:-1]).max().item()
 
@@ -60,7 +64,7 @@ def wrap_sliding_window_attn_func(
         if use_cute:
             assert flash_attn_cute_varlen_func is not None, "flash_attn.cute is not available"
             cute_window_size = tuple(None if w == -1 else w for w in window_size)
-            output, _ = flash_attn_cute_varlen_func(
+            output, lse = flash_attn_cute_varlen_func(
                 q, k, v,
                 cu_seqlens_q=cu_seqlens_q,
                 cu_seqlens_k=cu_seqlens_k,
@@ -68,7 +72,10 @@ def wrap_sliding_window_attn_func(
                 causal=causal,
                 window_size=cute_window_size,
                 deterministic=deterministic,
+                return_lse=True,
             )
+            if learnable_sink is not None:
+                output = apply_sink_gate(output, lse, learnable_sink)
             return output
         else:
             output = flash_attn_varlen_func(
@@ -112,7 +119,7 @@ def wrap_sliding_window_attn_func(
         world_size=local_world_size,
     )
 
-    output = sliding_window_attn_func(
+    out, softmax_lse = sliding_window_attn_func(
         q,
         k,
         v,
@@ -124,12 +131,14 @@ def wrap_sliding_window_attn_func(
         window_size=window_size,
         alibi_slopes=alibi_slopes,
         deterministic=deterministic,
-        return_attn_probs=False,
         group=local_process_group,
         use_cute=use_cute,
     )
 
-    return output
+    if learnable_sink is not None:
+        out = apply_sink_gate(out, softmax_lse, learnable_sink)
+
+    return out
 
 
 def emit_ring(node: IRDimops, args: List[str], kwargs: Dict[str, str], runtime_devid: int, plan_ndevs: int, runtime_ndevs: int) -> str:
@@ -164,12 +173,11 @@ def emit_ring(node: IRDimops, args: List[str], kwargs: Dict[str, str], runtime_d
     return f"{signature}({args})"
 
 
-def flash_attention_anno(query_states, key_states, value_states, cu_seqlens_q, cu_seqlens_k, alibi_slopes, *args, **kwargs) -> str:
+def flash_attention_anno(query_states, key_states, value_states, cu_seqlens_q, cu_seqlens_k, alibi_slopes, learnable_sink=None, *args, **kwargs) -> str:
     q_anno, kv_anno = gen_head_anno(query_states, key_states, value_states, head_pos=1)
-    if isinstance(alibi_slopes, IRTensor):
-        return f'l {q_anno} hd^, l {kv_anno} hd^, l {kv_anno} vd^, e^, e^, {q_anno} -> l {q_anno} vd^'
-    else:
-        return f'l {q_anno} hd^, l {kv_anno} hd^, l {kv_anno} vd^, e^, e^, ? -> l {q_anno} vd^'
+    alibi_anno = f'{q_anno}' if isinstance(alibi_slopes, IRTensor) else '?'
+    sink_anno = f'{q_anno}' if isinstance(learnable_sink, IRTensor) else '?'
+    return f'l {q_anno} hd^, l {kv_anno} hd^, l {kv_anno} vd^, e^, e^, {alibi_anno}, {sink_anno} -> l {q_anno} vd^'
 
 
 def input_gen_fn(node: IRDimops):
@@ -181,7 +189,7 @@ def input_gen_fn(node: IRDimops):
             inputs.append(torch.randn(t.shape, dtype=t.dtype, device=device, requires_grad=t.requires_grad))
         elif i in [3, 4]:  # cu_seqlens
             inputs.append(torch.Tensor([0, seqlen]).to(torch.int32).to(device))
-        elif i == 5:  # optional alibi_slopes
+        elif i in [5, 6]:  # optional alibi_slopes, learnable_sink
             if isinstance(t, IRTensor):
                 inputs.append(torch.randn(t.shape, dtype=t.dtype, device=device, requires_grad=t.requires_grad))
             else:

@@ -341,3 +341,19 @@ def reduce_scatter(tensor: torch.Tensor, dim: int, process_group: dist.ProcessGr
     otensor = torch.empty_like(itensors[0], requires_grad=False)
     torch.distributed.reduce_scatter(otensor, itensors, group=process_group)
     return otensor
+
+
+def apply_sink_gate(
+    out: torch.Tensor,
+    lse: torch.Tensor,
+    learnable_sink: torch.Tensor,
+) -> torch.Tensor:
+    """Apply sigmoid gate: out * sigmoid(lse - sink).
+
+    Args:
+        out: attention output, shape (total_tokens, nheads, hdim)
+        lse: log-sum-exp, shape (nheads, total_tokens)
+        learnable_sink: per-head sink bias, shape (nheads,)
+    """
+    gate = torch.sigmoid(lse.transpose(0, 1).float() - learnable_sink.float())
+    return out * gate.unsqueeze(-1).to(out.dtype)

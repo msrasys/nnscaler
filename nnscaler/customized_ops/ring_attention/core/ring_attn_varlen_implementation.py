@@ -214,6 +214,7 @@ def llama3_flash_attn_varlen_backward(
     alibi_slopes=None,
     deterministic=False,
     use_cute=False,
+    dlse=None,
 ):  # pragma: no cover
     nheads = q.shape[1]
     total_k, nheads_k, head_dim = k.shape
@@ -266,6 +267,14 @@ def llama3_flash_attn_varlen_backward(
         else:
             lse_i = softmax_lse[q_slice]
 
+        if dlse is not None:
+            if dlse.dim() == 3:
+                dlse_i = dlse[:, q_slice].contiguous()
+            else:
+                dlse_i = dlse[q_slice]
+        else:
+            dlse_i = None
+
         comm.wait()
         kv_buffer, kv_buffer_copy = kv_buffer_copy, kv_buffer
 
@@ -311,6 +320,7 @@ def llama3_flash_attn_varlen_backward(
                     "window_size_left": window_size_cute[0],
                     "window_size_right": window_size_cute[1],
                     "deterministic": deterministic,
+                    "dlse": dlse_i,
                 }
             )
             _flash_attn_bwd(**params)
@@ -386,7 +396,6 @@ class Llama3FlashAttnVarlenFunc(torch.autograd.Function):
         window_size,
         alibi_slopes,
         deterministic,
-        return_softmax,
         group,
         use_cute,
     ):
@@ -428,11 +437,12 @@ class Llama3FlashAttnVarlenFunc(torch.autograd.Function):
         ctx.deterministic = deterministic
         ctx.group = group
         ctx.use_cute = use_cute
-        return out if not return_softmax else (out, softmax_lse, None)
+        return out, softmax_lse
 
     @staticmethod
     def backward(ctx, dout, *args):  # pragma: no cover
         q, k, v, out, softmax_lse, cu_seqlens_q, cu_seqlens_k = ctx.saved_tensors
+        dlse = args[0] if args else None
         dq, dk, dv = llama3_flash_attn_varlen_backward(
             ctx.group,
             dout,
@@ -454,8 +464,9 @@ class Llama3FlashAttnVarlenFunc(torch.autograd.Function):
             alibi_slopes=ctx.alibi_slopes,
             deterministic=ctx.deterministic,
             use_cute=ctx.use_cute,
+            dlse=dlse,
         )
-        return (dq, dk, dv) + (None,) * 16
+        return (dq, dk, dv) + (None,) * 14
 
 
 def llama3_flash_attn_varlen_qkvpacked_func(
@@ -472,7 +483,6 @@ def llama3_flash_attn_varlen_qkvpacked_func(
     window_size=(-1, -1),  # -1 means infinite context window
     alibi_slopes=None,
     deterministic=False,
-    return_attn_probs=False,
     group=None,
     use_cute=False,
 ):
@@ -492,7 +502,6 @@ def llama3_flash_attn_varlen_qkvpacked_func(
         window_size,
         alibi_slopes,
         deterministic,
-        return_attn_probs,
         group,
         use_cute,
     )
@@ -513,7 +522,6 @@ def llama3_flash_attn_varlen_kvpacked_func(
     window_size=(-1, -1),  # -1 means infinite context window
     alibi_slopes=None,
     deterministic=False,
-    return_attn_probs=False,
     group=None,
     use_cute=False,
 ):
@@ -533,7 +541,6 @@ def llama3_flash_attn_varlen_kvpacked_func(
         window_size,
         alibi_slopes,
         deterministic,
-        return_attn_probs,
         group,
         use_cute,
     )
@@ -555,7 +562,6 @@ def llama3_flash_attn_varlen_func(
     window_size=(-1, -1),  # -1 means infinite context window
     alibi_slopes=None,
     deterministic=False,
-    return_attn_probs=False,
     group=None,
     use_cute=False,
 ):
@@ -575,7 +581,6 @@ def llama3_flash_attn_varlen_func(
         window_size,
         alibi_slopes,
         deterministic,
-        return_attn_probs,
         group,
         use_cute,
     )

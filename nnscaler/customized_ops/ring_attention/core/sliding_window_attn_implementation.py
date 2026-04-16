@@ -361,6 +361,7 @@ def sliding_window_backward(
     alibi_slopes: Optional[torch.Tensor] = None,
     deterministic: bool = False,
     use_cute: bool = False,
+    dlse: Optional[torch.Tensor] = None,
 ):  # pragma: no cover
     """
     Backward pass for sliding window CP attention.
@@ -407,6 +408,7 @@ def sliding_window_backward(
             "window_size_left": window_size_cute[0],
             "window_size_right": window_size_cute[1],
             "deterministic": deterministic,
+            "dlse": dlse,
         })
         _flash_attn_bwd(**params)
     else:
@@ -472,7 +474,6 @@ class SlidingWindowAttnFunc(torch.autograd.Function):
         window_size,
         alibi_slopes,
         deterministic,
-        return_softmax,
         group,
         use_cute,
     ):
@@ -505,11 +506,12 @@ class SlidingWindowAttnFunc(torch.autograd.Function):
         ctx.deterministic = deterministic
         ctx.group = group
         ctx.use_cute = use_cute
-        return out if not return_softmax else (out, softmax_lse, None)
+        return out, softmax_lse
 
     @staticmethod
     def backward(ctx, dout, *args):  # pragma: no cover
         q, extended_k, extended_v, out, softmax_lse = ctx.saved_tensors
+        dlse = args[0] if args else None
         dq, dk, dv = sliding_window_backward(
             ctx.group,
             dout,
@@ -525,8 +527,9 @@ class SlidingWindowAttnFunc(torch.autograd.Function):
             alibi_slopes=ctx.alibi_slopes,
             deterministic=ctx.deterministic,
             use_cute=ctx.use_cute,
+            dlse=dlse,
         )
-        return (dq, dk, dv) + (None,) * 11
+        return (dq, dk, dv) + (None,) * 10
 
 
 def sliding_window_attn_func(
@@ -541,7 +544,6 @@ def sliding_window_attn_func(
     window_size=(-1, -1),
     alibi_slopes=None,
     deterministic=False,
-    return_attn_probs=False,
     group=None,
     use_cute=False,
 ):
@@ -570,7 +572,6 @@ def sliding_window_attn_func(
         window_size,
         alibi_slopes,
         deterministic,
-        return_attn_probs,
         group,
         use_cute,
     )
