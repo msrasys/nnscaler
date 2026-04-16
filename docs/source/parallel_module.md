@@ -598,7 +598,7 @@ In Non-PP mode, If you use `ParallelModule.forward` directly, you need to manual
 
 In the end of `train_step`, we need to sync the gradients across devices. The way we sync gradients is different in PP and Non-PP mode.
 
-We will always call `optimizer.sync_shard_grad()` to sync the gradients before `optimizer.step()`, but in PP mode, the `sync_shard_grad` is a no-op because the gradients are already synced in the codegen, whereas in Non-PP mode, the `sync_shard_grad` will do the real synchronization.
+We will always call `optimizer.sync_shard_grad()` to sync the gradients before `optimizer.step()`, but in end2end model, the `sync_shard_grad` is a no-op because the gradients are already synced in the codegen (`_train_step`), whereas in Non-end2end mode, the `sync_shard_grad` will do the real synchronization.
 
 In Non-PP mode, to support multiple calls of `optimizer.sync_shard_grad()`, `ParallelModule` will keep track whether the gradients are synced or not with `self._sync_grad_required` flag, and only sync the gradients when `self._sync_grad_required` is True. So you can call `optimizer.sync_shard_grad()` multiple times without worrying about it.
 
