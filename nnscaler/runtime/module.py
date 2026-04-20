@@ -1469,6 +1469,50 @@ class ParallelModule(CubeModule):
         # make sure the gradients are synchronized
         self.sync_grad()
 
+        # Per-parameter gradient checksum for parity debugging
+        import os
+        if os.environ.get('GRAD_CHECKSUM') and torch.distributed.get_rank() == 0:
+            import logging as _logging
+            _glog = _logging.getLogger('nnscaler.gnorm_diag')
+            _step = getattr(self, '_gnorm_diag_step', 0)
+            self._gnorm_diag_step = _step + 1
+            if _step == 0:
+                groups = {}
+                for name, param in self.named_parameters():
+                    if not param.requires_grad or param.grad is None:
+                        continue
+                    if 'tok_embeddings' in name or 'tok_embed' in name:
+                        key = 'tok_embed'
+                    elif 'output' in name and ('weight' in name or 'bias' in name):
+                        key = 'output'
+                    elif 'self_attn' in name or 'attn' in name:
+                        key = 'attn'
+                    elif 'gate' in name or 'router' in name:
+                        key = 'moe_gate'
+                    elif ('w13' in name or 'w2' in name) and 'expert' not in name:
+                        key = 'moe_expert'
+                    elif 'mlp' in name:
+                        key = 'mlp_other'
+                    elif 'norm' in name:
+                        key = 'norm'
+                    elif 'k_proj' in name or 'v_proj' in name:
+                        key = 'yoco_proj'
+                    else:
+                        key = 'other'
+                    with torch.no_grad():
+                        g = param.grad.float()
+                        gnorm = g.norm().item()
+                        gsum = g.sum().item()
+                    if key not in groups:
+                        groups[key] = []
+                    groups[key].append((name, gnorm, gsum))
+                for key in sorted(groups.keys()):
+                    params = groups[key]
+                    total_norm = sum(n**2 for _, n, _ in params)**0.5
+                    _glog.info(f"[GRAD_GROUP_POST_SYNC] {key}: group_norm={total_norm:.15e} n={len(params)}")
+                    for pname, pnorm, psum in params:
+                        _glog.info(f"[GRAD_PARAM_POST_SYNC] {key} | {pname} norm={pnorm:.15e} sum={psum:.15e}")
+
         return clip_gnorm(self._nreplicas2localparams, max_norm)
 
     def _get_zero_metadata(self) -> ZeroMetadata:
