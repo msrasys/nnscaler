@@ -1,11 +1,11 @@
 #  Copyright (c) Microsoft Corporation.
 #  Licensed under the MIT License.
 
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Union
 import copy
 import logging
 
-from nnscaler.ir.cten import IRCell, IRTensor
+from nnscaler.ir.cten import IRCell, IRTensor, IR
 from nnscaler.ir.operator import IRDataOperation, IRFwOperation
 from nnscaler.ir.tensor import IRSubTensor
 from nnscaler.ir.adapter import IRWeightReducer, IRAdapter
@@ -16,7 +16,7 @@ from nnscaler.execplan.execplan import ExecutionPlan, ExeReuseCell
 from nnscaler.codegen.emit import FuncEmission
 from nnscaler.codegen.syntax.symtable import SymbolTable
 from nnscaler.codegen.lifecycle import LifeCycle
-from nnscaler.codegen.syntax.blocks import FunctionBlock
+from nnscaler.codegen.syntax.blocks import FunctionBlock, Block
 from nnscaler.flags import CompileFlag
 
 
@@ -78,22 +78,60 @@ class ScheduleCodeGen(FuncEmission):
 
         assert all(not isinstance(n, IRFwOperation) for n in device_nodes), \
             "Expected all forward operators have been grouped into IRSegment"
+        self._validate_events(device_nodes)
 
         lifetime = LifeCycle(device_nodes, [], self.execplan.outputs())
 
         args = ['model'] + [self.tensor_name(t) for t in self.execplan.graph.inputs()]
 
+        last_stream = None
+        buffered_codes = []
+
+        def _get_codes_with_stream_context(codes: List[str], stream: Optional[str]) -> List[str]:
+            if stream is None:
+                return codes + ['']
+            else:
+                with Block(f'with torch.cuda.stream(nnscaler.runtime.device.DeviceGroup().get_stream({repr(stream)})):' ) as stream_block:
+                    stream_block.insert_body(codes)
+                return stream_block.code + ['']
+
+        def _append_code(fb: FunctionBlock, code: Union[List[str], str], stream: Optional[str] = None, force_flush=False):
+            codes = code if isinstance(code, list) else [code]
+
+            nonlocal last_stream, buffered_codes
+
+            if last_stream == stream:
+                buffered_codes.extend(codes)
+            else:
+                if buffered_codes:
+                    fb.insert_body(_get_codes_with_stream_context(buffered_codes, last_stream))
+
+                last_stream = stream
+                buffered_codes.clear()
+                buffered_codes.extend(codes)
+
+            if force_flush:
+                if buffered_codes:
+                    fb.insert_body(_get_codes_with_stream_context(buffered_codes, last_stream))
+                buffered_codes.clear()
+                last_stream = None
+
         with FunctionBlock(func_name='_train_step',
                            args=args) as fb:
-            fb.insert_body('_ = None')
+            _append_code(fb, '_ = None')
 
             if use_scheduler:
-                fb.insert_body('nnscaler.flags.RuntimeFlag.skip_zero_grad = False')
-            fb.insert_body('model.zero_grad()')
+                _append_code(fb, 'nnscaler.flags.RuntimeFlag.skip_zero_grad = False')
+            _append_code(
+                fb,
+                self._emit_stream_context(self.execplan.zero_grad_stream_context, ['model.zero_grad()']),
+                self.execplan.zero_grad_stream_context.stream
+                    if self.execplan.zero_grad_stream_context else None
+            )
 
             # body code
             if len(device_nodes) == 0:
-                fb.insert_body('pass')
+                _append_code(fb, 'pass')
             else:
                 def _is_backward_segment(node: IRCell) -> bool:
                     node = node.cell if isinstance(node, ExeReuseCell) else node
@@ -118,47 +156,50 @@ class ScheduleCodeGen(FuncEmission):
                 for line, node in enumerate(device_nodes):
                     # when use scheduler, skip reducer if it is not the last backward of same segments
                     if use_scheduler and _is_backward_segment(node):
-                        fb.insert_body(
+                        _append_code(fb,
                             f'nnscaler.flags.RuntimeFlag.skip_reducer = '
                             f'{id(node) not in last_backward_node_oids !r}'
                         )
                     codes = self.emit_node(node)
-                    fb.insert_body(codes)
+                    _append_code(fb, codes, self._get_node_stream(node))
                     # release
                     tensors = lifetime.release_tensors_after_line(line)
                     if len(tensors) > 0 : # not necessarily to have one after each line
-                        fb.insert_body(self.emit_release(tensors))
+                        _append_code(fb, self.emit_release(tensors))
             # return code
             outputs = self.return_name_complex(self.execplan.outputs())
             code = f'return {outputs}'
-            fb.insert_body(code)
+            _append_code(fb, code, force_flush=True)
+
         gencode += fb.code
 
         gencode += ['', '']
 
+        last_stream = None
+        buffered_codes.clear()
         # infer code
         if not any(not node.isfw() for node in device_nodes):
             gencode += ['_infer_step = _train_step']
         else:
             with FunctionBlock(func_name='_infer_step', args=args) as fb:
-                fb.insert_body('_ = None')
+                _append_code(fb, '_ = None')
                 # body code
                 if len(device_nodes) == 0:
-                    fb.insert_body('pass')
+                    _append_code(fb, 'pass')
                 for line, node in enumerate(device_nodes):
                     if not node.isfw(): continue  # skip backward segments and adapters
                     # execute
                     codes = self.emit_node(node, force_no_grad=True)
-                    fb.insert_body(codes)
+                    _append_code(fb, codes, self._get_node_stream(node))
                     # release
                     tensors = lifetime.release_tensors_after_line(line)
                     tensors = [t for t in tensors if isinstance(t, IRTensor) and not t.is_grad()]
                     if len(tensors) > 0 : # not necessarily to have one after each line
-                        fb.insert_body(self.emit_release(tensors))
+                        _append_code(fb, self.emit_release(tensors))
                 # return code
                 outputs = self.return_name_complex(self.execplan.outputs())
                 code = f'return {outputs}'
-                fb.insert_body(code)
+                _append_code(fb, code, force_flush=True)
             gencode += fb.code
         gencode += ['']
 
@@ -168,6 +209,59 @@ class ScheduleCodeGen(FuncEmission):
             with open(outfile, 'a' if attach else 'w') as f:
                 f.write(code)
         return code
+
+    def _get_node_stream_context(self, node: IRCell):
+        unwrap_node = node.cell if isinstance(node, ExeReuseCell) else node
+        stream_context = node.get_op_context('stream_context')
+
+        if not stream_context and isinstance(node, ExeReuseCell):
+            stream_context = node.cell.get_op_context('stream_context')
+
+        if not stream_context and isinstance(unwrap_node, IRWeightReducer):
+            stream_context = self.execplan.weight_reducer_stream_context
+
+        return stream_context
+
+    def _get_node_stream(self, node: IRCell) -> Optional[str]:
+        stream_context = self._get_node_stream_context(node)
+        if stream_context:
+            return stream_context.stream
+        else:
+            return None
+
+    def _emit_stream_context(self, stream_context, codes: List[str]) -> List[str]:
+        wait_stream_codes = []
+        if stream_context and stream_context.wait_streams:
+            for wait_stream in stream_context.wait_streams:
+                wait_stream_codes.append(f'torch.cuda.current_stream().wait_stream(nnscaler.runtime.device.DeviceGroup().get_stream({repr(wait_stream)}))')
+
+        wait_event_codes = []
+        if stream_context and stream_context.wait_events:
+            for wait_event in stream_context.wait_events:
+                wait_event_codes.append(f'nnscaler.runtime.device.DeviceGroup().get_event({repr(wait_event)}).wait()')
+
+        record_event_codes = []
+        if stream_context and stream_context.record_events:
+            for record_event in stream_context.record_events:
+                record_event_codes.append(f'nnscaler.runtime.device.DeviceGroup().get_event({repr(record_event)}).record()')
+
+        return wait_stream_codes + wait_event_codes + codes + record_event_codes
+
+    def _validate_events(self, nodes):
+        """
+        Validate that all events waited by nodes are recorded by some previous nodes in the graph
+        """
+        events = set()
+        for node in nodes:
+            stream_context = self._get_node_stream_context(node)
+            if stream_context:
+                if stream_context.wait_events:
+                    for wait_event in stream_context.wait_events:
+                        if wait_event not in events:
+                            raise ValueError(f'Event `{wait_event}` is waited but has not been recorded')
+                if stream_context.record_events:
+                    for record_event in stream_context.record_events:
+                        events.add(record_event)
 
     def emit_detach(self, tensor: IRTensor) -> str:
         """
@@ -184,6 +278,8 @@ class ScheduleCodeGen(FuncEmission):
         bsign = '{input_grads} = nnscaler.runtime.executor.backward({name}, {input_tensors}, {output_tensors}, {output_grads})'
 
         node_inputs, node_outputs = node.inputs(), node.outputs()
+        # the real inputs in gencode
+        gen_inputs = node_inputs
         req_grad = any(t.requires_grad for t in node.outputs() if isinstance(t, IRTensor))
         req_grad = False if force_no_grad else req_grad
 
@@ -193,6 +289,7 @@ class ScheduleCodeGen(FuncEmission):
 
         unwrap_node = node.cell if isinstance(node, ExeReuseCell) else node
         name = self.node_name(unwrap_node)
+        stream_context = self._get_node_stream_context(node)
 
         if isinstance(unwrap_node, IRSegment):
             # emit forward segment
@@ -208,6 +305,7 @@ class ScheduleCodeGen(FuncEmission):
                 # get gradient computation arguments
                 input_tensors, output_tensors, output_grads, input_grads = \
                         self.get_backward_callsite_io_tensors(node)
+                gen_inputs = (input_tensors, output_tensors, output_grads)
                 # special handle for loss
                 for idx, tensor in enumerate(output_grads):
                     if isinstance(tensor, IRSubTensor) and tensor.is_loss():
@@ -258,8 +356,27 @@ class ScheduleCodeGen(FuncEmission):
         else:
             raise RuntimeError(f"Unspported node type: {type(unwrap_node)}")
 
+        if stream_context and stream_context.stream:
+            # register all input tensors to the current stream
+            # to avoid cross-stream premature deallocation issue
+            # see `Tensor.record_stream` in PyTorch for more details
+
+            # NOTE: The dataloader output is not considered here. Two reasons:
+            # 1) Dataloader output is wrapped in an IRObject, and internal IRTensors cannot be accessed here easily.
+            # 2) Dataloader output is used as input of the first forward segment immediately after data loading
+            # 3) Dataloader output is never del'ed. (its lifetime is not managed here due to #1)
+            input_tensor_name = [
+                self.tensor_name(t) for t in IR.get_objects(gen_inputs)
+                if isinstance(t, IRTensor) and not t.is_attr()
+            ]
+            record_stream_codes = []
+            for t in input_tensor_name:
+                record_stream_codes.append(f'{t}.record_stream(torch.cuda.current_stream())')
+
+            codes = record_stream_codes + codes
+
         if CompileFlag.line_timer:
             type_str = type(unwrap_node).__name__
-            return [f'nnscaler.runtime.function.print_time({repr(type_str)})'] + codes
-        else:
-            return codes
+            codes = [f'nnscaler.runtime.function.print_time({repr(type_str)})'] + codes
+
+        return self._emit_stream_context(stream_context, codes)

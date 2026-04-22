@@ -572,3 +572,36 @@ But on the other hand, `self.training` is very common used in module forward met
 So we add a very limited support for `self.training` in tracing.
 
 Please note that user code is flattened and transformed into a single `ParallelModule` at runtime, so `training` is a global module state, and we don't support the case that user want to set a sub-module's training to True but remaining modules to False.
+
+## Some Details on Integration with Trainer
+
+There are two ways to use `ParallelModule` with Trainer:
+
+1. Pipeline Parallelism with End2End Module (Data Parallelism/Tensor Parallelism can also be used here): You must use `ParallelModule.train_step` and `ParallelModule.infer_step` (which are wrappers of `_train_step`/`_infer_step` from gencode of `ExecutionPlan`) to train/infer the module. The PAS policy must have pipeline parallelism, and the compute config must set `use_end2end=True`.
+
+2. Pure Non-Pipeline Parallelism (Data Parallelism/Tensor Parallelism) : You can use `ParallelModule` just like a normal `torch.nn.Module`, i.e., call `ParallelModule.forward` to do forward, and use `build_optimizer` to create optimizer for the module. `ParallelModule.train_step` and `ParallelModule.infer_step` are also available, which are just a wrapper of `ParallelModule.forward`. The PAS policy must not have pipeline parallelism.
+
+We can distinguish the above two ways by checking `ParallelModule.use_scheduler` flag.
+
+In the following, we will refer to the first way as "PP", and the second way as "Non-PP" for better readability.
+
+### Gradient Accumulation Support
+
+Gradient accumulation is done with two runtime flags: `RuntimeFlag.skip_zero_grad` and `RuntimeFlag.skip_reducer`.
+
+In PP mode, both flags are managed directly in generated code of `ExecutionPlan`, and you don't need to care about them. The codegen will automatically set the flags according to the micro-batch index and the accumulation steps.
+
+In Non-PP mode, If you use `ParallelModule.forward` directly, you need to manually set the flags in the training loop for gradient accumulation by `nnscaler.utils.accum_mode`. If you use `ParellelModule.train_step`, the flags will be automatically set in `train_step` according to the micro-batch index and the accumulation steps, so you don't need to care about them.
+
+
+### Gradient Reduction Support
+
+In the end of `train_step`, we need to sync the gradients across devices. The way we sync gradients is different in PP and Non-PP mode.
+
+We will always call `optimizer.sync_shard_grad()` to sync the gradients before `optimizer.step()`, but in end2end model, the `sync_shard_grad` is a no-op because the gradients are already synced in the codegen (`_train_step`), whereas in Non-end2end mode, the `sync_shard_grad` will do the real synchronization.
+
+In Non-PP mode, to support multiple calls of `optimizer.sync_shard_grad()`, `ParallelModule` will keep track whether the gradients are synced or not with `self._sync_grad_required` flag, and only sync the gradients when `self._sync_grad_required` is True. So you can call `optimizer.sync_shard_grad()` multiple times without worrying about it.
+
+We also support async gradient reduction via `compute_config.use_async_reducer`. In this case, the gradient reduction will be kicked off once the gradients are ready, and `optimizer.sync_shard_grad()` will wait for the reduction to be done if it is called before the reduction is done.
+
+When we combine async reduction with gradient accumulation, The time of kicking off gradient reduction becomes a problem. The current implementation is reusing `RuntimeFlag.skip_reducer` flag to control when to kick off the reduction. It is not ideal because `RuntimeFlag.skip_reducer` is originally designed for gradient accumulation, and it is not compatible when overlapping is used. So in overlapped scenarios, we must not use async reduction. We will improve it in the future.

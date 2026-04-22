@@ -11,7 +11,7 @@ from nnscaler.ir.tensor import IRSubTensor, IRFullTensor
 from nnscaler.ir.adapter import IRAdapter, IRWeightReducer
 from nnscaler.ir.operator import IRBpOperation, IRFwOperation, IRDataOperation
 from nnscaler.graph.graph import IRGraph, IRSegment
-from nnscaler.graph.schedule.schedplan import SchedulePlan, Block
+from nnscaler.graph.schedule.schedplan import SchedulePlan, Block, StreamContext
 
 
 class ExeReuseCell(IRCell):
@@ -65,6 +65,7 @@ class ExeReuseCell(IRCell):
             outputs.append(t)
         reuse = ExeReuseCell(self._cell.dispatch(devid), inputs, outputs)
         reuse._id = self._id
+        reuse._op_context = self._op_context
         if _mirror and self.mirror is not None:
             mreuse = self.mirror.dispatch(devid, _mirror=False)
             IRCell.make_pair(reuse, mreuse)
@@ -127,6 +128,10 @@ class ExecutionPlan:
 
         micro_fcells: Dict[(int, IRCell), ExeReuseCell] = {}
         def block2reuse(node: Block) -> ExeReuseCell:
+            # Note: we set op_context for forward and backward seperately.
+            # But as forward/backward are paired
+            # (e.g., forward and backward of a same micro-batch are used, which is always true in training),
+            # both forward and backward will have the stream_context set correctly.
             if node.content.isfw():
                 key = (node.mid, node.content)
                 if key in micro_fcells:
@@ -134,6 +139,8 @@ class ExecutionPlan:
                 inputs = [get(t, node.mid) for t in node.content.inputs()]
                 outputs = [get(t, node.mid) for t in node.content.outputs()]
                 cell = ExeReuseCell(node.content, inputs, outputs)
+                if node.stream_context is not None:
+                    cell.set_op_context('stream_context', node.stream_context)
                 if isinstance(node.content.mirror, IRCell):
                     minputs = [get(t, node.mid) for t in node.content.mirror.inputs()]
                     moutputs = [get(t, node.mid) for t in node.content.mirror.outputs()]
@@ -143,6 +150,8 @@ class ExecutionPlan:
                 return cell
             else:
                 mcell = block2reuse(Block(node.content.mirror, node.mid, node.span))
+                if node.stream_context is not None:
+                    mcell.mirror.set_op_context('stream_context', node.stream_context)
                 return mcell.mirror
 
         topo_seqs: List[IRCell] = []
@@ -164,6 +173,33 @@ class ExecutionPlan:
         execplan = ExecutionPlan(schedplan.graph, topo_seqs)
         execplan.set_outputs(outputs)
 
+        def _is_cuda_stream_used() -> bool:
+            if schedplan.stream_config.dataloader and schedplan.stream_config.dataloader.stream:
+                return True
+            if schedplan.stream_config.inter_segment_move and schedplan.stream_config.inter_segment_move.stream:
+                return True
+            if schedplan.stream_config.result_broadcast and schedplan.stream_config.result_broadcast.stream:
+                return True
+            if schedplan.stream_config.grad_reduce and schedplan.stream_config.grad_reduce.stream:
+                return True
+            if schedplan.stream_config.zero_grad and schedplan.stream_config.zero_grad.stream:
+                return True
+
+            for block in schedplan.nodes():
+                # check segment stream context (all segments are wrapped in blocks)
+                if isinstance(block, Block) and (stream_context := block.stream_context) is not None:
+                    if stream_context.stream:
+                        return True
+                    if stream_context.wait_streams:
+                        return True
+            return False
+
+
+        execplan.weight_reducer_stream_context = schedplan.stream_config.grad_reduce
+        execplan.zero_grad_stream_context = schedplan.stream_config.zero_grad
+        execplan.use_multi_streams = _is_cuda_stream_used()
+        execplan.cuda_sync_required = execplan.use_multi_streams and schedplan.stream_config.cuda_sync_required
+
         return execplan
 
     def __init__(self, graph: IRGraph, topo_seqs: List[IRCell]):
@@ -173,6 +209,10 @@ class ExecutionPlan:
         self._topo_seqs = topo_seqs
         self._seq: Dict[int, List[IRCell]] = {}
         self._outputs = list(graph.outputs())
+        self._weight_reducer_stream_context: Optional[StreamContext] = None
+        self._zero_grad_stream_context: Optional[StreamContext] = None
+        self._use_multi_streams = False
+        self._cuda_sync_required = False
 
         for node in self._topo_seqs:
             assert len(node.device) > 0, f"Node device not set: {node}"
@@ -207,6 +247,38 @@ class ExecutionPlan:
     @property
     def inference(self) -> bool:
         return not self._graph.train
+
+    @property
+    def weight_reducer_stream_context(self) -> Optional[StreamContext]:
+        return self._weight_reducer_stream_context
+
+    @weight_reducer_stream_context.setter
+    def weight_reducer_stream_context(self, stream_context: StreamContext):
+        self._weight_reducer_stream_context = stream_context
+
+    @property
+    def zero_grad_stream_context(self) -> Optional[StreamContext]:
+        return self._zero_grad_stream_context
+
+    @zero_grad_stream_context.setter
+    def zero_grad_stream_context(self, stream_context: StreamContext):
+        self._zero_grad_stream_context = stream_context
+
+    @property
+    def use_multi_streams(self) -> bool:
+        return self._use_multi_streams
+
+    @use_multi_streams.setter
+    def use_multi_streams(self, value: bool):
+        self._use_multi_streams = value
+
+    @property
+    def cuda_sync_required(self) -> bool:
+        return self._cuda_sync_required
+
+    @cuda_sync_required.setter
+    def cuda_sync_required(self, value: bool):
+        self._cuda_sync_required = value
 
     def outputs(self) -> List[Any]:
         """Get execution plan return outputs"""

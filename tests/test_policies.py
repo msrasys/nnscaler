@@ -10,6 +10,8 @@ import torch.nn as nn
 
 from nnscaler.parallel import ComputeConfig, _load_parallel_module_class, parallelize
 from nnscaler.policies import get_called_self_module_name, get_pas_ops
+from nnscaler.graph.graph import IRGraph, IRSegment
+from nnscaler.graph.schedule.schedplan import SchedulePlan, StreamConfig, StreamContext
 from tests.launch_torchrun import launch_torchrun
 from tests.parallel_module.common import FFN, init_distributed
 from tests.parallel_module.test_gencode import _gencode_contains, print_gencode
@@ -228,11 +230,10 @@ class FFNDropout(torch.nn.Module):
 
 
 class FnPolicyModuleList(torch.nn.Module):
-    def __init__(self):
+    def __init__(self, ffn_layers=2):
         super().__init__()
         self.ffn = torch.nn.ModuleList([
-            FFNDropout(4, 8),
-            FFNDropout(4, 8),
+            FFNDropout(4, 8) for _ in range(ffn_layers)
         ])
 
     def forward(self, x):
@@ -424,6 +425,142 @@ def test_codegen_fn_pipeline(tmp_path):
     #     sum_1_306 = nnscaler.runtime.executor.aexecute(model.adapter160, *(), requires_grad=False)
     #     return sum_1_50, sum_1_306
     assert True
+
+
+def sched_1f1b_multi_stream(graph: IRGraph, num_microbatches: int, num_stages: int) -> SchedulePlan:
+    if num_microbatches <= 0:
+        raise ValueError(f"expected num_microbatches > 0, but got {num_microbatches} ")
+    segments: List[IRSegment] = graph.select(ntype=IRSegment, flatten=False)
+    fsegs = [seg for seg in segments if seg.isfw()]
+    assert len(fsegs) == num_stages, f"Mismatch of forward segment number ({len(fsegs)}) with num_stages ({num_stages})"
+
+    # describe schedule
+    sched = SchedulePlan(graph, num_microbatches)
+    comm_sc = StreamContext(stream='comm',wait_streams=['comp'])
+    comp_sc = StreamContext(stream='comp', wait_streams=['comm'])
+    sched.stream_config = StreamConfig(
+        dataloader=comp_sc,
+        zero_grad=comp_sc,
+        inter_segment_move=comm_sc,
+        result_broadcast=comm_sc,
+        grad_reduce=comm_sc,
+    )
+
+    wait_steps = [sid for sid in range(num_stages)]
+    bw_ofst = [num_stages - 1 - sid for sid in range(num_stages)]
+    total_steps = num_microbatches * 2 + (num_stages - 1) * 2
+
+    for step in range(total_steps):
+        for sid in range(num_stages):
+            ofst = wait_steps[sid]
+            if step < ofst: continue
+            fw_idx = (step - ofst) // 2
+            # forward or backward segment
+            segment = fsegs[sid] if (step - ofst) % 2 == 0 else fsegs[sid].mirror
+            mb_idx = fw_idx if (step - ofst) % 2 == 0 else fw_idx - bw_ofst[sid]
+            # append for execution
+            if mb_idx < 0 or mb_idx >= num_microbatches: continue
+            sched.add_segment(segment, mb_idx, step, stream_context=comp_sc)
+    sched.finish()
+    return sched
+
+
+@replace_all_device_with('cpu')
+def test_codegen_fn_pipeline_multi_streams(tmp_path):
+    parallelize(
+        FnPolicyModuleList(),
+        {'x': torch.randn(4, 4)},
+        # 'pp',
+        megatron_ffn_policy_list,
+        ComputeConfig(4, 8, use_end2end=True,
+            pas_config={
+                'pipeline_nmicros': 2,
+                'pipeline_size': 2,
+                'pipeline_scheduler': sched_1f1b_multi_stream,
+            }
+        ),
+        gen_savedir=tmp_path,
+        load_module=False
+    )
+    for rank in range(8):
+        assert _gencode_contains(
+            tmp_path, FnPolicyModuleList, rank,
+            r"with torch.cuda.stream\(nnscaler.runtime.device.DeviceGroup\(\).get_stream\('comp'\)\):"
+        )
+        assert _gencode_contains(
+            tmp_path, FnPolicyModuleList, rank,
+            r"with torch.cuda.stream\(nnscaler.runtime.device.DeviceGroup\(\).get_stream\('comm'\)\):"
+        )
+        assert _gencode_contains(
+            tmp_path, FnPolicyModuleList, rank,
+            r"torch.cuda.current_stream\(\).wait_stream\(nnscaler.runtime.device.DeviceGroup\(\).get_stream\('comm'\)\)"
+        )
+        assert _gencode_contains(
+            tmp_path, FnPolicyModuleList, rank,
+            r"torch.cuda.current_stream\(\).wait_stream\(nnscaler.runtime.device.DeviceGroup\(\).get_stream\('comp'\)\)"
+        )
+    # The generated code should look like:
+    # def _train_step(model, dataloader_69):
+    #     _ = None
+    #     nnscaler.flags.RuntimeFlag.skip_zero_grad = False
+
+    #     with torch.cuda.stream(nnscaler.runtime.device.DeviceGroup().get_stream('comp')):
+    #         torch.cuda.current_stream().wait_stream(nnscaler.runtime.device.DeviceGroup().get_stream('comm'))
+    #         model.zero_grad()
+    #         torch.cuda.current_stream().wait_stream(nnscaler.runtime.device.DeviceGroup().get_stream('comm'))
+    #         x_47 = next(*(dataloader_69, ))
+    #         torch.cuda.current_stream().wait_stream(nnscaler.runtime.device.DeviceGroup().get_stream('comm'))
+    #         dropout_58 = nnscaler.runtime.executor.fexecute('segment78', model.segment78, *(x_47, ), requires_grad=True)
+
+    #     del x_47
+
+    #     with torch.cuda.stream(nnscaler.runtime.device.DeviceGroup().get_stream('comm')):
+    #         torch.cuda.current_stream().wait_stream(nnscaler.runtime.device.DeviceGroup().get_stream('comp'))
+    #         _ = nnscaler.runtime.executor.aexecute(model.adapter192, *(dropout_58, ), requires_grad=False)
+
+    #     with torch.cuda.stream(nnscaler.runtime.device.DeviceGroup().get_stream('comp')):
+    #         torch.cuda.current_stream().wait_stream(nnscaler.runtime.device.DeviceGroup().get_stream('comm'))
+    #         x_251 = next(*(dataloader_69, ))
+    #         torch.cuda.current_stream().wait_stream(nnscaler.runtime.device.DeviceGroup().get_stream('comm'))
+    #         dropout_256 = nnscaler.runtime.executor.fexecute('segment78', model.segment78, *(x_251, ), requires_grad=True)
+
+    #     del x_251
+
+    #     with torch.cuda.stream(nnscaler.runtime.device.DeviceGroup().get_stream('comm')):
+    #         torch.cuda.current_stream().wait_stream(nnscaler.runtime.device.DeviceGroup().get_stream('comp'))
+    #         _ = nnscaler.runtime.executor.aexecute(model.adapter192, *(dropout_256, ), requires_grad=False)
+    #         torch.cuda.current_stream().wait_stream(nnscaler.runtime.device.DeviceGroup().get_stream('comp'))
+    #         gdropout_79 = nnscaler.runtime.executor.aexecute(model.adapter203, *(), requires_grad=False)
+
+    #     nnscaler.flags.RuntimeFlag.skip_reducer = True
+
+    #     with torch.cuda.stream(nnscaler.runtime.device.DeviceGroup().get_stream('comp')):
+    #         torch.cuda.current_stream().wait_stream(nnscaler.runtime.device.DeviceGroup().get_stream('comm'))
+    #         _ = nnscaler.runtime.executor.backward('segment78', (), (dropout_58, ), (gdropout_79, ))
+
+    #     del dropout_58, gdropout_79
+
+    #     with torch.cuda.stream(nnscaler.runtime.device.DeviceGroup().get_stream('comm')):
+    #         torch.cuda.current_stream().wait_stream(nnscaler.runtime.device.DeviceGroup().get_stream('comp'))
+    #         gdropout_257 = nnscaler.runtime.executor.aexecute(model.adapter203, *(), requires_grad=False)
+
+    #     nnscaler.flags.RuntimeFlag.skip_reducer = False
+
+    #     with torch.cuda.stream(nnscaler.runtime.device.DeviceGroup().get_stream('comp')):
+    #         torch.cuda.current_stream().wait_stream(nnscaler.runtime.device.DeviceGroup().get_stream('comm'))
+    #         _ = nnscaler.runtime.executor.backward('segment78', (), (dropout_256, ), (gdropout_257, ))
+
+    #     del dropout_256, gdropout_257
+
+    #     with torch.cuda.stream(nnscaler.runtime.device.DeviceGroup().get_stream('comm')):
+    #         torch.cuda.current_stream().wait_stream(nnscaler.runtime.device.DeviceGroup().get_stream('comp'))
+    #         sum_1_48 = nnscaler.runtime.executor.aexecute(model.adapter156, *(), requires_grad=True)
+    #         torch.cuda.current_stream().wait_stream(nnscaler.runtime.device.DeviceGroup().get_stream('comp'))
+    #         sum_1_275 = nnscaler.runtime.executor.aexecute(model.adapter156, *(), requires_grad=True)
+    #         torch.cuda.current_stream().wait_stream(nnscaler.runtime.device.DeviceGroup().get_stream('comp'))
+    #         _ = nnscaler.runtime.executor.aexecute(model.reducer462, *(), requires_grad=False)
+
+    #     return sum_1_48, sum_1_275
 
 
 class FnPolicyModuleSharedWeight(torch.nn.Module):

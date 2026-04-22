@@ -229,7 +229,7 @@ class ComputeConfig:
             graph: IRGraph,
             pipeline_nstages: int,
             pipeline_nmicros: int,
-            pipeline_scheduler: str,
+            pipeline_scheduler: Union[str, Callable[[IRGraph, int, int], SchedulePlan]]
     ) -> Optional[SchedulePlan]:
         """
         Apply the pipeline scheduler to the graph.
@@ -240,16 +240,26 @@ class ComputeConfig:
             raise ValueError(f"pipeline_nmicros {pipeline_nmicros} must be > 0.")
         if pipeline_nstages <= 0:
             raise ValueError(f"pipeline_nstages {pipeline_nstages} must be > 0.")
-        if pipeline_scheduler not in _PREDEFINE_SCHEDS:
-            raise ValueError(f"pipeline_scheduler {pipeline_scheduler} is not supported. "
-                             f"Supported schedulers are {_PREDEFINE_SCHEDS.keys()}")
         if self.inference_only and pipeline_scheduler not in _PREDEFINED_INFERENCE_SCHEDS:
             raise ValueError(f"pipeline_scheduler {pipeline_scheduler} is not supported in inference mode. "
                              f"Supported schedulers are {_PREDEFINED_INFERENCE_SCHEDS}")
         if not self.inference_only and pipeline_scheduler in _PREDEFINED_INFERENCE_SCHEDS:
             raise ValueError(f"pipeline_scheduler {pipeline_scheduler} is not supported in training mode.")
 
-        sched = _PREDEFINE_SCHEDS[pipeline_scheduler]
+        if pipeline_scheduler in _PREDEFINE_SCHEDS:
+            sched = _PREDEFINE_SCHEDS[pipeline_scheduler]
+        elif isinstance(pipeline_scheduler, str):
+            try:
+                sched = load_type(pipeline_scheduler)
+            except Exception as e:
+                raise ValueError(
+                    f"Failed to load pipeline_scheduler {pipeline_scheduler}. "
+                    f"Make sure it is a valid predefined scheduler name or a valid import path of a callable object."
+                ) from e
+        else:
+            if not callable(pipeline_scheduler):
+                raise ValueError(f"pipeline_scheduler {pipeline_scheduler} is not str nor callable.")
+            sched = pipeline_scheduler
         return sched(graph, pipeline_nmicros, pipeline_nstages)
 
     @property
@@ -1120,6 +1130,7 @@ def parallelize(
                 regen_status = RegenStatus.NONE
                 logger.info(f"Reuse generated code in {outdir}")
     except Exception as e:
+        logger.exception(f"Error during code generation: {e}")
         regen_status = RegenStatus.ERROR
         regen_exception = e
     else:
@@ -1397,6 +1408,11 @@ def build_optimizer(
     4. backward():
        you need to call optimizer.sync_shard_grad() manually if you want to read the gradients of the module before optimizer.step().
 
+    All operations are done in default stream. To support multiple cuda streams,
+    The caller is responsible to make sure the synchronization is done in the right way,
+    so optimizer can read the correct gradients
+    and correct parameters can be correctly read from any streams.
+
     Non-parallel module (mixed module) is also supported given it contains any sub `ParallelModule`.
     `compute_config` argument is used when we creating the reducer
     for parameters in non-parallel modules.
@@ -1670,6 +1686,7 @@ def build_optimizer(
             m.gather_params()
         if non_parallel_module_reducer:
             non_parallel_module_reducer.gather_params()
+
     optimizer.step = types.MethodType(_patched_step, optimizer)
 
     orig_zero_grad = optimizer.zero_grad

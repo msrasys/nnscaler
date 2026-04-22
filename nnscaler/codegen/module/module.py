@@ -117,6 +117,8 @@ class ModuleCodeGen(FuncEmission):
         # we need to do two things:
         # 1. update execplan with dp reducers (via add_scale_reducers)
         # 2. update node devices when emitting code (via scale)
+        # TODO: Move the logic of scaling to a separate class (Maybe as a PlanPass?)
+        #   It is too bad to put the scaling logic in the codegen
         if self.runtime_ndevs % len(self.devices) != 0:
             raise ValueError(f'runtime_ndevs must be a multiple of {len(self.devices)}')
         self.enable_dp = self.runtime_ndevs > len(self.devices)
@@ -128,6 +130,7 @@ class ModuleCodeGen(FuncEmission):
             'import torch', 'import torch.utils.checkpoint as ckpt',
             'import nnscaler', 'import nnscaler.flags',
             'import nnscaler.runtime.function',
+            'import nnscaler.runtime.device',
             'import _operator', 'from numpy import inf', 'import builtins', '',
             f'runtime_version = {runtime_version!r}', '', ''
         ]
@@ -317,9 +320,11 @@ class ModuleCodeGen(FuncEmission):
             reducer.device = sorted(scale_ranks)
             return reducer
         if isinstance(node, IRSegment) and node.isfw():
+            # TODO: where is the backward segment? Do we need to scale it as well?
             nodes = [self.scale(n, device) for n in node.nodes()]
             segment = IRSegment(nodes, node.inputs(), node.outputs(), node.name)
             segment._id = node.cid
+            segment._op_context = node._op_context
             return segment
         return node
 
@@ -515,8 +520,11 @@ class ModuleCodeGen(FuncEmission):
             derived=[f'nnscaler.runtime.module.{"ParallelModule" if as_parallel_module else "CubeModule"}']
         ) as cb:
             graph_sched = self.execplan.graph.sched
+
             cb.insert_body(f'use_scheduler = {graph_sched is not None}')
             cb.insert_body(f'nmicros_per_scheduler_step = {graph_sched.nmicros if graph_sched is not None else 1}')
+            cb.insert_body(f'use_multi_streams = {self.execplan.use_multi_streams}')
+            cb.insert_body(f'cuda_sync_required = {self.execplan.cuda_sync_required}')
 
             if as_parallel_module:
                 cb.insert_body(f'rank = {device}')  # save rank in class level

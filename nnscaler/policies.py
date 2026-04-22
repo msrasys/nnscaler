@@ -722,8 +722,9 @@ def fn(
     if pp_enabled:
         if not cfg.use_end2end:
             raise ValueError("Pipeline parallelism requires use_end2end to be True")
-        if pp_size <= 1:
-            raise ValueError("pipeline_size must be greater than 1 when pipeline is enabled")
+        if pp_size < 1:
+            # not all schedulers support pp_size == 1
+            raise ValueError("pipeline_size must be >= 1 when pipeline is enabled")
         if not nmicros:
             raise ValueError("nmicros must be set when pipeline is enabled")
         if nstages % pp_size != 0:

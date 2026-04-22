@@ -34,9 +34,36 @@ This implementation may be improved in the future, since
   Dependencies are materialized by inserting send and recv adapters between blocks. As a result,
   a block may start as soon as its input data is ready, rather than strictly following the start
   time in the schedule plan.
+
+
+Multiple Stream Support:
+In the current implementation, we also support users to specify stream configuration
+for different types of communication
+(e.g., inter-segment communication, result broadcasting, gradient reduction)
+by setting its `stream_config` property.
+The stream configuration will be attached to the corresponding adapters,
+and can be used in codegen to generate stream context manager for the adapters.
+This can help to achieve better performance in pipeline parallelism
+by separating compute and communication to different streams.
+
+Some implementation details:
+- Stream information is attached to Segments/Adapters via `op_context` field,
+    which is a dict that can be used to store any information for codegen.
+    The key for stream context is 'stream_context', and the value is a `StreamContext` dataclass that contains the stream name and wait stream names.
+- Stream information for other operations including WeightReducers, dataloaders, and zero_grad will be passed to `ExecutionPlan`
+    and finally attached to those operations in scheduler codegen.
+
+How to create a SchedulePlan for users:
+1) Create a SchedulePlan with the graph and number of micro-batches.
+2) Add segments to the plan by `add_segment` or `insert_step` interface, and specify stream context for each segment if needed.
+3) Set `stream_config` property to set stream configuration for other operations.
+4) Call `finish` to mark done.
+
 """
 
-from typing import Dict, List,  Optional, Tuple, Set
+from typing import Dict, List,  Optional, Tuple, Set, Union
+from dataclasses import dataclass, field
+from enum import IntEnum
 
 from nnscaler.ir.cten import IRCell
 from nnscaler.ir.adapter import IRAdapter
@@ -48,13 +75,42 @@ from nnscaler.graph.segment import IRSegment
 from nnscaler.flags import CompileFlag
 
 
+@dataclass
+class StreamContext:
+    """
+    StreamContext is a dataclass that holds the stream context of an operation.
+    Currently, all stream context information is ignored when tracing.
+    But we can set it in codegen to improve the performance of the generated code.
+    One example is we can seperate compute and communication to different streams
+    to achieve better performance in pipeline parallelism.
+
+    Args:
+        stream: The stream name that the operation is executed on.
+        wait_streams: The stream names that the operation needs to wait for before execution.
+        record_events: The event names that the operation needs to record after execution.
+        wait_events: The event names that the operation needs to wait for before execution.
+    """
+    stream: Optional[str] = None
+    wait_streams: Optional[List[str]] = None
+    record_events: Optional[List[str]] = None
+    wait_events: Optional[List[str]] = None
+
+    def __post_init__(self):
+        if isinstance(self.wait_streams, str):
+            self.wait_streams = [self.wait_streams]
+        if isinstance(self.record_events, str):
+            self.record_events = [self.record_events]
+        if isinstance(self.wait_events, str):
+            self.wait_events = [self.wait_events]
+
+
 class Block:
     """
     A block is a node in SchedulePlan, representing an IRCell
     that is executed with input data of a given micro-batch index.
     """
 
-    def __init__(self, cell: IRCell, micro_batch_id: int, span: int) -> None:
+    def __init__(self, cell: IRCell, micro_batch_id: int, span: int, stream_context: Optional[StreamContext] = None) -> None:
         """Create an execution block with IRCell on microbatch index. The
         block will take `span` steps to finish execution.
         """
@@ -62,6 +118,7 @@ class Block:
         self._content: IRCell = cell
         self._micro_batch_id: int = micro_batch_id
         self._span = span
+        self._stream_context: Optional[StreamContext] = stream_context
 
     def __eq__(self, other):
         if isinstance(other, Block):
@@ -87,8 +144,9 @@ class Block:
     def span(self) -> int:
         return self._span
 
-    def dispatch(self, devid: int):
-        return Block(self._content.dispatch(devid), self._micro_batch_id)
+    @property
+    def stream_context(self) -> Optional['StreamContext']:
+        return self._stream_context
 
     def __repr__(self) -> str:
         return f"{self._content.cid}{'f' if self.content.isfw() else 'b'}{self._micro_batch_id}"
@@ -137,6 +195,32 @@ class ScheduleDependency:
         return prev.mid == next.mid and self.graph.depends(prev.content, next.content)
 
 
+@dataclass
+class StreamConfig:
+    """
+    StreamConfig is a dataclass that holds the stream configuration
+    for different types of operations.
+
+    Args:
+        dataloader: The stream context for dataloader operations.
+        zero_grad: The stream context for zero_grad operations.
+        inter_segment_move: The stream context for inter-segment communication adapters, which
+            are used to transfer data between consecutive segment.
+        result_broadcast: The stream context for result broadcast adapters,
+            which are used to broadcast results to all ranks in the same scale unit after forward pass.
+        grad_reduce: The stream context for gradient reduction adapters,
+            which are used to reduce gradients across ranks.
+        cuda_sync_required: Whether to call `torch.cuda.synchronize()` before and after train_step
+    """
+
+    dataloader: Optional[StreamContext] = None
+    zero_grad: Optional[StreamContext] = None
+    inter_segment_move: Optional[StreamContext] = None
+    result_broadcast: Optional[StreamContext] = None
+    grad_reduce: Optional[StreamContext] = None
+    cuda_sync_required: bool = True
+
+
 class PlanBase:
 
     def __init__(self, graph: IRGraph, _dependency: Optional[ScheduleDependency] = None):
@@ -157,6 +241,10 @@ class PlanBase:
         self._dependency = _dependency if _dependency is not None \
             else ScheduleDependency(graph)
 
+        # stream context for different adapters,
+        # which can be used in codegen to generate stream context manager for the adapters.
+        self._stream_config: StreamConfig = StreamConfig(cuda_sync_required=False)
+
         # topological sequence
         self._seqs: List[IRCell] = []
 
@@ -174,6 +262,18 @@ class PlanBase:
         for devs in self._step_devices:
             device.update(devs)
         return tuple(device)
+
+    @property
+    def stream_config(self) -> StreamConfig:
+        return self._stream_config
+
+    @stream_config.setter
+    def stream_config(self, stream_config: StreamConfig):
+        self._stream_config = stream_config
+
+    def _set_node_stream(self, node: IRCell, stream_context: StreamContext):
+        if stream_context is not None:
+            node.set_op_context('stream_context', stream_context)
 
     def nodes(self) -> Tuple[Block]:
         return tuple(self._seqs)
@@ -195,8 +295,12 @@ class PlanBase:
         self._blocks.append(block)
         return block
 
-    def add_segment(self, seg: IRSegment, micro_batch_id: int,
-                    step: int, span: Optional[int] = 1) -> Block:
+    def add_segment(
+        self,
+        seg: IRSegment, micro_batch_id: int,
+        step: int, span: Optional[int] = 1,
+        stream_context: Optional[StreamContext] = None,
+    ) -> Block:
         """Add a segment to be executed with micro_batch_id data at step.
 
         The segments after `step` will keep unchanged.
@@ -210,11 +314,16 @@ class PlanBase:
         Returns:
             block (Block): the block representing the segment
         """
-        block = Block(seg, micro_batch_id, span)
+        block = Block(seg, micro_batch_id, span, stream_context)
         self.add_block(block, step)
         return block
 
-    def insert_step(self, step: int, seg: IRSegment, micro_batch_id: int, span: Optional[int] = 1) -> Block:
+    def insert_step(
+        self,
+        step: int, seg: IRSegment,
+        micro_batch_id: int, span: Optional[int] = 1,
+        stream_context: Optional[StreamContext] = None,
+    ) -> Block:
         """Insert `span` steps at current `step`.
 
         The segments after `step` will be pushed `span` time step for execution。
@@ -238,7 +347,7 @@ class PlanBase:
                 raise NotImplementedError(
                     f"Cannot shift the block {block} that is in execution on step {step}")
         # insert
-        block = Block(seg, micro_batch_id, span)
+        block = Block(seg, micro_batch_id, span, stream_context)
         for _ in range(span):
             self._step_blocks.insert(step, [block])
             self._step_devices.insert(step, set(seg.device))
@@ -331,6 +440,7 @@ class PlanBase:
 
         # insert dataloaders to its devices before the first required segment
         for dl in self._dependency.dataloaders:
+            self._set_node_stream(dl, self._stream_config.dataloader)
             inserted_mids = set()
             for step in range(self.nsteps):
                 blocks = self.start_blocks(step)
@@ -445,9 +555,12 @@ class SchedulePlan(PlanBase):
             # These adapters don't have any dependent recver segment,
             # and will be placed at the end of the plan to not block the schedule execution.
             if adapter not in self._dependency.recvers:
+                self._set_node_stream(adapter, self._stream_config.result_broadcast)
                 for mid in range(self._num_microbatches):
                     self._step_adapters[self.nsteps-1].append(Block(adapter, mid, 1))
                 continue
+
+            self._set_node_stream(adapter, self._stream_config.inter_segment_move)
 
             # find sender step and insert adapter
             for step in range(self.nsteps):
