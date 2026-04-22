@@ -9,6 +9,24 @@ import torch.nn.functional as F
 
 from nnscaler.graph.parser.register import register_op
 
+# Auto-detect optimized kernels (fla + causal-conv1d)
+try:
+    from fla.ops.gated_delta_rule import chunk_gated_delta_rule as _fla_chunk_gated_delta_rule
+    _use_fla = True
+    # Disable FusedRMSNormGated: fla's fused kernel breaks nnscaler tracer
+    import transformers.models.qwen3_5.modeling_qwen3_5 as _qwen3_5_mod
+    _qwen3_5_mod.FusedRMSNormGated = None
+except ImportError:
+    _fla_chunk_gated_delta_rule = None
+    _use_fla = False
+
+try:
+    from causal_conv1d import causal_conv1d_fn as _causal_conv1d_fn
+    _use_causal_conv1d = True
+except ImportError:
+    _causal_conv1d_fn = None
+    _use_causal_conv1d = False
+
 # 1. Register flash attention (for Gated Attention layers)
 # Import the shared flash_attn_anno module which registers _flash_attention_forward
 # and patches ALL_ATTENTION_FUNCTIONS["flash_attention_2"]
@@ -72,17 +90,25 @@ from transformers.models.qwen3_5.modeling_qwen3_5 import (
 
 def nnscaler_chunk_gated_delta_rule(query, key, value, g, beta):
     """Wrapper with fixed kwargs for training (no cache, no final state).
+    Uses fla optimized kernel if available, otherwise PyTorch fallback.
     Inputs (after repeat_interleave in DeltaNet forward):
       query, key, value: (batch, seq_len, num_v_heads, head_dim)
       g, beta: (batch, seq_len, num_v_heads)
     Output:
       core_attn_out: (batch, seq_len, num_v_heads, head_dim)
     """
-    output, _ = _torch_chunk_gated_delta_rule(
-        query, key, value, g=g, beta=beta,
-        initial_state=None, output_final_state=False,
-        use_qk_l2norm_in_kernel=True,
-    )
+    if _use_fla:
+        output, _ = _fla_chunk_gated_delta_rule(
+            query, key, value, g=g, beta=beta,
+            initial_state=None, output_final_state=False,
+            use_qk_l2norm_in_kernel=True,
+        )
+    else:
+        output, _ = _torch_chunk_gated_delta_rule(
+            query, key, value, g=g, beta=beta,
+            initial_state=None, output_final_state=False,
+            use_qk_l2norm_in_kernel=True,
+        )
     return output
 
 
@@ -92,7 +118,28 @@ register_op('b l^ h d^, b l^ h d^, b l^ h d^, b l^ h, b l^ h -> b l^ h d^')(
 )
 
 
-# 3. Monkey-patch Qwen3_5GatedDeltaNet.forward for clean tracing
+# 4. Register causal conv1d wrapper (auto-selects optimized kernel or fallback)
+
+def nnscaler_causal_conv1d(x, weight):
+    """Causal conv1d + SiLU. Uses causal_conv1d_fn if available, else nn.Conv1d fallback.
+    Args:
+        x: (batch, dim, seqlen)
+        weight: (dim, 1, kernel_size) — Conv1d weight (no bias)
+    Returns:
+        (batch, dim, seqlen)
+    """
+    if _use_causal_conv1d:
+        return _causal_conv1d_fn(x=x, weight=weight.squeeze(1), bias=None, activation="silu")
+    else:
+        seq_len = x.shape[2]
+        return F.silu(F.conv1d(x, weight, None, groups=x.shape[1],
+                               padding=weight.shape[2] - 1)[:, :, :seq_len])
+
+
+register_op('b d^ l^, d^ 1 k^ -> b d^ l^')(nnscaler_causal_conv1d)
+
+
+# 5. Monkey-patch Qwen3_5GatedDeltaNet.forward for clean tracing
 # Remove all cache/precomputed_state branches and causal_conv1d_fn branches.
 # Training path only: no cache, use nn.Conv1d fallback, call registered delta rule.
 def _patched_deltanet_forward(
@@ -114,8 +161,8 @@ def _patched_deltanet_forward(
     b = self.in_proj_b(hidden_states)
     a = self.in_proj_a(hidden_states)
 
-    # Conv1d fallback (no causal_conv1d_fn)
-    mixed_qkv = F.silu(self.conv1d(mixed_qkv)[:, :, :seq_len])
+    # Causal conv1d (registered atomic op, auto-selects optimized kernel)
+    mixed_qkv = nnscaler_causal_conv1d(mixed_qkv, self.conv1d.weight)
 
     mixed_qkv = mixed_qkv.transpose(1, 2)  # (b, s, conv_dim)
     query, key, value = torch.split(
@@ -151,7 +198,7 @@ def _patched_deltanet_forward(
 Qwen3_5GatedDeltaNet.forward = _patched_deltanet_forward
 
 
-# 4. Monkey-patch Qwen3_5TextRotaryEmbedding.forward
+# 6. Monkey-patch Qwen3_5TextRotaryEmbedding.forward
 # Remove maybe_autocast (its type annotation `torch.dtype | None` breaks
 # nnscaler tracer's exec-based patching).  The original call is
 # maybe_autocast(enabled=False) which is effectively a no-op during training.
@@ -175,7 +222,7 @@ def _patched_rope_forward(self, x, position_ids):
 Qwen3_5TextRotaryEmbedding.forward = _patched_rope_forward
 
 
-# 5. Monkey-patch Qwen3_5Attention.forward
+# 7. Monkey-patch Qwen3_5Attention.forward
 # The original forward uses ALL_ATTENTION_FUNCTIONS.get_interface() which
 # calls dict.get() — the tracer can't inspect the returned callable.
 # Directly call flash_attention_forward from flash_attn_anno.
