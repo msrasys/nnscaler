@@ -42,7 +42,7 @@ def test_rope_buggy_anno(tmp_path):
         load_module=False,
         reuse='override',
     )
-    # because of the bad annoation, a wrong grad allreduce is inserted
+    # because of the bad annotation, a wrong grad allreduce is inserted
     assert _gencode_contains(tmp_path, RopeModel, 0, r'nnscaler.runtime.adapter.nn.identity_allreduce')
     # def segment143(self, x_44, cos_45, sin_46, position_ids_47):
     #     # File "/data/weijiangxu/nnscaler/tests/autodist/spmd_solver/test_follow.py", line 42, in forward,  bsz, seq_len, hidden_dim = x.shape

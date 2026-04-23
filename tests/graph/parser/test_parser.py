@@ -208,7 +208,7 @@ def test_non_tensor_multiple_outputs(tmp_path, output_list):
     ir_graph = to_ir_graph(fx_graph, dummy_input, attr_savedir=tmp_path, constant_folding=False)
     print(ir_graph.extra_repr())
 
-    # the output number of node depends on the annoation.
+    # the output number of node depends on the annotation.
     # the right part of both func_output_list3 and func_output_list4 are the same ( `?, ?`)
     # so two outputs are expected
     assert len(ir_graph.nodes()[-1].outputs()) == 2
@@ -254,7 +254,7 @@ def test_non_tensor_multiple_outputs2(tmp_path, output_list):
     ir_graph = to_ir_graph(fx_graph, dummy_input, attr_savedir=tmp_path, constant_folding=False)
     print(ir_graph.extra_repr())
 
-    # the output number of node depends on the annoation.
+    # the output number of node depends on the annotation.
     # the right part of both func_output_list3 and func_output_list4 are the same ( `?`)
     # so 1 output are expected
     assert len(ir_graph.nodes()[-1].outputs()) == 1
@@ -290,7 +290,7 @@ def test_non_tensor_multiple_outputs3(tmp_path, output_list):
     ir_graph = to_ir_graph(fx_graph, dummy_input, attr_savedir=tmp_path, constant_folding=False)
     print(ir_graph.extra_repr())
 
-    # the output number of node depends on the annoation.
+    # the output number of node depends on the annotation.
     # the right part of both func_output_list3 and func_output_list4 are the same ( `?`)
     # so 1 output are expected
     assert len(ir_graph.nodes()[-1].outputs()) == 1

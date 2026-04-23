@@ -149,6 +149,8 @@ class DimAnno:
             anno = (anno,)
         if len(anno) > 1 and any(i in anno for i in _kSpecialIdentifiers):
             raise ValueError(f"Dim annotation cannot have {_kSpecialIdentifiers} as partial dimension.")
+        if any(i == '/' for i in anno):
+            raise ValueError(f"Dim annotation cannot have '/' because it is a special identifier for shape-level control, got {anno}")
         identifiers, reduces = [], []
         for identifier in anno:
             # get reduce type
@@ -351,7 +353,12 @@ class ShapeAnno:
             if token == '/':
                 no_grad_reduce_ids.append('')
             elif token.startswith('/'):
-                no_grad_reduce_ids.append(token[1:])
+                identifier = token[1:]
+                if not identifier.isidentifier():
+                    raise ValueError(
+                        f"Syntax Error: expected valid identifier after '/', got '{identifier}'"
+                    )
+                no_grad_reduce_ids.append(identifier)
             else:
                 raise ValueError(
                     f"Syntax Error: expected /identifier or / after ':' in shape annotation, got '{token}'"
