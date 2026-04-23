@@ -185,7 +185,7 @@ An `identifier` must be one of:
 Special identifier:
   1) '*': this special identifier indicates the dimension is dynamic, which will automatically get expanded given the shape
   2) '?': this special identifier indicates the value is can only be replicated, no matter it is a tensor or a non-tensor.
-  3) '/': this special identifier indicates the value can only be replicated, and its gradient should be replicated instead of reduced, no matter it is a tensor or a non-tensor. It is a shortcut of '?:/'. See [Gradient Behavior](#gradient-behavior-during-partitioning) for details.
+  3) '/': this special identifier is only used as a whole-shape shortcut of '?:/' and in gradient behavior modifiers such as ':/identifier'. It indicates the value can only be replicated, and its gradient should be replicated instead of reduced, no matter it is a tensor or a non-tensor. See [Gradient Behavior](#gradient-behavior-during-partitioning) for details. It should not be used as a regular dimension identifier inside multi-dimension annotations.
 
 A `reduction` can be a set of {'', '+', '^'}:
   '' indicates this dimension can be partitioned, and each output should have this dimension.
