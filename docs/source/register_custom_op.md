@@ -374,8 +374,8 @@ In these cases, you can annotate inputs to skip gradient all-reduce using the `:
 
 | Annotation | Meaning |
 |---|---|
-| `'a b : /a'` | Skip grad all-reduce for this input when partitioning on `a` |
-| `'a b : /a /b'` | Skip grad all-reduce when partitioning on `a` or `b` |
+| `'a b : /x'` | Skip grad all-reduce for this input when partitioning on `x` |
+| `'a b : /x /y'` | Skip grad all-reduce when partitioning on `x` or `y` |
 | `'a b : /'` | Skip grad all-reduce when partitioning on any identifier (wildcard) |
 | `'/'` | Shortcut for `'?:/'` — input is replicated and never grad-reduced |
 
