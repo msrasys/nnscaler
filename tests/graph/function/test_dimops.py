@@ -11,7 +11,7 @@ from functools import partial
 import pytest
 
 import nnscaler.graph.function as F
-from nnscaler.graph.function.dimops import IRDimops, OpAnno
+from nnscaler.graph.function.dimops import IRDimops, OpAnno, ShapeAnno, DimAnno
 from nnscaler.ir.tensor import IRFullTensor
 from nnscaler.ir.cten import IRObject, IRTensor
 
@@ -125,3 +125,144 @@ def test_parse_op():
 
     with pytest.raises(ValueError):
         str(OpAnno('a b^, b^ c -> a c^')) == 'a b^, b^ c -> a c^'
+
+
+def test_plain_shape_no_meta():
+    """Plain shape without ':' has no no_grad_reduce_ids."""
+    s = ShapeAnno('a b c')
+    assert s.no_grad_reduce_ids == ()
+    assert s.no_grad_reduce is False
+    assert s.no_grad_reduce_for('a') is False
+
+
+def test_single_modifier():
+    """'a b : /m' marks only 'm'."""
+    s = ShapeAnno('a b : /m')
+    assert s.no_grad_reduce_ids == ('m',)
+    assert s.no_grad_reduce is False
+    assert s.no_grad_reduce_for('m') is True
+    assert s.no_grad_reduce_for('a') is False
+
+
+def test_multiple_modifiers():
+    """'a b : /m /n' marks 'm' and 'n'."""
+    s = ShapeAnno('l h^ : /m /n')
+    assert s.no_grad_reduce_ids == ('m', 'n')
+    assert s.no_grad_reduce_for('m') is True
+    assert s.no_grad_reduce_for('n') is True
+    assert s.no_grad_reduce_for('l') is False
+    assert s.no_grad_reduce is False
+
+
+def test_wildcard_modifier():
+    """'a b : /' is a wildcard — all identifiers match."""
+    s = ShapeAnno('l h^ : /')
+    assert s.no_grad_reduce_ids == ('',)
+    assert s.no_grad_reduce is True
+    assert s.no_grad_reduce_for('l') is True
+    assert s.no_grad_reduce_for('h') is True
+    assert s.no_grad_reduce_for('anything') is True
+
+
+def test_slash_shortcut():
+    """'/' alone is shortcut for '?:/' — ignore=True with wildcard no_grad_reduce."""
+    s = ShapeAnno('/')
+    assert s.ignore is True
+    assert s.no_grad_reduce is True
+    assert s.no_grad_reduce_for('x') is True
+    # dims should be '?'
+    assert s.ndims == 1
+    assert s._dims[0].name == '?'
+
+
+def test_question_mark():
+    """'?' is ignore but has no no_grad_reduce."""
+    s = ShapeAnno('?')
+    assert s.ignore is True
+    assert s.no_grad_reduce is False
+    assert s.no_grad_reduce_for('x') is False
+
+
+def test_repr_plain():
+    s = ShapeAnno('a b^ c')
+    assert repr(s) == 'a b^ c'
+
+
+def test_repr_with_modifier():
+    s = ShapeAnno('a b : /m')
+    assert repr(s) == 'a b : /m'
+
+
+def test_repr_with_multiple_modifiers():
+    s = ShapeAnno('l h^ : /m /n')
+    assert repr(s) == 'l h^ : /m /n'
+
+
+def test_repr_wildcard():
+    s = ShapeAnno('l h^ : /')
+    assert repr(s) == 'l h^ : /'
+
+
+def test_repr_slash_shortcut():
+    """'/' becomes '?:/' internally, repr shows '?^ : /'."""
+    s = ShapeAnno('/')
+    assert repr(s) == '?^ : /'
+
+
+def test_construct_from_tuple_with_no_grad_reduce_ids():
+    dims = ShapeAnno._parse_dims('a b c')
+    s = ShapeAnno(dims, no_grad_reduce_ids=('a', 'b'))
+    assert s.no_grad_reduce_ids == ('a', 'b')
+    assert s.no_grad_reduce_for('a') is True
+    assert s.no_grad_reduce_for('c') is False
+
+
+def test_construct_from_tuple_wildcard():
+    dims = ShapeAnno._parse_dims('a b')
+    s = ShapeAnno(dims, no_grad_reduce_ids=('',))
+    assert s.no_grad_reduce is True
+    assert s.no_grad_reduce_for('a') is True
+
+
+def test_str_with_kwarg_raises():
+    """Cannot pass no_grad_reduce_ids when dim_annos is a string."""
+    with pytest.raises(ValueError):
+        ShapeAnno('a b', no_grad_reduce_ids=('m',))
+
+
+def test_invalid_meta_token():
+    with pytest.raises(ValueError, match="expected /identifier"):
+        ShapeAnno('a b : m')
+
+
+def test_invalid_meta_token2():
+    with pytest.raises(ValueError, match="expected /identifier"):
+        ShapeAnno('a b : foo')
+
+
+def test_star_expansion_preserves_no_grad_reduce_ids():
+    """When '*' expansion happens in IRDimops.align(), no_grad_reduce_ids should be preserved."""
+    def StarOp(input, weight, signature='star_op'):
+        anno = '* a : /c, a b -> * b'
+        return IRDimops(StarOp, 'star_op', signature, [anno], [input, weight])
+
+    op = create_op(StarOp, [(4, 8, 16), (16, 32)])
+    # After align, the first input's '*' expands but no_grad_reduce_ids should remain
+    ianno = op.anno.input(0)
+    assert ianno.no_grad_reduce_for('c') is True
+
+
+def test_opanno_with_no_grad_reduce():
+    """OpAnno should preserve no_grad_reduce modifiers in input ShapeAnnos."""
+    anno = OpAnno('a b : /a, b c -> a c')
+    ianno = anno.input(0)
+    assert ianno.no_grad_reduce_for('a') is True
+    assert ianno.no_grad_reduce_for('b') is False
+
+
+def test_opanno_slash_input():
+    """OpAnno with '/' input (the ignore+no_grad_reduce shortcut)."""
+    anno = OpAnno('a b, / -> a b')
+    ianno = anno.input(1)
+    assert ianno.ignore is True
+    assert ianno.no_grad_reduce is True

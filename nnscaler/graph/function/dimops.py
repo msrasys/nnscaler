@@ -22,6 +22,8 @@ An `identifier` must be one of:
 Special identifier:
   1) '*': this special identifier indicates the dimension is dynamic, which will automatically get expanded given the shape
   2) '?': this special identifier indicates the value is can only be replicated, no matter it is a tensor or a non-tensor.
+  3) '/': this special identifier indicates the value can only be replicated, and its gradient should be replicated instead of reduced, no matter it is a tensor or a non-tensor.
+          It is a shortcut of '?:/'
 
 A `reduction` can be a set of {'', '+', '^'}:
   '' indicates this dimension can be partitioned, and each output should have this dimension.
@@ -36,6 +38,15 @@ The value of inner dimension needs to be inferrable, or indicated by function ar
   e.g., 'a (c+ d^) e'
 
 A shape annotation consists of dimension annotation separated by (multiple) spaces.
+
+A shape annotation may also include tensor-level control after a ':' separator.
+Currently we only support '/' or '/identifier',
+which indicates that when partitioning on that identifier,
+the gradient for this input should not be all-reduced (By default, gradients are all-reduced when partitioning).
+Multiple modifiers are allowed.
+  e.g., 'l h^ : /m' means when splitting on 'm', skip grad reduce for this input.
+  e.g., 'l h^ : /m /n' means skip grad reduce when splitting on 'm' or 'n'.
+  e.g., 'l h^ : /' means skip grad reduce when splitting on any identifier.
 
 
 * Operator Annotation:
@@ -76,7 +87,7 @@ from nnscaler.ir.cten import IRTensor, IRObject, ValueTrack
 from nnscaler.ir.operator import IRFwOperation
 
 
-_kSpecialIdentifiers = ('*', '?')
+_kSpecialIdentifiers = ('*', '?', '/')
 _logger = logging.getLogger(__name__)
 
 
@@ -164,14 +175,37 @@ class ShapeAnno:
     Shape annotation
 
     e.g., a (b+ dim)  d^
+
+    Supports /identifier modifiers after a ':' separator to indicate that when
+    partitioning on the given identifier, this input's gradient should not be all-reduced.
+    e.g., 'l h^ : /m' means when splitting on 'm', skip grad reduce for this input.
+    Multiple modifiers are allowed: 'l h^ : /m /n'
     """
 
-    def __init__(self, dim_annos: Union[str, Tuple[DimAnno]]):
+    def __init__(
+        self,
+        dim_annos: Union[str, Tuple[DimAnno]],
+        *,
+        no_grad_reduce_ids: Optional[Tuple[str, ...]] = None
+    ):
         assert isinstance(dim_annos, str) or all(isinstance(adim, DimAnno) for adim in dim_annos), \
             f"dim_annos must be str or Tuple[DimAnno] but got {dim_annos}"
         if isinstance(dim_annos, str):
-            dim_annos = ShapeAnno.parse(dim_annos)
+            if no_grad_reduce_ids is not None:
+                raise ValueError("Cannot specify no_grad_reduce_ids when dim_annos is str, please include them in the annotation string after ':'")
+
+            dim_annos = dim_annos.strip()
+            if dim_annos == '/':  # shortcut for "?:/"
+                dim_annos = '?:/'
+            if ':' in dim_annos:
+                dim_annos, meta_annos = dim_annos.split(':', 1)
+            else:
+                dim_annos, meta_annos = dim_annos, ''
+            dim_annos = self._parse_dims(dim_annos)
+            no_grad_reduce_ids = self._parse_meta(meta_annos)
+
         self._dims: Tuple[DimAnno] = dim_annos
+        self._no_grad_reduce_ids: Tuple[str, ...] = tuple(no_grad_reduce_ids) if no_grad_reduce_ids else ()
 
     @property
     def dims(self) -> Tuple[DimAnno, ...]:
@@ -211,7 +245,29 @@ class ShapeAnno:
         self._dims[index] = dim_anno
 
     def __repr__(self) -> str:
-        return ' '.join(repr(dim) for dim in self._dims)
+        parts = [repr(dim) for dim in self._dims]
+        base = ' '.join(parts)
+        if self._no_grad_reduce_ids:
+            modifiers = ' '.join(f'/{id}' for id in self._no_grad_reduce_ids)
+            return f'{base} : {modifiers}'
+        return base
+
+    def no_grad_reduce_for(self, identifier: str) -> bool:
+        """Check if grad reduce should be skipped when partitioning on the given identifier.
+
+        Returns True if:
+        - '/' (wildcard, stored as '') is in no_grad_reduce_ids, or
+        - the specific identifier is in no_grad_reduce_ids
+        """
+        return '' in self._no_grad_reduce_ids or identifier in self._no_grad_reduce_ids
+
+    @property
+    def no_grad_reduce_ids(self) -> Tuple[str, ...]:
+        """
+        Identifiers for which this input's gradient should not be reduced.
+        '' (empty string) is a wildcard that indicates all identifiers.
+        """
+        return self._no_grad_reduce_ids
 
     @property
     def ignore(self) -> bool:
@@ -222,8 +278,20 @@ class ShapeAnno:
         """
         return self.ndims == 1 and self._dims[0].name == '?'
 
+    @property
+    def no_grad_reduce(self) -> bool:
+        """!
+        Check if the shape should skip grad reduce when partitioning on any identifier.
+
+        Return:
+            bool: True if the shape should skip grad reduce
+                    when partitioning on any identifier,
+                  else False
+        """
+        return '' in self._no_grad_reduce_ids
+
     @staticmethod
-    def parse(shape_anno: str) -> Tuple[DimAnno]:
+    def _parse_dims(shape_anno: str) -> Tuple[DimAnno]:
         """
         Parse annotations like of a single shape, e.g.,
             a (b+ dim)  d^
@@ -271,6 +339,24 @@ class ShapeAnno:
             edims.append(current_identifier)
         dim_annos = tuple(DimAnno(edim) for edim in edims)
         return dim_annos
+
+    @staticmethod
+    def _parse_meta(meta_anno: str) -> List[str]:
+        """Extract /identifier modifiers from shape annotation string.
+        e.g., '/m /n' -> ['m', 'n']
+        e.g., '/' -> ['']  (empty string means all identifiers)
+        """
+        no_grad_reduce_ids = []
+        for token in meta_anno.strip().split():
+            if token == '/':
+                no_grad_reduce_ids.append('')
+            elif token.startswith('/'):
+                no_grad_reduce_ids.append(token[1:])
+            else:
+                raise ValueError(
+                    f"Syntax Error: expected /identifier or / after ':' in shape annotation, got '{token}'"
+                )
+        return no_grad_reduce_ids
 
     @staticmethod
     def create_shape_str(shape: Tuple[int], reduction: str = '', iterator: Optional[Iterable] = None) -> List[str]:
@@ -656,11 +742,14 @@ class TransformRule:
         irules: Tuple[DimopSplit],
         orules: Tuple[DimopSplit],
         kwarg_modifier: Optional[Callable[[Dict, int, Union[int, str], int, int], Dict]] = None,
+        *,
+        no_grad_reduce_inputs: Optional[List[int]] = None,
     ) -> None:
         self._inputs = tuple(irules)
         self._outputs = tuple(orules)
         modifier = kwarg_modifier if kwarg_modifier is not None else TransformRule.default_modifier
         self._modifier = (modifier,)
+        self._no_grad_reduce_inputs = no_grad_reduce_inputs or []
 
     def inputs(self) -> Tuple[DimopSplit]:
         return self._inputs
@@ -676,6 +765,10 @@ class TransformRule:
 
     def modifier(self) -> Optional[Callable]:
         return self._modifier[0]
+
+    @property
+    def no_grad_reduce_inputs(self) -> List[int]:
+        return self._no_grad_reduce_inputs
 
     def __repr__(self) -> str:
         inputs = ', '.join(repr(split) for split in self._inputs)
@@ -733,6 +826,13 @@ class IRDimops(IRFwOperation):
                 f"kwargs: {kwargs}\n"
             )
 
+        # no grad reduce config for this operator annotated by '/',
+        # will be set to specific input indices
+        # when creating new operator with `new` function, and used in transform rules to determine whether to skip grad reduce when partitioning on specific identifier.
+        self._no_grad_reduce_inputs = [
+            idx for idx, ianno in enumerate(self._iannos) if ianno.no_grad_reduce
+        ]
+
         n_outputs = len(self._oannos)
         super().__init__(name, signature, inputs, n_outputs, constant_foldable=constant_foldable, **kwargs)
 
@@ -787,7 +887,13 @@ class IRDimops(IRFwOperation):
             shapes[oidx] = tuple(shape)
         return shapes
 
-    def new(self, inputs: List[IRTensor], outputs: List[IRTensor], **kwargs):
+    def new(
+        self,
+        inputs: List[IRTensor], outputs: List[IRTensor],
+        *,
+        no_grad_reduce_inputs: Optional[List[int]] = None,
+        **kwargs
+    ):
         """!
         Construct a new operator sharing same kwargs with new inputs
         and outputs
@@ -798,12 +904,40 @@ class IRDimops(IRFwOperation):
         @return op IRDimop: the new constructed operator
         """
         op = self._create_fn[0](*inputs, **kwargs, signature=self.signature)
+        if no_grad_reduce_inputs is not None:
+            op._no_grad_reduce_inputs = no_grad_reduce_inputs
         # annos = self._annos_candidates
         # rules = self._trans_rules
         # op = IRDimops(self.signature, annos, inputs, self.name, rules, **kwargs)
         for idx, output in enumerate(outputs):
             op.set_output(idx, output)
         return op
+
+    def ignore_grad_reduce(self, *, input_idx: int) -> bool:
+        return self._no_grad_reduce_inputs is not None \
+            and input_idx in self._no_grad_reduce_inputs
+
+    def _resolve_identifier_from_kwargs(
+            self, signature: str, identifier: str, kwargs: Dict
+    ) -> int:
+        if identifier not in kwargs:
+            raise ValueError(
+                f"Function {signature}: identifier {identifier} not found in kwargs, "
+                f"cannot resolve the length of this identifier for shape inference. "
+            )
+
+        if isinstance(kwargs[identifier], IRObject):
+            _logger.warning(
+                f"Function {signature}: Found identifier {identifier} in kwargs to be IRObject, "
+                f"this will turn it into a static value. Pay attention to the usage "
+                f"in dynamic-shape scenarios")
+            kwargs[identifier] = kwargs[identifier].value
+        length = kwargs[identifier]
+        if not isinstance(length, int):
+            raise ValueError(
+                f"Function {signature}: identifier {identifier} in kwargs "
+                f"must be int or IRObject[value=int], but got {length}")
+        return length
 
     def align(self, signature, inputs: List[IRTensor], op_anno: OpAnno, kwargs: Dict) -> bool:
         """!
@@ -837,8 +971,9 @@ class IRDimops(IRFwOperation):
                         expand_dims = []
                         if ndims > 0:
                             expand_dims = list(DimAnno(candicates[dim] + reduce) for dim in range(ndims))
-                    shape_anno = list(op_anno.input(idx).dims[:pos]) + expand_dims + list(op_anno.input(idx).dims[pos+1:])
-                    shape_anno = ShapeAnno(tuple(shape_anno))
+                    orig_input = op_anno.input(idx)
+                    shape_anno = list(orig_input.dims[:pos]) + expand_dims + list(orig_input.dims[pos+1:])
+                    shape_anno = ShapeAnno(tuple(shape_anno), no_grad_reduce_ids=orig_input.no_grad_reduce_ids)
                     op_anno.set_input(idx, shape_anno)
             # * should appear in inputs
             assert expand_dims is not None, f"Syntax Error: {op_anno}: * should also appear in inputs"
@@ -847,8 +982,9 @@ class IRDimops(IRFwOperation):
                 names = [dim_anno.name for dim_anno in shape_anno.dims]
                 if '*' in names:
                     pos = names.index('*')
-                    shape_anno = list(op_anno.output(idx).dims[:pos]) + expand_dims + list(op_anno.output(idx).dims[pos+1:])
-                    shape_anno = ShapeAnno(tuple(shape_anno))
+                    orig_output = op_anno.output(idx)
+                    shape_anno = list(orig_output.dims[:pos]) + expand_dims + list(orig_output.dims[pos+1:])
+                    shape_anno = ShapeAnno(tuple(shape_anno), no_grad_reduce_ids=orig_output.no_grad_reduce_ids)
                     op_anno.set_output(idx, shape_anno)
             op_anno.reset_identifiers()
 
@@ -890,17 +1026,7 @@ class IRDimops(IRFwOperation):
                         length = op_anno.getlen(identifier)
                         if length is None:
                             if identifier in kwargs:
-                                if isinstance(kwargs[identifier], IRObject):
-                                    _logger.warning(
-                                        f"Function {signature}: Found identifier {identifier} in kwargs to be IRObject, "
-                                        f"this will turn it into a static value. Pay attention to the usage "
-                                        f"in dynamic-shape scenarios")
-                                    kwargs[identifier] = kwargs[identifier].value
-                                length = kwargs[identifier]
-                                if not isinstance(length, int):
-                                    raise ValueError(
-                                        f"Function {signature}: identifier {identifier} in kwargs "
-                                        f"must be int or IRObject[value=int], but got {length}")
+                                length = self._resolve_identifier_from_kwargs(signature, identifier, kwargs)
                                 ret = op_anno.setlen(identifier, length)
                                 accum *= length
                             elif identifier in identifier_values:
@@ -918,6 +1044,17 @@ class IRDimops(IRFwOperation):
                         ret = op_anno.setlen(toinfer[0], dimlen // accum)
                 if not ret:
                     return False
+
+        # resolve output-only identifiers from kwargs
+        for oshape in op_anno.outputs():
+            if oshape.ignore:
+                continue
+            for odim in oshape.dims:
+                for identifier in odim.identifiers:
+                    if op_anno.getlen(identifier) is None and identifier in kwargs:
+                        length = self._resolve_identifier_from_kwargs(signature, identifier, kwargs)
+                        op_anno.setlen(identifier, length)
+
         return True
 
     def transform_space(self) -> List[Tuple[int, int]]:

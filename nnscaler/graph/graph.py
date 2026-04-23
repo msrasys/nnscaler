@@ -415,17 +415,24 @@ class IRGraph(IRSegment):
                 consumers.setdefault(itensor.parent, []).append(fnode)
         # set up gradient
         for fnode in fnodes:
-            for itensor in fnode.inputs():
+            for input_idx, itensor in enumerate(fnode.inputs()):
                 if not isinstance(itensor, IRSubTensor): continue
                 ftensor = itensor.parent
                 itensor.grad = None
                 if valmaps[ftensor] is None: continue
-                # collect consumers that consume the same sub_tensor
-                consumers_of_same_tensor = []
-                for idx, t in enumerate(ctensors[ftensor]):
-                    if t == itensor:
-                        consumers_of_same_tensor.append(consumers[ftensor][idx])
-                consumers_of_same_tensor = consumers_of_same_tensor[::-1]  # make valmap grow with exec order
+                if isinstance(fnode, IRDimops) and fnode.ignore_grad_reduce(input_idx=input_idx):
+                    # ignore possible gradient reduction on this input
+                    # this is mainly for customized gradient reduction.
+                    # for example, if the reduction will be done inside the operator
+                    # we don't need to generate extra adapter for gradient reduction.
+                    consumers_of_same_tensor = [fnode]
+                else:
+                    # collect consumers that consume the same sub_tensor
+                    consumers_of_same_tensor = []
+                    for idx, t in enumerate(ctensors[ftensor]):
+                        if t == itensor:
+                            consumers_of_same_tensor.append(consumers[ftensor][idx])
+                    consumers_of_same_tensor = consumers_of_same_tensor[::-1]  # make valmap grow with exec order
                 # calculate value map
                 valmap = valmaps[ftensor].map(
                     (consumers_of_same_tensor.index(fnode), len(consumers_of_same_tensor))

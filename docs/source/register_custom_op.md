@@ -185,6 +185,7 @@ An `identifier` must be one of:
 Special identifier:
   1) '*': this special identifier indicates the dimension is dynamic, which will automatically get expanded given the shape
   2) '?': this special identifier indicates the value is can only be replicated, no matter it is a tensor or a non-tensor.
+  3) '/': this special identifier indicates the value can only be replicated, and its gradient should be replicated instead of reduced, no matter it is a tensor or a non-tensor. It is a shortcut of '?:/'. See [Gradient Behavior](#gradient-behavior-during-partitioning) for details.
 
 A `reduction` can be a set of {'', '+', '^'}:
   '' indicates this dimension can be partitioned, and each output should have this dimension.
@@ -223,9 +224,11 @@ So we can mark `x` partitioned.
 
 ### Shape Annotation
 
-  e.g., 'a (c+ d^) e'
+  e.g., `'a (c+ d^) e'`
 
 A shape annotation consists of dimension annotation separated by (multiple) spaces.
+
+A shape annotation may also include tensor-level gradient control after a `:` separator. See [Gradient Behavior](#gradient-behavior-during-partitioning) for details.
 
 
 ### Operator Annotation
@@ -323,3 +326,83 @@ def optional_op(x: torch.Tensor, y: Optional[torch.Tensor]) -> torch.Tensor:
 ```
 
 Please note the value of the optional tensor should be consistent in runtime and tracing time. Which mean if the value of the optional tensor is `None` in tracing time, it should always be `None` in runtime, and if the value of optional tensor is not `None` in tracing time, it should always not be `None` in runtime. It may cause runtime error if the consistency is not guaranteed.
+
+
+## Gradient Behavior During Partitioning
+
+When nnscaler partitions an operator across multiple devices, the backward pass may require additional communication to produce correct gradients. Understanding when and why this happens is important for writing correct annotations.
+
+### Default Behavior: Gradient All-Reduce
+
+Consider a matrix multiplication `X = M @ N`, where `M` has shape `(a, b)` and `N` has shape `(b, c)`. The annotation is `'a b+, b+ c -> a c'`.
+
+**Spatial Partition** (splitting on `a`):
+Splitting on `a`:
+- `M` is split along dim 0 into `M1, M2`
+- `N` is replicated
+- Forward: `X1 = M1 @ N`, `X2 = M2 @ N`
+- Backward: given grad `Y1` for `X1`, grad for `N` is `M1^T @ Y1`. But this is only a **partial** gradient — the other device computes `M2^T @ Y2`. The full gradient for `N` requires an **all-reduce** (sum) across devices.
+
+This is the default: when an input is replicated but the operator is partitioned, nnscaler automatically inserts an all-reduce for that input's gradient.
+
+**Value Partition** (splitting on `b`):
+
+Splitting on `b`:
+- `M` is split along dim 1: `M1, M2`
+- `N` is split along dim 0: `N1, N2`
+- Forward: `X = M1 @ N1 + M2 @ N2` (results are summed via all-reduce)
+- Backward: given grad `Y` for `X`:
+  - grad for `M1` = `Y @ N1^T` (correct, no communication needed)
+  - grad for `N1` = `M1^T @ Y` (correct, no communication needed)
+
+  Each device already has the full `Y`, so each device can independently compute the correct gradient for its local partition. **No gradient all-reduce is needed.**
+
+### Skipping Gradient All-Reduce: `: /identifier`
+
+Sometimes the default all-reduce is unnecessary or even harmful. Common cases:
+
+1. **The operator handles gradient reduction internally** (e.g., a custom `torch.autograd.Function` that does its own all-reduce in backward).
+2. **The operator's math makes the all-reduce redundant** (e.g., value partition as shown above, or customized expert parallelism operators where gradients are already correct per-device).
+
+In these cases, you can annotate inputs to skip gradient all-reduce using the `: /identifier` syntax after the dimension annotations:
+
+```
+'<dim_annotations> : /<identifier1> /<identifier2> ...'
+```
+
+**Syntax variants:**
+
+| Annotation | Meaning |
+|---|---|
+| `'a b : /a'` | Skip grad all-reduce for this input when partitioning on `a` |
+| `'a b : /a /b'` | Skip grad all-reduce when partitioning on `a` or `b` |
+| `'a b : /'` | Skip grad all-reduce when partitioning on any identifier (wildcard) |
+| `'/'` | Shortcut for `'?:/'` — input is replicated and never grad-reduced |
+
+**Example: Rotary Position Embedding**
+
+The function `apply_rotary_pos_emb(q, k, cos, sin, position_ids)` takes query `q` of shape `(b, h, s, d)` and key `k` of shape `(b, m, s, d)`. When we split on `m`, `q` is replicated — normally this would trigger a gradient all-reduce on `q`. But because the rotary embedding only rotates each head independently, the partial gradient for `q` from one partition is already the full correct gradient. So we annotate:
+
+```python
+@nnscaler.register_op('b h s^ d^ : /m, b m s^ d^ : /h, s^ d^, s^ d^, s^ -> b h s^ d^, b m s^ d^')
+def apply_rotary_pos_emb(q, k, cos, sin, position_ids):
+    ...
+```
+
+- `'b h s^ d^ : /m'` — when splitting on `m`, don't all-reduce `q`'s gradient
+- `'b m s^ d^ : /h'` — when splitting on `h`, don't all-reduce `k`'s gradient
+
+Without these annotations, nnscaler would insert unnecessary `identity_allreduce` adapters in the generated code, leading to wrong results.
+
+### Summary Table
+
+| Partition Type | Input Role | Gradient Behavior |
+|---|---|---|
+| Spatial (`''`) | Partitioned input | No all-reduce needed (gradient is local) |
+| Spatial (`''`) | Replicated input | **All-reduce** by default |
+| Value (`'+'`) | Partitioned input | No all-reduce needed |
+| Value (`'+'`) | Replicated input | **All-reduce** by default |
+| Any | Marked with `: /id` | Skip all-reduce when splitting on `id` |
+| Any | Marked with `: /` | Skip all-reduce for any partition |
+| `'?'` | Replicated only | Normal all-reduce if needed |
+| `'/'` | Replicated only | **No** all-reduce (shortcut for `'?:/'`) |
