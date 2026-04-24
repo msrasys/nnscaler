@@ -238,6 +238,11 @@ class ModuleParallelizeConfig:
     # for example, mark some dims of tensors as dynamic
     # (you can do it in `forward_args_gen_fn` as well)
     forward_args_post_process_fn: Optional[Callable[['TrainerArgs', dict[str, Any]], dict[str, Any]]] = fn_field(default=None)
+    # whether to automatically set the requires_grad attribute of the dummy sample.
+    # If False, we will retain the requires_grad attribute of the dummy sample.
+    # If True, we will automatically set requires_grad to True for all input tensors in the dummy sample,
+    #   (except when the dtype is not float).
+    forward_args_autoset_requires_grad: bool = True
     # the model state dict file for tracing.
     # It is only used in tracing to serve as the initial state dict of the model.
     tracing_from_weights: str = None

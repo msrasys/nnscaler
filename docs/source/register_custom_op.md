@@ -46,9 +46,11 @@ def register_op(
     annotation: Union[str, Callable],
     name: Optional[str] = None,
     code_impl_pattern: str = 'import',
+    *,
     emit_fn: Callable[[IRFwOperation, List[str], Dict[str, str], int, int, int], str] = None,
     transform_rules: Tuple[TransformRule] = None,
-    input_gen_fn: Callable[IRFwOperation, List[torch.Tensor]] = None) -> Callable:
+    input_gen_fn: Callable[[IRFwOperation], List[torch.Tensor]] = None,
+    fake_fn: Optional[Callable] = None,
 ) -> Callable:
     ...
 ```
@@ -119,13 +121,67 @@ This function has the following parameters:
     of the operator. By using `input_gen_fn`, we can provide compatible input tensors to the profiler so that the solver can generate a
     good distributed plan.
     Default: None.
+- `fake_fn` (`Callable | None`): a lightweight substitute function used during tracing instead of the real runtime function.
+    It must have the same signature (inputs and outputs, and `requires_grad` flags of all outputs) as the runtime function so that the two are interchangeable.
+    If `fake_fn` is `None`, the runtime function is called directly during tracing.
+    This is useful when the runtime function contains operations that cannot run during tracing
+    (e.g., distributed communication ops, or functions that raise errors outside their intended environment).
+    **Note:** `fake_fn` is not supported for `torch.autograd.Function`. If you need a fake function for an autograd op,
+    wrap it in a plain function and register the wrapper instead.
+    Default: None.
+
+## Fake Function (`fake_fn`)
+
+When registering a custom operator, nnscaler needs to **trace** (execute) the function once to understand its computation graph. However, some functions cannot run during tracing:
+
+- Functions that use distributed communication (e.g., `torch.distributed.all_reduce`)
+- Functions that intentionally raise errors outside their `torchrun` runtime environment
+
+In these cases, you can provide a `fake_fn` — a lightweight stand-in that produces the correct output **shapes, types and `requires_grad` flags** without performing the real computation.
+
+### Requirements
+
+1. `fake_fn` must have the **same input signature** as the runtime function
+2. `fake_fn` must return outputs with the **same shapes and types** as the runtime function
+3. `fake_fn` must set the **same `requires_grad` flags** on its outputs as the runtime function
+4. `fake_fn` should be **simple and fast** — it only runs during tracing, not during training
+5. `fake_fn` is **not supported** for `torch.autograd.Function`
+
+
+### Example: Distributed Communication Op
+
+```python
+import torch
+import torch.distributed as dist
+import nnscaler
+
+def fake_allreduce_linear(x: torch.Tensor, weight: torch.Tensor):
+    # Just compute the linear part — skip the all-reduce
+    return x @ weight.T
+
+@nnscaler.register_op('a b, c b -> a c', fake_fn=fake_allreduce_linear)
+def allreduce_linear(x: torch.Tensor, weight: torch.Tensor):
+    out = x @ weight.T
+    dist.all_reduce(out)  # Cannot run during tracing
+    return out
+```
+
+### When You Don't Need `fake_fn`
+
+If your function can run normally during tracing (e.g., it only uses standard PyTorch ops), you don't need `fake_fn` — just omit it:
+
+```python
+@nnscaler.register_op('a b, b c -> a c')
+def my_matmul(x: torch.Tensor, w: torch.Tensor):
+    return torch.matmul(x, w)
+```
 
 ## `torch.autograd.Function`
 
 If you are using `torch.autograd.Function`, you should register it(internally its `apply` function is registered).
 Otherwise it will be replicated by default, which may lead to poor performance.
 
-```
+```python
 import torch
 import nnscaler
 
@@ -148,6 +204,25 @@ nnscaler.register_op(annotation)(MyFunction)
 or
 ```
 nnscaler.register_op(annotation)(MyFunction.apply)
+```
+
+**Note:** `fake_fn` is not supported for `torch.autograd.Function`. If you need a fake function for an autograd op, wrap it in a plain function and register the wrapper:
+
+```python
+class MyAutograd(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x):
+        ...  # real implementation
+    @staticmethod
+    def backward(ctx, grad):
+        ...
+
+def fake_my_op(x: torch.Tensor):
+    return x  # lightweight substitute
+
+@nnscaler.register_op('* -> *', fake_fn=fake_my_op)
+def my_op(x: torch.Tensor):
+    return MyAutograd.apply(x)
 ```
 
 ## `torch.compile` functions
@@ -398,10 +473,10 @@ Without these annotations, nnscaler would insert unnecessary `identity_allreduce
 
 | Partition Type | Input Role | Gradient Behavior |
 |---|---|---|
-| Spatial (`''`) | Partitioned input | No all-reduce needed (gradient is local) |
-| Spatial (`''`) | Replicated input | **All-reduce** by default |
-| Value (`'+'`) | Partitioned input | No all-reduce needed |
-| Value (`'+'`) | Replicated input | **All-reduce** by default |
+| Spatial | Partitioned input | No all-reduce needed (gradient is local) |
+| Spatial | Replicated input | **All-reduce** by default |
+| Value | Partitioned input | No all-reduce needed |
+| Value | Replicated input | **All-reduce** by default |
 | Any | Marked with `: /id` | Skip all-reduce when splitting on `id` |
 | Any | Marked with `: /` | Skip all-reduce for any partition |
 | `'?'` | Replicated only | Normal all-reduce if needed |

@@ -712,6 +712,7 @@ def _gen_graph(
     constant_folding: bool,
     end2end_mode: bool = False,
     inference_only: bool = False,
+    autoset_requires_grad: bool = True,
 ):
     # reset environment
     IDGenerator().clear()
@@ -729,7 +730,7 @@ def _gen_graph(
         # in end2end mode, we don't need gradients for inputs
         # in normal mode, we assume all inputs require gradients
         # so it can connect to other parts of the graph correctly
-        requires_grad=not end2end_mode
+        requires_grad=not end2end_mode if autoset_requires_grad else None
     )
     fx_graph = parser.to_fx_graph(module, dummy_forward_args)
 
@@ -780,6 +781,7 @@ def _gencode(
         *,
         module_dtype:  Optional[torch.dtype] = None,
         module_fn: Optional[Callable[[], torch.nn.Module]] = None,
+        autoset_requires_grad: bool = True,
     ) -> RegenStatus:
     """
     Generate parallel module source code from a torch module, and save it to file.
@@ -799,7 +801,7 @@ def _gencode(
         outdir (Path): the directory to save generated code
         module_dtype (Optional[torch.dtype]): the dtype of the module. Keep as it is when it is None.
         module_fn (Optional[Callable[[], torch.nn.Module]]): the function to create the module. Will use __init__ if it is None.
-
+        autoset_requires_grad (bool): whether to automatically set the requires_grad of input tensors.
     Returns:
         RegenStatus: which part is regenerated.
     """
@@ -845,6 +847,7 @@ def _gencode(
                 wrapped_module, dummy_forward_args, outdir,
                 constant_folding=compute_config.constant_folding, end2end_mode=compute_config.use_end2end,
                 inference_only=compute_config.inference_only,
+                autoset_requires_grad=autoset_requires_grad,
             )
 
         graph.dump(graph_ckp)
@@ -985,6 +988,7 @@ def parallelize(
     init_module_params: bool = True,
     build_module_buckets: bool = True,
     broadcast_strategy: Union[str, BroadcastGenFilesStrategy] = 'none',
+    autoset_requires_grad: bool = True,
 ) -> Union[None, ParallelModule, Type[ParallelModule]]:
     """
     Convert a torch.nn.Module object or class to ParallelModule object or class.
@@ -1068,6 +1072,12 @@ def parallelize(
         broadcast_strategy (Union[str, BroadcastGenFilesStrategy]): the broadcast strategy for generated files.
             Please note that the broadcasting will only be done in torchrun environment,
             and will throw an error if torch.distributed is not initialized and broadcast_strategy is not NONE.
+        autoset_requires_grad (bool):
+            whether to automatically set the requires_grad attribute of the dummy forward arguments.
+            If false, we will retain the requires_grad attribute of the dummy forward arguments.
+            If true, we will automatically set requires_grad according to compute_config and tensor dtypes.
+            Note set requires_grad to True for end2end module is not useful,
+            and this argument is mainly for non-end2end module.
     Returns:
         Union[ParallelModule, Type[ParallelModule], None]:
             if load_module flag is set, return the converted ParallelModule object or class
@@ -1125,6 +1135,7 @@ def parallelize(
                         outdir,
                         module_dtype=module_dtype,
                         module_fn=module_fn,
+                        autoset_requires_grad=autoset_requires_grad,
                     )
             else:
                 regen_status = RegenStatus.NONE
