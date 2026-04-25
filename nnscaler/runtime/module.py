@@ -1411,8 +1411,6 @@ class ParallelModule(CubeModule):
             for idx in range(len(outs)):
                 # loss always requires to be a scalar, and its gradient should be None
                 if grads[idx] is None:
-                    assert idx == 0, "Loss must be the first output."
-
                     if is_dummy_batch and accum_idx >= len(is_dummy_batch):
                         raise RuntimeError(
                             f"Expected {len(is_dummy_batch)} number of micro-batches, but got more than it."

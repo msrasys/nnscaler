@@ -301,15 +301,37 @@ class InterPathFinder:
         assert producer_out_devs is not None, f"Can't find inter-rvd producer out device placement"
 
         # setup consumer primitives and entry device placement
+        # The consumer device ordering must match the producer's permutation
+        # pattern so that position-i in producer maps to position-i in consumer
+        # during InterTransition.transition(). Without this, inner_transpose
+        # permutations on the producer side (e.g. (0,2,1,3)) can pair with a
+        # different consumer ordering (e.g. (4,5,6,7)), causing rank i on stage 0
+        # to send data to the wrong rank on stage 1.
+        sorted_pdevs = sorted(producer_out_devs)
+        perm = [sorted_pdevs.index(d) for d in producer_out_devs]
+
         consumer_entry_devs = None
-        for cdevs in cdev_space:
+        # First try: apply producer's permutation to consumer devices
+        any_cdevs = next(iter(cdev_space))
+        sorted_cdevs = sorted(any_cdevs)
+        if len(sorted_cdevs) == len(perm):
+            matched_cdevs = tuple(sorted_cdevs[p] for p in perm)
             clayout = RVDLayout.grid(
                 olayout.ftensor, r=crvds[0][0], v=crvds[0][1],
-                dims=crvds[0][2:], devices=cdevs)
+                dims=crvds[0][2:], devices=matched_cdevs)
             align, cprims = IntraPathFinder.device_align(clayout, olayout, crvds)
             if align:
-                consumer_entry_devs = cdevs
-                break
+                consumer_entry_devs = matched_cdevs
+        # Fallback: iterate deterministically
+        if consumer_entry_devs is None:
+            for cdevs in sorted(cdev_space):
+                clayout = RVDLayout.grid(
+                    olayout.ftensor, r=crvds[0][0], v=crvds[0][1],
+                    dims=crvds[0][2:], devices=cdevs)
+                align, cprims = IntraPathFinder.device_align(clayout, olayout, crvds)
+                if align:
+                    consumer_entry_devs = cdevs
+                    break
         assert consumer_entry_devs is not None, f"Can't find inter-rvd consumer entry device placement."
 
         # setup inter-primitive
