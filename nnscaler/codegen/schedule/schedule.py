@@ -4,8 +4,9 @@
 from typing import List, Optional, Tuple
 import copy
 import logging
+import re as _re
 
-from nnscaler.ir.cten import IRCell, IRTensor
+from nnscaler.ir.cten import IRCell, IRObject, IRTensor
 from nnscaler.ir.operator import IRDataOperation, IRFwOperation
 from nnscaler.ir.tensor import IRSubTensor
 from nnscaler.ir.adapter import IRWeightReducer, IRAdapter
@@ -163,11 +164,179 @@ class ScheduleCodeGen(FuncEmission):
         gencode += ['']
 
         code = '\n'.join(gencode)
+        # Post-process: fix undefined non-tensor refs in pipeline mode.
+        # Collect getitem info from the IR graph (not from code text) so we
+        # can see cross-stage extractions.
+        getitem_info = self._collect_getitem_info()
+        if getitem_info:
+            code = self._fix_undefined_nontensor_refs(code, getitem_info)
+        code = self._fix_undefined_backward_grads(code)
         # write to file
         if outfile:
             with open(outfile, 'a' if attach else 'w') as f:
                 f.write(code)
         return code
+
+    def _collect_getitem_info(self):
+        """Scan IR graph for non-tensor getitem ops: ``_operator.getitem(samples, key)``.
+
+        Returns a dict mapping a variable-name prefix (derived from the IRObject
+        name, e.g. ``'getitem_1'``) to the extraction key (e.g. ``'context'``).
+        """
+        info = {}
+        for node in self.execplan.graph.nodes(flatten=True):
+            if not isinstance(node, IRFwOperation):
+                continue
+            if node.signature != '_operator.getitem':
+                continue
+            outputs = node.outputs()
+            if not outputs:
+                continue
+            out = outputs[0]
+            if isinstance(out, IRTensor):
+                continue
+            if not isinstance(out, IRObject):
+                continue
+            inputs = node.inputs()
+            if len(inputs) < 2:
+                continue
+            key_obj = inputs[1]
+            if isinstance(key_obj, IRObject) and isinstance(key_obj.value, str):
+                key = key_obj.value
+            elif isinstance(key_obj, str):
+                key = key_obj
+            else:
+                continue
+            # Get the codegen variable name for this IRObject and extract its
+            # prefix (everything before the last _<tid> suffix).
+            full_var = self.tensor_name(out)
+            # full_var is e.g. "getitem_1_1080" where "getitem_1" is from out.name
+            # and "1080" is out.tid.  The prefix is "getitem_1".
+            prefix = full_var.rsplit('_', 1)[0] if '_' in full_var else full_var
+            info[prefix] = key
+        return info
+
+    @staticmethod
+    def _fix_undefined_nontensor_refs(code: str, getitem_info: dict) -> str:
+        """Fix undefined non-tensor variable references in pipeline schedule code.
+
+        ``getitem_info`` maps a variable-name prefix (e.g. ``'getitem_1'``) to
+        the extraction key (e.g. ``'context'``).  For every fexecute() call that
+        references a ``getitem_<prefix>_<tid>`` variable which has not been
+        assigned, we insert ``var = _operator.getitem(samples_<tid2>, key)``
+        using the co-occurring ``samples_*`` on the same line.
+        """
+        lines = code.split('\n')
+        new_lines = []
+        defined_vars = set()
+        in_function = False
+
+        for line in lines:
+            stripped = line.lstrip()
+            if stripped.startswith('def _train_step(') or stripped.startswith('def _infer_step('):
+                in_function = True
+                defined_vars = set()
+            elif stripped.startswith('def ') and in_function:
+                in_function = False
+
+            if in_function:
+                assign_match = _re.match(r'^(\s*)(.+?)\s*=\s', line)
+                if assign_match:
+                    lhs = assign_match.group(2)
+                    for var in _re.findall(r'\b(\w+)\b', lhs):
+                        defined_vars.add(var)
+
+                if 'nnscaler.runtime.executor.fexecute(' in line:
+                    refs = _re.findall(r'\b(getitem_(\w+?)_(\d+))\b', line)
+                    samples_match = _re.search(r'\b(samples_\d+)\b', line)
+                    if samples_match:
+                        samples_var = samples_match.group(1)
+                        indent = len(line) - len(line.lstrip())
+                        for full_name, prefix_part, tid in refs:
+                            if full_name in defined_vars:
+                                continue
+                            prefix = f'getitem_{prefix_part}'
+                            if prefix not in getitem_info:
+                                continue
+                            key = getitem_info[prefix]
+                            fix = ' ' * indent + f"{full_name} = _operator.getitem({samples_var}, '{key}')"
+                            new_lines.append(fix)
+                            defined_vars.add(full_name)
+
+            new_lines.append(line)
+
+        return '\n'.join(new_lines)
+
+    @staticmethod
+    def _fix_undefined_backward_grads(code: str) -> str:
+        """Replace undefined gradient variables with zero-grad in backward() calls.
+
+        In pipeline mode, non-loss output tensors (e.g. z_loss returned for
+        logging) may have gradient variables that are never assigned.  These
+        should receive zero gradients so they don't inject spurious gradient
+        flow.  Loss tensors are already handled by the ``is_loss()`` check
+        which emits ``None`` (PyTorch defaults to ``ones_like`` for scalars).
+        """
+        lines = code.split('\n')
+        new_lines = []
+        defined_vars = set()
+        in_function = False
+        replaced_vars = set()
+
+        for line in lines:
+            stripped = line.lstrip()
+            if stripped.startswith('def _train_step(') or stripped.startswith('def _infer_step('):
+                in_function = True
+                defined_vars = set()
+                replaced_vars = set()
+                func_match = _re.search(r'def \w+\(([^)]*)\)', stripped)
+                if func_match:
+                    for arg in func_match.group(1).split(','):
+                        defined_vars.add(arg.strip())
+            elif stripped.startswith('def ') and in_function:
+                in_function = False
+
+            if in_function:
+                assign_match = _re.match(r'^(\s*)(.+?)\s*=\s', line)
+                if assign_match:
+                    lhs = assign_match.group(2)
+                    for var in _re.findall(r'\b(\w+)\b', lhs):
+                        defined_vars.add(var)
+
+                if 'nnscaler.runtime.executor.backward(' in line:
+                    all_tuples = list(_re.finditer(r'\(([^()]*)\)', line))
+                    if len(all_tuples) >= 2:
+                        output_tensors_match = all_tuples[-2]
+                        grads_match = all_tuples[-1]
+                        ot_names = [v.strip() for v in output_tensors_match.group(1).split(',') if v.strip()]
+                        grads_str = grads_match.group(1)
+                        grad_names = [v.strip() for v in grads_str.split(',') if v.strip()]
+                        new_grad_names = list(grad_names)
+                        for i, gvar in enumerate(grad_names):
+                            if gvar == 'None':
+                                continue
+                            if gvar not in defined_vars:
+                                if i < len(ot_names):
+                                    new_grad_names[i] = f'torch.zeros_like({ot_names[i]})'
+                                else:
+                                    new_grad_names[i] = 'None'
+                                replaced_vars.add(gvar)
+                        new_grads_str = ', '.join(new_grad_names)
+                        if new_grads_str != grads_str:
+                            line = line[:grads_match.start(1)] + new_grads_str + line[grads_match.end(1):]
+
+                if stripped.startswith('del ') and replaced_vars:
+                    del_vars = [v.strip() for v in stripped[4:].split(',')]
+                    remaining = [v for v in del_vars if v not in replaced_vars]
+                    if not remaining:
+                        new_lines.append(line[:len(line) - len(stripped)] + 'pass')
+                        continue
+                    elif len(remaining) < len(del_vars):
+                        line = line[:len(line) - len(stripped)] + 'del ' + ', '.join(remaining)
+
+            new_lines.append(line)
+
+        return '\n'.join(new_lines)
 
     def emit_detach(self, tensor: IRTensor) -> str:
         """

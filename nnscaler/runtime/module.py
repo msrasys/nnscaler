@@ -1361,7 +1361,6 @@ class ParallelModule(CubeModule):
             for idx in range(len(outs)):
                 # loss always requires to be a scalar, and its gradient should be None
                 if grads[idx] is None:
-                    assert idx == 0, "Loss must be the first output."
                     if outs[idx].size() != torch.Size([]):
                         raise ValueError(f"Expected scalar loss, but got {outs[idx].size()}.")
                     if scale_fn:
