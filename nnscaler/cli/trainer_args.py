@@ -104,7 +104,6 @@ def _resolve_precision(precision: Union[str, Dict[_TENSOR_TYPE, _PRECISION_TYPE]
         precision = precision.copy()
         pbi_precision = precision.pop('pbi')
         for tensor_type in pbi_tensor_type:
-            # default does not apply to grad
             if tensor_type not in precision:
                 precision[tensor_type] = pbi_precision
 
