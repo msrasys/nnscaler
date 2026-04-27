@@ -260,6 +260,14 @@ def create_wrapped_leaf_class(clz, *, replace_cls: Optional[Callable]=None, defa
 
         def __new__(cls, *args, **kwargs):
             global TEMP_CALL_ORIGIN
+            # When this wrapper replaces a builtin like `tuple` and a subclass
+            # (e.g. codecs.CodecInfo) calls `tuple.__new__(cls, ...)`, `cls` will be
+            # the subclass instead of `clz_wrapper_clz`. In that case we must
+            # delegate to the original class's `__new__` to preserve the subclass,
+            # otherwise we would return a plain instance of `clz` and break
+            # subsequent attribute assignments / behavior on the subclass.
+            if cls is not clz_wrapper_clz and isinstance(cls, type) and issubclass(cls, clz):
+                return clz.__new__(cls, *args, **kwargs)
             if TEMP_CALL_ORIGIN:
                 return clz(*args, **kwargs)
             else:
