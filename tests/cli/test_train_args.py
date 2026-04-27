@@ -102,7 +102,7 @@ def test_resolve_precision_string_sets_grad():
 @pytest.mark.skipif(torch.__version__ < (2, 10), reason='requires torch >= 2.10 for grad_dtype support')
 def test_resolve_precision_dict_with_grad():
     """Dict precision with explicit grad key."""
-    p = _resolve_precision({'param': 'bf16', 'buffer': 'bf16', 'input': 'bf16', 'grad': 'fp32'})
+    p = _resolve_precision({'pbi': 'bf16', 'grad': 'fp32'})
     assert _get_tensor_dtype(p, 'grad') == torch.float32
     assert _get_tensor_dtype(p, 'param') == torch.bfloat16
 
