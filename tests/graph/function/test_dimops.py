@@ -172,7 +172,7 @@ def test_slash_shortcut():
     assert s.no_grad_reduce_for('x') is True
     # dims should be '?'
     assert s.ndims == 1
-    assert s._dims[0].name == '?'
+    assert s.dims[0].name == '?'
 
 
 def test_question_mark():
