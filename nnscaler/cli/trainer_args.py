@@ -93,6 +93,7 @@ def _resolve_precision(precision: Union[str, Dict[_TENSOR_TYPE, _PRECISION_TYPE]
     supported_precision_type = get_args(_PRECISION_TYPE)
     supported_tensor_type = get_args(_TENSOR_TYPE)
     pbi_tensor_type = tuple(t for t in supported_tensor_type if t != 'grad')
+    supported_tensor_type_short = {t[0]: t for t in supported_tensor_type}
 
     if not precision:
         precision = 'none'
@@ -100,12 +101,22 @@ def _resolve_precision(precision: Union[str, Dict[_TENSOR_TYPE, _PRECISION_TYPE]
     if isinstance(precision, str):
         precision = {k: precision for k in pbi_tensor_type}
 
-    if isinstance(precision, dict) and 'pbi' in precision:
-        precision = precision.copy()
-        pbi_precision = precision.pop('pbi')
-        for tensor_type in pbi_tensor_type:
-            if tensor_type not in precision:
-                precision[tensor_type] = pbi_precision
+    if isinstance(precision, dict):
+        # sorted/reversed is for key priority
+        # 1. sorted: shorter keys have higher priority so that 'p' has higher priority than 'pb'
+        # 2. reversed: later keys have higher priority than earlier keys of the same length
+        for k in sorted(reversed(list(precision.keys())), key=lambda x: len(x)):
+            if k in supported_tensor_type:
+                continue
+
+            v = precision.pop(k)
+            # expand abbreviations like 'pb' -> 'param', 'buffer'
+            for skey in k:
+                if skey not in supported_tensor_type_short:
+                    raise ValueError(f"Invalid tensor type abbreviation {skey} found in {k}")
+                tensor_type = supported_tensor_type_short[skey]
+                if tensor_type not in precision:
+                    precision[tensor_type] = v
 
     for tensor_type in supported_tensor_type:
         if tensor_type not in precision:

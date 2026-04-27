@@ -105,6 +105,19 @@ def test_resolve_precision_dict_with_grad():
     p = _resolve_precision({'pbi': 'bf16', 'grad': 'fp32'})
     assert _get_tensor_dtype(p, 'grad') == torch.float32
     assert _get_tensor_dtype(p, 'param') == torch.bfloat16
+    assert _get_tensor_dtype(p, 'input') == torch.bfloat16
+
+    p = _resolve_precision({'pi': 'bf16', 'grad': 'fp32', 'i': 'fp32'})
+    assert _get_tensor_dtype(p, 'grad') == torch.float32
+    assert _get_tensor_dtype(p, 'input') == torch.float32
+    assert _get_tensor_dtype(p, 'param') == torch.bfloat16
+    assert _get_tensor_dtype(p, 'buffer') is None
+
+    p = _resolve_precision({'pi': 'bf16', 'gi': 'fp32'})
+    assert _get_tensor_dtype(p, 'grad') == torch.float32
+    assert _get_tensor_dtype(p, 'input') == torch.float32
+    assert _get_tensor_dtype(p, 'param') == torch.bfloat16
+    assert _get_tensor_dtype(p, 'buffer') is None
 
 
 def test_resolve_precision_dict_missing_grad():
