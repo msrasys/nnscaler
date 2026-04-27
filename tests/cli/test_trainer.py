@@ -686,7 +686,7 @@ def trainer_grad_dtype_worker(save_dir, use_zero):
     ])
     trainer.run()
 
-    # verify the reducer's grad buffer is fp32 while params are bf16
+    # verify the reducer's grad buffer and params are bf16
     from nnscaler.parallel import ParallelModule
     for m in trainer.model.modules():
         if isinstance(m, ParallelModule):

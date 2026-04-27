@@ -206,7 +206,7 @@ class IRWeightReducer(IRCell):
             return []
 
         # TODO: group weights by both dtype and grad_dtype
-        # currently we assumpe all grad dtypes are
+        # currently we assume all grad dtypes are
         # 1. the same as weight dtype, or
         # 2. all the same (e.g., all fp32) if grad_dtype is set in training config
         # But when we support more flexible grad dtype configuration in the future,
