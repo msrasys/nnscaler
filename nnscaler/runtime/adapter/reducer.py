@@ -10,7 +10,7 @@ import torch
 from torch.utils.hooks import RemovableHandle
 
 from nnscaler.runtime.device import DeviceGroup
-from nnscaler.runtime.utils import split_array_min_max, set_fparam_meta
+from nnscaler.runtime.utils import split_array_min_max, set_fparam_meta, get_grad_dtype, set_grad_dtype
 from nnscaler.profiler.timer import CudaTimer
 from nnscaler.flags import RuntimeFlag
 from nnscaler.utils import unchecked_fields, first
@@ -389,6 +389,8 @@ class Bucket:
         # build parameter for optimizer (shared storage).
         # Its gradient will be updated everytime calling `self.sync_grads()`
         self._param_for_optimizer = torch.nn.Parameter(self._get_opt_param_data())
+        if self._contiguous_grads.dtype != self._param_for_optimizer.dtype:
+            set_grad_dtype(self._param_for_optimizer, self._contiguous_grads.dtype)
         set_fparam_meta(self._param_for_optimizer, self._flatten_param_info)
 
     def register_hooks(self):
@@ -880,8 +882,9 @@ class Reducer:
 
     def _allocate_buffers(self):
         # gradient buffer
+        grad_dtype = get_grad_dtype(self._params[0])
         self._contiguous_grads: torch.Tensor = torch.zeros(
-            (self.buffer_length,), dtype=self._params[0].dtype,
+            (self.buffer_length,), dtype=grad_dtype,
             device=torch.cuda.current_device(), requires_grad=False)
         # parameter buffer
         self._contiguous_params: torch.Tensor = torch.zeros(

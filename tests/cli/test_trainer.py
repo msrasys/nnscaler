@@ -114,6 +114,60 @@ def test_trainer_compile_worker(tmp_path):
     shutil.rmtree(gen_savedir)
 
 
+@replace_all_device_with('cpu')
+def test_trainer_compile_with_grad_precision(tmp_path):
+    """Test compile with grad precision set via precision dict."""
+    save_dir = Path(tmp_path)
+    config_path = str(Path(__file__).with_name('trainer_args.yaml').resolve())
+    gen_savedir = save_dir / 'gen'
+
+    # compile with grad=fp32, param/buffer/input=bf16
+    trainer = Trainer([
+        '-f', config_path,
+        '--max_epochs', '2',
+        '--gen_savedir', str(gen_savedir),
+        '--compute_config.plan_ngpus', '2',
+        '--compute_config.runtime_ngpus', '4',
+        '--checkpoint.no_save', 'true',
+        '--run_mode', 'compile',
+        '--broadcast_strategy', 'none',
+        '--precision.param', 'bf16',
+        '--precision.buffer', 'bf16',
+        '--precision.input', 'bf16',
+        '--precision.grad', 'fp32',
+    ])
+    trainer.run()
+
+    assert set([f.name for f in gen_savedir.glob('**/*.py')]) == set(['gencode0.py', 'gencode1.py', 'gencode2.py', 'gencode3.py'])
+    shutil.rmtree(gen_savedir)
+
+    # mixed compile with grad precision
+    gen_savedir2 = save_dir / 'gen2'
+    trainer = Trainer([
+        '-f', config_path,
+        '--max_epochs', '2',
+        '--gen_savedir', str(gen_savedir2),
+        '--compute_config.plan_ngpus', '2',
+        '--compute_config.runtime_ngpus', '4',
+        '--checkpoint.no_save', 'true',
+        '--run_mode', 'compile',
+        '--broadcast_strategy', 'none',
+        '--precision.param', 'bf16',
+        '--precision.buffer', 'bf16',
+        '--precision.input', 'bf16',
+        '--precision.grad', 'fp32',
+        '--model.type', 'tests.cli.common.MixedModule',
+        '--model.parallel_modules.0.type', 'tests.cli.common.MixModuleMLP2',
+        '--model.parallel_modules.0.args.dim', '16',
+        '--model.parallel_modules.0.args.nlayers', '16',
+        '--model.parallel_modules.0.forward_args_gen_fn', 'tests.cli.common.forward_args_gen_fn',
+    ])
+    trainer.run()
+
+    assert set([f.name for f in gen_savedir2.glob('**/*.py')]) == set(['gencode0.py', 'gencode1.py', 'gencode2.py', 'gencode3.py'])
+    shutil.rmtree(gen_savedir2)
+
+
 def trainer_resume_worker(save_dir, save_type, bf16, parallel_type=0):
     save_dir = Path(save_dir)
     config_path = str(Path(__file__).with_name('trainer_args.yaml').resolve())
@@ -630,6 +684,45 @@ def trainer_grad_sync_check(save_dir, use_bf16, zero_ngroups, runtime_ngpus):
     ])
     trainer.run()
     torch.distributed.barrier()
+
+
+def trainer_grad_dtype_worker(save_dir, use_zero):
+    save_dir = Path(save_dir)
+    config_path = str(Path(__file__).with_name('trainer_args.yaml').resolve())
+    gen_savedir = save_dir / 'gen'
+    ckpt_savedir = save_dir / 'ckpt'
+
+    trainer = Trainer([
+        '-f', config_path,
+        '--precision.pbi', 'bf16',
+        '--precision.grad', 'fp32',
+        '--max_epochs', '1',
+        '--enable_progress_bar', 'false',
+        '--gen_savedir', str(gen_savedir),
+        '--compute_config.plan_ngpus', '1',
+        '--compute_config.runtime_ngpus', '2',
+        '--compute_config.use_zero', str(use_zero),
+        '--checkpoint.save_dir', str(ckpt_savedir),
+    ])
+    trainer.run()
+
+    # verify the reducer's grad buffer is fp32 while params are bf16
+    from nnscaler.parallel import ParallelModule
+    for m in trainer.model.modules():
+        if isinstance(m, ParallelModule):
+            for reducer in m.reducers:
+                assert reducer._contiguous_grads.dtype == torch.float32, \
+                    f"Expected grad buffer to be fp32 but got {reducer._contiguous_grads.dtype}"
+                assert reducer._contiguous_params.dtype == torch.bfloat16, \
+                    f"Expected param buffer to be bf16 but got {reducer._contiguous_params.dtype}"
+
+    torch.distributed.barrier()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.device_count() < 2, reason='lack of gpu devices')
+@pytest.mark.parametrize('use_zero', [0, 1])
+def test_trainer_grad_dtype(tmp_path, use_zero):
+    launch_torchrun(2, trainer_grad_dtype_worker, tmp_path, use_zero)
 
 
 def trainer_correctness_worker(save_dir, parallel_type=0, async_reducer=False, hybrid_opt=False, use_zero=0, zero_param_level_sharding=False, reducer_bucket_cap_mb=1e-6):
