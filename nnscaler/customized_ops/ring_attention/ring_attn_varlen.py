@@ -145,9 +145,10 @@ def wrap_ring_attn_varlen_func(
 
     if process_group is None or len(process_group) == 1 or not enable_ring:
         if use_cute:
+            # print("Using flash_attn.cute for local attention")
             assert flash_attn_cute_varlen_func is not None, "flash_attn.cute is not available"
             cute_window_size = tuple(None if w == -1 else w for w in window_size)
-            output, _ = flash_attn_cute_varlen_func(
+            output, softmax_lse = flash_attn_cute_varlen_func(
                 q, k, v,
                 cu_seqlens_q=cu_seqlens_q,
                 cu_seqlens_k=cu_seqlens_k,
@@ -156,9 +157,10 @@ def wrap_ring_attn_varlen_func(
                 window_size=cute_window_size,
                 deterministic=deterministic,
             )
-            return output
+            return output, softmax_lse
         else:
-            output = flash_attn_varlen_func(
+            # print("Using flash_attn for local attention")
+            output, softmax_lse, _ = flash_attn_varlen_func(
                 q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k,
                 dropout_p=dropout_p,
                 softmax_scale=softmax_scale,
@@ -166,10 +168,10 @@ def wrap_ring_attn_varlen_func(
                 window_size=window_size,
                 alibi_slopes=alibi_slopes,
                 deterministic=deterministic,
-                return_attn_probs=False,
+                return_attn_probs=True,
             )
-        return output
-
+        return output, softmax_lse
+    # print("Using ring-attention for distributed attention")
     assert len(q.shape) == 3, "q must have shape [total_q, qh, dim]"
     assert len(k.shape) == 3, "k must have shape [total_k, kh, dim]"
     assert len(v.shape) == 3, "v must have shape [total_k, vh, dim]"
@@ -232,7 +234,7 @@ def wrap_ring_attn_varlen_func(
                 attn_mask_type="padding_causal" if causal else "padding",
             )
             output = unshuffle_varlen(shuffled_output, cu_seqlens_q, process_group, local_process_group)
-            return output
+            return output, None
         else:
             # Fallback to basic ring attention implementation
             if _ENABLE_TE_CP:
@@ -256,7 +258,7 @@ def wrap_ring_attn_varlen_func(
         world_size=local_world_size,
     )
 
-    output = llama3_flash_attn_varlen_func(
+    output, softmax_lse = llama3_flash_attn_varlen_func(
         q,
         k,
         v,
@@ -271,12 +273,11 @@ def wrap_ring_attn_varlen_func(
         window_size=window_size,
         alibi_slopes=alibi_slopes,
         deterministic=deterministic,
-        return_attn_probs=False,
         group=local_process_group,
         use_cute=use_cute,
     )
 
-    return output
+    return output, softmax_lse
 
 
 def emit_ring(node: IRDimops, args: List[str], kwargs: Dict[str, str], runtime_devid: int, plan_ndevs: int, runtime_ndevs: int) -> str:
@@ -317,9 +318,9 @@ def emit_ring(node: IRDimops, args: List[str], kwargs: Dict[str, str], runtime_d
 def flash_attention_anno(query_states, key_states, value_states, cu_seqlens_q, cu_seqlens_k, alibi_slopes, *args, **kwargs) -> str:
     q_anno, kv_anno = gen_head_anno(query_states, key_states, value_states, head_pos=1)
     if isinstance(alibi_slopes, IRTensor):
-        return f'l {q_anno} hd^, l {kv_anno} hd^, l {kv_anno} vd^, e^, e^, {q_anno} -> l {q_anno} vd^'
+        return f'l {q_anno} hd^, l {kv_anno} hd^, l {kv_anno} vd^, e^, e^, {q_anno} -> l {q_anno} vd^, ?'
     else:
-        return f'l {q_anno} hd^, l {kv_anno} hd^, l {kv_anno} vd^, e^, e^, ? -> l {q_anno} vd^'
+        return f'l {q_anno} hd^, l {kv_anno} hd^, l {kv_anno} vd^, e^, e^, ? -> l {q_anno} vd^, ?'
 
 
 def input_gen_fn(node: IRDimops):

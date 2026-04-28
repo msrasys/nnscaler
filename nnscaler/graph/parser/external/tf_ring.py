@@ -138,7 +138,7 @@ try:
                 key_states = key_states.reshape(-1, key_states.size(-2), key_states.size(-1))
                 value_states = value_states.reshape(-1, value_states.size(-2), value_states.size(-1))
 
-            attn_output = wrap_ring_attn_varlen_func(
+            attn_output, _ = wrap_ring_attn_varlen_func(
                 query_states,
                 key_states,
                 value_states,

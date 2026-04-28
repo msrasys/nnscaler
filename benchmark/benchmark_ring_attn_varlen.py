@@ -45,11 +45,12 @@ class RingAttnVarlenBenchmark(RingAttnBenchmarkBase):
                 super(TestModule, self).__init__()
 
             def forward(self, q, k, v, cu_seqlens_q, cu_seqlens_k):
-                return wrap_ring_attn_varlen_func(
+                output, _ = wrap_ring_attn_varlen_func(
                     q, k, v, cu_seqlens_q, cu_seqlens_k, None,
                     causal=getattr(config, 'causal', True),
                     window_size=getattr(config, 'window_size', (-1, -1))
                 )
+                return output
 
         return TestModule()
 
@@ -87,7 +88,7 @@ class RingAttnVarlenBenchmark(RingAttnBenchmarkBase):
         cu_seqlens_q = inputs['cu_seqlens_q']
         cu_seqlens_k = inputs['cu_seqlens_k']
         
-        output = wrap_ring_attn_varlen_func(
+        output, _ = wrap_ring_attn_varlen_func(
             q, k, v, cu_seqlens_q, cu_seqlens_k, None,
             causal=getattr(config, 'causal', True),
             window_size=getattr(config, 'window_size', (-1, -1))

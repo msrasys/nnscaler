@@ -23,7 +23,7 @@ class TestModule(torch.nn.Module):
         self.window_size = window_size
 
     def forward(self, q, k, v, cu_seqlens_q, cu_seqlens_k):
-        out = wrap_ring_attn_varlen_func(
+        out, _ = wrap_ring_attn_varlen_func(
             q, k, v, cu_seqlens_q, cu_seqlens_k, None,
             causal=self.causal,
             window_size=self.window_size
@@ -69,7 +69,7 @@ class RingAttnVarlenRunner(RingAttnRunnerBase):
 
     def run_single_gpu_reference(self, inputs, config):
         """Run single GPU reference implementation"""
-        single_out = wrap_ring_attn_varlen_func(
+        single_out, _ = wrap_ring_attn_varlen_func(
             inputs['q'], inputs['k'], inputs['v'],
             inputs['cu_seqlens_q'], inputs['cu_seqlens_k'], None,
             causal=config.causal,
