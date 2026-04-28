@@ -44,8 +44,8 @@ class MuonMixin:
 
         for p in unflattened_params:
             if dmeta := get_dparam_meta(p):
-                if dmeta.sub_shape != dmeta.shape:
-                    raise ValueError("Muon does not support TP.")
+                if dmeta.sub_shape[-2:] != dmeta.shape[-2:]:
+                    raise ValueError("Muon does not support TP on last two dimensions.")
                 if dmeta.sub_shape != p.shape:
                     raise ValueError("Muon does not support ZeRO3.")
             else:
