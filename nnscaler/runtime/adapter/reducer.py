@@ -1045,10 +1045,12 @@ class Reducer:
                 self.buffer_length += max_group_size * self._zero_size
             else:
                 if zero_param_level_sharding:
-                    _logger.warning(
-                        f"the number of parameters in the bucket {len(params)} is smaller than "
-                        f"the number of ranks in the zero group {self._zero_size}, "
-                        f"ZeRO parameter-level sharding is skipped for this bucket."
+                    raise RuntimeError(
+                        f"the number of parameters({len(params)}) in the bucket  is smaller than "
+                        f"the number of ranks({self._zero_size}) in the zero group."
+                        f"ZeRO parameter-level sharding cannot be applied for this bucket."
+                        f"Please disable ZeRO or disable "
+                        f"parameter-level sharding or increase bucket size."
                     )
                 chunk_offset = 0
                 for idx, ps in enumerate(param_sizes):
