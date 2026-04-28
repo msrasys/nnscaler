@@ -9,8 +9,6 @@ import torch
 import torch.distributed as dist
 from flash_attn import flash_attn_varlen_func
 
-from .utils import apply_sink_gate
-
 try:
     from flash_attn.cute import flash_attn_varlen_func as flash_attn_cute_varlen_func
 except ImportError:
@@ -223,7 +221,6 @@ def zigzag_allgather_attn_varlen_func(
     deterministic: bool = False,
     use_cute: bool = False,
     window_size: Tuple[int, int] = (-1, -1),
-    learnable_sink: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     assert process_group is not None and dist.get_world_size(process_group) > 1, (
         "zigzag_allgather_attn_varlen_func only handles the multi-GPU CP branch"
@@ -279,12 +276,5 @@ def zigzag_allgather_attn_varlen_func(
     output = front_output.new_empty((q.shape[0],) + front_output.shape[1:])
     output[metadata.q_front_idx] = front_output
     output[metadata.q_end_idx] = end_output
-
-    if learnable_sink is not None:
-        nheads = front_lse.shape[0]
-        lse = front_lse.new_empty(nheads, q.shape[0])
-        lse[:, metadata.q_front_idx] = front_lse
-        lse[:, metadata.q_end_idx] = end_lse
-        output = apply_sink_gate(output, lse, learnable_sink)
 
     return output

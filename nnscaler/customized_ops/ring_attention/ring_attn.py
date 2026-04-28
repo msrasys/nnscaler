@@ -13,7 +13,7 @@ from flash_attn import flash_attn_func
 from nnscaler.runtime.device import DeviceGroup
 
 
-def wrap_ring_attn_func(q: Tensor, k: Tensor, v: Tensor, learnable_sink: Tensor=None,
+def wrap_ring_attn_func(q: Tensor, k: Tensor, v: Tensor,
                           softmax_scale: Tensor=None,
                           dropout_p: float=0.0, causal: bool=True, window_size: Tuple[int]=(-1, -1),
                           alibi_slopes: Tensor=None, deterministic: bool=False,
@@ -29,7 +29,6 @@ def wrap_ring_attn_func(q: Tensor, k: Tensor, v: Tensor, learnable_sink: Tensor=
 
     assert alibi_slopes is None, "alibi_slopes is not supported in ring_attn_func"
     assert return_attn_probs is False, "return_attn_probs is not supported in ring_attn_func"
-    assert learnable_sink is None, "learnable_sink requires use_cute which is not supported in wrap_ring_attn_func"
 
     if process_group is None or len(process_group) == 1:
         # there is an additional checker for the `softmax_scale`, which is equivalent
