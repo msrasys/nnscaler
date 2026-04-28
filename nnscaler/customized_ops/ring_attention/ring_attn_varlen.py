@@ -285,7 +285,7 @@ def wrap_ring_attn_varlen_func(
     if learnable_sink is not None:
         out = apply_sink_gate(out, softmax_lse, learnable_sink)
 
-    return out
+    return out, softmax_lse
 
 
 def emit_ring(node: IRDimops, args: List[str], kwargs: Dict[str, str], runtime_devid: int, plan_ndevs: int, runtime_ndevs: int) -> str:
