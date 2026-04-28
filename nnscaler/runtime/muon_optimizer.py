@@ -23,10 +23,8 @@ class MuonMixin:
         else:
             params = self._unflatten_params(params)
 
-        self.momentum_buffer_name = (
-            'momentum_buffer'
-            if not getattr(self, 'is_dion', None) is not None
-            else 'momentum'
+        self.momentum_buffer_name = getattr(
+            self, 'momentum_buffer_name', 'momentum_buffer'
         )
 
         super().__init__(params, **kwargs)

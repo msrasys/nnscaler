@@ -5,7 +5,7 @@ try:
     from dion import Muon as _Muon
 
     class Muon(MuonMixin, _Muon):
-        is_dion = True
+        momentum_buffer_name = 'momentum'
 
 except ImportError:
     pass
