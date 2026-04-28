@@ -170,6 +170,7 @@ class ScheduleCodeGen(FuncEmission):
         getitem_info = self._collect_getitem_info()
         if getitem_info:
             code = self._fix_undefined_nontensor_refs(code, getitem_info)
+        code = self._remove_dead_dataloader_reads(code)
         code = self._fix_undefined_backward_grads(code)
         # write to file
         if outfile:
@@ -225,17 +226,26 @@ class ScheduleCodeGen(FuncEmission):
         references a ``getitem_<prefix>_<tid>`` variable which has not been
         assigned, we insert ``var = _operator.getitem(samples_<tid2>, key)``
         using the co-occurring ``samples_*`` on the same line.
+
+        When no ``samples_*`` appears on the line (e.g. pipeline intermediate
+        stages that receive activations via adapters but still need data-derived
+        non-tensor inputs like ``context``), we emit a ``next(dataloader)`` call
+        to obtain the samples first.
         """
         lines = code.split('\n')
         new_lines = []
         defined_vars = set()
         in_function = False
+        dataloader_var = None
+        auto_samples_counter = 0
 
         for line in lines:
             stripped = line.lstrip()
             if stripped.startswith('def _train_step(') or stripped.startswith('def _infer_step('):
                 in_function = True
                 defined_vars = set()
+                dl_match = _re.search(r'\b(dataloader_\d+)\b', line)
+                dataloader_var = dl_match.group(1) if dl_match else None
             elif stripped.startswith('def ') and in_function:
                 in_function = False
 
@@ -248,24 +258,82 @@ class ScheduleCodeGen(FuncEmission):
 
                 if 'nnscaler.runtime.executor.fexecute(' in line:
                     refs = _re.findall(r'\b(getitem_(\w+?)_(\d+))\b', line)
-                    samples_match = _re.search(r'\b(samples_\d+)\b', line)
-                    if samples_match:
-                        samples_var = samples_match.group(1)
-                        indent = len(line) - len(line.lstrip())
-                        for full_name, prefix_part, tid in refs:
-                            if full_name in defined_vars:
-                                continue
-                            prefix = f'getitem_{prefix_part}'
-                            if prefix not in getitem_info:
-                                continue
-                            key = getitem_info[prefix]
-                            fix = ' ' * indent + f"{full_name} = _operator.getitem({samples_var}, '{key}')"
+                    undefined_refs = [
+                        (full_name, prefix_part, tid) for full_name, prefix_part, tid in refs
+                        if full_name not in defined_vars and f'getitem_{prefix_part}' in getitem_info
+                    ]
+                    if undefined_refs:
+                        samples_match = _re.search(r'\b(samples_\d+)\b', line)
+                        if samples_match:
+                            samples_var = samples_match.group(1)
+                        elif dataloader_var:
+                            samples_var = f'samples_auto_{auto_samples_counter}'
+                            auto_samples_counter += 1
+                            indent = len(line) - len(line.lstrip())
+                            fix = ' ' * indent + f"{samples_var} = next(*({dataloader_var}, ))"
                             new_lines.append(fix)
-                            defined_vars.add(full_name)
+                            defined_vars.add(samples_var)
+                        else:
+                            samples_var = None
+
+                        if samples_var:
+                            indent = len(line) - len(line.lstrip())
+                            for full_name, prefix_part, tid in undefined_refs:
+                                prefix = f'getitem_{prefix_part}'
+                                key = getitem_info[prefix]
+                                fix = ' ' * indent + f"{full_name} = _operator.getitem({samples_var}, '{key}')"
+                                new_lines.append(fix)
+                                defined_vars.add(full_name)
 
             new_lines.append(line)
 
         return '\n'.join(new_lines)
+
+    @staticmethod
+    def _remove_dead_dataloader_reads(code: str) -> str:
+        """Remove ``samples_* = next(dataloader)`` lines where the variable is never read.
+
+        In pipeline intermediate stages, the code generator emits next(dataloader)
+        for every microbatch, but the data is received via adapters, not from the
+        dataloader.  After _fix_undefined_nontensor_refs adds targeted reads for
+        non-tensor refs (e.g. context), the original dead reads must be pruned to
+        avoid exhausting the dataloader.
+        """
+        lines = code.split('\n')
+        next_assignments = []
+        for i, line in enumerate(lines):
+            m = _re.match(r'^\s+(samples_\w+)\s*=\s*next\(', line)
+            if m:
+                next_assignments.append((i, m.group(1)))
+        if not next_assignments:
+            return code
+
+        var_assignment_lines = {}
+        for i, var in next_assignments:
+            var_assignment_lines.setdefault(var, set()).add(i)
+
+        dead_vars = set()
+        for var, assign_lines in var_assignment_lines.items():
+            pattern = _re.compile(r'\b' + _re.escape(var) + r'\b')
+            used = False
+            for i, line in enumerate(lines):
+                if i in assign_lines:
+                    continue
+                if pattern.search(line):
+                    used = True
+                    break
+            if not used:
+                dead_vars.add(var)
+
+        if not dead_vars:
+            return code
+
+        dead_lines = set()
+        for i, var in next_assignments:
+            if var in dead_vars:
+                dead_lines.add(i)
+        lines = [l for i, l in enumerate(lines) if i not in dead_lines]
+        return '\n'.join(lines)
 
     @staticmethod
     def _fix_undefined_backward_grads(code: str) -> str:
@@ -321,8 +389,10 @@ class ScheduleCodeGen(FuncEmission):
                                 else:
                                     new_grad_names[i] = 'None'
                                 replaced_vars.add(gvar)
-                        new_grads_str = ', '.join(new_grad_names)
-                        if new_grads_str != grads_str:
+                        if new_grad_names != grad_names:
+                            new_grads_str = ', '.join(new_grad_names)
+                            if len(new_grad_names) == 1:
+                                new_grads_str += ','
                             line = line[:grads_match.start(1)] + new_grads_str + line[grads_match.end(1):]
 
                 if stripped.startswith('del ') and replaced_vars:
