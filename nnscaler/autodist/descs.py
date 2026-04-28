@@ -1,11 +1,9 @@
 #  Copyright (c) Microsoft Corporation.
 #  Licensed under the MIT License.
 
-from dataclasses import dataclass
-from typing import List, Dict, Tuple, Any, Optional
-import json
 import copy
-import yaml
+from dataclasses import dataclass
+from typing import Any, Dict, List, Tuple
 
 
 @dataclass
@@ -40,9 +38,19 @@ class TensorParallelDesc:
     mesh_desc: MeshDesc
     analysis: Dict[str, Any]
 
-    def to_json(self):
+    def to_json(self, cid2node=None):
         ret = {}
-        descs_list = [(k, v.desc) for k, v in self.partition_descs.items()]
+        if cid2node is not None:
+            descs_list = []
+            for k, v in self.partition_descs.items():
+                entry = {'cid': k, 'partition': v.desc}
+                node = cid2node.get(k)
+                if node is not None:
+                    entry['fqn'] = node.fqn
+                    entry['op'] = node.signature
+                descs_list.append(entry)
+        else:
+            descs_list = [(k, v.desc) for k, v in self.partition_descs.items()]
         ret['partition_descs'] = descs_list
         ret['recompute_groups'] = self.recompute_groups
         ret['mesh_desc'] = self.mesh_desc.to_json()
@@ -52,8 +60,14 @@ class TensorParallelDesc:
     @staticmethod
     def from_json(ret):
         partition_descs = {}
-        for k, v in ret['partition_descs']:
-            partition_descs[k] = NodePartitionDesc(v)
+        for item in ret['partition_descs']:
+            if isinstance(item, dict):
+                # new format: {"cid": ..., "partition": ..., "fqn": ..., "op": ...}
+                partition_descs[item['cid']] = NodePartitionDesc(item['partition'])
+            else:
+                # old format: [cid, desc]
+                k, v = item
+                partition_descs[k] = NodePartitionDesc(v)
         return TensorParallelDesc(partition_descs,
                                   copy.deepcopy(ret['recompute_groups']),
                                   MeshDesc.from_json(ret['mesh_desc']),
@@ -88,9 +102,9 @@ class PipelineParallelDesc:
     recompute_groups: List[List[int]]
     mesh_desc: MeshDesc
 
-    def to_json(self):
+    def to_json(self, cid2node=None):
         return {
-            'spmd_descs': [desc.to_json() for desc in self.spmd_descs],
+            'spmd_descs': [desc.to_json(cid2node=cid2node) for desc in self.spmd_descs],
             'recompute_groups': self.recompute_groups,
             'mesh_desc': self.mesh_desc.to_json(),
         }
@@ -113,9 +127,9 @@ class PipelineSearchOutput:
     stage_all_times: List[float]
     stage_comp_times: List[float]
 
-    def to_json(self):
+    def to_json(self, cid2node=None):
         return {
-            'desc': self.desc.to_json(),
+            'desc': self.desc.to_json(cid2node=cid2node),
             'e2e_time': self.e2e_time,
             'stage_mems': self.stage_mems,
             'stage_all_times': self.stage_all_times,
