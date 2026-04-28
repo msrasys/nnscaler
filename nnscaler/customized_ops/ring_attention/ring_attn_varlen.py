@@ -3,6 +3,7 @@
 
 from typing import Tuple, List, Dict, Optional
 import torch
+import os
 from torch import Tensor
 import torch.distributed as dist
 import warnings
@@ -15,11 +16,24 @@ from flash_attn import flash_attn_varlen_func
 from .core.ring_attn_varlen_implementation import llama3_flash_attn_prepare_cu_seqlens, llama3_flash_attn_varlen_func
 from .core.utils import gen_head_anno
 from .varlen_utils import shuffle_varlen, unshuffle_varlen
+from .core.utils import apply_sink_gate
 
-# Try to import TransformerEngine with version check
+try:
+    from flash_attn.cute import flash_attn_varlen_func as flash_attn_cute_varlen_func
+except ImportError as e:
+    print(f"flash_attn.cute not available: {e}")
+    flash_attn_cute_varlen_func = None
+
+# Try to import TransformerEngine with version check and optional CP enable via env var.
+# Usage control:
+#   Set environment variable ENABLE_TE_CP=1 to enable TransformerEngine context-parallel (CP) attention.
+#   Default (unset or 0) will disable CP usage even if TE is installed.
 _HAS_TRANSFORMER_ENGINE = False
 _TE_VERSION_OK = False
 attn_forward_func_with_cp = None
+
+# Read environment variable switch (string compare to '1').
+_ENABLE_TE_CP = os.getenv("ENABLE_TE_CP", "0") == "1"
 
 try:
     import transformer_engine
@@ -80,7 +94,8 @@ def get_transformer_engine_info() -> Dict[str, any]:
     return {
         "has_transformer_engine": _HAS_TRANSFORMER_ENGINE,
         "version_ok": _TE_VERSION_OK,
-        "has_cp_function": attn_forward_func_with_cp is not None,
+    "has_cp_function": attn_forward_func_with_cp is not None,
+    "env_enable_cp": _ENABLE_TE_CP,
         "version": getattr(transformer_engine, "__version__", None) if _HAS_TRANSFORMER_ENGINE else None,
         "required_version": "2.2.0+",
     }
@@ -97,7 +112,8 @@ def print_transformer_engine_status():
         print(f"  - CP Function Available: {info['has_cp_function']}")
     else:
         print(f"  - Required Version: {info['required_version']}")
-    print(f"  - Will use TE CP: {info['has_transformer_engine'] and info['version_ok'] and info['has_cp_function']}")
+    print(f"  - Env ENABLE_TE_CP=1: {info['env_enable_cp']}")
+    print(f"  - Will use TE CP: {info['has_transformer_engine'] and info['version_ok'] and info['has_cp_function'] and info['env_enable_cp']}")
 
 
 def wrap_ring_attn_varlen_func(
@@ -107,12 +123,15 @@ def wrap_ring_attn_varlen_func(
         cu_seqlens_q: Tensor,
         cu_seqlens_k: Tensor,
         alibi_slopes: Tensor,
+        learnable_sink: Tensor = None,
         dropout_p: float = 0.0,
         softmax_scale: Tensor = None,
         causal: bool = False,
         window_size: Tuple[int] = (-1, -1),
         deterministic: bool = False,
         return_attn_probs: bool = False,
+        enable_ring: bool = True,
+        use_cute:  bool = False,
         process_group: Tuple[int] = None,
 ):
     '''
@@ -123,20 +142,39 @@ def wrap_ring_attn_varlen_func(
     required communications.
     '''
     assert not return_attn_probs, "return_attn_probs is not supported in ring-attention"
+    if learnable_sink is not None:
+        assert use_cute, "learnable_sink requires use_cute=True"
     max_seqlen_q = (cu_seqlens_q[1:] - cu_seqlens_q[:-1]).max().item()
     max_seqlen_k = (cu_seqlens_k[1:] - cu_seqlens_k[:-1]).max().item()
 
-    if process_group is None or len(process_group) == 1:
-        output = flash_attn_varlen_func(
-            q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k,
-            dropout_p=dropout_p,
-            softmax_scale=softmax_scale,
-            causal=causal,
-            window_size=window_size,
-            alibi_slopes=alibi_slopes,
-            deterministic=deterministic,
-            return_attn_probs=False,
-        )
+    if process_group is None or len(process_group) == 1 or not enable_ring:
+        if use_cute:
+            assert flash_attn_cute_varlen_func is not None, "flash_attn.cute is not available"
+            cute_window_size = tuple(None if w == -1 else w for w in window_size)
+            output, lse = flash_attn_cute_varlen_func(
+                q, k, v,
+                cu_seqlens_q=cu_seqlens_q,
+                cu_seqlens_k=cu_seqlens_k,
+                softmax_scale=softmax_scale,
+                causal=causal,
+                window_size=cute_window_size,
+                deterministic=deterministic,
+                return_lse=True,
+            )
+            if learnable_sink is not None:
+                output = apply_sink_gate(output, lse, learnable_sink)
+            return output
+        else:
+            output = flash_attn_varlen_func(
+                q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k,
+                dropout_p=dropout_p,
+                softmax_scale=softmax_scale,
+                causal=causal,
+                window_size=window_size,
+                alibi_slopes=alibi_slopes,
+                deterministic=deterministic,
+                return_attn_probs=False,
+            )
         return output
 
     assert len(q.shape) == 3, "q must have shape [total_q, qh, dim]"
@@ -158,9 +196,10 @@ def wrap_ring_attn_varlen_func(
     if local_process_group is None:
         local_process_group = dist.group.WORLD
 
-    if window_size == (-1, -1):
+    if window_size == (-1, -1) and not use_cute:
         # Use TransformerEngine with context parallelism if available and version is OK
-        if _HAS_TRANSFORMER_ENGINE and _TE_VERSION_OK and attn_forward_func_with_cp is not None:
+        # Only use TransformerEngine CP path if env flag is enabled
+        if _ENABLE_TE_CP and _HAS_TRANSFORMER_ENGINE and _TE_VERSION_OK and attn_forward_func_with_cp is not None:
             shuffled_q = shuffle_varlen(q, cu_seqlens_q, process_group, local_process_group)
             shuffled_k = shuffle_varlen(k, cu_seqlens_k, process_group, local_process_group)
             shuffled_v = shuffle_varlen(v, cu_seqlens_k, process_group, local_process_group)
@@ -203,10 +242,13 @@ def wrap_ring_attn_varlen_func(
             return output
         else:
             # Fallback to basic ring attention implementation
-            warnings.warn(
-                "TransformerEngine not available or version incompatible. "
-                "Using basic ring attention implementation which may be slower."
-            )
+            if _ENABLE_TE_CP:
+                # User requested CP but TE unavailable/incompatible
+                warnings.warn(
+                    "ENABLE_TE_CP=1 set but TransformerEngine CP attention unavailable (missing or incompatible). "
+                    "Falling back to basic ring attention implementation."
+                )
+            # If not enabled, remain silent (no warning spam) unless TE missing earlier already warned.
 
     (
         local_cu_seqlens_q,
@@ -221,7 +263,7 @@ def wrap_ring_attn_varlen_func(
         world_size=local_world_size,
     )
 
-    output = llama3_flash_attn_varlen_func(
+    out, softmax_lse = llama3_flash_attn_varlen_func(
         q,
         k,
         v,
@@ -236,11 +278,14 @@ def wrap_ring_attn_varlen_func(
         window_size=window_size,
         alibi_slopes=alibi_slopes,
         deterministic=deterministic,
-        return_attn_probs=False,
         group=local_process_group,
+        use_cute=use_cute,
     )
 
-    return output
+    if learnable_sink is not None:
+        out = apply_sink_gate(out, softmax_lse, learnable_sink)
+
+    return out
 
 
 def emit_ring(node: IRDimops, args: List[str], kwargs: Dict[str, str], runtime_devid: int, plan_ndevs: int, runtime_ndevs: int) -> str:
@@ -278,12 +323,11 @@ def emit_ring(node: IRDimops, args: List[str], kwargs: Dict[str, str], runtime_d
     return f"{signature}({args})"
 
 
-def flash_attention_anno(query_states, key_states, value_states, cu_seqlens_q, cu_seqlens_k, alibi_slopes, *args, **kwargs) -> str:
+def flash_attention_anno(query_states, key_states, value_states, cu_seqlens_q, cu_seqlens_k, alibi_slopes, learnable_sink=None, *args, **kwargs) -> str:
     q_anno, kv_anno = gen_head_anno(query_states, key_states, value_states, head_pos=1)
-    if isinstance(alibi_slopes, IRTensor):
-        return f'l {q_anno} hd^, l {kv_anno} hd^, l {kv_anno} vd^, e^, e^, {q_anno} -> l {q_anno} vd^'
-    else:
-        return f'l {q_anno} hd^, l {kv_anno} hd^, l {kv_anno} vd^, e^, e^, ? -> l {q_anno} vd^'
+    alibi_anno = f'{q_anno}' if isinstance(alibi_slopes, IRTensor) else '?'
+    sink_anno = f'{q_anno}' if isinstance(learnable_sink, IRTensor) else '?'
+    return f'l {q_anno} hd^, l {kv_anno} hd^, l {kv_anno} vd^, e^, e^, {alibi_anno}, {sink_anno} -> l {q_anno} vd^'
 
 
 def input_gen_fn(node: IRDimops):
@@ -295,7 +339,7 @@ def input_gen_fn(node: IRDimops):
             inputs.append(torch.randn(t.shape, dtype=t.dtype, device=device, requires_grad=t.requires_grad))
         elif i in [3, 4]: # cu_seqlens
             inputs.append(torch.Tensor([0, seqlen]).to(torch.int32).to(device))
-        elif i == 5: # optional alibi_slopes
+        elif i in [5, 6]: # optional alibi_slopes, learnable_sink
             if isinstance(t, IRTensor):
                 inputs.append(torch.randn(t.shape, dtype=t.dtype, device=device, requires_grad=t.requires_grad))
             else:

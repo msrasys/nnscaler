@@ -16,7 +16,8 @@ import torch.distributed as dist
 from nnscaler.runtime.device import DeviceGroup
 
 
-def wrap_zigzag_attn_func(q: Tensor, k: Tensor, v: Tensor, softmax_scale: Tensor=None,
+def wrap_zigzag_attn_func(q: Tensor, k: Tensor, v: Tensor, learnable_sink: Tensor=None,
+                          softmax_scale: Tensor=None,
                           dropout_p: float=0.0, causal: bool=True, window_size: Tuple[int]=(-1, -1),
                           alibi_slopes: Tensor=None, deterministic: bool=False,
                           return_attn_probs: bool=False,
@@ -32,6 +33,7 @@ def wrap_zigzag_attn_func(q: Tensor, k: Tensor, v: Tensor, softmax_scale: Tensor
     assert window_size == (-1, -1), "window_size is not supported in zigzag-attention"
     assert not return_attn_probs, "return_attn_probs is not supported in zigzag-attention"
     assert alibi_slopes is None, "alibi_slopes is not supported in zigzag-attention"
+    assert learnable_sink is None, "learnable_sink requires use_cute which is not supported in wrap_zigzag_attn_func"
 
     if process_group is None or len(process_group) == 1:
         # there is an additional checker for the `softmax_scale`, which is equivalent
