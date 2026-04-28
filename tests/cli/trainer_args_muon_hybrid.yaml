@@ -14,7 +14,7 @@ pas_policy: dp
 micro_batch_size: 2
 global_batch_size: 8
 max_epochs: 4
-max_train_steps: 30
+max_train_steps: 100
 seed: 0
 precision: fp32
 enable_progress_bar: false

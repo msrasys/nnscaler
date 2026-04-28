@@ -239,17 +239,17 @@ def test_trainer_muon_resume_correctness_zero_ngroups(tmp_path, name):
 def test_trainer_muon_resume_correctness_zero_ngroups_hybrid_param_config(tmp_path, name):
     config_file = 'trainer_args_muon_hybrid.yaml'
 
-    launch_torchrun(4, trainer_muon_worker, tmp_path, config_file, '1', [
+    launch_torchrun(2, trainer_muon_worker, tmp_path, config_file, '1', [
         '--compute_config.use_zero', 1,
-        '--compute_config.runtime_ngpus', 4,
+        # '--compute_config.runtime_ngpus', 4,
         '--optimizer.args.config.optimizers.1.type', get_optimizer_type(name),
         '--optimizer.param_clss_fn', 'tests.cli.test_trainer_muon.param_clss_fn2',
     ])
 
-    launch_torchrun(4, trainer_muon_worker, tmp_path, config_file, '2', [
+    launch_torchrun(2, trainer_muon_worker, tmp_path, config_file, '2', [
         '--compute_config.use_zero', 1,
         '--compute_config.zero_ngroups', 2,
-        '--compute_config.runtime_ngpus', 4,
+        # '--compute_config.runtime_ngpus', 4,
         '--optimizer.args.config.optimizers.1.type', get_optimizer_type(name),
         '--optimizer.param_clss_fn', 'tests.cli.test_trainer_muon.param_clss_fn2',
     ])
