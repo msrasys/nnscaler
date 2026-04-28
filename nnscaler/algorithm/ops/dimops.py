@@ -170,7 +170,7 @@ class DimSplitEinops(GenericDistAlgo):
             inputs = [t[nid] for t in ins]
             outputs = [t[nid] for t in ous]
             kwargs = rule.modifier()(node.kwargs, idx, dim, num, nid)
-            sub_node: IRDimops = node.new(inputs, outputs, **kwargs)
+            sub_node: IRDimops = node.new(inputs, outputs, no_grad_reduce_inputs=rule.no_grad_reduce_inputs, **kwargs)
             sub_node.verify_shape()
             sub_nodes.append(sub_node)
 
@@ -249,7 +249,16 @@ class DimSplitEinops(GenericDistAlgo):
                 updated_kwargs[adim] = updated_kwargs[adim] // num
             return updated_kwargs
 
-        return TransformRule(itransform, otransform, modify)
+        # collect inputs whose grad should not be reduced when splitting on adim
+        no_grad_reduce_inputs = []
+        for input_idx, ianno in enumerate(node.anno.inputs()):
+            if ianno.no_grad_reduce_for(adim):
+                no_grad_reduce_inputs.append(input_idx)
+
+        return TransformRule(
+            itransform, otransform, modify,
+            no_grad_reduce_inputs=no_grad_reduce_inputs,
+        )
 
 
 def collect_split_info(node: IRDimops):
