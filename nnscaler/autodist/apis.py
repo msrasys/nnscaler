@@ -1,29 +1,29 @@
 #  Copyright (c) Microsoft Corporation.
 #  Licensed under the MIT License.
 
-from .spmd_solver import calc_optimal_spmd_plan, analysis_pretty_printer
-from .pipeline_solver import calc_optimal_pp_plan
-from .autodist_config import AutoDistConfig
-from .model_graph import ModelGraph, estimate_mem_lower_bound
-from .descs import *
-from .util import replica, partition_node
+import copy
+import json
+import logging
+from collections import defaultdict
+from pathlib import Path
+from typing import Dict, List
 
 from nnscaler.graph import IRGraph
-from nnscaler.graph.segment import IRSegment
-from nnscaler.ir.operator import IRDataOperation, IRFwOperation
-from nnscaler.ir.tensor import IRSubTensor
-from nnscaler.ir import IRCell
 from nnscaler.graph.function import IRDimops
 from nnscaler.graph.function.anchor import IRGraphAnchor
 from nnscaler.graph.function.pyfunc import IRPyFunc
 from nnscaler.graph.schedule.predefined import PredefinedSched
+from nnscaler.graph.segment import IRSegment
+from nnscaler.ir import IRCell
+from nnscaler.ir.operator import IRDataOperation, IRFwOperation
+from nnscaler.ir.tensor import IRSubTensor
 
-import json
-import logging
-import copy
-from typing import Dict, List
-from pathlib import Path
-from collections import defaultdict
+from .autodist_config import AutoDistConfig
+from .descs import *
+from .model_graph import ModelGraph, estimate_mem_lower_bound
+from .pipeline_solver import calc_optimal_pp_plan
+from .spmd_solver import analysis_pretty_printer, calc_optimal_spmd_plan
+from .util import partition_node, replica
 
 _logger = logging.getLogger(__name__)
 
@@ -106,6 +106,27 @@ def calc_parallel_plan(graph: IRGraph,
     return pp_out
 
 
+def _write_plan_json(plan_json, f):
+    """Write plan JSON with compact one-line partition_descs entries.
+
+    Each entry in partition_descs is rendered as a single line like:
+        {"cid": 11, "partition": [[[0, 0], 2]], "fqn": "...", "op": "..."}
+    while the rest of the JSON uses standard indent=2 pretty-printing.
+    """
+    plan_json = copy.deepcopy(plan_json)
+    markers = {}
+    for spmd in plan_json.get('desc', {}).get('spmd_descs', []):
+        for i, entry in enumerate(spmd.get('partition_descs', [])):
+            if isinstance(entry, dict) and 'cid' in entry:
+                marker = f'__COMPACT_{entry["cid"]}__'
+                markers[f'"{marker}"'] = json.dumps(entry, separators=(', ', ': '))
+                spmd['partition_descs'][i] = marker
+    text = json.dumps(plan_json, indent=2)
+    for marker, compact in markers.items():
+        text = text.replace(marker, compact)
+    f.write(text)
+
+
 def parallelize_graph(graph: IRGraph,
                       autodist_config: AutoDistConfig) -> IRGraph:
     segments: List[IRSegment] = graph.select(ntype=IRSegment)
@@ -122,8 +143,14 @@ def parallelize_graph(graph: IRGraph,
 
         if autodist_config.save_plan_path:
             _logger.info(f'save plan to {autodist_config.save_plan_path}')
+            # build cid-to-node mapping for annotating plan with fqn/op
+            cid2node_for_save: Dict[int, IRFwOperation] = {}
+            for node in graph.nodes():
+                if isinstance(node, IRFwOperation):
+                    cid2node_for_save[node.cid] = node
+            plan_json = search_out.to_json(cid2node=cid2node_for_save)
             with open(autodist_config.save_plan_path, 'w') as f:
-                json.dump(search_out.to_json(), f, indent=2)
+                _write_plan_json(plan_json, f)
 
     _logger.info(f'use plan with e2e time/s {1000 * search_out.e2e_time:.2f}ms')
     pp_desc = search_out.desc
