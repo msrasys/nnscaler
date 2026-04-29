@@ -341,3 +341,4 @@ def reduce_scatter(tensor: torch.Tensor, dim: int, process_group: dist.ProcessGr
     otensor = torch.empty_like(itensors[0], requires_grad=False)
     torch.distributed.reduce_scatter(otensor, itensors, group=process_group)
     return otensor
+
