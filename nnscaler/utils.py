@@ -667,13 +667,17 @@ class MuonOptState(TypedDict):
     momentum_buffer: torch.Tensor
 
 
+class DionOptState(TypedDict):
+    momentum: torch.Tensor
+
+
 class OptStateParamGroup(TypedDict):
     params: list[int]
     lr: float
 
 
 class OptStateDict(TypedDict):
-    state: dict[int, AdamOptState | MuonOptState]
+    state: dict[int, AdamOptState | MuonOptState | DionOptState]
     param_groups: list[OptStateParamGroup]
 
 

@@ -23,6 +23,10 @@ class MuonMixin:
         else:
             params = self._unflatten_params(params)
 
+        self.momentum_buffer_name = getattr(
+            self, 'momentum_buffer_name', 'momentum_buffer'
+        )
+
         super().__init__(params, **kwargs)
 
     def _unflatten_params(self, params):
@@ -40,8 +44,8 @@ class MuonMixin:
 
         for p in unflattened_params:
             if dmeta := get_dparam_meta(p):
-                if dmeta.sub_shape != dmeta.shape:
-                    raise ValueError("Muon does not support TP.")
+                if dmeta.sub_shape[-2:] != dmeta.shape[-2:]:
+                    raise ValueError("Muon does not support TP on last two dimensions.")
                 if dmeta.sub_shape != p.shape:
                     raise ValueError("Muon does not support ZeRO3.")
             else:
@@ -69,10 +73,10 @@ class MuonMixin:
                 elif any(i in state['state'] for i in param_indices):
                     # need to flatten the states
                     embeded_states = [
-                        state['state'][i]['momentum_buffer'] if i in state['state'] else None
+                        state['state'][i][self.momentum_buffer_name] if i in state['state'] else None
                         for i in param_indices
                     ]
-                    new_param_states[flat_idx] = {'momentum_buffer': fpi.flatten(embeded_states, device='cpu')}
+                    new_param_states[flat_idx] = {self.momentum_buffer_name: fpi.flatten(embeded_states, device='cpu')}
                 #else: no state for this flattened param
 
             state['state'] = new_param_states
@@ -95,10 +99,10 @@ class MuonMixin:
                 new_param_states[param_indices[0]] = state_dict['state'][flat_idx]
             else:
                 # need to unflatten the states
-                flat_state = state_dict['state'][flat_idx]['momentum_buffer']
+                flat_state = state_dict['state'][flat_idx][self.momentum_buffer_name]
                 embeded_states = fpi.unflatten(flat_state, device='cpu')
                 for i, param_idx in enumerate(param_indices):
-                    new_param_states[param_idx] = {'momentum_buffer': embeded_states[i]}
+                    new_param_states[param_idx] = {self.momentum_buffer_name: embeded_states[i]}
         state_dict['state'] = new_param_states
         param_count = sum(len(v[1]) for v in self._flat_map.values())
         state_dict['param_groups'][0]['params'] = list(range(param_count))

@@ -10,7 +10,7 @@ import torch
 from torch.utils.hooks import RemovableHandle
 
 from nnscaler.runtime.device import DeviceGroup
-from nnscaler.runtime.utils import split_array_min_max, set_fparam_meta
+from nnscaler.runtime.utils import split_array_min_max, set_fparam_meta, get_grad_dtype, set_grad_dtype
 from nnscaler.profiler.timer import CudaTimer
 from nnscaler.flags import RuntimeFlag
 from nnscaler.utils import unchecked_fields, first
@@ -389,6 +389,8 @@ class Bucket:
         # build parameter for optimizer (shared storage).
         # Its gradient will be updated everytime calling `self.sync_grads()`
         self._param_for_optimizer = torch.nn.Parameter(self._get_opt_param_data())
+        if self._contiguous_grads.dtype != self._param_for_optimizer.dtype:
+            set_grad_dtype(self._param_for_optimizer, self._contiguous_grads.dtype)
         set_fparam_meta(self._param_for_optimizer, self._flatten_param_info)
 
     def register_hooks(self):
@@ -880,8 +882,9 @@ class Reducer:
 
     def _allocate_buffers(self):
         # gradient buffer
+        grad_dtype = get_grad_dtype(self._params[0])
         self._contiguous_grads: torch.Tensor = torch.zeros(
-            (self.buffer_length,), dtype=self._params[0].dtype,
+            (self.buffer_length,), dtype=grad_dtype,
             device=torch.cuda.current_device(), requires_grad=False)
         # parameter buffer
         self._contiguous_params: torch.Tensor = torch.zeros(
@@ -1042,10 +1045,12 @@ class Reducer:
                 self.buffer_length += max_group_size * self._zero_size
             else:
                 if zero_param_level_sharding:
-                    _logger.warning(
-                        f"the number of parameters in the bucket {len(params)} is smaller than "
-                        f"the number of ranks in the zero group {self._zero_size}, "
-                        f"ZeRO parameter-level sharding is skipped for this bucket."
+                    raise RuntimeError(
+                        f"the number of parameters({len(params)}) in the bucket  is smaller than "
+                        f"the number of ranks({self._zero_size}) in the zero group."
+                        f"ZeRO parameter-level sharding cannot be applied for this bucket."
+                        f"Please disable ZeRO or disable "
+                        f"parameter-level sharding or increase bucket size."
                     )
                 chunk_offset = 0
                 for idx, ps in enumerate(param_sizes):

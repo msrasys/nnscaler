@@ -3,7 +3,7 @@
 
 r"""Runtime Utilities"""
 
-from typing import Any, List, TYPE_CHECKING, Optional
+from typing import Any, List, TYPE_CHECKING, Optional, Union
 import logging
 import heapq
 
@@ -282,3 +282,31 @@ def set_dparam_meta(param: torch.nn.Parameter, meta: 'AttrMeta'):
     Set the distributed meta information of a parameter.
     """
     setattr(param, DISTRIBUTED_PARAM_META_KEY, meta)
+
+
+def set_grad_dtype(
+        module_or_param: Union[torch.nn.Module, torch.nn.Parameter],
+        dtype: Optional[torch.dtype],
+        *,
+        raise_on_unsupported: bool = True
+):
+    if dtype is None:
+        return
+    if torch.__version__ < (2, 10):
+        if raise_on_unsupported:
+            raise RuntimeError(f'Setting grad dtype is only supported in PyTorch 2.10 or above, but got {torch.__version__}')
+        return
+    if isinstance(module_or_param, torch.nn.Module):
+        for param in module_or_param.parameters():
+            if param.requires_grad:
+                param.grad_dtype = dtype
+    else:
+        assert isinstance(module_or_param, torch.nn.Parameter)
+        module_or_param.grad_dtype = dtype
+
+
+def get_grad_dtype(param: torch.nn.Parameter) -> torch.dtype:
+    """
+    Get the gradient dtype of a parameter.
+    """
+    return getattr(param, 'grad_dtype', param.dtype)

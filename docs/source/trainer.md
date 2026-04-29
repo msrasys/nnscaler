@@ -851,11 +851,26 @@ Please note
   as the initial state dict of the model. Default is `None`.
 - `precision`(`Union[str, Dict[_TENSOR_TYPE, _PRECISION_TYPE], None]`):
   The precision of the model. It can be a `str`, which means the same
-  precision for all tensors, or a `Dict[_TENSOR_TYPE, _PRECISION_TYPE]`,
+  precision for all tensors (except `grad`), or a `Dict[_TENSOR_TYPE, _PRECISION_TYPE]`,
   which means the precision for each tensor type. Default is `None`.
-  Currently we support 3 tensor types (`param`, `buffer`, `input`) and
+  Currently we support 4 tensor types (`param`, `buffer`, `input`, `grad`) and
   three precisions (`fp32`, `fp16`, `bf16`). You can set precision to
   `none` to avoid any precision conversion.
+
+  When a `str` is provided, it applies to `param`, `buffer`, and `input`;
+  `grad` defaults to `none` (i.e., same dtype as the parameter). To set
+  `grad` precision, use a dict, e.g.,
+  `{'param': 'bf16', 'buffer': 'bf16', 'input': 'bf16', 'grad': 'fp32'}`.
+  You can also use the shorthand key `'pbi'` to set `param`, `buffer`,
+  and `input` at once: `{'pbi': 'bf16', 'grad': 'fp32'}`.
+
+  Setting `grad` to a higher precision (e.g., `fp32` with `bf16` params)
+  uses PyTorch's `grad_dtype` attribute (requires PyTorch >= 2.10) so
+  that the autograd engine accumulates gradients in the specified dtype.
+  This improves gradient reduction accuracy and avoids overflow in
+  all-reduce, but the optimizer must be able to handle the dtype
+  mismatch between parameters and their gradients.(`nnscaler.runtime.f16_optimizer.Mixed*` can handle mixed precision between parameters and gradients, but optimizers in `torch.optim` may not support this and could fail.)
+
 - `micro_batch_size` (`int`): The micro batch size. Default is `1`.
 - `global_batch_size` (`Optional[int]`) and `grad_accumulation_steps`
   (`Optional[int]`): You can set one of `global_batch_size` and
