@@ -113,40 +113,18 @@ def _write_plan_json(plan_json, f):
         {"cid": 11, "partition": [[[0, 0], 2]], "fqn": "...", "op": "..."}
     while the rest of the JSON uses standard indent=2 pretty-printing.
     """
+    plan_json = copy.deepcopy(plan_json)
+    markers = {}
+    for spmd in plan_json.get('desc', {}).get('spmd_descs', []):
+        for i, entry in enumerate(spmd.get('partition_descs', [])):
+            if isinstance(entry, dict) and 'cid' in entry:
+                marker = f'__COMPACT_{entry["cid"]}__'
+                markers[f'"{marker}"'] = json.dumps(entry, separators=(', ', ': '))
+                spmd['partition_descs'][i] = marker
     text = json.dumps(plan_json, indent=2)
-    # Post-process: collapse each partition_descs entry dict onto one line.
-    # These appear as multi-line dicts within the "partition_descs" array
-    # that contain a "cid" key. We match opening `{` with `"cid"` and
-    # collapse everything up to the matching `}`.
-    result = []
-    lines = text.split('\n')
-    i = 0
-    while i < len(lines):
-        stripped = lines[i].lstrip()
-        if stripped.startswith('{') and i + 1 < len(lines) and '"cid"' in lines[i + 1]:
-            # Collect lines until the closing brace at the same indent level
-            indent = len(lines[i]) - len(stripped)
-            brace_depth = 0
-            collected = []
-            j = i
-            while j < len(lines):
-                for ch in lines[j]:
-                    if ch == '{':
-                        brace_depth += 1
-                    elif ch == '}':
-                        brace_depth -= 1
-                collected.append(lines[j].strip())
-                if brace_depth == 0:
-                    break
-                j += 1
-            compact = ' '.join(collected)
-            # re-add proper indentation
-            result.append(' ' * indent + compact)
-            i = j + 1
-        else:
-            result.append(lines[i])
-            i += 1
-    f.write('\n'.join(result))
+    for marker, compact in markers.items():
+        text = text.replace(marker, compact)
+    f.write(text)
 
 
 def parallelize_graph(graph: IRGraph,
