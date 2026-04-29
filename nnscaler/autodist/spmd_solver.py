@@ -7,6 +7,8 @@ from .descs import *
 from .cost_database import CostDatabase
 from .autodist_config import AutoDistConfig
 from .op_partition import OpPartition, generate_partitions
+from .constraints import ConstraintSet, PartitionConstraintV2
+from .constraint_validator import validate_constraints
 from nnscaler.graph.function.dimops import IRDimops
 from nnscaler.ir import IRTensor
 
@@ -168,7 +170,12 @@ class SPMDSolver:
         self.graph = graph
         self.pcs: Dict[str, Dict[str, PartitionConstraint]] = dict()
         self.non_used_pcs: Set[PartitionConstraint] = set()
-        if autodist_config.pc_path:
+        # V2 constraint system (takes priority over legacy pc_path)
+        self._constraint_set = autodist_config.constraints
+        if self._constraint_set is not None:
+            self._constraint_set.reset_matched()
+            _logger.info('using V2 constraint system')
+        elif autodist_config.pc_path:
             self._load_partition_constraints(autodist_config.pc_path)
         else:
             _logger.info('no partition constraint is loaded')
@@ -182,6 +189,7 @@ class SPMDSolver:
     def initialize(self):
         self.build_cut_ops()
         self.init_op_partitions()
+        self._apply_v2_recompute_constraints()
         self.build_following_relationships()
         self.calc_partition_info()
 
@@ -207,6 +215,128 @@ class SPMDSolver:
                 self.pcs = dict()
         else:
             _logger.warning(f'pc path {pc_path} does not exist')
+
+    # ---- V2 constraint helpers -------------------------------------------
+
+    def _get_v2_constraints_for_op(
+        self, operator: CubeOperator,
+    ) -> List[PartitionConstraintV2]:
+        """Return V2 constraints matching *operator*, or empty list."""
+        if self._constraint_set is None:
+            return []
+        import re as _re
+        from .constraint_validator import _extract_layer_index
+        module_stack = (
+            operator.ir_cell.module_stack
+            if isinstance(operator.ir_cell, IRDimops) else {}
+        )
+        param_fqns = []
+        for item in operator.ir_cell.inputs():
+            if isinstance(item, IRTensor) and item.is_param():
+                if hasattr(item, 'name'):
+                    param_fqns.append(item.name)
+        layer_index = _extract_layer_index(module_stack)
+        return self._constraint_set.get_matching_constraints(
+            operator.op_name, module_stack, layer_index, param_fqns,
+        )
+
+    def _v2_partition_allowed(
+        self,
+        constraints: List[PartitionConstraintV2],
+        operator: CubeOperator,
+        p_ids: List[Any],
+        p_nums: List[int],
+    ) -> bool:
+        """Check whether a partition is allowed by V2 constraints.
+
+        Returns ``True`` if the partition passes all matching constraints.
+        """
+        if not constraints:
+            return True
+
+        for c in constraints:
+            # force_replicate: only replicated partition is allowed
+            if c.force_replicate:
+                if p_ids[0] != -1:
+                    return False
+
+            # forbid_replicate: replication is not allowed
+            if c.forbid_replicate:
+                if p_ids[0] == -1:
+                    return False
+
+            # max_partition_degree
+            if c.max_partition_degree is not None and p_ids[0] != -1:
+                if p_nums[0] > c.max_partition_degree:
+                    return False
+
+            if p_ids[0] != -1 and isinstance(operator.ir_cell, IRDimops):
+                # Convert allowed/forbidden dim positions to dim_ids for comparison.
+                # A dimension (like 'k') can appear in multiple inputs, so
+                # dim_id2pos only returns the first position. Instead, we convert
+                # each allowed/forbidden position to a dim_id and check against
+                # the partition's dim_id.
+                dim_id = p_ids[0]
+
+                # allowed_dims: (input_idx, dim_idx) whitelist
+                if c.allowed_dims is not None:
+                    allowed_dim_ids = set()
+                    for pos in c.allowed_dims:
+                        try:
+                            allowed_dim_ids.add(operator.pos2dim_id(pos))
+                        except Exception:
+                            pass  # invalid position for this operator
+                    if dim_id not in allowed_dim_ids:
+                        return False
+
+                # forbidden_dims: (input_idx, dim_idx) blacklist
+                if c.forbidden_dims is not None:
+                    forbidden_dim_ids = set()
+                    for pos in c.forbidden_dims:
+                        try:
+                            forbidden_dim_ids.add(operator.pos2dim_id(pos))
+                        except Exception:
+                            pass
+                    if dim_id in forbidden_dim_ids:
+                        return False
+
+        return True
+
+    def _run_v2_validation(self) -> None:
+        """Run validation and log results (best-effort, non-blocking)."""
+        if self._constraint_set is None:
+            return
+        try:
+            result = validate_constraints(
+                self._constraint_set, self.graph, self.device_num,
+            )
+            unmatched = self._constraint_set.get_unmatched_constraints()
+            if unmatched:
+                _logger.warning(
+                    f'V2 constraints: {len(unmatched)} constraint(s) '
+                    f'did not match any operator'
+                )
+        except Exception:
+            _logger.exception('V2 constraint validation failed (non-fatal)')
+
+    def _apply_v2_recompute_constraints(self) -> None:
+        """Apply recompute overrides from V2 constraints to operators."""
+        if self._constraint_set is None:
+            return
+        for i, operator in enumerate(self.graph.operator_list):
+            v2_matches = self._get_v2_constraints_for_op(operator)
+            for c in v2_matches:
+                if c.recompute is not None:
+                    if c.recompute and not operator.recompute:
+                        _logger.info(
+                            f'V2 constraint: enabling recompute for {operator.op_name}'
+                        )
+                        operator.recompute = True
+                    elif not c.recompute and operator.recompute:
+                        _logger.info(
+                            f'V2 constraint: disabling recompute for {operator.op_name}'
+                        )
+                        operator.recompute = False
 
     def get_operator(self, idx: int) -> CubeOperator:
         return self.graph.operator_list[idx]
@@ -373,6 +503,13 @@ class SPMDSolver:
                             if u not in allowed_pids:
                                 return False
 
+            # V2 constraint check (applied when V2 constraints are active)
+            if self._constraint_set is not None:
+                v2_matches = self._get_v2_constraints_for_op(operator)
+                if v2_matches:
+                    if not self._v2_partition_allowed(v2_matches, operator, p_ids, p_nums):
+                        return False
+
             if p_ids[0] != -1:
                 if not operator.ir_cell.algorithm('dim').satisfy(
                         p_idx, p_dim, p_nums[0]):
@@ -430,6 +567,9 @@ class SPMDSolver:
             _logger.warning(
                 f'find unused partition constraints {self.non_used_pcs}')
         _logger.info('finish building op partitions')
+
+        # Run V2 constraint validation (non-blocking, logging only)
+        self._run_v2_validation()
 
     # use a union-find set to find the oldest operator in a following chain
     def get_father_id(self, i):
