@@ -169,7 +169,7 @@ def _compute_a2a_metadata(cu_seqlens_padded: Tensor, cp_size: int, cp_rank: int,
     return result
 
 
-def shuffle_varlen(t: Tensor, cu_seqlens_padded: Tensor, cp_group: dist.ProcessGroup) -> Tensor:
+def shuffle_varlen(t: Tensor, cu_seqlens_padded: Tensor, cp_ranks: List[int], cp_group: dist.ProcessGroup) -> Tensor:
     """
     Shuffle tensor data for variable-length sequences in context parallel processing.
 
@@ -189,7 +189,7 @@ def shuffle_varlen(t: Tensor, cu_seqlens_padded: Tensor, cp_group: dist.ProcessG
     )
 
 
-def unshuffle_varlen(t: Tensor, cu_seqlens_padded: Tensor, cp_group: dist.ProcessGroup) -> Tensor:
+def unshuffle_varlen(t: Tensor, cu_seqlens_padded: Tensor, cp_ranks: List[int], cp_group: dist.ProcessGroup) -> Tensor:
     """
     Unshuffle tensor data to restore original variable-length sequence order.
     This is the reverse operation of shuffle_varlen.
