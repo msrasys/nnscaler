@@ -4,6 +4,7 @@
 import copy
 import json
 import logging
+import re
 from collections import defaultdict
 from pathlib import Path
 from typing import Dict, List
@@ -122,8 +123,8 @@ def _write_plan_json(plan_json, f):
                 markers[f'"{marker}"'] = json.dumps(entry, separators=(', ', ': '))
                 spmd['partition_descs'][i] = marker
     text = json.dumps(plan_json, indent=2)
-    for marker, compact in markers.items():
-        text = text.replace(marker, compact)
+    pattern = re.compile('|'.join(re.escape(m) for m in markers))
+    text = pattern.sub(lambda match: markers[match.group(0)], text)
     f.write(text)
 
 
