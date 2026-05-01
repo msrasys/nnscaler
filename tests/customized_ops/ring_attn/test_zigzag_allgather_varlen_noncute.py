@@ -52,7 +52,7 @@ def _zigzag_allgather_noncute_worker():
     v = torch.randn(seq_len, nheads, head_dim, device=device, dtype=torch.bfloat16)
     cu_seqlens = torch.tensor([0, seq_len], dtype=torch.int32, device=device)
 
-    out = zigzag_allgather_attn_varlen_func(
+    out, _ = zigzag_allgather_attn_varlen_func(
         q,
         k,
         v,
