@@ -50,7 +50,7 @@ def wrap_zigzag_allgather_attn_varlen_func(
         if use_cute:
             assert flash_attn_cute_varlen_func is not None, "flash_attn.cute is not available"
             cute_window_size = tuple(None if w == -1 else w for w in window_size)
-            output, lse = flash_attn_cute_varlen_func(
+            output, softmax_lse = flash_attn_cute_varlen_func(
                 q, k, v,
                 cu_seqlens_q=cu_seqlens_q,
                 cu_seqlens_k=cu_seqlens_k,
@@ -60,9 +60,9 @@ def wrap_zigzag_allgather_attn_varlen_func(
                 deterministic=deterministic,
                 return_lse=True,
             )
-            return output
+            return output, softmax_lse
 
-        return flash_attn_varlen_func(
+        output, softmax_lse, _ = flash_attn_varlen_func(
             q,
             k,
             v,
@@ -76,8 +76,9 @@ def wrap_zigzag_allgather_attn_varlen_func(
             window_size=window_size,
             alibi_slopes=alibi_slopes,
             deterministic=deterministic,
-            return_attn_probs=False,
+            return_attn_probs=True,
         )
+        return output, softmax_lse
 
     local_process_group = DeviceGroup().get_group(process_group)
     if local_process_group is None:
@@ -143,7 +144,7 @@ def emit_ring(
 def flash_attention_anno(query_states, key_states, value_states, cu_seqlens_q, cu_seqlens_k, alibi_slopes, *args, **kwargs) -> str:
     q_anno, kv_anno = gen_head_anno(query_states, key_states, value_states, head_pos=1)
     alibi_anno = f'{q_anno}' if isinstance(alibi_slopes, IRTensor) else '?'
-    return f"l {q_anno} hd^, al^ {kv_anno} hd^, al^ {kv_anno} vd^, e^, e^, {alibi_anno} -> l {q_anno} vd^"
+    return f"l {q_anno} hd^, al^ {kv_anno} hd^, al^ {kv_anno} vd^, e^, e^, {alibi_anno} -> l {q_anno} vd^, ?"
 
 
 def input_gen_fn(node: IRDimops):
