@@ -18,8 +18,6 @@ import inspect
 import os
 import warnings
 from concurrent.futures import ThreadPoolExecutor
-import itertools
-import numpy as np
 
 import nnscaler
 from nnscaler.flags import RuntimeFlag, CompileFlag
@@ -28,6 +26,9 @@ import torch
 
 
 _logger = logging.getLogger(__name__)
+
+_DEFAULT_BROADCAST_FILE_CHUNK_SIZE = 64 * 1024 * 1024
+_BROADCAST_FILE_CHUNK_SIZE_ENV = 'NNSCALER_BROADCAST_FILE_CHUNK_SIZE'
 
 
 def print_each_rank(msg: str, rank_only: Optional[int] = None, logger: Optional[logging.Logger] = None):
@@ -727,15 +728,26 @@ def broadcast_files(
     file_groups: List[List[Union[str, Path]]],
     *,
     max_workers: int = 8,
+    chunk_size: Optional[int] = None,
 ):
     """Broadcast files from src to all other nodes. Files are grouped into file_groups,
     and each group of files are broadcasted together to get better performance.
 
     Args:
-        files (List[List[str | Path]]): List of file groups to be broadcasted.
+        file_groups (List[List[str | Path]]): List of file groups to be broadcasted.
             Note that the file names should be the same across all ranks.
+        chunk_size (Optional[int]): Maximum number of bytes to stage on CUDA for each
+            broadcast. Defaults to ``NNSCALER_BROADCAST_FILE_CHUNK_SIZE`` or 64 MiB.
     """
     from nnscaler.runtime.device import DeviceGroup
+
+    if chunk_size is None:
+        chunk_size = int(os.environ.get(
+            _BROADCAST_FILE_CHUNK_SIZE_ENV,
+            _DEFAULT_BROADCAST_FILE_CHUNK_SIZE,
+        ))
+    if chunk_size <= 0:
+        raise ValueError(f'chunk_size must be positive, got {chunk_size}')
 
     # filter out empty file groups
     file_groups = [
@@ -770,48 +782,119 @@ def broadcast_files(
     file_groups = [pair[0] for pair in file_groups_sizes_pairs]
     file_group_sizes = [pair[1] for pair in file_groups_sizes_pairs]
 
-    def _write_file(file: Union[str, Path], buffer, start, size):
-        _logger.info(f'Rank {curr_rank}: Writing file {file} of size {size} bytes.')
-        # have better performance than open + write
-        buffer[start: start + size].numpy().tofile(file)
+    def _iter_segments(files, file_sizes, start, size):
+        end = start + size
+        file_start = 0
+        for file, file_size in zip(files, file_sizes):
+            file_end = file_start + file_size
+            if file_end <= start:
+                file_start = file_end
+                continue
+            if file_start >= end:
+                break
 
-    def _read_file(file, buffer, start, size):
-        _logger.info(f'Rank {curr_rank}: Reading file {file} of size {size} bytes.')
-        # slightly faster than open + read
-        buffer[start: start + size] = torch.from_numpy(np.fromfile(file, dtype=np.uint8))
+            segment_start = max(start, file_start)
+            segment_end = min(end, file_end)
+            if segment_start < segment_end:
+                yield (
+                    file,
+                    segment_start - file_start,
+                    segment_start - start,
+                    segment_end - segment_start,
+                )
+            file_start = file_end
 
-    def _write_files(buffer, files, file_sizes):
-        buffer = buffer.cpu()
-        file_starts = itertools.accumulate([0] + file_sizes[:-1])
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            executor.map(
-                lambda args: _write_file(args[0], buffer, args[1], args[2]),
-                zip(files, file_starts, file_sizes)
+    def _read_segment(args):
+        file, file_offset, buffer_offset, size, buffer_array = args
+        with open(file, 'rb') as f:
+            f.seek(file_offset)
+            read_size = f.readinto(buffer_array[buffer_offset: buffer_offset + size])
+        if read_size != size:
+            raise IOError(
+                f'Failed to read {size} bytes from {file} at offset {file_offset}; got {read_size}'
             )
+
+    def _write_segment(args):
+        file, file_offset, buffer_offset, size, buffer_array = args
+        with open(file, 'r+b') as f:
+            f.seek(file_offset)
+            write_size = f.write(buffer_array[buffer_offset: buffer_offset + size])
+        if write_size != size:
+            raise IOError(
+                f'Failed to write {size} bytes to {file} at offset {file_offset}; got {write_size}'
+            )
+
+    def _map_segments(fn, segments):
+        if len(segments) > 1 and max_workers > 1:
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                list(executor.map(fn, segments))
+        else:
+            for segment in segments:
+                fn(segment)
+
+    def _read_chunk(files, file_sizes, start, size, buffer):
+        buffer_array = buffer.numpy()
+        segments = [
+            (*segment, buffer_array)
+            for segment in _iter_segments(files, file_sizes, start, size)
+        ]
+        _map_segments(_read_segment, segments)
+
+    def _prepare_output_files(files, file_sizes):
+        for file, size in zip(files, file_sizes):
+            _logger.info(
+                f'Rank {curr_rank}: Writing file {file} of size {size} bytes.'
+            )
+            Path(file).parent.mkdir(parents=True, exist_ok=True)
+            with open(file, 'wb') as f:
+                f.truncate(size)
+
+    def _write_chunk(files, file_sizes, start, size, buffer):
+        buffer_array = buffer.numpy()
+        segments = [
+            (*segment, buffer_array)
+            for segment in _iter_segments(files, file_sizes, start, size)
+        ]
+        _map_segments(_write_segment, segments)
 
     def _send_file_group(src, files, file_sizes):
         total_size = sum(file_sizes)
 
         ranks = list(range(src, world_size, local_world_size))
         group = DeviceGroup().get_group(ranks)
-        file_buffer = torch.empty(total_size, dtype=torch.uint8, device='cpu').pin_memory()
+        is_src_rank = curr_rank == src
 
-        if curr_rank < local_world_size:
-            file_starts = itertools.accumulate([0] + file_sizes[:-1])
-            with ThreadPoolExecutor(max_workers=max_workers) as executor:
-                executor.map(
-                    lambda args: _read_file(args[0], file_buffer, args[1], args[2]),
-                    zip(files, file_starts, file_sizes)
+        if is_src_rank:
+            for file, size in zip(files, file_sizes):
+                _logger.info(
+                    f'Rank {curr_rank}: Reading file {file} of size {size} bytes.'
                 )
-            broadcast_tensor = file_buffer.cuda()
         else:
-            broadcast_tensor = torch.empty(total_size, dtype=torch.uint8, device='cuda')
+            _prepare_output_files(files, file_sizes)
 
-        torch.distributed.broadcast(broadcast_tensor, src=src, group=group)
+        if total_size == 0:
+            return
 
-        if curr_rank >= local_world_size:
-            file_buffer.copy_(broadcast_tensor)
-            _write_files(file_buffer, files, file_sizes)
+        buffer_size = min(total_size, chunk_size)
+        file_buffer = torch.empty(
+            buffer_size, dtype=torch.uint8, device='cpu'
+        ).pin_memory()
+        broadcast_tensor = torch.empty(buffer_size, dtype=torch.uint8, device='cuda')
+
+        for start in range(0, total_size, chunk_size):
+            valid_size = min(chunk_size, total_size - start)
+            cpu_chunk = file_buffer[:valid_size]
+            cuda_chunk = broadcast_tensor[:valid_size]
+
+            if is_src_rank:
+                _read_chunk(files, file_sizes, start, valid_size, cpu_chunk)
+                cuda_chunk.copy_(cpu_chunk)
+
+            torch.distributed.broadcast(cuda_chunk, src=src, group=group)
+
+            if not is_src_rank:
+                cpu_chunk.copy_(cuda_chunk)
+                _write_chunk(files, file_sizes, start, valid_size, cpu_chunk)
 
     # we split the file groups among local ranks
     # each local rank sends its assigned file groups (in round robin fashion)
