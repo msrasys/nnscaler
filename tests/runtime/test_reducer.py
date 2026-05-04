@@ -8,6 +8,8 @@ import torch
 import logging
 from functools import partial
 
+import pytest
+
 import nnscaler
 from nnscaler.compiler import compile
 from nnscaler.utils import load_model
@@ -160,3 +162,79 @@ def test_reducer_build():
     assert buckets[3]._aligned_numel == 12
     assert buckets[4].numel == 1
     assert buckets[4]._aligned_numel == 4
+
+
+def _add_scalar_params(reducer, num_params, param_clss=None, param_cls=None):
+    params = []
+    for _ in range(num_params):
+        param = torch.nn.Parameter(torch.randn(1))
+        reducer.add_param(param)
+        params.append(param)
+        if param_clss is not None:
+            param_clss[param] = param_cls
+    return params
+
+
+@mock_reducer_env(0, 8)
+def test_reducer_build_zero_param_level_sharding_merges_single_param_tail():
+    reducer = Reducer(
+        list(range(8)),
+        max_bucket_size_bytes=128,
+        zero=1,
+        zero_param_level_sharding=True,
+    )
+    _add_scalar_params(reducer, 9)
+
+    reducer.build_buckets()
+
+    buckets = list(reversed(reducer.buckets))
+    assert [len(bucket.params) for bucket in buckets] == [9]
+
+
+@mock_reducer_env(0, 8)
+def test_reducer_build_zero_param_level_sharding_merges_small_tail_to_previous_bucket():
+    reducer = Reducer(
+        list(range(8)),
+        max_bucket_size_bytes=128,
+        zero=1,
+        zero_param_level_sharding=True,
+    )
+    _add_scalar_params(reducer, 17)
+
+    reducer.build_buckets()
+
+    buckets = list(reversed(reducer.buckets))
+    assert [len(bucket.params) for bucket in buckets] == [8, 9]
+
+
+@mock_reducer_env(0, 8)
+def test_reducer_build_zero_param_level_sharding_keeps_param_classes_separate():
+    reducer = Reducer(
+        list(range(8)),
+        max_bucket_size_bytes=128,
+        zero=1,
+        zero_param_level_sharding=True,
+    )
+    param_clss = {}
+    _add_scalar_params(reducer, 9, param_clss, 0)
+    _add_scalar_params(reducer, 9, param_clss, 1)
+
+    reducer.build_buckets(param_clss=param_clss)
+
+    buckets = list(reversed(reducer.buckets))
+    assert [len(bucket.params) for bucket in buckets] == [9, 9]
+    assert [bucket.param_cls[0] for bucket in buckets] == [0, 1]
+
+
+@mock_reducer_env(0, 8)
+def test_reducer_build_zero_param_level_sharding_rejects_too_few_params():
+    reducer = Reducer(
+        list(range(8)),
+        max_bucket_size_bytes=128,
+        zero=1,
+        zero_param_level_sharding=True,
+    )
+    _add_scalar_params(reducer, 7)
+
+    with pytest.raises(RuntimeError, match="parameter class is smaller"):
+        reducer.build_buckets()
