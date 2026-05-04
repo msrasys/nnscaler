@@ -906,8 +906,9 @@ class Reducer:
 
         The parameters in each bucket have consistent data types and classes,
         and each bucket contains at least one parameter.
-        If the bucket contains more than 2 parameters, than the total size is samller
-        than the max_bucket_size_bytes.
+        The total bucket size is bounded by max_bucket_size_bytes unless ZeRO
+        parameter-level sharding needs a larger bucket to keep at least one
+        parameter per zero rank.
         """
         if self._buckets:
             raise RuntimeError("Buckets have already been built, cannot build again.")
@@ -985,34 +986,79 @@ class Reducer:
         #       (used in pytorch, with a couple percentage improvement)
         bucket_size = self._numel * 8 + 1 if not self._bucket_size else self._bucket_size
 
-        seq_buckets_cls: List[Optional[Tuple[int, int, ParamZeroConfig]]] = []
-        last_bucket_size = None
-        last_bucket_cls = None
-
         assert len(set(p.dtype for p in self._params)) == 1, (
             "All parameters in the reducer should have the same data type"
         )
+
+        def _param_nbytes(param: torch.nn.Parameter) -> int:
+            aligned_nelements = _aligned_nelement(param.nelement(), param.element_size(), self._align_size)
+            return aligned_nelements * param.element_size()
+
+        def _is_zero_param_level_sharding(param_cls: Any) -> bool:
+            return param_cls[-1].zero_param_level_sharding if param_cls else self._zero_param_level_sharding
+
+        def _build_class_buckets(
+            params: List[torch.nn.Parameter],
+            param_cls: Any,
+        ) -> List[List[torch.nn.Parameter]]:
+            zero_param_level_sharding = _is_zero_param_level_sharding(param_cls)
+            if zero_param_level_sharding and len(params) < self._zero_size:
+                raise RuntimeError(
+                    f"the number of parameters({len(params)}) in the parameter class is smaller than "
+                    f"the number of ranks({self._zero_size}) in the zero group."
+                    f"ZeRO parameter-level sharding cannot be applied for this parameter class."
+                    f"Please disable ZeRO or disable parameter-level sharding."
+                )
+
+            buckets: List[List[torch.nn.Parameter]] = []
+            bucket_nbytes: List[int] = []
+
+            for param in params:
+                cur_byte_size = _param_nbytes(param)
+                if not buckets:
+                    buckets.append([param])
+                    bucket_nbytes.append(cur_byte_size)
+                    continue
+
+                append_to_last_bucket = bucket_nbytes[-1] + cur_byte_size <= bucket_size
+                if zero_param_level_sharding:
+                    append_to_last_bucket = append_to_last_bucket or len(buckets[-1]) < self._zero_size
+
+                if append_to_last_bucket:
+                    buckets[-1].append(param)
+                    bucket_nbytes[-1] += cur_byte_size
+                else:
+                    buckets.append([param])
+                    bucket_nbytes.append(cur_byte_size)
+
+            if zero_param_level_sharding and len(buckets) > 1 and len(buckets[-1]) < self._zero_size:
+                buckets[-2].extend(buckets[-1])
+                buckets.pop()
+
+            return buckets
+
+        def _flush_class_buckets(params: List[torch.nn.Parameter], param_cls: Any):
+            for bucket in _build_class_buckets(params, param_cls):
+                self.seq_buckets.append(bucket)
+                seq_buckets_cls.append(param_cls)
+
+        seq_buckets_cls: List[Optional[Any]] = []
+        class_params: List[torch.nn.Parameter] = []
+        class_param_cls = None
         for param in self._params:
             if param.requires_grad:
-                cur_byte_size = _aligned_nelement(param.nelement(), param.element_size(), self._align_size) * param.element_size()
-                # also work when cur_byte_size > bucket_size
-                # It will go the `else` branch
-                # and finish the current bucket and start a new bucket.
-                # This new bucket will be sealed in the next iteration
-                if len(self.seq_buckets) == 0:
-                    self.seq_buckets.append([param])
-                    last_bucket_size = cur_byte_size
-                    last_bucket_cls = self._param_clss.get(param, None)
-                    seq_buckets_cls.append(last_bucket_cls)
-                elif last_bucket_size + cur_byte_size <= bucket_size \
-                    and last_bucket_cls == self._param_clss.get(param, None):
-                    self.seq_buckets[-1].append(param)
-                    last_bucket_size += cur_byte_size
+                param_cls = self._param_clss.get(param, None)
+                if not class_params:
+                    class_params.append(param)
+                    class_param_cls = param_cls
+                elif class_param_cls == param_cls:
+                    class_params.append(param)
                 else:
-                    self.seq_buckets.append([param])
-                    last_bucket_size = cur_byte_size
-                    last_bucket_cls = self._param_clss.get(param, None)
-                    seq_buckets_cls.append(last_bucket_cls)
+                    _flush_class_buckets(class_params, class_param_cls)
+                    class_params = [param]
+                    class_param_cls = param_cls
+        if class_params:
+            _flush_class_buckets(class_params, class_param_cls)
 
         # step 2: build meta data for the offset of each bucket
         # the start of each bucket will be padded to the next multiple of `len(self.ranks)`
