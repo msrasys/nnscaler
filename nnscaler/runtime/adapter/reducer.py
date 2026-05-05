@@ -1032,8 +1032,29 @@ class Reducer:
                     bucket_nbytes.append(cur_byte_size)
 
             if zero_param_level_sharding and len(buckets) > 1 and len(buckets[-1]) < self._zero_size:
+                bucket_nbytes[-2] += bucket_nbytes[-1]
                 buckets[-2].extend(buckets[-1])
                 buckets.pop()
+                bucket_nbytes.pop()
+
+            # log (at INFO level, i.e. only visible in verbose mode) when ZeRO
+            # parameter-level sharding forced any bucket to grow beyond the
+            # user-requested max_bucket_size_bytes. We only log for multi-param
+            # buckets, since a single oversized parameter exceeding the limit
+            # is unavoidable and already happened without sharding.
+            if zero_param_level_sharding and self._bucket_size:
+                for bucket, nbytes in zip(buckets, bucket_nbytes):
+                    if nbytes > bucket_size and len(bucket) > 1:
+                        _logger.info(
+                            f"ZeRO parameter-level sharding produced a bucket of "
+                            f"{nbytes} bytes, exceeding max_bucket_size_bytes="
+                            f"{self._bucket_size} (param_cls={param_cls}, "
+                            f"#params={len(bucket)}, zero_size={self._zero_size}). "
+                            f"At least {self._zero_size} parameters per bucket are "
+                            f"required for parameter-level sharding; consider "
+                            f"increasing max_bucket_size_bytes or disabling "
+                            f"zero_param_level_sharding."
+                        )
 
             return buckets
 

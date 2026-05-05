@@ -238,3 +238,132 @@ def test_reducer_build_zero_param_level_sharding_rejects_too_few_params():
 
     with pytest.raises(RuntimeError, match="parameter class is smaller"):
         reducer.build_buckets()
+
+
+@mock_reducer_env(0, 8)
+def test_reducer_build_zero_param_level_sharding_logs_when_bucket_exceeds_max(caplog):
+    """When ZeRO param-level sharding forces a bucket beyond max_bucket_size_bytes,
+    an INFO-level log must be emitted (verbose-only, no user-facing warning)."""
+    reducer = Reducer(
+        list(range(8)),
+        max_bucket_size_bytes=8,  # one fp32 scalar already aligns to 16 bytes
+        zero=1,
+        zero_param_level_sharding=True,
+    )
+    _add_scalar_params(reducer, 9)
+
+    with caplog.at_level(logging.INFO, logger='nnscaler.runtime.adapter.reducer'):
+        reducer.build_buckets()
+
+    info_msgs = [r.message for r in caplog.records if r.levelno == logging.INFO]
+    assert any("exceeding max_bucket_size_bytes=8" in m for m in info_msgs), info_msgs
+    # must not be elevated to WARNING
+    assert not any(
+        "exceeding max_bucket_size_bytes" in r.message and r.levelno >= logging.WARNING
+        for r in caplog.records
+    )
+
+
+@mock_reducer_env(0, 8)
+def test_reducer_build_zero_param_level_sharding_no_log_when_within_max(caplog):
+    reducer = Reducer(
+        list(range(8)),
+        max_bucket_size_bytes=1024,  # 9 * 16 = 144 bytes, well within
+        zero=1,
+        zero_param_level_sharding=True,
+    )
+    _add_scalar_params(reducer, 9)
+
+    with caplog.at_level(logging.INFO, logger='nnscaler.runtime.adapter.reducer'):
+        reducer.build_buckets()
+
+    assert not any(
+        "exceeding max_bucket_size_bytes" in r.message for r in caplog.records
+    )
+
+
+@mock_reducer_env(0, 8)
+def test_reducer_build_no_log_when_sharding_disabled(caplog):
+    """The size-exceeded info log is gated on zero_param_level_sharding."""
+    reducer = Reducer(
+        list(range(8)),
+        max_bucket_size_bytes=8,
+        zero=0,
+        zero_param_level_sharding=False,
+    )
+    _add_scalar_params(reducer, 9)
+
+    with caplog.at_level(logging.INFO, logger='nnscaler.runtime.adapter.reducer'):
+        reducer.build_buckets()
+
+    assert not any(
+        "exceeding max_bucket_size_bytes" in r.message for r in caplog.records
+    )
+
+
+@mock_reducer_env(0, 8)
+def test_reducer_build_skips_non_trainable_params():
+    """Parameters with requires_grad=False must not be placed in any bucket
+    nor counted toward the zero_size quota of the parameter class."""
+    reducer = Reducer(
+        list(range(8)),
+        max_bucket_size_bytes=128,
+        zero=1,
+        zero_param_level_sharding=True,
+    )
+    trainable = _add_scalar_params(reducer, 9)
+    frozen = torch.nn.Parameter(torch.randn(1), requires_grad=False)
+    reducer.add_param(frozen)
+
+    reducer.build_buckets()
+
+    bucket_param_ids = {id(p) for b in reducer.buckets for p in b.params}
+    assert all(id(p) in bucket_param_ids for p in trainable)
+    assert id(frozen) not in bucket_param_ids
+
+
+@mock_reducer_env(0, 8)
+def test_reducer_build_internal_lists_are_consistent():
+    """seq_buckets / starts / stops / buckets must all have the same length,
+    and bucket bytes must be non-decreasing offsets in the contiguous buffer."""
+    reducer = Reducer(
+        list(range(8)),
+        max_bucket_size_bytes=128,
+        zero=1,
+        zero_param_level_sharding=True,
+    )
+    _add_scalar_params(reducer, 17)
+
+    reducer.build_buckets()
+
+    n = len(reducer.seq_buckets)
+    assert n == len(reducer.starts) == len(reducer.stops) == len(reducer.buckets)
+    # offsets must be monotonically non-decreasing
+    for i in range(n):
+        assert reducer.starts[i] <= reducer.stops[i]
+        if i > 0:
+            assert reducer.starts[i] >= reducer.stops[i - 1]
+    # every bucket has at least zero_size params (param-level sharding requirement)
+    for params in reducer.seq_buckets:
+        assert len(params) >= reducer._zero_size
+
+
+@mock_reducer_env(0, 8)
+def test_reducer_build_zero_param_level_sharding_keeps_param_classes_separate_three_classes():
+    """Multi-class case beyond the 2-class scenario already covered."""
+    reducer = Reducer(
+        list(range(8)),
+        max_bucket_size_bytes=128,
+        zero=1,
+        zero_param_level_sharding=True,
+    )
+    param_clss = {}
+    _add_scalar_params(reducer, 8, param_clss, 0)
+    _add_scalar_params(reducer, 9, param_clss, 1)
+    _add_scalar_params(reducer, 8, param_clss, 2)
+
+    reducer.build_buckets(param_clss=param_clss)
+
+    buckets = list(reversed(reducer.buckets))
+    assert [len(bucket.params) for bucket in buckets] == [8, 9, 8]
+    assert [bucket.param_cls[0] for bucket in buckets] == [0, 1, 2]
