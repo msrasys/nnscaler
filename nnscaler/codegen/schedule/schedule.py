@@ -372,12 +372,13 @@ class ScheduleCodeGen(FuncEmission):
         When a non-tensor input's root source variable is not among node_inputs
         (e.g. VPP pipeline intermediate ranks where ``samples`` is not a direct
         input to this segment), falls back to reading from the dataloader once
-        and extracting from that.  The ``fallback_state`` dict persists across
-        calls within one function to avoid multiple dataloader reads.
+        and extracting from that.  The fallback source is local to each call so
+        that different microbatches get their own dataloader read.
         """
         if produced_tids is None or not getitem_info:
             return []
         codes = []
+        _local_fallback_var = None
         for inp in node_inputs:
             if isinstance(inp, IRTensor) or not isinstance(inp, IRObject):
                 continue
@@ -411,7 +412,7 @@ class ScheduleCodeGen(FuncEmission):
                     break
             if source_var is None:
                 if dataloader_var and fallback_state is not None:
-                    if fallback_state.get('samples_var') is None:
+                    if _local_fallback_var is None:
                         upcoming = fallback_state.get('upcoming_samples')
                         fb_var, fb_tid = None, None
                         if upcoming:
@@ -422,10 +423,10 @@ class ScheduleCodeGen(FuncEmission):
                         if fb_var is None:
                             fb_var = '_nontensor_fallback_samples'
                         codes.append(f"{fb_var} = next(*({dataloader_var}, ))")
-                        fallback_state['samples_var'] = fb_var
+                        _local_fallback_var = fb_var
                         if fb_tid is not None:
                             produced_tids.add(fb_tid)
-                    source_var = fallback_state['samples_var']
+                    source_var = _local_fallback_var
                 if source_var is None:
                     continue
             current_var = source_var
