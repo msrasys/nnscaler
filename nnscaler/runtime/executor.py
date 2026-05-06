@@ -29,6 +29,7 @@ class AsyncCommHandler:
         def __init__(self):
             self._works: Dict[int, List] = {}
             self._callbacks: Dict[int, Callable] = {}
+            self._send_holds: List = []
 
     instance = None
 
@@ -63,11 +64,19 @@ class AsyncCommHandler:
         self._works[id(tensor)] = works
         self._callbacks[id(tensor)] = callback
 
+    def hold_send(self, tensor: torch.Tensor, work):
+        self._send_holds.append((tensor, work))
+
+    def drain_sends(self):
+        for _, work in self._send_holds:
+            work.wait()
+        self._send_holds.clear()
+
     def clear(self):
         AsyncCommHandler.instance = AsyncCommHandler.__AsyncCommHandler()
 
     def check_clear(self):
-        assert len(self._works) == 0 and len(self._callbacks) == 0
+        assert len(self._works) == 0 and len(self._callbacks) == 0 and len(self._send_holds) == 0
 
 
 TensorPairs = List[Tuple[int, torch.Tensor]]
@@ -205,6 +214,7 @@ class Executor:
         """
         Wait until the finish of synchornized tensors
         """
+        AsyncCommHandler().drain_sends()
         return [AsyncCommHandler().wait(t) if torch.is_tensor(t) else t for t in tensors]
 
 

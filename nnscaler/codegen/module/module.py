@@ -481,7 +481,13 @@ class ModuleCodeGen(FuncEmission):
             elif isinstance(node, IRFwOperation):
                 raise RuntimeError(f"Unexcepted global-level op call: {node}")
             elif isinstance(node, IRAdapter):
-                codes = self.emit_adapter(node, prefix_attr='self.', async_op=CompileFlag.async_comm)
+                from nnscaler.ir.adapter.prim import MovePrim, CommPrim, ChunkPrim, VChunkPrim
+                has_p2p = any(isinstance(prim, MovePrim) for prim in node.prims)
+                has_other_comm = any(
+                    isinstance(prim, CommPrim) and not isinstance(prim, (MovePrim, ChunkPrim, VChunkPrim))
+                    for prim in node.prims
+                )
+                codes = self.emit_adapter(node, prefix_attr='self.', async_op=CompileFlag.async_comm or (has_p2p and not has_other_comm))
             elif isinstance(node, IRWeightReducer):
                 self.init_reducer(node, device, param_first_used_pos, as_parallel_module)
                 codes = self.emit_reducer(node)
