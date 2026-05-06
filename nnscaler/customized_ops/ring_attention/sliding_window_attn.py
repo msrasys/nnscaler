@@ -64,6 +64,8 @@ def wrap_sliding_window_attn_func(
                 q, k, v,
                 cu_seqlens_q=cu_seqlens_q,
                 cu_seqlens_k=cu_seqlens_k,
+                max_seqlen_q=max_seqlen_q,
+                max_seqlen_k=max_seqlen_k,
                 softmax_scale=softmax_scale,
                 causal=causal,
                 window_size=cute_window_size,
