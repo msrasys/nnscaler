@@ -719,6 +719,12 @@ def fn(
     scheduler = cfg.pas_config.get('pipeline_scheduler', '1f1b')
     tp_size = ngpus // pp_size
 
+    def stages_share_physical_pipeline_rank(stage_ids: Iterable[int]) -> bool:
+        """Return True when VPP logical stages map to one physical PP rank."""
+        if not pp_enabled or nstages <= pp_size:
+            return False
+        return len({stage_id % pp_size for stage_id in stage_ids}) == 1
+
     if pp_enabled:
         if not cfg.use_end2end:
             raise ValueError("Pipeline parallelism requires use_end2end to be True")
@@ -750,6 +756,11 @@ def fn(
             continue
         splits = set(k for v in stage_info.values() for k in v)
         find_replicated = None in splits
+        colocated_replicated_vpp_param = (
+            find_replicated and len(splits) == 1
+            and len(stage_info) > 1
+            and stages_share_physical_pipeline_rank(stage_info.keys())
+        )
         splits = list(splits)
         # For safety, we will add multiref when detecting shared param are all replicated for pipeline parallelism.
         # The reason is that stages may have different number of devices, it is hard to synchronize gradients directly
@@ -764,9 +775,16 @@ def fn(
         # 4. (2) and (3): if the param is shared across stages and is replicated in at least one stage.
         #    Note: the case when some is replicated and some is partitioned is handled by (1).
 
-        if len(splits) > 1 or (len(stage_info) > 1 and find_replicated):
+        if len(splits) > 1 or (
+            len(stage_info) > 1 and find_replicated and not colocated_replicated_vpp_param
+        ):
             _logger.info(f'add multiref for shared param {ftensor}')
             graph.multiref(ftensor, comment='shared param')
+        elif colocated_replicated_vpp_param:
+            _logger.info(
+                f'skip multiref for VPP colocated shared param {ftensor}; '
+                f'logical stages={sorted(stage_info.keys())}, physical stage={next(iter(stage_info)) % pp_size}'
+            )
 
     # set pipeline stages
     if pp_enabled:
