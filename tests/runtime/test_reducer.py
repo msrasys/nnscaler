@@ -18,7 +18,7 @@ from nnscaler.ir.operator import IRFwOperation
 from nnscaler.flags import CompileFlag
 from nnscaler.runtime.adapter.reducer import Reducer
 from ..launch_torchrun import torchrun
-from ..utils import init_parameter, assert_parity, mock_reducer_env
+from ..utils import catch_log, init_parameter, assert_parity, mock_reducer_env
 
 
 class MLP(torch.nn.Module):
@@ -165,6 +165,8 @@ def test_reducer_build():
 
 
 def _add_scalar_params(reducer, num_params, param_clss=None, param_cls=None):
+    # NOTE: all params will be aligned to 16 bytes.
+    # So even 1 float32 param will take 16 bytes in the bucket.
     params = []
     for _ in range(num_params):
         param = torch.nn.Parameter(torch.randn(1))
@@ -183,6 +185,11 @@ def test_reducer_build_zero_param_level_sharding_merges_single_param_tail():
         zero=1,
         zero_param_level_sharding=True,
     )
+    # max_bucket_size_bytes = 128 bytes means 8 float32 params (taking account of alignment) can be put in one bucket,
+    # so the first 8 params will fill one bucket, and the last 1 param will be merged to the first bucket because it's smaller than zero_size(8)
+    # 8 will be put in the first bucket,
+    # and the last 1 param will be merged to the first bucket
+    # because it's smaller than zero_size(8)
     _add_scalar_params(reducer, 9)
 
     reducer.build_buckets()
@@ -236,5 +243,24 @@ def test_reducer_build_zero_param_level_sharding_rejects_too_few_params():
     )
     _add_scalar_params(reducer, 7)
 
-    with pytest.raises(RuntimeError, match="parameter class is smaller"):
+    with pytest.raises(RuntimeError, match="Please disable ZeRO or disable parameter-level sharding or increase bucket size."):
         reducer.build_buckets()
+
+
+@mock_reducer_env(0, 8)
+def test_reducer_build_zero_param_level_sharding_waste_warning():
+    reducer = Reducer(
+        list(range(8)),
+        max_bucket_size_bytes=128,
+        zero=1,
+        zero_param_level_sharding=True,
+    )
+    _add_scalar_params(reducer, 7)
+    param = torch.nn.Parameter(torch.randn(100))
+    reducer.add_param(param)
+
+    from nnscaler.runtime.adapter.reducer import _logger
+    with catch_log(_logger) as log_stream:
+        reducer.build_buckets()
+        logs = log_stream.getvalue()
+        assert "which may cause memory waste" in logs
