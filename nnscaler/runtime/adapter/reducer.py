@@ -1043,7 +1043,7 @@ class Reducer:
             if len(params) < _min_bucket_param_num(param_cls):
                 if last_cls_bucket is None:
                     raise RuntimeError(
-                        f"the number of parameters({len(params)}) in the bucket  is smaller than "
+                        f"the number of parameters({len(params)}) in the bucket is smaller than "
                         f"the number of ranks({self._zero_size}) in the zero group. "
                         f"ZeRO parameter-level sharding cannot be applied for this bucket. "
                         f"Please disable ZeRO or disable "
@@ -1098,7 +1098,7 @@ class Reducer:
                 # we warn users about potential memory waste.
                 if max_group_size * self._zero_size > total_param_size * 1.5:
                     _logger.warning(
-                        f"the allocated buffer size {max_group_size * self._zero_size} allocated for this bucket is much larger than the total param size {total_param_size}, "
+                        f"the buffer size {max_group_size * self._zero_size} allocated for this bucket is much larger than the total param size {total_param_size}, "
                         f"which may cause memory waste. "
                         f"Consider increasing bucket size or disable zero parameter-level sharding for better memory efficiency."
                     )
