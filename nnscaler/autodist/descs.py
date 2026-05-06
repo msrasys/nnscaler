@@ -3,10 +3,9 @@
 
 import copy
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
-if TYPE_CHECKING:
-    from nnscaler.ir.operator import IRFwOperation
+from nnscaler.ir.operator import IRFwOperation
 
 
 @dataclass
@@ -41,15 +40,16 @@ class TensorParallelDesc:
     mesh_desc: MeshDesc
     analysis: Dict[str, Any]
 
-    def to_json(self, cid2node: 'Dict[int, IRFwOperation]'):
+    def to_json(self, cid2node: Optional[Dict[int, IRFwOperation]] = None):
         ret = {}
         descs_list = []
         for k, v in self.partition_descs.items():
             entry = {'cid': k, 'partition': v.desc}
-            node = cid2node.get(k)
-            if node is not None:
-                entry['fqn'] = node.fqn
-                entry['op'] = node.signature
+            if cid2node is not None:
+                node = cid2node.get(k)
+                if node is not None:
+                    entry['fqn'] = node.fqn
+                    entry['op'] = node.signature
             descs_list.append(entry)
         ret['partition_descs'] = descs_list
         ret['recompute_groups'] = self.recompute_groups
@@ -81,7 +81,7 @@ class SPMDSearchOutput:
     all_time: float
     comp_time: float
 
-    def to_json(self, cid2node: 'Dict[int, IRFwOperation]'):
+    def to_json(self, cid2node: Optional[Dict[int, IRFwOperation]] = None):
         return {
             'desc': self.desc.to_json(cid2node),
             'memory': self.memory,
@@ -102,7 +102,7 @@ class PipelineParallelDesc:
     recompute_groups: List[List[int]]
     mesh_desc: MeshDesc
 
-    def to_json(self, cid2node: 'Dict[int, IRFwOperation]'):
+    def to_json(self, cid2node: Optional[Dict[int, IRFwOperation]] = None):
         return {
             'spmd_descs': [desc.to_json(cid2node=cid2node) for desc in self.spmd_descs],
             'recompute_groups': self.recompute_groups,
@@ -127,7 +127,7 @@ class PipelineSearchOutput:
     stage_all_times: List[float]
     stage_comp_times: List[float]
 
-    def to_json(self, cid2node: 'Dict[int, IRFwOperation]'):
+    def to_json(self, cid2node: Optional[Dict[int, IRFwOperation]] = None):
         return {
             'desc': self.desc.to_json(cid2node=cid2node),
             'e2e_time': self.e2e_time,

@@ -123,8 +123,9 @@ def _write_plan_json(plan_json, f):
                 markers[f'"{marker}"'] = json.dumps(entry, separators=(', ', ': '))
                 spmd['partition_descs'][i] = marker
     text = json.dumps(plan_json, indent=2)
-    pattern = re.compile('|'.join(re.escape(m) for m in markers))
-    text = pattern.sub(lambda match: markers[match.group(0)], text)
+    if markers:
+        pattern = re.compile('|'.join(re.escape(m) for m in markers))
+        text = pattern.sub(lambda match: markers[match.group(0)], text)
     f.write(text)
 
 
