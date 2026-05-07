@@ -640,6 +640,23 @@ class MergedScheduler:
         elif isinstance(grads, torch.Tensor):
             grads.record_stream(comp)
 
+    @staticmethod
+    def _attn_backward_grads(attn_node, grad_h, grad_h_ln, grad_routing):
+        outputs = attn_node.get_output()
+        if not isinstance(outputs, tuple):
+            return grad_h
+
+        grads = [grad_h, grad_h_ln, grad_routing]
+        aux_tensors = getattr(attn_node, 'loss_aux_tensors', ())
+        for tensor in aux_tensors:
+            if isinstance(tensor, torch.Tensor):
+                grads.append(tensor.grad)
+            else:
+                grads.append(None)
+        while len(grads) < len(outputs):
+            grads.append(None)
+        return tuple(grads[:len(outputs)])
+
     def _forward_all_layers(self, h, lc_list, event):
         """Warmup: forward all layers, collect nodes and routing data."""
         all_nodes = []
@@ -706,7 +723,10 @@ class MergedScheduler:
         attn_n, dispatch_n, expert_n, combine_n = nodes
 
         attn_out = attn_n.forward((h,))
-        h_residual, h_ln, routing_probs = attn_out
+        h_residual, h_ln, routing_probs = attn_out[:3]
+        loss_aux_tensors = lc.step_data.get('_loss_aux_tensors')
+        if loss_aux_tensors is not None:
+            attn_n.loss_aux_tensors = loss_aux_tensors
         dispatch_out = dispatch_n.forward((h_ln, routing_probs))
         expert_result = expert_n.forward((*dispatch_out, h_ln))
         expert_out, shared_expert_out = expert_result
@@ -755,7 +775,9 @@ class MergedScheduler:
 
             grad_h_ln_total = dispatch_grads[0] + expert_grads[2]
 
-            grad_x = attn_n.backward((combine_grads[1], grad_h_ln_total, dispatch_grads[1]))
+            attn_grads = self._attn_backward_grads(
+                attn_n, combine_grads[1], grad_h_ln_total, dispatch_grads[1])
+            grad_x = attn_n.backward(attn_grads)
 
         return grad_x
 
@@ -842,7 +864,10 @@ class MergedScheduler:
             else:
                 combine_grads = bwd_combine.backward(grad_h)
                 fwd_attn_out = fwd_attn.forward((fwd_h,))
-            fwd_h_residual, fwd_h_ln, fwd_routing_probs = fwd_attn_out
+            fwd_h_residual, fwd_h_ln, fwd_routing_probs = fwd_attn_out[:3]
+            loss_aux_tensors = fwd_lc.step_data.get('_loss_aux_tensors')
+            if loss_aux_tensors is not None:
+                fwd_attn.loss_aux_tensors = loss_aux_tensors
 
             # Phase boundary: Phase 2 COMP needs COMM output (combine_grads),
             # Phase 2 COMM needs COMP output (attn_out + precomputed metadata)
@@ -886,14 +911,18 @@ class MergedScheduler:
                 self._record_for_comp(dispatch_grads)
                 self._record_for_comp(combine_grads)
                 grad_h_ln_total = dispatch_grads[0] + expert_grads[2]
-                grad_x = bwd_attn.backward((combine_grads[1], grad_h_ln_total, dispatch_grads[1]))
+                attn_grads = self._attn_backward_grads(
+                    bwd_attn, combine_grads[1], grad_h_ln_total, dispatch_grads[1])
+                grad_x = bwd_attn.backward(attn_grads)
                 fwd_h_out = fut_combine_fwd.result()
             else:
                 fwd_h_out = fwd_combine.forward((fwd_expert_out, fwd_h_residual, fwd_shared_expert_out))
                 self._record_for_comp(dispatch_grads)
                 self._record_for_comp(combine_grads)
                 grad_h_ln_total = dispatch_grads[0] + expert_grads[2]
-                grad_x = bwd_attn.backward((combine_grads[1], grad_h_ln_total, dispatch_grads[1]))
+                attn_grads = self._attn_backward_grads(
+                    bwd_attn, combine_grads[1], grad_h_ln_total, dispatch_grads[1])
+                grad_x = bwd_attn.backward(attn_grads)
 
             for n in fwd_nodes:
                 if n.checkpoint:
