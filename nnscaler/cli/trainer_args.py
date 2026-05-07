@@ -21,7 +21,7 @@ import torch
 import nnscaler
 from nnscaler.utils import enforce_zero_num_worker, fields, transform_recursively, load_type, copy_dynamic
 from nnscaler.parallel import ComputeConfig, build_optimizer, ReuseType, BroadcastGenFilesStrategy, _PREDEFINED_POLICIES
-from nnscaler.runtime.utils import set_grad_dtype
+from nnscaler.runtime.utils import is_torch_version_at_least, set_grad_dtype
 
 from .arg_parser import (
     deserialize_dataclass,
@@ -127,7 +127,8 @@ def _resolve_precision(precision: Union[str, Dict[_TENSOR_TYPE, _PRECISION_TYPE]
     if any(k not in supported_tensor_type for k in precision):
         raise ValueError(f"Invalid tensor type found in {precision.keys()}")
 
-    if _get_tensor_dtype(precision, 'grad') is not None and torch.__version__ < (2, 10):
+    if (_get_tensor_dtype(precision, 'grad') is not None
+            and not is_torch_version_at_least(2, 10)):
         raise RuntimeError(f'setting grad precision is only supported in PyTorch 2.10 or above, but got {torch.__version__}')
 
     return precision

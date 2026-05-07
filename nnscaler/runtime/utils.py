@@ -284,6 +284,18 @@ def set_dparam_meta(param: torch.nn.Parameter, meta: 'AttrMeta'):
     setattr(param, DISTRIBUTED_PARAM_META_KEY, meta)
 
 
+def is_torch_version_at_least(major: int, minor: int) -> bool:
+    """Compare PyTorch by release tuple, accepting nightly/pre-release builds."""
+    release = str(torch.__version__).split('+', 1)[0]
+    parts = []
+    for part in release.split('.')[:2]:
+        digits = ''.join(ch for ch in part if ch.isdigit())
+        parts.append(int(digits) if digits else 0)
+    while len(parts) < 2:
+        parts.append(0)
+    return tuple(parts) >= (major, minor)
+
+
 def set_grad_dtype(
         module_or_param: Union[torch.nn.Module, torch.nn.Parameter],
         dtype: Optional[torch.dtype],
@@ -292,7 +304,7 @@ def set_grad_dtype(
 ):
     if dtype is None:
         return
-    if torch.__version__ < (2, 10):
+    if not is_torch_version_at_least(2, 10):
         if raise_on_unsupported:
             raise RuntimeError(f'Setting grad dtype is only supported in PyTorch 2.10 or above, but got {torch.__version__}')
         return
