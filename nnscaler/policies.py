@@ -769,6 +769,11 @@ def fn(
         # The reason is that stages may have different number of devices, it is hard to synchronize gradients directly
         # by inserting reducers although weights are all REPLICAED.
 
+        # The effect is that the parameter will be converted to a normal tensor
+        # and will be passed to the next stages.
+        # So only the first stage will have the parameter as a parameter,
+        # and the later stages will have it as an activation tensor.
+
         # A further explanation:
         # 1. len(splits) > 1: the param is partitioned in different ways in its different consumers.
         #    this can also happen when pipeline parallelism is not used
