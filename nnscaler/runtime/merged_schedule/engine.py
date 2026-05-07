@@ -32,214 +32,15 @@ from torch.autograd import Variable
 import nnscaler
 
 
-
 # Suppress AccumulateGrad stream mismatch warning in dual-stream mode.
 if hasattr(torch.autograd.graph, 'set_warn_on_accumulate_grad_stream_mismatch'):
     torch.autograd.graph.set_warn_on_accumulate_grad_stream_mismatch(False)
 
 _logger = logging.getLogger(__name__)
 
-_COMP_STREAM = None   # computation stream (default stream)
-_COMM_STREAM = None   # communication stream (side stream)
+_COMP_STREAM = None   # computation stream (non-defaul)
+_COMM_STREAM = None   # communication stream (non-default)
 _IN_RECOMPUTE = False  # Flag: True when inside ScheduleNode checkpoint recompute
-_PROFILE_OVERLAP = os.environ.get('PROFILE_OVERLAP', '0') not in ('0', '')
-_profile_data = []  # collected per merged-step timing records
-_TIMING_BREAKDOWN = os.environ.get('TIMING_BREAKDOWN', '0') not in ('0', '')
-_sequential_comm_events = []  # [(start_ev, end_ev)] for COMM ops in non-overlap phases
-_LAYER_CHECKSUM = bool(os.environ.get('LAYER_CHECKSUM'))
-
-
-
-def _log_checksum(tag, tensor):
-    """Log tensor checksum for precision debugging."""
-    if not _LAYER_CHECKSUM:
-        return
-    with torch.no_grad():
-        t = tensor.float()
-        s = t.sum().item()
-        n = t.norm().item()
-        mx = t.abs().max().item()
-    _logger.info(f"[CHECKSUM] {tag} sum={s:.15e} norm={n:.15e} max={mx:.15e}")
-
-
-
-class _TimingCtx:
-    """Lightweight timing context for run() breakdown using CUDA events.
-
-    Uses CUDA events with enable_timing=True instead of torch.cuda.synchronize()
-    + perf_counter. This avoids ~15 device-wide syncs per step that distort
-    profiling results and make overlap debugging impossible.
-
-    Only one synchronize happens: inside report(), after all work is done.
-
-    Usage:
-        tb = _TimingCtx(enabled)
-        tb.start()
-        ... code ...
-        tb.mark('phase_name')  # records a CUDA event (no sync)
-        ... more code ...
-        tb.mark('next_phase')
-        tb.report()             # single sync + elapsed_time() for all segments
-    """
-
-    def __init__(self, enabled):
-        self.enabled = enabled
-        self._events = []       # [(name, start_event, end_event)]
-        self._last_event = None
-
-    def start(self):
-        if not self.enabled:
-            return
-        ev = torch.cuda.Event(enable_timing=True)
-        ev.record()
-        self._last_event = ev
-
-    def mark(self, name):
-        if not self.enabled:
-            return
-        ev = torch.cuda.Event(enable_timing=True)
-        ev.record()
-        self._events.append((name, self._last_event, ev))
-        self._last_event = ev
-
-    def report(self, label="TIMING BREAKDOWN"):
-        if not self.enabled or not self._events:
-            return
-        torch.cuda.synchronize()
-        import torch.distributed as dist
-        rank = dist.get_rank() if dist.is_initialized() else 0
-        if rank != 0:
-            return
-        records = []
-        for name, start_ev, end_ev in self._events:
-            ms = start_ev.elapsed_time(end_ev)
-            records.append((name, ms / 1000.0))
-        total = sum(t for _, t in records)
-        lines = [f"=== {label} ==="]
-        for name, t in records:
-            pct = t / total * 100 if total > 0 else 0
-            lines.append(f"  {name:30s}: {t:8.3f}s  ({pct:5.1f}%)")
-        lines.append(f"  {'TOTAL':30s}: {total:8.3f}s")
-        _logger.info("\n".join(lines))
-
-
-def _profile_report():
-    """Log overlap profiling summary. Called after torch.cuda.synchronize()."""
-    if not _profile_data:
-        _sequential_comm_events.clear()
-        return
-    import torch.distributed as dist
-    rank = dist.get_rank() if dist.is_initialized() else 0
-    if rank != 0:
-        _profile_data.clear()
-        _sequential_comm_events.clear()
-        return
-
-    phase_names = ['P1(b_combine||f_attn)', 'P2(b_expert||f_dispatch)',
-                   'P3(b_dispatch||f_expert)', 'P4(b_attn||f_combine)']
-
-    # Compute timings from stored events.
-    # Events are recorded BEFORE cross-stream barriers, so the faster stream's
-    # measurement for the NEXT phase includes its barrier wait.
-    # Decontamination: subtract the barrier wait (= gap between the two streams
-    # in the previous phase) from the stream that waited.
-    records = []
-    for raw in _profile_data:
-        ce, me = raw['ce'], raw['me']
-        # Collect raw (contaminated) measurements
-        raw_comp = [ce[pi].elapsed_time(ce[pi + 1]) for pi in range(4)]
-        raw_comm = [me[pi].elapsed_time(me[pi + 1]) for pi in range(4)]
-
-        # Decontaminate: P1 is clean; for P2-P4, remove barrier wait leakage
-        act_comp = [0.0] * 4
-        act_comm = [0.0] * 4
-        act_comp[0] = raw_comp[0]
-        act_comm[0] = raw_comm[0]
-        for pi in range(1, 4):
-            barrier_wait = abs(act_comp[pi - 1] - act_comm[pi - 1])
-            if act_comp[pi - 1] < act_comm[pi - 1]:
-                # COMP was faster → COMP waited at barrier → its next measurement is inflated
-                act_comp[pi] = raw_comp[pi] - barrier_wait
-                act_comm[pi] = raw_comm[pi]
-            else:
-                act_comp[pi] = raw_comp[pi]
-                act_comm[pi] = raw_comm[pi] - barrier_wait
-
-        phases = []
-        for pi in range(4):
-            wall_ms = max(act_comp[pi], act_comm[pi])
-            phases.append({
-                'comp_ms': act_comp[pi], 'comm_ms': act_comm[pi], 'wall_ms': wall_ms,
-                'raw_comp_ms': raw_comp[pi], 'raw_comm_ms': raw_comm[pi],
-            })
-        total_comp = sum(act_comp)
-        total_comm = sum(act_comm)
-        total_wall = sum(p['wall_ms'] for p in phases)
-        records.append({
-            'wall_ms': total_wall, 'comp_ms': total_comp, 'comm_ms': total_comm,
-            'phases': phases
-        })
-
-    n = len(records)
-
-    total_wall = sum(r['wall_ms'] for r in records)
-    total_comp = sum(r['comp_ms'] for r in records)
-    total_comm = sum(r['comm_ms'] for r in records)
-    avg_wall = total_wall / n
-    avg_comp = total_comp / n
-    avg_comm = total_comm / n
-    avg_overlap_pct = (avg_comp + avg_comm - avg_wall) / avg_wall * 100 if avg_wall > 0 else 0
-    _logger.info(
-        f"[PROFILE] 4-phase merged step (n={n}): "
-        f"wall={avg_wall:.2f}ms, comp={avg_comp:.2f}ms, comm={avg_comm:.2f}ms, "
-        f"overlap={avg_overlap_pct:.1f}%"
-    )
-    for pi in range(4):
-        ac = sum(r['phases'][pi]['comp_ms'] for r in records) / n
-        am = sum(r['phases'][pi]['comm_ms'] for r in records) / n
-        aw = sum(r['phases'][pi]['wall_ms'] for r in records) / n
-        rc = sum(r['phases'][pi]['raw_comp_ms'] for r in records) / n
-        rm = sum(r['phases'][pi]['raw_comm_ms'] for r in records) / n
-        op = (ac + am - aw) / aw * 100 if aw > 0 else 0
-        # per-phase comm hiding: Σmin(comp,comm) / Σcomm across records
-        ph = sum(min(r['phases'][pi]['comp_ms'], r['phases'][pi]['comm_ms']) for r in records)
-        pc = sum(r['phases'][pi]['comm_ms'] for r in records)
-        ch = ph / pc * 100 if pc > 0 else 0
-        raw_note = ""
-        if abs(rc - ac) > 0.01 or abs(rm - am) > 0.01:
-            raw_note = f" (raw: comp={rc:.2f} comm={rm:.2f})"
-        _logger.info(
-            f"  {phase_names[pi]}: wall={aw:.2f}ms comp={ac:.2f}ms comm={am:.2f}ms "
-            f"overlap={op:.1f}% comm_hiding={ch:.1f}%{raw_note}"
-        )
-
-    # --- Communication hiding rate ---
-    # COMM_hidden: comm time in merged loop that runs concurrently with comp
-    # = sum of min(comp_i, comm_i) per phase across all merged steps
-    comm_hidden_ms = 0.0
-    comm_merged_ms = 0.0
-    for r in records:
-        for p in r['phases']:
-            comm_hidden_ms += max(0.0, min(p['comp_ms'], p['comm_ms']))
-            comm_merged_ms += max(0.0, p['comm_ms'])
-
-    # COMM_sequential: comm time in non-overlap phases (warmup/cooldown/remaining)
-    comm_sequential_ms = 0.0
-    for (s_ev, e_ev) in _sequential_comm_events:
-        comm_sequential_ms += s_ev.elapsed_time(e_ev)
-
-    comm_total_ms = comm_merged_ms + comm_sequential_ms
-    hiding_rate = comm_hidden_ms / comm_total_ms * 100 if comm_total_ms > 0 else 0
-
-    _logger.info(
-        f"[PROFILE-COMM] hiding_rate={hiding_rate:.1f}% "
-        f"COMM_hidden={comm_hidden_ms:.1f}ms "
-        f"COMM_total={comm_total_ms:.1f}ms "
-        f"(merged={comm_merged_ms:.1f}ms sequential={comm_sequential_ms:.1f}ms)"
-    )
-
-    _sequential_comm_events.clear()
-    _profile_data.clear()
 
 
 def set_streams():
@@ -267,15 +68,6 @@ def _make_viewless(t):
     if isinstance(t, torch.Tensor) and t._base is not None:
         return t.clone()
     return t
-
-
-def _detach_tensor(t):
-    """Detach tensor, mark requires_grad, and ensure own storage view."""
-    if t is None:
-        return None
-    d = _make_viewless(t).detach()
-    d.requires_grad = t.requires_grad
-    return d
 
 
 class ScheduleNode:
@@ -314,7 +106,6 @@ class ScheduleNode:
         self.inputs = None
         self.output = None
         self._skip_event = False  # When True, skip event wait/record in _stream_ctx
-        self._collect_exec_time = False  # When True, record exec time events for COMM profiling
 
     def forward(self, inputs=()):
         if not isinstance(inputs, tuple):
@@ -341,9 +132,6 @@ class ScheduleNode:
                 else:
                     self.inputs.append(inp)
 
-            if self._collect_exec_time:
-                _ev_s = torch.cuda.Event(enable_timing=True); _ev_s.record()
-
             if self.checkpoint:
                 with torch.no_grad():
                     data = self.forward_func(*self.inputs)
@@ -357,10 +145,6 @@ class ScheduleNode:
                     )
             else:
                 data = self.forward_func(*self.inputs)
-
-            if self._collect_exec_time:
-                _ev_e = torch.cuda.Event(enable_timing=True); _ev_e.record()
-                _sequential_comm_events.append((_ev_s, _ev_e))
 
             self.output = data
 
@@ -388,9 +172,6 @@ class ScheduleNode:
                 g.record_stream(self.stream)
 
         with self._stream_ctx(f"{self.name} bwd"):
-            if self._collect_exec_time:
-                _ev_s = torch.cuda.Event(enable_timing=True); _ev_s.record()
-
             if self.checkpoint:
                 _IN_RECOMPUTE = True
                 try:
@@ -422,10 +203,6 @@ class ScheduleNode:
                 if tensor_outputs:
                     self.backward_func(tuple(tensor_outputs), tuple(tensor_grads),
                                        retain_graph=retain_graph)
-
-            if self._collect_exec_time:
-                _ev_e = torch.cuda.Event(enable_timing=True); _ev_e.record()
-                _sequential_comm_events.append((_ev_s, _ev_e))
 
         grads = self.get_grad()
         self._release()
@@ -465,25 +242,6 @@ class ScheduleNode:
     def _release(self):
         self.inputs = None
         self.output = None
-
-
-class NoopScheduleNode:
-    """Transparent pass-through: forward returns inputs, backward returns output_grad."""
-
-    def __init__(self, name="noop"):
-        self.name = name
-
-    def forward(self, inputs=()):
-        return inputs
-
-    def backward(self, output_grad):
-        return output_grad
-
-    def get_output(self):
-        return None
-
-    def get_grad(self):
-        return None
 
 
 @dataclass
@@ -558,9 +316,6 @@ class MergedScheduler:
         num_mbs = len(samples)
         assert num_mbs >= 2, "merged FWD-BWD requires at least 2 micro-batches"
 
-        tb = _TimingCtx(_TIMING_BREAKDOWN)
-        tb.start()
-
         # Ensure COMP/COMM streams see all prior default-stream work
         # (optimizer.step, zero_grad from the previous training step).
         # Non-blocking streams do NOT auto-synchronize with the default stream,
@@ -575,24 +330,17 @@ class MergedScheduler:
         events = [torch.cuda.Event() for _ in range(num_mbs)]
         results = [None] * num_mbs
 
-        # Layer-level profiler: removed (synchronize-based profiling destroys
-        # dual-stream overlap; use PROFILE_OVERLAP or nsys instead)
-
         _logger.debug("Warmup: forward mb0")
         with torch.cuda.stream(get_comp_stream()):
             h0 = embed_fn(samples[0])
         _embed_h_list = [h0]  # Save embedding outputs for backward
-        _log_checksum("merged embed mb=0", h0)
-        tb.mark("warmup_embed")
 
         lc_list_0 = []
         for si in range(num_steps):
             lc_list_0.append(layer_callables_fn(si, samples[0]))
-        tb.mark("warmup_lc_create")
 
         h0, all_nodes_0, rmaps_0, eprobs_0 = self._forward_all_layers(
             h0, lc_list_0, events[0])
-        tb.mark("warmup_fwd_layers")
 
         # Sync COMM→COMP: last forward node may be on COMM (MoE combine),
         # but loss_node runs on COMP with a fresh event (no wait).
@@ -605,7 +353,6 @@ class MergedScheduler:
         with torch.cuda.stream(get_comp_stream()):
             loss_grad = torch.ones_like(loss_0)
         del h0, rmaps_0, eprobs_0, output_info_0
-        tb.mark("warmup_loss")
 
         prev_all_nodes = all_nodes_0
         prev_loss_node = loss_node_0
@@ -627,13 +374,11 @@ class MergedScheduler:
                 grad_h = prev_loss_node.backward(loss_grad)
 
             prev_loss_node._release()
-            tb.mark(f"mb{mb_i}_loss_bwd")
 
             # Create layer callables (CPU work, overlaps with GPU)
             fwd_lc_list = []
             for si in range(num_steps):
                 fwd_lc_list.append(layer_callables_fn(si, fwd_sample))
-            tb.mark(f"mb{mb_i}_embed_lc")
 
             fwd_routing_maps = []
             fwd_expert_probs = []
@@ -672,8 +417,7 @@ class MergedScheduler:
 
                 with nnscaler.sync_grad_when(False):
                     fwd_h, grad_h, fwd_entry = self._merged_step_general(
-                        bwd_entry, fwd_lc, fwd_event, grad_h, fwd_h,
-                        fwd_layer_idx=fwd_idx, bwd_layer_idx=bwd_idx)
+                        bwd_entry, fwd_lc, fwd_event, grad_h, fwd_h)
 
                 prev_all_nodes[bwd_idx] = None
 
@@ -685,8 +429,6 @@ class MergedScheduler:
 
                 fwd_idx += 1
                 bwd_idx -= 1
-
-            tb.mark(f"mb{mb_i}_merged_loop")
 
             while fwd_idx < num_steps:
                 fwd_lc = fwd_lc_list[fwd_idx]
@@ -733,7 +475,6 @@ class MergedScheduler:
             # Propagate gradient through embedding graph to tok_embed weight
             with nnscaler.sync_grad_when(False):
                 _embed_h_list[mb_i].backward(grad_h)
-            tb.mark(f"mb{mb_i}_remaining_fwd_bwd")
 
             # Sync COMM→COMP: last fwd node may be on COMM (MoE combine),
             # but loss_node runs on COMP with a fresh event.
@@ -751,7 +492,6 @@ class MergedScheduler:
                 del all_nodes_0, loss_node_0, loss_0
             del fwd_h, fwd_loss, fwd_routing_maps, fwd_expert_probs
             del fwd_lc_list
-            tb.mark(f"mb{mb_i}_loss_fwd")
 
         _logger.debug(f"Cooldown: backward mb{num_mbs-1}")
         with nnscaler.sync_grad_when(False):
@@ -768,22 +508,14 @@ class MergedScheduler:
                 grad_h = self._backward_entry(entry, grad_h)
             # Propagate gradient through embedding graph to tok_embed weight
             _embed_h_list[-1].backward(grad_h)
-        tb.mark("cooldown_bwd")
 
-        if _PROFILE_OVERLAP:
-            # Profile needs host-visible event completion for elapsed_time().
-            torch.cuda.synchronize()
-            _profile_report()
-        else:
-            # Use stream-event sync instead of device-wide synchronize:
-            # Make default stream wait for COMP/COMM to finish, without blocking host.
-            comp_done = torch.cuda.Event()
-            comm_done = torch.cuda.Event()
-            comp_done.record(get_comp_stream())
-            comm_done.record(get_comm_stream())
-            torch.cuda.default_stream().wait_event(comp_done)
-            torch.cuda.default_stream().wait_event(comm_done)
-        tb.mark("cuda_sync")
+        # Make default stream wait for COMP/COMM to finish without blocking host.
+        comp_done = torch.cuda.Event()
+        comm_done = torch.cuda.Event()
+        comp_done.record(get_comp_stream())
+        comm_done.record(get_comm_stream())
+        torch.cuda.default_stream().wait_event(comp_done)
+        torch.cuda.default_stream().wait_event(comm_done)
 
         for i in range(len(results)):
             if results[i] is not None:
@@ -793,9 +525,6 @@ class MergedScheduler:
                 )
 
         del prev_all_nodes, prev_loss_node
-
-
-        tb.report("MERGED SCHEDULER BREAKDOWN")
 
         return results
 
@@ -879,16 +608,6 @@ class MergedScheduler:
         elif isinstance(grads, torch.Tensor):
             grads.record_stream(comp)
 
-    def _record_for_comm(self, grads):
-        """Record COMP-produced tensors for safe use on COMM stream."""
-        comm = get_comm_stream()
-        if isinstance(grads, tuple):
-            for t in grads:
-                if isinstance(t, torch.Tensor):
-                    t.record_stream(comm)
-        elif isinstance(grads, torch.Tensor):
-            grads.record_stream(comm)
-
     def _forward_all_layers(self, h, lc_list, event):
         """Warmup: forward all layers, collect nodes and routing data."""
         all_nodes = []
@@ -925,7 +644,6 @@ class MergedScheduler:
                 routing_maps.append(lc.step_data.get('routing_map'))
                 expert_probs.append(lc.step_data.get('gate_scores'))
 
-            _log_checksum(f"merged layer={si}", h)
             all_nodes.append(entry)
 
         return h, all_nodes, routing_maps, expert_probs
@@ -955,20 +673,12 @@ class MergedScheduler:
         nodes = self._create_nodes_4(lc, event)
         attn_n, dispatch_n, expert_n, combine_n = nodes
 
-        if _PROFILE_OVERLAP:
-            dispatch_n._collect_exec_time = True
-            combine_n._collect_exec_time = True
-
         attn_out = attn_n.forward((h,))
         h_residual, h_ln, routing_probs = attn_out
         dispatch_out = dispatch_n.forward((h_ln, routing_probs))
         expert_result = expert_n.forward((*dispatch_out, h_ln))
         expert_out, shared_expert_out = expert_result
         h_out = combine_n.forward((expert_out, h_residual, shared_expert_out))
-
-        if _PROFILE_OVERLAP:
-            dispatch_n._collect_exec_time = False
-            combine_n._collect_exec_time = False
 
         for n in nodes:
             if n.checkpoint:
@@ -994,10 +704,6 @@ class MergedScheduler:
         """
         attn_n, dispatch_n, expert_n, combine_n = nodes
 
-        if _PROFILE_OVERLAP:
-            combine_n._collect_exec_time = True
-            dispatch_n._collect_exec_time = True
-
         # Ensure all intermediate ops run on COMP stream,
         # not the default stream (which has no sync with COMP/COMM in overlap mode).
         with torch.cuda.stream(get_comp_stream()):
@@ -1019,10 +725,6 @@ class MergedScheduler:
 
             grad_x = attn_n.backward((combine_grads[1], grad_h_ln_total, dispatch_grads[1]))
 
-        if _PROFILE_OVERLAP:
-            combine_n._collect_exec_time = False
-            dispatch_n._collect_exec_time = False
-
         return grad_x
 
     def _backward_entry(self, entry, grad_h):
@@ -1035,10 +737,9 @@ class MergedScheduler:
         else:
             raise ValueError(f"Unknown entry tag: {tag}")
 
-    def _merged_step(self, bwd_entry, fwd_lc, fwd_event, grad_h, fwd_h,
-                     fwd_layer_idx=-1, bwd_layer_idx=-1):
+    def _merged_step(self, bwd_entry, fwd_lc, fwd_event, grad_h, fwd_h):
         """2-phase overlap for dense layers."""
-        bwd_tag, bwd_nodes = bwd_entry
+        _, bwd_nodes = bwd_entry
         bwd_attn, bwd_body = bwd_nodes
 
         fwd_nodes = self._create_nodes(fwd_lc, fwd_event)
@@ -1082,14 +783,6 @@ class MergedScheduler:
 
         pool = self._async_pool  # None in sequential mode
 
-        profiling = bool(_PROFILE_OVERLAP)
-        if profiling:
-            comp_s, comm_s = get_comp_stream(), get_comm_stream()
-            # 5 boundaries × 2 streams = 10 events (enable_timing for elapsed_time)
-            # Boundaries: start, after_p1, after_p2, after_p3, after_p4
-            ce = [torch.cuda.Event(enable_timing=True) for _ in range(5)]  # COMP
-            me = [torch.cuda.Event(enable_timing=True) for _ in range(5)]  # COMM
-
         # --- Skip per-node event protocol during merged step ---
         # The default shared event serializes all nodes (COMP waits for COMM
         # and vice versa), preventing within-phase parallelism. By setting
@@ -1108,10 +801,6 @@ class MergedScheduler:
             # Initial sync: COMP→COMM so COMM can read grad_h (from loss_bwd on COMP)
             self._sync_comp_to_comm()
 
-            if profiling:
-                ce[0].record(comp_s)
-                me[0].record(comm_s)
-
             # Phase 1: COMM(b_combine) || COMP(f_attn_router)
             # b_combine is pure communication (shared expert merged into expert).
             if pool is not None:
@@ -1122,10 +811,6 @@ class MergedScheduler:
                 combine_grads = bwd_combine.backward(grad_h)
                 fwd_attn_out = fwd_attn.forward((fwd_h,))
             fwd_h_residual, fwd_h_ln, fwd_routing_probs = fwd_attn_out
-
-            if profiling:
-                ce[1].record(comp_s)
-                me[1].record(comm_s)
 
             # Phase boundary: Phase 2 COMP needs COMM output (combine_grads),
             # Phase 2 COMM needs COMP output (attn_out + precomputed metadata)
@@ -1143,10 +828,6 @@ class MergedScheduler:
                 expert_grads = bwd_expert.backward((combine_grads[0], combine_grads[2]))
             # expert_grads: (grad_sorted_tokens, grad_sorted_probs, grad_h_ln)
 
-            if profiling:
-                ce[2].record(comp_s)
-                me[2].record(comm_s)
-
             # Phase boundary: Phase 3 COMP needs COMM output (dispatch_out),
             # Phase 3 COMM needs COMP output (expert_grads)
             self._cross_stream_barrier(slot=1)
@@ -1161,10 +842,6 @@ class MergedScheduler:
                 dispatch_grads = bwd_dispatch.backward((expert_grads[0], expert_grads[1]))
                 fwd_expert_result = fwd_expert.forward((*fwd_dispatch_out, fwd_h_ln))
             fwd_expert_out, fwd_shared_expert_out = fwd_expert_result
-
-            if profiling:
-                ce[3].record(comp_s)
-                me[3].record(comm_s)
 
             # Phase boundary: Phase 4 COMP needs COMM output (dispatch_grads),
             # Phase 4 COMM needs COMP output (expert_out + shared_expert_out)
@@ -1186,10 +863,6 @@ class MergedScheduler:
                 grad_h_ln_total = dispatch_grads[0] + expert_grads[2]
                 grad_x = bwd_attn.backward((combine_grads[1], grad_h_ln_total, dispatch_grads[1]))
 
-            if profiling:
-                ce[4].record(comp_s)
-                me[4].record(comm_s)
-
             for n in fwd_nodes:
                 if n.checkpoint:
                     n.output = None
@@ -1203,28 +876,16 @@ class MergedScheduler:
         for n in fwd_nodes:
             n._skip_event = False
 
-        if profiling:
-            # Don't synchronize here - just store events for later analysis.
-            # _profile_report() will be called after torch.cuda.synchronize() in run().
-            _profile_data.append({'ce': ce, 'me': me})
-
         return fwd_h_out, grad_x, ('layer4', fwd_nodes)
 
-    def _merged_step_general(self, bwd_entry, fwd_lc, fwd_event, grad_h, fwd_h,
-                             fwd_layer_idx=-1, bwd_layer_idx=-1):
+    def _merged_step_general(self, bwd_entry, fwd_lc, fwd_event, grad_h, fwd_h):
         """Dispatch to 4-phase or 2-phase merged step based on layer types."""
         bwd_tag, bwd_nodes = bwd_entry
 
         if self._use_4node and bwd_tag == 'layer4' and fwd_lc.is_moe:
-            # DEBUG: force fallback to isolate 4-phase interleaving vs stream issues
-            if os.environ.get('DEBUG_NO_4PHASE'):
-                grad_x = self._backward_entry(bwd_entry, grad_h)
-                fwd_h_out, fwd_entry = self._forward_single_layer_4node(fwd_h, fwd_lc, fwd_event)
-                return fwd_h_out, grad_x, fwd_entry
             return self._merged_step_4phase(bwd_nodes, fwd_lc, fwd_event, grad_h, fwd_h)
         elif bwd_tag == 'layer2':
-            return self._merged_step(bwd_entry, fwd_lc, fwd_event, grad_h, fwd_h,
-                                     fwd_layer_idx=fwd_layer_idx, bwd_layer_idx=bwd_layer_idx)
+            return self._merged_step(bwd_entry, fwd_lc, fwd_event, grad_h, fwd_h)
         else:
             with nnscaler.sync_grad_when(False):
                 grad_x = self._backward_entry(bwd_entry, grad_h)

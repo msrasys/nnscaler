@@ -4,7 +4,6 @@ from .engine import (
     MergedScheduler,
     LayerCallables,
     ScheduleNode,
-    NoopScheduleNode,
     set_streams,
     get_comp_stream,
     get_comm_stream,
