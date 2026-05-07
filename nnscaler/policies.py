@@ -551,8 +551,16 @@ def fn(
     # key: IRFullTensor
     # value:
     #   key: stage_id
-    #   value: set of dims in this stage, None if the tensor is replicated in this stage
-    tensor_splits: dict[IRFullTensor, dict[int, set[Optional[int]]]] = {}
+    #   value: set of dims in this stage,
+    #       'rr' if the tensor is replicated and grad will be all-reduced:
+    #            One case where grad will be all-reduced:
+    #            1. op is partitioned on other tensors, and this tensor is not marked as '/'(no-grad-reduce)
+    #       'rn' if the tensor is replicated and grad will not be all-reduced.
+    #            Two cases where grad will not be all-reduced:
+    #            1. op is partitioned on other tensors, and this tensor is marked as '/'(no-grad-reduce)
+    #            2. op is replicated
+    #       int: the partitioned dim if the tensor is partitioned
+    tensor_splits: dict[IRFullTensor, dict[int, set[int | Literal['rr', 'rn']]]] = {}
     # store the last split info for each tensor to help handle auto partition
     # None: replicated
     # 'value': value partitioned
@@ -603,7 +611,7 @@ def fn(
 
         # final partition plan for the op
         # key: input idx, value: partitioned dim
-        op_partition_map: dict[int, int] = {}
+        op_partition_map: dict[int, int | Literal['rn', 'rr']] = {}
         if op_partitions:
             # we partition the op based on the first partition plan
             # and then check the rest partitions are satisfied or not
@@ -611,10 +619,11 @@ def fn(
             partitioned_nodes = op_plan.op.algorithm('dim')\
                 .instantiate(idx=op_first_partition.input, dim=op_first_partition.dim, num=ngpus)
             subnode = partitioned_nodes[0]  # first subnode carries all necessary partition info
+            assert isinstance(subnode, IRDimops), "Internal Error: partitioned node should be IRDimops"
 
             # collect input partition info
             # key: input idx, value: partitioned dim
-            result_partitions: dict[int, int] = {}
+            result_partitions: dict[int, int | Literal['rn', 'rr']] = {}
             for idx, input in enumerate(subnode.inputs()):
                 if not isinstance(input, IRSubTensor):
                     continue
@@ -622,6 +631,8 @@ def fn(
                 assert len(split_dims) <= 1, "Internal Error: multiple splitdims in one input"
                 if split_dims:
                     result_partitions[idx] = split_dims[0]
+                else:
+                    result_partitions[idx] = 'rn' if subnode.ignore_grad_reduce(input_idx=idx) else 'rr'
 
             # check the rest partitions
             # Note if we only have one partition plan, the check is skipped, we can always partition it
@@ -677,7 +688,10 @@ def fn(
             if ftensor not in tensor_splits:
                 tensor_splits[ftensor] = {}
             if idx not in op_partition_map:
-                tensor_splits[ftensor].setdefault(op_plan.stage_id, set()).add(None)
+                assert not op_partition_map, "Internal Error: if op_partition_map is not empty, all input should have partition info"
+                # if the op is not partitioned,
+                # all inputs should be replicated, and no grad accumulation is needed
+                tensor_splits[ftensor].setdefault(op_plan.stage_id, set()).add('rn')
             else:
                 tensor_splits[ftensor].setdefault(op_plan.stage_id, set()).add(op_partition_map[idx])
 
@@ -749,7 +763,7 @@ def fn(
         if not ftensor.is_param():
             continue
         splits = set(k for v in stage_info.values() for k in v)
-        find_replicated = None in splits
+        find_replicated = 'rr' in splits or 'rn' in splits
         splits = list(splits)
         # For safety, we will add multiref when detecting shared param are all replicated for pipeline parallelism.
         # The reason is that stages may have different number of devices, it is hard to synchronize gradients directly
@@ -804,7 +818,8 @@ def fn(
             stage = pp_segs[idx]
             split_list = list(splits)
             if len(split_list) > 1 or (
-                is_seg_output[idx] and split_list[0] is not None # treat segment output as a consumer
+                # treat segment output as a consumer (replicated but not all-reduced)
+                is_seg_output[idx] and split_list[0] != 'rn'
             ):
                 _logger.debug(f'add multiref for {ftensor} in stage {stage}')
                 stage.multiref(ftensor, comment='activation')

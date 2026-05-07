@@ -1,10 +1,11 @@
 import torch
+import pytest
 
 from nnscaler import parallelize, ComputeConfig
 import nnscaler
 
 from tests.autodist.spmd_solver.test_follow import apply_rotary_pos_emb, Model as RopeModel
-from tests.parallel_module.test_gencode import replace_all_device_with, _gencode_contains
+from tests.parallel_module.test_gencode import replace_all_device_with, _gencode_contains, print_gencode
 
 
 def rope_m_policy(graph, cfg):
@@ -200,3 +201,301 @@ def test_value_partition_anno(tmp_path):
     #     matmul_10 = nnscaler.runtime.adapter.nn.allreduce_identity(matmul_19, ranks=[0, 1])
     #     del matmul_19
     #     return matmul_10
+
+
+@nnscaler.register_op('a b : /, b c -> a c')
+def _shared_skip_op(x, w):
+    """Custom op that asks nnscaler to skip grad all-reduce on input 0."""
+    return x @ w
+
+
+class _SharedInputModel(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.w0 = torch.nn.Parameter(torch.randn(4, 4))
+        self.w1 = torch.nn.Parameter(torch.randn(4, 4))
+        self.w2 = torch.nn.Parameter(torch.randn(4, 4))
+
+    def forward(self, raw_x):
+        # The same `x` is consumed by two operators:
+        #   - `_shared_skip_op`: annotation declares input 0 = ': /'
+        #     so its grad-reduce should be skipped.
+        #   - `torch.matmul`: standard op, full grad-reduce expected.
+        x = torch.nn.functional.linear(raw_x, self.w0)
+        a = _shared_skip_op(x, self.w1)
+        b = torch.matmul(x, self.w2)
+        return (a + b).sum()
+
+
+def _shared_input_partition_policy(graph, cfg):
+    """Partition both consumers along weight-dim 1 (= identifier 'c'),
+    which causes `x` (replicated input) to need grad reduction on the
+    `torch.matmul` side. The `_shared_skip_op` side is annotated with `: /`,
+    so its grad reduction must be skipped — but this MUST NOT alter the
+    `torch.matmul` side's gradient bookkeeping.
+    """
+    from nnscaler.policies import OpPlan, OpPartition, get_pas_ops
+
+    for node in get_pas_ops(graph):
+        if node.fn == torch.matmul:
+            yield OpPlan(node, partition=OpPartition(input=1, dim=1))
+        elif node.fn == _shared_skip_op:
+            yield OpPlan(node, partition=OpPartition(input=1, dim=1))
+
+
+@replace_all_device_with('cpu')
+def test_shared_input_with_no_grad_reduce_consumer(tmp_path):
+    """Two consumers of an internal activation `x`:
+      * `_shared_skip_op` is annotated with `: /` -> grad-reduce skipped;
+      * `torch.matmul` is a standard op -> grad-reduce required.
+
+    Both are partitioned along weight-dim 1 (identifier `c`), so `x` is
+    replicated across both ranks for both consumers. After fix, parallelize
+    should succeed and emit at least one `identity_allreduce` on the matmul
+    side.
+    """
+    m = _SharedInputModel()
+    m.train()
+    parallelize(
+        m,
+        {'raw_x': torch.randn(4, 4)},
+        _shared_input_partition_policy,
+        ComputeConfig(2, 4, use_end2end=True),
+        gen_savedir=tmp_path,
+        load_module=False,
+        reuse='override',
+    )
+    # expected exactly one identity_allreduce (on torch.matmul's x input)"
+    assert len(_gencode_contains(tmp_path, _SharedInputModel, 0, r'.*identity_allreduce.*')) == 1
+
+    # code looks like:
+    # def segment110(self, raw_x_20):
+    #     # File "/data/weijiangxu/nnscaler/tests/parallel_module/test_gencode_partition.py", line 223, in forward,  x = torch.nn.functional.linear(raw_x, self.w0)
+    #     linear_23 = torch.nn.functional.linear(raw_x_20, self.w0_22, bias=None)
+    #     del raw_x_20
+    #     # create at IRAdapterGener:autoref, comment before transformation: activation
+    #     linear_52, linear_53 = nnscaler.runtime.function.multiref(linear_23, times=2)
+    #     del linear_23
+    #     # File "/data/weijiangxu/nnscaler/tests/parallel_module/test_gencode_partition.py", line 224, in forward,  a = _shared_skip_op(x, self.w1)
+    #     _shared_skip_op_42 = tests.parallel_module.test_gencode_partition._shared_skip_op(linear_52, self.w1_40)
+    #     del linear_52
+    #     linear_53 = nnscaler.runtime.adapter.nn.identity_allreduce(linear_53, ranks=[0, 1])
+    #     # File "/data/weijiangxu/nnscaler/tests/parallel_module/test_gencode_partition.py", line 225, in forward,  b = torch.matmul(x, self.w2)
+    #     matmul_46 = torch.matmul(linear_53, self.w2_44)
+    #     del linear_53
+    #     _shared_skip_op_25 = nnscaler.runtime.adapter.nn.allgather_split(_shared_skip_op_42, dim=1, ranks=[0, 1])
+    #     del _shared_skip_op_42
+    #     matmul_27 = nnscaler.runtime.adapter.nn.allgather_split(matmul_46, dim=1, ranks=[0, 1])
+    #     del matmul_46
+    #     # File "/data/weijiangxu/nnscaler/tests/parallel_module/test_gencode_partition.py", line 226, in forward,  return (a + b).sum()
+    #     add_28 = torch.add(_shared_skip_op_25, matmul_27, alpha=1)
+    #     del _shared_skip_op_25, matmul_27
+    #     # File "/data/weijiangxu/nnscaler/tests/parallel_module/test_gencode_partition.py", line 226, in forward,  return (a + b).sum()
+    #     sum_1_21 = torch.sum(add_28)
+    #     del add_28
+    #     return sum_1_21
+
+
+class _SharedInputModelReplicatedGradReduce(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.w0 = torch.nn.Parameter(torch.randn(4, 4))
+        self.w1 = torch.nn.Parameter(torch.randn(4, 4))
+        self.w2 = torch.nn.Parameter(torch.randn(4, 4))
+
+    def forward(self, raw_x):
+        # The same `x` is consumed by two operators:
+        #   - `+`: replicated (and no grad reduce).
+        #   - `torch.matmul`: standard op, full grad-reduce expected.
+        x = torch.nn.functional.linear(raw_x, self.w0)
+        a = x + self.w1
+        b = torch.matmul(x, self.w2)
+        return (a + b).sum()
+
+
+@replace_all_device_with('cpu')
+def test_shared_input_replicated_grad_reduce(tmp_path):
+    """Two consumers of an internal activation `x`:
+      * `+` replicated (and no grad reduce);
+      * `torch.matmul` is a standard op -> grad-reduce required.
+    """
+    m = _SharedInputModelReplicatedGradReduce()
+    m.train()
+    parallelize(
+        m,
+        {'raw_x': torch.randn(4, 4)},
+        _shared_input_partition_policy,
+        ComputeConfig(2, 4, use_end2end=True),
+        gen_savedir=tmp_path,
+        load_module=False,
+        reuse='override',
+    )
+    # expected exactly one identity_allreduce (on torch.matmul's x input)"
+    assert len(_gencode_contains(tmp_path, _SharedInputModelReplicatedGradReduce, 0, r'.*identity_allreduce.*')) == 1
+    # code looks like:
+    # def segment98(self, raw_x_20):
+    #     # File "/data/weijiangxu/nnscaler/tests/parallel_module/test_gencode_partition.py", line 309, in forward,  x = torch.nn.functional.linear(raw_x, self.w0)
+    #     linear_23 = torch.nn.functional.linear(raw_x_20, self.w0_22, bias=None)
+    #     del raw_x_20
+    #     # create at IRAdapterGener:autoref, comment before transformation: activation
+    #     linear_48, linear_49 = nnscaler.runtime.function.multiref(linear_23, times=2)
+    #     del linear_23
+    #     # File "/data/weijiangxu/nnscaler/tests/parallel_module/test_gencode_partition.py", line 310, in forward,  a = x + self.w1
+    #     add_25 = torch.add(linear_48, self.w1_24, alpha=1)
+    #     del linear_48
+    #     linear_49 = nnscaler.runtime.adapter.nn.identity_allreduce(linear_49, ranks=[0, 1])
+    #     # File "/data/weijiangxu/nnscaler/tests/parallel_module/test_gencode_partition.py", line 311, in forward,  b = torch.matmul(x, self.w2)
+    #     matmul_42 = torch.matmul(linear_49, self.w2_40)
+    #     del linear_49
+    #     matmul_27 = nnscaler.runtime.adapter.nn.allgather_split(matmul_42, dim=1, ranks=[0, 1])
+    #     del matmul_42
+    #     # File "/data/weijiangxu/nnscaler/tests/parallel_module/test_gencode_partition.py", line 312, in forward,  return (a + b).sum()
+    #     add_1_28 = torch.add(add_25, matmul_27, alpha=1)
+    #     del add_25, matmul_27
+    #     # File "/data/weijiangxu/nnscaler/tests/parallel_module/test_gencode_partition.py", line 312, in forward,  return (a + b).sum()
+    #     sum_1_21 = torch.sum(add_1_28)
+    #     del add_1_28
+    #     return sum_1_21
+
+
+class _SharedInputModelReplicatedNoGradReduce(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.w0 = torch.nn.Parameter(torch.randn(4, 4))
+        self.w1 = torch.nn.Parameter(torch.randn(4, 4))
+        self.w2 = torch.nn.Parameter(torch.randn(4, 4))
+
+    def forward(self, raw_x):
+        # The same `x` is consumed by two operators:
+        #   - `+`: replicated (and no grad reduce).
+        #   - `_shared_skip_op`: replicated and no grad reduce.
+        x = torch.nn.functional.linear(raw_x, self.w0)
+        a = x + self.w1
+        b = _shared_skip_op(x, self.w2)
+        return (a + b).sum()
+
+
+@replace_all_device_with('cpu')
+def test_shared_input_replicated_no_grad_reduce(tmp_path):
+    """Two consumers of an internal activation `x`:
+      * `+` replicated (and no grad reduce);
+      * `_shared_skip_op` is a standard op -> grad-reduce required.
+    """
+    m = _SharedInputModelReplicatedNoGradReduce()
+    m.train()
+    parallelize(
+        m,
+        {'raw_x': torch.randn(4, 4)},
+        _shared_input_partition_policy,
+        ComputeConfig(2, 4, use_end2end=True),
+        gen_savedir=tmp_path,
+        load_module=False,
+        reuse='override',
+    )
+    # expected no identity_allreduce (still have multiref added by `local_consumer_multiref` )
+    assert not _gencode_contains(tmp_path, _SharedInputModelReplicatedNoGradReduce, 0, r'.*identity_allreduce.*')
+    # code looks like:
+    # def segment74(self, raw_x_20):
+    #     # File "/data/weijiangxu/nnscaler/tests/parallel_module/test_gencode_partition.py", line 371, in forward,  x = torch.nn.functional.linear(raw_x, self.w0)
+    #     linear_23 = torch.nn.functional.linear(raw_x_20, self.w0_22, bias=None)
+    #     del raw_x_20
+    #     # created at IRAdapterGener:local_consumer_multiref
+    #     linear_50, linear_54 = nnscaler.runtime.function.multiref(linear_23, times=2)
+    #     del linear_23
+    #     # File "/data/weijiangxu/nnscaler/tests/parallel_module/test_gencode_partition.py", line 372, in forward,  a = x + self.w1
+    #     add_25 = torch.add(linear_50, self.w1_24, alpha=1)
+    #     del linear_50
+    #     # File "/data/weijiangxu/nnscaler/tests/parallel_module/test_gencode_partition.py", line 373, in forward,  b = _shared_skip_op(x, self.w2)
+    #     _shared_skip_op_42 = tests.parallel_module.test_gencode_partition._shared_skip_op(linear_54, self.w2_40)
+    #     del linear_54
+    #     _shared_skip_op_27 = nnscaler.runtime.adapter.nn.allgather_split(_shared_skip_op_42, dim=1, ranks=[0, 1])
+    #     del _shared_skip_op_42
+    #     # File "/data/weijiangxu/nnscaler/tests/parallel_module/test_gencode_partition.py", line 374, in forward,  return (a + b).sum()
+    #     add_1_28 = torch.add(add_25, _shared_skip_op_27, alpha=1)
+    #     del add_25, _shared_skip_op_27
+    #     # File "/data/weijiangxu/nnscaler/tests/parallel_module/test_gencode_partition.py", line 374, in forward,  return (a + b).sum()
+    #     sum_1_21 = torch.sum(add_1_28)
+    #     del add_1_28
+    #     return sum_1_21
+
+
+class StageOutputModel(torch.nn.Module):
+    def __init__(self, no_grad_reduce=False):
+        hidden_dim = 4
+        self.no_grad_reduce = no_grad_reduce
+        super().__init__()
+        self.w = torch.nn.Parameter(torch.randn(hidden_dim, hidden_dim))
+
+    def forward(self, x):
+        y = torch.nn.functional.relu(x)
+        if self.no_grad_reduce:
+            z = _shared_skip_op(y, self.w)
+        else:
+            z = torch.matmul(y, self.w)
+        w = y + z
+        return w.sum()
+
+
+def _stage_output_policy(graph, cfg):
+    from nnscaler.policies import OpPlan, get_pas_ops, OpPartition
+
+    matmul_found = False
+    for node in get_pas_ops(graph):
+        if matmul_found:
+            yield OpPlan(node,stage_id=1)
+        else:
+            if node.fn == torch.matmul or node.fn == _shared_skip_op:
+                yield OpPlan(node, stage_id=0, partition=OpPartition(input=1, dim=1))
+                matmul_found = True
+            else:
+                yield OpPlan(node, stage_id=0)
+
+
+@replace_all_device_with('cpu')
+@pytest.mark.parametrize('no_grad_reduce', [False, True])
+def test_stage_output(tmp_path, no_grad_reduce):
+    m = StageOutputModel(no_grad_reduce)
+    m.train()
+    parallelize(
+        m,
+        {'x': torch.randn(4, 4)},
+        _stage_output_policy,
+        ComputeConfig(4, 4, use_end2end=True,
+            pas_config={
+                'pipeline_nmicros': 2,
+                'pipeline_size': 2,
+            }
+        ),
+        gen_savedir=tmp_path,
+        load_module=False,
+        reuse='override',
+    )
+    if no_grad_reduce:
+        assert not _gencode_contains(tmp_path, StageOutputModel, 0, r'nnscaler.runtime.function.multiref')
+        # code looks like:
+        # !!rank0
+        # def segment17(self, x_13):
+        #     # File "/data/weijiangxu/nnscaler/tests/parallel_module/test_gencode_partition.py", line 429, in forward,  y = torch.nn.functional.relu(x)
+        #     relu_15 = torch.nn.functional.relu(x_13, inplace=False)
+        #     del x_13
+        #     # File "/data/weijiangxu/nnscaler/tests/parallel_module/test_gencode_partition.py", line 431, in forward,  z = _shared_skip_op(y, self.w)
+        #     _shared_skip_op_40 = tests.parallel_module.test_gencode_partition._shared_skip_op(relu_15, self.w_38)
+        #     _shared_skip_op_17 = nnscaler.runtime.adapter.nn.allgather_split(_shared_skip_op_40, dim=1, ranks=[0, 1])
+        #     del _shared_skip_op_40
+        #     return relu_15, _shared_skip_op_17
+    else:
+        assert _gencode_contains(tmp_path, StageOutputModel, 0, r'nnscaler.runtime.function.multiref')
+        # code looks like:
+        # !!rank0
+        # def segment17(self, x_13):
+        #     # File "/data/weijiangxu/nnscaler/tests/parallel_module/test_gencode_partition.py", line 430, in forward,  y = torch.nn.functional.relu(x)
+        #     relu_15 = torch.nn.functional.relu(x_13, inplace=False)
+        #     del x_13
+        #     # create at IRAdapterGener:autoref, comment before transformation: activation
+        #     relu_39 = nnscaler.runtime.function.multiref(relu_15, times=1)
+        #     # File "/data/weijiangxu/nnscaler/tests/parallel_module/test_gencode_partition.py", line 434, in forward,  z = torch.matmul(y, self.w)
+        #     matmul_42 = torch.matmul(relu_39, self.w_40)
+        #     del relu_39
+        #     matmul_17 = nnscaler.runtime.adapter.nn.allgather_split(matmul_42, dim=1, ranks=[0, 1])
+        #     del matmul_42
+        #     return relu_15, matmul_17
