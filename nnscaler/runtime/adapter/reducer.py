@@ -275,8 +275,7 @@ class Bucket:
                 self._contiguous_grads[ofst:ofst+z3_info.numel()]\
                     .add_(output[0:z3_info.end-z3_info.start])
             else:
-                if param.grad is not None:
-                    self._contiguous_grads[ofst:ofst+param.numel()].add_(param.grad.data.view(-1))
+                self._contiguous_grads[ofst:ofst+param.numel()].add_(param.grad.data.view(-1))
 
             param.grad = None
 

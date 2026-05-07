@@ -38,7 +38,7 @@ if hasattr(torch.autograd.graph, 'set_warn_on_accumulate_grad_stream_mismatch'):
 
 _logger = logging.getLogger(__name__)
 
-_COMP_STREAM = None   # computation stream (non-defaul)
+_COMP_STREAM = None   # computation stream (non-default)
 _COMM_STREAM = None   # communication stream (non-default)
 _IN_RECOMPUTE = False  # Flag: True when inside ScheduleNode checkpoint recompute
 
