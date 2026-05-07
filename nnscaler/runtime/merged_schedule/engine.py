@@ -32,15 +32,10 @@ from torch.autograd import Variable
 import nnscaler
 
 
-# Suppress AccumulateGrad stream mismatch warning in dual-stream mode.
-if hasattr(torch.autograd.graph, 'set_warn_on_accumulate_grad_stream_mismatch'):
-    torch.autograd.graph.set_warn_on_accumulate_grad_stream_mismatch(False)
-
 _logger = logging.getLogger(__name__)
 
 _COMP_STREAM = None   # computation stream (non-default)
 _COMM_STREAM = None   # communication stream (non-default)
-_IN_RECOMPUTE = False  # Flag: True when inside ScheduleNode checkpoint recompute
 
 
 def set_streams():
@@ -51,6 +46,11 @@ def set_streams():
     global _COMP_STREAM, _COMM_STREAM
     _COMP_STREAM = torch.cuda.Stream()
     _COMM_STREAM = torch.cuda.Stream()
+    # Merged scheduling intentionally accumulates gradients on non-default
+    # streams. Suppress this warning only when the merged scheduler streams
+    # are initialized, rather than at module import time.
+    if hasattr(torch.autograd.graph, 'set_warn_on_accumulate_grad_stream_mismatch'):
+        torch.autograd.graph.set_warn_on_accumulate_grad_stream_mismatch(False)
 
 
 def get_comp_stream():
@@ -61,6 +61,31 @@ def get_comp_stream():
 def get_comm_stream():
     assert _COMM_STREAM is not None, "call set_streams() first"
     return _COMM_STREAM
+
+
+def manual_sync_grads(parallel_module):
+    """Manually trigger synchronous allreduce after all backward calls.
+
+    The merged scheduler uses skip_reducer=True, so hooks copy grads to the
+    contiguous buffer but skip counting/triggering allreduce. This function
+    performs the allreduce and sets param.grad from the buffer.
+    """
+    pm = parallel_module
+    if hasattr(pm, 'backbone'):
+        pm = pm.backbone
+    if not hasattr(pm, '_reducers'):
+        _logger.warning("No _reducers found on parallel module, skipping manual sync")
+        return
+
+    for reducer in pm._reducers:
+        for bucket in reducer._buckets:
+            old_async = bucket._async
+            bucket._async = False
+            try:
+                bucket.sync_grads()
+            finally:
+                bucket._async = old_async
+            bucket.reset()
 
 
 def _make_viewless(t):
@@ -165,7 +190,6 @@ class ScheduleNode:
         return self._backward(*output_grad, retain_graph=retain_graph)
 
     def _backward(self, *output_grad, retain_graph=False):
-        global _IN_RECOMPUTE
         # Record cross-stream tensor usage for output_grad tensors.
         for g in output_grad:
             if isinstance(g, torch.Tensor):
@@ -173,11 +197,7 @@ class ScheduleNode:
 
         with self._stream_ctx(f"{self.name} bwd"):
             if self.checkpoint:
-                _IN_RECOMPUTE = True
-                try:
-                    recomputed = self.forward_func(*self.inputs)
-                finally:
-                    _IN_RECOMPUTE = False
+                recomputed = self.forward_func(*self.inputs)
                 if not isinstance(recomputed, tuple):
                     recomputed = (recomputed,)
 
@@ -290,7 +310,10 @@ class MergedScheduler:
         # so their kernel launches can interleave, enabling true GPU overlap.
         # Controlled by ASYNC_4PHASE env var (default=1, set 0 to disable).
         _async_on = os.environ.get('ASYNC_4PHASE', '1') not in ('0', '')
-        self._async_pool = ThreadPoolExecutor(max_workers=1) if _async_on else None
+        self._async_pool = (
+            ThreadPoolExecutor(max_workers=1, thread_name_prefix='moe-overlap')
+            if _async_on else None
+        )
 
         # Pre-allocate CUDA events for cross-stream synchronization.
         # Using separate events per barrier slot avoids re-recording while
@@ -301,6 +324,21 @@ class MergedScheduler:
         # 2 uni-directional sync events (comp->comm and comm->comp)
         self._sync_c2m_evt = torch.cuda.Event()
         self._sync_m2c_evt = torch.cuda.Event()
+
+    def shutdown(self):
+        """Release scheduler-owned CPU worker resources."""
+        pool = self._async_pool
+        if pool is not None:
+            self._async_pool = None
+            pool.shutdown(wait=True)
+
+    close = shutdown
+
+    def __del__(self):
+        try:
+            self.shutdown()
+        except Exception:
+            pass
 
     def run(self, samples, layer_callables_fn, embed_fn, loss_fn):
         """Execute merged FWD-BWD schedule.
@@ -537,19 +575,13 @@ class MergedScheduler:
             name="attn", checkpoint=self.use_checkpoint)
 
         if lc.is_moe:
-            def combined_body_fn(h, h_ln, routing_probs):
-                sorted_tokens, sorted_probs = lc.dispatch_fn(h_ln, routing_probs)
-                expert_outs = lc.expert_fn(sorted_tokens, sorted_probs)
-                h_out = lc.combine_fn(expert_outs, h, h_ln)
-                return h_out
+            raise NotImplementedError(
+                "2-node MoE fallback is unsupported. MoE layers must use the "
+                "4-node dispatch/expert/combine schedule.")
 
-            body_node = ScheduleNode(
-                combined_body_fn, comp_stream, event,
-                name="moe_body", checkpoint=self.use_checkpoint)
-        else:
-            body_node = ScheduleNode(
-                lc.body_fn, comp_stream, event,
-                name="ffn", checkpoint=self.use_checkpoint)
+        body_node = ScheduleNode(
+            lc.body_fn, comp_stream, event,
+            name="ffn", checkpoint=self.use_checkpoint)
 
         return (attn_node, body_node)
 
@@ -885,6 +917,10 @@ class MergedScheduler:
         if self._use_4node and bwd_tag == 'layer4' and fwd_lc.is_moe:
             return self._merged_step_4phase(bwd_nodes, fwd_lc, fwd_event, grad_h, fwd_h)
         elif bwd_tag == 'layer2':
+            if fwd_lc.is_moe:
+                raise NotImplementedError(
+                    "Merging dense backward with MoE forward is unsupported. "
+                    "The MoE forward must run through the 4-node schedule.")
             return self._merged_step(bwd_entry, fwd_lc, fwd_event, grad_h, fwd_h)
         else:
             with nnscaler.sync_grad_when(False):
