@@ -251,7 +251,7 @@ def test_shared_input_with_no_grad_reduce_consumer(tmp_path):
 
     Both are partitioned along weight-dim 1 (identifier `c`), so `x` is
     replicated across both ranks for both consumers. After fix, parallelize
-    should succeed and emit at least one `identity_allreduce` on the matmul
+    should succeed and emit one `identity_allreduce` on the matmul
     side.
     """
     m = _SharedInputModel()
@@ -265,7 +265,7 @@ def test_shared_input_with_no_grad_reduce_consumer(tmp_path):
         load_module=False,
         reuse='override',
     )
-    # expected exactly one identity_allreduce (on torch.matmul's x input)"
+    # expected exactly one identity_allreduce (on torch.matmul's x input)
     assert len(_gencode_contains(tmp_path, _SharedInputModel, 0, r'.*identity_allreduce.*')) == 1
 
     # code looks like:
@@ -330,7 +330,7 @@ def test_shared_input_replicated_grad_reduce(tmp_path):
         load_module=False,
         reuse='override',
     )
-    # expected exactly one identity_allreduce (on torch.matmul's x input)"
+    # expected exactly one identity_allreduce (on torch.matmul's x input)
     assert len(_gencode_contains(tmp_path, _SharedInputModelReplicatedGradReduce, 0, r'.*identity_allreduce.*')) == 1
     # code looks like:
     # def segment98(self, raw_x_20):
@@ -379,7 +379,7 @@ class _SharedInputModelReplicatedNoGradReduce(torch.nn.Module):
 def test_shared_input_replicated_no_grad_reduce(tmp_path):
     """Two consumers of an internal activation `x`:
       * `+` replicated (and no grad reduce);
-      * `_shared_skip_op` is a standard op -> grad-reduce required.
+      * `_shared_skip_op` replicated and no grad reduce.
     """
     m = _SharedInputModelReplicatedNoGradReduce()
     m.train()
