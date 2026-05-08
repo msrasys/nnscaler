@@ -490,6 +490,57 @@ def get_pas_ops(graph: IRGraph) -> List[IRFwOperation]:
     return graph.select(ntype=IRFwOperation)
 
 
+def _identity_segment_output(tensor: IRSubTensor, segment: IRSegment) -> IRFwOperation:
+    """
+    Insert an identity operator for the segment output tensor to make it easier to handle in policy.
+    After the insertion, the original output tensor will be replaced by the identity operator's output tensor in the graph.
+    The effect of this function is like:
+    Before:
+    ```
+    x = op1(...)
+    y = op2(x, ...)
+    return x, y
+    ```
+    After:
+    ```
+    x = op1(...)
+    y = op2(x, ...)
+    z = identity(x)
+    return z, y
+    ```
+    In other words, the segment output will never be inputs to any operators.
+
+    """
+    from nnscaler.graph.function.function import Identity
+
+    last_fwop_idx = -1
+    for idx, node in enumerate(segment._nodes):
+        if isinstance(node, IRFwOperation):
+            last_fwop_idx = idx
+    insert_idx = last_fwop_idx + 1
+
+    fwop = Identity(tensor)
+    output = tensor.parent.like().tosub()
+    fwop.set_output(0, output)
+    fwop.device = segment.device
+    if tensor.requires_grad:
+        # set input grad
+        igrad = tensor.parent.grad.select(tensor.indmap, tensor.valmap)
+        fwop.input(0).grad = igrad
+        # set output grad
+        otensor = fwop.output(0).parent
+        ograd = otensor.grad.select(tensor.indmap, (0,1))
+        fwop.output(0).grad = ograd
+        # insert identity
+        segment.finsert(fwop, insert_idx)
+    else:
+        segment.insert(fwop, insert_idx)
+
+    segment.replace_output(tensor, fwop.output(0))
+
+    return fwop
+
+
 def fn(
         graph: IRGraph, cfg: 'ComputeConfig',
         policy: Union[
@@ -804,6 +855,16 @@ def fn(
                 # TODO: is it possible to have TP here?
                 op_plans[node] = OpPlan(op=node, stage_id=stage_id, partition=None)
 
+    for stage_id, seg in enumerate(pp_segs):
+        for sub_tensor in IR.get_objects(seg.outputs()):
+            if not isinstance(sub_tensor, IRSubTensor):
+                continue
+            if seg.consumers(sub_tensor.parent):
+                ident_op = _identity_segment_output(sub_tensor, seg)
+                op_plans[ident_op] = OpPlan(op=ident_op, stage_id=stage_id, partition=None)
+                # 'rn' means `ident_op` is replicated and grad doesn't need to be all-reduced
+                tensor_splits[sub_tensor.parent].setdefault(stage_id, set()).add('rn')
+
     # add multiref to an activation tensor when the states of the tensor and its grad are different
     # among consumers and current segment's outputs
     for ftensor, stage_info in tensor_splits.items():
@@ -818,14 +879,12 @@ def fn(
                 stage.outputs(),
                 lambda x: isinstance(x, IRSubTensor) and x.parent == ftensor
             )
+            assert not is_seg_output[idx] or not stage.consumers(ftensor)
 
         for idx, splits in stage_info.items():
             stage = pp_segs[idx]
             split_list = list(splits)
-            if len(split_list) > 1 or (
-                # treat segment output as a consumer (replicated but not all-reduced)
-                is_seg_output[idx] and split_list[0] != 'rn'
-            ):
+            if len(split_list) > 1:
                 _logger.debug(f'add multiref for {ftensor} in stage {stage}')
                 stage.multiref(ftensor, comment='activation')
 

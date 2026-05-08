@@ -554,3 +554,116 @@ def test_pp_shared_model(tmp_path):
             assert _gencode_contains(tmp_path, PPSharedModel, rank, r'self.register_parameter\(')
         else:
             assert not _gencode_contains(tmp_path, PPSharedModel, rank, r'self.register_parameter\(')
+
+
+class LossDataModel(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.fc = torch.nn.Linear(10, 10)
+
+    def forward(self, x):
+        x = self.fc(x)
+        l = x.sum()
+        return l, l.data
+
+
+def _loss_data_policy(graph, cfg):
+    from nnscaler.policies import OpPlan, get_pas_ops, OpPartition
+
+    for node in get_pas_ops(graph):
+        if node.fn == torch.nn.functional.linear:
+            yield OpPlan(node, partition=OpPartition(input=0, dim=0))
+        if node.fn == torch.sum:
+            yield OpPlan(node, partition=OpPartition(input=0, dim=0))
+
+
+@replace_all_device_with('cpu')
+def test_loss_insert_identity(tmp_path):
+    m = LossDataModel()
+    m.train()
+
+    trace_data = torch.randn([2, 10], dtype=torch.float32)
+    parallelize(
+            m,
+            {'x': trace_data},
+            _loss_data_policy,
+            ComputeConfig(2, 2, use_end2end=False),
+            reuse='override',
+            gen_savedir=tmp_path,
+            load_module=False,
+    )
+
+    assert _gencode_contains(tmp_path, LossDataModel, 0, 'nnscaler.runtime.function.identity')
+    # nnscaler.runtime.adapter.nn.split_allgather
+    # and nnscaler.runtime.adapter.nn.allreduce_identity
+    assert len(_gencode_contains(tmp_path, LossDataModel, 0, 'nnscaler.runtime.adapter.nn.')) == 2
+    # code looks like:
+    # def segment73(self, x_15):
+    #     x_26 = nnscaler.runtime.adapter.nn.split_allgather(x_15, dim=0, ranks=[0, 1])
+    #     del x_15
+    #     # File "/data/weijiangxu/nnscaler/tests/parallel_module/test_gencode_partition.py", line 565, in forward,  x = self.fc(x)
+    #     linear_28 = torch.nn.functional.linear(x_26, self.fc_weight_18, self.fc_bias_19)
+    #     del x_26
+    #     # File "/data/weijiangxu/nnscaler/tests/parallel_module/test_gencode_partition.py", line 566, in forward,  l = x.sum()
+    #     sum_1_30 = torch.sum(linear_28)
+    #     del linear_28
+    #     sum_1_16 = nnscaler.runtime.adapter.nn.allreduce_identity(sum_1_30, ranks=[0, 1])
+    #     del sum_1_30
+    #     # File "/data/weijiangxu/nnscaler/tests/parallel_module/test_gencode_partition.py", line 568, in forward,  return l, l.data
+    #     getattr_2_17 = builtins.getattr(sum_1_16, 'data')
+    #     sum_1_34 = nnscaler.runtime.function.identity(sum_1_16)
+    #     del sum_1_16
+    #     return getattr_2_17, sum_1_34
+
+
+from nnscaler.runtime.function import identity
+
+class LossDataExplicitIdentityModel(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.fc = torch.nn.Linear(10, 10)
+
+    def forward(self, x):
+        x = self.fc(x)
+        l = x.sum()
+        z = identity(l)
+        return z, l.data
+
+
+@replace_all_device_with('cpu')
+def test_loss_explicit_identity(tmp_path):
+    m = LossDataExplicitIdentityModel()
+    m.train()
+
+    trace_data = torch.randn([2, 10], dtype=torch.float32)
+    parallelize(
+            m,
+            {'x': trace_data},
+            _loss_data_policy,
+            ComputeConfig(2, 2, use_end2end=False),
+            reuse='override',
+            gen_savedir=tmp_path,
+            load_module=False,
+    )
+    assert _gencode_contains(tmp_path, LossDataExplicitIdentityModel, 0, 'nnscaler.runtime.function.identity')
+    # nnscaler.runtime.adapter.nn.split_allgather
+    # and nnscaler.runtime.adapter.nn.allreduce_identity
+    assert len(_gencode_contains(tmp_path, LossDataExplicitIdentityModel, 0, 'nnscaler.runtime.adapter.nn.')) == 2
+    # code looks like:
+    # def segment73(self, x_17):
+    #     x_30 = nnscaler.runtime.adapter.nn.split_allgather(x_17, dim=0, ranks=[0, 1])
+    #     del x_17
+    #     # File "/data/weijiangxu/nnscaler/tests/parallel_module/test_gencode_partition.py", line 627, in forward,  x = self.fc(x)
+    #     linear_32 = torch.nn.functional.linear(x_30, self.fc_weight_20, self.fc_bias_21)
+    #     del x_30
+    #     # File "/data/weijiangxu/nnscaler/tests/parallel_module/test_gencode_partition.py", line 628, in forward,  l = x.sum()
+    #     sum_1_34 = torch.sum(linear_32)
+    #     del linear_32
+    #     sum_1_23 = nnscaler.runtime.adapter.nn.allreduce_identity(sum_1_34, ranks=[0, 1])
+    #     del sum_1_34
+    #     # File "/data/weijiangxu/nnscaler/tests/parallel_module/test_gencode_partition.py", line 629, in forward,  z = identity(l)
+    #     identity_18 = nnscaler.runtime.function.identity(sum_1_23)
+    #     # File "/data/weijiangxu/nnscaler/tests/parallel_module/test_gencode_partition.py", line 630, in forward,  return z, l.data
+    #     getattr_2_19 = builtins.getattr(sum_1_23, 'data')
+    #     del sum_1_23
+    #     return identity_18, getattr_2_19
