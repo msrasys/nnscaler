@@ -616,7 +616,7 @@ def test_loss_insert_identity(tmp_path):
     #     return getattr_2_17, sum_1_34
 
 
-from nnscaler.runtime.function import identity
+from nnscaler.runtime.function import identity, multiref
 
 class LossDataExplicitIdentityModel(torch.nn.Module):
     def __init__(self):
@@ -667,3 +667,62 @@ def test_loss_explicit_identity(tmp_path):
     #     getattr_2_19 = builtins.getattr(sum_1_23, 'data')
     #     del sum_1_23
     #     return identity_18, getattr_2_19
+
+
+class LossDataExplicitMultirefModel(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.fc = torch.nn.Linear(10, 10)
+
+    def forward(self, x):
+        x = self.fc(x)
+        l = x.sum()
+        l1, l2 = multiref(l, times=2)
+        return l1, l2.data
+
+
+@replace_all_device_with('cpu')
+def test_loss_explicit_multiref(tmp_path):
+    """
+    Test that if the user explicitly inserts a multiref for the loss,
+    The gencode partitioning logic should still correctly insert the necessary adapters (e.g. allreduce_identity) to ensure the multiref outputs are correctly partitioned
+    """
+    m = LossDataExplicitMultirefModel()
+    m.train()
+
+    trace_data = torch.randn([2, 10], dtype=torch.float32)
+    parallelize(
+            m,
+            {'x': trace_data},
+            _loss_data_policy,
+            ComputeConfig(2, 2, use_end2end=False),
+            reuse='override',
+            gen_savedir=tmp_path,
+            load_module=False,
+    )
+    assert True
+    assert len(_gencode_contains(tmp_path, LossDataExplicitMultirefModel, 0, 'nnscaler.runtime.function.multiref')) == 1
+    assert len(_gencode_contains(tmp_path, LossDataExplicitMultirefModel, 0, 'nnscaler.runtime.adapter.nn.split_allgather')) == 1
+    assert len(_gencode_contains(tmp_path, LossDataExplicitMultirefModel, 0, 'nnscaler.runtime.adapter.nn.allreduce_identity')) == 1
+    assert len(_gencode_contains(tmp_path, LossDataExplicitMultirefModel, 0, 'nnscaler.runtime.adapter.all_reduce')) == 1
+    # code looks like:
+    # def segment86(self, x_23):
+    #     x_38 = nnscaler.runtime.adapter.nn.split_allgather(x_23, dim=0, ranks=[0, 1])
+    #     del x_23
+    #     # File "/data/weijiangxu/nnscaler/tests/parallel_module/test_gencode_partition.py", line 678, in forward,  x = self.fc(x)
+    #     linear_40 = torch.nn.functional.linear(x_38, self.fc_weight_26, self.fc_bias_27)
+    #     del x_38
+    #     # File "/data/weijiangxu/nnscaler/tests/parallel_module/test_gencode_partition.py", line 679, in forward,  l = x.sum()
+    #     sum_1_42 = torch.sum(linear_40)
+    #     del linear_40
+    #     # create at IRAdapterGener:autoref, comment before transformation: File "/data/weijiangxu/nnscaler/tests/parallel_module/test_gencode_partition.py", line 680, in forward,  l1, l2 = multiref(l, times=2)
+    #     multiref_52, multiref_53 = nnscaler.runtime.function.multiref(sum_1_42, times=2)
+    #     del sum_1_42
+    #     multiref_30 = nnscaler.runtime.adapter.all_reduce(multiref_53, ranks=[0, 1])
+    #     del multiref_53
+    #     # File "/data/weijiangxu/nnscaler/tests/parallel_module/test_gencode_partition.py", line 681, in forward,  return l1, l2.data
+    #     getattr_2_25 = builtins.getattr(multiref_30, 'data')
+    #     del multiref_30
+    #     multiref_24 = nnscaler.runtime.adapter.nn.allreduce_identity(multiref_52, ranks=[0, 1])
+    #     del multiref_52
+    #     return multiref_24, getattr_2_25
