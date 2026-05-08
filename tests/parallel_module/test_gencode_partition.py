@@ -459,8 +459,9 @@ def test_multiref_multi_rr(tmp_path):
         load_module=False,
         reuse='override',
     )
-    assert True
-    # code looks like (no multiref are generated in `fn`):
+    # no multiref are generated in `fn`
+    assert not _gencode_contains(tmp_path, MultileRRModule, 0, r'activation')
+    # code looks like:
     # def segment124(self, input_24):
     #     # File "/data/weijiangxu/nnscaler/tests/parallel_module/test_gencode_partition.py", line 430, in forward,  x = torch.nn.functional.linear(input, self.w0)
     #     linear_27 = torch.nn.functional.linear(input_24, self.w0_26, bias=None)
@@ -777,7 +778,6 @@ def test_loss_explicit_multiref(tmp_path):
             gen_savedir=tmp_path,
             load_module=False,
     )
-    assert True
     assert len(_gencode_contains(tmp_path, LossDataExplicitMultirefModel, 0, 'nnscaler.runtime.function.multiref')) == 1
     assert len(_gencode_contains(tmp_path, LossDataExplicitMultirefModel, 0, 'nnscaler.runtime.adapter.nn.split_allgather')) == 1
     assert len(_gencode_contains(tmp_path, LossDataExplicitMultirefModel, 0, 'nnscaler.runtime.adapter.nn.allreduce_identity')) == 1
