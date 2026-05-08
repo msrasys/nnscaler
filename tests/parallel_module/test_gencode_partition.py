@@ -419,6 +419,83 @@ def test_shared_input_replicated_no_grad_reduce(tmp_path):
     #     return sum_1_21
 
 
+class MultileRRModule(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.w0 = torch.nn.Parameter(torch.randn(4, 4))
+        self.w1 = torch.nn.Parameter(torch.randn(4, 4))
+        self.w2 = torch.nn.Parameter(torch.randn(4, 4))
+
+    def forward(self, input):
+        x = torch.nn.functional.linear(input, self.w0)
+        y = torch.nn.functional.linear(input, self.w1)
+        z = torch.nn.functional.linear(input, self.w2)
+        a = torch.matmul(x, y)
+        b = torch.matmul(x, z)
+        return (a + b).sum()
+
+
+def multirr_pas(graph, cfg):
+    from nnscaler.policies import OpPlan, OpPartition, get_pas_ops
+
+    for node in get_pas_ops(graph):
+        if node.fn == torch.matmul:
+            yield OpPlan(node, partition=OpPartition(input=1, dim=1))
+
+
+@replace_all_device_with('cpu')
+def test_multiref_multi_rr(tmp_path):
+    """
+    Test the case of two RR (replicate + allreduce) pattern
+    """
+    m = MultileRRModule()
+    m.train()
+    parallelize(
+        m,
+        {'input': torch.randn(4, 4)},
+        multirr_pas,
+        ComputeConfig(2, 4, use_end2end=True),
+        gen_savedir=tmp_path,
+        load_module=False,
+        reuse='override',
+    )
+    assert True
+    # code looks like (no multiref are generated in `fn`):
+    # def segment124(self, input_24):
+    #     # File "/data/weijiangxu/nnscaler/tests/parallel_module/test_gencode_partition.py", line 430, in forward,  x = torch.nn.functional.linear(input, self.w0)
+    #     linear_27 = torch.nn.functional.linear(input_24, self.w0_26, bias=None)
+    #     # File "/data/weijiangxu/nnscaler/tests/parallel_module/test_gencode_partition.py", line 431, in forward,  y = torch.nn.functional.linear(input, self.w1)
+    #     linear_1_29 = torch.nn.functional.linear(input_24, self.w1_28, bias=None)
+    #     # File "/data/weijiangxu/nnscaler/tests/parallel_module/test_gencode_partition.py", line 432, in forward,  z = torch.nn.functional.linear(input, self.w2)
+    #     linear_2_31 = torch.nn.functional.linear(input_24, self.w2_30, bias=None)
+    #     del input_24
+    #     linear_27 = nnscaler.runtime.adapter.nn.identity_allreduce(linear_27, ranks=[0, 1])
+    #     # created at IRAdapterGener:local_consumer_multiref
+    #     linear_70, linear_74 = nnscaler.runtime.function.multiref(linear_27, times=2)
+    #     del linear_27
+    #     linear_1_48 = nnscaler.runtime.adapter.nn.split_allgather(linear_1_29, dim=1, ranks=[0, 1])
+    #     del linear_1_29
+    #     # File "/data/weijiangxu/nnscaler/tests/parallel_module/test_gencode_partition.py", line 433, in forward,  a = torch.matmul(x, y)
+    #     matmul_50 = torch.matmul(linear_70, linear_1_48)
+    #     del linear_70, linear_1_48
+    #     linear_2_52 = nnscaler.runtime.adapter.nn.split_allgather(linear_2_31, dim=1, ranks=[0, 1])
+    #     del linear_2_31
+    #     # File "/data/weijiangxu/nnscaler/tests/parallel_module/test_gencode_partition.py", line 434, in forward,  b = torch.matmul(x, z)
+    #     matmul_1_54 = torch.matmul(linear_74, linear_2_52)
+    #     del linear_74, linear_2_52
+    #     matmul_32 = nnscaler.runtime.adapter.nn.allgather_split(matmul_50, dim=1, ranks=[0, 1])
+    #     del matmul_50
+    #     matmul_1_33 = nnscaler.runtime.adapter.nn.allgather_split(matmul_1_54, dim=1, ranks=[0, 1])
+    #     del matmul_1_54
+    #     # File "/data/weijiangxu/nnscaler/tests/parallel_module/test_gencode_partition.py", line 435, in forward,  return (a + b).sum()
+    #     add_34 = torch.add(matmul_32, matmul_1_33, alpha=1)
+    #     del matmul_32, matmul_1_33
+    #     # File "/data/weijiangxu/nnscaler/tests/parallel_module/test_gencode_partition.py", line 435, in forward,  return (a + b).sum()
+    #     sum_1_25 = torch.sum(add_34)
+    #     del add_34
+    #     return sum_1_25
+
+
 class StageOutputModel(torch.nn.Module):
     def __init__(self, no_grad_reduce=False):
         hidden_dim = 4
