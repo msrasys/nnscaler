@@ -156,11 +156,11 @@ def _run_flash_attn_varlen(
     deterministic: bool,
     use_cute: bool,
     window_size: Tuple[int, int],
-) -> torch.Tensor:
+) -> Tuple[torch.Tensor, torch.Tensor]:
     if use_cute:
         assert flash_attn_cute_varlen_func is not None, "flash_attn.cute is not available"
         cute_window_size = tuple(None if w == -1 else w for w in window_size)
-        out, _ = flash_attn_cute_varlen_func(
+        out, lse = flash_attn_cute_varlen_func(
             q,
             k,
             v,
@@ -172,10 +172,11 @@ def _run_flash_attn_varlen(
             causal=causal,
             window_size=cute_window_size,
             deterministic=deterministic,
+            return_lse=True,
         )
-        return out
+        return out, lse
 
-    return flash_attn_varlen_func(
+    out, lse, _ = flash_attn_varlen_func(
         q,
         k,
         v,
@@ -189,8 +190,9 @@ def _run_flash_attn_varlen(
         window_size=window_size,
         alibi_slopes=alibi_slopes,
         deterministic=deterministic,
-        return_attn_probs=False,
+        return_attn_probs=True,
     )
+    return out, lse
 
 
 def zigzag_allgather_attn_varlen_func(
@@ -207,7 +209,7 @@ def zigzag_allgather_attn_varlen_func(
     deterministic: bool = False,
     use_cute: bool = False,
     window_size: Tuple[int, int] = (-1, -1),
-) -> torch.Tensor:
+) -> Tuple[torch.Tensor, torch.Tensor]:
     assert process_group is not None and dist.get_world_size(process_group) > 1, (
         "zigzag_allgather_attn_varlen_func only handles the multi-GPU CP branch"
     )
@@ -224,7 +226,7 @@ def zigzag_allgather_attn_varlen_func(
     q_front = q[metadata.q_front_idx]
     q_end = q[metadata.q_end_idx]
 
-    front_output = _run_flash_attn_varlen(
+    front_output, front_lse = _run_flash_attn_varlen(
         q_front,
         k,
         v,
@@ -240,7 +242,7 @@ def zigzag_allgather_attn_varlen_func(
         use_cute,
         window_size,
     )
-    end_output = _run_flash_attn_varlen(
+    end_output, end_lse = _run_flash_attn_varlen(
         q_end,
         k,
         v,
@@ -261,4 +263,8 @@ def zigzag_allgather_attn_varlen_func(
     output[metadata.q_front_idx] = front_output
     output[metadata.q_end_idx] = end_output
 
-    return output
+    softmax_lse = front_lse.new_empty(front_lse.shape[:-1] + (q.shape[0],))
+    softmax_lse[..., metadata.q_front_idx] = front_lse
+    softmax_lse[..., metadata.q_end_idx] = end_lse
+
+    return output, softmax_lse

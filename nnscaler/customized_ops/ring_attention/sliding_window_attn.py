@@ -60,7 +60,7 @@ def wrap_sliding_window_attn_func(
         if use_cute:
             assert flash_attn_cute_varlen_func is not None, "flash_attn.cute is not available"
             cute_window_size = tuple(None if w == -1 else w for w in window_size)
-            output, lse = flash_attn_cute_varlen_func(
+            output, softmax_lse = flash_attn_cute_varlen_func(
                 q, k, v,
                 cu_seqlens_q=cu_seqlens_q,
                 cu_seqlens_k=cu_seqlens_k,
@@ -72,9 +72,9 @@ def wrap_sliding_window_attn_func(
                 deterministic=deterministic,
                 return_lse=True,
             )
-            return output
+            return output, softmax_lse
         else:
-            output = flash_attn_varlen_func(
+            output, softmax_lse, _ = flash_attn_varlen_func(
                 q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k,
                 dropout_p=dropout_p,
                 softmax_scale=softmax_scale,
@@ -82,9 +82,9 @@ def wrap_sliding_window_attn_func(
                 window_size=window_size,
                 alibi_slopes=alibi_slopes,
                 deterministic=deterministic,
-                return_attn_probs=False,
+                return_attn_probs=True,
             )
-            return output
+            return output, softmax_lse
 
     assert causal, "sliding window CP attention requires causal=True"
     assert window_size[0] > 0, (
@@ -131,7 +131,7 @@ def wrap_sliding_window_attn_func(
         use_cute=use_cute,
     )
 
-    return out
+    return out, softmax_lse
 
 
 def emit_ring(node: IRDimops, args: List[str], kwargs: Dict[str, str], runtime_devid: int, plan_ndevs: int, runtime_ndevs: int) -> str:
@@ -169,7 +169,7 @@ def emit_ring(node: IRDimops, args: List[str], kwargs: Dict[str, str], runtime_d
 def flash_attention_anno(query_states, key_states, value_states, cu_seqlens_q, cu_seqlens_k, alibi_slopes, *args, **kwargs) -> str:
     q_anno, kv_anno = gen_head_anno(query_states, key_states, value_states, head_pos=1)
     alibi_anno = f'{q_anno}' if isinstance(alibi_slopes, IRTensor) else '?'
-    return f'l {q_anno} hd^, l {kv_anno} hd^, l {kv_anno} vd^, e^, e^, {alibi_anno} -> l {q_anno} vd^'
+    return f'l {q_anno} hd^, l {kv_anno} hd^, l {kv_anno} vd^, e^, e^, {alibi_anno} -> l {q_anno} vd^, ?'
 
 
 def input_gen_fn(node: IRDimops):
