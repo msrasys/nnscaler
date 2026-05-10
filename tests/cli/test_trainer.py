@@ -14,6 +14,7 @@ from unittest.mock import patch
 
 from nnscaler import merge_state_dicts
 from nnscaler.cli.serialization import Checkpointer
+from nnscaler.runtime.utils import is_torch_version_at_least
 import nnscaler
 from nnscaler.cli.trainer import Trainer, logger
 from nnscaler.cli.trainer_args import AggregatedOutputs, TrainerArgs
@@ -708,7 +709,7 @@ def trainer_grad_dtype_worker(save_dir, use_zero):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.device_count() < 2, reason='lack of gpu devices')
-@pytest.mark.skipif(torch.__version__ < (2, 10), reason='requires torch >= 2.10 for grad_dtype support')
+@pytest.mark.skipif(not is_torch_version_at_least(2, 10), reason='requires torch >= 2.10 for grad_dtype support')
 @pytest.mark.parametrize('use_zero', [0, 1])
 def test_trainer_grad_dtype(tmp_path, use_zero):
     launch_torchrun(2, trainer_grad_dtype_worker, tmp_path, use_zero)

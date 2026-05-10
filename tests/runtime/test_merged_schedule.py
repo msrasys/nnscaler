@@ -33,12 +33,14 @@ def _assert_current_stream(expected_stream):
 
 
 class _FakeMoELayer(nn.Module):
-    def __init__(self, hidden_dim):
+    def __init__(self, hidden_dim, use_aux_loss=False):
         super().__init__()
         self.attn = nn.Linear(hidden_dim, hidden_dim)
         self.router = nn.Linear(hidden_dim, hidden_dim)
         self.expert = nn.Linear(hidden_dim, hidden_dim)
         self.shared = nn.Linear(hidden_dim, hidden_dim)
+        self.use_aux_loss = use_aux_loss
+        self.step_data = None
         self.check_streams = False
         self.stream_counts = {'comp': 0, 'comm': 0, 'all_reduce': 0}
 
@@ -68,6 +70,12 @@ class _FakeMoELayer(nn.Module):
         self._check_comp_stream()
         h_ln = torch.tanh(self.attn(h))
         routing_probs = torch.sigmoid(self.router(h))
+        if self.use_aux_loss:
+            aux_loss = routing_probs.float().pow(2).mean()
+            if self.step_data is not None:
+                self.step_data['_loss_aux_tensors'] = (aux_loss,)
+                self.step_data['gate_scores'] = aux_loss
+            return h, h_ln, routing_probs, aux_loss
         return h, h_ln, routing_probs
 
     def dispatch_forward(self, h_ln, routing_probs):
@@ -89,10 +97,13 @@ class _FakeMoELayer(nn.Module):
 
 
 class _FakeMoEModel(nn.Module):
-    def __init__(self, input_dim=5, hidden_dim=7, num_layers=2):
+    def __init__(self, input_dim=5, hidden_dim=7, num_layers=2, use_aux_loss=False):
         super().__init__()
         self.embed = nn.Linear(input_dim, hidden_dim)
-        self.layers = nn.ModuleList(_FakeMoELayer(hidden_dim) for _ in range(num_layers))
+        self.layers = nn.ModuleList(
+            _FakeMoELayer(hidden_dim, use_aux_loss=use_aux_loss)
+            for _ in range(num_layers)
+        )
 
     def set_stream_checks(self, enabled):
         for layer in self.layers:
@@ -107,14 +118,21 @@ class _FakeMoEModel(nn.Module):
             counts['all_reduce'] += layer.stream_counts['all_reduce']
         return counts
 
-    def forward(self, x):
+    def forward(self, x, return_aux=False):
         h = self.embed(x)
+        aux_losses = []
         for layer in self.layers:
-            h_residual, h_ln, routing_probs = layer.attn_forward(h)
+            attn_out = layer.attn_forward(h)
+            h_residual, h_ln, routing_probs = attn_out[:3]
+            aux_losses.extend(
+                t for t in attn_out[3:] if isinstance(t, torch.Tensor)
+            )
             dispatched, reduced_probs = layer.dispatch_forward(h_ln, routing_probs)
             expert_out, shared_out = layer.expert_forward(
                 dispatched, reduced_probs, h_ln)
             h = layer.combine_forward(expert_out, h_residual, shared_out)
+        if return_aux:
+            return h, aux_losses
         return h
 
 
@@ -140,46 +158,61 @@ def _make_samples(device, rank):
     return samples
 
 
-def _run_sequential(model, samples):
+def _run_sequential(model, samples, use_aux_loss=False):
     model.zero_grad(set_to_none=True)
     losses = []
     for sample in samples:
-        h = model(sample['x'])
+        if use_aux_loss:
+            h, aux_losses = model(sample['x'], return_aux=True)
+        else:
+            h = model(sample['x'])
+            aux_losses = ()
         loss = (h - sample['target']).pow(2).sum()
+        if aux_losses:
+            loss = loss + sum(aux_losses)
         losses.append(loss.detach())
         loss.backward()
     return torch.stack(losses), _distributed_grad_norm(model)
 
 
-def _run_merged(model, samples):
+def _run_merged(model, samples, use_checkpoint=False, use_aux_loss=False):
     model.zero_grad(set_to_none=True)
     set_streams()
     model.set_stream_checks(True)
     scheduler = _CountingMergedScheduler(
         parallel_module=model,
         num_layers=len(model.layers),
-        use_checkpoint=False,
+        use_checkpoint=use_checkpoint,
     )
 
     def layer_callables_fn(step_idx, _sample):
         layer = model.layers[step_idx]
+        step_data = {}
+        layer.step_data = step_data
         return LayerCallables(
             attn_fn=layer.attn_forward,
             dispatch_fn=layer.dispatch_forward,
             expert_fn=layer.expert_forward,
             combine_fn=layer.combine_forward,
             is_moe=True,
+            step_data=step_data,
         )
 
     def embed_fn(sample):
         return model.embed(sample['x'])
 
-    def loss_fn(h, sample, _routing_maps, _expert_probs):
+    def loss_fn(h, sample, _routing_maps, expert_probs):
         output_info = {}
+        aux_losses = tuple(
+            t for t in expert_probs
+            if use_aux_loss and isinstance(t, torch.Tensor)
+        )
 
         def loss_forward(loss_input):
             _assert_current_stream(get_comp_stream())
             loss = (loss_input - sample['target']).pow(2).sum()
+            if aux_losses:
+                loss = loss + sum(aux_losses)
             output_info['output_tuple'] = (loss.detach(),)
             return loss
 
@@ -208,34 +241,56 @@ def _worker():
         assert dist.get_world_size() >= 2
         rank = dist.get_rank()
         torch.manual_seed(10)
-        sequential_model = _FakeMoEModel().to(device)
-        merged_model = copy.deepcopy(sequential_model).to(device)
-        samples = _make_samples(device, rank)
+        case_results = []
+        cases = [
+            (False, False, 10),
+            (True, False, 11),
+            (False, True, 12),
+            (True, True, 11),
+        ]
+        for use_checkpoint, use_aux_loss, case_seed in cases:
+            torch.manual_seed(case_seed)
+            sequential_model = _FakeMoEModel(use_aux_loss=use_aux_loss).to(device)
+            merged_model = copy.deepcopy(sequential_model).to(device)
+            samples = _make_samples(device, rank)
 
-        sequential_losses, sequential_gnorm = _run_sequential(sequential_model, samples)
-        merged_losses, merged_gnorm, merged_4phase_calls, stream_counts = _run_merged(
-            merged_model, samples)
+            sequential_losses, sequential_gnorm = _run_sequential(
+                sequential_model, samples, use_aux_loss=use_aux_loss)
+            merged_losses, merged_gnorm, merged_4phase_calls, stream_counts = _run_merged(
+                merged_model, samples,
+                use_checkpoint=use_checkpoint,
+                use_aux_loss=use_aux_loss)
 
-        torch.testing.assert_close(
-            merged_losses, sequential_losses, rtol=1e-5, atol=1e-5)
-        torch.testing.assert_close(
-            merged_gnorm, sequential_gnorm, rtol=1e-5, atol=1e-5)
-
-        for (seq_name, seq_param), (merged_name, merged_param) in zip(
-            sequential_model.named_parameters(), merged_model.named_parameters()
-        ):
-            assert seq_name == merged_name
+            case_label = f'use_checkpoint={use_checkpoint}, use_aux_loss={use_aux_loss}'
             torch.testing.assert_close(
-                merged_param.grad, seq_param.grad, rtol=1e-5, atol=1e-5)
+                merged_losses, sequential_losses, rtol=1e-5, atol=1e-5,
+                msg=case_label)
 
-        assert merged_4phase_calls == len(merged_model.layers)
-        assert stream_counts['comp'] > 0
-        assert stream_counts['comm'] > 0
-        assert stream_counts['all_reduce'] > 0
+            for (seq_name, seq_param), (merged_name, merged_param) in zip(
+                sequential_model.named_parameters(), merged_model.named_parameters()
+            ):
+                assert seq_name == merged_name
+                torch.testing.assert_close(
+                    merged_param.grad, seq_param.grad, rtol=1e-5, atol=1e-5,
+                    msg=lambda msg: f'{case_label}, param={seq_name}\n{msg}')
+
+            torch.testing.assert_close(
+                merged_gnorm, sequential_gnorm, rtol=1e-5, atol=1e-5,
+                msg=lambda msg: f'{case_label}\n{msg}')
+
+            assert merged_4phase_calls == len(merged_model.layers)
+            assert stream_counts['comp'] > 0
+            assert stream_counts['comm'] > 0
+            assert stream_counts['all_reduce'] > 0
+            case_results.append({
+                'use_checkpoint': use_checkpoint,
+                'use_aux_loss': use_aux_loss,
+                'merged_4phase_calls': merged_4phase_calls,
+                'stream_counts': stream_counts,
+            })
         return {
             'rank': rank,
-            'merged_4phase_calls': merged_4phase_calls,
-            'stream_counts': stream_counts,
+            'cases': case_results,
         }
     finally:
         dist.destroy_process_group()
@@ -249,7 +304,11 @@ def test_merged_scheduler_fake_moe_matches_sequential_gnorm():
     results = launch_torchrun(2, _worker)
     assert len(results) == 2
     for result in results.values():
-        assert result['merged_4phase_calls'] == 2
-        assert result['stream_counts']['comp'] > 0
-        assert result['stream_counts']['comm'] > 0
-        assert result['stream_counts']['all_reduce'] > 0
+        assert len(result['cases']) == 4
+        assert result['cases'][-1]['use_checkpoint']
+        assert result['cases'][-1]['use_aux_loss']
+        for case in result['cases']:
+            assert case['merged_4phase_calls'] == 2
+            assert case['stream_counts']['comp'] > 0
+            assert case['stream_counts']['comm'] > 0
+            assert case['stream_counts']['all_reduce'] > 0

@@ -130,6 +130,8 @@ class ScheduleNode:
         self.checkpoint = checkpoint
         self.inputs = None
         self.output = None
+        self._output_is_tuple = False
+        self._output_arity = 1
         self._skip_event = False  # When True, skip event wait/record in _stream_ctx
 
     def forward(self, inputs=()):
@@ -160,6 +162,7 @@ class ScheduleNode:
             if self.checkpoint:
                 with torch.no_grad():
                     data = self.forward_func(*self.inputs)
+                self._set_output_metadata(data)
                 if not isinstance(data, tuple):
                     data = _make_viewless(data).detach().requires_grad_(True)
                 else:
@@ -170,6 +173,7 @@ class ScheduleNode:
                     )
             else:
                 data = self.forward_func(*self.inputs)
+                self._set_output_metadata(data)
 
             self.output = data
 
@@ -205,7 +209,7 @@ class ScheduleNode:
                 tensor_grads = []
                 for i, out in enumerate(recomputed):
                     if isinstance(out, torch.Tensor) and out.requires_grad:
-                        g = output_grad[i] if i < len(output_grad) else None
+                        g = self._output_grad_or_zero(output_grad, i, out)
                         tensor_outputs.append(out)
                         tensor_grads.append(g)
                 if tensor_outputs:
@@ -217,7 +221,7 @@ class ScheduleNode:
                 tensor_grads = []
                 for i, out in enumerate(outputs):
                     if isinstance(out, torch.Tensor) and out.requires_grad:
-                        g = output_grad[i] if i < len(output_grad) else None
+                        g = self._output_grad_or_zero(output_grad, i, out)
                         tensor_outputs.append(out)
                         tensor_grads.append(g)
                 if tensor_outputs:
@@ -231,6 +235,23 @@ class ScheduleNode:
     def get_grad(self):
         grad = tuple(e.grad if e is not None else None for e in self.inputs)
         return grad[0] if len(grad) == 1 else grad
+
+    def _set_output_metadata(self, output):
+        self._output_is_tuple = isinstance(output, tuple)
+        self._output_arity = len(output) if self._output_is_tuple else 1
+
+    def output_arity(self):
+        return self._output_arity
+
+    def output_is_tuple(self):
+        return self._output_is_tuple
+
+    @staticmethod
+    def _output_grad_or_zero(output_grad, index, output):
+        grad = output_grad[index] if index < len(output_grad) else None
+        if grad is None:
+            return torch.zeros_like(output)
+        return grad
 
     @staticmethod
     def _default_backward(outputs, output_grad, retain_graph=False):
@@ -512,7 +533,8 @@ class MergedScheduler:
             del prev_all_nodes
             # Propagate gradient through embedding graph to tok_embed weight
             with nnscaler.sync_grad_when(False):
-                _embed_h_list[mb_i].backward(grad_h)
+                with torch.cuda.stream(get_comp_stream()):
+                    _embed_h_list[mb_i].backward(grad_h)
 
             # Sync COMM→COMP: last fwd node may be on COMM (MoE combine),
             # but loss_node runs on COMP with a fresh event.
@@ -545,7 +567,8 @@ class MergedScheduler:
                     continue
                 grad_h = self._backward_entry(entry, grad_h)
             # Propagate gradient through embedding graph to tok_embed weight
-            _embed_h_list[-1].backward(grad_h)
+            with torch.cuda.stream(get_comp_stream()):
+                _embed_h_list[-1].backward(grad_h)
 
         # Make default stream wait for COMP/COMM to finish without blocking host.
         comp_done = torch.cuda.Event()
@@ -640,10 +663,96 @@ class MergedScheduler:
         elif isinstance(grads, torch.Tensor):
             grads.record_stream(comp)
 
+    def _prepare_loss_aux_tensors(self, attn_node, lc, attn_out):
+        aux_tensors = lc.step_data.get('_loss_aux_tensors')
+        if aux_tensors is None:
+            return
+        if not isinstance(aux_tensors, (tuple, list)):
+            aux_tensors = (aux_tensors,)
+        if not aux_tensors:
+            attn_node.loss_aux_tensors = ()
+            return
+
+        outputs = attn_out if isinstance(attn_out, tuple) else (attn_out,)
+        if len(outputs) < 3 + len(aux_tensors):
+            raise ValueError(
+                "MoE aux loss tensors must be returned by attn_fn after "
+                "(h_residual, h_ln, routing_probs).")
+
+        replacements = {}
+        grad_receivers = []
+        for idx, aux_tensor in enumerate(aux_tensors):
+            output = outputs[3 + idx]
+            if aux_tensor is None:
+                grad_receivers.append(None)
+                continue
+            if (not isinstance(aux_tensor, torch.Tensor)
+                    or not isinstance(output, torch.Tensor)):
+                raise TypeError("MoE aux loss tensors must correspond to tensor attn_fn outputs.")
+
+            if attn_node.checkpoint:
+                receiver = output
+            else:
+                receiver = _make_viewless(output).detach()
+                receiver.requires_grad = output.requires_grad
+
+            if receiver.requires_grad and not receiver.is_leaf:
+                receiver.retain_grad()
+            replacements[id(aux_tensor)] = receiver
+            replacements[id(output)] = receiver
+            grad_receivers.append(receiver)
+
+        prepared_step_data = {}
+        for key, value in list(lc.step_data.items()):
+            replaced, changed = self._replace_tensors_by_identity(value, replacements)
+            if changed:
+                lc.step_data[key] = replaced
+                prepared_step_data[key] = replaced
+        lc.step_data['_loss_aux_tensors'] = tuple(grad_receivers)
+        prepared_step_data['_loss_aux_tensors'] = tuple(grad_receivers)
+        attn_node.loss_aux_tensors = tuple(grad_receivers)
+        attn_node.loss_aux_step_data = prepared_step_data
+
+    @staticmethod
+    def _replace_tensors_by_identity(value, replacements):
+        replacement = replacements.get(id(value))
+        if replacement is not None:
+            return replacement, True
+        if isinstance(value, tuple):
+            replaced = []
+            changed = False
+            for v in value:
+                item, item_changed = MergedScheduler._replace_tensors_by_identity(v, replacements)
+                replaced.append(item)
+                changed = changed or item_changed
+            return (tuple(replaced) if changed else value), changed
+        if isinstance(value, list):
+            replaced = []
+            changed = False
+            for v in value:
+                item, item_changed = MergedScheduler._replace_tensors_by_identity(v, replacements)
+                replaced.append(item)
+                changed = changed or item_changed
+            return (replaced if changed else value), changed
+        if isinstance(value, dict):
+            replaced = {}
+            changed = False
+            for k, v in value.items():
+                item, item_changed = MergedScheduler._replace_tensors_by_identity(v, replacements)
+                replaced[k] = item
+                changed = changed or item_changed
+            return (replaced if changed else value), changed
+        return value, False
+
+    @staticmethod
+    def _restore_loss_aux_step_data(attn_node, lc):
+        prepared_step_data = getattr(attn_node, 'loss_aux_step_data', None)
+        if prepared_step_data:
+            lc.step_data.update(prepared_step_data)
+
     @staticmethod
     def _attn_backward_grads(attn_node, grad_h, grad_h_ln, grad_routing):
-        outputs = attn_node.get_output()
-        if not isinstance(outputs, tuple):
+        if not attn_node.output_is_tuple():
             return grad_h
 
         grads = [grad_h, grad_h_ln, grad_routing]
@@ -653,9 +762,9 @@ class MergedScheduler:
                 grads.append(tensor.grad)
             else:
                 grads.append(None)
-        while len(grads) < len(outputs):
+        while len(grads) < attn_node.output_arity():
             grads.append(None)
-        return tuple(grads[:len(outputs)])
+        return tuple(grads[:attn_node.output_arity()])
 
     def _forward_all_layers(self, h, lc_list, event):
         """Warmup: forward all layers, collect nodes and routing data."""
@@ -724,9 +833,7 @@ class MergedScheduler:
 
         attn_out = attn_n.forward((h,))
         h_residual, h_ln, routing_probs = attn_out[:3]
-        loss_aux_tensors = lc.step_data.get('_loss_aux_tensors')
-        if loss_aux_tensors is not None:
-            attn_n.loss_aux_tensors = loss_aux_tensors
+        self._prepare_loss_aux_tensors(attn_n, lc, attn_out)
         dispatch_out = dispatch_n.forward((h_ln, routing_probs))
         expert_result = expert_n.forward((*dispatch_out, h_ln))
         expert_out, shared_expert_out = expert_result
@@ -865,9 +972,7 @@ class MergedScheduler:
                 combine_grads = bwd_combine.backward(grad_h)
                 fwd_attn_out = fwd_attn.forward((fwd_h,))
             fwd_h_residual, fwd_h_ln, fwd_routing_probs = fwd_attn_out[:3]
-            loss_aux_tensors = fwd_lc.step_data.get('_loss_aux_tensors')
-            if loss_aux_tensors is not None:
-                fwd_attn.loss_aux_tensors = loss_aux_tensors
+            self._prepare_loss_aux_tensors(fwd_attn, fwd_lc, fwd_attn_out)
 
             # Phase boundary: Phase 2 COMP needs COMM output (combine_grads),
             # Phase 2 COMM needs COMP output (attn_out + precomputed metadata)
@@ -923,6 +1028,8 @@ class MergedScheduler:
                 attn_grads = self._attn_backward_grads(
                     bwd_attn, combine_grads[1], grad_h_ln_total, dispatch_grads[1])
                 grad_x = bwd_attn.backward(attn_grads)
+
+            self._restore_loss_aux_step_data(fwd_attn, fwd_lc)
 
             for n in fwd_nodes:
                 if n.checkpoint:

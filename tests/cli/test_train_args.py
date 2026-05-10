@@ -10,7 +10,10 @@ from nnscaler.cli.trainer_args import (
     load_type, ComputeConfig, OptionalComputeConfig, TrainerArgs,
     _resolve_precision, _to_precision, _get_tensor_dtype,
 )
-from nnscaler.runtime.utils import set_grad_dtype, get_grad_dtype
+from nnscaler.runtime.utils import is_torch_version_at_least, set_grad_dtype, get_grad_dtype
+
+
+_HAS_GRAD_DTYPE = is_torch_version_at_least(2, 10)
 
 
 def test_load_type():
@@ -84,6 +87,15 @@ def test_dyn_str_config():
 
 # --- grad dtype tests ---
 
+
+def test_torch_version_helper_accepts_nightly(monkeypatch):
+    monkeypatch.setattr(torch, '__version__', '2.10.0a0+gitabcdef')
+    assert is_torch_version_at_least(2, 10)
+
+    monkeypatch.setattr(torch, '__version__', '2.9.0.dev20260507+cu128')
+    assert not is_torch_version_at_least(2, 10)
+
+
 def test_resolve_precision_default_grad_none():
     """Default precision 'none' sets grad to None dtype."""
     p = _resolve_precision('none')
@@ -99,7 +111,7 @@ def test_resolve_precision_string_sets_grad():
     assert _get_tensor_dtype(p, 'grad') is None
 
 
-@pytest.mark.skipif(torch.__version__ < (2, 10), reason='requires torch >= 2.10 for grad_dtype support')
+@pytest.mark.skipif(not _HAS_GRAD_DTYPE, reason='requires torch >= 2.10 for grad_dtype support')
 def test_resolve_precision_dict_with_grad():
     """Dict precision with explicit grad key."""
     p = _resolve_precision({'pbi': 'bf16', 'grad': 'fp32'})
@@ -134,7 +146,7 @@ def test_set_get_grad_dtype_on_param():
     """set_grad_dtype/get_grad_dtype on a single parameter."""
     p = torch.nn.Parameter(torch.randn(4, dtype=torch.bfloat16))
     assert get_grad_dtype(p) == torch.bfloat16  # default: same as param dtype
-    if torch.__version__ < (2, 10):
+    if not _HAS_GRAD_DTYPE:
         with pytest.raises(RuntimeError):
             set_grad_dtype(p, torch.float32)  # grad dtype must be same as param dtype prior to 2.10
     else:
@@ -152,7 +164,7 @@ def test_set_grad_dtype_none_is_noop():
 def test_set_grad_dtype_on_module():
     """set_grad_dtype on a module sets grad_dtype for all trainable parameters."""
     m = torch.nn.Linear(4, 4).to(torch.bfloat16)
-    if torch.__version__ < (2, 10):
+    if not _HAS_GRAD_DTYPE:
         with pytest.raises(RuntimeError):
             set_grad_dtype(m, torch.float32)  # grad dtype must be same as param dtype prior to 2.10
     else:
@@ -162,7 +174,7 @@ def test_set_grad_dtype_on_module():
                 assert get_grad_dtype(p) == torch.float32
 
 
-@pytest.mark.skipif(torch.__version__ < (2, 10), reason="grad dtype must be same as param dtype prior to PyTorch 2.10")
+@pytest.mark.skipif(not _HAS_GRAD_DTYPE, reason="grad dtype must be same as param dtype prior to PyTorch 2.10")
 def test_to_precision_sets_grad_dtype():
     """_to_precision with grad precision sets grad_dtype on module parameters."""
     m = torch.nn.Linear(4, 4)
@@ -185,7 +197,7 @@ def test_to_precision_no_grad_precision():
             assert get_grad_dtype(p) == torch.bfloat16
 
 
-@pytest.mark.skipif(torch.__version__ < (2, 10), reason="grad dtype must be same as param dtype prior to PyTorch 2.10")
+@pytest.mark.skipif(not _HAS_GRAD_DTYPE, reason="grad dtype must be same as param dtype prior to PyTorch 2.10")
 def test_trainer_args_precision_with_grad():
     """TrainerArgs with precision dict containing grad key."""
     config_path = str(Path(__file__).with_name('trainer_args.yaml').resolve())
