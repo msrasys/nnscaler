@@ -298,7 +298,13 @@ def test_follow_attention():
         ]
 
         def helper(search_out):
-            return search_out[0][0].to_json()['desc']['partition_descs']
+            # `partition_descs` is now a list of dicts annotated with `cid`,
+            # `partition`, and (optionally) `fqn`/`op`. Project back to the
+            # (cid, partition) tuple that this test asserts against.
+            return [
+                (entry['cid'], entry['partition'])
+                for entry in search_out[0][0].to_json()['desc']['partition_descs']
+            ]
 
         dp_spmd_outs = spmd_solver.do_dp([(0, model_graph.op_num - 1)], 1)
         ilp_spmd_outs = spmd_solver.do_ilp([(0, model_graph.op_num - 1)], 1)
@@ -370,7 +376,13 @@ def test_solver_data_parallel():
         ]
 
         def helper(search_out):
-            return search_out[0][0].to_json()['desc']['partition_descs']
+            # `partition_descs` is now a list of dicts annotated with `cid`,
+            # `partition`, and (optionally) `fqn`/`op`. Project back to the
+            # (cid, partition) tuple that this test asserts against.
+            return [
+                (entry['cid'], entry['partition'])
+                for entry in search_out[0][0].to_json()['desc']['partition_descs']
+            ]
 
         dp_spmd_outs = spmd_solver.do_dp([(0, model_graph.op_num - 1)], 1)
         ilp_spmd_outs = spmd_solver.do_ilp([(0, model_graph.op_num - 1)], 1)
