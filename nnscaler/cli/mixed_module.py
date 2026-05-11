@@ -129,6 +129,16 @@ class ModuleParallelizeConfigAdapter(PrecisionMixin, PolicyMixin):
             else self.trainer_args.tracing_from_weights
         )
 
+    @property
+    def autoset_requires_grad(self):
+        # for end2end_mode, set it to True (requires_grad of all inputs will be set to False in this case)
+        # for non-end2end_mode, set it to self.parallel_module.forward_args_autoset_requires_grad
+        # if self.parallel_module.forward_args_autoset_requires_grad is False,
+        #   it means the user wants to retain the requires_grad of the dummy input
+        # if self.parallel_module.forward_args_autoset_requires_grad is True,
+        #   it means all float input tensors will be set requires_grad to True
+        return not self.parallel_module or self.parallel_module.forward_args_autoset_requires_grad
+
     def load_tracing_weights(self) -> Optional[dict[str, Any]]:
         tracing_weights = None
         if not self.parallel_module:
@@ -202,6 +212,7 @@ class ModuleParallelizeConfigAdapter(PrecisionMixin, PolicyMixin):
             'gbs': self.trainer_args.global_batch_size,
             'precision': self.trainer_args.precision,
             'model_args': self.trainer_args.model.args,
+            'autoset_requires_grad': self.autoset_requires_grad
         }
         return compute_config
 
@@ -210,7 +221,7 @@ class ModuleParallelizeConfigAdapter(PrecisionMixin, PolicyMixin):
         load_module: bool = True,
         build_buckets: bool = True,
         module_args: Optional[tuple[tuple, dict]] = None
-    ):
+    ) -> Optional[nnscaler.ParallelModule]:
         pmodel_class = nnscaler.parallelize(
             self.model_type,
             self.create_dummy_forward_args(dummy_input),
@@ -222,9 +233,14 @@ class ModuleParallelizeConfigAdapter(PrecisionMixin, PolicyMixin):
             instance_name=self.instance_name,
             broadcast_strategy=self.broadcast_strategy,
             load_module=load_module,
+            autoset_requires_grad=self.autoset_requires_grad,
         )
         if load_module:
-            return pmodel_class(build_buckets=build_buckets)
+            pmodel = pmodel_class(build_buckets=False)
+            self.set_grad_dtype(pmodel)
+            if build_buckets:
+                pmodel.build_buckets()
+            return pmodel
         return pmodel_class
 
 

@@ -205,6 +205,12 @@ class IRWeightReducer(IRCell):
         if not weights:
             return []
 
+        # TODO: group weights by both dtype and grad_dtype
+        # currently we assume all grad dtypes are
+        # 1. the same as weight dtype, or
+        # 2. all the same (e.g., all fp32) if grad_dtype is set in training config
+        # But when we support more flexible grad dtype configuration in the future,
+        # we should consider grad dtype when grouping weights for reducers
         dtype_groups: Dict[torch.dtype, List[IRSubTensor]] = {}
         for sub in weights:
             dtype_groups.setdefault(sub.dtype, []).append(sub)

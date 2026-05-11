@@ -1879,6 +1879,9 @@ class ParallelModule(CubeModule):
         """
         Get a packed information of the ParallelModule, so it can be sent to other ranks.
         """
+        # Note grad_dtype attribute of parameter with meta device is not saved
+        # TODO: currently it is not useful for reconstructing the ParallelModule on another rank.
+        #       We can consider saving the grad_dtype in the future if we need it.
         param_map: dict[torch.nn.Parameter, torch.nn.Parameter] = {}
         for p in self.parameters():
             param_map[p] = torch.nn.Parameter(

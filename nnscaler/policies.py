@@ -551,8 +551,8 @@ def fn(
     # key: IRFullTensor
     # value:
     #   key: stage_id
-    #   value: set of OpPartition in this stage
-    tensor_splits: dict[IRFullTensor, dict[int, set[OpPartition]]] = {}
+    #   value: set of dims in this stage, None if the tensor is replicated in this stage
+    tensor_splits: dict[IRFullTensor, dict[int, set[Optional[int]]]] = {}
     # store the last split info for each tensor to help handle auto partition
     # None: replicated
     # 'value': value partitioned
@@ -641,8 +641,9 @@ def fn(
                 # then we can update input/output partition info
 
                 # make sure the first item in op_partition_map is the first partition plan
-                op_partition_map[op_first_partition.input] = op_first_partition.dim
-                op_partition_map.update(result_partitions)
+                if result_partitions:
+                    op_partition_map[op_first_partition.input] = op_first_partition.dim
+                    op_partition_map.update(result_partitions)
 
                 for output in subnode.outputs():
                     if not isinstance(output, IRSubTensor):
@@ -678,8 +679,7 @@ def fn(
             if idx not in op_partition_map:
                 tensor_splits[ftensor].setdefault(op_plan.stage_id, set()).add(None)
             else:
-                tensor_splits[ftensor].setdefault(op_plan.stage_id, set()).add(
-                    OpPartition(input=idx, dim=op_partition_map[idx]))
+                tensor_splits[ftensor].setdefault(op_plan.stage_id, set()).add(op_partition_map[idx])
 
         if op_plan.recompute_id != -1:
             if op_plan.recompute_id in recompute_group_stages:
@@ -748,7 +748,7 @@ def fn(
     for ftensor, stage_info in tensor_splits.items():
         if not ftensor.is_param():
             continue
-        splits = set(k.dim if k is not None else None for v in stage_info.values() for k in v)
+        splits = set(k for v in stage_info.values() for k in v)
         find_replicated = None in splits
         splits = list(splits)
         # For safety, we will add multiref when detecting shared param are all replicated for pipeline parallelism.

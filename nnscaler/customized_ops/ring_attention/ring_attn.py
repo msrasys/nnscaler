@@ -13,7 +13,8 @@ from flash_attn import flash_attn_func
 from nnscaler.runtime.device import DeviceGroup
 
 
-def wrap_ring_attn_func(q: Tensor, k: Tensor, v: Tensor, softmax_scale: Tensor=None,
+def wrap_ring_attn_func(q: Tensor, k: Tensor, v: Tensor,
+                          softmax_scale: Tensor=None,
                           dropout_p: float=0.0, causal: bool=True, window_size: Tuple[int]=(-1, -1),
                           alibi_slopes: Tensor=None, deterministic: bool=False,
                           return_attn_probs: bool=False,

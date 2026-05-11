@@ -10,7 +10,7 @@ import torch
 from torch.utils.hooks import RemovableHandle
 
 from nnscaler.runtime.device import DeviceGroup
-from nnscaler.runtime.utils import split_array_min_max, set_fparam_meta
+from nnscaler.runtime.utils import split_array_min_max, set_fparam_meta, get_grad_dtype, set_grad_dtype
 from nnscaler.profiler.timer import CudaTimer
 from nnscaler.flags import RuntimeFlag
 from nnscaler.utils import unchecked_fields, first
@@ -206,7 +206,7 @@ class FlattenParamInfo:
         return tensors
 
 
-@dataclass
+@dataclass(frozen=True)
 class ParamZeroConfig:
     zero_param_level_sharding: Optional[bool] = None
 
@@ -389,6 +389,8 @@ class Bucket:
         # build parameter for optimizer (shared storage).
         # Its gradient will be updated everytime calling `self.sync_grads()`
         self._param_for_optimizer = torch.nn.Parameter(self._get_opt_param_data())
+        if self._contiguous_grads.dtype != self._param_for_optimizer.dtype:
+            set_grad_dtype(self._param_for_optimizer, self._contiguous_grads.dtype)
         set_fparam_meta(self._param_for_optimizer, self._flatten_param_info)
 
     def register_hooks(self):
@@ -880,8 +882,9 @@ class Reducer:
 
     def _allocate_buffers(self):
         # gradient buffer
+        grad_dtype = get_grad_dtype(self._params[0])
         self._contiguous_grads: torch.Tensor = torch.zeros(
-            (self.buffer_length,), dtype=self._params[0].dtype,
+            (self.buffer_length,), dtype=grad_dtype,
             device=torch.cuda.current_device(), requires_grad=False)
         # parameter buffer
         self._contiguous_params: torch.Tensor = torch.zeros(
@@ -903,8 +906,11 @@ class Reducer:
 
         The parameters in each bucket have consistent data types and classes,
         and each bucket contains at least one parameter.
-        If the bucket contains more than 2 parameters, than the total size is samller
-        than the max_bucket_size_bytes.
+
+        The total bucket size is bounded by max_bucket_size_bytes unless ZeRO
+        parameter-level sharding needs a larger bucket to keep at least one
+        parameter per zero rank, which means zero parameter-level sharding config has higher priority
+        than max_bucket_size_bytes.
         """
         if self._buckets:
             raise RuntimeError("Buckets have already been built, cannot build again.")
@@ -989,8 +995,16 @@ class Reducer:
         assert len(set(p.dtype for p in self._params)) == 1, (
             "All parameters in the reducer should have the same data type"
         )
+
+        def _min_bucket_param_num(param_cls: Any) -> int:
+            zero_param_level_sharding = param_cls[-1].zero_param_level_sharding if param_cls else self._zero_param_level_sharding
+            return 1 if not zero_param_level_sharding else self._zero_size
+
         for param in self._params:
             if param.requires_grad:
+                param_cls = self._param_clss.get(param, None)
+                min_bucket_param_num = _min_bucket_param_num(param_cls)
+
                 cur_byte_size = _aligned_nelement(param.nelement(), param.element_size(), self._align_size) * param.element_size()
                 # also work when cur_byte_size > bucket_size
                 # It will go the `else` branch
@@ -999,17 +1013,56 @@ class Reducer:
                 if len(self.seq_buckets) == 0:
                     self.seq_buckets.append([param])
                     last_bucket_size = cur_byte_size
-                    last_bucket_cls = self._param_clss.get(param, None)
+                    last_bucket_cls = param_cls
                     seq_buckets_cls.append(last_bucket_cls)
-                elif last_bucket_size + cur_byte_size <= bucket_size \
-                    and last_bucket_cls == self._param_clss.get(param, None):
+                elif ((last_bucket_size + cur_byte_size <= bucket_size
+                     or len(self.seq_buckets[-1]) < min_bucket_param_num)
+                    and last_bucket_cls == param_cls):
+                    # a greedy strategy is used here
+                    # which may not be the optimal one but is simple and efficient
                     self.seq_buckets[-1].append(param)
                     last_bucket_size += cur_byte_size
                 else:
                     self.seq_buckets.append([param])
                     last_bucket_size = cur_byte_size
-                    last_bucket_cls = self._param_clss.get(param, None)
+                    last_bucket_cls = param_cls
                     seq_buckets_cls.append(last_bucket_cls)
+
+        # check and fix the last bucket size when zero parameter-level sharding is enabled,
+        # this is done by merging the last bucket with the previous bucket with the same class
+        # if the last bucket size is smaller than the number of ranks in zero subgroup
+        # Note: only the last bucket of each cls needs to be fixed
+        # because the bucket building process ensures all buckets except the last one have enough parameters
+        old_seq_buckets = self.seq_buckets
+        old_seq_buckets_cls = seq_buckets_cls
+        self.seq_buckets = []
+        seq_buckets_cls = []
+        last_cls_buckets = {} # save the last bucket so far for each class
+        for params, param_cls in zip(old_seq_buckets, old_seq_buckets_cls):
+            last_cls_bucket = last_cls_buckets.get(param_cls, None)
+            if len(params) < _min_bucket_param_num(param_cls):
+                if last_cls_bucket is None:
+                    raise RuntimeError(
+                        f"the number of parameters({len(params)}) in the bucket is smaller than "
+                        f"the number of ranks({self._zero_size}) in the zero group. "
+                        f"ZeRO parameter-level sharding cannot be applied for this bucket. "
+                        f"Please disable ZeRO or disable "
+                        f"parameter-level sharding or increase bucket size."
+                    )
+                else:
+                    _logger.warning(
+                        f"the number of parameters({len(params)}) in the bucket is smaller than "
+                        f"the number of ranks({self._zero_size}) in the zero group. "
+                        f"This bucket will be merged with the previous bucket of the same class to enable ZeRO parameter-level sharding, "
+                        f"which makes the byte size of the previous bucket larger than the maximum bucket size, "
+                        f"and violates the setting for bucket size limit. "
+                    )
+                    # merge with the previous bucket with the same class,
+                    last_cls_bucket.extend(params)
+            else:
+                self.seq_buckets.append(params)
+                seq_buckets_cls.append(param_cls)
+                last_cls_buckets[param_cls] = params
 
         # step 2: build meta data for the offset of each bucket
         # the start of each bucket will be padded to the next multiple of `len(self.ranks)`
@@ -1040,13 +1093,20 @@ class Reducer:
                 # reorder params according to group idx
                 params[:] = new_param_order
                 self.buffer_length += max_group_size * self._zero_size
-            else:
-                if zero_param_level_sharding:
+                total_param_size = sum(param_sizes)
+                # if the allocated buffer size is 50% larger than the total param size,
+                # we warn users about potential memory waste.
+                if max_group_size * self._zero_size > total_param_size * 1.5:
                     _logger.warning(
-                        f"the number of parameters in the bucket {len(params)} is smaller than "
-                        f"the number of ranks in the zero group {self._zero_size}, "
-                        f"ZeRO parameter-level sharding is skipped for this bucket."
+                        f"the buffer size {max_group_size * self._zero_size} allocated for this bucket is much larger than the total param size {total_param_size}, "
+                        f"which may cause memory waste. "
+                        f"Consider increasing bucket size or disable zero parameter-level sharding for better memory efficiency."
                     )
+            else:
+                assert not zero_param_level_sharding, \
+                    "zero parameter-level sharding is supposed to be applied "\
+                    "but the number of parameters in this bucket is smaller than "\
+                    "the number of ranks in zero subgroup."
                 chunk_offset = 0
                 for idx, ps in enumerate(param_sizes):
                     param = params[idx]
