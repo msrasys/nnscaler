@@ -38,6 +38,13 @@ _COMP_STREAM = None   # computation stream (non-default)
 _COMM_STREAM = None   # communication stream (non-default)
 
 
+def _env_enabled(name, default=False):
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value not in ('0', '', 'false', 'False', 'FALSE')
+
+
 def set_streams():
     """Initialize global COMP/COMM streams.
     BOTH streams are non-default so that CUDA's legacy
@@ -63,6 +70,24 @@ def get_comm_stream():
     return _COMM_STREAM
 
 
+def _drain_overlap_streams_before_grad_sync():
+    """Make overlap stream frees visible before NCCL gradient all-reduce.
+
+    The merged schedule runs backward on non-default COMP/COMM streams. At the
+    end of the schedule the default stream waits on those streams, but the host
+    can still enqueue the reducer all-reduce before stream-ordered frees are
+    visible to CUDA/NCCL. Draining here trades a small post-backward sync for a
+    lower and more deterministic memory peak at manual gradient synchronization.
+    """
+    if not torch.cuda.is_available() or (_COMP_STREAM is None and _COMM_STREAM is None):
+        return
+
+    if _COMP_STREAM is not None:
+        _COMP_STREAM.synchronize()
+    if _COMM_STREAM is not None:
+        _COMM_STREAM.synchronize()
+
+
 def manual_sync_grads(parallel_module):
     """Manually trigger synchronous allreduce after all backward calls.
 
@@ -76,6 +101,8 @@ def manual_sync_grads(parallel_module):
     if not hasattr(pm, '_reducers'):
         _logger.warning("No _reducers found on parallel module, skipping manual sync")
         return
+
+    _drain_overlap_streams_before_grad_sync()
 
     for reducer in pm._reducers:
         for bucket in reducer._buckets:
