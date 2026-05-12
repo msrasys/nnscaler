@@ -30,6 +30,7 @@ import torch
 from torch.autograd import Variable
 
 import nnscaler
+from nnscaler.profiler.timer import CudaTimer
 
 
 _logger = logging.getLogger(__name__)
@@ -43,6 +44,17 @@ def _env_enabled(name, default=False):
     if value is None:
         return default
     return value not in ('0', '', 'false', 'False', 'FALSE')
+
+
+def _env_int(name, default):
+    value = os.environ.get(name)
+    if value is None or value == '':
+        return default
+    try:
+        return int(value)
+    except ValueError:
+        _logger.warning("Invalid %s=%r, using %s", name, value, default)
+        return default
 
 
 def set_streams():
@@ -87,6 +99,72 @@ def _drain_overlap_streams_before_grad_sync():
     if _COMM_STREAM is not None:
         _COMM_STREAM.synchronize()
 
+    if _env_enabled('MERGED_SYNC_GRADS_EMPTY_CACHE'):
+        torch.cuda.empty_cache()
+
+
+def _all_reduce_in_chunks(tensor, *, op, group, chunk_bytes):
+    if chunk_bytes <= 0 or tensor.numel() * tensor.element_size() <= chunk_bytes:
+        torch.distributed.all_reduce(tensor, op=op, group=group)
+        return
+
+    chunk_numel = max(1, chunk_bytes // tensor.element_size())
+    for start in range(0, tensor.numel(), chunk_numel):
+        torch.distributed.all_reduce(
+            tensor[start:start + chunk_numel], op=op, group=group)
+
+
+def _finish_bucket_sync(bucket):
+    for param in bucket._params:
+        assert param.grad is None
+        pofst = bucket._pofset[param]
+        if bucket._z3:
+            z3_info = bucket._reducer.get_z3_info(param)
+            assert z3_info.numel_with_padding() == param.numel() and len(param.shape) == 1, \
+                f"internal error: zero3 param size mismatch, " \
+                f"expect {[z3_info.numel_with_padding()]} got {param.shape}"
+        param.grad = bucket._contiguous_grads[pofst:pofst + param.numel()].view(param.size())
+
+    if bucket._zero == 1:
+        rank = torch.distributed.get_rank(group=bucket._zero_subgroup)
+        bucket._param_for_optimizer.grad = bucket._contiguous_grads.chunk(
+            bucket._zgroup_sz, dim=0)[rank]
+    else:
+        bucket._param_for_optimizer.grad = bucket._contiguous_grads
+
+    bucket._apply_post_hooks()
+
+
+def _sync_bucket_grads_chunked(bucket, chunk_bytes):
+    if bucket._async:
+        bucket.sync_grads()
+        return
+
+    # Keep reduce-scatter unchanged; it uses a different subgroup/crossgroup
+    # protocol than the plain all-reduce paths that trigger this OOM.
+    if bucket._zero == 1 and bucket._zero_use_reduce_scatter:
+        bucket.sync_grads()
+        return
+
+    CudaTimer().start('comm', predefined=True)
+    bucket._apply_pre_hooks()
+    if bucket._zero > 1:
+        _all_reduce_in_chunks(
+            bucket._contiguous_grads,
+            op=bucket._reduce_op,
+            group=bucket._zero_crossgroup,
+            chunk_bytes=chunk_bytes,
+        )
+    else:
+        _all_reduce_in_chunks(
+            bucket._contiguous_grads,
+            op=bucket._reduce_op,
+            group=bucket._group,
+            chunk_bytes=chunk_bytes,
+        )
+    CudaTimer().stop('comm', predefined=True)
+    _finish_bucket_sync(bucket)
+
 
 def manual_sync_grads(parallel_module):
     """Manually trigger synchronous allreduce after all backward calls.
@@ -103,13 +181,15 @@ def manual_sync_grads(parallel_module):
         return
 
     _drain_overlap_streams_before_grad_sync()
+    chunk_mb = _env_int('MERGED_SYNC_GRADS_CHUNK_MB', 128)
+    chunk_bytes = chunk_mb * 1024 * 1024
 
     for reducer in pm._reducers:
         for bucket in reducer._buckets:
             old_async = bucket._async
             bucket._async = False
             try:
-                bucket.sync_grads()
+                _sync_bucket_grads_chunked(bucket, chunk_bytes)
             finally:
                 bucket._async = old_async
             bucket.reset()

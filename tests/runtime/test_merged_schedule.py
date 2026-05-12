@@ -6,6 +6,7 @@ import torch
 import torch.distributed as dist
 from torch import nn
 
+import nnscaler.runtime.merged_schedule.engine as merged_engine
 from nnscaler.runtime.merged_schedule import (
     LayerCallables,
     MergedScheduler,
@@ -15,6 +16,51 @@ from nnscaler.runtime.merged_schedule import (
     set_streams,
 )
 from tests.launch_torchrun import launch_torchrun
+
+
+def test_chunked_manual_bucket_sync_preserves_grad_views(monkeypatch):
+    param0 = nn.Parameter(torch.empty(4))
+    param1 = nn.Parameter(torch.empty(6))
+    grad_buffer = torch.arange(10, dtype=torch.float32)
+
+    class FakeBucket:
+        _async = False
+        _zero = 0
+        _zero_use_reduce_scatter = False
+        _z3 = False
+        _params = [param0, param1]
+        _pofset = {param0: 0, param1: 4}
+        _contiguous_grads = grad_buffer
+        _param_for_optimizer = nn.Parameter(torch.empty_like(grad_buffer))
+        _reduce_op = None
+        _group = object()
+        post_hook_called = False
+
+        def _apply_pre_hooks(self):
+            self._contiguous_grads.add_(1)
+
+        def _apply_post_hooks(self):
+            self.post_hook_called = True
+
+    calls = []
+
+    def fake_all_reduce(tensor, op=None, group=None):
+        calls.append(tensor.numel())
+        tensor.add_(10)
+
+    monkeypatch.setattr(torch.distributed, 'all_reduce', fake_all_reduce)
+
+    bucket = FakeBucket()
+    merged_engine._sync_bucket_grads_chunked(bucket, chunk_bytes=16)
+
+    assert calls == [4, 4, 2]
+    torch.testing.assert_close(grad_buffer, torch.arange(10, dtype=torch.float32) + 11)
+    torch.testing.assert_close(param0.grad, grad_buffer[:4])
+    torch.testing.assert_close(param1.grad, grad_buffer[4:])
+    assert param0.grad.data_ptr() == grad_buffer[:4].data_ptr()
+    assert param1.grad.data_ptr() == grad_buffer[4:].data_ptr()
+    assert bucket._param_for_optimizer.grad is grad_buffer
+    assert bucket.post_hook_called
 
 
 class _CountingMergedScheduler(MergedScheduler):
