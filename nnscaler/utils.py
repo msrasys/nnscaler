@@ -880,7 +880,8 @@ def broadcast_mixed_data(
     device: Optional[Union[str, torch.device]] = None,
 ):
     """
-    Broadcast the data (containing tensors) from src_rank to all other ranks.
+    Broadcast the data (containing tensors) from `src_rank` to the ranks in `group`
+    (`src_rank` is based on the global process group, and should be a member of `group`).
 
     Args:
         data (Optional[dict]): The data to be broadcasted.
