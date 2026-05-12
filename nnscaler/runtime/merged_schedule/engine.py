@@ -535,6 +535,8 @@ class MergedScheduler:
             with nnscaler.sync_grad_when(False):
                 with torch.cuda.stream(get_comp_stream()):
                     _embed_h_list[mb_i].backward(grad_h)
+                    _embed_h_list[mb_i] = None
+                    del grad_h
 
             # Sync COMM→COMP: last fwd node may be on COMM (MoE combine),
             # but loss_node runs on COMP with a fresh event.
@@ -562,13 +564,17 @@ class MergedScheduler:
                     lc = entry[1]
                     with torch.cuda.stream(get_comp_stream()):
                         grad_h = lc.special_backward(grad_h)
+                    prev_all_nodes[i] = None
                     continue
                 if entry is None:
                     continue
                 grad_h = self._backward_entry(entry, grad_h)
+                prev_all_nodes[i] = None
             # Propagate gradient through embedding graph to tok_embed weight
             with torch.cuda.stream(get_comp_stream()):
                 _embed_h_list[-1].backward(grad_h)
+                _embed_h_list[-1] = None
+                del grad_h
 
         # Make default stream wait for COMP/COMM to finish without blocking host.
         comp_done = torch.cuda.Event()
@@ -584,6 +590,8 @@ class MergedScheduler:
                     t.detach() if isinstance(t, torch.Tensor) else t
                     for t in results[i]
                 )
+
+        _embed_h_list.clear()
 
         del prev_all_nodes, prev_loss_node
 
