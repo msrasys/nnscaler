@@ -18,6 +18,7 @@ from nnscaler.utils import is_running_distributed
 _logger = logging.getLogger(__name__)
 _LARGE_TIMEOUT = datetime.timedelta(seconds=21600)
 _deferred_release_refs: List[Tuple[torch.cuda.Event, Tuple[Any, ...]]] = []
+_release_wait_events: List[torch.cuda.Event] = []
 _deferred_release_lock = threading.Lock()
 
 
@@ -44,27 +45,81 @@ def _collect_cuda_storages(value: Any, refs: List[Any], seen: set):
 
 
 def prune_deferred_releases():
-    """Drop storage refs whose last-use CUDA event has completed."""
+    """Drop completed release events and storage refs."""
     with _deferred_release_lock:
-        if not _deferred_release_refs:
-            return
+        if _release_wait_events:
+            _release_wait_events[:] = [
+                event for event in _release_wait_events
+                if not event.query()
+            ]
 
-        pending = []
-        for event, refs in _deferred_release_refs:
-            if not event.query():
-                pending.append((event, refs))
-        _deferred_release_refs[:] = pending
+        if _deferred_release_refs:
+            pending = []
+            for event, refs in _deferred_release_refs:
+                if not event.query():
+                    pending.append((event, refs))
+            _deferred_release_refs[:] = pending
 
 
 def flush_deferred_releases():
-    """Synchronize and release all storages held by defer_release."""
+    """Synchronize and release all pending release events/storages."""
     with _deferred_release_lock:
-        if not _deferred_release_refs:
+        if not _deferred_release_refs and not _release_wait_events:
             return
 
+        for event in _release_wait_events:
+            event.synchronize()
         for event, _ in _deferred_release_refs:
             event.synchronize()
+        _release_wait_events.clear()
         _deferred_release_refs.clear()
+
+
+def _resolve_stream(stream: Optional[torch.cuda.Stream], stream_name: Optional[str],
+                    *, default_current: bool) -> torch.cuda.Stream:
+    if stream is not None:
+        return stream
+    if stream_name is not None:
+        return DeviceGroup().get_stream(stream_name)
+    if default_current:
+        return torch.cuda.current_stream()
+    return torch.cuda.default_stream()
+
+
+def _same_stream(lhs: torch.cuda.Stream, rhs: torch.cuda.Stream) -> bool:
+    return lhs is rhs or lhs.cuda_stream == rhs.cuda_stream
+
+
+def wait_stream_for_release(*,
+                            producer_stream: Optional[torch.cuda.Stream] = None,
+                            producer_stream_name: Optional[str] = None,
+                            consumer_stream: Optional[torch.cuda.Stream] = None,
+                            consumer_stream_name: Optional[str] = None):
+    """Order a producer stream after a tensor's last-use stream before deletion.
+
+    A tensor allocated on one stream and last used on another normally needs
+    Tensor.record_stream or a temporary Python ref. Both can keep large blocks
+    unavailable to the caching allocator. Instead, record an event on the
+    consumer stream and make the producer stream wait for it before the caller
+    deletes the tensor. The block can then return to the allocator immediately,
+    while future work on the producer stream cannot reuse it too early.
+    """
+    producer = _resolve_stream(
+        producer_stream, producer_stream_name, default_current=False)
+    consumer = _resolve_stream(
+        consumer_stream, consumer_stream_name, default_current=True)
+    if _same_stream(producer, consumer):
+        return
+
+    prune_deferred_releases()
+
+    event = torch.cuda.Event()
+    event.record(consumer)
+    producer.wait_event(event)
+    if event.query():
+        return
+    with _deferred_release_lock:
+        _release_wait_events.append(event)
 
 
 def defer_release(*values: Any, stream: Optional[torch.cuda.Stream] = None,

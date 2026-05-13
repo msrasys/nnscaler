@@ -81,6 +81,25 @@ class ScheduleCodeGen(FuncEmission):
         self._validate_events(device_nodes)
 
         lifetime = LifeCycle(device_nodes, [], self.execplan.outputs())
+        tensor_producer_stream = {}
+        unknown_producer_stream = object()
+
+        def _node_output_tensors(node: IRCell) -> List[IRTensor]:
+            if isinstance(node, (IRSegment, ExeReuseCell)) and not node.isfw():
+                _, _, _, input_grads = self.get_backward_callsite_io_tensors(node)
+                outputs = input_grads
+            else:
+                outputs = node.outputs()
+            return [
+                tensor for tensor in IRSegment.get_objects_from_complex(outputs)
+                if isinstance(tensor, IRTensor) and not tensor.is_attr()
+            ]
+
+        if self.execplan.use_multi_streams:
+            for node in device_nodes:
+                node_stream = self._get_node_stream(node)
+                for tensor in _node_output_tensors(node):
+                    tensor_producer_stream[tensor] = node_stream
 
         args = ['model'] + [self.tensor_name(t) for t in self.execplan.graph.inputs()]
 
@@ -119,16 +138,41 @@ class ScheduleCodeGen(FuncEmission):
         def _emit_release_after_stream(tensors, stream: Optional[str]) -> List[str]:
             if not self.execplan.use_multi_streams:
                 return [self.emit_release(tensors)]
-            tensor_args = ', '.join(self.tensor_name(t) for t in tensors)
-            if not stream:
-                return [
-                    f'nnscaler.runtime.device.defer_release({tensor_args})',
-                    self.emit_release(tensors),
-                ]
-            return [
-                f'nnscaler.runtime.device.defer_release({tensor_args}, stream_name={stream!r})',
-                self.emit_release(tensors),
-            ]
+
+            streams_to_wait = set()
+            tensors_to_defer = []
+            for tensor in tensors:
+                producer_stream = tensor_producer_stream.get(tensor, unknown_producer_stream)
+                if producer_stream == stream:
+                    continue
+                if producer_stream is unknown_producer_stream:
+                    tensors_to_defer.append(tensor)
+                else:
+                    streams_to_wait.add(producer_stream)
+
+            release_codes = []
+            for producer_stream in sorted(streams_to_wait, key=lambda s: '' if s is None else s):
+                kwargs = []
+                if producer_stream is not None:
+                    kwargs.append(f'producer_stream_name={producer_stream!r}')
+                if stream is not None:
+                    kwargs.append(f'consumer_stream_name={stream!r}')
+                release_codes.append(
+                    f'nnscaler.runtime.device.wait_stream_for_release({", ".join(kwargs)})'
+                )
+
+            if tensors_to_defer:
+                tensor_args = ', '.join(self.tensor_name(t) for t in tensors_to_defer)
+                if not stream:
+                    release_codes.append(
+                        f'nnscaler.runtime.device.defer_release({tensor_args})'
+                    )
+                else:
+                    release_codes.append(
+                        f'nnscaler.runtime.device.defer_release({tensor_args}, stream_name={stream!r})'
+                    )
+
+            return release_codes + [self.emit_release(tensors)]
 
         with FunctionBlock(func_name='_train_step',
                            args=args) as fb:

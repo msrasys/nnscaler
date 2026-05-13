@@ -142,18 +142,22 @@ def _mark_tensors_stream(value, stream):
             _set_tensor_stream(tensor, stream)
 
 
-def _defer_cross_stream_tensors_until_done(value, stream):
-    refs = []
+def _order_cross_stream_tensors_until_done(value, stream):
+    producer_streams = []
     seen = set()
     for tensor in _iter_tensors(value):
         producer_stream = _get_tensor_stream(tensor)
         if producer_stream is None or _same_stream(producer_stream, stream):
             continue
-        if id(tensor) not in seen:
-            refs.append(tensor)
-            seen.add(id(tensor))
-    if refs:
-        nnscaler.runtime.device.defer_release(*refs, stream=stream)
+        stream_key = getattr(producer_stream, 'cuda_stream', id(producer_stream))
+        if stream_key not in seen:
+            producer_streams.append(producer_stream)
+            seen.add(stream_key)
+    for producer_stream in producer_streams:
+        nnscaler.runtime.device.wait_stream_for_release(
+            producer_stream=producer_stream,
+            consumer_stream=stream,
+        )
 
 
 class ScheduleNode:
@@ -279,7 +283,7 @@ class ScheduleNode:
                     self.backward_func(tuple(tensor_outputs), tuple(tensor_grads),
                                        retain_graph=retain_graph)
 
-        _defer_cross_stream_tensors_until_done(output_grad, self.stream)
+        _order_cross_stream_tensors_until_done(output_grad, self.stream)
         grads = self.get_grad()
         _mark_tensors_stream(grads, self.stream)
         self._release()
@@ -335,7 +339,7 @@ class ScheduleNode:
                 self.event.record(self.stream)
 
     def _release(self):
-        _defer_cross_stream_tensors_until_done((self.inputs, self.output), self.stream)
+        _order_cross_stream_tensors_until_done((self.inputs, self.output), self.stream)
         self.inputs = None
         self.output = None
 
@@ -729,9 +733,9 @@ class MergedScheduler:
         get_comm_stream().wait_event(comp_evt)
         get_comp_stream().wait_event(comm_evt)
 
-    def _defer_cross_stream_for_comp(self, tensors):
-        """Keep cross-stream tensors alive until queued COMP work has used them."""
-        _defer_cross_stream_tensors_until_done(tensors, get_comp_stream())
+    def _order_cross_stream_for_comp(self, tensors):
+        """Order producer streams after queued COMP work that uses tensors."""
+        _order_cross_stream_tensors_until_done(tensors, get_comp_stream())
 
     def _prepare_loss_aux_tensors(self, attn_node, lc, attn_out):
         aux_tensors = lc.step_data.get('_loss_aux_tensors')
@@ -955,8 +959,8 @@ class MergedScheduler:
             attn_grads = self._attn_backward_grads(
                 attn_n, combine_grads[1], grad_h_ln_total, dispatch_grads[1])
             grad_x = attn_n.backward(attn_grads)
-            self._defer_cross_stream_for_comp(dispatch_grads)
-            self._defer_cross_stream_for_comp(combine_grads)
+            self._order_cross_stream_for_comp(dispatch_grads)
+            self._order_cross_stream_for_comp(combine_grads)
 
         return grad_x
 
@@ -1090,8 +1094,8 @@ class MergedScheduler:
                 attn_grads = self._attn_backward_grads(
                     bwd_attn, combine_grads[1], grad_h_ln_total, dispatch_grads[1])
                 grad_x = bwd_attn.backward(attn_grads)
-                self._defer_cross_stream_for_comp(dispatch_grads)
-                self._defer_cross_stream_for_comp(combine_grads)
+                self._order_cross_stream_for_comp(dispatch_grads)
+                self._order_cross_stream_for_comp(combine_grads)
                 fwd_h_out = fut_combine_fwd.result()
             else:
                 fwd_h_out = fwd_combine.forward((fwd_expert_out, fwd_h_residual, fwd_shared_expert_out))
@@ -1099,8 +1103,8 @@ class MergedScheduler:
                 attn_grads = self._attn_backward_grads(
                     bwd_attn, combine_grads[1], grad_h_ln_total, dispatch_grads[1])
                 grad_x = bwd_attn.backward(attn_grads)
-                self._defer_cross_stream_for_comp(dispatch_grads)
-                self._defer_cross_stream_for_comp(combine_grads)
+                self._order_cross_stream_for_comp(dispatch_grads)
+                self._order_cross_stream_for_comp(combine_grads)
 
             self._restore_loss_aux_step_data(fwd_attn, fwd_lc)
 
