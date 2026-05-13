@@ -1,11 +1,11 @@
 #  Copyright (c) Microsoft Corporation.
 #  Licensed under the MIT License.
 
-from typing import List, Optional, Tuple, Union
+from typing import Dict, List, Optional, Set, Tuple, Union
 import copy
 import logging
 
-from nnscaler.ir.cten import IRCell, IRTensor, IR
+from nnscaler.ir.cten import IRCell, IRTensor
 from nnscaler.ir.operator import IRDataOperation, IRFwOperation
 from nnscaler.ir.tensor import IRSubTensor
 from nnscaler.ir.adapter import IRWeightReducer, IRAdapter
@@ -81,6 +81,7 @@ class ScheduleCodeGen(FuncEmission):
         self._validate_events(device_nodes)
 
         lifetime = LifeCycle(device_nodes, [], self.execplan.outputs())
+        producer_streams, consumer_streams = self._collect_tensor_streams(device_nodes)
 
         args = ['model'] + [self.tensor_name(t) for t in self.execplan.graph.inputs()]
 
@@ -165,7 +166,11 @@ class ScheduleCodeGen(FuncEmission):
                     # release
                     tensors = lifetime.release_tensors_after_line(line)
                     if len(tensors) > 0 : # not necessarily to have one after each line
-                        _append_code(fb, self.emit_release(tensors))
+                        _append_code(
+                            fb,
+                            self._emit_release_with_stream_waits(
+                                tensors, producer_streams, consumer_streams)
+                        )
             # return code
             outputs = self.return_name_complex(self.execplan.outputs())
             code = f'return {outputs}'
@@ -195,7 +200,11 @@ class ScheduleCodeGen(FuncEmission):
                     tensors = lifetime.release_tensors_after_line(line)
                     tensors = [t for t in tensors if isinstance(t, IRTensor) and not t.is_grad()]
                     if len(tensors) > 0 : # not necessarily to have one after each line
-                        _append_code(fb, self.emit_release(tensors))
+                        _append_code(
+                            fb,
+                            self._emit_release_with_stream_waits(
+                                tensors, producer_streams, consumer_streams)
+                        )
                 # return code
                 outputs = self.return_name_complex(self.execplan.outputs())
                 code = f'return {outputs}'
@@ -228,6 +237,78 @@ class ScheduleCodeGen(FuncEmission):
             return stream_context.stream
         else:
             return None
+
+    @staticmethod
+    def _stream_expr(stream: Optional[str]) -> str:
+        if stream is None:
+            return 'torch.cuda.default_stream()'
+        return f'nnscaler.runtime.device.DeviceGroup().get_stream({stream!r})'
+
+    @staticmethod
+    def _activation_tensors(objs) -> List[IRSubTensor]:
+        return [
+            t for t in IRSegment.get_objects_from_complex(objs)
+            if isinstance(t, IRSubTensor) and not t.is_attr()
+        ]
+
+    def _node_lifecycle_io(self, node: IRCell):
+        if isinstance(node, (IRSegment, ExeReuseCell)):
+            if node.isfw():
+                return node.inputs(), node.outputs()
+
+            fw_inputs, fw_outputs, output_grads, input_grads = \
+                self.get_backward_callsite_io_tensors(node)
+            output_grads = [t for t in output_grads if not t.is_loss()]
+            return list(fw_inputs) + list(fw_outputs) + output_grads, input_grads
+
+        return node.inputs(), node.outputs()
+
+    def _collect_tensor_streams(
+        self, nodes: List[IRCell]
+    ) -> Tuple[Dict[IRSubTensor, Optional[str]], Dict[IRSubTensor, Set[Optional[str]]]]:
+        producer_streams: Dict[IRSubTensor, Optional[str]] = {}
+        consumer_streams: Dict[IRSubTensor, Set[Optional[str]]] = {}
+
+        for tensor in self._activation_tensors(self.execplan.graph.inputs()):
+            producer_streams.setdefault(tensor, None)
+
+        for node in nodes:
+            stream = self._get_node_stream(node)
+            inputs, outputs = self._node_lifecycle_io(node)
+
+            for tensor in self._activation_tensors(inputs):
+                consumer_streams.setdefault(tensor, set()).add(stream)
+            for tensor in self._activation_tensors(outputs):
+                producer_streams[tensor] = stream
+
+        return producer_streams, consumer_streams
+
+    def _emit_release_with_stream_waits(
+        self,
+        tensors: List[IRTensor],
+        producer_streams: Dict[IRSubTensor, Optional[str]],
+        consumer_streams: Dict[IRSubTensor, Set[Optional[str]]],
+    ) -> List[str]:
+        wait_codes = []
+        emitted = set()
+
+        for tensor in tensors:
+            if not isinstance(tensor, IRSubTensor) or tensor.is_attr():
+                continue
+            producer = producer_streams.get(tensor, None)
+            consumers = sorted(
+                consumer_streams.get(tensor, ()),
+                key=lambda s: '' if s is None else s,
+            )
+            for consumer in consumers:
+                if consumer == producer:
+                    continue
+                code = f'{self._stream_expr(producer)}.wait_stream({self._stream_expr(consumer)})'
+                if code not in emitted:
+                    wait_codes.append(code)
+                    emitted.add(code)
+
+        return wait_codes + [self.emit_release(tensors)]
 
     def _emit_stream_context(self, stream_context, codes: List[str]) -> List[str]:
         wait_stream_codes = []
@@ -278,8 +359,6 @@ class ScheduleCodeGen(FuncEmission):
         bsign = '{input_grads} = nnscaler.runtime.executor.backward({name}, {input_tensors}, {output_tensors}, {output_grads})'
 
         node_inputs, node_outputs = node.inputs(), node.outputs()
-        # the real inputs in gencode
-        gen_inputs = node_inputs
         req_grad = any(t.requires_grad for t in node.outputs() if isinstance(t, IRTensor))
         req_grad = False if force_no_grad else req_grad
 
@@ -305,7 +384,6 @@ class ScheduleCodeGen(FuncEmission):
                 # get gradient computation arguments
                 input_tensors, output_tensors, output_grads, input_grads = \
                         self.get_backward_callsite_io_tensors(node)
-                gen_inputs = (input_tensors, output_tensors, output_grads)
                 # special handle for loss
                 for idx, tensor in enumerate(output_grads):
                     if isinstance(tensor, IRSubTensor) and tensor.is_loss():
@@ -355,25 +433,6 @@ class ScheduleCodeGen(FuncEmission):
 
         else:
             raise RuntimeError(f"Unspported node type: {type(unwrap_node)}")
-
-        if stream_context and stream_context.stream:
-            # register all input tensors to the current stream
-            # to avoid cross-stream premature deallocation issue
-            # see `Tensor.record_stream` in PyTorch for more details
-
-            # NOTE: The dataloader output is not considered here. Two reasons:
-            # 1) Dataloader output is wrapped in an IRObject, and internal IRTensors cannot be accessed here easily.
-            # 2) Dataloader output is used as input of the first forward segment immediately after data loading
-            # 3) Dataloader output is never del'ed. (its lifetime is not managed here due to #1)
-            input_tensor_name = [
-                self.tensor_name(t) for t in IR.get_objects(gen_inputs)
-                if isinstance(t, IRTensor) and not t.is_attr()
-            ]
-            record_stream_codes = []
-            for t in input_tensor_name:
-                record_stream_codes.append(f'{t}.record_stream(torch.cuda.current_stream())')
-
-            codes = record_stream_codes + codes
 
         if CompileFlag.line_timer:
             type_str = type(unwrap_node).__name__

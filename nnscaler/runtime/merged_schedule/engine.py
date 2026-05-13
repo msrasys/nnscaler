@@ -133,6 +133,8 @@ class ScheduleNode:
         self._output_is_tuple = False
         self._output_arity = 1
         self._skip_event = False  # When True, skip event wait/record in _stream_ctx
+        self._defer_release = False
+        self._pending_release = False
 
     def forward(self, inputs=()):
         if not isinstance(inputs, tuple):
@@ -140,13 +142,6 @@ class ScheduleNode:
         return self._forward(*inputs)
 
     def _forward(self, *inputs):
-        # Record cross-stream tensor usage for CUDA caching allocator safety.
-        # Inputs may have been produced on a different stream; tell the allocator
-        # that this stream will also read from their underlying storage.
-        for inp in inputs:
-            if isinstance(inp, torch.Tensor):
-                inp.record_stream(self.stream)
-
         with self._stream_ctx(f"{self.name} fwd"):
             self.inputs = []
             for inp in inputs:
@@ -178,9 +173,9 @@ class ScheduleNode:
             self.output = data
 
         if self.free_input:
+            self.stream.synchronize()
             for inp in inputs:
                 if inp is not None:
-                    inp.record_stream(self.stream)
                     inp.untyped_storage().resize_(0)
 
         return self.output
@@ -194,11 +189,6 @@ class ScheduleNode:
         return self._backward(*output_grad, retain_graph=retain_graph)
 
     def _backward(self, *output_grad, retain_graph=False):
-        # Record cross-stream tensor usage for output_grad tensors.
-        for g in output_grad:
-            if isinstance(g, torch.Tensor):
-                g.record_stream(self.stream)
-
         with self._stream_ctx(f"{self.name} bwd"):
             if self.checkpoint:
                 recomputed = self.forward_func(*self.inputs)
@@ -229,7 +219,7 @@ class ScheduleNode:
                                        retain_graph=retain_graph)
 
         grads = self.get_grad()
-        self._release()
+        self._release_or_defer()
         return grads
 
     def get_grad(self):
@@ -283,6 +273,17 @@ class ScheduleNode:
     def _release(self):
         self.inputs = None
         self.output = None
+        self._pending_release = False
+
+    def _release_or_defer(self):
+        if self._defer_release:
+            self._pending_release = True
+        else:
+            self._release()
+
+    def release_pending(self):
+        if self._pending_release:
+            self._release()
 
 
 @dataclass
@@ -430,9 +431,7 @@ class MergedScheduler:
 
             # Loss backward on COMP — overlaps with embed on COMM
             with nnscaler.sync_grad_when(False):
-                grad_h = prev_loss_node.backward(loss_grad)
-
-            prev_loss_node._release()
+                grad_h = self._backward_loss_node(prev_loss_node, loss_grad)
 
             # Create layer callables (CPU work, overlaps with GPU)
             fwd_lc_list = []
@@ -453,10 +452,7 @@ class MergedScheduler:
                 fwd_lc = fwd_lc_list[fwd_idx]
 
                 if fwd_lc.is_special:
-                    # Sync COMM→COMP: previous MoE layer's combine ran on COMM.
-                    self._sync_comm_to_comp()
-                    with torch.cuda.stream(get_comp_stream()):
-                        fwd_h, special_data = fwd_lc.special_forward(fwd_h)
+                    fwd_h, special_data = self._special_forward_on_comp(fwd_lc, fwd_h)
                     fwd_all_nodes[fwd_idx] = ('special', fwd_lc)
                     fwd_idx += 1
                     continue
@@ -492,10 +488,7 @@ class MergedScheduler:
             while fwd_idx < num_steps:
                 fwd_lc = fwd_lc_list[fwd_idx]
                 if fwd_lc.is_special:
-                    # Sync COMM→COMP: previous MoE layer's combine ran on COMM.
-                    self._sync_comm_to_comp()
-                    with torch.cuda.stream(get_comp_stream()):
-                        fwd_h, special_data = fwd_lc.special_forward(fwd_h)
+                    fwd_h, special_data = self._special_forward_on_comp(fwd_lc, fwd_h)
                     fwd_all_nodes[fwd_idx] = ('special', fwd_lc)
                     fwd_idx += 1
                     continue
@@ -535,6 +528,7 @@ class MergedScheduler:
             with nnscaler.sync_grad_when(False):
                 with torch.cuda.stream(get_comp_stream()):
                     _embed_h_list[mb_i].backward(grad_h)
+                    self._sync_comp_to_comm()
                     _embed_h_list[mb_i] = None
                     del grad_h
 
@@ -557,7 +551,7 @@ class MergedScheduler:
 
         _logger.debug(f"Cooldown: backward mb{num_mbs-1}")
         with nnscaler.sync_grad_when(False):
-            grad_h = prev_loss_node.backward(loss_grad)
+            grad_h = self._backward_loss_node(prev_loss_node, loss_grad)
             for i in reversed(range(num_steps)):
                 entry = prev_all_nodes[i]
                 if isinstance(entry, tuple) and len(entry) == 2 and entry[0] == 'special':
@@ -573,6 +567,7 @@ class MergedScheduler:
             # Propagate gradient through embedding graph to tok_embed weight
             with torch.cuda.stream(get_comp_stream()):
                 _embed_h_list[-1].backward(grad_h)
+                self._sync_comp_to_comm()
                 _embed_h_list[-1] = None
                 del grad_h
 
@@ -661,15 +656,24 @@ class MergedScheduler:
         get_comm_stream().wait_event(comp_evt)
         get_comp_stream().wait_event(comm_evt)
 
-    def _record_for_comp(self, grads):
-        """Record COMM-produced tensors for safe use on COMP stream."""
-        comp = get_comp_stream()
-        if isinstance(grads, tuple):
-            for t in grads:
-                if isinstance(t, torch.Tensor):
-                    t.record_stream(comp)
-        elif isinstance(grads, torch.Tensor):
-            grads.record_stream(comp)
+    def _join_comp_comm_for_release(self):
+        """Join COMP/COMM before dropping tensors used across streams."""
+        comp_evt = torch.cuda.Event()
+        comm_evt = torch.cuda.Event()
+        comp_evt.record(get_comp_stream())
+        comm_evt.record(get_comm_stream())
+        get_comm_stream().wait_event(comp_evt)
+        get_comp_stream().wait_event(comm_evt)
+
+    def _backward_loss_node(self, loss_node, loss_grad):
+        loss_node._defer_release = True
+        try:
+            grad_h = loss_node.backward(loss_grad)
+            self._sync_comp_to_comm()
+            loss_node.release_pending()
+        finally:
+            loss_node._defer_release = False
+        return grad_h
 
     def _prepare_loss_aux_tensors(self, attn_node, lc, attn_out):
         aux_tensors = lc.step_data.get('_loss_aux_tensors')
@@ -758,6 +762,15 @@ class MergedScheduler:
         if prepared_step_data:
             lc.step_data.update(prepared_step_data)
 
+    def _special_forward_on_comp(self, lc, h):
+        self._sync_comm_to_comp()
+        prev_h = h
+        with torch.cuda.stream(get_comp_stream()):
+            h, special_data = lc.special_forward(prev_h)
+            self._sync_comp_to_comm()
+        del prev_h
+        return h, special_data
+
     @staticmethod
     def _attn_backward_grads(attn_node, grad_h, grad_h_ln, grad_routing):
         if not attn_node.output_is_tuple():
@@ -782,11 +795,7 @@ class MergedScheduler:
 
         for si, lc in enumerate(lc_list):
             if lc.is_special:
-                # Sync COMM→COMP: previous MoE layer's combine ran on COMM,
-                # special_forward runs on COMP and needs the COMM-produced h.
-                self._sync_comm_to_comp()
-                with torch.cuda.stream(get_comp_stream()):
-                    h, special_data = lc.special_forward(h)
+                h, special_data = self._special_forward_on_comp(lc, h)
                 all_nodes.append(('special', lc))
                 continue
 
@@ -870,29 +879,36 @@ class MergedScheduler:
         as its 3rd output gradient (for the h_ln input).
         """
         attn_n, dispatch_n, expert_n, combine_n = nodes
+        for n in nodes:
+            n._defer_release = True
 
-        # Ensure all intermediate ops run on COMP stream,
-        # not the default stream (which has no sync with COMP/COMM in overlap mode).
-        with torch.cuda.stream(get_comp_stream()):
-            self._sync_comp_to_comm()
+        try:
+            # Ensure all intermediate ops run on COMP stream,
+            # not the default stream (which has no sync with COMP/COMM in overlap mode).
+            with torch.cuda.stream(get_comp_stream()):
+                self._sync_comp_to_comm()
 
-            # combine_grads: (grad_expert_outs, grad_h_residual, grad_shared_expert_out)
-            combine_grads = combine_n.backward(grad_h)
-            # expert backward needs grads for both outputs: expert_outs and shared_expert_out
-            expert_grads = expert_n.backward((combine_grads[0], combine_grads[2]))
-            # expert_grads: (grad_sorted_tokens, grad_sorted_probs, grad_h_ln)
-            dispatch_grads = dispatch_n.backward((expert_grads[0], expert_grads[1]))
+                # combine_grads: (grad_expert_outs, grad_h_residual, grad_shared_expert_out)
+                combine_grads = combine_n.backward(grad_h)
+                # expert backward needs grads for both outputs: expert_outs and shared_expert_out
+                expert_grads = expert_n.backward((combine_grads[0], combine_grads[2]))
+                # expert_grads: (grad_sorted_tokens, grad_sorted_probs, grad_h_ln)
+                dispatch_grads = dispatch_n.backward((expert_grads[0], expert_grads[1]))
 
-            self._sync_comm_to_comp()
-            # Record COMM-produced grads for COMP-side addition and attn backward.
-            self._record_for_comp(dispatch_grads)
-            self._record_for_comp(combine_grads)
+                self._sync_comm_to_comp()
 
-            grad_h_ln_total = dispatch_grads[0] + expert_grads[2]
+                grad_h_ln_total = dispatch_grads[0] + expert_grads[2]
 
-            attn_grads = self._attn_backward_grads(
-                attn_n, combine_grads[1], grad_h_ln_total, dispatch_grads[1])
-            grad_x = attn_n.backward(attn_grads)
+                attn_grads = self._attn_backward_grads(
+                    attn_n, combine_grads[1], grad_h_ln_total, dispatch_grads[1])
+                grad_x = attn_n.backward(attn_grads)
+                self._join_comp_comm_for_release()
+
+            for n in nodes:
+                n.release_pending()
+        finally:
+            for n in nodes:
+                n._defer_release = False
 
         return grad_x
 
@@ -955,13 +971,14 @@ class MergedScheduler:
         # --- Skip per-node event protocol during merged step ---
         # The default shared event serializes all nodes (COMP waits for COMM
         # and vice versa), preventing within-phase parallelism. By setting
-        # _skip_event=True, each node still switches to its own stream and
-        # does record_stream for allocator safety, but does not wait/record
-        # the shared event. Cross-stream dependencies are enforced explicitly
-        # via _cross_stream_barrier() at phase boundaries.
+        # _skip_event=True, each node still switches to its own stream but does
+        # not wait/record the shared event. Cross-stream dependencies and tensor
+        # release safety are enforced explicitly at phase boundaries.
         all_nodes = (*bwd_nodes, *fwd_nodes)
         for n in all_nodes:
             n._skip_event = True
+        for n in bwd_nodes:
+            n._defer_release = True
 
         # Ensure grad addition runs on COMP stream,
         # not the default stream (which has no sync with COMP/COMM in overlap mode).
@@ -985,6 +1002,7 @@ class MergedScheduler:
             # Phase boundary: Phase 2 COMP needs COMM output (combine_grads),
             # Phase 2 COMM needs COMP output (attn_out + precomputed metadata)
             self._cross_stream_barrier(slot=0)
+            bwd_combine.release_pending()
 
             # Phase 2: COMM(f_dispatch) || COMP(b_expert)
             # expert backward includes shared expert backward (both on COMP).
@@ -1001,6 +1019,7 @@ class MergedScheduler:
             # Phase boundary: Phase 3 COMP needs COMM output (dispatch_out),
             # Phase 3 COMM needs COMP output (expert_grads)
             self._cross_stream_barrier(slot=1)
+            bwd_expert.release_pending()
 
             # Phase 3: COMM(b_dispatch) || COMP(f_expert)
             # expert forward includes shared expert (takes h_ln, returns tuple).
@@ -1016,13 +1035,12 @@ class MergedScheduler:
             # Phase boundary: Phase 4 COMP needs COMM output (dispatch_grads),
             # Phase 4 COMM needs COMP output (expert_out + shared_expert_out)
             self._cross_stream_barrier(slot=2)
+            bwd_dispatch.release_pending()
 
             # Phase 4: COMM(f_combine) || COMP(b_attn)
             if pool is not None:
                 fut_combine_fwd = pool.submit(fwd_combine.forward,
                                               (fwd_expert_out, fwd_h_residual, fwd_shared_expert_out))
-                self._record_for_comp(dispatch_grads)
-                self._record_for_comp(combine_grads)
                 grad_h_ln_total = dispatch_grads[0] + expert_grads[2]
                 attn_grads = self._attn_backward_grads(
                     bwd_attn, combine_grads[1], grad_h_ln_total, dispatch_grads[1])
@@ -1030,12 +1048,13 @@ class MergedScheduler:
                 fwd_h_out = fut_combine_fwd.result()
             else:
                 fwd_h_out = fwd_combine.forward((fwd_expert_out, fwd_h_residual, fwd_shared_expert_out))
-                self._record_for_comp(dispatch_grads)
-                self._record_for_comp(combine_grads)
                 grad_h_ln_total = dispatch_grads[0] + expert_grads[2]
                 attn_grads = self._attn_backward_grads(
                     bwd_attn, combine_grads[1], grad_h_ln_total, dispatch_grads[1])
                 grad_x = bwd_attn.backward(attn_grads)
+
+            self._join_comp_comm_for_release()
+            bwd_attn.release_pending()
 
             self._restore_loss_aux_step_data(fwd_attn, fwd_lc)
 
@@ -1043,14 +1062,14 @@ class MergedScheduler:
                 if n.checkpoint:
                     n.output = None
 
-            # Sync COMM→COMP: fwd_combine ran on COMM stream producing fwd_h_out.
-            # The next merged step's fwd_attn will consume fwd_h_out on COMP stream,
-            # so COMP must wait for COMM to finish.
-            self._sync_comm_to_comp()
+            # The release join also makes COMP wait for fwd_combine on COMM, so
+            # the next merged step's fwd_attn can safely consume fwd_h_out.
 
         # Restore event protocol for sequential backward use (cooldown)
-        for n in fwd_nodes:
+        for n in all_nodes:
             n._skip_event = False
+        for n in bwd_nodes:
+            n._defer_release = False
 
         return fwd_h_out, grad_x, ('layer4', fwd_nodes)
 
