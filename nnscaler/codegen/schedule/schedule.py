@@ -308,7 +308,11 @@ class ScheduleCodeGen(FuncEmission):
                     wait_codes.append(code)
                     emitted.add(code)
 
-        return wait_codes + [self.emit_release(tensors)]
+        release_codes = wait_codes + [self.emit_release(tensors)]
+        if self.execplan.use_multi_streams:
+            release_codes.append(
+                'nnscaler.runtime.utils.maybe_empty_cache_after_release()')
+        return release_codes
 
     def _emit_stream_context(self, stream_context, codes: List[str]) -> List[str]:
         wait_stream_codes = []

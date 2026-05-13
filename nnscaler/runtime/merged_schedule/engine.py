@@ -30,6 +30,7 @@ import torch
 from torch.autograd import Variable
 
 import nnscaler
+from nnscaler.runtime.utils import maybe_empty_cache_after_release
 
 
 _logger = logging.getLogger(__name__)
@@ -274,6 +275,7 @@ class ScheduleNode:
         self.inputs = None
         self.output = None
         self._pending_release = False
+        maybe_empty_cache_after_release()
 
     def _release_or_defer(self):
         if self._defer_release:
