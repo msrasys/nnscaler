@@ -133,6 +133,7 @@ class ScheduleNode:
         self._output_is_tuple = False
         self._output_arity = 1
         self._skip_event = False  # When True, skip event wait/record in _stream_ctx
+        self._record_stream_enabled = True
 
     def forward(self, inputs=()):
         if not isinstance(inputs, tuple):
@@ -143,9 +144,10 @@ class ScheduleNode:
         # Record cross-stream tensor usage for CUDA caching allocator safety.
         # Inputs may have been produced on a different stream; tell the allocator
         # that this stream will also read from their underlying storage.
-        for inp in inputs:
-            if isinstance(inp, torch.Tensor):
-                inp.record_stream(self.stream)
+        if self._record_stream_enabled:
+            for inp in inputs:
+                if isinstance(inp, torch.Tensor):
+                    inp.record_stream(self.stream)
 
         with self._stream_ctx(f"{self.name} fwd"):
             self.inputs = []
@@ -180,7 +182,8 @@ class ScheduleNode:
         if self.free_input:
             for inp in inputs:
                 if inp is not None:
-                    inp.record_stream(self.stream)
+                    if self._record_stream_enabled:
+                        inp.record_stream(self.stream)
                     inp.untyped_storage().resize_(0)
 
         return self.output
@@ -195,9 +198,10 @@ class ScheduleNode:
 
     def _backward(self, *output_grad, retain_graph=False):
         # Record cross-stream tensor usage for output_grad tensors.
-        for g in output_grad:
-            if isinstance(g, torch.Tensor):
-                g.record_stream(self.stream)
+        if self._record_stream_enabled:
+            for g in output_grad:
+                if isinstance(g, torch.Tensor):
+                    g.record_stream(self.stream)
 
         with self._stream_ctx(f"{self.name} bwd"):
             if self.checkpoint:
@@ -335,13 +339,22 @@ class MergedScheduler:
             ThreadPoolExecutor(max_workers=1, thread_name_prefix='moe-overlap')
             if _async_on else None
         )
+        # record_stream is correct, but in the 4-phase MoE hot path it can
+        # strand many freed all-to-all/expert blocks behind allocator events.
+        # By default, use explicit stream ordering for allocator safety there.
+        # Set MOE_OVERLAP_RECORD_STREAM=1 to restore the previous behavior.
+        self._record_stream_in_4phase = (
+            os.environ.get('MOE_OVERLAP_RECORD_STREAM', '0') not in ('0', '')
+        )
 
         # Pre-allocate CUDA events for cross-stream synchronization.
         # Using separate events per barrier slot avoids re-recording while
         # a previous wait may still be pending (undefined behavior per CUDA spec).
-        # 3 barrier slots in _merged_step_4phase, each needs comp + comm events
-        self._barrier_comp_evts = [torch.cuda.Event() for _ in range(3)]
-        self._barrier_comm_evts = [torch.cuda.Event() for _ in range(3)]
+        # 4 barrier slots in _merged_step_4phase, each needs comp + comm events.
+        # The last slot is an allocator-safety barrier used when record_stream
+        # is disabled for the 4-phase hot path.
+        self._barrier_comp_evts = [torch.cuda.Event() for _ in range(4)]
+        self._barrier_comm_evts = [torch.cuda.Event() for _ in range(4)]
         # 2 uni-directional sync events (comp->comm and comm->comp)
         self._sync_c2m_evt = torch.cuda.Event()
         self._sync_m2c_evt = torch.cuda.Event()
@@ -661,8 +674,29 @@ class MergedScheduler:
         get_comm_stream().wait_event(comp_evt)
         get_comp_stream().wait_event(comm_evt)
 
-    def _record_for_comp(self, grads):
+    @contextmanager
+    def _node_runtime_flags(self, nodes, *, skip_event=None, record_stream_enabled=None):
+        """Temporarily override ScheduleNode runtime flags."""
+        states = [
+            (node, node._skip_event, node._record_stream_enabled)
+            for node in nodes
+        ]
+        try:
+            for node, _, _ in states:
+                if skip_event is not None:
+                    node._skip_event = skip_event
+                if record_stream_enabled is not None:
+                    node._record_stream_enabled = record_stream_enabled
+            yield
+        finally:
+            for node, old_skip_event, old_record_stream_enabled in states:
+                node._skip_event = old_skip_event
+                node._record_stream_enabled = old_record_stream_enabled
+
+    def _record_for_comp(self, grads, *, record_stream=True):
         """Record COMM-produced tensors for safe use on COMP stream."""
+        if not record_stream:
+            return
         comp = get_comp_stream()
         if isinstance(grads, tuple):
             for t in grads:
@@ -955,18 +989,22 @@ class MergedScheduler:
         # --- Skip per-node event protocol during merged step ---
         # The default shared event serializes all nodes (COMP waits for COMM
         # and vice versa), preventing within-phase parallelism. By setting
-        # _skip_event=True, each node still switches to its own stream and
-        # does record_stream for allocator safety, but does not wait/record
-        # the shared event. Cross-stream dependencies are enforced explicitly
-        # via _cross_stream_barrier() at phase boundaries.
+        # _skip_event=True, each node still switches to its own stream but does
+        # not wait/record the shared event. Cross-stream dependencies are
+        # enforced explicitly via _cross_stream_barrier() at phase boundaries.
+        # record_stream is disabled by default in this hot path; the phase
+        # barriers, plus the final allocator barrier, make each producer stream
+        # wait for peer-stream consumers before the corresponding refs drop.
         all_nodes = (*bwd_nodes, *fwd_nodes)
-        for n in all_nodes:
-            n._skip_event = True
 
         # Ensure grad addition runs on COMP stream,
         # not the default stream (which has no sync with COMP/COMM in overlap mode).
         # ScheduleNode calls internally switch to their own stream and restore on exit.
-        with torch.cuda.stream(get_comp_stream()):
+        with self._node_runtime_flags(
+            all_nodes,
+            skip_event=True,
+            record_stream_enabled=self._record_stream_in_4phase,
+        ), torch.cuda.stream(get_comp_stream()):
             # Initial sync: COMP→COMM so COMM can read grad_h (from loss_bwd on COMP)
             self._sync_comp_to_comm()
 
@@ -1021,8 +1059,10 @@ class MergedScheduler:
             if pool is not None:
                 fut_combine_fwd = pool.submit(fwd_combine.forward,
                                               (fwd_expert_out, fwd_h_residual, fwd_shared_expert_out))
-                self._record_for_comp(dispatch_grads)
-                self._record_for_comp(combine_grads)
+                self._record_for_comp(
+                    dispatch_grads, record_stream=self._record_stream_in_4phase)
+                self._record_for_comp(
+                    combine_grads, record_stream=self._record_stream_in_4phase)
                 grad_h_ln_total = dispatch_grads[0] + expert_grads[2]
                 attn_grads = self._attn_backward_grads(
                     bwd_attn, combine_grads[1], grad_h_ln_total, dispatch_grads[1])
@@ -1030,8 +1070,10 @@ class MergedScheduler:
                 fwd_h_out = fut_combine_fwd.result()
             else:
                 fwd_h_out = fwd_combine.forward((fwd_expert_out, fwd_h_residual, fwd_shared_expert_out))
-                self._record_for_comp(dispatch_grads)
-                self._record_for_comp(combine_grads)
+                self._record_for_comp(
+                    dispatch_grads, record_stream=self._record_stream_in_4phase)
+                self._record_for_comp(
+                    combine_grads, record_stream=self._record_stream_in_4phase)
                 grad_h_ln_total = dispatch_grads[0] + expert_grads[2]
                 attn_grads = self._attn_backward_grads(
                     bwd_attn, combine_grads[1], grad_h_ln_total, dispatch_grads[1])
@@ -1043,14 +1085,17 @@ class MergedScheduler:
                 if n.checkpoint:
                     n.output = None
 
-            # Sync COMM→COMP: fwd_combine ran on COMM stream producing fwd_h_out.
-            # The next merged step's fwd_attn will consume fwd_h_out on COMP stream,
-            # so COMP must wait for COMM to finish.
-            self._sync_comm_to_comp()
-
-        # Restore event protocol for sequential backward use (cooldown)
-        for n in fwd_nodes:
-            n._skip_event = False
+            if self._record_stream_in_4phase:
+                # Sync COMM→COMP: fwd_combine ran on COMM stream producing fwd_h_out.
+                # The next merged step's fwd_attn will consume fwd_h_out on COMP stream,
+                # so COMP must wait for COMM to finish. record_stream protects the
+                # reverse allocator edge for COMM-produced backward grads.
+                self._sync_comm_to_comp()
+            else:
+                # Bidirectional allocator barrier: COMP waits for fwd_combine's
+                # output, and COMM waits for Phase-4 COMP consumers before freed
+                # COMM-owned blocks can be reused without record_stream events.
+                self._cross_stream_barrier(slot=3)
 
         return fwd_h_out, grad_x, ('layer4', fwd_nodes)
 
