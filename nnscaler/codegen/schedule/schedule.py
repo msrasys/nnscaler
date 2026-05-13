@@ -1,7 +1,7 @@
 #  Copyright (c) Microsoft Corporation.
 #  Licensed under the MIT License.
 
-from typing import List, Optional, Tuple, Union
+from typing import Iterable, List, Optional, Tuple, Union
 import copy
 import logging
 
@@ -160,10 +160,11 @@ class ScheduleCodeGen(FuncEmission):
                             f'nnscaler.flags.RuntimeFlag.skip_reducer = '
                             f'{id(node) not in last_backward_node_oids !r}'
                         )
-                    codes = self.emit_node(node)
+                    releasable_tensors = lifetime.release_tensors_after_line(line)
+                    codes = self.emit_node(node, record_stream_tensors=releasable_tensors)
                     _append_code(fb, codes, self._get_node_stream(node))
                     # release
-                    tensors = lifetime.release_tensors_after_line(line)
+                    tensors = releasable_tensors
                     if len(tensors) > 0 : # not necessarily to have one after each line
                         _append_code(fb, self.emit_release(tensors))
             # return code
@@ -189,11 +190,16 @@ class ScheduleCodeGen(FuncEmission):
                 for line, node in enumerate(device_nodes):
                     if not node.isfw(): continue  # skip backward segments and adapters
                     # execute
-                    codes = self.emit_node(node, force_no_grad=True)
+                    releasable_tensors = lifetime.release_tensors_after_line(line)
+                    releasable_tensors = [t for t in releasable_tensors if isinstance(t, IRTensor) and not t.is_grad()]
+                    codes = self.emit_node(
+                        node,
+                        force_no_grad=True,
+                        record_stream_tensors=releasable_tensors,
+                    )
                     _append_code(fb, codes, self._get_node_stream(node))
                     # release
-                    tensors = lifetime.release_tensors_after_line(line)
-                    tensors = [t for t in tensors if isinstance(t, IRTensor) and not t.is_grad()]
+                    tensors = releasable_tensors
                     if len(tensors) > 0 : # not necessarily to have one after each line
                         _append_code(fb, self.emit_release(tensors))
                 # return code
@@ -269,7 +275,12 @@ class ScheduleCodeGen(FuncEmission):
         """
         return f'{self.tensor_name(tensor)} = {self.tensor_name(tensor)}.detach()'
 
-    def emit_node(self, node: IRCell, force_no_grad: bool = False) -> List[str]:
+    def emit_node(
+        self,
+        node: IRCell,
+        force_no_grad: bool = False,
+        record_stream_tensors: Optional[Iterable[IRTensor]] = None,
+    ) -> List[str]:
         """
         Emit node / subgraph code
         """
@@ -357,17 +368,24 @@ class ScheduleCodeGen(FuncEmission):
             raise RuntimeError(f"Unspported node type: {type(unwrap_node)}")
 
         if stream_context and stream_context.stream:
-            # register all input tensors to the current stream
-            # to avoid cross-stream premature deallocation issue
+            # Register input tensors that may be released immediately after
+            # this node to the current stream. Long-lived activations remain
+            # referenced until later synchronization points; recording those
+            # early can delay allocator reuse until much later stream work.
             # see `Tensor.record_stream` in PyTorch for more details
 
             # NOTE: The dataloader output is not considered here. Two reasons:
             # 1) Dataloader output is wrapped in an IRObject, and internal IRTensors cannot be accessed here easily.
             # 2) Dataloader output is used as input of the first forward segment immediately after data loading
             # 3) Dataloader output is never del'ed. (its lifetime is not managed here due to #1)
+            record_stream_tensor_set = (
+                set(record_stream_tensors)
+                if record_stream_tensors is not None else None
+            )
             input_tensor_name = [
                 self.tensor_name(t) for t in IR.get_objects(gen_inputs)
                 if isinstance(t, IRTensor) and not t.is_attr()
+                and (record_stream_tensor_set is None or t in record_stream_tensor_set)
             ]
             record_stream_codes = []
             for t in input_tensor_name:
