@@ -27,6 +27,43 @@ class _CountingMergedScheduler(MergedScheduler):
         return super()._merged_step_4phase(*args, **kwargs)
 
 
+def test_allocator_safety_mode_env(monkeypatch):
+    monkeypatch.delenv('MOE_OVERLAP_ALLOCATOR_SAFETY', raising=False)
+    monkeypatch.delenv('MOE_OVERLAP_RECORD_STREAM', raising=False)
+    assert MergedScheduler._resolve_allocator_safety_mode() == 'defer'
+
+    monkeypatch.setenv('MOE_OVERLAP_RECORD_STREAM', '1')
+    assert MergedScheduler._resolve_allocator_safety_mode() == 'record_stream'
+
+    monkeypatch.setenv('MOE_OVERLAP_ALLOCATOR_SAFETY', 'strict')
+    assert MergedScheduler._resolve_allocator_safety_mode() == 'barrier'
+
+    monkeypatch.setenv('MOE_OVERLAP_ALLOCATOR_SAFETY', 'hold')
+    assert MergedScheduler._resolve_allocator_safety_mode() == 'defer'
+
+    monkeypatch.setenv('MOE_OVERLAP_ALLOCATOR_SAFETY', 'record')
+    assert MergedScheduler._resolve_allocator_safety_mode() == 'record_stream'
+
+    monkeypatch.setenv('MOE_OVERLAP_ALLOCATOR_SAFETY', 'bad')
+    with pytest.raises(ValueError):
+        MergedScheduler._resolve_allocator_safety_mode()
+
+
+def test_deferred_comm_refs_hold_and_release():
+    scheduler = object.__new__(MergedScheduler)
+    scheduler._record_stream_in_4phase = False
+    scheduler._strict_barrier_in_4phase = False
+    scheduler._pending_comm_refs = []
+
+    t0 = torch.tensor(1)
+    t1 = torch.tensor(2)
+    scheduler._defer_comm_refs_until_next_comm_wait((t0, None), {'x': [t1]})
+    assert [id(t) for t in scheduler._pending_comm_refs] == [id(t0), id(t1)]
+
+    scheduler._release_pending_comm_refs()
+    assert scheduler._pending_comm_refs == []
+
+
 def _assert_current_stream(expected_stream):
     current = torch.cuda.current_stream()
     assert current.cuda_stream == expected_stream.cuda_stream

@@ -37,6 +37,8 @@ _logger = logging.getLogger(__name__)
 _COMP_STREAM = None   # computation stream (non-default)
 _COMM_STREAM = None   # communication stream (non-default)
 
+_ALLOCATOR_SAFETY_MODES = {'defer', 'barrier', 'record_stream'}
+
 
 def set_streams():
     """Initialize global COMP/COMM streams.
@@ -339,28 +341,73 @@ class MergedScheduler:
             ThreadPoolExecutor(max_workers=1, thread_name_prefix='moe-overlap')
             if _async_on else None
         )
-        # record_stream is correct, but in the 4-phase MoE hot path it can
-        # strand many freed all-to-all/expert blocks behind allocator events.
-        # By default, use explicit stream ordering for allocator safety there.
-        # Set MOE_OVERLAP_RECORD_STREAM=1 to restore the previous behavior.
+        self._allocator_safety_mode = self._resolve_allocator_safety_mode()
         self._record_stream_in_4phase = (
-            os.environ.get('MOE_OVERLAP_RECORD_STREAM', '0') not in ('0', '')
+            self._allocator_safety_mode == 'record_stream'
         )
+        self._strict_barrier_in_4phase = (
+            self._allocator_safety_mode == 'barrier'
+        )
+        self._pending_comm_refs = []
 
         # Pre-allocate CUDA events for cross-stream synchronization.
         # Using separate events per barrier slot avoids re-recording while
         # a previous wait may still be pending (undefined behavior per CUDA spec).
-        # 4 barrier slots in _merged_step_4phase, each needs comp + comm events.
-        # The last slot is an allocator-safety barrier used when record_stream
-        # is disabled for the 4-phase hot path.
+        # 3 phase barriers in _merged_step_4phase, plus one optional strict
+        # allocator-safety barrier slot for MOE_OVERLAP_ALLOCATOR_SAFETY=barrier.
         self._barrier_comp_evts = [torch.cuda.Event() for _ in range(4)]
         self._barrier_comm_evts = [torch.cuda.Event() for _ in range(4)]
         # 2 uni-directional sync events (comp->comm and comm->comp)
         self._sync_c2m_evt = torch.cuda.Event()
         self._sync_m2c_evt = torch.cuda.Event()
 
+    @staticmethod
+    def _resolve_allocator_safety_mode():
+        """Resolve 4-phase allocator safety strategy from environment.
+
+        Modes:
+          - defer: avoid record_stream and avoid the extra end-of-phase-4
+            COMM wait. Keep the few COMM-produced tensors that are consumed on
+            COMP alive until the next existing COMP->COMM wait is enqueued.
+          - barrier: avoid record_stream and add a strict bidirectional barrier
+            at the end of each 4-phase step. This minimizes live memory, but can
+            reduce overlap.
+          - record_stream: old behavior; fastest when allocator pressure is low,
+            but can strand blocks behind allocator events.
+        """
+        mode = os.environ.get('MOE_OVERLAP_ALLOCATOR_SAFETY')
+        if mode is None:
+            legacy_record_stream = os.environ.get('MOE_OVERLAP_RECORD_STREAM', '0')
+            if legacy_record_stream not in ('0', ''):
+                return 'record_stream'
+            return 'defer'
+
+        normalized = mode.strip().lower().replace('-', '_')
+        aliases = {
+            'deferred': 'defer',
+            'deferred_refs': 'defer',
+            'hold': 'defer',
+            'strict': 'barrier',
+            'sync': 'barrier',
+            'record': 'record_stream',
+            'recordstream': 'record_stream',
+        }
+        normalized = aliases.get(normalized, normalized)
+        if normalized not in _ALLOCATOR_SAFETY_MODES:
+            raise ValueError(
+                "MOE_OVERLAP_ALLOCATOR_SAFETY must be one of "
+                f"{sorted(_ALLOCATOR_SAFETY_MODES)}, got {mode!r}"
+            )
+        return normalized
+
     def shutdown(self):
         """Release scheduler-owned CPU worker resources."""
+        if self._pending_comm_refs:
+            # Pending refs are safe to drop only after the queued COMP consumers
+            # have completed or a COMP->COMM wait has been enqueued. Shutdown is
+            # outside the hot path, so prefer a conservative device sync.
+            torch.cuda.synchronize()
+            self._pending_comm_refs.clear()
         pool = self._async_pool
         if pool is not None:
             self._async_pool = None
@@ -397,6 +444,9 @@ class MergedScheduler:
         default_done.record(torch.cuda.default_stream())
         get_comp_stream().wait_event(default_done)
         get_comm_stream().wait_event(default_done)
+        # If the previous run ended with deferred COMM-produced refs, this
+        # default-stream edge orders COMM after the previous COMP work.
+        self._release_pending_comm_refs()
 
         num_steps = self.num_layers
         events = [torch.cuda.Event() for _ in range(num_mbs)]
@@ -659,6 +709,7 @@ class MergedScheduler:
     def _sync_comp_to_comm(self):
         self._sync_c2m_evt.record(get_comp_stream())
         get_comm_stream().wait_event(self._sync_c2m_evt)
+        self._release_pending_comm_refs()
 
     def _cross_stream_barrier(self, slot=0):
         """Bidirectional sync: each stream waits for the other's current position.
@@ -673,6 +724,39 @@ class MergedScheduler:
         comm_evt.record(get_comm_stream())
         get_comm_stream().wait_event(comp_evt)
         get_comp_stream().wait_event(comm_evt)
+
+    def _defer_comm_refs_until_next_comm_wait(self, *values):
+        """Keep COMM-owned tensors alive until COMM is ordered after COMP.
+
+        In the 4-phase schedule, Phase 4 consumes a small set of tensors that
+        were produced on COMM and consumed on COMP. Without record_stream,
+        those tensor refs cannot be dropped until future COMM work is known to
+        occur after the COMP consumer. The next _sync_comp_to_comm() already
+        creates that ordering for the following layer, so this avoids an extra
+        barrier.
+        """
+        if self._record_stream_in_4phase or self._strict_barrier_in_4phase:
+            return
+
+        refs = []
+        for value in values:
+            self._collect_tensors(value, refs)
+        if refs:
+            self._pending_comm_refs.extend(refs)
+
+    @staticmethod
+    def _collect_tensors(value, refs):
+        if isinstance(value, torch.Tensor):
+            refs.append(value)
+        elif isinstance(value, (tuple, list)):
+            for item in value:
+                MergedScheduler._collect_tensors(item, refs)
+        elif isinstance(value, dict):
+            for item in value.values():
+                MergedScheduler._collect_tensors(item, refs)
+
+    def _release_pending_comm_refs(self):
+        self._pending_comm_refs.clear()
 
     @contextmanager
     def _node_runtime_flags(self, nodes, *, skip_event=None, record_stream_enabled=None):
@@ -992,9 +1076,9 @@ class MergedScheduler:
         # _skip_event=True, each node still switches to its own stream but does
         # not wait/record the shared event. Cross-stream dependencies are
         # enforced explicitly via _cross_stream_barrier() at phase boundaries.
-        # record_stream is disabled by default in this hot path; the phase
-        # barriers, plus the final allocator barrier, make each producer stream
-        # wait for peer-stream consumers before the corresponding refs drop.
+        # record_stream is disabled by default in this hot path. Phase barriers
+        # order most cross-stream frees; the remaining Phase-4 COMM grads are
+        # held briefly until the next existing COMP->COMM wait is enqueued.
         all_nodes = (*bwd_nodes, *fwd_nodes)
 
         # Ensure grad addition runs on COMP stream,
@@ -1091,11 +1175,23 @@ class MergedScheduler:
                 # so COMP must wait for COMM to finish. record_stream protects the
                 # reverse allocator edge for COMM-produced backward grads.
                 self._sync_comm_to_comp()
-            else:
+            elif self._strict_barrier_in_4phase:
                 # Bidirectional allocator barrier: COMP waits for fwd_combine's
                 # output, and COMM waits for Phase-4 COMP consumers before freed
                 # COMM-owned blocks can be reused without record_stream events.
                 self._cross_stream_barrier(slot=3)
+            else:
+                # Fast allocator-safe path: keep the COMM-produced Phase-4 grads
+                # alive until the next existing COMP->COMM wait is enqueued. This
+                # preserves the old COMM->COMP dependency for fwd_h_out without
+                # adding a new COMM-side wait on every layer.
+                self._defer_comm_refs_until_next_comm_wait(
+                    dispatch_grads,
+                    combine_grads[1]
+                    if isinstance(combine_grads, tuple)
+                    else combine_grads,
+                )
+                self._sync_comm_to_comp()
 
         return fwd_h_out, grad_x, ('layer4', fwd_nodes)
 
