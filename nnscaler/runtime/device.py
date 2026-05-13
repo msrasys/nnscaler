@@ -4,18 +4,89 @@
 """
 Communication group settings among devices
 """
-from typing import List, Dict, Optional
+from typing import Any, List, Dict, Optional, Tuple
 import numpy as np
 import torch
 import os
 import logging
 import datetime
+import threading
 
 from nnscaler.flags import CompileFlag
 from nnscaler.utils import is_running_distributed
 
 _logger = logging.getLogger(__name__)
 _LARGE_TIMEOUT = datetime.timedelta(seconds=21600)
+_deferred_release_refs: List[Tuple[torch.cuda.Event, Tuple[torch.Tensor, ...]]] = []
+_deferred_release_lock = threading.Lock()
+
+
+def _collect_cuda_tensors(value: Any, refs: List[torch.Tensor], seen: set):
+    if isinstance(value, torch.Tensor):
+        if value.is_cuda and id(value) not in seen:
+            refs.append(value)
+            seen.add(id(value))
+        return
+    if isinstance(value, (tuple, list)):
+        for item in value:
+            _collect_cuda_tensors(item, refs, seen)
+        return
+    if isinstance(value, dict):
+        for item in value.values():
+            _collect_cuda_tensors(item, refs, seen)
+
+
+def prune_deferred_releases():
+    """Drop tensor refs whose last-use CUDA event has completed."""
+    with _deferred_release_lock:
+        if not _deferred_release_refs:
+            return
+
+        pending = []
+        for event, refs in _deferred_release_refs:
+            if not event.query():
+                pending.append((event, refs))
+        _deferred_release_refs[:] = pending
+
+
+def flush_deferred_releases():
+    """Synchronize and release all tensors held by defer_release."""
+    with _deferred_release_lock:
+        if not _deferred_release_refs:
+            return
+
+        for event, _ in _deferred_release_refs:
+            event.synchronize()
+        _deferred_release_refs.clear()
+
+
+def defer_release(*values: Any, stream: Optional[torch.cuda.Stream] = None,
+                  stream_name: Optional[str] = None):
+    """Keep CUDA tensor refs alive until work already queued on a stream completes.
+
+    This is used by multi-stream schedules before deleting local tensor variables.
+    It avoids Tensor.record_stream while still preventing the caching allocator from
+    reusing storage that a non-default stream may still be reading or writing.
+    """
+    refs: List[torch.Tensor] = []
+    seen = set()
+    for value in values:
+        _collect_cuda_tensors(value, refs, seen)
+    if not refs:
+        return
+
+    prune_deferred_releases()
+
+    if stream is None:
+        if stream_name is not None:
+            stream = DeviceGroup().get_stream(stream_name)
+        else:
+            stream = torch.cuda.current_stream(refs[0].device)
+
+    event = torch.cuda.Event()
+    event.record(stream)
+    with _deferred_release_lock:
+        _deferred_release_refs.append((event, tuple(refs)))
 
 
 class _DeviceGroup:
@@ -178,6 +249,7 @@ def init_device():
 
 def uninit_device():
     global _instance
+    flush_deferred_releases()
     if _instance is not None:
         _instance.close()
         _instance = None

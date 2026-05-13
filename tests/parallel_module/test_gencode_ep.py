@@ -567,6 +567,8 @@ def test_moe_breakdown_overlap(tmp_path):
         load_module=False
     )
     assert True  # should success
+    assert len(_gencode_contains(tmp_path, MoeWithLoss, 0, r'\.record_stream\(')) == 0
+    assert len(_gencode_contains(tmp_path, MoeWithLoss, 0, 'nnscaler.runtime.device.defer_release')) > 0
 
     # def segment54(self, x_65):
     #     # File "/data/weijiangxu/nnscaler/tests/parallel_module/test_gencode_ep.py", line 235, in forward,  logits = self.gate(x.float())
