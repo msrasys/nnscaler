@@ -36,6 +36,19 @@ _logger = logging.getLogger(__name__)
 
 _COMP_STREAM = None   # computation stream (non-default)
 _COMM_STREAM = None   # communication stream (non-default)
+_RECORD_STREAM_ENV = 'NNSCALER_MERGED_SCHEDULE_RECORD_STREAM'
+
+
+def _record_streams_enabled():
+    """Whether to use PyTorch allocator stream tracking for ScheduleNode tensors.
+
+    The merged scheduler orders cross-stream tensor use with explicit CUDA
+    events. Recording every tensor on the consumer stream is safe, but it also
+    ties block reuse to that stream's later work and can inflate peak memory.
+    Keep a kill switch for debugging or deployments that prefer allocator-side
+    lifetime tracking.
+    """
+    return os.environ.get(_RECORD_STREAM_ENV, '0').lower() not in ('0', 'false', 'no', '')
 
 
 def set_streams():
@@ -120,6 +133,7 @@ class ScheduleNode:
         free_input=False,
         name="schedule_node",
         checkpoint=False,
+        record_stream=None,
     ):
         self.name = name
         self.forward_func = forward_func
@@ -128,6 +142,9 @@ class ScheduleNode:
         self.event = event
         self.free_input = free_input
         self.checkpoint = checkpoint
+        self.record_stream = (
+            _record_streams_enabled() if record_stream is None else record_stream
+        )
         self.inputs = None
         self.output = None
         self._output_is_tuple = False
@@ -140,12 +157,13 @@ class ScheduleNode:
         return self._forward(*inputs)
 
     def _forward(self, *inputs):
-        # Record cross-stream tensor usage for CUDA caching allocator safety.
-        # Inputs may have been produced on a different stream; tell the allocator
-        # that this stream will also read from their underlying storage.
-        for inp in inputs:
-            if isinstance(inp, torch.Tensor):
-                inp.record_stream(self.stream)
+        if self.record_stream:
+            # Legacy allocator-side lifetime tracking. The scheduler normally
+            # relies on explicit stream events instead to avoid pinning these
+            # blocks to long-running consumer streams.
+            for inp in inputs:
+                if isinstance(inp, torch.Tensor):
+                    inp.record_stream(self.stream)
 
         with self._stream_ctx(f"{self.name} fwd"):
             self.inputs = []
@@ -179,7 +197,11 @@ class ScheduleNode:
 
         if self.free_input:
             for inp in inputs:
-                if inp is not None:
+                if isinstance(inp, torch.Tensor):
+                    # free_input drops storage on the host before the queued
+                    # stream work has necessarily completed, so this path still
+                    # needs allocator tracking even when normal ScheduleNode
+                    # record_stream calls are disabled.
                     inp.record_stream(self.stream)
                     inp.untyped_storage().resize_(0)
 
@@ -194,10 +216,11 @@ class ScheduleNode:
         return self._backward(*output_grad, retain_graph=retain_graph)
 
     def _backward(self, *output_grad, retain_graph=False):
-        # Record cross-stream tensor usage for output_grad tensors.
-        for g in output_grad:
-            if isinstance(g, torch.Tensor):
-                g.record_stream(self.stream)
+        if self.record_stream:
+            # Legacy allocator-side lifetime tracking for cross-stream grads.
+            for g in output_grad:
+                if isinstance(g, torch.Tensor):
+                    g.record_stream(self.stream)
 
         with self._stream_ctx(f"{self.name} bwd"):
             if self.checkpoint:
@@ -326,6 +349,7 @@ class MergedScheduler:
         self.num_layers = num_layers
         self.use_checkpoint = use_checkpoint
         self._use_4node = True
+        self._record_stream = _record_streams_enabled()
 
         # Async overlap: launch COMM and COMP ops from separate CPU threads
         # so their kernel launches can interleave, enabling true GPU overlap.
@@ -603,7 +627,8 @@ class MergedScheduler:
 
         attn_node = ScheduleNode(
             lc.attn_fn, comp_stream, event,
-            name="attn", checkpoint=self.use_checkpoint)
+            name="attn", checkpoint=self.use_checkpoint,
+            record_stream=self._record_stream)
 
         if lc.is_moe:
             raise NotImplementedError(
@@ -612,7 +637,8 @@ class MergedScheduler:
 
         body_node = ScheduleNode(
             lc.body_fn, comp_stream, event,
-            name="ffn", checkpoint=self.use_checkpoint)
+            name="ffn", checkpoint=self.use_checkpoint,
+            record_stream=self._record_stream)
 
         return (attn_node, body_node)
 
@@ -623,19 +649,23 @@ class MergedScheduler:
 
         attn_node = ScheduleNode(
             lc.attn_fn, comp_stream, event,
-            name="attn_router", checkpoint=self.use_checkpoint)
+            name="attn_router", checkpoint=self.use_checkpoint,
+            record_stream=self._record_stream)
 
         dispatch_node = ScheduleNode(
             lc.dispatch_fn, comm_stream, event,
-            name="dispatch", checkpoint=False)
+            name="dispatch", checkpoint=False,
+            record_stream=self._record_stream)
 
         expert_node = ScheduleNode(
             lc.expert_fn, comp_stream, event,
-            name="expert", checkpoint=self.use_checkpoint)
+            name="expert", checkpoint=self.use_checkpoint,
+            record_stream=self._record_stream)
 
         combine_node = ScheduleNode(
             lc.combine_fn, comm_stream, event,
-            name="combine", checkpoint=False)
+            name="combine", checkpoint=False,
+            record_stream=self._record_stream)
 
         return (attn_node, dispatch_node, expert_node, combine_node)
 
@@ -646,6 +676,17 @@ class MergedScheduler:
     def _sync_comp_to_comm(self):
         self._sync_c2m_evt.record(get_comp_stream())
         get_comm_stream().wait_event(self._sync_c2m_evt)
+
+    def _fence_comp_before_future_comm(self):
+        """Make later COMM work wait for already-queued COMP work.
+
+        This is a one-shot lifetime fence used when COMM-owned tensors are
+        consumed on COMP without record_stream. It avoids re-recording a shared
+        event while an older stream wait may still be pending.
+        """
+        comp_done = torch.cuda.Event()
+        comp_done.record(get_comp_stream())
+        get_comm_stream().wait_event(comp_done)
 
     def _cross_stream_barrier(self, slot=0):
         """Bidirectional sync: each stream waits for the other's current position.
@@ -662,7 +703,9 @@ class MergedScheduler:
         get_comp_stream().wait_event(comm_evt)
 
     def _record_for_comp(self, grads):
-        """Record COMM-produced tensors for safe use on COMP stream."""
+        """Optionally record COMM-produced tensors for COMP-side allocator tracking."""
+        if not self._record_stream:
+            return
         comp = get_comp_stream()
         if isinstance(grads, tuple):
             for t in grads:
@@ -884,7 +927,8 @@ class MergedScheduler:
             dispatch_grads = dispatch_n.backward((expert_grads[0], expert_grads[1]))
 
             self._sync_comm_to_comp()
-            # Record COMM-produced grads for COMP-side addition and attn backward.
+            # Explicit COMM->COMP sync above makes these grads safe to consume on
+            # COMP. Optional record_stream remains available through the env knob.
             self._record_for_comp(dispatch_grads)
             self._record_for_comp(combine_grads)
 
@@ -893,6 +937,7 @@ class MergedScheduler:
             attn_grads = self._attn_backward_grads(
                 attn_n, combine_grads[1], grad_h_ln_total, dispatch_grads[1])
             grad_x = attn_n.backward(attn_grads)
+            self._fence_comp_before_future_comm()
 
         return grad_x
 
@@ -955,10 +1000,10 @@ class MergedScheduler:
         # --- Skip per-node event protocol during merged step ---
         # The default shared event serializes all nodes (COMP waits for COMM
         # and vice versa), preventing within-phase parallelism. By setting
-        # _skip_event=True, each node still switches to its own stream and
-        # does record_stream for allocator safety, but does not wait/record
-        # the shared event. Cross-stream dependencies are enforced explicitly
-        # via _cross_stream_barrier() at phase boundaries.
+        # _skip_event=True, each node still switches to its own stream, but does
+        # not wait/record the shared event. Cross-stream dependencies and tensor
+        # lifetimes are enforced explicitly via _cross_stream_barrier() at phase
+        # boundaries.
         all_nodes = (*bwd_nodes, *fwd_nodes)
         for n in all_nodes:
             n._skip_event = True
@@ -1047,6 +1092,9 @@ class MergedScheduler:
             # The next merged step's fwd_attn will consume fwd_h_out on COMP stream,
             # so COMP must wait for COMM to finish.
             self._sync_comm_to_comp()
+            # COMM-produced grads were consumed by bwd_attn on COMP without
+            # record_stream, so later COMM work must wait before reusing memory.
+            self._fence_comp_before_future_comm()
 
         # Restore event protocol for sequential backward use (cooldown)
         for n in fwd_nodes:
