@@ -19,6 +19,7 @@ _logger = logging.getLogger(__name__)
 
 
 _EMPTY_CACHE_RELEASE_COUNTER = 0
+_EMPTY_CACHE_LAST_CALL_COUNTER = -1
 
 
 def _env_flag(name: str, default: bool) -> bool:
@@ -34,7 +35,7 @@ def maybe_empty_cache_after_release() -> None:
     Multi-stream MoE overlap can create many differently sized temporary blocks.
     After Python references are dropped, PyTorch may still reserve enough free
     blocks to fragment later large allocations. This helper is intentionally
-    thresholded so normal release points only pay a few allocator-stat queries.
+    throttled and thresholded so normal release points are cheap.
 
     Environment knobs:
       NNSCALER_EMPTY_CACHE_ON_RELEASE=0 disables this helper.
@@ -42,6 +43,7 @@ def maybe_empty_cache_after_release() -> None:
       NNSCALER_EMPTY_CACHE_THRESHOLD_MB sets the minimum cached/inactive bytes.
       NNSCALER_EMPTY_CACHE_FRAGMENTATION_RATIO sets the minimum pressure ratio.
       NNSCALER_EMPTY_CACHE_RELEASE_INTERVAL checks every N release points.
+      NNSCALER_EMPTY_CACHE_COOLDOWN_INTERVAL skips N releases after empty_cache.
       NNSCALER_EMPTY_CACHE_SYNC=1 synchronizes before empty_cache.
     """
     if not torch.cuda.is_available():
@@ -51,11 +53,17 @@ def maybe_empty_cache_after_release() -> None:
     if mode in ('0', 'false', 'off', 'no', ''):
         return
 
-    global _EMPTY_CACHE_RELEASE_COUNTER
+    global _EMPTY_CACHE_RELEASE_COUNTER, _EMPTY_CACHE_LAST_CALL_COUNTER
     _EMPTY_CACHE_RELEASE_COUNTER += 1
     interval = max(
-        1, int(os.environ.get('NNSCALER_EMPTY_CACHE_RELEASE_INTERVAL', '1')))
+        1, int(os.environ.get('NNSCALER_EMPTY_CACHE_RELEASE_INTERVAL', '16')))
     if _EMPTY_CACHE_RELEASE_COUNTER % interval != 0:
+        return
+
+    cooldown = max(
+        0, int(os.environ.get('NNSCALER_EMPTY_CACHE_COOLDOWN_INTERVAL', '64')))
+    if (mode != 'force' and _EMPTY_CACHE_LAST_CALL_COUNTER >= 0
+            and _EMPTY_CACHE_RELEASE_COUNTER - _EMPTY_CACHE_LAST_CALL_COUNTER < cooldown):
         return
 
     if mode != 'force':
@@ -69,18 +77,23 @@ def maybe_empty_cache_after_release() -> None:
         if reserved <= 0:
             return
         cached = max(0, reserved - torch.cuda.memory_allocated())
-        try:
-            inactive_split = torch.cuda.memory_stats().get(
-                'inactive_split_bytes.all.current', 0)
-        except Exception:
-            inactive_split = 0
-        pressure = max(cached, inactive_split)
+        pressure = cached
+        if pressure < threshold or pressure / reserved < ratio:
+            try:
+                pressure = max(
+                    pressure,
+                    torch.cuda.memory_stats().get(
+                        'inactive_split_bytes.all.current', 0),
+                )
+            except Exception:
+                pass
         if pressure < threshold or pressure / reserved < ratio:
             return
 
     if _env_flag('NNSCALER_EMPTY_CACHE_SYNC', False):
         torch.cuda.synchronize()
     torch.cuda.empty_cache()
+    _EMPTY_CACHE_LAST_CALL_COUNTER = _EMPTY_CACHE_RELEASE_COUNTER
 
 
 class MicroBatchDataLoader:
