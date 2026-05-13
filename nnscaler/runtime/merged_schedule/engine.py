@@ -36,6 +36,37 @@ _logger = logging.getLogger(__name__)
 
 _COMP_STREAM = None   # computation stream (non-default)
 _COMM_STREAM = None   # communication stream (non-default)
+_ALLOCATOR_CONFIGURED = False
+
+
+def _configure_allocator_for_moe_overlap():
+    """Apply allocator settings that reduce MoE overlap fragmentation."""
+    global _ALLOCATOR_CONFIGURED
+    if _ALLOCATOR_CONFIGURED:
+        return
+    _ALLOCATOR_CONFIGURED = True
+
+    alloc_conf = os.environ.get('MOE_OVERLAP_ALLOC_CONF')
+    if alloc_conf is None:
+        if os.environ.get('PYTORCH_CUDA_ALLOC_CONF'):
+            return
+        alloc_conf = 'expandable_segments:True'
+    if alloc_conf in ('', '0', 'none', 'None'):
+        return
+
+    set_allocator_settings = getattr(
+        getattr(torch.cuda, 'memory', None), '_set_allocator_settings', None)
+    if set_allocator_settings is None:
+        _logger.warning(
+            "MOE_OVERLAP_ALLOC_CONF=%s ignored: this PyTorch build does not "
+            "expose torch.cuda.memory._set_allocator_settings", alloc_conf)
+        return
+    try:
+        set_allocator_settings(alloc_conf)
+    except Exception as exc:
+        _logger.warning(
+            "Failed to apply MOE_OVERLAP_ALLOC_CONF=%s: %s",
+            alloc_conf, exc)
 
 
 def set_streams():
@@ -44,6 +75,7 @@ def set_streams():
     default-stream implicit sync does not serialise them.
     """
     global _COMP_STREAM, _COMM_STREAM
+    _configure_allocator_for_moe_overlap()
     _COMP_STREAM = torch.cuda.Stream()
     _COMM_STREAM = torch.cuda.Stream()
     # Merged scheduling intentionally accumulates gradients on non-default
@@ -346,6 +378,15 @@ class MergedScheduler:
         self._record_stream_in_4phase = (
             os.environ.get('MOE_OVERLAP_RECORD_STREAM', '0') not in ('0', '')
         )
+        self._trim_fragmented_cache = (
+            os.environ.get('MOE_OVERLAP_TRIM_CACHE', '1') not in ('0', '')
+        )
+        self._trim_inactive_split_bytes = (
+            int(os.environ.get('MOE_OVERLAP_TRIM_INACTIVE_MB', '1024'))
+            * 1024 * 1024
+        )
+        self._trim_inactive_split_ratio = float(
+            os.environ.get('MOE_OVERLAP_TRIM_INACTIVE_RATIO', '0.20'))
 
         # Pre-allocate CUDA events for cross-stream synchronization.
         # Using separate events per barrier slot avoids re-recording while
@@ -705,6 +746,21 @@ class MergedScheduler:
         elif isinstance(grads, torch.Tensor):
             grads.record_stream(comp)
 
+    def _maybe_trim_fragmented_cache(self):
+        if not self._trim_fragmented_cache:
+            return
+        try:
+            stats = torch.cuda.memory_stats()
+        except Exception:
+            return
+        inactive_split = stats.get('inactive_split_bytes.all.current', 0)
+        reserved = stats.get('reserved_bytes.all.current', 0)
+        if inactive_split < self._trim_inactive_split_bytes or reserved <= 0:
+            return
+        if inactive_split / reserved < self._trim_inactive_split_ratio:
+            return
+        torch.cuda.empty_cache()
+
     def _prepare_loss_aux_tensors(self, attn_node, lc, attn_out):
         aux_tensors = lc.step_data.get('_loss_aux_tensors')
         if aux_tensors is None:
@@ -910,11 +966,11 @@ class MergedScheduler:
         with torch.cuda.stream(get_comp_stream()):
             self._sync_comp_to_comm()
 
-            # combine_grads: (grad_expert_outs, grad_h_residual, grad_shared_expert_out)
+            # combine grads: grad_expert_outs and grad_shared_expert_out feed expert bwd.
             combine_grads = combine_n.backward(grad_h)
             # expert backward needs grads for both outputs: expert_outs and shared_expert_out
             expert_grads = expert_n.backward((combine_grads[0], combine_grads[2]))
-            # expert_grads: (grad_sorted_tokens, grad_sorted_probs, grad_h_ln)
+            # expert grads: token/prob grads feed dispatch bwd; h_ln grad is used in Phase 4.
             dispatch_grads = dispatch_n.backward((expert_grads[0], expert_grads[1]))
 
             self._sync_comm_to_comp()
@@ -1017,6 +1073,9 @@ class MergedScheduler:
             else:
                 combine_grads = bwd_combine.backward(grad_h)
                 fwd_attn_out = fwd_attn.forward((fwd_h,))
+            del grad_h
+            combine_grad_expert, combine_grad_h_residual, combine_grad_shared = combine_grads
+            del combine_grads
             fwd_h_residual, fwd_h_ln, fwd_routing_probs = fwd_attn_out[:3]
             self._prepare_loss_aux_tensors(fwd_attn, fwd_lc, fwd_attn_out)
 
@@ -1029,55 +1088,76 @@ class MergedScheduler:
             # combine_grads: (grad_expert_outs, grad_h_residual, grad_shared_expert_out)
             if pool is not None:
                 fut_dispatch = pool.submit(fwd_dispatch.forward, (fwd_h_ln, fwd_routing_probs))
-                expert_grads = bwd_expert.backward((combine_grads[0], combine_grads[2]))
+                expert_grads = bwd_expert.backward((combine_grad_expert, combine_grad_shared))
                 fwd_dispatch_out = fut_dispatch.result()
             else:
                 fwd_dispatch_out = fwd_dispatch.forward((fwd_h_ln, fwd_routing_probs))
-                expert_grads = bwd_expert.backward((combine_grads[0], combine_grads[2]))
+                expert_grads = bwd_expert.backward((combine_grad_expert, combine_grad_shared))
+            if self._record_stream_in_4phase:
+                self._record_for_comp((combine_grad_expert, combine_grad_shared))
+            expert_grad_tokens, expert_grad_probs, expert_grad_h_ln = expert_grads
+            del expert_grads
             # expert_grads: (grad_sorted_tokens, grad_sorted_probs, grad_h_ln)
 
             # Phase boundary: Phase 3 COMP needs COMM output (dispatch_out),
             # Phase 3 COMM needs COMP output (expert_grads)
             self._cross_stream_barrier(slot=1)
+            del combine_grad_expert, combine_grad_shared
 
             # Phase 3: COMM(b_dispatch) || COMP(f_expert)
             # expert forward includes shared expert (takes h_ln, returns tuple).
             if pool is not None:
-                fut_dispatch_bwd = pool.submit(bwd_dispatch.backward, (expert_grads[0], expert_grads[1]))
+                fut_dispatch_bwd = pool.submit(
+                    bwd_dispatch.backward, (expert_grad_tokens, expert_grad_probs))
                 fwd_expert_result = fwd_expert.forward((*fwd_dispatch_out, fwd_h_ln))
                 dispatch_grads = fut_dispatch_bwd.result()
             else:
-                dispatch_grads = bwd_dispatch.backward((expert_grads[0], expert_grads[1]))
+                dispatch_grads = bwd_dispatch.backward((expert_grad_tokens, expert_grad_probs))
                 fwd_expert_result = fwd_expert.forward((*fwd_dispatch_out, fwd_h_ln))
+            dispatch_grad_h_ln, dispatch_grad_routing = dispatch_grads
+            del dispatch_grads
             fwd_expert_out, fwd_shared_expert_out = fwd_expert_result
+            del fwd_dispatch_out, fwd_expert_result
 
             # Phase boundary: Phase 4 COMP needs COMM output (dispatch_grads),
             # Phase 4 COMM needs COMP output (expert_out + shared_expert_out)
             self._cross_stream_barrier(slot=2)
+            del expert_grad_tokens, expert_grad_probs
 
             # Phase 4: COMM(f_combine) || COMP(b_attn)
             if pool is not None:
                 fut_combine_fwd = pool.submit(fwd_combine.forward,
                                               (fwd_expert_out, fwd_h_residual, fwd_shared_expert_out))
                 self._record_for_comp(
-                    dispatch_grads, record_stream=self._record_stream_in_4phase)
+                    (dispatch_grad_h_ln, dispatch_grad_routing),
+                    record_stream=self._record_stream_in_4phase)
                 self._record_for_comp(
-                    combine_grads, record_stream=self._record_stream_in_4phase)
-                grad_h_ln_total = dispatch_grads[0] + expert_grads[2]
+                    combine_grad_h_residual,
+                    record_stream=self._record_stream_in_4phase)
+                grad_h_ln_total = dispatch_grad_h_ln + expert_grad_h_ln
+                del expert_grad_h_ln
                 attn_grads = self._attn_backward_grads(
-                    bwd_attn, combine_grads[1], grad_h_ln_total, dispatch_grads[1])
+                    bwd_attn, combine_grad_h_residual,
+                    grad_h_ln_total, dispatch_grad_routing)
                 grad_x = bwd_attn.backward(attn_grads)
+                del attn_grads, grad_h_ln_total
                 fwd_h_out = fut_combine_fwd.result()
             else:
                 fwd_h_out = fwd_combine.forward((fwd_expert_out, fwd_h_residual, fwd_shared_expert_out))
                 self._record_for_comp(
-                    dispatch_grads, record_stream=self._record_stream_in_4phase)
+                    (dispatch_grad_h_ln, dispatch_grad_routing),
+                    record_stream=self._record_stream_in_4phase)
                 self._record_for_comp(
-                    combine_grads, record_stream=self._record_stream_in_4phase)
-                grad_h_ln_total = dispatch_grads[0] + expert_grads[2]
+                    combine_grad_h_residual,
+                    record_stream=self._record_stream_in_4phase)
+                grad_h_ln_total = dispatch_grad_h_ln + expert_grad_h_ln
+                del expert_grad_h_ln
                 attn_grads = self._attn_backward_grads(
-                    bwd_attn, combine_grads[1], grad_h_ln_total, dispatch_grads[1])
+                    bwd_attn, combine_grad_h_residual,
+                    grad_h_ln_total, dispatch_grad_routing)
                 grad_x = bwd_attn.backward(attn_grads)
+                del attn_grads, grad_h_ln_total
+            del fwd_expert_out, fwd_shared_expert_out
 
             self._restore_loss_aux_step_data(fwd_attn, fwd_lc)
 
@@ -1096,6 +1176,8 @@ class MergedScheduler:
                 # output, and COMM waits for Phase-4 COMP consumers before freed
                 # COMM-owned blocks can be reused without record_stream events.
                 self._cross_stream_barrier(slot=3)
+            del dispatch_grad_h_ln, dispatch_grad_routing, combine_grad_h_residual
+            self._maybe_trim_fragmented_cache()
 
         return fwd_h_out, grad_x, ('layer4', fwd_nodes)
 
