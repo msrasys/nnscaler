@@ -566,7 +566,8 @@ def test_moe_breakdown_overlap(tmp_path):
         gen_savedir=tmp_path,
         load_module=False
     )
-    assert True  # should success
+    for rank in range(4):
+        assert not _gencode_contains(tmp_path, MoeWithLoss, rank, r'\.record_stream\(')
 
     # def segment54(self, x_65):
     #     # File "/data/weijiangxu/nnscaler/tests/parallel_module/test_gencode_ep.py", line 235, in forward,  logits = self.gate(x.float())

@@ -70,7 +70,7 @@ class AsyncCommHandler:
         assert len(self._works) == 0 and len(self._callbacks) == 0
 
 
-TensorPairs = List[Tuple[int, torch.Tensor]]
+TensorPairs = List[Tuple[int, Optional[torch.Tensor]]]
 
 
 class Executor:
@@ -78,8 +78,8 @@ class Executor:
     # We consider each segment as an isolated graph. By
     # executing the forward of graph, the input tensors will be detached
     # from previous graph and saved for backward.
-    # Each graph has its name, and multiple call for the graph will append
-    # (instant id -> detached) input tensor pairs for backward reference.
+    # Each graph has its name, and multiple calls for the graph will append
+    # input ids plus detached grad-capable tensors for backward reference.
     _detach: Dict[str, List[TensorPairs]] = dict()
     _backward_pre_hook: Optional[Callable] = None
 
@@ -102,8 +102,17 @@ class Executor:
                 mapping[id(itensor)] = itensor.detach().requires_grad_()
         input_dtensors = tuple(mapping[id(t)] if id(t) in mapping else t for t in input_tensors)
         
-        saved_pairs = [(id(itensor), dtensor) for itensor, dtensor in zip(input_tensors, input_dtensors)]
-        Executor._detach.setdefault(name, []).append(saved_pairs)  
+        # Backward only needs detached inputs that can receive gradients. Keep
+        # ids for schedule validation, but avoid extending non-grad tensor
+        # lifetimes across overlapped micro-batches.
+        saved_pairs = [
+            (
+                id(itensor),
+                dtensor if torch.is_tensor(dtensor) and dtensor.requires_grad else None,
+            )
+            for itensor, dtensor in zip(input_tensors, input_dtensors)
+        ]
+        Executor._detach.setdefault(name, []).append(saved_pairs)
         
         outputs = subgraph(*input_dtensors)
         return outputs
