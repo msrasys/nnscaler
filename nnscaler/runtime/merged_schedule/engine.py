@@ -124,6 +124,7 @@ class ScheduleNode:
         free_input=False,
         name="schedule_node",
         checkpoint=False,
+        host_wait=False,
     ):
         self.name = name
         self.forward_func = forward_func
@@ -132,6 +133,7 @@ class ScheduleNode:
         self.event = event
         self.free_input = free_input
         self.checkpoint = checkpoint
+        self.host_wait = host_wait
         self.inputs = None
         self.output = None
         self._output_is_tuple = False
@@ -262,6 +264,11 @@ class ScheduleNode:
     def _stream_ctx(self, name=None):
         if not self._skip_event:
             self.event.wait(self.stream)
+        if self.host_wait:
+            # DeepEP communication calls include CPU-side polling timeouts. Do
+            # not enter those callables while this stream is still blocked on
+            # previously enqueued cross-stream dependencies.
+            self.stream.synchronize()
         if name:
             torch.cuda.nvtx.range_push(name)
         try:
@@ -327,6 +334,13 @@ class MergedScheduler:
         self._async_pool = (
             ThreadPoolExecutor(max_workers=1, thread_name_prefix='moe-overlap')
             if _async_on else None
+        )
+        # DeepEP dispatch/combine have CPU polling timeouts. Host-waiting at
+        # COMM node entry prevents those timeouts from including prior queued
+        # COMP work; set this env var to 0 to restore pure async enqueueing.
+        self._host_wait_comm = (
+            os.environ.get('NNSCALER_MERGED_SCHEDULE_HOST_WAIT_COMM', '1')
+            not in ('0', '')
         )
 
         # Pre-allocate CUDA events for cross-stream synchronization.
@@ -620,7 +634,8 @@ class MergedScheduler:
 
         dispatch_node = ScheduleNode(
             lc.dispatch_fn, comm_stream, event,
-            name="dispatch", checkpoint=False)
+            name="dispatch", checkpoint=False,
+            host_wait=self._host_wait_comm)
 
         expert_node = ScheduleNode(
             lc.expert_fn, comp_stream, event,
@@ -628,7 +643,8 @@ class MergedScheduler:
 
         combine_node = ScheduleNode(
             lc.combine_fn, comm_stream, event,
-            name="combine", checkpoint=False)
+            name="combine", checkpoint=False,
+            host_wait=self._host_wait_comm)
 
         return (attn_node, dispatch_node, expert_node, combine_node)
 
