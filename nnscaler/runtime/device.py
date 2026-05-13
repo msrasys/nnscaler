@@ -17,27 +17,34 @@ from nnscaler.utils import is_running_distributed
 
 _logger = logging.getLogger(__name__)
 _LARGE_TIMEOUT = datetime.timedelta(seconds=21600)
-_deferred_release_refs: List[Tuple[torch.cuda.Event, Tuple[torch.Tensor, ...]]] = []
+_deferred_release_refs: List[Tuple[torch.cuda.Event, Tuple[Any, ...]]] = []
 _deferred_release_lock = threading.Lock()
 
 
-def _collect_cuda_tensors(value: Any, refs: List[torch.Tensor], seen: set):
+def _collect_cuda_storages(value: Any, refs: List[Any], seen: set):
     if isinstance(value, torch.Tensor):
-        if value.is_cuda and id(value) not in seen:
-            refs.append(value)
-            seen.add(id(value))
+        if value.is_cuda:
+            try:
+                storage = value.untyped_storage()
+                key = (storage.device, storage.data_ptr())
+            except Exception:
+                storage = value
+                key = ('tensor', id(value))
+            if key not in seen:
+                refs.append(storage)
+                seen.add(key)
         return
     if isinstance(value, (tuple, list)):
         for item in value:
-            _collect_cuda_tensors(item, refs, seen)
+            _collect_cuda_storages(item, refs, seen)
         return
     if isinstance(value, dict):
         for item in value.values():
-            _collect_cuda_tensors(item, refs, seen)
+            _collect_cuda_storages(item, refs, seen)
 
 
 def prune_deferred_releases():
-    """Drop tensor refs whose last-use CUDA event has completed."""
+    """Drop storage refs whose last-use CUDA event has completed."""
     with _deferred_release_lock:
         if not _deferred_release_refs:
             return
@@ -50,7 +57,7 @@ def prune_deferred_releases():
 
 
 def flush_deferred_releases():
-    """Synchronize and release all tensors held by defer_release."""
+    """Synchronize and release all storages held by defer_release."""
     with _deferred_release_lock:
         if not _deferred_release_refs:
             return
@@ -62,16 +69,18 @@ def flush_deferred_releases():
 
 def defer_release(*values: Any, stream: Optional[torch.cuda.Stream] = None,
                   stream_name: Optional[str] = None):
-    """Keep CUDA tensor refs alive until work already queued on a stream completes.
+    """Keep CUDA storages alive until work already queued on a stream completes.
 
     This is used by multi-stream schedules before deleting local tensor variables.
     It avoids Tensor.record_stream while still preventing the caching allocator from
-    reusing storage that a non-default stream may still be reading or writing.
+    reusing storage that a non-default stream may still be reading or writing.  We
+    keep storages, not tensors, so autograd metadata and saved tensors can be
+    released immediately after the caller deletes its tensor variables.
     """
-    refs: List[torch.Tensor] = []
+    refs: List[Any] = []
     seen = set()
     for value in values:
-        _collect_cuda_tensors(value, refs, seen)
+        _collect_cuda_storages(value, refs, seen)
     if not refs:
         return
 
@@ -85,6 +94,8 @@ def defer_release(*values: Any, stream: Optional[torch.cuda.Stream] = None,
 
     event = torch.cuda.Event()
     event.record(stream)
+    if event.query():
+        return
     with _deferred_release_lock:
         _deferred_release_refs.append((event, tuple(refs)))
 

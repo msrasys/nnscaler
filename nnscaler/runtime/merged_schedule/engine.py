@@ -326,6 +326,7 @@ class ScheduleNode:
             torch.cuda.nvtx.range_push(name)
         try:
             with torch.cuda.stream(self.stream):
+                nnscaler.runtime.device.prune_deferred_releases()
                 yield
         finally:
             if name:
@@ -447,6 +448,7 @@ class MergedScheduler:
 
         _logger.debug("Warmup: forward mb0")
         with torch.cuda.stream(get_comp_stream()):
+            nnscaler.runtime.device.prune_deferred_releases()
             h0 = embed_fn(samples[0])
         _embed_h_list = [h0]  # Save embedding outputs for backward
 
@@ -466,6 +468,7 @@ class MergedScheduler:
         results[0] = output_info_0['output_tuple']
 
         with torch.cuda.stream(get_comp_stream()):
+            nnscaler.runtime.device.prune_deferred_releases()
             loss_grad = torch.ones_like(loss_0)
         del h0, rmaps_0, eprobs_0, output_info_0
 
@@ -481,6 +484,7 @@ class MergedScheduler:
             # Launch embed on COMM — overlaps with loss_bwd on COMP.
             # embed_fn only reads sample data + embedding weight, independent of COMP.
             with torch.cuda.stream(get_comm_stream()):
+                nnscaler.runtime.device.prune_deferred_releases()
                 fwd_h = embed_fn(fwd_sample)
             _embed_h_list.append(fwd_h)
 
@@ -512,6 +516,7 @@ class MergedScheduler:
                     # Sync COMM→COMP: previous MoE layer's combine ran on COMM.
                     self._sync_comm_to_comp()
                     with torch.cuda.stream(get_comp_stream()):
+                        nnscaler.runtime.device.prune_deferred_releases()
                         fwd_h, special_data = fwd_lc.special_forward(fwd_h)
                     fwd_all_nodes[fwd_idx] = ('special', fwd_lc)
                     fwd_idx += 1
@@ -522,6 +527,7 @@ class MergedScheduler:
                     bwd_lc = bwd_entry[1]
                     with nnscaler.sync_grad_when(False):
                         with torch.cuda.stream(get_comp_stream()):
+                            nnscaler.runtime.device.prune_deferred_releases()
                             grad_h = bwd_lc.special_backward(grad_h)
                     prev_all_nodes[bwd_idx] = None
                     bwd_idx -= 1
@@ -551,6 +557,7 @@ class MergedScheduler:
                     # Sync COMM→COMP: previous MoE layer's combine ran on COMM.
                     self._sync_comm_to_comp()
                     with torch.cuda.stream(get_comp_stream()):
+                        nnscaler.runtime.device.prune_deferred_releases()
                         fwd_h, special_data = fwd_lc.special_forward(fwd_h)
                     fwd_all_nodes[fwd_idx] = ('special', fwd_lc)
                     fwd_idx += 1
@@ -574,6 +581,7 @@ class MergedScheduler:
                     bwd_lc = bwd_entry[1]
                     with nnscaler.sync_grad_when(False):
                         with torch.cuda.stream(get_comp_stream()):
+                            nnscaler.runtime.device.prune_deferred_releases()
                             grad_h = bwd_lc.special_backward(grad_h)
                     prev_all_nodes[bwd_idx] = None
                     bwd_idx -= 1
@@ -590,6 +598,7 @@ class MergedScheduler:
             # Propagate gradient through embedding graph to tok_embed weight
             with nnscaler.sync_grad_when(False):
                 with torch.cuda.stream(get_comp_stream()):
+                    nnscaler.runtime.device.prune_deferred_releases()
                     _embed_h_list[mb_i].backward(grad_h)
                     _embed_h_list[mb_i] = None
                     del grad_h
@@ -619,6 +628,7 @@ class MergedScheduler:
                 if isinstance(entry, tuple) and len(entry) == 2 and entry[0] == 'special':
                     lc = entry[1]
                     with torch.cuda.stream(get_comp_stream()):
+                        nnscaler.runtime.device.prune_deferred_releases()
                         grad_h = lc.special_backward(grad_h)
                     prev_all_nodes[i] = None
                     continue
@@ -628,6 +638,7 @@ class MergedScheduler:
                 prev_all_nodes[i] = None
             # Propagate gradient through embedding graph to tok_embed weight
             with torch.cuda.stream(get_comp_stream()):
+                nnscaler.runtime.device.prune_deferred_releases()
                 _embed_h_list[-1].backward(grad_h)
                 _embed_h_list[-1] = None
                 del grad_h
@@ -837,6 +848,7 @@ class MergedScheduler:
                 # special_forward runs on COMP and needs the COMM-produced h.
                 self._sync_comm_to_comp()
                 with torch.cuda.stream(get_comp_stream()):
+                    nnscaler.runtime.device.prune_deferred_releases()
                     h, special_data = lc.special_forward(h)
                 all_nodes.append(('special', lc))
                 continue
@@ -910,6 +922,7 @@ class MergedScheduler:
         # Ensure all intermediate ops run on COMP stream,
         # not the default stream (which has no sync with COMP/COMM in overlap mode).
         with torch.cuda.stream(get_comp_stream()):
+            nnscaler.runtime.device.prune_deferred_releases()
             body_grads = body_n.backward(grad_h)
             grad_x = attn_n.backward(body_grads)
         return grad_x
@@ -925,6 +938,7 @@ class MergedScheduler:
         # Ensure all intermediate ops run on COMP stream,
         # not the default stream (which has no sync with COMP/COMM in overlap mode).
         with torch.cuda.stream(get_comp_stream()):
+            nnscaler.runtime.device.prune_deferred_releases()
             self._sync_comp_to_comm()
 
             # combine_grads: (grad_expert_outs, grad_h_residual, grad_shared_expert_out)
@@ -966,6 +980,7 @@ class MergedScheduler:
 
         # Ensure all intermediate ops run on COMP stream, not default stream.
         with torch.cuda.stream(get_comp_stream()):
+            nnscaler.runtime.device.prune_deferred_releases()
             body_grads = bwd_body.backward(grad_h)
             fwd_attn_out = fwd_attn.forward((fwd_h,))
 
@@ -1016,6 +1031,7 @@ class MergedScheduler:
         # not the default stream (which has no sync with COMP/COMM in overlap mode).
         # ScheduleNode calls internally switch to their own stream and restore on exit.
         with torch.cuda.stream(get_comp_stream()):
+            nnscaler.runtime.device.prune_deferred_releases()
             # Initial sync: COMP→COMM so COMM can read grad_h (from loss_bwd on COMP)
             self._sync_comp_to_comm()
 

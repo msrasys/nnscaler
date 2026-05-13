@@ -170,6 +170,8 @@ class ScheduleCodeGen(FuncEmission):
 
                 for line, node in enumerate(device_nodes):
                     node_stream = self._get_node_stream(node)
+                    if self.execplan.use_multi_streams:
+                        _append_code(fb, 'nnscaler.runtime.device.prune_deferred_releases()', node_stream)
                     # when use scheduler, skip reducer if it is not the last backward of same segments
                     if use_scheduler and _is_backward_segment(node):
                         _append_code(fb,
@@ -206,6 +208,8 @@ class ScheduleCodeGen(FuncEmission):
                 for line, node in enumerate(device_nodes):
                     if not node.isfw(): continue  # skip backward segments and adapters
                     node_stream = self._get_node_stream(node)
+                    if self.execplan.use_multi_streams:
+                        _append_code(fb, 'nnscaler.runtime.device.prune_deferred_releases()', node_stream)
                     # execute
                     codes = self.emit_node(node, force_no_grad=True)
                     _append_code(fb, codes, node_stream)
