@@ -65,6 +65,28 @@ def get_comm_stream():
     return _COMM_STREAM
 
 
+def _prepare_manual_grad_sync():
+    """Make reducer allreduce start after merged-stream work has released memory."""
+    if not torch.cuda.is_available():
+        return
+    if _COMP_STREAM is None and _COMM_STREAM is None:
+        return
+
+    current = torch.cuda.current_stream()
+    if _COMP_STREAM is not None and current.cuda_stream != _COMP_STREAM.cuda_stream:
+        current.wait_stream(_COMP_STREAM)
+    if _COMM_STREAM is not None and current.cuda_stream != _COMM_STREAM.cuda_stream:
+        current.wait_stream(_COMM_STREAM)
+
+    # NCCL may allocate internal buffers when all_reduce is called. If the host
+    # launches all_reduce before the queued backward frees are visible, that
+    # allocation can OOM even though the NCCL stream would later wait correctly.
+    if os.environ.get('MOE_OVERLAP_SYNC_BEFORE_GRAD_REDUCE', '1') not in ('0', ''):
+        current.synchronize()
+        if os.environ.get('MOE_OVERLAP_EMPTY_CACHE_BEFORE_GRAD_REDUCE', '1') not in ('0', ''):
+            torch.cuda.empty_cache()
+
+
 def manual_sync_grads(parallel_module):
     """Manually trigger synchronous allreduce after all backward calls.
 
@@ -78,6 +100,8 @@ def manual_sync_grads(parallel_module):
     if not hasattr(pm, '_reducers'):
         _logger.warning("No _reducers found on parallel module, skipping manual sync")
         return
+
+    _prepare_manual_grad_sync()
 
     for reducer in pm._reducers:
         for bucket in reducer._buckets:
@@ -646,6 +670,7 @@ class MergedScheduler:
         comm_done.record(get_comm_stream())
         torch.cuda.default_stream().wait_event(comp_done)
         torch.cuda.default_stream().wait_event(comm_done)
+        self._release_pending_comm_refs()
 
         for i in range(len(results)):
             if results[i] is not None:
