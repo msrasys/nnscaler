@@ -8,3 +8,4 @@ from nnscaler.runtime import adapter
 from nnscaler.runtime import resource
 from nnscaler.runtime import module
 from nnscaler.runtime import function
+from nnscaler.runtime import stream_utils

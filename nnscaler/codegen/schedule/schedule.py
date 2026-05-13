@@ -229,7 +229,12 @@ class ScheduleCodeGen(FuncEmission):
         else:
             return None
 
-    def _emit_stream_context(self, stream_context, codes: List[str]) -> List[str]:
+    def _emit_stream_context(
+        self,
+        stream_context,
+        codes: List[str],
+        post_record_codes: Optional[List[str]] = None,
+    ) -> List[str]:
         wait_stream_codes = []
         if stream_context and stream_context.wait_streams:
             for wait_stream in stream_context.wait_streams:
@@ -245,7 +250,8 @@ class ScheduleCodeGen(FuncEmission):
             for record_event in stream_context.record_events:
                 record_event_codes.append(f'nnscaler.runtime.device.DeviceGroup().get_event({repr(record_event)}).record()')
 
-        return wait_stream_codes + wait_event_codes + codes + record_event_codes
+        post_record_codes = post_record_codes or []
+        return wait_stream_codes + wait_event_codes + codes + record_event_codes + post_record_codes
 
     def _validate_events(self, nodes):
         """
@@ -357,9 +363,10 @@ class ScheduleCodeGen(FuncEmission):
             raise RuntimeError(f"Unspported node type: {type(unwrap_node)}")
 
         if stream_context and stream_context.stream:
-            # register all input tensors to the current stream
-            # to avoid cross-stream premature deallocation issue
-            # see `Tensor.record_stream` in PyTorch for more details
+            # Keep input tensors alive until this stream reaches the end of the
+            # enqueued node work. This avoids cross-stream premature
+            # deallocation without using Tensor.record_stream, which can defer
+            # caching allocator reuse for too long in overlapped schedules.
 
             # NOTE: The dataloader output is not considered here. Two reasons:
             # 1) Dataloader output is wrapped in an IRObject, and internal IRTensors cannot be accessed here easily.
@@ -369,14 +376,19 @@ class ScheduleCodeGen(FuncEmission):
                 self.tensor_name(t) for t in IR.get_objects(gen_inputs)
                 if isinstance(t, IRTensor) and not t.is_attr()
             ]
-            record_stream_codes = []
-            for t in input_tensor_name:
-                record_stream_codes.append(f'{t}.record_stream(torch.cuda.current_stream())')
-
-            codes = record_stream_codes + codes
+            post_record_codes = []
+            if input_tensor_name:
+                tensors = ', '.join(input_tensor_name)
+                if len(input_tensor_name) == 1:
+                    tensors = tensors + ','
+                post_record_codes.append(
+                    f'nnscaler.runtime.stream_utils.keep_alive_until_stream_done(({tensors}), torch.cuda.current_stream())'
+                )
+        else:
+            post_record_codes = []
 
         if CompileFlag.line_timer:
             type_str = type(unwrap_node).__name__
             codes = [f'nnscaler.runtime.function.print_time({repr(type_str)})'] + codes
 
-        return self._emit_stream_context(stream_context, codes)
+        return self._emit_stream_context(stream_context, codes, post_record_codes)
