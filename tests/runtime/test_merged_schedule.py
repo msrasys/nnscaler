@@ -175,8 +175,9 @@ def _run_sequential(model, samples, use_aux_loss=False):
     return torch.stack(losses), _distributed_grad_norm(model)
 
 
-def _run_merged(model, samples, use_checkpoint=False, use_aux_loss=False):
+def _run_merged(model, samples, async_4phase, use_checkpoint=False, use_aux_loss=False):
     model.zero_grad(set_to_none=True)
+    os.environ['ASYNC_4PHASE'] = async_4phase
     set_streams()
     model.set_stream_checks(True)
     scheduler = _CountingMergedScheduler(
@@ -230,8 +231,7 @@ def _run_merged(model, samples, use_checkpoint=False, use_aux_loss=False):
     return losses, _distributed_grad_norm(model), scheduler.merged_4phase_calls, model.stream_counts()
 
 
-def _worker():
-    os.environ['ASYNC_4PHASE'] = '0'
+def _worker(async_4phase):
     local_rank = int(os.environ['LOCAL_RANK'])
     dist.init_process_group(backend='nccl')
     torch.cuda.set_device(local_rank)
@@ -257,11 +257,13 @@ def _worker():
             sequential_losses, sequential_gnorm = _run_sequential(
                 sequential_model, samples, use_aux_loss=use_aux_loss)
             merged_losses, merged_gnorm, merged_4phase_calls, stream_counts = _run_merged(
-                merged_model, samples,
+                merged_model, samples, async_4phase,
                 use_checkpoint=use_checkpoint,
                 use_aux_loss=use_aux_loss)
 
-            case_label = f'use_checkpoint={use_checkpoint}, use_aux_loss={use_aux_loss}'
+            case_label = (
+                f'async_4phase={async_4phase}, '
+                f'use_checkpoint={use_checkpoint}, use_aux_loss={use_aux_loss}')
             torch.testing.assert_close(
                 merged_losses, sequential_losses, rtol=1e-5, atol=1e-5,
                 msg=case_label)
@@ -283,6 +285,7 @@ def _worker():
             assert stream_counts['comm'] > 0
             assert stream_counts['all_reduce'] > 0
             case_results.append({
+                'async_4phase': async_4phase,
                 'use_checkpoint': use_checkpoint,
                 'use_aux_loss': use_aux_loss,
                 'merged_4phase_calls': merged_4phase_calls,
@@ -301,14 +304,16 @@ def _worker():
     reason='requires at least 2 CUDA devices for communication',
 )
 def test_merged_scheduler_fake_moe_matches_sequential_gnorm():
-    results = launch_torchrun(2, _worker)
-    assert len(results) == 2
-    for result in results.values():
-        assert len(result['cases']) == 4
-        assert result['cases'][-1]['use_checkpoint']
-        assert result['cases'][-1]['use_aux_loss']
-        for case in result['cases']:
-            assert case['merged_4phase_calls'] == 2
-            assert case['stream_counts']['comp'] > 0
-            assert case['stream_counts']['comm'] > 0
-            assert case['stream_counts']['all_reduce'] > 0
+    for async_4phase in ('0', '1'):
+        results = launch_torchrun(2, _worker, async_4phase)
+        assert len(results) == 2
+        for result in results.values():
+            assert len(result['cases']) == 4
+            assert result['cases'][-1]['use_checkpoint']
+            assert result['cases'][-1]['use_aux_loss']
+            for case in result['cases']:
+                assert case['async_4phase'] == async_4phase
+                assert case['merged_4phase_calls'] == 2
+                assert case['stream_counts']['comp'] > 0
+                assert case['stream_counts']['comm'] > 0
+                assert case['stream_counts']['all_reduce'] > 0

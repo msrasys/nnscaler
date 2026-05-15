@@ -21,6 +21,7 @@ Dense layers use 2 ScheduleNodes (attn, ffn) both on COMP stream.
 
 import logging
 import os
+import threading
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -95,6 +96,71 @@ def _make_viewless(t):
     return t
 
 
+class _DeferredCudaReleaseQueue:
+    """Keep CUDA tensor references alive until stream work finishes."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._pending = []
+
+    def defer(self, stream, *payloads, resize_storages=()):
+        payloads = tuple(p for p in payloads if p is not None)
+        resize_storages = tuple(s for s in resize_storages if s is not None)
+        if not payloads and not resize_storages:
+            return
+
+        event = torch.cuda.Event()
+        event.record(stream)
+        entry = {
+            'event': event,
+            'payloads': payloads,
+            'resize_storages': resize_storages,
+        }
+        with self._lock:
+            self._pending.append(entry)
+
+    def drain(self, blocking=False):
+        with self._lock:
+            pending = self._pending
+            self._pending = []
+
+        if not pending:
+            return
+
+        remaining = []
+        for entry in pending:
+            event = entry['event']
+            if blocking:
+                event.synchronize()
+                self._release_entry(entry)
+            elif event.query():
+                self._release_entry(entry)
+            else:
+                remaining.append(entry)
+
+        if remaining:
+            with self._lock:
+                self._pending = remaining + self._pending
+
+    @staticmethod
+    def _release_entry(entry):
+        for storage in entry['resize_storages']:
+            storage.resize_(0)
+        entry.clear()
+
+
+_DEFERRED_CUDA_RELEASES = _DeferredCudaReleaseQueue()
+
+
+def _defer_cuda_release(stream, *payloads, resize_storages=()):
+    _DEFERRED_CUDA_RELEASES.defer(
+        stream, *payloads, resize_storages=resize_storages)
+
+
+def _drain_deferred_cuda_releases(blocking=False):
+    _DEFERRED_CUDA_RELEASES.drain(blocking=blocking)
+
+
 class ScheduleNode:
     """A node that executes *forward_func* on *stream*, synchronized via *event*.
 
@@ -140,13 +206,6 @@ class ScheduleNode:
         return self._forward(*inputs)
 
     def _forward(self, *inputs):
-        # Record cross-stream tensor usage for CUDA caching allocator safety.
-        # Inputs may have been produced on a different stream; tell the allocator
-        # that this stream will also read from their underlying storage.
-        for inp in inputs:
-            if isinstance(inp, torch.Tensor):
-                inp.record_stream(self.stream)
-
         with self._stream_ctx(f"{self.name} fwd"):
             self.inputs = []
             for inp in inputs:
@@ -178,10 +237,13 @@ class ScheduleNode:
             self.output = data
 
         if self.free_input:
-            for inp in inputs:
-                if inp is not None:
-                    inp.record_stream(self.stream)
-                    inp.untyped_storage().resize_(0)
+            resize_storages = tuple(
+                inp.untyped_storage()
+                for inp in inputs
+                if isinstance(inp, torch.Tensor)
+            )
+            _defer_cuda_release(
+                self.stream, inputs, resize_storages=resize_storages)
 
         return self.output
 
@@ -194,11 +256,10 @@ class ScheduleNode:
         return self._backward(*output_grad, retain_graph=retain_graph)
 
     def _backward(self, *output_grad, retain_graph=False):
-        # Record cross-stream tensor usage for output_grad tensors.
-        for g in output_grad:
-            if isinstance(g, torch.Tensor):
-                g.record_stream(self.stream)
-
+        recomputed = None
+        outputs = None
+        tensor_outputs = ()
+        tensor_grads = ()
         with self._stream_ctx(f"{self.name} bwd"):
             if self.checkpoint:
                 recomputed = self.forward_func(*self.inputs)
@@ -213,6 +274,8 @@ class ScheduleNode:
                         tensor_outputs.append(out)
                         tensor_grads.append(g)
                 if tensor_outputs:
+                    tensor_outputs = tuple(tensor_outputs)
+                    tensor_grads = tuple(tensor_grads)
                     self.backward_func(tuple(tensor_outputs), tuple(tensor_grads),
                                        retain_graph=retain_graph)
             else:
@@ -225,11 +288,13 @@ class ScheduleNode:
                         tensor_outputs.append(out)
                         tensor_grads.append(g)
                 if tensor_outputs:
+                    tensor_outputs = tuple(tensor_outputs)
+                    tensor_grads = tuple(tensor_grads)
                     self.backward_func(tuple(tensor_outputs), tuple(tensor_grads),
                                        retain_graph=retain_graph)
 
         grads = self.get_grad()
-        self._release()
+        self._release(output_grad, recomputed, outputs, tensor_outputs, tensor_grads)
         return grads
 
     def get_grad(self):
@@ -280,7 +345,9 @@ class ScheduleNode:
             if not self._skip_event:
                 self.event.record(self.stream)
 
-    def _release(self):
+    def _release(self, *extra_payloads):
+        _defer_cuda_release(
+            self.stream, self.inputs, self.output, *extra_payloads)
         self.inputs = None
         self.output = None
 
@@ -531,6 +598,7 @@ class MergedScheduler:
                 bwd_idx -= 1
 
             del prev_all_nodes
+            self._drain_release_queue()
             # Propagate gradient through embedding graph to tok_embed weight
             with nnscaler.sync_grad_when(False):
                 with torch.cuda.stream(get_comp_stream()):
@@ -554,6 +622,7 @@ class MergedScheduler:
                 del all_nodes_0, loss_node_0, loss_0
             del fwd_h, fwd_loss, fwd_routing_maps, fwd_expert_probs
             del fwd_lc_list
+            self._drain_release_queue()
 
         _logger.debug(f"Cooldown: backward mb{num_mbs-1}")
         with nnscaler.sync_grad_when(False):
@@ -594,6 +663,7 @@ class MergedScheduler:
         _embed_h_list.clear()
 
         del prev_all_nodes, prev_loss_node
+        _drain_deferred_cuda_releases(blocking=True)
 
         return results
 
@@ -642,10 +712,12 @@ class MergedScheduler:
     def _sync_comm_to_comp(self):
         self._sync_m2c_evt.record(get_comm_stream())
         get_comp_stream().wait_event(self._sync_m2c_evt)
+        _drain_deferred_cuda_releases(blocking=False)
 
     def _sync_comp_to_comm(self):
         self._sync_c2m_evt.record(get_comp_stream())
         get_comm_stream().wait_event(self._sync_c2m_evt)
+        _drain_deferred_cuda_releases(blocking=False)
 
     def _cross_stream_barrier(self, slot=0):
         """Bidirectional sync: each stream waits for the other's current position.
@@ -660,16 +732,11 @@ class MergedScheduler:
         comm_evt.record(get_comm_stream())
         get_comm_stream().wait_event(comp_evt)
         get_comp_stream().wait_event(comm_evt)
+        _drain_deferred_cuda_releases(blocking=False)
 
-    def _record_for_comp(self, grads):
-        """Record COMM-produced tensors for safe use on COMP stream."""
-        comp = get_comp_stream()
-        if isinstance(grads, tuple):
-            for t in grads:
-                if isinstance(t, torch.Tensor):
-                    t.record_stream(comp)
-        elif isinstance(grads, torch.Tensor):
-            grads.record_stream(comp)
+    def _drain_release_queue(self):
+        """Opportunistically release tensors whose stream events completed."""
+        _drain_deferred_cuda_releases(blocking=False)
 
     def _prepare_loss_aux_tensors(self, attn_node, lc, attn_out):
         aux_tensors = lc.step_data.get('_loss_aux_tensors')
@@ -884,15 +951,16 @@ class MergedScheduler:
             dispatch_grads = dispatch_n.backward((expert_grads[0], expert_grads[1]))
 
             self._sync_comm_to_comp()
-            # Record COMM-produced grads for COMP-side addition and attn backward.
-            self._record_for_comp(dispatch_grads)
-            self._record_for_comp(combine_grads)
+            self._drain_release_queue()
 
             grad_h_ln_total = dispatch_grads[0] + expert_grads[2]
 
             attn_grads = self._attn_backward_grads(
                 attn_n, combine_grads[1], grad_h_ln_total, dispatch_grads[1])
             grad_x = attn_n.backward(attn_grads)
+            _defer_cuda_release(
+                get_comp_stream(), dispatch_grads, expert_grads,
+                combine_grads, grad_h_ln_total, attn_grads)
 
         return grad_x
 
@@ -955,10 +1023,10 @@ class MergedScheduler:
         # --- Skip per-node event protocol during merged step ---
         # The default shared event serializes all nodes (COMP waits for COMM
         # and vice versa), preventing within-phase parallelism. By setting
-        # _skip_event=True, each node still switches to its own stream and
-        # does record_stream for allocator safety, but does not wait/record
-        # the shared event. Cross-stream dependencies are enforced explicitly
-        # via _cross_stream_barrier() at phase boundaries.
+        # _skip_event=True, each node still switches to its own stream, but
+        # does not wait/record the shared event. Cross-stream dependencies and
+        # tensor lifetimes are enforced explicitly via events and the deferred
+        # release queue.
         all_nodes = (*bwd_nodes, *fwd_nodes)
         for n in all_nodes:
             n._skip_event = True
@@ -1021,21 +1089,25 @@ class MergedScheduler:
             if pool is not None:
                 fut_combine_fwd = pool.submit(fwd_combine.forward,
                                               (fwd_expert_out, fwd_h_residual, fwd_shared_expert_out))
-                self._record_for_comp(dispatch_grads)
-                self._record_for_comp(combine_grads)
+                self._drain_release_queue()
                 grad_h_ln_total = dispatch_grads[0] + expert_grads[2]
                 attn_grads = self._attn_backward_grads(
                     bwd_attn, combine_grads[1], grad_h_ln_total, dispatch_grads[1])
                 grad_x = bwd_attn.backward(attn_grads)
+                _defer_cuda_release(
+                    get_comp_stream(), dispatch_grads, expert_grads,
+                    combine_grads, grad_h_ln_total, attn_grads)
                 fwd_h_out = fut_combine_fwd.result()
             else:
                 fwd_h_out = fwd_combine.forward((fwd_expert_out, fwd_h_residual, fwd_shared_expert_out))
-                self._record_for_comp(dispatch_grads)
-                self._record_for_comp(combine_grads)
+                self._drain_release_queue()
                 grad_h_ln_total = dispatch_grads[0] + expert_grads[2]
                 attn_grads = self._attn_backward_grads(
                     bwd_attn, combine_grads[1], grad_h_ln_total, dispatch_grads[1])
                 grad_x = bwd_attn.backward(attn_grads)
+                _defer_cuda_release(
+                    get_comp_stream(), dispatch_grads, expert_grads,
+                    combine_grads, grad_h_ln_total, attn_grads)
 
             self._restore_loss_aux_step_data(fwd_attn, fwd_lc)
 
