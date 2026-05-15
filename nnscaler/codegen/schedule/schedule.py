@@ -160,12 +160,24 @@ class ScheduleCodeGen(FuncEmission):
                             f'nnscaler.flags.RuntimeFlag.skip_reducer = '
                             f'{id(node) not in last_backward_node_oids !r}'
                         )
+                    node_stream = self._get_node_stream(node)
                     codes = self.emit_node(node)
-                    _append_code(fb, codes, self._get_node_stream(node))
+                    _append_code(fb, codes, node_stream)
                     # release
                     tensors = lifetime.release_tensors_after_line(line)
                     if len(tensors) > 0 : # not necessarily to have one after each line
-                        _append_code(fb, self.emit_release(tensors))
+                        _append_code(
+                            fb,
+                            self._emit_release(
+                                tensors,
+                                sync_stream=(
+                                    use_scheduler
+                                    and node_stream is not None
+                                    and not CompileFlag.schedule_record_stream
+                                ),
+                            ),
+                            node_stream if use_scheduler else None,
+                        )
             # return code
             outputs = self.return_name_complex(self.execplan.outputs())
             code = f'return {outputs}'
@@ -189,13 +201,25 @@ class ScheduleCodeGen(FuncEmission):
                 for line, node in enumerate(device_nodes):
                     if not node.isfw(): continue  # skip backward segments and adapters
                     # execute
+                    node_stream = self._get_node_stream(node)
                     codes = self.emit_node(node, force_no_grad=True)
-                    _append_code(fb, codes, self._get_node_stream(node))
+                    _append_code(fb, codes, node_stream)
                     # release
                     tensors = lifetime.release_tensors_after_line(line)
                     tensors = [t for t in tensors if isinstance(t, IRTensor) and not t.is_grad()]
                     if len(tensors) > 0 : # not necessarily to have one after each line
-                        _append_code(fb, self.emit_release(tensors))
+                        _append_code(
+                            fb,
+                            self._emit_release(
+                                tensors,
+                                sync_stream=(
+                                    use_scheduler
+                                    and node_stream is not None
+                                    and not CompileFlag.schedule_record_stream
+                                ),
+                            ),
+                            node_stream if use_scheduler else None,
+                        )
                 # return code
                 outputs = self.return_name_complex(self.execplan.outputs())
                 code = f'return {outputs}'
@@ -228,6 +252,13 @@ class ScheduleCodeGen(FuncEmission):
             return stream_context.stream
         else:
             return None
+
+    def _emit_release(self, tensors: List[IRTensor], *, sync_stream: bool = False) -> List[str]:
+        codes = []
+        if sync_stream:
+            codes.append('torch.cuda.current_stream().synchronize()')
+        codes.append(self.emit_release(tensors))
+        return codes
 
     def _emit_stream_context(self, stream_context, codes: List[str]) -> List[str]:
         wait_stream_codes = []
@@ -356,10 +387,10 @@ class ScheduleCodeGen(FuncEmission):
         else:
             raise RuntimeError(f"Unspported node type: {type(unwrap_node)}")
 
-        if stream_context and stream_context.stream:
-            # register all input tensors to the current stream
-            # to avoid cross-stream premature deallocation issue
-            # see `Tensor.record_stream` in PyTorch for more details
+        if CompileFlag.schedule_record_stream and stream_context and stream_context.stream:
+            # Optional legacy allocator-lifetime handling. The default schedule
+            # relies on explicit stream synchronization before generated del
+            # statements so large overlap activations can be reused promptly.
 
             # NOTE: The dataloader output is not considered here. Two reasons:
             # 1) Dataloader output is wrapped in an IRObject, and internal IRTensors cannot be accessed here easily.

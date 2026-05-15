@@ -116,6 +116,15 @@ class _DeferredCudaReleaseQueue:
             'payloads': payloads,
             'resize_storages': resize_storages,
         }
+
+        # The memory-safe default is to wait for this node's stream work and
+        # drop references immediately. Pure deferred release avoids host waits,
+        # but can retain too many large MoE activations under deep overlap.
+        if os.environ.get('NNSCALER_MERGED_SCHEDULE_DEFER_RELEASE', '0') in ('0', ''):
+            event.synchronize()
+            self._release_entry(entry)
+            return
+
         with self._lock:
             self._pending.append(entry)
 
@@ -498,8 +507,6 @@ class MergedScheduler:
             # Loss backward on COMP — overlaps with embed on COMM
             with nnscaler.sync_grad_when(False):
                 grad_h = prev_loss_node.backward(loss_grad)
-
-            prev_loss_node._release()
 
             # Create layer callables (CPU work, overlaps with GPU)
             fwd_lc_list = []

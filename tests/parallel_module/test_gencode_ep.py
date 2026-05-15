@@ -567,6 +567,12 @@ def test_moe_breakdown_overlap(tmp_path):
         load_module=False
     )
     assert True  # should success
+    generated = list(tmp_path.rglob('gencode*.py'))
+    assert generated
+    for gencode in generated:
+        filecontent = gencode.read_text()
+        assert '.record_stream(' not in filecontent
+        assert 'torch.cuda.current_stream().synchronize()' in filecontent
 
     # def segment54(self, x_65):
     #     # File "/data/weijiangxu/nnscaler/tests/parallel_module/test_gencode_ep.py", line 235, in forward,  logits = self.gate(x.float())

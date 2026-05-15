@@ -42,6 +42,10 @@ class CompileFlag:
     dev_mode = _to_bool('SINGLE_DEV_MODE')  # allow to use python xx.py
     async_comm = _to_bool('ASYNC_COMM')
     line_timer = _to_bool('LINE_TIMER')
+    # Generated pipeline/overlap schedules default to explicit stream sync at
+    # release points instead of tensor stream recording. Set this for the old
+    # allocator-lifetime behavior when memory headroom is sufficient.
+    schedule_record_stream = _to_bool('SCHEDULE_RECORD_STREAM')
 
     # ============== reducer ==================
     # use zero optimization on optimizer status.
