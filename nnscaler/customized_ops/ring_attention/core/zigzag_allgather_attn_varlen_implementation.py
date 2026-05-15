@@ -3,7 +3,7 @@
 
 from dataclasses import dataclass
 from collections import OrderedDict
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Union
 
 import torch
 import torch.distributed as dist
@@ -156,11 +156,12 @@ def _run_flash_attn_varlen(
     deterministic: bool,
     use_cute: bool,
     window_size: Tuple[int, int],
-) -> torch.Tensor:
+    return_lse: bool = False,
+) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     if use_cute:
         assert flash_attn_cute_varlen_func is not None, "flash_attn.cute is not available"
         cute_window_size = tuple(None if w == -1 else w for w in window_size)
-        out, _ = flash_attn_cute_varlen_func(
+        out, lse = flash_attn_cute_varlen_func(
             q,
             k,
             v,
@@ -172,10 +173,11 @@ def _run_flash_attn_varlen(
             causal=causal,
             window_size=cute_window_size,
             deterministic=deterministic,
+            return_lse=True,
         )
-        return out
+        return (out, lse) if return_lse else out
 
-    return flash_attn_varlen_func(
+    result = flash_attn_varlen_func(
         q,
         k,
         v,
@@ -189,8 +191,12 @@ def _run_flash_attn_varlen(
         window_size=window_size,
         alibi_slopes=alibi_slopes,
         deterministic=deterministic,
-        return_attn_probs=False,
+        return_attn_probs=bool(return_lse),
     )
+    if return_lse:
+        out, lse, _ = result
+        return out, lse
+    return result
 
 
 def zigzag_allgather_attn_varlen_func(
@@ -207,7 +213,8 @@ def zigzag_allgather_attn_varlen_func(
     deterministic: bool = False,
     use_cute: bool = False,
     window_size: Tuple[int, int] = (-1, -1),
-) -> torch.Tensor:
+    return_lse: bool = False,
+) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     assert process_group is not None and dist.get_world_size(process_group) > 1, (
         "zigzag_allgather_attn_varlen_func only handles the multi-GPU CP branch"
     )
@@ -224,7 +231,7 @@ def zigzag_allgather_attn_varlen_func(
     q_front = q[metadata.q_front_idx]
     q_end = q[metadata.q_end_idx]
 
-    front_output = _run_flash_attn_varlen(
+    front_result = _run_flash_attn_varlen(
         q_front,
         k,
         v,
@@ -239,8 +246,9 @@ def zigzag_allgather_attn_varlen_func(
         deterministic,
         use_cute,
         window_size,
+        return_lse=return_lse,
     )
-    end_output = _run_flash_attn_varlen(
+    end_result = _run_flash_attn_varlen(
         q_end,
         k,
         v,
@@ -255,10 +263,24 @@ def zigzag_allgather_attn_varlen_func(
         deterministic,
         use_cute,
         window_size,
+        return_lse=return_lse,
     )
+
+    if return_lse:
+        front_output, front_lse = front_result
+        end_output, end_lse = end_result
+    else:
+        front_output = front_result
+        end_output = end_result
 
     output = front_output.new_empty((q.shape[0],) + front_output.shape[1:])
     output[metadata.q_front_idx] = front_output
     output[metadata.q_end_idx] = end_output
+
+    if return_lse:
+        softmax_lse = front_lse.new_empty(front_lse.shape[:-1] + (q.shape[0],))
+        softmax_lse[..., metadata.q_front_idx] = front_lse
+        softmax_lse[..., metadata.q_end_idx] = end_lse
+        return output, softmax_lse
 
     return output

@@ -131,6 +131,7 @@ def wrap_ring_attn_varlen_func(
         enable_ring: bool = True,
         use_cute:  bool = False,
         process_group: Tuple[int] = None,
+        return_lse: bool = False,
 ):
     '''
     wrap the ring_attn_varlen_func to support the distributed training in nnScaler.
@@ -159,9 +160,9 @@ def wrap_ring_attn_varlen_func(
                 deterministic=deterministic,
                 return_lse=True,
             )
-            return output
+            return (output, lse) if return_lse else output
         else:
-            output = flash_attn_varlen_func(
+            result = flash_attn_varlen_func(
                 q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k,
                 dropout_p=dropout_p,
                 softmax_scale=softmax_scale,
@@ -169,9 +170,12 @@ def wrap_ring_attn_varlen_func(
                 window_size=window_size,
                 alibi_slopes=alibi_slopes,
                 deterministic=deterministic,
-                return_attn_probs=False,
+                return_attn_probs=bool(return_lse),
             )
-        return output
+            if return_lse:
+                output, softmax_lse, _ = result
+                return output, softmax_lse
+        return result
 
     assert len(q.shape) == 3, "q must have shape [total_q, qh, dim]"
     assert len(k.shape) == 3, "k must have shape [total_k, kh, dim]"
@@ -235,7 +239,7 @@ def wrap_ring_attn_varlen_func(
                 attn_mask_type="padding_causal" if causal else "padding",
             )
             output = unshuffle_varlen(shuffled_output, cu_seqlens_q, process_group, local_process_group)
-            return output
+            return (output, None) if return_lse else output
         else:
             # Fallback to basic ring attention implementation
             if _ENABLE_TE_CP:
@@ -278,7 +282,7 @@ def wrap_ring_attn_varlen_func(
         use_cute=use_cute,
     )
 
-    return out
+    return (out, softmax_lse) if return_lse else out
 
 
 def emit_ring(node: IRDimops, args: List[str], kwargs: Dict[str, str], runtime_devid: int, plan_ndevs: int, runtime_ndevs: int) -> str:
@@ -319,7 +323,10 @@ def emit_ring(node: IRDimops, args: List[str], kwargs: Dict[str, str], runtime_d
 def flash_attention_anno(query_states, key_states, value_states, cu_seqlens_q, cu_seqlens_k, alibi_slopes, *args, **kwargs) -> str:
     q_anno, kv_anno = gen_head_anno(query_states, key_states, value_states, head_pos=1)
     alibi_anno = f'{q_anno}' if isinstance(alibi_slopes, IRTensor) else '?'
-    return f'l {q_anno} hd^, l {kv_anno} hd^, l {kv_anno} vd^, e^, e^, {alibi_anno} -> l {q_anno} vd^'
+    output_anno = f'l {q_anno} vd^'
+    if kwargs.get("return_lse", False) or (len(args) > 9 and args[9]):
+        output_anno += ', ?'
+    return f'l {q_anno} hd^, l {kv_anno} hd^, l {kv_anno} vd^, e^, e^, {alibi_anno} -> {output_anno}'
 
 
 def input_gen_fn(node: IRDimops):
