@@ -582,10 +582,9 @@ class MergedScheduler:
                 fwd_all_nodes[fwd_idx] = fwd_entry
 
                 if fwd_lc.is_moe:
-                    fwd_routing_maps.append(fwd_lc.step_data.get('routing_map'))
-                    fwd_expert_probs.append(fwd_lc.step_data.get('gate_scores'))
-                    if not self.use_checkpoint:
-                        self._clear_step_data(fwd_lc)
+                    routing_map, expert_prob = self._take_moe_loss_inputs(fwd_lc)
+                    fwd_routing_maps.append(routing_map)
+                    fwd_expert_probs.append(expert_prob)
                 fwd_lc_list[fwd_idx] = None
 
                 fwd_idx += 1
@@ -610,10 +609,9 @@ class MergedScheduler:
                         fwd_h, fwd_lc, fwd_event)
                 fwd_all_nodes[fwd_idx] = fwd_entry
                 if fwd_lc.is_moe:
-                    fwd_routing_maps.append(fwd_lc.step_data.get('routing_map'))
-                    fwd_expert_probs.append(fwd_lc.step_data.get('gate_scores'))
-                    if not self.use_checkpoint:
-                        self._clear_step_data(fwd_lc)
+                    routing_map, expert_prob = self._take_moe_loss_inputs(fwd_lc)
+                    fwd_routing_maps.append(routing_map)
+                    fwd_expert_probs.append(expert_prob)
                 fwd_lc_list[fwd_idx] = None
                 fwd_idx += 1
 
@@ -871,6 +869,21 @@ class MergedScheduler:
         if step_data:
             step_data.clear()
 
+    def _take_moe_loss_inputs(self, lc):
+        step_data = getattr(lc, 'step_data', None)
+        if not step_data:
+            return None, None
+
+        routing_map = step_data.get('routing_map')
+        gate_scores = step_data.get('gate_scores')
+        if not self.use_checkpoint:
+            # Non-checkpointed backward uses ScheduleNode outputs/autograd saved
+            # tensors, not LayerCallables.step_data. Drop forward-only routing,
+            # dispatch metadata, DeepEP handles and aux count refs as soon as the
+            # loss-side tensors have been handed off.
+            step_data.clear()
+        return routing_map, gate_scores
+
     @staticmethod
     def _attn_backward_grads(attn_node, grad_h, grad_h_ln, grad_routing):
         if not attn_node.output_is_tuple():
@@ -920,10 +933,9 @@ class MergedScheduler:
                 entry = ('layer2', nodes)
 
             if lc.is_moe:
-                routing_maps.append(lc.step_data.get('routing_map'))
-                expert_probs.append(lc.step_data.get('gate_scores'))
-                if not self.use_checkpoint:
-                    self._clear_step_data(lc)
+                routing_map, expert_prob = self._take_moe_loss_inputs(lc)
+                routing_maps.append(routing_map)
+                expert_probs.append(expert_prob)
 
             all_nodes.append(entry)
             if isinstance(lc_list, list):
