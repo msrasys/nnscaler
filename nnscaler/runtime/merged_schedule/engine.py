@@ -89,6 +89,16 @@ def manual_sync_grads(parallel_module):
             bucket.reset()
 
 
+_WORKSPACE_HOLD_ATTR = '_nnscaler_workspace_hold'
+
+
+def _inherit_workspace_hold(dst, src):
+    hold = getattr(src, _WORKSPACE_HOLD_ATTR, None)
+    if hold is not None:
+        setattr(dst, _WORKSPACE_HOLD_ATTR, hold)
+    return dst
+
+
 def _make_viewless(t):
     """Ensure tensor has its own storage view (avoids grad-engine pitfalls)."""
     if isinstance(t, torch.Tensor) and t._base is not None:
@@ -233,7 +243,7 @@ class ScheduleNode:
                 if inp is None:
                     self.inputs.append(None)
                 elif isinstance(inp, torch.Tensor):
-                    d = inp.detach()
+                    d = _inherit_workspace_hold(inp.detach(), inp)
                     d.requires_grad = inp.requires_grad
                     self.inputs.append(d)
                 else:
