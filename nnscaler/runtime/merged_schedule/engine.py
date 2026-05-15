@@ -95,6 +95,15 @@ def _make_viewless(t):
     return t
 
 
+def _has_workspace_handles(t):
+    return bool(getattr(t, '_moe_workspace_handles', None))
+
+
+def _record_stream_if_needed(t, stream):
+    if isinstance(t, torch.Tensor) and not _has_workspace_handles(t):
+        t.record_stream(stream)
+
+
 class ScheduleNode:
     """A node that executes *forward_func* on *stream*, synchronized via *event*.
 
@@ -120,6 +129,7 @@ class ScheduleNode:
         free_input=False,
         name="schedule_node",
         checkpoint=False,
+        on_release=None,
     ):
         self.name = name
         self.forward_func = forward_func
@@ -128,6 +138,7 @@ class ScheduleNode:
         self.event = event
         self.free_input = free_input
         self.checkpoint = checkpoint
+        self.on_release = on_release
         self.inputs = None
         self.output = None
         self._output_is_tuple = False
@@ -144,8 +155,7 @@ class ScheduleNode:
         # Inputs may have been produced on a different stream; tell the allocator
         # that this stream will also read from their underlying storage.
         for inp in inputs:
-            if isinstance(inp, torch.Tensor):
-                inp.record_stream(self.stream)
+            _record_stream_if_needed(inp, self.stream)
 
         with self._stream_ctx(f"{self.name} fwd"):
             self.inputs = []
@@ -180,7 +190,7 @@ class ScheduleNode:
         if self.free_input:
             for inp in inputs:
                 if inp is not None:
-                    inp.record_stream(self.stream)
+                    _record_stream_if_needed(inp, self.stream)
                     inp.untyped_storage().resize_(0)
 
         return self.output
@@ -196,8 +206,7 @@ class ScheduleNode:
     def _backward(self, *output_grad, retain_graph=False):
         # Record cross-stream tensor usage for output_grad tensors.
         for g in output_grad:
-            if isinstance(g, torch.Tensor):
-                g.record_stream(self.stream)
+            _record_stream_if_needed(g, self.stream)
 
         with self._stream_ctx(f"{self.name} bwd"):
             if self.checkpoint:
@@ -228,6 +237,7 @@ class ScheduleNode:
                     self.backward_func(tuple(tensor_outputs), tuple(tensor_grads),
                                        retain_graph=retain_graph)
 
+        self._release_workspace_handles(output_grad, self.stream)
         grads = self.get_grad()
         self._release()
         return grads
@@ -281,8 +291,37 @@ class ScheduleNode:
                 self.event.record(self.stream)
 
     def _release(self):
+        self._release_workspace_handles(self.output, self.stream)
+        if self.on_release is not None:
+            self.on_release(self)
         self.inputs = None
         self.output = None
+
+    @staticmethod
+    def _release_workspace_handles(value, stream=None):
+        try:
+            from moe_overlap_workspace import release_workspace_handles
+        except ImportError:
+            release_workspace_handles = None
+        if release_workspace_handles is not None:
+            release_workspace_handles(value, stream=stream)
+            return
+        if isinstance(value, torch.Tensor):
+            handles = getattr(value, '_moe_workspace_handles', None)
+            if handles:
+                for handle in handles:
+                    release = getattr(handle, 'release', None)
+                    if release is not None:
+                        release(stream=stream)
+                value._moe_workspace_handles = []
+            return
+        if isinstance(value, (tuple, list)):
+            for item in value:
+                ScheduleNode._release_workspace_handles(item, stream)
+            return
+        if isinstance(value, dict):
+            for item in value.values():
+                ScheduleNode._release_workspace_handles(item, stream)
 
 
 @dataclass
@@ -666,10 +705,9 @@ class MergedScheduler:
         comp = get_comp_stream()
         if isinstance(grads, tuple):
             for t in grads:
-                if isinstance(t, torch.Tensor):
-                    t.record_stream(comp)
-        elif isinstance(grads, torch.Tensor):
-            grads.record_stream(comp)
+                _record_stream_if_needed(t, comp)
+        else:
+            _record_stream_if_needed(grads, comp)
 
     def _prepare_loss_aux_tensors(self, attn_node, lc, attn_out):
         aux_tensors = lc.step_data.get('_loss_aux_tensors')
@@ -955,9 +993,10 @@ class MergedScheduler:
         # --- Skip per-node event protocol during merged step ---
         # The default shared event serializes all nodes (COMP waits for COMM
         # and vice versa), preventing within-phase parallelism. By setting
-        # _skip_event=True, each node still switches to its own stream and
-        # does record_stream for allocator safety, but does not wait/record
-        # the shared event. Cross-stream dependencies are enforced explicitly
+        # _skip_event=True, each node still switches to its own stream.
+        # Non-workspace tensors still use record_stream for allocator safety,
+        # while workspace tensors rely on explicit slot-release events.
+        # The shared event is not waited/recorded here; dependencies are enforced explicitly
         # via _cross_stream_barrier() at phase boundaries.
         all_nodes = (*bwd_nodes, *fwd_nodes)
         for n in all_nodes:
