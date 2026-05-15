@@ -96,6 +96,18 @@ def _make_viewless(t):
     return t
 
 
+def _detach_result_tuple(value):
+    if isinstance(value, tuple):
+        return tuple(_detach_result_tuple(v) for v in value)
+    if isinstance(value, list):
+        return [_detach_result_tuple(v) for v in value]
+    if isinstance(value, dict):
+        return {k: _detach_result_tuple(v) for k, v in value.items()}
+    if isinstance(value, torch.Tensor):
+        return value.detach()
+    return value
+
+
 class _DeferredCudaReleaseQueue:
     """Keep CUDA tensor references alive until stream work finishes."""
 
@@ -244,6 +256,8 @@ class ScheduleNode:
                 self._set_output_metadata(data)
 
             self.output = data
+            if not self.checkpoint:
+                self.forward_func = None
 
         if self.free_input:
             resize_storages = tuple(
@@ -355,10 +369,18 @@ class ScheduleNode:
                 self.event.record(self.stream)
 
     def _release(self, *extra_payloads):
+        aux_tensors = getattr(self, 'loss_aux_tensors', None)
+        aux_step_data = getattr(self, 'loss_aux_step_data', None)
         _defer_cuda_release(
-            self.stream, self.inputs, self.output, *extra_payloads)
+            self.stream, self.inputs, self.output,
+            aux_tensors, aux_step_data, *extra_payloads)
         self.inputs = None
         self.output = None
+        self.forward_func = None
+        self.backward_func = None
+        for attr in ('loss_aux_tensors', 'loss_aux_step_data'):
+            if hasattr(self, attr):
+                delattr(self, attr)
 
 
 @dataclass
@@ -450,6 +472,7 @@ class MergedScheduler:
         """
         num_mbs = len(samples)
         assert num_mbs >= 2, "merged FWD-BWD requires at least 2 micro-batches"
+        samples = list(samples)
 
         # Ensure COMP/COMM streams see all prior default-stream work
         # (optimizer.step, zero_grad from the previous training step).
@@ -476,6 +499,7 @@ class MergedScheduler:
 
         h0, all_nodes_0, rmaps_0, eprobs_0 = self._forward_all_layers(
             h0, lc_list_0, events[0])
+        del lc_list_0
 
         # Sync COMM→COMP: last forward node may be on COMM (MoE combine),
         # but loss_node runs on COMP with a fresh event (no wait).
@@ -483,11 +507,12 @@ class MergedScheduler:
 
         loss_node_0, output_info_0 = loss_fn(h0, samples[0], rmaps_0, eprobs_0)
         loss_0 = loss_node_0.forward((h0,))
-        results[0] = output_info_0['output_tuple']
+        results[0] = _detach_result_tuple(output_info_0['output_tuple'])
 
         with torch.cuda.stream(get_comp_stream()):
             loss_grad = torch.ones_like(loss_0)
-        del h0, rmaps_0, eprobs_0, output_info_0
+        samples[0] = None
+        del h0, loss_0, rmaps_0, eprobs_0, output_info_0
 
         prev_all_nodes = all_nodes_0
         prev_loss_node = loss_node_0
@@ -559,6 +584,9 @@ class MergedScheduler:
                 if fwd_lc.is_moe:
                     fwd_routing_maps.append(fwd_lc.step_data.get('routing_map'))
                     fwd_expert_probs.append(fwd_lc.step_data.get('gate_scores'))
+                    if not self.use_checkpoint:
+                        self._clear_step_data(fwd_lc)
+                fwd_lc_list[fwd_idx] = None
 
                 fwd_idx += 1
                 bwd_idx -= 1
@@ -584,6 +612,9 @@ class MergedScheduler:
                 if fwd_lc.is_moe:
                     fwd_routing_maps.append(fwd_lc.step_data.get('routing_map'))
                     fwd_expert_probs.append(fwd_lc.step_data.get('gate_scores'))
+                    if not self.use_checkpoint:
+                        self._clear_step_data(fwd_lc)
+                fwd_lc_list[fwd_idx] = None
                 fwd_idx += 1
 
             while bwd_idx >= 0:
@@ -620,14 +651,16 @@ class MergedScheduler:
             fwd_loss_node, fwd_output_info = loss_fn(
                 fwd_h, fwd_sample, fwd_routing_maps, fwd_expert_probs)
             fwd_loss = fwd_loss_node.forward((fwd_h,))
-            results[mb_i + 1] = fwd_output_info['output_tuple']
+            results[mb_i + 1] = _detach_result_tuple(fwd_output_info['output_tuple'])
 
             prev_all_nodes = fwd_all_nodes
             prev_loss_node = fwd_loss_node
 
             if mb_i == 0:
-                del all_nodes_0, loss_node_0, loss_0
-            del fwd_h, fwd_loss, fwd_routing_maps, fwd_expert_probs
+                del all_nodes_0, loss_node_0
+            samples[mb_i + 1] = None
+            del fwd_h, fwd_loss, fwd_output_info, fwd_routing_maps, fwd_expert_probs
+            del fwd_sample
             del fwd_lc_list
             self._drain_release_queue()
 
@@ -833,6 +866,12 @@ class MergedScheduler:
             lc.step_data.update(prepared_step_data)
 
     @staticmethod
+    def _clear_step_data(lc):
+        step_data = getattr(lc, 'step_data', None)
+        if step_data:
+            step_data.clear()
+
+    @staticmethod
     def _attn_backward_grads(attn_node, grad_h, grad_h_ln, grad_routing):
         if not attn_node.output_is_tuple():
             return grad_h
@@ -883,8 +922,12 @@ class MergedScheduler:
             if lc.is_moe:
                 routing_maps.append(lc.step_data.get('routing_map'))
                 expert_probs.append(lc.step_data.get('gate_scores'))
+                if not self.use_checkpoint:
+                    self._clear_step_data(lc)
 
             all_nodes.append(entry)
+            if isinstance(lc_list, list):
+                lc_list[si] = None
 
         return h, all_nodes, routing_maps, expert_probs
 
