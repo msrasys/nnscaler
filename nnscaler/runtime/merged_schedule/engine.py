@@ -426,14 +426,17 @@ class MergedScheduler:
         self._use_4node = True
 
         # Async overlap launches COMM and COMP ops from separate CPU
-        # threads so kernel launches can interleave. Memory-first mode disables
-        # that pool and orders backward releases before forward allocations.
+        # threads so kernel launches can interleave. Memory-first mode can
+        # selectively order backward releases before forward allocations.
         _async_on = os.environ.get('ASYNC_4PHASE', '1') not in ('0', '')
-        self._memory_first = os.environ.get(
-            'NNSCALER_MERGED_SCHEDULE_MEMORY_FIRST', '0') not in ('0', '')
+        memory_first_mode = os.environ.get(
+            'NNSCALER_MERGED_SCHEDULE_MEMORY_FIRST', '0').lower()
+        self._memory_first_mode = memory_first_mode
+        self._memory_first = memory_first_mode not in ('0', '', 'false', 'none')
+        self._memory_first_full = memory_first_mode in ('1', 'true', 'full', 'all')
         self._async_pool = (
             ThreadPoolExecutor(max_workers=1, thread_name_prefix='moe-overlap')
-            if _async_on and not self._memory_first else None
+            if _async_on else None
         )
 
         # Pre-allocate CUDA events for cross-stream synchronization.
@@ -782,6 +785,17 @@ class MergedScheduler:
         """Block until deferred refs are dropped before launching forward allocs."""
         _drain_deferred_cuda_releases(blocking=True)
 
+    def _memory_first_phase(self, phase):
+        if not self._memory_first:
+            return False
+        if self._memory_first_full:
+            return True
+        if self._memory_first_mode in ('selective', 'heavy', 'expert'):
+            return phase in (2, 3)
+        if self._memory_first_mode in ('dispatch', 'comm'):
+            return phase == 2
+        return phase in (2, 3)
+
     def _prepare_loss_aux_tensors(self, attn_node, lc, attn_out):
         aux_tensors = lc.step_data.get('_loss_aux_tensors')
         if aux_tensors is None:
@@ -1106,15 +1120,20 @@ class MergedScheduler:
             # Initial sync: COMP→COMM so COMM can read grad_h (from loss_bwd on COMP)
             self._sync_comp_to_comm()
 
+            memory_first_p1 = self._memory_first_phase(1)
+            memory_first_p2 = self._memory_first_phase(2)
+            memory_first_p3 = self._memory_first_phase(3)
+            memory_first_p4 = self._memory_first_phase(4)
+
             # Phase 1: COMM(b_combine) || COMP(f_attn_router)
             # b_combine is pure communication (shared expert merged into expert).
-            if pool is not None:
+            if pool is not None and not memory_first_p1:
                 fut_combine = pool.submit(bwd_combine.backward, grad_h)
                 fwd_attn_out = fwd_attn.forward((fwd_h,))
                 combine_grads = fut_combine.result()
             else:
                 combine_grads = bwd_combine.backward(grad_h)
-                if self._memory_first:
+                if memory_first_p1:
                     self._memory_first_release_point()
                 fwd_attn_out = fwd_attn.forward((fwd_h,))
             fwd_h_residual, fwd_h_ln, fwd_routing_probs = fwd_attn_out[:3]
@@ -1127,12 +1146,12 @@ class MergedScheduler:
             # Phase 2: COMM(f_dispatch) || COMP(b_expert)
             # expert backward includes shared expert backward (both on COMP).
             # combine_grads: (grad_expert_outs, grad_h_residual, grad_shared_expert_out)
-            if pool is not None:
+            if pool is not None and not memory_first_p2:
                 fut_dispatch = pool.submit(fwd_dispatch.forward, (fwd_h_ln, fwd_routing_probs))
                 expert_grads = bwd_expert.backward((combine_grads[0], combine_grads[2]))
                 fwd_dispatch_out = fut_dispatch.result()
             else:
-                if self._memory_first:
+                if memory_first_p2:
                     expert_grads = bwd_expert.backward((combine_grads[0], combine_grads[2]))
                     self._memory_first_release_point()
                     fwd_dispatch_out = fwd_dispatch.forward((fwd_h_ln, fwd_routing_probs))
@@ -1147,13 +1166,13 @@ class MergedScheduler:
 
             # Phase 3: COMM(b_dispatch) || COMP(f_expert)
             # expert forward includes shared expert (takes h_ln, returns tuple).
-            if pool is not None:
+            if pool is not None and not memory_first_p3:
                 fut_dispatch_bwd = pool.submit(bwd_dispatch.backward, (expert_grads[0], expert_grads[1]))
                 fwd_expert_result = fwd_expert.forward((*fwd_dispatch_out, fwd_h_ln))
                 dispatch_grads = fut_dispatch_bwd.result()
             else:
                 dispatch_grads = bwd_dispatch.backward((expert_grads[0], expert_grads[1]))
-                if self._memory_first:
+                if memory_first_p3:
                     self._memory_first_release_point()
                 fwd_expert_result = fwd_expert.forward((*fwd_dispatch_out, fwd_h_ln))
             fwd_expert_out, fwd_shared_expert_out = fwd_expert_result
@@ -1163,7 +1182,7 @@ class MergedScheduler:
             self._cross_stream_barrier(slot=2)
 
             # Phase 4: COMM(f_combine) || COMP(b_attn)
-            if pool is not None:
+            if pool is not None and not memory_first_p4:
                 fut_combine_fwd = pool.submit(fwd_combine.forward,
                                               (fwd_expert_out, fwd_h_residual, fwd_shared_expert_out))
                 self._drain_release_queue()
@@ -1176,7 +1195,7 @@ class MergedScheduler:
                     combine_grads, grad_h_ln_total, attn_grads)
                 fwd_h_out = fut_combine_fwd.result()
             else:
-                if self._memory_first:
+                if memory_first_p4:
                     self._memory_first_release_point()
                     grad_h_ln_total = dispatch_grads[0] + expert_grads[2]
                     attn_grads = self._attn_backward_grads(
