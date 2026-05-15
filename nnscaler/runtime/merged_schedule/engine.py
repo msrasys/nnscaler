@@ -425,13 +425,15 @@ class MergedScheduler:
         self.use_checkpoint = use_checkpoint
         self._use_4node = True
 
-        # Async overlap: launch COMM and COMP ops from separate CPU threads
-        # so their kernel launches can interleave, enabling true GPU overlap.
-        # Controlled by ASYNC_4PHASE env var (default=1, set 0 to disable).
+        # Async overlap launches COMM and COMP ops from separate CPU
+        # threads so kernel launches can interleave. Memory-first mode disables
+        # that pool and orders backward releases before forward allocations.
         _async_on = os.environ.get('ASYNC_4PHASE', '1') not in ('0', '')
+        self._memory_first = os.environ.get(
+            'NNSCALER_MERGED_SCHEDULE_MEMORY_FIRST', '0') not in ('0', '')
         self._async_pool = (
             ThreadPoolExecutor(max_workers=1, thread_name_prefix='moe-overlap')
-            if _async_on else None
+            if _async_on and not self._memory_first else None
         )
 
         # Pre-allocate CUDA events for cross-stream synchronization.
@@ -776,6 +778,10 @@ class MergedScheduler:
         """Opportunistically release tensors whose stream events completed."""
         _drain_deferred_cuda_releases(blocking=False)
 
+    def _memory_first_release_point(self):
+        """Block until deferred refs are dropped before launching forward allocs."""
+        _drain_deferred_cuda_releases(blocking=True)
+
     def _prepare_loss_aux_tensors(self, attn_node, lc, attn_out):
         aux_tensors = lc.step_data.get('_loss_aux_tensors')
         if aux_tensors is None:
@@ -1080,7 +1086,7 @@ class MergedScheduler:
         fwd_nodes = self._create_nodes_4(fwd_lc, fwd_event)
         fwd_attn, fwd_dispatch, fwd_expert, fwd_combine = fwd_nodes
 
-        pool = self._async_pool  # None in sequential mode
+        pool = self._async_pool  # None in sequential or memory-first mode
 
         # --- Skip per-node event protocol during merged step ---
         # The default shared event serializes all nodes (COMP waits for COMM
@@ -1108,6 +1114,8 @@ class MergedScheduler:
                 combine_grads = fut_combine.result()
             else:
                 combine_grads = bwd_combine.backward(grad_h)
+                if self._memory_first:
+                    self._memory_first_release_point()
                 fwd_attn_out = fwd_attn.forward((fwd_h,))
             fwd_h_residual, fwd_h_ln, fwd_routing_probs = fwd_attn_out[:3]
             self._prepare_loss_aux_tensors(fwd_attn, fwd_lc, fwd_attn_out)
@@ -1124,8 +1132,13 @@ class MergedScheduler:
                 expert_grads = bwd_expert.backward((combine_grads[0], combine_grads[2]))
                 fwd_dispatch_out = fut_dispatch.result()
             else:
-                fwd_dispatch_out = fwd_dispatch.forward((fwd_h_ln, fwd_routing_probs))
-                expert_grads = bwd_expert.backward((combine_grads[0], combine_grads[2]))
+                if self._memory_first:
+                    expert_grads = bwd_expert.backward((combine_grads[0], combine_grads[2]))
+                    self._memory_first_release_point()
+                    fwd_dispatch_out = fwd_dispatch.forward((fwd_h_ln, fwd_routing_probs))
+                else:
+                    fwd_dispatch_out = fwd_dispatch.forward((fwd_h_ln, fwd_routing_probs))
+                    expert_grads = bwd_expert.backward((combine_grads[0], combine_grads[2]))
             # expert_grads: (grad_sorted_tokens, grad_sorted_probs, grad_h_ln)
 
             # Phase boundary: Phase 3 COMP needs COMM output (dispatch_out),
@@ -1140,6 +1153,8 @@ class MergedScheduler:
                 dispatch_grads = fut_dispatch_bwd.result()
             else:
                 dispatch_grads = bwd_dispatch.backward((expert_grads[0], expert_grads[1]))
+                if self._memory_first:
+                    self._memory_first_release_point()
                 fwd_expert_result = fwd_expert.forward((*fwd_dispatch_out, fwd_h_ln))
             fwd_expert_out, fwd_shared_expert_out = fwd_expert_result
 
@@ -1161,15 +1176,28 @@ class MergedScheduler:
                     combine_grads, grad_h_ln_total, attn_grads)
                 fwd_h_out = fut_combine_fwd.result()
             else:
-                fwd_h_out = fwd_combine.forward((fwd_expert_out, fwd_h_residual, fwd_shared_expert_out))
-                self._drain_release_queue()
-                grad_h_ln_total = dispatch_grads[0] + expert_grads[2]
-                attn_grads = self._attn_backward_grads(
-                    bwd_attn, combine_grads[1], grad_h_ln_total, dispatch_grads[1])
-                grad_x = bwd_attn.backward(attn_grads)
-                _defer_cuda_release(
-                    get_comp_stream(), dispatch_grads, expert_grads,
-                    combine_grads, grad_h_ln_total, attn_grads)
+                if self._memory_first:
+                    self._memory_first_release_point()
+                    grad_h_ln_total = dispatch_grads[0] + expert_grads[2]
+                    attn_grads = self._attn_backward_grads(
+                        bwd_attn, combine_grads[1], grad_h_ln_total, dispatch_grads[1])
+                    grad_x = bwd_attn.backward(attn_grads)
+                    _defer_cuda_release(
+                        get_comp_stream(), dispatch_grads, expert_grads,
+                        combine_grads, grad_h_ln_total, attn_grads)
+                    self._memory_first_release_point()
+                    fwd_h_out = fwd_combine.forward((
+                        fwd_expert_out, fwd_h_residual, fwd_shared_expert_out))
+                else:
+                    fwd_h_out = fwd_combine.forward((fwd_expert_out, fwd_h_residual, fwd_shared_expert_out))
+                    self._drain_release_queue()
+                    grad_h_ln_total = dispatch_grads[0] + expert_grads[2]
+                    attn_grads = self._attn_backward_grads(
+                        bwd_attn, combine_grads[1], grad_h_ln_total, dispatch_grads[1])
+                    grad_x = bwd_attn.backward(attn_grads)
+                    _defer_cuda_release(
+                        get_comp_stream(), dispatch_grads, expert_grads,
+                        combine_grads, grad_h_ln_total, attn_grads)
 
             self._restore_loss_aux_step_data(fwd_attn, fwd_lc)
 
