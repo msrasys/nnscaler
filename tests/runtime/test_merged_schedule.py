@@ -191,8 +191,9 @@ def _run_sequential(model, samples, use_aux_loss=False):
 
 
 def _run_merged(model, samples, use_checkpoint=False, use_aux_loss=False,
-                early_attn_memory_release=False):
+                early_attn_memory_release=False, async_4phase=False):
     model.zero_grad(set_to_none=True)
+    os.environ['ASYNC_4PHASE'] = '1' if async_4phase else '0'
     set_streams()
     model.set_stream_checks(True)
     scheduler = _CountingMergedScheduler(
@@ -258,7 +259,6 @@ def _run_merged(model, samples, use_checkpoint=False, use_aux_loss=False,
 
 
 def _worker():
-    os.environ['ASYNC_4PHASE'] = '0'
     local_rank = int(os.environ['LOCAL_RANK'])
     dist.init_process_group(backend='nccl')
     torch.cuda.set_device(local_rank)
@@ -270,13 +270,15 @@ def _worker():
         torch.manual_seed(10)
         case_results = []
         cases = [
-            (False, False, False, 10),
-            (True, False, False, 11),
-            (False, True, False, 12),
-            (True, True, False, 11),
-            (False, True, True, 13),
+            (False, False, False, False, 10),
+            (True, False, False, False, 11),
+            (False, True, False, False, 12),
+            (True, True, False, False, 11),
+            (False, True, True, False, 13),
+            (False, True, False, True, 14),
         ]
-        for use_checkpoint, use_aux_loss, early_attn_memory_release, case_seed in cases:
+        for (use_checkpoint, use_aux_loss, early_attn_memory_release,
+             async_4phase, case_seed) in cases:
             torch.manual_seed(case_seed)
             sequential_model = _FakeMoEModel(use_aux_loss=use_aux_loss).to(device)
             merged_model = copy.deepcopy(sequential_model).to(device)
@@ -288,11 +290,13 @@ def _worker():
                 merged_model, samples,
                 use_checkpoint=use_checkpoint,
                 use_aux_loss=use_aux_loss,
-                early_attn_memory_release=early_attn_memory_release)
+                early_attn_memory_release=early_attn_memory_release,
+                async_4phase=async_4phase)
 
             case_label = (
                 f'use_checkpoint={use_checkpoint}, use_aux_loss={use_aux_loss}, '
-                f'early_attn_memory_release={early_attn_memory_release}'
+                f'early_attn_memory_release={early_attn_memory_release}, '
+                f'async_4phase={async_4phase}'
             )
             torch.testing.assert_close(
                 merged_losses, sequential_losses, rtol=1e-5, atol=1e-5,
@@ -318,6 +322,7 @@ def _worker():
                 'use_checkpoint': use_checkpoint,
                 'use_aux_loss': use_aux_loss,
                 'early_attn_memory_release': early_attn_memory_release,
+                'async_4phase': async_4phase,
                 'merged_4phase_calls': merged_4phase_calls,
                 'stream_counts': stream_counts,
             })
@@ -337,10 +342,11 @@ def test_merged_scheduler_fake_moe_matches_sequential_gnorm():
     results = launch_torchrun(2, _worker)
     assert len(results) == 2
     for result in results.values():
-        assert len(result['cases']) == 5
-        assert result['cases'][-2]['use_checkpoint']
+        assert len(result['cases']) == 6
+        assert result['cases'][-3]['use_checkpoint']
+        assert result['cases'][-2]['early_attn_memory_release']
         assert result['cases'][-1]['use_aux_loss']
-        assert result['cases'][-1]['early_attn_memory_release']
+        assert result['cases'][-1]['async_4phase']
         for case in result['cases']:
             assert case['merged_4phase_calls'] == 2
             assert case['stream_counts']['comp'] > 0

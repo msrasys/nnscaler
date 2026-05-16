@@ -30,6 +30,7 @@ import torch
 from torch.autograd import Variable
 
 import nnscaler
+from nnscaler.runtime import device as runtime_device
 
 
 _logger = logging.getLogger(__name__)
@@ -104,6 +105,71 @@ def _detach_for_layer_state(t):
     return detached
 
 
+_TENSOR_STREAM_ATTR = '_nnscaler_merged_schedule_stream'
+
+
+def _iter_tensors(value):
+    if isinstance(value, torch.Tensor):
+        yield value
+    elif isinstance(value, (tuple, list)):
+        for item in value:
+            yield from _iter_tensors(item)
+    elif isinstance(value, dict):
+        for item in value.values():
+            yield from _iter_tensors(item)
+
+
+def _same_stream(lhs, rhs):
+    return lhs is rhs or getattr(lhs, 'cuda_stream', None) == getattr(rhs, 'cuda_stream', None)
+
+
+def _set_tensor_stream(tensor, stream):
+    try:
+        setattr(tensor, _TENSOR_STREAM_ATTR, stream)
+    except Exception:
+        pass
+
+
+def _get_tensor_stream(tensor):
+    stream = getattr(tensor, _TENSOR_STREAM_ATTR, None)
+    if stream is not None:
+        return stream
+    base = getattr(tensor, '_base', None)
+    if isinstance(base, torch.Tensor):
+        return getattr(base, _TENSOR_STREAM_ATTR, None)
+    return None
+
+
+def _copy_tensor_stream(src, dst):
+    stream = _get_tensor_stream(src)
+    if stream is not None:
+        _set_tensor_stream(dst, stream)
+
+
+def _mark_tensors_stream(value, stream):
+    for tensor in _iter_tensors(value):
+        if _get_tensor_stream(tensor) is None:
+            _set_tensor_stream(tensor, stream)
+
+
+def _order_cross_stream_tensors_until_done(value, stream):
+    producer_streams = []
+    seen = set()
+    for tensor in _iter_tensors(value):
+        producer_stream = _get_tensor_stream(tensor)
+        if producer_stream is None or _same_stream(producer_stream, stream):
+            continue
+        stream_key = getattr(producer_stream, 'cuda_stream', id(producer_stream))
+        if stream_key not in seen:
+            producer_streams.append(producer_stream)
+            seen.add(stream_key)
+    for producer_stream in producer_streams:
+        runtime_device.wait_stream_for_release(
+            producer_stream=producer_stream,
+            consumer_stream=stream,
+        )
+
+
 class ScheduleNode:
     """A node that executes *forward_func* on *stream*, synchronized via *event*.
 
@@ -149,13 +215,6 @@ class ScheduleNode:
         return self._forward(*inputs)
 
     def _forward(self, *inputs):
-        # Record cross-stream tensor usage for CUDA caching allocator safety.
-        # Inputs may have been produced on a different stream; tell the allocator
-        # that this stream will also read from their underlying storage.
-        for inp in inputs:
-            if isinstance(inp, torch.Tensor):
-                inp.record_stream(self.stream)
-
         with self._stream_ctx(f"{self.name} fwd"):
             self.inputs = []
             for inp in inputs:
@@ -163,6 +222,7 @@ class ScheduleNode:
                     self.inputs.append(None)
                 elif isinstance(inp, torch.Tensor):
                     d = inp.detach()
+                    _copy_tensor_stream(inp, d)
                     d.requires_grad = inp.requires_grad
                     self.inputs.append(d)
                 else:
@@ -184,6 +244,7 @@ class ScheduleNode:
                 data = self.forward_func(*self.inputs)
                 self._set_output_metadata(data)
 
+            _mark_tensors_stream(data, self.stream)
             self.output = data
 
         self._free_forward_inputs(inputs)
@@ -199,11 +260,6 @@ class ScheduleNode:
         return self._backward(*output_grad, retain_graph=retain_graph)
 
     def _backward(self, *output_grad, retain_graph=False):
-        # Record cross-stream tensor usage for output_grad tensors.
-        for g in output_grad:
-            if isinstance(g, torch.Tensor):
-                g.record_stream(self.stream)
-
         with self._stream_ctx(f"{self.name} bwd"):
             if self.checkpoint:
                 recomputed = self.forward_func(*self.inputs)
@@ -233,7 +289,9 @@ class ScheduleNode:
                     self.backward_func(tuple(tensor_outputs), tuple(tensor_grads),
                                        retain_graph=retain_graph)
 
+        _order_cross_stream_tensors_until_done(output_grad, self.stream)
         grads = self.get_grad()
+        _mark_tensors_stream(grads, self.stream)
         self._release()
         return grads
 
@@ -298,6 +356,7 @@ class ScheduleNode:
             torch.cuda.nvtx.range_push(name)
         try:
             with torch.cuda.stream(self.stream):
+                runtime_device.prune_deferred_releases()
                 yield
         finally:
             if name:
@@ -306,6 +365,7 @@ class ScheduleNode:
                 self.event.record(self.stream)
 
     def _release(self):
+        _order_cross_stream_tensors_until_done((self.inputs, self.output), self.stream)
         self.inputs = None
         self.output = None
 
@@ -375,6 +435,7 @@ class MergedScheduler:
 
     def shutdown(self):
         """Release scheduler-owned CPU worker resources."""
+        runtime_device.prune_deferred_releases()
         pool = self._async_pool
         if pool is not None:
             self._async_pool = None
@@ -401,6 +462,7 @@ class MergedScheduler:
         """
         num_mbs = len(samples)
         assert num_mbs >= 2, "merged FWD-BWD requires at least 2 micro-batches"
+        runtime_device.prune_deferred_releases()
 
         # Ensure COMP/COMM streams see all prior default-stream work
         # (optimizer.step, zero_grad from the previous training step).
@@ -619,6 +681,7 @@ class MergedScheduler:
                 )
 
         _embed_h_list.clear()
+        runtime_device.prune_deferred_releases()
 
         del prev_all_nodes, prev_loss_node
 
@@ -689,15 +752,9 @@ class MergedScheduler:
         get_comm_stream().wait_event(comp_evt)
         get_comp_stream().wait_event(comm_evt)
 
-    def _record_for_comp(self, grads):
-        """Record COMM-produced tensors for safe use on COMP stream."""
-        comp = get_comp_stream()
-        if isinstance(grads, tuple):
-            for t in grads:
-                if isinstance(t, torch.Tensor):
-                    t.record_stream(comp)
-        elif isinstance(grads, torch.Tensor):
-            grads.record_stream(comp)
+    def _order_cross_stream_for_comp(self, tensors):
+        """Order producer streams after queued COMP work that uses tensors."""
+        _order_cross_stream_tensors_until_done(tensors, get_comp_stream())
 
     @staticmethod
     def _prepare_combine_state(lc, h_residual=None, shared_expert_out=None):
@@ -722,10 +779,9 @@ class MergedScheduler:
             shared_expert_out.grad if isinstance(shared_expert_out, torch.Tensor) else None
         )
 
-        current_stream = torch.cuda.current_stream()
-        for tensor in (residual, shared_expert_out):
-            if isinstance(tensor, torch.Tensor):
-                tensor.record_stream(current_stream)
+        _mark_tensors_stream((grad_residual, grad_shared), combine_node.stream)
+        _order_cross_stream_tensors_until_done(
+            (residual, shared_expert_out), combine_node.stream)
 
         return grad_expert_out, grad_residual, grad_shared
 
@@ -945,15 +1001,14 @@ class MergedScheduler:
             dispatch_grads = dispatch_n.backward((expert_grads[0], expert_grads[1]))
 
             self._sync_comm_to_comp()
-            # Record COMM-produced grads for COMP-side addition and attn backward.
-            self._record_for_comp(dispatch_grads)
-            self._record_for_comp(combine_grads)
 
             grad_h_ln_total = dispatch_grads[0] + expert_grads[2]
 
             attn_grads = self._attn_backward_grads(
                 attn_n, combine_grads[1], grad_h_ln_total, dispatch_grads[1])
             grad_x = attn_n.backward(attn_grads)
+            self._order_cross_stream_for_comp(dispatch_grads)
+            self._order_cross_stream_for_comp(combine_grads)
 
         return grad_x
 
@@ -1016,10 +1071,9 @@ class MergedScheduler:
         # --- Skip per-node event protocol during merged step ---
         # The default shared event serializes all nodes (COMP waits for COMM
         # and vice versa), preventing within-phase parallelism. By setting
-        # _skip_event=True, each node still switches to its own stream and
-        # does record_stream for allocator safety, but does not wait/record
-        # the shared event. Cross-stream dependencies are enforced explicitly
-        # via _cross_stream_barrier() at phase boundaries.
+        # _skip_event=True, each node still switches to its own stream, but
+        # does not wait/record the shared event. Cross-stream dependencies are
+        # enforced explicitly via _cross_stream_barrier() at phase boundaries.
         all_nodes = (*bwd_nodes, *fwd_nodes)
         for n in all_nodes:
             n._skip_event = True
@@ -1077,12 +1131,12 @@ class MergedScheduler:
                     dispatch_grads = bwd_dispatch.backward((expert_grads[0], expert_grads[1]))
 
                 self._sync_comm_to_comp()
-                self._record_for_comp(dispatch_grads)
-                self._record_for_comp(combine_grads)
                 grad_h_ln_total = dispatch_grads[0] + expert_grads[2]
                 attn_grads = self._attn_backward_grads(
                     bwd_attn, combine_grads[1], grad_h_ln_total, dispatch_grads[1])
                 grad_x = bwd_attn.backward(attn_grads)
+                self._order_cross_stream_for_comp(dispatch_grads)
+                self._order_cross_stream_for_comp(combine_grads)
 
                 fwd_expert_result = fwd_expert.forward((*fwd_dispatch_out, fwd_h_ln))
                 fwd_expert_out, fwd_shared_expert_out = fwd_expert_result
@@ -1123,21 +1177,21 @@ class MergedScheduler:
             # Phase 4: COMM(f_combine) || COMP(b_attn)
             if pool is not None:
                 fut_combine_fwd = pool.submit(fwd_combine.forward, (fwd_expert_out,))
-                self._record_for_comp(dispatch_grads)
-                self._record_for_comp(combine_grads)
                 grad_h_ln_total = dispatch_grads[0] + expert_grads[2]
                 attn_grads = self._attn_backward_grads(
                     bwd_attn, combine_grads[1], grad_h_ln_total, dispatch_grads[1])
                 grad_x = bwd_attn.backward(attn_grads)
+                self._order_cross_stream_for_comp(dispatch_grads)
+                self._order_cross_stream_for_comp(combine_grads)
                 fwd_h_out = fut_combine_fwd.result()
             else:
                 fwd_h_out = fwd_combine.forward((fwd_expert_out,))
-                self._record_for_comp(dispatch_grads)
-                self._record_for_comp(combine_grads)
                 grad_h_ln_total = dispatch_grads[0] + expert_grads[2]
                 attn_grads = self._attn_backward_grads(
                     bwd_attn, combine_grads[1], grad_h_ln_total, dispatch_grads[1])
                 grad_x = bwd_attn.backward(attn_grads)
+                self._order_cross_stream_for_comp(dispatch_grads)
+                self._order_cross_stream_for_comp(combine_grads)
 
             self._restore_loss_aux_step_data(fwd_attn, fwd_lc)
 

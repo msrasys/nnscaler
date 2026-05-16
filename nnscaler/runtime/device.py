@@ -10,12 +10,79 @@ import torch
 import os
 import logging
 import datetime
+import threading
 
 from nnscaler.flags import CompileFlag
 from nnscaler.utils import is_running_distributed
 
 _logger = logging.getLogger(__name__)
 _LARGE_TIMEOUT = datetime.timedelta(seconds=21600)
+_release_wait_events = []
+_deferred_release_lock = threading.Lock()
+
+
+def prune_deferred_releases():
+    """Drop completed release-ordering events."""
+    with _deferred_release_lock:
+        if not _release_wait_events:
+            return
+        _release_wait_events[:] = [
+            event for event in _release_wait_events
+            if not event.query()
+        ]
+
+
+def flush_deferred_releases():
+    """Synchronize pending release-ordering events."""
+    with _deferred_release_lock:
+        if not _release_wait_events:
+            return
+        for event in _release_wait_events:
+            event.synchronize()
+        _release_wait_events.clear()
+
+
+def _resolve_stream(stream, stream_name, *, default_current):
+    if stream is not None:
+        return stream
+    if stream_name is not None:
+        return DeviceGroup().get_stream(stream_name)
+    if default_current:
+        return torch.cuda.current_stream()
+    return torch.cuda.default_stream()
+
+
+def _same_stream(lhs, rhs):
+    return lhs is rhs or lhs.cuda_stream == rhs.cuda_stream
+
+
+def wait_stream_for_release(*,
+                            producer_stream=None,
+                            producer_stream_name=None,
+                            consumer_stream=None,
+                            consumer_stream_name=None):
+    """Order producer reuse after queued consumer work that uses a tensor.
+
+    This avoids broad Tensor.record_stream() use while still preventing a
+    producer stream from reusing storage before a consumer stream has finished
+    its queued work.
+    """
+    producer = _resolve_stream(
+        producer_stream, producer_stream_name, default_current=False)
+    consumer = _resolve_stream(
+        consumer_stream, consumer_stream_name, default_current=True)
+    if _same_stream(producer, consumer):
+        return
+
+    prune_deferred_releases()
+
+    event = torch.cuda.Event()
+    event.record(consumer)
+    producer.wait_event(event)
+    if event.query():
+        return
+    with _deferred_release_lock:
+        _release_wait_events.append(event)
 
 
 class _DeviceGroup:
