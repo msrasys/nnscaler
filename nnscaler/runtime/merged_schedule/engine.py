@@ -771,8 +771,12 @@ class MergedScheduler:
 
         grad_expert_out = combine_grads[0] if isinstance(combine_grads, tuple) else combine_grads
         step_data = getattr(combine_node, 'step_data', None) or {}
-        residual = step_data.pop('_combine_residual', None)
-        shared_expert_out = step_data.pop('_combine_shared_expert_out', None)
+        backward_tensors = step_data.pop('_combine_backward_tensors', None)
+        if backward_tensors is not None:
+            residual, shared_expert_out = backward_tensors
+        else:
+            residual = step_data.pop('_combine_residual', None)
+            shared_expert_out = step_data.pop('_combine_shared_expert_out', None)
 
         grad_residual = residual.grad if isinstance(residual, torch.Tensor) else None
         grad_shared = (
