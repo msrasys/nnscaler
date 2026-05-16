@@ -95,6 +95,15 @@ def _make_viewless(t):
     return t
 
 
+def _detach_for_layer_state(t):
+    if t is None:
+        return None
+    t = _make_viewless(t)
+    detached = t.detach()
+    detached.requires_grad = t.requires_grad
+    return detached
+
+
 class ScheduleNode:
     """A node that executes *forward_func* on *stream*, synchronized via *event*.
 
@@ -177,11 +186,7 @@ class ScheduleNode:
 
             self.output = data
 
-        if self.free_input:
-            for inp in inputs:
-                if inp is not None:
-                    inp.record_stream(self.stream)
-                    inp.untyped_storage().resize_(0)
+        self._free_forward_inputs(inputs)
 
         return self.output
 
@@ -265,6 +270,26 @@ class ScheduleNode:
             accumulate_grad=True,
         )
 
+    def _free_forward_inputs(self, inputs):
+        """Release selected forward input storages after stream-safe use.
+
+        record_stream() only makes cross-stream allocator reuse safe. The
+        memory-pressure reduction comes from explicitly resizing safe input
+        storages to zero. free_input may be False, True, or a collection of
+        integer input indexes.
+        """
+        if not self.free_input:
+            return
+
+        indexes = range(len(inputs)) if self.free_input is True else self.free_input
+        for idx in indexes:
+            if idx >= len(inputs):
+                continue
+            inp = inputs[idx]
+            if isinstance(inp, torch.Tensor):
+                inp.record_stream(self.stream)
+                inp.untyped_storage().resize_(0)
+
     @contextmanager
     def _stream_ctx(self, name=None):
         if not self._skip_event:
@@ -292,7 +317,7 @@ class LayerCallables:
     attn_fn: Callable = None          # (h) -> (h, h_ln) for MoE, (h) -> h for dense
     dispatch_fn: Callable = None      # (h_ln) -> (sorted_tokens, sorted_probs)
     expert_fn: Callable = None        # (sorted_tokens, sorted_probs) -> expert_outs
-    combine_fn: Callable = None       # (expert_outs, h, shared_expert_out) -> h_out
+    combine_fn: Callable = None       # (expert_outs) -> h_out; residual/shared state in step_data
 
     # Dense-only:
     body_fn: Callable = None          # (h) -> h_out (wraps FFN)
@@ -321,11 +346,13 @@ class MergedScheduler:
     """
 
     def __init__(self, parallel_module, num_layers, *,
-                 use_checkpoint=False):
+                 use_checkpoint=False,
+                 early_attn_memory_release=False):
         self.parallel_module = parallel_module
         self.num_layers = num_layers
         self.use_checkpoint = use_checkpoint
         self._use_4node = True
+        self.early_attn_memory_release = early_attn_memory_release
 
         # Async overlap: launch COMM and COMP ops from separate CPU threads
         # so their kernel launches can interleave, enabling true GPU overlap.
@@ -635,7 +662,8 @@ class MergedScheduler:
 
         combine_node = ScheduleNode(
             lc.combine_fn, comm_stream, event,
-            name="combine", checkpoint=False)
+            free_input=True, name="combine", checkpoint=False)
+        combine_node.step_data = lc.step_data
 
         return (attn_node, dispatch_node, expert_node, combine_node)
 
@@ -670,6 +698,36 @@ class MergedScheduler:
                     t.record_stream(comp)
         elif isinstance(grads, torch.Tensor):
             grads.record_stream(comp)
+
+    @staticmethod
+    def _prepare_combine_state(lc, h_residual=None, shared_expert_out=None):
+        if h_residual is not None:
+            lc.step_data['_combine_residual'] = _detach_for_layer_state(h_residual)
+        if shared_expert_out is not None:
+            lc.step_data['_combine_shared_expert_out'] = _detach_for_layer_state(
+                shared_expert_out)
+
+    def _collect_combine_grads(self, combine_node, combine_grads):
+        """Collect grads from combine's detached layer-state tensors."""
+        if isinstance(combine_grads, tuple) and len(combine_grads) == 3:
+            return combine_grads
+
+        grad_expert_out = combine_grads[0] if isinstance(combine_grads, tuple) else combine_grads
+        step_data = getattr(combine_node, 'step_data', None) or {}
+        residual = step_data.pop('_combine_residual', None)
+        shared_expert_out = step_data.pop('_combine_shared_expert_out', None)
+
+        grad_residual = residual.grad if isinstance(residual, torch.Tensor) else None
+        grad_shared = (
+            shared_expert_out.grad if isinstance(shared_expert_out, torch.Tensor) else None
+        )
+
+        current_stream = torch.cuda.current_stream()
+        for tensor in (residual, shared_expert_out):
+            if isinstance(tensor, torch.Tensor):
+                tensor.record_stream(current_stream)
+
+        return grad_expert_out, grad_residual, grad_shared
 
     def _prepare_loss_aux_tensors(self, attn_node, lc, attn_out):
         aux_tensors = lc.step_data.get('_loss_aux_tensors')
@@ -833,19 +891,21 @@ class MergedScheduler:
         """Forward a single MoE layer through 4 nodes.
 
         expert_fn now includes shared expert: takes (sorted_tokens, sorted_probs, h_ln),
-        returns (expert_outs, shared_expert_out). combine_fn takes shared_expert_out
-        directly, keeping combine (COMM) as pure communication.
+        returns (expert_outs, shared_expert_out). combine_fn reads detached
+        residual/shared state from step_data, keeping combine inputs safe to free.
         """
         nodes = self._create_nodes_4(lc, event)
         attn_n, dispatch_n, expert_n, combine_n = nodes
 
         attn_out = attn_n.forward((h,))
         h_residual, h_ln, routing_probs = attn_out[:3]
+        self._prepare_combine_state(lc, h_residual=h_residual)
         self._prepare_loss_aux_tensors(attn_n, lc, attn_out)
         dispatch_out = dispatch_n.forward((h_ln, routing_probs))
         expert_result = expert_n.forward((*dispatch_out, h_ln))
         expert_out, shared_expert_out = expert_result
-        h_out = combine_n.forward((expert_out, h_residual, shared_expert_out))
+        self._prepare_combine_state(lc, shared_expert_out=shared_expert_out)
+        h_out = combine_n.forward((expert_out,))
 
         for n in nodes:
             if n.checkpoint:
@@ -878,6 +938,7 @@ class MergedScheduler:
 
             # combine_grads: (grad_expert_outs, grad_h_residual, grad_shared_expert_out)
             combine_grads = combine_n.backward(grad_h)
+            combine_grads = self._collect_combine_grads(combine_n, combine_grads)
             # expert backward needs grads for both outputs: expert_outs and shared_expert_out
             expert_grads = expert_n.backward((combine_grads[0], combine_grads[2]))
             # expert_grads: (grad_sorted_tokens, grad_sorted_probs, grad_h_ln)
@@ -979,7 +1040,9 @@ class MergedScheduler:
             else:
                 combine_grads = bwd_combine.backward(grad_h)
                 fwd_attn_out = fwd_attn.forward((fwd_h,))
+            combine_grads = self._collect_combine_grads(bwd_combine, combine_grads)
             fwd_h_residual, fwd_h_ln, fwd_routing_probs = fwd_attn_out[:3]
+            self._prepare_combine_state(fwd_lc, h_residual=fwd_h_residual)
             self._prepare_loss_aux_tensors(fwd_attn, fwd_lc, fwd_attn_out)
 
             # Phase boundary: Phase 2 COMP needs COMM output (combine_grads),
@@ -1002,6 +1065,45 @@ class MergedScheduler:
             # Phase 3 COMM needs COMP output (expert_grads)
             self._cross_stream_barrier(slot=1)
 
+            if self.early_attn_memory_release:
+                # Run backward dispatch and attention before later forward
+                # expert/combine allocations. This lowers peak memory at the
+                # cost of Phase-3/4 overlap.
+                if pool is not None:
+                    fut_dispatch_bwd = pool.submit(
+                        bwd_dispatch.backward, (expert_grads[0], expert_grads[1]))
+                    dispatch_grads = fut_dispatch_bwd.result()
+                else:
+                    dispatch_grads = bwd_dispatch.backward((expert_grads[0], expert_grads[1]))
+
+                self._sync_comm_to_comp()
+                self._record_for_comp(dispatch_grads)
+                self._record_for_comp(combine_grads)
+                grad_h_ln_total = dispatch_grads[0] + expert_grads[2]
+                attn_grads = self._attn_backward_grads(
+                    bwd_attn, combine_grads[1], grad_h_ln_total, dispatch_grads[1])
+                grad_x = bwd_attn.backward(attn_grads)
+
+                fwd_expert_result = fwd_expert.forward((*fwd_dispatch_out, fwd_h_ln))
+                fwd_expert_out, fwd_shared_expert_out = fwd_expert_result
+                self._prepare_combine_state(
+                    fwd_lc, shared_expert_out=fwd_shared_expert_out)
+                self._sync_comp_to_comm()
+                fwd_h_out = fwd_combine.forward((fwd_expert_out,))
+
+                self._restore_loss_aux_step_data(fwd_attn, fwd_lc)
+
+                for n in fwd_nodes:
+                    if n.checkpoint:
+                        n.output = None
+
+                self._sync_comm_to_comp()
+
+                for n in fwd_nodes:
+                    n._skip_event = False
+
+                return fwd_h_out, grad_x, ('layer4', fwd_nodes)
+
             # Phase 3: COMM(b_dispatch) || COMP(f_expert)
             # expert forward includes shared expert (takes h_ln, returns tuple).
             if pool is not None:
@@ -1012,6 +1114,7 @@ class MergedScheduler:
                 dispatch_grads = bwd_dispatch.backward((expert_grads[0], expert_grads[1]))
                 fwd_expert_result = fwd_expert.forward((*fwd_dispatch_out, fwd_h_ln))
             fwd_expert_out, fwd_shared_expert_out = fwd_expert_result
+            self._prepare_combine_state(fwd_lc, shared_expert_out=fwd_shared_expert_out)
 
             # Phase boundary: Phase 4 COMP needs COMM output (dispatch_grads),
             # Phase 4 COMM needs COMP output (expert_out + shared_expert_out)
@@ -1019,8 +1122,7 @@ class MergedScheduler:
 
             # Phase 4: COMM(f_combine) || COMP(b_attn)
             if pool is not None:
-                fut_combine_fwd = pool.submit(fwd_combine.forward,
-                                              (fwd_expert_out, fwd_h_residual, fwd_shared_expert_out))
+                fut_combine_fwd = pool.submit(fwd_combine.forward, (fwd_expert_out,))
                 self._record_for_comp(dispatch_grads)
                 self._record_for_comp(combine_grads)
                 grad_h_ln_total = dispatch_grads[0] + expert_grads[2]
@@ -1029,7 +1131,7 @@ class MergedScheduler:
                 grad_x = bwd_attn.backward(attn_grads)
                 fwd_h_out = fut_combine_fwd.result()
             else:
-                fwd_h_out = fwd_combine.forward((fwd_expert_out, fwd_h_residual, fwd_shared_expert_out))
+                fwd_h_out = fwd_combine.forward((fwd_expert_out,))
                 self._record_for_comp(dispatch_grads)
                 self._record_for_comp(combine_grads)
                 grad_h_ln_total = dispatch_grads[0] + expert_grads[2]

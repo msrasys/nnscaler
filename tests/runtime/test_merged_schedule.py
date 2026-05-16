@@ -17,6 +17,14 @@ from nnscaler.runtime.merged_schedule import (
 from tests.launch_torchrun import launch_torchrun
 
 
+def _detach_for_layer_state(tensor):
+    if tensor is None:
+        return None
+    detached = tensor.detach()
+    detached.requires_grad = tensor.requires_grad
+    return detached
+
+
 class _CountingMergedScheduler(MergedScheduler):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -70,6 +78,8 @@ class _FakeMoELayer(nn.Module):
         self._check_comp_stream()
         h_ln = torch.tanh(self.attn(h))
         routing_probs = torch.sigmoid(self.router(h))
+        if self.step_data is not None:
+            self.step_data['_combine_residual'] = _detach_for_layer_state(h)
         if self.use_aux_loss:
             aux_loss = routing_probs.float().pow(2).mean()
             if self.step_data is not None:
@@ -88,10 +98,15 @@ class _FakeMoELayer(nn.Module):
         self._check_comp_stream()
         expert_out = torch.relu(self.expert(dispatched)) * (reduced_probs + 0.5)
         shared_out = torch.tanh(self.shared(h_ln))
+        if self.step_data is not None:
+            self.step_data['_combine_shared_expert_out'] = _detach_for_layer_state(shared_out)
         return expert_out, shared_out
 
-    def combine_forward(self, expert_out, h_residual, shared_out):
+    def combine_forward(self, expert_out, h_residual=None, shared_out=None):
         self._check_comm_stream()
+        if h_residual is None:
+            h_residual = self.step_data['_combine_residual']
+            shared_out = self.step_data.get('_combine_shared_expert_out')
         combined = self._all_reduce_avg_with_local_grad(expert_out + shared_out)
         return h_residual + combined
 
@@ -175,7 +190,8 @@ def _run_sequential(model, samples, use_aux_loss=False):
     return torch.stack(losses), _distributed_grad_norm(model)
 
 
-def _run_merged(model, samples, use_checkpoint=False, use_aux_loss=False):
+def _run_merged(model, samples, use_checkpoint=False, use_aux_loss=False,
+                early_attn_memory_release=False):
     model.zero_grad(set_to_none=True)
     set_streams()
     model.set_stream_checks(True)
@@ -183,17 +199,28 @@ def _run_merged(model, samples, use_checkpoint=False, use_aux_loss=False):
         parallel_module=model,
         num_layers=len(model.layers),
         use_checkpoint=use_checkpoint,
+        early_attn_memory_release=early_attn_memory_release,
     )
 
     def layer_callables_fn(step_idx, _sample):
         layer = model.layers[step_idx]
         step_data = {}
-        layer.step_data = step_data
+
+        def bind_step_data(fn):
+            def wrapped(*args, _fn=fn, _layer=layer, _step_data=step_data):
+                prev_step_data = _layer.step_data
+                _layer.step_data = _step_data
+                try:
+                    return _fn(*args)
+                finally:
+                    _layer.step_data = prev_step_data
+            return wrapped
+
         return LayerCallables(
-            attn_fn=layer.attn_forward,
-            dispatch_fn=layer.dispatch_forward,
-            expert_fn=layer.expert_forward,
-            combine_fn=layer.combine_forward,
+            attn_fn=bind_step_data(layer.attn_forward),
+            dispatch_fn=bind_step_data(layer.dispatch_forward),
+            expert_fn=bind_step_data(layer.expert_forward),
+            combine_fn=bind_step_data(layer.combine_forward),
             is_moe=True,
             step_data=step_data,
         )
@@ -243,12 +270,13 @@ def _worker():
         torch.manual_seed(10)
         case_results = []
         cases = [
-            (False, False, 10),
-            (True, False, 11),
-            (False, True, 12),
-            (True, True, 11),
+            (False, False, False, 10),
+            (True, False, False, 11),
+            (False, True, False, 12),
+            (True, True, False, 11),
+            (False, True, True, 13),
         ]
-        for use_checkpoint, use_aux_loss, case_seed in cases:
+        for use_checkpoint, use_aux_loss, early_attn_memory_release, case_seed in cases:
             torch.manual_seed(case_seed)
             sequential_model = _FakeMoEModel(use_aux_loss=use_aux_loss).to(device)
             merged_model = copy.deepcopy(sequential_model).to(device)
@@ -259,9 +287,13 @@ def _worker():
             merged_losses, merged_gnorm, merged_4phase_calls, stream_counts = _run_merged(
                 merged_model, samples,
                 use_checkpoint=use_checkpoint,
-                use_aux_loss=use_aux_loss)
+                use_aux_loss=use_aux_loss,
+                early_attn_memory_release=early_attn_memory_release)
 
-            case_label = f'use_checkpoint={use_checkpoint}, use_aux_loss={use_aux_loss}'
+            case_label = (
+                f'use_checkpoint={use_checkpoint}, use_aux_loss={use_aux_loss}, '
+                f'early_attn_memory_release={early_attn_memory_release}'
+            )
             torch.testing.assert_close(
                 merged_losses, sequential_losses, rtol=1e-5, atol=1e-5,
                 msg=case_label)
@@ -285,6 +317,7 @@ def _worker():
             case_results.append({
                 'use_checkpoint': use_checkpoint,
                 'use_aux_loss': use_aux_loss,
+                'early_attn_memory_release': early_attn_memory_release,
                 'merged_4phase_calls': merged_4phase_calls,
                 'stream_counts': stream_counts,
             })
@@ -304,9 +337,10 @@ def test_merged_scheduler_fake_moe_matches_sequential_gnorm():
     results = launch_torchrun(2, _worker)
     assert len(results) == 2
     for result in results.values():
-        assert len(result['cases']) == 4
-        assert result['cases'][-1]['use_checkpoint']
+        assert len(result['cases']) == 5
+        assert result['cases'][-2]['use_checkpoint']
         assert result['cases'][-1]['use_aux_loss']
+        assert result['cases'][-1]['early_attn_memory_release']
         for case in result['cases']:
             assert case['merged_4phase_calls'] == 2
             assert case['stream_counts']['comp'] > 0
