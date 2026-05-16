@@ -270,7 +270,9 @@ class ScheduleNode:
                 tensor_grads = []
                 for i, out in enumerate(recomputed):
                     if isinstance(out, torch.Tensor) and out.requires_grad:
-                        g = self._output_grad_or_zero(output_grad, i, out)
+                        g = self._output_grad_or_none(output_grad, i)
+                        if g is None:
+                            continue
                         tensor_outputs.append(out)
                         tensor_grads.append(g)
                 if tensor_outputs:
@@ -282,7 +284,9 @@ class ScheduleNode:
                 tensor_grads = []
                 for i, out in enumerate(outputs):
                     if isinstance(out, torch.Tensor) and out.requires_grad:
-                        g = self._output_grad_or_zero(output_grad, i, out)
+                        g = self._output_grad_or_none(output_grad, i)
+                        if g is None:
+                            continue
                         tensor_outputs.append(out)
                         tensor_grads.append(g)
                 if tensor_outputs:
@@ -310,11 +314,8 @@ class ScheduleNode:
         return self._output_is_tuple
 
     @staticmethod
-    def _output_grad_or_zero(output_grad, index, output):
-        grad = output_grad[index] if index < len(output_grad) else None
-        if grad is None:
-            return torch.zeros_like(output)
-        return grad
+    def _output_grad_or_none(output_grad, index):
+        return output_grad[index] if index < len(output_grad) else None
 
     @staticmethod
     def _default_backward(outputs, output_grad, retain_graph=False):

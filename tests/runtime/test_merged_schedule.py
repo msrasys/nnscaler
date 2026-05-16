@@ -40,6 +40,48 @@ def _assert_current_stream(expected_stream):
     assert current.cuda_stream == expected_stream.cuda_stream
 
 
+class _AuxOnlyBranch(torch.autograd.Function):
+    backward_calls = 0
+
+    @staticmethod
+    def forward(ctx, x):
+        return x.sin()
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        _AuxOnlyBranch.backward_calls += 1
+        return torch.cos(grad_output)
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available(),
+    reason='requires CUDA streams',
+)
+@pytest.mark.parametrize('checkpoint', (False, True))
+def test_schedule_node_skips_outputs_with_none_grad(checkpoint):
+    stream = torch.cuda.Stream()
+    event = torch.cuda.Event()
+    x = torch.randn(8, device='cuda', requires_grad=True)
+    _AuxOnlyBranch.backward_calls = 0
+
+    def forward_fn(t):
+        return t * t, _AuxOnlyBranch.apply(t)
+
+    node = ScheduleNode(
+        forward_fn,
+        stream,
+        event,
+        name='main_with_aux',
+        checkpoint=checkpoint,
+    )
+    main, _aux = node.forward((x,))
+    grad = node.backward((torch.ones_like(main), None))
+    torch.cuda.synchronize()
+
+    assert _AuxOnlyBranch.backward_calls == 0
+    torch.testing.assert_close(grad, 2 * x.detach())
+
+
 class _FakeMoELayer(nn.Module):
     def __init__(self, hidden_dim, use_aux_loss=False):
         super().__init__()
