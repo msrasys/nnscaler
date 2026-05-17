@@ -446,6 +446,7 @@ class LayerCallables:
 
     is_moe: bool = False
     step_data: dict = field(default_factory=dict)
+    loss_aux_data: dict = field(default_factory=dict)
 
     # Special steps (yoco_proj):
     is_special: bool = False
@@ -612,15 +613,15 @@ class MergedScheduler:
                     with torch.cuda.stream(get_comp_stream()):
                         fwd_h, special_data = fwd_lc.special_forward(fwd_h)
                     fwd_all_nodes[fwd_idx] = ('special', fwd_lc)
+                    fwd_lc_list[fwd_idx] = None
+                    fwd_lc = None
                     fwd_idx += 1
                     continue
 
                 bwd_entry = prev_all_nodes[bwd_idx]
                 if isinstance(bwd_entry, tuple) and len(bwd_entry) == 2 and bwd_entry[0] == 'special':
-                    bwd_lc = bwd_entry[1]
                     with nnscaler.sync_grad_when(False):
-                        with torch.cuda.stream(get_comp_stream()):
-                            grad_h = bwd_lc.special_backward(grad_h)
+                        grad_h = self._special_backward_and_release(bwd_entry, grad_h)
                     prev_all_nodes[bwd_idx] = None
                     bwd_idx -= 1
                     continue
@@ -637,9 +638,14 @@ class MergedScheduler:
                 fwd_all_nodes[fwd_idx] = fwd_entry
 
                 if fwd_lc.is_moe:
-                    fwd_routing_maps.append(fwd_lc.step_data.get('routing_map'))
-                    fwd_expert_probs.append(fwd_lc.step_data.get('gate_scores'))
+                    routing_map = self._get_loss_aux_value(fwd_lc, 'routing_map')
+                    gate_scores = self._get_loss_aux_value(fwd_lc, 'gate_scores')
+                    if routing_map is not None or gate_scores is not None:
+                        fwd_routing_maps.append(routing_map)
+                        fwd_expert_probs.append(gate_scores)
 
+                fwd_lc_list[fwd_idx] = None
+                fwd_lc = None
                 fwd_idx += 1
                 bwd_idx -= 1
 
@@ -651,6 +657,8 @@ class MergedScheduler:
                     with torch.cuda.stream(get_comp_stream()):
                         fwd_h, special_data = fwd_lc.special_forward(fwd_h)
                     fwd_all_nodes[fwd_idx] = ('special', fwd_lc)
+                    fwd_lc_list[fwd_idx] = None
+                    fwd_lc = None
                     fwd_idx += 1
                     continue
 
@@ -662,17 +670,20 @@ class MergedScheduler:
                         fwd_h, fwd_lc, fwd_event)
                 fwd_all_nodes[fwd_idx] = fwd_entry
                 if fwd_lc.is_moe:
-                    fwd_routing_maps.append(fwd_lc.step_data.get('routing_map'))
-                    fwd_expert_probs.append(fwd_lc.step_data.get('gate_scores'))
+                    routing_map = self._get_loss_aux_value(fwd_lc, 'routing_map')
+                    gate_scores = self._get_loss_aux_value(fwd_lc, 'gate_scores')
+                    if routing_map is not None or gate_scores is not None:
+                        fwd_routing_maps.append(routing_map)
+                        fwd_expert_probs.append(gate_scores)
+                fwd_lc_list[fwd_idx] = None
+                fwd_lc = None
                 fwd_idx += 1
 
             while bwd_idx >= 0:
                 bwd_entry = prev_all_nodes[bwd_idx]
                 if isinstance(bwd_entry, tuple) and len(bwd_entry) == 2 and bwd_entry[0] == 'special':
-                    bwd_lc = bwd_entry[1]
                     with nnscaler.sync_grad_when(False):
-                        with torch.cuda.stream(get_comp_stream()):
-                            grad_h = bwd_lc.special_backward(grad_h)
+                        grad_h = self._special_backward_and_release(bwd_entry, grad_h)
                     prev_all_nodes[bwd_idx] = None
                     bwd_idx -= 1
                     continue
@@ -680,7 +691,7 @@ class MergedScheduler:
                     bwd_idx -= 1
                     continue
                 with nnscaler.sync_grad_when(False):
-                    grad_h = self._backward_entry(bwd_entry, grad_h)
+                    grad_h = self._backward_entry_and_release(bwd_entry, grad_h)
                 prev_all_nodes[bwd_idx] = None
                 bwd_idx -= 1
 
@@ -715,14 +726,12 @@ class MergedScheduler:
             for i in reversed(range(num_steps)):
                 entry = prev_all_nodes[i]
                 if isinstance(entry, tuple) and len(entry) == 2 and entry[0] == 'special':
-                    lc = entry[1]
-                    with torch.cuda.stream(get_comp_stream()):
-                        grad_h = lc.special_backward(grad_h)
+                    grad_h = self._special_backward_and_release(entry, grad_h)
                     prev_all_nodes[i] = None
                     continue
                 if entry is None:
                     continue
-                grad_h = self._backward_entry(entry, grad_h)
+                grad_h = self._backward_entry_and_release(entry, grad_h)
                 prev_all_nodes[i] = None
             # Propagate gradient through embedding graph to tok_embed weight
             with torch.cuda.stream(get_comp_stream()):
@@ -864,7 +873,10 @@ class MergedScheduler:
             combine_node._release_step_data()
 
     def _prepare_loss_aux_tensors(self, attn_node, lc, attn_out):
-        aux_tensors = lc.step_data.get('_loss_aux_tensors')
+        aux_data = self._select_loss_aux_data(lc)
+        if aux_data is None:
+            return
+        aux_tensors = aux_data.get('_loss_aux_tensors')
         if aux_tensors is None:
             return
         if not isinstance(aux_tensors, (tuple, list)):
@@ -902,16 +914,17 @@ class MergedScheduler:
             replacements[id(output)] = receiver
             grad_receivers.append(receiver)
 
-        prepared_step_data = {}
-        for key, value in list(lc.step_data.items()):
+        prepared_aux_data = {}
+        for key, value in list(aux_data.items()):
             replaced, changed = self._replace_tensors_by_identity(value, replacements)
             if changed:
-                lc.step_data[key] = replaced
-                prepared_step_data[key] = replaced
-        lc.step_data['_loss_aux_tensors'] = tuple(grad_receivers)
-        prepared_step_data['_loss_aux_tensors'] = tuple(grad_receivers)
+                aux_data[key] = replaced
+                prepared_aux_data[key] = replaced
+        aux_data['_loss_aux_tensors'] = tuple(grad_receivers)
+        prepared_aux_data['_loss_aux_tensors'] = tuple(grad_receivers)
         attn_node.loss_aux_tensors = tuple(grad_receivers)
-        attn_node.loss_aux_step_data = prepared_step_data
+        attn_node.loss_aux_step_data = prepared_aux_data
+        attn_node.loss_aux_data_ref = aux_data
 
     @staticmethod
     def _replace_tensors_by_identity(value, replacements):
@@ -948,8 +961,111 @@ class MergedScheduler:
     def _restore_loss_aux_step_data(attn_node, lc):
         prepared_step_data = getattr(attn_node, 'loss_aux_step_data', None)
         if prepared_step_data:
-            lc.step_data.update(prepared_step_data)
+            aux_data = getattr(attn_node, 'loss_aux_data_ref', None)
+            if aux_data is None:
+                aux_data = MergedScheduler._select_loss_aux_data(lc, create=True)
+            aux_data.update(prepared_step_data)
         attn_node._release_attr('loss_aux_step_data')
+        attn_node._release_attr('loss_aux_data_ref')
+
+    @staticmethod
+    def _select_loss_aux_data(lc, create=False):
+        aux_data = getattr(lc, 'loss_aux_data', None)
+        if isinstance(aux_data, dict) and (aux_data or create):
+            return aux_data
+        step_data = getattr(lc, 'step_data', None)
+        if isinstance(step_data, dict) and '_loss_aux_tensors' in step_data:
+            return step_data
+        if create:
+            if aux_data is None:
+                lc.loss_aux_data = {}
+            return lc.loss_aux_data
+        return None
+
+    @staticmethod
+    def _get_loss_aux_value(lc, key):
+        aux_data = MergedScheduler._select_loss_aux_data(lc)
+        if isinstance(aux_data, dict) and key in aux_data:
+            return aux_data.get(key)
+        step_data = getattr(lc, 'step_data', None)
+        if isinstance(step_data, dict):
+            return step_data.get(key)
+        return None
+
+    @staticmethod
+    def _release_node_runtime_state(node):
+        if node is None:
+            return
+        for attr in ('inputs', 'output'):
+            if hasattr(node, attr):
+                setattr(node, attr, None)
+        if hasattr(node, '_release_step_data'):
+            node._release_step_data()
+        if hasattr(node, '_release_attr'):
+            for attr in (
+                'loss_aux_tensors',
+                'loss_aux_step_data',
+                'loss_aux_data_ref',
+                'forward_func',
+                'backward_func',
+                'wgrad_func',
+            ):
+                node._release_attr(attr)
+
+    @staticmethod
+    def _release_layer_callable_state(lc):
+        if lc is None:
+            return
+        step_data = getattr(lc, 'step_data', None)
+        if isinstance(step_data, dict):
+            step_data.clear()
+        loss_aux_data = getattr(lc, 'loss_aux_data', None)
+        if isinstance(loss_aux_data, dict):
+            loss_aux_data.clear()
+        for attr in (
+            'attn_fn',
+            'dispatch_fn',
+            'expert_fn',
+            'expert_wgrad_fn',
+            'combine_fn',
+            'body_fn',
+            'special_forward',
+            'special_backward',
+            'step_data',
+            'loss_aux_data',
+        ):
+            if hasattr(lc, attr):
+                setattr(lc, attr, None)
+
+    def _release_entry_state(self, entry):
+        """Drop Python references for an entry after its backward is complete."""
+        if not isinstance(entry, tuple) or len(entry) != 2:
+            return
+        tag, payload = entry
+        if tag == 'special':
+            self._release_layer_callable_state(payload)
+            return
+        if tag not in ('layer2', 'layer4'):
+            return
+        nodes = payload if isinstance(payload, (tuple, list)) else (payload,)
+        for node in nodes:
+            self._release_node_runtime_state(node)
+
+    def _special_backward_and_release(self, entry, grad_h):
+        """Run a special layer backward and immediately drop its callable state."""
+        try:
+            _, lc = entry
+            with torch.cuda.stream(get_comp_stream()):
+                return lc.special_backward(grad_h)
+        finally:
+            self._release_entry_state(entry)
+
+    def _backward_entry_and_release(self, entry, grad_h):
+        """Run a layer backward and immediately drop its saved runtime state."""
+        try:
+            return self._backward_entry(entry, grad_h)
+        finally:
+            self._release_entry_state(entry)
 
     @staticmethod
     def _attn_backward_grads(attn_node, grad_h, grad_h_ln, grad_routing):
@@ -1013,6 +1129,8 @@ class MergedScheduler:
                 with torch.cuda.stream(get_comp_stream()):
                     h, special_data = lc.special_forward(h)
                 all_nodes.append(('special', lc))
+                lc_list[si] = None
+                lc = None
                 continue
 
             if lc.is_moe and self._use_4node:
@@ -1032,10 +1150,15 @@ class MergedScheduler:
                 entry = ('layer2', nodes)
 
             if lc.is_moe:
-                routing_maps.append(lc.step_data.get('routing_map'))
-                expert_probs.append(lc.step_data.get('gate_scores'))
+                routing_map = self._get_loss_aux_value(lc, 'routing_map')
+                gate_scores = self._get_loss_aux_value(lc, 'gate_scores')
+                if routing_map is not None or gate_scores is not None:
+                    routing_maps.append(routing_map)
+                    expert_probs.append(gate_scores)
 
             all_nodes.append(entry)
+            lc_list[si] = None
+            lc = None
 
         return h, all_nodes, routing_maps, expert_probs
 
@@ -1139,26 +1262,34 @@ class MergedScheduler:
         """2-phase overlap for dense layers."""
         _, bwd_nodes = bwd_entry
         bwd_attn, bwd_body = bwd_nodes
+        bwd_released = False
 
-        fwd_nodes = self._create_nodes(fwd_lc, fwd_event)
-        fwd_attn, fwd_body = fwd_nodes
+        try:
+            fwd_nodes = self._create_nodes(fwd_lc, fwd_event)
+            fwd_attn, fwd_body = fwd_nodes
 
-        # Ensure all intermediate ops run on COMP stream, not default stream.
-        with torch.cuda.stream(get_comp_stream()):
-            body_grads = bwd_body.backward(grad_h)
-            fwd_attn_out = fwd_attn.forward((fwd_h,))
+            # Ensure all intermediate ops run on COMP stream, not default stream.
+            with torch.cuda.stream(get_comp_stream()):
+                body_grads = bwd_body.backward(grad_h)
+                fwd_attn_out = fwd_attn.forward((fwd_h,))
 
-            grad_x = bwd_attn.backward(body_grads)
-            fwd_h_out = fwd_body.forward(fwd_attn_out)
+                grad_x = bwd_attn.backward(body_grads)
+                self._release_entry_state(bwd_entry)
+                bwd_released = True
+                del body_grads
+                fwd_h_out = fwd_body.forward(fwd_attn_out)
 
-            if fwd_attn.checkpoint:
-                fwd_attn.output = None
-            if fwd_body.checkpoint:
-                fwd_body.output = None
+                if fwd_attn.checkpoint:
+                    fwd_attn.output = None
+                if fwd_body.checkpoint:
+                    fwd_body.output = None
 
-        return fwd_h_out, grad_x, ('layer2', fwd_nodes)
+            return fwd_h_out, grad_x, ('layer2', fwd_nodes)
+        finally:
+            if not bwd_released:
+                self._release_entry_state(bwd_entry)
 
-    def _merged_step_4phase(self, bwd_nodes, fwd_lc, fwd_event, grad_h, fwd_h):
+    def _merged_step_4phase(self, bwd_entry, fwd_lc, fwd_event, grad_h, fwd_h):
         """4-phase overlap for MoE layers.
 
         Each phase interleaves COMP and COMM operations from different
@@ -1175,6 +1306,7 @@ class MergedScheduler:
         Shared expert is merged into expert_fn (COMP stream), keeping
         combine_fn (COMM stream) as pure communication.
         """
+        _, bwd_nodes = bwd_entry
         bwd_attn, bwd_dispatch, bwd_expert, bwd_combine = bwd_nodes
         fwd_nodes = self._create_nodes_4(fwd_lc, fwd_event)
         fwd_attn, fwd_dispatch, fwd_expert, fwd_combine = fwd_nodes
@@ -1246,6 +1378,8 @@ class MergedScheduler:
                 grad_x = bwd_attn.backward(attn_grads)
                 self._order_cross_stream_for_comp(dispatch_grads)
                 self._order_cross_stream_for_comp(combine_grads)
+                self._release_entry_state(bwd_entry)
+                del combine_grads, expert_grads, dispatch_grads, attn_grads, grad_h_ln_total
 
                 fwd_expert_result = fwd_expert.forward((*fwd_dispatch_out, fwd_h_ln))
                 fwd_expert_out, fwd_shared_expert_out = fwd_expert_result
@@ -1299,6 +1433,8 @@ class MergedScheduler:
                 grad_x = bwd_attn.backward(attn_grads)
                 self._order_cross_stream_for_comp(dispatch_grads)
                 self._order_cross_stream_for_comp(combine_grads)
+                self._release_entry_state(bwd_entry)
+                del combine_grads, expert_grads, dispatch_grads, attn_grads, grad_h_ln_total
                 fwd_h_out = fut_combine_fwd.result()
             else:
                 fwd_h_out = fwd_combine.forward((fwd_expert_out,))
@@ -1308,6 +1444,8 @@ class MergedScheduler:
                 grad_x = bwd_attn.backward(attn_grads)
                 self._order_cross_stream_for_comp(dispatch_grads)
                 self._order_cross_stream_for_comp(combine_grads)
+                self._release_entry_state(bwd_entry)
+                del combine_grads, expert_grads, dispatch_grads, attn_grads, grad_h_ln_total
 
             self._restore_loss_aux_step_data(fwd_attn, fwd_lc)
 
@@ -1328,10 +1466,14 @@ class MergedScheduler:
 
     def _merged_step_general(self, bwd_entry, fwd_lc, fwd_event, grad_h, fwd_h):
         """Dispatch to 4-phase or 2-phase merged step based on layer types."""
-        bwd_tag, bwd_nodes = bwd_entry
+        bwd_tag, _ = bwd_entry
 
         if self._use_4node and bwd_tag == 'layer4' and fwd_lc.is_moe:
-            return self._merged_step_4phase(bwd_nodes, fwd_lc, fwd_event, grad_h, fwd_h)
+            try:
+                return self._merged_step_4phase(bwd_entry, fwd_lc, fwd_event, grad_h, fwd_h)
+            except BaseException:
+                self._release_entry_state(bwd_entry)
+                raise
         elif bwd_tag == 'layer2':
             if fwd_lc.is_moe:
                 raise NotImplementedError(
@@ -1340,7 +1482,7 @@ class MergedScheduler:
             return self._merged_step(bwd_entry, fwd_lc, fwd_event, grad_h, fwd_h)
         else:
             with nnscaler.sync_grad_when(False):
-                grad_x = self._backward_entry(bwd_entry, grad_h)
+                grad_x = self._backward_entry_and_release(bwd_entry, grad_h)
             if fwd_lc.is_moe and self._use_4node:
                 fwd_h_out, fwd_entry = self._forward_single_layer_4node(fwd_h, fwd_lc, fwd_event)
             else:
