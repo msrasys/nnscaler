@@ -36,28 +36,27 @@ import nnscaler
 
 _logger = logging.getLogger(__name__)
 
-_COMP_STREAM = None   # computation stream (non-default)
 _COMM_STREAM = None   # communication stream (non-default)
 
 
 def set_streams():
-    """Initialize global COMP/COMM streams.
-    BOTH streams are non-default so that CUDA's legacy
-    default-stream implicit sync does not serialise them.
+    """Initialize the global COMM stream.
+
+    Computation intentionally runs on the caller's current stream, matching
+    Megatron's EP-overlap scheduler.  Only MoE communication is moved to a
+    dedicated non-default stream.
     """
-    global _COMP_STREAM, _COMM_STREAM
-    _COMP_STREAM = torch.cuda.Stream()
+    global _COMM_STREAM
     _COMM_STREAM = torch.cuda.Stream()
-    # Merged scheduling intentionally accumulates gradients on non-default
-    # streams. Suppress this warning only when the merged scheduler streams
-    # are initialized, rather than at module import time.
+    # Some communication-node backward work still runs on the non-default
+    # COMM stream. Suppress this warning only when the merged scheduler stream
+    # is initialized, rather than at module import time.
     if hasattr(torch.autograd.graph, 'set_warn_on_accumulate_grad_stream_mismatch'):
         torch.autograd.graph.set_warn_on_accumulate_grad_stream_mismatch(False)
 
 
 def get_comp_stream():
-    assert _COMP_STREAM is not None, "call set_streams() first"
-    return _COMP_STREAM
+    return torch.cuda.current_stream()
 
 
 def get_comm_stream():
@@ -640,15 +639,11 @@ class MergedScheduler:
         assert num_mbs >= 2, "merged FWD-BWD requires at least 2 micro-batches"
         self._timing_begin_run()
 
-        # Ensure COMP/COMM streams see all prior default-stream work
-        # (optimizer.step, zero_grad from the previous training step).
-        # Non-blocking streams do NOT auto-synchronize with the default stream,
-        # so without this explicit sync, the forward pass might read stale
-        # parameters or see non-zeroed gradients.
-        default_done = torch.cuda.Event()
-        default_done.record(torch.cuda.default_stream())
-        get_comp_stream().wait_event(default_done)
-        get_comm_stream().wait_event(default_done)
+        # Computation uses the caller's current stream.  Make COMM see all
+        # prior work already queued there (optimizer.step, zero_grad, etc.).
+        comp_entry_done = torch.cuda.Event()
+        comp_entry_done.record(get_comp_stream())
+        get_comm_stream().wait_event(comp_entry_done)
 
         num_steps = self.num_layers
         events = [torch.cuda.Event() for _ in range(num_mbs)]
@@ -843,13 +838,10 @@ class MergedScheduler:
                 _embed_h_list[-1] = None
                 del grad_h
 
-        # Make default stream wait for COMP/COMM to finish without blocking host.
-        comp_done = torch.cuda.Event()
+        # Make the computation stream wait for COMM to finish without blocking host.
         comm_done = torch.cuda.Event()
-        comp_done.record(get_comp_stream())
         comm_done.record(get_comm_stream())
-        torch.cuda.default_stream().wait_event(comp_done)
-        torch.cuda.default_stream().wait_event(comm_done)
+        get_comp_stream().wait_event(comm_done)
 
         for i in range(len(results)):
             if results[i] is not None:
