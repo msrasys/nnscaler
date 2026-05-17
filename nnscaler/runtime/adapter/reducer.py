@@ -407,41 +407,7 @@ class Bucket:
 
         @torch.no_grad()
         def post_grad_hook(param: torch.nn.Parameter, *unused): # pragma: no cover
-            # stream = DeviceGroup().get_stream('reducer')
-            ofst = self._pofset[param]
-            rank = torch.distributed.get_rank()
-            # TODO: need to handle sparse gradients in torch.nn.Embedding
-            if self._z3:
-                z3_info = self._reducer.get_z3_info(param)
-                grad = param.grad.data.view(-1)
-                padded_numel = z3_info.numel_with_padding() * self._zgroup_sz
-                if grad.numel() < padded_numel:
-                    # add padding
-                    grad = torch.nn.functional.pad(
-                        grad,
-                        (0, padded_numel - grad.numel()),
-                        mode='constant',
-                        value=0.0,
-                    )
-                output = torch.zeros(z3_info.numel_with_padding(), device=grad.device, dtype=grad.dtype)
-                torch.distributed.reduce_scatter_tensor(
-                    output,
-                    grad,
-                    op=self._reduce_op,
-                    group=self._zero_subgroup
-                )
-                # accumulate the param grad in zero3 way
-                self._contiguous_grads[ofst:ofst+z3_info.numel()]\
-                    .add_(output[0:z3_info.end-z3_info.start])
-            else:
-                self._contiguous_grads[ofst:ofst+param.numel()].add_(param.grad.data.view(-1))
-
-            param.grad = None
-
-            if self._z3:
-                # in most cases, it is not necessary to post-evict here,
-                # let's add it for safety
-                self._reducer.postevict_param(param)
+            self.accumulate_param_grad(param, param.grad)
 
             if RuntimeFlag.skip_reducer: return
             self._async_param_cnt += 1
@@ -501,6 +467,56 @@ class Bucket:
             self._hooks.append((grad_acc, hook))
 
         torch.cuda.empty_cache()
+
+    @torch.no_grad()
+    def accumulate_param_grad(self, param: torch.nn.Parameter, grad: torch.Tensor):
+        """Accumulate a parameter gradient into this bucket's grad buffer.
+
+        This is the same storage update used by the AccumulateGrad hook, exposed
+        for delayed gradient producers that intentionally bypass autograd wgrad.
+        """
+        if grad is None:
+            return
+        if param not in self._pofset:
+            raise ValueError(f"parameter {param} not found in bucket")
+
+        ofst = self._pofset[param]
+        grad = grad.detach().contiguous()
+        target_dtype = self._contiguous_grads.dtype
+
+        # TODO: need to handle sparse gradients in torch.nn.Embedding
+        if self._z3:
+            z3_info = self._reducer.get_z3_info(param)
+            grad = grad.view(-1).to(dtype=target_dtype)
+            padded_numel = z3_info.numel_with_padding() * self._zgroup_sz
+            if grad.numel() < padded_numel:
+                grad = torch.nn.functional.pad(
+                    grad,
+                    (0, padded_numel - grad.numel()),
+                    mode='constant',
+                    value=0.0,
+                )
+            output = torch.zeros(
+                z3_info.numel_with_padding(), device=grad.device, dtype=grad.dtype)
+            torch.distributed.reduce_scatter_tensor(
+                output,
+                grad,
+                op=self._reduce_op,
+                group=self._zero_subgroup,
+            )
+            # accumulate the param grad in zero3 way
+            self._contiguous_grads[ofst:ofst+z3_info.numel()]\
+                .add_(output[0:z3_info.end-z3_info.start])
+        else:
+            self._contiguous_grads[ofst:ofst+param.numel()].add_(
+                grad.view(-1).to(dtype=target_dtype))
+
+        param.grad = None
+
+        if self._z3:
+            # in most cases, it is not necessary to post-evict here,
+            # let's add it for safety
+            self._reducer.postevict_param(param)
 
     def sync_grads(self):
         """

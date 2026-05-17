@@ -8,6 +8,8 @@ MergedScheduler (merged forward-backward with communication/computation overlap)
   Phase 1: f_attn_router(COMP) || b_combine(COMM)
   Phase 2: b_expert (COMP) || f_dispatch   (COMM)
   Phase 3: f_expert (COMP) || b_dispatch(COMM)
+           delayed-wgrad mode: b_expert_wgrad(COMP) || b_dispatch(COMM),
+           then f_expert(COMP)
   Phase 4: b_attn   (COMP) || f_combine    (COMM)
 
 2-Phase Overlap (dense layers):
@@ -87,6 +89,42 @@ def manual_sync_grads(parallel_module):
             finally:
                 bucket._async = old_async
             bucket.reset()
+
+
+def _unwrap_parallel_module(parallel_module):
+    pm = parallel_module
+    if hasattr(pm, 'backbone'):
+        pm = pm.backbone
+    return pm
+
+
+@torch.no_grad()
+def manual_accumulate_param_grad(parallel_module, param, grad):
+    """Accumulate a delayed parameter gradient into nnscaler reducer buffers.
+
+    The merged MoE scheduler can intentionally return no autograd wgrad from a
+    fused expert op, then compute that wgrad later on the COMP stream. This
+    helper mirrors the reducer's post-AccumulateGrad hook so the later wgrad
+    lands in the same contiguous gradient buffer used by manual_sync_grads().
+
+    Returns False when the parameter is not owned by a reducer, allowing callers
+    outside ParallelModule/reducer contexts to fall back to param.grad.
+    """
+    if grad is None:
+        return True
+
+    pm = _unwrap_parallel_module(parallel_module)
+    if not hasattr(pm, '_reducers'):
+        return False
+
+    for reducer in pm._reducers:
+        for bucket in reducer._buckets:
+            if param not in bucket._pofset:
+                continue
+            bucket.accumulate_param_grad(param, grad)
+            return True
+
+    return False
 
 
 def _make_viewless(t):
@@ -400,6 +438,7 @@ class LayerCallables:
     attn_fn: Callable = None          # (h) -> (h, h_ln) for MoE, (h) -> h for dense
     dispatch_fn: Callable = None      # (h_ln) -> (sorted_tokens, sorted_probs)
     expert_fn: Callable = None        # (sorted_tokens, sorted_probs) -> expert_outs
+    expert_wgrad_fn: Callable = None  # delayed routed expert wgrad drain
     combine_fn: Callable = None       # (expert_outs) -> h_out; residual/shared state in step_data
 
     # Dense-only:
@@ -430,12 +469,14 @@ class MergedScheduler:
 
     def __init__(self, parallel_module, num_layers, *,
                  use_checkpoint=False,
-                 early_attn_memory_release=False):
+                 early_attn_memory_release=False,
+                 delay_wgrad_compute=False):
         self.parallel_module = parallel_module
         self.num_layers = num_layers
         self.use_checkpoint = use_checkpoint
         self._use_4node = True
         self.early_attn_memory_release = early_attn_memory_release
+        self.delay_wgrad_compute = delay_wgrad_compute
 
         # Async overlap: launch COMM and COMP ops from separate CPU threads
         # so their kernel launches can interleave, enabling true GPU overlap.
@@ -746,6 +787,7 @@ class MergedScheduler:
         expert_node = ScheduleNode(
             lc.expert_fn, comp_stream, event,
             name="expert", checkpoint=self.use_checkpoint)
+        expert_node.wgrad_func = lc.expert_wgrad_fn
 
         combine_node = ScheduleNode(
             lc.combine_fn, comm_stream, event,
@@ -925,6 +967,38 @@ class MergedScheduler:
             grads.append(None)
         return tuple(grads[:attn_node.output_arity()])
 
+    def _has_delayed_expert_wgrad(self, expert_node):
+        return (
+            self.delay_wgrad_compute
+            and callable(getattr(expert_node, 'wgrad_func', None))
+        )
+
+    def _run_expert_wgrad(self, expert_node):
+        wgrad_func = getattr(expert_node, 'wgrad_func', None)
+        if not self.delay_wgrad_compute or wgrad_func is None:
+            expert_node._release_attr('wgrad_func')
+            return
+        with torch.cuda.stream(get_comp_stream()):
+            torch.cuda.nvtx.range_push("expert wgrad")
+            try:
+                wgrad_func()
+            finally:
+                torch.cuda.nvtx.range_pop()
+        expert_node._release_attr('wgrad_func')
+
+    def _dispatch_backward_with_optional_wgrad(self, dispatch_node, expert_node, expert_grads, pool=None):
+        dispatch_grad_inputs = (expert_grads[0], expert_grads[1])
+        if not self._has_delayed_expert_wgrad(expert_node):
+            expert_node._release_attr('wgrad_func')
+            return dispatch_node.backward(dispatch_grad_inputs)
+
+        self._run_expert_wgrad(expert_node)
+        if pool is not None:
+            fut_dispatch_bwd = pool.submit(dispatch_node.backward, dispatch_grad_inputs)
+            return fut_dispatch_bwd.result()
+
+        return dispatch_node.backward(dispatch_grad_inputs)
+
     def _forward_all_layers(self, h, lc_list, event):
         """Warmup: forward all layers, collect nodes and routing data."""
         all_nodes = []
@@ -1036,7 +1110,8 @@ class MergedScheduler:
             # expert backward needs grads for both outputs: expert_outs and shared_expert_out
             expert_grads = expert_n.backward((combine_grads[0], combine_grads[2]))
             # expert_grads: (grad_sorted_tokens, grad_sorted_probs, grad_h_ln)
-            dispatch_grads = dispatch_n.backward((expert_grads[0], expert_grads[1]))
+            dispatch_grads = self._dispatch_backward_with_optional_wgrad(
+                dispatch_n, expert_n, expert_grads, self._async_pool)
 
             self._sync_comm_to_comp()
 
@@ -1161,12 +1236,8 @@ class MergedScheduler:
                 # Run backward dispatch and attention before later forward
                 # expert/combine allocations. This lowers peak memory at the
                 # cost of Phase-3/4 overlap.
-                if pool is not None:
-                    fut_dispatch_bwd = pool.submit(
-                        bwd_dispatch.backward, (expert_grads[0], expert_grads[1]))
-                    dispatch_grads = fut_dispatch_bwd.result()
-                else:
-                    dispatch_grads = bwd_dispatch.backward((expert_grads[0], expert_grads[1]))
+                dispatch_grads = self._dispatch_backward_with_optional_wgrad(
+                    bwd_dispatch, bwd_expert, expert_grads, pool)
 
                 self._sync_comm_to_comp()
                 grad_h_ln_total = dispatch_grads[0] + expert_grads[2]
@@ -1196,14 +1267,21 @@ class MergedScheduler:
 
                 return fwd_h_out, grad_x, ('layer4', fwd_nodes)
 
-            # Phase 3: COMM(b_dispatch) || COMP(f_expert)
-            # expert forward includes shared expert (takes h_ln, returns tuple).
-            if pool is not None:
+            # Phase 3: when delayed wgrad is active, overlap routed expert
+            # wgrad on COMP with dispatch backward on COMM. Otherwise keep the
+            # original f_expert(COMP) || b_dispatch(COMM) overlap.
+            if self._has_delayed_expert_wgrad(bwd_expert):
+                dispatch_grads = self._dispatch_backward_with_optional_wgrad(
+                    bwd_dispatch, bwd_expert, expert_grads, pool)
+                fwd_expert_result = fwd_expert.forward((*fwd_dispatch_out, fwd_h_ln))
+            elif pool is not None:
                 fut_dispatch_bwd = pool.submit(bwd_dispatch.backward, (expert_grads[0], expert_grads[1]))
                 fwd_expert_result = fwd_expert.forward((*fwd_dispatch_out, fwd_h_ln))
                 dispatch_grads = fut_dispatch_bwd.result()
+                bwd_expert._release_attr('wgrad_func')
             else:
                 dispatch_grads = bwd_dispatch.backward((expert_grads[0], expert_grads[1]))
+                bwd_expert._release_attr('wgrad_func')
                 fwd_expert_result = fwd_expert.forward((*fwd_dispatch_out, fwd_h_ln))
             fwd_expert_out, fwd_shared_expert_out = fwd_expert_result
             self._prepare_combine_state(fwd_lc, shared_expert_out=fwd_shared_expert_out)

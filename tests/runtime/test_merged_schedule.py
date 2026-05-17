@@ -53,6 +53,18 @@ class _AuxOnlyBranch(torch.autograd.Function):
         return torch.cos(grad_output)
 
 
+class _DispatchBackwardRecorder(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, tensor, order_log):
+        ctx.order_log = order_log
+        return tensor
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        ctx.order_log.append('dispatch_backward')
+        return grad_output, None
+
+
 @pytest.mark.skipif(
     not torch.cuda.is_available(),
     reason='requires CUDA streams',
@@ -174,6 +186,9 @@ class _FakeMoELayer(nn.Module):
         self._check_comm_stream()
         dispatched = self._all_reduce_avg_with_local_grad(h_ln * routing_probs)
         reduced_probs = self._all_reduce_avg_with_local_grad(routing_probs)
+        if self.step_data is not None and self.step_data.get('order_log') is not None:
+            dispatched = _DispatchBackwardRecorder.apply(
+                dispatched, self.step_data['order_log'])
         return dispatched, reduced_probs
 
     def expert_forward(self, dispatched, reduced_probs, h_ln):
@@ -273,21 +288,24 @@ def _run_sequential(model, samples, use_aux_loss=False):
 
 
 def _run_merged(model, samples, use_checkpoint=False, use_aux_loss=False,
-                early_attn_memory_release=False, async_4phase=False):
+                early_attn_memory_release=False, async_4phase=False,
+                delay_wgrad_compute=False):
     model.zero_grad(set_to_none=True)
     os.environ['ASYNC_4PHASE'] = '1' if async_4phase else '0'
     set_streams()
     model.set_stream_checks(True)
+    order_log = []
     scheduler = _CountingMergedScheduler(
         parallel_module=model,
         num_layers=len(model.layers),
         use_checkpoint=use_checkpoint,
         early_attn_memory_release=early_attn_memory_release,
+        delay_wgrad_compute=delay_wgrad_compute,
     )
 
     def layer_callables_fn(step_idx, _sample):
         layer = model.layers[step_idx]
-        step_data = {}
+        step_data = {'order_log': order_log} if delay_wgrad_compute else {}
 
         def bind_step_data(fn):
             def wrapped(*args, _fn=fn, _layer=layer, _step_data=step_data):
@@ -299,10 +317,14 @@ def _run_merged(model, samples, use_checkpoint=False, use_aux_loss=False,
                     _layer.step_data = prev_step_data
             return wrapped
 
+        def expert_wgrad_fn(_order_log=order_log):
+            _order_log.append('expert_wgrad')
+
         return LayerCallables(
             attn_fn=bind_step_data(layer.attn_forward),
             dispatch_fn=bind_step_data(layer.dispatch_forward),
             expert_fn=bind_step_data(layer.expert_forward),
+            expert_wgrad_fn=expert_wgrad_fn,
             combine_fn=bind_step_data(layer.combine_forward),
             is_moe=True,
             step_data=step_data,
@@ -337,7 +359,20 @@ def _run_merged(model, samples, use_checkpoint=False, use_aux_loss=False,
     results = scheduler.run(samples, layer_callables_fn, embed_fn, loss_fn)
     torch.cuda.synchronize()
     losses = torch.stack([result[0] for result in results])
-    return losses, _distributed_grad_norm(model), scheduler.merged_4phase_calls, model.stream_counts()
+    return losses, _distributed_grad_norm(model), scheduler.merged_4phase_calls, model.stream_counts(), order_log
+
+
+def _assert_wgrad_before_dispatch_backward(order_log):
+    pending_wgrads = 0
+    dispatch_backward_count = 0
+    for item in order_log:
+        if item == 'expert_wgrad':
+            pending_wgrads += 1
+        elif item == 'dispatch_backward':
+            assert pending_wgrads > 0, order_log
+            pending_wgrads -= 1
+            dispatch_backward_count += 1
+    assert dispatch_backward_count > 0, order_log
 
 
 def _worker():
@@ -352,15 +387,16 @@ def _worker():
         torch.manual_seed(10)
         case_results = []
         cases = [
-            (False, False, False, False, 10),
-            (True, False, False, False, 11),
-            (False, True, False, False, 12),
-            (True, True, False, False, 11),
-            (False, True, True, False, 13),
-            (False, True, False, True, 14),
+            (False, False, False, False, False, 10),
+            (True, False, False, False, False, 11),
+            (False, True, False, False, False, 12),
+            (True, True, False, False, False, 11),
+            (False, True, True, False, False, 13),
+            (False, True, False, True, False, 14),
+            (False, False, False, False, True, 15),
         ]
         for (use_checkpoint, use_aux_loss, early_attn_memory_release,
-             async_4phase, case_seed) in cases:
+             async_4phase, delay_wgrad_compute, case_seed) in cases:
             torch.manual_seed(case_seed)
             sequential_model = _FakeMoEModel(use_aux_loss=use_aux_loss).to(device)
             merged_model = copy.deepcopy(sequential_model).to(device)
@@ -368,17 +404,20 @@ def _worker():
 
             sequential_losses, sequential_gnorm = _run_sequential(
                 sequential_model, samples, use_aux_loss=use_aux_loss)
-            merged_losses, merged_gnorm, merged_4phase_calls, stream_counts = _run_merged(
+            merged_results = _run_merged(
                 merged_model, samples,
                 use_checkpoint=use_checkpoint,
                 use_aux_loss=use_aux_loss,
                 early_attn_memory_release=early_attn_memory_release,
-                async_4phase=async_4phase)
+                async_4phase=async_4phase,
+                delay_wgrad_compute=delay_wgrad_compute)
+            merged_losses, merged_gnorm, merged_4phase_calls, stream_counts, order_log = merged_results
 
             case_label = (
                 f'use_checkpoint={use_checkpoint}, use_aux_loss={use_aux_loss}, '
                 f'early_attn_memory_release={early_attn_memory_release}, '
-                f'async_4phase={async_4phase}'
+                f'async_4phase={async_4phase}, '
+                f'delay_wgrad_compute={delay_wgrad_compute}'
             )
             torch.testing.assert_close(
                 merged_losses, sequential_losses, rtol=1e-5, atol=1e-5,
@@ -400,13 +439,17 @@ def _worker():
             assert stream_counts['comp'] > 0
             assert stream_counts['comm'] > 0
             assert stream_counts['all_reduce'] > 0
+            if delay_wgrad_compute:
+                _assert_wgrad_before_dispatch_backward(order_log)
             case_results.append({
                 'use_checkpoint': use_checkpoint,
                 'use_aux_loss': use_aux_loss,
                 'early_attn_memory_release': early_attn_memory_release,
                 'async_4phase': async_4phase,
+                'delay_wgrad_compute': delay_wgrad_compute,
                 'merged_4phase_calls': merged_4phase_calls,
                 'stream_counts': stream_counts,
+                'order_log': order_log,
             })
         return {
             'rank': rank,
@@ -424,13 +467,16 @@ def test_merged_scheduler_fake_moe_matches_sequential_gnorm():
     results = launch_torchrun(2, _worker)
     assert len(results) == 2
     for result in results.values():
-        assert len(result['cases']) == 6
-        assert result['cases'][-3]['use_checkpoint']
-        assert result['cases'][-2]['early_attn_memory_release']
-        assert result['cases'][-1]['use_aux_loss']
-        assert result['cases'][-1]['async_4phase']
+        assert len(result['cases']) == 7
+        assert result['cases'][-4]['use_checkpoint']
+        assert result['cases'][-3]['early_attn_memory_release']
+        assert result['cases'][-2]['use_aux_loss']
+        assert result['cases'][-2]['async_4phase']
+        assert result['cases'][-1]['delay_wgrad_compute']
         for case in result['cases']:
             assert case['merged_4phase_calls'] == 2
             assert case['stream_counts']['comp'] > 0
             assert case['stream_counts']['comm'] > 0
             assert case['stream_counts']['all_reduce'] > 0
+            if case['delay_wgrad_compute']:
+                _assert_wgrad_before_dispatch_backward(case['order_log'])
