@@ -17,14 +17,6 @@ from nnscaler.runtime.merged_schedule import (
 from tests.launch_torchrun import launch_torchrun
 
 
-def _detach_for_layer_state(tensor):
-    if tensor is None:
-        return None
-    detached = tensor.detach()
-    detached.requires_grad = tensor.requires_grad
-    return detached
-
-
 class _CountingMergedScheduler(MergedScheduler):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -120,36 +112,35 @@ class _FakeMoELayer(nn.Module):
         self._check_comp_stream()
         h_ln = torch.tanh(self.attn(h))
         routing_probs = torch.sigmoid(self.router(h))
-        if self.step_data is not None:
-            self.step_data['_combine_residual'] = _detach_for_layer_state(h)
+        shared_out = torch.tanh(self.shared(h_ln))
         if self.use_aux_loss:
             aux_loss = routing_probs.float().pow(2).mean()
             if self.step_data is not None:
                 self.step_data['_loss_aux_tensors'] = (aux_loss,)
                 self.step_data['gate_scores'] = aux_loss
-            return h, h_ln, routing_probs, aux_loss
-        return h, h_ln, routing_probs
+        else:
+            aux_loss = None
+        return h, h_ln, routing_probs, aux_loss, shared_out
 
-    def dispatch_forward(self, h_ln, routing_probs):
+    def dispatch_forward(self, dispatch_tokens, dispatch_probs):
         self._check_comm_stream()
-        dispatched = self._all_reduce_avg_with_local_grad(h_ln * routing_probs)
-        reduced_probs = self._all_reduce_avg_with_local_grad(routing_probs)
+        dispatched = self._all_reduce_avg_with_local_grad(dispatch_tokens)
+        reduced_probs = self._all_reduce_avg_with_local_grad(dispatch_probs)
         return dispatched, reduced_probs
 
-    def expert_forward(self, dispatched, reduced_probs, h_ln):
+    def expert_forward(self, dispatched, reduced_probs):
         self._check_comp_stream()
         expert_out = torch.relu(self.expert(dispatched)) * (reduced_probs + 0.5)
-        shared_out = torch.tanh(self.shared(h_ln))
-        if self.step_data is not None:
-            self.step_data['_combine_shared_expert_out'] = _detach_for_layer_state(shared_out)
-        return expert_out, shared_out
+        return expert_out
 
     def combine_forward(self, expert_out, h_residual=None, shared_out=None):
         self._check_comm_stream()
         if h_residual is None:
             h_residual = self.step_data['_combine_residual']
             shared_out = self.step_data.get('_combine_shared_expert_out')
-        combined = self._all_reduce_avg_with_local_grad(expert_out + shared_out)
+        combined = self._all_reduce_avg_with_local_grad(expert_out)
+        if shared_out is not None:
+            combined = combined + shared_out
         return h_residual + combined
 
 
@@ -180,13 +171,12 @@ class _FakeMoEModel(nn.Module):
         aux_losses = []
         for layer in self.layers:
             attn_out = layer.attn_forward(h)
-            h_residual, h_ln, routing_probs = attn_out[:3]
-            aux_losses.extend(
-                t for t in attn_out[3:] if isinstance(t, torch.Tensor)
-            )
-            dispatched, reduced_probs = layer.dispatch_forward(h_ln, routing_probs)
-            expert_out, shared_out = layer.expert_forward(
-                dispatched, reduced_probs, h_ln)
+            h_residual, dispatch_tokens, dispatch_probs, aux_loss, shared_out = attn_out
+            if isinstance(aux_loss, torch.Tensor):
+                aux_losses.append(aux_loss)
+            dispatched, reduced_probs = layer.dispatch_forward(
+                dispatch_tokens, dispatch_probs)
+            expert_out = layer.expert_forward(dispatched, reduced_probs)
             h = layer.combine_forward(expert_out, h_residual, shared_out)
         if return_aux:
             return h, aux_losses
