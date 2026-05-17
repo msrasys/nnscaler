@@ -382,6 +382,11 @@ class ScheduleNode:
         self.output = None
         self.detached = tuple()
         self.before_detached = tuple()
+        # Drop callable closures after backward/release. Loss callables can
+        # capture per-layer aux tensors, so keeping them here extends tensor
+        # lifetimes past the point where the node is otherwise dead.
+        self.forward_func = None
+        self.backward_func = None
 
 
 @dataclass
