@@ -509,6 +509,9 @@ class MergedScheduler:
         if self._timing_run_idx <= self._timing_warmup:
             self._timing_current_records = None
             return
+        if not self._timing_should_log_rank():
+            self._timing_current_records = None
+            return
         self._timing_current_records = []
 
     def _timing_record_start(self, name):
@@ -571,9 +574,6 @@ class MergedScheduler:
 
     def _timing_flush(self, force=False):
         if not self._timing_enabled or not self._timing_pending_records:
-            return
-        if not self._timing_should_log_rank():
-            self._timing_pending_records.clear()
             return
         if not torch.cuda.is_available() or not torch.cuda.is_initialized():
             self._timing_pending_records.clear()
@@ -1416,9 +1416,14 @@ class MergedScheduler:
             # Phase 4: COMM(f_combine) || COMP(b_attn)
             timing_record = self._timing_record_start('phase4_b_attn_f_combine')
             if pool is not None:
-                fut_combine_fwd = pool.submit(
-                    self._timing_call, timing_record, 'comm',
-                    fwd_combine.forward, (fwd_expert_out,))
+                # Launch combine on the host before attention backward.  The
+                # combine node has free_input=True and releases fwd_expert_out
+                # immediately after its COMM-stream kernels are enqueued.  If
+                # the worker thread is merely submitted here, no-timing runs can
+                # let b_attn enqueue first and hit a higher transient peak; CUDA
+                # event timing accidentally hid that by slowing the main thread.
+                fwd_h_out = self._timing_call(
+                    timing_record, 'comm', fwd_combine.forward, (fwd_expert_out,))
                 attn_grads = self._attn_backward_grads(
                     bwd_attn, combine_grads[1], dispatch_grads[0], dispatch_grads[1],
                     combine_grads[2])
@@ -1426,7 +1431,6 @@ class MergedScheduler:
                     timing_record, 'comp', bwd_attn.backward, attn_grads)
                 self._order_cross_stream_for_comp(dispatch_grads)
                 self._order_cross_stream_for_comp(combine_grads)
-                fwd_h_out = fut_combine_fwd.result()
             else:
                 fwd_h_out = self._timing_call(
                     timing_record, 'comm', fwd_combine.forward, (fwd_expert_out,))
