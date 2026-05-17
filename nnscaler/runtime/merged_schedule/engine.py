@@ -434,12 +434,6 @@ class MergedScheduler:
             if _async_on else None
         )
 
-        # Pre-allocate CUDA events for cross-stream synchronization.
-        # Using separate events per barrier slot avoids re-recording while
-        # a previous wait may still be pending (undefined behavior per CUDA spec).
-        # 3 barrier slots in _merged_step_4phase, each needs comp + comm events
-        self._barrier_comp_evts = [torch.cuda.Event() for _ in range(3)]
-        self._barrier_comm_evts = [torch.cuda.Event() for _ in range(3)]
         # 2 uni-directional sync events (comp->comm and comm->comp)
         self._sync_c2m_evt = torch.cuda.Event()
         self._sync_m2c_evt = torch.cuda.Event()
@@ -749,20 +743,6 @@ class MergedScheduler:
     def _sync_comp_to_comm(self):
         self._sync_c2m_evt.record(get_comp_stream())
         get_comm_stream().wait_event(self._sync_c2m_evt)
-
-    def _cross_stream_barrier(self, slot=0):
-        """Bidirectional sync: each stream waits for the other's current position.
-
-        Records events on both streams simultaneously, then makes each wait
-        for the other. Uses pre-allocated events indexed by slot to avoid
-        event creation overhead and re-recording conflicts.
-        """
-        comp_evt = self._barrier_comp_evts[slot]
-        comm_evt = self._barrier_comm_evts[slot]
-        comp_evt.record(get_comp_stream())
-        comm_evt.record(get_comm_stream())
-        get_comm_stream().wait_event(comp_evt)
-        get_comp_stream().wait_event(comm_evt)
 
     def _overlap_dispatch_backward_with_expert_wgrad(
         self,
@@ -1119,10 +1099,10 @@ class MergedScheduler:
         """4-phase overlap for MoE layers.
 
         Each phase interleaves COMP and COMM operations from different
-        micro-batches. Within each phase, COMP and COMM run in PARALLEL on
-        the GPU because we skip the per-node shared-event protocol (which
-        would serialize all operations). Instead, we use explicit cross-stream
-        barriers at phase boundaries to enforce data dependencies.
+        micro-batches. Forward nodes share one event and backward nodes share
+        another event, matching Megatron's per-microbatch dependency protocol.
+        We only bypass that protocol around dispatch backward/expert wgrad,
+        where the shared backward event would serialize the intended overlap.
 
         Phase 1: f_attn_router(COMP) || b_combine(COMM)   [combine = pure comm]
         Phase 2: b_expert_dgrad (COMP) || f_dispatch (COMM)
@@ -1137,16 +1117,6 @@ class MergedScheduler:
         fwd_attn, fwd_dispatch, fwd_expert, fwd_combine = fwd_nodes
 
         pool = self._async_pool  # None in sequential mode
-
-        # --- Skip per-node event protocol during merged step ---
-        # The default shared event serializes all nodes (COMP waits for COMM
-        # and vice versa), preventing within-phase parallelism. By setting
-        # _skip_event=True, each node still switches to its own stream, but
-        # does not wait/record the shared event. Cross-stream dependencies are
-        # enforced explicitly via _cross_stream_barrier() at phase boundaries.
-        all_nodes = (*bwd_nodes, *fwd_nodes)
-        for n in all_nodes:
-            n._skip_event = True
 
         # Ensure grad addition runs on COMP stream,
         # not the default stream (which has no sync with COMP/COMM in overlap mode).
@@ -1169,10 +1139,6 @@ class MergedScheduler:
             self._prepare_combine_state(fwd_lc, h_residual=fwd_h_residual)
             self._prepare_loss_aux_tensors(fwd_attn, fwd_lc, fwd_attn_out)
 
-            # Phase boundary: Phase 2 COMP needs COMM output (combine_grads),
-            # Phase 2 COMM needs COMP output (attn_out + precomputed metadata)
-            self._cross_stream_barrier(slot=0)
-
             # Phase 2: COMM(f_dispatch) || COMP(b_expert_dgrad)
             # expert backward includes shared expert backward (both on COMP),
             # but routed expert wgrad is delayed until Phase 3 so it does not
@@ -1187,17 +1153,27 @@ class MergedScheduler:
                 expert_grads = bwd_expert.backward((combine_grads[0], combine_grads[2]))
             # expert_grads: (grad_sorted_tokens, grad_sorted_probs, grad_h_ln)
 
-            # Phase boundary: Phase 3 COMP needs COMM output (dispatch_out),
-            # Phase 3 COMM needs COMP output (expert_grads)
-            self._cross_stream_barrier(slot=1)
+            # Narrow Phase 2->3 hand-off:
+            #   * b_dispatch needs expert_grads, so only COMM waits for COMP.
+            #   * expert wgrad does not need f_dispatch_out, so COMP must not wait
+            #     for COMM before wgrad. f_expert waits on the forward event.
+            self._sync_comp_to_comm()
 
             if self.early_attn_memory_release:
                 # Run backward dispatch and attention before later forward
                 # expert/combine allocations. This lowers peak memory at the
                 # cost of most Phase-3/4 overlap, but dispatch backward still
                 # starts before routed expert wgrad.
-                dispatch_grads = self._overlap_dispatch_backward_with_expert_wgrad(
-                    bwd_dispatch, bwd_expert, expert_grads)
+                old_dispatch_skip = bwd_dispatch._skip_event
+                old_expert_skip = bwd_expert._skip_event
+                bwd_dispatch._skip_event = True
+                bwd_expert._skip_event = True
+                try:
+                    dispatch_grads = self._overlap_dispatch_backward_with_expert_wgrad(
+                        bwd_dispatch, bwd_expert, expert_grads)
+                finally:
+                    bwd_dispatch._skip_event = old_dispatch_skip
+                    bwd_expert._skip_event = old_expert_skip
 
                 self._sync_comm_to_comp()
                 grad_h_ln_total = dispatch_grads[0] + expert_grads[2]
@@ -1222,9 +1198,6 @@ class MergedScheduler:
 
                 self._sync_comm_to_comp()
 
-                for n in fwd_nodes:
-                    n._skip_event = False
-
                 return fwd_h_out, grad_x, ('layer4', fwd_nodes)
 
             # Phase 3: COMM(b_dispatch) || COMP(b_expert_wgrad + f_expert)
@@ -1234,16 +1207,25 @@ class MergedScheduler:
             def fwd_expert_after_wgrad():
                 return fwd_expert.forward((*fwd_dispatch_out, fwd_h_ln))
 
-            dispatch_grads, fwd_expert_result = (
-                self._overlap_dispatch_backward_with_expert_wgrad(
-                    bwd_dispatch, bwd_expert, expert_grads,
-                    after_wgrad=fwd_expert_after_wgrad))
+            old_dispatch_skip = bwd_dispatch._skip_event
+            old_expert_skip = bwd_expert._skip_event
+            bwd_dispatch._skip_event = True
+            bwd_expert._skip_event = True
+            try:
+                dispatch_grads, fwd_expert_result = (
+                    self._overlap_dispatch_backward_with_expert_wgrad(
+                        bwd_dispatch, bwd_expert, expert_grads,
+                        after_wgrad=fwd_expert_after_wgrad))
+            finally:
+                bwd_dispatch._skip_event = old_dispatch_skip
+                bwd_expert._skip_event = old_expert_skip
             fwd_expert_out, fwd_shared_expert_out = fwd_expert_result
             self._prepare_combine_state(fwd_lc, shared_expert_out=fwd_shared_expert_out)
 
-            # Phase boundary: Phase 4 COMP needs COMM output (dispatch_grads),
-            # Phase 4 COMM needs COMP output (expert_out + shared_expert_out)
-            self._cross_stream_barrier(slot=2)
+            # b_dispatch ran with the backward event protocol disabled, so COMP
+            # must explicitly wait before consuming dispatch_grads in b_attn.
+            # f_combine still waits for f_expert through the forward event.
+            self._sync_comm_to_comp()
 
             # Phase 4: COMM(f_combine) || COMP(b_attn)
             if pool is not None:
@@ -1274,10 +1256,6 @@ class MergedScheduler:
             # The next merged step's fwd_attn will consume fwd_h_out on COMP stream,
             # so COMP must wait for COMM to finish.
             self._sync_comm_to_comp()
-
-        # Restore event protocol for sequential backward use (cooldown)
-        for n in fwd_nodes:
-            n._skip_event = False
 
         return fwd_h_out, grad_x, ('layer4', fwd_nodes)
 
