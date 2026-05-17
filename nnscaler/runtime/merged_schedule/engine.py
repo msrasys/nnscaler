@@ -939,6 +939,23 @@ class MergedScheduler:
         get_comm_stream().wait_event(comp_evt)
         get_comp_stream().wait_event(comm_evt)
 
+    def _comm_waits_for_comp_and_return_comm_event(self, slot=0):
+        """Order COMM after COMP, and return COMM's current-position event.
+
+        This is the split form of _cross_stream_barrier().  It records both
+        streams at a phase boundary, immediately makes COMM wait for COMP,
+        and lets the caller decide when COMP must wait for the recorded COMM
+        position.  The MoE phase2->phase3 boundary needs exactly this: the
+        backward dispatch on COMM needs expert dgrad from COMP, but expert
+        wgrad on COMP does not need the forward dispatch result.
+        """
+        comp_evt = self._barrier_comp_evts[slot]
+        comm_evt = self._barrier_comm_evts[slot]
+        comp_evt.record(get_comp_stream())
+        comm_evt.record(get_comm_stream())
+        get_comm_stream().wait_event(comp_evt)
+        return comm_evt
+
     def _order_cross_stream_for_comp(self, tensors):
         """Compatibility hook; ScheduleNode records actual cross-stream uses."""
         return None
@@ -1320,9 +1337,12 @@ class MergedScheduler:
 
         Phase 1: f_attn_router(COMP) || b_combine(COMM)   [attn includes shared fwd]
         Phase 2: b_expert_dgrad (COMP) || f_dispatch (COMM)
-        Phase 3: b_expert_wgrad (COMP) || b_dispatch (COMM)
+        Phase 3: b_expert_wgrad (COMP) || b_dispatch (COMM); only COMM waits
+                 for Phase 2 expert dgrad, while COMP does not wait for the
+                 forward dispatch tail.
         Phase 4: f_expert (COMP), then b_attn (COMP) || f_combine (COMM),
-                 with only a COMM->COMP wait before b_attn consumes b_dispatch grads.
+                 with a deferred wait for f_dispatch before f_expert and a
+                 COMM->COMP wait before b_attn consumes b_dispatch grads.
         """
         bwd_attn, bwd_dispatch, bwd_expert, bwd_combine = bwd_nodes
         fwd_nodes = self._create_nodes_4(fwd_lc, fwd_event)
@@ -1335,7 +1355,7 @@ class MergedScheduler:
         # and vice versa), preventing within-phase parallelism. By setting
         # _skip_event=True, each node still switches to its own stream, but
         # does not wait/record the shared event. Cross-stream dependencies are
-        # enforced explicitly via _cross_stream_barrier() at phase boundaries.
+        # enforced explicitly with CUDA events at phase boundaries.
         all_nodes = (*bwd_nodes, *fwd_nodes)
         for n in all_nodes:
             n._skip_event = True
@@ -1408,10 +1428,12 @@ class MergedScheduler:
                 fwd_dispatch, fwd_lc, fwd_dispatch_out)
             del fwd_dispatch_tokens, fwd_dispatch_probs
 
-            # Phase boundary: Phase 3 COMP needs COMM output (dispatch_out),
-            # Phase 3 COMM needs COMP output (expert_grads)
+            # Phase boundary: Phase 3 COMM needs COMP output (expert_grads),
+            # while Phase 3 COMP only needs b_expert's local state.  Do not
+            # make b_expert_wgrad wait for the forward dispatch tail here;
+            # defer the COMP wait on f_dispatch until f_expert consumes it.
             timing_record = self._timing_record_start('barrier1_p2_to_p3')
-            self._cross_stream_barrier(slot=1)
+            fwd_dispatch_done_evt = self._comm_waits_for_comp_and_return_comm_event(slot=1)
             self._timing_record_end(timing_record)
 
             if self.early_attn_memory_release:
@@ -1499,6 +1521,10 @@ class MergedScheduler:
                 dispatch_grads = (dispatch_grads,)
             grad_dispatch_tokens, grad_dispatch_probs = dispatch_grads[:2]
             del dispatch_grads
+
+            timing_record = self._timing_record_start('wait_f_dispatch_before_f_expert')
+            get_comp_stream().wait_event(fwd_dispatch_done_evt)
+            self._timing_record_end(timing_record)
 
             timing_record = self._timing_record_start('phase4_f_expert')
             fwd_expert_out = self._timing_call(
