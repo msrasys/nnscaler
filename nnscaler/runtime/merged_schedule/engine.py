@@ -192,6 +192,7 @@ class ScheduleNode:
         stream,
         event,
         backward_func=None,
+        backward_dw_func=None,
         free_input=False,
         name="schedule_node",
         checkpoint=False,
@@ -199,6 +200,7 @@ class ScheduleNode:
         self.name = name
         self.forward_func = forward_func
         self.backward_func = backward_func if backward_func else self._default_backward
+        self.backward_dw_func = backward_dw_func
         self.stream = stream
         self.event = event
         self.free_input = free_input
@@ -299,6 +301,12 @@ class ScheduleNode:
         self._release()
         return grads
 
+    def backward_dw(self):
+        if self.backward_dw_func is None:
+            return None
+        with self._stream_ctx(f"{self.name} wgrad"):
+            return self.backward_dw_func()
+
     def get_grad(self):
         grad = tuple(e.grad if e is not None else None for e in self.inputs)
         return grad[0] if len(grad) == 1 else grad
@@ -378,6 +386,7 @@ class LayerCallables:
     attn_fn: Callable = None          # (h) -> (h, h_ln) for MoE, (h) -> h for dense
     dispatch_fn: Callable = None      # (h_ln) -> (sorted_tokens, sorted_probs)
     expert_fn: Callable = None        # (sorted_tokens, sorted_probs) -> expert_outs
+    expert_backward_dw: Callable = None
     combine_fn: Callable = None       # (expert_outs) -> h_out; residual/shared state in step_data
 
     # Dense-only:
@@ -722,6 +731,7 @@ class MergedScheduler:
 
         expert_node = ScheduleNode(
             lc.expert_fn, comp_stream, event,
+            backward_dw_func=lc.expert_backward_dw,
             name="expert", checkpoint=self.use_checkpoint)
 
         combine_node = ScheduleNode(
@@ -1002,6 +1012,7 @@ class MergedScheduler:
             combine_grads = self._collect_combine_grads(combine_n, combine_grads)
             # expert backward needs grads for both outputs: expert_outs and shared_expert_out
             expert_grads = expert_n.backward((combine_grads[0], combine_grads[2]))
+            expert_n.backward_dw()
             # expert_grads: (grad_sorted_tokens, grad_sorted_probs, grad_h_ln)
             dispatch_grads = dispatch_n.backward((expert_grads[0], expert_grads[1]))
 
@@ -1118,6 +1129,7 @@ class MergedScheduler:
             else:
                 fwd_dispatch_out = fwd_dispatch.forward((fwd_h_ln, fwd_routing_probs))
                 expert_grads = bwd_expert.backward((combine_grads[0], combine_grads[2]))
+            bwd_expert.backward_dw()
             # expert_grads: (grad_sorted_tokens, grad_sorted_probs, grad_h_ln)
 
             # Phase boundary: Phase 3 COMP needs COMM output (dispatch_out),

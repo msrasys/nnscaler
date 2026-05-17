@@ -92,6 +92,8 @@ class _FakeMoELayer(nn.Module):
         self.use_aux_loss = use_aux_loss
         self.step_data = None
         self.check_streams = False
+        self.backward_dw_calls = 0
+        self.delayed_wgrad_queue = []
         self.stream_counts = {'comp': 0, 'comm': 0, 'all_reduce': 0}
 
     def _check_comp_stream(self):
@@ -140,9 +142,21 @@ class _FakeMoELayer(nn.Module):
         self._check_comp_stream()
         expert_out = torch.relu(self.expert(dispatched)) * (reduced_probs + 0.5)
         shared_out = torch.tanh(self.shared(h_ln))
+        if expert_out.requires_grad:
+            expert_out.register_hook(self._queue_delayed_wgrad)
         if self.step_data is not None:
             self.step_data['_combine_shared_expert_out'] = _detach_for_layer_state(shared_out)
         return expert_out, shared_out
+
+    def _queue_delayed_wgrad(self, grad):
+        self.delayed_wgrad_queue.append(object())
+        return grad
+
+    def expert_backward_dw(self):
+        self._check_comp_stream()
+        assert self.delayed_wgrad_queue
+        self.backward_dw_calls += 1
+        self.delayed_wgrad_queue.clear()
 
     def combine_forward(self, expert_out, h_residual=None, shared_out=None):
         self._check_comm_stream()
@@ -165,6 +179,8 @@ class _FakeMoEModel(nn.Module):
     def set_stream_checks(self, enabled):
         for layer in self.layers:
             layer.check_streams = enabled
+            layer.backward_dw_calls = 0
+            layer.delayed_wgrad_queue.clear()
             layer.stream_counts = {'comp': 0, 'comm': 0, 'all_reduce': 0}
 
     def stream_counts(self):
@@ -174,6 +190,12 @@ class _FakeMoEModel(nn.Module):
             counts['comm'] += layer.stream_counts['comm']
             counts['all_reduce'] += layer.stream_counts['all_reduce']
         return counts
+
+    def backward_dw_calls(self):
+        return sum(layer.backward_dw_calls for layer in self.layers)
+
+    def pending_backward_dw_tasks(self):
+        return sum(len(layer.delayed_wgrad_queue) for layer in self.layers)
 
     def forward(self, x, return_aux=False):
         h = self.embed(x)
@@ -263,6 +285,7 @@ def _run_merged(model, samples, use_checkpoint=False, use_aux_loss=False,
             attn_fn=bind_step_data(layer.attn_forward),
             dispatch_fn=bind_step_data(layer.dispatch_forward),
             expert_fn=bind_step_data(layer.expert_forward),
+            expert_backward_dw=bind_step_data(layer.expert_backward_dw),
             combine_fn=bind_step_data(layer.combine_forward),
             is_moe=True,
             step_data=step_data,
@@ -297,7 +320,14 @@ def _run_merged(model, samples, use_checkpoint=False, use_aux_loss=False,
     results = scheduler.run(samples, layer_callables_fn, embed_fn, loss_fn)
     torch.cuda.synchronize()
     losses = torch.stack([result[0] for result in results])
-    return losses, _distributed_grad_norm(model), scheduler.merged_4phase_calls, model.stream_counts()
+    return (
+        losses,
+        _distributed_grad_norm(model),
+        scheduler.merged_4phase_calls,
+        model.stream_counts(),
+        model.backward_dw_calls(),
+        model.pending_backward_dw_tasks(),
+    )
 
 
 def _worker():
@@ -328,7 +358,8 @@ def _worker():
 
             sequential_losses, sequential_gnorm = _run_sequential(
                 sequential_model, samples, use_aux_loss=use_aux_loss)
-            merged_losses, merged_gnorm, merged_4phase_calls, stream_counts = _run_merged(
+            (merged_losses, merged_gnorm, merged_4phase_calls, stream_counts,
+             backward_dw_calls, pending_backward_dw_tasks) = _run_merged(
                 merged_model, samples,
                 use_checkpoint=use_checkpoint,
                 use_aux_loss=use_aux_loss,
@@ -357,6 +388,8 @@ def _worker():
                 msg=lambda msg: f'{case_label}\n{msg}')
 
             assert merged_4phase_calls == len(merged_model.layers)
+            assert backward_dw_calls == len(samples) * len(merged_model.layers)
+            assert pending_backward_dw_tasks == 0
             assert stream_counts['comp'] > 0
             assert stream_counts['comm'] > 0
             assert stream_counts['all_reduce'] > 0
@@ -366,6 +399,8 @@ def _worker():
                 'early_attn_memory_release': early_attn_memory_release,
                 'async_4phase': async_4phase,
                 'merged_4phase_calls': merged_4phase_calls,
+                'backward_dw_calls': backward_dw_calls,
+                'pending_backward_dw_tasks': pending_backward_dw_tasks,
                 'stream_counts': stream_counts,
             })
         return {
@@ -391,6 +426,8 @@ def test_merged_scheduler_fake_moe_matches_sequential_gnorm():
         assert result['cases'][-1]['async_4phase']
         for case in result['cases']:
             assert case['merged_4phase_calls'] == 2
+            assert case['backward_dw_calls'] == 4
+            assert case['pending_backward_dw_tasks'] == 0
             assert case['stream_counts']['comp'] > 0
             assert case['stream_counts']['comm'] > 0
             assert case['stream_counts']['all_reduce'] > 0
