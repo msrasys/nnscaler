@@ -35,26 +35,41 @@ import nnscaler
 
 _logger = logging.getLogger(__name__)
 
-_COMP_STREAM = None   # computation stream (non-default)
+_COMP_STREAM = None   # optional dedicated computation stream
 _COMM_STREAM = None   # communication stream (non-default)
+_USE_CURRENT_COMP_STREAM = None
 
 
 def set_streams():
-    """Initialize global COMP/COMM streams.
-    BOTH streams are non-default so that CUDA's legacy
-    default-stream implicit sync does not serialise them.
+    """Initialize global COMP/COMM stream policy.
+
+    By default, computation follows Megatron's convention and uses the current
+    stream. This keeps autograd, reducers, optimizer work, and loss handling on
+    the normal training stream while MoE communication uses a side stream.
+
+    Set ``NNSCALER_MOE_OVERLAP_DEDICATED_COMP_STREAM=1`` to restore the previous
+    behavior of launching compute on a dedicated non-default stream.
     """
-    global _COMP_STREAM, _COMM_STREAM
-    _COMP_STREAM = torch.cuda.Stream()
+    global _COMP_STREAM, _COMM_STREAM, _USE_CURRENT_COMP_STREAM
+
+    dedicated_comp = os.environ.get(
+        'NNSCALER_MOE_OVERLAP_DEDICATED_COMP_STREAM', '0') not in ('0', '')
+    _USE_CURRENT_COMP_STREAM = not dedicated_comp
+    _COMP_STREAM = torch.cuda.Stream() if dedicated_comp else None
     _COMM_STREAM = torch.cuda.Stream()
-    # Merged scheduling intentionally accumulates gradients on non-default
-    # streams. Suppress this warning only when the merged scheduler streams
-    # are initialized, rather than at module import time.
+
+    # Only the legacy dedicated-COMP mode intentionally accumulates parameter
+    # gradients on a non-default compute stream. The default current-stream mode
+    # should preserve PyTorch/nnscaler reducer stream semantics.
     if hasattr(torch.autograd.graph, 'set_warn_on_accumulate_grad_stream_mismatch'):
-        torch.autograd.graph.set_warn_on_accumulate_grad_stream_mismatch(False)
+        torch.autograd.graph.set_warn_on_accumulate_grad_stream_mismatch(
+            not dedicated_comp)
 
 
 def get_comp_stream():
+    assert _USE_CURRENT_COMP_STREAM is not None, "call set_streams() first"
+    if _USE_CURRENT_COMP_STREAM:
+        return torch.cuda.current_stream()
     assert _COMP_STREAM is not None, "call set_streams() first"
     return _COMP_STREAM
 
@@ -78,15 +93,25 @@ def manual_sync_grads(parallel_module):
         _logger.warning("No _reducers found on parallel module, skipping manual sync")
         return
 
+    synced = False
     for reducer in pm._reducers:
         for bucket in reducer._buckets:
             old_async = bucket._async
             bucket._async = False
             try:
                 bucket.sync_grads()
+                synced = True
             finally:
                 bucket._async = old_async
             bucket.reset()
+
+    # Trainer.optimizer.sync_shard_grad() is called after train_step. The manual
+    # path has already synchronized every reducer bucket, so mark the module as
+    # clean to avoid a second sync attempt on reset buckets.
+    if synced:
+        for module in (parallel_module, pm):
+            if hasattr(module, '_sync_grad_required'):
+                module._sync_grad_required = False
 
 
 def _make_viewless(t):
@@ -422,11 +447,10 @@ class MergedScheduler:
         num_mbs = len(samples)
         assert num_mbs >= 2, "merged FWD-BWD requires at least 2 micro-batches"
 
-        # Ensure COMP/COMM streams see all prior default-stream work
-        # (optimizer.step, zero_grad from the previous training step).
-        # Non-blocking streams do NOT auto-synchronize with the default stream,
-        # so without this explicit sync, the forward pass might read stale
-        # parameters or see non-zeroed gradients.
+        # Ensure COMM, and the optional dedicated COMP stream, see all prior
+        # default-stream work (optimizer.step, zero_grad from the previous
+        # training step). In the default current-stream COMP mode, the COMP wait
+        # is a no-op when the caller is already on the default stream.
         default_done = torch.cuda.Event()
         default_done.record(torch.cuda.default_stream())
         get_comp_stream().wait_event(default_done)
@@ -961,8 +985,7 @@ class MergedScheduler:
     def _backward_layer(self, nodes, grad_h):
         """Backward through a 2-node layer: body -> attn."""
         attn_n, body_n = nodes
-        # Ensure all intermediate ops run on COMP stream,
-        # not the default stream (which has no sync with COMP/COMM in overlap mode).
+        # Ensure all intermediate ops run on the active COMP stream.
         with torch.cuda.stream(get_comp_stream()):
             body_grads = body_n.backward(grad_h)
             grad_x = attn_n.backward(body_grads)
@@ -976,8 +999,7 @@ class MergedScheduler:
         """
         attn_n, dispatch_n, expert_n, combine_n = nodes
 
-        # Ensure all intermediate ops run on COMP stream,
-        # not the default stream (which has no sync with COMP/COMM in overlap mode).
+        # Ensure all intermediate ops run on the active COMP stream.
         with torch.cuda.stream(get_comp_stream()):
             self._sync_comp_to_comm()
 
@@ -1031,7 +1053,7 @@ class MergedScheduler:
         fwd_nodes = self._create_nodes(fwd_lc, fwd_event)
         fwd_attn, fwd_body = fwd_nodes
 
-        # Ensure all intermediate ops run on COMP stream, not default stream.
+        # Ensure all intermediate ops run on the active COMP stream.
         with torch.cuda.stream(get_comp_stream()):
             body_grads = bwd_body.backward(grad_h)
             fwd_attn_out = fwd_attn.forward((fwd_h,))
@@ -1069,8 +1091,7 @@ class MergedScheduler:
 
         pool = self._async_pool  # None in sequential mode
 
-        # Ensure grad addition runs on COMP stream,
-        # not the default stream (which has no sync with COMP/COMM in overlap mode).
+        # Ensure grad addition runs on the active COMP stream.
         # ScheduleNode calls internally switch to their own stream and restore on exit.
         with torch.cuda.stream(get_comp_stream()):
             # Initial sync: COMP→COMM so COMM can read grad_h (from loss_bwd on COMP)

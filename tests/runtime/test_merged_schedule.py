@@ -14,6 +14,7 @@ from nnscaler.runtime.merged_schedule import (
     ScheduleNode,
     get_comm_stream,
     get_comp_stream,
+    manual_sync_grads,
     set_streams,
 )
 from tests.launch_torchrun import launch_torchrun
@@ -40,6 +41,42 @@ class _CountingMergedScheduler(MergedScheduler):
 def _assert_current_stream(expected_stream):
     current = torch.cuda.current_stream()
     assert current.cuda_stream == expected_stream.cuda_stream
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available(),
+    reason='requires CUDA streams',
+)
+def test_comp_stream_defaults_to_current_stream(monkeypatch):
+    monkeypatch.delenv('NNSCALER_MOE_OVERLAP_DEDICATED_COMP_STREAM', raising=False)
+    set_streams()
+
+    default_stream = torch.cuda.current_stream()
+    assert get_comp_stream().cuda_stream == default_stream.cuda_stream
+    assert get_comm_stream().cuda_stream != default_stream.cuda_stream
+
+    side_stream = torch.cuda.Stream()
+    with torch.cuda.stream(side_stream):
+        assert get_comp_stream().cuda_stream == side_stream.cuda_stream
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available(),
+    reason='requires CUDA streams',
+)
+def test_dedicated_comp_stream_mode_is_opt_in(monkeypatch):
+    monkeypatch.setenv('NNSCALER_MOE_OVERLAP_DEDICATED_COMP_STREAM', '1')
+    set_streams()
+
+    dedicated_stream = get_comp_stream()
+    assert dedicated_stream.cuda_stream != torch.cuda.current_stream().cuda_stream
+
+    side_stream = torch.cuda.Stream()
+    with torch.cuda.stream(side_stream):
+        assert get_comp_stream().cuda_stream == dedicated_stream.cuda_stream
+
+    monkeypatch.delenv('NNSCALER_MOE_OVERLAP_DEDICATED_COMP_STREAM', raising=False)
+    set_streams()
 
 
 def test_overlap_dispatch_backward_with_expert_wgrad_async_order():
@@ -97,6 +134,40 @@ def test_overlap_dispatch_backward_with_expert_wgrad_sequential_order():
 
     assert dispatch_grads == ('grad_h_ln', 'grad_router')
     assert trace == ['dispatch_bwd_enter', 'dispatch_bwd_exit', 'expert_wgrad']
+
+
+def test_manual_sync_grads_marks_parallel_module_clean():
+    class Bucket:
+        def __init__(self):
+            self._async = True
+            self.synced = 0
+            self.reset_called = 0
+
+        def sync_grads(self):
+            assert self._async is False
+            self.synced += 1
+
+        def reset(self):
+            self.reset_called += 1
+
+    class Reducer:
+        def __init__(self, bucket):
+            self._buckets = [bucket]
+
+    class ParallelModule:
+        pass
+
+    bucket = Bucket()
+    module = ParallelModule()
+    module._reducers = [Reducer(bucket)]
+    module._sync_grad_required = True
+
+    manual_sync_grads(module)
+
+    assert bucket.synced == 1
+    assert bucket.reset_called == 1
+    assert bucket._async is True
+    assert module._sync_grad_required is False
 
 
 class _AuxOnlyBranch(torch.autograd.Function):
