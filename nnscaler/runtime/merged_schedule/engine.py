@@ -1310,13 +1310,14 @@ class MergedScheduler:
         Each phase interleaves COMP and COMM operations from different
         micro-batches. Within each phase, COMP and COMM run in PARALLEL on
         the GPU because we skip the per-node shared-event protocol (which
-        would serialize all operations). Instead, we use explicit cross-stream
-        barriers at phase boundaries to enforce data dependencies.
+        would serialize all operations). Instead, we use explicit stream
+        synchronization only at the dependency boundaries.
 
         Phase 1: f_attn_router(COMP) || b_combine(COMM)   [attn includes shared fwd]
         Phase 2: b_expert_dgrad (COMP) || f_dispatch (COMM)
         Phase 3: b_expert_wgrad (COMP) || b_dispatch (COMM)
-        Phase 4: f_expert (COMP), then b_attn (COMP) || f_combine (COMM)
+        Phase 4: f_expert (COMP), then b_attn (COMP) || f_combine (COMM),
+                 with only a COMM->COMP wait before b_attn consumes b_dispatch grads.
         """
         bwd_attn, bwd_dispatch, bwd_expert, bwd_combine = bwd_nodes
         fwd_nodes = self._create_nodes_4(fwd_lc, fwd_event)
@@ -1494,15 +1495,20 @@ class MergedScheduler:
             grad_dispatch_tokens, grad_dispatch_probs = dispatch_grads[:2]
             del dispatch_grads
 
-            # Phase boundary: f_expert and b_attn need b_dispatch grads;
-            # COMM must not start f_combine before delayed wgrad finishes.
-            timing_record = self._timing_record_start('barrier2_p3_to_p4')
-            self._cross_stream_barrier(slot=2)
-            self._timing_record_end(timing_record)
-
             timing_record = self._timing_record_start('phase4_f_expert')
             fwd_expert_out = self._timing_call(
                 timing_record, 'comp', fwd_expert.forward, fwd_dispatch_out)
+            self._timing_record_end(timing_record)
+
+            # Only b_attn consumes b_dispatch grads.  f_expert depends on the
+            # forward dispatch output from phase 2, so it can run immediately
+            # after delayed wgrad instead of waiting for phase-3 COMM kernels.
+            # Insert the COMM->COMP wait after f_expert has been enqueued and
+            # before f_combine is enqueued, so b_attn waits for b_dispatch but
+            # does not wait for f_combine.
+            timing_record = self._timing_record_start(
+                'sync_b_dispatch_before_b_attn')
+            get_comp_stream().wait_stream(get_comm_stream())
             self._timing_record_end(timing_record)
 
             self._sync_comp_to_comm()

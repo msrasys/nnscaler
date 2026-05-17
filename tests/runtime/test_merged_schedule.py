@@ -379,7 +379,15 @@ def _worker():
             else:
                 assert 'phase3_b_dispatch_b_expert_wgrad' in phase_names
                 assert 'phase4_f_expert' in phase_names
-                assert phase_names.index('phase3_b_dispatch_b_expert_wgrad') < phase_names.index('phase4_f_expert')
+                assert 'sync_b_dispatch_before_b_attn' in phase_names
+                assert phase_names.index(
+                    'phase3_b_dispatch_b_expert_wgrad'
+                ) < phase_names.index('phase4_f_expert')
+                assert phase_names.index(
+                    'phase4_f_expert'
+                ) < phase_names.index(
+                    'sync_b_dispatch_before_b_attn'
+                ) < phase_names.index('phase4_b_attn_f_combine')
             case_results.append({
                 'use_checkpoint': use_checkpoint,
                 'use_aux_loss': use_aux_loss,
