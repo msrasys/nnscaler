@@ -887,12 +887,19 @@ class MergedScheduler:
             lc.attn_fn, comp_stream, event,
             name="attn_router", checkpoint=self.use_checkpoint)
 
+        dispatch_free_input = bool(lc.step_data.get('_free_dispatch_inputs', False))
+        expert_free_input = (
+            bool(lc.step_data.get('_free_expert_inputs', False))
+            and not self.use_checkpoint)
+
         dispatch_node = ScheduleNode(
             lc.dispatch_fn, comm_stream, event,
+            free_input=dispatch_free_input,
             name="dispatch", checkpoint=False)
 
         expert_node = ScheduleNode(
             lc.expert_fn, comp_stream, event,
+            free_input=expert_free_input,
             name="expert", checkpoint=self.use_checkpoint)
 
         combine_node = ScheduleNode(
