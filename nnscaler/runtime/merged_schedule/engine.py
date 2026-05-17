@@ -7,8 +7,8 @@ MergedScheduler (merged forward-backward with communication/computation overlap)
 4-Phase Overlap (MoE layers):
   Phase 1: f_attn_router(COMP) || b_combine(COMM)
   Phase 2: b_expert (COMP) || f_dispatch   (COMM)
-  Phase 3: f_expert (COMP) || b_dispatch(COMM)
-  Phase 4: b_attn   (COMP) || f_combine    (COMM)
+  Phase 3: b_expert_wgrad(COMP) || b_dispatch(COMM)
+  Phase 4: f_expert(COMP), then b_attn(COMP) || f_combine(COMM)
 
 2-Phase Overlap (dense layers):
   Phase 1: body_bwd(prev)[COMP] || attn_fwd(next)[COMP]
@@ -391,6 +391,7 @@ class LayerCallables:
     attn_fn: Callable = None          # (h) -> residual, dispatch inputs, aux, shared
     dispatch_fn: Callable = None      # dispatch communication only
     expert_fn: Callable = None        # dispatch postprocess + routed expert + combine preprocess
+    expert_wgrad_fn: Callable = None  # delayed routed expert wgrad after expert dgrad
     combine_fn: Callable = None       # (expert_outs) -> h_out; residual/shared state in step_data
 
     # Dense-only:
@@ -901,6 +902,8 @@ class MergedScheduler:
             lc.expert_fn, comp_stream, event,
             free_input=expert_free_input,
             name="expert", checkpoint=self.use_checkpoint)
+        expert_node.expert_wgrad_fn = lc.expert_wgrad_fn
+        expert_node.step_data = lc.step_data
 
         combine_node = ScheduleNode(
             lc.combine_fn, comm_stream, event,
@@ -934,6 +937,12 @@ class MergedScheduler:
     def _order_cross_stream_for_comp(self, tensors):
         """Compatibility hook; ScheduleNode records actual cross-stream uses."""
         return None
+
+    @staticmethod
+    def _run_expert_wgrad(expert_node):
+        wgrad_fn = getattr(expert_node, 'expert_wgrad_fn', None)
+        if wgrad_fn is not None:
+            wgrad_fn()
 
     @staticmethod
     def _replace_node_output_indexes(node, replacements):
@@ -1203,7 +1212,14 @@ class MergedScheduler:
             expert_grads = expert_n.backward(combine_grads[0])
             if not isinstance(expert_grads, tuple):
                 expert_grads = (expert_grads,)
-            dispatch_grads = dispatch_n.backward(expert_grads)
+            pool = self._async_pool
+            if pool is not None:
+                fut_dispatch = pool.submit(dispatch_n.backward, expert_grads)
+                self._run_expert_wgrad(expert_n)
+                dispatch_grads = fut_dispatch.result()
+            else:
+                dispatch_grads = dispatch_n.backward(expert_grads)
+                self._run_expert_wgrad(expert_n)
             if not isinstance(dispatch_grads, tuple):
                 dispatch_grads = (dispatch_grads,)
 
@@ -1261,9 +1277,9 @@ class MergedScheduler:
         barriers at phase boundaries to enforce data dependencies.
 
         Phase 1: f_attn_router(COMP) || b_combine(COMM)   [attn includes shared fwd]
-        Phase 2: b_expert    (COMP) || f_dispatch (COMM)   [dispatch = communication]
-        Phase 3: f_expert    (COMP) || b_dispatch (COMM)   [expert excludes shared]
-        Phase 4: b_attn      (COMP) || f_combine  (COMM)
+        Phase 2: b_expert_dgrad (COMP) || f_dispatch (COMM)
+        Phase 3: b_expert_wgrad (COMP) || b_dispatch (COMM)
+        Phase 4: f_expert (COMP), then b_attn (COMP) || f_combine (COMM)
         """
         bwd_attn, bwd_dispatch, bwd_expert, bwd_combine = bwd_nodes
         fwd_nodes = self._create_nodes_4(fwd_lc, fwd_event)
@@ -1352,22 +1368,32 @@ class MergedScheduler:
             self._timing_record_end(timing_record)
 
             if self.early_attn_memory_release:
-                # Run backward dispatch and attention before later forward
+                # Run backward dispatch/wgrad and attention before later forward
                 # expert/combine allocations. This lowers peak memory at the
-                # cost of Phase-3/4 overlap.
-                timing_record = self._timing_record_start('phase3_early_b_dispatch_b_attn')
+                # cost of delaying the next forward expert.
+                timing_record = self._timing_record_start(
+                    'phase3_early_b_dispatch_b_expert_wgrad')
                 if pool is not None:
                     fut_dispatch_bwd = pool.submit(
                         self._timing_call, timing_record, 'comm',
                         bwd_dispatch.backward, expert_grads)
+                    self._timing_call(
+                        timing_record, 'comp', self._run_expert_wgrad, bwd_expert)
                     dispatch_grads = fut_dispatch_bwd.result()
                 else:
                     dispatch_grads = self._timing_call(
                         timing_record, 'comm', bwd_dispatch.backward, expert_grads)
+                    self._timing_call(
+                        timing_record, 'comp', self._run_expert_wgrad, bwd_expert)
+                self._timing_record_end(timing_record)
                 if not isinstance(dispatch_grads, tuple):
                     dispatch_grads = (dispatch_grads,)
 
-                self._sync_comm_to_comp()
+                timing_record = self._timing_record_start('barrier2_p3_to_p4')
+                self._cross_stream_barrier(slot=2)
+                self._timing_record_end(timing_record)
+
+                timing_record = self._timing_record_start('phase4_early_b_attn')
                 attn_grads = self._attn_backward_grads(
                     bwd_attn, combine_grads[1], dispatch_grads[0], dispatch_grads[1],
                     combine_grads[2])
@@ -1377,7 +1403,7 @@ class MergedScheduler:
                 self._order_cross_stream_for_comp(combine_grads)
                 self._timing_record_end(timing_record)
 
-                timing_record = self._timing_record_start('phase4_early_f_expert_f_combine')
+                timing_record = self._timing_record_start('phase5_early_f_expert_f_combine')
                 fwd_expert_out = self._timing_call(
                     timing_record, 'comp', fwd_expert.forward, fwd_dispatch_out)
                 self._sync_comp_to_comm()
@@ -1396,29 +1422,36 @@ class MergedScheduler:
 
                 return fwd_h_out, grad_x, ('layer4', fwd_nodes)
 
-            # Phase 3: COMM(b_dispatch) || COMP(f_expert)
-            timing_record = self._timing_record_start('phase3_f_expert_b_dispatch')
+            # Phase 3: COMM(b_dispatch) || COMP(b_expert_wgrad)
+            timing_record = self._timing_record_start('phase3_b_dispatch_b_expert_wgrad')
             if pool is not None:
                 fut_dispatch_bwd = pool.submit(
                     self._timing_call, timing_record, 'comm',
                     bwd_dispatch.backward, expert_grads)
-                fwd_expert_out = self._timing_call(
-                    timing_record, 'comp', fwd_expert.forward, fwd_dispatch_out)
+                self._timing_call(
+                    timing_record, 'comp', self._run_expert_wgrad, bwd_expert)
                 dispatch_grads = fut_dispatch_bwd.result()
             else:
                 dispatch_grads = self._timing_call(
                     timing_record, 'comm', bwd_dispatch.backward, expert_grads)
-                fwd_expert_out = self._timing_call(
-                    timing_record, 'comp', fwd_expert.forward, fwd_dispatch_out)
+                self._timing_call(
+                    timing_record, 'comp', self._run_expert_wgrad, bwd_expert)
             self._timing_record_end(timing_record)
             if not isinstance(dispatch_grads, tuple):
                 dispatch_grads = (dispatch_grads,)
 
-            # Phase boundary: Phase 4 COMP needs COMM output (dispatch_grads),
-            # Phase 4 COMM needs COMP output (combine-ready expert_out)
+            # Phase boundary: f_expert and b_attn need b_dispatch grads;
+            # COMM must not start f_combine before delayed wgrad finishes.
             timing_record = self._timing_record_start('barrier2_p3_to_p4')
             self._cross_stream_barrier(slot=2)
             self._timing_record_end(timing_record)
+
+            timing_record = self._timing_record_start('phase4_f_expert')
+            fwd_expert_out = self._timing_call(
+                timing_record, 'comp', fwd_expert.forward, fwd_dispatch_out)
+            self._timing_record_end(timing_record)
+
+            self._sync_comp_to_comm()
 
             # Phase 4: COMM(f_combine) || COMP(b_attn)
             timing_record = self._timing_record_start('phase4_b_attn_f_combine')

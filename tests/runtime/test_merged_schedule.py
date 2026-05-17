@@ -21,10 +21,15 @@ class _CountingMergedScheduler(MergedScheduler):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.merged_4phase_calls = 0
+        self.phase_names = []
 
     def _merged_step_4phase(self, *args, **kwargs):
         self.merged_4phase_calls += 1
         return super()._merged_step_4phase(*args, **kwargs)
+
+    def _timing_record_start(self, name):
+        self.phase_names.append(name)
+        return super()._timing_record_start(name)
 
 
 def _assert_current_stream(expected_stream):
@@ -84,7 +89,7 @@ class _FakeMoELayer(nn.Module):
         self.use_aux_loss = use_aux_loss
         self.step_data = None
         self.check_streams = False
-        self.stream_counts = {'comp': 0, 'comm': 0, 'all_reduce': 0}
+        self.stream_counts = {'comp': 0, 'comm': 0, 'all_reduce': 0, 'wgrad': 0}
 
     def _check_comp_stream(self):
         if self.check_streams:
@@ -135,6 +140,10 @@ class _FakeMoELayer(nn.Module):
         expert_out = torch.relu(self.expert(dispatched)) * (reduced_probs + 0.5)
         return expert_out
 
+    def expert_wgrad(self):
+        self._check_comp_stream()
+        self.stream_counts['wgrad'] += 1
+
     def combine_forward(self, expert_out, h_residual=None, shared_out=None):
         self._check_comm_stream()
         if h_residual is None:
@@ -158,14 +167,15 @@ class _FakeMoEModel(nn.Module):
     def set_stream_checks(self, enabled):
         for layer in self.layers:
             layer.check_streams = enabled
-            layer.stream_counts = {'comp': 0, 'comm': 0, 'all_reduce': 0}
+            layer.stream_counts = {'comp': 0, 'comm': 0, 'all_reduce': 0, 'wgrad': 0}
 
     def stream_counts(self):
-        counts = {'comp': 0, 'comm': 0, 'all_reduce': 0}
+        counts = {'comp': 0, 'comm': 0, 'all_reduce': 0, 'wgrad': 0}
         for layer in self.layers:
             counts['comp'] += layer.stream_counts['comp']
             counts['comm'] += layer.stream_counts['comm']
             counts['all_reduce'] += layer.stream_counts['all_reduce']
+            counts['wgrad'] += layer.stream_counts['wgrad']
         return counts
 
     def forward(self, x, return_aux=False):
@@ -255,6 +265,7 @@ def _run_merged(model, samples, use_checkpoint=False, use_aux_loss=False,
             attn_fn=bind_step_data(layer.attn_forward),
             dispatch_fn=bind_step_data(layer.dispatch_forward),
             expert_fn=bind_step_data(layer.expert_forward),
+            expert_wgrad_fn=bind_step_data(layer.expert_wgrad),
             combine_fn=bind_step_data(layer.combine_forward),
             is_moe=True,
             step_data=step_data,
@@ -289,7 +300,13 @@ def _run_merged(model, samples, use_checkpoint=False, use_aux_loss=False,
     results = scheduler.run(samples, layer_callables_fn, embed_fn, loss_fn)
     torch.cuda.synchronize()
     losses = torch.stack([result[0] for result in results])
-    return losses, _distributed_grad_norm(model), scheduler.merged_4phase_calls, model.stream_counts()
+    return (
+        losses,
+        _distributed_grad_norm(model),
+        scheduler.merged_4phase_calls,
+        model.stream_counts(),
+        scheduler.phase_names,
+    )
 
 
 def _worker():
@@ -320,7 +337,8 @@ def _worker():
 
             sequential_losses, sequential_gnorm = _run_sequential(
                 sequential_model, samples, use_aux_loss=use_aux_loss)
-            merged_losses, merged_gnorm, merged_4phase_calls, stream_counts = _run_merged(
+            (merged_losses, merged_gnorm, merged_4phase_calls,
+             stream_counts, phase_names) = _run_merged(
                 merged_model, samples,
                 use_checkpoint=use_checkpoint,
                 use_aux_loss=use_aux_loss,
@@ -352,6 +370,16 @@ def _worker():
             assert stream_counts['comp'] > 0
             assert stream_counts['comm'] > 0
             assert stream_counts['all_reduce'] > 0
+            assert stream_counts['wgrad'] == len(merged_model.layers) * len(samples)
+            assert 'phase3_f_expert_b_dispatch' not in phase_names
+            if early_attn_memory_release:
+                assert 'phase3_early_b_dispatch_b_expert_wgrad' in phase_names
+                assert 'phase4_early_b_attn' in phase_names
+                assert 'phase5_early_f_expert_f_combine' in phase_names
+            else:
+                assert 'phase3_b_dispatch_b_expert_wgrad' in phase_names
+                assert 'phase4_f_expert' in phase_names
+                assert phase_names.index('phase3_b_dispatch_b_expert_wgrad') < phase_names.index('phase4_f_expert')
             case_results.append({
                 'use_checkpoint': use_checkpoint,
                 'use_aux_loss': use_aux_loss,
@@ -359,6 +387,7 @@ def _worker():
                 'async_4phase': async_4phase,
                 'merged_4phase_calls': merged_4phase_calls,
                 'stream_counts': stream_counts,
+                'phase_names': phase_names,
             })
         return {
             'rank': rank,
@@ -386,3 +415,5 @@ def test_merged_scheduler_fake_moe_matches_sequential_gnorm():
             assert case['stream_counts']['comp'] > 0
             assert case['stream_counts']['comm'] > 0
             assert case['stream_counts']['all_reduce'] > 0
+            assert case['stream_counts']['wgrad'] == 4
+            assert 'phase3_f_expert_b_dispatch' not in case['phase_names']
