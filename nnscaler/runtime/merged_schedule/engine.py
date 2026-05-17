@@ -939,23 +939,6 @@ class MergedScheduler:
         get_comm_stream().wait_event(comp_evt)
         get_comp_stream().wait_event(comm_evt)
 
-    def _comm_waits_for_comp_and_return_comm_event(self, slot=0):
-        """Order COMM after COMP, and return COMM's current-position event.
-
-        This is the split form of _cross_stream_barrier().  It records both
-        streams at a phase boundary, immediately makes COMM wait for COMP,
-        and lets the caller decide when COMP must wait for the recorded COMM
-        position.  The MoE phase2->phase3 boundary needs exactly this: the
-        backward dispatch on COMM needs expert dgrad from COMP, but expert
-        wgrad on COMP does not need the forward dispatch result.
-        """
-        comp_evt = self._barrier_comp_evts[slot]
-        comm_evt = self._barrier_comm_evts[slot]
-        comp_evt.record(get_comp_stream())
-        comm_evt.record(get_comm_stream())
-        get_comm_stream().wait_event(comp_evt)
-        return comm_evt
-
     def _order_cross_stream_for_comp(self, tensors):
         """Compatibility hook; ScheduleNode records actual cross-stream uses."""
         return None
@@ -1404,18 +1387,26 @@ class MergedScheduler:
 
             # Phase 2: COMM(f_dispatch) || COMP(b_expert)
             timing_record = self._timing_record_start('phase2_b_expert_f_dispatch')
+
+            def _forward_dispatch_with_done_event(record, tokens, probs):
+                dispatch_out = self._timing_call(
+                    record, 'comm', fwd_dispatch.forward, (tokens, probs))
+                dispatch_done_evt = torch.cuda.Event()
+                dispatch_done_evt.record(get_comm_stream())
+                return dispatch_out, dispatch_done_evt
+
+            fwd_dispatch_future = None
+            fwd_dispatch_out = None
+            fwd_dispatch_done_evt = None
             if pool is not None:
-                fut_dispatch = pool.submit(
-                    self._timing_call, timing_record, 'comm',
-                    fwd_dispatch.forward, (fwd_dispatch_tokens, fwd_dispatch_probs))
+                fwd_dispatch_future = pool.submit(
+                    _forward_dispatch_with_done_event, timing_record,
+                    fwd_dispatch_tokens, fwd_dispatch_probs)
                 expert_grads = self._timing_call(
                     timing_record, 'comp', bwd_expert.backward, grad_expert_out)
-                fwd_dispatch_out = fut_dispatch.result()
-                del fut_dispatch
             else:
-                fwd_dispatch_out = self._timing_call(
-                    timing_record, 'comm', fwd_dispatch.forward,
-                    (fwd_dispatch_tokens, fwd_dispatch_probs))
+                fwd_dispatch_out, fwd_dispatch_done_evt = _forward_dispatch_with_done_event(
+                    timing_record, fwd_dispatch_tokens, fwd_dispatch_probs)
                 expert_grads = self._timing_call(
                     timing_record, 'comp', bwd_expert.backward, grad_expert_out)
             self._timing_record_end(timing_record)
@@ -1424,8 +1415,6 @@ class MergedScheduler:
                 expert_grads = (expert_grads,)
             # expert_grads: grad for dispatch output tokens; detached probs grad
             # is collected from dispatch_node.detach() during dispatch backward.
-            fwd_dispatch_out = self._prepare_dispatch_state(
-                fwd_dispatch, fwd_lc, fwd_dispatch_out)
             del fwd_dispatch_tokens, fwd_dispatch_probs
 
             # Phase boundary: Phase 3 COMM needs COMP output (expert_grads),
@@ -1433,8 +1422,13 @@ class MergedScheduler:
             # make b_expert_wgrad wait for the forward dispatch tail here;
             # defer the COMP wait on f_dispatch until f_expert consumes it.
             timing_record = self._timing_record_start('barrier1_p2_to_p3')
-            fwd_dispatch_done_evt = self._comm_waits_for_comp_and_return_comm_event(slot=1)
+            phase2_comp_done_evt = self._barrier_comp_evts[1]
+            phase2_comp_done_evt.record(get_comp_stream())
             self._timing_record_end(timing_record)
+
+            def _backward_dispatch_after_phase2_comp(record, grads):
+                get_comm_stream().wait_event(phase2_comp_done_evt)
+                return self._timing_call(record, 'comm', bwd_dispatch.backward, grads)
 
             if self.early_attn_memory_release:
                 # Run backward dispatch/wgrad and attention before later forward
@@ -1444,15 +1438,14 @@ class MergedScheduler:
                     'phase3_early_b_dispatch_b_expert_wgrad')
                 if pool is not None:
                     fut_dispatch_bwd = pool.submit(
-                        self._timing_call, timing_record, 'comm',
-                        bwd_dispatch.backward, expert_grads)
+                        _backward_dispatch_after_phase2_comp, timing_record, expert_grads)
                     self._timing_call(
                         timing_record, 'comp', self._run_expert_wgrad, bwd_expert)
                     dispatch_grads = fut_dispatch_bwd.result()
                     del fut_dispatch_bwd
                 else:
-                    dispatch_grads = self._timing_call(
-                        timing_record, 'comm', bwd_dispatch.backward, expert_grads)
+                    dispatch_grads = _backward_dispatch_after_phase2_comp(
+                        timing_record, expert_grads)
                     self._timing_call(
                         timing_record, 'comp', self._run_expert_wgrad, bwd_expert)
                 self._timing_record_end(timing_record)
@@ -1481,6 +1474,16 @@ class MergedScheduler:
                 )
                 self._cleanup_layer_nodes(bwd_nodes)
 
+                if fwd_dispatch_future is not None:
+                    fwd_dispatch_out, fwd_dispatch_done_evt = fwd_dispatch_future.result()
+                    del fwd_dispatch_future
+                fwd_dispatch_out = self._prepare_dispatch_state(
+                    fwd_dispatch, fwd_lc, fwd_dispatch_out)
+
+                timing_record = self._timing_record_start('wait_f_dispatch_before_f_expert')
+                get_comp_stream().wait_event(fwd_dispatch_done_evt)
+                self._timing_record_end(timing_record)
+
                 timing_record = self._timing_record_start('phase5_early_f_expert_f_combine')
                 fwd_expert_out = self._timing_call(
                     timing_record, 'comp', fwd_expert.forward, fwd_dispatch_out)
@@ -1502,25 +1505,26 @@ class MergedScheduler:
 
             # Phase 3: COMM(b_dispatch) || COMP(b_expert_wgrad)
             timing_record = self._timing_record_start('phase3_b_dispatch_b_expert_wgrad')
+            dispatch_grads_future = None
+            dispatch_grads = None
             if pool is not None:
-                fut_dispatch_bwd = pool.submit(
-                    self._timing_call, timing_record, 'comm',
-                    bwd_dispatch.backward, expert_grads)
+                dispatch_grads_future = pool.submit(
+                    _backward_dispatch_after_phase2_comp, timing_record, expert_grads)
                 self._timing_call(
                     timing_record, 'comp', self._run_expert_wgrad, bwd_expert)
-                dispatch_grads = fut_dispatch_bwd.result()
-                del fut_dispatch_bwd
             else:
-                dispatch_grads = self._timing_call(
-                    timing_record, 'comm', bwd_dispatch.backward, expert_grads)
+                dispatch_grads = _backward_dispatch_after_phase2_comp(
+                    timing_record, expert_grads)
                 self._timing_call(
                     timing_record, 'comp', self._run_expert_wgrad, bwd_expert)
             self._timing_record_end(timing_record)
             del expert_grads
-            if not isinstance(dispatch_grads, tuple):
-                dispatch_grads = (dispatch_grads,)
-            grad_dispatch_tokens, grad_dispatch_probs = dispatch_grads[:2]
-            del dispatch_grads
+
+            if fwd_dispatch_future is not None:
+                fwd_dispatch_out, fwd_dispatch_done_evt = fwd_dispatch_future.result()
+                del fwd_dispatch_future
+            fwd_dispatch_out = self._prepare_dispatch_state(
+                fwd_dispatch, fwd_lc, fwd_dispatch_out)
 
             timing_record = self._timing_record_start('wait_f_dispatch_before_f_expert')
             get_comp_stream().wait_event(fwd_dispatch_done_evt)
@@ -1539,6 +1543,13 @@ class MergedScheduler:
             # does not wait for f_combine.
             timing_record = self._timing_record_start(
                 'sync_b_dispatch_before_b_attn')
+            if dispatch_grads_future is not None:
+                dispatch_grads = dispatch_grads_future.result()
+                del dispatch_grads_future
+            if not isinstance(dispatch_grads, tuple):
+                dispatch_grads = (dispatch_grads,)
+            grad_dispatch_tokens, grad_dispatch_probs = dispatch_grads[:2]
+            del dispatch_grads
             get_comp_stream().wait_stream(get_comm_stream())
             self._timing_record_end(timing_record)
 
