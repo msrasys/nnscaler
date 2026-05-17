@@ -6,8 +6,8 @@ MergedScheduler (merged forward-backward with communication/computation overlap)
 
 4-Phase Overlap (MoE layers):
   Phase 1: f_attn_router(COMP) || b_combine(COMM)
-  Phase 2: b_expert (COMP) || f_dispatch   (COMM)
-  Phase 3: f_expert (COMP) || b_dispatch(COMM)
+  Phase 2: b_expert_dgrad (COMP) || f_dispatch(COMM)
+  Phase 3: b_expert_wgrad + f_expert (COMP) || b_dispatch(COMM)
   Phase 4: b_attn   (COMP) || f_combine    (COMM)
 
 2-Phase Overlap (dense layers):
@@ -21,6 +21,7 @@ Dense layers use 2 ScheduleNodes (attn, ffn) both on COMP stream.
 
 import logging
 import os
+import threading
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -763,6 +764,48 @@ class MergedScheduler:
         get_comm_stream().wait_event(comp_evt)
         get_comp_stream().wait_event(comm_evt)
 
+    def _overlap_dispatch_backward_with_expert_wgrad(
+        self,
+        dispatch_node,
+        expert_node,
+        expert_grads,
+        after_wgrad=None,
+    ):
+        """Run dispatch backward without waiting for expert wgrad.
+
+        Dispatch backward only depends on expert dgrad outputs. Expert wgrad
+        consumes delayed wgrad tasks produced by that expert backward, so it can
+        be launched after dispatch backward is submitted instead of before it.
+        Callers must establish the comp->comm dependency for ``expert_grads``
+        before invoking this helper.
+        """
+        dispatch_inputs = (expert_grads[0], expert_grads[1])
+        after_result = None
+        pool = self._async_pool
+
+        if pool is not None:
+            dispatch_started = threading.Event()
+
+            def dispatch_backward():
+                dispatch_started.set()
+                return dispatch_node.backward(dispatch_inputs)
+
+            fut_dispatch_bwd = pool.submit(dispatch_backward)
+            dispatch_started.wait()
+            expert_node.backward_dw()
+            if after_wgrad is not None:
+                after_result = after_wgrad()
+            dispatch_grads = fut_dispatch_bwd.result()
+        else:
+            dispatch_grads = dispatch_node.backward(dispatch_inputs)
+            expert_node.backward_dw()
+            if after_wgrad is not None:
+                after_result = after_wgrad()
+
+        if after_wgrad is None:
+            return dispatch_grads
+        return dispatch_grads, after_result
+
     def _order_cross_stream_for_comp(self, tensors):
         """Order producer streams after queued COMP work that uses tensors."""
         _order_cross_stream_tensors_until_done(tensors, get_comp_stream())
@@ -1012,9 +1055,20 @@ class MergedScheduler:
             combine_grads = self._collect_combine_grads(combine_n, combine_grads)
             # expert backward needs grads for both outputs: expert_outs and shared_expert_out
             expert_grads = expert_n.backward((combine_grads[0], combine_grads[2]))
-            expert_n.backward_dw()
             # expert_grads: (grad_sorted_tokens, grad_sorted_probs, grad_h_ln)
-            dispatch_grads = dispatch_n.backward((expert_grads[0], expert_grads[1]))
+            # The shared per-microbatch event would serialize dispatch backward
+            # with expert wgrad. Use explicit stream ordering for this overlap.
+            old_dispatch_skip = dispatch_n._skip_event
+            old_expert_skip = expert_n._skip_event
+            dispatch_n._skip_event = True
+            expert_n._skip_event = True
+            try:
+                self._sync_comp_to_comm()
+                dispatch_grads = self._overlap_dispatch_backward_with_expert_wgrad(
+                    dispatch_n, expert_n, expert_grads)
+            finally:
+                dispatch_n._skip_event = old_dispatch_skip
+                expert_n._skip_event = old_expert_skip
 
             self._sync_comm_to_comp()
 
@@ -1071,8 +1125,8 @@ class MergedScheduler:
         barriers at phase boundaries to enforce data dependencies.
 
         Phase 1: f_attn_router(COMP) || b_combine(COMM)   [combine = pure comm]
-        Phase 2: b_expert    (COMP) || f_dispatch (COMM)   [expert includes shared expert bwd]
-        Phase 3: f_expert    (COMP) || b_dispatch (COMM)   [expert includes shared expert fwd]
+        Phase 2: b_expert_dgrad (COMP) || f_dispatch (COMM)
+        Phase 3: b_expert_wgrad + f_expert (COMP) || b_dispatch (COMM)
         Phase 4: b_attn      (COMP) || f_combine  (COMM)
 
         Shared expert is merged into expert_fn (COMP stream), keeping
@@ -1119,8 +1173,10 @@ class MergedScheduler:
             # Phase 2 COMM needs COMP output (attn_out + precomputed metadata)
             self._cross_stream_barrier(slot=0)
 
-            # Phase 2: COMM(f_dispatch) || COMP(b_expert)
-            # expert backward includes shared expert backward (both on COMP).
+            # Phase 2: COMM(f_dispatch) || COMP(b_expert_dgrad)
+            # expert backward includes shared expert backward (both on COMP),
+            # but routed expert wgrad is delayed until Phase 3 so it does not
+            # block dispatch backward.
             # combine_grads: (grad_expert_outs, grad_h_residual, grad_shared_expert_out)
             if pool is not None:
                 fut_dispatch = pool.submit(fwd_dispatch.forward, (fwd_h_ln, fwd_routing_probs))
@@ -1129,7 +1185,6 @@ class MergedScheduler:
             else:
                 fwd_dispatch_out = fwd_dispatch.forward((fwd_h_ln, fwd_routing_probs))
                 expert_grads = bwd_expert.backward((combine_grads[0], combine_grads[2]))
-            bwd_expert.backward_dw()
             # expert_grads: (grad_sorted_tokens, grad_sorted_probs, grad_h_ln)
 
             # Phase boundary: Phase 3 COMP needs COMM output (dispatch_out),
@@ -1139,13 +1194,10 @@ class MergedScheduler:
             if self.early_attn_memory_release:
                 # Run backward dispatch and attention before later forward
                 # expert/combine allocations. This lowers peak memory at the
-                # cost of Phase-3/4 overlap.
-                if pool is not None:
-                    fut_dispatch_bwd = pool.submit(
-                        bwd_dispatch.backward, (expert_grads[0], expert_grads[1]))
-                    dispatch_grads = fut_dispatch_bwd.result()
-                else:
-                    dispatch_grads = bwd_dispatch.backward((expert_grads[0], expert_grads[1]))
+                # cost of most Phase-3/4 overlap, but dispatch backward still
+                # starts before routed expert wgrad.
+                dispatch_grads = self._overlap_dispatch_backward_with_expert_wgrad(
+                    bwd_dispatch, bwd_expert, expert_grads)
 
                 self._sync_comm_to_comp()
                 grad_h_ln_total = dispatch_grads[0] + expert_grads[2]
@@ -1175,15 +1227,17 @@ class MergedScheduler:
 
                 return fwd_h_out, grad_x, ('layer4', fwd_nodes)
 
-            # Phase 3: COMM(b_dispatch) || COMP(f_expert)
-            # expert forward includes shared expert (takes h_ln, returns tuple).
-            if pool is not None:
-                fut_dispatch_bwd = pool.submit(bwd_dispatch.backward, (expert_grads[0], expert_grads[1]))
-                fwd_expert_result = fwd_expert.forward((*fwd_dispatch_out, fwd_h_ln))
-                dispatch_grads = fut_dispatch_bwd.result()
-            else:
-                dispatch_grads = bwd_dispatch.backward((expert_grads[0], expert_grads[1]))
-                fwd_expert_result = fwd_expert.forward((*fwd_dispatch_out, fwd_h_ln))
+            # Phase 3: COMM(b_dispatch) || COMP(b_expert_wgrad + f_expert)
+            # Routed expert wgrad only depends on the delayed task from expert
+            # backward, so dispatch backward can be submitted before wgrad.
+            # Expert forward includes shared expert (takes h_ln, returns tuple).
+            def fwd_expert_after_wgrad():
+                return fwd_expert.forward((*fwd_dispatch_out, fwd_h_ln))
+
+            dispatch_grads, fwd_expert_result = (
+                self._overlap_dispatch_backward_with_expert_wgrad(
+                    bwd_dispatch, bwd_expert, expert_grads,
+                    after_wgrad=fwd_expert_after_wgrad))
             fwd_expert_out, fwd_shared_expert_out = fwd_expert_result
             self._prepare_combine_state(fwd_lc, shared_expert_out=fwd_shared_expert_out)
 

@@ -1,5 +1,7 @@
 import copy
 import os
+import threading
+from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 import torch
@@ -38,6 +40,63 @@ class _CountingMergedScheduler(MergedScheduler):
 def _assert_current_stream(expected_stream):
     current = torch.cuda.current_stream()
     assert current.cuda_stream == expected_stream.cuda_stream
+
+
+def test_overlap_dispatch_backward_with_expert_wgrad_async_order():
+    trace = []
+    dispatch_entered = threading.Event()
+    release_dispatch = threading.Event()
+
+    class DispatchNode:
+        def backward(self, grads):
+            assert grads == ('grad_tokens', 'grad_probs')
+            trace.append('dispatch_bwd_enter')
+            dispatch_entered.set()
+            assert release_dispatch.wait(timeout=5)
+            trace.append('dispatch_bwd_exit')
+            return ('grad_h_ln', 'grad_router')
+
+    class ExpertNode:
+        def backward_dw(self):
+            assert dispatch_entered.wait(timeout=5)
+            trace.append('expert_wgrad')
+            release_dispatch.set()
+
+    scheduler = object.__new__(MergedScheduler)
+    scheduler._async_pool = ThreadPoolExecutor(max_workers=1)
+    try:
+        dispatch_grads = scheduler._overlap_dispatch_backward_with_expert_wgrad(
+            DispatchNode(), ExpertNode(),
+            ('grad_tokens', 'grad_probs', 'grad_h_ln_from_expert'))
+    finally:
+        scheduler._async_pool.shutdown(wait=True)
+
+    assert dispatch_grads == ('grad_h_ln', 'grad_router')
+    assert trace == ['dispatch_bwd_enter', 'expert_wgrad', 'dispatch_bwd_exit']
+
+
+def test_overlap_dispatch_backward_with_expert_wgrad_sequential_order():
+    trace = []
+
+    class DispatchNode:
+        def backward(self, grads):
+            assert grads == ('grad_tokens', 'grad_probs')
+            trace.append('dispatch_bwd_enter')
+            trace.append('dispatch_bwd_exit')
+            return ('grad_h_ln', 'grad_router')
+
+    class ExpertNode:
+        def backward_dw(self):
+            trace.append('expert_wgrad')
+
+    scheduler = object.__new__(MergedScheduler)
+    scheduler._async_pool = None
+    dispatch_grads = scheduler._overlap_dispatch_backward_with_expert_wgrad(
+        DispatchNode(), ExpertNode(),
+        ('grad_tokens', 'grad_probs', 'grad_h_ln_from_expert'))
+
+    assert dispatch_grads == ('grad_h_ln', 'grad_router')
+    assert trace == ['dispatch_bwd_enter', 'dispatch_bwd_exit', 'expert_wgrad']
 
 
 class _AuxOnlyBranch(torch.autograd.Function):
