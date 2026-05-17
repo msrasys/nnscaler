@@ -945,6 +945,30 @@ class MergedScheduler:
             wgrad_fn()
 
     @staticmethod
+    def _cleanup_layer_nodes(nodes):
+        """Release references owned by a layer after its backward has completed."""
+        seen_step_data = set()
+        for node in nodes:
+            if node is None:
+                continue
+            node._release()
+            node._skip_event = False
+
+            if hasattr(node, 'loss_aux_tensors'):
+                node.loss_aux_tensors = ()
+            if hasattr(node, 'expert_wgrad_fn'):
+                node.expert_wgrad_fn = None
+
+            step_data = getattr(node, 'step_data', None)
+            if isinstance(step_data, dict):
+                step_data_id = id(step_data)
+                if step_data_id not in seen_step_data:
+                    step_data.clear()
+                    seen_step_data.add(step_data_id)
+            if hasattr(node, 'step_data'):
+                node.step_data = None
+
+    @staticmethod
     def _replace_node_output_indexes(node, replacements):
         if not node.output_is_tuple() or node.output is None:
             return
@@ -1204,12 +1228,16 @@ class MergedScheduler:
         with torch.cuda.stream(get_comp_stream()):
             self._sync_comp_to_comm()
 
-            # combine_grads: (grad_expert_outs, grad_h_residual, grad_shared_expert_out)
-            combine_grads = combine_n.backward(grad_h)
-            combine_grads = self._collect_combine_grads(combine_n, combine_grads)
+            # combine gradients feed different downstream nodes. Split them so
+            # each large tensor can be released as soon as its consumer is enqueued.
+            combine_grads = self._collect_combine_grads(
+                combine_n, combine_n.backward(grad_h))
+            grad_expert_out, grad_h_residual, grad_shared_expert_out = combine_grads
+            del combine_grads
             # expert_grads: grad for dispatch output tokens; detached probs grad
             # is collected from dispatch_node.detach() during dispatch backward.
-            expert_grads = expert_n.backward(combine_grads[0])
+            expert_grads = expert_n.backward(grad_expert_out)
+            del grad_expert_out
             if not isinstance(expert_grads, tuple):
                 expert_grads = (expert_grads,)
             pool = self._async_pool
@@ -1217,21 +1245,30 @@ class MergedScheduler:
                 fut_dispatch = pool.submit(dispatch_n.backward, expert_grads)
                 self._run_expert_wgrad(expert_n)
                 dispatch_grads = fut_dispatch.result()
+                del fut_dispatch
             else:
                 dispatch_grads = dispatch_n.backward(expert_grads)
                 self._run_expert_wgrad(expert_n)
+            del expert_grads
             if not isinstance(dispatch_grads, tuple):
                 dispatch_grads = (dispatch_grads,)
+            grad_dispatch_tokens, grad_dispatch_probs = dispatch_grads[:2]
+            del dispatch_grads
 
             self._sync_comm_to_comp()
 
             attn_grads = self._attn_backward_grads(
-                attn_n, combine_grads[1], dispatch_grads[0], dispatch_grads[1],
-                combine_grads[2])
+                attn_n, grad_h_residual, grad_dispatch_tokens, grad_dispatch_probs,
+                grad_shared_expert_out)
             grad_x = attn_n.backward(attn_grads)
-            self._order_cross_stream_for_comp(dispatch_grads)
-            self._order_cross_stream_for_comp(combine_grads)
+            self._order_cross_stream_for_comp((grad_dispatch_tokens, grad_dispatch_probs))
+            self._order_cross_stream_for_comp((grad_h_residual, grad_shared_expert_out))
+            del (
+                attn_grads, grad_dispatch_tokens, grad_dispatch_probs,
+                grad_h_residual, grad_shared_expert_out,
+            )
 
+        self._cleanup_layer_nodes(nodes)
         return grad_x
 
     def _backward_entry(self, entry, grad_h):
@@ -1312,6 +1349,7 @@ class MergedScheduler:
                 fwd_attn_out = self._timing_call(
                     timing_record, 'comp', fwd_attn.forward, (fwd_h,))
                 combine_grads = fut_combine.result()
+                del fut_combine
             else:
                 combine_grads = self._timing_call(
                     timing_record, 'comm', bwd_combine.backward, grad_h)
@@ -1319,6 +1357,8 @@ class MergedScheduler:
                     timing_record, 'comp', fwd_attn.forward, (fwd_h,))
             self._timing_record_end(timing_record)
             combine_grads = self._collect_combine_grads(bwd_combine, combine_grads)
+            grad_expert_out, grad_h_residual, grad_shared_expert_out = combine_grads
+            del combine_grads
             fwd_h_residual, fwd_dispatch_tokens, fwd_dispatch_probs = fwd_attn_out[:3]
             fwd_shared_expert_out = fwd_attn_out[-1] if len(fwd_attn_out) > 3 else None
             self._prepare_combine_state(
@@ -1330,29 +1370,30 @@ class MergedScheduler:
             self._prepare_loss_aux_tensors(fwd_attn, fwd_lc, fwd_attn_out)
             del fwd_attn_out, fwd_h_residual, fwd_shared_expert_out
 
-            # Phase boundary: Phase 2 COMP needs COMM output (combine_grads),
+            # Phase boundary: Phase 2 COMP needs COMM output (grad_expert_out),
             # Phase 2 COMM needs COMP output (attn_out + precomputed metadata)
             timing_record = self._timing_record_start('barrier0_p1_to_p2')
             self._cross_stream_barrier(slot=0)
             self._timing_record_end(timing_record)
 
             # Phase 2: COMM(f_dispatch) || COMP(b_expert)
-            # combine_grads: (grad_expert_outs, grad_h_residual, grad_shared_expert_out)
             timing_record = self._timing_record_start('phase2_b_expert_f_dispatch')
             if pool is not None:
                 fut_dispatch = pool.submit(
                     self._timing_call, timing_record, 'comm',
                     fwd_dispatch.forward, (fwd_dispatch_tokens, fwd_dispatch_probs))
                 expert_grads = self._timing_call(
-                    timing_record, 'comp', bwd_expert.backward, combine_grads[0])
+                    timing_record, 'comp', bwd_expert.backward, grad_expert_out)
                 fwd_dispatch_out = fut_dispatch.result()
+                del fut_dispatch
             else:
                 fwd_dispatch_out = self._timing_call(
                     timing_record, 'comm', fwd_dispatch.forward,
                     (fwd_dispatch_tokens, fwd_dispatch_probs))
                 expert_grads = self._timing_call(
-                    timing_record, 'comp', bwd_expert.backward, combine_grads[0])
+                    timing_record, 'comp', bwd_expert.backward, grad_expert_out)
             self._timing_record_end(timing_record)
+            del grad_expert_out
             if not isinstance(expert_grads, tuple):
                 expert_grads = (expert_grads,)
             # expert_grads: grad for dispatch output tokens; detached probs grad
@@ -1380,14 +1421,18 @@ class MergedScheduler:
                     self._timing_call(
                         timing_record, 'comp', self._run_expert_wgrad, bwd_expert)
                     dispatch_grads = fut_dispatch_bwd.result()
+                    del fut_dispatch_bwd
                 else:
                     dispatch_grads = self._timing_call(
                         timing_record, 'comm', bwd_dispatch.backward, expert_grads)
                     self._timing_call(
                         timing_record, 'comp', self._run_expert_wgrad, bwd_expert)
                 self._timing_record_end(timing_record)
+                del expert_grads
                 if not isinstance(dispatch_grads, tuple):
                     dispatch_grads = (dispatch_grads,)
+                grad_dispatch_tokens, grad_dispatch_probs = dispatch_grads[:2]
+                del dispatch_grads
 
                 timing_record = self._timing_record_start('barrier2_p3_to_p4')
                 self._cross_stream_barrier(slot=2)
@@ -1395,13 +1440,18 @@ class MergedScheduler:
 
                 timing_record = self._timing_record_start('phase4_early_b_attn')
                 attn_grads = self._attn_backward_grads(
-                    bwd_attn, combine_grads[1], dispatch_grads[0], dispatch_grads[1],
-                    combine_grads[2])
+                    bwd_attn, grad_h_residual, grad_dispatch_tokens, grad_dispatch_probs,
+                    grad_shared_expert_out)
                 grad_x = self._timing_call(
                     timing_record, 'comp', bwd_attn.backward, attn_grads)
-                self._order_cross_stream_for_comp(dispatch_grads)
-                self._order_cross_stream_for_comp(combine_grads)
+                self._order_cross_stream_for_comp((grad_dispatch_tokens, grad_dispatch_probs))
+                self._order_cross_stream_for_comp((grad_h_residual, grad_shared_expert_out))
                 self._timing_record_end(timing_record)
+                del (
+                    attn_grads, grad_dispatch_tokens, grad_dispatch_probs,
+                    grad_h_residual, grad_shared_expert_out,
+                )
+                self._cleanup_layer_nodes(bwd_nodes)
 
                 timing_record = self._timing_record_start('phase5_early_f_expert_f_combine')
                 fwd_expert_out = self._timing_call(
@@ -1431,14 +1481,18 @@ class MergedScheduler:
                 self._timing_call(
                     timing_record, 'comp', self._run_expert_wgrad, bwd_expert)
                 dispatch_grads = fut_dispatch_bwd.result()
+                del fut_dispatch_bwd
             else:
                 dispatch_grads = self._timing_call(
                     timing_record, 'comm', bwd_dispatch.backward, expert_grads)
                 self._timing_call(
                     timing_record, 'comp', self._run_expert_wgrad, bwd_expert)
             self._timing_record_end(timing_record)
+            del expert_grads
             if not isinstance(dispatch_grads, tuple):
                 dispatch_grads = (dispatch_grads,)
+            grad_dispatch_tokens, grad_dispatch_probs = dispatch_grads[:2]
+            del dispatch_grads
 
             # Phase boundary: f_expert and b_attn need b_dispatch grads;
             # COMM must not start f_combine before delayed wgrad finishes.
@@ -1465,23 +1519,28 @@ class MergedScheduler:
                 fwd_h_out = self._timing_call(
                     timing_record, 'comm', fwd_combine.forward, (fwd_expert_out,))
                 attn_grads = self._attn_backward_grads(
-                    bwd_attn, combine_grads[1], dispatch_grads[0], dispatch_grads[1],
-                    combine_grads[2])
+                    bwd_attn, grad_h_residual, grad_dispatch_tokens, grad_dispatch_probs,
+                    grad_shared_expert_out)
                 grad_x = self._timing_call(
                     timing_record, 'comp', bwd_attn.backward, attn_grads)
-                self._order_cross_stream_for_comp(dispatch_grads)
-                self._order_cross_stream_for_comp(combine_grads)
+                self._order_cross_stream_for_comp((grad_dispatch_tokens, grad_dispatch_probs))
+                self._order_cross_stream_for_comp((grad_h_residual, grad_shared_expert_out))
             else:
                 fwd_h_out = self._timing_call(
                     timing_record, 'comm', fwd_combine.forward, (fwd_expert_out,))
                 attn_grads = self._attn_backward_grads(
-                    bwd_attn, combine_grads[1], dispatch_grads[0], dispatch_grads[1],
-                    combine_grads[2])
+                    bwd_attn, grad_h_residual, grad_dispatch_tokens, grad_dispatch_probs,
+                    grad_shared_expert_out)
                 grad_x = self._timing_call(
                     timing_record, 'comp', bwd_attn.backward, attn_grads)
-                self._order_cross_stream_for_comp(dispatch_grads)
-                self._order_cross_stream_for_comp(combine_grads)
+                self._order_cross_stream_for_comp((grad_dispatch_tokens, grad_dispatch_probs))
+                self._order_cross_stream_for_comp((grad_h_residual, grad_shared_expert_out))
             self._timing_record_end(timing_record)
+            del (
+                attn_grads, grad_dispatch_tokens, grad_dispatch_probs,
+                grad_h_residual, grad_shared_expert_out,
+            )
+            self._cleanup_layer_nodes(bwd_nodes)
 
             for n in fwd_nodes:
                 if n.checkpoint:
