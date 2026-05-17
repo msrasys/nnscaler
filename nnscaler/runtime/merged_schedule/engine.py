@@ -20,7 +20,9 @@ Dense layers use 2 ScheduleNodes (attn, ffn) both on COMP stream.
 """
 
 import logging
+import math
 import os
+from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -425,8 +427,22 @@ class MergedScheduler:
         self._sync_c2m_evt = torch.cuda.Event()
         self._sync_m2c_evt = torch.cuda.Event()
 
+        self._timing_enabled = (
+            os.environ.get('NNSCALER_MOE_OVERLAP_TIMING', '0') not in ('0', '')
+        )
+        self._timing_log_every = max(
+            1, int(os.environ.get('NNSCALER_MOE_OVERLAP_TIMING_EVERY', '1')))
+        self._timing_warmup = max(
+            0, int(os.environ.get('NNSCALER_MOE_OVERLAP_TIMING_WARMUP', '0')))
+        self._timing_rank_filter = os.environ.get(
+            'NNSCALER_MOE_OVERLAP_TIMING_RANKS', '0')
+        self._timing_run_idx = 0
+        self._timing_current_records = None
+        self._timing_pending_records = []
+
     def shutdown(self):
         """Release scheduler-owned CPU worker resources."""
+        self._timing_flush(force=True)
         pool = self._async_pool
         if pool is not None:
             self._async_pool = None
@@ -439,6 +455,149 @@ class MergedScheduler:
             self.shutdown()
         except Exception:
             pass
+
+    @staticmethod
+    def _timing_percentile(values, pct):
+        if not values:
+            return 0.0
+        values = sorted(values)
+        index = max(0, min(len(values) - 1, math.ceil(len(values) * pct / 100.0) - 1))
+        return values[index]
+
+    @staticmethod
+    def _timing_rank():
+        dist = torch.distributed
+        if dist.is_available() and dist.is_initialized():
+            return dist.get_rank()
+        return 0
+
+    def _timing_should_log_rank(self):
+        rank_filter = self._timing_rank_filter.strip().lower()
+        if rank_filter in ('all', '*'):
+            return True
+        rank = self._timing_rank()
+        try:
+            return rank in {int(item) for item in rank_filter.split(',') if item.strip()}
+        except ValueError:
+            return rank == 0
+
+    def _timing_begin_run(self):
+        if not self._timing_enabled:
+            self._timing_current_records = None
+            return
+        self._timing_run_idx += 1
+        if self._timing_run_idx <= self._timing_warmup:
+            self._timing_current_records = None
+            return
+        self._timing_current_records = []
+
+    def _timing_record_start(self, name):
+        if self._timing_current_records is None:
+            return None
+        record = {
+            'name': name,
+            'wall_comp_start': torch.cuda.Event(enable_timing=True),
+            'wall_comp_end': torch.cuda.Event(enable_timing=True),
+            'wall_comm_start': torch.cuda.Event(enable_timing=True),
+            'wall_comm_end': torch.cuda.Event(enable_timing=True),
+            'comp_start': None,
+            'comp_end': None,
+            'comm_start': None,
+            'comm_end': None,
+        }
+        record['wall_comp_start'].record(get_comp_stream())
+        record['wall_comm_start'].record(get_comm_stream())
+        return record
+
+    def _timing_record_end(self, record):
+        if record is None:
+            return
+        record['wall_comp_end'].record(get_comp_stream())
+        record['wall_comm_end'].record(get_comm_stream())
+        self._timing_current_records.append(record)
+
+    def _timing_branch_start(self, record, branch):
+        if record is None:
+            return
+        stream = get_comp_stream() if branch == 'comp' else get_comm_stream()
+        record[f'{branch}_start'] = torch.cuda.Event(enable_timing=True)
+        record[f'{branch}_end'] = torch.cuda.Event(enable_timing=True)
+        record[f'{branch}_start'].record(stream)
+
+    def _timing_branch_end(self, record, branch):
+        if record is None:
+            return
+        stream = get_comp_stream() if branch == 'comp' else get_comm_stream()
+        record[f'{branch}_end'].record(stream)
+
+    def _timing_call(self, record, branch, func, *args):
+        if record is None:
+            return func(*args)
+        self._timing_branch_start(record, branch)
+        try:
+            return func(*args)
+        finally:
+            self._timing_branch_end(record, branch)
+
+    def _timing_finish_run(self):
+        records = self._timing_current_records
+        self._timing_current_records = None
+        if not records:
+            return
+        self._timing_pending_records.extend(records)
+        completed_runs = self._timing_run_idx - self._timing_warmup
+        if completed_runs > 0 and completed_runs % self._timing_log_every == 0:
+            self._timing_flush()
+
+    def _timing_flush(self, force=False):
+        if not self._timing_enabled or not self._timing_pending_records:
+            return
+        if not self._timing_should_log_rank():
+            self._timing_pending_records.clear()
+            return
+        if not torch.cuda.is_available() or not torch.cuda.is_initialized():
+            self._timing_pending_records.clear()
+            return
+
+        torch.cuda.synchronize()
+        by_name = defaultdict(lambda: defaultdict(list))
+        for record in self._timing_pending_records:
+            wall_comp_ms = record['wall_comp_start'].elapsed_time(record['wall_comp_end'])
+            wall_comm_ms = record['wall_comm_start'].elapsed_time(record['wall_comm_end'])
+            if record['comp_start'] is not None:
+                comp_ms = record['comp_start'].elapsed_time(record['comp_end'])
+            else:
+                comp_ms = wall_comp_ms
+            if record['comm_start'] is not None:
+                comm_ms = record['comm_start'].elapsed_time(record['comm_end'])
+            else:
+                comm_ms = wall_comm_ms
+            by_name[record['name']]['comp'].append(comp_ms)
+            by_name[record['name']]['comm'].append(comm_ms)
+            by_name[record['name']]['wall'].append(max(wall_comp_ms, wall_comm_ms))
+            by_name[record['name']]['imbalance'].append(abs(comp_ms - comm_ms))
+
+        rank = self._timing_rank()
+        lines = [
+            f"[NNSCALER_MOE_OVERLAP_TIMING rank={rank} run={self._timing_run_idx} "
+            f"records={len(self._timing_pending_records)}]",
+            "name                         n  comp_p50  comp_p95  comm_p50  comm_p95  wall_p50  wall_p95  imbalance_p50  ms",
+        ]
+        for name in sorted(by_name):
+            stats = by_name[name]
+            n = len(stats['wall'])
+            lines.append(
+                f"{name:<28} {n:4d} "
+                f"{self._timing_percentile(stats['comp'], 50):9.3f} "
+                f"{self._timing_percentile(stats['comp'], 95):9.3f} "
+                f"{self._timing_percentile(stats['comm'], 50):9.3f} "
+                f"{self._timing_percentile(stats['comm'], 95):9.3f} "
+                f"{self._timing_percentile(stats['wall'], 50):9.3f} "
+                f"{self._timing_percentile(stats['wall'], 95):9.3f} "
+                f"{self._timing_percentile(stats['imbalance'], 50):13.3f}"
+            )
+        print('\n'.join(lines), flush=True)
+        self._timing_pending_records.clear()
 
     def run(self, samples, layer_callables_fn, embed_fn, loss_fn):
         """Execute merged FWD-BWD schedule.
@@ -453,6 +612,7 @@ class MergedScheduler:
         """
         num_mbs = len(samples)
         assert num_mbs >= 2, "merged FWD-BWD requires at least 2 micro-batches"
+        self._timing_begin_run()
 
         # Ensure COMP/COMM streams see all prior default-stream work
         # (optimizer.step, zero_grad from the previous training step).
@@ -673,6 +833,7 @@ class MergedScheduler:
                 )
 
         _embed_h_list.clear()
+        self._timing_finish_run()
 
         del prev_all_nodes, prev_loss_node
 
@@ -1073,13 +1234,19 @@ class MergedScheduler:
             self._sync_comp_to_comm()
 
             # Phase 1: COMM(b_combine) || COMP(f_attn_router/shared)
+            timing_record = self._timing_record_start('phase1_f_attn_b_combine')
             if pool is not None:
-                fut_combine = pool.submit(bwd_combine.backward, grad_h)
-                fwd_attn_out = fwd_attn.forward((fwd_h,))
+                fut_combine = pool.submit(
+                    self._timing_call, timing_record, 'comm', bwd_combine.backward, grad_h)
+                fwd_attn_out = self._timing_call(
+                    timing_record, 'comp', fwd_attn.forward, (fwd_h,))
                 combine_grads = fut_combine.result()
             else:
-                combine_grads = bwd_combine.backward(grad_h)
-                fwd_attn_out = fwd_attn.forward((fwd_h,))
+                combine_grads = self._timing_call(
+                    timing_record, 'comm', bwd_combine.backward, grad_h)
+                fwd_attn_out = self._timing_call(
+                    timing_record, 'comp', fwd_attn.forward, (fwd_h,))
+            self._timing_record_end(timing_record)
             combine_grads = self._collect_combine_grads(bwd_combine, combine_grads)
             fwd_h_residual, fwd_dispatch_tokens, fwd_dispatch_probs = fwd_attn_out[:3]
             fwd_shared_expert_out = fwd_attn_out[-1] if len(fwd_attn_out) > 3 else None
@@ -1092,37 +1259,50 @@ class MergedScheduler:
 
             # Phase boundary: Phase 2 COMP needs COMM output (combine_grads),
             # Phase 2 COMM needs COMP output (attn_out + precomputed metadata)
+            timing_record = self._timing_record_start('barrier0_p1_to_p2')
             self._cross_stream_barrier(slot=0)
+            self._timing_record_end(timing_record)
 
             # Phase 2: COMM(f_dispatch) || COMP(b_expert)
             # combine_grads: (grad_expert_outs, grad_h_residual, grad_shared_expert_out)
+            timing_record = self._timing_record_start('phase2_b_expert_f_dispatch')
             if pool is not None:
                 fut_dispatch = pool.submit(
+                    self._timing_call, timing_record, 'comm',
                     fwd_dispatch.forward, (fwd_dispatch_tokens, fwd_dispatch_probs))
-                expert_grads = bwd_expert.backward(combine_grads[0])
+                expert_grads = self._timing_call(
+                    timing_record, 'comp', bwd_expert.backward, combine_grads[0])
                 fwd_dispatch_out = fut_dispatch.result()
             else:
-                fwd_dispatch_out = fwd_dispatch.forward(
+                fwd_dispatch_out = self._timing_call(
+                    timing_record, 'comm', fwd_dispatch.forward,
                     (fwd_dispatch_tokens, fwd_dispatch_probs))
-                expert_grads = bwd_expert.backward(combine_grads[0])
+                expert_grads = self._timing_call(
+                    timing_record, 'comp', bwd_expert.backward, combine_grads[0])
+            self._timing_record_end(timing_record)
             if not isinstance(expert_grads, tuple):
                 expert_grads = (expert_grads,)
             # expert_grads: grads for dispatch outputs (dispatched tokens/probs)
 
             # Phase boundary: Phase 3 COMP needs COMM output (dispatch_out),
             # Phase 3 COMM needs COMP output (expert_grads)
+            timing_record = self._timing_record_start('barrier1_p2_to_p3')
             self._cross_stream_barrier(slot=1)
+            self._timing_record_end(timing_record)
 
             if self.early_attn_memory_release:
                 # Run backward dispatch and attention before later forward
                 # expert/combine allocations. This lowers peak memory at the
                 # cost of Phase-3/4 overlap.
+                timing_record = self._timing_record_start('phase3_early_b_dispatch_b_attn')
                 if pool is not None:
                     fut_dispatch_bwd = pool.submit(
+                        self._timing_call, timing_record, 'comm',
                         bwd_dispatch.backward, expert_grads)
                     dispatch_grads = fut_dispatch_bwd.result()
                 else:
-                    dispatch_grads = bwd_dispatch.backward(expert_grads)
+                    dispatch_grads = self._timing_call(
+                        timing_record, 'comm', bwd_dispatch.backward, expert_grads)
                 if not isinstance(dispatch_grads, tuple):
                     dispatch_grads = (dispatch_grads,)
 
@@ -1130,13 +1310,19 @@ class MergedScheduler:
                 attn_grads = self._attn_backward_grads(
                     bwd_attn, combine_grads[1], dispatch_grads[0], dispatch_grads[1],
                     combine_grads[2])
-                grad_x = bwd_attn.backward(attn_grads)
+                grad_x = self._timing_call(
+                    timing_record, 'comp', bwd_attn.backward, attn_grads)
                 self._order_cross_stream_for_comp(dispatch_grads)
                 self._order_cross_stream_for_comp(combine_grads)
+                self._timing_record_end(timing_record)
 
-                fwd_expert_out = fwd_expert.forward(fwd_dispatch_out)
+                timing_record = self._timing_record_start('phase4_early_f_expert_f_combine')
+                fwd_expert_out = self._timing_call(
+                    timing_record, 'comp', fwd_expert.forward, fwd_dispatch_out)
                 self._sync_comp_to_comm()
-                fwd_h_out = fwd_combine.forward((fwd_expert_out,))
+                fwd_h_out = self._timing_call(
+                    timing_record, 'comm', fwd_combine.forward, (fwd_expert_out,))
+                self._timing_record_end(timing_record)
 
                 for n in fwd_nodes:
                     if n.checkpoint:
@@ -1150,38 +1336,54 @@ class MergedScheduler:
                 return fwd_h_out, grad_x, ('layer4', fwd_nodes)
 
             # Phase 3: COMM(b_dispatch) || COMP(f_expert)
+            timing_record = self._timing_record_start('phase3_f_expert_b_dispatch')
             if pool is not None:
-                fut_dispatch_bwd = pool.submit(bwd_dispatch.backward, expert_grads)
-                fwd_expert_out = fwd_expert.forward(fwd_dispatch_out)
+                fut_dispatch_bwd = pool.submit(
+                    self._timing_call, timing_record, 'comm',
+                    bwd_dispatch.backward, expert_grads)
+                fwd_expert_out = self._timing_call(
+                    timing_record, 'comp', fwd_expert.forward, fwd_dispatch_out)
                 dispatch_grads = fut_dispatch_bwd.result()
             else:
-                dispatch_grads = bwd_dispatch.backward(expert_grads)
-                fwd_expert_out = fwd_expert.forward(fwd_dispatch_out)
+                dispatch_grads = self._timing_call(
+                    timing_record, 'comm', bwd_dispatch.backward, expert_grads)
+                fwd_expert_out = self._timing_call(
+                    timing_record, 'comp', fwd_expert.forward, fwd_dispatch_out)
+            self._timing_record_end(timing_record)
             if not isinstance(dispatch_grads, tuple):
                 dispatch_grads = (dispatch_grads,)
 
             # Phase boundary: Phase 4 COMP needs COMM output (dispatch_grads),
             # Phase 4 COMM needs COMP output (combine-ready expert_out)
+            timing_record = self._timing_record_start('barrier2_p3_to_p4')
             self._cross_stream_barrier(slot=2)
+            self._timing_record_end(timing_record)
 
             # Phase 4: COMM(f_combine) || COMP(b_attn)
+            timing_record = self._timing_record_start('phase4_b_attn_f_combine')
             if pool is not None:
-                fut_combine_fwd = pool.submit(fwd_combine.forward, (fwd_expert_out,))
+                fut_combine_fwd = pool.submit(
+                    self._timing_call, timing_record, 'comm',
+                    fwd_combine.forward, (fwd_expert_out,))
                 attn_grads = self._attn_backward_grads(
                     bwd_attn, combine_grads[1], dispatch_grads[0], dispatch_grads[1],
                     combine_grads[2])
-                grad_x = bwd_attn.backward(attn_grads)
+                grad_x = self._timing_call(
+                    timing_record, 'comp', bwd_attn.backward, attn_grads)
                 self._order_cross_stream_for_comp(dispatch_grads)
                 self._order_cross_stream_for_comp(combine_grads)
                 fwd_h_out = fut_combine_fwd.result()
             else:
-                fwd_h_out = fwd_combine.forward((fwd_expert_out,))
+                fwd_h_out = self._timing_call(
+                    timing_record, 'comm', fwd_combine.forward, (fwd_expert_out,))
                 attn_grads = self._attn_backward_grads(
                     bwd_attn, combine_grads[1], dispatch_grads[0], dispatch_grads[1],
                     combine_grads[2])
-                grad_x = bwd_attn.backward(attn_grads)
+                grad_x = self._timing_call(
+                    timing_record, 'comp', bwd_attn.backward, attn_grads)
                 self._order_cross_stream_for_comp(dispatch_grads)
                 self._order_cross_stream_for_comp(combine_grads)
+            self._timing_record_end(timing_record)
 
             for n in fwd_nodes:
                 if n.checkpoint:
