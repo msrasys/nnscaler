@@ -82,6 +82,46 @@ def test_schedule_node_skips_outputs_with_none_grad(checkpoint):
     torch.testing.assert_close(grad, 2 * x.detach())
 
 
+@pytest.mark.skipif(
+    not torch.cuda.is_available(),
+    reason='requires CUDA streams',
+)
+@pytest.mark.parametrize('defer_step_data_release', (False, True))
+def test_schedule_node_release_drops_runtime_references(defer_step_data_release):
+    stream = torch.cuda.Stream()
+    event = torch.cuda.Event()
+    x = torch.randn(8, device='cuda', requires_grad=True)
+
+    def forward_fn(t):
+        return t * t
+
+    node = ScheduleNode(forward_fn, stream, event, name='release_state')
+    step_data = {'tensor': torch.ones(8, device='cuda')}
+    node.step_data = step_data
+    node.loss_aux_tensors = (step_data['tensor'],)
+    node.loss_aux_step_data = {'aux': step_data['tensor']}
+    if defer_step_data_release:
+        node._defer_step_data_release = True
+
+    out = node.forward((x,))
+    grad = node.backward(torch.ones_like(out))
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(grad, 2 * x.detach())
+    assert not hasattr(node, 'forward_func')
+    assert not hasattr(node, 'backward_func')
+    assert not hasattr(node, 'loss_aux_tensors')
+    assert not hasattr(node, 'loss_aux_step_data')
+
+    if defer_step_data_release:
+        assert getattr(node, 'step_data') is step_data
+        assert 'tensor' in step_data
+        node._release_step_data()
+
+    assert not hasattr(node, 'step_data')
+    assert step_data == {}
+
+
 class _FakeMoELayer(nn.Module):
     def __init__(self, hidden_dim, use_aux_loss=False):
         super().__init__()

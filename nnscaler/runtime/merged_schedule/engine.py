@@ -370,6 +370,28 @@ class ScheduleNode:
         self.inputs = None
         self.output = None
 
+        if not getattr(self, '_defer_step_data_release', False):
+            self._release_step_data()
+
+        for attr in (
+            'loss_aux_tensors',
+            'loss_aux_step_data',
+            'forward_func',
+            'backward_func',
+        ):
+            self._release_attr(attr)
+
+    def _release_step_data(self):
+        step_data = getattr(self, 'step_data', None)
+        if isinstance(step_data, dict):
+            step_data.clear()
+        self._release_attr('step_data')
+
+    def _release_attr(self, attr):
+        if hasattr(self, attr):
+            setattr(self, attr, None)
+            delattr(self, attr)
+
 
 @dataclass
 class LayerCallables:
@@ -490,6 +512,7 @@ class MergedScheduler:
 
         h0, all_nodes_0, rmaps_0, eprobs_0 = self._forward_all_layers(
             h0, lc_list_0, events[0])
+        del lc_list_0
 
         # Sync COMM→COMP: last forward node may be on COMM (MoE combine),
         # but loss_node runs on COMP with a fresh event (no wait).
@@ -728,6 +751,8 @@ class MergedScheduler:
             lc.combine_fn, comm_stream, event,
             free_input=True, name="combine", checkpoint=False)
         combine_node.step_data = lc.step_data
+        # combine.backward() returns before residual/shared grads are collected.
+        combine_node._defer_step_data_release = True
 
         return (attn_node, dispatch_node, expert_node, combine_node)
 
@@ -767,28 +792,34 @@ class MergedScheduler:
 
     def _collect_combine_grads(self, combine_node, combine_grads):
         """Collect grads from combine's detached layer-state tensors."""
-        if isinstance(combine_grads, tuple) and len(combine_grads) == 3:
-            return combine_grads
+        try:
+            if isinstance(combine_grads, tuple) and len(combine_grads) == 3:
+                return combine_grads
 
-        grad_expert_out = combine_grads[0] if isinstance(combine_grads, tuple) else combine_grads
-        step_data = getattr(combine_node, 'step_data', None) or {}
-        backward_tensors = step_data.pop('_combine_backward_tensors', None)
-        if backward_tensors is not None:
-            residual, shared_expert_out = backward_tensors
-        else:
-            residual = step_data.pop('_combine_residual', None)
-            shared_expert_out = step_data.pop('_combine_shared_expert_out', None)
+            if isinstance(combine_grads, tuple):
+                grad_expert_out = combine_grads[0]
+            else:
+                grad_expert_out = combine_grads
+            step_data = getattr(combine_node, 'step_data', None) or {}
+            backward_tensors = step_data.pop('_combine_backward_tensors', None)
+            if backward_tensors is not None:
+                residual, shared_expert_out = backward_tensors
+            else:
+                residual = step_data.pop('_combine_residual', None)
+                shared_expert_out = step_data.pop('_combine_shared_expert_out', None)
 
-        grad_residual = residual.grad if isinstance(residual, torch.Tensor) else None
-        grad_shared = (
-            shared_expert_out.grad if isinstance(shared_expert_out, torch.Tensor) else None
-        )
+            grad_residual = residual.grad if isinstance(residual, torch.Tensor) else None
+            grad_shared = (
+                shared_expert_out.grad if isinstance(shared_expert_out, torch.Tensor) else None
+            )
 
-        _mark_tensors_stream((grad_residual, grad_shared), combine_node.stream)
-        _order_cross_stream_tensors_until_done(
-            (residual, shared_expert_out), combine_node.stream)
+            _mark_tensors_stream((grad_residual, grad_shared), combine_node.stream)
+            _order_cross_stream_tensors_until_done(
+                (residual, shared_expert_out), combine_node.stream)
 
-        return grad_expert_out, grad_residual, grad_shared
+            return grad_expert_out, grad_residual, grad_shared
+        finally:
+            combine_node._release_step_data()
 
     def _prepare_loss_aux_tensors(self, attn_node, lc, attn_out):
         aux_tensors = lc.step_data.get('_loss_aux_tensors')
@@ -876,6 +907,7 @@ class MergedScheduler:
         prepared_step_data = getattr(attn_node, 'loss_aux_step_data', None)
         if prepared_step_data:
             lc.step_data.update(prepared_step_data)
+        attn_node._release_attr('loss_aux_step_data')
 
     @staticmethod
     def _attn_backward_grads(attn_node, grad_h, grad_h_ln, grad_routing):
@@ -967,6 +999,7 @@ class MergedScheduler:
         expert_out, shared_expert_out = expert_result
         self._prepare_combine_state(lc, shared_expert_out=shared_expert_out)
         h_out = combine_n.forward((expert_out,))
+        self._restore_loss_aux_step_data(attn_n, lc)
 
         for n in nodes:
             if n.checkpoint:
