@@ -488,12 +488,14 @@ class MergedScheduler:
             if _async_on else None
         )
 
-        # Pre-allocate CUDA events for cross-stream synchronization.
-        # Using separate events per barrier slot avoids re-recording while
-        # a previous wait may still be pending (undefined behavior per CUDA spec).
-        # 3 barrier slots in _merged_step_4phase, each needs comp + comm events
-        self._barrier_comp_evts = [torch.cuda.Event() for _ in range(3)]
-        self._barrier_comm_evts = [torch.cuda.Event() for _ in range(3)]
+        # Pre-allocate CUDA events for per-dependency stream synchronization.
+        # 4-phase MoE scheduling has three cross-stream dependency points:
+        #   0: f_attn -> f_dispatch,      b_combine -> b_expert
+        #   1: f_dispatch -> f_expert,    b_expert -> b_dispatch
+        #   2: f_expert -> f_combine,     b_dispatch -> b_attn
+        # Each slot has one COMP-produced event and one COMM-produced event.
+        self._dep_comp_evts = [torch.cuda.Event() for _ in range(3)]
+        self._dep_comm_evts = [torch.cuda.Event() for _ in range(3)]
         # 2 uni-directional sync events (comp->comm and comm->comp)
         self._sync_c2m_evt = torch.cuda.Event()
         self._sync_m2c_evt = torch.cuda.Event()
@@ -815,19 +817,17 @@ class MergedScheduler:
         self._sync_c2m_evt.record(get_comp_stream())
         get_comm_stream().wait_event(self._sync_c2m_evt)
 
-    def _cross_stream_barrier(self, slot=0):
-        """Bidirectional sync: each stream waits for the other's current position.
+    def _record_comp_dependency(self, slot):
+        self._dep_comp_evts[slot].record(get_comp_stream())
 
-        Records events on both streams simultaneously, then makes each wait
-        for the other. Uses pre-allocated events indexed by slot to avoid
-        event creation overhead and re-recording conflicts.
-        """
-        comp_evt = self._barrier_comp_evts[slot]
-        comm_evt = self._barrier_comm_evts[slot]
-        comp_evt.record(get_comp_stream())
-        comm_evt.record(get_comm_stream())
-        get_comm_stream().wait_event(comp_evt)
-        get_comp_stream().wait_event(comm_evt)
+    def _record_comm_dependency(self, slot):
+        self._dep_comm_evts[slot].record(get_comm_stream())
+
+    def _comm_waits_for_comp_dependency(self, slot):
+        get_comm_stream().wait_event(self._dep_comp_evts[slot])
+
+    def _comp_waits_for_comm_dependency(self, slot):
+        get_comp_stream().wait_event(self._dep_comm_evts[slot])
 
     def _order_cross_stream_for_comp(self, tensors):
         """Order producer streams after queued COMP work that uses tensors."""
@@ -1295,8 +1295,9 @@ class MergedScheduler:
         Each phase interleaves COMP and COMM operations from different
         micro-batches. Within each phase, COMP and COMM run in PARALLEL on
         the GPU because we skip the per-node shared-event protocol (which
-        would serialize all operations). Instead, we use explicit cross-stream
-        barriers at phase boundaries to enforce data dependencies.
+        would serialize all operations). Cross-stream ordering is expressed
+        with per-dependency events instead of phase-level bidirectional
+        barriers, so each stream waits only for the producer it consumes.
 
         Phase 1: f_attn_router(COMP) || b_combine(COMM)   [combine = pure comm]
         Phase 2: b_expert    (COMP) || f_dispatch (COMM)   [expert includes shared expert bwd]
@@ -1318,7 +1319,7 @@ class MergedScheduler:
         # and vice versa), preventing within-phase parallelism. By setting
         # _skip_event=True, each node still switches to its own stream, but
         # does not wait/record the shared event. Cross-stream dependencies are
-        # enforced explicitly via _cross_stream_barrier() at phase boundaries.
+        # enforced explicitly at the consumer side below.
         all_nodes = (*bwd_nodes, *fwd_nodes)
         for n in all_nodes:
             n._skip_event = True
@@ -1344,34 +1345,44 @@ class MergedScheduler:
             self._prepare_combine_state(fwd_lc, h_residual=fwd_h_residual)
             self._prepare_loss_aux_tensors(fwd_attn, fwd_lc, fwd_attn_out)
 
-            # Phase boundary: Phase 2 COMP needs COMM output (combine_grads),
-            # Phase 2 COMM needs COMP output (attn_out + precomputed metadata)
-            self._cross_stream_barrier(slot=0)
+            # Dependencies for Phase 2:
+            # - f_dispatch(COMM) consumes f_attn_router(COMP) outputs.
+            # - b_expert(COMP) consumes b_combine(COMM) gradients.
+            self._record_comp_dependency(slot=0)
+            self._record_comm_dependency(slot=0)
 
             # Phase 2: COMM(f_dispatch) || COMP(b_expert)
             # expert backward includes shared expert backward (both on COMP).
             # combine_grads: (grad_expert_outs, grad_h_residual, grad_shared_expert_out)
             if pool is not None:
+                self._comm_waits_for_comp_dependency(slot=0)
                 fut_dispatch = pool.submit(fwd_dispatch.forward, (fwd_h_ln, fwd_routing_probs))
+                self._comp_waits_for_comm_dependency(slot=0)
                 expert_grads = bwd_expert.backward((combine_grads[0], combine_grads[2]))
                 fwd_dispatch_out = fut_dispatch.result()
             else:
+                self._comm_waits_for_comp_dependency(slot=0)
                 fwd_dispatch_out = fwd_dispatch.forward((fwd_h_ln, fwd_routing_probs))
+                self._comp_waits_for_comm_dependency(slot=0)
                 expert_grads = bwd_expert.backward((combine_grads[0], combine_grads[2]))
             # expert_grads: (grad_sorted_tokens, grad_sorted_probs, grad_h_ln)
 
-            # Phase boundary: Phase 3 COMP needs COMM output (dispatch_out),
-            # Phase 3 COMM needs COMP output (expert_grads)
-            self._cross_stream_barrier(slot=1)
+            # Dependencies for Phase 3:
+            # - f_expert(COMP) consumes f_dispatch(COMM) outputs.
+            # - b_dispatch(COMM) consumes b_expert(COMP) gradients.
+            self._record_comm_dependency(slot=1)
+            self._record_comp_dependency(slot=1)
 
             if self.early_attn_memory_release:
                 # Run backward dispatch and attention before later forward
                 # expert/combine allocations. This lowers peak memory at the
                 # cost of Phase-3/4 overlap.
+                self._comm_waits_for_comp_dependency(slot=1)
                 dispatch_grads = self._dispatch_backward_with_optional_wgrad(
                     bwd_dispatch, bwd_expert, expert_grads, pool)
 
-                self._sync_comm_to_comp()
+                self._record_comm_dependency(slot=2)
+                self._comp_waits_for_comm_dependency(slot=2)
                 grad_h_ln_total = dispatch_grads[0] + expert_grads[2]
                 attn_grads = self._attn_backward_grads(
                     bwd_attn, combine_grads[1], grad_h_ln_total, dispatch_grads[1])
@@ -1385,7 +1396,8 @@ class MergedScheduler:
                 fwd_expert_out, fwd_shared_expert_out = fwd_expert_result
                 self._prepare_combine_state(
                     fwd_lc, shared_expert_out=fwd_shared_expert_out)
-                self._sync_comp_to_comm()
+                self._record_comp_dependency(slot=2)
+                self._comm_waits_for_comp_dependency(slot=2)
                 fwd_h_out = fwd_combine.forward((fwd_expert_out,))
 
                 self._restore_loss_aux_step_data(fwd_attn, fwd_lc)
@@ -1405,28 +1417,38 @@ class MergedScheduler:
             # wgrad on COMP with dispatch backward on COMM. Otherwise keep the
             # original f_expert(COMP) || b_dispatch(COMM) overlap.
             if self._has_delayed_expert_wgrad(bwd_expert):
+                self._comm_waits_for_comp_dependency(slot=1)
                 dispatch_grads = self._dispatch_backward_with_optional_wgrad(
                     bwd_dispatch, bwd_expert, expert_grads, pool)
+                self._comp_waits_for_comm_dependency(slot=1)
                 fwd_expert_result = fwd_expert.forward((*fwd_dispatch_out, fwd_h_ln))
             elif pool is not None:
+                self._comm_waits_for_comp_dependency(slot=1)
                 fut_dispatch_bwd = pool.submit(bwd_dispatch.backward, (expert_grads[0], expert_grads[1]))
+                self._comp_waits_for_comm_dependency(slot=1)
                 fwd_expert_result = fwd_expert.forward((*fwd_dispatch_out, fwd_h_ln))
                 dispatch_grads = fut_dispatch_bwd.result()
                 bwd_expert._release_attr('wgrad_func')
             else:
+                self._comm_waits_for_comp_dependency(slot=1)
                 dispatch_grads = bwd_dispatch.backward((expert_grads[0], expert_grads[1]))
                 bwd_expert._release_attr('wgrad_func')
+                self._comp_waits_for_comm_dependency(slot=1)
                 fwd_expert_result = fwd_expert.forward((*fwd_dispatch_out, fwd_h_ln))
             fwd_expert_out, fwd_shared_expert_out = fwd_expert_result
             self._prepare_combine_state(fwd_lc, shared_expert_out=fwd_shared_expert_out)
 
-            # Phase boundary: Phase 4 COMP needs COMM output (dispatch_grads),
-            # Phase 4 COMM needs COMP output (expert_out + shared_expert_out)
-            self._cross_stream_barrier(slot=2)
+            # Dependencies for Phase 4:
+            # - f_combine(COMM) consumes f_expert(COMP) outputs/state.
+            # - b_attn(COMP) consumes b_dispatch(COMM) gradients.
+            self._record_comp_dependency(slot=2)
+            self._record_comm_dependency(slot=2)
 
             # Phase 4: COMM(f_combine) || COMP(b_attn)
             if pool is not None:
+                self._comm_waits_for_comp_dependency(slot=2)
                 fut_combine_fwd = pool.submit(fwd_combine.forward, (fwd_expert_out,))
+                self._comp_waits_for_comm_dependency(slot=2)
                 grad_h_ln_total = dispatch_grads[0] + expert_grads[2]
                 attn_grads = self._attn_backward_grads(
                     bwd_attn, combine_grads[1], grad_h_ln_total, dispatch_grads[1])
@@ -1437,7 +1459,9 @@ class MergedScheduler:
                 del combine_grads, expert_grads, dispatch_grads, attn_grads, grad_h_ln_total
                 fwd_h_out = fut_combine_fwd.result()
             else:
+                self._comm_waits_for_comp_dependency(slot=2)
                 fwd_h_out = fwd_combine.forward((fwd_expert_out,))
+                self._comp_waits_for_comm_dependency(slot=2)
                 grad_h_ln_total = dispatch_grads[0] + expert_grads[2]
                 attn_grads = self._attn_backward_grads(
                     bwd_attn, combine_grads[1], grad_h_ln_total, dispatch_grads[1])
