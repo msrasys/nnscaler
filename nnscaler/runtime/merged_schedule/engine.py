@@ -97,15 +97,6 @@ def _make_viewless(t):
     return t
 
 
-def _detach_for_layer_state(t):
-    if t is None:
-        return None
-    t = _make_viewless(t)
-    detached = t.detach()
-    detached.requires_grad = t.requires_grad
-    return detached
-
-
 _TENSOR_STREAM_ATTR = '_nnscaler_merged_schedule_stream'
 
 
@@ -202,6 +193,8 @@ class ScheduleNode:
         self._output_is_tuple = False
         self._output_arity = 1
         self._skip_event = False  # When True, skip event wait/record in _stream_ctx
+        self.detached = tuple()
+        self.before_detached = tuple()
 
     def forward(self, inputs=()):
         if not isinstance(inputs, tuple):
@@ -249,6 +242,18 @@ class ScheduleNode:
     def get_output(self):
         return self.output
 
+    def detach(self, tensor):
+        """Detach a tensor for layer state while preserving its backward edge."""
+        if tensor is None:
+            return None
+        tensor = _make_viewless(tensor)
+        detached = tensor.detach()
+        detached.requires_grad = tensor.requires_grad
+        _copy_tensor_stream(tensor, detached)
+        self.before_detached = self.before_detached + (tensor,)
+        self.detached = self.detached + (detached,)
+        return detached
+
     def backward(self, output_grad, retain_graph=False):
         if not isinstance(output_grad, tuple):
             output_grad = (output_grad,)
@@ -271,6 +276,7 @@ class ScheduleNode:
                             continue
                         tensor_outputs.append(out)
                         tensor_grads.append(g)
+                self._append_detached_backward_tensors(tensor_outputs, tensor_grads)
                 if tensor_outputs:
                     self.backward_func(tuple(tensor_outputs), tuple(tensor_grads),
                                        retain_graph=retain_graph)
@@ -285,6 +291,7 @@ class ScheduleNode:
                             continue
                         tensor_outputs.append(out)
                         tensor_grads.append(g)
+                self._append_detached_backward_tensors(tensor_outputs, tensor_grads)
                 if tensor_outputs:
                     self.backward_func(tuple(tensor_outputs), tuple(tensor_grads),
                                        retain_graph=retain_graph)
@@ -311,6 +318,17 @@ class ScheduleNode:
     @staticmethod
     def _output_grad_or_none(output_grad, index):
         return output_grad[index] if index < len(output_grad) else None
+
+    def _append_detached_backward_tensors(self, tensor_outputs, tensor_grads):
+        for before, detached in zip(self.before_detached, self.detached):
+            if not isinstance(before, torch.Tensor) or not before.requires_grad:
+                continue
+            grad = detached.grad if isinstance(detached, torch.Tensor) else None
+            if grad is None:
+                continue
+            _record_tensors_stream(grad, self.stream)
+            tensor_outputs.append(before)
+            tensor_grads.append(grad)
 
     @staticmethod
     def _default_backward(outputs, output_grad, retain_graph=False):
@@ -362,6 +380,8 @@ class ScheduleNode:
     def _release(self):
         self.inputs = None
         self.output = None
+        self.detached = tuple()
+        self.before_detached = tuple()
 
 
 @dataclass
@@ -909,12 +929,37 @@ class MergedScheduler:
         return None
 
     @staticmethod
-    def _prepare_combine_state(lc, h_residual=None, shared_expert_out=None):
+    def _replace_node_output_indexes(node, replacements):
+        if not node.output_is_tuple() or node.output is None:
+            return
+        outputs = list(node.output)
+        for index, value in replacements.items():
+            if -len(outputs) <= index < len(outputs):
+                outputs[index] = value
+        node.output = tuple(outputs)
+
+    def _prepare_combine_state(self, attn_node, lc, h_residual=None, shared_expert_out=None):
+        replacements = {}
         if h_residual is not None:
-            lc.step_data['_combine_residual'] = _detach_for_layer_state(h_residual)
+            lc.step_data['_combine_residual'] = attn_node.detach(h_residual)
+            replacements[0] = None
         if shared_expert_out is not None:
-            lc.step_data['_combine_shared_expert_out'] = _detach_for_layer_state(
-                shared_expert_out)
+            lc.step_data['_combine_shared_expert_out'] = attn_node.detach(shared_expert_out)
+            replacements[-1] = None
+        self._replace_node_output_indexes(attn_node, replacements)
+
+    def _prepare_dispatch_state(self, dispatch_node, lc, dispatch_out):
+        if not isinstance(dispatch_out, tuple):
+            return dispatch_out
+        if len(dispatch_out) < 2:
+            return dispatch_out[0] if len(dispatch_out) == 1 else dispatch_out
+
+        dispatched_tokens, dispatched_probs = dispatch_out[:2]
+        if isinstance(dispatched_probs, torch.Tensor):
+            lc.step_data['_dispatched_probs'] = dispatch_node.detach(dispatched_probs)
+            replacements = {1: None}
+            self._replace_node_output_indexes(dispatch_node, replacements)
+        return dispatched_tokens
 
     def _collect_combine_grads(self, combine_node, combine_grads):
         """Collect grads from combine's detached layer-state tensors."""
@@ -1106,9 +1151,11 @@ class MergedScheduler:
         h_residual, dispatch_tokens, dispatch_probs = attn_out[:3]
         shared_expert_out = attn_out[-1] if len(attn_out) > 3 else None
         self._prepare_combine_state(
-            lc, h_residual=h_residual, shared_expert_out=shared_expert_out)
+            attn_n, lc, h_residual=h_residual, shared_expert_out=shared_expert_out)
         self._prepare_loss_aux_tensors(attn_n, lc, attn_out)
         dispatch_out = dispatch_n.forward((dispatch_tokens, dispatch_probs))
+        del attn_out, h_residual, shared_expert_out, dispatch_tokens, dispatch_probs
+        dispatch_out = self._prepare_dispatch_state(dispatch_n, lc, dispatch_out)
         expert_out = expert_n.forward(dispatch_out)
         h_out = combine_n.forward((expert_out,))
 
@@ -1144,7 +1191,8 @@ class MergedScheduler:
             # combine_grads: (grad_expert_outs, grad_h_residual, grad_shared_expert_out)
             combine_grads = combine_n.backward(grad_h)
             combine_grads = self._collect_combine_grads(combine_n, combine_grads)
-            # expert_grads: grads for dispatch outputs (dispatched tokens/probs)
+            # expert_grads: grad for dispatch output tokens; detached probs grad
+            # is collected from dispatch_node.detach() during dispatch backward.
             expert_grads = expert_n.backward(combine_grads[0])
             if not isinstance(expert_grads, tuple):
                 expert_grads = (expert_grads,)
@@ -1251,11 +1299,13 @@ class MergedScheduler:
             fwd_h_residual, fwd_dispatch_tokens, fwd_dispatch_probs = fwd_attn_out[:3]
             fwd_shared_expert_out = fwd_attn_out[-1] if len(fwd_attn_out) > 3 else None
             self._prepare_combine_state(
+                fwd_attn,
                 fwd_lc,
                 h_residual=fwd_h_residual,
                 shared_expert_out=fwd_shared_expert_out,
             )
             self._prepare_loss_aux_tensors(fwd_attn, fwd_lc, fwd_attn_out)
+            del fwd_attn_out, fwd_h_residual, fwd_shared_expert_out
 
             # Phase boundary: Phase 2 COMP needs COMM output (combine_grads),
             # Phase 2 COMM needs COMP output (attn_out + precomputed metadata)
@@ -1282,7 +1332,11 @@ class MergedScheduler:
             self._timing_record_end(timing_record)
             if not isinstance(expert_grads, tuple):
                 expert_grads = (expert_grads,)
-            # expert_grads: grads for dispatch outputs (dispatched tokens/probs)
+            # expert_grads: grad for dispatch output tokens; detached probs grad
+            # is collected from dispatch_node.detach() during dispatch backward.
+            fwd_dispatch_out = self._prepare_dispatch_state(
+                fwd_dispatch, fwd_lc, fwd_dispatch_out)
+            del fwd_dispatch_tokens, fwd_dispatch_probs
 
             # Phase boundary: Phase 3 COMP needs COMM output (dispatch_out),
             # Phase 3 COMM needs COMP output (expert_grads)

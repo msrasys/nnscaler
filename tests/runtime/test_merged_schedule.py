@@ -128,8 +128,10 @@ class _FakeMoELayer(nn.Module):
         reduced_probs = self._all_reduce_avg_with_local_grad(dispatch_probs)
         return dispatched, reduced_probs
 
-    def expert_forward(self, dispatched, reduced_probs):
+    def expert_forward(self, dispatched, reduced_probs=None):
         self._check_comp_stream()
+        if reduced_probs is None:
+            reduced_probs = self.step_data['_dispatched_probs']
         expert_out = torch.relu(self.expert(dispatched)) * (reduced_probs + 0.5)
         return expert_out
 
