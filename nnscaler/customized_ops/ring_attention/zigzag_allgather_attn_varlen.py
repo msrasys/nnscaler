@@ -13,7 +13,7 @@ from nnscaler.graph.parser.register import register_op
 from nnscaler.ir import IRTensor
 from nnscaler.runtime.device import DeviceGroup
 
-from .core.utils import gen_head_anno
+from .core.utils import call_flash_attn_cute_varlen_func, gen_head_anno
 from .core.zigzag_allgather_attn_varlen_implementation import (
     zigzag_allgather_attn_varlen_func,
 )
@@ -51,7 +51,8 @@ def wrap_zigzag_allgather_attn_varlen_func(
         if use_cute:
             assert flash_attn_cute_varlen_func is not None, "flash_attn.cute is not available"
             cute_window_size = tuple(None if w == -1 else w for w in window_size)
-            output, lse = flash_attn_cute_varlen_func(
+            return call_flash_attn_cute_varlen_func(
+                flash_attn_cute_varlen_func,
                 q, k, v,
                 cu_seqlens_q=cu_seqlens_q,
                 cu_seqlens_k=cu_seqlens_k,
@@ -61,9 +62,8 @@ def wrap_zigzag_allgather_attn_varlen_func(
                 causal=causal,
                 window_size=cute_window_size,
                 deterministic=deterministic,
-                return_lse=True,
+                return_lse=return_lse,
             )
-            return (output, lse) if return_lse else output
 
         result = flash_attn_varlen_func(
             q,

@@ -15,7 +15,7 @@ from .core.sliding_window_attn_implementation import (
     prepare_sliding_window_metadata,
     sliding_window_attn_func,
 )
-from .core.utils import gen_head_anno
+from .core.utils import call_flash_attn_cute_varlen_func, gen_head_anno
 
 try:
     from flash_attn.cute import flash_attn_varlen_func as flash_attn_cute_varlen_func
@@ -61,7 +61,8 @@ def wrap_sliding_window_attn_func(
         if use_cute:
             assert flash_attn_cute_varlen_func is not None, "flash_attn.cute is not available"
             cute_window_size = tuple(None if w == -1 else w for w in window_size)
-            output, lse = flash_attn_cute_varlen_func(
+            return call_flash_attn_cute_varlen_func(
+                flash_attn_cute_varlen_func,
                 q, k, v,
                 cu_seqlens_q=cu_seqlens_q,
                 cu_seqlens_k=cu_seqlens_k,
@@ -71,9 +72,8 @@ def wrap_sliding_window_attn_func(
                 causal=causal,
                 window_size=cute_window_size,
                 deterministic=deterministic,
-                return_lse=True,
+                return_lse=return_lse,
             )
-            return (output, lse) if return_lse else output
         else:
             result = flash_attn_varlen_func(
                 q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k,

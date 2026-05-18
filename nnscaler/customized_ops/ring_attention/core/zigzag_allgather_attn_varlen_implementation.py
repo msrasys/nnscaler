@@ -9,6 +9,8 @@ import torch
 import torch.distributed as dist
 from flash_attn import flash_attn_varlen_func
 
+from .utils import call_flash_attn_cute_varlen_func
+
 try:
     from flash_attn.cute import flash_attn_varlen_func as flash_attn_cute_varlen_func
 except ImportError:
@@ -161,7 +163,8 @@ def _run_flash_attn_varlen(
     if use_cute:
         assert flash_attn_cute_varlen_func is not None, "flash_attn.cute is not available"
         cute_window_size = tuple(None if w == -1 else w for w in window_size)
-        out, lse = flash_attn_cute_varlen_func(
+        return call_flash_attn_cute_varlen_func(
+            flash_attn_cute_varlen_func,
             q,
             k,
             v,
@@ -173,9 +176,8 @@ def _run_flash_attn_varlen(
             causal=causal,
             window_size=cute_window_size,
             deterministic=deterministic,
-            return_lse=True,
+            return_lse=return_lse,
         )
-        return (out, lse) if return_lse else out
 
     result = flash_attn_varlen_func(
         q,

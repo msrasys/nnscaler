@@ -80,6 +80,26 @@ def get_default_args(func):
         return _get_default_args(func._init_fn)
 
 
+@cache
+def _supports_return_lse(func):
+    return "return_lse" in inspect.signature(func).parameters
+
+
+def call_flash_attn_cute_varlen_func(func, *args, return_lse=False, **kwargs):
+    if _supports_return_lse(func):
+        kwargs["return_lse"] = bool(return_lse)
+
+    output, lse = func(*args, **kwargs)
+    if return_lse:
+        if lse is None:
+            raise RuntimeError(
+                "flash_attn.cute.flash_attn_varlen_func did not return softmax LSE. "
+                "Install a flash-attn version whose cute varlen API supports return_lse."
+            )
+        return output, lse
+    return output
+
+
 class AllGatherComm:
     def __init__(self, group=None) -> None:
         self.group = group
@@ -341,4 +361,3 @@ def reduce_scatter(tensor: torch.Tensor, dim: int, process_group: dist.ProcessGr
     otensor = torch.empty_like(itensors[0], requires_grad=False)
     torch.distributed.reduce_scatter(otensor, itensors, group=process_group)
     return otensor
-
