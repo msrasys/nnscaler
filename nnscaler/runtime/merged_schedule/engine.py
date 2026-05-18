@@ -21,8 +21,6 @@ Dense layers use 2 ScheduleNodes (attn, ffn) both on COMP stream.
 
 import logging
 import os
-import pathlib
-import re
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -39,8 +37,6 @@ _logger = logging.getLogger(__name__)
 _COMP_STREAM = None   # computation stream (non-default)
 _COMM_STREAM = None   # communication stream (non-default)
 _CREATION_STREAM_ATTR = '_nnscaler_creation_stream'
-_MEM_HISTORY_STARTED = False
-_MEM_THRESHOLD_DUMPS = 0
 
 
 class TransformerLayerState:
@@ -54,38 +50,6 @@ def _env_true(name, default=False):
     if value is None:
         return default
     return value.lower() not in ('0', 'false', 'no', '')
-
-
-def _debug_rank():
-    return int(os.environ.get('RANK', os.environ.get('LOCAL_RANK', '0')))
-
-
-def _mem_debug_enabled():
-    if not _env_true('NNSCALER_MEM_DEBUG', False):
-        return False
-    ranks = os.environ.get('NNSCALER_MEM_DEBUG_RANKS', '0')
-    if ranks.lower() in ('all', '*'):
-        return True
-    return str(_debug_rank()) in {r.strip() for r in ranks.split(',')}
-
-
-def _gb(value):
-    return float(value) / 1024 / 1024 / 1024
-
-
-def _cuda_storage_nbytes(obj):
-    total = 0
-    seen = set()
-    for tensor in _iter_cuda_tensors(obj):
-        key = _storage_key(tensor)
-        if key is None or key in seen:
-            continue
-        seen.add(key)
-        try:
-            total += tensor.untyped_storage().nbytes()
-        except Exception:
-            pass
-    return total
 
 
 def _tensor_storage_byte_range(tensor):
@@ -120,192 +84,6 @@ def _covered_storage_bytes(ranges):
     return sum(end - start for start, end in merged)
 
 
-def _release_debug_log_enabled():
-    if not _env_true('NNSCALER_RELEASE_DEBUG_LOG', False):
-        return False
-    ranks = os.environ.get('NNSCALER_RELEASE_DEBUG_LOG_RANKS', '0')
-    if ranks.lower() in ('all', '*'):
-        return True
-    return str(_debug_rank()) in {r.strip() for r in ranks.split(',')}
-
-
-def _release_debug_log(tag, message):
-    if not _release_debug_log_enabled():
-        return
-    print(f"[RELEASE_DEBUG][rank={_debug_rank()}][{tag}] {message}", flush=True)
-
-
-def _safe_tag(tag):
-    return re.sub(r'[^A-Za-z0-9_.-]+', '_', tag).strip('_')
-
-
-def _maybe_start_memory_history():
-    global _MEM_HISTORY_STARTED
-    if _MEM_HISTORY_STARTED:
-        return
-    if not (_mem_debug_enabled() or _env_true('NNSCALER_MEM_SNAPSHOT_ON_THRESHOLD', False)):
-        return
-    ranks = os.environ.get(
-        'NNSCALER_MEM_HISTORY_RANKS',
-        os.environ.get('NNSCALER_MEM_SNAPSHOT_RANKS', '0'))
-    if ranks.lower() not in ('all', '*') and str(_debug_rank()) not in {r.strip() for r in ranks.split(',')}:
-        return
-    if not (
-        _env_true('NNSCALER_MEM_HISTORY', False)
-        or _env_true('NNSCALER_MEM_SNAPSHOT_HISTORY', False)
-    ):
-        return
-    max_entries = int(os.environ.get('NNSCALER_MEM_HISTORY_MAX_ENTRIES', '200000'))
-    torch.cuda.memory._record_memory_history(
-        enabled='all', context='all', stacks='all', max_entries=max_entries)
-    _MEM_HISTORY_STARTED = True
-    print(f"[MEMDBG][rank={_debug_rank()}] memory history enabled max_entries={max_entries}", flush=True)
-
-
-def _maybe_dump_threshold_snapshot(tag, reserved, active, allocated):
-    global _MEM_THRESHOLD_DUMPS
-    if not _env_true('NNSCALER_MEM_SNAPSHOT_ON_THRESHOLD', False):
-        return
-    ranks = os.environ.get('NNSCALER_MEM_SNAPSHOT_RANKS', '0')
-    if ranks.lower() not in ('all', '*') and str(_debug_rank()) not in {r.strip() for r in ranks.split(',')}:
-        return
-
-    tag_filters = [
-        item.strip() for item in os.environ.get(
-            'NNSCALER_MEM_SNAPSHOT_TAG_SUBSTRINGS', '').split(',')
-        if item.strip()
-    ]
-    if tag_filters and not any(item in tag for item in tag_filters):
-        return
-
-    min_reserved_gb = float(os.environ.get('NNSCALER_MEM_SNAPSHOT_MIN_RESERVED_GB', '0'))
-    if _gb(reserved) < min_reserved_gb:
-        return
-
-    max_dumps = int(os.environ.get('NNSCALER_MEM_SNAPSHOT_MAX_DUMPS', '1'))
-    if _MEM_THRESHOLD_DUMPS >= max_dumps:
-        return
-
-    dump_dir = os.environ.get('NNSCALER_MEM_SNAPSHOT_DIR')
-    if not dump_dir:
-        return
-
-    _maybe_start_memory_history()
-    pathlib.Path(dump_dir).mkdir(parents=True, exist_ok=True)
-    _MEM_THRESHOLD_DUMPS += 1
-    path = pathlib.Path(dump_dir) / (
-        f"rank{_debug_rank()}_dump{_MEM_THRESHOLD_DUMPS}_"
-        f"{_safe_tag(tag)}_reserved{_gb(reserved):.1f}G.pickle")
-    torch.cuda.memory._dump_snapshot(str(path))
-    print(
-        f"[MEMDBG][rank={_debug_rank()}][{tag}] threshold_snapshot={path} "
-        f"allocated={_gb(allocated):.3f}G active={_gb(active):.3f}G "
-        f"reserved={_gb(reserved):.3f}G",
-        flush=True,
-    )
-
-
-def _mem_probe(tag, dump=False):
-    if _env_true('NNSCALER_MEM_PROBE_TO_PHASE_LOG', False):
-        _phase_mem_probe(f'mem:{tag}')
-
-    if not _mem_debug_enabled() or not torch.cuda.is_available():
-        return
-    if _env_true('NNSCALER_MEM_DEBUG_SYNC', False):
-        torch.cuda.synchronize()
-
-    stats = torch.cuda.memory_stats()
-    allocated = torch.cuda.memory_allocated()
-    reserved = torch.cuda.memory_reserved()
-    active = stats.get('active_bytes.all.current', 0)
-    inactive_split = stats.get('inactive_split_bytes.all.current', 0)
-    inactive = stats.get('inactive_bytes.all.current', 0)
-    requested = stats.get('requested_bytes.all.current', 0)
-    seg_current = stats.get('segment.all.current', 0)
-    oversize_segments = stats.get('oversize_segments.current', 0)
-    max_allocated = torch.cuda.max_memory_allocated()
-    max_reserved = torch.cuda.max_memory_reserved()
-    print(
-        f"[MEMDBG][rank={_debug_rank()}][{tag}] "
-        f"alloc={_gb(allocated):.3f}G active={_gb(active):.3f}G "
-        f"requested={_gb(requested):.3f}G reserved={_gb(reserved):.3f}G "
-        f"inactive={_gb(inactive):.3f}G inactive_split={_gb(inactive_split):.3f}G "
-        f"segments={seg_current} oversize_segments={oversize_segments} "
-        f"max_alloc={_gb(max_allocated):.3f}G max_reserved={_gb(max_reserved):.3f}G",
-        flush=True,
-    )
-
-    dump_dir = os.environ.get('NNSCALER_MEM_DEBUG_DUMP_DIR')
-    dump_tags = {t.strip() for t in os.environ.get('NNSCALER_MEM_DEBUG_DUMP_TAGS', '').split(',') if t.strip()}
-    if dump_dir and (dump or tag in dump_tags):
-        pathlib.Path(dump_dir).mkdir(parents=True, exist_ok=True)
-        path = pathlib.Path(dump_dir) / f"rank{_debug_rank()}_{_safe_tag(tag)}.pickle"
-        torch.cuda.memory._dump_snapshot(str(path))
-        print(f"[MEMDBG][rank={_debug_rank()}][{tag}] snapshot={path}", flush=True)
-
-    _maybe_dump_threshold_snapshot(tag, reserved, active, allocated)
-
-
-def _phase_mem_probe(tag):
-    if not _env_true('NNSCALER_PHASE_MEM_LOG', False) or not torch.cuda.is_available():
-        return
-    ranks = os.environ.get('NNSCALER_PHASE_MEM_LOG_RANKS', '0')
-    if ranks.lower() not in ('all', '*') and str(_debug_rank()) not in {r.strip() for r in ranks.split(',')}:
-        return
-    if _env_true('NNSCALER_PHASE_MEM_LOG_SYNC', False):
-        torch.cuda.synchronize()
-
-    stats = torch.cuda.memory_stats()
-    allocated = torch.cuda.memory_allocated()
-    reserved = torch.cuda.memory_reserved()
-    active = stats.get('active_bytes.all.current', 0)
-    requested = stats.get('requested_bytes.all.current', 0)
-    allocated_stat = stats.get('allocated_bytes.all.current', 0)
-    active_allocated = stats.get('active_bytes.all.allocated', 0)
-    active_freed = stats.get('active_bytes.all.freed', 0)
-    reserved_large = stats.get('reserved_bytes.large_pool.current', 0)
-    active_large = stats.get('active_bytes.large_pool.current', 0)
-    allocated_large = stats.get('allocated_bytes.large_pool.current', 0)
-    requested_large = stats.get('requested_bytes.large_pool.current', 0)
-    inactive_split = stats.get('inactive_split_bytes.all.current', 0)
-    inactive = stats.get('inactive_bytes.all.current', 0)
-    free_bytes, total_bytes = torch.cuda.mem_get_info()
-    pending_or_active_cache = max(active - allocated, 0)
-    cached_reusable = max(reserved - active, 0)
-
-    line = (
-        f"[PHASE_MEM][rank={_debug_rank()}][{tag}] "
-        f"alloc_live={_gb(allocated):.3f}G "
-        f"alloc_stat={_gb(allocated_stat):.3f}G "
-        f"active_allocator={_gb(active):.3f}G "
-        f"pending_or_active_cache={_gb(pending_or_active_cache):.3f}G "
-        f"requested={_gb(requested):.3f}G "
-        f"reserved={_gb(reserved):.3f}G "
-        f"cached_reusable={_gb(cached_reusable):.3f}G "
-        f"active_delta={_gb(active_allocated - active_freed):.3f}G "
-        f"large_alloc={_gb(allocated_large):.3f}G "
-        f"large_active={_gb(active_large):.3f}G "
-        f"large_requested={_gb(requested_large):.3f}G "
-        f"large_reserved={_gb(reserved_large):.3f}G "
-        f"inactive={_gb(inactive):.3f}G "
-        f"inactive_split={_gb(inactive_split):.3f}G "
-        f"cuda_free={_gb(free_bytes):.3f}G "
-        f"cuda_total={_gb(total_bytes):.3f}G "
-        f"max_alloc={_gb(torch.cuda.max_memory_allocated()):.3f}G "
-        f"max_reserved={_gb(torch.cuda.max_memory_reserved()):.3f}G\n"
-    )
-
-    path = os.environ.get('NNSCALER_PHASE_MEM_LOG_FILE')
-    if path:
-        pathlib.Path(path).parent.mkdir(parents=True, exist_ok=True)
-        with open(path, 'a', encoding='utf-8') as f:
-            f.write(line)
-    else:
-        print(line, end='', flush=True)
-
-    _maybe_dump_threshold_snapshot(tag, reserved, active, allocated)
-
-
 def set_streams():
     """Initialize global COMP/COMM streams.
     BOTH streams are non-default so that CUDA's legacy
@@ -319,8 +97,6 @@ def set_streams():
     else:
         _COMP_STREAM = torch.cuda.Stream()
     _COMM_STREAM = torch.cuda.Stream()
-    _maybe_start_memory_history()
-    _mem_probe('set_streams')
     # Merged scheduling intentionally accumulates gradients on non-default
     # streams. Suppress this warning only when the merged scheduler streams
     # are initialized, rather than at module import time.
@@ -547,58 +323,25 @@ def _release_owned_storage_after_last_use(
     for group in storage_groups.values():
         tensor = group['tensor']
         nbytes = group['nbytes']
-        logical_nbytes = tensor.numel() * tensor.element_size()
         is_exact = (
             getattr(tensor, '_base', None) is None
             and tensor.storage_offset() == 0
-            and nbytes == logical_nbytes
+            and nbytes == tensor.numel() * tensor.element_size()
         )
         if exact_storage_only and not is_exact:
-            _release_debug_log(
-                tag,
-                f'skip_non_owned_storage={_gb(nbytes):.6f}G '
-                f'logical={_gb(logical_nbytes):.6f}G '
-                f'offset={tensor.storage_offset()} '
-                f'is_view={getattr(tensor, "_base", None) is not None}')
             continue
 
-        force_alias_release = (
-            not exact_storage_only
-            and _env_true('NNSCALER_EP_OVERLAP_RELEASE_PARTIAL_ALIAS_STORAGE', False)
-        )
-
-        if not exact_storage_only and not is_exact and not force_alias_release:
+        if not exact_storage_only and not is_exact:
             covered = _covered_storage_bytes(group['ranges'])
             if covered < nbytes:
-                _release_debug_log(
-                    tag,
-                    f'skip_partial_alias_storage={_gb(nbytes):.6f}G '
-                    f'covered={_gb(covered):.6f}G '
-                    f'logical={_gb(logical_nbytes):.6f}G '
-                    f'offset={tensor.storage_offset()} '
-                    f'is_view={getattr(tensor, "_base", None) is not None}')
                 continue
-        elif force_alias_release and not is_exact:
-            _release_debug_log(
-                tag,
-                f'force_release_alias_storage={_gb(nbytes):.6f}G '
-                f'logical={_gb(logical_nbytes):.6f}G '
-                f'offset={tensor.storage_offset()} '
-                f'is_view={getattr(tensor, "_base", None) is not None}')
 
         try:
             tensor.record_stream(stream)
             tensor.untyped_storage().resize_(0)
-        except RuntimeError as exc:
-            _release_debug_log(tag, f'skip_resize_error={exc}')
+        except RuntimeError:
             continue
         released += nbytes
-        _release_debug_log(
-            tag,
-            f'resize_storage={_gb(nbytes):.6f}G '
-            f'logical={_gb(logical_nbytes):.6f}G '
-            f'offset={tensor.storage_offset()} '
-            f'is_view={getattr(tensor, "_base", None) is not None}')
     return released
 
 
@@ -626,8 +369,6 @@ def _release_layer_dead_storage_after_backward(tag, obj, stream, exclude_obj=())
     explicitly excludes its storage, the whole storage can be resized. This is
     intentionally more aggressive than per-node consumed-grad release.
     """
-    if _env_true('NNSCALER_EP_OVERLAP_SYNC_BEFORE_LAYER_DEAD_RELEASE', False):
-        stream.synchronize()
     return _release_owned_storage_after_last_use(
         tag, obj, stream,
         exclude_obj=exclude_obj,
@@ -734,13 +475,8 @@ class ScheduleNode:
             _sync_lifetime_to_creation_stream(inputs, self.stream)
             for inp in inputs:
                 if isinstance(inp, torch.Tensor) and inp.is_cuda:
-                    nbytes = _cuda_storage_nbytes(inp)
                     inp.record_stream(self.stream)
                     inp.untyped_storage().resize_(0)
-                    if nbytes:
-                        _release_debug_log(
-                            f'{self.name}:free_input',
-                            f'resize_storage={_gb(nbytes):.6f}G')
 
         return self.output
 
@@ -924,19 +660,8 @@ class MergedScheduler:
             ThreadPoolExecutor(max_workers=1, thread_name_prefix='moe-overlap')
             if _async_on else None
         )
-        self._early_attn_memory_release = _env_true(
-            'NNSCALER_EP_OVERLAP_EARLY_ATTN_MEMORY_RELEASE', False)
-        self._sync_4phase_between_phases = _env_true(
-            'NNSCALER_EP_OVERLAP_SYNC_PHASES', False)
-        self._sync_4phase_device = _env_true(
-            'NNSCALER_EP_OVERLAP_SYNC_PHASES_DEVICE', False)
-        self._aggressive_release_debug = _env_true(
-            'NNSCALER_EP_OVERLAP_AGGRESSIVE_RELEASE', False)
         self._drop_forward_only_step_data = _env_true(
-            'NNSCALER_EP_OVERLAP_DROP_STEP_DATA',
-            self._aggressive_release_debug)
-        self._sync_after_loss_backward = _env_true(
-            'NNSCALER_EP_OVERLAP_SYNC_AFTER_LOSS_BWD', False)
+            'NNSCALER_EP_OVERLAP_DROP_STEP_DATA', True)
 
         # Pre-allocate CUDA events for cross-stream synchronization.
         # Using separate events per barrier slot avoids re-recording while
@@ -974,7 +699,6 @@ class MergedScheduler:
 
         Returns: [output_info] per micro-batch
         """
-        _mem_probe('run:start')
         num_mbs = len(samples)
         assert num_mbs >= 2, "merged FWD-BWD requires at least 2 micro-batches"
 
@@ -987,7 +711,6 @@ class MergedScheduler:
         default_done.record(torch.cuda.default_stream())
         get_comp_stream().wait_event(default_done)
         get_comm_stream().wait_event(default_done)
-        _mem_probe('run:after_default_wait_setup')
 
         num_steps = self.num_layers
         events = [torch.cuda.Event() for _ in range(num_mbs)]
@@ -997,7 +720,6 @@ class MergedScheduler:
         with torch.cuda.stream(get_comp_stream()):
             h0 = embed_fn(samples[0])
             _mark_creation_stream(h0, get_comp_stream())
-        _mem_probe('run:after_embed_mb0')
         _embed_h_list = [h0]  # Save embedding outputs for backward
 
         lc_list_0 = []
@@ -1006,7 +728,6 @@ class MergedScheduler:
 
         h0, all_nodes_0, rmaps_0, eprobs_0 = self._forward_all_layers(
             h0, lc_list_0, events[0])
-        _mem_probe('run:after_forward_all_layers_mb0')
 
         # Sync COMM→COMP: last forward node may be on COMM (MoE combine),
         # but loss_node runs on COMP with a fresh event (no wait).
@@ -1015,7 +736,6 @@ class MergedScheduler:
         loss_node_0, output_info_0 = loss_fn(h0, samples[0], rmaps_0, eprobs_0)
         loss_0 = loss_node_0.forward((h0,))
         results[0] = output_info_0['output_tuple']
-        _mem_probe('run:after_loss_forward_mb0')
 
         del h0, rmaps_0, eprobs_0, output_info_0
 
@@ -1034,7 +754,6 @@ class MergedScheduler:
                 fwd_h = embed_fn(fwd_sample)
                 _mark_creation_stream(fwd_h, get_comm_stream())
             _embed_h_list.append(fwd_h)
-            _mem_probe(f'run:after_embed_mb{mb_i + 1}')
 
             # Loss backward on COMP — overlaps with embed on COMM
             with torch.cuda.stream(get_comp_stream()):
@@ -1043,10 +762,6 @@ class MergedScheduler:
             with nnscaler.sync_grad_when(False):
                 grad_h = prev_loss_node.backward(loss_grad)
             del loss_grad
-            self._release_loss_wgrad_scratch()
-            self._sync_after_loss_backward_for_debug(
-                f'run:after_loss_backward_mb{mb_i}')
-            _mem_probe(f'run:after_loss_backward_mb{mb_i}')
 
             prev_loss_node._release()
 
@@ -1097,10 +812,8 @@ class MergedScheduler:
                     continue
 
                 with nnscaler.sync_grad_when(False):
-                    _mem_probe(f'run:before_merged mb{mb_i} f{fwd_idx} b{bwd_idx}')
                     fwd_h, grad_h, fwd_entry = self._merged_step_general(
                         bwd_entry, fwd_lc, fwd_event, grad_h, fwd_h)
-                    _mem_probe(f'run:after_merged mb{mb_i} f{fwd_idx} b{bwd_idx}')
 
                 prev_all_nodes[bwd_idx] = None
 
@@ -1133,7 +846,6 @@ class MergedScheduler:
                 else:
                     fwd_h, fwd_entry = self._forward_single_layer(
                         fwd_h, fwd_lc, fwd_event)
-                _mem_probe(f'run:after_forward_tail mb{mb_i + 1} f{fwd_idx}')
                 fwd_all_nodes[fwd_idx] = fwd_entry
                 if fwd_lc.is_moe:
                     fwd_routing_maps.append(fwd_lc.step_data.get('routing_map'))
@@ -1158,7 +870,6 @@ class MergedScheduler:
                     continue
                 with nnscaler.sync_grad_when(False):
                     grad_h = self._backward_entry(bwd_entry, grad_h)
-                _mem_probe(f'run:after_backward_tail mb{mb_i} b{bwd_idx}')
                 prev_all_nodes[bwd_idx] = None
                 bwd_idx -= 1
 
@@ -1166,7 +877,6 @@ class MergedScheduler:
             # Propagate gradient through embedding graph to tok_embed weight
             with nnscaler.sync_grad_when(False):
                 _embed_h_list[mb_i].backward(grad_h)
-            _mem_probe(f'run:after_embed_backward_mb{mb_i}')
 
             # Sync COMM→COMP: last fwd node may be on COMM (MoE combine),
             # but loss_node runs on COMP with a fresh event.
@@ -1176,7 +886,6 @@ class MergedScheduler:
                 fwd_h, fwd_sample, fwd_routing_maps, fwd_expert_probs)
             fwd_loss = fwd_loss_node.forward((fwd_h,))
             results[mb_i + 1] = fwd_output_info['output_tuple']
-            _mem_probe(f'run:after_loss_forward_mb{mb_i + 1}')
 
             prev_all_nodes = fwd_all_nodes
             prev_loss_node = fwd_loss_node
@@ -1193,9 +902,6 @@ class MergedScheduler:
                 _mark_creation_stream(loss_grad, get_comp_stream())
             grad_h = prev_loss_node.backward(loss_grad)
             del loss_grad
-            self._release_loss_wgrad_scratch()
-            self._sync_after_loss_backward_for_debug('run:cooldown_after_loss_backward')
-            _mem_probe('run:cooldown_after_loss_backward')
             for i in reversed(range(num_steps)):
                 entry = prev_all_nodes[i]
                 if isinstance(entry, tuple) and len(entry) == 2 and entry[0] == 'special':
@@ -1209,10 +915,8 @@ class MergedScheduler:
                 if entry is None:
                     continue
                 grad_h = self._backward_entry(entry, grad_h)
-                _mem_probe(f'run:cooldown_after_backward b{i}')
             # Propagate gradient through embedding graph to tok_embed weight
             _embed_h_list[-1].backward(grad_h)
-            _mem_probe('run:after_final_embed_backward')
 
         # Make default stream wait for COMP/COMM to finish without blocking host.
         comp_done = torch.cuda.Event()
@@ -1221,7 +925,6 @@ class MergedScheduler:
         comm_done.record(get_comm_stream())
         torch.cuda.default_stream().wait_event(comp_done)
         torch.cuda.default_stream().wait_event(comm_done)
-        _mem_probe('run:after_default_stream_wait')
 
         for i in range(len(results)):
             if results[i] is not None:
@@ -1229,14 +932,8 @@ class MergedScheduler:
                     t.detach() if isinstance(t, torch.Tensor) else t
                     for t in results[i]
                 )
-        _mem_probe('run:after_detach_results')
 
         del prev_all_nodes, prev_loss_node
-        _mem_probe('run:end', dump=True)
-        _phase_mem_probe('run:end')
-        if _env_true('NNSCALER_MEM_DEBUG_EMPTY_CACHE', False):
-            torch.cuda.empty_cache()
-            _mem_probe('run:after_empty_cache', dump=True)
 
         return results
 
@@ -1334,81 +1031,26 @@ class MergedScheduler:
         get_comm_stream().wait_event(comp_evt)
         get_comp_stream().wait_event(comm_evt)
 
-    def _sync_4phase_boundary_for_debug(self, tag):
-        if not self._sync_4phase_between_phases:
-            return
-        if self._sync_4phase_device:
-            torch.cuda.synchronize()
-            _mem_probe(f'4phase:after_device_sync_{tag}')
-            _phase_mem_probe(f'4phase:after_device_sync_{tag}')
-            return
-        get_comp_stream().synchronize()
-        get_comm_stream().synchronize()
-        _mem_probe(f'4phase:after_sync_{tag}')
-        _phase_mem_probe(f'4phase:after_sync_{tag}')
-
-    def _release_debug_probe(self, tag):
-        if not self._aggressive_release_debug:
-            return
-        if self._sync_4phase_between_phases:
-            get_comp_stream().synchronize()
-            get_comm_stream().synchronize()
-        _mem_probe(f'4phase:after_release_{tag}')
-        _phase_mem_probe(f'4phase:after_release_{tag}')
-
-    def _sync_after_loss_backward_for_debug(self, tag):
-        if not self._sync_after_loss_backward:
-            return
-        if _env_true('NNSCALER_EP_OVERLAP_SYNC_AFTER_LOSS_BWD_DEVICE', False):
-            torch.cuda.synchronize()
-            _mem_probe(f'{tag}:after_sync_loss_bwd')
-            return
-        get_comp_stream().synchronize()
-        if _env_true('NNSCALER_EP_OVERLAP_SYNC_AFTER_LOSS_BWD_BOTH_STREAMS', False):
-            get_comm_stream().synchronize()
-        _mem_probe(f'{tag}:after_sync_loss_bwd')
-
-    def _release_loss_wgrad_scratch(self):
-        if not _env_true('MSRALLM_CE_RELEASE_WGRAD_SCRATCH_AFTER_BWD', False):
-            return
-        try:
-            from arch.linear import release_ce_wgrad_scratch
-        except Exception:
-            return
-        with torch.cuda.stream(get_comp_stream()):
-            release_ce_wgrad_scratch()
-
-    def _drop_step_data_keys(self, lc, keys, tag):
+    def _drop_step_data_keys(self, lc, keys):
         if not self._drop_forward_only_step_data:
             return
-        dropped = []
-        dropped_bytes = 0
         for key in keys:
             if key not in lc.step_data:
                 continue
             value = lc.step_data.pop(key)
-            nbytes = _cuda_storage_nbytes(value)
-            dropped_bytes += nbytes
-            dropped.append(f'{key}:{_gb(nbytes):.6f}G')
             del value
-        if dropped:
-            _release_debug_log(
-                tag,
-                f"dropped_step_data={','.join(dropped)} "
-                f'total_tensor_storage={_gb(dropped_bytes):.6f}G')
 
-    def _drop_after_dispatch_forward(self, lc, tag):
+    def _drop_after_dispatch_forward(self, lc):
         # The private routing map is only needed to build dispatch metadata.
         # Keep public routing_map/gate_scores because the loss path consumes them.
-        self._drop_step_data_keys(lc, ('_routing_map', '_deepep_token_indices'), tag)
+        self._drop_step_data_keys(lc, ('_routing_map', '_deepep_token_indices'))
 
-    def _drop_after_combine_forward(self, lc, tag):
+    def _drop_after_combine_forward(self, lc):
         # meta/precomputed are forward-only scheduler inputs. Autograd Functions
         # save what they need in their own ctx during forward.
         self._drop_step_data_keys(
             lc,
             ('meta', 'precomputed', 'aux_counts', '_loss_aux_tensors'),
-            tag,
         )
 
     @staticmethod
@@ -1659,7 +1301,7 @@ class MergedScheduler:
             attn_n.loss_aux_tensors = loss_aux_tensors
         dispatch_out = dispatch_n.forward((h_ln, routing_probs))
         dispatch_out = self._prepare_state_dispatched_probs(lc, dispatch_n, dispatch_out)
-        self._drop_after_dispatch_forward(lc, 'forward_single:after_dispatch')
+        self._drop_after_dispatch_forward(lc)
         expert_result = expert_n.forward(
             self._expert_forward_inputs(lc, expert_n, dispatch_out, h_ln))
         expert_out, shared_expert_out = self._prepare_state_shared_expert(
@@ -1667,7 +1309,7 @@ class MergedScheduler:
         combine_n.uses_state_residual = lc.step_data.get('_use_state_residual', False)
         h_out = combine_n.forward(
             self._combine_forward_inputs(lc, expert_out, h_residual, shared_expert_out))
-        self._drop_after_combine_forward(lc, 'forward_single:after_combine')
+        self._drop_after_combine_forward(lc)
 
         for n in nodes:
             if n.checkpoint:
@@ -1848,7 +1490,6 @@ class MergedScheduler:
             layer_dead_refs = [consumed_grad_h]
             # Initial sync: COMP→COMM so COMM can read grad_h (from loss_bwd on COMP)
             self._sync_comp_to_comm()
-            _mem_probe('4phase:start')
 
             # Phase 1: COMM(b_combine) || COMP(f_attn_router)
             # b_combine is pure communication (shared expert merged into expert).
@@ -1871,22 +1512,10 @@ class MergedScheduler:
             loss_aux_tensors = fwd_lc.step_data.get('_loss_aux_tensors')
             if loss_aux_tensors is not None:
                 fwd_attn.loss_aux_tensors = loss_aux_tensors
-            if self._aggressive_release_debug:
-                # These Python refs are redundant after the nodes have captured
-                # their own forward/backward state. If active memory does not
-                # move here, the storage is still owned by node/autograd state.
-                fwd_attn_out = None
-                fwd_h = None
-                grad_h = None
-                self._release_debug_probe('phase1_refs')
-            _mem_probe('4phase:after_phase1')
-            _phase_mem_probe('4phase:after_phase1')
-            self._sync_4phase_boundary_for_debug('phase1')
 
             # Phase boundary: Phase 2 COMP needs COMM output (combine_grads),
             # Phase 2 COMM needs COMP output (attn_out + precomputed metadata)
             self._cross_stream_barrier(slot=0)
-            _mem_probe('4phase:after_barrier0')
 
             # Phase 2: COMM(f_dispatch) || COMP(b_expert)
             # expert backward includes shared expert backward (both on COMP).
@@ -1908,38 +1537,51 @@ class MergedScheduler:
             if getattr(bwd_attn, 'uses_state_residual', False):
                 combine_grads = None
                 combine_grads_for_attn = None
-            if self._aggressive_release_debug and getattr(bwd_attn, 'uses_state_residual', False):
-                self._release_debug_probe('phase2_combine_grads')
             fwd_dispatch_out = self._prepare_state_dispatched_probs(
                 fwd_lc, fwd_dispatch, fwd_dispatch_out)
-            self._drop_after_dispatch_forward(fwd_lc, '4phase:after_dispatch_forward')
-            _mem_probe('4phase:after_phase2')
-            _phase_mem_probe('4phase:after_phase2')
-            self._sync_4phase_boundary_for_debug('phase2')
+            self._drop_after_dispatch_forward(fwd_lc)
 
             # Phase boundary: Phase 3 COMP needs COMM output (dispatch_out),
             # Phase 3 COMM needs COMP output (expert_grads)
             self._cross_stream_barrier(slot=1)
-            _mem_probe('4phase:after_barrier1')
 
-            if self._early_attn_memory_release:
-                # Release previous attention activations before launching the next
-                # expert forward, which is the next large allocation region.
-                dispatch_bwd_grads = self._dispatch_backward_grads(
-                    bwd_dispatch, expert_grads)
-                expert_h_ln_grad = self._expert_h_ln_grad(bwd_expert, expert_grads)
+            # Phase 3: COMM(b_dispatch) || COMP(f_expert)
+            # expert forward includes shared expert (takes h_ln, returns tuple).
+            dispatch_bwd_grads = self._dispatch_backward_grads(
+                bwd_dispatch, expert_grads)
+            expert_h_ln_grad = self._expert_h_ln_grad(bwd_expert, expert_grads)
+            if pool is not None:
+                fut_dispatch_bwd = pool.submit(
+                    bwd_dispatch.backward, dispatch_bwd_grads)
+                fwd_expert_result = fwd_expert.forward(
+                    self._expert_forward_inputs(
+                        fwd_lc, fwd_expert, fwd_dispatch_out, fwd_h_ln))
+                dispatch_grads = fut_dispatch_bwd.result()
+            else:
                 dispatch_grads = bwd_dispatch.backward(dispatch_bwd_grads)
-                _release_consumed_storage_after_last_use(
-                    '4phase:dispatch_consumed_output_grads', dispatch_bwd_grads,
-                    get_comm_stream(), exclude_obj=(expert_h_ln_grad, dispatch_grads))
-                layer_dead_refs.extend((dispatch_bwd_grads, dispatch_grads, expert_h_ln_grad))
-                dispatch_bwd_grads = None
-                if self._aggressive_release_debug:
-                    expert_grads = None
-                    self._release_debug_probe('early_dispatch_inputs')
-                self._sync_comm_to_comp()
-                _mem_probe('4phase:after_dispatch_bwd_early')
+                fwd_expert_result = fwd_expert.forward(
+                    self._expert_forward_inputs(
+                        fwd_lc, fwd_expert, fwd_dispatch_out, fwd_h_ln))
+            _release_consumed_storage_after_last_use(
+                '4phase:dispatch_consumed_output_grads', dispatch_bwd_grads,
+                get_comm_stream(), exclude_obj=(expert_h_ln_grad, dispatch_grads))
+            layer_dead_refs.extend((dispatch_bwd_grads, dispatch_grads, expert_h_ln_grad))
+            dispatch_bwd_grads = None
+            fwd_expert_out, fwd_shared_expert_out = self._prepare_state_shared_expert(
+                fwd_lc, fwd_expert, fwd_expert_result)
+            fwd_expert_result = None
+            fwd_combine.uses_state_residual = fwd_lc.step_data.get('_use_state_residual', False)
 
+            # Phase boundary: Phase 4 COMP needs COMM output (dispatch_grads),
+            # Phase 4 COMM needs COMP output (expert_out + shared_expert_out)
+            self._cross_stream_barrier(slot=2)
+
+            # Phase 4: COMM(f_combine) || COMP(b_attn)
+            if pool is not None:
+                fut_combine_fwd = pool.submit(
+                    fwd_combine.forward,
+                    self._combine_forward_inputs(
+                        fwd_lc, fwd_expert_out, fwd_h_residual, fwd_shared_expert_out))
                 grad_h_ln_total = self._add_optional_grad(
                     dispatch_grads[0], expert_h_ln_grad)
                 attn_grads = self._attn_backward_grads(
@@ -1947,145 +1589,31 @@ class MergedScheduler:
                     live_residual_grad,
                     grad_h_ln_total, dispatch_grads[1])
                 grad_x = bwd_attn.backward(attn_grads)
-                _release_consumed_storage_after_last_use(
-                    '4phase:attn_consumed_output_grads',
-                    (attn_grads, dispatch_grads, expert_h_ln_grad, live_residual_grad),
-                    get_comp_stream(), exclude_obj=grad_x)
-                layer_dead_refs.extend((live_residual_grad, grad_h_ln_total, attn_grads))
-                _release_layer_dead_storage_after_backward(
-                    '4phase:dead_after_layer_backward', layer_dead_refs,
-                    get_comp_stream(), exclude_obj=(
-                        grad_x, fwd_nodes, fwd_lc.step_data,
-                        fwd_h_residual, fwd_h_ln, fwd_routing_probs,
-                        fwd_dispatch_out))
-                if self._aggressive_release_debug:
-                    dispatch_grads = None
-                    grad_h_ln_total = None
-                    expert_h_ln_grad = None
-                    attn_grads = None
-                    live_residual_grad = None
-                    combine_grads_for_attn = None
-                    self._release_debug_probe('early_attn_grads')
-                _mem_probe('4phase:after_attn_bwd_early')
-
-                fwd_expert_result = fwd_expert.forward(
-                    self._expert_forward_inputs(
-                        fwd_lc, fwd_expert, fwd_dispatch_out, fwd_h_ln))
-                fwd_expert_out, fwd_shared_expert_out = self._prepare_state_shared_expert(
-                    fwd_lc, fwd_expert, fwd_expert_result)
-                fwd_expert_result = None
-                if self._aggressive_release_debug:
-                    fwd_dispatch_out = None
-                    self._release_debug_probe('early_expert_inputs')
-                fwd_combine.uses_state_residual = fwd_lc.step_data.get('_use_state_residual', False)
-                _mem_probe('4phase:after_phase3')
-                _phase_mem_probe('4phase:after_phase3')
-                self._sync_4phase_boundary_for_debug('phase3')
-
-                self._cross_stream_barrier(slot=2)
-                _mem_probe('4phase:after_barrier2')
-
+                fwd_h_out = fut_combine_fwd.result()
+            else:
                 fwd_h_out = fwd_combine.forward(
                     self._combine_forward_inputs(
                         fwd_lc, fwd_expert_out, fwd_h_residual, fwd_shared_expert_out))
-                self._drop_after_combine_forward(fwd_lc, '4phase:after_combine_forward')
-                if self._aggressive_release_debug:
-                    fwd_expert_out = None
-                    fwd_shared_expert_out = None
-                    fwd_h_residual = None
-                    self._release_debug_probe('early_combine_refs')
-            else:
-                # Phase 3: COMM(b_dispatch) || COMP(f_expert)
-                # expert forward includes shared expert (takes h_ln, returns tuple).
-                dispatch_bwd_grads = self._dispatch_backward_grads(
-                    bwd_dispatch, expert_grads)
-                expert_h_ln_grad = self._expert_h_ln_grad(bwd_expert, expert_grads)
-                if pool is not None:
-                    fut_dispatch_bwd = pool.submit(
-                        bwd_dispatch.backward, dispatch_bwd_grads)
-                    fwd_expert_result = fwd_expert.forward(
-                        self._expert_forward_inputs(
-                            fwd_lc, fwd_expert, fwd_dispatch_out, fwd_h_ln))
-                    dispatch_grads = fut_dispatch_bwd.result()
-                else:
-                    dispatch_grads = bwd_dispatch.backward(dispatch_bwd_grads)
-                    fwd_expert_result = fwd_expert.forward(
-                        self._expert_forward_inputs(
-                            fwd_lc, fwd_expert, fwd_dispatch_out, fwd_h_ln))
-                _release_consumed_storage_after_last_use(
-                    '4phase:dispatch_consumed_output_grads', dispatch_bwd_grads,
-                    get_comm_stream(), exclude_obj=(expert_h_ln_grad, dispatch_grads))
-                layer_dead_refs.extend((dispatch_bwd_grads, dispatch_grads, expert_h_ln_grad))
-                dispatch_bwd_grads = None
-                if self._aggressive_release_debug:
-                    expert_grads = None
-                    fwd_dispatch_out = None
-                    self._release_debug_probe('phase3_dispatch_expert_inputs')
-                fwd_expert_out, fwd_shared_expert_out = self._prepare_state_shared_expert(
-                    fwd_lc, fwd_expert, fwd_expert_result)
-                fwd_expert_result = None
-                fwd_combine.uses_state_residual = fwd_lc.step_data.get('_use_state_residual', False)
-                _mem_probe('4phase:after_phase3')
-                _phase_mem_probe('4phase:after_phase3')
-                self._sync_4phase_boundary_for_debug('phase3')
-
-                # Phase boundary: Phase 4 COMP needs COMM output (dispatch_grads),
-                # Phase 4 COMM needs COMP output (expert_out + shared_expert_out)
-                self._cross_stream_barrier(slot=2)
-                _mem_probe('4phase:after_barrier2')
-
-                # Phase 4: COMM(f_combine) || COMP(b_attn)
-                if pool is not None:
-                    fut_combine_fwd = pool.submit(
-                        fwd_combine.forward,
-                        self._combine_forward_inputs(
-                            fwd_lc, fwd_expert_out, fwd_h_residual, fwd_shared_expert_out))
-                    grad_h_ln_total = self._add_optional_grad(
-                        dispatch_grads[0], expert_h_ln_grad)
-                    attn_grads = self._attn_backward_grads(
-                        bwd_attn,
-                        live_residual_grad,
-                        grad_h_ln_total, dispatch_grads[1])
-                    grad_x = bwd_attn.backward(attn_grads)
-                    fwd_h_out = fut_combine_fwd.result()
-                else:
-                    fwd_h_out = fwd_combine.forward(
-                        self._combine_forward_inputs(
-                            fwd_lc, fwd_expert_out, fwd_h_residual, fwd_shared_expert_out))
-                    grad_h_ln_total = self._add_optional_grad(
-                        dispatch_grads[0], expert_h_ln_grad)
-                    attn_grads = self._attn_backward_grads(
-                        bwd_attn,
-                        live_residual_grad,
-                        grad_h_ln_total, dispatch_grads[1])
-                    grad_x = bwd_attn.backward(attn_grads)
-                _release_consumed_storage_after_last_use(
-                    '4phase:attn_consumed_output_grads',
-                    (attn_grads, dispatch_grads, expert_h_ln_grad, live_residual_grad),
-                    get_comp_stream(), exclude_obj=grad_x)
-                layer_dead_refs.extend((live_residual_grad, grad_h_ln_total, attn_grads))
-                _release_layer_dead_storage_after_backward(
-                    '4phase:dead_after_layer_backward', layer_dead_refs,
-                    get_comp_stream(), exclude_obj=(
-                        grad_x, fwd_nodes, fwd_lc.step_data,
-                        fwd_h_residual, fwd_h_ln, fwd_routing_probs,
-                        fwd_dispatch_out, fwd_expert_out,
-                        fwd_shared_expert_out, fwd_h_out))
-                self._drop_after_combine_forward(fwd_lc, '4phase:after_combine_forward')
-                if self._aggressive_release_debug:
-                    dispatch_grads = None
-                    grad_h_ln_total = None
-                    expert_h_ln_grad = None
-                    attn_grads = None
-                    live_residual_grad = None
-                    combine_grads_for_attn = None
-                    fwd_expert_out = None
-                    fwd_shared_expert_out = None
-                    fwd_h_residual = None
-                    self._release_debug_probe('phase4_refs')
-            _mem_probe('4phase:after_phase4')
-            _phase_mem_probe('4phase:after_phase4')
-            self._sync_4phase_boundary_for_debug('phase4')
+                grad_h_ln_total = self._add_optional_grad(
+                    dispatch_grads[0], expert_h_ln_grad)
+                attn_grads = self._attn_backward_grads(
+                    bwd_attn,
+                    live_residual_grad,
+                    grad_h_ln_total, dispatch_grads[1])
+                grad_x = bwd_attn.backward(attn_grads)
+            _release_consumed_storage_after_last_use(
+                '4phase:attn_consumed_output_grads',
+                (attn_grads, dispatch_grads, expert_h_ln_grad, live_residual_grad),
+                get_comp_stream(), exclude_obj=grad_x)
+            layer_dead_refs.extend((live_residual_grad, grad_h_ln_total, attn_grads))
+            _release_layer_dead_storage_after_backward(
+                '4phase:dead_after_layer_backward', layer_dead_refs,
+                get_comp_stream(), exclude_obj=(
+                    grad_x, fwd_nodes, fwd_lc.step_data,
+                    fwd_h_residual, fwd_h_ln, fwd_routing_probs,
+                    fwd_dispatch_out, fwd_expert_out,
+                    fwd_shared_expert_out, fwd_h_out))
+            self._drop_after_combine_forward(fwd_lc)
 
             if dispatch_grads is not None:
                 _sync_lifetime_to_creation_stream((dispatch_grads[0],), get_comp_stream())
@@ -2093,7 +1621,6 @@ class MergedScheduler:
                  dispatch_bwd_grads, dispatch_grads, expert_h_ln_grad,
                  live_residual_grad, grad_h_ln_total, attn_grads,
                  layer_dead_refs)
-            _mem_probe('4phase:after_del_grads')
 
             for n in fwd_nodes:
                 if n.checkpoint:
@@ -2103,7 +1630,6 @@ class MergedScheduler:
             # The next merged step's fwd_attn will consume fwd_h_out on COMP stream,
             # so COMP must wait for COMM to finish.
             self._sync_comm_to_comp()
-            _mem_probe('4phase:end')
 
         # Restore event protocol for sequential backward use (cooldown)
         for n in fwd_nodes:
