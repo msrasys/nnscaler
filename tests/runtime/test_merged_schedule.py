@@ -79,6 +79,74 @@ def test_dedicated_comp_stream_mode_is_opt_in(monkeypatch):
     set_streams()
 
 
+@pytest.mark.skipif(
+    not torch.cuda.is_available(),
+    reason='requires CUDA streams',
+)
+def test_scheduler_checkpoint_policy_can_target_body_only(monkeypatch):
+    monkeypatch.delenv('NNSCALER_MOE_OVERLAP_DEDICATED_COMP_STREAM', raising=False)
+    set_streams()
+    scheduler = MergedScheduler(
+        parallel_module=object(),
+        num_layers=1,
+        checkpoint_attn=False,
+        checkpoint_body=True,
+    )
+    event = torch.cuda.Event()
+
+    dense_nodes = scheduler._create_nodes(
+        LayerCallables(
+            attn_fn=lambda h: h,
+            body_fn=lambda h: h,
+            is_moe=False,
+        ),
+        event,
+    )
+    assert dense_nodes[0].checkpoint is False
+    assert dense_nodes[1].checkpoint is True
+
+    moe_nodes = scheduler._create_nodes_4(
+        LayerCallables(
+            attn_fn=lambda h: (h, h, h),
+            dispatch_fn=lambda h, p: (h, p),
+            expert_fn=lambda h, p, h_ln: (h, h_ln),
+            combine_fn=lambda h: h,
+            is_moe=True,
+        ),
+        event,
+    )
+    assert moe_nodes[0].checkpoint is False
+    assert moe_nodes[1].checkpoint is False
+    assert moe_nodes[2].checkpoint is True
+    assert moe_nodes[3].checkpoint is False
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available(),
+    reason='requires CUDA streams',
+)
+def test_scheduler_use_checkpoint_remains_all_compute_nodes(monkeypatch):
+    monkeypatch.delenv('NNSCALER_MOE_OVERLAP_DEDICATED_COMP_STREAM', raising=False)
+    set_streams()
+    scheduler = MergedScheduler(
+        parallel_module=object(),
+        num_layers=1,
+        use_checkpoint=True,
+    )
+    event = torch.cuda.Event()
+
+    dense_nodes = scheduler._create_nodes(
+        LayerCallables(
+            attn_fn=lambda h: h,
+            body_fn=lambda h: h,
+            is_moe=False,
+        ),
+        event,
+    )
+    assert dense_nodes[0].checkpoint is True
+    assert dense_nodes[1].checkpoint is True
+
+
 def test_overlap_dispatch_backward_with_expert_wgrad_async_order():
     trace = []
     dispatch_entered = threading.Event()

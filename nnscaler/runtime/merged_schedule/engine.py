@@ -398,10 +398,16 @@ class MergedScheduler:
 
     def __init__(self, parallel_module, num_layers, *,
                  use_checkpoint=False,
+                 checkpoint_attn=None,
+                 checkpoint_body=None,
                  early_attn_memory_release=False):
         self.parallel_module = parallel_module
         self.num_layers = num_layers
-        self.use_checkpoint = use_checkpoint
+        self.checkpoint_attn = (
+            use_checkpoint if checkpoint_attn is None else checkpoint_attn)
+        self.checkpoint_body = (
+            use_checkpoint if checkpoint_body is None else checkpoint_body)
+        self.use_checkpoint = self.checkpoint_attn or self.checkpoint_body
         self._use_4node = True
         self.early_attn_memory_release = early_attn_memory_release
 
@@ -554,8 +560,8 @@ class MergedScheduler:
                 fwd_all_nodes[fwd_idx] = fwd_entry
 
                 if fwd_lc.is_moe:
-                    fwd_routing_maps.append(fwd_lc.step_data.get('routing_map'))
-                    fwd_expert_probs.append(fwd_lc.step_data.get('gate_scores'))
+                    self._append_loss_aux_data(
+                        fwd_lc, fwd_routing_maps, fwd_expert_probs)
 
                 fwd_idx += 1
                 bwd_idx -= 1
@@ -579,8 +585,8 @@ class MergedScheduler:
                         fwd_h, fwd_lc, fwd_event)
                 fwd_all_nodes[fwd_idx] = fwd_entry
                 if fwd_lc.is_moe:
-                    fwd_routing_maps.append(fwd_lc.step_data.get('routing_map'))
-                    fwd_expert_probs.append(fwd_lc.step_data.get('gate_scores'))
+                    self._append_loss_aux_data(
+                        fwd_lc, fwd_routing_maps, fwd_expert_probs)
                 fwd_idx += 1
 
             while bwd_idx >= 0:
@@ -674,7 +680,7 @@ class MergedScheduler:
 
         attn_node = ScheduleNode(
             lc.attn_fn, comp_stream, event,
-            name="attn", checkpoint=self.use_checkpoint)
+            name="attn", checkpoint=self.checkpoint_attn)
 
         if lc.is_moe:
             raise NotImplementedError(
@@ -683,7 +689,7 @@ class MergedScheduler:
 
         body_node = ScheduleNode(
             lc.body_fn, comp_stream, event,
-            name="ffn", checkpoint=self.use_checkpoint)
+            name="ffn", checkpoint=self.checkpoint_body)
 
         return (attn_node, body_node)
 
@@ -694,7 +700,7 @@ class MergedScheduler:
 
         attn_node = ScheduleNode(
             lc.attn_fn, comp_stream, event,
-            name="attn_router", checkpoint=self.use_checkpoint)
+            name="attn_router", checkpoint=self.checkpoint_attn)
 
         dispatch_node = ScheduleNode(
             lc.dispatch_fn, comm_stream, event,
@@ -703,7 +709,7 @@ class MergedScheduler:
         expert_node = ScheduleNode(
             lc.expert_fn, comp_stream, event,
             backward_dw_func=lc.expert_backward_dw,
-            name="expert", checkpoint=self.use_checkpoint)
+            name="expert", checkpoint=self.checkpoint_body)
 
         combine_node = ScheduleNode(
             lc.combine_fn, comm_stream, event,
@@ -901,6 +907,14 @@ class MergedScheduler:
             grads.append(None)
         return tuple(grads[:attn_node.output_arity()])
 
+    @staticmethod
+    def _append_loss_aux_data(lc, routing_maps, expert_probs):
+        routing_map = lc.step_data.get('routing_map')
+        expert_prob = lc.step_data.get('gate_scores')
+        if routing_map is not None or expert_prob is not None:
+            routing_maps.append(routing_map)
+            expert_probs.append(expert_prob)
+
     def _forward_all_layers(self, h, lc_list, event):
         """Warmup: forward all layers, collect nodes and routing data."""
         all_nodes = []
@@ -934,8 +948,7 @@ class MergedScheduler:
                 entry = ('layer2', nodes)
 
             if lc.is_moe:
-                routing_maps.append(lc.step_data.get('routing_map'))
-                expert_probs.append(lc.step_data.get('gate_scores'))
+                self._append_loss_aux_data(lc, routing_maps, expert_probs)
 
             all_nodes.append(entry)
 
