@@ -364,11 +364,11 @@ class ScheduleNode:
 class LayerCallables:
     """User-provided callable description for each layer step."""
     # MoE 4-node mode:
-    attn_fn: Callable = None          # (h) -> (h, h_ln) for MoE, (h) -> h for dense
-    dispatch_fn: Callable = None      # (h_ln) -> (sorted_tokens, sorted_probs)
-    expert_fn: Callable = None        # (sorted_tokens, sorted_probs) -> expert_outs
+    attn_fn: Callable = None          # (h) -> (h, h_ln, dispatch_tensor, dispatch_probs, *aux)
+    dispatch_fn: Callable = None      # (dispatch_tensor, dispatch_probs) -> (dispatched_tensor, dispatched_probs)
+    expert_fn: Callable = None        # (dispatched_tensor, dispatched_probs, h_ln) -> (combine_tensor, shared)
     expert_backward_dw: Callable = None
-    combine_fn: Callable = None       # (expert_outs) -> h_out; residual/shared state in step_data
+    combine_fn: Callable = None       # (combine_tensor) -> h_out; residual/shared state in step_data
 
     # Dense-only:
     body_fn: Callable = None          # (h) -> h_out (wraps FFN)
@@ -386,10 +386,10 @@ class MergedScheduler:
     """Communication/computation overlap merged forward-backward scheduler.
 
     MoE layers use 4-node scheduling with COMP/COMM stream alternation:
-      - attn_router: attention + residual + gate + routing (COMP)
-      - dispatch:    all2all dispatch (COMM)
-      - expert:      fused FFN (COMP)
-      - combine:     all2all combine + shared expert + residual (COMM)
+      - attn_router: attention + residual + router + dispatch preprocess (COMP)
+      - dispatch:    all2all/fused dispatch (COMM)
+      - expert:      dispatch postprocess + fused FFN + combine preprocess (COMP)
+      - combine:     all2all/fused combine + final residual add (COMM)
 
     Dense layers use 2-node scheduling:
       - attn_node: attention + residual (COMP)
@@ -815,15 +815,17 @@ class MergedScheduler:
             return
 
         outputs = attn_out if isinstance(attn_out, tuple) else (attn_out,)
-        if len(outputs) < 3 + len(aux_tensors):
+        aux_output_offset = lc.step_data.get(
+            '_loss_aux_output_offset', 4 if lc.is_moe else 3)
+        if len(outputs) < aux_output_offset + len(aux_tensors):
             raise ValueError(
                 "MoE aux loss tensors must be returned by attn_fn after "
-                "(h_residual, h_ln, routing_probs).")
+                "the configured base MoE outputs.")
 
         replacements = {}
         grad_receivers = []
         for idx, aux_tensor in enumerate(aux_tensors):
-            output = outputs[3 + idx]
+            output = outputs[aux_output_offset + idx]
             if aux_tensor is None:
                 grad_receivers.append(None)
                 continue
@@ -892,11 +894,12 @@ class MergedScheduler:
             lc.step_data.update(prepared_step_data)
 
     @staticmethod
-    def _attn_backward_grads(attn_node, grad_h, grad_h_ln, grad_routing):
+    def _attn_backward_grads(attn_node, grad_h, grad_h_ln,
+                             grad_dispatch_tensor, grad_dispatch_probs):
         if not attn_node.output_is_tuple():
             return grad_h
 
-        grads = [grad_h, grad_h_ln, grad_routing]
+        grads = [grad_h, grad_h_ln, grad_dispatch_tensor, grad_dispatch_probs]
         aux_tensors = getattr(attn_node, 'loss_aux_tensors', ())
         for tensor in aux_tensors:
             if isinstance(tensor, torch.Tensor):
@@ -972,22 +975,23 @@ class MergedScheduler:
     def _forward_single_layer_4node(self, h, lc, event):
         """Forward a single MoE layer through 4 nodes.
 
-        expert_fn now includes shared expert: takes (sorted_tokens, sorted_probs, h_ln),
-        returns (expert_outs, shared_expert_out). combine_fn reads detached
+        expert_fn takes (dispatched_tensor, dispatched_probs, h_ln), runs
+        dispatch postprocess + FFN + combine preprocess, and returns
+        (combine_tensor, shared_expert_out). combine_fn reads detached
         residual/shared state from step_data, keeping combine inputs safe to free.
         """
         nodes = self._create_nodes_4(lc, event)
         attn_n, dispatch_n, expert_n, combine_n = nodes
 
         attn_out = attn_n.forward((h,))
-        h_residual, h_ln, routing_probs = attn_out[:3]
+        h_residual, h_ln, dispatch_tensor, dispatch_probs = attn_out[:4]
         self._prepare_combine_state(lc, h_residual=h_residual)
         self._prepare_loss_aux_tensors(attn_n, lc, attn_out)
-        dispatch_out = dispatch_n.forward((h_ln, routing_probs))
+        dispatch_out = dispatch_n.forward((dispatch_tensor, dispatch_probs))
         expert_result = expert_n.forward((*dispatch_out, h_ln))
-        expert_out, shared_expert_out = expert_result
+        combine_tensor, shared_expert_out = expert_result
         self._prepare_combine_state(lc, shared_expert_out=shared_expert_out)
-        h_out = combine_n.forward((expert_out,))
+        h_out = combine_n.forward((combine_tensor,))
 
         for n in nodes:
             if n.checkpoint:
@@ -1016,12 +1020,12 @@ class MergedScheduler:
         with torch.cuda.stream(get_comp_stream()):
             self._sync_comp_to_comm()
 
-            # combine_grads: (grad_expert_outs, grad_h_residual, grad_shared_expert_out)
+            # combine_grads: (grad_combine_tensor, grad_h_residual, grad_shared_expert_out)
             combine_grads = combine_n.backward(grad_h)
             combine_grads = self._collect_combine_grads(combine_n, combine_grads)
-            # expert backward needs grads for both outputs: expert_outs and shared_expert_out
+            # expert backward needs grads for both outputs: combine_tensor and shared_expert_out
             expert_grads = expert_n.backward((combine_grads[0], combine_grads[2]))
-            # expert_grads: (grad_sorted_tokens, grad_sorted_probs, grad_h_ln)
+            # expert_grads: (grad_dispatched_tensor, grad_dispatched_probs, grad_h_ln)
             # The shared per-microbatch event would serialize dispatch backward
             # with expert wgrad. Use explicit stream ordering for this overlap.
             old_dispatch_skip = dispatch_n._skip_event
@@ -1040,10 +1044,13 @@ class MergedScheduler:
             self._record_tensors_on_comp(dispatch_grads)
             self._record_tensors_on_comp(combine_grads)
 
-            grad_h_ln_total = dispatch_grads[0] + expert_grads[2]
-
             attn_grads = self._attn_backward_grads(
-                attn_n, combine_grads[1], grad_h_ln_total, dispatch_grads[1])
+                attn_n,
+                combine_grads[1],
+                expert_grads[2],
+                dispatch_grads[0],
+                dispatch_grads[1],
+            )
             grad_x = attn_n.backward(attn_grads)
 
         return grad_x
@@ -1120,7 +1127,8 @@ class MergedScheduler:
                 combine_grads = bwd_combine.backward(grad_h)
                 fwd_attn_out = fwd_attn.forward((fwd_h,))
             combine_grads = self._collect_combine_grads(bwd_combine, combine_grads)
-            fwd_h_residual, fwd_h_ln, fwd_routing_probs = fwd_attn_out[:3]
+            (fwd_h_residual, fwd_h_ln,
+             fwd_dispatch_tensor, fwd_dispatch_probs) = fwd_attn_out[:4]
             self._prepare_combine_state(fwd_lc, h_residual=fwd_h_residual)
             self._prepare_loss_aux_tensors(fwd_attn, fwd_lc, fwd_attn_out)
 
@@ -1128,15 +1136,19 @@ class MergedScheduler:
             # expert backward includes shared expert backward (both on COMP),
             # but routed expert wgrad is delayed until Phase 3 so it does not
             # block dispatch backward.
-            # combine_grads: (grad_expert_outs, grad_h_residual, grad_shared_expert_out)
+            # combine_grads: (grad_combine_tensor, grad_h_residual, grad_shared_expert_out)
             if pool is not None:
-                fut_dispatch = pool.submit(fwd_dispatch.forward, (fwd_h_ln, fwd_routing_probs))
+                fut_dispatch = pool.submit(
+                    fwd_dispatch.forward,
+                    (fwd_dispatch_tensor, fwd_dispatch_probs),
+                )
                 expert_grads = bwd_expert.backward((combine_grads[0], combine_grads[2]))
                 fwd_dispatch_out = fut_dispatch.result()
             else:
-                fwd_dispatch_out = fwd_dispatch.forward((fwd_h_ln, fwd_routing_probs))
+                fwd_dispatch_out = fwd_dispatch.forward(
+                    (fwd_dispatch_tensor, fwd_dispatch_probs))
                 expert_grads = bwd_expert.backward((combine_grads[0], combine_grads[2]))
-            # expert_grads: (grad_sorted_tokens, grad_sorted_probs, grad_h_ln)
+            # expert_grads: (grad_dispatched_tensor, grad_dispatched_probs, grad_h_ln)
 
             # Narrow Phase 2->3 hand-off:
             #   * b_dispatch needs expert_grads, so only COMM waits for COMP.
@@ -1163,9 +1175,13 @@ class MergedScheduler:
                 self._sync_comm_to_comp()
                 self._record_tensors_on_comp(dispatch_grads)
                 self._record_tensors_on_comp(combine_grads)
-                grad_h_ln_total = dispatch_grads[0] + expert_grads[2]
                 attn_grads = self._attn_backward_grads(
-                    bwd_attn, combine_grads[1], grad_h_ln_total, dispatch_grads[1])
+                    bwd_attn,
+                    combine_grads[1],
+                    expert_grads[2],
+                    dispatch_grads[0],
+                    dispatch_grads[1],
+                )
                 grad_x = bwd_attn.backward(attn_grads)
 
                 fwd_expert_result = fwd_expert.forward((*fwd_dispatch_out, fwd_h_ln))
@@ -1217,16 +1233,24 @@ class MergedScheduler:
             # Phase 4: COMM(f_combine) || COMP(b_attn)
             if pool is not None:
                 fut_combine_fwd = pool.submit(fwd_combine.forward, (fwd_expert_out,))
-                grad_h_ln_total = dispatch_grads[0] + expert_grads[2]
                 attn_grads = self._attn_backward_grads(
-                    bwd_attn, combine_grads[1], grad_h_ln_total, dispatch_grads[1])
+                    bwd_attn,
+                    combine_grads[1],
+                    expert_grads[2],
+                    dispatch_grads[0],
+                    dispatch_grads[1],
+                )
                 grad_x = bwd_attn.backward(attn_grads)
                 fwd_h_out = fut_combine_fwd.result()
             else:
                 fwd_h_out = fwd_combine.forward((fwd_expert_out,))
-                grad_h_ln_total = dispatch_grads[0] + expert_grads[2]
                 attn_grads = self._attn_backward_grads(
-                    bwd_attn, combine_grads[1], grad_h_ln_total, dispatch_grads[1])
+                    bwd_attn,
+                    combine_grads[1],
+                    expert_grads[2],
+                    dispatch_grads[0],
+                    dispatch_grads[1],
+                )
                 grad_x = bwd_attn.backward(attn_grads)
 
             self._restore_loss_aux_step_data(fwd_attn, fwd_lc)

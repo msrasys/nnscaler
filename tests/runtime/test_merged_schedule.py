@@ -107,7 +107,7 @@ def test_scheduler_checkpoint_policy_can_target_body_only(monkeypatch):
 
     moe_nodes = scheduler._create_nodes_4(
         LayerCallables(
-            attn_fn=lambda h: (h, h, h),
+            attn_fn=lambda h: (h, h, h, h),
             dispatch_fn=lambda h, p: (h, p),
             expert_fn=lambda h, p, h_ln: (h, h_ln),
             combine_fn=lambda h: h,
@@ -159,7 +159,7 @@ def test_overlap_dispatch_backward_with_expert_wgrad_async_order():
             dispatch_entered.set()
             assert release_dispatch.wait(timeout=5)
             trace.append('dispatch_bwd_exit')
-            return ('grad_h_ln', 'grad_router')
+            return ('grad_dispatch_tensor', 'grad_dispatch_probs')
 
     class ExpertNode:
         def backward_dw(self):
@@ -176,7 +176,7 @@ def test_overlap_dispatch_backward_with_expert_wgrad_async_order():
     finally:
         scheduler._async_pool.shutdown(wait=True)
 
-    assert dispatch_grads == ('grad_h_ln', 'grad_router')
+    assert dispatch_grads == ('grad_dispatch_tensor', 'grad_dispatch_probs')
     assert trace == ['dispatch_bwd_enter', 'expert_wgrad', 'dispatch_bwd_exit']
 
 
@@ -188,7 +188,7 @@ def test_overlap_dispatch_backward_with_expert_wgrad_sequential_order():
             assert grads == ('grad_tokens', 'grad_probs')
             trace.append('dispatch_bwd_enter')
             trace.append('dispatch_bwd_exit')
-            return ('grad_h_ln', 'grad_router')
+            return ('grad_dispatch_tensor', 'grad_dispatch_probs')
 
     class ExpertNode:
         def backward_dw(self):
@@ -200,7 +200,7 @@ def test_overlap_dispatch_backward_with_expert_wgrad_sequential_order():
         DispatchNode(), ExpertNode(),
         ('grad_tokens', 'grad_probs', 'grad_h_ln_from_expert'))
 
-    assert dispatch_grads == ('grad_h_ln', 'grad_router')
+    assert dispatch_grads == ('grad_dispatch_tensor', 'grad_dispatch_probs')
     assert trace == ['dispatch_bwd_enter', 'dispatch_bwd_exit', 'expert_wgrad']
 
 
@@ -320,20 +320,23 @@ class _FakeMoELayer(nn.Module):
         self._check_comp_stream()
         h_ln = torch.tanh(self.attn(h))
         routing_probs = torch.sigmoid(self.router(h))
+        dispatch_tensor = h_ln * routing_probs
+        dispatch_probs = routing_probs
         if self.step_data is not None:
             self.step_data['_combine_residual'] = _detach_for_layer_state(h)
+            self.step_data['_loss_aux_output_offset'] = 4
         if self.use_aux_loss:
             aux_loss = routing_probs.float().pow(2).mean()
             if self.step_data is not None:
                 self.step_data['_loss_aux_tensors'] = (aux_loss,)
                 self.step_data['gate_scores'] = aux_loss
-            return h, h_ln, routing_probs, aux_loss
-        return h, h_ln, routing_probs
+            return h, h_ln, dispatch_tensor, dispatch_probs, aux_loss
+        return h, h_ln, dispatch_tensor, dispatch_probs
 
-    def dispatch_forward(self, h_ln, routing_probs):
+    def dispatch_forward(self, dispatch_tensor, dispatch_probs):
         self._check_comm_stream()
-        dispatched = self._all_reduce_avg_with_local_grad(h_ln * routing_probs)
-        reduced_probs = self._all_reduce_avg_with_local_grad(routing_probs)
+        dispatched = self._all_reduce_avg_with_local_grad(dispatch_tensor)
+        reduced_probs = self._all_reduce_avg_with_local_grad(dispatch_probs)
         return dispatched, reduced_probs
 
     def expert_forward(self, dispatched, reduced_probs, h_ln):
@@ -400,11 +403,12 @@ class _FakeMoEModel(nn.Module):
         aux_losses = []
         for layer in self.layers:
             attn_out = layer.attn_forward(h)
-            h_residual, h_ln, routing_probs = attn_out[:3]
+            h_residual, h_ln, dispatch_tensor, dispatch_probs = attn_out[:4]
             aux_losses.extend(
-                t for t in attn_out[3:] if isinstance(t, torch.Tensor)
+                t for t in attn_out[4:] if isinstance(t, torch.Tensor)
             )
-            dispatched, reduced_probs = layer.dispatch_forward(h_ln, routing_probs)
+            dispatched, reduced_probs = layer.dispatch_forward(
+                dispatch_tensor, dispatch_probs)
             expert_out, shared_out = layer.expert_forward(
                 dispatched, reduced_probs, h_ln)
             h = layer.combine_forward(expert_out, h_residual, shared_out)
