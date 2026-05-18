@@ -731,6 +731,7 @@ class MergedScheduler:
         dispatch_node,
         expert_node,
         expert_grads,
+        during_dispatch=None,
         after_wgrad=None,
     ):
         """Run dispatch backward without waiting for expert wgrad.
@@ -738,10 +739,15 @@ class MergedScheduler:
         Dispatch backward only depends on expert dgrad outputs. Expert wgrad
         consumes delayed wgrad tasks produced by that expert backward, so it can
         be launched after dispatch backward is submitted instead of before it.
+        ``during_dispatch`` is COMP-stream work that should be submitted after
+        dispatch backward starts but before routed expert wgrad, e.g. the next
+        microbatch's expert forward. This keeps forward combine from being
+        gated by the previous microbatch's delayed wgrad.
         Callers must establish the comp->comm dependency for ``expert_grads``
         before invoking this helper.
         """
         dispatch_inputs = (expert_grads[0], expert_grads[1])
+        during_result = None
         after_result = None
         pool = self._async_pool
 
@@ -754,18 +760,26 @@ class MergedScheduler:
 
             fut_dispatch_bwd = pool.submit(dispatch_backward)
             dispatch_started.wait()
+            if during_dispatch is not None:
+                during_result = during_dispatch()
             expert_node.backward_dw()
             if after_wgrad is not None:
                 after_result = after_wgrad()
             dispatch_grads = fut_dispatch_bwd.result()
         else:
             dispatch_grads = dispatch_node.backward(dispatch_inputs)
+            if during_dispatch is not None:
+                during_result = during_dispatch()
             expert_node.backward_dw()
             if after_wgrad is not None:
                 after_result = after_wgrad()
 
-        if after_wgrad is None:
+        if during_dispatch is None and after_wgrad is None:
             return dispatch_grads
+        if during_dispatch is not None and after_wgrad is not None:
+            return dispatch_grads, during_result, after_result
+        if during_dispatch is not None:
+            return dispatch_grads, during_result
         return dispatch_grads, after_result
 
     def _record_tensors_on_comp(self, tensors):
@@ -1099,7 +1113,7 @@ class MergedScheduler:
 
         Phase 1: f_attn_router(COMP) || b_combine(COMM)   [combine = pure comm]
         Phase 2: b_expert_dgrad (COMP) || f_dispatch (COMM)
-        Phase 3: b_expert_wgrad + f_expert (COMP) || b_dispatch (COMM)
+        Phase 3: f_expert + b_expert_wgrad (COMP) || b_dispatch (COMM)
         Phase 4: b_attn      (COMP) || f_combine  (COMM)
 
         Shared expert is merged into expert_fn (COMP stream), keeping
@@ -1152,8 +1166,8 @@ class MergedScheduler:
 
             # Narrow Phase 2->3 hand-off:
             #   * b_dispatch needs expert_grads, so only COMM waits for COMP.
-            #   * expert wgrad does not need f_dispatch_out, so COMP must not wait
-            #     for COMM before wgrad. f_expert waits on the forward event.
+            #   * f_expert waits on f_dispatch through the forward event, while
+            #     routed wgrad remains independent and is submitted afterward.
             self._sync_comp_to_comm()
 
             if self.early_attn_memory_release:
@@ -1201,11 +1215,13 @@ class MergedScheduler:
 
                 return fwd_h_out, grad_x, ('layer4', fwd_nodes)
 
-            # Phase 3: COMM(b_dispatch) || COMP(b_expert_wgrad + f_expert)
+            # Phase 3: COMM(b_dispatch) || COMP(f_expert + b_expert_wgrad)
             # Routed expert wgrad only depends on the delayed task from expert
             # backward, so dispatch backward can be submitted before wgrad.
+            # Expert forward is submitted before wgrad so f_combine's forward
+            # event is not delayed by the previous microbatch's routed wgrad.
             # Expert forward includes shared expert (takes h_ln, returns tuple).
-            def fwd_expert_after_wgrad():
+            def fwd_expert_during_dispatch():
                 return fwd_expert.forward((*fwd_dispatch_out, fwd_h_ln))
 
             old_dispatch_skip = bwd_dispatch._skip_event
@@ -1216,7 +1232,7 @@ class MergedScheduler:
                 dispatch_grads, fwd_expert_result = (
                     self._overlap_dispatch_backward_with_expert_wgrad(
                         bwd_dispatch, bwd_expert, expert_grads,
-                        after_wgrad=fwd_expert_after_wgrad))
+                        during_dispatch=fwd_expert_during_dispatch))
             finally:
                 bwd_dispatch._skip_event = old_dispatch_skip
                 bwd_expert._skip_event = old_expert_skip

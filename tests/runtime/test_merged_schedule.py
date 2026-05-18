@@ -180,6 +180,47 @@ def test_overlap_dispatch_backward_with_expert_wgrad_async_order():
     assert trace == ['dispatch_bwd_enter', 'expert_wgrad', 'dispatch_bwd_exit']
 
 
+def test_overlap_dispatch_backward_can_submit_forward_expert_before_wgrad():
+    trace = []
+    dispatch_entered = threading.Event()
+    release_dispatch = threading.Event()
+
+    class DispatchNode:
+        def backward(self, grads):
+            assert grads == ('grad_tokens', 'grad_probs')
+            trace.append('dispatch_bwd_enter')
+            dispatch_entered.set()
+            assert release_dispatch.wait(timeout=5)
+            trace.append('dispatch_bwd_exit')
+            return ('grad_dispatch_tensor', 'grad_dispatch_probs')
+
+    class ExpertNode:
+        def backward_dw(self):
+            trace.append('expert_wgrad')
+            release_dispatch.set()
+
+    def during_dispatch():
+        assert dispatch_entered.wait(timeout=5)
+        trace.append('fwd_expert')
+        return 'fwd_expert_result'
+
+    scheduler = object.__new__(MergedScheduler)
+    scheduler._async_pool = ThreadPoolExecutor(max_workers=1)
+    try:
+        dispatch_grads, fwd_result = scheduler._overlap_dispatch_backward_with_expert_wgrad(
+            DispatchNode(), ExpertNode(),
+            ('grad_tokens', 'grad_probs', 'grad_h_ln_from_expert'),
+            during_dispatch=during_dispatch)
+    finally:
+        scheduler._async_pool.shutdown(wait=True)
+
+    assert dispatch_grads == ('grad_dispatch_tensor', 'grad_dispatch_probs')
+    assert fwd_result == 'fwd_expert_result'
+    assert trace == [
+        'dispatch_bwd_enter', 'fwd_expert', 'expert_wgrad', 'dispatch_bwd_exit'
+    ]
+
+
 def test_overlap_dispatch_backward_with_expert_wgrad_sequential_order():
     trace = []
 
@@ -202,6 +243,68 @@ def test_overlap_dispatch_backward_with_expert_wgrad_sequential_order():
 
     assert dispatch_grads == ('grad_dispatch_tensor', 'grad_dispatch_probs')
     assert trace == ['dispatch_bwd_enter', 'dispatch_bwd_exit', 'expert_wgrad']
+
+
+def test_overlap_dispatch_backward_sequential_submits_forward_expert_before_wgrad():
+    trace = []
+
+    class DispatchNode:
+        def backward(self, grads):
+            assert grads == ('grad_tokens', 'grad_probs')
+            trace.append('dispatch_bwd_enter')
+            trace.append('dispatch_bwd_exit')
+            return ('grad_dispatch_tensor', 'grad_dispatch_probs')
+
+    class ExpertNode:
+        def backward_dw(self):
+            trace.append('expert_wgrad')
+
+    def during_dispatch():
+        trace.append('fwd_expert')
+        return 'fwd_expert_result'
+
+    scheduler = object.__new__(MergedScheduler)
+    scheduler._async_pool = None
+    dispatch_grads, fwd_result = scheduler._overlap_dispatch_backward_with_expert_wgrad(
+        DispatchNode(), ExpertNode(),
+        ('grad_tokens', 'grad_probs', 'grad_h_ln_from_expert'),
+        during_dispatch=during_dispatch)
+
+    assert dispatch_grads == ('grad_dispatch_tensor', 'grad_dispatch_probs')
+    assert fwd_result == 'fwd_expert_result'
+    assert trace == [
+        'dispatch_bwd_enter', 'dispatch_bwd_exit', 'fwd_expert', 'expert_wgrad'
+    ]
+
+
+def test_attn_backward_grads_uses_moe_dispatch_outputs_order():
+    class AttnNode:
+        def output_is_tuple(self):
+            return True
+
+        def output_arity(self):
+            return 5
+
+    aux = torch.tensor(1.0, requires_grad=True)
+    aux.grad = torch.tensor(2.0)
+    node = AttnNode()
+    node.loss_aux_tensors = (aux,)
+
+    grads = MergedScheduler._attn_backward_grads(
+        node,
+        'grad_residual',
+        'grad_h_ln_from_expert',
+        'grad_dispatch_tensor',
+        'grad_dispatch_probs',
+    )
+
+    assert grads[:4] == (
+        'grad_residual',
+        'grad_h_ln_from_expert',
+        'grad_dispatch_tensor',
+        'grad_dispatch_probs',
+    )
+    torch.testing.assert_close(grads[4], torch.tensor(2.0))
 
 
 def test_manual_sync_grads_marks_parallel_module_clean():
