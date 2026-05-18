@@ -900,7 +900,10 @@ def broadcast_mixed_data(
     if isinstance(device, str):
         # need to compare device later, so convert to torch.device
         device = torch.device(device)
-    rank = torch.distributed.get_rank(group=group)
+    # `src` arguments below are global ranks, even when a process group is
+    # supplied. Compare against the global rank as well; otherwise rank 0 of a
+    # non-zero node is treated as a non-source rank inside local process groups.
+    rank = torch.distributed.get_rank()
 
     # share the structure and tensor shapes
     if rank == src_rank:
