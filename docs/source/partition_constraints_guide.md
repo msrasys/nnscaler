@@ -47,6 +47,8 @@ Below is an example of a custom operator:
 
 ```
 
+For communication libraries such as DeepEP v2, keep the communication implementation in the user project and register it as a custom operator. NNScaler only needs the custom op annotation, transform rule, and optional `emit_fn` that writes runtime arguments such as `process_group=[...]`; it does not require a built-in DeepEP dependency.
+
 To use this file, pass its path to `AutoDistConfig`:
 
 ```python

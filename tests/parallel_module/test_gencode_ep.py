@@ -118,6 +118,45 @@ def build_ep_transform_rule():
     return TransformRule(itransform, otransform)
 
 
+def emit_deepep_v2_moe_fn(node, args: List[str], kwargs: dict, runtime_devid: int, plan_ndevs: int, runtime_ndevs: int) -> str:
+    """Emit a user-space DeepEP v2 fused MoE custom op with EP runtime ranks."""
+    kw_pairs = [f'{key}={val}' for key, val in kwargs.items()]
+
+    sub_input = node.inputs()[0]
+    full_input = sub_input.parent
+    partition_dims = [i for i, (sub_dim, full_dim) in enumerate(zip(sub_input.shape, full_input.shape)) if sub_dim != full_dim]
+    if partition_dims:
+        assert partition_dims == [0], f"DeepEP v2 MoE only supports partition on batch dim, but got {partition_dims}"
+        ep_size = full_input.shape[0] // sub_input.shape[0]
+        group_start = (runtime_devid // ep_size) * ep_size
+        scale_unit_dev_ids = list(range(group_start, group_start + ep_size))
+        kw_pairs.append(f"process_group={scale_unit_dev_ids}")
+
+    call_args = ", ".join(list(args) + kw_pairs)
+    return f"{node.signature}({call_args})"
+
+
+@nnscaler.register_op(
+    'l h^, l m^, l m^, E t^ h^, E h^ d^ -> l h^',
+    name='arch.all2all_moe.nnscaler_all2all_moe_gmm',
+    transform_rules=(build_ep_transform_rule(),),
+    emit_fn=emit_deepep_v2_moe_fn,
+)
+def deepep_v2_user_moe_op(
+    hidden_states,
+    routing_probs,
+    routing_map,
+    w13,
+    w2,
+    num_experts,
+    local_expert_start,
+    local_expert_end,
+    topk,
+    process_group=None,
+):
+    return hidden_states.clone()
+
+
 # @nnscaler.register_op(f'l h^, l m^, l m^, E t^ h^, E h^ d^ -> l h^', transform_rules=(build_ep_transform_rule(),))
 def moe_forward(x, routing_map, routing_probs, w13, w2, top_k, num_local_experts, num_experts, ep_size):
     """
@@ -240,6 +279,43 @@ class MoE(nn.Module):
                            self.top_k, self.num_local_experts, self.num_experts, self.ep_size)
 
 
+class DeepEPV2UserMoE(nn.Module):
+    def __init__(self, embed_dim, moe_ffn_dim, num_experts, top_k):
+        super().__init__()
+        self.embed_dim = embed_dim
+        self.moe_ffn_dim = moe_ffn_dim
+        self.num_experts = num_experts
+        self.top_k = top_k
+        self.ep_size = 2
+        self.num_local_experts = num_experts // self.ep_size
+        self.gate = nn.Linear(self.embed_dim, self.num_experts, bias=False, dtype=torch.float32)
+        self.w13 = torch.nn.Parameter(torch.empty((self.num_experts, 2 * self.moe_ffn_dim, self.embed_dim)))
+        self.w2 = torch.nn.Parameter(torch.empty((self.num_experts, self.embed_dim, self.moe_ffn_dim)))
+
+    def forward(self, x):
+        logits = self.gate(x.float())
+        routing_probs, routing_map, _ = topk_routing(logits, self.top_k)
+        return deepep_v2_user_moe_op(
+            x,
+            routing_probs,
+            routing_map,
+            self.w13,
+            self.w2,
+            num_experts=self.num_experts,
+            local_expert_start=0,
+            local_expert_end=self.num_local_experts,
+            topk=self.top_k,
+        )
+
+
+def deepep_v2_user_op_policy(graph, cfg):
+    from nnscaler.policies import OpPlan, OpPartition
+
+    for node in get_pas_ops(graph):
+        if node.fn == deepep_v2_user_moe_op:
+            yield OpPlan(node, partition=OpPartition(input=0, dim=0))
+
+
 def ep_policy(graph, cfg):
     from nnscaler.policies import OpPlan, OpPartition
 
@@ -311,6 +387,28 @@ def test_moe_whole(tmp_path):
     #     moe_forward_26 = nnscaler.runtime.adapter.nn.allgather_split(moe_forward_56, dim=0, ranks=[0, 1])
     #     del moe_forward_56
     #     return moe_forward_26
+
+
+@replace_all_device_with('cpu')
+def test_deepep_v2_user_custom_op_codegen(tmp_path):
+    ep = DeepEPV2UserMoE(embed_dim=32, moe_ffn_dim=64, num_experts=8, top_k=2)
+    h = torch.randn(16, 32)
+
+    nnscaler.parallelize(
+        ep,
+        {'x': h},
+        deepep_v2_user_op_policy,
+        nnscaler.ComputeConfig(
+            plan_ngpus=2,
+            runtime_ngpus=4,
+        ),
+        gen_savedir=tmp_path,
+        load_module=False
+    )
+
+    assert _gencode_contains(tmp_path, DeepEPV2UserMoE, 0, r'process_group=\[0, 1\]')
+    assert not _gencode_contains(tmp_path, DeepEPV2UserMoE, 0, r'import deep_ep')
+    assert not _gencode_contains(tmp_path, DeepEPV2UserMoE, 0, r'nnscaler\.runtime\.adapter\.deepep')
 
 
 @replace_all_device_with('cpu')
