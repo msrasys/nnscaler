@@ -36,20 +36,12 @@ _logger = logging.getLogger(__name__)
 
 _COMP_STREAM = None   # computation stream (non-default)
 _COMM_STREAM = None   # communication stream (non-default)
-_CREATION_STREAM_ATTR = '_nnscaler_creation_stream'
 
 
 class TransformerLayerState:
     """Per-layer state shared by the four MoE schedule nodes."""
 
     pass
-
-
-def _env_true(name, default=False):
-    value = os.environ.get(name)
-    if value is None:
-        return default
-    return value.lower() not in ('0', 'false', 'no', '')
 
 
 def _tensor_storage_byte_range(tensor):
@@ -86,16 +78,12 @@ def _covered_storage_bytes(ranges):
 
 def set_streams():
     """Initialize global COMP/COMM streams.
-    BOTH streams are non-default so that CUDA's legacy
-    default-stream implicit sync does not serialise them.
+
+    Match Megatron's EP overlap stream topology: computation stays on the
+    current/default stream and communication uses one persistent side stream.
     """
     global _COMP_STREAM, _COMM_STREAM
-    if _env_true('NNSCALER_EP_OVERLAP_MEGATRON_STYLE_STREAMS', False):
-        # Megatron's EP overlap uses the current/default stream for compute and
-        # only creates a persistent side stream for communication.
-        _COMP_STREAM = torch.cuda.current_stream()
-    else:
-        _COMP_STREAM = torch.cuda.Stream()
+    _COMP_STREAM = torch.cuda.current_stream()
     _COMM_STREAM = torch.cuda.Stream()
     # Merged scheduling intentionally accumulates gradients on non-default
     # streams. Suppress this warning only when the merged scheduler streams
@@ -189,37 +177,6 @@ def _iter_cuda_tensors(obj):
     yield from visit(obj)
 
 
-def _stream_key(stream):
-    return (stream.device, stream.cuda_stream)
-
-
-def _same_stream(left, right):
-    return _stream_key(left) == _stream_key(right)
-
-
-def _tensor_creation_stream(tensor):
-    stream = getattr(tensor, _CREATION_STREAM_ATTR, None)
-    if stream is not None:
-        return stream
-    if tensor.is_cuda:
-        return torch.cuda.default_stream(tensor.device)
-    return None
-
-
-def _set_tensor_creation_stream(tensor, stream):
-    if isinstance(tensor, torch.Tensor) and tensor.is_cuda:
-        try:
-            setattr(tensor, _CREATION_STREAM_ATTR, stream)
-        except Exception:
-            pass
-
-
-def _mark_creation_stream(obj, stream):
-    for tensor in _iter_cuda_tensors(obj):
-        _set_tensor_creation_stream(tensor, stream)
-    return obj
-
-
 def _storage_key(tensor):
     try:
         return (tensor.device, tensor.untyped_storage().data_ptr())
@@ -227,60 +184,11 @@ def _storage_key(tensor):
         return None
 
 
-def _mark_outputs_creation_stream(obj, stream, inputs=()):
-    input_streams = {}
-    for tensor in _iter_cuda_tensors(inputs):
-        key = _storage_key(tensor)
-        if key is not None:
-            input_streams[key] = _tensor_creation_stream(tensor)
-
-    for tensor in _iter_cuda_tensors(obj):
-        origin = None
-        key = _storage_key(tensor)
-        if key is not None:
-            origin = input_streams.get(key)
-        base = getattr(tensor, '_base', None)
-        if origin is None and isinstance(base, torch.Tensor):
-            origin = _tensor_creation_stream(base)
-        _set_tensor_creation_stream(tensor, origin or stream)
-    return obj
-
-
-def _copy_creation_stream(dst, src, fallback_stream):
-    stream = _tensor_creation_stream(src) if isinstance(src, torch.Tensor) else None
-    _set_tensor_creation_stream(dst, stream or fallback_stream)
-
-
-def _sync_lifetime_to_creation_stream(obj, consumer_stream):
-    """Sync tensor lifetime back to the stream that owns its allocation."""
-    creators = {}
-    storages = set()
-    for tensor in _iter_cuda_tensors(obj):
-        storage = _storage_key(tensor)
-        if storage is not None:
-            if storage in storages:
-                continue
-            storages.add(storage)
-        creator = _tensor_creation_stream(tensor)
-        if creator is not None and not _same_stream(creator, consumer_stream):
-            creators[_stream_key(creator)] = creator
-
-    if not creators:
-        return
-
-    event = torch.cuda.Event()
-    event.record(consumer_stream)
-    for creator in creators.values():
-        creator.wait_event(event)
-
-
 def _release_owned_storage_after_last_use(
     tag,
     obj,
     stream,
     exclude_obj=(),
-    env_name='NNSCALER_EP_OVERLAP_RELEASE_NODE_OUTPUT_STORAGE',
-    default=False,
     exact_storage_only=False,
 ):
     """Resize storages once a scheduler node has consumed all known users.
@@ -291,16 +199,11 @@ def _release_owned_storage_after_last_use(
     inputs. Resizing the storage invalidates every alias, so the exclude set is
     the guardrail.
     """
-    if not _env_true(env_name, default):
-        return 0
-
     excluded = set()
     for tensor in _iter_cuda_tensors(exclude_obj):
         key = _storage_key(tensor)
         if key is not None:
             excluded.add(key)
-
-    _sync_lifetime_to_creation_stream(obj, stream)
 
     storage_groups = {}
     for tensor in _iter_cuda_tensors(obj):
@@ -355,8 +258,6 @@ def _release_consumed_storage_after_last_use(tag, obj, stream, exclude_obj=()):
     return _release_owned_storage_after_last_use(
         tag, obj, stream,
         exclude_obj=exclude_obj,
-        env_name='NNSCALER_EP_OVERLAP_RELEASE_CONSUMED_GRAD_STORAGE',
-        default=False,
         exact_storage_only=True,
     )
 
@@ -372,8 +273,6 @@ def _release_layer_dead_storage_after_backward(tag, obj, stream, exclude_obj=())
     return _release_owned_storage_after_last_use(
         tag, obj, stream,
         exclude_obj=exclude_obj,
-        env_name='NNSCALER_EP_OVERLAP_RELEASE_LAYER_DEAD_ALIAS_STORAGE',
-        default=False,
         exact_storage_only=False,
     )
 
@@ -436,7 +335,6 @@ class ScheduleNode:
                 elif isinstance(inp, torch.Tensor):
                     d = _make_viewless(inp).detach()
                     d.requires_grad = inp.requires_grad
-                    _copy_creation_stream(d, inp, self.stream)
                     self.inputs.append(d)
                 else:
                     self.inputs.append(inp)
@@ -469,10 +367,8 @@ class ScheduleNode:
                     )
 
             self.output = data
-            _mark_outputs_creation_stream(self.output, self.stream, self.inputs)
 
         if self.free_input:
-            _sync_lifetime_to_creation_stream(inputs, self.stream)
             for inp in inputs:
                 if isinstance(inp, torch.Tensor) and inp.is_cuda:
                     inp.record_stream(self.stream)
@@ -490,7 +386,6 @@ class ScheduleNode:
                 f"{self.name}: detach_for_backward is unsupported with checkpoint=True")
         detached = _make_viewless(tensor).detach()
         detached.requires_grad = tensor.requires_grad
-        _copy_creation_stream(detached, tensor, self.stream)
         self.before_detached = self.before_detached + (tensor,)
         self.detached = self.detached + (detached,)
         return detached
@@ -547,7 +442,6 @@ class ScheduleNode:
 
     def get_grad(self):
         grad = tuple(e.grad if e is not None else None for e in self.inputs)
-        _mark_creation_stream(grad, self.stream)
         return grad[0] if len(grad) == 1 else grad
 
     @staticmethod
@@ -578,11 +472,6 @@ class ScheduleNode:
                 self.event.record(self.stream)
 
     def _release(self, extra_refs=()):
-        _sync_lifetime_to_creation_stream(self.inputs, self.stream)
-        _sync_lifetime_to_creation_stream(self.before_detached, self.stream)
-        _sync_lifetime_to_creation_stream(self.detached, self.stream)
-        _sync_lifetime_to_creation_stream(getattr(self, 'loss_aux_tensors', ()), self.stream)
-        _sync_lifetime_to_creation_stream(extra_refs, self.stream)
         _release_owned_storage_after_last_use(
             f'{self.name}:node_output', self.output, self.stream,
             exclude_obj=self.inputs)
@@ -597,9 +486,7 @@ class ScheduleNode:
             exclude_obj=self.inputs)
         _release_owned_storage_after_last_use(
             f'{self.name}:consumed_output_grad', extra_refs, self.stream,
-            exclude_obj=(self.inputs, self.output, self.before_detached, self.detached),
-            env_name='NNSCALER_EP_OVERLAP_RELEASE_NODE_GRAD_STORAGE',
-            default=False)
+            exclude_obj=(self.inputs, self.output, self.before_detached, self.detached))
         self.inputs = None
         self.output = None
         self.before_detached = tuple()
@@ -660,9 +547,6 @@ class MergedScheduler:
             ThreadPoolExecutor(max_workers=1, thread_name_prefix='moe-overlap')
             if _async_on else None
         )
-        self._drop_forward_only_step_data = _env_true(
-            'NNSCALER_EP_OVERLAP_DROP_STEP_DATA', True)
-
         # Pre-allocate CUDA events for cross-stream synchronization.
         # Using separate events per barrier slot avoids re-recording while
         # a previous wait may still be pending (undefined behavior per CUDA spec).
@@ -719,7 +603,6 @@ class MergedScheduler:
         _logger.debug("Warmup: forward mb0")
         with torch.cuda.stream(get_comp_stream()):
             h0 = embed_fn(samples[0])
-            _mark_creation_stream(h0, get_comp_stream())
         _embed_h_list = [h0]  # Save embedding outputs for backward
 
         lc_list_0 = []
@@ -752,13 +635,11 @@ class MergedScheduler:
             # embed_fn only reads sample data + embedding weight, independent of COMP.
             with torch.cuda.stream(get_comm_stream()):
                 fwd_h = embed_fn(fwd_sample)
-                _mark_creation_stream(fwd_h, get_comm_stream())
             _embed_h_list.append(fwd_h)
 
             # Loss backward on COMP — overlaps with embed on COMM
             with torch.cuda.stream(get_comp_stream()):
                 loss_grad = torch.ones_like(prev_loss_node.get_output())
-                _mark_creation_stream(loss_grad, get_comp_stream())
             with nnscaler.sync_grad_when(False):
                 grad_h = prev_loss_node.backward(loss_grad)
             del loss_grad
@@ -787,10 +668,7 @@ class MergedScheduler:
                     # Sync COMM→COMP: previous MoE layer's combine ran on COMM.
                     self._sync_comm_to_comp()
                     with torch.cuda.stream(get_comp_stream()):
-                        special_input = fwd_h
                         fwd_h, special_data = fwd_lc.special_forward(fwd_h)
-                        _mark_outputs_creation_stream(
-                            (fwd_h, special_data), get_comp_stream(), (special_input,))
                     fwd_all_nodes[fwd_idx] = ('special', fwd_lc)
                     fwd_idx += 1
                     continue
@@ -800,10 +678,7 @@ class MergedScheduler:
                     bwd_lc = bwd_entry[1]
                     with nnscaler.sync_grad_when(False):
                         with torch.cuda.stream(get_comp_stream()):
-                            special_grad_input = grad_h
                             grad_h = bwd_lc.special_backward(grad_h)
-                            _mark_outputs_creation_stream(
-                                grad_h, get_comp_stream(), (special_grad_input,))
                     prev_all_nodes[bwd_idx] = None
                     bwd_idx -= 1
                     continue
@@ -832,10 +707,7 @@ class MergedScheduler:
                     # Sync COMM→COMP: previous MoE layer's combine ran on COMM.
                     self._sync_comm_to_comp()
                     with torch.cuda.stream(get_comp_stream()):
-                        special_input = fwd_h
                         fwd_h, special_data = fwd_lc.special_forward(fwd_h)
-                        _mark_outputs_creation_stream(
-                            (fwd_h, special_data), get_comp_stream(), (special_input,))
                     fwd_all_nodes[fwd_idx] = ('special', fwd_lc)
                     fwd_idx += 1
                     continue
@@ -858,10 +730,7 @@ class MergedScheduler:
                     bwd_lc = bwd_entry[1]
                     with nnscaler.sync_grad_when(False):
                         with torch.cuda.stream(get_comp_stream()):
-                            special_grad_input = grad_h
                             grad_h = bwd_lc.special_backward(grad_h)
-                            _mark_outputs_creation_stream(
-                                grad_h, get_comp_stream(), (special_grad_input,))
                     prev_all_nodes[bwd_idx] = None
                     bwd_idx -= 1
                     continue
@@ -899,7 +768,6 @@ class MergedScheduler:
         with nnscaler.sync_grad_when(False):
             with torch.cuda.stream(get_comp_stream()):
                 loss_grad = torch.ones_like(prev_loss_node.get_output())
-                _mark_creation_stream(loss_grad, get_comp_stream())
             grad_h = prev_loss_node.backward(loss_grad)
             del loss_grad
             for i in reversed(range(num_steps)):
@@ -907,10 +775,7 @@ class MergedScheduler:
                 if isinstance(entry, tuple) and len(entry) == 2 and entry[0] == 'special':
                     lc = entry[1]
                     with torch.cuda.stream(get_comp_stream()):
-                        special_grad_input = grad_h
                         grad_h = lc.special_backward(grad_h)
-                        _mark_outputs_creation_stream(
-                            grad_h, get_comp_stream(), (special_grad_input,))
                     continue
                 if entry is None:
                     continue
@@ -1032,8 +897,6 @@ class MergedScheduler:
         get_comp_stream().wait_event(comm_evt)
 
     def _drop_step_data_keys(self, lc, keys):
-        if not self._drop_forward_only_step_data:
-            return
         for key in keys:
             if key not in lc.step_data:
                 continue
@@ -1238,10 +1101,7 @@ class MergedScheduler:
                 # special_forward runs on COMP and needs the COMM-produced h.
                 self._sync_comm_to_comp()
                 with torch.cuda.stream(get_comp_stream()):
-                    special_input = h
                     h, special_data = lc.special_forward(h)
-                    _mark_outputs_creation_stream(
-                        (h, special_data), get_comp_stream(), (special_input,))
                 all_nodes.append(('special', lc))
                 continue
 
@@ -1395,8 +1255,6 @@ class MergedScheduler:
             _release_layer_dead_storage_after_backward(
                 'layer4:dead_after_layer_backward', layer_dead_refs,
                 get_comp_stream(), exclude_obj=grad_x)
-
-            _sync_lifetime_to_creation_stream((dispatch_grads[0],), get_comp_stream())
             del (combine_grads, expert_bwd_grads, expert_grads,
                  dispatch_bwd_grads, dispatch_grads, expert_h_ln_grad,
                  live_residual_grad, grad_h_ln_total, attn_grads,
@@ -1615,8 +1473,6 @@ class MergedScheduler:
                     fwd_shared_expert_out, fwd_h_out))
             self._drop_after_combine_forward(fwd_lc)
 
-            if dispatch_grads is not None:
-                _sync_lifetime_to_creation_stream((dispatch_grads[0],), get_comp_stream())
             del (combine_grads, combine_grads_for_attn, expert_grads,
                  dispatch_bwd_grads, dispatch_grads, expert_h_ln_grad,
                  live_residual_grad, grad_h_ln_total, attn_grads,
