@@ -39,6 +39,7 @@ def wrap_sliding_window_attn_func(
         enable_ring: bool = True,
         use_cute: bool = False,
         process_group: Tuple[int] = None,
+        return_lse: bool = True,
 ):
     '''
     Context parallel sliding window attention using single-hop A2A communication.
@@ -72,7 +73,7 @@ def wrap_sliding_window_attn_func(
                 deterministic=deterministic,
                 return_lse=True,
             )
-            return output, softmax_lse
+            return (output, softmax_lse) if return_lse else output
         else:
             output, softmax_lse, _ = flash_attn_varlen_func(
                 q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k,
@@ -84,7 +85,7 @@ def wrap_sliding_window_attn_func(
                 deterministic=deterministic,
                 return_attn_probs=True,
             )
-            return output, softmax_lse
+            return (output, softmax_lse) if return_lse else output
 
     assert causal, "sliding window CP attention requires causal=True"
     assert window_size[0] > 0, (
@@ -131,7 +132,7 @@ def wrap_sliding_window_attn_func(
         use_cute=use_cute,
     )
 
-    return out, softmax_lse
+    return (out, softmax_lse) if return_lse else out
 
 
 def emit_ring(node: IRDimops, args: List[str], kwargs: Dict[str, str], runtime_devid: int, plan_ndevs: int, runtime_ndevs: int) -> str:

@@ -133,6 +133,7 @@ def wrap_ring_attn_varlen_func(
         process_group: Tuple[int] = None,
         max_seqlen_q: Optional[int] = None,
         max_seqlen_k: Optional[int] = None,
+        return_lse: bool = True,
 ):
     '''
     wrap the ring_attn_varlen_func to support the distributed training in nnScaler.
@@ -163,7 +164,7 @@ def wrap_ring_attn_varlen_func(
                 deterministic=deterministic,
                 return_lse=True,
             )
-            return output, softmax_lse
+            return (output, softmax_lse) if return_lse else output
         else:
             output, softmax_lse, _ = flash_attn_varlen_func(
                 q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k,
@@ -175,7 +176,7 @@ def wrap_ring_attn_varlen_func(
                 deterministic=deterministic,
                 return_attn_probs=True,
             )
-        return output, softmax_lse
+        return (output, softmax_lse) if return_lse else output
 
     assert len(q.shape) == 3, "q must have shape [total_q, qh, dim]"
     assert len(k.shape) == 3, "k must have shape [total_k, kh, dim]"
@@ -239,7 +240,7 @@ def wrap_ring_attn_varlen_func(
                 attn_mask_type="padding_causal" if causal else "padding",
             )
             output = unshuffle_varlen(shuffled_output, cu_seqlens_q, process_group, local_process_group)
-            return output, None
+            return (output, None) if return_lse else output
         else:
             # Fallback to basic ring attention implementation
             if _ENABLE_TE_CP:
@@ -282,7 +283,7 @@ def wrap_ring_attn_varlen_func(
         use_cute=use_cute,
     )
 
-    return output, softmax_lse
+    return (output, softmax_lse) if return_lse else output
 
 
 def emit_ring(node: IRDimops, args: List[str], kwargs: Dict[str, str], runtime_devid: int, plan_ndevs: int, runtime_ndevs: int) -> str:

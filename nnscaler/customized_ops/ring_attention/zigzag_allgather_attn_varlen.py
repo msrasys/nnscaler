@@ -40,6 +40,7 @@ def wrap_zigzag_allgather_attn_varlen_func(
     enable_ring: bool = True,
     use_cute: bool = False,
     process_group: Tuple[int] = None,
+    return_lse: bool = True,
 ):
     assert not return_attn_probs, "return_attn_probs is not supported"
 
@@ -62,7 +63,7 @@ def wrap_zigzag_allgather_attn_varlen_func(
                 deterministic=deterministic,
                 return_lse=True,
             )
-            return output, softmax_lse
+            return (output, softmax_lse) if return_lse else output
 
         output, softmax_lse, _ = flash_attn_varlen_func(
             q,
@@ -80,13 +81,13 @@ def wrap_zigzag_allgather_attn_varlen_func(
             deterministic=deterministic,
             return_attn_probs=True,
         )
-        return output, softmax_lse
+        return (output, softmax_lse) if return_lse else output
 
     local_process_group = DeviceGroup().get_group(process_group)
     if local_process_group is None:
         local_process_group = dist.group.WORLD
 
-    return zigzag_allgather_attn_varlen_func(
+    output, softmax_lse = zigzag_allgather_attn_varlen_func(
         q,
         k,
         v,
@@ -101,6 +102,7 @@ def wrap_zigzag_allgather_attn_varlen_func(
         deterministic=deterministic,
         use_cute=use_cute,
     )
+    return (output, softmax_lse) if return_lse else output
 
 
 def emit_ring(
