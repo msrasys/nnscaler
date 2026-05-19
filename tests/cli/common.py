@@ -267,3 +267,24 @@ class MLP2(nn.Module):
         x = torch.sigmoid(x)
         loss = self.loss_fn(x, data['target'])
         return loss
+
+
+class MLPObj(nn.Module):
+    def __init__(self, dim: int):
+        init_random_fn()
+        super().__init__()
+        nlayers = 4
+        self.layers = torch.nn.ModuleList([])
+        for _ in range(nlayers):
+            self.layers.append(nn.Linear(dim, dim, bias=False))
+        self.loss_fn = nn.BCELoss()
+
+    def forward(self, data: Dict[str, torch.Tensor]):
+        x = data['data']
+        y = x.shape[0]
+        for layer in self.layers:
+            x = layer(x) + y
+            y = y + 1
+        x = torch.sigmoid(x)
+        loss = self.loss_fn(x, data['target'])
+        return loss

@@ -839,6 +839,15 @@ def fn(
             graph.multiref(ftensor, comment='shared param')
 
     # set pipeline stages
+    # Note we must stage graph before any transformation to the graph,
+    #      which is required by graph.group and graph.create_segment to work correctly.
+    # The consequence is that the inputs and outputs of the segment will always be complete tensors.
+    # For example:
+    # If the output subtensor of last operator in stage 0 can
+    # exactly fit into the input subtensor of the first operator in stage 1,
+    # we still need to insert adapters to
+    # collect the subtensors into a complete tensor as the output of stage 0,
+    # and then split it again as the input of stage 1.
     if pp_enabled:
         graph.staging([s[0] for s in pp_stages])
         pp_segs: list[IRSegment] = graph.select(ntype=IRSegment, flatten=False)

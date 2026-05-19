@@ -100,9 +100,12 @@ def ir_object_contains_dynamic(obj: IRObject):
 
 def Identity(tensor: IRObject, signature = None):
     signature = 'nnscaler.runtime.function.identity'
-    eshape = ShapeAnno.create_shape_str(tensor.shape)
-    anno = OpAnno.create_op_str([eshape], [eshape])
-    return IRDimops(Identity, 'identity', signature, [anno], [tensor])
+    if isinstance(tensor, IRTensor):
+        eshape = ShapeAnno.create_shape_str(tensor.shape)
+        anno = OpAnno.create_op_str([eshape], [eshape])
+        return IRDimops(Identity, 'identity', signature, [anno], [tensor])
+    else:
+        return IRDimops(Identity, 'identity', signature, ['? -> ?'], [tensor])
 
 
 def Ifexpr(cond: Any, true_value: Any, false_value: Any, signature = None) -> IRPyFunc:

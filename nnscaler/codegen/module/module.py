@@ -813,7 +813,7 @@ class ModuleCodeGen(FuncEmission):
             "ranks={ranks}, reduce_op={reduce_op}, "
             "async_op={async_op}, zero={zero}, max_bucket_size_bytes={max_nbytes}, "
             "zero_use_reduce_scatter={zero_use_reduce_scatter}, "
-            "zero_param_level_sharding={zero_param_level_sharding},"
+            "zero_param_level_sharding={zero_param_level_sharding}, "
             "zero_ngroups={zero_ngroups})"
         )
         reducer_add = 'self.add_reducer({reducer})'

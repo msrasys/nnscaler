@@ -7,13 +7,13 @@ import copy
 import torch
 
 from nnscaler.ir.adapter.prim import IRAdapterPrim, IdentityPrim
-from nnscaler.ir.tensor import IRSubTensor
-from nnscaler.ir.cten import IRCell
+from nnscaler.ir.tensor import IRSubTensor, IRTensor
+from nnscaler.ir.cten import IRCell, IRObject
 
 
 class IRAdapter(IRCell):
 
-    def __init__(self, inputs: List[IRSubTensor], outputs: List[IRSubTensor]):
+    def __init__(self, inputs: List[IRObject], outputs: List[IRObject]):
         super().__init__(
             name='adapter', signature='adapter',
             input_length=len(inputs),
@@ -37,8 +37,9 @@ class IRAdapter(IRCell):
         self._recompute = None
 
         # setup whether this adapter is for forward stage
-        is_fw = any(not t.is_grad() for t in self.inputs() + self.outputs())
-        is_bw = any(t.is_grad() for t in self.inputs() + self.outputs())
+        # non-tensor IRObject is always forward (not gradient)
+        is_fw = any(not isinstance(t, IRTensor) or not t.is_grad() for t in self.inputs() + self.outputs())
+        is_bw = any(isinstance(t, IRTensor) and t.is_grad() for t in self.inputs() + self.outputs())
         assert not (is_fw and is_bw), "An IRAdapter cannot serve for both forward and backward stage"
         self._forward = is_fw
 

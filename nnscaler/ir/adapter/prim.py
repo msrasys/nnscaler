@@ -7,7 +7,9 @@ The primitive used for IRAdapter
 
 from typing import List, Optional, Union, Tuple
 import copy
+import pickle
 
+from nnscaler.ir.cten import IRObject
 from nnscaler.ir.tensor import IRSubTensor, IndexMap, ValueMap
 from nnscaler.flags import CompileFlag
 
@@ -212,6 +214,33 @@ class MovePrim(CommPrim):
         return dscp
 
 
+class ObjectMovePrim(CommPrim):
+    """
+    P2P send/recv for non-tensor IRObject, non-differentiable.
+    Non-tensor objects are always replicated, so only inter-device
+    transfer is needed.
+    """
+    def __init__(self, iobjects: List[IRObject], oobjects: List[IRObject], **kwargs):
+        if len(kwargs) == 0:
+            assert len(iobjects) == 1 and len(oobjects) == 1
+            kwargs['src'] = iobjects[0].device[0] if len(iobjects[0].device) > 0 else None
+            kwargs['dst'] = oobjects[0].device[0] if len(oobjects[0].device) > 0 else None
+        src, dst = kwargs['src'], kwargs['dst']
+        super().__init__(iobjects, oobjects, src=src, dst=dst)
+        self.signature = 'nnscaler.runtime.adapter.move_object'
+
+    def volume(self) -> int:
+        # use pickle size as the volume estimation for non-tensor objects
+        if self._inputs:
+            return len(pickle.dumps(self.input(0)))
+        else:
+            return len(pickle.dumps(self.output(0)))
+
+    def __repr__(self):
+        dscp = f"{self.outputs()} = move_object{self.device}({self.inputs()}, src={self.kwargs['src']}, dst={self.kwargs['dst']})"
+        return dscp
+
+
 class CollectivePrim(CommPrim):
     """
     Collective primitive, non-differentiable
@@ -336,7 +365,7 @@ class RVGatherPrim(CollectivePrim):
 
 class BroadcastPrim(CollectivePrim):
     """
-    non-differential reduce-scatter
+    non-differential broadcast
     """
     def __init__(self, itensors: List[IRSubTensor], otensors: List[IRSubTensor], **kwargs):
         if len(kwargs) == 0:
@@ -353,6 +382,26 @@ class BroadcastPrim(CollectivePrim):
 
     def __repr__(self) -> str:
         return f"{self.outputs()} = broadcast{self.device}({self.inputs()}, src={self.kwargs['src']})"
+
+
+class ObjectBroadcastPrim(CollectivePrim):
+    """
+    non-differential broadcast
+    """
+    def __init__(self, iobjects: List[IRObject], oobjects: List[IRObject], **kwargs):
+        if len(kwargs) == 0:
+            assert len(iobjects) == 1
+            kwargs['src'] = iobjects[0].device[0] if len(iobjects[0].device) > 0 else None
+        super().__init__(iobjects, oobjects, **kwargs)
+        self.signature = 'nnscaler.runtime.adapter.broadcast_object'
+
+    def volume(self) -> int:
+        ndevs = len(self.outputs())
+        # use pickle size as the volume estimation for non-tensor objects
+        return len(pickle.dumps(self.input(0))) * (ndevs-1)
+
+    def __repr__(self) -> str:
+        return f"{self.outputs()} = broadcast_object{self.device}({self.inputs()}, src={self.kwargs['src']})"
 
 
 class AllReducePrim(CollectivePrim):

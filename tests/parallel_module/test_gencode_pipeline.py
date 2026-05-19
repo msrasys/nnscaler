@@ -1,4 +1,5 @@
 import torch
+import pytest
 
 from nnscaler import parallelize, ComputeConfig
 from tests.parallel_module.test_gencode import replace_all_device_with, _gencode_contains, print_gencode
@@ -16,37 +17,40 @@ class PPModule1(torch.nn.Module):
         x = data
         y = data.shape
         z = torch.abs(x)
-        for layer in self.layers:
+        for i, layer in enumerate(self.layers):
             x = layer(x)
+            if i == len(self.layers) // 2:
+                w = x.shape
+
         loss = torch.sum(x)
         if self.return_type == 0:
             return loss
         elif self.return_type == 1:
-            return loss, y # the second return is not tensor
+            return loss, y # the second return is a non-tensor from first layer
         elif self.return_type == 2:
             return loss, data.shape
         elif self.return_type == 3:
             return loss, {'data': data}
         elif self.return_type == 4:
             return loss, z
+        elif self.return_type == 5:
+            return loss, w  # the second return is a non-tensor from middle layer
         else:
             raise ValueError(f"Unsupported return_type: {self.return_type}")
 
 
-def pp_pas(graph, cfg):
+def pp_pas(graph, cfg, nlayers_per_stage=2):
     from nnscaler.policies import OpPlan, OpPartition, get_layer_index, get_called_self_module_name, get_pas_ops
 
-    found_layer = False
+    last_stage_id = 0
     for node in get_pas_ops(graph):
         if torch.nn.modules.linear.Linear in node.module_class_chain:
             layer_idx = get_layer_index(node.fqn)
             partition = None
-            # if layer_idx == 1 or layer_idx == 2:
-            #     partition = OpPartition(0, 0)
-            yield OpPlan(node, stage_id=layer_idx // 2, partition=partition)
-            found_layer = True
+            yield OpPlan(node, stage_id=layer_idx // nlayers_per_stage, partition=partition)
+            last_stage_id = layer_idx // nlayers_per_stage
         else:
-            yield OpPlan(node, stage_id=1 if found_layer else 0)
+            yield OpPlan(node, stage_id=last_stage_id)
 
 
 @replace_all_device_with('cpu')
@@ -56,7 +60,7 @@ def test_gencode_correct_dataloader_order(tmp_path):
     parallelize(
         m,
         {'data': torch.randn(64, 1024)},
-        pas_policy=pp_pas,
+        pas_policy=lambda graph, cfg: pp_pas(graph, cfg, nlayers_per_stage=2),
         compute_config= ComputeConfig(
             2, 2,
             constant_folding=False,
@@ -101,3 +105,86 @@ def test_gencode_correct_dataloader_order(tmp_path):
     #     sum_1_24 = nnscaler.runtime.executor.aexecute(model.adapter56, *(sum_1_24, ), requires_grad=True)
     #     sum_1_65 = nnscaler.runtime.executor.aexecute(model.adapter56, *(sum_1_65, ), requires_grad=True)
     #     return [sum_1_24, {'data': data_23}], [sum_1_65, {'data': data_48}]
+
+
+@replace_all_device_with('cpu')
+@pytest.mark.parametrize('return_type', [1, 2, 5])
+def test_gencode_irobject_output(tmp_path, return_type):
+    m = PPModule1(return_type=return_type)
+    m.train()
+    parallelize(
+        m,
+        {'data': torch.randn(64, 1024)},
+        pas_policy=lambda graph, cfg: pp_pas(graph, cfg, nlayers_per_stage=1),
+        compute_config= ComputeConfig(
+            4, 8,
+            constant_folding=False,
+            use_end2end=True,
+            pas_config=dict(
+                pipeline_nmicros=4,
+                pipeline_scheduler='1f1b'
+            )
+        ),
+        gen_savedir=tmp_path,
+        load_module=False,
+        reuse='override',
+    )
+    if return_type == 1:
+        src_rank = 0
+    elif return_type == 2:
+        src_rank = 3
+    else:
+        src_rank = 2
+    for rank in range(4):
+        assert _gencode_contains(tmp_path, PPModule1, rank, rf'nnscaler.runtime.adapter.broadcast_object\(.*, src={src_rank}, ranks=\[0, 1, 2, 3\]\)')
+
+    for rank in range(4, 8):
+        assert _gencode_contains(tmp_path, PPModule1, rank, rf'nnscaler.runtime.adapter.broadcast_object\(.*, src={src_rank + 4}, ranks=\[4, 5, 6, 7\]\)')
+
+
+class PPModule2(torch.nn.Module):
+    def __init__(self, dim: int = 1024):
+        super().__init__()
+        self.layers = torch.nn.ModuleList([])
+        for _ in range(4):
+            self.layers.append(torch.nn.Linear(dim, dim, bias=False))
+
+    def forward(self, data: torch.Tensor):
+        x = self.layers[0](data)
+        xs = x.shape[0]
+        x = self.layers[1](x) + xs
+        xs = x.shape[0]
+        x = self.layers[2](x) + xs
+        xs = x.shape[0]
+        x = self.layers[3](x) + xs
+        loss = torch.sum(x)
+        return loss
+
+
+@replace_all_device_with('cpu')
+def test_gencode_shared_irobject(tmp_path):
+    m = PPModule2()
+    m.train()
+    parallelize(
+        m,
+        {'data': torch.randn(64, 1024)},
+        pas_policy=lambda graph, cfg: pp_pas(graph, cfg, nlayers_per_stage=1),
+        compute_config= ComputeConfig(
+            4, 8,
+            constant_folding=False,
+            use_end2end=True,
+            pas_config=dict(
+                pipeline_nmicros=4,
+                pipeline_scheduler='1f1b'
+            )
+        ),
+        gen_savedir=tmp_path,
+        load_module=False,
+        reuse='override',
+    )
+
+    for rank in range(3):
+        assert _gencode_contains(tmp_path, PPModule2, rank, rf'nnscaler.runtime.adapter.move_object\(.*, src={rank}, dst={rank + 1}\)')
+
+    for rank in range(4, 7):
+        assert _gencode_contains(tmp_path, PPModule2, rank, rf'nnscaler.runtime.adapter.move_object\(.*, src={rank}, dst={rank + 1}\)')
