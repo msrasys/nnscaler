@@ -504,7 +504,7 @@ class IRAdapterGener:
         # transfer (producer devices disjoint from consumer devices) is needed.
         # No backward pass is needed for non-tensor objects.
         # TODO: We separately handle non-tensor objects here
-        # because the implemenation is quite different from tensor objects,
+        # because the implementation is quite different from tensor objects,
         # and we also want to avoid regression on tensor adapter generation.
         # In the future, we may want to unify the implementation of tensor and non-tensor adapter generation,
         _obj_cnt = 0

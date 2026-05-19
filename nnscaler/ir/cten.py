@@ -848,6 +848,9 @@ class IRObject:
         if type(self) is not IRObject:
             raise TypeError("like() is only supported for IRObject, but got type {}".format(type(self)))
 
+        if self is IRObject.missing:  # missing object is singleton
+            return IRObject.missing
+
         obj = IRObject(
             self.name, None, self._value, self.is_constant, value_track=self._value_track
         )

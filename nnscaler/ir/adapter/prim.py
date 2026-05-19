@@ -232,9 +232,9 @@ class ObjectMovePrim(CommPrim):
     def volume(self) -> int:
         # use pickle size as the volume estimation for non-tensor objects
         if self._inputs:
-            return len(pickle.dumps(self.input(0)))
+            return len(pickle.dumps(self.input(0).value))
         else:
-            return len(pickle.dumps(self.output(0)))
+            return len(pickle.dumps(self.output(0).value))
 
     def __repr__(self):
         dscp = f"{self.outputs()} = move_object{self.device}({self.inputs()}, src={self.kwargs['src']}, dst={self.kwargs['dst']})"
@@ -398,7 +398,7 @@ class ObjectBroadcastPrim(CollectivePrim):
     def volume(self) -> int:
         ndevs = len(self.outputs())
         # use pickle size as the volume estimation for non-tensor objects
-        return len(pickle.dumps(self.input(0))) * (ndevs-1)
+        return len(pickle.dumps(self.input(0).value)) * (ndevs-1)
 
     def __repr__(self) -> str:
         return f"{self.outputs()} = broadcast_object{self.device}({self.inputs()}, src={self.kwargs['src']})"

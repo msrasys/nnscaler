@@ -865,13 +865,6 @@ def _gencode(
     if not isinstance(graph, IRGraph):
         raise RuntimeError("Expected policy return IRGraph")
 
-    # currently graph.sched is only used for pipeline parallelism
-    # so it is not none means we are in pipeline parallelism
-    # if graph.sched is not None and _contains_uncommutable_data(graph.outputs()):
-    #     raise RuntimeError("Communication generation error: "
-    #                        "some of outputs are not commutable between gpus, "
-    #                        "which is not supported in pipeline parallelism.")
-
     # check assignment
     for node in graph.nodes(flatten=True):
         # skip graph anchor: will be removed
