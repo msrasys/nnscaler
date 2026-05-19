@@ -16,7 +16,7 @@ from nnscaler.utils import load_model
 from nnscaler.graph import IRGraph
 from nnscaler.ir.operator import IRFwOperation
 from nnscaler.flags import CompileFlag
-from nnscaler.runtime.adapter.reducer import Reducer
+from nnscaler.runtime.adapter.reducer import Reducer, _accumulate_grad_from_hook_args
 from ..launch_torchrun import torchrun
 from ..utils import catch_log, init_parameter, assert_parity, mock_reducer_env
 
@@ -34,6 +34,50 @@ class MLP(torch.nn.Module):
             x = layer(x)
         loss = torch.sum(x)
         return loss
+
+
+class _DelayedParamGradFn(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, weight):
+        return x * weight
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        return grad_output, None
+
+
+def test_accumulate_grad_hook_allows_delayed_parameter_grad():
+    param = torch.nn.Parameter(torch.tensor([2.0, 3.0]))
+    x = torch.ones_like(param, requires_grad=True)
+    copied_grads = []
+
+    param_tmp = param.expand_as(param)
+    grad_acc = param_tmp.grad_fn.next_functions[0][0]
+
+    def hook(*hook_args):
+        grad = _accumulate_grad_from_hook_args(param, hook_args)
+        if grad is None:
+            return
+        copied_grads.append(grad.detach().clone())
+        param.grad = None
+
+    handle = grad_acc.register_hook(hook)
+
+    try:
+        _DelayedParamGradFn.apply(x, param).sum().backward()
+        assert copied_grads == []
+        assert param.grad is None
+
+        delayed_grad = torch.tensor([5.0, 7.0])
+        torch.autograd.backward((param,), (delayed_grad,))
+
+        assert len(copied_grads) == 1
+        torch.testing.assert_close(copied_grads[0], delayed_grad)
+        assert param.grad is None
+    finally:
+        handle.remove()
+        # Keep the AccumulateGrad object alive until the hook is removed.
+        del grad_acc
 
 
 def get_dummy_data(batch_size: int = 256):

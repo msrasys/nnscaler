@@ -23,6 +23,30 @@ if TYPE_CHECKING:
 _logger = logging.getLogger(__name__)
 
 
+def _accumulate_grad_from_hook_args(
+    param: torch.nn.Parameter,
+    hook_args: Tuple[Any, ...],
+) -> Optional[torch.Tensor]:
+    """Return the concrete grad observed by an AccumulateGrad hook.
+
+    Some custom autograd functions intentionally return ``None`` for a
+    parameter grad and materialize it later with a separate backward call.  The
+    AccumulateGrad hook still fires for that placeholder edge, while
+    ``param.grad`` remains ``None``.
+    """
+    if param.grad is not None:
+        return param.grad
+
+    for arg in reversed(hook_args):
+        if isinstance(arg, torch.Tensor):
+            return arg
+        if isinstance(arg, (tuple, list)):
+            grads = [item for item in arg if isinstance(item, torch.Tensor)]
+            if len(grads) == 1:
+                return grads[0]
+    return None
+
+
 # According to https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#device-memory-accesses
 # Any address of a variable residing in global memory or returned by one of the memory allocation
 # routines from the driver or runtime API is always aligned to at least 256 bytes.
@@ -406,14 +430,17 @@ class Bucket:
         """
 
         @torch.no_grad()
-        def post_grad_hook(param: torch.nn.Parameter, *unused): # pragma: no cover
+        def post_grad_hook(param: torch.nn.Parameter, *hook_args): # pragma: no cover
             # stream = DeviceGroup().get_stream('reducer')
             ofst = self._pofset[param]
             rank = torch.distributed.get_rank()
+            grad = _accumulate_grad_from_hook_args(param, hook_args)
+            if grad is None:
+                return
             # TODO: need to handle sparse gradients in torch.nn.Embedding
             if self._z3:
                 z3_info = self._reducer.get_z3_info(param)
-                grad = param.grad.data.view(-1)
+                grad = grad.data.view(-1)
                 padded_numel = z3_info.numel_with_padding() * self._zgroup_sz
                 if grad.numel() < padded_numel:
                     # add padding
@@ -434,7 +461,7 @@ class Bucket:
                 self._contiguous_grads[ofst:ofst+z3_info.numel()]\
                     .add_(output[0:z3_info.end-z3_info.start])
             else:
-                self._contiguous_grads[ofst:ofst+param.numel()].add_(param.grad.data.view(-1))
+                self._contiguous_grads[ofst:ofst+param.numel()].add_(grad.data.view(-1))
 
             param.grad = None
 
