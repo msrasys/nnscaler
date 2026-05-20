@@ -61,7 +61,8 @@ def move_object(obj, src: int, dst: int, async_op=False):
     rank = torch.distributed.get_rank()
     if rank == src:
         torch.distributed.send_object_list([obj], dst=dst)
-    elif rank == dst:
+    else:
+        assert rank == dst
         obj_list = [None]
         torch.distributed.recv_object_list(obj_list, src=src)
         obj = obj_list[0]
@@ -349,6 +350,9 @@ def broadcast_object(obj, src: int, ranks: List[int], async_op=False):
     """
     if async_op:
         raise NotImplementedError("Async broadcast_object is not implemented yet")
+
+    if src not in ranks:
+        raise ValueError(f"src {src} must be in ranks {ranks}")
 
     CudaTimer().start(field_name='comm', predefined=True)
     rank = torch.distributed.get_rank()
