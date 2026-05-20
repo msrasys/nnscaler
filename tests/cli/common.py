@@ -284,7 +284,7 @@ class MLPObj(nn.Module):
         y = x.shape[0]
         for layer in self.layers:
             x = layer(x) + y
-            y = y + 1
+            y = x.shape[0]
         x = torch.sigmoid(x)
         loss = self.loss_fn(x, data['target'])
-        return loss
+        return loss, loss.data

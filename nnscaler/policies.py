@@ -490,7 +490,7 @@ def get_pas_ops(graph: IRGraph) -> List[IRFwOperation]:
     return graph.select(ntype=IRFwOperation)
 
 
-def _identity_segment_output(tensor: IRSubTensor, segment: IRSegment) -> IRFwOperation:
+def _identity_segment_output(graph: IRGraph, tensor: IRSubTensor, segment: IRSegment, all_segments: List[IRSegment]) -> IRFwOperation:
     """
     Insert an identity operator for the segment output tensor to make it easier to handle in policy.
     After the insertion, the original output tensor will be replaced by the identity operator's output tensor in the graph.
@@ -536,7 +536,53 @@ def _identity_segment_output(tensor: IRSubTensor, segment: IRSegment) -> IRFwOpe
     else:
         segment.insert(fwop, insert_idx)
 
+    # replace the original output tensor with the identity output tensor in the entire graph
+    # this includes:
+    # 1. forward output
+    # 2. backward grad input (if the tensor requires grad)
+    # 3. graph output (if the original output tensor is also a graph output)
+    # 4. graph mirror input (if the tensor requires grad and graph has mirror)
+    # 5. following segments' forward input
+    # 6. Nodes in the following segments that consume the original output tensor (if any)
+    # 7. following segments' backward grad input (if the tensor requires grad)
+    # 8. Nodes in the following segments that produce the original output tensor's grad (if any)
+
+    # forward output
     segment.replace_output(tensor, fwop.output(0))
+    # backward grad input
+    if tensor.grad and segment.mirror:
+        segment.mirror.replace_input(tensor.grad, fwop.output(0).grad)
+
+    # replace the original output tensor with the identity output tensor in the entire graph
+    if graph != segment:
+        if tensor in graph.get_objects_from_complex(graph.oobjs()):
+            graph.replace_output(tensor, fwop.output(0))
+        # should never goes here.
+        # in current implementation, the graph mirror is the graph itself
+        # (graph contains both forward and backward nodes)
+        # so the following check will never be true.
+        if tensor.grad and graph.mirror and tensor.grad in graph.get_objects_from_complex(graph.mirror.iobjs()):
+            graph.mirror.replace_input(tensor.grad, fwop.output(0).grad)
+
+    # replace the original output tensor with the identity output tensor
+    # in the following segments
+    for s in all_segments:
+        if s == segment:
+            continue
+
+        # forward
+        if tensor in segment.get_objects_from_complex(s.iobjs()):
+            s.replace_input(tensor, fwop.output(0))
+            for consumer in s.consumers(tensor.parent):
+                with s.update(consumer):
+                    consumer.replace_input(tensor, fwop.output(0))
+
+        # backward grad
+        if tensor.grad and s.mirror and tensor.grad in segment.get_objects_from_complex(s.mirror.oobjs()):
+            s.mirror.replace_output(tensor.grad, fwop.output(0).grad)
+            for producer in s.mirror.producers(tensor.grad.parent):
+                with s.mirror.update(producer):
+                    producer.replace_output(tensor.grad, fwop.output(0).grad)
 
     return fwop
 
@@ -869,7 +915,7 @@ def fn(
             if not isinstance(sub_tensor, IRSubTensor):
                 continue
             if seg.consumers(sub_tensor.parent):
-                ident_op = _identity_segment_output(sub_tensor, seg)
+                ident_op = _identity_segment_output(graph, sub_tensor, seg, pp_segs)
                 op_plans[ident_op] = OpPlan(op=ident_op, stage_id=stage_id, partition=None)
                 # 'rn' means `ident_op` is replicated and grad doesn't need to be all-reduced
                 tensor_splits[sub_tensor.parent].setdefault(stage_id, set()).add('rn')

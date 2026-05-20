@@ -188,3 +188,44 @@ def test_gencode_shared_irobject(tmp_path):
 
     for rank in range(4, 7):
         assert _gencode_contains(tmp_path, PPModule2, rank, rf'nnscaler.runtime.adapter.move_object\(.*, src={rank}, dst={rank + 1}\)')
+
+
+class PPModule3(PPModule2):
+    def forward(self, data: torch.Tensor):
+        loss = super().forward(data)
+        return loss, loss.data
+
+
+@replace_all_device_with('cpu')
+def test_gencode_shared_irobject_loss_data(tmp_path):
+    """
+    Test the case when the segment output is also the graph output,
+    and the segment output is replaced with an inserted identiy op
+    (by `_identity_segment_output` in `fn`)
+    """
+    m = PPModule3()
+    m.train()
+    parallelize(
+        m,
+        {'data': torch.randn(64, 1024)},
+        pas_policy=lambda graph, cfg: pp_pas(graph, cfg, nlayers_per_stage=1),
+        compute_config= ComputeConfig(
+            4, 8,
+            constant_folding=False,
+            use_end2end=True,
+            pas_config=dict(
+                pipeline_nmicros=4,
+                pipeline_scheduler='1f1b'
+            )
+        ),
+        gen_savedir=tmp_path,
+        load_module=False,
+        reuse='override',
+    )
+    for rank in range(3):
+        assert _gencode_contains(tmp_path, PPModule3, rank, rf'sum_.* = nnscaler.runtime.adapter.broadcast\(\(\), shape=\(\), dtype=torch.float32, src=3, ranks=\[0, 1, 2, 3\]\)')
+    assert _gencode_contains(tmp_path, PPModule3, 3, rf'sum_.* = nnscaler.runtime.adapter.broadcast\(sum_.*, shape=\(\), dtype=torch.float32, src=3, ranks=\[0, 1, 2, 3\]\)')
+
+    for rank in range(4, 7):
+        assert _gencode_contains(tmp_path, PPModule3, rank, rf'sum_.* = nnscaler.runtime.adapter.broadcast\(\(\), shape=\(\), dtype=torch.float32, src=7, ranks=\[4, 5, 6, 7\]\)')
+    assert _gencode_contains(tmp_path, PPModule3, 7, rf'sum_.* = nnscaler.runtime.adapter.broadcast\(sum_.*, shape=\(\), dtype=torch.float32, src=7, ranks=\[4, 5, 6, 7\]\)')
