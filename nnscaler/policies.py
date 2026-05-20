@@ -555,13 +555,13 @@ def _identity_segment_output(graph: IRGraph, tensor: IRSubTensor, segment: IRSeg
 
     # replace the original output tensor with the identity output tensor in the entire graph
     if graph != segment:
-        if tensor in graph.get_objects_from_complex(graph.oobjs()):
+        if tensor in IRCell.get_objects_from_complex(graph.oobjs()):
             graph.replace_output(tensor, fwop.output(0))
         # should never goes here.
         # in current implementation, the graph mirror is the graph itself
         # (graph contains both forward and backward nodes)
         # so the following check will never be true.
-        if tensor.grad and graph.mirror and tensor.grad in graph.get_objects_from_complex(graph.mirror.iobjs()):
+        if tensor.grad and graph.mirror and tensor.grad in IRCell.get_objects_from_complex(graph.mirror.iobjs()):
             graph.mirror.replace_input(tensor.grad, fwop.output(0).grad)
 
     # replace the original output tensor with the identity output tensor
@@ -571,14 +571,14 @@ def _identity_segment_output(graph: IRGraph, tensor: IRSubTensor, segment: IRSeg
             continue
 
         # forward
-        if tensor in segment.get_objects_from_complex(s.iobjs()):
+        if tensor in IRCell.get_objects_from_complex(s.iobjs()):
             s.replace_input(tensor, fwop.output(0))
             for consumer in s.consumers(tensor.parent):
                 with s.update(consumer):
                     consumer.replace_input(tensor, fwop.output(0))
 
         # backward grad
-        if tensor.grad and s.mirror and tensor.grad in segment.get_objects_from_complex(s.mirror.oobjs()):
+        if tensor.grad and s.mirror and tensor.grad in IRCell.get_objects_from_complex(s.mirror.oobjs()):
             s.mirror.replace_output(tensor.grad, fwop.output(0).grad)
             for producer in s.mirror.producers(tensor.grad.parent):
                 with s.mirror.update(producer):
