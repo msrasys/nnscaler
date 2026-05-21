@@ -26,7 +26,7 @@ from nnscaler.graph.parser import FxModuleParser
 from nnscaler.runtime.device import DeviceGroup
 from nnscaler.runtime.dtensor import DTensor
 from nnscaler.runtime.adapter.reducer import Reducer
-from nnscaler.runtime.executor import Executor
+from nnscaler.runtime.executor import Executor, get_and_clear_executor_timing_stats
 from nnscaler.runtime.gnorm import ParamsInfo
 from nnscaler.runtime.utils import microbatches, set_dparam_meta, get_dparam_meta
 from nnscaler.runtime.function import insert_backward_hook
@@ -1510,6 +1510,43 @@ class ParallelModule(CubeModule):
                     if elapsed >= 0.001
                 ]
                 _logger.info('Inner train_step timing step=%s max_rank: %s', timing_step, ', '.join(timing_parts))
+
+            executor_stats = get_and_clear_executor_timing_stats()
+            if not executor_stats:
+                return
+            gathered_stats = [None for _ in range(self.world_size)] if dist.is_available() and dist.is_initialized() else [executor_stats]
+            if dist.is_available() and dist.is_initialized() and self.world_size > 1:
+                dist.all_gather_object(gathered_stats, executor_stats)
+            rank = dist.get_rank() if dist.is_available() and dist.is_initialized() else 0
+            if rank != 0:
+                return
+            aggregated = {}
+            for stat_rank, rank_stats in enumerate(gathered_stats):
+                if not rank_stats:
+                    continue
+                for label, stat in rank_stats.items():
+                    item = aggregated.setdefault(label, {
+                        'max_rank_sum_s': 0.0,
+                        'rank': stat_rank,
+                        'count': 0,
+                        'max_op_s': 0.0,
+                    })
+                    if stat['sum_s'] > item['max_rank_sum_s']:
+                        item['max_rank_sum_s'] = stat['sum_s']
+                        item['rank'] = stat_rank
+                        item['count'] = stat['count']
+                    item['max_op_s'] = max(item['max_op_s'], stat['max_s'])
+            top_segments = sorted(
+                aggregated.items(),
+                key=lambda item: item[1]['max_rank_sum_s'],
+                reverse=True,
+            )[:10]
+            top_segments_text = ', '.join(
+                f"{label}: rank={stat['rank']} count={stat['count']} "
+                f"sum={stat['max_rank_sum_s']:.3f}s max={stat['max_op_s']:.3f}s"
+                for label, stat in top_segments
+            )
+            _logger.info('Executor segment timing step=%s top=[%s]', timing_step, top_segments_text)
 
         self._scale_loss(is_dummy_batch, scale_fn)
         _timing_mark('scale_loss_setup')

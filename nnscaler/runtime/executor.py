@@ -9,6 +9,7 @@ import atexit
 from typing import Tuple, Any, Callable, List, Dict, Optional
 import torch
 import logging
+import os
 
 _logger = logging.getLogger(__name__)
 
@@ -72,6 +73,48 @@ class AsyncCommHandler:
 
 TensorPairs = List[Tuple[int, torch.Tensor]]
 
+_TIMING_EVENTS = []
+
+
+def _timing_enabled() -> bool:
+    return os.getenv('NNSCALER_EXECUTOR_TIMING', os.getenv('LLM_TRAIN_EXECUTOR_TIMING', '')).lower() in {'1', 'true', 'yes', 'on'}
+
+
+def _timing_start(kind: str, name: str):
+    if not _timing_enabled() or not torch.cuda.is_available():
+        return None
+    start_event = torch.cuda.Event(enable_timing=True)
+    end_event = torch.cuda.Event(enable_timing=True)
+    start_event.record()
+    return kind, name, start_event, end_event
+
+
+def _timing_end(record) -> None:
+    if record is None:
+        return
+    kind, name, start_event, end_event = record
+    end_event.record()
+    _TIMING_EVENTS.append((kind, name, start_event, end_event))
+
+
+def get_and_clear_executor_timing_stats(max_entries: int = 100):
+    global _TIMING_EVENTS
+    if not _TIMING_EVENTS:
+        return None
+    torch.cuda.synchronize()
+    stats = {}
+    for kind, name, start_event, end_event in _TIMING_EVENTS:
+        label = f'{kind}:{name}'
+        elapsed_s = start_event.elapsed_time(end_event) / 1000.0
+        stat = stats.setdefault(label, {'count': 0, 'sum_s': 0.0, 'max_s': 0.0})
+        stat['count'] += 1
+        stat['sum_s'] += elapsed_s
+        stat['max_s'] = max(stat['max_s'], elapsed_s)
+    _TIMING_EVENTS = []
+    if max_entries and len(stats) > max_entries:
+        stats = dict(sorted(stats.items(), key=lambda item: item[1]['sum_s'], reverse=True)[:max_entries])
+    return stats
+
 
 class Executor:
 
@@ -88,11 +131,13 @@ class Executor:
         """
         forward the sub-graph.
         """
+        timing_record = _timing_start('fw', name)
         input_tensors = Executor.sync_tensors(input_tensors)
 
         if not requires_grad:
             with torch.no_grad():
                 outputs = subgraph(*input_tensors)
+            _timing_end(timing_record)
             return outputs
 
         # everytime forward a segment, detach the tensor from previous graph
@@ -106,6 +151,7 @@ class Executor:
         Executor._detach.setdefault(name, []).append(saved_pairs)  
         
         outputs = subgraph(*input_dtensors)
+        _timing_end(timing_record)
         return outputs
 
     @staticmethod
@@ -113,6 +159,7 @@ class Executor:
         """
         execute adapter
         """
+        timing_record = _timing_start('adapter', getattr(subgraph, '__name__', subgraph.__class__.__name__))
         if not requires_grad:
             with torch.no_grad():
                 outputs = subgraph(*input_tensors)
@@ -122,6 +169,7 @@ class Executor:
                 outputs = (t.requires_grad_() if torch.is_tensor(t) and t.dtype in _ALLOW_GRAD_DTYPES else t for t in outputs)
             elif torch.is_tensor(outputs) and outputs.dtype in _ALLOW_GRAD_DTYPES:
                 outputs = outputs.requires_grad_()
+        _timing_end(timing_record)
         return outputs
 
     @staticmethod
@@ -146,6 +194,7 @@ class Executor:
         @return gradients List[torch.Tensor]:
             gradient tensors corresponding to input_tensors.
         """
+        timing_record = _timing_start('bw', name)
         output_tensor_grads = Executor.sync_tensors(output_tensor_grads)
 
         saved_pairs = Executor._detach[name].pop(0)
@@ -196,9 +245,12 @@ class Executor:
         grads = tuple(t.grad for t in input_tensors)
         assert all(grad is not None for grad in grads), "RuntimeError: got gradient None"
 
-        if    len(grads) == 0: return None
-        elif  len(grads) == 1: return grads[0]
-        else: return grads
+        _timing_end(timing_record)
+        if len(grads) == 0:
+            return None
+        if len(grads) == 1:
+            return grads[0]
+        return grads
 
     @staticmethod
     def sync_tensors(tensors: List[Any]) -> List[Any]:
