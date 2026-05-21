@@ -99,13 +99,15 @@ def call_flash_attn_cute_varlen_func(func, *args, return_lse=False, **kwargs):
     if _supports_return_lse(func):
         kwargs["return_lse"] = bool(return_lse)
 
-    output, lse = func(*args, **kwargs)
+    result = func(*args, **kwargs)
+    if isinstance(result, tuple):
+        output = result[0]
+        lse = result[1] if len(result) > 1 else None
+    else:
+        output = result
+        lse = None
+
     if return_lse:
-        if lse is None:
-            raise RuntimeError(
-                "flash_attn.cute.flash_attn_varlen_func did not return softmax LSE. "
-                "Install a flash-attn version whose cute varlen API supports return_lse."
-            )
         return output, lse
     return output
 
