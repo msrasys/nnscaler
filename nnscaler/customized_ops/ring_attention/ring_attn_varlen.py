@@ -14,7 +14,7 @@ from nnscaler.ir import IRTensor
 from nnscaler.runtime.device import DeviceGroup
 from flash_attn import flash_attn_varlen_func
 from .core.ring_attn_varlen_implementation import llama3_flash_attn_prepare_cu_seqlens, llama3_flash_attn_varlen_func
-from .core.utils import call_flash_attn_cute_varlen_func, gen_head_anno
+from .core.utils import call_flash_attn_cute_varlen_func, gen_head_anno, get_arg_by_name
 from .varlen_utils import shuffle_varlen, unshuffle_varlen
 
 try:
@@ -324,7 +324,20 @@ def flash_attention_anno(query_states, key_states, value_states, cu_seqlens_q, c
     q_anno, kv_anno = gen_head_anno(query_states, key_states, value_states, head_pos=1)
     alibi_anno = f'{q_anno}' if isinstance(alibi_slopes, IRTensor) else '?'
     output_anno = f'l {q_anno} vd^'
-    if kwargs.get("return_lse", False) or (len(args) > 9 and args[9]):
+    return_lse = get_arg_by_name(
+        wrap_ring_attn_varlen_func,
+        "return_lse",
+        False,
+        query_states,
+        key_states,
+        value_states,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        alibi_slopes,
+        *args,
+        **kwargs,
+    )
+    if return_lse:
         output_anno += f', {q_anno} l'
     return f'l {q_anno} hd^, l {kv_anno} hd^, l {kv_anno} vd^, e^, e^, {alibi_anno} -> {output_anno}'
 

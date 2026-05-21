@@ -85,6 +85,16 @@ def _supports_return_lse(func):
     return "return_lse" in inspect.signature(func).parameters
 
 
+@cache
+def _get_signature(func):
+    return inspect.signature(func)
+
+
+def get_arg_by_name(func, name, default, *args, **kwargs):
+    bound = _get_signature(func).bind_partial(*args, **kwargs)
+    return bound.arguments.get(name, default)
+
+
 def call_flash_attn_cute_varlen_func(func, *args, return_lse=False, **kwargs):
     if _supports_return_lse(func):
         kwargs["return_lse"] = bool(return_lse)
