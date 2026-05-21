@@ -36,6 +36,57 @@ _logger = logging.getLogger(__name__)
 
 _COMP_STREAM = None   # computation stream (non-default)
 _COMM_STREAM = None   # communication stream (non-default)
+_SCHEDULER_TIMING_EVENTS = []
+
+
+def _env_flag(*names: str) -> bool:
+    for name in names:
+        value = os.getenv(name)
+        if value is not None:
+            return value.lower() in {'1', 'true', 'yes', 'on'}
+    return False
+
+
+def _scheduler_timing_enabled() -> bool:
+    return (
+        _env_flag('NNSCALER_SCHEDULER_TIMING', 'LLM_TRAIN_SCHEDULER_TIMING')
+        and _env_flag('_NNSCALER_SCHEDULER_TIMING_ACTIVE')
+    )
+
+
+def _scheduler_timing_start(label: str):
+    if not _scheduler_timing_enabled() or not torch.cuda.is_available():
+        return None
+    start_event = torch.cuda.Event(enable_timing=True)
+    end_event = torch.cuda.Event(enable_timing=True)
+    start_event.record()
+    return label, start_event, end_event
+
+
+def _scheduler_timing_end(record) -> None:
+    if record is None:
+        return
+    label, start_event, end_event = record
+    end_event.record()
+    _SCHEDULER_TIMING_EVENTS.append((label, start_event, end_event))
+
+
+def get_and_clear_scheduler_timing_stats(max_entries: int = 200):
+    global _SCHEDULER_TIMING_EVENTS
+    if not _SCHEDULER_TIMING_EVENTS:
+        return None
+    torch.cuda.synchronize()
+    stats = {}
+    for label, start_event, end_event in _SCHEDULER_TIMING_EVENTS:
+        elapsed_s = start_event.elapsed_time(end_event) / 1000.0
+        stat = stats.setdefault(label, {'count': 0, 'sum_s': 0.0, 'max_s': 0.0})
+        stat['count'] += 1
+        stat['sum_s'] += elapsed_s
+        stat['max_s'] = max(stat['max_s'], elapsed_s)
+    _SCHEDULER_TIMING_EVENTS = []
+    if max_entries and len(stats) > max_entries:
+        stats = dict(sorted(stats.items(), key=lambda item: item[1]['sum_s'], reverse=True)[:max_entries])
+    return stats
 
 
 class TransformerLayerState:
@@ -464,12 +515,16 @@ class ScheduleNode:
             torch.cuda.nvtx.range_push(name)
         try:
             with torch.cuda.stream(self.stream):
-                yield
+                timing_record = _scheduler_timing_start(name or self.name)
+                try:
+                    yield
+                finally:
+                    _scheduler_timing_end(timing_record)
+                    if not self._skip_event:
+                        self.event.record(self.stream)
         finally:
             if name:
                 torch.cuda.nvtx.range_pop()
-            if not self._skip_event:
-                self.event.record(self.stream)
 
     def _release(self, extra_refs=()):
         _release_owned_storage_after_last_use(
@@ -688,7 +743,8 @@ class MergedScheduler:
 
                 with nnscaler.sync_grad_when(False):
                     fwd_h, grad_h, fwd_entry = self._merged_step_general(
-                        bwd_entry, fwd_lc, fwd_event, grad_h, fwd_h)
+                        bwd_entry, fwd_lc, fwd_event, grad_h, fwd_h,
+                        fwd_layer_idx=fwd_idx)
 
                 prev_all_nodes[bwd_idx] = None
 
@@ -714,10 +770,10 @@ class MergedScheduler:
 
                 if fwd_lc.is_moe and self._use_4node:
                     fwd_h, fwd_entry = self._forward_single_layer_4node(
-                        fwd_h, fwd_lc, fwd_event)
+                        fwd_h, fwd_lc, fwd_event, layer_idx=fwd_idx)
                 else:
                     fwd_h, fwd_entry = self._forward_single_layer(
-                        fwd_h, fwd_lc, fwd_event)
+                        fwd_h, fwd_lc, fwd_event, layer_idx=fwd_idx)
                 fwd_all_nodes[fwd_idx] = fwd_entry
                 if fwd_lc.is_moe:
                     fwd_routing_maps.append(fwd_lc.step_data.get('routing_map'))
@@ -802,13 +858,17 @@ class MergedScheduler:
 
         return results
 
-    def _create_nodes(self, lc, event):
+    @staticmethod
+    def _node_name(layer_idx, name):
+        return f'L{layer_idx}:{name}' if layer_idx is not None else name
+
+    def _create_nodes(self, lc, event, layer_idx=None):
         """Create 2 ScheduleNodes for a layer (dense or MoE fallback)."""
         comp_stream = get_comp_stream()
 
         attn_node = ScheduleNode(
             lc.attn_fn, comp_stream, event,
-            name="attn", checkpoint=self.use_checkpoint)
+            name=self._node_name(layer_idx, "attn"), checkpoint=self.use_checkpoint)
 
         if lc.is_moe:
             raise NotImplementedError(
@@ -817,11 +877,11 @@ class MergedScheduler:
 
         body_node = ScheduleNode(
             lc.body_fn, comp_stream, event,
-            name="ffn", checkpoint=self.use_checkpoint)
+            name=self._node_name(layer_idx, "ffn"), checkpoint=self.use_checkpoint)
 
         return (attn_node, body_node)
 
-    def _create_nodes_4(self, lc, event):
+    def _create_nodes_4(self, lc, event, layer_idx=None):
         """Create 4 ScheduleNodes for MoE layer, alternating COMP/COMM streams."""
         comp_stream = get_comp_stream()
         comm_stream = get_comm_stream()
@@ -837,7 +897,7 @@ class MergedScheduler:
 
         attn_node = ScheduleNode(
             lc.attn_fn, comp_stream, event,
-            name="attn_router", checkpoint=self.use_checkpoint,
+            name=self._node_name(layer_idx, "attn_router"), checkpoint=self.use_checkpoint,
             pass_node=lc.step_data.get('_state_lifetime_in_callables', False),
             layer_state=layer_state)
         attn_node.uses_state_residual = lc.step_data.get('_use_state_residual', False)
@@ -845,7 +905,7 @@ class MergedScheduler:
 
         dispatch_node = ScheduleNode(
             lc.dispatch_fn, comm_stream, event,
-            name="dispatch", checkpoint=False,
+            name=self._node_name(layer_idx, "dispatch"), checkpoint=False,
             free_input=free_dispatch_input,
             pass_node=lc.step_data.get('_state_lifetime_in_callables', False),
             layer_state=layer_state)
@@ -854,7 +914,7 @@ class MergedScheduler:
 
         expert_node = ScheduleNode(
             lc.expert_fn, comp_stream, event,
-            name="expert", checkpoint=self.use_checkpoint,
+            name=self._node_name(layer_idx, "expert"), checkpoint=self.use_checkpoint,
             free_input=lc.step_data.get('_free_expert_input', False),
             pass_node=lc.step_data.get('_state_lifetime_in_callables', False),
             layer_state=layer_state)
@@ -866,7 +926,7 @@ class MergedScheduler:
 
         combine_node = ScheduleNode(
             lc.combine_fn, comm_stream, event,
-            name="combine", checkpoint=False,
+            name=self._node_name(layer_idx, "combine"), checkpoint=False,
             free_input=free_combine_input,
             pass_node=lc.step_data.get('_state_lifetime_in_callables', False),
             layer_state=layer_state)
@@ -1106,9 +1166,9 @@ class MergedScheduler:
                 continue
 
             if lc.is_moe and self._use_4node:
-                h, entry = self._forward_single_layer_4node(h, lc, event)
+                h, entry = self._forward_single_layer_4node(h, lc, event, layer_idx=si)
             else:
-                nodes = self._create_nodes(lc, event)
+                nodes = self._create_nodes(lc, event, layer_idx=si)
                 attn_n, body_n = nodes
 
                 attn_out = attn_n.forward((h,))
@@ -1129,9 +1189,9 @@ class MergedScheduler:
 
         return h, all_nodes, routing_maps, expert_probs
 
-    def _forward_single_layer(self, h, lc, event):
+    def _forward_single_layer(self, h, lc, event, layer_idx=None):
         """Forward a single dense layer."""
-        nodes = self._create_nodes(lc, event)
+        nodes = self._create_nodes(lc, event, layer_idx=layer_idx)
         attn_n, body_n = nodes
 
         attn_out = attn_n.forward((h,))
@@ -1144,13 +1204,13 @@ class MergedScheduler:
 
         return h, ('layer2', nodes)
 
-    def _forward_single_layer_4node(self, h, lc, event):
+    def _forward_single_layer_4node(self, h, lc, event, layer_idx=None):
         """Forward a single MoE layer through 4 nodes.
 
         MoE auxiliary tensors may be carried through node state rather than as
         ordinary node inputs, matching Megatron's safe-release schedule.
         """
-        nodes = self._create_nodes_4(lc, event)
+        nodes = self._create_nodes_4(lc, event, layer_idx=layer_idx)
         attn_n, dispatch_n, expert_n, combine_n = nodes
 
         attn_out = attn_n.forward((h,))
@@ -1272,14 +1332,14 @@ class MergedScheduler:
         else:
             raise ValueError(f"Unknown entry tag: {tag}")
 
-    def _merged_step(self, bwd_entry, fwd_lc, fwd_event, grad_h, fwd_h):
+    def _merged_step(self, bwd_entry, fwd_lc, fwd_event, grad_h, fwd_h, fwd_layer_idx=None):
         """2-phase overlap for dense layers."""
         _, bwd_nodes = bwd_entry
         bwd_attn, bwd_body = bwd_nodes
         consumed_grad_h = grad_h
         layer_dead_refs = [consumed_grad_h]
 
-        fwd_nodes = self._create_nodes(fwd_lc, fwd_event)
+        fwd_nodes = self._create_nodes(fwd_lc, fwd_event, layer_idx=fwd_layer_idx)
         fwd_attn, fwd_body = fwd_nodes
 
         # Ensure all intermediate ops run on COMP stream, not default stream.
@@ -1307,7 +1367,7 @@ class MergedScheduler:
 
         return fwd_h_out, grad_x, ('layer2', fwd_nodes)
 
-    def _merged_step_4phase(self, bwd_nodes, fwd_lc, fwd_event, grad_h, fwd_h):
+    def _merged_step_4phase(self, bwd_nodes, fwd_lc, fwd_event, grad_h, fwd_h, fwd_layer_idx=None):
         """4-phase overlap for MoE layers.
 
         Each phase interleaves COMP and COMM operations from different
@@ -1325,7 +1385,7 @@ class MergedScheduler:
         combine_fn (COMM stream) as pure communication.
         """
         bwd_attn, bwd_dispatch, bwd_expert, bwd_combine = bwd_nodes
-        fwd_nodes = self._create_nodes_4(fwd_lc, fwd_event)
+        fwd_nodes = self._create_nodes_4(fwd_lc, fwd_event, layer_idx=fwd_layer_idx)
         fwd_attn, fwd_dispatch, fwd_expert, fwd_combine = fwd_nodes
 
         pool = self._async_pool  # None in sequential mode
@@ -1493,23 +1553,29 @@ class MergedScheduler:
 
         return fwd_h_out, grad_x, ('layer4', fwd_nodes)
 
-    def _merged_step_general(self, bwd_entry, fwd_lc, fwd_event, grad_h, fwd_h):
+    def _merged_step_general(self, bwd_entry, fwd_lc, fwd_event, grad_h, fwd_h, fwd_layer_idx=None):
         """Dispatch to 4-phase or 2-phase merged step based on layer types."""
         bwd_tag, bwd_nodes = bwd_entry
 
         if self._use_4node and bwd_tag == 'layer4' and fwd_lc.is_moe:
-            return self._merged_step_4phase(bwd_nodes, fwd_lc, fwd_event, grad_h, fwd_h)
+            return self._merged_step_4phase(
+                bwd_nodes, fwd_lc, fwd_event, grad_h, fwd_h,
+                fwd_layer_idx=fwd_layer_idx)
         elif bwd_tag == 'layer2':
             if fwd_lc.is_moe:
                 raise NotImplementedError(
                     "Merging dense backward with MoE forward is unsupported. "
                     "The MoE forward must run through the 4-node schedule.")
-            return self._merged_step(bwd_entry, fwd_lc, fwd_event, grad_h, fwd_h)
+            return self._merged_step(
+                bwd_entry, fwd_lc, fwd_event, grad_h, fwd_h,
+                fwd_layer_idx=fwd_layer_idx)
         else:
             with nnscaler.sync_grad_when(False):
                 grad_x = self._backward_entry(bwd_entry, grad_h)
             if fwd_lc.is_moe and self._use_4node:
-                fwd_h_out, fwd_entry = self._forward_single_layer_4node(fwd_h, fwd_lc, fwd_event)
+                fwd_h_out, fwd_entry = self._forward_single_layer_4node(
+                    fwd_h, fwd_lc, fwd_event, layer_idx=fwd_layer_idx)
             else:
-                fwd_h_out, fwd_entry = self._forward_single_layer(fwd_h, fwd_lc, fwd_event)
+                fwd_h_out, fwd_entry = self._forward_single_layer(
+                    fwd_h, fwd_lc, fwd_event, layer_idx=fwd_layer_idx)
             return fwd_h_out, grad_x, fwd_entry

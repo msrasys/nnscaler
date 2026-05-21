@@ -8,4 +8,5 @@ from .engine import (
     get_comp_stream,
     get_comm_stream,
     manual_sync_grads,
+    get_and_clear_scheduler_timing_stats,
 )
