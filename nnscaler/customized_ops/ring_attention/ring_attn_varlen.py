@@ -325,7 +325,7 @@ def flash_attention_anno(query_states, key_states, value_states, cu_seqlens_q, c
     alibi_anno = f'{q_anno}' if isinstance(alibi_slopes, IRTensor) else '?'
     output_anno = f'l {q_anno} vd^'
     if kwargs.get("return_lse", False) or (len(args) > 9 and args[9]):
-        output_anno += ', ?'
+        output_anno += f', {q_anno} l'
     return f'l {q_anno} hd^, l {kv_anno} hd^, l {kv_anno} vd^, e^, e^, {alibi_anno} -> {output_anno}'
 
 
