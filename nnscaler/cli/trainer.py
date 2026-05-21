@@ -942,6 +942,41 @@ class Trainer:
         VAL_STATUS_SAVE = 2   # validated and saved
         has_validated = VAL_STATUS_NO   # 3 states
 
+        timing_enabled = os.getenv('NNSCALER_STAGE_TIMING', os.getenv('LLM_TRAIN_STAGE_TIMING', '')).lower() in {'1', 'true', 'yes', 'on'}
+        timing_sync = os.getenv('NNSCALER_STAGE_TIMING_SYNC', os.getenv('LLM_TRAIN_STAGE_TIMING_SYNC', '1')).lower() in {'1', 'true', 'yes', 'on'}
+
+        def _env_int(name: str, default: int) -> int:
+            value = os.getenv(name)
+            if value is None:
+                return default
+            try:
+                return int(value)
+            except ValueError:
+                logger.warning('Ignoring invalid integer value for %s=%r', name, value)
+                return default
+
+        timing_interval = max(1, _env_int('NNSCALER_STAGE_TIMING_INTERVAL', _env_int('LLM_TRAIN_STAGE_TIMING_INTERVAL', 10)))
+        timing_start = max(0, _env_int('NNSCALER_STAGE_TIMING_START', _env_int('LLM_TRAIN_STAGE_TIMING_START', 0)))
+
+        def _stage_sync() -> None:
+            if timing_sync and torch.cuda.is_available():
+                torch.cuda.synchronize()
+
+        def _log_stage_timings(step: int, names: list[str], values: list[float]) -> None:
+            if not names:
+                return
+            tensor_device = torch.device('cuda', torch.cuda.current_device()) if torch.cuda.is_available() else torch.device('cpu')
+            max_values = torch.tensor(values, dtype=torch.float64, device=tensor_device)
+            if torch.distributed.is_available() and torch.distributed.is_initialized() and self.world_size and self.world_size > 1:
+                torch.distributed.all_reduce(max_values, op=torch.distributed.ReduceOp.MAX)
+            if self.rank == 0:
+                timing_parts = [
+                    f'{name}={elapsed:.3f}s'
+                    for name, elapsed in zip(names, max_values.cpu().tolist())
+                    if elapsed >= 0.001
+                ]
+                logger.info('Stage timing step=%s max_rank: %s', step, ', '.join(timing_parts))
+
         resume_from_idx = self.train_status.finished_train_steps % self.total_train_steps_per_epoch
         data_iter = enumerate(self._global_batch_iterator(resume_from_idx))
 
@@ -962,24 +997,51 @@ class Trainer:
             )
 
         step_stat: Optional[_StepStat] = None
+        data_wait_start_at = time.perf_counter()
         for i, batches in data_iter:
+            data_iter_wait = time.perf_counter() - data_wait_start_at
             idx = i + resume_from_idx
             self.hook.on_step_start(self, epoch, idx)
 
             step_start_at = time.perf_counter()
+            timing_step = self.train_status.finished_train_steps + 1
+            timing_active = timing_enabled \
+                and timing_step >= timing_start \
+                and timing_step % timing_interval == 0
+            timing_names: list[str] = []
+            timing_values: list[float] = []
+            timing_last_at = step_start_at
+            if timing_active:
+                timing_names.append('data_iter_wait')
+                timing_values.append(data_iter_wait)
+
+            def _stage_mark(name: str) -> None:
+                nonlocal timing_last_at
+                if not timing_active:
+                    return
+                _stage_sync()
+                now = time.perf_counter()
+                timing_names.append(name)
+                timing_values.append(now - timing_last_at)
+                timing_last_at = now
+
             step_stat = _StepStat()
             step_metrics = {}
             has_validated = VAL_STATUS_NO
             num_batches = len(batches)
             batches, is_dummy_batch = self._fix_batches(batches)
+            _stage_mark('fix_batches')
 
             self.model.train()
+            _stage_mark('model_train')
 
             self.hook.before_zero_grad(self)
             self.optimizer.zero_grad()
             self.hook.after_zero_grad(self)
+            _stage_mark('zero_grad')
 
             self.hook.on_train_step_start(self, batches[:num_batches])
+            _stage_mark('train_step_start_hook')
 
             # wrap train_step with `torch.cuda.synchronize`
             # to support multiple cuda streams in train_step.
@@ -989,13 +1051,17 @@ class Trainer:
 
             if cuda_sync_required:
                 torch.cuda.synchronize()
+            _stage_mark('pre_train_step_sync')
 
             losses = self.model.train_step(batches, is_dummy_batch)
+            _stage_mark('train_step')
 
             if cuda_sync_required:
                 torch.cuda.synchronize()
+            _stage_mark('post_train_step_sync')
 
             self.hook.on_train_step_end(self, losses[:num_batches])
+            _stage_mark('train_step_end_hook')
 
             aggregate_outputs = self.train_args.resolved_aggregate_outputs_fn or self.aggregate_outputs
             aggregated_outputs = aggregate_outputs(losses[:num_batches], self.sync_group)
@@ -1008,13 +1074,18 @@ class Trainer:
             else:
                 loss = aggregated_outputs.loss_sum
             step_stat.train_loss = loss
+            _stage_mark('aggregate_outputs')
             self.hook.after_aggregate_train_step_outputs(self, aggregated_outputs, loss)
+            _stage_mark('after_aggregate_hook')
 
             self.hook.before_sync_grad(self)
+            _stage_mark('before_sync_grad_hook')
             # `sync_shard_grad` is no-op if the whole model is parallelized
             #  because syncing grad in end2end model is done in `_train_step`.
             self.optimizer.sync_shard_grad()
+            _stage_mark('sync_shard_grad')
             self.hook.after_sync_grad(self)
+            _stage_mark('after_sync_grad_hook')
 
             # scale gradients
             multiplier = self.train_args.optimizer.grad_reduce_divisor or self.train_args.scaling_factor
@@ -1031,10 +1102,12 @@ class Trainer:
                     raise RuntimeError("`aggregate_outputs` doesn't set `num_tokens` field")
                 multiplier /= aggregated_outputs.num_tokens
             self.optimizer.scale_grads(multiplier)
+            _stage_mark('scale_grads')
 
             # check gradient sync & scale correctness
             if self.train_args.debug.check_gradient_sync_cross_devices:
                 self._check_grad_cross_devices_correctness()
+            _stage_mark('gradient_debug_check')
 
             # clip gradients
             self.hook.before_gnorm_clip(self)
@@ -1044,6 +1117,7 @@ class Trainer:
                 step_stat.gnorm = self.optimizer.clip_gnorm()
             self.hook.after_gnorm_clip(self, step_stat.gnorm)
             step_stat.gnorm = step_stat.gnorm.item()
+            _stage_mark('clip_gnorm')
 
             # update parameters
             step_stat.lr = self.optimizer.param_groups[0]['lr']  # only log the first group's lr
@@ -1052,6 +1126,7 @@ class Trainer:
             self.hook.after_optimizer_step(self)
             if self.lr_scheduler and self.train_args.lr_scheduler.interval == 'step':
                 self.lr_scheduler.step()
+            _stage_mark('optimizer_step')
 
             self.train_status.finished_train_steps += 1
             self._log_mem_stats(tag='train')
@@ -1060,6 +1135,9 @@ class Trainer:
             step_metrics['loss'] = step_metrics['train_loss']
             self.hook.before_log_train_metrics(self, step_metrics, aggregated_outputs)
             self.log_metrics(step_metrics, tag='train')
+            _stage_mark('log_metrics')
+            if timing_active:
+                _log_stage_timings(self.train_status.finished_train_steps, timing_names, timing_values)
             if self.rank == 0:
                 data_iter.set_postfix(step_metrics)
                 if self.train_args.enable_log_progress \
@@ -1097,6 +1175,7 @@ class Trainer:
                 self._validate(step_stat)
                 has_validated = VAL_STATUS_VAL
 
+            data_wait_start_at = time.perf_counter()
             # time.sleep(1)
         else:
             # Do per-epoch operations here.

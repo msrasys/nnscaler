@@ -10,6 +10,7 @@ import os
 import sys
 import gc
 import warnings
+import time
 from pathlib import Path
 from dataclasses import dataclass, asdict
 from collections import defaultdict
@@ -1458,26 +1459,85 @@ class ParallelModule(CubeModule):
         if is_dummy_batch and len(samples) != len(is_dummy_batch):
             raise ValueError("The length of samples and is_dummy_batch should be the same")
 
+        timing_enabled = os.getenv('NNSCALER_INNER_STEP_TIMING', os.getenv('LLM_TRAIN_INNER_STEP_TIMING', '')).lower() in {'1', 'true', 'yes', 'on'}
+        timing_sync = os.getenv('NNSCALER_INNER_STEP_TIMING_SYNC', os.getenv('LLM_TRAIN_INNER_STEP_TIMING_SYNC', '1')).lower() in {'1', 'true', 'yes', 'on'}
+
+        def _env_int(name: str, default: int) -> int:
+            value = os.getenv(name)
+            if value is None:
+                return default
+            try:
+                return int(value)
+            except ValueError:
+                _logger.warning('Ignoring invalid integer value for %s=%r', name, value)
+                return default
+
+        timing_step = getattr(self, '_inner_step_timing_step', 0) + 1
+        self._inner_step_timing_step = timing_step
+        timing_start = max(0, _env_int('NNSCALER_INNER_STEP_TIMING_START', _env_int('LLM_TRAIN_INNER_STEP_TIMING_START', 0)))
+        timing_interval = max(1, _env_int('NNSCALER_INNER_STEP_TIMING_INTERVAL', _env_int('LLM_TRAIN_INNER_STEP_TIMING_INTERVAL', 10)))
+        timing_active = timing_enabled and timing_step >= timing_start and timing_step % timing_interval == 0
+        timing_names: list[str] = []
+        timing_values: list[float] = []
+        timing_last_at = time.perf_counter()
+
+        def _timing_sync() -> None:
+            if timing_sync and torch.cuda.is_available():
+                torch.cuda.synchronize()
+
+        def _timing_mark(name: str) -> None:
+            nonlocal timing_last_at
+            if not timing_active:
+                return
+            _timing_sync()
+            now = time.perf_counter()
+            timing_names.append(name)
+            timing_values.append(now - timing_last_at)
+            timing_last_at = now
+
+        def _timing_log() -> None:
+            if not timing_active or not timing_names:
+                return
+            tensor_device = torch.device('cuda', torch.cuda.current_device()) if torch.cuda.is_available() else torch.device('cpu')
+            max_values = torch.tensor(timing_values, dtype=torch.float64, device=tensor_device)
+            if dist.is_available() and dist.is_initialized() and self.world_size > 1:
+                dist.all_reduce(max_values, op=dist.ReduceOp.MAX)
+            rank = dist.get_rank() if dist.is_available() and dist.is_initialized() else 0
+            if rank == 0:
+                timing_parts = [
+                    f'{name}={elapsed:.3f}s'
+                    for name, elapsed in zip(timing_names, max_values.cpu().tolist())
+                    if elapsed >= 0.001
+                ]
+                _logger.info('Inner train_step timing step=%s max_rank: %s', timing_step, ', '.join(timing_parts))
+
         self._scale_loss(is_dummy_batch, scale_fn)
+        _timing_mark('scale_loss_setup')
 
         # sync_grad will be done in _train_step
         # so we never need to call it manually
         self._sync_grad_required = False
         sample_count = len(samples)
         dataloader = microbatches(samples, cycle=False)
+        _timing_mark('make_microbatch_iter')
 
         if self.use_scheduler:
             if len(samples) != self.nmicros_per_scheduler_step:
                 raise ValueError(f"Expected {self.nmicros_per_scheduler_step} samples, but got {sample_count}")
             # only one step, so begin/end are both True
             with accum_mode(begin=True, end=True):
-                return self._train_step(dataloader)
+                output = self._train_step(dataloader)
+            _timing_mark('scheduler_train_step')
+            _timing_log()
+            return output
         else:
             outputs = []
             for idx in range(sample_count):
                 with accum_mode(begin=(idx==0), end=(idx==sample_count-1)):
                     output = self._train_step(dataloader)
+                _timing_mark(f'micro_{idx}_train_step')
                 outputs.append(output)
+            _timing_log()
             return outputs
 
     def infer_step(self, samples: List[Any]) -> List[Any]:
