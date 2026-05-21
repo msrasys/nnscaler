@@ -186,6 +186,22 @@ def toy_policy(graph, cfg):
             raise ValueError(f"Unexpected module in graph: {node.module_class_chain}")
 
 
+def segment_pre_hook(module, meta, inputs, kwargs):
+    print(f'segment pre_hook: {meta}')
+
+
+def segment_post_hook(module, meta, inputs, kwargs, outputs):
+    print(f'segment post_hook: {meta}')
+
+
+def segment_mirror_pre_hook(module, meta, inputs, kwargs):
+    print(f'segment pre_hook: {meta}')
+
+
+def segment_mirror_post_hook(module, meta, inputs, kwargs, outputs):
+    print(f'segment post_hook: {meta}')
+
+
 def sched_overlap(graph: IRGraph, num_microbatches: int, num_stages: int) -> SchedulePlan:
     """
     1F1B overlapped schedule with two CUDA streams.
@@ -213,6 +229,14 @@ def sched_overlap(graph: IRGraph, num_microbatches: int, num_stages: int) -> Sch
     segments: List[IRSegment] = graph.select(ntype=IRSegment, flatten=False)
     fsegs = [seg for seg in segments if seg.isfw()]
     assert len(fsegs) == num_stages, f"Mismatch of forward segment number ({len(fsegs)}) with num_stages ({num_stages})"
+
+    fseg_names = ['InputProj', 'CommGather', 'ExpertFFN', 'CommScatter', 'OutputHead']
+    for seg, name in zip(fsegs, fseg_names):
+        seg.name = name
+        seg.pre_hook = segment_pre_hook
+        seg.post_hook = segment_post_hook
+        seg.mirror.pre_hook = segment_mirror_pre_hook
+        seg.mirror.post_hook = segment_mirror_post_hook
 
     # describe schedule
     sched = SchedulePlan(graph, num_microbatches)

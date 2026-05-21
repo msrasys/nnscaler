@@ -151,6 +151,11 @@ class ModuleCodeGen(FuncEmission):
                 hook_imports.add(inspect.getmodule(node.pre_hook).__name__)
             if node.post_hook is not None:
                 hook_imports.add(inspect.getmodule(node.post_hook).__name__)
+        for segment in execplan.graph.select(ntype=IRSegment):
+            if segment.pre_hook is not None:
+                hook_imports.add(inspect.getmodule(segment.pre_hook).__name__)
+            if segment.post_hook is not None:
+                hook_imports.add(inspect.getmodule(segment.post_hook).__name__)
         for modname in hook_imports:
             self.init_code.append(f'import {modname}')
             self.init_code += ['']

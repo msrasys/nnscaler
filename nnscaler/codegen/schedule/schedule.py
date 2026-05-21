@@ -3,6 +3,7 @@
 
 from typing import List, Optional, Tuple, Union
 import copy
+import inspect
 import logging
 
 from nnscaler.ir.cten import IRCell, IRTensor, IR
@@ -263,6 +264,32 @@ class ScheduleCodeGen(FuncEmission):
                     for record_event in stream_context.record_events:
                         events.add(record_event)
 
+    def _emit_segment_hook_code(
+            self, hook, hook_meta,
+            inputs_str: str,
+            is_pre: bool,
+            outputs_str: str = None
+        ) -> List[str]:
+        """Generate hook call code for a segment.
+
+        Args:
+            hook: The hook function.
+            hook_meta: Meta data passed to the hook.
+            inputs_str: Tuple string of segment inputs.
+            is_pre: True for pre-hook, False for post-hook.
+            outputs_str: Tuple string of segment outputs (for post-hook).
+
+        Returns:
+            List[str]: lines of hook call code.
+        """
+        module_path = inspect.getmodule(hook).__name__
+        fsig = f'{module_path}.{hook.__name__}'
+        kwargs = '{}' # always pass empty kwargs for now, can be extended in the future if needed
+        if is_pre:
+            return [f'{fsig}(model, {repr(hook_meta)}, {inputs_str}, {kwargs})']
+        else:
+            return [f'{fsig}(model, {repr(hook_meta)}, {inputs_str}, {kwargs}, {outputs_str})']
+
     def emit_detach(self, tensor: IRTensor) -> str:
         """
         Emit detach code
@@ -292,6 +319,8 @@ class ScheduleCodeGen(FuncEmission):
         stream_context = self._get_node_stream_context(node)
 
         if isinstance(unwrap_node, IRSegment):
+            # segment hooks
+            pre_hook, post_hook, hook_meta = unwrap_node.pre_hook, unwrap_node.post_hook, unwrap_node.hook_meta
             # emit forward segment
             if node.isfw():
                 codes = [fsign.format(
@@ -301,6 +330,13 @@ class ScheduleCodeGen(FuncEmission):
                     inputs = inputs,
                     req_grad = req_grad
                 )]
+                if pre_hook:
+                    codes = self._emit_segment_hook_code(pre_hook, hook_meta, inputs, is_pre=True) + codes
+                if post_hook:
+                    codes = codes + self._emit_segment_hook_code(
+                        post_hook, hook_meta, inputs, is_pre=False,
+                        outputs_str=outputs if len(node_outputs) <= 1 else f'({outputs})'
+                    )
             else:
                 # get gradient computation arguments
                 input_tensors, output_tensors, output_grads, input_grads = \
@@ -310,13 +346,26 @@ class ScheduleCodeGen(FuncEmission):
                 for idx, tensor in enumerate(output_grads):
                     if isinstance(tensor, IRSubTensor) and tensor.is_loss():
                         output_grads[idx] = None
+
+                input_grads_str = self.return_name(input_grads)
+                input_tensors_str = self.tuple_name(input_tensors, skip_attr=True, prefix_attr='model.')
+                output_tensors_str = self.tuple_name(output_tensors, skip_attr=True, prefix_attr='model.')
+                output_grads_str = self.tuple_name(output_grads, skip_attr=True, prefix_attr='model.')
                 codes = [bsign.format(
-                    name = f"'{self.node_name(unwrap_node.mirror)}'",
-                    input_grads = self.return_name(input_grads),
-                    input_tensors = self.tuple_name(input_tensors, skip_attr=True, prefix_attr='model.'),
-                    output_tensors = self.tuple_name(output_tensors, skip_attr=True, prefix_attr='model.'),
-                    output_grads = self.tuple_name(output_grads, skip_attr=True, prefix_attr='model.')
+                    name = f"'{self.node_name(unwrap_node.mirror)}'", # always use name of fw segment
+                    input_grads = input_grads_str,
+                    input_tensors = input_tensors_str,
+                    output_tensors = output_tensors_str,
+                    output_grads = output_grads_str
                 )]
+
+                bwd_input_str = f'({input_tensors_str}, {output_tensors_str}, {output_grads_str})'
+                bwd_output_str = input_grads_str if len(input_grads) <= 1 else f'({input_grads_str})'
+                if pre_hook:
+                    codes = self._emit_segment_hook_code(pre_hook, hook_meta, bwd_input_str, is_pre=True) + codes
+                if post_hook:
+                    codes = codes + self._emit_segment_hook_code(post_hook, hook_meta, bwd_input_str, is_pre=False, outputs_str=bwd_output_str)
+
                 """
                 In the end2end mode, although the graph's output may contain tensors that requires grad,
                 like the loss tensor, the backward pass has been done by the nnscaler runtime by calling
