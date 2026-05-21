@@ -21,6 +21,7 @@ Dense layers use 2 ScheduleNodes (attn, ffn) both on COMP stream.
 
 import logging
 import os
+import time
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -37,6 +38,7 @@ _logger = logging.getLogger(__name__)
 _COMP_STREAM = None   # computation stream (non-default)
 _COMM_STREAM = None   # communication stream (non-default)
 _SCHEDULER_TIMING_EVENTS = []
+_MANUAL_SYNC_TIMING_STATS = []
 
 
 def _env_flag(*names: str) -> bool:
@@ -60,15 +62,16 @@ def _scheduler_timing_start(label: str):
     start_event = torch.cuda.Event(enable_timing=True)
     end_event = torch.cuda.Event(enable_timing=True)
     start_event.record()
-    return label, start_event, end_event
+    return label, start_event, end_event, time.perf_counter()
 
 
 def _scheduler_timing_end(record) -> None:
     if record is None:
         return
-    label, start_event, end_event = record
+    label, start_event, end_event, cpu_start = record
+    cpu_elapsed_s = time.perf_counter() - cpu_start
     end_event.record()
-    _SCHEDULER_TIMING_EVENTS.append((label, start_event, end_event))
+    _SCHEDULER_TIMING_EVENTS.append((label, start_event, end_event, cpu_elapsed_s))
 
 
 def get_and_clear_scheduler_timing_stats(max_entries: int = 200):
@@ -77,15 +80,76 @@ def get_and_clear_scheduler_timing_stats(max_entries: int = 200):
         return None
     torch.cuda.synchronize()
     stats = {}
-    for label, start_event, end_event in _SCHEDULER_TIMING_EVENTS:
+    for label, start_event, end_event, cpu_elapsed_s in _SCHEDULER_TIMING_EVENTS:
         elapsed_s = start_event.elapsed_time(end_event) / 1000.0
-        stat = stats.setdefault(label, {'count': 0, 'sum_s': 0.0, 'max_s': 0.0})
+        stat = stats.setdefault(label, {
+            'count': 0,
+            'sum_s': 0.0,
+            'max_s': 0.0,
+            'cpu_sum_s': 0.0,
+            'cpu_max_s': 0.0,
+        })
         stat['count'] += 1
         stat['sum_s'] += elapsed_s
         stat['max_s'] = max(stat['max_s'], elapsed_s)
+        stat['cpu_sum_s'] += cpu_elapsed_s
+        stat['cpu_max_s'] = max(stat['cpu_max_s'], cpu_elapsed_s)
     _SCHEDULER_TIMING_EVENTS = []
     if max_entries and len(stats) > max_entries:
         stats = dict(sorted(stats.items(), key=lambda item: item[1]['sum_s'], reverse=True)[:max_entries])
+    return stats
+
+
+def _manual_sync_timing_enabled() -> bool:
+    return (
+        _env_flag('NNSCALER_MANUAL_SYNC_TIMING', 'LLM_TRAIN_MANUAL_SYNC_TIMING')
+        and _env_flag('_NNSCALER_MANUAL_SYNC_TIMING_ACTIVE')
+    )
+
+
+def _format_param_cls(param_cls):
+    if param_cls is None:
+        return 'none'
+    if not isinstance(param_cls, tuple):
+        param_cls = (param_cls,)
+    parts = []
+    for item in param_cls:
+        if hasattr(item, 'zero_param_level_sharding'):
+            parts.append(f'zpls={int(bool(item.zero_param_level_sharding))}')
+        else:
+            parts.append(str(item))
+    return '/'.join(parts)
+
+
+def _bucket_timing_meta(reducer_idx, bucket_idx, bucket, original_async):
+    grad_buffer = getattr(bucket, '_contiguous_grads', None)
+    elem_size = grad_buffer.element_size() if grad_buffer is not None else 0
+    buffer_numel = grad_buffer.numel() if grad_buffer is not None else 0
+    return {
+        'reducer': reducer_idx,
+        'bucket': bucket_idx,
+        'param_cls': _format_param_cls(getattr(bucket, '_param_cls', None)),
+        'params': len(getattr(bucket, '_params', ())),
+        'numel': int(getattr(bucket, '_numel', 0)),
+        'aligned_numel': int(getattr(bucket, '_aligned_numel', 0)),
+        'buffer_numel': int(buffer_numel),
+        'buffer_mb': buffer_numel * elem_size / 1024 / 1024,
+        'zero': int(getattr(bucket, '_zero', 0)),
+        'zero_group_size': int(getattr(bucket, '_zgroup_sz', 0)),
+        'world_size': int(getattr(bucket, '_wsz', 0)),
+        'zero_reduce_scatter': bool(getattr(bucket, '_zero_use_reduce_scatter', False)),
+        'original_async': bool(original_async),
+    }
+
+
+def get_and_clear_manual_sync_timing_stats(max_entries: int = 200):
+    global _MANUAL_SYNC_TIMING_STATS
+    if not _MANUAL_SYNC_TIMING_STATS:
+        return None
+    stats = _MANUAL_SYNC_TIMING_STATS
+    _MANUAL_SYNC_TIMING_STATS = []
+    if max_entries and len(stats) > max_entries:
+        stats = sorted(stats, key=lambda item: item['elapsed_s'], reverse=True)[:max_entries]
     return stats
 
 
@@ -167,13 +231,21 @@ def manual_sync_grads(parallel_module):
         _logger.warning("No _reducers found on parallel module, skipping manual sync")
         return
 
-    for reducer in pm._reducers:
-        for bucket in reducer._buckets:
+    timing_enabled = _manual_sync_timing_enabled()
+
+    for reducer_idx, reducer in enumerate(pm._reducers):
+        for bucket_idx, bucket in enumerate(reducer._buckets):
             old_async = bucket._async
             bucket._async = False
+            start = time.perf_counter() if timing_enabled else None
             try:
                 bucket.sync_grads()
             finally:
+                if timing_enabled:
+                    elapsed_s = time.perf_counter() - start
+                    stat = _bucket_timing_meta(reducer_idx, bucket_idx, bucket, old_async)
+                    stat['elapsed_s'] = elapsed_s
+                    _MANUAL_SYNC_TIMING_STATS.append(stat)
                 bucket._async = old_async
             bucket.reset()
 

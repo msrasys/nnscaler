@@ -9,4 +9,5 @@ from .engine import (
     get_comm_stream,
     manual_sync_grads,
     get_and_clear_scheduler_timing_stats,
+    get_and_clear_manual_sync_timing_stats,
 )
