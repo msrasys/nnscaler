@@ -274,7 +274,6 @@ class Bucket:
         self._contiguous_params = param_buffer
         self._contiguous_grads = grad_buffer
         assert grad_buffer.size() == param_buffer.size()
-        assert grad_buffer.size(0) % self._wsz == 0, "internal error: buffer size not chunkable"
         # the parameter exposed for optimizer
         self._param_for_optimizer: torch.nn.Parameter = None
         # total number of parameters
@@ -288,6 +287,9 @@ class Bucket:
         self._zero_subgroup = self._group if zero_subgroup is None else zero_subgroup
         self._zgroup_sz: int = torch.distributed.get_world_size(group=self._zero_subgroup)
         self._zero_crossgroup = zero_crossgroup
+        # ZeRO-1 optimizer shards are partitioned within the ZeRO subgroup, not the full reducer group.
+        opt_num_chunks = self._zgroup_sz if self._zero == 1 else 1
+        assert grad_buffer.size(0) % opt_num_chunks == 0, "internal error: buffer size not chunkable"
 
         # pre and post hooks for gradient synchronization
         self._pre_hooks: List[Callable] = []

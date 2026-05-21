@@ -17,6 +17,7 @@ from nnscaler.graph import IRGraph
 from nnscaler.ir.operator import IRFwOperation
 from nnscaler.flags import CompileFlag
 from nnscaler.runtime.adapter.reducer import Reducer
+from nnscaler.runtime.device import DeviceGroup
 from ..launch_torchrun import torchrun
 from ..utils import catch_log, init_parameter, assert_parity, mock_reducer_env
 
@@ -264,3 +265,46 @@ def test_reducer_build_zero_param_level_sharding_waste_warning():
         reducer.build_buckets()
         logs = log_stream.getvalue()
         assert "which may cause memory waste" in logs
+
+
+@mock_reducer_env(0, 16)
+def test_reducer_build_zero_param_level_sharding_zero_ngroups_chunk_by_zero_subgroup(monkeypatch):
+    class FakeGroup:
+        def __init__(self, rank, world_size):
+            self.rank = rank
+            self.world_size = world_size
+
+    device_group = DeviceGroup()
+    device_group.groups[device_group.bitmap([0, 1])] = FakeGroup(0, 2)
+    device_group.groups[device_group.bitmap([0, 2, 4, 6, 8, 10, 12, 14])] = FakeGroup(0, 8)
+
+    orig_get_world_size = torch.distributed.get_world_size
+    orig_get_rank = torch.distributed.get_rank
+
+    def get_world_size(group=None):
+        if isinstance(group, FakeGroup):
+            return group.world_size
+        return orig_get_world_size(group=group)
+
+    def get_rank(group=None):
+        if isinstance(group, FakeGroup):
+            return group.rank
+        return orig_get_rank(group=group)
+
+    monkeypatch.setattr(torch.distributed, "get_world_size", get_world_size)
+    monkeypatch.setattr(torch.distributed, "get_rank", get_rank)
+
+    reducer = Reducer(
+        list(range(16)),
+        max_bucket_size_bytes=128,
+        zero=1,
+        zero_ngroups=8,
+        zero_param_level_sharding=True,
+    )
+    _add_scalar_params(reducer, 2)
+
+    reducer.build_buckets()
+
+    buckets = list(reversed(reducer.buckets))
+    assert buckets[0]._contiguous_grads.numel() == 8
+    assert buckets[0]._flatten_param_info.opt_num_chunks == 2
