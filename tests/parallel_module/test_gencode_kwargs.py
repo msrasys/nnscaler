@@ -187,3 +187,44 @@ def test_dictargs(tmp_path):
     # def _forward_impl(self, x, kwargs):
     #     add_3_36 = self.segment52(x, kwargs)
     #     return add_3_36
+
+
+@nnscaler.register_op('*, * -> *', name='kw_implicit_operator')
+def kw_implicit_operator(x: torch.Tensor, y: torch.Tensor, a, b ,c) -> torch.Tensor:
+    return x + y
+
+
+class ImplicitKwModule(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.scale = torch.nn.Parameter(torch.randn(4, 4))
+
+    def forward(self, x):
+        # even 3/4/5 are passed as args, not kwargs,
+        # in generate code we still treat them as kwargs
+        # and pass them to operator
+        # because they are not listed in the annotation of the operator
+        return kw_implicit_operator(x, self.scale, 3, 4, 5)
+
+
+@replace_all_device_with('cpu')
+def test_implicit_kw_args(tmp_path):
+    m = ImplicitKwModule()
+    m.train()
+    parallelize(
+        m,
+        {'x': torch.randn(4, 4)},
+        'dp',
+        ComputeConfig(1, 1, constant_folding=False),
+        gen_savedir=tmp_path,
+        load_module=False,
+        reuse='override',
+    )
+    assert _gencode_contains(tmp_path, ImplicitKwModule, 0,
+        r'tests.parallel_module.test_gencode_kwargs.kw_implicit_operator\(x_\d+, self.scale_\d+, a=3, b=4, c=5\)')
+    # code looks like:
+    # def segment14(self, x_9):
+    #     # File "/data/weijiangxu/nnscaler/tests/parallel_module/test_gencode_kwargs.py", line 203, in forward,  return kw_implicit_operator(x, self.scale, 3, 4, 5)
+    #     kw_implicit_operator_10 = tests.parallel_module.test_gencode_kwargs.kw_implicit_operator(x_9, self.scale_11, a=3, b=4, c=5)
+    #     del x_9
+    #     return kw_implicit_operator_10
