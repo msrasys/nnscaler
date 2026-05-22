@@ -146,8 +146,18 @@ def get_and_clear_manual_sync_timing_stats(max_entries: int = 200):
     global _MANUAL_SYNC_TIMING_STATS
     if not _MANUAL_SYNC_TIMING_STATS:
         return None
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
     stats = _MANUAL_SYNC_TIMING_STATS
     _MANUAL_SYNC_TIMING_STATS = []
+    for stat in stats:
+        start_event = stat.pop('_start_event', None)
+        end_event = stat.pop('_end_event', None)
+        if start_event is not None and end_event is not None:
+            stat['gpu_elapsed_s'] = start_event.elapsed_time(end_event) / 1000.0
+            stat['elapsed_s'] = stat['gpu_elapsed_s']
+        else:
+            stat['gpu_elapsed_s'] = 0.0
     if max_entries and len(stats) > max_entries:
         stats = sorted(stats, key=lambda item: item['elapsed_s'], reverse=True)[:max_entries]
     return stats
@@ -237,14 +247,26 @@ def manual_sync_grads(parallel_module):
         for bucket_idx, bucket in enumerate(reducer._buckets):
             old_async = bucket._async
             bucket._async = False
-            start = time.perf_counter() if timing_enabled else None
+            cpu_start = time.perf_counter() if timing_enabled else None
+            start_event = None
+            end_event = None
+            if timing_enabled and torch.cuda.is_available():
+                start_event = torch.cuda.Event(enable_timing=True)
+                end_event = torch.cuda.Event(enable_timing=True)
+                start_event.record()
             try:
                 bucket.sync_grads()
             finally:
                 if timing_enabled:
-                    elapsed_s = time.perf_counter() - start
+                    cpu_elapsed_s = time.perf_counter() - cpu_start
+                    if end_event is not None:
+                        end_event.record()
                     stat = _bucket_timing_meta(reducer_idx, bucket_idx, bucket, old_async)
-                    stat['elapsed_s'] = elapsed_s
+                    stat['cpu_elapsed_s'] = cpu_elapsed_s
+                    stat['gpu_elapsed_s'] = 0.0
+                    stat['elapsed_s'] = cpu_elapsed_s
+                    stat['_start_event'] = start_event
+                    stat['_end_event'] = end_event
                     _MANUAL_SYNC_TIMING_STATS.append(stat)
                 bucket._async = old_async
             bucket.reset()
