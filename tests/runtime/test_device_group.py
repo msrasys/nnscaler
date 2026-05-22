@@ -31,6 +31,7 @@ def _barrier_worker():
     finally:
         uninit()
 
+
 @pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.device_count() < 2, reason='lack of gpu devices')
 def test_barrier_warning():
     launch_torchrun(2, _barrier_worker)
