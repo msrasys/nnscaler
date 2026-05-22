@@ -127,6 +127,47 @@ def manual_sync_grads(parallel_module):
             bucket.reset()
 
 
+def manual_wait_grads(parallel_module):
+    """Finalize reducer buckets after the final backward launches grad sync."""
+    pm = parallel_module
+    if hasattr(pm, 'backbone'):
+        pm = pm.backbone
+    if not hasattr(pm, '_reducers'):
+        _logger.warning("No _reducers found on parallel module, skipping manual wait")
+        return
+
+    for reducer in pm._reducers:
+        for bucket in reducer._buckets:
+            bucket.sync_grads()
+            bucket.reset()
+
+    if hasattr(pm, '_sync_grad_required'):
+        pm._sync_grad_required = False
+
+
+def _iter_reducer_buckets(parallel_module):
+    pm = parallel_module
+    if hasattr(pm, 'backbone'):
+        pm = pm.backbone
+    if not hasattr(pm, '_reducers'):
+        return
+    for reducer in pm._reducers:
+        for bucket in reducer._buckets:
+            yield bucket
+
+
+def _begin_record_async_hook_counts(parallel_module):
+    for bucket in _iter_reducer_buckets(parallel_module):
+        if hasattr(bucket, 'begin_record_async_hook_counts'):
+            bucket.begin_record_async_hook_counts()
+
+
+def _end_record_async_hook_counts(parallel_module):
+    for bucket in _iter_reducer_buckets(parallel_module):
+        if hasattr(bucket, 'end_record_async_hook_counts'):
+            bucket.end_record_async_hook_counts()
+
+
 def _kernel_make_viewless_tensor(tensor, requires_grad):
     """Create a viewless tensor sharing the same data, matching Megatron."""
     out = torch.empty(
@@ -628,6 +669,9 @@ class MergedScheduler:
         for mb_i in range(num_mbs - 1):
             fwd_sample = samples[mb_i + 1]
             fwd_event = events[mb_i + 1]
+            record_async_hook_counts = (mb_i == 0)
+            if record_async_hook_counts:
+                _begin_record_async_hook_counts(self.parallel_module)
 
             _logger.debug(f"[MERGED] bwd(mb{mb_i}) + fwd(mb{mb_i+1})")
 
@@ -746,6 +790,8 @@ class MergedScheduler:
             # Propagate gradient through embedding graph to tok_embed weight
             with nnscaler.sync_grad_when(False):
                 _embed_h_list[mb_i].backward(grad_h)
+            if record_async_hook_counts:
+                _end_record_async_hook_counts(self.parallel_module)
 
             # Sync COMM→COMP: last fwd node may be on COMM (MoE combine),
             # but loss_node runs on COMP with a fresh event.
@@ -765,7 +811,7 @@ class MergedScheduler:
             del fwd_lc_list
 
         _logger.debug(f"Cooldown: backward mb{num_mbs-1}")
-        with nnscaler.sync_grad_when(False):
+        with nnscaler.sync_grad_when(True):
             with torch.cuda.stream(get_comp_stream()):
                 loss_grad = torch.ones_like(prev_loss_node.get_output())
             grad_h = prev_loss_node.backward(loss_grad)

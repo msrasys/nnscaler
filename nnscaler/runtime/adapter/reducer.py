@@ -266,6 +266,9 @@ class Bucket:
         self._wsz: int = torch.distributed.get_world_size(group=self._group)
         self._async_param_cnt: int = 0  # flag for triggering async communication
         self._async_handle = None  # asynchrounous communication handler
+        self._async_expected_hook_counts = None
+        self._async_seen_hook_counts = None
+        self._async_record_hook_counts = None
         self._hooks: List[Tuple[Any, RemovableHandle]] = []
 
         self._async: bool = async_op
@@ -445,11 +448,26 @@ class Bucket:
                 # let's add it for safety
                 self._reducer.postevict_param(param)
 
+            if self._async_record_hook_counts is not None:
+                self._async_record_hook_counts[param] = \
+                    self._async_record_hook_counts.get(param, 0) + 1
+
             if RuntimeFlag.skip_reducer: return
-            self._async_param_cnt += 1
 
             # perform all-reduce
             if self._async:
+                if self._async_expected_hook_counts is not None:
+                    expected = self._async_expected_hook_counts.get(param, 1)
+                    seen = self._async_seen_hook_counts.get(param, 0) + 1
+                    self._async_seen_hook_counts[param] = seen
+                    if seen < expected:
+                        return
+                    if seen > expected:
+                        raise RuntimeError(
+                            "Detected more async reducer hook calls than recorded "
+                            "for a parameter in split backward.")
+
+                self._async_param_cnt += 1
                 if self._async_param_cnt > len(self._params):
                     raise RuntimeError(
                         "Detected gradient accumulation with asynchronous Reducer. "
@@ -624,6 +642,24 @@ class Bucket:
         """Reset status."""
         self._async_param_cnt = 0
         self._async_handle = None
+        if self._async_seen_hook_counts is not None:
+            self._async_seen_hook_counts = {}
+
+    def begin_record_async_hook_counts(self):
+        """Record per-parameter hook multiplicity for split backward."""
+        if not self._async:
+            return
+        self._async_expected_hook_counts = None
+        self._async_seen_hook_counts = None
+        self._async_record_hook_counts = {}
+
+    def end_record_async_hook_counts(self):
+        """Use recorded hook multiplicity as async reducer readiness."""
+        if not self._async or self._async_record_hook_counts is None:
+            return
+        self._async_expected_hook_counts = dict(self._async_record_hook_counts)
+        self._async_seen_hook_counts = {}
+        self._async_record_hook_counts = None
 
     def sleep(self):
         """
