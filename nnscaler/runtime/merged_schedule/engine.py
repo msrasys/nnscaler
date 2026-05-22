@@ -499,18 +499,22 @@ class ScheduleNode:
 
     @contextmanager
     def _stream_ctx(self, name=None):
-        if not self._skip_event:
-            self.event.wait(self.stream)
-        if name:
-            torch.cuda.nvtx.range_push(name)
-        try:
-            with torch.cuda.stream(self.stream):
-                yield
-        finally:
-            if name:
-                torch.cuda.nvtx.range_pop()
+        stream_device = getattr(self.stream, 'device', None)
+        if stream_device is None:
+            stream_device = torch.device('cuda', self.stream.device_index)
+        with torch.cuda.device(stream_device):
             if not self._skip_event:
-                self.event.record(self.stream)
+                self.event.wait(self.stream)
+            if name:
+                torch.cuda.nvtx.range_push(name)
+            try:
+                with torch.cuda.stream(self.stream):
+                    yield
+            finally:
+                if not self._skip_event:
+                    self.event.record(self.stream)
+                if name:
+                    torch.cuda.nvtx.range_pop()
 
     def _release(self, extra_refs=()):
         _release_owned_storage_after_last_use(

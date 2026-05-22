@@ -92,7 +92,7 @@ class _DeviceGroup:
         Barrier synchronization with very long timeout
         """
         # torch.distributed.barrier(group=self.barrier_gloo_group)
-        torch.distributed.barrier()
+        torch.distributed.barrier(device_ids=[self.local_rank])
 
     def get_stream(self, name: str) -> torch.cuda.Stream:
         """
