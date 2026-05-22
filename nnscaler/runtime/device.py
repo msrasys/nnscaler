@@ -10,6 +10,7 @@ import torch
 import os
 import logging
 import datetime
+import inspect
 
 from nnscaler.flags import CompileFlag
 from nnscaler.utils import is_running_distributed
@@ -28,10 +29,18 @@ class _DeviceGroup:
             self.local_rank = 0
             self.node_rank = 0
         else:
+            # Bind the process to its local CUDA device before NCCL initialization.
+            # Otherwise every rank may create an initial CUDA/NCCL context on cuda:0.
+            self.local_world_size = int(os.environ.get('LOCAL_WORLD_SIZE'))
+            self.local_rank = int(os.environ.get('LOCAL_RANK'))
+            self.node_rank = int(os.environ.get('GROUP_RANK'))
+            torch.cuda.set_device(self.local_rank)
+
             if not torch.distributed.is_initialized():
-                torch.distributed.init_process_group(
-                    backend='nccl', timeout=_LARGE_TIMEOUT
-                )
+                init_kwargs = dict(backend='nccl', timeout=_LARGE_TIMEOUT)
+                if 'device_id' in inspect.signature(torch.distributed.init_process_group).parameters:
+                    init_kwargs['device_id'] = torch.device(f'cuda:{self.local_rank}')
+                torch.distributed.init_process_group(**init_kwargs)
                 self._is_pg_initer = True
 
             # disable it for now due to connection refused error when nnodes > 1
@@ -45,10 +54,6 @@ class _DeviceGroup:
 
             self.rank = torch.distributed.get_rank()
             self.world_size = torch.distributed.get_world_size()
-            # assume each node has the same device number
-            self.local_world_size = int(os.environ.get('LOCAL_WORLD_SIZE'))
-            self.local_rank = int(os.environ.get('LOCAL_RANK'))
-            self.node_rank = int(os.environ.get('GROUP_RANK'))
 
         torch.cuda.set_device(self.local_rank)
         self.groups: Dict = { '1'*self.world_size: None }
