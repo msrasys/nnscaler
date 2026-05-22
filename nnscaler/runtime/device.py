@@ -30,7 +30,8 @@ class _DeviceGroup:
         else:
             if not torch.distributed.is_initialized():
                 torch.distributed.init_process_group(
-                    backend='nccl', timeout=_LARGE_TIMEOUT
+                    backend='nccl', timeout=_LARGE_TIMEOUT,
+                    device_id=torch.device('cuda', int(os.environ.get('LOCAL_RANK'))),
                 )
                 self._is_pg_initer = True
 
