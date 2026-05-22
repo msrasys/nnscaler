@@ -190,7 +190,7 @@ def test_dictargs(tmp_path):
 
 
 @nnscaler.register_op('*, * -> *', name='kw_implicit_operator')
-def kw_implicit_operator(x: torch.Tensor, y: torch.Tensor, a, b ,c) -> torch.Tensor:
+def kw_implicit_operator(x: torch.Tensor, y: torch.Tensor, a, b ,c, d=10) -> torch.Tensor:
     return x + y
 
 
@@ -220,6 +220,9 @@ def test_implicit_kw_args(tmp_path):
         load_module=False,
         reuse='override',
     )
+    # d=10 is default value and not passed in, so it should not appear in the gencode
+    # a/b/c are passed in as args, but they are not listed in the annotation of the operator,
+    # so they should be treated as kwargs in the gencode
     assert _gencode_contains(tmp_path, ImplicitKwModule, 0,
         r'tests.parallel_module.test_gencode_kwargs.kw_implicit_operator\(x_\d+, self.scale_\d+, a=3, b=4, c=5\)')
     # code looks like:
