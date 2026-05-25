@@ -782,8 +782,8 @@ def fn(
     pp_size = cfg.pas_config.get('pipeline_size', nstages)
     nmicros = cfg.pas_config.get('pipeline_nmicros', None)
     scheduler = cfg.pas_config.get('pipeline_scheduler', '1f1b')
-    pp_multiref_replicated_param = \
-        cfg.pas_config.get('pipeline_multiref_replicated_param', True)
+    pp_multiref_replicated_params = \
+        cfg.pas_config.get('pipeline_multiref_replicated_params', True)
     tp_size = ngpus // pp_size
 
     if pp_enabled:
@@ -836,7 +836,7 @@ def fn(
         # 4. (2) and (3): if the param is shared across stages and is replicated in at least one stage.
         #    Note: the case when some is replicated and some is partitioned is handled by (1).
 
-        if len(splits) > 1 or (pp_multiref_replicated_param and len(stage_info) > 1 and find_replicated):
+        if len(splits) > 1 or (pp_multiref_replicated_params and len(stage_info) > 1 and find_replicated):
             _logger.info(f'add multiref for shared param {ftensor}')
             graph.multiref(ftensor, comment='shared param')
 
