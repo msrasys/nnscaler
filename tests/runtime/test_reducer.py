@@ -268,32 +268,8 @@ def test_reducer_build_zero_param_level_sharding_waste_warning():
 
 
 @mock_reducer_env(0, 16)
-def test_reducer_build_zero_param_level_sharding_zero_ngroups_chunk_by_zero_subgroup(monkeypatch):
-    class FakeGroup:
-        def __init__(self, rank, world_size):
-            self.rank = rank
-            self.world_size = world_size
-
-    device_group = DeviceGroup()
-    device_group.groups[device_group.bitmap([0, 1])] = FakeGroup(0, 2)
-    device_group.groups[device_group.bitmap([0, 2, 4, 6, 8, 10, 12, 14])] = FakeGroup(0, 8)
-
-    orig_get_world_size = torch.distributed.get_world_size
-    orig_get_rank = torch.distributed.get_rank
-
-    def get_world_size(group=None):
-        if isinstance(group, FakeGroup):
-            return group.world_size
-        return orig_get_world_size(group=group)
-
-    def get_rank(group=None):
-        if isinstance(group, FakeGroup):
-            return group.rank
-        return orig_get_rank(group=group)
-
-    monkeypatch.setattr(torch.distributed, "get_world_size", get_world_size)
-    monkeypatch.setattr(torch.distributed, "get_rank", get_rank)
-
+def test_reducer_build_zero_param_level_sharding_zero_ngroups_chunk_by_zero_subgroup():
+    DeviceGroup().get_group([0, 1])
     reducer = Reducer(
         list(range(16)),
         max_bucket_size_bytes=128,
