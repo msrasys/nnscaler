@@ -6,6 +6,7 @@ pytest unit_tests/runtime/test_reducer.py
 """
 import torch
 import logging
+from dataclasses import asdict
 from functools import partial
 
 import pytest
@@ -18,6 +19,13 @@ from nnscaler.ir.operator import IRFwOperation
 from nnscaler.flags import CompileFlag
 from nnscaler.runtime.adapter.reducer import Reducer
 from nnscaler.runtime.device import DeviceGroup
+from nnscaler.runtime.module import AttrMeta, ParallelModule
+from nnscaler.parallel import (
+    ComputeConfig,
+    ModuleParameterLocation,
+    OptimizerExtraState,
+    _get_optimizer_state_dict_info,
+)
 from ..launch_torchrun import torchrun
 from ..utils import catch_log, init_parameter, assert_parity, mock_reducer_env
 
@@ -253,6 +261,75 @@ def test_reducer_build_zero_param_level_sharding_allows_too_few_params_with_empt
         assert buckets[0]._flatten_param_info.opt_num_chunks == 8
         assert buckets[0]._flatten_param_info.opt_chunk_index == rank
         assert len(buckets[0]._flatten_param_info.get_embeded_params()) == expected_embedded_params
+
+
+def _make_scalar_fullmaps(num_ranks, num_params):
+    return [
+        {
+            f"p{i}": AttrMeta(
+                tid=i,
+                is_param=True,
+                orig_name=f"p{i}",
+                shape=(1,),
+                slicers=(slice(0, 1),),
+                val_chunks=1,
+                dtype=torch.float32,
+                sub_shape=(1,),
+            )
+            for i in range(num_params)
+        }
+        for _ in range(num_ranks)
+    ]
+
+
+def test_merge_opt_state_dicts_allows_missing_empty_zero_shard_state():
+    num_ranks = 8
+    num_params = 7
+    aligned_param_size = 4
+    bucket_size = aligned_param_size * num_ranks
+    chunk_size = aligned_param_size
+
+    fullmaps = _make_scalar_fullmaps(num_ranks, num_params)
+    model_idx2opt_idx = {
+        i: (0, i * aligned_param_size, i * aligned_param_size + 1, (1,))
+        for i in range(num_params)
+    }
+    opt_idx2ranks = {0: (list(range(num_ranks)), bucket_size)}
+    zero_idx_maps = [(model_idx2opt_idx, opt_idx2ranks, 1) for _ in range(num_ranks)]
+
+    optim_state_dicts = []
+    for rank in range(num_ranks):
+        state = {}
+        if rank < num_params:
+            bucket_state = torch.zeros(chunk_size, dtype=torch.float32)
+            bucket_state[0] = rank + 1
+            state[0] = {"momentum": bucket_state}
+        optim_state_dicts.append({"state": state, "param_groups": [{"params": [0]}]})
+
+    merged = ParallelModule.merge_opt_state_dicts(fullmaps, optim_state_dicts, zero_idx_maps)
+
+    assert list(merged["state"].keys()) == list(range(num_params))
+    for idx in range(num_params):
+        torch.testing.assert_close(merged["state"][idx]["momentum"], torch.tensor([idx + 1.0]))
+
+
+def test_optimizer_state_collection_allows_missing_empty_zero_shard_state():
+    compute_config = ComputeConfig(plan_ngpus=1, runtime_ngpus=1, use_zero=1)
+    extra_state = OptimizerExtraState(
+        rank=0,
+        name="Muon",
+        parallel_module_locs={"": ModuleParameterLocation(0, 1)},
+        parallel_module_configs={"": compute_config},
+    )
+    optimizer_state_dict = {
+        "state": {},
+        "param_groups": [{"params": [0]}],
+        ParallelModule.EXTRA_STATE_KEY: asdict(extra_state),
+    }
+
+    _, opt_state_dicts, _ = _get_optimizer_state_dict_info([optimizer_state_dict])
+
+    assert opt_state_dicts[""][0]["state"] == {}
 
 
 @mock_reducer_env(0, 8)
