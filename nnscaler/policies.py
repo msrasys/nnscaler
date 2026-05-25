@@ -717,6 +717,8 @@ def fn(
     pp_size = cfg.pas_config.get('pipeline_size', nstages)
     nmicros = cfg.pas_config.get('pipeline_nmicros', None)
     scheduler = cfg.pas_config.get('pipeline_scheduler', '1f1b')
+    pp_multiref_replicated_param = \
+        cfg.pas_config.get('pipeline_multiref_replicated_param', True)
     tp_size = ngpus // pp_size
 
     def stages_share_physical_pipeline_rank(stage_ids: Iterable[int]) -> bool:
@@ -776,7 +778,10 @@ def fn(
         #    Note: the case when some is replicated and some is partitioned is handled by (1).
 
         if len(splits) > 1 or (
-            len(stage_info) > 1 and find_replicated and not colocated_replicated_vpp_param
+            pp_multiref_replicated_param
+            and len(stage_info) > 1
+            and find_replicated
+            and not colocated_replicated_vpp_param
         ):
             _logger.info(f'add multiref for shared param {ftensor}')
             graph.multiref(ftensor, comment='shared param')
