@@ -17,6 +17,7 @@ from nnscaler.graph import IRGraph
 from nnscaler.ir.operator import IRFwOperation
 from nnscaler.flags import CompileFlag
 from nnscaler.runtime.adapter.reducer import Reducer
+from nnscaler.runtime.device import DeviceGroup
 from ..launch_torchrun import torchrun
 from ..utils import catch_log, init_parameter, assert_parity, mock_reducer_env
 
@@ -264,3 +265,22 @@ def test_reducer_build_zero_param_level_sharding_waste_warning():
         reducer.build_buckets()
         logs = log_stream.getvalue()
         assert "which may cause memory waste" in logs
+
+
+@mock_reducer_env(0, 16)
+def test_reducer_build_zero_param_level_sharding_zero_ngroups_chunk_by_zero_subgroup():
+    DeviceGroup().get_group([0, 1])
+    reducer = Reducer(
+        list(range(16)),
+        max_bucket_size_bytes=128,
+        zero=1,
+        zero_ngroups=8,
+        zero_param_level_sharding=True,
+    )
+    _add_scalar_params(reducer, 2)
+
+    reducer.build_buckets()
+
+    buckets = list(reversed(reducer.buckets))
+    assert buckets[0]._contiguous_grads.numel() == 8
+    assert buckets[0]._flatten_param_info.opt_num_chunks == 2
