@@ -885,7 +885,7 @@ def broadcast_mixed_data(
     Args:
         data (Optional[dict]): The data to be broadcasted.
             for non-src ranks, this must be None.
-        src_rank (int): The source rank to broadcast from. Default: 0.
+        src_rank (int): The global source rank to broadcast from. Default: 0.
         group (torch.distributed.ProcessGroup, optional): The process group to use for broadcasting.
             If None, the default process group will be used. Default: None.
         device (str or torch.device, optional): The device to use for receiving tensors on non-src ranks.
@@ -900,7 +900,7 @@ def broadcast_mixed_data(
     if isinstance(device, str):
         # need to compare device later, so convert to torch.device
         device = torch.device(device)
-    rank = torch.distributed.get_rank(group=group)
+    rank = torch.distributed.get_rank()
 
     # share the structure and tensor shapes
     if rank == src_rank:

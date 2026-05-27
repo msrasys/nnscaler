@@ -9,6 +9,8 @@ import pytest
 import torch
 
 from nnscaler.parallel import ComputeConfig, _prepare_namespace, parallelize, broadcast_weights
+from nnscaler.runtime.device import DeviceGroup
+from nnscaler.utils import broadcast_mixed_data
 
 from .common import init_distributed
 from ..launch_torchrun import launch_torchrun
@@ -142,3 +144,26 @@ def test_broadcast(tmp_path):
 @pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.device_count() < 4, reason='lack of gpu devices')
 def test_broadcast4(tmp_path):
     launch_torchrun(4, _gpu_worker, tmp_path)
+
+
+def _broadcast_mixed_data_nonzero_src_worker():
+    init_distributed()
+    rank = torch.distributed.get_rank()
+    group_ranks = [1, 2]
+    group = DeviceGroup().get_group(group_ranks)
+
+    if rank in group_ranks:
+        data = {
+            'rank': rank,
+            'payload': torch.tensor([rank, rank + 1], device='cpu'),
+        } if rank == group_ranks[0] else None
+        result = broadcast_mixed_data(data, src_rank=group_ranks[0], group=group, device='cpu')
+        assert result['rank'] == group_ranks[0]
+        assert torch.equal(result['payload'], torch.tensor([1, 2], device='cpu'))
+
+    torch.distributed.barrier()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.device_count() < 3, reason='lack of gpu devices')
+def test_broadcast_mixed_data_with_nonzero_src_rank():
+    launch_torchrun(3, _broadcast_mixed_data_nonzero_src_worker)
