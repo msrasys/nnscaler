@@ -135,7 +135,7 @@ class FlattenParamInfo:
                 Note these tensors must be in the same order as `self.get_embeded_params()`
                 or None for missing tensors.
             device: the device of the result flattened tensor,
-                if None, use the device of the first non-None tensor
+                if None, use the device of the embeded params
         """
         if tensors is None:
             raise ValueError("tensors should not be None")
