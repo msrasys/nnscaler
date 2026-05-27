@@ -235,7 +235,8 @@ def test_reducer_build_zero_param_level_sharding_keeps_param_classes_separate():
 
 
 @mock_reducer_env(0, 8)
-def test_reducer_build_zero_param_level_sharding_rejects_too_few_params():
+def test_reducer_build_zero_param_level_sharding_pads_too_few_params():
+    """When fewer params than zero_size, padding is added so that some ranks get empty shards."""
     reducer = Reducer(
         list(range(8)),
         max_bucket_size_bytes=128,
@@ -244,8 +245,86 @@ def test_reducer_build_zero_param_level_sharding_rejects_too_few_params():
     )
     _add_scalar_params(reducer, 7)
 
-    with pytest.raises(RuntimeError, match="Please disable ZeRO or disable parameter-level sharding or increase bucket size."):
+    from nnscaler.runtime.adapter.reducer import _logger
+    with catch_log(_logger) as log_stream:
         reducer.build_buckets()
+        logs = log_stream.getvalue()
+        assert "Padding will be added so that some ranks have empty shards" in logs
+
+    buckets = list(reversed(reducer.buckets))
+    assert len(buckets) == 1
+    assert len(buckets[0].params) == 7
+    # buffer should be max_group_size * zero_size = 4 * 8 = 32
+    # (each scalar param is aligned to 4 float32 = 16 bytes)
+    assert buckets[0]._contiguous_params.numel() == 4 * 8
+
+
+@mock_reducer_env(0, 8)
+def test_reducer_build_zero_param_level_sharding_pads_single_param():
+    """A single param with zero_param_level_sharding should pad to zero_size chunks."""
+    reducer = Reducer(
+        list(range(8)),
+        max_bucket_size_bytes=128,
+        zero=1,
+        zero_param_level_sharding=True,
+    )
+    _add_scalar_params(reducer, 1)
+
+    reducer.build_buckets()
+
+    buckets = list(reversed(reducer.buckets))
+    assert len(buckets) == 1
+    assert len(buckets[0].params) == 1
+    # buffer = max_group_size(4) * zero_size(8) = 32
+    assert buckets[0]._contiguous_params.numel() == 4 * 8
+
+
+@mock_reducer_env(0, 8)
+def test_reducer_build_zero_param_level_sharding_pads_with_classes():
+    """Two param classes each with fewer params than zero_size should each get their own padded bucket."""
+    reducer = Reducer(
+        list(range(8)),
+        max_bucket_size_bytes=128,
+        zero=1,
+        zero_param_level_sharding=True,
+    )
+    param_clss = {}
+    _add_scalar_params(reducer, 3, param_clss, 0)
+    _add_scalar_params(reducer, 5, param_clss, 1)
+
+    reducer.build_buckets(param_clss=param_clss)
+
+    buckets = list(reversed(reducer.buckets))
+    assert len(buckets) == 2
+    assert [len(b.params) for b in buckets] == [3, 5]
+    assert [b.param_cls[0] for b in buckets] == [0, 1]
+    # each bucket buffer = 4 * 8 = 32
+    assert buckets[0]._contiguous_params.numel() == 4 * 8
+    assert buckets[1]._contiguous_params.numel() == 4 * 8
+
+
+@mock_reducer_env(0, 4)
+def test_reducer_build_zero_param_level_sharding_pads_mixed_sizes():
+    """Params with different sizes, fewer than zero_size, should pad using max aligned size."""
+    reducer = Reducer(
+        list(range(4)),
+        max_bucket_size_bytes=1024,
+        zero=1,
+        zero_param_level_sharding=True,
+    )
+    # Add 2 params of different sizes: 1 float32 (aligned to 4) and 5 float32 (aligned to 8)
+    p1 = torch.nn.Parameter(torch.randn(1))
+    p2 = torch.nn.Parameter(torch.randn(5))
+    reducer.add_param(p1)
+    reducer.add_param(p2)
+
+    reducer.build_buckets()
+
+    buckets = list(reversed(reducer.buckets))
+    assert len(buckets) == 1
+    assert len(buckets[0].params) == 2
+    # max aligned size is 8 (from param of size 5), buffer = 8 * 4 = 32
+    assert buckets[0]._contiguous_params.numel() == 8 * 4
 
 
 @mock_reducer_env(0, 8)

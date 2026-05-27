@@ -137,13 +137,15 @@ class FlattenParamInfo:
             device: the device of the result flattened tensor,
                 if None, use the device of the first non-None tensor
         """
-        if tensors is None or len(tensors) == 0 or all(t is None for t in tensors):
-            raise ValueError("tensors should not be empty or all None")
+        if tensors is None:
+            raise ValueError("tensors should not be None")
 
-        non_none_tensor = first(tensors, lambda t: t is not None)
+        # self.params_info is never empty
+        first_param = first(self.params_info)
+        dtype = first_param.dtype
         if device is None:
-            device = non_none_tensor.device
-        flat_tensors = torch.zeros(self.opt_chunk_size, dtype=non_none_tensor.dtype, device=device, pin_memory=True)
+            device = first_param.device
+        flat_tensors = torch.zeros(self.opt_chunk_size, dtype=dtype, device=device, pin_memory=True)
 
         opt_start = self.opt_chunk_index * self.opt_chunk_size
         opt_end = (self.opt_chunk_index + 1) * self.opt_chunk_size
@@ -1045,26 +1047,24 @@ class Reducer:
         last_cls_buckets = {} # save the last bucket so far for each class
         for params, param_cls in zip(old_seq_buckets, old_seq_buckets_cls):
             last_cls_bucket = last_cls_buckets.get(param_cls, None)
-            if len(params) < _min_bucket_param_num(param_cls):
-                if last_cls_bucket is None:
-                    raise RuntimeError(
-                        f"the number of parameters({len(params)}) in the bucket is smaller than "
-                        f"the number of ranks({self._zero_size}) in the zero group. "
-                        f"ZeRO parameter-level sharding cannot be applied for this bucket. "
-                        f"Please disable ZeRO or disable "
-                        f"parameter-level sharding or increase bucket size."
-                    )
-                else:
+            if len(params) < _min_bucket_param_num(param_cls) and last_cls_bucket is not None:
+                _logger.warning(
+                    f"the number of parameters({len(params)}) in the bucket is smaller than "
+                    f"the number of ranks({self._zero_size}) in the zero group. "
+                    f"This bucket will be merged with the previous bucket of the same class to enable ZeRO parameter-level sharding, "
+                    f"which makes the byte size of the previous bucket larger than the maximum bucket size, "
+                    f"and violates the setting for bucket size limit. "
+                )
+                # merge with the previous bucket with the same class,
+                last_cls_bucket.extend(params)
+            else:
+                if len(params) < _min_bucket_param_num(param_cls):
+                    # allow through with padding: some zero ranks will have empty shards
                     _logger.warning(
                         f"the number of parameters({len(params)}) in the bucket is smaller than "
                         f"the number of ranks({self._zero_size}) in the zero group. "
-                        f"This bucket will be merged with the previous bucket of the same class to enable ZeRO parameter-level sharding, "
-                        f"which makes the byte size of the previous bucket larger than the maximum bucket size, "
-                        f"and violates the setting for bucket size limit. "
+                        f"Padding will be added so that some ranks have empty shards."
                     )
-                    # merge with the previous bucket with the same class,
-                    last_cls_bucket.extend(params)
-            else:
                 self.seq_buckets.append(params)
                 seq_buckets_cls.append(param_cls)
                 last_cls_buckets[param_cls] = params
@@ -1075,11 +1075,18 @@ class Reducer:
             self.starts.append(self.buffer_length)
             zero_param_level_sharding = param_cls[-1].zero_param_level_sharding if param_cls else self._zero_param_level_sharding
             param_sizes = [_aligned_nelement(p.nelement(), p.element_size(), self._align_size) for p in params]
-            if zero_param_level_sharding and len(params) >= self._zero_size:
+            if zero_param_level_sharding:
                 # TODO: set keep_order=False for less padding
                 # 1. async doesn't work well with keep_order=False
                 # 2. hard to write test cases.
-                groups, group_idx = split_array_min_max(param_sizes, self._zero_size, keep_order=True)
+                if len(params) >= self._zero_size:
+                    groups, group_idx = split_array_min_max(param_sizes, self._zero_size, keep_order=True)
+                else:
+                    # fewer params than ranks: assign each param to one rank, remaining ranks get empty shards
+                    groups = [[param_sizes[i]] for i in range(len(params))]
+                    groups += [[] for _ in range(self._zero_size - len(params))]
+                    group_idx = [[i] for i in range(len(params))]
+                    group_idx += [[] for _ in range(self._zero_size - len(params))]
                 max_group_size = max(sum(sizes) for sizes in groups)
                 new_param_order = []
                 for i in range(len(group_idx)):
@@ -1108,10 +1115,6 @@ class Reducer:
                         f"Consider increasing bucket size or disable zero parameter-level sharding for better memory efficiency."
                     )
             else:
-                assert not zero_param_level_sharding, \
-                    "zero parameter-level sharding is supposed to be applied "\
-                    "but the number of parameters in this bucket is smaller than "\
-                    "the number of ranks in zero subgroup."
                 chunk_offset = 0
                 for idx, ps in enumerate(param_sizes):
                     param = params[idx]
