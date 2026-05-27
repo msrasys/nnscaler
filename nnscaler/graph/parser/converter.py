@@ -103,7 +103,9 @@ def to_fx_graph(model: torch.nn.Module, dummy_input) -> torch.fx.GraphModule:
     cube_rt_funcs = [
         cube_rt_function.anchor,
         cube_rt_function.ifexpr,
-        cube_rt_function.fold_constant
+        cube_rt_function.fold_constant,
+        cube_rt_function.identity,
+        cube_rt_function.multiref,
     ]
     leaf_functions.update({
         func: LeafWrapInfo([Location(cube_rt_function, func.__name__)], True, None)

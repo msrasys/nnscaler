@@ -291,6 +291,7 @@ class Bucket:
         self._zgroup_sz: int = torch.distributed.get_world_size(group=self._zero_subgroup)
         self._zero_crossgroup = zero_crossgroup
         # ZeRO-1 optimizer shards are partitioned within the ZeRO subgroup, not the full reducer group.
+        # For ZeRO-3, the parameters are already partitioned in the reducer, so the full reducer group is used for allreduce.
         opt_num_chunks = self._zgroup_sz if self._zero == 1 else 1
         assert grad_buffer.size(0) % opt_num_chunks == 0, "internal error: buffer size not chunkable"
 
@@ -858,6 +859,8 @@ class Reducer:
 
         self._zero_ngroups = zero_ngroups
 
+        # when zero is disabled, zero_size has no meaning,
+        # but we set it to world size for simplicity of implementation
         self._zero_size = torch.distributed.get_world_size(group=self._zero_subgroup)
         if self._zero_size == 1:
             self._zero = 0  # disable zero when only one rank in subgroup
@@ -1161,7 +1164,7 @@ class Reducer:
                 # this pad is for zero, which needs numels in each Bucket can be divided by the number of ranks in this group * _align_size
                 # so that each chunck during zero can be divided by _align_size
                 align_nelements = self._align_size // params[0].element_size() * len(self._ranks)
-                padding = (align_nelements - numel % align_nelements) % len(self._ranks)
+                padding = (align_nelements - numel % align_nelements) % align_nelements
                 self.buffer_length += numel + padding
             self.stops.append(self.buffer_length)
 
