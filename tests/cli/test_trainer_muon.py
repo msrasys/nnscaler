@@ -296,7 +296,7 @@ def param_clss_fn3(param_name: str) -> tuple[int, int]:
 
 
 
-@pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.device_count() < 2, reason='lack of gpu devices')
+@pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.device_count() < 2 or not MuonAvailable, reason='lack of gpu devices')
 def test_trainer_muon_resume_correctness_zero1_param_config_less_params(tmp_path):
     config_file = 'trainer_args_muon_hybrid.yaml'
 
