@@ -607,7 +607,8 @@ class PPSharedModel(torch.nn.Module):
 
 
 @replace_all_device_with('cpu')
-def test_pp_shared_model(tmp_path):
+@pytest.mark.parametrize('pipeline_multiref_replicated_params', [False, True])
+def test_pp_shared_model(tmp_path, pipeline_multiref_replicated_params):
     m = PPSharedModel(4)
     m.train()
     parallelize(
@@ -618,6 +619,7 @@ def test_pp_shared_model(tmp_path):
             pas_config={
                 'pipeline_nmicros': 2,
                 'pipeline_size': 2,
+                'pipeline_multiref_replicated_params': pipeline_multiref_replicated_params,
             }
         ),
         gen_savedir=tmp_path,
@@ -628,7 +630,7 @@ def test_pp_shared_model(tmp_path):
     # and only it should register it as a parameter
     # (the other stage gets it as a non-parameter shared input)
     for rank in range(4):
-        if rank % 2 == 0:
+        if rank % 2 == 0 or not pipeline_multiref_replicated_params:
             assert _gencode_contains(tmp_path, PPSharedModel, rank, r'self.register_parameter\(')
         else:
             assert not _gencode_contains(tmp_path, PPSharedModel, rank, r'self.register_parameter\(')
