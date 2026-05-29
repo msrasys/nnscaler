@@ -407,10 +407,33 @@ class Trainer:
             else:
                 state_dict = self.checkpointer.load_for_rank(resume_from, self.rank)
                 if state_dict['train_args']['compute_config'] != asdict(self.train_args.compute_config):
-                    logger.warning(
-                        f"compute_config is changed, and loading checkpoint may fail. "
-                        f"If it fails, please try with merged checkpoint."
-                    )
+                    if self.train_args.checkpoint.resume_from.with_merged is None:
+                        logger.warning(
+                            "compute_config is changed. Auto switching to merged checkpoint loading "
+                            "because with_merged is not explicitly set."
+                        )
+                        # Fall back to merged loading to support topology changes
+                        # (e.g. changed plan_ngpus / zero_group_size) when world size is unchanged.
+                        torch.distributed.barrier()
+                        if self.local_rank == 0:
+                            logger.info(f"Merging checkpoint files from {resume_from}")
+                            state_dict = self._merge_checkpoint(list(rank_ckpt_files.values()), checkpointer=self.checkpointer)
+                        else:
+                            state_dict = None
+
+                        load_from_merged = True
+                        trimmed_broadcast_required = self.train_args.checkpoint.resume_from.save_memory
+                        if not self.train_args.checkpoint.resume_from.save_memory:
+                            logger.info("Broadcasting merged checkpoint to all ranks.")
+                            state_dict = self._broadcast_merged_state_dict(
+                                state_dict, src_rank=self.local_rank0, dst_ranks=self.local_ranks
+                            )
+                            logger.info("Broadcasted merged checkpoint to all ranks.")
+                    else:
+                        logger.warning(
+                            f"compute_config is changed, and loading checkpoint may fail. "
+                            f"If it fails, please try with merged checkpoint."
+                        )
 
         if trimmed_broadcast_required:
             logger.info("Broadcasting trimmed checkpoint to all ranks.")
