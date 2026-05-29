@@ -16,6 +16,8 @@ import time
 
 import torch
 import torch.distributed
+import torch.cuda.profiler
+import os
 from torch.utils.data import DataLoader
 import psutil
 
@@ -1054,6 +1056,14 @@ class Trainer:
                 self.lr_scheduler.step()
 
             self.train_status.finished_train_steps += 1
+            _nsys_start = int(os.environ.get('NSYS_START_STEP', '0') or 0)
+            _nsys_stop = int(os.environ.get('NSYS_STOP_STEP', '0') or 0)
+            if _nsys_start > 0 and self.train_status.finished_train_steps == _nsys_start:
+                torch.cuda.synchronize()
+                torch.cuda.profiler.start()
+            if _nsys_stop > 0 and self.train_status.finished_train_steps == _nsys_stop:
+                torch.cuda.synchronize()
+                torch.cuda.profiler.stop()
             self._log_mem_stats(tag='train')
             step_metrics = {k:v for k, v in asdict(step_stat).items() if v is not None}
             step_metrics['train_wall'] = time.perf_counter() - step_start_at
