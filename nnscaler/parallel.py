@@ -1948,13 +1948,11 @@ def _get_optimizer_state_dict_info(
             if opt_extra_state.rank < opt_dedup_group_size:
                 for i in range(loc.offset, loc.offset + loc.count):
                     # if the parameter is not used or requires_grad is False, it will not be in the state dict
+                    # for us, as we use a continous buffer, it will always have grad, so it will always be in the state dict
                     # the state for each parameters is inserted in Adam in a lazy way.
                     # see https://github.com/pytorch/pytorch/blob/dad1b765848c4f52501c4c60b1c3e6fbd3cc8837/torch/optim/adam.py#L103
-                    # Param-level ZeRO may also expose empty optimizer shards for small buckets.
-                    # Optimizers that unflatten bucket params, such as Muon, intentionally have no
-                    # state for those empty shards.
-                    if i in opt_state_dict['state']:
-                        opt_state_dicts[module_prefix][opt_extra_state.rank]['state'][i - loc.offset] = opt_state_dict['state'][i]
+                    assert i in opt_state_dict['state']
+                    opt_state_dicts[module_prefix][opt_extra_state.rank]['state'][i - loc.offset] = opt_state_dict['state'][i]
                 # TODO: inaccurate param_groups, for example, the 'params' in it is not right.
                 # we have this to make `ParallelModule.merge_partial_states` happy.
                 opt_state_dicts[module_prefix][opt_extra_state.rank]['param_groups'] = copy.deepcopy(opt_state_dict['param_groups'])

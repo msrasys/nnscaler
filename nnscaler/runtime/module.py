@@ -687,18 +687,14 @@ class CubeModule(torch.nn.Module):
 
         def _retrieve_param_opt_state(bucket_states, pstart, pend, pshape, bucket_size, zero_version):
             assert bucket_size % len(bucket_states) == 0
-            template_bucket_state = next((state for state in bucket_states if state), None)
-            if template_bucket_state is None:
-                return {}
-
-            opt_state_keys = list(template_bucket_state.keys())
-            if 'step' in template_bucket_state:
+            opt_state_keys = list(bucket_states[0].keys())
+            if 'step' in bucket_states[0]:
                 opt_state_keys.remove('step')
-            assert _check_state_size(opt_state_keys, template_bucket_state), f'the keys {opt_state_keys} have different shape'
+            assert _check_state_size(opt_state_keys, bucket_states[0]), f'the keys {opt_state_keys} have different shape'
 
             opt_states, opt_states_1d = {}, {}
             for key in opt_state_keys:
-                opt_states[key] = torch.zeros(pshape, dtype=template_bucket_state[key].dtype,
+                opt_states[key] = torch.zeros(pshape, dtype=bucket_states[0][key].dtype,
                                                 device='cpu', requires_grad=False)
                 opt_states_1d[key] = opt_states[key].view(-1)
 
@@ -707,25 +703,17 @@ class CubeModule(torch.nn.Module):
                 start_rank_id, start_offset = pstart // chunk_size, pstart % chunk_size
                 end_rank_id, end_offset = pend // chunk_size, pend % chunk_size
                 if start_rank_id == end_rank_id:
-                    if bucket_states[start_rank_id] is None:
-                        return {}
                     for key in opt_state_keys:
                         opt_states_1d[key][:] = bucket_states[start_rank_id][key][start_offset:end_offset]
                 else:
-                    if bucket_states[start_rank_id] is None:
-                        return {}
                     offset = chunk_size-start_offset
                     for key in opt_state_keys:
                         opt_states_1d[key][:offset] = bucket_states[start_rank_id][key][start_offset:]
                     for i in range(start_rank_id+1, end_rank_id):
-                        if bucket_states[i] is None:
-                            return {}
                         for key in opt_state_keys:
                             opt_states_1d[key][offset:offset+chunk_size] = bucket_states[i][key][:]
                         offset += chunk_size
                     if end_offset:  # skip if end_offset == 0, because it is a no-op
-                        if bucket_states[end_rank_id] is None:
-                            return {}
                         for key in opt_state_keys:
                             opt_states_1d[key][offset:] = bucket_states[end_rank_id][key][:end_offset]
             else:  # zero_version == 3
@@ -735,10 +723,6 @@ class CubeModule(torch.nn.Module):
                     fill_len = pend - pstart
                     param_numel = opt_states_1d[key].numel()
                     for bstate in bucket_states:
-                        if bstate is None:
-                            if fill_start < param_numel:
-                                return {}
-                            continue
                         if fill_start >= param_numel:
                             # from current implementation, code never goes here
                             # because we have used model_idx2opt_idx to filter out unnecessary ranks
@@ -759,9 +743,9 @@ class CubeModule(torch.nn.Module):
                             opt_states_1d[key][fill_start: fill_start + fill_len] = bstate[key][pstart: pstart+fill_len]
                         fill_start += fill_len
 
-            if 'step' in template_bucket_state:
+            if 'step' in bucket_states[0]:
                 # make sure all steps are different tensors (with same value)
-                opt_states['step'] = template_bucket_state['step'].cpu().clone()
+                opt_states['step'] = bucket_states[0]['step'].cpu().clone()
             return opt_states
 
         def _merge_opt_zero(param_shape, worker_idx, param_idx):
@@ -785,7 +769,7 @@ class CubeModule(torch.nn.Module):
                     assert param_shape == pshape, f'param shape {param_shape} vs pshape {pshape}'
                 ranks, bucket_size = opt_idx2ranks[opt_idx]
                 # parameters in reducer come first, so we can directly use opt_idx to index.
-                bucket_states = [optim_state_dicts[rank].get('state', {}).get(opt_idx) for rank in ranks]
+                bucket_states = [optim_state_dicts[rank]['state'][opt_idx] for rank in ranks]
                 return _retrieve_param_opt_state(
                     bucket_states,
                     pstart,
