@@ -22,8 +22,6 @@ class MuonMixin:
             params[0]['params'] = self._unflatten_params(params[0]['params'])
         else:
             params = self._unflatten_params(params)
-            if not params:
-                params = [{'params': []}]
 
         self.momentum_buffer_name = getattr(
             self, 'momentum_buffer_name', 'momentum_buffer'

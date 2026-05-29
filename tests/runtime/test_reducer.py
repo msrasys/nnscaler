@@ -234,25 +234,18 @@ def test_reducer_build_zero_param_level_sharding_keeps_param_classes_separate():
     assert [bucket.param_cls[0] for bucket in buckets] == [0, 1]
 
 
-@pytest.mark.parametrize("rank, expected_embedded_params", [(0, 1), (7, 0)])
-def test_reducer_build_zero_param_level_sharding_allows_too_few_params_with_empty_shards(rank, expected_embedded_params):
-    with mock_reducer_env(rank, 8):
-        reducer = Reducer(
-            list(range(8)),
-            max_bucket_size_bytes=128,
-            zero=1,
-            zero_param_level_sharding=True,
-        )
-        _add_scalar_params(reducer, 7)
+@mock_reducer_env(0, 8)
+def test_reducer_build_zero_param_level_sharding_rejects_too_few_params():
+    reducer = Reducer(
+        list(range(8)),
+        max_bucket_size_bytes=128,
+        zero=1,
+        zero_param_level_sharding=True,
+    )
+    _add_scalar_params(reducer, 7)
 
+    with pytest.raises(RuntimeError, match="Please disable ZeRO or disable parameter-level sharding or increase bucket size."):
         reducer.build_buckets()
-
-        buckets = list(reversed(reducer.buckets))
-        assert [len(bucket.params) for bucket in buckets] == [7]
-        assert buckets[0]._contiguous_grads.numel() == 32
-        assert buckets[0]._flatten_param_info.opt_num_chunks == 8
-        assert buckets[0]._flatten_param_info.opt_chunk_index == rank
-        assert len(buckets[0]._flatten_param_info.get_embeded_params()) == expected_embedded_params
 
 
 @mock_reducer_env(0, 8)
