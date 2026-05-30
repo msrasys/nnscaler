@@ -67,10 +67,21 @@ class AsyncCommHandler:
     def hold_send(self, tensor: torch.Tensor, work):
         self._send_holds.append((tensor, work))
 
-    def drain_sends(self):
-        for _, work in self._send_holds:
-            work.wait()
-        self._send_holds.clear()
+    def drain_sends(self, wait: bool = True):
+        if wait:
+            for _, work in self._send_holds:
+                work.wait()
+            self._send_holds.clear()
+            return
+
+        pending = []
+        for tensor, work in self._send_holds:
+            is_completed = getattr(work, 'is_completed', None)
+            if is_completed is not None and is_completed():
+                work.wait()
+            else:
+                pending.append((tensor, work))
+        self._send_holds = pending
 
     def clear(self):
         AsyncCommHandler.instance = AsyncCommHandler.__AsyncCommHandler()
@@ -214,7 +225,7 @@ class Executor:
         """
         Wait until the finish of synchornized tensors
         """
-        AsyncCommHandler().drain_sends()
+        AsyncCommHandler().drain_sends(wait=False)
         return [AsyncCommHandler().wait(t) if torch.is_tensor(t) else t for t in tensors]
 
 
