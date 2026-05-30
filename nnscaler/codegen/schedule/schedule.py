@@ -203,6 +203,7 @@ class ScheduleCodeGen(FuncEmission):
                             produced_tids.add(out.tid)
             # return code
             outputs = self.return_name_complex(self.execplan.outputs())
+            _append_code(fb, 'nnscaler.runtime.executor.AsyncCommHandler().drain_sends()')
             code = f'return {outputs}'
             _append_code(fb, code, force_flush=True)
 
@@ -245,6 +246,7 @@ class ScheduleCodeGen(FuncEmission):
                             infer_produced_tids.add(out.tid)
                 # return code
                 outputs = self.return_name_complex(self.execplan.outputs())
+                _append_code(fb, 'nnscaler.runtime.executor.AsyncCommHandler().drain_sends()')
                 code = f'return {outputs}'
                 _append_code(fb, code, force_flush=True)
             gencode += fb.code
