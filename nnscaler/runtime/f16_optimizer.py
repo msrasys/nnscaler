@@ -135,6 +135,7 @@ class MixedPrecisionF16OptimizerMixin(ScaleDelayedOptimizerMixin):
             raise RuntimeError('only support one param group')
 
         super().load_state_dict(state_dict)
+        self._sync_fp32_params_to_f16()
         self._fp32_params_loaded = True
 
     def _sync_f16_grads_to_fp32(self):
