@@ -9,6 +9,7 @@ import pytest
 import torch.distributed
 
 from nnscaler.cli.trainer import Trainer
+from nnscaler.runtime.f16_optimizer import MixedPrecisionAdamW
 from tests.parallel_module.common import assert_close
 from ..launch_torchrun import launch_torchrun
 
@@ -58,3 +59,41 @@ def trainer_worker(save_dir):
 @pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.device_count() < 2, reason='lack of gpu devices')
 def test_bf16(tmp_path):
     launch_torchrun(2, trainer_worker, tmp_path)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason='requires cuda')
+def test_load_state_dict_syncs_fp32_master_to_model_params():
+    device = torch.device('cuda')
+    params = [
+        torch.nn.Parameter(torch.tensor([1.0, 2.0, 3.0], device=device, dtype=torch.bfloat16)),
+        torch.nn.Parameter(torch.tensor([4.0, 5.0, 6.0], device=device, dtype=torch.float32)),
+    ]
+    opt = MixedPrecisionAdamW(params, lr=0.01)
+
+    for p in params:
+        p.grad = torch.ones_like(p)
+    opt.step()
+    opt.zero_grad()
+
+    state_dict = opt.state_dict()
+    expected_params = [
+        state_dict['state'][idx]['fp32_params'].detach().clone()
+        for idx in range(len(params))
+    ]
+
+    # Simulate a bad/incomplete model load: model params are stale, while the
+    # optimizer checkpoint still contains the correct fp32 master params.
+    restored_params = [
+        torch.nn.Parameter(torch.full_like(params[0], -11)),
+        torch.nn.Parameter(torch.full_like(params[1], -13)),
+    ]
+    restored_opt = MixedPrecisionAdamW(restored_params, lr=0.01)
+    restored_opt.load_state_dict(state_dict)
+
+    for param, expected in zip(restored_params, expected_params):
+        torch.testing.assert_close(
+            param.detach().float(),
+            expected.to(dtype=param.dtype).float(),
+            rtol=0,
+            atol=0,
+        )

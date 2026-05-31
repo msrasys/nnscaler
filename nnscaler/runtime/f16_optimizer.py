@@ -4,17 +4,41 @@
 # CREDITS: This implementation is inspired by Fairseq https://github.com/facebookresearch/fairseq/blob/main/fairseq/optim/fp16_optimizer.py
 
 import logging
+import os
 import types
 from typing import TYPE_CHECKING
 
 import torch
 
 from nnscaler.runtime.hybrid_optimizer import ScaleDelayedOptimizerMixin
+from nnscaler.runtime.utils import get_dparam_meta, get_fparam_meta
 
 if TYPE_CHECKING:
     from nnscaler.cli.trainer import Trainer
 
 logger = logging.getLogger(__name__)
+
+
+def _env_float(name: str, default: float) -> float:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    try:
+        return float(value)
+    except ValueError:
+        logger.warning("Invalid %s=%r, using default %s", name, value, default)
+        return default
+
+
+def _env_int(name: str, default: int) -> int:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    try:
+        return int(value)
+    except ValueError:
+        logger.warning("Invalid %s=%r, using default %s", name, value, default)
+        return default
 
 
 class MixedPrecisionF16OptimizerMixin(ScaleDelayedOptimizerMixin):
@@ -116,9 +140,11 @@ class MixedPrecisionF16OptimizerMixin(ScaleDelayedOptimizerMixin):
         """Load an optimizer state dict.
         This will also load the fp32_params from the state
         """
+        loaded_fp32_params = False
         if 'state' in state_dict and len(state_dict['state']) > 0 and 'fp32_params' in state_dict['state'][0]:
             logger.info('try to load fp32_params from state_dict in f16_optimizer')
             assert isinstance(self.fp32_params, list), f'fp32_params is not a list: {type(self.fp32_params)}'
+            loaded_fp32_params = True
             device = torch.cuda.current_device()
             for i, param in enumerate(self.fp32_params):
                 ckpt_param = state_dict['state'][i]['fp32_params']
@@ -135,7 +161,104 @@ class MixedPrecisionF16OptimizerMixin(ScaleDelayedOptimizerMixin):
             raise RuntimeError('only support one param group')
 
         super().load_state_dict(state_dict)
+        if loaded_fp32_params:
+            self._log_fp32_model_param_mismatches('f16_optimizer.load_state_dict.before_sync')
+        self._sync_fp32_params_to_f16()
         self._fp32_params_loaded = True
+
+    @staticmethod
+    def _max_abs_diff_to_model_dtype(model_param: torch.nn.Parameter, fp32_param: torch.nn.Parameter) -> float:
+        model_data = model_param.data.detach().view(-1)
+        fp32_data = fp32_param.data.detach().view(-1)
+        if model_data.numel() == 0:
+            return 0.0
+
+        chunk_numel = max(1, _env_int('NNSCALER_RESUME_PARAM_CHECK_CHUNK_NUMEL', 8 * 1024 * 1024))
+        max_diff = 0.0
+        with torch.no_grad():
+            for start in range(0, model_data.numel(), chunk_numel):
+                end = min(start + chunk_numel, model_data.numel())
+                model_chunk = model_data[start:end]
+                fp32_chunk = fp32_data[start:end]
+                if fp32_chunk.device != model_chunk.device:
+                    fp32_chunk = fp32_chunk.to(model_chunk.device)
+                if fp32_chunk.dtype != model_chunk.dtype:
+                    fp32_chunk = fp32_chunk.to(model_chunk.dtype)
+                diff = (model_chunk - fp32_chunk).float().abs().max().item()
+                max_diff = max(max_diff, diff)
+        return max_diff
+
+    @staticmethod
+    def _describe_param(index: int, param: torch.nn.Parameter) -> str:
+        meta = get_dparam_meta(param)
+        if meta is not None:
+            return f"idx={index} orig={meta.orig_name} local_shape={tuple(param.shape)} dtype={param.dtype}"
+
+        fmeta = get_fparam_meta(param)
+        if fmeta is not None:
+            names = []
+            try:
+                embedded_params = fmeta.get_embeded_params()
+            except Exception:
+                embedded_params = list(fmeta.params_info.keys())
+            for embedded_param in embedded_params[:4]:
+                embedded_meta = get_dparam_meta(embedded_param)
+                if embedded_meta is not None:
+                    names.append(embedded_meta.orig_name)
+                else:
+                    names.append(f"shape={tuple(embedded_param.shape)}")
+            suffix = "" if len(embedded_params) <= 4 else f", ... +{len(embedded_params) - 4}"
+            return (
+                f"idx={index} flattened local_shape={tuple(param.shape)} dtype={param.dtype} "
+                f"embedded=[{', '.join(names)}{suffix}]"
+            )
+
+        return f"idx={index} local_shape={tuple(param.shape)} dtype={param.dtype}"
+
+    def _log_fp32_model_param_mismatches(self, context: str) -> None:
+        threshold = _env_float('NNSCALER_RESUME_PARAM_CHECK_THRESHOLD', 0.0)
+        max_logs = max(0, _env_int('NNSCALER_RESUME_PARAM_CHECK_MAX_LOGS', 20))
+        mismatch_count = 0
+        checked_count = 0
+        max_diff = 0.0
+        max_diff_index = -1
+
+        for index, (model_param, fp32_param) in enumerate(zip(self.f16_params, self.fp32_params)):
+            if not model_param.requires_grad:
+                continue
+            checked_count += 1
+            diff = self._max_abs_diff_to_model_dtype(model_param, fp32_param)
+            if diff > max_diff:
+                max_diff = diff
+                max_diff_index = index
+            if diff <= threshold:
+                continue
+
+            mismatch_count += 1
+            if mismatch_count <= max_logs:
+                logger.warning(
+                    "[resume param mismatch] context=%s %s cast_diff=%s "
+                    "fp32_dtype=%s fp32_shape=%s",
+                    context,
+                    self._describe_param(index, model_param),
+                    diff,
+                    fp32_param.dtype,
+                    tuple(fp32_param.shape),
+                )
+
+        if mismatch_count:
+            logger.warning(
+                "[resume param mismatch summary] context=%s checked=%s mismatched=%s "
+                "threshold=%s max_diff=%s max_diff_index=%s logged=%s",
+                context, checked_count, mismatch_count, threshold, max_diff,
+                max_diff_index, min(mismatch_count, max_logs),
+            )
+        else:
+            logger.info(
+                "[resume param mismatch summary] context=%s checked=%s mismatched=0 "
+                "threshold=%s max_diff=%s max_diff_index=%s",
+                context, checked_count, threshold, max_diff, max_diff_index,
+            )
 
     def _sync_f16_grads_to_fp32(self):
         # copy FP16 grads to FP32
