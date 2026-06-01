@@ -1056,9 +1056,9 @@ class Trainer:
             self.train_status.finished_train_steps += 1
             self._log_mem_stats(tag='train')
             step_metrics = {k:v for k, v in asdict(step_stat).items() if v is not None}
-            step_metrics['train_wall'] = time.perf_counter() - step_start_at
             step_metrics['loss'] = step_metrics['train_loss']
             self.hook.before_log_train_metrics(self, step_metrics, aggregated_outputs)
+            step_metrics['train_wall'] = time.perf_counter() - step_start_at
             self.log_metrics(step_metrics, tag='train')
             if self.rank == 0:
                 data_iter.set_postfix(step_metrics)
