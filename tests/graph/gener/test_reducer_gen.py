@@ -11,6 +11,7 @@ from nnscaler.graph.parser.converter import convert_model
 from nnscaler.ir.operator import IRFwOperation
 from nnscaler.ir.tensor import IRFullTensor
 from nnscaler.ir.adapter import IRWeightReducer
+from nnscaler.flags import CompileFlag
 from nnscaler.parallel import ComputeConfig, _load_parallel_module_class, parallelize
 from ...utils import new_empty
 
@@ -80,11 +81,12 @@ def test_cross_segment_weight_reducer():
     assert len(reducers[0].inputs()) == 1
     assert reducers[0].input(0) == matmul1.input(1)
     assert reducers[0].device == (0, 1)
+    assert reducers[0].nreplicas == 1
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason='lack of gpu devices')
 def test_replicate_shared_param():
-
+    # default: reducer_replicated_weights=False, no reducers for replicated weights
     graph = build_graph()
     for node in graph.select(ntype=IRFwOperation):
         sn1, sn2 = graph.replicate(node, 2)
@@ -96,6 +98,29 @@ def test_replicate_shared_param():
 
     reducers = graph.select(ntype=IRWeightReducer)
     assert len(reducers) == 0
+
+    old_flag = CompileFlag.reducer_replicated_weights
+    try:
+        CompileFlag.reducer_replicated_weights = False
+        graph_copy = build_graph()
+        for node in graph_copy.select(ntype=IRFwOperation):
+            sn1, sn2 = graph_copy.replicate(node, 2)
+            graph_copy.assign(sn1, 0)
+            graph_copy.assign(sn2, 1)
+        graph_copy = IRAdapterGener.gen_weight(graph_copy)
+        reducers = graph_copy.select(ntype=IRWeightReducer)
+        assert len(reducers) == 0
+
+        # with reducer_replicated_weights=True, reducers are generated with nreplicas
+        CompileFlag.reducer_replicated_weights = True
+        graph = IRAdapterGener.gen_weight(graph)
+        reducers = graph.select(ntype=IRWeightReducer)
+        assert len(reducers) > 0
+        for reducer in reducers:
+            assert reducer.nreplicas == 2
+            assert reducer.device == (0, 1)
+    finally:
+        CompileFlag.reducer_replicated_weights = old_flag
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason='lack of gpu devices')

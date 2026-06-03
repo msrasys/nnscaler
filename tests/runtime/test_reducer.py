@@ -165,6 +165,25 @@ def test_reducer_build():
     assert buckets[4]._aligned_numel == 4
 
 
+@mock_reducer_env(0, 2)
+def test_reducer_nreplicas():
+    """Test that nreplicas is correctly passed to buckets and applied to gradients."""
+    # Test nreplicas defaults to 1
+    reducer = Reducer([0, 1])
+    assert reducer._nreplicas == 1
+
+    # Test nreplicas is set correctly
+    reducer = Reducer([0, 1], nreplicas=2)
+    assert reducer._nreplicas == 2
+
+    # Test nreplicas is passed to buckets
+    reducer = Reducer([0, 1], nreplicas=3)
+    reducer.add_param(torch.nn.Parameter(torch.randn(4)))
+    reducer.build_buckets()
+    for bucket in reducer.buckets:
+        assert bucket._nreplicas == 3
+
+
 def _add_scalar_params(reducer, num_params, param_clss=None, param_cls=None):
     # NOTE: all params will be aligned to 16 bytes.
     # So even 1 float32 param will take 16 bytes in the bucket.

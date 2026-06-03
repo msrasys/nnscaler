@@ -812,6 +812,7 @@ class ModuleCodeGen(FuncEmission):
         zero = CompileFlag.use_zero
         zero_ngroups = CompileFlag.zero_ngroups
         reduce_op = f"'{CompileFlag.reducer_op}'"
+        nreplicas = node.nreplicas
         # reducer init interface
         reducer_init = (
             "{reducer} = nnscaler.runtime.adapter.Reducer("
@@ -819,7 +820,8 @@ class ModuleCodeGen(FuncEmission):
             "async_op={async_op}, zero={zero}, max_bucket_size_bytes={max_nbytes}, "
             "zero_use_reduce_scatter={zero_use_reduce_scatter}, "
             "zero_param_level_sharding={zero_param_level_sharding}, "
-            "zero_ngroups={zero_ngroups})"
+            "zero_ngroups={zero_ngroups},"
+            "nreplicas={nreplicas})"
         )
         reducer_add = 'self.add_reducer({reducer})'
         add_param = '{reducer}.add_param({weight})'
@@ -832,7 +834,8 @@ class ModuleCodeGen(FuncEmission):
             reducer=reducer_name, ranks=ranks, reduce_op=reduce_op,
             async_op=async_op, zero=zero, max_nbytes=max_nbytes,
             zero_ngroups=zero_ngroups, zero_use_reduce_scatter=zero_use_reduce_scatter,
-            zero_param_level_sharding=zero_param_level_sharding
+            zero_param_level_sharding=zero_param_level_sharding,
+            nreplicas=nreplicas
         )
         self.model_init_statements.append(init_code)
         # sort weights by first used time (which is gradient all-reduce time in reverse order)

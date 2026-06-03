@@ -140,6 +140,10 @@ class ComputeConfig:
     # It is also effective for sync reducer.
     # None/0 means using the default value. (25MB for async, no limit for sync)
     reducer_bucket_cap_mb: Optional[float] = None
+    # whether to generate weight reducers for replicated weights.
+    # When True, replicated weights will also go through all-reduce (with nreplicas division),
+    # ensuring gradient consistency across ranks. Default is False.
+    reducer_replicated_weights: bool = False
 
     # PAS policy settings
     # you can also put any other settings that can affect code generation here.
@@ -404,6 +408,7 @@ def _compile_flags(compute_config: ComputeConfig):
         zero_use_reduce_scatter=compute_config.zero_use_reduce_scatter,
         trace_strategy=compute_config.trace_strategy,
         zero_param_level_sharding=compute_config.zero_param_level_sharding,
+        reducer_replicated_weights=compute_config.reducer_replicated_weights,
     )
 
 
