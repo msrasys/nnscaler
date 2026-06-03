@@ -629,7 +629,7 @@ def test_codegen_fn_pipeline_segment_hooks(tmp_path):
     )) == 2
     assert len(_gencode_contains(
         tmp_path, FnPolicyModuleList, 0,
-        r"tests.test_policies.segment_mirror_post_hook\(model, 'stage0_mirror', \(\(\), \(dropout_.*, \), \(gdropout_.*, \)\), {}, _\)"
+        r"tests\.test_policies\.segment_mirror_post_hook\(model, 'stage0_mirror', \(\(\), \(dropout_.*, \), \(gdropout_.*, \)\), {}, _\)"
     )) == 2
 
     # rank0 generated code should look like:
