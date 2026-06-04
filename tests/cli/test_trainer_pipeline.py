@@ -9,13 +9,15 @@ from tests.launch_torchrun import launch_torchrun
 from tests.parallel_module.common import assert_equal
 
 
-def trainer_worker_pipeline(save_dir, config_file):
+def trainer_worker_pipeline(save_dir, config_file, run_name=None, additional_args=None):
     save_dir = Path(save_dir)
     config_path = Path(__file__).with_name(config_file).resolve()
-    run_name = config_path.stem
+    run_name = run_name or config_path.stem
     gen_savedir = save_dir / run_name / 'gen'
     ckpt_savedir = save_dir / run_name / 'ckpt'
-    instance_name = f'instance_{config_path.stem}'
+    instance_name = f'instance_{run_name}'
+
+    additional_args = additional_args or []
 
     trainer = Trainer([
         '-f', config_path,
@@ -23,6 +25,7 @@ def trainer_worker_pipeline(save_dir, config_file):
         '--max_epochs', '2',
         '--gen_savedir', str(gen_savedir),
         '--checkpoint.save_dir', str(ckpt_savedir),
+        *additional_args
     ])
     trainer.run()
     assert trainer.model.use_scheduler
@@ -74,3 +77,36 @@ def test_trainer_pipeline(tmp_path):
     assert_equal(merged_state_dicts[0]['optimizer'], merged_state_dicts[1]['optimizer'])
     assert_equal(merged_state_dicts[0]['model'], merged_state_dicts[2]['model'])
     assert_equal(merged_state_dicts[0]['optimizer'], merged_state_dicts[2]['optimizer'])
+
+
+def pp_obj_pas(graph, cfg):
+    from nnscaler.policies import OpPlan, OpPartition, get_layer_index, get_called_self_module_name, get_pas_ops
+
+    last_stage_id = 0
+    for node in get_pas_ops(graph):
+        if torch.nn.modules.linear.Linear in node.module_class_chain:
+            layer_idx = get_layer_index(node.fqn)
+            yield OpPlan(node, stage_id=layer_idx // 2)
+            last_stage_id = layer_idx // 2
+        else:
+            yield OpPlan(node, stage_id=last_stage_id)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.device_count() < 4, reason='lack of gpu devices')
+def test_trainer_pipeline_obj(tmp_path):
+    launch_torchrun(4, trainer_worker_pipeline, tmp_path,
+        'trainer_args_pipeline_obj.yaml',
+        'no_constant_folding',
+        ['--compute_config.constant_folding', False]
+    )
+    launch_torchrun(4, trainer_worker_pipeline, tmp_path,
+        'trainer_args_pipeline_obj.yaml',
+        'constant_folding',
+    )
+    merged_files = list((tmp_path).glob('merged_*.pt'))
+    assert len(merged_files) == 2
+    state_dict0 = torch.load(merged_files[0], weights_only=False)
+    state_dict1 = torch.load(merged_files[1], weights_only=False)
+
+    assert_equal(state_dict0['model'], state_dict1['model'])
+    assert_equal(state_dict0['optimizer'], state_dict1['optimizer'])

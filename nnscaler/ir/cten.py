@@ -834,9 +834,27 @@ class IRObject:
 
     def __copy__(self):
         """Copy this object but remove the cell information"""
+        if type(self) is not IRObject:
+            raise TypeError("__copy__() is only supported for IRObject, but got type {}".format(type(self)))
+
         if self is IRObject.missing:  # missing object is singleton
             return IRObject.missing
         return IRObject(self.name, self._id, self._value, self.is_constant, value_track=self._value_track)
+
+    def like(self):
+        """
+        Create a IRObject with same attributes but a different id and empty cell.
+        """
+        if type(self) is not IRObject:
+            raise TypeError("like() is only supported for IRObject, but got type {}".format(type(self)))
+
+        if self is IRObject.missing:  # missing object is singleton
+            return IRObject.missing
+
+        obj = IRObject(
+            self.name, None, self._value, self.is_constant, value_track=self._value_track
+        )
+        return obj
 
     def as_attr(self):
         """

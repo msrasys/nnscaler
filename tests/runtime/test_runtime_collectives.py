@@ -4,6 +4,7 @@
 from typing import List
 
 import nnscaler
+import nnscaler.runtime.adapter
 import torch
 import pytest
 
@@ -35,6 +36,12 @@ def _move_worker(async_op: bool):
     if async_op:
         tensor = nnscaler.runtime.executor.AsyncCommHandler().wait(tensor)
     return clone_to_cpu(tensor)
+
+
+def _move_object_worker():
+    obj = {'hello': 'world', 'count': 1}
+    robj = nnscaler.runtime.adapter.move_object(obj, 0, 1)
+    assert robj == obj
 
 
 def _allreduce_worker(async_op: bool):
@@ -99,6 +106,7 @@ def _2gpu_worker():
     result['reduce_scatter_async'] = _reduce_scatter_worker(True)
     result['all2all'] = _all2all_worker(False)
     result['all2all_async'] = _all2all_worker(True)
+    _move_object_worker()
 
     return result
 
@@ -178,6 +186,13 @@ def _broadcast_worker(async_op):
     return (clone_to_cpu(tensor), clone_to_cpu(otensor))
 
 
+def _broadcast_object_worker():
+    obj = {'hello': 'world', 'count': 1}
+    robj = nnscaler.runtime.adapter.broadcast_object(
+        obj, src=0, ranks=[0,1,2])
+    assert robj == obj
+
+
 def _3gpu_worker():
     _init_distributed(3)
     result = {}
@@ -187,6 +202,7 @@ def _3gpu_worker():
     result['rdgather_async'] = _rdgather_worker(True)
     result['broadcast'] = _broadcast_worker(False)
     result['broadcast_async'] = _broadcast_worker(True)
+    _broadcast_object_worker()
     return result
 
 

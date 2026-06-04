@@ -619,7 +619,7 @@ class IRSegment(IRCell):
         self.insert(index, node)
 
     @contextmanager
-    def update(self, node):
+    def update(self, node: IRCell):
         """
         Update a node. Note the related change in backward operator
         will not be automatically updated.

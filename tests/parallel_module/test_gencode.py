@@ -989,12 +989,7 @@ def test_codegen_end2end():
                     r"self\.register_parameter"
             )
             p(tempdir, use_pipeline=use_pipeline, constant_folding=True, return_type=0)  # should success
-            if use_pipeline:
-                with raises_with_cause(RuntimeError, match='.*Communication generation.*'):
-                    # fail for non-tensor IRObject return in pipeline mode
-                    p(tempdir, use_pipeline=use_pipeline, constant_folding=False, return_type=1)
-            else:
-                p(tempdir, use_pipeline=use_pipeline, constant_folding=False, return_type=1)
+            p(tempdir, use_pipeline=use_pipeline, constant_folding=False, return_type=1)
             p(tempdir, use_pipeline=use_pipeline, constant_folding=True, return_type=1)  # should success
             p(tempdir, use_pipeline=use_pipeline, constant_folding=False, return_type=2)  # should success
             p(tempdir, use_pipeline=use_pipeline, constant_folding=True, return_type=2)  # should success
