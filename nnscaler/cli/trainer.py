@@ -97,6 +97,7 @@ class Trainer:
         self._log_futures: deque[Future] = deque()
         self._last_batch_next_wall = None
         self._last_batch_fix_input_wall = None
+        self._last_batch_loader_timings = None
         self.hook = None
         self.checkpointer = None
         # RNG states pending resume; reset to None after resuming
@@ -735,6 +736,7 @@ class Trainer:
         samples = []
         batch_next_wall = 0.0
         batch_fix_input_wall = 0.0
+        batch_loader_timings = {}
         while True:
             try:
                 sample_start_at = time.perf_counter()
@@ -742,6 +744,9 @@ class Trainer:
                 sample_next_at = time.perf_counter()
             except StopIteration:
                 break
+            for key, value in getattr(it, 'last_timing', {}).items():
+                if value is not None:
+                    batch_loader_timings[key] = batch_loader_timings.get(key, 0.0) + float(value)
             sample = self._fix_input(sample)
             sample_fix_at = time.perf_counter()
 
@@ -751,13 +756,16 @@ class Trainer:
             if len(samples) == self.train_args.update_freq:
                 self._last_batch_next_wall = batch_next_wall
                 self._last_batch_fix_input_wall = batch_fix_input_wall
+                self._last_batch_loader_timings = batch_loader_timings
                 yield samples
                 samples = []
                 batch_next_wall = 0.0
                 batch_fix_input_wall = 0.0
+                batch_loader_timings = {}
         if samples:
             self._last_batch_next_wall = batch_next_wall
             self._last_batch_fix_input_wall = batch_fix_input_wall
+            self._last_batch_loader_timings = batch_loader_timings
             yield samples
 
     def aggregate_outputs(self, loss_outputs, sync_group) -> AggregatedOutputs:
@@ -1113,6 +1121,8 @@ class Trainer:
                 step_metrics['batch_next_wall'] = self._last_batch_next_wall
             if self._last_batch_fix_input_wall is not None:
                 step_metrics['batch_fix_input_wall'] = self._last_batch_fix_input_wall
+            if self._last_batch_loader_timings:
+                step_metrics.update(self._last_batch_loader_timings)
             last_train_wall_at = train_wall_at
             self.hook.before_log_train_metrics(self, step_metrics, aggregated_outputs)
             self.log_metrics(step_metrics, tag='train')
