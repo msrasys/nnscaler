@@ -563,6 +563,235 @@ def test_codegen_fn_pipeline_multi_streams(tmp_path):
     #     return sum_1_48, sum_1_275
 
 
+def segment_pre_hook(module, meta, inputs, kwargs):
+    print(f'segment pre_hook: {meta}')
+
+
+def segment_post_hook(module, meta, inputs, kwargs, outputs):
+    print(f'segment post_hook: {meta}')
+
+
+def segment_mirror_pre_hook(module, meta, inputs, kwargs):
+    print(f'segment pre_hook: {meta}')
+
+
+def segment_mirror_post_hook(module, meta, inputs, kwargs, outputs):
+    print(f'segment post_hook: {meta}')
+
+
+def sched_1f1b_with_hooks(graph: IRGraph, num_microbatches: int, num_stages: int) -> SchedulePlan:
+    from nnscaler.graph.schedule.predefined import PredefinedSched
+    segments: List[IRSegment] = graph.select(ntype=IRSegment, flatten=False)
+    fsegs = [seg for seg in segments if seg.isfw()]
+    # set hooks on segments directly
+    for sid, seg in enumerate(fsegs):
+        seg.pre_hook = segment_pre_hook
+        seg.post_hook = segment_post_hook
+        seg.hook_meta = f'stage{sid}'
+        if seg.mirror is not None:
+            seg.mirror.pre_hook = segment_mirror_pre_hook
+            seg.mirror.post_hook = segment_mirror_post_hook
+            seg.mirror.hook_meta = f'stage{sid}_mirror'
+
+    return PredefinedSched.sched_1f1b(graph, num_microbatches, num_stages)
+
+
+@replace_all_device_with('cpu')
+def test_codegen_fn_pipeline_segment_hooks(tmp_path):
+    parallelize(
+        FnPolicyModuleList(),
+        {'x': torch.randn(4, 4)},
+        megatron_ffn_policy_list,
+        ComputeConfig(4, 8, use_end2end=True,
+            pas_config={
+                'pipeline_nmicros': 2,
+                'pipeline_size': 2,
+                'pipeline_scheduler': sched_1f1b_with_hooks,
+            }
+        ),
+        gen_savedir=tmp_path,
+        load_module=False
+    )
+    assert _gencode_contains(tmp_path, FnPolicyModuleList, 0,
+        'import tests.test_policies'
+    )
+    assert len(_gencode_contains(
+        tmp_path, FnPolicyModuleList, 0,
+        r"tests\.test_policies\.segment_pre_hook\(model, 'stage0', \(x_.*, \), {}\)"
+    )) == 4
+    assert len(_gencode_contains(
+        tmp_path, FnPolicyModuleList, 0,
+        r"tests\.test_policies\.segment_post_hook\(model, 'stage0', \(x_.*, \), {}, dropout_.*\)"
+    )) == 4
+    assert len(_gencode_contains(
+        tmp_path, FnPolicyModuleList, 0,
+        r"tests\.test_policies\.segment_mirror_pre_hook\(model, 'stage0_mirror', \(\(\), \(dropout_.*, \), \(gdropout_.*, \)\), {}\)"
+    )) == 2
+    assert len(_gencode_contains(
+        tmp_path, FnPolicyModuleList, 0,
+        r"tests\.test_policies\.segment_mirror_post_hook\(model, 'stage0_mirror', \(\(\), \(dropout_.*, \), \(gdropout_.*, \)\), {}, _\)"
+    )) == 2
+
+    # rank0 generated code should look like:
+
+    # def _train_step(model, dataloader_69):
+    #     _ = None
+    #     nnscaler.flags.RuntimeFlag.skip_zero_grad = False
+
+    #     with torch.cuda.stream(nnscaler.runtime.device.DeviceGroup().get_stream('comp')):
+    #         torch.cuda.current_stream().wait_stream(nnscaler.runtime.device.DeviceGroup().get_stream('comm'))
+    #         model.zero_grad()
+    #         torch.cuda.current_stream().wait_stream(nnscaler.runtime.device.DeviceGroup().get_stream('comm'))
+    #         x_47 = next(*(dataloader_69, ))
+    #         torch.cuda.current_stream().wait_stream(nnscaler.runtime.device.DeviceGroup().get_stream('comm'))
+    #         x_47.record_stream(torch.cuda.current_stream())
+    #         tests.test_policies.segment_pre_hook(model, 'stage0', (x_47, ), {})
+    #         dropout_58 = nnscaler.runtime.executor.fexecute('segment78', model.segment78, *(x_47, ), requires_grad=True)
+    #         tests.test_policies.segment_post_hook(model, 'stage0', (x_47, ), {}, dropout_58)
+
+    #     del x_47
+
+    #     with torch.cuda.stream(nnscaler.runtime.device.DeviceGroup().get_stream('comm')):
+    #         torch.cuda.current_stream().wait_stream(nnscaler.runtime.device.DeviceGroup().get_stream('comp'))
+    #         dropout_58.record_stream(torch.cuda.current_stream())
+    #         _ = nnscaler.runtime.executor.aexecute(model.adapter192, *(dropout_58, ), requires_grad=False)
+
+    #     with torch.cuda.stream(nnscaler.runtime.device.DeviceGroup().get_stream('comp')):
+    #         torch.cuda.current_stream().wait_stream(nnscaler.runtime.device.DeviceGroup().get_stream('comm'))
+    #         x_251 = next(*(dataloader_69, ))
+    #         torch.cuda.current_stream().wait_stream(nnscaler.runtime.device.DeviceGroup().get_stream('comm'))
+    #         x_251.record_stream(torch.cuda.current_stream())
+    #         tests.test_policies.segment_pre_hook(model, 'stage0', (x_251, ), {})
+    #         dropout_256 = nnscaler.runtime.executor.fexecute('segment78', model.segment78, *(x_251, ), requires_grad=True)
+    #         tests.test_policies.segment_post_hook(model, 'stage0', (x_251, ), {}, dropout_256)
+
+    #     del x_251
+
+    #     with torch.cuda.stream(nnscaler.runtime.device.DeviceGroup().get_stream('comm')):
+    #         torch.cuda.current_stream().wait_stream(nnscaler.runtime.device.DeviceGroup().get_stream('comp'))
+    #         dropout_256.record_stream(torch.cuda.current_stream())
+    #         _ = nnscaler.runtime.executor.aexecute(model.adapter192, *(dropout_256, ), requires_grad=False)
+    #         torch.cuda.current_stream().wait_stream(nnscaler.runtime.device.DeviceGroup().get_stream('comp'))
+    #         gdropout_79 = nnscaler.runtime.executor.aexecute(model.adapter203, *(), requires_grad=False)
+
+    #     nnscaler.flags.RuntimeFlag.skip_reducer = True
+
+    #     with torch.cuda.stream(nnscaler.runtime.device.DeviceGroup().get_stream('comp')):
+    #         torch.cuda.current_stream().wait_stream(nnscaler.runtime.device.DeviceGroup().get_stream('comm'))
+    #         dropout_58.record_stream(torch.cuda.current_stream())
+    #         gdropout_79.record_stream(torch.cuda.current_stream())
+    #         tests.test_policies.segment_mirror_pre_hook(model, 'stage0_mirror', ((), (dropout_58, ), (gdropout_79, )), {})
+    #         _ = nnscaler.runtime.executor.backward('segment78', (), (dropout_58, ), (gdropout_79, ))
+    #         tests.test_policies.segment_mirror_post_hook(model, 'stage0_mirror', ((), (dropout_58, ), (gdropout_79, )), {}, _)
+
+    #     del dropout_58, gdropout_79
+
+    #     with torch.cuda.stream(nnscaler.runtime.device.DeviceGroup().get_stream('comm')):
+    #         torch.cuda.current_stream().wait_stream(nnscaler.runtime.device.DeviceGroup().get_stream('comp'))
+    #         gdropout_257 = nnscaler.runtime.executor.aexecute(model.adapter203, *(), requires_grad=False)
+
+    #     nnscaler.flags.RuntimeFlag.skip_reducer = False
+
+    #     with torch.cuda.stream(nnscaler.runtime.device.DeviceGroup().get_stream('comp')):
+    #         torch.cuda.current_stream().wait_stream(nnscaler.runtime.device.DeviceGroup().get_stream('comm'))
+    #         dropout_256.record_stream(torch.cuda.current_stream())
+    #         gdropout_257.record_stream(torch.cuda.current_stream())
+    #         tests.test_policies.segment_mirror_pre_hook(model, 'stage0_mirror', ((), (dropout_256, ), (gdropout_257, )), {})
+    #         _ = nnscaler.runtime.executor.backward('segment78', (), (dropout_256, ), (gdropout_257, ))
+    #         tests.test_policies.segment_mirror_post_hook(model, 'stage0_mirror', ((), (dropout_256, ), (gdropout_257, )), {}, _)
+
+    #     del dropout_256, gdropout_257
+
+    #     with torch.cuda.stream(nnscaler.runtime.device.DeviceGroup().get_stream('comm')):
+    #         torch.cuda.current_stream().wait_stream(nnscaler.runtime.device.DeviceGroup().get_stream('comp'))
+    #         sum_1_48 = nnscaler.runtime.executor.aexecute(model.adapter156, *(), requires_grad=True)
+    #         torch.cuda.current_stream().wait_stream(nnscaler.runtime.device.DeviceGroup().get_stream('comp'))
+    #         sum_1_275 = nnscaler.runtime.executor.aexecute(model.adapter156, *(), requires_grad=True)
+    #         torch.cuda.current_stream().wait_stream(nnscaler.runtime.device.DeviceGroup().get_stream('comp'))
+    #         _ = nnscaler.runtime.executor.aexecute(model.reducer462, *(), requires_grad=False)
+
+    #     return sum_1_48, sum_1_275
+
+    # rank1 generated code should look like:
+    # def _train_step(model, dataloader_69):
+    #     _ = None
+    #     nnscaler.flags.RuntimeFlag.skip_zero_grad = False
+
+    #     with torch.cuda.stream(nnscaler.runtime.device.DeviceGroup().get_stream('comp')):
+    #         torch.cuda.current_stream().wait_stream(nnscaler.runtime.device.DeviceGroup().get_stream('comm'))
+    #         model.zero_grad()
+    #         torch.cuda.current_stream().wait_stream(nnscaler.runtime.device.DeviceGroup().get_stream('comm'))
+    #         x_47 = next(*(dataloader_69, ))
+    #         torch.cuda.current_stream().wait_stream(nnscaler.runtime.device.DeviceGroup().get_stream('comm'))
+    #         x_47.record_stream(torch.cuda.current_stream())
+    #         tests.test_policies.segment_pre_hook(model, 'stage0', (x_47, ), {})
+    #         dropout_58 = nnscaler.runtime.executor.fexecute('segment78', model.segment78, *(x_47, ), requires_grad=True)
+    #         tests.test_policies.segment_post_hook(model, 'stage0', (x_47, ), {}, dropout_58)
+
+    #     del x_47
+
+    #     with torch.cuda.stream(nnscaler.runtime.device.DeviceGroup().get_stream('comm')):
+    #         torch.cuda.current_stream().wait_stream(nnscaler.runtime.device.DeviceGroup().get_stream('comp'))
+    #         dropout_58.record_stream(torch.cuda.current_stream())
+    #         _ = nnscaler.runtime.executor.aexecute(model.adapter192, *(dropout_58, ), requires_grad=False)
+
+    #     with torch.cuda.stream(nnscaler.runtime.device.DeviceGroup().get_stream('comp')):
+    #         torch.cuda.current_stream().wait_stream(nnscaler.runtime.device.DeviceGroup().get_stream('comm'))
+    #         x_251 = next(*(dataloader_69, ))
+    #         torch.cuda.current_stream().wait_stream(nnscaler.runtime.device.DeviceGroup().get_stream('comm'))
+    #         x_251.record_stream(torch.cuda.current_stream())
+    #         tests.test_policies.segment_pre_hook(model, 'stage0', (x_251, ), {})
+    #         dropout_256 = nnscaler.runtime.executor.fexecute('segment78', model.segment78, *(x_251, ), requires_grad=True)
+    #         tests.test_policies.segment_post_hook(model, 'stage0', (x_251, ), {}, dropout_256)
+
+    #     del x_251
+
+    #     with torch.cuda.stream(nnscaler.runtime.device.DeviceGroup().get_stream('comm')):
+    #         torch.cuda.current_stream().wait_stream(nnscaler.runtime.device.DeviceGroup().get_stream('comp'))
+    #         dropout_256.record_stream(torch.cuda.current_stream())
+    #         _ = nnscaler.runtime.executor.aexecute(model.adapter192, *(dropout_256, ), requires_grad=False)
+    #         torch.cuda.current_stream().wait_stream(nnscaler.runtime.device.DeviceGroup().get_stream('comp'))
+    #         gdropout_79 = nnscaler.runtime.executor.aexecute(model.adapter203, *(), requires_grad=False)
+
+    #     nnscaler.flags.RuntimeFlag.skip_reducer = True
+
+    #     with torch.cuda.stream(nnscaler.runtime.device.DeviceGroup().get_stream('comp')):
+    #         torch.cuda.current_stream().wait_stream(nnscaler.runtime.device.DeviceGroup().get_stream('comm'))
+    #         dropout_58.record_stream(torch.cuda.current_stream())
+    #         gdropout_79.record_stream(torch.cuda.current_stream())
+    #         tests.test_policies.segment_mirror_pre_hook(model, 'stage0_mirror', ((), (dropout_58, ), (gdropout_79, )), {})
+    #         _ = nnscaler.runtime.executor.backward('segment78', (), (dropout_58, ), (gdropout_79, ))
+    #         tests.test_policies.segment_mirror_post_hook(model, 'stage0_mirror', ((), (dropout_58, ), (gdropout_79, )), {}, _)
+
+    #     del dropout_58, gdropout_79
+
+    #     with torch.cuda.stream(nnscaler.runtime.device.DeviceGroup().get_stream('comm')):
+    #         torch.cuda.current_stream().wait_stream(nnscaler.runtime.device.DeviceGroup().get_stream('comp'))
+    #         gdropout_257 = nnscaler.runtime.executor.aexecute(model.adapter203, *(), requires_grad=False)
+
+    #     nnscaler.flags.RuntimeFlag.skip_reducer = False
+
+    #     with torch.cuda.stream(nnscaler.runtime.device.DeviceGroup().get_stream('comp')):
+    #         torch.cuda.current_stream().wait_stream(nnscaler.runtime.device.DeviceGroup().get_stream('comm'))
+    #         dropout_256.record_stream(torch.cuda.current_stream())
+    #         gdropout_257.record_stream(torch.cuda.current_stream())
+    #         tests.test_policies.segment_mirror_pre_hook(model, 'stage0_mirror', ((), (dropout_256, ), (gdropout_257, )), {})
+    #         _ = nnscaler.runtime.executor.backward('segment78', (), (dropout_256, ), (gdropout_257, ))
+    #         tests.test_policies.segment_mirror_post_hook(model, 'stage0_mirror', ((), (dropout_256, ), (gdropout_257, )), {}, _)
+
+    #     del dropout_256, gdropout_257
+
+    #     with torch.cuda.stream(nnscaler.runtime.device.DeviceGroup().get_stream('comm')):
+    #         torch.cuda.current_stream().wait_stream(nnscaler.runtime.device.DeviceGroup().get_stream('comp'))
+    #         sum_1_48 = nnscaler.runtime.executor.aexecute(model.adapter156, *(), requires_grad=True)
+    #         torch.cuda.current_stream().wait_stream(nnscaler.runtime.device.DeviceGroup().get_stream('comp'))
+    #         sum_1_275 = nnscaler.runtime.executor.aexecute(model.adapter156, *(), requires_grad=True)
+    #         torch.cuda.current_stream().wait_stream(nnscaler.runtime.device.DeviceGroup().get_stream('comp'))
+    #         _ = nnscaler.runtime.executor.aexecute(model.reducer463, *(), requires_grad=False)
+
+    #     return sum_1_48, sum_1_275
+
+
 class FnPolicyModuleSharedWeight(torch.nn.Module):
     def __init__(self):
         super().__init__()

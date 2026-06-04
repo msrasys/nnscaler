@@ -1216,6 +1216,9 @@ class IRSegment(IRCell):
         segment = IRSegment(nodes, inputs, outputs, self.name)
         segment._id = self.cid
         segment.op_context = self.op_context
+        segment.pre_hook = self.pre_hook
+        segment.post_hook = self.post_hook
+        segment.hook_meta = self.hook_meta
         if _gen_mirror and self.mirror is not None:
             msegment = self.mirror.dispatch(devid, _gen_mirror=False)
             IRCell.make_pair(segment, msegment)
