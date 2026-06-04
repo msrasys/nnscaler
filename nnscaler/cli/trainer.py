@@ -1008,7 +1008,6 @@ class Trainer:
         step_stat: Optional[_StepStat] = None
         last_train_wall_at: Optional[float] = None
         last_loop_end_at: Optional[float] = None
-        last_post_train_wall: Optional[float] = None
         for i, batches in data_iter:
             idx = i + resume_from_idx
             self.hook.on_step_start(self, epoch, idx)
@@ -1110,16 +1109,12 @@ class Trainer:
             step_metrics['local_train_wall'] = train_wall_at - step_start_at
             if inter_step_wall is not None:
                 step_metrics['inter_step_wall'] = inter_step_wall
-            if last_post_train_wall is not None:
-                step_metrics['prev_post_train_wall'] = last_post_train_wall
             if self._last_batch_next_wall is not None:
                 step_metrics['batch_next_wall'] = self._last_batch_next_wall
             if self._last_batch_fix_input_wall is not None:
                 step_metrics['batch_fix_input_wall'] = self._last_batch_fix_input_wall
             last_train_wall_at = train_wall_at
-            before_log_start_at = time.perf_counter()
             self.hook.before_log_train_metrics(self, step_metrics, aggregated_outputs)
-            step_metrics['before_log_train_metrics_wall'] = time.perf_counter() - before_log_start_at
             self.log_metrics(step_metrics, tag='train')
             if self.rank == 0:
                 if self.train_args.enable_log_progress \
@@ -1159,7 +1154,6 @@ class Trainer:
                 has_validated = VAL_STATUS_VAL
 
             loop_end_at = time.perf_counter()
-            last_post_train_wall = loop_end_at - train_wall_at
             last_loop_end_at = loop_end_at
 
             # time.sleep(1)
