@@ -986,12 +986,15 @@ class Trainer:
             )
 
         step_stat: Optional[_StepStat] = None
-        last_step_start_at: Optional[float] = None
+        last_train_wall_at: Optional[float] = None
+        last_loop_end_at: Optional[float] = None
+        last_post_train_wall: Optional[float] = None
         for i, batches in data_iter:
             idx = i + resume_from_idx
             self.hook.on_step_start(self, epoch, idx)
 
             step_start_at = time.perf_counter()
+            inter_step_wall = None if last_loop_end_at is None else step_start_at - last_loop_end_at
             step_stat = _StepStat()
             step_metrics = {}
             has_validated = VAL_STATUS_NO
@@ -1083,10 +1086,16 @@ class Trainer:
             step_metrics = {k:v for k, v in asdict(step_stat).items() if v is not None}
             step_metrics['loss'] = step_metrics['train_loss']
             train_wall_at = time.perf_counter()
-            step_metrics['train_wall'] = train_wall_at - (last_step_start_at or step_start_at)
+            step_metrics['train_wall'] = train_wall_at - (last_train_wall_at or step_start_at)
             step_metrics['local_train_wall'] = train_wall_at - step_start_at
-            last_step_start_at = train_wall_at
+            if inter_step_wall is not None:
+                step_metrics['inter_step_wall'] = inter_step_wall
+            if last_post_train_wall is not None:
+                step_metrics['prev_post_train_wall'] = last_post_train_wall
+            last_train_wall_at = train_wall_at
+            before_log_start_at = time.perf_counter()
             self.hook.before_log_train_metrics(self, step_metrics, aggregated_outputs)
+            step_metrics['before_log_train_metrics_wall'] = time.perf_counter() - before_log_start_at
             self.log_metrics(step_metrics, tag='train')
             if self.rank == 0:
                 if self.train_args.enable_log_progress \
@@ -1124,6 +1133,10 @@ class Trainer:
                 self.train_status.finished_train_steps % self.train_args.val_every_n_train_steps == 0:
                 self._validate(step_stat)
                 has_validated = VAL_STATUS_VAL
+
+            loop_end_at = time.perf_counter()
+            last_post_train_wall = loop_end_at - train_wall_at
+            last_loop_end_at = loop_end_at
 
             # time.sleep(1)
         else:
