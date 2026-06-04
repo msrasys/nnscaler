@@ -282,6 +282,23 @@ class IRAdapterGener:
                         f"Consumers:\n{nl.join([repr(w.cell) for w in sub_ws])}\n"
                     )
 
+        # no-grad-reduce case:
+        # if a weight's gradient is full,
+        # treat the weight as replicated even if its consumers are partitioned, since no reducer is needed for full gradient.
+        for ftensor, sub_ws in sub_weights.items():
+            if all(sw == sub_ws[0] and sw.grad.valmap == (0, 1) for sw in sub_ws):
+                replicated.add(sub_ws[0])
+            elif all(sw == sub_ws[0] for sw in sub_ws) \
+                and any(sw.grad.valmap == (0, 1) for sw in sub_ws) \
+                and any(sw.grad.valmap != (0, 1) for sw in sub_ws):
+                nl = '\n'
+                raise RuntimeError(
+                    f"Detected a weight has inconsistent gradient valmap among its sub-tensors.\n"
+                    f"To achieve this, users need to call `graph.multiref(weight)` inside the policy.\n"
+                    f"FullTensor weight: {ftensor}\n"
+                    f"Consumers:\n{nl.join([repr(w.cell) + ', grad valmap: ' + repr(w.grad.valmap) for w in sub_ws])}\n"
+                )
+
         # only record sub-weight that is consumed by multiple devices
         sub_weight_devices: Dict[IRSubTensor, Tuple[int,]] = dict()
         # gather sub weights that are consumed by same device groups
@@ -294,16 +311,16 @@ class IRAdapterGener:
                 sub_weight_devices[sub_weight] = devices
 
         # create reducer
-        # separate replicated and partitioned weights since they need different nreplicas
-        partitioned_reducers: Dict[Tuple[int,...], List[IRSubTensor]] = dict()
+        # separate replicated and vp (grad is value partitioned) weights since they need different nreplicas
+        vp_reducers: Dict[Tuple[int,...], List[IRSubTensor]] = dict()
         replicated_reducers: Dict[Tuple[int,...], List[IRSubTensor]] = dict()
         for subw, devices in sub_weight_devices.items():
             if subw in replicated:
                 replicated_reducers.setdefault(devices, []).append(subw)
             else:
-                partitioned_reducers.setdefault(devices, []).append(subw)
+                vp_reducers.setdefault(devices, []).append(subw)
 
-        for devices, subws in partitioned_reducers.items():
+        for devices, subws in vp_reducers.items():
             for reducer in IRWeightReducer.from_weights(subws, devices):
                 graph.insert(reducer, graph.nnodes)
 

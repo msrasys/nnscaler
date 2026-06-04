@@ -316,7 +316,7 @@ class ModuleCodeGen(FuncEmission):
                 IRCell.make_pair(adapter, badapter)
             return adapter
         if isinstance(node, IRWeightReducer):
-            reducer = IRWeightReducer(node.inputs(), name=node.name)
+            reducer = IRWeightReducer(node.inputs(), name=node.name, nreplicas=node.nreplicas)
             reducer._id = node.cid
             ranks = list(node.device)
             scale_ranks = []
