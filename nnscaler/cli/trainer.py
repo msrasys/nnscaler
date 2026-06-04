@@ -36,6 +36,13 @@ from .serialization import Checkpointer
 logger = logging.getLogger(__name__)
 
 
+def _env_flag(name: str, default: bool = False) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.lower() not in ('0', 'false', 'no', 'off', '')
+
+
 @dataclass
 class TrainStatus:
     best_loss = float('inf')
@@ -98,6 +105,7 @@ class Trainer:
         self._last_batch_next_wall = None
         self._last_batch_fix_input_wall = None
         self._last_batch_loader_timings = None
+        self._enable_dataloader_timing = _env_flag('NNSCALER_DATALOADER_TIMING')
         self.hook = None
         self.checkpointer = None
         # RNG states pending resume; reset to None after resuming
@@ -733,6 +741,18 @@ class Trainer:
             # for validation and test, we don't need to resume rng states
             it = iter(self.dataloader[stage])
 
+        if not self._enable_dataloader_timing:
+            samples = []
+            for sample in it:
+                sample = self._fix_input(sample)
+                samples.append(sample)
+                if len(samples) == self.train_args.update_freq:
+                    yield samples
+                    samples = []
+            if samples:
+                yield samples
+            return
+
         samples = []
         batch_next_wall = 0.0
         batch_fix_input_wall = 0.0
@@ -1021,7 +1041,10 @@ class Trainer:
             self.hook.on_step_start(self, epoch, idx)
 
             step_start_at = time.perf_counter()
-            inter_step_wall = None if last_loop_end_at is None else step_start_at - last_loop_end_at
+            inter_step_wall = (
+                None if not self._enable_dataloader_timing or last_loop_end_at is None
+                else step_start_at - last_loop_end_at
+            )
             step_stat = _StepStat()
             step_metrics = {}
             has_validated = VAL_STATUS_NO
@@ -1115,14 +1138,15 @@ class Trainer:
             train_wall_at = time.perf_counter()
             step_metrics['train_wall'] = train_wall_at - (last_train_wall_at or step_start_at)
             step_metrics['local_train_wall'] = train_wall_at - step_start_at
-            if inter_step_wall is not None:
-                step_metrics['inter_step_wall'] = inter_step_wall
-            if self._last_batch_next_wall is not None:
-                step_metrics['batch_next_wall'] = self._last_batch_next_wall
-            if self._last_batch_fix_input_wall is not None:
-                step_metrics['batch_fix_input_wall'] = self._last_batch_fix_input_wall
-            if self._last_batch_loader_timings:
-                step_metrics.update(self._last_batch_loader_timings)
+            if self._enable_dataloader_timing:
+                if inter_step_wall is not None:
+                    step_metrics['inter_step_wall'] = inter_step_wall
+                if self._last_batch_next_wall is not None:
+                    step_metrics['batch_next_wall'] = self._last_batch_next_wall
+                if self._last_batch_fix_input_wall is not None:
+                    step_metrics['batch_fix_input_wall'] = self._last_batch_fix_input_wall
+                if self._last_batch_loader_timings:
+                    step_metrics.update(self._last_batch_loader_timings)
             last_train_wall_at = train_wall_at
             self.hook.before_log_train_metrics(self, step_metrics, aggregated_outputs)
             self.log_metrics(step_metrics, tag='train')
@@ -1163,8 +1187,8 @@ class Trainer:
                 self._validate(step_stat)
                 has_validated = VAL_STATUS_VAL
 
-            loop_end_at = time.perf_counter()
-            last_loop_end_at = loop_end_at
+            if self._enable_dataloader_timing:
+                last_loop_end_at = time.perf_counter()
 
             # time.sleep(1)
         else:
