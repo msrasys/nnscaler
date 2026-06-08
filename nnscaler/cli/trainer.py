@@ -962,7 +962,6 @@ class Trainer:
             )
 
         step_stat: Optional[_StepStat] = None
-        last_step_start_at: Optional[float] = None
         for i, batches in data_iter:
             idx = i + resume_from_idx
             self.hook.on_step_start(self, epoch, idx)
