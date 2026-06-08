@@ -79,7 +79,7 @@ class CompileFlag:
     # whether to generate weight reducers for replicated weights.
     # When True, replicated weights will also go through all-reduce and divide by nreplicas,
     # ensuring gradient consistency across ranks. Default is False (original behavior).
-    reducer_replicated_weights = _to_bool('REDUCER_REPLICATED_WEIGHTS')
+    reducer_replicated_params = _to_bool('REDUCER_REPLICATED_PARAMS')
 
     # use automate mixture precision training, where weights, gradients
     # and optimizer status are kept in its original data type (can be float32),

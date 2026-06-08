@@ -27,7 +27,7 @@ def trainer_worker_reducer(save_dir, config_file, run_name=None, additional_args
         *additional_args
     ])
     trainer.run()
-    if trainer.train_args.compute_config.reducer_replicated_weights:
+    if trainer.train_args.compute_config.reducer_replicated_params:
         assert len(trainer.model.reducers[0].ranks) == trainer.world_size
         assert trainer.model.reducers[0]._nreplicas == trainer.train_args.compute_config.plan_ngpus
     else:
@@ -54,12 +54,12 @@ def test_trainer_reducer_replicas(tmp_path):
     launch_torchrun(4, trainer_worker_reducer, tmp_path,
         'trainer_args_reducer.yaml',
         'replicas',
-        ['--compute_config.reducer_replicated_weights', True]
+        ['--compute_config.reducer_replicated_params', True]
     )
     launch_torchrun(4, trainer_worker_reducer, tmp_path,
         'trainer_args_reducer.yaml',
         'no_replicas',
-        ['--compute_config.reducer_replicated_weights', False]
+        ['--compute_config.reducer_replicated_params', False]
     )
     merged_files = list((tmp_path).glob('merged_*.pt'))
     assert len(merged_files) == 2

@@ -307,7 +307,7 @@ class IRAdapterGener:
             for reducer in IRWeightReducer.from_weights(subws, devices):
                 graph.insert(reducer, graph.nnodes)
 
-        if CompileFlag.reducer_replicated_weights:
+        if CompileFlag.reducer_replicated_params:
             for devices, subws in replicated_reducers.items():
                 for reducer in IRWeightReducer.from_weights(subws, devices, nreplicas=len(devices)):
                     graph.insert(reducer, graph.nnodes)

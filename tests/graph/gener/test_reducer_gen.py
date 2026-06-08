@@ -86,7 +86,7 @@ def test_cross_segment_weight_reducer():
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason='lack of gpu devices')
 def test_replicate_shared_param():
-    # default: reducer_replicated_weights=False, no reducers for replicated weights
+    # default: reducer_replicated_params=False, no reducers for replicated weights
     graph = build_graph()
     for node in graph.select(ntype=IRFwOperation):
         sn1, sn2 = graph.replicate(node, 2)
@@ -99,9 +99,9 @@ def test_replicate_shared_param():
     reducers = graph.select(ntype=IRWeightReducer)
     assert len(reducers) == 0
 
-    old_flag = CompileFlag.reducer_replicated_weights
+    old_flag = CompileFlag.reducer_replicated_params
     try:
-        CompileFlag.reducer_replicated_weights = False
+        CompileFlag.reducer_replicated_params = False
         graph_copy = build_graph()
         for node in graph_copy.select(ntype=IRFwOperation):
             sn1, sn2 = graph_copy.replicate(node, 2)
@@ -111,8 +111,8 @@ def test_replicate_shared_param():
         reducers = graph_copy.select(ntype=IRWeightReducer)
         assert len(reducers) == 0
 
-        # with reducer_replicated_weights=True, reducers are generated with nreplicas
-        CompileFlag.reducer_replicated_weights = True
+        # with reducer_replicated_params=True, reducers are generated with nreplicas
+        CompileFlag.reducer_replicated_params = True
         graph = IRAdapterGener.gen_weight(graph)
         reducers = graph.select(ntype=IRWeightReducer)
         assert len(reducers) > 0
@@ -120,7 +120,7 @@ def test_replicate_shared_param():
             assert reducer.nreplicas == 2
             assert reducer.device == (0, 1)
     finally:
-        CompileFlag.reducer_replicated_weights = old_flag
+        CompileFlag.reducer_replicated_params = old_flag
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason='lack of gpu devices')
