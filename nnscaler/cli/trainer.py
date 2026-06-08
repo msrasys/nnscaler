@@ -3,8 +3,6 @@
 
 from __future__ import annotations
 
-from collections import deque
-from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, asdict
 from typing import Any, Dict, List, Optional, Union
 from pathlib import Path
@@ -93,8 +91,6 @@ class Trainer:
         self.total_train_steps_per_epoch = None
         self.max_train_steps = None
         self.loggers = []
-        self._log_executor: Optional[ThreadPoolExecutor] = None
-        self._log_futures: deque[Future] = deque()
         self.hook = None
         self.checkpointer = None
         # RNG states pending resume; reset to None after resuming
@@ -116,6 +112,7 @@ class Trainer:
                 self.dataloader[stage] = None
             if self.hook:
                 self.hook.on_finalize(self)
+            self._log_finalize()
             # It is very common to use `torch.distributed` after training
             # So let's not uninitialize nnscaler here.
             # TODO: make it configurable?
@@ -220,11 +217,6 @@ class Trainer:
         # Currently we never pass `last_epoch` to its constructor
         self.lr_scheduler = self.train_args.create_lr_scheduler(self.optimizer)
         self.loggers = self.train_args.create_loggers()
-        if self.loggers:
-            self._log_executor = ThreadPoolExecutor(
-                max_workers=1,
-                thread_name_prefix="nnscaler-logger",
-            )
         self.profiler = self.train_args.create_profiler()
 
         supported_hook_components = [
@@ -357,28 +349,13 @@ class Trainer:
         checkpointer.flush()
 
     def _log_finalize(self):
-        while self._log_futures:
-            self._log_futures.popleft().result()
-        if self._log_executor is not None:
-            self._log_executor.shutdown(wait=True)
-            self._log_executor = None
         for logger in self.loggers:
             logger.finalize()
 
-    def _log_metrics_sync(self, metrics: Dict[str, float], step: int, tag: Optional[str] = None):
+    def log_metrics(self, metrics: Dict[str, float], step: Optional[int] = None, *, tag: Optional[str] = None):
+        step = step or self.train_status.finished_train_steps
         for logger in self.loggers:
             logger.log_metrics(metrics, step, tag=tag)
-
-    def log_metrics(self, metrics: Dict[str, float], step: Optional[int] = None, *, tag: Optional[str] = None):
-        if not self.loggers:
-            return
-        step = step or self.train_status.finished_train_steps
-        while self._log_futures and self._log_futures[0].done():
-            self._log_futures.popleft().result()
-        assert self._log_executor is not None
-        self._log_futures.append(
-            self._log_executor.submit(self._log_metrics_sync, dict(metrics), step, tag)
-        )
 
     def _log_config(self, config: Dict):
         for logger in self.loggers:
@@ -883,7 +860,6 @@ class Trainer:
                 # finished with max_epochs
                 logger.info(f"Reached max_epochs({self.train_args.max_epochs}): Training is done.")
 
-        self._log_finalize()
         self.hook.on_train_end(self)
         torch.distributed.barrier()
 
@@ -1081,17 +1057,14 @@ class Trainer:
             self.train_status.finished_train_steps += 1
             self._log_mem_stats(tag='train')
             step_metrics = {k:v for k, v in asdict(step_stat).items() if v is not None}
+            step_metrics['train_wall'] = time.perf_counter() - step_start_at
             step_metrics['loss'] = step_metrics['train_loss']
-            train_wall_at = time.perf_counter()
-            step_metrics['train_wall'] = train_wall_at - (last_step_start_at or step_start_at)
-            step_metrics['local_train_wall'] = train_wall_at - step_start_at
-            last_step_start_at = train_wall_at
             self.hook.before_log_train_metrics(self, step_metrics, aggregated_outputs)
             self.log_metrics(step_metrics, tag='train')
             if self.rank == 0:
+                data_iter.set_postfix(step_metrics)
                 if self.train_args.enable_log_progress \
                     and self.train_status.finished_train_steps % self.train_args.log_progress_every_n_train_steps == 0:
-                    data_iter.set_postfix(step_metrics)
                     logger.info(self._format_metrics(epoch_desc, idx + 1, step_metrics))
                     step_metrics = {}
 

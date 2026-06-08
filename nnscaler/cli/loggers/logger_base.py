@@ -25,3 +25,10 @@ class LoggerBase(ABC):
     @abstractmethod
     def finalize(self) -> None:
         ...
+
+    def is_async(self) -> bool:
+        """
+        Whether this logger is asynchronous.
+        If True, the trainer will call `log_metrics` in a separate thread and will not wait for it to finish.
+        """
+        return False
