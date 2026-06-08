@@ -87,6 +87,7 @@ def test_cross_segment_weight_reducer():
 @pytest.mark.skipif(not torch.cuda.is_available(), reason='lack of gpu devices')
 def test_replicate_shared_param():
     # default: reducer_replicated_params=False, no reducers for replicated weights
+    assert not CompileFlag.reducer_replicated_params
     graph = build_graph()
     for node in graph.select(ntype=IRFwOperation):
         sn1, sn2 = graph.replicate(node, 2)

@@ -544,7 +544,7 @@ class Bucket:
                 torch.distributed.all_reduce(
                     self._contiguous_grads, op=self._reduce_op, group=self._group)
             CudaTimer().stop('comm', predefined=True)
-        # apply nreplicas after all-reduce
+        # apply nreplicas divisor if needed
         if self._nreplicas != 1:
             self._contiguous_grads.div_(self._nreplicas)
         # grads = self._contiguous_grads.clone()
@@ -781,6 +781,9 @@ class Reducer:
 
         if not isinstance(self._nreplicas, int) or self._nreplicas < 1:
             raise ValueError(f"nreplicas should be an integer greater than or equal to 1, but got {self._nreplicas}")
+
+        if self._nreplicas != 1 and self._reduce_op != torch.distributed.ReduceOp.SUM:
+            raise ValueError(f"nreplicas should be used with sum reduce op, but got {self._reduce_op}")
 
         if self._align_size % ALIGNED_BYTES != 0:
             raise ValueError(f"align_size {self._align_size} must be divisible by {ALIGNED_BYTES}")

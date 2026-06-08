@@ -152,7 +152,7 @@ def test_codegen_mixed_linear_split(tmp_path):
     # generated reducer:
     # self.wreducer80 = nnscaler.runtime.adapter.Reducer(ranks=[0, 2], reduce_op='sum', async_op=async_op, zero=0, max_bucket_size_bytes=max_bucket_size_bytes, zero_use_reduce_scatter=zero_use_reduce_scatter, zero_param_level_sharding=zero_param_level_sharding,zero_ngroups=1,nreplicas=1)
 
-    m = NormLinearModule()
+    m = MixedLinearModule()
     m.train()
     parallelize(
         m,
@@ -166,12 +166,12 @@ def test_codegen_mixed_linear_split(tmp_path):
     )
 
     # all rank reducer, with nreplicas=2
-    assert _gencode_contains(tmp_path, NormLinearModule, 0,
+    assert _gencode_contains(tmp_path, MixedLinearModule, 0,
         r"nnscaler.runtime.adapter.Reducer\(ranks=\[0, 1, 2, 3\].*nreplicas=2\)",
         instance_name = 'replicated_weights',
     )
     # will have identity allreduce for replicated weights
-    assert _gencode_contains(tmp_path, NormLinearModule, 0,
+    assert _gencode_contains(tmp_path, MixedLinearModule, 0,
         r"nnscaler.runtime.adapter.nn.identity_allreduce",
         instance_name = 'replicated_weights',
     )
@@ -269,7 +269,6 @@ def test_codegen_normal_add_mul_multiref_split(tmp_path):
         instance_name = 'replicated_weights',
     )
 
-    # weight is partitioned, so the reducer should have rank=[0, 2] and nreplicas=1
     assert _gencode_contains(tmp_path, NormalAddMulMultirefModule, 0,
         r"nnscaler.runtime.adapter.Reducer\(ranks=\[0, 1, 2, 3\].*nreplicas=2\)",
         instance_name = 'replicated_weights',

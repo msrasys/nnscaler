@@ -167,7 +167,7 @@ def test_reducer_build():
 
 @mock_reducer_env(0, 2)
 def test_reducer_nreplicas():
-    """Test that nreplicas is correctly passed to buckets and applied to gradients."""
+    """Test that nreplicas is correctly passed to buckets"""
     # Test nreplicas defaults to 1
     reducer = Reducer([0, 1])
     assert reducer._nreplicas == 1
