@@ -55,12 +55,12 @@ class ExeReuseCell(IRCell):
 
         inputs = []
         for t, cell_t in zip(self._inputs, self._cell.inputs()):
-            if isinstance(cell_t, IRSubTensor) and devid not in cell_t.device:
+            if isinstance(cell_t, IRObject) and devid not in cell_t.device:
                 continue
             inputs.append(t)
         outputs = []
         for t, cell_t in zip(self._outputs, self._cell.outputs()):
-            if isinstance(cell_t, IRSubTensor) and devid not in cell_t.device:
+            if isinstance(cell_t, IRObject) and devid not in cell_t.device:
                 continue
             outputs.append(t)
         reuse = ExeReuseCell(self._cell.dispatch(devid), inputs, outputs)

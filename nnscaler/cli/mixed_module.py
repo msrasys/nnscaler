@@ -221,7 +221,7 @@ class ModuleParallelizeConfigAdapter(PrecisionMixin, PolicyMixin):
         load_module: bool = True,
         build_buckets: bool = True,
         module_args: Optional[tuple[tuple, dict]] = None
-    ):
+    ) -> Optional[nnscaler.ParallelModule]:
         pmodel_class = nnscaler.parallelize(
             self.model_type,
             self.create_dummy_forward_args(dummy_input),
@@ -236,7 +236,11 @@ class ModuleParallelizeConfigAdapter(PrecisionMixin, PolicyMixin):
             autoset_requires_grad=self.autoset_requires_grad,
         )
         if load_module:
-            return pmodel_class(build_buckets=build_buckets)
+            pmodel = pmodel_class(build_buckets=False)
+            self.set_grad_dtype(pmodel)
+            if build_buckets:
+                pmodel.build_buckets()
+            return pmodel
         return pmodel_class
 
 

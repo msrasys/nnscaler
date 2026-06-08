@@ -970,24 +970,30 @@ class IRGraph(IRSegment):
                     return idx
             return None
 
-        def insert_identity(tensor: IRSubTensor, sid: int) -> IRFwOperation:
+        def insert_identity(tensor: Union[IRTensor, IRObject], sid: int) -> IRFwOperation:
             fwop = Identity(tensor)
-            output = tensor.parent.like().tosub()
-            fwop.set_output(0, output)
-            if tensor.requires_grad:
-                # set input grad
-                igrad = tensor.parent.grad.select(tensor.indmap, tensor.valmap)
-                fwop.input(0).grad = igrad
-                # set output grad
-                otensor = fwop.output(0).parent
-                ograd = otensor.grad.select(tensor.indmap, (0,1))
-                fwop.output(0).grad = ograd
-                # insert identity
-                fidx = self.index(fstages[sid][0])
-                self.finsert(fwop, fidx)
-            else:
+            if not isinstance(tensor, IRTensor):
+                output = tensor.like()
+                fwop.set_output(0, output)
                 fidx = self.index(fstages[sid][0])
                 self.insert(fwop, fidx)
+            else:
+                output = tensor.parent.like().tosub()
+                fwop.set_output(0, output)
+                if tensor.requires_grad:
+                    # set input grad
+                    igrad = tensor.parent.grad.select(tensor.indmap, tensor.valmap)
+                    fwop.input(0).grad = igrad
+                    # set output grad
+                    otensor = fwop.output(0).parent
+                    ograd = otensor.grad.select(tensor.indmap, (0,1))
+                    fwop.output(0).grad = ograd
+                    # insert identity
+                    fidx = self.index(fstages[sid][0])
+                    self.finsert(fwop, fidx)
+                else:
+                    fidx = self.index(fstages[sid][0])
+                    self.insert(fwop, fidx)
             # update stage op group
             fstages[sid].insert(0, fwop)
             if isinstance(fwop.mirror, IRCell):
@@ -995,59 +1001,71 @@ class IRGraph(IRSegment):
             return fwop
 
         # create identity op for cross-stage dataflow
-        for ftensor in self.full_tensors():
-            if ftensor.is_grad() or ftensor.is_attr(): continue
-            if len(self.consumers(ftensor)) == 0: continue
+        for fobj in self.full_objects():
+            if fobj.is_attr(): continue
+            if isinstance(fobj, IRTensor) and fobj.is_grad(): continue
+            if len(self.consumers(fobj)) == 0: continue
+            # only dataloader output has no producer.
+            # we can skip them as they are expected to be in the first stage
+            # and won't cause cross-stage dataflow.
+            if len(self.producers(fobj)) == 0: continue
 
-            assert len(self.producers(ftensor)) <= 1, \
+            assert len(self.producers(fobj)) <= 1, \
                 "The staging interface should be called before any operator partition."
-            ctensors = self.ctensors(ftensor)
-            if len(self.ctensors(ftensor)) > 0:
+            ctensors = self.ctensors(fobj)
+            if len(self.ctensors(fobj)) > 0:
                 assert all(ctensor == ctensors[0] for ctensor in ctensors), (
                     "The staging interface should be called before any operator partition."
                 )
 
-            producer, ptensor = self.producers(ftensor)[0], self.ptensors(ftensor)[0]
+            producer, pobj = self.producers(fobj)[0], self.ptensors(fobj)[0]
             psid = get_sid(producer)
             # outside of stages, not consider
             if psid is None: continue
 
             # group consumers into stages
-            consumers = self.consumers(ftensor)
+            consumers = self.consumers(fobj)
             csids = [get_sid(consumer) for consumer in consumers]
-            buckets = [[] for _ in range(len(fstages))]
+            buckets: List[List[IRFwOperation]] = [[] for _ in range(len(fstages))]
             for idx, csid in enumerate(csids):
                 buckets[csid].append(consumers[idx])
 
             # go through each stage to generate identity operators
-            out = ptensor
+            out = pobj
             end_sid = max(csids) + 1
             for sid in range(psid + 1, end_sid):
                 # insert identity
                 op = insert_identity(out, sid)
                 out = op.output(0)
-                # calculate gradient
-                curr_valmap = ValueMap((0, 1))
-                nconsumers = len(buckets[sid])
-                fgrad = ftensor.grad
-                for cidx, consumer in enumerate(buckets[sid]):
-                    if fgrad is None:
-                        grad = None
-                    else:
-                        valmap = curr_valmap.map((0, 2)) if cidx != nconsumers - 1 else curr_valmap
-                        grad = fgrad.select(ptensor.indmap, valmap)
-                        curr_valmap = curr_valmap.map((1, 2)) if cidx != nconsumers - 1 else curr_valmap
-                    # update forward consumer
-                    idx = consumer.inputs().index(ptensor)
-                    tensor = consumer.input(idx)
-                    with self.update(consumer) as consumer:
-                        consumer.set_input(idx, out)
-                        consumer.input(idx).grad = grad
-                    # update backward
-                    if tensor.grad is not None:
-                        with self.update(consumer.mirror) as bconsumer:
-                            idx = bconsumer.outputs().index(tensor.grad)
-                            bconsumer.set_output(idx, grad)
+
+                if isinstance(fobj, IRTensor):
+                    # calculate gradient
+                    curr_valmap = ValueMap((0, 1))
+                    nconsumers = len(buckets[sid])
+                    fgrad = fobj.grad
+                    for cidx, consumer in enumerate(buckets[sid]):
+                        if fgrad is None:
+                            grad = None
+                        else:
+                            valmap = curr_valmap.map((0, 2)) if cidx != nconsumers - 1 else curr_valmap
+                            grad = fgrad.select(pobj.indmap, valmap)
+                            curr_valmap = curr_valmap.map((1, 2)) if cidx != nconsumers - 1 else curr_valmap
+                        # update forward consumer
+                        idx = consumer.inputs().index(pobj)
+                        tensor = consumer.input(idx)
+                        with self.update(consumer) as consumer:
+                            consumer.set_input(idx, out)
+                            consumer.input(idx).grad = grad
+                        # update backward
+                        if tensor.grad is not None:
+                            with self.update(consumer.mirror) as bconsumer:
+                                idx = bconsumer.outputs().index(tensor.grad)
+                                bconsumer.set_output(idx, grad)
+                else:
+                    # IRObject without gradient, just update consumer
+                    for consumer in buckets[sid]:
+                        with self.update(consumer) as consumer:
+                            consumer.replace_input(pobj, out)
 
         # grouping into segment
         for sid in range(len(fstages)):

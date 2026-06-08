@@ -131,8 +131,6 @@ def wrap_ring_attn_varlen_func(
         enable_ring: bool = True,
         use_cute:  bool = False,
         process_group: Tuple[int] = None,
-        max_seqlen_q: Optional[int] = None,
-        max_seqlen_k: Optional[int] = None,
 ):
     '''
     wrap the ring_attn_varlen_func to support the distributed training in nnScaler.
@@ -142,22 +140,24 @@ def wrap_ring_attn_varlen_func(
     required communications.
     '''
     assert not return_attn_probs, "return_attn_probs is not supported in ring-attention"
-    if max_seqlen_q is None:
-        max_seqlen_q = (cu_seqlens_q[1:] - cu_seqlens_q[:-1]).max().item()
-    if max_seqlen_k is None:
-        max_seqlen_k = (cu_seqlens_k[1:] - cu_seqlens_k[:-1]).max().item()
+    max_seqlen_q = (cu_seqlens_q[1:] - cu_seqlens_q[:-1]).max().item()
+    max_seqlen_k = (cu_seqlens_k[1:] - cu_seqlens_k[:-1]).max().item()
 
     if process_group is None or len(process_group) == 1 or not enable_ring:
         if use_cute:
             assert flash_attn_cute_varlen_func is not None, "flash_attn.cute is not available"
-            output, _ = flash_attn_cute_varlen_func(
+            cute_window_size = tuple(None if w == -1 else w for w in window_size)
+            output, lse = flash_attn_cute_varlen_func(
                 q, k, v,
                 cu_seqlens_q=cu_seqlens_q,
                 cu_seqlens_k=cu_seqlens_k,
+                max_seqlen_q=max_seqlen_q,
+                max_seqlen_k=max_seqlen_k,
                 softmax_scale=softmax_scale,
                 causal=causal,
-                window_size=window_size,
+                window_size=cute_window_size,
                 deterministic=deterministic,
+                return_lse=True,
             )
             return output
         else:
@@ -192,7 +192,7 @@ def wrap_ring_attn_varlen_func(
     if local_process_group is None:
         local_process_group = dist.group.WORLD
 
-    if window_size == (-1, -1):
+    if window_size == (-1, -1) and not use_cute:
         # Use TransformerEngine with context parallelism if available and version is OK
         # Only use TransformerEngine CP path if env flag is enabled
         if _ENABLE_TE_CP and _HAS_TRANSFORMER_ENGINE and _TE_VERSION_OK and attn_forward_func_with_cp is not None:
@@ -259,7 +259,7 @@ def wrap_ring_attn_varlen_func(
         world_size=local_world_size,
     )
 
-    output = llama3_flash_attn_varlen_func(
+    out, softmax_lse = llama3_flash_attn_varlen_func(
         q,
         k,
         v,
@@ -274,11 +274,11 @@ def wrap_ring_attn_varlen_func(
         window_size=window_size,
         alibi_slopes=alibi_slopes,
         deterministic=deterministic,
-        return_attn_probs=False,
         group=local_process_group,
+        use_cute=use_cute,
     )
 
-    return output
+    return out
 
 
 def emit_ring(node: IRDimops, args: List[str], kwargs: Dict[str, str], runtime_devid: int, plan_ndevs: int, runtime_ndevs: int) -> str:
@@ -318,10 +318,8 @@ def emit_ring(node: IRDimops, args: List[str], kwargs: Dict[str, str], runtime_d
 
 def flash_attention_anno(query_states, key_states, value_states, cu_seqlens_q, cu_seqlens_k, alibi_slopes, *args, **kwargs) -> str:
     q_anno, kv_anno = gen_head_anno(query_states, key_states, value_states, head_pos=1)
-    if isinstance(alibi_slopes, IRTensor):
-        return f'l {q_anno} hd^, l {kv_anno} hd^, l {kv_anno} vd^, e^, e^, {q_anno} -> l {q_anno} vd^'
-    else:
-        return f'l {q_anno} hd^, l {kv_anno} hd^, l {kv_anno} vd^, e^, e^, ? -> l {q_anno} vd^'
+    alibi_anno = f'{q_anno}' if isinstance(alibi_slopes, IRTensor) else '?'
+    return f'l {q_anno} hd^, l {kv_anno} hd^, l {kv_anno} vd^, e^, e^, {alibi_anno} -> l {q_anno} vd^'
 
 
 def input_gen_fn(node: IRDimops):
@@ -333,7 +331,7 @@ def input_gen_fn(node: IRDimops):
             inputs.append(torch.randn(t.shape, dtype=t.dtype, device=device, requires_grad=t.requires_grad))
         elif i in [3, 4]: # cu_seqlens
             inputs.append(torch.Tensor([0, seqlen]).to(torch.int32).to(device))
-        elif i == 5: # optional alibi_slopes
+        elif i in [5]: # optional alibi_slopes
             if isinstance(t, IRTensor):
                 inputs.append(torch.randn(t.shape, dtype=t.dtype, device=device, requires_grad=t.requires_grad))
             else:

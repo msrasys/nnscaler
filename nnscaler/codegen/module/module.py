@@ -151,6 +151,11 @@ class ModuleCodeGen(FuncEmission):
                 hook_imports.add(inspect.getmodule(node.pre_hook).__name__)
             if node.post_hook is not None:
                 hook_imports.add(inspect.getmodule(node.post_hook).__name__)
+        for segment in execplan.graph.select(ntype=IRSegment):
+            if segment.pre_hook is not None:
+                hook_imports.add(inspect.getmodule(segment.pre_hook).__name__)
+            if segment.post_hook is not None:
+                hook_imports.add(inspect.getmodule(segment.post_hook).__name__)
         for modname in hook_imports:
             self.init_code.append(f'import {modname}')
             self.init_code += ['']
@@ -819,7 +824,7 @@ class ModuleCodeGen(FuncEmission):
             "ranks={ranks}, reduce_op={reduce_op}, "
             "async_op={async_op}, zero={zero}, max_bucket_size_bytes={max_nbytes}, "
             "zero_use_reduce_scatter={zero_use_reduce_scatter}, "
-            "zero_param_level_sharding={zero_param_level_sharding},"
+            "zero_param_level_sharding={zero_param_level_sharding}, "
             "zero_ngroups={zero_ngroups})"
         )
         reducer_add = 'self.add_reducer({reducer})'

@@ -3,10 +3,10 @@
 
 from typing import List, Optional, Tuple, Union
 import copy
+import inspect
 import logging
-import re as _re
 
-from nnscaler.ir.cten import IRCell, IRObject, IRTensor, IR
+from nnscaler.ir.cten import IRCell, IRTensor, IR
 from nnscaler.ir.operator import IRDataOperation, IRFwOperation
 from nnscaler.ir.tensor import IRSubTensor
 from nnscaler.ir.adapter import IRWeightReducer, IRAdapter
@@ -85,27 +85,6 @@ class ScheduleCodeGen(FuncEmission):
 
         args = ['model'] + [self.tensor_name(t) for t in self.execplan.graph.inputs()]
 
-        getitem_info = self._collect_getitem_info()
-
-        dataloader_var = None
-        for t in self.execplan.graph.inputs():
-            name = self.tensor_name(t)
-            if name.startswith('dataloader_'):
-                dataloader_var = name
-                break
-
-        # Collect upcoming samples reads (IRDataOperation -> samples_*)
-        # so the nontensor fallback can reuse them instead of adding extra reads
-        upcoming_samples_reads = []
-        for node in device_nodes:
-            unwrap = node.cell if isinstance(node, ExeReuseCell) else node
-            if isinstance(unwrap, IRDataOperation):
-                for out in node.outputs():
-                    if isinstance(out, IRObject):
-                        out_name = self.tensor_name(out)
-                        if 'samples_' in out_name:
-                            upcoming_samples_reads.append((out_name, out.tid))
-
         last_stream = None
         buffered_codes = []
 
@@ -175,12 +154,6 @@ class ScheduleCodeGen(FuncEmission):
                             last_backwards[node.cell.cid] = node
                     last_backward_node_oids = [id(node) for node in last_backwards.values()]
 
-                produced_tids = set()
-                for inp in IRSegment.get_objects_from_complex(self.execplan.graph.inputs()):
-                    if isinstance(inp, IRObject):
-                        produced_tids.add(inp.tid)
-
-                fallback_state = {'upcoming_samples': iter(upcoming_samples_reads)}
                 for line, node in enumerate(device_nodes):
                     # when use scheduler, skip reducer if it is not the last backward of same segments
                     if use_scheduler and _is_backward_segment(node):
@@ -188,22 +161,14 @@ class ScheduleCodeGen(FuncEmission):
                             f'nnscaler.flags.RuntimeFlag.skip_reducer = '
                             f'{id(node) not in last_backward_node_oids !r}'
                         )
-                    codes = self.emit_node(node, produced_tids=produced_tids,
-                                           getitem_info=getitem_info,
-                                           dataloader_var=dataloader_var,
-                                           fallback_state=fallback_state)
+                    codes = self.emit_node(node)
                     _append_code(fb, codes, self._get_node_stream(node))
                     # release
                     tensors = lifetime.release_tensors_after_line(line)
                     if len(tensors) > 0 : # not necessarily to have one after each line
                         _append_code(fb, self.emit_release(tensors))
-                    # track produced tids for downstream filtering
-                    for out in IRSegment.get_objects_from_complex(node.outputs()):
-                        if isinstance(out, IRObject):
-                            produced_tids.add(out.tid)
             # return code
             outputs = self.return_name_complex(self.execplan.outputs())
-            _append_code(fb, 'nnscaler.runtime.executor.AsyncCommHandler().drain_sends()')
             code = f'return {outputs}'
             _append_code(fb, code, force_flush=True)
 
@@ -222,39 +187,24 @@ class ScheduleCodeGen(FuncEmission):
                 # body code
                 if len(device_nodes) == 0:
                     _append_code(fb, 'pass')
-                infer_produced_tids = set()
-                for inp in IRSegment.get_objects_from_complex(self.execplan.graph.inputs()):
-                    if isinstance(inp, IRObject):
-                        infer_produced_tids.add(inp.tid)
-                infer_fallback_state = {'upcoming_samples': iter(upcoming_samples_reads)}
                 for line, node in enumerate(device_nodes):
                     if not node.isfw(): continue  # skip backward segments and adapters
                     # execute
-                    codes = self.emit_node(node, force_no_grad=True,
-                                           produced_tids=infer_produced_tids,
-                                           getitem_info=getitem_info,
-                                           dataloader_var=dataloader_var,
-                                           fallback_state=infer_fallback_state)
+                    codes = self.emit_node(node, force_no_grad=True)
                     _append_code(fb, codes, self._get_node_stream(node))
                     # release
                     tensors = lifetime.release_tensors_after_line(line)
                     tensors = [t for t in tensors if isinstance(t, IRTensor) and not t.is_grad()]
                     if len(tensors) > 0 : # not necessarily to have one after each line
                         _append_code(fb, self.emit_release(tensors))
-                    for out in IRSegment.get_objects_from_complex(node.outputs()):
-                        if isinstance(out, IRObject):
-                            infer_produced_tids.add(out.tid)
                 # return code
                 outputs = self.return_name_complex(self.execplan.outputs())
-                _append_code(fb, 'nnscaler.runtime.executor.AsyncCommHandler().drain_sends()')
                 code = f'return {outputs}'
                 _append_code(fb, code, force_flush=True)
             gencode += fb.code
         gencode += ['']
 
         code = '\n'.join(gencode)
-        dead_segs = self._find_dead_samples_segments(device_nodes)
-        code = self._remove_dead_dataloader_reads(code, dead_segs)
         # write to file
         if outfile:
             with open(outfile, 'a' if attach else 'w') as f:
@@ -314,225 +264,31 @@ class ScheduleCodeGen(FuncEmission):
                     for record_event in stream_context.record_events:
                         events.add(record_event)
 
-    @staticmethod
-    def _var_prefix(var_name: str) -> str:
-        return var_name.rsplit('_', 1)[0] if '_' in var_name else var_name
+    def _emit_segment_hook_code(
+            self, hook, hook_meta,
+            inputs_str: str,
+            is_pre: bool,
+            outputs_str: str = None
+        ) -> List[str]:
+        """Generate hook call code for a segment.
 
-    def _collect_getitem_info(self):
-        """Scan IR graph for non-tensor extraction ops from sample dicts.
+        Args:
+            hook: The hook function.
+            hook_meta: Meta data passed to the hook.
+            inputs_str: Tuple string of segment inputs.
+            is_pre: True for pre-hook, False for post-hook.
+            outputs_str: Tuple string of segment outputs (for post-hook).
 
-        Handles both ``_operator.getitem(samples, key)`` and
-        ``builtins.dict.get(samples, key)`` patterns.
-
-        Returns a dict mapping a variable-name prefix (derived from the IRObject
-        name, e.g. ``'getitem_1'``) to ``(key, src_prefix)`` where *key* is
-        the extraction key (e.g. ``'context'``) and *src_prefix* is the prefix
-        of the source dict variable (e.g. ``'getitem_1'`` for nested access,
-        or ``None`` when the source is not itself a tracked extraction).
+        Returns:
+            List[str]: lines of hook call code.
         """
-        _extract_signatures = {'_operator.getitem', 'builtins.dict.get'}
-        info = {}
-        for node in self.execplan.graph.nodes(flatten=True):
-            if not isinstance(node, IRFwOperation):
-                continue
-            if node.signature not in _extract_signatures:
-                continue
-            outputs = node.outputs()
-            if not outputs:
-                continue
-            out = outputs[0]
-            if isinstance(out, IRTensor):
-                continue
-            if not isinstance(out, IRObject):
-                continue
-            inputs = node.inputs()
-            if len(inputs) < 2:
-                continue
-            key_obj = inputs[1]
-            if isinstance(key_obj, IRObject) and isinstance(key_obj.value, str):
-                key = key_obj.value
-            elif isinstance(key_obj, str):
-                key = key_obj
-            else:
-                continue
-            full_var = self.tensor_name(out)
-            prefix = self._var_prefix(full_var)
-            src = inputs[0]
-            src_prefix = None
-            if isinstance(src, IRObject):
-                src_full = self.tensor_name(src)
-                src_prefix = self._var_prefix(src_full)
-            info[prefix] = (key, src_prefix)
-        return info
-
-    def _gen_nontensor_getitem_codes(self, node_inputs, produced_tids, getitem_info,
-                                      dataloader_var=None, fallback_state=None):
-        """Generate _operator.getitem calls for undefined non-tensor inputs.
-
-        Returns a list of code strings to prepend before the fexecute call.
-
-        When a non-tensor input's root source variable is not among node_inputs
-        (e.g. VPP pipeline intermediate ranks where ``samples`` is not a direct
-        input to this segment), falls back to reading from the dataloader once
-        and extracting from that.  The fallback source is local to each call so
-        that different microbatches get their own dataloader read.
-        """
-        if produced_tids is None or not getitem_info:
-            return []
-        codes = []
-        _local_fallback_var = None
-        for inp in node_inputs:
-            if isinstance(inp, IRTensor) or not isinstance(inp, IRObject):
-                continue
-            if inp.tid in produced_tids:
-                continue
-            var_name = self.tensor_name(inp)
-            prefix = self._var_prefix(var_name)
-            if prefix not in getitem_info:
-                continue
-            chain = []
-            cur = prefix
-            root_src_prefix = None
-            while cur in getitem_info:
-                key, src = getitem_info[cur]
-                chain.append(key)
-                root_src_prefix = src
-                if src is None or src not in getitem_info:
-                    break
-                cur = src
-            chain.reverse()
-            if root_src_prefix is None:
-                continue
-            source_var = None
-            for other_inp in node_inputs:
-                if not isinstance(other_inp, IRObject):
-                    continue
-                other_name = self.tensor_name(other_inp)
-                other_prefix = self._var_prefix(other_name)
-                if other_prefix == root_src_prefix:
-                    source_var = other_name
-                    break
-            if source_var is None:
-                if dataloader_var and fallback_state is not None:
-                    if _local_fallback_var is None:
-                        upcoming = fallback_state.get('upcoming_samples')
-                        fb_var, fb_tid = None, None
-                        if upcoming:
-                            try:
-                                fb_var, fb_tid = next(upcoming)
-                            except StopIteration:
-                                pass
-                        if fb_var is None:
-                            fb_var = '_nontensor_fallback_samples'
-                        codes.append(f"{fb_var} = next(*({dataloader_var}, ))")
-                        _local_fallback_var = fb_var
-                        if fb_tid is not None:
-                            produced_tids.add(fb_tid)
-                    source_var = _local_fallback_var
-                if source_var is None:
-                    continue
-            current_var = source_var
-            for i, k in enumerate(chain[:-1]):
-                inter_var = f'_nontensor_{inp.tid}_{i}'
-                codes.append(f"{inter_var} = _operator.getitem({current_var}, '{k}')")
-                current_var = inter_var
-            leaf_key = chain[-1] if chain else getitem_info[prefix][0]
-            codes.append(f"{var_name} = _operator.getitem({current_var}, '{leaf_key}')")
-            produced_tids.add(inp.tid)
-        return codes
-
-    def _find_dead_samples_segments(self, device_nodes) -> set:
-        """Find segment names where ``samples_*`` inputs are accepted but never
-        consumed by any internal operation.
-
-        Works at the IR level so it can see inside segment bodies that are
-        generated separately by ``ModuleCodeGen``.
-        """
-        dead = set()
-        for node in device_nodes:
-            unwrap_node = node.cell if isinstance(node, ExeReuseCell) else node
-            if not isinstance(unwrap_node, IRSegment) or not unwrap_node.isfw():
-                continue
-            samples_tids = set()
-            for inp in unwrap_node.inputs():
-                if isinstance(inp, IRObject) and not isinstance(inp, IRTensor):
-                    name = self.tensor_name(inp)
-                    if 'samples_' in name:
-                        samples_tids.add(inp.tid)
-            if not samples_tids:
-                continue
-            used = False
-            for internal_node in unwrap_node.nodes(flatten=True):
-                for inp in internal_node.inputs():
-                    if isinstance(inp, IRObject) and inp.tid in samples_tids:
-                        used = True
-                        break
-                if used:
-                    break
-            if not used:
-                dead.add(self.node_name(unwrap_node))
-        return dead
-
-    @staticmethod
-    def _remove_dead_dataloader_reads(code: str, dead_samples_segments: set = None) -> str:
-        """Remove ``samples_* = next(dataloader)`` lines where the variable
-        is never meaningfully read.
-
-        A read is considered dead when:
-        1. The variable is never referenced outside its assignment, OR
-        2. The variable is only passed as a dead parameter to ``fexecute``
-           (i.e. the corresponding segment function accepts but never uses
-           the parameter in its body).
-
-        ``dead_samples_segments`` is a set of segment names (e.g.
-        ``{'segment23986'}``) where ``samples_*`` parameters are not consumed
-        internally. When provided it is used directly; otherwise a text-based
-        fallback attempts (imperfectly) to detect them.
-        """
-        if dead_samples_segments is None:
-            dead_samples_segments = set()
-        lines = code.split('\n')
-
-        # collect next(dataloader) assignments
-        next_assignments = []
-        for i, line in enumerate(lines):
-            m = _re.match(r'^\s+(samples_\w+)\s*=\s*next\(', line)
-            if m:
-                next_assignments.append((i, m.group(1)))
-        if not next_assignments:
-            return code
-
-        var_assignment_lines = {}
-        for i, var in next_assignments:
-            var_assignment_lines.setdefault(var, set()).add(i)
-
-        # determine which reads are dead
-        dead_vars = set()
-        for var, assign_lines in var_assignment_lines.items():
-            pattern = _re.compile(r'\b' + _re.escape(var) + r'\b')
-            used_meaningfully = False
-            for i, line in enumerate(lines):
-                if i in assign_lines:
-                    continue
-                if not pattern.search(line):
-                    continue
-                fexecute_match = _re.search(r"fexecute\('(segment\d+)'", line)
-                if fexecute_match and fexecute_match.group(1) in dead_samples_segments:
-                    continue
-                used_meaningfully = True
-                break
-            if not used_meaningfully:
-                dead_vars.add(var)
-
-        if not dead_vars:
-            return code
-
-        dead_lines = set()
-        for i, var in next_assignments:
-            if var in dead_vars:
-                dead_lines.add(i)
-        lines = [l for i, l in enumerate(lines) if i not in dead_lines]
-        return '\n'.join(lines)
+        module_path = inspect.getmodule(hook).__name__
+        fsig = f'{module_path}.{hook.__name__}'
+        kwargs = '{}' # always pass empty kwargs for now, can be extended in the future if needed
+        if is_pre:
+            return [f'{fsig}(model, {repr(hook_meta)}, {inputs_str}, {kwargs})']
+        else:
+            return [f'{fsig}(model, {repr(hook_meta)}, {inputs_str}, {kwargs}, {outputs_str})']
 
     def emit_detach(self, tensor: IRTensor) -> str:
         """
@@ -540,9 +296,7 @@ class ScheduleCodeGen(FuncEmission):
         """
         return f'{self.tensor_name(tensor)} = {self.tensor_name(tensor)}.detach()'
 
-    def emit_node(self, node: IRCell, force_no_grad: bool = False,
-                  produced_tids: set = None, getitem_info: dict = None,
-                  dataloader_var: str = None, fallback_state: dict = None) -> List[str]:
+    def emit_node(self, node: IRCell, force_no_grad: bool = False) -> List[str]:
         """
         Emit node / subgraph code
         """
@@ -565,44 +319,53 @@ class ScheduleCodeGen(FuncEmission):
         stream_context = self._get_node_stream_context(node)
 
         if isinstance(unwrap_node, IRSegment):
+            # segment hooks
+            pre_hook, post_hook, hook_meta = unwrap_node.pre_hook, unwrap_node.post_hook, unwrap_node.hook_meta
             # emit forward segment
             if node.isfw():
-                getitem_codes = self._gen_nontensor_getitem_codes(
-                    node_inputs, produced_tids, getitem_info,
-                    dataloader_var=dataloader_var, fallback_state=fallback_state)
-                codes = getitem_codes + [fsign.format(
+                codes = [fsign.format(
                     outputs = outputs,
                     name = f"'{name}'",
                     model = f'model.{name}',
                     inputs = inputs,
                     req_grad = req_grad
                 )]
+                if pre_hook:
+                    codes = self._emit_segment_hook_code(pre_hook, hook_meta, inputs, is_pre=True) + codes
+                if post_hook:
+                    codes = codes + self._emit_segment_hook_code(
+                        post_hook, hook_meta, inputs, is_pre=False,
+                        outputs_str=outputs if len(node_outputs) <= 1 else f'({outputs})'
+                    )
             else:
                 # get gradient computation arguments
                 input_tensors, output_tensors, output_grads, input_grads = \
                         self.get_backward_callsite_io_tensors(node)
+                gen_inputs = (input_tensors, output_tensors, output_grads)
                 # special handle for loss
                 for idx, tensor in enumerate(output_grads):
                     if isinstance(tensor, IRSubTensor) and tensor.is_loss():
                         output_grads[idx] = None
-                # filter out (output_tensor, output_grad) pairs where the
-                # grad was never produced by an earlier node in this stage
-                if produced_tids is not None:
-                    filtered_ot, filtered_og = [], []
-                    for ot, og in zip(output_tensors, output_grads):
-                        if og is None or (isinstance(og, IRSubTensor) and og.tid in produced_tids):
-                            filtered_ot.append(ot)
-                            filtered_og.append(og)
-                    output_tensors = filtered_ot
-                    output_grads = filtered_og
-                gen_inputs = (input_tensors, output_tensors, output_grads)
+
+                input_grads_str = self.return_name(input_grads)
+                input_tensors_str = self.tuple_name(input_tensors, skip_attr=True, prefix_attr='model.')
+                output_tensors_str = self.tuple_name(output_tensors, skip_attr=True, prefix_attr='model.')
+                output_grads_str = self.tuple_name(output_grads, skip_attr=True, prefix_attr='model.')
                 codes = [bsign.format(
-                    name = f"'{self.node_name(unwrap_node.mirror)}'",
-                    input_grads = self.return_name(input_grads),
-                    input_tensors = self.tuple_name(input_tensors, skip_attr=True, prefix_attr='model.'),
-                    output_tensors = self.tuple_name(output_tensors, skip_attr=True, prefix_attr='model.'),
-                    output_grads = self.tuple_name(output_grads, skip_attr=True, prefix_attr='model.')
+                    name = f"'{self.node_name(unwrap_node.mirror)}'", # always use name of fw segment
+                    input_grads = input_grads_str,
+                    input_tensors = input_tensors_str,
+                    output_tensors = output_tensors_str,
+                    output_grads = output_grads_str
                 )]
+
+                bwd_input_str = f'({input_tensors_str}, {output_tensors_str}, {output_grads_str})'
+                bwd_output_str = input_grads_str if len(input_grads) <= 1 else f'({input_grads_str})'
+                if pre_hook:
+                    codes = self._emit_segment_hook_code(pre_hook, hook_meta, bwd_input_str, is_pre=True) + codes
+                if post_hook:
+                    codes = codes + self._emit_segment_hook_code(post_hook, hook_meta, bwd_input_str, is_pre=False, outputs_str=bwd_output_str)
+
                 """
                 In the end2end mode, although the graph's output may contain tensors that requires grad,
                 like the loss tensor, the backward pass has been done by the nnscaler runtime by calling
@@ -621,16 +384,7 @@ class ScheduleCodeGen(FuncEmission):
                         codes.append(self.emit_detach(tensor))
 
         elif isinstance(unwrap_node, IRDataOperation):
-            already_produced = False
-            if produced_tids is not None:
-                for out in node_outputs:
-                    if isinstance(out, IRObject) and out.tid in produced_tids:
-                        already_produced = True
-                        break
-            if already_produced:
-                codes = []
-            else:
-                codes = [f'{outputs} = {unwrap_node.signature}(*{inputs})']
+            codes = [f'{outputs} = {unwrap_node.signature}(*{inputs})']
 
         elif isinstance(unwrap_node, IRAdapter):
             codes = [asign.format(

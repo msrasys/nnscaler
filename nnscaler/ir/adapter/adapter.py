@@ -7,13 +7,13 @@ import copy
 import torch
 
 from nnscaler.ir.adapter.prim import IRAdapterPrim, IdentityPrim
-from nnscaler.ir.tensor import IRSubTensor
-from nnscaler.ir.cten import IRCell
+from nnscaler.ir.tensor import IRSubTensor, IRTensor
+from nnscaler.ir.cten import IRCell, IRObject
 
 
 class IRAdapter(IRCell):
 
-    def __init__(self, inputs: List[IRSubTensor], outputs: List[IRSubTensor]):
+    def __init__(self, inputs: List[IRObject], outputs: List[IRObject]):
         super().__init__(
             name='adapter', signature='adapter',
             input_length=len(inputs),
@@ -37,8 +37,9 @@ class IRAdapter(IRCell):
         self._recompute = None
 
         # setup whether this adapter is for forward stage
-        is_fw = any(not t.is_grad() for t in self.inputs() + self.outputs())
-        is_bw = any(t.is_grad() for t in self.inputs() + self.outputs())
+        # non-tensor IRObject is always forward (not gradient)
+        is_fw = any(not isinstance(t, IRTensor) or not t.is_grad() for t in self.inputs() + self.outputs())
+        is_bw = any(isinstance(t, IRTensor) and t.is_grad() for t in self.inputs() + self.outputs())
         assert not (is_fw and is_bw), "An IRAdapter cannot serve for both forward and backward stage"
         self._forward = is_fw
 
@@ -205,6 +206,12 @@ class IRWeightReducer(IRCell):
         if not weights:
             return []
 
+        # TODO: group weights by both dtype and grad_dtype
+        # currently we assume all grad dtypes are
+        # 1. the same as weight dtype, or
+        # 2. all the same (e.g., all fp32) if grad_dtype is set in training config
+        # But when we support more flexible grad dtype configuration in the future,
+        # we should consider grad dtype when grouping weights for reducers
         dtype_groups: Dict[torch.dtype, List[IRSubTensor]] = {}
         for sub in weights:
             dtype_groups.setdefault(sub.dtype, []).append(sub)

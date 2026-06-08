@@ -21,6 +21,7 @@ import torch
 import nnscaler
 from nnscaler.utils import enforce_zero_num_worker, fields, transform_recursively, load_type, copy_dynamic
 from nnscaler.parallel import ComputeConfig, build_optimizer, ReuseType, BroadcastGenFilesStrategy, _PREDEFINED_POLICIES
+from nnscaler.runtime.utils import set_grad_dtype
 
 from .arg_parser import (
     deserialize_dataclass,
@@ -40,7 +41,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-_TENSOR_TYPE = Literal['param', 'buffer', 'input']
+_TENSOR_TYPE = Literal['param', 'buffer', 'input', 'grad']
 _PRECISION_TYPE = Literal['fp32', 'fp16', 'bf16', 'none']
 _PRECISION_MAP = {
     'fp32': torch.float32,
@@ -52,13 +53,14 @@ _SELF_ARG_VALUE = 'self'
 _LOSS_TYPE = TypeVar('_LOSS_TYPE')
 
 
-def _get_tensor_dtype(precision: Dict[_TENSOR_TYPE, _PRECISION_TYPE], tensor_type: _TENSOR_TYPE) -> torch.dtype:
+def _get_tensor_dtype(precision: Dict[_TENSOR_TYPE, _PRECISION_TYPE], tensor_type: _TENSOR_TYPE) -> Optional[torch.dtype]:
     return _PRECISION_MAP[precision[tensor_type]]
 
 
 def _to_precision(module: torch.nn.Module, precision: Dict[_TENSOR_TYPE, _PRECISION_TYPE]):
     param_dtype = _get_tensor_dtype(precision, 'param')
     buffer_dtype = _get_tensor_dtype(precision, 'buffer')
+    grad_dtype = _get_tensor_dtype(precision, 'grad')
 
     if param_dtype == buffer_dtype:
         if param_dtype is not None:
@@ -82,23 +84,51 @@ def _to_precision(module: torch.nn.Module, precision: Dict[_TENSOR_TYPE, _PRECIS
                     if t.is_floating_point() and id(t) in buf_ids
                     else t)
 
+    set_grad_dtype(module, grad_dtype)
+
     return module
 
 
 def _resolve_precision(precision: Union[str, Dict[_TENSOR_TYPE, _PRECISION_TYPE]]):
     supported_precision_type = get_args(_PRECISION_TYPE)
     supported_tensor_type = get_args(_TENSOR_TYPE)
+    pbi_tensor_type = tuple(t for t in supported_tensor_type if t != 'grad')
+    supported_tensor_type_short = {t[0]: t for t in supported_tensor_type}
+
     if not precision:
         precision = 'none'
+
     if isinstance(precision, str):
-        precision = {k: precision for k in supported_tensor_type}
+        precision = {k: precision for k in pbi_tensor_type}
+
+    if isinstance(precision, dict):
+        # sorted/reversed is for key priority
+        # 1. sorted: shorter keys have higher priority so that 'p' has higher priority than 'pb'
+        # 2. reversed: later keys have higher priority than earlier keys of the same length
+        for k in sorted(reversed(list(precision.keys())), key=lambda x: len(x)):
+            if k in supported_tensor_type:
+                continue
+
+            v = precision.pop(k)
+            # expand abbreviations like 'pb' -> 'param', 'buffer'
+            for skey in k:
+                if skey not in supported_tensor_type_short:
+                    raise ValueError(f"Invalid tensor type abbreviation {skey} found in {k}")
+                tensor_type = supported_tensor_type_short[skey]
+                if tensor_type not in precision:
+                    precision[tensor_type] = v
+
     for tensor_type in supported_tensor_type:
         if tensor_type not in precision:
             precision[tensor_type] = 'none'
         if precision[tensor_type] not in supported_precision_type:
             raise ValueError(f"Invalid precision {precision[tensor_type]} for {tensor_type}")
+
     if any(k not in supported_tensor_type for k in precision):
         raise ValueError(f"Invalid tensor type found in {precision.keys()}")
+
+    if _get_tensor_dtype(precision, 'grad') is not None and torch.__version__ < (2, 10):
+        raise RuntimeError(f'setting grad precision is only supported in PyTorch 2.10 or above, but got {torch.__version__}')
 
     return precision
 
@@ -131,8 +161,15 @@ class PrecisionMixin:
     def input_dtype(self):
         return _get_tensor_dtype(self.precision, 'input')
 
+    @property
+    def grad_dtype(self):
+        return _get_tensor_dtype(self.precision, 'grad')
+
     def fix_input(self, input):
         return fix_input(input, input_dtype=self.input_dtype)
+
+    def set_grad_dtype(self, module):
+        set_grad_dtype(module, self.grad_dtype)
 
     def to_precision(self, module):
         return _to_precision(module, self.precision)

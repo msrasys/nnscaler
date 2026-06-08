@@ -29,9 +29,15 @@ class _DeviceGroup:
             self.node_rank = 0
         else:
             if not torch.distributed.is_initialized():
-                torch.distributed.init_process_group(
-                    backend='nccl', timeout=_LARGE_TIMEOUT
-                )
+                if torch.__version__ >= (2, 3):
+                    torch.distributed.init_process_group(
+                        backend='nccl', timeout=_LARGE_TIMEOUT,
+                        device_id=int(os.environ.get('LOCAL_RANK')),
+                    )
+                else:
+                    torch.distributed.init_process_group(
+                        backend='nccl', timeout=_LARGE_TIMEOUT,
+                    )
                 self._is_pg_initer = True
 
             # disable it for now due to connection refused error when nnodes > 1

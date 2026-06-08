@@ -454,7 +454,9 @@ class PlanBase:
                         break
             # we guarantee each dataloader is inserted into the schedule plan,
             # in case that graph output requires the data from dataloader.
-            for mid in range(self._num_microbatches):
+            # Use reversed order because insert_block uses insert(0, ...),
+            # which reverses the insertion order, so this yields ascending mid order.
+            for mid in reversed(range(self._num_microbatches)):
                 if mid not in inserted_mids:
                     insert_block(dl, mid, self.nsteps - 1)
 

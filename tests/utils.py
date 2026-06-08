@@ -261,14 +261,39 @@ def mock_dist(rank, world_size):
 
     old_store_based_barrier = c10d._store_based_barrier
     old_new_group = dist.new_group
+    old_get_world_size = torch.distributed.get_world_size
+    old_get_rank = torch.distributed.get_rank
+
+    class FakeGroup:
+        def __init__(self, rank, world_size):
+            self.rank = rank
+            self.world_size = world_size
+
+    def get_world_size(group=None):
+        if isinstance(group, FakeGroup):
+            return group.world_size
+        return old_get_world_size(group=group)
+
+    def get_rank(group=None):
+        if isinstance(group, FakeGroup):
+            return group.rank
+        return old_get_rank(group=group)
+
     try:
         c10d._store_based_barrier = lambda *args, **kwargs: None
         mock_init_dist(rank, world_size)
-        dist.new_group = lambda *args, **kwargs: None
+        dist.new_group = lambda ranks, *args, **kwargs: FakeGroup(
+            rank=ranks.index(rank) if rank in ranks else -1, world_size=len(ranks)
+        )
+        dist.get_rank = get_rank
+        dist.get_world_size = get_world_size
         yield
     finally:
         dist.destroy_process_group()
         c10d._store_based_barrier = old_store_based_barrier
+        dist.new_group = old_new_group
+        dist.get_world_size = old_get_world_size
+        dist.get_rank = old_get_rank
 
 
 @contextmanager

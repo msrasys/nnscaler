@@ -632,6 +632,88 @@ def trainer_grad_sync_check(save_dir, use_bf16, zero_ngroups, runtime_ngpus):
     torch.distributed.barrier()
 
 
+def trainer_grad_dtype_worker(save_dir, use_zero):
+    save_dir = Path(save_dir)
+    config_path = str(Path(__file__).with_name('trainer_args.yaml').resolve())
+
+    instance_name = f'grad_dtype_fp32'
+    gen_savedir = save_dir / 'gen' / instance_name
+    ckpt_savedir = save_dir / 'ckpt' / instance_name
+
+    common_options = [
+        '--precision.pbi', 'bf16',
+        '--enable_progress_bar', 'false',
+        '--compute_config.plan_ngpus', '1',
+        '--compute_config.runtime_ngpus', '2',
+        '--compute_config.use_zero', str(use_zero),
+        '--optimizer.type', 'nnscaler.runtime.f16_optimizer.MixedPrecisionAdam',
+    ]
+
+    trainer = Trainer([
+        '-f', config_path,
+        '--precision.grad', 'fp32',
+        '--instance_name', instance_name,
+        '--gen_savedir', str(gen_savedir),
+        '--checkpoint.save_dir', str(ckpt_savedir),
+        *common_options
+    ])
+    trainer.run()
+
+    # verify the reducer's grad buffer is fp32 while params are bf16
+    from nnscaler.parallel import ParallelModule
+    for m in trainer.model.modules():
+        if isinstance(m, ParallelModule):
+            for reducer in m.reducers:
+                assert reducer._contiguous_grads.dtype == torch.float32
+                assert reducer._contiguous_params.dtype == torch.bfloat16
+
+    torch.distributed.barrier()
+
+    if trainer.rank == 0:
+        Trainer.merge_checkpoint(list((ckpt_savedir / 'last').glob('*.ckpt')), save_dir / 'result_fp32.pt')
+
+    torch.distributed.barrier()
+
+    instance_name = f'grad_dtype_bf16'
+    gen_savedir = save_dir / 'gen' / instance_name
+    ckpt_savedir = save_dir / 'ckpt' / instance_name
+    trainer = Trainer([
+        '-f', config_path,
+        '--instance_name', instance_name,
+        '--gen_savedir', str(gen_savedir),
+        '--checkpoint.save_dir', str(ckpt_savedir),
+        *common_options
+    ])
+    trainer.run()
+
+    # verify the reducer's grad buffer and params are bf16
+    from nnscaler.parallel import ParallelModule
+    for m in trainer.model.modules():
+        if isinstance(m, ParallelModule):
+            for reducer in m.reducers:
+                assert reducer._contiguous_grads.dtype == torch.bfloat16
+                assert reducer._contiguous_params.dtype == torch.bfloat16
+
+    if trainer.rank == 0:
+        Trainer.merge_checkpoint(list((ckpt_savedir / 'last').glob('*.ckpt')), save_dir / 'result_bf16.pt')
+
+        # the difference is big.
+        # fp32_ckpt = torch.load(save_dir / 'result_fp32.pt', weights_only=False)
+        # bf16_ckpt = torch.load(save_dir / 'result_bf16.pt', weights_only=False)
+
+        # assert_equal(fp32_ckpt['model'], bf16_ckpt['model'])
+        # assert_equal(fp32_ckpt['optimizer']['state'], bf16_ckpt['optimizer']['state'])
+
+    torch.distributed.barrier()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.device_count() < 2, reason='lack of gpu devices')
+@pytest.mark.skipif(torch.__version__ < (2, 10), reason='requires torch >= 2.10 for grad_dtype support')
+@pytest.mark.parametrize('use_zero', [0, 1])
+def test_trainer_grad_dtype(tmp_path, use_zero):
+    launch_torchrun(2, trainer_grad_dtype_worker, tmp_path, use_zero)
+
+
 def trainer_correctness_worker(save_dir, parallel_type=0, async_reducer=False, hybrid_opt=False, use_zero=0, zero_param_level_sharding=False, reducer_bucket_cap_mb=1e-6):
     save_dir = Path(save_dir)
     config_path = str(Path(__file__).with_name('trainer_args.yaml').resolve())

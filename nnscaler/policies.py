@@ -490,6 +490,103 @@ def get_pas_ops(graph: IRGraph) -> List[IRFwOperation]:
     return graph.select(ntype=IRFwOperation)
 
 
+def _identity_segment_output(graph: IRGraph, tensor: IRSubTensor, segment: IRSegment, all_segments: List[IRSegment]) -> IRFwOperation:
+    """
+    Insert an identity operator for the segment output tensor to make it easier to handle in policy.
+    After the insertion, the original output tensor will be replaced by the identity operator's output tensor in the graph.
+    The effect of this function is like:
+    Before:
+    ```
+    x = op1(...)
+    y = op2(x, ...)
+    return x, y
+    ```
+    After:
+    ```
+    x = op1(...)
+    y = op2(x, ...)
+    z = identity(x)
+    return z, y
+    ```
+    In other words, the segment output will never be inputs to any operators.
+
+    """
+    from nnscaler.graph.function.function import Identity
+
+    last_fwop_idx = -1
+    for idx, node in enumerate(segment._nodes):
+        if isinstance(node, IRFwOperation):
+            last_fwop_idx = idx
+    insert_idx = last_fwop_idx + 1
+
+    fwop = Identity(tensor)
+    output = tensor.parent.like().tosub()
+    fwop.set_output(0, output)
+    fwop.device = segment.device
+    if tensor.requires_grad:
+        # set input grad
+        igrad = tensor.parent.grad.select(tensor.indmap, tensor.valmap)
+        fwop.input(0).grad = igrad
+        # set output grad
+        otensor = fwop.output(0).parent
+        ograd = otensor.grad.select(tensor.indmap, (0,1))
+        fwop.output(0).grad = ograd
+        # insert identity
+        segment.finsert(fwop, insert_idx)
+    else:
+        segment.insert(fwop, insert_idx)
+
+    # replace the original output tensor with the identity output tensor in the entire graph
+    # this includes:
+    # 1. forward output
+    # 2. backward grad input (if the tensor requires grad)
+    # 3. graph output (if the original output tensor is also a graph output)
+    # 4. graph mirror input (if the tensor requires grad and graph has mirror)
+    # 5. following segments' forward input
+    # 6. Nodes in the following segments that consume the original output tensor (if any)
+    # 7. following segments' backward grad input (if the tensor requires grad)
+    # 8. Nodes in the following segments that produce the original output tensor's grad (if any)
+
+    # forward output
+    segment.replace_output(tensor, fwop.output(0))
+    # backward grad input
+    if tensor.grad and segment.mirror:
+        segment.mirror.replace_input(tensor.grad, fwop.output(0).grad)
+
+    # replace the original output tensor with the identity output tensor in the entire graph
+    if graph != segment:
+        if tensor in IRCell.get_objects_from_complex(graph.oobjs()):
+            graph.replace_output(tensor, fwop.output(0))
+        # should never goes here.
+        # in current implementation, the graph mirror is the graph itself
+        # (graph contains both forward and backward nodes)
+        # so the following check will never be true.
+        if tensor.grad and graph.mirror and tensor.grad in IRCell.get_objects_from_complex(graph.mirror.iobjs()):
+            graph.mirror.replace_input(tensor.grad, fwop.output(0).grad)
+
+    # replace the original output tensor with the identity output tensor
+    # in the following segments
+    for s in all_segments:
+        if s == segment:
+            continue
+
+        # forward
+        if tensor in IRCell.get_objects_from_complex(s.iobjs()):
+            s.replace_input(tensor, fwop.output(0))
+            for consumer in s.consumers(tensor.parent):
+                with s.update(consumer):
+                    consumer.replace_input(tensor, fwop.output(0))
+
+        # backward grad
+        if tensor.grad and s.mirror and tensor.grad in IRCell.get_objects_from_complex(s.mirror.oobjs()):
+            s.mirror.replace_output(tensor.grad, fwop.output(0).grad)
+            for producer in s.mirror.producers(tensor.grad.parent):
+                with s.mirror.update(producer):
+                    producer.replace_output(tensor.grad, fwop.output(0).grad)
+
+    return fwop
+
+
 def fn(
         graph: IRGraph, cfg: 'ComputeConfig',
         policy: Union[
@@ -551,8 +648,16 @@ def fn(
     # key: IRFullTensor
     # value:
     #   key: stage_id
-    #   value: set of dims in this stage, None if the tensor is replicated in this stage
-    tensor_splits: dict[IRFullTensor, dict[int, set[Optional[int]]]] = {}
+    #   value: set of dims in this stage,
+    #       'rr' if the tensor is replicated and grad will be all-reduced:
+    #            One case where grad will be all-reduced:
+    #            1. op is partitioned on other tensors, and this tensor is not marked as '/'(no-grad-reduce)
+    #       'rn' if the tensor is replicated and grad will not be all-reduced.
+    #            Two cases where grad will not be all-reduced:
+    #            1. op is partitioned on other tensors, and this tensor is marked as '/'(no-grad-reduce)
+    #            2. op is replicated
+    #       int: the partitioned dim if the tensor is partitioned
+    tensor_splits: dict[IRFullTensor, dict[int, set[int | Literal['rr', 'rn']]]] = {}
     # store the last split info for each tensor to help handle auto partition
     # None: replicated
     # 'value': value partitioned
@@ -603,7 +708,7 @@ def fn(
 
         # final partition plan for the op
         # key: input idx, value: partitioned dim
-        op_partition_map: dict[int, int] = {}
+        op_partition_map: dict[int, int | Literal['rn', 'rr']] = {}
         if op_partitions:
             # we partition the op based on the first partition plan
             # and then check the rest partitions are satisfied or not
@@ -611,10 +716,11 @@ def fn(
             partitioned_nodes = op_plan.op.algorithm('dim')\
                 .instantiate(idx=op_first_partition.input, dim=op_first_partition.dim, num=ngpus)
             subnode = partitioned_nodes[0]  # first subnode carries all necessary partition info
+            assert isinstance(subnode, IRDimops), "Internal Error: partitioned node should be IRDimops"
 
             # collect input partition info
             # key: input idx, value: partitioned dim
-            result_partitions: dict[int, int] = {}
+            result_partitions: dict[int, int | Literal['rn', 'rr']] = {}
             for idx, input in enumerate(subnode.inputs()):
                 if not isinstance(input, IRSubTensor):
                     continue
@@ -622,6 +728,8 @@ def fn(
                 assert len(split_dims) <= 1, "Internal Error: multiple splitdims in one input"
                 if split_dims:
                     result_partitions[idx] = split_dims[0]
+                else:
+                    result_partitions[idx] = 'rn' if subnode.ignore_grad_reduce(input_idx=idx) else 'rr'
 
             # check the rest partitions
             # Note if we only have one partition plan, the check is skipped, we can always partition it
@@ -677,7 +785,10 @@ def fn(
             if ftensor not in tensor_splits:
                 tensor_splits[ftensor] = {}
             if idx not in op_partition_map:
-                tensor_splits[ftensor].setdefault(op_plan.stage_id, set()).add(None)
+                assert not op_partition_map, "Internal Error: if op_partition_map is not empty, all input should have partition info"
+                # if the op is not partitioned,
+                # all inputs should be replicated, and no grad accumulation is needed
+                tensor_splits[ftensor].setdefault(op_plan.stage_id, set()).add('rn')
             else:
                 tensor_splits[ftensor].setdefault(op_plan.stage_id, set()).add(op_partition_map[idx])
 
@@ -721,12 +832,6 @@ def fn(
         cfg.pas_config.get('pipeline_multiref_replicated_params', True)
     tp_size = ngpus // pp_size
 
-    def stages_share_physical_pipeline_rank(stage_ids: Iterable[int]) -> bool:
-        """Return True when VPP logical stages map to one physical PP rank."""
-        if not pp_enabled or nstages <= pp_size:
-            return False
-        return len({stage_id % pp_size for stage_id in stage_ids}) == 1
-
     if pp_enabled:
         if not cfg.use_end2end:
             raise ValueError("Pipeline parallelism requires use_end2end to be True")
@@ -757,16 +862,16 @@ def fn(
         if not ftensor.is_param():
             continue
         splits = set(k for v in stage_info.values() for k in v)
-        find_replicated = None in splits
-        colocated_replicated_vpp_param = (
-            find_replicated and len(splits) == 1
-            and len(stage_info) > 1
-            and stages_share_physical_pipeline_rank(stage_info.keys())
-        )
+        find_replicated = 'rr' in splits or 'rn' in splits
         splits = list(splits)
         # For safety, we will add multiref when detecting shared param are all replicated for pipeline parallelism.
         # The reason is that stages may have different number of devices, it is hard to synchronize gradients directly
         # by inserting reducers although weights are all REPLICAED.
+
+        # The effect is that the parameter will be converted to a normal tensor
+        # and will be passed to the next stages.
+        # So only the first stage will have the parameter as a parameter,
+        # and the later stages will have it as an activation tensor.
 
         # A further explanation:
         # 1. len(splits) > 1: the param is partitioned in different ways in its different consumers.
@@ -777,21 +882,20 @@ def fn(
         # 4. (2) and (3): if the param is shared across stages and is replicated in at least one stage.
         #    Note: the case when some is replicated and some is partitioned is handled by (1).
 
-        if len(splits) > 1 or (
-            pp_multiref_replicated_params
-            and len(stage_info) > 1
-            and find_replicated
-            and not colocated_replicated_vpp_param
-        ):
+        if len(splits) > 1 or (pp_multiref_replicated_params and len(stage_info) > 1 and find_replicated):
             _logger.info(f'add multiref for shared param {ftensor}')
             graph.multiref(ftensor, comment='shared param')
-        elif colocated_replicated_vpp_param:
-            _logger.info(
-                f'skip multiref for VPP colocated shared param {ftensor}; '
-                f'logical stages={sorted(stage_info.keys())}, physical stage={next(iter(stage_info)) % pp_size}'
-            )
 
     # set pipeline stages
+    # Note we must stage graph before any transformation to the graph,
+    #      which is required by graph.group and graph.create_segment to work correctly.
+    # The consequence is that the inputs and outputs of the segment will always be complete tensors.
+    # For example:
+    # If the output subtensor of last operator in stage 0 can
+    # exactly fit into the input subtensor of the first operator in stage 1,
+    # we still need to insert adapters to
+    # collect the subtensors into a complete tensor as the output of stage 0,
+    # and then split it again as the input of stage 1.
     if pp_enabled:
         graph.staging([s[0] for s in pp_stages])
         pp_segs: list[IRSegment] = graph.select(ntype=IRSegment, flatten=False)
@@ -808,6 +912,16 @@ def fn(
                 # TODO: is it possible to have TP here?
                 op_plans[node] = OpPlan(op=node, stage_id=stage_id, partition=None)
 
+    for stage_id, seg in enumerate(pp_segs):
+        for sub_tensor in IR.get_objects(seg.outputs()):
+            if not isinstance(sub_tensor, IRSubTensor):
+                continue
+            if seg.consumers(sub_tensor.parent):
+                ident_op = _identity_segment_output(graph, sub_tensor, seg, pp_segs)
+                op_plans[ident_op] = OpPlan(op=ident_op, stage_id=stage_id, partition=None)
+                # 'rn' means `ident_op` is replicated and grad doesn't need to be all-reduced
+                tensor_splits[sub_tensor.parent].setdefault(stage_id, set()).add('rn')
+
     # add multiref to an activation tensor when the states of the tensor and its grad are different
     # among consumers and current segment's outputs
     for ftensor, stage_info in tensor_splits.items():
@@ -822,13 +936,12 @@ def fn(
                 stage.outputs(),
                 lambda x: isinstance(x, IRSubTensor) and x.parent == ftensor
             )
+            assert not is_seg_output[idx] or not stage.consumers(ftensor)
 
         for idx, splits in stage_info.items():
             stage = pp_segs[idx]
             split_list = list(splits)
-            if len(split_list) > 1 or (
-                is_seg_output[idx] and split_list[0] is not None # treat segment output as a consumer
-            ):
+            if len(split_list) > 1:
                 _logger.debug(f'add multiref for {ftensor} in stage {stage}')
                 stage.multiref(ftensor, comment='activation')
 

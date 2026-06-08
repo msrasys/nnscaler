@@ -49,6 +49,27 @@ def move(tensor: Optional[torch.Tensor], shape: Tuple[int], dtype: torch.dtype, 
     return tensor
 
 
+def move_object(obj, src: int, dst: int, async_op=False):
+    """
+    Move a non-tensor object from source device to destination device
+    using send_object_list / recv_object_list.
+    """
+    if async_op:
+        raise NotImplementedError("Async move_object is not implemented yet")
+
+    CudaTimer().start(field_name='comm', predefined=True)
+    rank = torch.distributed.get_rank()
+    if rank == src:
+        torch.distributed.send_object_list([obj], dst=dst)
+    else:
+        assert rank == dst
+        obj_list = [None]
+        torch.distributed.recv_object_list(obj_list, src=src)
+        obj = obj_list[0]
+    CudaTimer().stop(field_name='comm', predefined=True)
+    return obj
+
+
 def all_reduce(tensor: torch.Tensor,
                ranks: List[int], async_op=False) -> torch.Tensor:
     """Allreduce"""
@@ -321,3 +342,28 @@ def broadcast(itensor: torch.Tensor, shape: Tuple[int], dtype: torch.dtype, src:
     if not async_op:
         CudaTimer().stop(field_name='comm', predefined=True)
     return tensor
+
+
+def broadcast_object(obj, src: int, ranks: List[int], async_op=False):
+    """
+    Broadcast a non-tensor object using broadcast_object_list.
+    """
+    if async_op:
+        raise NotImplementedError("Async broadcast_object is not implemented yet")
+
+    if src not in ranks:
+        raise ValueError(f"src {src} must be in ranks {ranks}")
+
+    CudaTimer().start(field_name='comm', predefined=True)
+    rank = torch.distributed.get_rank()
+    group = DeviceGroup().get_group(ranks)
+    if rank == src:
+        torch.distributed.broadcast_object_list([obj], src=src, group=group)
+    else:
+        assert rank in ranks
+        obj_list = [None]
+        torch.distributed.broadcast_object_list(obj_list, src=src, group=group)
+        obj = obj_list[0]
+
+    CudaTimer().stop(field_name='comm', predefined=True)
+    return obj

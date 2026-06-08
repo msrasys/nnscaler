@@ -20,3 +20,4 @@ tensorboard
 mosaicml-streaming
 cppimport
 einops
+git+https://github.com/microsoft/dion.git
