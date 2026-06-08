@@ -229,14 +229,6 @@ class NormalAddMulMultirefModule(torch.nn.Module):
         return y - z
 
 
-def normal_add_split_policy(graph, cfg):
-    from nnscaler.policies import get_pas_ops, OpPlan, OpPartition
-
-    for node in get_pas_ops(graph):
-        if node.fn == torch.add:
-            yield OpPlan(node, partition=OpPartition(input=0, dim=0))
-
-
 @replace_all_device_with('cpu')
 def test_codegen_normal_add_mul_multiref_split(tmp_path):
     m = NormalAddMulMultirefModule()
