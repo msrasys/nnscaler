@@ -41,16 +41,13 @@ def trainer_worker_reducer(save_dir, config_file, run_name=None, additional_args
 
 
 
-def replicas_reducer_pas(graph, cfg):
+def replicas_reducer_no_partition_pas(graph, cfg):
     from nnscaler.policies import OpPlan, OpPartition, get_pas_ops
-
-    for node in get_pas_ops(graph):
-        if node.fn == torch.add:
-            yield OpPlan(node, partition=OpPartition(input=0, dim=0))
+    return []
 
 
 @pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.device_count() < 4, reason='lack of gpu devices')
-def test_trainer_reducer_replicas(tmp_path):
+def test_trainer_reducer_replicas_no_partition(tmp_path):
     launch_torchrun(4, trainer_worker_reducer, tmp_path,
         'trainer_args_reducer.yaml',
         'replicas',

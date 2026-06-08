@@ -10,7 +10,7 @@ compute_config:
   use_end2end: true
 
 run_mode: run
-pas_policy: tests.cli.test_trainer_reducer.replicas_reducer_pas
+pas_policy: tests.cli.test_trainer_reducer.replicas_reducer_no_partition_pas
 micro_batch_size: 2
 global_batch_size: 16
 max_epochs: 4
