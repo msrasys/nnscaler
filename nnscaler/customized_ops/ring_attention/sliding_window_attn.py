@@ -10,17 +10,12 @@ from nnscaler.graph.parser.register import register_op
 from nnscaler.graph.function.dimops import IRDimops
 from nnscaler.ir import IRTensor
 from nnscaler.runtime.device import DeviceGroup
-from flash_attn import flash_attn_varlen_func
+from .core.flash_attn_varlen_lse import flash_attn_varlen_lse_func
 from .core.sliding_window_attn_implementation import (
     prepare_sliding_window_metadata,
     sliding_window_attn_func,
 )
 from .core.utils import gen_head_anno
-
-try:
-    from flash_attn.cute import flash_attn_varlen_func as flash_attn_cute_varlen_func
-except ImportError:
-    flash_attn_cute_varlen_func = None
 
 
 def wrap_sliding_window_attn_func(
@@ -62,34 +57,17 @@ def wrap_sliding_window_attn_func(
         max_seqlen_k = (cu_seqlens_k[1:] - cu_seqlens_k[:-1]).max().item()
 
     if process_group is None or len(process_group) == 1 or not enable_ring:
-        if use_cute:
-            assert flash_attn_cute_varlen_func is not None, "flash_attn.cute is not available"
-            cute_window_size = tuple(None if w == -1 else w for w in window_size)
-            output, softmax_lse = flash_attn_cute_varlen_func(
-                q, k, v,
-                cu_seqlens_q=cu_seqlens_q,
-                cu_seqlens_k=cu_seqlens_k,
-                max_seqlen_q=max_seqlen_q,
-                max_seqlen_k=max_seqlen_k,
-                softmax_scale=softmax_scale,
-                causal=causal,
-                window_size=cute_window_size,
-                deterministic=deterministic,
-                return_lse=True,
-            )
-            return (output, softmax_lse) if return_lse else output
-        else:
-            output, softmax_lse, _ = flash_attn_varlen_func(
-                q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k,
-                dropout_p=dropout_p,
-                softmax_scale=softmax_scale,
-                causal=causal,
-                window_size=window_size,
-                alibi_slopes=alibi_slopes,
-                deterministic=deterministic,
-                return_attn_probs=True,
-            )
-            return (output, softmax_lse) if return_lse else output
+        output, softmax_lse = flash_attn_varlen_lse_func(
+            q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k,
+            dropout_p=dropout_p,
+            softmax_scale=softmax_scale,
+            causal=causal,
+            window_size=window_size,
+            alibi_slopes=alibi_slopes,
+            deterministic=deterministic,
+            use_cute=use_cute,
+        )
+        return (output, softmax_lse) if return_lse else output
 
     assert causal, "sliding window CP attention requires causal=True"
     assert window_size[0] > 0, (

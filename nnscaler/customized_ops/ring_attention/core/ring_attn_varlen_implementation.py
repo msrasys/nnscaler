@@ -320,9 +320,13 @@ def llama3_flash_attn_varlen_backward(
                     "window_size_left": window_size_cute[0],
                     "window_size_right": window_size_cute[1],
                     "deterministic": deterministic,
-                    "dlse": dlse_i,
                 }
             )
+            if "dlse" in params:
+                params["dlse"] = dlse_i
+            elif dlse_i is not None:
+                raise RuntimeError(
+                    "attention z-loss requires a FlashAttention cute backward with dlse support")
             _flash_attn_bwd(**params)
         else:
             params = get_default_args(_flash_attn_varlen_backward).copy()
@@ -357,6 +361,11 @@ def llama3_flash_attn_varlen_backward(
                         "window_size_right": window_size[1],
                     }
                 )
+            if "dlse" in params:
+                params["dlse"] = dlse_i
+            elif dlse_i is not None:
+                raise RuntimeError(
+                    "attention z-loss requires a FlashAttention varlen backward with dlse support")
             _flash_attn_varlen_backward(**params)
 
         if heads_k_stride != nheads_k:

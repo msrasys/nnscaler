@@ -971,6 +971,21 @@ class MergedScheduler:
         return value if isinstance(value, tuple) else (value,)
 
     @staticmethod
+    def _set_loss_aux_tensors(lc, attn_node):
+        loss_aux_tensors = lc.step_data.get('_loss_aux_tensors')
+        if loss_aux_tensors is not None:
+            attn_node.loss_aux_tensors = loss_aux_tensors
+
+    @staticmethod
+    def _prepare_dense_attn_output(lc, attn_node, attn_out):
+        MergedScheduler._set_loss_aux_tensors(lc, attn_node)
+        if not isinstance(attn_out, tuple):
+            return attn_out
+        if len(attn_out) == 0:
+            raise RuntimeError("Dense attention callable returned an empty tuple")
+        return attn_out[0]
+
+    @staticmethod
     def _prepare_state_residual(lc, attn_node, attn_out):
         attn_items = list(attn_out if isinstance(attn_out, tuple) else (attn_out,))
         if lc.step_data.get('_state_lifetime_in_callables', False):
@@ -1139,6 +1154,23 @@ class MergedScheduler:
             grads.append(None)
         return tuple(grads[:len(outputs)])
 
+    @staticmethod
+    def _dense_attn_backward_grads(attn_node, grad_h):
+        outputs = attn_node.get_output()
+        if not isinstance(outputs, tuple):
+            return grad_h
+
+        grads = [grad_h]
+        aux_tensors = getattr(attn_node, 'loss_aux_tensors', ())
+        for tensor in aux_tensors:
+            if isinstance(tensor, torch.Tensor):
+                grads.append(tensor.grad)
+            else:
+                grads.append(None)
+        while len(grads) < len(outputs):
+            grads.append(None)
+        return tuple(grads[:len(outputs)])
+
     def _forward_all_layers(self, h, lc_list, event):
         """Warmup: forward all layers, collect nodes and routing data."""
         all_nodes = []
@@ -1162,7 +1194,8 @@ class MergedScheduler:
                 attn_n, body_n = nodes
 
                 attn_out = attn_n.forward((h,))
-                h = body_n.forward(attn_out)
+                body_input = self._prepare_dense_attn_output(lc, attn_n, attn_out)
+                h = body_n.forward(body_input)
 
                 if attn_n.checkpoint:
                     attn_n.output = None
@@ -1185,7 +1218,8 @@ class MergedScheduler:
         attn_n, body_n = nodes
 
         attn_out = attn_n.forward((h,))
-        h = body_n.forward(attn_out)
+        body_input = self._prepare_dense_attn_output(lc, attn_n, attn_out)
+        h = body_n.forward(body_input)
 
         if attn_n.checkpoint:
             attn_n.output = None
@@ -1236,13 +1270,17 @@ class MergedScheduler:
         # not the default stream (which has no sync with COMP/COMM in overlap mode).
         with torch.cuda.stream(get_comp_stream()):
             body_grads = body_n.backward(grad_h)
-            grad_x = attn_n.backward(body_grads)
-            layer_dead_refs.extend((consumed_grad_h, body_grads))
+            attn_grads = self._dense_attn_backward_grads(attn_n, body_grads)
+            grad_x = attn_n.backward(attn_grads)
+            layer_dead_refs.extend((consumed_grad_h, body_grads, attn_grads))
             _release_consumed_storage_after_last_use(
                 'layer2:consumed_output_grad', consumed_grad_h,
                 get_comp_stream(), exclude_obj=(body_grads, grad_x))
             _release_consumed_storage_after_last_use(
                 'layer2:consumed_body_grads', body_grads,
+                get_comp_stream(), exclude_obj=(attn_grads, grad_x))
+            _release_consumed_storage_after_last_use(
+                'layer2:consumed_attn_grads', attn_grads,
                 get_comp_stream(), exclude_obj=grad_x)
             _release_layer_dead_storage_after_backward(
                 'layer2:dead_after_layer_backward', layer_dead_refs,
@@ -1337,18 +1375,23 @@ class MergedScheduler:
             body_grads = bwd_body.backward(grad_h)
             fwd_attn_out = fwd_attn.forward((fwd_h,))
 
-            grad_x = bwd_attn.backward(body_grads)
-            layer_dead_refs.append(body_grads)
+            attn_grads = self._dense_attn_backward_grads(bwd_attn, body_grads)
+            grad_x = bwd_attn.backward(attn_grads)
+            layer_dead_refs.extend((body_grads, attn_grads))
             _release_consumed_storage_after_last_use(
                 '2phase:body_consumed_output_grad', consumed_grad_h,
                 get_comp_stream(), exclude_obj=(body_grads, grad_x))
             _release_consumed_storage_after_last_use(
                 '2phase:attn_consumed_body_grads', body_grads,
+                get_comp_stream(), exclude_obj=(attn_grads, grad_x))
+            _release_consumed_storage_after_last_use(
+                '2phase:attn_consumed_attn_grads', attn_grads,
                 get_comp_stream(), exclude_obj=grad_x)
             _release_layer_dead_storage_after_backward(
                 '2phase:dead_after_layer_backward', layer_dead_refs,
                 get_comp_stream(), exclude_obj=(grad_x, fwd_nodes, fwd_h, fwd_attn_out))
-            fwd_h_out = fwd_body.forward(fwd_attn_out)
+            fwd_body_input = self._prepare_dense_attn_output(fwd_lc, fwd_attn, fwd_attn_out)
+            fwd_h_out = fwd_body.forward(fwd_body_input)
 
             if fwd_attn.checkpoint:
                 fwd_attn.output = None

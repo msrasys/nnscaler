@@ -386,8 +386,12 @@ def sliding_window_backward(
             "window_size_left": window_size_cute[0],
             "window_size_right": window_size_cute[1],
             "deterministic": deterministic,
-            "dlse": dlse,
         })
+        if "dlse" in params:
+            params["dlse"] = dlse
+        elif dlse is not None:
+            raise RuntimeError(
+                "attention z-loss requires a FlashAttention cute backward with dlse support")
         _flash_attn_bwd(**params)
     else:
         params = get_default_args(_flash_attn_varlen_backward).copy()
@@ -416,6 +420,11 @@ def sliding_window_backward(
         else:
             params["window_size_left"] = window_size[0]
             params["window_size_right"] = window_size[1]
+        if "dlse" in params:
+            params["dlse"] = dlse
+        elif dlse is not None:
+            raise RuntimeError(
+                "attention z-loss requires a FlashAttention varlen backward with dlse support")
         _flash_attn_varlen_backward(**params)
 
     # Step 3: Split dk_extended into recv portion and local portion
