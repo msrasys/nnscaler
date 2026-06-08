@@ -278,6 +278,9 @@ class Bucket:
         if not isinstance(self._nreplicas, int) or self._nreplicas < 1:
             raise ValueError(f"nreplicas should be an integer greater than or equal to 1, but got {self._nreplicas}")
 
+        if self._nreplicas != 1 and self._reduce_op != torch.distributed.ReduceOp.SUM:
+            raise ValueError(f"nreplicas should be used with sum reduce op, but got {self._reduce_op}")
+
         self._contiguous_params = param_buffer
         self._contiguous_grads = grad_buffer
         assert grad_buffer.size() == param_buffer.size()
