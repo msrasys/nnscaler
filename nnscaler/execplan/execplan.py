@@ -23,7 +23,8 @@ class ExeReuseCell(IRCell):
     """
 
     def __init__(self, cell: IRCell,
-                 inputs: List[IRSubTensor], outputs: List[IRCell]):
+                 inputs: List[IRSubTensor], outputs: List[IRCell],
+                 micro_batch_id: Optional[int] = None):
         assert len(inputs) == len(cell.inputs())
         assert len(outputs) == len(cell.outputs()), (
             f"output length mismatch: {cell}\n"
@@ -36,6 +37,7 @@ class ExeReuseCell(IRCell):
             self.set_output(idx, t)
         self._cell: IRCell = cell
         self._cached_dispatched: Dict[int, ExeReuseCell] = {}
+        self._micro_batch_id = micro_batch_id
 
     @property
     def device(self) -> int:
@@ -45,6 +47,10 @@ class ExeReuseCell(IRCell):
     def cell(self) -> IRCell:
         return self._cell
 
+    @property
+    def micro_batch_id(self) -> Optional[int]:
+        return self._micro_batch_id
+
     def isfw(self) -> bool:
         return self._cell.isfw()
 
@@ -53,17 +59,38 @@ class ExeReuseCell(IRCell):
         if devid in self._cached_dispatched:
             return self._cached_dispatched[devid]
 
-        inputs = []
-        for t, cell_t in zip(self._inputs, self._cell.inputs()):
-            if isinstance(cell_t, IRObject) and devid not in cell_t.device:
-                continue
-            inputs.append(t)
-        outputs = []
-        for t, cell_t in zip(self._outputs, self._cell.outputs()):
-            if isinstance(cell_t, IRObject) and devid not in cell_t.device:
-                continue
-            outputs.append(t)
-        reuse = ExeReuseCell(self._cell.dispatch(devid), inputs, outputs)
+        dispatched_cell = self._cell.dispatch(devid)
+
+        def align_with_dispatched(cell_objs, reuse_objs, dispatched_objs):
+            aligned = []
+            used = set()
+            pairs = list(zip(cell_objs, reuse_objs))
+            for dispatched_obj in dispatched_objs:
+                match_idx = None
+                for idx, (cell_obj, reuse_obj) in enumerate(pairs):
+                    if idx in used:
+                        continue
+                    if cell_obj is dispatched_obj or cell_obj == dispatched_obj:
+                        match_idx = idx
+                        break
+                assert match_idx is not None, (
+                    f"Cannot align dispatched reuse object {dispatched_obj} "
+                    f"from cell {self._cell}"
+                )
+                used.add(match_idx)
+                aligned.append(pairs[match_idx][1])
+            return aligned
+
+        inputs = align_with_dispatched(
+            self._cell.inputs(), self._inputs, dispatched_cell.inputs()
+        )
+        outputs = align_with_dispatched(
+            self._cell.outputs(), self._outputs, dispatched_cell.outputs()
+        )
+        reuse = ExeReuseCell(
+            dispatched_cell, inputs, outputs,
+            micro_batch_id=self._micro_batch_id
+        )
         reuse._id = self._id
         reuse._op_context = self._op_context
         if _mirror and self.mirror is not None:
@@ -138,13 +165,19 @@ class ExecutionPlan:
                     return micro_fcells[key]
                 inputs = [get(t, node.mid) for t in node.content.inputs()]
                 outputs = [get(t, node.mid) for t in node.content.outputs()]
-                cell = ExeReuseCell(node.content, inputs, outputs)
+                cell = ExeReuseCell(
+                    node.content, inputs, outputs,
+                    micro_batch_id=node.mid
+                )
                 if node.stream_context is not None:
                     cell.set_op_context('stream_context', node.stream_context)
                 if isinstance(node.content.mirror, IRCell):
                     minputs = [get(t, node.mid) for t in node.content.mirror.inputs()]
                     moutputs = [get(t, node.mid) for t in node.content.mirror.outputs()]
-                    mcell = ExeReuseCell(node.content.mirror, minputs, moutputs)
+                    mcell = ExeReuseCell(
+                        node.content.mirror, minputs, moutputs,
+                        micro_batch_id=node.mid
+                    )
                     IRCell.make_pair(cell, mcell)
                 micro_fcells[key] = cell
                 return cell

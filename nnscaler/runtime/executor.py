@@ -83,11 +83,26 @@ class AsyncCommHandler:
                 pending.append((tensor, work))
         self._send_holds = pending
 
+    def drain(self):
+        self.drain_sends()
+
+        for tid, works in list(self._works.items()):
+            callback = self._callbacks.get(tid)
+            if callback is not None:
+                continue
+            for work in works:
+                work.wait()
+            self._works.pop(tid, None)
+            self._callbacks.pop(tid, None)
+
     def clear(self):
         AsyncCommHandler.instance = AsyncCommHandler.__AsyncCommHandler()
 
     def check_clear(self):
-        assert len(self._works) == 0 and len(self._callbacks) == 0 and len(self._send_holds) == 0
+        assert len(self._works) == 0 and len(self._callbacks) == 0 and len(self._send_holds) == 0, (
+            f"AsyncCommHandler is not clear: works={len(self._works)}, "
+            f"callbacks={len(self._callbacks)}, send_holds={len(self._send_holds)}"
+        )
 
 
 TensorPairs = List[Tuple[int, torch.Tensor]]

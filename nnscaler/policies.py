@@ -832,6 +832,25 @@ def fn(
         cfg.pas_config.get('pipeline_multiref_replicated_params', True)
     tp_size = ngpus // pp_size
 
+    def stages_share_physical_pipeline_rank(stage_ids: Iterable[int]) -> bool:
+        if not pp_enabled or nstages <= pp_size:
+            return False
+        return len({stage_id % pp_size for stage_id in stage_ids}) == 1
+
+    def move_following_stage_splits(
+        old_ftensor: IRFullTensor,
+        new_ftensor: IRFullTensor,
+        stage_id: int,
+    ) -> None:
+        old_stage_info = tensor_splits.setdefault(old_ftensor, {})
+        old_stage_info.setdefault(stage_id, set()).add('rn')
+        new_stage_info = tensor_splits.setdefault(new_ftensor, {})
+        for following_stage_id, splits in list(old_stage_info.items()):
+            if following_stage_id <= stage_id:
+                continue
+            new_stage_info.setdefault(following_stage_id, set()).update(splits)
+            del old_stage_info[following_stage_id]
+
     if pp_enabled:
         if not cfg.use_end2end:
             raise ValueError("Pipeline parallelism requires use_end2end to be True")
@@ -863,6 +882,11 @@ def fn(
             continue
         splits = set(k for v in stage_info.values() for k in v)
         find_replicated = 'rr' in splits or 'rn' in splits
+        colocated_replicated_vpp_param = (
+            find_replicated and len(splits) == 1
+            and len(stage_info) > 1
+            and stages_share_physical_pipeline_rank(stage_info.keys())
+        )
         splits = list(splits)
         # For safety, we will add multiref when detecting shared param are all replicated for pipeline parallelism.
         # The reason is that stages may have different number of devices, it is hard to synchronize gradients directly
@@ -882,9 +906,19 @@ def fn(
         # 4. (2) and (3): if the param is shared across stages and is replicated in at least one stage.
         #    Note: the case when some is replicated and some is partitioned is handled by (1).
 
-        if len(splits) > 1 or (pp_multiref_replicated_params and len(stage_info) > 1 and find_replicated):
+        if len(splits) > 1 or (
+            pp_multiref_replicated_params
+            and len(stage_info) > 1
+            and find_replicated
+            and not colocated_replicated_vpp_param
+        ):
             _logger.info(f'add multiref for shared param {ftensor}')
             graph.multiref(ftensor, comment='shared param')
+        elif colocated_replicated_vpp_param:
+            _logger.info(
+                f'skip multiref for VPP colocated shared param {ftensor}; '
+                f'logical stages={sorted(stage_info.keys())}, '
+                f'physical stage={next(iter(stage_info)) % pp_size}')
 
     # set pipeline stages
     # Note we must stage graph before any transformation to the graph,
@@ -896,6 +930,8 @@ def fn(
     # we still need to insert adapters to
     # collect the subtensors into a complete tensor as the output of stage 0,
     # and then split it again as the input of stage 1.
+    activation_multirefed: set[tuple[int, int]] = set()
+
     if pp_enabled:
         graph.staging([s[0] for s in pp_stages])
         pp_segs: list[IRSegment] = graph.select(ntype=IRSegment, flatten=False)
@@ -911,16 +947,30 @@ def fn(
                 # these nodes are usually added for data transfer between stages in graph.staging
                 # TODO: is it possible to have TP here?
                 op_plans[node] = OpPlan(op=node, stage_id=stage_id, partition=None)
+                input_tensors = [t for t in node.inputs() if isinstance(t, IRSubTensor)]
+                output_tensors = [t for t in node.outputs() if isinstance(t, IRSubTensor)]
+                if len(input_tensors) == 1 and len(output_tensors) == 1:
+                    move_following_stage_splits(
+                        input_tensors[0].parent,
+                        output_tensors[0].parent,
+                        stage_id,
+                    )
 
     for stage_id, seg in enumerate(pp_segs):
         for sub_tensor in IR.get_objects(seg.outputs()):
             if not isinstance(sub_tensor, IRSubTensor):
                 continue
             if seg.consumers(sub_tensor.parent):
+                old_ftensor = sub_tensor.parent
                 ident_op = _identity_segment_output(graph, sub_tensor, seg, pp_segs)
+                new_ftensor = ident_op.output(0).parent
                 op_plans[ident_op] = OpPlan(op=ident_op, stage_id=stage_id, partition=None)
-                # 'rn' means `ident_op` is replicated and grad doesn't need to be all-reduced
-                tensor_splits[sub_tensor.parent].setdefault(stage_id, set()).add('rn')
+                # `ident_op` consumes the old tensor in this stage. Its output is a
+                # new full tensor that replaces uses in following stages, so move
+                # those split records to the new tensor before activation multiref.
+                move_following_stage_splits(old_ftensor, new_ftensor, stage_id)
+                seg.multiref(old_ftensor, comment='activation')
+                activation_multirefed.add((stage_id, id(old_ftensor)))
 
     # add multiref to an activation tensor when the states of the tensor and its grad are different
     # among consumers and current segment's outputs
@@ -940,8 +990,13 @@ def fn(
 
         for idx, splits in stage_info.items():
             stage = pp_segs[idx]
+            if (idx, id(ftensor)) in activation_multirefed:
+                continue
             split_list = list(splits)
-            if len(split_list) > 1:
+            has_partitioned_consumer = any(split not in ('rr', 'rn') for split in split_list)
+            if len(split_list) > 1 or (
+                is_seg_output[idx] and has_partitioned_consumer
+            ):
                 _logger.debug(f'add multiref for {ftensor} in stage {stage}')
                 stage.multiref(ftensor, comment='activation')
 
