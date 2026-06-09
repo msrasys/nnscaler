@@ -167,10 +167,6 @@ def _gpu_worker_npbuffer():
     with clear_dir_on_rank0(Path(tempfile.gettempdir()) / f'cube_test_npbuffer_{PYTEST_RUN_ID}') as tempdir:
         # Test 1: Verify npbuffer.pt is created during tracing
         net1 = _to_cube_model(Net1(), compute_config, tempdir, 'net1-npb', (128, 64))
-        # Find the generated module directory
-        module_file = Path(net1.__module__.replace('.', '/') + '.py')
-        # npbuffer.pt should exist alongside fullmodel.pt
-        module_dir = Path(tempdir)
         # Navigate to the actual module directory
         import sys
         gen_module = sys.modules[net1.__class__.__module__]
