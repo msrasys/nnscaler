@@ -594,6 +594,10 @@ class LogsConfig:
     max_workers: int = 1
     logs: List[LogConfig] = field(default_factory=list)
 
+    def __post_init__(self):
+        if self.max_workers < 1:
+            raise ValueError("max_workers must be positive")
+
     @classmethod
     def deserialize(cls, data: Any) -> 'LogsConfig':
         # backward compatibility: if the config is a list or dict of log config,

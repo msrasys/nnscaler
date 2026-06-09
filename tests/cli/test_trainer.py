@@ -32,7 +32,8 @@ def trainer_logging_worker(save_dir, run_async):
     wandb_log_savedir = log_savedir / 'wandb'
     # train 4 epcho in one time
     if run_async:
-        # old format of async log config
+        # old format of log config
+        # async logging is enabled by default.
         trainer = Trainer([
             '-f', config_path,
             '--max_epochs', '2',
@@ -50,7 +51,8 @@ def trainer_logging_worker(save_dir, run_async):
             '--log.1.args.mode', 'offline',
         ])
     else:
-        # new format of async log config
+        # new format of log config
+        # (async_logging disabled)
         trainer = Trainer([
             '-f', config_path,
             '--max_epochs', '2',

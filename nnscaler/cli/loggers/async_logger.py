@@ -44,7 +44,10 @@ class AsyncLogger(LoggerBase):
 
     def log_metrics(self, metrics: Dict[str, float], step: int, *, tag: Optional[str] = None) -> None:
         for lg in self._async_loggers:
-            lg.log_metrics(metrics, step, tag=tag)
+            try:
+                lg.log_metrics(metrics, step, tag=tag)
+            except Exception:
+                logger.exception("Error in async logger %s", type(lg).__name__)
 
         if self._executor is not None:
             self._executor.submit(self._log_sync, metrics, step, tag)

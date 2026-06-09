@@ -29,6 +29,7 @@ class LoggerBase(ABC):
     def is_async(self) -> bool:
         """
         Whether this logger is asynchronous.
-        If True, the trainer will call `log_metrics` in a separate thread and will not wait for it to finish.
+        This flag will help AsyncLogger determine whether to call log_metrics in a separate thread or not.
+        By default, loggers are synchronous.
         """
         return False
