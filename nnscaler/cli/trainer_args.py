@@ -589,15 +589,33 @@ class LogsConfig:
     async_logging: bool = True
     # the number of workers for asynchronous logging.
     # Only applicable when async_logging is True.
+    # be careful when setting this value.
+    # You need to make sure the underlying logging runner can support multiple workers.
     max_workers: int = 1
     logs: List[LogConfig] = field(default_factory=list)
 
     @classmethod
     def deserialize(cls, data: Any) -> 'LogsConfig':
+        # backward compatibility: if the config is a list or dict of log config,
+        # we treat it as the `logs` field of LogsConfig
+        # So here we support two formats for LogsConfig:
+        # 1. LogsConfig format:
+        #    async_logging: true
+        #    max_workers: 1
+        #    logs:
+        #      - type: tensorboard
+        #        args:
+        #          log_dir: ./logs
+        # 2. List of LogConfig or dict of LogConfig:
+        #    - type: tensorboard
+        #      args:
+        #        log_dir: ./logs
         if isinstance(data, (tuple, list)):
             data = {'logs': data}
         elif isinstance(data, dict) \
             and not any(k in cls.__dataclass_fields__ for k in data.keys()):
+            # when passed from command line,
+            # it will be a dict with `0`, `1`, etc as the keys
             data = {'logs': data}
 
         return deserialize_dataclass(data, cls)
@@ -911,7 +929,7 @@ class TrainerArgs(PrecisionMixin, PolicyMixin):
     checkpoint: CheckpointConfig = field(default_factory=CheckpointConfig)
     log: LogsConfig = field(default_factory=LogsConfig,
         metadata={
-            'deserialize': lambda x: LogsConfig.deserialize(x)
+            'deserialize': LogsConfig.deserialize
         }
     )
     # It can be `HookConfig` or `HookMapConfig`
@@ -1015,6 +1033,7 @@ class TrainerArgs(PrecisionMixin, PolicyMixin):
             raise ValueError("lr_scheduler type is required")
 
         if not isinstance(self.log, LogsConfig):
+            # backward compatibility: support list of log configs
             if isinstance(self.log, (list, tuple)) and all(isinstance(i, LogConfig) for i in self.log):
                 # support list of log configs
                 self.log = LogsConfig(logs=self.log)
