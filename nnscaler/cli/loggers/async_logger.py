@@ -2,7 +2,7 @@
 #  Licensed under the MIT License.
 
 import logging
-from concurrent.futures import ThreadPoolExecutor, Future
+from concurrent.futures import ThreadPoolExecutor
 from typing import Dict, List, Optional
 
 from .logger_base import LoggerBase
@@ -31,7 +31,6 @@ class AsyncLogger(LoggerBase):
 
         self._max_workers = max_workers
         self._executor: Optional[ThreadPoolExecutor] = None
-        self._futures: List[Future] = []
 
     def is_async(self) -> bool:
         return True
@@ -48,20 +47,19 @@ class AsyncLogger(LoggerBase):
             lg.log_metrics(metrics, step, tag=tag)
 
         if self._executor is not None:
-            future = self._executor.submit(self._log_sync, metrics, step, tag)
-            self._futures.append(future)
+            self._executor.submit(self._log_sync, metrics, step, tag)
 
     def finalize(self) -> None:
         if self._executor is not None:
             # wait for all pending log tasks to complete
-            for future in self._futures:
-                future.result()
-            self._futures.clear()
             self._executor.shutdown(wait=True)
             self._executor = None
 
         for lg in self._async_loggers + self._sync_loggers:
-            lg.finalize()
+            try:
+                lg.finalize()
+            except Exception:
+                logger.exception("Error in finalize of logger %s", type(lg).__name__)
 
     def _log_sync(self, metrics: Dict[str, float], step: int, tag: Optional[str]) -> None:
         for lg in self._sync_loggers:
