@@ -30,7 +30,7 @@ from .arg_parser import (
     _TYPE_KEY, _VALUE_TYPE_KEY, _VALUE_KEY,
     resolve_args
 )
-from .loggers.logger_base import LoggerBase
+from .loggers import LoggerBase, AsyncLogger
 from .train_hook import TrainHook
 from .serialization import Checkpointer
 
@@ -585,6 +585,43 @@ class LogConfig:
 
 
 @dataclass
+class LogsConfig:
+    async_logging: bool = True
+    # the number of workers for asynchronous logging.
+    # Only applicable when async_logging is True.
+    # be careful when setting this value.
+    # You need to make sure the underlying logging runner can support multiple workers.
+    max_workers: int = 1
+    logs: List[LogConfig] = field(default_factory=list)
+
+    @classmethod
+    def deserialize(cls, data: Any) -> 'LogsConfig':
+        # backward compatibility: if the config is a list or dict of log config,
+        # we treat it as the `logs` field of LogsConfig
+        # So here we support two formats for LogsConfig:
+        # 1. LogsConfig format:
+        #    async_logging: true
+        #    max_workers: 1
+        #    logs:
+        #      - type: tensorboard
+        #        args:
+        #          log_dir: ./logs
+        # 2. List of LogConfig or dict of LogConfig:
+        #    - type: tensorboard
+        #      args:
+        #        log_dir: ./logs
+        if isinstance(data, (tuple, list)):
+            data = {'logs': data}
+        elif isinstance(data, dict) \
+            and not any(k in cls.__dataclass_fields__ for k in data.keys()):
+            # when passed from command line,
+            # it will be a dict with `0`, `1`, etc as the keys
+            data = {'logs': data}
+
+        return deserialize_dataclass(data, cls)
+
+
+@dataclass
 class ProfileScheduleConfig:
     # schedule configuration for the profiler.
     # The profiler will skip
@@ -890,7 +927,11 @@ class TrainerArgs(PrecisionMixin, PolicyMixin):
     dataset_sampler: Optional[DatasetSamplerConfig] = None
     lr_scheduler: Optional[LRSchedulerConfig] = None
     checkpoint: CheckpointConfig = field(default_factory=CheckpointConfig)
-    log: List[LogConfig] = field(default_factory=list)
+    log: LogsConfig = field(default_factory=LogsConfig,
+        metadata={
+            'deserialize': LogsConfig.deserialize
+        }
+    )
     # It can be `HookConfig` or `HookMapConfig`
     hook: Union[HookConfig, HookMapConfig, None] = field(default=None, metadata={
         'deserialize': _deserialize_hook_config
@@ -990,6 +1031,17 @@ class TrainerArgs(PrecisionMixin, PolicyMixin):
             raise ValueError("dataset_sampler type is required")
         if self.lr_scheduler and not self.lr_scheduler.type:
             raise ValueError("lr_scheduler type is required")
+
+        if not isinstance(self.log, LogsConfig):
+            # backward compatibility: support list of log configs
+            if isinstance(self.log, (list, tuple)) and all(isinstance(i, LogConfig) for i in self.log):
+                # support list of log configs
+                self.log = LogsConfig(logs=self.log)
+            else:
+                raise ValueError(
+                    "Invalid log config. It must be a LogsConfig instance "
+                    "or a list of LogConfig instances."
+                )
 
         if isinstance(self.hook, dict):
             # if it is a dict, we will deserialize it to HookMapConfig
@@ -1231,11 +1283,15 @@ class TrainerArgs(PrecisionMixin, PolicyMixin):
 
     def create_loggers(self) -> List['LoggerBase']:
         loggers = []
-        for log_config in self.log:
+        for log_config in self.log.logs:
             kwargs = self.create_kwarg(log_config.args)
             logger_class = load_type(log_config.type)
             loggers.append(logger_class(**kwargs))
-        return loggers
+
+        if loggers and self.log.async_logging:
+            return [AsyncLogger(loggers, max_workers=self.log.max_workers)]
+        else:
+            return loggers
 
     def create_hook(self) -> TrainHook:
         if not self.hook:
