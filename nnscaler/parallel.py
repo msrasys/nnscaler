@@ -649,6 +649,7 @@ def _prepare_and_check_reusable(
         expected_output_files.append(outdir / _GRAPH_DUMP_FILE)
         expected_output_files.append(outdir / _FORWARD_ARGS_DUMP_FILE)
         expected_output_files.append(outdir / ParallelModule.ORIGIN_MODULE_METADATA_FILE)
+        expected_output_files.append(outdir / FxModuleParser.NON_PERSISTENT_BUFFER_FILE)
         existing_output_files = [
             f for f in outdir.glob('*')
             if f.is_file() and (  # just take fullmodel.pt.0 to compare
@@ -2660,6 +2661,7 @@ def _broadcast_gen_files(
                 (
                     broadcast_strategy == BroadcastGenFilesStrategy.NO_WEIGHTS
                     and not file.name.startswith(FxModuleParser.ATTR_CONTENT_FILE_STEM)
+                    and file.name != FxModuleParser.NON_PERSISTENT_BUFFER_FILE
                 ) or
                 (
                     # broadcast code files and compute config file

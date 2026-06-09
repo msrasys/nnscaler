@@ -198,6 +198,27 @@ class SimpleDataset(Dataset):
         return len(self.data)
 
 
+class MLPWithNPBuffer(nn.Module):
+    """MLP with a non-persistent buffer, used to test npbuffer.pt loading."""
+    def __init__(self, dim: int = 16, nlayers: int = 16):
+        init_random_fn()
+        super().__init__()
+        self.layers = torch.nn.ModuleList([])
+        for _ in range(nlayers):
+            self.layers.append(nn.Linear(dim, dim, bias=False))
+        self.register_buffer('scale', torch.ones(dim) * 0.5, persistent=False)
+        self.loss_fn = nn.BCELoss()
+
+    def forward(self, data: Dict[str, torch.Tensor]):
+        x = data['data']
+        for layer in self.layers:
+            x = layer(x)
+        x = x * self.scale
+        x = torch.sigmoid(x)
+        loss = self.loss_fn(x, data['target'])
+        return loss
+
+
 class BranchedSimpleDataset(Dataset):
     def __init__(self, dim: int, size: int = 100):
         torch.manual_seed(0)
