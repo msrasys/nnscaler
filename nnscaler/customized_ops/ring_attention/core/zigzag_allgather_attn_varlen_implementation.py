@@ -280,6 +280,13 @@ def zigzag_allgather_attn_varlen_func(
     output[metadata.q_end_idx] = end_output
 
     if return_lse:
+        if front_lse is None or end_lse is None:
+            raise RuntimeError(
+                "flash_attn.cute.flash_attn_varlen_func did not return softmax_lse. "
+                "Install a FlashAttention build with return_lse support or call with use_cute=False."
+            )
+        # Each branch returns FlashAttention's [num_heads, local_q] LSE;
+        # scatter it back to the original q order.
         softmax_lse = front_lse.new_empty(front_lse.shape[:-1] + (q.shape[0],))
         softmax_lse[..., metadata.q_front_idx] = front_lse
         softmax_lse[..., metadata.q_end_idx] = end_lse

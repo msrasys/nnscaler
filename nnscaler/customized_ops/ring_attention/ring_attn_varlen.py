@@ -175,7 +175,7 @@ def wrap_ring_attn_varlen_func(
             if return_lse:
                 output, softmax_lse, _ = result
                 return output, softmax_lse
-        return result
+            return result
 
     assert len(q.shape) == 3, "q must have shape [total_q, qh, dim]"
     assert len(k.shape) == 3, "k must have shape [total_k, kh, dim]"
@@ -199,7 +199,13 @@ def wrap_ring_attn_varlen_func(
     if window_size == (-1, -1) and not use_cute:
         # Use TransformerEngine with context parallelism if available and version is OK
         # Only use TransformerEngine CP path if env flag is enabled
-        if _ENABLE_TE_CP and _HAS_TRANSFORMER_ENGINE and _TE_VERSION_OK and attn_forward_func_with_cp is not None:
+        te_cp_available = (
+            _ENABLE_TE_CP
+            and _HAS_TRANSFORMER_ENGINE
+            and _TE_VERSION_OK
+            and attn_forward_func_with_cp is not None
+        )
+        if te_cp_available and not return_lse:
             shuffled_q = shuffle_varlen(q, cu_seqlens_q, process_group, local_process_group)
             shuffled_k = shuffle_varlen(k, cu_seqlens_k, process_group, local_process_group)
             shuffled_v = shuffle_varlen(v, cu_seqlens_k, process_group, local_process_group)
@@ -239,15 +245,23 @@ def wrap_ring_attn_varlen_func(
                 attn_mask_type="padding_causal" if causal else "padding",
             )
             output = unshuffle_varlen(shuffled_output, cu_seqlens_q, process_group, local_process_group)
-            return (output, None) if return_lse else output
+            return output
         else:
             # Fallback to basic ring attention implementation
             if _ENABLE_TE_CP:
-                # User requested CP but TE unavailable/incompatible
-                warnings.warn(
-                    "ENABLE_TE_CP=1 set but TransformerEngine CP attention unavailable (missing or incompatible). "
-                    "Falling back to basic ring attention implementation."
-                )
+                # TransformerEngine CP currently returns only attention output,
+                # while return_lse=True is annotated as a real tensor output.
+                if return_lse and te_cp_available:
+                    warnings.warn(
+                        "ENABLE_TE_CP=1 ignored for return_lse=True because TransformerEngine CP attention "
+                        "does not return softmax_lse. Falling back to basic ring attention implementation."
+                    )
+                else:
+                    # User requested CP but TE unavailable/incompatible
+                    warnings.warn(
+                        "ENABLE_TE_CP=1 set but TransformerEngine CP attention unavailable (missing or incompatible). "
+                        "Falling back to basic ring attention implementation."
+                    )
             # If not enabled, remain silent (no warning spam) unless TE missing earlier already warned.
 
     (
@@ -338,6 +352,7 @@ def flash_attention_anno(query_states, key_states, value_states, cu_seqlens_q, c
         **kwargs,
     )
     if return_lse:
+        # return_lse=True is annotated as a real tensor output: [num_heads, total_q].
         output_anno += f', {q_anno} l'
     return f'l {q_anno} hd^, l {kv_anno} hd^, l {kv_anno} vd^, e^, e^, {alibi_anno} -> {output_anno}'
 

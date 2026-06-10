@@ -7,7 +7,8 @@ Regression test for the non-cute path of zigzag_allgather_attn_varlen_func.
 On main, zigzag_allgather_attn_varlen_func is absent, so this test is skipped.
 On yutao/attention / PR #32, the symbol exists and this test exercises the
 non-cute branch that previously returned only the attention output while callers
-unpacked it as (out, lse).
+unpacked it as (out, lse). return_lse=True is annotated as a tensor output, so
+the non-cute branch should return a real LSE tensor.
 """
 
 from functools import partial
@@ -64,6 +65,22 @@ def _zigzag_allgather_noncute_worker():
     )
 
     assert out.shape == q.shape, f"unexpected output shape {out.shape}"
+
+    out_with_lse, lse = zigzag_allgather_attn_varlen_func(
+        q,
+        k,
+        v,
+        cu_seqlens,
+        cu_seqlens,
+        process_group=dist.group.WORLD,
+        causal=True,
+        use_cute=False,
+        return_lse=True,
+    )
+
+    assert out_with_lse.shape == q.shape, f"unexpected output shape {out_with_lse.shape}"
+    assert lse is not None
+    assert lse.shape[-2:] == (nheads, local_seq_len), f"unexpected lse shape {lse.shape}"
     dist.barrier()
     dist.destroy_process_group()
 

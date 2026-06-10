@@ -96,6 +96,13 @@ def get_arg_by_name(func, name, default, *args, **kwargs):
 
 
 def call_flash_attn_cute_varlen_func(func, *args, return_lse=False, **kwargs):
+    """Call flash_attn.cute varlen attention with version-compatible LSE handling.
+
+    Some FlashAttention cute builds expose a ``return_lse`` keyword while older
+    builds do not. When nnScaler requests LSE, the registered op annotation
+    exposes it as a tensor output, so missing LSE is an explicit runtime error
+    instead of returning ``None``.
+    """
     if _supports_return_lse(func):
         kwargs["return_lse"] = bool(return_lse)
 
@@ -108,6 +115,11 @@ def call_flash_attn_cute_varlen_func(func, *args, return_lse=False, **kwargs):
         lse = None
 
     if return_lse:
+        if lse is None:
+            raise RuntimeError(
+                "flash_attn.cute.flash_attn_varlen_func did not return softmax_lse. "
+                "Install a FlashAttention build with return_lse support or call with use_cute=False."
+            )
         return output, lse
     return output
 

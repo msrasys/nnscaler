@@ -166,6 +166,7 @@ def flash_attention_anno(query_states, key_states, value_states, cu_seqlens_q, c
         **kwargs,
     )
     if return_lse:
+        # return_lse=True is annotated as a real tensor output: [num_heads, total_q].
         output_anno += f", {q_anno} l"
     return f"l {q_anno} hd^, al^ {kv_anno} hd^, al^ {kv_anno} vd^, e^, e^, {alibi_anno} -> {output_anno}"
 
