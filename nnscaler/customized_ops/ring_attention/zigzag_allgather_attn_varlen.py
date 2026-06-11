@@ -13,7 +13,7 @@ from nnscaler.graph.parser.register import register_op
 from nnscaler.ir import IRTensor
 from nnscaler.runtime.device import DeviceGroup
 
-from .core.utils import gen_head_anno
+from .core.utils import call_flash_attn_cute_varlen_func, gen_head_anno, get_arg_by_name
 from .core.zigzag_allgather_attn_varlen_implementation import (
     zigzag_allgather_attn_varlen_func,
 )
@@ -40,6 +40,7 @@ def wrap_zigzag_allgather_attn_varlen_func(
     enable_ring: bool = True,
     use_cute: bool = False,
     process_group: Tuple[int] = None,
+    return_lse: bool = False,
 ):
     assert not return_attn_probs, "return_attn_probs is not supported"
 
@@ -50,7 +51,8 @@ def wrap_zigzag_allgather_attn_varlen_func(
         if use_cute:
             assert flash_attn_cute_varlen_func is not None, "flash_attn.cute is not available"
             cute_window_size = tuple(None if w == -1 else w for w in window_size)
-            output, lse = flash_attn_cute_varlen_func(
+            return call_flash_attn_cute_varlen_func(
+                flash_attn_cute_varlen_func,
                 q, k, v,
                 cu_seqlens_q=cu_seqlens_q,
                 cu_seqlens_k=cu_seqlens_k,
@@ -60,11 +62,10 @@ def wrap_zigzag_allgather_attn_varlen_func(
                 causal=causal,
                 window_size=cute_window_size,
                 deterministic=deterministic,
-                return_lse=True,
+                return_lse=return_lse,
             )
-            return output
 
-        return flash_attn_varlen_func(
+        result = flash_attn_varlen_func(
             q,
             k,
             v,
@@ -78,8 +79,12 @@ def wrap_zigzag_allgather_attn_varlen_func(
             window_size=window_size,
             alibi_slopes=alibi_slopes,
             deterministic=deterministic,
-            return_attn_probs=False,
+            return_attn_probs=bool(return_lse),
         )
+        if return_lse:
+            output, softmax_lse, _ = result
+            return output, softmax_lse
+        return result
 
     local_process_group = DeviceGroup().get_group(process_group)
     if local_process_group is None:
@@ -99,6 +104,7 @@ def wrap_zigzag_allgather_attn_varlen_func(
         alibi_slopes=alibi_slopes,
         deterministic=deterministic,
         use_cute=use_cute,
+        return_lse=return_lse,
     )
 
 
@@ -145,7 +151,24 @@ def emit_ring(
 def flash_attention_anno(query_states, key_states, value_states, cu_seqlens_q, cu_seqlens_k, alibi_slopes, *args, **kwargs) -> str:
     q_anno, kv_anno = gen_head_anno(query_states, key_states, value_states, head_pos=1)
     alibi_anno = f'{q_anno}' if isinstance(alibi_slopes, IRTensor) else '?'
-    return f"l {q_anno} hd^, al^ {kv_anno} hd^, al^ {kv_anno} vd^, e^, e^, {alibi_anno} -> l {q_anno} vd^"
+    output_anno = f"l {q_anno} vd^"
+    return_lse = get_arg_by_name(
+        wrap_zigzag_allgather_attn_varlen_func,
+        "return_lse",
+        False,
+        query_states,
+        key_states,
+        value_states,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        alibi_slopes,
+        *args,
+        **kwargs,
+    )
+    if return_lse:
+        # return_lse=True is annotated as a real tensor output: [num_heads, total_q].
+        output_anno += f", {q_anno} l"
+    return f"l {q_anno} hd^, al^ {kv_anno} hd^, al^ {kv_anno} vd^, e^, e^, {alibi_anno} -> {output_anno}"
 
 
 def input_gen_fn(node: IRDimops):
