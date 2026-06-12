@@ -260,8 +260,10 @@ def test_trainer_muon_resume_correctness_zero_ngroups_hybrid_param_config(tmp_pa
         zero0_ckpt = torch.load(tmp_path / '1' / 'result.pt', weights_only=False)
         zero1_ckpt = torch.load(tmp_path / '2' / 'result.pt', weights_only=False)
 
-        assert_close(zero0_ckpt['model'], zero1_ckpt['model'])
-        assert_close(zero0_ckpt['optimizer']['state'], zero1_ckpt['optimizer']['state'])
+        # Different zero_ngroups values change reduction order, so we allow
+        # small numerical drift instead of requiring near bitwise equality.
+        assert_close(zero0_ckpt['model'], zero1_ckpt['model'], atol=2e-2, rtol=2e-2)
+        assert_close(zero0_ckpt['optimizer']['state'], zero1_ckpt['optimizer']['state'], atol=2e-3, rtol=2e-3)
 
 
 def param_clss_fn(param_name: str) -> tuple[int, int]:

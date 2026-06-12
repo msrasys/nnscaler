@@ -5,27 +5,69 @@ from typing import Callable
 import uuid
 import torch
 import os
+import socket
 
 from torch.distributed.run import elastic_launch, LaunchConfig
 from torch.distributed.elastic.multiprocessing.errors import ChildFailedError
 
-from .utils import retry, MASTER_PORT
+def _find_free_port() -> int:
+    """Find an available local TCP port for rendezvous."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        return sock.getsockname()[1]
 
 
-@retry(ChildFailedError, delay=10, match='The server socket has failed to listen on any local network address.')
-def launch_torchrun(nproc_per_node, worker_fn, *args, **kwargs):
-    launch_config = LaunchConfig(
-        min_nodes=1,
-        max_nodes=1,
-        nproc_per_node=nproc_per_node,
-        rdzv_backend = "c10d",
-        rdzv_endpoint = f"localhost:{MASTER_PORT}",
-        run_id = str(uuid.uuid4()),
-        monitor_interval=0.1,
-        max_restarts=0,
+def _is_retryable_rdzv_error(exc: BaseException) -> bool:
+    retryable_markers = (
+        "The server socket has failed to listen on any local network address.",
+        "The connection to the C10d store has failed.",
+        "The client socket has timed out",
+        "Address already in use",
     )
-    outputs = elastic_launch(launch_config, worker_fn)(*args, **kwargs)
-    return outputs
+    cur = exc
+    messages = []
+    while cur is not None:
+        messages.append(str(cur))
+        cur = cur.__cause__
+    error_text = " ".join(messages)
+    return any(marker in error_text for marker in retryable_markers)
+
+
+def launch_torchrun(nproc_per_node, worker_fn, *args, **kwargs):
+    explicit_master_port = os.environ.get("MASTER_PORT")
+
+    # LaunchConfig may transiently fail if a selected port is no longer
+    # available. Retry with a fresh local port when c10d rendezvous errors.
+    for attempt in range(3):
+        if attempt == 0 and explicit_master_port is not None:
+            master_port = explicit_master_port
+        else:
+            master_port = str(_find_free_port())
+
+        launch_config = LaunchConfig(
+            min_nodes=1,
+            max_nodes=1,
+            nproc_per_node=nproc_per_node,
+            rdzv_backend="c10d",
+            rdzv_endpoint=f"127.0.0.1:{master_port}",
+            rdzv_configs={"is_host": True},
+            run_id=str(uuid.uuid4()),
+            monitor_interval=0.1,
+            max_restarts=0,
+        )
+
+        try:
+            return elastic_launch(launch_config, worker_fn)(*args, **kwargs)
+        except ChildFailedError:
+            raise
+        except Exception as exc:
+            if attempt == 2 or not _is_retryable_rdzv_error(exc):
+                raise
+            print(
+                f"retrying launch_torchrun with new rendezvous port after error: {exc}"
+            )
+
+    raise RuntimeError("launch_torchrun failed after retries")
 
 
 def torchrun(nproc_per_node: int, test_fn: Callable, *args, **kwargs):
