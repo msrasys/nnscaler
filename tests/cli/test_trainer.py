@@ -23,7 +23,7 @@ from ..launch_torchrun import launch_torchrun
 from .common import MixedModule, MixModuleMLP, MixModuleMLP3
 
 
-def trainer_logging_worker(save_dir):
+def trainer_logging_worker(save_dir, run_async):
     save_dir = Path(save_dir)
     config_path = str(Path(__file__).with_name('trainer_args.yaml').resolve())
     gen_savedir = save_dir / 'gen'
@@ -31,23 +31,52 @@ def trainer_logging_worker(save_dir):
     tb_log_savedir = log_savedir / 'tensorboard'
     wandb_log_savedir = log_savedir / 'wandb'
     # train 4 epcho in one time
-    trainer = Trainer([
-        '-f', config_path,
-        '--max_epochs', '2',
-        '--gen_savedir', str(gen_savedir),
-        '--compute_config.plan_ngpus', '2',
-        '--compute_config.runtime_ngpus', '4',
-        '--checkpoint.no_save', 'true',
-        '--log.0.type', 'nnscaler.cli.loggers.TensorBoardLogger',
-        '--log.0.args.name', 'test-cli',
-        '--log.0.args.root_dir', str(tb_log_savedir),
-        '--log.1.type', 'nnscaler.cli.loggers.WandbLogger',
-        '--log.1.args.name', 'test-cli',
-        '--log.1.args.dir', str(wandb_log_savedir),
-        '--log.1.args.project', 'nnscaler',
-        '--log.1.args.mode', 'offline',
-    ])
+    if run_async:
+        # old format of log config
+        # async logging is enabled by default.
+        trainer = Trainer([
+            '-f', config_path,
+            '--max_epochs', '2',
+            '--gen_savedir', str(gen_savedir),
+            '--compute_config.plan_ngpus', '2',
+            '--compute_config.runtime_ngpus', '4',
+            '--checkpoint.no_save', 'true',
+            '--log.0.type', 'nnscaler.cli.loggers.TensorBoardLogger',
+            '--log.0.args.name', 'test-cli',
+            '--log.0.args.root_dir', str(tb_log_savedir),
+            '--log.1.type', 'nnscaler.cli.loggers.WandbLogger',
+            '--log.1.args.name', 'test-cli',
+            '--log.1.args.dir', str(wandb_log_savedir),
+            '--log.1.args.project', 'nnscaler',
+            '--log.1.args.mode', 'offline',
+        ])
+    else:
+        # new format of log config
+        # (async_logging disabled)
+        trainer = Trainer([
+            '-f', config_path,
+            '--max_epochs', '2',
+            '--gen_savedir', str(gen_savedir),
+            '--compute_config.plan_ngpus', '2',
+            '--compute_config.runtime_ngpus', '4',
+            '--checkpoint.no_save', 'true',
+            '--log.async_logging', 'false',
+            '--log.logs.0.type', 'nnscaler.cli.loggers.TensorBoardLogger',
+            '--log.logs.0.args.name', 'test-cli',
+            '--log.logs.0.args.root_dir', str(tb_log_savedir),
+            '--log.logs.1.type', 'nnscaler.cli.loggers.WandbLogger',
+            '--log.logs.1.args.name', 'test-cli',
+            '--log.logs.1.args.dir', str(wandb_log_savedir),
+            '--log.logs.1.args.project', 'nnscaler',
+            '--log.logs.1.args.mode', 'offline',
+        ])
     trainer.run()
+    if run_async:
+        assert len(trainer.loggers) == 1 and isinstance(trainer.loggers[0], nnscaler.cli.loggers.AsyncLogger)
+    else:
+        assert len(trainer.loggers) == 2 \
+            and isinstance(trainer.loggers[0], nnscaler.cli.loggers.TensorBoardLogger) \
+            and isinstance(trainer.loggers[1], nnscaler.cli.loggers.WandbLogger)
 
     torch.distributed.barrier()
 
@@ -65,10 +94,14 @@ def trainer_logging_worker(save_dir):
         assert len(wandb_run_db) == 1
         assert wandb_run_db[0].stat().st_size > 1000
 
+        shutil.rmtree(tb_log_savedir / 'test-cli')
+        shutil.rmtree(wandb_log_savedir / 'wandb')
+
 
 @pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.device_count() < 4, reason='lack of gpu devices')
 def test_trainer_logging(tmp_path):
-    launch_torchrun(4, trainer_logging_worker, tmp_path)
+    launch_torchrun(4, trainer_logging_worker, tmp_path, False)
+    launch_torchrun(4, trainer_logging_worker, tmp_path, True)
 
 
 @replace_all_device_with('cpu')
