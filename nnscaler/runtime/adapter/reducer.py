@@ -232,6 +232,7 @@ class Bucket:
                  align_size: int = ALIGNED_BYTES,
                  param_cls: Any = None,
                  params_info: Dict[torch.nn.Parameter, ReducerParamInfo] = None,
+                 nreplicas: int = 1,
     ):
         """
         Create a communication unit for parameter allreduce.
@@ -253,6 +254,7 @@ class Bucket:
             zero_use_reduce_scatter (bool): whether to use reduce scatter for zero optimization
             align_size (int): the alignment size in bytes for each parameter
             param_cls (Any): the class of the parameters
+            nreplicas (int): divisor applied to gradients after all-reduce (default 1)
         """
 
         self._params: List[torch.nn.Parameter] = params
@@ -273,6 +275,14 @@ class Bucket:
         self._async: bool = async_op
         self._zero: int = zero
         self._zero_use_reduce_scatter = zero_use_reduce_scatter
+        self._nreplicas: int = nreplicas
+
+        if not isinstance(self._nreplicas, int) or self._nreplicas < 1:
+            raise ValueError(f"nreplicas should be an integer greater than or equal to 1, but got {self._nreplicas}")
+
+        if self._nreplicas != 1 and self._reduce_op != torch.distributed.ReduceOp.SUM:
+            raise ValueError(f"nreplicas should be used with sum reduce op, but got {self._reduce_op}")
+
         self._contiguous_params = param_buffer
         self._contiguous_grads = grad_buffer
         assert grad_buffer.size() == param_buffer.size()
@@ -539,6 +549,9 @@ class Bucket:
                 torch.distributed.all_reduce(
                     self._contiguous_grads, op=self._reduce_op, group=self._group)
             CudaTimer().stop('comm', predefined=True)
+        # apply nreplicas divisor if needed
+        if self._nreplicas != 1:
+            self._contiguous_grads.div_(self._nreplicas)
         # grads = self._contiguous_grads.clone()
         for param in self._params:
             assert param.grad is None
@@ -721,6 +734,7 @@ class Reducer:
         zero_use_reduce_scatter: bool = False,
         zero_param_level_sharding: bool = False,
         align_size: int = ALIGNED_BYTES,
+        nreplicas: int = 1,
     ):
         """
         Create a reducer applied on a set of weights for weight reduction
@@ -742,6 +756,10 @@ class Reducer:
             zero_param_level_sharding (bool): whether to use parameter-level sharding in ZeRO
                 This flag is required when use parameter-level optimizers(like Muon)
             align_size (int): the alignment size in bytes for each parameter
+            nreplicas (int): divisor applied to gradients after all-reduce.
+                For replicated weights where each rank already has the full gradient,
+                set this to the number of ranks so the summed gradient is averaged.
+                Default is 1 (no division).
         """
         # the parameters with same class will be consecutive in the list.
         self._params: List[torch.nn.Parameter] = list()
@@ -764,6 +782,14 @@ class Reducer:
         self._zero_use_reduce_scatter = zero_use_reduce_scatter
         self._zero_param_level_sharding = zero_param_level_sharding and self._zero > 0
         self._align_size: int = align_size
+        self._nreplicas: int = nreplicas
+
+        if not isinstance(self._nreplicas, int) or self._nreplicas < 1:
+            raise ValueError(f"nreplicas should be an integer greater than or equal to 1, but got {self._nreplicas}")
+
+        if self._nreplicas != 1 and self._reduce_op != torch.distributed.ReduceOp.SUM:
+            raise ValueError(f"nreplicas should be used with sum reduce op, but got {self._reduce_op}")
+
         if self._align_size % ALIGNED_BYTES != 0:
             raise ValueError(f"align_size {self._align_size} must be divisible by {ALIGNED_BYTES}")
 
@@ -1156,6 +1182,7 @@ class Reducer:
                 self._align_size,
                 param_cls=param_cls,
                 params_info=self._params_info,
+                nreplicas=self._nreplicas,
             )
             buckets.append(bucket)
         torch.cuda.empty_cache()

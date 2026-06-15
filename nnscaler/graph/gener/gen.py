@@ -21,6 +21,7 @@ from nnscaler.ir.operator import IRFwOperation, IRDataOperation
 from nnscaler.ir.adapter import IRAdapter, IRWeightReducer
 from nnscaler.ir.adapter.prim import IRAdapterPrim, ObjectMovePrim
 from nnscaler.graph.function.function import Accum, Cat, MultiRef
+from nnscaler.flags import CompileFlag
 
 
 DeviceID = int
@@ -234,7 +235,7 @@ class IRAdapterGener:
         collect_sub_weight(graph)
 
         # check consistency in node replicate or node partition
-        replicated = []
+        replicated = set()
         for sub_weight, consumers in sub_weight_consumers.items():
             # suppose a weight is originally shared by 2 operators op1 and op2,
             # each operator is replicated on a same device group (e.g., rank 0 and rank 1).
@@ -259,8 +260,8 @@ class IRAdapterGener:
                     f"FullTensor weight: {sub_weight.parent}\n"
                     f"Consumers:\n{nl.join([repr(n) for n in consumers])}\n"
                 )
-            if cross_device_replicated == 1:  # replicated weights
-                replicated.append(sub_weight)
+            if cross_device_replicated:  # replicated weights
+                replicated.add(sub_weight)
         # check consistency in weight partition
         # note we don't support sub-weight tensors with partially shared part.
         # This is because the shared part may require reducer to accumulate gradients only for the
@@ -283,11 +284,9 @@ class IRAdapterGener:
 
         # only record sub-weight that is consumed by multiple devices
         sub_weight_devices: Dict[IRSubTensor, Tuple[int,]] = dict()
-        # - pop out replicated sub weights as they will have full gradients,
-        # no need for reducer.
-        for sub_weight in replicated:
-            del sub_weight_consumers[sub_weight]
-        # - gather sub weights that are consumed by same device groups
+        # gather sub weights that are consumed by same device groups
+        # For replicated weights, we still create reducers but with nreplicas
+        # set to the number of devices so that the summed gradient is averaged.
         for sub_weight, consumers in sub_weight_consumers.items():
             devices = set(consumer.device[0] for consumer in consumers)
             if len(devices) > 1:
@@ -295,14 +294,23 @@ class IRAdapterGener:
                 sub_weight_devices[sub_weight] = devices
 
         # create reducer
-        reducers: Dict[Tuple[int,...], List[IRSubTensor]] = dict()
+        # separate replicated and vp (grad is value partitioned) weights since they need different nreplicas
+        vp_reducers: Dict[Tuple[int,...], List[IRSubTensor]] = dict()
+        replicated_reducers: Dict[Tuple[int,...], List[IRSubTensor]] = dict()
         for subw, devices in sub_weight_devices.items():
-            reducers.setdefault(devices, []).append(subw)
+            if subw in replicated:
+                replicated_reducers.setdefault(devices, []).append(subw)
+            else:
+                vp_reducers.setdefault(devices, []).append(subw)
 
-        for devices, subws in reducers.items():
+        for devices, subws in vp_reducers.items():
             for reducer in IRWeightReducer.from_weights(subws, devices):
-                # insert reducer to as the last node.
                 graph.insert(reducer, graph.nnodes)
+
+        if CompileFlag.reducer_replicated_params:
+            for devices, subws in replicated_reducers.items():
+                for reducer in IRWeightReducer.from_weights(subws, devices, nreplicas=len(devices)):
+                    graph.insert(reducer, graph.nnodes)
 
         return graph
 

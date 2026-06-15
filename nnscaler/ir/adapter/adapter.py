@@ -174,7 +174,7 @@ class IRAdapter(IRCell):
 
 class IRWeightReducer(IRCell):
 
-    def __init__(self, weights: List[IRSubTensor], name='reducer'):
+    def __init__(self, weights: List[IRSubTensor], name='reducer', nreplicas: int = 1):
         if not all(isinstance(w, IRSubTensor) and w.is_param() for w in weights):
             raise RuntimeError("Expected a list of gradient IRSubTensor")
         if len(set(w.dtype for w in weights)) != 1:
@@ -184,6 +184,7 @@ class IRWeightReducer(IRCell):
         super().__init__(name, signature, len(weights), 0)
         for idx, weight in enumerate(weights):
             self.set_input(idx, weight)
+        self.nreplicas = nreplicas
 
     def isfw(self) -> bool:
         return False
@@ -199,9 +200,17 @@ class IRWeightReducer(IRCell):
         return repr(self)
 
     @classmethod
-    def from_weights(cls, weights: List[IRSubTensor], devices, name='reducer') -> List['IRWeightReducer']:
+    def from_weights(cls, weights: List[IRSubTensor], devices, name='reducer', nreplicas: int = 1) -> List['IRWeightReducer']:
         """!
         Create reducers from a list of weights
+
+        Args:
+            weights: list of weight sub-tensors
+            devices: device tuple for the reducer
+            name: reducer name
+            nreplicas: divisor applied to gradients after all-reduce.
+                For replicated weights, this should be the number of devices
+                so that the summed gradient is averaged back to the correct value.
         """
         if not weights:
             return []
@@ -218,7 +227,7 @@ class IRWeightReducer(IRCell):
 
         reducers = []
         for typed_subws in dtype_groups.values():
-            reducer = IRWeightReducer(typed_subws, name)
+            reducer = IRWeightReducer(typed_subws, name, nreplicas=nreplicas)
             reducer.device = devices
             reducers.append(reducer)
 
