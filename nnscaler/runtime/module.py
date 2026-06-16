@@ -409,6 +409,32 @@ class CubeModule(torch.nn.Module):
                 raise RuntimeError(
                     f'remaining graph parameters / buffers cannot find in model files: {list(attr_names)}')
 
+    def load_np_buffer_content(self, filename: str):
+        """Load non-persistent buffer content from file.
+
+        Only loads attributes that are non-persistent buffers
+        (i.e., in self._non_persistent_buffers_set).
+
+        Args:
+            filename (str): file path to the npbuffer.pt file
+        """
+        if not self._non_persistent_buffers_set:
+            return
+        np_buffer_model: Dict[int, torch.Tensor] = torch.load(filename)
+        with torch.no_grad():
+            _logger.info(f'loading non-persistent buffers from {filename}')
+            for attr_name in self._non_persistent_buffers_set:
+                if attr_name not in self._fullmap:
+                    raise RuntimeError(f'non-persistent buffer {attr_name} not found in fullmap.')
+                meta = self._fullmap[attr_name]
+                if meta.tid not in np_buffer_model:
+                    raise RuntimeError(f'non-persistent buffer {attr_name} (tid={meta.tid}) not found in {filename}.')
+                attr = getattr(self, attr_name)
+                content = np_buffer_model[meta.tid][meta.slicers]
+                if meta.val_chunks != 1:
+                    content = content / meta.val_chunks
+                attr.copy_(content)
+
     def init_group(self, ranks: List[int]):
         if not all([isinstance(rank, int) for rank in ranks]):
             raise TypeError("Expected ranks to be List[int]")
@@ -1166,6 +1192,14 @@ class ParallelModule(CubeModule):
         module_file = Path(sys.modules[self.__module__].__file__)
         if init_params:
             self.load_attr_content(str(module_file.with_name(f"{FxModuleParser.ATTR_CONTENT_FILE_STEM}")))
+        elif self._non_persistent_buffers_set:
+            # When init_params=False, only load non-persistent buffers from the small npbuffer.pt file.
+            # This avoids loading the large fullmodel.pt files when resuming from checkpoint,
+            # since checkpoint will provide the rest of the parameters/buffers.
+            np_buffer_file = module_file.with_name(FxModuleParser.NON_PERSISTENT_BUFFER_FILE)
+            if np_buffer_file.is_file():
+                self.load_np_buffer_content(str(np_buffer_file))
+                self._non_presistent_buffers_inited = True
 
         self._warn_uninitialized_non_persistent_buffers()
 
