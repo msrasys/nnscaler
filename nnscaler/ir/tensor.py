@@ -54,7 +54,7 @@ class IndexMap:
 
     def __eq__(self, other):
         if isinstance(other, IndexMap):
-            if self.ndims != self.ndims:
+            if self.ndims != other.ndims:
                 return False
             for dim in range(self.ndims):
                 if self.indices[dim] != other.indices[dim]:
@@ -248,6 +248,46 @@ class ValueMap:
 
     def __repr__(self):
         return f'({self.weight[0]}/{self.weight[1]})'
+
+    @classmethod
+    def is_complete(cls, valmaps: List['ValueMap']) -> bool:
+        """
+        Check if a group of ValueMaps can compose a complete Value,
+        i.e., they cover the full value range exactly with no gaps and no overlaps.
+
+        Args:
+            valmaps List[ValueMap]: a list of ValueMap instances
+
+        Returns:
+           bool: True if they compose a complete value
+
+        Raises:
+            ValueError: if any two ValueMaps overlap (including duplicates)
+        """
+        if not valmaps:
+            return False
+        valmaps = [vm.weight if isinstance(vm, ValueMap) else vm for vm in valmaps]
+        from math import lcm
+        base = 1
+        for vm in valmaps:
+            base = lcm(base, vm[1])
+        intervals = []
+        for vm in valmaps:
+            idx, nchunks = vm
+            scale = base // nchunks
+            intervals.append((idx * scale, (idx + 1) * scale))
+        intervals.sort()
+        for i in range(1, len(intervals)):
+            if intervals[i][0] < intervals[i - 1][1]:
+                raise ValueError(
+                    f"Overlapping ValueMaps detected: intervals {intervals[i - 1]} and {intervals[i]} overlap"
+                )
+        if intervals[0][0] != 0 or intervals[-1][1] != base:
+            return False
+        for i in range(1, len(intervals)):
+            if intervals[i][0] != intervals[i - 1][1]:
+                return False
+        return True
 
 
 class IRFullTensor(IRTensor):
