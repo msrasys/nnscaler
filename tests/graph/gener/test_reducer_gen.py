@@ -507,13 +507,12 @@ def test_pp_shared_no_reduce():
         finally:
             CompileFlag.reducer_replicated_params = old_flag
 
+    # PP + all replicated + no-grad-reduce
+    # will always use reducer_replicated_params internally.
     reducers = _get_reducers(reducer_replicated_params=False)[0]
-    assert len(reducers) == 2
-    assert reducers[0].nreplicas == 1
-    assert reducers[1].nreplicas == 1
-    assert reducers[0].device == (0, 2)
-    assert reducers[1].device == (1, 3)
-    assert reducers[0].input(0).parent == reducers[1].input(0).parent
+    assert len(reducers) == 1
+    assert reducers[0].nreplicas == 2
+    assert reducers[0].device == (0, 1, 2, 3)
 
     reducers = _get_reducers(reducer_replicated_params=True)[0]
     assert len(reducers) == 2

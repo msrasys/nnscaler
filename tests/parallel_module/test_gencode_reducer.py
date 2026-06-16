@@ -279,3 +279,135 @@ def test_codegen_normal_add_mul_multiref_split(tmp_path):
     )
     # generated reducer:
     # self.wreducer94 = nnscaler.runtime.adapter.Reducer(ranks=[0, 1, 2, 3], reduce_op='sum', async_op=async_op, zero=0, max_bucket_size_bytes=max_bucket_size_bytes, zero_use_reduce_scatter=zero_use_reduce_scatter, zero_param_level_sharding=zero_param_level_sharding,zero_ngroups=1,nreplicas=2)
+
+
+from tests.graph.gener.test_reducer_gen import (
+    ReducerModule,
+    SimpleModule,
+    SimpleModuleNoReduce,
+    SimpleModule2ConsumersTp,
+    SimpleModule2ConsumersSP,
+    SimpleModule2ConsumersSP3
+)
+
+
+@replace_all_device_with('cpu')
+def test_pp_replicated_tp1_shared_weight(tmp_path):
+    m = ReducerModule()
+    m.train()
+
+    def _pas(graph, cfg):
+        from nnscaler.policies import get_pas_ops, OpPlan, OpPartition, IRFwOperation
+        [matmul1, matmul2, add, sum] = graph.select(ntype=IRFwOperation)
+        for node in get_pas_ops(graph):
+            if node in [matmul1, matmul2]:
+                yield OpPlan(node, stage_id=0)
+            elif node in [add, sum]:
+                yield OpPlan(node, stage_id=1)
+
+    parallelize(
+        m,
+        {'x': torch.randn(128, 128)},
+        _pas,
+        ComputeConfig(2, 4, use_end2end=True, pas_config={
+            'pipeline_nmicros': 2
+        }),
+        gen_savedir=tmp_path,
+        load_module=False,
+        reuse='override',
+        instance_name = 'multiref_weight',
+    )
+    assert _gencode_contains(tmp_path, ReducerModule, 0,
+        r"nnscaler.runtime.function.multiref\(self.param1_.*, times=2\)",
+        instance_name = 'multiref_weight',
+    )
+    assert _gencode_contains(tmp_path, ReducerModule, 0,
+        r"nnscaler.runtime.adapter.Reducer\(ranks=\[0, 2\].*nreplicas=1\)",
+        instance_name = 'multiref_weight',
+    )
+
+    m = ReducerModule()
+    m.train()
+    parallelize(
+        m,
+        {'x': torch.randn(128, 128)},
+        _pas,
+        ComputeConfig(2, 4, use_end2end=True, pas_config={
+            'pipeline_nmicros': 2,
+            'pipeline_multiref_replicated_params': False,
+        }),
+        gen_savedir=tmp_path,
+        load_module=False,
+        reuse='override',
+        instance_name = 'nomultiref_weight',
+    )
+    # param1 will be on both stages,
+    # the reducer for param1 will be [0, 1, 2, 3] with nreplicas=1, and there will be no multiref
+    assert not _gencode_contains(tmp_path, ReducerModule, 0,
+        r"nnscaler.runtime.function.multiref\(self.param1_.*, times=2\)",
+        instance_name = 'nomultiref_weight',
+    )
+    assert _gencode_contains(tmp_path, ReducerModule, 0,
+        r"nnscaler.runtime.adapter.Reducer\(ranks=\[0, 2\].*nreplicas=1\)",
+        instance_name = 'nomultiref_weight',
+    )
+    assert _gencode_contains(tmp_path, ReducerModule, 0,
+        r"nnscaler.runtime.adapter.Reducer\(ranks=\[0, 1, 2, 3\].*nreplicas=1\)",
+        instance_name = 'nomultiref_weight',
+    )
+    assert _gencode_contains(tmp_path, ReducerModule, 0,
+        r"self.register_parameter\('param1_.*",
+        instance_name = 'nomultiref_weight',
+    )
+
+    assert not _gencode_contains(tmp_path, ReducerModule, 1,
+        r"nnscaler.runtime.adapter.Reducer\(ranks=\[0, 2\].*nreplicas=1\)",
+        instance_name = 'nomultiref_weight',
+    )
+    assert _gencode_contains(tmp_path, ReducerModule, 1,
+        r"nnscaler.runtime.adapter.Reducer\(ranks=\[0, 1, 2, 3\].*nreplicas=1\)",
+        instance_name = 'nomultiref_weight',
+    )
+    assert _gencode_contains(tmp_path, ReducerModule, 1,
+        r"self.register_parameter\('param1_.*",
+        instance_name = 'nomultiref_weight',
+    )
+
+
+@replace_all_device_with('cpu')
+def test_tp_partitioned_weight(tmp_path):
+    def _pas(graph, cfg):
+        from nnscaler.policies import get_pas_ops, OpPlan, OpPartition, IRFwOperation
+        [matmul1, matmul2, sum] = graph.select(ntype=IRFwOperation)
+        for node in get_pas_ops(graph):
+            if node in [matmul1]:
+                yield OpPlan(node, partition=OpPartition(input=0, dim=1))
+
+    m = SimpleModule()
+    m.train()
+
+    parallelize(
+        m,
+        {'x': torch.randn(128, 128)},
+        _pas,
+        ComputeConfig(2, 4, use_end2end=True, reducer_replicated_params=False),
+        gen_savedir=tmp_path,
+        load_module=False,
+        reuse='override',
+        instance_name = 'noreducer_replicated_params',
+    )
+
+    m = SimpleModule()
+    m.train()
+
+    parallelize(
+        m,
+        {'x': torch.randn(128, 128)},
+        _pas,
+        ComputeConfig(2, 4, use_end2end=True, reducer_replicated_params=True),
+        gen_savedir=tmp_path,
+        load_module=False,
+        reuse='override',
+        instance_name = 'reducer_replicated_params',
+    )
+    assert True

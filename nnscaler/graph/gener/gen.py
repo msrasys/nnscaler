@@ -464,25 +464,29 @@ class IRAdapterGener:
                         f"To achieve this, users need to call `graph.multiref(weight)` inside the policy.\n"
                         f"FullTensor weight: {weight}\n"
                     )
-                if reduce_replicated_params:
-                    # generate reducer across all replicas for better convergence
-                    # for example, device group0 (0, 1) device group1(2, 3)
-                    # Reducer will be generated for ranks (0, 1, 2, 3) with replicas = 2
-                    for sw in deduped_sub_ws:
-                        devices = sub_weight_devices[sw]
-                        replicas = first_group_size
-                        reducer_info.append((sw, devices, replicas))
-                else:
-                    # generate reducer across device groups
-                    # for example, device group0 (0, 1) device group1(2, 3)
-                    # Reducer will be generated for ranks (0, 2) and ranks (1, 3) respectively.
-                    for sw in deduped_sub_ws:
-                        devices = sub_weight_devices[sw]
-                        grouped_devices = {}
-                        for dev in devices:
-                            grouped_devices.setdefault(dev % first_group_size, []).append(dev)
-                        for group_devs in grouped_devices.values():
-                            reducer_info.append((sw, sorted(group_devs), 1))
+                # always assume reduce_replicated_params=True
+                # generate reducer across all replicas for better convergence
+                # for example, device group0 (0, 1) device group1(2, 3)
+                # Reducer will be generated for ranks (0, 1, 2, 3) with replicas = 2
+                for sw in deduped_sub_ws:
+                    devices = sub_weight_devices[sw]
+                    replicas = first_group_size
+                    reducer_info.append((sw, devices, replicas))
+
+                # the following is when reduce_replicated_params=False,
+                # But this implementation is not compatible with gnorm calculation
+                # in current implementation.
+                # Anyway, this implementation looks weird. Not bad to disable it.
+                # # generate reducer across device groups
+                # # for example, device group0 (0, 1) device group1(2, 3)
+                # # Reducer will be generated for ranks (0, 2) and ranks (1, 3) respectively.
+                # for sw in deduped_sub_ws:
+                #     devices = sub_weight_devices[sw]
+                #     grouped_devices = {}
+                #     for dev in devices:
+                #         grouped_devices.setdefault(dev % first_group_size, []).append(dev)
+                #     for group_devs in grouped_devices.values():
+                #         reducer_info.append((sw, sorted(group_devs), 1))
             else: # PP + all replicated + grad_reduce
                 assert len(deduped_sub_ws) == 1
                 # all gradients are partitioned
