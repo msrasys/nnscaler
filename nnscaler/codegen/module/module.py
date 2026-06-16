@@ -492,7 +492,15 @@ class ModuleCodeGen(FuncEmission):
                     isinstance(prim, CommPrim) and not isinstance(prim, (MovePrim, ChunkPrim, VChunkPrim))
                     for prim in node.prims
                 )
-                codes = self.emit_adapter(node, prefix_attr='self.', async_op=CompileFlag.async_comm or (has_p2p and not has_other_comm))
+                codes = self.emit_adapter(
+                    node,
+                    prefix_attr='self.',
+                    async_op=(
+                        CompileFlag.async_comm
+                        or self.is_async_recv_adapter(node)
+                        or (has_p2p and not has_other_comm)
+                    ),
+                )
             elif isinstance(node, IRWeightReducer):
                 self.init_reducer(node, device, param_first_used_pos, as_parallel_module)
                 codes = self.emit_reducer(node)
@@ -587,6 +595,14 @@ class ModuleCodeGen(FuncEmission):
                 if CompileFlag.use_jit and name.startswith('segment'):
                     cb.insert_body('@torch.jit.script_method')
                 cb.insert_body(fb.code)
+
+                if isinstance(node, IRAdapter) and self.is_async_recv_adapter(node):
+                    with FunctionBlock(func_name=f'{name}_wait', args=['self', '__pending']) as wait_fb:
+                        wait_fb.insert_body(self.emit_async_recv_adapter_wait(node))
+                        outputs = [self.tensor_name(t) for t in node.outputs()]
+                        wait_fb.insert_body(f"return {', '.join(outputs)}")
+                    cb.insert_body('')
+                    cb.insert_body(wait_fb.code)
 
                 if saved_tensors_hooks_needed:
                     with FunctionBlock(func_name=name, args=input_args) as fb:

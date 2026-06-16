@@ -11,7 +11,7 @@ from nnscaler.ir.cten import IRCell, IRTensor, IRObject
 from nnscaler.ir.tensor import IRSubTensor
 from nnscaler.ir.operator import IRDataOperation, IRFwOperation
 from nnscaler.ir.adapter import IRWeightReducer, IRAdapter
-from nnscaler.ir.adapter.prim import CommPrim
+from nnscaler.ir.adapter.prim import CommPrim, MovePrim
 
 from nnscaler.graph.segment import IRSegment
 
@@ -323,6 +323,78 @@ class FuncEmission(CodeEmission):
 
         return codes
 
+    def _adapter_prims(self, node: IRAdapter) -> List:
+        return [node] if node.differentiable and node.custom else [prim for prim in node.prims]
+
+    def is_async_recv_adapter(self, node: IRAdapter) -> bool:
+        if node.differentiable and node.custom:
+            return False
+        prims = self._adapter_prims(node)
+        return (
+            len(node.inputs()) == 0
+            and len(node.outputs()) == 1
+            and len(prims) > 0
+            and isinstance(prims[0], MovePrim)
+            and len(prims[0].inputs()) == 0
+            and len(prims[0].outputs()) == 1
+        )
+
+    def _emit_adapter_prims(
+        self,
+        prims: List,
+        prefix_attr: Optional[str] = None,
+        async_op: bool = False,
+        input_name_overrides: Optional[Dict[int, str]] = None,
+    ) -> List[str]:
+        codes = []
+        input_name_overrides = input_name_overrides or {}
+
+        def _input_name(inp: IRObject) -> str:
+            if isinstance(inp, IRObject) and inp.tid in input_name_overrides:
+                return input_name_overrides[inp.tid]
+            return self.tensor_name(inp, prefix_attr=prefix_attr)
+
+        for prim in prims:
+            prim_inputs = prim.inputs()
+            if len(prim_inputs) == 0:
+                itensors = '()'
+            elif len(prim_inputs) == 1:
+                itensors = _input_name(prim_inputs[0])
+            else:
+                itensors = '(' + ', '.join(_input_name(inp) for inp in prim_inputs) + ')'
+            prim_kwargs = dict(prim.kwargs)
+            if async_op and isinstance(prim, CommPrim):
+                prim_kwargs['async_op'] = True
+            kwargs = self.kwargs_name(**prim_kwargs)
+            outputs = self.return_name(prim.outputs())
+            if CompileFlag.line_timer:
+                codes.append(f'nnscaler.runtime.function.print_time({repr(prim.signature)})')
+            codes.append(f'{outputs} = {prim.signature}({itensors}, {kwargs})')
+        return codes
+
+    def emit_async_recv_adapter_wait(self, node: IRAdapter, prefix_attr: Optional[str] = None) -> List[str]:
+        assert self.is_async_recv_adapter(node), f'Expected async recv adapter, got {node}'
+        prims = self._adapter_prims(node)
+        codes = ['__pending = nnscaler.runtime.executor.AsyncCommHandler().wait(__pending)']
+        first_output = prims[0].output(0)
+        codes += self._emit_adapter_prims(
+            prims[1:],
+            prefix_attr=prefix_attr,
+            async_op=False,
+            input_name_overrides={first_output.tid: '__pending'},
+        )
+
+        final_output = self.tensor_name(node.output(0), prefix_attr=prefix_attr)
+        emitted_outputs = {
+            out.tid
+            for prim in prims[1:]
+            for out in prim.outputs()
+            if isinstance(out, IRObject)
+        }
+        if node.output(0).tid not in emitted_outputs:
+            codes.append(f'{final_output} = __pending')
+        return codes
+
     def emit_adapter(self, node: IRAdapter, prefix_attr: Optional[str] = None,
                      async_op: bool = False) -> List[str]:
         """
@@ -337,9 +409,16 @@ class FuncEmission(CodeEmission):
             prefix_attr (str | None): prefix to the tensor name
             async_op (bool): whether to enable async communication
         """
-        codes = []
         assert len(node.device) == 1, f"Expected adapter to be dispatched:\n{node.extra_repr()}"
-        prims = [node] if node.differentiable and node.custom else [prim for prim in node.prims]
+        prims = self._adapter_prims(node)
+
+        if async_op and self.is_async_recv_adapter(node):
+            codes = self._emit_adapter_prims(prims[:1], prefix_attr=prefix_attr, async_op=True)
+            first_output = self.tensor_name(prims[0].output(0), prefix_attr=prefix_attr)
+            final_output = self.tensor_name(node.output(0), prefix_attr=prefix_attr)
+            if first_output != final_output:
+                codes.append(f'{final_output} = {first_output}')
+            return codes
 
         if async_op:
             # note async_op can only be applied when primitives satisfy:
@@ -356,21 +435,7 @@ class FuncEmission(CodeEmission):
             if len(colls) > 1 and not all(devs == devices[0] for devs in devices[1:]):
                 async_op = False
 
-        for prim in prims:
-            if len(prim.inputs()) == 1:
-                itensors = self.tensor_name(prim.inputs()[0], prefix_attr=prefix_attr)
-            else:
-                itensors = self.tuple_name(prim.inputs(), prefix_attr=prefix_attr)
-            prim_kwargs = dict(prim.kwargs)
-            if async_op and isinstance(prim, CommPrim):
-                prim_kwargs['async_op'] = True
-            kwargs = self.kwargs_name(**prim_kwargs)
-            outputs = self.return_name(prim.outputs())
-            if CompileFlag.line_timer:
-                codes.append(f'nnscaler.runtime.function.print_time({repr(prim.signature)})')
-            code = f'{outputs} = {prim.signature}({itensors}, {kwargs})'
-            codes.append(code)
-        return codes
+        return self._emit_adapter_prims(prims, prefix_attr=prefix_attr, async_op=async_op)
 
     def emit_reducer(self, node: IRWeightReducer) -> List[str]:
         """
