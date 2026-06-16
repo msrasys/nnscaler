@@ -605,6 +605,7 @@ class IRAdapterGener:
         )
         # merge reducers with the same device group and replica number
         # to reduce the number of reducer nodes
+        # this is important for later work (continuous buffer/zero etc.)
         subweights_map: Dict[Tuple[Tuple[int,...], int], List[IRSubTensor]] = {}
         for sub_weight, devices, replicas in gen_reducer_info:
             subweights_map.setdefault((tuple(devices), replicas), []).append(sub_weight)

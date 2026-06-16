@@ -312,11 +312,10 @@ def test_tp_partitioned_input_2_consumers_allreduce():
 
     graph = IRAdapterGener.gen_weight(graph)
     reducers = graph.select(ntype=IRWeightReducer)
-    assert len(reducers) == 2
-    for reducer in reducers:
-        assert reducer.device == (0, 1)
-        assert reducer.nreplicas == 1
-    assert set([reducers[0].input(0).parent, reducers[1].input(0).parent]) ==\
+    assert len(reducers) == 1
+    assert reducers[0].device == (0, 1)
+    assert reducers[0].nreplicas == 1
+    assert set([reducers[0].input(0).parent, reducers[0].input(1).parent]) ==\
         set([mul1.input(1).parent, matmul2.input(1).parent])
 
 
@@ -383,11 +382,10 @@ def test_tp_partitioned_input_2_consumers_noreduce():
 
     reducers, [mul1, add, matmul2, sum] = _get_reducers(reducer_replicated_params=True)
 
-    assert len(reducers) == 2
-    for reducer in reducers:
-        assert reducer.device == (0, 1)
-        assert reducer.nreplicas == 2
-    assert set([reducers[0].input(0).parent, reducers[1].input(0).parent]) ==\
+    assert len(reducers) == 1
+    assert reducers[0].device == (0, 1)
+    assert reducers[0].nreplicas == 2
+    assert set([reducers[0].input(0).parent, reducers[0].input(1).parent]) ==\
         set([mul1.input(1).parent, matmul2.input(1).parent])
 
 
@@ -446,8 +444,7 @@ def test_pp_shared_tp():
     assert len(reducers) == 2
     assert reducers[0].nreplicas == 1
     assert reducers[1].nreplicas == 1
-    assert reducers[0].device == (0, 2)
-    assert reducers[1].device == (1, 3)
+    assert set([reducers[0].device, reducers[1].device]) == {(0, 2), (1, 3)}
     assert reducers[0].input(0).parent == reducers[1].input(0).parent
 
 
