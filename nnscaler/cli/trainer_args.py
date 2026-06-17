@@ -586,7 +586,7 @@ class LogConfig:
 
 @dataclass
 class LogsConfig:
-    async_logging: bool = True
+    async_logging: bool = False
     # the number of workers for asynchronous logging.
     # Only applicable when async_logging is True.
     # be careful when setting this value.

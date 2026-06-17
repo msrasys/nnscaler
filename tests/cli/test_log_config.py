@@ -55,7 +55,7 @@ def test_old_format_list_of_dicts():
     assert len(config.logs) == 1
     assert config.logs[0].type == 'nnscaler.cli.loggers.TensorBoardLogger'
     # defaults should apply
-    assert config.async_logging is True
+    assert config.async_logging is False
     assert config.max_workers == 1
 
 
@@ -120,7 +120,7 @@ def test_new_format_defaults():
         ],
     }
     config = LogsConfig.deserialize(data)
-    assert config.async_logging is True
+    assert config.async_logging is False
     assert config.max_workers == 1
     assert len(config.logs) == 1
 
@@ -302,7 +302,7 @@ def test_cli_old_format_log():
     assert args.log.logs[1].type == 'nnscaler.cli.loggers.WandbLogger'
     assert args.log.logs[1].args == {'name': 'test-wandb', 'project': 'nnscaler'}
     # defaults for async_logging / max_workers
-    assert args.log.async_logging is True
+    assert args.log.async_logging is False
     assert args.log.max_workers == 1
 
 
@@ -384,7 +384,7 @@ def test_post_init_list_converted_to_logs_config():
     assert len(args.log.logs) == 1
     assert args.log.logs[0].type == 'nnscaler.cli.loggers.TensorBoardLogger'
     # defaults
-    assert args.log.async_logging is True
+    assert args.log.async_logging is False
     assert args.log.max_workers == 1
 
 

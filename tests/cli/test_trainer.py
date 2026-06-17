@@ -31,9 +31,9 @@ def trainer_logging_worker(save_dir, run_async):
     tb_log_savedir = log_savedir / 'tensorboard'
     wandb_log_savedir = log_savedir / 'wandb'
     # train 4 epcho in one time
-    if run_async:
+    if not run_async:
         # old format of log config
-        # async logging is enabled by default.
+        # async logging is disabled by default.
         trainer = Trainer([
             '-f', config_path,
             '--max_epochs', '2',
@@ -52,7 +52,7 @@ def trainer_logging_worker(save_dir, run_async):
         ])
     else:
         # new format of log config
-        # (async_logging disabled)
+        # (async_logging enabled)
         trainer = Trainer([
             '-f', config_path,
             '--max_epochs', '2',
@@ -60,7 +60,7 @@ def trainer_logging_worker(save_dir, run_async):
             '--compute_config.plan_ngpus', '2',
             '--compute_config.runtime_ngpus', '4',
             '--checkpoint.no_save', 'true',
-            '--log.async_logging', 'false',
+            '--log.async_logging', 'true',
             '--log.logs.0.type', 'nnscaler.cli.loggers.TensorBoardLogger',
             '--log.logs.0.args.name', 'test-cli',
             '--log.logs.0.args.root_dir', str(tb_log_savedir),
