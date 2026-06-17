@@ -29,6 +29,7 @@ class AsyncCommHandler:
         def __init__(self):
             self._works: Dict[int, List] = {}
             self._callbacks: Dict[int, Callable] = {}
+            self._metas: Dict[int, str] = {}
             self._send_holds: List = []
 
     instance = None
@@ -49,38 +50,56 @@ class AsyncCommHandler:
         """
         if id(tensor) not in self._works:
             return tensor
-        works = self._works.pop(id(tensor))
+        tid = id(tensor)
+        works = self._works.pop(tid)
+        comm_label = self._metas.pop(tid, None)
+        from nnscaler.profiler import nvtx
         for work in works:
-            work.wait()
-        callback = self._callbacks.pop(id(tensor))
+            with nvtx.range(nvtx.wait_trace_label(comm_label)):
+                work.wait()
+        callback = self._callbacks.pop(tid)
         if callback is not None:
             tensor = callback(tensor)
         return tensor
     
-    def submit(self, tensor: torch.Tensor, works: List, callback: Optional[Callable] = None):
+    def submit(self, tensor: torch.Tensor, works: List, callback: Optional[Callable] = None, comm_label: Optional[str] = None):
         """
         Submit an async communication
         """
-        self._works[id(tensor)] = works
-        self._callbacks[id(tensor)] = callback
+        from nnscaler.profiler import nvtx
 
-    def hold_send(self, tensor: torch.Tensor, work):
-        self._send_holds.append((tensor, work))
+        tid = id(tensor)
+        self._works[tid] = works
+        self._callbacks[tid] = callback
+        label = comm_label or nvtx.current_label()
+        if label is not None:
+            self._metas[tid] = label
+
+    def hold_send(self, tensor: torch.Tensor, work, comm_label: Optional[str] = None):
+        from nnscaler.profiler import nvtx
+
+        self._send_holds.append((tensor, work, comm_label or nvtx.current_label()))
 
     def drain_sends(self, wait: bool = True):
         if wait:
-            for _, work in self._send_holds:
-                work.wait()
+            from nnscaler.profiler import nvtx
+
+            for _, work, comm_label in self._send_holds:
+                with nvtx.range(nvtx.wait_trace_label(comm_label)):
+                    work.wait()
             self._send_holds.clear()
             return
 
         pending = []
-        for tensor, work in self._send_holds:
+        from nnscaler.profiler import nvtx
+
+        for tensor, work, comm_label in self._send_holds:
             is_completed = getattr(work, 'is_completed', None)
             if is_completed is not None and is_completed():
-                work.wait()
+                with nvtx.range(nvtx.wait_trace_label(comm_label)):
+                    work.wait()
             else:
-                pending.append((tensor, work))
+                pending.append((tensor, work, comm_label))
         self._send_holds = pending
 
     def drain(self):
@@ -90,18 +109,23 @@ class AsyncCommHandler:
             callback = self._callbacks.get(tid)
             if callback is not None:
                 continue
+            comm_label = self._metas.get(tid)
+            from nnscaler.profiler import nvtx
             for work in works:
-                work.wait()
+                with nvtx.range(nvtx.wait_trace_label(comm_label)):
+                    work.wait()
             self._works.pop(tid, None)
             self._callbacks.pop(tid, None)
+            self._metas.pop(tid, None)
 
     def clear(self):
         AsyncCommHandler.instance = AsyncCommHandler.__AsyncCommHandler()
 
     def check_clear(self):
-        assert len(self._works) == 0 and len(self._callbacks) == 0 and len(self._send_holds) == 0, (
+        assert len(self._works) == 0 and len(self._callbacks) == 0 and len(self._metas) == 0 and len(self._send_holds) == 0, (
             f"AsyncCommHandler is not clear: works={len(self._works)}, "
-            f"callbacks={len(self._callbacks)}, send_holds={len(self._send_holds)}"
+            f"callbacks={len(self._callbacks)}, metas={len(self._metas)}, "
+            f"send_holds={len(self._send_holds)}"
         )
 
 
@@ -119,15 +143,23 @@ class Executor:
     _backward_pre_hook: Optional[Callable] = None
 
     @staticmethod
-    def fexecute(name: str, subgraph: Callable, *input_tensors: Tuple[Any], requires_grad=True):
+    def fexecute(
+        name: str,
+        subgraph: Callable,
+        *input_tensors: Tuple[Any],
+        requires_grad=True,
+        trace_label: Optional[str] = None,
+    ):
         """
         forward the sub-graph.
         """
         input_tensors = Executor.sync_tensors(input_tensors)
+        from nnscaler.profiler import nvtx
 
         if not requires_grad:
             with torch.no_grad():
-                outputs = subgraph(*input_tensors)
+                with nvtx.range(trace_label):
+                    outputs = subgraph(*input_tensors)
             return outputs
 
         # everytime forward a segment, detach the tensor from previous graph
@@ -140,7 +172,8 @@ class Executor:
         saved_pairs = [(id(itensor), dtensor) for itensor, dtensor in zip(input_tensors, input_dtensors)]
         Executor._detach.setdefault(name, []).append(saved_pairs)  
         
-        outputs = subgraph(*input_dtensors)
+        with nvtx.range(trace_label):
+            outputs = subgraph(*input_dtensors)
         return outputs
 
     @staticmethod
@@ -163,7 +196,8 @@ class Executor:
     def backward(name: str,
                  input_tensors: List[torch.Tensor],
                  output_tensors: List[torch.Tensor],
-                 output_tensor_grads: List[torch.Tensor]) -> Tuple[torch.Tensor]:
+                 output_tensor_grads: List[torch.Tensor],
+                 trace_label: Optional[str] = None) -> Tuple[torch.Tensor]:
         """
         Backward Procedure.
 
@@ -182,6 +216,7 @@ class Executor:
             gradient tensors corresponding to input_tensors.
         """
         output_tensor_grads = Executor.sync_tensors(output_tensor_grads)
+        from nnscaler.profiler import nvtx
 
         saved_pairs = Executor._detach[name].pop(0)
         tensor_ids: List[int] = [pair[0] for pair in saved_pairs]
@@ -224,10 +259,11 @@ class Executor:
                     dedup_output_tensor_grads
                 )
 
-        torch.autograd.backward(
-            dedup_output_tensors,
-            grad_tensors=dedup_output_tensor_grads,
-        )
+        with nvtx.range(trace_label):
+            torch.autograd.backward(
+                dedup_output_tensors,
+                grad_tensors=dedup_output_tensor_grads,
+            )
         grads = tuple(t.grad for t in input_tensors)
         assert all(grad is not None for grad in grads), "RuntimeError: got gradient None"
 

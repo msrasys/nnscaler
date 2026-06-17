@@ -20,6 +20,7 @@ from nnscaler.codegen.syntax.symtable import SymbolTable
 from nnscaler.codegen.lifecycle import LifeCycle
 from nnscaler.codegen.syntax.blocks import FunctionBlock, Block
 from nnscaler.flags import CompileFlag
+from nnscaler.profiler import nvtx
 
 
 _logger = logging.getLogger(__name__)
@@ -62,9 +63,38 @@ class ScheduleCodeGen(FuncEmission):
         # model full code
         self.init_code: List[str] = [
             '\n\n########## Generated Schedule Code ###########',
-            'import torch', 'import nnscaler', 'import _operator', '']
+            'import torch', 'import nnscaler', 'import nnscaler.profiler.nvtx', 'import _operator', '']
         # module member name
         self.symbols = SymbolTable()
+        self._segment_stage_ids = self._build_segment_stage_ids()
+
+    def _build_segment_stage_ids(self) -> dict[int, int]:
+        segment_stage_ids = {}
+        fsegments = [
+            seg for seg in self.execplan.graph.select(ntype=IRSegment, flatten=False)
+            if seg.isfw()
+        ]
+        for stage_id, segment in enumerate(fsegments):
+            segment_stage_ids[segment.cid] = stage_id
+            if isinstance(segment.mirror, IRSegment):
+                segment_stage_ids[segment.mirror.cid] = stage_id
+        return segment_stage_ids
+
+    def _segment_trace_label(self, node: IRSegment, action: str, rank: Optional[int], micro_batch_id: Optional[int]) -> str:
+        fw_segment = node if node.isfw() else node.mirror
+        stage_id = self._segment_stage_ids.get(node.cid)
+        if stage_id is None and isinstance(fw_segment, IRSegment):
+            stage_id = self._segment_stage_ids.get(fw_segment.cid)
+        segment_name = self.node_name(fw_segment) if isinstance(fw_segment, IRSegment) else self.node_name(node)
+        return nvtx.segment_trace_label(action, rank, stage_id, micro_batch_id, segment_name)
+
+    @staticmethod
+    def _wrap_nvtx(label: Optional[str], codes: List[str]) -> List[str]:
+        if not label or not codes:
+            return codes
+        with Block(f'with nnscaler.profiler.nvtx.range({repr(label)}):') as nvtx_block:
+            nvtx_block.insert_body(codes)
+        return nvtx_block.code
 
     def gen(self, device: int, outfile=None, attach=None) -> str:
         """
@@ -207,6 +237,7 @@ class ScheduleCodeGen(FuncEmission):
                         getitem_info=getitem_info,
                         dataloader_var=dataloader_var,
                         fallback_state=fallback_state,
+                        rank=device,
                     )
                     _append_code(fb, codes, self._get_node_stream(node))
                     # release
@@ -255,6 +286,7 @@ class ScheduleCodeGen(FuncEmission):
                         getitem_info=getitem_info,
                         dataloader_var=dataloader_var,
                         fallback_state=infer_fallback_state,
+                        rank=device,
                     )
                     _append_code(fb, codes, self._get_node_stream(node))
                     # release
@@ -561,13 +593,14 @@ class ScheduleCodeGen(FuncEmission):
 
     def emit_node(self, node: IRCell, force_no_grad: bool = False,
                   produced_tids: set = None, getitem_info: dict = None,
-                  dataloader_var: str = None, fallback_state: dict = None) -> List[str]:
+                  dataloader_var: str = None, fallback_state: dict = None,
+                  rank: Optional[int] = None) -> List[str]:
         """
         Emit node / subgraph code
         """
-        fsign = '{outputs} = nnscaler.runtime.executor.fexecute({name}, {model}, *{inputs}, requires_grad={req_grad})'
+        fsign = '{outputs} = nnscaler.runtime.executor.fexecute({name}, {model}, *{inputs}, requires_grad={req_grad}, trace_label={trace_label})'
         asign = '{outputs} = nnscaler.runtime.executor.aexecute({model}, *{inputs}, requires_grad={req_grad})'
-        bsign = '{input_grads} = nnscaler.runtime.executor.backward({name}, {input_tensors}, {output_tensors}, {output_grads})'
+        bsign = '{input_grads} = nnscaler.runtime.executor.backward({name}, {input_tensors}, {output_tensors}, {output_grads}, trace_label={trace_label})'
 
         node_inputs, node_outputs = node.inputs(), node.outputs()
         # the real inputs in gencode
@@ -605,7 +638,8 @@ class ScheduleCodeGen(FuncEmission):
                     name = f"'{name}'",
                     model = f'model.{name}',
                     inputs = inputs,
-                    req_grad = req_grad
+                    req_grad = req_grad,
+                    trace_label = repr(self._segment_trace_label(unwrap_node, 'FWD', rank, micro_batch_id)),
                 )]
                 if post_hook:
                     codes = codes + self._emit_segment_hook_code(
@@ -644,7 +678,8 @@ class ScheduleCodeGen(FuncEmission):
                     input_grads = input_grads_str,
                     input_tensors = input_tensors_str,
                     output_tensors = output_tensors_str,
-                    output_grads = output_grads_str
+                    output_grads = output_grads_str,
+                    trace_label = repr(self._segment_trace_label(unwrap_node, 'BWD', rank, micro_batch_id)),
                 )]
 
                 bwd_input_str = f'({input_tensors_str}, {output_tensors_str}, {output_grads_str})'
@@ -690,6 +725,10 @@ class ScheduleCodeGen(FuncEmission):
                 inputs = inputs,
                 req_grad = req_grad
             )]
+            codes = self._wrap_nvtx(
+                nvtx.adapter_trace_label(unwrap_node, rank, self.node_name(unwrap_node), micro_batch_id),
+                codes,
+            )
 
         elif isinstance(unwrap_node, IRWeightReducer):
             codes = [asign.format(
@@ -698,6 +737,10 @@ class ScheduleCodeGen(FuncEmission):
                 inputs='()',
                 req_grad=req_grad
             )]
+            codes = self._wrap_nvtx(
+                nvtx.weight_reducer_trace_label(unwrap_node, rank, self.node_name(unwrap_node)),
+                codes,
+            )
 
         else:
             raise RuntimeError(f"Unspported node type: {type(unwrap_node)}")
