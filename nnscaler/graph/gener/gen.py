@@ -474,9 +474,7 @@ class IRAdapterGener:
                     reducer_info.append((sw, devices, replicas))
 
                 # the following is when reduce_replicated_params=False,
-                # But this implementation is not compatible with gnorm calculation
-                # in current implementation.
-                # Anyway, this implementation looks weird. Not bad to disable it.
+                # this implementation looks weird. Not bad to disable it.
                 # # generate reducer across device groups
                 # # for example, device group0 (0, 1) device group1(2, 3)
                 # # Reducer will be generated for ranks (0, 2) and ranks (1, 3) respectively.
@@ -607,13 +605,21 @@ class IRAdapterGener:
             sub_weight_devices=sub_weight_devices,
             reduce_replicated_params=CompileFlag.reducer_replicated_params,
         )
-        # merge reducers with the same device group and replica number
+        # merge reducers with the same device group/number of grad replicas number/number of weight replicas
         # to reduce the number of reducer nodes
         # this is important for later work (continuous buffer/zero etc.)
-        subweights_map: Dict[Tuple[Tuple[int,...], int], List[IRSubTensor]] = {}
+        # NOTE: we can't put weights with different number of weight replicas into the same reducer,
+        # this is a requirement for current gnorm calculation implementation.
+        # for most cases, size of device group is the same with number of weight replicas,
+        # but that depends on the implementation of `_get_gen_reducer_info`.
+        # In current implementation, we have disable that case
+        # `PP + all replicated + no-grad-reduce + reduce_replicated_params=False`
+        subweights_map: Dict[Tuple[Tuple[int,...], int, int], List[IRSubTensor]] = {}
         for sub_weight, devices, replicas in gen_reducer_info:
-            subweights_map.setdefault((tuple(devices), replicas), []).append(sub_weight)
-        for (devices, replicas), sub_weights in subweights_map.items():
+            subweights_map.setdefault(
+                (tuple(devices), replicas, len(sub_weight_devices[sub_weight])), []
+            ).append(sub_weight)
+        for (devices, replicas, _), sub_weights in subweights_map.items():
             for reducer in IRWeightReducer.from_weights(sub_weights, devices, nreplicas=replicas):
                 graph.insert(reducer, graph.nnodes)
 
