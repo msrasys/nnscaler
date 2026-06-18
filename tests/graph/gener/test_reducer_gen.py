@@ -466,7 +466,7 @@ def test_pp_shared_replicated():
 
     # build reducer
     with pytest.raises(RuntimeError):
-        # we should be able to suppor this case.
+        # we should be able to support this case.
         # but currently the pre-check in gen_weights will raise error.
         graph = IRAdapterGener.gen_weight(graph)
         # reducers = graph.select(ntype=IRWeightReducer)
@@ -538,7 +538,6 @@ def test_pp_no_shared_allreduce():
                 nodes = graph.partition(node, node.algorithm('dim'), idx=0, dim=0, num=2)
             else:
                 nodes = graph.replicate(node, 2)
-            sn1, sn2 = nodes
             sn1, sn2 = nodes
             graph.assign(sn1, idx * 2)
             graph.assign(sn2, idx * 2 + 1)

@@ -209,7 +209,7 @@ class IRAdapterGener:
         Precondition:
             1. Devices of all consumers have been expanded so that each consumer is on one device.
             2. Devices of all weights have been expanded so that each weight is on one device.
-            3. All consumers of the same weight tensor should be either all partitioned or all replicated. This can be guaranteed by users' annotation and will be checked in `update_replicated_weights`.
+            3. All consumers of the same weight tensor should be either all partitioned or all replicated.
 
         group devices for pipeline parallelism (PP)
         - TP (partition/replicate): all consumers' outputs are sub-tensors of the same IRFullTensor parent(s),
@@ -593,7 +593,7 @@ class IRAdapterGener:
                         f"Consumers:\n{nl.join([repr(w.cell) for w in sub_ws])}\n"
                     )
 
-        # only record sub-weight that is consumed by multiple devices
+        # record sub-weight consumer devices (reducers are filtered later based on device count)
         sub_weight_devices: Dict[IRSubTensor, Tuple[int,...]] = dict()
         # gather sub weights that are consumed by same device groups
         # For replicated weights, we still create reducers but with nreplicas
