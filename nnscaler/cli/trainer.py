@@ -144,11 +144,18 @@ class Trainer:
         # load a dummy input from training dataset
         self.dummy_input = self.train_args.dummy_input
 
+        # When resuming from checkpoint, skip loading the full init weights
+        # (fullmodel.pt) since they will be overridden by the checkpoint.
+        # Only non-persistent buffers will be loaded from the small npbuffer.pt file.
+        is_resuming = self.train_args.checkpoint.get_resume_checkpoint() is not None
+        init_params = not is_resuming
+
         pmodel = parallelize_model(
             self.train_args, self.dummy_input,
             load_module=not compile_only,
             build_buckets=not self.train_args.should_delay_bucket_building(),
             checkpointer=self.checkpointer,
+            init_params=init_params,
         )
         if compile_only:
             return

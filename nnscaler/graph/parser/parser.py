@@ -38,6 +38,7 @@ class FxModuleParser:
     ATTR_CONTENT_FILE_0 = 'fullmodel.pt.0'
     ATTR_CONTENT_FILE_FORMAT = '{stem}.{idx}'
     ATTR_MAP_FILE = 'dist_param_map.pt'
+    NON_PERSISTENT_BUFFER_FILE = 'npbuffer.pt'
 
     def __init__(self,
               module: torch.fx.GraphModule,
@@ -153,6 +154,7 @@ class FxModuleParser:
             attr_savedir = Path(self.attr_savedir)
             self.frame.save_attr_content(attr_savedir / self.ATTR_CONTENT_FILE_STEM)
             self.frame.save_attr_map(attr_savedir / self.ATTR_MAP_FILE)
+            self.frame.save_np_buffer_content(attr_savedir / self.NON_PERSISTENT_BUFFER_FILE)
 
         self.frame.pop_var()
         return inputs, all_ir_nodes, outputs
