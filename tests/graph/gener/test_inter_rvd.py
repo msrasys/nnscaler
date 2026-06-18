@@ -75,6 +75,38 @@ def test_one_f_case():
     assert fprims[13].device == [11, 15]
 
 
+def test_one_f_case2():
+    fshape = [16, 16]
+
+    src_r, src_v, src_d = 2,1,(1,1)
+    dst_r, dst_v, dst_d = 2,1,(1,1)
+    src_rvd = (src_r, src_v) + src_d
+    dst_rvd = (dst_r, dst_v) + dst_d
+
+    pndevs = np.prod(src_rvd)
+    cndevs = np.prod(dst_rvd)
+
+    ftensor = IRFullTensor(shape=fshape, name='tensor', requires_grad=False)
+
+    pdevs = list(range(pndevs))
+    fp_rvd = RVDLayout.grid(ftensor, r=src_r, v=src_v, dims=src_d, devices=pdevs)
+
+    cdevs = list(range(pndevs, pndevs + cndevs))
+    fc_rvd = RVDLayout.grid(ftensor, r=dst_r, v=dst_v, dims=dst_d, devices=cdevs)
+
+    rvds = InterPathFinder.get_optimal_path(ftensor, src_rvd, dst_rvd)
+    fprims = InterPathFinder.path(fp_rvd, fc_rvd)
+    assert rvds == (('p', 2, 1, 1, 1), ('c', 2, 1, 1, 1))
+
+    fprims = InterPathFinder.path(fp_rvd, fc_rvd)
+    assert len(fprims) == 2
+    # producer part, v->d, so reduce_scatter
+    assert fprims[0].signature == 'nnscaler.runtime.adapter.move'
+    assert fprims[0].device == [0, 2]
+    assert fprims[1].signature == 'nnscaler.runtime.adapter.move'
+    assert fprims[1].device == [1, 3]
+
+
 def test_all_f_cases_fix_placement():
     fshape = [128, 256, 512]
     ftensor = IRFullTensor(shape=fshape, name='tensor', requires_grad=False)
