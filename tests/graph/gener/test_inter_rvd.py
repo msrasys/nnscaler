@@ -98,7 +98,6 @@ def test_one_f_case2():
     fprims = InterPathFinder.path(fp_rvd, fc_rvd)
     assert rvds == (('p', 2, 1, 1, 1), ('c', 2, 1, 1, 1))
 
-    fprims = InterPathFinder.path(fp_rvd, fc_rvd)
     assert len(fprims) == 2
     # producer part, v->d, so reduce_scatter
     assert fprims[0].signature == 'nnscaler.runtime.adapter.move'
