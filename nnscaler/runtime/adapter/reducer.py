@@ -1002,8 +1002,18 @@ class Reducer:
         )
 
         def _min_bucket_param_num(param_cls: Any) -> int:
-            zero_param_level_sharding = param_cls[-1].zero_param_level_sharding if param_cls else self._zero_param_level_sharding
-            return 1 if not zero_param_level_sharding else self._zero_size
+            return 1
+
+        def _split_param_sizes_for_zero(param_sizes: list[int]) -> tuple[list[list[int]], list[list[int]]]:
+            if len(param_sizes) >= self._zero_size:
+                return split_array_min_max(param_sizes, self._zero_size, keep_order=True)
+
+            groups = [[] for _ in range(self._zero_size)]
+            group_idx = [[] for _ in range(self._zero_size)]
+            for idx, param_size in enumerate(param_sizes):
+                groups[idx].append(param_size)
+                group_idx[idx].append(idx)
+            return groups, group_idx
 
         for param in self._params:
             if param.requires_grad:
@@ -1033,11 +1043,9 @@ class Reducer:
                     last_bucket_cls = param_cls
                     seq_buckets_cls.append(last_bucket_cls)
 
-        # check and fix the last bucket size when zero parameter-level sharding is enabled,
-        # this is done by merging the last bucket with the previous bucket with the same class
-        # if the last bucket size is smaller than the number of ranks in zero subgroup
-        # Note: only the last bucket of each cls needs to be fixed
-        # because the bucket building process ensures all buckets except the last one have enough parameters
+        # Keep this pass to merge same-class tail buckets when bucket limits split them.
+        # Parameter-level ZeRO can handle fewer parameters than zero ranks by assigning
+        # empty padded optimizer shards to the extra ranks.
         old_seq_buckets = self.seq_buckets
         old_seq_buckets_cls = seq_buckets_cls
         self.seq_buckets = []
@@ -1075,11 +1083,17 @@ class Reducer:
             self.starts.append(self.buffer_length)
             zero_param_level_sharding = param_cls[-1].zero_param_level_sharding if param_cls else self._zero_param_level_sharding
             param_sizes = [_aligned_nelement(p.nelement(), p.element_size(), self._align_size) for p in params]
-            if zero_param_level_sharding and len(params) >= self._zero_size:
+            if zero_param_level_sharding:
                 # TODO: set keep_order=False for less padding
                 # 1. async doesn't work well with keep_order=False
                 # 2. hard to write test cases.
-                groups, group_idx = split_array_min_max(param_sizes, self._zero_size, keep_order=True)
+                if len(params) < self._zero_size:
+                    _logger.warning(
+                        f"the number of parameters({len(params)}) in the bucket is smaller than "
+                        f"the number of ranks({self._zero_size}) in the zero group. "
+                        f"Extra zero ranks will receive padded empty optimizer shards."
+                    )
+                groups, group_idx = _split_param_sizes_for_zero(param_sizes)
                 max_group_size = max(sum(sizes) for sizes in groups)
                 new_param_order = []
                 for i in range(len(group_idx)):
