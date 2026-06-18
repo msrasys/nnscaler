@@ -497,7 +497,7 @@ class InterPathFinder:
         # so we only consider the first primitive for cost estimation?
         icost = cost_fn(prims[0])
         # gather all
-        # consider differnt linkbandwidth intra NVLink 300GB/s vs. inter-node 100Gbps
+        # consider different linkbandwidth intra NVLink 300GB/s vs. inter-node 100Gbps
         # disable comm_factor for now,
         # since we don't know whether InterTransition will happen in intra-node or inter-node,
         # and we don't have the information of device placement here

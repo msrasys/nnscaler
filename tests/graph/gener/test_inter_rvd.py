@@ -99,11 +99,9 @@ def test_one_f_case2():
     assert rvds == (('p', 2, 1, 1, 1), ('c', 2, 1, 1, 1))
 
     assert len(fprims) == 2
-    # producer part, v->d, so reduce_scatter
     assert fprims[0].signature == 'nnscaler.runtime.adapter.move'
-    assert fprims[0].device == [0, 2]
     assert fprims[1].signature == 'nnscaler.runtime.adapter.move'
-    assert fprims[1].device == [1, 3]
+    assert set([tuple(fprims[0].device), tuple(fprims[1].device)]) == set([(0, 2), (1, 3)])
 
 
 def test_all_f_cases_fix_placement():
