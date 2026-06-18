@@ -260,9 +260,9 @@ class IRAdapterGener:
                     or are partitioned on non-weight input and the weight is marked as no-grad-reduce by users (e.g., using '/' in annotation)
 
                     Reducer:
-                        CompileFlag.reducer_replicated_weights is False:
+                        CompileFlag.reducer_replicated_params is False:
                             No reducer is needed since the gradient is full,
-                        CompileFlag.reducer_replicated_weights is True:
+                        CompileFlag.reducer_replicated_params is True:
                             Reducer is generated to average the full gradients across devices for better convergence.
 
                 b.2 All Grad-Reduce: the gradient of all replicas are value partitioned
@@ -288,12 +288,12 @@ class IRAdapterGener:
                     (ERROR if different)
 
                     Reducer:
-                        CompileFlag.reducer_replicated_weights is False:
+                        CompileFlag.reducer_replicated_params is False:
                             Reducer is generated across device groups
                             for example, device group0 (0, 1) device group1(2, 3)
                             Reducer will be generated for ranks (0, 2) and ranks (1, 3) respectively.
 
-                        CompileFlag.reducer_replicated_weights is True:
+                        CompileFlag.reducer_replicated_params is True:
                             Reducer is generated to average the full gradients across devices for better convergence.
                             for example, device group0 (0, 1) device group1(2, 3)
                             Reducer will be generated for ranks (0, 1, 2, 3) with replicas = 2
@@ -352,13 +352,13 @@ class IRAdapterGener:
             dgs = [dev_groups[sw.device[0]] for sw in sub_ws]
             return not all(dgs[0] == dg for dg in dgs)
 
-        def _is_grad_replicated(sub_weights: List[IRSubTensor]) -> bool:
-            grads = [w.grad for w in sub_weights]
-            if not all(w.grad.indmap == grads[0].indmap for w in sub_weights): # partitioned
+        def _is_grad_replicated(sub_ws: List[IRSubTensor]) -> bool:
+            grads = [w.grad for w in sub_ws]
+            if not all(w.grad.indmap == grads[0].indmap for w in sub_ws): # partitioned
                 return False
 
             device_grads = {}
-            for sub in sub_weights:
+            for sub in sub_ws:
                 grad = sub.grad
                 dev = sub.device[0]
                 device_grads.setdefault(dev, []).append(grad)
@@ -369,6 +369,10 @@ class IRAdapterGener:
 
         reducer_info: List[Tuple[IRSubTensor, list[int], int]] = []
         for weight in sub_weights:
+            if weight not in ftensor_consumer_outputs:
+                # means all consumers have no outputs.
+                # unlikely to happen
+                continue
             sub_ws = sub_weights[weight]
             deduped_sub_ws = set(sub_ws)
             num_consumers = len(ftensor_consumer_outputs[weight])
@@ -612,15 +616,15 @@ class IRAdapterGener:
         # this is a requirement for current gnorm calculation implementation.
         # for most cases, size of device group is the same with number of weight replicas,
         # but that depends on the implementation of `_get_gen_reducer_info`.
-        # In current implementation, we have disable that case
+        # In current implementation, we have disabled that case
         # `PP + all replicated + no-grad-reduce + reduce_replicated_params=False`
         subweights_map: Dict[Tuple[Tuple[int,...], int, int], List[IRSubTensor]] = {}
         for sub_weight, devices, replicas in gen_reducer_info:
             subweights_map.setdefault(
                 (tuple(devices), replicas, len(sub_weight_devices[sub_weight])), []
             ).append(sub_weight)
-        for (devices, replicas, _), sub_weights in subweights_map.items():
-            for reducer in IRWeightReducer.from_weights(sub_weights, devices, nreplicas=replicas):
+        for (devices, replicas, _), sub_ws in subweights_map.items():
+            for reducer in IRWeightReducer.from_weights(sub_ws, devices, nreplicas=replicas):
                 graph.insert(reducer, graph.nnodes)
 
         return graph
