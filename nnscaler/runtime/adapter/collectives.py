@@ -26,24 +26,37 @@ def move(tensor: Optional[torch.Tensor], shape: Tuple[int], dtype: torch.dtype, 
         CudaTimer().start(field_name='comm', predefined=True)
     rank = torch.distributed.get_rank()
     work = None
+    group, group_src, group_dst = DeviceGroup().get_p2p_group(src, dst)
     if rank == src:
         tensor = tensor.contiguous() if not tensor.is_contiguous() else tensor
         assert torch.is_tensor(tensor)
         if async_op:
-            work = torch.distributed.isend(tensor, dst)
+            if group is None:
+                work = torch.distributed.isend(tensor, dst)
+            else:
+                work = torch.distributed.isend(tensor, group=group, group_dst=group_dst)
             AsyncCommHandler().hold_send(tensor, work)
         else:
-            torch.distributed.send(tensor, dst)
+            if group is None:
+                torch.distributed.send(tensor, dst)
+            else:
+                torch.distributed.send(tensor, group=group, group_dst=group_dst)
     else:
         assert rank == dst
         tensor = torch.empty(shape, dtype=dtype,
             device=torch.cuda.current_device()
         )
         if async_op:
-            work = torch.distributed.irecv(tensor, src)
+            if group is None:
+                work = torch.distributed.irecv(tensor, src)
+            else:
+                work = torch.distributed.irecv(tensor, group=group, group_src=group_src)
             AsyncCommHandler().submit(tensor, [work])
         else:
-            torch.distributed.recv(tensor, src)
+            if group is None:
+                torch.distributed.recv(tensor, src)
+            else:
+                torch.distributed.recv(tensor, group=group, group_src=group_src)
     if not async_op:
         CudaTimer().stop(field_name='comm', predefined=True)
     return tensor
