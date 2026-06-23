@@ -510,8 +510,8 @@ def test_visualize_schedule_writes_dot():
 # Cross-segment (execution sequence) rescheduling
 # ---------------------------------------------------------------------------
 
-def test_sequence_graph_serializes_segments():
-    """Segments keep their relative order; an input-less recv can still move."""
+def test_sequence_graph_serializes_anchors():
+    """Non-communication nodes keep their relative order; an input-less recv moves."""
     t0 = _sub(requires_grad=False)
     seg_a = _op('seg_a', [t0], _sub())     # stands in for a forward segment producer
     seg_b = _op('seg_b', [seg_a.output(0)], _sub())
@@ -519,14 +519,13 @@ def test_sequence_graph_serializes_segments():
     recv = IRAdapter([], [_sub()])
     nodes = [seg_a, recv, seg_b]
 
-    # without serialize_segments, plain ops are not constrained beyond data deps;
-    # build the graph treating these ops as "segments" is not possible (they are not
-    # IRSegment), so this test only checks the comm/data behaviour on the sequence.
-    graph = OpDependencyGraph(nodes, comm_types=(IRAdapter, IRWeightReducer))
-    # recv has no predecessor
+    graph = OpDependencyGraph(nodes, serialize_segments=True, comm_types=(IRAdapter,))
+    # recv has no predecessor and can be hoisted to the front
     assert all(dst is not recv for _, dst, _ in graph.edges())
     order = graph.topological_sort(priority=lambda n: (0 if isinstance(n, IRAdapter) else 1))
     assert order[0] is recv
+    # the two non-comm anchors keep their relative order
+    assert order.index(seg_a) < order.index(seg_b)
     assert graph.is_valid_order(order)
 
 
@@ -552,29 +551,33 @@ def test_sequence_reschedule_keeps_segments_ordered():
 def test_sequence_hoists_async_recv_before_segments():
     """An async recv in the execution sequence is hoisted ahead of the segments."""
     execplan = _build_execplan()
-    # keep only the data op + segments so that the injected recv is the only
-    # communication op (otherwise comm-serialization would order it after the
-    # existing weight reducer, which is the correct but separate behaviour).
-    seq = [n for n in execplan.seq(0) if not isinstance(n, IRWeightReducer)]
+    seq = list(execplan.seq(0))
     segs = [n for n in seq if isinstance(n, IRSegment)]
+    reducers = [n for n in seq if isinstance(n, IRWeightReducer)]
     assert len(segs) >= 2
 
-    # craft an input-less async recv that produces a fresh tensor
+    # craft an input-less async recv that produces a fresh tensor, placed late
     recv = IRAdapter([], [_sub()])
     nodes = seq + [recv]
 
+    # only adapters move; segments AND reducers are anchors (kept in relative order)
     graph = OpDependencyGraph(
-        nodes, serialize_segments=True, comm_types=(IRAdapter, IRWeightReducer))
+        nodes, serialize_segments=True, comm_types=(IRAdapter,))
 
-    # segments keep their relative order in the dependency graph
-    for i in range(len(segs) - 1):
-        assert segs[i + 1] in graph.successors(segs[i])
+    # the non-comm anchors keep their relative order in the dependency graph
+    anchors = [n for n in nodes if not isinstance(n, IRAdapter)]
+    for i in range(len(anchors) - 1):
+        assert anchors[i + 1] in graph.successors(anchors[i])
 
     # communication-early priority hoists the recv to the very front
     order = graph.topological_sort(
-        priority=lambda n: (0 if isinstance(n, (IRAdapter, IRWeightReducer)) else 1))
+        priority=lambda n: (0 if isinstance(n, IRAdapter) else 1))
     assert order[0] is recv
     assert [n for n in order if isinstance(n, IRSegment)] == segs
+    # reducers stay after the segments (their backward dependency is implicit)
+    for r in reducers:
+        for s in segs:
+            assert order.index(s) < order.index(r)
     assert graph.is_valid_order(order)
 
 

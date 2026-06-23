@@ -90,15 +90,18 @@ class OpDependencyGraph:
     Args:
         nodes: operators in their original (known-valid) execution order.
         serialize_segments: when ``True``, edges are added between consecutive
-            :class:`IRSegment` nodes so that the segments keep their original
-            relative order.  This is required at the cross-segment (execution
-            sequence) level, where the forward -> backward dependency is implicit
-            (carried by the runtime's saved-activation / autograd mechanism) and is
-            therefore *not* visible in the tensor data-flow.  Only the adapters /
-            reducers are then free to move within their data-dependency window.
-        comm_types: node types that are treated as communication for the purpose of
-            the communication-serialization edges (which preserve their relative
-            order to keep collective communication consistent across ranks).
+            *non-communication* nodes so that they keep their original relative
+            order.  This is required at the cross-segment (execution sequence)
+            level, where the forward -> backward dependency, the gradient flow
+            between backward segments, and the backward -> reducer dependency are
+            all implicit (carried by the runtime's saved-activation / autograd
+            machinery) and are therefore *not* visible in the tensor data-flow.
+            Only the communication adapters are then free to move within their
+            data-dependency window.
+        comm_types: node types that are treated as communication.  These are the
+            only nodes allowed to move when ``serialize_segments`` is set, and their
+            relative order is preserved (communication-serialization) to keep
+            collective communication consistent across ranks.
     """
 
     def __init__(
@@ -137,7 +140,7 @@ class OpDependencyGraph:
         self._build_data_edges()
         self._build_comm_edges()
         if self._serialize_segments:
-            self._build_segment_edges()
+            self._build_anchor_edges()
 
     def _build_data_edges(self) -> None:
         """Add read-after-write, write-after-read and write-after-write edges."""
@@ -179,16 +182,17 @@ class OpDependencyGraph:
         for prev_node, node in more_itertools.pairwise(comm_nodes):
             self._add_edge(prev_node, node, 'comm')
 
-    def _build_segment_edges(self) -> None:
-        """Keep the relative order of segments.
+    def _build_anchor_edges(self) -> None:
+        """Keep the relative order of every non-communication node.
 
-        At the cross-segment level the forward -> backward dependency (and the
-        gradient flow between backward segments) is implicit and not captured by the
-        tensor data-flow, so we conservatively forbid reordering segments relative to
-        each other. Only the adapters / reducers between them are free to move.
+        At the cross-segment level the forward -> backward dependency, the gradient
+        flow between backward segments, and the backward -> reducer dependency are
+        implicit and not captured by the tensor data-flow, so we conservatively
+        forbid reordering any non-communication node (segments, reducers, data ops)
+        relative to each other.  Only the communication adapters are free to move.
         """
-        segments = [node for node in self._nodes if isinstance(node, IRSegment)]
-        for prev_node, node in more_itertools.pairwise(segments):
+        anchors = [node for node in self._nodes if not self._is_comm(node)]
+        for prev_node, node in more_itertools.pairwise(anchors):
             self._add_edge(prev_node, node, 'order')
 
     def successors(self, node: IRCell) -> Tuple[IRCell, ...]:
@@ -443,6 +447,8 @@ def _dot_escape(text: str) -> str:
 
 def _node_dot_label(idx: int, node: IRCell) -> str:
     name = getattr(node, 'name', '') or type(node).__name__
+    if isinstance(node, IRSegment):
+        name = f"segment({'fw' if node.isfw() else 'bw'})"
     # escape each line separately, then join with a graphviz newline (``\n``) so the
     # separator is not turned into a literal backslash-n by the escaping.
     line1 = _dot_escape(f'#{idx} {name}')
@@ -451,19 +457,67 @@ def _node_dot_label(idx: int, node: IRCell) -> str:
 
 
 def _node_dot_fill(node: IRCell) -> str:
-    if _is_comm(node):
+    if isinstance(node, (IRAdapter, IRWeightReducer)):
         return '#d5f5d5'   # light green for communication ops
     if isinstance(node, IRSegment):
-        return '#fff2cc'   # light yellow for nested segments
+        return '#fff2cc'   # light yellow for segments
     return '#dae8fc'       # light blue for compute ops
 
 
-def schedule_to_dot(execplan: ExecutionPlan, name: str = 'schedule') -> str:
+def _cluster_to_dot(
+    lines: List[str],
+    cluster_idx: int,
+    label: str,
+    nodes: List[IRCell],
+    dep: 'OpDependencyGraph',
+) -> None:
+    """Emit one DOT cluster: nodes in linear order + dependency arrows."""
+    node_id = {node: f'c{cluster_idx}_{idx}' for idx, node in enumerate(nodes)}
+    lines.append(f'  subgraph cluster_{cluster_idx} {{')
+    lines.append(f'    label="{_dot_escape(label)}";')
+    lines.append('    color="#999999";')
+    for idx, node in enumerate(nodes):
+        lines.append(
+            f'    {node_id[node]} '
+            f'[label="{_node_dot_label(idx, node)}", '
+            f'fillcolor="{_node_dot_fill(node)}"];'
+        )
+    # program-order connectors keep the nodes laid out in the current order
+    for idx in range(len(nodes) - 1):
+        lines.append(
+            f'    {node_id[nodes[idx]]} -> {node_id[nodes[idx + 1]]} '
+            f'[color="#cccccc", arrowhead=none, weight=100];'
+        )
+    lines.append('  }')
+    # dependency arrows (do not constrain the layout so the linear order stays)
+    for src, dst, kinds in dep.edges():
+        kind = kinds[0]
+        color, _ = _EDGE_STYLE.get(kind, ('#000000', kind))
+        style = 'dashed' if kind in ('comm', 'order') else 'solid'
+        lines.append(
+            f'  {node_id[src]} -> {node_id[dst]} '
+            f'[color="{color}", style={style}, constraint=false];'
+        )
+
+
+def schedule_to_dot(
+    execplan: ExecutionPlan,
+    name: str = 'schedule',
+    scope: str = 'segment',
+) -> str:
     """Build a Graphviz DOT string visualizing the current op schedule.
 
-    Operators of every forward segment are arranged top-to-bottom in their current
-    order; dependency edges are drawn as coloured arrows.
+    Args:
+        execplan: the execution plan to visualize.
+        name: the digraph name.
+        scope: ``'segment'`` visualizes the operators *inside* every forward segment;
+            ``'sequence'`` visualizes the cross-segment execution sequence of every
+            device (segments shown as boxes, with the adapters / reducers between
+            them). Dependency / communication / segment-order arrows are drawn.
     """
+    if scope not in ('segment', 'sequence'):
+        raise ValueError(f"invalid scope {scope!r}, expected 'segment' | 'sequence'")
+
     lines: List[str] = [
         f'digraph {name} {{',
         '  rankdir=TB;',
@@ -472,51 +526,37 @@ def schedule_to_dot(execplan: ExecutionPlan, name: str = 'schedule') -> str:
         '  edge [fontname="monospace", fontsize=8];',
     ]
 
-    for seg_idx, segment in enumerate(_iter_forward_segments(execplan)):
-        nodes = list(segment.nodes())
-        dep = OpDependencyGraph(nodes)
-        node_id = {node: f's{seg_idx}_{idx}' for idx, node in enumerate(nodes)}
-
-        lines.append(f'  subgraph cluster_{seg_idx} {{')
-        lines.append(
-            f'    label="segment cid={segment.cid} device={list(segment.device)}";'
-        )
-        lines.append('    color="#999999";')
-        # node declarations, in current order
-        for idx, node in enumerate(nodes):
-            lines.append(
-                f'    {node_id[node]} '
-                f'[label="{_node_dot_label(idx, node)}", '
-                f'fillcolor="{_node_dot_fill(node)}"];'
-            )
-        # program-order connectors keep the nodes laid out in the current order
-        for idx in range(len(nodes) - 1):
-            lines.append(
-                f'    {node_id[nodes[idx]]} -> {node_id[nodes[idx + 1]]} '
-                f'[color="#cccccc", arrowhead=none, weight=100];'
-            )
-        lines.append('  }')
-
-        # dependency arrows (do not constrain the layout so the linear order stays)
-        for src, dst, kinds in dep.edges():
-            kind = kinds[0]
-            color, _ = _EDGE_STYLE.get(kind, ('#000000', kind))
-            style = 'dashed' if kind == 'comm' else 'solid'
-            lines.append(
-                f'  {node_id[src]} -> {node_id[dst]} '
-                f'[color="{color}", style={style}, constraint=false];'
-            )
+    if scope == 'segment':
+        for seg_idx, segment in enumerate(_iter_forward_segments(execplan)):
+            nodes = list(segment.nodes())
+            dep = OpDependencyGraph(nodes)
+            label = f'segment cid={segment.cid} device={list(segment.device)}'
+            _cluster_to_dot(lines, seg_idx, label, nodes, dep)
+    else:  # sequence
+        for dev_idx, devid in enumerate(execplan.devices()):
+            nodes = [
+                n.cell if isinstance(n, ExeReuseCell) else n
+                for n in execplan.seq(devid)
+            ]
+            dep = OpDependencyGraph(
+                nodes, serialize_segments=True, comm_types=(IRAdapter,))
+            _cluster_to_dot(lines, dev_idx, f'device {devid} execution sequence', nodes, dep)
 
     lines.append('}')
     return '\n'.join(lines) + '\n'
 
 
-def visualize_schedule(execplan: ExecutionPlan, path: Union[str, Path]) -> str:
+
+def visualize_schedule(
+    execplan: ExecutionPlan,
+    path: Union[str, Path],
+    scope: str = 'segment',
+) -> str:
     """Write a Graphviz visualization of the current op schedule to ``path``.
 
-    The operators of every forward segment are arranged linearly in their current
-    execution order with dependency arrows between them.  Dump it before and after
-    :class:`Reschedule` to compare the two schedules.
+    The operators are arranged linearly in their current execution order with
+    dependency arrows between them.  Dump it before and after :class:`Reschedule` to
+    compare the two schedules.
 
     A ``.dot`` file is always written.  If ``path`` has an image extension
     (``.png`` / ``.svg`` / ``.pdf``) and the ``graphviz`` package is available, the
@@ -525,11 +565,13 @@ def visualize_schedule(execplan: ExecutionPlan, path: Union[str, Path]) -> str:
     Args:
         execplan: the execution plan to visualize.
         path: output file path.
+        scope: ``'segment'`` (inside each forward segment) or ``'sequence'`` (the
+            cross-segment execution sequence of every device).
 
     Returns:
         the DOT source string.
     """
-    dot = schedule_to_dot(execplan)
+    dot = schedule_to_dot(execplan, scope=scope)
     path = str(path)
     ext = os.path.splitext(path)[1].lower()
 
@@ -678,7 +720,7 @@ class Reschedule(PlanPass):
             graph = OpDependencyGraph(
                 nodes,
                 serialize_segments=True,
-                comm_types=(IRAdapter, IRWeightReducer),
+                comm_types=(IRAdapter,),
             )
             new_order = graph.topological_sort(priority)
             changed = len(new_order) != len(nodes) or \
