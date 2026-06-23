@@ -123,7 +123,9 @@ class OpDependencyGraph:
         self._build()
 
     def _is_comm(self, node: IRCell) -> bool:
-        return isinstance(node, self._comm_types)
+        # unwrap ExeReuseCell (used in pipeline schedules) before the type check
+        cell = node.cell if isinstance(node, ExeReuseCell) else node
+        return isinstance(cell, self._comm_types)
 
     def _add_edge(self, src: IRCell, dst: IRCell, kind: str = 'raw') -> None:
         if src is dst:
@@ -446,20 +448,26 @@ def _dot_escape(text: str) -> str:
 
 
 def _node_dot_label(idx: int, node: IRCell) -> str:
-    name = getattr(node, 'name', '') or type(node).__name__
-    if isinstance(node, IRSegment):
-        name = f"segment({'fw' if node.isfw() else 'bw'})"
+    cell = node.cell if isinstance(node, ExeReuseCell) else node
+    name = getattr(cell, 'name', '') or type(cell).__name__
+    if isinstance(cell, IRSegment):
+        name = f"segment({'fw' if cell.isfw() else 'bw'})"
+    elif isinstance(cell, IRAdapter):
+        name = 'adapter(comm)'
+    elif isinstance(cell, IRWeightReducer):
+        name = 'reducer'
     # escape each line separately, then join with a graphviz newline (``\n``) so the
     # separator is not turned into a literal backslash-n by the escaping.
     line1 = _dot_escape(f'#{idx} {name}')
-    line2 = _dot_escape(f'cid={node.cid} {type(node).__name__}')
+    line2 = _dot_escape(f'cid={cell.cid} {type(cell).__name__}')
     return f'{line1}\\n{line2}'
 
 
 def _node_dot_fill(node: IRCell) -> str:
-    if isinstance(node, (IRAdapter, IRWeightReducer)):
+    cell = node.cell if isinstance(node, ExeReuseCell) else node
+    if isinstance(cell, (IRAdapter, IRWeightReducer)):
         return '#d5f5d5'   # light green for communication ops
-    if isinstance(node, IRSegment):
+    if isinstance(cell, IRSegment):
         return '#fff2cc'   # light yellow for segments
     return '#dae8fc'       # light blue for compute ops
 
@@ -534,10 +542,10 @@ def schedule_to_dot(
             _cluster_to_dot(lines, seg_idx, label, nodes, dep)
     else:  # sequence
         for dev_idx, devid in enumerate(execplan.devices()):
-            nodes = [
-                n.cell if isinstance(n, ExeReuseCell) else n
-                for n in execplan.seq(devid)
-            ]
+            # keep the (distinct) sequence nodes; ExeReuseCell wrappers are unwrapped
+            # only for the label/colour, not for identity (the underlying cells are
+            # shared across micro-batches in pipeline schedules).
+            nodes = list(execplan.seq(devid))
             dep = OpDependencyGraph(
                 nodes, serialize_segments=True, comm_types=(IRAdapter,))
             _cluster_to_dot(lines, dev_idx, f'device {devid} execution sequence', nodes, dep)

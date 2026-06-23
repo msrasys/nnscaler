@@ -27,6 +27,7 @@ from nnscaler.execplan.planpass.reschedule import (
 )
 from nnscaler.graph.segment import IRSegment
 from nnscaler.codegen.module.module import ModuleCodeGen
+from nnscaler.execplan.execplan import ExeReuseCell
 
 from ..utils import replace_all_device_with
 
@@ -181,6 +182,28 @@ def test_async_recv_pair_keeps_order():
     # even trying to schedule communication last, recv1 stays before recv2
     order = graph.topological_sort(priority=lambda n: (1 if isinstance(n, IRAdapter) else 0))
     assert order.index(recv1) < order.index(recv2)
+    assert graph.is_valid_order(order)
+
+
+def test_dep_graph_unwraps_exereusecell_for_comm():
+    """ExeReuseCell-wrapped adapters (pipeline schedules) are treated as comm."""
+    x1, y1 = _sub(), _sub()
+    x2, y2 = _sub(), _sub()
+    adapter1 = IRAdapter([x1], [y1])
+    adapter2 = IRAdapter([x2], [y2])
+    # wrap the adapters as they would be in a pipeline schedule sequence
+    reuse1 = ExeReuseCell(adapter1, [x1], [y1])
+    reuse2 = ExeReuseCell(adapter2, [x2], [y2])
+    compute = _op('compute', [_sub()], _sub())
+    nodes = [reuse1, compute, reuse2]
+
+    graph = OpDependencyGraph(nodes, serialize_segments=True, comm_types=(IRAdapter,))
+    # both wrapped adapters are recognized as communication and serialized
+    assert graph._is_comm(reuse1) and graph._is_comm(reuse2)
+    assert reuse2 in graph.successors(reuse1)         # comm-serialization edge
+    # the non-comm anchor keeps its place; the wrapped adapters may still reorder
+    order = graph.topological_sort(priority=lambda n: 0 if n is reuse2 else 1)
+    assert order.index(reuse1) < order.index(reuse2)  # relative comm order preserved
     assert graph.is_valid_order(order)
 
 
