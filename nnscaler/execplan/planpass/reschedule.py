@@ -42,7 +42,7 @@ import more_itertools
 
 from nnscaler.ir.cten import IRCell, IRObject
 from nnscaler.ir.tensor import IRSubTensor
-from nnscaler.ir.adapter import IRAdapter
+from nnscaler.ir.adapter import IRAdapter, IRWeightReducer
 from nnscaler.graph.segment import IRSegment
 
 from nnscaler.execplan import ExecutionPlan
@@ -86,17 +86,41 @@ class OpDependencyGraph:
     order of the segment).  Edges are only added in the forward direction (from an
     earlier node to a later node), so the resulting graph is acyclic by construction
     and every topological order of it is a legal execution order.
+
+    Args:
+        nodes: operators in their original (known-valid) execution order.
+        serialize_segments: when ``True``, edges are added between consecutive
+            :class:`IRSegment` nodes so that the segments keep their original
+            relative order.  This is required at the cross-segment (execution
+            sequence) level, where the forward -> backward dependency is implicit
+            (carried by the runtime's saved-activation / autograd mechanism) and is
+            therefore *not* visible in the tensor data-flow.  Only the adapters /
+            reducers are then free to move within their data-dependency window.
+        comm_types: node types that are treated as communication for the purpose of
+            the communication-serialization edges (which preserve their relative
+            order to keep collective communication consistent across ranks).
     """
 
-    def __init__(self, nodes: List[IRCell]):
+    def __init__(
+        self,
+        nodes: List[IRCell],
+        *,
+        serialize_segments: bool = False,
+        comm_types: Tuple[type, ...] = (IRAdapter,),
+    ):
         self._nodes: List[IRCell] = list(nodes)
         self._order: Dict[IRCell, int] = {node: idx for idx, node in enumerate(self._nodes)}
         # successors[a] contains b iff there is an edge a -> b (a must run before b)
         self._successors: Dict[IRCell, set] = {node: set() for node in self._nodes}
         self._predecessors: Dict[IRCell, set] = {node: set() for node in self._nodes}
-        # (src, dst) -> set of edge kinds ('raw' | 'war' | 'waw' | 'comm')
+        # (src, dst) -> set of edge kinds ('raw' | 'war' | 'waw' | 'comm' | 'order')
         self._edge_kinds: Dict[Tuple[IRCell, IRCell], set] = {}
+        self._serialize_segments = serialize_segments
+        self._comm_types = comm_types
         self._build()
+
+    def _is_comm(self, node: IRCell) -> bool:
+        return isinstance(node, self._comm_types)
 
     def _add_edge(self, src: IRCell, dst: IRCell, kind: str = 'raw') -> None:
         if src is dst:
@@ -112,6 +136,8 @@ class OpDependencyGraph:
     def _build(self) -> None:
         self._build_data_edges()
         self._build_comm_edges()
+        if self._serialize_segments:
+            self._build_segment_edges()
 
     def _build_data_edges(self) -> None:
         """Add read-after-write, write-after-read and write-after-write edges."""
@@ -149,9 +175,21 @@ class OpDependencyGraph:
 
     def _build_comm_edges(self) -> None:
         """Serialize communication operators to preserve their relative order."""
-        comm_nodes = [node for node in self._nodes if _is_comm(node)]
+        comm_nodes = [node for node in self._nodes if self._is_comm(node)]
         for prev_node, node in more_itertools.pairwise(comm_nodes):
             self._add_edge(prev_node, node, 'comm')
+
+    def _build_segment_edges(self) -> None:
+        """Keep the relative order of segments.
+
+        At the cross-segment level the forward -> backward dependency (and the
+        gradient flow between backward segments) is implicit and not captured by the
+        tensor data-flow, so we conservatively forbid reordering segments relative to
+        each other. Only the adapters / reducers between them are free to move.
+        """
+        segments = [node for node in self._nodes if isinstance(node, IRSegment)]
+        for prev_node, node in more_itertools.pairwise(segments):
+            self._add_edge(prev_node, node, 'order')
 
     def successors(self, node: IRCell) -> Tuple[IRCell, ...]:
         """Get the direct successors of a node (nodes that must run after it)."""
@@ -395,6 +433,7 @@ _EDGE_STYLE = {
     'war': ('#ff7f0e', 'write-after-read'),    # orange
     'waw': ('#d62728', 'write-after-write'),   # red
     'comm': ('#2ca02c', 'comm-serialization'),  # green
+    'order': ('#9467bd', 'segment-order'),     # purple
 }
 
 
@@ -560,8 +599,9 @@ class Reschedule(PlanPass):
         execplan: ExecutionPlan,
         priority: Optional[Callable[[IRCell], Hashable]] = None,
         config: Optional[Union[str, Path, Dict]] = None,
+        scope: str = 'segment',
     ) -> ExecutionPlan:
-        """Reschedule operators of all forward segments in ``execplan``.
+        """Reschedule operators of ``execplan``.
 
         Args:
             execplan: the execution plan to reschedule (modified in place).
@@ -571,25 +611,82 @@ class Reschedule(PlanPass):
                 :func:`dump_schedule`, or an already-parsed dict). When given, the
                 operator order recorded in the config drives the rescheduling and
                 takes precedence over ``priority``.
+            scope: what to reschedule:
+                - ``'segment'`` (default): reorder operators *inside* every forward
+                  segment.
+                - ``'sequence'``: reorder the cross-segment execution sequence
+                  (segments keep their relative order; adapters / reducers, e.g.
+                  asynchronous communication, may move within their data window).
+                - ``'both'``: do both.
         """
         if config is not None:
             order_map = load_schedule_order(config)
             priority = config_priority(order_map)
-        visited = set()
+
+        if scope not in ('segment', 'sequence', 'both'):
+            raise ValueError(f"invalid scope {scope!r}, expected 'segment' | 'sequence' | 'both'")
+
+        if scope in ('segment', 'both'):
+            visited = set()
+            reordered = 0
+            for devid in execplan.devices():
+                for node in execplan.seq(devid):
+                    if isinstance(node, ExeReuseCell):
+                        node = node.cell
+                    if not (isinstance(node, IRSegment) and node.isfw()):
+                        continue
+                    if id(node) in visited:
+                        continue
+                    visited.add(id(node))
+                    if Reschedule._reschedule_segment(node, priority):
+                        reordered += 1
+            _logger.info(f'op reschedule: reordered ops inside {reordered} forward segment(s)')
+
+        if scope in ('sequence', 'both'):
+            reordered = Reschedule._reschedule_sequence(execplan, priority)
+            _logger.info(f'op reschedule: reordered the execution sequence of {reordered} device(s)')
+
+        return execplan
+
+    @staticmethod
+    def _reschedule_sequence(
+        execplan: ExecutionPlan,
+        priority: Optional[Callable[[IRCell], Hashable]] = None,
+    ) -> int:
+        """Reschedule the cross-segment execution sequence of every device.
+
+        Segments keep their original relative order (the forward -> backward
+        dependency is implicit and not visible in the tensor data-flow); only the
+        adapters / reducers between them are free to move within their data window.
+        This is what lets an asynchronous communication (e.g. an ``irecv``) be issued
+        as early as its data allows, instead of right before the consuming operator.
+
+        A deliberately constructed pipeline schedule is left untouched.
+
+        Returns the number of device sequences that changed.
+        """
+        # never reorder a deliberately constructed pipeline schedule
+        if execplan.graph.sched is not None:
+            return 0
+
         reordered = 0
         for devid in execplan.devices():
-            for node in execplan.seq(devid):
-                if isinstance(node, ExeReuseCell):
-                    node = node.cell
-                if not (isinstance(node, IRSegment) and node.isfw()):
-                    continue
-                if id(node) in visited:
-                    continue
-                visited.add(id(node))
-                if Reschedule._reschedule_segment(node, priority):
-                    reordered += 1
-        _logger.info(f'op reschedule: reordered {reordered} forward segment(s)')
-        return execplan
+            seq = execplan.at(devid)   # the actual per-device list (mutated in place)
+            nodes = list(seq)
+            if len(nodes) <= 1:
+                continue
+            graph = OpDependencyGraph(
+                nodes,
+                serialize_segments=True,
+                comm_types=(IRAdapter, IRWeightReducer),
+            )
+            new_order = graph.topological_sort(priority)
+            changed = len(new_order) != len(nodes) or \
+                any(a is not b for a, b in zip(new_order, nodes))
+            if changed:
+                seq[:] = new_order
+                reordered += 1
+        return reordered
 
     @staticmethod
     def _reschedule_segment(

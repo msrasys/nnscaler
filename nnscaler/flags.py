@@ -44,6 +44,10 @@ class CompileFlag:
     # any topological order of the graph is a legal (causally-correct) execution order,
     # and the operators are reordered accordingly. Default is False (original op order).
     enable_op_reschedule = _to_bool('ENABLE_OP_RESCHEDULE', False)
+    # scope of the operator rescheduling: 'segment' (reorder ops inside each forward
+    # segment), 'sequence' (reorder the cross-segment execution sequence so that e.g.
+    # asynchronous communication can be issued early), or 'both'. Default 'segment'.
+    op_reschedule_scope = os.environ.get('OP_RESCHEDULE_SCOPE', default='segment')
     # path to a schedule config file (produced by `dump_schedule`) that records the
     # desired operator order per forward segment. When set together with
     # `enable_op_reschedule`, the operators are reordered to follow the recorded order

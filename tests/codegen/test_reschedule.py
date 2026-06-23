@@ -8,7 +8,7 @@ import torch
 
 from nnscaler.ir.tensor import IRFullTensor
 from nnscaler.ir.operator import IRFwOperation
-from nnscaler.ir.adapter import IRAdapter
+from nnscaler.ir.adapter import IRAdapter, IRWeightReducer
 from nnscaler.graph import IRGraph
 from nnscaler.graph.gener.gen import IRAdapterGener
 from nnscaler.parallel import _gen_graph
@@ -504,5 +504,91 @@ def test_visualize_schedule_writes_dot():
         png_path = os.path.join(tempdir, 'graph.png')
         visualize_schedule(execplan, png_path)
         assert os.path.exists(os.path.join(tempdir, 'graph.dot'))
+
+
+# ---------------------------------------------------------------------------
+# Cross-segment (execution sequence) rescheduling
+# ---------------------------------------------------------------------------
+
+def test_sequence_graph_serializes_segments():
+    """Segments keep their relative order; an input-less recv can still move."""
+    t0 = _sub(requires_grad=False)
+    seg_a = _op('seg_a', [t0], _sub())     # stands in for a forward segment producer
+    seg_b = _op('seg_b', [seg_a.output(0)], _sub())
+    # an input-less recv adapter (irecv) produces a tensor consumed by nobody here
+    recv = IRAdapter([], [_sub()])
+    nodes = [seg_a, recv, seg_b]
+
+    # without serialize_segments, plain ops are not constrained beyond data deps;
+    # build the graph treating these ops as "segments" is not possible (they are not
+    # IRSegment), so this test only checks the comm/data behaviour on the sequence.
+    graph = OpDependencyGraph(nodes, comm_types=(IRAdapter, IRWeightReducer))
+    # recv has no predecessor
+    assert all(dst is not recv for _, dst, _ in graph.edges())
+    order = graph.topological_sort(priority=lambda n: (0 if isinstance(n, IRAdapter) else 1))
+    assert order[0] is recv
+    assert graph.is_valid_order(order)
+
+
+@replace_all_device_with('cpu')
+def test_sequence_reschedule_keeps_segments_ordered():
+    """The cross-segment reschedule never reorders segments relative to each other."""
+    execplan = _build_execplan()
+    seq = execplan.seq(0)
+    segs_before = [n for n in seq if isinstance(n, IRSegment)]
+    assert len(segs_before) >= 2          # forward + backward
+
+    Reschedule.apply(
+        execplan,
+        scope='sequence',
+        priority=lambda n: (0 if isinstance(n, (IRAdapter, IRWeightReducer)) else 1),
+    )
+
+    segs_after = [n for n in execplan.seq(0) if isinstance(n, IRSegment)]
+    assert segs_after == segs_before      # same segments, same relative order
+
+
+@replace_all_device_with('cpu')
+def test_sequence_hoists_async_recv_before_segments():
+    """An async recv in the execution sequence is hoisted ahead of the segments."""
+    execplan = _build_execplan()
+    # keep only the data op + segments so that the injected recv is the only
+    # communication op (otherwise comm-serialization would order it after the
+    # existing weight reducer, which is the correct but separate behaviour).
+    seq = [n for n in execplan.seq(0) if not isinstance(n, IRWeightReducer)]
+    segs = [n for n in seq if isinstance(n, IRSegment)]
+    assert len(segs) >= 2
+
+    # craft an input-less async recv that produces a fresh tensor
+    recv = IRAdapter([], [_sub()])
+    nodes = seq + [recv]
+
+    graph = OpDependencyGraph(
+        nodes, serialize_segments=True, comm_types=(IRAdapter, IRWeightReducer))
+
+    # segments keep their relative order in the dependency graph
+    for i in range(len(segs) - 1):
+        assert segs[i + 1] in graph.successors(segs[i])
+
+    # communication-early priority hoists the recv to the very front
+    order = graph.topological_sort(
+        priority=lambda n: (0 if isinstance(n, (IRAdapter, IRWeightReducer)) else 1))
+    assert order[0] is recv
+    assert [n for n in order if isinstance(n, IRSegment)] == segs
+    assert graph.is_valid_order(order)
+
+
+@replace_all_device_with('cpu')
+def test_sequence_scope_codegen_compiles():
+    """Code generated after a cross-segment reschedule is valid Python."""
+    execplan = _build_execplan()
+    Reschedule.apply(
+        execplan,
+        scope='both',
+        priority=lambda n: (0 if isinstance(n, (IRAdapter, IRWeightReducer)) else 1),
+    )
+    code = ModuleCodeGen(execplan).gen(0)
+    compile(code, '<gencode>', 'exec')
+
 
 

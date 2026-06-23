@@ -268,6 +268,7 @@ def compile(model: Union[torch.nn.Module, SemanticModel], *args,
                 execplan = Reschedule.apply(
                     execplan,
                     config=CompileFlag.op_reschedule_config or None,
+                    scope=CompileFlag.op_reschedule_scope,
                 )
                 span = time.time() - start
                 _logger.info('finish planpass on rescheduling operations: {:.2f} s'.format(span))
