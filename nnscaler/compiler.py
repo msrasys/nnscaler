@@ -24,6 +24,7 @@ from nnscaler.graph.schedule.schedplan import SchedulePlan
 from nnscaler.execplan import ExecutionPlan
 from nnscaler.execplan.planpass.fusion import DiffFusion
 from nnscaler.execplan.planpass.grouping import Grouping
+from nnscaler.execplan.planpass.reschedule import Reschedule, dump_schedule, visualize_schedule, insert_path_suffix as _insert_path_suffix
 
 from nnscaler.codegen import ModuleCodeGen, ScheduleCodeGen
 
@@ -254,6 +255,35 @@ def compile(model: Union[torch.nn.Module, SemanticModel], *args,
                 execplan = Grouping.apply(execplan)
                 span = time.time() - start
                 _logger.info('finish planpass on grouping operations: {:.2f} s'.format(span))
+
+            # plan pass for rescheduling operators inside forward segments
+            if CompileFlag.enable_op_reschedule:
+                # visualize the schedule before rescheduling for comparison
+                if CompileFlag.dump_op_schedule_graph:
+                    visualize_schedule(
+                        execplan,
+                        _insert_path_suffix(CompileFlag.dump_op_schedule_graph, 'before'),
+                    )
+                start = time.time()
+                execplan = Reschedule.apply(
+                    execplan,
+                    config=CompileFlag.op_reschedule_config or None,
+                )
+                span = time.time() - start
+                _logger.info('finish planpass on rescheduling operations: {:.2f} s'.format(span))
+
+            # dump the operator schedule so it can be edited and fed back via
+            # CompileFlag.op_reschedule_config
+            if CompileFlag.dump_op_schedule:
+                dump_schedule(execplan, CompileFlag.dump_op_schedule)
+
+            # visualize the (possibly rescheduled) operator schedule with dependency arrows
+            if CompileFlag.dump_op_schedule_graph:
+                suffix = 'after' if CompileFlag.enable_op_reschedule else None
+                visualize_schedule(
+                    execplan,
+                    _insert_path_suffix(CompileFlag.dump_op_schedule_graph, suffix),
+                )
 
             # execplan.graph.reset_dependency()
             # execplan.analyze(outfile='execplan.png')

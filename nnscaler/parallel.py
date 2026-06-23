@@ -25,6 +25,9 @@ from nnscaler.codegen.schedule.schedule import ScheduleCodeGen
 from nnscaler.execplan import ExecutionPlan
 from nnscaler.execplan.planpass.fusion import DiffFusion
 from nnscaler.execplan.planpass.grouping import Grouping
+from nnscaler.execplan.planpass.reschedule import (
+    Reschedule, dump_schedule, visualize_schedule, insert_path_suffix as _insert_path_suffix,
+)
 
 from nnscaler.graph import IRGraph
 from nnscaler.graph import parser
@@ -900,6 +903,32 @@ def _gencode(
     # plan pass for computation grouping
     if not graph.sched:
         execplan = Grouping.apply(execplan)
+
+    # plan pass for rescheduling operators inside forward segments
+    if CompileFlag.enable_op_reschedule:
+        # visualize the schedule before rescheduling for comparison
+        if CompileFlag.dump_op_schedule_graph:
+            visualize_schedule(
+                execplan,
+                _insert_path_suffix(CompileFlag.dump_op_schedule_graph, 'before'),
+            )
+        execplan = Reschedule.apply(
+            execplan,
+            config=CompileFlag.op_reschedule_config or None,
+        )
+
+    # dump the operator schedule so it can be edited and fed back via
+    # CompileFlag.op_reschedule_config
+    if CompileFlag.dump_op_schedule:
+        dump_schedule(execplan, CompileFlag.dump_op_schedule)
+
+    # visualize the (possibly rescheduled) operator schedule with dependency arrows
+    if CompileFlag.dump_op_schedule_graph:
+        suffix = 'after' if CompileFlag.enable_op_reschedule else None
+        visualize_schedule(
+            execplan,
+            _insert_path_suffix(CompileFlag.dump_op_schedule_graph, suffix),
+        )
 
     # code generation
     assert len(execplan.graph.device) == compute_config.plan_ngpus, f"{execplan.graph.device}"

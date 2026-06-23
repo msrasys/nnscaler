@@ -1,0 +1,34 @@
+version: 1
+comment: 'Operator schedule. Reorder the entries of each segment "order" list to change
+  the execution order. Operators are matched by "cid". The order is a preference:
+  data dependencies are always enforced, so an illegal order is automatically corrected
+  to the nearest legal one.'
+segments:
+- segment_cid: 33
+  device:
+  - 0
+  order:
+  - cid: 1
+    kind: IRDimops
+    name: linear
+    signature: torch.nn.functional.linear
+    device:
+    - 0
+  - cid: 2
+    kind: IRDimops
+    name: linear
+    signature: torch.nn.functional.linear
+    device:
+    - 0
+  - cid: 3
+    kind: IRDimops
+    name: add
+    signature: torch.add
+    device:
+    - 0
+  - cid: 4
+    kind: IRDimops
+    name: sum
+    signature: torch.sum
+    device:
+    - 0

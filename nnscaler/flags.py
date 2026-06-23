@@ -38,6 +38,28 @@ class CompileFlag:
     # but sometimes it may cause communication bugs, so we provide an option to enable/disable it
     disable_reduce_scatter_adapter = _to_bool('DISABLE_REDUCE_SCATTER_ADAPTER', False)
 
+    # whether to reschedule the operators (compute and communication ops) inside each
+    # forward segment before code generation.
+    # When enabled, a data-dependency graph is built among the ops of a segment so that
+    # any topological order of the graph is a legal (causally-correct) execution order,
+    # and the operators are reordered accordingly. Default is False (original op order).
+    enable_op_reschedule = _to_bool('ENABLE_OP_RESCHEDULE', False)
+    # path to a schedule config file (produced by `dump_schedule`) that records the
+    # desired operator order per forward segment. When set together with
+    # `enable_op_reschedule`, the operators are reordered to follow the recorded order
+    # (data dependencies are always enforced). Default '' (use the original order).
+    op_reschedule_config = os.environ.get('OP_RESCHEDULE_CONFIG', default='')
+    # path to dump the current operator schedule to (one entry per forward segment).
+    # When set, the schedule is written after code generation planning so it can be
+    # edited and fed back via `OP_RESCHEDULE_CONFIG`. Default '' (do not dump).
+    dump_op_schedule = os.environ.get('DUMP_OP_SCHEDULE', default='')
+    # path to dump a Graphviz visualization of the operator schedule to (ops laid out
+    # linearly in their current order with dependency arrows). When set together with
+    # `enable_op_reschedule`, both the "before" and "after" graphs are written
+    # (with `.before`/`.after` inserted before the extension) for comparison.
+    # Default '' (do not dump).
+    dump_op_schedule_graph = os.environ.get('DUMP_OP_SCHEDULE_GRAPH', default='')
+
     # ============== runtime ====================
     dev_mode = _to_bool('SINGLE_DEV_MODE')  # allow to use python xx.py
     async_comm = _to_bool('ASYNC_COMM')
