@@ -99,3 +99,11 @@ def test_all_f_cases_fix_placement():
 
     # should not raise any exception
     assert True
+
+
+def test_fail_case():
+    ilayout = (1, 1, 2, 1)
+    olayout = (1, 1, 2, 1)
+    inter_rvds = [('p', 1, 1, 2, 1), ('c', 1, 1, 2, 1)]
+    InterPathFinder.device_align(ilayout, olayout, inter_rvds)
+    assert True

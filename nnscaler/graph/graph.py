@@ -1071,6 +1071,23 @@ class IRGraph(IRSegment):
         for sid in range(len(fstages)):
             self.group(fstages[sid])
 
+    def gen_per_device_segements(self) -> Dict[IRSegment, Dict[int, IRSegment]]:
+        # collect device map for each segment to prepare for adapter generation
+        # key: segment, value: dict{device id -> segment on that device}
+        per_device_segs: Dict[IRSegment, Dict[int, IRSegment]] = {}
+        for seg in self.nodes():
+            if not isinstance(seg, IRSegment):
+                continue
+            per_device_segs[seg] = seg._gen_per_device_segments()
+        # set segment mirror
+        for seg, dev_seg_map in per_device_segs.items():
+            if seg.isfw():
+                mirror = seg.mirror
+                assert mirror in per_device_segs, f"mirror segment not found in per_device_segs: {mirror}"
+                for dev, dev_seg in dev_seg_map.items():
+                    IRSegment.make_pair(dev_seg, per_device_segs[mirror][dev])
+
+        return per_device_segs
 
     # ================= Other optimizations ==================
 

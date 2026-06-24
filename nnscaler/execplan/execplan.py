@@ -53,17 +53,26 @@ class ExeReuseCell(IRCell):
         if devid in self._cached_dispatched:
             return self._cached_dispatched[devid]
 
+        dispatch_cell = self._cell.dispatch(devid)
         inputs = []
-        for t, cell_t in zip(self._inputs, self._cell.inputs()):
+        for t, cell_t in zip(self._inputs, dispatch_cell.inputs()):
             if isinstance(cell_t, IRObject) and devid not in cell_t.device:
                 continue
+            if isinstance(t, IRSubTensor) and t.shape != cell_t.shape:
+                t = t.parent.select(cell_t.indmap, cell_t.valmap)
+                if t.grad is not None:
+                    t.grad = t.grad.parent.select(cell_t.grad.indmap, cell_t.grad.valmap)
             inputs.append(t)
         outputs = []
-        for t, cell_t in zip(self._outputs, self._cell.outputs()):
+        for t, cell_t in zip(self._outputs, dispatch_cell.outputs()):
             if isinstance(cell_t, IRObject) and devid not in cell_t.device:
                 continue
+            if isinstance(t, IRSubTensor) and t.shape != cell_t.shape:
+                t = t.parent.select(cell_t.indmap, cell_t.valmap)
+                if t.grad is not None:
+                    t.grad = t.grad.parent.select(cell_t.grad.indmap, cell_t.grad.valmap)
             outputs.append(t)
-        reuse = ExeReuseCell(self._cell.dispatch(devid), inputs, outputs)
+        reuse = ExeReuseCell(dispatch_cell, inputs, outputs)
         reuse._id = self._id
         reuse._op_context = self._op_context
         if _mirror and self.mirror is not None:
