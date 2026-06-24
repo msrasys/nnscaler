@@ -804,6 +804,7 @@ class IRAdapterGener:
         graph._reorder_producer_consumer()
         _logger.info("finish reordering producer and consumer")
 
+        original_graph = graph
         if not isinstance(graph, IRGraph):
             graph = graph.get_per_device_segment()
 
@@ -817,15 +818,18 @@ class IRAdapterGener:
         per_device_segs: Dict[
             IRSegment, Tuple[Dict[int, List[IRObject]], Dict[int, List[IRObject]]]
         ] = {}
+        dataloader_outputs = set()
         if isinstance(graph, IRGraph):
-            for seg in graph.nodes():
-                if not isinstance(seg, IRSegment):
+            for node in graph.nodes():
+                if isinstance(node, IRDataOperation):
+                    dataloader_outputs.update(obj.parent for obj in IR.get_objects(node.outputs()))
+                if not isinstance(node, IRSegment):
                     continue
-                per_device_segs[seg] = seg.get_per_device_inout()
+                per_device_segs[node] = node.get_per_device_inout(dataloader_outputs)
         else:
-            assert isinstance(graph, IRSegment)
-            per_device_segs[graph] = graph.get_per_device_inout()
-            per_device_segs[graph.mirror] = graph.mirror.get_per_device_inout()
+            assert isinstance(original_graph, IRSegment)
+            per_device_segs[graph] = original_graph.get_per_device_inout(dataloader_outputs)
+            per_device_segs[graph.mirror] = original_graph.mirror.get_per_device_inout(dataloader_outputs)
 
         def _adjust_producer_for_per_device_seg(producers: List[IRCell], ptensors: List[IRSubTensor]):
             """
@@ -947,34 +951,35 @@ class IRAdapterGener:
             if ftensor in input_producer:
                 fptensors = fptensors + tuple(fop.output(0) for fop in input_producer[ftensor])
                 fproducers = fproducers + tuple(input_producer[ftensor])
-            fptensors = expand_devices(fptensors, producer=True)
-            assert all(len(ptensor.device) == 1 for ptensor in fptensors), "Not support for multi-device"
             # abandon the producer as it is not used
             _, fptensors = _adjust_producer_for_per_device_seg(fproducers, fptensors)
+            fptensors = expand_devices(fptensors, producer=True)
+            assert all(len(ptensor.device) == 1 for ptensor in fptensors), "Not support for multi-device"
 
             # consumers can be operators and graph outputs
             fconsumers, fctensors = graph.consumers(ftensor), graph.ctensors(ftensor)
-            fctensors = expand_devices(fctensors, consumer=True)
-            assert all(len(ctensor.device) == 1 for ctensor in fctensors), "Not support for multi-device"
             # abandon the consumer to avoid graph.multi_index() error
             # because the consumers are virtual segments and not in the graph's node list
             _, fctensors = _adjust_consumer_for_per_device_seg(fconsumers, fctensors)
+            fctensors = expand_devices(fctensors, consumer=True)
+            assert all(len(ctensor.device) == 1 for ctensor in fctensors), "Not support for multi-device"
 
             bproducers, bptensors = [], []
             bconsumers, bctensors = [], []
             if isinstance(ftensor.grad, IRFullTensor):
                 bproducers, bptensors = bgraph.producers(ftensor.grad), bgraph.ptensors(ftensor.grad)
-                bptensors = expand_devices(bptensors, producer=True)
                 # abandon the producer to avoid graph.multi_index() error
                 _, bptensors = _adjust_producer_for_per_device_seg(bproducers, bptensors)
+                bptensors = expand_devices(bptensors, producer=True)
 
                 bconsumers, bctensors = bgraph.consumers(ftensor.grad), bgraph.ctensors(ftensor.grad)
                 if ftensor in input_producer:
                     bctensors = bctensors + tuple(fwop.output(0).grad for fwop in input_producer[ftensor])
-                bctensors = expand_devices(bctensors, consumer=True)
-                assert all(len(ctensor.device) == 1 for ctensor in bctensors), "Not support for multi-device"
+                    bconsumers = bconsumers + tuple(input_producer[ftensor])
                 # abandon the consumer as it is not used
                 _, bctensors = _adjust_consumer_for_per_device_seg(bconsumers, bctensors)
+                bctensors = expand_devices(bctensors, consumer=True)
+                assert all(len(ctensor.device) == 1 for ctensor in bctensors), "Not support for multi-device"
 
             fadapters = []
 

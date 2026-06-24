@@ -1187,7 +1187,7 @@ class IRSegment(IRCell):
         segment = IRSegment(nodes, order(inputs), order(outputs))
         return segment
 
-    def get_per_device_inout(self):
+    def get_per_device_inout(self, dataloader_outputs: Optional[Set[IRObject]] = None):
         """
         Must call this function after the graph is partitioned
         but before local multirefs and adapters are generated.
@@ -1195,6 +1195,8 @@ class IRSegment(IRCell):
         # per-device inputs/outputs
         if self._per_device_input:
             return self._per_device_input, self._per_device_output
+
+        dataloader_outputs = dataloader_outputs or set()
 
         devices = self.device
         for dev in devices:
@@ -1225,6 +1227,10 @@ class IRSegment(IRCell):
                 A dict mapping device ID to the unique partition sub-tensor consumed on that device,
                 or None if the segment cannot be narrowed.
             """
+            if ftensor in dataloader_outputs:
+                # If the full tensor is an output of the dataloader, we don't narrow it.
+                return None
+
             from nnscaler.runtime.function.function import identity as _identity_fn
             original_ftensor = ftensor
             # Trace through identity nodes to find the actual consumption pattern.
@@ -1410,36 +1416,6 @@ class IRSegment(IRCell):
                 IRSegment.make_pair(self._per_device_seg, per_device_seg_mirror)
         return self._per_device_seg
 
-    def _gen_per_device_segments(self):
-        """
-        Create virtual segments for each device, which are used to generate code for each device.
-        The segments are created by dispatching the original segment to each device, and then
-        narrowing the inputs and outputs to the corresponding device.
-
-        Note the mirror segments are not generated here
-        """
-        if type(self) != IRSegment:
-            raise ValueError("per-device segments should only be generated for IRSegment")
-
-        if not self._per_device_segs:
-            device_input_map, device_output_map = self.get_per_device_inout()
-            segs = {}
-            for dev in self.device:
-                inputs = device_input_map[dev]
-                outputs = device_output_map[dev]
-                nodes = list(_fix_identity(node.dispatch(dev) for node in self._nodes if dev in node.device))
-                segment = IRSegment(nodes, inputs, outputs, self.name)
-                segs[dev] = segment
-            self._per_device_segs = segs
-
-            if self.isfw() and self.mirror is not None:
-                mirror_per_device_segs = self.mirror._gen_per_device_segments()
-                assert set(mirror_per_device_segs.keys()) == set(self._per_device_segs.keys()), "Mirror segment should have the same device set"
-                for dev in self._per_device_segs:
-                    IRSegment.make_pair(self._per_device_segs[dev], mirror_per_device_segs[dev])
-
-        return self._per_device_segs
-
     def dispatch(self, devid: int, _gen_mirror: bool = True) -> Optional[IRCell]:
         """
         Instantiate the segment to a specific device.
@@ -1478,8 +1454,8 @@ class IRSegment(IRCell):
         segment.pre_hook = self.pre_hook
         segment.post_hook = self.post_hook
         segment.hook_meta = self.hook_meta
-        if _gen_mirror and per_device_segment.mirror is not None:
-            msegment = per_device_segment.mirror.dispatch(devid, _gen_mirror=False)
+        if _gen_mirror and self.mirror is not None:
+            msegment = self.mirror.dispatch(devid, _gen_mirror=False)
             IRCell.make_pair(segment, msegment)
         self._dispatch_cached[devid] = segment
         return segment
