@@ -48,6 +48,11 @@ class CompileFlag:
     # segment), 'sequence' (reorder the cross-segment execution sequence so that e.g.
     # asynchronous communication can be issued early), or 'both'. Default 'segment'.
     op_reschedule_scope = os.environ.get('OP_RESCHEDULE_SCOPE', default='segment')
+    # whether to also reschedule pipeline (graph.sched) schedules at the 'sequence'
+    # scope. The deliberate compute order is preserved (only communication adapters
+    # move), but enabling it changes the generated pipeline code, so it is opt-in and
+    # should be validated at runtime. Default False (pipeline schedules untouched).
+    op_reschedule_pipeline = _to_bool('OP_RESCHEDULE_PIPELINE', False)
     # path to a schedule config file (produced by `dump_schedule`) that records the
     # desired operator order per forward segment. When set together with
     # `enable_op_reschedule`, the operators are reordered to follow the recorded order

@@ -916,6 +916,7 @@ def _gencode(
             execplan,
             config=CompileFlag.op_reschedule_config or None,
             scope=CompileFlag.op_reschedule_scope,
+            allow_pipeline=CompileFlag.op_reschedule_pipeline,
         )
 
     # dump the operator schedule so it can be edited and fed back via

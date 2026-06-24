@@ -418,6 +418,17 @@ def config_priority(order_map: Dict[int, int]) -> Callable[[IRCell], Hashable]:
     return priority
 
 
+def _comm_early_priority(node: IRCell) -> Hashable:
+    """Priority that schedules communication (adapters / reducers) as early as legal.
+
+    Used as the default for the cross-segment (sequence) reschedule: a plain stable
+    topological sort would reproduce the original order, so to actually overlap
+    communication we prefer to issue it as early as its data dependencies allow.
+    """
+    cell = node.cell if isinstance(node, ExeReuseCell) else node
+    return 0 if isinstance(cell, (IRAdapter, IRWeightReducer)) else 1
+
+
 # ---------------------------------------------------------------------------
 # Schedule visualization (Graphviz DOT)
 # ---------------------------------------------------------------------------
@@ -650,6 +661,7 @@ class Reschedule(PlanPass):
         priority: Optional[Callable[[IRCell], Hashable]] = None,
         config: Optional[Union[str, Path, Dict]] = None,
         scope: str = 'segment',
+        allow_pipeline: bool = False,
     ) -> ExecutionPlan:
         """Reschedule operators of ``execplan``.
 
@@ -668,6 +680,12 @@ class Reschedule(PlanPass):
                   (segments keep their relative order; adapters / reducers, e.g.
                   asynchronous communication, may move within their data window).
                 - ``'both'``: do both.
+            allow_pipeline: when ``True``, the sequence reschedule is also applied to
+                pipeline schedules (``graph.sched`` set). The deliberate compute order
+                (the ExeReuseCell forward/backward segments) is still preserved; only
+                the communication adapters move. Default ``False`` (pipeline schedules
+                are left untouched), since reordering a real pipeline schedule needs
+                multi-GPU runtime validation.
         """
         if config is not None:
             order_map = load_schedule_order(config)
@@ -693,7 +711,7 @@ class Reschedule(PlanPass):
             _logger.info(f'op reschedule: reordered ops inside {reordered} forward segment(s)')
 
         if scope in ('sequence', 'both'):
-            reordered = Reschedule._reschedule_sequence(execplan, priority)
+            reordered = Reschedule._reschedule_sequence(execplan, priority, allow_pipeline)
             _logger.info(f'op reschedule: reordered the execution sequence of {reordered} device(s)')
 
         return execplan
@@ -702,6 +720,7 @@ class Reschedule(PlanPass):
     def _reschedule_sequence(
         execplan: ExecutionPlan,
         priority: Optional[Callable[[IRCell], Hashable]] = None,
+        allow_pipeline: bool = False,
     ) -> int:
         """Reschedule the cross-segment execution sequence of every device.
 
@@ -711,12 +730,20 @@ class Reschedule(PlanPass):
         This is what lets an asynchronous communication (e.g. an ``irecv``) be issued
         as early as its data allows, instead of right before the consuming operator.
 
-        A deliberately constructed pipeline schedule is left untouched.
+        A deliberately constructed pipeline schedule is left untouched unless
+        ``allow_pipeline`` is set.
 
         Returns the number of device sequences that changed.
         """
-        # never reorder a deliberately constructed pipeline schedule
-        if execplan.graph.sched is not None:
+        # a stable topological sort of a sequence reproduces the original order, so
+        # default to issuing communication as early as legally possible (the whole
+        # point of the cross-segment reschedule) when no explicit order is requested.
+        if priority is None:
+            priority = _comm_early_priority
+
+        # never reorder a deliberately constructed pipeline schedule unless explicitly
+        # allowed (reordering it needs multi-GPU runtime validation)
+        if execplan.graph.sched is not None and not allow_pipeline:
             return 0
 
         reordered = 0
