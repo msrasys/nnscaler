@@ -11,7 +11,7 @@ from nnscaler.ir.cten import IRCell, IRTensor, IRObject
 from nnscaler.ir.tensor import IRSubTensor
 from nnscaler.ir.operator import IRDataOperation, IRFwOperation
 from nnscaler.ir.adapter import IRWeightReducer, IRAdapter
-from nnscaler.ir.adapter.prim import CommPrim
+from nnscaler.ir.adapter.prim import CommPrim, MovePrim
 
 from nnscaler.graph.segment import IRSegment
 
@@ -323,6 +323,98 @@ class FuncEmission(CodeEmission):
 
         return codes
 
+    def _adapter_prims(self, node: IRAdapter) -> List:
+        """Return the list of primitives that compose an adapter's runtime call."""
+        return [node] if node.differentiable and node.custom else [prim for prim in node.prims]
+
+    def is_async_recv_adapter(self, node: IRAdapter) -> bool:
+        """
+        Whether `node` is a pure cross-device receive adapter that can be issued
+        asynchronously and waited on later (the "async irecv" pattern).
+
+        It is an async-recv adapter when it takes no inputs, produces a single
+        output, and its first primitive is a `MovePrim` that itself takes no
+        input and produces a single output (i.e. a remote receive).
+        """
+        if node.differentiable and node.custom:
+            return False
+        prims = self._adapter_prims(node)
+        return (
+            len(node.inputs()) == 0
+            and len(node.outputs()) == 1
+            and len(prims) > 0
+            and isinstance(prims[0], MovePrim)
+            and len(prims[0].inputs()) == 0
+            and len(prims[0].outputs()) == 1
+        )
+
+    def _emit_adapter_prims(
+        self,
+        prims: List,
+        prefix_attr: Optional[str] = None,
+        async_op: bool = False,
+        input_name_overrides: Optional[Dict[int, str]] = None,
+    ) -> List[str]:
+        """
+        Emit code lines for a list of adapter primitives, optionally overriding
+        the rendered name of selected input tensors (keyed by tid).
+        """
+        codes = []
+        input_name_overrides = input_name_overrides or {}
+
+        def _input_name(inp: Any) -> str:
+            if isinstance(inp, IRObject) and inp.tid in input_name_overrides:
+                return input_name_overrides[inp.tid]
+            return self.tensor_name(inp, prefix_attr=prefix_attr)
+
+        for prim in prims:
+            prim_inputs = prim.inputs()
+            if len(prim_inputs) == 0:
+                itensors = '()'
+            elif len(prim_inputs) == 1:
+                itensors = _input_name(prim_inputs[0])
+            else:
+                itensors = '(' + ', '.join(_input_name(inp) for inp in prim_inputs) + ', )'
+            prim_kwargs = dict(prim.kwargs)
+            if async_op and isinstance(prim, CommPrim):
+                prim_kwargs['async_op'] = True
+            kwargs = self.kwargs_name(**prim_kwargs)
+            outputs = self.return_name(prim.outputs())
+            if CompileFlag.line_timer:
+                codes.append(f'nnscaler.runtime.function.print_time({repr(prim.signature)})')
+            codes.append(f'{outputs} = {prim.signature}({itensors}, {kwargs})')
+        return codes
+
+    def emit_async_recv_adapter_wait(self, node: IRAdapter, prefix_attr: Optional[str] = None) -> List[str]:
+        """
+        Emit the body of the deferred-wait method for an async-recv adapter.
+
+        The launch method (see `emit_adapter` with `async_op=True`) issues the
+        receive via `AsyncCommHandler().submit(...)` and returns immediately.
+        This method resolves the pending work via `AsyncCommHandler().wait(...)`
+        and then runs any remaining post-receive primitives.
+        """
+        assert self.is_async_recv_adapter(node), f'Expected async recv adapter, got {node}'
+        prims = self._adapter_prims(node)
+        codes = ['__pending = nnscaler.runtime.executor.AsyncCommHandler().wait(__pending)']
+        first_output = prims[0].output(0)
+        codes += self._emit_adapter_prims(
+            prims[1:],
+            prefix_attr=prefix_attr,
+            async_op=False,
+            input_name_overrides={first_output.tid: '__pending'},
+        )
+        final_output = self.tensor_name(node.output(0), prefix_attr=prefix_attr)
+        emitted_outputs = {
+            out.tid
+            for prim in prims[1:]
+            for out in prim.outputs()
+            if isinstance(out, IRObject)
+        }
+        if node.output(0).tid not in emitted_outputs:
+            codes.append(f'{final_output} = __pending')
+        return codes
+
     def emit_adapter(self, node: IRAdapter, prefix_attr: Optional[str] = None,
                      async_op: bool = False) -> List[str]:
         """
@@ -339,7 +431,19 @@ class FuncEmission(CodeEmission):
         """
         codes = []
         assert len(node.device) == 1, f"Expected adapter to be dispatched:\n{node.extra_repr()}"
-        prims = [node] if node.differentiable and node.custom else [prim for prim in node.prims]
+        prims = self._adapter_prims(node)
+
+        if async_op and CompileFlag.async_recv and self.is_async_recv_adapter(node):
+            # Launch path for an async-recv adapter: issue only the receiving
+            # `move` asynchronously and alias it to the adapter output name. Any
+            # remaining post-receive primitives are emitted by the companion
+            # `<name>_wait` method (see `emit_async_recv_adapter_wait`).
+            codes = self._emit_adapter_prims(prims[:1], prefix_attr=prefix_attr, async_op=True)
+            first_output = self.tensor_name(prims[0].output(0), prefix_attr=prefix_attr)
+            final_output = self.tensor_name(node.output(0), prefix_attr=prefix_attr)
+            if first_output != final_output:
+                codes.append(f'{final_output} = {first_output}')
+            return codes
 
         if async_op:
             # note async_op can only be applied when primitives satisfy:

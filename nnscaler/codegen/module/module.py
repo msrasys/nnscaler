@@ -486,7 +486,10 @@ class ModuleCodeGen(FuncEmission):
             elif isinstance(node, IRFwOperation):
                 raise RuntimeError(f"Unexcepted global-level op call: {node}")
             elif isinstance(node, IRAdapter):
-                codes = self.emit_adapter(node, prefix_attr='self.', async_op=CompileFlag.async_comm)
+                adapter_async = CompileFlag.async_comm or (
+                    CompileFlag.async_recv and self.is_async_recv_adapter(node)
+                )
+                codes = self.emit_adapter(node, prefix_attr='self.', async_op=adapter_async)
             elif isinstance(node, IRWeightReducer):
                 self.init_reducer(node, device, param_first_used_pos, as_parallel_module)
                 codes = self.emit_reducer(node)
@@ -581,6 +584,22 @@ class ModuleCodeGen(FuncEmission):
                 if CompileFlag.use_jit and name.startswith('segment'):
                     cb.insert_body('@torch.jit.script_method')
                 cb.insert_body(fb.code)
+
+                # For an async-recv adapter the method above only *launches* the
+                # receive (`async_op=True`, submitted to `AsyncCommHandler`). Emit a
+                # companion `<name>_wait` method that resolves the pending receive so
+                # the schedule can defer the wait until the first consumer needs it.
+                if (
+                    CompileFlag.async_recv
+                    and isinstance(node, IRAdapter)
+                    and self.is_async_recv_adapter(node)
+                ):
+                    with FunctionBlock(func_name=f'{name}_wait', args=['self', '__pending']) as wait_fb:
+                        wait_fb.insert_body(self.emit_async_recv_adapter_wait(node))
+                        wait_outputs = [self.tensor_name(t) for t in node.outputs()]
+                        wait_fb.insert_body(f"return {', '.join(wait_outputs)}")
+                    cb.insert_body('')
+                    cb.insert_body(wait_fb.code)
 
                 if saved_tensors_hooks_needed:
                     with FunctionBlock(func_name=name, args=input_args) as fb:

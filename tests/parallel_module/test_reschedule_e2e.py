@@ -123,3 +123,41 @@ def test_pipeline_reschedule_numeric_equivalence():
             b = on_sd[k]
             assert torch.allclose(a, b, atol=1e-5, rtol=1e-5), \
                 f'step {step} key {k} differs: max|diff|={(a - b).abs().max().item():.3e}'
+
+
+@pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.device_count() < 4,
+                    reason='requires 4 gpus')
+def test_pipeline_reschedule_async_recv_numeric_equivalence():
+    """Reschedule + ASYNC_RECV (cross-stage irecv issued early, waited lazily)
+    must stay numerically identical to the synchronous baseline."""
+    keys = ('ENABLE_OP_RESCHEDULE', 'OP_RESCHEDULE_SCOPE', 'OP_RESCHEDULE_PIPELINE', 'ASYNC_RECV')
+    saved = {k: os.environ.get(k) for k in keys}
+    try:
+        # baseline (sync, no reschedule)
+        for k in keys:
+            os.environ.pop(k, None)
+        off = launch_torchrun(4, _pp_reschedule_worker, False)
+
+        # reschedule ON + async recv (irecv early + deferred wait)
+        os.environ['ENABLE_OP_RESCHEDULE'] = '1'
+        os.environ['OP_RESCHEDULE_SCOPE'] = 'both'
+        os.environ['OP_RESCHEDULE_PIPELINE'] = '1'
+        os.environ['ASYNC_RECV'] = '1'
+        on = launch_torchrun(4, _pp_reschedule_worker, True)
+    finally:
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+    assert off and on, 'workers returned no result'
+    for step in range(NSTEPS):
+        off_sd = merge_state_dicts([off[r][step] for r in range(4)])[0]
+        on_sd = merge_state_dicts([on[r][step] for r in range(4)])[0]
+        for k, a in off_sd.items():
+            if not torch.is_tensor(a):
+                continue
+            b = on_sd[k]
+            assert torch.allclose(a, b, atol=1e-5, rtol=1e-5), \
+                f'step {step} key {k} differs: max|diff|={(a - b).abs().max().item():.3e}'

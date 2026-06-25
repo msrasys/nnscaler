@@ -6,7 +6,7 @@ import copy
 import inspect
 import logging
 
-from nnscaler.ir.cten import IRCell, IRTensor, IR
+from nnscaler.ir.cten import IRCell, IRTensor, IR, IRObject
 from nnscaler.ir.operator import IRDataOperation, IRFwOperation
 from nnscaler.ir.tensor import IRSubTensor
 from nnscaler.ir.adapter import IRWeightReducer, IRAdapter
@@ -154,6 +154,8 @@ class ScheduleCodeGen(FuncEmission):
                             last_backwards[node.cell.cid] = node
                     last_backward_node_oids = [id(node) for node in last_backwards.values()]
 
+                # tid -> (adapter, output) for async-recv adapters whose wait is deferred
+                pending_async_recvs = {}
                 for line, node in enumerate(device_nodes):
                     # when use scheduler, skip reducer if it is not the last backward of same segments
                     if use_scheduler and _is_backward_segment(node):
@@ -161,14 +163,24 @@ class ScheduleCodeGen(FuncEmission):
                             f'nnscaler.flags.RuntimeFlag.skip_reducer = '
                             f'{id(node) not in last_backward_node_oids !r}'
                         )
+                    if CompileFlag.async_recv:
+                        wait_codes = self._emit_async_recv_waits(node, pending_async_recvs)
+                        if wait_codes:
+                            _append_code(fb, wait_codes, self._get_node_stream(node))
                     codes = self.emit_node(node)
                     _append_code(fb, codes, self._get_node_stream(node))
+                    if CompileFlag.async_recv:
+                        self._track_async_recv(node, pending_async_recvs)
                     # release
                     tensors = lifetime.release_tensors_after_line(line)
                     if len(tensors) > 0 : # not necessarily to have one after each line
                         _append_code(fb, self.emit_release(tensors))
             # return code
             outputs = self.return_name_complex(self.execplan.outputs())
+            if CompileFlag.async_recv:
+                # ensure any pending async-recv whose output is a step output
+                # (e.g. the gathered loss) has completed before returning
+                _append_code(fb, 'nnscaler.runtime.executor.AsyncCommHandler().drain()', force_flush=True)
             code = f'return {outputs}'
             _append_code(fb, code, force_flush=True)
 
@@ -187,11 +199,18 @@ class ScheduleCodeGen(FuncEmission):
                 # body code
                 if len(device_nodes) == 0:
                     _append_code(fb, 'pass')
+                pending_async_recvs = {}
                 for line, node in enumerate(device_nodes):
                     if not node.isfw(): continue  # skip backward segments and adapters
                     # execute
+                    if CompileFlag.async_recv:
+                        wait_codes = self._emit_async_recv_waits(node, pending_async_recvs, force_no_grad=True)
+                        if wait_codes:
+                            _append_code(fb, wait_codes, self._get_node_stream(node))
                     codes = self.emit_node(node, force_no_grad=True)
                     _append_code(fb, codes, self._get_node_stream(node))
+                    if CompileFlag.async_recv:
+                        self._track_async_recv(node, pending_async_recvs)
                     # release
                     tensors = lifetime.release_tensors_after_line(line)
                     tensors = [t for t in tensors if isinstance(t, IRTensor) and not t.is_grad()]
@@ -199,6 +218,8 @@ class ScheduleCodeGen(FuncEmission):
                         _append_code(fb, self.emit_release(tensors))
                 # return code
                 outputs = self.return_name_complex(self.execplan.outputs())
+                if CompileFlag.async_recv:
+                    _append_code(fb, 'nnscaler.runtime.executor.AsyncCommHandler().drain()', force_flush=True)
                 code = f'return {outputs}'
                 _append_code(fb, code, force_flush=True)
             gencode += fb.code
@@ -295,6 +316,51 @@ class ScheduleCodeGen(FuncEmission):
         Emit detach code
         """
         return f'{self.tensor_name(tensor)} = {self.tensor_name(tensor)}.detach()'
+
+    def _unwrap_node(self, node: IRCell) -> IRCell:
+        return node.cell if isinstance(node, ExeReuseCell) else node
+
+    def _track_async_recv(self, node: IRCell, pending_async_recvs: dict) -> None:
+        """
+        If `node` is an async-recv adapter (issued via `async_op=True`), record its
+        output tensors as pending so a later consumer can emit the deferred wait.
+        """
+        unwrap_node = self._unwrap_node(node)
+        if not isinstance(unwrap_node, IRAdapter) or not self.is_async_recv_adapter(unwrap_node):
+            return
+        for out in IR.get_objects(node.outputs()):
+            if isinstance(out, IRObject):
+                pending_async_recvs[out.tid] = (unwrap_node, out)
+
+    def _node_wait_inputs(self, node: IRCell) -> List:
+        """Return the io objects of `node` that may need a pending async-recv wait."""
+        unwrap_node = self._unwrap_node(node)
+        if isinstance(unwrap_node, IRSegment) and not node.isfw():
+            input_tensors, output_tensors, output_grads, _ = self.get_backward_callsite_io_tensors(node)
+            return IR.get_objects((input_tensors, output_tensors, output_grads))
+        return IR.get_objects(node.inputs())
+
+    def _emit_async_recv_waits(self, node: IRCell, pending_async_recvs: dict,
+                               force_no_grad: bool = False) -> List[str]:
+        """
+        Emit deferred-wait calls for any pending async-recv tensors that `node`
+        consumes. Each waited tensor is removed from `pending_async_recvs`.
+        """
+        codes = []
+        seen_tids = set()
+        for inp in self._node_wait_inputs(node):
+            if not isinstance(inp, IRObject) or inp.tid not in pending_async_recvs or inp.tid in seen_tids:
+                continue
+            seen_tids.add(inp.tid)
+            adapter, pending_out = pending_async_recvs.pop(inp.tid)
+            adapter_name = self.node_name(adapter)
+            tensor_name = self.tensor_name(pending_out)
+            req_grad = (not force_no_grad) and isinstance(pending_out, IRTensor) and pending_out.requires_grad
+            codes.append(
+                f'{tensor_name} = nnscaler.runtime.executor.aexecute('
+                f'model.{adapter_name}_wait, *({tensor_name}, ), requires_grad={req_grad})'
+            )
+        return codes
 
     def emit_node(self, node: IRCell, force_no_grad: bool = False) -> List[str]:
         """

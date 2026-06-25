@@ -617,4 +617,78 @@ def test_sequence_scope_codegen_compiles():
     compile(code, '<gencode>', 'exec')
 
 
+# ---------------------------------------------------------------------------
+# async-recv deferred-wait codegen
+# ---------------------------------------------------------------------------
+
+def _recv_adapter(extra_prim=False):
+    """Build an IRAdapter whose first primitive is a no-input recv `MovePrim`."""
+    from nnscaler.ir.adapter.prim import MovePrim
+    moved = _sub(requires_grad=False)
+    out = moved if not extra_prim else _sub(requires_grad=False)
+    mp = MovePrim([], [moved], shape=(4, 4), dtype='torch.float32', src=0, dst=1)
+    adapter = IRAdapter([], [out])
+    prims = [mp]
+    if extra_prim:
+        # a post-receive collective consuming the moved tensor (composite recv)
+        from nnscaler.ir.adapter.prim import AllGatherPrim
+        prims.append(AllGatherPrim([moved], [out], dim=0, ranks=[0, 1]))
+    adapter.prims = prims
+    return adapter
+
+
+def test_is_async_recv_adapter():
+    from nnscaler.codegen.emit import FuncEmission
+    emit = FuncEmission()
+    # pure recv: 0 inputs, 1 output, single move prim
+    assert emit.is_async_recv_adapter(_recv_adapter())
+    # composite recv (move + all_gather): still classified by the leading move
+    assert emit.is_async_recv_adapter(_recv_adapter(extra_prim=True))
+    # an adapter with inputs is not a recv
+    inp, out = _sub(), _sub()
+    not_recv = IRAdapter([inp], [out])
+    from nnscaler.ir.adapter.prim import MovePrim
+    not_recv.prims = [MovePrim([inp], [out], shape=(4, 4), dtype='torch.float32', src=0, dst=1)]
+    assert not emit.is_async_recv_adapter(not_recv)
+
+
+def test_emit_async_recv_adapter_wait():
+    from nnscaler.codegen.emit import FuncEmission
+    emit = FuncEmission()
+
+    # pure recv: the wait resolves the pending work and aliases it to the output
+    body = '\n'.join(emit.emit_async_recv_adapter_wait(_recv_adapter()))
+    assert 'AsyncCommHandler().wait(__pending)' in body
+    assert '= __pending' in body
+
+    # composite recv: the wait resolves, then runs the deferred post-receive prim
+    body2 = '\n'.join(emit.emit_async_recv_adapter_wait(_recv_adapter(extra_prim=True)))
+    assert 'AsyncCommHandler().wait(__pending)' in body2
+    assert 'all_gather' in body2
+    assert '__pending' in body2  # the deferred all_gather consumes __pending
+
+
+def test_async_comm_handler_drain():
+    from nnscaler.runtime.executor import AsyncCommHandler
+
+    class _Work:
+        def __init__(self):
+            self.waited = False
+        def wait(self):
+            self.waited = True
+
+    handler = AsyncCommHandler()
+    handler.clear()
+    t1, w1 = torch.zeros(2), _Work()
+    t2, w2 = torch.zeros(2), _Work()
+    handler.submit(t1, [w1])                       # callback-less (recv)
+    handler.submit(t2, [w2], callback=lambda x: x)  # has callback (collective)
+
+    handler.drain()
+    assert w1.waited, 'callback-less work should be drained'
+    assert not w2.waited, 'work with callback must be left for explicit wait'
+    handler.clear()
+
+
+
 

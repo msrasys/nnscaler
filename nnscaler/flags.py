@@ -72,6 +72,12 @@ class CompileFlag:
     # ============== runtime ====================
     dev_mode = _to_bool('SINGLE_DEV_MODE')  # allow to use python xx.py
     async_comm = _to_bool('ASYNC_COMM')
+    # issue cross-device receive adapters (point-to-point irecv) asynchronously and
+    # defer their `wait` until the first consumer needs the tensor. Combined with
+    # operator rescheduling (which can hoist the receive earlier in the sequence),
+    # this overlaps the receive with intervening compute ("single-stream async
+    # irecv early"). Opt-in and independent of `ASYNC_COMM`. Default off.
+    async_recv = _to_bool('ASYNC_RECV')
     line_timer = _to_bool('LINE_TIMER')
 
     # ============== reducer ==================

@@ -66,6 +66,21 @@ class AsyncCommHandler:
     def clear(self):
         AsyncCommHandler.instance = AsyncCommHandler.__AsyncCommHandler()
 
+    def drain(self):
+        """
+        Wait for any still-pending callback-less async works (e.g. async-recv
+        adapters whose output is a step output and thus never explicitly waited).
+        Works that carry a callback are left untouched, as their result must be
+        rebound at an explicit `wait` call-site rather than discarded here.
+        """
+        for tid, works in list(self._works.items()):
+            if self._callbacks.get(tid) is not None:
+                continue
+            for work in works:
+                work.wait()
+            self._works.pop(tid, None)
+            self._callbacks.pop(tid, None)
+
     def check_clear(self):
         assert len(self._works) == 0 and len(self._callbacks) == 0
 
