@@ -16,7 +16,7 @@ import copy
 import dill
 import hashlib
 
-from nnscaler.ir.cten import IRTensor, IRCell, IRObject
+from nnscaler.ir.cten import IRTensor, IRCell, IRObject, IR
 from nnscaler.ir.unique import IDGenerator
 from nnscaler.ir.operator import IRBpOperation, IRFwOperation, IRDataOperation
 from nnscaler.ir.tensor import IRFullTensor, IRSubTensor, ValueMap
@@ -25,7 +25,7 @@ from nnscaler.graph.function.function import Identity
 from nnscaler.graph.function.anchor import IRGraphAnchor
 from nnscaler.graph.function.pyfunc import IRPyFunc
 from nnscaler.graph.function.dimops import IRDimops, OpAnno
-from nnscaler.graph.segment import IRSegment
+from nnscaler.graph.segment import IRSegment, IRSegmentExpander
 
 from nnscaler.algorithm.generics import GenericDistAlgo
 
@@ -47,6 +47,7 @@ class IRGraph(IRSegment):
         super().__init__(nodes, inputs, outputs, module_name)
 
         self._sched = None  # the schedule strategy
+        self._expander: IRGraphExpander = IRGraphExpander(self)
 
     @property
     def train(self) -> bool:
@@ -56,6 +57,10 @@ class IRGraph(IRSegment):
         @return train bool: True if backward is required, otherwise False (inference only).
         """
         return any(not n.isfw() for n in reversed(self._nodes))
+
+    @property
+    def expander(self) -> 'IRGraphExpander':
+        return self._expander
 
     # ================ Deep Learning Interfalce ======================
 
@@ -1250,3 +1255,107 @@ class IRGraph(IRSegment):
         dest_node.hook_meta = src_node.hook_meta
         dest_node.pre_hook = src_node.pre_hook
         dest_node.post_hook = src_node.post_hook
+
+
+class IRGraphExpander:
+    def __init__(self, graph: IRGraph):
+        if not isinstance(graph, IRGraph):
+            raise TypeError(f"Expect IRGraph but got: {type(graph)}")
+
+        self._graph = graph
+        # collect device map for each segment to prepare for adapter generation
+        # key: segment,
+        # value: tuple of dict{device id -> list of input tensors},
+        #                 dict{device id -> list of output tensors}
+        self.segment_expanders: Dict[IRSegment, IRSegmentExpander] = {}
+        self.expanded_segments: Dict[IRSegment, IRSegment] = {}
+        self.reverse_expanded_segments: Dict[IRSegment, IRSegment] = {}
+        self.per_device_ios: Dict[
+            IRSegment, Tuple[Dict[int, List[IRObject]], Dict[int, List[IRObject]]]
+        ] = {}
+        self.dataloader_outputs = set()
+        self.io_built = False
+
+    def build_io(self):
+        for node in self._graph.nodes():
+            if isinstance(node, IRDataOperation):
+                self.dataloader_outputs.update(obj.parent for obj in IR.get_objects(node.outputs()))
+
+        for node in self._graph.nodes():
+            if isinstance(node, IRSegment):
+                segment_expander = IRSegmentExpander(node, self.dataloader_outputs)
+                segment_expander.build_io()
+                self.segment_expanders[node] = segment_expander
+                self.per_device_ios[node] = segment_expander.get_per_device_inout()
+        self.io_built = True
+
+    def get_expanded_segment(self, segment: IRSegment) -> IRSegment:
+        if segment not in self.segment_expanders:
+            raise ValueError(f"Segment {segment} is not in segment_expanders. Please call build_io() first.")
+        if segment not in self.expanded_segments:
+            expanded_segment = self.segment_expanders[segment].get_expanded_segment()
+            self.expanded_segments[segment] = expanded_segment
+            self.reverse_expanded_segments[expanded_segment] = segment
+            if segment.mirror is not None:
+                self.expanded_segments[segment.mirror] = expanded_segment.mirror
+                self.reverse_expanded_segments[expanded_segment.mirror] = segment.mirror
+
+        return self.expanded_segments[segment]
+
+    def get_original_segment(self, expanded_segment: IRSegment) -> IRSegment:
+        if expanded_segment not in self.reverse_expanded_segments:
+            raise ValueError(f"Expanded segment {expanded_segment} is not in reverse_expanded_segments. Please call get_expanded_segment() first.")
+        return self.reverse_expanded_segments[expanded_segment]
+
+    def adjust_producer_for_per_device_seg(self, producers: List[IRCell], ptensors: List[IRSubTensor]):
+        """
+        Replace the producer and ptensors with per-device producers and ptensors
+        if the producer is a segment.
+        """
+        assert len(producers) == len(ptensors), "producers and ptensors should have the same length"
+        assert self.io_built, "Please call build_io() before adjusting producers for per-device segments"
+
+        new_producers = []
+        new_ptensors = []
+
+        for producer, tensor in zip(producers, ptensors):
+            if producer not in self.per_device_ios:
+                new_producers.append(producer)
+                new_ptensors.append(tensor)
+                continue
+            tensor_index_in_seg_output = IR.index_with_same_parent(tensor, producer.outputs())
+            if tensor_index_in_seg_output is None:
+                new_producers.append(producer)
+                new_ptensors.append(tensor)
+                continue
+            for per_dev_output in self.per_device_ios[producer][1].values():
+                new_producers.append(producer)
+                new_ptensors.append(per_dev_output[tensor_index_in_seg_output])
+
+        return new_producers, new_ptensors
+
+    def adjust_consumer_for_per_device_seg(self, consumers: List[IRCell], ctensors: List[IRSubTensor]):
+        """
+        Replace the consumer and ctensors with per-device consumers and ctensors
+        if the consumer is a segment.
+        """
+        assert len(consumers) == len(ctensors), "consumers and ctensors should have the same length"
+        assert self.io_built, "Please call build_io() before adjusting consumers for per-device segments"
+
+        new_consumers = []
+        new_ctensors = []
+
+        for consumer, tensor in zip(consumers, ctensors):
+            if consumer not in self.per_device_ios:
+                new_consumers.append(consumer)
+                new_ctensors.append(tensor)
+                continue
+            tensor_index_in_seg_input = IR.index_with_same_parent(tensor, consumer.inputs())
+            if tensor_index_in_seg_input is None:
+                new_consumers.append(consumer)
+                new_ctensors.append(tensor)
+                continue
+            for per_dev_input in self.per_device_ios[consumer][0].values():
+                new_consumers.append(consumer)
+                new_ctensors.append(per_dev_input[tensor_index_in_seg_input])
+        return new_consumers, new_ctensors

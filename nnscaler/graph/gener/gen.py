@@ -1,7 +1,7 @@
 #  Copyright (c) Microsoft Corporation.
 #  Licensed under the MIT License.
 
-from typing import Dict, List, Optional, Tuple, Callable, Set
+from typing import Dict, List, Optional, Tuple, Callable, Set, Union
 import numpy as np
 import itertools
 import logging
@@ -10,8 +10,8 @@ import copy
 from nnscaler.graph.function.anchor import IRGraphAnchor
 from nnscaler.graph.gener.concurrent import ConcurrentGener
 import nnscaler.graph.gener.utils as utils
-from nnscaler.graph.graph import IRGraph
-from nnscaler.graph.segment import IRSegment, CellPosition
+from nnscaler.graph.graph import IRGraph, IRGraphExpander
+from nnscaler.graph.segment import IRSegment, CellPosition, IRSegmentExpander
 from nnscaler.graph.function.pyfunc import IRPyFunc
 
 from nnscaler.ir.cten import IRCell, IRObject, IR
@@ -743,14 +743,14 @@ class IRAdapterGener:
         The forward/backward adapter is inserted before the first consumers of its full tensor.
 
         Args:
-            graph (IRGraph): the graph the requires for adapter.
+            graph (IRSegment): the graph the requires for adapter.
             allow_recompute (bool): Allow adapter recomputes. If this enables, all adapters will be
                 set to the same recompute group with its consumed node.
             cost_fn (Callable | None): takes an IRAdapterPrim and outputs a cost in float.
                 default to be None, which will use communication volume.
 
         Returns:
-            graph (IRGraph): the (inplace) modified graph with activation adapters.
+            graph (IRSegment): the (inplace) modified graph with activation adapters.
         """
         def skip(ptensors: List[IRSubTensor], ctensors: List[IRSubTensor]) -> bool:
             # e.g., loss or parameter/buffer
@@ -804,138 +804,21 @@ class IRAdapterGener:
         graph._reorder_producer_consumer()
         _logger.info("finish reordering producer and consumer")
 
-        original_graph = graph
-        if not isinstance(graph, IRGraph):
-            graph = graph.get_per_device_segment()
+        is_graph = isinstance(graph, IRGraph)
+        expander: Union[IRGraphExpander, IRSegmentExpander] = graph.expander
+        if is_graph:
+            expander.build_io()
+        else:
+            graph = expander.get_expanded_segment()
 
         input_producer, output_consumer = create_dummy(graph, inputs=True, outputs=True)
         bgraph: Optional[IRSegment] = graph.mirror
-
-        # collect device map for each segment to prepare for adapter generation
-        # key: segment,
-        # value: tuple of dict{device id -> list of input tensors},
-        #                 dict{device id -> list of output tensors}
-        per_device_segs: Dict[
-            IRSegment, Tuple[Dict[int, List[IRObject]], Dict[int, List[IRObject]]]
-        ] = {}
-        dataloader_outputs = set()
-        if isinstance(graph, IRGraph):
-            for node in graph.nodes():
-                if isinstance(node, IRDataOperation):
-                    dataloader_outputs.update(obj.parent for obj in IR.get_objects(node.outputs()))
-                if not isinstance(node, IRSegment):
-                    continue
-                per_device_segs[node] = node.get_per_device_inout(dataloader_outputs)
-        else:
-            assert isinstance(original_graph, IRSegment)
-            per_device_segs[graph] = original_graph.get_per_device_inout(dataloader_outputs)
-            per_device_segs[graph.mirror] = original_graph.mirror.get_per_device_inout(dataloader_outputs)
-
-        def _adjust_producer_for_per_device_seg(producers: List[IRCell], ptensors: List[IRSubTensor]):
-            """
-            Replace the producer and ptensors with per-device producers and ptensors
-            if the producer is a segment.
-            """
-            if not per_device_segs:
-                return producers, ptensors
-
-            new_producers = []
-            new_ptensors = []
-
-            for producer, tensor in zip(producers, ptensors):
-                if producer not in per_device_segs:
-                    new_producers.append(producer)
-                    new_ptensors.append(tensor)
-                    continue
-                tensor_index_in_seg_output = None
-                for idx, seg_output in enumerate(producer.outputs()):
-                    if seg_output.parent == tensor.parent:
-                        tensor_index_in_seg_output = idx
-                        break
-                if tensor_index_in_seg_output is None:
-                    new_producers.append(producer)
-                    new_ptensors.append(tensor)
-                    continue
-                for per_dev_output in per_device_segs[producer][1].values():
-                    new_producers.append(producer)
-                    new_ptensors.append(per_dev_output[tensor_index_in_seg_output])
-            return new_producers, new_ptensors
-
-        def _adjust_consumer_for_per_device_seg(consumers: List[IRCell], ctensors: List[IRSubTensor]):
-            """
-            Replace the consumer and ctensors with per-device consumers and ctensors
-            if the consumer is a segment.
-            """
-            if not per_device_segs:
-                return consumers, ctensors
-
-            new_consumers = []
-            new_ctensors = []
-
-            for consumer, tensor in zip(consumers, ctensors):
-                if consumer not in per_device_segs:
-                    new_consumers.append(consumer)
-                    new_ctensors.append(tensor)
-                    continue
-                tensor_index_in_seg_input = None
-                for idx, seg_input in enumerate(consumer.inputs()):
-                    if seg_input.parent == tensor.parent:
-                        tensor_index_in_seg_input = idx
-                        break
-                if tensor_index_in_seg_input is None:
-                    new_consumers.append(consumer)
-                    new_ctensors.append(tensor)
-                    continue
-                for per_dev_input in per_device_segs[consumer][0].values():
-                    new_consumers.append(consumer)
-                    new_ctensors.append(per_dev_input[tensor_index_in_seg_input])
-            return new_consumers, new_ctensors
-
-        def is_partitioned_segment_input(segment: IRSegment, tensor: IRFullTensor) -> bool:
-            """
-            Check if the tensor is a partitioned input of a segment.
-            """
-            tensor_index_in_seg_input = None
-            for idx, seg_input in enumerate(segment.inputs()):
-                if isinstance(seg_input, IRObject) and seg_input.parent == tensor.parent:
-                    tensor_index_in_seg_input = idx
-                    break
-            else:
-                return False
-
-            per_dev_inputs = [
-                per_dev_input[tensor_index_in_seg_input]
-                for per_dev_input in per_device_segs[segment][0].values()
-            ]
-            return len(set(per_dev_inputs)) > 1
-
-        def is_partitioned_segment_output(segment: IRSegment, tensor: IRFullTensor) -> bool:
-            """
-            Check if the tensor is a partitioned output of a segment.
-            """
-            tensor_index_in_seg_output = None
-            for idx, seg_output in enumerate(segment.outputs()):
-                if isinstance(seg_output, IRObject) and seg_output.parent == tensor.parent:
-                    tensor_index_in_seg_output = idx
-                    break
-            else:
-                return False
-
-            per_dev_outputs = [
-                per_dev_output[tensor_index_in_seg_output]
-                for per_dev_output in per_device_segs[segment][1].values()
-            ]
-            return len(set(per_dev_outputs)) > 1
-
 
         # generate adapter for intra-segments
         # FIXME: assume producers and consumers can run in parallel
         _cnt = 0
         for ftensor in ftensors:
-            if not isinstance(graph, IRGraph) and (
-                is_partitioned_segment_input(graph, ftensor) or
-                is_partitioned_segment_output(graph, ftensor)
-            ):
+            if not is_graph and expander.is_partitioned_segment_io(ftensor):
                 # if the tensor is already partitioned on segment input or output,
                 # we can skip generating adapter for it
                 # because the segment-level gen_activation will generate adapter for it
@@ -951,16 +834,17 @@ class IRAdapterGener:
             if ftensor in input_producer:
                 fptensors = fptensors + tuple(fop.output(0) for fop in input_producer[ftensor])
                 fproducers = fproducers + tuple(input_producer[ftensor])
-            # abandon the producer as it is not used
-            _, fptensors = _adjust_producer_for_per_device_seg(fproducers, fptensors)
+            if is_graph:
+                _, fptensors = expander.adjust_producer_for_per_device_seg(fproducers, fptensors)
             fptensors = expand_devices(fptensors, producer=True)
             assert all(len(ptensor.device) == 1 for ptensor in fptensors), "Not support for multi-device"
 
             # consumers can be operators and graph outputs
             fconsumers, fctensors = graph.consumers(ftensor), graph.ctensors(ftensor)
-            # abandon the consumer to avoid graph.multi_index() error
-            # because the consumers are virtual segments and not in the graph's node list
-            _, fctensors = _adjust_consumer_for_per_device_seg(fconsumers, fctensors)
+            if is_graph:
+                # abandon the consumer to avoid graph.multi_index() error
+                # because the consumers are expanded segments and not in the graph's node list
+                _, fctensors = expander.adjust_consumer_for_per_device_seg(fconsumers, fctensors)
             fctensors = expand_devices(fctensors, consumer=True)
             assert all(len(ctensor.device) == 1 for ctensor in fctensors), "Not support for multi-device"
 
@@ -968,16 +852,17 @@ class IRAdapterGener:
             bconsumers, bctensors = [], []
             if isinstance(ftensor.grad, IRFullTensor):
                 bproducers, bptensors = bgraph.producers(ftensor.grad), bgraph.ptensors(ftensor.grad)
-                # abandon the producer to avoid graph.multi_index() error
-                _, bptensors = _adjust_producer_for_per_device_seg(bproducers, bptensors)
+                if is_graph:
+                    # abandon the producer to avoid graph.multi_index() error
+                    _, bptensors = expander.adjust_producer_for_per_device_seg(bproducers, bptensors)
                 bptensors = expand_devices(bptensors, producer=True)
 
                 bconsumers, bctensors = bgraph.consumers(ftensor.grad), bgraph.ctensors(ftensor.grad)
                 if ftensor in input_producer:
                     bctensors = bctensors + tuple(fwop.output(0).grad for fwop in input_producer[ftensor])
                     bconsumers = bconsumers + tuple(input_producer[ftensor])
-                # abandon the consumer as it is not used
-                _, bctensors = _adjust_consumer_for_per_device_seg(bconsumers, bctensors)
+                if is_graph:
+                    _, bctensors = expander.adjust_consumer_for_per_device_seg(bconsumers, bctensors)
                 bctensors = expand_devices(bctensors, consumer=True)
                 assert all(len(ctensor.device) == 1 for ctensor in bctensors), "Not support for multi-device"
 

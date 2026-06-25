@@ -1072,20 +1072,6 @@ class IR:
         return irobj_path
 
     @classmethod
-    def find_object_by_parent(cls, val: IRObject, parent: IRObject) -> List[IRObject]:
-        """
-        Find all IRObjects that have the given IRObject as their parent
-
-        Args:
-            val (IRObject): the complex data structure to search
-            parent (IRObject): the parent IRObject to match
-
-        Return:
-            List[IRObject]: all IRObjects that have the given IRObject as their parent
-        """
-        return [obj for obj in cls.get_objects(val) if obj.parent == parent.parent]
-
-    @classmethod
     def contains_object(cls, val: Any, condition: Optional[Callable[[IRObject], bool]]=None) -> bool:
         """
         Check if there is any IRObject in the complex data structure that satisfies the condition
@@ -1142,17 +1128,17 @@ class IR:
         return IRCell.modify_objects_of_complex(val, modifier)
 
     @classmethod
-    def modify_objects_inplace(cls, val: Any, modifier: Callable[['IRObject'], None]):
-        """Modify a complex data structure inplace
+    def modify_objects_inplace(cls, val: Any, modifier: Callable[['IRObject'], None]) -> Any:
+        """Modify a complex data structure inplace.
 
         Supported complex of types: List, Tuple, Dict, Slice, IRTensor, IRObject
 
         Args:
             val (Any): the complex data structure to be modified
-            modifier (Callable): a modifier that takes an IRObject and return nothing.
+            modifier (Callable): a modifier that takes an IRObject and returns nothing.
 
-        Return:
-            None
+        Returns:
+            The input val (for chaining convenience).
         """
         rcall = cls.modify_objects_inplace
         if isinstance(val, (list, tuple)):
@@ -1216,29 +1202,46 @@ class IR:
 
     @classmethod
     def set_object_device(cls, val: Any, device: Union[int, List[int]]) -> Any:
-        """
-        Modify the device of the IRObject in the complex data structure inplace.
+        """Set the device of IRObjects in a (possibly complex) data structure.
 
-        Supported complex of types: List, Tuple, Dict, Slice
+        Creates a lightweight dummy cell to hold the device assignment,
+        since device is a property of IRCell, not IRObject directly.
 
         Args:
-            val (Any): the complex data structure to be modified
-            device (Union[int, List[int]]): the device to set
+            val: an IRObject or complex structure containing IRObjects
+            device: the device id(s) to assign
 
-        Return:
-            new_val (Any): complex data structure with modified IRObjects
+        Returns:
+            The same val (modified in-place).
         """
-        def modifier(obj: IRObject)-> IRObject:
-            # create a dummy cell for device assignment.
-            # because we can't assign device attribute to an IRObject.
+        def modifier(obj: IRObject) -> None:
             obj.cell = IRCell(
-                name=f'{obj.name}_modified_device',
+                name='_dev_holder',
                 signature='dummy',
                 input_length=1, output_length=1
             )
             obj.cell.device = device
 
         return cls.modify_objects_inplace(val, modifier)
+
+    @classmethod
+    def index_with_same_parent(cls, tensor: IRObject, tensors: List[IRObject]) -> Optional[int]:
+        """
+        Find the index of a tensor in a list of tensors that shares the same parent.
+
+        Args:
+            tensor (IRObject): The tensor to find.
+            tensors (List[IRObject]): The list of tensors to search.
+
+        Returns:
+            Optional[int]: The index of the tensor with the same parent, or None if not found.
+        """
+        tensor_index_in_seg_output = None
+        for idx, seg_output in enumerate(tensors):
+            if seg_output.parent == tensor.parent:
+                tensor_index_in_seg_output = idx
+                break
+        return tensor_index_in_seg_output
 
 
 class IRTensor(IRObject):

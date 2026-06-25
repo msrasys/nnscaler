@@ -95,9 +95,8 @@ class IRSegment(IRCell):
         self._ptensors: Dict[IRFullTensor, List[IRSubTensor]] = dict()
         self._ctensors: Dict[IRFullTensor, List[IRSubTensor]] = dict()
 
-        self._per_device_input: Dict[int, List[IRObject]] = dict()
-        self._per_device_output: Dict[int, List[IRObject]] = dict()
-        self._per_device_seg: Optional[IRSegment] = None
+        # will be assigned by IRSegmentExpander when building io
+        self._expander: Optional[IRSegmentExpander] = None
 
         # attributes
         self._attributes: Set[IRFullTensor] = set()
@@ -157,6 +156,14 @@ class IRSegment(IRCell):
         @return ftensors List[IRFullTensor]
         """
         return tuple(self._attributes)
+
+    @property
+    def expander(self) -> 'IRSegmentExpander':
+        return self._expander
+
+    @expander.setter
+    def expander(self, expander: 'IRSegmentExpander'):
+        self._expander = expander
 
     # ========================= Basic Graph access =======================
 
@@ -1187,7 +1194,204 @@ class IRSegment(IRCell):
         segment = IRSegment(nodes, order(inputs), order(outputs))
         return segment
 
-    def get_per_device_inout(self, dataloader_outputs: Optional[Set[IRObject]] = None):
+    def dispatch(self, devid: int, _gen_mirror: bool = True) -> Optional[IRCell]:
+        """
+        Instantiate the segment to a specific device.
+
+        Args:
+            devid (int): the target device
+            _gen_mirror (bool): whether to generate the mirror segment. Default True.
+
+        Returns:
+            Optional[IRCell]: the instantiated segment, or None if the device is not in the segment.
+        """
+        if devid not in self.device:
+            return None
+        if devid in self._dispatch_cached:
+            return self._dispatch_cached[devid]
+
+        segment = self.expander.dispatch(devid, _gen_mirror=_gen_mirror)
+        self._dispatch_cached[devid] = segment
+        return segment
+
+    # ========================== Graph Visualize ================================
+
+    def __repr__(self):
+        fw = 'f' if self.isfw() else 'b'
+        inputs = tuple(t for t in self.inputs() if isinstance(t, IRObject) and not t.is_attr())
+        if self.isfw():
+            dscp = f"{fw}Graph{self.cid}-{self.device}(inputs={inputs}, outputs={self.outputs()})"
+        else:
+            dscp = f"{fw}Graph{self.cid}-{self.device}(fGraph{self.mirror.cid}, inputs={inputs}, outputs={self.outputs()})"
+        return dscp
+
+    def extra_repr(self) -> str:
+        dscp = f"\n{self.name}:\n{'=' * len(self.name)}\n"
+        # inputs
+        dscp += f"Inputs: {self.inputs()}\n"
+        for node in self._nodes:
+            dscp += f"\n{node}"
+            if isinstance(node, IRSegment):
+                for subnode in node.nodes():
+                    dscp += f"\n\t{subnode}"
+        # outputs
+        dscp += f"\nOutputs: {self.outputs()}\n{'=' * len(self.name)}\n"
+        return dscp
+
+
+class IRSegmentExpander:
+    def __init__(self, segment: IRSegment, dataloader_outputs: Set[IRObject]):
+        if type(segment) is not IRSegment:
+            raise ValueError("IRSegmentExpander can only be created from an IRSegment")
+
+        self._segment = segment
+        self._segment.expander = self
+        self._dataloader_outputs = dataloader_outputs
+        self._per_device_input: Dict[int, List[IRObject]] = dict()
+        self._per_device_output: Dict[int, List[IRObject]] = dict()
+        self._expanded_seg: Optional[IRSegment] = None
+
+    def build_io(self):
+        """
+        Call this when gen_activation is called for the whole graph.
+        This will generate the per-device inputs and outputs for the expanded segment.
+        """
+        self.get_per_device_inout()
+
+    def build_expanded_segment(self):
+        """
+        Call this when gen_activation is called for self._segment.
+        This will generate the expanded segment.
+        """
+        self.get_expanded_segment()
+
+    @property
+    def per_device_inputs(self):
+        device_input_map, _ = self.get_per_device_inout()
+        return device_input_map
+
+    @property
+    def per_device_outputs(self):
+        _, device_output_map = self.get_per_device_inout()
+        return device_output_map
+
+    @property
+    def segment(self):
+        return self._segment
+
+    @property
+    def expanded_segment(self):
+        return self.get_expanded_segment()
+
+    def _try_narrow_segment_ctensors(self, ftensor: IRFullTensor) -> Optional[Dict[int, IRSubTensor]]:
+        """Check if a segment's consumption of a full tensor can be narrowed to per-device partitions.
+
+        When all internal consumers on each device use the same partition (non-overlapping,
+        non-replicated), we can use the per-device internal ctensors directly instead of
+        the full-shape segment input tensor. This enables more efficient adapter generation
+        at the graph level (e.g., P2P instead of AllGather).
+
+        After autoref, identity nodes may consume the full tensor at the segment boundary.
+        This function traces through such pass-through nodes to find the actual compute
+        consumption patterns.
+
+        Args:
+            segment: the consuming segment
+            ftensor: the full tensor consumed by the segment
+
+        Returns:
+            A dict mapping device ID to the unique partition sub-tensor consumed on that device,
+            or None if the segment cannot be narrowed.
+        """
+        if ftensor in self._dataloader_outputs:
+            # If the full tensor is an output of the dataloader, we don't narrow it.
+            return None
+
+        from nnscaler.runtime.function.function import identity as _identity_fn
+        original_ftensor = ftensor
+        # Trace through identity nodes to find the actual consumption pattern.
+        consumers = self._segment.consumers(ftensor)
+        assert all(len(consumer.device) == 1 for consumer in consumers), "Not support for multi-device"
+        if all(consumer.fn == _identity_fn for consumer in consumers) \
+            and len(set(consumer.device[0] for consumer in consumers)) == len(consumers):
+            ftensor = consumers[0].oobjs()[0].parent
+            consumers = self._segment.consumers(ftensor)
+
+        ctensors = self._segment.ctensors(ftensor)
+        # tensor can be passed through without any internal consumption,
+        # e.g., output of segment.
+        if not ctensors:
+            return None
+
+        full_indmap = tuple((0, s) for s in ftensor.shape)
+        if any(ct.indmap == full_indmap for ct in ctensors):
+            # Some ops directly consume the full tensor — can't narrow
+            return None
+
+        # Group ctensors by device
+        dev_partitions: Dict[int, List[IRSubTensor]] = {}
+        for ct in ctensors:
+            for devid in ct.device:
+                new_ct = original_ftensor.select(ct.indmap, ct.valmap)  # Use the original full tensor for device mapping
+                IR.set_object_device(new_ct, devid)
+                if ct.grad is not None:
+                    new_ct.grad = original_ftensor.grad.select(ct.grad.indmap, ct.grad.valmap)
+                    IR.set_object_device(new_ct.grad, devid)
+                dev_partitions.setdefault(devid, []).append(new_ct)
+
+        # Check: each device uses exactly one unique partition (by indmap)
+        dev_unique: Dict[int, IRSubTensor] = {}
+        for dev, cts in dev_partitions.items():
+            unique_indmaps = set(ct.indmap for ct in cts)
+            if len(unique_indmaps) != 1:
+                return None
+            dev_unique[dev] = cts[0]
+
+        partitions = list(dev_unique.values())
+
+        # Check: partitions don't overlap
+        for i, t1 in enumerate(partitions):
+            for t2 in partitions[i+1:]:
+                if t1 != t2 and t1.overlap(t2):
+                    return None
+
+        return dev_unique
+
+    def _try_narrow_segment_ptensors(self, ftensor: IRFullTensor) -> Optional[Dict[int,IRSubTensor]]:
+        """Check if a segment's production of a full tensor can be narrowed to per-device partitions.
+
+        Similar to _try_narrow_segment_ctensors but for producers (used for backward segment outputs).
+        """
+        ptensors = self._segment.ptensors(ftensor)
+        # pass through without any internal production, e.g., input of segment.
+        # Here we treat Identity as a normal operator, and we don't trace through it to find the actual production pattern.
+        if not ptensors:
+            return None
+
+        dev_partitions: Dict[int, List[IRSubTensor]] = {}
+        for pt in ptensors:
+            for devid in pt.device:
+                dev_partitions.setdefault(devid, []).append(pt)
+
+        if not dev_partitions:
+            return None
+
+        dev_unique: Dict[int, IRSubTensor] = {}
+        for dev, pts in dev_partitions.items():
+            unique_indmaps = set(pt.indmap for pt in pts)
+            if len(unique_indmaps) != 1:
+                return None
+            dev_unique[dev] = pts[0]
+
+        partitions = list(dev_unique.values())
+        for i, t1 in enumerate(partitions):
+            for t2 in partitions[i+1:]:
+                if t1 != t2 and t1.overlap(t2):
+                    return None
+
+        return dev_unique
+
+    def get_per_device_inout(self):
         """
         Must call this function after the graph is partitioned
         but before local multirefs and adapters are generated.
@@ -1196,128 +1400,18 @@ class IRSegment(IRCell):
         if self._per_device_input:
             return self._per_device_input, self._per_device_output
 
-        dataloader_outputs = dataloader_outputs or set()
-
-        devices = self.device
+        devices = self._segment.device
         for dev in devices:
             self._per_device_input[dev] = []
             self._per_device_output[dev] = []
 
-        segment = self
+        segment = self._segment
         if not isinstance(segment, IRSegment):
             raise ValueError("collect_device_inout_map should be called on an IRSegment")
 
-        def _try_narrow_segment_ctensors(ftensor: IRFullTensor) -> Optional[Dict[int, IRSubTensor]]:
-            """Check if a segment's consumption of a full tensor can be narrowed to per-device partitions.
-
-            When all internal consumers on each device use the same partition (non-overlapping,
-            non-replicated), we can use the per-device internal ctensors directly instead of
-            the full-shape segment input tensor. This enables more efficient adapter generation
-            at the graph level (e.g., P2P instead of AllGather).
-
-            After autoref, identity nodes may consume the full tensor at the segment boundary.
-            This function traces through such pass-through nodes to find the actual compute
-            consumption patterns.
-
-            Args:
-                segment: the consuming segment
-                ftensor: the full tensor consumed by the segment
-
-            Returns:
-                A dict mapping device ID to the unique partition sub-tensor consumed on that device,
-                or None if the segment cannot be narrowed.
-            """
-            if ftensor in dataloader_outputs:
-                # If the full tensor is an output of the dataloader, we don't narrow it.
-                return None
-
-            from nnscaler.runtime.function.function import identity as _identity_fn
-            original_ftensor = ftensor
-            # Trace through identity nodes to find the actual consumption pattern.
-            consumers = segment.consumers(ftensor)
-            assert all(len(consumer.device) == 1 for consumer in consumers), "Not support for multi-device"
-            if all(consumer.fn == _identity_fn for consumer in consumers) \
-                and len(set(consumer.device[0] for consumer in consumers)) == len(consumers):
-                ftensor = consumers[0].oobjs()[0].parent
-                consumers = segment.consumers(ftensor)
-
-            ctensors = segment.ctensors(ftensor)
-            # tensor can be passed through without any internal consumption,
-            # e.g., output of segment.
-            if not ctensors:
-                return None
-
-            full_indmap = tuple((0, s) for s in ftensor.shape)
-            if any(ct.indmap == full_indmap for ct in ctensors):
-                # Some ops directly consume the full tensor — can't narrow
-                return None
-
-            # Group ctensors by device
-            dev_partitions: Dict[int, List[IRSubTensor]] = {}
-            for ct in ctensors:
-                for devid in ct.device:
-                    new_ct = original_ftensor.select(ct.indmap, ct.valmap)  # Use the original full tensor for device mapping
-                    IR.set_object_device(new_ct, devid)
-                    if ct.grad is not None:
-                        new_ct.grad = original_ftensor.grad.select(ct.grad.indmap, ct.grad.valmap)
-                        IR.set_object_device(new_ct.grad, devid)
-                    dev_partitions.setdefault(devid, []).append(new_ct)
-
-            # Check: each device uses exactly one unique partition (by indmap)
-            dev_unique: Dict[int, IRSubTensor] = {}
-            for dev, cts in dev_partitions.items():
-                unique_indmaps = set(ct.indmap for ct in cts)
-                if len(unique_indmaps) != 1:
-                    return None
-                dev_unique[dev] = cts[0]
-
-            partitions = list(dev_unique.values())
-
-            # Check: partitions don't overlap
-            for i, t1 in enumerate(partitions):
-                for t2 in partitions[i+1:]:
-                    if t1 != t2 and t1.overlap(t2):
-                        return None
-
-            return dev_unique
-
-        def _try_narrow_segment_ptensors(ftensor: IRFullTensor) -> Optional[Dict[int,IRSubTensor]]:
-            """Check if a segment's production of a full tensor can be narrowed to per-device partitions.
-
-            Similar to _try_narrow_segment_ctensors but for producers (used for backward segment outputs).
-            """
-            ptensors = segment.ptensors(ftensor)
-            # pass through without any internal production, e.g., input of segment.
-            # Here we treat Identity as a normal operator, and we don't trace through it to find the actual production pattern.
-            if not ptensors:
-                return None
-
-            dev_partitions: Dict[int, List[IRSubTensor]] = {}
-            for pt in ptensors:
-                for devid in pt.device:
-                    dev_partitions.setdefault(devid, []).append(pt)
-
-            if not dev_partitions:
-                return None
-
-            dev_unique: Dict[int, IRSubTensor] = {}
-            for dev, pts in dev_partitions.items():
-                unique_indmaps = set(pt.indmap for pt in pts)
-                if len(unique_indmaps) != 1:
-                    return None
-                dev_unique[dev] = pts[0]
-
-            partitions = list(dev_unique.values())
-            for i, t1 in enumerate(partitions):
-                for t2 in partitions[i+1:]:
-                    if t1 != t2 and t1.overlap(t2):
-                        return None
-
-            return dev_unique
-
-        for t in self._inputs:
+        for t in segment._inputs:
             if isinstance(t, IRSubTensor) and (
-                dev_unique := _try_narrow_segment_ctensors(t.parent)
+                dev_unique := self._try_narrow_segment_ctensors(t.parent)
             ) is not None:
                 assert set(dev_unique.keys()) == set(devices), "Narrowing should preserve the device set"
                 for dev, sub_tensor in dev_unique.items():
@@ -1326,9 +1420,9 @@ class IRSegment(IRCell):
                 for dev in devices:
                     self._per_device_input[dev].append(IR.set_object_device(t, dev))
 
-        for t in self._outputs:
+        for t in segment._outputs:
             if isinstance(t, IRSubTensor) and (
-                dev_unique := _try_narrow_segment_ptensors(t.parent)
+                dev_unique := self._try_narrow_segment_ptensors(t.parent)
             ) is not None:
                 assert set(dev_unique.keys()) == set(devices), "Narrowing should preserve the device set"
                 for dev, sub_tensor in dev_unique.items():
@@ -1361,11 +1455,11 @@ class IRSegment(IRCell):
                 return None
 
         for node in nodes:
-            if (self.isfw()
+            if (self._segment.isfw()
                 and node.fn == _identity_fn
                 and isinstance(node.input(0), IRSubTensor)
                 and (per_device_input := _find_per_device_partitioned_input(
-                    node.input(0), self.inputs(), node.device[0], device_input_map)
+                    node.input(0), self._segment.inputs(), node.device[0], device_input_map)
                 )
             ):
                 # input of segment is not shared with other nodes
@@ -1373,68 +1467,89 @@ class IRSegment(IRCell):
                 assert per_device_input.valmap == (0, 1)
                 new_node = Identity(per_device_input)
                 new_node.device = node.device
-                new_node.comment = f"segment dispatch: fix identity for device"
+                new_node.comment = f"created at: segment dispatch: fix identity"
                 new_node.set_output(0, node.output(0).parent.select(per_device_input.indmap, per_device_input.valmap))
                 if node.output(0).grad is not None:
                     new_node.output(0).grad = node.output(0).grad.parent.select(per_device_input.indmap, (0, 1))
-                new_bwnode = self.create_bwop(new_node)
+                new_bwnode = self._segment.create_bwop(new_node)
                 new_bwnode.device = node.device
                 replaced_nodes[node] = new_node
                 replaced_nodes[node.mirror] = new_bwnode
                 yield new_node
-            elif not self.isfw() and node in replaced_nodes:
+            elif not self._segment.isfw() and node in replaced_nodes:
                 # for backward segment, if the mirror node in forward segment is fixed,
                 # we also need to fix it
                 yield replaced_nodes[node]
             else:
                 yield node
 
-    @property
-    def per_device_inputs(self):
-        device_input_map, _ = self.get_per_device_inout()
-        return device_input_map
-
-    @property
-    def per_device_outputs(self):
-        _, device_output_map = self.get_per_device_inout()
-        return device_output_map
-
-    def get_per_device_segment(self, replaced_nodes: Dict[IRFwOperation, IRFwOperation] = None):
+    def get_expanded_segment(self, replaced_nodes: Dict[IRFwOperation, IRFwOperation] = None):
         """
         Virtual segment for communication generation.
-        The segment is not materialized in the graph
         """
         replaced_nodes = replaced_nodes or {}
-        if not self._per_device_seg:
-            self._per_device_seg = IRSegment(
-                list(self._fix_per_device_identity(self._nodes, self.per_device_inputs, replaced_nodes)),
-                self.inputs(), self.outputs(), self.name
+        if not self._expanded_seg:
+            self._expanded_seg = IRSegment(
+                list(self._fix_per_device_identity(self._segment._nodes, self.per_device_inputs, replaced_nodes)),
+                self._segment.inputs(), self._segment.outputs(), self._segment.name
             )
-            self._per_device_seg._id = self.cid
-            if self.isfw() and self.mirror is not None:
-                per_device_seg_mirror = self.mirror.get_per_device_segment(replaced_nodes)
-                IRSegment.make_pair(self._per_device_seg, per_device_seg_mirror)
-        return self._per_device_seg
+            self._expanded_seg._id = self._segment.cid
+            if self._segment.isfw() and self._segment.mirror is not None:
+                expanded_mirror_seg = self._segment.mirror.expander.get_expanded_segment(replaced_nodes)
+                IRSegment.make_pair(self._expanded_seg, expanded_mirror_seg)
+        return self._expanded_seg
 
-    def dispatch(self, devid: int, _gen_mirror: bool = True) -> Optional[IRCell]:
+
+    def is_partitioned_segment_input(self, tensor: IRFullTensor) -> bool:
+        """
+        Check if the tensor is a partitioned input of the segment.
+        """
+        tensor_index_in_seg_input = IR.index_with_same_parent(tensor, self._segment.inputs())
+        if tensor_index_in_seg_input is None:
+            return False
+
+        per_dev_inputs = [
+            per_dev_input[tensor_index_in_seg_input]
+            for per_dev_input in self.per_device_inputs.values()
+        ]
+        return len(set(per_dev_inputs)) > 1
+
+    def is_partitioned_segment_output(self, tensor: IRFullTensor) -> bool:
+        """
+        Check if the tensor is a partitioned output of the segment.
+        """
+        tensor_index_in_seg_output = IR.index_with_same_parent(tensor, self._segment.outputs())
+        if tensor_index_in_seg_output is None:
+            return False
+
+        per_dev_outputs = [
+            per_dev_output[tensor_index_in_seg_output]
+            for per_dev_output in self.per_device_outputs.values()
+        ]
+        return len(set(per_dev_outputs)) > 1
+
+    def is_partitioned_segment_io(self, tensor: IRFullTensor) -> bool:
+        """
+        Check if the tensor is a partitioned input or output of the segment.
+        """
+        return self.is_partitioned_segment_input(tensor) or self.is_partitioned_segment_output(tensor)
+
+    def dispatch(self, devid: int, _gen_mirror: bool = True) -> IRSegment:
         """
         Instantiate the segment to a specific device.
 
-        @param devid int: the target device
+        Args:
+            devid (int): the target device
+            _gen_mirror (bool): whether to generate the mirror segment for backward pass
 
-        @return segment IRSegment: the instantiated segment
+        Returns:
+            segment (IRSegment): the instantiated segment
         """
-        if devid not in self.device:
-            return None
-        if len(self.device) == 1 and self.device == [devid]:
-            return self
-        if devid in self._dispatch_cached:
-            return self._dispatch_cached[devid]
-
+        seg = self._segment
         per_device_input_map, per_device_output_map = self.get_per_device_inout()
-        per_device_segment = self.get_per_device_segment()
+        expanded_segment = self.get_expanded_segment()
         inputs, outputs, nodes = per_device_input_map[devid], per_device_output_map[devid], []
-        for node in per_device_segment._nodes:
+        for node in expanded_segment._nodes:
             if devid in node.device:
                 nodes.append(node.dispatch(devid))
 
@@ -1445,43 +1560,16 @@ class IRSegment(IRCell):
             indices = np.argsort(tids)
             return tuple(tensors[idx] for idx in indices)
 
-        if self.isfw():
+        if seg.isfw():
             inputs, outputs = order(inputs), order(outputs)
 
-        segment = IRSegment(nodes, inputs, outputs, self.name)
-        segment._id = self.cid
-        segment.op_context = self.op_context
-        segment.pre_hook = self.pre_hook
-        segment.post_hook = self.post_hook
-        segment.hook_meta = self.hook_meta
-        if _gen_mirror and self.mirror is not None:
-            msegment = self.mirror.dispatch(devid, _gen_mirror=False)
+        segment = IRSegment(nodes, inputs, outputs, seg.name)
+        segment._id = seg.cid
+        segment.op_context = seg.op_context
+        segment.pre_hook = seg.pre_hook
+        segment.post_hook = seg.post_hook
+        segment.hook_meta = seg.hook_meta
+        if _gen_mirror and seg.mirror is not None:
+            msegment = seg.mirror.expander.dispatch(devid, _gen_mirror=False)
             IRCell.make_pair(segment, msegment)
-        self._dispatch_cached[devid] = segment
         return segment
-
-
-    # ========================== Graph Visualize ================================
-
-    def __repr__(self):
-        fw = 'f' if self.isfw() else 'b'
-        inputs = tuple(t for t in self.inputs() if isinstance(t, IRObject) and not t.is_attr())
-        if self.isfw():
-            dscp = f"{fw}Graph{self.cid}-{self.device}(inputs={inputs}, outputs={self.outputs()})"
-        else:
-            dscp = f"{fw}Graph{self.cid}-{self.device}(fGraph{self.mirror.cid}, inputs={inputs}, outputs={self.outputs()})"
-        return dscp
-
-    def extra_repr(self) -> str:
-        dscp = f"\n{self.name}:\n{'=' * len(self.name)}\n"
-        # inputs
-        dscp += f"Inputs: {self.inputs()}\n"
-        for node in self._nodes:
-            dscp += f"\n{node}"
-            if isinstance(node, IRSegment):
-                for subnode in node.nodes():
-                    dscp += f"\n\t{subnode}"
-        # outputs
-        dscp += f"\nOutputs: {self.outputs()}\n{'=' * len(self.name)}\n"
-        return dscp
-
