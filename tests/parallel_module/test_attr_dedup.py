@@ -16,7 +16,7 @@ from nnscaler.runtime.module import ParallelModule
 from nnscaler.graph.graph import IRGraph
 from nnscaler.ir.operator import IRFwOperation
 from nnscaler.policies import _tp, _replica
-from nnscaler.runtime.module import dedup_attrs
+from nnscaler.runtime.module import AttrMeta, dedup_attrs
 
 from .common import init_distributed, assert_equal
 from ..launch_torchrun import launch_torchrun
@@ -38,6 +38,31 @@ class Net(torch.nn.Module):
         x = self.fc3(x)
         x = self.buffer + x
         return x
+
+
+def test_dedup_attrs_supports_legacy_scalar_slicer():
+    legacy_scalar_meta = dict(
+        tid=0,
+        is_param=False,
+        orig_name='scale',
+        shape=(),
+        slicers='...',
+        val_chunks=1,
+        dtype=torch.float32,
+        sub_shape=(1,),
+    )
+    rank2attr_area_map = {
+        0: {'scalar_module': {'scale': AttrMeta(**legacy_scalar_meta)}},
+        1: {'scalar_module': {'scale': AttrMeta(**legacy_scalar_meta)}},
+    }
+
+    assert rank2attr_area_map[0]['scalar_module']['scale'].slicers == ()
+    assert rank2attr_area_map[0]['scalar_module']['scale'].sub_shape == ()
+
+    dedup_meta_info = dedup_attrs(rank2attr_area_map)
+
+    assert list(dedup_meta_info[0]['scalar_module'].keys()) == ['scale']
+    assert dedup_meta_info[1] == {}
 
 
 def pas(graph: IRGraph, config: ComputeConfig):

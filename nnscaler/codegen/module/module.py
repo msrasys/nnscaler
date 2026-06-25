@@ -756,7 +756,7 @@ class ModuleCodeGen(FuncEmission):
                         slicers = tuple(slice(start, stop) for (start, stop) in itensor.indmap)
                         if itensor.is_scalar_tensor():
                             assert len(slicers) == 1 and slicers[0] == slice(0, 1), f"Unexpected slicers {slicers} for scalar tensor."
-                            slicers = '...'  # Ellipsis slicer for scalar tensor, x[...] is equivalent to x
+                            slicers = ()
                         val_chunks = itensor.valmap[1]
                         attr_name = self.tensor_name(itensor)
                         attr_props = dict(
@@ -770,7 +770,7 @@ class ModuleCodeGen(FuncEmission):
                         attr_meta_map[attr_name] = dict(
                             **attr_props,
                             dtype=itensor.dtype,
-                            sub_shape=tuple(itensor.shape)
+                            sub_shape=tuple(itensor.origin_shape)
                         )
 
                         code = map_sign.format(

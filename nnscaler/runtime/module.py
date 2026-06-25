@@ -62,6 +62,20 @@ class AttrMeta:
     # it should be the shape of full_tensor[slicers]
     sub_shape: Tuple[int, ...]
 
+    def __post_init__(self):
+        self.shape = tuple(self.shape)
+        self.sub_shape = tuple(self.sub_shape)
+        if self.slicers is Ellipsis or self.slicers == '...':
+            if self.shape != ():
+                raise ValueError(f'Ellipsis slicer is only supported for scalar tensors, got shape {self.shape}')
+            self.slicers = ()
+        else:
+            self.slicers = tuple(self.slicers)
+            if self.shape == () and self.slicers == (slice(0, 1),):
+                self.slicers = ()
+        if self.shape == ():
+            self.sub_shape = ()
+
     def get_local_numel(self):
         return math.prod(self.sub_shape)
 
