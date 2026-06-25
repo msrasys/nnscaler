@@ -1241,13 +1241,14 @@ class IRSegment(IRCell):
 
 
 class IRSegmentExpander:
-    def __init__(self, segment: IRSegment, dataloader_outputs: Set[IRObject]):
+    def __init__(self, segment: IRSegment, dataloader_outputs: Set[IRObject], graph_outputs: Set[IRObject]):
         if type(segment) is not IRSegment:
             raise ValueError("IRSegmentExpander can only be created from an IRSegment")
 
         self._segment = segment
         self._segment.expander = self
         self._dataloader_outputs = dataloader_outputs
+        self._graph_outputs = graph_outputs
         self._per_device_input: Dict[int, List[IRObject]] = dict()
         self._per_device_output: Dict[int, List[IRObject]] = dict()
         self._expanded_seg: Optional[IRSegment] = None
@@ -1304,6 +1305,8 @@ class IRSegmentExpander:
             A dict mapping device ID to the unique partition sub-tensor consumed on that device,
             or None if the segment cannot be narrowed.
         """
+        assert self._segment.isfw(), "Only support forward segment"
+
         if ftensor in self._dataloader_outputs:
             # If the full tensor is an output of the dataloader, we don't narrow it.
             return None
@@ -1363,6 +1366,12 @@ class IRSegmentExpander:
 
         Similar to _try_narrow_segment_ctensors but for producers (used for backward segment outputs).
         """
+        assert self._segment.isfw(), "Only support forward segment"
+
+        if ftensor in self._graph_outputs:
+            # If the full tensor is an output of the graph, we don't narrow it.
+            return None
+
         ptensors = self._segment.ptensors(ftensor)
         # pass through without any internal production, e.g., input of segment.
         # Here we treat Identity as a normal operator, and we don't trace through it to find the actual production pattern.
@@ -1390,6 +1399,18 @@ class IRSegmentExpander:
                 if t1 != t2 and t1.overlap(t2):
                     return None
 
+        # If the produced full tensor is also consumed inside the same segment
+        # (e.g., `l.data` => getattr(l, 'data')), the internal consumer may need
+        # the merged/full value rather than the per-device partition. Narrowing
+        # the production would remove the full value from the segment, leaving
+        # the internal consumer with an undefined input. Only narrow when every
+        # internal consumer is satisfied by the partition produced on its device.
+        for ct in self._segment.ctensors(ftensor):
+            for devid in ct.device:
+                produced = dev_unique[devid]
+                if ct.indmap != produced.indmap:
+                    return None
+
         return dev_unique
 
     def get_per_device_inout(self):
@@ -1400,6 +1421,28 @@ class IRSegmentExpander:
         # per-device inputs/outputs
         if self._per_device_input:
             return self._per_device_input, self._per_device_output
+
+        if self._segment.isfw():
+            seg_fw, seg_bw = self._segment, self._segment.mirror
+        else:
+            seg_fw, seg_bw = self._segment.mirror, self._segment
+
+        seg_fw.expander._fw_get_per_device_inout()
+        for devid in self._per_device_input:
+            inputs = self._per_device_input[devid]
+            outputs = self._per_device_output[devid]
+            # get backward graph inputs
+            output_grads = [IR.copy_and_set_object_device(t.grad, devid) for t in outputs if isinstance(t, IRSubTensor) and t.grad is not None]
+            # get backward graph outputs
+            input_grads = [IR.copy_and_set_object_device(t.grad, devid) for t in inputs if isinstance(t, IRSubTensor) and t.grad is not None]
+
+            seg_bw.expander._per_device_input[devid] = output_grads
+            seg_bw.expander._per_device_output[devid] = input_grads
+
+        return self._per_device_input, self._per_device_output
+
+    def _fw_get_per_device_inout(self):
+        assert self._segment.isfw(), "Only support forward segment"
 
         devices = self._segment.device
         for dev in devices:
@@ -1419,7 +1462,7 @@ class IRSegmentExpander:
                     self._per_device_input[dev].append(IR.set_object_device(sub_tensor, dev))
             else:
                 for dev in devices:
-                    self._per_device_input[dev].append(IR.set_object_device(copy.copy(t), dev))
+                    self._per_device_input[dev].append(IR.copy_and_set_object_device(t, dev))
 
         for t in segment._outputs:
             if isinstance(t, IRSubTensor) and (
@@ -1430,7 +1473,7 @@ class IRSegmentExpander:
                     self._per_device_output[dev].append(IR.set_object_device(sub_tensor, dev))
             else:
                 for dev in devices:
-                    self._per_device_output[dev].append(IR.set_object_device(copy.copy(t), dev))
+                    self._per_device_output[dev].append(IR.copy_and_set_object_device(t, dev))
 
         return self._per_device_input, self._per_device_output
 
@@ -1553,16 +1596,6 @@ class IRSegmentExpander:
         for node in expanded_segment._nodes:
             if devid in node.device:
                 nodes.append(node.dispatch(devid))
-
-        def order(tensors: Set[IRObject]) -> Tuple[IRObject]:
-            """Reorder by logical tensor id. Temporally necessary for pipeline scheduling"""
-            tensors = list(tensors)
-            tids = np.array([t.parent.tid for t in tensors])
-            indices = np.argsort(tids)
-            return tuple(tensors[idx] for idx in indices)
-
-        if seg.isfw():
-            inputs, outputs = order(inputs), order(outputs)
 
         segment = IRSegment(nodes, inputs, outputs, seg.name)
         segment._id = seg.cid

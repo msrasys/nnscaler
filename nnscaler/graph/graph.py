@@ -1274,19 +1274,24 @@ class IRGraphExpander:
             IRSegment, Tuple[Dict[int, List[IRObject]], Dict[int, List[IRObject]]]
         ] = {}
         self.dataloader_outputs = set()
+        self.graph_outputs = set()
         self.io_built = False
 
     def build_io(self):
         for node in self._graph.nodes():
             if isinstance(node, IRDataOperation):
                 self.dataloader_outputs.update(obj.parent for obj in IR.get_objects(node.outputs()))
+        self.graph_outputs.update(obj.parent for obj in IR.get_objects(self._graph.outputs()))
 
         for node in self._graph.nodes():
             if isinstance(node, IRSegment):
-                segment_expander = IRSegmentExpander(node, self.dataloader_outputs)
-                segment_expander.build_io()
+                segment_expander = IRSegmentExpander(node, self.dataloader_outputs, self.graph_outputs)
                 self.segment_expanders[node] = segment_expander
-                self.per_device_ios[node] = segment_expander.get_per_device_inout()
+
+        for node, segment_expander in self.segment_expanders.items():
+            segment_expander.build_io()
+            self.per_device_ios[node] = segment_expander.get_per_device_inout()
+
         self.io_built = True
 
     def get_expanded_segment(self, segment: IRSegment) -> IRSegment:

@@ -1225,6 +1225,21 @@ class IR:
         return cls.modify_objects_inplace(val, modifier)
 
     @classmethod
+    def copy_and_set_object_device(cls, val: Any, device: Union[int, List[int]]) -> Any:
+        """Copy the IRObject and set the device of the copy.
+
+        Creates a lightweight dummy cell to hold the device assignment,
+        since device is a property of IRCell, not IRObject directly.
+
+        Args:
+            device: the device id(s) to assign
+
+        Returns:
+            A copy of val with the device set.
+        """
+        return cls.set_object_device(copy.copy(val), device)
+
+    @classmethod
     def index_with_same_parent(cls, tensor: IRObject, tensors: List[IRObject]) -> Optional[int]:
         """
         Find the index of a tensor in a list of tensors that shares the same parent.
