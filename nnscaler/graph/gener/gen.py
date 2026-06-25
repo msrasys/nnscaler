@@ -136,7 +136,7 @@ def _apply_producer_narrowing(
     return new_outputs
 
 
-def create_dummy(segment: IRSegment, inputs: bool = True, outputs: bool = True) -> List[IRFwOperation]:
+def create_dummy(segment: IRSegment, inputs: bool = True, outputs: bool = True):
     """
     Create dummy operators segment inputs and outputs.
 
@@ -737,31 +737,7 @@ class IRAdapterGener:
         return graph
 
     @staticmethod
-    def gen_activation(graph: IRSegment, allow_recompute: bool = True, cost_fn: Optional[Callable] = None) -> IRSegment:
-        """!
-        Generate adapter for activation tensors.
-        The forward/backward adapter is inserted before the first consumers of its full tensor.
-
-        Args:
-            graph (IRSegment): the graph the requires for adapter.
-            allow_recompute (bool): Allow adapter recomputes. If this enables, all adapters will be
-                set to the same recompute group with its consumed node.
-            cost_fn (Callable | None): takes an IRAdapterPrim and outputs a cost in float.
-                default to be None, which will use communication volume.
-
-        Returns:
-            graph (IRSegment): the (inplace) modified graph with activation adapters.
-        """
-        def skip(ptensors: List[IRSubTensor], ctensors: List[IRSubTensor]) -> bool:
-            # e.g., loss or parameter/buffer
-            if len(ptensors) == 0 or len(ctensors) == 0:
-                return True
-            # direct connection
-            for ctensor in ctensors:
-                if not any(t == ctensor and set(ctensor.device).issubset(set(t.device)) for t in ptensors):
-                    return False
-            return True
-
+    def _local_optimize(graph: IRSegment):
         # Here are two optimization passes that are applied before generating communication adapters:
         # - local producer fusion: If an operator is partitioned and there are multiple
         #   different sub-tensors on the same device, insert appropriate concat or accumulate
@@ -784,7 +760,6 @@ class IRAdapterGener:
         # plan of the input graph is SPMD, the local consumer multiref pass will ensure the number of
         # fptensors and bptensors is the same, which raise the possibility of generating high performance
         # collectives, like allgather, allreduce, etc.
-        ftensors = []
         _cnt = 0
         for ftensor in graph.full_tensors():
             # backward adapter will be generated along with the forward adapter
@@ -794,25 +769,66 @@ class IRAdapterGener:
             utils.flatten_grad(graph, ftensor)
             ftensor = IRAdapterGener.local_producer_fusion(graph, ftensor)
             IRAdapterGener.local_consumer_multiref(graph, ftensor)
-            ftensors.append(ftensor)
             _cnt = _cnt + 1
             if _cnt % 100 == 0:
                 _logger.info(f'processed local fusion & multiref for {_cnt} tensors')
-        _logger.info(f'finish local fusion & multiref for {_cnt} tensors')
 
+        _logger.info(f'finish local fusion & multiref for {_cnt} tensors')
         # reorder again since inserted multiref could be mis-ordered
         graph._reorder_producer_consumer()
         _logger.info("finish reordering producer and consumer")
 
+    @staticmethod
+    def gen_activation(graph: IRGraph, allow_recompute: bool = True, cost_fn: Optional[Callable] = None) -> IRSegment:
+        """
+        Generate adapter for activation tensors.
+        The forward/backward adapter is inserted before the first consumers of its full tensor.
+
+        Args:
+            graph (IRGraph): the graph the requires for adapter.
+            allow_recompute (bool): Allow adapter recomputes. If this enables, all adapters will be
+                set to the same recompute group with its consumed node.
+            cost_fn (Callable | None): takes an IRAdapterPrim and outputs a cost in float.
+                default to be None, which will use communication volume.
+
+        Returns:
+            graph (IRGraph): the (inplace) modified graph with activation adapters.
+        """
+        segments = [seg for seg in graph.nodes() if isinstance(seg, IRSegment) and seg.isfw()]
+
+        IRAdapterGener._local_optimize(graph)
+        for segment in segments:
+            IRAdapterGener._local_optimize(segment)
+
+        graph.expander.build_io()
+
+        IRAdapterGener._gen_activation(graph, allow_recompute=allow_recompute, cost_fn=cost_fn)
+        # generate adapter for each segment
+        for segment in segments:
+            IRAdapterGener._gen_activation(segment, allow_recompute=allow_recompute, cost_fn=cost_fn)
+
+        return graph
+
+    @staticmethod
+    def _gen_activation(graph: IRSegment, allow_recompute: bool = True, cost_fn: Optional[Callable] = None) -> IRSegment:
+        def skip(ptensors: List[IRSubTensor], ctensors: List[IRSubTensor]) -> bool:
+            # e.g., loss or parameter/buffer
+            if len(ptensors) == 0 or len(ctensors) == 0:
+                return True
+            # direct connection
+            for ctensor in ctensors:
+                if not any(t == ctensor and set(ctensor.device).issubset(set(t.device)) for t in ptensors):
+                    return False
+            return True
+
         is_graph = isinstance(graph, IRGraph)
         expander: Union[IRGraphExpander, IRSegmentExpander] = graph.expander
-        if is_graph:
-            expander.build_io()
-        else:
+        if not is_graph:
             graph = expander.get_expanded_segment()
 
         input_producer, output_consumer = create_dummy(graph, inputs=True, outputs=True)
         bgraph: Optional[IRSegment] = graph.mirror
+        ftensors = [t for t in graph.full_tensors() if not t.is_param() and not t.is_grad()]
 
         # generate adapter for intra-segments
         # FIXME: assume producers and consumers can run in parallel
@@ -820,10 +836,8 @@ class IRAdapterGener:
         for ftensor in ftensors:
             if not is_graph and expander.is_partitioned_segment_io(ftensor):
                 # if the tensor is already partitioned on segment input or output,
-                # we can skip generating adapter for it
-                # because the segment-level gen_activation will generate adapter for it
-                # if necessary, and the graph-level
-                # gen_activation doesn't need to generate redundant adapter for it.
+                # (which means in each device, only one partition is produced or consumed),
+                # then we can skip generating adapter for it
                 continue
             # debug
             # print(f'forward:\n{graph.debug_tensor_map_str(ftensor)}')
@@ -1077,11 +1091,6 @@ class IRAdapterGener:
 
             _obj_cnt += 1
         _logger.info(f'finish generating adapters for {_obj_cnt} non-tensor objects')
-
-        # generate adapter for each segment
-        segments = [seg for seg in graph.nodes() if isinstance(seg, IRSegment) and seg.isfw()]
-        for segment in segments:
-            IRAdapterGener.gen_activation(segment, allow_recompute=allow_recompute, cost_fn=cost_fn)
 
         return graph
 

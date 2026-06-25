@@ -5,6 +5,7 @@ from contextlib import contextmanager
 from typing import Dict, Union, List, Optional, Set, Tuple, Any, Callable
 import numpy as np
 import logging
+import copy
 
 from nnscaler.ir.tensor import IRFullTensor, IRSubTensor, ValueMap
 from nnscaler.ir.cten import IRTensor, IRCell, IRObject, IR
@@ -1418,7 +1419,7 @@ class IRSegmentExpander:
                     self._per_device_input[dev].append(IR.set_object_device(sub_tensor, dev))
             else:
                 for dev in devices:
-                    self._per_device_input[dev].append(IR.set_object_device(t, dev))
+                    self._per_device_input[dev].append(IR.set_object_device(copy.copy(t), dev))
 
         for t in segment._outputs:
             if isinstance(t, IRSubTensor) and (
@@ -1429,7 +1430,7 @@ class IRSegmentExpander:
                     self._per_device_output[dev].append(IR.set_object_device(sub_tensor, dev))
             else:
                 for dev in devices:
-                    self._per_device_output[dev].append(IR.set_object_device(t, dev))
+                    self._per_device_output[dev].append(IR.set_object_device(copy.copy(t), dev))
 
         return self._per_device_input, self._per_device_output
 
