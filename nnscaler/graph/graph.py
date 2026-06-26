@@ -47,7 +47,7 @@ class IRGraph(IRSegment):
         super().__init__(nodes, inputs, outputs, module_name)
 
         self._sched = None  # the schedule strategy
-        self._expander: IRGraphExpander = IRGraphExpander(self)
+        self._expander = None  # the graph expander
 
     @property
     def train(self) -> bool:
@@ -61,6 +61,10 @@ class IRGraph(IRSegment):
     @property
     def expander(self) -> 'IRGraphExpander':
         return self._expander
+
+    @expander.setter
+    def expander(self, expander: 'IRGraphExpander'):
+        self._expander = expander
 
     # ================ Deep Learning Interfalce ======================
 
@@ -1256,6 +1260,32 @@ class IRGraph(IRSegment):
         dest_node.pre_hook = src_node.pre_hook
         dest_node.post_hook = src_node.post_hook
 
+    # ================= Graph Expander ==================
+    def build_expander(self):
+        """
+        Build per-device input/output for each segment in the graph.
+        This is used to prepare for adapter generation.
+        """
+        if self.expander is not None:
+            return
+
+        self.expander = IRGraphExpander(self)
+        self.expander.build_io()
+
+    def expand(self):
+        self.expander.expand()
+
+    def is_partitioned_segment_io(self, tensor: IRFullTensor):
+        return False
+
+    def adjust_producer_for_per_device_seg(self, producers: List[IRCell], ptensors: List[IRSubTensor]):
+        assert self.expander is not None, "Please call build_expander() before adjusting producers for per-device segments"
+        return self.expander.adjust_producer_for_per_device_seg(producers, ptensors)
+
+    def adjust_consumer_for_per_device_seg(self, consumers: List[IRCell], ctensors: List[IRSubTensor]):
+        assert self.expander is not None, "Please call build_expander() before adjusting consumers for per-device segments"
+        return self.expander.adjust_consumer_for_per_device_seg(consumers, ctensors)
+
 
 class IRGraphExpander:
     def __init__(self, graph: IRGraph):
@@ -1263,13 +1293,6 @@ class IRGraphExpander:
             raise TypeError(f"Expect IRGraph but got: {type(graph)}")
 
         self._graph = graph
-        # collect device map for each segment to prepare for adapter generation
-        # key: segment,
-        # value: tuple of dict{device id -> list of input tensors},
-        #                 dict{device id -> list of output tensors}
-        self.segment_expanders: Dict[IRSegment, IRSegmentExpander] = {}
-        self.expanded_segments: Dict[IRSegment, IRSegment] = {}
-        self.reverse_expanded_segments: Dict[IRSegment, IRSegment] = {}
         self.per_device_ios: Dict[
             IRSegment, Tuple[Dict[int, List[IRObject]], Dict[int, List[IRObject]]]
         ] = {}
@@ -1278,39 +1301,27 @@ class IRGraphExpander:
         self.io_built = False
 
     def build_io(self):
+        if self.io_built:
+            return
+
         for node in self._graph.nodes():
             if isinstance(node, IRDataOperation):
                 self.dataloader_outputs.update(obj.parent for obj in IR.get_objects(node.outputs()))
         self.graph_outputs.update(obj.parent for obj in IR.get_objects(self._graph.outputs()))
 
         for node in self._graph.nodes():
-            if isinstance(node, IRSegment):
-                segment_expander = IRSegmentExpander(node, self.dataloader_outputs, self.graph_outputs)
-                self.segment_expanders[node] = segment_expander
-
-        for node, segment_expander in self.segment_expanders.items():
-            segment_expander.build_io()
-            self.per_device_ios[node] = segment_expander.get_per_device_inout()
+            if isinstance(node, IRSegment) and node.isfw():
+                node.build_expander(self.dataloader_outputs, self.graph_outputs)
+                self.per_device_ios[node] = node.expander.get_per_device_inout()
+                if node.mirror is not None:
+                    self.per_device_ios[node.mirror] = node.mirror.expander.get_per_device_inout()
 
         self.io_built = True
 
-    def get_expanded_segment(self, segment: IRSegment) -> IRSegment:
-        if segment not in self.segment_expanders:
-            raise ValueError(f"Segment {segment} is not in segment_expanders. Please call build_io() first.")
-        if segment not in self.expanded_segments:
-            expanded_segment = self.segment_expanders[segment].get_expanded_segment()
-            self.expanded_segments[segment] = expanded_segment
-            self.reverse_expanded_segments[expanded_segment] = segment
-            if segment.mirror is not None:
-                self.expanded_segments[segment.mirror] = expanded_segment.mirror
-                self.reverse_expanded_segments[expanded_segment.mirror] = segment.mirror
-
-        return self.expanded_segments[segment]
-
-    def get_original_segment(self, expanded_segment: IRSegment) -> IRSegment:
-        if expanded_segment not in self.reverse_expanded_segments:
-            raise ValueError(f"Expanded segment {expanded_segment} is not in reverse_expanded_segments. Please call get_expanded_segment() first.")
-        return self.reverse_expanded_segments[expanded_segment]
+    def expand(self):
+        for segment in self._graph.nodes():
+            if isinstance(segment, IRSegment) and segment.isfw():
+                segment.expand()
 
     def adjust_producer_for_per_device_seg(self, producers: List[IRCell], ptensors: List[IRSubTensor]):
         """

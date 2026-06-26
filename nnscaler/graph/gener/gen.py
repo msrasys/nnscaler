@@ -800,25 +800,12 @@ class IRAdapterGener:
         for segment in segments:
             IRAdapterGener._local_optimize(segment)
 
-        graph.expander.build_io()
+        graph.build_expander()
 
         IRAdapterGener._gen_activation(graph, allow_recompute=allow_recompute, cost_fn=cost_fn)
         # generate adapter for each segment
         for segment in segments:
             IRAdapterGener._gen_activation(segment, allow_recompute=allow_recompute, cost_fn=cost_fn)
-
-        # replace the segment with its expanded segment,
-        # and replace the mirror segment with its expanded mirror segment
-        for segment in segments:
-            expanded_seg = segment.expander.get_expanded_segment()
-            assert all(input == expand_input for input, expand_input in zip(segment.inputs(), expanded_seg.inputs()))
-            assert all(output == expand_output for output, expand_output in zip(segment.outputs(), expanded_seg.outputs()))
-            graph._nodes[graph._nodes.index(segment)] = expanded_seg
-            if segment.mirror is not None:
-                expanded_mirror_seg = segment.mirror.expander.get_expanded_segment()
-                assert all(input == expand_input for input, expand_input in zip(segment.mirror.inputs(), expanded_mirror_seg.inputs()))
-                assert all(output == expand_output for output, expand_output in zip(segment.mirror.outputs(),expanded_mirror_seg.outputs()))
-                graph._nodes[graph._nodes.index(segment.mirror)] = expanded_mirror_seg
 
         return graph
 
@@ -835,9 +822,8 @@ class IRAdapterGener:
             return True
 
         is_graph = isinstance(graph, IRGraph)
-        expander: Union[IRGraphExpander, IRSegmentExpander] = graph.expander
         if not is_graph:
-            graph = expander.get_expanded_segment()
+            graph.expand()
 
         input_producer, output_consumer = create_dummy(graph, inputs=True, outputs=True)
         bgraph: Optional[IRSegment] = graph.mirror
@@ -847,7 +833,7 @@ class IRAdapterGener:
         # FIXME: assume producers and consumers can run in parallel
         _cnt = 0
         for ftensor in ftensors:
-            if not is_graph and expander.is_partitioned_segment_io(ftensor):
+            if graph.is_partitioned_segment_io(ftensor):
                 # if the tensor is already partitioned on segment input or output,
                 # (which means in each device, only one partition is produced or consumed),
                 # then we can skip generating adapter for it
@@ -861,17 +847,13 @@ class IRAdapterGener:
             if ftensor in input_producer:
                 fptensors = fptensors + tuple(fop.output(0) for fop in input_producer[ftensor])
                 fproducers = fproducers + tuple(input_producer[ftensor])
-            if is_graph:
-                _, fptensors = expander.adjust_producer_for_per_device_seg(fproducers, fptensors)
+            _, fptensors = graph.adjust_producer_for_per_device_seg(fproducers, fptensors)
             fptensors = expand_devices(fptensors, producer=True)
             assert all(len(ptensor.device) == 1 for ptensor in fptensors), "Not support for multi-device"
 
             # consumers can be operators and graph outputs
             fconsumers, fctensors = graph.consumers(ftensor), graph.ctensors(ftensor)
-            if is_graph:
-                # abandon the consumer to avoid graph.multi_index() error
-                # because the consumers are expanded segments and not in the graph's node list
-                _, fctensors = expander.adjust_consumer_for_per_device_seg(fconsumers, fctensors)
+            _, fctensors = graph.adjust_consumer_for_per_device_seg(fconsumers, fctensors)
             fctensors = expand_devices(fctensors, consumer=True)
             assert all(len(ctensor.device) == 1 for ctensor in fctensors), "Not support for multi-device"
 
@@ -879,17 +861,14 @@ class IRAdapterGener:
             bconsumers, bctensors = [], []
             if isinstance(ftensor.grad, IRFullTensor):
                 bproducers, bptensors = bgraph.producers(ftensor.grad), bgraph.ptensors(ftensor.grad)
-                if is_graph:
-                    # abandon the producer to avoid graph.multi_index() error
-                    _, bptensors = expander.adjust_producer_for_per_device_seg(bproducers, bptensors)
+                _, bptensors = graph.adjust_producer_for_per_device_seg(bproducers, bptensors)
                 bptensors = expand_devices(bptensors, producer=True)
 
                 bconsumers, bctensors = bgraph.consumers(ftensor.grad), bgraph.ctensors(ftensor.grad)
                 if ftensor in input_producer:
                     bctensors = bctensors + tuple(fwop.output(0).grad for fwop in input_producer[ftensor])
                     bconsumers = bconsumers + tuple(input_producer[ftensor])
-                if is_graph:
-                    _, bctensors = expander.adjust_consumer_for_per_device_seg(bconsumers, bctensors)
+                _, bctensors = graph.adjust_consumer_for_per_device_seg(bconsumers, bctensors)
                 bctensors = expand_devices(bctensors, consumer=True)
                 assert all(len(ctensor.device) == 1 for ctensor in bctensors), "Not support for multi-device"
 

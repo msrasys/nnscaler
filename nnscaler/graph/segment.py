@@ -98,6 +98,8 @@ class IRSegment(IRCell):
 
         # will be assigned by IRSegmentExpander when building io
         self._expander: Optional[IRSegmentExpander] = None
+        # used to avoid multiple expansion of the same segment
+        self._expanded: bool = False
 
         # attributes
         self._attributes: Set[IRFullTensor] = set()
@@ -1239,6 +1241,35 @@ class IRSegment(IRCell):
         dscp += f"\nOutputs: {self.outputs()}\n{'=' * len(self.name)}\n"
         return dscp
 
+    # ========================= Expand ================================
+    def build_expander(self, dataloader_outputs: Set[IRObject], graph_outputs: Set[IRObject]):
+        """
+        Call this when gen_activation is called for the whole graph,
+        but before gen_activation is called for the segment.
+        This will collect the per-device inputs and outputs for the segment and its mirror.
+        """
+        if self.expander is None:
+            self.expander = IRSegmentExpander(self, dataloader_outputs, graph_outputs)
+        if self.mirror is not None and self.mirror.expander is None:
+            self.mirror.expander = IRSegmentExpander(self.mirror, dataloader_outputs, graph_outputs)
+
+        self.expander.build_io()
+
+    def expand(self):
+        if self.expander is None:
+            raise ValueError("Please call build_expander first to create expander.")
+        self.expander.expand()
+
+    def is_partitioned_segment_io(self, tensor: IRFullTensor):
+        assert self.expander is not None, "Please call build_expander first to create expander."
+        return self.expander.is_partitioned_segment_io(tensor)
+
+    def adjust_producer_for_per_device_seg(self, producers: List[IRCell], ptensors: List[IRSubTensor]):
+        return producers, ptensors
+
+    def adjust_consumer_for_per_device_seg(self, consumers: List[IRCell], ctensors: List[IRSubTensor]):
+        return consumers, ctensors
+
 
 class IRSegmentExpander:
     def __init__(self, segment: IRSegment, dataloader_outputs: Set[IRObject], graph_outputs: Set[IRObject]):
@@ -1255,17 +1286,11 @@ class IRSegmentExpander:
 
     def build_io(self):
         """
-        Call this when gen_activation is called for the whole graph.
-        This will generate the per-device inputs and outputs for the expanded segment.
+        Call this when gen_activation is called for the whole graph,
+        but before gen_activation is called for the segment.
+        This will collect the per-device inputs and outputs for the expanded segment.
         """
         self.get_per_device_inout()
-
-    def build_expanded_segment(self):
-        """
-        Call this when gen_activation is called for self._segment.
-        This will generate the expanded segment.
-        """
-        self.get_expanded_segment()
 
     @property
     def per_device_inputs(self):
@@ -1280,10 +1305,6 @@ class IRSegmentExpander:
     @property
     def segment(self):
         return self._segment
-
-    @property
-    def expanded_segment(self):
-        return self.get_expanded_segment()
 
     def _try_narrow_segment_ctensors(self, ftensor: IRFullTensor) -> Optional[Dict[int, IRSubTensor]]:
         """Check if a segment's consumption of a full tensor can be narrowed to per-device partitions.
@@ -1527,26 +1548,33 @@ class IRSegmentExpander:
             else:
                 yield node
 
-    def get_expanded_segment(self, replaced_nodes: Dict[IRFwOperation, IRFwOperation] = None):
+    def expand(self):
         """
-        Virtual segment for communication generation.
+        Update segment inplace with per-device ops.
         """
-        replaced_nodes = replaced_nodes or {}
-        if not self._expanded_seg:
-            self._segment._nodes = list(self._fix_per_device_identity(self._segment._nodes, self.per_device_inputs, replaced_nodes))
-            self._segment._reorder_producer_consumer()
-            self._expanded_seg = self._segment
-            # self._expanded_seg = IRSegment(
-            #     list(self._fix_per_device_identity(self._segment._nodes, self.per_device_inputs, replaced_nodes)),
-            #     self._segment.inputs(), self._segment.outputs(), self._segment.name
-            # )
-            # self._expanded_seg.expander = self
-            # self._copy_meta(self._expanded_seg)
-            if self._segment.isfw() and self._segment.mirror is not None:
-                expanded_mirror_seg = self._segment.mirror.expander.get_expanded_segment(replaced_nodes)
-                # IRSegment.make_pair(self._expanded_seg, expanded_mirror_seg)
-        return self._expanded_seg
+        if self._segment._expanded:
+            return
 
+        if self._segment.isfw():
+            seg_fw, seg_bw = self._segment, self._segment.mirror
+        else:
+            seg_fw, seg_bw = self._segment.mirror, self._segment
+
+        replaced_nodes = {}
+        fw_expander = seg_fw.expander
+        seg_fw._nodes[:] = list(fw_expander._fix_per_device_identity(
+            seg_fw._nodes, fw_expander.per_device_inputs, replaced_nodes
+        ))
+        seg_fw._reorder_producer_consumer()
+        seg_fw._expanded = True
+
+        if seg_bw is not None:
+            bw_expander = seg_bw.expander
+            seg_bw._nodes[:] = list(bw_expander._fix_per_device_identity(
+                seg_bw._nodes, bw_expander.per_device_inputs, replaced_nodes
+            ))
+            seg_bw._reorder_producer_consumer()
+            seg_bw._expanded = True
 
     def is_partitioned_segment_input(self, tensor: IRFullTensor) -> bool:
         """
@@ -1595,9 +1623,8 @@ class IRSegmentExpander:
         """
         seg = self._segment
         per_device_input_map, per_device_output_map = self.get_per_device_inout()
-        expanded_segment = self.get_expanded_segment()
         inputs, outputs, nodes = per_device_input_map[devid], per_device_output_map[devid], []
-        for node in expanded_segment._nodes:
+        for node in seg._nodes:
             if devid in node.device:
                 nodes.append(node.dispatch(devid))
 
