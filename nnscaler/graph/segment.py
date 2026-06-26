@@ -1533,14 +1533,18 @@ class IRSegmentExpander:
         """
         replaced_nodes = replaced_nodes or {}
         if not self._expanded_seg:
-            self._expanded_seg = IRSegment(
-                list(self._fix_per_device_identity(self._segment._nodes, self.per_device_inputs, replaced_nodes)),
-                self._segment.inputs(), self._segment.outputs(), self._segment.name
-            )
-            self._expanded_seg._id = self._segment.cid
+            self._segment._nodes = list(self._fix_per_device_identity(self._segment._nodes, self.per_device_inputs, replaced_nodes))
+            self._segment._reorder_producer_consumer()
+            self._expanded_seg = self._segment
+            # self._expanded_seg = IRSegment(
+            #     list(self._fix_per_device_identity(self._segment._nodes, self.per_device_inputs, replaced_nodes)),
+            #     self._segment.inputs(), self._segment.outputs(), self._segment.name
+            # )
+            # self._expanded_seg.expander = self
+            # self._copy_meta(self._expanded_seg)
             if self._segment.isfw() and self._segment.mirror is not None:
                 expanded_mirror_seg = self._segment.mirror.expander.get_expanded_segment(replaced_nodes)
-                IRSegment.make_pair(self._expanded_seg, expanded_mirror_seg)
+                # IRSegment.make_pair(self._expanded_seg, expanded_mirror_seg)
         return self._expanded_seg
 
 
@@ -1598,12 +1602,20 @@ class IRSegmentExpander:
                 nodes.append(node.dispatch(devid))
 
         segment = IRSegment(nodes, inputs, outputs, seg.name)
-        segment._id = seg.cid
-        segment.op_context = seg.op_context
-        segment.pre_hook = seg.pre_hook
-        segment.post_hook = seg.post_hook
-        segment.hook_meta = seg.hook_meta
+        self._copy_meta(segment)
         if _gen_mirror and seg.mirror is not None:
             msegment = seg.mirror.expander.dispatch(devid, _gen_mirror=False)
             IRCell.make_pair(segment, msegment)
         return segment
+
+    def _copy_meta(self, target_seg, include_id=True):
+        """
+        Copy the meta information from the original segment to another segment.
+        """
+        target_seg.op_context = self._segment.op_context
+        target_seg.pre_hook = self._segment.pre_hook
+        target_seg.post_hook = self._segment.post_hook
+        target_seg.hook_meta = self._segment.hook_meta
+        if include_id:
+            target_seg._id = self._segment.cid
+        return target_seg

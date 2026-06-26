@@ -807,6 +807,19 @@ class IRAdapterGener:
         for segment in segments:
             IRAdapterGener._gen_activation(segment, allow_recompute=allow_recompute, cost_fn=cost_fn)
 
+        # replace the segment with its expanded segment,
+        # and replace the mirror segment with its expanded mirror segment
+        for segment in segments:
+            expanded_seg = segment.expander.get_expanded_segment()
+            assert all(input == expand_input for input, expand_input in zip(segment.inputs(), expanded_seg.inputs()))
+            assert all(output == expand_output for output, expand_output in zip(segment.outputs(), expanded_seg.outputs()))
+            graph._nodes[graph._nodes.index(segment)] = expanded_seg
+            if segment.mirror is not None:
+                expanded_mirror_seg = segment.mirror.expander.get_expanded_segment()
+                assert all(input == expand_input for input, expand_input in zip(segment.mirror.inputs(), expanded_mirror_seg.inputs()))
+                assert all(output == expand_output for output, expand_output in zip(segment.mirror.outputs(),expanded_mirror_seg.outputs()))
+                graph._nodes[graph._nodes.index(segment.mirror)] = expanded_mirror_seg
+
         return graph
 
     @staticmethod
