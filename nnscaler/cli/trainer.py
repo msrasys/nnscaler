@@ -112,6 +112,7 @@ class Trainer:
                 self.dataloader[stage] = None
             if self.hook:
                 self.hook.on_finalize(self)
+            self._log_finalize()
             # It is very common to use `torch.distributed` after training
             # So let's not uninitialize nnscaler here.
             # TODO: make it configurable?
@@ -866,7 +867,6 @@ class Trainer:
                 # finished with max_epochs
                 logger.info(f"Reached max_epochs({self.train_args.max_epochs}): Training is done.")
 
-        self._log_finalize()
         self.hook.on_train_end(self)
         torch.distributed.barrier()
 
