@@ -1,7 +1,7 @@
 #  Copyright (c) Microsoft Corporation.
 #  Licensed under the MIT License.
 
-from typing import Dict, List, Optional, Tuple, Callable, Set, Union
+from typing import Dict, List, Optional, Tuple, Callable, Set
 import numpy as np
 import itertools
 import logging
@@ -10,8 +10,8 @@ import copy
 from nnscaler.graph.function.anchor import IRGraphAnchor
 from nnscaler.graph.gener.concurrent import ConcurrentGener
 import nnscaler.graph.gener.utils as utils
-from nnscaler.graph.graph import IRGraph, IRGraphExpander
-from nnscaler.graph.segment import IRSegment, CellPosition, IRSegmentExpander
+from nnscaler.graph.graph import IRGraph
+from nnscaler.graph.segment import IRSegment, CellPosition
 from nnscaler.graph.function.pyfunc import IRPyFunc
 
 from nnscaler.ir.cten import IRCell, IRObject, IR
@@ -27,113 +27,6 @@ from nnscaler.flags import CompileFlag
 DeviceID = int
 
 _logger = logging.getLogger(__name__)
-
-
-def _apply_producer_narrowing(
-    graph: 'IRGraph',
-    segment: IRSegment,
-    ftensor: IRFullTensor,
-    partitions: List[IRSubTensor],
-) -> List[IRSubTensor]:
-    """Replace a segment's full-shape output with per-device partition outputs.
-
-    This modifies the segment's declared outputs at the graph level so that:
-    1. The segment returns per-device partitions instead of a full tensor
-    2. The graph-level adapter receives partitions directly (no allgather+chunk)
-    3. The segment's internal gen_activation won't generate a redundant allgather
-       (since the output now matches the internal production)
-
-    Args:
-        graph: the top-level IRGraph
-        segment: the producing forward segment
-        ftensor: the full tensor being communicated between stages
-        partitions: per-device partition sub-tensors from _try_narrow_segment_ptensors
-
-    Returns:
-        The partition sub-tensors to use as fptensors for adapter generation.
-    """
-    # Find the current full-shape output sub-tensor for this ftensor
-    old_output = None
-    old_output_idx = None
-    for idx, out in enumerate(segment.oobjs()):
-        if isinstance(out, IRSubTensor) and out.parent == ftensor:
-            old_output = out
-            old_output_idx = idx
-            break
-
-    if old_output is None:
-        return None
-
-    # Create new per-device output sub-tensors for the segment
-    # Use the same sub-tensors that the internal operators produce
-    new_outputs = list(partitions)  # these are already tracked in segment._ptensors
-
-    # Set up gradients for the new partition outputs
-    if old_output.grad is not None and ftensor.grad is not None:
-        grad_ftensor = ftensor.grad
-        for pt in new_outputs:
-            grad_st = grad_ftensor.select(pt.indmap, (0, 1))
-            # Inherit device from the forward partition's producing node
-            grad_st.cell = pt.cell
-            pt.grad = grad_st
-
-    # Replace segment outputs: remove old full output, add partition outputs
-    # Rebuild _outputs list
-    old_outputs = list(segment._outputs)
-    new_outputs_list = []
-    for i, out in enumerate(old_outputs):
-        if i == old_output_idx:
-            # Replace the single full output with multiple partitions
-            new_outputs_list.extend(new_outputs)
-        else:
-            new_outputs_list.append(out)
-
-    # Reset and set outputs
-    segment.reset_outputs(len(new_outputs_list))
-    for i, out in enumerate(new_outputs_list):
-        segment.set_output(i, out)
-
-    # Mark this ftensor as narrowed on the segment so that the segment-level
-    # gen_activation won't generate an internal exchange adapter for it.
-    if not hasattr(segment, '_narrowed_ftensors'):
-        segment._narrowed_ftensors = set()
-    segment._narrowed_ftensors.add(ftensor)
-
-    # Update graph-level tracking
-    graph._ptensors[ftensor] = list(new_outputs)
-    graph._producers[ftensor] = [segment] * len(new_outputs)
-
-    # Update backward graph tracking (mirror)
-    if old_output.grad is not None and ftensor.grad is not None:
-        bgraph = graph.mirror
-        bseg = segment.mirror
-        grad_ftensor = ftensor.grad
-
-        # Create per-device gradient ctensors for the backward segment
-        new_grad_cts = []
-        for pt in new_outputs:
-            new_grad_cts.append(pt.grad)
-
-        # Update backward graph's consumer tracking
-        bgraph._ctensors[grad_ftensor] = new_grad_cts
-        bgraph._consumers[grad_ftensor] = [bseg] * len(new_grad_cts)
-
-        # Update backward segment inputs
-        old_binputs = list(bseg._inputs)
-        new_binputs = []
-        replaced = False
-        for inp in old_binputs:
-            if not replaced and isinstance(inp, IRSubTensor) and inp.parent == grad_ftensor:
-                new_binputs.extend(new_grad_cts)
-                replaced = True
-            else:
-                new_binputs.append(inp)
-        if replaced:
-            bseg.reset_inputs(len(new_binputs))
-            for i, inp in enumerate(new_binputs):
-                bseg.set_input(i, inp)
-
-    return new_outputs
 
 
 def create_dummy(segment: IRSegment, inputs: bool = True, outputs: bool = True):
@@ -820,8 +713,7 @@ class IRAdapterGener:
         graph.build_expander()
 
         # replace the segment input/output with per-device narrowed input/output, if possible.
-        for segment in segments:
-            segment.expand()
+        graph.expand()
 
         IRAdapterGener._gen_activation(graph, allow_recompute=allow_recompute, cost_fn=cost_fn)
         # generate adapter for each segment

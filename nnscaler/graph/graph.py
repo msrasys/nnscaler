@@ -1300,6 +1300,7 @@ class IRGraph(IRSegment):
         self.expander.expand()
 
     def is_partitioned_segment_io(self, tensor: IRFullTensor):
+        # graph never has partitioned segment IO, only segments can have partitioned IO
         return False
 
     def adjust_producer_for_per_device_seg(self, producers: List[IRCell], ptensors: List[IRSubTensor]):
