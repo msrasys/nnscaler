@@ -254,7 +254,7 @@ def split_segment_pas(graph, cfg):
     last_stage_id = 0
     for node in get_pas_ops(graph):
         if torch.nn.modules.linear.Linear in node.module_class_chain:
-            layer_idx = get_layer_index(node.fqn)
+            layer_idx = get_layer_index(node.fqn) // 2
             yield OpPlan(node, stage_id=layer_idx, partition=OpPartition(input=0, dim=0))
             last_stage_id = layer_idx
         else:
@@ -273,7 +273,7 @@ def test_gencode_split_segment(tmp_path):
         {'data': torch.randn(64, 64)},
         pas_policy=split_segment_pas,
         compute_config= ComputeConfig(
-            8, 8,
+            4, 8,
             constant_folding=False,
             use_end2end=True,
             pas_config=dict(
@@ -285,4 +285,16 @@ def test_gencode_split_segment(tmp_path):
         load_module=False,
         reuse='override',
     )
-    assert True
+
+    assert _gencode_contains(
+        tmp_path, SplitSegmentModule, 2, r'nnscaler.runtime.adapter.nn.allreduce_identity\(sum_.*, ranks=\[2, 3\]\)'
+    )
+    assert not _gencode_contains(
+        tmp_path, SplitSegmentModule, 2, r'nnscaler.runtime.adapter.chunk'
+    )
+    assert not _gencode_contains(
+        tmp_path, SplitSegmentModule, 2, r'nnscaler.runtime.adapter.nn.split_allgather'
+    )
+    assert _gencode_contains(
+        tmp_path, SplitSegmentModule, 6, r'nnscaler.runtime.adapter.nn.allreduce_identity\(sum_.*, ranks=\[6, 7\]\)'
+    )

@@ -1261,6 +1261,30 @@ class IRGraph(IRSegment):
         dest_node.post_hook = src_node.post_hook
 
     # ================= Graph Expander ==================
+    #
+    # About graph/segment expanders:
+    #
+    # Previously every device that owned a (forward/backward) segment held the
+    # *full* segment input/output tensors, and adapters were generated against
+    # that full IO. Expander introduces an explicit expand pass that builds
+    # *per-device* segment IO and lets segments be "narrowed", so each device
+    # only keeps the slice of the segment IO it actually produces/consumes
+    # (e.g. tp partition mapped onto multiple
+    # devices) to reduce redundant communication.
+    #
+    # Two-tier expander:
+    #   - IRGraphExpander  (whole-graph driver, below): iterates fw segments,
+    #     calls build_expander() on each, and caches per_device_ios so that
+    #     producers/consumers can be rewired to the right per-device tensors.
+    #   - IRSegmentExpander (in segment.py): computes per-device inputs/outputs,
+    #     mirrors them to the backward segment (grads), and narrows segment IO
+    #     when shapes allow.
+    #
+    # Lifecycle: build_expander() -> build_io() (compute & cache per-device IO),
+    # then expand() materializes the per-device segments. adjust_*_for_per_device_seg
+    # rewire a producer/consumer that is itself a per-device segment to its
+    # narrowed per-device tensor so adapters connect the correct shards.
+    #
     def build_expander(self):
         """
         Build per-device input/output for each segment in the graph.

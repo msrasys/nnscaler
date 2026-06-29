@@ -784,6 +784,21 @@ class IRAdapterGener:
         Generate adapter for activation tensors.
         The forward/backward adapter is inserted before the first consumers of its full tensor.
 
+        Narrowed segment input/output and communication generation:
+            Before generating adapters we call `graph.build_expander()`, which builds the
+            per-device input/output of every segment. A segment that runs on multiple devices
+            may keep only a slice ("narrowed") of its input/output on each device, instead of
+            the full segment tensor. This affects communication generation in two ways:
+
+            - At graph level, the producer/consumer of a segment IO is the segment itself,
+              which only owns a per-device slice. `adjust_producer_for_per_device_seg` /
+              `adjust_consumer_for_per_device_seg` rewire these to the actual per-device
+              sub-tensors so adapters connect the correct shards rather than the full tensor.
+            - At segment level, if a tensor is already partitioned on the segment boundary
+              (one partition per device), `is_partitioned_segment_io` returns True and adapter
+              generation is skipped for it, since the narrowing already places data correctly
+              on each device. Communication is then only generated for the remaining tensors.
+
         Args:
             graph (IRGraph): the graph the requires for adapter.
             allow_recompute (bool): Allow adapter recomputes. If this enables, all adapters will be
@@ -796,11 +811,17 @@ class IRAdapterGener:
         """
         segments = [seg for seg in graph.nodes() if isinstance(seg, IRSegment) and seg.isfw()]
 
+        # finalize the compute graph
         IRAdapterGener._local_optimize(graph)
         for segment in segments:
             IRAdapterGener._local_optimize(segment)
 
+        # check the possibility of narrowing segment input/output, and build per-device segment input/output
         graph.build_expander()
+
+        # replace the segment input/output with per-device narrowed input/output, if possible.
+        for segment in segments:
+            segment.expand()
 
         IRAdapterGener._gen_activation(graph, allow_recompute=allow_recompute, cost_fn=cost_fn)
         # generate adapter for each segment
@@ -821,10 +842,6 @@ class IRAdapterGener:
                     return False
             return True
 
-        is_graph = isinstance(graph, IRGraph)
-        if not is_graph:
-            graph.expand()
-
         input_producer, output_consumer = create_dummy(graph, inputs=True, outputs=True)
         bgraph: Optional[IRSegment] = graph.mirror
         ftensors = [t for t in graph.full_tensors() if not t.is_param() and not t.is_grad()]
@@ -835,7 +852,7 @@ class IRAdapterGener:
         for ftensor in ftensors:
             if graph.is_partitioned_segment_io(ftensor):
                 # if the tensor is already partitioned on segment input or output,
-                # (which means in each device, only one partition is produced or consumed),
+                # which means in each device, only one unoverlapped partition is produced or consumed,
                 # then we can skip generating adapter for it
                 continue
             # debug

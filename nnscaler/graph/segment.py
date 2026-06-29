@@ -1449,16 +1449,19 @@ class IRSegmentExpander:
             seg_fw, seg_bw = self._segment.mirror, self._segment
 
         seg_fw.expander._fw_get_per_device_inout()
-        for devid in self._per_device_input:
-            inputs = self._per_device_input[devid]
-            outputs = self._per_device_output[devid]
-            # get backward graph inputs
-            output_grads = [IR.copy_and_set_object_device(t.grad, devid) for t in outputs if isinstance(t, IRSubTensor) and t.grad is not None]
-            # get backward graph outputs
-            input_grads = [IR.copy_and_set_object_device(t.grad, devid) for t in inputs if isinstance(t, IRSubTensor) and t.grad is not None]
 
-            seg_bw.expander._per_device_input[devid] = output_grads
-            seg_bw.expander._per_device_output[devid] = input_grads
+        # when inference mode is on, seg_bw will be None
+        if seg_bw is not None:
+            for devid in self._per_device_input:
+                inputs = self._per_device_input[devid]
+                outputs = self._per_device_output[devid]
+                # get backward graph inputs
+                output_grads = [IR.copy_and_set_object_device(t.grad, devid) for t in outputs if isinstance(t, IRSubTensor) and t.grad is not None]
+                # get backward graph outputs
+                input_grads = [IR.copy_and_set_object_device(t.grad, devid) for t in inputs if isinstance(t, IRSubTensor) and t.grad is not None]
+
+                seg_bw.expander._per_device_input[devid] = output_grads
+                seg_bw.expander._per_device_output[devid] = input_grads
 
         return self._per_device_input, self._per_device_output
 
@@ -1498,9 +1501,12 @@ class IRSegmentExpander:
 
         return self._per_device_input, self._per_device_output
 
-    def _fix_per_device_identity(self, nodes: List[IRCell], device_input_map, replaced_nodes: Dict[IRFwOperation, IRFwOperation]):
+    @classmethod
+    def _fix_per_device_identity(cls, segment: IRSegment, device_input_map, replaced_nodes: Dict[IRFwOperation, IRFwOperation]):
         from nnscaler.runtime.function.function import identity as _identity_fn
         from nnscaler.graph.function.function import Identity
+
+        nodes: List[IRCell] = segment._nodes
 
         def _find_per_device_partitioned_input(
                 tensor: IRSubTensor,
@@ -1520,11 +1526,11 @@ class IRSegmentExpander:
                 return None
 
         for node in nodes:
-            if (self._segment.isfw()
+            if (segment.isfw()
                 and node.fn == _identity_fn
                 and isinstance(node.input(0), IRSubTensor)
                 and (per_device_input := _find_per_device_partitioned_input(
-                    node.input(0), self._segment.inputs(), node.device[0], device_input_map)
+                    node.input(0), segment.inputs(), node.device[0], device_input_map)
                 )
             ):
                 # input of segment is not shared with other nodes
@@ -1536,12 +1542,12 @@ class IRSegmentExpander:
                 new_node.set_output(0, node.output(0).parent.select(per_device_input.indmap, per_device_input.valmap))
                 if node.output(0).grad is not None:
                     new_node.output(0).grad = node.output(0).grad.parent.select(per_device_input.indmap, (0, 1))
-                new_bwnode = self._segment.create_bwop(new_node)
+                new_bwnode = segment.create_bwop(new_node)
                 new_bwnode.device = node.device
                 replaced_nodes[node] = new_node
                 replaced_nodes[node.mirror] = new_bwnode
                 yield new_node
-            elif not self._segment.isfw() and node in replaced_nodes:
+            elif not segment.isfw() and node in replaced_nodes:
                 # for backward segment, if the mirror node in forward segment is fixed,
                 # we also need to fix it
                 yield replaced_nodes[node]
@@ -1562,16 +1568,16 @@ class IRSegmentExpander:
 
         replaced_nodes = {}
         fw_expander = seg_fw.expander
-        seg_fw._nodes[:] = list(fw_expander._fix_per_device_identity(
-            seg_fw._nodes, fw_expander.per_device_inputs, replaced_nodes
+        seg_fw._nodes[:] = list(self._fix_per_device_identity(
+            seg_fw, fw_expander.per_device_inputs, replaced_nodes
         ))
         seg_fw._reorder_producer_consumer()
         seg_fw._expanded = True
 
         if seg_bw is not None:
             bw_expander = seg_bw.expander
-            seg_bw._nodes[:] = list(bw_expander._fix_per_device_identity(
-                seg_bw._nodes, bw_expander.per_device_inputs, replaced_nodes
+            seg_bw._nodes[:] = list(self._fix_per_device_identity(
+                seg_bw, bw_expander.per_device_inputs, replaced_nodes
             ))
             seg_bw._reorder_producer_consumer()
             seg_bw._expanded = True
