@@ -1417,7 +1417,12 @@ class IRSegmentExpander:
         dev_partitions: Dict[int, List[IRSubTensor]] = {}
         for pt in ptensors:
             for devid in pt.device:
-                dev_partitions.setdefault(devid, []).append(pt)
+                new_pt = ftensor.select(pt.indmap, pt.valmap)
+                IR.set_object_device(new_pt, devid)
+                if pt.grad is not None:
+                    new_pt.grad = ftensor.grad.select(pt.grad.indmap, pt.grad.valmap)
+                    IR.set_object_device(new_pt.grad, devid)
+                dev_partitions.setdefault(devid, []).append(new_pt)
 
         if not dev_partitions:
             return None
@@ -1467,6 +1472,8 @@ class IRSegmentExpander:
 
         # when inference mode is on, seg_bw will be None
         if seg_bw is not None:
+            bw_inputs = seg_bw.inputs()
+            bw_outputs = seg_bw.outputs()
             for devid in self._per_device_input:
                 inputs = self._per_device_input[devid]
                 outputs = self._per_device_output[devid]
@@ -1474,6 +1481,21 @@ class IRSegmentExpander:
                 output_grads = [IR.copy_and_set_object_device(t.grad, devid) for t in outputs if isinstance(t, IRSubTensor) and t.grad is not None]
                 # get backward graph outputs
                 input_grads = [IR.copy_and_set_object_device(t.grad, devid) for t in inputs if isinstance(t, IRSubTensor) and t.grad is not None]
+
+                # The backward per-device IO is built by filtering the forward IO
+                # grads, but it is later indexed positionally against
+                # seg_bw.inputs()/outputs() (see adjust_*_for_per_device_seg and
+                # is_partitioned_segment_io). Assert the positional co-indexing
+                # assumption holds: same length and parent-aligned with the
+                # backward segment's declared IO.
+                assert len(output_grads) == len(bw_inputs) \
+                    and all(g.parent == t.parent for g, t in zip(output_grads, bw_inputs)), \
+                    f"backward per-device input not co-indexed with backward segment inputs: " \
+                    f"{[g.parent for g in output_grads]} vs {[t.parent for t in bw_inputs]}"
+                assert len(input_grads) == len(bw_outputs) \
+                    and all(g.parent == t.parent for g, t in zip(input_grads, bw_outputs)), \
+                    f"backward per-device output not co-indexed with backward segment outputs: " \
+                    f"{[g.parent for g in input_grads]} vs {[t.parent for t in bw_outputs]}"
 
                 seg_bw.expander._per_device_input[devid] = output_grads
                 seg_bw.expander._per_device_output[devid] = input_grads
