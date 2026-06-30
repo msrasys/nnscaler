@@ -158,7 +158,6 @@ class ScheduleDependency:
         # adapter info
         self.graph: IRGraph = graph
         self.dataloaders : List[IRDataOperation] = []
-        self.dataloader_adapter: Optional[IRAdapter] = None
         self.segments: List[IRSegment] = []
         self.adapters: List[IRAdapter] = []
         # the IRSegment that consumes the output of IRAdapter
@@ -172,7 +171,6 @@ class ScheduleDependency:
         Cluster operations and build dependency to identify the connected
         segments for each adapter.
         """
-        from nnscaler.graph.gener.concurrent import SelectPrim
         # get all dataloaders
         self.dataloaders = list(self.graph.select(ntype=IRDataOperation, flatten=False))
         # get all segment
@@ -180,6 +178,7 @@ class ScheduleDependency:
         self.segments = segments
         # get all adapters
         for adapter in self.graph.select(ntype=IRAdapter, flatten=False):
+            self.adapters.append(adapter)
             for segment in segments:
                 if self.graph.depends(adapter, segment):
                     assert adapter not in self.recvers, \
@@ -189,14 +188,6 @@ class ScheduleDependency:
                     assert adapter not in self.senders, \
                         f"Detected one adapter {adapter} sends data to more than one segments"
                     self.senders[adapter] = segment
-            if adapter in self.senders:
-                self.adapters.append(adapter)
-            else:
-                assert self.dataloader_adapter is None, "Detected more than one dataloader adapter"
-                assert all(isinstance(prim, SelectPrim) for prim in adapter.prims), \
-                    "Dataloader adapter contains non-SelectPrim operations"
-                # dataloader adapter
-                self.dataloader_adapter = adapter
         # get all weight reducers
         self.reducers = self.graph.select(ntype=IRWeightReducer, flatten=False)
 
@@ -468,27 +459,6 @@ class PlanBase:
             for mid in reversed(range(self._num_microbatches)):
                 if mid not in inserted_mids:
                     insert_block(dl, mid, self.nsteps - 1)
-
-        if not self._dependency.dataloader_adapter:
-            return
-
-        # find dataloader adapter receiver and insert adapter
-        recv = self._dependency.recvers[self._dependency.dataloader_adapter]
-        for step in range(self.nsteps):
-            blocks = self.start_blocks(step)
-            segments = [block.content for block in blocks]
-            mids = [block.mid for block in blocks]
-            if recv in segments:
-                idx = segments.index(recv)
-                mid = mids[idx]
-                block = blocks[idx]
-                dl_block = Block(self._dependency.dataloader_adapter, mid, 1)
-                self._blocks.append(dl_block)
-                self._step_blocks[step].insert(
-                    self._step_blocks[step].index(block),
-                    dl_block
-                )
-                self._block_start_step[dl_block] = step
 
     def topo_sort(self):
         """

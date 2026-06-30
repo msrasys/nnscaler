@@ -672,7 +672,7 @@ class IRAdapterGener:
         _logger.info("finish reordering producer and consumer")
 
     @staticmethod
-    def gen_activation(graph: IRGraph, allow_recompute: bool = True, cost_fn: Optional[Callable] = None) -> IRSegment:
+    def gen_activation(graph: IRGraph, allow_recompute: bool = True, cost_fn: Optional[Callable] = None) -> IRGraph:
         """
         Generate adapter for activation tensors.
         The forward/backward adapter is inserted before the first consumers of its full tensor.

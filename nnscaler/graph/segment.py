@@ -5,7 +5,6 @@ from contextlib import contextmanager
 from typing import Dict, Union, List, Optional, Set, Tuple, Any, Callable
 import numpy as np
 import logging
-import copy
 
 from nnscaler.ir.tensor import IRFullTensor, IRSubTensor, ValueMap
 from nnscaler.ir.cten import IRTensor, IRCell, IRObject, IR
@@ -1213,6 +1212,9 @@ class IRSegment(IRCell):
         if devid in self._dispatch_cached:
             return self._dispatch_cached[devid]
 
+        if self.expander is None:
+            raise ValueError("Please call build_expander first to create expander.")
+
         segment = self.expander.dispatch(devid, _gen_mirror=_gen_mirror)
         self._dispatch_cached[devid] = segment
         return segment
@@ -1256,6 +1258,19 @@ class IRSegment(IRCell):
         self.expander.build_io()
 
     def expand(self):
+        """
+        An expanded Segment is almost the same with original segment, with additional per device informations.
+        1. inputs/outputs: exactly the same with original segment
+        2. nodes: the same with original segment except `Identity` nodes,
+            whose inputs/outputs will be revised to per device tensors.
+
+        Expanded Segment is used to generate adapters for the segment,
+        Comparing to orginal segment, two changes include:
+        1. cross-segment adapters: Will replace segment inputs/outputs with per device tensors by
+            `graph.adjust_producer_for_per_device_seg` and `graph.adjust_consumer_for_per_device_seg`.
+        2. intra-segment adapters: Will skip adapters for partitioned segment inputs/outputs by
+            `segment.is_partitioned_segment_io`.
+        """
         if self.expander is None:
             raise ValueError("Please call build_expander first to create expander.")
         self.expander.expand()

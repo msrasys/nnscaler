@@ -64,20 +64,30 @@ class ExeReuseCell(IRCell):
                 continue
             outputs.append(t)
 
+        # inputs and outputs of dispatched cell should be aligned with inputs/outputs,
         dispatch_cell = self._cell.dispatch(devid)
         expanded_inputs = []
+        assert len(inputs) == len(dispatch_cell.inputs()), \
+            f"inputs length mismatch: {dispatch_cell}\ninputs: {inputs}\ndispatch_cell.inputs(): {dispatch_cell.inputs()}"
+        assert len(outputs) == len(dispatch_cell.outputs()), \
+            f"outputs length mismatch: {dispatch_cell}\noutputs: {outputs}\ndispatch_cell.outputs(): {dispatch_cell.outputs()}"
+
         for t, cell_t in zip(inputs, dispatch_cell.inputs()):
             if isinstance(t, IRSubTensor) and t.shape != cell_t.shape:
+                assert isinstance(cell_t, IRSubTensor), f"Expected IRSubTensor, got {type(cell_t)}"
                 new_t = t.parent.select(cell_t.indmap, cell_t.valmap)
                 if t.grad is not None:
+                    assert isinstance(cell_t.grad, IRSubTensor), f"Expected IRSubTensor, got {type(cell_t.grad)}"
                     new_t.grad = t.grad.parent.select(cell_t.grad.indmap, cell_t.grad.valmap)
                 t = new_t
             expanded_inputs.append(t)
         expanded_outputs = []
         for t, cell_t in zip(outputs, dispatch_cell.outputs()):
             if isinstance(t, IRSubTensor) and t.shape != cell_t.shape:
+                assert isinstance(cell_t, IRSubTensor), f"Expected IRSubTensor, got {type(cell_t)}"
                 new_t = t.parent.select(cell_t.indmap, cell_t.valmap)
                 if t.grad is not None:
+                    assert isinstance(cell_t.grad, IRSubTensor), f"Expected IRSubTensor, got {type(cell_t.grad)}"
                     new_t.grad = t.grad.parent.select(cell_t.grad.indmap, cell_t.grad.valmap)
                 t = new_t
             expanded_outputs.append(t)
