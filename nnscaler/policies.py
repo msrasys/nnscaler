@@ -637,6 +637,14 @@ def fn(
 
     op_plans = {r.op: r for r in result}
     ngpus: int = cfg.plan_ngpus
+    op_partition_ngpus = ngpus
+    configured_pp_size = cfg.pas_config.get('pipeline_size', None)
+    if configured_pp_size is not None:
+        if configured_pp_size < 1:
+            raise ValueError("pipeline_size must be >= 1 when set")
+        if ngpus % configured_pp_size != 0:
+            raise ValueError(f'invalid pipeline_size {configured_pp_size} for ngpus {ngpus}')
+        op_partition_ngpus = ngpus // configured_pp_size
 
     recompute_groups: dict[int, list[IRFwOperation]] = {}
     recompute_last_id: int = -1
@@ -714,7 +722,12 @@ def fn(
             # and then check the rest partitions are satisfied or not
             op_first_partition = op_partitions[0]
             partitioned_nodes = op_plan.op.algorithm('dim')\
-                .instantiate(idx=op_first_partition.input, dim=op_first_partition.dim, num=ngpus)
+                .instantiate(idx=op_first_partition.input, dim=op_first_partition.dim, num=op_partition_ngpus)
+            if partitioned_nodes is None:
+                raise ValueError(
+                    f"Operator {op_plan.op} cannot be partitioned as specified: {op_first_partition} "
+                    f"with num={op_partition_ngpus}"
+                )
             subnode = partitioned_nodes[0]  # first subnode carries all necessary partition info
             assert isinstance(subnode, IRDimops), "Internal Error: partitioned node should be IRDimops"
 
