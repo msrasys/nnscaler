@@ -1237,7 +1237,16 @@ class IR:
         Returns:
             A copy of val with the device set.
         """
-        return cls.set_object_device(copy.copy(val), device)
+        def _copy_and_set(x: IRObject) -> IRObject:
+            x = copy.copy(x)
+            x.cell = IRCell(
+                name='_dev_holder',
+                signature='dummy',
+                input_length=1, output_length=1
+            )
+            x.cell.device = device
+            return x
+        return cls.modify_objects(val, _copy_and_set)
 
     @classmethod
     def index_with_same_parent(cls, tensor: IRObject, tensors: List[IRObject]) -> Optional[int]:

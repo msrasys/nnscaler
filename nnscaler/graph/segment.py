@@ -1213,7 +1213,7 @@ class IRSegment(IRCell):
             return self._dispatch_cached[devid]
 
         if self.expander is None:
-            raise ValueError("Please call build_expander first to create expander.")
+            raise ValueError("Please call build_expander first to create expander. This is usually called in IRAdapterGener.gen_activation.")
 
         segment = self.expander.dispatch(devid, _gen_mirror=_gen_mirror)
         self._dispatch_cached[devid] = segment
