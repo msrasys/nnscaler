@@ -492,10 +492,16 @@ class InterPathFinder:
             ftensor, r=prvds[-1][0], v=prvds[-1][1],
             dims=prvds[-1][2:], devices=list(range(pndevs)))
         _, prims = InterTransition.transition(playout, crvds[0], list(range(pndevs, pndevs + cndevs)))
+        # TODO: why only consider the first primitive? should we consider all primitives?
+        # because all primitives are executed in parallel (they are in different devices),
+        # so we only consider the first primitive for cost estimation?
         icost = cost_fn(prims[0])
         # gather all
-        # consider differnt linkbandwidth intra NVLink 300GB/s vs. inter-node 100Gbps
-        comm_factor = 24
+        # consider different linkbandwidth intra NVLink 300GB/s vs. inter-node 100Gbps
+        # disable comm_factor for now,
+        # since we don't know whether InterTransition will happen in intra-node or inter-node,
+        # and we don't have the information of device placement here
+        comm_factor = 1
         return pcost + ccost + icost * comm_factor
 
     @staticmethod
