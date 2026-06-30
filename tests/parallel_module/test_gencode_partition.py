@@ -497,6 +497,85 @@ def test_multiref_multi_rr(tmp_path):
     #     return sum_1_25
 
 
+class MultileROModule(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.w0 = torch.nn.Parameter(torch.randn(4, 4))
+        self.w1 = torch.nn.Parameter(torch.randn(4, 4))
+        self.w2 = torch.nn.Parameter(torch.randn(4, 4))
+
+    def forward(self, input):
+        x = torch.nn.functional.linear(input, self.w0)
+        y = torch.nn.functional.linear(input, self.w1)
+        z = torch.nn.functional.linear(input, self.w2)
+        a = _shared_skip_op(x, y)
+        b = _shared_skip_op(x, z)
+        return (a + b).sum()
+
+
+def multirr_pas(graph, cfg):
+    from nnscaler.policies import OpPlan, OpPartition, get_pas_ops
+
+    for node in get_pas_ops(graph):
+        if node.fn == _shared_skip_op:
+            yield OpPlan(node, partition=OpPartition(input=1, dim=1))
+
+
+@replace_all_device_with('cpu')
+def test_multiref_multi_ro(tmp_path):
+    """
+    Test the case of two RO (replicate + no reduce) pattern
+    """
+    m = MultileROModule()
+    m.train()
+    parallelize(
+        m,
+        {'input': torch.randn(4, 4)},
+        multirr_pas,
+        ComputeConfig(2, 4, use_end2end=True),
+        gen_savedir=tmp_path,
+        load_module=False,
+        reuse='override',
+    )
+    # no multiref are generated in `fn`
+    assert not _gencode_contains(tmp_path, MultileROModule, 0, r'activation')
+    # no identity_allreduce should be generated because the op is annotated with `: /`
+    assert not _gencode_contains(tmp_path, MultileROModule, 0, r'nnscaler.runtime.adapter.nn.identity_allreduce')
+    # code looks like:
+    # def segment139(self, input_24):
+    #     # File "/data/weijiangxu/nnscaler/tests/parallel_module/test_gencode_partition.py", line 508, in forward,  x = torch.nn.functional.linear(input, self.w0)
+    #     linear_27 = torch.nn.functional.linear(input_24, self.w0_26, bias=None)
+    #     # File "/data/weijiangxu/nnscaler/tests/parallel_module/test_gencode_partition.py", line 509, in forward,  y = torch.nn.functional.linear(input, self.w1)
+    #     linear_1_29 = torch.nn.functional.linear(input_24, self.w1_28, bias=None)
+    #     # File "/data/weijiangxu/nnscaler/tests/parallel_module/test_gencode_partition.py", line 510, in forward,  z = torch.nn.functional.linear(input, self.w2)
+    #     linear_2_31 = torch.nn.functional.linear(input_24, self.w2_30, bias=None)
+    #     del input_24
+    #     # created at IRAdapterGener:local_consumer_multiref
+    #     linear_66, linear_70 = nnscaler.runtime.function.multiref(linear_27, times=2)
+    #     del linear_27
+    #     linear_1_48 = nnscaler.runtime.adapter.nn.split_allgather(linear_1_29, dim=1, ranks=[0, 1])
+    #     del linear_1_29
+    #     # File "/data/weijiangxu/nnscaler/tests/parallel_module/test_gencode_partition.py", line 511, in forward,  a = _shared_skip_op(x, y)
+    #     _shared_skip_op_50 = tests.parallel_module.test_gencode_partition._shared_skip_op(linear_66, linear_1_48)
+    #     del linear_66, linear_1_48
+    #     linear_2_52 = nnscaler.runtime.adapter.nn.split_allgather(linear_2_31, dim=1, ranks=[0, 1])
+    #     del linear_2_31
+    #     # File "/data/weijiangxu/nnscaler/tests/parallel_module/test_gencode_partition.py", line 512, in forward,  b = _shared_skip_op(x, z)
+    #     _shared_skip_op_1_54 = tests.parallel_module.test_gencode_partition._shared_skip_op(linear_70, linear_2_52)
+    #     del linear_70, linear_2_52
+    #     _shared_skip_op_32 = nnscaler.runtime.adapter.nn.allgather_split(_shared_skip_op_50, dim=1, ranks=[0, 1])
+    #     del _shared_skip_op_50
+    #     _shared_skip_op_1_33 = nnscaler.runtime.adapter.nn.allgather_split(_shared_skip_op_1_54, dim=1, ranks=[0, 1])
+    #     del _shared_skip_op_1_54
+    #     # File "/data/weijiangxu/nnscaler/tests/parallel_module/test_gencode_partition.py", line 513, in forward,  return (a + b).sum()
+    #     add_34 = torch.add(_shared_skip_op_32, _shared_skip_op_1_33, alpha=1)
+    #     del _shared_skip_op_32, _shared_skip_op_1_33
+    #     # File "/data/weijiangxu/nnscaler/tests/parallel_module/test_gencode_partition.py", line 513, in forward,  return (a + b).sum()
+    #     sum_1_25 = torch.sum(add_34)
+    #     del add_34
+    #     return sum_1_25
+
+
 class StageOutputModel(torch.nn.Module):
     def __init__(self, no_grad_reduce=False):
         hidden_dim = 4

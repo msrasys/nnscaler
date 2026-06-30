@@ -1456,8 +1456,7 @@ class IRSegmentExpander:
 
     def get_per_device_inout(self):
         """
-        Must call this function after the graph is partitioned
-        but before local multirefs and adapters are generated.
+        Call this function after the graph is partitioned
         """
         # per-device inputs/outputs
         if self._per_device_input:
