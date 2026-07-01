@@ -1171,7 +1171,7 @@ def trainer_resumable_dataloader(save_dir):
             '--checkpoint.save_type', save_type,
             '--checkpoint.save_dir', str(ckpt2_1_savedir),
             '--checkpoint.resume_from.checkpoint', str(ckpt2_savedir / 'merged.pt'),
-            '--checkpoint.resume_from.save_memory', True,
+            '--checkpoint.resume_from.slow_fs', True,
             '--checkpoint.keep_last_n_checkpoints', '30',
         ])
         trainer.run()

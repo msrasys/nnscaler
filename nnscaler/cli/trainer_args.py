@@ -457,7 +457,7 @@ class ResumeOptions:
     # the state dict to the local rank 0 of every node (which then follows the existing
     # in-node broadcast logic).
     # When `False`, the original behavior is kept (every node's local rank 0 reads the file).
-    slow_fs: bool = True
+    slow_fs: bool = False
 
     def __post_init__(self):
         # combination of slow_fs and save_memory table

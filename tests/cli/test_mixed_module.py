@@ -104,6 +104,7 @@ def mixed1_worker(save_dir, config_file):
         '--checkpoint.save_dir', str(ckpt0_savedir),
         '--checkpoint.resume_from.checkpoint', 'last',
         '--checkpoint.resume_from.save_memory', True,
+        '--checkpoint.resume_from.slow_fs', True,
     ])
     trainer.run()
 
