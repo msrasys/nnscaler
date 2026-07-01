@@ -191,6 +191,10 @@ class Trainer:
         # create local process groups
         for local_rank0 in range(0, self.world_size, self.local_world_size):
             DeviceGroup().get_group(list(range(local_rank0, local_rank0 + self.local_world_size)))
+        # the local rank 0 of every node, used to broadcast checkpoint across nodes
+        # when `slow_fs` is enabled (see `_load_checkpoint`)
+        self.node_leader_ranks = list(range(0, self.world_size, self.local_world_size))
+        DeviceGroup().get_group(self.node_leader_ranks)
 
         self.total_train_steps_per_epoch = len(self.dataloader['train']) // self.train_args.update_freq
         if len(self.dataloader['train']) % self.train_args.update_freq != 0:
@@ -376,16 +380,36 @@ class Trainer:
         trimmed_broadcast_required = False
         load_from_merged = False
 
+        slow_fs = self.train_args.checkpoint.resume_from.slow_fs
+        save_memory = slow_fs or self.train_args.checkpoint.resume_from.save_memory
+
         if resume_from.is_file():
             # when we load from merged checkpoint
             load_from_merged = True
-            trimmed_broadcast_required = self.train_args.checkpoint.resume_from.save_memory
-            if not self.train_args.checkpoint.resume_from.save_memory or self.local_rank == 0:
+            trimmed_broadcast_required = save_memory
+            if slow_fs:
+                # slow filesystem: only the global rank 0 reads the file,
+                # then broadcast to the local rank 0 of every node
+                should_read = self.rank == 0
+            elif save_memory:
+                # each node's local rank 0 reads the file
+                should_read = self.local_rank == 0
+            else:
+                # every rank reads and uses the full merged state dict
+                should_read = True
+
+            if should_read:
                 state_dict = self.checkpointer.load(resume_from)
                 if convert_fn := self.train_args.checkpoint.resolved_convert_fn:
                     state_dict = convert_fn(state_dict)
             else:
                 state_dict = None
+            if slow_fs and self.local_rank == 0:
+                logger.info("Broadcasting merged checkpoint to node leaders.")
+                state_dict = self._broadcast_merged_state_dict(
+                    state_dict, src_rank=0, dst_ranks=self.node_leader_ranks
+                )
+                logger.info("Broadcasted merged checkpoint to node leaders.")
         else:
             ckpt_files = self.checkpointer.list_checkpoints(resume_from)
             rank_ckpt_files = {int(f.stem): f for f in ckpt_files if f.stem.isdigit()}
@@ -398,15 +422,24 @@ class Trainer:
             if len(rank_ckpt_files) != self.world_size or self.train_args.checkpoint.resume_from.with_merged:
                 # merge the checkpoint files from all ranks and broadcast to all ranks
                 torch.distributed.barrier()
-                if self.local_rank == 0:
+                # normally each node's local rank 0 reads and merges the checkpoint files.
+                # with a slow filesystem, only the global rank 0 reads and merges them,
+                # then broadcasts the merged state dict to the local rank 0 of every node.
+                if self.rank == 0 or (not slow_fs and self.local_rank == 0):
                     logger.info(f"Merging checkpoint files from {resume_from}")
                     state_dict = self._merge_checkpoint(list(rank_ckpt_files.values()), checkpointer=self.checkpointer)
                 else:
                     state_dict = None
 
                 load_from_merged = True
-                trimmed_broadcast_required = self.train_args.checkpoint.resume_from.save_memory
-                if not self.train_args.checkpoint.resume_from.save_memory:
+                trimmed_broadcast_required = save_memory
+                if slow_fs and self.local_rank == 0:
+                    logger.info("Broadcasting merged checkpoint to node leaders.")
+                    state_dict = self._broadcast_merged_state_dict(
+                        state_dict, src_rank=0, dst_ranks=self.node_leader_ranks
+                    )
+                    logger.info("Broadcasted merged checkpoint to node leaders.")
+                if not save_memory:
                     logger.info(f"Broadcasting merged checkpoint to all ranks.")
                     state_dict = self._broadcast_merged_state_dict(
                         state_dict, src_rank=self.local_rank0, dst_ranks=self.local_ranks
