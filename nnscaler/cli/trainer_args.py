@@ -464,7 +464,7 @@ class ResumeOptions:
         # slow_fs | save_memory | behavior
         # --------+-------------+------------------------------------------------------
         # True    | True        | only global rank 0 reads the file, then broadcast to the local rank 0 of every node, then broadcast trimmed state dict to other ranks in the same node
-        # True    | False       | only global rank 0 reads the file, then broadcast to the local rank 0 of every node, then broadcast trimmed state dict to other ranks in the same node
+        # True    | False       | invalid combination. save_memory is treated as True to reduce file reads.
         # False   | True        | each node's local rank 0 reads the file, then broadcast the trimmed state dict to other ranks in the same node
         # False   | False       | all ranks read the file and use the full merged state dict.
 
@@ -475,6 +475,7 @@ class ResumeOptions:
                 "save_memory=False is ignored when slow_fs=True, "
                 "since it would produce more IO. Treating save_memory as True."
             )
+            self.save_memory = True
 
 
 @dataclass
