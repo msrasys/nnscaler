@@ -449,7 +449,6 @@ class ResumeOptions:
     # and broadcast trimmed state dict to other ranks in the same node
     # although this will be slower
     # Only used when resuming from a merged checkpoint.
-    # When `slow_fs` is `True`, `save_memory` is always treated as `True` to reduce file reads.
     save_memory: bool = True
     # Whether the filesystem is slow (e.g. a remote/network filesystem).
     # When `True`, we reduce file reads: instead of letting the local rank 0 of every node
@@ -459,12 +458,25 @@ class ResumeOptions:
     # When `False`, the original behavior is kept (every node's local rank 0 reads the file).
     slow_fs: bool = False
     # combination of slow_fs and save_memory table
-    # slow_fs | save_memory | behavior
-    # --------+-------------+------------------------------------------------------
-    # True    | True        | only global rank 0 reads the file, then broadcast to the local rank 0 of every node, then broadcast trimmed state dict to other ranks in the same node
-    # True    | False       | only global rank 0 reads the file, then broadcast all ranks.
-    # False   | True        | each node's local rank 0 reads the file, then broadcast the trimmed state dict to other ranks in the same node
-    # False   | False       | all ranks read the file and use the full merged state dict.
+    # Behavior for each (slow_fs, save_memory) combination:
+
+    # For merged checkpoint file (`checkpoint` is a file),
+    # we have the following cases:
+    # | slow_fs | save_memory | who holds the dict on entry | action here                                                      |
+    # |---------|-------------|-----------------------------|------------------------------------------------------------------|
+    # | True    | True        | global rank 0               | broadcast to node leaders; trimmed broadcast distributes in-node |
+    # | True    | False       | global rank 0               | one-step broadcast to all ranks                                  |
+    # | False   | True        | each node's local rank 0    | trimmed broadcast distributes in-node                            |
+    # | False   | False       | file: all ranks             | none                                                       |
+
+    # For sharded checkpoint files (`checkpoint` is a directory and `with_merged` = `True`),
+    # we have the following cases:
+    # | slow_fs | save_memory | who holds the dict on entry | action here                                                      |
+    # |---------|-------------|-----------------------------|------------------------------------------------------------------|
+    # | True    | True        | global rank 0               | broadcast to node leaders; trimmed broadcast distributes in-node |
+    # | True    | False       | global rank 0               | one-step broadcast to all ranks                                  |
+    # | False   | True        | each node's local rank 0    | trimmed broadcast distributes in-node                            |
+    # | False   | False       | each node's local rank 0    | broadcast to the ranks in the node                               |
 
 @dataclass
 class SerializerOptions:
