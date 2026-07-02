@@ -448,9 +448,33 @@ class ResumeOptions:
     # If the memory is limited, we can save memory by only loading merged state dict in GPU 0 of each node
     # and broadcast trimmed state dict to other ranks in the same node
     # although this will be slower
-    # Only used when resuming from a merged checkpoint.
+    # Only used when resuming from a merged checkpoint or `with_merged` is True
     save_memory: bool = True
+    # Whether the filesystem is slow (e.g. a remote/network filesystem).
+    # When `True`, we reduce file reads: instead of letting the local rank 0 of every node
+    # read the checkpoint from disk, only the global rank 0 reads it.
+    # When `False`, every node's local rank 0 reads the file.
+    slow_fs: bool = False
+    # Behavior matrix for (slow_fs, save_memory)
+    # Behavior for each (slow_fs, save_memory) combination:
 
+    # For merged checkpoint file (`checkpoint` is a file),
+    # we have the following cases:
+    # | slow_fs | save_memory | who holds the dict on entry | action here                                                      |
+    # |---------|-------------|-----------------------------|------------------------------------------------------------------|
+    # | True    | True        | global rank 0               | broadcast to node leaders; trimmed broadcast distributes in-node |
+    # | True    | False       | global rank 0               | one-step broadcast to all ranks                                  |
+    # | False   | True        | each node's local rank 0    | trimmed broadcast distributes in-node                            |
+    # | False   | False       | file: all ranks             | none                                                       |
+
+    # For sharded checkpoint files (`checkpoint` is a directory and `with_merged` = `True`),
+    # we have the following cases:
+    # | slow_fs | save_memory | who holds the dict on entry | action here                                                      |
+    # |---------|-------------|-----------------------------|------------------------------------------------------------------|
+    # | True    | True        | global rank 0               | broadcast to node leaders; trimmed broadcast distributes in-node |
+    # | True    | False       | global rank 0               | one-step broadcast to all ranks                                  |
+    # | False   | True        | each node's local rank 0    | trimmed broadcast distributes in-node                            |
+    # | False   | False       | each node's local rank 0    | broadcast to the ranks in the node                               |
 
 @dataclass
 class SerializerOptions:
