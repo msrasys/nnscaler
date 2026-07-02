@@ -395,11 +395,11 @@ class Trainer:
             return None
 
         def _broadcast_to_local_ranks(state_dict):
-            logger.info(f"Broadcasting merged checkpoint to all ranks.")
+            logger.info(f"Broadcasting merged checkpoint to in-node ranks.")
             state_dict = self._broadcast_merged_state_dict(
                 state_dict, src_rank=self.local_rank0, dst_ranks=self.local_ranks
             )
-            logger.info(f"Broadcasted merged checkpoint to all ranks.")
+            logger.info(f"Broadcasted merged checkpoint to in-node ranks.")
             return state_dict
 
         def _broadcast_to_all_ranks(state_dict):
