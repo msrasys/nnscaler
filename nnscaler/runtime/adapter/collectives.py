@@ -62,6 +62,23 @@ def move(tensor: Optional[torch.Tensor], shape: Tuple[int], dtype: torch.dtype, 
     return tensor
 
 
+def _assert_no_tensors(obj, path=''):
+    """Assert that a nested structure contains no tensors.
+    Non-tensor IRObjects should not contain tensors; tensors must use
+    the dedicated tensor communication primitives instead."""
+    if isinstance(obj, torch.Tensor):
+        raise AssertionError(
+            f"Unexpected tensor found at '{path}' inside a non-tensor object. "
+            f"Tensors must use tensor communication primitives, not move_object/broadcast_object."
+        )
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            _assert_no_tensors(v, f'{path}["{k}"]')
+    elif isinstance(obj, (list, tuple)):
+        for i, v in enumerate(obj):
+            _assert_no_tensors(v, f'{path}[{i}]')
+
+
 def move_object(obj, src: int, dst: int, async_op=False):
     """
     Move a non-tensor object from source device to destination device
@@ -79,6 +96,7 @@ def move_object(obj, src: int, dst: int, async_op=False):
         obj_list = [None]
         torch.distributed.recv_object_list(obj_list, src=src)
         obj = obj_list[0]
+        _assert_no_tensors(obj)
     CudaTimer().stop(field_name='comm', predefined=True)
     return obj
 
@@ -377,6 +395,7 @@ def broadcast_object(obj, src: int, ranks: List[int], async_op=False):
         obj_list = [None]
         torch.distributed.broadcast_object_list(obj_list, src=src, group=group)
         obj = obj_list[0]
+        _assert_no_tensors(obj)
 
     CudaTimer().stop(field_name='comm', predefined=True)
     return obj

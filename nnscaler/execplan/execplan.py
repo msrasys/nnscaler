@@ -59,36 +59,77 @@ class ExeReuseCell(IRCell):
         if devid in self._cached_dispatched:
             return self._cached_dispatched[devid]
 
-        dispatched_cell = self._cell.dispatch(devid)
+        dispatch_cell = self._cell.dispatch(devid)
 
         def align_with_dispatched(cell_objs, reuse_objs, dispatched_objs):
-            aligned = []
-            used = set()
+            # `dispatched_objs` (dispatch_cell.inputs()/outputs()) is the authoritative
+            # order and is sorted by parent.tid, which differs from the original
+            # (cell_objs, reuse_objs) order. Also, dispatch may narrow a tensor's shape.
+            # So we align each dispatched object back to its reuse object by parent.tid
+            # (identity/equality for non-tensors), then narrow the reuse object when needed.
             pairs = list(zip(cell_objs, reuse_objs))
+            used = set()
+            aligned = []
             for dispatched_obj in dispatched_objs:
                 match_idx = None
-                for idx, (cell_obj, reuse_obj) in enumerate(pairs):
-                    if idx in used:
-                        continue
-                    if cell_obj is dispatched_obj or cell_obj == dispatched_obj:
-                        match_idx = idx
-                        break
+                if isinstance(dispatched_obj, IRSubTensor):
+                    # First pass: prefer exact sub-tensor tid match.
+                    # This avoids mis-pairing when multiple sub-tensors
+                    # share the same parent full tensor (e.g., different
+                    # partitions of the same tensor on different devices).
+                    for idx, (cell_obj, _) in enumerate(pairs):
+                        if idx in used:
+                            continue
+                        if isinstance(cell_obj, IRSubTensor) \
+                                and cell_obj.tid == dispatched_obj.tid:
+                            match_idx = idx
+                            break
+                    # Second pass: fall back to parent.tid match for cases
+                    # where dispatch narrows the tensor (different sub-tensor
+                    # tid but same parent full tensor).
+                    if match_idx is None:
+                        for idx, (cell_obj, _) in enumerate(pairs):
+                            if idx in used:
+                                continue
+                            if isinstance(cell_obj, IRSubTensor) \
+                                    and cell_obj.parent.tid == dispatched_obj.parent.tid:
+                                match_idx = idx
+                                break
+                else:
+                    for idx, (cell_obj, _) in enumerate(pairs):
+                        if idx in used:
+                            continue
+                        if cell_obj is dispatched_obj or cell_obj == dispatched_obj:
+                            match_idx = idx
+                            break
                 assert match_idx is not None, (
                     f"Cannot align dispatched reuse object {dispatched_obj} "
                     f"from cell {self._cell}"
                 )
                 used.add(match_idx)
-                aligned.append(pairs[match_idx][1])
+                reuse_obj = pairs[match_idx][1]
+                # narrow the reuse object if the dispatched cell narrows its shape
+                if isinstance(reuse_obj, IRSubTensor) and isinstance(dispatched_obj, IRSubTensor) \
+                        and reuse_obj.shape != dispatched_obj.shape:
+                    # capture grad before rebuilding: the narrowed tensor's grad is None
+                    grad = reuse_obj.grad
+                    narrowed = reuse_obj.parent.select(dispatched_obj.indmap, dispatched_obj.valmap)
+                    if grad is not None:
+                        assert isinstance(dispatched_obj.grad, IRSubTensor), \
+                            f"Expected IRSubTensor, got {type(dispatched_obj.grad)}"
+                        narrowed.grad = grad.parent.select(dispatched_obj.grad.indmap, dispatched_obj.grad.valmap)
+                    reuse_obj = narrowed
+                aligned.append(reuse_obj)
             return aligned
 
         inputs = align_with_dispatched(
-            self._cell.inputs(), self._inputs, dispatched_cell.inputs()
+            self._cell.inputs(), self._inputs, dispatch_cell.inputs()
         )
         outputs = align_with_dispatched(
-            self._cell.outputs(), self._outputs, dispatched_cell.outputs()
+            self._cell.outputs(), self._outputs, dispatch_cell.outputs()
         )
         reuse = ExeReuseCell(
-            dispatched_cell, inputs, outputs,
+            dispatch_cell, inputs, outputs,
             micro_batch_id=self._micro_batch_id
         )
         reuse._id = self._id
@@ -269,7 +310,16 @@ class ExecutionPlan:
             for idx in range(len(nodes)):
                 node = nodes[idx]
                 # print(f'handling {node}')
-                if len(node.device) == 1: continue  # no need for dispatch
+                if len(node.device) == 1:
+                    # Single-device segments still need dispatch when their
+                    # per-device IO has been narrowed by IRSegmentExpander.
+                    # Without dispatch, the ExeReuseCell keeps the original
+                    # (un-narrowed) output tensor IDs while inter-segment
+                    # adapters reference the narrowed tensor IDs, causing
+                    # UnboundLocalError in the generated schedule code.
+                    unwrap = node.cell if isinstance(node, ExeReuseCell) else node
+                    if not isinstance(unwrap, IRSegment):
+                        continue
                 dnode = cached_dispatch(node, devid, dispatched)
                 nodes[idx] = dnode
 
