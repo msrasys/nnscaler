@@ -1233,7 +1233,7 @@ def trainer_resumable_dataloader(save_dir):
         ])
         trainer.run()
         assert trainer.dataloader_resumed
-        assert 'Broadcasting merged checkpoint to all ranks.' in log.getvalue()  # no warning about dataloader states
+        assert 'Broadcasting merged checkpoint to in-node ranks.' in log.getvalue()  # no warning about dataloader states
 
     # resume from auto-merged with save_memory
     ckpt5_savedir = save_dir / 'ckpt5'
