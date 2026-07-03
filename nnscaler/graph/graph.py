@@ -981,6 +981,7 @@ class IRGraph(IRSegment):
 
         def insert_identity(tensor: Union[IRTensor, IRObject], sid: int) -> IRFwOperation:
             fwop = Identity(tensor)
+            fwop.comment = 'graph.staging:identity'
             if not isinstance(tensor, IRTensor):
                 output = tensor.like()
                 fwop.set_output(0, output)

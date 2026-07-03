@@ -520,6 +520,7 @@ def _identity_segment_output(graph: IRGraph, tensor: IRSubTensor, segment: IRSeg
     insert_idx = last_fwop_idx + 1
 
     fwop = Identity(tensor)
+    fwop.comment = 'fn:identity_segment_output'
     output = tensor.parent.like().tosub()
     fwop.set_output(0, output)
     fwop.device = segment.device
@@ -856,7 +857,6 @@ def fn(
         stage_id: int,
     ) -> None:
         old_stage_info = tensor_splits.setdefault(old_ftensor, {})
-        old_stage_info.setdefault(stage_id, set()).add('rn')
         new_stage_info = tensor_splits.setdefault(new_ftensor, {})
         for following_stage_id, splits in list(old_stage_info.items()):
             if following_stage_id <= stage_id:
@@ -959,6 +959,7 @@ def fn(
                 # force identity nodes to be replicated
                 # these nodes are usually added for data transfer between stages in graph.staging
                 # TODO: is it possible to have TP here?
+                node.comment = 'fn:staging_identity'
                 op_plans[node] = OpPlan(op=node, stage_id=stage_id, partition=None)
                 input_tensors = [t for t in node.inputs() if isinstance(t, IRSubTensor)]
                 output_tensors = [t for t in node.outputs() if isinstance(t, IRSubTensor)]
@@ -982,7 +983,7 @@ def fn(
                 # new full tensor that replaces uses in following stages, so move
                 # those split records to the new tensor before activation multiref.
                 move_following_stage_splits(old_ftensor, new_ftensor, stage_id)
-                seg.multiref(old_ftensor, comment='activation')
+                seg.multiref(old_ftensor, comment='fn:activation_output_consumer_split')
                 activation_multirefed.add((stage_id, id(old_ftensor)))
 
     # add multiref to an activation tensor when the states of the tensor and its grad are different
@@ -1007,11 +1008,9 @@ def fn(
                 continue
             split_list = list(splits)
             has_partitioned_consumer = any(split not in ('rr', 'rn') for split in split_list)
-            if len(split_list) > 1 or (
-                is_seg_output[idx] and has_partitioned_consumer
-            ):
+            if len(split_list) > 1:
                 _logger.debug(f'add multiref for {ftensor} in stage {stage}')
-                stage.multiref(ftensor, comment='activation')
+                stage.multiref(ftensor, comment='fn:activation_mixed_partition')
 
     # stage-wise tensor parallelism
     curr_devices = list(range(ngpus))

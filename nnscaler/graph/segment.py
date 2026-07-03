@@ -1345,6 +1345,7 @@ class IRSegmentExpander:
 
         if ftensor in self._dataloader_outputs:
             # If the full tensor is an output of the dataloader, we don't narrow it.
+            _logger.info(f'  narrow_input FAIL {ftensor} shape={ftensor.shape}: dataloader output')
             return None
 
         from nnscaler.runtime.function.function import identity as _identity_fn
@@ -1352,8 +1353,10 @@ class IRSegmentExpander:
         # Trace through identity nodes to find the actual consumption pattern.
         consumers = self._segment.consumers(ftensor)
         assert all(len(consumer.device) == 1 for consumer in consumers), "Not support for multi-device"
+        traced_through_identity = False
         if all(consumer.fn == _identity_fn for consumer in consumers) \
             and len(set(consumer.device[0] for consumer in consumers)) == len(consumers):
+            traced_through_identity = True
             ftensor = consumers[0].oobjs()[0].parent
             consumers = self._segment.consumers(ftensor)
 
@@ -1361,11 +1364,15 @@ class IRSegmentExpander:
         # tensor can be passed through without any internal consumption,
         # e.g., output of segment.
         if not ctensors:
+            _logger.info(f'  narrow_input FAIL {original_ftensor} shape={original_ftensor.shape}: no ctensors (pass-through), traced_identity={traced_through_identity}')
             return None
 
         full_indmap = tuple((0, s) for s in ftensor.shape)
         if any(ct.indmap == full_indmap for ct in ctensors):
             # Some ops directly consume the full tensor — can't narrow
+            consumer_fns = [c.fn.__name__ if hasattr(c.fn, '__name__') else str(c.fn) for c in self._segment.consumers(ftensor)]
+            full_consumers = [c.fn.__name__ if hasattr(c.fn, '__name__') else str(c.fn) for c in self._segment.consumers(ftensor) if any(ct.indmap == full_indmap and ct in [inp for inp in c.inputs() if isinstance(inp, IRSubTensor)] for ct in ctensors)]
+            _logger.info(f'  narrow_input FAIL {original_ftensor} shape={original_ftensor.shape}: full-tensor consumer exists, traced_identity={traced_through_identity}, consumers={consumer_fns}')
             return None
 
         # Group ctensors by device
@@ -1384,6 +1391,7 @@ class IRSegmentExpander:
         for dev, cts in dev_partitions.items():
             unique_indmaps = set(ct.indmap for ct in cts)
             if len(unique_indmaps) != 1:
+                _logger.info(f'  narrow_input FAIL {original_ftensor} shape={original_ftensor.shape}: dev {dev} has {len(unique_indmaps)} unique indmaps: {unique_indmaps}, traced_identity={traced_through_identity}')
                 return None
             dev_unique[dev] = cts[0]
 
@@ -1393,8 +1401,10 @@ class IRSegmentExpander:
         for i, t1 in enumerate(partitions):
             for t2 in partitions[i+1:]:
                 if t1 != t2 and t1.overlap(t2):
+                    _logger.info(f'  narrow_input FAIL {original_ftensor} shape={original_ftensor.shape}: overlapping partitions, traced_identity={traced_through_identity}')
                     return None
 
+        _logger.info(f'  narrow_input OK {original_ftensor} shape={original_ftensor.shape}: narrowed to {len(dev_unique)} devices, traced_identity={traced_through_identity}')
         return dev_unique
 
     def _try_narrow_segment_ptensors(self, ftensor: IRFullTensor) -> Optional[Dict[int,IRSubTensor]]:
@@ -1406,12 +1416,14 @@ class IRSegmentExpander:
 
         if ftensor in self._graph_outputs:
             # If the full tensor is an output of the graph, we don't narrow it.
+            _logger.info(f'  narrow_output FAIL {ftensor} shape={ftensor.shape}: graph output')
             return None
 
         ptensors = self._segment.ptensors(ftensor)
         # pass through without any internal production, e.g., input of segment.
         # Here we treat Identity as a normal operator, and we don't trace through it to find the actual production pattern.
         if not ptensors:
+            _logger.info(f'  narrow_output FAIL {ftensor} shape={ftensor.shape}: no ptensors (pass-through input)')
             return None
 
         dev_partitions: Dict[int, List[IRSubTensor]] = {}
@@ -1425,12 +1437,14 @@ class IRSegmentExpander:
                 dev_partitions.setdefault(devid, []).append(new_pt)
 
         if not dev_partitions:
+            _logger.info(f'  narrow_output FAIL {ftensor} shape={ftensor.shape}: empty dev_partitions')
             return None
 
         dev_unique: Dict[int, IRSubTensor] = {}
         for dev, pts in dev_partitions.items():
             unique_indmaps = set(pt.indmap for pt in pts)
             if len(unique_indmaps) != 1:
+                _logger.info(f'  narrow_output FAIL {ftensor} shape={ftensor.shape}: dev {dev} has {len(unique_indmaps)} unique indmaps')
                 return None
             dev_unique[dev] = pts[0]
 
@@ -1438,6 +1452,7 @@ class IRSegmentExpander:
         for i, t1 in enumerate(partitions):
             for t2 in partitions[i+1:]:
                 if t1 != t2 and t1.overlap(t2):
+                    _logger.info(f'  narrow_output FAIL {ftensor} shape={ftensor.shape}: overlapping partitions')
                     return None
 
         # If the produced full tensor is also consumed inside the same segment
@@ -1450,8 +1465,10 @@ class IRSegmentExpander:
             for devid in ct.device:
                 produced = dev_unique[devid]
                 if ct.indmap != produced.indmap:
+                    _logger.info(f'  narrow_output FAIL {ftensor} shape={ftensor.shape}: internal consumer indmap mismatch on dev {devid}')
                     return None
 
+        _logger.info(f'  narrow_output OK {ftensor} shape={ftensor.shape}: narrowed to {len(dev_unique)} devices')
         return dev_unique
 
     def get_per_device_inout(self):
@@ -1513,6 +1530,7 @@ class IRSegmentExpander:
         if not isinstance(segment, IRSegment):
             raise ValueError("collect_device_inout_map should be called on an IRSegment")
 
+        _logger.info(f'=== Segment {segment} inputs narrowing (devices={devices}) ===')
         for t in segment._inputs:
             if isinstance(t, IRSubTensor) and (
                 dev_unique := self._try_narrow_segment_ctensors(t.parent)
@@ -1521,9 +1539,12 @@ class IRSegmentExpander:
                 for dev, sub_tensor in dev_unique.items():
                     self._per_device_input[dev].append(IR.set_object_device(sub_tensor, dev))
             else:
+                if isinstance(t, IRSubTensor):
+                    _logger.info(f'  (not narrowed input: {t.parent} shape={t.parent.shape})')
                 for dev in devices:
                     self._per_device_input[dev].append(IR.copy_and_set_object_device(t, dev))
 
+        _logger.info(f'=== Segment {segment} outputs narrowing (devices={devices}) ===')
         for t in segment._outputs:
             if isinstance(t, IRSubTensor) and (
                 dev_unique := self._try_narrow_segment_ptensors(t.parent)
@@ -1532,6 +1553,8 @@ class IRSegmentExpander:
                 for dev, sub_tensor in dev_unique.items():
                     self._per_device_output[dev].append(IR.set_object_device(sub_tensor, dev))
             else:
+                if isinstance(t, IRSubTensor):
+                    _logger.info(f'  (not narrowed output: {t.parent} shape={t.parent.shape})')
                 for dev in devices:
                     self._per_device_output[dev].append(IR.copy_and_set_object_device(t, dev))
 
