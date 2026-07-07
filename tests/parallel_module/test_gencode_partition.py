@@ -664,7 +664,12 @@ def _pp_shared_policy(graph, cfg):
     relu_found = False
     for node in get_pas_ops(graph):
         if relu_found:
-            yield OpPlan(node,stage_id=1)
+            if node.fn == torch.add:
+                yield OpPlan(node, stage_id=1, partition=OpPartition(input=1, dim=0))
+            elif node.fn == _shared_skip_op:
+                yield OpPlan(node, stage_id=1, partition=OpPartition(input=0, dim=0))
+            else:
+                yield OpPlan(node,stage_id=1)
         else:
             if node.fn == torch.nn.functional.relu:
                 yield OpPlan(node, stage_id=0, partition=OpPartition(input=1, dim=1))
@@ -713,6 +718,49 @@ def test_pp_shared_model(tmp_path, pipeline_multiref_replicated_params):
             assert _gencode_contains(tmp_path, PPSharedModel, rank, r'self.register_parameter\(')
         else:
             assert not _gencode_contains(tmp_path, PPSharedModel, rank, r'self.register_parameter\(')
+
+
+class PPSharedMutipleConsumersModel(torch.nn.Module):
+    def __init__(self, hidden_dim):
+        super().__init__()
+        self.w = torch.nn.Parameter(torch.randn(hidden_dim, hidden_dim))
+
+    def forward(self, x):
+        x = torch.matmul(x, self.w)
+        x = torch.nn.functional.relu(x)
+        x = torch.matmul(x, self.w)
+        y = _shared_skip_op(x, self.w)
+        z = x + self.w
+        return (x + y + z).sum()
+
+
+@replace_all_device_with('cpu')
+def test_pp_shared_model_complex_comsumers(tmp_path):
+    m = PPSharedMutipleConsumersModel(4)
+    m.train()
+    parallelize(
+        m,
+        {'x': torch.randn(4, 4)},
+        _pp_shared_policy,
+        ComputeConfig(2, 4, use_end2end=True,
+            pas_config={
+                'pipeline_nmicros': 2,
+                'pipeline_size': 2,
+                'pipeline_multiref_replicated_params': True,
+            }
+        ),
+        gen_savedir=tmp_path,
+        load_module=False,
+        reuse='override',
+    )
+    # only the first stage (rank 0/2) should have the shared parameter,
+    # and only it should register it as a parameter
+    # (the other stage gets it as a non-parameter shared input)
+    for rank in range(4):
+        if rank % 2 == 0:
+            assert _gencode_contains(tmp_path, PPSharedMutipleConsumersModel, rank, r'self.register_parameter\(')
+        else:
+            assert not _gencode_contains(tmp_path, PPSharedMutipleConsumersModel, rank, r'self.register_parameter\(')
 
 
 class LossDataModel(torch.nn.Module):
@@ -884,3 +932,91 @@ def test_loss_explicit_multiref(tmp_path):
     #     multiref_24 = nnscaler.runtime.adapter.nn.allreduce_identity(multiref_52, ranks=[0, 1])
     #     del multiref_52
     #     return multiref_24, getattr_2_25
+
+
+class SharedOutputModel1(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.w0 = torch.nn.Parameter(torch.randn(4, 4))
+        self.w1 = torch.nn.Parameter(torch.randn(4, 4))
+        self.w2 = torch.nn.Parameter(torch.randn(4, 4))
+
+    def forward(self, raw_x):
+        x = torch.nn.functional.linear(raw_x, self.w0)
+        a = _shared_skip_op(x, self.w1)
+        return x, a
+
+
+class SharedOutputModel2(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.w0 = torch.nn.Parameter(torch.randn(4, 4))
+        self.w1 = torch.nn.Parameter(torch.randn(4, 4))
+        self.w2 = torch.nn.Parameter(torch.randn(4, 4))
+
+    def forward(self, raw_x):
+        x = torch.nn.functional.linear(raw_x, self.w0)
+        a = torch.matmul(x, self.w1)
+        return x, a
+
+
+class SharedOutputModel3(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.w0 = torch.nn.Parameter(torch.randn(4, 4))
+        self.w1 = torch.nn.Parameter(torch.randn(4, 4))
+        self.w2 = torch.nn.Parameter(torch.randn(4, 4))
+
+    def forward(self, raw_x):
+        x = torch.nn.functional.linear(raw_x, self.w0)
+        a = torch.matmul(x, self.w1)
+        b = identity(x)
+        return b, a
+
+
+@replace_all_device_with('cpu')
+def test_shared_output_with_no_grad_reduce_consumer(tmp_path):
+    m = SharedOutputModel1()
+    m.train()
+    parallelize(
+        m,
+        {'raw_x': torch.randn(4, 4)},
+        _shared_input_partition_policy,
+        ComputeConfig(2, 4, use_end2end=False),
+        gen_savedir=tmp_path,
+        load_module=False,
+        reuse='override',
+    )
+    assert True
+
+
+@replace_all_device_with('cpu')
+def test_shared_output_with_grad_reduce_consumer(tmp_path):
+    m = SharedOutputModel2()
+    m.train()
+    parallelize(
+        m,
+        {'raw_x': torch.randn(4, 4)},
+        _shared_input_partition_policy,
+        ComputeConfig(2, 4, use_end2end=False),
+        gen_savedir=tmp_path,
+        load_module=False,
+        reuse='override',
+    )
+    assert True
+
+
+@replace_all_device_with('cpu')
+def test_shared_output_with_explicit_identity(tmp_path):
+    m = SharedOutputModel3()
+    m.train()
+    parallelize(
+        m,
+        {'raw_x': torch.randn(4, 4)},
+        _shared_input_partition_policy,
+        ComputeConfig(2, 4, use_end2end=False),
+        gen_savedir=tmp_path,
+        load_module=False,
+        reuse='override',
+    )
+    assert True
