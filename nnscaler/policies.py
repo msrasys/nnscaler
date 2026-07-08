@@ -593,6 +593,7 @@ def _identity_segment_output(graph: IRGraph, tensor: IRSubTensor, segment: IRSeg
     insert_idx = last_fwop_idx + 1
 
     fwop = Identity(tensor)
+    fwop.comment = f'fn identity for segment output'
     output = tensor.parent.like().tosub()
     fwop.set_output(0, output)
     fwop.device = segment.device
@@ -720,6 +721,14 @@ def fn(
 
     op_plans = {r.op: r for r in result}
     ngpus: int = cfg.plan_ngpus
+    nstages: int = len(set(r.stage_id for r in op_plans.values() if r.stage_id != -1))
+    if nstages == 0:
+        nstages = 1
+    if ngpus % nstages != 0:
+        raise ValueError(f"plan_ngpus {ngpus} should be divisible by nstages {nstages}")
+    # not all schedulers support pp_size < nstages
+    pp_size = cfg.pas_config.get('pipeline_size', nstages)
+    tp_size = ngpus // pp_size
 
     recompute_groups: dict[int, list[IRFwOperation]] = {}
     recompute_last_id: int = -1
@@ -803,7 +812,9 @@ def fn(
             # and then check the rest partitions are satisfied or not
             op_first_partition = op_partitions[0]
             partitioned_nodes = op_plan.op.algorithm('dim')\
-                .instantiate(idx=op_first_partition.input, dim=op_first_partition.dim, num=ngpus)
+                .instantiate(idx=op_first_partition.input, dim=op_first_partition.dim, num=tp_size)
+            if not partitioned_nodes:
+                raise RuntimeError(f"Failed to partition the operator {op_plan.op} with {op_first_partition}/{tp_size}, please check the partition plan.")
             subnode = partitioned_nodes[0]  # first subnode carries all necessary partition info
             assert isinstance(subnode, IRDimops), "Internal Error: partitioned node should be IRDimops"
 
@@ -912,15 +923,12 @@ def fn(
                 raise ValueError(f"OpPlan contains operator {op_plan.op} not in the graph or not a forward operator")
 
     pp_segs = [graph]
-    nstages = len(pp_stages)
+    assert nstages == len(pp_stages), "Internal Error: nstages should be equal to the number of pipeline stages"
     pp_enabled = nstages > 1
-    # not all schedulers support pp_size < nstages
-    pp_size = cfg.pas_config.get('pipeline_size', nstages)
     nmicros = cfg.pas_config.get('pipeline_nmicros', None)
     scheduler = cfg.pas_config.get('pipeline_scheduler', '1f1b')
     pp_multiref_replicated_params = \
         cfg.pas_config.get('pipeline_multiref_replicated_params', True)
-    tp_size = ngpus // pp_size
 
     if pp_enabled:
         if not cfg.use_end2end:
