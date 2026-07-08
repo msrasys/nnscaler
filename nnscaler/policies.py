@@ -73,20 +73,6 @@ def is_tensor_in_output(t: IRFullTensor, graph: IRSegment) -> bool:
     return False
 
 
-def is_tensor_in_input(t: IRFullTensor, graph: IRSegment) -> bool:
-    for input in IRCell.get_objects_from_complex(graph.inputs()):
-        if isinstance(input, IRSubTensor) and input.parent == t:
-            return True
-    return False
-
-
-def get_sub_tensors_of_parent(t: IRFullTensor, tensors) -> List[IRSubTensor]:
-    """
-    Get all subtensors in ``tensors`` that have the same parent as ``t``.
-    """
-    return [x for x in tensors if isinstance(x, IRSubTensor) and x.parent == t]
-
-
 def auto_multiref(graph: IRGraph):
     for ftensor in graph.full_tensors():
         if ftensor.is_grad(): continue
@@ -532,6 +518,51 @@ def _move_tensor_splits(
         del old_stage_info[following_stage_id]
 
 
+def _get_new_node_outputs_splits(node: IRFwOperation, stage: IRSegment, op_plans: dict, op_partition_maps: dict):
+    new_node_splits = {}
+    for new_output in node.outputs():
+        if not isinstance(new_output, IRSubTensor):
+            continue
+
+        for consumer in stage.consumers(new_output.parent):
+            if consumer.fn == multiref:
+                continue # skip multiref nodes
+
+            tensor_idx = IR.index_with_same_parent(new_output.parent, consumer.inputs())
+            op_partition_map = op_partition_maps.get(consumer, {})
+            stage_id = op_plans[consumer].stage_id
+
+            if not op_partition_map:
+                tensor_split = 'rn'
+            else:
+                assert tensor_idx in op_partition_map, "Internal Error: tensor_idx should be in op_partition_map"
+                tensor_split = op_partition_map[tensor_idx]
+
+            new_node_splits.setdefault(new_output.parent, {}).setdefault(stage_id, set()).add(tensor_split)
+
+    return new_node_splits
+
+
+def _refresh_grads(segment: IRSegment, tensor: IRSubTensor):
+    if not tensor.requires_grad:
+        return
+
+    consumers = segment.consumers(tensor.parent)
+    if not consumers:
+        return
+
+    segment.infer_grad(tensor.parent)
+
+    for fwop in consumers:
+        if fwop.fn == multiref or not fwop.mirror:
+            continue # skip multiref nodes
+        fins = [t for t in fwop.iobjs() if isinstance(t, IRSubTensor)]
+        igrads = [t.grad for t in fins if t.grad is not None]
+        with segment.mirror.update(fwop.mirror):
+            for i, igrad in enumerate(igrads):
+                fwop.mirror.set_output(i, igrad)
+
+
 def _identity_segment_output(graph: IRGraph, tensor: IRSubTensor, segment: IRSegment, all_segments: List[IRSegment]) -> IRFwOperation:
     """
     Insert an identity operator for the segment output tensor to make it easier to handle in policy.
@@ -554,11 +585,6 @@ def _identity_segment_output(graph: IRGraph, tensor: IRSubTensor, segment: IRSeg
 
     """
     from nnscaler.graph.function.function import Identity
-
-    # Whether the tensor is a real graph output (an external gradient contributor).
-    # This must be captured *before* the output replacement below, which removes
-    # the tensor from the graph outputs. See the `infer_grad` call at the end.
-    was_graph_output = is_tensor_in_output(tensor.parent, graph)
 
     last_fwop_idx = -1
     for idx, node in enumerate(segment._nodes):
@@ -620,34 +646,26 @@ def _identity_segment_output(graph: IRGraph, tensor: IRSubTensor, segment: IRSeg
         # forward
         if tensor in IRCell.get_objects_from_complex(s.iobjs()):
             s.replace_input(tensor, fwop.output(0))
-            for consumer in s.consumers(tensor.parent):
+            consumers = s.consumers(tensor.parent)
+            # only Identity operator can consume the segment output tensor in the following segments
+            assert len(consumers) <= 1, "Internal Error: there should be zero or one consumer for the segment input tensor"
+            for consumer in consumers:
                 with s.update(consumer):
+                    # grad.valmap is (0, 1)
                     consumer.replace_input(tensor, fwop.output(0))
 
         # backward grad
         if tensor.grad and s.mirror and tensor.grad in IRCell.get_objects_from_complex(s.mirror.oobjs()):
             s.mirror.replace_output(tensor.grad, fwop.output(0).grad)
-            for producer in s.mirror.producers(tensor.grad.parent):
+            producers = s.mirror.producers(tensor.grad.parent)
+            # only Identity operator can produce the segment grad output tensor in the following segments
+            assert len(producers) <= 1, "Internal Error: there should be zero or one producer for the segment grad output tensor"
+            for producer in producers:
                 with s.mirror.update(producer):
+                    # valmap is (0, 1)
                     producer.replace_output(tensor.grad, fwop.output(0).grad)
 
-    # The just-inserted identity becomes an extra gradient contributor for the
-    # original tensor (which is now both consumed by other operators and passed
-    # through the identity). This only causes a problem when the tensor is a real
-    # graph output: `IRGraph.backward` gives graph outputs a full ``(0, 1)``
-    # gradient on the output side, *separate from* the per-consumer gradients, so
-    # after the identity turns the output side into a consumer there are two
-    # full ``(0, 1)`` gradients that cannot be accumulated together (the
-    # ``Not accumable`` failure in ``local_consumer_multiref``).
-    #
-    # Re-inferring the gradient value-maps re-distributes them into the
-    # exponential accumulation format so their sum is a complete value again.
-    # We must NOT do this for pipeline stage-boundary outputs (which are not
-    # graph outputs): there the downstream gradient is already represented among
-    # the consumers, and re-inferring would disturb the existing multiref-based
-    # handling.
-    if tensor.requires_grad: # and was_graph_output:
-        segment.infer_grad(tensor.parent)
+    _refresh_grads(segment, tensor)
 
     return fwop
 
@@ -971,16 +989,7 @@ def fn(
             # we can't use `_move_tensor_splits` here
             # because we can't distingish each output of multiref tensor
             assert len(multiref_node.outputs()) == len(consumers), "Internal Error: multiref outputs should match the number of consumers"
-            for consumer, multiref_tensor in zip(consumers, multiref_node.outputs()):
-                tensor_idx = IR.index_with_same_parent(multiref_tensor, consumer.inputs())
-                op_partition_map = op_partition_maps.get(consumer, {})
-                if not op_partition_map:
-                    tensor_split = 'rn'
-                else:
-                    assert tensor_idx in op_partition_map, "Internal Error: tensor_idx should be in op_partition_map"
-                    tensor_split = op_partition_map[tensor_idx]
-                new_tensor_splits.setdefault(multiref_tensor.parent, {})\
-                    .setdefault(op_plan.stage_id, set()).add(tensor_split)
+            new_tensor_splits = _get_new_node_outputs_splits(multiref_node, graph, op_plans, op_partition_maps)
 
     tensor_splits.update(new_tensor_splits)
 
@@ -1010,12 +1019,16 @@ def fn(
                 # TODO: is it possible to have TP here?
                 op_plans[node] = OpPlan(op=node, stage_id=stage_id, partition=None)
                 assert len(stage.consumers(node.input(0).parent)) == 1, "Internal Error: identity node input should only consumed by itself."
-                # 'rn' means `identity` is replicated
-                tensor_splits[node.input(0).parent][stage_id] = set(['rn'])
                 # only real tensors participate in tensor_splits bookkeeping;
                 # identity nodes added for non-tensor IRObject transfer have no splits.
                 if isinstance(node.input(0), IRSubTensor):
                     assert isinstance(node.output(0), IRSubTensor)
+                    # 'rn' means `identity` is replicated
+                    tensor_splits[node.input(0).parent][stage_id] = set(['rn'])
+                    tensor_splits.update(
+                        _get_new_node_outputs_splits(node, stage, op_plans, op_partition_maps)
+                    )
+
                     # If the tensor is a segment output,
                     # we need to move the split info in the following stages.
                     _move_tensor_splits(
@@ -1031,21 +1044,13 @@ def fn(
                 continue
             if seg.consumers(sub_tensor.parent):
                 ident_op = _identity_segment_output(graph, sub_tensor, seg, pp_segs)
-
-                # try not to introduce new splits (similar to `auto` partition)
-                tensor_split_info = tensor_splits.setdefault(sub_tensor.parent, {}).setdefault(stage_id, set())
-                assert len(tensor_split_info) >= 1, "Internal Error: tensor_splits should have at least one split for segment output tensor"
-                tensor_split = list(tensor_split_info)
-                if len(tensor_split) == 1 and isinstance(tensor_split[0], int):
-                    # use the same split info for the identity operator as the original tensor
-                    # to avoid introducing new splits (to avoid multiref)
-                    op_plans[ident_op] = OpPlan(op=ident_op, stage_id=stage_id, partition=OpPartition(input=0, dim=tensor_split[0]))
-                else:
-                    # if there are multiple split info for the original tensor,
-                    # we just replicate the identity operator
-                    op_plans[ident_op] = OpPlan(op=ident_op, stage_id=stage_id, partition=None)
-                    # 'rn' means `ident_op` is replicated
-                    tensor_splits[sub_tensor.parent].setdefault(stage_id, set()).add('rn')
+                # always replicate the identity operator
+                # even when the original tensor is partitioned
+                # as it is the output of segment which needs a complete tensor.
+                op_plans[ident_op] = OpPlan(op=ident_op, stage_id=stage_id, partition=None)
+                # 'rn' means `ident_op` is replicated
+                tensor_splits[sub_tensor.parent].setdefault(stage_id, set()).add('rn')
+                op_partition_maps[ident_op] = {}
 
                 # the tensor is a segment output,
                 # we have replaced the original output tensor with the identity output tensor
@@ -1079,7 +1084,7 @@ def fn(
             split_list = list(splits)
             if len(split_list) > 1:
                 _logger.debug(f'add multiref for {ftensor} in stage {stage}')
-                stage.multiref(ftensor, comment='fn: activation')
+                stage.multiref(ftensor, comment='fn activation')
 
     # stage-wise tensor parallelism
     curr_devices = list(range(ngpus))

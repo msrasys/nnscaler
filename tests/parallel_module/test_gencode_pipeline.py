@@ -1,3 +1,5 @@
+from re import RegexFlag
+
 import torch
 import pytest
 
@@ -298,3 +300,124 @@ def test_gencode_split_segment(tmp_path):
     assert _gencode_contains(
         tmp_path, SplitSegmentModule, 6, r'nnscaler.runtime.adapter.nn.allreduce_identity\(sum_.*, ranks=\[6, 7\]\)'
     )
+
+
+class PassThroughSegmentModule(torch.nn.Module):
+    def __init__(self, dim: int = 64):
+        super().__init__()
+        self.layers = torch.nn.ModuleList([])
+        for _ in range(6):
+            self.layers.append(torch.nn.Linear(dim, dim, bias=False))
+        self.layerx = torch.nn.Linear(dim, dim, bias=False)
+
+    def forward(self, data: torch.Tensor):
+        x0 = self.layers[0](data)
+        x1 = self.layers[1](x0)
+        x2 = self.layers[2](x1)
+        x3 = self.layers[3](x2) + x0
+        x4 = self.layers[4](x3)
+        x5 = self.layers[5](x4)
+        loss = torch.sum(x5)
+        return loss
+
+
+def per_layer_segment_pas(graph, cfg):
+    from nnscaler.policies import OpPlan, OpPartition, get_layer_index, get_called_self_module_name, get_pas_ops
+
+    last_stage_id = 0
+    for node in get_pas_ops(graph):
+        if torch.nn.modules.linear.Linear in node.module_class_chain:
+            last_stage_id = get_layer_index(node.fqn)
+        yield OpPlan(node, stage_id=last_stage_id)
+
+
+@replace_all_device_with('cpu')
+def test_gencode_split_segment_pass_through(tmp_path):
+    m = PassThroughSegmentModule()
+    m.train()
+    parallelize(
+        m,
+        {'data': torch.randn(64, 64)},
+        pas_policy=per_layer_segment_pas,
+        compute_config= ComputeConfig(
+            6, 12,
+            constant_folding=False,
+            use_end2end=True,
+            pas_config=dict(
+                pipeline_nmicros=6,
+                pipeline_scheduler='1f1b'
+            )
+        ),
+        gen_savedir=tmp_path,
+        load_module=False,
+        reuse='override',
+    )
+    assert _gencode_contains(
+        tmp_path, PassThroughSegmentModule, 1,
+        r'def segment.*'
+        r'nnscaler.runtime.function.identity.*'
+        r'nnscaler.runtime.function.multiref.*'
+        r'torch.nn.functional.linear.*'
+        r'return linear_.*, linear_.*'
+        r'def _train_step.*',
+        flags=RegexFlag.DOTALL
+    )
+    assert _gencode_contains(
+        tmp_path, PassThroughSegmentModule, 2,
+        r'def segment.*'
+        r'nnscaler.runtime.function.identity.*'
+        r'nnscaler.runtime.function.identity.*'
+        r'torch.nn.functional.linear.*'
+        r'return linear_.*, linear_.*'
+        r'def _train_step.*',
+        flags=RegexFlag.DOTALL
+    )
+    assert _gencode_contains(
+        tmp_path, PassThroughSegmentModule, 3,
+        r'def segment.*'
+        r'nnscaler.runtime.function.identity.*'
+        r'nnscaler.runtime.function.identity.*'
+        r'torch.nn.functional.linear.*'
+        r'torch.add.*'
+        r'return add_.*'
+        r'def _train_step.*',
+        flags=RegexFlag.DOTALL
+    )
+    # code in rank 1:
+    # def segment36(self, linear_35):
+    #     linear_66 = nnscaler.runtime.function.identity(linear_35)
+    #     del linear_35
+    #     # created at IRAdapterGener:local_consumer_multiref
+    #     linear_100, linear_104 = nnscaler.runtime.function.multiref(linear_66, times=2)
+    #     del linear_66
+    #     # File "/data/weijiangxu/nnscaler/tests/parallel_module/test_gencode_pipeline.py", line 313, in forward,  x1 = self.layers[1](x0)
+    #     linear_1_37 = torch.nn.functional.linear(linear_100, self.layers_1_weight_36, bias=None)
+    #     del linear_100
+    #     linear_94 = nnscaler.runtime.function.identity(linear_104)
+    #     del linear_104
+    #     return linear_1_37, linear_94
+
+    # code in rank 2:
+    # def segment40(self, linear_1_37, linear_94):
+    #     linear_1_78 = nnscaler.runtime.function.identity(linear_1_37)
+    #     del linear_1_37
+    #     linear_70 = nnscaler.runtime.function.identity(linear_94)
+    #     del linear_94
+    #     # File "/data/weijiangxu/nnscaler/tests/parallel_module/test_gencode_pipeline.py", line 314, in forward,  x2 = self.layers[2](x1)
+    #     linear_2_39 = torch.nn.functional.linear(linear_1_78, self.layers_2_weight_38, bias=None)
+    #     del linear_1_78
+    #     return linear_2_39, linear_70
+
+    # code in rank 3:
+    # def segment45(self, linear_2_39, linear_70):
+    #     linear_2_82 = nnscaler.runtime.function.identity(linear_2_39)
+    #     del linear_2_39
+    #     linear_74 = nnscaler.runtime.function.identity(linear_70)
+    #     del linear_70
+    #     # File "/data/weijiangxu/nnscaler/tests/parallel_module/test_gencode_pipeline.py", line 315, in forward,  x3 = self.layers[3](x2) + x0
+    #     linear_3_41 = torch.nn.functional.linear(linear_2_82, self.layers_3_weight_40, bias=None)
+    #     del linear_2_82
+    #     # File "/data/weijiangxu/nnscaler/tests/parallel_module/test_gencode_pipeline.py", line 315, in forward,  x3 = self.layers[3](x2) + x0
+    #     add_42 = torch.add(linear_3_41, linear_74, alpha=1)
+    #     del linear_74, linear_3_41
+    #     return add_42
