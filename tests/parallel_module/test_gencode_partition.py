@@ -720,7 +720,7 @@ def test_pp_shared_model(tmp_path, pipeline_multiref_replicated_params):
             assert not _gencode_contains(tmp_path, PPSharedModel, rank, r'self.register_parameter\(')
 
 
-class PPSharedMutipleConsumersModel(torch.nn.Module):
+class PPSharedMultipleConsumersModel(torch.nn.Module):
     def __init__(self, hidden_dim):
         super().__init__()
         self.w = torch.nn.Parameter(torch.randn(hidden_dim, hidden_dim))
@@ -736,7 +736,7 @@ class PPSharedMutipleConsumersModel(torch.nn.Module):
 
 @replace_all_device_with('cpu')
 def test_pp_shared_model_complex_comsumers(tmp_path):
-    m = PPSharedMutipleConsumersModel(4)
+    m = PPSharedMultipleConsumersModel(4)
     m.train()
     parallelize(
         m,
@@ -758,9 +758,9 @@ def test_pp_shared_model_complex_comsumers(tmp_path):
     # (the other stage gets it as a non-parameter shared input)
     for rank in range(4):
         if rank % 2 == 0:
-            assert _gencode_contains(tmp_path, PPSharedMutipleConsumersModel, rank, r'self.register_parameter\(')
+            assert _gencode_contains(tmp_path, PPSharedMultipleConsumersModel, rank, r'self.register_parameter\(')
         else:
-            assert not _gencode_contains(tmp_path, PPSharedMutipleConsumersModel, rank, r'self.register_parameter\(')
+            assert not _gencode_contains(tmp_path, PPSharedMultipleConsumersModel, rank, r'self.register_parameter\(')
 
 
 class LossDataModel(torch.nn.Module):

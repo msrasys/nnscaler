@@ -993,7 +993,7 @@ def fn(
 
             # update tensor_splits for new multiref tensors
             # we can't use `_move_tensor_splits` here
-            # because we can't distingish each output of multiref tensor
+            # because we can't distinguish each output of multiref tensor
             assert len(multiref_node.outputs()) == len(consumers), "Internal Error: multiref outputs should match the number of consumers"
             new_tensor_splits.update(_get_new_node_outputs_splits(multiref_node, graph, op_plans, op_partition_maps))
 
@@ -1024,7 +1024,7 @@ def fn(
                 # these nodes are usually added for data transfer between stages in graph.staging
                 # TODO: is it possible to have TP here?
                 op_plans[node] = OpPlan(op=node, stage_id=stage_id, partition=None)
-                assert len(stage.consumers(node.input(0).parent)) == 1, "Internal Error: identity node input should only consumed by itself."
+                assert len(stage.consumers(node.input(0).parent)) == 1, "Internal Error: identity node input should only be consumed by identity node itself    ."
                 # only real tensors participate in tensor_splits bookkeeping;
                 # identity nodes added for non-tensor IRObject transfer have no splits.
                 if isinstance(node.input(0), IRSubTensor):

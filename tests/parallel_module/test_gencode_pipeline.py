@@ -466,7 +466,7 @@ def _shared_output_partition_policy(graph, cfg):
 
 
 @replace_all_device_with('cpu')
-def test_split_segement_with_shared_output(tmp_path):
+def test_split_segment_with_shared_output(tmp_path):
     """
     Shared output will prevent the segment output from being split,
     TODO: we should support splitting the shared output, but currently we don't support it.
