@@ -593,7 +593,7 @@ def _identity_segment_output(graph: IRGraph, tensor: IRSubTensor, segment: IRSeg
     insert_idx = last_fwop_idx + 1
 
     fwop = Identity(tensor)
-    fwop.comment = f'fn identity for segment output'
+    fwop.comment = 'fn identity for segment output'
     output = tensor.parent.like().tosub()
     fwop.set_output(0, output)
     fwop.device = segment.device
@@ -724,8 +724,6 @@ def fn(
     nstages: int = len(set(r.stage_id for r in op_plans.values() if r.stage_id != -1))
     if nstages == 0:
         nstages = 1
-    if ngpus % nstages != 0:
-        raise ValueError(f"plan_ngpus {ngpus} should be divisible by nstages {nstages}")
     # not all schedulers support pp_size < nstages
     pp_size = cfg.pas_config.get('pipeline_size', nstages)
     tp_size = ngpus // pp_size
@@ -997,7 +995,7 @@ def fn(
             # we can't use `_move_tensor_splits` here
             # because we can't distingish each output of multiref tensor
             assert len(multiref_node.outputs()) == len(consumers), "Internal Error: multiref outputs should match the number of consumers"
-            new_tensor_splits = _get_new_node_outputs_splits(multiref_node, graph, op_plans, op_partition_maps)
+            new_tensor_splits.update(_get_new_node_outputs_splits(multiref_node, graph, op_plans, op_partition_maps))
 
     tensor_splits.update(new_tensor_splits)
 

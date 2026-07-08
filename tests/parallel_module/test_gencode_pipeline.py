@@ -1,4 +1,4 @@
-from re import RegexFlag
+import re
 
 import torch
 import pytest
@@ -360,7 +360,7 @@ def test_gencode_split_segment_pass_through(tmp_path):
         r'torch.nn.functional.linear.*'
         r'return linear_.*, linear_.*'
         r'def _train_step.*',
-        flags=RegexFlag.DOTALL
+        flags=re.DOTALL
     )
     assert _gencode_contains(
         tmp_path, PassThroughSegmentModule, 2,
@@ -370,7 +370,7 @@ def test_gencode_split_segment_pass_through(tmp_path):
         r'torch.nn.functional.linear.*'
         r'return linear_.*, linear_.*'
         r'def _train_step.*',
-        flags=RegexFlag.DOTALL
+        flags=re.DOTALL
     )
     assert _gencode_contains(
         tmp_path, PassThroughSegmentModule, 3,
@@ -381,7 +381,7 @@ def test_gencode_split_segment_pass_through(tmp_path):
         r'torch.add.*'
         r'return add_.*'
         r'def _train_step.*',
-        flags=RegexFlag.DOTALL
+        flags=re.DOTALL
     )
     # code in rank 1:
     # def segment36(self, linear_35):
