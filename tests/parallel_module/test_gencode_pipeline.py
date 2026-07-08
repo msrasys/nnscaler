@@ -454,11 +454,11 @@ def _shared_output_partition_policy(graph, cfg):
     for node in get_pas_ops(graph):
 
         if node.fn == torch.add:
-            if node.input(1).is_param and node.input(1).name in ['w0', 'w1']:
+            if node.input(1).is_param() and node.input(1).name in ['w0', 'w1']:
                 stage_id = 0
-            elif node.input(1).is_param and node.input(1).name in ['w2', 'w3']:
+            elif node.input(1).is_param() and node.input(1).name in ['w2', 'w3']:
                 stage_id = 1
-            elif node.input(1).is_param and node.input(1).name in ['w4', 'w5']:
+            elif node.input(1).is_param() and node.input(1).name in ['w4', 'w5']:
                 stage_id = 2
             yield OpPlan(node, stage_id=stage_id, partition=OpPartition(input=0, dim=0))
         else:
