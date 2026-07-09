@@ -882,7 +882,8 @@ def fn(
         for node in graph.select(ntype=IRFwOperation):
             plan = op_plans.get(node)
             if plan is None:
-                continue
+                op_plans[node] = OpPlan(op=node)
+                plan = op_plans[node]
             if plan.stage_id == -1:
                 plan.stage_id = _pre_resolve_cur_stage
             else:

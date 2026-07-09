@@ -1,6 +1,18 @@
 #  Copyright (c) Microsoft Corporation.
 #  Licensed under the MIT License.
 
+import warnings as _warnings
+
+# Suppress nvidia_cutlass_dsl DeprecationWarning about struct.scalar.ptr.
+# cutlass uses catch_warnings()+simplefilter("always") which bypasses
+# filterwarnings, so we intercept at the showwarning level.
+_orig_showwarning = _warnings.showwarning
+def _nnscaler_showwarning(message, category, filename, lineno, file=None, line=None):
+    if category is DeprecationWarning and "struct.scalar.ptr" in str(message):
+        return
+    _orig_showwarning(message, category, filename, lineno, file, line)
+_warnings.showwarning = _nnscaler_showwarning
+
 from .version import __version__
 from .parallel import (
     ParallelModule,
