@@ -874,6 +874,19 @@ def fn(
     # reads the indexed piece from its local dataloader instead of receiving it from
     # an earlier stage via a cross-stage adapter. Must run before staging.
     if nstages > 1:
+        # Pre-resolve stage_id == -1 before duplicate_dataloader_index_ops_per_stage.
+        # Ops with stage_id == -1 inherit the stage from the preceding op (just like
+        # the main loop does via pp_cur_stage_id).  Without this, the duplication pass
+        # sees all -1 ops as "stage 0" and misses cross-stage consumers.
+        _pre_resolve_cur_stage = 0
+        for node in graph.select(ntype=IRFwOperation):
+            plan = op_plans.get(node)
+            if plan is None:
+                continue
+            if plan.stage_id == -1:
+                plan.stage_id = _pre_resolve_cur_stage
+            else:
+                _pre_resolve_cur_stage = plan.stage_id
         _duplicate_dataloader_index_ops_per_stage(graph, op_plans)
 
     fw_nodes = dict.fromkeys(graph.select(ntype=IRFwOperation))
