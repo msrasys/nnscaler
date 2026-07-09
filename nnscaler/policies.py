@@ -36,7 +36,8 @@ from nnscaler.graph.function.pyfunc import IRPyFunc
 from nnscaler.graph.segment import IRSegment
 from nnscaler.ir.operator import IRBpOperation, IRDataOperation, IRFwOperation
 from nnscaler.ir import IRCell, IRSubTensor, IRFullTensor
-from nnscaler.ir.cten import IR
+from nnscaler.ir.cten import IR, IRObject
+from nnscaler.ir.unique import IDGenerator
 from nnscaler.runtime.function import identity, multiref
 from nnscaler.utils import load_type
 
@@ -671,6 +672,187 @@ def _identity_segment_output(graph: IRGraph, tensor: IRSubTensor, segment: IRSeg
     return fwop
 
 
+# signatures of cheap, deterministic, non-differentiable indexing/attribute ops
+# that are safe to recompute (e.g. `data['loss']` -> `_operator.getitem`).
+_SINKABLE_INDEX_SIGNATURES = ('_operator.getitem', )
+
+
+def _duplicate_dataloader_index_ops_per_stage(graph: IRGraph, op_plans: dict) -> None:
+    """
+    Duplicate cheap dataloader-derived indexing ops (e.g. ``data['loss']``) into
+    every consumer stage so that a stage which only needs an indexed piece of the
+    dataloader input computes it locally, instead of receiving it from an earlier
+    stage through a cross-stage adapter.
+
+    Motivation:
+    The dataloader operation is replicated to all devices (see the end of ``fn``),
+    hence its raw output is available in every pipeline stage. An indexing op
+    (``getitem`` / ``getattr``) on that output is non-differentiable and cheap, so
+    recomputing it per stage is strictly better than transferring its result.
+
+    Consider::
+
+        data_loss = data['loss']   # placed in stage 0 by op order
+        ...                        # stages 0..n-1
+        loss = (x + data_loss).sum()  # consumed only in the last stage
+
+    Without this pass, ``data['loss']`` is computed in stage 0 and moved to the
+    last stage via an adapter. With this pass, a copy of the ``getitem`` is placed
+    in the last stage which reads ``data`` from its local dataloader directly.
+
+    The original op is kept in its own stage (that stage may still need it). If the
+    original becomes dead (no remaining consumer and not a graph output), it is
+    removed.
+
+    This must be called before ``graph.staging`` (i.e. before any partition), while
+    all forward ops still live at the top level of the graph and stage ids are known
+    from ``op_plans``.
+    """
+    # tids of dataloader outputs: available in every stage
+    dataloader_output_tids = set()
+    for dl in graph.select(ntype=IRDataOperation):
+        for out in dl.oobjs():
+            dataloader_output_tids.add(out.tid)
+    if not dataloader_output_tids:
+        return
+
+    def _get_node_stage(node) -> Optional[int]:
+        plan = op_plans.get(node)
+        if plan is None or plan.stage_id == -1:
+            return 0
+        return plan.stage_id
+
+    def _is_index_op(node) -> bool:
+        return isinstance(node, IRPyFunc) and node.signature in _SINKABLE_INDEX_SIGNATURES
+
+    def _is_sinkable(node) -> bool:
+        """A node is sinkable if it is a non-grad index/attr op whose tensor/object
+        inputs are all either dataloader outputs or outputs of other sinkable ops."""
+
+        assert not isinstance(node, IRDataOperation), "Internal Error: dataloader ops should be handled earlier"
+
+        if node.cid in node_sinkable_cache:
+            return node_sinkable_cache[node.cid]
+
+        if not _is_index_op(node):
+            node_sinkable_cache[node.cid] = False
+            return False
+
+        # index op output must not require grad (duplicating a grad producer
+        # would create multiple gradient sources for the same value)
+        if any(isinstance(oobj, IRSubTensor) and oobj.requires_grad for oobj in node.oobjs()):
+            node_sinkable_cache[node.cid] = False
+            return False
+
+        for inp in node.inputs():
+            if not isinstance(inp, IRObject):
+                continue
+            if inp.tid in dataloader_output_tids:
+                continue
+            prods = graph.producers(inp.parent)
+            assert len(prods) == 1, "Internal Error: call this before graph partitioning, each tensor/object should have a single producer"
+            if _is_sinkable(prods[0]):
+                continue
+
+            node_sinkable_cache[node.cid] = False
+            return False
+
+        node_sinkable_cache[node.cid] = True
+        return True
+
+    # cache of sinkable status for each node, keyed by node.cid
+    node_sinkable_cache: dict[int, bool] = {}
+    # stage_id -> first forward op in that stage (used as insertion anchor for copies)
+    stage_anchors: dict[int, IRFwOperation] = {}
+    sinkable_obj_memo: dict[tuple[IRObject, int], IRObject] = {}
+    for node in graph.select(ntype=IRFwOperation):
+        stage_id = _get_node_stage(node)
+        if stage_id not in stage_anchors:
+            stage_anchors[stage_id] = node
+
+        if _is_sinkable(node):  # also populate node_sinkable_cache
+            for out in node.oobjs():
+                sinkable_obj_memo[(out, stage_id)] = out
+
+    def _fresh_output(out):
+        if isinstance(out, IRSubTensor):
+            return out.parent.like().tosub()
+        if isinstance(out, IRObject):
+            return out.like()
+        return out  # static / constant output: reuse as-is
+
+    def _resolve(node: IRFwOperation, stage: int):
+        assert _is_sinkable(node), "Internal Error: only sinkable nodes can be resolved"
+
+        if _get_node_stage(node) == stage:
+            return
+
+        copy_node = node.replicate()
+        copy_node._id = IDGenerator().gen_cell_id()  # a distinct op, not a device replica
+        copy_node._device = ()
+        copy_node._mirror = None
+        copy_node.recompute = None
+        copy_node.comment = 'fn: clone dataloader index op in consumer stage'
+
+        # rewire inputs: recurse into sinkable inputs, keep dataloader/constant inputs
+        for inp in copy_node.iobjs():
+            resolved = inp
+            if isinstance(inp, (IRSubTensor, IRObject)) and inp.tid not in dataloader_output_tids:
+                if (inp, stage) not in sinkable_obj_memo:
+                    prods = graph.producers(inp.parent)
+                    assert len(prods) == 1, "Internal Error: call this before graph partitioning, each tensor/object should have a single producer"
+                    assert _is_sinkable(prods[0]), "Internal Error: only sinkable nodes can be resolved"
+
+                    _resolve(prods[0], stage)
+
+                resolved = sinkable_obj_memo[(inp, stage)]
+                copy_node.replace(inp, resolved)
+
+        # fresh output so the copy is a distinct value produced inside `stage`
+        for out in copy_node.oobjs():
+            new_out = _fresh_output(out)
+            copy_node.replace(out, new_out)
+            sinkable_obj_memo[(out, stage)] = new_out
+
+        graph.insert(copy_node, graph.index(stage_anchors[stage]))
+        op_plans[copy_node] = OpPlan(op=copy_node, stage_id=stage, partition=None)
+
+    # try to sink each sinkable node into its consumer stages, creating copies as needed
+    # Note that we iterate in reverse topological order
+    # so we have better chance to remove dead sinkable nodes after the sinking.
+    for node in reversed(graph.select(ntype=IRFwOperation)):
+        if not _is_sinkable(node):
+            continue
+        # group consumers by their (foreign) stage
+        foreign: dict[int, list[IRFwOperation]] = {}
+
+        node_stage = _get_node_stage(node)
+        found_consumer_in_current_stage = False
+        for oobj in node.oobjs():
+            for consumer in graph.consumers(oobj.parent):
+                cs = _get_node_stage(consumer)
+                if cs != node_stage:
+                    foreign.setdefault(cs, []).append(consumer)
+                else:
+                    found_consumer_in_current_stage = True
+
+        for stage, consumers in foreign.items():
+            # recursively resolve the node in the consumer stage, creating a copy if needed
+            _resolve(node, stage)
+
+            for consumer in consumers:
+                with graph.update(consumer):
+                    for iobj in consumer.iobjs():
+                        if isinstance(iobj, (IRSubTensor, IRObject)) and (iobj, stage) in sinkable_obj_memo:
+                            new_iobj = sinkable_obj_memo[(iobj, stage)]
+                            consumer.replace(iobj, new_iobj)
+
+        # dead sinkable nodes that are not needed in their own stage can be removed
+        if not found_consumer_in_current_stage:
+            graph.remove(node)
+            op_plans.pop(node, None)
+
+
 def fn(
         graph: IRGraph, cfg: 'ComputeConfig',
         policy: Union[
@@ -720,10 +902,30 @@ def fn(
         return result
 
     op_plans = {r.op: r for r in result}
+
+    # fill in
+    # 1. missing op_plans for ops that don't have it set, with default values
+    # 2. missing stage_id for ops that don't have it set, following the previous op's stage_id
+    # 3. check stage_id continuity, raise error if not continuous
+    cur_stage_id = 0
+    for node in graph.select(ntype=IRFwOperation):
+        if node not in op_plans:
+            op_plans[node] = OpPlan(op=node) # default: no partition, stage -1, no recompute
+
+        plan = op_plans[node]
+        if plan.stage_id < 0:
+            plan.stage_id = cur_stage_id
+        else:
+            if plan.stage_id not in (cur_stage_id, cur_stage_id + 1):
+                raise ValueError(f"Pipeline stage ids must be continuous and increase by 1, but got {cur_stage_id} -> {plan.stage_id} for op {node}")
+            cur_stage_id = plan.stage_id
+
     ngpus: int = cfg.plan_ngpus
-    nstages: int = len(set(r.stage_id for r in op_plans.values() if r.stage_id != -1))
-    if nstages == 0:
-        nstages = 1
+    stages = set(r.stage_id for r in op_plans.values())
+    if stages != set(range(len(stages))):
+        raise ValueError(f"Pipeline stage ids must be continuous and start from 0, but got {stages}")
+
+    nstages: int = len(stages)
     # not all schedulers support pp_size < nstages
     pp_size = cfg.pas_config.get('pipeline_size', nstages)
     tp_size = ngpus // pp_size
@@ -760,21 +962,21 @@ def fn(
     # int: the partitioned dim
     output_tensor_last_split: dict[IRFullTensor, int | None | Literal['value']] = {}
 
+    # When pipeline parallelism is enabled, duplicate cheap dataloader-derived
+    # indexing ops (e.g. `data['loss']`) into their consumer stages so that a stage
+    # reads the indexed piece from its local dataloader instead of receiving it from
+    # an earlier stage via a cross-stage adapter. Must run before staging.
+    if nstages > 1:
+        _duplicate_dataloader_index_ops_per_stage(graph, op_plans)
+
     fw_nodes = dict.fromkeys(graph.select(ntype=IRFwOperation))
 
     for node in fw_nodes:
-        if node not in op_plans:
-            op_plans[node] = OpPlan(op=node)  # default: no partition, stage 0, no recompute
-
         node.hook_meta = op_plans[node].hook_meta
         node.pre_hook = op_plans[node].pre_hook
         node.post_hook = op_plans[node].post_hook
 
         op_plan = op_plans[node]
-
-        # set pipeline stage id if not set
-        if op_plan.stage_id == -1:
-            op_plan.stage_id = pp_cur_stage_id
 
         # currently we only support partition for IRDimops
         if not isinstance(op_plan.op, IRDimops):
