@@ -1187,9 +1187,12 @@ class Reducer:
             buckets.append(bucket)
         torch.cuda.empty_cache()
 
-        # make it in reverse order as the backward happens from tail to head
-        # it is not important but may be helpful for waiting cuda stream to finish
-        self._buckets: List[Bucket] = list(reversed(buckets))
+        # NOTE: keep `self._buckets` in the same order as `self.starts` / `self.stops`.
+        # `wake_up()` re-binds each bucket to its buffer slice via
+        # `zip(self.starts, self.stops, self._buckets)`, so any reordering here (e.g.
+        # reversing to match the tail-to-head backward order) would misalign buckets to
+        # the wrong slices.
+        self._buckets: List[Bucket] = buckets
         assert len(self._buckets) > 0, (
             f"Find {len(self._params)} parameters in the reducer. "
             f"Make sure adding all parameters before building buckets")
