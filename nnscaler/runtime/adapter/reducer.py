@@ -276,6 +276,12 @@ class Bucket:
         self._zero: int = zero
         self._zero_use_reduce_scatter = zero_use_reduce_scatter
         self._nreplicas: int = nreplicas
+        # number of gradient accumulation steps, used for async reducer to determine
+        # when to trigger allreduce
+        # 0 means we will rely on Flag.skip_reducer to determine when to trigger allreduce,
+        # which is the default/traditional behavior
+        # Non-zero value means we will trigger allreduce after the specified number of gradient accumulation steps
+        self._grad_accumulation_steps: int = 0
 
         if not isinstance(self._nreplicas, int) or self._nreplicas < 1:
             raise ValueError(f"nreplicas should be an integer greater than or equal to 1, but got {self._nreplicas}")
@@ -340,6 +346,18 @@ class Bucket:
     def zero3(self) -> bool:
         """Whether enable zero3 for this bucket"""
         return self._z3
+
+    @property
+    def grad_accumulation_steps(self) -> int:
+        """Get the number of gradient accumulation steps for this bucket"""
+        return self._grad_accumulation_steps
+
+    @grad_accumulation_steps.setter
+    def grad_accumulation_steps(self, steps: int):
+        """Set the number of gradient accumulation steps for this bucket"""
+        if not isinstance(steps, int) or steps < 0:
+            raise ValueError(f"grad_accumulation_steps should be a non-negative integer, but got {steps}")
+        self._grad_accumulation_steps = steps
 
     def get_aligned_numel(self, param) -> int:
         """
@@ -458,16 +476,32 @@ class Bucket:
                 # let's add it for safety
                 self._reducer.postevict_param(param)
 
-            if RuntimeFlag.skip_reducer: return
+            if not self._grad_accumulation_steps and RuntimeFlag.skip_reducer:
+                return
+
             self._async_param_cnt += 1
 
             # perform all-reduce
             if self._async:
-                if self._async_param_cnt > len(self._params):
+                if self._grad_accumulation_steps:
+                    target_cnt = self._grad_accumulation_steps * len(self._params)
+                else:
+                    target_cnt = len(self._params)
+
+                if self._async_param_cnt > target_cnt:
+                    if self._grad_accumulation_steps:
+                        raise RuntimeError(
+                            f"Asynchronous Reducer received more gradients than expected "
+                            f"({self._async_param_cnt} > {target_cnt} = "
+                            f"grad_accumulation_steps({self._grad_accumulation_steps}) * num_params({len(self._params)})). "
+                            f"Make sure `grad_accumulation_steps` matches the actual number of gradient accumulation steps per optimizer step."
+                        )
                     raise RuntimeError(
-                        "Detected gradient accumulation with asynchronous Reducer. "
-                        "Users should run with `nnscaler.accum_mode` to manage gradient synchronization.")
-                if self._async_param_cnt == len(self._params):
+                        f"Detected gradient accumulation with asynchronous Reducer "
+                        f"({self._async_param_cnt} > {target_cnt} = num_params). "
+                        f"Run with `nnscaler.accum_mode` (or set `grad_accumulation_steps`) to manage gradient synchronization."
+                    )
+                if self._async_param_cnt == target_cnt:
                     # apply pre hooks
                     self._apply_pre_hooks()
                     # communication
@@ -783,6 +817,13 @@ class Reducer:
         self._zero_param_level_sharding = zero_param_level_sharding and self._zero > 0
         self._align_size: int = align_size
         self._nreplicas: int = nreplicas
+        # number of gradient accumulation steps, used for async reducer to determine
+        # when to trigger allreduce
+        # 0 means we will rely on Flag.skip_reducer to determine when to trigger allreduce,
+        # which is the default/traditional behavior
+        # Non-zero value means we will trigger allreduce
+        # after the specified number of gradient accumulation steps
+        self._grad_accumulation_steps: int = 0
 
         if not isinstance(self._nreplicas, int) or self._nreplicas < 1:
             raise ValueError(f"nreplicas should be an integer greater than or equal to 1, but got {self._nreplicas}")
@@ -894,6 +935,20 @@ class Reducer:
     def reduce_op(self) -> torch.distributed.ReduceOp:
         """Get reduce operation"""
         return self._reduce_op
+
+    @property
+    def grad_accumulation_steps(self) -> int:
+        """Get the number of gradient accumulation steps for async reducer"""
+        return self._grad_accumulation_steps
+
+    @grad_accumulation_steps.setter
+    def grad_accumulation_steps(self, value: int):
+        """Set the number of gradient accumulation steps for async reducer"""
+        if not isinstance(value, int) or value < 0:
+            raise ValueError(f"grad_accumulation_steps should be a non-negative integer, but got {value}")
+        self._grad_accumulation_steps = value
+        for bucket in self._buckets:
+            bucket.grad_accumulation_steps = value
 
     def add_param(self, param: torch.nn.Parameter):
         """

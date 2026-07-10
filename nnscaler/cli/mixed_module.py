@@ -249,6 +249,21 @@ def mixin_module(model: torch.nn.Module, optimizer: torch.optim.Optimizer):
     if isinstance(model, nnscaler.ParallelModule):
         return model
 
+    def set_grad_accumulation_steps(self, steps: int):
+        """
+        Set the number of gradient accumulation steps for the module.
+
+        Args:
+            steps (int): the number of gradient accumulation steps
+        """
+        non_parallel_module_reducer: Reducer = optimizer._non_parallel_module_reducer
+        if non_parallel_module_reducer:
+            non_parallel_module_reducer.grad_accumulation_steps = steps
+
+        for submodule in self.modules():
+            if isinstance(submodule, nnscaler.ParallelModule):
+                submodule.set_grad_accumulation_steps(steps)
+
     def train_step(self,
         samples: list[Any],
         is_dummy_batch: Optional[list[bool]] = None
@@ -267,6 +282,7 @@ def mixin_module(model: torch.nn.Module, optimizer: torch.optim.Optimizer):
             if not all(is_dummy_batch[len(samples):]):
                 raise ValueError('Dummy samples should be at the end of the batch')
 
+        set_grad_accumulation_steps(model, len(samples))
         forward_outputs = []
         for idx, sample in enumerate(samples):
             with nnscaler.sync_grad_when(idx == len(samples) - 1):
@@ -302,6 +318,7 @@ def mixin_module(model: torch.nn.Module, optimizer: torch.optim.Optimizer):
 
         return params_info
 
+    model.set_grad_accumulation_steps = types.MethodType(set_grad_accumulation_steps, model)
     model.train_step = types.MethodType(train_step, model)
     model.infer_step = types.MethodType(infer_step, model)
     model.parameters_for_calc_gnorm = types.MethodType(parameters_for_calc_gnorm, model)
