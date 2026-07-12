@@ -14,6 +14,11 @@ _logger = logging.getLogger(__name__)
 
 _ALLOW_GRAD_DTYPES = (torch.double, torch.float32, torch.float16, torch.bfloat16)
 
+try:
+    from torch.autograd.graph import get_gradient_edge
+except ImportError:
+    get_gradient_edge = None
+
 
 def debug_id(tensors, msg: str, rank: int):
     if torch.distributed.get_rank() == rank:
@@ -64,24 +69,28 @@ class AsyncCommHandler:
         self._works[id(tensor)] = works
         self._callbacks[id(tensor)] = callback
 
-    def hold_send(self, tensor: torch.Tensor, work):
-        self._send_holds.append((tensor, work))
+    def hold_send(self, tensor: torch.Tensor, work, callback: Optional[Callable] = None):
+        self._send_holds.append((tensor, work, callback))
 
     def drain_sends(self, wait: bool = True):
         if wait:
-            for _, work in self._send_holds:
+            for _, work, callback in self._send_holds:
                 work.wait()
+                if callback is not None:
+                    callback()
             self._send_holds.clear()
             return
 
         pending = []
-        for tensor, work in self._send_holds:
+        for tensor, work, callback in self._send_holds:
             is_completed = getattr(work, 'is_completed', None)
             if is_completed is not None and is_completed():
                 work.wait()
+                if callback is not None:
+                    callback()
             else:
-                pending.append((tensor, work))
-        self._send_holds = pending
+                pending.append((tensor, work, callback))
+        self._send_holds[:] = pending
 
     def drain(self):
         self.drain_sends()
@@ -116,6 +125,9 @@ class Executor:
     # Each graph has its name, and multiple call for the graph will append
     # (instant id -> detached) input tensor pairs for backward reference.
     _detach: Dict[str, List[TensorPairs]] = dict()
+    _pseudo_free_grad_edges: Dict[int, Any] = dict()
+    _pseudo_free_pending_sends: Dict[int, int] = dict()
+    _pseudo_free_unavailable_warned = False
     _backward_pre_hook: Optional[Callable] = None
 
     @staticmethod
@@ -235,10 +247,25 @@ class Executor:
                     dedup_output_tensor_grads
                 )
 
-        torch.autograd.backward(
-            dedup_output_tensors,
-            grad_tensors=dedup_output_tensor_grads,
-        )
+        pseudo_free_output_ids = []
+        backward_roots = []
+        for tensor in dedup_output_tensors:
+            edge = Executor._pseudo_free_grad_edges.get(id(tensor))
+            if edge is None:
+                backward_roots.append(tensor)
+            else:
+                pseudo_free_output_ids.append(id(tensor))
+                backward_roots.append(edge)
+
+        try:
+            torch.autograd.backward(
+                backward_roots,
+                grad_tensors=dedup_output_tensor_grads,
+            )
+        finally:
+            for tensor_id in pseudo_free_output_ids:
+                Executor._pseudo_free_grad_edges.pop(tensor_id, None)
+                Executor._pseudo_free_pending_sends.pop(tensor_id, None)
         grads = tuple(t.grad for t in input_tensors)
         assert all(grad is not None for grad in grads), "RuntimeError: got gradient None"
 
@@ -276,10 +303,75 @@ class Executor:
                 same format of updated tensors.
         """
         Executor._backward_pre_hook = hook
+
+    @staticmethod
+    def _can_pseudo_free_tensor(tensor: torch.Tensor) -> bool:
+        if get_gradient_edge is None:
+            if not Executor._pseudo_free_unavailable_warned:
+                _logger.warning(
+                    'Pipeline output pseudo-free requires '
+                    'torch.autograd.graph.get_gradient_edge; leaving outputs allocated.'
+                )
+                Executor._pseudo_free_unavailable_warned = True
+            return False
+        if not torch.is_tensor(tensor):
+            return False
+        if not tensor.requires_grad or tensor.grad_fn is None:
+            return False
+        if tensor.layout != torch.strided or tensor.numel() <= 1:
+            return False
+        if getattr(tensor, '_base', None) is not None:
+            return False
+        return True
+
+    @staticmethod
+    def _record_pseudo_free_edge(tensor: torch.Tensor) -> bool:
+        if not Executor._can_pseudo_free_tensor(tensor):
+            return False
+        tensor_id = id(tensor)
+        if tensor_id not in Executor._pseudo_free_grad_edges:
+            Executor._pseudo_free_grad_edges[tensor_id] = get_gradient_edge(tensor)
+        return True
+
+    @staticmethod
+    def defer_pseudo_free_tensor(tensor: torch.Tensor) -> torch.Tensor:
+        if Executor._record_pseudo_free_edge(tensor):
+            tensor_id = id(tensor)
+            Executor._pseudo_free_pending_sends[tensor_id] = \
+                Executor._pseudo_free_pending_sends.get(tensor_id, 0) + 1
+        return tensor
+
+    @staticmethod
+    def complete_deferred_pseudo_free_tensor(tensor: torch.Tensor) -> torch.Tensor:
+        tensor_id = id(tensor)
+        pending = Executor._pseudo_free_pending_sends.get(tensor_id)
+        if pending is None:
+            return tensor
+        if pending > 1:
+            Executor._pseudo_free_pending_sends[tensor_id] = pending - 1
+            return tensor
+
+        Executor._pseudo_free_pending_sends.pop(tensor_id, None)
+        if tensor_id not in Executor._pseudo_free_grad_edges:
+            return tensor
+        return Executor.pseudo_free_tensor(tensor)
+
+    @staticmethod
+    def pseudo_free_tensor(tensor: torch.Tensor) -> torch.Tensor:
+        """
+        Replace a non-leaf output tensor's payload with a 1-element placeholder
+        while keeping its autograd edge for a later Executor.backward call.
+        """
+        if not Executor._record_pseudo_free_edge(tensor):
+            return tensor
+        tensor.data = torch.empty((1,), dtype=tensor.dtype, device=tensor.device)
+        return tensor
     
     @staticmethod
     def clear():
         Executor._detach = dict()
+        Executor._pseudo_free_grad_edges = dict()
+        Executor._pseudo_free_pending_sends = dict()
         Executor._backward_pre_hook = None
 
     @staticmethod
@@ -287,11 +379,22 @@ class Executor:
         for name, npairs in Executor._detach.items():
             assert len(npairs) == 0, \
                 f"Fine remaining segment needs backward: {name}, remaining times: {len(npairs)}"
+        assert (
+            len(Executor._pseudo_free_grad_edges) == 0
+            and len(Executor._pseudo_free_pending_sends) == 0
+        ), (
+            f"Pseudo-free output tensors remain: "
+            f"edges={len(Executor._pseudo_free_grad_edges)}, "
+            f"pending_sends={len(Executor._pseudo_free_pending_sends)}"
+        )
 
 
 fexecute = Executor.fexecute
 aexecute = Executor.aexecute
 backward = Executor.backward
+pseudo_free_tensor = Executor.pseudo_free_tensor
+defer_pseudo_free_tensor = Executor.defer_pseudo_free_tensor
+complete_deferred_pseudo_free_tensor = Executor.complete_deferred_pseudo_free_tensor
 
 
 # register checking for normal exit

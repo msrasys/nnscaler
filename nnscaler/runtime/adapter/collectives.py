@@ -15,10 +15,23 @@ import torch
 from nnscaler.runtime.device import DeviceGroup
 from nnscaler.profiler.timer import CudaTimer
 
-from nnscaler.runtime.executor import AsyncCommHandler
+from nnscaler.runtime.executor import (
+    AsyncCommHandler,
+    complete_deferred_pseudo_free_tensor,
+    defer_pseudo_free_tensor,
+    pseudo_free_tensor,
+)
 
 
-def move(tensor: Optional[torch.Tensor], shape: Tuple[int], dtype: torch.dtype, src: int, dst: int, async_op=False):
+def move(
+    tensor: Optional[torch.Tensor],
+    shape: Tuple[int],
+    dtype: torch.dtype,
+    src: int,
+    dst: int,
+    async_op=False,
+    release_after_send: Optional[torch.Tensor] = None,
+):
     """
     Move a tensor from source device to destination device.
     """
@@ -35,12 +48,18 @@ def move(tensor: Optional[torch.Tensor], shape: Tuple[int], dtype: torch.dtype, 
                 work = torch.distributed.isend(tensor, dst)
             else:
                 work = torch.distributed.isend(tensor, group=group, group_dst=group_dst)
-            AsyncCommHandler().hold_send(tensor, work)
+            callback = None
+            if release_after_send is not None:
+                defer_pseudo_free_tensor(release_after_send)
+                callback = lambda: complete_deferred_pseudo_free_tensor(release_after_send)
+            AsyncCommHandler().hold_send(tensor, work, callback=callback)
         else:
             if group is None:
                 torch.distributed.send(tensor, dst)
             else:
                 torch.distributed.send(tensor, group=group, group_dst=group_dst)
+            if release_after_send is not None:
+                pseudo_free_tensor(release_after_send)
     else:
         assert rank == dst
         tensor = torch.empty(shape, dtype=dtype,
