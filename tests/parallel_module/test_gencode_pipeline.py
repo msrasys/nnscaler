@@ -190,6 +190,45 @@ def test_gencode_shared_irobject(tmp_path):
         assert _gencode_contains(tmp_path, PPModule2, rank, rf'nnscaler.runtime.adapter.move_object\(.*, src={rank}, dst={rank + 1}\)')
 
 
+@replace_all_device_with('cpu')
+def test_gencode_shared_irobject_between_tp_stages(tmp_path):
+    """IRObjects are replicated, not spatially split, between TP stages."""
+    m = PPModule2()
+    m.train()
+    parallelize(
+        m,
+        {'data': torch.randn(64, 1024)},
+        pas_policy=lambda graph, cfg: pp_pas(graph, cfg, nlayers_per_stage=2),
+        compute_config=ComputeConfig(
+            4, 4,
+            constant_folding=False,
+            use_end2end=True,
+            pas_config=dict(
+                pipeline_nmicros=4,
+                pipeline_size=2,
+                pipeline_scheduler='1f1b',
+            ),
+        ),
+        gen_savedir=tmp_path,
+        load_module=False,
+        reuse='override',
+    )
+
+    for src, dst in ((0, 2), (1, 3)):
+        assert _gencode_contains(
+            tmp_path,
+            PPModule2,
+            src,
+            rf'nnscaler.runtime.adapter.move_object\(.*, src={src}, dst={dst}\)',
+        )
+        assert _gencode_contains(
+            tmp_path,
+            PPModule2,
+            dst,
+            rf'nnscaler.runtime.adapter.move_object\(.*, src={src}, dst={dst}\)',
+        )
+
+
 class PPModule3(PPModule2):
     def forward(self, data: torch.Tensor):
         loss = super().forward(data)
