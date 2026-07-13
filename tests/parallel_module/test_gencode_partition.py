@@ -497,6 +497,52 @@ def test_multiref_multi_rr(tmp_path):
     #     return sum_1_25
 
 
+class MultileROModule(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.w0 = torch.nn.Parameter(torch.randn(4, 4))
+        self.w1 = torch.nn.Parameter(torch.randn(4, 4))
+        self.w2 = torch.nn.Parameter(torch.randn(4, 4))
+
+    def forward(self, input):
+        x = torch.nn.functional.linear(input, self.w0)
+        y = torch.nn.functional.linear(input, self.w1)
+        z = torch.nn.functional.linear(input, self.w2)
+        a = _shared_skip_op(x, y)
+        b = _shared_skip_op(x, z)
+        return (a + b).sum()
+
+
+def multiro_pas(graph, cfg):
+    from nnscaler.policies import OpPlan, OpPartition, get_pas_ops
+
+    for node in get_pas_ops(graph):
+        if node.fn == _shared_skip_op:
+            yield OpPlan(node, partition=OpPartition(input=1, dim=1))
+
+
+@replace_all_device_with('cpu')
+def test_multiref_multi_ro(tmp_path):
+    """
+    Test the case of two RO (replicate + no reduce) pattern
+    """
+    m = MultileROModule()
+    m.train()
+    parallelize(
+        m,
+        {'input': torch.randn(4, 4)},
+        multiro_pas,
+        ComputeConfig(2, 4, use_end2end=True),
+        gen_savedir=tmp_path,
+        load_module=False,
+        reuse='override',
+    )
+    # no multiref are generated in `fn`
+    assert not _gencode_contains(tmp_path, MultileROModule, 0, r'activation')
+    # no identity_allreduce should be generated because the op is annotated with `: /`
+    assert not _gencode_contains(tmp_path, MultileROModule, 0, r'nnscaler.runtime.adapter.nn.identity_allreduce')
+
+
 class StageOutputModel(torch.nn.Module):
     def __init__(self, no_grad_reduce=False):
         hidden_dim = 4

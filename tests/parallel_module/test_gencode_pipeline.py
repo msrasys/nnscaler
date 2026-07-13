@@ -268,3 +268,71 @@ def test_gencode_shared_irobject_loss_data(tmp_path):
     for rank in range(4, 7):
         assert _gencode_contains(tmp_path, PPModule3, rank, rf'sum_.* = nnscaler.runtime.adapter.broadcast\(\(\), shape=\(\), dtype=torch.float32, src=7, ranks=\[4, 5, 6, 7\]\)')
     assert _gencode_contains(tmp_path, PPModule3, 7, rf'sum_.* = nnscaler.runtime.adapter.broadcast\(sum_.*, shape=\(\), dtype=torch.float32, src=7, ranks=\[4, 5, 6, 7\]\)')
+
+
+class SplitSegmentModule(torch.nn.Module):
+    def __init__(self, dim: int = 64):
+        super().__init__()
+        self.layers = torch.nn.ModuleList([])
+        for _ in range(4):
+            self.layers.append(torch.nn.Linear(dim, dim, bias=False))
+
+    def forward(self, data: torch.Tensor):
+        x = self.layers[0](data)
+        x = self.layers[1](x) + x
+        x = self.layers[2](x)
+        x = self.layers[3](x)
+        loss = torch.sum(x)
+        return loss
+
+
+def split_segment_pas(graph, cfg):
+    from nnscaler.policies import OpPlan, OpPartition, get_layer_index, get_pas_ops
+
+    last_stage_id = 0
+    for node in get_pas_ops(graph):
+        if torch.nn.modules.linear.Linear in node.module_class_chain:
+            layer_idx = get_layer_index(node.fqn) // 2
+            yield OpPlan(node, stage_id=layer_idx, partition=OpPartition(input=0, dim=0))
+            last_stage_id = layer_idx
+        else:
+            if node.fn == torch.sum or node.fn == torch.add:
+                yield OpPlan(node, stage_id=last_stage_id, partition=OpPartition(input=0, dim=0))
+            else:
+                yield OpPlan(node, stage_id=last_stage_id)
+
+
+@replace_all_device_with('cpu')
+def test_gencode_split_segment(tmp_path):
+    m = SplitSegmentModule()
+    m.train()
+    parallelize(
+        m,
+        {'data': torch.randn(64, 64)},
+        pas_policy=split_segment_pas,
+        compute_config= ComputeConfig(
+            4, 8,
+            constant_folding=False,
+            use_end2end=True,
+            pas_config=dict(
+                pipeline_nmicros=4,
+                pipeline_scheduler='1f1b'
+            )
+        ),
+        gen_savedir=tmp_path,
+        load_module=False,
+        reuse='override',
+    )
+
+    assert _gencode_contains(
+        tmp_path, SplitSegmentModule, 2, r'nnscaler.runtime.adapter.nn.allreduce_identity\(sum_.*, ranks=\[2, 3\]\)'
+    )
+    assert not _gencode_contains(
+        tmp_path, SplitSegmentModule, 2, r'nnscaler.runtime.adapter.chunk'
+    )
+    assert not _gencode_contains(
+        tmp_path, SplitSegmentModule, 2, r'nnscaler.runtime.adapter.nn.split_allgather'
+    )
+    assert _gencode_contains(
+        tmp_path, SplitSegmentModule, 6, r'nnscaler.runtime.adapter.nn.allreduce_identity\(sum_.*, ranks=\[6, 7\]\)'
+    )

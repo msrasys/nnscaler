@@ -12,8 +12,10 @@ from pathlib import Path
 
 import nnscaler
 import nnscaler.graph.function.function as F
+from nnscaler.ir.cten import IR, IRCell
 from nnscaler.ir.tensor import IRFullTensor
 from nnscaler.graph import IRGraph
+from nnscaler.graph.segment import IRSegment, IRSegmentExpander
 from nnscaler.ir.adapter import IRAdapter
 from nnscaler.parallel import ComputeConfig, parallelize, build_optimizer
 from nnscaler.ir.operator import IRFwOperation, IRDataOperation
@@ -24,6 +26,43 @@ from ..launch_torchrun import torchrun
 
 def _tensor(shape, requires_grad=True):
     return IRFullTensor(shape, requires_grad=requires_grad).tosub()
+
+
+def test_segment_expander_uses_full_tensor_layout():
+    nodes = [IRCell('node0', 'node0', 0, 0), IRCell('node1', 'node1', 0, 0)]
+    nodes[0].device = 0
+    nodes[1].device = 1
+    segment = IRSegment(nodes, [], [], 'segment')
+    expander = IRSegmentExpander(segment, set(), set())
+    full = IRFullTensor((8,))
+
+    value0 = full.select(((0, 8),), (0, 2))
+    value1 = full.select(((0, 8),), (1, 2))
+    IR.set_object_device(value0, 0)
+    IR.set_object_device(value1, 1)
+    partitions = expander._collect_per_device_partitions([value0, value1], full)
+    assert partitions is not None
+    assert partitions[0].valmap == (0, 2)
+    assert partitions[1].valmap == (1, 2)
+
+    conflicting = full.select(((0, 8),), (1, 2))
+    IR.set_object_device(conflicting, 0)
+    assert expander._collect_per_device_partitions([value0, conflicting, value1], full) is None
+
+
+def test_segment_expander_maps_backward_io_by_parent():
+    first = IRFullTensor((4,), requires_grad=True).tosub()
+    second = IRFullTensor((4,), requires_grad=True).tosub()
+    first.grad = first.parent.grad.tosub()
+    second.grad = second.parent.grad.tosub()
+
+    mapped = IRSegmentExpander._map_grads(
+        [first, second],
+        [second.grad, first.grad],
+        device=3,
+    )
+    assert [tensor.parent for tensor in mapped] == [second.grad.parent, first.grad.parent]
+    assert all(tensor.device == (3,) for tensor in mapped)
 
 
 def test_create_segment_loss_func():

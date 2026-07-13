@@ -16,7 +16,7 @@ import copy
 import dill
 import hashlib
 
-from nnscaler.ir.cten import IRTensor, IRCell, IRObject
+from nnscaler.ir.cten import IRTensor, IRCell, IRObject, IR
 from nnscaler.ir.unique import IDGenerator
 from nnscaler.ir.operator import IRBpOperation, IRFwOperation, IRDataOperation
 from nnscaler.ir.tensor import IRFullTensor, IRSubTensor, ValueMap
@@ -47,6 +47,7 @@ class IRGraph(IRSegment):
         super().__init__(nodes, inputs, outputs, module_name)
 
         self._sched = None  # the schedule strategy
+        self._expander = None  # the graph expander
 
     @property
     def train(self) -> bool:
@@ -56,6 +57,14 @@ class IRGraph(IRSegment):
         @return train bool: True if backward is required, otherwise False (inference only).
         """
         return any(not n.isfw() for n in reversed(self._nodes))
+
+    @property
+    def expander(self) -> 'IRGraphExpander':
+        return self._expander
+
+    @expander.setter
+    def expander(self, expander: 'IRGraphExpander'):
+        self._expander = expander
 
     # ================ Deep Learning Interfalce ======================
 
@@ -1071,7 +1080,6 @@ class IRGraph(IRSegment):
         for sid in range(len(fstages)):
             self.group(fstages[sid])
 
-
     # ================= Other optimizations ==================
 
     def recompute(self, nodes: Union[IRSegment, List[IRFwOperation]]) -> bool:
@@ -1251,3 +1259,122 @@ class IRGraph(IRSegment):
         dest_node.hook_meta = src_node.hook_meta
         dest_node.pre_hook = src_node.pre_hook
         dest_node.post_hook = src_node.post_hook
+
+    # ================= Graph Expander ==================
+    #
+    # About graph/segment expanders:
+    #
+    # Previously every device that owned a (forward/backward) segment held the
+    # *full* segment input/output tensors, and adapters were generated against
+    # that full IO. Expander introduces an explicit expand pass that builds
+    # *per-device* segment IO and lets segments be "narrowed", so each device
+    # only keeps the slice of the segment IO it actually produces/consumes
+    # (e.g. tp partition mapped onto multiple
+    # devices) to reduce redundant communication.
+    #
+    # Two-tier expander:
+    #   - IRGraphExpander  (whole-graph driver, below): iterates fw segments,
+    #     calls build_expander() on each, and caches per_device_ios so that
+    #     producers/consumers can be rewired to the right per-device tensors.
+    #   - IRSegmentExpander (in segment.py): computes per-device inputs/outputs,
+    #     mirrors them to the backward segment (grads), and narrows segment IO
+    #     when shapes allow.
+    #
+    # Lifecycle: build_expander() -> build_io() (compute & cache per-device IO),
+    # then expand() materializes the per-device segments. adjust_*_for_per_device_seg
+    # rewire a producer/consumer that is itself a per-device segment to its
+    # narrowed per-device tensor so adapters connect the correct shards.
+    #
+    def build_expander(self):
+        """
+        Build per-device input/output for each segment in the graph.
+        This is used to prepare for adapter generation.
+        """
+        if self.expander is not None:
+            return
+
+        self.expander = IRGraphExpander(self)
+        self.expander.build_io()
+
+    def expand(self):
+        self.expander.expand()
+
+    def is_partitioned_segment_io(self, tensor: IRFullTensor):
+        # graph never has partitioned segment IO, only segments can have partitioned IO
+        return False
+
+    def adjust_producer_for_per_device_seg(self, producers: List[IRCell], ptensors: List[IRSubTensor]):
+        assert self.expander is not None, "Please call build_expander() before adjusting producers for per-device segments"
+        return self.expander.adjust_producer_for_per_device_seg(producers, ptensors)
+
+    def adjust_consumer_for_per_device_seg(self, consumers: List[IRCell], ctensors: List[IRSubTensor]):
+        assert self.expander is not None, "Please call build_expander() before adjusting consumers for per-device segments"
+        return self.expander.adjust_consumer_for_per_device_seg(consumers, ctensors)
+
+
+class IRGraphExpander:
+    def __init__(self, graph: IRGraph):
+        if not isinstance(graph, IRGraph):
+            raise TypeError(f"Expect IRGraph but got: {type(graph)}")
+
+        self._graph = graph
+        self.per_device_ios: Dict[
+            IRSegment, Tuple[Dict[int, List[IRObject]], Dict[int, List[IRObject]]]
+        ] = {}
+        self.dataloader_outputs = set()
+        self.graph_outputs = set()
+        self.io_built = False
+
+    def build_io(self):
+        if self.io_built:
+            return
+
+        for node in self._graph.nodes():
+            if isinstance(node, IRDataOperation):
+                self.dataloader_outputs.update(obj.parent for obj in IR.get_objects(node.outputs()))
+        self.graph_outputs.update(obj.parent for obj in IR.get_objects(self._graph.outputs()))
+
+        for node in self._graph.nodes():
+            if isinstance(node, IRSegment) and node.isfw():
+                node.build_expander(self.dataloader_outputs, self.graph_outputs)
+                self.per_device_ios[node] = node.expander.get_per_device_inout()
+                if node.mirror is not None:
+                    self.per_device_ios[node.mirror] = node.mirror.expander.get_per_device_inout()
+
+        self.io_built = True
+
+    def expand(self):
+        for segment in self._graph.nodes():
+            if isinstance(segment, IRSegment) and segment.isfw():
+                segment.expand()
+
+    def _adjust_segment_io(self, cells, tensors, *, output: bool):
+        assert len(cells) == len(tensors), "cells and tensors should have the same length"
+        assert self.io_built, "Please call build_io() before adjusting per-device segment IO"
+
+        adjusted_cells = []
+        adjusted_tensors = []
+        io_side = 1 if output else 0
+        for cell, tensor in zip(cells, tensors):
+            if cell not in self.per_device_ios:
+                adjusted_cells.append(cell)
+                adjusted_tensors.append(tensor)
+                continue
+
+            cell_ios = cell.outputs() if output else cell.inputs()
+            index = IR.index_with_same_parent(tensor, cell_ios)
+            if index is None:
+                adjusted_cells.append(cell)
+                adjusted_tensors.append(tensor)
+                continue
+
+            for per_device_io in self.per_device_ios[cell][io_side].values():
+                adjusted_cells.append(cell)
+                adjusted_tensors.append(per_device_io[index])
+        return adjusted_cells, adjusted_tensors
+
+    def adjust_producer_for_per_device_seg(self, producers: List[IRCell], ptensors: List[IRSubTensor]):
+        return self._adjust_segment_io(producers, ptensors, output=True)
+
+    def adjust_consumer_for_per_device_seg(self, consumers: List[IRCell], ctensors: List[IRSubTensor]):
+        return self._adjust_segment_io(consumers, ctensors, output=False)

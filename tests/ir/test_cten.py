@@ -10,6 +10,18 @@ from nnscaler.ir.tensor import IRFullTensor, IRSubTensor
 from nnscaler.graph.parser.parser import TensorMetadata, DICT_VALUES_TYPE, DICT_ITEMS_TYPE
 
 
+def test_index_with_same_parent_prefers_exact_and_rejects_ambiguity():
+    full = IRFullTensor((8,))
+    left = full.select(((0, 4),), (0, 1))
+    right = full.select(((4, 8),), (0, 1))
+
+    assert IR.index_with_same_parent(right, [left, right]) == 1
+
+    other = full.select(((2, 6),), (0, 1))
+    assert IR.index_with_same_parent(other, [left, right]) is None
+    assert IR.index_with_same_parent(other, [left]) == 0
+
+
 @pytest.mark.parametrize('tosub', [True, False])
 @pytest.mark.parametrize('requires_grad', [True, False, None])
 def test_from_complex(tosub, requires_grad):

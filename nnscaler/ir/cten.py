@@ -1128,17 +1128,17 @@ class IR:
         return IRCell.modify_objects_of_complex(val, modifier)
 
     @classmethod
-    def modify_objects_inplace(cls, val: Any, modifier: Callable[['IRObject'], None]) -> None:
-        """Modify a complex data structure inplace
+    def modify_objects_inplace(cls, val: Any, modifier: Callable[['IRObject'], None]) -> Any:
+        """Modify a complex data structure inplace.
 
         Supported complex of types: List, Tuple, Dict, Slice, IRTensor, IRObject
 
         Args:
             val (Any): the complex data structure to be modified
-            modifier (Callable): a modifier that takes an IRObject and return nothing.
+            modifier (Callable): a modifier that takes an IRObject and returns nothing.
 
-        Return:
-            None
+        Returns:
+            The input val (for chaining convenience).
         """
         rcall = cls.modify_objects_inplace
         if isinstance(val, (list, tuple)):
@@ -1199,6 +1199,73 @@ class IR:
         Check if the value is an IRObject
         """
         return isinstance(val, IRObject) and (include_ir_tensor or not isinstance(val, IRTensor))
+
+    @classmethod
+    def set_object_device(cls, val: Any, device: Union[int, List[int]]) -> Any:
+        """Set the device of IRObjects in a (possibly complex) data structure.
+
+        Creates a lightweight dummy cell to hold the device assignment,
+        since device is a property of IRCell, not IRObject directly.
+
+        Args:
+            val: an IRObject or complex structure containing IRObjects
+            device: the device id(s) to assign
+
+        Returns:
+            The same val (modified in-place).
+        """
+        def modifier(obj: IRObject) -> None:
+            obj.cell = IRCell(
+                name='_dev_holder',
+                signature='dummy',
+                input_length=1, output_length=1
+            )
+            obj.cell.device = device
+
+        return cls.modify_objects_inplace(val, modifier)
+
+    @classmethod
+    def copy_and_set_object_device(cls, val: Any, device: Union[int, List[int]]) -> Any:
+        """Copy the IRObject and set the device of the copy.
+
+        Creates a lightweight dummy cell to hold the device assignment,
+        since device is a property of IRCell, not IRObject directly.
+
+        Args:
+            val: an IRObject or complex structure containing IRObjects
+            device: the device id(s) to assign
+
+        Returns:
+            A copy of val with the device set.
+        """
+        return cls.set_object_device(cls.modify_objects(val, copy.copy), device)
+
+    @classmethod
+    def index_with_same_parent(cls, tensor: IRObject, tensors: List[IRObject]) -> Optional[int]:
+        """
+        Find the index of a tensor in a list of tensors that shares the same parent.
+
+        Args:
+            tensor (IRObject): The tensor to find.
+            tensors (List[IRObject]): The list of tensors to search.
+
+        Returns:
+            Optional[int]: The index of the tensor with the same parent, or None if not found.
+        """
+        exact = [
+            idx for idx, candidate in enumerate(tensors)
+            if isinstance(candidate, IRObject) and candidate.tid == tensor.tid
+        ]
+        if len(exact) == 1:
+            return exact[0]
+        if len(exact) > 1:
+            return None
+
+        parent_matches = [
+            idx for idx, candidate in enumerate(tensors)
+            if isinstance(candidate, IRObject) and candidate.parent == tensor.parent
+        ]
+        return parent_matches[0] if len(parent_matches) == 1 else None
 
 
 class IRTensor(IRObject):

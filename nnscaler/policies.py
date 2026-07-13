@@ -856,7 +856,6 @@ def fn(
         stage_id: int,
     ) -> None:
         old_stage_info = tensor_splits.setdefault(old_ftensor, {})
-        old_stage_info.setdefault(stage_id, set()).add('rn')
         new_stage_info = tensor_splits.setdefault(new_ftensor, {})
         for following_stage_id, splits in list(old_stage_info.items()):
             if following_stage_id <= stage_id:
@@ -933,16 +932,8 @@ def fn(
                 f'logical stages={sorted(stage_info.keys())}, '
                 f'physical stage={next(iter(stage_info)) % pp_size}')
 
-    # set pipeline stages
-    # Note we must stage graph before any transformation to the graph,
-    #      which is required by graph.group and graph.create_segment to work correctly.
-    # The consequence is that the inputs and outputs of the segment will always be complete tensors.
-    # For example:
-    # If the output subtensor of last operator in stage 0 can
-    # exactly fit into the input subtensor of the first operator in stage 1,
-    # we still need to insert adapters to
-    # collect the subtensors into a complete tensor as the output of stage 0,
-    # and then split it again as the input of stage 1.
+    # Stage first so graph.group/create_segment see the original graph. Adapter
+    # generation can narrow compatible segment boundaries back to per-device IO.
     activation_multirefed: set[tuple[int, int]] = set()
 
     if pp_enabled:
@@ -1006,10 +997,7 @@ def fn(
             if (idx, id(ftensor)) in activation_multirefed:
                 continue
             split_list = list(splits)
-            has_partitioned_consumer = any(split not in ('rr', 'rn') for split in split_list)
-            if len(split_list) > 1 or (
-                is_seg_output[idx] and has_partitioned_consumer
-            ):
+            if len(split_list) > 1:
                 _logger.debug(f'add multiref for {ftensor} in stage {stage}')
                 stage.multiref(ftensor, comment='activation')
 
