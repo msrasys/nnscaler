@@ -16,9 +16,10 @@ from nnscaler.graph.function.pyfunc import IRPyFunc
 
 from nnscaler.ir.cten import IRCell, IRObject
 from nnscaler.ir.tensor import IRFullTensor, IRSubTensor
-from nnscaler.ir.operator import IRFwOperation
+from nnscaler.ir.operator import IRFwOperation, IRDataOperation
 
 from nnscaler.ir.adapter import IRAdapter, IRWeightReducer
+from nnscaler.ir.adapter.prim import ObjectBroadcastPrim, ObjectMovePrim
 from nnscaler.graph.function.function import Accum, Cat, MultiRef
 
 
@@ -45,25 +46,23 @@ def create_dummy(segment: IRSegment, inputs: bool = True, outputs: bool = True) 
     if inputs:
         input_objects = IRGraph.get_objects_from_complex(segment.inputs())
         for tensor in input_objects:
-            if not isinstance(tensor, IRSubTensor):
-                continue
-            assert tensor.valmap == (0, 1), f"valmap != (0, 1):\n{segment.extra_repr()}"
             fwop = utils.DummyInputOuput(tensor, devices, is_output=True, name=f'segment{segment.cid}_input')
-            if tensor.grad is not None:
-                fwop.output(0).grad = tensor.parent.grad.select(tensor.indmap, (0, 1))
-                fwop.output(0).grad.cell = fwop
+            if isinstance(tensor, IRSubTensor):
+                assert tensor.valmap == (0, 1), f"valmap != (0, 1):\n{segment.extra_repr()}"
+                if tensor.grad is not None:
+                    fwop.output(0).grad = tensor.parent.grad.select(tensor.indmap, (0, 1))
+                    fwop.output(0).grad.cell = fwop
             input_producers.setdefault(tensor.parent, []).append(fwop)
     # create outputs
     if outputs:
         output_objects = IRGraph.get_objects_from_complex(segment.outputs())
         for tensor in output_objects:
-            if not isinstance(tensor, IRSubTensor):
-                continue
-            assert tensor.valmap == (0, 1), f"valmap != (0, 1):\n{segment.extra_repr()}"
             fwop = utils.DummyInputOuput(tensor, devices, is_input=True, name=f'segment{segment.cid}_output')
-            if tensor.grad is not None:
-                fwop.input(0).grad = tensor.parent.grad.select(tensor.indmap, (0, 1))
-                fwop.input(0).grad.cell = fwop
+            if isinstance(tensor, IRSubTensor):
+                assert tensor.valmap == (0, 1), f"valmap != (0, 1):\n{segment.extra_repr()}"
+                if tensor.grad is not None:
+                    fwop.input(0).grad = tensor.parent.grad.select(tensor.indmap, (0, 1))
+                    fwop.input(0).grad.cell = fwop
             output_consumers.setdefault(tensor.parent, []).append(fwop)
     return input_producers, output_consumers
 
@@ -308,6 +307,67 @@ class IRAdapterGener:
         return graph
 
     @staticmethod
+    def gen_object_adapter(
+        pobjects: List[IRObject],
+        cobjects: List[IRObject],
+    ) -> Optional[IRAdapter]:
+        """Generate whole-object communication between replicated placements.
+
+        Unlike tensors, an IRObject cannot be spatially or value partitioned. Map
+        remote consumers evenly to producer replicas and use only point-to-point
+        moves or broadcasts of the complete object.
+        """
+        if not pobjects or not cobjects:
+            return None
+
+        if any(len(obj.device) != 1 for obj in pobjects + cobjects):
+            raise ValueError("IRObject adapter generation expects one device per placement")
+
+        # expand_devices has already removed duplicate placements. Keep its
+        # ordering because producer/consumer replicas are laid out in that order.
+        producers = {obj.device[0]: obj for obj in pobjects}
+        consumers = {obj.device[0]: obj for obj in cobjects}
+        remote_consumers = [
+            obj for devid, obj in consumers.items()
+            if devid not in producers
+        ]
+        if not remote_consumers:
+            return None
+
+        # Split consecutive consumer replicas evenly across producer replicas.
+        # This preserves scale-unit grouping, e.g. producers [0, 4] and consumers
+        # [1, 2, 3, 5, 6, 7] become broadcasts [0..3] and [4..7].
+        producer_objects = list(producers.values())
+        group_size, extra = divmod(len(remote_consumers), len(producer_objects))
+        offset = 0
+        adapter_inputs = []
+        adapter_outputs = []
+        prims = []
+        for idx, producer in enumerate(producer_objects):
+            size = group_size + (1 if idx < extra else 0)
+            targets = remote_consumers[offset:offset + size]
+            offset += size
+            if not targets:
+                continue
+
+            adapter_inputs.append(producer)
+            if len(targets) == 1:
+                adapter_outputs.extend(targets)
+                prims.append(ObjectMovePrim([producer], targets))
+                continue
+
+            # A broadcast includes its source rank as an output. Prefer the
+            # local consumer placement; otherwise reuse the producer object.
+            outputs = list(targets)
+            outputs.append(consumers.get(producer.device[0], producer))
+            adapter_outputs.extend(outputs)
+            prims.append(ObjectBroadcastPrim([producer], outputs))
+
+        adapter = IRAdapter(adapter_inputs, adapter_outputs)
+        adapter.prims = prims
+        return adapter
+
+    @staticmethod
     def gen_activation(graph: IRSegment, allow_recompute: bool = True, cost_fn: Optional[Callable] = None) -> IRSegment:
         """!
         Generate adapter for activation tensors.
@@ -499,6 +559,58 @@ class IRAdapterGener:
             if _cnt % 100 == 0:
                 _logger.info(f'generated {_cnt} activation adapters')
         _logger.info(f'finish generating {_cnt} activation adapters')
+
+        # Generate adapters for non-tensor IRObjects. Objects are replicated, so
+        # only forward, inter-device transfers are needed.
+        _obj_cnt = 0
+        for fobj in graph.full_objects():
+            if isinstance(fobj, IRFullTensor):
+                continue
+
+            fpobjects = graph.ptensors(fobj)
+            if fobj in input_producer:
+                fpobjects = fpobjects + tuple(fop.output(0) for fop in input_producer[fobj])
+            fpobjects = expand_devices(fpobjects, producer=True)
+
+            fconsumers = graph.consumers(fobj)
+            fcobjects = expand_devices(graph.ctensors(fobj), consumer=True)
+            if fobj in output_consumer:
+                out_fcobjs = tuple(fwop.input(0) for fwop in output_consumer[fobj])
+                out_fcobjs = expand_devices(out_fcobjs, consumer=True)
+            else:
+                out_fcobjs = ()
+
+            if not out_fcobjs and all(isinstance(c, IRDataOperation) for c in fconsumers):
+                # Dataloader objects are moved together with their input tensors.
+                continue
+
+            fadapters = []
+
+            fadapter = IRAdapterGener.gen_object_adapter(fpobjects, fcobjects)
+            if fadapter is not None:
+                fadapters.append(fadapter)
+
+            if out_fcobjs:
+                if set(out_fcobjs) == set(fcobjects) and \
+                   set(t.device[0] for t in out_fcobjs) == set(t.device[0] for t in fcobjects):
+                    pass
+                else:
+                    fadapter = IRAdapterGener.gen_object_adapter(fpobjects, out_fcobjs)
+                    if fadapter is not None:
+                        fadapters.append(fadapter)
+
+            for fadapter in fadapters:
+                if fconsumers:
+                    fidx = min(graph.multi_index(fconsumers))
+                else:
+                    for fidx, node in enumerate(graph.nodes()[::-1]):
+                        if node.isfw():
+                            fidx = CellPosition((graph.nnodes - fidx,))
+                            break
+                graph.insert(fadapter, fidx)
+
+            _obj_cnt += 1
+        _logger.info(f'finish generating adapters for {_obj_cnt} non-tensor objects')
 
         # generate adapter for each segment
         segments = [seg for seg in graph.nodes() if isinstance(seg, IRSegment) and seg.isfw()]
