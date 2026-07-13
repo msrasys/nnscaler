@@ -1202,7 +1202,9 @@ class Reducer:
         synchronize gradients using allreduce (non-zero) or reduce-scatter (zero)
         """
         if RuntimeFlag.skip_reducer: return
-        for bucket in self._buckets:
+        # async bucket grad all-reduce will be done in reversed order
+        # so we wait them in reversed order to have a slightly better performance.
+        for bucket in reversed(self._buckets):
             bucket.sync_grads()
 
     def get_z3_info(self, param: torch.nn.Parameter) -> ReducerParamInfo:
