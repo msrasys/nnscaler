@@ -38,10 +38,27 @@ def _move_worker(async_op: bool):
     return clone_to_cpu(tensor)
 
 
+def _object_collective_payload():
+    return {
+        'cuda': torch.arange(3, device=torch.cuda.current_device()),
+        'cpu': torch.arange(2, device='cpu'),
+        'metadata': {'hello': 'world', 'count': 1},
+    }
+
+
+def _assert_object_collective_payload(obj):
+    assert obj['cuda'].device == torch.device('cuda', torch.cuda.current_device())
+    assert obj['cuda'].tolist() == [0, 1, 2]
+    assert obj['cpu'].device.type == 'cpu'
+    assert obj['cpu'].tolist() == [0, 1]
+    assert obj['metadata'] == {'hello': 'world', 'count': 1}
+
+
 def _move_object_worker():
-    obj = {'hello': 'world', 'count': 1}
+    rank = torch.distributed.get_rank()
+    obj = _object_collective_payload() if rank == 0 else None
     robj = nnscaler.runtime.adapter.move_object(obj, 0, 1)
-    assert robj == obj
+    _assert_object_collective_payload(robj)
 
 
 def _allreduce_worker(async_op: bool):
@@ -187,10 +204,11 @@ def _broadcast_worker(async_op):
 
 
 def _broadcast_object_worker():
-    obj = {'hello': 'world', 'count': 1}
+    rank = torch.distributed.get_rank()
+    obj = _object_collective_payload() if rank == 0 else None
     robj = nnscaler.runtime.adapter.broadcast_object(
         obj, src=0, ranks=[0,1,2])
-    assert robj == obj
+    _assert_object_collective_payload(robj)
 
 
 def _3gpu_worker():

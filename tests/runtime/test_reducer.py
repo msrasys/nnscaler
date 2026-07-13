@@ -5,6 +5,7 @@
 pytest unit_tests/runtime/test_reducer.py
 """
 import io
+import os
 import torch
 import logging
 from functools import partial
@@ -25,7 +26,7 @@ from nnscaler.runtime.adapter.reducer import (
     mark_reducer_grad_ready,
 )
 from nnscaler.runtime.device import DeviceGroup
-from ..launch_torchrun import torchrun
+from ..launch_torchrun import launch_torchrun, torchrun
 from ..utils import catch_log, init_parameter, assert_parity, mock_reducer_env
 
 
@@ -421,3 +422,47 @@ def test_manual_grad_slice_zero3_reduces_by_owner_and_postevicts_param():
     )
     assert param.grad is None
     assert param.shape == (info.numel_with_padding(),)
+
+
+def _manual_grad_slice_zero3_distributed_worker():
+    local_rank = int(os.environ['LOCAL_RANK'])
+    torch.cuda.set_device(local_rank)
+    torch.distributed.init_process_group(backend='nccl')
+
+    rank = torch.distributed.get_rank()
+    param = torch.nn.Parameter(torch.zeros(8, device=local_rank))
+    reducer = Reducer([0, 1], zero=3)
+    reducer.add_param(param)
+    reducer.build_buckets()
+    bucket = reducer.buckets[0]
+    info = reducer.get_z3_info(param)
+
+    # Materialize the full parameter as a normal ZeRO-3 forward would do.
+    param.data = torch.zeros(info.shape, device=local_rank)
+    base_grad = torch.arange(1.0, 7.0, device=local_rank)
+    contribution = base_grad * (1 if rank == 0 else 10)
+    _ManualReducerGrad.apply(param, [(contribution, 0)]).backward()
+
+    reduced = base_grad * 11
+    expected_full = torch.cat((reduced, torch.zeros(2, device=local_rank)))
+    expected_local = expected_full[info.start:info.end]
+    offset = bucket._pofset[param]
+    torch.testing.assert_close(
+        bucket._contiguous_grads[offset:offset + info.numel()],
+        expected_local,
+    )
+    assert param.grad is None
+    assert param.shape == (info.numel_with_padding(),)
+
+    reducer.sync_grads()
+    torch.testing.assert_close(param.grad[:info.numel()], expected_local)
+    torch.distributed.barrier()
+    torch.distributed.destroy_process_group()
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.device_count() < 2,
+    reason='requires two CUDA devices',
+)
+def test_manual_grad_slice_zero3_real_collective_2gpu():
+    launch_torchrun(2, _manual_grad_slice_zero3_distributed_worker)

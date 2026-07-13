@@ -9,6 +9,7 @@ for non-autograd (e.g., inference) scenarios.
 Every collective is implemented using out-of-place semantics.
 """
 
+import io
 from typing import List, Tuple, Optional
 import torch
 
@@ -21,6 +22,24 @@ from nnscaler.runtime.executor import (
     defer_pseudo_free_tensor,
     pseudo_free_tensor,
 )
+
+
+def _serialize_object(obj) -> bytes:
+    buffer = io.BytesIO()
+    torch.save(obj, buffer)
+    return buffer.getvalue()
+
+
+def _deserialize_object(payload: bytes):
+    # Object collectives otherwise restore nested CUDA tensors on the sender's
+    # device, which is invalid when an IRObject crosses pipeline stages.
+    def map_location(storage, location):
+        if location.startswith('cuda'):
+            return storage.cuda(torch.cuda.current_device())
+        return None
+
+    return torch.load(
+        io.BytesIO(payload), map_location=map_location, weights_only=False)
 
 
 def move(
@@ -92,12 +111,12 @@ def move_object(obj, src: int, dst: int, async_op=False):
     CudaTimer().start(field_name='comm', predefined=True)
     rank = torch.distributed.get_rank()
     if rank == src:
-        torch.distributed.send_object_list([obj], dst=dst)
+        torch.distributed.send_object_list([_serialize_object(obj)], dst=dst)
     else:
         assert rank == dst
         obj_list = [None]
         torch.distributed.recv_object_list(obj_list, src=src)
-        obj = obj_list[0]
+        obj = _deserialize_object(obj_list[0])
     CudaTimer().stop(field_name='comm', predefined=True)
     return obj
 
@@ -390,12 +409,13 @@ def broadcast_object(obj, src: int, ranks: List[int], async_op=False):
     rank = torch.distributed.get_rank()
     group = DeviceGroup().get_group(ranks)
     if rank == src:
-        torch.distributed.broadcast_object_list([obj], src=src, group=group)
+        torch.distributed.broadcast_object_list(
+            [_serialize_object(obj)], src=src, group=group)
     else:
         assert rank in ranks
         obj_list = [None]
         torch.distributed.broadcast_object_list(obj_list, src=src, group=group)
-        obj = obj_list[0]
+        obj = _deserialize_object(obj_list[0])
 
     CudaTimer().stop(field_name='comm', predefined=True)
     return obj
