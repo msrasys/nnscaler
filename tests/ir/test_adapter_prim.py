@@ -1,0 +1,38 @@
+#  Copyright (c) Microsoft Corporation.
+#  Licensed under the MIT License.
+
+from nnscaler.ir.adapter.prim import AllGatherPrim, ChunkPrim
+from nnscaler.ir.cten import IR
+from nnscaler.ir.tensor import IRFullTensor
+
+
+def _set_device(tensor, device):
+    return IR.set_object_device(tensor, device)
+
+
+def test_allgather_preserves_logical_partition_rank_order():
+    full = IRFullTensor((16,))
+    devices = [0, 2, 1, 3]
+    inputs = [
+        _set_device(full.select(((index * 4, (index + 1) * 4),), (0, 1)), device)
+        for index, device in enumerate(devices)
+    ]
+    outputs = [_set_device(full.tosub(), device) for device in devices]
+
+    prim = AllGatherPrim(inputs, outputs, dim=0)
+
+    assert prim.kwargs['ranks'] == (0, 2, 1, 3)
+
+
+def test_chunk_preserves_logical_partition_rank_order():
+    full = IRFullTensor((16,))
+    devices = [0, 2, 1, 3]
+    inputs = [_set_device(full.tosub(), device) for device in devices]
+    outputs = [
+        _set_device(full.select(((index * 4, (index + 1) * 4),), (0, 1)), device)
+        for index, device in enumerate(devices)
+    ]
+
+    prim = ChunkPrim(inputs, outputs, dim=0)
+
+    assert prim.kwargs['ranks'] == (0, 2, 1, 3)

@@ -150,12 +150,17 @@ def all_gather(tensor: torch.Tensor, dim: int,
     tensor_list = [torch.empty_like(tensor) for _ in ranks]
     tensor_list[torch.distributed.get_rank(group)] = tensor.data
     work = torch.distributed.all_gather(tensor_list, tensor, group=group, async_op=async_op)
+    group_ranks = torch.distributed.get_process_group_ranks(group)
+    gather_order = tuple(group_ranks.index(rank) for rank in ranks)
+
+    def concat_gathered(_):
+        return torch.concat(tuple(tensor_list[index] for index in gather_order), dim=dim)
+
     if work:
-        allgather_callback = lambda t: torch.concat(tuple(tensor_list), dim=dim)
-        AsyncCommHandler().submit(tensor, [work], allgather_callback)
+        AsyncCommHandler().submit(tensor, [work], concat_gathered)
         otensor = tensor
     else:
-        otensor = torch.concat(tuple(tensor_list), dim=dim)
+        otensor = concat_gathered(tensor)
     if not async_op:
         CudaTimer().stop(field_name='comm', predefined=True)
     return otensor
@@ -250,8 +255,7 @@ def chunk(itensor: torch.Tensor, dim: int, ranks: Tuple[int], async_op=False) ->
 
     ranks (Tuple[int]): the order of split tensor.
     """
-    group = DeviceGroup().get_group(ranks)
-    idx = torch.distributed.get_rank(group)
+    idx = tuple(ranks).index(torch.distributed.get_rank())
     with torch.no_grad():
         otensor = itensor.chunk(len(ranks), dim)[idx]
         otensor = otensor.detach()
