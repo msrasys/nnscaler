@@ -664,7 +664,12 @@ def _pp_shared_policy(graph, cfg):
     relu_found = False
     for node in get_pas_ops(graph):
         if relu_found:
-            yield OpPlan(node,stage_id=1)
+            if node.fn == torch.add:
+                yield OpPlan(node, stage_id=1, partition=OpPartition(input=1, dim=0))
+            elif node.fn == _shared_skip_op:
+                yield OpPlan(node, stage_id=1, partition=OpPartition(input=0, dim=0))
+            else:
+                yield OpPlan(node,stage_id=1)
         else:
             if node.fn == torch.nn.functional.relu:
                 yield OpPlan(node, stage_id=0, partition=OpPartition(input=1, dim=1))
@@ -713,6 +718,49 @@ def test_pp_shared_model(tmp_path, pipeline_multiref_replicated_params):
             assert _gencode_contains(tmp_path, PPSharedModel, rank, r'self.register_parameter\(')
         else:
             assert not _gencode_contains(tmp_path, PPSharedModel, rank, r'self.register_parameter\(')
+
+
+class PPSharedMultipleConsumersModel(torch.nn.Module):
+    def __init__(self, hidden_dim):
+        super().__init__()
+        self.w = torch.nn.Parameter(torch.randn(hidden_dim, hidden_dim))
+
+    def forward(self, x):
+        x = torch.matmul(x, self.w)
+        x = torch.nn.functional.relu(x)
+        x = torch.matmul(x, self.w)
+        y = _shared_skip_op(x, self.w)
+        z = x + self.w
+        return (x + y + z).sum()
+
+
+@replace_all_device_with('cpu')
+def test_pp_shared_model_complex_comsumers(tmp_path):
+    m = PPSharedMultipleConsumersModel(4)
+    m.train()
+    parallelize(
+        m,
+        {'x': torch.randn(4, 4)},
+        _pp_shared_policy,
+        ComputeConfig(2, 4, use_end2end=True,
+            pas_config={
+                'pipeline_nmicros': 2,
+                'pipeline_size': 2,
+                'pipeline_multiref_replicated_params': True,
+            }
+        ),
+        gen_savedir=tmp_path,
+        load_module=False,
+        reuse='override',
+    )
+    # only the first stage (rank 0/2) should have the shared parameter,
+    # and only it should register it as a parameter
+    # (the other stage gets it as a non-parameter shared input)
+    for rank in range(4):
+        if rank % 2 == 0:
+            assert _gencode_contains(tmp_path, PPSharedMultipleConsumersModel, rank, r'self.register_parameter\(')
+        else:
+            assert not _gencode_contains(tmp_path, PPSharedMultipleConsumersModel, rank, r'self.register_parameter\(')
 
 
 class LossDataModel(torch.nn.Module):
@@ -884,3 +932,278 @@ def test_loss_explicit_multiref(tmp_path):
     #     multiref_24 = nnscaler.runtime.adapter.nn.allreduce_identity(multiref_52, ranks=[0, 1])
     #     del multiref_52
     #     return multiref_24, getattr_2_25
+
+
+def _shared_output_partition_policy(graph, cfg):
+    from nnscaler.policies import OpPlan, OpPartition, get_pas_ops
+
+    for node in get_pas_ops(graph):
+        if node.fn == torch.matmul:
+            yield OpPlan(node, partition=OpPartition(input=1, dim=1))
+        elif node.fn == _shared_skip_op:
+            yield OpPlan(node, partition=OpPartition(input=1, dim=1))
+
+
+class SharedOutputModel1(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.w0 = torch.nn.Parameter(torch.randn(4, 4))
+        self.w1 = torch.nn.Parameter(torch.randn(4, 4))
+        self.w2 = torch.nn.Parameter(torch.randn(4, 4))
+
+    def forward(self, raw_x):
+        x = torch.nn.functional.linear(raw_x, self.w0)
+        a = _shared_skip_op(x, self.w1)
+        return x, a
+
+
+@replace_all_device_with('cpu')
+def test_shared_output_with_no_grad_reduce_consumer(tmp_path):
+    m = SharedOutputModel1()
+    m.train()
+    parallelize(
+        m,
+        {'raw_x': torch.randn(4, 4)},
+        _shared_output_partition_policy,
+        ComputeConfig(2, 4, use_end2end=False),
+        gen_savedir=tmp_path,
+        load_module=False,
+        reuse='override',
+    )
+    # will not insert a multiref from fn
+    assert not _gencode_contains(
+        tmp_path, SharedOutputModel1, 0, r'fn activation'
+    )
+    # code looks like:
+    # def segment73(self, raw_x_15):
+    #     # File "/data/weijiangxu/nnscaler/tests/parallel_module/test_gencode_partition.py", line 955, in forward,  x = torch.nn.functional.linear(raw_x, self.w0)
+    #     linear_16 = torch.nn.functional.linear(raw_x_15, self.w0_18, bias=None)
+    #     del raw_x_15
+    #     # created at IRAdapterGener:local_consumer_multiref
+    #     linear_41, linear_45 = nnscaler.runtime.function.multiref(linear_16, times=2)
+    #     del linear_16
+    #     # File "/data/weijiangxu/nnscaler/tests/parallel_module/test_gencode_partition.py", line 956, in forward,  a = _shared_skip_op(x, self.w1)
+    #     _shared_skip_op_27 = tests.parallel_module.test_gencode_partition._shared_skip_op(linear_41, self.w1_25)
+    #     del linear_41
+    #     linear_31 = nnscaler.runtime.function.identity(linear_45)
+    #     del linear_45
+    #     _shared_skip_op_17 = nnscaler.runtime.adapter.nn.allgather_split(_shared_skip_op_27, dim=1, ranks=[0, 1])
+    #     del _shared_skip_op_27
+    #     return _shared_skip_op_17, linear_31
+
+
+class SharedOutputModel2(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.w0 = torch.nn.Parameter(torch.randn(4, 4))
+        self.w1 = torch.nn.Parameter(torch.randn(4, 4))
+        self.w2 = torch.nn.Parameter(torch.randn(4, 4))
+
+    def forward(self, raw_x):
+        x = torch.nn.functional.linear(raw_x, self.w0)
+        a = torch.matmul(x, self.w1)
+        return x, a
+
+
+@replace_all_device_with('cpu')
+def test_shared_output_with_grad_reduce_consumer(tmp_path):
+    m = SharedOutputModel2()
+    m.train()
+    parallelize(
+        m,
+        {'raw_x': torch.randn(4, 4)},
+        _shared_output_partition_policy,
+        ComputeConfig(2, 4, use_end2end=False),
+        gen_savedir=tmp_path,
+        load_module=False,
+        reuse='override',
+    )
+    # will insert a multiref from fn
+    assert _gencode_contains(
+        tmp_path, SharedOutputModel2, 0, r'fn activation'
+    )
+    # code looks like:
+    # def segment81(self, raw_x_15):
+    #     # File "/data/weijiangxu/nnscaler/tests/parallel_module/test_gencode_partition.py", line 1000, in forward,  x = torch.nn.functional.linear(raw_x, self.w0)
+    #     linear_16 = torch.nn.functional.linear(raw_x_15, self.w0_18, bias=None)
+    #     del raw_x_15
+    #     # create at IRAdapterGener:autoref, comment before transformation: fn activation
+    #     linear_39, linear_40 = nnscaler.runtime.function.multiref(linear_16, times=2)
+    #     del linear_16
+    #     linear_39 = nnscaler.runtime.adapter.nn.identity_allreduce(linear_39, ranks=[0, 1])
+    #     # File "/data/weijiangxu/nnscaler/tests/parallel_module/test_gencode_partition.py", line 1001, in forward,  a = torch.matmul(x, self.w1)
+    #     matmul_27 = torch.matmul(linear_39, self.w1_25)
+    #     del linear_39
+    #     linear_31 = nnscaler.runtime.function.identity(linear_40)
+    #     del linear_40
+    #     matmul_17 = nnscaler.runtime.adapter.nn.allgather_split(matmul_27, dim=1, ranks=[0, 1])
+    #     del matmul_27
+    #     return matmul_17, linear_31
+
+
+class SharedOutputModel3(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.w0 = torch.nn.Parameter(torch.randn(4, 4))
+        self.w1 = torch.nn.Parameter(torch.randn(4, 4))
+        self.w2 = torch.nn.Parameter(torch.randn(4, 4))
+
+    def forward(self, raw_x):
+        x = torch.nn.functional.linear(raw_x, self.w0)
+        a = torch.matmul(x, self.w1)
+        b = identity(x)
+        return b, a
+
+
+@replace_all_device_with('cpu')
+def test_shared_output_with_explicit_identity(tmp_path):
+    m = SharedOutputModel3()
+    m.train()
+    parallelize(
+        m,
+        {'raw_x': torch.randn(4, 4)},
+        _shared_output_partition_policy,
+        ComputeConfig(2, 4, use_end2end=False),
+        gen_savedir=tmp_path,
+        load_module=False,
+        reuse='override',
+    )
+    # will insert a multiref from fn
+    assert _gencode_contains(
+        tmp_path, SharedOutputModel3, 0, r'fn activation'
+    )
+    # code looks like:
+    # def segment83(self, raw_x_17):
+    #     # File "/data/weijiangxu/nnscaler/tests/parallel_module/test_gencode_partition.py", line 1052, in forward,  x = torch.nn.functional.linear(raw_x, self.w0)
+    #     linear_21 = torch.nn.functional.linear(raw_x_17, self.w0_20, bias=None)
+    #     del raw_x_17
+    #     # create at IRAdapterGener:autoref, comment before transformation: fn activation
+    #     linear_39, linear_40 = nnscaler.runtime.function.multiref(linear_21, times=2)
+    #     del linear_21
+    #     linear_39 = nnscaler.runtime.adapter.nn.identity_allreduce(linear_39, ranks=[0, 1])
+    #     # File "/data/weijiangxu/nnscaler/tests/parallel_module/test_gencode_partition.py", line 1053, in forward,  a = torch.matmul(x, self.w1)
+    #     matmul_33 = torch.matmul(linear_39, self.w1_31)
+    #     del linear_39
+    #     # File "/data/weijiangxu/nnscaler/tests/parallel_module/test_gencode_partition.py", line 1054, in forward,  b = identity(x)
+    #     identity_18 = nnscaler.runtime.function.identity(linear_40)
+    #     del linear_40
+    #     matmul_19 = nnscaler.runtime.adapter.nn.allgather_split(matmul_33, dim=1, ranks=[0, 1])
+    #     del matmul_33
+    #     return matmul_19, identity_18
+
+
+class SharedOutputModel4(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.w0 = torch.nn.Parameter(torch.randn(4, 4))
+        self.w1 = torch.nn.Parameter(torch.randn(4, 4))
+        self.w2 = torch.nn.Parameter(torch.randn(4, 4))
+
+    def forward(self, raw_x):
+        x = torch.nn.functional.linear(raw_x, self.w0)
+        a = torch.matmul(x, self.w1)
+        b = _shared_skip_op(x, self.w2)
+        c = a + b
+        return x, c
+
+
+@replace_all_device_with('cpu')
+def test_shared_output_with_mixed_grad_reduce_consumer(tmp_path):
+    m = SharedOutputModel4()
+    m.train()
+    parallelize(
+        m,
+        {'raw_x': torch.randn(4, 4)},
+        _shared_output_partition_policy,
+        ComputeConfig(2, 4, use_end2end=False),
+        gen_savedir=tmp_path,
+        load_module=False,
+        reuse='override',
+    )
+    # will insert a multiref from fn
+    assert _gencode_contains(
+        tmp_path, SharedOutputModel4, 0, r'fn activation'
+    )
+    # code looks like:
+    # def segment121(self, raw_x_21):
+    #     # File "/data/weijiangxu/nnscaler/tests/parallel_module/test_gencode_partition.py", line 1103, in forward,  x = torch.nn.functional.linear(raw_x, self.w0)
+    #     linear_22 = torch.nn.functional.linear(raw_x_21, self.w0_24, bias=None)
+    #     del raw_x_21
+    #     # create at IRAdapterGener:autoref, comment before transformation: fn activation
+    #     linear_59, linear_60, linear_61 = nnscaler.runtime.function.multiref(linear_22, times=3)
+    #     del linear_22
+    #     linear_59 = nnscaler.runtime.adapter.nn.identity_allreduce(linear_59, ranks=[0, 1])
+    #     # File "/data/weijiangxu/nnscaler/tests/parallel_module/test_gencode_partition.py", line 1104, in forward,  a = torch.matmul(x, self.w1)
+    #     matmul_41 = torch.matmul(linear_59, self.w1_39)
+    #     del linear_59
+    #     # File "/data/weijiangxu/nnscaler/tests/parallel_module/test_gencode_partition.py", line 1105, in forward,  b = _shared_skip_op(x, self.w2)
+    #     _shared_skip_op_45 = tests.parallel_module.test_gencode_partition._shared_skip_op(linear_60, self.w2_43)
+    #     del linear_60
+    #     matmul_26 = nnscaler.runtime.adapter.nn.allgather_split(matmul_41, dim=1, ranks=[0, 1])
+    #     del matmul_41
+    #     _shared_skip_op_28 = nnscaler.runtime.adapter.nn.allgather_split(_shared_skip_op_45, dim=1, ranks=[0, 1])
+    #     del _shared_skip_op_45
+    #     # File "/data/weijiangxu/nnscaler/tests/parallel_module/test_gencode_partition.py", line 1106, in forward,  c = a + b
+    #     add_23 = torch.add(matmul_26, _shared_skip_op_28, alpha=1)
+    #     del matmul_26, _shared_skip_op_28
+    #     linear_49 = nnscaler.runtime.function.identity(linear_61)
+    #     del linear_61
+    #     return add_23, linear_49
+
+
+class SharedOutputModel5(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.w0 = torch.nn.Parameter(torch.randn(4, 4))
+        self.w1 = torch.nn.Parameter(torch.randn(4, 4))
+        self.w2 = torch.nn.Parameter(torch.randn(4, 4))
+
+    def forward(self, raw_x):
+        x = torch.nn.functional.linear(raw_x, self.w0)
+        a = x + self.w1
+        return x, a
+
+
+def _shared_output_partition_policy4(graph, cfg):
+    from nnscaler.policies import OpPlan, OpPartition, get_pas_ops
+
+    for node in get_pas_ops(graph):
+        if node.fn == torch.add:
+            yield OpPlan(node, partition=OpPartition(input=0, dim=0))
+
+
+@replace_all_device_with('cpu')
+def test_shared_output_with_partitioned_consumer(tmp_path):
+    m = SharedOutputModel5()
+    m.train()
+    parallelize(
+        m,
+        {'raw_x': torch.randn(4, 4)},
+        _shared_output_partition_policy4,
+        ComputeConfig(2, 4, use_end2end=False),
+        gen_savedir=tmp_path,
+        load_module=False,
+        reuse='override',
+    )
+    # will insert a multiref from fn
+    assert _gencode_contains(
+        tmp_path, SharedOutputModel5, 0, r'fn activation'
+    )
+    # code looks like:
+    # def segment81(self, raw_x_15):
+    #     # File "/data/weijiangxu/nnscaler/tests/parallel_module/test_gencode_partition.py", line 1162, in forward,  x = torch.nn.functional.linear(raw_x, self.w0)
+    #     linear_16 = torch.nn.functional.linear(raw_x_15, self.w0_18, bias=None)
+    #     del raw_x_15
+    #     # create at IRAdapterGener:autoref, comment before transformation: fn activation
+    #     linear_41, linear_42 = nnscaler.runtime.function.multiref(linear_16, times=2)
+    #     del linear_16
+    #     linear_45 = nnscaler.runtime.adapter.nn.split_allgather(linear_41, dim=0, ranks=[0, 1])
+    #     del linear_41
+    #     # File "/data/weijiangxu/nnscaler/tests/parallel_module/test_gencode_partition.py", line 1163, in forward,  a = x + self.w1
+    #     add_29 = torch.add(linear_45, self.w1_27, alpha=1)
+    #     del linear_45
+    #     linear_33 = nnscaler.runtime.function.identity(linear_42)
+    #     del linear_42
+    #     add_17 = nnscaler.runtime.adapter.nn.allgather_split(add_29, dim=0, ranks=[0, 1])
+    #     del add_29
+    #     return add_17, linear_33
