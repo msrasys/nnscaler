@@ -1,0 +1,2639 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>nnScaler Schedule DOT Viewer</title>
+  <style>
+    :root {
+      --bg: #0f131a;
+      --panel: #171d27;
+      --panel-border: #2c3445;
+      --text: #ecf2ff;
+      --muted: #9ca9c0;
+      --accent: #61d8ff;
+      --good: #9be190;
+      --warn: #ffb020;
+      --warn-soft: #3a2a11;
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      color: var(--text);
+      font-family: "SF Pro Text", "Segoe UI", "PingFang SC", "Noto Sans CJK SC", sans-serif;
+      background: radial-gradient(1100px 700px at 0% -10%, #1f2e47 0, #0f131a 55%);
+      min-height: 100vh;
+    }
+
+    .wrap {
+      max-width: 1900px;
+      margin: 0 auto;
+      padding: 16px;
+    }
+
+    h1 {
+      margin: 0 0 6px;
+      font-size: 23px;
+      letter-spacing: 0.2px;
+    }
+
+    .desc {
+      margin: 0 0 12px;
+      color: var(--muted);
+      font-size: 13px;
+      line-height: 1.5;
+    }
+
+    .desc b { color: var(--good); }
+
+    .toolbar {
+      display: flex;
+      gap: 10px;
+      flex-wrap: wrap;
+      align-items: center;
+      background: rgba(255,255,255,0.02);
+      border: 1px solid var(--panel-border);
+      border-radius: 10px;
+      padding: 10px;
+      margin-bottom: 10px;
+    }
+
+    label {
+      font-size: 12px;
+      color: var(--muted);
+      margin-right: 4px;
+    }
+
+    select, button {
+      height: 34px;
+      border-radius: 8px;
+      border: 1px solid #43506a;
+      background: #20293a;
+      color: var(--text);
+      font-size: 13px;
+      padding: 0 10px;
+    }
+
+    button {
+      cursor: pointer;
+      background: linear-gradient(180deg, #2d5e92, #254a72);
+      border-color: #4777aa;
+    }
+
+    .grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 12px;
+      height: calc(100vh - 220px);
+      min-height: 650px;
+    }
+
+    .panel {
+      border: 1px solid var(--panel-border);
+      border-radius: 10px;
+      background: var(--panel);
+      overflow: hidden;
+      display: flex;
+      flex-direction: column;
+      min-height: 0;
+    }
+
+    .head {
+      padding: 8px 10px;
+      border-bottom: 1px solid var(--panel-border);
+      font-size: 12px;
+      color: var(--muted);
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      background: rgba(255,255,255,0.015);
+    }
+
+    .head strong {
+      color: var(--accent);
+      font-weight: 650;
+    }
+
+    .view {
+      flex: 1;
+      background: #fff;
+      min-height: 0;
+      position: relative;
+      overflow: auto;
+      cursor: default;
+    }
+
+    .view.dragging,
+    .view.dragging * {
+      cursor: grabbing !important;
+      user-select: none !important;
+    }
+
+    .canvas {
+      min-width: 100%;
+      min-height: 100%;
+      background: #fff;
+      transform-origin: top left;
+    }
+
+    .status {
+      position: absolute;
+      top: 8px;
+      left: 8px;
+      background: rgba(20, 24, 34, 0.9);
+      color: #d7e2f3;
+      border: 1px solid #3e4a63;
+      border-radius: 6px;
+      font-size: 11px;
+      padding: 4px 8px;
+      z-index: 10;
+      pointer-events: none;
+      max-width: calc(100% - 16px);
+    }
+
+    .canvas svg g.edge {
+      cursor: pointer;
+    }
+
+    .canvas svg g.node {
+      cursor: pointer;
+    }
+
+    .canvas svg g.edge path,
+    .canvas svg g.edge polygon {
+      transition: opacity 120ms ease, stroke-width 120ms ease, stroke 120ms ease, fill 120ms ease;
+    }
+
+    .canvas svg g.edge.edge-dim path,
+    .canvas svg g.edge.edge-dim polygon {
+      opacity: 0.16;
+    }
+
+    .canvas svg g.edge.edge-selected path {
+      stroke: #ff4d6d !important;
+      stroke-width: 2.2 !important;
+      opacity: 1 !important;
+    }
+
+    .canvas svg g.edge.edge-selected polygon {
+      fill: #ff4d6d !important;
+      stroke: #ff4d6d !important;
+      opacity: 1 !important;
+    }
+
+    .canvas svg g.edge.edge-invalid path {
+      stroke: var(--warn) !important;
+      stroke-width: 2.2 !important;
+      opacity: 1 !important;
+    }
+
+    .canvas svg g.edge.edge-invalid polygon {
+      fill: var(--warn) !important;
+      stroke: var(--warn) !important;
+      opacity: 1 !important;
+    }
+
+    .canvas svg g.edge.edge-invalid.edge-dim path,
+    .canvas svg g.edge.edge-invalid.edge-dim polygon {
+      opacity: 0.78 !important;
+    }
+
+    .canvas svg g.edge.edge-neighbor path {
+      stroke: #4de8ff !important;
+      stroke-width: 2.2 !important;
+      opacity: 1 !important;
+    }
+
+    .canvas svg g.edge.edge-neighbor polygon {
+      fill: #4de8ff !important;
+      stroke: #4de8ff !important;
+      opacity: 1 !important;
+    }
+
+    .canvas svg g.edge.node-dep-dim path,
+    .canvas svg g.edge.node-dep-dim polygon {
+      opacity: 0.12;
+    }
+
+    .canvas svg g.node.node-selected polygon,
+    .canvas svg g.node.node-selected path,
+    .canvas svg g.node.node-selected ellipse {
+      stroke: #4de8ff !important;
+      stroke-width: 2.4 !important;
+      filter: drop-shadow(0 0 2px rgba(77, 232, 255, 0.6));
+    }
+
+    .canvas svg g.node.node-comm polygon,
+    .canvas svg g.node.node-comm path,
+    .canvas svg g.node.node-comm ellipse {
+      fill: #fff7c7 !important;
+      stroke: #d7bf69 !important;
+    }
+
+    .canvas svg g.node.node-comm text {
+      fill: #3f2f05 !important;
+      font-weight: 600;
+    }
+
+    .node-deps-popup {
+      position: absolute;
+      top: 34px;
+      right: 8px;
+      width: min(460px, calc(100% - 16px));
+      background: rgba(20, 28, 40, 0.96);
+      border: 1px solid #456086;
+      border-radius: 9px;
+      box-shadow: 0 8px 30px rgba(0,0,0,0.35);
+      color: #dbe9ff;
+      z-index: 30;
+      padding: 8px;
+      display: none;
+      pointer-events: none;
+    }
+
+    .node-deps-popup.show {
+      display: block;
+    }
+
+    .node-deps-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      margin-bottom: 6px;
+      font-size: 12px;
+      color: #bcd1f6;
+    }
+
+    .node-deps-head b {
+      color: #66dcff;
+      font-size: 13px;
+    }
+
+    .node-deps-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 8px;
+    }
+
+    .node-deps-col {
+      border: 1px solid #334766;
+      border-radius: 7px;
+      background: rgba(255,255,255,0.02);
+      min-height: 120px;
+      display: flex;
+      flex-direction: column;
+    }
+
+    .node-deps-col h4 {
+      margin: 0;
+      padding: 6px 8px;
+      border-bottom: 1px solid #334766;
+      color: #9ac8ff;
+      font-size: 12px;
+      font-weight: 600;
+    }
+
+    .node-deps-col ul {
+      margin: 0;
+      padding: 6px 8px;
+      list-style: none;
+      max-height: 220px;
+      overflow: auto;
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+      font-size: 11px;
+      line-height: 1.35;
+      color: #dbe9ff;
+    }
+
+    .node-deps-empty {
+      color: #90a9cf;
+      font-style: italic;
+    }
+
+    .edge-info {
+      margin-top: 10px;
+      background: rgba(255,255,255,0.02);
+      border: 1px solid var(--panel-border);
+      border-radius: 10px;
+      padding: 10px;
+      font-size: 12px;
+      color: var(--muted);
+    }
+
+    .edge-info b {
+      color: var(--accent);
+    }
+
+    #edgeInfoBody {
+      margin-top: 6px;
+      color: var(--text);
+      white-space: pre-wrap;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+      line-height: 1.45;
+    }
+
+    .editor {
+      margin-top: 10px;
+      background: rgba(255,255,255,0.02);
+      border: 1px solid var(--panel-border);
+      border-radius: 10px;
+      padding: 10px;
+      font-size: 12px;
+      color: var(--muted);
+    }
+
+    .editor-head {
+      display: flex;
+      justify-content: space-between;
+      gap: 8px;
+      align-items: center;
+      margin-bottom: 8px;
+    }
+
+    .editor-head b {
+      color: var(--accent);
+      font-size: 13px;
+    }
+
+    .editor-toolbar {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      align-items: center;
+      margin-bottom: 8px;
+    }
+
+    .editor-toolbar select,
+    .editor-toolbar button,
+    .editor-toolbar input {
+      height: 32px;
+      border-radius: 7px;
+      border: 1px solid #43506a;
+      background: #20293a;
+      color: var(--text);
+      font-size: 12px;
+      padding: 0 10px;
+    }
+
+    .editor-list-wrap {
+      border: 1px solid var(--panel-border);
+      border-radius: 8px;
+      background: rgba(0,0,0,0.15);
+      max-height: 320px;
+      overflow: auto;
+    }
+
+    .op-order-list {
+      margin: 0;
+      padding: 8px;
+      list-style: none;
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+    }
+
+    .op-order-item {
+      display: grid;
+      grid-template-columns: 24px 1fr auto auto;
+      gap: 8px;
+      align-items: center;
+      border: 1px solid #2f394d;
+      border-radius: 7px;
+      background: #172033;
+      color: var(--text);
+      padding: 6px 8px;
+      cursor: grab;
+      user-select: none;
+    }
+
+    .op-order-item.comm-op {
+      background: #fff7c7;
+      border-color: #d7bf69;
+      color: #3f2f05;
+    }
+
+    .op-order-item.comm-op .drag-handle {
+      color: #7f6314;
+    }
+
+    .op-order-item.comm-op .name {
+      color: #3f2f05;
+      font-weight: 600;
+    }
+
+    .op-order-item.comm-op .meta {
+      color: #6d5411;
+    }
+
+    .op-order-item.comm-op .swap-delta {
+      border-color: #c8ad4e;
+      background: rgba(255, 244, 184, 0.9);
+      color: #4a3905;
+    }
+
+    .op-order-item .drag-handle {
+      color: #8ea0bf;
+      text-align: center;
+      font-size: 13px;
+    }
+
+    .op-order-item .name {
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    .op-order-item .meta {
+      color: #9ab0d8;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+      font-size: 11px;
+    }
+
+    .op-order-item .swap-hints {
+      display: inline-flex;
+      gap: 4px;
+      align-items: center;
+      pointer-events: none;
+    }
+
+    .op-order-item .swap-dir {
+      min-width: 24px;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+    }
+
+    .op-order-item .swap-delta {
+      min-width: 18px;
+      height: 18px;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      border-radius: 5px;
+      border: 1px solid rgba(143, 169, 206, 0.55);
+      background: rgba(88, 106, 136, 0.15);
+      color: #b5c9ea;
+      font-size: 10px;
+      font-weight: 700;
+      line-height: 1;
+      padding: 0 4px;
+    }
+
+    .op-order-item .swap-delta.warn {
+      border-color: rgba(255, 176, 32, 0.7);
+      background: rgba(58, 42, 17, 0.78);
+      color: #ffd89f;
+    }
+
+    .op-order-item .swap-delta.good {
+      border-color: rgba(155, 225, 144, 0.6);
+      background: rgba(108, 167, 101, 0.18);
+      color: #b7efb0;
+    }
+
+    .op-order-item .swap-delta.na {
+      border-color: rgba(143, 169, 206, 0.35);
+      background: rgba(88, 106, 136, 0.08);
+      color: #7f93b6;
+    }
+
+    .op-order-item.dragging {
+      opacity: 0.45;
+      border-style: dashed;
+    }
+
+    .op-order-item.over {
+      border-color: var(--accent);
+      box-shadow: 0 0 0 1px rgba(97,216,255,0.35) inset;
+    }
+
+    .editor-summary {
+      margin-top: 8px;
+      border-radius: 8px;
+      border: 1px solid #334057;
+      background: rgba(255,255,255,0.02);
+      padding: 6px 8px;
+      color: #c6d6f0;
+      line-height: 1.45;
+      white-space: pre-wrap;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+      max-height: 120px;
+      overflow: auto;
+    }
+
+    .editor-summary.warn {
+      border-color: var(--warn);
+      background: color-mix(in srgb, var(--warn-soft) 72%, transparent);
+      color: #ffd89f;
+    }
+
+    .toast-stack {
+      position: fixed;
+      top: 16px;
+      right: 16px;
+      z-index: 5000;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      pointer-events: none;
+      max-width: min(460px, calc(100vw - 32px));
+    }
+
+    .toast {
+      border-radius: 9px;
+      border: 1px solid #445374;
+      background: rgba(23, 30, 44, 0.96);
+      color: #e8f1ff;
+      padding: 8px 10px;
+      font-size: 12px;
+      line-height: 1.4;
+      box-shadow: 0 8px 24px rgba(0,0,0,0.35);
+      animation: toast-in 160ms ease-out;
+    }
+
+    .toast.warn {
+      border-color: var(--warn);
+      color: #ffd89f;
+      background: rgba(58, 42, 17, 0.96);
+    }
+
+    .toast.info {
+      border-color: #4e7bab;
+      color: #dbecff;
+      background: rgba(25, 40, 64, 0.95);
+    }
+
+    @keyframes toast-in {
+      from {
+        transform: translateY(-6px);
+        opacity: 0;
+      }
+      to {
+        transform: translateY(0);
+        opacity: 1;
+      }
+    }
+
+    .links {
+      margin-top: 10px;
+      display: flex;
+      gap: 12px;
+      flex-wrap: wrap;
+      font-size: 12px;
+    }
+
+    a {
+      color: var(--accent);
+      text-decoration: none;
+    }
+
+    a:hover { text-decoration: underline; }
+
+    @media (max-width: 1200px) {
+      .grid {
+        grid-template-columns: 1fr;
+        height: auto;
+      }
+
+      .panel {
+        height: 68vh;
+      }
+    }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>nnScaler Schedule DOT Viewer</h1>
+    <p class="desc">
+      This page renders <b>.dot</b> files directly in the browser instead of embedded pre-rendered SVG.
+      Fast layout mode is enabled by default (while preserving DOT hierarchy), with side-by-side comparison and zoom.
+      Use <b>Ctrl + mouse wheel</b> to zoom, and press <b>R</b>/<b>0</b> or the button to reset zoom.
+      Hold <b>Ctrl + left mouse drag</b> to pan the canvas.
+      Use the buttons below to load any local <b>.dot</b> file.
+    </p>
+
+    <div class="toolbar">
+      <div>
+        <label for="leftSel">Left</label>
+        <select id="leftSel"></select>
+        <button id="btnPickLeftDot" type="button">Load Local DOT (Left)</button>
+        <input id="leftDotFileInput" type="file" accept=".dot,.gv,.txt,text/plain" style="display:none" />
+      </div>
+      <div>
+        <label for="rightSel">Right</label>
+        <select id="rightSel"></select>
+        <button id="btnPickRightDot" type="button">Load Local DOT (Right)</button>
+        <input id="rightDotFileInput" type="file" accept=".dot,.gv,.txt,text/plain" style="display:none" />
+      </div>
+      <div>
+        <label for="fastMode">Fast Mode (faster, more edge overlap)</label>
+        <input id="fastMode" type="checkbox" checked />
+      </div>
+      <div>
+        <label for="deoverlapMode">Edge De-overlap</label>
+        <input id="deoverlapMode" type="checkbox" checked />
+      </div>
+      <div>
+        <label for="deoverlapSpread">De-overlap Strength</label>
+        <input id="deoverlapSpread" type="range" min="0" max="8" step="0.5" value="2" />
+        <span id="deoverlapSpreadVal" style="font-size:12px;color:#9ca9c0;min-width:28px;display:inline-block;">2</span>
+      </div>
+      <div>
+        <button id="btnResetZoom">Reset Zoom (R/0)</button>
+        <button id="btnRerender">Re-render</button>
+      </div>
+    </div>
+
+    <div class="grid">
+      <div class="panel">
+        <div class="head">
+          <span>Left: <strong id="leftTitle"></strong></span>
+          <span id="leftPath"></span>
+        </div>
+        <div class="view" id="leftView">
+          <div id="leftStatus" class="status">Idle</div>
+          <div id="leftCanvas" class="canvas"></div>
+          <div id="leftNodeDepsPopup" class="node-deps-popup" aria-live="polite">
+            <div class="node-deps-head">
+              <b>Node Dependencies</b>
+              <span id="leftNodeDepsTitle"></span>
+            </div>
+            <div class="node-deps-grid">
+              <div class="node-deps-col">
+                <h4>Incoming Nodes</h4>
+                <ul id="leftIncomingNodes"></ul>
+              </div>
+              <div class="node-deps-col">
+                <h4>Outgoing Nodes</h4>
+                <ul id="leftOutgoingNodes"></ul>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="panel">
+        <div class="head">
+          <span>Right: <strong id="rightTitle"></strong></span>
+          <span id="rightPath"></span>
+        </div>
+        <div class="view" id="rightView">
+          <div id="rightStatus" class="status">Idle</div>
+          <div id="rightCanvas" class="canvas"></div>
+          <div id="rightNodeDepsPopup" class="node-deps-popup" aria-live="polite">
+            <div class="node-deps-head">
+              <b>Node Dependencies</b>
+              <span id="rightNodeDepsTitle"></span>
+            </div>
+            <div class="node-deps-grid">
+              <div class="node-deps-col">
+                <h4>Incoming Nodes</h4>
+                <ul id="rightIncomingNodes"></ul>
+              </div>
+              <div class="node-deps-col">
+                <h4>Outgoing Nodes</h4>
+                <ul id="rightOutgoingNodes"></ul>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="edge-info" id="edgeInfo">
+      <b>Edge Inspector</b>
+      <div id="edgeInfoBody">Click an arrow edge to inspect details (src, dst, cid, etc.).</div>
+    </div>
+
+    <div class="editor" id="dotEditor">
+      <div class="editor-head">
+        <b>DOT Order Editor (Drag to Reorder Ops)</b>
+        <span id="dotEditorHeadHint">Drag within a segment; two swap numbers per row: first=move up, second=move down; value is introduced conflicts (0=safe swap, x=boundary).</span>
+      </div>
+      <div class="editor-toolbar">
+        <label for="editSideSel">Edit Side</label>
+        <select id="editSideSel">
+          <option value="left">Left</option>
+          <option value="right">Right</option>
+        </select>
+
+        <label for="editSegmentSel">Segment</label>
+        <select id="editSegmentSel"></select>
+
+        <label for="editFilterInput">Filter</label>
+        <input id="editFilterInput" type="text" placeholder="Filter by cid / op name" />
+
+        <button id="btnApplyDotEdit" type="button">Apply & Re-render</button>
+        <button id="btnResetDotEdit" type="button">Reset Side Edits</button>
+        <button id="btnSaveDotAs" type="button">Save As New DOT</button>
+      </div>
+      <div class="editor-list-wrap">
+        <ul id="opOrderList" class="op-order-list"></ul>
+      </div>
+      <div id="editValidationSummary" class="editor-summary">Current order pending validation.</div>
+    </div>
+
+  </div>
+
+  <div id="toastStack" class="toast-stack" aria-live="polite" aria-atomic="false"></div>
+
+  <script src="https://cdn.jsdelivr.net/npm/d3@7/dist/d3.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@hpcc-js/wasm@2/dist/graphviz.umd.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/d3-graphviz@5/build/d3-graphviz.min.js"></script>
+
+  <script>
+    const options = [
+      {
+        key: "empty",
+        title: "Load a local DOT file",
+        path: "local://empty",
+        inlineDot: "digraph schedule { label=\"Load a local schedule DOT file\"; }"
+      }
+    ];
+
+    const leftSel = document.getElementById("leftSel");
+    const rightSel = document.getElementById("rightSel");
+    const btnPickLeftDot = document.getElementById("btnPickLeftDot");
+    const btnPickRightDot = document.getElementById("btnPickRightDot");
+    const leftDotFileInput = document.getElementById("leftDotFileInput");
+    const rightDotFileInput = document.getElementById("rightDotFileInput");
+    const leftStatus = document.getElementById("leftStatus");
+    const rightStatus = document.getElementById("rightStatus");
+    const fastMode = document.getElementById("fastMode");
+    const leftView = document.getElementById("leftView");
+    const rightView = document.getElementById("rightView");
+    const deoverlapMode = document.getElementById("deoverlapMode");
+    const deoverlapSpread = document.getElementById("deoverlapSpread");
+    const deoverlapSpreadVal = document.getElementById("deoverlapSpreadVal");
+    const btnResetZoom = document.getElementById("btnResetZoom");
+    const leftTitle = document.getElementById("leftTitle");
+    const rightTitle = document.getElementById("rightTitle");
+    const leftPath = document.getElementById("leftPath");
+    const rightPath = document.getElementById("rightPath");
+    const leftCanvas = document.getElementById("leftCanvas");
+    const rightCanvas = document.getElementById("rightCanvas");
+    const edgeInfoBody = document.getElementById("edgeInfoBody");
+    const leftNodeDepsPopup = document.getElementById("leftNodeDepsPopup");
+    const rightNodeDepsPopup = document.getElementById("rightNodeDepsPopup");
+    const leftNodeDepsTitle = document.getElementById("leftNodeDepsTitle");
+    const rightNodeDepsTitle = document.getElementById("rightNodeDepsTitle");
+    const leftIncomingNodes = document.getElementById("leftIncomingNodes");
+    const leftOutgoingNodes = document.getElementById("leftOutgoingNodes");
+    const rightIncomingNodes = document.getElementById("rightIncomingNodes");
+    const rightOutgoingNodes = document.getElementById("rightOutgoingNodes");
+    const editSideSel = document.getElementById("editSideSel");
+    const editSegmentSel = document.getElementById("editSegmentSel");
+    const editFilterInput = document.getElementById("editFilterInput");
+    const opOrderList = document.getElementById("opOrderList");
+    const editValidationSummary = document.getElementById("editValidationSummary");
+    const btnApplyDotEdit = document.getElementById("btnApplyDotEdit");
+    const btnResetDotEdit = document.getElementById("btnResetDotEdit");
+    const btnSaveDotAs = document.getElementById("btnSaveDotAs");
+    const toastStack = document.getElementById("toastStack");
+
+    const hpccGraphviz = window["@hpcc-js/wasm/graphviz"]
+      || (window["@hpcc-js/wasm"] && window["@hpcc-js/wasm"].Graphviz)
+      || (window.hpccWasm && window.hpccWasm.Graphviz)
+      || window.Graphviz
+      || null;
+
+    const leftGraph = d3.select(leftCanvas).graphviz({
+      // Worker mode may fail to access Graphviz global in some remote-forwarded environments.
+      useWorker: false,
+      zoom: false,
+      fit: true
+    }).engine("dot");
+
+    const rightGraph = d3.select(rightCanvas).graphviz({
+      useWorker: false,
+      zoom: false,
+      fit: true
+    }).engine("dot");
+
+    // Cache raw DOT and rendered SVG to avoid repeated expensive layouts.
+    const dotTextCache = new Map();
+    const localDotTextByKey = new Map();
+    const svgCache = new Map();
+    const nodeInfoBySvg = new WeakMap();
+    const nodeDepsBySvg = new WeakMap();
+    const selectedEdgeBySide = { left: null, right: null };
+    const selectedNodeBySide = { left: null, right: null };
+    const suppressClickBySide = { left: false, right: false };
+    const localKeyBySide = { left: null, right: null };
+    const dotEditorStateBySide = { left: createDotEditorState(), right: createDotEditorState() };
+    let localDotOptionSeq = 0;
+    let draggingOpItem = null;
+    const zoomState = { left: 1, right: 1 };
+    const panState = {
+      left: { active: false, dragging: false, pointerId: null, startX: 0, startY: 0, startLeft: 0, startTop: 0 },
+      right: { active: false, dragging: false, pointerId: null, startX: 0, startY: 0, startLeft: 0, startTop: 0 }
+    };
+    const ZOOM_MIN = 0.2;
+    const ZOOM_MAX = 6;
+    const ZOOM_FACTOR = 1.12;
+    const PAN_START_THRESHOLD = 3;
+
+    const clusterStartRe = /^\s*subgraph\s+cluster_(\d+)\s*\{/;
+    const clusterEndRe = /^\s*}\s*$/;
+    const nodeLineRe = /^\s*(c(\d+)_\d+)\s*\[.*\]\s*;\s*$/;
+    const edgeLineRe = /^\s*([A-Za-z0-9_]+)(?::[A-Za-z0-9_]+)?\s*->\s*([A-Za-z0-9_]+)(?::[A-Za-z0-9_]+)?\s*(?:\[(.*)\])?/;
+    const commOpPattern = /(adapter\(comm\)|move_object|all2all|all_to_all|allgather|all_gather|allreduce|all_reduce|reduce_scatter|reducescatter|broadcast|send|recv|shuffle|unshuffle|collective|communication|zigzag_allgather|nnscaler_all2all)/i;
+
+    function isCommunicationOpText(text) {
+      return commOpPattern.test(String(text || ""));
+    }
+
+    function isCommunicationNodeInfo(nodeId, lines) {
+      const merged = [nodeId, ...(lines || [])].join(" ");
+      return isCommunicationOpText(merged);
+    }
+
+    function appendOption(sel, opt) {
+      const o = document.createElement("option");
+      o.value = opt.key;
+      o.textContent = opt.title;
+      sel.appendChild(o);
+    }
+
+    function fill(sel) {
+      for (const opt of options) {
+        appendOption(sel, opt);
+      }
+    }
+
+    function findOptStrict(key) {
+      return options.find((x) => x.key === key) || null;
+    }
+
+    function findOpt(key) {
+      return findOptStrict(key) || options[0];
+    }
+
+    function updateOptionText(sel, key, text) {
+      for (const optNode of sel.options) {
+        if (optNode.value === key) {
+          optNode.textContent = text;
+          return;
+        }
+      }
+    }
+
+    function upsertLocalOption(side, fileName, dotText) {
+      const currentKey = localKeyBySide[side];
+      const sidePrefix = side === "left" ? "Left" : "Right";
+      const title = `${sidePrefix} Local: ${fileName}`;
+      const path = `local://${fileName}`;
+
+      if (currentKey) {
+        const existing = findOptStrict(currentKey);
+        if (existing) {
+          existing.title = title;
+          existing.path = path;
+          existing.isLocal = true;
+          localDotTextByKey.set(currentKey, dotText);
+          updateOptionText(leftSel, currentKey, title);
+          updateOptionText(rightSel, currentKey, title);
+          return existing;
+        }
+      }
+
+      const key = `${side}_local_${++localDotOptionSeq}`;
+      const created = { key, title, path, isLocal: true };
+      options.push(created);
+      localDotTextByKey.set(key, dotText);
+      localKeyBySide[side] = key;
+      appendOption(leftSel, created);
+      appendOption(rightSel, created);
+      return created;
+    }
+
+    function withLayoutAttrs(dotText) {
+      const marker = "{";
+      const idx = dotText.indexOf(marker);
+      if (idx < 0) {
+        return dotText;
+      }
+      const attrs = fastMode.checked
+        // Fast mode: quicker layout, more overlap acceptable.
+        ? "\n  graph [splines=false, remincross=false, nslimit=2, nslimit1=2, maxiter=2000];\n  edge [penwidth=0.8, arrowsize=0.6];\n"
+        // Quality mode: spend more time to reduce overlapping arrows.
+        : "\n  graph [splines=true, remincross=true, nodesep=0.45, ranksep=0.7, nslimit=8, nslimit1=8, maxiter=10000];\n  edge [penwidth=0.9, arrowsize=0.65];\n";
+      return dotText.slice(0, idx + 1) + attrs + dotText.slice(idx + 1);
+    }
+
+    async function fetchDot(path) {
+      if (dotTextCache.has(path)) {
+        return dotTextCache.get(path);
+      }
+      const resp = await fetch(path);
+      if (!resp.ok) {
+        throw new Error(`Load failed: ${resp.status} ${resp.statusText}`);
+      }
+      const txt = await resp.text();
+      dotTextCache.set(path, txt);
+      return txt;
+    }
+
+    async function resolveDotText(option) {
+      if (option && option.inlineDot) {
+        return option.inlineDot;
+      }
+      if (option && option.isLocal) {
+        const txt = localDotTextByKey.get(option.key);
+        if (!txt) {
+          throw new Error("Local DOT content is missing. Please choose the file again.");
+        }
+        return txt;
+      }
+      return fetchDot(option.path);
+    }
+
+    async function loadLocalDotForSide(side, file) {
+      if (!file) {
+        return;
+      }
+      const { status } = getSideElements(side);
+      status.textContent = "Reading local DOT...";
+      try {
+        const dotText = await file.text();
+        if (!dotText || !dotText.trim()) {
+          throw new Error("File is empty");
+        }
+        const localOpt = upsertLocalOption(side, file.name, dotText);
+        if (side === "left") {
+          leftSel.value = localOpt.key;
+        } else {
+          rightSel.value = localOpt.key;
+        }
+        await renderSide(side, { force: true });
+      } catch (err) {
+        status.textContent = "Load local DOT failed";
+        console.error(err);
+        showToast(`Failed to load local DOT: ${err && err.message ? err.message : err}`, "warn", 4200);
+      }
+    }
+
+    function svgCacheKey(option, editToken = 0) {
+      const mode = fastMode.checked ? "fast" : "full";
+      return `${option.key}|${mode}|edit:${editToken}`;
+    }
+
+    function getSideElements(side) {
+      const isLeft = side === "left";
+      return {
+        status: isLeft ? leftStatus : rightStatus,
+        graph: isLeft ? leftGraph : rightGraph,
+        view: isLeft ? leftView : rightView,
+        canvas: isLeft ? leftCanvas : rightCanvas,
+        title: isLeft ? leftTitle : rightTitle,
+        path: isLeft ? leftPath : rightPath,
+      };
+    }
+
+    function getNodeDepsElements(side) {
+      const isLeft = side === "left";
+      return {
+        popup: isLeft ? leftNodeDepsPopup : rightNodeDepsPopup,
+        title: isLeft ? leftNodeDepsTitle : rightNodeDepsTitle,
+        incoming: isLeft ? leftIncomingNodes : rightIncomingNodes,
+        outgoing: isLeft ? leftOutgoingNodes : rightOutgoingNodes,
+      };
+    }
+
+    function getSelectedOption(side) {
+      return findOpt((side === "left" ? leftSel : rightSel).value);
+    }
+
+    function createDotEditorState() {
+      return {
+        optionKey: "",
+        optionTitle: "",
+        sourceDotText: "",
+        originalDotText: "",
+        currentDotText: "",
+        parsed: null,
+        orderBySegment: new Map(),
+        invalidEdgeKeys: new Set(),
+        validation: null,
+        dirty: false,
+        editToken: 0,
+      };
+    }
+
+    function getEditingSide() {
+      return editSideSel.value === "right" ? "right" : "left";
+    }
+
+    function sanitizeFileName(text) {
+      return String(text || "edited")
+        .replace(/\s+/g, "_")
+        .replace(/[^A-Za-z0-9._-]+/g, "_")
+        .replace(/^_+|_+$/g, "")
+        || "edited";
+    }
+
+    function timestampTag() {
+      const d = new Date();
+      const pad = (n) => String(n).padStart(2, "0");
+      return `${d.getFullYear()}${pad(d.getMonth() + 1)}${pad(d.getDate())}_${pad(d.getHours())}${pad(d.getMinutes())}${pad(d.getSeconds())}`;
+    }
+
+    function showToast(message, type = "info", timeoutMs = 2600) {
+      const item = document.createElement("div");
+      item.className = `toast ${type}`;
+      item.textContent = message;
+      toastStack.appendChild(item);
+      window.setTimeout(() => {
+        if (item.parentElement) {
+          item.parentElement.removeChild(item);
+        }
+      }, timeoutMs);
+    }
+
+    function parseDotForEditor(dotText) {
+      const lines = dotText.split(/\r?\n/);
+      const segments = [];
+      const segmentById = new Map();
+      const nodeById = new Map();
+      const nodeToSegment = new Map();
+      const edges = [];
+
+      let currentSegmentId = null;
+
+      function isDependencyEdgeFromAttrs(attrsRaw) {
+        const text = String(attrsRaw || "").toLowerCase();
+        const compact = text.replace(/\s+/g, "");
+        if (compact.includes("arrowhead=none")) {
+          return false;
+        }
+        if (compact.includes("color=\"#cccccc\"") || compact.includes("color=#cccccc")) {
+          return false;
+        }
+        return true;
+      }
+
+      function ensureSegment(segId, lineIndex) {
+        if (!segmentById.has(segId)) {
+          const seg = {
+            segmentId: segId,
+            startLine: lineIndex,
+            endLine: lineIndex,
+            nodes: [],
+          };
+          segmentById.set(segId, seg);
+          segments.push(seg);
+        }
+        const seg = segmentById.get(segId);
+        seg.startLine = Math.min(seg.startLine, lineIndex);
+        seg.endLine = Math.max(seg.endLine, lineIndex);
+        return seg;
+      }
+
+      lines.forEach((line, lineIndex) => {
+        const cStart = clusterStartRe.exec(line);
+        if (cStart) {
+          currentSegmentId = Number(cStart[1]);
+          ensureSegment(currentSegmentId, lineIndex);
+          return;
+        }
+
+        if (currentSegmentId !== null && clusterEndRe.test(line)) {
+          const seg = segmentById.get(currentSegmentId);
+          if (seg) {
+            seg.endLine = lineIndex;
+          }
+          currentSegmentId = null;
+          return;
+        }
+
+        const nodeMatch = nodeLineRe.exec(line);
+        if (nodeMatch) {
+          const nodeId = nodeMatch[1];
+          const segIdFromNode = Number(nodeMatch[2]);
+          const seg = ensureSegment(segIdFromNode, lineIndex);
+          const cidMatch = line.match(/cid=(\d+)/);
+          const opMatch = line.match(/label="(?:#\d+\s+)?([^\\"]+)/);
+          const cid = cidMatch ? Number(cidMatch[1]) : null;
+          const opName = opMatch ? opMatch[1].trim() : "(unknown)";
+          const isCommunication = isCommunicationOpText(`${opName} ${line}`);
+          const node = {
+            nodeId,
+            segmentId: segIdFromNode,
+            lineIndex,
+            rawLine: line,
+            cid,
+            opName,
+            isCommunication,
+          };
+          seg.nodes.push(node);
+          nodeById.set(nodeId, node);
+          nodeToSegment.set(nodeId, segIdFromNode);
+          return;
+        }
+
+        const edgeMatch = edgeLineRe.exec(line);
+        if (edgeMatch) {
+          const src = edgeMatch[1];
+          const dst = edgeMatch[2];
+          const attrsRaw = edgeMatch[3] || "";
+          const isDependency = isDependencyEdgeFromAttrs(attrsRaw);
+          edges.push({
+            src,
+            dst,
+            key: `${src}->${dst}`,
+            lineIndex,
+            attrsRaw,
+            isDependency,
+          });
+        }
+      });
+
+      const intraSegmentEdgeKeys = new Set();
+      edges.forEach((edge) => {
+        if (!edge.isDependency) {
+          return;
+        }
+        const srcSeg = nodeToSegment.get(edge.src);
+        const dstSeg = nodeToSegment.get(edge.dst);
+        if (srcSeg === undefined || dstSeg === undefined || srcSeg !== dstSeg) {
+          return;
+        }
+        intraSegmentEdgeKeys.add(edge.key);
+      });
+
+      return {
+        lines,
+        segments,
+        segmentById,
+        nodeById,
+        nodeToSegment,
+        edges,
+        intraSegmentEdgeKeys,
+      };
+    }
+
+    function computeAdjacentSwapImpact(state, order, idx, direction) {
+      if (!state || !state.parsed || !Array.isArray(order)) {
+        return {
+          available: false,
+          safe: false,
+          introduced: 0,
+          resolved: 0,
+          net: 0,
+          fromNode: "",
+          toNode: "",
+        };
+      }
+
+      const edgeSet = state.parsed.intraSegmentEdgeKeys || new Set();
+      let first = "";
+      let second = "";
+
+      if (direction === -1) {
+        if (idx <= 0) {
+          return {
+            available: false,
+            safe: false,
+            introduced: 0,
+            resolved: 0,
+            net: 0,
+            fromNode: "",
+            toNode: "",
+          };
+        }
+        first = order[idx - 1];
+        second = order[idx];
+      } else if (direction === 1) {
+        if (idx >= order.length - 1) {
+          return {
+            available: false,
+            safe: false,
+            introduced: 0,
+            resolved: 0,
+            net: 0,
+            fromNode: "",
+            toNode: "",
+          };
+        }
+        first = order[idx];
+        second = order[idx + 1];
+      } else {
+        return {
+          available: false,
+          safe: false,
+          introduced: 0,
+          resolved: 0,
+          net: 0,
+          fromNode: "",
+          toNode: "",
+        };
+      }
+
+      const introduced = edgeSet.has(`${first}->${second}`) ? 1 : 0;
+      const resolved = edgeSet.has(`${second}->${first}`) ? 1 : 0;
+      const net = introduced - resolved;
+      return {
+        available: true,
+        safe: introduced === 0,
+        introduced,
+        resolved,
+        net,
+        fromNode: first,
+        toNode: second,
+      };
+    }
+
+    function swapImpactText(impact) {
+      const signNet = String(impact.net);
+      return `introduced ${impact.introduced}, resolved ${impact.resolved}, net ${signNet}`;
+    }
+
+    function renderSwapDirection(impact, directionLabel) {
+      if (!impact.available) {
+        const edgeHint = `${directionLabel}: unavailable (boundary)`;
+        return `<span class="swap-dir" title="${edgeHint}"><span class="swap-delta na">x</span></span>`;
+      }
+
+      const deltaCls = impact.introduced > 0 ? "warn" : "good";
+      const deltaText = String(impact.introduced);
+      if (impact.safe) {
+        const title = `${directionLabel}: safe swap. ${swapImpactText(impact)}`;
+        return `<span class="swap-dir" title="${title}"><span class="swap-delta ${deltaCls}">${deltaText}</span></span>`;
+      }
+
+      const title = `${directionLabel}: swap breaks direct dependency ${impact.fromNode} -> ${impact.toNode}. ${swapImpactText(impact)}`;
+      return `<span class="swap-dir" title="${title}"><span class="swap-delta warn">${deltaText}</span></span>`;
+    }
+
+    function computeDependencyViolations(parsed, orderBySegment) {
+      const posBySegment = new Map();
+      parsed.segments.forEach((seg) => {
+        const order = orderBySegment.get(seg.segmentId) || seg.nodes.map((n) => n.nodeId);
+        const pos = new Map();
+        order.forEach((nodeId, idx) => {
+          pos.set(nodeId, idx);
+        });
+        posBySegment.set(seg.segmentId, pos);
+      });
+
+      const invalidEdgeKeys = new Set();
+      const details = [];
+
+      parsed.edges.forEach((edge) => {
+        if (!edge.isDependency) {
+          return;
+        }
+        const srcSeg = parsed.nodeToSegment.get(edge.src);
+        const dstSeg = parsed.nodeToSegment.get(edge.dst);
+        if (srcSeg === undefined || dstSeg === undefined || srcSeg !== dstSeg) {
+          return;
+        }
+        const pos = posBySegment.get(srcSeg);
+        if (!pos || !pos.has(edge.src) || !pos.has(edge.dst)) {
+          return;
+        }
+        const srcPos = pos.get(edge.src);
+        const dstPos = pos.get(edge.dst);
+        if (srcPos <= dstPos) {
+          return;
+        }
+        invalidEdgeKeys.add(edge.key);
+        if (details.length < 10) {
+          const srcNode = parsed.nodeById.get(edge.src);
+          const dstNode = parsed.nodeById.get(edge.dst);
+          details.push(
+            `cluster_${srcSeg}: ${edge.src}(cid=${srcNode?.cid ?? "?"}) -> ${edge.dst}(cid=${dstNode?.cid ?? "?"}) but order is ${srcPos} > ${dstPos}`
+          );
+        }
+      });
+
+      return {
+        invalidEdgeKeys,
+        details,
+      };
+    }
+
+    function rebuildDotTextFromOrders(state) {
+      if (!state.parsed) {
+        return state.currentDotText || state.originalDotText || "";
+      }
+      const lines = state.parsed.lines.slice();
+      state.parsed.segments.forEach((seg) => {
+        const fallback = seg.nodes.map((n) => n.nodeId);
+        const order = state.orderBySegment.get(seg.segmentId) || fallback;
+        if (order.length !== seg.nodes.length) {
+          state.orderBySegment.set(seg.segmentId, fallback);
+        }
+        const normalizedOrder = state.orderBySegment.get(seg.segmentId) || fallback;
+        const nodeById = new Map(seg.nodes.map((n) => [n.nodeId, n]));
+        seg.nodes.forEach((node, idx) => {
+          const orderedNode = nodeById.get(normalizedOrder[idx]) || node;
+          lines[node.lineIndex] = orderedNode.rawLine;
+        });
+      });
+
+      const merged = lines.join("\n");
+      return state.originalDotText.endsWith("\n") ? `${merged}\n` : merged;
+    }
+
+    function applyInvalidEdgeHighlight(side) {
+      const { canvas } = getSideElements(side);
+      const state = dotEditorStateBySide[side];
+      const svg = canvas.querySelector("svg");
+      if (!svg || !state) {
+        return;
+      }
+      const invalid = state.invalidEdgeKeys || new Set();
+      svg.querySelectorAll("g.edge").forEach((edge) => {
+        const rawTitle = edge.querySelector("title")?.textContent || "";
+        const parsed = parseEdgeTitle(rawTitle);
+        const key = `${parsed.srcNode}->${parsed.dstNode}`;
+        edge.classList.toggle("edge-invalid", invalid.has(key));
+      });
+    }
+
+    function ensureSideEditorState(side, option, sourceDotText) {
+      const state = dotEditorStateBySide[side];
+      const optionChanged = state.optionKey !== option.key;
+      const sourceChanged = state.sourceDotText !== sourceDotText;
+      const shouldReset = optionChanged || !state.parsed || (!state.dirty && sourceChanged);
+
+      if (shouldReset) {
+        state.optionKey = option.key;
+        state.optionTitle = option.title;
+        state.sourceDotText = sourceDotText;
+        state.originalDotText = sourceDotText;
+        state.currentDotText = sourceDotText;
+        state.parsed = parseDotForEditor(sourceDotText);
+        state.orderBySegment = new Map();
+        state.parsed.segments.forEach((seg) => {
+          state.orderBySegment.set(seg.segmentId, seg.nodes.map((n) => n.nodeId));
+        });
+        state.dirty = false;
+        state.editToken += 1;
+      }
+
+      state.validation = computeDependencyViolations(state.parsed, state.orderBySegment);
+      state.invalidEdgeKeys = state.validation.invalidEdgeKeys;
+      return state;
+    }
+
+    function getCurrentSegmentIdForEdit(state) {
+      const n = Number(editSegmentSel.value);
+      if (Number.isFinite(n)) {
+        return n;
+      }
+      return state.parsed?.segments?.[0]?.segmentId ?? null;
+    }
+
+    function refreshSegmentOptionsForEditing(side) {
+      const state = dotEditorStateBySide[side];
+      const prev = editSegmentSel.value;
+      editSegmentSel.innerHTML = "";
+
+      if (!state.parsed || state.parsed.segments.length === 0) {
+        const empty = document.createElement("option");
+        empty.value = "";
+        empty.textContent = "(no cluster)";
+        editSegmentSel.appendChild(empty);
+        return;
+      }
+
+      state.parsed.segments.forEach((seg) => {
+        const opt = document.createElement("option");
+        opt.value = String(seg.segmentId);
+        opt.textContent = `cluster_${seg.segmentId} (${seg.nodes.length} ops)`;
+        editSegmentSel.appendChild(opt);
+      });
+
+      const keep = Array.from(editSegmentSel.options).some((o) => o.value === prev);
+      editSegmentSel.value = keep ? prev : editSegmentSel.options[0].value;
+    }
+
+    function updateValidationSummary(side) {
+      const state = dotEditorStateBySide[side];
+      if (!state || !state.parsed) {
+        editValidationSummary.classList.remove("warn");
+        editValidationSummary.textContent = "Current order pending validation.";
+        return;
+      }
+
+      const segId = getCurrentSegmentIdForEdit(state);
+      const violations = state.validation?.invalidEdgeKeys?.size || 0;
+      const lines = [];
+      lines.push(`side=${side} option=${state.optionTitle || state.optionKey}`);
+      lines.push(`segment=cluster_${segId} | dirty=${state.dirty ? "yes" : "no"}`);
+
+      if (violations > 0) {
+        lines.push(`Dependency check: ${violations} conflict(s), warning edges highlighted`);
+        (state.validation?.details || []).slice(0, 6).forEach((d) => lines.push(`- ${d}`));
+        editValidationSummary.classList.add("warn");
+      } else {
+        lines.push("Dependency check: pass (no conflicts)");
+        editValidationSummary.classList.remove("warn");
+      }
+      editValidationSummary.textContent = lines.join("\n");
+    }
+
+    function renderOpOrderListForEditing(side) {
+      const state = dotEditorStateBySide[side];
+      opOrderList.innerHTML = "";
+      if (!state || !state.parsed || state.parsed.segments.length === 0) {
+        return;
+      }
+
+      const segId = getCurrentSegmentIdForEdit(state);
+      const segment = state.parsed.segmentById.get(segId);
+      if (!segment) {
+        return;
+      }
+
+      const order = state.orderBySegment.get(segId) || segment.nodes.map((n) => n.nodeId);
+      const nodeById = new Map(segment.nodes.map((n) => [n.nodeId, n]));
+      const filter = (editFilterInput.value || "").trim().toLowerCase();
+      const lockReorder = filter.length > 0;
+
+      order.forEach((nodeId, idx) => {
+        const node = nodeById.get(nodeId);
+        if (!node) {
+          return;
+        }
+        const matchKey = `${node.nodeId} ${node.cid ?? ""} ${node.opName || ""}`.toLowerCase();
+        if (filter && !matchKey.includes(filter)) {
+          return;
+        }
+
+        const item = document.createElement("li");
+        item.className = "op-order-item";
+        if (node.isCommunication) {
+          item.classList.add("comm-op");
+        }
+        item.draggable = !lockReorder;
+        item.dataset.nodeId = node.nodeId;
+        const upImpact = computeAdjacentSwapImpact(state, order, idx, -1);
+        const downImpact = computeAdjacentSwapImpact(state, order, idx, 1);
+        const upHtml = renderSwapDirection(upImpact, "Move Up");
+        const downHtml = renderSwapDirection(downImpact, "Move Down");
+        item.innerHTML = `<span class="drag-handle">⇅</span><span class="name">${node.opName || "(unknown)"}</span><span class="swap-hints">${upHtml}${downHtml}</span><span class="meta">cid=${node.cid ?? "?"} | ${node.nodeId}</span>`;
+
+        item.addEventListener("dragstart", (ev) => {
+          if (lockReorder) {
+            ev.preventDefault();
+            return;
+          }
+          draggingOpItem = item;
+          item.classList.add("dragging");
+          ev.dataTransfer.effectAllowed = "move";
+          ev.dataTransfer.setData("text/plain", node.nodeId);
+        });
+
+        item.addEventListener("dragend", () => {
+          if (!draggingOpItem) {
+            return;
+          }
+          opOrderList.querySelectorAll(".op-order-item.over").forEach((x) => x.classList.remove("over"));
+          draggingOpItem.classList.remove("dragging");
+          draggingOpItem = null;
+          commitEditorOrderFromDom(side, segId, { notify: true });
+        });
+
+        opOrderList.appendChild(item);
+      });
+
+      if (lockReorder) {
+        showToast("Filter mode is view-only. Clear filter to enable drag reorder.", "info", 1800);
+      }
+    }
+
+    function getDropInsertTarget(list, y) {
+      const items = Array.from(list.querySelectorAll(".op-order-item:not(.dragging)"));
+      for (const item of items) {
+        const rect = item.getBoundingClientRect();
+        if (y < rect.top + rect.height / 2) {
+          return item;
+        }
+      }
+      return null;
+    }
+
+    function commitEditorOrderFromDom(side, segId, { notify = false } = {}) {
+      const state = dotEditorStateBySide[side];
+      if (!state || !state.parsed || segId === null || segId === undefined) {
+        return;
+      }
+      const segment = state.parsed.segmentById.get(segId);
+      if (!segment) {
+        return;
+      }
+
+      const domOrder = Array.from(opOrderList.querySelectorAll(".op-order-item")).map((el) => el.dataset.nodeId);
+      if (domOrder.length !== segment.nodes.length) {
+        // Partial list (typically from filter mode), do not apply reorder.
+        return;
+      }
+
+      state.orderBySegment.set(segId, domOrder);
+      state.currentDotText = rebuildDotTextFromOrders(state);
+      state.dirty = state.currentDotText !== state.originalDotText;
+      state.editToken += 1;
+      state.validation = computeDependencyViolations(state.parsed, state.orderBySegment);
+      state.invalidEdgeKeys = state.validation.invalidEdgeKeys;
+      applyInvalidEdgeHighlight(side);
+      updateValidationSummary(side);
+
+      if (notify) {
+        const count = state.validation.invalidEdgeKeys.size;
+        if (count > 0) {
+          showToast(`Detected ${count} dependency conflict(s); violating edges highlighted in warning color`, "warn");
+        } else {
+          showToast("Order change applied; dependency check passed", "info");
+        }
+      }
+    }
+
+    function resetEditsForSide(side) {
+      const state = dotEditorStateBySide[side];
+      if (!state || !state.parsed) {
+        return;
+      }
+      state.currentDotText = state.originalDotText;
+      state.parsed = parseDotForEditor(state.originalDotText);
+      state.orderBySegment = new Map();
+      state.parsed.segments.forEach((seg) => {
+        state.orderBySegment.set(seg.segmentId, seg.nodes.map((n) => n.nodeId));
+      });
+      state.dirty = false;
+      state.editToken += 1;
+      state.validation = computeDependencyViolations(state.parsed, state.orderBySegment);
+      state.invalidEdgeKeys = state.validation.invalidEdgeKeys;
+      if (getEditingSide() === side) {
+        refreshSegmentOptionsForEditing(side);
+        renderOpOrderListForEditing(side);
+        updateValidationSummary(side);
+      }
+      applyInvalidEdgeHighlight(side);
+    }
+
+    function downloadEditedDotForSide(side) {
+      const state = dotEditorStateBySide[side];
+      if (!state || !state.currentDotText) {
+        showToast("No DOT content to export", "warn");
+        return;
+      }
+      const option = getSelectedOption(side);
+      const nameCore = sanitizeFileName(option?.title || `${side}_dot`);
+      const filename = `${nameCore}_edited_${timestampTag()}.dot`;
+
+      const blob = new Blob([state.currentDotText], { type: "text/vnd.graphviz;charset=utf-8" });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = filename;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+      showToast(`Saved as ${filename}`, "info");
+    }
+
+    function refreshEditorUiForSide(side) {
+      refreshSegmentOptionsForEditing(side);
+      renderOpOrderListForEditing(side);
+      updateValidationSummary(side);
+      applyInvalidEdgeHighlight(side);
+    }
+
+    opOrderList.addEventListener("dragover", (ev) => {
+      if (!draggingOpItem) {
+        return;
+      }
+      ev.preventDefault();
+      const target = getDropInsertTarget(opOrderList, ev.clientY);
+      opOrderList.querySelectorAll(".op-order-item.over").forEach((x) => x.classList.remove("over"));
+      if (target && target !== draggingOpItem) {
+        target.classList.add("over");
+        opOrderList.insertBefore(draggingOpItem, target);
+      } else if (!target) {
+        opOrderList.appendChild(draggingOpItem);
+      }
+    });
+
+    opOrderList.addEventListener("drop", (ev) => {
+      if (!draggingOpItem) {
+        return;
+      }
+      ev.preventDefault();
+      opOrderList.querySelectorAll(".op-order-item.over").forEach((x) => x.classList.remove("over"));
+    });
+
+    function setEdgeInfo(lines) {
+      edgeInfoBody.textContent = lines.join("\n");
+    }
+
+    function resetViewport(canvas) {
+      const view = canvas.parentElement;
+      if (!view) {
+        return;
+      }
+      view.scrollTop = 0;
+      view.scrollLeft = 0;
+    }
+
+    function parseEdgeTitle(raw) {
+      const text = (raw || "").trim();
+      const parts = text.split("->");
+      const srcRaw = (parts[0] || "").trim();
+      const dstRaw = (parts[1] || "").trim();
+      const srcNode = srcRaw.split(":")[0];
+      const dstNode = dstRaw.split(":")[0];
+      return { text, srcRaw, dstRaw, srcNode, dstNode };
+    }
+
+    function readNodeCidFromInfo(lines) {
+      for (const line of lines || []) {
+        const m = /cid=(\d+)/.exec(line || "");
+        if (m) {
+          return Number(m[1]);
+        }
+      }
+      return Number.POSITIVE_INFINITY;
+    }
+
+    function nodeDisplayText(nodeId, nodeMap) {
+      const lines = nodeMap.get(nodeId) || [];
+      const first = lines[0] || "(unknown)";
+      const second = lines[1] || "";
+      return second ? `${nodeId} | ${first} | ${second}` : `${nodeId} | ${first}`;
+    }
+
+    function buildNodeInfoMap(svg) {
+      const map = new Map();
+      svg.querySelectorAll("g.node").forEach((node) => {
+        const key = node.querySelector("title")?.textContent?.trim();
+        if (!key) {
+          return;
+        }
+        const lines = Array.from(node.querySelectorAll("text")).map((t) => (t.textContent || "").trim());
+        map.set(key, lines);
+        node.classList.toggle("node-comm", isCommunicationNodeInfo(key, lines));
+      });
+      nodeInfoBySvg.set(svg, map);
+      return map;
+    }
+
+    function buildNodeDepsIndex(svg) {
+      const nodeMap = nodeInfoBySvg.get(svg) || buildNodeInfoMap(svg);
+      const nodeElementById = new Map();
+      const incomingNodes = new Map();
+      const outgoingNodes = new Map();
+      const incomingEdges = new Map();
+      const outgoingEdges = new Map();
+
+      svg.querySelectorAll("g.node").forEach((node) => {
+        const nodeId = (node.querySelector("title")?.textContent || "").trim();
+        if (nodeId) {
+          nodeElementById.set(nodeId, node);
+        }
+      });
+
+      function ensureSet(map, key) {
+        if (!map.has(key)) {
+          map.set(key, new Set());
+        }
+        return map.get(key);
+      }
+
+      svg.querySelectorAll("g.edge").forEach((edge) => {
+        const rawTitle = edge.querySelector("title")?.textContent || "";
+        const parsed = parseEdgeTitle(rawTitle);
+        if (!parsed.srcNode || !parsed.dstNode) {
+          return;
+        }
+
+        ensureSet(outgoingNodes, parsed.srcNode).add(parsed.dstNode);
+        ensureSet(incomingNodes, parsed.dstNode).add(parsed.srcNode);
+        ensureSet(outgoingEdges, parsed.srcNode).add(edge);
+        ensureSet(incomingEdges, parsed.dstNode).add(edge);
+      });
+
+      const data = {
+        nodeMap,
+        nodeElementById,
+        incomingNodes,
+        outgoingNodes,
+        incomingEdges,
+        outgoingEdges,
+      };
+      nodeDepsBySvg.set(svg, data);
+      return data;
+    }
+
+    function bringNodesToFront(svg) {
+      const graphRoot = svg.querySelector("g.graph") || svg.querySelector("g");
+      if (!graphRoot) {
+        return;
+      }
+      const nodes = Array.from(graphRoot.querySelectorAll(":scope > g.node"));
+      nodes.forEach((node) => {
+        graphRoot.appendChild(node);
+      });
+    }
+
+    function setNodeListItems(listEl, nodeIds, nodeMap) {
+      listEl.innerHTML = "";
+      if (!nodeIds || nodeIds.length === 0) {
+        const li = document.createElement("li");
+        li.className = "node-deps-empty";
+        li.textContent = "(none)";
+        listEl.appendChild(li);
+        return;
+      }
+
+      const sorted = [...nodeIds].sort((a, b) => {
+        const ca = readNodeCidFromInfo(nodeMap.get(a) || []);
+        const cb = readNodeCidFromInfo(nodeMap.get(b) || []);
+        if (ca !== cb) {
+          return ca - cb;
+        }
+        return a.localeCompare(b);
+      });
+
+      sorted.forEach((id) => {
+        const li = document.createElement("li");
+        li.textContent = nodeDisplayText(id, nodeMap);
+        listEl.appendChild(li);
+      });
+    }
+
+    function rectInViewContent(view, rect) {
+      const viewRect = view.getBoundingClientRect();
+      return {
+        left: rect.left - viewRect.left + view.scrollLeft,
+        top: rect.top - viewRect.top + view.scrollTop,
+        right: rect.right - viewRect.left + view.scrollLeft,
+        bottom: rect.bottom - viewRect.top + view.scrollTop,
+        width: rect.width,
+        height: rect.height,
+      };
+    }
+
+    function expandRect(rect, pad) {
+      return {
+        left: rect.left - pad,
+        top: rect.top - pad,
+        right: rect.right + pad,
+        bottom: rect.bottom + pad,
+      };
+    }
+
+    function rectIntersectionArea(a, b) {
+      const w = Math.max(0, Math.min(a.right, b.right) - Math.max(a.left, b.left));
+      const h = Math.max(0, Math.min(a.bottom, b.bottom) - Math.max(a.top, b.top));
+      return w * h;
+    }
+
+    function positionNodeDepsPopup(side, popup, nodeId, incomingList, outgoingList, opts = {}) {
+      const { view } = getSideElements(side);
+      const nodeEl = opts.nodeEl || null;
+      const deps = opts.deps || null;
+      if (!view || !popup || !nodeEl || !deps) {
+        return;
+      }
+
+      const nodeRectClient = nodeEl.getBoundingClientRect();
+      if (!nodeRectClient || nodeRectClient.width <= 0 || nodeRectClient.height <= 0) {
+        return;
+      }
+
+      const anchorRect = rectInViewContent(view, nodeRectClient);
+      const viewRect = view.getBoundingClientRect();
+      const clickCenter = opts.anchorClient
+        ? {
+            x: opts.anchorClient.x - viewRect.left + view.scrollLeft,
+            y: opts.anchorClient.y - viewRect.top + view.scrollTop,
+          }
+        : {
+            x: anchorRect.left + anchorRect.width / 2,
+            y: anchorRect.top + anchorRect.height / 2,
+          };
+
+      popup.style.left = "0px";
+      popup.style.top = "0px";
+      const popupWidth = Math.max(220, popup.offsetWidth || 320);
+      const popupHeight = Math.max(120, popup.offsetHeight || 160);
+
+      const margin = 8;
+      const gap = 12;
+      const minLeft = view.scrollLeft + margin;
+      const maxLeft = view.scrollLeft + Math.max(margin, view.clientWidth - popupWidth - margin);
+      const minTop = view.scrollTop + margin;
+      const maxTop = view.scrollTop + Math.max(margin, view.clientHeight - popupHeight - margin);
+
+      const neighborNodeIds = new Set([...(incomingList || []), ...(outgoingList || [])]);
+      neighborNodeIds.delete(nodeId);
+      const neighborRects = [];
+      neighborNodeIds.forEach((id) => {
+        const el = deps.nodeElementById?.get(id);
+        if (!el) {
+          return;
+        }
+        const clientRect = el.getBoundingClientRect();
+        if (!clientRect || clientRect.width <= 0 || clientRect.height <= 0) {
+          return;
+        }
+        neighborRects.push(rectInViewContent(view, clientRect));
+      });
+
+      const candidates = [
+        { left: anchorRect.right + gap, top: clickCenter.y - popupHeight / 2 },
+        { left: anchorRect.left - popupWidth - gap, top: clickCenter.y - popupHeight / 2 },
+        { left: clickCenter.x - popupWidth / 2, top: anchorRect.top - popupHeight - gap },
+        { left: clickCenter.x - popupWidth / 2, top: anchorRect.bottom + gap },
+        { left: anchorRect.right + gap, top: anchorRect.bottom + gap },
+        { left: anchorRect.left - popupWidth - gap, top: anchorRect.bottom + gap },
+      ];
+
+      function clampCandidate(raw) {
+        return {
+          left: clamp(raw.left, minLeft, maxLeft),
+          top: clamp(raw.top, minTop, maxTop),
+          rawLeft: raw.left,
+          rawTop: raw.top,
+        };
+      }
+
+      function scoreCandidate(candidate) {
+        const rect = {
+          left: candidate.left,
+          top: candidate.top,
+          right: candidate.left + popupWidth,
+          bottom: candidate.top + popupHeight,
+        };
+        const selfPenalty = rectIntersectionArea(rect, expandRect(anchorRect, 6)) * 4;
+        const neighborPenalty = neighborRects.reduce((sum, nr) => sum + rectIntersectionArea(rect, expandRect(nr, 4)), 0);
+        const clampPenalty = (Math.abs(candidate.left - candidate.rawLeft) + Math.abs(candidate.top - candidate.rawTop)) * 0.8;
+        return selfPenalty + neighborPenalty + clampPenalty;
+      }
+
+      let best = null;
+      candidates.forEach((raw) => {
+        const candidate = clampCandidate(raw);
+        const score = scoreCandidate(candidate);
+        if (!best || score < best.score) {
+          best = { ...candidate, score };
+        }
+      });
+
+      if (!best) {
+        best = clampCandidate({ left: anchorRect.right + gap, top: anchorRect.bottom + gap });
+      }
+
+      popup.style.left = `${Math.round(best.left)}px`;
+      popup.style.top = `${Math.round(best.top)}px`;
+    }
+
+    function showNodeDepsPopup(side, nodeId, nodeMap, incomingList, outgoingList, opts = {}) {
+      const { popup, title, incoming, outgoing } = getNodeDepsElements(side);
+      title.textContent = nodeDisplayText(nodeId, nodeMap);
+      setNodeListItems(incoming, incomingList, nodeMap);
+      setNodeListItems(outgoing, outgoingList, nodeMap);
+      popup.classList.add("show");
+      positionNodeDepsPopup(side, popup, nodeId, incomingList, outgoingList, opts);
+    }
+
+    function hideNodeDepsPopup(side) {
+      const { popup } = getNodeDepsElements(side);
+      popup.classList.remove("show");
+    }
+
+    function parseNumber(value) {
+      const n = Number(value);
+      return Number.isFinite(n) ? n : 0;
+    }
+
+    function clamp(value, min, max) {
+      return Math.min(max, Math.max(min, value));
+    }
+
+    function formatNumber(value) {
+      return String(Math.round(value * 100) / 100);
+    }
+
+    function ensureSvgBaseSize(svg) {
+      if (svg.dataset.baseWidth && svg.dataset.baseHeight) {
+        return {
+          width: parseNumber(svg.dataset.baseWidth),
+          height: parseNumber(svg.dataset.baseHeight)
+        };
+      }
+
+      let width = 0;
+      let height = 0;
+      const vb = (svg.getAttribute("viewBox") || "").trim().split(/\s+/).map(parseNumber);
+      if (vb.length >= 4 && vb[2] > 0 && vb[3] > 0) {
+        width = vb[2];
+        height = vb[3];
+      } else {
+        const box = svg.getBBox();
+        width = box.width;
+        height = box.height;
+      }
+
+      svg.dataset.baseWidth = String(width);
+      svg.dataset.baseHeight = String(height);
+      return { width, height };
+    }
+
+    function applyZoom(side) {
+      const { canvas } = getSideElements(side);
+      const svg = canvas.querySelector("svg");
+      if (!svg) {
+        return false;
+      }
+
+      const { width, height } = ensureSvgBaseSize(svg);
+      const scale = clamp(zoomState[side], ZOOM_MIN, ZOOM_MAX);
+      zoomState[side] = scale;
+
+      svg.style.maxWidth = "none";
+      svg.style.width = `${Math.max(1, width * scale)}px`;
+      svg.style.height = `${Math.max(1, height * scale)}px`;
+      return true;
+    }
+
+    function resetZoom(side, { resetScroll = false } = {}) {
+      zoomState[side] = 1;
+      const ok = applyZoom(side);
+      if (resetScroll) {
+        const { view } = getSideElements(side);
+        view.scrollTop = 0;
+        view.scrollLeft = 0;
+      }
+      return ok;
+    }
+
+    function resetZoomAll({ resetScroll = false } = {}) {
+      resetZoom("left", { resetScroll });
+      resetZoom("right", { resetScroll });
+    }
+
+    function zoomAtPoint(side, nextZoom, clientX, clientY) {
+      const { view } = getSideElements(side);
+      const prev = zoomState[side];
+      const target = clamp(nextZoom, ZOOM_MIN, ZOOM_MAX);
+      if (target === prev) {
+        return;
+      }
+
+      const rect = view.getBoundingClientRect();
+      const localX = clientX - rect.left;
+      const localY = clientY - rect.top;
+      const anchorX = localX + view.scrollLeft;
+      const anchorY = localY + view.scrollTop;
+
+      zoomState[side] = target;
+      if (!applyZoom(side)) {
+        return;
+      }
+
+      const ratio = target / prev;
+      view.scrollLeft = anchorX * ratio - localX;
+      view.scrollTop = anchorY * ratio - localY;
+    }
+
+    function bindZoomInteractions(side) {
+      const { view } = getSideElements(side);
+      view.addEventListener("wheel", (ev) => {
+        if (!ev.ctrlKey) {
+          return;
+        }
+        ev.preventDefault();
+        const factor = ev.deltaY < 0 ? ZOOM_FACTOR : 1 / ZOOM_FACTOR;
+        zoomAtPoint(side, zoomState[side] * factor, ev.clientX, ev.clientY);
+      }, { passive: false });
+    }
+
+    function bindPanInteractions(side) {
+      const { view } = getSideElements(side);
+      const state = panState[side];
+
+      function finishPan() {
+        if (!state.active) {
+          return;
+        }
+        if (state.dragging) {
+          suppressClickBySide[side] = true;
+        }
+        state.active = false;
+        state.dragging = false;
+        view.classList.remove("dragging");
+        if (state.pointerId !== null) {
+          try {
+            view.releasePointerCapture(state.pointerId);
+          } catch (err) {
+            // Ignore release failure from stale pointers.
+          }
+        }
+        state.pointerId = null;
+      }
+
+      view.addEventListener("pointerdown", (ev) => {
+        if (ev.button !== 0 || !ev.ctrlKey) {
+          return;
+        }
+        state.active = true;
+        state.dragging = false;
+        state.pointerId = ev.pointerId;
+        state.startX = ev.clientX;
+        state.startY = ev.clientY;
+        state.startLeft = view.scrollLeft;
+        state.startTop = view.scrollTop;
+        if (view.setPointerCapture) {
+          view.setPointerCapture(ev.pointerId);
+        }
+      });
+
+      view.addEventListener("pointermove", (ev) => {
+        if (!state.active) {
+          return;
+        }
+        const dx = ev.clientX - state.startX;
+        const dy = ev.clientY - state.startY;
+        if (!state.dragging && (Math.abs(dx) >= PAN_START_THRESHOLD || Math.abs(dy) >= PAN_START_THRESHOLD)) {
+          state.dragging = true;
+          view.classList.add("dragging");
+        }
+        if (!state.dragging) {
+          return;
+        }
+        ev.preventDefault();
+        view.scrollLeft = state.startLeft - dx;
+        view.scrollTop = state.startTop - dy;
+      });
+
+      view.addEventListener("pointerup", finishPan);
+      view.addEventListener("pointercancel", finishPan);
+
+      // Prevent default browser drag behavior from interfering with pan.
+      view.addEventListener("dragstart", (ev) => ev.preventDefault());
+
+      // Capture phase: if previous action was a drag, swallow the click once.
+      view.addEventListener("click", (ev) => {
+        if (!suppressClickBySide[side]) {
+          return;
+        }
+        suppressClickBySide[side] = false;
+        ev.preventDefault();
+        ev.stopPropagation();
+      }, true);
+    }
+
+    function shiftCoordinateText(text, dx, dy) {
+      if (!text || (!dx && !dy)) {
+        return text;
+      }
+      let idx = 0;
+      return text.replace(/-?\d*\.?\d+(?:e[-+]?\d+)?/gi, (raw) => {
+        const base = parseNumber(raw);
+        const shifted = idx % 2 === 0 ? base + dx : base + dy;
+        idx += 1;
+        return formatNumber(shifted);
+      });
+    }
+
+    function ensureBaseEdgeGeometry(edge) {
+      const path = edge.querySelector("path");
+      const polygon = edge.querySelector("polygon");
+      if (path && !path.dataset.baseD) {
+        path.dataset.baseD = path.getAttribute("d") || "";
+      }
+      if (polygon && !polygon.dataset.basePoints) {
+        polygon.dataset.basePoints = polygon.getAttribute("points") || "";
+      }
+      return { path, polygon };
+    }
+
+    function extractPairs(pathText) {
+      const nums = (pathText || "").match(/-?\d*\.?\d+(?:e[-+]?\d+)?/gi) || [];
+      const pairs = [];
+      for (let i = 0; i + 1 < nums.length; i += 2) {
+        pairs.push([parseNumber(nums[i]), parseNumber(nums[i + 1])]);
+      }
+      return pairs;
+    }
+
+    function edgeRouteSignature(pathText) {
+      const pairs = extractPairs(pathText);
+      if (pairs.length < 2) {
+        return "";
+      }
+      // Coarse signature: quantized start/end anchors.
+      // This works for both polyline/spline and fast straight-edge layouts.
+      const first = pairs[0];
+      const last = pairs[pairs.length - 1];
+      return `${Math.round(first[0] / 20)},${Math.round(first[1] / 20)}|${Math.round(last[0] / 20)},${Math.round(last[1] / 20)}`;
+    }
+
+    function restoreEdgeGeometry(edge) {
+      const { path, polygon } = ensureBaseEdgeGeometry(edge);
+      if (path && path.dataset.baseD !== undefined) {
+        path.setAttribute("d", path.dataset.baseD);
+      }
+      if (polygon && polygon.dataset.basePoints !== undefined) {
+        polygon.setAttribute("points", polygon.dataset.basePoints);
+      }
+    }
+
+    function shiftEdgeGeometry(edge, dx, dy) {
+      const { path, polygon } = ensureBaseEdgeGeometry(edge);
+      if (path && path.dataset.baseD) {
+        path.setAttribute("d", shiftCoordinateText(path.dataset.baseD, dx, dy));
+      }
+      if (polygon && polygon.dataset.basePoints) {
+        polygon.setAttribute("points", shiftCoordinateText(polygon.dataset.basePoints, dx, dy));
+      }
+    }
+
+    function applyEdgeDeoverlap(side) {
+      const { canvas } = getSideElements(side);
+      const svg = canvas.querySelector("svg");
+      if (!svg) {
+        return { total: 0, shifted: 0, groups: 0 };
+      }
+
+      const edges = Array.from(svg.querySelectorAll("g.edge"));
+      edges.forEach(restoreEdgeGeometry);
+
+      const spread = parseNumber(deoverlapSpread.value);
+      if (!deoverlapMode.checked || spread <= 0) {
+        return { total: edges.length, shifted: 0, groups: 0 };
+      }
+
+      const buckets = new Map();
+      edges.forEach((edge) => {
+        const path = edge.querySelector("path");
+        const baseD = path?.dataset.baseD || "";
+        const routeKey = edgeRouteSignature(baseD);
+        if (!routeKey) {
+          return;
+        }
+        if (!buckets.has(routeKey)) {
+          buckets.set(routeKey, []);
+        }
+        buckets.get(routeKey).push(edge);
+      });
+
+      let shifted = 0;
+      let groups = 0;
+      buckets.forEach((group) => {
+        if (group.length < 2) {
+          return;
+        }
+        groups += 1;
+        const mid = (group.length - 1) / 2;
+        group.forEach((edge, idx) => {
+          const dx = (idx - mid) * spread;
+          if (dx !== 0) {
+            shiftEdgeGeometry(edge, dx, 0);
+            shifted += 1;
+          }
+        });
+      });
+
+      return { total: edges.length, shifted, groups };
+    }
+
+    function refreshDeoverlapBothSides() {
+      const left = applyEdgeDeoverlap("left");
+      const right = applyEdgeDeoverlap("right");
+      deoverlapSpreadVal.textContent = String(parseNumber(deoverlapSpread.value));
+      if (left.total > 0) {
+        leftStatus.textContent = `Done (overlap groups ${left.groups}, shifted ${left.shifted}/${left.total})`;
+      }
+      if (right.total > 0) {
+        rightStatus.textContent = `Done (overlap groups ${right.groups}, shifted ${right.shifted}/${right.total})`;
+      }
+    }
+
+    function clearEdgeSelection(side, { keepInfo = false } = {}) {
+      const { canvas } = getSideElements(side);
+      const svg = canvas.querySelector("svg");
+      if (svg) {
+        svg.querySelectorAll("g.edge.edge-selected, g.edge.edge-dim").forEach((e) => {
+          e.classList.remove("edge-selected", "edge-dim");
+        });
+      }
+      selectedEdgeBySide[side] = null;
+      if (!keepInfo) {
+        setEdgeInfo(["Click an arrow edge to inspect details (src, dst, cid, etc.)."]);
+      }
+    }
+
+    function clearNodeSelection(side, { keepInfo = false, keepPopup = false } = {}) {
+      const { canvas } = getSideElements(side);
+      const svg = canvas.querySelector("svg");
+      if (svg) {
+        svg.querySelectorAll("g.node.node-selected").forEach((n) => {
+          n.classList.remove("node-selected");
+        });
+        svg.querySelectorAll("g.edge.edge-neighbor, g.edge.node-dep-dim").forEach((e) => {
+          e.classList.remove("edge-neighbor", "node-dep-dim");
+        });
+      }
+      selectedNodeBySide[side] = null;
+      if (!keepPopup) {
+        hideNodeDepsPopup(side);
+      }
+      if (!keepInfo) {
+        setEdgeInfo(["Click an arrow edge to inspect details (src, dst, cid, etc.)."]);
+      }
+    }
+
+    function selectEdge(side, edgeEl) {
+      const { canvas } = getSideElements(side);
+      const svg = canvas.querySelector("svg");
+      if (!svg || !edgeEl) {
+        return;
+      }
+
+      clearNodeSelection(side, { keepInfo: true });
+
+      if (selectedEdgeBySide[side] === edgeEl) {
+        clearEdgeSelection(side);
+        return;
+      }
+
+      clearEdgeSelection(side, { keepInfo: true });
+      selectedEdgeBySide[side] = edgeEl;
+
+      const allEdges = Array.from(svg.querySelectorAll("g.edge"));
+      allEdges.forEach((e) => {
+        if (e === edgeEl) {
+          e.classList.add("edge-selected");
+        } else {
+          e.classList.add("edge-dim");
+        }
+      });
+
+      const rawTitle = edgeEl.querySelector("title")?.textContent || "";
+      const parsed = parseEdgeTitle(rawTitle);
+      const nodeMap = nodeInfoBySvg.get(svg) || buildNodeInfoMap(svg);
+      const srcInfo = nodeMap.get(parsed.srcNode) || ["(unknown)"];
+      const dstInfo = nodeMap.get(parsed.dstNode) || ["(unknown)"];
+
+      setEdgeInfo([
+        `panel: ${side}`,
+        `edge: ${parsed.text || "(unknown)"}`,
+        `src: ${parsed.srcRaw || "(unknown)"}`,
+        `dst: ${parsed.dstRaw || "(unknown)"}`,
+        `src_node: ${parsed.srcNode || "(unknown)"} | ${srcInfo.join(" | ")}`,
+        `dst_node: ${parsed.dstNode || "(unknown)"} | ${dstInfo.join(" | ")}`,
+      ]);
+    }
+
+    function selectNode(side, nodeEl, ev = null) {
+      const { canvas } = getSideElements(side);
+      const svg = canvas.querySelector("svg");
+      if (!svg || !nodeEl) {
+        return;
+      }
+
+      const nodeId = (nodeEl.querySelector("title")?.textContent || "").trim();
+      if (!nodeId) {
+        return;
+      }
+
+      clearEdgeSelection(side, { keepInfo: true });
+
+      if (selectedNodeBySide[side] === nodeEl) {
+        clearNodeSelection(side);
+        return;
+      }
+
+      clearNodeSelection(side, { keepInfo: true, keepPopup: true });
+      selectedNodeBySide[side] = nodeEl;
+      nodeEl.classList.add("node-selected");
+
+      const deps = nodeDepsBySvg.get(svg) || buildNodeDepsIndex(svg);
+      const incoming = deps.incomingNodes.get(nodeId) || new Set();
+      const outgoing = deps.outgoingNodes.get(nodeId) || new Set();
+      const inEdges = deps.incomingEdges.get(nodeId) || new Set();
+      const outEdges = deps.outgoingEdges.get(nodeId) || new Set();
+      const relatedEdges = new Set([...inEdges, ...outEdges]);
+
+      svg.querySelectorAll("g.edge").forEach((edge) => {
+        const isRelated = relatedEdges.has(edge);
+        edge.classList.toggle("edge-neighbor", isRelated);
+        edge.classList.toggle("node-dep-dim", !isRelated);
+      });
+
+      showNodeDepsPopup(side, nodeId, deps.nodeMap, [...incoming], [...outgoing], {
+        nodeEl,
+        deps,
+        anchorClient: ev ? { x: ev.clientX, y: ev.clientY } : null,
+      });
+
+      setEdgeInfo([
+        `panel: ${side}`,
+        `node: ${nodeId}`,
+        `incoming: ${incoming.size}`,
+        `outgoing: ${outgoing.size}`,
+      ]);
+    }
+
+    function wireEdgeInteractions(side) {
+      const { canvas } = getSideElements(side);
+      const svg = canvas.querySelector("svg");
+      if (!svg) {
+        return 0;
+      }
+
+      buildNodeInfoMap(svg);
+      buildNodeDepsIndex(svg);
+      bringNodesToFront(svg);
+      const edges = Array.from(svg.querySelectorAll("g.edge"));
+      edges.forEach((edge) => {
+        edge.classList.remove("edge-selected", "edge-dim", "edge-neighbor", "node-dep-dim");
+        edge.onclick = (ev) => {
+          if (suppressClickBySide[side]) {
+            return;
+          }
+          ev.stopPropagation();
+          selectEdge(side, edge);
+        };
+      });
+
+      const nodes = Array.from(svg.querySelectorAll("g.node"));
+      nodes.forEach((node) => {
+        node.classList.remove("node-selected");
+        node.onclick = (ev) => {
+          if (suppressClickBySide[side]) {
+            return;
+          }
+          ev.stopPropagation();
+          selectNode(side, node, ev);
+        };
+      });
+
+      clearNodeSelection(side, { keepInfo: true });
+
+      canvas.onclick = (ev) => {
+        if (ev.target && ev.target.closest && (ev.target.closest("g.edge") || ev.target.closest("g.node"))) {
+          return;
+        }
+        clearEdgeSelection(side);
+        clearNodeSelection(side, { keepPopup: false, keepInfo: true });
+      };
+
+      return edges.length;
+    }
+
+    function renderDot(graph, canvasEl, dotText, timeoutMs = 180000) {
+      return new Promise((resolve, reject) => {
+        let done = false;
+        const timer = setTimeout(() => {
+          finish(new Error("DOT render timed out"));
+        }, timeoutMs);
+
+        function cleanup() {
+          clearTimeout(timer);
+          graph.on("end", null);
+          graph.on("renderEnd", null);
+        }
+
+        function finish(err) {
+          if (done) {
+            return;
+          }
+          done = true;
+          cleanup();
+          if (err) {
+            reject(err);
+          } else {
+            resolve();
+          }
+        }
+
+        // Clear old graph so completion conditions are based on current render only.
+        canvasEl.innerHTML = "";
+
+        try {
+          graph.on("end", () => finish());
+          graph.on("renderEnd", () => finish());
+          graph.renderDot(dotText);
+        } catch (err) {
+          finish(err);
+        }
+      });
+    }
+
+    const renderToken = { left: 0, right: 0 };
+
+    async function renderOne(side, { force = false } = {}) {
+      const token = ++renderToken[side];
+      const option = getSelectedOption(side);
+      const { status, graph, canvas, title, path } = getSideElements(side);
+
+      title.textContent = option.title;
+      path.textContent = option.path;
+
+      status.textContent = "Loading DOT...";
+      const t0 = performance.now();
+      const sourceDot = await resolveDotText(option);
+      if (token !== renderToken[side]) {
+        return;
+      }
+
+      const editorState = ensureSideEditorState(side, option, sourceDot);
+      const dotToRender = editorState.currentDotText || sourceDot;
+      const key = svgCacheKey(option, editorState.editToken);
+
+      if (!force && svgCache.has(key)) {
+        canvas.innerHTML = svgCache.get(key);
+        resetZoom(side);
+        const overlapStats = applyEdgeDeoverlap(side);
+        resetViewport(canvas);
+        const edgeCount = wireEdgeInteractions(side);
+        applyInvalidEdgeHighlight(side);
+        const invalidCount = editorState.validation?.invalidEdgeKeys?.size || 0;
+        status.textContent = `Done (cached, edges ${edgeCount}, overlap groups ${overlapStats.groups}, invalid ${invalidCount})`;
+        if (getEditingSide() === side) {
+          refreshEditorUiForSide(side);
+        }
+        return;
+      }
+
+      status.textContent = "Rendering...";
+      await renderDot(graph, canvas, withLayoutAttrs(dotToRender));
+      if (token !== renderToken[side]) {
+        return;
+      }
+
+      svgCache.set(key, canvas.innerHTML);
+      resetZoom(side);
+      const overlapStats = applyEdgeDeoverlap(side);
+      resetViewport(canvas);
+      const edgeCount = wireEdgeInteractions(side);
+      applyInvalidEdgeHighlight(side);
+
+      const t1 = performance.now();
+      const invalidCount = editorState.validation?.invalidEdgeKeys?.size || 0;
+      status.textContent = `Done ${(t1 - t0).toFixed(0)} ms (edges ${edgeCount}, overlap groups ${overlapStats.groups}, invalid ${invalidCount})`;
+      if (getEditingSide() === side) {
+        refreshEditorUiForSide(side);
+      }
+    }
+
+    async function renderAll({ force = false } = {}) {
+      if (!hpccGraphviz) {
+        leftStatus.textContent = "Graphviz WASM not loaded";
+        rightStatus.textContent = "Graphviz WASM not loaded";
+        showToast("Failed to load Graphviz WASM. Check network/CDN.", "warn", 4200);
+        return;
+      }
+
+      leftStatus.textContent = force ? "Queued (force)" : "Queued";
+      rightStatus.textContent = force ? "Queued (force)" : "Queued";
+
+      try {
+        // Sequential render prevents two huge layouts from competing for CPU.
+        await renderOne("left", { force });
+        await renderOne("right", { force });
+      } catch (err) {
+        leftStatus.textContent = "Render failed";
+        rightStatus.textContent = "Render failed";
+        console.error(err);
+        showToast("DOT render failed. See console for details.", "warn", 4200);
+      }
+    }
+
+    async function renderSide(side, { force = false } = {}) {
+      if (!hpccGraphviz) {
+        leftStatus.textContent = "Graphviz WASM not loaded";
+        rightStatus.textContent = "Graphviz WASM not loaded";
+        return;
+      }
+      try {
+        await renderOne(side, { force });
+      } catch (err) {
+        const { status } = getSideElements(side);
+        status.textContent = "Render failed";
+        console.error(err);
+      }
+    }
+
+    fill(leftSel);
+    fill(rightSel);
+
+    leftSel.value = "empty";
+    rightSel.value = "empty";
+    editSideSel.value = "left";
+    renderAll();
+
+    refreshEditorUiForSide("left");
+
+    leftSel.addEventListener("change", () => renderSide("left"));
+    rightSel.addEventListener("change", () => renderSide("right"));
+    btnPickLeftDot.addEventListener("click", () => {
+      leftDotFileInput.value = "";
+      leftDotFileInput.click();
+    });
+    btnPickRightDot.addEventListener("click", () => {
+      rightDotFileInput.value = "";
+      rightDotFileInput.click();
+    });
+    leftDotFileInput.addEventListener("change", () => loadLocalDotForSide("left", leftDotFileInput.files && leftDotFileInput.files[0]));
+    rightDotFileInput.addEventListener("change", () => loadLocalDotForSide("right", rightDotFileInput.files && rightDotFileInput.files[0]));
+    fastMode.addEventListener("change", () => renderAll());
+    deoverlapMode.addEventListener("change", () => refreshDeoverlapBothSides());
+    deoverlapSpread.addEventListener("input", () => refreshDeoverlapBothSides());
+
+    editSideSel.addEventListener("change", () => {
+      const side = getEditingSide();
+      renderSide(side);
+      refreshEditorUiForSide(side);
+    });
+
+    editSegmentSel.addEventListener("change", () => {
+      const side = getEditingSide();
+      renderOpOrderListForEditing(side);
+      updateValidationSummary(side);
+      applyInvalidEdgeHighlight(side);
+    });
+
+    editFilterInput.addEventListener("input", () => {
+      const side = getEditingSide();
+      renderOpOrderListForEditing(side);
+      updateValidationSummary(side);
+    });
+
+    btnApplyDotEdit.addEventListener("click", async () => {
+      const side = getEditingSide();
+      const state = dotEditorStateBySide[side];
+      if (!state || !state.parsed) {
+        showToast("No editable DOT on this side yet. Load and render first.", "warn");
+        return;
+      }
+      if ((editFilterInput.value || "").trim()) {
+        showToast("Clear the filter before applying drag order.", "warn");
+        return;
+      }
+      const segId = getCurrentSegmentIdForEdit(state);
+      commitEditorOrderFromDom(side, segId, { notify: true });
+      await renderSide(side, { force: true });
+    });
+
+    btnResetDotEdit.addEventListener("click", async () => {
+      const side = getEditingSide();
+      const state = dotEditorStateBySide[side];
+      if (!state || !state.parsed) {
+        return;
+      }
+      resetEditsForSide(side);
+      showToast(`Reset DOT edits on ${side} side`, "info");
+      await renderSide(side, { force: true });
+    });
+
+    btnSaveDotAs.addEventListener("click", () => {
+      const side = getEditingSide();
+      const state = dotEditorStateBySide[side];
+      if (!state || !state.parsed) {
+        showToast("No DOT available on this side to export", "warn");
+        return;
+      }
+      if (!(editFilterInput.value || "").trim()) {
+        const segId = getCurrentSegmentIdForEdit(state);
+        commitEditorOrderFromDom(side, segId, { notify: false });
+      }
+      downloadEditedDotForSide(side);
+    });
+
+    bindZoomInteractions("left");
+    bindZoomInteractions("right");
+    bindPanInteractions("left");
+    bindPanInteractions("right");
+
+    btnResetZoom.addEventListener("click", () => resetZoomAll());
+
+    window.addEventListener("keydown", (ev) => {
+      const tag = ev.target && ev.target.tagName ? ev.target.tagName.toLowerCase() : "";
+      const isEditable = !!(ev.target && (ev.target.isContentEditable || tag === "input" || tag === "textarea" || tag === "select"));
+      if (isEditable) {
+        return;
+      }
+      if (ev.key === "r" || ev.key === "R" || ev.key === "0") {
+        ev.preventDefault();
+        resetZoomAll();
+      }
+    });
+
+    document.getElementById("btnRerender").addEventListener("click", () => renderAll({ force: true }));
+  </script>
+</body>
+</html>

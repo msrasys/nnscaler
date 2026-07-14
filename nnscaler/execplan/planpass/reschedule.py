@@ -36,6 +36,7 @@ from typing import Callable, Dict, Hashable, List, Optional, Tuple, Union
 import logging
 import json
 import os
+import re
 from pathlib import Path
 
 import more_itertools
@@ -327,6 +328,136 @@ def _write_config(config: Dict, path: Union[str, Path]) -> None:
             yaml.safe_dump(config, f, sort_keys=False)
         else:
             json.dump(config, f, indent=2)
+
+
+def schedule_viewer_path() -> Path:
+    """Return the packaged standalone schedule DOT viewer path."""
+    return Path(__file__).resolve().parents[2] / 'resources' / 'schedule_viewer.html'
+
+
+def parse_dot_cid_order(path: Union[str, Path]) -> Dict:
+    """Extract operator CID order from a schedule DOT file.
+
+    Schedule graphs group nodes in ``cluster_<index>`` subgraphs. CID order is
+    deduplicated independently in each cluster because the same CID may appear on
+    multiple devices. The returned ``linear`` order is a globally deduplicated
+    fallback for DOT files without matching cluster metadata.
+
+    Args:
+        path: schedule DOT file produced by :func:`visualize_schedule`.
+
+    Returns:
+        A dictionary containing ``by_segment``, ``segment_sequence``, and
+        ``linear`` CID orders.
+    """
+    cluster_start_re = re.compile(r'^\s*subgraph\s+cluster_(\d+)\s*\{')
+    cluster_end_re = re.compile(r'^\s*}\s*$')
+    node_re = re.compile(r'^\s*c\d+_\d+\s*\[')
+    cid_re = re.compile(r'cid=(\d+)')
+
+    segment_orders: Dict[int, List[int]] = {}
+    segment_sequence: List[int] = []
+    linear: List[int] = []
+    current_cluster: Optional[int] = None
+
+    with open(path, 'r') as dot_file:
+        for line in dot_file:
+            cluster_match = cluster_start_re.search(line)
+            if cluster_match:
+                current_cluster = int(cluster_match.group(1))
+                if current_cluster not in segment_orders:
+                    segment_orders[current_cluster] = []
+                    segment_sequence.append(current_cluster)
+                continue
+
+            if current_cluster is not None and cluster_end_re.search(line):
+                current_cluster = None
+                continue
+
+            if not node_re.search(line):
+                continue
+            cid_match = cid_re.search(line)
+            if not cid_match:
+                continue
+            cid = int(cid_match.group(1))
+            linear.append(cid)
+            if current_cluster is not None:
+                segment_orders[current_cluster].append(cid)
+
+    normalized = {}
+    for segment_idx in segment_sequence:
+        seen = set()
+        normalized[segment_idx] = [
+            cid for cid in segment_orders[segment_idx]
+            if not (cid in seen or seen.add(cid))
+        ]
+
+    seen_linear = set()
+    linear = [cid for cid in linear if not (cid in seen_linear or seen_linear.add(cid))]
+    return {
+        'by_segment': normalized,
+        'segment_sequence': segment_sequence,
+        'linear': linear,
+    }
+
+
+def convert_manual_dot_to_config(
+    dot_path: Union[str, Path],
+    base_config: Union[str, Path, Dict],
+    output_path: Union[str, Path],
+) -> Dict:
+    """Convert an edited schedule DOT into a reschedule config.
+
+    The baseline config supplies complete operator descriptors and establishes the
+    segment-to-cluster mapping. Operators omitted from the DOT retain their original
+    relative order, while unknown CIDs are ignored.
+
+    Args:
+        dot_path: manually reordered schedule DOT file.
+        base_config: config dictionary or path produced by :func:`dump_schedule`.
+        output_path: destination YAML or JSON config path.
+
+    Returns:
+        The converted config dictionary.
+    """
+    parsed = parse_dot_cid_order(dot_path)
+    if not parsed['linear']:
+        raise ValueError(f'no operator cid found in manual dot: {dot_path}')
+
+    base = dict(base_config) if isinstance(base_config, dict) else _read_config(base_config)
+    segments = base.get('segments', [])
+    if not segments:
+        raise ValueError('invalid schedule config: missing segments')
+
+    converted_segments = []
+    for segment_idx, segment in enumerate(segments):
+        original_entries = segment.get('order', [])
+        entry_by_cid = {int(entry['cid']): entry for entry in original_entries}
+        preferred_cids = parsed['by_segment'].get(segment_idx) or parsed['linear']
+
+        converted_order = []
+        seen = set()
+        for cid in preferred_cids:
+            if cid in entry_by_cid and cid not in seen:
+                converted_order.append(entry_by_cid[cid])
+                seen.add(cid)
+        for entry in original_entries:
+            cid = int(entry['cid'])
+            if cid not in seen:
+                converted_order.append(entry)
+                seen.add(cid)
+
+        converted_segment = dict(segment)
+        converted_segment['order'] = converted_order
+        converted_segments.append(converted_segment)
+
+    converted = dict(base)
+    converted['segments'] = converted_segments
+    comment = converted.get('comment', '')
+    converted['comment'] = f'{comment}\nGenerated from manual dot: {dot_path}'.strip()
+    _write_config(converted, output_path)
+    _logger.info(f'op reschedule: converted manual DOT {dot_path} to {output_path}')
+    return converted
 
 
 def dump_schedule(execplan: ExecutionPlan, path: Union[str, Path]) -> Dict:

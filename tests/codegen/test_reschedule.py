@@ -22,7 +22,10 @@ from nnscaler.execplan.planpass.reschedule import (
     dump_schedule,
     load_schedule_order,
     config_priority,
+    convert_manual_dot_to_config,
+    parse_dot_cid_order,
     schedule_to_dot,
+    schedule_viewer_path,
     visualize_schedule,
 )
 from nnscaler.graph.segment import IRSegment
@@ -463,6 +466,68 @@ def test_dump_schedule_yaml():
         assert os.path.exists(path)
         order_map = load_schedule_order(path)
         assert len(order_map) > 0
+
+
+def test_parse_dot_cid_order_keeps_duplicate_cids_per_cluster(tmp_path):
+    """The same CID can be reordered independently on multiple devices."""
+    dot_path = tmp_path / 'edited.dot'
+    dot_path.write_text(
+        'digraph schedule {\n'
+        '  subgraph cluster_0 {\n'
+        '    c0_1 [label="#1 b\\ncid=2 IRFwOperation"];\n'
+        '    c0_0 [label="#0 a\\ncid=1 IRFwOperation"];\n'
+        '  }\n'
+        '  subgraph cluster_1 {\n'
+        '    c1_1 [label="#1 d\\ncid=2 IRFwOperation"];\n'
+        '    c1_0 [label="#0 c\\ncid=1 IRFwOperation"];\n'
+        '  }\n'
+        '}\n'
+    )
+
+    parsed = parse_dot_cid_order(dot_path)
+
+    assert parsed['segment_sequence'] == [0, 1]
+    assert parsed['by_segment'] == {0: [2, 1], 1: [2, 1]}
+    assert parsed['linear'] == [2, 1]
+
+
+def test_convert_manual_dot_to_config_reorders_each_segment(tmp_path):
+    """Edited cluster order is mapped onto the matching baseline segment."""
+    dot_path = tmp_path / 'edited.dot'
+    dot_path.write_text(
+        'digraph schedule {\n'
+        '  subgraph cluster_0 {\n'
+        '    c0_1 [label="#1 b\\ncid=2 IRFwOperation"];\n'
+        '    c0_0 [label="#0 a\\ncid=1 IRFwOperation"];\n'
+        '  }\n'
+        '  subgraph cluster_1 {\n'
+        '    c1_1 [label="#1 d\\ncid=2 IRFwOperation"];\n'
+        '    c1_0 [label="#0 c\\ncid=1 IRFwOperation"];\n'
+        '  }\n'
+        '}\n'
+    )
+    base = {
+        'version': 1,
+        'segments': [
+            {'segment_cid': 10, 'order': [{'cid': 1}, {'cid': 2}, {'cid': 3}]},
+            {'segment_cid': 20, 'order': [{'cid': 1}, {'cid': 2}, {'cid': 4}]},
+        ],
+    }
+    output_path = tmp_path / 'manual.json'
+
+    converted = convert_manual_dot_to_config(dot_path, base, output_path)
+
+    orders = [[entry['cid'] for entry in segment['order']] for segment in converted['segments']]
+    assert orders == [[2, 1, 3], [2, 1, 4]]
+    assert load_schedule_order(output_path) == {2: 0, 1: 1, 3: 2, 4: 3}
+
+
+def test_schedule_viewer_is_packaged():
+    viewer_path = schedule_viewer_path()
+    assert viewer_path.is_file()
+    viewer = viewer_path.read_text()
+    assert 'DOT Order Editor' in viewer
+    assert 'adapter\\(comm\\)' in viewer
 
 
 # ---------------------------------------------------------------------------

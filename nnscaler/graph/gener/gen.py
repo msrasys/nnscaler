@@ -542,7 +542,9 @@ class IRAdapterGener:
             # to reuse the existing adapter generation algorithm for tensor objects.
             # The device attribute of the subtensor's dummy cell is used to
             # indicate the device of the non-tensor object
-            fake_ftensor = IRFullTensor((8,), name=f'{fobj.name}_fake_ftensor')
+            # Keep the fake tensor non-splittable so generated prims stay in
+            # move/broadcast space for non-tensor objects.
+            fake_ftensor = IRFullTensor((1,), name=f'{fobj.name}_fake_ftensor')
             def _get_fake_subtensor(device: Tuple[int,...]) -> IRSubTensor:
                 subtensor = fake_ftensor.tosub()
                 # create a dummy cell for device assignment.
