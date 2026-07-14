@@ -131,6 +131,7 @@ class ModuleCodeGen(FuncEmission):
             'import nnscaler', 'import nnscaler.flags',
             'import nnscaler.runtime.function',
             'import nnscaler.runtime.device',
+            'import chronotrigger.trace as ct',
             'import _operator', 'from numpy import inf', 'import builtins', '',
             f'runtime_version = {runtime_version!r}', '', ''
         ]

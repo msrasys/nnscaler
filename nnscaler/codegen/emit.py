@@ -16,8 +16,10 @@ from nnscaler.ir.adapter.prim import CommPrim
 from nnscaler.graph.segment import IRSegment
 
 from nnscaler.codegen.frontend_mapping import Sign2EmitRule
+from nnscaler.codegen.syntax.blocks import Block
 
 from nnscaler.flags import CompileFlag
+from nnscaler.profiler.chronotrigger import primitive_trace_spec
 
 _logger = logging.getLogger(__name__)
 
@@ -356,7 +358,9 @@ class FuncEmission(CodeEmission):
             if len(colls) > 1 and not all(devs == devices[0] for devs in devices[1:]):
                 async_op = False
 
-        for prim in prims:
+        adapter_name = self.node_name(node)
+        rank = node.device[0]
+        for index, prim in enumerate(prims):
             if len(prim.inputs()) == 1:
                 itensors = self.tensor_name(prim.inputs()[0], prefix_attr=prefix_attr)
             else:
@@ -369,7 +373,16 @@ class FuncEmission(CodeEmission):
             if CompileFlag.line_timer:
                 codes.append(f'nnscaler.runtime.function.print_time({repr(prim.signature)})')
             code = f'{outputs} = {prim.signature}({itensors}, {kwargs})'
-            codes.append(code)
+            trace_spec = primitive_trace_spec(prim, rank, adapter_name, index)
+            if trace_spec is None:
+                codes.append(code)
+            else:
+                peer = f', peer={trace_spec.peer}' if trace_spec.peer is not None else ''
+                with Block(
+                    f'with ct.range(ct.Kind.{trace_spec.kind}, {trace_spec.entity!r}{peer}):'
+                ) as trace_block:
+                    trace_block.insert_body(code)
+                codes.extend(trace_block.code)
         return codes
 
     def emit_reducer(self, node: IRWeightReducer) -> List[str]:
@@ -383,7 +396,9 @@ class FuncEmission(CodeEmission):
         codes = []
         if CompileFlag.line_timer:
             codes.append(f'nnscaler.runtime.function.print_time({repr(reducer_name)})')
-        codes.append(f'{reducer_name}.sync_grads()')
+        with Block(f'with ct.range(ct.Kind.REDUCE, {self.node_name(node)!r}):') as trace_block:
+            trace_block.insert_body(f'{reducer_name}.sync_grads()')
+        codes.extend(trace_block.code)
         return codes
 
     def emit_release(self, tensors: Iterable[IRTensor]) -> str:

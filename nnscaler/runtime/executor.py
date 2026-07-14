@@ -7,6 +7,7 @@ Executor for runtime
 import atexit
 
 from typing import Tuple, Any, Callable, List, Dict, Optional
+import chronotrigger.trace as ct
 import torch
 import logging
 
@@ -29,7 +30,7 @@ class AsyncCommHandler:
         def __init__(self):
             self._works: Dict[int, List] = {}
             self._callbacks: Dict[int, Callable] = {}
-            self._metas: Dict[int, str] = {}
+            self._metas: Dict[int, Optional[ct.TraceContext]] = {}
             self._send_holds: List = []
 
     instance = None
@@ -52,54 +53,43 @@ class AsyncCommHandler:
             return tensor
         tid = id(tensor)
         works = self._works.pop(tid)
-        comm_label = self._metas.pop(tid, None)
-        from nnscaler.profiler import nvtx
+        trace_context = self._metas.pop(tid, None)
         for work in works:
-            with nvtx.range(nvtx.wait_trace_label(comm_label)):
+            with ct.range_from(trace_context, kind=ct.Kind.WAIT):
                 work.wait()
         callback = self._callbacks.pop(tid)
         if callback is not None:
             tensor = callback(tensor)
         return tensor
     
-    def submit(self, tensor: torch.Tensor, works: List, callback: Optional[Callable] = None, comm_label: Optional[str] = None):
+    def submit(self, tensor: torch.Tensor, works: List, callback: Optional[Callable] = None):
         """
         Submit an async communication
         """
-        from nnscaler.profiler import nvtx
-
         tid = id(tensor)
         self._works[tid] = works
         self._callbacks[tid] = callback
-        label = comm_label or nvtx.current_label()
-        if label is not None:
-            self._metas[tid] = label
+        self._metas[tid] = ct.current_context()
 
-    def hold_send(self, tensor: torch.Tensor, work, comm_label: Optional[str] = None):
-        from nnscaler.profiler import nvtx
-
-        self._send_holds.append((tensor, work, comm_label or nvtx.current_label()))
+    def hold_send(self, tensor: torch.Tensor, work):
+        self._send_holds.append((tensor, work, ct.current_context()))
 
     def drain_sends(self, wait: bool = True):
         if wait:
-            from nnscaler.profiler import nvtx
-
-            for _, work, comm_label in self._send_holds:
-                with nvtx.range(nvtx.wait_trace_label(comm_label)):
+            for _, work, trace_context in self._send_holds:
+                with ct.range_from(trace_context, kind=ct.Kind.WAIT):
                     work.wait()
             self._send_holds.clear()
             return
 
         pending = []
-        from nnscaler.profiler import nvtx
-
-        for tensor, work, comm_label in self._send_holds:
+        for tensor, work, trace_context in self._send_holds:
             is_completed = getattr(work, 'is_completed', None)
             if is_completed is not None and is_completed():
-                with nvtx.range(nvtx.wait_trace_label(comm_label)):
+                with ct.range_from(trace_context, kind=ct.Kind.WAIT):
                     work.wait()
             else:
-                pending.append((tensor, work, comm_label))
+                pending.append((tensor, work, trace_context))
         self._send_holds = pending
 
     def drain(self):
@@ -109,10 +99,9 @@ class AsyncCommHandler:
             callback = self._callbacks.get(tid)
             if callback is not None:
                 continue
-            comm_label = self._metas.get(tid)
-            from nnscaler.profiler import nvtx
+            trace_context = self._metas.get(tid)
             for work in works:
-                with nvtx.range(nvtx.wait_trace_label(comm_label)):
+                with ct.range_from(trace_context, kind=ct.Kind.WAIT):
                     work.wait()
             self._works.pop(tid, None)
             self._callbacks.pop(tid, None)
@@ -154,12 +143,10 @@ class Executor:
         forward the sub-graph.
         """
         input_tensors = Executor.sync_tensors(input_tensors)
-        from nnscaler.profiler import nvtx
 
         if not requires_grad:
             with torch.no_grad():
-                with nvtx.range(trace_label):
-                    outputs = subgraph(*input_tensors)
+                outputs = subgraph(*input_tensors)
             return outputs
 
         # everytime forward a segment, detach the tensor from previous graph
@@ -172,8 +159,7 @@ class Executor:
         saved_pairs = [(id(itensor), dtensor) for itensor, dtensor in zip(input_tensors, input_dtensors)]
         Executor._detach.setdefault(name, []).append(saved_pairs)  
         
-        with nvtx.range(trace_label):
-            outputs = subgraph(*input_dtensors)
+        outputs = subgraph(*input_dtensors)
         return outputs
 
     @staticmethod
@@ -216,7 +202,6 @@ class Executor:
             gradient tensors corresponding to input_tensors.
         """
         output_tensor_grads = Executor.sync_tensors(output_tensor_grads)
-        from nnscaler.profiler import nvtx
 
         saved_pairs = Executor._detach[name].pop(0)
         tensor_ids: List[int] = [pair[0] for pair in saved_pairs]
@@ -259,11 +244,10 @@ class Executor:
                     dedup_output_tensor_grads
                 )
 
-        with nvtx.range(trace_label):
-            torch.autograd.backward(
-                dedup_output_tensors,
-                grad_tensors=dedup_output_tensor_grads,
-            )
+        torch.autograd.backward(
+            dedup_output_tensors,
+            grad_tensors=dedup_output_tensor_grads,
+        )
         grads = tuple(t.grad for t in input_tensors)
         assert all(grad is not None for grad in grads), "RuntimeError: got gradient None"
 

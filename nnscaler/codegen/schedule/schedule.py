@@ -20,7 +20,6 @@ from nnscaler.codegen.syntax.symtable import SymbolTable
 from nnscaler.codegen.lifecycle import LifeCycle
 from nnscaler.codegen.syntax.blocks import FunctionBlock, Block
 from nnscaler.flags import CompileFlag
-from nnscaler.profiler import nvtx
 
 
 _logger = logging.getLogger(__name__)
@@ -63,7 +62,7 @@ class ScheduleCodeGen(FuncEmission):
         # model full code
         self.init_code: List[str] = [
             '\n\n########## Generated Schedule Code ###########',
-            'import torch', 'import nnscaler', 'import nnscaler.profiler.nvtx', 'import _operator', '']
+            'import torch', 'import nnscaler', 'import chronotrigger.trace as ct', 'import _operator', '']
         # module member name
         self.symbols = SymbolTable()
         self._segment_stage_ids = self._build_segment_stage_ids()
@@ -80,21 +79,37 @@ class ScheduleCodeGen(FuncEmission):
                 segment_stage_ids[segment.mirror.cid] = stage_id
         return segment_stage_ids
 
-    def _segment_trace_label(self, node: IRSegment, action: str, rank: Optional[int], micro_batch_id: Optional[int]) -> str:
+    def _segment_trace_fields(self, node: IRSegment) -> Tuple[str, Optional[int]]:
         fw_segment = node if node.isfw() else node.mirror
         stage_id = self._segment_stage_ids.get(node.cid)
         if stage_id is None and isinstance(fw_segment, IRSegment):
             stage_id = self._segment_stage_ids.get(fw_segment.cid)
         segment_name = self.node_name(fw_segment) if isinstance(fw_segment, IRSegment) else self.node_name(node)
-        return nvtx.segment_trace_label(action, rank, stage_id, micro_batch_id, segment_name)
+        return segment_name, stage_id
 
     @staticmethod
-    def _wrap_nvtx(label: Optional[str], codes: List[str]) -> List[str]:
-        if not label or not codes:
+    def _wrap_trace(
+        kind: str,
+        entity: str,
+        codes: List[str],
+        *,
+        virtual_stage: Optional[int] = None,
+        peer: Optional[int] = None,
+        micro_batch_id: Optional[int] = None,
+    ) -> List[str]:
+        if not codes:
             return codes
-        with Block(f'with nnscaler.profiler.nvtx.range({repr(label)}):') as nvtx_block:
-            nvtx_block.insert_body(codes)
-        return nvtx_block.code
+        fields = []
+        if virtual_stage is not None:
+            fields.append(f'vs={virtual_stage}')
+        if peer is not None:
+            fields.append(f'peer={peer}')
+        if micro_batch_id is not None:
+            fields.append(f'mb={micro_batch_id}')
+        kwargs = f", {', '.join(fields)}" if fields else ''
+        with Block(f'with ct.range(ct.Kind.{kind}, {entity!r}{kwargs}):') as trace_block:
+            trace_block.insert_body(codes)
+        return trace_block.code
 
     def gen(self, device: int, outfile=None, attach=None) -> str:
         """
@@ -598,9 +613,9 @@ class ScheduleCodeGen(FuncEmission):
         """
         Emit node / subgraph code
         """
-        fsign = '{outputs} = nnscaler.runtime.executor.fexecute({name}, {model}, *{inputs}, requires_grad={req_grad}, trace_label={trace_label})'
+        fsign = '{outputs} = nnscaler.runtime.executor.fexecute({name}, {model}, *{inputs}, requires_grad={req_grad})'
         asign = '{outputs} = nnscaler.runtime.executor.aexecute({model}, *{inputs}, requires_grad={req_grad})'
-        bsign = '{input_grads} = nnscaler.runtime.executor.backward({name}, {input_tensors}, {output_tensors}, {output_grads}, trace_label={trace_label})'
+        bsign = '{input_grads} = nnscaler.runtime.executor.backward({name}, {input_tensors}, {output_tensors}, {output_grads})'
 
         node_inputs, node_outputs = node.inputs(), node.outputs()
         # the real inputs in gencode
@@ -622,6 +637,7 @@ class ScheduleCodeGen(FuncEmission):
             pre_hook, post_hook, hook_meta = unwrap_node.pre_hook, unwrap_node.post_hook, unwrap_node.hook_meta
             # emit forward segment
             if node.isfw():
+                segment_name, virtual_stage = self._segment_trace_fields(unwrap_node)
                 getitem_codes = self._gen_nontensor_getitem_codes(
                     node_inputs,
                     produced_tids,
@@ -633,20 +649,27 @@ class ScheduleCodeGen(FuncEmission):
                 codes = getitem_codes
                 if pre_hook:
                     codes += self._emit_segment_hook_code(pre_hook, hook_meta, inputs, is_pre=True)
-                codes += [fsign.format(
+                operation_codes = [fsign.format(
                     outputs = outputs,
                     name = f"'{name}'",
                     model = f'model.{name}',
                     inputs = inputs,
                     req_grad = req_grad,
-                    trace_label = repr(self._segment_trace_label(unwrap_node, 'FWD', rank, micro_batch_id)),
                 )]
+                codes += self._wrap_trace(
+                    'FWD',
+                    segment_name,
+                    operation_codes,
+                    virtual_stage=virtual_stage,
+                    micro_batch_id=micro_batch_id,
+                )
                 if post_hook:
                     codes = codes + self._emit_segment_hook_code(
                         post_hook, hook_meta, inputs, is_pre=False,
                         outputs_str=outputs if len(node_outputs) <= 1 else f'({outputs})'
                     )
             else:
+                segment_name, virtual_stage = self._segment_trace_fields(unwrap_node)
                 # get gradient computation arguments
                 input_tensors, output_tensors, output_grads, input_grads = \
                         self.get_backward_callsite_io_tensors(node)
@@ -679,8 +702,14 @@ class ScheduleCodeGen(FuncEmission):
                     input_tensors = input_tensors_str,
                     output_tensors = output_tensors_str,
                     output_grads = output_grads_str,
-                    trace_label = repr(self._segment_trace_label(unwrap_node, 'BWD', rank, micro_batch_id)),
                 )]
+                codes = self._wrap_trace(
+                    'BWD',
+                    segment_name,
+                    codes,
+                    virtual_stage=virtual_stage,
+                    micro_batch_id=micro_batch_id,
+                )
 
                 bwd_input_str = f'({input_tensors_str}, {output_tensors_str}, {output_grads_str})'
                 bwd_output_str = input_grads_str if len(input_grads) <= 1 else f'({input_grads_str})'
@@ -725,9 +754,11 @@ class ScheduleCodeGen(FuncEmission):
                 inputs = inputs,
                 req_grad = req_grad
             )]
-            codes = self._wrap_nvtx(
-                nvtx.adapter_trace_label(unwrap_node, rank, self.node_name(unwrap_node), micro_batch_id),
+            codes = self._wrap_trace(
+                'COMM',
+                self.node_name(unwrap_node),
                 codes,
+                micro_batch_id=micro_batch_id,
             )
 
         elif isinstance(unwrap_node, IRWeightReducer):
@@ -737,8 +768,9 @@ class ScheduleCodeGen(FuncEmission):
                 inputs='()',
                 req_grad=req_grad
             )]
-            codes = self._wrap_nvtx(
-                nvtx.weight_reducer_trace_label(unwrap_node, rank, self.node_name(unwrap_node)),
+            codes = self._wrap_trace(
+                'REDUCE',
+                self.node_name(unwrap_node),
                 codes,
             )
 
