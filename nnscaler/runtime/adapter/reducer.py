@@ -13,7 +13,7 @@ from nnscaler.runtime.device import DeviceGroup
 from nnscaler.runtime.utils import split_array_min_max, set_fparam_meta, get_grad_dtype, set_grad_dtype
 from nnscaler.profiler.timer import CudaTimer
 from nnscaler.flags import RuntimeFlag
-from nnscaler.utils import unchecked_fields, first, first_or
+from nnscaler.utils import unchecked_fields, first
 
 
 if TYPE_CHECKING:
@@ -138,7 +138,8 @@ class FlattenParamInfo:
                 if None, use the dtype of first non-none `tensors`
                 if all tensors are None, use the dtype of first parameter in `self.params_info`
             device: the device of the result flattened tensor,
-                if None, use the device of the embeded params
+                if None, use the device of first non-none `tensors`
+                if all tensors are None, use the device of first parameter in `self.params_info`
         """
         if tensors is None:
             raise ValueError("tensors should not be None")
@@ -150,9 +151,17 @@ class FlattenParamInfo:
             # self.params_info is never empty
             ref_tensor = first(self.params_info)
 
-        dtype = dtype or ref_tensor.dtype
-        device = torch.device(device or ref_tensor.device)
-        flat_tensors = torch.zeros(self.opt_chunk_size, dtype=dtype, device=device, pin_memory=True)
+        if dtype is None:
+            dtype = ref_tensor.dtype
+        if device is None:
+            device = ref_tensor.device
+        device = torch.device(device)
+        flat_tensors = torch.zeros(
+            self.opt_chunk_size,
+            dtype=dtype,
+            device=device,
+            pin_memory=device.type == 'cpu',
+        )
 
         opt_start = self.opt_chunk_index * self.opt_chunk_size
         opt_end = (self.opt_chunk_index + 1) * self.opt_chunk_size
