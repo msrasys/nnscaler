@@ -184,7 +184,7 @@ class FlattenParamInfo:
                 ].copy_(tensor.view(-1), non_blocking=True)
 
         # non-blocking copy may need synchronization
-        if device.type == 'cuda' or any(
+        if device.type == 'cpu' and any(
             t.device.type == 'cuda' for t in non_none_tensors
         ):
             torch.cuda.synchronize()

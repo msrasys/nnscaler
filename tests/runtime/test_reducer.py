@@ -189,7 +189,7 @@ def test_flatten_param_info_dtype():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason='lack of gpu devices')
-def test_flatten_param_info_honors_integer_device():
+def test_flatten_param_info_cuda_device_and_synchronization(monkeypatch):
     param = torch.nn.Parameter(torch.zeros(2))
     flatten_info = FlattenParamInfo(
         zero=0,
@@ -207,11 +207,26 @@ def test_flatten_param_info_honors_integer_device():
         opt_chunk_index=0,
     )
 
-    tensor = torch.tensor([1, 2], dtype=torch.float32)
-    flattened = flatten_info.flatten([tensor], device=0)
+    synchronize_calls = 0
+    cuda_synchronize = torch.cuda.synchronize
 
-    assert flattened.device == torch.device(0)
-    assert flattened.cpu().equal(tensor)
+    def record_synchronize():
+        nonlocal synchronize_calls
+        synchronize_calls += 1
+        cuda_synchronize()
+
+    monkeypatch.setattr(torch.cuda, 'synchronize', record_synchronize)
+
+    tensor = torch.tensor([1, 2], dtype=torch.float32)
+    cuda_flattened = flatten_info.flatten([tensor], device=0)
+
+    assert cuda_flattened.device == torch.device(0)
+    assert synchronize_calls == 0
+
+    cpu_flattened = flatten_info.flatten([cuda_flattened], device='cpu')
+
+    assert synchronize_calls == 1
+    assert cpu_flattened.equal(tensor)
 
 
 @mock_reducer_env(0, 2)
