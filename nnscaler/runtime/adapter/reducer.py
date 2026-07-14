@@ -13,7 +13,7 @@ from nnscaler.runtime.device import DeviceGroup
 from nnscaler.runtime.utils import split_array_min_max, set_fparam_meta, get_grad_dtype, set_grad_dtype
 from nnscaler.profiler.timer import CudaTimer
 from nnscaler.flags import RuntimeFlag
-from nnscaler.utils import unchecked_fields, first
+from nnscaler.utils import unchecked_fields, first, first_or
 
 
 if TYPE_CHECKING:
@@ -127,24 +127,29 @@ class FlattenParamInfo:
                 )
         return params
 
-    def flatten(self, tensors: list[Optional[torch.Tensor]], *, device=None) -> torch.Tensor:
+    def flatten(self, tensors: list[Optional[torch.Tensor]], *, dtype=None, device=None) -> torch.Tensor:
         """
         Flatten the given tensors into a single tensor
         Args:
             tensors (list[Optional[torch.Tensor]]): the tensors to be flattened.
                 Note these tensors must be in the same order as `self.get_embeded_params()`
                 or None for missing tensors.
+            dtype: the dtype of the result flattened tensor,
+                if None, use the dtype of first non-none `tensors`
+                if all tensors are None, use the dtype of first parameter in `self.params_info`
             device: the device of the result flattened tensor,
                 if None, use the device of the embeded params
         """
         if tensors is None:
             raise ValueError("tensors should not be None")
 
-        # self.params_info is never empty
-        first_param = first(self.params_info)
-        dtype = first_param.dtype
-        if device is None:
-            device = first_param.device
+        ref_tensor = first_or(tensors, lambda t: t is not None, default=None)
+        if ref_tensor is None:
+            # self.params_info is never empty
+            ref_tensor = first(self.params_info)
+
+        dtype = dtype or ref_tensor.dtype
+        device = torch.device(device or ref_tensor.device)
         flat_tensors = torch.zeros(self.opt_chunk_size, dtype=dtype, device=device, pin_memory=True)
 
         opt_start = self.opt_chunk_index * self.opt_chunk_size
@@ -168,7 +173,10 @@ class FlattenParamInfo:
                 ].copy_(tensor.view(-1), non_blocking=True)
 
         # non-blocking copy may need synchronization
-        torch.cuda.synchronize()
+        if device.type == 'cuda' or any(
+            t is not None and t.device.type == 'cuda' for t in tensors
+        ):
+            torch.cuda.synchronize()
         return flat_tensors
 
     def unflatten(self, tensor: torch.Tensor, *, device=None) -> list[torch.Tensor]:

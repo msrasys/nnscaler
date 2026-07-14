@@ -16,7 +16,7 @@ from nnscaler.utils import load_model
 from nnscaler.graph import IRGraph
 from nnscaler.ir.operator import IRFwOperation
 from nnscaler.flags import CompileFlag
-from nnscaler.runtime.adapter.reducer import Reducer
+from nnscaler.runtime.adapter.reducer import FlattenParamInfo, Reducer, ReducerParamInfo
 from nnscaler.runtime.device import DeviceGroup
 from ..launch_torchrun import torchrun
 from ..utils import catch_log, init_parameter, assert_parity, mock_reducer_env
@@ -139,6 +139,52 @@ def reducer_test():
     assert_parity(baseline, partial(reducer, False, False))
 
 test_reducer_2gpu = partial(torchrun, 2, reducer_test)
+
+
+def test_flatten_param_info_dtype():
+    params = [
+        torch.nn.Parameter(torch.zeros(2, dtype=torch.float16)),
+        torch.nn.Parameter(torch.zeros(2, dtype=torch.float16)),
+    ]
+    flatten_info = FlattenParamInfo(
+        zero=0,
+        params_info={
+            params[0]: ReducerParamInfo(
+                shape=params[0].shape,
+                start=0,
+                end=2,
+                bucket_param_buffer_start=0,
+                bucket_param_buffer_end=2,
+            ),
+            params[1]: ReducerParamInfo(
+                shape=params[1].shape,
+                start=0,
+                end=2,
+                bucket_param_buffer_start=2,
+                bucket_param_buffer_end=4,
+            ),
+        },
+        opt_numel=4,
+        opt_num_chunks=1,
+        opt_chunk_index=0,
+    )
+
+    tensor = torch.tensor([1, 2], dtype=torch.float32)
+    flattened = flatten_info.flatten([None, tensor], device='cpu')
+    assert flattened.dtype == torch.float32
+    assert flattened.equal(torch.tensor([0, 0, 1, 2], dtype=torch.float32))
+
+    flattened = flatten_info.flatten([None, tensor], dtype=torch.float64, device='cpu')
+    assert flattened.dtype == torch.float64
+    assert flattened.equal(torch.tensor([0, 0, 1, 2], dtype=torch.float64))
+
+    flattened = flatten_info.flatten([None, None], dtype=torch.float64, device='cpu')
+    assert flattened.dtype == torch.float64
+    assert flattened.equal(torch.zeros(4, dtype=torch.float64))
+
+    flattened = flatten_info.flatten([None, None], device='cpu')
+    assert flattened.dtype == torch.float16  # default to first param's dtype
+    assert flattened.equal(torch.zeros(4, dtype=torch.float16))
 
 
 @mock_reducer_env(0, 2)
