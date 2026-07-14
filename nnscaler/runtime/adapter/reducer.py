@@ -143,8 +143,10 @@ class FlattenParamInfo:
         if tensors is None:
             raise ValueError("tensors should not be None")
 
-        ref_tensor = first_or(tensors, lambda t: t is not None, default=None)
-        if ref_tensor is None:
+        non_none_tensors = [t for t in tensors if t is not None]
+        if non_none_tensors:
+            ref_tensor = non_none_tensors[0]
+        else:
             # self.params_info is never empty
             ref_tensor = first(self.params_info)
 
@@ -174,7 +176,7 @@ class FlattenParamInfo:
 
         # non-blocking copy may need synchronization
         if device.type == 'cuda' or any(
-            t is not None and t.device.type == 'cuda' for t in tensors
+            t.device.type == 'cuda' for t in non_none_tensors
         ):
             torch.cuda.synchronize()
         return flat_tensors
