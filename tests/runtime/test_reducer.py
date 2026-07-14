@@ -170,7 +170,8 @@ def test_flatten_param_info_dtype():
     )
 
     tensor = torch.tensor([1, 2], dtype=torch.float32)
-    flattened = flatten_info.flatten([None, tensor], device='cpu')
+    flattened = flatten_info.flatten([None, tensor])
+    assert flattened.device.type == 'cpu'
     assert flattened.dtype == torch.float32
     assert flattened.equal(torch.tensor([0, 0, 1, 2], dtype=torch.float32))
 
@@ -185,6 +186,32 @@ def test_flatten_param_info_dtype():
     flattened = flatten_info.flatten([None, None], device='cpu')
     assert flattened.dtype == torch.float16  # default to first param's dtype
     assert flattened.equal(torch.zeros(4, dtype=torch.float16))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason='lack of gpu devices')
+def test_flatten_param_info_honors_integer_device():
+    param = torch.nn.Parameter(torch.zeros(2))
+    flatten_info = FlattenParamInfo(
+        zero=0,
+        params_info={
+            param: ReducerParamInfo(
+                shape=param.shape,
+                start=0,
+                end=2,
+                bucket_param_buffer_start=0,
+                bucket_param_buffer_end=2,
+            ),
+        },
+        opt_numel=2,
+        opt_num_chunks=1,
+        opt_chunk_index=0,
+    )
+
+    tensor = torch.tensor([1, 2], dtype=torch.float32)
+    flattened = flatten_info.flatten([tensor], device=0)
+
+    assert flattened.device == torch.device(0)
+    assert flattened.cpu().equal(tensor)
 
 
 @mock_reducer_env(0, 2)
