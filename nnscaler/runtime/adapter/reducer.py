@@ -127,15 +127,13 @@ class FlattenParamInfo:
                 )
         return params
 
-    def flatten(self, tensors: list[Optional[torch.Tensor]], *, dtype=None, device=None) -> torch.Tensor:
+    def flatten(self, tensors: list[Optional[torch.Tensor]], *, device=None) -> torch.Tensor:
         """
         Flatten the given tensors into a single tensor
         Args:
             tensors (list[Optional[torch.Tensor]]): the tensors to be flattened.
                 Note these tensors must be in the same order as `self.get_embeded_params()`
                 or None for missing tensors.
-            dtype: the data type of the result flattened tensor,
-                if None, use the dtype of the embeded params
             device: the device of the result flattened tensor,
                 if None, use the device of the embeded params
         """
@@ -144,8 +142,7 @@ class FlattenParamInfo:
 
         # self.params_info is never empty
         first_param = first(self.params_info)
-        if dtype is None:
-            dtype = first_param.dtype
+        dtype = first_param.dtype
         if device is None:
             device = first_param.device
         flat_tensors = torch.zeros(self.opt_chunk_size, dtype=dtype, device=device, pin_memory=True)
