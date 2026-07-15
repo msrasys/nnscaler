@@ -23,6 +23,7 @@ from tqdm import tqdm
 
 import nnscaler
 from nnscaler.runtime.device import DeviceGroup
+from nnscaler.profiler.chronotrigger_hook import ChronoTriggerTrainHook
 from nnscaler.utils import broadcast_mixed_data, is_running_distributed
 
 from .trainer_args import AggregatedOutputs, TrainerArgs, fix_input
@@ -235,7 +236,8 @@ class Trainer:
         component_hooks = list({id(hook): hook for hook in component_hooks}.values())
 
         self.hook = AggregatedTrainHook(
-            component_hooks
+            [ChronoTriggerTrainHook()]
+            + component_hooks
             + [self.train_args.create_hook()]
         )
 
