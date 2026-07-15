@@ -23,6 +23,7 @@ logger = logging.getLogger(__name__)
 
 _TRACE_AXES = ("pp", "ep", "tp", "cp")
 _DEFAULT_AXIS_ORDER = _TRACE_AXES
+_LEGACY_TRACE_GATE_ENV = "NNSCALER_NVTX_TRACE"
 
 
 class ChronoTriggerTrainHook(TrainHook):
@@ -34,8 +35,14 @@ class ChronoTriggerTrainHook(TrainHook):
         self.capture_stopped = False
 
     def after_setup(self, trainer: "Trainer") -> None:
-        rank_layout = _rank_layout(trainer) if _env_enabled("CT_TRACE") else None
-        ct.init(profile="nnscaler", schema="nnscaler.v1", rank_layout=rank_layout)
+        tracing_enabled = _tracing_enabled()
+        rank_layout = _rank_layout(trainer) if tracing_enabled else None
+        ct.init(
+            profile="nnscaler",
+            schema="nnscaler.v1",
+            rank_layout=rank_layout,
+            enabled=tracing_enabled,
+        )
         self.capture_window = _capture_window()
 
     def on_train_step_start(self, trainer: "Trainer", batches: list) -> None:
@@ -97,8 +104,14 @@ def _rank_layout(trainer: "Trainer") -> Dict[str, int]:
         pas_config.get("pp_size", pas_config.get("pipeline_size", 1))
     )
     axis_sizes = {
-        "pp": _positive_env_int("NNSCALER_TRACE_PP_SIZE", default_pp_size),
-        "ep": _positive_env_int("NNSCALER_TRACE_EP_SIZE", 1),
+        "pp": _positive_env_int(
+            "NNSCALER_TRACE_PP_SIZE",
+            _env_int("PIPELINE_VPP_PP_SIZE", default_pp_size),
+        ),
+        "ep": _positive_env_int(
+            "NNSCALER_TRACE_EP_SIZE",
+            _env_int("PIPELINE_VPP_EP_SIZE", 1),
+        ),
         "tp": _positive_env_int("NNSCALER_TRACE_TP_SIZE", 1),
         "cp": _positive_env_int("NNSCALER_TRACE_CP_SIZE", 1),
     }
@@ -160,6 +173,12 @@ def _capture_window() -> Optional[Tuple[int, int]]:
             return None
         end_step = start_step + capture_steps
     return start_step, end_step
+
+
+def _tracing_enabled() -> bool:
+    if "CT_TRACE" in os.environ:
+        return _env_enabled("CT_TRACE")
+    return _env_enabled(_LEGACY_TRACE_GATE_ENV)
 
 
 def _env_enabled(name: str) -> bool:

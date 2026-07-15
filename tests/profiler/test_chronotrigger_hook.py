@@ -46,6 +46,18 @@ def test_rank_layout_does_not_guess_unidentified_inner_axis():
     assert layout["cp"] == 0
 
 
+def test_rank_layout_accepts_legacy_launcher_hints(monkeypatch):
+    monkeypatch.setenv("PIPELINE_VPP_PP_SIZE", "4")
+    monkeypatch.setenv("PIPELINE_VPP_EP_SIZE", "2")
+
+    layout = chronotrigger_hook._rank_layout(
+        _trainer(rank=5, pas_config={"pipeline_size": 1})
+    )
+
+    assert layout["pp"] == 2
+    assert layout["ep"] == 1
+
+
 def test_rank_layout_rejects_incomplete_inner_parallelism(monkeypatch):
     monkeypatch.setenv("NNSCALER_TRACE_EP_SIZE", "3")
 
@@ -71,8 +83,25 @@ def test_disabled_hook_does_not_resolve_rank_layout(monkeypatch):
             "profile": "nnscaler",
             "schema": "nnscaler.v1",
             "rank_layout": None,
+            "enabled": False,
         }
     ]
+
+
+def test_hook_accepts_legacy_trace_gate(monkeypatch):
+    monkeypatch.setenv("NNSCALER_NVTX_TRACE", "1")
+    monkeypatch.setenv("PIPELINE_VPP_EP_SIZE", "2")
+    init_calls = []
+    monkeypatch.setattr(
+        chronotrigger_hook.ct,
+        "init",
+        lambda **kwargs: init_calls.append(kwargs),
+    )
+
+    chronotrigger_hook.ChronoTriggerTrainHook().after_setup(_trainer())
+
+    assert init_calls[0]["enabled"] is True
+    assert init_calls[0]["rank_layout"]["ep"] == 0
 
 
 def test_hook_owns_step_and_delayed_capture(monkeypatch):
@@ -134,6 +163,7 @@ def test_hook_owns_step_and_delayed_capture(monkeypatch):
                     "tp": 0,
                     "cp": 0,
                 },
+                "enabled": True,
             },
         ),
         ("step", 10),
