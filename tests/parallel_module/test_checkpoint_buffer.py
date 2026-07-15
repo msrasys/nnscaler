@@ -91,7 +91,7 @@ def _gpu_worker():
             assert torch.equal(list(net2._buffers.values())[0], torch.ones(256, 64))
 
             logs = log_stream.getvalue()
-            assert not 'Non-persistent buffers cannot be initialized with' in logs
+            assert 'Non-persistent buffers cannot be initialized with' not in logs
 
         net3 = _to_cube_model(Net3(), compute_config, tempdir, 'net3', (128, 64))
         cube_state_dict = net3.state_dict()
