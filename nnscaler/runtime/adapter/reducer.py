@@ -156,11 +156,14 @@ class FlattenParamInfo:
         if device is None:
             device = ref_tensor.device
         device = torch.device(device)
+        cuda_to_cpu = device.type == 'cpu' and any(
+            t.device.type == 'cuda' for t in non_none_tensors
+        )
         flat_tensors = torch.zeros(
             self.opt_chunk_size,
             dtype=dtype,
             device=device,
-            pin_memory=device.type == 'cpu',
+            pin_memory=cuda_to_cpu,
         )
 
         opt_start = self.opt_chunk_index * self.opt_chunk_size
@@ -184,9 +187,7 @@ class FlattenParamInfo:
                 ].copy_(tensor.view(-1), non_blocking=True)
 
         # non-blocking copy may need synchronization
-        if device.type == 'cpu' and any(
-            t.device.type == 'cuda' for t in non_none_tensors
-        ):
+        if cuda_to_cpu:
             torch.cuda.synchronize()
         return flat_tensors
 

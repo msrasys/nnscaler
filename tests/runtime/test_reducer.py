@@ -172,6 +172,7 @@ def test_flatten_param_info_dtype():
     tensor = torch.tensor([1, 2], dtype=torch.float32)
     flattened = flatten_info.flatten([None, tensor])
     assert flattened.device.type == 'cpu'
+    assert not flattened.is_pinned()
     assert flattened.dtype == torch.float32
     assert flattened.equal(torch.tensor([0, 0, 1, 2], dtype=torch.float32))
 
