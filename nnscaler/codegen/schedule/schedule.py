@@ -24,6 +24,14 @@ from nnscaler.flags import CompileFlag
 _logger = logging.getLogger(__name__)
 
 
+fsign = '{outputs} = nnscaler.runtime.executor.fexecute({name}, {model}, *{inputs}, requires_grad={req_grad})'
+asign = '{outputs} = nnscaler.runtime.executor.aexecute({model}, *{inputs}, requires_grad={req_grad})'
+bsign = '{input_grads} = nnscaler.runtime.executor.backward({name}, {input_tensors}, {output_tensors}, {output_grads})'
+bi_sign = '{input_grads} = nnscaler.runtime.executor.backward_input({name}, {input_tensors}, {output_tensors}, {output_grads}, {weights})'
+bw_sign = 'nnscaler.runtime.executor.backward_weight({name}, {weights})'
+bw_fn_name = 'nnscaler.runtime.executor.backward_weight'
+
+
 class ScheduleCodeGen(FuncEmission):
 
     def __init__(
@@ -117,6 +125,19 @@ class ScheduleCodeGen(FuncEmission):
                 buffered_codes.clear()
                 last_stream = None
 
+        def _split_backward_codes(codes: List[str]) -> Tuple[List[str], List[str]]:
+            """
+            Split backward codes into two parts: backward_input and backward_weight
+            """
+            idx_weight = 0
+            for idx, code in enumerate(codes):
+                if code.strip().startswith(bw_fn_name):
+                    idx_weight = idx
+                    break
+            else:
+                raise RuntimeError(f"Expected backward_weight call in backward segment when using FBW schedule")
+            return codes[:idx_weight], codes[idx_weight:]
+
         with FunctionBlock(func_name='_train_step',
                            args=args) as fb:
             _append_code(fb, '_ = None')
@@ -138,6 +159,18 @@ class ScheduleCodeGen(FuncEmission):
                     node = node.cell if isinstance(node, ExeReuseCell) else node
                     return isinstance(node, IRSegment) and not node.isfw()
 
+                def _is_adapter(node: IRCell) -> bool:
+                    node = node.cell if isinstance(node, ExeReuseCell) else node
+                    return isinstance(node, IRAdapter)
+
+                def _depends_totally_on(adapter: IRAdapter, node: IRCell) -> bool:
+                    """
+                    Check if the adapter depends on the node
+                    """
+                    node_outputs = set(node.outputs())
+                    adapter_inputs = set(adapter.inputs())
+                    return adapter_inputs.issubset(node_outputs)
+
                 # collect backward segments that needs to reduce gradients
                 # which are the last backward segments of every stage.
                 # (Every segment will be used multiple times via `ExeReuseCell`)
@@ -154,6 +187,8 @@ class ScheduleCodeGen(FuncEmission):
                             last_backwards[node.cell.cid] = node
                     last_backward_node_oids = [id(node) for node in last_backwards.values()]
 
+                last_backward_node = None
+                last_backward_weight_codes = []
                 for line, node in enumerate(device_nodes):
                     # when use scheduler, skip reducer if it is not the last backward of same segments
                     if use_scheduler and _is_backward_segment(node):
@@ -161,12 +196,38 @@ class ScheduleCodeGen(FuncEmission):
                             f'nnscaler.flags.RuntimeFlag.skip_reducer = '
                             f'{id(node) not in last_backward_node_oids !r}'
                         )
+
                     codes = self.emit_node(node)
-                    _append_code(fb, codes, self._get_node_stream(node))
+
+                    if use_scheduler and _is_backward_segment(node) and CompileFlag.use_fbw:
+                        if last_backward_node is not None:
+                            _append_code(fb, last_backward_weight_codes, self._get_node_stream(last_backward_node))
+                        last_backward_node = node
+                        codes_input, codes_weight = _split_backward_codes(codes)
+                        last_backward_weight_codes = codes_weight
+                        _append_code(fb, codes_input, self._get_node_stream(node))
+                    else:
+                        if last_backward_node is not None:
+                            if _is_adapter(node) and _depends_totally_on(node, last_backward_node):
+                                # if the next node is an adapter that depends on the last backward,
+                                # we need to emit the adapter before the last backward_weight codes
+                                _append_code(fb, codes, self._get_node_stream(node))
+                            else:
+                                _append_code(fb, last_backward_weight_codes, self._get_node_stream(last_backward_node))
+                                last_backward_node = None
+                                last_backward_weight_codes = []
+                                _append_code(fb, codes, self._get_node_stream(node))
+                        else:
+                            _append_code(fb, codes, self._get_node_stream(node))
+
                     # release
                     tensors = lifetime.release_tensors_after_line(line)
                     if len(tensors) > 0 : # not necessarily to have one after each line
                         _append_code(fb, self.emit_release(tensors))
+
+                if last_backward_node is not None:
+                    _append_code(fb, last_backward_weight_codes, self._get_node_stream(last_backward_node))
+
             # return code
             outputs = self.return_name_complex(self.execplan.outputs())
             code = f'return {outputs}'
@@ -300,10 +361,6 @@ class ScheduleCodeGen(FuncEmission):
         """
         Emit node / subgraph code
         """
-        fsign = '{outputs} = nnscaler.runtime.executor.fexecute({name}, {model}, *{inputs}, requires_grad={req_grad})'
-        asign = '{outputs} = nnscaler.runtime.executor.aexecute({model}, *{inputs}, requires_grad={req_grad})'
-        bsign = '{input_grads} = nnscaler.runtime.executor.backward({name}, {input_tensors}, {output_tensors}, {output_grads})'
-
         node_inputs, node_outputs = node.inputs(), node.outputs()
         # the real inputs in gencode
         gen_inputs = node_inputs
@@ -351,13 +408,27 @@ class ScheduleCodeGen(FuncEmission):
                 input_tensors_str = self.tuple_name(input_tensors, skip_attr=True, prefix_attr='model.')
                 output_tensors_str = self.tuple_name(output_tensors, skip_attr=True, prefix_attr='model.')
                 output_grads_str = self.tuple_name(output_grads, skip_attr=True, prefix_attr='model.')
-                codes = [bsign.format(
-                    name = f"'{self.node_name(unwrap_node.mirror)}'", # always use name of fw segment
-                    input_grads = input_grads_str,
-                    input_tensors = input_tensors_str,
-                    output_tensors = output_tensors_str,
-                    output_grads = output_grads_str
-                )]
+                if CompileFlag.use_fbw:
+                    codes = [bi_sign.format(
+                        input_grads = input_grads_str,
+                        name = f"'{self.node_name(unwrap_node.mirror)}'", # always use name of fw segment
+                        input_tensors = input_tensors_str,
+                        output_tensors = output_tensors_str,
+                        output_grads = output_grads_str,
+                        weights = 'model.parameters()'
+                    )]
+                    codes.append(bw_sign.format(
+                        name = f"'{self.node_name(unwrap_node.mirror)}'", # always use name of fw segment
+                        weights = 'model.parameters()'
+                    ))
+                else:
+                    codes = [bsign.format(
+                        name = f"'{self.node_name(unwrap_node.mirror)}'", # always use name of fw segment
+                        input_grads = input_grads_str,
+                        input_tensors = input_tensors_str,
+                        output_tensors = output_tensors_str,
+                        output_grads = output_grads_str
+                    )]
 
                 bwd_input_str = f'({input_tensors_str}, {output_tensors_str}, {output_grads_str})'
                 bwd_output_str = input_grads_str if len(input_grads) <= 1 else f'({input_grads_str})'

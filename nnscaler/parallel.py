@@ -131,6 +131,10 @@ class ComputeConfig:
     #  2. the first return value of `module.forward` must be the loss
     #  which must be a scalar tensor
     use_end2end: bool = False
+    # whether to use FBW schedules or FB schedules. Default is False (FB schedules).
+    # only effective when `use_end2end` is True and `inference_only` is False.
+    # Only useful for pipeline training with multi-stream scheduling.
+    use_fbw: bool = False
 
     # whether to use async reducer
     # if True, the gradient all-reduce will be async,
@@ -409,6 +413,7 @@ def _compile_flags(compute_config: ComputeConfig):
         trace_strategy=compute_config.trace_strategy,
         zero_param_level_sharding=compute_config.zero_param_level_sharding,
         reducer_replicated_params=compute_config.reducer_replicated_params,
+        use_fbw=compute_config.use_fbw,
     )
 
 

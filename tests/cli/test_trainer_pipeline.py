@@ -37,13 +37,15 @@ def trainer_worker_pipeline(save_dir, config_file, run_name=None, additional_arg
     torch.distributed.barrier()
 
 
-def trainer_worker_pipeline_multiple_stream(save_dir, config_file):
+def trainer_worker_pipeline_multiple_stream(save_dir, config_file, run_name=None, additional_args=None):
     save_dir = Path(save_dir)
     config_path = Path(__file__).with_name(config_file).resolve()
-    run_name = f'{config_path.stem}_multi_stream'
+    run_name = run_name or f'{config_path.stem}_multi_stream'
     gen_savedir = save_dir / run_name / 'gen'
     ckpt_savedir = save_dir / run_name / 'ckpt'
     instance_name = f'instance_{run_name}'
+
+    additional_args = additional_args or []
 
     trainer = Trainer([
         '-f', config_path,
@@ -52,6 +54,7 @@ def trainer_worker_pipeline_multiple_stream(save_dir, config_file):
         '--gen_savedir', str(gen_savedir),
         '--compute_config.pas_config.pipeline_scheduler', 'tests.test_policies.sched_1f1b_multi_stream',
         '--checkpoint.save_dir', str(ckpt_savedir),
+        *additional_args
     ])
     trainer.run()
     assert trainer.model.use_scheduler
@@ -66,17 +69,23 @@ def trainer_worker_pipeline_multiple_stream(save_dir, config_file):
 @pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.device_count() < 4, reason='lack of gpu devices')
 def test_trainer_pipeline(tmp_path):
     launch_torchrun(4, trainer_worker_pipeline_multiple_stream, tmp_path, 'trainer_args_pipeline.yaml')
+    launch_torchrun(4, trainer_worker_pipeline_multiple_stream, tmp_path, 'trainer_args_pipeline.yaml',
+        'fbw',
+        ['--compute_config.use_fbw', 'True',]
+    )
     launch_torchrun(4, trainer_worker_pipeline, tmp_path, 'trainer_args_pipeline_autodist.yaml')
     launch_torchrun(4, trainer_worker_pipeline, tmp_path, 'trainer_args_pipeline.yaml')
 
     merged_files = list((tmp_path).glob('merged_*.pt'))
-    assert len(merged_files) == 3
+    assert len(merged_files) == 4
     merged_state_dicts = [torch.load(merged_file, weights_only=False) for merged_file in merged_files]
 
     assert_equal(merged_state_dicts[0]['model'], merged_state_dicts[1]['model'])
     assert_equal(merged_state_dicts[0]['optimizer'], merged_state_dicts[1]['optimizer'])
     assert_equal(merged_state_dicts[0]['model'], merged_state_dicts[2]['model'])
     assert_equal(merged_state_dicts[0]['optimizer'], merged_state_dicts[2]['optimizer'])
+    assert_equal(merged_state_dicts[0]['model'], merged_state_dicts[3]['model'])
+    assert_equal(merged_state_dicts[0]['optimizer'], merged_state_dicts[3]['optimizer'])
 
 
 def pp_obj_pas(graph, cfg):
