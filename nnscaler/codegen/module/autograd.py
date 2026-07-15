@@ -54,7 +54,8 @@ class AutogradAdapterCodeGen(FuncEmission):
             f'**(dict({context_expr}.payload_fields) if {context_expr} is not None else {{}})'
         )
         with Block(
-            f'with ct.range(ct.Kind.{trace_spec.kind}, {trace_spec.entity!r}{peer}{trace_fields}):'
+            f'with ct.range(ct.Kind.{trace_spec.kind}, {trace_spec.entity!r}{peer}'
+            f'{trace_fields}, process_scope=False):'
         ) as trace_block:
             trace_block.insert_body(code)
         return trace_block.code

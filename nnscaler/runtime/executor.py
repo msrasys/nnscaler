@@ -16,6 +16,14 @@ _logger = logging.getLogger(__name__)
 _ALLOW_GRAD_DTYPES = (torch.double, torch.float32, torch.float16, torch.bfloat16)
 
 
+def _wait_for_work(work, trace_context: Optional[ct.TraceContext]):
+    with ct.range_from(trace_context, kind=ct.Kind.WAIT, source=_WAIT_SOURCE):
+        work.wait()
+
+
+_WAIT_SOURCE = ct.Source.callable(_wait_for_work)
+
+
 def debug_id(tensors, msg: str, rank: int):
     if torch.distributed.get_rank() == rank:
         if torch.is_tensor(tensors):
@@ -55,8 +63,7 @@ class AsyncCommHandler:
         works = self._works.pop(tid)
         trace_context = self._metas.pop(tid, None)
         for work in works:
-            with ct.range_from(trace_context, kind=ct.Kind.WAIT):
-                work.wait()
+            _wait_for_work(work, trace_context)
         callback = self._callbacks.pop(tid)
         if callback is not None:
             tensor = callback(tensor)
@@ -77,8 +84,7 @@ class AsyncCommHandler:
     def drain_sends(self, wait: bool = True):
         if wait:
             for _, work, trace_context in self._send_holds:
-                with ct.range_from(trace_context, kind=ct.Kind.WAIT):
-                    work.wait()
+                _wait_for_work(work, trace_context)
             self._send_holds.clear()
             return
 
@@ -86,8 +92,7 @@ class AsyncCommHandler:
         for tensor, work, trace_context in self._send_holds:
             is_completed = getattr(work, 'is_completed', None)
             if is_completed is not None and is_completed():
-                with ct.range_from(trace_context, kind=ct.Kind.WAIT):
-                    work.wait()
+                work.wait()
             else:
                 pending.append((tensor, work, trace_context))
         self._send_holds = pending
@@ -101,8 +106,7 @@ class AsyncCommHandler:
                 continue
             trace_context = self._metas.get(tid)
             for work in works:
-                with ct.range_from(trace_context, kind=ct.Kind.WAIT):
-                    work.wait()
+                _wait_for_work(work, trace_context)
             self._works.pop(tid, None)
             self._callbacks.pop(tid, None)
             self._metas.pop(tid, None)

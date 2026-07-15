@@ -96,6 +96,7 @@ class ScheduleCodeGen(FuncEmission):
         virtual_stage: Optional[int] = None,
         peer: Optional[int] = None,
         micro_batch_id: Optional[int] = None,
+        process_scope: bool = True,
     ) -> List[str]:
         if not codes:
             return codes
@@ -106,10 +107,26 @@ class ScheduleCodeGen(FuncEmission):
             fields.append(f'peer={peer}')
         if micro_batch_id is not None:
             fields.append(f'mb={micro_batch_id}')
+        if not process_scope:
+            fields.append('process_scope=False')
         kwargs = f", {', '.join(fields)}" if fields else ''
         with Block(f'with ct.range(ct.Kind.{kind}, {entity!r}{kwargs}):') as trace_block:
             trace_block.insert_body(codes)
         return trace_block.code
+
+    @staticmethod
+    def _wrap_scope(
+        entity: str,
+        codes: List[str],
+        *,
+        micro_batch_id: Optional[int] = None,
+    ) -> List[str]:
+        if not codes:
+            return codes
+        fields = f', mb={micro_batch_id}' if micro_batch_id is not None else ''
+        with Block(f'with ct.scope({entity!r}{fields}):') as scope_block:
+            scope_block.insert_body(codes)
+        return scope_block.code
 
     def gen(self, device: int, outfile=None, attach=None) -> str:
         """
@@ -662,6 +679,7 @@ class ScheduleCodeGen(FuncEmission):
                     operation_codes,
                     virtual_stage=virtual_stage,
                     micro_batch_id=micro_batch_id,
+                    process_scope=False,
                 )
                 if post_hook:
                     codes = codes + self._emit_segment_hook_code(
@@ -754,8 +772,7 @@ class ScheduleCodeGen(FuncEmission):
                 inputs = inputs,
                 req_grad = req_grad
             )]
-            codes = self._wrap_trace(
-                'COMM',
+            codes = self._wrap_scope(
                 self.node_name(unwrap_node),
                 codes,
                 micro_batch_id=micro_batch_id,
@@ -768,11 +785,6 @@ class ScheduleCodeGen(FuncEmission):
                 inputs='()',
                 req_grad=req_grad
             )]
-            codes = self._wrap_trace(
-                'REDUCE',
-                self.node_name(unwrap_node),
-                codes,
-            )
 
         else:
             raise RuntimeError(f"Unspported node type: {type(unwrap_node)}")

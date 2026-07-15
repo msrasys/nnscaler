@@ -379,7 +379,8 @@ class FuncEmission(CodeEmission):
             else:
                 peer = f', peer={trace_spec.peer}' if trace_spec.peer is not None else ''
                 with Block(
-                    f'with ct.range(ct.Kind.{trace_spec.kind}, {trace_spec.entity!r}{peer}):'
+                    f'with ct.range(ct.Kind.{trace_spec.kind}, '
+                    f'{trace_spec.entity!r}{peer}, process_scope=False):'
                 ) as trace_block:
                     trace_block.insert_body(code)
                 codes.extend(trace_block.code)
@@ -396,7 +397,9 @@ class FuncEmission(CodeEmission):
         codes = []
         if CompileFlag.line_timer:
             codes.append(f'nnscaler.runtime.function.print_time({repr(reducer_name)})')
-        with Block(f'with ct.range(ct.Kind.REDUCE, {self.node_name(node)!r}):') as trace_block:
+        with Block(
+            f'with ct.range(ct.Kind.REDUCE, {self.node_name(node)!r}, process_scope=False):'
+        ) as trace_block:
             trace_block.insert_body(f'{reducer_name}.sync_grads()')
         codes.extend(trace_block.code)
         return codes
