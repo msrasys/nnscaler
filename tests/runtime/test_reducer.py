@@ -170,11 +170,19 @@ def test_flatten_param_info_dtype():
     )
 
     tensor = torch.tensor([1, 2], dtype=torch.float32)
+    with pytest.raises(ValueError, match="tensors length 1 does not match the expected length 2"):
+        flatten_info.flatten([tensor])
+
     flattened = flatten_info.flatten([None, tensor])
     assert flattened.device.type == 'cpu'
     assert not flattened.is_pinned()
     assert flattened.dtype == torch.float32
     assert flattened.equal(torch.tensor([0, 0, 1, 2], dtype=torch.float32))
+
+    unflattened = flatten_info.unflatten(flattened, device='cpu')
+    assert all(output.device.type == 'cpu' and not output.is_pinned() for output in unflattened)
+    assert unflattened[0].equal(torch.zeros(2, dtype=torch.float32))
+    assert unflattened[1].equal(tensor)
 
     flattened = flatten_info.flatten([None, tensor], dtype=torch.float64, device='cpu')
     assert flattened.dtype == torch.float64
@@ -227,7 +235,20 @@ def test_flatten_param_info_cuda_device_and_synchronization(monkeypatch):
     cpu_flattened = flatten_info.flatten([cuda_flattened], device='cpu')
 
     assert synchronize_calls == 1
+    assert cpu_flattened.is_pinned()
     assert cpu_flattened.equal(tensor)
+
+    cuda_unflattened = flatten_info.unflatten(cuda_flattened, device=0)
+
+    assert synchronize_calls == 1
+    assert cuda_unflattened[0].device == torch.device(0)
+    assert cuda_unflattened[0].cpu().equal(tensor)
+
+    cpu_unflattened = flatten_info.unflatten(cuda_flattened, device='cpu')
+
+    assert synchronize_calls == 2
+    assert cpu_unflattened[0].is_pinned()
+    assert cpu_unflattened[0].equal(tensor)
 
 
 @mock_reducer_env(0, 2)

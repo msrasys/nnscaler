@@ -143,6 +143,10 @@ class FlattenParamInfo:
         """
         if tensors is None:
             raise ValueError("tensors should not be None")
+        if len(tensors) != len(self.get_embeded_params()):
+            raise ValueError(
+                f"tensors length {len(tensors)} does not match the expected length {len(self.get_embeded_params())}"
+            )
 
         non_none_tensors = [t for t in tensors if t is not None]
         if non_none_tensors:
@@ -206,6 +210,9 @@ class FlattenParamInfo:
             raise ValueError("tensor numel does not match the expected size")
         if device is None:
             device = tensor.device
+        device = torch.device(device)
+
+        cuda_to_cpu = device.type == 'cpu' and tensor.device.type == 'cuda'
 
         tensors = []
         opt_start = self.opt_chunk_index * self.opt_chunk_size
@@ -213,7 +220,7 @@ class FlattenParamInfo:
 
         for info in self.params_info.values():
             if info.bucket_param_buffer_start >= opt_start and info.bucket_param_buffer_end <= opt_end:
-                param_tensor = torch.empty(info.shape, dtype=tensor.dtype, device=device, pin_memory=True)
+                param_tensor = torch.empty(info.shape, dtype=tensor.dtype, device=device, pin_memory=cuda_to_cpu)
                 param_tensor.view(-1).copy_(
                     tensor[
                         info.bucket_param_buffer_start - opt_start:
@@ -224,7 +231,8 @@ class FlattenParamInfo:
                 tensors.append(param_tensor)
 
         # non-blocking copy may need synchronization
-        torch.cuda.synchronize()
+        if cuda_to_cpu:
+            torch.cuda.synchronize()
         return tensors
 
 
