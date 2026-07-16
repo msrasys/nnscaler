@@ -17,6 +17,8 @@ from nnscaler.cli.train_hook import TrainHook
 
 if TYPE_CHECKING:
     from nnscaler.cli.trainer import Trainer
+    from nnscaler.cli.trainer_args import AggregatedOutputs
+    from nnscaler.cli.train_hook import TrainStepMetrics
 
 
 logger = logging.getLogger(__name__)
@@ -45,7 +47,7 @@ class ChronoTriggerTrainHook(TrainHook):
         )
         self.capture_window = _capture_window()
 
-    def on_train_step_start(self, trainer: "Trainer", batches: list) -> None:
+    def on_step_start(self, trainer: "Trainer", epoch: int, idx: int) -> None:
         current_step = trainer.train_status.finished_train_steps
         ct.set_step(current_step)
         if (
@@ -66,7 +68,14 @@ class ChronoTriggerTrainHook(TrainHook):
                 *self.capture_window,
             )
 
-    def on_train_step_end(self, trainer: "Trainer", outputs: list) -> None:
+    def on_step_end(
+        self,
+        trainer: "Trainer",
+        epoch: int,
+        idx: int,
+        step_metrics: "TrainStepMetrics",
+        aggregated_outputs: "AggregatedOutputs",
+    ) -> None:
         if (
             not self.capture_started
             or self.capture_stopped
@@ -74,7 +83,7 @@ class ChronoTriggerTrainHook(TrainHook):
         ):
             return
 
-        completed_step = trainer.train_status.finished_train_steps + 1
+        completed_step = trainer.train_status.finished_train_steps
         if completed_step < self.capture_window[1]:
             return
 

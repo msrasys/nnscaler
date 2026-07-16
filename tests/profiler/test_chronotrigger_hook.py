@@ -144,9 +144,22 @@ def test_hook_owns_step_and_delayed_capture(monkeypatch):
 
     hook = chronotrigger_hook.ChronoTriggerTrainHook()
     hook.after_setup(trainer)
-    hook.on_train_step_start(trainer, [])
+    hook.on_step_start(trainer, 0, 10)
+    events.append(("zero_grad",))
+    events.append(("train_step",))
+    events.append(("optimizer_step",))
+    events.append(("lr_scheduler",))
+    events.append(("logging",))
     trainer.train_status.finished_train_steps = 11
-    hook.on_train_step_end(trainer, [])
+    hook.on_step_end(trainer, 0, 10, {}, None)
+    hook.on_step_start(trainer, 0, 11)
+    events.append(("zero_grad",))
+    events.append(("train_step",))
+    events.append(("optimizer_step",))
+    events.append(("lr_scheduler",))
+    events.append(("logging",))
+    trainer.train_status.finished_train_steps = 12
+    hook.on_step_end(trainer, 0, 11, {}, None)
 
     assert events == [
         (
@@ -171,6 +184,17 @@ def test_hook_owns_step_and_delayed_capture(monkeypatch):
         ("synchronize",),
         ("cudaProfilerStart",),
         ("metadata",),
+        ("zero_grad",),
+        ("train_step",),
+        ("optimizer_step",),
+        ("lr_scheduler",),
+        ("logging",),
+        ("step", 11),
+        ("zero_grad",),
+        ("train_step",),
+        ("optimizer_step",),
+        ("lr_scheduler",),
+        ("logging",),
         ("synchronize",),
         ("barrier",),
         ("cudaProfilerStop",),
