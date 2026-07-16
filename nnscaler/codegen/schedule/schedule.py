@@ -269,7 +269,6 @@ class ScheduleCodeGen(FuncEmission):
                         getitem_info=getitem_info,
                         dataloader_var=dataloader_var,
                         fallback_state=fallback_state,
-                        rank=device,
                     )
                     _append_code(fb, codes, self._get_node_stream(node))
                     # release
@@ -318,7 +317,6 @@ class ScheduleCodeGen(FuncEmission):
                         getitem_info=getitem_info,
                         dataloader_var=dataloader_var,
                         fallback_state=infer_fallback_state,
-                        rank=device,
                     )
                     _append_code(fb, codes, self._get_node_stream(node))
                     # release
@@ -625,8 +623,7 @@ class ScheduleCodeGen(FuncEmission):
 
     def emit_node(self, node: IRCell, force_no_grad: bool = False,
                   produced_tids: set = None, getitem_info: dict = None,
-                  dataloader_var: str = None, fallback_state: dict = None,
-                  rank: Optional[int] = None) -> List[str]:
+                  dataloader_var: str = None, fallback_state: dict = None) -> List[str]:
         """
         Emit node / subgraph code
         """

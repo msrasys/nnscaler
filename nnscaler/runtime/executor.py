@@ -141,7 +141,6 @@ class Executor:
         subgraph: Callable,
         *input_tensors: Tuple[Any],
         requires_grad=True,
-        trace_label: Optional[str] = None,
     ):
         """
         forward the sub-graph.
@@ -186,8 +185,7 @@ class Executor:
     def backward(name: str,
                  input_tensors: List[torch.Tensor],
                  output_tensors: List[torch.Tensor],
-                 output_tensor_grads: List[torch.Tensor],
-                 trace_label: Optional[str] = None) -> Tuple[torch.Tensor]:
+                 output_tensor_grads: List[torch.Tensor]) -> Tuple[torch.Tensor]:
         """
         Backward Procedure.
 
