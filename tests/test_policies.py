@@ -267,7 +267,8 @@ def megatron_ffn_policy_list(graph, cfg):
 
 
 @replace_all_device_with('cpu')
-def test_codegen_fn_pipeline(tmp_path):
+@pytest.mark.parametrize('pipeline_size_key', ['pp_size', 'pipeline_size'])
+def test_codegen_fn_pipeline(tmp_path, pipeline_size_key):
     parallelize(
         FnPolicyModuleList(),
         {'x': torch.randn(4, 4)},
@@ -276,7 +277,7 @@ def test_codegen_fn_pipeline(tmp_path):
         ComputeConfig(4, 4, use_end2end=True,
             pas_config={
                 'pipeline_nmicros': 2,
-                'pipeline_size': 2,
+                pipeline_size_key: 2,
             }
         ),
         gen_savedir=tmp_path,
@@ -425,6 +426,20 @@ def test_codegen_fn_pipeline(tmp_path):
     #     sum_1_306 = nnscaler.runtime.executor.aexecute(model.adapter160, *(), requires_grad=False)
     #     return sum_1_50, sum_1_306
     assert True
+
+
+def test_pipeline_size_aliases_must_match():
+    from nnscaler.policies import _get_configured_pipeline_size
+
+    assert _get_configured_pipeline_size({'pp_size': 2}) == 2
+    assert _get_configured_pipeline_size({'pipeline_size': 2}) == 2
+    assert _get_configured_pipeline_size({
+        'pp_size': 2, 'pipeline_size': 2,
+    }) == 2
+    with pytest.raises(ValueError, match='must match'):
+        _get_configured_pipeline_size({
+            'pp_size': 2, 'pipeline_size': 4,
+        })
 
 
 def sched_1f1b_multi_stream(graph: IRGraph, num_microbatches: int, num_stages: int) -> SchedulePlan:

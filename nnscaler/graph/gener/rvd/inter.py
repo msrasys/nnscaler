@@ -12,6 +12,7 @@ from nnscaler.ir.adapter.prim import MovePrim           # p2p
 from nnscaler.ir.adapter.prim import BroadcastPrim
 from nnscaler.ir.adapter.prim import RDScatterPrim, RVScatterPrim
 from nnscaler.ir.adapter.prim import RDGatherPrim, RVGatherPrim
+from nnscaler.ir.adapter.prim import SelectPrim
 
 from nnscaler.graph.gener.rvd.layout import RVDLayout
 from nnscaler.graph.gener.rvd.intra import IntraPathFinder
@@ -256,11 +257,114 @@ class InterPathFinder:
         ftensor: IRFullTensor = ilayout.ftensor
         cost_fn = InterPathFinder.default_cost_fn if cost_fn is None else cost_fn
 
+        direct_prims = InterPathFinder.direct_reshard(ilayout, olayout)
         inter_rvds: List[InterRVD] = InterPathFinder.get_optimal_path(
             ftensor, ilayout.vec, olayout.vec, cost_fn)
-
         all_prims = InterPathFinder.device_align(ilayout, olayout, inter_rvds)
+        if direct_prims is not None:
+            direct_cost = sum(map(cost_fn, direct_prims))
+            if direct_cost < sum(map(cost_fn, all_prims)):
+                return direct_prims
         return all_prims
+
+    @staticmethod
+    def direct_reshard(
+        ilayout: RVDLayout,
+        olayout: RVDLayout,
+    ) -> Optional[List[IRAdapterPrim]]:
+        """Reshard one spatial dimension into another across disjoint devices."""
+        src_rvd, dst_rvd = ilayout.vec, olayout.vec
+        if src_rvd[:2] != (1, 1) or dst_rvd[:2] != (1, 1):
+            return None
+        if len(src_rvd) != len(dst_rvd):
+            return None
+
+        decreased = [
+            dim for dim in range(2, len(src_rvd))
+            if src_rvd[dim] > dst_rvd[dim]
+        ]
+        increased = [
+            dim for dim in range(2, len(src_rvd))
+            if src_rvd[dim] < dst_rvd[dim]
+        ]
+        if len(decreased) != 1 or len(increased) != 1:
+            return None
+
+        gather_dim = decreased[0] - 2
+        split_dim = increased[0] - 2
+        gather_chunks = src_rvd[decreased[0]] // dst_rvd[decreased[0]]
+        split_chunks = dst_rvd[increased[0]] // src_rvd[increased[0]]
+        if (
+            gather_chunks <= 1
+            or gather_chunks != split_chunks
+            or src_rvd[decreased[0]] % dst_rvd[decreased[0]] != 0
+            or dst_rvd[increased[0]] % src_rvd[increased[0]] != 0
+        ):
+            return None
+
+        src_tensors = list(ilayout.mat.flatten())
+        dst_tensors = list(olayout.mat.flatten())
+        src_devices = [tensor.device[0] for tensor in src_tensors]
+        dst_devices = [tensor.device[0] for tensor in dst_tensors]
+        if (
+            len(set(src_devices)) != len(src_devices)
+            or len(set(dst_devices)) != len(dst_devices)
+            or not set(src_devices).isdisjoint(dst_devices)
+        ):
+            return None
+
+        selects = []
+        inputs_by_dst = {dst.tid: [] for dst in dst_tensors}
+        outputs_by_src = {src.tid: [] for src in src_tensors}
+        for src in src_tensors:
+            for dst in dst_tensors:
+                common = src.common(dst)
+                if common is None:
+                    continue
+                common.cell = src.cell
+                inputs_by_dst[dst.tid].append(common)
+                outputs_by_src[src.tid].append(common)
+                if common != src:
+                    relative_indmap = tuple(
+                        (
+                            common.indmap[dim][0] - src.indmap[dim][0],
+                            common.indmap[dim][1] - src.indmap[dim][0],
+                        )
+                        for dim in range(src.ndims)
+                    )
+                    selects.append(SelectPrim(src, relative_indmap, (0, 1), common))
+
+        for src in src_tensors:
+            chunks = sorted(
+                outputs_by_src[src.tid],
+                key=lambda tensor: tensor.indmap[split_dim][0],
+            )
+            if len(chunks) != split_chunks:
+                return None
+            merged = chunks[0]
+            for chunk in chunks[1:]:
+                merged = merged.concat(chunk, split_dim)
+            if merged != src:
+                return None
+
+        gathers = []
+        for dst in dst_tensors:
+            chunks = sorted(
+                inputs_by_dst[dst.tid],
+                key=lambda tensor: tensor.indmap[gather_dim][0],
+            )
+            if len(chunks) != gather_chunks:
+                return None
+            if any(chunk.shape != chunks[0].shape for chunk in chunks[1:]):
+                return None
+            merged = chunks[0]
+            for chunk in chunks[1:]:
+                merged = merged.concat(chunk, gather_dim)
+            if merged != dst:
+                return None
+            gathers.append(RDGatherPrim(chunks, [dst], dim=gather_dim))
+
+        return selects + gathers
 
     @staticmethod
     def device_align(ilayout: RVDLayout, olayout: RVDLayout,

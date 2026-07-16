@@ -587,6 +587,22 @@ def _identity_segment_output(graph: IRGraph, tensor: IRSubTensor, segment: IRSeg
     return fwop
 
 
+def _get_configured_pipeline_size(pas_config, default=None):
+    """Resolve the public ``pp_size`` key and its legacy alias."""
+    pp_size = pas_config.get('pp_size')
+    pipeline_size = pas_config.get('pipeline_size')
+    if (pp_size is not None and pipeline_size is not None
+            and pp_size != pipeline_size):
+        raise ValueError(
+            f'pp_size ({pp_size}) and pipeline_size ({pipeline_size}) '
+            'must match when both are set')
+    if pp_size is not None:
+        return pp_size
+    if pipeline_size is not None:
+        return pipeline_size
+    return default
+
+
 def fn(
         graph: IRGraph, cfg: 'ComputeConfig',
         policy: Union[
@@ -638,12 +654,12 @@ def fn(
     op_plans = {r.op: r for r in result}
     ngpus: int = cfg.plan_ngpus
     op_partition_ngpus = ngpus
-    configured_pp_size = cfg.pas_config.get('pipeline_size', None)
+    configured_pp_size = _get_configured_pipeline_size(cfg.pas_config)
     if configured_pp_size is not None:
         if configured_pp_size < 1:
-            raise ValueError("pipeline_size must be >= 1 when set")
+            raise ValueError("pp_size must be >= 1 when set")
         if ngpus % configured_pp_size != 0:
-            raise ValueError(f'invalid pipeline_size {configured_pp_size} for ngpus {ngpus}')
+            raise ValueError(f'invalid pp_size {configured_pp_size} for ngpus {ngpus}')
         op_partition_ngpus = ngpus // configured_pp_size
 
     recompute_groups: dict[int, list[IRFwOperation]] = {}
@@ -838,7 +854,7 @@ def fn(
     nstages = len(pp_stages)
     pp_enabled = nstages > 1
     # not all schedulers support pp_size < nstages
-    pp_size = cfg.pas_config.get('pipeline_size', nstages)
+    pp_size = _get_configured_pipeline_size(cfg.pas_config, nstages)
     nmicros = cfg.pas_config.get('pipeline_nmicros', None)
     scheduler = cfg.pas_config.get('pipeline_scheduler', '1f1b')
     pp_multiref_replicated_params = \
@@ -868,16 +884,16 @@ def fn(
             raise ValueError("Pipeline parallelism requires use_end2end to be True")
         if pp_size < 1:
             # not all schedulers support pp_size == 1
-            raise ValueError("pipeline_size must be >= 1 when pipeline is enabled")
+            raise ValueError("pp_size must be >= 1 when pipeline is enabled")
         if not nmicros:
             raise ValueError("nmicros must be set when pipeline is enabled")
         if nstages % pp_size != 0:
-            raise ValueError(f'invalid pipeline_size {pp_size} for nstages {nstages}')
+            raise ValueError(f'invalid pp_size {pp_size} for nstages {nstages}')
         if ngpus % pp_size != 0:
-            raise ValueError(f'invalid pipeline_size {pp_size} for ngpus {ngpus}')
+            raise ValueError(f'invalid pp_size {pp_size} for ngpus {ngpus}')
     else:
         if pp_size != 1:
-            raise ValueError("pipeline_size must be 1 when pipeline is disabled")
+            raise ValueError("pp_size must be 1 when pipeline is disabled")
 
     # set recompute groups
     for group in recompute_groups.values():

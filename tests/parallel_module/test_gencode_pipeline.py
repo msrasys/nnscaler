@@ -80,6 +80,14 @@ def test_gencode_correct_dataloader_order(tmp_path):
     rank0_dataloader_ops = _gencode_contains(tmp_path, PPModule1, 0, r'.*next\(\*\(dataloader\_.*')
     rank1_dataloader_ops = _gencode_contains(tmp_path, PPModule1, 1, r'.*next\(\*\(dataloader\_.*')
     assert rank0_dataloader_ops == rank1_dataloader_ops
+    assert _gencode_contains(
+        tmp_path, PPModule1, 0,
+        r'.*reserve_send_bundle\(\(\(0, 1\),\)\)',
+    )
+    assert _gencode_contains(
+        tmp_path, PPModule1, 1,
+        r'.*reserve_send_bundle\(\(\(1, 0\),\)\)',
+    )
     # code looks like:
     # rank1:
     # def _train_step(model, dataloader_33):
@@ -286,6 +294,20 @@ class SplitSegmentModule(torch.nn.Module):
         return loss
 
 
+class CrossDimSegmentModule(torch.nn.Module):
+    def __init__(self, dim: int = 64):
+        super().__init__()
+        self.layers = torch.nn.ModuleList([
+            torch.nn.Linear(dim, dim, bias=False),
+            torch.nn.Linear(dim, dim, bias=False),
+        ])
+
+    def forward(self, data: torch.Tensor):
+        x = torch.nn.functional.gelu(self.layers[0](data))
+        x = self.layers[1](x)
+        return x.sum()
+
+
 def split_segment_pas(graph, cfg):
     from nnscaler.policies import OpPlan, OpPartition, get_layer_index, get_pas_ops
 
@@ -300,6 +322,23 @@ def split_segment_pas(graph, cfg):
                 yield OpPlan(node, stage_id=last_stage_id, partition=OpPartition(input=0, dim=0))
             else:
                 yield OpPlan(node, stage_id=last_stage_id)
+
+
+def cross_dim_segment_pas(graph, cfg):
+    from nnscaler.policies import OpPlan, OpPartition, get_layer_index, get_pas_ops
+
+    stage_id = 0
+    for node in get_pas_ops(graph):
+        if torch.nn.modules.linear.Linear in node.module_class_chain:
+            stage_id = get_layer_index(node.fqn)
+            yield OpPlan(
+                node,
+                stage_id=stage_id,
+                partition=OpPartition(input=0, dim=stage_id),
+            )
+        else:
+            partition = OpPartition(input=0, dim=0) if stage_id == 0 else 'auto'
+            yield OpPlan(node, stage_id=stage_id, partition=partition)
 
 
 @replace_all_device_with('cpu')
@@ -335,4 +374,47 @@ def test_gencode_split_segment(tmp_path):
     )
     assert _gencode_contains(
         tmp_path, SplitSegmentModule, 6, r'nnscaler.runtime.adapter.nn.allreduce_identity\(sum_.*, ranks=\[6, 7\]\)'
+    )
+
+
+@replace_all_device_with('cpu')
+def test_gencode_cross_stage_direct_reshard(tmp_path):
+    parallelize(
+        CrossDimSegmentModule(),
+        {'data': torch.randn(64, 64)},
+        pas_policy=cross_dim_segment_pas,
+        compute_config=ComputeConfig(
+            4,
+            4,
+            constant_folding=False,
+            use_end2end=True,
+            pas_config={
+                'pipeline_nmicros': 2,
+                'pipeline_nstages': 2,
+                'pipeline_scheduler': '1f1b',
+            },
+        ),
+        gen_savedir=tmp_path,
+        load_module=False,
+        reuse='override',
+    )
+
+    for rank in range(4):
+        assert _gencode_contains(
+            tmp_path,
+            CrossDimSegmentModule,
+            rank,
+            r'nnscaler.runtime.adapter.rdgather',
+        )
+    assert _gencode_contains(
+        tmp_path,
+        CrossDimSegmentModule,
+        0,
+        r'init_p2p_groups\(pairs=\[\(0, 2\), \(0, 3\), \(1, 2\), \(1, 3\)\]\)',
+    )
+    assert _gencode_contains(
+        tmp_path,
+        CrossDimSegmentModule,
+        0,
+        r'reserve_send_bundle\(\(\(0, 2\), \(0, 3\)\)\)',
     )

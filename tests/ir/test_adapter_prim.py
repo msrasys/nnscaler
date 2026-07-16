@@ -1,7 +1,7 @@
 #  Copyright (c) Microsoft Corporation.
 #  Licensed under the MIT License.
 
-from nnscaler.ir.adapter.prim import AllGatherPrim, ChunkPrim
+from nnscaler.ir.adapter.prim import AllGatherPrim, ChunkPrim, RVGatherPrim
 from nnscaler.ir.cten import IR
 from nnscaler.ir.tensor import IRFullTensor
 
@@ -36,3 +36,17 @@ def test_chunk_preserves_logical_partition_rank_order():
     prim = ChunkPrim(inputs, outputs, dim=0)
 
     assert prim.kwargs['ranks'] == (0, 2, 1, 3)
+
+
+def test_rvgather_uses_input_devices_as_sources():
+    full = IRFullTensor((16,))
+    inputs = [
+        _set_device(full.tosub(), 2),
+        _set_device(full.tosub(), 1),
+    ]
+    output = _set_device(full.tosub(), 0)
+
+    prim = RVGatherPrim(inputs, [output])
+
+    assert prim.kwargs['srcs'] == (2, 1)
+    assert prim.kwargs['dst'] == 0

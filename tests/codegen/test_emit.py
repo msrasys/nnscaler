@@ -4,9 +4,10 @@
 import pytest
 import torch
 from nnscaler.codegen.emit import CodeEmission, IRValue
-from nnscaler.ir.cten import IRCell, IRObject
+from nnscaler.ir.cten import IR, IRCell, IRObject
 from nnscaler.codegen.emit import FuncEmission
 from nnscaler.codegen.module.module import ModuleCodeGen
+from nnscaler.codegen.schedule.schedule import ScheduleCodeGen
 from nnscaler.execplan import ExecutionPlan
 from nnscaler.graph.function import Dropout
 from nnscaler.graph.function.function import MultiRef
@@ -16,7 +17,12 @@ from nnscaler.graph.schedule.schedplan import SchedulePlan
 from nnscaler.graph.segment import IRSegment
 from nnscaler.flags import CompileFlag
 from nnscaler.ir.adapter import IRAdapter
-from nnscaler.ir.adapter.prim import ChunkPrim, MovePrim
+from nnscaler.ir.adapter.prim import (
+    ChunkPrim,
+    MovePrim,
+    RDGatherPrim,
+    SelectPrim,
+)
 from nnscaler.ir.tensor import IRFullTensor
 
 
@@ -31,6 +37,48 @@ def _make_send_adapter(src=None):
     adapter.prims = [
         ChunkPrim([src], [chunk], dim=0, ranks=[0, 1]),
         MovePrim([chunk], [], shape=(4, 4), dtype='torch.float32', src=0, dst=1),
+    ]
+    return adapter
+
+
+def _make_grad_send_adapter():
+    src = IRFullTensor(
+        (8, 4), name='gx', requires_grad=True, dtype=torch.float32
+    ).grad.tosub()
+    adapter = IRAdapter([src], [])
+    adapter.device = [0]
+    adapter.prims = [
+        MovePrim([src], [], shape=(8, 4), dtype='torch.float32', src=0, dst=1),
+    ]
+    return adapter
+
+
+def _make_direct_reshard_send_adapter():
+    full = IRFullTensor(
+        (8, 8), name='reshard', requires_grad=True, dtype=torch.float32,
+    )
+    src = IR.set_object_device(
+        full.select(((0, 4), (0, 8)), (0, 1)), 0,
+    )
+    chunks = [
+        IR.set_object_device(
+            full.select(((0, 4), (start, start + 4)), (0, 1)), 0,
+        )
+        for start in (0, 4)
+    ]
+    adapter = IRAdapter([src], [])
+    adapter.device = [0]
+    adapter.prims = [
+        SelectPrim(src, ((0, 4), (0, 4)), (0, 1), chunks[0]),
+        SelectPrim(src, ((0, 4), (4, 8)), (0, 1), chunks[1]),
+        RDGatherPrim(
+            [chunks[0]], [], dim=0, shape=(4, 4),
+            dtype='torch.float32', srcs=(0, 1), dst=2,
+        ),
+        RDGatherPrim(
+            [chunks[1]], [], dim=0, shape=(4, 4),
+            dtype='torch.float32', srcs=(0, 1), dst=3,
+        ),
     ]
     return adapter
 
@@ -119,7 +167,42 @@ def test_emit_pipeline_output_release_after_send(monkeypatch):
     assert 'release_after_send=x_chunk' not in code
 
 
-def test_emit_pipeline_output_release_after_send_disabled_by_default(monkeypatch):
+def test_emit_direct_reshard_releases_source_after_all_sends(monkeypatch):
+    monkeypatch.setattr(CompileFlag, 'pipeline_output_pseudo_free', True)
+    adapter = _make_direct_reshard_send_adapter()
+
+    code = '\n'.join(FuncEmission().emit_adapter(
+        adapter,
+        async_op=True,
+        pseudo_free_source_tids={adapter.input(0).tid},
+    ))
+
+    assert code.count('nnscaler.runtime.adapter.rdgather') == 2
+    assert code.count('async_op=True') == 2
+    assert code.count('release_after_send=reshard_') == 2
+
+
+def test_emit_direct_reshard_recv_waits_before_use():
+    full = IRFullTensor((8, 4), name='gathered', dtype=torch.float32)
+    output = IR.set_object_device(full.tosub(), 2)
+    adapter = IRAdapter([], [output])
+    adapter.prims = [RDGatherPrim(
+        [], [output], dim=0, shape=(4, 4), dtype='torch.float32',
+        srcs=(0, 1), dst=2,
+    )]
+    emission = FuncEmission()
+
+    assert emission.is_async_recv_adapter(adapter)
+    recv_code = '\n'.join(emission.emit_adapter(adapter, async_op=True))
+    wait_code = '\n'.join(emission.emit_async_recv_adapter_wait(adapter))
+
+    assert 'rdgather((), ' in recv_code
+    assert 'async_op=True' in recv_code
+    assert 'AsyncCommHandler().wait(__pending)' in wait_code
+    assert f'{emission.tensor_name(output)} = __pending' in wait_code
+
+
+def test_emit_pipeline_output_release_after_send_can_be_disabled(monkeypatch):
     monkeypatch.setattr(CompileFlag, 'pipeline_output_pseudo_free', False)
     adapter = _make_send_adapter()
     code = '\n'.join(FuncEmission().emit_adapter(
@@ -216,3 +299,38 @@ def test_pipeline_output_release_skips_multiref_alias(monkeypatch):
     )
 
     assert eligible == set()
+
+
+def test_schedule_groups_adjacent_pipeline_sends_into_one_bundle():
+    segment, first = _make_pipeline_boundary()
+    second = _make_send_adapter(first.input(0))
+
+    events = ScheduleCodeGen._collect_send_bundle_ranges([segment, first, second], device=0)
+
+    assert events == {
+        0: [('reserve', ((0, 1),))],
+        1: [('begin', ((0, 1),))],
+        2: [('end', ((0, 1),))],
+    }
+
+
+def test_schedule_does_not_merge_forward_and_backward_send_bundles():
+    backward = _make_grad_send_adapter()
+    forward = _make_send_adapter()
+
+    events = ScheduleCodeGen._collect_send_bundle_ranges(
+        [backward, forward], device=0,
+    )
+
+    assert events == {
+        0: [
+            ('reserve', ((0, 1),)),
+            ('begin', ((0, 1),)),
+            ('end', ((0, 1),)),
+        ],
+        1: [
+            ('reserve', ((0, 1),)),
+            ('begin', ((0, 1),)),
+            ('end', ((0, 1),)),
+        ],
+    }

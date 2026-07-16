@@ -4,6 +4,7 @@
 from typing import List, Tuple
 import nnscaler
 from nnscaler.ir.tensor import IRFullTensor
+from nnscaler.ir.adapter.prim import RDGatherPrim, SelectPrim
 from nnscaler.graph.gener.rvd.layout import RVDLayout, RVDInspector
 from nnscaler.graph.gener.rvd.inter import InterPathFinder
 import numpy as np
@@ -73,6 +74,39 @@ def test_one_f_case():
     assert fprims[12].device == [10, 14]
     assert fprims[13].signature == 'nnscaler.runtime.adapter.all_gather'
     assert fprims[13].device == [11, 15]
+
+
+def test_direct_cross_stage_spatial_reshard_and_inverse(monkeypatch):
+    ftensor = IRFullTensor(
+        shape=(16, 8), name='tensor', requires_grad=True,
+    )
+    token_sharded = RVDLayout.grid(
+        ftensor, r=1, v=1, dims=(2, 1), devices=(0, 1),
+    )
+    hidden_sharded = RVDLayout.grid(
+        ftensor, r=1, v=1, dims=(1, 2), devices=(2, 3),
+    )
+
+    forward_prims = InterPathFinder.path(token_sharded, hidden_sharded)
+    backward_prims = InterPathFinder.path(hidden_sharded, token_sharded)
+
+    monkeypatch.setattr(InterPathFinder, 'direct_reshard', lambda *_: None)
+    fallback_prims = InterPathFinder.path(token_sharded, hidden_sharded)
+    assert sum(prim.volume() for prim in forward_prims) < sum(
+        prim.volume() for prim in fallback_prims
+    )
+
+    for prims, gather_dim, destinations in (
+        (forward_prims, 0, {2, 3}),
+        (backward_prims, 1, {0, 1}),
+    ):
+        assert len([prim for prim in prims if isinstance(prim, SelectPrim)]) == 4
+        gathers = [prim for prim in prims if isinstance(prim, RDGatherPrim)]
+        assert len(gathers) == 2
+        assert {prim.kwargs['dst'] for prim in gathers} == destinations
+        assert all(prim.kwargs['dim'] == gather_dim for prim in gathers)
+        assert all(len(prim.inputs()) == 2 for prim in gathers)
+        assert sum(prim.volume() for prim in gathers) == ftensor.nelement()
 
 
 def test_all_f_cases_fix_placement():

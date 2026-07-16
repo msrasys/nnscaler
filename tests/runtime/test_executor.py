@@ -202,3 +202,46 @@ def test_async_send_callback_runs_when_drained():
         AsyncCommHandler().check_clear()
     finally:
         AsyncCommHandler().clear()
+
+
+def test_send_bundle_waits_for_oldest_bundle_at_window_limit():
+    class Work:
+        def __init__(self):
+            self.waited = False
+
+        def wait(self):
+            self.waited = True
+
+    handler = AsyncCommHandler()
+    handler.clear()
+    try:
+        works = [Work() for _ in range(3)]
+        callbacks = [False, False, False]
+
+        for index in range(2):
+            AsyncCommHandler().reserve_send_bundle(((0, 1),))
+            AsyncCommHandler().begin_send_bundle(((0, 1),))
+            AsyncCommHandler().hold_send(
+                torch.empty(1),
+                works[index],
+                callback=lambda index=index: callbacks.__setitem__(index, True),
+            )
+            AsyncCommHandler().end_send_bundle()
+
+        AsyncCommHandler().reserve_send_bundle(((0, 1),))
+        assert works[0].waited
+        assert callbacks == [True, False, False]
+        AsyncCommHandler().begin_send_bundle(((0, 1),))
+        AsyncCommHandler().hold_send(
+            torch.empty(1),
+            works[2],
+            callback=lambda: callbacks.__setitem__(2, True),
+        )
+        AsyncCommHandler().end_send_bundle()
+
+        handler.drain()
+        assert all(work.waited for work in works)
+        assert callbacks == [True, True, True]
+        handler.check_clear()
+    finally:
+        handler.clear()

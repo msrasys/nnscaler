@@ -43,8 +43,8 @@ class CompileFlag:
     async_comm = _to_bool('ASYNC_COMM')
     line_timer = _to_bool('LINE_TIMER')
     # Pseudo-free sent pipeline outputs after their p2p send has completed.
-    # This is experimental and disabled by default.
-    pipeline_output_pseudo_free = _to_bool('PIPELINE_OUTPUT_PSEUDO_FREE')
+    # Set PIPELINE_OUTPUT_PSEUDO_FREE=0 to disable it.
+    pipeline_output_pseudo_free = _to_bool('PIPELINE_OUTPUT_PSEUDO_FREE', True)
 
     # ============== reducer ==================
     # use zero optimization on optimizer status.

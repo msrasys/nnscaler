@@ -20,14 +20,6 @@ except ImportError:
     get_gradient_edge = None
 
 
-def debug_id(tensors, msg: str, rank: int):
-    if torch.distributed.get_rank() == rank:
-        if torch.is_tensor(tensors):
-            print(f'[{torch.distributed.get_rank()}] {msg}: [{id(tensors)}]')
-        else:
-            print(f'[{torch.distributed.get_rank()}] {msg}: {[id(t) for t in tensors]}')
-
-
 class AsyncCommHandler:
 
     class __AsyncCommHandler:
@@ -35,6 +27,8 @@ class AsyncCommHandler:
             self._works: Dict[int, List] = {}
             self._callbacks: Dict[int, Callable] = {}
             self._send_holds: List = []
+            self._send_bundle_queues: Dict[Any, List[List]] = {}
+            self._active_send_bundle: Optional[Tuple[Any, List]] = None
 
     instance = None
 
@@ -70,15 +64,57 @@ class AsyncCommHandler:
         self._callbacks[id(tensor)] = callback
 
     def hold_send(self, tensor: torch.Tensor, work, callback: Optional[Callable] = None):
-        self._send_holds.append((tensor, work, callback))
+        hold = (tensor, work, callback)
+        state = self.instance
+        if state._active_send_bundle is None:
+            state._send_holds.append(hold)
+        else:
+            state._active_send_bundle[1].append(hold)
+
+    @staticmethod
+    def _complete_send_holds(holds):
+        for _, work, callback in holds:
+            work.wait()
+            if callback is not None:
+                callback()
+
+    def reserve_send_bundle(self, key, max_pending: int = 2):
+        """Wait for capacity before materializing another pipeline output."""
+        if max_pending < 1:
+            raise ValueError(f'max_pending must be positive, got {max_pending}')
+
+        queue = self._send_bundle_queues.setdefault(key, [])
+        while len(queue) >= max_pending:
+            self._complete_send_holds(queue.pop(0))
+
+    def begin_send_bundle(self, key):
+        """Start collecting sends for one pipeline boundary."""
+        state = self.instance
+        if state._active_send_bundle is not None:
+            raise RuntimeError('A send bundle is already active')
+        state._active_send_bundle = (key, [])
+
+    def end_send_bundle(self):
+        """Commit the active pipeline-boundary send bundle."""
+        state = self.instance
+        if state._active_send_bundle is None:
+            raise RuntimeError('No send bundle is active')
+        key, holds = state._active_send_bundle
+        state._active_send_bundle = None
+        if holds:
+            state._send_bundle_queues.setdefault(key, []).append(holds)
 
     def drain_sends(self, wait: bool = True):
+        if self._active_send_bundle is not None:
+            raise RuntimeError('Cannot drain sends while a send bundle is active')
+
         if wait:
-            for _, work, callback in self._send_holds:
-                work.wait()
-                if callback is not None:
-                    callback()
+            self._complete_send_holds(self._send_holds)
             self._send_holds.clear()
+            for queue in self._send_bundle_queues.values():
+                for bundle in queue:
+                    self._complete_send_holds(bundle)
+            self._send_bundle_queues.clear()
             return
 
         pending = []
@@ -108,9 +144,17 @@ class AsyncCommHandler:
         AsyncCommHandler.instance = AsyncCommHandler.__AsyncCommHandler()
 
     def check_clear(self):
-        assert len(self._works) == 0 and len(self._callbacks) == 0 and len(self._send_holds) == 0, (
+        assert (
+            len(self._works) == 0
+            and len(self._callbacks) == 0
+            and len(self._send_holds) == 0
+            and len(self._send_bundle_queues) == 0
+            and self._active_send_bundle is None
+        ), (
             f"AsyncCommHandler is not clear: works={len(self._works)}, "
-            f"callbacks={len(self._callbacks)}, send_holds={len(self._send_holds)}"
+            f"callbacks={len(self._callbacks)}, send_holds={len(self._send_holds)}, "
+            f"send_bundle_queues={len(self._send_bundle_queues)}, "
+            f"active_send_bundle={self._active_send_bundle is not None}"
         )
 
 

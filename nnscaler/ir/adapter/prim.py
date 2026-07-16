@@ -348,7 +348,7 @@ class RVGatherPrim(CollectivePrim):
             assert len(otensors) == 1
             kwargs['shape'] = itensors[0].origin_shape
             kwargs['dtype'] = str(itensors[0].dtype)
-            kwargs['srcs'] = tuple(otensor.device[0] if len(otensor.device) > 0 else None for otensor in otensors)
+            kwargs['srcs'] = tuple(itensor.device[0] if len(itensor.device) > 0 else None for itensor in itensors)
             kwargs['dst'] = otensors[0].device[0] if len(otensors[0].device) > 0 else None
         shape, dtype, srcs, dst = kwargs['shape'], kwargs['dtype'], kwargs['srcs'], kwargs['dst']
         super().__init__(itensors, otensors, shape=shape, dtype=dtype, srcs=srcs, dst=dst)

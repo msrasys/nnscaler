@@ -77,6 +77,8 @@ class ScheduleCodeGen(FuncEmission):
         # when we use scheduler (i.e. pipeline parallelism)
         # Otherwise, the caller of `_train_step` will set these flags to support gradient accumulation
         use_scheduler = self.execplan.graph.sched is not None
+        send_bundle_ranges = self._collect_send_bundle_ranges(device_nodes, device_map) \
+            if use_scheduler else {}
 
         assert all(not isinstance(n, IRFwOperation) for n in device_nodes), \
             "Expected all forward operators have been grouped into IRSegment"
@@ -148,6 +150,20 @@ class ScheduleCodeGen(FuncEmission):
                 buffered_codes.clear()
                 last_stream = None
 
+        def _append_send_bundle_events(fb: FunctionBlock, events, before_node: bool):
+            methods = {
+                'reserve': 'reserve_send_bundle',
+                'begin': 'begin_send_bundle',
+            } if before_node else {'end': 'end_send_bundle'}
+            for event_name, bundle_key in events:
+                if method_name := methods.get(event_name):
+                    args = repr(bundle_key) if event_name != 'end' else ''
+                    _append_code(
+                        fb,
+                        'nnscaler.runtime.executor.AsyncCommHandler()'
+                        f'.{method_name}({args})',
+                    )
+
         with FunctionBlock(func_name='_train_step',
                            args=args) as fb:
             _append_code(fb, '_ = None')
@@ -200,6 +216,8 @@ class ScheduleCodeGen(FuncEmission):
                 pending_async_recvs = {}
                 for line, node in enumerate(device_nodes):
                     unwrap_node = node.cell if isinstance(node, ExeReuseCell) else node
+                    bundle_events = send_bundle_ranges.get(line, ())
+                    _append_send_bundle_events(fb, bundle_events, before_node=True)
                     wait_codes = self._emit_async_recv_waits(node, pending_async_recvs, produced_tids)
                     if wait_codes:
                         _append_code(fb, wait_codes, self._get_node_stream(node))
@@ -234,6 +252,7 @@ class ScheduleCodeGen(FuncEmission):
                     for out in IRSegment.get_objects_from_complex(node.outputs()):
                         if isinstance(out, IRObject):
                             produced_tids.add(out.tid)
+                    _append_send_bundle_events(fb, bundle_events, before_node=False)
             # return code
             outputs = self.return_name_complex(self.execplan.outputs())
             _append_code(fb, 'nnscaler.runtime.executor.AsyncCommHandler().drain()')
@@ -266,6 +285,8 @@ class ScheduleCodeGen(FuncEmission):
                 infer_pending_async_recvs = {}
                 for line, node in enumerate(device_nodes):
                     if not node.isfw(): continue  # skip backward segments and adapters
+                    bundle_events = send_bundle_ranges.get(line, ())
+                    _append_send_bundle_events(fb, bundle_events, before_node=True)
                     wait_codes = self._emit_async_recv_waits(
                         node, infer_pending_async_recvs, infer_produced_tids
                     )
@@ -291,6 +312,7 @@ class ScheduleCodeGen(FuncEmission):
                     for out in IRSegment.get_objects_from_complex(node.outputs()):
                         if isinstance(out, IRObject):
                             infer_produced_tids.add(out.tid)
+                    _append_send_bundle_events(fb, bundle_events, before_node=False)
                 # return code
                 outputs = self.return_name_complex(self.execplan.outputs())
                 _append_code(fb, 'nnscaler.runtime.executor.AsyncCommHandler().drain()')
@@ -307,6 +329,64 @@ class ScheduleCodeGen(FuncEmission):
             with open(outfile, 'a' if attach else 'w') as f:
                 f.write(code)
         return code
+
+    @classmethod
+    def _pipeline_send_key(cls, node: IRCell, device: int):
+        unwrap_node = node.cell if isinstance(node, ExeReuseCell) else node
+        if not isinstance(unwrap_node, IRAdapter):
+            return None
+
+        links = set()
+        for prim in unwrap_node.prims:
+            if len(prim.inputs()) == 0:
+                continue
+            links.update(
+                (src, dst)
+                for src, dst in cls._p2p_endpoints(prim)
+                if src == device
+            )
+        return tuple(sorted(links)) or None
+
+    @classmethod
+    def _collect_send_bundle_ranges(cls, nodes: List[IRCell], device: int):
+        """Group adjacent pipeline sends to the same physical link into bundles."""
+        events = {}
+        line = 0
+        while line < len(nodes):
+            key = cls._pipeline_send_key(nodes[line], device)
+            if key is None:
+                line += 1
+                continue
+
+            end = line
+            is_forward = nodes[line].isfw()
+            while (
+                end + 1 < len(nodes)
+                and nodes[end + 1].isfw() == is_forward
+                and cls._pipeline_send_key(nodes[end + 1], device) == key
+            ):
+                end += 1
+            input_tids = {
+                inp.tid
+                for send_node in nodes[line:end + 1]
+                for inp in IRSegment.get_objects_from_complex(send_node.inputs())
+                if isinstance(inp, IRObject)
+            }
+            reserve_line = line
+            for candidate in range(line - 1, -1, -1):
+                output_tids = {
+                    out.tid
+                    for out in IRSegment.get_objects_from_complex(nodes[candidate].outputs())
+                    if isinstance(out, IRObject)
+                }
+                if input_tids.intersection(output_tids):
+                    reserve_line = candidate
+                    break
+            events.setdefault(reserve_line, []).append(('reserve', key))
+            events.setdefault(line, []).append(('begin', key))
+            events.setdefault(end, []).append(('end', key))
+            line = end + 1
+        return events
 
     def _get_node_stream_context(self, node: IRCell):
         unwrap_node = node.cell if isinstance(node, ExeReuseCell) else node
