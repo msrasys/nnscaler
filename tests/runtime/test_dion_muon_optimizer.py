@@ -6,16 +6,18 @@ from copy import deepcopy
 import pytest
 import torch
 
+
+try:
+    from dion.muon import Muon as _DionMuon  # noqa: F401
+except ImportError:
+    pytest.skip("Dion Muon not available", allow_module_level=True)
+
+
 from nnscaler.runtime.adapter.reducer import FlattenParamInfo, ReducerParamInfo
-from nnscaler.runtime.dion_muon_optimizer import (
-    DionMuon,
-    MixedPrecisionDionMuon,
-)
+from nnscaler.runtime.dion_optimizer import Muon as DionMuon
+from nnscaler.runtime.f16_optimizer import MixedPrecisionDionMuon
 from nnscaler.runtime.hybrid_optimizer import HybridOptimizer
 from nnscaler.runtime.utils import set_fparam_meta
-
-
-pytest.importorskip('dion.muon')
 
 
 def _identity_newton_schulz(tensor, epsilon=1e-7):
