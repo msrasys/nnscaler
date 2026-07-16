@@ -328,8 +328,7 @@ def rvscatter(itensor: torch.Tensor, shape: Tuple[int], dtype: torch.dtype,
 
 
 def rdgather(itensor: torch.Tensor, shape: Tuple[int], dtype: torch.dtype,
-             dim: int, srcs: Tuple[int], dst: int, async_op=False,
-             release_after_send: Optional[torch.Tensor] = None):
+             dim: int, srcs: Tuple[int], dst: int, async_op=False):
     """
     @param srcs Tuple[int]: global rank of each source device
     @param dst int: global rank of destination device
@@ -373,20 +372,13 @@ def rdgather(itensor: torch.Tensor, shape: Tuple[int], dtype: torch.dtype,
             else:
                 work = torch.distributed.isend(
                     otensor, group=group, group_dst=group_dst)
-            callback = None
-            if release_after_send is not None:
-                defer_pseudo_free_tensor(release_after_send)
-                callback = lambda: complete_deferred_pseudo_free_tensor(
-                    release_after_send)
-            AsyncCommHandler().hold_send(otensor, work, callback=callback)
+            AsyncCommHandler().hold_send(otensor, work)
         else:
             if group is None:
                 torch.distributed.send(otensor, dst)
             else:
                 torch.distributed.send(
                     otensor, group=group, group_dst=group_dst)
-            if release_after_send is not None:
-                pseudo_free_tensor(release_after_send)
     if not async_op:
         CudaTimer().stop(field_name='comm', predefined=True)
     return otensor

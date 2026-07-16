@@ -26,12 +26,7 @@ from ..launch_torchrun import clone_to_cpu_recursively, launch_torchrun
 from ..utils import replace_all_device_with, clear_dir_on_rank0, PYTEST_RUN_ID
 
 from .test_checkpoint import End2EndMLP
-from .test_gencode_pipeline import (
-    CrossDimSegmentModule,
-    SplitSegmentModule,
-    cross_dim_segment_pas,
-    split_segment_pas,
-)
+from .test_gencode_pipeline import SplitSegmentModule, split_segment_pas
 
 
 DATA_SIZE = 64
@@ -207,16 +202,16 @@ def allclose(a, b, atol=1e-6, rtol=1e-6):
         assert torch.allclose(a[step][-1].cpu(), b[step][-1].cpu(), atol=atol, rtol=rtol)
 
 
-def _pipeline_boundary_worker(model_cls, policy, nmicros):
+def _narrowed_boundary_worker():
     dim = 16
+    nmicros = 4
     init_distributed()
-    test_dir = Path(tempfile.gettempdir()) / f'{model_cls.__name__}_{PYTEST_RUN_ID}'
-    with clear_dir_on_rank0(test_dir) as tempdir:
+    with clear_dir_on_rank0(Path(tempfile.gettempdir()) / f'narrowed_boundary_{PYTEST_RUN_ID}') as tempdir:
         init_random()
         model = parallelize(
-            model_cls(dim),
+            SplitSegmentModule(dim),
             {'data': torch.randn(8, dim)},
-            pas_policy=policy,
+            pas_policy=split_segment_pas,
             compute_config=ComputeConfig(
                 4,
                 4,
@@ -224,7 +219,6 @@ def _pipeline_boundary_worker(model_cls, policy, nmicros):
                 use_end2end=True,
                 pas_config={
                     'pipeline_nmicros': nmicros,
-                    'pipeline_nstages': 2,
                     'pipeline_scheduler': '1f1b',
                 },
             ),
@@ -239,41 +233,29 @@ def _pipeline_boundary_worker(model_cls, policy, nmicros):
         return clone_to_cpu_recursively(grads)
 
 
-def _assert_pipeline_boundary_grads(model_cls, policy, nmicros):
+@pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.device_count() < 4, reason='lack of gpu devices')
+def test_narrowed_pipeline_boundary():
     dim = 16
-    results = launch_torchrun(
-        4, _pipeline_boundary_worker, model_cls, policy, nmicros,
-    )
+    nmicros = 4
+    results = launch_torchrun(4, _narrowed_boundary_worker)
     merged_grads, _ = merge_state_dicts([results[rank] for rank in range(4)])
 
     torch.cuda.set_device(0)
     with torch.device('cuda:0'):
         init_random()
-        reference = model_cls(dim)
+        reference = SplitSegmentModule(dim)
         init_random()
         losses = [reference(torch.randn(8, dim)) for _ in range(nmicros)]
         torch.stack(losses).sum().backward()
 
     reference_grads = {
-        name: param.grad
+        name: param.grad.cpu()
         for name, param in reference.named_parameters()
         if param.grad is not None
     }
     assert merged_grads.keys() == reference_grads.keys()
     for name, grad in reference_grads.items():
-        torch.testing.assert_close(merged_grads[name], grad.cpu(), atol=1e-5, rtol=1e-5)
-
-
-@pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.device_count() < 4, reason='lack of gpu devices')
-def test_narrowed_pipeline_boundary():
-    _assert_pipeline_boundary_grads(SplitSegmentModule, split_segment_pas, 4)
-
-
-@pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.device_count() < 4, reason='lack of gpu devices')
-def test_cross_stage_direct_reshard():
-    _assert_pipeline_boundary_grads(
-        CrossDimSegmentModule, cross_dim_segment_pas, 2,
-    )
+        torch.testing.assert_close(merged_grads[name], grad, atol=1e-5, rtol=1e-5)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.device_count() < 4, reason='lack of gpu devices')

@@ -14,7 +14,7 @@ from nnscaler.ir.cten import IRCell, IRTensor
 from nnscaler.ir.tensor import IRFullTensor, IRSubTensor
 from nnscaler.ir.operator import IRBpOperation, IRDataOperation, IRFwOperation
 from nnscaler.ir.adapter import IRWeightReducer, IRAdapter
-from nnscaler.ir.adapter.prim import CollectivePrim, IdentityPrim
+from nnscaler.ir.adapter.prim import CollectivePrim, IdentityPrim, MovePrim
 
 from nnscaler.graph.graph import IRSegment
 from nnscaler.graph.parser.register import CustomizedOps
@@ -374,24 +374,22 @@ class ModuleCodeGen(FuncEmission):
 
     def get_p2p_pairs(self):
         """
-        Scale real P2P endpoints to runtime devices.
+        Scale real P2P MovePrim endpoints to runtime devices.
         """
         nreplica = self.runtime_ndevs // len(self.devices)
         pairs = set()
         for adapter in self.execplan.graph.select(ntype=IRAdapter):
             for prim in adapter.prims:
-                for src, dst in self._p2p_endpoints(prim):
-                    if src is None or dst is None or src == dst:
-                        continue
-                    for i in range(nreplica):
-                        shifted_src = int(src) + i * len(self.devices)
-                        shifted_dst = int(dst) + i * len(self.devices)
-                        pair = (
-                            (shifted_src, shifted_dst)
-                            if shifted_src < shifted_dst
-                            else (shifted_dst, shifted_src)
-                        )
-                        pairs.add(pair)
+                if not isinstance(prim, MovePrim):
+                    continue
+                src, dst = prim.kwargs['src'], prim.kwargs['dst']
+                if src is None or dst is None or src == dst:
+                    continue
+                for i in range(nreplica):
+                    shifted_src = int(src) + i * len(self.devices)
+                    shifted_dst = int(dst) + i * len(self.devices)
+                    pair = (shifted_src, shifted_dst) if shifted_src < shifted_dst else (shifted_dst, shifted_src)
+                    pairs.add(pair)
         return sorted(pairs)
 
     def scale(self, node: IRCell, device: int) -> IRCell:
@@ -597,12 +595,10 @@ class ModuleCodeGen(FuncEmission):
             elif isinstance(node, IRFwOperation):
                 raise RuntimeError(f"Unexcepted global-level op call: {node}")
             elif isinstance(node, IRAdapter):
-                from nnscaler.ir.adapter.prim import CommPrim, ChunkPrim, VChunkPrim
-                has_p2p = any(self._p2p_endpoints(prim) for prim in node.prims)
+                from nnscaler.ir.adapter.prim import MovePrim, CommPrim, ChunkPrim, VChunkPrim
+                has_p2p = any(isinstance(prim, MovePrim) for prim in node.prims)
                 has_other_comm = any(
-                    isinstance(prim, CommPrim)
-                    and not self._p2p_endpoints(prim)
-                    and not isinstance(prim, (ChunkPrim, VChunkPrim))
+                    isinstance(prim, CommPrim) and not isinstance(prim, (MovePrim, ChunkPrim, VChunkPrim))
                     for prim in node.prims
                 )
                 codes = self.emit_adapter(

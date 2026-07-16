@@ -11,6 +11,7 @@ from nnscaler.ir.cten import IRCell, IRObject, IRTensor, IR
 from nnscaler.ir.operator import IRDataOperation, IRFwOperation
 from nnscaler.ir.tensor import IRSubTensor
 from nnscaler.ir.adapter import IRWeightReducer, IRAdapter
+from nnscaler.ir.adapter.prim import MovePrim
 from nnscaler.graph.graph import IRSegment
 
 from nnscaler.execplan.execplan import ExecutionPlan, ExeReuseCell
@@ -330,21 +331,19 @@ class ScheduleCodeGen(FuncEmission):
                 f.write(code)
         return code
 
-    @classmethod
-    def _pipeline_send_key(cls, node: IRCell, device: int):
+    @staticmethod
+    def _pipeline_send_key(node: IRCell, device: int):
         unwrap_node = node.cell if isinstance(node, ExeReuseCell) else node
         if not isinstance(unwrap_node, IRAdapter):
             return None
 
         links = set()
         for prim in unwrap_node.prims:
-            if len(prim.inputs()) == 0:
+            if not isinstance(prim, MovePrim) or len(prim.inputs()) == 0:
                 continue
-            links.update(
-                (src, dst)
-                for src, dst in cls._p2p_endpoints(prim)
-                if src == device
-            )
+            src, dst = prim.kwargs['src'], prim.kwargs['dst']
+            if src == device:
+                links.add((src, dst))
         return tuple(sorted(links)) or None
 
     @classmethod

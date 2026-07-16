@@ -11,13 +11,7 @@ from nnscaler.ir.cten import IRCell, IRTensor, IRObject
 from nnscaler.ir.tensor import IRSubTensor
 from nnscaler.ir.operator import IRDataOperation, IRFwOperation
 from nnscaler.ir.adapter import IRWeightReducer, IRAdapter
-from nnscaler.ir.adapter.prim import (
-    ChunkPrim,
-    CommPrim,
-    MovePrim,
-    RDGatherPrim,
-    SelectPrim,
-)
+from nnscaler.ir.adapter.prim import CommPrim, MovePrim, ChunkPrim
 
 from nnscaler.graph.segment import IRSegment
 
@@ -197,15 +191,6 @@ class CodeEmission:
 
 
 class FuncEmission(CodeEmission):
-    @staticmethod
-    def _p2p_endpoints(prim) -> Tuple[Tuple[int, int], ...]:
-        if isinstance(prim, MovePrim):
-            return ((prim.kwargs['src'], prim.kwargs['dst']),)
-        if isinstance(prim, RDGatherPrim):
-            dst = prim.kwargs['dst']
-            return tuple((src, dst) for src in prim.kwargs['srcs'])
-        return ()
-
     def __init__(self):
         super().__init__()
         self._emit_rules = Sign2EmitRule()
@@ -349,7 +334,7 @@ class FuncEmission(CodeEmission):
             len(node.inputs()) == 0
             and len(node.outputs()) == 1
             and len(prims) > 0
-            and isinstance(prims[0], (MovePrim, RDGatherPrim))
+            and isinstance(prims[0], MovePrim)
             and len(prims[0].inputs()) == 0
             and len(prims[0].outputs()) == 1
         )
@@ -382,11 +367,7 @@ class FuncEmission(CodeEmission):
             prim_kwargs = dict(prim.kwargs)
             if async_op and isinstance(prim, CommPrim):
                 prim_kwargs['async_op'] = True
-            if (
-                async_op
-                and isinstance(prim, (MovePrim, RDGatherPrim))
-                and len(prim_inputs) > 0
-            ):
+            if async_op and isinstance(prim, MovePrim) and len(prim_inputs) > 0:
                 release_tensor_name = release_after_send.get(prim_inputs[0].tid)
                 if release_tensor_name is not None:
                     prim_kwargs['release_after_send'] = IRValue(release_tensor_name)
@@ -426,17 +407,14 @@ class FuncEmission(CodeEmission):
         release_after_send = {}
         for prim in prims:
             if (
-                isinstance(prim, (ChunkPrim, SelectPrim))
+                isinstance(prim, ChunkPrim)
                 and len(prim.inputs()) == 1
                 and len(prim.outputs()) == 1
             ):
                 source = source_by_tid.get(prim.input(0).tid)
                 if source is not None:
                     source_by_tid[prim.output(0).tid] = source
-            if (
-                isinstance(prim, (MovePrim, RDGatherPrim))
-                and len(prim.inputs()) == 1
-            ):
+            if isinstance(prim, MovePrim) and len(prim.inputs()) == 1:
                 source = source_by_tid.get(prim.input(0).tid)
                 if source is not None:
                     release_after_send[prim.input(0).tid] = self.tensor_name(
@@ -506,12 +484,7 @@ class FuncEmission(CodeEmission):
                     async_op = False
             # check condition 2)
             devices = [set(p.device) for p in colls]
-            all_p2p = all(self._p2p_endpoints(p) for p in colls)
-            if (
-                len(colls) > 1
-                and not all_p2p
-                and not all(devs == devices[0] for devs in devices[1:])
-            ):
+            if len(colls) > 1 and not all(devs == devices[0] for devs in devices[1:]):
                 async_op = False
 
         release_after_send = {}
