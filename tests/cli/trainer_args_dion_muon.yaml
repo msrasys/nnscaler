@@ -25,7 +25,7 @@ model:
     nlayers: 4
 
 optimizer:
-  type: nnscaler.runtime.dion_muon_optimizer.MixedPrecisionDionMuon
+  type: nnscaler.runtime.f16_optimizer.MixedPrecisionDionMuon
   args:
     lr: 0.01
     use_triton: false

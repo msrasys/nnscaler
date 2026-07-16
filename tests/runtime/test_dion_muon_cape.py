@@ -6,8 +6,8 @@ import math
 import pytest
 import torch
 
-import nnscaler.runtime.dion_muon_optimizer as dion_muon_optimizer
-from nnscaler.runtime.dion_muon_optimizer import cape_polar
+import nnscaler.runtime.dion_cape as dion_cape
+from nnscaler.runtime.dion_cape import cape_polar
 
 
 def _zero_newton_schulz(tensor, epsilon=1e-7):
@@ -26,7 +26,7 @@ def _zero_newton_schulz(tensor, epsilon=1e-7):
 )
 def test_cape_shape_dtype_and_update_scale(monkeypatch, shape, dtype):
     monkeypatch.setattr(
-        dion_muon_optimizer,
+        dion_cape,
         'newton_schulz_triton',
         _zero_newton_schulz,
     )
@@ -50,7 +50,7 @@ def test_cape_shape_dtype_and_update_scale(monkeypatch, shape, dtype):
 
 def test_cape_zero_input_stays_finite_and_zero(monkeypatch):
     monkeypatch.setattr(
-        dion_muon_optimizer,
+        dion_cape,
         'newton_schulz_triton',
         _zero_newton_schulz,
     )
@@ -76,7 +76,7 @@ def _reference_mclip(tensor, polar, radius, epsilon=1e-7):
         device=gram.device,
         dtype=gram.dtype,
     ).expand_as(gram)
-    sign = dion_muon_optimizer.newton_schulz_triton(
+    sign = dion_cape.newton_schulz_triton(
         gram - radius * radius * identity,
         epsilon=epsilon,
     )
@@ -95,7 +95,7 @@ def _reference_cape(gradient, epsilon=1e-7, c=3.0, iterations=5):
         iterate.norm(dim=(-2, -1), keepdim=True) * 1.02 + epsilon
     )
     radius = c / sqrt_rank
-    polar = dion_muon_optimizer.newton_schulz_triton(
+    polar = dion_cape.newton_schulz_triton(
         iterate,
         epsilon=epsilon,
     )
