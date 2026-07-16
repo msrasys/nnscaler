@@ -344,3 +344,60 @@ def test_gencode_split_segment(tmp_path):
     assert _gencode_contains(
         tmp_path, SplitSegmentModule, 6, r'nnscaler.runtime.adapter.nn.allreduce_identity\(sum_.*, ranks=\[6, 7\]\)'
     )
+
+
+class AliasedSegmentInputModule(torch.nn.Module):
+    def __init__(self, dim: int = 64):
+        super().__init__()
+        self.layers = torch.nn.ModuleList([
+            torch.nn.Linear(dim, dim, bias=False) for _ in range(3)
+        ])
+
+    def forward(self, data: torch.Tensor):
+        shared = self.layers[0](data)
+        hidden = self.layers[1](shared)
+        hidden = self.layers[2](hidden + shared)
+        return torch.sum(hidden)
+
+
+def aliased_segment_input_pas(graph, cfg):
+    from nnscaler.policies import OpPlan, OpPartition, get_layer_index, get_pas_ops
+
+    stage_id = 0
+    for node in get_pas_ops(graph):
+        if torch.nn.modules.linear.Linear in node.module_class_chain:
+            stage_id = get_layer_index(node.fqn)
+        elif node.fn == torch.add:
+            stage_id = 2
+        yield OpPlan(node, stage_id=stage_id, partition=OpPartition(input=0, dim=0))
+
+
+@replace_all_device_with('cpu')
+def test_gencode_narrows_aliased_segment_input(tmp_path):
+    parallelize(
+        AliasedSegmentInputModule(),
+        {'data': torch.randn(64, 64)},
+        pas_policy=aliased_segment_input_pas,
+        compute_config=ComputeConfig(
+            6,
+            6,
+            constant_folding=False,
+            use_end2end=True,
+            pas_config={
+                'pp_size': 3,
+                'pipeline_nmicros': 3,
+                'pipeline_scheduler': '1f1b',
+            },
+        ),
+        gen_savedir=tmp_path,
+        load_module=False,
+        reuse='override',
+    )
+
+    for rank in range(6):
+        assert not _gencode_contains(
+            tmp_path,
+            AliasedSegmentInputModule,
+            rank,
+            r'nnscaler\.runtime\.adapter\.(?:all_gather|nn\.split_allgather)',
+        )

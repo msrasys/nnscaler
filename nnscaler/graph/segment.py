@@ -1373,6 +1373,73 @@ class IRSegmentExpander:
                     return None
         return per_device
 
+    @staticmethod
+    def _is_layout_alias(node: IRCell) -> bool:
+        from nnscaler.runtime.function.function import identity, multiref
+
+        return node.fn == identity or (
+            node.fn == multiref
+            and node.kwargs.get('clone_level', 0) == 0
+            and isinstance(node.input(0), IRSubTensor)
+            and not node.input(0).is_param()
+        )
+
+    def _layout_alias_component(self, ftensor: IRFullTensor) -> Set[IRFullTensor]:
+        """Find full tensors connected by shape-preserving, storage-sharing ops."""
+        component: Set[IRFullTensor] = set()
+        pending = [ftensor]
+        while pending:
+            current = pending.pop()
+            if current in component:
+                continue
+            component.add(current)
+            for node in self._segment.producers(current) + self._segment.consumers(current):
+                if not self._is_layout_alias(node):
+                    continue
+                aliases = {
+                    tensor.parent
+                    for tensor in node.iobjs() + node.oobjs()
+                    if isinstance(tensor, IRSubTensor)
+                }
+                if any(alias.shape != ftensor.shape for alias in aliases):
+                    continue
+                pending.extend(aliases - component)
+        return component
+
+    def _alias_terminal_tensors(self, ftensor: IRFullTensor) -> List[IRSubTensor]:
+        """Collect actual compute layouts around an alias component."""
+        tensors: List[IRSubTensor] = []
+        for parent in self._layout_alias_component(ftensor):
+            for node in self._segment.producers(parent):
+                if not self._is_layout_alias(node):
+                    tensors.extend(
+                        tensor for tensor in node.oobjs()
+                        if isinstance(tensor, IRSubTensor) and tensor.parent == parent
+                    )
+            for node in self._segment.consumers(parent):
+                if not self._is_layout_alias(node):
+                    tensors.extend(
+                        tensor for tensor in node.iobjs()
+                        if isinstance(tensor, IRSubTensor) and tensor.parent == parent
+                    )
+        return tensors
+
+    def _try_narrow_alias_component(
+        self,
+        ftensor: IRFullTensor,
+    ) -> Optional[Dict[int, IRSubTensor]]:
+        tensors = self._alias_terminal_tensors(ftensor)
+        if not tensors:
+            return None
+
+        full_indmap = tuple((0, size) for size in ftensor.shape)
+        if any(
+            tensor.indmap == full_indmap and tensor.valmap == (0, 1)
+            for tensor in tensors
+        ):
+            return None
+        return self._collect_per_device_partitions(tensors, ftensor)
+
     def _try_narrow_segment_ctensors(self, ftensor: IRFullTensor) -> Optional[Dict[int, IRSubTensor]]:
         """Check if a segment's consumption of a full tensor can be narrowed to per-device partitions.
 
@@ -1398,27 +1465,7 @@ class IRSegmentExpander:
             # If the full tensor is an output of the dataloader, we don't narrow it.
             return None
 
-        from nnscaler.runtime.function.function import identity as _identity_fn
-        original_ftensor = ftensor
-        # Trace through identity nodes to find the actual consumption pattern.
-        consumers = self._segment.consumers(ftensor)
-        assert all(len(consumer.device) == 1 for consumer in consumers), "Not support for multi-device"
-        if consumers and all(consumer.fn == _identity_fn for consumer in consumers) \
-            and len(set(consumer.device[0] for consumer in consumers)) == len(consumers):
-            ftensor = consumers[0].oobjs()[0].parent
-
-        ctensors = self._segment.ctensors(ftensor)
-        # tensor can be passed through without any internal consumption,
-        # e.g., output of segment.
-        if not ctensors:
-            return None
-
-        full_indmap = tuple((0, s) for s in ftensor.shape)
-        if any(ct.indmap == full_indmap and ct.valmap == (0, 1) for ct in ctensors):
-            # Some ops directly consume the full tensor — can't narrow
-            return None
-
-        return self._collect_per_device_partitions(ctensors, original_ftensor)
+        return self._try_narrow_alias_component(ftensor)
 
     def _try_narrow_segment_ptensors(self, ftensor: IRFullTensor) -> Optional[Dict[int, IRSubTensor]]:
         """Check if a segment's production of a full tensor can be narrowed to per-device partitions.
@@ -1431,29 +1478,7 @@ class IRSegmentExpander:
             # If the full tensor is an output of the graph, we don't narrow it.
             return None
 
-        ptensors = self._segment.ptensors(ftensor)
-        # pass through without any internal production, e.g., input of segment.
-        # Here we treat Identity as a normal operator, and we don't trace through it to find the actual production pattern.
-        if not ptensors:
-            return None
-
-        dev_unique = self._collect_per_device_partitions(ptensors, ftensor)
-        if dev_unique is None:
-            return None
-
-        # If the produced full tensor is also consumed inside the same segment
-        # (e.g., `l.data` => getattr(l, 'data')), the internal consumer may need
-        # the merged/full value rather than the per-device partition. Narrowing
-        # the production would remove the full value from the segment, leaving
-        # the internal consumer with an undefined input. Only narrow when every
-        # internal consumer is satisfied by the partition produced on its device.
-        for ct in self._segment.ctensors(ftensor):
-            for devid in ct.device:
-                produced = dev_unique[devid]
-                if ct.indmap != produced.indmap or ct.valmap != produced.valmap:
-                    return None
-
-        return dev_unique
+        return self._try_narrow_alias_component(ftensor)
 
     @staticmethod
     def _map_grads(forward_ios, backward_ios, device):
@@ -1537,55 +1562,92 @@ class IRSegmentExpander:
         return self._per_device_input, self._per_device_output
 
     @classmethod
-    def _fix_per_device_identity(cls, segment: IRSegment, device_input_map, replaced_nodes: Dict[IRFwOperation, IRFwOperation]):
-        from nnscaler.runtime.function.function import identity as _identity_fn
+    def _fix_per_device_aliases(
+        cls,
+        segment: IRSegment,
+        device_input_map,
+        device_output_map,
+        replaced_nodes: Dict[IRFwOperation, IRFwOperation],
+    ):
+        """Apply narrowed segment I/O layouts to storage-sharing alias nodes."""
         from nnscaler.graph.function.function import Identity
 
         nodes: List[IRCell] = segment._nodes
+        assert segment.isfw(), "Only support forward segment"
 
-        def _find_per_device_partitioned_input(
-                tensor: IRSubTensor,
-                inputs: Tuple[IRObject],
-                device: int,
-                device_input_map
-        ) -> Optional[IRSubTensor]:
-            tensor_idx_in_input = None
-            for idx, t in enumerate(inputs):
-                if isinstance(t, IRSubTensor) and t.parent == tensor.parent:
-                    tensor_idx_in_input = idx
-                    per_device_input: IRSubTensor = device_input_map[device][tensor_idx_in_input]
-                    if per_device_input.parent.shape == per_device_input.shape:
-                        return None  # no need to fix if the input is not partitioned
-                    return per_device_input
-            else:
-                return None
+        def _partition_like(
+            tensor: IRSubTensor,
+            layout: IRSubTensor,
+            device: int,
+        ) -> IRSubTensor:
+            partition = tensor.parent.select(layout.indmap, layout.valmap)
+            IR.set_object_device(partition, device)
+            if tensor.grad is not None:
+                grad_indmap = layout.grad.indmap if layout.grad is not None else layout.indmap
+                grad_valmap = layout.grad.valmap if layout.grad is not None else (0, 1)
+                partition.grad = tensor.grad.parent.select(grad_indmap, grad_valmap)
+                IR.set_object_device(partition.grad, device)
+            return partition
+
+        layouts: Dict[int, Dict[IRFullTensor, IRSubTensor]] = {
+            device: {} for device in segment.device
+        }
+        for segment_ios, per_device_ios in (
+            (segment.inputs(), device_input_map),
+            (segment.outputs(), device_output_map),
+        ):
+            for index, tensor in enumerate(segment_ios):
+                if not isinstance(tensor, IRSubTensor):
+                    continue
+                component = segment.expander._layout_alias_component(tensor.parent)
+                for device in segment.device:
+                    layout = per_device_ios[device][index]
+                    if not isinstance(layout, IRSubTensor):
+                        continue
+                    full_indmap = tuple((0, size) for size in layout.parent.shape)
+                    if layout.indmap == full_indmap and layout.valmap == (0, 1):
+                        continue
+                    for parent in component:
+                        existing = layouts[device].get(parent)
+                        if existing is not None and (
+                            existing.indmap != layout.indmap or existing.valmap != layout.valmap
+                        ):
+                            raise ValueError(
+                                f'Conflicting narrowed layouts in alias component: {existing} vs {layout}'
+                            )
+                        layouts[device][parent] = layout
 
         for node in nodes:
-            if (segment.isfw()
-                and node.fn == _identity_fn
-                and isinstance(node.input(0), IRSubTensor)
-                and (per_device_input := _find_per_device_partitioned_input(
-                    node.input(0), segment.inputs(), node.device[0], device_input_map)
+            if cls._is_layout_alias(node) and isinstance(node.input(0), IRSubTensor):
+                device = node.device[0]
+                layout = layouts[device].get(node.input(0).parent)
+                if layout is None:
+                    yield node
+                    continue
+
+                mapped_input = _partition_like(node.input(0), layout, device)
+                new_node = (
+                    Identity(mapped_input)
+                    if node.name == 'identity'
+                    else MultiRef(mapped_input, len(node.outputs()))
                 )
-            ):
-                # input of segment is not shared with other nodes
-                # so its valmap must be (0, 1)
-                assert per_device_input.valmap == (0, 1)
-                new_node = Identity(per_device_input)
                 new_node.device = node.device
-                new_node.comment = "created at: segment dispatch: fix identity"
-                new_node.set_output(0, node.output(0).parent.select(per_device_input.indmap, per_device_input.valmap))
-                if node.output(0).grad is not None:
-                    new_node.output(0).grad = node.output(0).grad.parent.select(per_device_input.indmap, (0, 1))
-                new_bwnode = segment.create_bwop(new_node)
-                new_bwnode.device = node.device
+                if node.comment is not None:
+                    new_node.comment = node.comment
+                new_node.recompute = node.recompute
+                new_node.op_context = node.op_context
+                for index, output in enumerate(node.outputs()):
+                    if isinstance(output, IRSubTensor):
+                        new_node.set_output(index, _partition_like(output, layout, device))
+                    else:
+                        new_node.set_output(index, output)
+                new_node.verify_shape()
                 replaced_nodes[node] = new_node
-                replaced_nodes[node.mirror] = new_bwnode
+                if node.mirror is not None:
+                    new_bwnode = segment.create_bwop(new_node)
+                    new_bwnode.device = node.device
+                    replaced_nodes[node.mirror] = new_bwnode
                 yield new_node
-            elif not segment.isfw() and node in replaced_nodes:
-                # for backward segment, if the mirror node in forward segment is fixed,
-                # we also need to fix it
-                yield replaced_nodes[node]
             else:
                 yield node
 
@@ -1603,17 +1665,19 @@ class IRSegmentExpander:
 
         replaced_nodes = {}
         fw_expander = seg_fw.expander
-        seg_fw._nodes[:] = list(self._fix_per_device_identity(
-            seg_fw, fw_expander.per_device_inputs, replaced_nodes
+        seg_fw._nodes[:] = list(self._fix_per_device_aliases(
+            seg_fw,
+            fw_expander.per_device_inputs,
+            fw_expander.per_device_outputs,
+            replaced_nodes,
         ))
         seg_fw._reorder_producer_consumer()
         seg_fw._expanded = True
 
         if seg_bw is not None:
-            bw_expander = seg_bw.expander
-            seg_bw._nodes[:] = list(self._fix_per_device_identity(
-                seg_bw, bw_expander.per_device_inputs, replaced_nodes
-            ))
+            seg_bw._nodes[:] = [
+                replaced_nodes.get(node, node) for node in seg_bw._nodes
+            ]
             seg_bw._reorder_producer_consumer()
             seg_bw._expanded = True
 
