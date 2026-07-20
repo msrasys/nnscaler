@@ -119,3 +119,24 @@ def test_trainer_pipeline_obj(tmp_path):
 
     assert_equal(state_dict0['model'], state_dict1['model'])
     assert_equal(state_dict0['optimizer'], state_dict1['optimizer'])
+
+
+@pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.device_count() < 4, reason='lack of gpu devices')
+def test_trainer_pipeline_async(tmp_path):
+    launch_torchrun(4, trainer_worker_pipeline, tmp_path, 'trainer_args_pipeline.yaml',
+        'async_comm',
+        ['--compute_config.use_async_comm', 'True']
+    )
+    launch_torchrun(4, trainer_worker_pipeline, tmp_path, 'trainer_args_pipeline.yaml',
+        'no_async_comm',
+        ['--compute_config.use_async_comm', 'False']
+    )
+
+    merged_files = list((tmp_path).glob('merged_*.pt'))
+    assert len(merged_files) == 2
+    merged_state_dicts = [torch.load(merged_file, weights_only=False) for merged_file in merged_files]
+
+    assert_equal(merged_state_dicts[0]['model'], merged_state_dicts[1]['model'])
+    assert_equal(merged_state_dicts[0]['optimizer'], merged_state_dicts[1]['optimizer'])
+    assert_equal(merged_state_dicts[0]['model'], merged_state_dicts[2]['model'])
+    assert_equal(merged_state_dicts[0]['optimizer'], merged_state_dicts[2]['optimizer'])

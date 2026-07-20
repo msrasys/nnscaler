@@ -135,6 +135,9 @@ class ComputeConfig:
     # only effective when `use_end2end` is True and `inference_only` is False.
     # Only useful for pipeline training with multi-stream scheduling.
     use_fbw: bool = False
+    # whether to use async communication for cross-stage collective operations.
+    # This option only works for pipeline.
+    use_async_comm: bool = False
 
     # whether to use async reducer
     # if True, the gradient all-reduce will be async,
@@ -406,7 +409,7 @@ def _compile_flags(compute_config: ComputeConfig):
         CompileFlag,
         async_reducer=compute_config.use_async_reducer, reducer_op='sum',
         max_reducer_bucket=compute_config.max_bucket_size_bytes,
-        async_comm=False,
+        async_comm=compute_config.use_async_comm,
         use_zero=compute_config.use_zero,
         zero_ngroups=compute_config.zero_ngroups,
         zero_use_reduce_scatter=compute_config.zero_use_reduce_scatter,

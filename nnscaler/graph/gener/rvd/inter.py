@@ -225,15 +225,15 @@ class InterPathFinder:
 
     @classproperty
     def _cached_inter_nodes(cls):
-        return cls._config_cached_inter_nodes.setdefault((CompileFlag.disable_reduce_scatter_adapter,), {})
+        return cls._config_cached_inter_nodes.setdefault((CompileFlag.disable_reduce_scatter_adapter, CompileFlag.async_comm), {})
 
     @classproperty
     def _cached_inter_edges(cls):
-        return cls._config_cached_inter_edges.setdefault((CompileFlag.disable_reduce_scatter_adapter,), {})
+        return cls._config_cached_inter_edges.setdefault((CompileFlag.disable_reduce_scatter_adapter, CompileFlag.async_comm), {})
 
     @classproperty
     def _cached_inter_paths(cls):
-        return cls._config_cached_inter_paths.setdefault((CompileFlag.disable_reduce_scatter_adapter,), {})
+        return cls._config_cached_inter_paths.setdefault((CompileFlag.disable_reduce_scatter_adapter, CompileFlag.async_comm), {})
 
     # type annotation because type cannot be inferred from `classproperty`
     _cached_inter_nodes: Dict[Tuple[TShape, int, int], Tuple[Tuple[InterRVD]]]
@@ -492,10 +492,13 @@ class InterPathFinder:
             ftensor, r=prvds[-1][0], v=prvds[-1][1],
             dims=prvds[-1][2:], devices=list(range(pndevs)))
         _, prims = InterTransition.transition(playout, crvds[0], list(range(pndevs, pndevs + cndevs)))
+        # TODO: why only consider the first primitive? should we consider all primitives?
         icost = cost_fn(prims[0])
         # gather all
         # consider differnt linkbandwidth intra NVLink 300GB/s vs. inter-node 100Gbps
-        comm_factor = 24
+        # disable comm_factor when async_comm is enabled,
+        # because async comm doesn't work when multiple inter-node comms are executed.
+        comm_factor = 24 if not CompileFlag.async_comm else 1
         return pcost + ccost + icost * comm_factor
 
     @staticmethod
