@@ -17,10 +17,10 @@ def test_p2p_endpoints_share_entity_and_have_opposite_directions():
     assert sender.entity == receiver.entity == "adapter10916:move:0->2:t16083"
 
 
-def test_p2p_direction_is_generic_when_rank_is_not_an_endpoint():
+def test_p2p_direction_is_collective_when_rank_is_not_an_endpoint():
     spec = p2p_trace_spec(1, "adapter7", "move", {"src": 0, "dst": 2})
 
-    assert spec.kind == "COMM"
+    assert spec.kind == "COLLECTIVE"
     assert spec.peer is None
 
 

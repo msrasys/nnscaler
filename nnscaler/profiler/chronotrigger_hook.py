@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING, Dict, Optional, Tuple
 
 import torch
 import chronotrigger.trace as ct
+from chronotrigger.trace.integrations import install_deepep_instrumentation
 
 from nnscaler.cli.train_hook import TrainHook
 
@@ -45,6 +46,8 @@ class ChronoTriggerTrainHook(TrainHook):
             rank_layout=rank_layout,
             enabled=tracing_enabled,
         )
+        if ct.enabled():
+            install_deepep_instrumentation()
         self.capture_window = _capture_window()
 
     def on_step_start(self, trainer: "Trainer", epoch: int, idx: int) -> None:

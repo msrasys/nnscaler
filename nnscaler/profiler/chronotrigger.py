@@ -45,7 +45,7 @@ def p2p_trace_spec(
         return TraceSpec("SEND", entity, _single_peer(destinations))
     if in_destinations and not in_sources:
         return TraceSpec("RECV", entity, _single_peer(sources))
-    return TraceSpec("COMM", entity, None)
+    return TraceSpec("COLLECTIVE", entity, None)
 
 
 def primitive_trace_spec(prim: Any, rank: int, adapter_name: str, index: int) -> Optional[TraceSpec]:
@@ -69,7 +69,7 @@ def primitive_trace_spec(prim: Any, rank: int, adapter_name: str, index: int) ->
             tensor_ids,
         )
 
-    return TraceSpec("COMM", f"{adapter_name}:{primitive_name}:{index}", None)
+    return TraceSpec("COLLECTIVE", f"{adapter_name}:{primitive_name}:{index}", None)
 
 
 def _endpoints(kwargs: Mapping[str, Any], singular: str, plural: str) -> Tuple[int, ...]:

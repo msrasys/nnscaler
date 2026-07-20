@@ -104,6 +104,23 @@ def test_hook_accepts_legacy_trace_gate(monkeypatch):
     assert init_calls[0]["rank_layout"]["ep"] == 0
 
 
+def test_enabled_hook_installs_deepep_integration(monkeypatch):
+    monkeypatch.setenv("CT_TRACE", "1")
+    monkeypatch.setenv("NNSCALER_TRACE_EP_SIZE", "2")
+    install_calls = []
+    monkeypatch.setattr(chronotrigger_hook.ct, "init", lambda **kwargs: None)
+    monkeypatch.setattr(chronotrigger_hook.ct, "enabled", lambda: True)
+    monkeypatch.setattr(
+        chronotrigger_hook,
+        "install_deepep_instrumentation",
+        lambda: install_calls.append("deepep"),
+    )
+
+    chronotrigger_hook.ChronoTriggerTrainHook().after_setup(_trainer())
+
+    assert install_calls == ["deepep"]
+
+
 def test_hook_owns_step_and_delayed_capture(monkeypatch):
     trainer = _trainer(step=10)
     events = []
