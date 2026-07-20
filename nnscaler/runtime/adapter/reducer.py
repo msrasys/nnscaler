@@ -1198,7 +1198,6 @@ class Reducer:
         # make it in reverse order as the backward happens from tail to head
         # it is not important but may be helpful for waiting cuda stream to finish
         self._buckets: List[Bucket] = list(reversed(buckets))
-
         assert len(self._buckets) > 0, (
             f"Find {len(self._params)} parameters in the reducer. "
             f"Make sure adding all parameters before building buckets")
@@ -1208,8 +1207,6 @@ class Reducer:
         synchronize gradients using allreduce (non-zero) or reduce-scatter (zero)
         """
         if RuntimeFlag.skip_reducer: return
-        # async bucket grad all-reduce will be done in reversed order
-        # so we wait them in reversed order to have a slightly better performance.
         for bucket in self._buckets:
             bucket.sync_grads()
 
