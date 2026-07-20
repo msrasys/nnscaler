@@ -152,7 +152,7 @@ def test_reducer_build():
     reducer.add_param(torch.nn.Parameter(torch.randn(1, 1)))  # 4 floats small again <bucket 4>
     reducer.build_buckets()
     assert len(reducer.buckets) == 5
-    buckets = list(reducer.buckets)
+    buckets = list(reversed(reducer.buckets))
     assert buckets[0].numel == 2
     assert buckets[0]._aligned_numel == 4
     assert buckets[1].numel == 14
@@ -169,13 +169,13 @@ def test_reducer_build():
 def test_reducer_wake_up_rebinds_buckets_to_correct_slices():
     """Regression test for the reducer wake_up bug.
 
-    `self.starts` / `self.stops` are built in bucket-insertion order, while
-    `wake_up()` re-binds each bucket to its buffer slice via
-    `zip(self.starts, self.stops, self._buckets)`. If `self._buckets` is kept in a
-    different order (e.g. reversed), `wake_up()` binds buckets to the wrong slices,
-    so a bucket ends up pointing at a different buffer region than the one it was
-    built with. This test builds several differently-sized buckets and asserts each
-    bucket points at the same buffer slice before and after a sleep/wake_up cycle.
+    Each bucket owns its buffer slice via its own `_start` / `_stop`, and
+    `wake_up()` re-binds every bucket to `buffer[bucket._start:bucket._stop]`.
+    Because the slice is derived from the bucket's own offsets, the binding is
+    correct regardless of the order in which buckets are stored (they are kept in
+    reversed, tail-to-head backward order). This test builds several
+    differently-sized buckets and asserts each bucket points at the same buffer
+    slice before and after a sleep/wake_up cycle.
     """
     reducer = Reducer([0, 1], max_bucket_size_bytes=48)
     reducer.add_param(torch.nn.Parameter(torch.randn(1, 2)))   # bucket 0
@@ -281,7 +281,7 @@ def test_reducer_build_zero_param_level_sharding_merges_small_tail_to_previous_b
 
     reducer.build_buckets()
 
-    buckets = list(reducer.buckets)
+    buckets = list(reversed(reducer.buckets))
     assert [len(bucket.params) for bucket in buckets] == [8, 9]
 
 
@@ -299,7 +299,7 @@ def test_reducer_build_zero_param_level_sharding_keeps_param_classes_separate():
 
     reducer.build_buckets(param_clss=param_clss)
 
-    buckets = list(reducer.buckets)
+    buckets = list(reversed(reducer.buckets))
     assert [len(bucket.params) for bucket in buckets] == [9, 9]
     assert [bucket.param_cls[0] for bucket in buckets] == [0, 1]
 
@@ -321,7 +321,7 @@ def test_reducer_build_zero_param_level_sharding_pads_too_few_params():
         logs = log_stream.getvalue()
         assert "Padding will be added so that some ranks have empty shards" in logs
 
-    buckets = list(reducer.buckets)
+    buckets = list(reversed(reducer.buckets))
     assert len(buckets) == 1
     assert len(buckets[0].params) == 7
     # buffer should be max_group_size * zero_size = 4 * 8 = 32
@@ -342,7 +342,7 @@ def test_reducer_build_zero_param_level_sharding_pads_single_param():
 
     reducer.build_buckets()
 
-    buckets = list(reducer.buckets)
+    buckets = list(reversed(reducer.buckets))
     assert len(buckets) == 1
     assert len(buckets[0].params) == 1
     # buffer = max_group_size(4) * zero_size(8) = 32
@@ -364,7 +364,7 @@ def test_reducer_build_zero_param_level_sharding_pads_with_classes():
 
     reducer.build_buckets(param_clss=param_clss)
 
-    buckets = list(reducer.buckets)
+    buckets = list(reversed(reducer.buckets))
     assert len(buckets) == 2
     assert [len(b.params) for b in buckets] == [3, 5]
     assert [b.param_cls[0] for b in buckets] == [0, 1]
@@ -390,7 +390,7 @@ def test_reducer_build_zero_param_level_sharding_pads_mixed_sizes():
 
     reducer.build_buckets()
 
-    buckets = list(reducer.buckets)
+    buckets = list(reversed(reducer.buckets))
     assert len(buckets) == 1
     assert len(buckets[0].params) == 2
     # max aligned size is 8 (from param of size 5), buffer = 8 * 4 = 32
@@ -430,6 +430,6 @@ def test_reducer_build_zero_param_level_sharding_zero_ngroups_chunk_by_zero_subg
 
     reducer.build_buckets()
 
-    buckets = list(reducer.buckets)
+    buckets = list(reversed(reducer.buckets))
     assert buckets[0]._contiguous_grads.numel() == 8
     assert buckets[0]._flatten_param_info.opt_num_chunks == 2

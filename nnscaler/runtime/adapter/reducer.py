@@ -243,8 +243,12 @@ class Bucket:
 
         Args:
             params (List[torch.nn.Parameter]): the parameters
-            param_buffer (torch.Tensor): Paramter contiguous buffer
-            grad_buffer (torch.Tensor): gradient contiguous buffer
+            param_buffer (torch.Tensor): the reducer's full parameter contiguous buffer;
+                this bucket owns the slice ``param_buffer[start:stop]``
+            grad_buffer (torch.Tensor): the reducer's full gradient contiguous buffer;
+                this bucket owns the slice ``grad_buffer[start:stop]``
+            start (int): start offset of this bucket's slice within the full buffer
+            stop (int): stop offset of this bucket's slice within the full buffer
             reduce_op (torch.distributed.ReduceOp): the reduce op used by collectives
             group (torch.distributed.ProcessGroup): communication group
             async_op (bool): whether to use asynchronous operation
