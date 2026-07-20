@@ -188,11 +188,11 @@ def test_reducer_wake_up_rebinds_buckets_to_correct_slices():
     assert len(reducer.buckets) == 5
 
     # each bucket must be bound to the slice described by starts/stops at its index
-    for start, stop, bucket in zip(reducer.starts, reducer.stops, reducer.buckets):
-        assert bucket._contiguous_params.storage_offset() == start
-        assert bucket._contiguous_params.numel() == stop - start
-        assert bucket._contiguous_grads.storage_offset() == start
-        assert bucket._contiguous_grads.numel() == stop - start
+    for bucket in reducer.buckets:
+        assert bucket._contiguous_params.storage_offset() == bucket._start
+        assert bucket._contiguous_params.numel() == bucket._stop - bucket._start
+        assert bucket._contiguous_grads.storage_offset() == bucket._start
+        assert bucket._contiguous_grads.numel() == bucket._stop - bucket._start
 
     # record each bucket's buffer slice (by identity) before offloading
     before = [
@@ -209,11 +209,11 @@ def test_reducer_wake_up_rebinds_buckets_to_correct_slices():
         for bucket in reducer.buckets
     ]
     assert before == after
-    for start, stop, bucket in zip(reducer.starts, reducer.stops, reducer.buckets):
-        assert bucket._contiguous_params.storage_offset() == start
-        assert bucket._contiguous_params.numel() == stop - start
-        assert bucket._contiguous_grads.storage_offset() == start
-        assert bucket._contiguous_grads.numel() == stop - start
+    for bucket in reducer.buckets:
+        assert bucket._contiguous_params.storage_offset() == bucket._start
+        assert bucket._contiguous_params.numel() == bucket._stop - bucket._start
+        assert bucket._contiguous_grads.storage_offset() == bucket._start
+        assert bucket._contiguous_grads.numel() == bucket._stop - bucket._start
 
 
 @mock_reducer_env(0, 2)

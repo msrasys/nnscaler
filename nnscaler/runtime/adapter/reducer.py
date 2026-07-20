@@ -224,6 +224,7 @@ class ParamZeroConfig:
 class Bucket:
     def __init__(self, reducer: 'Reducer', params: List[torch.nn.Parameter],
                  param_buffer: torch.Tensor, grad_buffer: torch.Tensor,
+                 start: int, stop: int,
                  reduce_op: torch.distributed.ReduceOp,
                  group: torch.distributed.ProcessGroup, async_op: bool, zero: int,
                  zero_subgroup: torch.distributed.ProcessGroup = None,
@@ -283,8 +284,10 @@ class Bucket:
         if self._nreplicas != 1 and self._reduce_op != torch.distributed.ReduceOp.SUM:
             raise ValueError(f"nreplicas should be used with sum reduce op, but got {self._reduce_op}")
 
-        self._contiguous_params = param_buffer
-        self._contiguous_grads = grad_buffer
+        self._start = start
+        self._stop = stop
+        self._contiguous_params = param_buffer[self._start:self._stop]
+        self._contiguous_grads = grad_buffer[self._start:self._stop]
         assert grad_buffer.size() == param_buffer.size()
         # the parameter exposed for optimizer
         self._param_for_optimizer: torch.nn.Parameter = None
@@ -655,8 +658,8 @@ class Bucket:
         """
         re-attach to the contiguous buffer and re-build hooks
         """
-        self._contiguous_params = param_buffer
-        self._contiguous_grads = grad_buffer
+        self._contiguous_params = param_buffer[self._start:self._stop]
+        self._contiguous_grads = grad_buffer[self._start:self._stop]
         self._param_for_optimizer.data = self._get_opt_param_data()
 
         # TODO(yizhu1): seems moving attributes to cpu will make hooks invalid.
@@ -800,8 +803,6 @@ class Reducer:
         # record following variables for params offload
         # items in the bucket is params list
         self.seq_buckets: List[List[torch.nn.Parameter]] = []
-        # bucket start and stop pos in buffer
-        self.starts, self.stops = [], []
         self.buffer_length: int = 0
         self._params_info: dict[torch.nn.Parameter, ReducerParamInfo] = dict()
 
@@ -1020,7 +1021,8 @@ class Reducer:
         # TODO: use native version of reducer, which is more efficient
         #       (used in pytorch, with a couple percentage improvement)
         bucket_size = self._numel * 8 + 1 if not self._bucket_size else self._bucket_size
-
+        # bucket start and stop pos in buffer
+        starts, stops = [], []
         seq_buckets_cls: List[Optional[Tuple[int, int, ParamZeroConfig]]] = []
         last_bucket_size = None
         last_bucket_cls = None
@@ -1098,7 +1100,7 @@ class Reducer:
         # step 2: build meta data for the offset of each bucket
         # the start of each bucket will be padded to the next multiple of `len(self.ranks)`
         for params, param_cls in zip(self.seq_buckets, seq_buckets_cls):
-            self.starts.append(self.buffer_length)
+            starts.append(self.buffer_length)
             zero_param_level_sharding = param_cls[-1].zero_param_level_sharding if param_cls else self._zero_param_level_sharding
             param_sizes = [_aligned_nelement(p.nelement(), p.element_size(), self._align_size) for p in params]
             if zero_param_level_sharding:
@@ -1122,7 +1124,7 @@ class Reducer:
                         param = params[pidx]
                         param_size = param_sizes[pidx]
                         new_param_order.append(param)
-                        self._params_info[param].param_buffer_start = self.starts[-1] + chunk_start + chunk_offset
+                        self._params_info[param].param_buffer_start = starts[-1] + chunk_start + chunk_offset
                         self._params_info[param].param_buffer_end = self._params_info[param].param_buffer_start + param.numel()
                         self._params_info[param].bucket_param_buffer_start = chunk_start + chunk_offset
                         self._params_info[param].bucket_param_buffer_end = self._params_info[param].bucket_param_buffer_start + param.numel()
@@ -1144,7 +1146,7 @@ class Reducer:
                 chunk_offset = 0
                 for idx, ps in enumerate(param_sizes):
                     param = params[idx]
-                    self._params_info[param].param_buffer_start = self.starts[-1] + chunk_offset
+                    self._params_info[param].param_buffer_start = starts[-1] + chunk_offset
                     self._params_info[param].param_buffer_end = self._params_info[param].param_buffer_start + param.numel()
                     self._params_info[param].bucket_param_buffer_start = chunk_offset
                     self._params_info[param].bucket_param_buffer_end = self._params_info[param].bucket_param_buffer_start + param.numel()
@@ -1155,7 +1157,7 @@ class Reducer:
                 align_nelements = self._align_size // params[0].element_size() * len(self._ranks)
                 padding = (align_nelements - numel % align_nelements) % align_nelements
                 self.buffer_length += numel + padding
-            self.stops.append(self.buffer_length)
+            stops.append(self.buffer_length)
 
         # step 3: allocate memory
         self._allocate_buffers()
@@ -1165,13 +1167,15 @@ class Reducer:
 
         # step 5: build buckets
         buckets: List[Bucket] = []
-        for params, param_cls, start, stop in zip(self.seq_buckets, seq_buckets_cls, self.starts, self.stops):
+        for params, param_cls, start, stop in zip(self.seq_buckets, seq_buckets_cls, starts, stops):
             # initialize buckets
             bucket = Bucket(
                 self,
                 params,
-                self._contiguous_params[start:stop],
-                self._contiguous_grads[start:stop],
+                self._contiguous_params,
+                self._contiguous_grads,
+                start,
+                stop,
                 self._reduce_op,
                 self._group,
                 self._async,
@@ -1187,12 +1191,10 @@ class Reducer:
             buckets.append(bucket)
         torch.cuda.empty_cache()
 
-        # NOTE: keep `self._buckets` in the same order as `self.starts` / `self.stops`.
-        # `wake_up()` re-binds each bucket to its buffer slice via
-        # `zip(self.starts, self.stops, self._buckets)`, so any reordering here (e.g.
-        # reversing to match the tail-to-head backward order) would misalign buckets to
-        # the wrong slices.
-        self._buckets: List[Bucket] = buckets
+        # make it in reverse order as the backward happens from tail to head
+        # it is not important but may be helpful for waiting cuda stream to finish
+        self._buckets: List[Bucket] = list(reversed(buckets))
+
         assert len(self._buckets) > 0, (
             f"Find {len(self._params)} parameters in the reducer. "
             f"Make sure adding all parameters before building buckets")
@@ -1204,7 +1206,7 @@ class Reducer:
         if RuntimeFlag.skip_reducer: return
         # async bucket grad all-reduce will be done in reversed order
         # so we wait them in reversed order to have a slightly better performance.
-        for bucket in reversed(self._buckets):
+        for bucket in self._buckets:
             bucket.sync_grads()
 
     def get_z3_info(self, param: torch.nn.Parameter) -> ReducerParamInfo:
@@ -1399,10 +1401,10 @@ class Reducer:
         self._allocate_buffers()
         self._bind_params()
 
-        for start, stop, bucket in zip(self.starts, self.stops, self._buckets):
+        for bucket in self._buckets:
             bucket.wake_up(
-                self._contiguous_params[start:stop],
-                self._contiguous_grads[start:stop],
+                self._contiguous_params,
+                self._contiguous_grads,
             )
 
     def _pack(
