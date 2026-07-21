@@ -387,6 +387,30 @@ class Trainer:
             self._log_executor.submit(self._log_metrics_sync, dict(metrics), step, tag)
         )
 
+    def _aggregate_timer_walls(self, timer_walls: Dict[str, float]) -> Dict[str, float]:
+        names = tuple(timer_walls)
+        local_walls = torch.tensor(
+            tuple(timer_walls.values()),
+            dtype=torch.float64,
+            device=torch.cuda.current_device(),
+        )
+        all_walls = torch.empty(
+            self.world_size * len(names),
+            dtype=local_walls.dtype,
+            device=local_walls.device,
+        )
+        torch.distributed.all_gather_into_tensor(all_walls, local_walls)
+        all_walls = all_walls.view(self.world_size, len(names))
+        stats = torch.stack(
+            (all_walls.mean(dim=0), all_walls.amax(dim=0) - all_walls.amin(dim=0)),
+            dim=1,
+        ).tolist()
+        return {
+            metric_name: value
+            for name, (avg, delta) in zip(names, stats)
+            for metric_name, value in ((f'{name}_avg', avg), (f'{name}_delta', delta))
+        }
+
     def _log_config(self, config: Dict):
         for logger in self.loggers:
             logger.setup(config)
@@ -994,7 +1018,9 @@ class Trainer:
 
         step_stat: Optional[_StepStat] = None
         last_step_start_at: Optional[float] = None
+        last_loop_end_at = time.perf_counter()
         for i, batches in data_iter:
+            read_batch_wall = time.perf_counter() - last_loop_end_at
             idx = i + resume_from_idx
             self.hook.on_step_start(self, epoch, idx)
 
@@ -1019,6 +1045,7 @@ class Trainer:
             cuda_sync_required = isinstance(self.model, nnscaler.ParallelModule) \
                   and getattr(self.model, 'cuda_sync_required', False)
 
+            train_step_start_at = time.perf_counter()
             if cuda_sync_required:
                 torch.cuda.synchronize()
 
@@ -1026,6 +1053,7 @@ class Trainer:
 
             if cuda_sync_required:
                 torch.cuda.synchronize()
+            train_step_wall = time.perf_counter() - train_step_start_at
 
             self.hook.on_train_step_end(self, losses[:num_batches])
 
@@ -1045,7 +1073,9 @@ class Trainer:
             self.hook.before_sync_grad(self)
             # `sync_shard_grad` is no-op if the whole model is parallelized
             #  because syncing grad in end2end model is done in `_train_step`.
+            sync_shard_grad_start_at = time.perf_counter()
             self.optimizer.sync_shard_grad()
+            sync_shard_grad_wall = time.perf_counter() - sync_shard_grad_start_at
             self.hook.after_sync_grad(self)
 
             # scale gradients
@@ -1065,8 +1095,10 @@ class Trainer:
             self.optimizer.scale_grads(multiplier)
 
             # check gradient sync & scale correctness
+            check_grad_start_at = time.perf_counter()
             if self.train_args.debug.check_gradient_sync_cross_devices:
                 self._check_grad_cross_devices_correctness()
+            check_grad_wall = time.perf_counter() - check_grad_start_at
 
             # clip gradients
             self.hook.before_gnorm_clip(self)
@@ -1080,7 +1112,9 @@ class Trainer:
             # update parameters
             step_stat.lr = self.optimizer.param_groups[0]['lr']  # only log the first group's lr
             self.hook.before_optimizer_step(self)
+            optim_step_start_at = time.perf_counter()
             self.optimizer.step()
+            optim_step_wall = time.perf_counter() - optim_step_start_at
             self.hook.after_optimizer_step(self)
             if self.lr_scheduler and self.train_args.lr_scheduler.interval == 'step':
                 self.lr_scheduler.step()
@@ -1090,10 +1124,19 @@ class Trainer:
             step_metrics = {k:v for k, v in asdict(step_stat).items() if v is not None}
             step_metrics['loss'] = step_metrics['train_loss']
             train_wall_at = time.perf_counter()
-            step_metrics['train_wall'] = train_wall_at - (last_step_start_at or step_start_at)
-            step_metrics['local_train_wall'] = train_wall_at - step_start_at
+            timer_walls = {
+                'read_batch': read_batch_wall,
+                'train_step': train_step_wall,
+                'sync_shard_grad': sync_shard_grad_wall,
+                'check_grad': check_grad_wall,
+                'optim_step': optim_step_wall,
+                'local_train_wall': train_wall_at - step_start_at,
+                'global_train_wall': train_wall_at - (last_step_start_at or step_start_at),
+            }
             last_step_start_at = train_wall_at
             self.hook.before_log_train_metrics(self, step_metrics, aggregated_outputs)
+            timer_metrics = self._aggregate_timer_walls(timer_walls)
+            self.log_metrics(timer_metrics, tag='timer')
             self.log_metrics(step_metrics, tag='train')
             if self.rank == 0:
                 if self.train_args.enable_log_progress \
@@ -1132,6 +1175,7 @@ class Trainer:
                 self._validate(step_stat)
                 has_validated = VAL_STATUS_VAL
 
+            last_loop_end_at = time.perf_counter()
             # time.sleep(1)
         else:
             # Do per-epoch operations here.
