@@ -30,6 +30,7 @@ bsign = '{input_grads} = nnscaler.runtime.executor.backward({name}, {input_tenso
 bi_sign = '{input_grads} = nnscaler.runtime.executor.backward_input({name}, {input_tensors}, {output_tensors}, {output_grads}, {weights})'
 bw_sign = 'nnscaler.runtime.executor.backward_weight({name}, {weights})'
 bw_fn_name = 'nnscaler.runtime.executor.backward_weight'
+ssign = '{inputs} = nnscaler.runtime.executor.sync_tensors({inputs})'
 
 
 class ScheduleCodeGen(FuncEmission):
@@ -95,6 +96,15 @@ class ScheduleCodeGen(FuncEmission):
 
         last_stream = None
         buffered_codes = []
+
+
+        def to_tensor_names(val) -> str:
+            """
+            Return the tensor names in a complex data type.
+            Currently support complex data type of Dict, List, Tuple
+            """
+            objs = IR.get_objects(val)
+            return self.tuple_name([obj for obj in objs if isinstance(obj, IRTensor)])
 
         def _get_codes_with_stream_context(codes: List[str], stream: Optional[str]) -> List[str]:
             if stream is None:
@@ -229,6 +239,9 @@ class ScheduleCodeGen(FuncEmission):
                     _append_code(fb, last_backward_weight_codes, self._get_node_stream(last_backward_node))
 
             # return code
+            if CompileFlag.async_comm:
+                _append_code(fb, 'nnscaler.runtime.executor.AsyncCommHandler().drain_sends()')
+                _append_code(fb, ssign.format(inputs=to_tensor_names(self.execplan.outputs())))
             outputs = self.return_name_complex(self.execplan.outputs())
             code = f'return {outputs}'
             _append_code(fb, code, force_flush=True)
@@ -259,6 +272,9 @@ class ScheduleCodeGen(FuncEmission):
                     if len(tensors) > 0 : # not necessarily to have one after each line
                         _append_code(fb, self.emit_release(tensors))
                 # return code
+                if CompileFlag.async_comm:
+                    _append_code(fb, 'nnscaler.runtime.executor.AsyncCommHandler().drain_sends()')
+                    _append_code(fb, ssign.format(inputs=to_tensor_names(self.execplan.outputs())))
                 outputs = self.return_name_complex(self.execplan.outputs())
                 code = f'return {outputs}'
                 _append_code(fb, code, force_flush=True)

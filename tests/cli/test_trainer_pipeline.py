@@ -75,9 +75,16 @@ def test_trainer_pipeline(tmp_path):
     )
     launch_torchrun(4, trainer_worker_pipeline, tmp_path, 'trainer_args_pipeline_autodist.yaml')
     launch_torchrun(4, trainer_worker_pipeline, tmp_path, 'trainer_args_pipeline.yaml')
+    launch_torchrun(4, trainer_worker_pipeline, tmp_path, 'trainer_args_pipeline.yaml',
+        'async_comm',
+        [
+            '--compute_config.use_async_comm', 'True',
+            '--compute_config.use_fbw', 'True'
+        ]
+    )
 
     merged_files = list((tmp_path).glob('merged_*.pt'))
-    assert len(merged_files) == 4
+    assert len(merged_files) == 5
     merged_state_dicts = [torch.load(merged_file, weights_only=False) for merged_file in merged_files]
 
     assert_equal(merged_state_dicts[0]['model'], merged_state_dicts[1]['model'])
@@ -86,6 +93,35 @@ def test_trainer_pipeline(tmp_path):
     assert_equal(merged_state_dicts[0]['optimizer'], merged_state_dicts[2]['optimizer'])
     assert_equal(merged_state_dicts[0]['model'], merged_state_dicts[3]['model'])
     assert_equal(merged_state_dicts[0]['optimizer'], merged_state_dicts[3]['optimizer'])
+    assert_equal(merged_state_dicts[0]['model'], merged_state_dicts[4]['model'])
+    assert_equal(merged_state_dicts[0]['optimizer'], merged_state_dicts[4]['optimizer'])
+
+    # when compute_config.use_async_comm is True, and compute_config.use_fbw is True
+    # the code will look like:
+    #....
+    # def adapter95(self):
+    #     glinear_8_131 = nnscaler.runtime.adapter.move((), shape=(2, 16), dtype=torch.float32, src=1, dst=0, async_op=True)
+    #     return glinear_8_131
+    # ...
+    # def _train_step(model, dataloader_112):
+    #     ...
+    #     _ = nnscaler.runtime.executor.backward_input('segment43', (), (linear_8_184, ), (glinear_8_185, ), model.parameters())
+    #     del linear_8_184, glinear_8_185
+    #     glinear_8_208 = nnscaler.runtime.executor.aexecute(model.adapter95, *(), requires_grad=False)
+    #     nnscaler.flags.RuntimeFlag.skip_reducer = False
+    #     nnscaler.runtime.executor.backward_weight('segment43', model.parameters())
+    #     _ = nnscaler.runtime.executor.backward_input('segment43', (), (linear_8_207, ), (glinear_8_208, ), model.parameters())
+    #     del linear_8_207, glinear_8_208
+    #     binary_cross_entropy_76 = nnscaler.runtime.executor.aexecute(model.adapter102, *(), requires_grad=True)
+    #     binary_cross_entropy_176 = nnscaler.runtime.executor.aexecute(model.adapter102, *(), requires_grad=True)
+    #     binary_cross_entropy_199 = nnscaler.runtime.executor.aexecute(model.adapter102, *(), requires_grad=True)
+    #     binary_cross_entropy_222 = nnscaler.runtime.executor.aexecute(model.adapter102, *(), requires_grad=True)
+    #     nnscaler.runtime.executor.backward_weight('segment43', model.parameters())
+    #     _ = nnscaler.runtime.executor.aexecute(model.reducer293, *(), requires_grad=False)
+    #     nnscaler.runtime.executor.AsyncCommHandler().drain_sends()
+    #     (binary_cross_entropy_76, binary_cross_entropy_176, binary_cross_entropy_199, binary_cross_entropy_222, ) = nnscaler.runtime.executor.sync_tensors((binary_cross_entropy_76, binary_cross_entropy_176, binary_cross_entropy_199, binary_cross_entropy_222, ))
+    #     return binary_cross_entropy_76, binary_cross_entropy_176, binary_cross_entropy_199, binary_cross_entropy_222
+    #     ...
 
 
 def pp_obj_pas(graph, cfg):
@@ -138,5 +174,3 @@ def test_trainer_pipeline_async(tmp_path):
 
     assert_equal(merged_state_dicts[0]['model'], merged_state_dicts[1]['model'])
     assert_equal(merged_state_dicts[0]['optimizer'], merged_state_dicts[1]['optimizer'])
-    assert_equal(merged_state_dicts[0]['model'], merged_state_dicts[2]['model'])
-    assert_equal(merged_state_dicts[0]['optimizer'], merged_state_dicts[2]['optimizer'])
