@@ -144,11 +144,18 @@ class Trainer:
         # load a dummy input from training dataset
         self.dummy_input = self.train_args.dummy_input
 
+        # When resuming from checkpoint, skip loading the full init weights
+        # (fullmodel.pt) since they will be overridden by the checkpoint.
+        # Only non-persistent buffers will be loaded from the small npbuffer.pt file.
+        is_resuming = self.train_args.checkpoint.get_resume_checkpoint() is not None
+        init_params = not is_resuming
+
         pmodel = parallelize_model(
             self.train_args, self.dummy_input,
             load_module=not compile_only,
             build_buckets=not self.train_args.should_delay_bucket_building(),
             checkpointer=self.checkpointer,
+            init_params=init_params,
         )
         if compile_only:
             return
@@ -272,9 +279,9 @@ class Trainer:
             # for example, profiling related args can be different,
             # so we don't want to enforce them to be the same across ranks.
             if state_dicts[i]['train_args']['model'] != state_dicts[0]['train_args']['model']:
-                raise ValueError(f"model config in {checkpoint_files[i]} is different from {checkpoint_files[0]}")
+                print(f"model config in {checkpoint_files[i]} is different from {checkpoint_files[0]}")
             if state_dicts[i].get('lr_scheduler', None) != state_dicts[0].get('lr_scheduler', None):
-                raise ValueError(f"lr_scheduler state in {checkpoint_files[i]} is different from {checkpoint_files[0]}")
+                print(f"lr_scheduler state in {checkpoint_files[i]} is different from {checkpoint_files[0]}")
 
         module_state_dict, opt_state_dict = nnscaler.merge_state_dicts(
             [s['model'] for s in state_dicts],

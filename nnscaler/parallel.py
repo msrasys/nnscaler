@@ -525,6 +525,7 @@ class BroadcastGenFilesStrategy(Enum):
     1. config file: compute config (compute_config.pt)
     2. trace files: graph dump (graph.ckp), forward args dump(forward_args.pkl),
        origin module metadata (origin_module_metadata.pt), init weights file(fullmodel.pt.*),
+       non-persistent buffer file (npbuffer.pt),
        param name mapping (dist_param_map.pt)
     3. code: generated code files (gencode*.py)
 
@@ -540,13 +541,15 @@ class BroadcastGenFilesStrategy(Enum):
     # please note the init weight files can be huge.
     ALL = 'all'
 
-    # broadcast all new generated files except init weights (fullmodel.pt.*).
+    # broadcast all new generated files except init weights (fullmodel.pt.*, npbuffer.pt).
     # Without weights,
-    # you can only construct the parallel module with `init_params=False`.
-    # You can then
+    # you can only construct parallel modules that have no non-persistent buffers with `init_params=False`.
+    # Non-persistent buffers (npbuffer.pt) are also excluded because they are
+    # part of the model weights. You can then
     # 1. Load the weights from a checkpoint file with `module.load_state_dict` or `load_merged_state_dict`
     # 2. Or you can use `broadcast_weights` to get the weights from the workers in node0.
     #    (local world size should be bigger than plan_ngpus)
+    #    `broadcast_weights` will also broadcast non-persistent buffers and mark them as initialized.
     NO_WEIGHTS = 'no_weights'
 
     # broadcast the new generated code (gencode*.py) and compute_config.pt only.
@@ -649,6 +652,7 @@ def _prepare_and_check_reusable(
         expected_output_files.append(outdir / _GRAPH_DUMP_FILE)
         expected_output_files.append(outdir / _FORWARD_ARGS_DUMP_FILE)
         expected_output_files.append(outdir / ParallelModule.ORIGIN_MODULE_METADATA_FILE)
+        expected_output_files.append(outdir / FxModuleParser.NON_PERSISTENT_BUFFER_FILE)
         existing_output_files = [
             f for f in outdir.glob('*')
             if f.is_file() and (  # just take fullmodel.pt.0 to compare
@@ -2665,8 +2669,11 @@ def _broadcast_gen_files(
             if file.is_file() and (
                 broadcast_strategy == BroadcastGenFilesStrategy.ALL or
                 (
+                    # NO_WEIGHTS excludes both fullmodel.pt.* and npbuffer.pt.
+                    # Non-persistent buffers will be initialized via `broadcast_weights`.
                     broadcast_strategy == BroadcastGenFilesStrategy.NO_WEIGHTS
                     and not file.name.startswith(FxModuleParser.ATTR_CONTENT_FILE_STEM)
+                    and file.name != FxModuleParser.NON_PERSISTENT_BUFFER_FILE
                 ) or
                 (
                     # broadcast code files and compute config file

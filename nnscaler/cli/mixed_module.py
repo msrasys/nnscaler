@@ -220,7 +220,8 @@ class ModuleParallelizeConfigAdapter(PrecisionMixin, PolicyMixin):
         dummy_input: Optional[dict[str, Any]] = None, *,
         load_module: bool = True,
         build_buckets: bool = True,
-        module_args: Optional[tuple[tuple, dict]] = None
+        module_args: Optional[tuple[tuple, dict]] = None,
+        init_params: bool = True,
     ) -> Optional[nnscaler.ParallelModule]:
         pmodel_class = nnscaler.parallelize(
             self.model_type,
@@ -236,7 +237,7 @@ class ModuleParallelizeConfigAdapter(PrecisionMixin, PolicyMixin):
             autoset_requires_grad=self.autoset_requires_grad,
         )
         if load_module:
-            pmodel = pmodel_class(build_buckets=False)
+            pmodel = pmodel_class(init_params=init_params, build_buckets=False)
             self.set_grad_dtype(pmodel)
             if build_buckets:
                 pmodel.build_buckets()
@@ -312,7 +313,8 @@ def parallelize_model(
     dummy_input: dict[str, Any],
     load_module: bool,
     build_buckets: bool,
-    checkpointer: Checkpointer
+    checkpointer: Checkpointer,
+    init_params: bool = True,
 ):
     tracing_weights = None
     checkpointer = checkpointer or Checkpointer()
@@ -328,7 +330,7 @@ def parallelize_model(
 
     if not trainer_args.model.parallel_modules:
         # parallelize the whole model
-        return _new_adapter().parallelize(dummy_input, load_module=load_module, build_buckets=build_buckets)
+        return _new_adapter().parallelize(dummy_input, load_module=load_module, build_buckets=build_buckets, init_params=init_params)
 
     if not load_module and all(pm.args is not None for pm in trainer_args.model.parallel_modules):
         for m in trainer_args.model.parallel_modules:
@@ -382,7 +384,7 @@ def parallelize_model(
                 # This is a trade-off to make sure the parallelized module is consistent.
                 # Maybe we can use torch.distributed.broadcast to sync the random state in all devices.
                 with fork_rng():
-                    return adapter.parallelize(dummy_input, load_module=load_module, build_buckets=build_buckets, module_args=(args, kwargs))
+                    return adapter.parallelize(dummy_input, load_module=load_module, build_buckets=build_buckets, module_args=(args, kwargs), init_params=init_params)
         finally:
             _patch_new()
 
