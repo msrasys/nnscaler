@@ -1124,14 +1124,14 @@ class Trainer:
             step_metrics = {k:v for k, v in asdict(step_stat).items() if v is not None}
             step_metrics['loss'] = step_metrics['train_loss']
             train_wall_at = time.perf_counter()
+            step_metrics['train_wall'] = train_wall_at - (last_step_start_at or step_start_at)
+            step_metrics['local_train_wall'] = train_wall_at - step_start_at
             timer_walls = {
                 'read_batch': read_batch_wall,
                 'train_step': train_step_wall,
                 'sync_shard_grad': sync_shard_grad_wall,
                 'check_grad': check_grad_wall,
                 'optim_step': optim_step_wall,
-                'local_train_wall': train_wall_at - step_start_at,
-                'global_train_wall': train_wall_at - (last_step_start_at or step_start_at),
             }
             last_step_start_at = train_wall_at
             self.hook.before_log_train_metrics(self, step_metrics, aggregated_outputs)
