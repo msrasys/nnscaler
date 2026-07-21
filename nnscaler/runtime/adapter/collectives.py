@@ -32,9 +32,9 @@ def move(tensor: Optional[torch.Tensor], shape: Tuple[int], dtype: torch.dtype, 
         assert torch.is_tensor(tensor)
         if async_op:
             work = torch.distributed.isend(tensor, dst)
-            # NOTE: we need to submit the work to AsyncCommHandler,
-            # otherwise the tensor will be freed before the communication is done.
-            AsyncCommHandler().submit(tensor, [work])
+            # NOTE: we need to hold the work to AsyncCommHandler,
+            # otherwise the tensor can be freed before the communication starts.
+            AsyncCommHandler().hold_send(tensor, work)
         else:
             torch.distributed.send(tensor, dst)
     else:

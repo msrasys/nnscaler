@@ -7,15 +7,100 @@ Executor for runtime
 import atexit
 
 from dataclasses import dataclass
-from typing import Tuple, Any, Callable, List, Dict, Iterable, Optional
+from typing import Tuple, Any, Callable, List, Dict, Iterable, Optional, Union, Iterator
 import torch
 import logging
+from torch.distributed import Work
 
 from torch.autograd.graph import GradientEdge
-from torch.distributed.pipelining._backward import (
-    _get_grad_fn_or_grad_acc,
-    stage_backward_input as _stage_backward_input,
-)
+from torch.nn import Parameter
+
+try:
+    from torch.distributed.pipelining._backward import (
+        stage_backward_input,
+        _get_grad_fn_or_grad_acc,
+    )
+
+    def stage_backward_weight(
+        weights: Iterator[Parameter], param_groups: list[dict[str, Any]], retain_graph=False
+    ) -> tuple[torch.Tensor | None, ...]:
+        """
+        copied from torch.distributed.pipelining._backward.stage_backward_weight
+
+        Compute weight gradients deferred by ``stage_backward_input`` and route
+        them through each weight's ``AccumulateGrad`` node.
+
+        Unlike ``torch.distributed.pipelining._backward.stage_backward_weight`` (which
+        assigns ``weight.grad`` directly via ``torch.autograd.grad``), this helper
+        seeds a leaf backward on each weight so that any hooks registered on the
+        weight's ``AccumulateGrad`` node fire. The gradient reducer relies on those
+        hooks to move ``weight.grad`` into its contiguous buffer, so bypassing them
+        leaves ``weight.grad`` set and the reducer's ``sync_grads`` bookkeeping stale.
+        """
+        # map weights to param_group_weights
+        grad_acc_to_weight = {}
+        weight_grads: list[torch.Tensor | None] = []
+        for index, weight in enumerate(weights):
+            grad_acc = _get_grad_fn_or_grad_acc(weight)
+            grad_acc_to_weight[grad_acc] = weight, index
+            weight_grads.append(weight.grad)
+
+        for param_group in param_groups:
+            valid_edges = []
+            valid_grad_outputs: list[torch.Tensor] = []
+
+            for grads_tuple, intermediate in zip(
+                param_group["grads"], param_group["intermediates"]
+            ):
+                non_none_grads = [g for g in grads_tuple if g is not None]
+                if non_none_grads:
+                    summed_grad = sum(non_none_grads)
+                    valid_edges.append(GradientEdge(intermediate, 0))
+                    # pyrefly: ignore [bad-argument-type]
+                    valid_grad_outputs.append(summed_grad)
+
+            # Break a reference cycle caused inside stage_backward_input->get_hook->hook
+            # The summarized cycle is:
+            # `hook` -> cell -> param_group -> intermediates -> `hook`
+            # because we install the hook function onto each of the intermediate autograd nodes.
+            # We need to keep intermediates alive up until backward_weight, but we can free it now.
+            del param_group["intermediates"]
+
+            if valid_edges:  # Only call autograd.grad if we have valid gradients
+                # [NEW!] Able to pass a GradientEdge to autograd.grad as output
+                weights_edges = tuple(GradientEdge(w, 0) for w in param_group["params"])
+                dweights = torch.autograd.grad(
+                    valid_edges,
+                    weights_edges,
+                    grad_outputs=valid_grad_outputs,
+                    retain_graph=retain_graph,
+                )
+
+                # release grad memory early after use
+                del param_group["grads"]
+
+                # Route each dW through the weight's AccumulateGrad node so that
+                # reducer hooks fire. `weight` is a leaf, so this only accumulates
+                # into its grad and does not recompute input gradients.
+                for grad_acc, dweight in zip(param_group["params"], dweights):
+                    weight, _ = grad_acc_to_weight[grad_acc]
+                    torch.autograd.backward([weight], grad_tensors=[dweight])
+        # return grads in the original order weights were provided in
+        return tuple(weight_grads)
+
+except ImportError:
+    def stage_backward_input(*args, **kwargs):
+        raise RuntimeError(
+            "torch.distributed.pipelining._backward.stage_backward_input is not available. "
+            "Please ensure you are using a compatible version of PyTorch."
+        )
+
+    def stage_backward_weight(*args, **kwargs):
+        raise RuntimeError(
+            "torch.distributed.pipelining._backward.stage_backward_weight is not available. "
+            "Please ensure you are using a compatible version of PyTorch."
+        )
+
 
 _logger = logging.getLogger(__name__)
 
@@ -30,21 +115,11 @@ def debug_id(tensors, msg: str, rank: int):
             print(f'[{torch.distributed.get_rank()}] {msg}: {[id(t) for t in tensors]}')
 
 
-class AsyncCommHandler:
-
-    class __AsyncCommHandler:
-        def __init__(self):
-            self._works: Dict[int, List] = {}
-            self._callbacks: Dict[int, Callable] = {}
-
-    instance = None
-
+class _AsyncCommHandler:
     def __init__(self) -> None:
-        if not AsyncCommHandler.instance:
-            AsyncCommHandler.instance = AsyncCommHandler.__AsyncCommHandler()
-
-    def __getattr__(self, name):
-        return getattr(self.instance, name)
+        self._works: Dict[torch.Tensor, Union[torch.Tensor, List[Work]]] = {}
+        self._callbacks: Dict[torch.Tensor, Callable] = {}
+        self._send_holds: List[Tuple[torch.Tensor, Work]] = []
 
     def wait(self, tensor: torch.Tensor) -> torch.Tensor:
         """
@@ -53,28 +128,72 @@ class AsyncCommHandler:
         @param tensor torch.Tensor
         @return tensor torch.Tensor
         """
-        if id(tensor) not in self._works:
+        if tensor not in self._works:
             return tensor
-        works = self._works.pop(id(tensor))
-        for work in works:
+
+        tensor_or_works = self._works.pop(tensor)
+        if isinstance(tensor_or_works, torch.Tensor):
+            return tensor_or_works
+
+        for work in tensor_or_works:
             work.wait()
-        callback = self._callbacks.pop(id(tensor))
+        callback = self._callbacks.pop(tensor)
         if callback is not None:
             tensor = callback(tensor)
         return tensor
 
-    def submit(self, tensor: torch.Tensor, works: List, callback: Optional[Callable] = None):
+    def submit(self, tensor: torch.Tensor, works: List[Work], callback: Optional[Callable] = None):
         """
         Submit an async communication
         """
-        self._works[id(tensor)] = works
-        self._callbacks[id(tensor)] = callback
+        self._works[tensor] = works
+        self._callbacks[tensor] = callback
 
-    def clear(self):
-        AsyncCommHandler.instance = AsyncCommHandler.__AsyncCommHandler()
+    def hold_send(self, tensor: torch.Tensor, work: Work):
+        self._send_holds.append((tensor, work))
+
+    def drain_sends_completed(self):
+        running: list[tuple[torch.Tensor, Work]] = []
+        for tensor, work in self._send_holds:
+            if work.is_completed():
+                work.wait()
+            else:
+                running.append((tensor, work))
+        self._send_holds[:] = running
+
+    def drain_sends(self):
+        for _, work in self._send_holds:
+            work.wait()
+        self._send_holds.clear()
+
+    def drain_all_completed(self):
+        self.drain_sends_completed()
+
+        for tensor, tensor_or_works in list(self._works.items()):
+            if isinstance(tensor_or_works, torch.Tensor):
+                continue
+
+            if not all(work.is_completed() for work in tensor_or_works):
+                continue
+
+            for work in tensor_or_works:
+                work.wait()
+
+            callback = self._callbacks.pop(tensor)
+            self._works[tensor] = tensor if callback is None else callback(tensor)
 
     def check_clear(self):
-        assert len(self._works) == 0 and len(self._callbacks) == 0
+        assert len(self._works) == 0 and len(self._callbacks) == 0 and len(self._send_holds) == 0, \
+            f"AsyncCommHandler not cleared: works={len(self._works)}, callbacks={len(self._callbacks)}, send_holds={len(self._send_holds)}"
+
+
+_instance: Optional[_AsyncCommHandler] = None
+
+def AsyncCommHandler() -> _AsyncCommHandler:
+    global _instance
+    if _instance is None:
+        _instance = _AsyncCommHandler()
+    return _instance
 
 
 TensorPairs = List[Tuple[int, torch.Tensor]]
@@ -85,42 +204,6 @@ class _WeightBackwardState:
     param_groups: Optional[List[Dict[str, Any]]] = None
     output_tensors: Optional[Tuple[torch.Tensor, ...]] = None
     output_tensor_grads: Optional[Tuple[Optional[torch.Tensor], ...]] = None
-
-
-def _stage_backward_weight(
-    weights: Iterable[torch.nn.Parameter],
-    param_groups: List[Dict[str, Any]],
-) -> None:
-    """Continue backward from captured edges through AccumulateGrad nodes."""
-    grad_acc_to_weight = {
-        _get_grad_fn_or_grad_acc(weight): weight
-        for weight in weights
-    }
-
-    for param_group in param_groups:
-        valid_edges = []
-        valid_grad_outputs = []
-        for grads, intermediate in zip(
-            param_group['grads'], param_group['intermediates']
-        ):
-            non_none_grads = [grad for grad in grads if grad is not None]
-            if non_none_grads:
-                valid_edges.append(GradientEdge(intermediate, 0))
-                valid_grad_outputs.append(sum(non_none_grads))
-
-        del param_group['intermediates']
-        del param_group['grads']
-
-        if valid_edges:
-            group_weights = tuple(
-                grad_acc_to_weight[grad_acc]
-                for grad_acc in param_group['params']
-            )
-            torch.autograd.backward(
-                valid_edges,
-                grad_tensors=valid_grad_outputs,
-                inputs=group_weights,
-            )
 
 
 class Executor:
@@ -325,7 +408,7 @@ class Executor:
             tensor.clone() if tensor._is_view() else tensor
             for tensor in dedup_output_tensors
         ]
-        grads, param_groups = _stage_backward_input(
+        grads, param_groups = stage_backward_input(
             stage_outputs,
             dedup_output_tensor_grads,
             input_tensors,
@@ -354,14 +437,18 @@ class Executor:
 
         if state.param_groups is not None:
             if weights and state.param_groups:
-                _stage_backward_weight(weights, state.param_groups)
+                stage_backward_weight(weights, state.param_groups)
             return
 
         if weights:
+            # No `inputs=weights`: run the backward through each weight's
+            # AccumulateGrad node so reducer hooks fire. Since this branch is
+            # only taken when the segment has no grad-requiring inputs, the
+            # backward reaches only weight leaves and does not recompute input
+            # gradients.
             torch.autograd.backward(
                 state.output_tensors,
                 grad_tensors=state.output_tensor_grads,
-                inputs=weights,
             )
 
     @staticmethod
@@ -369,6 +456,7 @@ class Executor:
         """
         Wait until the finish of synchornized tensors
         """
+        AsyncCommHandler().drain_all_completed()
         return [AsyncCommHandler().wait(t) if torch.is_tensor(t) else t for t in tensors]
 
 
@@ -415,6 +503,7 @@ aexecute = Executor.aexecute
 backward = Executor.backward
 backward_input = Executor.backward_input
 backward_weight = Executor.backward_weight
+sync_tensors = Executor.sync_tensors
 
 
 # register checking for normal exit
