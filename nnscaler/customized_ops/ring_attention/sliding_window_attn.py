@@ -40,6 +40,8 @@ def wrap_sliding_window_attn_func(
         use_cute: bool = False,
         process_group: Tuple[int] = None,
         return_lse: bool = False,
+        max_seqlen_q: Optional[int] = None,
+        max_seqlen_k: Optional[int] = None,
 ):
     '''
     Context parallel sliding window attention using single-hop A2A communication.
@@ -54,8 +56,10 @@ def wrap_sliding_window_attn_func(
     - window_size[0] <= length_per_rank (single-hop communication)
     '''
     assert not return_attn_probs, "return_attn_probs is not supported"
-    max_seqlen_q = (cu_seqlens_q[1:] - cu_seqlens_q[:-1]).max().item()
-    max_seqlen_k = (cu_seqlens_k[1:] - cu_seqlens_k[:-1]).max().item()
+    if max_seqlen_q is None:
+        max_seqlen_q = (cu_seqlens_q[1:] - cu_seqlens_q[:-1]).max().item()
+    if max_seqlen_k is None:
+        max_seqlen_k = (cu_seqlens_k[1:] - cu_seqlens_k[:-1]).max().item()
 
     if process_group is None or len(process_group) == 1 or not enable_ring:
         if use_cute:
