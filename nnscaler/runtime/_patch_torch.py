@@ -102,3 +102,19 @@ if torch.__version__ < (2, 4, 0):
 
     torch.distributed.send_object_list = send_object_list
     torch.distributed.recv_object_list = recv_object_list
+
+
+try:
+    from ._patch_torch_pipelining_backend import stage_backward_input, stage_backward_weight
+except ImportError:
+    def stage_backward_input(*args, **kwargs):
+        raise ImportError(
+            "Failed to import stage_backward_input from torch.distributed. "
+            "Please update pytorch version to a higher version."
+        )
+
+    def stage_backward_weight(*args, **kwargs):
+        raise ImportError(
+            "Failed to import stage_backward_weight from torch.distributed. "
+            "Please update pytorch version to a higher version."
+        )
