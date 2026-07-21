@@ -17,6 +17,10 @@ _ALLOW_GRAD_DTYPES = (torch.double, torch.float32, torch.float16, torch.bfloat16
 
 
 def _wait_for_work(work, trace_context: Optional[ct.TraceContext]):
+    is_completed = getattr(work, 'is_completed', None)
+    if is_completed is not None and is_completed():
+        work.wait()
+        return
     with ct.range_from(trace_context, kind=ct.Kind.WAIT, source=_WAIT_SOURCE):
         work.wait()
 
@@ -32,6 +36,12 @@ def debug_id(tensors, msg: str, rank: int):
             print(f'[{torch.distributed.get_rank()}] {msg}: {[id(t) for t in tensors]}')
 
 
+try:
+    from torch.autograd.graph import get_gradient_edge
+except ImportError:
+    get_gradient_edge = None
+
+
 class AsyncCommHandler:
 
     class __AsyncCommHandler:
@@ -40,6 +50,8 @@ class AsyncCommHandler:
             self._callbacks: Dict[int, Callable] = {}
             self._metas: Dict[int, Optional[ct.TraceContext]] = {}
             self._send_holds: List = []
+            self._send_bundle_queues: Dict[Any, List[List]] = {}
+            self._active_send_bundle: Optional[Tuple[Any, List]] = None
 
     instance = None
 
@@ -78,24 +90,70 @@ class AsyncCommHandler:
         self._callbacks[tid] = callback
         self._metas[tid] = ct.current_context()
 
-    def hold_send(self, tensor: torch.Tensor, work):
-        self._send_holds.append((tensor, work, ct.current_context()))
+    def hold_send(self, tensor: torch.Tensor, work, callback: Optional[Callable] = None):
+        hold = (tensor, work, callback, ct.current_context())
+        state = self.instance
+        if state._active_send_bundle is None:
+            state._send_holds.append(hold)
+        else:
+            state._active_send_bundle[1].append(hold)
+
+    @staticmethod
+    def _complete_send_holds(holds):
+        for _, work, callback, trace_context in holds:
+            _wait_for_work(work, trace_context)
+            if callback is not None:
+                callback()
+
+    def reserve_send_bundle(self, key, max_pending: int = 2):
+        """Wait for capacity before materializing another pipeline output."""
+        if max_pending < 1:
+            raise ValueError(f'max_pending must be positive, got {max_pending}')
+
+        queue = self._send_bundle_queues.setdefault(key, [])
+        while len(queue) >= max_pending:
+            self._complete_send_holds(queue.pop(0))
+
+    def begin_send_bundle(self, key):
+        """Start collecting sends for one pipeline boundary."""
+        state = self.instance
+        if state._active_send_bundle is not None:
+            raise RuntimeError('A send bundle is already active')
+        state._active_send_bundle = (key, [])
+
+    def end_send_bundle(self):
+        """Commit the active pipeline-boundary send bundle."""
+        state = self.instance
+        if state._active_send_bundle is None:
+            raise RuntimeError('No send bundle is active')
+        key, holds = state._active_send_bundle
+        state._active_send_bundle = None
+        if holds:
+            state._send_bundle_queues.setdefault(key, []).append(holds)
 
     def drain_sends(self, wait: bool = True):
+        if self._active_send_bundle is not None:
+            raise RuntimeError('Cannot drain sends while a send bundle is active')
+
         if wait:
-            for _, work, trace_context in self._send_holds:
-                _wait_for_work(work, trace_context)
+            self._complete_send_holds(self._send_holds)
             self._send_holds.clear()
+            for queue in self._send_bundle_queues.values():
+                for bundle in queue:
+                    self._complete_send_holds(bundle)
+            self._send_bundle_queues.clear()
             return
 
         pending = []
-        for tensor, work, trace_context in self._send_holds:
+        for tensor, work, callback, trace_context in self._send_holds:
             is_completed = getattr(work, 'is_completed', None)
             if is_completed is not None and is_completed():
                 work.wait()
+                if callback is not None:
+                    callback()
             else:
-                pending.append((tensor, work, trace_context))
-        self._send_holds = pending
+                pending.append((tensor, work, callback, trace_context))
+        self._send_holds[:] = pending
 
     def drain(self):
         self.drain_sends()
@@ -115,10 +173,19 @@ class AsyncCommHandler:
         AsyncCommHandler.instance = AsyncCommHandler.__AsyncCommHandler()
 
     def check_clear(self):
-        assert len(self._works) == 0 and len(self._callbacks) == 0 and len(self._metas) == 0 and len(self._send_holds) == 0, (
+        assert (
+            len(self._works) == 0
+            and len(self._callbacks) == 0
+            and len(self._metas) == 0
+            and len(self._send_holds) == 0
+            and len(self._send_bundle_queues) == 0
+            and self._active_send_bundle is None
+        ), (
             f"AsyncCommHandler is not clear: works={len(self._works)}, "
             f"callbacks={len(self._callbacks)}, metas={len(self._metas)}, "
-            f"send_holds={len(self._send_holds)}"
+            f"send_holds={len(self._send_holds)}, "
+            f"send_bundle_queues={len(self._send_bundle_queues)}, "
+            f"active_send_bundle={self._active_send_bundle is not None}"
         )
 
 
@@ -133,6 +200,9 @@ class Executor:
     # Each graph has its name, and multiple call for the graph will append
     # (instant id -> detached) input tensor pairs for backward reference.
     _detach: Dict[str, List[TensorPairs]] = dict()
+    _pseudo_free_grad_edges: Dict[int, Any] = dict()
+    _pseudo_free_pending_sends: Dict[int, int] = dict()
+    _pseudo_free_unavailable_warned = False
     _backward_pre_hook: Optional[Callable] = None
 
     @staticmethod
@@ -208,8 +278,18 @@ class Executor:
         saved_pairs = Executor._detach[name].pop(0)
         tensor_ids: List[int] = [pair[0] for pair in saved_pairs]
         dtensors: List[torch.Tensor] = [pair[1] for pair in saved_pairs]
-        for t in input_tensors:
-            if id(t) not in tensor_ids:
+        requested_input_tensors = input_tensors
+        requested_tensor_ids = [
+            id(t) for t in requested_input_tensors if torch.is_tensor(t)
+        ]
+        dtensor_by_input_id = {
+            tid: dtensor
+            for tid, dtensor in saved_pairs
+            if torch.is_tensor(dtensor)
+        }
+
+        for t in requested_input_tensors:
+            if torch.is_tensor(t) and id(t) not in tensor_ids:
                 import traceback
                 _logger.warning(
                     f"rank {torch.distributed.get_rank()}: input {name} doesn't match. "
@@ -221,7 +301,8 @@ class Executor:
         if len(output_tensors) == 0: return None
 
         input_tensors = []
-        for t in dtensors:
+        for tid in requested_tensor_ids:
+            t = dtensor_by_input_id.get(tid)
             if torch.is_tensor(t) and t.requires_grad:
                 t.retain_grad()
                 input_tensors.append(t)
@@ -246,10 +327,25 @@ class Executor:
                     dedup_output_tensor_grads
                 )
 
-        torch.autograd.backward(
-            dedup_output_tensors,
-            grad_tensors=dedup_output_tensor_grads,
-        )
+        pseudo_free_output_ids = []
+        backward_roots = []
+        for tensor in dedup_output_tensors:
+            edge = Executor._pseudo_free_grad_edges.get(id(tensor))
+            if edge is None:
+                backward_roots.append(tensor)
+            else:
+                pseudo_free_output_ids.append(id(tensor))
+                backward_roots.append(edge)
+
+        try:
+            torch.autograd.backward(
+                backward_roots,
+                grad_tensors=dedup_output_tensor_grads,
+            )
+        finally:
+            for tensor_id in pseudo_free_output_ids:
+                Executor._pseudo_free_grad_edges.pop(tensor_id, None)
+                Executor._pseudo_free_pending_sends.pop(tensor_id, None)
         grads = tuple(t.grad for t in input_tensors)
         assert all(grad is not None for grad in grads), "RuntimeError: got gradient None"
 
@@ -287,10 +383,75 @@ class Executor:
                 same format of updated tensors.
         """
         Executor._backward_pre_hook = hook
+
+    @staticmethod
+    def _can_pseudo_free_tensor(tensor: torch.Tensor) -> bool:
+        if get_gradient_edge is None:
+            if not Executor._pseudo_free_unavailable_warned:
+                _logger.warning(
+                    'Pipeline output pseudo-free requires '
+                    'torch.autograd.graph.get_gradient_edge; leaving outputs allocated.'
+                )
+                Executor._pseudo_free_unavailable_warned = True
+            return False
+        if not torch.is_tensor(tensor):
+            return False
+        if not tensor.requires_grad or tensor.grad_fn is None:
+            return False
+        if tensor.layout != torch.strided or tensor.numel() <= 1:
+            return False
+        if getattr(tensor, '_base', None) is not None:
+            return False
+        return True
+
+    @staticmethod
+    def _record_pseudo_free_edge(tensor: torch.Tensor) -> bool:
+        if not Executor._can_pseudo_free_tensor(tensor):
+            return False
+        tensor_id = id(tensor)
+        if tensor_id not in Executor._pseudo_free_grad_edges:
+            Executor._pseudo_free_grad_edges[tensor_id] = get_gradient_edge(tensor)
+        return True
+
+    @staticmethod
+    def defer_pseudo_free_tensor(tensor: torch.Tensor) -> torch.Tensor:
+        if Executor._record_pseudo_free_edge(tensor):
+            tensor_id = id(tensor)
+            Executor._pseudo_free_pending_sends[tensor_id] = \
+                Executor._pseudo_free_pending_sends.get(tensor_id, 0) + 1
+        return tensor
+
+    @staticmethod
+    def complete_deferred_pseudo_free_tensor(tensor: torch.Tensor) -> torch.Tensor:
+        tensor_id = id(tensor)
+        pending = Executor._pseudo_free_pending_sends.get(tensor_id)
+        if pending is None:
+            return tensor
+        if pending > 1:
+            Executor._pseudo_free_pending_sends[tensor_id] = pending - 1
+            return tensor
+
+        Executor._pseudo_free_pending_sends.pop(tensor_id, None)
+        if tensor_id not in Executor._pseudo_free_grad_edges:
+            return tensor
+        return Executor.pseudo_free_tensor(tensor)
+
+    @staticmethod
+    def pseudo_free_tensor(tensor: torch.Tensor) -> torch.Tensor:
+        """
+        Replace a non-leaf output tensor's payload with a 1-element placeholder
+        while keeping its autograd edge for a later Executor.backward call.
+        """
+        if not Executor._record_pseudo_free_edge(tensor):
+            return tensor
+        tensor.data = torch.empty((1,), dtype=tensor.dtype, device=tensor.device)
+        return tensor
     
     @staticmethod
     def clear():
         Executor._detach = dict()
+        Executor._pseudo_free_grad_edges = dict()
+        Executor._pseudo_free_pending_sends = dict()
         Executor._backward_pre_hook = None
 
     @staticmethod
@@ -298,11 +459,22 @@ class Executor:
         for name, npairs in Executor._detach.items():
             assert len(npairs) == 0, \
                 f"Fine remaining segment needs backward: {name}, remaining times: {len(npairs)}"
+        assert (
+            len(Executor._pseudo_free_grad_edges) == 0
+            and len(Executor._pseudo_free_pending_sends) == 0
+        ), (
+            f"Pseudo-free output tensors remain: "
+            f"edges={len(Executor._pseudo_free_grad_edges)}, "
+            f"pending_sends={len(Executor._pseudo_free_pending_sends)}"
+        )
 
 
 fexecute = Executor.fexecute
 aexecute = Executor.aexecute
 backward = Executor.backward
+pseudo_free_tensor = Executor.pseudo_free_tensor
+defer_pseudo_free_tensor = Executor.defer_pseudo_free_tensor
+complete_deferred_pseudo_free_tensor = Executor.complete_deferred_pseudo_free_tensor
 
 
 # register checking for normal exit

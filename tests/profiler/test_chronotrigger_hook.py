@@ -216,3 +216,76 @@ def test_hook_owns_step_and_delayed_capture(monkeypatch):
         ("barrier",),
         ("cudaProfilerStop",),
     ]
+
+
+def test_failed_profiler_start_does_not_activate_or_emit_metadata(monkeypatch):
+    trainer = _trainer(step=10)
+    metadata_calls = []
+    hook = chronotrigger_hook.ChronoTriggerTrainHook()
+    hook.capture_window = (10, 12)
+    monkeypatch.setattr(chronotrigger_hook.ct, "set_step", lambda step: None)
+    monkeypatch.setattr(
+        chronotrigger_hook.ct,
+        "emit_metadata",
+        lambda: metadata_calls.append("metadata"),
+    )
+    monkeypatch.setattr(chronotrigger_hook, "_distributed_barrier", lambda: None)
+    monkeypatch.setattr(chronotrigger_hook.torch.cuda, "synchronize", lambda: None)
+
+    def fail_start(name):
+        raise RuntimeError(name)
+
+    monkeypatch.setattr(chronotrigger_hook, "_cuda_profiler_call", fail_start)
+
+    with pytest.raises(RuntimeError, match="cudaProfilerStart"):
+        hook.on_step_start(trainer, 0, 10)
+
+    assert hook.capture_started is False
+    assert metadata_calls == []
+
+
+def test_failed_profiler_stop_surfaces_and_remains_active(monkeypatch):
+    trainer = _trainer(step=12)
+    hook = chronotrigger_hook.ChronoTriggerTrainHook()
+    hook.capture_window = (10, 12)
+    hook.capture_started = True
+    monkeypatch.setattr(chronotrigger_hook, "_distributed_barrier", lambda: None)
+    monkeypatch.setattr(chronotrigger_hook.torch.cuda, "synchronize", lambda: None)
+
+    def fail_stop(name):
+        raise RuntimeError(name)
+
+    monkeypatch.setattr(chronotrigger_hook, "_cuda_profiler_call", fail_stop)
+
+    with pytest.raises(RuntimeError, match="cudaProfilerStop"):
+        hook.on_step_end(trainer, 0, 11, {}, None)
+
+    assert hook.capture_stopped is False
+
+
+def test_finalize_stops_locally_without_barrier_and_clears_active(monkeypatch):
+    trainer = _trainer(step=11)
+    calls = []
+    hook = chronotrigger_hook.ChronoTriggerTrainHook()
+    hook.capture_window = (10, 12)
+    hook.capture_started = True
+    monkeypatch.setattr(
+        chronotrigger_hook,
+        "_distributed_barrier",
+        lambda: pytest.fail("finalize must not enter a distributed barrier"),
+    )
+    monkeypatch.setattr(
+        chronotrigger_hook.torch.cuda,
+        "synchronize",
+        lambda: pytest.fail("finalize must not synchronize failed work"),
+    )
+    monkeypatch.setattr(
+        chronotrigger_hook,
+        "_cuda_profiler_call",
+        lambda name: calls.append(name),
+    )
+
+    hook.on_finalize(trainer)
+
+    assert calls == ["cudaProfilerStop"]
+    assert hook.capture_stopped is True

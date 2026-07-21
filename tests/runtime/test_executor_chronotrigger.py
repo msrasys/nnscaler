@@ -10,14 +10,15 @@ from nnscaler.runtime.executor import AsyncCommHandler
 
 
 class FakeWork:
-    def __init__(self):
+    def __init__(self, *, completed=False):
         self.waited = False
+        self.completed = completed
 
     def wait(self):
         self.waited = True
 
     def is_completed(self):
-        return True
+        return self.completed
 
 
 @pytest.fixture(autouse=True)
@@ -79,7 +80,7 @@ def test_held_send_reuses_exact_trace_context_at_drain(trace_observer):
 
 def test_completed_send_cleanup_does_not_emit_wait_range(trace_observer):
     _, waits = trace_observer
-    work = FakeWork()
+    work = FakeWork(completed=True)
     handler = AsyncCommHandler()
 
     handler.hold_send(object(), work)
@@ -87,3 +88,19 @@ def test_completed_send_cleanup_does_not_emit_wait_range(trace_observer):
 
     assert work.waited
     assert waits == []
+
+
+def test_bundled_send_reuses_exact_trace_context_at_drain(trace_observer):
+    trace_context, waits = trace_observer
+    work = FakeWork()
+    handler = AsyncCommHandler()
+
+    handler.begin_send_bundle(((0, 1),))
+    handler.hold_send(object(), work, callback=lambda: None)
+    handler.end_send_bundle()
+    handler.drain_sends()
+
+    assert work.waited
+    assert len(waits) == 1
+    assert waits[0][:2] == (trace_context, ct.Kind.WAIT)
+    assert waits[0][2]["source"] is not None

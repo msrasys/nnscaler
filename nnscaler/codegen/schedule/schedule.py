@@ -1,7 +1,7 @@
 #  Copyright (c) Microsoft Corporation.
 #  Licensed under the MIT License.
 
-from typing import List, Optional, Tuple, Union
+from typing import Dict, List, Optional, Tuple, Union
 import copy
 import inspect
 import logging
@@ -11,6 +11,7 @@ from nnscaler.ir.cten import IRCell, IRObject, IRTensor, IR
 from nnscaler.ir.operator import IRDataOperation, IRFwOperation
 from nnscaler.ir.tensor import IRSubTensor
 from nnscaler.ir.adapter import IRWeightReducer, IRAdapter
+from nnscaler.ir.adapter.prim import MovePrim
 from nnscaler.graph.graph import IRSegment
 
 from nnscaler.execplan.execplan import ExecutionPlan, ExeReuseCell
@@ -133,12 +134,16 @@ class ScheduleCodeGen(FuncEmission):
         Generate scheduling code on device
         """
         gencode = copy.copy(self.init_code)
+        if attach:
+            gencode.remove('import chronotrigger.trace as ct')
         device_map = device % len(self.devices)
         device_nodes = self.execplan.seq(device_map)
         # We will manually set the `skip_reducer` flag and `skip_zero_grad`
         # when we use scheduler (i.e. pipeline parallelism)
         # Otherwise, the caller of `_train_step` will set these flags to support gradient accumulation
         use_scheduler = self.execplan.graph.sched is not None
+        send_bundle_ranges = self._collect_send_bundle_ranges(device_nodes, device_map) \
+            if use_scheduler else {}
 
         assert all(not isinstance(n, IRFwOperation) for n in device_nodes), \
             "Expected all forward operators have been grouped into IRSegment"
@@ -210,6 +215,20 @@ class ScheduleCodeGen(FuncEmission):
                 buffered_codes.clear()
                 last_stream = None
 
+        def _append_send_bundle_events(fb: FunctionBlock, events, before_node: bool):
+            methods = {
+                'reserve': 'reserve_send_bundle',
+                'begin': 'begin_send_bundle',
+            } if before_node else {'end': 'end_send_bundle'}
+            for event_name, bundle_key in events:
+                if method_name := methods.get(event_name):
+                    args = repr(bundle_key) if event_name != 'end' else ''
+                    _append_code(
+                        fb,
+                        'nnscaler.runtime.executor.AsyncCommHandler()'
+                        f'.{method_name}({args})',
+                    )
+
         with FunctionBlock(func_name='_train_step',
                            args=args) as fb:
             _append_code(fb, '_ = None')
@@ -222,6 +241,9 @@ class ScheduleCodeGen(FuncEmission):
                 self.execplan.zero_grad_stream_context.stream
                     if self.execplan.zero_grad_stream_context else None
             )
+            if use_scheduler and CompileFlag.async_reducer:
+                for code in self._emit_async_reducer_expectations(device_nodes):
+                    _append_code(fb, code)
 
             # body code
             if len(device_nodes) == 0:
@@ -256,13 +278,29 @@ class ScheduleCodeGen(FuncEmission):
                     'sample_reads_by_mid': sample_reads_by_mid,
                     'fallback_vars_by_mid': {},
                 }
+                pending_async_recvs = {}
                 for line, node in enumerate(device_nodes):
+                    unwrap_node = node.cell if isinstance(node, ExeReuseCell) else node
+                    bundle_events = send_bundle_ranges.get(line, ())
+                    _append_send_bundle_events(fb, bundle_events, before_node=True)
+                    wait_codes = self._emit_async_recv_waits(node, pending_async_recvs, produced_tids)
+                    if wait_codes:
+                        _append_code(fb, wait_codes, self._get_node_stream(node))
+
                     # when use scheduler, skip reducer if it is not the last backward of same segments
                     if use_scheduler and _is_backward_segment(node):
+                        skip_reducer = id(node) not in last_backward_node_oids
+                        if CompileFlag.async_reducer:
+                            # Scheduled pipeline async reducer tracks all local
+                            # gradient contributions and launches each bucket
+                            # when its expected contributions are complete.
+                            skip_reducer = False
                         _append_code(fb,
                             f'nnscaler.flags.RuntimeFlag.skip_reducer = '
-                            f'{id(node) not in last_backward_node_oids !r}'
+                            f'{skip_reducer !r}'
                         )
+                    elif use_scheduler and isinstance(unwrap_node, IRWeightReducer):
+                        _append_code(fb, 'nnscaler.flags.RuntimeFlag.skip_reducer = False')
                     codes = self.emit_node(
                         node,
                         produced_tids=produced_tids,
@@ -271,6 +309,7 @@ class ScheduleCodeGen(FuncEmission):
                         fallback_state=fallback_state,
                     )
                     _append_code(fb, codes, self._get_node_stream(node))
+                    self._track_async_recv(node, pending_async_recvs)
                     # release
                     tensors = lifetime.release_tensors_after_line(line)
                     if len(tensors) > 0 : # not necessarily to have one after each line
@@ -278,6 +317,7 @@ class ScheduleCodeGen(FuncEmission):
                     for out in IRSegment.get_objects_from_complex(node.outputs()):
                         if isinstance(out, IRObject):
                             produced_tids.add(out.tid)
+                    _append_send_bundle_events(fb, bundle_events, before_node=False)
             # return code
             outputs = self.return_name_complex(self.execplan.outputs())
             _append_code(fb, 'nnscaler.runtime.executor.AsyncCommHandler().drain()')
@@ -307,8 +347,17 @@ class ScheduleCodeGen(FuncEmission):
                     'sample_reads_by_mid': sample_reads_by_mid,
                     'fallback_vars_by_mid': {},
                 }
+                infer_pending_async_recvs = {}
                 for line, node in enumerate(device_nodes):
                     if not node.isfw(): continue  # skip backward segments and adapters
+                    bundle_events = send_bundle_ranges.get(line, ())
+                    _append_send_bundle_events(fb, bundle_events, before_node=True)
+                    wait_codes = self._emit_async_recv_waits(
+                        node, infer_pending_async_recvs, infer_produced_tids
+                    )
+                    if wait_codes:
+                        _append_code(fb, wait_codes, self._get_node_stream(node))
+
                     # execute
                     codes = self.emit_node(
                         node,
@@ -319,6 +368,7 @@ class ScheduleCodeGen(FuncEmission):
                         fallback_state=infer_fallback_state,
                     )
                     _append_code(fb, codes, self._get_node_stream(node))
+                    self._track_async_recv(node, infer_pending_async_recvs)
                     # release
                     tensors = lifetime.release_tensors_after_line(line)
                     tensors = [t for t in tensors if isinstance(t, IRTensor) and not t.is_grad()]
@@ -327,6 +377,7 @@ class ScheduleCodeGen(FuncEmission):
                     for out in IRSegment.get_objects_from_complex(node.outputs()):
                         if isinstance(out, IRObject):
                             infer_produced_tids.add(out.tid)
+                    _append_send_bundle_events(fb, bundle_events, before_node=False)
                 # return code
                 outputs = self.return_name_complex(self.execplan.outputs())
                 _append_code(fb, 'nnscaler.runtime.executor.AsyncCommHandler().drain()')
@@ -343,6 +394,62 @@ class ScheduleCodeGen(FuncEmission):
             with open(outfile, 'a' if attach else 'w') as f:
                 f.write(code)
         return code
+
+    @staticmethod
+    def _pipeline_send_key(node: IRCell, device: int):
+        unwrap_node = node.cell if isinstance(node, ExeReuseCell) else node
+        if not isinstance(unwrap_node, IRAdapter):
+            return None
+
+        links = set()
+        for prim in unwrap_node.prims:
+            if not isinstance(prim, MovePrim) or len(prim.inputs()) == 0:
+                continue
+            src, dst = prim.kwargs['src'], prim.kwargs['dst']
+            if src == device:
+                links.add((src, dst))
+        return tuple(sorted(links)) or None
+
+    @classmethod
+    def _collect_send_bundle_ranges(cls, nodes: List[IRCell], device: int):
+        """Group adjacent pipeline sends to the same physical link into bundles."""
+        events = {}
+        line = 0
+        while line < len(nodes):
+            key = cls._pipeline_send_key(nodes[line], device)
+            if key is None:
+                line += 1
+                continue
+
+            end = line
+            is_forward = nodes[line].isfw()
+            while (
+                end + 1 < len(nodes)
+                and nodes[end + 1].isfw() == is_forward
+                and cls._pipeline_send_key(nodes[end + 1], device) == key
+            ):
+                end += 1
+            input_tids = {
+                inp.tid
+                for send_node in nodes[line:end + 1]
+                for inp in IRSegment.get_objects_from_complex(send_node.inputs())
+                if isinstance(inp, IRObject)
+            }
+            reserve_line = line
+            for candidate in range(line - 1, -1, -1):
+                output_tids = {
+                    out.tid
+                    for out in IRSegment.get_objects_from_complex(nodes[candidate].outputs())
+                    if isinstance(out, IRObject)
+                }
+                if input_tids.intersection(output_tids):
+                    reserve_line = candidate
+                    break
+            events.setdefault(reserve_line, []).append(('reserve', key))
+            events.setdefault(line, []).append(('begin', key))
+            events.setdefault(end, []).append(('end', key))
+            line = end + 1
+        return events
 
     def _get_node_stream_context(self, node: IRCell):
         unwrap_node = node.cell if isinstance(node, ExeReuseCell) else node
@@ -362,6 +469,106 @@ class ScheduleCodeGen(FuncEmission):
             return stream_context.stream
         else:
             return None
+
+    def _emit_async_reducer_expectations(self, device_nodes: List[IRCell]) -> List[str]:
+        reducer_params: Dict[int, List[str]] = {}
+        for node in device_nodes:
+            unwrap_node = self._unwrap_node(node)
+            if not isinstance(unwrap_node, IRWeightReducer):
+                continue
+            reducer_params[unwrap_node._id] = [
+                self.tensor_name(t, prefix_attr='model.')
+                for t in unwrap_node.inputs()
+            ]
+
+        if not reducer_params:
+            return []
+
+        param_counts: Dict[str, int] = {}
+        for node in device_nodes:
+            unwrap_node = self._unwrap_node(node)
+            if not isinstance(unwrap_node, IRSegment) or unwrap_node.isfw():
+                continue
+            for pname in self._segment_parameter_names(unwrap_node):
+                param_counts[pname] = param_counts.get(pname, 0) + 1
+
+        codes = []
+        for reducer_id, param_names in sorted(reducer_params.items()):
+            entries = []
+            for pname in sorted(param_names):
+                count = param_counts.get(pname, 1)
+                entries.append(f'{pname}: {count}')
+            codes.append(
+                f'model.wreducer{reducer_id}.set_async_grad_expected_counts({{{", ".join(entries)}}})'
+            )
+        return codes
+
+    def _segment_parameter_names(self, node: IRSegment) -> List[str]:
+        if node.isfw():
+            fw_node = node
+        else:
+            fw_node = node.mirror
+        if not isinstance(fw_node, IRSegment):
+            return []
+
+        param_names = set()
+        for inner_node in fw_node.nodes(flatten=True):
+            for tensor in IRSegment.get_objects_from_complex([inner_node.inputs(), inner_node.kwargs]):
+                if not isinstance(tensor, IRSubTensor) or not tensor.is_param():
+                    continue
+                param_names.add(self.tensor_name(tensor, prefix_attr='model.'))
+        return sorted(param_names)
+
+    def _unwrap_node(self, node: IRCell) -> IRCell:
+        return node.cell if isinstance(node, ExeReuseCell) else node
+
+    def _track_async_recv(self, node: IRCell, pending_async_recvs: dict):
+        unwrap_node = self._unwrap_node(node)
+        if not isinstance(unwrap_node, IRAdapter) or not self.is_async_recv_adapter(unwrap_node):
+            return
+        for out in IR.get_objects(node.outputs()):
+            if isinstance(out, IRObject):
+                pending_async_recvs[out.tid] = (unwrap_node, out)
+
+    def _node_wait_inputs(self, node: IRCell, produced_tids: Optional[set]) -> List[IRObject]:
+        unwrap_node = self._unwrap_node(node)
+        if isinstance(unwrap_node, IRSegment) and not node.isfw():
+            input_tensors, output_tensors, output_grads, _ = self.get_backward_callsite_io_tensors(node)
+            if produced_tids is not None:
+                filtered_ot, filtered_og = [], []
+                for output_tensor, output_grad in zip(output_tensors, output_grads):
+                    if output_grad is None or (
+                        isinstance(output_grad, IRSubTensor)
+                        and output_grad.tid in produced_tids
+                    ):
+                        filtered_ot.append(output_tensor)
+                        filtered_og.append(output_grad)
+                output_tensors = filtered_ot
+                output_grads = filtered_og
+            return IR.get_objects((input_tensors, output_tensors, output_grads))
+        return IR.get_objects(node.inputs())
+
+    def _emit_async_recv_waits(
+        self,
+        node: IRCell,
+        pending_async_recvs: dict,
+        produced_tids: Optional[set],
+    ) -> List[str]:
+        codes = []
+        seen_tids = set()
+        for inp in self._node_wait_inputs(node, produced_tids):
+            if not isinstance(inp, IRObject) or inp.tid not in pending_async_recvs or inp.tid in seen_tids:
+                continue
+            seen_tids.add(inp.tid)
+            adapter, pending_out = pending_async_recvs.pop(inp.tid)
+            adapter_name = self.node_name(adapter)
+            tensor_name = self.tensor_name(pending_out)
+            req_grad = isinstance(pending_out, IRTensor) and pending_out.requires_grad
+            codes.append(
+                f'{tensor_name} = nnscaler.runtime.executor.aexecute('
+                f'model.{adapter_name}_wait, *({tensor_name}, ), requires_grad={req_grad})'
+            )
+        return codes
 
     def _emit_stream_context(self, stream_context, codes: List[str]) -> List[str]:
         wait_stream_codes = []

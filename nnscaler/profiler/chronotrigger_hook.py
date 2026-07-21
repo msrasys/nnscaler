@@ -71,6 +71,15 @@ class ChronoTriggerTrainHook(TrainHook):
                 *self.capture_window,
             )
 
+    def on_finalize(self, trainer: "Trainer") -> None:
+        if not self.capture_started or self.capture_stopped:
+            return
+
+        _cuda_profiler_call("cudaProfilerStop")
+        self.capture_stopped = True
+        if trainer.rank == 0:
+            logger.info("Stopped incomplete Nsight Systems capture during finalization")
+
     def on_step_end(
         self,
         trainer: "Trainer",

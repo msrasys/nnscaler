@@ -35,7 +35,7 @@ def p2p_trace_spec(
     destinations = _endpoints(kwargs, "dst", "dsts")
     edge = f"{_format_endpoints(sources)}->{_format_endpoints(destinations)}"
     tensor_key = ",".join(str(tensor_id) for tensor_id in sorted(set(tensor_ids)))
-    entity = f"{adapter_name}:{primitive_name}:{edge}"
+    entity = f"{primitive_name}:{edge}"
     if tensor_key:
         entity = f"{entity}:t{tensor_key}"
 
@@ -59,7 +59,7 @@ def primitive_trace_spec(prim: Any, rank: int, adapter_name: str, index: int) ->
         tensor_ids = [
             tensor_id
             for tensor in prim.inputs() + prim.outputs()
-            if (tensor_id := getattr(tensor, "tid", None)) is not None
+            if (tensor_id := _stable_tensor_id(tensor)) is not None
         ]
         return p2p_trace_spec(
             rank,
@@ -70,6 +70,11 @@ def primitive_trace_spec(prim: Any, rank: int, adapter_name: str, index: int) ->
         )
 
     return TraceSpec("COLLECTIVE", f"{adapter_name}:{primitive_name}:{index}", None)
+
+
+def _stable_tensor_id(tensor: Any) -> Optional[int]:
+    parent = getattr(tensor, "parent", None)
+    return getattr(parent, "tid", getattr(tensor, "tid", None))
 
 
 def _endpoints(kwargs: Mapping[str, Any], singular: str, plural: str) -> Tuple[int, ...]:

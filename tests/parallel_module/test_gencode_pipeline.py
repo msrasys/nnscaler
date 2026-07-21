@@ -80,6 +80,18 @@ def test_gencode_correct_dataloader_order(tmp_path):
     rank0_dataloader_ops = _gencode_contains(tmp_path, PPModule1, 0, r'.*next\(\*\(dataloader\_.*')
     rank1_dataloader_ops = _gencode_contains(tmp_path, PPModule1, 1, r'.*next\(\*\(dataloader\_.*')
     assert rank0_dataloader_ops == rank1_dataloader_ops
+    assert _gencode_contains(
+        tmp_path, PPModule1, 0,
+        r'.*reserve_send_bundle\(\(\(0, 1\),\)\)',
+    )
+    assert _gencode_contains(
+        tmp_path, PPModule1, 1,
+        r'.*reserve_send_bundle\(\(\(1, 0\),\)\)',
+    )
+    for generated_file in tmp_path.rglob('gencode*.py'):
+        assert generated_file.read_text().count(
+            'import chronotrigger.trace as ct'
+        ) == 1
     # code looks like:
     # rank1:
     # def _train_step(model, dataloader_33):
@@ -190,6 +202,45 @@ def test_gencode_shared_irobject(tmp_path):
         assert _gencode_contains(tmp_path, PPModule2, rank, rf'nnscaler.runtime.adapter.move_object\(.*, src={rank}, dst={rank + 1}\)')
 
 
+@replace_all_device_with('cpu')
+def test_gencode_shared_irobject_between_tp_stages(tmp_path):
+    """IRObjects are replicated, not spatially split, between TP stages."""
+    m = PPModule2()
+    m.train()
+    parallelize(
+        m,
+        {'data': torch.randn(64, 1024)},
+        pas_policy=lambda graph, cfg: pp_pas(graph, cfg, nlayers_per_stage=2),
+        compute_config=ComputeConfig(
+            4, 4,
+            constant_folding=False,
+            use_end2end=True,
+            pas_config=dict(
+                pipeline_nmicros=4,
+                pipeline_size=2,
+                pipeline_scheduler='1f1b',
+            ),
+        ),
+        gen_savedir=tmp_path,
+        load_module=False,
+        reuse='override',
+    )
+
+    for src, dst in ((0, 2), (1, 3)):
+        assert _gencode_contains(
+            tmp_path,
+            PPModule2,
+            src,
+            rf'nnscaler.runtime.adapter.move_object\(.*, src={src}, dst={dst}\)',
+        )
+        assert _gencode_contains(
+            tmp_path,
+            PPModule2,
+            dst,
+            rf'nnscaler.runtime.adapter.move_object\(.*, src={src}, dst={dst}\)',
+        )
+
+
 class PPModule3(PPModule2):
     def forward(self, data: torch.Tensor):
         loss = super().forward(data)
@@ -229,3 +280,128 @@ def test_gencode_shared_irobject_loss_data(tmp_path):
     for rank in range(4, 7):
         assert _gencode_contains(tmp_path, PPModule3, rank, rf'sum_.* = nnscaler.runtime.adapter.broadcast\(\(\), shape=\(\), dtype=torch.float32, src=7, ranks=\[4, 5, 6, 7\]\)')
     assert _gencode_contains(tmp_path, PPModule3, 7, rf'sum_.* = nnscaler.runtime.adapter.broadcast\(sum_.*, shape=\(\), dtype=torch.float32, src=7, ranks=\[4, 5, 6, 7\]\)')
+
+
+class SplitSegmentModule(torch.nn.Module):
+    def __init__(self, dim: int = 64):
+        super().__init__()
+        self.layers = torch.nn.ModuleList([])
+        for _ in range(4):
+            self.layers.append(torch.nn.Linear(dim, dim, bias=False))
+
+    def forward(self, data: torch.Tensor):
+        x = self.layers[0](data)
+        x = self.layers[1](x) + x
+        x = self.layers[2](x)
+        x = self.layers[3](x)
+        loss = torch.sum(x)
+        return loss
+
+
+def split_segment_pas(graph, cfg):
+    from nnscaler.policies import OpPlan, OpPartition, get_layer_index, get_pas_ops
+
+    last_stage_id = 0
+    for node in get_pas_ops(graph):
+        if torch.nn.modules.linear.Linear in node.module_class_chain:
+            layer_idx = get_layer_index(node.fqn) // 2
+            yield OpPlan(node, stage_id=layer_idx, partition=OpPartition(input=0, dim=0))
+            last_stage_id = layer_idx
+        else:
+            if node.fn == torch.sum or node.fn == torch.add:
+                yield OpPlan(node, stage_id=last_stage_id, partition=OpPartition(input=0, dim=0))
+            else:
+                yield OpPlan(node, stage_id=last_stage_id)
+
+
+@replace_all_device_with('cpu')
+def test_gencode_split_segment(tmp_path):
+    m = SplitSegmentModule()
+    m.train()
+    parallelize(
+        m,
+        {'data': torch.randn(64, 64)},
+        pas_policy=split_segment_pas,
+        compute_config= ComputeConfig(
+            4, 8,
+            constant_folding=False,
+            use_end2end=True,
+            pas_config=dict(
+                pipeline_nmicros=4,
+                pipeline_scheduler='1f1b'
+            )
+        ),
+        gen_savedir=tmp_path,
+        load_module=False,
+        reuse='override',
+    )
+
+    assert _gencode_contains(
+        tmp_path, SplitSegmentModule, 2, r'nnscaler.runtime.adapter.nn.allreduce_identity\(sum_.*, ranks=\[2, 3\]\)'
+    )
+    assert not _gencode_contains(
+        tmp_path, SplitSegmentModule, 2, r'nnscaler.runtime.adapter.chunk'
+    )
+    assert not _gencode_contains(
+        tmp_path, SplitSegmentModule, 2, r'nnscaler.runtime.adapter.nn.split_allgather'
+    )
+    assert _gencode_contains(
+        tmp_path, SplitSegmentModule, 6, r'nnscaler.runtime.adapter.nn.allreduce_identity\(sum_.*, ranks=\[6, 7\]\)'
+    )
+
+
+class AliasedSegmentInputModule(torch.nn.Module):
+    def __init__(self, dim: int = 64):
+        super().__init__()
+        self.layers = torch.nn.ModuleList([
+            torch.nn.Linear(dim, dim, bias=False) for _ in range(3)
+        ])
+
+    def forward(self, data: torch.Tensor):
+        shared = self.layers[0](data)
+        hidden = self.layers[1](shared)
+        hidden = self.layers[2](hidden + shared)
+        return torch.sum(hidden)
+
+
+def aliased_segment_input_pas(graph, cfg):
+    from nnscaler.policies import OpPlan, OpPartition, get_layer_index, get_pas_ops
+
+    stage_id = 0
+    for node in get_pas_ops(graph):
+        if torch.nn.modules.linear.Linear in node.module_class_chain:
+            stage_id = get_layer_index(node.fqn)
+        elif node.fn == torch.add:
+            stage_id = 2
+        yield OpPlan(node, stage_id=stage_id, partition=OpPartition(input=0, dim=0))
+
+
+@replace_all_device_with('cpu')
+def test_gencode_narrows_aliased_segment_input(tmp_path):
+    parallelize(
+        AliasedSegmentInputModule(),
+        {'data': torch.randn(64, 64)},
+        pas_policy=aliased_segment_input_pas,
+        compute_config=ComputeConfig(
+            6,
+            6,
+            constant_folding=False,
+            use_end2end=True,
+            pas_config={
+                'pp_size': 3,
+                'pipeline_nmicros': 3,
+                'pipeline_scheduler': '1f1b',
+            },
+        ),
+        gen_savedir=tmp_path,
+        load_module=False,
+        reuse='override',
+    )
+
+    for rank in range(6):
+        assert not _gencode_contains(
+            tmp_path,
+            AliasedSegmentInputModule,
+            rank,
+            r'nnscaler\.runtime\.adapter\.(?:all_gather|nn\.split_allgather)',
+        )

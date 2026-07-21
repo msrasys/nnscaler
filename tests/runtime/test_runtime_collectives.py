@@ -38,10 +38,27 @@ def _move_worker(async_op: bool):
     return clone_to_cpu(tensor)
 
 
+def _object_collective_payload():
+    return {
+        'cuda': torch.arange(3, device=torch.cuda.current_device()),
+        'cpu': torch.arange(2, device='cpu'),
+        'metadata': {'hello': 'world', 'count': 1},
+    }
+
+
+def _assert_object_collective_payload(obj):
+    assert obj['cuda'].device == torch.device('cuda', torch.cuda.current_device())
+    assert obj['cuda'].tolist() == [0, 1, 2]
+    assert obj['cpu'].device.type == 'cpu'
+    assert obj['cpu'].tolist() == [0, 1]
+    assert obj['metadata'] == {'hello': 'world', 'count': 1}
+
+
 def _move_object_worker():
-    obj = {'hello': 'world', 'count': 1}
+    rank = torch.distributed.get_rank()
+    obj = _object_collective_payload() if rank == 0 else None
     robj = nnscaler.runtime.adapter.move_object(obj, 0, 1)
-    assert robj == obj
+    _assert_object_collective_payload(robj)
 
 
 def _allreduce_worker(async_op: bool):
@@ -155,6 +172,7 @@ def _rdscatter_worker(async_op):
 
     if async_op:
         otensor = nnscaler.runtime.executor.AsyncCommHandler().wait(otensor)
+        nnscaler.runtime.executor.AsyncCommHandler().drain()
 
     return (clone_to_cpu(tensor), clone_to_cpu(otensor))
 
@@ -164,10 +182,11 @@ def _rdgather_worker(async_op):
 
     tensor = _get_tensor(shape)
     otensor = nnscaler.runtime.adapter.rdgather(
-        tensor, shape, torch.float32, dim=0, srcs=[1,2], dst=0)
+        tensor, shape, torch.float32, dim=0, srcs=[1,2], dst=0, async_op=async_op)
 
     if async_op:
         otensor = nnscaler.runtime.executor.AsyncCommHandler().wait(otensor)
+        nnscaler.runtime.executor.AsyncCommHandler().drain()
 
     return (clone_to_cpu(tensor), clone_to_cpu(otensor))
 
@@ -179,27 +198,62 @@ def _broadcast_worker(async_op):
 
     # synchronize
     otensor = nnscaler.runtime.adapter.broadcast(
-        tensor, shape, torch.float32, src=0, ranks=[0,1,2])
+        tensor, shape, torch.float32, src=0, ranks=[0,1,2], async_op=async_op)
     if async_op:
         otensor = nnscaler.runtime.executor.AsyncCommHandler().wait(otensor)
+        nnscaler.runtime.executor.AsyncCommHandler().drain()
+
+    return (clone_to_cpu(tensor), clone_to_cpu(otensor))
+
+
+def _rvscatter_worker(async_op):
+    shape = [128, 256]
+    tensor = _get_tensor(shape)
+    otensor = nnscaler.runtime.adapter.rvscatter(
+        tensor, shape, torch.float32, src=0, dsts=(1, 2), async_op=async_op)
+
+    if async_op:
+        otensor = nnscaler.runtime.executor.AsyncCommHandler().wait(otensor)
+        nnscaler.runtime.executor.AsyncCommHandler().drain()
+
+    return (clone_to_cpu(tensor), clone_to_cpu(otensor))
+
+
+def _rvgather_worker(async_op):
+    shape = [128, 256]
+    tensor = _get_tensor(shape)
+    otensor = nnscaler.runtime.adapter.rvgather(
+        tensor, shape, torch.float32, srcs=(1, 2), dst=0, async_op=async_op)
+
+    if async_op:
+        otensor = nnscaler.runtime.executor.AsyncCommHandler().wait(otensor)
+        nnscaler.runtime.executor.AsyncCommHandler().drain()
 
     return (clone_to_cpu(tensor), clone_to_cpu(otensor))
 
 
 def _broadcast_object_worker():
-    obj = {'hello': 'world', 'count': 1}
+    rank = torch.distributed.get_rank()
+    obj = _object_collective_payload() if rank == 0 else None
     robj = nnscaler.runtime.adapter.broadcast_object(
         obj, src=0, ranks=[0,1,2])
-    assert robj == obj
+    _assert_object_collective_payload(robj)
 
 
 def _3gpu_worker():
     _init_distributed(3)
+    nnscaler.runtime.device.DeviceGroup().init_p2p_groups(
+        pairs=[(0, 1), (0, 2)],
+    )
     result = {}
     result['rdscatter'] = _rdscatter_worker(False)
     result['rdscatter_async'] = _rdscatter_worker(True)
     result['rdgather'] = _rdgather_worker(False)
     result['rdgather_async'] = _rdgather_worker(True)
+    result['rvscatter'] = _rvscatter_worker(False)
+    result['rvscatter_async'] = _rvscatter_worker(True)
+    result['rvgather'] = _rvgather_worker(False)
+    result['rvgather_async'] = _rvgather_worker(True)
     result['broadcast'] = _broadcast_worker(False)
     result['broadcast_async'] = _broadcast_worker(True)
     _broadcast_object_worker()
@@ -222,8 +276,42 @@ def test_3gpu():
         result = torch.cat((outputs[1][0], outputs[2][0]), dim=0)
         assert torch.equal(outputs[0][1], result)
 
+        # check rvscatter
+        outputs = results[0][f'rvscatter{op}'], results[1][f'rvscatter{op}'], results[2][f'rvscatter{op}']
+        expected = outputs[0][0] / 2
+        assert torch.equal(outputs[1][1], expected)
+        assert torch.equal(outputs[2][1], expected)
+
+        # check rvgather
+        outputs = results[0][f'rvgather{op}'], results[1][f'rvgather{op}'], results[2][f'rvgather{op}']
+        expected = outputs[1][0] + outputs[2][0]
+        assert torch.equal(outputs[0][1], expected)
+
         # check broadcast
         outputs = results[0][f'broadcast{op}'], results[1][f'broadcast{op}'], results[2][f'broadcast{op}']
         assert torch.equal(outputs[0][0], outputs[0][1])
         assert torch.equal(outputs[0][0], outputs[1][1])
         assert torch.equal(outputs[0][0], outputs[2][1])
+
+
+def _ordered_rank_worker():
+    _init_distributed(4)
+    rank = torch.distributed.get_rank()
+    ranks = [0, 2, 1, 3]
+
+    value = torch.tensor([rank], dtype=torch.int64)
+    gathered = nnscaler.runtime.adapter.all_gather(value, 0, ranks)
+    chunked = nnscaler.runtime.adapter.chunk(
+        torch.arange(4, dtype=torch.int64), 0, ranks)
+    return clone_to_cpu(gathered), clone_to_cpu(chunked)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.device_count() < 4, reason='lack of gpu devices')
+def test_collectives_respect_explicit_rank_order():
+    results = launch_torchrun(4, _ordered_rank_worker)
+
+    expected_gather = torch.tensor([0, 2, 1, 3], dtype=torch.int64)
+    expected_chunks = [0, 2, 1, 3]
+    for rank, (gathered, chunked) in results.items():
+        assert torch.equal(gathered, expected_gather)
+        assert chunked.item() == expected_chunks[rank]

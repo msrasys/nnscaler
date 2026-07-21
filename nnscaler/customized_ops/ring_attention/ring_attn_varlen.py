@@ -15,7 +15,11 @@ from nnscaler.runtime.device import DeviceGroup
 from flash_attn import flash_attn_varlen_func
 from .core.ring_attn_varlen_implementation import llama3_flash_attn_prepare_cu_seqlens, llama3_flash_attn_varlen_func
 from .core.utils import gen_head_anno
-from .varlen_utils import shuffle_varlen, unshuffle_varlen
+from .varlen_utils import (
+    select_sequence_group_cu_seqlens,
+    shuffle_varlen,
+    unshuffle_varlen,
+)
 
 try:
     from flash_attn.cute import flash_attn_varlen_func as flash_attn_cute_varlen_func
@@ -131,6 +135,8 @@ def wrap_ring_attn_varlen_func(
         enable_ring: bool = True,
         use_cute:  bool = False,
         process_group: Tuple[int] = None,
+        sequence_parallel_size: int = None,
+        sequence_group_count: int = 1,
 ):
     '''
     wrap the ring_attn_varlen_func to support the distributed training in nnScaler.
@@ -140,6 +146,16 @@ def wrap_ring_attn_varlen_func(
     required communications.
     '''
     assert not return_attn_probs, "return_attn_probs is not supported in ring-attention"
+    if process_group is not None and len(process_group) > 1 and enable_ring:
+        if sequence_parallel_size is not None and len(process_group) != sequence_parallel_size:
+            raise ValueError(
+                f"Generated process group size {len(process_group)} does not match "
+                f"sequence_parallel_size={sequence_parallel_size}"
+            )
+        cu_seqlens_q = select_sequence_group_cu_seqlens(
+            cu_seqlens_q, process_group, sequence_group_count)
+        cu_seqlens_k = select_sequence_group_cu_seqlens(
+            cu_seqlens_k, process_group, sequence_group_count)
     max_seqlen_q = (cu_seqlens_q[1:] - cu_seqlens_q[:-1]).max().item()
     max_seqlen_k = (cu_seqlens_k[1:] - cu_seqlens_k[:-1]).max().item()
 
@@ -304,7 +320,21 @@ def emit_ring(node: IRDimops, args: List[str], kwargs: Dict[str, str], runtime_d
         if partition_dims[0][0] == 0: # partition on sequence dim
             # the synchronization should occur across scaleunits
             num = partition_dims[0][1]
-            scale_unit_dev_ids = [local_rank + offset for local_rank in range(remainder // num * num, (remainder // num + 1) * num)]
+            configured_group_size = kwargs.get('sequence_parallel_size')
+            group_size = (
+                num if configured_group_size in (None, 'None')
+                else int(configured_group_size)
+            )
+            if group_size < 1 or num % group_size != 0:
+                raise ValueError(
+                    f'sequence_parallel_size must divide the sequence partition degree, '
+                    f'got sequence_parallel_size={group_size}, partition_degree={num}')
+            partition_start = remainder // num * num
+            group_start = partition_start + (remainder % num) // group_size * group_size
+            scale_unit_dev_ids = [
+                local_rank + offset
+                for local_rank in range(group_start, group_start + group_size)
+            ]
             kw_pairs.append(f"process_group={scale_unit_dev_ids}")
         elif partition_dims[0][0] == 1:
             # partition the head dim, use local flash_attn_func

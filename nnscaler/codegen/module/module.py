@@ -1,7 +1,7 @@
 #  Copyright (c) Microsoft Corporation.
 #  Licensed under the MIT License.
 
-from typing import List, Optional, Tuple, Dict, Any, Literal
+from typing import List, Optional, Tuple, Dict, Any, Literal, Set
 import more_itertools
 import logging
 import copy
@@ -14,7 +14,7 @@ from nnscaler.ir.cten import IRCell, IRTensor
 from nnscaler.ir.tensor import IRFullTensor, IRSubTensor
 from nnscaler.ir.operator import IRBpOperation, IRDataOperation, IRFwOperation
 from nnscaler.ir.adapter import IRWeightReducer, IRAdapter
-from nnscaler.ir.adapter.prim import CollectivePrim
+from nnscaler.ir.adapter.prim import CollectivePrim, IdentityPrim, MovePrim
 
 from nnscaler.graph.graph import IRSegment
 from nnscaler.graph.parser.register import CustomizedOps
@@ -175,6 +175,91 @@ class ModuleCodeGen(FuncEmission):
         self.comm_groups: List[Tuple[int]] = self.get_comm_groups()
         self.add_scale_reducers()
 
+    @staticmethod
+    def _is_alias_or_unknown_segment_output(
+        segment: IRSegment,
+        source: IRSubTensor,
+    ) -> bool:
+        """Return whether an output is aliased or lacks one known producer."""
+        def produces_source(cell: Any) -> bool:
+            outputs = cell.oobjs() if isinstance(cell, IRCell) else cell.outputs()
+            return any(
+                output == source and output.device == source.device
+                for output in outputs
+            )
+
+        producers = [
+            cell for cell in segment.nodes(flatten=True)
+            if produces_source(cell)
+        ]
+
+        if len(producers) != 1:
+            return True
+
+        producer = producers[0]
+        if producer.name in ('identity', 'multiref'):
+            return True
+        if not isinstance(producer, IRAdapter):
+            return False
+
+        matching_prims = [prim for prim in producer.prims if produces_source(prim)]
+        return not matching_prims or any(
+            isinstance(prim, IdentityPrim) for prim in matching_prims
+        )
+
+    @classmethod
+    def _pipeline_pseudo_free_source_tids(
+        cls,
+        sequence: List[IRCell],
+        *,
+        pipeline_enabled: bool,
+    ) -> Set[int]:
+        """Find boundary outputs whose only remaining forward use is one send adapter."""
+        if not CompileFlag.pipeline_output_pseudo_free or not pipeline_enabled:
+            return set()
+
+        forward_consumers: Dict[int, Set[IRCell]] = {}
+        segment_outputs: Dict[int, List[Tuple[IRSegment, IRSubTensor]]] = {}
+        for cell in sequence:
+            if not cell.isfw():
+                continue
+            for obj in cell.iobjs():
+                if isinstance(obj, IRSubTensor):
+                    forward_consumers.setdefault(obj.tid, set()).add(cell)
+            if isinstance(cell, IRSegment):
+                for obj in cell.oobjs():
+                    if isinstance(obj, IRSubTensor):
+                        segment_outputs.setdefault(obj.tid, []).append((cell, obj))
+
+        eligible = set()
+        for cell in sequence:
+            if not isinstance(cell, IRAdapter):
+                continue
+            if not cell.isfw() or len(cell.outputs()) != 0 or cell.mirror is None:
+                continue
+            if cell.differentiable and cell.custom:
+                continue
+
+            for source in cell.inputs():
+                if not isinstance(source, IRSubTensor):
+                    continue
+                if not source.requires_grad or source.is_attr() or source.is_grad():
+                    continue
+                if forward_consumers.get(source.tid) != {cell}:
+                    continue
+                boundaries = [
+                    (segment, output)
+                    for segment, output in segment_outputs.get(source.tid, [])
+                    if output.device == source.device
+                ]
+                if len(boundaries) != 1:
+                    continue
+                if cls._is_alias_or_unknown_segment_output(*boundaries[0]):
+                    continue
+                eligible.add(source.tid)
+
+        return eligible
+
     def add_scale_reducers(self):
         """
         Insert reducers to for scale scenario
@@ -287,6 +372,26 @@ class ModuleCodeGen(FuncEmission):
                         if shifted_ranks not in comm_groups:
                             comm_groups.append(shifted_ranks)
         return comm_groups
+
+    def get_p2p_pairs(self):
+        """
+        Scale real P2P MovePrim endpoints to runtime devices.
+        """
+        nreplica = self.runtime_ndevs // len(self.devices)
+        pairs = set()
+        for adapter in self.execplan.graph.select(ntype=IRAdapter):
+            for prim in adapter.prims:
+                if not isinstance(prim, MovePrim):
+                    continue
+                src, dst = prim.kwargs['src'], prim.kwargs['dst']
+                if src is None or dst is None or src == dst:
+                    continue
+                for i in range(nreplica):
+                    shifted_src = int(src) + i * len(self.devices)
+                    shifted_dst = int(dst) + i * len(self.devices)
+                    pair = (shifted_src, shifted_dst) if shifted_src < shifted_dst else (shifted_dst, shifted_src)
+                    pairs.add(pair)
+        return sorted(pairs)
 
     def scale(self, node: IRCell, device: int) -> IRCell:
         if not self.enable_dp:
@@ -453,6 +558,10 @@ class ModuleCodeGen(FuncEmission):
 
         # scale to multiple devices
         sequence = [self.scale(node, device) for node in sequence]
+        pseudo_free_source_tids = self._pipeline_pseudo_free_source_tids(
+            sequence,
+            pipeline_enabled=self.execplan.graph.sched is not None,
+        )
 
         # init customized adapter
         fsegments = [node for node in sequence if isinstance(node, IRSegment) and node.isfw()]
@@ -493,7 +602,16 @@ class ModuleCodeGen(FuncEmission):
                     isinstance(prim, CommPrim) and not isinstance(prim, (MovePrim, ChunkPrim, VChunkPrim))
                     for prim in node.prims
                 )
-                codes = self.emit_adapter(node, prefix_attr='self.', async_op=CompileFlag.async_comm or (has_p2p and not has_other_comm))
+                codes = self.emit_adapter(
+                    node,
+                    prefix_attr='self.',
+                    async_op=(
+                        CompileFlag.async_comm
+                        or self.is_async_recv_adapter(node)
+                        or (has_p2p and not has_other_comm)
+                    ),
+                    pseudo_free_source_tids=pseudo_free_source_tids,
+                )
             elif isinstance(node, IRWeightReducer):
                 self.init_reducer(node, device, param_first_used_pos, as_parallel_module)
                 codes = self.emit_reducer(node)
@@ -588,6 +706,14 @@ class ModuleCodeGen(FuncEmission):
                 if CompileFlag.use_jit and name.startswith('segment'):
                     cb.insert_body('@torch.jit.script_method')
                 cb.insert_body(fb.code)
+
+                if isinstance(node, IRAdapter) and self.is_async_recv_adapter(node):
+                    with FunctionBlock(func_name=f'{name}_wait', args=['self', '__pending']) as wait_fb:
+                        wait_fb.insert_body(self.emit_async_recv_adapter_wait(node))
+                        outputs = [self.tensor_name(t) for t in node.outputs()]
+                        wait_fb.insert_body(f"return {', '.join(outputs)}")
+                    cb.insert_body('')
+                    cb.insert_body(wait_fb.code)
 
                 if saved_tensors_hooks_needed:
                     with FunctionBlock(func_name=name, args=input_args) as fb:
@@ -715,6 +841,11 @@ class ModuleCodeGen(FuncEmission):
         for ranks in self.comm_groups:
             code = sign.format(ranks=list(ranks))
             self.model_init_statements.append(code)
+        p2p_pairs = self.get_p2p_pairs()
+        if p2p_pairs:
+            self.model_init_statements.append('# P2P communication groups')
+            self.model_init_statements.append(
+                f'nnscaler.runtime.device.DeviceGroup().init_p2p_groups(pairs={p2p_pairs})')
         self.model_init_statements.append(' ')
 
     def init_attributes(self, node: IRCell) -> dict[str, dict[str, Any]]:
