@@ -6,7 +6,7 @@
 # https://github.com/pytorch/pytorch/blob/v2.13.0/torch/distributed/pipelining/_backward.py
 
 # We have to copy the code here because we need to modify the behavior of stage_backward_weight
-# to support multi-output intermediate nodes.
+# to support AccumulateGrad hook (reducer depends on it).
 # and stage_backward_input and stage_backward_weight are paired functions that are used together,
 # so we need to copy both of them.
 
