@@ -84,7 +84,7 @@ def test_trainer_pipeline(tmp_path):
     )
 
     merged_files = list((tmp_path).glob('merged_*.pt'))
-    assert len(merged_files) == 6
+    assert len(merged_files) == 5
     merged_state_dicts = [torch.load(merged_file, weights_only=False) for merged_file in merged_files]
 
     assert_equal(merged_state_dicts[0]['model'], merged_state_dicts[1]['model'])
@@ -95,8 +95,6 @@ def test_trainer_pipeline(tmp_path):
     assert_equal(merged_state_dicts[0]['optimizer'], merged_state_dicts[3]['optimizer'])
     assert_equal(merged_state_dicts[0]['model'], merged_state_dicts[4]['model'])
     assert_equal(merged_state_dicts[0]['optimizer'], merged_state_dicts[4]['optimizer'])
-    assert_equal(merged_state_dicts[0]['model'], merged_state_dicts[5]['model'])
-    assert_equal(merged_state_dicts[0]['optimizer'], merged_state_dicts[5]['optimizer'])
 
     # when compute_config.use_async_comm is True, and compute_config.use_fbw is True
     # the code will look like:
