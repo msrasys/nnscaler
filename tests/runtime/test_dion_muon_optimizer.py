@@ -225,9 +225,9 @@ def test_padding_only_zero1_chunk_has_stable_checkpoint_layout():
             use_polar_express=False,
         )
         state_dict = optimizer.state_dict()
-        assert state_dict['state'] == {}
-        assert state_dict['param_groups'][0]['params'] == [0]
-        assert optimizer.param_groups[0]['params'] == []
+        expected_keys = {'momentum'} if optimizer_type is DionMuon else {'momentum', 'fp32_params'}
+        assert set(state_dict['state']) == {0} and set(state_dict['state'][0]) == expected_keys
+        assert state_dict['param_groups'][0]['params'] == [0] and optimizer.param_groups[0]['params'] == []
         optimizer.load_state_dict(deepcopy(state_dict))
 
 
