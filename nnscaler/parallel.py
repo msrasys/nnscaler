@@ -133,7 +133,7 @@ class ComputeConfig:
     use_end2end: bool = False
     # whether to use FBW schedules or FB schedules. Default is False (FB schedules).
     # only effective when `use_end2end` is True and `inference_only` is False.
-    # Only useful for pipeline training with multi-stream scheduling.
+    # Only useful for pipeline training with multi-stream scheduling or `use_async_common` is True.
     use_fbw: bool = False
     # whether to use async communication for cross-stage collective operations.
     # This option only works for pipeline.
