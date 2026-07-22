@@ -354,11 +354,13 @@ class Executor:
             return
 
         if weights:
-            # No `inputs=weights`: run the backward through each weight's
-            # AccumulateGrad node so reducer hooks fire. Since this branch is
-            # only taken when the segment has no grad-requiring inputs, the
-            # backward reaches only weight leaves and does not recompute input
-            # gradients.
+            # This branch is only taken when the segment has no grad-requiring
+            # inputs, so a plain backward reaches only the weight leaves and does
+            # not recompute input gradients. Running through each weight's
+            # AccumulateGrad node makes reducer hooks fire (they move `param.grad`
+            # into the reducer's buffer). `inputs=weights` would fire the hooks
+            # too, but it is unnecessary here and only `torch.autograd.grad` /
+            # manual `weight.grad = dw` would bypass AccumulateGrad.
             torch.autograd.backward(
                 state.output_tensors,
                 grad_tensors=state.output_tensor_grads,
