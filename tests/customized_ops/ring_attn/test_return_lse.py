@@ -71,3 +71,64 @@ def test_flash_attention_anno_marks_lse_shape_by_keyword_and_position(module_nam
     assert default_anno.endswith("-> l num_heads vd^")
     assert keyword_anno.endswith("-> l num_heads vd^, num_heads l")
     assert positional_anno.endswith("-> l num_heads vd^, num_heads l")
+
+
+@pytest.mark.parametrize(
+    ("module_name", "wrapper_name"),
+    [
+        (
+            "nnscaler.customized_ops.ring_attention.ring_attn_varlen",
+            "wrap_ring_attn_varlen_func",
+        ),
+        (
+            "nnscaler.customized_ops.ring_attention.sliding_window_attn",
+            "wrap_sliding_window_attn_func",
+        ),
+        (
+            "nnscaler.customized_ops.ring_attention.zigzag_allgather_attn_varlen",
+            "wrap_zigzag_allgather_attn_varlen_func",
+        ),
+    ],
+)
+def test_varlen_wrapper_honors_explicit_max_seqlens(
+    monkeypatch, module_name, wrapper_name
+):
+    module = importlib.import_module(module_name)
+    calls = {}
+
+    def fake_flash_attn_varlen_func(
+        q,
+        k,
+        v,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        max_seqlen_q,
+        max_seqlen_k,
+        **kwargs,
+    ):
+        calls["max_seqlen_q"] = max_seqlen_q
+        calls["max_seqlen_k"] = max_seqlen_k
+        return q
+
+    monkeypatch.setattr(
+        module, "flash_attn_varlen_func", fake_flash_attn_varlen_func
+    )
+    wrapper = getattr(module, wrapper_name)
+    q = torch.empty(4, 2, 8)
+    k = torch.empty_like(q)
+    v = torch.empty_like(q)
+    cu_seqlens = torch.tensor([0, 4], dtype=torch.int32)
+
+    output = wrapper(
+        q,
+        k,
+        v,
+        cu_seqlens,
+        cu_seqlens,
+        None,
+        max_seqlen_q=8,
+        max_seqlen_k=16,
+    )
+
+    assert output is q
+    assert calls == {"max_seqlen_q": 8, "max_seqlen_k": 16}
