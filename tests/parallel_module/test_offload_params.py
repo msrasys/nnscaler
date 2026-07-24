@@ -105,6 +105,7 @@ def _correctness_worker():
     compute_config = ComputeConfig(
         plan_ngpus=1,
         runtime_ngpus=2,
+        reducer_bucket_cap_mb=1e-6
     )
 
     with clear_dir_on_rank0(Path(tempfile.gettempdir()) / f'nnscaler_test_offload_correctness_{PYTEST_RUN_ID}') as tempdir:
@@ -123,6 +124,7 @@ def _correctness_worker():
             gen_savedir=tempdir,
             instance_name='normal'
         )
+        assert len(p_module1.reducers[0].buckets) > 1
         optimizer1 = build_optimizer(p_module1, torch.optim.Adam, lr=0.01)
 
         results_normal = []

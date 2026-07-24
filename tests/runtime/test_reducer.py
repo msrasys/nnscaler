@@ -276,6 +276,57 @@ def test_reducer_build():
 
 
 @mock_reducer_env(0, 2)
+def test_reducer_wake_up_rebinds_buckets_to_correct_slices():
+    """Regression test for the reducer wake_up bug.
+
+    Each bucket owns its buffer slice via its own `_start` / `_stop`, and
+    `wake_up()` re-binds every bucket to `buffer[bucket._start:bucket._stop]`.
+    Because the slice is derived from the bucket's own offsets, the binding is
+    correct regardless of the order in which buckets are stored (they are kept in
+    reversed, tail-to-head backward order). This test builds several
+    differently-sized buckets and asserts each bucket points at the same buffer
+    slice before and after a sleep/wake_up cycle.
+    """
+    reducer = Reducer([0, 1], max_bucket_size_bytes=48)
+    reducer.add_param(torch.nn.Parameter(torch.randn(1, 2)))   # bucket 0
+    reducer.add_param(torch.nn.Parameter(torch.randn(1, 14)))  # bucket 1
+    reducer.add_param(torch.nn.Parameter(torch.randn(1, 5)))   # bucket 2
+    reducer.add_param(torch.nn.Parameter(torch.randn(1, 5)))   # bucket 3
+    reducer.add_param(torch.nn.Parameter(torch.randn(1, 1)))   # bucket 3
+    reducer.add_param(torch.nn.Parameter(torch.randn(1, 1)))   # bucket 4
+    reducer.build_buckets()
+    assert len(reducer.buckets) == 5
+
+    # each bucket must be bound to the slice described by starts/stops at its index
+    for bucket in reducer.buckets:
+        assert bucket._contiguous_params.storage_offset() == bucket._start
+        assert bucket._contiguous_params.numel() == bucket._stop - bucket._start
+        assert bucket._contiguous_grads.storage_offset() == bucket._start
+        assert bucket._contiguous_grads.numel() == bucket._stop - bucket._start
+
+    # record each bucket's buffer slice (by identity) before offloading
+    before = [
+        (bucket._contiguous_params.storage_offset(), bucket._contiguous_params.numel())
+        for bucket in reducer.buckets
+    ]
+
+    reducer.sleep()
+    reducer.wake_up()
+
+    # after wake_up, every bucket must be re-bound to exactly the same slice
+    after = [
+        (bucket._contiguous_params.storage_offset(), bucket._contiguous_params.numel())
+        for bucket in reducer.buckets
+    ]
+    assert before == after
+    for bucket in reducer.buckets:
+        assert bucket._contiguous_params.storage_offset() == bucket._start
+        assert bucket._contiguous_params.numel() == bucket._stop - bucket._start
+        assert bucket._contiguous_grads.storage_offset() == bucket._start
+        assert bucket._contiguous_grads.numel() == bucket._stop - bucket._start
+
+
+@mock_reducer_env(0, 2)
 def test_reducer_nreplicas():
     """Test that nreplicas is correctly passed to buckets"""
     # Test nreplicas defaults to 1
@@ -324,7 +375,7 @@ def test_reducer_build_zero_param_level_sharding_merges_single_param_tail():
 
     reducer.build_buckets()
 
-    buckets = list(reversed(reducer.buckets))
+    buckets = list(reducer.buckets)
     assert [len(bucket.params) for bucket in buckets] == [9]
 
 
