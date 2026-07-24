@@ -86,6 +86,15 @@ class CompileFlag:
     # but some of the forward operators will be converted to float16.
     use_amp = _to_bool('USE_AMP')
 
+    # Traditionally, PP schedules only schedule the 'forward' and 'backward' step
+    # (call these FB schedules).
+    # The Zero Bubble schedule suggests that separating Backward into 'dInput' and 'dWeight' portions
+    # allows for finer-grained scheduling and reduction of pipeline bubbles
+    # (call these FBW schedules).
+    # this flag controls whether to use FBW schedules or FB schedules.
+    # Default is False (FB schedules).
+    use_fbw = _to_bool('USE_FBW')
+
 
 class RuntimeFlag:
 

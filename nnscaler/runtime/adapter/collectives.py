@@ -10,6 +10,7 @@ Every collective is implemented using out-of-place semantics.
 """
 
 from typing import List, Tuple, Optional
+import warnings
 import torch
 
 from nnscaler.runtime.device import DeviceGroup
@@ -31,7 +32,9 @@ def move(tensor: Optional[torch.Tensor], shape: Tuple[int], dtype: torch.dtype, 
         assert torch.is_tensor(tensor)
         if async_op:
             work = torch.distributed.isend(tensor, dst)
-            # NOTE: we don't add isend work item into handler
+            # NOTE: we need to hold the work to AsyncCommHandler,
+            # otherwise the tensor can be freed before the communication starts.
+            AsyncCommHandler().hold_send(tensor, work)
         else:
             torch.distributed.send(tensor, dst)
     else:
@@ -55,7 +58,7 @@ def move_object(obj, src: int, dst: int, async_op=False):
     using send_object_list / recv_object_list.
     """
     if async_op:
-        raise NotImplementedError("Async move_object is not implemented yet")
+        warnings.warn("Async move_object is not implemented yet. Will fallback to synchronous move_object.")
 
     CudaTimer().start(field_name='comm', predefined=True)
     rank = torch.distributed.get_rank()
