@@ -20,6 +20,12 @@ from nnscaler.codegen.emit import FuncEmission
 from nnscaler.codegen.syntax.symtable import SymbolTable
 from nnscaler.codegen.lifecycle import LifeCycle
 from nnscaler.codegen.syntax.blocks import FunctionBlock, Block
+from chronotrigger.trace.integrations.nnscaler import (
+    build_stage_ids,
+    segment_trace_fields,
+    wrap_generated_range,
+    wrap_generated_scope,
+)
 from nnscaler.flags import CompileFlag
 
 
@@ -66,68 +72,9 @@ class ScheduleCodeGen(FuncEmission):
             'import torch', 'import nnscaler', 'import chronotrigger.trace as ct', 'import _operator', '']
         # module member name
         self.symbols = SymbolTable()
-        self._segment_stage_ids = self._build_segment_stage_ids()
-
-    def _build_segment_stage_ids(self) -> dict[int, int]:
-        segment_stage_ids = {}
-        fsegments = [
-            seg for seg in self.execplan.graph.select(ntype=IRSegment, flatten=False)
-            if seg.isfw()
-        ]
-        for stage_id, segment in enumerate(fsegments):
-            segment_stage_ids[segment.cid] = stage_id
-            if isinstance(segment.mirror, IRSegment):
-                segment_stage_ids[segment.mirror.cid] = stage_id
-        return segment_stage_ids
-
-    def _segment_trace_fields(self, node: IRSegment) -> Tuple[str, Optional[int]]:
-        fw_segment = node if node.isfw() else node.mirror
-        stage_id = self._segment_stage_ids.get(node.cid)
-        if stage_id is None and isinstance(fw_segment, IRSegment):
-            stage_id = self._segment_stage_ids.get(fw_segment.cid)
-        segment_name = self.node_name(fw_segment) if isinstance(fw_segment, IRSegment) else self.node_name(node)
-        return segment_name, stage_id
-
-    @staticmethod
-    def _wrap_trace(
-        kind: str,
-        entity: str,
-        codes: List[str],
-        *,
-        virtual_stage: Optional[int] = None,
-        peer: Optional[int] = None,
-        micro_batch_id: Optional[int] = None,
-        process_scope: bool = True,
-    ) -> List[str]:
-        if not codes:
-            return codes
-        fields = []
-        if virtual_stage is not None:
-            fields.append(f'vs={virtual_stage}')
-        if peer is not None:
-            fields.append(f'peer={peer}')
-        if micro_batch_id is not None:
-            fields.append(f'mb={micro_batch_id}')
-        if not process_scope:
-            fields.append('process_scope=False')
-        kwargs = f", {', '.join(fields)}" if fields else ''
-        with Block(f'with ct.range(ct.Kind.{kind}, {entity!r}{kwargs}):') as trace_block:
-            trace_block.insert_body(codes)
-        return trace_block.code
-
-    @staticmethod
-    def _wrap_scope(
-        entity: str,
-        codes: List[str],
-        *,
-        micro_batch_id: Optional[int] = None,
-    ) -> List[str]:
-        if not codes:
-            return codes
-        fields = f', mb={micro_batch_id}' if micro_batch_id is not None else ''
-        with Block(f'with ct.scope({entity!r}{fields}):') as scope_block:
-            scope_block.insert_body(codes)
-        return scope_block.code
+        self._segment_stage_ids = build_stage_ids(
+            self.execplan.graph.select(ntype=IRSegment, flatten=False)
+        )
 
     def gen(self, device: int, outfile=None, attach=None) -> str:
         """
@@ -858,7 +805,11 @@ class ScheduleCodeGen(FuncEmission):
             pre_hook, post_hook, hook_meta = unwrap_node.pre_hook, unwrap_node.post_hook, unwrap_node.hook_meta
             # emit forward segment
             if node.isfw():
-                segment_name, virtual_stage = self._segment_trace_fields(unwrap_node)
+                segment_name, virtual_stage = segment_trace_fields(
+                    unwrap_node,
+                    self._segment_stage_ids,
+                    self.node_name,
+                )
                 getitem_codes = self._gen_nontensor_getitem_codes(
                     node_inputs,
                     produced_tids,
@@ -877,12 +828,12 @@ class ScheduleCodeGen(FuncEmission):
                     inputs = inputs,
                     req_grad = req_grad,
                 )]
-                codes += self._wrap_trace(
-                    'FWD',
-                    segment_name,
+                codes += wrap_generated_range(
                     operation_codes,
+                    kind='FWD',
+                    entity=segment_name,
                     virtual_stage=virtual_stage,
-                    micro_batch_id=micro_batch_id,
+                    micro_batch=micro_batch_id,
                     process_scope=False,
                 )
                 if post_hook:
@@ -891,7 +842,11 @@ class ScheduleCodeGen(FuncEmission):
                         outputs_str=outputs if len(node_outputs) <= 1 else f'({outputs})'
                     )
             else:
-                segment_name, virtual_stage = self._segment_trace_fields(unwrap_node)
+                segment_name, virtual_stage = segment_trace_fields(
+                    unwrap_node,
+                    self._segment_stage_ids,
+                    self.node_name,
+                )
                 # get gradient computation arguments
                 input_tensors, output_tensors, output_grads, input_grads = \
                         self.get_backward_callsite_io_tensors(node)
@@ -925,12 +880,12 @@ class ScheduleCodeGen(FuncEmission):
                     output_tensors = output_tensors_str,
                     output_grads = output_grads_str,
                 )]
-                codes = self._wrap_trace(
-                    'BWD',
-                    segment_name,
+                codes = wrap_generated_range(
                     codes,
+                    kind='BWD',
+                    entity=segment_name,
                     virtual_stage=virtual_stage,
-                    micro_batch_id=micro_batch_id,
+                    micro_batch=micro_batch_id,
                 )
 
                 bwd_input_str = f'({input_tensors_str}, {output_tensors_str}, {output_grads_str})'
@@ -976,10 +931,10 @@ class ScheduleCodeGen(FuncEmission):
                 inputs = inputs,
                 req_grad = req_grad
             )]
-            codes = self._wrap_scope(
-                self.node_name(unwrap_node),
+            codes = wrap_generated_scope(
                 codes,
-                micro_batch_id=micro_batch_id,
+                entity=self.node_name(unwrap_node),
+                micro_batch=micro_batch_id,
             )
 
         elif isinstance(unwrap_node, IRWeightReducer):

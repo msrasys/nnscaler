@@ -16,10 +16,11 @@ from nnscaler.ir.adapter.prim import CommPrim, MovePrim, ChunkPrim
 from nnscaler.graph.segment import IRSegment
 
 from nnscaler.codegen.frontend_mapping import Sign2EmitRule
-from nnscaler.codegen.syntax.blocks import Block
-
 from nnscaler.flags import CompileFlag
-from nnscaler.profiler.chronotrigger import primitive_trace_spec
+from chronotrigger.trace.integrations.nnscaler import (
+    primitive_trace_spec,
+    wrap_generated_range,
+)
 
 _logger = logging.getLogger(__name__)
 
@@ -386,13 +387,15 @@ class FuncEmission(CodeEmission):
             if trace_spec is None:
                 codes.append(code)
             else:
-                peer = f', peer={trace_spec.peer}' if trace_spec.peer is not None else ''
-                with Block(
-                    f'with ct.range(ct.Kind.{trace_spec.kind}, '
-                    f'{trace_spec.entity!r}{peer}, process_scope=False):'
-                ) as trace_block:
-                    trace_block.insert_body(code)
-                codes.extend(trace_block.code)
+                codes.extend(
+                    wrap_generated_range(
+                        [code],
+                        kind=trace_spec.kind,
+                        entity=trace_spec.entity,
+                        peer=trace_spec.peer,
+                        process_scope=False,
+                    )
+                )
         return codes
 
     def _pipeline_output_release_after_send(
@@ -539,11 +542,14 @@ class FuncEmission(CodeEmission):
         codes = []
         if CompileFlag.line_timer:
             codes.append(f'nnscaler.runtime.function.print_time({repr(reducer_name)})')
-        with Block(
-            f'with ct.range(ct.Kind.REDUCE, {self.node_name(node)!r}, process_scope=False):'
-        ) as trace_block:
-            trace_block.insert_body(f'{reducer_name}.sync_grads()')
-        codes.extend(trace_block.code)
+        codes.extend(
+            wrap_generated_range(
+                [f'{reducer_name}.sync_grads()'],
+                kind='REDUCE',
+                entity=self.node_name(node),
+                process_scope=False,
+            )
+        )
         return codes
 
     def emit_release(self, tensors: Iterable[IRTensor]) -> str:

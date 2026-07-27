@@ -88,10 +88,6 @@ def test_gencode_correct_dataloader_order(tmp_path):
         tmp_path, PPModule1, 1,
         r'.*reserve_send_bundle\(\(\(1, 0\),\)\)',
     )
-    for generated_file in tmp_path.rglob('gencode*.py'):
-        assert generated_file.read_text().count(
-            'import chronotrigger.trace as ct'
-        ) == 1
     # code looks like:
     # rank1:
     # def _train_step(model, dataloader_33):

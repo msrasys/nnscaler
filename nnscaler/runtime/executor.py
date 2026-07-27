@@ -7,34 +7,12 @@ Executor for runtime
 import atexit
 
 from typing import Tuple, Any, Callable, List, Dict, Optional
-import chronotrigger.trace as ct
 import torch
 import logging
 
 _logger = logging.getLogger(__name__)
 
 _ALLOW_GRAD_DTYPES = (torch.double, torch.float32, torch.float16, torch.bfloat16)
-
-
-def _wait_for_work(work, trace_context: Optional[ct.TraceContext]):
-    is_completed = getattr(work, 'is_completed', None)
-    if is_completed is not None and is_completed():
-        work.wait()
-        return
-    with ct.range_from(trace_context, kind=ct.Kind.WAIT, source=_WAIT_SOURCE):
-        work.wait()
-
-
-_WAIT_SOURCE = ct.Source.callable(_wait_for_work)
-
-
-def debug_id(tensors, msg: str, rank: int):
-    if torch.distributed.get_rank() == rank:
-        if torch.is_tensor(tensors):
-            print(f'[{torch.distributed.get_rank()}] {msg}: [{id(tensors)}]')
-        else:
-            print(f'[{torch.distributed.get_rank()}] {msg}: {[id(t) for t in tensors]}')
-
 
 try:
     from torch.autograd.graph import get_gradient_edge
@@ -48,7 +26,6 @@ class AsyncCommHandler:
         def __init__(self):
             self._works: Dict[int, List] = {}
             self._callbacks: Dict[int, Callable] = {}
-            self._metas: Dict[int, Optional[ct.TraceContext]] = {}
             self._send_holds: List = []
             self._send_bundle_queues: Dict[Any, List[List]] = {}
             self._active_send_bundle: Optional[Tuple[Any, List]] = None
@@ -71,12 +48,10 @@ class AsyncCommHandler:
         """
         if id(tensor) not in self._works:
             return tensor
-        tid = id(tensor)
-        works = self._works.pop(tid)
-        trace_context = self._metas.pop(tid, None)
+        works = self._works.pop(id(tensor))
         for work in works:
-            _wait_for_work(work, trace_context)
-        callback = self._callbacks.pop(tid)
+            work.wait()
+        callback = self._callbacks.pop(id(tensor))
         if callback is not None:
             tensor = callback(tensor)
         return tensor
@@ -85,13 +60,11 @@ class AsyncCommHandler:
         """
         Submit an async communication
         """
-        tid = id(tensor)
-        self._works[tid] = works
-        self._callbacks[tid] = callback
-        self._metas[tid] = ct.current_context()
+        self._works[id(tensor)] = works
+        self._callbacks[id(tensor)] = callback
 
     def hold_send(self, tensor: torch.Tensor, work, callback: Optional[Callable] = None):
-        hold = (tensor, work, callback, ct.current_context())
+        hold = (tensor, work, callback)
         state = self.instance
         if state._active_send_bundle is None:
             state._send_holds.append(hold)
@@ -100,8 +73,8 @@ class AsyncCommHandler:
 
     @staticmethod
     def _complete_send_holds(holds):
-        for _, work, callback, trace_context in holds:
-            _wait_for_work(work, trace_context)
+        for _, work, callback in holds:
+            work.wait()
             if callback is not None:
                 callback()
 
@@ -145,14 +118,14 @@ class AsyncCommHandler:
             return
 
         pending = []
-        for tensor, work, callback, trace_context in self._send_holds:
+        for tensor, work, callback in self._send_holds:
             is_completed = getattr(work, 'is_completed', None)
             if is_completed is not None and is_completed():
                 work.wait()
                 if callback is not None:
                     callback()
             else:
-                pending.append((tensor, work, callback, trace_context))
+                pending.append((tensor, work, callback))
         self._send_holds[:] = pending
 
     def drain(self):
@@ -162,12 +135,10 @@ class AsyncCommHandler:
             callback = self._callbacks.get(tid)
             if callback is not None:
                 continue
-            trace_context = self._metas.get(tid)
             for work in works:
-                _wait_for_work(work, trace_context)
+                work.wait()
             self._works.pop(tid, None)
             self._callbacks.pop(tid, None)
-            self._metas.pop(tid, None)
 
     def clear(self):
         AsyncCommHandler.instance = AsyncCommHandler.__AsyncCommHandler()
@@ -176,14 +147,12 @@ class AsyncCommHandler:
         assert (
             len(self._works) == 0
             and len(self._callbacks) == 0
-            and len(self._metas) == 0
             and len(self._send_holds) == 0
             and len(self._send_bundle_queues) == 0
             and self._active_send_bundle is None
         ), (
             f"AsyncCommHandler is not clear: works={len(self._works)}, "
-            f"callbacks={len(self._callbacks)}, metas={len(self._metas)}, "
-            f"send_holds={len(self._send_holds)}, "
+            f"callbacks={len(self._callbacks)}, send_holds={len(self._send_holds)}, "
             f"send_bundle_queues={len(self._send_bundle_queues)}, "
             f"active_send_bundle={self._active_send_bundle is not None}"
         )
@@ -206,12 +175,7 @@ class Executor:
     _backward_pre_hook: Optional[Callable] = None
 
     @staticmethod
-    def fexecute(
-        name: str,
-        subgraph: Callable,
-        *input_tensors: Tuple[Any],
-        requires_grad=True,
-    ):
+    def fexecute(name: str, subgraph: Callable, *input_tensors: Tuple[Any], requires_grad=True):
         """
         forward the sub-graph.
         """

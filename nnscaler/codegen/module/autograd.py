@@ -6,9 +6,12 @@ from typing import List
 from nnscaler.ir.tensor import IRSubTensor
 from nnscaler.ir.adapter import IRAdapter
 from nnscaler.ir.adapter.prim import IRAdapterPrim
-from nnscaler.profiler.chronotrigger import primitive_trace_spec
+from chronotrigger.trace.integrations.nnscaler import (
+    primitive_trace_spec,
+    wrap_generated_range,
+)
 
-from nnscaler.codegen.syntax.blocks import Block, ClassBlock, FunctionBlock
+from nnscaler.codegen.syntax.blocks import ClassBlock, FunctionBlock
 
 from nnscaler.codegen.emit import FuncEmission
 
@@ -48,17 +51,14 @@ class AutogradAdapterCodeGen(FuncEmission):
         trace_spec = primitive_trace_spec(prim, rank, adapter_name, index)
         if trace_spec is None:
             return [code]
-        peer = f', peer={trace_spec.peer}' if trace_spec.peer is not None else ''
-        trace_fields = (
-            f', step={context_expr}.step if {context_expr} is not None else None, '
-            f'**(dict({context_expr}.payload_fields) if {context_expr} is not None else {{}})'
+        return wrap_generated_range(
+            [code],
+            kind=trace_spec.kind,
+            entity=trace_spec.entity,
+            peer=trace_spec.peer,
+            context=context_expr,
+            process_scope=False,
         )
-        with Block(
-            f'with ct.range(ct.Kind.{trace_spec.kind}, {trace_spec.entity!r}{peer}'
-            f'{trace_fields}, process_scope=False):'
-        ) as trace_block:
-            trace_block.insert_body(code)
-        return trace_block.code
 
     def gen(self, fadapter: IRAdapter) -> List[str]:
         assert fadapter.isfw() and fadapter.differentiable and fadapter.custom, "generate autograd for a non-differentiable adapter"

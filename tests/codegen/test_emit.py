@@ -130,8 +130,6 @@ def test_emit_pipeline_output_release_after_send(monkeypatch):
 
     assert 'release_after_send=x_' in code
     assert 'release_after_send=x_chunk' not in code
-    assert code.count('with ct.range(ct.Kind.SEND') == 1
-    assert '    _ = nnscaler.runtime.adapter.move(' in code
 
 
 def test_emit_pipeline_output_release_after_send_can_be_disabled(monkeypatch):
