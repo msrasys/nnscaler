@@ -340,7 +340,7 @@ class ModelConfig:
     # The reducer config for non-parallel parameters
     # If None, the global compute_config will be used
     # with `use_async_reducer` set to False and `reducer_bucket_cap_mb` set to 0
-    # We need to disable async reducer and set reducer_bucket_cap_mb=0 for non-parellel parameters
+    # We need to disable async reducer and set reducer_bucket_cap_mb=0 for non-parallel parameters
     # Because in most cases, non-parallel parameters are used when the compute graph is not static
     # For example, some parameters are only used in some branches of the model,
     # and they are not used in every forward/backward pass.

@@ -601,11 +601,12 @@ class Bucket:
                     f'CudaTimer: the communication time of async reducer will not be recorded in `comm`')
             if self._async_handle is None:
                 raise RuntimeError(
-                    "Detecting gradient asynchronous synchronization hasn't been triggered. "
-                    "This usually means some of the parameters are not used in forward pass, "
-                    "and therefore their gradients are not generated. "
-                    "Please check your model and make sure all parameters are used "
-                    "with enable_grad in EVERY forward pass. "
+                    "The async reducer's asynchronous gradient synchronization was never triggered, "
+                    "which means no gradient was produced for the parameters in this reducer on this step. "
+                    "This usually happens when some parameters are not used, "
+                    "or are used outside a `torch.enable_grad` context, in the forward pass. "
+                    "Please make sure every parameter in this reducer is used under `torch.enable_grad` "
+                    "in EVERY forward pass, or disable the async reducer."
                 )
             self._async_handle.wait()
         else:
