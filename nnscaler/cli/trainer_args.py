@@ -1,7 +1,7 @@
 #  Copyright (c) Microsoft Corporation.
 #  Licensed under the MIT License.
 
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 import importlib
 from typing import Any, Callable, Dict, List, Literal, Optional, TYPE_CHECKING, Protocol, Type, Union, TypeVar
 from typing_extensions import get_args
@@ -230,17 +230,12 @@ class AggregatedOutputs:
 
 
 @dataclass(frozen=True)
-class OptionalComputeConfig:
-    constant_folding: Optional[bool] = None
-    trace_strategy: Optional[str] = None
+class OptionalReducerConfig:
     use_zero: Optional[bool] = None
     zero_ngroups: Optional[int] = None
     zero_use_reduce_scatter: Optional[bool] = None
     use_async_reducer: Optional[bool] = None
     reducer_bucket_cap_mb: Optional[float] = None
-
-    pas_config: Optional[Dict[str, Any]] = None
-    user_config: Optional[Dict[str, Any]] = None
 
     def resolve(self, compute_config: ComputeConfig) -> ComputeConfig:
         replace_values = {
@@ -251,6 +246,15 @@ class OptionalComputeConfig:
         resolved_values.update(replace_values)
         resolved_values[fields(ComputeConfig).use_end2end] = False
         return ComputeConfig(**resolved_values)
+
+
+@dataclass(frozen=True)
+class OptionalComputeConfig(OptionalReducerConfig):
+    constant_folding: Optional[bool] = None
+    trace_strategy: Optional[str] = None
+
+    pas_config: Optional[Dict[str, Any]] = None
+    user_config: Optional[Dict[str, Any]] = None
 
 
 @dataclass
@@ -333,6 +337,17 @@ class ModuleParallelizeConfig:
 class ModelConfig:
     type: str = None
     args: dict[str, Any] = field(default_factory=dict)
+    # The reducer config for non-parallel parameters
+    # If None, the global compute_config will be used
+    # with `use_async_reducer` set to False and `reducer_bucket_cap_mb` set to 0
+    # We need to disable async reducer and set reducer_bucket_cap_mb=0 for non-parellel parameters
+    # Because in most cases, non-parallel parameters are used when the compute graph is not static
+    # For example, some parameters are only used in some branches of the model,
+    # and they are not used in every forward/backward pass.
+    # In this case, the async reducer will not be able to reduce the gradients of these parameters,
+    # instead they will cause the training to hang
+    # because the async reducer is waiting forever for the gradients of these parameters to be reduced.
+    non_parallel_params_reducer_config: Optional[OptionalReducerConfig] = None
     # if parallel_modules is not empty,
     # these modules will be parallelized instead of the whole model
     # and sub modules (in the list of `parallel_modules`) in the model
@@ -1245,8 +1260,11 @@ class TrainerArgs(PrecisionMixin, PolicyMixin):
     def create_parallel_optimizer(self, parallel_model: torch.nn.Module):
         kwargs = self.create_kwarg(self.optimizer.args)
         optimizer_class = load_type(self.optimizer.type)
+        npp_reducer_config = self.model.non_parallel_params_reducer_config \
+            or OptionalReducerConfig(use_async_reducer=False, reducer_bucket_cap_mb=0)
+        npp_compute_config = npp_reducer_config.resolve(self.compute_config)
         return build_optimizer(
-            parallel_model, optimizer_class, self.compute_config,
+            parallel_model, optimizer_class, npp_compute_config,
             self.optimizer.param_clss_fn,
             **kwargs
         )

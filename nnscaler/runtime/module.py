@@ -663,6 +663,7 @@ class CubeModule(torch.nn.Module):
         # help understand the whole logic. In other words, the real plan_ngpus is <= len(model_state_dicts).
         plan_ngpus = len(model_state_dicts)
         # gather model states
+        _logger.info('start merge model states')
         full_model_state_dict = cls.merge_model_state_dicts(model_state_dicts, fullmaps[0: plan_ngpus], zero_idx_maps)
         _logger.info('finish merge model states')
         if optim_state_dicts is None:
