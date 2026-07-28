@@ -1361,6 +1361,16 @@ class ParallelModule(CubeModule):
             raise ValueError(f"Rank {rank} is out of range [0, {cls.world_size})")
         return cls.attr_meta_maps[rank]
 
+    def set_grad_accumulation_steps(self, steps: int):
+        """
+        Set the number of gradient accumulation steps for the module.
+
+        Args:
+            steps (int): the number of gradient accumulation steps
+        """
+        for reducer in self._reducers:
+            reducer.grad_accumulation_steps = steps
+
     def forward(self, *args, **kwargs):
         self._warn_uninitialized_non_persistent_buffers(raise_error=True)
         if self.training:
@@ -1499,6 +1509,7 @@ class ParallelModule(CubeModule):
         self._sync_grad_required = False
         sample_count = len(samples)
         dataloader = microbatches(samples, cycle=False)
+        self.set_grad_accumulation_steps(sample_count)
 
         if self.use_scheduler:
             if len(samples) != self.nmicros_per_scheduler_step:
