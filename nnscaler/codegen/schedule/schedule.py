@@ -197,9 +197,7 @@ class ScheduleCodeGen(FuncEmission):
                             last_backwards[node.cell.cid] = node
                     last_backward_node_oids = [id(node) for node in last_backwards.values()]
 
-                last_backward_node = None
-                last_backward_weight_codes = []
-                for line, node in enumerate(device_nodes):
+                def _append_skip_flag(node: IRCell):
                     # when use scheduler, skip reducer if it is not the last backward of same segments
                     if use_scheduler and _is_backward_segment(node):
                         _append_code(fb,
@@ -207,27 +205,35 @@ class ScheduleCodeGen(FuncEmission):
                             f'{id(node) not in last_backward_node_oids !r}'
                         )
 
+                prev_backward_node = None
+                prev_backward_weight_codes = []
+                for line, node in enumerate(device_nodes):
                     codes = self.emit_node(node)
 
                     if use_scheduler and _is_backward_segment(node) and CompileFlag.use_fbw:
-                        if last_backward_node is not None:
-                            _append_code(fb, last_backward_weight_codes, self._get_node_stream(last_backward_node))
-                        last_backward_node = node
+                        if prev_backward_node is not None:
+                            _append_skip_flag(prev_backward_node)
+                            _append_code(fb, prev_backward_weight_codes, self._get_node_stream(prev_backward_node))
+                        prev_backward_node = node
                         codes_input, codes_weight = _split_backward_codes(codes)
-                        last_backward_weight_codes = codes_weight
+                        prev_backward_weight_codes = codes_weight
                         _append_code(fb, codes_input, self._get_node_stream(node))
                     else:
-                        if last_backward_node is not None:
-                            if _is_adapter(node) and _depends_totally_on(node, last_backward_node):
+                        if prev_backward_node is not None:
+                            if _is_adapter(node) and _depends_totally_on(node, prev_backward_node):
                                 # if the next node is an adapter that depends on the last backward,
                                 # we need to emit the adapter before the last backward_weight codes
+                                _append_skip_flag(node) # should no-op for adapters.
                                 _append_code(fb, codes, self._get_node_stream(node))
                             else:
-                                _append_code(fb, last_backward_weight_codes, self._get_node_stream(last_backward_node))
-                                last_backward_node = None
-                                last_backward_weight_codes = []
+                                _append_skip_flag(prev_backward_node)
+                                _append_code(fb, prev_backward_weight_codes, self._get_node_stream(prev_backward_node))
+                                prev_backward_node = None
+                                prev_backward_weight_codes = []
+                                _append_skip_flag(node)
                                 _append_code(fb, codes, self._get_node_stream(node))
                         else:
+                            _append_skip_flag(node)
                             _append_code(fb, codes, self._get_node_stream(node))
 
                     # release
@@ -235,8 +241,9 @@ class ScheduleCodeGen(FuncEmission):
                     if len(tensors) > 0 : # not necessarily to have one after each line
                         _append_code(fb, self.emit_release(tensors))
 
-                if last_backward_node is not None:
-                    _append_code(fb, last_backward_weight_codes, self._get_node_stream(last_backward_node))
+                if prev_backward_node is not None:
+                    _append_skip_flag(prev_backward_node)
+                    _append_code(fb, prev_backward_weight_codes, self._get_node_stream(prev_backward_node))
 
             # return code
             if CompileFlag.async_comm:

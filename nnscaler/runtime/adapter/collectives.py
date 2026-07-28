@@ -225,7 +225,8 @@ def rdscatter(itensor: torch.Tensor, shape: Tuple[int], dtype: torch.dtype,
             for dst, otensor in zip(dsts, otensors):
                 otensor = otensor.contiguous() if not otensor.is_contiguous() else otensor
                 if async_op:
-                    torch.distributed.isend(otensor, dst)
+                    work = torch.distributed.isend(otensor, dst)
+                    AsyncCommHandler().hold_send(otensor, work)
                 else:
                     torch.distributed.send(otensor, dst)
         otensor = itensor
@@ -297,7 +298,8 @@ def rdgather(itensor: torch.Tensor, shape: Tuple[int], dtype: torch.dtype,
         assert rank in srcs
         otensor = itensor.contiguous() if not itensor.is_contiguous() else itensor
         if async_op:
-            torch.distributed.isend(otensor, dst)
+            work = torch.distributed.isend(otensor, dst)
+            AsyncCommHandler().hold_send(otensor, work)
         else:
             torch.distributed.send(otensor, dst)
     if not async_op:

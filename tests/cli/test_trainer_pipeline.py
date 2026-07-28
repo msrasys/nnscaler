@@ -107,8 +107,10 @@ def test_trainer_pipeline(tmp_path):
     #     ...
     #     _ = nnscaler.runtime.executor.backward_input('segment43', (), (linear_8_184, ), (glinear_8_185, ), model.parameters())
     #     del linear_8_184, glinear_8_185
+    #     _ = nnscaler.runtime.executor.backward_input('segment43', (), (linear_8_184, ), (glinear_8_185, ), model.parameters())
+    #     del linear_8_184, glinear_8_185
     #     glinear_8_208 = nnscaler.runtime.executor.aexecute(model.adapter95, *(), requires_grad=False)
-    #     nnscaler.flags.RuntimeFlag.skip_reducer = False
+    #     nnscaler.flags.RuntimeFlag.skip_reducer = True
     #     nnscaler.runtime.executor.backward_weight('segment43', model.parameters())
     #     _ = nnscaler.runtime.executor.backward_input('segment43', (), (linear_8_207, ), (glinear_8_208, ), model.parameters())
     #     del linear_8_207, glinear_8_208
@@ -116,6 +118,7 @@ def test_trainer_pipeline(tmp_path):
     #     binary_cross_entropy_176 = nnscaler.runtime.executor.aexecute(model.adapter102, *(), requires_grad=True)
     #     binary_cross_entropy_199 = nnscaler.runtime.executor.aexecute(model.adapter102, *(), requires_grad=True)
     #     binary_cross_entropy_222 = nnscaler.runtime.executor.aexecute(model.adapter102, *(), requires_grad=True)
+    #     nnscaler.flags.RuntimeFlag.skip_reducer = False
     #     nnscaler.runtime.executor.backward_weight('segment43', model.parameters())
     #     _ = nnscaler.runtime.executor.aexecute(model.reducer293, *(), requires_grad=False)
     #     nnscaler.runtime.executor.AsyncCommHandler().drain_sends()
