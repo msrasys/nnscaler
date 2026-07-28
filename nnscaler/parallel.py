@@ -235,6 +235,19 @@ class ComputeConfig:
         if self.use_zero and self.zero_use_reduce_scatter and self.zero_ngroups != 1:
             raise ValueError("zero_use_reduce_scatter is only supported when zero_ngroups is 1.")
 
+        if self.use_fbw:
+            if not self.use_end2end:
+                raise ValueError("use_fbw is only supported in end2end mode.")
+            if self.inference_only:
+                raise ValueError("use_fbw is not supported in inference mode.")
+
+            from nnscaler.runtime._patch_torch import FBW_SUPPORTED
+            if not FBW_SUPPORTED:
+                raise ValueError(
+                    "fbw is not supported in the current environment. "
+                    "Please update pytorch(2.5.0+) and/or python(2.10+) to a higher version."
+                )
+
     def apply_pipeline_scheduler(
             self,
             graph: IRGraph,
