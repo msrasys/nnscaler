@@ -57,7 +57,7 @@ def _make_data(nsteps, nmicros, seed=1234):
     return steps
 
 
-def _pp_reschedule_worker(reschedule: bool):
+def _pp_reschedule_worker(reschedule: bool, use_async_recv: bool = False):
     init_distributed()
     dev = torch.cuda.current_device()
     init_random()
@@ -70,6 +70,7 @@ def _pp_reschedule_worker(reschedule: bool):
                       'target': torch.rand(MBS, DIM, device=dev)}},
             PASMegatron,
             ComputeConfig(4, 4, use_end2end=True,
+                          use_async_recv=use_async_recv,
                           pas_config=dict(pipeline_nstages=2, pipeline_nmicros=NMICROS,
                                           pipeline_scheduler='1f1b')),
             gen_savedir=tempdir,
@@ -128,9 +129,9 @@ def test_pipeline_reschedule_numeric_equivalence():
 @pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.device_count() < 4,
                     reason='requires 4 gpus')
 def test_pipeline_reschedule_async_recv_numeric_equivalence():
-    """Reschedule + ASYNC_RECV (cross-stage irecv issued early, waited lazily)
+    """Reschedule + async recv (cross-stage irecv issued early, waited lazily)
     must stay numerically identical to the synchronous baseline."""
-    keys = ('ENABLE_OP_RESCHEDULE', 'OP_RESCHEDULE_SCOPE', 'OP_RESCHEDULE_PIPELINE', 'ASYNC_RECV')
+    keys = ('ENABLE_OP_RESCHEDULE', 'OP_RESCHEDULE_SCOPE', 'OP_RESCHEDULE_PIPELINE')
     saved = {k: os.environ.get(k) for k in keys}
     try:
         # baseline (sync, no reschedule)
@@ -138,12 +139,11 @@ def test_pipeline_reschedule_async_recv_numeric_equivalence():
             os.environ.pop(k, None)
         off = launch_torchrun(4, _pp_reschedule_worker, False)
 
-        # reschedule ON + async recv (irecv early + deferred wait)
+        # reschedule ON + async recv (irecv early + deferred wait via ComputeConfig)
         os.environ['ENABLE_OP_RESCHEDULE'] = '1'
         os.environ['OP_RESCHEDULE_SCOPE'] = 'both'
         os.environ['OP_RESCHEDULE_PIPELINE'] = '1'
-        os.environ['ASYNC_RECV'] = '1'
-        on = launch_torchrun(4, _pp_reschedule_worker, True)
+        on = launch_torchrun(4, _pp_reschedule_worker, True, True)
     finally:
         for k, v in saved.items():
             if v is None:

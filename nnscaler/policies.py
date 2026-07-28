@@ -36,7 +36,8 @@ from nnscaler.graph.function.pyfunc import IRPyFunc
 from nnscaler.graph.segment import IRSegment
 from nnscaler.ir.operator import IRBpOperation, IRDataOperation, IRFwOperation
 from nnscaler.ir import IRCell, IRSubTensor, IRFullTensor
-from nnscaler.ir.cten import IR
+from nnscaler.ir.cten import IR, IRObject
+from nnscaler.ir.unique import IDGenerator
 from nnscaler.runtime.function import identity, multiref
 from nnscaler.utils import load_type
 
@@ -490,6 +491,79 @@ def get_pas_ops(graph: IRGraph) -> List[IRFwOperation]:
     return graph.select(ntype=IRFwOperation)
 
 
+def _move_tensor_splits(
+    tensor_splits: dict,
+    old_ftensor: IRFullTensor,
+    new_ftensor: IRFullTensor,
+    stage_id: int,
+) -> None:
+    """
+    Move the per-stage split info of ``old_ftensor`` that belongs to stages
+    *after* ``stage_id`` onto ``new_ftensor``.
+
+    This is used when an ``identity`` op renames a tensor at (or after) a stage
+    boundary: the original tensor ``old_ftensor`` is only visible up to
+    ``stage_id``, while the following stages consume the identity output
+    ``new_ftensor`` instead. The split info collected on ``old_ftensor`` during
+    op-plan processing (when all consumers still referenced ``old_ftensor``)
+    must therefore be re-attributed to ``new_ftensor`` for the following stages,
+    otherwise the later activation-multiref decision would be made against a
+    tensor that no longer lives in that stage.
+    """
+    old_stage_info = tensor_splits.setdefault(old_ftensor, {})
+    new_stage_info = tensor_splits.setdefault(new_ftensor, {})
+    for following_stage_id, splits in list(old_stage_info.items()):
+        if following_stage_id <= stage_id:
+            continue
+        new_stage_info.setdefault(following_stage_id, set()).update(splits)
+        del old_stage_info[following_stage_id]
+
+
+def _get_new_node_outputs_splits(node: IRFwOperation, stage: IRSegment, op_plans: dict, op_partition_maps: dict):
+    new_node_splits = {}
+    for new_output in node.outputs():
+        if not isinstance(new_output, IRSubTensor):
+            continue
+
+        for consumer in stage.consumers(new_output.parent):
+            if consumer.fn == multiref:
+                continue # skip multiref nodes
+
+            tensor_idx = IR.index_with_same_parent(new_output.parent, consumer.inputs())
+            op_partition_map = op_partition_maps.get(consumer, {})
+            stage_id = op_plans[consumer].stage_id
+
+            if not op_partition_map:
+                tensor_split = 'rn'
+            else:
+                assert tensor_idx in op_partition_map, "Internal Error: tensor_idx should be in op_partition_map"
+                tensor_split = op_partition_map[tensor_idx]
+
+            new_node_splits.setdefault(new_output.parent, {}).setdefault(stage_id, set()).add(tensor_split)
+
+    return new_node_splits
+
+
+def _refresh_grads(segment: IRSegment, tensor: IRSubTensor):
+    if not tensor.requires_grad:
+        return
+
+    consumers = segment.consumers(tensor.parent)
+    if not consumers:
+        return
+
+    segment.infer_grad(tensor.parent)
+
+    for fwop in consumers:
+        if fwop.fn == multiref or not fwop.mirror:
+            continue # skip multiref nodes
+        fins = [t for t in fwop.iobjs() if isinstance(t, IRSubTensor)]
+        igrads = [t.grad for t in fins if t.grad is not None]
+        with segment.mirror.update(fwop.mirror):
+            for i, igrad in enumerate(igrads):
+                fwop.mirror.set_output(i, igrad)
+
+
 def _identity_segment_output(graph: IRGraph, tensor: IRSubTensor, segment: IRSegment, all_segments: List[IRSegment]) -> IRFwOperation:
     """
     Insert an identity operator for the segment output tensor to make it easier to handle in policy.
@@ -520,6 +594,7 @@ def _identity_segment_output(graph: IRGraph, tensor: IRSubTensor, segment: IRSeg
     insert_idx = last_fwop_idx + 1
 
     fwop = Identity(tensor)
+    fwop.comment = 'fn identity for segment output'
     output = tensor.parent.like().tosub()
     fwop.set_output(0, output)
     fwop.device = segment.device
@@ -573,18 +648,209 @@ def _identity_segment_output(graph: IRGraph, tensor: IRSubTensor, segment: IRSeg
         # forward
         if tensor in IRCell.get_objects_from_complex(s.iobjs()):
             s.replace_input(tensor, fwop.output(0))
-            for consumer in s.consumers(tensor.parent):
+            consumers = s.consumers(tensor.parent)
+            # only Identity operator can consume the segment output tensor in the following segments
+            assert len(consumers) <= 1, "Internal Error: there should be zero or one consumer for the segment input tensor"
+            for consumer in consumers:
                 with s.update(consumer):
+                    # grad.valmap is (0, 1)
                     consumer.replace_input(tensor, fwop.output(0))
 
         # backward grad
         if tensor.grad and s.mirror and tensor.grad in IRCell.get_objects_from_complex(s.mirror.oobjs()):
             s.mirror.replace_output(tensor.grad, fwop.output(0).grad)
-            for producer in s.mirror.producers(tensor.grad.parent):
+            producers = s.mirror.producers(tensor.grad.parent)
+            # only Identity operator can produce the segment grad output tensor in the following segments
+            assert len(producers) <= 1, "Internal Error: there should be zero or one producer for the segment grad output tensor"
+            for producer in producers:
                 with s.mirror.update(producer):
+                    # valmap is (0, 1)
                     producer.replace_output(tensor.grad, fwop.output(0).grad)
 
+    _refresh_grads(segment, tensor)
+
     return fwop
+
+
+# signatures of cheap, deterministic, non-differentiable indexing/attribute ops
+# that are safe to recompute (e.g. `data['loss']` -> `_operator.getitem`).
+_SINKABLE_INDEX_SIGNATURES = ('_operator.getitem', )
+
+
+def _duplicate_dataloader_index_ops_per_stage(graph: IRGraph, op_plans: dict) -> None:
+    """
+    Duplicate cheap dataloader-derived indexing ops (e.g. ``data['loss']``) into
+    every consumer stage so that a stage which only needs an indexed piece of the
+    dataloader input computes it locally, instead of receiving it from an earlier
+    stage through a cross-stage adapter.
+
+    Motivation:
+    The dataloader operation is replicated to all devices (see the end of ``fn``),
+    hence its raw output is available in every pipeline stage. An indexing op
+    (``getitem`` / ``getattr``) on that output is non-differentiable and cheap, so
+    recomputing it per stage is strictly better than transferring its result.
+
+    Consider::
+
+        data_loss = data['loss']   # placed in stage 0 by op order
+        ...                        # stages 0..n-1
+        loss = (x + data_loss).sum()  # consumed only in the last stage
+
+    Without this pass, ``data['loss']`` is computed in stage 0 and moved to the
+    last stage via an adapter. With this pass, a copy of the ``getitem`` is placed
+    in the last stage which reads ``data`` from its local dataloader directly.
+
+    The original op is kept in its own stage (that stage may still need it). If the
+    original becomes dead (no remaining consumer and not a graph output), it is
+    removed.
+
+    This must be called before ``graph.staging`` (i.e. before any partition), while
+    all forward ops still live at the top level of the graph and stage ids are known
+    from ``op_plans``.
+    """
+    # tids of dataloader outputs: available in every stage
+    dataloader_output_tids = set()
+    for dl in graph.select(ntype=IRDataOperation):
+        for out in dl.oobjs():
+            dataloader_output_tids.add(out.tid)
+    if not dataloader_output_tids:
+        return
+
+    def _get_node_stage(node) -> Optional[int]:
+        plan = op_plans.get(node)
+        if plan is None or plan.stage_id == -1:
+            return 0
+        return plan.stage_id
+
+    def _is_index_op(node) -> bool:
+        return isinstance(node, IRPyFunc) and node.signature in _SINKABLE_INDEX_SIGNATURES
+
+    def _is_sinkable(node) -> bool:
+        """A node is sinkable if it is a non-grad index/attr op whose tensor/object
+        inputs are all either dataloader outputs or outputs of other sinkable ops."""
+
+        assert not isinstance(node, IRDataOperation), "Internal Error: dataloader ops should be handled earlier"
+
+        if node.cid in node_sinkable_cache:
+            return node_sinkable_cache[node.cid]
+
+        if not _is_index_op(node):
+            node_sinkable_cache[node.cid] = False
+            return False
+
+        # index op output must not require grad (duplicating a grad producer
+        # would create multiple gradient sources for the same value)
+        if any(isinstance(oobj, IRSubTensor) and oobj.requires_grad for oobj in node.oobjs()):
+            node_sinkable_cache[node.cid] = False
+            return False
+
+        for inp in node.inputs():
+            if not isinstance(inp, IRObject):
+                continue
+            if inp.tid in dataloader_output_tids:
+                continue
+            prods = graph.producers(inp.parent)
+            assert len(prods) == 1, "Internal Error: call this before graph partitioning, each tensor/object should have a single producer"
+            if _is_sinkable(prods[0]):
+                continue
+
+            node_sinkable_cache[node.cid] = False
+            return False
+
+        node_sinkable_cache[node.cid] = True
+        return True
+
+    # cache of sinkable status for each node, keyed by node.cid
+    node_sinkable_cache: dict[int, bool] = {}
+    # stage_id -> first forward op in that stage (used as insertion anchor for copies)
+    stage_anchors: dict[int, IRFwOperation] = {}
+    sinkable_obj_memo: dict[tuple[IRObject, int], IRObject] = {}
+    for node in graph.select(ntype=IRFwOperation):
+        stage_id = _get_node_stage(node)
+        if stage_id not in stage_anchors:
+            stage_anchors[stage_id] = node
+
+        if _is_sinkable(node):  # also populate node_sinkable_cache
+            for out in node.oobjs():
+                sinkable_obj_memo[(out, stage_id)] = out
+
+    def _fresh_output(out):
+        if isinstance(out, IRSubTensor):
+            return out.parent.like().tosub()
+        if isinstance(out, IRObject):
+            return out.like()
+        return out  # static / constant output: reuse as-is
+
+    def _resolve(node: IRFwOperation, stage: int):
+        assert _is_sinkable(node), "Internal Error: only sinkable nodes can be resolved"
+
+        if _get_node_stage(node) == stage:
+            return
+
+        copy_node = node.replicate()
+        copy_node._id = IDGenerator().gen_cell_id()  # a distinct op, not a device replica
+        copy_node._device = ()
+        copy_node._mirror = None
+        copy_node.recompute = None
+        copy_node.comment = 'fn: clone dataloader index op in consumer stage'
+
+        # rewire inputs: recurse into sinkable inputs, keep dataloader/constant inputs
+        for inp in copy_node.iobjs():
+            resolved = inp
+            if isinstance(inp, (IRSubTensor, IRObject)) and inp.tid not in dataloader_output_tids:
+                if (inp, stage) not in sinkable_obj_memo:
+                    prods = graph.producers(inp.parent)
+                    assert len(prods) == 1, "Internal Error: call this before graph partitioning, each tensor/object should have a single producer"
+                    assert _is_sinkable(prods[0]), "Internal Error: only sinkable nodes can be resolved"
+
+                    _resolve(prods[0], stage)
+
+                resolved = sinkable_obj_memo[(inp, stage)]
+                copy_node.replace(inp, resolved)
+
+        # fresh output so the copy is a distinct value produced inside `stage`
+        for out in copy_node.oobjs():
+            new_out = _fresh_output(out)
+            copy_node.replace(out, new_out)
+            sinkable_obj_memo[(out, stage)] = new_out
+
+        graph.insert(copy_node, graph.index(stage_anchors[stage]))
+        op_plans[copy_node] = OpPlan(op=copy_node, stage_id=stage, partition=None)
+
+    # try to sink each sinkable node into its consumer stages, creating copies as needed
+    # Note that we iterate in reverse topological order
+    # so we have better chance to remove dead sinkable nodes after the sinking.
+    for node in reversed(graph.select(ntype=IRFwOperation)):
+        if not _is_sinkable(node):
+            continue
+        # group consumers by their (foreign) stage
+        foreign: dict[int, list[IRFwOperation]] = {}
+
+        node_stage = _get_node_stage(node)
+        found_consumer_in_current_stage = False
+        for oobj in node.oobjs():
+            for consumer in graph.consumers(oobj.parent):
+                cs = _get_node_stage(consumer)
+                if cs != node_stage:
+                    foreign.setdefault(cs, []).append(consumer)
+                else:
+                    found_consumer_in_current_stage = True
+
+        for stage, consumers in foreign.items():
+            # recursively resolve the node in the consumer stage, creating a copy if needed
+            _resolve(node, stage)
+
+            for consumer in consumers:
+                with graph.update(consumer):
+                    for iobj in consumer.iobjs():
+                        if isinstance(iobj, (IRSubTensor, IRObject)) and (iobj, stage) in sinkable_obj_memo:
+                            new_iobj = sinkable_obj_memo[(iobj, stage)]
+                            consumer.replace(iobj, new_iobj)
+
+        # dead sinkable nodes that are not needed in their own stage can be removed
+        if not found_consumer_in_current_stage:
+            graph.remove(node)
+            op_plans.pop(node, None)
 
 
 def fn(
@@ -636,7 +902,33 @@ def fn(
         return result
 
     op_plans = {r.op: r for r in result}
+
+    # fill in
+    # 1. missing op_plans for ops that don't have it set, with default values
+    # 2. missing stage_id for ops that don't have it set, following the previous op's stage_id
+    # 3. check stage_id continuity, raise error if not continuous
+    cur_stage_id = 0
+    for node in graph.select(ntype=IRFwOperation):
+        if node not in op_plans:
+            op_plans[node] = OpPlan(op=node) # default: no partition, stage -1, no recompute
+
+        plan = op_plans[node]
+        if plan.stage_id < 0:
+            plan.stage_id = cur_stage_id
+        else:
+            if plan.stage_id not in (cur_stage_id, cur_stage_id + 1):
+                raise ValueError(f"Pipeline stage ids must be continuous and increase by 1, but got {cur_stage_id} -> {plan.stage_id} for op {node}")
+            cur_stage_id = plan.stage_id
+
     ngpus: int = cfg.plan_ngpus
+    stages = set(r.stage_id for r in op_plans.values())
+    if stages != set(range(len(stages))):
+        raise ValueError(f"Pipeline stage ids must be continuous and start from 0, but got {stages}")
+
+    nstages: int = len(stages)
+    # not all schedulers support pp_size < nstages
+    pp_size = cfg.pas_config.get('pipeline_size', nstages)
+    tp_size = ngpus // pp_size
 
     recompute_groups: dict[int, list[IRFwOperation]] = {}
     recompute_last_id: int = -1
@@ -658,27 +950,33 @@ def fn(
     #            2. op is replicated
     #       int: the partitioned dim if the tensor is partitioned
     tensor_splits: dict[IRFullTensor, dict[int, set[int | Literal['rr', 'rn']]]] = {}
+    # key: IRFwOperation
+    # value:
+    #   key: input idx
+    #   value: partitioned dim if the op is partitioned,
+    #     'rn' or 'rr' if the op is replicated, see tensor_splits for their meanings.
+    op_partition_maps: dict[IRFwOperation, dict[int, int | Literal['rn', 'rr']]] = {}
     # store the last split info for each tensor to help handle auto partition
     # None: replicated
     # 'value': value partitioned
     # int: the partitioned dim
     output_tensor_last_split: dict[IRFullTensor, int | None | Literal['value']] = {}
 
+    # When pipeline parallelism is enabled, duplicate cheap dataloader-derived
+    # indexing ops (e.g. `data['loss']`) into their consumer stages so that a stage
+    # reads the indexed piece from its local dataloader instead of receiving it from
+    # an earlier stage via a cross-stage adapter. Must run before staging.
+    if nstages > 1:
+        _duplicate_dataloader_index_ops_per_stage(graph, op_plans)
+
     fw_nodes = dict.fromkeys(graph.select(ntype=IRFwOperation))
 
     for node in fw_nodes:
-        if node not in op_plans:
-            op_plans[node] = OpPlan(op=node)  # default: no partition, stage 0, no recompute
-
         node.hook_meta = op_plans[node].hook_meta
         node.pre_hook = op_plans[node].pre_hook
         node.post_hook = op_plans[node].post_hook
 
         op_plan = op_plans[node]
-
-        # set pipeline stage id if not set
-        if op_plan.stage_id == -1:
-            op_plan.stage_id = pp_cur_stage_id
 
         # currently we only support partition for IRDimops
         if not isinstance(op_plan.op, IRDimops):
@@ -714,7 +1012,9 @@ def fn(
             # and then check the rest partitions are satisfied or not
             op_first_partition = op_partitions[0]
             partitioned_nodes = op_plan.op.algorithm('dim')\
-                .instantiate(idx=op_first_partition.input, dim=op_first_partition.dim, num=ngpus)
+                .instantiate(idx=op_first_partition.input, dim=op_first_partition.dim, num=tp_size)
+            if not partitioned_nodes:
+                raise RuntimeError(f"Failed to partition the operator {op_plan.op} with {op_first_partition}/{tp_size}, please check the partition plan.")
             subnode = partitioned_nodes[0]  # first subnode carries all necessary partition info
             assert isinstance(subnode, IRDimops), "Internal Error: partitioned node should be IRDimops"
 
@@ -777,6 +1077,7 @@ def fn(
                     dim=op_partition_map[first_input_idx]
                 )
 
+        op_partition_maps[op_plan.op] = op_partition_map
         # update tensor_splits for input tensors
         for idx, input in enumerate(op_plan.op.inputs()):
             if not isinstance(input, IRSubTensor):
@@ -822,15 +1123,12 @@ def fn(
                 raise ValueError(f"OpPlan contains operator {op_plan.op} not in the graph or not a forward operator")
 
     pp_segs = [graph]
-    nstages = len(pp_stages)
+    assert nstages == len(pp_stages), "Internal Error: nstages should be equal to the number of pipeline stages"
     pp_enabled = nstages > 1
-    # not all schedulers support pp_size < nstages
-    pp_size = cfg.pas_config.get('pipeline_size', nstages)
     nmicros = cfg.pas_config.get('pipeline_nmicros', None)
     scheduler = cfg.pas_config.get('pipeline_scheduler', '1f1b')
     pp_multiref_replicated_params = \
         cfg.pas_config.get('pipeline_multiref_replicated_params', True)
-    tp_size = ngpus // pp_size
 
     if pp_enabled:
         if not cfg.use_end2end:
@@ -858,6 +1156,7 @@ def fn(
     # note that we have constrained that shared parameters cannot be partitioned in SPMDSolver, other input tensors
     # belonging to the same operator can be partitioned. For example, in some LLMs, the embedding matrix is shared
     # with the output layer. In this case, the batch dim / seq dim of the activation tensor can be partitioned.
+    new_tensor_splits = {}
     for ftensor, stage_info in tensor_splits.items():
         if not ftensor.is_param():
             continue
@@ -884,7 +1183,23 @@ def fn(
 
         if len(splits) > 1 or (pp_multiref_replicated_params and len(stage_info) > 1 and find_replicated):
             _logger.info(f'add multiref for shared param {ftensor}')
-            graph.multiref(ftensor, comment='shared param')
+            consumers = graph.consumers(ftensor)
+            multiref_node = graph.multiref(ftensor, comment='shared param')
+            min_stage_id = min(stage_info.keys())
+            # the first stage will have the multiref node
+            stage_info[min_stage_id] = set(['rn'])
+            # clear the stage info for the later stages
+            other_stage_ids = [s for s in stage_info.keys() if s != min_stage_id]
+            for stage_id in other_stage_ids:
+                stage_info.pop(stage_id)
+
+            # update tensor_splits for new multiref tensors
+            # we can't use `_move_tensor_splits` here
+            # because we can't distinguish each output of multiref tensor
+            assert len(multiref_node.outputs()) == len(consumers), "Internal Error: multiref outputs should match the number of consumers"
+            new_tensor_splits.update(_get_new_node_outputs_splits(multiref_node, graph, op_plans, op_partition_maps))
+
+    tensor_splits.update(new_tensor_splits)
 
     # set pipeline stages
     # Note we must stage graph before any transformation to the graph,
@@ -911,6 +1226,25 @@ def fn(
                 # these nodes are usually added for data transfer between stages in graph.staging
                 # TODO: is it possible to have TP here?
                 op_plans[node] = OpPlan(op=node, stage_id=stage_id, partition=None)
+                assert len(stage.consumers(node.input(0).parent)) == 1, "Internal Error: identity node input should only be consumed by identity node itself    ."
+                # only real tensors participate in tensor_splits bookkeeping;
+                # identity nodes added for non-tensor IRObject transfer have no splits.
+                if isinstance(node.input(0), IRSubTensor):
+                    assert isinstance(node.output(0), IRSubTensor)
+                    # 'rn' means `identity` is replicated
+                    tensor_splits[node.input(0).parent][stage_id] = set(['rn'])
+                    tensor_splits.update(
+                        _get_new_node_outputs_splits(node, stage, op_plans, op_partition_maps)
+                    )
+
+                    # If the tensor is a segment output,
+                    # we need to move the split info in the following stages.
+                    _move_tensor_splits(
+                        tensor_splits,
+                        old_ftensor=node.input(0).parent,
+                        new_ftensor=node.output(0).parent,
+                        stage_id=stage_id,
+                    )
 
     for stage_id, seg in enumerate(pp_segs):
         for sub_tensor in IR.get_objects(seg.outputs()):
@@ -918,9 +1252,24 @@ def fn(
                 continue
             if seg.consumers(sub_tensor.parent):
                 ident_op = _identity_segment_output(graph, sub_tensor, seg, pp_segs)
+                # always replicate the identity operator
+                # even when the original tensor is partitioned
+                # as it is the output of segment which needs a complete tensor.
                 op_plans[ident_op] = OpPlan(op=ident_op, stage_id=stage_id, partition=None)
-                # 'rn' means `ident_op` is replicated and grad doesn't need to be all-reduced
+                # 'rn' means `ident_op` is replicated
                 tensor_splits[sub_tensor.parent].setdefault(stage_id, set()).add('rn')
+                op_partition_maps[ident_op] = {}
+
+                # the tensor is a segment output,
+                # we have replaced the original output tensor with the identity output tensor
+                # in `_identity_segment_output`,
+                # but we still need to move the split info in the following stages.
+                _move_tensor_splits(
+                    tensor_splits,
+                    old_ftensor=ident_op.input(0).parent,
+                    new_ftensor=ident_op.output(0).parent,
+                    stage_id=stage_id,
+                )
 
     # add multiref to an activation tensor when the states of the tensor and its grad are different
     # among consumers and current segment's outputs
@@ -943,7 +1292,7 @@ def fn(
             split_list = list(splits)
             if len(split_list) > 1:
                 _logger.debug(f'add multiref for {ftensor} in stage {stage}')
-                stage.multiref(ftensor, comment='activation')
+                stage.multiref(ftensor, comment='fn activation')
 
     # stage-wise tensor parallelism
     curr_devices = list(range(ngpus))

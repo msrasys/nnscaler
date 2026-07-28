@@ -16,7 +16,7 @@ from nnscaler.utils import load_model
 from nnscaler.graph import IRGraph
 from nnscaler.ir.operator import IRFwOperation
 from nnscaler.flags import CompileFlag
-from nnscaler.runtime.adapter.reducer import Reducer
+from nnscaler.runtime.adapter.reducer import FlattenParamInfo, Reducer, ReducerParamInfo
 from nnscaler.runtime.device import DeviceGroup
 from ..launch_torchrun import torchrun
 from ..utils import catch_log, init_parameter, assert_parity, mock_reducer_env
@@ -141,6 +141,116 @@ def reducer_test():
 test_reducer_2gpu = partial(torchrun, 2, reducer_test)
 
 
+def test_flatten_param_info_dtype():
+    params = [
+        torch.nn.Parameter(torch.zeros(2, dtype=torch.float16)),
+        torch.nn.Parameter(torch.zeros(2, dtype=torch.float16)),
+    ]
+    flatten_info = FlattenParamInfo(
+        zero=0,
+        params_info={
+            params[0]: ReducerParamInfo(
+                shape=params[0].shape,
+                start=0,
+                end=2,
+                bucket_param_buffer_start=0,
+                bucket_param_buffer_end=2,
+            ),
+            params[1]: ReducerParamInfo(
+                shape=params[1].shape,
+                start=0,
+                end=2,
+                bucket_param_buffer_start=2,
+                bucket_param_buffer_end=4,
+            ),
+        },
+        opt_numel=4,
+        opt_num_chunks=1,
+        opt_chunk_index=0,
+    )
+
+    tensor = torch.tensor([1, 2], dtype=torch.float32)
+    with pytest.raises(ValueError, match="tensors length 1 does not match the expected length 2"):
+        flatten_info.flatten([tensor])
+
+    flattened = flatten_info.flatten([None, tensor])
+    assert flattened.device.type == 'cpu'
+    assert not flattened.is_pinned()
+    assert flattened.dtype == torch.float32
+    assert flattened.equal(torch.tensor([0, 0, 1, 2], dtype=torch.float32))
+
+    unflattened = flatten_info.unflatten(flattened, device='cpu')
+    assert all(output.device.type == 'cpu' and not output.is_pinned() for output in unflattened)
+    assert unflattened[0].equal(torch.zeros(2, dtype=torch.float32))
+    assert unflattened[1].equal(tensor)
+
+    flattened = flatten_info.flatten([None, tensor], dtype=torch.float64, device='cpu')
+    assert flattened.dtype == torch.float64
+    assert flattened.equal(torch.tensor([0, 0, 1, 2], dtype=torch.float64))
+
+    flattened = flatten_info.flatten([None, None], dtype=torch.float64, device='cpu')
+    assert flattened.dtype == torch.float64
+    assert flattened.equal(torch.zeros(4, dtype=torch.float64))
+
+    flattened = flatten_info.flatten([None, None], device='cpu')
+    assert flattened.dtype == torch.float16  # default to first param's dtype
+    assert flattened.equal(torch.zeros(4, dtype=torch.float16))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason='lack of gpu devices')
+def test_flatten_param_info_cuda_device_and_synchronization(monkeypatch):
+    param = torch.nn.Parameter(torch.zeros(2))
+    flatten_info = FlattenParamInfo(
+        zero=0,
+        params_info={
+            param: ReducerParamInfo(
+                shape=param.shape,
+                start=0,
+                end=2,
+                bucket_param_buffer_start=0,
+                bucket_param_buffer_end=2,
+            ),
+        },
+        opt_numel=2,
+        opt_num_chunks=1,
+        opt_chunk_index=0,
+    )
+
+    synchronize_calls = 0
+    cuda_synchronize = torch.cuda.synchronize
+
+    def record_synchronize():
+        nonlocal synchronize_calls
+        synchronize_calls += 1
+        cuda_synchronize()
+
+    monkeypatch.setattr(torch.cuda, 'synchronize', record_synchronize)
+
+    tensor = torch.tensor([1, 2], dtype=torch.float32)
+    cuda_flattened = flatten_info.flatten([tensor], device=0)
+
+    assert cuda_flattened.device == torch.device(0)
+    assert synchronize_calls == 0
+
+    cpu_flattened = flatten_info.flatten([cuda_flattened], device='cpu')
+
+    assert synchronize_calls == 1
+    assert cpu_flattened.is_pinned()
+    assert cpu_flattened.equal(tensor)
+
+    cuda_unflattened = flatten_info.unflatten(cuda_flattened, device=0)
+
+    assert synchronize_calls == 1
+    assert cuda_unflattened[0].device == torch.device(0)
+    assert cuda_unflattened[0].cpu().equal(tensor)
+
+    cpu_unflattened = flatten_info.unflatten(cuda_flattened, device='cpu')
+
+    assert synchronize_calls == 2
+    assert cpu_unflattened[0].is_pinned()
+    assert cpu_unflattened[0].equal(tensor)
+
+
 @mock_reducer_env(0, 2)
 def test_reducer_build():
     reducer = Reducer([0, 1], max_bucket_size_bytes=48)  # 24 bytes means 12 float32
@@ -163,6 +273,57 @@ def test_reducer_build():
     assert buckets[3]._aligned_numel == 12
     assert buckets[4].numel == 1
     assert buckets[4]._aligned_numel == 4
+
+
+@mock_reducer_env(0, 2)
+def test_reducer_wake_up_rebinds_buckets_to_correct_slices():
+    """Regression test for the reducer wake_up bug.
+
+    Each bucket owns its buffer slice via its own `_start` / `_stop`, and
+    `wake_up()` re-binds every bucket to `buffer[bucket._start:bucket._stop]`.
+    Because the slice is derived from the bucket's own offsets, the binding is
+    correct regardless of the order in which buckets are stored (they are kept in
+    reversed, tail-to-head backward order). This test builds several
+    differently-sized buckets and asserts each bucket points at the same buffer
+    slice before and after a sleep/wake_up cycle.
+    """
+    reducer = Reducer([0, 1], max_bucket_size_bytes=48)
+    reducer.add_param(torch.nn.Parameter(torch.randn(1, 2)))   # bucket 0
+    reducer.add_param(torch.nn.Parameter(torch.randn(1, 14)))  # bucket 1
+    reducer.add_param(torch.nn.Parameter(torch.randn(1, 5)))   # bucket 2
+    reducer.add_param(torch.nn.Parameter(torch.randn(1, 5)))   # bucket 3
+    reducer.add_param(torch.nn.Parameter(torch.randn(1, 1)))   # bucket 3
+    reducer.add_param(torch.nn.Parameter(torch.randn(1, 1)))   # bucket 4
+    reducer.build_buckets()
+    assert len(reducer.buckets) == 5
+
+    # each bucket must be bound to the slice described by starts/stops at its index
+    for bucket in reducer.buckets:
+        assert bucket._contiguous_params.storage_offset() == bucket._start
+        assert bucket._contiguous_params.numel() == bucket._stop - bucket._start
+        assert bucket._contiguous_grads.storage_offset() == bucket._start
+        assert bucket._contiguous_grads.numel() == bucket._stop - bucket._start
+
+    # record each bucket's buffer slice (by identity) before offloading
+    before = [
+        (bucket._contiguous_params.storage_offset(), bucket._contiguous_params.numel())
+        for bucket in reducer.buckets
+    ]
+
+    reducer.sleep()
+    reducer.wake_up()
+
+    # after wake_up, every bucket must be re-bound to exactly the same slice
+    after = [
+        (bucket._contiguous_params.storage_offset(), bucket._contiguous_params.numel())
+        for bucket in reducer.buckets
+    ]
+    assert before == after
+    for bucket in reducer.buckets:
+        assert bucket._contiguous_params.storage_offset() == bucket._start
+        assert bucket._contiguous_params.numel() == bucket._stop - bucket._start
+        assert bucket._contiguous_grads.storage_offset() == bucket._start
+        assert bucket._contiguous_grads.numel() == bucket._stop - bucket._start
 
 
 @mock_reducer_env(0, 2)
@@ -214,7 +375,7 @@ def test_reducer_build_zero_param_level_sharding_merges_single_param_tail():
 
     reducer.build_buckets()
 
-    buckets = list(reversed(reducer.buckets))
+    buckets = list(reducer.buckets)
     assert [len(bucket.params) for bucket in buckets] == [9]
 
 

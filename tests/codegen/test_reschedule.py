@@ -678,16 +678,29 @@ def test_async_comm_handler_drain():
             self.waited = True
 
     handler = AsyncCommHandler()
-    handler.clear()
+    # reset the singleton's state
+    handler._works.clear()
+    handler._callbacks.clear()
+    handler._send_holds.clear()
+
     t1, w1 = torch.zeros(2), _Work()
     t2, w2 = torch.zeros(2), _Work()
-    handler.submit(t1, [w1])                       # callback-less (recv)
+    ts, ws = torch.zeros(2), _Work()
+    handler.submit(t1, [w1])                        # callback-less (recv)
     handler.submit(t2, [w2], callback=lambda x: x)  # has callback (collective)
+    handler.hold_send(ts, ws)                       # held send
 
     handler.drain()
     assert w1.waited, 'callback-less work should be drained'
+    assert ws.waited, 'held send should be drained'
     assert not w2.waited, 'work with callback must be left for explicit wait'
-    handler.clear()
+    assert t1 not in handler._works, 'drained work should be removed'
+    assert len(handler._send_holds) == 0, 'held sends should be cleared'
+
+    # cleanup
+    handler._works.clear()
+    handler._callbacks.clear()
+    handler._send_holds.clear()
 
 
 

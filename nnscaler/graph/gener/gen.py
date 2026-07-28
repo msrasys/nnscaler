@@ -14,8 +14,8 @@ from nnscaler.graph.graph import IRGraph
 from nnscaler.graph.segment import IRSegment, CellPosition
 from nnscaler.graph.function.pyfunc import IRPyFunc
 
-from nnscaler.ir.cten import IRCell, IRObject
-from nnscaler.ir.tensor import IRFullTensor, IRSubTensor
+from nnscaler.ir.cten import IRCell, IRObject, IR
+from nnscaler.ir.tensor import IRFullTensor, IRSubTensor, ValueMap
 from nnscaler.ir.operator import IRFwOperation, IRDataOperation
 
 from nnscaler.ir.adapter import IRAdapter, IRWeightReducer
@@ -29,7 +29,7 @@ DeviceID = int
 _logger = logging.getLogger(__name__)
 
 
-def create_dummy(segment: IRSegment, inputs: bool = True, outputs: bool = True) -> List[IRFwOperation]:
+def create_dummy(segment: IRSegment, inputs: bool = True, outputs: bool = True):
     """
     Create dummy operators segment inputs and outputs.
 
@@ -199,6 +199,317 @@ class IRAdapterGener:
         return graph
 
     @staticmethod
+    def _get_gen_reducer_info(
+        sub_weights : Dict[IRFullTensor, List[IRSubTensor]],
+        sub_weight_consumers: Dict[IRSubTensor, List[IRFwOperation]],
+        sub_weight_devices: Dict[IRSubTensor, Tuple[int,...]],
+        reduce_replicated_params: bool
+    ):
+        """
+        Precondition:
+            1. Devices of all consumers have been expanded so that each consumer is on one device.
+            2. Devices of all weights have been expanded so that each weight is on one device.
+            3. All consumers of the same weight tensor should be either all partitioned or all replicated.
+
+        group devices for pipeline parallelism (PP)
+        - TP (partition/replicate): all consumers' outputs are sub-tensors of the same IRFullTensor parent(s),
+            because they are partitions/replicas of the same original operator.
+        - PP (different ops sharing weight): consumers produce outputs with different IRFullTensor parents,
+            because they are fundamentally different operators.
+
+        Understanding of Grad Value Partitioning (Per Stage In PP):
+        Note (i, n) is just a notion. In actual implementation, it is more complex.
+        But each of valmap is different,
+        and the combination of all valmaps will be the full tensor, e.g. (0, 1).
+
+        see `IRGraph.infer_grad` and `utils.flatten_grad` for more details.
+        1. Single Consumer: If a weight tensor is only consumed by one operator
+            a. Partitioned Consumer: the weight is partitioned by partitioned operators.
+                This is TP case, and the gradient is partitioned accordingly.
+                Each sub tensor will have valmap == (0, 1)
+            b. Replicated + No-Grad-Reduce Consumer:
+                Each Sub tensor will have valmap == (0, 1)
+            c. Replicated + Grad-Reduce Consumer:
+                Each Sub Tensor will have valmap == (i, n) where n is the number of replicas.
+        2. Multiple Consumers (take the case of 2 consumers as example):
+            If a weight tensor is consumed by multiple operators,
+            the gradient partitioning strategy is determined
+            by the combination of all consumers.
+            a. All Partitioned Consumers: the weight is partitioned by partitioned operators.
+               This is TP case, and the gradient is partitioned accordingly.
+               Each sub tensor will have valmap == (i, m) where m is the number of consumers.
+            b. All Replicated + No-Grad-Reduce Consumers:
+                Each Sub tensor will have valmap == (i, m) where m is the number of consumers.
+            c. All Replicated + Grad-Reduce Consumers:
+                Each Sub Tensor will have valmap == (i, n * m) where n is the number of replicas,
+            d. Mixed Consumers (e.g., one partitioned consumer and one replicated consumer):
+                This is not supported.
+                But it should not be a problem if `multiref` is correctly inserted in pas policy.
+
+        We can say single consumer case is a special case of multiple consumer case where m = 1. But we separate them for better understanding.
+
+        Reducer generation logic:
+
+        1. Non-PP Case:
+            a. All Partitioned Weights(TP): weight is partitioned, and each partition is consumed by one device.
+                Reducer: No reducer is needed (all consumers are partitioned on weight input)
+
+            b. All Replicated Weights: weight is replicated by replicated operators, and each replica is consumed by one device.
+                b.1 All No-Grad-Reduce: the gradient of all replicas are full (valmap == (i, m)).
+                    This happens when all consumers are replicated,
+                    or are partitioned on non-weight input and the weight is marked as no-grad-reduce by users (e.g., using '/' in annotation)
+
+                    Reducer:
+                        CompileFlag.reducer_replicated_params is False:
+                            No reducer is needed since the gradient is full,
+                        CompileFlag.reducer_replicated_params is True:
+                            Reducer is generated to average the full gradients across devices for better convergence.
+
+                b.2 All Grad-Reduce: the gradient of all replicas are value partitioned
+                    This happens when all consumers are partitioned on non-weight input
+                    and the weight is not marked as no-grad-reduce by users.
+
+                    Reducer: Reducer is generated to sum the partitioned gradients across devices.
+
+                b.3 Inconsistent Grad-Reduce: some replicas have full gradient and some replicas have partitioned gradient (valmap is inconsistent among replicas)
+                    ERROR: Not supported since it requires more fine-grained tensor granularity and reducer generation logic.
+
+        2. PP Case (shared weight across pipeline stages):
+            a. All Partitioned Weights: Which means all consumers use a un-overlapped partion of weights.
+                But the consumers are on different device groups (e.g., pipeline stages),
+                which is impossible in real life (each device group should have the full weights.)
+            b. All Replicated Weights: the weight is shared by operators on different device groups
+                b.1 ALL No-Grad-Reduce: the gradient of all replicas are full (valmap == (i, m)).
+                    This happens when all consumers are replicated,
+                    or are partitioned on non-weight input
+                    and the weight is marked as no-grad-reduce by users (e.g., using '/' in annotation)
+
+                    NOTE: Replicas in each device groups should the same,
+                    (ERROR if different)
+
+                    Reducer:
+                        CompileFlag.reducer_replicated_params is False:
+                            Reducer is generated across device groups
+                            for example, device group0 (0, 1) device group1(2, 3)
+                            Reducer will be generated for ranks (0, 2) and ranks (1, 3) respectively.
+
+                        CompileFlag.reducer_replicated_params is True:
+                            Reducer is generated to average the full gradients across devices for better convergence.
+                            for example, device group0 (0, 1) device group1(2, 3)
+                            Reducer will be generated for ranks (0, 1, 2, 3) with replicas = 2
+
+                b.2 ALL Grad-Reduce: the gradient of all replicas are value partitioned
+                    This happens when all consumers are partitioned on non-weight input
+                    and the weight is not marked as no-grad-reduce by users.
+
+                    Reducer: Reducer is generated to sum the partitioned gradients across device groups.
+                b.3 Inconsistent Grad-Reduce:
+                    ERROR: Not supported since it requires more fine-grained tensor granularity and reducer generation logic.
+            c. Inconsistent Partition/Replicated: In some device groups weights are partitioned
+                while in other device groups, weights are replicated.
+                ERROR: Not supported
+            d. Partitioned weights across device groups:
+                the full weight is split into several partitions and each partition is not overlapped with other partitions,
+
+                for example, device group0 (0, 1) device group1(2, 3), weights shape (4, 4)
+                device 0 and device 2 consume weight[:, :2],
+                device 1 and device 3 consume weight[:, 2:],
+
+                Reducer will be generated for ranks (0, 2) and ranks (1, 3) respectively.
+        """
+        # key: full weight tensor,
+        # value: a list of output object parent ids of the consumers
+        # so len(value) is the number of different consumers
+        ftensor_consumer_outputs: dict[IRFullTensor, set[frozenset[int]]] = {}
+        # key: device id, value: device ids in the same device group
+        dev_groups: dict[int, frozenset[int]] = {}
+        # key: device id, value: output object parent ids of the consumers
+        dev_tids_groups: dict[int, set[int]] = {}
+        for subw, consumers in sub_weight_consumers.items():
+            for consumer in consumers:
+                key = frozenset(obj.parent.tid for obj in IR.get_objects(consumer.outputs()))
+                if not key: # unlikely to happen
+                    continue
+                ftensor_consumer_outputs.setdefault(subw.parent, set()).add(key)
+                for k in key:
+                    assert len(consumer.device) == 1, f"Device should have been expanded here"
+                    dev_tids_groups.setdefault(consumer.device[0], set()).add(k)
+
+        # each device groups have the same output tensor parents
+        tids_devids_map: dict[frozenset[int], set[int]] = {}
+        for dev_id, tids in dev_tids_groups.items():
+            tids = frozenset(tids)
+            tids_devids_map.setdefault(tids, set()).add(dev_id)
+
+        for devids in tids_devids_map.values():
+            devids = frozenset(devids)
+            for devid in devids:
+                dev_groups[devid] = devids
+
+        def _is_pp_shared_weight(weight: IRFullTensor) -> bool:
+            sub_ws = sub_weights[weight]
+            # consumers are on different device groups
+            dgs = [dev_groups[sw.device[0]] for sw in sub_ws]
+            return not all(dgs[0] == dg for dg in dgs)
+
+        def _is_grad_replicated(sub_ws: List[IRSubTensor]) -> bool:
+            grads = [w.grad for w in sub_ws]
+            if not all(w.grad.indmap == grads[0].indmap for w in sub_ws): # partitioned
+                return False
+
+            device_grads = {}
+            for sub in sub_ws:
+                grad = sub.grad
+                dev = sub.device[0]
+                device_grads.setdefault(dev, []).append(grad)
+
+            return all(ValueMap.is_complete(
+                [grad.valmap for grad in grads]) for grads in device_grads.values()
+            )
+
+        reducer_info: List[Tuple[IRSubTensor, list[int], int]] = []
+        for weight in sub_weights:
+            if weight not in ftensor_consumer_outputs:
+                # means all consumers have no outputs.
+                # unlikely to happen
+                continue
+            sub_ws = sub_weights[weight]
+            deduped_sub_ws = set(sub_ws)
+            num_consumers = len(ftensor_consumer_outputs[weight])
+            deduped_grad_valmaps = set(sw.grad.valmap for sw in sub_ws)
+
+            weight_all_devices = set(sw.device[0] for sw in sub_ws)
+            if len(weight_all_devices) == 1:  # single device, no reducer is needed
+                continue
+
+            if not _is_pp_shared_weight(weight): # Non-PP case
+                if len(deduped_sub_ws) > 1: # all partitioned
+                    # for example, 4 gpus, 3 consumers (c0, c1, c2), weights shape (4, 4)
+                    # | rank | weight portions | gradient valmap |
+                    # |------|-----------------| -----------------|
+                    # | 0    | [0:1]           | c0(0/2) c1(2/4) c2(3/4) |
+                    # | 1    | [1:2]           | c0(0/2) c1(2/4) c2(3/4) |
+                    # | 2    | [2:3]           | c0(0/2) c1(2/4) c2(3/4) |
+                    # | 3    | [3:4]           | c0(0/2) c1(2/4) c2(3/4) |
+                    # all weights in different ranks are different (different portion of the full weight)
+                    # no reducer is needed
+                    assert len(deduped_grad_valmaps) == num_consumers
+                elif len(deduped_grad_valmaps) == num_consumers: # replicated + no-grad-reduce
+                    # all gradients are full (valmap == (i, num_consumers))
+                    # for example, 4 gpus, 3 consumers (c0, c1, c2), weights shape (4, 4)
+                    # | rank | weight portions | gradient valmap |
+                    # |------|-----------------| -----------------|
+                    # | 0    | [0:4]           | c0(0/2) c1(2/4) c2(3/4) |
+                    # | 1    | [0:4]           | c0(0/2) c1(2/4) c2(3/4) |
+                    # | 2    | [0:4]           | c0(0/2) c1(2/4) c2(3/4) |
+                    # | 3    | [0:4]           | c0(0/2) c1(2/4) c2(3/4) |
+                    assert len(deduped_sub_ws) == 1
+                    if reduce_replicated_params:
+                        # generate reducer across all replicas for better convergence
+                        for sw in deduped_sub_ws:
+                            devices = sub_weight_devices[sw]
+                            replicas = len(devices)
+                            reducer_info.append((sw, devices, replicas))
+                    else:
+                        # no reducer is needed since the gradient is full
+                        pass
+                else:  # replicated + grad-reduce
+                    assert len(deduped_sub_ws) == 1
+                    assert len(deduped_grad_valmaps) == len(sub_ws)
+                    # all gradients are partitioned
+                    # generate reducer to sum the partitioned gradients across device groups
+                    # for example, 4 gpus, 3 consumers (c0, c1, c2), weights shape (4, 4)
+                    # | rank | weight portions | gradient valmap |
+                    # |------|-----------------| -----------------|
+                    # | 0    | [0:4]           | c0(0/8) c1(8/16) c2(12/16) |
+                    # | 1    | [0:4]           | c0(1/8) c1(9/16) c2(13/16) |
+                    # | 2    | [0:4]           | c0(2/8) c1(10/16) c2(14/16) |
+                    # | 3    | [0:4]           | c0(3/8) c1(11/16) c2(15/16) |
+                    for sw in deduped_sub_ws:
+                        devices = sub_weight_devices[sw]
+                        reducer_info.append((sw, devices, 1))
+            elif len(deduped_sub_ws) > 1: # PP + all partitioned
+                # for example, device group0 (0, 1) device group1(2, 3), weights shape (4, 4)
+                # device 0 and device 2 consume weight[:, :2],
+                # device 1 and device 3 consume weight[:, 2:],
+                # Reducer will be generated for ranks (0, 2) and ranks (1, 3) respectively.
+                # for example, 6 gpus, device group 0(0, 1) device group 1(2, 3) device group 2(4, 5), weights shape (4, 4)
+                # 4 consumers (c0, c1, c2, c3), c0 in dg0, c1/c2 in dg1, c3 in dg2, weights shape (4, 4)
+                # |   rank   | weight portions | gradient valmap |
+                # |----------|-----------------| -----------------|
+                # | 0(dg0)   | [0:2]           | c0(0/1)|
+                # | 1(dg0)   | [2:4]           | c0(0/1)|
+                # | 2(dg1)   | [0:2]           | c1(0/2) c2(1/2) |
+                # | 3(dg1)   | [2:4]           | c1(0/2) c2(1/2) |
+                # | 4(dg2)   | [0:2]           | c3(0/1)|
+                # | 5(dg2)   | [2:4]           | c3(0/1)|
+                for sw in deduped_sub_ws:
+                    reducer_info.append((sw, sub_weight_devices[sw], 1))
+            elif _is_grad_replicated(sub_ws): # PP + all replicated + no-grad-reduce
+                assert len(deduped_sub_ws) == 1
+                # all device groups should have the same size (same number of replicas)
+                # for example, 6 gpus, device group 0(0, 1) device group 1(2, 3) device group 2(4, 5), weights shape (4, 4)
+                # 4 consumers (c0, c1, c2, c3), c0 in dg0, c1/c2 in dg1, c3 in dg2, weights shape (4, 4)
+                # |   rank   | weight portions | gradient valmap |
+                # |----------|-----------------| -----------------|
+                # | 0(dg0)   | [0:4]           | c0(0/1)|
+                # | 1(dg0)   | [0:4]           | c0(0/1)|
+                # | 2(dg1)   | [0:4]           | c1(0/2) c2(1/2) |
+                # | 3(dg1)   | [0:4]           | c1(0/2) c2(1/2) |
+                # | 4(dg2)   | [0:4]           | c3(0/1)|
+                # | 5(dg2)   | [0:4]           | c3(0/1)|
+                first_group_size = len(dev_groups[sub_ws[0].device[0]])
+                if any(
+                    len(dev_groups[sw.device[0]]) != first_group_size
+                    for sw in sub_ws
+                ):
+                    raise RuntimeError(
+                        f"Detected a weight shared across pipeline stages with inconsistent replicated status among its sub-tensors.\n"
+                        f"To achieve this, users need to call `graph.multiref(weight)` inside the policy.\n"
+                        f"FullTensor weight: {weight}\n"
+                    )
+                # always assume reduce_replicated_params=True
+                # generate reducer across all replicas for better convergence
+                # for example, device group0 (0, 1) device group1(2, 3)
+                # Reducer will be generated for ranks (0, 1, 2, 3) with replicas = 2
+                for sw in deduped_sub_ws:
+                    devices = sub_weight_devices[sw]
+                    replicas = first_group_size
+                    reducer_info.append((sw, devices, replicas))
+
+                # the following is when reduce_replicated_params=False,
+                # this implementation looks weird. Not bad to disable it.
+                # # generate reducer across device groups
+                # # for example, device group0 (0, 1) device group1(2, 3)
+                # # Reducer will be generated for ranks (0, 2) and ranks (1, 3) respectively.
+                # for sw in deduped_sub_ws:
+                #     devices = sub_weight_devices[sw]
+                #     grouped_devices = {}
+                #     for dev in devices:
+                #         grouped_devices.setdefault(dev % first_group_size, []).append(dev)
+                #     for group_devs in grouped_devices.values():
+                #         reducer_info.append((sw, sorted(group_devs), 1))
+            else: # PP + all replicated + grad_reduce
+                assert len(deduped_sub_ws) == 1
+                # all gradients are partitioned
+                # generate reducer to sum the partitioned gradients across devices
+                # for example, 6 gpus, device group 0(0, 1) device group 1(2, 3) device group 2(4, 5), weights shape (4, 4)
+                # 4 consumers (c0, c1, c2, c3), c0 in dg0, c1/c2 in dg1, c3 in dg2, weights shape (4, 4)
+                # |   rank   | weight portions | gradient valmap |
+                # |----------|-----------------| -----------------|
+                # | 0(dg0)   | [0:4]           | c0(0/2)|
+                # | 1(dg0)   | [0:4]           | c0(1/2)|
+                # | 2(dg1)   | [0:4]           | c1(0/4) c2(2/4) |
+                # | 3(dg1)   | [0:4]           | c1(1/4) c2(3/4) |
+                # | 4(dg2)   | [0:4]           | c3(0/2)|
+                # | 5(dg2)   | [0:4]           | c3(1/2)|
+                for sw in deduped_sub_ws:
+                    devices = sub_weight_devices[sw]
+                    reducer_info.append((sw, devices, 1))
+
+        return [(sw, devices, replicas) for sw, devices, replicas in reducer_info if len(devices) > 1]
+
+    @staticmethod
     def gen_weight(graph: IRGraph) -> IRGraph:
         """Generate cross-device weight reducers for gradient accumulation.
 
@@ -282,67 +593,44 @@ class IRAdapterGener:
                         f"Consumers:\n{nl.join([repr(w.cell) for w in sub_ws])}\n"
                     )
 
-        # only record sub-weight that is consumed by multiple devices
-        sub_weight_devices: Dict[IRSubTensor, Tuple[int,]] = dict()
+        # record sub-weight consumer devices (reducers are filtered later based on device count)
+        sub_weight_devices: Dict[IRSubTensor, Tuple[int,...]] = dict()
         # gather sub weights that are consumed by same device groups
         # For replicated weights, we still create reducers but with nreplicas
         # set to the number of devices so that the summed gradient is averaged.
         for sub_weight, consumers in sub_weight_consumers.items():
             devices = set(consumer.device[0] for consumer in consumers)
-            if len(devices) > 1:
-                devices = tuple(sorted(devices))
-                sub_weight_devices[sub_weight] = devices
+            devices = tuple(sorted(devices))
+            sub_weight_devices[sub_weight] = devices
 
-        # create reducer
-        # separate replicated and vp (grad is value partitioned) weights since they need different nreplicas
-        vp_reducers: Dict[Tuple[int,...], List[IRSubTensor]] = dict()
-        replicated_reducers: Dict[Tuple[int,...], List[IRSubTensor]] = dict()
-        for subw, devices in sub_weight_devices.items():
-            if subw in replicated:
-                replicated_reducers.setdefault(devices, []).append(subw)
-            else:
-                vp_reducers.setdefault(devices, []).append(subw)
-
-        for devices, subws in vp_reducers.items():
-            for reducer in IRWeightReducer.from_weights(subws, devices):
+        gen_reducer_info = IRAdapterGener._get_gen_reducer_info(
+            sub_weights=sub_weights,
+            sub_weight_consumers=sub_weight_consumers,
+            sub_weight_devices=sub_weight_devices,
+            reduce_replicated_params=CompileFlag.reducer_replicated_params,
+        )
+        # merge reducers with the same device group/number of grad replicas number/number of weight replicas
+        # to reduce the number of reducer nodes
+        # this is important for later work (continuous buffer/zero etc.)
+        # NOTE: we can't put weights with different number of weight replicas into the same reducer,
+        # this is a requirement for current gnorm calculation implementation.
+        # for most cases, size of device group is the same with number of weight replicas,
+        # but that depends on the implementation of `_get_gen_reducer_info`.
+        # In current implementation, we have disabled that case
+        # `PP + all replicated + no-grad-reduce + reduce_replicated_params=False`
+        subweights_map: Dict[Tuple[Tuple[int,...], int, int], List[IRSubTensor]] = {}
+        for sub_weight, devices, replicas in gen_reducer_info:
+            subweights_map.setdefault(
+                (tuple(devices), replicas, len(sub_weight_devices[sub_weight])), []
+            ).append(sub_weight)
+        for (devices, replicas, _), sub_ws in subweights_map.items():
+            for reducer in IRWeightReducer.from_weights(sub_ws, devices, nreplicas=replicas):
                 graph.insert(reducer, graph.nnodes)
-
-        if CompileFlag.reducer_replicated_params:
-            for devices, subws in replicated_reducers.items():
-                for reducer in IRWeightReducer.from_weights(subws, devices, nreplicas=len(devices)):
-                    graph.insert(reducer, graph.nnodes)
 
         return graph
 
     @staticmethod
-    def gen_activation(graph: IRSegment, allow_recompute: bool = True, cost_fn: Optional[Callable] = None) -> IRSegment:
-        """!
-        Generate adapter for activation tensors.
-        The forward/backward adapter is inserted before the first consumers of its full tensor.
-
-        Args:
-            graph (IRGraph): the graph the requires for adapter.
-            allow_recompute (bool): Allow adapter recomputes. If this enables, all adapters will be
-                set to the same recompute group with its consumed node.
-            cost_fn (Callable | None): takes an IRAdapterPrim and outputs a cost in float.
-                default to be None, which will use communication volume.
-
-        Returns:
-            graph (IRGraph): the (inplace) modified graph with activation adapters.
-        """
-        def skip(ptensors: List[IRSubTensor], ctensors: List[IRSubTensor]) -> bool:
-            # e.g., loss or parameter/buffer
-            if len(ptensors) == 0 or len(ctensors) == 0:
-                return True
-            # direct connection
-            for ctensor in ctensors:
-                if not any(t == ctensor and set(ctensor.device).issubset(set(t.device)) for t in ptensors):
-                    return False
-            return True
-
-        input_producer, output_consumer = create_dummy(graph, inputs=True, outputs=True)
-        bgraph: Optional[IRSegment] = graph.mirror
-
+    def _local_optimize(graph: IRSegment):
         # Here are two optimization passes that are applied before generating communication adapters:
         # - local producer fusion: If an operator is partitioned and there are multiple
         #   different sub-tensors on the same device, insert appropriate concat or accumulate
@@ -365,7 +653,6 @@ class IRAdapterGener:
         # plan of the input graph is SPMD, the local consumer multiref pass will ensure the number of
         # fptensors and bptensors is the same, which raise the possibility of generating high performance
         # collectives, like allgather, allreduce, etc.
-        ftensors = []
         _cnt = 0
         for ftensor in graph.full_tensors():
             # backward adapter will be generated along with the forward adapter
@@ -375,21 +662,91 @@ class IRAdapterGener:
             utils.flatten_grad(graph, ftensor)
             ftensor = IRAdapterGener.local_producer_fusion(graph, ftensor)
             IRAdapterGener.local_consumer_multiref(graph, ftensor)
-            ftensors.append(ftensor)
             _cnt = _cnt + 1
             if _cnt % 100 == 0:
                 _logger.info(f'processed local fusion & multiref for {_cnt} tensors')
-        _logger.info(f'finish local fusion & multiref for {_cnt} tensors')
 
+        _logger.info(f'finish local fusion & multiref for {_cnt} tensors')
         # reorder again since inserted multiref could be mis-ordered
         graph._reorder_producer_consumer()
         _logger.info("finish reordering producer and consumer")
+
+    @staticmethod
+    def gen_activation(graph: IRGraph, allow_recompute: bool = True, cost_fn: Optional[Callable] = None) -> IRGraph:
+        """
+        Generate adapter for activation tensors.
+        The forward/backward adapter is inserted before the first consumers of its full tensor.
+
+        Narrowed segment input/output and communication generation:
+            Before generating adapters we call `graph.build_expander()`, which builds the
+            per-device input/output of every segment. A segment that runs on multiple devices
+            may keep only a slice ("narrowed") of its input/output on each device, instead of
+            the full segment tensor. This affects communication generation in two ways:
+
+            - At graph level, the producer/consumer of a segment IO is the segment itself,
+              which only owns a per-device slice. `adjust_producer_for_per_device_seg` /
+              `adjust_consumer_for_per_device_seg` rewire these to the actual per-device
+              sub-tensors so adapters connect the correct shards rather than the full tensor.
+            - At segment level, if a tensor is already partitioned on the segment boundary
+              (one partition per device), `is_partitioned_segment_io` returns True and adapter
+              generation is skipped for it, since the narrowing already places data correctly
+              on each device. Communication is then only generated for the remaining tensors.
+
+        Args:
+            graph (IRGraph): the graph the requires for adapter.
+            allow_recompute (bool): Allow adapter recomputes. If this enables, all adapters will be
+                set to the same recompute group with its consumed node.
+            cost_fn (Callable | None): takes an IRAdapterPrim and outputs a cost in float.
+                default to be None, which will use communication volume.
+
+        Returns:
+            graph (IRGraph): the (inplace) modified graph with activation adapters.
+        """
+        segments = [seg for seg in graph.nodes() if isinstance(seg, IRSegment) and seg.isfw()]
+
+        # finalize the compute graph
+        IRAdapterGener._local_optimize(graph)
+        for segment in segments:
+            IRAdapterGener._local_optimize(segment)
+
+        # check the possibility of narrowing segment input/output, and build per-device segment input/output
+        graph.build_expander()
+
+        # replace the segment input/output with per-device narrowed input/output, if possible.
+        graph.expand()
+
+        IRAdapterGener._gen_activation(graph, allow_recompute=allow_recompute, cost_fn=cost_fn)
+        # generate adapter for each segment
+        for segment in segments:
+            IRAdapterGener._gen_activation(segment, allow_recompute=allow_recompute, cost_fn=cost_fn)
+
+        return graph
+
+    @staticmethod
+    def _gen_activation(graph: IRSegment, allow_recompute: bool = True, cost_fn: Optional[Callable] = None) -> IRSegment:
+        def skip(ptensors: List[IRSubTensor], ctensors: List[IRSubTensor]) -> bool:
+            # e.g., loss or parameter/buffer
+            if len(ptensors) == 0 or len(ctensors) == 0:
+                return True
+            # direct connection
+            for ctensor in ctensors:
+                if not any(t == ctensor and set(ctensor.device).issubset(set(t.device)) for t in ptensors):
+                    return False
+            return True
+
+        input_producer, output_consumer = create_dummy(graph, inputs=True, outputs=True)
+        bgraph: Optional[IRSegment] = graph.mirror
+        ftensors = [t for t in graph.full_tensors() if not t.is_param() and not t.is_grad()]
 
         # generate adapter for intra-segments
         # FIXME: assume producers and consumers can run in parallel
         _cnt = 0
         for ftensor in ftensors:
-
+            if graph.is_partitioned_segment_io(ftensor):
+                # if the tensor is already partitioned on segment input or output,
+                # which means in each device, only one unoverlapped partition is produced or consumed,
+                # then we can skip generating adapter for it
+                continue
             # debug
             # print(f'forward:\n{graph.debug_tensor_map_str(ftensor)}')
             # print(f'backward:\n{graph.mirror.debug_tensor_map_str(ftensor.grad)}')
@@ -398,11 +755,14 @@ class IRAdapterGener:
             fproducers, fptensors = graph.producers(ftensor), graph.ptensors(ftensor)
             if ftensor in input_producer:
                 fptensors = fptensors + tuple(fop.output(0) for fop in input_producer[ftensor])
+                fproducers = fproducers + tuple(input_producer[ftensor])
+            _, fptensors = graph.adjust_producer_for_per_device_seg(fproducers, fptensors)
             fptensors = expand_devices(fptensors, producer=True)
             assert all(len(ptensor.device) == 1 for ptensor in fptensors), "Not support for multi-device"
 
             # consumers can be operators and graph outputs
             fconsumers, fctensors = graph.consumers(ftensor), graph.ctensors(ftensor)
+            _, fctensors = graph.adjust_consumer_for_per_device_seg(fconsumers, fctensors)
             fctensors = expand_devices(fctensors, consumer=True)
             assert all(len(ctensor.device) == 1 for ctensor in fctensors), "Not support for multi-device"
 
@@ -410,10 +770,14 @@ class IRAdapterGener:
             bconsumers, bctensors = [], []
             if isinstance(ftensor.grad, IRFullTensor):
                 bproducers, bptensors = bgraph.producers(ftensor.grad), bgraph.ptensors(ftensor.grad)
+                _, bptensors = graph.adjust_producer_for_per_device_seg(bproducers, bptensors)
                 bptensors = expand_devices(bptensors, producer=True)
+
                 bconsumers, bctensors = bgraph.consumers(ftensor.grad), bgraph.ctensors(ftensor.grad)
                 if ftensor in input_producer:
                     bctensors = bctensors + tuple(fwop.output(0).grad for fwop in input_producer[ftensor])
+                    bconsumers = bconsumers + tuple(input_producer[ftensor])
+                _, bctensors = graph.adjust_consumer_for_per_device_seg(bconsumers, bctensors)
                 bctensors = expand_devices(bctensors, consumer=True)
                 assert all(len(ctensor.device) == 1 for ctensor in bctensors), "Not support for multi-device"
 
@@ -542,7 +906,7 @@ class IRAdapterGener:
             # to reuse the existing adapter generation algorithm for tensor objects.
             # The device attribute of the subtensor's dummy cell is used to
             # indicate the device of the non-tensor object
-            fake_ftensor = IRFullTensor((8,), name=f'{fobj.name}_fake_ftensor')
+            fake_ftensor = IRFullTensor((1,), name=f'{fobj.name}_fake_ftensor')
             def _get_fake_subtensor(device: Tuple[int,...]) -> IRSubTensor:
                 subtensor = fake_ftensor.tosub()
                 # create a dummy cell for device assignment.
@@ -628,11 +992,6 @@ class IRAdapterGener:
 
             _obj_cnt += 1
         _logger.info(f'finish generating adapters for {_obj_cnt} non-tensor objects')
-
-        # generate adapter for each segment
-        segments = [seg for seg in graph.nodes() if isinstance(seg, IRSegment) and seg.isfw()]
-        for segment in segments:
-            IRAdapterGener.gen_activation(segment, allow_recompute=allow_recompute, cost_fn=cost_fn)
 
         return graph
 

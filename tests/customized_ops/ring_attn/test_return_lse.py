@@ -6,6 +6,13 @@ import importlib
 import pytest
 import torch
 
+# Skip all tests if flash_attn_func is not available
+try:
+    from flash_attn import flash_attn_func
+except ImportError:
+    pytest.skip("flash_attn_func not available", allow_module_level=True)
+
+
 pytest.importorskip("flash_attn")
 
 from nnscaler.customized_ops.ring_attention.core.utils import call_flash_attn_cute_varlen_func
