@@ -93,14 +93,15 @@ class ScheduleCodeGen(FuncEmission):
             gencode += ['', '']
             gencode += infer_step_code
         else:
+            for micros, execplan in self.execplans.items():
+                train_step_code, infer_step_code = self._gen(execplan, device, f'_{micros}')
+                gencode += train_step_code
+                gencode += ['', '']
+                gencode += infer_step_code
+                gencode += ['', '']
+
             with FunctionBlock(func_name='_train_step', args=['*args']) as tfb, \
                  FunctionBlock(func_name='_infer_step', args=['*args']) as ifb:
-                for micros, execplan in self.execplans.items():
-                    train_step_code, infer_step_code = self._gen(execplan, device, f'_{micros}')
-                    tfb.insert_body(train_step_code)
-                    tfb.insert_body('')
-                    ifb.insert_body(infer_step_code)
-                    ifb.insert_body('')
                 mapping = ', '.join(f'{n}: _train_step_{n}' for n in list(self.execplans.keys()))
                 tfb.insert_body(f'_train_steps = {{{mapping}}}')
                 tfb.insert_body(f'return _train_steps[len(args[1])](*args)')
@@ -519,7 +520,7 @@ class ScheduleCodeGen(FuncEmission):
                 operation here so that the backward graph's tensors can be deallocated right after the
                 backward pass.
                 """
-                plan_outputs = IRCell.get_objects_from_complex(self.execplan.outputs())
+                plan_outputs = IRCell.get_objects_from_complex(execplan.outputs())
                 for tensor in output_tensors:
                     if not isinstance(tensor, IRTensor):
                         continue
