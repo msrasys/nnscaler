@@ -1,7 +1,7 @@
 #  Copyright (c) Microsoft Corporation.
 #  Licensed under the MIT License.
 
-from typing import List, Optional, Tuple, Union
+from typing import List, Optional, Tuple, Union, Dict
 import copy
 import inspect
 import logging
@@ -12,13 +12,14 @@ from nnscaler.ir.tensor import IRSubTensor
 from nnscaler.ir.adapter import IRWeightReducer, IRAdapter
 from nnscaler.graph.graph import IRSegment
 
-from nnscaler.execplan.execplan import ExecutionPlan, ExeReuseCell
+from nnscaler.execplan.execplan import ExecutionPlan, ExeReuseCell, ExecutionPlanType
 
 from nnscaler.codegen.emit import FuncEmission
 from nnscaler.codegen.syntax.symtable import SymbolTable
 from nnscaler.codegen.lifecycle import LifeCycle
 from nnscaler.codegen.syntax.blocks import FunctionBlock, Block
 from nnscaler.flags import CompileFlag
+from nnscaler.utils import first
 
 
 _logger = logging.getLogger(__name__)
@@ -37,7 +38,7 @@ class ScheduleCodeGen(FuncEmission):
 
     def __init__(
         self,
-        execplan: ExecutionPlan,
+        execplan: ExecutionPlanType,
         runtime_ndevs: Optional[int] = None,
         *,
         scale_ndevs: Optional[int] = None,
@@ -46,12 +47,18 @@ class ScheduleCodeGen(FuncEmission):
         Create a schedule code generator
 
         Args:
-            execplan (ExecutionPlan): execution plan
+            execplan (ExecutionPlanType): execution plan.
+                When multiple schedulers are enabled, a dict mapping the number of
+                micro-batches to its corresponding execution plan is given, and one
+                train/infer step function is generated for each of them.
             runtime_ndevs (Optional[int]): the number of devices in runtime
             scale_ndevs (Optional[int]): Deprecated. Use `runtime_ndevs` instead
         """
-        self.execplan = execplan
-        self.devices: Tuple[int] = tuple(sorted(execplan.graph.device))
+        self.execplans: Dict[int, ExecutionPlan] = execplan if isinstance(execplan, dict) else {0: execplan}
+        if len(self.execplans) == 0:
+            raise ValueError("Expected at least one execution plan")
+        self.graph = first(self.execplans.values()).graph
+        self.devices: Tuple[int] = tuple(sorted(self.graph.device))
         if self.devices != tuple(range(len(self.devices))):
             raise ValueError(f'device must be consecutive')
 
@@ -74,29 +81,68 @@ class ScheduleCodeGen(FuncEmission):
         # module member name
         self.symbols = SymbolTable()
 
-    def gen(self, device: int, outfile=None, attach=None) -> str:
+    def gen(self, device: int, outfile=None, attach=None):
         """
         Generate scheduling code on device
         """
         gencode = copy.copy(self.init_code)
+        gencode += ['', '']
+        if len(self.execplans) == 1:
+            train_step_code, infer_step_code = self._gen(self.execplans[0], device)
+            gencode += train_step_code
+            gencode += ['', '']
+            gencode += infer_step_code
+        else:
+            with FunctionBlock(func_name='_train_step', args=['*args']) as tfb, \
+                 FunctionBlock(func_name='_infer_step', args=['*args']) as ifb:
+                for micros, execplan in self.execplans.items():
+                    train_step_code, infer_step_code = self._gen(execplan, device, f'_{micros}')
+                    tfb.insert_body(train_step_code)
+                    tfb.insert_body('')
+                    ifb.insert_body(infer_step_code)
+                    ifb.insert_body('')
+                mapping = ', '.join(f'{n}: _train_step_{n}' for n in list(self.execplans.keys()))
+                tfb.insert_body(f'_train_steps = {{{mapping}}}')
+                tfb.insert_body(f'return _train_steps[len(args[1])](*args)')
+                mapping = ', '.join(f'{n}: _infer_step_{n}' for n in list(self.execplans.keys()))
+                ifb.insert_body(f'_infer_steps = {{{mapping}}}')
+                ifb.insert_body(f'return _infer_steps[len(args[1])](*args)')
+
+            gencode += tfb.code
+            gencode += ['', '']
+            gencode += ifb.code
+
+        gencode += ['']
+
+        code = '\n'.join(gencode)
+        # write to file
+        if outfile:
+            with open(outfile, 'a' if attach else 'w') as f:
+                f.write(code)
+        return code
+
+    def _gen(self, execplan: ExecutionPlan, device: int, fn_name_suffix="") -> Tuple[List[str], List[str]]:
+        """
+        Generate scheduling code on device
+        """
+        gencode = []
         device_map = device % len(self.devices)
-        device_nodes = self.execplan.seq(device_map)
+        device_nodes = execplan.seq(device_map)
         # We will manually set the `skip_reducer` flag and `skip_zero_grad`
         # when we use scheduler (i.e. pipeline parallelism)
         # Otherwise, the caller of `_train_step` will set these flags to support gradient accumulation
-        use_scheduler = self.execplan.graph.sched is not None
+        use_scheduler = execplan.graph.sched is not None
 
         assert all(not isinstance(n, IRFwOperation) for n in device_nodes), \
-            "Expected all forward operators have been grouped into IRSegment"
-        self._validate_events(device_nodes)
+                "Expected all forward operators have been grouped into IRSegment"
+        self._validate_events(execplan, device_nodes)
 
-        lifetime = LifeCycle(device_nodes, [], self.execplan.outputs())
+        lifetime = LifeCycle(device_nodes, [], execplan.outputs())
 
-        args = ['model'] + [self.tensor_name(t) for t in self.execplan.graph.inputs()]
+        args = ['model'] + [self.tensor_name(t) for t in execplan.graph.inputs()]
 
         last_stream = None
         buffered_codes = []
-
 
         def to_tensor_names(val) -> str:
             """
@@ -148,7 +194,7 @@ class ScheduleCodeGen(FuncEmission):
                 raise RuntimeError(f"Expected backward_weight call in backward segment when using FBW schedule")
             return codes[:idx_weight], codes[idx_weight:]
 
-        with FunctionBlock(func_name='_train_step',
+        with FunctionBlock(func_name='_train_step' + fn_name_suffix,
                            args=args) as fb:
             _append_code(fb, '_ = None')
 
@@ -156,9 +202,9 @@ class ScheduleCodeGen(FuncEmission):
                 _append_code(fb, 'nnscaler.flags.RuntimeFlag.skip_zero_grad = False')
             _append_code(
                 fb,
-                self._emit_stream_context(self.execplan.zero_grad_stream_context, ['model.zero_grad()']),
-                self.execplan.zero_grad_stream_context.stream
-                    if self.execplan.zero_grad_stream_context else None
+                self._emit_stream_context(execplan.zero_grad_stream_context, ['model.zero_grad()']),
+                execplan.zero_grad_stream_context.stream
+                    if execplan.zero_grad_stream_context else None
             )
 
             # body code
@@ -208,16 +254,16 @@ class ScheduleCodeGen(FuncEmission):
                 prev_backward_node = None
                 prev_backward_weight_codes = []
                 for line, node in enumerate(device_nodes):
-                    codes = self.emit_node(node)
+                    codes = self.emit_node(execplan, node)
 
                     if use_scheduler and _is_backward_segment(node) and CompileFlag.use_fbw:
                         if prev_backward_node is not None:
                             _append_skip_flag(prev_backward_node)
-                            _append_code(fb, prev_backward_weight_codes, self._get_node_stream(prev_backward_node))
+                            _append_code(fb, prev_backward_weight_codes, self._get_node_stream(execplan, prev_backward_node))
                         prev_backward_node = node
                         codes_input, codes_weight = _split_backward_codes(codes)
                         prev_backward_weight_codes = codes_weight
-                        _append_code(fb, codes_input, self._get_node_stream(node))
+                        _append_code(fb, codes_input, self._get_node_stream(execplan, node))
                     else:
                         if prev_backward_node is not None:
                             if _is_adapter(node) and _depends_totally_on(node, prev_backward_node):
@@ -229,17 +275,17 @@ class ScheduleCodeGen(FuncEmission):
                                 # the outputs of the previous backward/forward segments.
                                 # So all adapters should be emitted before the last backward_weight codes.
                                 _append_skip_flag(node) # should no-op for adapters.
-                                _append_code(fb, codes, self._get_node_stream(node))
+                                _append_code(fb, codes, self._get_node_stream(execplan, node))
                             else:
                                 _append_skip_flag(prev_backward_node)
-                                _append_code(fb, prev_backward_weight_codes, self._get_node_stream(prev_backward_node))
+                                _append_code(fb, prev_backward_weight_codes, self._get_node_stream(execplan, prev_backward_node))
                                 prev_backward_node = None
                                 prev_backward_weight_codes = []
                                 _append_skip_flag(node)
-                                _append_code(fb, codes, self._get_node_stream(node))
+                                _append_code(fb, codes, self._get_node_stream(execplan, node))
                         else:
                             _append_skip_flag(node)
-                            _append_code(fb, codes, self._get_node_stream(node))
+                            _append_code(fb, codes, self._get_node_stream(execplan, node))
 
                     # release
                     tensors = lifetime.release_tensors_after_line(line)
@@ -248,27 +294,28 @@ class ScheduleCodeGen(FuncEmission):
 
                 if prev_backward_node is not None:
                     _append_skip_flag(prev_backward_node)
-                    _append_code(fb, prev_backward_weight_codes, self._get_node_stream(prev_backward_node))
+                    _append_code(fb, prev_backward_weight_codes, self._get_node_stream(execplan, prev_backward_node))
 
             # return code
             if CompileFlag.async_comm:
                 _append_code(fb, 'nnscaler.runtime.executor.AsyncCommHandler().drain_sends()')
                 _append_code(fb, ssign.format(inputs=to_tensor_names(self.execplan.outputs())))
-            outputs = self.return_name_complex(self.execplan.outputs())
+            outputs = self.return_name_complex(execplan.outputs())
             code = f'return {outputs}'
             _append_code(fb, code, force_flush=True)
 
         gencode += fb.code
 
-        gencode += ['', '']
+        train_step_codes = gencode[:]
 
         last_stream = None
         buffered_codes.clear()
+        gencode.clear()
         # infer code
         if not any(not node.isfw() for node in device_nodes):
-            gencode += ['_infer_step = _train_step']
+            gencode += [f'_infer_step{fn_name_suffix} = _train_step{fn_name_suffix}']
         else:
-            with FunctionBlock(func_name='_infer_step', args=args) as fb:
+            with FunctionBlock(func_name='_infer_step' + fn_name_suffix, args=args) as fb:
                 _append_code(fb, '_ = None')
                 # body code
                 if len(device_nodes) == 0:
@@ -276,8 +323,8 @@ class ScheduleCodeGen(FuncEmission):
                 for line, node in enumerate(device_nodes):
                     if not node.isfw(): continue  # skip backward segments and adapters
                     # execute
-                    codes = self.emit_node(node, force_no_grad=True)
-                    _append_code(fb, codes, self._get_node_stream(node))
+                    codes = self.emit_node(execplan, node, force_no_grad=True)
+                    _append_code(fb, codes, self._get_node_stream(execplan, node))
                     # release
                     tensors = lifetime.release_tensors_after_line(line)
                     tensors = [t for t in tensors if isinstance(t, IRTensor) and not t.is_grad()]
@@ -287,20 +334,17 @@ class ScheduleCodeGen(FuncEmission):
                 if CompileFlag.async_comm:
                     _append_code(fb, 'nnscaler.runtime.executor.AsyncCommHandler().drain_sends()')
                     _append_code(fb, ssign.format(inputs=to_tensor_names(self.execplan.outputs())))
-                outputs = self.return_name_complex(self.execplan.outputs())
+                outputs = self.return_name_complex(execplan.outputs())
                 code = f'return {outputs}'
                 _append_code(fb, code, force_flush=True)
             gencode += fb.code
         gencode += ['']
 
-        code = '\n'.join(gencode)
-        # write to file
-        if outfile:
-            with open(outfile, 'a' if attach else 'w') as f:
-                f.write(code)
-        return code
+        infer_step_codes = gencode[:]
 
-    def _get_node_stream_context(self, node: IRCell):
+        return train_step_codes, infer_step_codes
+
+    def _get_node_stream_context(self, execplan: ExecutionPlan, node: IRCell):
         unwrap_node = node.cell if isinstance(node, ExeReuseCell) else node
         stream_context = node.get_op_context('stream_context')
 
@@ -308,12 +352,12 @@ class ScheduleCodeGen(FuncEmission):
             stream_context = node.cell.get_op_context('stream_context')
 
         if not stream_context and isinstance(unwrap_node, IRWeightReducer):
-            stream_context = self.execplan.weight_reducer_stream_context
+            stream_context = execplan.weight_reducer_stream_context
 
         return stream_context
 
-    def _get_node_stream(self, node: IRCell) -> Optional[str]:
-        stream_context = self._get_node_stream_context(node)
+    def _get_node_stream(self, execplan: ExecutionPlan, node: IRCell) -> Optional[str]:
+        stream_context = self._get_node_stream_context(execplan, node)
         if stream_context:
             return stream_context.stream
         else:
@@ -337,13 +381,13 @@ class ScheduleCodeGen(FuncEmission):
 
         return wait_stream_codes + wait_event_codes + codes + record_event_codes
 
-    def _validate_events(self, nodes):
+    def _validate_events(self, execplan: ExecutionPlan, nodes):
         """
         Validate that all events waited by nodes are recorded by some previous nodes in the graph
         """
         events = set()
         for node in nodes:
-            stream_context = self._get_node_stream_context(node)
+            stream_context = self._get_node_stream_context(execplan, node)
             if stream_context:
                 if stream_context.wait_events:
                     for wait_event in stream_context.wait_events:
@@ -385,7 +429,7 @@ class ScheduleCodeGen(FuncEmission):
         """
         return f'{self.tensor_name(tensor)} = {self.tensor_name(tensor)}.detach()'
 
-    def emit_node(self, node: IRCell, force_no_grad: bool = False) -> List[str]:
+    def emit_node(self, execplan: ExecutionPlan, node: IRCell, force_no_grad: bool = False) -> List[str]:
         """
         Emit node / subgraph code
         """
@@ -401,7 +445,7 @@ class ScheduleCodeGen(FuncEmission):
 
         unwrap_node = node.cell if isinstance(node, ExeReuseCell) else node
         name = self.node_name(unwrap_node)
-        stream_context = self._get_node_stream_context(node)
+        stream_context = self._get_node_stream_context(execplan, node)
 
         if isinstance(unwrap_node, IRSegment):
             # segment hooks

@@ -758,6 +758,7 @@ class IRGraph(IRSegment):
         Returns:
             None
         """
+        from nnscaler.graph.schedule import SchedulePlan
         if not isinstance(schedplan, SchedulePlan) and (
             not isinstance(schedplan, dict) or
             not all(isinstance(k, int) and isinstance(v, SchedulePlan) for k, v in schedplan.items())

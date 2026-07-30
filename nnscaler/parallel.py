@@ -67,8 +67,7 @@ from nnscaler.utils import (
     OptStateDict,
     copy_dynamic,
     broadcast_files,
-    broadcast_mixed_data,
-    gather_mixed_data,
+    first
 )
 
 logger = logging.getLogger(__name__)
@@ -909,11 +908,23 @@ def _gencode(
             raise RuntimeError(f"Node {node} device is not set")
     # anchor node removed in gener
     graph = IRAdapterGener.gen(graph, cost_fn=None)
+    # `graph.sched` can be a single `SchedulePlan` or a `Dict[int, SchedulePlan]`
+    # (one plan per number of micro-batches) when multiple schedulers are enabled.
     if graph.sched is not None:
-        graph.sched.apply()
+        for sched_plan in (
+            [graph.sched] if not isinstance(graph.sched, dict) else graph.sched.values()
+        ):
+            sched_plan.apply()
 
     if isinstance(graph.sched, SchedulePlan):
         execplan = ExecutionPlan.from_schedplan(graph.sched)
+    elif isinstance(graph.sched, dict):
+        # generate an independent execution plan for each schedule plan.
+        # `from_schedplan` does not mutate the shared graph, so this is safe.
+        execplan = {
+            nmicros: ExecutionPlan.from_schedplan(sched_plan)
+            for nmicros, sched_plan in graph.sched.items()
+        }
     else:
         execplan = ExecutionPlan.from_graph(graph)
 
@@ -922,9 +933,14 @@ def _gencode(
     if not graph.sched:
         execplan = Grouping.apply(execplan)
 
+    # for a dict of execution plans (multiple schedulers), the module (non-schedule)
+    # code is identical across plans because they share the same graph, so we use a
+    # representative execution plan to generate the module code.
+    repr_execplan = first(execplan.values()) if isinstance(execplan, dict) else execplan
+
     # code generation
-    assert len(execplan.graph.device) == compute_config.plan_ngpus, f"{execplan.graph.device}"
-    mgener = ModuleCodeGen(execplan, compute_config.runtime_ngpus)
+    assert len(repr_execplan.graph.device) == compute_config.plan_ngpus, f"{repr_execplan.graph.device}"
+    mgener = ModuleCodeGen(repr_execplan, compute_config.runtime_ngpus)
     sgener = None
     if compute_config.use_end2end:
         sgener = ScheduleCodeGen(execplan, compute_config.runtime_ngpus)
