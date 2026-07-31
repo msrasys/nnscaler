@@ -3,6 +3,7 @@
 
 import builtins
 import importlib
+import bisect
 from contextlib import contextmanager
 from functools import wraps, cache
 from typing import (
@@ -465,6 +466,187 @@ def first_or(data: Iterable[ItemT], fn: Optional[Callable[[ItemT], bool]] = None
         if fn is None or fn(item):
             return item
     return default
+
+
+def ceil_div(a: int, b: int) -> int:
+    return -(-a // b)
+
+
+class StepwiseConfig:
+    """A piecewise-constant integer configuration keyed by global step thresholds.
+
+    Wraps either a single ``int`` (constant for all steps) or a ``dict[int, int]``
+    whose keys are step thresholds.
+    """
+    @staticmethod
+    def value_at(config: Union[int, Dict[int, int]], step: int) -> int:
+        """
+        Active value at global ``step``.
+        if step <= min(config.keys()), will return config[min(config.keys())],
+        if step >= max(config.keys()), will return config[max(config.keys())].
+        """
+        if isinstance(config, int):
+            return config
+        if not config:
+            raise ValueError("Config dict must not be empty")
+        keys = sorted(config)
+        i = max(bisect.bisect_right(keys, step) - 1, 0)
+        return config[keys[i]]
+
+    @staticmethod
+    def sum_value(config: Union[int, Dict[int, int]], start_step: int, end_step: int) -> int:
+        """Sum of ``value_at(step)`` for ``step`` in ``[start_step, end_step)``."""
+        if isinstance(config, int):
+            return config * (end_step - start_step)
+        if not config:
+            raise ValueError("Config dict must not be empty")
+        keys = sorted(config)
+        remaining = end_step - start_step
+        step = start_step
+        total = 0
+        i = max(bisect.bisect_right(keys, step) - 1, 0)
+        while remaining > 0:
+            cur = config[keys[i]]
+            if i + 1 < len(keys):
+                # steps [step, keys[i + 1]) all use `cur`
+                seg_steps = min(keys[i + 1] - step, remaining)
+                total += seg_steps * cur
+                remaining -= seg_steps
+                step += seg_steps
+                i += 1
+            else:
+                # last segment: `cur` holds for all remaining steps
+                total += remaining * cur
+                remaining = 0
+        return total
+
+    @staticmethod
+    def steps_to_consume(config: Union[int, Dict[int, int]], num_items: int, start_step: int = 0) -> int:
+        """Number of steps to consume ``num_items`` items starting at ``start_step``,
+        where each step consumes ``value_at(step)`` items.
+        """
+        if isinstance(config, int):
+            return ceil_div(num_items, config)
+
+        if not config:
+            raise ValueError("Config dict must not be empty")
+
+        keys = sorted(config)
+        remaining = num_items
+        step = start_step
+        nsteps = 0
+        i = max(bisect.bisect_right(keys, step) - 1, 0)
+        while remaining > 0:
+            cur = config[keys[i]]
+            if i + 1 < len(keys):
+                # steps [step, keys[i + 1]) all use `cur`
+                seg_steps = keys[i + 1] - step
+                seg_capacity = seg_steps * cur
+                if remaining <= seg_capacity:
+                    nsteps += ceil_div(remaining, cur)
+                    remaining = 0
+                else:
+                    remaining -= seg_capacity
+                    nsteps += seg_steps
+                    step = keys[i + 1]
+                    i += 1
+            else:
+                # last segment: `cur` holds for all remaining steps
+                nsteps += ceil_div(remaining, cur)
+                remaining = 0
+        return nsteps
+
+    @staticmethod
+    def step_and_offset(config: Union[int, Dict[int, int]], num_items: int, start_step: int = 0) -> Tuple[int, int]:
+        """Locate the position of item index ``num_items`` when consuming items
+        starting at ``start_step``, where each step ``s`` holds ``value_at(s)`` items.
+
+        Returns ``(step, offset)`` such that
+        ``num_items == sum(value_at(k) for k in [start_step, step)) + offset``
+        with ``0 <= offset < value_at(step)``. Equivalently, after consuming
+        ``num_items`` items, ``step`` is the step currently being filled and
+        ``offset`` is how many of its items are already consumed.
+        """
+        if num_items < 0:
+            raise ValueError("num_items must be non-negative")
+
+        if isinstance(config, int):
+            return start_step + num_items // config, num_items % config
+
+        if not config:
+            raise ValueError("Config dict must not be empty")
+
+        keys = sorted(config)
+        remaining = num_items
+        step = start_step
+        i = max(bisect.bisect_right(keys, step) - 1, 0)
+        while True:
+            cur = config[keys[i]]
+            if i + 1 < len(keys):
+                # steps [step, keys[i + 1]) all use `cur`
+                seg_steps = keys[i + 1] - step
+                seg_capacity = seg_steps * cur
+                if remaining < seg_capacity:
+                    return step + remaining // cur, remaining % cur
+                remaining -= seg_capacity
+                step = keys[i + 1]
+                i += 1
+            else:
+                # last segment: `cur` holds for all remaining steps
+                return step + remaining // cur, remaining % cur
+
+    @staticmethod
+    def steps_per_period(
+        config: Union[int, Dict[int, int]],
+        items_per_period: int,
+        max_periods: Optional[int] = None,
+        max_total_steps: Optional[int] = None,
+    ) -> Dict[int, int]:
+        """Number of steps in each period when every period consumes
+        ``items_per_period`` items and each global step ``s`` consumes
+        ``value_at(s)`` items.
+
+        Steps are counted globally across periods, so the per-period step count
+        can change as later periods start at higher global steps (where
+        ``value_at`` may differ). The result is a piecewise dict keyed by period
+        index -> number of steps in that period; only periods whose count
+        differs from the previous one are stored, so it can be read back with
+        :meth:`value_at`.
+
+        ``max_periods`` / ``max_total_steps`` stop the enumeration early once the
+        given number of periods / cumulative steps is reached (to avoid computing
+        beyond a run's limits); they never change the values that are emitted.
+        """
+        if isinstance(config, int):
+            return {0: ceil_div(items_per_period, config)}
+
+        if not config:
+            raise ValueError("Config dict must not be empty")
+
+        max_variant_step = max(config)
+        result: Dict[int, int] = {}
+        accum_steps = 0
+        period = 0
+        prev_steps = None
+        while True:
+            steps_this_period = StepwiseConfig.steps_to_consume(config, items_per_period, accum_steps)
+            if steps_this_period != prev_steps:
+                result[period] = steps_this_period
+                prev_steps = steps_this_period
+
+            # once a period starts past the last threshold, every later period is
+            # identical, so the compressed dict already captures all of them
+            if accum_steps >= max_variant_step:
+                break
+            if max_periods and period + 1 >= max_periods:
+                break
+            if max_total_steps and accum_steps + steps_this_period >= max_total_steps:
+                break
+
+            accum_steps += steps_this_period
+            period += 1
+
+        return result
 
 
 # ref: https://stackoverflow.com/questions/128573/using-property-on-classmethods

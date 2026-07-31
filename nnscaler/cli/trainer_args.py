@@ -20,7 +20,7 @@ import yaml
 import torch
 
 import nnscaler
-from nnscaler.utils import enforce_zero_num_worker, fields, transform_recursively, load_type, copy_dynamic
+from nnscaler.utils import enforce_zero_num_worker, fields, transform_recursively, load_type, copy_dynamic, StepwiseConfig
 from nnscaler.parallel import ComputeConfig, build_optimizer, ReuseType, BroadcastGenFilesStrategy, _PREDEFINED_POLICIES
 from nnscaler.runtime.utils import set_grad_dtype
 
@@ -1211,10 +1211,22 @@ class TrainerArgs(PrecisionMixin, PolicyMixin):
 
     @property
     def update_freq(self):
-        if isinstance(self.grad_accumulation_steps, dict):
-            return {k: v // self.scaling_factor for k, v in self.grad_accumulation_steps.items()}
+        if isinstance(self.global_batch_size, dict):
+            return {
+                k: v // self.micro_batch_size  // self.scaling_factor
+                for k, v in self.global_batch_size.items()
+            }
         else:
             return self.global_batch_size // self.micro_batch_size // self.scaling_factor
+
+    def update_freq_at(self, global_step: int) -> int:
+        """Return the number of microbatches (update_freq) active at ``global_step``.
+
+        When ``update_freq`` is a dict, its keys are global train-step thresholds:
+        the value of the largest key ``<= global_step`` is used, and the smallest
+        key's value applies before the first threshold.
+        """
+        return StepwiseConfig.value_at(self.update_freq, global_step)
 
     @property
     def enable_log_progress(self):

@@ -283,7 +283,16 @@ class ComputeConfig:
             if not callable(pipeline_scheduler):
                 raise ValueError(f"pipeline_scheduler {pipeline_scheduler} is not str nor callable.")
             sched = pipeline_scheduler
-        return sched(graph, pipeline_nmicros, pipeline_nstages)
+
+        if isinstance(pipeline_nmicros, int):
+            graph.bind_schedule(sched(graph, pipeline_nmicros, pipeline_nstages))
+        else:
+            scheds = {}
+            for num_micro in pipeline_nmicros:
+                scheds[num_micro] = sched(graph, pipeline_nmicros, pipeline_nstages)
+            graph.bind_schedule(scheds)
+
+        return graph.sched
 
     @property
     def gpu_config(self) -> Dict[str, int]:
