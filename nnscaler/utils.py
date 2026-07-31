@@ -617,6 +617,9 @@ class StepwiseConfig:
         given number of periods / cumulative steps is reached (to avoid computing
         beyond a run's limits); they never change the values that are emitted.
         """
+        if items_per_period <= 0:
+            raise ValueError("items_per_period must be positive")
+
         if isinstance(config, int):
             return {0: ceil_div(items_per_period, config)}
 

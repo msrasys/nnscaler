@@ -1083,7 +1083,7 @@ class Trainer:
         if self.rank == 0:
             data_iter = tqdm(
                 data_iter,
-                total=self.total_train_steps_per_epoch,
+                total=self._steps_in_epoch(epoch),
                 initial=resume_from_idx,
                 desc=epoch_desc,
                 disable=not self.train_args.enable_progress_bar,

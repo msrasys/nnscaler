@@ -490,6 +490,14 @@ def test_stepwise_steps_per_period_empty_dict_raises():
         StepwiseConfig.steps_per_period({}, 10)
 
 
+def test_stepwise_steps_per_period_zero_items():
+    # an empty period cannot advance and is rejected
+    with pytest.raises(ValueError):
+        StepwiseConfig.steps_per_period(3, 0)
+    with pytest.raises(ValueError):
+        StepwiseConfig.steps_per_period({0: 2, 5: 4}, 0)
+
+
 @pytest.mark.parametrize("config", _SCHEDULES)
 @pytest.mark.parametrize("items", [1, 2, 3, 5, 7, 10, 13])
 def test_stepwise_steps_per_period_matches_reference(config, items):
