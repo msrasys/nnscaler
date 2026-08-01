@@ -2,10 +2,12 @@
 #  Licensed under the MIT License.
 
 from nnscaler.autodist.cube_operator import CubeOperator
+from nnscaler.autodist.descs import NodePartitionDesc
+from nnscaler.autodist.util import instantiate_partition_desc
 from nnscaler.graph.function.dimops import DimAnno, IRDimops
 
 import itertools
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 
 def calc_factors(val: int, num: int) -> List[Tuple[int, ...]]:
@@ -103,36 +105,52 @@ class OpPartition:
     """
 
     def __init__(self, partition_dims: Tuple[str, ...],
-                 partition_nums: Tuple[int, ...], operator: CubeOperator):
+                 partition_nums: Tuple[int, ...], operator: CubeOperator,
+                 partition_positions: Optional[Tuple[Tuple[int, int], ...]] = None):
         self.operator = operator
-        self.partition_dims = partition_dims
-        self.partition_nums = partition_nums
+        self.partition_dims = tuple(partition_dims)
+        self.partition_nums = tuple(partition_nums)
         self.is_partial_val = False
 
         if len(partition_dims) != len(partition_nums):
             raise ValueError(
                 'partition_dims and partition_nums should have the same length')
-        if len(partition_dims) != 1:
-            raise ValueError('only support split along one dimension for now')
+        if not partition_dims:
+            raise ValueError('partition plan must contain at least one step')
+        if any(num < 1 for num in partition_nums):
+            raise ValueError(
+                f'partition numbers must be positive, got {partition_nums}'
+            )
+
+        if partition_positions is None:
+            partition_positions = tuple(
+                (-1, -1) if dim == -1 else operator.dim_id2pos(dim)
+                for dim in partition_dims
+            )
+        else:
+            partition_positions = tuple(tuple(pos) for pos in partition_positions)
+        if len(partition_positions) != len(partition_dims):
+            raise ValueError(
+                'partition_positions and partition_dims should have the same length'
+            )
+        for dim_id, pos in zip(partition_dims, partition_positions):
+            if dim_id == -1:
+                if pos != (-1, -1):
+                    raise ValueError(
+                        f'replication must use position (-1, -1), got {pos}'
+                    )
+            elif pos[0] < 0 or pos[1] < 0:
+                raise ValueError(f'invalid partition position {pos}')
+        self.partition_positions = partition_positions
 
         if isinstance(self.operator.ir_cell, IRDimops):
-            if partition_dims[0] != -1:
-                idx, dim = operator.dim_id2pos(partition_dims[0])
-                if not operator.ir_cell.algorithm('dim').satisfy(
-                        idx, dim, partition_nums[0]):
-                    raise ValueError(
-                        f'invalid partition plan {partition_dims}, {partition_nums} for {operator.op_name}'
-                    )
-                # Store the first node among partition results of the full cube node.
-                # Other nodes are not stored because
-                # 1. they share the same shape with the first node.
-                # 2. we can calculate th intra-communication cost without knowing the device assignment now,
-                #    since operator is constrained to be partitioned along one dimension.
-                # It is used to query the computation cost in the cost database.
-                self.ir_cell = operator.ir_cell.algorithm('dim').instantiate(
-                    idx, dim, partition_nums[0])[0]
-            else:
-                self.ir_cell = operator.ir_cell
+            # Store one final local operator. All children at each ordered step
+            # have identical shapes, while keyword modifiers are applied at the
+            # same time as in graph partitioning.
+            self.ir_cell = instantiate_partition_desc(
+                operator.ir_cell,
+                self.to_node_partition_desc(),
+            )
 
             for dim, num in zip(partition_dims, partition_nums):
                 if dim == -1:
@@ -142,12 +160,21 @@ class OpPartition:
                     self.is_partial_val = True
                     break
         else:
-            if partition_dims[0] != -1:
+            if any(dim != -1 for dim in partition_dims):
                 raise ValueError('only support replicated for non-dimops')
             self.ir_cell = operator.ir_cell
 
     def is_replicated(self):
-        return len(self.partition_dims) == 1 and self.partition_dims[0] == -1
+        return all(dim == -1 for dim in self.partition_dims)
+
+    def to_node_partition_desc(self) -> NodePartitionDesc:
+        return NodePartitionDesc(list(zip(
+            self.partition_positions,
+            self.partition_nums,
+        )))
 
     def __repr__(self):
-        return f'OpPartition({self.partition_dims}, {self.partition_nums})'
+        return (
+            f'OpPartition({self.partition_dims}, {self.partition_nums}, '
+            f'positions={self.partition_positions})'
+        )

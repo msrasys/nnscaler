@@ -58,6 +58,40 @@ def replica(graph: IRGraph, node: IRFwOperation, devs: List[int]):
     return sub_nodes
 
 
+def instantiate_partition_desc(
+    node: IRFwOperation,
+    desc: NodePartitionDesc,
+) -> IRFwOperation:
+    """Instantiate the representative local operator of an ordered plan.
+
+    This mirrors :func:`partition_node` without mutating a graph. The first
+    child is sufficient for profiling and tensor-layout inspection because all
+    children produced by one partition step have the same shapes.
+    """
+    local_node = node
+    for (idx, dim), num in desc.desc:
+        if num < 1:
+            raise ValueError(f'partition number must be positive, got {num}')
+        if (idx, dim) == (-1, -1):
+            local_node = local_node.replicate()
+            continue
+        if idx < 0 or dim < 0:
+            raise ValueError(
+                'partition input and dim must both be -1 for replication, '
+                f'or both be non-negative, got {(idx, dim)}'
+            )
+        sub_nodes = local_node.algorithm('dim').instantiate(
+            idx=idx, dim=dim, num=num
+        )
+        if not sub_nodes:
+            raise ValueError(
+                f'node {local_node} cannot be partitioned by '
+                f'input={idx}, dim={dim}, num={num}'
+            )
+        local_node = sub_nodes[0]
+    return local_node
+
+
 def partition_node(node: IRFwOperation, graph: IRGraph, devs: List[int],
                    desc: NodePartitionDesc) -> None:
     min_dev_index = min(devs)

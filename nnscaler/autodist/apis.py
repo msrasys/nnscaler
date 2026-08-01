@@ -7,7 +7,7 @@ import logging
 import re
 from collections import defaultdict
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Tuple
 
 from nnscaler.graph import IRGraph
 from nnscaler.graph.function import IRDimops
@@ -24,7 +24,7 @@ from .descs import *
 from .model_graph import ModelGraph, estimate_mem_lower_bound
 from .pipeline_solver import calc_optimal_pp_plan
 from .spmd_solver import analysis_pretty_printer, calc_optimal_spmd_plan
-from .util import partition_node, replica
+from .util import instantiate_partition_desc, partition_node, replica
 
 _logger = logging.getLogger(__name__)
 
@@ -129,6 +129,57 @@ def _write_plan_json(plan_json, f):
     f.write(text)
 
 
+def _validate_fixed_partition_plan(
+    graph: IRGraph,
+    pp_desc: PipelineParallelDesc,
+    fixed_descs: Tuple[FixedPartitionDesc, ...],
+) -> None:
+    """Ensure a generated or loaded plan honors every matching fixed rule."""
+    planned_descs = {
+        cid: node_desc
+        for stage_desc in pp_desc.spmd_descs
+        for cid, node_desc in stage_desc.partition_descs.items()
+    }
+    unmatched = set(fixed_descs)
+    for node in graph.select(ntype=IRFwOperation):
+        module_types = tuple(
+            module_type.__name__
+            for module_type in (node.module_stack or {}).values()
+        )
+        selected, matched = select_fixed_partition_desc(
+            node.signature,
+            module_types,
+            fixed_descs,
+        )
+        unmatched.difference_update(matched)
+        if selected is None:
+            continue
+        if node.cid not in planned_descs:
+            raise ValueError(
+                f'fixed partition target {node.signature!r} (cid={node.cid}) '
+                'is missing from the partition plan'
+            )
+        actual_desc = tuple(
+            (tuple(pos), num)
+            for pos, num in planned_descs[node.cid].desc
+        )
+        if actual_desc != selected.desc:
+            raise ValueError(
+                f'partition plan for {node.signature!r} (cid={node.cid}) '
+                f'does not match fixed description: expected '
+                f'{selected.desc}, got {actual_desc}'
+            )
+    if unmatched:
+        unmatched_keys = sorted(
+            (fixed_desc.name, fixed_desc.parent_module)
+            for fixed_desc in unmatched
+        )
+        raise ValueError(
+            'fixed partition descriptions did not match any operator: '
+            f'{unmatched_keys}'
+        )
+
+
 def parallelize_graph(graph: IRGraph,
                       autodist_config: AutoDistConfig) -> IRGraph:
     segments: List[IRSegment] = graph.select(ntype=IRSegment)
@@ -143,19 +194,26 @@ def parallelize_graph(graph: IRGraph,
     else:
         search_out = calc_parallel_plan(graph, autodist_config)
 
-        if autodist_config.save_plan_path:
-            _logger.info(f'save plan to {autodist_config.save_plan_path}')
-            # build cid-to-node mapping for annotating plan with fqn/op
-            cid2node_for_save: Dict[int, IRFwOperation] = {}
-            for node in graph.nodes():
-                if isinstance(node, IRFwOperation):
-                    cid2node_for_save[node.cid] = node
-            plan_json = search_out.to_json(cid2node=cid2node_for_save)
-            with open(autodist_config.save_plan_path, 'w') as f:
-                _write_plan_json(plan_json, f)
+    pp_desc = search_out.desc
+    if autodist_config.fixed_partition_descs:
+        _validate_fixed_partition_plan(
+            graph,
+            pp_desc,
+            autodist_config.fixed_partition_descs,
+        )
+
+    if not autodist_config.load_plan_path and autodist_config.save_plan_path:
+        _logger.info(f'save plan to {autodist_config.save_plan_path}')
+        # build cid-to-node mapping for annotating plan with fqn/op
+        cid2node_for_save: Dict[int, IRFwOperation] = {}
+        for node in graph.nodes():
+            if isinstance(node, IRFwOperation):
+                cid2node_for_save[node.cid] = node
+        plan_json = search_out.to_json(cid2node=cid2node_for_save)
+        with open(autodist_config.save_plan_path, 'w') as f:
+            _write_plan_json(plan_json, f)
 
     _logger.info(f'use plan with e2e time/s {1000 * search_out.e2e_time:.2f}ms')
-    pp_desc = search_out.desc
 
     cid2node: Dict[int, IRFwOperation] = dict()
     for node in graph.nodes():
@@ -299,24 +357,26 @@ def collect_tensor_split_info(graph: IRGraph, pp_desc: PipelineSearchOutput):
                 if consumer.cid not in stage_desc.partition_descs:
                     continue
                 find_desc = True
-                node_desc = stage_desc.partition_descs[consumer.cid].desc
-                if len(node_desc) != 1:
-                    raise RuntimeError(f'node {consumer} is partitioned along multiple dims')
-
-                (p_idx, p_dim), p_num = node_desc[0]
-                if p_idx == -1:
-                    partitioned_node = consumer
-                else:
-                    partitioned_nodes = consumer.algorithm('dim').instantiate(idx=p_idx, dim=p_dim, num=p_num)
-                    if partitioned_nodes is None:
-                        raise RuntimeError(f'node {consumer} cannot be partitioned by {p_idx}-{p_dim}-{p_num}')
-                    partitioned_node = partitioned_nodes[0]
+                node_desc = stage_desc.partition_descs[consumer.cid]
+                try:
+                    partitioned_node = instantiate_partition_desc(
+                        consumer, node_desc
+                    )
+                except Exception as e:
+                    raise RuntimeError(
+                        f'node {consumer} cannot be partitioned by '
+                        f'{node_desc.desc}'
+                    ) from e
+                replicated = all(
+                    tuple(pos) == (-1, -1)
+                    for pos, _ in node_desc.desc
+                )
 
                 if stage_idx not in tensor_split_info[ftensor]:
                     tensor_split_info[ftensor][stage_idx] = set()
                 for input in partitioned_node.inputs():
                     if isinstance(input, IRSubTensor) and input.parent == ftensor:
-                        if p_idx == -1 and stage_desc.mesh_desc.ngpus > 1:
+                        if replicated and stage_desc.mesh_desc.ngpus > 1:
                             tensor_split_info[ftensor][stage_idx].add(('REPLICATED', subtensor_desc(input)))
                         else:
                             # special case: if the stage has only one gpu, we treat it as partitioned

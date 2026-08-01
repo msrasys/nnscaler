@@ -1,7 +1,7 @@
 #  Copyright (c) Microsoft Corporation.
 #  Licensed under the MIT License.
 
-from typing import List, Tuple, Union, Callable, Dict
+from typing import List, Tuple, Union, Callable, Dict, Optional
 import json
 import os
 from os import listdir
@@ -12,6 +12,7 @@ import torch
 
 from nnscaler.graph import IRGraph
 from nnscaler.ir.cten import IRTensor
+from nnscaler.ir.tensor import IRSubTensor
 from nnscaler.profiler.database import ProfileDataBase, ProfiledMetrics
 from nnscaler.algorithm.ops.dimops import gen_partitions
 from nnscaler.ir.operator import IRFwOperation
@@ -96,6 +97,24 @@ def _profile_nodes(nodes: List[IRFwOperation], db: ProfileDataBase, partition_de
     return ret
 
 
+def _profile_exact_nodes(
+    nodes: List[IRFwOperation],
+    db: ProfileDataBase,
+    re_profile: bool,
+):
+    """Profile the exact local shapes used by concrete partition options."""
+    ret = []
+    visited = set()
+    for node in nodes:
+        key = node.signature + ' : ' + db._serialize(node)
+        if key in visited:
+            continue
+        visited.add(key)
+        profiled_metrics = db.profile(node, override=re_profile)
+        ret.append((node.signature, db._serialize(node), profiled_metrics))
+    return ret
+
+
 def _profile_graph(dilled_info: str, dev_id: int, partition_degree: int, re_profile: bool, comp_profile_path: str, result: multiprocessing.Queue):
     import dill
     torch.cuda.set_device(dev_id)
@@ -170,7 +189,13 @@ class CostDatabase:
         self.memory_granularity = memory_granularity
         self.ignore_small_tensor_threshold = ignore_small_tensor_threshold
 
-    def profile_comp(self, partition_degree: int, parallel_profile: bool, re_profile: bool):
+    def profile_comp(
+        self,
+        partition_degree: int,
+        parallel_profile: bool,
+        re_profile: bool,
+        exact_nodes: Optional[List[IRFwOperation]] = None,
+    ):
         def insert_profile_info(info: List[Tuple[str, str, ProfiledMetrics]]):
             for sign, serialized, profiled_metrics in info:
                 _logger.debug(f'profiled {sign} in {serialized} with {profiled_metrics}')
@@ -204,6 +229,13 @@ class CostDatabase:
             _logger.info('Profiling in serial')
             node_to_profile = _filter_nodes(self.graph, self.db)
             ret = _profile_nodes(node_to_profile, self.db, partition_degree, re_profile)
+            insert_profile_info(ret)
+
+        if exact_nodes:
+            # gen_partitions only explores one partition step in the normal
+            # profiler path. Ordered fixed plans can produce a different final
+            # local shape, so always profile the concrete candidates as well.
+            ret = _profile_exact_nodes(exact_nodes, self.db, re_profile)
             insert_profile_info(ret)
 
         self.db.dump_ops(self.comp_profile_path, override=True)
@@ -420,15 +452,11 @@ class CostDatabase:
         Returns:
             communication cost in seconds
         """
-        # partition_dims and partition_nums represent a concrete partition option of a node
-        # if the element in partition_dims is -1, it means the node is replicated.
-        # currently, len of partition_dims is 1, we only support partitioning one dimension
+        # partition_dims and partition_nums represent an ordered concrete
+        # partition option. If an element in partition_dims is -1, that step
+        # explicitly replicates the whole operator.
         partition_dims = cur_partition.partition_dims
         partition_nums = cur_partition.partition_nums
-        # TODO: remove this assertion, support partitioning multiple dimensions
-        assert len(
-            partition_dims
-        ) == 1, f'expect len(partition_dims) == 1, got {len(partition_dims)}'
         full_weight_mem = self.query_single_mem(cur_partition,
                                                 'full_weight',
                                                 round=False)
@@ -441,9 +469,11 @@ class CostDatabase:
         if full_weight_mem % partitioned_weight_mem == 0:
             mem_weight_spatial_num = full_weight_mem // partitioned_weight_mem
         else:
-            # when setting memory granularity > 1, possible that the two numbers are not divisible
-            mem_weight_spatial_num = (full_weight_mem + partitioned_weight_mem
-                                     ) // partitioned_weight_mem
+            # Aggregated and granularity-masked parameter sizes are not always
+            # exactly divisible. Preserve the historical conservative estimate.
+            mem_weight_spatial_num = (
+                full_weight_mem + partitioned_weight_mem
+            ) // partitioned_weight_mem
 
         replica_num = 1
         for i, partition_dim_name in enumerate(partition_dims):
@@ -452,8 +482,9 @@ class CostDatabase:
         all_num = 1
         for num in cur_partition.partition_nums:
             all_num *= num
-        weight_update_num = all_num // (mem_weight_spatial_num * replica_num)
-        if weight_update_num == 1:
+        divisor = mem_weight_spatial_num * replica_num
+        weight_update_num = all_num // divisor
+        if weight_update_num <= 1:
             return 0
         comm_time = self.primitive_to_cost(dev_num=weight_update_num,
                                            primitive='all reduce',
@@ -475,11 +506,17 @@ class CostDatabase:
         Returns:
             communication cost in seconds
         """
-        assert len(src_p.partition_nums) == 1 and len(dst_p.partition_nums) == 1
+        src_device_num = 1
+        for num in src_p.partition_nums:
+            src_device_num *= num
+        dst_device_num = 1
+        for num in dst_p.partition_nums:
+            dst_device_num *= num
+        assert src_device_num == dst_device_num
 
         def comm_cost(tensor: IRTensor, num_devices: int, src_split: DimopSplit,
                       dst_split: DimopSplit, dst_replica: bool,
-                      is_forward: bool):
+                      is_forward: bool, same_layout: bool):
             """
             Calculate communication cost for a single tensor.
             Note for data parallel, we don't consider allreduce cost as it
@@ -549,23 +586,38 @@ class CostDatabase:
                             return helper('reduce scatter')
                 # all2all-all2all or identity-identity
                 if dst_split.isD():
-                    return 0.0 if src_split.dims == dst_split.dims else helper(
-                        'all to all')
+                    return 0.0 if src_split.dims == dst_split.dims and same_layout \
+                        else helper('all to all')
             raise NotImplementedError(
                 f'Unknown split type: {src_split} -> {dst_split}')
 
-        src_p_dim, src_p_num = src_p.partition_dims[0], src_p.partition_nums[0]
-        dst_p_dim, dst_p_num = dst_p.partition_dims[0], dst_p.partition_nums[0]
-        assert src_p_num == dst_p_num
-        src_idx, src_dim = src_p.operator.dim_id2pos(src_p_dim)
-        dst_idx, dst_dim = dst_p.operator.dim_id2pos(dst_p_dim)
-        rule_src, rule_dst = None, None
-        if src_idx != -1:
-            rule_src = src_p.operator.ir_cell.algorithm('dim').infer(
-                src_idx, src_dim, src_p_num)
-        if dst_idx != -1:
-            rule_dst = dst_p.operator.ir_cell.algorithm('dim').infer(
-                dst_idx, dst_dim, dst_p_num)
+        def tensor_split(tensor: IRSubTensor) -> DimopSplit:
+            spatial_degree = 1
+            for full_dim, local_dim in zip(tensor.parent.shape, tensor.shape):
+                if full_dim % local_dim != 0:
+                    raise NotImplementedError(
+                        f'non-uniform tensor partition is unsupported: {tensor}'
+                    )
+                spatial_degree *= full_dim // local_dim
+            value_degree = tensor.valmap[1]
+            if spatial_degree > 1 and value_degree > 1:
+                raise NotImplementedError(
+                    f'mixed spatial/value tensor layout is unsupported: {tensor}'
+                )
+            local_degree = spatial_degree * value_degree
+            if local_degree not in (1, src_device_num):
+                raise NotImplementedError(
+                    'mixed partition/replica activation layout is unsupported: '
+                    f'local degree {local_degree}, device degree '
+                    f'{src_device_num}, tensor {tensor}'
+                )
+            if value_degree > 1:
+                return DimopSplit.V()
+            split_dims = tensor.splitdims()
+            if split_dims:
+                return DimopSplit.D(split_dims)
+            return DimopSplit.R()
+
         cost = 0.0
         for i, src_t in enumerate(src_p.operator.ir_cell.outputs()):
             for j, dst_t in enumerate(dst_p.operator.ir_cell.inputs()):
@@ -575,12 +627,21 @@ class CostDatabase:
                         # then no backward communication.
                         cost += 0.0
                     else:
+                        local_src_t = src_p.ir_cell.outputs()[i]
+                        local_dst_t = dst_p.ir_cell.inputs()[j]
+                        if not isinstance(local_src_t, IRSubTensor) or \
+                                not isinstance(local_dst_t, IRSubTensor):
+                            continue
                         cost += comm_cost(
-                            src_t, src_p_num,
-                            rule_src.outputs()[i]
-                            if rule_src is not None else DimopSplit(r=True),
-                            rule_dst.inputs()[j] if rule_dst is not None else
-                            DimopSplit(r=True), dst_idx == -1, is_forward)
+                            src_t,
+                            src_device_num,
+                            tensor_split(local_src_t),
+                            tensor_split(local_dst_t),
+                            dst_p.is_replicated(),
+                            is_forward,
+                            local_src_t.indmap == local_dst_t.indmap and
+                            local_src_t.valmap == local_dst_t.valmap,
+                        )
                     break
         return cost
 

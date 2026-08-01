@@ -4,7 +4,7 @@
 from pathlib import Path
 import argparse
 import logging
-from .descs import MeshDesc
+from .descs import FixedPartitionDesc, MeshDesc
 from .util import get_default_profile_path
 
 _logger = logging.getLogger(__name__)
@@ -125,6 +125,10 @@ class AutoDistConfig:
         Whether to disable the shared parameter constraint in spmd solver. When a parameter is shared by multiple modules,
         the spmd solver will force the parameter to be replicated to complicated adapter generation. However, user can disable
         it and provide customized partition constraints for those shared parameters.
+    - fixed_partition_descs (`list`, *optional*, defaults to `None`):
+        Ordered partition descriptions forced on matching operators. Each item contains
+        ``name``, ``parent_module``, and a ``desc`` list whose steps contain
+        ``input``, ``dim``, and ``num``.
     """
 
     def __init__(self,
@@ -162,6 +166,7 @@ class AutoDistConfig:
                  parallel_profile=True,
                  transient_mem_coef=2,
                  disable_shared_param_constraint=False,
+                 fixed_partition_descs=None,
                  **kwargs):
         self.pc_path = partition_constraints_path
         self.profile_dir = profile_dir
@@ -206,6 +211,17 @@ class AutoDistConfig:
         self.parallel_profile = parallel_profile
         self.transient_mem_coef = transient_mem_coef
         self.disable_shared_param_constraint = disable_shared_param_constraint
+        if fixed_partition_descs is None:
+            fixed_partition_descs = []
+        if not isinstance(fixed_partition_descs, list):
+            raise ValueError(
+                'fixed_partition_descs must be a list, '
+                f'got {type(fixed_partition_descs)}'
+            )
+        self.fixed_partition_descs = tuple(
+            FixedPartitionDesc.from_config(desc)
+            for desc in fixed_partition_descs
+        )
 
         ignored_keys = list(kwargs.keys())
         if ignored_keys:
@@ -246,6 +262,31 @@ class AutoDistConfig:
 
         if self.save_plan_path:
             Path(self.save_plan_path).parent.mkdir(parents=True, exist_ok=True)
+
+        fixed_keys = set()
+        for fixed_desc in self.fixed_partition_descs:
+            key = (fixed_desc.name, fixed_desc.parent_module)
+            if key in fixed_keys:
+                raise ValueError(
+                    'duplicate fixed partition description for '
+                    f'name={fixed_desc.name!r}, '
+                    f'parent_module={fixed_desc.parent_module!r}'
+                )
+            fixed_keys.add(key)
+            partition_degree = 1
+            for _, num in fixed_desc.desc:
+                partition_degree *= num
+            if partition_degree != self.mesh_desc.col:
+                raise ValueError(
+                    f'fixed partition degree for {fixed_desc.name!r} under '
+                    f'{fixed_desc.parent_module!r} is {partition_degree}, '
+                    f'but mesh_col is {self.mesh_desc.col}'
+                )
+        if self.fixed_partition_descs and self.pipeline_enabled:
+            raise ValueError(
+                'fixed_partition_descs currently require a single SPMD stage; '
+                'pipeline exploration can use smaller per-stage device meshes'
+            )
 
         if self.zero_stage not in [0, 1]:
             raise ValueError(f'zero stage {self.zero_stage} must be 0 or 1')

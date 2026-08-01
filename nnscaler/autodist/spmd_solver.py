@@ -21,7 +21,7 @@ import functools
 from dataclasses import dataclass, asdict
 from collections import defaultdict
 from pathlib import Path
-from typing import Dict, Tuple, List, Set, Any
+from typing import Dict, Tuple, List, Set, Any, Optional
 
 __all__ = [
     'SPMDSolver',
@@ -173,8 +173,16 @@ class SPMDSolver:
         else:
             _logger.info('no partition constraint is loaded')
 
+        self.fixed_partition_descs: Dict[str, Dict[str, FixedPartitionDesc]] = dict()
+        self.non_used_fixed_partition_descs = set(
+            autodist_config.fixed_partition_descs
+        )
+        for fixed_desc in autodist_config.fixed_partition_descs:
+            self.fixed_partition_descs.setdefault(fixed_desc.name, {})[
+                fixed_desc.parent_module
+            ] = fixed_desc
+
         self.cost_database = graph.cost_database
-        self.cost_database.profile_comp(self.device_num, autodist_config.parallel_profile, autodist_config.re_profile)
         self.stage_num = stage_num
 
         self.initialize()
@@ -182,6 +190,18 @@ class SPMDSolver:
     def initialize(self):
         self.build_cut_ops()
         self.init_op_partitions()
+        exact_nodes = [
+            partition.ir_cell
+            for partitions in self._op_partitions
+            for partition in partitions
+            if len(partition.partition_nums) > 1
+        ]
+        self.cost_database.profile_comp(
+            self.device_num,
+            self.autodist_config.parallel_profile,
+            self.autodist_config.re_profile,
+            exact_nodes=exact_nodes,
+        )
         self.build_following_relationships()
         self.calc_partition_info()
 
@@ -213,6 +233,25 @@ class SPMDSolver:
 
     def get_op_partition_count(self, idx: int) -> int:
         return len(self._op_partitions[idx])
+
+    def _select_fixed_partition_desc(
+        self,
+        operator: CubeOperator,
+    ) -> Optional[FixedPartitionDesc]:
+        if operator.op_name not in self.fixed_partition_descs:
+            return None
+        module_types = tuple(
+            module_type.__name__
+            for module_type in (operator.ir_cell.module_stack or {}).values()
+        )
+        selected, matched = select_fixed_partition_desc(
+            operator.op_name,
+            module_types,
+            self.fixed_partition_descs[operator.op_name].values(),
+        )
+        # A shadowed fallback or outer-module rule is still a valid match.
+        self.non_used_fixed_partition_descs.difference_update(matched)
+        return selected
 
     def init_op_partitions(self):
         '''
@@ -380,6 +419,46 @@ class SPMDSolver:
             return True
 
         def build_op_partitions(operator: CubeOperator) -> List[OpPartition]:
+            fixed_desc = self._select_fixed_partition_desc(operator)
+            if fixed_desc is not None:
+                fixed_degree = functools.reduce(
+                    lambda lhs, step: lhs * step[1],
+                    fixed_desc.desc,
+                    1,
+                )
+                if fixed_degree != self.device_num:
+                    raise ValueError(
+                        f'fixed partition degree {fixed_degree} for '
+                        f'{operator.op_name} does not match solver device '
+                        f'count {self.device_num}'
+                    )
+                partition_dims = []
+                partition_nums = []
+                partition_positions = []
+                for pos, num in fixed_desc.desc:
+                    if pos == (-1, -1):
+                        dim_id = -1
+                    else:
+                        try:
+                            dim_id = operator.pos2dim_id(pos)
+                        except Exception as e:
+                            raise ValueError(
+                                f'invalid fixed partition position {pos} for '
+                                f'{operator}'
+                            ) from e
+                    partition_dims.append(dim_id)
+                    partition_nums.append(num)
+                    partition_positions.append(pos)
+                _logger.debug(
+                    f'force fixed partition {fixed_desc} on {operator.ir_cell}'
+                )
+                return [OpPartition(
+                    partition_dims=tuple(partition_dims),
+                    partition_nums=tuple(partition_nums),
+                    partition_positions=tuple(partition_positions),
+                    operator=operator,
+                )]
+
             # force replica for non-dimops
             if not isinstance(operator.ir_cell, IRDimops):
                 candidates = [((-1,), (self.device_num,))]
@@ -429,6 +508,18 @@ class SPMDSolver:
         if self.non_used_pcs:
             _logger.warning(
                 f'find unused partition constraints {self.non_used_pcs}')
+        if self.non_used_fixed_partition_descs:
+            unmatched = sorted(
+                (
+                    fixed_desc.name,
+                    fixed_desc.parent_module,
+                )
+                for fixed_desc in self.non_used_fixed_partition_descs
+            )
+            raise ValueError(
+                'fixed partition descriptions did not match any operator: '
+                f'{unmatched}'
+            )
         _logger.info('finish building op partitions')
 
     # use a union-find set to find the oldest operator in a following chain
@@ -1408,13 +1499,12 @@ class SPMDSolver:
         Returns:
             int: the index of the partition
         '''
+        normalized_desc = tuple(
+            (tuple(pos), num) for pos, num in node_desc.desc
+        )
         for i, p in enumerate(self._op_partitions[node_idx]):
-            op = p.operator
-            p_info = tuple([
-                (op.dim_id2pos(dim), num)
-                for dim, num in zip(p.partition_dims, p.partition_nums)
-            ])
-            if p_info == node_desc.desc:
+            p_info = tuple(zip(p.partition_positions, p.partition_nums))
+            if p_info == normalized_desc:
                 return i
         raise RuntimeError(f'fail to find the partition {node_desc} for node {self.get_operator(node_idx)}')
 
@@ -1435,10 +1525,7 @@ class SPMDSolver:
         partition_descs = {}
         for p in partitions:
             op = p.operator
-            p_info = tuple([
-                (op.dim_id2pos(dim), num)
-                for dim, num in zip(p.partition_dims, p.partition_nums)
-            ])
+            p_info = tuple(zip(p.partition_positions, p.partition_nums))
             partition_descs[op.ir_cell.cid] = NodePartitionDesc(desc=p_info)
 
         return partition_descs
