@@ -42,6 +42,8 @@ def wrap_sliding_window_attn_func(
         max_seqlen_q: Optional[int] = None,
         max_seqlen_k: Optional[int] = None,
         return_lse: bool = True,
+        cp_size: Optional[int] = None,
+        require_full_plan_sequence_partition: bool = False,
 ):
     '''
     Context parallel sliding window attention using single-hop A2A communication.
@@ -56,6 +58,20 @@ def wrap_sliding_window_attn_func(
     - window_size[0] <= length_per_rank (single-hop communication)
     '''
     assert not return_attn_probs, "return_attn_probs is not supported"
+    if not isinstance(require_full_plan_sequence_partition, bool):
+        raise ValueError(
+            "require_full_plan_sequence_partition must be a bool, got "
+            f"{require_full_plan_sequence_partition!r}"
+        )
+    if cp_size is not None:
+        if not isinstance(cp_size, int) or isinstance(cp_size, bool) or cp_size < 1:
+            raise ValueError(f"cp_size must be a positive int or None, got {cp_size!r}")
+        if process_group is not None and len(process_group) != cp_size:
+            raise ValueError(
+                f"process_group size ({len(process_group)}) must match cp_size ({cp_size})"
+            )
+        if cp_size == 1:
+            enable_ring = False
     if max_seqlen_q is None:
         max_seqlen_q = (cu_seqlens_q[1:] - cu_seqlens_q[:-1]).max().item()
     if max_seqlen_k is None:
@@ -148,6 +164,8 @@ def emit_ring(node: IRDimops, args: List[str], kwargs: Dict[str, str], runtime_d
 
     kw_pairs = list()
     for key, val in kwargs.items():
+        if key == 'process_group':
+            continue
         code = f'{key}={val}'
         kw_pairs.append(code)
 
@@ -155,14 +173,73 @@ def emit_ring(node: IRDimops, args: List[str], kwargs: Dict[str, str], runtime_d
     full_input = sub_input.parent
     partition_dims = [(i, f // s) for i, (s, f) in enumerate(zip(sub_input.shape, full_input.shape)) if s != f]
     assert len(partition_dims) <= 1, f"support no more than one partition dim, but got {partition_dims}"
+    explicit_cp_size = node.kwargs.get('cp_size')
+    if explicit_cp_size is not None and (
+        not isinstance(explicit_cp_size, int)
+        or isinstance(explicit_cp_size, bool)
+        or explicit_cp_size < 1
+    ):
+        raise ValueError(
+            f"cp_size must be a positive int or None, got {explicit_cp_size!r}"
+        )
+    require_full_partition = node.kwargs.get(
+        'require_full_plan_sequence_partition', False
+    )
+    if not isinstance(require_full_partition, bool):
+        raise ValueError(
+            "require_full_plan_sequence_partition must be a bool, got "
+            f"{require_full_partition!r}"
+        )
+    strict_sequence_partition = require_full_partition or (
+        explicit_cp_size is not None and explicit_cp_size > 1
+    )
+    strict_reason = (
+        f"data-lane layout with cp_size={explicit_cp_size}"
+        if require_full_partition
+        else f"explicit cp_size={explicit_cp_size}"
+    )
     if not partition_dims:
+        if strict_sequence_partition:
+            raise ValueError(
+                f"{strict_reason} requires partitioning "
+                "the sequence dimension across the full plan"
+            )
         kw_pairs.append("process_group=None")
     else:
         if partition_dims[0][0] == 0:  # partition on sequence dim
-            num = partition_dims[0][1]
-            scale_unit_dev_ids = [local_rank + offset for local_rank in range(remainder // num * num, (remainder // num + 1) * num)]
-            kw_pairs.append(f"process_group={scale_unit_dev_ids}")
+            partition_degree = partition_dims[0][1]
+            cp_size = explicit_cp_size
+            if cp_size is None:
+                cp_size = partition_degree
+            if plan_ndevs % cp_size != 0:
+                raise ValueError(
+                    f"cp_size ({cp_size}) must divide plan size ({plan_ndevs})"
+                )
+            if strict_sequence_partition and partition_degree != plan_ndevs:
+                raise ValueError(
+                    f"sequence partition degree ({partition_degree}) must equal "
+                    f"plan size ({plan_ndevs}) for {strict_reason}"
+                )
+            if partition_degree % cp_size != 0:
+                raise ValueError(
+                    f"sequence partition degree ({partition_degree}) must be a "
+                    f"multiple of cp_size ({cp_size})"
+                )
+            if cp_size == 1:
+                kw_pairs.append("process_group=None")
+            else:
+                group_start = remainder // cp_size * cp_size
+                scale_unit_dev_ids = [
+                    local_rank + offset
+                    for local_rank in range(group_start, group_start + cp_size)
+                ]
+                kw_pairs.append(f"process_group={scale_unit_dev_ids}")
         elif partition_dims[0][0] == 1:
+            if strict_sequence_partition:
+                raise ValueError(
+                    f"{strict_reason} requires sequence-dimension "
+                    "partitioning, not head-dimension partitioning"
+                )
             kw_pairs.append("process_group=None")
         else:
             raise ValueError(f'unsupported partition dim: {partition_dims[0]}')
