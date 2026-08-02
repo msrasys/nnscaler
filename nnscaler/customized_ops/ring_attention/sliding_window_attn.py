@@ -1,6 +1,7 @@
 #  Copyright (c) Microsoft Corporation.
 #  Licensed under the MIT License.
 
+from dataclasses import replace
 from typing import Tuple, List, Dict, Optional
 import torch
 from torch import Tensor
@@ -119,6 +120,15 @@ def wrap_sliding_window_attn_func(
         rank=local_rank,
         world_size=local_world_size,
     )
+
+    # Only the maxima consumed by FA4 are replaced; communication metadata is
+    # still derived from the exact packed batch.
+    if use_cute:
+        metadata = replace(
+            metadata,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_k=max_seqlen_k,
+        )
 
     out, softmax_lse = sliding_window_attn_func(
         q,

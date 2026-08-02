@@ -105,6 +105,8 @@ def wrap_zigzag_allgather_attn_varlen_func(
         alibi_slopes=alibi_slopes,
         deterministic=deterministic,
         use_cute=use_cute,
+        max_seqlen_q=max_seqlen_q,
+        max_seqlen_k=max_seqlen_k,
     )
     return (output, softmax_lse) if return_lse else output
 

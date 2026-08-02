@@ -1,7 +1,7 @@
 #  Copyright (c) Microsoft Corporation.
 #  Licensed under the MIT License.
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from collections import OrderedDict
 from typing import Optional, Tuple
 
@@ -209,6 +209,8 @@ def zigzag_allgather_attn_varlen_func(
     deterministic: bool = False,
     use_cute: bool = False,
     window_size: Tuple[int, int] = (-1, -1),
+    max_seqlen_q: Optional[int] = None,
+    max_seqlen_k: Optional[int] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     assert process_group is not None and dist.get_world_size(process_group) > 1, (
         "zigzag_allgather_attn_varlen_func only handles the multi-GPU CP branch"
@@ -222,6 +224,14 @@ def zigzag_allgather_attn_varlen_func(
         world_size=world_size,
         rank=rank,
     )
+
+    if use_cute:
+        metadata = replace(
+            metadata,
+            max_seqlen_q=max_seqlen_q or metadata.max_seqlen_q,
+            max_seqlen_k_front=max_seqlen_k or metadata.max_seqlen_k_front,
+            max_seqlen_k_end=max_seqlen_k or metadata.max_seqlen_k_end,
+        )
 
     q_front = q[metadata.q_front_idx]
     q_end = q[metadata.q_end_idx]
