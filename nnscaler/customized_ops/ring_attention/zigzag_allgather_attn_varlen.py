@@ -109,6 +109,8 @@ def wrap_zigzag_allgather_attn_varlen_func(
         deterministic=deterministic,
         use_cute=use_cute,
         return_lse=return_lse,
+        max_seqlen_q=max_seqlen_q,
+        max_seqlen_k=max_seqlen_k,
     )
 
 
