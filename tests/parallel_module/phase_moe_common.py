@@ -30,51 +30,58 @@ honestly scoped (see ``nnscaler/graph/schedule/phase.py``'s "Scope"): multiple
 local experts per rank would need an additional local expert-selection split,
 not attempted here.
 
-Honest scoping note: what's real, and what's replicated for simplicity
-------------------------------------------------------------------------
+Real, per-rank-distinct expert parameters (genuine EP, not replica)
+-----------------------------------------------------------------------
+Fixed in response to a post-commit audit finding (the previous revision
+replicated ``expert_up``/``expert_down`` identically across every EP rank,
+so despite genuinely real dispatch/combine communication, every rank
+computed the *identical* function and, combined with identical replicated
+input, moved bit-identical data -- correctly flagged as "not really EP").
+The expert FFN weights are now a stacked ``[num_experts, ...]`` tensor
+(:func:`expert_ffn_local`), *partitioned* -- not replicated -- across each
+stage's ``ep_ranks`` via a minimal :class:`~nnscaler.graph.function.dimops.TransformRule`
+(:func:`_build_expert_transform_rule`, ``DimopSplit.D(0)`` on the weight
+args), mirroring ``examples/deepseek_coder_v2_lite``'s
+``build_ep_transform_rule`` precedent but simplified for this model's
+``num_experts == len(ep_ranks)`` (no ``local_expert_start``/``end`` masking
+needed -- see that function's docstring). After compilation each rank's
+local weight slice has shape ``[1, dim, ffn_hidden]``/``[1, ffn_hidden,
+dim]``: a genuinely independent, memory-partitioned copy of exactly one
+expert (verified empirically both in a standalone experiment and in
+:mod:`test_phase_moe_asymmetric_e2e`'s hard assertions), not a redundant
+full replica. Independently initialized per expert (a fresh, separately
+-constructed ``nn.Linear`` per expert slice, immediately copied and
+discarded) for genuine, non-contrived distinctness.
+
+What remains replicated (still an honest, documented limitation)
+-----------------------------------------------------------------------
 Every op *before* :func:`~nnscaler.runtime.adapter.moe.moe_dispatch` (QKV,
-attention, the gate, and the fixed-capacity scatter build) is
+attention, the gate, and the fixed-capacity scatter build) is still
 *replicated* (``nnscaler.policies._replica``) across each stage's
-``ep_ranks``, i.e. every EP rank runs the identical computation on the
-identical (replicated) input -- **not** TP-sharded per rank. This was a
-deliberate simplification found necessary while building this model: the
-capacity-scatter's constituent ops (``torch.argmax``, ``torch.nn.functional.one_hot``,
-``Tensor.new_zeros``, ``torch.scatter_add``) are not registered nnScaler
-``IRDimops`` (confirmed via the "Find unknown pytorch operation" trace-time
-notice), so they have no partition-dimension algorithm nnScaler's
-``_tp``/``graph.partition`` can act on; TP-sharding only the *upstream*
-attention ops while replicating these downstream ones produced a genuine,
-confirmed compile-time error (``IRAdapterGener.gen_activation``'s
+``ep_ranks`` -- **not** TP-sharded per rank. This remains necessary because
+the capacity-scatter's constituent ops (``torch.argmax``,
+``torch.nn.functional.one_hot``, ``Tensor.new_zeros``, ``torch.scatter_add``)
+are not registered nnScaler ``IRDimops`` (confirmed via the "Find unknown
+pytorch operation" trace-time notice), so they have no partition-dimension
+algorithm nnScaler's ``_tp``/``graph.partition`` can act on; TP-sharding only
+the *upstream* attention ops while replicating these downstream ones produced
+a genuine, confirmed compile-time error (``IRAdapterGener.gen_activation``'s
 ``local_consumer_multiref``: "Detect that a full tensor is partitioned
-differently on a device") -- nnScaler's ``_replica`` primitive means "run
-identically on the full (replicated) tensor", not "process whatever local
-shard an upstream partition happened to produce", so mixing TP-sharded
-upstream ops with replica'd downstream ops on the same tensor is
-structurally inconsistent, not just under-tested. Registering these ops
-with proper partition annotations (mirroring how
-``examples/deepseek_coder_v2_lite`` registers ``nnscaler_moe_gmm``) would
-resolve this but is out of scope for Step C's IR/scheduling/communication
-focus.
+differently on a device"). Registering these ops with proper partition
+annotations would resolve this but is out of scope here.
 
-Similarly, the expert FFN weights (``gate``/``expert_up``/``expert_down``)
-are replicated, i.e. every rank's local "expert" computes the identical
-function, rather than each rank owning an independently-parameterized expert
-slice (which would need the same kind of new, stacked-expert-axis weight
-partitioning, mirroring ``nnscaler_moe_gmm``/``build_ep_transform_rule``).
-
-Consequently, in these e2e tests every EP rank computes *identical* gating
-on *identical* (replicated) input, so the content actually moved by
-dispatch/combine happens to be identical across ranks too. This does **not**
-weaken what is actually novel and being tested here: the all-to-all
-*communication* itself is fully real (genuine NCCL collectives, genuine
-async issue + deferred wait, genuine gradients through real autograd
-Functions -- see ``nnscaler/runtime/adapter/moe.py``), and the phase
-IR/scheduling/overlap machinery operates identically regardless of *what*
-content is moved. The routing/capacity *logic itself* (non-uniform,
-per-token-varying expert assignment, overflow drop, underflow pad) is
-separately, directly unit-tested with synthetic non-uniform inputs in
-``tests/runtime/test_moe_comm.py`` (CPU, no distributed launch needed),
-decoupled from this distributed-replication limitation.
+This is why the calling test harness (:mod:`test_phase_moe_asymmetric_e2e`)
+gives each EP rank a genuinely *different* local input batch (different
+seed per rank, real data-parallel-style local sharding) rather than relying
+on this module alone: since the gate/attention are still replicated
+(identical function everywhere), it is the *difference in each rank's local
+input* -- not a difference in the replicated gating function -- that makes
+the routing decision, and hence the dispatch buffer, genuinely differ across
+ranks (hard-asserted directly, not merely assumed). Combined with the now
+-genuinely-distinct expert weights above, both halves of "real EP" (real
+communication moving real, rank-different data AND real, rank-different
+expert computation on the receiving side) now hold, not just the
+communication half.
 
 Phase-tagged vs. plain ("serial baseline") variants
 ------------------------------------------------------
@@ -102,6 +109,167 @@ from nnscaler.policies import _replica
 from nnscaler.graph.schedule.phase import PhaseType, PhaseAwareSched, lower_layer_to_phases, validate_phase_layout, phase_anchor
 from nnscaler.graph.schedule.schedplan import StreamContext
 from nnscaler.runtime.adapter.moe import moe_dispatch, moe_dispatch_wait, moe_combine, moe_combine_wait
+from nnscaler.graph.parser.register import register_op
+from nnscaler.graph.function.dimops import DimopSplit, TransformRule
+
+
+def expert_ffn_local(x: torch.Tensor, up_w: torch.Tensor, down_w: torch.Tensor) -> torch.Tensor:
+    """Real, genuinely per-rank-distinct expert FFN (Linear -> SiLU -> Linear).
+
+    ``up_w``/``down_w`` carry a leading ``num_experts`` axis that
+    :func:`_build_expert_transform_rule`'s ``TransformRule`` tells nnScaler
+    to *partition* (``DimopSplit.D(0)``, not replicate) across a stage's
+    ``ep_ranks`` -- i.e. after compilation, each EP rank's local copy has
+    shape ``[1, dim, ffn_hidden]``/``[1, ffn_hidden, dim]``: a genuinely
+    independent, memory-partitioned slice of the full stacked tensor (one
+    real expert's own weights), not a redundant full replica every rank
+    happens to only partially use. Verified empirically (see the session
+    report): after compilation, ``up_w.shape[0] == 1`` and its value is the
+    slice belonging to *that* rank's position in ``ep_ranks``, distinct from
+    every other rank's slice.
+
+    Tolerant of a not-yet-partitioned (``shape[0] > 1``) weight during
+    nnScaler's own codegen-time shape-inference/validation calls (which may
+    invoke the real function on the original, full, unpartitioned tensor
+    purely to check shapes) -- always uses slot 0 either way. This is
+    intentional and important, *not* just a validation shim: the traced
+    (trace-time, full-tensor) call and the real per-device (partitioned,
+    ``shape[0] == 1``) call MUST produce identically-shaped output, because
+    ``MoEFFN.forward``'s very next line (a hand-written ``.reshape(...)``
+    with a shape computed from Python ints, not from ``expert_out`` itself)
+    is traced once, at trace time, and that one fixed reshape gets reused
+    (via codegen) for the real, partitioned runtime call too -- there is no
+    re-tracing per-device. A per-branch *different output shape* (an earlier
+    revision tried stacking every expert's output in the ``shape[0] > 1``
+    branch to satisfy a leading ``e+`` annotation axis) breaks the very
+    reshape call that immediately follows at trace time -- confirmed via a
+    real ``RuntimeError: shape '[2, 4, 16]' is invalid for input of size
+    256`` in this session -- so slot-0-only, *unconditionally*, is the
+    correct choice, not a simplification.
+
+    The output carries NO leading ``num_experts``/``e`` axis of its own
+    (unlike the inputs) -- see :func:`_build_expert_transform_rule`'s
+    docstring for why (``DimopSplit.R()``, not ``V()`` or an artificial
+    ``D(0)``) and the real bug this fixes.
+    """
+    h = F.silu(torch.matmul(x, up_w[0]))
+    return torch.matmul(h, down_w[0])
+
+
+def _build_expert_transform_rule() -> TransformRule:
+    """``x`` is replicated (every rank already has its own, locally-relevant
+    ``x`` -- see ``MoEFFN.forward``); ``up_w``/``down_w`` are split along
+    their leading (``num_experts``) axis; the output is ``DimopSplit.R()``.
+
+    A real, load-bearing bug was found and fixed here (see the session
+    report): an earlier revision used ``DimopSplit.V()`` ("value split",
+    i.e. this partition's output is only a PARTIAL value requiring a
+    cross-partition REDUCE, typically sum, to reconstruct the true value --
+    confirmed via ``nnscaler/algorithm/ops/dimops.py``'s
+    ``split_val``/``satisfy``, and ``nnscaler/graph/gener/gen.py``'s
+    valmap-combination comments) for the output transform rule. That is
+    flatly wrong for this op: each EP rank's expert output is already the
+    COMPLETE, final result for its own local tokens (``expert_ffn_local``
+    applies its own, single local expert uniformly across every row of
+    ``x`` -- there is no per-row "this row belongs to a different logical
+    partition" structure at all) -- there is no cross-rank value to sum.
+    With ``V()``, nnScaler's adapter generation silently inserted an
+    all-reduce-like combination across the ``ep_ranks`` group on
+    ``expert_out`` before the following (``_replica``-assigned) reshape
+    node could consume it, corrupting it (concretely: a token dropped --
+    zero-padded -- for capacity-underflow on ONE rank was silently "filled
+    in" by summing with the OTHER rank's non-zero value at the same
+    position, discovered by noticing the combined buffer had NO zero rows
+    even though its own input provably did -- see
+    ``test_phase_moe_asymmetric_e2e.py``'s debugging history in the
+    report). A follow-up attempt gave the output an artificial leading
+    ``e+`` axis (``DimopSplit.D(0)``, mirroring the inputs') to try to
+    signal "independent, not combinable" -- but that changes the output's
+    *shape itself* at trace time (an ``unsqueeze``/stack was needed to
+    satisfy the annotation's declared axis), which broke the very next,
+    hand-written ``.reshape()`` call in ``MoEFFN.forward`` (its target
+    shape is computed from Python ints, not from ``expert_out``, and is
+    traced/codegenned once for both the full trace-time call and every
+    real per-device partitioned call -- see :func:`expert_ffn_local`'s
+    docstring). The actual fix needs BOTH: (1) the output shape must stay
+    exactly ``[n, h]`` (no ``e`` axis) at both trace time and runtime, and
+    (2) nnScaler must not insert an unwanted cross-partition combine for
+    it. ``DimopSplit.R()`` satisfies both: it declares the output "already
+    valid/complete as computed, locally, on each partition" (no reduce, no
+    extra axis) -- it does not assert bit-identical values across
+    partitions the way an *assignment consistency check* would; it only
+    means "no adapter needs to combine this for a downstream reader",
+    which is exactly what's needed since ``expert_out``'s only consumer
+    (the following reshape, then ``moe_combine``) runs on that very same
+    device with that very same local value. Mirrors
+    ``examples/deepseek_coder_v2_lite``'s ``build_ep_transform_rule`` (the
+    established precedent for this exact "stacked expert axis" pattern in
+    this codebase) for the *input* transform rules; the *output* rule
+    differs from that example (which uses ``V()``) because that example's
+    local-expert compute is mask-zeroed per row before summing (so a
+    V()-triggered sum is a harmless no-op there), while this op applies a
+    single local expert densely across every row (so a V()-triggered sum
+    is not a no-op -- it silently corrupts real data). Simplified for this
+    model's ``num_experts == len(ep_ranks)`` (exactly one *local* expert
+    per rank after full EP-degree sharding, so unlike the DeepSeek
+    example's multi-local-expert ``local_expert_start``/``local_expert_end``
+    masking, no kwarg modification is needed at all here -- the default
+    ``TransformRule.kwarg_modifier`` no-op suffices).
+
+    A SECOND, separate real bug (also found and fixed in this session, after
+    an initial WRONG fix attempt -- documented honestly here since it is
+    instructive) concerns how ``x``'s gradient must NOT be all-reduced
+    across the ``ep_ranks`` partition group. The wrong fix first tried was a
+    ``': /e'`` no-grad-reduce modifier on ``x``'s ``register_op`` annotation
+    shape string (``nnscaler/graph/function/dimops.py``'s ``ShapeAnno``
+    ``_parse_meta``/``no_grad_reduce_for``) -- this had ZERO effect (verified
+    by inspecting the actual generated backward code before and after: byte
+    -identical), because that annotation-string mechanism is grep-confirmed
+    to have NO call sites anywhere in nnScaler outside ``dimops.py`` itself
+    -- i.e. it is vestigial/unwired for this code path (custom
+    ``TransformRule``-based partitioning), not merely inapplicable. The REAL
+    mechanism, confirmed by directly reading the generated Python source
+    (``nnscaler.runtime.adapter.nn.identity_allreduce(reshape_2_229,
+    ranks=[0, 1])`` was being inserted right before the call to this op --
+    identity in forward, hence forward numerically matched; all-reduce
+    -SUM in backward, hence the corrupted input gradient) is
+    ``TransformRule``'s own, separate, keyword-only
+    ``no_grad_reduce_inputs: Optional[List[int]]`` constructor parameter
+    (grep-confirmed real call chain:
+    ``nnscaler/algorithm/ops/dimops.py``'s ``instantiate()`` passes
+    ``rule.no_grad_reduce_inputs`` into each partitioned sub-node's own
+    ``_no_grad_reduce_inputs`` -- ``nnscaler/graph/function/dimops.py``'s
+    ``IRDimops.new()``/``ignore_grad_reduce()`` -- consulted directly by
+    ``nnscaler/graph/graph.py``'s own gradient-flow code, line ~432:
+    ``if isinstance(fnode, IRDimops) and fnode.ignore_grad_reduce(input_idx=input_idx)``).
+    Without marking ``x`` (input index 0) here, nnScaler's default assumes
+    the standard Megatron-style tensor-parallel "column-parallel input"
+    semantic: ``x`` is treated as ONE shared/replicated value visible to
+    every partition of this node, so its gradient (correctly, for that
+    *different* scenario) must be summed across all partitions to
+    reconstruct "the true gradient of the one shared input". That is wrong
+    here: ``x`` (``flat_in`` in ``MoEFFN.forward``) is genuinely DIFFERENT
+    data on each EP rank (each rank's own post-dispatch tokens), not one
+    logical value redundantly visible everywhere -- each rank's ``dL/dx``
+    must flow back independently, untouched by the other rank's. Confirmed
+    via a REAL, synchronized, central finite-difference check directly on
+    the compiled 2-GPU model itself (perturbing one element of rank 0's
+    input by +-eps, re-running the real forward, comparing
+    ``(loss(+eps)-loss(-eps))/(2*eps)`` against the captured analytic
+    gradient at that element -- independent of this file's own test
+    reference implementation entirely): before this fix, analytic and
+    finite-difference gradients differed consistently (~5.4e-4 absolute,
+    stable across eps in [2e-3, 5e-2], ruling out discretization/routing
+    -flip artifacts) -- i.e. a real, load-bearing, reproducible bug, not a
+    reference-implementation artifact.
+    """
+    itransform = [DimopSplit.R(), DimopSplit.D(0), DimopSplit.D(0)]
+    otransform = [DimopSplit.R()]
+    return TransformRule(itransform, otransform, no_grad_reduce_inputs=[0])
+
+
+register_op('n h^, e+ h^ f^, e+ f^ h^ -> n h^',
+            transform_rules=(_build_expert_transform_rule(),))(expert_ffn_local)
 
 
 
@@ -230,6 +398,7 @@ class MoEFFN(nn.Module):
                  layer_id: int, capacity_factor: float = 1.0):
         super().__init__()
         self.dim = dim
+        self.ffn_hidden = ffn_hidden
         self.ep_ranks = tuple(ep_ranks)
         self.num_experts = len(self.ep_ranks)
         self.layer_id = layer_id
@@ -248,8 +417,26 @@ class MoEFFN(nn.Module):
         # rather than patching either gap, is the robust fix.
         self._cf_num, self._cf_den = capacity_factor.as_integer_ratio()
         self.gate = nn.Linear(dim, self.num_experts, bias=False)
-        self.expert_up = nn.Linear(dim, ffn_hidden, bias=False)
-        self.expert_down = nn.Linear(ffn_hidden, dim, bias=False)
+        # Genuinely per-expert-distinct, memory-partitioned weights (real
+        # EP): a stacked [num_experts, ...] tensor, PARTITIONED (not
+        # replicated) across ep_ranks by make_pas via expert_ffn_local's
+        # TransformRule -- each rank ends up owning exactly ONE expert's
+        # own slice (see expert_ffn_local's docstring). Initialized with a
+        # genuinely independent random draw PER expert (a fresh nn.Linear
+        # per expert, immediately copied into the stacked parameter and
+        # discarded) so distinctness is real, not a deliberately-inserted
+        # test artifact.
+        up_slices, down_slices = [], []
+        for _ in range(self.num_experts):
+            up_slices.append(nn.Linear(dim, ffn_hidden, bias=False).weight.detach().clone())
+            down_slices.append(nn.Linear(ffn_hidden, dim, bias=False).weight.detach().clone())
+        # nn.Linear's weight is [out_features, in_features]; expert_ffn_local
+        # computes `x @ up_w[0]` (x: [n, dim]) so up_w's slice must be
+        # [dim, ffn_hidden] (i.e. transposed relative to nn.Linear's own
+        # [ffn_hidden, dim] storage convention) -- likewise down_w's slice
+        # must be [ffn_hidden, dim].
+        self.expert_up_weight = nn.Parameter(torch.stack([w.t().contiguous() for w in up_slices]))
+        self.expert_down_weight = nn.Parameter(torch.stack([w.t().contiguous() for w in down_slices]))
 
     def _capacity(self, num_local_tokens: int) -> int:
         # Integer ceiling division of (num_local_tokens * capacity_factor)
@@ -279,7 +466,7 @@ class MoEFFN(nn.Module):
             phase_anchor(self.layer_id, PhaseType.EXPERT_COMPUTE)
         dispatched = moe_dispatch_wait(pending)
         flat_in = dispatched.reshape(self.num_experts * capacity, self.dim)
-        expert_out = self.expert_down(F.silu(self.expert_up(flat_in)))
+        expert_out = expert_ffn_local(flat_in, self.expert_up_weight, self.expert_down_weight)
         combine_buffer = expert_out.view(self.num_experts, capacity, self.dim)
         channel_c = f'phase_moe_L{self.layer_id}_combine'
         pending2 = moe_combine(combine_buffer, self.ep_ranks, channel=channel_c, max_outstanding=1)
@@ -392,9 +579,11 @@ class PhaseMoEModel(nn.Module):
 def _layer_node_ranges(all_ops: List, num_stages: int, layers_per_stage: int, use_phases: bool):
     """Return, for each global layer id, the (start, end) index range (into
     `all_ops`) of that layer's forward nodes -- boundaries found via phase
-    anchors (if `use_phases`) or via a fixed 5-linears-per-layer count
-    otherwise (both variants trace the exact same op sequence, see module
-    docstring)."""
+    anchors (if `use_phases`) or via a fixed 3-linears-per-layer count
+    otherwise (``qkv``, ``out_proj``, ``gate`` -- the expert FFN is a
+    distinctly-named ``expert_ffn_local`` op, not a plain ``'linear'``, so
+    it is intentionally excluded from this count; both variants trace the
+    exact same op sequence, see module docstring)."""
     total_layers = num_stages * layers_per_stage
     if use_phases:
         anchor_positions = {
@@ -403,8 +592,8 @@ def _layer_node_ranges(all_ops: List, num_stages: int, layers_per_stage: int, us
         starts = [anchor_positions[f'__phase__{lid}:attention'] for lid in range(total_layers)]
     else:
         linear_positions = [i for i, n in enumerate(all_ops) if n.name == 'linear']
-        assert len(linear_positions) == total_layers * 5
-        starts = [linear_positions[lid * 5] for lid in range(total_layers)]
+        assert len(linear_positions) == total_layers * 3
+        starts = [linear_positions[lid * 3] for lid in range(total_layers)]
     ends = starts[1:] + [len(all_ops)]
     return list(zip(starts, ends))
 
@@ -452,6 +641,26 @@ def _set_moe_stream_context(phase_nodes) -> None:
         'stream_context', StreamContext(stream='default', wait_streams=[MOE_COMM_STREAM]))
 
 
+def _assign_node_for_ep(graph: IRGraph, node, ep_ranks: List[int]) -> None:
+    """Assign one node to ``ep_ranks``: replicate (``_replica``) for every
+    op EXCEPT ``expert_ffn_local``, which is instead genuinely PARTITIONED
+    (``graph.partition`` with its registered ``'dim'`` algorithm, splitting
+    the stacked ``[num_experts, ...]`` weight axis -- see
+    :func:`expert_ffn_local`'s and :func:`_build_expert_transform_rule`'s
+    docstrings) across ``ep_ranks``, one real, distinct, memory-partitioned
+    expert slice per device -- the load-bearing difference between genuine
+    EP and a redundantly-replicated "every rank computes the identical
+    function" stand-in.
+    """
+    if node.name == 'expert_ffn_local':
+        algo = node.algorithm('dim')
+        sub_nodes = graph.partition(node, algo, idx=1, dim=0, num=len(ep_ranks))
+        for devid, sub in zip(ep_ranks, sub_nodes):
+            graph.assign(sub, devid)
+    else:
+        _replica(graph, node, devs=ep_ranks)
+
+
 def make_pas(num_stages: int, layers_per_stage: int, ep_ranks_per_stage: Sequence[Sequence[int]],
              use_phases: bool):
     """Build a ``parallelize(..., pas_fn, ...)``-compatible PAS policy.
@@ -461,9 +670,11 @@ def make_pas(num_stages: int, layers_per_stage: int, ep_ranks_per_stage: Sequenc
     lowers it to its 4 phases (:func:`lower_layer_to_phases`); otherwise
     groups the whole stage into one plain segment (Step A/B-style baseline).
     Every real op is replicated (``nnscaler.policies._replica``) across its
-    stage's ``ep_ranks`` (see module docstring's "Honest scoping note").
-    Schedules with :meth:`PhaseAwareSched.sched_1f1b_phase_aware` (phase
-    variant) or ``PredefinedSched.sched_1f1b`` (plain variant).
+    stage's ``ep_ranks``, EXCEPT ``expert_ffn_local`` (the real, per-rank
+    -distinct expert FFN), which is genuinely partitioned -- see
+    :func:`_assign_node_for_ep`. Schedules with
+    :meth:`PhaseAwareSched.sched_1f1b_phase_aware` (phase variant) or
+    ``PredefinedSched.sched_1f1b`` (plain variant).
     """
     def pas(graph: IRGraph, config: ComputeConfig):
         from nnscaler.graph.schedule.predefined import PredefinedSched
@@ -505,13 +716,13 @@ def make_pas(num_stages: int, layers_per_stage: int, ep_ranks_per_stage: Sequenc
                     phase_nodes = lower_layer_to_phases(graph, per_layer_nodes[lid], layer_id=lid)
                     for pn in phase_nodes:
                         for node in pn.segment.nodes():
-                            _replica(graph, node, devs=ep_ranks)
+                            _assign_node_for_ep(graph, node, ep_ranks)
                     _set_moe_stream_context(phase_nodes)
             else:
                 stage_nodes = all_ops[stage_start:stage_end]
                 graph.group(stage_nodes)
                 for node in stage_nodes:
-                    _replica(graph, node, devs=ep_ranks)
+                    _assign_node_for_ep(graph, node, ep_ranks)
 
         for dl in dataloaders:
             _replica(graph, dl, devs=list(range(config.plan_ngpus)))

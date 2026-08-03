@@ -438,6 +438,68 @@ def get_phase(node) -> Optional[PhaseNode]:
     return ctx_get(OP_CONTEXT_KEY)
 
 
+@dataclass(frozen=True)
+class PhaseExecutionIdentity:
+    """The full identity of one *concrete, scheduled execution instance* of
+    a phase -- i.e. :class:`PhaseIdentity` (static: layer/phase-type
+    /direction/seq, the same for every microbatch and every run of the
+    schedule) PLUS the two runtime/schedule-time coordinates that make one
+    execution instance concretely distinct from another: which microbatch,
+    and which physical stage (device group) it executes on.
+
+    ``PhaseIdentity`` itself deliberately stays static/microbatch
+    -independent (see its own docstring) -- microbatch and physical-stage
+    identity already exist on :class:`~nnscaler.graph.schedule.schedplan.Block`
+    (``.mid``, ``.device``) but, before this dataclass, were never bundled
+    together with a phase's own static identity into one explicit, directly
+    -constructible, directly-comparable object; call sites had to
+    separately track a block's ``.mid``/``.device`` alongside its
+    ``PhaseNode`` via implicit local variables/tuples. This makes that
+    bundling explicit and gives it a name.
+
+    Every concrete phase execution instance placed anywhere in a schedule's
+    table must have a UNIQUE ``PhaseExecutionIdentity`` -- see
+    :func:`phase_execution_identity` (the standard constructor from a
+    ``(Block, PhaseNode)`` pair) and
+    ``tests/graph/schedule/test_phase_schedule_sweep.py``'s
+    ``test_phase_execution_identity_is_globally_unique`` for the property
+    test proving this holds across an entire real, multi-stage,
+    multi-microbatch schedule table.
+    """
+    microbatch: int
+    physical_stage: Tuple[int, ...]
+    layer_id: int
+    phase_type: PhaseType
+    direction: str
+    seq_in_layer: int
+
+    @classmethod
+    def from_identity(cls, identity: PhaseIdentity, microbatch: int,
+                       physical_stage: Tuple[int, ...]) -> 'PhaseExecutionIdentity':
+        return cls(microbatch, tuple(physical_stage), identity.layer_id,
+                    identity.phase_type, identity.direction, identity.seq_in_layer)
+
+    def __repr__(self):
+        arrow = 'fwd' if self.direction == 'forward' else 'bwd'
+        return (f"PhaseExec(mb{self.microbatch}@stage{self.physical_stage}:"
+                f"L{self.layer_id}.{self.phase_type.value}.{arrow}#{self.seq_in_layer})")
+
+
+def phase_execution_identity(block, phase_node: Optional[PhaseNode] = None) -> Optional[PhaseExecutionIdentity]:
+    """Construct a :class:`PhaseExecutionIdentity` for one scheduled
+    ``Block``, reading its phase's static identity from ``phase_node``
+    (defaults to ``get_phase(block.content)``, i.e. the block's own tagged
+    metadata) and its microbatch/physical-stage coordinates directly off
+    the block itself (``block.mid``/``block.device``). Returns ``None`` if
+    the block carries no :class:`PhaseNode` (a plain, non-phase node, e.g.
+    an untagged dataloader/reducer block)."""
+    if phase_node is None:
+        phase_node = get_phase(block.content)
+    if phase_node is None:
+        return None
+    return PhaseExecutionIdentity.from_identity(phase_node.identity, block.mid, tuple(block.device))
+
+
 def _tag(segment: IRSegment, identity: PhaseIdentity) -> None:
     segment.set_op_context(OP_CONTEXT_KEY, PhaseNode(identity, segment))
 
