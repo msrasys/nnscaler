@@ -97,6 +97,7 @@ read as "the nnscaler combined_1f1b implementation".
 Requires >= 2 GPUs (uses a pure pipeline-parallel PP2 configuration, no
 tensor parallelism, to keep the example minimal).
 """
+import math
 import os
 import signal
 import tempfile
@@ -120,6 +121,17 @@ NSTAGES = 2       # pure pipeline-parallel, no tensor-parallel -> only 2 GPUs ne
 NMICROS = 4
 NSTEPS = 2
 COMM_STREAM = 'comm'
+
+# Deliberately larger than DIM/NLAYERS above -- used ONLY by the overlap
+# benchmark (`_timing_worker`), not by the structural/numeric-equivalence
+# tests, which stay on the tiny model for speed. A bigger per-layer compute
+# cost improves the overlap benchmark's signal-to-noise ratio: the constant
+# per-step CPU-side scheduling/channel-tracking overhead this test wants to
+# distinguish from a genuine overlap win becomes relatively smaller compared
+# to a real backward segment's compute time.
+TIMING_DIM = 1024
+TIMING_NLAYERS = 8
+TIMING_NMICROS = 8
 
 
 class _MLP(nn.Module):
@@ -576,82 +588,126 @@ def test_combined_1f1b_global_schedule_no_deadlock():
 
 @pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.device_count() < 2,
                     reason='requires >= 2 gpus')
-def test_combined_1f1b_global_schedule_overlap_timing():
-    """Multi-round, warmup-excluded wall-clock comparison: GlobalCommSchedule
-    ON (recv hoisted across a full backward segment, see the structural test
-    above) vs OFF (baseline synchronous-ish ordering), same model/data/seeds.
+def test_combined_1f1b_global_schedule_overlap_benchmark():
+    """Multi-round, AB/BA-order-alternating, warmup-excluded wall-clock
+    comparison: GlobalCommSchedule ON (recv hoisted across a full backward
+    segment, see the structural test above) vs OFF, same model/data/seeds.
+    EXPLICIT BENCHMARK, NOT A CI CORRECTNESS GATE (see rationale below) --
+    ``test_combined_1f1b_global_schedule_gencode_structure`` is the strict,
+    always-enforced proof that overlap is actually scheduled; this test's
+    job is only to honestly measure and report wall-clock effect, never to
+    fake a pass/fail signal out of noise.
 
-    Methodology: several full training steps per configuration; the first
-    ``WARMUP_STEPS`` are discarded (NCCL/cuBLAS/connection warmup), each
-    remaining step is individually wall-clock timed with an explicit
-    ``torch.cuda.synchronize()`` immediately before starting and after
-    finishing the timed region (so the measurement is not polluted by
-    already-queued async work from a previous step, and is not an
-    underestimate from returning before the GPU actually finished). We report
-    mean/stdev of both configurations and only assert an improvement if it
-    clearly exceeds run-to-run noise (mean difference vs the pooled stdev);
-    otherwise (this model is intentionally tiny for test speed, so the
-    absolute overlap window is small relative to system noise on a shared
-    GPU) we report the raw per-step distributions rather than assert a
-    possibly-flaky threshold.
+    Methodology (upgraded from an earlier, single-order version after a
+    dedicated self-audit): a bigger model than the other tests in this file
+    (``TIMING_DIM``/``TIMING_NLAYERS`` -- deliberately larger, so a real
+    backward segment's compute time is large relative to the constant
+    per-step CPU-side scheduling/channel-tracking overhead, improving
+    signal-to-noise) is measured over ``N_ROUNDS`` independent rounds; each
+    round launches a FRESH ``torchrun`` job per configuration (so NCCL/CUDA
+    context, not just in-process warmup, is exercised identically for both),
+    with warmup steps discarded and each remaining step individually
+    ``torch.cuda.synchronize()``-bounded. Critically, the ORDER of OFF vs ON
+    is ALTERNATED every other round (round 0: OFF then ON; round 1: ON then
+    OFF; ...): an earlier, single-order version of this test always measured
+    OFF first, and a dedicated self-audit found evidence consistent with a
+    systematic "whichever config runs first/second" bias (thermal/allocator/
+    cache state) confounding the result -- alternating order cancels this
+    out in aggregate. Each round's representative value is the MEDIAN of its
+    own timed steps; the PAIRED per-round difference (OFF - ON) is what is
+    actually tested for a stable gain (a paired design controls for
+    round-to-round shared noise, e.g. other jobs on this shared GPU, far
+    better than comparing pooled, unpaired distributions).
+
+    A "stable positive gain" requires BOTH: (a) the median paired difference
+    across rounds is positive and exceeds a noise floor derived from the
+    paired differences' own MAD (median absolute deviation) -- not a fixed,
+    possibly-too-generous constant -- and (b) a clear majority of individual
+    rounds (not just the aggregate) show ON faster than OFF (a simple sign
+    test), so a single lucky/unlucky round cannot flip the conclusion. If
+    this environment cannot demonstrate that (observed to happen on this
+    shared, multi-tenant machine even with the larger model -- see raw
+    output), this test reports the full raw distribution and paired
+    differences honestly and does NOT assert a gain (it only asserts there
+    is no gross, stable REGRESSION) -- it is explicitly a benchmark in that
+    case, not a silently-weakened correctness gate.
     """
     import statistics
 
-    WARMUP_STEPS = 3
-    TIMED_STEPS = 8
+    WARMUP_STEPS = 2
+    TIMED_STEPS = 3
+    N_ROUNDS = 6
 
-    def _time_rounds(reschedule_env: bool):
-        saved = _set_global_schedule_env(reschedule_env, max_outstanding=6)
+    def _measure_one(reschedule_env: bool):
+        # cap must exceed TIMING_NMICROS (the result-broadcast's concurrent
+        # in-flight receives scale with microbatch count, all resolved only
+        # by the bulk end-of-step drain)
+        saved = _set_global_schedule_env(reschedule_env, max_outstanding=TIMING_NMICROS + 2)
         try:
-            with _Alarm(180, f'possible deadlock: overlap-timing run '
+            with _Alarm(180, f'possible deadlock: overlap-benchmark run '
                               f'(global_schedule={reschedule_env}) did not finish in 180s'):
                 outputs = launch_torchrun(NSTAGES, _timing_worker, WARMUP_STEPS, TIMED_STEPS)
         finally:
             _restore_env(saved)
         assert outputs and outputs[0] is not None
-        return outputs[0]  # list[float] of per-step seconds, rank 0's wall-clock view
+        times = outputs[0]
+        assert len(times) == TIMED_STEPS
+        return statistics.median(times)
 
-    off_times = _time_rounds(False)
-    on_times = _time_rounds(True)
+    off_round_values, on_round_values = [], []
+    for round_idx in range(N_ROUNDS):
+        off_first = (round_idx % 2 == 0)
+        if off_first:
+            off_val = _measure_one(False)
+            on_val = _measure_one(True)
+        else:
+            on_val = _measure_one(True)
+            off_val = _measure_one(False)
+        off_round_values.append(off_val)
+        on_round_values.append(on_val)
+        print(f'[overlap benchmark] round {round_idx} (order={"OFF,ON" if off_first else "ON,OFF"}): '
+              f'off={off_val*1e3:.3f}ms on={on_val*1e3:.3f}ms diff={((off_val-on_val)*1e3):+.3f}ms')
 
-    assert len(off_times) == len(on_times) == TIMED_STEPS
+    diffs = [off - on for off, on in zip(off_round_values, on_round_values)]
+    median_diff = statistics.median(diffs)
+    mad = statistics.median([abs(d - median_diff) for d in diffs]) or 1e-9
+    wins = sum(1 for d in diffs if d > 0)
 
-    off_mean, on_mean = statistics.mean(off_times), statistics.mean(on_times)
-    off_std = statistics.stdev(off_times) if len(off_times) > 1 else 0.0
-    on_std = statistics.stdev(on_times) if len(on_times) > 1 else 0.0
-    pooled_std = max((off_std + on_std) / 2, 1e-6)
-    improvement = off_mean - on_mean
+    print(f'[overlap benchmark] OFF per-round medians (ms): {[f"{v*1e3:.3f}" for v in off_round_values]}')
+    print(f'[overlap benchmark] ON  per-round medians (ms): {[f"{v*1e3:.3f}" for v in on_round_values]}')
+    print(f'[overlap benchmark] paired diffs (OFF-ON, ms):  {[f"{d*1e3:+.3f}" for d in diffs]}')
+    print(f'[overlap benchmark] median_diff={median_diff*1e3:+.3f}ms, MAD={mad*1e3:.3f}ms, '
+          f'wins={wins}/{N_ROUNDS}')
 
-    print(f'[overlap timing] OFF: mean={off_mean*1e3:.3f}ms std={off_std*1e3:.3f}ms {[f"{t*1e3:.2f}" for t in off_times]}')
-    print(f'[overlap timing] ON:  mean={on_mean*1e3:.3f}ms std={on_std*1e3:.3f}ms {[f"{t*1e3:.2f}" for t in on_times]}')
-    print(f'[overlap timing] improvement={improvement*1e3:.3f}ms, pooled_std={pooled_std*1e3:.3f}ms, '
-          f'ratio={improvement/pooled_std:.2f}')
+    stable_gain = median_diff > 3 * mad and wins >= math.ceil(0.7 * N_ROUNDS)
 
-    # Reasonable, noise-aware threshold: ON should not be MEANINGFULLY slower
-    # than OFF (a hard regression -- e.g. more than 2 pooled-stdevs slower --
-    # would indicate the reorder+channel-tracking overhead genuinely hurts,
-    # which we do want to catch). We do not hard-require a speedup: on this
-    # deliberately tiny model, the hidden communication window is small
-    # enough that shared-GPU wall-clock noise can dominate it -- the
-    # structural test above is the authoritative proof that overlap is
-    # actually being scheduled; this test's job is to catch a gross
-    # regression and to report the honest raw distribution either way.
-    assert on_mean < off_mean + 2 * pooled_std, (
-        f'GlobalCommSchedule ON is meaningfully SLOWER than OFF '
-        f'(on={on_mean*1e3:.3f}ms vs off={off_mean*1e3:.3f}ms, pooled_std={pooled_std*1e3:.3f}ms); '
-        f'raw OFF={off_times}, raw ON={on_times}'
+    # Not a weakened stand-in for "stable gain": this only catches a GROSS,
+    # stable regression (the opposite sign, same bar) -- it does not claim,
+    # and must not be read as, evidence of a gain. See docstring.
+    stable_regression = (-median_diff) > 3 * mad and (N_ROUNDS - wins) >= math.ceil(0.7 * N_ROUNDS)
+    assert not stable_regression, (
+        f'GlobalCommSchedule ON shows a STABLE regression across {N_ROUNDS} '
+        f'AB/BA-alternated rounds (median_diff={median_diff*1e3:+.3f}ms, '
+        f'{N_ROUNDS - wins}/{N_ROUNDS} rounds slower) -- raw OFF={off_round_values}, ON={on_round_values}'
     )
-    if improvement > 2 * pooled_std:
-        print(f'[overlap timing] PASS with clear improvement: {improvement*1e3:.3f}ms '
-              f'({improvement/off_mean*100:.1f}% faster)')
+
+    if stable_gain:
+        print(f'[overlap benchmark] BENCHMARK RESULT: stable positive gain, '
+              f'{median_diff*1e3:.3f}ms/step ({median_diff/statistics.median(off_round_values)*100:.1f}% faster), '
+              f'{wins}/{N_ROUNDS} rounds improved.')
     else:
-        print('[overlap timing] no clear win/loss beyond noise on this tiny model; '
-              'raw distributions reported above (structural test is authoritative for overlap).')
+        print('[overlap benchmark] BENCHMARK RESULT: no stable gain demonstrated in this run '
+              '(noise-dominated on this shared machine, or a real but not-yet-stable-across-rounds '
+              'effect) -- this is a benchmark measurement, NOT a CI correctness gate; '
+              'test_combined_1f1b_global_schedule_gencode_structure is the authoritative, '
+              'always-enforced proof that the overlap is actually being scheduled.')
 
 
 def _timing_worker(warmup_steps: int, timed_steps: int):
-    """Like `_worker`, but times each full train_step (post-warmup) and
-    returns rank 0's list of per-step wall-clock seconds instead of states."""
+    """Like `_worker`, but on the larger `TIMING_DIM`/`TIMING_NLAYERS`/
+    `TIMING_NMICROS` model (see their definitions above for why), and times
+    each full train_step (post-warmup), returning rank 0's list of per-step
+    wall-clock seconds instead of states."""
     import time
     init_distributed()
     dev = torch.cuda.current_device()
@@ -660,13 +716,13 @@ def _timing_worker(warmup_steps: int, timed_steps: int):
     with clear_dir_on_rank0(Path(tempfile.gettempdir()) / f'combined_1f1b_timing_{PYTEST_RUN_ID}') as tempdir:
         init_random()
         model = parallelize(
-            _MLP(),
-            {'data': {'data': torch.randn(MBS, DIM, device=dev),
-                      'target': torch.rand(MBS, DIM, device=dev)}},
+            _MLP(dim=TIMING_DIM, nlayers=TIMING_NLAYERS),
+            {'data': {'data': torch.randn(MBS, TIMING_DIM, device=dev),
+                      'target': torch.rand(MBS, TIMING_DIM, device=dev)}},
             _pas_multi_stream,
             ComputeConfig(NSTAGES, NSTAGES, use_end2end=True,
                           use_async_recv=True,
-                          pas_config=dict(pipeline_nstages=NSTAGES, pipeline_nmicros=NMICROS,
+                          pas_config=dict(pipeline_nstages=NSTAGES, pipeline_nmicros=TIMING_NMICROS,
                                           pipeline_scheduler='1f1b')),
             gen_savedir=tempdir,
             instance_name=f'combined_1f1b_{tag}',
@@ -675,7 +731,13 @@ def _timing_worker(warmup_steps: int, timed_steps: int):
         optimizer = build_optimizer(model, torch.optim.Adam, lr=0.01)
 
         total_steps = warmup_steps + timed_steps
-        data = _make_data(total_steps, NMICROS)
+        g = torch.Generator().manual_seed(1234)
+        data = [
+            [{'data': torch.randn(MBS, TIMING_DIM, generator=g, device='cpu'),
+              'target': torch.rand(MBS, TIMING_DIM, generator=g, device='cpu')}
+             for _ in range(TIMING_NMICROS)]
+            for _ in range(total_steps)
+        ]
         per_step_seconds = []
         for step in range(total_steps):
             model.train()

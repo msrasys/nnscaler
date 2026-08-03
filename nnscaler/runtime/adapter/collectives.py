@@ -26,15 +26,32 @@ def move(tensor: Optional[torch.Tensor], shape: Tuple[int], dtype: torch.dtype, 
 
     Args:
         channel: optional stable, hashable identity for this P2P callsite
-            (e.g. an adapter's IR cell id), used only when ``async_op`` is
-            True. When given, the issue is additionally tracked via
-            `nnscaler.runtime.executor.AsyncCommHandler`'s channel/sequence
-            bookkeeping (see ``issue_recv``/``issue_send``) on top of the
-            plain tensor-keyed path, bounding the outstanding (issued-but-
-            unwaited) op count per channel to ``max_outstanding``. Default
-            None preserves the exact prior (untracked) behavior.
+            (e.g. an adapter's IR cell id). Only meaningful on the
+            *receiving* side, when ``async_op`` is True: the issue is then
+            additionally tracked via
+            `nnscaler.runtime.executor.AsyncCommHandler.issue_recv`'s
+            channel/sequence bookkeeping on top of the plain tensor-keyed
+            path, bounding the outstanding (issued-but-unwaited) op count per
+            channel to ``max_outstanding``. Default None preserves the exact
+            prior (untracked) behavior. Ignored on the sending side (there is
+            no channel-tracked async send -- see
+            ``AsyncCommHandler``'s module docstring for why).
         max_outstanding: required (must be >= 1) when ``channel`` is given;
             ignored otherwise.
+
+    Always issued on the default (world) process group, regardless of
+    ``CompileFlag.enable_global_p2p_reschedule``. A dedicated per-``(src,
+    dst)``-pair process group was investigated (mirroring the pattern every
+    *other* collective in this module already uses via
+    ``DeviceGroup().get_group(ranks)``) as a fix for a confirmed real-4-GPU
+    deadlock when 2+ independent peer-pairs are rescheduled independently,
+    but did NOT resolve it even when properly, synchronously established
+    across all ranks -- see ``nnscaler.execplan.planpass.global_schedule``'s
+    module docstring for the full investigation. The actual fix is on the
+    scheduling side: ``GlobalCommSchedule`` never lets 2+ distinct peer-pairs
+    reorder independently in the first place (see that module's
+    ``single_chain_channel_key`` fail-closed degradation), which is why the
+    default process group remains safe to use unconditionally here.
     """
     if not async_op:
         CudaTimer().start(field_name='comm', predefined=True)
@@ -47,10 +64,7 @@ def move(tensor: Optional[torch.Tensor], shape: Tuple[int], dtype: torch.dtype, 
             work = torch.distributed.isend(tensor, dst)
             # NOTE: we need to hold the work to AsyncCommHandler,
             # otherwise the tensor can be freed before the communication starts.
-            if channel is not None:
-                AsyncCommHandler().issue_send(channel, tensor, work, max_outstanding)
-            else:
-                AsyncCommHandler().hold_send(tensor, work)
+            AsyncCommHandler().hold_send(tensor, work)
         else:
             torch.distributed.send(tensor, dst)
     else:

@@ -79,11 +79,11 @@ class CompileFlag:
     # irecv early"). Opt-in and independent of `ASYNC_COMM`. Default off.
     async_recv = _to_bool('ASYNC_RECV')
 
-    # make async-recv (and, best-effort, async-send) go through explicit,
-    # channel/sequence-tracked issue/wait bookkeeping (see
-    # `nnscaler.runtime.executor._AsyncCommHandler.issue_recv/issue_send`)
-    # instead of the plain tensor-keyed dict. A "channel" is the stable
-    # per-callsite identity of a P2P adapter (its IR cell id, shared by the
+    # make async-recv go through explicit, channel/sequence-tracked
+    # issue/wait bookkeeping (see
+    # `nnscaler.runtime.executor._AsyncCommHandler.issue_recv`) instead of
+    # the plain tensor-keyed dict. A "channel" is the stable per-callsite
+    # identity of a P2P adapter (its IR cell id, shared by the
     # send-side and recv-side dispatch of the same logical move); every issue
     # on a channel gets a monotonically increasing sequence number that its
     # matching wait must consume in FIFO order, and the number of outstanding
@@ -92,6 +92,11 @@ class CompileFlag:
     # layer: it does not change *which* adapters are async, only how their
     # in-flight state is tracked and validated. Opt-in; requires `async_recv`.
     # Default off (no behavior change to the existing tensor-keyed path).
+    # (Only the receive side: an earlier attempt to also channel-track async
+    # sends turned out to be structurally unreachable from codegen -- the
+    # only path that would ever emit one, `CompileFlag.async_comm`, is
+    # unconditionally rejected by `GlobalCommSchedule` -- so it was removed
+    # rather than kept as untested, misleadingly-named dead code.)
     async_recv_channel = _to_bool('ASYNC_RECV_CHANNEL')
     # maximum number of outstanding (issued-but-not-waited) async P2P ops
     # allowed per channel when `async_recv_channel` is enabled. Exceeding this

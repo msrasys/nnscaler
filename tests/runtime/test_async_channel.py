@@ -2,11 +2,16 @@
 #  Licensed under the MIT License.
 
 """CPU-only unit tests for the channel/sequence/lifecycle-tracked async P2P
-bookkeeping added to ``_AsyncCommHandler`` (``issue_recv`` / ``issue_send``,
-and the transparently channel-aware ``wait``). See
-``CompileFlag.async_recv_channel`` / ``async_recv_max_outstanding`` and
-``nnscaler.execplan.planpass.global_schedule`` for how these are driven by
-real compiled code.
+receive bookkeeping added to ``_AsyncCommHandler`` (``issue_recv``, and the
+transparently channel-aware ``wait``), plus its exception-safety cleanup
+(``force_clear_after_exception``). See ``CompileFlag.async_recv_channel`` /
+``async_recv_max_outstanding`` and ``nnscaler.execplan.planpass.global_schedule``
+for how these are driven by real compiled code. There is no channel-tracked
+``issue_send``: an earlier attempt at one turned out to be structurally
+unreachable from codegen (the only path that would emit one,
+``CompileFlag.async_comm``, is unconditionally rejected by
+``GlobalCommSchedule``), so it was removed rather than kept as untested,
+misleadingly-named dead code.
 
 Style follows ``tests/codegen/test_reschedule.py::test_async_comm_handler_drain``:
 a minimal fake ``Work`` (records whether ``.wait()`` was called) and explicit
@@ -92,7 +97,7 @@ def test_illegal_max_outstanding_config_raises():
     with pytest.raises(AsyncCommError, match='max_outstanding'):
         handler.issue_recv('chanC', torch.zeros(2), [_Work()], max_outstanding=0)
     with pytest.raises(AsyncCommError, match='max_outstanding'):
-        handler.issue_send('chanC', torch.zeros(2), _Work(), max_outstanding=-1)
+        handler.issue_recv('chanC', torch.zeros(2), [_Work()], max_outstanding=-1)
     _reset(handler)
 
 
@@ -120,44 +125,39 @@ def test_wait_sequence_mismatch_raises():
     handler.issue_recv('chanE', t2, [_Work()], max_outstanding=2)
     with pytest.raises(AsyncCommError, match='sequence mismatch'):
         handler._resolve_channel_strict(t2)
-    # clean up manually: the strict resolver already popped t2 from
-    # _tensor_channel before raising (see its docstring), so only chanE's
-    # deque and t1's bookkeeping remain to clear
-    handler._channel_pending['chanE'].clear()
-    handler._tensor_channel.pop(t1, None)
-    handler._works.pop(t1, None)
-    handler._callbacks.pop(t1, None)
-    handler._works.pop(t2, None)
-    handler._callbacks.pop(t2, None)
-    _reset(handler)
-
-
-def test_issue_send_and_drain_sends_releases_channel():
-    handler = AsyncCommHandler()
-    _reset(handler)
-    t, w = torch.zeros(2), _Work()
-    handler.issue_send('chanF', t, w, max_outstanding=1)
-    assert len(handler._channel_pending['chanF']) == 1
-    handler.drain_sends()
-    assert w.waited
-    assert len(handler._channel_pending['chanF']) == 0
-    assert t not in handler._tensor_channel
+    # atomic on failure: `_resolve_channel_strict` must not have mutated
+    # ANY state before raising -- both t1 and t2 remain exactly as they
+    # were (still outstanding, still FIFO-ordered), unlike the pre-fix
+    # behavior which popped t2 from `_tensor_channel` before validating.
+    assert t1 in handler._tensor_channel and t2 in handler._tensor_channel
+    assert len(handler._channel_pending['chanE']) == 2
+    # resolving in the correct (FIFO) order now succeeds cleanly
+    handler.wait(t1)
+    handler.wait(t2)
     handler.check_clear()
     _reset(handler)
 
 
-def test_drain_sends_completed_releases_channel_for_completed_only():
+def test_drain_sends_and_drain_sends_completed_wait_held_sends():
+    """`drain_sends()` (unconditional) and `drain_sends_completed()`
+    (only already-finished ones) must still work correctly for plain
+    (non-channel-tracked) held sends -- regression guard: these two methods'
+    channel-release calls were removed when channel-tracked sends
+    (`issue_send`) were removed as structurally unreachable dead code (see
+    module docstring), so this specifically re-covers their core, still-live
+    plain-send behavior."""
     handler = AsyncCommHandler()
     _reset(handler)
     t1, w1 = torch.zeros(2), _Work()
     t2, w2 = torch.zeros(2), _Work()
-    handler.issue_send('chanG', t1, w1, max_outstanding=2)
-    handler.issue_send('chanG', t2, w2, max_outstanding=2)
+    handler.hold_send(t1, w1)
+    handler.hold_send(t2, w2)
     w1.waited = True  # simulate w1's transport op having completed already
     handler.drain_sends_completed()
-    assert t1 not in handler._tensor_channel
-    assert t2 in handler._tensor_channel  # not completed yet, still tracked
-    handler.drain_sends()  # cleanup
+    assert w1.waited and len(handler._send_holds) == 1
+    handler.drain_sends()
+    assert w2.waited and len(handler._send_holds) == 0
+    handler.check_clear()
     _reset(handler)
 
 
@@ -197,3 +197,80 @@ def test_check_clear_detects_leaked_channel_state():
     with pytest.raises(AssertionError, match='channel state not cleared'):
         handler.check_clear()
     _reset(handler)
+
+
+def test_force_clear_after_exception_clears_all_state_without_waiting():
+    """`force_clear_after_exception` must wipe ALL bookkeeping (tensor-keyed
+    AND channel-tracked) so a subsequent, unrelated step does not inherit
+    stale state -- and must NOT call `.wait()` on any outstanding work (the
+    communicator may be broken after the crash that triggered this)."""
+    handler = AsyncCommHandler()
+    _reset(handler)
+
+    t_plain, w_plain = torch.zeros(2), _Work()
+    handler.submit(t_plain, [w_plain])
+    t_send, w_send = torch.zeros(2), _Work()
+    handler.hold_send(t_send, w_send)
+    t_chan, w_chan = torch.zeros(2), _Work()
+    handler.issue_recv('chanK', t_chan, [w_chan], max_outstanding=1)
+
+    handler.force_clear_after_exception()
+
+    assert not w_plain.waited and not w_send.waited and not w_chan.waited, \
+        'force_clear_after_exception must not wait on any outstanding work'
+    handler.check_clear()  # fully clean, no assertion error
+    _reset(handler)
+
+
+def test_force_clear_after_exception_never_raises():
+    """Even if internal state is bizarrely inconsistent, this method must
+    never itself raise (it is meant to be called from an except-block that
+    is about to re-raise a real exception; it must not mask it)."""
+    handler = AsyncCommHandler()
+    _reset(handler)
+    handler._works = None  # deliberately corrupt internal state
+    try:
+        handler.force_clear_after_exception()  # must not raise
+    finally:
+        handler._works = {}
+    _reset(handler)
+
+
+def test_run_step_with_exception_safety_reraises_original_and_clears_state():
+    """`RuntimeModule._run_step_with_exception_safety` must re-raise the
+    ORIGINAL exception unmodified, after force-clearing any AsyncCommHandler
+    state the aborted step left outstanding -- so a subsequent, healthy step
+    reusing the same channel does not spuriously fail with a misattributed
+    cap/FIFO error (see the docstring / module.py wiring)."""
+    from nnscaler.flags import CompileFlag
+    from nnscaler.runtime.module import ParallelModule
+
+    handler = AsyncCommHandler()
+    _reset(handler)
+    saved_async_recv = CompileFlag.async_recv
+    CompileFlag.async_recv = True
+    try:
+        t, w = torch.zeros(2), _Work()
+        def _crashing_step():
+            handler.issue_recv('chanCrash', t, [w], max_outstanding=1)
+            raise ValueError('simulated mid-step failure')
+
+        # bind the method to a bare instance without running __init__
+        # (only the plain, non-generated-code method under test is needed)
+        module = ParallelModule.__new__(ParallelModule)
+        with pytest.raises(ValueError, match='simulated mid-step failure'):
+            module._run_step_with_exception_safety(_crashing_step)
+
+        # the ORIGINAL exception propagated (not e.g. an AsyncCommError from
+        # leftover state), and the handler is now fully clean
+        handler.check_clear()
+
+        # a subsequent, unrelated issue on the SAME channel must succeed
+        # (not spuriously hit a stale outstanding-cap/FIFO error)
+        t2, w2 = torch.zeros(2), _Work()
+        handler.issue_recv('chanCrash', t2, [w2], max_outstanding=1)
+        handler.wait(t2)
+        handler.check_clear()
+    finally:
+        CompileFlag.async_recv = saved_async_recv
+        _reset(handler)

@@ -25,7 +25,7 @@ from nnscaler.graph.parser import FxModuleParser
 from nnscaler.runtime.device import DeviceGroup
 from nnscaler.runtime.dtensor import DTensor
 from nnscaler.runtime.adapter.reducer import Reducer
-from nnscaler.runtime.executor import Executor
+from nnscaler.runtime.executor import Executor, AsyncCommHandler
 from nnscaler.runtime.gnorm import ParamsInfo
 from nnscaler.runtime.utils import microbatches, set_dparam_meta, get_dparam_meta
 from nnscaler.runtime.function import insert_backward_hook
@@ -1475,6 +1475,30 @@ class ParallelModule(CubeModule):
 
         Executor.register_backward_pre_hook(cube_scale)
 
+    def _run_step_with_exception_safety(self, step_fn: Callable[[], Any]) -> Any:
+        """Call ``step_fn()`` (a generated ``_train_step``/``_infer_step``
+        invocation); on ANY exception, force-clear any ``AsyncCommHandler``
+        bookkeeping the aborted step may have left outstanding (see
+        ``AsyncCommHandler.force_clear_after_exception``) before re-raising
+        the ORIGINAL exception completely unmodified.
+
+        Without this, a step that raises partway through -- e.g. between an
+        async-recv's issue and its deferred wait -- leaves that (process-wide
+        singleton) handler's channel/tensor bookkeeping outstanding; since
+        nothing else resets it between steps, a SUBSEQUENT, otherwise-healthy
+        step's legitimate ``issue_recv`` calls on the same
+        channel could then spuriously fail with a confusing, misattributed
+        outstanding-cap or FIFO-mismatch error instead of the real step ever
+        surfacing its own root cause. Only meaningful when async-recv is
+        enabled; a cheap no-op flag check otherwise.
+        """
+        try:
+            return step_fn()
+        except BaseException:
+            if CompileFlag.async_recv:
+                AsyncCommHandler().force_clear_after_exception()
+            raise
+
     def train_step(self,
         samples: List[Any],
         is_dummy_batch: Optional[List[bool]] = None,
@@ -1516,12 +1540,12 @@ class ParallelModule(CubeModule):
                 raise ValueError(f"Expected {self.nmicros_per_scheduler_step} samples, but got {sample_count}")
             # only one step, so begin/end are both True
             with accum_mode(begin=True, end=True):
-                return self._train_step(dataloader)
+                return self._run_step_with_exception_safety(lambda: self._train_step(dataloader))
         else:
             outputs = []
             for idx in range(sample_count):
                 with accum_mode(begin=(idx==0), end=(idx==sample_count-1)):
-                    output = self._train_step(dataloader)
+                    output = self._run_step_with_exception_safety(lambda: self._train_step(dataloader))
                 outputs.append(output)
             return outputs
 
@@ -1546,11 +1570,11 @@ class ParallelModule(CubeModule):
         if self.use_scheduler:
             if len(samples) != self.nmicros_per_scheduler_step:
                 raise ValueError(f"Expected {self.nmicros_per_scheduler_step} samples, but got {sample_count}")
-            return self._infer_step(dataloader)
+            return self._run_step_with_exception_safety(lambda: self._infer_step(dataloader))
         else:
             outputs = []
             for _ in range(sample_count):
-                output = self._infer_step(dataloader)
+                output = self._run_step_with_exception_safety(lambda: self._infer_step(dataloader))
                 outputs.append(output)
             return outputs
 

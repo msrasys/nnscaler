@@ -25,8 +25,11 @@ from nnscaler.execplan.planpass.global_schedule import (
     peer_pair_channel_key,
     cid_channel_key,
     unsafe_direction_split_channel_key,
+    single_chain_channel_key,
     p2p_peer_pair,
     device_of,
+    _distinct_peer_pairs,
+    _check_group_isolation,
 )
 
 
@@ -315,3 +318,168 @@ def test_global_schedule_projection_is_consistent_subsequence():
     after = {devid: list(execplan.at(devid)) for devid in execplan.devices()}
     for devid in before:
         assert set(id(n) for n in before[devid]) == set(id(n) for n in after[devid])
+
+
+# ---------------------------------------------------------------------------
+# Cross-peer-pair group-isolation invariant (post-self-audit fix): the
+# CONFIRMED-ON-REAL-4-GPU deadlock (independent peer-pairs sharing the
+# default process group) must be caught/prevented, not merely documented.
+# ---------------------------------------------------------------------------
+
+def test_distinct_peer_pairs_collects_sorted_deduplicated_set():
+    send01, recv01 = _make_p2p_pair((4, 4), src=0, dst=1)
+    send12, recv12 = _make_p2p_pair((4, 4), src=1, dst=2)
+    send01_b, recv01_b = _make_p2p_pair((1,), src=0, dst=1)  # a 2nd channel, same pair
+    assert _distinct_peer_pairs([send01, recv01, send12, recv12, send01_b, recv01_b]) == [(0, 1), (1, 2)]
+
+
+def test_distinct_peer_pairs_empty_or_single_pair():
+    assert _distinct_peer_pairs([]) == []
+    send01, recv01 = _make_p2p_pair((4, 4), src=0, dst=1)
+    assert _distinct_peer_pairs([send01, recv01]) == [(0, 1)]
+
+
+def test_check_group_isolation_safe_with_0_or_1_pairs_regardless_of_key():
+    assert _check_group_isolation([], peer_pair_channel_key) == []
+    assert _check_group_isolation([(0, 1)], peer_pair_channel_key) == []
+
+
+def test_check_group_isolation_safe_with_single_chain_key_regardless_of_pair_count():
+    assert _check_group_isolation([(0, 1), (1, 2), (2, 3)], single_chain_channel_key) == []
+
+
+def test_check_group_isolation_flags_2plus_pairs_with_non_single_chain_key():
+    """The exact precondition the real-4-GPU deadlock violated: 2+ distinct
+    peer-pairs with a channel_key that lets them reorder independently --
+    confirmed unsafe (dedicated per-pair process groups were investigated as
+    a fix and did NOT resolve it either -- see module docstring) -- must
+    always be flagged, unconditionally, not silently accepted."""
+    errors = _check_group_isolation([(0, 1), (1, 2)], peer_pair_channel_key)
+    assert len(errors) == 1
+    assert 'peer_pair_channel_key' in errors[0] and 'deadlock' in errors[0]
+
+
+def test_schedule_report_is_safe_reflects_group_isolation_errors():
+    from nnscaler.execplan.planpass.global_schedule import ScheduleViolation
+    assert not ScheduleReport(group_isolation_errors=['some problem']).is_safe
+    assert ScheduleReport().is_safe
+
+
+def test_apply_rejects_async_recv_channel_without_async_recv():
+    """ENABLE ASYNC_RECV_CHANNEL without ASYNC_RECV would silently reschedule
+    /cap-track receives that are never actually issued asynchronously, for
+    zero real benefit -- must be rejected rather than silently ineffective."""
+    from nnscaler.flags import CompileFlag
+    saved = (CompileFlag.async_recv, CompileFlag.async_recv_channel)
+    try:
+        CompileFlag.async_recv = False
+        CompileFlag.async_recv_channel = True
+        with pytest.raises(GlobalScheduleError, match='async_recv_channel'):
+            GlobalCommSchedule.apply(_FakeExecPlan(), max_outstanding=2)
+    finally:
+        CompileFlag.async_recv, CompileFlag.async_recv_channel = saved
+
+
+def test_apply_fail_closed_degrades_to_single_chain_on_real_3plus_stage_plan(caplog):
+    """The actual scenario that deadlocked on real 4-GPU hardware pre-fix:
+    3+ pipeline stages -> 2+ independent peer-pairs. ``apply`` must NOT keep
+    the (confirmed cross-peer-pair-unsafe) ``peer_pair_channel_key`` default;
+    it must UNCONDITIONALLY fail-closed degrade to ``single_chain_channel_key``
+    and log why (dedicated per-pair process groups were tried as a fix and
+    did NOT resolve the deadlock either -- see module docstring -- so there
+    is no known-safe way to avoid this degradation), and the resulting
+    schedule must still be produced (no crash) and pass ``validate`` (the
+    group-isolation check must also see the ACTUALLY-used, safe channel_key)."""
+    import logging
+    execplan = _build_pipeline_execplan(nstages=4, nlayers=8, nmicros=3)
+    assert len(execplan.devices()) == 4
+
+    with caplog.at_level(logging.INFO, logger='nnscaler.execplan.planpass.global_schedule'):
+        GlobalCommSchedule.apply(execplan, max_outstanding=6)
+    assert any('fail-closed degrading' in rec.message for rec in caplog.records), (
+        f'expected a fail-closed-degradation log; got: {[r.message for r in caplog.records]}'
+    )
+
+    # defensively re-validate as if a caller had used the (real, confirmed
+    # unsafe) default directly, standalone -- this is exactly what the
+    # deadlock-prone configuration looked like pre-fix, and must now be
+    # flagged by validate() too (the second, independent line of defense)
+    unsafe_report = GlobalCommSchedule.validate(
+        execplan, max_outstanding=6, comm_channel_key=peer_pair_channel_key)
+    assert not unsafe_report.is_safe
+    assert any('deadlock' in e for e in unsafe_report.group_isolation_errors)
+
+    # ... but validating with the channel_key `apply` ACTUALLY used
+    # (single_chain_channel_key, the unconditional fallback) is safe,
+    # confirming the fallback genuinely eliminates the hazard
+    safe_report = GlobalCommSchedule.validate(
+        execplan, max_outstanding=6, comm_channel_key=single_chain_channel_key)
+    assert safe_report.is_safe
+
+
+# ---------------------------------------------------------------------------
+# Collective (non-P2P) relative order preservation, across ranks, with 2+
+# peer-pairs present (item 7 of the fix-round self-audit remediation): the
+# single_chain_channel_key fallback must not just be "safe" for P2P, it must
+# also not silently reorder collectives relative to each other or to P2P on
+# a shared device.
+# ---------------------------------------------------------------------------
+
+def _make_collective(devid, shape=(4, 4)):
+    """A synthetic non-P2P ('collective-like') adapter: no MovePrim, so
+    `p2p_peer_pair` correctly returns None for it (see `peer_pair_channel_key`
+    / `single_chain_channel_key`'s 'non-p2p' fallback)."""
+    t = _sub(shape, requires_grad=False)
+    node = IRAdapter([], [t])
+    node.device = [devid]
+    node.prims = []
+    return node
+
+
+def test_single_chain_fallback_preserves_per_device_collective_and_p2p_order():
+    """Build a 2-device plan with 2 independent peer-pairs -- (0,1) and
+    (1,2), so device 1 participates in both, exactly the multi-peer-pair
+    shape that deadlocked pre-fix -- PLUS 2 collectives per device
+    interleaved with the P2P traffic. After `GlobalCommSchedule.apply`
+    (which must fail-closed degrade here, len(pairs) == 2), every device's
+    ORIGINAL relative order among its own comm nodes (collectives AND P2P
+    together) must be exactly preserved -- not merely "some safe order":
+    `single_chain_channel_key` groups ALL of a device's comm nodes into one
+    chain, and chaining preserves whichever order they were given in
+    (mirroring the pre-existing, already-validated ``Reschedule`` baseline)."""
+    send01, recv01 = _make_p2p_pair((4, 4), src=0, dst=1)
+    send12, recv12 = _make_p2p_pair((4, 4), src=1, dst=2)
+    coll0_a, coll0_b = _make_collective(0), _make_collective(0)
+    coll1_a, coll1_b = _make_collective(1), _make_collective(1)
+    coll2_a, coll2_b = _make_collective(2), _make_collective(2)
+
+    # deliberately interleaved original per-device order:
+    dev0_nodes = [coll0_a, send01, coll0_b]
+    dev1_nodes = [recv01, coll1_a, send12, coll1_b]
+    dev2_nodes = [coll2_a, recv12, coll2_b]
+
+    class _FakeExecPlanMulti:
+        def __init__(self, per_dev):
+            self._per_dev = per_dev
+        def devices(self):
+            return list(self._per_dev.keys())
+        def at(self, devid):
+            return self._per_dev[devid]
+
+    execplan = _FakeExecPlanMulti({0: dev0_nodes, 1: dev1_nodes, 2: dev2_nodes})
+    before = {d: list(seq) for d, seq in execplan._per_dev.items()}
+
+    GlobalCommSchedule.apply(execplan, max_outstanding=4)
+
+    for devid, orig in before.items():
+        after = execplan.at(devid)
+        # same multiset (projection property)
+        assert set(id(n) for n in orig) == set(id(n) for n in after)
+        # AND the relative order among comm nodes on this device (all of
+        # them: collectives interleaved with P2P) is exactly preserved --
+        # this is what single_chain_channel_key's one-big-chain guarantees
+        assert after == orig, (
+            f'device {devid}: single_chain_channel_key fallback must preserve '
+            f'the original relative order of collectives and P2P; '
+            f'before={[repr(n) for n in orig]} after={[repr(n) for n in after]}'
+        )

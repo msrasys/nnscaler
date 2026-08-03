@@ -92,22 +92,75 @@ resolves. Consequently:
   concurrently outstanding with anything else on it. This is more
   conservative than the (deadlocking) direction-split alternative -- see
   :func:`unsafe_direction_split_channel_key` for that dead end, kept
-  documented so it is not rediscovered the hard way -- but it is what is
-  actually safe to ship without an additional mechanism (e.g. dedicated
-  per-channel process groups) that this module does not implement. Distinct
-  peer-*pairs* (e.g. ranks (0, 1) vs (1, 2) in a 3-stage pipeline) remain free
-  to reorder relative to each other, which is where this pass still
-  meaningfully generalizes past a single global per-device chain.
+  documented so it is not rediscovered the hard way. Distinct peer-*pairs*
+  (e.g. ranks (0, 1) vs (1, 2) in a 3-stage pipeline) remain free to reorder
+  relative to each other, which is where this pass still meaningfully
+  generalizes past a single global per-device chain.
 - **Validation** (:func:`GlobalCommSchedule.validate`) is a defensive,
   testable safety net using the same peer-pair grouping: it simulates every
   hoistable receive's issue/first-local-consumer window and raises
   :class:`GlobalScheduleError` if more than the configured
   ``max_outstanding`` are concurrently active for one peer-pair, rather than
   silently risking a hang.
+
+A second, independent hazard: shared default process group requires a
+GLOBALLY consistent P2P order across ALL peer-pairs
+------------------------------------------------------------------------
+Letting *distinct* peer-pairs reorder relative to each other (the whole point
+of ``peer_pair_channel_key`` over a single fully-global chain) was, in an
+earlier version of this module, empirically confirmed **unsafe** on a real
+4-GPU, 4-stage (3 independent peer-pair) pipeline: it deadlocked on the very
+first training step, reproduced via ``faulthandler``/``SIGUSR1`` stack dumps
+showing one rank stuck in a plain synchronous ``send`` while the others were
+stuck inside ``irecv``'s enqueue call itself -- i.e. the deadlock was not
+about any single peer-pair's outstanding count (``GlobalCommSchedule.validate``
+found nothing wrong), but about *cross-peer-pair* ordering: PyTorch/NCCL's
+own runtime warning documents that unbatched P2P ops sharing one process
+group are "serialized with all other ops on this ProcessGroup, including
+other P2P ops", regardless of which peer-pair each one talks to -- allowing
+independent peer-pairs to reorder differently on different ranks can then
+produce a globally-inconsistent order across the whole shared group.
+
+**An attempted fix, and why it is NOT used**: the natural fix suggested by
+the above is to give every distinct peer-pair its own dedicated process
+group (mirroring the pattern every other collective in ``collectives.py``
+already uses, e.g. ``all_reduce``/``broadcast``/``all_gather`` via
+``DeviceGroup().get_group(ranks)``), so the "one shared group needs one
+global order" constraint no longer spans multiple peer-pairs. This was
+implemented carefully -- accounting for ``torch.distributed.new_group``
+itself being a collective that every rank must enter in the same order
+(groups were pre-established via a dedicated, all-ranks broadcast +
+synchronization point in ``nnscaler.parallel.parallelize``, specifically
+NOT lazily on first use, and NEVER created from inside ``GlobalCommSchedule``
+itself, since code generation -- and hence this pass -- only actually runs on
+rank 0, not all ranks) -- and STILL reproducibly deadlocked in the exact same
+way on the same real 4-GPU/4-stage test, across three independent, carefully
+diagnosed attempts. The root cause of *that* remaining hang was not
+identified within available investigation time; dedicated per-peer-pair
+process groups are therefore **not** a confirmed fix and are **not** used.
+
+**The actual, empirically-validated fix (fail-closed)**: whenever 2 or more
+distinct peer-pairs are present, :meth:`GlobalCommSchedule.apply` -- with the
+default ``channel_key`` -- unconditionally degrades to
+:func:`single_chain_channel_key`: every P2P op on a device, to ANY peer,
+stays in one relatively-ordered chain, equivalent (for cross-peer-pair
+ordering-safety purposes) to the pre-existing ``Reschedule`` baseline. This
+trades away the "independent peer-pairs may reorder relative to each other"
+hoisting benefit for guaranteed safety on the *only* configuration confirmed
+to work on real multi-stage hardware, rather than shipping an unsafe default;
+:meth:`GlobalCommSchedule.validate` independently re-checks this precondition
+(see ``_check_group_isolation``) as a second, defensive line of defense, so a
+caller invoking ``validate``/``apply`` directly with an explicit
+``channel_key=peer_pair_channel_key`` override (bypassing the automatic
+degradation) is still rejected rather than silently allowed to reproduce the
+confirmed-unsafe configuration. With 0 or 1 distinct peer-pairs (e.g. any
+plain 2-stage pipeline), there is nothing to be inconsistent *with*, so the
+default (world) process group with the un-degraded ``peer_pair_channel_key``
+remains exactly the configuration already validated safe on real GPUs.
 """
 
 from dataclasses import dataclass, field
-from typing import Callable, Dict, FrozenSet, Hashable, List, Optional, Tuple
+from typing import Callable, Dict, FrozenSet, Hashable, Iterable, List, Optional, Tuple
 import logging
 
 from nnscaler.ir.cten import IRCell
@@ -200,18 +253,57 @@ def peer_pair_channel_key(node: IRCell) -> Optional[Hashable]:
     of the (possibly more permissive) key used for construction. Non-P2P
     (e.g. collective) nodes fall back to grouping by device alone.
 
-    This is also the *default*, and only verified-safe, ``channel_key`` for
-    :func:`GlobalCommSchedule.apply`'s comm-serialization chain: a device's
-    receive(s) from a peer and its send(s) to that *same* peer must stay in
-    one relatively-ordered chain, not be split into independent groups (see
+    This is the *default* ``channel_key`` for :func:`GlobalCommSchedule.apply`'s
+    comm-serialization chain: a device's receive(s) from a peer and its
+    send(s) to that *same* peer must stay in one relatively-ordered chain,
+    not be split into independent groups (see
     :func:`unsafe_direction_split_channel_key` for why that alternative,
     despite giving a larger measured hoist distance, was empirically found to
-    deadlock).
+    deadlock). NOT safe to use across 2+ distinct peer-pairs (letting them
+    reorder independently) -- see the module docstring's second hazard
+    section; ``apply`` automatically degrades to
+    :func:`single_chain_channel_key` whenever 2 or more distinct peer-pairs
+    are present.
     """
     peer = p2p_peer_pair(node)
     if peer is None:
         return (device_of(node), 'non-p2p')
     return (device_of(node), peer)
+
+
+def single_chain_channel_key(node: IRCell) -> Hashable:
+    """The fully conservative ``channel_key`` fallback: every communication
+    node on a device -- P2P to ANY peer, and collectives -- stays in ONE
+    relatively-ordered chain, regardless of which peer (if any) it talks to.
+
+    Equivalent, for cross-peer-pair ordering-safety purposes, to the
+    pre-existing ``Reschedule`` baseline's single per-device comm chain.
+    Used by :func:`GlobalCommSchedule.apply` unconditionally whenever 2+
+    distinct peer-pairs are present -- see the module docstring's second
+    hazard section for why (this is the only configuration confirmed safe,
+    on real multi-stage GPU hardware, among those tried) -- trading away the
+    "independent peer-pairs may reorder" benefit for guaranteed safety.
+    """
+    return (device_of(node), 'single-chain')
+
+
+def _distinct_peer_pairs(nodes: Iterable[IRCell]) -> List[Tuple[int, int]]:
+    """The sorted, deduplicated set of every distinct P2P peer-pair among
+    ``nodes``, as ascending ``(lo, hi)`` rank tuples in a globally
+    deterministic order (plain ``sorted()`` of the tuples themselves).
+
+    Used by :func:`GlobalCommSchedule.apply` to detect whether 2+ distinct
+    peer-pairs are present at all (the precondition for the module
+    docstring's second hazard, requiring the fail-closed degradation to
+    :func:`single_chain_channel_key`).
+    """
+    pairs = set()
+    for node in nodes:
+        peer = p2p_peer_pair(node)
+        if peer is not None:
+            lo, hi = sorted(peer)
+            pairs.add((lo, hi))
+    return sorted(pairs)
 
 
 def unsafe_direction_split_channel_key(node: IRCell) -> Optional[Hashable]:
@@ -264,6 +356,38 @@ def cid_channel_key(node: IRCell) -> Optional[Hashable]:
     return (device_of(node), _unwrap(node).cid)
 
 
+def _check_group_isolation(
+    pairs: List[Tuple[int, int]],
+    comm_channel_key: Callable[[IRCell], Optional[Hashable]],
+) -> List[str]:
+    """Return human-readable problem descriptions if ``comm_channel_key``
+    allows 2+ distinct peer-pairs to reorder independently of each other
+    (i.e. is anything other than :func:`single_chain_channel_key`) -- the
+    exact configuration confirmed, on real 4-GPU/4-stage hardware, to
+    deadlock (see the module docstring's second hazard section: dedicated
+    per-peer-pair process groups were investigated as a fix and did NOT
+    resolve it either, so there is currently no known-safe way to let 2+
+    peer-pairs reorder independently). An empty list means the configuration
+    is safe.
+
+    With 0 or 1 distinct peer-pairs there is nothing to be inconsistent
+    *with*, so the shared default process group with any ``comm_channel_key``
+    remains exactly the configuration already validated safe on real GPUs.
+    """
+    if len(pairs) <= 1:
+        return []
+    if comm_channel_key is single_chain_channel_key:
+        return []
+    key_name = getattr(comm_channel_key, '__name__', repr(comm_channel_key))
+    return [
+        f"comm_channel_key={key_name!r} allows {len(pairs)} distinct "
+        f"peer-pairs {pairs} to reorder independently of each other -- "
+        f"confirmed, on real 4-GPU/4-stage hardware, to deadlock (see module "
+        f"docstring's second hazard section). Use single_chain_channel_key "
+        f"instead whenever 2+ distinct peer-pairs are present."
+    ]
+
+
 @dataclass
 class ScheduleViolation:
     """One detected pair of overlapping same-peer-pair receive windows."""
@@ -292,13 +416,20 @@ class ScheduleReport:
     how many other nodes now legally sit *between* the issue and the wait,
     the concrete, checkable proxy for "genuine overlap window" used by the
     unit and end-to-end tests.
+
+    ``group_isolation_errors`` holds any problems found by
+    :func:`_check_group_isolation` -- the cross-peer-pair, shared-default-
+    process-group hazard (see module docstring's second hazard section),
+    independent of ``violations`` (which is the per-peer-pair outstanding-
+    count hazard).
     """
     hoist_span: Dict[Tuple[int, Hashable], int] = field(default_factory=dict)
     violations: List[ScheduleViolation] = field(default_factory=list)
+    group_isolation_errors: List[str] = field(default_factory=list)
 
     @property
     def is_safe(self) -> bool:
-        return not self.violations
+        return not self.violations and not self.group_isolation_errors
 
 
 def _cap_aware_order(
@@ -465,11 +596,17 @@ class GlobalCommSchedule(PlanPass):
                 ``Reschedule`` convention.
             channel_key: groups communication nodes for the comm-serialization
                 *ordering* chain (see module docstring for the safety
-                reasoning). Defaults to :func:`peer_pair_channel_key` --
-                overriding this to something finer-grained (e.g. splitting by
-                direction) is a confirmed deadlock risk without an additional
-                mechanism (e.g. per-channel process groups) this module does
-                not implement; see :func:`unsafe_direction_split_channel_key`.
+                reasoning). Defaults to :func:`peer_pair_channel_key`.
+                Overriding this to something finer-grained (e.g. splitting by
+                direction) is a confirmed deadlock risk; see
+                :func:`unsafe_direction_split_channel_key`. When the DEFAULT
+                is in effect (not explicitly overridden) and 2+ distinct
+                peer-pairs are present, ``apply`` automatically, fail-closed
+                degrades to :func:`single_chain_channel_key` instead of
+                silently keeping the (confirmed cross-peer-pair-unsafe)
+                default -- see module docstring's second hazard section. An
+                explicitly-passed non-default ``channel_key`` is used as-is
+                (not auto-degraded), but is still checked by ``validate``.
             cap_key: groups hoistable receives for the outstanding-count
                 *cap*, independent of ``channel_key`` -- deliberately a finer
                 grouping (see :func:`cid_channel_key`) so two unrelated
@@ -480,19 +617,24 @@ class GlobalCommSchedule(PlanPass):
                 change the comm-chain's cross-channel relative ordering.
             validate: when True (default), raise :class:`GlobalScheduleError`
                 if the resulting schedule still has any channel (per
-                ``cap_key``) exceeding ``max_outstanding`` (see
+                ``cap_key``) exceeding ``max_outstanding``, OR fails the
+                cross-peer-pair group-isolation invariant (see
                 :func:`validate`) instead of returning a possibly-unsafe
                 schedule.
 
         Raises:
             GlobalScheduleError: for illegal configuration (``max_outstanding
-                < 1``, an empty execution plan, or ``CompileFlag.async_comm``
+                < 1``, an empty execution plan, ``CompileFlag.async_comm``
                 enabled at the same time -- asynchronous sends add a further,
                 separately-unverified risk on top of the peer-pair chain, see
-                module docstring), if cap-aware scheduling stalls
-                (``max_outstanding`` too small for the plan's genuine
-                concurrency), or, when ``validate`` is set, an unsafe
-                resulting schedule.
+                module docstring -- or ``CompileFlag.async_recv_channel`` set
+                while ``CompileFlag.async_recv`` is not, which would silently
+                reschedule/cap-track receives that are never actually issued
+                asynchronously, for zero real benefit), if cap-aware
+                scheduling stalls (``max_outstanding`` too small for the
+                plan's genuine concurrency), or, when ``validate`` is set, an
+                unsafe resulting schedule (outstanding-count OR group-
+                isolation).
         """
         if max_outstanding < 1:
             raise GlobalScheduleError(
@@ -506,6 +648,16 @@ class GlobalCommSchedule(PlanPass):
                 "send left outstanding is an additional, separately "
                 "unverified risk on top of the confirmed peer-pair hazard. "
                 "See module docstring for the full reasoning."
+            )
+        if CompileFlag.async_recv_channel and not CompileFlag.async_recv:
+            raise GlobalScheduleError(
+                "CompileFlag.async_recv_channel is set but CompileFlag.async_recv "
+                "is not: without async_recv, no receive is ever actually issued "
+                "asynchronously, so channel/cap-tracking and this reschedule's "
+                "hoisting would have zero real effect (a silently-ineffective "
+                "configuration) -- set ASYNC_RECV=1 alongside ASYNC_RECV_CHANNEL=1, "
+                "or unset ASYNC_RECV_CHANNEL if only the ordering benefit (without "
+                "channel tracking) is wanted."
             )
         devices = execplan.devices()
         if not devices:
@@ -523,6 +675,33 @@ class GlobalCommSchedule(PlanPass):
         all_nodes: List[IRCell] = []
         for devid in devices:
             all_nodes.extend(execplan.at(devid))
+
+        # Cross-peer-pair hazard (module docstring, second hazard): only
+        # matters when the DEFAULT channel_key is in effect and 2+ distinct
+        # peer-pairs actually exist -- with 0 or 1 pairs there is nothing to
+        # be inconsistent WITH, so the shared default process group is
+        # already safe (as validated on real GPUs) and no degradation is
+        # needed at all. With 2+ pairs, fail-closed degrade unconditionally:
+        # dedicated per-peer-pair process groups were investigated as a fix
+        # and did NOT resolve the deadlock either (see module docstring), so
+        # there is currently no known-safe way to let 2+ peer-pairs reorder
+        # independently -- single_chain_channel_key is the only configuration
+        # confirmed safe on real multi-stage GPU hardware.
+        channel_key_is_default = channel_key is peer_pair_channel_key
+        if channel_key_is_default:
+            pairs = _distinct_peer_pairs(all_nodes)
+            if len(pairs) >= 2:
+                _logger.info(
+                    f"GlobalCommSchedule: {len(pairs)} distinct peer-pairs "
+                    f"{pairs} present; fail-closed degrading channel_key from "
+                    f"peer_pair_channel_key to single_chain_channel_key (every "
+                    f"peer-pair serialized into one chain per device -- the "
+                    f"only configuration confirmed safe on real multi-stage "
+                    f"GPU hardware; see module docstring's second hazard "
+                    f"section for why dedicated per-pair process groups were "
+                    f"tried and did not resolve this)."
+                )
+                channel_key = single_chain_channel_key
 
         graph = OpDependencyGraph(
             all_nodes,
@@ -555,16 +734,21 @@ class GlobalCommSchedule(PlanPass):
 
         if validate:
             report = GlobalCommSchedule.validate(
-                execplan, max_outstanding=max_outstanding, channel_key=cap_key)
+                execplan, max_outstanding=max_outstanding, channel_key=cap_key,
+                comm_channel_key=channel_key)
             if not report.is_safe:
                 violation_lines = '\n  '.join(str(v) for v in report.violations)
+                group_lines = '\n  '.join(report.group_isolation_errors)
                 raise GlobalScheduleError(
                     f"GlobalCommSchedule produced an unsafe schedule: "
                     f"{len(report.violations)} channel(s) exceed "
                     f"max_outstanding={max_outstanding} concurrently-active "
                     f"receives (would exceed the runtime outstanding cap, or "
-                    f"risk the buffer/handle lifecycle growing unbounded):\n"
-                    f"  {violation_lines}"
+                    f"risk the buffer/handle lifecycle growing unbounded); "
+                    f"{len(report.group_isolation_errors)} group-isolation "
+                    f"problem(s):\n"
+                    f"  {violation_lines}\n"
+                    f"  {group_lines}"
                 )
         return execplan
 
@@ -574,10 +758,13 @@ class GlobalCommSchedule(PlanPass):
         *,
         max_outstanding: int = 2,
         channel_key: Callable[[IRCell], Optional[Hashable]] = cid_channel_key,
+        comm_channel_key: Callable[[IRCell], Optional[Hashable]] = peer_pair_channel_key,
     ) -> ScheduleReport:
         """Simulate each device's hoistable-receive issue/first-local-consumer
         windows and report any channel where more than ``max_outstanding``
-        receives are simultaneously outstanding.
+        receives are simultaneously outstanding, AND independently check the
+        cross-peer-pair group-isolation invariant (see
+        :func:`_check_group_isolation` / module docstring's second hazard).
 
         A receive's "window" is ``[issue_position, wait_position)`` where
         ``wait_position`` is the position of its earliest same-device data
@@ -595,12 +782,27 @@ class GlobalCommSchedule(PlanPass):
         ``AsyncCommHandler.issue_recv`` enforces at runtime, so a
         misconfiguration is caught here at schedule time instead of at the
         first runtime violation.
+
+        Args:
+            channel_key: the *cap* grouping (outstanding-count check above);
+                defaults to :func:`cid_channel_key`, matching ``apply``'s
+                default ``cap_key``.
+            comm_channel_key: the comm-serialization *ordering* key that
+                was (or would be) used to build the schedule -- defaults to
+                :func:`peer_pair_channel_key`, matching ``apply``'s default
+                ``channel_key``, so calling ``validate`` standalone (without
+                going through ``apply``) checks the same precondition
+                ``apply`` itself enforces. Pass :func:`single_chain_channel_key`
+                if that is what was actually used (no group-isolation problem
+                is possible then -- see :func:`_check_group_isolation`).
         """
         hoist_span: Dict[Tuple[int, Hashable], int] = {}
         violations: List[ScheduleViolation] = []
+        all_nodes: List[IRCell] = []
 
         for devid in execplan.devices():
             seq = execplan.at(devid)
+            all_nodes.extend(seq)
             if not seq:
                 continue
             position = {n: i for i, n in enumerate(seq)}
@@ -664,4 +866,8 @@ class GlobalCommSchedule(PlanPass):
                         if node in active:
                             active.remove(node)
 
-        return ScheduleReport(hoist_span=hoist_span, violations=violations)
+        group_isolation_errors = _check_group_isolation(
+            _distinct_peer_pairs(all_nodes), comm_channel_key)
+        return ScheduleReport(
+            hoist_span=hoist_span, violations=violations,
+            group_isolation_errors=group_isolation_errors)
