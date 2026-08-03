@@ -19,9 +19,22 @@ from nnscaler.profiler.timer import CudaTimer
 from nnscaler.runtime.executor import AsyncCommHandler
 
 
-def move(tensor: Optional[torch.Tensor], shape: Tuple[int], dtype: torch.dtype, src: int, dst: int, async_op=False):
+def move(tensor: Optional[torch.Tensor], shape: Tuple[int], dtype: torch.dtype, src: int, dst: int, async_op=False,
+         channel=None, max_outstanding: Optional[int] = None):
     """
     Move a tensor from source device to destination device.
+
+    Args:
+        channel: optional stable, hashable identity for this P2P callsite
+            (e.g. an adapter's IR cell id), used only when ``async_op`` is
+            True. When given, the issue is additionally tracked via
+            `nnscaler.runtime.executor.AsyncCommHandler`'s channel/sequence
+            bookkeeping (see ``issue_recv``/``issue_send``) on top of the
+            plain tensor-keyed path, bounding the outstanding (issued-but-
+            unwaited) op count per channel to ``max_outstanding``. Default
+            None preserves the exact prior (untracked) behavior.
+        max_outstanding: required (must be >= 1) when ``channel`` is given;
+            ignored otherwise.
     """
     if not async_op:
         CudaTimer().start(field_name='comm', predefined=True)
@@ -34,7 +47,10 @@ def move(tensor: Optional[torch.Tensor], shape: Tuple[int], dtype: torch.dtype, 
             work = torch.distributed.isend(tensor, dst)
             # NOTE: we need to hold the work to AsyncCommHandler,
             # otherwise the tensor can be freed before the communication starts.
-            AsyncCommHandler().hold_send(tensor, work)
+            if channel is not None:
+                AsyncCommHandler().issue_send(channel, tensor, work, max_outstanding)
+            else:
+                AsyncCommHandler().hold_send(tensor, work)
         else:
             torch.distributed.send(tensor, dst)
     else:
@@ -44,7 +60,10 @@ def move(tensor: Optional[torch.Tensor], shape: Tuple[int], dtype: torch.dtype, 
         )
         if async_op:
             work = torch.distributed.irecv(tensor, src)
-            AsyncCommHandler().submit(tensor, [work])
+            if channel is not None:
+                AsyncCommHandler().issue_recv(channel, tensor, [work], max_outstanding)
+            else:
+                AsyncCommHandler().submit(tensor, [work])
         else:
             torch.distributed.recv(tensor, src)
     if not async_op:

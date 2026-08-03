@@ -78,6 +78,44 @@ class CompileFlag:
     # this overlaps the receive with intervening compute ("single-stream async
     # irecv early"). Opt-in and independent of `ASYNC_COMM`. Default off.
     async_recv = _to_bool('ASYNC_RECV')
+
+    # make async-recv (and, best-effort, async-send) go through explicit,
+    # channel/sequence-tracked issue/wait bookkeeping (see
+    # `nnscaler.runtime.executor._AsyncCommHandler.issue_recv/issue_send`)
+    # instead of the plain tensor-keyed dict. A "channel" is the stable
+    # per-callsite identity of a P2P adapter (its IR cell id, shared by the
+    # send-side and recv-side dispatch of the same logical move); every issue
+    # on a channel gets a monotonically increasing sequence number that its
+    # matching wait must consume in FIFO order, and the number of outstanding
+    # (issued-but-not-waited) ops per channel is bounded by
+    # `async_recv_max_outstanding`. This is purely a bookkeeping/lifecycle
+    # layer: it does not change *which* adapters are async, only how their
+    # in-flight state is tracked and validated. Opt-in; requires `async_recv`.
+    # Default off (no behavior change to the existing tensor-keyed path).
+    async_recv_channel = _to_bool('ASYNC_RECV_CHANNEL')
+    # maximum number of outstanding (issued-but-not-waited) async P2P ops
+    # allowed per channel when `async_recv_channel` is enabled. Exceeding this
+    # raises a clear error rather than letting buffers/handles accumulate
+    # unbounded. Default 2 (matches "issue next, wait previous" steady-state
+    # depth-1 pipelining with one slot of slack).
+    async_recv_max_outstanding = _to_int('ASYNC_RECV_MAX_OUTSTANDING', default=2)
+
+    # reschedule the cross-device execution sequence of an ExecutionPlan using
+    # ONE global (cross-rank) dependency graph + a single topological sort,
+    # then project the result back onto each device's local sequence -- as
+    # opposed to `enable_op_reschedule`'s `scope='sequence'`, which solves an
+    # independent topological sort *per device* (see
+    # `nnscaler.execplan.planpass.global_schedule.GlobalCommSchedule`). This
+    # guarantees every device's order is consistent-by-construction with a
+    # single shared schedule instead of being separately (re)discovered per
+    # rank. Communication is serialized per *undirected peer-pair* (both
+    # directions between the same two ranks stay relatively ordered, since
+    # concurrent unbatched bidirectional P2P between one pair was confirmed to
+    # deadlock -- see module docstring), while independent peer-pairs (e.g.
+    # a 3-stage pipeline's stage0<->stage1 vs stage1<->stage2 traffic) may be
+    # freely reordered relative to each other. Opt-in; default off.
+    enable_global_p2p_reschedule = _to_bool('ENABLE_GLOBAL_P2P_RESCHEDULE')
+
     line_timer = _to_bool('LINE_TIMER')
 
     # ============== reducer ==================

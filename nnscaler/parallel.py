@@ -28,6 +28,7 @@ from nnscaler.execplan.planpass.grouping import Grouping
 from nnscaler.execplan.planpass.reschedule import (
     Reschedule, dump_schedule, visualize_schedule, insert_path_suffix as _insert_path_suffix,
 )
+from nnscaler.execplan.planpass.global_schedule import GlobalCommSchedule
 
 from nnscaler.graph import IRGraph
 from nnscaler.graph import parser
@@ -932,6 +933,18 @@ def _gencode(
             config=CompileFlag.op_reschedule_config or None,
             scope=CompileFlag.op_reschedule_scope,
             allow_pipeline=CompileFlag.op_reschedule_pipeline,
+        )
+
+    # global (cross-rank), fixed communication schedule: rebuild every
+    # device's sequence from ONE shared dependency graph + a single
+    # cap-aware topological sort, instead of Reschedule's per-device
+    # independent solve (see nnscaler.execplan.planpass.global_schedule for
+    # why this is needed for a hoisted receive to genuinely overlap a full
+    # neighboring compute segment). Independent of `enable_op_reschedule`.
+    if CompileFlag.enable_global_p2p_reschedule:
+        execplan = GlobalCommSchedule.apply(
+            execplan,
+            max_outstanding=CompileFlag.async_recv_max_outstanding,
         )
 
     # dump the operator schedule so it can be edited and fed back via

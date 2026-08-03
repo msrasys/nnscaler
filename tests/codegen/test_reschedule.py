@@ -668,6 +668,67 @@ def test_emit_async_recv_adapter_wait():
     assert '__pending' in body2  # the deferred all_gather consumes __pending
 
 
+def test_emit_adapter_injects_channel_kwargs_when_flag_enabled():
+    """`emit_adapter`'s async-recv launch path must inject the adapter's
+    `cid` as `channel=` and `CompileFlag.async_recv_max_outstanding` as
+    `max_outstanding=` into the emitted `move(...)` call, but ONLY when
+    `CompileFlag.async_recv_channel` is set; the plain `async_recv`-only path
+    (the pre-existing behaviour) must stay byte-for-byte unchanged (no
+    `channel=`/`max_outstanding=` at all) as a regression guard."""
+    from nnscaler.codegen.emit import FuncEmission
+    from nnscaler.flags import CompileFlag
+
+    node = _recv_adapter()
+    node.device = [1]  # emit_adapter requires a dispatched (single-device) adapter
+    saved = (CompileFlag.async_recv, CompileFlag.async_recv_channel, CompileFlag.async_recv_max_outstanding)
+    try:
+        emit = FuncEmission()
+
+        # --- regression: async_recv alone (no channel flag) unchanged ---
+        CompileFlag.async_recv = True
+        CompileFlag.async_recv_channel = False
+        code_plain = '\n'.join(emit.emit_adapter(node, async_op=True))
+        assert 'channel=' not in code_plain
+        assert 'max_outstanding=' not in code_plain
+        assert 'async_op=True' in code_plain
+
+        # --- new behaviour: async_recv_channel injects channel/cap kwargs ---
+        CompileFlag.async_recv_channel = True
+        CompileFlag.async_recv_max_outstanding = 6
+        code_chan = '\n'.join(emit.emit_adapter(node, async_op=True))
+        assert f'channel={node.cid}' in code_chan
+        assert 'max_outstanding=6' in code_chan
+        assert 'async_op=True' in code_chan
+
+        # cid is a stable per-adapter identity: re-emitting yields the same
+        # channel literal (determinism -- required for reproducible gencode)
+        code_chan2 = '\n'.join(emit.emit_adapter(node, async_op=True))
+        assert code_chan == code_chan2
+    finally:
+        CompileFlag.async_recv, CompileFlag.async_recv_channel, CompileFlag.async_recv_max_outstanding = saved
+
+
+def test_emit_adapter_channel_kwargs_absent_without_async_op():
+    """Without `async_op=True` the adapter is emitted as an ordinary
+    (synchronous) call regardless of `async_recv_channel`; the flag must not
+    leak channel kwargs into unrelated, non-async-recv code paths."""
+    from nnscaler.codegen.emit import FuncEmission
+    from nnscaler.flags import CompileFlag
+
+    node = _recv_adapter()
+    node.device = [1]  # emit_adapter requires a dispatched (single-device) adapter
+    saved = (CompileFlag.async_recv, CompileFlag.async_recv_channel)
+    try:
+        CompileFlag.async_recv = True
+        CompileFlag.async_recv_channel = True
+        emit = FuncEmission()
+        code = '\n'.join(emit.emit_adapter(node, async_op=False))
+        assert 'channel=' not in code
+        assert 'max_outstanding=' not in code
+    finally:
+        CompileFlag.async_recv, CompileFlag.async_recv_channel = saved
+
+
 def test_async_comm_handler_drain():
     from nnscaler.runtime.executor import AsyncCommHandler
 

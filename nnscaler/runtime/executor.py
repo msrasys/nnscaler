@@ -6,8 +6,9 @@ Executor for runtime
 """
 import atexit
 
+from collections import deque
 from dataclasses import dataclass
-from typing import Tuple, Any, Callable, List, Dict, Iterable, Optional, Union, Iterator
+from typing import Tuple, Any, Callable, List, Dict, Hashable, Iterable, Optional, Union, Iterator
 import torch
 import logging
 from torch.distributed import Work
@@ -28,11 +29,47 @@ def debug_id(tensors, msg: str, rank: int):
             print(f'[{torch.distributed.get_rank()}] {msg}: {[id(t) for t in tensors]}')
 
 
+class AsyncCommError(RuntimeError):
+    """Illegal channel/sequence/lifecycle usage of async P2P communication.
+
+    Raised by :meth:`_AsyncCommHandler.issue_recv` / :meth:`issue_send`, and by
+    the channel-aware check inside :meth:`_AsyncCommHandler.wait`, instead of
+    letting an outstanding-op count grow unbounded or a mismatched issue/wait
+    pairing resolve silently (which could otherwise hang, or resolve the wrong
+    buffer). See ``CompileFlag.async_recv_channel`` / ``async_recv_max_outstanding``.
+    """
+
+
+@dataclass
+class _ChannelEntry:
+    """One outstanding (issued, not yet waited) op tracked on a channel."""
+    seq: int
+    tensor: torch.Tensor
+    works: List[Work]
+
+
 class _AsyncCommHandler:
     def __init__(self) -> None:
         self._works: Dict[torch.Tensor, Union[torch.Tensor, List[Work]]] = {}
         self._callbacks: Dict[torch.Tensor, Callable] = {}
         self._send_holds: List[Tuple[torch.Tensor, Work]] = []
+
+        # ---- channel/sequence/lifecycle tracking (opt-in, additive) ----
+        # A "channel" is any hashable, stable identity chosen by the caller for
+        # a repeatedly-issued P2P callsite (e.g. an adapter's IR cell id). Each
+        # `issue_recv`/`issue_send` on a channel is assigned a monotonically
+        # increasing sequence number; the matching resolution (via `wait`, or
+        # via a bulk drain) must consume outstanding entries FIFO. This layer
+        # only adds bookkeeping/validation on top of the plain tensor-keyed
+        # `submit`/`hold_send` -- it does not change what is transported.
+        # channel -> FIFO queue of outstanding entries
+        self._channel_pending: Dict[Hashable, 'deque[_ChannelEntry]'] = {}
+        # channel -> next sequence number to hand out on issue
+        self._channel_next_seq: Dict[Hashable, int] = {}
+        # tensor identity -> (channel, seq), so the plain `wait(tensor)` entry
+        # point (used unmodified by existing codegen) transparently becomes
+        # channel-checked when the tensor was issued through a channel
+        self._tensor_channel: Dict[torch.Tensor, Tuple[Hashable, int]] = {}
 
     def wait(self, tensor: torch.Tensor) -> torch.Tensor:
         """
@@ -43,6 +80,9 @@ class _AsyncCommHandler:
         """
         if tensor not in self._works:
             return tensor
+
+        if tensor in self._tensor_channel:
+            self._resolve_channel_strict(tensor)
 
         tensor_or_works = self._works.pop(tensor)
         if isinstance(tensor_or_works, torch.Tensor):
@@ -62,6 +102,135 @@ class _AsyncCommHandler:
         self._works[tensor] = works
         self._callbacks[tensor] = callback
 
+    def issue_recv(
+        self,
+        channel: Hashable,
+        tensor: torch.Tensor,
+        works: List[Work],
+        max_outstanding: int,
+        callback: Optional[Callable] = None,
+    ) -> int:
+        """Register an asynchronously-issued receive on ``channel``, in
+        addition to the plain tensor-keyed :meth:`submit`.
+
+        Assigns and returns the channel's next FIFO sequence number, and
+        enforces that no more than ``max_outstanding`` ops issued on this
+        channel may be outstanding (issued but not yet waited) at once -- this
+        bounds the buffer/handle lifecycle instead of letting it grow without
+        limit. The later :meth:`wait` for ``tensor`` transparently validates
+        and clears this bookkeeping (no separate "wait_recv" call needed).
+
+        Raises:
+            AsyncCommError: if ``max_outstanding < 1`` (illegal configuration),
+                if ``tensor`` already has an outstanding issue, or if issuing
+                would exceed the outstanding cap for ``channel``.
+        """
+        seq = self._channel_issue(channel, tensor, works, max_outstanding)
+        self.submit(tensor, works, callback)
+        return seq
+
+    def issue_send(
+        self,
+        channel: Hashable,
+        tensor: torch.Tensor,
+        work: Work,
+        max_outstanding: int,
+    ) -> int:
+        """Register an asynchronously-issued send on ``channel`` (see
+        :meth:`issue_recv` for the channel/sequence/outstanding-cap
+        semantics), in addition to the plain :meth:`hold_send`. The send is
+        transport-resolved the same way as any held send, via
+        :meth:`drain_sends` / :meth:`drain_sends_completed` -- this only adds
+        channel/sequence/lifecycle bookkeeping on top of that existing path.
+        """
+        seq = self._channel_issue(channel, tensor, [work], max_outstanding)
+        self.hold_send(tensor, work)
+        return seq
+
+    def _channel_issue(
+        self,
+        channel: Hashable,
+        tensor: torch.Tensor,
+        works: List[Work],
+        max_outstanding: int,
+    ) -> int:
+        if max_outstanding < 1:
+            raise AsyncCommError(
+                f"channel {channel!r}: max_outstanding must be >= 1, got {max_outstanding}"
+            )
+        if tensor in self._tensor_channel:
+            prior_channel, _ = self._tensor_channel[tensor]
+            raise AsyncCommError(
+                f"channel {channel!r}: tensor already has an outstanding issue "
+                f"on channel {prior_channel!r}; a buffer must be waited before "
+                f"it is reissued"
+            )
+        pending = self._channel_pending.setdefault(channel, deque())
+        if len(pending) >= max_outstanding:
+            raise AsyncCommError(
+                f"channel {channel!r}: {len(pending)} outstanding op(s) already "
+                f"in flight, exceeds max_outstanding={max_outstanding}; a prior "
+                f"issue on this channel must be waited/drained before issuing "
+                f"another (increase max_outstanding if more pipelining depth "
+                f"is genuinely intended)"
+            )
+        seq = self._channel_next_seq.get(channel, 0)
+        self._channel_next_seq[channel] = seq + 1
+        pending.append(_ChannelEntry(seq, tensor, works))
+        self._tensor_channel[tensor] = (channel, seq)
+        return seq
+
+    def _resolve_channel_strict(self, tensor: torch.Tensor) -> None:
+        """Validate and clear the channel bookkeeping for ``tensor``'s wait.
+
+        Enforces that waits are consumed in the exact FIFO order they were
+        issued on their channel, and that the waited tensor is exactly the
+        buffer that was issued -- catching mismatched issue/wait pairing (a
+        scheduling/codegen bug) early with a clear error instead of a silent
+        hang or a wrongly-resolved buffer. Used by the deliberate, program-order
+        -driven :meth:`wait`; the opportunistic bulk-drain paths use the more
+        lenient :meth:`_release_channel_any` instead (see its docstring).
+        """
+        channel, seq = self._tensor_channel.pop(tensor)
+        pending = self._channel_pending.get(channel)
+        if not pending:
+            raise AsyncCommError(
+                f"channel {channel!r}: attempted to resolve seq={seq} but no "
+                f"outstanding issue is recorded on this channel (already "
+                f"resolved, or never issued)"
+            )
+        entry = pending[0]
+        if entry.seq != seq or entry.tensor is not tensor:
+            raise AsyncCommError(
+                f"channel {channel!r}: sequence mismatch on wait -- the oldest "
+                f"outstanding issue is seq={entry.seq}, but wait() resolved "
+                f"seq={seq}; issue/wait pairs on a channel must be resolved "
+                f"strictly FIFO"
+            )
+        pending.popleft()
+
+    def _release_channel_any(self, tensor: torch.Tensor) -> None:
+        """Release ``tensor``'s channel-tracking entry from wherever it sits
+        in its channel's outstanding queue, if it has one; a no-op otherwise.
+
+        Used by the bulk drain paths (:meth:`drain`, :meth:`drain_sends`,
+        :meth:`drain_sends_completed`, :meth:`drain_all_completed`), which
+        opportunistically resolve whichever transport op has completed first
+        -- not necessarily FIFO issue order -- so, unlike :meth:`wait`, this
+        does not enforce (or require) the entry to be at the front.
+        """
+        entry = self._tensor_channel.pop(tensor, None)
+        if entry is None:
+            return
+        channel, seq = entry
+        pending = self._channel_pending.get(channel)
+        if not pending:
+            return
+        for i, e in enumerate(pending):
+            if e.seq == seq:
+                del pending[i]
+                break
+
     def hold_send(self, tensor: torch.Tensor, work: Work):
         self._send_holds.append((tensor, work))
 
@@ -70,13 +239,15 @@ class _AsyncCommHandler:
         for tensor, work in self._send_holds:
             if work.is_completed():
                 work.wait()
+                self._release_channel_any(tensor)
             else:
                 running.append((tensor, work))
         self._send_holds[:] = running
 
     def drain_sends(self):
-        for _, work in self._send_holds:
+        for tensor, work in self._send_holds:
             work.wait()
+            self._release_channel_any(tensor)
         self._send_holds.clear()
 
     def drain_all_completed(self):
@@ -94,6 +265,7 @@ class _AsyncCommHandler:
 
             callback = self._callbacks.pop(tensor)
             self._works[tensor] = tensor if callback is None else callback(tensor)
+            self._release_channel_any(tensor)
 
     def drain(self):
         """
@@ -112,6 +284,7 @@ class _AsyncCommHandler:
                 # an already-resolved value that was never consumed; drop it
                 self._works.pop(tensor, None)
                 self._callbacks.pop(tensor, None)
+                self._release_channel_any(tensor)
                 continue
             if self._callbacks.get(tensor) is not None:
                 continue
@@ -119,10 +292,15 @@ class _AsyncCommHandler:
                 work.wait()
             self._works.pop(tensor, None)
             self._callbacks.pop(tensor, None)
+            self._release_channel_any(tensor)
 
     def check_clear(self):
         assert len(self._works) == 0 and len(self._callbacks) == 0 and len(self._send_holds) == 0, \
             f"AsyncCommHandler not cleared: works={len(self._works)}, callbacks={len(self._callbacks)}, send_holds={len(self._send_holds)}"
+        leaked_channels = {c: len(p) for c, p in self._channel_pending.items() if len(p) > 0}
+        assert len(self._tensor_channel) == 0 and not leaked_channels, \
+            f"AsyncCommHandler channel state not cleared: tracked_tensors={len(self._tensor_channel)}, " \
+            f"channels_with_outstanding={leaked_channels}"
 
 
 _instance: Optional[_AsyncCommHandler] = None

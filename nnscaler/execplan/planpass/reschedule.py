@@ -102,6 +102,29 @@ class OpDependencyGraph:
             only nodes allowed to move when ``serialize_segments`` is set, and their
             relative order is preserved (communication-serialization) to keep
             collective communication consistent across ranks.
+        channel_key: optional key function that partitions communication nodes
+            into independent serialization groups.  By default (``None``) every
+            communication node is chained into a *single* global relative-order
+            sequence (the original, maximally conservative behaviour).  When
+            given, only nodes that share the same key are chained together, so
+            nodes in different groups are free to reorder relative to each
+            other.  This is what lets a cross-*device* graph (built from more
+            than one device's nodes) avoid over-serializing unrelated P2P
+            traffic -- see ``nnscaler.execplan.planpass.global_schedule``,
+            which uses the *undirected peer-pair* as the key (both directions
+            between the same two ranks must stay relatively ordered; concurrent
+            unbatched bidirectional P2P between one pair is unsafe, but
+            independent peer-pairs are not).  Ignored when ``nodes`` contains no
+            communication nodes.
+        device_key: optional key function that partitions non-communication
+            (anchor) nodes the same way ``channel_key`` partitions communication
+            nodes, only used when ``serialize_segments`` is set.  By default
+            (``None``) every anchor is chained into a single sequence (correct
+            when ``nodes`` is one device's own sequence).  When given (e.g. by
+            device id), anchors are only serialized relative to other anchors
+            with the same key, so a cross-device graph does not spuriously
+            force one device's segments to stay ordered relative to another,
+            independent device's segments.
     """
 
     def __init__(
@@ -110,6 +133,8 @@ class OpDependencyGraph:
         *,
         serialize_segments: bool = False,
         comm_types: Tuple[type, ...] = (IRAdapter,),
+        channel_key: Optional[Callable[[IRCell], Hashable]] = None,
+        device_key: Optional[Callable[[IRCell], Hashable]] = None,
     ):
         self._nodes: List[IRCell] = list(nodes)
         self._order: Dict[IRCell, int] = {node: idx for idx, node in enumerate(self._nodes)}
@@ -120,6 +145,8 @@ class OpDependencyGraph:
         self._edge_kinds: Dict[Tuple[IRCell, IRCell], set] = {}
         self._serialize_segments = serialize_segments
         self._comm_types = comm_types
+        self._channel_key = channel_key
+        self._device_key = device_key
         self._build()
 
     def _is_comm(self, node: IRCell) -> bool:
@@ -179,10 +206,17 @@ class OpDependencyGraph:
                 writers.setdefault(_group_key(obj), []).append((node, obj))
 
     def _build_comm_edges(self) -> None:
-        """Serialize communication operators to preserve their relative order."""
+        """Serialize communication operators to preserve their relative order.
+
+        With the default ``channel_key=None`` every communication node is
+        chained into one global sequence (see class docstring). When a key is
+        given, nodes are first grouped by it and only chained within their
+        group.
+        """
         comm_nodes = [node for node in self._nodes if self._is_comm(node)]
-        for prev_node, node in more_itertools.pairwise(comm_nodes):
-            self._add_edge(prev_node, node, 'comm')
+        for group_nodes in self._group_by(comm_nodes, self._channel_key):
+            for prev_node, node in more_itertools.pairwise(group_nodes):
+                self._add_edge(prev_node, node, 'comm')
 
     def _build_anchor_edges(self) -> None:
         """Keep the relative order of every non-communication node.
@@ -192,14 +226,41 @@ class OpDependencyGraph:
         implicit and not captured by the tensor data-flow, so we conservatively
         forbid reordering any non-communication node (segments, reducers, data ops)
         relative to each other.  Only the communication adapters are free to move.
+
+        With the default ``device_key=None`` every anchor is chained into one
+        global sequence (correct for a single device's nodes). When a key is
+        given (e.g. by device id), anchors are only serialized relative to
+        other anchors sharing the same key -- see class docstring.
         """
         anchors = [node for node in self._nodes if not self._is_comm(node)]
-        for prev_node, node in more_itertools.pairwise(anchors):
-            self._add_edge(prev_node, node, 'order')
+        for group_nodes in self._group_by(anchors, self._device_key):
+            for prev_node, node in more_itertools.pairwise(group_nodes):
+                self._add_edge(prev_node, node, 'order')
+
+    @staticmethod
+    def _group_by(
+        nodes: List[IRCell],
+        key: Optional[Callable[[IRCell], Hashable]],
+    ) -> List[List[IRCell]]:
+        """Partition ``nodes`` (in their given relative order) by ``key``.
+
+        Returns ``[nodes]`` unchanged (one group) when ``key`` is None, which
+        reproduces the exact prior (single global chain) behaviour.
+        """
+        if key is None:
+            return [nodes]
+        groups: Dict[Hashable, List[IRCell]] = {}
+        for node in nodes:
+            groups.setdefault(key(node), []).append(node)
+        return list(groups.values())
 
     def successors(self, node: IRCell) -> Tuple[IRCell, ...]:
         """Get the direct successors of a node (nodes that must run after it)."""
         return tuple(self._successors[node])
+
+    def predecessors(self, node: IRCell) -> Tuple[IRCell, ...]:
+        """Get the direct predecessors of a node (nodes that must run before it)."""
+        return tuple(self._predecessors[node])
 
     def edges(self) -> List[Tuple[IRCell, IRCell, Tuple[str, ...]]]:
         """Get all edges as ``(src, dst, kinds)`` tuples in a deterministic order."""

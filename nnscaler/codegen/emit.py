@@ -354,10 +354,19 @@ class FuncEmission(CodeEmission):
         prefix_attr: Optional[str] = None,
         async_op: bool = False,
         input_name_overrides: Optional[Dict[int, str]] = None,
+        extra_kwargs: Optional[Dict[str, Any]] = None,
     ) -> List[str]:
         """
         Emit code lines for a list of adapter primitives, optionally overriding
         the rendered name of selected input tensors (keyed by tid).
+
+        Args:
+            extra_kwargs: additional keyword arguments (e.g. ``channel`` /
+                ``max_outstanding``, see ``CompileFlag.async_recv_channel``)
+                merged into the call for every communication (``CommPrim``)
+                primitive. Values must already be code-literal-safe (e.g.
+                plain ints); they are rendered via ``kwargs_name`` like any
+                other kwarg.
         """
         codes = []
         input_name_overrides = input_name_overrides or {}
@@ -378,6 +387,8 @@ class FuncEmission(CodeEmission):
             prim_kwargs = dict(prim.kwargs)
             if async_op and isinstance(prim, CommPrim):
                 prim_kwargs['async_op'] = True
+            if extra_kwargs and isinstance(prim, CommPrim):
+                prim_kwargs.update(extra_kwargs)
             kwargs = self.kwargs_name(**prim_kwargs)
             outputs = self.return_name(prim.outputs())
             if CompileFlag.line_timer:
@@ -438,7 +449,28 @@ class FuncEmission(CodeEmission):
             # `move` asynchronously and alias it to the adapter output name. Any
             # remaining post-receive primitives are emitted by the companion
             # `<name>_wait` method (see `emit_async_recv_adapter_wait`).
-            codes = self._emit_adapter_prims(prims[:1], prefix_attr=prefix_attr, async_op=True)
+            #
+            # When `CompileFlag.async_recv_channel` is set, additionally pass
+            # `channel=<this adapter's stable cell id>` and `max_outstanding=
+            # <CompileFlag.async_recv_max_outstanding>` to the underlying
+            # `move()` call, so it routes through
+            # `AsyncCommHandler.issue_recv`'s channel/sequence/outstanding-cap
+            # bookkeeping instead of the plain tensor-keyed `submit`. The
+            # cid is shared by the send-side and receive-side dispatch of the
+            # same logical P2P move (see `IRAdapter.dispatch`), and stable
+            # across this adapter's repeated per-microbatch invocations, so it
+            # is a natural, deterministic "channel" identity requiring no new
+            # compiler-side bookkeeping. No change to the wait side is needed:
+            # `AsyncCommHandler.wait` already detects a channel-issued tensor
+            # transparently (see `nnscaler.runtime.executor`).
+            extra_kwargs = None
+            if CompileFlag.async_recv_channel:
+                extra_kwargs = {
+                    'channel': node.cid,
+                    'max_outstanding': CompileFlag.async_recv_max_outstanding,
+                }
+            codes = self._emit_adapter_prims(
+                prims[:1], prefix_attr=prefix_attr, async_op=True, extra_kwargs=extra_kwargs)
             first_output = self.tensor_name(prims[0].output(0), prefix_attr=prefix_attr)
             final_output = self.tensor_name(node.output(0), prefix_attr=prefix_attr)
             if first_output != final_output:
