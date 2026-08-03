@@ -233,8 +233,8 @@ def _worker(reschedule: bool, use_async_recv: bool = True, capture_gencode: bool
         states = []
         for step in range(NSTEPS):
             model.train()
-            batch = [{k: v.to(dev) for k, v in mb.items()} for mb in data[step]]
-            model.train_step(batch)
+            batch = [{k: v.to(dev).requires_grad_(True) for k, v in mb.items()} for mb in data[step]]
+            loss = model.train_step(batch)
             # Because this test's PAS (`_pas_multi_stream`) sets a custom
             # `stream_config.inter_segment_move`, `execplan.cuda_sync_required`
             # is derived True by nnscaler (see `execplan.py`); the built-in
@@ -248,9 +248,33 @@ def _worker(reschedule: bool, use_async_recv: bool = True, capture_gencode: bool
             # ON/OFF runs, i.e. a real, reproducible correctness hazard when
             # a custom inter-segment CUDA stream is used without this sync.
             torch.cuda.synchronize()
+            # Captured HERE (post-backward, pre-optimizer.step()/zero_grad())
+            # so this rank's own local parameters' real gradients (not yet
+            # zeroed/consumed) are available for the numeric-equivalence
+            # tests' param-grad comparison -- see their own docstrings for
+            # why this, together with loss/optimizer-state, was added
+            # (remediation item 4: a self-audit finding that the ON/OFF
+            # comparison only ever checked post-step weights, never the
+            # loss/gradients/optimizer-state that produced them).
+            param_grads = {
+                name: (p.grad.detach().clone().cpu() if p.grad is not None else None)
+                for name, p in model.named_parameters()
+            }
+            input_grads = [
+                {k: (v.grad.detach().clone().cpu() if v.grad is not None else None)
+                 for k, v in mb.items()}
+                for mb in batch
+            ]
             optimizer.step()
+            optimizer_state = clone_to_cpu_recursively(optimizer.state_dict())
             optimizer.zero_grad()
-            states.append(clone_to_cpu_recursively(model.state_dict()))
+            states.append({
+                'state_dict': clone_to_cpu_recursively(model.state_dict()),
+                'loss': clone_to_cpu_recursively(loss),
+                'optimizer_state': optimizer_state,
+                'param_grads': clone_to_cpu_recursively(param_grads),
+                'input_grads': clone_to_cpu_recursively(input_grads),
+            })
         return states, gencode_text, per_file
 
 
@@ -346,6 +370,107 @@ def test_combined_1f1b_gencode_has_stream_and_async_recv_structures():
     assert n_issue > 0
 
 
+def _assert_off_on_equivalent(off_states, on_states, label: str):
+    """Shared numeric-equivalence assertion body for BOTH
+    ``test_combined_1f1b_pipeline_numeric_equivalence`` and
+    ``test_combined_1f1b_global_schedule_numeric_equivalence``: compares,
+    per step, ACROSS ALL RANKS:
+      - post-step weights (``state_dict``, merged across ranks since a
+        pipeline-sharded model's full weight state is split disjointly
+        across ranks -- unchanged from before this remediation);
+      - loss (every microbatch's own value, per rank -- a rank not owning
+        the loss-computing stage naturally returns the same, e.g. `None`
+        /placeholder, value on both sides, so this is still a meaningful,
+        safe per-rank comparison);
+      - EVERY parameter's own gradient (captured post-backward, pre
+        -optimizer.step()/zero_grad(), per rank -- each rank only owns a
+        disjoint subset of parameters in this pipeline-sharded model, so,
+        unlike weights, NO merging is needed: comparing the same rank's own
+        local gradients between the two runs is already a like-for-like,
+        meaningful comparison);
+      - optimizer state (``exp_avg``/``exp_avg_sq``/``step``, post
+        -optimizer.step(), per rank -- same no-merge-needed reasoning as
+        param grads, since Adam's per-parameter state lives on whichever
+        rank owns that parameter);
+      - input gradients (``data``/``target``, per microbatch, per rank --
+        each pipeline rank only has real, non-None gradients for the
+        leaves its own local segment(s) actually consume; a rank for which
+        a given key has no gradient at all consistently returns `None` on
+        both sides, so the comparison is still meaningful without any
+        stage-specific special-casing).
+    This is remediation item 4: the pre-existing version of these two
+    tests only ever compared post-step WEIGHTS, never the loss/gradients
+    /optimizer-state that produced them -- a real coverage gap for a
+    "does rescheduling/channel-tracking change the math" test.
+    """
+    assert off_states and on_states, 'workers returned no result'
+    nstages = len(off_states)
+    nsteps = len(off_states[0])
+    for step in range(nsteps):
+        off_sd = merge_state_dicts([off_states[r][step]['state_dict'] for r in range(nstages)])[0]
+        on_sd = merge_state_dicts([on_states[r][step]['state_dict'] for r in range(nstages)])[0]
+        for k, a in off_sd.items():
+            if not torch.is_tensor(a):
+                continue
+            b = on_sd[k]
+            assert torch.allclose(a, b, atol=1e-5, rtol=1e-5), \
+                f'{label} step {step} weight key {k} differs: max|diff|={(a - b).abs().max().item():.3e}'
+
+        for r in range(nstages):
+            off_step, on_step = off_states[r][step], on_states[r][step]
+
+            # ---- loss ----
+            off_loss, on_loss = off_step['loss'], on_step['loss']
+            off_loss_list = list(off_loss) if isinstance(off_loss, (list, tuple)) else [off_loss]
+            on_loss_list = list(on_loss) if isinstance(on_loss, (list, tuple)) else [on_loss]
+            assert len(off_loss_list) == len(on_loss_list), (label, step, r)
+            for mb, (a, b) in enumerate(zip(off_loss_list, on_loss_list)):
+                if a is None or b is None:
+                    assert a is None and b is None, f'{label} step {step} rank {r} mb {mb}: one loss is None, other is not'
+                    continue
+                assert torch.allclose(a.float(), b.float(), atol=1e-5, rtol=1e-5), \
+                    f'{label} step {step} rank {r} mb {mb}: loss differs {a.item()} vs {b.item()}'
+
+            # ---- param grads (no merge needed -- see docstring) ----
+            off_pg, on_pg = off_step['param_grads'], on_step['param_grads']
+            assert set(off_pg) == set(on_pg), (label, step, r, set(off_pg) ^ set(on_pg))
+            for name in off_pg:
+                a, b = off_pg[name], on_pg[name]
+                if a is None or b is None:
+                    assert a is None and b is None, \
+                        f'{label} step {step} rank {r} param {name}: one grad is None, other is not'
+                    continue
+                assert torch.allclose(a, b, atol=1e-5, rtol=1e-5), \
+                    f'{label} step {step} rank {r} param {name}: grad differs max|diff|={(a - b).abs().max().item():.3e}'
+
+            # ---- optimizer state (no merge needed -- see docstring) ----
+            off_os, on_os = off_step['optimizer_state']['state'], on_step['optimizer_state']['state']
+            assert set(off_os) == set(on_os), (label, step, r)
+            for pid in off_os:
+                for key in ('exp_avg', 'exp_avg_sq', 'step'):
+                    if key not in off_os[pid]:
+                        continue
+                    a, b = off_os[pid][key], on_os[pid][key]
+                    a_t = a if torch.is_tensor(a) else torch.tensor(float(a))
+                    b_t = b if torch.is_tensor(b) else torch.tensor(float(b))
+                    assert torch.allclose(a_t.float(), b_t.float(), atol=1e-5, rtol=1e-5), \
+                        f'{label} step {step} rank {r} param#{pid} optimizer[{key}] differs'
+
+            # ---- input grads ----
+            off_ig, on_ig = off_step['input_grads'], on_step['input_grads']
+            assert len(off_ig) == len(on_ig), (label, step, r)
+            for mb, (off_mb, on_mb) in enumerate(zip(off_ig, on_ig)):
+                assert set(off_mb) == set(on_mb), (label, step, r, mb)
+                for k in off_mb:
+                    a, b = off_mb[k], on_mb[k]
+                    if a is None or b is None:
+                        assert a is None and b is None, \
+                            f'{label} step {step} rank {r} mb {mb} input[{k}]: one grad is None, other is not'
+                        continue
+                    assert torch.allclose(a, b, atol=1e-5, rtol=1e-5), \
+                        f'{label} step {step} rank {r} mb {mb} input[{k}]: grad differs max|diff|={(a - b).abs().max().item():.3e}'
+
+
 @pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.device_count() < 2,
                     reason='requires >= 2 gpus')
 def test_combined_1f1b_pipeline_numeric_equivalence():
@@ -373,18 +498,9 @@ def test_combined_1f1b_pipeline_numeric_equivalence():
     finally:
         _restore_env(saved_on)
 
-    assert off and on, 'workers returned no result'
     off_states = [off[r][0] for r in range(NSTAGES)]
     on_states = [on[r][0] for r in range(NSTAGES)]
-    for step in range(NSTEPS):
-        off_sd = merge_state_dicts([off_states[r][step] for r in range(NSTAGES)])[0]
-        on_sd = merge_state_dicts([on_states[r][step] for r in range(NSTAGES)])[0]
-        for k, a in off_sd.items():
-            if not torch.is_tensor(a):
-                continue
-            b = on_sd[k]
-            assert torch.allclose(a, b, atol=1e-5, rtol=1e-5), \
-                f'step {step} key {k} differs: max|diff|={(a - b).abs().max().item():.3e}'
+    _assert_off_on_equivalent(off_states, on_states, 'reschedule')
 
 
 @pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.device_count() < 2,
@@ -549,18 +665,9 @@ def test_combined_1f1b_global_schedule_numeric_equivalence():
     finally:
         _restore_env(saved_on)
 
-    assert off and on, 'workers returned no result'
     off_states = [off[r][0] for r in range(NSTAGES)]
     on_states = [on[r][0] for r in range(NSTAGES)]
-    for step in range(NSTEPS):
-        off_sd = merge_state_dicts([off_states[r][step] for r in range(NSTAGES)])[0]
-        on_sd = merge_state_dicts([on_states[r][step] for r in range(NSTAGES)])[0]
-        for k, a in off_sd.items():
-            if not torch.is_tensor(a):
-                continue
-            b = on_sd[k]
-            assert torch.allclose(a, b, atol=1e-5, rtol=1e-5), \
-                f'step {step} key {k} differs: max|diff|={(a - b).abs().max().item():.3e}'
+    _assert_off_on_equivalent(off_states, on_states, 'global_schedule')
 
 
 @pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.device_count() < 2,
