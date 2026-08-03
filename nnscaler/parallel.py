@@ -245,7 +245,7 @@ class ComputeConfig:
             if not FBW_SUPPORTED:
                 raise ValueError(
                     "fbw is not supported in the current environment. "
-                    "Please update pytorch(2.5.0+) and/or python(2.10+) to a higher version."
+                    "Please update pytorch(2.5.0+) and/or python(3.10+) to a higher version."
                 )
 
     def apply_pipeline_scheduler(

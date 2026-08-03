@@ -110,14 +110,15 @@ try:
     from ._patch_torch_pipelining_backend import stage_backward_input, stage_backward_weight
 except (ImportError, TypeError) as ex:
     FBW_SUPPORTED = False
+    import_error = ex
     def stage_backward_input(*args, **kwargs):
         raise ImportError(
             "Failed to import stage_backward_input from torch.distributed. "
-            "Please update pytorch(2.5.0+) and/or python(2.10+) to a higher version."
-        ) from ex
+            "Please update pytorch(2.5.0+) and/or python(3.10+) to a higher version."
+        ) from import_error
 
     def stage_backward_weight(*args, **kwargs):
         raise ImportError(
             "Failed to import stage_backward_weight from torch.distributed. "
-            "Please update pytorch(2.5.0+) and/or python(2.10+) to a higher version."
-        ) from ex
+            "Please update pytorch(2.5.0+) and/or python(3.10+) to a higher version."
+        ) from import_error
