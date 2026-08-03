@@ -860,5 +860,3 @@ def _timing_worker(warmup_steps: int, timed_steps: int):
             if step >= warmup_steps:
                 per_step_seconds.append(t1 - t0)
         return per_step_seconds
-
-
