@@ -260,9 +260,11 @@ class ComputeConfig:
         if not self.use_end2end:
             raise ValueError("pipeline is only supported in end2end mode")
         if (isinstance(pipeline_nmicros, int) and pipeline_nmicros <= 0) or (
-            isinstance(pipeline_nmicros, list) and any(n <= 0 for n in pipeline_nmicros)
+            isinstance(pipeline_nmicros, (list, tuple)) and any(n <= 0 for n in pipeline_nmicros)
         ):
             raise ValueError(f"pipeline_nmicros {pipeline_nmicros} must be > 0.")
+        if isinstance(pipeline_nmicros, (list, tuple))and len(pipeline_nmicros) == 0:
+            raise ValueError(f"pipeline_nmicros {pipeline_nmicros} must not be empty.")
         if pipeline_nstages <= 0:
             raise ValueError(f"pipeline_nstages {pipeline_nstages} must be > 0.")
         if self.inference_only and pipeline_scheduler not in _PREDEFINED_INFERENCE_SCHEDS:
@@ -285,6 +287,9 @@ class ComputeConfig:
             if not callable(pipeline_scheduler):
                 raise ValueError(f"pipeline_scheduler {pipeline_scheduler} is not str nor callable.")
             sched = pipeline_scheduler
+
+        if isinstance(pipeline_nmicros, (list, tuple)) and len(pipeline_nmicros) == 1:
+            pipeline_nmicros = pipeline_nmicros[0]
 
         if isinstance(pipeline_nmicros, int):
             graph.bind_schedule(sched(graph, pipeline_nmicros, pipeline_nstages))

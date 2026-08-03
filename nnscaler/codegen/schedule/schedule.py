@@ -88,7 +88,7 @@ class ScheduleCodeGen(FuncEmission):
         gencode = copy.copy(self.init_code)
         gencode += ['', '']
         if len(self.execplans) == 1:
-            train_step_code, infer_step_code = self._gen(self.execplans[0], device)
+            train_step_code, infer_step_code = self._gen(first(self.execplans.values()), device)
             gencode += train_step_code
             gencode += ['']
             gencode += infer_step_code

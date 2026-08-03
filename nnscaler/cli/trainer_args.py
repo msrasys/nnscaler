@@ -1,7 +1,6 @@
 #  Copyright (c) Microsoft Corporation.
 #  Licensed under the MIT License.
 
-import ast
 from dataclasses import asdict, dataclass, field
 import importlib
 from typing import Any, Callable, Dict, List, Literal, Optional, TYPE_CHECKING, Protocol, Type, Union, TypeVar
