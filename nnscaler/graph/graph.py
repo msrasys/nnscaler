@@ -764,6 +764,8 @@ class IRGraph(IRSegment):
             not all(isinstance(k, int) and isinstance(v, SchedulePlan) for k, v in schedplan.items())
         ):
             raise TypeError(f"Expect a SchedulePlan or Dict[int, SchedulePlan] but got: {type(schedplan)}")
+        if isinstance(schedplan, dict) and not schedplan:
+            raise ValueError("Expect a non-empty Dict[int, SchedulePlan] but got an empty dict")
         self._sched = schedplan
 
     # ================= staging primitives ==================

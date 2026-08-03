@@ -1022,15 +1022,19 @@ class TrainerArgs(PrecisionMixin, PolicyMixin):
         if not self.compute_config.use_end2end:
             raise ValueError("use_end2end must be True")
 
-        if not self.global_batch_size and not self.grad_accumulation_steps:
+        if (self.global_batch_size is not None and self.grad_accumulation_steps is not None
+                and isinstance(self.global_batch_size, dict) != isinstance(self.grad_accumulation_steps, dict)):
+            raise ValueError("`global_batch_size` and `grad_accumulation_steps` must both be int or both be dict")
+
+        if self.global_batch_size is None and self.grad_accumulation_steps is None:
             self.global_batch_size = self.micro_batch_size*self.scaling_factor
             self.grad_accumulation_steps = 1
-        elif not self.global_batch_size:
+        elif self.global_batch_size is None:
             if isinstance(self.grad_accumulation_steps, dict):
                 self.global_batch_size = {k: self.micro_batch_size*self.scaling_factor*v for k, v in self.grad_accumulation_steps.items()}
             else:
                 self.global_batch_size = self.micro_batch_size*self.scaling_factor*self.grad_accumulation_steps
-        elif not self.grad_accumulation_steps:
+        elif self.grad_accumulation_steps is None:
             if isinstance(self.global_batch_size, dict):
                 self.grad_accumulation_steps = {k: v // (self.micro_batch_size*self.scaling_factor) for k, v in self.global_batch_size.items()}
             else:

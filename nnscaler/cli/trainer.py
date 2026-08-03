@@ -214,16 +214,15 @@ class Trainer:
         _, self.sync_group = self.train_args.compute_config.get_sync_group()
         self.model = pmodel
         if isinstance(self.model, ParallelModule) and self.model.use_scheduler:
-            if isinstance(self.model.nmicros_per_scheduler_step, int):
-                if self.model.nmicros_per_scheduler_step != self.train_args.update_freq:
-                    raise ValueError(
-                        f"nmicros_per_scheduler_step {self.model.nmicros_per_scheduler_step} "
-                        f"does not match update_freq {self.train_args.update_freq}"
-                    )
-            elif set(self.model.nmicros_per_scheduler_step) != set(self.train_args.update_freq.values()):
+            compiled_nmicros = self.model.nmicros_per_scheduler_step
+            compiled_nmicros = {compiled_nmicros} if isinstance(compiled_nmicros, int) else set(compiled_nmicros)
+            update_freq = self.train_args.update_freq
+            update_freq_values = {update_freq} if isinstance(update_freq, int) else set(update_freq.values())
+            # the runtime update_freq value(s) must be schedulers the model was compiled with
+            if not update_freq_values <= compiled_nmicros:
                 raise ValueError(
-                    f"nmicros_per_scheduler_step {self.model.nmicros_per_scheduler_step} "
-                    f"does not match update_freq values {list(self.train_args.update_freq.values())}"
+                    f"update_freq value(s) {sorted(update_freq_values)} must be a subset of the "
+                    f"compiled nmicros_per_scheduler_step {sorted(compiled_nmicros)}"
                 )
         self.model.cuda()
         self.optimizer = self.train_args.create_parallel_optimizer(self.model)

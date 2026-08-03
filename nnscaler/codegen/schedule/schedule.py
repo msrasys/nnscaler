@@ -94,15 +94,17 @@ class ScheduleCodeGen(FuncEmission):
             gencode += infer_step_code
             gencode += ['']
         else:
-            for micros, execplan in self.execplans.items():
-                train_step_code, infer_step_code = self._gen(execplan, device, f'_{micros}')
+            # sort by nmicros so the generated code order is deterministic
+            sorted_micros = sorted(self.execplans.keys())
+            for micros in sorted_micros:
+                train_step_code, infer_step_code = self._gen(self.execplans[micros], device, f'_{micros}')
                 gencode += train_step_code
                 gencode += infer_step_code
                 gencode += ['']
 
-            mapping = ', '.join(f'{n}: _train_step_{n}' for n in list(self.execplans.keys()))
+            mapping = ', '.join(f'{n}: _train_step_{n}' for n in sorted_micros)
             gencode += [f'_train_steps = {{{mapping}}}']
-            mapping = ', '.join(f'{n}: _infer_step_{n}' for n in list(self.execplans.keys()))
+            mapping = ', '.join(f'{n}: _infer_step_{n}' for n in sorted_micros)
             gencode += [f'_infer_steps = {{{mapping}}}']
             gencode += ['']
 

@@ -1,10 +1,9 @@
 from pathlib import Path
-from typing import List
 
 import pytest
 import torch
 
-from nnscaler.cli.trainer import Trainer, TrainerArgs
+from nnscaler.cli.trainer import Trainer
 
 from tests.launch_torchrun import launch_torchrun
 from tests.parallel_module.common import assert_equal

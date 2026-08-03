@@ -253,7 +253,7 @@ class ComputeConfig:
             pipeline_nstages: int,
             pipeline_nmicros: Union[int, List[int]],
             pipeline_scheduler: Union[str, Callable[[IRGraph, int, int], SchedulePlan]]
-    ) -> Optional[SchedulePlan]:
+    ) -> Optional[Union[SchedulePlan, Dict[int, SchedulePlan]]]:
         """
         Apply the pipeline scheduler to the graph.
         """
