@@ -251,7 +251,7 @@ class ComputeConfig:
             self,
             graph: IRGraph,
             pipeline_nstages: int,
-            pipeline_nmicros: int,
+            pipeline_nmicros: Union[int, List[int]],
             pipeline_scheduler: Union[str, Callable[[IRGraph, int, int], SchedulePlan]]
     ) -> Optional[SchedulePlan]:
         """
@@ -259,7 +259,9 @@ class ComputeConfig:
         """
         if not self.use_end2end:
             raise ValueError("pipeline is only supported in end2end mode")
-        if pipeline_nmicros <= 0:
+        if (isinstance(pipeline_nmicros, int) and pipeline_nmicros <= 0) or (
+            isinstance(pipeline_nmicros, list) and any(n <= 0 for n in pipeline_nmicros)
+        ):
             raise ValueError(f"pipeline_nmicros {pipeline_nmicros} must be > 0.")
         if pipeline_nstages <= 0:
             raise ValueError(f"pipeline_nstages {pipeline_nstages} must be > 0.")
@@ -289,7 +291,7 @@ class ComputeConfig:
         else:
             scheds = {}
             for num_micro in pipeline_nmicros:
-                scheds[num_micro] = sched(graph, pipeline_nmicros, pipeline_nstages)
+                scheds[num_micro] = sched(graph, num_micro, pipeline_nstages)
             graph.bind_schedule(scheds)
 
         return graph.sched

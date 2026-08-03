@@ -11,6 +11,9 @@ compute_config:
   pas_config:
     pipeline_nstages: 2
     pipeline_scheduler: 1f1b
+    pipeline_nmicros:
+      - 2
+      - 4
 
 run_mode: run
 pas_policy: hybrid
@@ -24,6 +27,7 @@ global_batch_size:
 max_epochs: 4
 max_train_steps: 100
 seed: 0
+enable_progress_bar: false
 
 model:
   type: tests.cli.common.MLP

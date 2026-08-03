@@ -90,23 +90,25 @@ class ScheduleCodeGen(FuncEmission):
         if len(self.execplans) == 1:
             train_step_code, infer_step_code = self._gen(self.execplans[0], device)
             gencode += train_step_code
-            gencode += ['', '']
+            gencode += ['']
             gencode += infer_step_code
+            gencode += ['']
         else:
             for micros, execplan in self.execplans.items():
                 train_step_code, infer_step_code = self._gen(execplan, device, f'_{micros}')
                 gencode += train_step_code
-                gencode += ['', '']
                 gencode += infer_step_code
-                gencode += ['', '']
+                gencode += ['']
+
+            mapping = ', '.join(f'{n}: _train_step_{n}' for n in list(self.execplans.keys()))
+            gencode += [f'_train_steps = {{{mapping}}}']
+            mapping = ', '.join(f'{n}: _infer_step_{n}' for n in list(self.execplans.keys()))
+            gencode += [f'_infer_steps = {{{mapping}}}']
+            gencode += ['']
 
             with FunctionBlock(func_name='_train_step', args=['*args']) as tfb, \
                  FunctionBlock(func_name='_infer_step', args=['*args']) as ifb:
-                mapping = ', '.join(f'{n}: _train_step_{n}' for n in list(self.execplans.keys()))
-                tfb.insert_body(f'_train_steps = {{{mapping}}}')
                 tfb.insert_body(f'return _train_steps[len(args[1])](*args)')
-                mapping = ', '.join(f'{n}: _infer_step_{n}' for n in list(self.execplans.keys()))
-                ifb.insert_body(f'_infer_steps = {{{mapping}}}')
                 ifb.insert_body(f'return _infer_steps[len(args[1])](*args)')
 
             gencode += tfb.code
@@ -339,7 +341,6 @@ class ScheduleCodeGen(FuncEmission):
                 code = f'return {outputs}'
                 _append_code(fb, code, force_flush=True)
             gencode += fb.code
-        gencode += ['']
 
         infer_step_codes = gencode[:]
 

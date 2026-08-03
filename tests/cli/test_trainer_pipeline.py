@@ -1,9 +1,10 @@
 from pathlib import Path
+from typing import List
 
 import pytest
 import torch
 
-from nnscaler.cli.trainer import Trainer
+from nnscaler.cli.trainer import Trainer, TrainerArgs
 
 from tests.launch_torchrun import launch_torchrun
 from tests.parallel_module.common import assert_equal
@@ -199,7 +200,7 @@ def trainer_worker_multi_sched(save_dir, config_file):
     trainer = Trainer([
         '-f', config_path,
         '--instance_name', instance_name,
-        '--max_epochs', '2',
+        '--max_train_steps', '12',
         '--gen_savedir', str(gen_savedir),
         '--checkpoint.save_dir', str(ckpt_savedir),
     ])
@@ -207,6 +208,42 @@ def trainer_worker_multi_sched(save_dir, config_file):
     assert trainer.model.use_scheduler
     # step-dependent update_freq {0: 2, 5: 4} compiles one scheduler per nmicros
     assert tuple(sorted(trainer.model.nmicros_per_scheduler_step)) == (2, 4)
+
+    torch.distributed.barrier()
+
+    trainer = Trainer([
+        '-f', config_path,
+        '--instance_name', instance_name,
+        '--max_epochs', '4',
+        '--gen_savedir', str(gen_savedir),
+        '--checkpoint.save_dir', str(ckpt_savedir),
+        '--checkpoint.resume_from', 'last',
+    ])
+    trainer.run()
+    assert trainer.model.use_scheduler
+    # step-dependent update_freq {0: 2, 5: 4} compiles one scheduler per nmicros
+    assert tuple(sorted(trainer.model.nmicros_per_scheduler_step)) == (2, 4)
+    torch.distributed.barrier()
+
+    ckpt1_savedir = save_dir / run_name / 'ckpt1'
+    trainer = Trainer([
+        '-f', config_path,
+        '--instance_name', instance_name,
+        '--max_epochs', '4',
+        '--gen_savedir', str(gen_savedir),
+        '--checkpoint.save_dir', str(ckpt1_savedir),
+    ])
+    trainer.run()
+
+    if trainer.rank == 0:
+        ckpt_files = list((ckpt_savedir / 'last').glob('*.ckpt'))
+        ckpt1_files = list((ckpt1_savedir / 'last').glob('*.ckpt'))
+        assert len(ckpt_files) == len(ckpt1_files) == 4
+        ckpt_state_dicts = [torch.load(ckpt_file, weights_only=False) for ckpt_file in ckpt_files]
+        ckpt1_state_dicts = [torch.load(ckpt1_file, weights_only=False) for ckpt1_file in ckpt1_files]
+        for ckpt_state_dict, ckpt1_state_dict in zip(ckpt_state_dicts, ckpt1_state_dicts):
+            assert_equal(ckpt_state_dict['model'], ckpt1_state_dict['model'])
+            assert_equal(ckpt_state_dict['optimizer'], ckpt1_state_dict['optimizer'])
 
     torch.distributed.barrier()
 
