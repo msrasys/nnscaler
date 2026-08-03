@@ -214,7 +214,13 @@ class Trainer:
         _, self.sync_group = self.train_args.compute_config.get_sync_group()
         self.model = pmodel
         if isinstance(self.model, ParallelModule) and self.model.use_scheduler:
-            if set(self.model.nmicros_per_scheduler_step) != set(self.train_args.update_freq.values()):
+            if isinstance(self.model.nmicros_per_scheduler_step, int):
+                if self.model.nmicros_per_scheduler_step != self.train_args.update_freq:
+                    raise ValueError(
+                        f"nmicros_per_scheduler_step {self.model.nmicros_per_scheduler_step} "
+                        f"does not match update_freq {self.train_args.update_freq}"
+                    )
+            elif set(self.model.nmicros_per_scheduler_step) != set(self.train_args.update_freq.values()):
                 raise ValueError(
                     f"nmicros_per_scheduler_step {self.model.nmicros_per_scheduler_step} "
                     f"does not match update_freq values {list(self.train_args.update_freq.values())}"
