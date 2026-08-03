@@ -250,6 +250,47 @@ def test_partition_rejects_cross_physical_stage():
 
 
 @replace_all_device_with('cpu')
+def test_partition_rejects_already_grouped_stage_no_boundary():
+    """Regression test (post-commit self-audit finding, HIGH severity):
+    calling partition_stage_into_local_segments() a *second* time, on the
+    node list of a segment that has *already* been created by a first
+    (legitimate) call/graph.group(), must be rejected -- not silently
+    create a forbidden nested IRSegment inside that existing segment. This
+    exercises the ordering mistake directly (single already-staged
+    physical stage), as opposed to test_partition_rejects_cross_physical_stage
+    above (which mixes nodes from *two different* already-staged stages)."""
+    with tempfile.TemporaryDirectory() as tempdir:
+        graph = _build_graph(_SeqLinears(dim=_dim(), nlayers=4), tempdir, dim=_dim())
+        _, linears, loss = _linears_and_loss(graph)
+        stage_nodes = list(linears) + [loss]
+        # legitimately create the physical-stage segment first
+        seg = graph.group(stage_nodes)
+        assert graph.segment(seg.nodes()[0]) is seg
+        # now (mis-)call partition again on that already-grouped segment's
+        # own node list, with no boundary
+        with pytest.raises(LocalSegmentError):
+            partition_stage_into_local_segments(graph, seg.nodes(), boundary=None)
+        # must still be flat: no nested IRSegment was created as a side effect
+        _assert_no_nested_segment(graph)
+
+
+@replace_all_device_with('cpu')
+def test_partition_rejects_already_grouped_stage_with_boundary():
+    """Same misuse as above, but with a real (non-None) boundary supplied
+    -- must be rejected just the same, before the boundary is even
+    consulted to compute split points."""
+    with tempfile.TemporaryDirectory() as tempdir:
+        graph = _build_graph(_SeqLinears(dim=_dim(), nlayers=4), tempdir, dim=_dim())
+        _, linears, loss = _linears_and_loss(graph)
+        stage_nodes = list(linears) + [loss]
+        seg = graph.group(stage_nodes)
+        boundary = CallableBoundary(lambda nodes: [2])
+        with pytest.raises(LocalSegmentError):
+            partition_stage_into_local_segments(graph, seg.nodes(), boundary)
+        _assert_no_nested_segment(graph)
+
+
+@replace_all_device_with('cpu')
 def test_partition_rejects_non_forward_operator():
     with tempfile.TemporaryDirectory() as tempdir:
         graph = _build_graph(_SeqLinears(dim=_dim(), nlayers=2), tempdir, dim=_dim())
@@ -509,6 +550,41 @@ def test_sched_local_segments_rejects_stage_count_mismatch():
         )
         with pytest.raises(ValueError):
             LocalSegmentSched.sched_1f1b_local_segments(graph, nmicros, num_stages=3)
+
+
+@replace_all_device_with('cpu')
+def test_sched_local_segments_rejects_vpp_round_robin_device_pattern():
+    """Regression test (post-commit self-audit finding, MEDIUM severity):
+    a *virtual*-pipeline-stage / round-robin device assignment (e.g. as
+    PredefinedSched.sched_1f1b_interleaved uses: chunk0->dev0, chunk1->dev1,
+    chunk2->dev0, chunk3->dev1) must be actively, directly rejected by
+    _stage_local_segments -- not left to (incidentally, and unreliably)
+    fail later inside SchedulePlan.validate() or some other downstream
+    consumer. Chosen so len(devs2segs) == num_stages (2 devices, 2
+    "stages" requested) *coincidentally holds*, so the pre-existing
+    count-mismatch check (see test above) alone provably does not catch
+    this pattern -- only the added direct contiguity check does."""
+    num_stages, nmicros = 2, 2
+    with tempfile.TemporaryDirectory() as tempdir:
+        graph = _build_graph(_SeqLinears(dim=_dim(), nlayers=8), tempdir, dim=_dim())
+        _, linears, loss = _linears_and_loss(graph)
+        # four "virtual stage" segments of 2 linears each (not created via
+        # partition_stage_into_local_segments -- these represent distinct
+        # virtual pipeline stages, not local segments of one physical stage)
+        chunks = [
+            graph.group(linears[0:2]),
+            graph.group(linears[2:4]),
+            graph.group(linears[4:6]),
+            graph.group(linears[6:8] + [loss]),
+        ]
+        round_robin_devices = [0, 1, 0, 1]
+        for chunk, dev in zip(chunks, round_robin_devices):
+            for node in chunk.nodes():
+                graph.assign(node, dev)
+
+        assert len({tuple(c.device) for c in chunks}) == num_stages  # count check alone would pass
+        with pytest.raises(LocalSegmentError):
+            LocalSegmentSched.sched_1f1b_local_segments(graph, nmicros, num_stages)
 
 
 # ---------------------------------------------------------------------------

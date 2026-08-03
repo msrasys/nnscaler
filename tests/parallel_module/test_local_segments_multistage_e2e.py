@@ -31,7 +31,7 @@ from nnscaler.ir.operator import IRFwOperation
 import nnscaler.runtime.function as ncf
 from nnscaler.graph.schedule.local_segment import AnchorBoundary, LocalSegmentSched, partition_stage_into_local_segments
 
-from .common import init_distributed
+from .common import init_distributed, assert_close
 from ..launch_torchrun import launch_torchrun, clone_to_cpu_recursively
 from ..utils import init_random, clear_dir_on_rank0, PYTEST_RUN_ID
 
@@ -143,6 +143,7 @@ def _worker(use_local_segments: bool):
 
         data = _make_data(NSTEPS, NMICROS)
         states = []
+        opt_states = []
         for step in range(NSTEPS):
             model.train()
             batch = [{k: v.to(dev) for k, v in mb.items()} for mb in data[step]]
@@ -151,7 +152,12 @@ def _worker(use_local_segments: bool):
             optimizer.step()
             optimizer.zero_grad()
             states.append(clone_to_cpu_recursively(model.state_dict()))
-        return states
+            # includes the automatically-injected CUBE_EXTRA_STATE key
+            # (added by build_optimizer's optimizer.state_dict patch),
+            # required by merge_state_dicts to reassemble per-rank Adam
+            # momentum/step across ranks -- see test below.
+            opt_states.append(clone_to_cpu_recursively(optimizer.state_dict()))
+        return states, opt_states
 
 
 class _Alarm:
@@ -189,7 +195,9 @@ def test_local_segments_multistage_no_deadlock():
             outputs = launch_torchrun(NSTAGES, _worker, True)
         assert outputs is not None and len(outputs) == NSTAGES
         for r in range(NSTAGES):
-            assert len(outputs[r]) == NSTEPS
+            rank_states, rank_opt_states = outputs[r]
+            assert len(rank_states) == NSTEPS
+            assert len(rank_opt_states) == NSTEPS
     print('NO_DEADLOCK PASS (PP4, x3): all ranks completed the local-segment pipeline run')
 
 
@@ -198,19 +206,35 @@ def test_local_segments_multistage_no_deadlock():
 def test_local_segments_multistage_numeric_equivalence():
     """PP4, every stage split into 2 local segments, must match the unsplit
     (single segment per stage) baseline -- both scheduled via the exact same
-    ``LocalSegmentSched.sched_1f1b_local_segments``."""
+    ``LocalSegmentSched.sched_1f1b_local_segments`` -- in trained weights
+    *and* optimizer state (Adam momentum/step)."""
     with _Alarm(180, 'possible deadlock: PP4 unsplit baseline run did not finish in 180s'):
         off = launch_torchrun(NSTAGES, _worker, False)
     with _Alarm(180, 'possible deadlock: PP4 local-segment-split run did not finish in 180s'):
         on = launch_torchrun(NSTAGES, _worker, True)
 
     assert off and on, 'workers returned no result'
+    off_states = [off[r][0] for r in range(NSTAGES)]
+    on_states = [on[r][0] for r in range(NSTAGES)]
+    off_opt_states = [off[r][1] for r in range(NSTAGES)]
+    on_opt_states = [on[r][1] for r in range(NSTAGES)]
     for step in range(NSTEPS):
-        off_sd = merge_state_dicts([off[r][step] for r in range(NSTAGES)])[0]
-        on_sd = merge_state_dicts([on[r][step] for r in range(NSTAGES)])[0]
+        off_sd, off_opt_sd = merge_state_dicts(
+            [off_states[r][step] for r in range(NSTAGES)],
+            [off_opt_states[r][step] for r in range(NSTAGES)],
+        )
+        on_sd, on_opt_sd = merge_state_dicts(
+            [on_states[r][step] for r in range(NSTAGES)],
+            [on_opt_states[r][step] for r in range(NSTAGES)],
+        )
         for k, a in off_sd.items():
             if not torch.is_tensor(a):
                 continue
             b = on_sd[k]
             assert torch.allclose(a, b, atol=1e-5, rtol=1e-5), \
                 f'step {step} key {k} differs: max|diff|={(a - b).abs().max().item():.3e}'
+
+        # Also compare merged optimizer state, not just model weights --
+        # same as test_local_segments_e2e.py's equivalence test.
+        # (Post-commit self-audit finding #4.)
+        assert_close(off_opt_sd, on_opt_sd, atol=1e-5, rtol=1e-5)

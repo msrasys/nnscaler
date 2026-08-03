@@ -33,7 +33,7 @@ from nnscaler.ir.operator import IRFwOperation
 import nnscaler.runtime.function as ncf
 from nnscaler.graph.schedule.local_segment import AnchorBoundary, LocalSegmentSched
 
-from .common import init_distributed
+from .common import init_distributed, assert_close
 from ..launch_torchrun import launch_torchrun, clone_to_cpu_recursively
 from ..utils import init_random, clear_dir_on_rank0, PYTEST_RUN_ID
 
@@ -163,6 +163,7 @@ def _worker(use_local_segments: bool, capture_per_file: bool = False):
 
         data = _make_data(NSTEPS, NMICROS)
         states = []
+        opt_states = []
         for step in range(NSTEPS):
             model.train()
             batch = [{k: v.to(dev) for k, v in mb.items()} for mb in data[step]]
@@ -171,7 +172,12 @@ def _worker(use_local_segments: bool, capture_per_file: bool = False):
             optimizer.step()
             optimizer.zero_grad()
             states.append(clone_to_cpu_recursively(model.state_dict()))
-        return states, per_file
+            # includes the automatically-injected CUBE_EXTRA_STATE key
+            # (added by build_optimizer's optimizer.state_dict patch),
+            # required by merge_state_dicts to reassemble per-rank Adam
+            # momentum/step across ranks -- see test below.
+            opt_states.append(clone_to_cpu_recursively(optimizer.state_dict()))
+        return states, opt_states, per_file
 
 
 class _Alarm:
@@ -204,7 +210,8 @@ def test_local_segments_numeric_equivalence_vs_unsplit_baseline():
     """Splitting each stage into 2 local segments (vs. the unsplit baseline,
     i.e. one whole-stage segment, both scheduled via the exact same
     ``LocalSegmentSched.sched_1f1b_local_segments``) must not change the
-    trained weights, across multiple steps."""
+    trained weights *or* optimizer state (Adam momentum/step), across
+    multiple steps."""
     with _Alarm(180, 'possible deadlock: unsplit baseline run did not finish in 180s'):
         off = launch_torchrun(NSTAGES, _worker, False, False)
     with _Alarm(180, 'possible deadlock: local-segment-split run did not finish in 180s'):
@@ -213,15 +220,31 @@ def test_local_segments_numeric_equivalence_vs_unsplit_baseline():
     assert off and on, 'workers returned no result'
     off_states = [off[r][0] for r in range(NSTAGES)]
     on_states = [on[r][0] for r in range(NSTAGES)]
+    off_opt_states = [off[r][1] for r in range(NSTAGES)]
+    on_opt_states = [on[r][1] for r in range(NSTAGES)]
     for step in range(NSTEPS):
-        off_sd = merge_state_dicts([off_states[r][step] for r in range(NSTAGES)])[0]
-        on_sd = merge_state_dicts([on_states[r][step] for r in range(NSTAGES)])[0]
+        off_sd, off_opt_sd = merge_state_dicts(
+            [off_states[r][step] for r in range(NSTAGES)],
+            [off_opt_states[r][step] for r in range(NSTAGES)],
+        )
+        on_sd, on_opt_sd = merge_state_dicts(
+            [on_states[r][step] for r in range(NSTAGES)],
+            [on_opt_states[r][step] for r in range(NSTAGES)],
+        )
         for k, a in off_sd.items():
             if not torch.is_tensor(a):
                 continue
             b = on_sd[k]
             assert torch.allclose(a, b, atol=1e-5, rtol=1e-5), \
                 f'step {step} key {k} differs: max|diff|={(a - b).abs().max().item():.3e}'
+
+        # Also compare merged optimizer state (Adam exp_avg/exp_avg_sq
+        # momentum + step counters), not just model weights -- uses the
+        # same merge_state_dicts(model_sds, optimizer_sds) API, proven in
+        # tests/parallel_module/test_checkpoint.py. (Post-commit
+        # self-audit finding #4: the original commit only ever compared
+        # model weights.)
+        assert_close(off_opt_sd, on_opt_sd, atol=1e-5, rtol=1e-5)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.device_count() < 2,
@@ -233,8 +256,9 @@ def test_local_segments_no_deadlock():
         outputs = launch_torchrun(NSTAGES, _worker, True, False)
     assert outputs is not None and len(outputs) == NSTAGES
     for r in range(NSTAGES):
-        rank_states, _ = outputs[r]
+        rank_states, rank_opt_states, _ = outputs[r]
         assert len(rank_states) == NSTEPS
+        assert len(rank_opt_states) == NSTEPS
     print('NO_DEADLOCK PASS: both ranks completed the local-segment pipeline run')
 
 
@@ -316,13 +340,38 @@ def test_local_segments_compatible_with_step_a_global_schedule():
         _restore_env(saved)
 
     assert outputs and outputs[0] is not None, 'worker returned no result'
-    _, per_file = outputs[0]
+    _, _, per_file = outputs[0]
     assert per_file, 'rank 0 did not capture any generated files'
     all_text = '\n'.join(per_file.values())
 
-    # multiple local-segment methods actually present (2 per stage, by construction)
-    seg_defs = sorted(set(re.findall(r'^\s*def (segment\d+)\(', all_text, re.MULTILINE)))
-    assert len(seg_defs) >= 2, f'expected >= 2 local segment methods in generated code, found {seg_defs}'
+    # Multiple local-segment methods actually present, and *exactly* 2 per
+    # physical-stage gencodeN.py file (matching _LSModel's construction:
+    # per_stage = NLAYERS // NSTAGES layers, split at the midpoint by
+    # AnchorBoundary -> 2 local segments/stage) -- not merely the weaker
+    # ">= 2 in total" this test originally checked, which would also be
+    # (wrongly) satisfied by e.g. all local segments living in a single
+    # stage's file and none in another. (Post-commit self-audit finding,
+    # MEDIUM-LOW severity.)
+    gencode_files = {name: content for name, content in per_file.items()
+                      if re.search(r'gencode\d+\.py$', name)}
+    assert len(gencode_files) == NSTAGES, (
+        f'expected exactly {NSTAGES} per-stage gencodeN.py files, found {sorted(gencode_files)}'
+    )
+    expected_segs_per_stage = 2  # see _LSModel docstring
+    all_seg_defs = []
+    for sid in range(NSTAGES):
+        name = next((n for n in gencode_files if n.endswith(f'gencode{sid}.py')), None)
+        assert name is not None, f'no gencode{sid}.py found among {sorted(gencode_files)}'
+        seg_defs = sorted(set(re.findall(r'^\s*def (segment\d+)\(', gencode_files[name], re.MULTILINE)))
+        assert len(seg_defs) == expected_segs_per_stage, (
+            f'stage {sid} ({name}): expected exactly {expected_segs_per_stage} local segment '
+            f'methods, found {seg_defs}'
+        )
+        all_seg_defs.extend(seg_defs)
+    assert len(set(all_seg_defs)) == NSTAGES * expected_segs_per_stage, (
+        f'expected {NSTAGES * expected_segs_per_stage} distinct segment method names in total '
+        f'across all stages, found {sorted(set(all_seg_defs))}'
+    )
 
     assert 'max_outstanding=6' in all_text, (
         'expected the configured max_outstanding to appear literally in the generated async-recv launch call'

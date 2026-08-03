@@ -165,7 +165,14 @@ Validation
 - ``stage_nodes`` is empty, contains a non-forward-operation node, or the
   nodes are not all part of the same not-yet-grouped region (i.e. they
   would cross an existing, different segment -- "illegal cross physical
-  stage").
+  stage"). This also covers calling this function *after* ``stage_nodes``
+  have already been grouped into one physical-stage segment (e.g. after
+  ``graph.staging()``/``.group()``/``.blocking()`` -- an easy ordering
+  mistake): the common enclosing scope must be the top-level graph itself,
+  not an already-existing segment, or a nested ``IRSegment`` would silently
+  be created, violating this module's own core design invariant. (Found and
+  hardened via a dedicated post-commit self-audit, not during original
+  development -- see "Known limitations".)
 - a computed split point is out of range, or the resulting groups would not
   be contiguous / would not cover ``stage_nodes`` exactly once each
   ("non-contiguous nodes"); this also surfaces (with a clearer message) the
@@ -176,6 +183,11 @@ Validation
 - a parameter/buffer (attribute) tensor would end up read or written from
   more than one of the resulting local segments ("shared parameter across
   local segments" -- see the reducer-count hazard above).
+
+:func:`_stage_local_segments` (used by
+:meth:`LocalSegmentSched.sched_1f1b_local_segments`) additionally raises
+:class:`LocalSegmentError` if some device tuple's forward ``IRSegment``\\ s
+are not contiguous in graph order -- see "Known limitations" below.
 
 Scheduling
 ----------
@@ -249,11 +261,18 @@ Known limitations (honestly scoped out of Step B)
   and explicitly out of scope for Step B.
 - Combining local segments with *virtual* pipeline stages
   (``sched_1f1b_interleaved``) is not supported by
-  :class:`LocalSegmentSched` in this module -- device-tuple grouping cannot
-  distinguish "several local segments of one physical stage" from "several
-  virtual stages round-robined onto one device" by device tuple alone, and
-  virtual stages additionally *do* need adapters between them. Doing both
-  at once is future work, not attempted here.
+  :class:`LocalSegmentSched` in this module -- device-tuple grouping alone
+  cannot distinguish "several local segments of one physical stage" from
+  "several virtual stages round-robined onto one device", and virtual
+  stages additionally *do* need adapters between them. Doing both at once
+  is future work, not attempted here. This is actively *detected and
+  rejected* (:func:`_stage_local_segments` raises :class:`LocalSegmentError`
+  when a device tuple's segments are not contiguous in graph order -- the
+  hallmark of round-robin/virtual-stage placement), not merely undocumented:
+  a post-commit self-audit found the original implementation relied on this
+  incidentally (and not reliably) surfacing as a downstream
+  ``SchedulePlan.validate()`` failure instead of being checked directly, so
+  a dedicated, unconditional contiguity check was added.
 - Only a 1F1B-shaped schedule is provided
   (:meth:`LocalSegmentSched.sched_1f1b_local_segments`); other predefined
   schedules (GPipe, 1F1B-plus, Chimera-direct, infer-pipe) are not given a
@@ -516,11 +535,12 @@ def _validate_same_ungrouped_region(graph: IRGraph, stage_nodes: Sequence[IRFwOp
                 f"got {type(node)}: {node!r}."
             )
     # `graph.segment(node)` returns the lowest *existing* segment containing
-    # `node`. If the given nodes are not all directly inside the same
-    # not-yet-grouped region (e.g. some are already part of a *different*,
-    # previously-created physical-stage segment, or of the top graph while
-    # others are inside a segment), this is an illegal cross-physical-stage
-    # request: `graph.group()` would raise its own
+    # `node` (or `graph` itself when `node` is a direct, not-yet-grouped
+    # child of the top-level graph). If the given nodes are not all directly
+    # inside the same not-yet-grouped region (e.g. some are already part of
+    # a *different*, previously-created physical-stage segment, or of the
+    # top graph while others are inside a segment), this is an illegal
+    # cross-physical-stage request: `graph.group()` would raise its own
     # "cross-segment grouping is not allowed yet" assertion once it hit the
     # mismatch, but we check first, with a clearer, Step-B-specific message,
     # since this is an explicitly required diagnosable case (not merely an
@@ -535,6 +555,35 @@ def _validate_same_ungrouped_region(graph: IRGraph, stage_nodes: Sequence[IRFwOp
             f"IRSegments were mixed together), which is illegal: local "
             f"segments may only subdivide a *single* physical stage."
         )
+    # The single common enclosing scope must be the top-level graph itself,
+    # *not* an already-existing IRSegment. `len(enclosing) == 1` alone is
+    # NOT sufficient: if a caller mistakenly calls this function *after*
+    # `stage_nodes` have already been grouped into one physical-stage
+    # segment (e.g. after `graph.staging()`/`.group()`/`.blocking()` --
+    # the exact ordering mistake this module's docstring warns against),
+    # every node's enclosing scope is that *same* pre-existing segment, so
+    # the check above would (incorrectly) pass. Left unchecked, the
+    # subsequent `graph.group(subrange)` call would then create a *nested*
+    # IRSegment inside that pre-existing segment -- silently violating this
+    # module's own core design invariant (see the module docstring's "Why
+    # no core-file changes are needed": "we don't allow IRSegment inside
+    # IRSegment"). This was found (and is now guarded against) via a
+    # dedicated post-commit self-audit, not during original development.
+    (scope,) = enclosing
+    if scope is not graph:
+        raise LocalSegmentError(
+            f"stage_nodes already belong to an existing segment ({scope!r}) "
+            f"instead of being direct, not-yet-grouped children of the "
+            f"top-level graph. partition_stage_into_local_segments() must be "
+            f"called BEFORE any physical-stage grouping "
+            f"(graph.group()/.staging()/.blocking()) creates that segment -- "
+            f"calling it afterwards, on the already-grouped segment's own "
+            f".nodes(), would silently create a nested IRSegment inside "
+            f"{scope!r}, which this module's design explicitly forbids. "
+            f"Call this function first (on the raw, ungrouped node range), "
+            f"then use its returned local segments in place of a single "
+            f"graph.group(stage_nodes) call."
+        )
     # `stage_nodes` itself (regardless of whether a boundary later
     # subdivides it) must be a contiguous run in its enclosing scope's node
     # order -- e.g. `[nodes[0], nodes[2], nodes[3]]` (skipping nodes[1]) is
@@ -543,8 +592,7 @@ def _validate_same_ungrouped_region(graph: IRGraph, stage_nodes: Sequence[IRFwOp
     # actually called (e.g. never, for a custom boundary whose groups happen
     # to each individually be contiguous even though the *whole* range is
     # not); check it here, unconditionally and with a clearer message.
-    (fgraph,) = enclosing
-    indices = [fgraph.index(node)[0] for node in stage_nodes]
+    indices = [graph.index(node)[0] for node in stage_nodes]
     if max(indices) - min(indices) + 1 != len(stage_nodes):
         raise LocalSegmentError(
             f"stage_nodes are not contiguous in the graph's node order "
@@ -642,12 +690,50 @@ def _stage_local_segments(graph: IRGraph, num_stages: int) -> List[List[IRSegmen
     graph's node list in (forward) execution order; since local segments of
     one physical stage are always contiguous (see module docstring), this
     is exactly the pipeline stage order.
+
+    Raises:
+        LocalSegmentError: if some device tuple's forward IRSegments are not
+            contiguous in graph order (another device tuple's segment(s)
+            interleaved in between) -- the hallmark of a *virtual* pipeline
+            stage / round-robin staging (``sched_1f1b_interleaved``-style)
+            layout, which this scheduler does not support combining with
+            local segments (see module docstring's "Known limitations").
+            This is checked directly and unconditionally here, rather than
+            relying on it incidentally surfacing (or not) as a downstream
+            ``SchedulePlan.validate()`` failure -- found and hardened via a
+            dedicated post-commit self-audit, not during original
+            development.
+        ValueError: if the number of distinct device tuples among forward
+            IRSegments does not match ``num_stages``.
     """
     segments = graph.select(ntype=IRSegment, flatten=False)
     fsegs = [seg for seg in segments if seg.isfw()]
+
     devs2segs: Dict[Tuple[int, ...], List[IRSegment]] = {}
+    seen_keys: Set[Tuple[int, ...]] = set()
+    last_key: Optional[Tuple[int, ...]] = None
     for seg in fsegs:
-        devs2segs.setdefault(tuple(seg.device), []).append(seg)
+        key = tuple(seg.device)
+        if key != last_key:
+            if key in seen_keys:
+                raise LocalSegmentError(
+                    f"forward IRSegments assigned to device tuple {key} are "
+                    f"not contiguous in graph order -- another device "
+                    f"tuple's segment(s) appear between two of {key}'s "
+                    f"segments. LocalSegmentSched requires every physical "
+                    f"stage's local segments to form one contiguous run in "
+                    f"graph order; a non-contiguous device tuple almost "
+                    f"always means the graph was staged with *virtual* "
+                    f"pipeline stages (e.g. round-robin, "
+                    f"sched_1f1b_interleaved-style staging), which "
+                    f"LocalSegmentSched does not support combining with "
+                    f"local segments (see module docstring's 'Known "
+                    f"limitations')."
+                )
+            seen_keys.add(key)
+            last_key = key
+        devs2segs.setdefault(key, []).append(seg)
+
     if len(devs2segs) != num_stages:
         raise ValueError(
             f"Mismatch of physical stage number ({len(devs2segs)}, inferred "
@@ -655,6 +741,7 @@ def _stage_local_segments(graph: IRGraph, num_stages: int) -> List[List[IRSegmen
             f"num_stages ({num_stages})."
         )
     return list(devs2segs.values())
+
 
 
 class LocalSegmentSched:
