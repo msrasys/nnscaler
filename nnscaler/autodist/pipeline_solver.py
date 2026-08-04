@@ -5,6 +5,7 @@ from .model_graph import ModelGraph, estimate_mem_lower_bound, IntervalInfo
 from .spmd_solver import SPMDSolver
 from .descs import *
 from .autodist_config import AutoDistConfig
+from .constraints import PartitionConstraintV2
 
 import os
 import time
@@ -236,12 +237,80 @@ def _compute_tp_info(
     return tp_info
 
 
+def _build_v2_stage_constraints(
+    model_graph: ModelGraph,
+    autodist_config: AutoDistConfig,
+) -> Dict[int, int]:
+    """Build a mapping from operator index to required stage_id from V2 constraints.
+
+    Returns a dict: {op_idx: stage_id} for operators with pinned stages.
+    """
+    constraint_set = autodist_config.constraints
+    if constraint_set is None:
+        return {}
+
+    from nnscaler.graph.function.dimops import IRDimops
+    from nnscaler.ir import IRTensor
+    from .constraint_validator import _extract_layer_index
+
+    op_stage_map: Dict[int, int] = {}
+    for i, operator in enumerate(model_graph.operator_list):
+        op_name = operator.op_name
+        ir_cell = operator.ir_cell
+        module_stack = (
+            ir_cell.module_stack if isinstance(ir_cell, IRDimops) else {}
+        )
+        param_fqns = []
+        for item in ir_cell.inputs():
+            if isinstance(item, IRTensor) and item.is_param():
+                if hasattr(item, 'name'):
+                    param_fqns.append(item.name)
+        layer_index = _extract_layer_index(module_stack)
+        matches = constraint_set.get_matching_constraints(
+            op_name, module_stack, layer_index, param_fqns,
+        )
+        for c in matches:
+            if c.stage_id is not None:
+                if i in op_stage_map and op_stage_map[i] != c.stage_id:
+                    _logger.warning(
+                        f'Conflicting stage_id constraints for operator {i} '
+                        f'({operator.op_name}): {op_stage_map[i]} vs {c.stage_id}'
+                    )
+                op_stage_map[i] = c.stage_id
+    return op_stage_map
+
+
+def _stage_assignment_valid(
+    stage_ranges: List[Tuple[int, int]],
+    op_stage_map: Dict[int, int],
+) -> bool:
+    """Check whether a pipeline stage assignment respects V2 stage_id constraints.
+
+    Args:
+        stage_ranges: list of (start_op_idx, end_op_idx) per stage (inclusive)
+        op_stage_map: {op_idx: required_stage_id}
+    """
+    if not op_stage_map:
+        return True
+    for stage_id, (start, end) in enumerate(stage_ranges):
+        for op_idx in range(start, end + 1):
+            if op_idx in op_stage_map:
+                if op_stage_map[op_idx] != stage_id:
+                    return False
+    return True
+
+
 def calc_optimal_pp_plan(
         model_graph: ModelGraph,
         autodist_config: AutoDistConfig) -> PipelineSearchOutput:
     # TODO: based on experience, tensor parallelism should <= 8
     legal_tp_degrees = _calc_legal_tp_degrees(
         min(8, autodist_config.mesh_desc.col))
+
+    # Build V2 stage_id constraint map
+    op_stage_map = _build_v2_stage_constraints(model_graph, autodist_config)
+    if op_stage_map:
+        _logger.info(f'V2 stage_id constraints: {len(op_stage_map)} operator(s) pinned')
 
     tp_info = _compute_tp_info(model_graph, autodist_config, legal_tp_degrees)
     '''
@@ -347,6 +416,24 @@ def calc_optimal_pp_plan(
             build_answer(*prev_idx)
 
     build_answer(*valid_best_state)
+
+    # Validate V2 stage_id constraints against the final plan
+    if op_stage_map:
+        stage_ranges = []
+        for spmd_out in spmd_outs:
+            cids = sorted(spmd_out.desc.partition_descs.keys())
+            if cids:
+                # Map cids back to operator indices
+                cid2idx = {op.ir_cell.cid: idx for idx, op in enumerate(model_graph.operator_list)}
+                start_idx = cid2idx.get(cids[0], cids[0])
+                end_idx = cid2idx.get(cids[-1], cids[-1])
+                stage_ranges.append((start_idx, end_idx))
+        if stage_ranges and not _stage_assignment_valid(stage_ranges, op_stage_map):
+            _logger.warning(
+                'Pipeline plan violates V2 stage_id constraints. '
+                'The solver found an optimal plan that conflicts with '
+                'pinned stage assignments.'
+            )
 
     spmd_descs = [spmd_out.desc for spmd_out in spmd_outs]
     pp_desc = PipelineParallelDesc(spmd_descs, [], autodist_config.mesh_desc)
