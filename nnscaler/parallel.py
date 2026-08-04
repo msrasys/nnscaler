@@ -131,6 +131,13 @@ class ComputeConfig:
     #  2. the first return value of `module.forward` must be the loss
     #  which must be a scalar tensor
     use_end2end: bool = False
+    # whether to use FBW schedules or FB schedules. Default is False (FB schedules).
+    # only effective when `use_end2end` is True and `inference_only` is False.
+    # Only useful for pipeline training with multi-stream scheduling or `use_async_common` is True.
+    use_fbw: bool = False
+    # whether to use async communication for cross-stage collective operations.
+    # This option only works for pipeline.
+    use_async_comm: bool = False
 
     # whether to use async reducer
     # if True, the gradient all-reduce will be async,
@@ -227,6 +234,19 @@ class ComputeConfig:
         # Let's hide this feature for now for consistency.
         if self.use_zero and self.zero_use_reduce_scatter and self.zero_ngroups != 1:
             raise ValueError("zero_use_reduce_scatter is only supported when zero_ngroups is 1.")
+
+        if self.use_fbw:
+            if not self.use_end2end:
+                raise ValueError("use_fbw is only supported in end2end mode.")
+            if self.inference_only:
+                raise ValueError("use_fbw is not supported in inference mode.")
+
+            from nnscaler.runtime._patch_torch import FBW_SUPPORTED
+            if not FBW_SUPPORTED:
+                raise ValueError(
+                    "fbw is not supported in the current environment. "
+                    "Please update pytorch(2.5.0+) and/or python(3.10+) to a higher version."
+                )
 
     def apply_pipeline_scheduler(
             self,
@@ -402,13 +422,14 @@ def _compile_flags(compute_config: ComputeConfig):
         CompileFlag,
         async_reducer=compute_config.use_async_reducer, reducer_op='sum',
         max_reducer_bucket=compute_config.max_bucket_size_bytes,
-        async_comm=False,
+        async_comm=compute_config.use_async_comm,
         use_zero=compute_config.use_zero,
         zero_ngroups=compute_config.zero_ngroups,
         zero_use_reduce_scatter=compute_config.zero_use_reduce_scatter,
         trace_strategy=compute_config.trace_strategy,
         zero_param_level_sharding=compute_config.zero_param_level_sharding,
         reducer_replicated_params=compute_config.reducer_replicated_params,
+        use_fbw=compute_config.use_fbw,
     )
 
 
