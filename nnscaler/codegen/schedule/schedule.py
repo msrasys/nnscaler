@@ -304,7 +304,7 @@ class ScheduleCodeGen(FuncEmission):
             # return code
             if CompileFlag.async_comm:
                 _append_code(fb, 'nnscaler.runtime.executor.AsyncCommHandler().drain_sends()')
-                _append_code(fb, ssign.format(inputs=to_tensor_names(self.execplan.outputs())))
+                _append_code(fb, ssign.format(inputs=to_tensor_names(execplan.outputs())))
             outputs = self.return_name_complex(execplan.outputs())
             code = f'return {outputs}'
             _append_code(fb, code, force_flush=True)
@@ -338,7 +338,7 @@ class ScheduleCodeGen(FuncEmission):
                 # return code
                 if CompileFlag.async_comm:
                     _append_code(fb, 'nnscaler.runtime.executor.AsyncCommHandler().drain_sends()')
-                    _append_code(fb, ssign.format(inputs=to_tensor_names(self.execplan.outputs())))
+                    _append_code(fb, ssign.format(inputs=to_tensor_names(execplan.outputs())))
                 outputs = self.return_name_complex(execplan.outputs())
                 code = f'return {outputs}'
                 _append_code(fb, code, force_flush=True)
