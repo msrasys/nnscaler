@@ -9,7 +9,9 @@ from typing import TYPE_CHECKING
 
 import torch
 
+from nnscaler.runtime.dion_optimizer import Muon as _DionMuon
 from nnscaler.runtime.hybrid_optimizer import ScaleDelayedOptimizerMixin
+from nnscaler.utils import OptStateDict
 
 if TYPE_CHECKING:
     from nnscaler.cli.trainer import Trainer
@@ -210,3 +212,80 @@ class MixedPrecisionAdamW(MixedPrecisionF16OptimizerMixin, torch.optim.AdamW):
         self.fp32_params = self.build_fp32_params(self.f16_params)
         kwargs = {**unfolded_kwargs, **kwargs}
         super().__init__(self.fp32_params, **kwargs)
+
+
+class MixedPrecisionDionMuon(MixedPrecisionF16OptimizerMixin, _DionMuon):
+    """Dion Muon with BF16/FP16 model parameters and FP32 optimizer state."""
+
+    _fp32_state_key = 'fp32_params'
+    additional_state_keys = (_fp32_state_key,)
+    state_key_dtypes = {
+        'momentum': torch.float32,
+        _fp32_state_key: torch.float32,
+    }
+
+    def __init__(self, params, **kwargs):
+        f16_params, unfolded_kwargs = self._unfold_params(params)
+        kwargs = {**unfolded_kwargs, **kwargs}
+
+        # Flatten metadata is attached to the model parameters and is lost when
+        # FP32 copies are created, so consume it on the model side first.
+        self._flat_map = {}
+        self.f16_params = self._unflatten_params(f16_params)
+        self.fp32_params = self.build_fp32_params(self.f16_params)
+
+        super().__init__(
+            self.fp32_params,
+            _nnscaler_flat_map=self._flat_map,
+            **kwargs,
+        )
+
+    def state_dict(self):
+        """Return bucket-flattened momentum and FP32 master parameters."""
+        state: OptStateDict = torch.optim.Optimizer.state_dict(self)
+        if state['state']:
+            # Optimizer.state_dict() returns shallow state entries. Copy them so
+            # attaching master parameters does not modify the live optimizer.
+            state['state'] = {
+                index: dict(param_state)
+                for index, param_state in state['state'].items()
+            }
+            for index, fp32_param in enumerate(self.fp32_params):
+                state['state'].setdefault(index, {})[
+                    self._fp32_state_key
+                ] = fp32_param.detach()
+        return self._flatten_state_dict(state)
+
+    def load_state_dict(self, state_dict: OptStateDict):
+        """Restore bucket-flattened momentum and FP32 master parameters."""
+        state_dict = self._unflatten_state_dict(state_dict)
+        loaded_fp32 = False
+
+        optimizer_state = {}
+        for index, param_state in state_dict['state'].items():
+            param_state = dict(param_state)
+            fp32_tensor = param_state.pop(self._fp32_state_key, None)
+            if fp32_tensor is not None:
+                target = self.fp32_params[index]
+                target.data.copy_(
+                    fp32_tensor.to(device=target.device, dtype=torch.float32)
+                )
+                loaded_fp32 = True
+
+            momentum = param_state.get(self.momentum_buffer_name)
+            if momentum is not None:
+                param_state[self.momentum_buffer_name] = momentum.detach().to(
+                    dtype=torch.float32
+                )
+            optimizer_state[index] = param_state
+
+        state_dict['state'] = optimizer_state
+        if not loaded_fp32:
+            logger.warning(
+                'fp32_params not found in state_dict, '
+                'will sync from fp16 params to fp32 params'
+            )
+            self._sync_fp16_params_to_fp32()
+
+        torch.optim.Optimizer.load_state_dict(self, state_dict)
+        self._fp32_params_loaded = True
