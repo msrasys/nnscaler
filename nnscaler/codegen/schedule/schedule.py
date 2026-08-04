@@ -223,6 +223,11 @@ class ScheduleCodeGen(FuncEmission):
                             if _is_adapter(node) and _depends_totally_on(node, prev_backward_node):
                                 # if the next node is an adapter that depends on the last backward,
                                 # we need to emit the adapter before the last backward_weight codes
+                                # TODO: `_depends_totally_on` looks unnecessary,
+                                # we should remove it and always emit adapters before the last backward_weight codes.
+                                # All adapters that follow a backward segment should depend on
+                                # the outputs of the previous backward/forward segments.
+                                # So all adapters should be emitted before the last backward_weight codes.
                                 _append_skip_flag(node) # should no-op for adapters.
                                 _append_code(fb, codes, self._get_node_stream(node))
                             else:
