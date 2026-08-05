@@ -139,11 +139,10 @@ def test_deserialize():
     x = parse_args(['--a=1', '--b', '0', '--c.d=3', '--c.e', '4', '--f.g.h=5',
                         '--v.a=10', '--v.b=20',
                         '--z.u.__type', 'tests.cli.test_arg_parser.GConfig',
-                        '--z.u.h=6', '--z.u.w=x'
+                        '--z.u.h=6'
         ])
     y = deserialize_dataclass(x, A)
-    # u is not a member of a dataclass, so it will be deserialized to dict instead of GConfig.
-    assert y.z == {'u': {'__type': 'tests.cli.test_arg_parser.GConfig', 'h': 6, 'w': 'x'}}
+    assert y.z == {'u': GConfig(h=6)}
 
 
 def test_deserialize_list():
@@ -189,6 +188,16 @@ def test_deserialize_value_type():
     x = parse_args(['--p.value=1'])
     y = deserialize_dataclass(x, A)
     assert y.p == {'value': 1}
+
+
+def test_deserialize_dataclass_nested_value_object():
+    @dataclass
+    class A:
+        p: Any = None
+
+    value_object = {'__value_type': 'int', 'value': '1'}
+    y = deserialize_dataclass({'p': {'nested': value_object}}, A)
+    assert y.p == {'nested': 1}
 
 
 def test_deserialize_union_type():

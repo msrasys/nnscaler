@@ -67,8 +67,7 @@ from nnscaler.utils import (
     OptStateDict,
     copy_dynamic,
     broadcast_files,
-    broadcast_mixed_data,
-    gather_mixed_data,
+    first
 )
 
 logger = logging.getLogger(__name__)
@@ -252,16 +251,20 @@ class ComputeConfig:
             self,
             graph: IRGraph,
             pipeline_nstages: int,
-            pipeline_nmicros: int,
+            pipeline_nmicros: Union[int, List[int]],
             pipeline_scheduler: Union[str, Callable[[IRGraph, int, int], SchedulePlan]]
-    ) -> Optional[SchedulePlan]:
+    ) -> Optional[Union[SchedulePlan, Dict[int, SchedulePlan]]]:
         """
         Apply the pipeline scheduler to the graph.
         """
         if not self.use_end2end:
             raise ValueError("pipeline is only supported in end2end mode")
-        if pipeline_nmicros <= 0:
+        if (isinstance(pipeline_nmicros, int) and pipeline_nmicros <= 0) or (
+            isinstance(pipeline_nmicros, (list, tuple)) and any(n <= 0 for n in pipeline_nmicros)
+        ):
             raise ValueError(f"pipeline_nmicros {pipeline_nmicros} must be > 0.")
+        if isinstance(pipeline_nmicros, (list, tuple))and len(pipeline_nmicros) == 0:
+            raise ValueError(f"pipeline_nmicros {pipeline_nmicros} must not be empty.")
         if pipeline_nstages <= 0:
             raise ValueError(f"pipeline_nstages {pipeline_nstages} must be > 0.")
         if self.inference_only and pipeline_scheduler not in _PREDEFINED_INFERENCE_SCHEDS:
@@ -284,7 +287,19 @@ class ComputeConfig:
             if not callable(pipeline_scheduler):
                 raise ValueError(f"pipeline_scheduler {pipeline_scheduler} is not str nor callable.")
             sched = pipeline_scheduler
-        return sched(graph, pipeline_nmicros, pipeline_nstages)
+
+        if isinstance(pipeline_nmicros, (list, tuple)) and len(pipeline_nmicros) == 1:
+            pipeline_nmicros = pipeline_nmicros[0]
+
+        if isinstance(pipeline_nmicros, int):
+            graph.bind_schedule(sched(graph, pipeline_nmicros, pipeline_nstages))
+        else:
+            scheds = {}
+            for num_micro in pipeline_nmicros:
+                scheds[num_micro] = sched(graph, num_micro, pipeline_nstages)
+            graph.bind_schedule(scheds)
+
+        return graph.sched
 
     @property
     def gpu_config(self) -> Dict[str, int]:
@@ -909,11 +924,23 @@ def _gencode(
             raise RuntimeError(f"Node {node} device is not set")
     # anchor node removed in gener
     graph = IRAdapterGener.gen(graph, cost_fn=None)
+    # `graph.sched` can be a single `SchedulePlan` or a `Dict[int, SchedulePlan]`
+    # (one plan per number of micro-batches) when multiple schedulers are enabled.
     if graph.sched is not None:
-        graph.sched.apply()
+        for sched_plan in (
+            [graph.sched] if not isinstance(graph.sched, dict) else graph.sched.values()
+        ):
+            sched_plan.apply()
 
     if isinstance(graph.sched, SchedulePlan):
         execplan = ExecutionPlan.from_schedplan(graph.sched)
+    elif isinstance(graph.sched, dict):
+        # generate an independent execution plan for each schedule plan.
+        # `from_schedplan` does not mutate the shared graph, so this is safe.
+        execplan = {
+            nmicros: ExecutionPlan.from_schedplan(sched_plan)
+            for nmicros, sched_plan in graph.sched.items()
+        }
     else:
         execplan = ExecutionPlan.from_graph(graph)
 
@@ -922,9 +949,14 @@ def _gencode(
     if not graph.sched:
         execplan = Grouping.apply(execplan)
 
+    # for a dict of execution plans (multiple schedulers), the module (non-schedule)
+    # code is identical across plans because they share the same graph, so we use a
+    # representative execution plan to generate the module code.
+    repr_execplan = first(execplan.values()) if isinstance(execplan, dict) else execplan
+
     # code generation
-    assert len(execplan.graph.device) == compute_config.plan_ngpus, f"{execplan.graph.device}"
-    mgener = ModuleCodeGen(execplan, compute_config.runtime_ngpus)
+    assert len(repr_execplan.graph.device) == compute_config.plan_ngpus, f"{repr_execplan.graph.device}"
+    mgener = ModuleCodeGen(repr_execplan, compute_config.runtime_ngpus)
     sgener = None
     if compute_config.use_end2end:
         sgener = ScheduleCodeGen(execplan, compute_config.runtime_ngpus)

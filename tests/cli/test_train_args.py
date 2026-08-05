@@ -9,6 +9,7 @@ import nnscaler
 from nnscaler.cli.trainer_args import (
     load_type, ComputeConfig, OptionalComputeConfig, TrainerArgs,
     _resolve_precision, _to_precision, _get_tensor_dtype,
+    _deserialize_int_or_dict_of_ints,
 )
 from nnscaler.runtime.utils import set_grad_dtype, get_grad_dtype
 
@@ -80,6 +81,17 @@ def test_dyn_str_config():
         '--global_batch_size!',
     ])
     assert args.instance_name == 'instance_p1'
+
+
+@pytest.mark.parametrize(('value', 'expected'), [
+    (4, 4),
+    ('4', 4),
+    ({0: 2, '5': '4'}, {0: 2, 5: 4}),
+    ('{0: 2, "5": "4"}', {0: 2, 5: 4}),
+    ({'__value_type': 'int', 'value': '4'}, 4),
+])
+def test_deserialize_int_or_dict_of_ints(value, expected):
+    assert _deserialize_int_or_dict_of_ints(value) == expected
 
 
 # --- grad dtype tests ---

@@ -140,7 +140,7 @@ def trainer_split_serializer_worker(tmp_path, symblink):
     torch.distributed.barrier()
 
     ckpt_files = list_ckpt_files(ckpt_savedir)
-    assert len(ckpt_files)/4 == min(10, trainer.total_train_steps_per_epoch * 4) + 2 # 2 for best/last
+    assert len(ckpt_files)/4 == min(10, trainer.total_train_steps_per_epoch[0] * 4) + 2 # 2 for best/last
 
     for f in ckpt_files:
         assert trainer.checkpointer.load(f)['mark'] == 'hello'

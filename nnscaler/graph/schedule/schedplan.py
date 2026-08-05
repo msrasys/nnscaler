@@ -487,12 +487,13 @@ class SchedulePlan(PlanBase):
     For each device, only up to one segment can be executed on a step.
     """
 
-    def __init__(self, graph: IRGraph, num_microbatches: int):
+    def __init__(self, graph: IRGraph, num_microbatches: int, bind_graph: bool = True):
         super().__init__(graph)
         # execution sequence
         self._num_microbatches = num_microbatches
         # bind to the graph
-        graph._bind_schedule(self)
+        if bind_graph:
+            graph.bind_schedule(self)
 
     @property
     def nmicros(self) -> int:
@@ -633,3 +634,6 @@ class SchedulePlan(PlanBase):
 
     def __repr__(self):
         return self.str(show_max_steps=20)
+
+
+SchedulePlanType = Union[SchedulePlan, Dict[int, SchedulePlan]]

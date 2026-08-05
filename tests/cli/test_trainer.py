@@ -240,7 +240,7 @@ def trainer_resume_worker(save_dir, save_type, bf16, parallel_type=0):
     ])
     trainer.run()
     ckpt_files = list_ckpt_files(ckpt_savedir)
-    assert len(ckpt_files)/4 == min(30, trainer.total_train_steps_per_epoch * 4) + 2 # 2 for best/last
+    assert len(ckpt_files)/4 == min(30, trainer.total_train_steps_per_epoch[0] * 4) + 2 # 2 for best/last
 
     torch.distributed.barrier()
     # train 4 epcho two times (resume from last)
@@ -265,7 +265,7 @@ def trainer_resume_worker(save_dir, save_type, bf16, parallel_type=0):
     ])
     trainer.run()
     ckpt0_files0 = {f: f.stat().st_mtime_ns for f in list_ckpt_files(ckpt0_savedir)}
-    assert len(ckpt0_files0)/4 == min(30, trainer.total_train_steps_per_epoch * 2) + 2 # 2 for best/last
+    assert len(ckpt0_files0)/4 == min(30, trainer.total_train_steps_per_epoch[0] * 2) + 2 # 2 for best/last
 
     # resume from last without update max_epochs
     trainer = Trainer([
@@ -326,7 +326,7 @@ def trainer_resume_worker(save_dir, save_type, bf16, parallel_type=0):
         assert ckpt0_files0[f] == s
 
     ckpt0_files1 = list_ckpt_files(ckpt0_savedir)
-    assert len(ckpt0_files1)/4 == min(30, trainer.total_train_steps_per_epoch * 4) + 2 # 2 for best/last
+    assert len(ckpt0_files1)/4 == min(30, trainer.total_train_steps_per_epoch[0] * 4) + 2 # 2 for best/last
 
     torch.distributed.barrier()
 
@@ -357,7 +357,7 @@ def trainer_resume_worker(save_dir, save_type, bf16, parallel_type=0):
         assert ckpt0_files0[f] == s
 
     ckpt0_files1 = list_ckpt_files(ckpt0_savedir)
-    assert len(ckpt0_files1)/4 == min(30, trainer.total_train_steps_per_epoch * 4) + 2 # 2 for best/last
+    assert len(ckpt0_files1)/4 == min(30, trainer.total_train_steps_per_epoch[0] * 4) + 2 # 2 for best/last
 
     torch.distributed.barrier()
 
@@ -963,7 +963,6 @@ def tracing_from_weights_worker(tmp_path):
         trainer = Trainer([
             '-f', config_path,
             '--gen_savedir', str(gen_dir),
-            '--global_batch_size', '0',
             '--max_epochs', '-1',  # HACK: will exit without training.
             '--max_train_steps', '-1',
             '--compute_config.plan_ngpus', '1',
