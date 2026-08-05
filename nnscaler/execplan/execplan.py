@@ -155,7 +155,16 @@ class ExecutionPlan:
                     t.grad = fgrad.select(tensor.grad.indmap, tensor.grad.valmap)
             return t
 
+        # Imported lazily to keep the generic execution-plan module free of a
+        # phase-scheduler import cycle for non-phase callers.
+        from nnscaler.graph.schedule.phase import phase_execution_identity
+
         micro_fcells: Dict[(int, IRCell), ExeReuseCell] = {}
+        def _attach_phase_execution_identity(reuse: ExeReuseCell, block: Block) -> None:
+            identity = phase_execution_identity(block)
+            if identity is not None:
+                reuse.set_op_context('phase_execution_identity', identity)
+
         def block2reuse(node: Block) -> ExeReuseCell:
             # Note: we set op_context for forward and backward seperately.
             # But as forward/backward are paired
@@ -168,17 +177,21 @@ class ExecutionPlan:
                 inputs = [get(t, node.mid) for t in node.content.inputs()]
                 outputs = [get(t, node.mid) for t in node.content.outputs()]
                 cell = ExeReuseCell(node.content, inputs, outputs)
+                _attach_phase_execution_identity(cell, node)
                 if node.stream_context is not None:
                     cell.set_op_context('stream_context', node.stream_context)
                 if isinstance(node.content.mirror, IRCell):
                     minputs = [get(t, node.mid) for t in node.content.mirror.inputs()]
                     moutputs = [get(t, node.mid) for t in node.content.mirror.outputs()]
                     mcell = ExeReuseCell(node.content.mirror, minputs, moutputs)
+                    _attach_phase_execution_identity(
+                        mcell, Block(node.content.mirror, node.mid, node.span))
                     IRCell.make_pair(cell, mcell)
                 micro_fcells[key] = cell
                 return cell
             else:
                 mcell = block2reuse(Block(node.content.mirror, node.mid, node.span))
+                _attach_phase_execution_identity(mcell.mirror, node)
                 if node.stream_context is not None:
                     mcell.mirror.set_op_context('stream_context', node.stream_context)
                 return mcell.mirror
@@ -200,24 +213,30 @@ class ExecutionPlan:
                 outputs.append(outs[0] if len(outs) == 1 else outs)
 
         execplan = ExecutionPlan(schedplan.graph, topo_seqs)
+        execplan._assign_phase_executor_slots()
         execplan.set_outputs(outputs)
 
         def _is_cuda_stream_used() -> bool:
-            if schedplan.stream_config.dataloader and schedplan.stream_config.dataloader.stream:
+            def uses_non_default_stream(stream_context: Optional[StreamContext]) -> bool:
+                return bool(stream_context and stream_context.stream not in (None, 'default'))
+
+            if uses_non_default_stream(schedplan.stream_config.dataloader):
                 return True
-            if schedplan.stream_config.inter_segment_move and schedplan.stream_config.inter_segment_move.stream:
+            if uses_non_default_stream(schedplan.stream_config.inter_segment_move):
                 return True
-            if schedplan.stream_config.result_broadcast and schedplan.stream_config.result_broadcast.stream:
+            if uses_non_default_stream(schedplan.stream_config.result_broadcast):
                 return True
-            if schedplan.stream_config.grad_reduce and schedplan.stream_config.grad_reduce.stream:
+            if uses_non_default_stream(schedplan.stream_config.grad_reduce):
                 return True
-            if schedplan.stream_config.zero_grad and schedplan.stream_config.zero_grad.stream:
+            if uses_non_default_stream(schedplan.stream_config.zero_grad):
                 return True
 
             for block in schedplan.nodes():
-                # check segment stream context (all segments are wrapped in blocks)
+                # Explicit ``'default'`` is a placement guarantee, not a
+                # multi-stream workload. Waits still imply true cross-stream
+                # synchronization and keep the existing safety behavior.
                 if isinstance(block, Block) and (stream_context := block.stream_context) is not None:
-                    if stream_context.stream:
+                    if uses_non_default_stream(stream_context):
                         return True
                     if stream_context.wait_streams:
                         return True
@@ -242,6 +261,9 @@ class ExecutionPlan:
         self._zero_grad_stream_context: Optional[StreamContext] = None
         self._use_multi_streams = False
         self._cuda_sync_required = False
+        # Device -> number of dense PhaseExecutor slots required by its
+        # scheduled phase execution instances. Populated after dispatch.
+        self._phase_executor_slot_counts: Dict[int, int] = {}
 
         for node in self._topo_seqs:
             assert len(node.device) > 0, f"Node device not set: {node}"
@@ -292,6 +314,28 @@ class ExecutionPlan:
     @zero_grad_stream_context.setter
     def zero_grad_stream_context(self, stream_context: StreamContext):
         self._zero_grad_stream_context = stream_context
+
+    def _assign_phase_executor_slots(self) -> None:
+        """Assign a dense forward/backward-shared slot per phase instance."""
+        for devid, nodes in self._seq.items():
+            slots: Dict[Tuple, int] = {}
+            for node in nodes:
+                identity = node.get_op_context('phase_execution_identity')
+                if identity is None:
+                    continue
+                key = (
+                    identity.microbatch,
+                    identity.physical_stage,
+                    identity.layer_id,
+                    identity.phase_type,
+                    identity.seq_in_layer,
+                )
+                slot = slots.setdefault(key, len(slots))
+                node.set_op_context('phase_executor_slot', slot)
+            self._phase_executor_slot_counts[devid] = len(slots)
+
+    def phase_executor_slot_count(self, devid: int) -> int:
+        return self._phase_executor_slot_counts.get(devid, 0)
 
     @property
     def use_multi_streams(self) -> bool:

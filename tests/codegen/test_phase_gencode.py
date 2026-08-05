@@ -27,15 +27,19 @@ generated ``.py`` source text* for:
 import re
 import tempfile
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 import pytest
 import torch
 
 from nnscaler.ir.unique import IDGenerator
+from nnscaler.ir.tensor import IRSubTensor
 from nnscaler.parallel import _gen_graph, ComputeConfig
+from nnscaler.flags import CompileFlag
 from nnscaler.graph.gener.gen import IRAdapterGener
 from nnscaler.execplan import ExecutionPlan
+from nnscaler.graph.segment import IRSegment
+from nnscaler.graph.schedule.schedplan import StreamContext
 from nnscaler.execplan.planpass.fusion import DiffFusion
 from nnscaler.codegen.module.module import ModuleCodeGen
 from nnscaler.codegen.schedule.schedule import ScheduleCodeGen
@@ -56,7 +60,9 @@ T = 8
 
 
 def _compile_phase_moe(tmpdir: Path, *, dedicated_moe_comm_stream: bool = False,
-                       independent_pp_replica_lanes: bool = False) -> Dict[int, str]:
+                       independent_pp_replica_lanes: Optional[bool] = None,
+                       pp_replica_semantics: Optional[str] = 'equal',
+                       explicit_default_stream: bool = False) -> Dict[int, str]:
     IDGenerator().clear()
     cfg = MoEConfig(dim=DIM, n_heads=NHEADS, seq_len=SEQLEN, ffn_hidden=FFN_HIDDEN, capacity_factor=1.0)
     model = PhaseMoEModel(cfg, NUM_STAGES, LAYERS_PER_STAGE, EP_RANKS_PER_STAGE, use_phases=True)
@@ -68,9 +74,13 @@ def _compile_phase_moe(tmpdir: Path, *, dedicated_moe_comm_stream: bool = False,
         NUM_STAGES, LAYERS_PER_STAGE, EP_RANKS_PER_STAGE, use_phases=True,
         dedicated_moe_comm_stream=dedicated_moe_comm_stream,
         independent_pp_replica_lanes=independent_pp_replica_lanes,
+        pp_replica_semantics=pp_replica_semantics,
     )
     config = ComputeConfig(RUNTIME_NDEVS, RUNTIME_NDEVS, use_end2end=True, pas_config=dict(pipeline_nmicros=NMICROS))
     graph = pas(graph, config)
+    if explicit_default_stream:
+        for segment in graph.select(ntype=IRSegment, flatten=False):
+            segment.set_op_context('stream_context', StreamContext(stream='default'))
 
     adapter_graph = IRAdapterGener.gen(graph, cost_fn=None)
     if adapter_graph.sched is not None:
@@ -108,12 +118,69 @@ def dedicated_gencode() -> Dict[int, str]:
 
 
 
+def test_gencode_identity_independent_lane_mapping_is_noop():
+    """A marked local identity layout must compile without an RVD gather."""
+    with replace_all_device_with('cpu', force=True):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmpdir = Path(tmpdir)
+            IDGenerator().clear()
+            cfg = MoEConfig(dim=DIM, n_heads=NHEADS, seq_len=SEQLEN, ffn_hidden=FFN_HIDDEN, capacity_factor=1.0)
+            model = PhaseMoEModel(cfg, 1, 2, [(0, 1)], use_phases=True)
+            graph, fargs = _gen_graph(
+                model,
+                {'data': {'data': torch.randn(T, cfg.dim), 'target': torch.randn(T, cfg.dim)}},
+                tmpdir,
+                constant_folding=True,
+                end2end_mode=True,
+            )
+            graph = make_pas(1, 2, [(0, 1)], use_phases=True)(
+                graph,
+                ComputeConfig(2, 2, use_end2end=True, pas_config=dict(pipeline_nmicros=NMICROS)),
+            )
+            fsegments = [segment for segment in graph.select(ntype=IRSegment, flatten=False) if segment.isfw()]
+            assert len(fsegments) >= 8
+            marked = [output for output in fsegments[3].outputs() if isinstance(output, IRSubTensor)]
+            assert marked
+            for output in marked:
+                output.parent.mark_independent_replica_lanes()
+            adapter_graph = IRAdapterGener.gen(graph, cost_fn=None)
+            adapter_graph.sched.apply()
+            execplan = DiffFusion.apply(ExecutionPlan.from_schedplan(adapter_graph.sched))
+            outfile = str(tmpdir / 'identity_lane.py')
+            ModuleCodeGen(execplan, 2).gen(0, forward_args=fargs, outfile=outfile,
+                                           attach=False, as_parallel_module=True, end2end_mode=True)
+            ScheduleCodeGen(execplan, 2).gen(0, outfile=outfile, attach=True)
+            generated = Path(outfile).read_text()
+    assert 'runtime.adapter.all_gather' not in generated
+
+
+def test_gencode_explicit_default_stream_is_a_real_context():
+    """``None`` and ``'default'`` must not collapse to the same codegen path."""
+    with replace_all_device_with('cpu', force=True):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            generated = _compile_phase_moe(Path(tmpdir), explicit_default_stream=True)
+    text = generated[0]
+    marker = "with torch.cuda.stream(nnscaler.runtime.device.DeviceGroup().get_stream('default')):"
+    assert marker in text
+    # Placement on the default stream is not a non-default multi-stream workload.
+    assert 'use_multi_streams = False' in text
+    assert '.record_stream(torch.cuda.current_stream())' not in text
+
+
+def test_gencode_pp_ep_replica_semantics_must_be_explicit():
+    """A PP×EP policy cannot silently assume rank-distinct lanes are equal."""
+    with replace_all_device_with('cpu', force=True):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with pytest.raises(ValueError, match='PP x EP replica semantics must be explicit'):
+                _compile_phase_moe(Path(tmpdir), pp_replica_semantics=None)
+
+
 def test_gencode_pp_ep_independent_lanes_fail_closed():
     """RVD replicas cannot silently become asymmetric EP lanes at a PP edge."""
     with replace_all_device_with('cpu', force=True):
         with tempfile.TemporaryDirectory() as tmpdir:
-            with pytest.raises(ValueError, match='independent replica lanes at a PP boundary are not yet executable safely'):
-                _compile_phase_moe(Path(tmpdir), independent_pp_replica_lanes=True)
+            with pytest.raises(ValueError, match='non-identity PP boundary are not yet executable safely'):
+                _compile_phase_moe(Path(tmpdir), pp_replica_semantics='independent')
 
 def _train_step_body(text: str) -> List[str]:
     lines = text.splitlines()
@@ -125,6 +192,23 @@ def _train_step_body(text: str) -> List[str]:
 # ---------------------------------------------------------------------------
 # 1) distinct phase methods
 # ---------------------------------------------------------------------------
+
+def test_gencode_phase_executor_can_be_disabled_for_ablation(monkeypatch):
+    monkeypatch.setattr(CompileFlag, 'disable_phase_executor', True)
+    with replace_all_device_with('cpu', force=True):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            generated = _compile_phase_moe(Path(tmpdir))
+    text = generated[0]
+    assert '_phase_fexecute = model._phase_executor.forward' not in text
+    assert 'nnscaler.runtime.executor.fexecute(' in text
+
+
+def test_gencode_phase_executor_slots_are_used(gencode):
+    text = gencode[0]
+    assert 'self._phase_executor = nnscaler.runtime.executor.PhaseExecutor(' in text
+    assert '_phase_fexecute = model._phase_executor.forward' in text
+    assert '_phase_backward = model._phase_executor.backward' in text
+
 
 def test_gencode_has_distinct_phase_methods(gencode):
     """Device 0 (stage 0, layer 0) must contain 4 distinct `segmentNNN`
@@ -148,18 +232,18 @@ def _find_dispatch_window(body: List[str]):
     window: the dispatch call's return-tuple's LAST element is the pending
     tensor; the wait window's fexecute call must reference that SAME
     variable name as its argument."""
-    issue_re = re.compile(r'(\w+), (\w+), (\w+) = nnscaler\.runtime\.executor\.fexecute\(.segment\d+., model\.segment\d+, \*\((\w+), \)')
+    issue_re = re.compile(r'(\w+), (\w+), (\w+) = _phase_fexecute\(\d+, model\.segment\d+, \*\((\w+), \)')
     for i, line in enumerate(body):
         m = issue_re.search(line)
         if not m:
             continue
         pending_var = m.group(3)
         wait_idx = next((j for j in range(i + 1, len(body))
-                          if f'*({pending_var}, )' in body[j] and 'fexecute' in body[j]), None)
+                          if f'*({pending_var}, )' in body[j] and 'phase_fexecute' in body[j]), None)
         if wait_idx is None:
             continue
         backward_idx = next((j for j in range(i + 1, wait_idx)
-                              if 'nnscaler.runtime.executor.backward(' in body[j]), None)
+                              if '_phase_backward(' in body[j]), None)
         if backward_idx is None:
             continue
         return i, backward_idx, wait_idx, pending_var
@@ -186,18 +270,18 @@ def test_gencode_combine_issue_lt_backward_lt_wait(gencode):
     body = _train_step_body(gencode[0])
     # combine issue: fexecute('segmentNNN', ..., *(dispatch_pending, )) whose
     # single return value feeds a LATER fexecute call by the same name.
-    issue_re = re.compile(r'(\w+) = nnscaler\.runtime\.executor\.fexecute\(.segment\d+., model\.segment\d+, \*\(\w+, \)')
+    issue_re = re.compile(r'(\w+) = _phase_fexecute\(\d+, model\.segment\d+, \*\(\w+, \)')
     for i, line in enumerate(body):
         m = issue_re.search(line)
         if not m:
             continue
         pending_var = m.group(1)
         wait_idx = next((j for j in range(i + 1, len(body))
-                          if re.search(rf'\b{re.escape(pending_var)}\b', body[j]) and 'fexecute' in body[j]), None)
+                          if re.search(rf'\b{re.escape(pending_var)}\b', body[j]) and 'phase_fexecute' in body[j]), None)
         if wait_idx is None:
             continue
         backward_idx = next((j for j in range(i + 1, wait_idx)
-                              if 'nnscaler.runtime.executor.backward(' in body[j]), None)
+                              if '_phase_backward(' in body[j]), None)
         if backward_idx is None:
             continue
         assert i < backward_idx < wait_idx
@@ -237,7 +321,7 @@ def test_gencode_stream_block_wraps_dispatch_issue_specifically(dedicated_gencod
     text = dedicated_gencode[0]
     pattern = re.compile(
         r"with torch\.cuda\.stream\(nnscaler\.runtime\.device\.DeviceGroup\(\)\.get_stream\('moe_comm'\)\):\n"
-        r"(?:.*\n)*?\s*\S+ = nnscaler\.runtime\.executor\.fexecute\('segment\d+', model\.segment\d+, \*\(\S+, \), requires_grad=True\)\n"
+        r"(?:.*\n)*?\s*\S+ = _phase_fexecute\(\d+, model\.segment\d+, \*\(\S+, \), requires_grad=True\)\n"
     )
     assert pattern.search(text), text
 
@@ -273,7 +357,7 @@ def _find_stream_context_blocks(body: List[str]):
     block_re = re.compile(r"with torch\.cuda\.stream\(nnscaler\.runtime\.device\.DeviceGroup\(\)\.get_stream\('(\w+)'\)\):")
     wait_re = re.compile(r"torch\.cuda\.current_stream\(\)\.wait_stream\(nnscaler\.runtime\.device\.DeviceGroup\(\)\.get_stream\('(\w+)'\)\)")
     record_re = re.compile(r'^\s*(\w+)\.record_stream\(torch\.cuda\.current_stream\(\)\)')
-    fexecute_re = re.compile(r"fexecute\('segment\d+', model\.segment\d+, \*\(([^)]*)\)")
+    fexecute_re = re.compile(r"_phase_fexecute\(\d+, model\.segment\d+, \*\(([^)]*)\)")
     blocks = []
     i = 0
     while i < len(body):
@@ -383,7 +467,7 @@ def test_gencode_record_stream_targets_match_producer_event_semantics(dedicated_
     start_idx, _, wait_idx, wait_src, record_entries, fexecute_idx, fexecute_args = moe_comm_blocks[0]
     assert wait_src == 'default', f"expected the moe_comm block to wait on the 'default' stream, got {wait_src!r}"
     for rec_idx, rec_var in record_entries:
-        producer_pattern = re.compile(rf'{re.escape(rec_var)} = nnscaler\.runtime\.executor\.fexecute\(')
+        producer_pattern = re.compile(rf'{re.escape(rec_var)} = _phase_fexecute\(')
         producer_idx = next((k for k in range(start_idx) if producer_pattern.search(body[k])), None)
         assert producer_idx is not None, (
             f"expected {rec_var!r} to be produced by an earlier fexecute call "

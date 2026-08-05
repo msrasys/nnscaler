@@ -67,22 +67,36 @@ def _replica_lanes(ftensor, ranks):
     return tensors
 
 
-def test_independent_replica_lanes_fail_closed_before_rvd_collectives():
+def test_independent_replica_lanes_identity_mapping_is_noop(monkeypatch):
     ftensor = IRFullTensor((4, 8), requires_grad=True).mark_independent_replica_lanes()
     assert ftensor.like().independent_replica_lanes
     assert ftensor.grad.independent_replica_lanes
 
+    def unexpected_rvd_path(*args, **kwargs):
+        raise AssertionError('identity independent lanes must not enter an RVD path')
+
+    monkeypatch.setattr(ConcurrentGener, 'gen_intra_rvd', staticmethod(unexpected_rvd_path))
+    monkeypatch.setattr(ConcurrentGener, 'gen_inter_rvd', staticmethod(unexpected_rvd_path))
     fsrc = _replica_lanes(ftensor, [0, 1])
-    fdst = _replica_lanes(ftensor, [2, 3])
-    bsrc = _replica_lanes(ftensor.grad, [2, 3])
+    fdst = _replica_lanes(ftensor, [0, 1])
+    bsrc = _replica_lanes(ftensor.grad, [0, 1])
     bdst = _replica_lanes(ftensor.grad, [0, 1])
-    with pytest.raises(ValueError, match='independent replica lanes at a PP boundary are not yet executable safely'):
-        ConcurrentGener.gen(fsrc, fdst, bsrc, bdst)
+    assert ConcurrentGener.gen(fsrc, fdst, bsrc, bdst) is None
 
 
-def test_independent_replica_lanes_fail_closed_for_nonbijective_mesh():
-    ftensor = IRFullTensor((4, 8)).mark_independent_replica_lanes()
+@pytest.mark.parametrize('consumer_ranks', ([1, 0], [2, 3], [2, 3, 4]))
+def test_independent_replica_lanes_nonidentity_fail_closed_before_rvd_collectives(
+        monkeypatch, consumer_ranks):
+    ftensor = IRFullTensor((4, 8), requires_grad=True).mark_independent_replica_lanes()
+
+    def unexpected_rvd_path(*args, **kwargs):
+        raise AssertionError('non-identity independent lanes must fail before an RVD path')
+
+    monkeypatch.setattr(ConcurrentGener, 'gen_intra_rvd', staticmethod(unexpected_rvd_path))
+    monkeypatch.setattr(ConcurrentGener, 'gen_inter_rvd', staticmethod(unexpected_rvd_path))
     fsrc = _replica_lanes(ftensor, [0, 1])
-    fdst = _replica_lanes(ftensor, [2, 3, 4])
-    with pytest.raises(ValueError, match='independent replica lanes at a PP boundary are not yet executable safely'):
-        ConcurrentGener.gen(fsrc, fdst, [], [])
+    fdst = _replica_lanes(ftensor, consumer_ranks)
+    bsrc = _replica_lanes(ftensor.grad, consumer_ranks)
+    bdst = _replica_lanes(ftensor.grad, [0, 1])
+    with pytest.raises(ValueError, match='non-identity PP boundary are not yet executable safely'):
+        ConcurrentGener.gen(fsrc, fdst, bsrc, bdst)

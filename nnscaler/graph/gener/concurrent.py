@@ -66,25 +66,59 @@ class ConcurrentGener:
         return layout
 
     @staticmethod
+    def _same_rvd_lane_mapping(producer: RVDLayout, consumer: RVDLayout) -> bool:
+        """Whether two RVD layouts are exactly the same physical lane mapping.
+
+        Compare each grid cell rather than device sets: ``[0, 1] -> [1, 0]``
+        is a non-identity lane permutation even though the device sets match.
+        """
+        if producer.vec != consumer.vec:
+            return False
+        for ptensor, ctensor in zip(producer.mat.flat, consumer.mat.flat):
+            if (ptensor.device != ctensor.device or
+                    ptensor.indmap != ctensor.indmap or
+                    ptensor.valmap != ctensor.valmap):
+                return False
+        return True
+
+    @staticmethod
+    def _independent_replica_lanes_are_identity(
+        fptensors: List[IRSubTensor], fctensors: List[IRSubTensor],
+        bptensors: List[IRSubTensor], bctensors: List[IRSubTensor],
+    ) -> bool:
+        """Check the only marked-lane case that needs no adapter at all."""
+        ftensor = fptensors[0].parent
+        playout = ConcurrentGener._independent_replica_lane_layout(ftensor, fptensors, 'producer')
+        clayout = ConcurrentGener._independent_replica_lane_layout(ftensor, fctensors, 'consumer')
+        if not ConcurrentGener._same_rvd_lane_mapping(playout, clayout):
+            return False
+        if not bptensors and not bctensors:
+            return True
+        if not bptensors or not bctensors:
+            return False
+        grad = ftensor.grad
+        if grad is None:
+            return False
+        bplayout = ConcurrentGener._independent_replica_lane_layout(grad, bptensors, 'backward producer')
+        bclayout = ConcurrentGener._independent_replica_lane_layout(grad, bctensors, 'backward consumer')
+        return ConcurrentGener._same_rvd_lane_mapping(bplayout, bclayout)
+
+    @staticmethod
     def _fail_independent_replica_lanes(
         fptensors: List[IRSubTensor], fctensors: List[IRSubTensor],
     ) -> None:
         """Fail closed rather than apply RVD replica collectives to lanes.
 
-        A bijective ``src[i] -> dst[i]`` transfer is numerically simple, but a
-        real PP execution may reach forward and reverse lane transfers in
-        different orders on different stages/microbatches.  The default NCCL
-        process group has a single untagged P2P ordering domain, while a
-        world-group collective would also require an identical global call
-        order.  Neither condition is represented by the current local
-        ``SchedulePlan``.  Reject until a first-class global lane issue/wait
-        schedule can prove that ordering.
+        A non-identity bijection needs a first-class global transfer ordinal:
+        different PP stages can otherwise reach forward and reverse lane
+        transfers in different microbatch orders on the untagged world P2P
+        process group.  Only an identity mapping can safely be a no-op today.
         """
         ftensor = fptensors[0].parent
         playout = ConcurrentGener._independent_replica_lane_layout(ftensor, fptensors, 'producer')
         clayout = ConcurrentGener._independent_replica_lane_layout(ftensor, fctensors, 'consumer')
         raise ValueError(
-            'independent replica lanes at a PP boundary are not yet executable safely: '
+            'independent replica lanes at a non-identity PP boundary are not yet executable safely: '
             f'producer={playout}, consumer={clayout}. The existing RVD inter-path may '
             'all-gather R replicas and would merge lane values, so compilation is refused. '
             'Implement a global deterministic lane issue/wait schedule plus an explicit '
@@ -116,6 +150,11 @@ class ConcurrentGener:
         # lanes.  Do this before any RVD path finder so it can never select a
         # replica all-gather/all-reduce transformation for lane data.
         if fptensors[0].parent.independent_replica_lanes:
+            if ConcurrentGener._independent_replica_lanes_are_identity(
+                    fptensors, fctensors, bptensors, bctensors):
+                # The physical/value mapping is already exact on every lane;
+                # adding an adapter would only create needless work.
+                return None
             ConcurrentGener._fail_independent_replica_lanes(fptensors, fctensors)
 
         # case 1: sharing device (intra-rvd)

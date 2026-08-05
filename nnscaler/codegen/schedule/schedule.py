@@ -11,6 +11,7 @@ from nnscaler.ir.operator import IRDataOperation, IRFwOperation
 from nnscaler.ir.tensor import IRSubTensor
 from nnscaler.ir.adapter import IRWeightReducer, IRAdapter
 from nnscaler.graph.graph import IRSegment
+from nnscaler.graph.schedule.phase import get_phase
 
 from nnscaler.execplan.execplan import ExecutionPlan, ExeReuseCell
 
@@ -27,6 +28,8 @@ _logger = logging.getLogger(__name__)
 fsign = '{outputs} = nnscaler.runtime.executor.fexecute({name}, {model}, *{inputs}, requires_grad={req_grad})'
 asign = '{outputs} = nnscaler.runtime.executor.aexecute({model}, *{inputs}, requires_grad={req_grad})'
 bsign = '{input_grads} = nnscaler.runtime.executor.backward({name}, {input_tensors}, {output_tensors}, {output_grads})'
+phase_fsign = '{outputs} = _phase_fexecute({slot}, {model}, *{inputs}, requires_grad={req_grad})'
+phase_bsign = '{input_grads} = _phase_backward({slot}, {output_tensors}, {output_grads})'
 bi_sign = '{input_grads} = nnscaler.runtime.executor.backward_input({name}, {input_tensors}, {output_tensors}, {output_grads}, {weights})'
 bw_sign = 'nnscaler.runtime.executor.backward_weight({name}, {weights})'
 bw_fn_name = 'nnscaler.runtime.executor.backward_weight'
@@ -81,6 +84,14 @@ class ScheduleCodeGen(FuncEmission):
         gencode = copy.copy(self.init_code)
         device_map = device % len(self.devices)
         device_nodes = self.execplan.seq(device_map)
+        has_phase_executor = (
+            not CompileFlag.disable_phase_executor
+            and not CompileFlag.use_fbw
+            and any(
+                node.get_op_context('phase_executor_slot') is not None
+                for node in device_nodes
+            )
+        )
         # We will manually set the `skip_reducer` flag and `skip_zero_grad`
         # when we use scheduler (i.e. pipeline parallelism)
         # Otherwise, the caller of `_train_step` will set these flags to support gradient accumulation
@@ -106,16 +117,16 @@ class ScheduleCodeGen(FuncEmission):
             objs = IR.get_objects(val)
             return self.tuple_name([obj for obj in objs if isinstance(obj, IRTensor)])
 
-        def _is_default_stream(stream: Optional[str]) -> bool:
-            return stream is None or stream == 'default'
-
         def _get_codes_with_stream_context(codes: List[str], stream: Optional[str]) -> List[str]:
-            if _is_default_stream(stream):
+            # ``None`` deliberately preserves the caller's current stream.
+            # The explicit string ``'default'`` has different semantics: it
+            # must enter CUDA's default stream even when train_step itself was
+            # invoked under a non-default stream.
+            if stream is None:
                 return codes + ['']
-            else:
-                with Block(f'with torch.cuda.stream(nnscaler.runtime.device.DeviceGroup().get_stream({repr(stream)})):' ) as stream_block:
-                    stream_block.insert_body(codes)
-                return stream_block.code + ['']
+            with Block(f'with torch.cuda.stream(nnscaler.runtime.device.DeviceGroup().get_stream({repr(stream)})):' ) as stream_block:
+                stream_block.insert_body(codes)
+            return stream_block.code + ['']
 
         def _append_code(fb: FunctionBlock, code: Union[List[str], str], stream: Optional[str] = None, force_flush=False):
             codes = code if isinstance(code, list) else [code]
@@ -154,6 +165,9 @@ class ScheduleCodeGen(FuncEmission):
         with FunctionBlock(func_name='_train_step',
                            args=args) as fb:
             _append_code(fb, '_ = None')
+            if has_phase_executor:
+                _append_code(fb, '_phase_fexecute = model._phase_executor.forward')
+                _append_code(fb, '_phase_backward = model._phase_executor.backward')
 
             if use_scheduler:
                 _append_code(fb, 'nnscaler.flags.RuntimeFlag.skip_zero_grad = False')
@@ -273,6 +287,8 @@ class ScheduleCodeGen(FuncEmission):
         else:
             with FunctionBlock(func_name='_infer_step', args=args) as fb:
                 _append_code(fb, '_ = None')
+                if has_phase_executor:
+                    _append_code(fb, '_phase_fexecute = model._phase_executor.forward')
                 # body code
                 if len(device_nodes) == 0:
                     _append_code(fb, 'pass')
@@ -326,9 +342,7 @@ class ScheduleCodeGen(FuncEmission):
 
     def _get_node_stream(self, node: IRCell) -> Optional[str]:
         stream_context = self._get_node_stream_context(node)
-        if stream_context and stream_context.stream not in (None, 'default'):
-            return stream_context.stream
-        return None
+        return stream_context.stream if stream_context else None
 
     def _emit_stream_context(self, stream_context, codes: List[str]) -> List[str]:
         wait_stream_codes = []
@@ -460,19 +474,36 @@ class ScheduleCodeGen(FuncEmission):
         unwrap_node = node.cell if isinstance(node, ExeReuseCell) else node
         name = self.node_name(unwrap_node)
         stream_context = self._get_node_stream_context(node)
+        phase_slot = node.get_op_context('phase_executor_slot')
+        use_phase_executor = (
+            isinstance(unwrap_node, IRSegment)
+            and phase_slot is not None
+            and get_phase(unwrap_node) is not None
+            and not CompileFlag.use_fbw
+            and not CompileFlag.disable_phase_executor
+        )
 
         if isinstance(unwrap_node, IRSegment):
             # segment hooks
             pre_hook, post_hook, hook_meta = unwrap_node.pre_hook, unwrap_node.post_hook, unwrap_node.hook_meta
             # emit forward segment
             if node.isfw():
-                codes = [fsign.format(
-                    outputs = outputs,
-                    name = f"'{name}'",
-                    model = f'model.{name}',
-                    inputs = inputs,
-                    req_grad = req_grad
-                )]
+                if use_phase_executor:
+                    codes = [phase_fsign.format(
+                        outputs=outputs,
+                        slot=phase_slot,
+                        model=f'model.{name}',
+                        inputs=inputs,
+                        req_grad=req_grad,
+                    )]
+                else:
+                    codes = [fsign.format(
+                        outputs = outputs,
+                        name = f"'{name}'",
+                        model = f'model.{name}',
+                        inputs = inputs,
+                        req_grad = req_grad
+                    )]
                 if pre_hook:
                     codes = self._emit_segment_hook_code(pre_hook, hook_meta, inputs, is_pre=True) + codes
                 if post_hook:
@@ -508,13 +539,21 @@ class ScheduleCodeGen(FuncEmission):
                         weights = 'model.parameters()'
                     ))
                 else:
-                    codes = [bsign.format(
-                        name = f"'{self.node_name(unwrap_node.mirror)}'", # always use name of fw segment
-                        input_grads = input_grads_str,
-                        input_tensors = input_tensors_str,
-                        output_tensors = output_tensors_str,
-                        output_grads = output_grads_str
-                    )]
+                    if use_phase_executor:
+                        codes = [phase_bsign.format(
+                            input_grads=input_grads_str,
+                            slot=phase_slot,
+                            output_tensors=output_tensors_str,
+                            output_grads=output_grads_str,
+                        )]
+                    else:
+                        codes = [bsign.format(
+                            name = f"'{self.node_name(unwrap_node.mirror)}'", # always use name of fw segment
+                            input_grads = input_grads_str,
+                            input_tensors = input_tensors_str,
+                            output_tensors = output_tensors_str,
+                            output_grads = output_grads_str
+                        )]
 
                 bwd_input_str = f'({input_tensors_str}, {output_tensors_str}, {output_grads_str})'
                 bwd_output_str = input_grads_str if len(input_grads) <= 1 else f'({input_grads_str})'

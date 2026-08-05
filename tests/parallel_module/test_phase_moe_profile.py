@@ -86,6 +86,8 @@ def _profile_worker(mode):
         import nnscaler.runtime.executor as executor_module
         original_fexecute = executor_module.fexecute
         original_backward = executor_module.backward
+        original_phase_forward = executor_module.PhaseExecutor.forward
+        original_phase_backward = executor_module.PhaseExecutor.backward
 
         def _range(label, fn, *args, **kwargs):
             torch.cuda.nvtx.range_push(label)
@@ -101,8 +103,22 @@ def _profile_worker(mode):
         def profiled_backward(name, *args, **kwargs):
             return _range(f'nnscaler/backward/{name}', original_backward, name, *args, **kwargs)
 
+        def profiled_phase_forward(phase_executor, slot, subgraph, *args, **kwargs):
+            return _range(
+                f'nnscaler/phase_fexecute/slot{slot}', original_phase_forward,
+                phase_executor, slot, subgraph, *args, **kwargs,
+            )
+
+        def profiled_phase_backward(phase_executor, slot, outputs, grads):
+            return _range(
+                f'nnscaler/phase_backward/slot{slot}', original_phase_backward,
+                phase_executor, slot, outputs, grads,
+            )
+
         executor_module.fexecute = profiled_fexecute
         executor_module.backward = profiled_backward
+        executor_module.PhaseExecutor.forward = profiled_phase_forward
+        executor_module.PhaseExecutor.backward = profiled_phase_backward
         try:
             activities = [torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA]
             with torch.profiler.profile(activities=activities, profile_memory=True, record_shapes=False) as profiler:
@@ -116,6 +132,8 @@ def _profile_worker(mode):
         finally:
             executor_module.fexecute = original_fexecute
             executor_module.backward = original_backward
+            executor_module.PhaseExecutor.forward = original_phase_forward
+            executor_module.PhaseExecutor.backward = original_phase_backward
 
         events = sorted(profiler.key_averages(), key=lambda event: event.self_cpu_time_total, reverse=True)
         summary = []
@@ -144,7 +162,7 @@ def test_phase_moe_c_profile():
         report = outputs[0]
         assert report['events']
         if mode != 'serial':
-            assert any(item['key'].startswith('nnscaler/fexecute/') for item in report['events'])
+            assert any(item['key'].startswith('nnscaler/phase_fexecute/') for item in report['events'])
         print(f'\n[C profile] mode={mode}')
         for event in report['events']:
             print('[C profile]', event)

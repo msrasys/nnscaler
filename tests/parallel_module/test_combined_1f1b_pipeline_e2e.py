@@ -109,6 +109,7 @@ import torch.nn as nn
 
 from nnscaler.parallel import ComputeConfig, parallelize, build_optimizer, merge_state_dicts
 from nnscaler.graph.schedule.schedplan import StreamConfig, StreamContext
+from nnscaler.graph.segment import IRSegment
 
 from .common import init_distributed, PASMegatron
 from ..launch_torchrun import launch_torchrun, clone_to_cpu_recursively
@@ -321,6 +322,66 @@ def _restore_env(saved):
             os.environ.pop(k, None)
         else:
             os.environ[k] = v
+
+
+def _record_default_stream_segment(model, meta, inputs, kwargs):
+    """Generated segment pre-hook: record actual CUDA stream placement."""
+    hits = getattr(model, '_explicit_default_stream_hits', None)
+    if hits is not None:
+        hits.append(torch.cuda.current_stream().cuda_stream == torch.cuda.default_stream().cuda_stream)
+
+
+def _pas_explicit_default_stream(graph, config: ComputeConfig):
+    """Force every generated segment onto CUDA default, not caller-current."""
+    graph = PASMegatron(graph, config)
+    for segment in graph.select(ntype=IRSegment, flatten=False):
+        segment.set_op_context('stream_context', StreamContext(stream='default'))
+        segment.pre_hook = _record_default_stream_segment
+    return graph
+
+
+def _explicit_default_stream_worker():
+    init_distributed()
+    dev = torch.cuda.current_device()
+    init_random()
+    with clear_dir_on_rank0(Path(tempfile.gettempdir()) / f'explicit_default_stream_{PYTEST_RUN_ID}') as tempdir:
+        model = parallelize(
+            _MLP(),
+            {'data': {'data': torch.randn(MBS, DIM, device=dev),
+                      'target': torch.rand(MBS, DIM, device=dev)}},
+            _pas_explicit_default_stream,
+            ComputeConfig(NSTAGES, NSTAGES, use_end2end=True, use_async_recv=True,
+                          pas_config=dict(pipeline_nstages=NSTAGES, pipeline_nmicros=NMICROS,
+                                          pipeline_scheduler='1f1b')),
+            gen_savedir=tempdir,
+            instance_name='explicit_default_stream',
+        )
+        generated = ''
+        if torch.distributed.get_rank() == 0:
+            generated = '\n'.join(path.read_text() for path in sorted(tempdir.rglob('*.py')))
+    model.cuda()
+    model._explicit_default_stream_hits = []
+    batch = [{key: value.to(dev) for key, value in micro.items()}
+             for micro in _make_data(1, NMICROS, seed=8128)[0]]
+    side = torch.cuda.Stream()
+    with torch.cuda.stream(side):
+        model.train_step(batch)
+    torch.cuda.synchronize()
+    return list(model._explicit_default_stream_hits), generated
+
+
+@pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.device_count() < 2,
+                    reason='requires >= 2 gpus')
+def test_explicit_default_stream_overrides_nondefault_train_step_caller():
+    """Generated ``stream='default'`` must not silently mean caller-current."""
+    with _Alarm(180, 'possible deadlock: explicit default stream e2e'):
+        outputs = launch_torchrun(NSTAGES, _explicit_default_stream_worker)
+    assert outputs and len(outputs) == NSTAGES
+    for rank in range(NSTAGES):
+        hits, _ = outputs[rank]
+        assert hits and all(hits), f'rank {rank} ran a segment outside CUDA default: {hits}'
+    source = outputs[0][1]
+    assert "with torch.cuda.stream(nnscaler.runtime.device.DeviceGroup().get_stream('default')):" in source
 
 
 @pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.device_count() < 2,

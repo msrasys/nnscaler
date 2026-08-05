@@ -670,7 +670,8 @@ def _assign_node_for_ep(graph: IRGraph, node, ep_ranks: List[int]) -> None:
 
 def make_pas(num_stages: int, layers_per_stage: int, ep_ranks_per_stage: Sequence[Sequence[int]],
              use_phases: bool, *, dedicated_moe_comm_stream: bool = False,
-             independent_pp_replica_lanes: bool = False,
+             independent_pp_replica_lanes: Optional[bool] = None,
+             pp_replica_semantics: Optional[str] = None,
              global_phase_interleave: bool = False):
     """Build a ``parallelize(..., pas_fn, ...)``-compatible PAS policy.
 
@@ -690,6 +691,31 @@ def make_pas(num_stages: int, layers_per_stage: int, ep_ranks_per_stage: Sequenc
     """
     def pas(graph: IRGraph, config: ComputeConfig):
         from nnscaler.graph.schedule.predefined import PredefinedSched
+
+        # Static RVD replicas cannot reveal whether runtime inputs are equal.
+        # A PP x EP policy must therefore say whether its boundary means true
+        # equal replicas (legacy RVD semantics) or independent ordered lanes.
+        # Keep the older boolean as a compatibility spelling, but never let an
+        # omitted declaration silently select all-gather for this test policy.
+        semantics = pp_replica_semantics
+        if independent_pp_replica_lanes is not None:
+            legacy_semantics = 'independent' if independent_pp_replica_lanes else 'equal'
+            if semantics is not None and semantics != legacy_semantics:
+                raise ValueError(
+                    'independent_pp_replica_lanes conflicts with pp_replica_semantics; '
+                    'use one explicit declaration'
+                )
+            semantics = legacy_semantics
+        needs_pp_ep_declaration = num_stages > 1 and any(len(ranks) > 1 for ranks in ep_ranks_per_stage)
+        if needs_pp_ep_declaration and semantics not in ('equal', 'independent'):
+            raise ValueError(
+                'PP x EP replica semantics must be explicit: pass '
+                "pp_replica_semantics='equal' for truly equal replicas or "
+                "pp_replica_semantics='independent' for lane-preserving activations"
+            )
+        if semantics is not None and semantics not in ('equal', 'independent'):
+            raise ValueError(f'unknown pp_replica_semantics {semantics!r}')
+        independent_lanes = semantics == 'independent'
 
         nmicros = config.pas_config['pipeline_nmicros']
         all_ops = [n for n in graph.nodes() if isinstance(n, IRFwOperation)]
@@ -733,14 +759,14 @@ def make_pas(num_stages: int, layers_per_stage: int, ep_ranks_per_stage: Sequenc
                     _set_moe_stream_context(
                         phase_nodes, dedicated_comm_stream=dedicated_moe_comm_stream)
                     stage_terminal_segment = phase_nodes[-1].segment
-                if independent_pp_replica_lanes and sid < num_stages - 1:
+                if independent_lanes and sid < num_stages - 1:
                     _mark_independent_replica_boundary(stage_terminal_segment)
             else:
                 stage_nodes = all_ops[stage_start:stage_end]
                 stage_terminal_segment = graph.group(stage_nodes)
                 for node in stage_nodes:
                     _assign_node_for_ep(graph, node, ep_ranks)
-                if independent_pp_replica_lanes and sid < num_stages - 1:
+                if independent_lanes and sid < num_stages - 1:
                     _mark_independent_replica_boundary(stage_terminal_segment)
 
         for dl in dataloaders:

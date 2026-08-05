@@ -71,6 +71,7 @@ def _worker(use_phases: bool, global_phase_interleave: bool = False):
             make_pas(
                 NUM_STAGES, LAYERS_PER_STAGE, EP_RANKS_PER_STAGE, use_phases=use_phases,
                 global_phase_interleave=global_phase_interleave,
+                pp_replica_semantics='equal',
             ),
             ComputeConfig(
                 NGPUS, NGPUS, use_end2end=True,
@@ -196,6 +197,7 @@ def _global_topology_worker(num_stages, ep_ranks_per_stage, ngpus, nmicros, glob
             make_pas(
                 num_stages, LAYERS_PER_STAGE, ep_ranks_per_stage, use_phases=True,
                 global_phase_interleave=global_phase_interleave,
+                pp_replica_semantics='equal',
             ),
             ComputeConfig(ngpus, ngpus, use_end2end=True, use_async_recv=True,
                           pas_config=dict(pipeline_nmicros=nmicros)),

@@ -365,6 +365,191 @@ class _WeightBackwardState:
     output_tensor_grads: Optional[Tuple[Optional[torch.Tensor], ...]] = None
 
 
+@dataclass(frozen=True)
+class PhaseSpec:
+    """Cached input schema for one scheduled phase execution slot.
+
+    The generated schedule gives every `(microbatch, stage, layer, phase)` a
+    stable integer slot.  This schema avoids repeated generic id-dictionary
+    construction while retaining alias and dynamic-input fallbacks.
+    """
+    input_arity: int
+    tensor_mask: Tuple[bool, ...]
+    grad_mask: Tuple[bool, ...]
+    grad_positions: Tuple[int, ...]
+    alias_groups: Tuple[Tuple[int, ...], ...]
+
+    @classmethod
+    def from_inputs(cls, inputs: Tuple[Any, ...]) -> 'PhaseSpec':
+        tensor_mask = tuple(torch.is_tensor(value) for value in inputs)
+        grad_mask = tuple(
+            bool(value.requires_grad) if is_tensor else False
+            for value, is_tensor in zip(inputs, tensor_mask)
+        )
+        grad_positions = tuple(index for index, requires_grad in enumerate(grad_mask) if requires_grad)
+        groups: List[List[int]] = []
+        positions_by_id: Dict[int, int] = {}
+        for index in grad_positions:
+            tensor_id = id(inputs[index])
+            group_index = positions_by_id.get(tensor_id)
+            if group_index is None:
+                positions_by_id[tensor_id] = len(groups)
+                groups.append([index])
+            else:
+                groups[group_index].append(index)
+        return cls(
+            input_arity=len(inputs),
+            tensor_mask=tensor_mask,
+            grad_mask=grad_mask,
+            grad_positions=grad_positions,
+            alias_groups=tuple(tuple(group) for group in groups),
+        )
+
+    def matches(self, inputs: Tuple[Any, ...]) -> bool:
+        if len(inputs) != self.input_arity:
+            return False
+        for index, value in enumerate(inputs):
+            if bool(torch.is_tensor(value)) != self.tensor_mask[index]:
+                return False
+            if self.tensor_mask[index] and bool(value.requires_grad) != self.grad_mask[index]:
+                return False
+        group_heads = []
+        for group in self.alias_groups:
+            head = id(inputs[group[0]])
+            if any(id(inputs[index]) != head for index in group[1:]):
+                return False
+            group_heads.append(head)
+        return len(group_heads) == len(set(group_heads))
+
+
+@dataclass
+class _PhaseState:
+    detached_inputs: Tuple[torch.Tensor, ...]
+
+
+class PhaseExecutor:
+    """Model-owned slot executor for independently schedulable phase islands.
+
+    It intentionally preserves one autograd graph and one backward invocation
+    per phase.  The fast path only removes generic string/FIFO bookkeeping and
+    rebuilds cached detach/alias metadata when an input schema changes.
+    """
+
+    def __init__(self, slot_count: int):
+        if slot_count <= 0:
+            raise ValueError(f'phase executor requires slot_count > 0, got {slot_count}')
+        self._states: List[Optional[_PhaseState]] = [None] * slot_count
+        self._specs: List[Optional[PhaseSpec]] = [None] * slot_count
+
+    @property
+    def slot_count(self) -> int:
+        return len(self._states)
+
+    def _check_slot(self, slot: int) -> None:
+        if not isinstance(slot, int) or slot < 0 or slot >= self.slot_count:
+            raise RuntimeError(f'invalid phase execution slot {slot!r}; expected [0, {self.slot_count})')
+
+    @staticmethod
+    def _sync_inputs(inputs: Tuple[Any, ...]) -> Tuple[Any, ...]:
+        # Match Executor.sync_tensors exactly when work exists.  Most phase
+        # boundaries have no outstanding async work, so avoid its generic list
+        # construction and handler scan in that common case.
+        handler = AsyncCommHandler()
+        if not handler.has_pending():
+            return inputs
+        handler.drain_all_completed()
+        return tuple(handler.wait(value) if torch.is_tensor(value) else value for value in inputs)
+
+    def forward(self, slot: int, subgraph: Callable, *inputs: Any, requires_grad: bool = True):
+        self._check_slot(slot)
+        inputs = self._sync_inputs(inputs)
+        if not requires_grad:
+            with torch.no_grad():
+                return subgraph(*inputs)
+        if self._states[slot] is not None:
+            raise RuntimeError(
+                f'phase execution slot {slot} already holds a forward state; '
+                'the prior phase instance must run backward or be cleared first'
+            )
+
+        spec = self._specs[slot]
+        if spec is None or not spec.matches(inputs):
+            spec = PhaseSpec.from_inputs(inputs)
+            self._specs[slot] = spec
+
+        detached = list(inputs)
+        for alias_group in spec.alias_groups:
+            source = inputs[alias_group[0]]
+            dtensor = source.detach().requires_grad_()
+            for index in alias_group:
+                detached[index] = dtensor
+        outputs = subgraph(*detached)
+        self._states[slot] = _PhaseState(tuple(detached[index] for index in spec.grad_positions))
+        return outputs
+
+    def backward(self, slot: int, output_tensors: List[torch.Tensor],
+                 output_tensor_grads: List[Optional[torch.Tensor]]):
+        self._check_slot(slot)
+        output_tensor_grads = list(self._sync_inputs(tuple(output_tensor_grads)))
+        state = self._states[slot]
+        if state is None:
+            raise RuntimeError(f'no pending forward state for phase execution slot {slot}')
+        # Clear before autograd to match Executor's popleft-before-backward
+        # lifecycle on an exception as well as on normal completion.
+        self._states[slot] = None
+        if len(output_tensors) == 0:
+            return None
+
+        dtensors = state.detached_inputs
+        input_tensors = []
+        for tensor in dtensors:
+            if torch.is_tensor(tensor) and tensor.requires_grad:
+                tensor.retain_grad()
+                input_tensors.append(tensor)
+
+        visited = set()
+        dedup_outputs = []
+        dedup_grads = []
+        for tensor, grad in zip(output_tensors, output_tensor_grads):
+            pair = (id(tensor), id(grad))
+            if pair not in visited:
+                visited.add(pair)
+                dedup_outputs.append(tensor)
+                dedup_grads.append(grad)
+
+        if Executor._backward_pre_hook is not None:
+            input_tensors, dedup_outputs, dedup_grads = Executor._backward_pre_hook(
+                input_tensors, dedup_outputs, dedup_grads
+            )
+        torch.autograd.backward(dedup_outputs, grad_tensors=dedup_grads)
+        grads = tuple(tensor.grad for tensor in input_tensors)
+        assert all(grad is not None for grad in grads), 'RuntimeError: got gradient None'
+        if len(grads) == 0:
+            return None
+        if len(grads) == 1:
+            return grads[0]
+        return grads
+
+    def clear(self) -> None:
+        self._states[:] = [None] * self.slot_count
+
+    def check_clear(self) -> None:
+        occupied = [index for index, state in enumerate(self._states) if state is not None]
+        if occupied:
+            raise AssertionError(f'phase executor has pending forward state in slots {occupied}')
+
+
+def phase_fexecute(phase_executor: PhaseExecutor, slot: int, subgraph: Callable,
+                   *inputs: Any, requires_grad: bool = True):
+    return phase_executor.forward(slot, subgraph, *inputs, requires_grad=requires_grad)
+
+
+def phase_backward(phase_executor: PhaseExecutor, slot: int,
+                   output_tensors: List[torch.Tensor],
+                   output_tensor_grads: List[Optional[torch.Tensor]]):
+    return phase_executor.backward(slot, output_tensors, output_tensor_grads)
+
+
 class Executor:
 
     # We consider each segment as an isolated graph. By

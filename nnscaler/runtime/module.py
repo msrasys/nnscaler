@@ -1493,8 +1493,15 @@ class ParallelModule(CubeModule):
         enabled; a cheap no-op flag check otherwise.
         """
         try:
-            return step_fn()
+            result = step_fn()
+            phase_executor = getattr(self, '_phase_executor', None)
+            if phase_executor is not None:
+                phase_executor.check_clear()
+            return result
         except BaseException:
+            phase_executor = getattr(self, '_phase_executor', None)
+            if phase_executor is not None:
+                phase_executor.clear()
             if CompileFlag.async_recv:
                 AsyncCommHandler().force_clear_after_exception()
             raise

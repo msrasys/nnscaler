@@ -4,7 +4,7 @@
 import pytest
 import torch
 
-from nnscaler.runtime.executor import Executor
+from nnscaler.runtime.executor import Executor, PhaseExecutor, phase_fexecute, phase_backward
 
 
 @pytest.fixture(autouse=True)
@@ -191,3 +191,103 @@ def test_backward_weight_requires_pending_input_backward():
     module = torch.nn.Linear(8, 16)
     with pytest.raises(RuntimeError, match='No pending weight backward'):
         Executor.backward_weight('linear', module.parameters())
+
+
+def test_phase_executor_matches_full_backward_and_reuses_slot():
+    torch.manual_seed(5)
+    reference, actual = _make_linears()
+    executor = PhaseExecutor(1)
+    input_data = torch.randn(4, 8, dtype=torch.float64)
+    output_grad = torch.randn(4, 16, dtype=torch.float64)
+
+    reference_input = input_data.clone().requires_grad_()
+    reference(reference_input).backward(output_grad)
+
+    actual_input = input_data.clone().requires_grad_()
+    output = phase_fexecute(executor, 0, actual, actual_input)
+    input_grad = phase_backward(executor, 0, [output], [output_grad])
+    torch.testing.assert_close(input_grad, reference_input.grad)
+    torch.testing.assert_close(actual.weight.grad, reference.weight.grad)
+    torch.testing.assert_close(actual.bias.grad, reference.bias.grad)
+    executor.check_clear()
+
+    # The same slot is intentionally reused on the next train step only after
+    # backward released its saved state.
+    actual.zero_grad()
+    second = actual_input.detach().clone().requires_grad_()
+    second_output = phase_fexecute(executor, 0, actual, second)
+    phase_backward(executor, 0, [second_output], [output_grad])
+    executor.check_clear()
+
+
+def test_phase_executor_preserves_aliases_and_hook_once():
+    executor = PhaseExecutor(1)
+    input_data = torch.randn(3, 4)
+    output_grad = torch.randn(3, 4)
+    hook_calls = []
+
+    reference_input = input_data.clone().requires_grad_()
+    (reference_input + reference_input).backward(output_grad * 2)
+
+    def scale_grad(inputs, outputs, grads):
+        hook_calls.append(None)
+        return inputs, outputs, [grad * 2 for grad in grads]
+
+    Executor.register_backward_pre_hook(scale_grad)
+    actual_input = input_data.clone().requires_grad_()
+    output = phase_fexecute(executor, 0, lambda left, right: left + right, actual_input, actual_input)
+    grads = phase_backward(executor, 0, [output], [output_grad])
+    assert len(hook_calls) == 1
+    assert isinstance(grads, tuple) and len(grads) == 2
+    torch.testing.assert_close(grads[0], reference_input.grad)
+    torch.testing.assert_close(grads[1], reference_input.grad)
+    executor.check_clear()
+
+
+def test_phase_executor_rejects_overwrite_and_clears_explicitly():
+    executor = PhaseExecutor(1)
+    value = torch.randn(2, requires_grad=True)
+    phase_fexecute(executor, 0, lambda x: x * 2, value)
+    with pytest.raises(RuntimeError, match='already holds a forward state'):
+        phase_fexecute(executor, 0, lambda x: x * 2, value)
+    executor.clear()
+    executor.check_clear()
+    with pytest.raises(RuntimeError, match='no pending forward state'):
+        phase_backward(executor, 0, [], [])
+
+
+def test_phase_executor_preserves_checkpoint_recompute():
+    executor = PhaseExecutor(1)
+    calls = []
+
+    def recomputed(x):
+        calls.append(None)
+        return x.square()
+
+    input_tensor = torch.randn(4, requires_grad=True)
+    output = phase_fexecute(
+        executor,
+        0,
+        lambda x: torch.utils.checkpoint.checkpoint(recomputed, x, use_reentrant=False),
+        input_tensor,
+    )
+    phase_backward(executor, 0, [output], [torch.ones_like(output)])
+    # One forward evaluation plus a checkpoint recomputation during backward.
+    assert len(calls) == 2
+    executor.check_clear()
+
+
+def test_phase_executor_triggers_accumulate_grad_hook_once():
+    module = torch.nn.Linear(8, 16)
+    phase_executor = PhaseExecutor(1)
+    input_tensor = torch.randn(4, 8, requires_grad=True)
+    output_grad = torch.randn(4, 16)
+    param_tmp = module.weight.expand_as(module.weight)
+    grad_acc = param_tmp.grad_fn.next_functions[0][0]
+    hook_calls = []
+    handle = grad_acc.register_hook(lambda *args: hook_calls.append(args))
+    output = phase_fexecute(phase_executor, 0, module, input_tensor)
+    phase_backward(phase_executor, 0, [output], [output_grad])
+    assert len(hook_calls) == 1
+    handle.remove()
+    phase_executor.check_clear()

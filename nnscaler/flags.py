@@ -122,6 +122,8 @@ class CompileFlag:
     enable_global_p2p_reschedule = _to_bool('ENABLE_GLOBAL_P2P_RESCHEDULE')
 
     line_timer = _to_bool('LINE_TIMER')
+    # Keep a correctness/performance A/B switch for the phase executor fast path.
+    disable_phase_executor = _to_bool('DISABLE_PHASE_EXECUTOR')
 
     # ============== reducer ==================
     # use zero optimization on optimizer status.

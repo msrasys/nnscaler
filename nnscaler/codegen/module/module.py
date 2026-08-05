@@ -128,7 +128,7 @@ class ModuleCodeGen(FuncEmission):
             'from typing import *',
             'from pathlib import Path',
             'import torch', 'import torch.utils.checkpoint as ckpt',
-            'import nnscaler', 'import nnscaler.flags',
+            'import nnscaler', 'import nnscaler.flags', 'import nnscaler.runtime.executor',
             'import nnscaler.runtime.function',
             'import nnscaler.runtime.device',
             'import _operator', 'from numpy import inf', 'import builtins', '',
@@ -441,6 +441,7 @@ class ModuleCodeGen(FuncEmission):
         gen_nodes: List[IRCell] = list()
 
         device_map = device % len(self.devices)
+        phase_executor_slot_count = self.execplan.phase_executor_slot_count(device_map)
         sequence = self.execplan.seq(device_map)
         unrolled_seqs = []
         for node in sequence:
@@ -554,11 +555,19 @@ class ModuleCodeGen(FuncEmission):
                     ]
                 ) as ib:
                     ib.insert_body(self.model_init_statements)
+                    if phase_executor_slot_count and not CompileFlag.disable_phase_executor:
+                        ib.insert_body(
+                            f'self._phase_executor = nnscaler.runtime.executor.PhaseExecutor({phase_executor_slot_count})'
+                        )
                     ib.insert_body('')
                     ib.insert_body('self._post_init(init_params, build_buckets)')
             else:
                 with FunctionBlock(func_name='__init__', args=['self']) as ib:
                     ib.insert_body(self.model_init_statements)
+                    if phase_executor_slot_count and not CompileFlag.disable_phase_executor:
+                        ib.insert_body(
+                            f'self._phase_executor = nnscaler.runtime.executor.PhaseExecutor({phase_executor_slot_count})'
+                        )
             cb.insert_body('')
             cb.insert_body(ib.code)
             segment_idxs =[]
