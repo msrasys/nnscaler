@@ -186,13 +186,33 @@ def maybe_anno(hidden_states, cu_seqlens, *args, **kwargs) -> str:
     return "l h, e^ -> l h"
 
 
+def _profile_tensor(shape, dtype, device, requires_grad=False):
+    if dtype.is_floating_point or dtype.is_complex:
+        return torch.randn(
+            shape,
+            dtype=dtype,
+            device=device,
+            requires_grad=requires_grad,
+        )
+    if requires_grad:
+        raise ValueError(
+            f"non-floating profile tensor with dtype {dtype} cannot require "
+            "gradients"
+        )
+    return torch.zeros(shape, dtype=dtype, device=device)
+
 
 def input_gen_fn(node: IRDimops):
     hidden_states = node.inputs()[0]
     device = torch.cuda.current_device()
     seqlen = hidden_states.shape[0]
     return (
-        torch.randn(hidden_states.shape, dtype=hidden_states.dtype, device=device, requires_grad=hidden_states.requires_grad),
+        _profile_tensor(
+            hidden_states.shape,
+            hidden_states.dtype,
+            device,
+            hidden_states.requires_grad,
+        ),
         torch.tensor([0, seqlen], dtype=torch.int32, device=device),
     )
 

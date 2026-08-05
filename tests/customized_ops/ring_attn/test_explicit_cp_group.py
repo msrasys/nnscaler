@@ -6,6 +6,7 @@ from torch import nn
 
 from nnscaler.codegen.emit import FuncEmission
 from nnscaler.customized_ops.ring_attention.maybe_shuffle import (
+    _profile_tensor,
     emit_ring as emit_shuffle,
     wrap_maybe_shuffle,
     wrap_maybe_unshuffle,
@@ -30,6 +31,25 @@ EMITTERS = [
     emit_zigzag_allgather,
     emit_shuffle,
 ]
+
+
+@pytest.mark.parametrize(
+    ('dtype', 'requires_grad'),
+    [
+        (torch.bool, False),
+        (torch.int64, False),
+        (torch.float32, True),
+    ],
+)
+def test_maybe_shuffle_profile_tensor_supports_input_dtype(
+    dtype, requires_grad
+):
+    tensor = _profile_tensor(
+        (4, 8), dtype, torch.device('cpu'), requires_grad)
+
+    assert tensor.shape == (4, 8)
+    assert tensor.dtype == dtype
+    assert tensor.requires_grad is requires_grad
 
 
 class _FakeTensor:
