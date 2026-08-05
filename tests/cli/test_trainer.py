@@ -963,7 +963,6 @@ def tracing_from_weights_worker(tmp_path):
         trainer = Trainer([
             '-f', config_path,
             '--gen_savedir', str(gen_dir),
-            '--global_batch_size', '0',
             '--max_epochs', '-1',  # HACK: will exit without training.
             '--max_train_steps', '-1',
             '--compute_config.plan_ngpus', '1',
