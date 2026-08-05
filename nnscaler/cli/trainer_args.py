@@ -237,14 +237,16 @@ class OptionalReducerConfig:
     use_async_reducer: Optional[bool] = None
     reducer_bucket_cap_mb: Optional[float] = None
 
-    def resolve(self, compute_config: ComputeConfig) -> ComputeConfig:
+    def resolve(self, compute_config: ComputeConfig, **kwargs) -> ComputeConfig:
         replace_values = {
             k: v for k, v in asdict(self).items()
             if v is not None
         }
         resolved_values = asdict(compute_config)
+        resolved_values.update(kwargs)
         resolved_values.update(replace_values)
         resolved_values[fields(ComputeConfig).use_end2end] = False
+        resolved_values[fields(ComputeConfig).use_fbw] = False
         return ComputeConfig(**resolved_values)
 
 
@@ -1260,9 +1262,16 @@ class TrainerArgs(PrecisionMixin, PolicyMixin):
     def create_parallel_optimizer(self, parallel_model: torch.nn.Module):
         kwargs = self.create_kwarg(self.optimizer.args)
         optimizer_class = load_type(self.optimizer.type)
+
         npp_reducer_config = self.model.non_parallel_params_reducer_config \
-            or OptionalReducerConfig(use_async_reducer=False, reducer_bucket_cap_mb=0)
-        npp_compute_config = npp_reducer_config.resolve(self.compute_config)
+            or OptionalReducerConfig()
+        # if the user does not specify the reducer config,
+        # we will use the following default values (which are always safe) for the reducer config.
+        npp_compute_config = npp_reducer_config.resolve(
+            self.compute_config,
+            use_async_reducer=False,
+            reducer_bucket_cap_mb=0.0
+        )
         return build_optimizer(
             parallel_model, optimizer_class, npp_compute_config,
             self.optimizer.param_clss_fn,
