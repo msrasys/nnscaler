@@ -321,7 +321,7 @@ def test_gencode_stream_block_wraps_dispatch_issue_specifically(dedicated_gencod
     text = dedicated_gencode[0]
     pattern = re.compile(
         r"with torch\.cuda\.stream\(nnscaler\.runtime\.device\.DeviceGroup\(\)\.get_stream\('moe_comm'\)\):\n"
-        r"(?:.*\n)*?\s*\S+ = _phase_fexecute\(\d+, model\.segment\d+, \*\(\S+, \), requires_grad=True\)\n"
+        r"(?:.*\n)*?\s*\S+ = _phase_fexecute\(\d+, model\.segment\d+, \*\(\S+, \), requires_grad=True, sync_inputs=False\)\n"
     )
     assert pattern.search(text), text
 

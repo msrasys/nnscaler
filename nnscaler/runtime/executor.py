@@ -460,9 +460,14 @@ class PhaseExecutor:
         handler.drain_all_completed()
         return tuple(handler.wait(value) if torch.is_tensor(value) else value for value in inputs)
 
-    def forward(self, slot: int, subgraph: Callable, *inputs: Any, requires_grad: bool = True):
+    def forward(self, slot: int, subgraph: Callable, *inputs: Any, requires_grad: bool = True,
+                sync_inputs: bool = True):
         self._check_slot(slot)
-        inputs = self._sync_inputs(inputs)
+        # Codegen disables this only for phase inputs proven not to be a
+        # pending async tensor. Consumers of dispatch/combine pending buffers
+        # keep the exact wait-before-detach behavior.
+        if sync_inputs:
+            inputs = self._sync_inputs(inputs)
         if not requires_grad:
             with torch.no_grad():
                 return subgraph(*inputs)
@@ -540,8 +545,10 @@ class PhaseExecutor:
 
 
 def phase_fexecute(phase_executor: PhaseExecutor, slot: int, subgraph: Callable,
-                   *inputs: Any, requires_grad: bool = True):
-    return phase_executor.forward(slot, subgraph, *inputs, requires_grad=requires_grad)
+                   *inputs: Any, requires_grad: bool = True, sync_inputs: bool = True):
+    return phase_executor.forward(
+        slot, subgraph, *inputs, requires_grad=requires_grad, sync_inputs=sync_inputs
+    )
 
 
 def phase_backward(phase_executor: PhaseExecutor, slot: int,

@@ -28,7 +28,7 @@ _logger = logging.getLogger(__name__)
 fsign = '{outputs} = nnscaler.runtime.executor.fexecute({name}, {model}, *{inputs}, requires_grad={req_grad})'
 asign = '{outputs} = nnscaler.runtime.executor.aexecute({model}, *{inputs}, requires_grad={req_grad})'
 bsign = '{input_grads} = nnscaler.runtime.executor.backward({name}, {input_tensors}, {output_tensors}, {output_grads})'
-phase_fsign = '{outputs} = _phase_fexecute({slot}, {model}, *{inputs}, requires_grad={req_grad})'
+phase_fsign = '{outputs} = _phase_fexecute({slot}, {model}, *{inputs}, requires_grad={req_grad}, sync_inputs={sync_inputs})'
 phase_bsign = '{input_grads} = _phase_backward({slot}, {output_tensors}, {output_grads})'
 bi_sign = '{input_grads} = nnscaler.runtime.executor.backward_input({name}, {input_tensors}, {output_tensors}, {output_grads}, {weights})'
 bw_sign = 'nnscaler.runtime.executor.backward_weight({name}, {weights})'
@@ -475,6 +475,7 @@ class ScheduleCodeGen(FuncEmission):
         name = self.node_name(unwrap_node)
         stream_context = self._get_node_stream_context(node)
         phase_slot = node.get_op_context('phase_executor_slot')
+        phase_sync_inputs = bool(unwrap_node.get_op_context('phase_sync_inputs', True))
         use_phase_executor = (
             isinstance(unwrap_node, IRSegment)
             and phase_slot is not None
@@ -495,6 +496,7 @@ class ScheduleCodeGen(FuncEmission):
                         model=f'model.{name}',
                         inputs=inputs,
                         req_grad=req_grad,
+                        sync_inputs=phase_sync_inputs,
                     )]
                 else:
                     codes = [fsign.format(

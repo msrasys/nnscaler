@@ -754,6 +754,14 @@ def make_pas(num_stages: int, layers_per_stage: int, ep_ranks_per_stage: Sequenc
                 for lid in stage_layer_ids:
                     phase_nodes = lower_layer_to_phases(graph, per_layer_nodes[lid], layer_id=lid)
                     for pn in phase_nodes:
+                        # Only the two phase consumers that receive an async
+                        # MoE pending tensor must resolve it before executor
+                        # detach. Other phase boundaries may leave unrelated
+                        # work in flight for overlap.
+                        pn.segment.set_op_context(
+                            'phase_sync_inputs',
+                            pn.identity.phase_type in (PhaseType.EXPERT_COMPUTE, PhaseType.MOE_COMBINE),
+                        )
                         for node in pn.segment.nodes():
                             _assign_node_for_ep(graph, node, ep_ranks)
                     _set_moe_stream_context(
