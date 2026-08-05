@@ -907,6 +907,13 @@ def _deserialize_hook_config(hook) -> Union[HookConfig, HookMapConfig]:
 
 
 def _deserialize_int_or_dict_of_ints(value: Any) -> Union[int, Dict[int, int]]:
+    if isinstance(value, str):
+        import ast
+        try:
+            value = ast.literal_eval(value)
+        except Exception:
+            pass
+
     value = factory_normalize(value)
     if isinstance(value, dict):
         return {int(k): int(v) for k, v in value.items()}
