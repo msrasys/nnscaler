@@ -101,6 +101,8 @@ class _DeviceGroup:
         will create a new one.
         if name is 'default', the default stream will be returned.
         """
+        if name == 'default':
+            return torch.cuda.default_stream()
         if name not in self.streams:
             stream = torch.cuda.Stream()
             self.streams[name] = stream

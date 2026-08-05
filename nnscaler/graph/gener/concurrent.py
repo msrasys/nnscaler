@@ -43,6 +43,55 @@ def _temp_disable_reduce_scatter_adapter():
 class ConcurrentGener:
 
     @staticmethod
+    def _independent_replica_lane_layout(ftensor: IRFullTensor, tensors: List[IRSubTensor], role: str) -> RVDLayout:
+        """Validate the narrow lane-preserving RVD subset.
+
+        A marked independent lane is deliberately *not* a general replacement
+        for RVD.  It is valid only when each R entry is one full, ordered lane
+        on a distinct device; any V/D redistribution needs an explicit policy
+        and must fail closed instead of silently calling all-gather/all-reduce.
+        """
+        layout = RVDLayout.togrid(ftensor, tensors)
+        if layout.R <= 1 or layout.V != 1 or any(dim != 1 for dim in layout.D):
+            raise ValueError(
+                f"independent replica lanes require a pure R(N)>1,V(1),D(1,...) {role} layout; "
+                f"got {layout}. Add an explicit lane redistribution policy for this PP boundary."
+            )
+        lanes = [layout.mat[(lane,) + (0,) * (layout.mat.ndim - 1)] for lane in range(layout.R)]
+        devices = [lane.device[0] for lane in lanes]
+        if len(set(devices)) != len(devices):
+            raise ValueError(
+                f"independent replica lanes require one distinct device per {role} lane, got {devices}."
+            )
+        return layout
+
+    @staticmethod
+    def _fail_independent_replica_lanes(
+        fptensors: List[IRSubTensor], fctensors: List[IRSubTensor],
+    ) -> None:
+        """Fail closed rather than apply RVD replica collectives to lanes.
+
+        A bijective ``src[i] -> dst[i]`` transfer is numerically simple, but a
+        real PP execution may reach forward and reverse lane transfers in
+        different orders on different stages/microbatches.  The default NCCL
+        process group has a single untagged P2P ordering domain, while a
+        world-group collective would also require an identical global call
+        order.  Neither condition is represented by the current local
+        ``SchedulePlan``.  Reject until a first-class global lane issue/wait
+        schedule can prove that ordering.
+        """
+        ftensor = fptensors[0].parent
+        playout = ConcurrentGener._independent_replica_lane_layout(ftensor, fptensors, 'producer')
+        clayout = ConcurrentGener._independent_replica_lane_layout(ftensor, fctensors, 'consumer')
+        raise ValueError(
+            'independent replica lanes at a PP boundary are not yet executable safely: '
+            f'producer={playout}, consumer={clayout}. The existing RVD inter-path may '
+            'all-gather R replicas and would merge lane values, so compilation is refused. '
+            'Implement a global deterministic lane issue/wait schedule plus an explicit '
+            'bijective P2P or collective redistribution before enabling this topology.'
+        )
+
+    @staticmethod
     def gen(fptensors: List[IRSubTensor], fctensors: List[IRSubTensor],
             bptensors: List[IRSubTensor], bctensors: List[IRSubTensor],
             cost_fn: Optional[Callable] = None) -> Optional[IRAdapter]:
@@ -61,6 +110,13 @@ class ConcurrentGener:
         cdevs = tuple(t.device[0] for t in fctensors)
 
         fadapter: IRAdapter = None
+
+        # RVD's replica dimension normally means equal values, but a caller
+        # can explicitly mark an ordered PP x EP activation as independent
+        # lanes.  Do this before any RVD path finder so it can never select a
+        # replica all-gather/all-reduce transformation for lane data.
+        if fptensors[0].parent.independent_replica_lanes:
+            ConcurrentGener._fail_independent_replica_lanes(fptensors, fctensors)
 
         # case 1: sharing device (intra-rvd)
         inshard = (set(pdevs) == set(cdevs)) and (len(fptensors) == len(fctensors)) and (len(pdevs) == len(fptensors))

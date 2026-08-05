@@ -817,3 +817,124 @@ class PhaseAwareSched:
 
         sched.finish()
         return sched
+
+
+    @staticmethod
+    def sched_1f1b_global_phase_aware(graph: IRGraph, num_microbatches: int, num_stages: int) -> SchedulePlan:
+        """Deterministic global, dependency-driven phase schedule.
+
+        Unlike the local first-stage-only rule, this constructs one finite DAG
+        of every ``(phase segment, microbatch)`` across all physical stages and
+        performs a deterministic list schedule over its logical unit-span
+        clock.  A stage alternates ready B/F work when possible; critically, a
+        non-first stage is never given F(m+1) merely because it is locally
+        tempting -- it becomes ready only after the upstream phase dependency
+        has completed.  The ordinary :meth:`SchedulePlan.validate` check and
+        explicit pipeline-DAG property tests both guard the resulting plan.
+
+        This is intentionally opt-in.  It creates opportunities only where
+        the real cross-rank DAG exposes slack; it does not pretend that every
+        physical stage has an issue-to-wait window, and it does not split P2P
+        adapters into new issue/wait IR nodes.  Those are a separate runtime
+        extension for wider communication overlap.
+        """
+        if num_microbatches <= 0:
+            raise ValueError(f"expected num_microbatches > 0, got {num_microbatches}")
+
+        validate_phase_layout(graph, num_stages)
+        stage_local_segs = _stage_local_segments(graph, num_stages)
+        sched = SchedulePlan(graph, num_microbatches)
+
+        # A task is a whole independently-backwardable phase segment.  Its
+        # position is deterministic even when two tasks become ready together.
+        tasks = []
+        by_key = {}
+        for sid, local_segs in enumerate(stage_local_segs):
+            for mid in range(num_microbatches):
+                for phase_index, seg in enumerate(local_segs):
+                    task = (sid, mid, 'F', phase_index, seg)
+                    tasks.append(task)
+                    by_key[(sid, mid, 'F', phase_index)] = task
+                for phase_index, seg in enumerate(reversed(local_segs)):
+                    bseg = seg.mirror
+                    task = (sid, mid, 'B', phase_index, bseg)
+                    tasks.append(task)
+                    by_key[(sid, mid, 'B', phase_index)] = task
+
+        by_mid = {mid: [task for task in tasks if task[1] == mid] for mid in range(num_microbatches)}
+        predecessors = {task: set() for task in tasks}
+        for mid, mtasks in by_mid.items():
+            for task in mtasks:
+                for candidate in mtasks:
+                    if candidate is task:
+                        continue
+                    if graph.depends(candidate[4], task[4]):
+                        predecessors[task].add(candidate)
+
+        # ``graph.depends`` is intentionally adapter-centric and, before
+        # adapters are generated, does not encode every mirror/pipeline
+        # ordering edge.  Add the canonical 1F1B phase DAG explicitly:
+        # F phases chain forward, B phases chain in mirrored order, each stage
+        # finishes F(m) before starting B(m), activations flow left-to-right,
+        # and gradients flow right-to-left.  These are the dependencies a
+        # local "move F earlier" / "move B later" edit used to violate.
+        for mid in range(num_microbatches):
+            for sid, local_segs in enumerate(stage_local_segs):
+                f_tasks = [by_key[(sid, mid, 'F', i)] for i in range(len(local_segs))]
+                b_tasks = [by_key[(sid, mid, 'B', i)] for i in range(len(local_segs))]
+                for prior, successor in zip(f_tasks, f_tasks[1:]):
+                    predecessors[successor].add(prior)
+                for prior, successor in zip(b_tasks, b_tasks[1:]):
+                    predecessors[successor].add(prior)
+                predecessors[b_tasks[0]].add(f_tasks[-1])
+                if sid > 0:
+                    upstream_f = by_key[(sid - 1, mid, 'F', len(stage_local_segs[sid - 1]) - 1)]
+                    predecessors[f_tasks[0]].add(upstream_f)
+                if sid < num_stages - 1:
+                    downstream_b = by_key[(sid + 1, mid, 'B', len(stage_local_segs[sid + 1]) - 1)]
+                    predecessors[b_tasks[0]].add(downstream_b)
+
+        remaining = set(tasks)
+        complete = set()
+        last_kind = [None] * num_stages
+        step = 0
+        while remaining:
+            selected = []
+            for sid in range(num_stages):
+                ready = [task for task in remaining
+                         if task[0] == sid and predecessors[task].issubset(complete)]
+                if not ready:
+                    continue
+
+                def priority(task):
+                    _, mid, kind, phase_index, _ = task
+                    # Switch B/F when both are ready (the actual phase-level
+                    # interleave); otherwise choose B first to bound live
+                    # activations.  Microbatch/phase tie-breakers make the
+                    # global schedule byte-for-byte deterministic.
+                    switch_penalty = 0 if last_kind[sid] is not None and kind != last_kind[sid] else 1
+                    kind_penalty = 0 if kind == 'B' else 1
+                    return (switch_penalty, kind_penalty, mid, phase_index)
+
+                chosen = min(ready, key=priority)
+                selected.append(chosen)
+
+            if not selected:
+                unresolved = sorted(
+                    (sid, mid, kind, phase_index)
+                    for sid, mid, kind, phase_index, _ in remaining
+                )[:8]
+                raise PhaseError(
+                    'global phase list scheduler stalled with no dependency-ready task; '
+                    f'unresolved tasks include {unresolved}'
+                )
+
+            for sid, mid, kind, phase_index, seg in selected:
+                sched.add_segment(seg, mid, step, stream_context=_seg_stream_context(seg))
+                complete.add((sid, mid, kind, phase_index, seg))
+                remaining.remove((sid, mid, kind, phase_index, seg))
+                last_kind[sid] = kind
+            step += 1
+
+        sched.finish()
+        return sched

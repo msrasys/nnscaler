@@ -104,6 +104,7 @@ import torch.nn.functional as F
 from nnscaler.graph.graph import IRGraph
 from nnscaler.graph.function.anchor import IRGraphAnchor
 from nnscaler.ir.operator import IRDataOperation, IRFwOperation
+from nnscaler.ir.tensor import IRSubTensor
 from nnscaler.parallel import ComputeConfig
 from nnscaler.policies import _replica
 from nnscaler.graph.schedule.phase import PhaseType, PhaseAwareSched, lower_layer_to_phases, validate_phase_layout, phase_anchor
@@ -606,39 +607,45 @@ def _layer_node_ranges(all_ops: List, num_stages: int, layers_per_stage: int, us
 MOE_COMM_STREAM = 'moe_comm'
 
 
-def _set_moe_stream_context(phase_nodes) -> None:
-    """Real stream/event wiring for one layer's phases (only meaningful for
-    the MoE phase sequence; a no-op, harmlessly, for a dense/ATTENTION-only
-    layer): ``MOE_DISPATCH``'s forward segment (ends with the dispatch issue)
-    runs on :data:`MOE_COMM_STREAM`, waiting for the default stream (its
-    input buffer must already be built); ``EXPERT_COMPUTE``'s forward
-    segment (starts with dispatch's wait, ends with the combine issue) runs
-    on the default stream, waiting for :data:`MOE_COMM_STREAM` (dispatch's
-    result must be ready) -- exactly the same ``wait_streams`` correctness
-    requirement documented (and empirically load-bearing) in
-    ``test_combined_1f1b_pipeline_e2e.py``'s ``_pas_multi_stream`` docstring.
+def _set_moe_stream_context(phase_nodes, *, dedicated_comm_stream: bool = False) -> None:
+    """Optionally put only the dispatch issue on a dedicated stream.
 
-    Honest scoping note: ``EXPERT_COMPUTE``'s own combine-issue therefore
-    runs on the *default* stream (not `MOE_COMM_STREAM`), an asymmetry kept
-    for simplicity -- one ``StreamContext`` applies to a whole segment (see
-    ``nnscaler.codegen.schedule.schedule._emit_stream_context``), and
-    ``EXPERT_COMPUTE`` is a single segment that both waits for dispatch and
-    issues combine. This does not affect correctness (the schedule's
-    program-order interleave, not stream placement, is what the phase IR's
-    issue/wait channel-tracking already guarantees is safe -- see
-    ``nnscaler/runtime/adapter/moe.py``), only how much of the combine
-    window's overlap is genuine hardware-level stream concurrency versus
-    NCCL's own internal async execution.
+    The default deliberately leaves every phase on the current/default stream.
+    ``all_to_all_single(async_op=True)`` is already nonblocking to Python and
+    uses ProcessGroupNCCL's communication stream; the following
+    ``moe_dispatch_wait`` calls ``Work.wait()``, which is the real readiness
+    edge. A second artificial ``wait_stream(moe_comm)`` before that wait does
+    not make the pending buffer safer, but does add a CUDA-context transition
+    and broad ``record_stream`` traffic at every phase boundary.
+
+    ``dedicated_comm_stream=True`` is retained solely as a benchmark ablation:
+    dispatch's input is then explicitly made visible to ``moe_comm``. Compute
+    phases, including the dispatch wait and expert work, remain on the current
+    stream; there is intentionally no synthetic ``'default'`` stream or
+    redundant post-dispatch ``wait_stream`` context.
     """
     by_type = {pn.identity.phase_type: pn for pn in phase_nodes}
     dispatch = by_type.get(PhaseType.MOE_DISPATCH)
     expert = by_type.get(PhaseType.EXPERT_COMPUTE)
     if dispatch is None or expert is None:
         return  # dense (ATTENTION-only) layer: nothing to do
-    dispatch.segment.set_op_context(
-        'stream_context', StreamContext(stream=MOE_COMM_STREAM, wait_streams=['default']))
-    expert.segment.set_op_context(
-        'stream_context', StreamContext(stream='default', wait_streams=[MOE_COMM_STREAM]))
+    if dedicated_comm_stream:
+        dispatch.segment.set_op_context(
+            'stream_context', StreamContext(stream=MOE_COMM_STREAM, wait_streams=['default']))
+
+
+def _mark_independent_replica_boundary(segment) -> None:
+    """Mark a PP stage output as ordered EP lanes, not equal RVD replicas."""
+    marked = 0
+    for output in segment.outputs():
+        if isinstance(output, IRSubTensor) and not output.is_attr():
+            output.parent.mark_independent_replica_lanes()
+            marked += 1
+    if marked == 0:
+        raise RuntimeError(
+            f'expected a tensor activation at PP boundary segment {segment.name}; '
+            'cannot safely infer independent replica lanes'
+        )
 
 
 def _assign_node_for_ep(graph: IRGraph, node, ep_ranks: List[int]) -> None:
@@ -662,14 +669,19 @@ def _assign_node_for_ep(graph: IRGraph, node, ep_ranks: List[int]) -> None:
 
 
 def make_pas(num_stages: int, layers_per_stage: int, ep_ranks_per_stage: Sequence[Sequence[int]],
-             use_phases: bool):
+             use_phases: bool, *, dedicated_moe_comm_stream: bool = False,
+             independent_pp_replica_lanes: bool = False,
+             global_phase_interleave: bool = False):
     """Build a ``parallelize(..., pas_fn, ...)``-compatible PAS policy.
 
     Stages the graph into ``num_stages`` physical stages (each
     ``layers_per_stage`` MoE layers), and, per layer: if ``use_phases``,
     lowers it to its 4 phases (:func:`lower_layer_to_phases`); otherwise
     groups the whole stage into one plain segment (Step A/B-style baseline).
-    Every real op is replicated (``nnscaler.policies._replica``) across its
+    The default leaves phases on the current/default stream; ProcessGroupNCCL
+    already runs asynchronous all-to-all work on its communication stream.
+    Set ``dedicated_moe_comm_stream=True`` only for the explicit dispatch-stream
+    profiling ablation. Every real op is replicated (``nnscaler.policies._replica``) across its
     stage's ``ep_ranks``, EXCEPT ``expert_ffn_local`` (the real, per-rank
     -distinct expert FFN), which is genuinely partitioned -- see
     :func:`_assign_node_for_ep`. Schedules with
@@ -712,24 +724,34 @@ def make_pas(num_stages: int, layers_per_stage: int, ep_ranks_per_stage: Sequenc
             per_layer_nodes = {lid: all_ops[layer_ranges[lid][0]:layer_ranges[lid][1]] for lid in stage_layer_ids}
 
             if use_phases:
+                stage_terminal_segment = None
                 for lid in stage_layer_ids:
                     phase_nodes = lower_layer_to_phases(graph, per_layer_nodes[lid], layer_id=lid)
                     for pn in phase_nodes:
                         for node in pn.segment.nodes():
                             _assign_node_for_ep(graph, node, ep_ranks)
-                    _set_moe_stream_context(phase_nodes)
+                    _set_moe_stream_context(
+                        phase_nodes, dedicated_comm_stream=dedicated_moe_comm_stream)
+                    stage_terminal_segment = phase_nodes[-1].segment
+                if independent_pp_replica_lanes and sid < num_stages - 1:
+                    _mark_independent_replica_boundary(stage_terminal_segment)
             else:
                 stage_nodes = all_ops[stage_start:stage_end]
-                graph.group(stage_nodes)
+                stage_terminal_segment = graph.group(stage_nodes)
                 for node in stage_nodes:
                     _assign_node_for_ep(graph, node, ep_ranks)
+                if independent_pp_replica_lanes and sid < num_stages - 1:
+                    _mark_independent_replica_boundary(stage_terminal_segment)
 
         for dl in dataloaders:
             _replica(graph, dl, devs=list(range(config.plan_ngpus)))
 
         if use_phases:
             validate_phase_layout(graph, num_stages)
-            PhaseAwareSched.sched_1f1b_phase_aware(graph, nmicros, num_stages)
+            if global_phase_interleave:
+                PhaseAwareSched.sched_1f1b_global_phase_aware(graph, nmicros, num_stages)
+            else:
+                PhaseAwareSched.sched_1f1b_phase_aware(graph, nmicros, num_stages)
         else:
             PredefinedSched.sched_1f1b(graph, nmicros, num_stages)
         return graph

@@ -303,6 +303,10 @@ class IRFullTensor(IRTensor):
         is_attr=False, is_grad=False, persistent=False, is_loss=False,
     ):
         self._is_loss: bool = False
+        # ``R`` in RVD normally means equal copies.  Some hybrid PP x EP
+        # pipelines instead use the replica axis as an ordered set of
+        # independent lanes; that distinction must survive adapter generation.
+        self._independent_replica_lanes: bool = False
         # record all created sub_tensors
         self._subtensors : Dict[(ValueMap, IndexMap), int] = dict()
         self._grad: Optional[IRFullTensor] = None
@@ -367,6 +371,29 @@ class IRFullTensor(IRTensor):
         """
         return self
 
+    @property
+    def independent_replica_lanes(self) -> bool:
+        """Whether RVD ``R`` entries denote ordered independent lanes.
+
+        The default is ``False``: ordinary RVD replicas are semantically equal
+        and may use collective replica transforms.  ``True`` is an explicit
+        opt-in for a PP boundary whose per-EP-rank activation must remain on
+        its corresponding lane instead of being gathered into a shared value.
+        """
+        return self._independent_replica_lanes
+
+    def mark_independent_replica_lanes(self):
+        """Mark this tensor (and its gradient tensor) as lane-preserving.
+
+        Adapter generation validates a pure-replica layout and then fails
+        closed until a global lane issue/wait schedule exists, rather than
+        silently applying an ``R``-collective with the wrong semantics.
+        """
+        self._independent_replica_lanes = True
+        if self._grad is not None:
+            self._grad._independent_replica_lanes = True
+        return self
+
     def like(self):
         """!
         Create a IRFullTensor with same name/shape/dtype/requires_grad/is_loss but a different id.
@@ -378,6 +405,8 @@ class IRFullTensor(IRTensor):
             self._dtype, is_loss=self._is_loss
         )
         tensor.dim_tracks = self.dim_tracks
+        if self.independent_replica_lanes:
+            tensor.mark_independent_replica_lanes()
         return tensor
 
     def like_grad(self):
@@ -391,6 +420,8 @@ class IRFullTensor(IRTensor):
             requires_grad=False, dtype=self.dtype
         ).as_grad(self._is_attr)
         grad.dim_tracks = self.dim_tracks
+        if self.independent_replica_lanes:
+            grad.mark_independent_replica_lanes()
         return grad
 
     @property

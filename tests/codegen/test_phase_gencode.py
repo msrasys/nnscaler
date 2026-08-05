@@ -20,11 +20,9 @@ generated ``.py`` source text* for:
    flowing from the issuing call's return value to the waiting call's
    argument (proving it is textually the *same* adapter/tensor, not merely
    "some call happened before some other call").
-3. Real, codegen-emitted ``with torch.cuda.stream(...)``/``wait_stream(...)``
-   blocks around the phases carrying a ``StreamContext`` (Step C's
-   ``_set_moe_stream_context``), using the exact same idiom
-   ``nnscaler.codegen.schedule.schedule._emit_stream_context``/
-   ``_get_codes_with_stream_context`` documents -- not hand-written.
+3. The optimized default emits no artificial stream context around a phase;
+   the optional dedicated-communication-stream ablation still emits a real,
+   selective ``with torch.cuda.stream(...)`` / ``record_stream(...)`` path.
 """
 import re
 import tempfile
@@ -57,7 +55,8 @@ NMICROS = 4
 T = 8
 
 
-def _compile_phase_moe(tmpdir: Path) -> Dict[int, str]:
+def _compile_phase_moe(tmpdir: Path, *, dedicated_moe_comm_stream: bool = False,
+                       independent_pp_replica_lanes: bool = False) -> Dict[int, str]:
     IDGenerator().clear()
     cfg = MoEConfig(dim=DIM, n_heads=NHEADS, seq_len=SEQLEN, ffn_hidden=FFN_HIDDEN, capacity_factor=1.0)
     model = PhaseMoEModel(cfg, NUM_STAGES, LAYERS_PER_STAGE, EP_RANKS_PER_STAGE, use_phases=True)
@@ -65,7 +64,11 @@ def _compile_phase_moe(tmpdir: Path) -> Dict[int, str]:
     dummy = {'data': {'data': torch.randn(T, cfg.dim), 'target': torch.randn(T, cfg.dim)}}
     graph, fargs = _gen_graph(model, dummy, tmpdir, constant_folding=True, end2end_mode=True)
 
-    pas = make_pas(NUM_STAGES, LAYERS_PER_STAGE, EP_RANKS_PER_STAGE, use_phases=True)
+    pas = make_pas(
+        NUM_STAGES, LAYERS_PER_STAGE, EP_RANKS_PER_STAGE, use_phases=True,
+        dedicated_moe_comm_stream=dedicated_moe_comm_stream,
+        independent_pp_replica_lanes=independent_pp_replica_lanes,
+    )
     config = ComputeConfig(RUNTIME_NDEVS, RUNTIME_NDEVS, use_end2end=True, pas_config=dict(pipeline_nmicros=NMICROS))
     graph = pas(graph, config)
 
@@ -89,10 +92,28 @@ def _compile_phase_moe(tmpdir: Path) -> Dict[int, str]:
 
 @pytest.fixture(scope='module')
 def gencode() -> Dict[int, str]:
+    """The performance-default: no synthetic phase stream contexts."""
     with replace_all_device_with('cpu', force=True):
         with tempfile.TemporaryDirectory() as tmpdir:
             return _compile_phase_moe(Path(tmpdir))
 
+
+@pytest.fixture(scope='module')
+def dedicated_gencode() -> Dict[int, str]:
+    """Explicit legacy-stream ablation, retained to exercise the safe path."""
+    with replace_all_device_with('cpu', force=True):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            return _compile_phase_moe(Path(tmpdir), dedicated_moe_comm_stream=True)
+
+
+
+
+def test_gencode_pp_ep_independent_lanes_fail_closed():
+    """RVD replicas cannot silently become asymmetric EP lanes at a PP edge."""
+    with replace_all_device_with('cpu', force=True):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with pytest.raises(ValueError, match='independent replica lanes at a PP boundary are not yet executable safely'):
+                _compile_phase_moe(Path(tmpdir), independent_pp_replica_lanes=True)
 
 def _train_step_body(text: str) -> List[str]:
     lines = text.splitlines()
@@ -188,8 +209,8 @@ def test_gencode_combine_issue_lt_backward_lt_wait(gencode):
 # 3) real, codegen-emitted stream/event blocks
 # ---------------------------------------------------------------------------
 
-def test_gencode_has_real_stream_and_wait_stream_blocks(gencode):
-    text = gencode[0]
+def test_gencode_has_real_stream_and_wait_stream_blocks(dedicated_gencode):
+    text = dedicated_gencode[0]
     assert 'use_multi_streams = True' in text
     assert (
         "with torch.cuda.stream(nnscaler.runtime.device.DeviceGroup().get_stream('moe_comm')):"
@@ -199,16 +220,21 @@ def test_gencode_has_real_stream_and_wait_stream_blocks(gencode):
         "torch.cuda.current_stream().wait_stream(nnscaler.runtime.device.DeviceGroup().get_stream('default'))"
         in text
     )
-    assert (
-        "torch.cuda.current_stream().wait_stream(nnscaler.runtime.device.DeviceGroup().get_stream('moe_comm'))"
-        in text
-    )
+    assert "torch.cuda.current_stream().wait_stream(nnscaler.runtime.device.DeviceGroup().get_stream('moe_comm'))" not in text
 
 
-def test_gencode_stream_block_wraps_dispatch_issue_specifically(gencode):
+def test_gencode_default_phase_path_has_no_synthetic_stream_context(gencode):
+    text = gencode[0]
+    assert 'use_multi_streams = False' in text
+    assert 'with torch.cuda.stream(' not in text
+    assert '.wait_stream(' not in text
+    assert '.record_stream(' not in text
+
+
+def test_gencode_stream_block_wraps_dispatch_issue_specifically(dedicated_gencode):
     """The `moe_comm`-stream block must specifically wrap the MOE_DISPATCH
     phase's own `segmentNNN` call (not some unrelated code)."""
-    text = gencode[0]
+    text = dedicated_gencode[0]
     pattern = re.compile(
         r"with torch\.cuda\.stream\(nnscaler\.runtime\.device\.DeviceGroup\(\)\.get_stream\('moe_comm'\)\):\n"
         r"(?:.*\n)*?\s*\S+ = nnscaler\.runtime\.executor\.fexecute\('segment\d+', model\.segment\d+, \*\(\S+, \), requires_grad=True\)\n"
@@ -284,23 +310,19 @@ def _find_stream_context_blocks(body: List[str]):
     return blocks
 
 
-def test_gencode_record_stream_present_for_cross_stream_consumed_tensors(gencode):
+def test_gencode_record_stream_present_for_cross_stream_consumed_tensors(dedicated_gencode):
     """``record_stream`` (Step C's remediation-added hard assertion,
     ``nnscaler/codegen/schedule/schedule.py``'s stream_context-triggered
     ``{t}.record_stream(torch.cuda.current_stream())`` emission) must
     literally appear in the generated code for the tensors consumed inside
     a phase's own named-stream block."""
-    text = gencode[0]
+    text = dedicated_gencode[0]
     assert re.search(r'\w+\.record_stream\(torch\.cuda\.current_stream\(\)\)', text), \
-        'expected at least one real, codegen-emitted .record_stream(...) call'
-    assert text.count('.record_stream(torch.cuda.current_stream())') >= 2, (
-        'expected record_stream for both the dispatch-issuing phase\'s own '
-        'input AND the following phase\'s own input (the dispatch pending '
-        'handle) -- got fewer than 2 occurrences'
-    )
+        'expected a real, codegen-emitted .record_stream(...) call on the dedicated stream'
+    assert text.count('.record_stream(torch.cuda.current_stream())') >= 1
 
 
-def test_gencode_stream_blocks_have_wait_then_record_stream_then_consumer(gencode):
+def test_gencode_stream_blocks_have_wait_then_record_stream_then_consumer(dedicated_gencode):
     """For every ``with torch.cuda.stream(<S>):`` block that both waits on
     another stream AND calls ``record_stream`` on some tensor ``t``: hard
     -assert, by exact line order AND exact variable-name identity (not
@@ -321,7 +343,7 @@ def test_gencode_stream_blocks_have_wait_then_record_stream_then_consumer(gencod
     keyword-only "wait_stream and record_stream both appear somewhere"
     check.
     """
-    body = _train_step_body(gencode[0])
+    body = _train_step_body(dedicated_gencode[0])
     blocks = _find_stream_context_blocks(body)
     checked = 0
     for start_idx, stream_name, wait_idx, wait_src, record_entries, fexecute_idx, fexecute_args in blocks:
@@ -341,21 +363,19 @@ def test_gencode_stream_blocks_have_wait_then_record_stream_then_consumer(gencod
                 f"(line {fexecute_idx}), got out-of-order indices"
             )
         checked += 1
-    assert checked >= 2, (
-        f'expected at least 2 stream-context blocks with a full '
-        f'wait_stream -> record_stream -> consumer chain (one for the '
-        f'MOE_DISPATCH-consuming block, one for the following '
-        f'EXPERT_COMPUTE-consuming block), found {checked}'
+    assert checked >= 1, (
+        f'expected the dedicated dispatch stream to retain one full '
+        f'wait_stream -> record_stream -> consumer chain, found {checked}'
     )
 
 
-def test_gencode_record_stream_targets_match_producer_event_semantics(gencode):
+def test_gencode_record_stream_targets_match_producer_event_semantics(dedicated_gencode):
     """Stronger version of the above: the record_stream'd tensor in the
     ``moe_comm`` stream block must be the SAME variable that was produced
     by an EARLIER (outside this block, on the ``default`` stream) segment
     call -- i.e. record_stream is applied to a genuine cross-stream
     producer/consumer tensor, not a same-stream local temporary."""
-    body = _train_step_body(gencode[0])
+    body = _train_step_body(dedicated_gencode[0])
     full_text = '\n'.join(body)
     blocks = _find_stream_context_blocks(body)
     moe_comm_blocks = [b for b in blocks if b[1] == 'moe_comm' and b[4]]

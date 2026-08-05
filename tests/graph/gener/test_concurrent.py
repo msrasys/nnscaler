@@ -1,8 +1,11 @@
 #  Copyright (c) Microsoft Corporation.
 #  Licensed under the MIT License.
 
+import copy
+
 import pytest
 from nnscaler.ir.tensor import IRFullTensor
+from nnscaler.ir.cten import IRCell
 from nnscaler.graph.gener.concurrent import ConcurrentGener, CompileFlag, \
     AllToAllPrim, ReduceScatterPrim, _logger
 from ...utils import catch_log
@@ -49,3 +52,37 @@ def test_path_retry():
 
     assert called == 1
     assert 'Detected invalid AllToAllPrim' not in log_stream.getvalue()
+
+
+def _replica_lanes(ftensor, ranks):
+    """Make a pure RVD R(len(ranks)),V(1),D(1,...) layout for a unit test."""
+    base = ftensor.tosub()
+    tensors = []
+    for rank in ranks:
+        tensor = copy.copy(base)
+        cell = IRCell('lane', '', 0, 0)
+        cell.device = rank
+        tensor.cell = cell
+        tensors.append(tensor)
+    return tensors
+
+
+def test_independent_replica_lanes_fail_closed_before_rvd_collectives():
+    ftensor = IRFullTensor((4, 8), requires_grad=True).mark_independent_replica_lanes()
+    assert ftensor.like().independent_replica_lanes
+    assert ftensor.grad.independent_replica_lanes
+
+    fsrc = _replica_lanes(ftensor, [0, 1])
+    fdst = _replica_lanes(ftensor, [2, 3])
+    bsrc = _replica_lanes(ftensor.grad, [2, 3])
+    bdst = _replica_lanes(ftensor.grad, [0, 1])
+    with pytest.raises(ValueError, match='independent replica lanes at a PP boundary are not yet executable safely'):
+        ConcurrentGener.gen(fsrc, fdst, bsrc, bdst)
+
+
+def test_independent_replica_lanes_fail_closed_for_nonbijective_mesh():
+    ftensor = IRFullTensor((4, 8)).mark_independent_replica_lanes()
+    fsrc = _replica_lanes(ftensor, [0, 1])
+    fdst = _replica_lanes(ftensor, [2, 3, 4])
+    with pytest.raises(ValueError, match='independent replica lanes at a PP boundary are not yet executable safely'):
+        ConcurrentGener.gen(fsrc, fdst, [], [])

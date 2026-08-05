@@ -106,8 +106,11 @@ class ScheduleCodeGen(FuncEmission):
             objs = IR.get_objects(val)
             return self.tuple_name([obj for obj in objs if isinstance(obj, IRTensor)])
 
+        def _is_default_stream(stream: Optional[str]) -> bool:
+            return stream is None or stream == 'default'
+
         def _get_codes_with_stream_context(codes: List[str], stream: Optional[str]) -> List[str]:
-            if stream is None:
+            if _is_default_stream(stream):
                 return codes + ['']
             else:
                 with Block(f'with torch.cuda.stream(nnscaler.runtime.device.DeviceGroup().get_stream({repr(stream)})):' ) as stream_block:
@@ -323,16 +326,17 @@ class ScheduleCodeGen(FuncEmission):
 
     def _get_node_stream(self, node: IRCell) -> Optional[str]:
         stream_context = self._get_node_stream_context(node)
-        if stream_context:
+        if stream_context and stream_context.stream not in (None, 'default'):
             return stream_context.stream
-        else:
-            return None
+        return None
 
     def _emit_stream_context(self, stream_context, codes: List[str]) -> List[str]:
         wait_stream_codes = []
         if stream_context and stream_context.wait_streams:
             for wait_stream in stream_context.wait_streams:
-                wait_stream_codes.append(f'torch.cuda.current_stream().wait_stream(nnscaler.runtime.device.DeviceGroup().get_stream({repr(wait_stream)}))')
+                if wait_stream != stream_context.stream:
+                    wait_stream_codes.append(
+                        f'torch.cuda.current_stream().wait_stream(nnscaler.runtime.device.DeviceGroup().get_stream({repr(wait_stream)}))')
 
         wait_event_codes = []
         if stream_context and stream_context.wait_events:
@@ -558,7 +562,7 @@ class ScheduleCodeGen(FuncEmission):
         else:
             raise RuntimeError(f"Unspported node type: {type(unwrap_node)}")
 
-        if stream_context and stream_context.stream:
+        if stream_context and stream_context.stream not in (None, 'default'):
             # register all input tensors to the current stream
             # to avoid cross-stream premature deallocation issue
             # see `Tensor.record_stream` in PyTorch for more details

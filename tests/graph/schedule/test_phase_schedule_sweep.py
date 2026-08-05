@@ -23,6 +23,7 @@ multiple micro-batch counts, stage counts, and (via ``layers_per_stage``)
 multiple MoE layers stacked in one physical stage.
 """
 import tempfile
+from pathlib import Path
 from typing import List, Tuple
 
 import pytest
@@ -182,7 +183,8 @@ def _build_graph(model, tempdir, dim=DIM):
     return graph
 
 
-def _pas_phase_pipeline(graph, num_stages: int, layers_per_stage: int, nmicros: int):
+def _pas_phase_pipeline(graph, num_stages: int, layers_per_stage: int, nmicros: int,
+                        *, global_phase_interleave: bool = False):
     """Stage the graph into ``num_stages`` physical stages, each
     ``layers_per_stage`` MoE layers deep, lowering every layer to its 4
     phases (:func:`lower_layer_to_phases`) before assigning devices, then
@@ -231,7 +233,9 @@ def _pas_phase_pipeline(graph, num_stages: int, layers_per_stage: int, nmicros: 
                 graph.assign(node, sid)
 
     validate_phase_layout(graph, num_stages)
-    sched = PhaseAwareSched.sched_1f1b_phase_aware(graph, nmicros, num_stages)
+    sched = (PhaseAwareSched.sched_1f1b_global_phase_aware(graph, nmicros, num_stages)
+             if global_phase_interleave else
+             PhaseAwareSched.sched_1f1b_phase_aware(graph, nmicros, num_stages))
     return graph, phase_nodes_per_stage, sched
 
 
@@ -372,6 +376,56 @@ def _assert_phase_schedule_properties(num_stages, layers_per_stage, nmicros):
             assert found_dispatch, f"no dispatch-window interleave for {(num_stages, layers_per_stage, nmicros)}: {seq}"
             assert found_combine, f"no combine-window interleave for {(num_stages, layers_per_stage, nmicros)}: {seq}"
 
+
+def _phase_positions(sched, phase_nodes_per_stage, nmicros):
+    """Assert the explicit global scheduler's pipeline dependency DAG."""
+    positions = {(block.content, block.mid): sched.start(block) for block in sched.all_blocks()}
+    for mid in range(nmicros):
+        for sid, phase_nodes in enumerate(phase_nodes_per_stage):
+            fsegs = [pn.segment for pn in phase_nodes]
+            bsegs = [pn.segment.mirror for pn in reversed(phase_nodes)]
+            for left, right in zip(fsegs, fsegs[1:]):
+                assert positions[left, mid] < positions[right, mid]
+            for left, right in zip(bsegs, bsegs[1:]):
+                assert positions[left, mid] < positions[right, mid]
+            assert positions[fsegs[-1], mid] < positions[bsegs[0], mid]
+            if sid > 0:
+                upstream = phase_nodes_per_stage[sid - 1][-1].segment
+                assert positions[upstream, mid] < positions[fsegs[0], mid]
+            if sid < len(phase_nodes_per_stage) - 1:
+                downstream = phase_nodes_per_stage[sid + 1][-1].segment.mirror
+                assert positions[downstream, mid] < positions[bsegs[0], mid]
+
+
+def _has_cross_microbatch_fb_interleave(sched, phase_nodes, device):
+    blocks = [block for block in sched.all_blocks() if device in block.device]
+    blocks.sort(key=sched.start)
+    for first, second, third in zip(blocks, blocks[1:], blocks[2:]):
+        kinds = (first.content.isfw(), second.content.isfw(), third.content.isfw())
+        if kinds in ((True, False, True), (False, True, False)) and len({first.mid, second.mid, third.mid}) > 1:
+            return True
+    return False
+
+
+@pytest.mark.parametrize('num_stages,nmicros', [(2, 2), (2, 4), (4, 4), (4, 6)])
+def test_global_phase_scheduler_preserves_cross_stage_dependencies_and_interleaves_when_ready(
+        num_stages, nmicros):
+    """Global list scheduling may cross all physical stages, never local-guessing F/B."""
+    with replace_all_device_with('cpu', force=True):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            graph = _build_graph(_MultiStageMoEModel(num_stages, 1), Path(tmpdir))
+            _, phase_nodes, sched = _pas_phase_pipeline(
+                graph, num_stages, 1, nmicros, global_phase_interleave=True)
+    assert sched.validate()
+    _phase_positions(sched, phase_nodes, nmicros)
+
+    # PP2 exposes a non-first-stage phase window.  In PP4, the last stages do
+    # too; intermediate stages can legitimately have no slack because their
+    # upstream activation and downstream gradient are both on the critical
+    # path.  Do not manufacture a local reordering in that case.
+    interleaved = [sid for sid, nodes in enumerate(phase_nodes)
+                   if _has_cross_microbatch_fb_interleave(sched, nodes, sid)]
+    assert any(sid > 0 for sid in interleaved), (num_stages, nmicros, interleaved)
 
 @pytest.mark.parametrize('num_stages,layers_per_stage,nmicros', _SWEEP_CONFIGS)
 @replace_all_device_with('cpu')

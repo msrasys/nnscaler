@@ -8,7 +8,7 @@ import atexit
 
 from collections import deque
 from dataclasses import dataclass
-from typing import Tuple, Any, Callable, List, Dict, Hashable, Iterable, Optional, Union, Iterator
+from typing import Tuple, Any, Callable, List, Dict, Deque, Hashable, Iterable, Optional, Union, Iterator
 import torch
 import logging
 from torch.distributed import Work
@@ -249,6 +249,10 @@ class _AsyncCommHandler:
             work.wait()
         self._send_holds.clear()
 
+    def has_pending(self) -> bool:
+        """Fast path for executor boundaries with no async work to poll."""
+        return bool(self._works or self._send_holds)
+
     def drain_all_completed(self):
         self.drain_sends_completed()
 
@@ -367,10 +371,10 @@ class Executor:
     # executing the forward of graph, the input tensors will be detached
     # from previous graph and saved for backward.
     # Each graph has its name, and multiple call for the graph will append
-    # (instant id -> detached) input tensor pairs for backward reference.
-    _detach: Dict[str, List[TensorPairs]] = dict()
+    # (instant id -> detached) input tensor pairs for FIFO backward reference.
+    _detach: Dict[str, Deque[TensorPairs]] = dict()
     # Weight-backward states follow the same per-segment FIFO order as `_detach`.
-    _weight_backward_states: Dict[str, List[_WeightBackwardState]] = dict()
+    _weight_backward_states: Dict[str, Deque[_WeightBackwardState]] = dict()
     _backward_pre_hook: Optional[Callable] = None
 
     @staticmethod
@@ -393,7 +397,7 @@ class Executor:
         input_dtensors = tuple(mapping[id(t)] if id(t) in mapping else t for t in input_tensors)
 
         saved_pairs = [(id(itensor), dtensor) for itensor, dtensor in zip(input_tensors, input_dtensors)]
-        Executor._detach.setdefault(name, []).append(saved_pairs)
+        Executor._detach.setdefault(name, deque()).append(saved_pairs)
 
         outputs = subgraph(*input_dtensors)
         return outputs
@@ -438,7 +442,7 @@ class Executor:
         """
         output_tensor_grads = Executor.sync_tensors(output_tensor_grads)
 
-        saved_pairs = Executor._detach[name].pop(0)
+        saved_pairs = Executor._detach[name].popleft()
         tensor_ids: List[int] = [pair[0] for pair in saved_pairs]
         dtensors: List[torch.Tensor] = [pair[1] for pair in saved_pairs]
         for t in input_tensors:
@@ -506,7 +510,7 @@ class Executor:
         output_tensor_grads = Executor.sync_tensors(output_tensor_grads)
         weights = tuple(weights)
 
-        saved_pairs = Executor._detach[name].pop(0)
+        saved_pairs = Executor._detach[name].popleft()
         tensor_ids: List[int] = [pair[0] for pair in saved_pairs]
         dtensors: List[torch.Tensor] = [pair[1] for pair in saved_pairs]
         for tensor in input_tensors:
@@ -520,7 +524,7 @@ class Executor:
                 )
 
         if len(output_tensors) == 0:
-            Executor._weight_backward_states.setdefault(name, []).append(
+            Executor._weight_backward_states.setdefault(name, deque()).append(
                 _WeightBackwardState(param_groups=[])
             )
             return None
@@ -549,7 +553,7 @@ class Executor:
                 )
 
         if not input_tensors:
-            Executor._weight_backward_states.setdefault(name, []).append(
+            Executor._weight_backward_states.setdefault(name, deque()).append(
                 _WeightBackwardState(
                     output_tensors=tuple(dedup_output_tensors),
                     output_tensor_grads=tuple(dedup_output_tensor_grads),
@@ -569,7 +573,7 @@ class Executor:
             input_tensors,
             iter(weights),
         )
-        Executor._weight_backward_states.setdefault(name, []).append(
+        Executor._weight_backward_states.setdefault(name, deque()).append(
             _WeightBackwardState(param_groups=param_groups)
         )
 
@@ -588,7 +592,7 @@ class Executor:
         states = Executor._weight_backward_states.get(name)
         if not states:
             raise RuntimeError(f"No pending weight backward for segment {name}.")
-        state = states.pop(0)
+        state = states.popleft()
 
         if state.param_groups is not None:
             if weights and state.param_groups:
@@ -611,10 +615,17 @@ class Executor:
     @staticmethod
     def sync_tensors(tensors: List[Any]) -> List[Any]:
         """
-        Wait until the finish of synchornized tensors
+        Wait until the finish of synchronized tensors.
+
+        Most small phase boundaries have no outstanding async work.  Avoid a
+        singleton lookup plus a full work-dictionary completion scan in that
+        common case; when work exists this preserves the exact prior drain and
+        per-tensor FIFO wait behavior.
         """
-        AsyncCommHandler().drain_all_completed()
-        return [AsyncCommHandler().wait(t) if torch.is_tensor(t) else t for t in tensors]
+        handler = AsyncCommHandler()
+        if handler.has_pending():
+            handler.drain_all_completed()
+        return [handler.wait(t) if torch.is_tensor(t) else t for t in tensors]
 
 
     @staticmethod
