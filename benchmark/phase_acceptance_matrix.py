@@ -28,6 +28,7 @@ from pathlib import Path
 import random
 import statistics
 import subprocess
+import time
 import sys
 from typing import Any
 
@@ -126,6 +127,8 @@ def _run_worker(args, config: dict[str, Any]) -> dict[str, Any]:
     ]
     env = os.environ.copy()
     env['NNSCALER_BENCH_WORKTREE'] = config['worktree']
+    if config.get('disable_phase_executor'):
+        env['DISABLE_PHASE_EXECUTOR'] = '1'
     completed = subprocess.run(command, cwd=config['worktree'], env=env,
                                text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                check=False)
@@ -137,6 +140,12 @@ def _run_worker(args, config: dict[str, Any]) -> dict[str, Any]:
             f"{completed.stdout[-8000:]}"
         )
     return json.loads(lines[-1][len(marker):])
+
+
+def _worktree_commit(worktree: str) -> str:
+    return subprocess.check_output(
+        ['git', '-C', worktree, 'rev-parse', 'HEAD'], text=True
+    ).strip()
 
 
 def _summary(rows: list[dict[str, Any]]) -> dict[str, Any]:
@@ -165,6 +174,7 @@ def _driver(args) -> None:
     for name, worktree in worktrees.items():
         if not (Path(worktree) / 'nnscaler').is_dir():
             raise ValueError(f'{name} worktree is not an nnscaler checkout: {worktree}')
+    commits = {name: _worktree_commit(worktree) for name, worktree in worktrees.items()}
 
     rng = random.Random(args.seed)
     rows = []
@@ -181,20 +191,37 @@ def _driver(args) -> None:
                     worktree=worktrees[variant], variant=variant,
                     scale_name=scale_name, scale=scale, round=round_index,
                     warmup=args.warmup, timed=args.timed,
+                    disable_phase_executor=(args.disable_phase_executor_d_new and variant == 'd-new'),
                 )
-                result = _run_worker(args, config)
+                last_error = None
+                for attempt in range(args.retries + 1):
+                    try:
+                        result = _run_worker(args, config)
+                        break
+                    except RuntimeError as error:
+                        last_error = error
+                        if attempt == args.retries:
+                            raise
+                        print(f'benchmark retry {attempt + 1}/{args.retries} for {config}: {error}', file=sys.stderr)
+                else:
+                    raise last_error
                 samples = result['samples']
                 row = dict(
                     scale=scale_name, round=round_index, ordinal=ordinal,
-                    variant=variant, worktree=worktrees[variant],
+                    variant=variant, commit=commits[variant], worktree=worktrees[variant], retry_attempt=attempt,
                     rank_max_samples_s=samples,
                     round_median_s=statistics.median(samples),
                 )
                 rows.append(row)
                 print(json.dumps(row, sort_keys=True))
+                # launch_torchrun uses one localhost rendezvous port in this
+                # repository. Give the previous fresh process group time to
+                # release it before starting the next ABBA cell.
+                if args.inter_run_delay:
+                    time.sleep(args.inter_run_delay)
 
     payload = dict(
-        seed=args.seed, rounds=args.rounds, warmup=args.warmup, timed=args.timed,
+        seed=args.seed, rounds=args.rounds, warmup=args.warmup, timed=args.timed, commits=commits,
         rows=rows, summary=_summary(rows),
     )
     json_path = Path(args.output_json)
@@ -204,9 +231,9 @@ def _driver(args) -> None:
     json_path.write_text(json.dumps(payload, indent=2) + '\n')
     with csv_path.open('w', newline='') as stream:
         writer = csv.DictWriter(stream, fieldnames=(
-            'scale', 'round', 'ordinal', 'variant', 'worktree',
+            'scale', 'round', 'ordinal', 'variant', 'commit', 'worktree', 'retry_attempt',
             'round_median_s', 'rank_max_samples_s',
-        ))
+        ), lineterminator='\n')
         writer.writeheader()
         for row in rows:
             out = dict(row)
@@ -236,6 +263,9 @@ def main() -> None:
     parser.add_argument('--warmup', type=int, default=2)
     parser.add_argument('--timed', type=int, default=3)
     parser.add_argument('--seed', type=int, default=20260805)
+    parser.add_argument('--retries', type=int, default=2)
+    parser.add_argument('--inter-run-delay', type=float, default=2.0)
+    parser.add_argument('--disable-phase-executor-d-new', action='store_true')
     args = parser.parse_args()
     if args.worker:
         _worker_main(args)

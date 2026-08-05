@@ -136,8 +136,16 @@ def _profile_worker(mode):
             executor_module.PhaseExecutor.backward = original_phase_backward
 
         events = sorted(profiler.key_averages(), key=lambda event: event.self_cpu_time_total, reverse=True)
+        selected_events = events[:30]
+        selected_ids = {id(event) for event in selected_events}
+        # Phase labels can be smaller than the top-30 CUDA/ATen entries; keep
+        # them explicitly so the profile remains an API-count artifact.
+        selected_events += [
+            event for event in events
+            if event.key.startswith('nnscaler/phase_') and id(event) not in selected_ids
+        ]
         summary = []
-        for event in events[:30]:
+        for event in selected_events:
             summary.append({
                 'key': event.key,
                 'count': event.count,

@@ -682,7 +682,10 @@ def make_pas(num_stages: int, layers_per_stage: int, ep_ranks_per_stage: Sequenc
     The default leaves phases on the current/default stream; ProcessGroupNCCL
     already runs asynchronous all-to-all work on its communication stream.
     Set ``dedicated_moe_comm_stream=True`` only for the explicit dispatch-stream
-    profiling ablation. Every real op is replicated (``nnscaler.policies._replica``) across its
+    profiling ablation. For a PP×EP boundary, callers must explicitly declare
+    ``pp_replica_semantics='equal'`` or ``'independent'``; runtime rank values
+    cannot be inferred from RVD metadata. Every real op is replicated
+    (``nnscaler.policies._replica``) across its
     stage's ``ep_ranks``, EXCEPT ``expert_ffn_local`` (the real, per-rank
     -distinct expert FFN), which is genuinely partitioned -- see
     :func:`_assign_node_for_ep`. Schedules with
