@@ -114,6 +114,14 @@ class ModuleParallelizeConfigAdapter(PrecisionMixin, PolicyMixin):
         )
 
     @property
+    def codegen_workers(self):
+        return (
+            self.parallel_module.codegen_workers
+            if self.parallel_module and self.parallel_module.codegen_workers is not None
+            else self.trainer_args.codegen_workers
+        )
+
+    @property
     def instance_name(self):
         return (
             self.parallel_module.instance_name
@@ -233,6 +241,7 @@ class ModuleParallelizeConfigAdapter(PrecisionMixin, PolicyMixin):
             reuse=self.gen_reuse,
             instance_name=self.instance_name,
             broadcast_strategy=self.broadcast_strategy,
+            codegen_workers=self.codegen_workers,
             load_module=load_module,
             autoset_requires_grad=self.autoset_requires_grad,
         )

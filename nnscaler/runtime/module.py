@@ -1074,6 +1074,8 @@ class ParallelModule(CubeModule):
     EXTRA_STATE_KEY = 'CUBE_EXTRA_STATE'
     ATTR_META_FILE_PREFIX = 'attr_meta'
     ATTR_META_FILE_TEMPLATE = ATTR_META_FILE_PREFIX + '{}.pkl'  # 'attr_meta{}.pkl'
+    ATTR_META_FILE = ATTR_META_FILE_PREFIX + '.pkl'
+    ATTR_META_FORMAT_VERSION = 1
 
     # the rank of the module, will be assigned in the generated subclasses
     rank: int
@@ -1134,15 +1136,8 @@ class ParallelModule(CubeModule):
         from nnscaler.parallel import ComputeConfig
 
         super().__init_subclass__(**kwargs)
-        cls.attr_meta_maps = []
         cls.module_dir = Path(sys.modules[cls.__module__].__file__).parent
-
-        for rank in range(cls.world_size):
-            attr_map_file = cls.module_dir / cls.ATTR_META_FILE_TEMPLATE.format(rank)
-            with open(attr_map_file, 'rb') as f:
-                attr_meta_map = pickle.load(f)
-                attr_meta_map = {attr: AttrMeta(**meta) for attr, meta in attr_meta_map.items()}
-                cls.attr_meta_maps.append(attr_meta_map)
+        cls.attr_meta_maps = cls._load_attr_meta_maps(cls.module_dir, cls.world_size)
 
         cls.dist_param_map = torch.load(cls.module_dir / FxModuleParser.ATTR_MAP_FILE, weights_only=False)
         cls.compute_config = ComputeConfig.safe_load_from_file(
@@ -1150,6 +1145,69 @@ class ParallelModule(CubeModule):
             return_none_on_error=False
         )
         cls.origin_module_metadata = torch.load(cls.module_dir / cls.ORIGIN_MODULE_METADATA_FILE, weights_only=False)
+
+    @staticmethod
+    def _normalize_attr_meta_map(attr_meta_map: Any, source: Path) -> dict[str, AttrMeta]:
+        if not isinstance(attr_meta_map, dict):
+            raise RuntimeError(f'Invalid attribute metadata map in {source}: expected a dictionary')
+        try:
+            return {
+                attr: meta if isinstance(meta, AttrMeta) else AttrMeta(**meta)
+                for attr, meta in attr_meta_map.items()
+            }
+        except (TypeError, KeyError) as exc:
+            raise RuntimeError(f'Invalid attribute metadata map in {source}') from exc
+
+    @classmethod
+    def _load_attr_meta_maps(cls, module_dir: Path, world_size: int) -> list[dict[str, AttrMeta]]:
+        """Load compact metadata when present, with legacy per-rank shard fallback."""
+        compact_file = module_dir / cls.ATTR_META_FILE
+        if not compact_file.exists():
+            attr_meta_maps = []
+            for rank in range(world_size):
+                attr_map_file = module_dir / cls.ATTR_META_FILE_TEMPLATE.format(rank)
+                with attr_map_file.open('rb') as stream:
+                    attr_meta_map = pickle.load(stream)
+                attr_meta_maps.append(cls._normalize_attr_meta_map(attr_meta_map, attr_map_file))
+            return attr_meta_maps
+
+        with compact_file.open('rb') as stream:
+            compact_meta = pickle.load(stream)
+        if not isinstance(compact_meta, dict):
+            raise RuntimeError(f'Invalid compact attribute metadata in {compact_file}: expected a dictionary')
+        if compact_meta.get('version') != cls.ATTR_META_FORMAT_VERSION:
+            raise RuntimeError(
+                f'Unsupported compact attribute metadata version in {compact_file}: '
+                f"{compact_meta.get('version')!r}"
+            )
+
+        unique_payloads = compact_meta.get('unique_payloads')
+        rank_to_variant = compact_meta.get('rank_to_variant')
+        if not isinstance(unique_payloads, list) or not all(isinstance(payload, bytes) for payload in unique_payloads):
+            raise RuntimeError(f'Invalid unique payloads in compact attribute metadata {compact_file}')
+        if not isinstance(rank_to_variant, list) or len(rank_to_variant) != world_size:
+            raise RuntimeError(
+                f'Compact attribute metadata world size mismatch in {compact_file}: '
+                f'expected {world_size}, got '
+                f'{len(rank_to_variant) if isinstance(rank_to_variant, list) else type(rank_to_variant).__name__}'
+            )
+        if any(
+            isinstance(variant, bool)
+            or not isinstance(variant, int)
+            or variant < 0
+            or variant >= len(unique_payloads)
+            for variant in rank_to_variant
+        ):
+            raise RuntimeError(f'Invalid rank-to-variant index in compact attribute metadata {compact_file}')
+
+        unique_maps = []
+        for payload in unique_payloads:
+            try:
+                attr_meta_map = pickle.loads(payload)
+            except Exception as exc:
+                raise RuntimeError(f'Invalid payload in compact attribute metadata {compact_file}') from exc
+            unique_maps.append(cls._normalize_attr_meta_map(attr_meta_map, compact_file))
+        return [unique_maps[variant] for variant in rank_to_variant]
 
     @property
     def non_presistent_buffers_inited(self):
