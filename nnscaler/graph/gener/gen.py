@@ -15,6 +15,7 @@ from nnscaler.graph.segment import IRSegment, CellPosition
 from nnscaler.graph.function.pyfunc import IRPyFunc
 
 from nnscaler.ir.cten import IRCell, IRObject
+from nnscaler.ir.model import consensus_model_spec
 from nnscaler.ir.tensor import IRFullTensor, IRSubTensor
 from nnscaler.ir.operator import IRFwOperation, IRDataOperation
 
@@ -716,6 +717,9 @@ class IRAdapterGener:
                 bconsumer.replace_output(ctensor.grad, igrad)
 
         for devid in devtensors:
+            model_spec = consensus_model_spec(
+                producer.model_spec for producer in devops[devid]
+            )
             indmaps = [t.indmap for t in devtensors[devid]]
             valmaps = [t.valmap for t in devtensors[devid]]
             split_dim = len(set(indmaps)) > 1
@@ -793,6 +797,7 @@ class IRAdapterGener:
                     node.set_output(0, output)
                     node.device = devid
                     node.recompute = rcid
+                    node.model_spec = model_spec
                     graph.insert(node, graph.index(ptensor.cell) + 1)
                     lhs = output
                 # remove last node for adaptation
@@ -822,6 +827,7 @@ class IRAdapterGener:
             else:
                 node.device = devid
                 node.recompute = rcid
+                node.model_spec = model_spec
                 # insert
                 max_fid = max(graph.index(producer) for producer in devops[devid])
                 graph.finsert(node, max_fid + 1)
@@ -892,6 +898,9 @@ class IRAdapterGener:
 
             multiref = MultiRef(devtensors[devid][0], len(grads))
             multiref.comment = 'created at IRAdapterGener:local_consumer_multiref'
+            multiref.model_spec = consensus_model_spec(
+                consumer.model_spec for consumer in devops[devid]
+            )
             # set input gradient
             multiref.input(0).grad = accum_grad
             # set output and its gradient
@@ -948,6 +957,7 @@ class IRAdapterGener:
                 for tensor in ptensors:
                     mr = MultiRef(tensor, len(multiref.outputs()))
                     mr.comment = f'create at IRAdapterGener:autoref, comment before transformation: {multiref.comment}'
+                    mr.model_spec = multiref.model_spec
                     mr.input(0).grad = tensor.grad
                     for idx, out in enumerate(multiref.outputs()):
                         output = out.parent.select(tensor.indmap, tensor.valmap)

@@ -30,6 +30,7 @@ import more_itertools as mitr
 from nnscaler.autodist.apis import parallelize_graph
 from nnscaler.autodist.autodist_config import AutoDistConfig
 from nnscaler.graph import IRGraph
+from nnscaler.graph.annotation import apply_graph_annotator
 from nnscaler.graph.function.anchor import IRGraphAnchor
 from nnscaler.graph.function.dimops import IRDimops
 from nnscaler.graph.function.pyfunc import IRPyFunc
@@ -647,6 +648,7 @@ def fn(
     Returns:
         the distributed IRGraph
     """
+    apply_graph_annotator(graph, cfg)
     result = policy(graph, cfg)
     if isinstance(result, IRGraph):  # traditional policy
         return result

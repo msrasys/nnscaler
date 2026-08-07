@@ -8,6 +8,7 @@ import logging
 
 from nnscaler.ir.tensor import IRFullTensor, IRSubTensor, ValueMap
 from nnscaler.ir.cten import IRTensor, IRCell, IRObject, IR
+from nnscaler.ir.model import consensus_model_spec
 from nnscaler.ir.operator import IRFwOperation, IRBpOperation
 from nnscaler.ir.adapter import IRAdapter
 
@@ -114,6 +115,7 @@ class IRSegment(IRCell):
         for node in nodes:
             self.insert(node, self.nnodes)
 
+        self.model_spec = consensus_model_spec(node.model_spec for node in nodes)
         self._dispatch_cached: Dict[int, IRSegment] = {}
 
     def set_input(self, idx: int, val: Any):
@@ -895,6 +897,9 @@ class IRSegment(IRCell):
         otensors: List[IRSubTensor] = [ft.select(tensor.indmap, tensor.valmap) for ft in ftensors]
         # create multiref
         multiref = MultiRef(tensor, len(consumers))
+        multiref.model_spec = consensus_model_spec(
+            consumer.model_spec for consumer in consumers
+        )
         if comment:
             multiref.comment = comment
         for idx, otensor in enumerate(otensors):
@@ -1004,6 +1009,7 @@ class IRSegment(IRCell):
                         producers[ftensor] = node
             for ftensor, cnodes in consumers.items():
                 if len(cnodes) == 1 or ftensor.is_attr(): continue
+                model_spec = consensus_model_spec(node.model_spec for node in cnodes)
                 reftensor = ftensor
                 ctensor = ftensor
                 while len(cnodes) > 0:
@@ -1012,6 +1018,7 @@ class IRSegment(IRCell):
                         itensors = [ftensor.like() for _ in range(2)]
                         multiref = MultiRef(reftensor, 2)
                         multiref.comment = 'create at IRSegment:single_consume'
+                        multiref.model_spec = model_spec
                         for idx, itensor in enumerate(itensors):
                             multiref.set_output(idx, itensor)
                         multiref.verify_shape()
@@ -1053,6 +1060,9 @@ class IRSegment(IRCell):
                 # create and insert multiref operation
                 multiref = MultiRef(ftensor, len(cnodes))
                 multiref.comment = 'create at IRSegment:single_consume'
+                multiref.model_spec = consensus_model_spec(
+                    node.model_spec for node in cnodes
+                )
                 for idx, itensor in enumerate(itensors):
                     multiref.set_output(idx, itensor)
                 multiref.verify_shape()
@@ -1229,6 +1239,7 @@ class IRSegment(IRCell):
             segment = IRSegment(nodes, inputs, outputs, self.name)
             segment._id = self.cid
             segment.op_context = self.op_context
+            segment.model_spec = self.model_spec
             segment.pre_hook = self.pre_hook
             segment.post_hook = self.post_hook
             segment.hook_meta = self.hook_meta
@@ -1636,6 +1647,7 @@ class IRSegmentExpander:
                     new_node.comment = node.comment
                 new_node.recompute = node.recompute
                 new_node.op_context = node.op_context
+                new_node.model_spec = node.model_spec
                 for index, output in enumerate(node.outputs()):
                     if isinstance(output, IRSubTensor):
                         new_node.set_output(index, _partition_like(output, layout, device))
@@ -1745,6 +1757,7 @@ class IRSegmentExpander:
         Copy the meta information from the original segment to another segment.
         """
         target_seg.op_context = self._segment.op_context
+        target_seg.model_spec = self._segment.model_spec
         target_seg.pre_hook = self._segment.pre_hook
         target_seg.post_hook = self._segment.post_hook
         target_seg.hook_meta = self._segment.hook_meta

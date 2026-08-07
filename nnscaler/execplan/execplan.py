@@ -36,6 +36,7 @@ class ExeReuseCell(IRCell):
         for idx, t in enumerate(outputs):
             self.set_output(idx, t)
         self._cell: IRCell = cell
+        self.model_spec = cell.model_spec
         self._cached_dispatched: Dict[int, ExeReuseCell] = {}
         self._micro_batch_id = micro_batch_id
 
@@ -116,6 +117,7 @@ class ExeReuseCell(IRCell):
         )
         reuse._id = self._id
         reuse._op_context = self._op_context
+        reuse.model_spec = self.model_spec
         if _mirror and self.mirror is not None:
             mreuse = self.mirror.dispatch(devid, _mirror=False)
             IRCell.make_pair(reuse, mreuse)

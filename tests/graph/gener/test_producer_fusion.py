@@ -2,6 +2,7 @@
 #  Licensed under the MIT License.
 
 from nnscaler.ir.tensor import IRFullTensor
+from nnscaler.ir import ModelSpec
 import nnscaler.graph.function.function as F
 from nnscaler.graph import IRGraph
 
@@ -24,6 +25,7 @@ def test_gener_producer_fusion_replicate():
     out2 = _tensor([128, 128])
     l2 = F.Linear(l1.output(0), w2)
     l2.set_output(0, out2)
+    l2.model_spec = ModelSpec('mlp', 'model.mlp', 'model.py:10-20')
 
     loss = _tensor([1])
     sum = F.Sum(l2.output(0))
@@ -40,6 +42,7 @@ def test_gener_producer_fusion_replicate():
     graph.assign(r1, 0)
     graph.assign(r2, 0)
     s3, s4 = graph.partition(s2, s2.algorithm('dim'), idx=0, dim=1, num=2)
+    s4.model_spec = ModelSpec('attention', 'model.attn', 'model.py:30-40')
     graph.assign(s3, 1)
     graph.assign(s4, 1)
 
@@ -51,6 +54,7 @@ def test_gener_producer_fusion_replicate():
 
     assert len(graph.select(name='accum')) == 1
     accum = graph.select(name='accum')[0]
+    assert accum.model_spec is None
 
     mms = graph.select(name='linear')[1:]
     assert len(mms) == 4

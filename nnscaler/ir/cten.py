@@ -27,6 +27,7 @@ import torch
 
 from nnscaler.ir.unique import IDGenerator
 from nnscaler.ir.dtype import DTypeInfo
+from nnscaler.ir.model import ModelSpec
 from nnscaler.utils import _DICT_ITEMS_TYPE, _DICT_VALUES_TYPE, load_type, get_dynamic
 
 
@@ -87,6 +88,8 @@ class IRCell:
         self._call_expr: Optional[str] = None
         # the operation context information
         self._op_context: Optional[Dict[str, Any]] = None
+        # semantic ownership information used by generated tracing ranges
+        self._model_spec: Optional[ModelSpec] = None
 
         # function to be called before the op is executed
         # which will be inserted in the runtime code before the op call.
@@ -522,6 +525,16 @@ class IRCell:
     @op_context.setter
     def op_context(self, context: Optional[Dict[str, Any]]):
         self._op_context = context
+
+    @property
+    def model_spec(self) -> Optional[ModelSpec]:
+        return getattr(self, '_model_spec', None)
+
+    @model_spec.setter
+    def model_spec(self, spec: Optional[ModelSpec]):
+        if spec is not None and not isinstance(spec, ModelSpec):
+            raise TypeError('model_spec must be a ModelSpec or None')
+        self._model_spec = spec
 
     def set_op_context(self, name: str, value: Any):
         """

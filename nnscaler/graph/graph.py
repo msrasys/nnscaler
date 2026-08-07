@@ -1245,7 +1245,7 @@ class IRGraph(IRSegment):
     def copy_node_meta_info(src_node: Union[IRFwOperation, IRDataOperation], dest_node: Union[IRFwOperation, IRDataOperation]):
         """
         Copy meta information from src_node to dest_node.
-        Current copy fields: ['recompute', 'comment', 'op_context', 'module_stack', 'device',
+        Current copy fields: ['recompute', 'comment', 'op_context', 'model_spec', 'module_stack', 'device',
         'hook_meta', 'pre_hook', 'post_hook']
         """
         if isinstance(src_node, IRFwOperation):
@@ -1254,6 +1254,7 @@ class IRGraph(IRSegment):
             dest_node.comment = src_node.comment
         if src_node.op_context is not None:
             dest_node.op_context = src_node.op_context
+        dest_node.model_spec = src_node.model_spec
         dest_node.module_stack = src_node.module_stack
         dest_node.device = src_node.device
         dest_node.hook_meta = src_node.hook_meta

@@ -436,6 +436,7 @@ class ModuleCodeGen(FuncEmission):
             segment = IRSegment(nodes, node.inputs(), node.outputs(), node.name)
             segment._id = node.cid
             segment._op_context = node._op_context
+            segment.model_spec = node.model_spec
             return segment
         return node
 
@@ -1163,83 +1164,49 @@ class ModuleCodeGen(FuncEmission):
                 node_code.append(self.emit_release(tensors_to_del))
             return node_code
 
-        def insert_codes_under_ctx(ctx_code, codes):
-            if ctx_code != "" and codes:
-                with Block(ctx_code) as cblock:
-                    cblock.insert_body(codes)
-                # [''] to make a new line, make the generated code pretty
-                return [''] + cblock.code + ['']
-            else:
-                return codes
+        def insert_codes_under_contexts(ctx_code, model_spec, codes):
+            if not codes:
+                return []
+
+            wrapped_codes = codes
+            if model_spec is not None:
+                component_code = (
+                    f'with ct.component({model_spec.component!r}, '
+                    f'model_fqn={model_spec.model_fqn!r}, '
+                    f'model_site={model_spec.model_site!r}, '
+                    'process_scope=False):'
+                )
+                with Block(component_code) as component_block:
+                    component_block.insert_body(wrapped_codes)
+                wrapped_codes = component_block.code
+
+            if ctx_code:
+                with Block(ctx_code) as context_block:
+                    context_block.insert_body(wrapped_codes)
+                wrapped_codes = context_block.code
+
+            if model_spec is not None or ctx_code:
+                # [''] makes generated context blocks easier to read.
+                return [''] + wrapped_codes + ['']
+            return wrapped_codes
 
         node_codes = []
-        current_context_manager_code = ""
+        unset_key = object()
+        current_key = unset_key
         current_codes = []
         for node_idx, node in enumerate(nodes):
-            if has_op_context_info(node):
-                new_context_manager_code = emit_context_manager(node)
-                if current_context_manager_code != new_context_manager_code:
-                    node_codes += insert_codes_under_ctx(current_context_manager_code, current_codes)
-                    current_codes = emit_node(node, node_idx)
-                    current_context_manager_code = new_context_manager_code
-                else:
-                    current_codes.extend(emit_node(node, node_idx))
+            context_manager_code = (
+                emit_context_manager(node) if has_op_context_info(node) else None
+            )
+            key = (context_manager_code, node.model_spec)
+            if current_key is unset_key or current_key == key:
+                current_codes.extend(emit_node(node, node_idx))
             else:
-                # Node without op context infortmation means it is inserted by nnscaler, not convert from original fx graph,
-                # for example, multiref node and adapter node, currently for nodes inserted by nnscaler we have the following assumption:
-                #     - the fx traced graph shows a context manager's impact to tensors,
-                #     - the behavior of an inserted node is determined by tensor properties, like data type and requires grad,
-                #     - combine the two points together, it is safe to put the inserted node in the default context.
-                # Base on this assumption, when we meet a node without op context infortmation, will force break the current code context scope
-                # and emit current node code without context managers.
-                #
-                # Here is an example about the inserted node code generation, the inserted node is a multiref node of y,
-                # and all the inserted nodes will under default context (without context managers):
-                #     """
-                #     # original code
-                #     with torch.no_grad():
-                #         y = func1(x)
-                #         z = func2(x)
-                #
-                #     # generated code
-                #     with torch.no_grad():
-                #         y = func1(x)
-                #     y_1, y_2 = nnscaler.runtime.function.multiref(y, 2)
-                #     with torch.no_grad():
-                #         z = func2(x)
-                #     """
-                #
-                # This way have two risks:
-                #     1. the assumption is no longer valid in subsequent development.
-                #     2. nodes that originally belonged to the same context need to be executed in a continuous context and cannot be interrupted.
-                # Fortunately, these two risks have not yet occurred for the current inserted nodes and supported context managers.
-                #
-                # Please note that if one entire context scope is split to multiple sub-scope, it may introduce additional overhead.
-                # Here is an overhead example about torch.autocast:
-                #     """
-                #     # original code
-                #     with torch.autocast(device_type='cuda', dtype=torch.float32, enabled=True, cache_enabled=True):
-                #         y = func1(x, a)
-                #         z = func2(x, b)
-                #
-                #     # generated code
-                #     with torch.autocast(device_type='cuda', dtype=torch.float32, enabled=True, cache_enabled=True):
-                #         y = func1(x, a)
-                #     ...
-                #     with torch.autocast(device_type='cuda', dtype=torch.float32, enabled=True, cache_enabled=True):
-                #         z = func2(x, b)
-                #     """
-                # In the original code, x might cast to float32 and used by both func1 and func2,
-                # but in generated code, because the scope is interrupted, the two new scopes cannot share the x cast result,
-                # then there might have a additional cast x to float32 for func2.
-                #
-                # For torch.no_grad and torch.inference_mode, the overhead is not significant, so we can ignore it.
-                #
-                # TODO: all inserted nodes should have its op context field.
-                node_codes += insert_codes_under_ctx(current_context_manager_code, current_codes)
-                node_codes += emit_node(node, node_idx)
-                current_codes = []
-        node_codes += insert_codes_under_ctx(current_context_manager_code, current_codes)
+                node_codes += insert_codes_under_contexts(*current_key, current_codes)
+                current_codes = emit_node(node, node_idx)
+            current_key = key
+        if current_key is not unset_key:
+            node_codes += insert_codes_under_contexts(*current_key, current_codes)
 
         return node_codes
 

@@ -9,6 +9,7 @@ import torch
 from nnscaler.ir.adapter.prim import IRAdapterPrim, IdentityPrim
 from nnscaler.ir.tensor import IRSubTensor, IRTensor
 from nnscaler.ir.cten import IRCell, IRObject
+from nnscaler.ir.model import consensus_model_spec
 
 
 class IRAdapter(IRCell):
@@ -135,6 +136,7 @@ class IRAdapter(IRCell):
         fadapter.custom = self.custom
         fadapter.recompute = self.recompute
         fadapter.op_context = self.op_context
+        fadapter.model_spec = self.model_spec
         # dispatch for mirror
         if _mirror and isinstance(self.mirror, IRAdapter):
             badapter = self.mirror.dispatch(devid, _mirror=False)
@@ -159,6 +161,9 @@ class IRAdapter(IRCell):
             prims += adapter.prims
         adapter = IRAdapter(itensors, otensors)
         adapter.prims = prims
+        adapter.model_spec = consensus_model_spec(
+            source.model_spec for source in adapters
+        )
         return adapter
 
 
