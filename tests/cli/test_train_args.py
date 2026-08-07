@@ -112,6 +112,7 @@ def test_arg_merge_resolve():
     config_path = str(Path(__file__).with_name('trainer_args.yaml').resolve())
     args = TrainerArgs.from_cli(['-f', config_path,
         '--vars.dim', '22',
+        '--codegen_workers', '2',
         '--vars.hello', '$(compute_config.plan_ngpus)',
         '--global_batch_size!',
         '--vars.vr_0', '$$(vars.dim)',
@@ -127,6 +128,7 @@ def test_arg_merge_resolve():
     assert args.dataset.train_args['dim'] == 22
     assert args.dataset.val_args['dim'] == 22
     assert args.vars['hello'] == args.compute_config.plan_ngpus
+    assert args.codegen_workers == 2
 
 
 
