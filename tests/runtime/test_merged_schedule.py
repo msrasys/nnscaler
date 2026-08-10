@@ -18,6 +18,7 @@ from nnscaler.runtime.merged_schedule import (
     manual_wait_grads,
     set_streams,
 )
+from nnscaler.runtime.merged_schedule.engine import _clone_output_tuple
 from torch import nn
 
 from tests.launch_torchrun import launch_torchrun
@@ -336,6 +337,16 @@ def test_schedule_node_uses_chronotrigger_ranges() -> None:
     assert "process_scope=False" in source
 
 
+def test_clone_output_tuple_owns_tensor_storage() -> None:
+    original = torch.tensor([3.0])
+
+    cloned = _clone_output_tuple((original, 4, None))
+    original.untyped_storage().resize_(0)
+
+    assert cloned[0].item() == 3.0
+    assert cloned[1:] == (4, None)
+
+
 def test_bucket_records_split_backward_contribution_counts() -> None:
     parameter = nn.Parameter(torch.ones(1))
     other = nn.Parameter(torch.ones(1))
@@ -348,6 +359,7 @@ def test_bucket_records_split_backward_contribution_counts() -> None:
     bucket._async_param_cnt = 0
     bucket._async_handle = None
     bucket._async_record_param_counts = None
+    bucket._manual_grad_pending = set()
 
     bucket.begin_record_async_hook_counts()
     bucket._record_async_grad_contribution(parameter)

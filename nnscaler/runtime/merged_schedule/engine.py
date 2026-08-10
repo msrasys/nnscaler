@@ -76,6 +76,13 @@ def _covered_storage_bytes(ranges):
     return sum(end - start for start, end in merged)
 
 
+def _clone_output_tuple(output_tuple):
+    return tuple(
+        value.detach().clone() if isinstance(value, torch.Tensor) else value
+        for value in output_tuple
+    )
+
+
 def set_streams():
     """Initialize global COMP/COMM streams.
 
@@ -678,7 +685,7 @@ class MergedScheduler:
 
         loss_node_0, output_info_0 = loss_fn(h0, samples[0], rmaps_0, eprobs_0)
         loss_0 = loss_node_0.forward((h0,))
-        results[0] = output_info_0['output_tuple']
+        results[0] = _clone_output_tuple(output_info_0['output_tuple'])
 
         del h0, rmaps_0, eprobs_0, output_info_0
 
@@ -844,7 +851,9 @@ class MergedScheduler:
             fwd_loss_node, fwd_output_info = loss_fn(
                 fwd_h, fwd_sample, fwd_routing_maps, fwd_expert_probs)
             fwd_loss = fwd_loss_node.forward((fwd_h,))
-            results[mb_i + 1] = fwd_output_info['output_tuple']
+            results[mb_i + 1] = _clone_output_tuple(
+                fwd_output_info['output_tuple']
+            )
 
             prev_all_nodes = fwd_all_nodes
             prev_loss_node = fwd_loss_node
@@ -885,13 +894,6 @@ class MergedScheduler:
         comm_done.record(get_comm_stream())
         torch.cuda.default_stream().wait_event(comp_done)
         torch.cuda.default_stream().wait_event(comm_done)
-
-        for i in range(len(results)):
-            if results[i] is not None:
-                results[i] = tuple(
-                    t.detach() if isinstance(t, torch.Tensor) else t
-                    for t in results[i]
-                )
 
         del prev_all_nodes, prev_loss_node
 
