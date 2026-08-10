@@ -79,9 +79,10 @@ class _FakeMoELayer(nn.Module):
         routing_probs = torch.sigmoid(self.router(h))
         if self.use_aux_loss:
             aux_loss = routing_probs.float().pow(2).mean()
+            loss_proxy = aux_loss.detach().requires_grad_(True)
             if self.step_data is not None:
-                self.step_data['_loss_aux_tensors'] = (aux_loss,)
-                self.step_data['gate_scores'] = aux_loss
+                self.step_data['_loss_aux_tensors'] = (loss_proxy,)
+                self.step_data['gate_scores'] = loss_proxy
             return h, h_ln, routing_probs, aux_loss
         return h, h_ln, routing_probs
 
