@@ -466,6 +466,8 @@ class ScheduleNode:
                 for i, out in enumerate(recomputed):
                     if isinstance(out, torch.Tensor) and out.requires_grad:
                         g = output_grad[i] if i < len(output_grad) else None
+                        if g is None:
+                            continue
                         tensor_outputs.append(out)
                         tensor_grads.append(g)
                 if tensor_outputs:
@@ -478,10 +480,16 @@ class ScheduleNode:
                 for i, out in enumerate(outputs):
                     if isinstance(out, torch.Tensor) and out.requires_grad:
                         g = output_grad[i] if i < len(output_grad) else None
+                        if g is None:
+                            continue
                         tensor_outputs.append(out)
                         tensor_grads.append(g)
                 for out, detached in zip(self.before_detached, self.detached):
-                    if isinstance(out, torch.Tensor) and out.requires_grad:
+                    if (
+                        isinstance(out, torch.Tensor)
+                        and out.requires_grad
+                        and detached.grad is not None
+                    ):
                         tensor_outputs.append(out)
                         tensor_grads.append(detached.grad)
                 if tensor_outputs:
