@@ -210,7 +210,7 @@ class ComputeConfig:
             logger.warning("use_zero=2 is not supported. ZeRO stage 3 will be used instead.")
             super().__setattr__('use_zero', 3)
 
-        num_scale_units = self.runtime_ngpus // self.plan_ngpus
+        num_scale_units = self.num_scale_units
         if self.use_zero:
             if num_scale_units % self.zero_ngroups != 0:
                 raise ValueError(f"zero_ngroups {self.zero_ngroups} must be a divisor of runtime_ngpus/plan_ngpus {num_scale_units}.")
@@ -336,9 +336,9 @@ class ComputeConfig:
             else None
 
     @property
-    def num_scale_unit(self) -> int:
+    def num_scale_units(self) -> int:
         """
-        Get the number of a scale unit, which is `runtime_ngpus // plan_ngpus`.
+        Get the number of scale units, which is `runtime_ngpus // plan_ngpus`.
         """
         return self.runtime_ngpus // self.plan_ngpus
 
