@@ -251,9 +251,7 @@ def _worker():
         case_results = []
         cases = [
             (False, False, 10),
-            (True, False, 11),
             (False, True, 12),
-            (True, True, 11),
         ]
         for use_checkpoint, use_aux_loss, case_seed in cases:
             torch.manual_seed(case_seed)
@@ -311,10 +309,10 @@ def test_merged_scheduler_fake_moe_matches_sequential_gnorm():
     results = launch_torchrun(2, _worker)
     assert len(results) == 2
     for result in results.values():
-        assert len(result['cases']) == 4
-        assert result['cases'][-1]['use_checkpoint']
+        assert len(result['cases']) == 2
         assert result['cases'][-1]['use_aux_loss']
         for case in result['cases']:
+            assert not case['use_checkpoint']
             assert case['merged_4phase_calls'] == 2
             assert case['stream_counts']['comp'] > 0
             assert case['stream_counts']['comm'] > 0
@@ -345,6 +343,15 @@ def test_clone_output_tuple_owns_tensor_storage() -> None:
 
     assert cloned[0].item() == 3.0
     assert cloned[1:] == (4, None)
+
+
+def test_merged_scheduler_rejects_checkpoint_mode() -> None:
+    with pytest.raises(ValueError, match="layer-owned recomputation"):
+        MergedScheduler(
+            parallel_module=nn.Linear(1, 1),
+            num_layers=1,
+            use_checkpoint=True,
+        )
 
 
 def test_bucket_records_split_backward_contribution_counts() -> None:

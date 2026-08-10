@@ -604,9 +604,14 @@ class MergedScheduler:
 
     def __init__(self, parallel_module, num_layers, *,
                  use_checkpoint=False):
+        if use_checkpoint:
+            raise ValueError(
+                "MergedScheduler activation checkpointing is unsupported; "
+                "use layer-owned recomputation instead."
+            )
         self.parallel_module = parallel_module
         self.num_layers = num_layers
-        self.use_checkpoint = use_checkpoint
+        self.use_checkpoint = False
         self._use_4node = True
 
         # Async overlap: launch COMM and COMP ops from separate CPU threads
