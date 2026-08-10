@@ -15,6 +15,7 @@ import logging
 import copy
 import os
 from collections import OrderedDict, defaultdict
+import pickle
 
 import torch
 import torch.distributed
@@ -333,6 +334,13 @@ class ComputeConfig:
         return int(self.reducer_bucket_cap_mb * 1024 * 1024) \
             if self.reducer_bucket_cap_mb \
             else None
+
+    @property
+    def num_scale_unit(self) -> int:
+        """
+        Get the number of a scale unit, which is `runtime_ngpus // plan_ngpus`.
+        """
+        return self.runtime_ngpus // self.plan_ngpus
 
     def get_sync_group(self) -> Tuple[List[int], torch.distributed.ProcessGroup]:
         """
@@ -666,30 +674,48 @@ def _prepare_and_check_reusable(
         outdir / FxModuleParser.ATTR_MAP_FILE,
     ]
 
+    def _clean_old_attr_map_files() -> None:
+        _clean_files(outdir, f'{ParallelModule.ATTR_META_FILE_PREFIX}[0-9]*.pkl')
+
     if reuse == ReuseType.MATCH or reuse == ReuseType.MOO:
         # check if the module is already generated
         expected_output_files = [outdir / _GENCODE_FILE_TEMPLATE.format(rank) for rank in range(compute_config.runtime_ngpus)]
-        expected_output_files.extend([
-            outdir / ParallelModule.ATTR_META_FILE_TEMPLATE.format(rank)
-            for rank in range(compute_config.runtime_ngpus)
-        ])
         expected_output_files.extend(trace_meta_files)
         expected_output_files.append(config_file)
         expected_output_files.append(outdir / _GRAPH_DUMP_FILE)
         expected_output_files.append(outdir / _FORWARD_ARGS_DUMP_FILE)
         expected_output_files.append(outdir / ParallelModule.ORIGIN_MODULE_METADATA_FILE)
         expected_output_files.append(outdir / FxModuleParser.NON_PERSISTENT_BUFFER_FILE)
+
+        existing_attr_map_files = set(outdir.glob(f'{ParallelModule.ATTR_META_FILE_PREFIX}*.pkl'))
+
+        def _has_attr_map_file() -> bool:
+            deprecated_attr_map_files = [
+                outdir / ParallelModule.ATTR_META_FILE_TEMPLATE.format(rank)
+                for rank in range(compute_config.runtime_ngpus)
+            ]
+            new_attr_map_file = outdir / ParallelModule.ATTR_META_MERGED_FILE
+            return (
+                    len(existing_attr_map_files) == 1
+                    and new_attr_map_file.exists()
+                ) or (
+                    len(existing_attr_map_files) == len(deprecated_attr_map_files)
+                    and all(f.exists() for f in deprecated_attr_map_files)
+                )
+
         existing_output_files = [
             f for f in outdir.glob('*')
             if f.is_file() and (  # just take fullmodel.pt.0 to compare
                 not f.name.startswith(FxModuleParser.ATTR_CONTENT_FILE_STEM)
                 or f.name == FxModuleParser.ATTR_CONTENT_FILE_0
-            )
+            ) and f not in existing_attr_map_files  # will manually check the attr map files
         ]
+
         if existing_output_files:
             if is_config_match \
                 and all([output_file.exists() for output_file in expected_output_files]) \
-                and len(existing_output_files) == len(expected_output_files):
+                and len(existing_output_files) == len(expected_output_files) \
+                and _has_attr_map_file():
                 reusable = True  # everything is matched.
             elif is_config_match \
                 and all(f.suffix != '.py'  for f in existing_output_files):
@@ -715,6 +741,7 @@ def _prepare_and_check_reusable(
                 elif is_graph_config_match:
                     # reuse the graph dump
                     _clean_files(outdir, '*.py')
+                    _clean_old_attr_map_files()
                 else:
                     _clean_files(outdir)
     else:
@@ -727,10 +754,11 @@ def _prepare_and_check_reusable(
             or not is_graph_config_match \
             or not all([meta_file.exists() for meta_file in trace_meta_files]):
             # we have to trace the graph again if not all meta files are present even when reuse=graph.
-            glob_pattern = '*'
+            _clean_files(outdir)
         else:
-            glob_pattern = '*.py'  # so we can keep graph dumps.
-        _clean_files(outdir, glob_pattern)
+            # graph dumps are not deleted.
+            _clean_files(outdir, '*.py')
+            _clean_old_attr_map_files()
 
     return outdir, reusable
 
@@ -926,18 +954,19 @@ def _gencode(
     assert len(execplan.graph.device) == compute_config.plan_ngpus, f"{execplan.graph.device}"
     mgener = ModuleCodeGen(execplan, compute_config.runtime_ngpus)
     sgener = None
+    attr_merged_meta_map = {}
     if compute_config.use_end2end:
         sgener = ScheduleCodeGen(execplan, compute_config.runtime_ngpus)
     for rank in range(compute_config.runtime_ngpus):
         fname = outdir / _GENCODE_FILE_TEMPLATE.format(rank)
-        attr_meta_map_fname = outdir / ParallelModule.ATTR_META_FILE_TEMPLATE.format(rank)
-        mgener.gen(rank,
+        mgener.gen(
+            rank,
             forward_args=forward_args,
             outfile=fname,
             attach=False,
             as_parallel_module=True,
             end2end_mode=compute_config.use_end2end,
-            outfile_attr_meta_map=attr_meta_map_fname
+            out_attr_meta_map=attr_merged_meta_map,
         )
         # generate temporal schedule code only for end2end module
         # because the code generated is wrong for non-end2end module.
@@ -947,6 +976,15 @@ def _gencode(
                 outfile=fname,
                 attach=True
             )
+
+    for rank in range(compute_config.plan_ngpus, compute_config.runtime_ngpus):
+        assert attr_merged_meta_map[rank] == attr_merged_meta_map[rank % compute_config.plan_ngpus], \
+            f"Rank {rank} and rank {rank % compute_config.plan_ngpus} " \
+            f"should have the same attribute map, " \
+            f"but got {attr_merged_meta_map[rank]} and {attr_merged_meta_map[rank % compute_config.plan_ngpus]}."
+
+    with open(outdir / ParallelModule.ATTR_META_MERGED_FILE, 'wb') as f:
+        pickle.dump([attr_merged_meta_map[rank] for rank in range(compute_config.plan_ngpus)], f)
 
     return ret
 

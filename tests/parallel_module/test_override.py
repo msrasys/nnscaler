@@ -5,6 +5,7 @@ from pathlib import Path
 from time import sleep
 import sys
 import tempfile
+import pickle
 import pytest
 import torch
 import shutil
@@ -135,13 +136,23 @@ def test_override():
         cmodule3 = _to_cube_model(MyModule, ComputeConfig(1, 1), tempdir, 'override', 'test4')
         assert not (test4_module_path / 'gencode1.py').exists()
 
-        # Graph | matched | generate
+        # Graph | matched legacy attr metadata | generate
         assert (test5_module_path / 'gencode1.py').exists()
+        attr_merged_file = test5_module_path / ParallelModule.ATTR_META_MERGED_FILE
+        with open(attr_merged_file, 'rb') as f:
+            attr_meta_maps = pickle.load(f)
+        attr_merged_file.unlink()
+        for rank, attr_meta_map in enumerate(attr_meta_maps):
+            with open(test5_module_path / ParallelModule.ATTR_META_FILE_TEMPLATE.format(rank), 'wb') as f:
+                pickle.dump(attr_meta_map, f)
         code_stat = (test5_module_path / 'gencode0.py').stat()
         graph_stat = (test5_module_path / 'graph.ckp').stat()
         args_stat = (test5_module_path / 'forward_args.pkl').stat()
         _to_cube_model(MyModule, ComputeConfig(1, 1), tempdir, 'graph', 'test5', False)
         assert not (test5_module_path / 'gencode1.py').exists()
+        assert attr_merged_file.exists()
+        assert not list(test5_module_path.glob(f'{ParallelModule.ATTR_META_FILE_PREFIX}[0-9]*.pkl'))
+        _to_cube_model(MyModule, ComputeConfig(1, 1), tempdir, 'match', 'test5', False)
         assert (test5_module_path / 'gencode0.py').stat().st_mtime_ns != code_stat.st_mtime_ns
         assert (test5_module_path / 'graph.ckp').stat().st_mtime_ns == graph_stat.st_mtime_ns
         assert (test5_module_path / 'forward_args.pkl').stat().st_mtime_ns == args_stat.st_mtime_ns

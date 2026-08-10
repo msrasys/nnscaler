@@ -343,6 +343,7 @@ class ModuleCodeGen(FuncEmission):
         end2end_mode: bool = False,
         forward_args: Optional[Dict[str, Any]] = None,
         outfile_attr_meta_map: Optional[str] = None,
+        out_attr_meta_map: Optional[Dict[int, Dict[str, Dict[str, Any]]]] = None
     ) -> str:
         """
         Generate model implementation code based on the given graph.
@@ -432,6 +433,8 @@ class ModuleCodeGen(FuncEmission):
             forward_args (Dict[str, Any]): argument names and their default values of forward function, if None, use node inputs.
                 This is used only in parallel module.
             outfile_attr_meta_map (str): output file path for parameter mapping. None if don't save
+            out_attr_meta_map (Optional[Dict[int, Dict[str, Dict[str, Any]]]]): output mapping populated with
+                each device's attribute metadata map. None if the metadata is not needed by the caller.
 
         Returns:
             generated code
@@ -616,6 +619,9 @@ class ModuleCodeGen(FuncEmission):
         if outfile:
             with open(outfile, 'a' if attach else 'w') as f:
                 f.write(code)
+        # write attr_meta_map to out_attr_meta_map
+        if out_attr_meta_map is not None:
+            out_attr_meta_map[device] = attr_meta_map
 
         # clear used buffer
         self.clear()
