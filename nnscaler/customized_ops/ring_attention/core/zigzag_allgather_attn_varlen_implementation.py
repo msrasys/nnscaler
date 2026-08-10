@@ -72,12 +72,18 @@ def _build_q_split_indices(
     return torch.cat(q_front_idx), torch.cat(q_end_idx)
 
 
+@torch.inference_mode(False)
+@torch.no_grad()
 def prepare_zigzag_allgather_attn_varlen_metadata(
     cu_seqlens_q: torch.Tensor,
     cu_seqlens_k: torch.Tensor,
     world_size: int,
     rank: int,
 ) -> ZigZagAllGatherVarlenMetadata:
+    # Metadata is cached across calls and may be created by validation under
+    # inference_mode before it is reused by autograd training.  Always build
+    # ordinary tensors: advanced indexing needs to save q_*_idx for backward,
+    # which PyTorch forbids when an index is an inference tensor.
     cache_key = (tuple(cu_seqlens_q.tolist()), tuple(cu_seqlens_k.tolist()), world_size, rank)
     if cache_key in _METADATA_CACHE:
         return _METADATA_CACHE[cache_key]
