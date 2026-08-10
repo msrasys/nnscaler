@@ -8,6 +8,7 @@ To avoid other potential parity issues that may have influence the gradient valu
 we use weight data as gradient, and calculate its norm to verify the correctness
 of gnorm calculation.
 """
+from contextlib import contextmanager
 import torch
 from functools import partial
 
@@ -17,10 +18,50 @@ from nnscaler.utils import load_model
 from nnscaler.ir.operator import IRFwOperation
 from nnscaler.runtime.module import CubeModule
 from nnscaler.runtime.gnorm import prepare_for_grad_clip, clip_gnorm
+from nnscaler.runtime import gnorm as gnorm_module
 from nnscaler.flags import CompileFlag
 
 from ..launch_torchrun import torchrun
 from ..utils import init_parameter
+
+
+def test_clip_gnorm_traces_only_global_reduction(monkeypatch):
+    events = []
+
+    @contextmanager
+    def record_range(kind, entity, **fields):
+        events.append(("enter", kind, entity, fields))
+        yield
+        events.append(("exit", kind, entity, fields))
+
+    def all_reduce(tensor):
+        events.append(("all_reduce", tensor.item()))
+
+    monkeypatch.setattr(gnorm_module.ct, "range", record_range)
+    monkeypatch.setattr(gnorm_module.dist, "all_reduce", all_reduce)
+    parameter = torch.nn.Parameter(torch.tensor([3.0, 4.0]))
+    parameter.grad = parameter.detach().clone()
+
+    norm, grads = clip_gnorm({1: [parameter]})
+
+    assert norm.item() == 5.0
+    assert len(grads) == 1
+    assert torch.equal(grads[0], parameter.grad)
+    assert events == [
+        (
+            "enter",
+            gnorm_module.ct.Kind.REDUCE,
+            "optimizer.grad_norm.all_reduce",
+            {"process_scope": False},
+        ),
+        ("all_reduce", 25.0),
+        (
+            "exit",
+            gnorm_module.ct.Kind.REDUCE,
+            "optimizer.grad_norm.all_reduce",
+            {"process_scope": False},
+        ),
+    ]
 
 
 class Module(torch.nn.Module):

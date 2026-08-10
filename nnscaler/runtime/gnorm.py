@@ -9,6 +9,7 @@ from collections import defaultdict
 
 import torch
 import torch.distributed as dist
+import chronotrigger.trace as ct
 
 try:
     from amp_C import multi_tensor_l2norm
@@ -310,7 +311,12 @@ def clip_gnorm(
         local_gnorm, local_grads = calcuate_gnorm(localparams, device)
         total_grad_square += local_gnorm.to(dtype=torch.float64).pow_(2).div_(nreplicas)
         grads.extend(local_grads)
-    dist.all_reduce(total_grad_square)
+    with ct.range(
+        ct.Kind.REDUCE,
+        "optimizer.grad_norm.all_reduce",
+        process_scope=False,
+    ):
+        dist.all_reduce(total_grad_square)
     total_norm = total_grad_square.sqrt_().to(torch.float32)
 
     if max_norm is not None and max_norm > 0:

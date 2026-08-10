@@ -22,6 +22,7 @@ import psutil
 from tqdm import tqdm
 
 import nnscaler
+import chronotrigger.trace as ct
 from nnscaler.runtime.device import DeviceGroup
 from chronotrigger.trace.integrations.nnscaler import create_train_hook
 from nnscaler.utils import broadcast_mixed_data, is_running_distributed
@@ -1000,7 +1001,12 @@ class Trainer:
             self.hook.on_train_step_end(self, losses[:num_batches])
 
             aggregate_outputs = self.train_args.resolved_aggregate_outputs_fn or self.aggregate_outputs
-            aggregated_outputs = aggregate_outputs(losses[:num_batches], self.sync_group)
+            with ct.range(
+                ct.Kind.REDUCE,
+                "trainer.output.aggregate",
+                process_scope=False,
+            ):
+                aggregated_outputs = aggregate_outputs(losses[:num_batches], self.sync_group)
             if self.train_args.optimizer.loss_reduction == 'mean':
                 loss = aggregated_outputs.loss_sum / aggregated_outputs.num_batches
             elif self.train_args.optimizer.loss_reduction == 'per-token-mean':
@@ -1015,7 +1021,12 @@ class Trainer:
             self.hook.before_sync_grad(self)
             # `sync_shard_grad` is no-op if the whole model is parallelized
             #  because syncing grad in end2end model is done in `_train_step`.
-            self.optimizer.sync_shard_grad()
+            with ct.range(
+                ct.Kind.REDUCE,
+                "optimizer.sync_shard_grad",
+                process_scope=False,
+            ):
+                self.optimizer.sync_shard_grad()
             self.hook.after_sync_grad(self)
 
             # scale gradients
@@ -1032,7 +1043,12 @@ class Trainer:
                 if not aggregated_outputs.num_tokens:
                     raise RuntimeError("`aggregate_outputs` doesn't set `num_tokens` field")
                 multiplier /= aggregated_outputs.num_tokens
-            self.optimizer.scale_grads(multiplier)
+            with ct.range(
+                ct.Kind.OPTIMIZER,
+                "optimizer.scale_grads",
+                process_scope=False,
+            ):
+                self.optimizer.scale_grads(multiplier)
 
             # check gradient sync & scale correctness
             if self.train_args.debug.check_gradient_sync_cross_devices:
@@ -1040,12 +1056,22 @@ class Trainer:
 
             # clip gradients
             self.hook.before_gnorm_clip(self)
-            if self.train_args.optimizer.clip_gnorm:
-                step_stat.gnorm = self.optimizer.clip_gnorm(self.train_args.optimizer.clip_gnorm)
-            else:
-                step_stat.gnorm = self.optimizer.clip_gnorm()
+            with ct.range(
+                ct.Kind.OPTIMIZER,
+                "optimizer.clip_gnorm",
+                process_scope=False,
+            ):
+                if self.train_args.optimizer.clip_gnorm:
+                    step_stat.gnorm = self.optimizer.clip_gnorm(self.train_args.optimizer.clip_gnorm)
+                else:
+                    step_stat.gnorm = self.optimizer.clip_gnorm()
             self.hook.after_gnorm_clip(self, step_stat.gnorm)
-            step_stat.gnorm = step_stat.gnorm.item()
+            with ct.range(
+                ct.Kind.OPTIMIZER,
+                "optimizer.grad_norm.item",
+                process_scope=False,
+            ):
+                step_stat.gnorm = step_stat.gnorm.item()
 
             # update parameters
             step_stat.lr = self.optimizer.param_groups[0]['lr']  # only log the first group's lr
