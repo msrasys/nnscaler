@@ -5,11 +5,70 @@
 Common scheduling descriptions
 """
 
-from typing import List
+from collections import deque
+from typing import Dict, List, Sequence
 
-from nnscaler.graph.schedule.schedplan import SchedulePlan
+from nnscaler.graph.schedule.schedplan import (
+    Block,
+    PipelineAction,
+    ScheduleDependency,
+    SchedulePlan,
+)
 from nnscaler.graph.graph import IRGraph
 from nnscaler.graph.segment import IRSegment
+
+
+def _schedule_local_actions(
+    graph: IRGraph,
+    num_microbatches: int,
+    local_actions: Sequence[Sequence[Block]],
+) -> SchedulePlan:
+    """Build the earliest valid global plan for fixed per-rank action orders."""
+    actions = [block for sequence in local_actions for block in sequence]
+    predecessors = {block: set() for block in actions}
+    order = {block: index for index, block in enumerate(actions)}
+
+    for sequence in local_actions:
+        for prev, next_block in zip(sequence, sequence[1:]):
+            predecessors[next_block].add(prev)
+
+    dependency = ScheduleDependency(graph)
+    for prev in actions:
+        for next_block in actions:
+            if dependency.depends(prev, next_block):
+                predecessors[next_block].add(prev)
+
+    start_steps: Dict[Block, int] = {}
+    remaining = set(actions)
+    while remaining:
+        ready = [
+            block for block in remaining
+            if predecessors[block].issubset(start_steps)
+        ]
+        if not ready:
+            unresolved = sorted(remaining, key=order.__getitem__)
+            raise RuntimeError(
+                f'Pipeline action order contains a dependency cycle: {unresolved[:8]}'
+            )
+        for block in sorted(ready, key=order.__getitem__):
+            start_steps[block] = max(
+                (start_steps[pred] + pred.span for pred in predecessors[block]),
+                default=0,
+            )
+            remaining.remove(block)
+
+    sched = SchedulePlan(graph, num_microbatches)
+    for block in sorted(actions, key=lambda item: (start_steps[item], order[item])):
+        sched.add_segment(
+            block.content,
+            block.mid,
+            start_steps[block],
+            block.span,
+            block.stream_context,
+            block.action,
+        )
+    sched.finish()
+    return sched
 
 
 class PredefinedSched:
@@ -55,7 +114,13 @@ class PredefinedSched:
         return sched
 
     @staticmethod
-    def sched_1f1b_interleaved(graph: IRGraph, num_microbatches: int, num_stages: int) -> SchedulePlan:
+    def sched_1f1b_interleaved(
+        graph: IRGraph,
+        num_microbatches: int,
+        num_stages: int,
+        *,
+        _bind_graph: bool = True,
+    ) -> SchedulePlan:
         """
         1F1B interleaved scheduling. The graph should be staged into segments. You can refer to the paper
         [Efficient Large-Scale Language Model Training on GPU Clusters Using Megatron-LM](https://arxiv.org/pdf/2104.04473)
@@ -173,7 +238,7 @@ class PredefinedSched:
             devs2segs.setdefault(cur_devs, []).append(seg)
         assert num_microbatches % len(devs2segs) == 0, f"num_microbatches: {num_microbatches} should be a multiple of the number of pipeline groups: {len(devs2segs)}"
 
-        sched = SchedulePlan(graph, num_microbatches)
+        sched = SchedulePlan(graph, num_microbatches, bind_graph=_bind_graph)
         # an adapter class to fit in torch's implementation
         class ScheduleInfo:
             def __init__(self, pp_group_size, num_stages, num_micro_batch):
@@ -199,6 +264,259 @@ class PredefinedSched:
 
         sched.finish()
         return sched
+
+    @staticmethod
+    def sched_1f1b_interleaved_fbw(
+        graph: IRGraph,
+        num_microbatches: int,
+        num_stages: int,
+    ) -> SchedulePlan:
+        """Interleaved 1F1B expressed as explicit F/I/W actions.
+
+        This intentionally preserves the existing local execution order: every
+        full backward is replaced by adjacent I and W actions.  It is the
+        representation bridge used before Zero-Bubble starts moving W actions.
+        """
+        base = PredefinedSched.sched_1f1b_interleaved(
+            graph, num_microbatches, num_stages, _bind_graph=False
+        )
+        sched = SchedulePlan(graph, num_microbatches)
+        for block in base.all_blocks():
+            step = base.start(block) * 2
+            if block.content.isfw():
+                sched.add_segment(
+                    block.content,
+                    block.mid,
+                    step,
+                    block.span,
+                    block.stream_context,
+                    PipelineAction.FORWARD,
+                )
+            else:
+                sched.add_segment(
+                    block.content,
+                    block.mid,
+                    step,
+                    block.span,
+                    block.stream_context,
+                    PipelineAction.BACKWARD_INPUT,
+                )
+                sched.add_segment(
+                    block.content,
+                    block.mid,
+                    step + block.span,
+                    block.span,
+                    block.stream_context,
+                    PipelineAction.BACKWARD_WEIGHT,
+                )
+        sched.finish()
+        return sched
+
+    @staticmethod
+    def sched_1f1b_interleaved_zero_bubble_steady(
+        graph: IRGraph,
+        num_microbatches: int,
+        num_stages: int,
+    ) -> SchedulePlan:
+        """Interleaved FBW with delayed W actions in the steady phase only.
+
+        The delay on physical rank ``r`` is ``r`` input-backward actions, as in
+        PyTorch's interleaved Zero-Bubble schedule. Pending steady-phase W work
+        is drained before cooldown, whose I/W pairs remain adjacent here.
+        """
+        base = PredefinedSched.sched_1f1b_interleaved(
+            graph, num_microbatches, num_stages, _bind_graph=False
+        )
+        device_groups = sorted({tuple(block.device) for block in base.all_blocks()})
+        local_actions = []
+
+        for rank, devices in enumerate(device_groups):
+            base_blocks = sorted(
+                (block for block in base.all_blocks() if tuple(block.device) == devices),
+                key=base.start,
+            )
+            block_at_step = {base.start(block): block for block in base_blocks}
+            sequence = []
+            pending_weights = deque()
+
+            def append_action(block: Block, action: PipelineAction) -> None:
+                sequence.append(Block(
+                    block.content,
+                    block.mid,
+                    block.span,
+                    block.stream_context,
+                    action,
+                ))
+
+            def drain_pending_weights() -> None:
+                while pending_weights:
+                    append_action(
+                        pending_weights.popleft(),
+                        PipelineAction.BACKWARD_WEIGHT,
+                    )
+
+            for block in base_blocks:
+                if block.content.isfw():
+                    append_action(block, PipelineAction.FORWARD)
+                    continue
+
+                step = base.start(block)
+                previous = block_at_step.get(step - 1)
+                in_steady_phase = previous is not None and previous.content.isfw()
+                if not in_steady_phase:
+                    drain_pending_weights()
+                    append_action(block, PipelineAction.BACKWARD_INPUT)
+                    append_action(block, PipelineAction.BACKWARD_WEIGHT)
+                    continue
+
+                append_action(block, PipelineAction.BACKWARD_INPUT)
+                pending_weights.append(block)
+                if len(pending_weights) > rank:
+                    append_action(
+                        pending_weights.popleft(),
+                        PipelineAction.BACKWARD_WEIGHT,
+                    )
+
+            drain_pending_weights()
+            local_actions.append(sequence)
+
+        return _schedule_local_actions(graph, num_microbatches, local_actions)
+
+    @staticmethod
+    def sched_1f1b_interleaved_zero_bubble(
+        graph: IRGraph,
+        num_microbatches: int,
+        num_stages: int,
+        *,
+        max_pending_weight_backwards: int | None = None,
+    ) -> SchedulePlan:
+        """Interleaved ZB1P schedule with F/I/W actions in every phase.
+
+        Compared with interleaved 1F1B, each rank starts input backward after
+        one rather than two warmup forwards per remaining physical stage.
+        Weight backward is delayed by ``rank`` input-backward actions and fills
+        otherwise idle slots through steady state and cooldown.
+        """
+        if num_microbatches <= 0:
+            raise ValueError(
+                f'expected num_microbatches > 0, but got {num_microbatches}'
+            )
+        if (max_pending_weight_backwards is not None
+                and max_pending_weight_backwards <= 0):
+            raise ValueError(
+                'max_pending_weight_backwards must be > 0, got '
+                f'{max_pending_weight_backwards}'
+            )
+
+        segments: List[IRSegment] = graph.select(
+            ntype=IRSegment, flatten=False
+        )
+        fsegs = [segment for segment in segments if segment.isfw()]
+        if len(fsegs) != num_stages:
+            raise ValueError(
+                f'Mismatch of forward segment number ({len(fsegs)}) '
+                f'with num_stages ({num_stages})'
+            )
+
+        device_groups = sorted({tuple(segment.device) for segment in fsegs})
+        pp_group_size = len(device_groups)
+        if num_stages % pp_group_size != 0:
+            raise ValueError(
+                f'num_stages ({num_stages}) must be divisible by the number '
+                f'of pipeline groups ({pp_group_size})'
+            )
+        if num_microbatches % pp_group_size != 0:
+            raise ValueError(
+                f'num_microbatches ({num_microbatches}) must be a multiple '
+                f'of the number of pipeline groups ({pp_group_size})'
+            )
+
+        from nnscaler.graph.schedule.interleaved_1f1b import (
+            BACKWARD_INPUT,
+            BACKWARD_WEIGHT,
+            FORWARD,
+            _get_1f1b_rank_ops,
+        )
+
+        n_local_stages = num_stages // pp_group_size
+        num_rounds = max(1, num_microbatches // pp_group_size)
+        microbatches_per_round = num_microbatches // num_rounds
+        microbatch_ops = n_local_stages * num_microbatches
+        action_map = {
+            FORWARD: PipelineAction.FORWARD,
+            BACKWARD_INPUT: PipelineAction.BACKWARD_INPUT,
+            BACKWARD_WEIGHT: PipelineAction.BACKWARD_WEIGHT,
+        }
+        local_actions = []
+
+        for rank, devices in enumerate(device_groups):
+            warmup_ops = min(
+                (n_local_stages - 1) * microbatches_per_round
+                + pp_group_size - 1 - rank,
+                microbatch_ops,
+            )
+            fwd_bwd_ops = microbatch_ops - warmup_ops
+            cooldown_ops = warmup_ops
+
+            def forward_stage_index(step: int) -> int:
+                local_index = (
+                    step // microbatches_per_round
+                ) % n_local_stages
+                return local_index * pp_group_size + rank
+
+            def backward_stage_index(step: int) -> int:
+                local_index = (
+                    n_local_stages
+                    - 1
+                    - ((step - warmup_ops) // microbatches_per_round)
+                    % n_local_stages
+                )
+                return local_index * pp_group_size + rank
+
+            weight_backward_delay = rank
+            if max_pending_weight_backwards is not None:
+                # A delay of d produces at most d + 1 pending I states before
+                # the first W. Cap that queue for models whose retained
+                # dWeight operands dominate pipeline memory.
+                weight_backward_delay = min(
+                    weight_backward_delay,
+                    max_pending_weight_backwards - 1,
+                )
+
+            rank_ops = _get_1f1b_rank_ops(
+                n_local_stages,
+                pp_group_size,
+                warmup_ops,
+                fwd_bwd_ops,
+                cooldown_ops,
+                rank,
+                forward_stage_index,
+                backward_stage_index,
+                num_1f1b_microbatches=weight_backward_delay,
+                enable_zero_bubble=True,
+            )
+            sequence = []
+            for op in rank_ops:
+                if op is None:
+                    continue
+                segment = fsegs[op.stage_index]
+                action = action_map[op.computation_type]
+                if action != PipelineAction.FORWARD:
+                    segment = segment.mirror
+                if tuple(segment.device) != devices:
+                    raise ValueError(
+                        f'stage {op.stage_index} is assigned to '
+                        f'{tuple(segment.device)}, expected {devices}'
+                    )
+                sequence.append(Block(
+                    segment,
+                    op.microbatch_index,
+                    1,
+                    action=action,
+                ))
+            local_actions.append(sequence)
+
+        return _schedule_local_actions(graph, num_microbatches, local_actions)
 
     @staticmethod
     def sched_1f1b_plus(graph: IRGraph, num_microbatches: int, num_stages: int) -> SchedulePlan:

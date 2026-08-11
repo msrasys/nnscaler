@@ -122,12 +122,12 @@ def move_object(obj, src: int, dst: int, async_op=False):
 
 
 def all_reduce(tensor: torch.Tensor,
-               ranks: List[int], async_op=False) -> torch.Tensor:
+               ranks: List[int], async_op=False, clone=True) -> torch.Tensor:
     """Allreduce"""
     if not async_op:
         CudaTimer().start(field_name='comm', predefined=True)
     tensor = tensor.contiguous() if not tensor.is_contiguous() else tensor
-    tensor = tensor.detach().clone()
+    tensor = tensor.detach().clone() if clone else tensor.detach()
     group = DeviceGroup().get_group(ranks)
 
     if async_op:

@@ -34,7 +34,7 @@ from nnscaler.graph.function.wrapnn import convert_to_wrapnn, wrapnn
 from nnscaler.graph.gener.gen import IRAdapterGener
 from nnscaler.graph.parser import FxModuleParser
 from nnscaler.graph.schedule.predefined import PredefinedSched
-from nnscaler.graph.schedule.schedplan import SchedulePlan
+from nnscaler.graph.schedule.schedplan import PipelineAction, SchedulePlan
 
 from nnscaler.ir.cten import IRObject, IRTensor, IR
 from nnscaler.ir.operator import IRBpOperation, IRDataOperation
@@ -132,6 +132,10 @@ class ComputeConfig:
     #  which must be a scalar tensor
     use_end2end: bool = False
 
+    # Split pipeline backward into input-gradient and weight-gradient phases.
+    # Only effective for end-to-end training.
+    use_fbw: bool = False
+
     # whether to use async reducer
     # if True, the gradient all-reduce will be async,
     # This only works when the `use_end2end` is `True` for now.
@@ -224,6 +228,20 @@ class ComputeConfig:
         if self.use_zero and self.zero_use_reduce_scatter and self.zero_ngroups != 1:
             raise ValueError("zero_use_reduce_scatter is only supported when zero_ngroups is 1.")
 
+        if self.use_fbw:
+            if not self.use_end2end:
+                raise ValueError("use_fbw is only supported in end2end mode.")
+            if self.inference_only:
+                raise ValueError("use_fbw is not supported in inference mode.")
+
+            from nnscaler.runtime._patch_torch import FBW_SUPPORTED, configure_fbw_runtime
+            if not FBW_SUPPORTED:
+                raise ValueError(
+                    "fbw is not supported in the current environment. "
+                    "Please update pytorch(2.5.0+) and/or python(3.10+) to a higher version."
+                )
+            configure_fbw_runtime()
+
     def apply_pipeline_scheduler(
             self,
             graph: IRGraph,
@@ -260,7 +278,32 @@ class ComputeConfig:
             if not callable(pipeline_scheduler):
                 raise ValueError(f"pipeline_scheduler {pipeline_scheduler} is not str nor callable.")
             sched = pipeline_scheduler
-        return sched(graph, pipeline_nmicros, pipeline_nstages)
+        scheduler_kwargs = {}
+        if pipeline_scheduler == '1f1b_interleaved_zero_bubble':
+            max_pending = self.pas_config.get(
+                'zero_bubble_max_pending_weight_backwards'
+            )
+            if max_pending is not None:
+                scheduler_kwargs['max_pending_weight_backwards'] = max_pending
+        plan = sched(
+            graph,
+            pipeline_nmicros,
+            pipeline_nstages,
+            **scheduler_kwargs,
+        )
+        has_explicit_fbw_actions = any(
+            block.action in (
+                PipelineAction.BACKWARD_INPUT,
+                PipelineAction.BACKWARD_WEIGHT,
+            )
+            for block in plan.all_blocks()
+        )
+        if has_explicit_fbw_actions and not self.use_fbw:
+            raise ValueError(
+                'A pipeline schedule with explicit I/W actions requires '
+                'ComputeConfig.use_fbw=True.'
+            )
+        return plan
 
     @property
     def gpu_config(self) -> Dict[str, int]:
@@ -404,6 +447,7 @@ def _compile_flags(compute_config: ComputeConfig):
         zero_use_reduce_scatter=compute_config.zero_use_reduce_scatter,
         trace_strategy=compute_config.trace_strategy,
         zero_param_level_sharding=compute_config.zero_param_level_sharding,
+        use_fbw=compute_config.use_fbw,
     )
 
 

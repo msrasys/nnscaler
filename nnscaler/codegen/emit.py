@@ -385,7 +385,9 @@ class FuncEmission(CodeEmission):
         prefix_attr: Optional[str],
         pseudo_free_source_tids: Optional[Set[int]],
     ) -> Dict[int, str]:
-        if not CompileFlag.pipeline_output_pseudo_free:
+        # Split backward currently needs the original output payload. Step 4
+        # will teach it to consume the saved GradientEdge directly.
+        if not CompileFlag.pipeline_output_pseudo_free or CompileFlag.use_fbw:
             return {}
         if not pseudo_free_source_tids:
             return {}

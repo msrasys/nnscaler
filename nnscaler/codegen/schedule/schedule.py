@@ -13,6 +13,7 @@ from nnscaler.ir.tensor import IRSubTensor
 from nnscaler.ir.adapter import IRWeightReducer, IRAdapter
 from nnscaler.ir.adapter.prim import MovePrim
 from nnscaler.graph.graph import IRSegment
+from nnscaler.graph.schedule.schedplan import PipelineAction
 
 from nnscaler.execplan.execplan import ExecutionPlan, ExeReuseCell
 
@@ -165,12 +166,27 @@ class ScheduleCodeGen(FuncEmission):
                         f'.{method_name}({args})',
                     )
 
+        def _split_backward_codes(codes: List[str]) -> Tuple[List[str], List[str]]:
+            """Split one emitted backward segment into dInput and dWeight."""
+            weight_call = 'nnscaler.runtime.executor.backward_weight'
+            for index, code in enumerate(codes):
+                if code.strip().startswith(weight_call):
+                    return codes[:index], codes[index:]
+            raise RuntimeError(
+                'Expected backward_weight call in backward segment when using FBW'
+            )
+
         with FunctionBlock(func_name='_train_step',
                            args=args) as fb:
             _append_code(fb, '_ = None')
 
             if use_scheduler:
                 _append_code(fb, 'nnscaler.flags.RuntimeFlag.skip_zero_grad = False')
+            if CompileFlag.use_fbw:
+                _append_code(
+                    fb,
+                    'nnscaler.runtime.adapter.nn.clear_deferred_identity_allreduce_grads()',
+                )
             _append_code(
                 fb,
                 self._emit_stream_context(self.execplan.zero_grad_stream_context, ['model.zero_grad()']),
@@ -189,6 +205,22 @@ class ScheduleCodeGen(FuncEmission):
                     node = node.cell if isinstance(node, ExeReuseCell) else node
                     return isinstance(node, IRSegment) and not node.isfw()
 
+                def _pipeline_action(node: IRCell) -> Optional[PipelineAction]:
+                    return node.pipeline_action \
+                        if isinstance(node, ExeReuseCell) else None
+
+                def _produces_weight_grad(node: IRCell) -> bool:
+                    return _pipeline_action(node) != PipelineAction.BACKWARD_INPUT
+
+                def _is_adapter(node: IRCell) -> bool:
+                    node = node.cell if isinstance(node, ExeReuseCell) else node
+                    return isinstance(node, IRAdapter)
+
+                def _depends_totally_on(adapter: IRCell, node: IRCell) -> bool:
+                    adapter = adapter.cell if isinstance(adapter, ExeReuseCell) else adapter
+                    node = node.cell if isinstance(node, ExeReuseCell) else node
+                    return set(adapter.inputs()).issubset(set(node.outputs()))
+
                 # collect backward segments that needs to reduce gradients
                 # which are the last backward segments of every stage.
                 # (Every segment will be used multiple times via `ExeReuseCell`)
@@ -198,12 +230,29 @@ class ScheduleCodeGen(FuncEmission):
                     # Value: the last backward ExeReuseCell of the segment
                     last_backwards = {}
                     for node in device_nodes[::-1]:
-                        if not _is_backward_segment(node):
+                        if not _is_backward_segment(node) or not _produces_weight_grad(node):
                             continue
                         assert isinstance(node, ExeReuseCell), 'Expected ExeReuseCell for backward segment when using scheduler'
                         if node.cell.cid not in last_backwards:
                             last_backwards[node.cell.cid] = node
                     last_backward_node_oids = [id(node) for node in last_backwards.values()]
+
+                def _append_reducer_flag(node: IRCell):
+                    unwrap_node = node.cell if isinstance(node, ExeReuseCell) else node
+                    if use_scheduler and _is_backward_segment(node) \
+                            and _produces_weight_grad(node):
+                        skip_reducer = id(node) not in last_backward_node_oids
+                        if CompileFlag.async_reducer:
+                            # Scheduled async reducer counts every local dWeight
+                            # contribution and launches at its expected count.
+                            skip_reducer = False
+                        _append_code(
+                            fb,
+                            'nnscaler.flags.RuntimeFlag.skip_reducer = '
+                            f'{skip_reducer !r}',
+                        )
+                    elif use_scheduler and isinstance(unwrap_node, IRWeightReducer):
+                        _append_code(fb, 'nnscaler.flags.RuntimeFlag.skip_reducer = False')
 
                 produced_tids = set()
                 for inp in IRSegment.get_objects_from_complex(self.execplan.graph.inputs()):
@@ -215,6 +264,8 @@ class ScheduleCodeGen(FuncEmission):
                     'fallback_vars_by_mid': {},
                 }
                 pending_async_recvs = {}
+                pending_backward_node = None
+                pending_backward_weight_codes = []
                 for line, node in enumerate(device_nodes):
                     unwrap_node = node.cell if isinstance(node, ExeReuseCell) else node
                     bundle_events = send_bundle_ranges.get(line, ())
@@ -223,20 +274,6 @@ class ScheduleCodeGen(FuncEmission):
                     if wait_codes:
                         _append_code(fb, wait_codes, self._get_node_stream(node))
 
-                    # when use scheduler, skip reducer if it is not the last backward of same segments
-                    if use_scheduler and _is_backward_segment(node):
-                        skip_reducer = id(node) not in last_backward_node_oids
-                        if CompileFlag.async_reducer:
-                            # Scheduled pipeline async reducer tracks all local
-                            # gradient contributions and launches each bucket
-                            # when its expected contributions are complete.
-                            skip_reducer = False
-                        _append_code(fb,
-                            f'nnscaler.flags.RuntimeFlag.skip_reducer = '
-                            f'{skip_reducer !r}'
-                        )
-                    elif use_scheduler and isinstance(unwrap_node, IRWeightReducer):
-                        _append_code(fb, 'nnscaler.flags.RuntimeFlag.skip_reducer = False')
                     codes = self.emit_node(
                         node,
                         produced_tids=produced_tids,
@@ -244,7 +281,43 @@ class ScheduleCodeGen(FuncEmission):
                         dataloader_var=dataloader_var,
                         fallback_state=fallback_state,
                     )
-                    _append_code(fb, codes, self._get_node_stream(node))
+
+                    if use_scheduler and _is_backward_segment(node) \
+                            and CompileFlag.use_fbw \
+                            and _pipeline_action(node) not in (
+                                PipelineAction.BACKWARD_INPUT,
+                                PipelineAction.BACKWARD_WEIGHT,
+                            ):
+                        if pending_backward_node is not None:
+                            _append_reducer_flag(pending_backward_node)
+                            _append_code(
+                                fb,
+                                pending_backward_weight_codes,
+                                self._get_node_stream(pending_backward_node),
+                            )
+                        pending_backward_node = node
+                        input_codes, pending_backward_weight_codes = \
+                            _split_backward_codes(codes)
+                        _append_code(fb, input_codes, self._get_node_stream(node))
+                    elif pending_backward_node is not None:
+                        if _is_adapter(node) and _depends_totally_on(node, pending_backward_node):
+                            # Send dInput before dWeight, allowing the P2P adapter
+                            # to make progress while the weight gradient runs.
+                            _append_code(fb, codes, self._get_node_stream(node))
+                        else:
+                            _append_reducer_flag(pending_backward_node)
+                            _append_code(
+                                fb,
+                                pending_backward_weight_codes,
+                                self._get_node_stream(pending_backward_node),
+                            )
+                            pending_backward_node = None
+                            pending_backward_weight_codes = []
+                            _append_reducer_flag(node)
+                            _append_code(fb, codes, self._get_node_stream(node))
+                    else:
+                        _append_reducer_flag(node)
+                        _append_code(fb, codes, self._get_node_stream(node))
                     self._track_async_recv(node, pending_async_recvs)
                     # release
                     tensors = lifetime.release_tensors_after_line(line)
@@ -254,8 +327,21 @@ class ScheduleCodeGen(FuncEmission):
                         if isinstance(out, IRObject):
                             produced_tids.add(out.tid)
                     _append_send_bundle_events(fb, bundle_events, before_node=False)
+
+                if pending_backward_node is not None:
+                    _append_reducer_flag(pending_backward_node)
+                    _append_code(
+                        fb,
+                        pending_backward_weight_codes,
+                        self._get_node_stream(pending_backward_node),
+                    )
             # return code
             outputs = self.return_name_complex(self.execplan.outputs())
+            if CompileFlag.use_fbw:
+                _append_code(
+                    fb,
+                    'nnscaler.runtime.adapter.nn.flush_deferred_identity_allreduce_grads()',
+                )
             _append_code(fb, 'nnscaler.runtime.executor.AsyncCommHandler().drain()')
             code = f'return {outputs}'
             _append_code(fb, code, force_flush=True)
@@ -424,6 +510,9 @@ class ScheduleCodeGen(FuncEmission):
         for node in device_nodes:
             unwrap_node = self._unwrap_node(node)
             if not isinstance(unwrap_node, IRSegment) or unwrap_node.isfw():
+                continue
+            if isinstance(node, ExeReuseCell) \
+                    and node.pipeline_action == PipelineAction.BACKWARD_INPUT:
                 continue
             for pname in self._segment_parameter_names(unwrap_node):
                 param_counts[pname] = param_counts.get(pname, 0) + 1
@@ -773,6 +862,8 @@ class ScheduleCodeGen(FuncEmission):
         fsign = '{outputs} = nnscaler.runtime.executor.fexecute({name}, {model}, *{inputs}, requires_grad={req_grad})'
         asign = '{outputs} = nnscaler.runtime.executor.aexecute({model}, *{inputs}, requires_grad={req_grad})'
         bsign = '{input_grads} = nnscaler.runtime.executor.backward({name}, {input_tensors}, {output_tensors}, {output_grads})'
+        bi_sign = '{input_grads} = nnscaler.runtime.executor.backward_input({name}, {input_tensors}, {output_tensors}, {output_grads}, model.parameters())'
+        bw_sign = 'nnscaler.runtime.executor.backward_weight({name}, model.parameters())'
 
         node_inputs, node_outputs = node.inputs(), node.outputs()
         # the real inputs in gencode
@@ -788,6 +879,8 @@ class ScheduleCodeGen(FuncEmission):
         name = self.node_name(unwrap_node)
         stream_context = self._get_node_stream_context(node)
         micro_batch_id = node.micro_batch_id if isinstance(node, ExeReuseCell) else None
+        pipeline_action = node.pipeline_action \
+            if isinstance(node, ExeReuseCell) else None
 
         if isinstance(unwrap_node, IRSegment):
             # segment hooks
@@ -844,19 +937,47 @@ class ScheduleCodeGen(FuncEmission):
                 input_tensors_str = self.tuple_name(input_tensors, skip_attr=True, prefix_attr='model.')
                 output_tensors_str = self.tuple_name(output_tensors, skip_attr=True, prefix_attr='model.')
                 output_grads_str = self.tuple_name(output_grads, skip_attr=True, prefix_attr='model.')
-                codes = [bsign.format(
-                    name = f"'{self.node_name(unwrap_node.mirror)}'", # always use name of fw segment
-                    input_grads = input_grads_str,
-                    input_tensors = input_tensors_str,
-                    output_tensors = output_tensors_str,
-                    output_grads = output_grads_str
-                )]
+                segment_name = f"'{self.node_name(unwrap_node.mirror)}'"
+                runs_input = True
+                runs_weight = True
+                if pipeline_action in (
+                    PipelineAction.BACKWARD_INPUT,
+                    PipelineAction.BACKWARD_WEIGHT,
+                ) and not CompileFlag.use_fbw:
+                    raise RuntimeError(
+                        'Explicit I/W pipeline actions require ComputeConfig.use_fbw=True'
+                    )
+                if CompileFlag.use_fbw:
+                    input_code = bi_sign.format(
+                        name=segment_name,
+                        input_grads=input_grads_str,
+                        input_tensors=input_tensors_str,
+                        output_tensors=output_tensors_str,
+                        output_grads=output_grads_str,
+                    )
+                    weight_code = bw_sign.format(name=segment_name)
+                    if pipeline_action == PipelineAction.BACKWARD_INPUT:
+                        codes = [input_code]
+                        runs_weight = False
+                    elif pipeline_action == PipelineAction.BACKWARD_WEIGHT:
+                        codes = [weight_code]
+                        runs_input = False
+                    else:
+                        codes = [input_code, weight_code]
+                else:
+                    codes = [bsign.format(
+                        name=segment_name,
+                        input_grads=input_grads_str,
+                        input_tensors=input_tensors_str,
+                        output_tensors=output_tensors_str,
+                        output_grads=output_grads_str,
+                    )]
 
                 bwd_input_str = f'({input_tensors_str}, {output_tensors_str}, {output_grads_str})'
                 bwd_output_str = input_grads_str if len(input_grads) <= 1 else f'({input_grads_str})'
-                if pre_hook:
+                if pre_hook and runs_input:
                     codes = self._emit_segment_hook_code(pre_hook, hook_meta, bwd_input_str, is_pre=True) + codes
-                if post_hook:
+                if post_hook and runs_weight:
                     codes = codes + self._emit_segment_hook_code(post_hook, hook_meta, bwd_input_str, is_pre=False, outputs_str=bwd_output_str)
 
                 """
@@ -869,12 +990,13 @@ class ScheduleCodeGen(FuncEmission):
                 operation here so that the backward graph's tensors can be deallocated right after the
                 backward pass.
                 """
-                plan_outputs = IRCell.get_objects_from_complex(self.execplan.outputs())
-                for tensor in output_tensors:
-                    if not isinstance(tensor, IRTensor):
-                        continue
-                    if tensor in plan_outputs:
-                        codes.append(self.emit_detach(tensor))
+                if runs_weight:
+                    plan_outputs = IRCell.get_objects_from_complex(self.execplan.outputs())
+                    for tensor in output_tensors:
+                        if not isinstance(tensor, IRTensor):
+                            continue
+                        if tensor in plan_outputs:
+                            codes.append(self.emit_detach(tensor))
 
         elif isinstance(unwrap_node, IRDataOperation):
             already_produced = False

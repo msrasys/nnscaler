@@ -6,6 +6,7 @@ Environment flags for compiling options
 """
 
 import os
+from typing import Any, Callable
 
 
 def _to_bool(s: str, default=False) -> bool:
@@ -84,8 +85,35 @@ class CompileFlag:
     # but some of the forward operators will be converted to float16.
     use_amp = _to_bool('USE_AMP')
 
+    # Split each pipeline backward into input-gradient and weight-gradient
+    # phases so schedulers can place them independently.
+    use_fbw = _to_bool('USE_FBW')
+
 
 class RuntimeFlag:
+
+    # Current split-backward phase. Custom autograd functions that manage
+    # temporary storage can use this to keep state alive during dInput and
+    # release it during the final dWeight pass.
+    fbw_phase: str | None = None
+    # Callbacks registered by phase-aware custom autograd functions during the
+    # dInput pass. Each callback computes dWeight directly from the tensors it
+    # retained during dInput, without traversing the model graph a second time.
+    fbw_deferred_tasks: list[Callable[[], Any]] | None = None
+
+    @classmethod
+    def defer_fbw_weight_task(
+        cls,
+        callback: Callable[[], Any],
+        targets: tuple[Any, ...],
+    ) -> None:
+        if cls.fbw_phase != "input" or cls.fbw_deferred_tasks is None:
+            raise RuntimeError(
+                "dWeight tasks can only be registered by the split-backward "
+                "dInput phase"
+            )
+        callback._nnscaler_fbw_targets = targets
+        cls.fbw_deferred_tasks.append(callback)
 
     # if True, skip model.zero_grad().
     # when applying gradient accumulation,

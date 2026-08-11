@@ -22,6 +22,7 @@ from nnscaler.flags import CompileFlag
 from nnscaler.runtime.adapter.reducer import (
     Reducer,
     accumulate_reducer_grad,
+    get_reducer_grad_accumulator,
     has_reducer_grad_accumulator,
     mark_reducer_grad_ready,
 )
@@ -329,6 +330,26 @@ def test_manual_grad_slice_accumulates_in_reducer_buffer_without_param_grad():
     torch.testing.assert_close(
         bucket._contiguous_grads[offset:offset + param.numel()],
         torch.tensor([0.0, 0.0, 1.0, 2.0, 3.0, 4.0]),
+    )
+
+
+@mock_reducer_env(0, 2)
+def test_reducer_grad_accumulator_exposes_parameter_shaped_buffer():
+    param = torch.nn.Parameter(torch.zeros(3, 2))
+    reducer = Reducer([0, 1])
+    reducer.add_param(param)
+    reducer.build_buckets()
+    bucket = reducer.buckets[0]
+
+    accumulator = get_reducer_grad_accumulator(param)
+    assert accumulator is not None
+    assert accumulator.shape == param.shape
+    accumulator.add_(torch.arange(6, dtype=accumulator.dtype).view_as(param))
+
+    offset = bucket._pofset[param]
+    torch.testing.assert_close(
+        bucket._contiguous_grads[offset:offset + param.numel()],
+        torch.arange(6, dtype=accumulator.dtype),
     )
 
 

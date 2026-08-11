@@ -6,13 +6,19 @@ Executor for runtime
 """
 import atexit
 
-from typing import Tuple, Any, Callable, List, Dict, Optional
+from contextlib import nullcontext
+from dataclasses import dataclass
+from typing import Tuple, Any, Callable, List, Dict, Iterable, Optional
 import torch
 import logging
+
+from ._patch_torch import stage_backward_input, stage_backward_weight
+from ._patch_torch_checkpoint import ReusableGraphExecGroup
 
 _logger = logging.getLogger(__name__)
 
 _ALLOW_GRAD_DTYPES = (torch.double, torch.float32, torch.float16, torch.bfloat16)
+
 
 try:
     from torch.autograd.graph import get_gradient_edge
@@ -161,6 +167,17 @@ class AsyncCommHandler:
 TensorPairs = List[Tuple[int, torch.Tensor]]
 
 
+@dataclass
+class _WeightBackwardState:
+    param_groups: Optional[List[Dict[str, Any]]] = None
+    output_tensors: Optional[Tuple[torch.Tensor, ...]] = None
+    output_tensor_grads: Optional[Tuple[Optional[torch.Tensor], ...]] = None
+    # Non-reentrant checkpoint keeps recomputed activations per graph-execution
+    # group. Reusing the group in W lets it consume the disjoint activations
+    # materialized by I instead of replaying the checkpointed forward again.
+    graph_exec_group: Optional[Any] = None
+
+
 class Executor:
 
     # We consider each segment as an isolated graph. By
@@ -169,6 +186,8 @@ class Executor:
     # Each graph has its name, and multiple call for the graph will append
     # (instant id -> detached) input tensor pairs for backward reference.
     _detach: Dict[str, List[TensorPairs]] = dict()
+    # Deferred weight-backward states use the same per-segment FIFO order.
+    _weight_backward_states: Dict[str, List[_WeightBackwardState]] = dict()
     _pseudo_free_grad_edges: Dict[int, Any] = dict()
     _pseudo_free_pending_sends: Dict[int, int] = dict()
     _pseudo_free_unavailable_warned = False
@@ -265,11 +284,18 @@ class Executor:
         if len(output_tensors) == 0: return None
 
         input_tensors = []
+        input_grad_dtypes = []
+        requested_dtype_by_id = {
+            id(tensor): tensor.dtype
+            for tensor in requested_input_tensors
+            if torch.is_tensor(tensor)
+        }
         for tid in requested_tensor_ids:
             t = dtensor_by_input_id.get(tid)
             if torch.is_tensor(t) and t.requires_grad:
                 t.retain_grad()
                 input_tensors.append(t)
+                input_grad_dtypes.append(requested_dtype_by_id[tid])
 
         visited = set()
         dedup_output_tensors = []
@@ -310,12 +336,156 @@ class Executor:
             for tensor_id in pseudo_free_output_ids:
                 Executor._pseudo_free_grad_edges.pop(tensor_id, None)
                 Executor._pseudo_free_pending_sends.pop(tensor_id, None)
-        grads = tuple(t.grad for t in input_tensors)
+        grads = tuple(
+            tensor.grad.to(dtype)
+            if tensor.grad.dtype != dtype else tensor.grad
+            for tensor, dtype in zip(input_tensors, input_grad_dtypes)
+        )
         assert all(grad is not None for grad in grads), "RuntimeError: got gradient None"
-
         if    len(grads) == 0: return None
         elif  len(grads) == 1: return grads[0]
         else: return grads
+
+    @staticmethod
+    def backward_input(
+        name: str,
+        input_tensors: List[torch.Tensor],
+        output_tensors: List[torch.Tensor],
+        output_tensor_grads: List[Optional[torch.Tensor]],
+        weights: Iterable[torch.nn.Parameter],
+    ) -> Any:
+        """Compute input gradients and save the state required for dWeight."""
+        output_tensor_grads = Executor.sync_tensors(output_tensor_grads)
+        weights = tuple(weights)
+
+        saved_pairs = Executor._detach[name].pop(0)
+        requested_tensor_ids = [
+            id(tensor) for tensor in input_tensors if torch.is_tensor(tensor)
+        ]
+        dtensor_by_input_id = {
+            tensor_id: dtensor
+            for tensor_id, dtensor in saved_pairs
+            if torch.is_tensor(dtensor)
+        }
+
+        if len(output_tensors) == 0:
+            Executor._weight_backward_states.setdefault(name, []).append(
+                _WeightBackwardState(param_groups=[])
+            )
+            return None
+
+        detached_inputs = []
+        input_grad_dtypes = []
+        requested_dtype_by_id = {
+            id(tensor): tensor.dtype
+            for tensor in input_tensors
+            if torch.is_tensor(tensor)
+        }
+        for tensor_id in requested_tensor_ids:
+            tensor = dtensor_by_input_id.get(tensor_id)
+            if torch.is_tensor(tensor) and tensor.requires_grad:
+                detached_inputs.append(tensor)
+                input_grad_dtypes.append(requested_dtype_by_id[tensor_id])
+
+        visited = set()
+        dedup_output_tensors = []
+        dedup_output_tensor_grads = []
+        for tensor, grad in zip(output_tensors, output_tensor_grads):
+            pair = (id(tensor), id(grad))
+            if pair not in visited:
+                visited.add(pair)
+                dedup_output_tensors.append(tensor)
+                dedup_output_tensor_grads.append(grad)
+
+        if Executor._backward_pre_hook is not None:
+            detached_inputs, dedup_output_tensors, dedup_output_tensor_grads = \
+                Executor._backward_pre_hook(
+                    detached_inputs,
+                    dedup_output_tensors,
+                    dedup_output_tensor_grads,
+                )
+
+        if not detached_inputs:
+            Executor._weight_backward_states.setdefault(name, []).append(
+                _WeightBackwardState(
+                    output_tensors=tuple(dedup_output_tensors),
+                    output_tensor_grads=tuple(dedup_output_tensor_grads),
+                )
+            )
+            return None
+
+        graph_exec_group = (
+            ReusableGraphExecGroup()
+            if ReusableGraphExecGroup is not None
+            else None
+        )
+        completed = False
+        try:
+            with graph_exec_group if graph_exec_group is not None else nullcontext():
+                grads, param_groups = stage_backward_input(
+                    dedup_output_tensors,
+                    dedup_output_tensor_grads,
+                    detached_inputs,
+                    iter(weights),
+                )
+            completed = True
+        finally:
+            if graph_exec_group is not None and not completed:
+                graph_exec_group.release()
+        grads = tuple(
+            grad.to(dtype) if grad is not None and grad.dtype != dtype else grad
+            for grad, dtype in zip(grads, input_grad_dtypes)
+        )
+        needs_graph_exec_group = any(
+            param_group.get("params")
+            for param_group in param_groups
+        )
+        if graph_exec_group is not None and not needs_graph_exec_group:
+            graph_exec_group.release()
+            graph_exec_group = None
+        state = _WeightBackwardState(
+            param_groups=param_groups,
+            graph_exec_group=graph_exec_group,
+        )
+        Executor._weight_backward_states.setdefault(name, []).append(state)
+
+        assert all(grad is not None for grad in grads), "RuntimeError: got gradient None"
+        if len(grads) == 0: return None
+        elif len(grads) == 1: return grads[0]
+        else: return grads
+
+    @staticmethod
+    def backward_weight(
+        name: str,
+        weights: Iterable[torch.nn.Parameter],
+    ) -> None:
+        """Compute a segment's oldest deferred weight gradients."""
+        weights = tuple(weights)
+        states = Executor._weight_backward_states.get(name)
+        if not states:
+            raise RuntimeError(f"No pending weight backward for segment {name}.")
+        state = states.pop(0)
+        try:
+            if state.param_groups is not None:
+                if weights and state.param_groups:
+                    with (
+                        state.graph_exec_group
+                        if state.graph_exec_group is not None
+                        else nullcontext()
+                    ):
+                        stage_backward_weight(iter(weights), state.param_groups)
+                return
+
+            if weights:
+                # No stage input required gradients. A regular backward reaches only
+                # weight leaves and, importantly, fires their AccumulateGrad hooks.
+                torch.autograd.backward(
+                    state.output_tensors,
+                    grad_tensors=state.output_tensor_grads,
+                )
+        finally:
+            if state.graph_exec_group is not None:
+                state.graph_exec_group.release()
 
     @staticmethod
     def sync_tensors(tensors: List[Any]) -> List[Any]:
@@ -414,6 +584,7 @@ class Executor:
     @staticmethod
     def clear():
         Executor._detach = dict()
+        Executor._weight_backward_states = dict()
         Executor._pseudo_free_grad_edges = dict()
         Executor._pseudo_free_pending_sends = dict()
         Executor._backward_pre_hook = None
@@ -423,6 +594,9 @@ class Executor:
         for name, npairs in Executor._detach.items():
             assert len(npairs) == 0, \
                 f"Fine remaining segment needs backward: {name}, remaining times: {len(npairs)}"
+        for name, states in Executor._weight_backward_states.items():
+            assert len(states) == 0, \
+                f"Fine remaining segment needs weight backward: {name}, remaining times: {len(states)}"
         assert (
             len(Executor._pseudo_free_grad_edges) == 0
             and len(Executor._pseudo_free_pending_sends) == 0
@@ -436,6 +610,8 @@ class Executor:
 fexecute = Executor.fexecute
 aexecute = Executor.aexecute
 backward = Executor.backward
+backward_input = Executor.backward_input
+backward_weight = Executor.backward_weight
 pseudo_free_tensor = Executor.pseudo_free_tensor
 defer_pseudo_free_tensor = Executor.defer_pseudo_free_tensor
 complete_deferred_pseudo_free_tensor = Executor.complete_deferred_pseudo_free_tensor

@@ -65,6 +65,26 @@ def has_reducer_grad_accumulator(param: torch.nn.Parameter) -> bool:
     return bucket is not None and param in bucket._pofset
 
 
+def get_reducer_grad_accumulator(
+    param: torch.nn.Parameter,
+) -> Optional[torch.Tensor]:
+    """Return the parameter-shaped reducer accumulation buffer when available.
+
+    A custom dWeight GEMM can use this tensor as its ``out`` accumulator and
+    avoid materializing a parameter-sized contribution first.  ZeRO-3 is not
+    eligible because each rank owns only a shard and must reduce the complete
+    contribution before selecting its local intersection.
+    """
+    bucket = _get_reducer_bucket(param)
+    if bucket is None or param not in bucket._pofset or bucket._z3:
+        return None
+    info = bucket._params_info[param]
+    offset = bucket._pofset[param]
+    return bucket._contiguous_grads[
+        offset:offset + math.prod(info.shape)
+    ].view(info.shape)
+
+
 @torch.no_grad()
 def accumulate_reducer_grad(
     param: torch.nn.Parameter,
@@ -98,6 +118,21 @@ def mark_reducer_grad_ready(param: torch.nn.Parameter) -> bool:
     if bucket is None:
         return False
     bucket.mark_grad_ready(param)
+    return True
+
+
+@torch.no_grad()
+def complete_reducer_grad(param: torch.nn.Parameter) -> bool:
+    """Complete one manually accumulated contribution without AccumulateGrad.
+
+    Deferred W callbacks run outside the original autograd GraphTask. They can
+    write directly into the reducer buffer and call this once after all local
+    contributions for ``param`` have been consumed.
+    """
+    bucket = _get_reducer_bucket(param)
+    if bucket is None:
+        return False
+    bucket.complete_manual_grad(param)
     return True
 
 
@@ -637,6 +672,17 @@ class Bucket:
         if param not in self._pofset:
             raise ValueError("Parameter is not owned by this reducer bucket.")
         self._manual_grad_pending.add(param)
+
+    @torch.no_grad()
+    def complete_manual_grad(self, param: torch.nn.Parameter):
+        """Finish a direct reducer-buffer contribution outside autograd."""
+        if param not in self._pofset:
+            raise ValueError("Parameter is not owned by this reducer bucket.")
+        self._manual_grad_pending.discard(param)
+        if self._z3:
+            self._reducer.postevict_param(param)
+        if not RuntimeFlag.skip_reducer and self._async:
+            self._mark_async_param_ready(param)
 
     def sync_grads(self):
         """

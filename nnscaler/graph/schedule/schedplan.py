@@ -63,7 +63,7 @@ How to create a SchedulePlan for users:
 
 from typing import Dict, List,  Optional, Tuple, Set, Union
 from dataclasses import dataclass, field
-from enum import IntEnum
+from enum import Enum, IntEnum
 
 from nnscaler.ir.cten import IRCell
 from nnscaler.ir.adapter import IRAdapter
@@ -73,6 +73,18 @@ from nnscaler.ir.operator import IRDataOperation
 from nnscaler.graph.graph import IRGraph
 from nnscaler.graph.segment import IRSegment
 from nnscaler.flags import CompileFlag
+
+
+class PipelineAction(str, Enum):
+    """Computation performed by one pipeline schedule block."""
+
+    FORWARD = 'F'
+    FULL_BACKWARD = 'B'
+    BACKWARD_INPUT = 'I'
+    BACKWARD_WEIGHT = 'W'
+
+    def __str__(self) -> str:
+        return self.value
 
 
 @dataclass
@@ -110,7 +122,14 @@ class Block:
     that is executed with input data of a given micro-batch index.
     """
 
-    def __init__(self, cell: IRCell, micro_batch_id: int, span: int, stream_context: Optional[StreamContext] = None) -> None:
+    def __init__(
+        self,
+        cell: IRCell,
+        micro_batch_id: int,
+        span: int,
+        stream_context: Optional[StreamContext] = None,
+        action: Optional[PipelineAction] = None,
+    ) -> None:
         """Create an execution block with IRCell on microbatch index. The
         block will take `span` steps to finish execution.
         """
@@ -119,14 +138,30 @@ class Block:
         self._micro_batch_id: int = micro_batch_id
         self._span = span
         self._stream_context: Optional[StreamContext] = stream_context
+        if isinstance(cell, IRSegment):
+            if action is None:
+                action = PipelineAction.FORWARD if cell.isfw() \
+                    else PipelineAction.FULL_BACKWARD
+            action = PipelineAction(action)
+            if cell.isfw() != (action == PipelineAction.FORWARD):
+                raise ValueError(
+                    f'Pipeline action {action} does not match segment {cell}'
+                )
+        elif action is not None:
+            raise ValueError('Pipeline actions can only be attached to IRSegment blocks')
+        self._action = action
 
     def __eq__(self, other):
         if isinstance(other, Block):
-            return other.content == self.content and other.mid == self.mid
+            return (
+                other.content == self.content
+                and other.mid == self.mid
+                and other.action == self.action
+            )
         return False
 
     def __hash__(self) -> int:
-        return hash((self._content, self._micro_batch_id))
+        return hash((self._content, self._micro_batch_id, self._action))
 
     @property
     def device(self) -> Tuple[int]:
@@ -148,8 +183,14 @@ class Block:
     def stream_context(self) -> Optional['StreamContext']:
         return self._stream_context
 
+    @property
+    def action(self) -> Optional[PipelineAction]:
+        return self._action
+
     def __repr__(self) -> str:
-        return f"{self._content.cid}{'f' if self.content.isfw() else 'b'}{self._micro_batch_id}"
+        action = self._action.value if self._action is not None \
+            else ('f' if self.content.isfw() else 'b')
+        return f"{self._content.cid}{action}{self._micro_batch_id}"
 
 
 class ScheduleDependency:
@@ -192,7 +233,19 @@ class ScheduleDependency:
         self.reducers = self.graph.select(ntype=IRWeightReducer, flatten=False)
 
     def depends(self, prev: Block, next: Block) -> bool:
-        return prev.mid == next.mid and self.graph.depends(prev.content, next.content)
+        if prev.mid != next.mid:
+            return False
+        if prev.content == next.content:
+            return (
+                prev.action == PipelineAction.BACKWARD_INPUT
+                and next.action == PipelineAction.BACKWARD_WEIGHT
+            )
+        # W consumes state saved by I but does not produce graph-visible data.
+        # All cross-segment backward dependencies therefore belong to I.
+        if prev.action == PipelineAction.BACKWARD_WEIGHT \
+                or next.action == PipelineAction.BACKWARD_WEIGHT:
+            return False
+        return self.graph.depends(prev.content, next.content)
 
 
 @dataclass
@@ -300,6 +353,7 @@ class PlanBase:
         seg: IRSegment, micro_batch_id: int,
         step: int, span: Optional[int] = 1,
         stream_context: Optional[StreamContext] = None,
+        action: Optional[PipelineAction] = None,
     ) -> Block:
         """Add a segment to be executed with micro_batch_id data at step.
 
@@ -314,7 +368,7 @@ class PlanBase:
         Returns:
             block (Block): the block representing the segment
         """
-        block = Block(seg, micro_batch_id, span, stream_context)
+        block = Block(seg, micro_batch_id, span, stream_context, action)
         self.add_block(block, step)
         return block
 
@@ -323,6 +377,7 @@ class PlanBase:
         step: int, seg: IRSegment,
         micro_batch_id: int, span: Optional[int] = 1,
         stream_context: Optional[StreamContext] = None,
+        action: Optional[PipelineAction] = None,
     ) -> Block:
         """Insert `span` steps at current `step`.
 
@@ -347,7 +402,7 @@ class PlanBase:
                 raise NotImplementedError(
                     f"Cannot shift the block {block} that is in execution on step {step}")
         # insert
-        block = Block(seg, micro_batch_id, span, stream_context)
+        block = Block(seg, micro_batch_id, span, stream_context, action)
         for _ in range(span):
             self._step_blocks.insert(step, [block])
             self._step_devices.insert(step, set(seg.device))
@@ -487,12 +542,19 @@ class SchedulePlan(PlanBase):
     For each device, only up to one segment can be executed on a step.
     """
 
-    def __init__(self, graph: IRGraph, num_microbatches: int):
+    def __init__(
+        self,
+        graph: IRGraph,
+        num_microbatches: int,
+        *,
+        bind_graph: bool = True,
+    ):
         super().__init__(graph)
         # execution sequence
         self._num_microbatches = num_microbatches
         # bind to the graph
-        graph._bind_schedule(self)
+        if bind_graph:
+            graph._bind_schedule(self)
 
     @property
     def nmicros(self) -> int:
@@ -568,12 +630,15 @@ class SchedulePlan(PlanBase):
             for step in range(self.nsteps):
                 blocks = self.start_blocks(step)
                 assert all(isinstance(blk, Block) for blk in blocks)
-                segments = [block.content for block in blocks]
-                mids = [block.mid for block in blocks]
-                if sender in segments:
-                    span = blocks[segments.index(sender)].span
-                    mid = mids[segments.index(sender)]
-                    self._step_adapters[step+span-1].append(Block(adapter, mid, 1))
+                sender_blocks = [
+                    block for block in blocks
+                    if block.content == sender
+                    and block.action != PipelineAction.BACKWARD_WEIGHT
+                ]
+                for sender_block in sender_blocks:
+                    self._step_adapters[step + sender_block.span - 1].append(
+                        Block(adapter, sender_block.mid, 1)
+                    )
 
     def topo_sort(self):
         super().topo_sort()
@@ -610,7 +675,9 @@ class SchedulePlan(PlanBase):
                         have_block = True
                         break
                 if have_block:
-                    blk_repr = f"{sids[block.content]}{'f' if block.content.isfw() else 'b'}{block.mid}"
+                    action = block.action.value if block.action is not None \
+                        else ('f' if block.content.isfw() else 'b')
+                    blk_repr = f"{sids[block.content]}{action}{block.mid}"
                     timeline += f" {'-'.join([blk_repr] * block.span)}"
                     step += block.span
                 else:

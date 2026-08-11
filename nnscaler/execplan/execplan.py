@@ -11,7 +11,12 @@ from nnscaler.ir.tensor import IRSubTensor, IRFullTensor
 from nnscaler.ir.adapter import IRAdapter, IRWeightReducer
 from nnscaler.ir.operator import IRBpOperation, IRFwOperation, IRDataOperation
 from nnscaler.graph.graph import IRGraph, IRSegment
-from nnscaler.graph.schedule.schedplan import SchedulePlan, Block, StreamContext
+from nnscaler.graph.schedule.schedplan import (
+    SchedulePlan,
+    Block,
+    PipelineAction,
+    StreamContext,
+)
 
 
 class ExeReuseCell(IRCell):
@@ -24,7 +29,8 @@ class ExeReuseCell(IRCell):
 
     def __init__(self, cell: IRCell,
                  inputs: List[IRSubTensor], outputs: List[IRCell],
-                 micro_batch_id: Optional[int] = None):
+                 micro_batch_id: Optional[int] = None,
+                 pipeline_action: Optional[PipelineAction] = None):
         assert len(inputs) == len(cell.inputs())
         assert len(outputs) == len(cell.outputs()), (
             f"output length mismatch: {cell}\n"
@@ -38,6 +44,7 @@ class ExeReuseCell(IRCell):
         self._cell: IRCell = cell
         self._cached_dispatched: Dict[int, ExeReuseCell] = {}
         self._micro_batch_id = micro_batch_id
+        self._pipeline_action = pipeline_action
 
     @property
     def device(self) -> int:
@@ -50,6 +57,10 @@ class ExeReuseCell(IRCell):
     @property
     def micro_batch_id(self) -> Optional[int]:
         return self._micro_batch_id
+
+    @property
+    def pipeline_action(self) -> Optional[PipelineAction]:
+        return self._pipeline_action
 
     def isfw(self) -> bool:
         return self._cell.isfw()
@@ -112,7 +123,8 @@ class ExeReuseCell(IRCell):
         )
         reuse = ExeReuseCell(
             dispatch_cell, inputs, outputs,
-            micro_batch_id=self._micro_batch_id
+            micro_batch_id=self._micro_batch_id,
+            pipeline_action=self._pipeline_action,
         )
         reuse._id = self._id
         reuse._op_context = self._op_context
@@ -123,7 +135,9 @@ class ExeReuseCell(IRCell):
         return reuse
 
     def __repr__(self) -> str:
-        return f'ReuseCell-{self.device}(name={self._cell.name}{self._cell.cid}, inputs={self.inputs()}, outputs={self.outputs()})'
+        action = f', action={self._pipeline_action.value}' \
+            if self._pipeline_action is not None else ''
+        return f'ReuseCell-{self.device}(name={self._cell.name}{self._cell.cid}{action}, inputs={self.inputs()}, outputs={self.outputs()})'
 
 
 
@@ -190,7 +204,8 @@ class ExecutionPlan:
                 outputs = [get(t, node.mid) for t in node.content.outputs()]
                 cell = ExeReuseCell(
                     node.content, inputs, outputs,
-                    micro_batch_id=node.mid
+                    micro_batch_id=node.mid,
+                    pipeline_action=node.action,
                 )
                 if node.stream_context is not None:
                     cell.set_op_context('stream_context', node.stream_context)
@@ -199,13 +214,51 @@ class ExecutionPlan:
                     moutputs = [get(t, node.mid) for t in node.content.mirror.outputs()]
                     mcell = ExeReuseCell(
                         node.content.mirror, minputs, moutputs,
-                        micro_batch_id=node.mid
+                        micro_batch_id=node.mid,
+                        pipeline_action=(
+                            PipelineAction.FULL_BACKWARD
+                            if isinstance(node.content.mirror, IRSegment) else None
+                        ),
                     )
                     IRCell.make_pair(cell, mcell)
                 micro_fcells[key] = cell
                 return cell
             else:
-                mcell = block2reuse(Block(node.content.mirror, node.mid, node.span))
+                if node.action in (
+                    PipelineAction.BACKWARD_INPUT,
+                    PipelineAction.BACKWARD_WEIGHT,
+                ):
+                    fw_content = node.content.mirror
+                    assert isinstance(fw_content, IRSegment)
+                    fcell = ExeReuseCell(
+                        fw_content,
+                        [get(t, node.mid) for t in fw_content.inputs()],
+                        [get(t, node.mid) for t in fw_content.outputs()],
+                        micro_batch_id=node.mid,
+                        pipeline_action=PipelineAction.FORWARD,
+                    )
+                    inputs = [get(t, node.mid) for t in node.content.inputs()]
+                    outputs = [get(t, node.mid) for t in node.content.outputs()]
+                    cell = ExeReuseCell(
+                        node.content,
+                        inputs,
+                        outputs,
+                        micro_batch_id=node.mid,
+                        pipeline_action=node.action,
+                    )
+                    IRCell.make_pair(fcell, cell)
+                    if node.stream_context is not None:
+                        cell.set_op_context('stream_context', node.stream_context)
+                    return cell
+                mcell = block2reuse(Block(
+                    node.content.mirror,
+                    node.mid,
+                    node.span,
+                    action=(
+                        PipelineAction.FORWARD
+                        if isinstance(node.content.mirror, IRSegment) else None
+                    ),
+                ))
                 if node.stream_context is not None:
                     mcell.mirror.set_op_context('stream_context', node.stream_context)
                 return mcell.mirror
@@ -278,6 +331,11 @@ class ExecutionPlan:
         def cached_dispatch(node: IRCell, devid: int,
                             dispatched: Dict[IRCell, IRCell]) -> IRCell:
             """Cached dispatch"""
+            if isinstance(node, ExeReuseCell) and node.pipeline_action in (
+                PipelineAction.BACKWARD_INPUT,
+                PipelineAction.BACKWARD_WEIGHT,
+            ):
+                return node.dispatch(devid)
             if node.isfw() or isinstance(node, IRWeightReducer):
                 return dispatched.setdefault(node, node.dispatch(devid))
             fnode = node.mirror

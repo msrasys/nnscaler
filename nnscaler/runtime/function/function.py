@@ -13,7 +13,7 @@ import torch
 import torch.nn.functional as TorchF
 import operator
 import datetime
-from nnscaler.flags import CompileFlag
+from nnscaler.flags import CompileFlag, RuntimeFlag
 
 
 def identity(tensor: torch.Tensor) -> torch.Tensor:
@@ -167,6 +167,136 @@ def conv3d(input: torch.Tensor, weight: torch.Tensor, bias: Optional[torch.Tenso
     return TorchF.conv3d(input, weight, bias, stride=stride, dilation=dilation, groups=groups)
 
 
+@torch.no_grad()
+def _accumulate_embedding_grad(
+    weight: torch.Tensor,
+    masked_input: torch.Tensor,
+    input_mask: torch.Tensor,
+    grad_output: torch.Tensor,
+    padding_idx: Optional[int],
+) -> bool:
+    """Accumulate an embedding dWeight without a vocabulary-sized temporary."""
+    if not (
+        isinstance(weight, torch.nn.Parameter)
+        and weight.is_leaf
+        and weight.requires_grad
+    ):
+        return False
+
+    from nnscaler.runtime.adapter.reducer import has_reducer_grad_accumulator
+    if has_reducer_grad_accumulator(weight):
+        return False
+
+    from nnscaler.runtime.utils import get_grad_dtype
+    if weight.grad is None:
+        weight.grad = torch.zeros_like(weight, dtype=get_grad_dtype(weight))
+
+    indices = masked_input.reshape(-1)
+    valid = ~input_mask.reshape(-1)
+    if padding_idx is not None:
+        valid = valid & (indices != padding_idx)
+    source = grad_output.reshape(-1, grad_output.shape[-1])
+
+    # Work through fixed-size vocabulary chunks. Boolean indexing and
+    # torch.unique both produce dynamic-size CUDA outputs and therefore
+    # synchronize the host once per microbatch. A reserved padding row maps
+    # every out-of-chunk token to an ignored index while preserving the native
+    # embedding reduction (and its deterministic summation order) for the
+    # real rows. Only one bounded BF16 chunk exists at a time; no
+    # vocabulary-sized dWeight is materialized.
+    chunk_rows = 32768
+    for row_start in range(0, weight.shape[0], chunk_rows):
+        row_end = min(row_start + chunk_rows, weight.shape[0])
+        in_chunk = valid & (indices >= row_start) & (indices < row_end)
+        chunk_indices = torch.where(
+            in_chunk,
+            indices - row_start + 1,
+            0,
+        )
+        chunk_grad = torch.ops.aten.embedding_dense_backward(
+            source,
+            chunk_indices,
+            row_end - row_start + 1,
+            0,
+            False,
+        )
+        weight.grad[row_start:row_end].add_(chunk_grad[1:])
+    return True
+
+
+def _embedding_dense_backward(
+    grad_output: torch.Tensor,
+    masked_input: torch.Tensor,
+    input_mask: torch.Tensor,
+    num_weights: int,
+    padding_idx: Optional[int],
+) -> torch.Tensor:
+    if input_mask.any():
+        grad_output = grad_output.masked_fill(input_mask.unsqueeze(-1), 0)
+    return torch.ops.aten.embedding_dense_backward(
+        grad_output,
+        masked_input,
+        num_weights,
+        -1 if padding_idx is None else padding_idx,
+        False,
+    )
+
+
+class _Embedding(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, input, weight, padding_idx, start, stop):
+        input = input.long()
+        input_mask = (input < start) | (input >= stop)
+        masked_input = input.clone() - start
+        masked_input[input_mask] = 0
+        local_padding_idx = (
+            padding_idx - start
+            if padding_idx is not None and start <= padding_idx < stop
+            else None
+        )
+        output = TorchF.embedding(
+            masked_input,
+            weight,
+            local_padding_idx,
+            None,
+            2.0,
+            False,
+            False,
+        )
+        output[input_mask, :] = 0.0
+        ctx.save_for_backward(masked_input, input_mask)
+        ctx.weight = weight
+        ctx.padding_idx = local_padding_idx
+        return output
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        if RuntimeFlag.fbw_phase == "input":
+            return None, None, None, None, None
+
+        masked_input, input_mask = ctx.saved_tensors
+        if (
+            RuntimeFlag.fbw_phase == "native_weight"
+            and _accumulate_embedding_grad(
+                ctx.weight,
+                masked_input,
+                input_mask,
+                grad_output,
+                ctx.padding_idx,
+            )
+        ):
+            return None, None, None, None, None
+
+        grad_weight = _embedding_dense_backward(
+            grad_output,
+            masked_input,
+            input_mask,
+            ctx.weight.shape[0],
+            ctx.padding_idx,
+        )
+        return None, grad_weight, None, None, None
+
+
 def embedding(input: torch.Tensor, weight: torch.Tensor, padding_idx: Optional[int], start: int, stop: int):
     """
     add start/stop to make vocab dim partitionable.
@@ -191,24 +321,7 @@ def embedding(input: torch.Tensor, weight: torch.Tensor, padding_idx: Optional[i
     Outputs:
         output: [*, embed_size]
     """
-    input = input.long()
-    input_mask = (input < start) | (input >= stop)
-    # make the range of value in the input to [0, stop-start)
-    # note that the embedding is implemented like a look up table.
-    masked_input = input.clone() - start
-    masked_input[input_mask] = 0
-    # if padding_idx is inside [start, stop), should map it to [0, stop-start)
-    # if padding_idx is outside [start, stop), directly make it None
-    if padding_idx is not None and start <= padding_idx < stop:
-        padding_idx -= start
-    else:
-        padding_idx = None
-    output = TorchF.embedding(
-        masked_input, weight, padding_idx,
-        None, 2.0, False, False
-    )
-    output[input_mask, :] = 0.0
-    return output
+    return _Embedding.apply(input, weight, padding_idx, start, stop)
 
 
 def layer_norm(input: torch.Tensor,
