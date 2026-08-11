@@ -1,11 +1,7 @@
 #  Copyright (c) Microsoft Corporation.
 #  Licensed under the MIT License.
 
-import os
 from pathlib import Path
-import socket
-import subprocess
-import sys
 
 import pytest
 import torch
@@ -14,23 +10,20 @@ from torch import nn
 from torch.utils.data import Dataset
 
 from nnscaler.cli.trainer import Trainer
-
+from tests.launch_torchrun import launch_torchrun
 
 try:
     import dion  # noqa: F401
-
-    DION_AVAILABLE = True
 except ImportError:
-    DION_AVAILABLE = False
+    pytest.skip('Dion Muon not available', allow_module_level=True)
 
 
 class DionMuonTestModel(nn.Module):
+
     def __init__(self, dim, nlayers):
         super().__init__()
-        self.layers = nn.ModuleList([
-            nn.Linear(dim, dim, bias=False)
-            for _ in range(nlayers)
-        ])
+        self.layers = nn.ModuleList(
+            [nn.Linear(dim, dim, bias=False) for _ in range(nlayers)])
         self.loss_fn = nn.BCELoss()
 
     def forward(self, data):
@@ -41,6 +34,7 @@ class DionMuonTestModel(nn.Module):
 
 
 class DionMuonTestDataset(Dataset):
+
     def __init__(self, dim, size):
         generator = torch.Generator().manual_seed(0)
         self.data = torch.randn(size, dim, generator=generator)
@@ -58,8 +52,7 @@ class DionMuonTestDataset(Dataset):
 
 def _assert_checkpoint_dtypes(checkpoint):
     model_tensors = [
-        value
-        for value in checkpoint['model'].values()
+        value for value in checkpoint['model'].values()
         if torch.is_tensor(value) and value.is_floating_point()
     ]
     assert model_tensors
@@ -67,27 +60,23 @@ def _assert_checkpoint_dtypes(checkpoint):
 
     optimizer_state = checkpoint['optimizer']['state']
     assert optimizer_state
-    optimizer_tensors = [
-        (key, value)
-        for param_state in optimizer_state.values()
-        for key, value in param_state.items()
-        if key in {'momentum', 'fp32_params'}
-    ]
-    assert {key for key, _ in optimizer_tensors} == {
-        'momentum',
-        'fp32_params',
-    }
-    assert all(
-        tensor.dtype == torch.float32
-        for _, tensor in optimizer_tensors
-    )
+    optimizer_tensors = [(key, value)
+                         for param_state in optimizer_state.values()
+                         for key, value in param_state.items()
+                         if key in {'momentum', 'fp32_params'}]
+    assert {key
+            for key, _ in optimizer_tensors} == {
+                'momentum',
+                'fp32_params',
+            }
+    assert all(tensor.dtype == torch.float32
+               for _, tensor in optimizer_tensors)
 
 
-def _trainer_checkpoint_worker(save_dir):
+def _trainer_checkpoint_worker(save_dir, runtime_ngpus, nlayers):
     save_dir = Path(save_dir)
     config_path = Path(__file__).with_name(
-        'trainer_args_dion_muon.yaml'
-    ).resolve()
+        'trainer_args_dion_muon.yaml').resolve()
     checkpoint_dir = save_dir / 'checkpoints'
     gen_savedir = save_dir / 'generated'
 
@@ -98,6 +87,12 @@ def _trainer_checkpoint_worker(save_dir):
         str(gen_savedir),
         '--checkpoint.save_dir',
         str(checkpoint_dir),
+        '--compute_config.runtime_ngpus',
+        str(runtime_ngpus),
+        '--global_batch_size',
+        str(2 * runtime_ngpus),
+        '--model.args.nlayers',
+        str(nlayers),
     ])
     trainer.run()
     torch.distributed.barrier()
@@ -131,7 +126,13 @@ def _trainer_checkpoint_worker(save_dir):
         '--checkpoint.save_dir',
         str(checkpoint_dir),
         '--checkpoint.resume_from',
-        'last',
+        str(checkpoint_dir / 'merged.pt'),
+        '--compute_config.runtime_ngpus',
+        str(runtime_ngpus),
+        '--global_batch_size',
+        str(2 * runtime_ngpus),
+        '--model.args.nlayers',
+        str(nlayers),
     ])
     resumed.run()
     torch.distributed.barrier()
@@ -148,32 +149,18 @@ def _trainer_checkpoint_worker(save_dir):
     torch.distributed.destroy_process_group()
 
 
-@pytest.mark.skipif(
-    not torch.cuda.is_available() or not DION_AVAILABLE,
-    reason='CUDA and Dion required',
-)
-def test_trainer_dumps_and_resumes_fp32_dion_state(tmp_path):
-    env = os.environ.copy()
-    with socket.socket() as sock:
-        sock.bind(('127.0.0.1', 0))
-        master_port = sock.getsockname()[1]
-    subprocess.run(
-        [
-            sys.executable,
-            '-m',
-            'torch.distributed.run',
-            '--nnodes=1',
-            '--nproc-per-node=1',
-            '--master-addr=127.0.0.1',
-            f'--master-port={master_port}',
-            str(Path(__file__).resolve()),
-            str(tmp_path),
-        ],
-        check=True,
-        env=env,
-        timeout=300,
+@pytest.mark.parametrize('runtime_ngpus, nlayers', [(1, 4), (2, 1)])
+def test_trainer_dumps_and_resumes_fp32_dion_state(
+    tmp_path,
+    runtime_ngpus,
+    nlayers,
+):
+    if torch.cuda.device_count() < runtime_ngpus:
+        pytest.skip(f'{runtime_ngpus} CUDA devices required')
+    launch_torchrun(
+        runtime_ngpus,
+        _trainer_checkpoint_worker,
+        tmp_path,
+        runtime_ngpus,
+        nlayers,
     )
-
-
-if __name__ == '__main__':
-    _trainer_checkpoint_worker(sys.argv[1])

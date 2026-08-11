@@ -6,12 +6,10 @@ from copy import deepcopy
 import pytest
 import torch
 
-
 try:
     from dion.muon import Muon as _DionMuon  # noqa: F401
 except ImportError:
     pytest.skip("Dion Muon not available", allow_module_level=True)
-
 
 from nnscaler.runtime.adapter.reducer import FlattenParamInfo, ReducerParamInfo
 from nnscaler.runtime.dion_optimizer import Muon as DionMuon
@@ -65,8 +63,7 @@ def _make_flattened_param(
             flatten_info.opt_chunk_size,
             dtype=dtype,
             device=device,
-        )
-    )
+        ))
     set_fparam_meta(flat_param, flatten_info)
     return flat_param, embedded_params
 
@@ -115,6 +112,19 @@ def test_mixed_precision_checkpoint_dump_and_load_are_fp32(tmp_path, device):
     model_params, optimizer = _make_mixed_optimizer(tensors, device)
     _populate_fp32_state(optimizer)
 
+    assert all(
+        actual is expected
+        for actual, expected in zip(optimizer.f16_params, model_params)
+    )
+    assert all(
+        actual is expected
+        for actual, expected in zip(
+            optimizer.param_groups[0]['params'],
+            optimizer.fp32_params,
+        )
+    )
+    assert all(param.dtype == torch.float32 for param in optimizer.fp32_params)
+
     checkpoint_path = tmp_path / 'dion_muon.pt'
     torch.save(
         {
@@ -123,10 +133,8 @@ def test_mixed_precision_checkpoint_dump_and_load_are_fp32(tmp_path, device):
         },
         checkpoint_path,
     )
-    assert all(
-        'fp32_params' not in optimizer.state[param]
-        for param in optimizer.fp32_params
-    )
+    assert all('fp32_params' not in optimizer.state[param]
+               for param in optimizer.fp32_params)
     checkpoint = torch.load(
         checkpoint_path,
         map_location='cpu',
@@ -145,67 +153,80 @@ def test_mixed_precision_checkpoint_dump_and_load_are_fp32(tmp_path, device):
     )
     restored.load_state_dict(deepcopy(checkpoint['optimizer']))
 
-    assert all(param.dtype == torch.bfloat16 for param in restored_model_params)
+    assert all(param.dtype == torch.bfloat16
+               for param in restored_model_params)
     assert all(param.dtype == torch.float32 for param in restored.fp32_params)
-    assert all(
-        restored.state[param]['momentum'].dtype == torch.float32
-        for param in restored.fp32_params
-    )
+    assert all(restored.state[param]['momentum'].dtype == torch.float32
+               for param in restored.fp32_params)
     for expected, actual in zip(optimizer.fp32_params, restored.fp32_params):
         torch.testing.assert_close(actual.cpu(), expected.cpu())
 
 
-def test_legacy_bf16_state_is_normalized_to_fp32():
+@pytest.mark.parametrize('include_fp32_params', [True, False])
+def test_bf16_state_is_normalized_to_fp32(include_fp32_params):
     tensors = [torch.randn(4, 8), torch.randn(8, 4)]
     _, optimizer = _make_mixed_optimizer(tensors, 'cpu')
     _populate_fp32_state(optimizer)
-    legacy_state = deepcopy(optimizer.state_dict())
-    entry = legacy_state['state'][0]
-    entry['momentum_buffer'] = entry.pop('momentum').bfloat16()
-    entry['fp32_params'] = entry['fp32_params'].bfloat16()
+    bf16_state = deepcopy(optimizer.state_dict())
+    entry = bf16_state['state'][0]
+    entry['momentum'] = entry['momentum'].bfloat16()
+    if include_fp32_params:
+        entry['fp32_params'] = entry['fp32_params'].bfloat16()
+    else:
+        entry.pop('fp32_params')
 
     _, restored = _make_mixed_optimizer(tensors, 'cpu')
-    restored.load_state_dict(legacy_state)
+    restored.load_state_dict(bf16_state)
 
     # Loading must not mutate a checkpoint object that may be reused elsewhere.
-    assert 'momentum_buffer' in legacy_state['state'][0]
-    assert legacy_state['state'][0]['fp32_params'].dtype == torch.bfloat16
+    assert bf16_state['state'][0]['momentum'].dtype == torch.bfloat16
+    if include_fp32_params:
+        assert bf16_state['state'][0]['fp32_params'].dtype == torch.bfloat16
+    else:
+        assert 'fp32_params' not in bf16_state['state'][0]
     for fp32_param in restored.fp32_params:
         assert fp32_param.dtype == torch.float32
         assert restored.state[fp32_param]['momentum'].dtype == torch.float32
 
     normalized = restored.state_dict()['state'][0]
-    assert 'momentum_buffer' not in normalized
     assert normalized['momentum'].dtype == torch.float32
     assert normalized['fp32_params'].dtype == torch.float32
 
 
-def test_legacy_momentum_key_loads_into_dion_muon():
-    param = torch.nn.Parameter(torch.randn(4, 8))
-    optimizer = DionMuon(
-        [param],
+def test_sparse_state_syncs_missing_fp32_param_from_model():
+    tensors = [torch.randn(4, 8), torch.randn(8, 4)]
+    model_params = [
+        torch.nn.Parameter(tensor.bfloat16()) for tensor in tensors
+    ]
+    optimizer = MixedPrecisionDionMuon(
+        model_params,
         use_triton=False,
         use_polar_express=False,
     )
-    optimizer.state[param]['momentum_buffer'] = torch.randn_like(param)
+    optimizer.fp32_params[0].data.add_(0.5)
+    optimizer.state[optimizer.fp32_params[0]]['momentum'] = torch.ones_like(
+        optimizer.fp32_params[0])
     state_dict = deepcopy(optimizer.state_dict())
-    assert set(state_dict['state'][0]) == {'momentum'}
-    expected = state_dict['state'][0].pop('momentum')
-    state_dict['state'][0]['momentum_buffer'] = expected
+    assert set(state_dict['state']) == {0}
 
-    restored_param = torch.nn.Parameter(torch.randn(4, 8))
-    restored = DionMuon(
-        [restored_param],
+    restored_model_params = [
+        torch.nn.Parameter(param.detach().clone()) for param in model_params
+    ]
+    restored = MixedPrecisionDionMuon(
+        restored_model_params,
         use_triton=False,
         use_polar_express=False,
     )
     restored.load_state_dict(state_dict)
 
     torch.testing.assert_close(
-        restored.state[restored_param]['momentum'],
-        expected,
+        restored.fp32_params[0],
+        optimizer.fp32_params[0],
     )
-    assert 'momentum_buffer' in state_dict['state'][0]
+    torch.testing.assert_close(
+        restored.fp32_params[1],
+        restored_model_params[1].float(),
+    )
 
 
 def test_padding_only_zero1_chunk_has_stable_checkpoint_layout():
@@ -225,10 +246,33 @@ def test_padding_only_zero1_chunk_has_stable_checkpoint_layout():
             use_polar_express=False,
         )
         state_dict = optimizer.state_dict()
-        expected_keys = {'momentum'} if optimizer_type is DionMuon else {'momentum', 'fp32_params'}
-        assert set(state_dict['state']) == {0} and set(state_dict['state'][0]) == expected_keys
-        assert state_dict['param_groups'][0]['params'] == [0] and optimizer.param_groups[0]['params'] == []
+        expected_keys = {'momentum'} if optimizer_type is DionMuon else {
+            'momentum', 'fp32_params'
+        }
+        assert set(state_dict['state']) == {0}
+        assert set(state_dict['state'][0]) == expected_keys
+        assert state_dict['param_groups'][0]['params'] == [0]
+        assert optimizer.param_groups[0]['params'] == []
         optimizer.load_state_dict(deepcopy(state_dict))
+
+
+def test_dion_muon_accepts_flattened_param_group():
+    flat_param, model_params = _make_flattened_param(
+        [torch.zeros(2, 4)],
+        dtype=torch.float32,
+        device='cpu',
+    )
+    optimizer = DionMuon(
+        [{
+            'params': [flat_param],
+            'lr': 0.02
+        }],
+        use_triton=False,
+        use_polar_express=False,
+    )
+
+    assert optimizer.param_groups[0]['lr'] == 0.02
+    assert optimizer.param_groups[0]['params'] == model_params
 
 
 def test_hybrid_optimizer_checkpoint_round_trip():
@@ -273,11 +317,10 @@ def test_hybrid_optimizer_checkpoint_round_trip():
     restored.load_state_dict(state_dict)
 
     restored_dion = restored.optimizers[0]
-    assert all(param.dtype == torch.float32 for param in restored_dion.fp32_params)
-    assert all(
-        restored_dion.state[param]['momentum'].dtype == torch.float32
-        for param in restored_dion.fp32_params
-    )
+    assert all(param.dtype == torch.float32
+               for param in restored_dion.fp32_params)
+    assert all(restored_dion.state[param]['momentum'].dtype == torch.float32
+               for param in restored_dion.fp32_params)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason='CUDA required')
@@ -303,9 +346,9 @@ def test_resume_next_step_matches_uninterrupted_training():
     torch.manual_seed(123)
     grads = [torch.randn_like(param) for param in model_params]
     for param, restored_param, grad in zip(
-        model_params,
-        restored_model_params,
-        grads,
+            model_params,
+            restored_model_params,
+            grads,
     ):
         param.grad = grad.clone()
         restored_param.grad = grad.clone()
