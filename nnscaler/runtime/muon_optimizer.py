@@ -30,7 +30,7 @@ class MuonMixin:
             **kwargs: Additional keyword arguments to pass to the parent optimizer class.
         """
         params = list(params)
-        if not params and flat_map is None:
+        if not params:
             raise ValueError("optimizer got an empty parameter list")
 
         self._flat_map: dict[int, tuple['FlattenParamInfo', list[int]]] = {}
