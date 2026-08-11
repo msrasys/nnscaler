@@ -40,6 +40,10 @@ class MuonMixin:
             params[0]['params'] = self._unflatten_params(params[0]['params'], flat_map)
         else:
             params = self._unflatten_params(params, flat_map)
+
+        # it is possible that the current rank only holds paddings
+        # in this case, we need to create a dummy param group to avoid Muon complaining
+        # about empty param group
         if not params:
             params = [{'params': []}]
 
