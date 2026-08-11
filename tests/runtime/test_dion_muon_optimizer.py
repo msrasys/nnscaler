@@ -93,20 +93,9 @@ def _populate_fp32_state(optimizer):
         )
 
 
-@pytest.mark.parametrize(
-    'device',
-    [
-        'cpu',
-        pytest.param(
-            'cuda',
-            marks=pytest.mark.skipif(
-                not torch.cuda.is_available(),
-                reason='CUDA required',
-            ),
-        ),
-    ],
-)
-def test_mixed_precision_checkpoint_dump_and_load_are_fp32(tmp_path, device):
+@pytest.mark.skipif(not torch.cuda.is_available(), reason='CUDA required')
+def test_mixed_precision_checkpoint_dump_and_load_are_fp32(tmp_path):
+    device = 'cuda'
     torch.manual_seed(0)
     tensors = [torch.randn(4, 8), torch.randn(8, 4)]
     model_params, optimizer = _make_mixed_optimizer(tensors, device)
@@ -162,31 +151,80 @@ def test_mixed_precision_checkpoint_dump_and_load_are_fp32(tmp_path, device):
         torch.testing.assert_close(actual.cpu(), expected.cpu())
 
 
-def test_padding_only_zero1_chunk_has_stable_checkpoint_layout():
+@pytest.mark.skipif(not torch.cuda.is_available(), reason='CUDA required')
+def test_bf16_momentum_is_normalized_to_fp32():
+    tensors = [torch.randn(4, 8), torch.randn(8, 4)]
+    _, optimizer = _make_mixed_optimizer(tensors, 'cuda')
+    _populate_fp32_state(optimizer)
+    state_dict = deepcopy(optimizer.state_dict())
+    state_dict['state'][0]['momentum'] = state_dict['state'][0][
+        'momentum'].bfloat16()
+
+    _, restored = _make_mixed_optimizer(tensors, 'cuda')
+    restored.load_state_dict(state_dict)
+
+    assert all(restored.state[param]['momentum'].dtype == torch.float32
+               for param in restored.fp32_params)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason='CUDA required')
+def test_nonempty_state_without_fp32_params_warns(caplog):
+    tensors = [torch.randn(4, 8), torch.randn(8, 4)]
+    _, optimizer = _make_mixed_optimizer(tensors, 'cuda')
+    _populate_fp32_state(optimizer)
+    state_dict = deepcopy(optimizer.state_dict())
+    state_dict['state'][0].pop('fp32_params')
+
+    _, restored = _make_mixed_optimizer(tensors, 'cuda')
+    restored.load_state_dict(state_dict)
+
+    assert 'fp32_params not found in state_dict' in caplog.text
+    for model_param, fp32_param in zip(restored.f16_params,
+                                       restored.fp32_params):
+        torch.testing.assert_close(fp32_param, model_param.float())
+
+
+@pytest.mark.parametrize(
+    'optimizer_type, device',
+    [
+        (DionMuon, 'cpu'),
+        pytest.param(
+            MixedPrecisionDionMuon,
+            'cuda',
+            marks=pytest.mark.skipif(
+                not torch.cuda.is_available(),
+                reason='CUDA required',
+            ),
+        ),
+    ],
+)
+def test_padding_only_zero1_chunk_has_stable_checkpoint_layout(
+    optimizer_type,
+    device,
+):
     flat_param, _ = _make_flattened_param(
         [torch.zeros(2, 4)],
         dtype=torch.bfloat16,
-        device='cpu',
+        device=device,
         padding=8,
         opt_num_chunks=2,
         opt_chunk_index=1,
     )
 
-    for optimizer_type in (DionMuon, MixedPrecisionDionMuon):
-        optimizer = optimizer_type(
-            [flat_param],
-            use_triton=False,
-            use_polar_express=False,
-        )
-        state_dict = optimizer.state_dict()
-        expected_keys = {'momentum'} if optimizer_type is DionMuon else {
-            'momentum', 'fp32_params'
-        }
-        assert set(state_dict['state']) == {0}
-        assert set(state_dict['state'][0]) == expected_keys
-        assert state_dict['param_groups'][0]['params'] == [0]
-        assert optimizer.param_groups[0]['params'] == []
-        optimizer.load_state_dict(deepcopy(state_dict))
+    optimizer = optimizer_type(
+        [flat_param],
+        use_triton=False,
+        use_polar_express=False,
+    )
+    state_dict = optimizer.state_dict()
+    expected_keys = {'momentum'} if optimizer_type is DionMuon else {
+        'momentum', 'fp32_params'
+    }
+    assert set(state_dict['state']) == {0}
+    assert set(state_dict['state'][0]) == expected_keys
+    assert state_dict['param_groups'][0]['params'] == [0]
+    assert optimizer.param_groups[0]['params'] == []
+    optimizer.load_state_dict(deepcopy(state_dict))
 
 
 def test_dion_muon_accepts_flattened_param_group():
@@ -208,12 +246,13 @@ def test_dion_muon_accepts_flattened_param_group():
     assert optimizer.param_groups[0]['params'] == model_params
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason='CUDA required')
 def test_hybrid_optimizer_checkpoint_round_trip():
     tensors = [torch.randn(4, 8), torch.randn(8, 4)]
     flat_param, _ = _make_flattened_param(
         tensors,
         dtype=torch.bfloat16,
-        device='cpu',
+        device='cuda',
     )
     config = {
         'optimizers': [{
@@ -240,7 +279,7 @@ def test_hybrid_optimizer_checkpoint_round_trip():
     restored_flat_param, _ = _make_flattened_param(
         tensors,
         dtype=torch.bfloat16,
-        device='cpu',
+        device='cuda',
     )
     restored = HybridOptimizer(
         [restored_flat_param],
