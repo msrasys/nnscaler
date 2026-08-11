@@ -1154,6 +1154,7 @@ class ParallelModule(CubeModule):
                     cls.attr_meta_maps.append(attr_meta_map)
                 assert len(cls.attr_meta_maps) == cls.compute_config.plan_ngpus, \
                     f"Expected {cls.compute_config.plan_ngpus} attr_meta_maps, but got {len(cls.attr_meta_maps)}"
+                # this list multiplication is intended
                 cls.attr_meta_maps = cls.attr_meta_maps * cls.compute_config.num_scale_units
         else:
             # for backward compatibility, we will load the attr_meta from each rank's file
