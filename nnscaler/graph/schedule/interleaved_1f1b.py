@@ -156,9 +156,6 @@ def _get_1f1b_rank_ops(
         n_local_stages * pp_group_size + 2 * (pp_group_size - 1 - rank)
     ) - (warmup_ops + rank)
 
-    if enable_zero_bubble:
-        post_warmup_ops = pp_group_size - rank - 1
-
     total_ops = warmup_ops + fwd_bwd_ops + cooldown_ops
 
     backward_op_ids = []

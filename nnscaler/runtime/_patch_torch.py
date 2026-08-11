@@ -107,7 +107,11 @@ if torch.__version__ < (2, 4, 0):
 FBW_SUPPORTED = True
 
 try:
-    from ._patch_torch_pipelining_backend import stage_backward_input, stage_backward_weight
+    from ._patch_torch_pipelining_backend import (
+        stage_backward_input,
+        stage_backward_input_selective,
+        stage_backward_weight,
+    )
 except (ImportError, TypeError) as ex:
     FBW_SUPPORTED = False
     import_error = ex
@@ -123,6 +127,8 @@ except (ImportError, TypeError) as ex:
             "Failed to import stage_backward_weight from torch.distributed. "
             "Please update pytorch(2.5.0+) and/or python(3.10+) to a higher version."
         ) from import_error
+
+    stage_backward_input_selective = stage_backward_input
 
 
 def configure_fbw_runtime() -> None:

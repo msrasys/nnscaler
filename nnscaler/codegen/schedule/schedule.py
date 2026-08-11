@@ -862,8 +862,8 @@ class ScheduleCodeGen(FuncEmission):
         fsign = '{outputs} = nnscaler.runtime.executor.fexecute({name}, {model}, *{inputs}, requires_grad={req_grad})'
         asign = '{outputs} = nnscaler.runtime.executor.aexecute({model}, *{inputs}, requires_grad={req_grad})'
         bsign = '{input_grads} = nnscaler.runtime.executor.backward({name}, {input_tensors}, {output_tensors}, {output_grads})'
-        bi_sign = '{input_grads} = nnscaler.runtime.executor.backward_input({name}, {input_tensors}, {output_tensors}, {output_grads}, model.parameters())'
-        bw_sign = 'nnscaler.runtime.executor.backward_weight({name}, model.parameters())'
+        bi_sign = '{input_grads} = nnscaler.runtime.executor.backward_input({name}, {input_tensors}, {output_tensors}, {output_grads}, {weights})'
+        bw_sign = 'nnscaler.runtime.executor.backward_weight({name}, {weights})'
 
         node_inputs, node_outputs = node.inputs(), node.outputs()
         # the real inputs in gencode
@@ -938,6 +938,12 @@ class ScheduleCodeGen(FuncEmission):
                 output_tensors_str = self.tuple_name(output_tensors, skip_attr=True, prefix_attr='model.')
                 output_grads_str = self.tuple_name(output_grads, skip_attr=True, prefix_attr='model.')
                 segment_name = f"'{self.node_name(unwrap_node.mirror)}'"
+                parameter_names = self._segment_parameter_names(unwrap_node)
+                weights = (
+                    '(' + ', '.join(parameter_names) + ',)'
+                    if parameter_names
+                    else '()'
+                )
                 runs_input = True
                 runs_weight = True
                 if pipeline_action in (
@@ -954,8 +960,12 @@ class ScheduleCodeGen(FuncEmission):
                         input_tensors=input_tensors_str,
                         output_tensors=output_tensors_str,
                         output_grads=output_grads_str,
+                        weights=weights,
                     )
-                    weight_code = bw_sign.format(name=segment_name)
+                    weight_code = bw_sign.format(
+                        name=segment_name,
+                        weights=weights,
+                    )
                     if pipeline_action == PipelineAction.BACKWARD_INPUT:
                         codes = [input_code]
                         runs_weight = False

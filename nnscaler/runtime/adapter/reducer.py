@@ -11,7 +11,12 @@ import torch
 from torch.utils.hooks import RemovableHandle
 
 from nnscaler.runtime.device import DeviceGroup
-from nnscaler.runtime.utils import split_array_min_max, set_fparam_meta, get_grad_dtype, set_grad_dtype
+from nnscaler.runtime.utils import (
+    get_grad_dtype,
+    set_fparam_meta,
+    set_grad_dtype,
+    split_array_min_max,
+)
 from nnscaler.profiler.timer import CudaTimer
 from nnscaler.flags import RuntimeFlag
 from nnscaler.utils import unchecked_fields, first
@@ -119,6 +124,46 @@ def mark_reducer_grad_ready(param: torch.nn.Parameter) -> bool:
         return False
     bucket.mark_grad_ready(param)
     return True
+
+
+@torch.no_grad()
+def defer_reducer_grad(param: torch.Tensor) -> bool:
+    """Declare that this GraphTask defers part or all of ``param``'s gradient.
+
+    Delayed-dWeight custom Functions call this before returning ``None`` for a
+    parameter during the dInput GraphTask.  The parameter's AccumulateGrad hook
+    may still consume ordinary contributions from other paths, but it must not
+    publish the parameter as ready until the scheduled dWeight callback calls
+    :func:`complete_reducer_grad`.
+
+    ``param`` may be a view/alias used by a custom kernel.  Follow only its
+    short autograd chain to registered reducer leaves; this covers per-head
+    reshapes and IdentityAllreduce aliases without scanning the model graph.
+    """
+    pending = [param.grad_fn] if param.grad_fn is not None else []
+    if isinstance(param, torch.nn.Parameter) and param.is_leaf:
+        pending.append(param)
+    visited = set()
+    found = False
+    while pending:
+        node = pending.pop()
+        if node is None or id(node) in visited:
+            continue
+        visited.add(id(node))
+        leaf = node if isinstance(node, torch.nn.Parameter) else getattr(
+            node, "variable", None
+        )
+        if isinstance(leaf, torch.nn.Parameter):
+            bucket = _get_reducer_bucket(leaf)
+            if bucket is not None:
+                bucket.defer_grad(leaf)
+                found = True
+            continue
+        pending.extend(
+            next_node for next_node, _ in getattr(node, "next_functions", ())
+            if next_node is not None
+        )
+    return found
 
 
 @torch.no_grad()
@@ -389,6 +434,11 @@ class Bucket:
         # function returns None; it consumes this marker and performs the
         # normal reducer completion lifecycle exactly once.
         self._manual_grad_pending: Set[torch.nn.Parameter] = set()
+        # Parameters whose current GraphTask has delayed dWeight work.  Unlike
+        # _manual_grad_pending, this marker explicitly suppresses async-ready:
+        # scheduled W completes the contribution later.  This mirrors
+        # Megatron's skip_backward_post_hook/backward_dw lifecycle.
+        self._deferred_grad_pending: Set[torch.nn.Parameter] = set()
         self._hooks: List[Tuple[Any, RemovableHandle]] = []
 
         self._async: bool = async_op
@@ -540,9 +590,11 @@ class Bucket:
             rank = torch.distributed.get_rank()
             manually_accumulated = param in self._manual_grad_pending
             self._manual_grad_pending.discard(param)
+            deferred = param in self._deferred_grad_pending
+            self._deferred_grad_pending.discard(param)
             # TODO: need to handle sparse gradients in torch.nn.Embedding
             if param.grad is None:
-                if not manually_accumulated:
+                if not manually_accumulated and not deferred:
                     raise RuntimeError(
                         "Reducer AccumulateGrad hook received no gradient. If a custom "
                         "autograd function computes this gradient manually, call "
@@ -583,7 +635,7 @@ class Bucket:
             if RuntimeFlag.skip_reducer: return
 
             # perform all-reduce
-            if self._async:
+            if self._async and not deferred:
                 self._mark_async_param_ready(param)
 
         for param in self._params:
@@ -674,11 +726,19 @@ class Bucket:
         self._manual_grad_pending.add(param)
 
     @torch.no_grad()
+    def defer_grad(self, param: torch.nn.Parameter):
+        """Keep this GraphTask's reducer contribution pending until W."""
+        if param not in self._pofset:
+            raise ValueError("Parameter is not owned by this reducer bucket.")
+        self._deferred_grad_pending.add(param)
+
+    @torch.no_grad()
     def complete_manual_grad(self, param: torch.nn.Parameter):
         """Finish a direct reducer-buffer contribution outside autograd."""
         if param not in self._pofset:
             raise ValueError("Parameter is not owned by this reducer bucket.")
         self._manual_grad_pending.discard(param)
+        self._deferred_grad_pending.discard(param)
         if self._z3:
             self._reducer.postevict_param(param)
         if not RuntimeFlag.skip_reducer and self._async:
@@ -872,6 +932,7 @@ class Bucket:
         self._async_handle = None
         self._async_seen_param_cnt = {p: 0 for p in self._params}
         self._manual_grad_pending.clear()
+        self._deferred_grad_pending.clear()
 
     def sleep(self):
         """
@@ -930,6 +991,7 @@ class Bucket:
         state.pop(fields._pre_hooks, None)
         state.pop(fields._post_hooks, None)
         state.pop(fields._manual_grad_pending, None)
+        state.pop(fields._deferred_grad_pending, None)
 
         # remove reducer reference
         state.pop(fields._reducer, None)
@@ -945,6 +1007,7 @@ class Bucket:
         bucket.__dict__.update(state)
         bucket._reducer = reducer
         bucket._manual_grad_pending = set()
+        bucket._deferred_grad_pending = set()
         set_fparam_meta(bucket._param_for_optimizer, bucket._flatten_param_info)
 
         for param in bucket._params:

@@ -55,6 +55,71 @@ def test_split_backward_matches_full_backward():
     Executor.check_clear()
 
 
+def test_selective_split_defers_only_registered_weight_work():
+    class SelectiveLinearFunction(torch.autograd.Function):
+        @staticmethod
+        def forward(ctx, input_tensor, weight):
+            ctx.save_for_backward(input_tensor, weight)
+            return input_tensor @ weight.t()
+
+        @staticmethod
+        def backward(ctx, output_grad):
+            input_tensor, weight = ctx.saved_tensors
+            input_grad = output_grad @ weight
+            if RuntimeFlag.fbw_phase == "input":
+                weight_grad = output_grad.t() @ input_tensor
+
+                def backward_dw(weight=weight, weight_grad=weight_grad):
+                    return ((weight, weight_grad),)
+
+                RuntimeFlag.defer_fbw_weight_task(backward_dw, (weight,))
+                return input_grad, None
+            return input_grad, output_grad.t() @ input_tensor
+
+    class SelectiveLinear(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.randn(16, 8, dtype=torch.float64))
+            self.bias = torch.nn.Parameter(torch.randn(16, dtype=torch.float64))
+
+        def forward(self, input_tensor):
+            return SelectiveLinearFunction.apply(input_tensor, self.weight) + self.bias
+
+    torch.manual_seed(31)
+    reference = SelectiveLinear()
+    actual = SelectiveLinear()
+    actual.load_state_dict(reference.state_dict())
+    input_data = torch.randn(4, 8, dtype=torch.float64)
+    output_grad = torch.randn(4, 16, dtype=torch.float64)
+
+    reference_input = input_data.clone().requires_grad_()
+    reference(reference_input).backward(output_grad)
+
+    previous = RuntimeFlag.fbw_accumulate_undeferred_grads
+    RuntimeFlag.fbw_accumulate_undeferred_grads = True
+    try:
+        actual_input = input_data.clone().requires_grad_()
+        output = Executor.fexecute("selective_linear", actual, actual_input)
+        input_grad = Executor.backward_input(
+            "selective_linear",
+            [actual_input],
+            [output],
+            [output_grad],
+            actual.parameters(),
+        )
+
+        torch.testing.assert_close(input_grad, reference_input.grad)
+        torch.testing.assert_close(actual.bias.grad, reference.bias.grad)
+        assert actual.weight.grad is None
+
+        Executor.backward_weight("selective_linear", actual.parameters())
+        torch.testing.assert_close(actual.weight.grad, reference.weight.grad)
+        torch.testing.assert_close(actual.bias.grad, reference.bias.grad)
+        Executor.check_clear()
+    finally:
+        RuntimeFlag.fbw_accumulate_undeferred_grads = previous
+
+
 def test_split_backward_groups_bridge_shared_parameter_paths():
     class BridgedParameters(torch.nn.Module):
         def __init__(self):

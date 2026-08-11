@@ -100,6 +100,11 @@ class RuntimeFlag:
     # dInput pass. Each callback computes dWeight directly from the tensors it
     # retained during dInput, without traversing the model graph a second time.
     fbw_deferred_tasks: list[Callable[[], Any]] | None = None
+    # Megatron-style selective dWeight deferral. Ordinary parameter gradients
+    # are accumulated by the dInput GraphTask; only custom Functions that call
+    # ``defer_fbw_weight_task`` leave work for the scheduled dWeight phase.
+    # The generic NNScaler graph-splitting path remains the default.
+    fbw_accumulate_undeferred_grads: bool = False
 
     @classmethod
     def defer_fbw_weight_task(

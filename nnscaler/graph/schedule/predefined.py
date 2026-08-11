@@ -392,10 +392,10 @@ class PredefinedSched:
     ) -> SchedulePlan:
         """Interleaved ZB1P schedule with F/I/W actions in every phase.
 
-        Compared with interleaved 1F1B, each rank starts input backward after
-        one rather than two warmup forwards per remaining physical stage.
-        Weight backward is delayed by ``rank`` input-backward actions and fills
-        otherwise idle slots through steady state and cooldown.
+        Keep the same warmup as Megatron's interleaved 1F1B schedule so that an
+        input backward is not issued before its downstream gradient can be
+        ready. Weight backward is delayed by ``rank`` input-backward actions
+        and fills otherwise idle slots through steady state and cooldown.
         """
         if num_microbatches <= 0:
             raise ValueError(
@@ -452,7 +452,7 @@ class PredefinedSched:
         for rank, devices in enumerate(device_groups):
             warmup_ops = min(
                 (n_local_stages - 1) * microbatches_per_round
-                + pp_group_size - 1 - rank,
+                + 2 * (pp_group_size - 1 - rank),
                 microbatch_ops,
             )
             fwd_bwd_ops = microbatch_ops - warmup_ops

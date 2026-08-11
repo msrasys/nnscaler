@@ -12,7 +12,13 @@ from typing import Tuple, Any, Callable, List, Dict, Iterable, Optional
 import torch
 import logging
 
-from ._patch_torch import stage_backward_input, stage_backward_weight
+from nnscaler.flags import RuntimeFlag
+
+from ._patch_torch import (
+    stage_backward_input,
+    stage_backward_input_selective,
+    stage_backward_weight,
+)
 from ._patch_torch_checkpoint import ReusableGraphExecGroup
 
 _logger = logging.getLogger(__name__)
@@ -405,7 +411,10 @@ class Executor:
                     dedup_output_tensor_grads,
                 )
 
-        if not detached_inputs:
+        if (
+            not detached_inputs
+            and not RuntimeFlag.fbw_accumulate_undeferred_grads
+        ):
             Executor._weight_backward_states.setdefault(name, []).append(
                 _WeightBackwardState(
                     output_tensors=tuple(dedup_output_tensors),
@@ -422,12 +431,19 @@ class Executor:
         completed = False
         try:
             with graph_exec_group if graph_exec_group is not None else nullcontext():
-                grads, param_groups = stage_backward_input(
-                    dedup_output_tensors,
-                    dedup_output_tensor_grads,
-                    detached_inputs,
-                    iter(weights),
-                )
+                if RuntimeFlag.fbw_accumulate_undeferred_grads:
+                    grads, param_groups = stage_backward_input_selective(
+                        dedup_output_tensors,
+                        dedup_output_tensor_grads,
+                        detached_inputs,
+                    )
+                else:
+                    grads, param_groups = stage_backward_input(
+                        dedup_output_tensors,
+                        dedup_output_tensor_grads,
+                        detached_inputs,
+                        iter(weights),
+                    )
             completed = True
         finally:
             if graph_exec_group is not None and not completed:

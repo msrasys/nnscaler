@@ -22,6 +22,8 @@ from nnscaler.flags import CompileFlag
 from nnscaler.runtime.adapter.reducer import (
     Reducer,
     accumulate_reducer_grad,
+    complete_reducer_grad,
+    defer_reducer_grad,
     get_reducer_grad_accumulator,
     has_reducer_grad_accumulator,
     mark_reducer_grad_ready,
@@ -201,6 +203,19 @@ class _ManualReducerGrad(torch.autograd.Function):
             assert accumulate_reducer_grad(param, grad, offset)
         assert mark_reducer_grad_ready(param)
         return None, None
+
+
+class _DeferredReducerGrad(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, param):
+        ctx.save_for_backward(param)
+        return param.sum()
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        param, = ctx.saved_tensors
+        assert defer_reducer_grad(param)
+        return None
 
 
 @mock_reducer_env(0, 8)
@@ -411,6 +426,86 @@ def test_manual_grad_combines_with_regular_autograd_path_before_async_ready():
     bucket._launch_async_reduce.assert_called_once_with()
     assert bucket._async_param_cnt == 1
     assert param.grad is None
+
+
+@mock_reducer_env(0, 2)
+def test_deferred_grad_waits_for_scheduled_weight_completion():
+    param = torch.nn.Parameter(torch.zeros(2))
+    reducer = Reducer([0, 1], async_op=True)
+    reducer.add_param(param)
+    reducer.build_buckets()
+    bucket = reducer.buckets[0]
+    bucket._launch_async_reduce = Mock()
+
+    _DeferredReducerGrad.apply(param).backward()
+
+    bucket._launch_async_reduce.assert_not_called()
+    assert bucket._async_param_cnt == 0
+    assert param.grad is None
+
+    assert accumulate_reducer_grad(param, torch.tensor([1.0, 2.0]))
+    assert complete_reducer_grad(param)
+
+    bucket._launch_async_reduce.assert_called_once_with()
+    assert bucket._async_param_cnt == 1
+
+
+@mock_reducer_env(0, 2)
+def test_deferred_grad_accumulates_native_paths_without_publishing_ready():
+    param = torch.nn.Parameter(torch.zeros(2))
+    reducer = Reducer([0, 1], async_op=True)
+    reducer.add_param(param)
+    reducer.build_buckets()
+    bucket = reducer.buckets[0]
+    bucket._launch_async_reduce = Mock()
+
+    loss = _DeferredReducerGrad.apply(param) + (param * 3.0).sum()
+    loss.backward()
+
+    offset = bucket._pofset[param]
+    torch.testing.assert_close(
+        bucket._contiguous_grads[offset:offset + param.numel()],
+        torch.tensor([3.0, 3.0]),
+    )
+    bucket._launch_async_reduce.assert_not_called()
+    assert bucket._async_param_cnt == 0
+
+    assert accumulate_reducer_grad(param, torch.tensor([1.0, 2.0]))
+    assert complete_reducer_grad(param)
+    torch.testing.assert_close(
+        bucket._contiguous_grads[offset:offset + param.numel()],
+        torch.tensor([4.0, 5.0]),
+    )
+    bucket._launch_async_reduce.assert_called_once_with()
+
+
+@mock_reducer_env(0, 2)
+def test_deferred_grad_resolves_parameter_through_view_alias():
+    param = torch.nn.Parameter(torch.zeros(2, 2))
+    reducer = Reducer([0, 1], async_op=True)
+    reducer.add_param(param)
+    reducer.build_buckets()
+    bucket = reducer.buckets[0]
+    bucket._launch_async_reduce = Mock()
+
+    class DeferredViewGrad(torch.autograd.Function):
+        @staticmethod
+        def forward(ctx, weight_view):
+            ctx.save_for_backward(weight_view)
+            return weight_view.sum()
+
+        @staticmethod
+        def backward(ctx, grad_output):
+            weight_view, = ctx.saved_tensors
+            assert defer_reducer_grad(weight_view)
+            return None
+
+    DeferredViewGrad.apply(param.view(4)).backward()
+
+    bucket._launch_async_reduce.assert_not_called()
+    assert accumulate_reducer_grad(param, torch.ones_like(param))
+    assert complete_reducer_grad(param)
+    bucket._launch_async_reduce.assert_called_once_with()
 
 
 @mock_reducer_env(0, 2)

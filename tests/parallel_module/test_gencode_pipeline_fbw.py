@@ -59,6 +59,18 @@ def test_pipeline_codegen_emits_split_backward(tmp_path, pipeline_scheduler):
             tmp_path,
             PPModule1,
             rank,
+            r'backward_(input|weight)\([^\n]*model\.parameters\(\)',
+        )
+        assert _gencode_contains(
+            tmp_path,
+            PPModule1,
+            rank,
+            r'backward_(input|weight)\([^\n]*\(model\.[^\n]+,\)\)',
+        )
+        assert not _gencode_contains(
+            tmp_path,
+            PPModule1,
+            rank,
             r'nnscaler\.runtime\.executor\.backward\(',
         )
 

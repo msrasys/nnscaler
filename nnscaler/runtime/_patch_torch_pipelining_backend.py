@@ -340,6 +340,55 @@ def _autograd_grad_for_inputs(
     return tuple(result)
 
 
+def stage_backward_input_selective(
+    stage_outputs_or_loss: list[torch.Tensor],
+    output_grads: list[torch.Tensor] | None,
+    input_values: list[Any],
+) -> tuple[tuple[torch.Tensor | None, ...], list[dict[str, Any]]]:
+    """Run dInput while deferring only explicitly registered dWeight work.
+
+    This follows Megatron's delayed-wgrad model: the ordinary backward owns
+    small/native parameter gradients, while phase-aware Linear/MoE Functions
+    retain their operands and register a direct ``backward_dw``-style task.
+    It avoids discovering and retaining the full autograd graph in Python for
+    every microbatch.
+    """
+    valid_outputs: list[torch.Tensor] = []
+    valid_output_grads: list[torch.Tensor | None] = []
+    for i, stage_output in enumerate(stage_outputs_or_loss):
+        if not stage_output.requires_grad and stage_output.grad_fn is None:
+            continue
+        valid_outputs.append(stage_output)
+        valid_output_grads.append(
+            torch.ones_like(stage_output) if output_grads is None else output_grads[i]
+        )
+
+    for input_value in input_values:
+        if isinstance(input_value, torch.Tensor) and input_value.requires_grad:
+            input_value.retain_grad()
+
+    deferred_tasks: list = []
+    if valid_outputs:
+        with _fbw_phase("input", deferred_tasks):
+            torch.autograd.backward(
+                valid_outputs,
+                grad_tensors=valid_output_grads,
+            )
+
+    dinputs = tuple(
+        input_value.grad
+        if isinstance(input_value, torch.Tensor) and input_value.requires_grad
+        else None
+        for input_value in input_values
+    )
+    return dinputs, [{
+        "params": set(),
+        "intermediates": [],
+        "grads": [],
+        "deferred_tasks": deferred_tasks,
+    }]
+
+
 def stage_backward_input(
     stage_outputs_or_loss: list[torch.Tensor],
     output_grads: list[torch.Tensor] | None,

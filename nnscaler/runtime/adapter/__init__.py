@@ -7,6 +7,7 @@ from nnscaler.runtime.adapter import nn
 from nnscaler.runtime.adapter.reducer import (
     Reducer,
     accumulate_reducer_grad,
+    defer_reducer_grad,
     has_reducer_grad_accumulator,
     mark_reducer_grad_ready,
 )
