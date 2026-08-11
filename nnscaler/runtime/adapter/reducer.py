@@ -349,7 +349,6 @@ class Bucket:
         self._async_expected_param_cnt: Dict[torch.nn.Parameter, int] = {p: 1 for p in self._params}
         self._async_seen_param_cnt: Dict[torch.nn.Parameter, int] = {p: 0 for p in self._params}
         self._async_expected_total: int = len(self._params)
-        self._async_record_param_counts: Optional[Dict[torch.nn.Parameter, int]] = None
         # Parameters whose custom autograd function accumulated gradients
         # directly into this bucket. AccumulateGrad still runs when that
         # function returns None; it consumes this marker and performs the
@@ -546,7 +545,6 @@ class Bucket:
                 # let's add it for safety
                 self._reducer.postevict_param(param)
 
-            self._record_async_grad_contribution(param)
             if RuntimeFlag.skip_reducer: return
 
             # perform all-reduce
@@ -708,11 +706,6 @@ class Bucket:
         expected = self._async_expected_param_cnt.get(param, 1)
         seen = self._async_seen_param_cnt.get(param, 0) + 1
         self._async_seen_param_cnt[param] = seen
-        if expected == 0:
-            raise RuntimeError(
-                "Detected an unexpected async reducer gradient contribution "
-                "for a parameter recorded as unused in split backward."
-            )
         self._async_param_cnt += 1
 
         if seen > expected or self._async_param_cnt > self._async_expected_total:
@@ -760,34 +753,11 @@ class Bucket:
         self._async_expected_param_cnt = {}
         for param in self._params:
             count = int(param_counts.get(param, 1))
-            if count < 0:
-                raise ValueError(
-                    f"Expected non-negative async grad contribution count for {param}, "
-                    f"got {count}"
-                )
+            if count <= 0:
+                raise ValueError(f"Expected positive async grad contribution count for {param}, got {count}")
             self._async_expected_param_cnt[param] = count
         self._async_expected_total = sum(self._async_expected_param_cnt.values())
         self.reset()
-
-    def _record_async_grad_contribution(self, param: torch.nn.Parameter):
-        if self._async_record_param_counts is None:
-            return
-        self._async_record_param_counts[param] = (
-            self._async_record_param_counts.get(param, 0) + 1
-        )
-
-    def begin_record_async_hook_counts(self):
-        """Record split-backward contribution counts for the async reducer."""
-        if self._async:
-            self._async_record_param_counts = {param: 0 for param in self._params}
-
-    def end_record_async_hook_counts(self):
-        """Use recorded split-backward counts for the final async reduction."""
-        if not self._async or self._async_record_param_counts is None:
-            return
-        param_counts = self._async_record_param_counts
-        self._async_record_param_counts = None
-        self.set_async_grad_expected_counts(param_counts)
 
     def gather_params(self):
         """
