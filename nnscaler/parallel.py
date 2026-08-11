@@ -2728,6 +2728,8 @@ def _broadcast_gen_files(
     # wait for all nodes to finish
     torch.distributed.barrier()
 
+    logger.info('Files broadcasted.')
+
 
 def _collect_dedup_info(parallel_modules: Dict[str, ParallelModule]) -> Tuple[
     Dict[int, Dict[str, Dict[str, AttrMeta]]],

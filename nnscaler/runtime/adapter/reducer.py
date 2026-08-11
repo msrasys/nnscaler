@@ -599,7 +599,15 @@ class Bucket:
             if CudaTimer().enabled and CudaTimer().predefined:
                 _logger.warning(
                     f'CudaTimer: the communication time of async reducer will not be recorded in `comm`')
-            assert self._async_handle is not None
+            if self._async_handle is None:
+                raise RuntimeError(
+                    "The async reducer's asynchronous gradient synchronization was never triggered, "
+                    "which means no gradient was produced for the parameters in this reducer on this step. "
+                    "This usually happens when some parameters are not used, "
+                    "or are used outside a `torch.enable_grad` context, in the forward pass. "
+                    "Please make sure every parameter in this reducer is used under `torch.enable_grad` "
+                    "in EVERY forward pass, or disable the async reducer."
+                )
             self._async_handle.wait()
         else:
             CudaTimer().start('comm', predefined=True)

@@ -135,6 +135,11 @@ def mixed1_worker(save_dir, config_file):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.device_count() < 4, reason='lack of gpu devices')
-@pytest.mark.parametrize('config_file', ['trainer_args_mixed1.yaml', 'trainer_args_mixed2.yaml', 'trainer_args_mixed3.yaml'])
+@pytest.mark.parametrize('config_file', [
+    'trainer_args_mixed1.yaml',
+    'trainer_args_mixed2.yaml',
+    'trainer_args_mixed3.yaml',
+    'trainer_args_mixed3_async.yaml',
+])
 def test_mixed1(tmp_path, config_file):
     launch_torchrun(4, mixed1_worker, tmp_path, config_file)
