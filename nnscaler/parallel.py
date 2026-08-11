@@ -725,6 +725,7 @@ def _prepare_and_check_reusable(
                 logger.info(f'Output directory {outdir} is not empty. '
                             f'But no python source code is present. '
                             f'Will reuse the directory and the graph dump if present.')
+                _clean_old_attr_map_files()
                 # we have to trace the graph again if not all meta files are present.
                 if not all([meta_file.exists() for meta_file in trace_meta_files]):
                     _clean_files(outdir)
