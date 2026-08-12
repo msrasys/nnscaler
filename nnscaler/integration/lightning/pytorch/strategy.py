@@ -270,7 +270,10 @@ class NnScalerStrategy(ParallelStrategy):
         setattr(model, self._pmodule_attr_name, pmodule)
         model.to(self.root_device)
         # rewrite model forward to parallelized model forward
-        model.forward = pmodule.forward
+        # note that we use __call__ so we can trigger the forward hooks of the original model
+        def _forward(self, *args, **kwargs):
+            return pmodule(*args, **kwargs)
+        model.forward = types.MethodType(_forward, model)
 
         # patch log function to add sync_dist_group
         _, sync_group = self.compute_config.get_sync_group()

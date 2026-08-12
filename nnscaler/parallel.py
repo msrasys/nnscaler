@@ -1698,8 +1698,9 @@ def build_optimizer(
         )
     else:
         optimizer: torch.optim.Optimizer = optimizer_fn(_local_parameters(module), **kwargs)
-    object.__setattr__(module, _SYNC_GRAD_REQUIRED_ATTR, False)
-    module.register_forward_hook(_mark_sync_grad_required)
+    if not isinstance(module, ParallelModule):
+        object.__setattr__(module, _SYNC_GRAD_REQUIRED_ATTR, False)
+        module.register_forward_hook(_mark_sync_grad_required)
     optimizer._non_parallel_module_reducer = non_parallel_module_reducer
     optimizer._extra_state = OptimizerExtraState(
             rank=torch.distributed.get_rank(),
@@ -1767,10 +1768,13 @@ def build_optimizer(
     optimizer.load_state_dict = types.MethodType(_patched_load_state_dict, optimizer)
 
     def _sync_grad_required():
+        if isinstance(module, ParallelModule):
+            return module._sync_grad_required
         return getattr(module, _SYNC_GRAD_REQUIRED_ATTR, False)
 
     def _reset_sync_grad_required():
-        setattr(module, _SYNC_GRAD_REQUIRED_ATTR, False)
+        if not isinstance(module, ParallelModule):
+            setattr(module, _SYNC_GRAD_REQUIRED_ATTR, False)
 
     def _sync_shard_grad(self):
         with _runtime_flags(skip_reducer=False):
