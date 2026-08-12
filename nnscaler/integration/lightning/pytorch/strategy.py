@@ -270,7 +270,7 @@ class NnScalerStrategy(ParallelStrategy):
         setattr(model, self._pmodule_attr_name, pmodule)
         model.to(self.root_device)
         # rewrite model forward to parallelized model forward
-        # note that we use __call__ so we can trigger the forward hooks of the original model
+        # note that we use __call__ so we can trigger the forward hooks of `pmodule`
         def _forward(self, *args, **kwargs):
             return pmodule(*args, **kwargs)
         model.forward = types.MethodType(_forward, model)
