@@ -329,6 +329,58 @@ def test_conditional_parallel_module_sync(tmp_path):
         assert_equal(state, active_only_states[index])
 
 
+def rank_dependent_parallel_module_worker(save_dir):
+    config_path = str(Path(__file__).with_name('trainer_args_mixed3.yaml').resolve())
+    parallel_module_args = []
+    for index, module_type in enumerate([
+        'tests.cli.common.MixModuleMLP',
+        'tests.cli.common.MixModuleMLP2',
+    ]):
+        prefix = f'--model.parallel_modules.{index}'
+        parallel_module_args.extend([
+            f'{prefix}.type', module_type,
+            f'{prefix}.args.dim', '16',
+            f'{prefix}.args.nlayers', '16',
+            f'{prefix}.forward_args_gen_fn', 'tests.cli.common.forward_args_gen_fn',
+        ])
+
+    trainer = Trainer([
+        '-f', config_path,
+        '--compute_config.plan_ngpus', '1',
+        '--compute_config.runtime_ngpus', '2',
+        '--compute_config.reducer_none_grad', 'true',
+        '--max_epochs', '1',
+        '--max_train_steps', '1',
+        '--dataset.type', 'tests.cli.common.BranchedSimpleDataset',
+        '--dataset.train_args.size', '8',
+        '--dataset.val_args.size', '4',
+        '--enable_progress_bar', 'false',
+        '--gen_savedir', str(Path(save_dir) / 'gen'),
+        '--checkpoint.no_save', 'true',
+        *parallel_module_args,
+    ])
+    trainer.run()
+
+    optimizer_state = trainer.optimizer.state_dict()['state']
+    for prefix in ('mlp0', 'mlp1'):
+        location = trainer.optimizer._extra_state.parallel_module_locs[prefix]
+        assert all(
+            index in optimizer_state
+            for index in range(location.offset, location.offset + location.count)
+        )
+
+    return {
+        prefix: [param.detach().cpu().clone() for param in getattr(trainer.model, prefix).parameters()]
+        for prefix in ('mlp0', 'mlp1')
+    }
+
+
+@pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.device_count() < 2, reason='lack of gpu devices')
+def test_rank_dependent_parallel_module_sync(tmp_path):
+    results = launch_torchrun(2, rank_dependent_parallel_module_worker, tmp_path)
+    assert_equal(results[0], results[1])
+
+
 def conditional_parallel_module_switch_worker(save_dir, resume_from_merged):
     save_dir = Path(save_dir)
     run_name = 'merged_resume' if resume_from_merged else 'sharded_resume'

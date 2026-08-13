@@ -1794,9 +1794,22 @@ def build_optimizer(
         with _runtime_flags(skip_reducer=False):
             if _sync_grad_required():
                 _reset_sync_grad_required()  # reentrant safe
-                for m in parallel_modules:
+
+                sync_activity = torch.tensor(
+                    [m._sync_grad_required for m in parallel_modules],
+                    dtype=torch.int32,
+                    device=torch.cuda.current_device(),
+                )
+                torch.distributed.all_reduce(sync_activity, op=torch.distributed.ReduceOp.MAX)
+
+                # TODO: Async reducers and ZeRO-3 issue collectives from backward hooks,
+                # before activity can be synchronized here. They still require every
+                # parameter to be used on every rank.
+                for m, active in zip(parallel_modules, sync_activity.tolist()):
+                    m._sync_grad_required = bool(active)
                     m.sync_grad()
 
+                # always sync non-parallel module reducer.
                 if non_parallel_module_reducer:
                     non_parallel_module_reducer.sync_grads()
 
