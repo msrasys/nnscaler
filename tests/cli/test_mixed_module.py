@@ -498,3 +498,74 @@ def reducer_none_grad_partial_bucket_worker(save_dir):
 @pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.device_count() < 2, reason='lack of gpu devices')
 def test_reducer_none_grad_partial_bucket_raises(tmp_path):
     launch_torchrun(2, reducer_none_grad_partial_bucket_worker, tmp_path)
+
+
+def reducer_none_grad_checkpoint_worker(save_dir, resume_from_merged):
+    run_name = 'merged_resume' if resume_from_merged else 'sharded_resume'
+    run_dir = Path(save_dir) / run_name
+    config_path = str(Path(__file__).with_name('trainer_args_mixed3.yaml').resolve())
+    common_args = [
+        '-f', config_path,
+        '--compute_config.plan_ngpus', '1',
+        '--compute_config.runtime_ngpus', '2',
+        '--dataset.train_args.size', '8',
+        '--dataset.val_args.size', '4',
+        '--enable_progress_bar', 'false',
+        '--gen_savedir', str(run_dir / 'gen'),
+        '--checkpoint.save_type', 'sharded',
+        '--checkpoint.save_dir', str(run_dir / 'ckpt'),
+        '--model.non_parallel_params_reducer_config.reducer_none_grad', 'true',
+        '--optimizer.param_clss_fn', 'tests.cli.test_mixed_module.branch_param_clss_fn',
+    ]
+
+    trainer = Trainer([
+        *common_args,
+        '--max_epochs', '1',
+        '--max_train_steps', '1',
+        '--dataset.type', 'tests.cli.test_mixed_module.FirstBranchDataset',
+    ])
+    trainer.run()
+    torch.distributed.barrier()
+    if trainer.rank == 0:
+        Trainer.merge_checkpoint(
+            list((run_dir / 'ckpt' / 'last').glob('*.ckpt')),
+            run_dir / 'branch1.pt',
+        )
+    torch.distributed.barrier()
+
+    trainer = Trainer([
+        *common_args,
+        '--max_epochs', '2',
+        '--max_train_steps', '2',
+        '--dataset.type', 'tests.cli.test_mixed_module.SecondBranchDataset',
+        '--checkpoint.resume_from.checkpoint',
+        str(run_dir / 'branch1.pt') if resume_from_merged else 'last',
+    ])
+    trainer.run()
+    torch.distributed.barrier()
+    if trainer.rank == 0:
+        Trainer.merge_checkpoint(
+            list((run_dir / 'ckpt' / 'last').glob('*.ckpt')),
+            run_dir / 'result.pt',
+        )
+    torch.distributed.barrier()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.device_count() < 2, reason='lack of gpu devices')
+def test_reducer_none_grad_checkpoint_roundtrip(tmp_path):
+    launch_torchrun(2, reducer_none_grad_checkpoint_worker, tmp_path, False)
+    launch_torchrun(2, reducer_none_grad_checkpoint_worker, tmp_path, True)
+
+    sharded_resume = torch.load(tmp_path / 'sharded_resume' / 'result.pt', weights_only=False)
+    merged_resume = torch.load(tmp_path / 'merged_resume' / 'result.pt', weights_only=False)
+    assert_equal(sharded_resume['model'], merged_resume['model'])
+    assert_equal(sharded_resume['optimizer'], merged_resume['optimizer'])
+
+    branch1 = torch.load(tmp_path / 'merged_resume' / 'branch1.pt', weights_only=False)
+    original_module = BranchedMixedModule(dim=16, nlayers=16)
+    branch2_state_indices = {
+        index for index, (name, _) in enumerate(original_module.named_parameters())
+        if name.startswith('mlp1.')
+    }
+    assert branch2_state_indices.isdisjoint(branch1['optimizer']['state'])
+    assert branch2_state_indices.issubset(merged_resume['optimizer']['state'])
