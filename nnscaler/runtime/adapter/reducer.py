@@ -236,16 +236,32 @@ class FlattenParamInfo:
         return tensors
 
 
-@dataclass(frozen=True)
-class ParamZeroConfig:
-    zero_param_level_sharding: Optional[bool] = None
+@dataclass(frozen=True, order=True)
+class ParamBucketConfig:
+    """Per-bucket reducer overrides. ``None`` inherits the reducer-level setting."""
 
-    def resolve(self, zero: int, zero_param_level_sharding: bool):
-        return ParamZeroConfig(
+    zero_param_level_sharding: Optional[bool] = None
+    use_async_reducer: Optional[bool] = None
+    use_none_grad: Optional[bool] = None
+
+    def resolve(
+        self,
+        zero: int,
+        zero_param_level_sharding: bool,
+        use_async_reducer: bool,
+        use_none_grad: bool,
+    ):
+        return ParamBucketConfig(
             zero_param_level_sharding=zero > 0 and (zero_param_level_sharding
                 if self.zero_param_level_sharding is None
                 else self.zero_param_level_sharding
-            )
+            ),
+            use_async_reducer=use_async_reducer
+                if self.use_async_reducer is None
+                else self.use_async_reducer,
+            use_none_grad=use_none_grad
+                if self.use_none_grad is None
+                else self.use_none_grad,
         )
 
 
@@ -855,14 +871,16 @@ class Reducer:
                 which is `_DEFAULT_BUCKET_CAP_MB` for async reducer, and no limit for sync reducer.
                 Default is `None`
             reduce_op (str): reduce operation, can be 'sum', 'avg', 'max' or 'min' (default 'sum')
-            async_op (bool): whether to overlap with backward computation (default False)
+            async_op (bool): default value for whether buckets overlap reduction with backward computation
+                (default False). ``ParamBucketConfig.use_async_reducer`` can override it per bucket.
             zero (int): whether to use zero optimization on gradients, currently only 0/1/3 are supported
                 zero=2 will be treated as zero=3
             zero_ngroups (int): number of ZeRO subgroups in the original ZeRO group
             zero_use_reduce_scatter (bool): whether to use reduce scatter for zero optimization
             zero_param_level_sharding (bool): whether to use parameter-level sharding in ZeRO
                 This flag is required when use parameter-level optimizers(like Muon)
-            use_none_grad (bool): whether a bucket unused on all ranks keeps a ``None`` gradient
+            use_none_grad (bool): default value for whether a bucket unused on all ranks keeps a ``None``
+                gradient. ``ParamBucketConfig.use_none_grad`` can override it per bucket.
             align_size (int): the alignment size in bytes for each parameter
             nreplicas (int): divisor applied to gradients after all-reduce.
                 For replicated weights where each rank already has the full gradient,
@@ -1072,34 +1090,45 @@ class Reducer:
         parameter-level sharding needs a larger bucket to keep at least one
         parameter per zero rank, which means zero parameter-level sharding config has higher priority
         than max_bucket_size_bytes.
+
+        Parameters with different resolved ``ParamBucketConfig`` values are placed in different buckets.
         """
         if self._buckets:
             raise RuntimeError("Buckets have already been built, cannot build again.")
 
-        self._param_clss: dict[torch.nn.Parameter, Union[
-            tuple[int, int, ParamZeroConfig],
-            tuple[int, ParamZeroConfig],
-            tuple[ParamZeroConfig],
-        ]] = {}
+        self._param_clss: dict[
+            torch.nn.Parameter,
+            tuple[tuple[int, ...], ParamBucketConfig],
+        ] = {}
         if param_clss:
+            default_param_config = ParamBucketConfig().resolve(
+                self._zero,
+                self._zero_param_level_sharding,
+                self._async,
+                self._use_none_grad,
+            )
+
             def _fix_param_cls(x: 'PARAM_CLASS_TYPE'):
                 if not isinstance(x, tuple):
                     x = (x,)
 
-                if not all(isinstance(i, int) for i in x[:-1]) or not isinstance(x[-1], (int, dict, ParamZeroConfig)):
-                    raise ValueError(f"Parameter class should be tuple of ints + optional ParamZeroConfig, but got {x}")
+                if not all(isinstance(i, int) for i in x[:-1]) or not isinstance(x[-1], (int, dict, ParamBucketConfig)):
+                    raise ValueError(f"Parameter class should be tuple of ints + optional ParamBucketConfig, but got {x}")
 
-                if isinstance(x[-1], (dict, ParamZeroConfig)):
+                if isinstance(x[-1], (dict, ParamBucketConfig)):
                     if isinstance(x[-1], dict):
-                        pzc = ParamZeroConfig(**x[-1])
+                        pzc = ParamBucketConfig(**x[-1])
                     else:
-                        assert isinstance(x[-1], ParamZeroConfig)
+                        assert isinstance(x[-1], ParamBucketConfig)
                         pzc = x[-1]
-                    return tuple(x[:-1]) + (
-                        pzc.resolve(self._zero, self._zero_param_level_sharding),
-                    )
+                    return tuple(x[:-1]), pzc.resolve(
+                            self._zero,
+                            self._zero_param_level_sharding,
+                            self._async,
+                            self._use_none_grad,
+                        )
 
-                return tuple(x) + (ParamZeroConfig(zero_param_level_sharding=self._zero_param_level_sharding),)
+                return tuple(x), default_param_config
 
             # only keep parameters that are in self._params
             self._param_clss = {p: _fix_param_cls(param_clss[p]) for p in self._params}
@@ -1150,7 +1179,7 @@ class Reducer:
         bucket_size = self._numel * 8 + 1 if not self._bucket_size else self._bucket_size
         # bucket start and stop pos in buffer
         starts, stops = [], []
-        seq_buckets_cls: List[Optional[Tuple[int, int, ParamZeroConfig]]] = []
+        seq_buckets_cls: List[Optional[tuple[tuple[int, ...], ParamBucketConfig]]] = []
         last_bucket_size = None
         last_bucket_cls = None
 
@@ -1305,7 +1334,7 @@ class Reducer:
                 stop,
                 self._reduce_op,
                 self._group,
-                self._async,
+                param_cls[-1].use_async_reducer if param_cls else self._async,
                 self._zero,
                 self._zero_subgroup,
                 self._zero_crossgroup,
@@ -1314,7 +1343,7 @@ class Reducer:
                 param_cls=param_cls,
                 params_info=self._params_info,
                 nreplicas=self._nreplicas,
-                use_none_grad=self._use_none_grad,
+                use_none_grad=param_cls[-1].use_none_grad if param_cls else self._use_none_grad,
             )
             buckets.append(bucket)
         torch.cuda.empty_cache()
@@ -1427,19 +1456,23 @@ class Reducer:
 
     def get_opt_params(self) -> dict[torch.nn.Parameter, Any]:
         """
-        Get parameters and their classes for optimizers
-        Please note for ZeRO optimization,
-        the returned parameters are not the same as the original parameters,
-        and can have paddings (with value 0.0) both at the end and in the middle of paramters data.
+        Get optimizer parameters and their optimizer class prefixes.
 
-        the calculation of gnorm is not affected as paddings are all 0.
+        The per-bucket ``ParamBucketConfig`` is not exposed to optimizers. For
+        ZeRO optimization, the returned parameters are flattened parameters
+        rather than the original model parameters and may contain zero padding
+        both between parameters and at the end.
+
+        The padding does not affect gradient norm calculation because it is zero.
 
         Returns:
-            List[torch.nn.Parameter]: parameters for optimizer
+            Dict[torch.nn.Parameter, Optional[Tuple[int, ...]]]: mapping from each
+            optimizer parameter to the class prefix returned by ``param_clss_fn``.
+            The value is ``None`` when no parameter classification is provided.
         """
         params = {}
         for bucket in self._buckets:
-            params[bucket._param_for_optimizer] = bucket.param_cls
+            params[bucket._param_for_optimizer] = bucket.param_cls[0] if bucket.param_cls else None
         return params
 
     def broadcast_params(self):

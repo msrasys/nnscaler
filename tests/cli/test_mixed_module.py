@@ -76,6 +76,14 @@ def shared_branch_param_clss_fn(param_name: str) -> int:
     return 1
 
 
+def per_bucket_reducer_param_clss_fn(param_name: str):
+    if param_name.startswith('mlp0.'):
+        return 0, {'use_async_reducer': False, 'use_none_grad': True}
+    if param_name.startswith('mlp1.'):
+        return 1, {'use_async_reducer': False, 'use_none_grad': True}
+    return 2, {'use_async_reducer': True, 'use_none_grad': False}
+
+
 def mixed1_worker(save_dir, config_file):
     save_dir = Path(save_dir)
     stem = Path(config_file).stem
@@ -491,7 +499,7 @@ def reducer_none_grad_worker(save_dir, use_none_grad):
 
     reducer = trainer.optimizer._non_parallel_module_reducer
     assert reducer._use_none_grad is use_none_grad
-    assert {bucket.param_cls[0] for bucket in reducer.buckets} == {0, 1, 2}
+    assert {bucket.param_cls[0] for bucket in reducer.buckets} == {(0,), (1,), (2,)}
     assert len(_reducer_none_grad_weight_history) == 2
     return _reducer_none_grad_weight_history
 
@@ -522,6 +530,48 @@ def test_reducer_none_grad_end2end(tmp_path):
 
     assert_equal(zero_grad_history[0], zero_grad_history[1])
     assert_equal(none_grad_history[0], none_grad_history[1])
+
+
+def per_bucket_reducer_worker(save_dir):
+    _reducer_none_grad_weight_history.clear()
+    config_path = str(Path(__file__).with_name('trainer_args_mixed3.yaml').resolve())
+    trainer = Trainer([
+        '-f', config_path,
+        '--compute_config.plan_ngpus', '1',
+        '--compute_config.runtime_ngpus', '2',
+        '--max_epochs', '1',
+        '--max_train_steps', '2',
+        '--dataset.type', 'tests.cli.test_mixed_module.SequentialBranchDataset',
+        '--dataset.train_args.size', '16',
+        '--dataset.val_args.size', '8',
+        '--enable_progress_bar', 'false',
+        '--gen_savedir', str(Path(save_dir) / 'gen'),
+        '--checkpoint.no_save', 'true',
+        '--optimizer.param_clss_fn',
+        'tests.cli.test_mixed_module.per_bucket_reducer_param_clss_fn',
+        '--hook.after_optimizer_step',
+        'tests.cli.test_mixed_module.record_reducer_none_grad_weights',
+    ])
+    trainer.run()
+
+    reducer = trainer.optimizer._non_parallel_module_reducer
+    bucket_options = {
+        bucket.param_cls[0]: (bucket._async, bucket._use_none_grad)
+        for bucket in reducer.buckets
+    }
+    assert bucket_options == {
+        (0,): (False, True),
+        (1,): (False, True),
+        (2,): (True, False),
+    }
+    return _reducer_none_grad_weight_history
+
+
+@pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.device_count() < 2, reason='lack of gpu devices')
+def test_per_bucket_reducer_options(tmp_path):
+    expected = launch_torchrun(2, reducer_none_grad_worker, tmp_path / 'expected', True)
+    actual = launch_torchrun(2, per_bucket_reducer_worker, tmp_path / 'actual')
+    assert_equal(actual, expected)
 
 
 def reducer_none_grad_partial_bucket_worker(save_dir):
@@ -566,8 +616,8 @@ def reducer_none_grad_checkpoint_worker(save_dir, resume_from_merged):
         '--gen_savedir', str(run_dir / 'gen'),
         '--checkpoint.save_type', 'sharded',
         '--checkpoint.save_dir', str(run_dir / 'ckpt'),
-        '--model.non_parallel_params_reducer_config.reducer_none_grad', 'true',
-        '--optimizer.param_clss_fn', 'tests.cli.test_mixed_module.branch_param_clss_fn',
+        '--optimizer.param_clss_fn',
+        'tests.cli.test_mixed_module.per_bucket_reducer_param_clss_fn',
     ]
 
     trainer = Trainer([

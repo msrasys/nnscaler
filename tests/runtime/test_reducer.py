@@ -16,7 +16,7 @@ from nnscaler.utils import load_model
 from nnscaler.graph import IRGraph
 from nnscaler.ir.operator import IRFwOperation
 from nnscaler.flags import CompileFlag
-from nnscaler.runtime.adapter.reducer import FlattenParamInfo, Reducer, ReducerParamInfo
+from nnscaler.runtime.adapter.reducer import FlattenParamInfo, ParamBucketConfig, Reducer, ReducerParamInfo
 from nnscaler.runtime.device import DeviceGroup
 from ..launch_torchrun import torchrun
 from ..utils import catch_log, init_parameter, assert_parity, mock_reducer_env
@@ -436,6 +436,28 @@ def _add_scalar_params(reducer, num_params, param_clss=None, param_cls=None):
     return params
 
 
+@mock_reducer_env(0, 2)
+def test_reducer_build_per_bucket_options():
+    reducer = Reducer([0, 1], async_op=False, use_none_grad=True)
+    param_clss = {}
+    params = _add_scalar_params(reducer, 3)
+    param_clss[params[0]] = (0, ParamBucketConfig(use_async_reducer=True))
+    param_clss[params[1]] = (0, ParamBucketConfig(use_none_grad=False))
+    param_clss[params[2]] = ParamBucketConfig()
+
+    reducer.build_buckets(param_clss=param_clss)
+
+    buckets = list(reversed(reducer.buckets))
+    assert [bucket.param_cls[0] for bucket in buckets] == [(), (0,), (0,)]
+    assert [(bucket._async, bucket._use_none_grad) for bucket in buckets] == [
+        (False, True),
+        (False, False),
+        (True, True),
+    ]
+    assert set(reducer.get_opt_params().values()) == {(), (0,)}
+    assert all(bucket._flatten_param_info.params_info for bucket in buckets)
+
+
 @mock_reducer_env(0, 8)
 def test_reducer_build_zero_param_level_sharding_merges_single_param_tail():
     reducer = Reducer(
@@ -489,7 +511,7 @@ def test_reducer_build_zero_param_level_sharding_keeps_param_classes_separate():
 
     buckets = list(reversed(reducer.buckets))
     assert [len(bucket.params) for bucket in buckets] == [9, 9]
-    assert [bucket.param_cls[0] for bucket in buckets] == [0, 1]
+    assert [bucket.param_cls[0] for bucket in buckets] == [(0,), (1,)]
 
 
 @mock_reducer_env(0, 8)
@@ -555,7 +577,7 @@ def test_reducer_build_zero_param_level_sharding_pads_with_classes():
     buckets = list(reversed(reducer.buckets))
     assert len(buckets) == 2
     assert [len(b.params) for b in buckets] == [3, 5]
-    assert [b.param_cls[0] for b in buckets] == [0, 1]
+    assert [b.param_cls[0] for b in buckets] == [(0,), (1,)]
     # each bucket buffer = 4 * 8 = 32
     assert buckets[0]._contiguous_params.numel() == 4 * 8
     assert buckets[1]._contiguous_params.numel() == 4 * 8
