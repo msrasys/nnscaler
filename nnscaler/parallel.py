@@ -151,6 +151,14 @@ class ComputeConfig:
     # When True, replicated weights will also go through all-reduce (with nreplicas division),
     # ensuring gradient consistency across ranks. Default is False.
     reducer_replicated_params: bool = False
+    # whether to use None grad for parameters that are not used in the current iteration.
+    # This is useful for models with dynamic control flow, where some parameters may not be used
+    # in certain iterations.
+    # Note: in current implemenation, the parameters are grouped into buckets,
+    # so if you want to set this flag to True,
+    # you must make sure that all parameters in the same bucket are used in the same iteration,
+    # otherwise, errors will be raised.
+    reducer_none_grad: bool = False
 
     # PAS policy settings
     # you can also put any other settings that can affect code generation here.
@@ -429,6 +437,7 @@ def _compile_flags(compute_config: ComputeConfig):
         trace_strategy=compute_config.trace_strategy,
         zero_param_level_sharding=compute_config.zero_param_level_sharding,
         reducer_replicated_params=compute_config.reducer_replicated_params,
+        reducer_none_grad=compute_config.reducer_none_grad,
         use_fbw=compute_config.use_fbw,
     )
 
@@ -1595,6 +1604,7 @@ def build_optimizer(
                 'max_bucket_size_bytes': compute_config.max_bucket_size_bytes,
                 'zero_use_reduce_scatter': compute_config.zero_use_reduce_scatter,
                 'zero_ngroups': compute_config.zero_ngroups,
+                'use_none_grad': compute_config.reducer_none_grad,
             }
         else:
             reducer_config = {
@@ -1603,6 +1613,9 @@ def build_optimizer(
                 'max_bucket_size_bytes': None,
                 'zero_use_reduce_scatter': False,
                 'zero_ngroups': 1,
+                # TODO: a better default value for use_none_grad?
+                # currently let's use the same value as the first parallel module
+                'use_none_grad': compute_configs[0].reducer_none_grad,
             }
         non_parallel_module_reducer_config = replace(
             compute_config or compute_configs[0],
@@ -1612,6 +1625,7 @@ def build_optimizer(
                 if reducer_config['max_bucket_size_bytes'] else None,
             zero_use_reduce_scatter=reducer_config['zero_use_reduce_scatter'],
             zero_ngroups=reducer_config['zero_ngroups'],
+            reducer_none_grad=reducer_config['use_none_grad'],
         )
         non_parallel_module_reducer = Reducer(group, **reducer_config)
         for param in non_parallel_parameters:

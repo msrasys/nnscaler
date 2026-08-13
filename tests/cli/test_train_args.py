@@ -53,6 +53,7 @@ def test_optional_reducer_config_resolve_preserves_base_values():
         use_zero=True,
         use_async_reducer=True,
         reducer_bucket_cap_mb=8.0,
+        reducer_none_grad=True,
     )
 
     rcc = OptionalReducerConfig().resolve(cc)
@@ -61,6 +62,7 @@ def test_optional_reducer_config_resolve_preserves_base_values():
     assert rcc.use_zero == 1
     assert rcc.use_async_reducer is True
     assert rcc.reducer_bucket_cap_mb == 8.0
+    assert rcc.reducer_none_grad is True
     assert rcc.use_end2end is False
     assert cc.use_end2end is True
 
@@ -77,10 +79,12 @@ def test_optional_reducer_config_resolve_applies_kwargs():
         cc,
         use_async_reducer=False,
         reducer_bucket_cap_mb=0.0,
+        reducer_none_grad=False,
     )
 
     assert rcc.use_async_reducer is False
     assert rcc.reducer_bucket_cap_mb == 0.0
+    assert rcc.reducer_none_grad is False
 
 
 def test_optional_reducer_config_resolve_explicit_values_override_kwargs():
@@ -88,16 +92,19 @@ def test_optional_reducer_config_resolve_explicit_values_override_kwargs():
     config = OptionalReducerConfig(
         use_async_reducer=True,
         reducer_bucket_cap_mb=4.0,
+        reducer_none_grad=True,
     )
 
     rcc = config.resolve(
         cc,
         use_async_reducer=False,
         reducer_bucket_cap_mb=0.0,
+        reducer_none_grad=False,
     )
 
     assert rcc.use_async_reducer is True
     assert rcc.reducer_bucket_cap_mb == 4.0
+    assert rcc.reducer_none_grad is True
 
 
 def test_optional_reducer_config_resolve_always_disables_end2end():
