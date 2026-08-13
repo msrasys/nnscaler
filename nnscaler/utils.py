@@ -450,9 +450,8 @@ def select_many(data: Iterable[ItemT], fn: Callable[[ItemT], Iterable[ItemU]]) -
 
 def first(data: Iterable[ItemT], fn: Optional[Callable[[ItemT], bool]] = None) -> ItemT:
     """Get the first element from the iterable that satisfies the given function."""
-    fn = fn or (lambda x: x)
     for item in data:
-        if fn(item):
+        if fn is None or fn(item):
             return item
     raise ValueError("No element satisfies the condition.")
 
@@ -462,9 +461,8 @@ def first_or(data: Iterable[ItemT], fn: Optional[Callable[[ItemT], bool]] = None
     Get the first element from the iterable that satisfies the given function,
     or return default value.
     """
-    fn = fn or (lambda x: x)
     for item in data:
-        if fn(item):
+        if fn is None or fn(item):
             return item
     return default
 

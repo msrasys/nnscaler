@@ -102,3 +102,23 @@ if torch.__version__ < (2, 4, 0):
 
     torch.distributed.send_object_list = send_object_list
     torch.distributed.recv_object_list = recv_object_list
+
+
+FBW_SUPPORTED = True
+
+try:
+    from ._patch_torch_pipelining_backend import stage_backward_input, stage_backward_weight
+except (ImportError, TypeError) as ex:
+    FBW_SUPPORTED = False
+    import_error = ex
+    def stage_backward_input(*args, **kwargs):
+        raise ImportError(
+            "Failed to import stage_backward_input from torch.distributed. "
+            "Please update pytorch(2.5.0+) and/or python(3.10+) to a higher version."
+        ) from import_error
+
+    def stage_backward_weight(*args, **kwargs):
+        raise ImportError(
+            "Failed to import stage_backward_weight from torch.distributed. "
+            "Please update pytorch(2.5.0+) and/or python(3.10+) to a higher version."
+        ) from import_error

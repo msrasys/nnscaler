@@ -63,23 +63,25 @@ class MuonMixin:
 
         # called from hybrid optimizer before call `.step` (to get the param_groups of the wrapped optimizer)
         # In this case, state_dict['state'] is empty.
-        if state['state']:
-            new_param_states = {}
-            for flat_idx, (fpi, param_indices) in self._flat_map.items():
-                if fpi is None:
-                    assert len(param_indices) == 1
-                    if param_indices[0] in state['state']:
-                        new_param_states[flat_idx] = state['state'][param_indices[0]]
-                elif any(i in state['state'] for i in param_indices):
-                    # need to flatten the states
-                    embeded_states = [
-                        state['state'][i][self.momentum_buffer_name] if i in state['state'] else None
-                        for i in param_indices
-                    ]
-                    new_param_states[flat_idx] = {self.momentum_buffer_name: fpi.flatten(embeded_states, device='cpu')}
-                #else: no state for this flattened param
+        # But unfortunately,
+        # we can't distinguish between above case and normal case
+        # (when there is no params in optimizer or all params are not used in any step )
+        # so we need to handle the empty state case always.
+        new_param_states = {}
+        for flat_idx, (fpi, param_indices) in self._flat_map.items():
+            if fpi is None:
+                assert len(param_indices) == 1
+                if param_indices[0] in state['state']:
+                    new_param_states[flat_idx] = state['state'][param_indices[0]]
+            else:
+                # need to flatten the states
+                embeded_states = [
+                    state['state'][i][self.momentum_buffer_name] if i in state['state'] else None
+                    for i in param_indices
+                ]
+                new_param_states[flat_idx] = {self.momentum_buffer_name: fpi.flatten(embeded_states, device='cpu')}
 
-            state['state'] = new_param_states
+        state['state'] = new_param_states
 
         state['param_groups'][0]['params'] = list(range(len(self._flat_map)))
         return state

@@ -14,7 +14,7 @@ from nnscaler.ir import IRTensor
 from nnscaler.runtime.device import DeviceGroup
 from flash_attn import flash_attn_varlen_func
 from .core.ring_attn_varlen_implementation import llama3_flash_attn_prepare_cu_seqlens, llama3_flash_attn_varlen_func
-from .core.utils import gen_head_anno
+from .core.utils import call_flash_attn_cute_varlen_func, gen_head_anno, get_arg_by_name
 from .varlen_utils import (
     select_sequence_group_cu_seqlens,
     shuffle_varlen,
@@ -137,6 +137,9 @@ def wrap_ring_attn_varlen_func(
         process_group: Tuple[int] = None,
         sequence_parallel_size: int = None,
         sequence_group_count: int = 1,
+        return_lse: bool = False,
+        max_seqlen_q: Optional[int] = None,
+        max_seqlen_k: Optional[int] = None,
 ):
     '''
     wrap the ring_attn_varlen_func to support the distributed training in nnScaler.
@@ -146,6 +149,7 @@ def wrap_ring_attn_varlen_func(
     required communications.
     '''
     assert not return_attn_probs, "return_attn_probs is not supported in ring-attention"
+    selected_sequence_group = False
     if process_group is not None and len(process_group) > 1 and enable_ring:
         if sequence_parallel_size is not None and len(process_group) != sequence_parallel_size:
             raise ValueError(
@@ -156,14 +160,23 @@ def wrap_ring_attn_varlen_func(
             cu_seqlens_q, process_group, sequence_group_count)
         cu_seqlens_k = select_sequence_group_cu_seqlens(
             cu_seqlens_k, process_group, sequence_group_count)
-    max_seqlen_q = (cu_seqlens_q[1:] - cu_seqlens_q[:-1]).max().item()
-    max_seqlen_k = (cu_seqlens_k[1:] - cu_seqlens_k[:-1]).max().item()
+        selected_sequence_group = True
+    if selected_sequence_group:
+        # PP down-sampling selects lane-local metadata here, so caller-provided
+        # maxima for the unselected metadata are no longer valid.
+        max_seqlen_q = (cu_seqlens_q[1:] - cu_seqlens_q[:-1]).max().item()
+        max_seqlen_k = (cu_seqlens_k[1:] - cu_seqlens_k[:-1]).max().item()
+    if max_seqlen_q is None:
+        max_seqlen_q = (cu_seqlens_q[1:] - cu_seqlens_q[:-1]).max().item()
+    if max_seqlen_k is None:
+        max_seqlen_k = (cu_seqlens_k[1:] - cu_seqlens_k[:-1]).max().item()
 
     if process_group is None or len(process_group) == 1 or not enable_ring:
         if use_cute:
             assert flash_attn_cute_varlen_func is not None, "flash_attn.cute is not available"
             cute_window_size = tuple(None if w == -1 else w for w in window_size)
-            output, lse = flash_attn_cute_varlen_func(
+            return call_flash_attn_cute_varlen_func(
+                flash_attn_cute_varlen_func,
                 q, k, v,
                 cu_seqlens_q=cu_seqlens_q,
                 cu_seqlens_k=cu_seqlens_k,
@@ -173,11 +186,10 @@ def wrap_ring_attn_varlen_func(
                 causal=causal,
                 window_size=cute_window_size,
                 deterministic=deterministic,
-                return_lse=True,
+                return_lse=return_lse,
             )
-            return output
         else:
-            output = flash_attn_varlen_func(
+            result = flash_attn_varlen_func(
                 q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k,
                 dropout_p=dropout_p,
                 softmax_scale=softmax_scale,
@@ -185,9 +197,12 @@ def wrap_ring_attn_varlen_func(
                 window_size=window_size,
                 alibi_slopes=alibi_slopes,
                 deterministic=deterministic,
-                return_attn_probs=False,
+                return_attn_probs=bool(return_lse),
             )
-        return output
+            if return_lse:
+                output, softmax_lse, _ = result
+                return output, softmax_lse
+            return result
 
     assert len(q.shape) == 3, "q must have shape [total_q, qh, dim]"
     assert len(k.shape) == 3, "k must have shape [total_k, kh, dim]"
@@ -211,7 +226,13 @@ def wrap_ring_attn_varlen_func(
     if window_size == (-1, -1) and not use_cute:
         # Use TransformerEngine with context parallelism if available and version is OK
         # Only use TransformerEngine CP path if env flag is enabled
-        if _ENABLE_TE_CP and _HAS_TRANSFORMER_ENGINE and _TE_VERSION_OK and attn_forward_func_with_cp is not None:
+        te_cp_available = (
+            _ENABLE_TE_CP
+            and _HAS_TRANSFORMER_ENGINE
+            and _TE_VERSION_OK
+            and attn_forward_func_with_cp is not None
+        )
+        if te_cp_available and not return_lse:
             shuffled_q = shuffle_varlen(q, cu_seqlens_q, process_group, local_process_group)
             shuffled_k = shuffle_varlen(k, cu_seqlens_k, process_group, local_process_group)
             shuffled_v = shuffle_varlen(v, cu_seqlens_k, process_group, local_process_group)
@@ -255,11 +276,19 @@ def wrap_ring_attn_varlen_func(
         else:
             # Fallback to basic ring attention implementation
             if _ENABLE_TE_CP:
-                # User requested CP but TE unavailable/incompatible
-                warnings.warn(
-                    "ENABLE_TE_CP=1 set but TransformerEngine CP attention unavailable (missing or incompatible). "
-                    "Falling back to basic ring attention implementation."
-                )
+                # TransformerEngine CP currently returns only attention output,
+                # while return_lse=True is annotated as a real tensor output.
+                if return_lse and te_cp_available:
+                    warnings.warn(
+                        "ENABLE_TE_CP=1 ignored for return_lse=True because TransformerEngine CP attention "
+                        "does not return softmax_lse. Falling back to basic ring attention implementation."
+                    )
+                else:
+                    # User requested CP but TE unavailable/incompatible
+                    warnings.warn(
+                        "ENABLE_TE_CP=1 set but TransformerEngine CP attention unavailable (missing or incompatible). "
+                        "Falling back to basic ring attention implementation."
+                    )
             # If not enabled, remain silent (no warning spam) unless TE missing earlier already warned.
 
     (
@@ -281,8 +310,8 @@ def wrap_ring_attn_varlen_func(
         v,
         local_cu_seqlens_q,
         local_cu_seqlens_k,
-        local_max_seqlen_q,
-        local_max_seqlen_k,
+        max_seqlen_q if use_cute else local_max_seqlen_q,
+        max_seqlen_k if use_cute else local_max_seqlen_k,
         heads_k_stride=1,
         local_k_slice=local_k_slice,
         dropout_p=dropout_p,
@@ -294,7 +323,7 @@ def wrap_ring_attn_varlen_func(
         use_cute=use_cute,
     )
 
-    return out
+    return (out, softmax_lse) if return_lse else out
 
 
 def emit_ring(node: IRDimops, args: List[str], kwargs: Dict[str, str], runtime_devid: int, plan_ndevs: int, runtime_ndevs: int) -> str:
@@ -349,7 +378,24 @@ def emit_ring(node: IRDimops, args: List[str], kwargs: Dict[str, str], runtime_d
 def flash_attention_anno(query_states, key_states, value_states, cu_seqlens_q, cu_seqlens_k, alibi_slopes, *args, **kwargs) -> str:
     q_anno, kv_anno = gen_head_anno(query_states, key_states, value_states, head_pos=1)
     alibi_anno = f'{q_anno}' if isinstance(alibi_slopes, IRTensor) else '?'
-    return f'l {q_anno} hd^, l {kv_anno} hd^, l {kv_anno} vd^, e^, e^, {alibi_anno} -> l {q_anno} vd^'
+    output_anno = f'l {q_anno} vd^'
+    return_lse = get_arg_by_name(
+        wrap_ring_attn_varlen_func,
+        "return_lse",
+        False,
+        query_states,
+        key_states,
+        value_states,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        alibi_slopes,
+        *args,
+        **kwargs,
+    )
+    if return_lse:
+        # return_lse=True is annotated as a real tensor output: [num_heads, total_q].
+        output_anno += f', {q_anno} l'
+    return f'l {q_anno} hd^, l {kv_anno} hd^, l {kv_anno} vd^, e^, e^, {alibi_anno} -> {output_anno}'
 
 
 def input_gen_fn(node: IRDimops):

@@ -205,23 +205,48 @@ class FlattenParamInfo:
                 )
         return params
 
-    def flatten(self, tensors: list[Optional[torch.Tensor]], *, device=None) -> torch.Tensor:
+    def flatten(self, tensors: list[Optional[torch.Tensor]], *, dtype=None, device=None) -> torch.Tensor:
         """
         Flatten the given tensors into a single tensor
         Args:
             tensors (list[Optional[torch.Tensor]]): the tensors to be flattened.
                 Note these tensors must be in the same order as `self.get_embeded_params()`
                 or None for missing tensors.
+            dtype: the dtype of the result flattened tensor,
+                if None, use the dtype of first non-none `tensors`
+                if all tensors are None, use the dtype of first parameter in `self.params_info`
             device: the device of the result flattened tensor,
-                if None, use the device of the first non-None tensor
+                if None, use the device of first non-none `tensors`
+                if all tensors are None, use the device of first parameter in `self.params_info`
         """
-        if tensors is None or len(tensors) == 0 or all(t is None for t in tensors):
-            raise ValueError("tensors should not be empty or all None")
+        if tensors is None:
+            raise ValueError("tensors should not be None")
+        if len(tensors) != len(self.get_embeded_params()):
+            raise ValueError(
+                f"tensors length {len(tensors)} does not match the expected length {len(self.get_embeded_params())}"
+            )
 
-        non_none_tensor = first(tensors, lambda t: t is not None)
+        non_none_tensors = [t for t in tensors if t is not None]
+        if non_none_tensors:
+            ref_tensor = non_none_tensors[0]
+        else:
+            # self.params_info is never empty
+            ref_tensor = first(self.params_info)
+
+        if dtype is None:
+            dtype = ref_tensor.dtype
         if device is None:
-            device = non_none_tensor.device
-        flat_tensors = torch.zeros(self.opt_chunk_size, dtype=non_none_tensor.dtype, device=device, pin_memory=True)
+            device = ref_tensor.device
+        device = torch.device(device)
+        cuda_to_cpu = device.type == 'cpu' and any(
+            t.device.type == 'cuda' for t in non_none_tensors
+        )
+        flat_tensors = torch.zeros(
+            self.opt_chunk_size,
+            dtype=dtype,
+            device=device,
+            pin_memory=cuda_to_cpu,
+        )
 
         opt_start = self.opt_chunk_index * self.opt_chunk_size
         opt_end = (self.opt_chunk_index + 1) * self.opt_chunk_size
@@ -244,7 +269,8 @@ class FlattenParamInfo:
                 ].copy_(tensor.view(-1), non_blocking=True)
 
         # non-blocking copy may need synchronization
-        torch.cuda.synchronize()
+        if cuda_to_cpu:
+            torch.cuda.synchronize()
         return flat_tensors
 
     def unflatten(self, tensor: torch.Tensor, *, device=None) -> list[torch.Tensor]:
@@ -262,6 +288,9 @@ class FlattenParamInfo:
             raise ValueError("tensor numel does not match the expected size")
         if device is None:
             device = tensor.device
+        device = torch.device(device)
+
+        cuda_to_cpu = device.type == 'cpu' and tensor.device.type == 'cuda'
 
         tensors = []
         opt_start = self.opt_chunk_index * self.opt_chunk_size
@@ -269,7 +298,7 @@ class FlattenParamInfo:
 
         for info in self.params_info.values():
             if info.bucket_param_buffer_start >= opt_start and info.bucket_param_buffer_end <= opt_end:
-                param_tensor = torch.empty(info.shape, dtype=tensor.dtype, device=device, pin_memory=True)
+                param_tensor = torch.empty(info.shape, dtype=tensor.dtype, device=device, pin_memory=cuda_to_cpu)
                 param_tensor.view(-1).copy_(
                     tensor[
                         info.bucket_param_buffer_start - opt_start:
@@ -280,7 +309,8 @@ class FlattenParamInfo:
                 tensors.append(param_tensor)
 
         # non-blocking copy may need synchronization
-        torch.cuda.synchronize()
+        if cuda_to_cpu:
+            torch.cuda.synchronize()
         return tensors
 
 
@@ -300,6 +330,7 @@ class ParamZeroConfig:
 class Bucket:
     def __init__(self, reducer: 'Reducer', params: List[torch.nn.Parameter],
                  param_buffer: torch.Tensor, grad_buffer: torch.Tensor,
+                 start: int, stop: int,
                  reduce_op: torch.distributed.ReduceOp,
                  group: torch.distributed.ProcessGroup, async_op: bool, zero: int,
                  zero_subgroup: torch.distributed.ProcessGroup = None,
@@ -308,6 +339,7 @@ class Bucket:
                  align_size: int = ALIGNED_BYTES,
                  param_cls: Any = None,
                  params_info: Dict[torch.nn.Parameter, ReducerParamInfo] = None,
+                 nreplicas: int = 1,
     ):
         """
         Create a communication unit for parameter allreduce.
@@ -317,8 +349,12 @@ class Bucket:
 
         Args:
             params (List[torch.nn.Parameter]): the parameters
-            param_buffer (torch.Tensor): Paramter contiguous buffer
-            grad_buffer (torch.Tensor): gradient contiguous buffer
+            param_buffer (torch.Tensor): the reducer's full parameter contiguous buffer;
+                this bucket owns the slice ``param_buffer[start:stop]``
+            grad_buffer (torch.Tensor): the reducer's full gradient contiguous buffer;
+                this bucket owns the slice ``grad_buffer[start:stop]``
+            start (int): start offset of this bucket's slice within the full buffer
+            stop (int): stop offset of this bucket's slice within the full buffer
             reduce_op (torch.distributed.ReduceOp): the reduce op used by collectives
             group (torch.distributed.ProcessGroup): communication group
             async_op (bool): whether to use asynchronous operation
@@ -329,6 +365,7 @@ class Bucket:
             zero_use_reduce_scatter (bool): whether to use reduce scatter for zero optimization
             align_size (int): the alignment size in bytes for each parameter
             param_cls (Any): the class of the parameters
+            nreplicas (int): divisor applied to gradients after all-reduce (default 1)
         """
 
         self._params: List[torch.nn.Parameter] = params
@@ -359,8 +396,24 @@ class Bucket:
         self._async: bool = async_op
         self._zero: int = zero
         self._zero_use_reduce_scatter = zero_use_reduce_scatter
-        self._contiguous_params = param_buffer
-        self._contiguous_grads = grad_buffer
+        self._nreplicas: int = nreplicas
+        # number of gradient accumulation steps, used for async reducer to determine
+        # when to trigger allreduce
+        # 0 means we will rely on Flag.skip_reducer to determine when to trigger allreduce,
+        # which is the default/traditional behavior
+        # Non-zero value means we will trigger allreduce after the specified number of gradient accumulation steps
+        self._grad_accumulation_steps: int = 0
+
+        if not isinstance(self._nreplicas, int) or self._nreplicas < 1:
+            raise ValueError(f"nreplicas should be an integer greater than or equal to 1, but got {self._nreplicas}")
+
+        if self._nreplicas != 1 and self._reduce_op != torch.distributed.ReduceOp.SUM:
+            raise ValueError(f"nreplicas should be used with sum reduce op, but got {self._reduce_op}")
+
+        self._start = start
+        self._stop = stop
+        self._contiguous_params = param_buffer[self._start:self._stop]
+        self._contiguous_grads = grad_buffer[self._start:self._stop]
         assert grad_buffer.size() == param_buffer.size()
         # the parameter exposed for optimizer
         self._param_for_optimizer: torch.nn.Parameter = None
@@ -418,6 +471,18 @@ class Bucket:
     def zero3(self) -> bool:
         """Whether enable zero3 for this bucket"""
         return self._z3
+
+    @property
+    def grad_accumulation_steps(self) -> int:
+        """Get the number of gradient accumulation steps for this bucket"""
+        return self._grad_accumulation_steps
+
+    @grad_accumulation_steps.setter
+    def grad_accumulation_steps(self, steps: int):
+        """Set the number of gradient accumulation steps for this bucket"""
+        if not isinstance(steps, int) or steps < 0:
+            raise ValueError(f"grad_accumulation_steps should be a non-negative integer, but got {steps}")
+        self._grad_accumulation_steps = steps
 
     def get_aligned_numel(self, param) -> int:
         """
@@ -545,11 +610,28 @@ class Bucket:
                 # let's add it for safety
                 self._reducer.postevict_param(param)
 
-            if RuntimeFlag.skip_reducer: return
+            if not self._grad_accumulation_steps and RuntimeFlag.skip_reducer:
+                return
 
             # perform all-reduce
             if self._async:
-                self._mark_async_param_ready(param)
+                if self._grad_accumulation_steps:
+                    target_cnt = self._grad_accumulation_steps * len(self._params)
+                    self._async_param_cnt += 1
+                    if self._async_param_cnt > target_cnt:
+                        raise RuntimeError(
+                            f"Asynchronous Reducer received more gradients than expected "
+                            f"({self._async_param_cnt} > {target_cnt} = "
+                            f"grad_accumulation_steps({self._grad_accumulation_steps}) * num_params({len(self._params)})). "
+                            f"Make sure `grad_accumulation_steps` matches the actual number of gradient accumulation steps per optimizer step."
+                        )
+                    if self._async_param_cnt == target_cnt:
+                        self._launch_async_reduce()
+                else:
+                    # Scheduled PP/VPP can contribute a different number of
+                    # gradients per parameter, so use generated per-parameter
+                    # counts instead of a uniform accumulation multiplier.
+                    self._mark_async_param_ready(param)
 
         for param in self._params:
             # same trick with FSDP and Megatron
@@ -661,6 +743,9 @@ class Bucket:
                 )
         else:
             self._sync_contiguous_grads()
+        # apply nreplicas divisor if needed
+        if self._nreplicas != 1:
+            self._contiguous_grads.div_(self._nreplicas)
         # grads = self._contiguous_grads.clone()
         for param in self._params:
             assert param.grad is None
@@ -841,8 +926,8 @@ class Bucket:
         """
         re-attach to the contiguous buffer and re-build hooks
         """
-        self._contiguous_params = param_buffer
-        self._contiguous_grads = grad_buffer
+        self._contiguous_params = param_buffer[self._start:self._stop]
+        self._contiguous_grads = grad_buffer[self._start:self._stop]
         self._param_for_optimizer.data = self._get_opt_param_data()
 
         # TODO(yizhu1): seems moving attributes to cpu will make hooks invalid.
@@ -924,6 +1009,7 @@ class Reducer:
         zero_use_reduce_scatter: bool = False,
         zero_param_level_sharding: bool = False,
         align_size: int = ALIGNED_BYTES,
+        nreplicas: int = 1,
     ):
         """
         Create a reducer applied on a set of weights for weight reduction
@@ -945,6 +1031,10 @@ class Reducer:
             zero_param_level_sharding (bool): whether to use parameter-level sharding in ZeRO
                 This flag is required when use parameter-level optimizers(like Muon)
             align_size (int): the alignment size in bytes for each parameter
+            nreplicas (int): divisor applied to gradients after all-reduce.
+                For replicated weights where each rank already has the full gradient,
+                set this to the number of ranks so the summed gradient is averaged.
+                Default is 1 (no division).
         """
         # the parameters with same class will be consecutive in the list.
         self._params: List[torch.nn.Parameter] = list()
@@ -967,6 +1057,21 @@ class Reducer:
         self._zero_use_reduce_scatter = zero_use_reduce_scatter
         self._zero_param_level_sharding = zero_param_level_sharding and self._zero > 0
         self._align_size: int = align_size
+        self._nreplicas: int = nreplicas
+        # number of gradient accumulation steps, used for async reducer to determine
+        # when to trigger allreduce
+        # 0 means we will rely on Flag.skip_reducer to determine when to trigger allreduce,
+        # which is the default/traditional behavior
+        # Non-zero value means we will trigger allreduce
+        # after the specified number of gradient accumulation steps
+        self._grad_accumulation_steps: int = 0
+
+        if not isinstance(self._nreplicas, int) or self._nreplicas < 1:
+            raise ValueError(f"nreplicas should be an integer greater than or equal to 1, but got {self._nreplicas}")
+
+        if self._nreplicas != 1 and self._reduce_op != torch.distributed.ReduceOp.SUM:
+            raise ValueError(f"nreplicas should be used with sum reduce op, but got {self._reduce_op}")
+
         if self._align_size % ALIGNED_BYTES != 0:
             raise ValueError(f"align_size {self._align_size} must be divisible by {ALIGNED_BYTES}")
 
@@ -977,8 +1082,6 @@ class Reducer:
         # record following variables for params offload
         # items in the bucket is params list
         self.seq_buckets: List[List[torch.nn.Parameter]] = []
-        # bucket start and stop pos in buffer
-        self.starts, self.stops = [], []
         self.buffer_length: int = 0
         self._params_info: dict[torch.nn.Parameter, ReducerParamInfo] = dict()
 
@@ -1071,6 +1174,20 @@ class Reducer:
     def reduce_op(self) -> torch.distributed.ReduceOp:
         """Get reduce operation"""
         return self._reduce_op
+
+    @property
+    def grad_accumulation_steps(self) -> int:
+        """Get the number of gradient accumulation steps for async reducer"""
+        return self._grad_accumulation_steps
+
+    @grad_accumulation_steps.setter
+    def grad_accumulation_steps(self, value: int):
+        """Set the number of gradient accumulation steps for async reducer"""
+        if not isinstance(value, int) or value < 0:
+            raise ValueError(f"grad_accumulation_steps should be a non-negative integer, but got {value}")
+        self._grad_accumulation_steps = value
+        for bucket in self._buckets:
+            bucket.grad_accumulation_steps = value
 
     def add_param(self, param: torch.nn.Parameter):
         """
@@ -1197,7 +1314,8 @@ class Reducer:
         # TODO: use native version of reducer, which is more efficient
         #       (used in pytorch, with a couple percentage improvement)
         bucket_size = self._numel * 8 + 1 if not self._bucket_size else self._bucket_size
-
+        # bucket start and stop pos in buffer
+        starts, stops = [], []
         seq_buckets_cls: List[Optional[Tuple[int, int, ParamZeroConfig]]] = []
         last_bucket_size = None
         last_bucket_cls = None
@@ -1207,7 +1325,11 @@ class Reducer:
         )
 
         def _min_bucket_param_num(param_cls: Any) -> int:
-            return 1
+            zero_param_level_sharding = (
+                param_cls[-1].zero_param_level_sharding
+                if param_cls else self._zero_param_level_sharding
+            )
+            return 1 if not zero_param_level_sharding else self._zero_size
 
         def _split_param_sizes_for_zero(param_sizes: list[int]) -> tuple[list[list[int]], list[list[int]]]:
             if len(param_sizes) >= self._zero_size:
@@ -1258,26 +1380,24 @@ class Reducer:
         last_cls_buckets = {} # save the last bucket so far for each class
         for params, param_cls in zip(old_seq_buckets, old_seq_buckets_cls):
             last_cls_bucket = last_cls_buckets.get(param_cls, None)
-            if len(params) < _min_bucket_param_num(param_cls):
-                if last_cls_bucket is None:
-                    raise RuntimeError(
-                        f"the number of parameters({len(params)}) in the bucket is smaller than "
-                        f"the number of ranks({self._zero_size}) in the zero group. "
-                        f"ZeRO parameter-level sharding cannot be applied for this bucket. "
-                        f"Please disable ZeRO or disable "
-                        f"parameter-level sharding or increase bucket size."
-                    )
-                else:
+            if len(params) < _min_bucket_param_num(param_cls) and last_cls_bucket is not None:
+                _logger.warning(
+                    f"the number of parameters({len(params)}) in the bucket is smaller than "
+                    f"the number of ranks({self._zero_size}) in the zero group. "
+                    f"This bucket will be merged with the previous bucket of the same class to enable ZeRO parameter-level sharding, "
+                    f"which makes the byte size of the previous bucket larger than the maximum bucket size, "
+                    f"and violates the setting for bucket size limit. "
+                )
+                # merge with the previous bucket with the same class,
+                last_cls_bucket.extend(params)
+            else:
+                if len(params) < _min_bucket_param_num(param_cls):
+                    # allow through with padding: some zero ranks will have empty shards
                     _logger.warning(
                         f"the number of parameters({len(params)}) in the bucket is smaller than "
                         f"the number of ranks({self._zero_size}) in the zero group. "
-                        f"This bucket will be merged with the previous bucket of the same class to enable ZeRO parameter-level sharding, "
-                        f"which makes the byte size of the previous bucket larger than the maximum bucket size, "
-                        f"and violates the setting for bucket size limit. "
+                        f"Padding will be added so that some ranks have empty shards."
                     )
-                    # merge with the previous bucket with the same class,
-                    last_cls_bucket.extend(params)
-            else:
                 self.seq_buckets.append(params)
                 seq_buckets_cls.append(param_cls)
                 last_cls_buckets[param_cls] = params
@@ -1285,7 +1405,7 @@ class Reducer:
         # step 2: build meta data for the offset of each bucket
         # the start of each bucket will be padded to the next multiple of `len(self.ranks)`
         for params, param_cls in zip(self.seq_buckets, seq_buckets_cls):
-            self.starts.append(self.buffer_length)
+            starts.append(self.buffer_length)
             zero_param_level_sharding = param_cls[-1].zero_param_level_sharding if param_cls else self._zero_param_level_sharding
             param_sizes = [_aligned_nelement(p.nelement(), p.element_size(), self._align_size) for p in params]
             if zero_param_level_sharding:
@@ -1308,7 +1428,7 @@ class Reducer:
                         param = params[pidx]
                         param_size = param_sizes[pidx]
                         new_param_order.append(param)
-                        self._params_info[param].param_buffer_start = self.starts[-1] + chunk_start + chunk_offset
+                        self._params_info[param].param_buffer_start = starts[-1] + chunk_start + chunk_offset
                         self._params_info[param].param_buffer_end = self._params_info[param].param_buffer_start + param.numel()
                         self._params_info[param].bucket_param_buffer_start = chunk_start + chunk_offset
                         self._params_info[param].bucket_param_buffer_end = self._params_info[param].bucket_param_buffer_start + param.numel()
@@ -1327,14 +1447,10 @@ class Reducer:
                         f"Consider increasing bucket size or disable zero parameter-level sharding for better memory efficiency."
                     )
             else:
-                assert not zero_param_level_sharding, \
-                    "zero parameter-level sharding is supposed to be applied "\
-                    "but the number of parameters in this bucket is smaller than "\
-                    "the number of ranks in zero subgroup."
                 chunk_offset = 0
                 for idx, ps in enumerate(param_sizes):
                     param = params[idx]
-                    self._params_info[param].param_buffer_start = self.starts[-1] + chunk_offset
+                    self._params_info[param].param_buffer_start = starts[-1] + chunk_offset
                     self._params_info[param].param_buffer_end = self._params_info[param].param_buffer_start + param.numel()
                     self._params_info[param].bucket_param_buffer_start = chunk_offset
                     self._params_info[param].bucket_param_buffer_end = self._params_info[param].bucket_param_buffer_start + param.numel()
@@ -1345,7 +1461,7 @@ class Reducer:
                 align_nelements = self._align_size // params[0].element_size() * len(self._ranks)
                 padding = (align_nelements - numel % align_nelements) % align_nelements
                 self.buffer_length += numel + padding
-            self.stops.append(self.buffer_length)
+            stops.append(self.buffer_length)
 
         # step 3: allocate memory
         self._allocate_buffers()
@@ -1355,13 +1471,15 @@ class Reducer:
 
         # step 5: build buckets
         buckets: List[Bucket] = []
-        for params, param_cls, start, stop in zip(self.seq_buckets, seq_buckets_cls, self.starts, self.stops):
+        for params, param_cls, start, stop in zip(self.seq_buckets, seq_buckets_cls, starts, stops):
             # initialize buckets
             bucket = Bucket(
                 self,
                 params,
-                self._contiguous_params[start:stop],
-                self._contiguous_grads[start:stop],
+                self._contiguous_params,
+                self._contiguous_grads,
+                start,
+                stop,
                 self._reduce_op,
                 self._group,
                 self._async,
@@ -1372,6 +1490,7 @@ class Reducer:
                 self._align_size,
                 param_cls=param_cls,
                 params_info=self._params_info,
+                nreplicas=self._nreplicas,
             )
             buckets.append(bucket)
         torch.cuda.empty_cache()
@@ -1593,10 +1712,10 @@ class Reducer:
         self._allocate_buffers()
         self._bind_params()
 
-        for start, stop, bucket in zip(self.starts, self.stops, self._buckets):
+        for bucket in self._buckets:
             bucket.wake_up(
-                self._contiguous_params[start:stop],
-                self._contiguous_grads[start:stop],
+                self._contiguous_params,
+                self._contiguous_grads,
             )
 
     def _pack(

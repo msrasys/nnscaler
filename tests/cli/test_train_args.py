@@ -7,7 +7,7 @@ import torch
 
 import nnscaler
 from nnscaler.cli.trainer_args import (
-    load_type, ComputeConfig, OptionalComputeConfig, TrainerArgs,
+    load_type, ComputeConfig, OptionalComputeConfig, OptionalReducerConfig, TrainerArgs,
     _resolve_precision, _to_precision, _get_tensor_dtype,
 )
 from nnscaler.runtime.utils import set_grad_dtype, get_grad_dtype
@@ -43,6 +43,69 @@ def test_compute_config_merge():
     occ2 = OptionalComputeConfig(zero_ngroups=-1)
     with pytest.raises(ValueError):
         occ2.resolve(cc)
+
+
+def test_optional_reducer_config_resolve_preserves_base_values():
+    cc = ComputeConfig(
+        1, 2,
+        constant_folding=True,
+        use_end2end=True,
+        use_zero=True,
+        use_async_reducer=True,
+        reducer_bucket_cap_mb=8.0,
+    )
+
+    rcc = OptionalReducerConfig().resolve(cc)
+
+    assert rcc.constant_folding is True
+    assert rcc.use_zero == 1
+    assert rcc.use_async_reducer is True
+    assert rcc.reducer_bucket_cap_mb == 8.0
+    assert rcc.use_end2end is False
+    assert cc.use_end2end is True
+
+
+def test_optional_reducer_config_resolve_applies_kwargs():
+    cc = ComputeConfig(
+        1, 2,
+        use_end2end=True,
+        use_async_reducer=True,
+        reducer_bucket_cap_mb=8.0,
+    )
+
+    rcc = OptionalReducerConfig().resolve(
+        cc,
+        use_async_reducer=False,
+        reducer_bucket_cap_mb=0.0,
+    )
+
+    assert rcc.use_async_reducer is False
+    assert rcc.reducer_bucket_cap_mb == 0.0
+
+
+def test_optional_reducer_config_resolve_explicit_values_override_kwargs():
+    cc = ComputeConfig(1, 2, use_end2end=True)
+    config = OptionalReducerConfig(
+        use_async_reducer=True,
+        reducer_bucket_cap_mb=4.0,
+    )
+
+    rcc = config.resolve(
+        cc,
+        use_async_reducer=False,
+        reducer_bucket_cap_mb=0.0,
+    )
+
+    assert rcc.use_async_reducer is True
+    assert rcc.reducer_bucket_cap_mb == 4.0
+
+
+def test_optional_reducer_config_resolve_always_disables_end2end():
+    cc = ComputeConfig(1, 2, use_end2end=True)
+
+    rcc = OptionalReducerConfig().resolve(cc, use_end2end=True)
+
+    assert rcc.use_end2end is False
 
 
 def test_arg_merge_resolve():

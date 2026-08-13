@@ -409,6 +409,32 @@ class CubeModule(torch.nn.Module):
                 raise RuntimeError(
                     f'remaining graph parameters / buffers cannot find in model files: {list(attr_names)}')
 
+    def load_np_buffer_content(self, filename: str):
+        """Load non-persistent buffer content from file.
+
+        Only loads attributes that are non-persistent buffers
+        (i.e., in self._non_persistent_buffers_set).
+
+        Args:
+            filename (str): file path to the npbuffer.pt file
+        """
+        if not self._non_persistent_buffers_set:
+            return
+        np_buffer_model: Dict[int, torch.Tensor] = torch.load(filename)
+        with torch.no_grad():
+            _logger.info(f'loading non-persistent buffers from {filename}')
+            for attr_name in self._non_persistent_buffers_set:
+                if attr_name not in self._fullmap:
+                    raise RuntimeError(f'non-persistent buffer {attr_name} not found in fullmap.')
+                meta = self._fullmap[attr_name]
+                if meta.tid not in np_buffer_model:
+                    raise RuntimeError(f'non-persistent buffer {attr_name} (tid={meta.tid}) not found in {filename}.')
+                attr = getattr(self, attr_name)
+                content = np_buffer_model[meta.tid][meta.slicers]
+                if meta.val_chunks != 1:
+                    content = content / meta.val_chunks
+                attr.copy_(content)
+
     def init_group(self, ranks: List[int]):
         if not all([isinstance(rank, int) for rank in ranks]):
             raise TypeError("Expected ranks to be List[int]")
@@ -637,6 +663,7 @@ class CubeModule(torch.nn.Module):
         # help understand the whole logic. In other words, the real plan_ngpus is <= len(model_state_dicts).
         plan_ngpus = len(model_state_dicts)
         # gather model states
+        _logger.info('start merge model states')
         full_model_state_dict = cls.merge_model_state_dicts(model_state_dicts, fullmaps[0: plan_ngpus], zero_idx_maps)
         _logger.info('finish merge model states')
         if optim_state_dicts is None:
@@ -1166,6 +1193,14 @@ class ParallelModule(CubeModule):
         module_file = Path(sys.modules[self.__module__].__file__)
         if init_params:
             self.load_attr_content(str(module_file.with_name(f"{FxModuleParser.ATTR_CONTENT_FILE_STEM}")))
+        elif self._non_persistent_buffers_set:
+            # When init_params=False, only load non-persistent buffers from the small npbuffer.pt file.
+            # This avoids loading the large fullmodel.pt files when resuming from checkpoint,
+            # since checkpoint will provide the rest of the parameters/buffers.
+            np_buffer_file = module_file.with_name(FxModuleParser.NON_PERSISTENT_BUFFER_FILE)
+            if np_buffer_file.is_file():
+                self.load_np_buffer_content(str(np_buffer_file))
+                self._non_presistent_buffers_inited = True
 
         self._warn_uninitialized_non_persistent_buffers()
 
@@ -1327,6 +1362,16 @@ class ParallelModule(CubeModule):
             raise ValueError(f"Rank {rank} is out of range [0, {cls.world_size})")
         return cls.attr_meta_maps[rank]
 
+    def set_grad_accumulation_steps(self, steps: int):
+        """
+        Set the number of gradient accumulation steps for the module.
+
+        Args:
+            steps (int): the number of gradient accumulation steps
+        """
+        for reducer in self._reducers:
+            reducer.grad_accumulation_steps = steps
+
     def forward(self, *args, **kwargs):
         self._warn_uninitialized_non_persistent_buffers(raise_error=True)
         if self.training:
@@ -1463,6 +1508,7 @@ class ParallelModule(CubeModule):
         self._sync_grad_required = False
         sample_count = len(samples)
         dataloader = microbatches(samples, cycle=False)
+        self.set_grad_accumulation_steps(sample_count)
 
         if self.use_scheduler:
             if len(samples) != self.nmicros_per_scheduler_step:

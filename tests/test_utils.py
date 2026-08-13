@@ -8,7 +8,7 @@ import torch
 
 from nnscaler.utils import (
     select_many, classproperty, fields, set_member_by_name, unchecked_fields,
-    transform_recursively,
+    transform_recursively, first, first_or,
 )
 
 
@@ -178,3 +178,58 @@ def test_transform_recursively():
 
     assert_equal(result1, skip_key_target)
     assert_equal(result2, noskip_key_target)
+
+
+def test_first_no_filter():
+    assert first([1, 2, 3]) == 1
+
+
+def test_first_no_filter_falsy_first():
+    """first() without filter should return falsy values like 0, None, '', False."""
+    assert first([0, 1, 2]) == 0
+    assert first([None, 1]) is None
+    assert first(['', 'a']) == ''
+    assert first([False, True]) is False
+
+
+def test_first_with_filter():
+    assert first([1, 2, 3], lambda x: x > 1) == 2
+
+
+def test_first_with_filter_falsy_items():
+    """Filter should still skip items that don't match, even if they are falsy."""
+    assert first([0, 0, 3], lambda x: x > 0) == 3
+
+
+def test_first_empty():
+    with pytest.raises(ValueError, match="No element satisfies the condition"):
+        first([])
+
+
+def test_first_no_match():
+    with pytest.raises(ValueError, match="No element satisfies the condition"):
+        first([1, 2, 3], lambda x: x > 10)
+
+
+def test_first_or_no_filter():
+    assert first_or([1, 2, 3]) == 1
+
+
+def test_first_or_no_filter_falsy_first():
+    assert first_or([0, 1, 2]) == 0
+    assert first_or([None, 1]) is None
+    assert first_or([False, True]) is False
+
+
+def test_first_or_with_filter():
+    assert first_or([1, 2, 3], lambda x: x > 1) == 2
+
+
+def test_first_or_empty():
+    assert first_or([]) is None
+    assert first_or([], default=42) == 42
+
+
+def test_first_or_no_match():
+    assert first_or([1, 2, 3], lambda x: x > 10) is None
+    assert first_or([1, 2, 3], lambda x: x > 10, default=-1) == -1
