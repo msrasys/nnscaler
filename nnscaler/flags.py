@@ -88,9 +88,11 @@ class CompileFlag:
     # have their gradients computed and stored, and their gradients will be set to 0.0
     # if they are not used in the current iteration
 
-    # Note in current implemenation, the parameters are grouped into buckets,
+    # Note in current implementation, the parameters are grouped into buckets,
     # so if you want to set this flag to True, you must make sure that all parameters in the same bucket are used in the same iteration,
     # otherwise, errors will be raised.
+    # Note2: This doesn't make async/zero3 work with dynamic control flow,
+    # because the async/zero3 reducer will always assume all parameters are used in the current iteration.
     reducer_none_grad = _to_bool('REDUCER_NONE_GRAD')
 
     # use automate mixture precision training, where weights, gradients

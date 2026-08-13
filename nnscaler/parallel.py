@@ -154,10 +154,12 @@ class ComputeConfig:
     # whether to use None grad for parameters that are not used in the current iteration.
     # This is useful for models with dynamic control flow, where some parameters may not be used
     # in certain iterations.
-    # Note: in current implemenation, the parameters are grouped into buckets,
+    # Note: in current implementation, the parameters are grouped into buckets,
     # so if you want to set this flag to True,
     # you must make sure that all parameters in the same bucket are used in the same iteration,
     # otherwise, errors will be raised.
+    # Note2: This doesn't make async/zero3 work with dynamic control flow,
+    # because the async/zero3 reducer will always assume all parameters are used in the current iteration.
     reducer_none_grad: bool = False
 
     # PAS policy settings
