@@ -16,7 +16,13 @@ from nnscaler.utils import load_model
 from nnscaler.graph import IRGraph
 from nnscaler.ir.operator import IRFwOperation
 from nnscaler.flags import CompileFlag
-from nnscaler.runtime.adapter.reducer import FlattenParamInfo, ParamBucketConfig, Reducer, ReducerParamInfo
+from nnscaler.runtime.adapter.reducer import (
+    DEFAULT_ASYNC_REDUCER_BUCKET_CAP_MB,
+    FlattenParamInfo,
+    ParamBucketConfig,
+    Reducer,
+    ReducerParamInfo,
+)
 from nnscaler.runtime.device import DeviceGroup
 from ..launch_torchrun import torchrun
 from ..utils import catch_log, init_parameter, assert_parity, mock_reducer_env
@@ -441,8 +447,11 @@ def test_reducer_build_per_bucket_options():
     reducer = Reducer([0, 1], async_op=False, use_none_grad=True)
     param_clss = {}
     params = _add_scalar_params(reducer, 3)
-    param_clss[params[0]] = (0, ParamBucketConfig(use_async_reducer=True))
-    param_clss[params[1]] = (0, ParamBucketConfig(use_none_grad=False))
+    param_clss[params[0]] = (0, ParamBucketConfig(
+        use_async_reducer=True,
+        reducer_bucket_cap_mb=0,
+    ))
+    param_clss[params[1]] = (0, ParamBucketConfig(reducer_none_grad=False))
     param_clss[params[2]] = ParamBucketConfig()
 
     reducer.build_buckets(param_clss=param_clss)
@@ -454,8 +463,43 @@ def test_reducer_build_per_bucket_options():
         (False, False),
         (True, True),
     ]
+    assert [bucket.param_cls[-1].reducer_bucket_cap_mb for bucket in buckets] == [
+        0,
+        0,
+        DEFAULT_ASYNC_REDUCER_BUCKET_CAP_MB,
+    ]
     assert set(reducer.get_opt_params().values()) == {(), (0,)}
     assert all(bucket._flatten_param_info.params_info for bucket in buckets)
+
+
+@mock_reducer_env(0, 2)
+def test_reducer_build_per_bucket_max_size():
+    reducer = Reducer([0, 1])
+    param_clss = {}
+    params = _add_scalar_params(reducer, 4)
+    cap_16_bytes_mb = 16 / (1024 * 1024)
+    cap_32_bytes_mb = 32 / (1024 * 1024)
+    for param in params[:2]:
+        param_clss[param] = (0, ParamBucketConfig(reducer_bucket_cap_mb=cap_16_bytes_mb))
+    for param in params[2:]:
+        param_clss[param] = (1, ParamBucketConfig(reducer_bucket_cap_mb=cap_32_bytes_mb))
+
+    reducer.build_buckets(param_clss=param_clss)
+
+    buckets = list(reversed(reducer.buckets))
+    assert [len(bucket.params) for bucket in buckets] == [1, 1, 2]
+    assert [bucket.param_cls[-1].reducer_bucket_cap_mb for bucket in buckets] == [
+        cap_16_bytes_mb,
+        cap_16_bytes_mb,
+        cap_32_bytes_mb,
+    ]
+
+    invalid_reducer = Reducer([0, 1])
+    param = _add_scalar_params(invalid_reducer, 1)[0]
+    with pytest.raises(ValueError, match='reducer_bucket_cap_mb should be non-negative'):
+        invalid_reducer.build_buckets({
+            param: ParamBucketConfig(reducer_bucket_cap_mb=-1),
+        })
 
 
 @mock_reducer_env(0, 8)
