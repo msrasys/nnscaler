@@ -78,10 +78,10 @@ def shared_branch_param_clss_fn(param_name: str) -> int:
 
 def per_bucket_reducer_param_clss_fn(param_name: str):
     if param_name.startswith('mlp0.'):
-        return 0, {'use_async_reducer': False, 'use_none_grad': True}
+        return 0, {'use_async_reducer': False, 'reducer_none_grad': True}
     if param_name.startswith('mlp1.'):
-        return 1, {'use_async_reducer': False, 'use_none_grad': True}
-    return 2, {'use_async_reducer': True, 'use_none_grad': False}
+        return 1, {'use_async_reducer': False, 'reducer_none_grad': True}
+    return 2, {'use_async_reducer': True, 'reducer_none_grad': False}
 
 
 def mixed1_worker(save_dir, config_file):
