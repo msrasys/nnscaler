@@ -41,7 +41,7 @@ from nnscaler.ir.operator import IRBpOperation, IRDataOperation
 from nnscaler.ir.tensor import IRFullTensor
 from nnscaler.ir.unique import IDGenerator
 
-from nnscaler.runtime.adapter.reducer import Bucket, Reducer, ParamZeroConfig
+from nnscaler.runtime.adapter.reducer import Bucket, Reducer, ParamBucketConfig
 from nnscaler.runtime.device import DeviceGroup
 from nnscaler.runtime.gnorm import calcuate_gnorm, clip_grads
 from nnscaler.runtime.module import (
@@ -1393,15 +1393,15 @@ HybridOptimizerT = TypeVar('HybridOptimizer', bound=torch.optim.Optimizer)
 PARAM_CLASS_TYPE = Union[
     # for hybrid optimizer, param_clss can be:
     Tuple[int, int],  # (optimizer_index, param_group_index)
-    Tuple[int, int, ParamZeroConfig],  # (optimizer_index, param_group_index, extra_info)
+    Tuple[int, int, ParamBucketConfig],  # (optimizer_index, param_group_index, extra_info)
     Tuple[int, int, dict[str, Any]],  # (optimizer_index, param_group_index, extra_info as dict)
     # for non-hybrid optimizer with param zero, param_clss can be:
-    Tuple[int, ParamZeroConfig],      # (reducer_bucket_sort, extra_info)
+    Tuple[int, ParamBucketConfig],      # (reducer_bucket_sort, extra_info)
     Tuple[int, dict[str, Any]],       # (reducer_bucket_sort, extra_info as dict)
-    Tuple[ParamZeroConfig],           # (extra_info)
+    Tuple[ParamBucketConfig],           # (extra_info)
     Tuple[dict[str, Any]],            # (extra_info as dict)
     int,                              # reducer_bucket_sort
-    ParamZeroConfig,                  # extra_info
+    ParamBucketConfig,                  # extra_info
     dict[str, Any],                   # extra_info as dict
 ]
 
