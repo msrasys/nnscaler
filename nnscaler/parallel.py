@@ -1416,6 +1416,12 @@ hybrid.is_hybrid = True  # mark this function as hybrid optimizer factory
 
 
 _NON_PARALLEL_MODULE_ATTR_NAME = '_nnscaler_non_parallel_module_'
+_SYNC_GRAD_REQUIRED_ATTR = '_nnscaler_sync_grad_required'
+
+
+def _mark_sync_grad_required(module: torch.nn.Module, inputs, output) -> None:
+    if module.training:
+        setattr(module, _SYNC_GRAD_REQUIRED_ATTR, True)
 
 
 def build_optimizer(
@@ -1692,6 +1698,9 @@ def build_optimizer(
         )
     else:
         optimizer: torch.optim.Optimizer = optimizer_fn(_local_parameters(module), **kwargs)
+    if not isinstance(module, ParallelModule):
+        object.__setattr__(module, _SYNC_GRAD_REQUIRED_ATTR, False)
+        module.register_forward_hook(_mark_sync_grad_required)
     optimizer._non_parallel_module_reducer = non_parallel_module_reducer
     optimizer._extra_state = OptimizerExtraState(
             rank=torch.distributed.get_rank(),
@@ -1758,14 +1767,21 @@ def build_optimizer(
         orig_load_state_dict(state_dict)
     optimizer.load_state_dict = types.MethodType(_patched_load_state_dict, optimizer)
 
+    def _sync_grad_required():
+        if isinstance(module, ParallelModule):
+            return module._sync_grad_required
+        return getattr(module, _SYNC_GRAD_REQUIRED_ATTR, False)
+
+    def _reset_sync_grad_required():
+        if not isinstance(module, ParallelModule):
+            setattr(module, _SYNC_GRAD_REQUIRED_ATTR, False)
+
     def _sync_shard_grad(self):
         with _runtime_flags(skip_reducer=False):
-            # HACK: we reuse the _sync_grad_required flag of the first parallel module
-            # in order to support calling sync_shard_grad() multiple times.
-            # _sync_grad_required will reset to `True` in forward() of ParallelModule.
-            if parallel_modules[0]._sync_grad_required:
+            if _sync_grad_required():
+                _reset_sync_grad_required()  # reentrant safe
                 for m in parallel_modules:
-                    m.sync_grad()  # _sync_grad_required flag will reset inside sync_grad()
+                    m.sync_grad()
 
                 if non_parallel_module_reducer:
                     non_parallel_module_reducer.sync_grads()
@@ -1815,7 +1831,7 @@ def build_optimizer(
     optimizer.clip_gnorm = types.MethodType(_clip_gnorm, optimizer)
 
     def _scale_grads(self, scale: float) -> None:
-        if parallel_modules[0]._sync_grad_required:
+        if _sync_grad_required():
             raise RuntimeError("You can only call scale_grads() after gradients are synchronized.")
         for pg in optimizer.param_groups:
             for p in pg['params']:
@@ -1971,11 +1987,10 @@ def _get_optimizer_state_dict_info(
             if opt_extra_state.rank < opt_dedup_group_size:
                 for i in range(loc.offset, loc.offset + loc.count):
                     # if the parameter is not used or requires_grad is False, it will not be in the state dict
-                    # for us, as we use a continous buffer, it will always have grad, so it will always be in the state dict
                     # the state for each parameters is inserted in Adam in a lazy way.
                     # see https://github.com/pytorch/pytorch/blob/dad1b765848c4f52501c4c60b1c3e6fbd3cc8837/torch/optim/adam.py#L103
-                    assert i in opt_state_dict['state']
-                    opt_state_dicts[module_prefix][opt_extra_state.rank]['state'][i - loc.offset] = opt_state_dict['state'][i]
+                    if i in opt_state_dict['state']:
+                        opt_state_dicts[module_prefix][opt_extra_state.rank]['state'][i - loc.offset] = opt_state_dict['state'][i]
                 # TODO: inaccurate param_groups, for example, the 'params' in it is not right.
                 # we have this to make `ParallelModule.merge_partial_states` happy.
                 opt_state_dicts[module_prefix][opt_extra_state.rank]['param_groups'] = copy.deepcopy(opt_state_dict['param_groups'])
@@ -2399,6 +2414,9 @@ def _opt_load_merged_state_dict(module: ParallelModule, states: Dict[int, Dict[s
             if cnt in states:  # some parameters may not in the sates when it is not used or requires_grad is False in training
                 orig_param_dict[name] = states[cnt]
             cnt = cnt + 1
+
+        if not orig_param_dict:
+            return {}
 
         if module.compute_config.use_zero == 1:
             return _construct_optim_state_zero(module, orig_param_dict)
@@ -3012,7 +3030,11 @@ def _broadcast_opt_state(optimizer_state_dict: OptStateDict, state_indexes: List
     if rank == src_rank:
         state_info = {}
         for idx in state_indexes:
-            state_info[idx] = {key: (value.shape, value.dtype) for key, value in optimizer_state_dict['state'][idx].items()}
+            if idx in optimizer_state_dict['state']:
+                state_info[idx] = {
+                    key: (value.shape, value.dtype)
+                    for key, value in optimizer_state_dict['state'][idx].items()
+                }
         sent = [state_info]
     else:
         sent = [None]
@@ -3021,6 +3043,7 @@ def _broadcast_opt_state(optimizer_state_dict: OptStateDict, state_indexes: List
             src=src_rank,
             group=curr_parallel_group,
     )
+    state_indexes = list(sent[0])
     if rank != src_rank:
         for k, v in sent[0].items():
             optimizer_state_dict['state'][k] = {
@@ -3449,6 +3472,8 @@ def trimmed_broadcast_merged_state_dict(
     device = device or torch.cuda.current_device()
     world_size = torch.distributed.get_world_size()
     dst_ranks = dst_ranks or list(range(world_size))
+    if dst_ranks != sorted(set(dst_ranks)):
+        raise ValueError(f"Invalid destination ranks: {dst_ranks}. They must be unique and sorted.")
     cur_rank = torch.distributed.get_rank()
 
     if cur_rank not in dst_ranks or src_rank not in dst_ranks:

@@ -4,8 +4,33 @@ import pytest
 import torch
 
 from nnscaler.cli.trainer import Trainer
+from tests.cli.common import BranchedMixedModule
 from tests.launch_torchrun import launch_torchrun
 from tests.parallel_module.common import assert_equal
+
+
+class FirstBranchDataset(torch.utils.data.Dataset):
+    def __init__(self, dim: int, size: int = 8):
+        generator = torch.Generator().manual_seed(0)
+        self.data = torch.randn(size, dim, generator=generator)
+        self.target = torch.rand(size, dim, generator=generator)
+
+    def __getitem__(self, idx: int):
+        return {
+            'data1': self.data[idx],
+            'target': self.target[idx],
+        }
+
+    def __len__(self):
+        return len(self.data)
+
+
+class SecondBranchDataset(FirstBranchDataset):
+    def __getitem__(self, idx: int):
+        return {
+            'data2': self.data[idx],
+            'target': self.target[idx],
+        }
 
 
 def mixed1_worker(save_dir, config_file):
@@ -143,3 +168,203 @@ def mixed1_worker(save_dir, config_file):
 ])
 def test_mixed1(tmp_path, config_file):
     launch_torchrun(4, mixed1_worker, tmp_path, config_file)
+
+
+def conditional_parallel_module_worker(save_dir, include_inactive_parallel_module):
+    save_dir = Path(save_dir)
+    run_name = 'with_inactive' if include_inactive_parallel_module else 'active_only'
+    run_dir = save_dir / run_name
+    config_path = str(Path(__file__).with_name('trainer_args_mixed3.yaml').resolve())
+    module_types = ['tests.cli.common.MixModuleMLP3']
+    if include_inactive_parallel_module:
+        module_types.insert(0, 'tests.cli.common.MixModuleMLP2')
+    parallel_module_args = []
+    for index, module_type in enumerate(module_types):
+        prefix = f'--model.parallel_modules.{index}'
+        parallel_module_args.extend([
+            f'{prefix}.type', module_type,
+            f'{prefix}.args.dim', '16',
+            f'{prefix}.args.nlayers', '16',
+            f'{prefix}.forward_args_gen_fn', 'tests.cli.common.forward_args_gen_fn',
+        ])
+
+    trainer = Trainer([
+        '-f', config_path,
+        '--compute_config.plan_ngpus', '1',
+        '--compute_config.runtime_ngpus', '2',
+        '--max_epochs', '1',
+        '--max_train_steps', '1',
+        '--dataset.type', 'tests.cli.test_mixed_module.FirstBranchDataset',
+        '--dataset.train_args.size', '8',
+        '--dataset.val_args.size', '4',
+        '--enable_progress_bar', 'false',
+        '--gen_savedir', str(run_dir / 'gen'),
+        '--checkpoint.save_type', 'sharded',
+        '--checkpoint.save_dir', str(run_dir / 'ckpt'),
+        *parallel_module_args,
+    ])
+    trainer.run()
+    torch.distributed.barrier()
+    if trainer.rank == 0:
+        Trainer.merge_checkpoint(
+            list((run_dir / 'ckpt' / 'last').glob('*.ckpt')),
+            run_dir / 'merged.pt',
+        )
+    torch.distributed.barrier()
+
+    trainer = Trainer([
+        '-f', config_path,
+        '--compute_config.plan_ngpus', '1',
+        '--compute_config.runtime_ngpus', '2',
+        '--max_epochs', '2',
+        '--max_train_steps', '2',
+        '--dataset.type', 'tests.cli.test_mixed_module.FirstBranchDataset',
+        '--dataset.train_args.size', '8',
+        '--dataset.val_args.size', '4',
+        '--enable_progress_bar', 'false',
+        '--gen_savedir', str(run_dir / 'gen'),
+        '--checkpoint.save_type', 'deduped',
+        '--checkpoint.save_dir', str(run_dir / 'resumed_ckpt'),
+        '--checkpoint.resume_from.checkpoint', str(run_dir / 'merged.pt'),
+        *parallel_module_args,
+    ])
+    trainer.run()
+    torch.distributed.barrier()
+
+    trainer = Trainer([
+        '-f', config_path,
+        '--compute_config.plan_ngpus', '1',
+        '--compute_config.runtime_ngpus', '2',
+        '--max_epochs', '3',
+        '--max_train_steps', '3',
+        '--dataset.type', 'tests.cli.test_mixed_module.FirstBranchDataset',
+        '--dataset.train_args.size', '8',
+        '--dataset.val_args.size', '4',
+        '--enable_progress_bar', 'false',
+        '--gen_savedir', str(run_dir / 'gen'),
+        '--checkpoint.save_type', 'sharded',
+        '--checkpoint.save_dir', str(run_dir / 'resumed_ckpt'),
+        '--checkpoint.resume_from.checkpoint', 'last',
+        *parallel_module_args,
+    ])
+    trainer.run()
+    torch.distributed.barrier()
+    if trainer.rank == 0:
+        Trainer.merge_checkpoint(
+            list((run_dir / 'resumed_ckpt' / 'last').glob('*.ckpt')),
+            run_dir / 'result.pt',
+        )
+    torch.distributed.barrier()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.device_count() < 2, reason='lack of gpu devices')
+def test_conditional_parallel_module_sync(tmp_path):
+    launch_torchrun(2, conditional_parallel_module_worker, tmp_path, False)
+    launch_torchrun(2, conditional_parallel_module_worker, tmp_path, True)
+
+    active_only = torch.load(tmp_path / 'active_only' / 'result.pt', weights_only=False)
+    with_inactive = torch.load(tmp_path / 'with_inactive' / 'result.pt', weights_only=False)
+    assert_equal(active_only['model'], with_inactive['model'])
+    assert_equal(
+        active_only['optimizer']['param_groups'],
+        with_inactive['optimizer']['param_groups'],
+    )
+
+    # inactive states are saved in `active_only` checkpoints,
+    # because they are part of non-parallel module continuous buffer.
+    # but they are not present in `with_inactive` checkpoints,
+    # because they are part of inactive parallel module continuous buffer.
+    original_module = BranchedMixedModule(dim=16, nlayers=16)
+    inactive_state_indices = {
+        index for index, (name, _) in enumerate(original_module.named_parameters())
+        if name.startswith('mlp1.')
+    }
+    active_only_states = active_only['optimizer']['state']
+    with_inactive_states = with_inactive['optimizer']['state']
+    assert set(with_inactive_states) == set(active_only_states) - inactive_state_indices
+    for index, state in with_inactive_states.items():
+        assert_equal(state, active_only_states[index])
+
+
+def conditional_parallel_module_switch_worker(save_dir, resume_from_merged):
+    save_dir = Path(save_dir)
+    run_name = 'merged_resume' if resume_from_merged else 'sharded_resume'
+    run_dir = save_dir / run_name
+    config_path = str(Path(__file__).with_name('trainer_args_mixed3.yaml').resolve())
+    parallel_module_args = []
+    for index, module_type in enumerate([
+        'tests.cli.common.MixModuleMLP2',
+        'tests.cli.common.MixModuleMLP3',
+    ]):
+        prefix = f'--model.parallel_modules.{index}'
+        parallel_module_args.extend([
+            f'{prefix}.type', module_type,
+            f'{prefix}.args.dim', '16',
+            f'{prefix}.args.nlayers', '16',
+            f'{prefix}.forward_args_gen_fn', 'tests.cli.common.forward_args_gen_fn',
+        ])
+
+    common_args = [
+        '-f', config_path,
+        '--compute_config.plan_ngpus', '1',
+        '--compute_config.runtime_ngpus', '2',
+        '--dataset.train_args.size', '8',
+        '--dataset.val_args.size', '4',
+        '--enable_progress_bar', 'false',
+        '--gen_savedir', str(run_dir / 'gen'),
+        '--checkpoint.save_type', 'sharded',
+        '--checkpoint.save_dir', str(run_dir / 'ckpt'),
+        *parallel_module_args,
+    ]
+
+    trainer = Trainer([
+        *common_args,
+        '--max_epochs', '1',
+        '--max_train_steps', '1',
+        '--dataset.type', 'tests.cli.test_mixed_module.FirstBranchDataset',
+    ])
+    trainer.run()
+    torch.distributed.barrier()
+    if trainer.rank == 0:
+        Trainer.merge_checkpoint(
+            list((run_dir / 'ckpt' / 'last').glob('*.ckpt')),
+            run_dir / 'branch1.pt',
+        )
+    torch.distributed.barrier()
+
+    trainer = Trainer([
+        *common_args,
+        '--max_epochs', '2',
+        '--max_train_steps', '2',
+        '--dataset.type', 'tests.cli.test_mixed_module.SecondBranchDataset',
+        '--checkpoint.resume_from.checkpoint',
+        str(run_dir / 'branch1.pt') if resume_from_merged else 'last',
+    ])
+    trainer.run()
+    torch.distributed.barrier()
+    if trainer.rank == 0:
+        Trainer.merge_checkpoint(
+            list((run_dir / 'ckpt' / 'last').glob('*.ckpt')),
+            run_dir / 'result.pt',
+        )
+    torch.distributed.barrier()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.device_count() < 2, reason='lack of gpu devices')
+def test_conditional_parallel_module_switch_branches(tmp_path):
+    launch_torchrun(2, conditional_parallel_module_switch_worker, tmp_path, False)
+    launch_torchrun(2, conditional_parallel_module_switch_worker, tmp_path, True)
+
+    sharded_resume = torch.load(tmp_path / 'sharded_resume' / 'result.pt', weights_only=False)
+    merged_resume = torch.load(tmp_path / 'merged_resume' / 'result.pt', weights_only=False)
+    assert_equal(sharded_resume['model'], merged_resume['model'])
+    assert_equal(sharded_resume['optimizer'], merged_resume['optimizer'])
+
+    branch1 = torch.load(tmp_path / 'merged_resume' / 'branch1.pt', weights_only=False)
+    original_module = BranchedMixedModule(dim=16, nlayers=16)
+    branch2_state_indices = {
+        index for index, (name, _) in enumerate(original_module.named_parameters())
+        if name.startswith('mlp1.')
+    }
+    assert branch2_state_indices.isdisjoint(branch1['optimizer']['state'])
+    assert branch2_state_indices.issubset(merged_resume['optimizer']['state'])
