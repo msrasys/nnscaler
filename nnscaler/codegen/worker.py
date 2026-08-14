@@ -10,6 +10,7 @@ import time
 
 import dill
 
+from nnscaler.codegen.serialization import codegen_pickle_recursion_limit
 from nnscaler.flags import CompileFlag
 from nnscaler.graph.parser.register import CustomizedOps
 from nnscaler.runtime.module import ParallelModule
@@ -25,7 +26,8 @@ def _restore_compile_flags(flags: dict[str, object]) -> None:
 
 def generate_rank_range(payload_file: Path, outdir: Path, rank_start: int, rank_end: int) -> None:
     with payload_file.open('rb') as payload_stream:
-        payload = dill.load(payload_stream)
+        with codegen_pickle_recursion_limit():
+            payload = dill.load(payload_stream)
 
     _restore_compile_flags(payload['compile_flags'])
     CustomizedOps.kOpEmit.clear()

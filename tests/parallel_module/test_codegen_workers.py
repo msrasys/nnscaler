@@ -3,6 +3,7 @@
 
 import pickle
 from pathlib import Path
+import sys
 import time
 
 import pytest
@@ -246,6 +247,54 @@ class _FailingModuleCodeGen:
         Path(outfile).write_text(f'rank {rank}\n')
         with Path(outfile_attr_meta_map).open('wb') as stream:
             pickle.dump({'rank': rank}, stream)
+
+
+class _PayloadDepthModuleCodeGen:
+    def gen(
+            self,
+            rank,
+            *,
+            forward_args,
+            outfile,
+            attach,
+            as_parallel_module,
+            end2end_mode,
+            outfile_attr_meta_map,
+        ):
+        nested = forward_args['nested']
+        depth = 0
+        while isinstance(nested, list):
+            depth += 1
+            nested = nested[0]
+        Path(outfile).write_text(f'{rank}:{depth}\n')
+        with Path(outfile_attr_meta_map).open('wb') as stream:
+            pickle.dump({}, stream)
+
+
+def test_multi_process_codegen_serializes_deep_payload(tmp_path):
+    depth = 1500
+    nested = None
+    for _ in range(depth):
+        nested = [nested]
+
+    original_limit = sys.getrecursionlimit()
+    try:
+        sys.setrecursionlimit(1000)
+        _gencode_in_subprocesses(
+            _PayloadDepthModuleCodeGen(),
+            None,
+            {'nested': nested},
+            ComputeConfig(1, 2),
+            tmp_path,
+            2,
+        )
+        assert sys.getrecursionlimit() == 1000
+    finally:
+        sys.setrecursionlimit(original_limit)
+
+    assert (tmp_path / 'gencode0.py').read_text() == f'0:{depth}\n'
+    assert (tmp_path / 'gencode1.py').read_text() == f'1:{depth}\n'
+    assert (tmp_path / ParallelModule.ATTR_META_FILE).is_file()
 
 
 def test_worker_failure_terminates_siblings_and_cleans_staging(tmp_path):
