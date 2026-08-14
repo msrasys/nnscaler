@@ -242,16 +242,42 @@ class FlattenParamInfo:
 
 @dataclass(frozen=True, order=True)
 class ParamBucketConfig:
-    """Per-bucket reducer overrides.
+    """Override reducer behavior for a parameter bucket.
 
-    ``None`` inherits the reducer-level setting. A zero or unset bucket size
-    resolves to 25 MB for async buckets and unlimited for synchronous buckets.
+    This config can be returned by ``param_clss_fn`` to customize reduction for
+    selected parameters. Each ``None`` field inherits the corresponding
+    reducer-level setting. Parameters with different resolved configs are placed
+    in different buckets, even when their bucket-sort class is otherwise equal.
+
+    Note: Some member names start with ``reducer_`` for consistency with the
+    corresponding reducer-level configs. This remains a bucket-level config
+    that can override those reducer-level defaults.
+
+    Args:
+        zero_param_level_sharding: Whether ZeRO shards complete parameters rather
+            than individual elements. It is ignored when ZeRO is disabled.
+        use_async_reducer: Whether to overlap this bucket's reduction with
+            backward computation.
+        reducer_bucket_cap_mb: Maximum bucket size in MB. ``None`` inherits the
+            reducer setting. After inheritance, zero or an unset value resolves
+            to 25 MB for an async bucket and no size limit for a synchronous
+            bucket.
+        reducer_none_grad: Whether parameters retain ``grad=None`` when the
+            entire bucket is unused on every reducer rank. Parameters grouped in
+            one such bucket must have the same per-iteration usage state.
+        reducer_nreplicas: Positive divisor applied after this bucket's gradient
+            collective. It does not change the collective operation or its rank
+            group. With a SUM reducer, ``1`` preserves the summed gradient (for
+            example, replicas processing disjoint input shards), while ``N``
+            averages gradients from ``N`` equivalent replicas. Values greater
+            than one require a SUM reducer.
     """
 
     zero_param_level_sharding: Optional[bool] = None
     use_async_reducer: Optional[bool] = None
     reducer_bucket_cap_mb: Optional[float] = None
     reducer_none_grad: Optional[bool] = None
+    reducer_nreplicas: Optional[int] = None
 
     def resolve(
         self,
@@ -260,6 +286,7 @@ class ParamBucketConfig:
         use_async_reducer: bool,
         reducer_bucket_cap_mb: Optional[float],
         reducer_none_grad: bool,
+        reducer_nreplicas: int,
     ) -> 'ParamBucketConfig':
         resolved_async = use_async_reducer \
             if self.use_async_reducer is None \
@@ -275,6 +302,14 @@ class ParamBucketConfig:
         if not resolved_bucket_cap_mb:
             resolved_bucket_cap_mb = DEFAULT_ASYNC_REDUCER_BUCKET_CAP_MB if resolved_async else 0
 
+        resolved_nreplicas = reducer_nreplicas \
+            if self.reducer_nreplicas is None \
+            else self.reducer_nreplicas
+        if not isinstance(resolved_nreplicas, int) or resolved_nreplicas < 1:
+            raise ValueError(
+                f"reducer_nreplicas should be an integer greater than or equal to 1, got {resolved_nreplicas}"
+            )
+
         return ParamBucketConfig(
             zero_param_level_sharding=zero > 0 and (zero_param_level_sharding
                 if self.zero_param_level_sharding is None
@@ -285,6 +320,7 @@ class ParamBucketConfig:
             reducer_none_grad=reducer_none_grad
                 if self.reducer_none_grad is None
                 else self.reducer_none_grad,
+            reducer_nreplicas=resolved_nreplicas,
         )
 
 
@@ -424,6 +460,11 @@ class Bucket:
     def zero3(self) -> bool:
         """Whether enable zero3 for this bucket"""
         return self._z3
+
+    @property
+    def nreplicas(self) -> int:
+        """Divisor applied to this bucket after gradient reduction."""
+        return self._nreplicas
 
     @property
     def grad_accumulation_steps(self) -> int:
@@ -1120,6 +1161,7 @@ class Reducer:
             self._async,
             reducer_bucket_cap_mb,
             self._use_none_grad,
+            self._nreplicas,
         )
         self._param_clss: dict[
             torch.nn.Parameter,
@@ -1145,6 +1187,7 @@ class Reducer:
                             self._async,
                             reducer_bucket_cap_mb,
                             self._use_none_grad,
+                            self._nreplicas,
                         )
 
                 return tuple(x), default_param_config
@@ -1368,7 +1411,7 @@ class Reducer:
                 self._align_size,
                 param_cls=param_cls,
                 params_info=self._params_info,
-                nreplicas=self._nreplicas,
+                nreplicas=param_config.reducer_nreplicas,
                 use_none_grad=param_config.reducer_none_grad,
             )
             buckets.append(bucket)
