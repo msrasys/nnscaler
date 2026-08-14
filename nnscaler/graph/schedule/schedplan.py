@@ -47,11 +47,9 @@ This can help to achieve better performance in pipeline parallelism
 by separating compute and communication to different streams.
 
 Some implementation details:
-- Stream information is attached to Segments/Adapters via `op_context` field,
-    which is a dict that can be used to store any information for codegen.
-    The key for stream context is 'stream_context', and the value is a `StreamContext` dataclass that contains the stream name and wait stream names.
-- Stream information for other operations including WeightReducers, dataloaders, and zero_grad will be passed to `ExecutionPlan`
-    and finally attached to those operations in scheduler codegen.
+- Stream information for segments, adapters, and dataloaders is attached to their plan-local `Block`
+    and copied to the corresponding execution cell during lowering.
+- Stream information for WeightReducers and zero_grad is passed directly to `ExecutionPlan`.
 
 How to create a SchedulePlan for users:
 1) Create a SchedulePlan with the graph and number of micro-batches.
@@ -271,10 +269,6 @@ class PlanBase:
     def stream_config(self, stream_config: StreamConfig):
         self._stream_config = stream_config
 
-    def _set_node_stream(self, node: IRCell, stream_context: StreamContext):
-        if stream_context is not None:
-            node.set_op_context('stream_context', stream_context)
-
     def nodes(self) -> Tuple[Block]:
         return tuple(self._seqs)
 
@@ -432,7 +426,7 @@ class PlanBase:
         Place dataloaders together with segments
         """
         def insert_block(dl, mid, step):
-            dl_block = Block(dl, mid, 1)
+            dl_block = Block(dl, mid, 1, self._stream_config.dataloader)
             # print(f'inserting microbatch {mid} at step {step} before {segment.name}{segment.cid}')
             self._blocks.append(dl_block)
             self._step_blocks[step+block.span-1].insert(0, dl_block)
@@ -440,7 +434,6 @@ class PlanBase:
 
         # insert dataloaders to its devices before the first required segment
         for dl in self._dependency.dataloaders:
-            self._set_node_stream(dl, self._stream_config.dataloader)
             inserted_mids = set()
             for step in range(self.nsteps):
                 blocks = self.start_blocks(step)
@@ -558,12 +551,11 @@ class SchedulePlan(PlanBase):
             # These adapters don't have any dependent recver segment,
             # and will be placed at the end of the plan to not block the schedule execution.
             if adapter not in self._dependency.recvers:
-                self._set_node_stream(adapter, self._stream_config.result_broadcast)
                 for mid in range(self._num_microbatches):
-                    self._step_adapters[self.nsteps-1].append(Block(adapter, mid, 1))
+                    self._step_adapters[self.nsteps-1].append(
+                        Block(adapter, mid, 1, self._stream_config.result_broadcast)
+                    )
                 continue
-
-            self._set_node_stream(adapter, self._stream_config.inter_segment_move)
 
             # find sender step and insert adapter
             for step in range(self.nsteps):
@@ -574,7 +566,9 @@ class SchedulePlan(PlanBase):
                 if sender in segments:
                     span = blocks[segments.index(sender)].span
                     mid = mids[segments.index(sender)]
-                    self._step_adapters[step+span-1].append(Block(adapter, mid, 1))
+                    self._step_adapters[step+span-1].append(
+                        Block(adapter, mid, 1, self._stream_config.inter_segment_move)
+                    )
 
     def topo_sort(self):
         super().topo_sort()
