@@ -25,6 +25,7 @@ import torch
 import torch.distributed
 
 from nnscaler.codegen import ModuleCodeGen
+from nnscaler.codegen.serialization import codegen_pickle_recursion_limit
 from nnscaler.codegen.schedule.schedule import ScheduleCodeGen
 
 from nnscaler.execplan import ExecutionPlan
@@ -1142,7 +1143,8 @@ def _gencode_in_subprocesses(
         }
         with tempfile.NamedTemporaryFile(prefix='nnscaler-codegen-', suffix='.dill', delete=False) as stream:
             payload_file = Path(stream.name)
-            dill.dump(payload, stream)
+            with codegen_pickle_recursion_limit():
+                dill.dump(payload, stream)
 
         for worker_id, (rank_start, rank_end) in enumerate(rank_ranges):
             log_file = staging_dir / f'worker{worker_id}.log'
