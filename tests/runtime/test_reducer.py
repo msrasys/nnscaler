@@ -426,7 +426,7 @@ def test_reducer_nreplicas():
     reducer.add_param(torch.nn.Parameter(torch.randn(4)))
     reducer.build_buckets()
     for bucket in reducer.buckets:
-        assert bucket._nreplicas == 3
+        assert bucket.nreplicas == 3
 
 
 def _add_scalar_params(reducer, num_params, param_clss=None, param_cls=None):
@@ -444,12 +444,13 @@ def _add_scalar_params(reducer, num_params, param_clss=None, param_cls=None):
 
 @mock_reducer_env(0, 2)
 def test_reducer_build_per_bucket_options():
-    reducer = Reducer([0, 1], async_op=False, use_none_grad=True)
+    reducer = Reducer([0, 1], async_op=False, use_none_grad=True, nreplicas=2)
     param_clss = {}
     params = _add_scalar_params(reducer, 3)
     param_clss[params[0]] = (0, ParamBucketConfig(
         use_async_reducer=True,
         reducer_bucket_cap_mb=0,
+        reducer_nreplicas=1,
     ))
     param_clss[params[1]] = (0, ParamBucketConfig(reducer_none_grad=False))
     param_clss[params[2]] = ParamBucketConfig()
@@ -463,6 +464,7 @@ def test_reducer_build_per_bucket_options():
         (False, False),
         (True, True),
     ]
+    assert [bucket.nreplicas for bucket in buckets] == [2, 2, 1]
     assert [bucket.param_cls[-1].reducer_bucket_cap_mb for bucket in buckets] == [
         0,
         0,
@@ -470,6 +472,42 @@ def test_reducer_build_per_bucket_options():
     ]
     assert set(reducer.get_opt_params().values()) == {(), (0,)}
     assert all(bucket._flatten_param_info.params_info for bucket in buckets)
+
+
+@mock_reducer_env(0, 2)
+def test_reducer_per_bucket_nreplicas_scales_gradients(monkeypatch):
+    reducer = Reducer([0, 1], nreplicas=2)
+    inherited_param, sum_param = _add_scalar_params(reducer, 2)
+    reducer.build_buckets(param_clss={
+        inherited_param: (0, ParamBucketConfig()),
+        sum_param: (0, ParamBucketConfig(reducer_nreplicas=1)),
+    })
+
+    assert len(reducer.buckets) == 2
+    for bucket in reducer.buckets:
+        bucket._contiguous_grads.fill_(1.0)
+
+    def all_reduce(tensor, *args, **kwargs):
+        tensor.mul_(2)
+
+    monkeypatch.setattr(torch.distributed, 'all_reduce', all_reduce)
+    reducer.sync_grads()
+
+    assert inherited_param.grad.item() == 1.0
+    assert sum_param.grad.item() == 2.0
+
+
+@mock_reducer_env(0, 2)
+def test_reducer_per_bucket_nreplicas_validation():
+    reducer = Reducer([0, 1])
+    param = _add_scalar_params(reducer, 1)[0]
+    with pytest.raises(ValueError, match='reducer_nreplicas should be an integer greater than or equal to 1'):
+        reducer.build_buckets({param: ParamBucketConfig(reducer_nreplicas=0)})
+
+    reducer = Reducer([0, 1], reduce_op='avg')
+    param = _add_scalar_params(reducer, 1)[0]
+    with pytest.raises(ValueError, match='nreplicas should be used with sum reduce op'):
+        reducer.build_buckets({param: ParamBucketConfig(reducer_nreplicas=2)})
 
 
 @mock_reducer_env(0, 2)
