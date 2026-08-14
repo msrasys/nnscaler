@@ -94,6 +94,21 @@ def test_deserialize_int_or_dict_of_ints(value, expected):
     assert _deserialize_int_or_dict_of_ints(value) == expected
 
 
+@pytest.mark.parametrize('cli_args', [
+    ['--global_batch_size', '0'],
+    ['--global_batch_size', '-1'],
+    ['--global_batch_size', '{}'],
+    ['--global_batch_size', '{0: 8, 5: 0}'],
+    ['--global_batch_size!', '--grad_accumulation_steps', '0'],
+    ['--global_batch_size!', '--grad_accumulation_steps', '{}'],
+    ['--global_batch_size!', '--grad_accumulation_steps', '{0: 2, 5: -1}'],
+])
+def test_batch_size_config_must_be_positive(cli_args):
+    config_path = str(Path(__file__).with_name('trainer_args.yaml').resolve())
+    with pytest.raises(ValueError, match='must (not be empty|be positive)|values must be positive'):
+        TrainerArgs.from_cli(['-f', config_path, *cli_args])
+
+
 # --- grad dtype tests ---
 
 def test_resolve_precision_default_grad_none():

@@ -23,6 +23,12 @@ from ..launch_torchrun import launch_torchrun
 from .common import MixedModule, MixModuleMLP, MixModuleMLP3
 
 
+def test_format_metrics_uses_current_epoch_steps():
+    trainer = object.__new__(Trainer)
+    assert trainer._format_metrics('Epoch 1', 3, {'loss': 1.0}, total_steps=12) == \
+        'Epoch 1: 03/12 loss=1.000'
+
+
 def trainer_logging_worker(save_dir, run_async):
     save_dir = Path(save_dir)
     config_path = str(Path(__file__).with_name('trainer_args.yaml').resolve())

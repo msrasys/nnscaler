@@ -1029,6 +1029,18 @@ class TrainerArgs(PrecisionMixin, PolicyMixin):
         if not self.compute_config.use_end2end:
             raise ValueError("use_end2end must be True")
 
+        for name, value in (
+            ('global_batch_size', self.global_batch_size),
+            ('grad_accumulation_steps', self.grad_accumulation_steps),
+        ):
+            if isinstance(value, dict):
+                if not value:
+                    raise ValueError(f"`{name}` must not be empty")
+                if any(v <= 0 for v in value.values()):
+                    raise ValueError(f"`{name}` values must be positive")
+            elif value is not None and value <= 0:
+                raise ValueError(f"`{name}` must be positive")
+
         if (self.global_batch_size is not None and self.grad_accumulation_steps is not None
                 and isinstance(self.global_batch_size, dict) != isinstance(self.grad_accumulation_steps, dict)):
             raise ValueError("`global_batch_size` and `grad_accumulation_steps` must both be int or both be dict")

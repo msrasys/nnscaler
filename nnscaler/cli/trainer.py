@@ -89,7 +89,6 @@ class Trainer:
         self.train_status = TrainStatus()
         self.dummy_input = None
         self.total_train_steps_per_epoch: Dict[int, int] = {}
-        self.max_train_steps_per_epoch = None
         self.max_train_steps = None
         self.loggers = []
         self.hook = None
@@ -198,7 +197,6 @@ class Trainer:
         DeviceGroup().get_group(self.node_leader_ranks)
 
         self.total_train_steps_per_epoch = self._get_train_steps_per_epoch()
-        self.max_train_steps_per_epoch = max(self.total_train_steps_per_epoch.values())
 
         if self.train_args.max_epochs and self.train_args.max_train_steps:
             self.max_train_steps = min(
@@ -613,9 +611,13 @@ class Trainer:
             'ram_gb_used': ram_gb_used,
          }, tag=tag)
 
-    def _format_metrics(self, epoch_desc, idx, metrics: Dict[str, Union[float,int]]):
-        ndigits = len(str(self.max_train_steps_per_epoch))
-        idx_format = f"0{ndigits}d"
+    def _format_metrics(
+        self,
+        epoch_desc,
+        idx,
+        metrics: Dict[str, Union[float, int]],
+        total_steps: Optional[int] = None,
+    ):
         int_format = ''
         float_format = '.3f'
         float_scientific_format = '.3e'
@@ -633,7 +635,10 @@ class Trainer:
             ]
         )
         if idx is not None:
-            step_str = f'{format(idx, idx_format)}/{self.max_train_steps_per_epoch} '
+            if total_steps is None:
+                raise ValueError("total_steps is required when idx is specified")
+            idx_format = f"0{len(str(total_steps))}d"
+            step_str = f'{format(idx, idx_format)}/{total_steps} '
         else:
             step_str = f''
         return f"{epoch_desc}: {step_str}{metrics_str}"
@@ -1084,11 +1089,12 @@ class Trainer:
         ndigits = len(str(max_epoch))
         epoch_format = f"0{ndigits}d"
         epoch_desc = f'Epoch {format(epoch, epoch_format)}'
+        total_steps = self._steps_in_epoch(epoch)
 
         if self.rank == 0:
             data_iter = tqdm(
                 data_iter,
-                total=self._steps_in_epoch(epoch),
+                total=total_steps,
                 initial=resume_from_idx,
                 desc=epoch_desc,
                 disable=not self.train_args.enable_progress_bar,
@@ -1198,7 +1204,7 @@ class Trainer:
                 data_iter.set_postfix(step_metrics)
                 if self.train_args.enable_log_progress \
                     and self.train_status.finished_train_steps % self.train_args.log_progress_every_n_train_steps == 0:
-                    logger.info(self._format_metrics(epoch_desc, idx + 1, step_metrics))
+                    logger.info(self._format_metrics(epoch_desc, idx + 1, step_metrics, total_steps))
                     step_metrics = {}
 
             self.hook.on_step_end(self, epoch, idx, step_metrics, aggregated_outputs)
@@ -1215,7 +1221,7 @@ class Trainer:
             # max_train_steps is reached
             if self.train_status.finished_train_steps >= self.max_train_steps:
                 if step_metrics and self.train_args.enable_log_progress:
-                    logger.info(self._format_metrics(epoch_desc, idx + 1, step_metrics))
+                    logger.info(self._format_metrics(epoch_desc, idx + 1, step_metrics, total_steps))
                     step_metrics = {}
                 if not has_validated:
                     self._validate_and_save(step_stat)
