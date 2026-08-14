@@ -12,6 +12,7 @@ and a single flash_attn computation (no ring loop).
 
 from dataclasses import dataclass
 from collections import OrderedDict
+from math import prod
 from typing import Tuple, Optional, List
 
 import torch
@@ -165,6 +166,51 @@ def _all_to_all_varlen(
     return output
 
 
+def _all_to_all_varlen_pair(
+    first: torch.Tensor,
+    second: torch.Tensor,
+    input_split_sizes: List[int],
+    output_split_sizes: List[int],
+    group: dist.ProcessGroup,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Fuse two per-token payloads into a single variable-size all-to-all."""
+    if first.shape[0] != second.shape[0]:
+        raise ValueError(
+            "fused tensors must have the same number of tokens, got "
+            f"{first.shape[0]} and {second.shape[0]}"
+        )
+    if first.dtype != second.dtype:
+        raise ValueError(
+            "fused tensors must have the same dtype, got "
+            f"{first.dtype} and {second.dtype}"
+        )
+    if first.device != second.device:
+        raise ValueError(
+            f"fused tensors must be on the same device, got {first.device} and {second.device}"
+        )
+
+    first_shape = tuple(first.shape[1:])
+    second_shape = tuple(second.shape[1:])
+    first_width = prod(first_shape)
+    second_width = prod(second_shape)
+    token_count = first.shape[0]
+
+    fused = torch.cat(
+        (
+            first.reshape(token_count, first_width),
+            second.reshape(token_count, second_width),
+        ),
+        dim=1,
+    )
+    received = _all_to_all_varlen(fused, input_split_sizes, output_split_sizes, group)
+    output_size = received.shape[0]
+    received_first, received_second = received.split((first_width, second_width), dim=1)
+    return (
+        received_first.reshape((output_size,) + first_shape),
+        received_second.reshape((output_size,) + second_shape),
+    )
+
+
 def _a2a_communicate_kv(
     k: torch.Tensor,
     v: torch.Tensor,
@@ -193,8 +239,9 @@ def _a2a_communicate_kv(
         send_k = k.new_empty((0, k.shape[1], k.shape[2]))
         send_v = v.new_empty((0, v.shape[1], v.shape[2]))
 
-    recv_k = _all_to_all_varlen(send_k, input_split_sizes, output_split_sizes, group)
-    recv_v = _all_to_all_varlen(send_v, input_split_sizes, output_split_sizes, group)
+    recv_k, recv_v = _all_to_all_varlen_pair(
+        send_k, send_v, input_split_sizes, output_split_sizes, group
+    )
 
     # Construct extended K/V
     if recv_size > 0:
@@ -238,8 +285,9 @@ def _a2a_communicate_grad(
         send_dk = dk_local.new_empty((0, dk_local.shape[1], dk_local.shape[2]))
         send_dv = dv_local.new_empty((0, dv_local.shape[1], dv_local.shape[2]))
 
-    dk_from_next = _all_to_all_varlen(send_dk, input_split_sizes, output_split_sizes, group)
-    dv_from_next = _all_to_all_varlen(send_dv, input_split_sizes, output_split_sizes, group)
+    dk_from_next, dv_from_next = _all_to_all_varlen_pair(
+        send_dk, send_dv, input_split_sizes, output_split_sizes, group
+    )
     if send_size == 0:
         dk_from_next = None
         dv_from_next = None
