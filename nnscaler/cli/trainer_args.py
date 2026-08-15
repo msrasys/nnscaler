@@ -936,6 +936,13 @@ class TrainerArgs(PrecisionMixin, PolicyMixin):
     # validation metrics will also be printed if it is not None.
     log_progress_every_n_train_steps: Optional[int] = 100
 
+    # Sample rank-level phase, reducer-arrival, GPU and InfiniBand metrics.
+    # Disabled by default. The profiler reuses the trainer's existing timer
+    # all-gather, so enabling it does not add a second per-step collective.
+    straggler_profile_interval: int = 0
+    straggler_profile_topk: int = 5
+    straggler_profile_gpu_sample_interval: float = 1.0
+
     seed: Optional[int] = None
     # environment initialization function
     # you can put your environment initialization code here
@@ -977,6 +984,22 @@ class TrainerArgs(PrecisionMixin, PolicyMixin):
             or self.codegen_workers < 1
         ):
             raise ValueError(f"codegen_workers must be a positive integer, got {self.codegen_workers}")
+
+        if self.straggler_profile_interval < 0:
+            raise ValueError(
+                'straggler_profile_interval must be non-negative, got '
+                f'{self.straggler_profile_interval}'
+            )
+        if self.straggler_profile_topk <= 0:
+            raise ValueError(
+                'straggler_profile_topk must be positive, got '
+                f'{self.straggler_profile_topk}'
+            )
+        if self.straggler_profile_gpu_sample_interval <= 0:
+            raise ValueError(
+                'straggler_profile_gpu_sample_interval must be positive, got '
+                f'{self.straggler_profile_gpu_sample_interval}'
+            )
 
         self.precision = _resolve_precision(self.precision)
 

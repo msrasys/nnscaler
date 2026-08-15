@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 
-from collections import deque
+from collections import Counter, deque
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, asdict
 from typing import Any, Dict, List, Optional, Union
@@ -11,6 +11,9 @@ from pathlib import Path
 import sys, os
 import copy
 import inspect
+import json
+import math
+import socket
 import warnings
 import shutil
 import logging
@@ -31,6 +34,12 @@ from .trainer_args import AggregatedOutputs, TrainerArgs, fix_input
 from .train_hook import AggregatedTrainHook, TrainHook, TrainHookHost
 from .mixed_module import parallelize_model, mixin_module
 from .serialization import Checkpointer
+from .straggler_profile import (
+    GpuTelemetrySampler,
+    InfiniBandTelemetrySampler,
+    finite_pearson,
+    finite_statistics,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -100,6 +109,23 @@ class Trainer:
         # RNG states pending resume; reset to None after resuming
         self.rng_states_from_resume: dict[str, torch.Tensor] | None = None
         self.profiler = None
+        self._straggler_profile_enabled = False
+        self._straggler_profile_this_step = False
+        self._straggler_profile_metrics: Dict[str, float] = {}
+        self._straggler_profile_rank_metadata = []
+        self._straggler_profile_gpu_sampler = None
+        self._straggler_profile_ib_sampler = None
+        self._straggler_profile_node_counts = Counter()
+        self._straggler_profile_replica_counts = Counter()
+        self._straggler_profile_history = deque(maxlen=100)
+        self._straggler_profile_iteration_start_at = None
+        self._straggler_profile_train_start_at = None
+        self._straggler_profile_reducer_first_ready = None
+        self._straggler_profile_reducer_last_ready = None
+        self._straggler_profile_reducer_first_done = None
+        self._straggler_profile_reducer_last_done = None
+        self._straggler_profile_reducer_bucket_count = 0
+        self._straggler_profile_reducer_group_size = 0
 
     def run(self):
         try:
@@ -107,6 +133,8 @@ class Trainer:
             if not self.train_args.compile_mode:
                 self._train()
         finally:
+            if self._straggler_profile_gpu_sampler is not None:
+                self._straggler_profile_gpu_sampler.close()
             if self.checkpointer:
                 self.checkpointer.flush()
             for stage in ['train', 'val', 'test']:
@@ -195,6 +223,8 @@ class Trainer:
         for local_rank0 in range(0, self.world_size, self.local_world_size):
             DeviceGroup().get_group(list(range(local_rank0, local_rank0 + self.local_world_size)))
 
+        self._setup_straggler_profile()
+
         self.total_train_steps_per_epoch = len(self.dataloader['train']) // self.train_args.update_freq
         if len(self.dataloader['train']) % self.train_args.update_freq != 0:
             self.total_train_steps_per_epoch += 1  # will add extra dummy batches
@@ -222,8 +252,13 @@ class Trainer:
         # (see `train_args.optimizer.grad_reduction`` handling in `train_epoch`).
         # This is useful to avoid overflow when the gradients are large.
         def reducer_pre_hook(reducer, grad):
+            self._record_reducer_ready(reducer)
             grad.div_(self.train_args.optimizer.grad_reduce_divisor or self.train_args.scaling_factor)
         self.optimizer.register_reducer_pre_hook(reducer_pre_hook)
+        if self._straggler_profile_enabled:
+            self.optimizer.register_reducer_post_hook(
+                lambda reducer, grad: self._record_reducer_done(reducer)
+            )
         # Currently we never pass `last_epoch` to its constructor
         self.lr_scheduler = self.train_args.create_lr_scheduler(self.optimizer)
         self.loggers = self.train_args.create_loggers()
@@ -387,10 +422,157 @@ class Trainer:
             self._log_executor.submit(self._log_metrics_sync, dict(metrics), step, tag)
         )
 
-    def _aggregate_timer_walls(self, timer_walls: Dict[str, float]) -> Dict[str, float]:
-        names = tuple(timer_walls)
+    @property
+    def is_straggler_profile_step(self) -> bool:
+        """Whether the current optimizer step is collecting rank-level diagnostics."""
+        return self._straggler_profile_this_step
+
+    def set_straggler_profile_metrics(self, metrics: Dict[str, Union[float, int]]) -> None:
+        """Attach model/workload metrics to the sampled rank record."""
+        if not self._straggler_profile_this_step:
+            return
+        for name, value in metrics.items():
+            if isinstance(value, torch.Tensor):
+                if value.numel() != 1:
+                    raise ValueError(f'straggler metric {name} must be scalar, got {value.shape}')
+                value = value.item()
+            self._straggler_profile_metrics[name] = float(value)
+
+    def _setup_straggler_profile(self) -> None:
+        interval = self.train_args.straggler_profile_interval
+        self._straggler_profile_enabled = interval > 0
+        if not self._straggler_profile_enabled:
+            return
+
+        hostname = socket.gethostname()
+        local_metadata = {
+            'rank': self.rank,
+            'local_rank': self.local_rank,
+            'node_rank': self.node_rank,
+            'hostname': hostname,
+            'pod_name': os.environ.get('POD_NAME', os.environ.get('HOSTNAME', hostname)),
+            'node_name': os.environ.get('NODE_NAME', hostname),
+        }
+        metadata = [None] * self.world_size
+        torch.distributed.all_gather_object(metadata, local_metadata)
+        self._straggler_profile_rank_metadata = metadata
+        self._straggler_profile_gpu_sampler = GpuTelemetrySampler(
+            self.local_rank,
+            self.train_args.straggler_profile_gpu_sample_interval,
+        )
+        self._straggler_profile_ib_sampler = InfiniBandTelemetrySampler(
+            enabled=self.local_rank == 0,
+        )
+        if self.rank == 0:
+            logger.info(
+                'Straggler profiling enabled: interval=%s topk=%s world_size=%s '
+                'plan_ngpus=%s local_world_size=%s',
+                interval,
+                self.train_args.straggler_profile_topk,
+                self.world_size,
+                self.train_args.compute_config.plan_ngpus,
+                self.local_world_size,
+            )
+
+    def _start_straggler_profile_step(self, step: int, iteration_start_at: float) -> None:
+        self._straggler_profile_this_step = (
+            self._straggler_profile_enabled
+            and step % self.train_args.straggler_profile_interval == 0
+        )
+        self._straggler_profile_metrics = {}
+        self._straggler_profile_iteration_start_at = iteration_start_at
+        self._straggler_profile_train_start_at = None
+        self._straggler_profile_reducer_first_ready = None
+        self._straggler_profile_reducer_last_ready = None
+        self._straggler_profile_reducer_first_done = None
+        self._straggler_profile_reducer_last_done = None
+        self._straggler_profile_reducer_bucket_count = 0
+        self._straggler_profile_reducer_group_size = 0
+        if not self._straggler_profile_this_step:
+            return
+        self._straggler_profile_gpu_sampler.reset()
+        self._straggler_profile_ib_sampler.begin()
+
+    def _record_reducer_ready(self, reducer) -> None:
+        if not self._straggler_profile_this_step or self._straggler_profile_train_start_at is None:
+            return
+        elapsed = time.perf_counter() - self._straggler_profile_train_start_at
+        if self._straggler_profile_reducer_first_ready is None:
+            self._straggler_profile_reducer_first_ready = elapsed
+        self._straggler_profile_reducer_last_ready = elapsed
+        self._straggler_profile_reducer_bucket_count += 1
+        self._straggler_profile_reducer_group_size = max(
+            self._straggler_profile_reducer_group_size,
+            len(reducer.ranks),
+        )
+
+    def _record_reducer_done(self, reducer) -> None:
+        if not self._straggler_profile_this_step or self._straggler_profile_train_start_at is None:
+            return
+        elapsed = time.perf_counter() - self._straggler_profile_train_start_at
+        if self._straggler_profile_reducer_first_done is None:
+            self._straggler_profile_reducer_first_done = elapsed
+        self._straggler_profile_reducer_last_done = elapsed
+
+    def _finish_straggler_profile_step(self, train_step_wall: float) -> Dict[str, float]:
+        if not self._straggler_profile_this_step:
+            return {}
+        first_ready = self._straggler_profile_reducer_first_ready
+        last_ready = self._straggler_profile_reducer_last_ready
+        first_done = self._straggler_profile_reducer_first_done
+        last_done = self._straggler_profile_reducer_last_done
+        profile_metrics = dict(self._straggler_profile_metrics)
+        profile_metrics.update({
+            'reducer_first_ready_s': first_ready if first_ready is not None else math.nan,
+            'reducer_last_ready_s': last_ready if last_ready is not None else math.nan,
+            'reducer_launch_span_s': (
+                last_ready - first_ready
+                if first_ready is not None and last_ready is not None else math.nan
+            ),
+            'reducer_first_done_s': first_done if first_done is not None else math.nan,
+            'reducer_last_done_s': last_done if last_done is not None else math.nan,
+            'reducer_host_wait_s': (
+                max(0.0, last_done - last_ready)
+                if last_ready is not None and last_done is not None else math.nan
+            ),
+            'reducer_exposed_tail_s': (
+                max(0.0, train_step_wall - last_ready)
+                if last_ready is not None else math.nan
+            ),
+            'reducer_last_ready_from_iter_s': (
+                self._straggler_profile_train_start_at
+                - self._straggler_profile_iteration_start_at
+                + last_ready
+                if last_ready is not None else math.nan
+            ),
+            'reducer_bucket_count': float(self._straggler_profile_reducer_bucket_count),
+            'reducer_group_size': float(self._straggler_profile_reducer_group_size),
+            'zero_subgroup_size': (
+                float(
+                    self._straggler_profile_reducer_group_size
+                    // self.train_args.compute_config.zero_ngroups
+                )
+                if self._straggler_profile_reducer_group_size else math.nan
+            ),
+        })
+        profile_metrics.update(self._straggler_profile_gpu_sampler.collect())
+        profile_metrics.update(self._straggler_profile_ib_sampler.collect())
+        return profile_metrics
+
+    def _aggregate_timer_walls(
+        self,
+        timer_walls: Dict[str, float],
+        profile_metrics: Optional[Dict[str, float]] = None,
+    ) -> Dict[str, float]:
+        gathered_metrics = dict(timer_walls)
+        if profile_metrics:
+            for name in sorted(profile_metrics):
+                if name in gathered_metrics:
+                    raise ValueError(f'duplicate rank metric {name}')
+                gathered_metrics[name] = profile_metrics[name]
+        names = tuple(gathered_metrics)
         local_walls = torch.tensor(
-            tuple(timer_walls.values()),
+            tuple(gathered_metrics.values()),
             dtype=torch.float64,
             device=torch.cuda.current_device(),
         )
@@ -401,15 +583,167 @@ class Trainer:
         )
         torch.distributed.all_gather_into_tensor(all_walls, local_walls)
         all_walls = all_walls.view(self.world_size, len(names))
+        timer_count = len(timer_walls)
+        timer_values = all_walls[:, :timer_count]
         stats = torch.stack(
-            (all_walls.mean(dim=0), all_walls.amax(dim=0) - all_walls.amin(dim=0)),
+            (timer_values.mean(dim=0), timer_values.amax(dim=0) - timer_values.amin(dim=0)),
             dim=1,
         ).tolist()
-        return {
+        metrics = {
             metric_name: value
-            for name, (avg, delta) in zip(names, stats)
+            for name, (avg, delta) in zip(tuple(timer_walls), stats)
             for metric_name, value in ((f'{name}_avg', avg), (f'{name}_delta', delta))
         }
+        if profile_metrics and self.rank == 0:
+            all_walls_cpu = all_walls.cpu()
+            for name, values in zip(names, all_walls_cpu.T):
+                rank_stats = finite_statistics(values)
+                if rank_stats is None:
+                    continue
+                for stat_name in ('p50', 'p95', 'max'):
+                    metrics[f'{name}_{stat_name}'] = rank_stats[stat_name]
+                metrics[f'{name}_max_rank'] = rank_stats['max_rank']
+                metrics[f'{name}_max_min'] = rank_stats['max'] - rank_stats['min']
+            metrics.update(self._log_straggler_profile(all_walls_cpu, names))
+        return metrics
+
+    def _rank_profile_record(self, rank: int, value: float, all_values, name_to_index):
+        metadata = dict(self._straggler_profile_rank_metadata[rank])
+        metadata['value'] = value
+        plan_ngpus = self.train_args.compute_config.plan_ngpus
+        metadata['replica_id'] = rank // plan_ngpus
+        metadata['plan_offset'] = rank % plan_ngpus
+        related_names = (
+            'attention_cost_sum',
+            'attention_cost_max',
+            'max_sequence_length',
+            'moe_expert_max_over_mean',
+            'gpu_util_avg',
+            'gpu_sm_clock_min_mhz',
+            'gpu_power_avg_w',
+            'gpu_throttle_reasons',
+        )
+        for name in related_names:
+            if name in name_to_index:
+                related_value = all_values[rank, name_to_index[name]].item()
+                if math.isfinite(related_value):
+                    metadata[name] = related_value
+
+        node_local_rank0 = metadata['node_rank'] * self.local_world_size
+        for name in ('ib_tx_mib_s', 'ib_rx_mib_s', 'ib_error_delta', 'ib_xmit_wait_delta'):
+            if name in name_to_index:
+                related_value = all_values[node_local_rank0, name_to_index[name]].item()
+                if math.isfinite(related_value):
+                    metadata[name] = related_value
+        return metadata
+
+    def _log_straggler_profile(self, all_values: torch.Tensor, names) -> Dict[str, float]:
+        step = self.train_status.finished_train_steps
+        name_to_index = {name: index for index, name in enumerate(names)}
+        topk = self.train_args.straggler_profile_topk
+        latency_names = tuple(
+            name for name in (
+                'read_batch',
+                'train_step',
+                'aggregate_outputs',
+                'gnorm',
+                'optim_step',
+                'local_step',
+                'reducer_last_ready_from_iter_s',
+                'reducer_last_ready_s',
+                'reducer_host_wait_s',
+                'reducer_exposed_tail_s',
+            )
+            if name in name_to_index
+        )
+        top_records = {}
+        for name in latency_names:
+            values = all_values[:, name_to_index[name]]
+            finite_ranks = torch.nonzero(torch.isfinite(values), as_tuple=False).flatten()
+            if not finite_ranks.numel():
+                continue
+            count = min(topk, finite_ranks.numel())
+            finite_values = values[finite_ranks]
+            _, order = torch.topk(finite_values, count)
+            ranks = finite_ranks[order].tolist()
+            top_records[name] = [
+                self._rank_profile_record(
+                    rank,
+                    values[rank].item(),
+                    all_values,
+                    name_to_index,
+                )
+                for rank in ranks
+            ]
+
+        primary_name = (
+            'reducer_last_ready_from_iter_s'
+            if 'reducer_last_ready_from_iter_s' in name_to_index
+            else 'train_step'
+        )
+        primary_records = top_records.get(primary_name, [])
+        for node_name in {record['node_name'] for record in primary_records}:
+            self._straggler_profile_node_counts[node_name] += 1
+
+        plan_ngpus = self.train_args.compute_config.plan_ngpus
+        primary_values = all_values[:, name_to_index[primary_name]]
+        replica_values = []
+        for replica_start in range(0, self.world_size, plan_ngpus):
+            values = primary_values[replica_start:replica_start + plan_ngpus]
+            valid = values[torch.isfinite(values)]
+            replica_values.append(valid.max().item() if valid.numel() else -math.inf)
+        if replica_values and max(replica_values) > -math.inf:
+            slowest_replica = max(range(len(replica_values)), key=replica_values.__getitem__)
+            self._straggler_profile_replica_counts[slowest_replica] += 1
+
+        dp_groups = []
+        for plan_offset in range(plan_ngpus):
+            ranks = torch.arange(plan_offset, self.world_size, plan_ngpus)
+            values = primary_values[ranks]
+            valid_mask = torch.isfinite(values)
+            if not valid_mask.any().item():
+                continue
+            valid_values = values[valid_mask]
+            valid_ranks = ranks[valid_mask]
+            max_index = torch.argmax(valid_values)
+            max_rank = int(valid_ranks[max_index].item())
+            dp_groups.append({
+                'plan_offset': plan_offset,
+                'ready_skew_s': (valid_values.max() - valid_values.min()).item(),
+                'last_rank': max_rank,
+                'last_replica': max_rank // plan_ngpus,
+                'last_node': self._straggler_profile_rank_metadata[max_rank]['node_name'],
+            })
+
+        correlations = {}
+        if 'attention_cost_sum' in name_to_index:
+            attention = all_values[:, name_to_index['attention_cost_sum']]
+            for latency_name in ('local_step', 'train_step', 'reducer_last_ready_from_iter_s'):
+                if latency_name in name_to_index:
+                    correlations[f'corr_{latency_name}_attention_cost_sum'] = finite_pearson(
+                        all_values[:, name_to_index[latency_name]], attention
+                    )
+            global_step_s = all_values[:, name_to_index['local_step']].max().item()
+            max_attention_cost = attention[torch.isfinite(attention)].max().item()
+            self._straggler_profile_history.append((global_step_s, max_attention_cost))
+            if len(self._straggler_profile_history) >= 2:
+                history = torch.tensor(tuple(self._straggler_profile_history), dtype=torch.float64)
+                correlations['corr_global_step_max_attention_cost'] = finite_pearson(
+                    history[:, 0], history[:, 1]
+                )
+
+        finite_correlations = {
+            name: value for name, value in correlations.items() if math.isfinite(value)
+        }
+        logger.info('STRAGGLER_PROFILE %s', json.dumps({
+            'step': step,
+            'top': top_records,
+            'dp_groups': dp_groups,
+            'correlations': finite_correlations,
+            'node_top5_counts': self._straggler_profile_node_counts.most_common(topk),
+            'slowest_replica_counts': self._straggler_profile_replica_counts.most_common(topk),
+        }, sort_keys=True))
+        return finite_correlations
 
     def _log_config(self, config: Dict):
         for logger in self.loggers:
@@ -1022,6 +1356,10 @@ class Trainer:
         for i, batches in data_iter:
             read_batch_wall = time.perf_counter() - last_loop_end_at
             idx = i + resume_from_idx
+            self._start_straggler_profile_step(
+                self.train_status.finished_train_steps + 1,
+                last_loop_end_at,
+            )
             self.hook.on_step_start(self, epoch, idx)
 
             step_start_at = time.perf_counter()
@@ -1046,6 +1384,7 @@ class Trainer:
                   and getattr(self.model, 'cuda_sync_required', False)
 
             train_step_start_at = time.perf_counter()
+            self._straggler_profile_train_start_at = train_step_start_at
             if cuda_sync_required:
                 torch.cuda.synchronize()
 
@@ -1058,6 +1397,7 @@ class Trainer:
             self.hook.on_train_step_end(self, losses[:num_batches])
 
             aggregate_outputs = self.train_args.resolved_aggregate_outputs_fn or self.aggregate_outputs
+            aggregate_outputs_start_at = time.perf_counter()
             aggregated_outputs = aggregate_outputs(losses[:num_batches], self.sync_group)
             if self.train_args.optimizer.loss_reduction == 'mean':
                 loss = aggregated_outputs.loss_sum / aggregated_outputs.num_batches
@@ -1069,6 +1409,7 @@ class Trainer:
                 loss = aggregated_outputs.loss_sum
             step_stat.train_loss = loss
             self.hook.after_aggregate_train_step_outputs(self, aggregated_outputs, loss)
+            aggregate_outputs_wall = time.perf_counter() - aggregate_outputs_start_at
 
             self.hook.before_sync_grad(self)
             # `sync_shard_grad` is no-op if the whole model is parallelized
@@ -1101,6 +1442,7 @@ class Trainer:
             check_grad_wall = time.perf_counter() - check_grad_start_at
 
             # clip gradients
+            gnorm_start_at = time.perf_counter()
             self.hook.before_gnorm_clip(self)
             if self.train_args.optimizer.clip_gnorm:
                 step_stat.gnorm = self.optimizer.clip_gnorm(self.train_args.optimizer.clip_gnorm)
@@ -1108,6 +1450,7 @@ class Trainer:
                 step_stat.gnorm = self.optimizer.clip_gnorm()
             self.hook.after_gnorm_clip(self, step_stat.gnorm)
             step_stat.gnorm = step_stat.gnorm.item()
+            gnorm_wall = time.perf_counter() - gnorm_start_at
 
             # update parameters
             step_stat.lr = self.optimizer.param_groups[0]['lr']  # only log the first group's lr
@@ -1125,17 +1468,22 @@ class Trainer:
             step_metrics['loss'] = step_metrics['train_loss']
             train_wall_at = time.perf_counter()
             step_metrics['train_wall'] = train_wall_at - (last_step_start_at or step_start_at)
-            step_metrics['local_train_wall'] = train_wall_at - step_start_at
+            local_step_wall = train_wall_at - step_start_at
+            step_metrics['local_train_wall'] = local_step_wall
             timer_walls = {
                 'read_batch': read_batch_wall,
                 'train_step': train_step_wall,
+                'aggregate_outputs': aggregate_outputs_wall,
                 'sync_shard_grad': sync_shard_grad_wall,
                 'check_grad': check_grad_wall,
+                'gnorm': gnorm_wall,
                 'optim_step': optim_step_wall,
+                'local_step': local_step_wall,
             }
             last_step_start_at = train_wall_at
             self.hook.before_log_train_metrics(self, step_metrics, aggregated_outputs)
-            timer_metrics = self._aggregate_timer_walls(timer_walls)
+            profile_metrics = self._finish_straggler_profile_step(train_step_wall)
+            timer_metrics = self._aggregate_timer_walls(timer_walls, profile_metrics)
             self.log_metrics(timer_metrics, tag='timer')
             self.log_metrics(step_metrics, tag='train')
             if self.rank == 0:
