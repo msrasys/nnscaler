@@ -120,6 +120,54 @@ def test_selective_split_defers_only_registered_weight_work():
         RuntimeFlag.fbw_accumulate_undeferred_grads = previous
 
 
+def test_selective_split_accumulates_embedding_weight_during_input_backward():
+    class Embedding(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = torch.nn.Parameter(
+                torch.randn(16, 8, dtype=torch.float64)
+            )
+
+        def forward(self, token_ids):
+            return runtime_function.embedding(
+                token_ids,
+                self.weight,
+                padding_idx=None,
+                start=0,
+                stop=16,
+            )
+
+    torch.manual_seed(47)
+    reference = Embedding()
+    actual = Embedding()
+    actual.load_state_dict(reference.state_dict())
+    token_ids = torch.tensor([1, 4, 4, 7])
+    output_grad = torch.randn(4, 8, dtype=torch.float64)
+
+    reference(token_ids).backward(output_grad)
+
+    previous = RuntimeFlag.fbw_accumulate_undeferred_grads
+    RuntimeFlag.fbw_accumulate_undeferred_grads = True
+    try:
+        output = Executor.fexecute("selective_embedding", actual, token_ids)
+        input_grads = Executor.backward_input(
+            "selective_embedding",
+            [token_ids],
+            [output],
+            [output_grad],
+            actual.parameters(),
+        )
+
+        assert input_grads is None
+        torch.testing.assert_close(actual.weight.grad, reference.weight.grad)
+
+        Executor.backward_weight("selective_embedding", actual.parameters())
+        torch.testing.assert_close(actual.weight.grad, reference.weight.grad)
+        Executor.check_clear()
+    finally:
+        RuntimeFlag.fbw_accumulate_undeferred_grads = previous
+
+
 def test_split_backward_groups_bridge_shared_parameter_paths():
     class BridgedParameters(torch.nn.Module):
         def __init__(self):

@@ -271,7 +271,10 @@ class _Embedding(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_output):
-        if RuntimeFlag.fbw_phase == "input":
+        if (
+            RuntimeFlag.fbw_phase == "input"
+            and not RuntimeFlag.fbw_accumulate_undeferred_grads
+        ):
             return None, None, None, None, None
 
         masked_input, input_mask = ctx.saved_tensors
