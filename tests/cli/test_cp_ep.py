@@ -661,14 +661,6 @@ def cp_ep_policy(graph, compute_config: ComputeConfig):
             yield OpPlan(node, partition=OpPartition(input=1, dim=0))
 
 
-def cp_param_clss_fn(parameter_fqn: str) -> ParamBucketConfig:
-    if parameter_fqn.startswith('layers.') and parameter_fqn.endswith('.expert_weight'):
-        # CP mode: ranks owning the same expert shard processed complementary
-        # sequence quarters, so preserve the SUM of their gradients.
-        return ParamBucketConfig(reducer_nreplicas=1)
-    return ParamBucketConfig()
-
-
 def baseline_param_clss_fn(parameter_fqn: str) -> ParamBucketConfig:
     if parameter_fqn.startswith('layers.') and parameter_fqn.endswith('.expert_weight'):
         if _SCALE_UNITS_PER_CONTEXT_GROUP is None:
@@ -725,14 +717,11 @@ def cp_ep_worker(save_dir, use_context_parallel: bool):
         '--checkpoint.save_dir', str(checkpoint_dir),
         '--enable_progress_bar', 'false',
     ]
-    args.extend([
-        '--optimizer.param_clss_fn',
-        (
-            'tests.cli.test_cp_ep.cp_param_clss_fn'
-            if use_context_parallel
-            else 'tests.cli.test_cp_ep.baseline_param_clss_fn'
-        ),
-    ])
+    if not use_context_parallel:
+        args.extend([
+            '--optimizer.param_clss_fn',
+            'tests.cli.test_cp_ep.baseline_param_clss_fn',
+        ])
 
     trainer = Trainer(args)
     trainer.run()
@@ -741,6 +730,7 @@ def cp_ep_worker(save_dir, use_context_parallel: bool):
     expert_slice = _check_expert_bucket(
         trainer,
         expected_nreplicas=(
+            # CP keeps the nreplicas=1 generated for partitioned expert shards.
             1 if use_context_parallel else _SCALE_UNITS_PER_CONTEXT_GROUP
         ),
     )
