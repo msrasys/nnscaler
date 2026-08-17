@@ -10,6 +10,7 @@ import logging
 import inspect
 import contextlib
 import os
+import functools
 
 import torch
 import torch.utils
@@ -368,7 +369,10 @@ class OptimizerConfig:
     args: Dict[str, Any] = field(default_factory=dict)
     clip_gnorm: float = 0.0
 
-    param_clss_fn: Optional[Callable[[str], Any]] = fn_field(default=None)
+    param_clss_fn: Optional[Union[
+        Callable[[str], Any],
+        Callable[['TrainerArgs', str], Any],
+    ]] = fn_field(default=None)
     # loss reduction method
     # mean: average the loss over all micro-batches
     # sum: sum the loss of all micro-batches
@@ -398,13 +402,36 @@ class OptimizerConfig:
 
     def __post_init__(self):
         if self.grad_reduction not in ('sum', 'mean', 'per-token-mean'):
-            raise ValueError(f"Invalid gradient_accumulation {self.grad_reduction}")
+            raise ValueError(f"Invalid grad_reduction {self.grad_reduction}")
         if self.grad_reduction == 'per-token-mean' and not self.aggregate_outputs_fn:
             raise ValueError("aggregate_outputs_fn is required when grad_reduction is 'per-token-mean'")
         if self.loss_reduction == 'per-token-mean' and not self.aggregate_outputs_fn:
             raise ValueError("aggregate_outputs_fn is required when loss_reduction is 'per-token-mean'")
         if self.loss_reduction not in ('mean', 'sum', 'per-token-mean'):
             raise ValueError(f"Invalid loss_reduction {self.loss_reduction}")
+
+    def get_normalized_param_clss_fn(self, trainer_args: 'TrainerArgs') -> Optional[Callable[[str], Any]]:
+        """
+        Get a normalized param_clss_fn that only accepts parameter name as input,
+        which can be used directly in build_optimizer.
+
+        If the original param_clss_fn accepts (trainer_args, parameter_name),
+        it will be partially applied with the given trainer_args.
+        """
+        param_clss_fn = self.param_clss_fn
+        if param_clss_fn is None:
+            return None
+
+        signature = inspect.signature(param_clss_fn)
+        if len(signature.parameters) == 1:
+            return param_clss_fn
+        if len(signature.parameters) == 2:
+            return functools.partial(param_clss_fn, trainer_args)
+
+        raise TypeError(
+            "`optimizer.param_clss_fn` must accept either `(parameter_name)` or "
+            f"`(trainer_args, parameter_name)`, but got signature {signature}."
+        )
 
 
 @dataclass
@@ -1275,7 +1302,7 @@ class TrainerArgs(PrecisionMixin, PolicyMixin):
         )
         return build_optimizer(
             parallel_model, optimizer_class, npp_compute_config,
-            self.optimizer.param_clss_fn,
+            self.optimizer.get_normalized_param_clss_fn(self),
             **kwargs
         )
 
