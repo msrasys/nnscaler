@@ -10,7 +10,7 @@ IRGraph:
     will be inserted at scheduling time.
 """
 
-from typing import Union, Tuple, List, Optional, Dict, Any
+from typing import Union, Tuple, List, Optional, Dict, Any, TYPE_CHECKING
 import logging
 import copy
 import dill
@@ -28,6 +28,10 @@ from nnscaler.graph.function.dimops import IRDimops, OpAnno
 from nnscaler.graph.segment import IRSegment, IRSegmentExpander
 
 from nnscaler.algorithm.generics import GenericDistAlgo
+
+
+if TYPE_CHECKING:
+    from nnscaler.graph.schedule.schedplan import SchedulePlan, SchedulePlanType
 
 
 _logger = logging.getLogger(__name__)
@@ -735,29 +739,33 @@ class IRGraph(IRSegment):
         return False
 
     @property
-    def sched(self):
+    def sched(self) -> Optional["SchedulePlanType"]:
         """ Get bound schedule plan
 
         Returns:
-            sched (SchedulePlan | None): bound schedule plan
+            sched (SchedulePlanType | None): bound schedule plan
         """
         return self._sched
 
-    def _bind_schedule(self, schedplan):
+    def bind_schedule(self, schedplan: "SchedulePlanType"):
         """Set schedule plan for the execution
 
         This will be called when initiating a schedule plan for the graph.
 
         Args:
-            schedplan (SchedulePlan)
+            schedplan (SchedulePlanType)
 
         Returns:
             None
         """
         from nnscaler.graph.schedule import SchedulePlan
-        if not isinstance(schedplan, SchedulePlan):
-            raise TypeError(f"Expect a SchedulePlan but got: {type(schedplan)}")
-        assert self._sched is None, "The graph is already bound with one schedule plan."
+        if not isinstance(schedplan, SchedulePlan) and (
+            not isinstance(schedplan, dict) or
+            not all(isinstance(k, int) and isinstance(v, SchedulePlan) for k, v in schedplan.items())
+        ):
+            raise TypeError(f"Expect a SchedulePlan or Dict[int, SchedulePlan] but got: {type(schedplan)}")
+        if isinstance(schedplan, dict) and not schedplan:
+            raise ValueError("Expect a non-empty Dict[int, SchedulePlan] but got an empty dict")
         self._sched = schedplan
 
     # ================= staging primitives ==================

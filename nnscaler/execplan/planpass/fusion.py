@@ -7,7 +7,7 @@ from nnscaler.graph.graph import IRSegment
 
 from nnscaler.ir.adapter import IRAdapter
 
-from nnscaler.execplan import ExecutionPlan
+from nnscaler.execplan import ExecutionPlan, ExecutionPlanType
 from nnscaler.execplan.execplan import ExeReuseCell
 from nnscaler.execplan.planpass.planpass import PlanPass
 
@@ -26,14 +26,26 @@ _logger = logging.getLogger(__name__)
 class DiffFusion(PlanPass):
 
     @staticmethod
-    def apply(execplan: ExecutionPlan) -> ExecutionPlan:
+    def apply(execplan: ExecutionPlanType) -> ExecutionPlanType:
+        visited = set()
+        # support multiple execution plans (one per number of micro-batches)
+        if isinstance(execplan, dict):
+            for plan in execplan.values():
+                DiffFusion._apply(plan, visited)
+        else:
+            DiffFusion._apply(execplan, visited)
+
+        return execplan
+
+    @staticmethod
+    def _apply(execplan: ExecutionPlan, visited: set) -> ExecutionPlan:
         """
         Fuse the non-differentiable adapters into differentiable adapters.
         """
+
         cnt = 0
         for devid in execplan.devices():
             # fadapters: Set[IRAdapter] = set()
-            visited = set()
             for node in execplan.seq(devid):
                 if isinstance(node, ExeReuseCell):
                     node = node.cell
@@ -49,23 +61,6 @@ class DiffFusion(PlanPass):
                 visited.add(node)
         _logger.info(f'adapter fusion: successfully fuse {cnt} differentiable adapters')
         return execplan
-
-    @staticmethod
-    def _apply(cell: IRSegment) -> int:
-        cnt = 0
-        for node in cell.nodes():
-            if isinstance(node, IRAdapter) and node.isfw():
-                ret = DiffFusion.nnfuse(node)
-                # if not ret and not node.differentiable:
-                #     raise NotImplementedError(
-                #         f"Adapter within IRSegment cannot fuse to differientiable adapter"
-                #         f"\nforward: {node.extra_repr()}"
-                #         f"\nbackward: {node.mirror.extra_repr()}"
-                #     )
-                cnt = cnt + 1 if ret else cnt
-            elif isinstance(node, IRSegment) and node.isfw():
-                cnt += DiffFusion._apply(node)
-        return cnt
 
     @staticmethod
     def nnfuse(fadapter: IRAdapter) -> bool:
@@ -124,7 +119,7 @@ class DiffFusion(PlanPass):
         # all-to-all
         elif is_alltoall(fprims) and is_alltoall(bprims):
             prims = [AllToAllAllToAllPrim(p.inputs(), p.outputs(), **p.kwargs) for p in fprims]
-        
+
         if prims is not None:
             fadapter.prims = prims
             badapter.prims = prims

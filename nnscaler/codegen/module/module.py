@@ -527,7 +527,17 @@ class ModuleCodeGen(FuncEmission):
             graph_sched = self.execplan.graph.sched
 
             cb.insert_body(f'use_scheduler = {graph_sched is not None}')
-            cb.insert_body(f'nmicros_per_scheduler_step = {graph_sched.nmicros if graph_sched is not None else 1}')
+            # `graph_sched` can be a single `SchedulePlan` or a `Dict[int, SchedulePlan]`
+            # (one plan per number of micro-batches) when multiple schedulers are enabled.
+            # `nmicros_per_scheduler_step` is a single int for a single scheduler, and a
+            # tuple of the supported micro-batch numbers when multiple schedulers are used.
+            if graph_sched is None:
+                nmicros_per_scheduler_step = 1
+            elif isinstance(graph_sched, dict):
+                nmicros_per_scheduler_step = tuple(sorted(graph_sched.keys()))
+            else:
+                nmicros_per_scheduler_step = graph_sched.nmicros
+            cb.insert_body(f'nmicros_per_scheduler_step = {nmicros_per_scheduler_step!r}')
             cb.insert_body(f'use_multi_streams = {self.execplan.use_multi_streams}')
             cb.insert_body(f'cuda_sync_required = {self.execplan.cuda_sync_required}')
 

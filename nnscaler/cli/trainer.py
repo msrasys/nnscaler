@@ -8,7 +8,6 @@ from typing import Any, Dict, List, Optional, Union
 from pathlib import Path
 import sys, os
 import copy
-import inspect
 import warnings
 import shutil
 import logging
@@ -23,7 +22,8 @@ from tqdm import tqdm
 
 import nnscaler
 from nnscaler.runtime.device import DeviceGroup
-from nnscaler.utils import broadcast_mixed_data, is_running_distributed
+from nnscaler.utils import broadcast_mixed_data, is_running_distributed, StepwiseConfig
+from nnscaler.runtime.module import ParallelModule
 
 from .trainer_args import AggregatedOutputs, TrainerArgs, fix_input
 from .train_hook import AggregatedTrainHook, TrainHook, TrainHookHost
@@ -88,7 +88,7 @@ class Trainer:
         self.lr_scheduler = None
         self.train_status = TrainStatus()
         self.dummy_input = None
-        self.total_train_steps_per_epoch = None
+        self.total_train_steps_per_epoch: Dict[int, int] = {}
         self.max_train_steps = None
         self.loggers = []
         self.hook = None
@@ -196,23 +196,32 @@ class Trainer:
         self.node_leader_ranks = list(range(0, self.world_size, self.local_world_size))
         DeviceGroup().get_group(self.node_leader_ranks)
 
-        self.total_train_steps_per_epoch = len(self.dataloader['train']) // self.train_args.update_freq
-        if len(self.dataloader['train']) % self.train_args.update_freq != 0:
-            self.total_train_steps_per_epoch += 1  # will add extra dummy batches
+        self.total_train_steps_per_epoch = self._get_train_steps_per_epoch()
 
         if self.train_args.max_epochs and self.train_args.max_train_steps:
             self.max_train_steps = min(
-                self.total_train_steps_per_epoch * self.train_args.max_epochs,
+                self._get_steps_of_epochs(self.train_args.max_epochs),
                 self.train_args.max_train_steps
             )
         elif self.train_args.max_train_steps:
             self.max_train_steps = self.train_args.max_train_steps
         else:
             assert self.train_args.max_epochs, "max_epochs or max_train_steps should be specified"
-            self.max_train_steps = self.total_train_steps_per_epoch * self.train_args.max_epochs
+            self.max_train_steps = self._get_steps_of_epochs(self.train_args.max_epochs)
 
         _, self.sync_group = self.train_args.compute_config.get_sync_group()
         self.model = pmodel
+        if isinstance(self.model, ParallelModule) and self.model.use_scheduler:
+            compiled_nmicros = self.model.nmicros_per_scheduler_step
+            compiled_nmicros = {compiled_nmicros} if isinstance(compiled_nmicros, int) else set(compiled_nmicros)
+            update_freq = self.train_args.update_freq
+            update_freq_values = {update_freq} if isinstance(update_freq, int) else set(update_freq.values())
+            # the runtime update_freq value(s) must be schedulers the model was compiled with
+            if not update_freq_values <= compiled_nmicros:
+                raise ValueError(
+                    f"update_freq value(s) {sorted(update_freq_values)} must be a subset of the "
+                    f"compiled nmicros_per_scheduler_step {sorted(compiled_nmicros)}"
+                )
         self.model.cuda()
         self.optimizer = self.train_args.create_parallel_optimizer(self.model)
         # unify the interface of ParallelModule and partial-parallelized model
@@ -602,9 +611,13 @@ class Trainer:
             'ram_gb_used': ram_gb_used,
          }, tag=tag)
 
-    def _format_metrics(self, epoch_desc, idx, metrics: Dict[str, Union[float,int]]):
-        ndigits = len(str(self.total_train_steps_per_epoch))
-        idx_format = f"0{ndigits}d"
+    def _format_metrics(
+        self,
+        epoch_desc,
+        idx,
+        metrics: Dict[str, Union[float, int]],
+        total_steps: Optional[int] = None,
+    ):
         int_format = ''
         float_format = '.3f'
         float_scientific_format = '.3e'
@@ -622,7 +635,10 @@ class Trainer:
             ]
         )
         if idx is not None:
-            step_str = f'{format(idx, idx_format)}/{self.total_train_steps_per_epoch} '
+            if total_steps is None:
+                raise ValueError("total_steps is required when idx is specified")
+            idx_format = f"0{len(str(total_steps))}d"
+            step_str = f'{format(idx, idx_format)}/{total_steps} '
         else:
             step_str = f''
         return f"{epoch_desc}: {step_str}{metrics_str}"
@@ -644,10 +660,9 @@ class Trainer:
         logger.info(f"Saving checkpoint after {self.train_status.finished_train_steps} steps with loss={loss:.3f}.")
         save_dir = Path(checkpoint_config.save_dir)
         save_dir.mkdir(parents=True, exist_ok=True)
-        current_epoch = self.train_status.finished_train_steps // self.total_train_steps_per_epoch
-        # the last step of the epoch
-        if self.train_status.finished_train_steps % self.total_train_steps_per_epoch == 0:
-            current_epoch -= 1
+        epoch, offset = self._epoch_and_offset(self.train_status.finished_train_steps)
+        # if we are exactly at an epoch boundary, the epoch that just finished is the previous one
+        current_epoch = epoch - 1 if offset == 0 else epoch
 
         if checkpoint_config.save_type == 'sharded':
             model_state_dict = self.model.state_dict()
@@ -771,7 +786,37 @@ class Trainer:
             except Exception as e:
                 logger.warning('Error when expiring checkpoint `%s`: %s. Will try later.', ckpt_name, e)
 
-    def _global_batch_iterator(self, num_skip_first=0, stage='train'):
+    def _steps_to_consume(self, num_microbatches: int, start_step: int) -> int:
+        """Number of train steps needed to consume ``num_microbatches`` microbatches,
+        starting at global train step ``start_step``, following the update_freq schedule.
+        """
+        return StepwiseConfig.steps_to_consume(self.train_args.update_freq, num_microbatches, start_step)
+
+    def _get_train_steps_per_epoch(self) -> Dict[int, int]:
+        return StepwiseConfig.steps_per_period(
+            self.train_args.update_freq,
+            len(self.dataloader['train']),
+            max_periods=self.train_args.max_epochs,
+            max_total_steps=self.train_args.max_train_steps,
+        )
+
+    def _get_steps_of_epochs(self, end_epoch: int) -> int:
+        """Number of train steps needed to consume all microbatches in epochs [0, end_epoch)."""
+        return StepwiseConfig.sum_value(self.total_train_steps_per_epoch, 0, end_epoch)
+
+    def _epoch_start_step(self, epoch: int) -> int:
+        """Global train step at the start of ``epoch``."""
+        return StepwiseConfig.sum_value(self.total_train_steps_per_epoch, 0, epoch)
+
+    def _steps_in_epoch(self, epoch: int) -> int:
+        """Number of train steps in ``epoch``."""
+        return StepwiseConfig.value_at(self.total_train_steps_per_epoch, epoch)
+
+    def _epoch_and_offset(self, finished_steps: int) -> tuple[int, int]:
+        """Map a global finished-step count to ``(epoch, offset_within_epoch)``."""
+        return StepwiseConfig.step_and_offset(self.total_train_steps_per_epoch, finished_steps, 0)
+
+    def _global_batch_iterator(self, num_skip_first=0, stage='train', start_step=0):
         if stage == 'train':
             if self.dataloader_resumed or num_skip_first == 0:
                 logger.info(f'Trainer resumes dataloader directly.')
@@ -784,7 +829,12 @@ class Trainer:
             else:  # dry run until reach the desired batch.
                 logger.info(f'Trainer try to resume dataloader for {stage} stage with {num_skip_first}.')
                 it = iter(self.dataloader[stage])
-                for _ in range(num_skip_first * self.train_args.update_freq):
+                # number of microbatches consumed by the skipped steps (variable freq aware)
+                n_skip_micro = sum(
+                    self.train_args.update_freq_at(start_step + i)
+                    for i in range(num_skip_first)
+                )
+                for _ in range(n_skip_micro):
                     _sample = next(it)
                 # if the checkpoint stops in the middle of an epoch,
                 # the rng states must be resumed before loading the first batch, which depends on the rng;
@@ -794,13 +844,17 @@ class Trainer:
             # for validation and test, we don't need to resume rng states
             it = iter(self.dataloader[stage])
 
+        step_idx = start_step + num_skip_first
+        target = self.train_args.update_freq_at(step_idx)
         samples = []
         for sample in it:
             sample = self._fix_input(sample)
             samples.append(sample)
-            if len(samples) == self.train_args.update_freq:
+            if len(samples) == target:
                 yield samples
                 samples = []
+                step_idx += 1
+                target = self.train_args.update_freq_at(step_idx)
         if samples:
             yield samples
 
@@ -811,11 +865,11 @@ class Trainer:
             loss_fn=lambda loss: loss if isinstance(loss, torch.Tensor) else loss[0]
         )
 
-    def _fix_batches(self, batches):
+    def _fix_batches(self, batches, target_freq):
         num_batches = len(batches)
         is_dummy_batch = [False] * num_batches
-        if num_batches < self.train_args.update_freq:
-            gap = self.train_args.update_freq - num_batches
+        if num_batches < target_freq:
+            gap = target_freq - num_batches
             is_dummy_batch += [True] * gap
             batches += [self.dummy_input] * gap
         return batches, is_dummy_batch
@@ -918,7 +972,7 @@ class Trainer:
             logger.info(f"Training is skipped: already done, finished_train_steps={self.train_status.finished_train_steps} >= max_train_steps={self.max_train_steps}.")
             return
 
-        start_epoch = self.train_status.finished_train_steps // self.total_train_steps_per_epoch
+        start_epoch = self._epoch_and_offset(self.train_status.finished_train_steps)[0]
 
         self.hook.on_train_start(self)
 
@@ -972,9 +1026,7 @@ class Trainer:
         logger.info(f"Validating...")
         data_iter = enumerate(self._global_batch_iterator(stage='val'))
         if self.rank == 0:
-            total_val_steps_per_epoch = len(self.dataloader['val']) // self.train_args.update_freq
-            if len(self.dataloader['val']) % self.train_args.update_freq != 0:
-                total_val_steps_per_epoch += 1  # will add extra dummy batches
+            total_val_steps_per_epoch = self._steps_to_consume(len(self.dataloader['val']), 0)
             data_iter = tqdm(
                 data_iter,
                 total=total_val_steps_per_epoch,
@@ -993,7 +1045,7 @@ class Trainer:
                 break
 
             num_batches = len(batches)
-            batches, _ = self._fix_batches(batches)
+            batches, _ = self._fix_batches(batches, self.train_args.update_freq_at(idx))
 
             self.model.eval()
             with torch.inference_mode():
@@ -1029,20 +1081,20 @@ class Trainer:
         VAL_STATUS_SAVE = 2   # validated and saved
         has_validated = VAL_STATUS_NO   # 3 states
 
-        resume_from_idx = self.train_status.finished_train_steps % self.total_train_steps_per_epoch
-        data_iter = enumerate(self._global_batch_iterator(resume_from_idx))
+        epoch_start_step = self._epoch_start_step(epoch)
+        resume_from_idx = self.train_status.finished_train_steps - epoch_start_step
+        data_iter = enumerate(self._global_batch_iterator(resume_from_idx, start_step=epoch_start_step))
 
-        max_epoch = self.max_train_steps // self.total_train_steps_per_epoch
-        if self.max_train_steps % self.total_train_steps_per_epoch != 0:
-            max_epoch += 1
+        max_epoch = self._epoch_and_offset(self.max_train_steps)[0]
         ndigits = len(str(max_epoch))
         epoch_format = f"0{ndigits}d"
         epoch_desc = f'Epoch {format(epoch, epoch_format)}'
+        total_steps = self._steps_in_epoch(epoch)
 
         if self.rank == 0:
             data_iter = tqdm(
                 data_iter,
-                total=self.total_train_steps_per_epoch,
+                total=total_steps,
                 initial=resume_from_idx,
                 desc=epoch_desc,
                 disable=not self.train_args.enable_progress_bar,
@@ -1058,7 +1110,8 @@ class Trainer:
             step_metrics = {}
             has_validated = VAL_STATUS_NO
             num_batches = len(batches)
-            batches, is_dummy_batch = self._fix_batches(batches)
+            current_freq = self.train_args.update_freq_at(epoch_start_step + idx)
+            batches, is_dummy_batch = self._fix_batches(batches, current_freq)
 
             self.model.train()
 
@@ -1151,7 +1204,7 @@ class Trainer:
                 data_iter.set_postfix(step_metrics)
                 if self.train_args.enable_log_progress \
                     and self.train_status.finished_train_steps % self.train_args.log_progress_every_n_train_steps == 0:
-                    logger.info(self._format_metrics(epoch_desc, idx + 1, step_metrics))
+                    logger.info(self._format_metrics(epoch_desc, idx + 1, step_metrics, total_steps))
                     step_metrics = {}
 
             self.hook.on_step_end(self, epoch, idx, step_metrics, aggregated_outputs)
@@ -1168,7 +1221,7 @@ class Trainer:
             # max_train_steps is reached
             if self.train_status.finished_train_steps >= self.max_train_steps:
                 if step_metrics and self.train_args.enable_log_progress:
-                    logger.info(self._format_metrics(epoch_desc, idx + 1, step_metrics))
+                    logger.info(self._format_metrics(epoch_desc, idx + 1, step_metrics, total_steps))
                     step_metrics = {}
                 if not has_validated:
                     self._validate_and_save(step_stat)

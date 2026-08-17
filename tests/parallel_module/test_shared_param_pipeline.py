@@ -313,10 +313,10 @@ def checker_multiref(model_cls, pm, tempdir):
     if pm.rank == 0:
         assert len(all_params) == 1
         assert all_params[0].shape == torch.Size([16, 16])
-        assert len(_gencode_contains(tempdir, model_cls, pm.rank, 'multiref\(')) == 1
+        assert len(_gencode_contains(tempdir, model_cls, pm.rank, r'multiref\(')) == 1
     else:
         assert not all_params
-        assert not _gencode_contains(tempdir, model_cls, pm.rank, 'multiref\(')
+        assert not _gencode_contains(tempdir, model_cls, pm.rank, r'multiref\(')
 
 
 @pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.device_count() < 4, reason='lack of gpu devices')
@@ -337,10 +337,10 @@ def checker_multiref2(model_cls, pm, tempdir):
     if pm.rank in [0, 1]:
         assert len(all_params) == 1
         assert all_params[0].shape == torch.Size([16, 16])
-        assert len(_gencode_contains(tempdir, model_cls, pm.rank, 'multiref\(')) == 1
+        assert len(_gencode_contains(tempdir, model_cls, pm.rank, r'multiref\(')) == 1
     else:
         assert not all_params
-        assert not _gencode_contains(tempdir, model_cls, pm.rank, 'multiref\(')
+        assert not _gencode_contains(tempdir, model_cls, pm.rank, r'multiref\(')
 
 
 @pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.device_count() < 4, reason='lack of gpu devices')

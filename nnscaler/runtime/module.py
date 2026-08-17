@@ -194,8 +194,10 @@ class CubeModule(torch.nn.Module):
     use_scheduler: bool
     # the number of microbatches in one scheduler train/infer step
     # 1 if no scheduler is used.
+    # A single int when one scheduler is used, or a tuple of the supported
+    # micro-batch numbers when multiple schedulers are used.
     # will be assigned in the generated subclasses
-    nmicros_per_scheduler_step: int
+    nmicros_per_scheduler_step: Union[int, Tuple[int, ...]]
     # whether to use multi stream for communication and computation overlapping
     # this is a hint of overlapping
     # will be assigned in the generated subclasses
@@ -1513,8 +1515,11 @@ class ParallelModule(CubeModule):
         self.set_grad_accumulation_steps(sample_count)
 
         if self.use_scheduler:
-            if len(samples) != self.nmicros_per_scheduler_step:
-                raise ValueError(f"Expected {self.nmicros_per_scheduler_step} samples, but got {sample_count}")
+            valid_nmicros = self.nmicros_per_scheduler_step
+            if isinstance(valid_nmicros, int):
+                valid_nmicros = (valid_nmicros,)
+            if len(samples) not in valid_nmicros:
+                raise ValueError(f"Expected one of {valid_nmicros} samples, but got {sample_count}")
             # only one step, so begin/end are both True
             with accum_mode(begin=True, end=True):
                 return self._train_step(dataloader)
@@ -1545,8 +1550,11 @@ class ParallelModule(CubeModule):
         sample_count = len(samples)
         dataloader = microbatches(samples, cycle=False)
         if self.use_scheduler:
-            if len(samples) != self.nmicros_per_scheduler_step:
-                raise ValueError(f"Expected {self.nmicros_per_scheduler_step} samples, but got {sample_count}")
+            valid_nmicros = self.nmicros_per_scheduler_step
+            if isinstance(valid_nmicros, int):
+                valid_nmicros = (valid_nmicros,)
+            if len(samples) not in valid_nmicros:
+                raise ValueError(f"Expected one of {valid_nmicros} samples, but got {sample_count}")
             return self._infer_step(dataloader)
         else:
             outputs = []

@@ -9,6 +9,7 @@ import nnscaler
 from nnscaler.cli.trainer_args import (
     load_type, ComputeConfig, OptionalComputeConfig, OptionalReducerConfig, TrainerArgs,
     _resolve_precision, _to_precision, _get_tensor_dtype,
+    _deserialize_int_or_dict_of_ints,
 )
 from nnscaler.runtime.utils import set_grad_dtype, get_grad_dtype
 
@@ -143,6 +144,32 @@ def test_dyn_str_config():
         '--global_batch_size!',
     ])
     assert args.instance_name == 'instance_p1'
+
+
+@pytest.mark.parametrize(('value', 'expected'), [
+    (4, 4),
+    ('4', 4),
+    ({0: 2, '5': '4'}, {0: 2, 5: 4}),
+    ('{0: 2, "5": "4"}', {0: 2, 5: 4}),
+    ({'__value_type': 'int', 'value': '4'}, 4),
+])
+def test_deserialize_int_or_dict_of_ints(value, expected):
+    assert _deserialize_int_or_dict_of_ints(value) == expected
+
+
+@pytest.mark.parametrize('cli_args', [
+    ['--global_batch_size', '0'],
+    ['--global_batch_size', '-1'],
+    ['--global_batch_size', '{}'],
+    ['--global_batch_size', '{0: 8, 5: 0}'],
+    ['--global_batch_size!', '--grad_accumulation_steps', '0'],
+    ['--global_batch_size!', '--grad_accumulation_steps', '{}'],
+    ['--global_batch_size!', '--grad_accumulation_steps', '{0: 2, 5: -1}'],
+])
+def test_batch_size_config_must_be_positive(cli_args):
+    config_path = str(Path(__file__).with_name('trainer_args.yaml').resolve())
+    with pytest.raises(ValueError, match='must (not be empty|be positive)|values must be positive'):
+        TrainerArgs.from_cli(['-f', config_path, *cli_args])
 
 
 # --- grad dtype tests ---
