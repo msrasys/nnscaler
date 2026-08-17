@@ -705,7 +705,11 @@ def _check_expert_bucket(trainer: Trainer, expected_nreplicas: int):
     return next(iter(expert_slices))
 
 
-def cp_ep_worker(save_dir, use_context_parallel: bool):
+def cp_ep_worker(
+    save_dir,
+    use_context_parallel: bool,
+    runtime_ngpus: Optional[int] = None,
+):
     run_name = 'cp' if use_context_parallel else 'baseline'
     save_dir = Path(save_dir)
     checkpoint_dir = save_dir / run_name / 'checkpoints'
@@ -717,6 +721,11 @@ def cp_ep_worker(save_dir, use_context_parallel: bool):
         '--checkpoint.save_dir', str(checkpoint_dir),
         '--enable_progress_bar', 'false',
     ]
+    if runtime_ngpus is not None:
+        args.extend([
+            '--compute_config.runtime_ngpus', str(runtime_ngpus),
+            '--global_batch_size', str(runtime_ngpus),
+        ])
     if not use_context_parallel:
         args.extend([
             '--optimizer.param_clss_fn',
@@ -744,6 +753,10 @@ def cp_ep_worker(save_dir, use_context_parallel: bool):
     return _LAST_EXPERT_SEQUENCE_LENGTH, expert_slice.start, expert_slice.stop
 
 
+@pytest.mark.skipif(
+    torch.cuda.is_available() and torch.cuda.device_count() >= 8,
+    reason='covered by the real eight-GPU test',
+)
 @replace_all_device_with('cpu')
 def test_cp4_ep2_runtime8_static(tmp_path):
     # No eight-GPU machine is required: compile eight rank-specific modules on
@@ -872,6 +885,53 @@ def test_cp4_ep2_runtime8_static(tmp_path):
         # Generated reducers must follow the same repeated expert ownership.
         expected_ranks = '[0, 2, 4, 6]' if rank % 2 == 0 else '[1, 3, 5, 7]'
         assert f'Reducer(ranks={expected_ranks}' in generated_code
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.device_count() < 8,
+    reason='lack of gpu devices',
+)
+def test_cp4_ep2_runtime8(tmp_path):
+    runtime_ngpus = 8
+    trainer_args = TrainerArgs.from_cli([
+        '-f', str(CONFIG_PATH),
+        '--compute_config.runtime_ngpus', str(runtime_ngpus),
+        '--global_batch_size', str(runtime_ngpus),
+    ])
+    plan_ngpus = trainer_args.compute_config.plan_ngpus
+    sequence_length = trainer_args.get_resolved_var('sequence_length')
+
+    baseline_lengths = launch_torchrun(
+        runtime_ngpus,
+        cp_ep_worker,
+        tmp_path,
+        False,
+        runtime_ngpus,
+    )
+    cp_lengths = launch_torchrun(
+        runtime_ngpus,
+        cp_ep_worker,
+        tmp_path,
+        True,
+        runtime_ngpus,
+    )
+
+    assert {result[0] for result in baseline_lengths.values()} == {sequence_length // plan_ngpus}
+    assert {result[0] for result in cp_lengths.values()} == {
+        sequence_length // trainer_args.model.args['context_parallel_size']
+    }
+    assert {
+        rank: result[1:]
+        for rank, result in cp_lengths.items()
+    } == {
+        rank: (0, 2) if rank % 2 == 0 else (2, 4)
+        for rank in range(runtime_ngpus)
+    }
+
+    baseline = torch.load(tmp_path / 'baseline.pt', weights_only=False)
+    context_parallel = torch.load(tmp_path / 'cp.pt', weights_only=False)
+    assert_close(baseline['model'], context_parallel['model'], atol=1e-6, rtol=1e-6)
+    assert_close(baseline['optimizer'], context_parallel['optimizer'], atol=1e-6, rtol=1e-6)
 
 
 @pytest.mark.skipif(
