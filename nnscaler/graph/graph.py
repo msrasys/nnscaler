@@ -25,7 +25,7 @@ from nnscaler.graph.function.function import Identity
 from nnscaler.graph.function.anchor import IRGraphAnchor
 from nnscaler.graph.function.pyfunc import IRPyFunc
 from nnscaler.graph.function.dimops import IRDimops, OpAnno
-from nnscaler.graph.segment import IRSegment
+from nnscaler.graph.segment import IRSegment, IRSegmentExpander
 
 from nnscaler.algorithm.generics import GenericDistAlgo
 

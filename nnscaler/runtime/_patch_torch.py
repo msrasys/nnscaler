@@ -115,7 +115,6 @@ try:
 except (ImportError, TypeError) as ex:
     FBW_SUPPORTED = False
     import_error = ex
-
     def stage_backward_input(*args, **kwargs):
         raise ImportError(
             "Failed to import stage_backward_input from torch.distributed. "

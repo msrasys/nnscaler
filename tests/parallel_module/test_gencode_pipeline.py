@@ -1,3 +1,5 @@
+import re
+
 import torch
 import pytest
 

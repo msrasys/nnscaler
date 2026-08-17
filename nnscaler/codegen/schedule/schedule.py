@@ -27,6 +27,14 @@ from nnscaler.flags import CompileFlag
 _logger = logging.getLogger(__name__)
 
 
+fsign = '{outputs} = nnscaler.runtime.executor.fexecute({name}, {model}, *{inputs}, requires_grad={req_grad})'
+asign = '{outputs} = nnscaler.runtime.executor.aexecute({model}, *{inputs}, requires_grad={req_grad})'
+bsign = '{input_grads} = nnscaler.runtime.executor.backward({name}, {input_tensors}, {output_tensors}, {output_grads})'
+bi_sign = '{input_grads} = nnscaler.runtime.executor.backward_input({name}, {input_tensors}, {output_tensors}, {output_grads}, {weights})'
+bw_sign = 'nnscaler.runtime.executor.backward_weight({name}, {weights})'
+ssign = '{inputs} = nnscaler.runtime.executor.sync_tensors({inputs})'
+
+
 class ScheduleCodeGen(FuncEmission):
 
     def __init__(
@@ -122,6 +130,15 @@ class ScheduleCodeGen(FuncEmission):
 
         last_stream = None
         buffered_codes = []
+
+
+        def to_tensor_names(val) -> str:
+            """
+            Return the tensor names in a complex data type.
+            Currently support complex data type of Dict, List, Tuple
+            """
+            objs = IR.get_objects(val)
+            return self.tuple_name([obj for obj in objs if isinstance(obj, IRTensor)])
 
         def _get_codes_with_stream_context(codes: List[str], stream: Optional[str]) -> List[str]:
             if stream is None:
@@ -336,6 +353,9 @@ class ScheduleCodeGen(FuncEmission):
                         self._get_node_stream(pending_backward_node),
                     )
             # return code
+            if CompileFlag.async_comm:
+                _append_code(fb, 'nnscaler.runtime.executor.AsyncCommHandler().drain_sends()')
+                _append_code(fb, ssign.format(inputs=to_tensor_names(self.execplan.outputs())))
             outputs = self.return_name_complex(self.execplan.outputs())
             if CompileFlag.use_fbw:
                 _append_code(
@@ -401,6 +421,9 @@ class ScheduleCodeGen(FuncEmission):
                             infer_produced_tids.add(out.tid)
                     _append_send_bundle_events(fb, bundle_events, before_node=False)
                 # return code
+                if CompileFlag.async_comm:
+                    _append_code(fb, 'nnscaler.runtime.executor.AsyncCommHandler().drain_sends()')
+                    _append_code(fb, ssign.format(inputs=to_tensor_names(self.execplan.outputs())))
                 outputs = self.return_name_complex(self.execplan.outputs())
                 _append_code(fb, 'nnscaler.runtime.executor.AsyncCommHandler().drain()')
                 code = f'return {outputs}'
@@ -859,12 +882,6 @@ class ScheduleCodeGen(FuncEmission):
         """
         Emit node / subgraph code
         """
-        fsign = '{outputs} = nnscaler.runtime.executor.fexecute({name}, {model}, *{inputs}, requires_grad={req_grad})'
-        asign = '{outputs} = nnscaler.runtime.executor.aexecute({model}, *{inputs}, requires_grad={req_grad})'
-        bsign = '{input_grads} = nnscaler.runtime.executor.backward({name}, {input_tensors}, {output_tensors}, {output_grads})'
-        bi_sign = '{input_grads} = nnscaler.runtime.executor.backward_input({name}, {input_tensors}, {output_tensors}, {output_grads}, {weights})'
-        bw_sign = 'nnscaler.runtime.executor.backward_weight({name}, {weights})'
-
         node_inputs, node_outputs = node.inputs(), node.outputs()
         # the real inputs in gencode
         gen_inputs = node_inputs

@@ -220,7 +220,8 @@ class ModuleParallelizeConfigAdapter(PrecisionMixin, PolicyMixin):
         dummy_input: Optional[dict[str, Any]] = None, *,
         load_module: bool = True,
         build_buckets: bool = True,
-        module_args: Optional[tuple[tuple, dict]] = None
+        module_args: Optional[tuple[tuple, dict]] = None,
+        init_params: bool = True,
     ) -> Optional[nnscaler.ParallelModule]:
         pmodel_class = nnscaler.parallelize(
             self.model_type,
@@ -236,7 +237,7 @@ class ModuleParallelizeConfigAdapter(PrecisionMixin, PolicyMixin):
             autoset_requires_grad=self.autoset_requires_grad,
         )
         if load_module:
-            pmodel = pmodel_class(build_buckets=False)
+            pmodel = pmodel_class(init_params=init_params, build_buckets=False)
             self.set_grad_dtype(pmodel)
             if build_buckets:
                 pmodel.build_buckets()
@@ -247,6 +248,21 @@ class ModuleParallelizeConfigAdapter(PrecisionMixin, PolicyMixin):
 def mixin_module(model: torch.nn.Module, optimizer: torch.optim.Optimizer):
     if isinstance(model, nnscaler.ParallelModule):
         return model
+
+    def set_grad_accumulation_steps(self, steps: int):
+        """
+        Set the number of gradient accumulation steps for the module.
+
+        Args:
+            steps (int): the number of gradient accumulation steps
+        """
+        non_parallel_module_reducer: Reducer = optimizer._non_parallel_module_reducer
+        if non_parallel_module_reducer:
+            non_parallel_module_reducer.grad_accumulation_steps = steps
+
+        for submodule in self.modules():
+            if isinstance(submodule, nnscaler.ParallelModule):
+                submodule.set_grad_accumulation_steps(steps)
 
     def train_step(self,
         samples: list[Any],
@@ -266,6 +282,7 @@ def mixin_module(model: torch.nn.Module, optimizer: torch.optim.Optimizer):
             if not all(is_dummy_batch[len(samples):]):
                 raise ValueError('Dummy samples should be at the end of the batch')
 
+        set_grad_accumulation_steps(model, len(samples))
         forward_outputs = []
         for idx, sample in enumerate(samples):
             with nnscaler.sync_grad_when(idx == len(samples) - 1):
@@ -301,6 +318,7 @@ def mixin_module(model: torch.nn.Module, optimizer: torch.optim.Optimizer):
 
         return params_info
 
+    model.set_grad_accumulation_steps = types.MethodType(set_grad_accumulation_steps, model)
     model.train_step = types.MethodType(train_step, model)
     model.infer_step = types.MethodType(infer_step, model)
     model.parameters_for_calc_gnorm = types.MethodType(parameters_for_calc_gnorm, model)
@@ -312,7 +330,8 @@ def parallelize_model(
     dummy_input: dict[str, Any],
     load_module: bool,
     build_buckets: bool,
-    checkpointer: Checkpointer
+    checkpointer: Checkpointer,
+    init_params: bool = True,
 ):
     tracing_weights = None
     checkpointer = checkpointer or Checkpointer()
@@ -328,7 +347,7 @@ def parallelize_model(
 
     if not trainer_args.model.parallel_modules:
         # parallelize the whole model
-        return _new_adapter().parallelize(dummy_input, load_module=load_module, build_buckets=build_buckets)
+        return _new_adapter().parallelize(dummy_input, load_module=load_module, build_buckets=build_buckets, init_params=init_params)
 
     if not load_module and all(pm.args is not None for pm in trainer_args.model.parallel_modules):
         for m in trainer_args.model.parallel_modules:
@@ -382,7 +401,7 @@ def parallelize_model(
                 # This is a trade-off to make sure the parallelized module is consistent.
                 # Maybe we can use torch.distributed.broadcast to sync the random state in all devices.
                 with fork_rng():
-                    return adapter.parallelize(dummy_input, load_module=load_module, build_buckets=build_buckets, module_args=(args, kwargs))
+                    return adapter.parallelize(dummy_input, load_module=load_module, build_buckets=build_buckets, module_args=(args, kwargs), init_params=init_params)
         finally:
             _patch_new()
 

@@ -282,3 +282,37 @@ def param_clss_fn2(param_name: str) -> tuple[int, int]:
         return 0, 0, {'zero_param_level_sharding': None}
     else:
         return 1, 0, {'zero_param_level_sharding': True}
+
+
+def param_clss_fn3(param_name: str) -> tuple[int, int]:
+    """
+    Classify a parameter name into an optimizer index and a parameter group index.
+    """
+    if 'layers.1.' in param_name:
+        # 1 param only, so we need to pad in zero param level sharding
+        return 1, 0, {'zero_param_level_sharding': True}
+    else:
+        return 0, 0, {'zero_param_level_sharding': None}
+
+
+
+@pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.device_count() < 2 or not MuonAvailable, reason='lack of gpu devices')
+def test_trainer_muon_resume_correctness_zero1_param_config_less_params(tmp_path):
+    config_file = 'trainer_args_muon_hybrid.yaml'
+
+    launch_torchrun(2, trainer_muon_worker, tmp_path, config_file, '2', [
+        '--compute_config.use_zero', 1,
+        '--optimizer.args.config.optimizers.1.type', 'nnscaler.runtime.muon_optimizer.Muon',
+        '--optimizer.param_clss_fn', 'tests.cli.test_trainer_muon.param_clss_fn3',
+    ])
+
+    launch_torchrun(2, trainer_muon_worker, tmp_path, config_file, '1', [
+        '--optimizer.args.config.optimizers.1.type', 'torch.optim.Muon',
+        '--optimizer.param_clss_fn', 'tests.cli.test_trainer_muon.param_clss_fn3',
+    ])
+
+    zero0_ckpt = torch.load(tmp_path / '1' / 'result.pt', weights_only=False)
+    zero1_ckpt = torch.load(tmp_path / '2' / 'result.pt', weights_only=False)
+
+    assert_equal(zero0_ckpt['model'], zero1_ckpt['model'])
+    assert_equal(zero0_ckpt['optimizer']['state'], zero1_ckpt['optimizer']['state'])

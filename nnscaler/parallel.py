@@ -131,10 +131,13 @@ class ComputeConfig:
     #  2. the first return value of `module.forward` must be the loss
     #  which must be a scalar tensor
     use_end2end: bool = False
-
-    # Split pipeline backward into input-gradient and weight-gradient phases.
-    # Only effective for end-to-end training.
+    # whether to use FBW schedules or FB schedules. Default is False (FB schedules).
+    # only effective when `use_end2end` is True and `inference_only` is False.
+    # Only useful for pipeline training with multi-stream scheduling or `use_async_common` is True.
     use_fbw: bool = False
+    # whether to use async communication for cross-stage collective operations.
+    # This option only works for pipeline.
+    use_async_comm: bool = False
 
     # whether to use async reducer
     # if True, the gradient all-reduce will be async,
@@ -144,6 +147,10 @@ class ComputeConfig:
     # It is also effective for sync reducer.
     # None/0 means using the default value. (25MB for async, no limit for sync)
     reducer_bucket_cap_mb: Optional[float] = None
+    # whether to generate weight reducers for replicated weights.
+    # When True, replicated weights will also go through all-reduce (with nreplicas division),
+    # ensuring gradient consistency across ranks. Default is False.
+    reducer_replicated_params: bool = False
 
     # PAS policy settings
     # you can also put any other settings that can affect code generation here.
@@ -441,12 +448,13 @@ def _compile_flags(compute_config: ComputeConfig):
         CompileFlag,
         async_reducer=compute_config.use_async_reducer, reducer_op='sum',
         max_reducer_bucket=compute_config.max_bucket_size_bytes,
-        async_comm=False,
+        async_comm=compute_config.use_async_comm,
         use_zero=compute_config.use_zero,
         zero_ngroups=compute_config.zero_ngroups,
         zero_use_reduce_scatter=compute_config.zero_use_reduce_scatter,
         trace_strategy=compute_config.trace_strategy,
         zero_param_level_sharding=compute_config.zero_param_level_sharding,
+        reducer_replicated_params=compute_config.reducer_replicated_params,
         use_fbw=compute_config.use_fbw,
     )
 
@@ -569,6 +577,7 @@ class BroadcastGenFilesStrategy(Enum):
     1. config file: compute config (compute_config.pt)
     2. trace files: graph dump (graph.ckp), forward args dump(forward_args.pkl),
        origin module metadata (origin_module_metadata.pt), init weights file(fullmodel.pt.*),
+       non-persistent buffer file (npbuffer.pt),
        param name mapping (dist_param_map.pt)
     3. code: generated code files (gencode*.py)
 
@@ -584,13 +593,15 @@ class BroadcastGenFilesStrategy(Enum):
     # please note the init weight files can be huge.
     ALL = 'all'
 
-    # broadcast all new generated files except init weights (fullmodel.pt.*).
+    # broadcast all new generated files except init weights (fullmodel.pt.*, npbuffer.pt).
     # Without weights,
-    # you can only construct the parallel module with `init_params=False`.
-    # You can then
+    # you can only construct parallel modules that have no non-persistent buffers with `init_params=False`.
+    # Non-persistent buffers (npbuffer.pt) are also excluded because they are
+    # part of the model weights. You can then
     # 1. Load the weights from a checkpoint file with `module.load_state_dict` or `load_merged_state_dict`
     # 2. Or you can use `broadcast_weights` to get the weights from the workers in node0.
     #    (local world size should be bigger than plan_ngpus)
+    #    `broadcast_weights` will also broadcast non-persistent buffers and mark them as initialized.
     NO_WEIGHTS = 'no_weights'
 
     # broadcast the new generated code (gencode*.py) and compute_config.pt only.
@@ -693,6 +704,7 @@ def _prepare_and_check_reusable(
         expected_output_files.append(outdir / _GRAPH_DUMP_FILE)
         expected_output_files.append(outdir / _FORWARD_ARGS_DUMP_FILE)
         expected_output_files.append(outdir / ParallelModule.ORIGIN_MODULE_METADATA_FILE)
+        expected_output_files.append(outdir / FxModuleParser.NON_PERSISTENT_BUFFER_FILE)
         existing_output_files = [
             f for f in outdir.glob('*')
             if f.is_file() and (  # just take fullmodel.pt.0 to compare
@@ -1430,6 +1442,12 @@ hybrid.is_hybrid = True  # mark this function as hybrid optimizer factory
 
 
 _NON_PARALLEL_MODULE_ATTR_NAME = '_nnscaler_non_parallel_module_'
+_SYNC_GRAD_REQUIRED_ATTR = '_nnscaler_sync_grad_required'
+
+
+def _mark_sync_grad_required(module: torch.nn.Module, inputs, output) -> None:
+    if module.training:
+        setattr(module, _SYNC_GRAD_REQUIRED_ATTR, True)
 
 
 def build_optimizer(
@@ -1706,6 +1724,9 @@ def build_optimizer(
         )
     else:
         optimizer: torch.optim.Optimizer = optimizer_fn(_local_parameters(module), **kwargs)
+    if not isinstance(module, ParallelModule):
+        object.__setattr__(module, _SYNC_GRAD_REQUIRED_ATTR, False)
+        module.register_forward_hook(_mark_sync_grad_required)
     optimizer._non_parallel_module_reducer = non_parallel_module_reducer
     optimizer._extra_state = OptimizerExtraState(
             rank=torch.distributed.get_rank(),
@@ -1772,14 +1793,21 @@ def build_optimizer(
         orig_load_state_dict(state_dict)
     optimizer.load_state_dict = types.MethodType(_patched_load_state_dict, optimizer)
 
+    def _sync_grad_required():
+        if isinstance(module, ParallelModule):
+            return module._sync_grad_required
+        return getattr(module, _SYNC_GRAD_REQUIRED_ATTR, False)
+
+    def _reset_sync_grad_required():
+        if not isinstance(module, ParallelModule):
+            setattr(module, _SYNC_GRAD_REQUIRED_ATTR, False)
+
     def _sync_shard_grad(self):
         with _runtime_flags(skip_reducer=False):
-            # HACK: we reuse the _sync_grad_required flag of the first parallel module
-            # in order to support calling sync_shard_grad() multiple times.
-            # _sync_grad_required will reset to `True` in forward() of ParallelModule.
-            if parallel_modules[0]._sync_grad_required:
+            if _sync_grad_required():
+                _reset_sync_grad_required()  # reentrant safe
                 for m in parallel_modules:
-                    m.sync_grad()  # _sync_grad_required flag will reset inside sync_grad()
+                    m.sync_grad()
 
                 if non_parallel_module_reducer:
                     non_parallel_module_reducer.sync_grads()
@@ -1829,7 +1857,7 @@ def build_optimizer(
     optimizer.clip_gnorm = types.MethodType(_clip_gnorm, optimizer)
 
     def _scale_grads(self, scale: float) -> None:
-        if parallel_modules[0]._sync_grad_required:
+        if _sync_grad_required():
             raise RuntimeError("You can only call scale_grads() after gradients are synchronized.")
         for pg in optimizer.param_groups:
             for p in pg['params']:
@@ -1985,11 +2013,10 @@ def _get_optimizer_state_dict_info(
             if opt_extra_state.rank < opt_dedup_group_size:
                 for i in range(loc.offset, loc.offset + loc.count):
                     # if the parameter is not used or requires_grad is False, it will not be in the state dict
-                    # for us, as we use a continous buffer, it will always have grad, so it will always be in the state dict
                     # the state for each parameters is inserted in Adam in a lazy way.
                     # see https://github.com/pytorch/pytorch/blob/dad1b765848c4f52501c4c60b1c3e6fbd3cc8837/torch/optim/adam.py#L103
-                    assert i in opt_state_dict['state']
-                    opt_state_dicts[module_prefix][opt_extra_state.rank]['state'][i - loc.offset] = opt_state_dict['state'][i]
+                    if i in opt_state_dict['state']:
+                        opt_state_dicts[module_prefix][opt_extra_state.rank]['state'][i - loc.offset] = opt_state_dict['state'][i]
                 # TODO: inaccurate param_groups, for example, the 'params' in it is not right.
                 # we have this to make `ParallelModule.merge_partial_states` happy.
                 opt_state_dicts[module_prefix][opt_extra_state.rank]['param_groups'] = copy.deepcopy(opt_state_dict['param_groups'])
@@ -2414,6 +2441,9 @@ def _opt_load_merged_state_dict(module: ParallelModule, states: Dict[int, Dict[s
                 orig_param_dict[name] = states[cnt]
             cnt = cnt + 1
 
+        if not orig_param_dict:
+            return {}
+
         if module.compute_config.use_zero == 1:
             return _construct_optim_state_zero(module, orig_param_dict)
         elif module.compute_config.use_zero > 1:
@@ -2702,8 +2732,11 @@ def _broadcast_gen_files(
             if file.is_file() and (
                 broadcast_strategy == BroadcastGenFilesStrategy.ALL or
                 (
+                    # NO_WEIGHTS excludes both fullmodel.pt.* and npbuffer.pt.
+                    # Non-persistent buffers will be initialized via `broadcast_weights`.
                     broadcast_strategy == BroadcastGenFilesStrategy.NO_WEIGHTS
                     and not file.name.startswith(FxModuleParser.ATTR_CONTENT_FILE_STEM)
+                    and file.name != FxModuleParser.NON_PERSISTENT_BUFFER_FILE
                 ) or
                 (
                     # broadcast code files and compute config file
@@ -2738,6 +2771,8 @@ def _broadcast_gen_files(
 
     # wait for all nodes to finish
     torch.distributed.barrier()
+
+    logger.info('Files broadcasted.')
 
 
 def _collect_dedup_info(parallel_modules: Dict[str, ParallelModule]) -> Tuple[
@@ -3021,7 +3056,11 @@ def _broadcast_opt_state(optimizer_state_dict: OptStateDict, state_indexes: List
     if rank == src_rank:
         state_info = {}
         for idx in state_indexes:
-            state_info[idx] = {key: (value.shape, value.dtype) for key, value in optimizer_state_dict['state'][idx].items()}
+            if idx in optimizer_state_dict['state']:
+                state_info[idx] = {
+                    key: (value.shape, value.dtype)
+                    for key, value in optimizer_state_dict['state'][idx].items()
+                }
         sent = [state_info]
     else:
         sent = [None]
@@ -3030,6 +3069,7 @@ def _broadcast_opt_state(optimizer_state_dict: OptStateDict, state_indexes: List
             src=src_rank,
             group=curr_parallel_group,
     )
+    state_indexes = list(sent[0])
     if rank != src_rank:
         for k, v in sent[0].items():
             optimizer_state_dict['state'][k] = {
@@ -3458,6 +3498,8 @@ def trimmed_broadcast_merged_state_dict(
     device = device or torch.cuda.current_device()
     world_size = torch.distributed.get_world_size()
     dst_ranks = dst_ranks or list(range(world_size))
+    if dst_ranks != sorted(set(dst_ranks)):
+        raise ValueError(f"Invalid destination ranks: {dst_ranks}. They must be unique and sorted.")
     cur_rank = torch.distributed.get_rank()
 
     if cur_rank not in dst_ranks or src_rank not in dst_ranks:

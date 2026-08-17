@@ -172,6 +172,21 @@ class Frame:
                 part = {k: tid2value[k] for k in chunk}
                 torch.save(part, f'{save_file_stem}.{idx}')
 
+    def save_np_buffer_content(self, save_file: str):
+        """
+        Save non-persistent buffer content into a separate file.
+        Only tensors that are non-persistent buffers (is_buffer() and not is_persistent()) are saved.
+
+        Args:
+            save_file (str): file path to save non-persistent buffer content.
+        """
+        tid2value = {
+            t.tid: val.cpu()
+            for t, (_, val) in self._attr_map.items()
+            if t.is_buffer() and not t.is_persistent()
+        }
+        torch.save(tid2value, save_file)
+
     def save_attr_map(self, save_file: str = 'dist_param_map.pt'):
         """
         Save local_param -> origin_param name map.

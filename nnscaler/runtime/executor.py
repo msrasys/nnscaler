@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from typing import Tuple, Any, Callable, List, Dict, Iterable, Optional
 import torch
 import logging
+from torch.distributed import Work
 
 from nnscaler.flags import RuntimeFlag
 
@@ -60,15 +61,19 @@ class AsyncCommHandler:
         """
         if id(tensor) not in self._works:
             return tensor
-        works = self._works.pop(id(tensor))
-        for work in works:
+
+        tensor_or_works = self._works.pop(id(tensor))
+        if isinstance(tensor_or_works, torch.Tensor):
+            return tensor_or_works
+
+        for work in tensor_or_works:
             work.wait()
         callback = self._callbacks.pop(id(tensor))
         if callback is not None:
             tensor = callback(tensor)
         return tensor
-    
-    def submit(self, tensor: torch.Tensor, works: List, callback: Optional[Callable] = None):
+
+    def submit(self, tensor: torch.Tensor, works: List[Work], callback: Optional[Callable] = None):
         """
         Submit an async communication
         """
@@ -217,10 +222,10 @@ class Executor:
             if torch.is_tensor(itensor) and itensor.requires_grad:
                 mapping[id(itensor)] = itensor.detach().requires_grad_()
         input_dtensors = tuple(mapping[id(t)] if id(t) in mapping else t for t in input_tensors)
-        
+
         saved_pairs = [(id(itensor), dtensor) for itensor, dtensor in zip(input_tensors, input_dtensors)]
-        Executor._detach.setdefault(name, []).append(saved_pairs)  
-        
+        Executor._detach.setdefault(name, []).append(saved_pairs)
+
         outputs = subgraph(*input_dtensors)
         return outputs
 
@@ -286,7 +291,7 @@ class Executor:
                     f"Remain {len(Executor._detach[name])} segments.\n"
                     f"{''.join(traceback.format_stack())}"
                 )
-        
+
         if len(output_tensors) == 0: return None
 
         input_tensors = []
@@ -360,7 +365,11 @@ class Executor:
         output_tensor_grads: List[Optional[torch.Tensor]],
         weights: Iterable[torch.nn.Parameter],
     ) -> Any:
-        """Compute input gradients and save the state required for dWeight."""
+        """Compute input gradients and defer weight gradients.
+
+        ``backward_weight`` must later be called for the same segment name and
+        in the same order as ``backward_input``.
+        """
         output_tensor_grads = Executor.sync_tensors(output_tensor_grads)
         weights = tuple(weights)
 
@@ -373,6 +382,16 @@ class Executor:
             for tensor_id, dtensor in saved_pairs
             if torch.is_tensor(dtensor)
         }
+        tensor_ids: List[int] = [pair[0] for pair in saved_pairs]
+        for tensor in input_tensors:
+            if torch.is_tensor(tensor) and id(tensor) not in tensor_ids:
+                import traceback
+                _logger.warning(
+                    f"rank {torch.distributed.get_rank()}: input {name} doesn't match. "
+                    f"Make sure in scheduling, earlier forward perform earlier backward. "
+                    f"Remain {len(Executor._detach[name])} segments.\n"
+                    f"{''.join(traceback.format_stack())}"
+                )
 
         if len(output_tensors) == 0:
             Executor._weight_backward_states.setdefault(name, []).append(
@@ -475,7 +494,7 @@ class Executor:
         name: str,
         weights: Iterable[torch.nn.Parameter],
     ) -> None:
-        """Compute a segment's oldest deferred weight gradients."""
+        """Compute weight gradients deferred by ``backward_input``."""
         weights = tuple(weights)
         states = Executor._weight_backward_states.get(name)
         if not states:
@@ -610,9 +629,6 @@ class Executor:
         for name, npairs in Executor._detach.items():
             assert len(npairs) == 0, \
                 f"Fine remaining segment needs backward: {name}, remaining times: {len(npairs)}"
-        for name, states in Executor._weight_backward_states.items():
-            assert len(states) == 0, \
-                f"Fine remaining segment needs weight backward: {name}, remaining times: {len(states)}"
         assert (
             len(Executor._pseudo_free_grad_edges) == 0
             and len(Executor._pseudo_free_pending_sends) == 0
@@ -621,6 +637,9 @@ class Executor:
             f"edges={len(Executor._pseudo_free_grad_edges)}, "
             f"pending_sends={len(Executor._pseudo_free_pending_sends)}"
         )
+        for name, states in Executor._weight_backward_states.items():
+            assert len(states) == 0, \
+                f"Fine remaining segment needs weight backward: {name}, remaining times: {len(states)}"
 
 
 fexecute = Executor.fexecute
@@ -631,6 +650,7 @@ backward_weight = Executor.backward_weight
 pseudo_free_tensor = Executor.pseudo_free_tensor
 defer_pseudo_free_tensor = Executor.defer_pseudo_free_tensor
 complete_deferred_pseudo_free_tensor = Executor.complete_deferred_pseudo_free_tensor
+sync_tensors = Executor.sync_tensors
 
 
 # register checking for normal exit
