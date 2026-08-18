@@ -1788,15 +1788,16 @@ def build_optimizer(
             return module._sync_grad_required
         return getattr(module, _SYNC_GRAD_REQUIRED_ATTR, False)
 
-    def _reset_sync_grad_required():
-        if not isinstance(module, ParallelModule):
-            setattr(module, _SYNC_GRAD_REQUIRED_ATTR, False)
-
     def _sync_shard_grad(self):
         with _runtime_flags(skip_reducer=False):
             if _sync_grad_required():
-                _reset_sync_grad_required()  # reentrant safe
+                if isinstance(module, ParallelModule):
+                    # there is no non-parallel module reducer in this case,
+                    # so we can just call sync_grad() directly
+                    module.sync_grad()
+                    return
 
+                setattr(module, _SYNC_GRAD_REQUIRED_ATTR, False) # reentrant safe
                 sync_activity = torch.tensor(
                     [m._sync_grad_required for m in parallel_modules],
                     dtype=torch.int32,
