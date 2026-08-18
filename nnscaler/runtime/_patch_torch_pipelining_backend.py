@@ -16,13 +16,15 @@ from collections.abc import Iterator, Sequence
 from typing import Any
 
 import torch
-from torch.autograd.graph import GradientEdge, Node
+from torch.autograd.graph import GradientEdge, Node, _engine_run_backward
 from torch.nn import Parameter
 
 from torch.distributed.pipelining._debug import map_debug_info
 
 
 logger = logging.getLogger(__name__)
+
+_GRAPH_OWNERS_KEY = "_nnscaler_graph_owners"
 
 
 def _get_grad_fn_or_grad_acc(t: torch.Tensor) -> Node | None:
@@ -231,6 +233,11 @@ def stage_backward_input(
     param_groups = get_param_groups(
         stage_input_grad_fns, weight_grad_fns, reverse_edges_dict
     )
+    if param_groups:
+        with torch.enable_grad():
+            param_groups[0][_GRAPH_OWNERS_KEY] = [
+                output.view_as(output).grad_fn for output in valid_outputs
+            ]
 
     handles = []
     try:
@@ -291,6 +298,12 @@ def stage_backward_input(
 def stage_backward_weight(
     weights: Iterator[Parameter], param_groups: list[dict[str, Any]], retain_graph=False
 ) -> tuple[torch.Tensor | None, ...]:
+    _graph_owners = [
+        owner
+        for param_group in param_groups
+        for owner in param_group.pop(_GRAPH_OWNERS_KEY, ())
+    ]
+
     # map weights to param_group_weights
     grad_acc_to_weight = {}
     weight_grads: list[torch.Tensor | None] = []
@@ -332,11 +345,14 @@ def stage_backward_weight(
 
             if valid_edges:
                 weights_edges = tuple(GradientEdge(w, 0) for w in param_group["params"])
-                dweights = torch.autograd.grad(
-                    valid_edges,
+                dweights = _engine_run_backward(
+                    tuple(valid_edges),
+                    tuple(valid_grad_outputs),
+                    retain_graph,
+                    False,
                     weights_edges,
-                    grad_outputs=valid_grad_outputs,
-                    retain_graph=retain_graph,
+                    False,
+                    accumulate_grad=False,
                 )
 
                 del param_group["grads"]

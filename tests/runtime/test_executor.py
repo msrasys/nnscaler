@@ -136,6 +136,48 @@ def test_split_backward_with_view_output():
     Executor.check_clear()
 
 
+def test_split_backward_with_custom_autograd_function():
+    class OpaqueLinearFunction(torch.autograd.Function):
+        @staticmethod
+        def forward(ctx, input_tensor, weight):
+            ctx.save_for_backward(input_tensor, weight)
+            return input_tensor @ weight
+
+        @staticmethod
+        def backward(ctx, output_grad):
+            input_tensor, weight = ctx.saved_tensors
+            return output_grad @ weight.T, input_tensor.T @ output_grad
+
+    class OpaqueLinear(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.randn(8, 16, dtype=torch.float64))
+
+        def forward(self, input_tensor):
+            return OpaqueLinearFunction.apply(input_tensor, self.weight)
+
+    torch.manual_seed(4)
+    reference = OpaqueLinear()
+    actual = OpaqueLinear()
+    actual.load_state_dict(reference.state_dict())
+    input_data = torch.randn(4, 8, dtype=torch.float64)
+    output_grad = torch.randn(4, 16, dtype=torch.float64)
+
+    reference_input = input_data.clone().requires_grad_()
+    reference(reference_input).backward(output_grad)
+
+    actual_input = input_data.clone().requires_grad_()
+    output = Executor.fexecute('opaque_linear', actual, actual_input)
+    input_grad = Executor.backward_input(
+        'opaque_linear', [actual_input], [output], [output_grad], actual.parameters()
+    )
+    Executor.backward_weight('opaque_linear', actual.parameters())
+
+    torch.testing.assert_close(input_grad, reference_input.grad)
+    torch.testing.assert_close(actual.weight.grad, reference.weight.grad)
+    Executor.check_clear()
+
+
 def test_weight_backward_triggers_accumulate_grad_hook():
     module = torch.nn.Linear(8, 16)
     input_tensor = torch.randn(4, 8, requires_grad=True)
