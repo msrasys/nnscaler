@@ -12,7 +12,6 @@ from tests.parallel_module.test_gencode_pipeline import PPModule1, pp_pas
     [
         '1f1b',
         '1f1b_interleaved_fbw',
-        '1f1b_interleaved_zero_bubble_steady',
         '1f1b_interleaved_zero_bubble',
     ],
 )

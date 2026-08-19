@@ -5,7 +5,6 @@
 Common scheduling descriptions
 """
 
-from collections import deque
 from typing import Dict, List, Sequence
 
 from nnscaler.graph.schedule.schedplan import (
@@ -311,76 +310,6 @@ class PredefinedSched:
                 )
         sched.finish()
         return sched
-
-    @staticmethod
-    def sched_1f1b_interleaved_zero_bubble_steady(
-        graph: IRGraph,
-        num_microbatches: int,
-        num_stages: int,
-    ) -> SchedulePlan:
-        """Interleaved FBW with delayed W actions in the steady phase only.
-
-        The delay on physical rank ``r`` is ``r`` input-backward actions, as in
-        PyTorch's interleaved Zero-Bubble schedule. Pending steady-phase W work
-        is drained before cooldown, whose I/W pairs remain adjacent here.
-        """
-        base = PredefinedSched.sched_1f1b_interleaved(
-            graph, num_microbatches, num_stages, _bind_graph=False
-        )
-        device_groups = sorted({tuple(block.device) for block in base.all_blocks()})
-        local_actions = []
-
-        for rank, devices in enumerate(device_groups):
-            base_blocks = sorted(
-                (block for block in base.all_blocks() if tuple(block.device) == devices),
-                key=base.start,
-            )
-            block_at_step = {base.start(block): block for block in base_blocks}
-            sequence = []
-            pending_weights = deque()
-
-            def append_action(block: Block, action: PipelineAction) -> None:
-                sequence.append(Block(
-                    block.content,
-                    block.mid,
-                    block.span,
-                    block.stream_context,
-                    action,
-                ))
-
-            def drain_pending_weights() -> None:
-                while pending_weights:
-                    append_action(
-                        pending_weights.popleft(),
-                        PipelineAction.BACKWARD_WEIGHT,
-                    )
-
-            for block in base_blocks:
-                if block.content.isfw():
-                    append_action(block, PipelineAction.FORWARD)
-                    continue
-
-                step = base.start(block)
-                previous = block_at_step.get(step - 1)
-                in_steady_phase = previous is not None and previous.content.isfw()
-                if not in_steady_phase:
-                    drain_pending_weights()
-                    append_action(block, PipelineAction.BACKWARD_INPUT)
-                    append_action(block, PipelineAction.BACKWARD_WEIGHT)
-                    continue
-
-                append_action(block, PipelineAction.BACKWARD_INPUT)
-                pending_weights.append(block)
-                if len(pending_weights) > rank:
-                    append_action(
-                        pending_weights.popleft(),
-                        PipelineAction.BACKWARD_WEIGHT,
-                    )
-
-            drain_pending_weights()
-            local_actions.append(sequence)
-
-        return _schedule_local_actions(graph, num_microbatches, local_actions)
 
     @staticmethod
     def sched_1f1b_interleaved_zero_bubble(

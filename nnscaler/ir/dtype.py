@@ -20,6 +20,13 @@ class DTypeInfo:
         torch.float32: 4,
         torch.bfloat16: 2,
         torch.float16: 2,
+        # FP8 tensors can appear in traced graphs even though PyTorch does not
+        # support ordinary dtype promotion for them.  The profiler only needs
+        # their storage size when estimating a partition's memory footprint.
+        torch.float8_e4m3fn: 1,
+        torch.float8_e5m2: 1,
+        torch.float8_e4m3fnuz: 1,
+        torch.float8_e5m2fnuz: 1,
         torch.int64: 8,
         torch.int32: 4,
         torch.int16: 2,
