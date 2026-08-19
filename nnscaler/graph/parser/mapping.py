@@ -78,6 +78,8 @@ class SignFx2Op:
         __ttemplate('unsqueeze'): function.Unsqueeze,
         __tttemplate('type_as'): function.TypeAs,
         __ttemplate('gather'): function.Gather,
+        __ttemplate('scatter'): function.Scatter,
+        __tttemplate('scatter_'): function.Scatter,
         __ttemplate('ceil'): function.Ceil,
         __ttemplate('sign'): function.Sign,
         __ttemplate('triu'): function.Triu,

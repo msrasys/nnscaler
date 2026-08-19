@@ -6,6 +6,7 @@ psutil
 pulp
 pybind11<3.0.0
 pyyaml
-torch>=2.0
+# PyTorch 2.13.0 is the latest validated release.
+torch>=2.0,<2.14
 tqdm
 safetensors

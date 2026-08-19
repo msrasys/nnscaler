@@ -1,0 +1,2 @@
+torch==2.13.0
+transformers @ git+https://github.com/huggingface/transformers.git@943628458a1691f8af09c47ea9fc6e314734722f

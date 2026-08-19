@@ -3,6 +3,7 @@
 
 ### Only test the anno creation in these tests
 
+from collections import namedtuple
 from functools import reduce
 from operator import add
 from nnscaler.graph.function.dimops import IRDimops, OpAnno
@@ -24,6 +25,47 @@ def o(value):
 
 def assert_anno(op, expected):
     assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == expected
+
+
+def test_unwrap_value_preserves_namedtuple():
+    metadata = namedtuple('Metadata', ('shape', 'dtype'))
+    value = metadata([o(2), o(3)], o(torch.float32))
+
+    unwrapped = F._unwrap_value(value)
+
+    assert isinstance(unwrapped, metadata)
+    assert unwrapped == metadata([2, 3], torch.float32)
+
+
+@pytest.mark.parametrize(
+    ('equation', 'expected'),
+    [
+        ('bshd,btd->bsht', 'b s h d+, b t d+ -> b s h t'),
+        ('b s h d, b t d -> b s h t', 'b s h d+, b t d+ -> b s h t'),
+    ],
+)
+def test_einsum_annotation(equation, expected):
+    op = F.CubeEinSum(
+        IRTensor([2, 8, 2, 8]),
+        IRTensor([2, 8, 8]),
+        equation=equation,
+    )
+
+    assert_anno(op, expected)
+
+
+def test_scatter_annotation():
+    op = F.Scatter(
+        IRTensor([2, 8, 8]),
+        o(-1),
+        IRTensor([2, 8, 4]),
+        o(0.0),
+    )
+
+    assert_anno(
+        op,
+        'i0^ i1^ i2^, ?, i0^ i1^ k2^, ? -> i0^ i1^ i2^',
+    )
 
 
 def test_handle_broadcast_multi():
@@ -714,6 +756,12 @@ def test_Softmax():
     assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == 'a b c^ -> a b c^'
     op = F.Softmax(IRTensor([2, 3, 4]), dtype=torch.float32)
     assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == 'a b c -> a b c'
+    op = F.Softmax(IRTensor([2, 3, 4]), dim=-1, signature='torch.softmax')
+    assert '_stacklevel' not in op.kwargs
+    op = F.Softmax(IRTensor([2, 3, 4]), dim=-1, signature='torch.nn.functional.softmax')
+    assert op.kwargs['_stacklevel'] == 3
+    op = F.LogSoftmax(IRTensor([2, 3, 4]), dim=-1, signature='torch.log_softmax')
+    assert '_stacklevel' not in op.kwargs
 
 
 def test_Conv1D():
@@ -1216,4 +1264,8 @@ def test_chunk():
     for output_dim_track in output_dim_tracks[1:]:
         assert output_dim_track[0] is output_dim_tracks[0][0]
         assert output_dim_track[1] is output_dim_tracks[0][1]
+
+    negative_dim_op = F.Chunk(IRTensor([8, 10]), chunks=2, dim=-1)
+    assert_anno(negative_dim_op, 'a 10 -> a 5, a 5')
+    assert negative_dim_op.kwargs['dim'] == 1
     assert True

@@ -199,13 +199,39 @@ def BMMAdd(input, batch1, batch2, *, beta=1, alpha=1, out=None, signature = None
 def CubeEinSum(*operands, equation=None, signature = None):
     assert isinstance(equation, str)
     signature = 'nnscaler.runtime.function.einsum'
-    lhs, rhs = equation.split('->')
+    lhs, rhs = equation.replace(' ', '').split('->')
     assert ',' not in rhs
-    lhs_dims = set(lhs.replace(',', ' ').split(' '))
-    for dim in lhs_dims:
-        if dim not in rhs:
-            lhs = lhs.replace(dim, f'{dim}+')
-    anno = f'{lhs} -> {rhs}'
+    lhs_operands = lhs.split(',')
+    assert len(lhs_operands) == len(operands)
+
+    def tokenize(subscript):
+        tokens = []
+        index = 0
+        while index < len(subscript):
+            if subscript[index:index + 3] == '...':
+                tokens.append('*')
+                index += 3
+            else:
+                tokens.append(subscript[index])
+                index += 1
+        return tokens
+
+    rhs_dims = tokenize(rhs)
+    lhs_dims = [tokenize(subscript) for subscript in lhs_operands]
+    if '*' in {dim for dims in lhs_dims for dim in dims} and '*' not in rhs_dims:
+        raise NotImplementedError('einsum reduction over ellipsis is not supported')
+
+    reduction_dims = {
+        dim
+        for dims in lhs_dims
+        for dim in dims
+        if dim != '*' and dim not in rhs_dims
+    }
+    input_annos = [
+        ' '.join(f'{dim}+' if dim in reduction_dims else dim for dim in dims)
+        for dims in lhs_dims
+    ]
+    anno = f'{", ".join(input_annos)} -> {" ".join(rhs_dims)}'
     return IRDimops(CubeEinSum, 'einsum', signature, [anno], operands, equation=equation)
 
 
@@ -762,6 +788,8 @@ def IsInf(input, *, signature=None):
 def _unwrap_value(obj: Union[IRObject, Any]):
     if isinstance(obj, IRObject):
         return _unwrap_value(obj.value)
+    elif isinstance(obj, tuple) and hasattr(obj, '_fields'):
+        return type(obj)(*(_unwrap_value(v) for v in obj))
     elif isinstance(obj, (list, tuple)):
         return type(obj)(_unwrap_value(v) for v in obj)
     elif isinstance(obj, dict):
@@ -1027,8 +1055,10 @@ def Softmax(input, dim=None, _stacklevel=3, dtype=None, signature = None):
         edim_in[dim] += '^'
         edim_ou[dim] += '^'
     anno = OpAnno.create_op_str([edim_in], [edim_ou])
-    return IRDimops(Softmax, 'softmax', signature, [anno], [input],
-                    dim=dim, _stacklevel=_stacklevel, dtype=dtype)
+    kwargs = {'dim': dim, 'dtype': dtype}
+    if signature == 'torch.nn.functional.softmax':
+        kwargs['_stacklevel'] = _stacklevel
+    return IRDimops(Softmax, 'softmax', signature, [anno], [input], **kwargs)
 
 
 def LogSoftmax(input, dim=None, _stacklevel=3, dtype=None, signature=None):
@@ -1041,8 +1071,10 @@ def LogSoftmax(input, dim=None, _stacklevel=3, dtype=None, signature=None):
         edim_in[dim] += '^'
         edim_ou[dim] += '^'
     anno = OpAnno.create_op_str([edim_in], [edim_ou])
-    return IRDimops(LogSoftmax, 'log_softmax', signature, [anno], [input],
-                    dim=dim, _stacklevel=_stacklevel, dtype=dtype)
+    kwargs = {'dim': dim, 'dtype': dtype}
+    if signature == 'torch.nn.functional.log_softmax':
+        kwargs['_stacklevel'] = _stacklevel
+    return IRDimops(LogSoftmax, 'log_softmax', signature, [anno], [input], **kwargs)
 
 
 def Dropout(input, p=0.5, training=True, inplace=False, signature = None):
@@ -1929,6 +1961,9 @@ def Chunk(input: IRTensor, chunks, dim=0, signature = None):
     """
     torch.chunk(input, chunks, dim=0)
     """
+    if not -len(input.shape) <= dim < len(input.shape):
+        raise IndexError(f'Dimension {dim} is out of range for tensor with {len(input.shape)} dimensions')
+    dim = dim % len(input.shape)
     assert input.shape[dim] % chunks == 0
     iannos = [ShapeAnno.create_shape_str(input.shape)]
     oannos = [copy.copy(iannos[0]) for _ in range(chunks)]
@@ -3443,6 +3478,41 @@ def Gather(input: IRTensor, dim, index: IRTensor, sparse_grad=False, out=None, s
             index_anno[i] = input_anno[i]
     anno = OpAnno.create_op_str([input_anno, '?', index_anno], [index_anno])
     return IRDimops(Gather, 'gather', signature, [anno], [input, dim, index])
+
+
+def Scatter(input: IRTensor, dim, index: IRTensor, src, reduce=None, signature=None):
+    """
+    torch.Tensor.scatter_(dim, index, src, *, reduce=None) -> Tensor
+
+    Scatter indices are local to the unpartitioned destination dimension, so
+    this conservative annotation keeps the operation replicated.
+    """
+    dim_value = _unwrap_value(dim)
+    if not (-len(input.shape) <= dim_value < len(input.shape)):
+        raise ValueError(f"Dimension {dim_value} is out of bounds for input with {len(input.shape)} dimensions.")
+    if len(input.shape) != len(index.shape):
+        raise ValueError("The dimensions of 'input' and 'index' must be the same.")
+    if isinstance(src, IRTensor) and src.shape != index.shape:
+        raise ValueError("Tensor 'src' and 'index' must have the same shape.")
+
+    input_dims = [f'i{axis}^' for axis in range(len(input.shape))]
+    index_dims = [
+        input_dims[axis] if input.shape[axis] == index.shape[axis] else f'k{axis}^'
+        for axis in range(len(input.shape))
+    ]
+    input_anno = ' '.join(input_dims)
+    index_anno = ' '.join(index_dims)
+    src_anno = index_anno if isinstance(src, IRTensor) else '?'
+    anno = f'{input_anno}, ?, {index_anno}, {src_anno} -> {input_anno}'
+    kwargs = {} if reduce is None else {'reduce': reduce}
+    return IRDimops(
+        Scatter,
+        'scatter',
+        signature,
+        [anno],
+        [input, dim, index, src],
+        **kwargs,
+    )
 
 
 def Ceil(input: IRTensor, out=None, signature=None):
