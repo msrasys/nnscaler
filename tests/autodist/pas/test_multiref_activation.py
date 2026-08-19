@@ -37,7 +37,7 @@ class ModelA(torch.nn.Module):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason='lack of gpu devices')
-def test_loss_multiref():
+def test_loss_output_identity():
     m = ModelA()
     m.train()
     torch.manual_seed(0)
@@ -59,7 +59,7 @@ def test_loss_multiref():
                 load_module=False,
         )
 
-        assert len(_gencode_contains(tempdir, ModelA, 0, '\.multiref')) == 1
+        assert len(_gencode_contains(tempdir, ModelA, 0, 'nnscaler.runtime.function.identity')) == 1
 
 
 class ModelB(torch.nn.Module):

@@ -3,14 +3,58 @@
 
 import logging
 import os
+from types import SimpleNamespace
 import unittest.mock
 import pytest
 import torch
 import nnscaler.autodist.pipeline_solver
+from nnscaler.autodist.descs import MeshDesc, SPMDSearchOutput, TensorParallelDesc
 from nnscaler.cli.trainer import Trainer
 from nnscaler.cli.trainer_args import *
 
 from .. import utils
+
+
+@pytest.mark.parametrize(
+    ('uniform_tp', 'expected_tp_degrees'),
+    [(False, [8, 4, 2, 2]), (True, [4, 4, 4, 4])],
+)
+def test_stages_use_same_tp_degree(monkeypatch, uniform_tp, expected_tp_degrees):
+    op_costs = (8, 4, 2, 2)
+
+    def fake_compute_tp_info(model_graph, cfg, legal_tp_degrees):
+        tp_info = {}
+        for tp_degree in legal_tp_degrees:
+            for stage_num in range(1, model_graph.op_num + 1):
+                for start in range(model_graph.op_num):
+                    for end in range(start, model_graph.op_num):
+                        desc = TensorParallelDesc({}, [], MeshDesc(1, tp_degree), {})
+                        all_time = sum(op_costs[start:end + 1]) / tp_degree
+                        tp_info[(tp_degree, stage_num, start, end)] = SPMDSearchOutput(
+                            desc, memory=0, all_time=all_time, comp_time=all_time
+                        )
+        return tp_info
+
+    monkeypatch.setattr(nnscaler.autodist.pipeline_solver, '_compute_tp_info', fake_compute_tp_info)
+    model_graph = SimpleNamespace(
+        op_num=len(op_costs),
+        get_pipeline_pivots=lambda: [1, 2, 3],
+    )
+    config = SimpleNamespace(
+        mesh_desc=MeshDesc(2, 8),
+        pipeline_nstages=4,
+        update_freq=4,
+    )
+
+    if uniform_tp:
+        plan = nnscaler.autodist.pipeline_solver.calc_optimal_pp_plan(
+            model_graph, config, uniform_tp=True
+        )
+    else:
+        # The default preserves the original heterogeneous-stage search.
+        plan = nnscaler.autodist.pipeline_solver.calc_optimal_pp_plan(model_graph, config)
+
+    assert [desc.mesh_desc.ngpus for desc in plan.desc.spmd_descs] == expected_tp_degrees
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason='no gpu')

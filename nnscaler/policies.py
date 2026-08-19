@@ -234,11 +234,16 @@ def pas_autodist(graph: IRGraph, cfg: 'ComputeConfig') -> IRGraph:
 
     pas_cfg = cfg.pas_config
 
-    update_freq = pas_cfg.get('update_freq', 1)
-    if isinstance(update_freq, dict):
-        update_freq = update_freq[min(update_freq)]
-    elif isinstance(update_freq, (tuple, list)):
-        update_freq = update_freq[0]
+    update_freq_config = pas_cfg.get('update_freq', 1)
+    pipeline_nmicros = update_freq_config
+    if isinstance(update_freq_config, dict):
+        pipeline_nmicros = sorted(set(update_freq_config.values()))
+        update_freq = update_freq_config[min(update_freq_config)]
+    elif isinstance(update_freq_config, (tuple, list)):
+        pipeline_nmicros = list(update_freq_config)
+        update_freq = update_freq_config[0]
+    else:
+        update_freq = update_freq_config
 
     # optional parameters
 
@@ -371,6 +376,7 @@ def pas_autodist(graph: IRGraph, cfg: 'ComputeConfig') -> IRGraph:
         solver=solver,
     )
 
+    pas_cfg.setdefault('pipeline_nmicros', pipeline_nmicros)
     return parallelize_graph(graph, autodist_cfg)
 
 

@@ -10,6 +10,8 @@ from pathlib import Path
 from nnscaler.graph.parser.converter import to_fx_graph, to_ir_graph
 from nnscaler.autodist.autodist_config import AutoDistConfig
 from nnscaler.autodist.apis import parallelize_graph
+from nnscaler.parallel import ComputeConfig
+from nnscaler.policies import fn, OpPlan
 
 import nnscaler
 from nnscaler.ir.unique import IDGenerator
@@ -67,7 +69,16 @@ def test_shared_param_pipeline(cfg_fname):
         print(ir_graph.nodes())
         plan_path = Path(os.path.dirname(__file__)) / cfg_fname
         cfg = AutoDistConfig(load_plan_path=plan_path, mesh_col=4)
-        graph = parallelize_graph(ir_graph, cfg)
+        compute_config = ComputeConfig(
+            4,
+            4,
+            use_end2end='pp' in cfg_fname,
+            pas_config={'pipeline_nmicros': cfg.update_freq},
+        )
+        op_plans = list(parallelize_graph(ir_graph, cfg))
+        assert op_plans and all(isinstance(plan, OpPlan) for plan in op_plans)
+        assert not ir_graph.select(ntype=IRSegment)
+        graph = fn(ir_graph, compute_config, lambda *_: op_plans)
         if 'pp' in cfg_fname:
             assert isinstance(graph.nodes()[4], IRSegment)
             # check multiref is correctly inserted at the 1st IRSegment (pipeline stage)
