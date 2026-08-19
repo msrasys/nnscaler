@@ -941,6 +941,10 @@ class Bucket:
                 group=self._group, async_op=True)
 
     def set_async_grad_expected_counts(self, param_counts: Dict[torch.nn.Parameter, int]):
+        # Explicit per-parameter counts describe scheduled PP/VPP plans where
+        # shared parameters can contribute more often than ordinary parameters.
+        # They therefore supersede the uniform accumulation-step multiplier.
+        self._grad_accumulation_steps = 0
         self._async_expected_param_cnt = {}
         for param in self._params:
             count = int(param_counts.get(param, 1))
@@ -1626,6 +1630,10 @@ class Reducer:
         """
         if not self._async:
             return
+        # Keep the public reducer state consistent with its buckets.  Generated
+        # scheduled code calls this after ParallelModule has installed the
+        # dataloader's uniform microbatch count.
+        self._grad_accumulation_steps = 0
         for bucket in self._buckets:
             bucket.set_async_grad_expected_counts(param_counts)
 
