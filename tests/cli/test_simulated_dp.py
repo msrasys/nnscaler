@@ -16,6 +16,7 @@ from nnscaler.runtime.adapter.reducer import ParamBucketConfig
 from nnscaler.runtime.device import DeviceGroup
 from tests.launch_torchrun import launch_torchrun
 from tests.parallel_module.common import assert_close
+from tests.parallel_module.test_gencode import _gencode_contains
 
 
 CONFIG_PATH = Path(__file__).with_name('trainer_args_simulated_dp.yaml')
@@ -443,11 +444,17 @@ def test_simulated_dp_cli(tmp_path):
 
 @pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.device_count() < 4, reason='lack of gpu devices')
 def test_simulated_dp_with_dp_sharded_input(tmp_path):
+    # launch_torchrun returns {global_rank: worker_result}. Each worker_result is
+    # (dummy_input_shape, opaque_runtime_batch_sizes, dataloader_info_by_stage).
     baseline_results = launch_torchrun(4, dp_sharded_simulated_dp_worker, tmp_path, False)
     dp_sharded_results = launch_torchrun(4, dp_sharded_simulated_dp_worker, tmp_path, True)
 
+    # Every worker traces the baseline with the logical batch of 4, while
+    # dp_sharded traces the same rank-local batch of 2 used at runtime.
+    # 7, 16 are the sequence length and hidden size.
     assert {result[0] for result in baseline_results.values()} == {(4, 7, 16)}
     assert {result[0] for result in dp_sharded_results.values()} == {(2, 7, 16)}
+    # 4/2 are the micro-batch size when calling the opaque block at runtime.
     assert {result[1] for result in baseline_results.values()} == {(4,)}
     assert {result[1] for result in dp_sharded_results.values()} == {(2,)}
 
@@ -472,12 +479,22 @@ def test_simulated_dp_with_dp_sharded_input(tmp_path):
     assert tuple(dp_sharded_loader_info[0][4] + dp_sharded_loader_info[1][4]) == baseline_loader_info[0][4]
     assert tuple(dp_sharded_loader_info[2][4] + dp_sharded_loader_info[3][4]) == baseline_loader_info[2][4]
 
-    generated_files = list((tmp_path / 'dp_sharded' / 'generated').glob('**/gencode*.py'))
-    assert len(generated_files) == 4
-    for generated_file in generated_files:
-        generated_code = generated_file.read_text()
-        assert 'scale_unit_all_gather' in generated_code
-        assert 'scale_unit_chunk' not in generated_code
+    gen_savedir = tmp_path / 'dp_sharded' / 'generated'
+    for rank in range(4):
+        assert _gencode_contains(
+            gen_savedir,
+            LeadingSimulatedDPModel,
+            rank,
+            r'tests\.cli\.test_simulated_dp\.scale_unit_all_gather\(',
+            instance_name='dp_sharded',
+        )
+        assert not _gencode_contains(
+            gen_savedir,
+            LeadingSimulatedDPModel,
+            rank,
+            r'tests\.cli\.test_simulated_dp\.scale_unit_chunk\(',
+            instance_name='dp_sharded',
+        )
 
     baseline = torch.load(tmp_path / 'leading_baseline.pt', weights_only=False)
     dp_sharded = torch.load(tmp_path / 'dp_sharded.pt', weights_only=False)
