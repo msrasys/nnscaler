@@ -1077,6 +1077,7 @@ class ParallelModule(CubeModule):
     EXTRA_STATE_KEY = 'CUBE_EXTRA_STATE'
     ATTR_META_FILE_PREFIX = 'attr_meta'
     ATTR_META_FILE_TEMPLATE = ATTR_META_FILE_PREFIX + '{}.pkl'  # 'attr_meta{}.pkl'
+    ATTR_META_MERGED_FILE = ATTR_META_FILE_PREFIX + '.merged.pkl'  # 'attr_meta.merged.pkl'
 
     # the rank of the module, will be assigned in the generated subclasses
     rank: int
@@ -1140,19 +1141,32 @@ class ParallelModule(CubeModule):
         cls.attr_meta_maps = []
         cls.module_dir = Path(sys.modules[cls.__module__].__file__).parent
 
-        for rank in range(cls.world_size):
-            attr_map_file = cls.module_dir / cls.ATTR_META_FILE_TEMPLATE.format(rank)
-            with open(attr_map_file, 'rb') as f:
-                attr_meta_map = pickle.load(f)
-                attr_meta_map = {attr: AttrMeta(**meta) for attr, meta in attr_meta_map.items()}
-                cls.attr_meta_maps.append(attr_meta_map)
-
         cls.dist_param_map = torch.load(cls.module_dir / FxModuleParser.ATTR_MAP_FILE, weights_only=False)
         cls.compute_config = ComputeConfig.safe_load_from_file(
             cls.module_dir / cls.COMPUTE_CONFIG_FILE,
             return_none_on_error=False
         )
         cls.origin_module_metadata = torch.load(cls.module_dir / cls.ORIGIN_MODULE_METADATA_FILE, weights_only=False)
+
+        attr_merged_file = cls.module_dir / cls.ATTR_META_MERGED_FILE
+        if attr_merged_file.is_file():
+            with open(attr_merged_file, 'rb') as f:
+                attr_merged_meta_map = pickle.load(f)
+                for rank, attr_meta_map in enumerate(attr_merged_meta_map):
+                    attr_meta_map = {attr: AttrMeta(**meta) for attr, meta in attr_meta_map.items()}
+                    cls.attr_meta_maps.append(attr_meta_map)
+                assert len(cls.attr_meta_maps) == cls.compute_config.plan_ngpus, \
+                    f"Expected {cls.compute_config.plan_ngpus} attr_meta_maps, but got {len(cls.attr_meta_maps)}"
+                # this list multiplication is intended
+                cls.attr_meta_maps = cls.attr_meta_maps * cls.compute_config.num_scale_units
+        else:
+            # for backward compatibility, we will load the attr_meta from each rank's file
+            for rank in range(cls.world_size):
+                attr_map_file = cls.module_dir / cls.ATTR_META_FILE_TEMPLATE.format(rank)
+                with open(attr_map_file, 'rb') as f:
+                    attr_meta_map = pickle.load(f)
+                    attr_meta_map = {attr: AttrMeta(**meta) for attr, meta in attr_meta_map.items()}
+                    cls.attr_meta_maps.append(attr_meta_map)
 
     @property
     def non_presistent_buffers_inited(self):
