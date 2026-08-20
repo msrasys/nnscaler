@@ -24,7 +24,8 @@ import torch.distributed as dist
 import torch.nn.functional as F
 
 import nnscaler
-from nnscaler.cli.scale_unit_topo import (
+from nnscaler.cli.scale_unit_dp import (
+    cross_scale_unit_param_config,
     cross_scale_unit_all_gather,
     cross_scale_unit_chunk,
     cross_scale_unit_lane_ranks,
@@ -38,7 +39,6 @@ from nnscaler.parallel import ComputeConfig, _load_parallel_module_class, parall
 from nnscaler.policies import OpPartition, OpPlan, fn, get_pas_ops
 from nnscaler.runtime.adapter.collectives import all_reduce
 from nnscaler.runtime.adapter.nn import alltoall_alltoall
-from nnscaler.runtime.adapter.reducer import ParamBucketConfig
 from nnscaler.runtime.device import DeviceGroup
 from tests.launch_torchrun import launch_torchrun
 from tests.parallel_module.common import assert_close
@@ -502,14 +502,20 @@ def cp_ep_policy(graph, compute_config: ComputeConfig):
             yield OpPlan(node, partition=OpPartition(input=1, dim=0))
 
 
-def baseline_param_clss_fn(parameter_fqn: str) -> ParamBucketConfig:
+def cp_param_clss_fn(trainer_args: TrainerArgs, parameter_fqn: str) -> dict:
+    if parameter_fqn.startswith('layers.') and parameter_fqn.endswith('.expert_weight'):
+        return cross_scale_unit_param_config(trainer_args)
+    return {}
+
+
+def baseline_param_clss_fn(parameter_fqn: str) -> dict:
     if parameter_fqn.startswith('layers.') and parameter_fqn.endswith('.expert_weight'):
         if _SCALE_UNITS_PER_CONTEXT_GROUP is None:
             raise RuntimeError('init_cp_ep_groups must run before optimizer construction')
         # Baseline mode: the two scale units in one CP group process the same
         # complete input, so average their duplicate expert gradients.
-        return ParamBucketConfig(reducer_nreplicas=_SCALE_UNITS_PER_CONTEXT_GROUP)
-    return ParamBucketConfig()
+        return {'reducer_nreplicas': _SCALE_UNITS_PER_CONTEXT_GROUP}
+    return {}
 
 
 def _check_expert_bucket(trainer: Trainer, expected_nreplicas: int):
@@ -569,11 +575,14 @@ def cp_ep_worker(
             '--compute_config.runtime_ngpus', str(runtime_ngpus),
             '--global_batch_size', str(runtime_ngpus),
         ])
-    if not use_context_parallel:
-        args.extend([
-            '--optimizer.param_clss_fn',
-            'tests.cli.test_cp_ep.baseline_param_clss_fn',
-        ])
+    args.extend([
+        '--optimizer.param_clss_fn',
+        (
+            'tests.cli.test_cp_ep.cp_param_clss_fn'
+            if use_context_parallel
+            else 'tests.cli.test_cp_ep.baseline_param_clss_fn'
+        ),
+    ])
 
     trainer = Trainer(args)
     trainer.run()

@@ -7,12 +7,15 @@ import torch.distributed as dist
 import torch.nn.functional as F
 
 import nnscaler
-from nnscaler.cli.scale_unit_topo import inner_scale_unit_all_gather, inner_scale_unit_chunk
+from nnscaler.cli.scale_unit_dp import (
+    inner_scale_unit_all_gather,
+    inner_scale_unit_chunk,
+    inner_scale_unit_param_config,
+)
 from nnscaler.cli.trainer import Trainer
 from nnscaler.cli.trainer_args import TrainerArgs
 from nnscaler.parallel import ComputeConfig
 from nnscaler.policies import OpPartition, OpPlan, get_pas_ops
-from nnscaler.runtime.adapter.reducer import ParamBucketConfig
 from nnscaler.runtime.device import DeviceGroup
 from tests.launch_torchrun import launch_torchrun
 from tests.parallel_module.common import assert_close
@@ -272,21 +275,20 @@ def simulated_dp_policy(graph, compute_config: ComputeConfig):
             yield OpPlan(node, partition='auto')
 
 
-def simulated_dp_param_clss_fn(parameter_fqn: str) -> ParamBucketConfig:
+def simulated_dp_param_clss_fn(trainer_args: TrainerArgs, parameter_fqn: str) -> dict:
     if parameter_fqn.startswith('dynamic_block.'):
-        return ParamBucketConfig(reducer_nreplicas=1)
-    return ParamBucketConfig()
+        return inner_scale_unit_param_config(trainer_args)
+    return {}
 
 
 def dp_sharded_simulated_dp_param_clss_fn(
     trainer_args: TrainerArgs,
     parameter_fqn: str,
-) -> ParamBucketConfig:
-    if parameter_fqn.startswith('dynamic_block.'):
-        nreplicas = 1 if trainer_args.get_resolved_var('dp_sharded') \
-            else trainer_args.compute_config.plan_ngpus
-        return ParamBucketConfig(reducer_nreplicas=nreplicas)
-    return ParamBucketConfig()
+) -> dict:
+    if parameter_fqn.startswith('dynamic_block.') \
+            and trainer_args.get_resolved_var('dp_sharded'):
+        return inner_scale_unit_param_config(trainer_args)
+    return {}
 
 
 def _check_dynamic_block_buckets(
@@ -437,14 +439,14 @@ def test_simulated_dp_with_dp_sharded_input(tmp_path):
             gen_savedir,
             LeadingSimulatedDPModel,
             rank,
-            r'nnscaler\.cli\.scale_unit_topo\.inner_scale_unit_all_gather\(',
+            r'nnscaler\.cli\.scale_unit_dp\.inner_scale_unit_all_gather\(',
             instance_name='dp_sharded',
         )
         assert not _gencode_contains(
             gen_savedir,
             LeadingSimulatedDPModel,
             rank,
-            r'nnscaler\.cli\.scale_unit_topo\.inner_scale_unit_chunk\(',
+            r'nnscaler\.cli\.scale_unit_dp\.inner_scale_unit_chunk\(',
             instance_name='dp_sharded',
         )
 

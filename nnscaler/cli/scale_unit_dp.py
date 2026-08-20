@@ -8,7 +8,7 @@ across the same plan-local lane of adjacent scale units. All chunk/gather
 operations require equal-sized shards.
 """
 
-from typing import Optional
+from typing import Optional, TYPE_CHECKING
 
 import torch
 import torch.distributed as dist
@@ -17,14 +17,20 @@ import nnscaler
 from nnscaler.runtime.adapter.collectives import all_gather, chunk
 
 
+if TYPE_CHECKING:
+    from nnscaler.cli.trainer_args import TrainerArgs
+
+
 __all__ = [
     'scale_unit_ranks',
     'cross_scale_unit_ranks',
     'cross_scale_unit_lane_ranks',
     'inner_scale_unit_chunk',
     'inner_scale_unit_all_gather',
+    'inner_scale_unit_param_config',
     'cross_scale_unit_chunk',
     'cross_scale_unit_all_gather',
+    'cross_scale_unit_param_config',
 ]
 
 
@@ -184,6 +190,23 @@ def inner_scale_unit_all_gather(x: torch.Tensor, plan_ngpus: int, dim: int) -> t
     return _InnerScaleUnitAllGather.apply(x, plan_ngpus, dim)
 
 
+def inner_scale_unit_param_config(trainer_args: 'TrainerArgs') -> dict:
+    """Return bucket settings for parameters consuming inner-unit data shards.
+
+    Ranks in one scale unit process complementary data, so their gradient
+    contributions must remain summed after the reducer collective.
+
+    Args:
+        trainer_args (TrainerArgs): Trainer configuration. Accepted so this
+            helper can be called from a two-argument ``param_clss_fn``.
+
+    Returns:
+        dict: A :class:`ParamBucketConfig`-compatible mapping that preserves the
+            collective SUM by setting ``reducer_nreplicas`` to 1.
+    """
+    return dict(reducer_nreplicas=1)
+
+
 class _CrossScaleUnitChunk(torch.autograd.Function):
     @staticmethod
     def forward(
@@ -290,3 +313,20 @@ def cross_scale_unit_all_gather(
         torch.Tensor: Full tensor replicated across the same-lane ranks.
     """
     return _CrossScaleUnitAllGather.apply(x, plan_ngpus, num_scale_units, dim)
+
+
+def cross_scale_unit_param_config(trainer_args: 'TrainerArgs') -> dict:
+    """Return bucket settings for cross-scale-unit data partitioning.
+
+    Cross-scale-unit chunk/gather does not by itself change the replica count
+    inferred from the plan-level parameter layout, so parameters should inherit
+    their generated reducer configuration.
+
+    Args:
+        trainer_args (TrainerArgs): Trainer configuration. Accepted so this
+            helper can be called from a two-argument ``param_clss_fn``.
+
+    Returns:
+        dict: An empty mapping, which inherits all reducer bucket defaults.
+    """
+    return {}
