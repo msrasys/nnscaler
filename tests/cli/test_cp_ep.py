@@ -24,12 +24,19 @@ import torch.distributed as dist
 import torch.nn.functional as F
 
 import nnscaler
+from nnscaler.cli.scale_unit_topo import (
+    cross_scale_unit_all_gather,
+    cross_scale_unit_chunk,
+    cross_scale_unit_lane_ranks,
+    cross_scale_unit_ranks,
+    scale_unit_ranks,
+)
 from nnscaler.cli.trainer import Trainer
 from nnscaler.cli.trainer_args import TrainerArgs
 from nnscaler.graph.function import DimopSplit, TransformRule
 from nnscaler.parallel import ComputeConfig, _load_parallel_module_class, parallelize
 from nnscaler.policies import OpPartition, OpPlan, fn, get_pas_ops
-from nnscaler.runtime.adapter.collectives import all_gather, all_reduce, chunk
+from nnscaler.runtime.adapter.collectives import all_reduce
 from nnscaler.runtime.adapter.nn import alltoall_alltoall
 from nnscaler.runtime.adapter.reducer import ParamBucketConfig
 from nnscaler.runtime.device import DeviceGroup
@@ -43,62 +50,6 @@ CONFIG_PATH = Path(__file__).with_name('trainer_args_cp_ep.yaml')
 _SCALE_UNITS_PER_CONTEXT_GROUP: Optional[int] = None
 # Test-only probe used to report the actual input length seen by routed_expert.
 _LAST_EXPERT_SEQUENCE_LENGTH: Optional[int] = None
-
-
-def _context_group_ranks(
-    context_parallel_size: int,
-    rank: Optional[int] = None,
-) -> Tuple[int, ...]:
-    # CP=4, runtime_ngpus=8:
-    # rank 0~3 -> [0, 1, 2, 3], rank 4~7 -> [4, 5, 6, 7].
-    # Each of these groups processes one independent input sequence.
-    rank = dist.get_rank() if rank is None else rank
-    first_rank = rank // context_parallel_size * context_parallel_size
-    return tuple(range(first_rank, first_rank + context_parallel_size))
-
-
-def _local_cross_scale_ranks(
-    expert_parallel_size: int,
-    context_parallel_size: int,
-    rank: Optional[int] = None,
-) -> Tuple[int, ...]:
-    # The outer CP split happens between scale units at the same EP position.
-    # For CP=4 and EP=2:
-    #   CP group [0, 1, 2, 3] -> [0, 2] and [1, 3]
-    #   CP group [4, 5, 6, 7] -> [4, 6] and [5, 7]
-    rank = dist.get_rank() if rank is None else rank
-    first_rank = rank // context_parallel_size * context_parallel_size
-    expert_lane = rank % expert_parallel_size
-    return tuple(
-        range(
-            first_rank + expert_lane,
-            first_rank + context_parallel_size,
-            expert_parallel_size,
-        )
-    )
-
-
-def _expert_shard_reducer_ranks(
-    expert_parallel_size: int,
-    rank: Optional[int] = None,
-    world_size: Optional[int] = None,
-) -> Tuple[int, ...]:
-    # The same expert shard is repeated at the same EP lane of every scale unit.
-    # For EP=2 and runtime_ngpus=8:
-    #   even ranks own expert shard 0 -> [0, 2, 4, 6]
-    #   odd ranks own expert shard 1  -> [1, 3, 5, 7]
-    rank = dist.get_rank() if rank is None else rank
-    world_size = dist.get_world_size() if world_size is None else world_size
-    expert_lane = rank % expert_parallel_size
-    return tuple(range(expert_lane, world_size, expert_parallel_size))
-
-
-def _expert_parallel_ranks(expert_parallel_size: int) -> Tuple[int, ...]:
-    # EP communication never crosses a scale-unit boundary:
-    # [0, 1], [2, 3], [4, 5], or [6, 7].
-    rank = dist.get_rank()
-    first_rank = rank // expert_parallel_size * expert_parallel_size
-    return tuple(range(first_rank, first_rank + expert_parallel_size))
 
 
 def init_cp_ep_groups(trainer: Trainer) -> None:
@@ -183,62 +134,6 @@ class ContextGroupSampler(torch.utils.data.Sampler):
         self.sampler.set_epoch(epoch)
 
 
-class _ScaleUnitContextChunk(torch.autograd.Function):
-    @staticmethod
-    def forward(
-        ctx,
-        x: torch.Tensor,
-        expert_parallel_size: int,
-        context_parallel_size: int,
-    ) -> torch.Tensor:
-        # Before this call, every rank in a CP group has the complete input
-        # sample. For input A, ranks [0, 2] split it into two parts: rank 0 gets
-        # the first half and rank 2 gets the second half. Ranks [1, 3] perform
-        # the same split for the other EP lane. The EP policy then splits each
-        # half once more, so every rank ultimately gets one quarter of input A.
-        ctx.ranks = _local_cross_scale_ranks(
-            expert_parallel_size,
-            context_parallel_size,
-        )
-        expected_scale_units = context_parallel_size // expert_parallel_size
-        if len(ctx.ranks) != expected_scale_units:
-            raise ValueError(f'expected {expected_scale_units} scale units, got ranks {ctx.ranks}')
-        return chunk(x, dim=1, ranks=ctx.ranks)
-
-    @staticmethod
-    def backward(ctx, grad: torch.Tensor):
-        # Reverse the forward chunk so the producer before the CP region receives
-        # the gradient of the complete sequence.
-        return all_gather(grad, dim=1, ranks=ctx.ranks), None, None
-
-
-class _ScaleUnitContextAllGather(torch.autograd.Function):
-    @staticmethod
-    def forward(
-        ctx,
-        x: torch.Tensor,
-        expert_parallel_size: int,
-        context_parallel_size: int,
-    ) -> torch.Tensor:
-        # nnscaler has already combined the two EP sequence quarters inside each
-        # scale unit. This all-gather then combines the two scale-unit halves and
-        # restores the complete sequence for this CP group.
-        ctx.ranks = _local_cross_scale_ranks(
-            expert_parallel_size,
-            context_parallel_size,
-        )
-        expected_scale_units = context_parallel_size // expert_parallel_size
-        if len(ctx.ranks) != expected_scale_units:
-            raise ValueError(f'expected {expected_scale_units} scale units, got ranks {ctx.ranks}')
-        return all_gather(x, dim=1, ranks=ctx.ranks)
-
-    @staticmethod
-    def backward(ctx, grad: torch.Tensor):
-        # Each scale unit only needs the gradient for the sequence half it owned
-        # in forward, so backward is the matching chunk operation.
-        return chunk(grad, dim=1, ranks=ctx.ranks), None, None
-
-
 class _GlobalContextMix(torch.autograd.Function):
     """
     A quick replacement of ring attention to test context parallelism.
@@ -251,10 +146,14 @@ class _GlobalContextMix(torch.autograd.Function):
         full_sequence_length: int,
         context_replicas: int,
         context_parallel_size: int,
+        expert_parallel_size: int,
     ) -> torch.Tensor:
         # ranks == [0, 1, 2, 3] or [4, 5, 6, 7]
         # for CP=4, EP=2, runtime_ngpus=8
-        ctx.ranks = _context_group_ranks(context_parallel_size)
+        ctx.ranks = cross_scale_unit_ranks(
+            expert_parallel_size,
+            context_parallel_size // expert_parallel_size,
+        )
         # context_replicas == 1 for CP=4, EP=2, runtime_ngpus=8
         ctx.denominator = full_sequence_length * context_replicas
         # The input is already partitioned across the context parallel group,
@@ -270,34 +169,7 @@ class _GlobalContextMix(torch.autograd.Function):
         # Sum the context branch's gradients over the same CP group, then add
         # both the local residual path and the global-context path.
         context_grad = all_reduce(grad.sum(dim=1, keepdim=True), ranks=ctx.ranks)
-        return grad + context_grad / ctx.denominator, None, None, None
-
-
-def _fake_context_chunk(
-    x: torch.Tensor,
-    expert_parallel_size: int,
-    context_parallel_size: int,
-    num_scale_units: int,
-) -> torch.Tensor:
-    # fake_fn runs only while nnscaler traces the model. It describes the local
-    # output shape without issuing a distributed collective.
-    if num_scale_units != context_parallel_size // expert_parallel_size:
-        raise ValueError('num_scale_units does not match CP/EP sizes')
-    if x.shape[1] % num_scale_units:
-        raise ValueError('sequence length must be divisible by num_scale_units')
-    return x.chunk(num_scale_units, dim=1)[0]
-
-
-def _fake_context_all_gather(
-    x: torch.Tensor,
-    expert_parallel_size: int,
-    context_parallel_size: int,
-    num_scale_units: int,
-) -> torch.Tensor:
-    # Shape-only tracing counterpart of _ScaleUnitContextAllGather.forward.
-    if num_scale_units != context_parallel_size // expert_parallel_size:
-        raise ValueError('num_scale_units does not match CP/EP sizes')
-    return torch.cat([x] * num_scale_units, dim=1)
+        return grad + context_grad / ctx.denominator, None, None, None, None
 
 
 def _fake_routed_expert(
@@ -311,40 +183,6 @@ def _fake_routed_expert(
     # Preserve shape and requires_grad during tracing. The real dispatch and
     # expert computation are emitted through routed_expert below.
     return x.clone()
-
-
-@nnscaler.register_op(
-    'b (num_scale_units s^) h^ -> b s^ h^',
-    fake_fn=_fake_context_chunk,
-)
-def scale_unit_context_chunk(
-    x: torch.Tensor,
-    expert_parallel_size: int,
-    context_parallel_size: int,
-    num_scale_units: int,
-) -> torch.Tensor:
-    # This explicit consistency check keeps the symbolic annotation
-    # ``(num_scale_units s)`` aligned with the runtime CP/EP topology.
-    if num_scale_units != context_parallel_size // expert_parallel_size:
-        raise ValueError('num_scale_units does not match CP/EP sizes')
-    return _ScaleUnitContextChunk.apply(x, expert_parallel_size, context_parallel_size)
-
-
-@nnscaler.register_op(
-    'b s^ h^ -> b (num_scale_units s^) h^',
-    fake_fn=_fake_context_all_gather,
-)
-def scale_unit_context_all_gather(
-    x: torch.Tensor,
-    expert_parallel_size: int,
-    context_parallel_size: int,
-    num_scale_units: int,
-) -> torch.Tensor:
-    # Use the same topology check as the entry boundary so the two Autograd
-    # Functions are exact inverses of one another.
-    if num_scale_units != context_parallel_size // expert_parallel_size:
-        raise ValueError('num_scale_units does not match CP/EP sizes')
-    return _ScaleUnitContextAllGather.apply(x, expert_parallel_size, context_parallel_size)
 
 
 _EP_DISPATCH_COMBINE_RULE = TransformRule(
@@ -399,7 +237,7 @@ def routed_expert(
     # rank 2/3 -> [2, 3]
     # rank 4/5 -> [4, 5]
     # rank 6/7 -> [6, 7]
-    expert_parallel_ranks = _expert_parallel_ranks(expert_parallel_size)
+    expert_parallel_ranks = scale_unit_ranks(expert_parallel_size)
     _LAST_EXPERT_SEQUENCE_LENGTH = x.shape[1]
 
     # Model a context-dependent operation (similar to attention) before expert
@@ -409,6 +247,7 @@ def routed_expert(
         full_sequence_length,
         context_replicas,
         context_parallel_size,
+        expert_parallel_size,
     )
     batch, local_sequence, hidden = x.shape
     local_experts = expert_weight.shape[0]
@@ -601,14 +440,14 @@ class ContextExpertModel(torch.nn.Module):
         if self.use_context_parallel:
             # Stage 1 of sequence partitioning:
             # [0, 2] (and [1, 3]) split S into two scale-unit halves.
-            # after scale_unit_context_chunk,
+            # after cross_scale_unit_chunk,
             # [0, 1] have the first half of the sequence
             # and [2, 3] have the second half.
-            x = scale_unit_context_chunk(
+            x = cross_scale_unit_chunk(
                 x,
-                expert_parallel_size=self.expert_parallel_size,
-                context_parallel_size=self.context_parallel_size,
+                plan_ngpus=self.expert_parallel_size,
                 num_scale_units=self.num_scale_units,
+                dim=1,
             )
             # The four CP ranks now hold complementary sequence quarters after
             # routed_expert's EP TransformRule, so no duplicate context exists.
@@ -633,11 +472,11 @@ class ContextExpertModel(torch.nn.Module):
         if self.use_context_parallel:
             # nnscaler first combines EP quarters inside each scale unit; this
             # boundary then gathers the two scale-unit halves into full S.
-            output = scale_unit_context_all_gather(
+            output = cross_scale_unit_all_gather(
                 output,
-                expert_parallel_size=self.expert_parallel_size,
-                context_parallel_size=self.context_parallel_size,
+                plan_ngpus=self.expert_parallel_size,
                 num_scale_units=self.num_scale_units,
+                dim=1,
             )
         return F.mse_loss(output, data['target'])
 
@@ -696,8 +535,10 @@ def _check_expert_bucket(trainer: Trainer, expected_nreplicas: int):
             assert bucket.nreplicas == expected_nreplicas
             # Same expert shards synchronize over [0,2,4,6] or [1,3,5,7].
             # This spans both scale units and, for runtime=8, both CP input groups.
-            assert reducer.ranks == _expert_shard_reducer_ranks(
-                trainer.train_args.compute_config.plan_ngpus
+            compute_config = trainer.train_args.compute_config
+            assert reducer.ranks == cross_scale_unit_lane_ranks(
+                compute_config.plan_ngpus,
+                compute_config.runtime_ngpus // compute_config.plan_ngpus,
             )
             matched_parameters.update(matched)
 
@@ -777,7 +618,7 @@ def test_cp4_ep2_runtime8_static(tmp_path):
 
     # Two independent inputs are processed by [0,4) and [4,8).
     assert {
-        rank: _context_group_ranks(4, rank)
+        rank: cross_scale_unit_ranks(2, 2, rank)
         for rank in range(8)
     } == {
         0: (0, 1, 2, 3), 1: (0, 1, 2, 3),
@@ -788,7 +629,7 @@ def test_cp4_ep2_runtime8_static(tmp_path):
     # The outer CP boundary communicates only between same-EP-lane scale units
     # inside one input group; it never mixes input A with input B.
     assert {
-        rank: _local_cross_scale_ranks(2, 4, rank)
+        rank: cross_scale_unit_lane_ranks(2, 2, rank)
         for rank in range(8)
     } == {
         0: (0, 2), 1: (1, 3), 2: (0, 2), 3: (1, 3),
@@ -796,7 +637,7 @@ def test_cp4_ep2_runtime8_static(tmp_path):
     }
     # Weight gradients synchronize globally by expert ownership, not by input.
     assert {
-        rank: _expert_shard_reducer_ranks(2, rank, 8)
+        rank: cross_scale_unit_lane_ranks(2, 4, rank)
         for rank in range(8)
     } == {
         0: (0, 2, 4, 6), 1: (1, 3, 5, 7),

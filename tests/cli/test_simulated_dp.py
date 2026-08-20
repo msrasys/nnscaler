@@ -7,11 +7,11 @@ import torch.distributed as dist
 import torch.nn.functional as F
 
 import nnscaler
+from nnscaler.cli.scale_unit_topo import inner_scale_unit_all_gather, inner_scale_unit_chunk
 from nnscaler.cli.trainer import Trainer
 from nnscaler.cli.trainer_args import TrainerArgs
 from nnscaler.parallel import ComputeConfig
 from nnscaler.policies import OpPartition, OpPlan, get_pas_ops
-from nnscaler.runtime.adapter.collectives import all_gather, chunk
 from nnscaler.runtime.adapter.reducer import ParamBucketConfig
 from nnscaler.runtime.device import DeviceGroup
 from tests.launch_torchrun import launch_torchrun
@@ -27,12 +27,6 @@ _OPAQUE_BATCH_SIZES = set()
 _DP_SHARDED_DATALOADER_INFO = {}
 
 
-def _scale_unit_ranks(group_size: int) -> Tuple[int, ...]:
-    rank = dist.get_rank()
-    first_rank = rank // group_size * group_size
-    return tuple(range(first_rank, first_rank + group_size))
-
-
 def init_scale_unit_groups(trainer: Trainer) -> None:
     compute_config = trainer.train_args.compute_config
     group_size = compute_config.plan_ngpus
@@ -43,48 +37,6 @@ def init_scale_unit_groups(trainer: Trainer) -> None:
         raise ValueError(f'world size {world_size} must be divisible by {group_size}')
     for first_rank in range(0, world_size, group_size):
         DeviceGroup().get_group(tuple(range(first_rank, first_rank + group_size)))
-
-
-class _ScaleUnitChunk(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx, x: torch.Tensor, group_size: int) -> torch.Tensor:
-        ctx.ranks = _scale_unit_ranks(group_size)
-        return chunk(x, dim=0, ranks=ctx.ranks)
-
-    @staticmethod
-    def backward(ctx, grad: torch.Tensor):
-        return all_gather(grad, dim=0, ranks=ctx.ranks), None
-
-
-class _ScaleUnitAllGather(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx, x: torch.Tensor, group_size: int) -> torch.Tensor:
-        ctx.ranks = _scale_unit_ranks(group_size)
-        return all_gather(x, dim=0, ranks=ctx.ranks)
-
-    @staticmethod
-    def backward(ctx, grad: torch.Tensor):
-        return chunk(grad, dim=0, ranks=ctx.ranks), None
-
-
-def _fake_chunk(x: torch.Tensor, group_size: int) -> torch.Tensor:
-    if x.shape[0] % group_size:
-        raise ValueError('batch size must be divisible by the scale-unit size')
-    return x.chunk(group_size, dim=0)[0]
-
-
-def _fake_all_gather(x: torch.Tensor, group_size: int) -> torch.Tensor:
-    return torch.cat([x] * group_size, dim=0)
-
-
-@nnscaler.register_op('(group_size b) s^ h^ -> b s^ h^', fake_fn=_fake_chunk)
-def scale_unit_chunk(x: torch.Tensor, group_size: int) -> torch.Tensor:
-    return _ScaleUnitChunk.apply(x, group_size)
-
-
-@nnscaler.register_op('b s^ h^ -> (group_size b) s^ h^', fake_fn=_fake_all_gather)
-def scale_unit_all_gather(x: torch.Tensor, group_size: int) -> torch.Tensor:
-    return _ScaleUnitAllGather.apply(x, group_size)
 
 
 def _fake_slow_block(
@@ -151,10 +103,10 @@ class SimulatedDPModel(torch.nn.Module):
     def forward(self, data) -> torch.Tensor:
         x = self.pre(data['data'])
         if self.use_scale_unit_dp:
-            x = scale_unit_chunk(x, group_size=self.scale_unit_size)
+            x = inner_scale_unit_chunk(x, plan_ngpus=self.scale_unit_size, dim=0)
         x = self.dynamic_block(x)
         if self.use_scale_unit_dp:
-            x = scale_unit_all_gather(x, group_size=self.scale_unit_size)
+            x = inner_scale_unit_all_gather(x, plan_ngpus=self.scale_unit_size, dim=0)
         output = self.post(x)
         return F.mse_loss(output, data['target'])
 
@@ -304,8 +256,8 @@ class LeadingSimulatedDPModel(torch.nn.Module):
         x = self.dynamic_block(data['data'])
         target = data['target']
         if self.dp_sharded:
-            x = scale_unit_all_gather(x, group_size=self.scale_unit_size)
-            target = scale_unit_all_gather(target, group_size=self.scale_unit_size)
+            x = inner_scale_unit_all_gather(x, plan_ngpus=self.scale_unit_size, dim=0)
+            target = inner_scale_unit_all_gather(target, plan_ngpus=self.scale_unit_size, dim=0)
         output = self.post(x)
         return F.mse_loss(output, target)
 
@@ -485,14 +437,14 @@ def test_simulated_dp_with_dp_sharded_input(tmp_path):
             gen_savedir,
             LeadingSimulatedDPModel,
             rank,
-            r'tests\.cli\.test_simulated_dp\.scale_unit_all_gather\(',
+            r'nnscaler\.cli\.scale_unit_topo\.inner_scale_unit_all_gather\(',
             instance_name='dp_sharded',
         )
         assert not _gencode_contains(
             gen_savedir,
             LeadingSimulatedDPModel,
             rank,
-            r'tests\.cli\.test_simulated_dp\.scale_unit_chunk\(',
+            r'nnscaler\.cli\.scale_unit_topo\.inner_scale_unit_chunk\(',
             instance_name='dp_sharded',
         )
 
