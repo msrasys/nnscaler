@@ -9,6 +9,7 @@ Runnable references:
 
 - `tests/cli/test_simulated_dp.py`
 - `tests/cli/trainer_args_simulated_dp.yaml`
+- `tests/cli/trainer_args_simulated_dp_dp_sharded.yaml`
 - `tests/cli/test_cp_ep.py`
 - `tests/cli/trainer_args_cp_ep.yaml`
 
@@ -123,6 +124,21 @@ The reasons are:
 3. nnScaler needs both layouts to construct correct forward and backward IR.
 
 This custom boundary performs an equal `torch.chunk`, so the traced batch dimension must be divisible by the chunk group size. This is a requirement of this implementation, not a general nnScaler tracing rule.
+
+#### Variant: the slow module is first
+
+If the slow module is the first model operation, the dataloader can provide its batch shards directly. In the reference `dp_sharded` mode:
+
+- every rank receives a disjoint slice of its scale unit's sampler batch;
+- `micro_batch_size=4` remains the logical batch seen by one scale unit;
+- each runtime dataloader yields `4 / plan_ngpus = 2` samples per rank, and gathering those slices reconstructs the original scale-unit batch in order;
+- `dummy_sample_gen_fn` supplies the same rank-local shape `[2,S,H]` for tracing;
+- the slow module therefore traces and executes with `[2,S,H]`;
+- a scale-unit all-gather after the slow module restores `[4,S,H]` before TP begins.
+
+No entry collective or runtime chunk is needed. The exit wrapper uses the standard all-gather `fake_fn`, which expands the traced rank-local batch from `[2,S,H]` to the logical `[4,S,H]` shape.
+
+The reducer settings are otherwise the same as the standard pattern: enable `reducer_replicated_params`, isolate the slow parameters with `param_clss_fn`, and set their bucket's `reducer_nreplicas=1`. The reference test verifies that these parameters use the all-rank reducer while preserving the sum of complementary rank-local gradients.
 
 ### 2.4 Create the scale-unit communication groups
 
@@ -263,14 +279,21 @@ The fake function need not reproduce runtime values or communication, but it mus
 - output dtype;
 - output `requires_grad` state.
 
-For an opaque slow operation, this is a safe fake implementation when input and output shapes match:
+If the activation input already requires gradients, cloning it preserves the required output metadata:
 
 ```python
 def fake_slow_block(x, *weights):
     return x.clone()
 ```
 
-Do not use a fake result that unintentionally has `requires_grad=False`. If backward IR stops at the fake operator, nnScaler cannot generate the activation-gradient adapters needed around the region.
+At model entry, dataloader tensors normally do not require gradients. For a registered opaque operation with trainable weight inputs, return a fresh tensor whose `requires_grad` flag is set when it is created:
+
+```python
+def fake_slow_block(x, *weights):
+    return torch.randn_like(x, requires_grad=True)
+```
+
+The fake values themselves are irrelevant. Because the weights are explicit registered-op inputs, marking the output differentiable is sufficient for nnScaler to create their gradient metadata and reducers. Do not set `requires_grad=True` on an existing non-leaf `x.clone()` result; PyTorch rejects changing that flag on non-leaf tensors. If the fake output has `requires_grad=False`, backward IR stops at the opaque operator and the required reducers or activation-gradient adapters are not generated.
 
 Register a module-level callable wrapper. If the operation uses module parameters, pass their tensors explicitly as operator arguments; the registered callable itself is not a parameter-owning `nn.Module`. See `tests/cli/test_simulated_dp.py`.
 
