@@ -15,6 +15,7 @@ expert weight shards are reduced across CP groups as data-parallel replicas.
 """
 
 from pathlib import Path
+import re
 from typing import Iterator, Optional, Tuple
 
 import pytest
@@ -34,6 +35,7 @@ from nnscaler.runtime.adapter.reducer import ParamBucketConfig
 from nnscaler.runtime.device import DeviceGroup
 from tests.launch_torchrun import launch_torchrun
 from tests.parallel_module.common import assert_close
+from tests.parallel_module.test_gencode import _gencode_contains
 from tests.utils import replace_all_device_with
 
 
@@ -880,11 +882,15 @@ def test_cp4_ep2_runtime8_static(tmp_path):
             for _, start, stop in expert_metas
         } == {expected_slice}
 
-        generated_file = next(tmp_path.glob(f'**/gencode{rank}.py'))
-        generated_code = generated_file.read_text()
         # Generated reducers must follow the same repeated expert ownership.
         expected_ranks = '[0, 2, 4, 6]' if rank % 2 == 0 else '[1, 3, 5, 7]'
-        assert f'Reducer(ranks={expected_ranks}' in generated_code
+        assert _gencode_contains(
+            tmp_path,
+            ContextExpertModel,
+            rank,
+            rf'Reducer\(ranks={re.escape(expected_ranks)}',
+            instance_name=instance_name,
+        )
 
 
 @pytest.mark.skipif(
