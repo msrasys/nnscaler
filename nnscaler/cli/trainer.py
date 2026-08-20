@@ -411,6 +411,10 @@ class Trainer:
             for metric_name, value in ((f'{name}_avg', avg), (f'{name}_delta', delta))
         }
 
+    @staticmethod
+    def _should_aggregate_timer_walls(finished_train_steps: int) -> bool:
+        return finished_train_steps > 0 and finished_train_steps % 100 == 0
+
     def _log_config(self, config: Dict):
         for logger in self.loggers:
             logger.setup(config)
@@ -1135,8 +1139,11 @@ class Trainer:
             }
             last_step_start_at = train_wall_at
             self.hook.before_log_train_metrics(self, step_metrics, aggregated_outputs)
-            timer_metrics = self._aggregate_timer_walls(timer_walls)
-            self.log_metrics(timer_metrics, tag='timer')
+            if self._should_aggregate_timer_walls(
+                self.train_status.finished_train_steps
+            ):
+                timer_metrics = self._aggregate_timer_walls(timer_walls)
+                self.log_metrics(timer_metrics, tag='timer')
             self.log_metrics(step_metrics, tag='train')
             if self.rank == 0:
                 if self.train_args.enable_log_progress \

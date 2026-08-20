@@ -48,6 +48,10 @@ def trainer_logging_worker(save_dir):
         '--log.1.args.project', 'nnscaler',
         '--log.1.args.mode', 'offline',
     ])
+    # This short integration run does not reach step 100. Force timer
+    # aggregation here so the logger output remains covered separately from
+    # the cadence unit test below.
+    trainer._should_aggregate_timer_walls = lambda _: True
     trainer.run()
 
     torch.distributed.barrier()
@@ -70,6 +74,23 @@ def trainer_logging_worker(save_dir):
 @pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.device_count() < 4, reason='lack of gpu devices')
 def test_trainer_logging(tmp_path):
     launch_torchrun(4, trainer_logging_worker, tmp_path)
+
+
+@pytest.mark.parametrize(
+    ('finished_train_steps', 'expected'),
+    [
+        (0, False),
+        (1, False),
+        (99, False),
+        (100, True),
+        (101, False),
+        (200, True),
+    ],
+)
+def test_timer_walls_are_aggregated_every_100_steps(
+    finished_train_steps, expected
+):
+    assert Trainer._should_aggregate_timer_walls(finished_train_steps) is expected
 
 
 @replace_all_device_with('cpu')
