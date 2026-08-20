@@ -6,6 +6,9 @@ DeepSeek Sparse Attention (DSA), MLA projections, sparse MoE, and the DSA
 indexer. The dimensions and layer count are reduced so code generation does
 not require downloading the 671B FP8 checkpoint.
 
+See [the four-GPU validation matrix](../open_models_parallelism.md) for EP,
+sequence/head sharding, pipeline, replica DP, reducer, and ZeRO commands.
+
 The pinned Transformers revision is required because DeepSeek-V3.2 support is
 newer than the 5.3.0 release. The example uses the partitionable `batched_mm`
 expert implementation. Production grouped-GEMM/expert-parallel kernels,
@@ -30,6 +33,8 @@ official PyTorch wheel index for a different CUDA runtime, but keep PyTorch at
 2.13.0.
 
 The reduced training graph (including backward, DSA, MLA, and tensorized MoE)
-was validated with PyTorch 2.13.0+cu126 and two NVIDIA RTX A6000 GPUs. It completed
-two distributed training steps with finite loss and gradients and AdamW
-parameter updates.
+was validated with PyTorch 2.13.0+cu126 on two and four NVIDIA RTX A6000 GPUs,
+with finite loss and gradients and AdamW parameter updates.
+
+Four-GPU validation additionally shards the routed-expert parameters. Use
+`ep_constraints.yaml` when deterministic EP selection is required.

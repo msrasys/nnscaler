@@ -33,3 +33,7 @@ def test_reduced_glm5_forward_and_backward():
     assert loss.ndim == 0
     assert torch.isfinite(loss)
     assert model.model.model.embed_tokens.weight.grad is not None
+    assert all(
+        not parameter.requires_grad
+        for parameter in model.model.model.layers[0].self_attn.indexer.parameters()
+    )

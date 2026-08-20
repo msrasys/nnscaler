@@ -14,11 +14,15 @@ import nnscaler
 from examples.kimi_k3.adapters import (
     batched_sparse_moe_forward,
     eager_attention_forward,
+    merge_kimi_expert_parameters,
     nnscaler_chunk_kda,
     precomputed_kimi_causal_mask,
+    rms_norm_gated_forward,
+    short_convolution_forward,
 )
 from examples.model_runtime import (
     assert_finite_tensors,
+    build_compute_config,
     default_output_dir,
     finish_distributed,
     init_distributed,
@@ -31,7 +35,7 @@ MODEL_ID = "moonshotai/Kimi-K3"
 MODEL_REVISION = "9f62e4e9fffbd0a83ddd60e1c209d828994b3569"
 
 
-def reduced_kimi_k3_config():
+def reduced_kimi_k3_config(num_hidden_layers: int = 2):
     config = AutoConfig.from_pretrained(
         MODEL_ID,
         revision=MODEL_REVISION,
@@ -47,7 +51,7 @@ def reduced_kimi_k3_config():
     text_config.intermediate_size = 128
     text_config.moe_intermediate_size = 32
     text_config.routed_expert_hidden_size = 32
-    text_config.num_hidden_layers = 2
+    text_config.num_hidden_layers = num_hidden_layers
     text_config.num_attention_heads = 4
     text_config.num_key_value_heads = 4
     text_config.q_lora_rank = 32
@@ -64,8 +68,8 @@ def reduced_kimi_k3_config():
     text_config.max_position_embeddings = 64
     text_config.attn_res_block_size = None
     text_config.linear_attn_config = {
-        "full_attn_layers": [1],
-        "kda_layers": [0],
+        "full_attn_layers": list(range(2, num_hidden_layers + 1, 2)),
+        "kda_layers": list(range(1, num_hidden_layers + 1, 2)),
         "gate_lower_bound": -5.0,
         "head_dim": 16,
         "num_heads": 4,
@@ -96,6 +100,9 @@ def install_kimi_k3_nnscaler_adapters(model) -> None:
     modeling_module.create_causal_mask = precomputed_kimi_causal_mask
     modeling_module.eager_attention_forward = eager_attention_forward
     modeling_module.KimiSparseMoeBlock.forward = batched_sparse_moe_forward
+    modeling_module.ShortConvolution.forward = short_convolution_forward
+    modeling_module.FusedRMSNormGated.forward = rms_norm_gated_forward
+    merge_kimi_expert_parameters(model, modeling_module.KimiSparseMoeBlock)
     model.config._attn_implementation = "eager"
 
 
@@ -106,6 +113,7 @@ class KimiK3InferenceModel(nn.Module):
         self.model = AutoModelForCausalLM.from_config(
             config,
             trust_remote_code=True,
+            code_revision=MODEL_REVISION,
         )
         install_kimi_k3_nnscaler_adapters(self.model)
         self.model.eval()
@@ -118,12 +126,16 @@ class KimiK3InferenceModel(nn.Module):
         )[0]
 
 
-def build_model() -> KimiK3InferenceModel:
-    return KimiK3InferenceModel(reduced_kimi_k3_config())
+def build_model(num_hidden_layers: int = 2) -> KimiK3InferenceModel:
+    return KimiK3InferenceModel(reduced_kimi_k3_config(num_hidden_layers))
 
 
 def eager_check() -> None:
     model = build_model().cuda()
+    if not model.model.model.layers[0].is_linear_attn:
+        raise RuntimeError("the reduced Kimi K3 model must preserve a KDA layer")
+    if model.model.model.layers[1].is_linear_attn:
+        raise RuntimeError("the reduced Kimi K3 model must preserve an MLA layer")
     input_ids = torch.randint(0, model.model.config.vocab_size, (2, 16), device="cuda")
     with torch.no_grad():
         logits = model(input_ids)
@@ -132,14 +144,29 @@ def eager_check() -> None:
     print("Kimi K3 reduced eager check passed")
 
 
-def compile_model(plan_ngpus: int, runtime_ngpus: int, output_dir: Path) -> None:
-    model = build_model()
+def compile_model(
+    plan_ngpus: int,
+    runtime_ngpus: int,
+    output_dir: Path,
+    num_hidden_layers: int = 2,
+    partition_constraints_path: Path | None = None,
+) -> None:
+    model = build_model(num_hidden_layers)
     input_ids = torch.randint(0, model.model.config.vocab_size, (2, 16))
-    compute_config = nnscaler.ComputeConfig(
+    compute_config = build_compute_config(
         plan_ngpus=plan_ngpus,
         runtime_ngpus=runtime_ngpus,
         inference_only=True,
-        pas_config={"mem_constraint": 40},
+        use_end2end=False,
+        use_zero=False,
+        zero_use_reduce_scatter=False,
+        use_async_reducer=False,
+        reducer_replicated_params=False,
+        microbatches=1,
+        pipeline_stages=1,
+        pipeline_pivot="",
+        max_partition_degree=None,
+        partition_constraints_path=partition_constraints_path,
     )
     nnscaler.parallelize(
         model,
@@ -156,18 +183,29 @@ def run_model(
     runtime_ngpus: int,
     output_dir: Path,
     steps: int,
+    num_hidden_layers: int = 2,
+    partition_constraints_path: Path | None = None,
 ) -> None:
     require_generated_output(output_dir)
     rank = init_distributed(runtime_ngpus)
     torch.manual_seed(0)
-    config = reduced_kimi_k3_config()
+    config = reduced_kimi_k3_config(num_hidden_layers)
     vocab_size = config.vocab_size
     model = KimiK3InferenceModel(config)
-    compute_config = nnscaler.ComputeConfig(
+    compute_config = build_compute_config(
         plan_ngpus=plan_ngpus,
         runtime_ngpus=runtime_ngpus,
         inference_only=True,
-        pas_config={"mem_constraint": 40},
+        use_end2end=False,
+        use_zero=False,
+        zero_use_reduce_scatter=False,
+        use_async_reducer=False,
+        reducer_replicated_params=False,
+        microbatches=1,
+        pipeline_stages=1,
+        pipeline_pivot="",
+        max_partition_degree=None,
+        partition_constraints_path=partition_constraints_path,
     )
     model = nnscaler.parallelize(
         model,
@@ -211,6 +249,8 @@ def parse_args() -> argparse.Namespace:
         default=default_output_dir("kimi-k3"),
     )
     parser.add_argument("--steps", type=int, default=2)
+    parser.add_argument("--num-layers", type=int, default=2)
+    parser.add_argument("--partition-constraints-path", type=Path)
     return parser.parse_args()
 
 
@@ -221,8 +261,16 @@ def main() -> None:
         return
     if args.plan_ngpus < 1 or args.runtime_ngpus % args.plan_ngpus != 0:
         raise ValueError("runtime-ngpus must be a positive multiple of plan-ngpus")
+    if args.num_layers < 1:
+        raise ValueError("num-layers must be positive")
     if args.mode == "compile":
-        compile_model(args.plan_ngpus, args.runtime_ngpus, args.output_dir)
+        compile_model(
+            args.plan_ngpus,
+            args.runtime_ngpus,
+            args.output_dir,
+            num_hidden_layers=args.num_layers,
+            partition_constraints_path=args.partition_constraints_path,
+        )
         print(f"Generated nnScaler code in {args.output_dir}")
     else:
         run_model(
@@ -230,6 +278,8 @@ def main() -> None:
             args.runtime_ngpus,
             args.output_dir,
             args.steps,
+            num_hidden_layers=args.num_layers,
+            partition_constraints_path=args.partition_constraints_path,
         )
 
 

@@ -51,9 +51,25 @@ class AutocastInfo:
     def from_context(cls):
         # use function pair [torch.autocast_increment_nesting, torch.autocast_decrement_nesting] to get the nesting number
         torch.autocast_increment_nesting()
-        return cls(torch.autocast_decrement_nesting(),  torch.is_autocast_cache_enabled(),
-                   torch.is_autocast_cpu_enabled(), torch.get_autocast_cpu_dtype(),
-                   torch.is_autocast_enabled(), torch.get_autocast_gpu_dtype())
+        nesting = torch.autocast_decrement_nesting()
+        try:
+            cpu_enabled = torch.is_autocast_enabled("cpu")
+            cpu_dtype = torch.get_autocast_dtype("cpu")
+            cuda_enabled = torch.is_autocast_enabled("cuda")
+            cuda_dtype = torch.get_autocast_dtype("cuda")
+        except (AttributeError, TypeError):
+            cpu_enabled = torch.is_autocast_cpu_enabled()
+            cpu_dtype = torch.get_autocast_cpu_dtype()
+            cuda_enabled = torch.is_autocast_enabled()
+            cuda_dtype = torch.get_autocast_gpu_dtype()
+        return cls(
+            nesting,
+            torch.is_autocast_cache_enabled(),
+            cpu_enabled,
+            cpu_dtype,
+            cuda_enabled,
+            cuda_dtype,
+        )
 
 
 @dataclass

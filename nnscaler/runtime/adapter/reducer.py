@@ -21,6 +21,16 @@ if TYPE_CHECKING:
 
 
 _logger = logging.getLogger(__name__)
+_all_gather_single = getattr(
+    torch.distributed,
+    "all_gather_single",
+    torch.distributed.all_gather_into_tensor,
+)
+_reduce_scatter_single = getattr(
+    torch.distributed,
+    "reduce_scatter_single",
+    torch.distributed.reduce_scatter_tensor,
+)
 
 
 # According to https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#device-memory-accesses
@@ -407,7 +417,7 @@ class Bucket:
         if self._zgroup_sz == self._wsz:
             # number of zero groups is 1, thus only reduce scatter is enough
             # in this case, self._group == self._zero_subgroup
-            torch.distributed.reduce_scatter_tensor(
+            _reduce_scatter_single(
                 partial_tensor, self._contiguous_grads,
                 op=self._reduce_op, group=self._zero_subgroup)
         else:
@@ -416,7 +426,7 @@ class Bucket:
             torch.distributed.all_reduce(
                 self._contiguous_grads, op=self._reduce_op, group=self._zero_crossgroup)
             # step #2, reduce scatter within each group
-            torch.distributed.reduce_scatter_tensor(
+            _reduce_scatter_single(
                 partial_tensor, self._contiguous_grads,
                 op=self._reduce_op, group=self._zero_subgroup)
 
@@ -492,7 +502,7 @@ class Bucket:
                         value=0.0,
                     )
                 output = torch.zeros(z3_info.numel_with_padding(), device=grad.device, dtype=grad.dtype)
-                torch.distributed.reduce_scatter_tensor(
+                _reduce_scatter_single(
                     output,
                     grad,
                     op=self._reduce_op,
@@ -660,7 +670,7 @@ class Bucket:
         rank = torch.distributed.get_rank(group=self._zero_subgroup)
         CudaTimer().start(field_name='comm', predefined=True)
         src_tensor = self._contiguous_params.chunk(self._zgroup_sz, dim=0)[rank]
-        torch.distributed.all_gather_into_tensor(self._contiguous_params, src_tensor, group=self._zero_subgroup)
+        _all_gather_single(self._contiguous_params, src_tensor, group=self._zero_subgroup)
         CudaTimer().stop(field_name='comm', predefined=True)
 
     def register_pre_hook(self, fn: Callable):
@@ -1334,7 +1344,7 @@ class Reducer:
 
         full_data = torch.zeros(info.numel_with_padding() * self._zero_size, dtype=param.dtype,
                                 device=torch.cuda.current_device())
-        torch.distributed.all_gather_into_tensor(
+        _all_gather_single(
             full_data,
             param.data,
             group=self._zero_subgroup

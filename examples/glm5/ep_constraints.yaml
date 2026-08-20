@@ -1,0 +1,5 @@
+- allowed_partition_dims:
+  - 3,0
+  name: examples.moe_utils.tensorized_moe
+  parent_module: GlmMoeDsaNaiveMoe
+  replica_allowed: false

@@ -12,12 +12,16 @@ from transformers.models.glm_moe_dsa import modeling_glm_moe_dsa
 
 import nnscaler
 
-from examples.moe_utils import select_experts
+from examples.moe_utils import select_experts, tensorized_moe
 from examples.model_runtime import (
     assert_finite_tensors,
+    assert_tensors_synced,
+    build_compute_config,
+    create_replica_group,
     default_output_dir,
     finish_distributed,
     init_distributed,
+    parse_pipeline_stages,
     print_rank0,
     require_generated_output,
 )
@@ -54,7 +58,21 @@ def install_glm5_nnscaler_adapters() -> None:
     modeling_glm_moe_dsa.create_causal_mask = _precomputed_causal_mask
     modeling_glm_moe_dsa.GlmMoeDsaRotaryEmbedding.forward = _rotary_embedding_forward
     modeling_glm_moe_dsa.GlmMoeDsaIndexer.forward = _indexer_forward
+    modeling_glm_moe_dsa.GlmMoeDsaNaiveMoe.forward = _experts_forward
     modeling_glm_moe_dsa.GlmMoeDsaMoE.route_tokens_to_experts = _route_tokens_to_experts
+
+
+def _experts_forward(self, hidden_states, top_k_index, top_k_weights):
+    return tensorized_moe(
+        hidden_states,
+        top_k_index,
+        top_k_weights,
+        self.gate_up_proj,
+        self.down_proj,
+        num_experts=self.num_experts,
+        local_expert_start=0,
+        local_expert_end=self.num_experts,
+    )
 
 
 @torch.no_grad()
@@ -139,6 +157,8 @@ class GLM5TrainingModel(nn.Module):
     def __init__(self, config: GlmMoeDsaConfig):
         super().__init__()
         self.model = GlmMoeDsaForCausalLM(config)
+        for layer in self.model.model.layers:
+            layer.self_attn.indexer.requires_grad_(False)
 
     def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
         sequence_length = input_ids.shape[1]
@@ -171,7 +191,7 @@ class GLM5TrainingModel(nn.Module):
         )
 
 
-def reduced_glm5_config() -> GlmMoeDsaConfig:
+def reduced_glm5_config(num_hidden_layers: int = 1) -> GlmMoeDsaConfig:
     """Keep GLM-5's DSA and sparse-MoE paths while making the probe small."""
 
     return GlmMoeDsaConfig(
@@ -179,7 +199,7 @@ def reduced_glm5_config() -> GlmMoeDsaConfig:
         hidden_size=64,
         intermediate_size=128,
         moe_intermediate_size=32,
-        num_hidden_layers=1,
+        num_hidden_layers=num_hidden_layers,
         num_attention_heads=4,
         num_key_value_heads=4,
         n_shared_experts=1,
@@ -193,7 +213,7 @@ def reduced_glm5_config() -> GlmMoeDsaConfig:
         n_group=1,
         topk_group=1,
         max_position_embeddings=32,
-        mlp_layer_types=["sparse"],
+        mlp_layer_types=["sparse"] * num_hidden_layers,
         index_topk=4,
         index_head_dim=16,
         index_n_heads=2,
@@ -208,21 +228,38 @@ def compile_model(
     output_dir: Path,
     batch_size: int = 2,
     sequence_length: int = 8,
+    num_hidden_layers: int = 1,
+    microbatches: int = 1,
+    pipeline_stages=1,
+    max_partition_degree: int | None = None,
+    use_zero: bool = True,
+    zero_use_reduce_scatter: bool = False,
+    use_async_reducer: bool = False,
+    reducer_replicated_params: bool = False,
+    partition_constraints_path: Path | None = None,
 ) -> None:
     install_glm5_nnscaler_adapters()
-    config = reduced_glm5_config()
+    config = reduced_glm5_config(num_hidden_layers)
     model = GLM5TrainingModel(config)
     input_ids = torch.randint(
         0,
         config.vocab_size,
         (batch_size, sequence_length),
     )
-    compute_config = nnscaler.ComputeConfig(
+    compute_config = build_compute_config(
         plan_ngpus=plan_ngpus,
         runtime_ngpus=runtime_ngpus,
-        use_zero=True,
+        inference_only=False,
         use_end2end=True,
-        pas_config={"mem_constraint": 40},
+        use_zero=use_zero,
+        zero_use_reduce_scatter=zero_use_reduce_scatter,
+        use_async_reducer=use_async_reducer,
+        reducer_replicated_params=reducer_replicated_params,
+        microbatches=microbatches,
+        pipeline_stages=pipeline_stages,
+        pipeline_pivot="GlmMoeDsaDecoderLayer",
+        max_partition_degree=max_partition_degree,
+        partition_constraints_path=partition_constraints_path,
     )
     nnscaler.parallelize(
         model,
@@ -239,19 +276,37 @@ def run_model(
     runtime_ngpus: int,
     output_dir: Path,
     steps: int,
+    num_hidden_layers: int = 1,
+    microbatches: int = 1,
+    pipeline_stages=1,
+    max_partition_degree: int | None = None,
+    use_zero: bool = True,
+    zero_use_reduce_scatter: bool = False,
+    use_async_reducer: bool = False,
+    reducer_replicated_params: bool = False,
+    partition_constraints_path: Path | None = None,
 ) -> None:
     require_generated_output(output_dir)
     rank = init_distributed(runtime_ngpus)
+    replica_group = create_replica_group(plan_ngpus, runtime_ngpus)
     torch.manual_seed(0)
-    config = reduced_glm5_config()
+    config = reduced_glm5_config(num_hidden_layers)
     vocab_size = config.vocab_size
     model = GLM5TrainingModel(config)
-    compute_config = nnscaler.ComputeConfig(
+    compute_config = build_compute_config(
         plan_ngpus=plan_ngpus,
         runtime_ngpus=runtime_ngpus,
-        use_zero=True,
+        inference_only=False,
         use_end2end=True,
-        pas_config={"mem_constraint": 40},
+        use_zero=use_zero,
+        zero_use_reduce_scatter=zero_use_reduce_scatter,
+        use_async_reducer=use_async_reducer,
+        reducer_replicated_params=reducer_replicated_params,
+        microbatches=microbatches,
+        pipeline_stages=pipeline_stages,
+        pipeline_pivot="GlmMoeDsaDecoderLayer",
+        max_partition_degree=max_partition_degree,
+        partition_constraints_path=partition_constraints_path,
     )
     model = nnscaler.parallelize(
         model,
@@ -264,21 +319,32 @@ def run_model(
     replica_rank = rank // plan_ngpus
 
     for step in range(steps):
-        generator = torch.Generator(device="cuda").manual_seed(1000 + replica_rank * steps + step)
-        input_ids = torch.randint(
-            0,
-            vocab_size,
-            (2, 8),
-            generator=generator,
-            device="cuda",
-        )
-        losses = model.train_step([input_ids])
+        inputs = []
+        for microbatch in range(microbatches):
+            seed = 1000 + replica_rank * steps * microbatches + step * microbatches + microbatch
+            generator = torch.Generator(device="cuda").manual_seed(seed)
+            inputs.append(
+                torch.randint(
+                    0,
+                    vocab_size,
+                    (2, 8),
+                    generator=generator,
+                    device="cuda",
+                )
+            )
+        losses = model.train_step(inputs)
+        model.sync_grad()
         assert_finite_tensors(losses, "GLM-5 losses")
         gradients = [parameter.grad for parameter in model.parameters() if parameter.grad is not None]
         if not gradients:
             raise RuntimeError("GLM-5 run produced no gradients")
         assert_finite_tensors(gradients, "GLM-5 gradients")
+        replica_sync_expected = use_zero or reducer_replicated_params
+        if replica_sync_expected and not zero_use_reduce_scatter:
+            assert_tensors_synced(gradients, replica_group, "GLM-5 gradients")
         optimizer.step()
+        if replica_sync_expected:
+            assert_tensors_synced(list(model.parameters()), replica_group, "GLM-5 parameters")
         optimizer.zero_grad()
 
     print_rank0(f"GLM-5 completed {steps} distributed training step(s)")
@@ -313,6 +379,19 @@ def parse_args() -> argparse.Namespace:
         default=default_output_dir("glm5"),
     )
     parser.add_argument("--steps", type=int, default=2)
+    parser.add_argument("--num-layers", type=int, default=1)
+    parser.add_argument("--microbatches", type=int, default=1)
+    parser.add_argument("--pipeline-stages", type=parse_pipeline_stages, default=1)
+    parser.add_argument("--max-partition-degree", type=int)
+    parser.add_argument(
+        "--use-zero",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    parser.add_argument("--zero-use-reduce-scatter", action="store_true")
+    parser.add_argument("--use-async-reducer", action="store_true")
+    parser.add_argument("--reducer-replicated-params", action="store_true")
+    parser.add_argument("--partition-constraints-path", type=Path)
     return parser.parse_args()
 
 
@@ -325,8 +404,23 @@ def main() -> None:
         raise ValueError("GPU counts must be positive")
     if args.runtime_ngpus % args.plan_ngpus != 0:
         raise ValueError("runtime-ngpus must be a multiple of plan-ngpus")
+    if args.num_layers < 1 or args.microbatches < 1:
+        raise ValueError("num-layers and microbatches must be positive")
     if args.mode == "compile":
-        compile_model(args.plan_ngpus, args.runtime_ngpus, args.output_dir)
+        compile_model(
+            args.plan_ngpus,
+            args.runtime_ngpus,
+            args.output_dir,
+            num_hidden_layers=args.num_layers,
+            microbatches=args.microbatches,
+            pipeline_stages=args.pipeline_stages,
+            max_partition_degree=args.max_partition_degree,
+            use_zero=args.use_zero,
+            zero_use_reduce_scatter=args.zero_use_reduce_scatter,
+            use_async_reducer=args.use_async_reducer,
+            reducer_replicated_params=args.reducer_replicated_params,
+            partition_constraints_path=args.partition_constraints_path,
+        )
         print(f"Generated nnScaler code in {args.output_dir}")
     else:
         run_model(
@@ -334,6 +428,15 @@ def main() -> None:
             args.runtime_ngpus,
             args.output_dir,
             args.steps,
+            num_hidden_layers=args.num_layers,
+            microbatches=args.microbatches,
+            pipeline_stages=args.pipeline_stages,
+            max_partition_degree=args.max_partition_degree,
+            use_zero=args.use_zero,
+            zero_use_reduce_scatter=args.zero_use_reduce_scatter,
+            use_async_reducer=args.use_async_reducer,
+            reducer_replicated_params=args.reducer_replicated_params,
+            partition_constraints_path=args.partition_constraints_path,
         )
 
 

@@ -12,12 +12,16 @@ from transformers.models.deepseek_v32 import modeling_deepseek_v32
 
 import nnscaler
 
-from examples.moe_utils import select_experts
+from examples.moe_utils import select_experts, tensorized_moe
 from examples.model_runtime import (
     assert_finite_tensors,
+    assert_tensors_synced,
+    build_compute_config,
+    create_replica_group,
     default_output_dir,
     finish_distributed,
     init_distributed,
+    parse_pipeline_stages,
     print_rank0,
     require_generated_output,
 )
@@ -137,24 +141,16 @@ def _router_forward(self, hidden_states):
 
 
 def _experts_forward(self, hidden_states, top_k_index, top_k_weights):
-    num_tokens = hidden_states.shape[0]
-    top_k = top_k_index.shape[-1]
-    token_indices = (
-        torch.arange(num_tokens, device=hidden_states.device)
-        .unsqueeze(1)
-        .expand(-1, top_k)
-        .reshape(-1)
+    return tensorized_moe(
+        hidden_states,
+        top_k_index,
+        top_k_weights,
+        self.gate_up_proj,
+        self.down_proj,
+        num_experts=self.num_experts,
+        local_expert_start=0,
+        local_expert_end=self.num_experts,
     )
-    expert_indices = top_k_index.reshape(-1)
-    selected_states = hidden_states[token_indices]
-    gate_up_weights = self.gate_up_proj[expert_indices]
-    gate_up = torch.bmm(gate_up_weights, selected_states.unsqueeze(-1)).squeeze(-1)
-    gate, up = gate_up.chunk(2, dim=-1)
-    activated = self.act_fn(gate) * up
-    down_weights = self.down_proj[expert_indices]
-    routed = torch.bmm(down_weights, activated.unsqueeze(-1)).squeeze(-1)
-    routed = routed * top_k_weights.reshape(-1, 1)
-    return routed.view(num_tokens, top_k, -1).sum(dim=1).to(hidden_states.dtype)
 
 
 def install_deepseek_v32_nnscaler_adapters() -> None:
@@ -166,13 +162,13 @@ def install_deepseek_v32_nnscaler_adapters() -> None:
     modeling_deepseek_v32.DeepseekV32Experts.forward = _experts_forward
 
 
-def reduced_deepseek_v32_config() -> DeepseekV32Config:
+def reduced_deepseek_v32_config(num_hidden_layers: int = 1) -> DeepseekV32Config:
     return DeepseekV32Config(
         vocab_size=128,
         hidden_size=64,
         intermediate_size=128,
         moe_intermediate_size=32,
-        num_hidden_layers=1,
+        num_hidden_layers=num_hidden_layers,
         num_attention_heads=4,
         num_key_value_heads=4,
         n_shared_experts=1,
@@ -186,7 +182,7 @@ def reduced_deepseek_v32_config() -> DeepseekV32Config:
         n_group=1,
         topk_group=1,
         max_position_embeddings=32,
-        mlp_layer_types=["sparse"],
+        mlp_layer_types=["sparse"] * num_hidden_layers,
         index_topk=4,
         index_head_dim=16,
         index_n_heads=2,
@@ -199,6 +195,8 @@ class DeepSeekV32TrainingModel(nn.Module):
     def __init__(self, config: DeepseekV32Config):
         super().__init__()
         self.model = DeepseekV32ForCausalLM(config)
+        for layer in self.model.model.layers:
+            layer.self_attn.indexer.requires_grad_(False)
 
     def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
         sequence_length = input_ids.shape[1]
@@ -223,9 +221,9 @@ class DeepSeekV32TrainingModel(nn.Module):
         )
 
 
-def build_model() -> DeepSeekV32TrainingModel:
+def build_model(num_hidden_layers: int = 1) -> DeepSeekV32TrainingModel:
     install_deepseek_v32_nnscaler_adapters()
-    return DeepSeekV32TrainingModel(reduced_deepseek_v32_config())
+    return DeepSeekV32TrainingModel(reduced_deepseek_v32_config(num_hidden_layers))
 
 
 def eager_check() -> None:
@@ -238,15 +236,36 @@ def eager_check() -> None:
     print(f"DeepSeek-V3.2 reduced eager check passed (loss={loss.item():.6f})")
 
 
-def compile_model(plan_ngpus: int, runtime_ngpus: int, output_dir: Path) -> None:
-    model = build_model()
+def compile_model(
+    plan_ngpus: int,
+    runtime_ngpus: int,
+    output_dir: Path,
+    num_hidden_layers: int = 1,
+    microbatches: int = 1,
+    pipeline_stages=1,
+    max_partition_degree: int | None = None,
+    use_zero: bool = True,
+    zero_use_reduce_scatter: bool = False,
+    use_async_reducer: bool = False,
+    reducer_replicated_params: bool = False,
+    partition_constraints_path: Path | None = None,
+) -> None:
+    model = build_model(num_hidden_layers)
     input_ids = torch.randint(0, model.model.config.vocab_size, (2, 8))
-    compute_config = nnscaler.ComputeConfig(
+    compute_config = build_compute_config(
         plan_ngpus=plan_ngpus,
         runtime_ngpus=runtime_ngpus,
-        use_zero=True,
+        inference_only=False,
         use_end2end=True,
-        pas_config={"mem_constraint": 40},
+        use_zero=use_zero,
+        zero_use_reduce_scatter=zero_use_reduce_scatter,
+        use_async_reducer=use_async_reducer,
+        reducer_replicated_params=reducer_replicated_params,
+        microbatches=microbatches,
+        pipeline_stages=pipeline_stages,
+        pipeline_pivot="DeepseekV32DecoderLayer",
+        max_partition_degree=max_partition_degree,
+        partition_constraints_path=partition_constraints_path,
     )
     nnscaler.parallelize(
         model,
@@ -263,20 +282,38 @@ def run_model(
     runtime_ngpus: int,
     output_dir: Path,
     steps: int,
+    num_hidden_layers: int = 1,
+    microbatches: int = 1,
+    pipeline_stages=1,
+    max_partition_degree: int | None = None,
+    use_zero: bool = True,
+    zero_use_reduce_scatter: bool = False,
+    use_async_reducer: bool = False,
+    reducer_replicated_params: bool = False,
+    partition_constraints_path: Path | None = None,
 ) -> None:
     require_generated_output(output_dir)
     rank = init_distributed(runtime_ngpus)
+    replica_group = create_replica_group(plan_ngpus, runtime_ngpus)
     torch.manual_seed(0)
-    config = reduced_deepseek_v32_config()
+    config = reduced_deepseek_v32_config(num_hidden_layers)
     vocab_size = config.vocab_size
     install_deepseek_v32_nnscaler_adapters()
     model = DeepSeekV32TrainingModel(config)
-    compute_config = nnscaler.ComputeConfig(
+    compute_config = build_compute_config(
         plan_ngpus=plan_ngpus,
         runtime_ngpus=runtime_ngpus,
-        use_zero=True,
+        inference_only=False,
         use_end2end=True,
-        pas_config={"mem_constraint": 40},
+        use_zero=use_zero,
+        zero_use_reduce_scatter=zero_use_reduce_scatter,
+        use_async_reducer=use_async_reducer,
+        reducer_replicated_params=reducer_replicated_params,
+        microbatches=microbatches,
+        pipeline_stages=pipeline_stages,
+        pipeline_pivot="DeepseekV32DecoderLayer",
+        max_partition_degree=max_partition_degree,
+        partition_constraints_path=partition_constraints_path,
     )
     model = nnscaler.parallelize(
         model,
@@ -289,21 +326,36 @@ def run_model(
     replica_rank = rank // plan_ngpus
 
     for step in range(steps):
-        generator = torch.Generator(device="cuda").manual_seed(2000 + replica_rank * steps + step)
-        input_ids = torch.randint(
-            0,
-            vocab_size,
-            (2, 8),
-            generator=generator,
-            device="cuda",
-        )
-        losses = model.train_step([input_ids])
+        inputs = []
+        for microbatch in range(microbatches):
+            seed = 2000 + replica_rank * steps * microbatches + step * microbatches + microbatch
+            generator = torch.Generator(device="cuda").manual_seed(seed)
+            inputs.append(
+                torch.randint(
+                    0,
+                    vocab_size,
+                    (2, 8),
+                    generator=generator,
+                    device="cuda",
+                )
+            )
+        losses = model.train_step(inputs)
+        model.sync_grad()
         assert_finite_tensors(losses, "DeepSeek-V3.2 losses")
         gradients = [parameter.grad for parameter in model.parameters() if parameter.grad is not None]
         if not gradients:
             raise RuntimeError("DeepSeek-V3.2 run produced no gradients")
         assert_finite_tensors(gradients, "DeepSeek-V3.2 gradients")
+        replica_sync_expected = use_zero or reducer_replicated_params
+        if replica_sync_expected and not zero_use_reduce_scatter:
+            assert_tensors_synced(gradients, replica_group, "DeepSeek-V3.2 gradients")
         optimizer.step()
+        if replica_sync_expected:
+            assert_tensors_synced(
+                list(model.parameters()),
+                replica_group,
+                "DeepSeek-V3.2 parameters",
+            )
         optimizer.zero_grad()
 
     print_rank0(f"DeepSeek-V3.2 completed {steps} distributed training step(s)")
@@ -323,6 +375,19 @@ def parse_args() -> argparse.Namespace:
         default=default_output_dir("deepseek-v32"),
     )
     parser.add_argument("--steps", type=int, default=2)
+    parser.add_argument("--num-layers", type=int, default=1)
+    parser.add_argument("--microbatches", type=int, default=1)
+    parser.add_argument("--pipeline-stages", type=parse_pipeline_stages, default=1)
+    parser.add_argument("--max-partition-degree", type=int)
+    parser.add_argument(
+        "--use-zero",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    parser.add_argument("--zero-use-reduce-scatter", action="store_true")
+    parser.add_argument("--use-async-reducer", action="store_true")
+    parser.add_argument("--reducer-replicated-params", action="store_true")
+    parser.add_argument("--partition-constraints-path", type=Path)
     return parser.parse_args()
 
 
@@ -333,8 +398,23 @@ def main() -> None:
         return
     if args.plan_ngpus < 1 or args.runtime_ngpus % args.plan_ngpus != 0:
         raise ValueError("runtime-ngpus must be a positive multiple of plan-ngpus")
+    if args.num_layers < 1 or args.microbatches < 1:
+        raise ValueError("num-layers and microbatches must be positive")
     if args.mode == "compile":
-        compile_model(args.plan_ngpus, args.runtime_ngpus, args.output_dir)
+        compile_model(
+            args.plan_ngpus,
+            args.runtime_ngpus,
+            args.output_dir,
+            num_hidden_layers=args.num_layers,
+            microbatches=args.microbatches,
+            pipeline_stages=args.pipeline_stages,
+            max_partition_degree=args.max_partition_degree,
+            use_zero=args.use_zero,
+            zero_use_reduce_scatter=args.zero_use_reduce_scatter,
+            use_async_reducer=args.use_async_reducer,
+            reducer_replicated_params=args.reducer_replicated_params,
+            partition_constraints_path=args.partition_constraints_path,
+        )
         print(f"Generated nnScaler code in {args.output_dir}")
     else:
         run_model(
@@ -342,6 +422,15 @@ def main() -> None:
             args.runtime_ngpus,
             args.output_dir,
             args.steps,
+            num_hidden_layers=args.num_layers,
+            microbatches=args.microbatches,
+            pipeline_stages=args.pipeline_stages,
+            max_partition_degree=args.max_partition_degree,
+            use_zero=args.use_zero,
+            zero_use_reduce_scatter=args.zero_use_reduce_scatter,
+            use_async_reducer=args.use_async_reducer,
+            reducer_replicated_params=args.reducer_replicated_params,
+            partition_constraints_path=args.partition_constraints_path,
         )
 
 

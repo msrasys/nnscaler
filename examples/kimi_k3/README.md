@@ -15,6 +15,9 @@ layer, one MLA layer, sparse MoE routing, latent experts, and SiTU-GLU. It:
 - constructs unquantized BF16/FP32 weights from config instead of downloading
   the 1.5 TB MXFP4 checkpoint.
 
+See [the four-GPU validation matrix](../open_models_parallelism.md) for the
+validated attention TP and four-way expert-parallel command.
+
 The official sparse-MoE reference path is inference-only, so this probe uses
 `ComputeConfig(inference_only=True)`. Training support requires an upstream
 Kimi K3 training MoE implementation and MXFP4-aware partition rules.
@@ -40,7 +43,11 @@ Production gaps remain: MXFP4/MXFP8 kernels and checkpoint loading, optimized
 expert parallelism, the multimodal MoonViT-V2 tower, and distributed KDA state
 handling.
 
-The reduced KDA + MLA + sparse-MoE graph was validated with PyTorch 2.13.0+cu126,
-Transformers 5.3.0, `fla-core` 0.5.2, and two NVIDIA RTX A6000 GPUs. It
-completed two distributed inference steps with finite logits of the expected
-shape.
+For the reduced probe, individual expert Linear weights are merged into three
+3D parameters so AutoDist can shard the expert dimension. Loading an official
+checkpoint therefore requires the inverse name/shape conversion.
+
+The reduced KDA + MLA + sparse-MoE graph was validated with PyTorch
+2.13.0+cu126, Transformers 5.3.0, `fla-core` 0.5.2, and two and four NVIDIA
+RTX A6000 GPUs. The remote Kimi code is pinned to the revision in
+`MODEL_REVISION`.

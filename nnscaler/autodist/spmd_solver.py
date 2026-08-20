@@ -229,7 +229,7 @@ class SPMDSolver:
             # 2. the output size of a norm operator is related to the batch size (do not replicate norm operators)
             # As a result, if the sum of inputs and outputs size of an operator is smaller than
             # the minimum output size of a norm operator, replicate it is safe.
-            if 'norm' in operator.op_name.lower():
+            if 'norm' in operator.op_name.lower() and operator.out_tensors:
                 norm_size = operator.out_tensors[0].nelement()
                 if force_replica_threshold == 0:
                     force_replica_threshold = norm_size

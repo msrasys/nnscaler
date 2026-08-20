@@ -4,6 +4,9 @@ This example compiles a reduced [GLM-5](https://huggingface.co/zai-org/GLM-5)
 whose dimensions are small but whose DeepSeek Sparse Attention (DSA), MLA,
 and sparse-MoE paths are enabled.
 
+See [the four-GPU validation matrix](../open_models_parallelism.md) for EP,
+TP, pipeline, replica DP, reducer, and ZeRO commands.
+
 ## Operator coverage
 
 | Operator/path | nnScaler status | Notes |
@@ -51,9 +54,10 @@ the system temporary directory by default. Run mode loads that generated
 module, performs forward and backward, checks loss and gradients for finite
 values, and applies AdamW updates.
 
-The reduced model was validated with PyTorch 2.13.0+cu126, Transformers 5.3.0, and
-two NVIDIA RTX A6000 GPUs. It completed two distributed training steps. The
-targeted core and example suite passed 63 tests.
+The reduced model was validated with PyTorch 2.13.0+cu126 and Transformers
+5.3.0 on two and four NVIDIA RTX A6000 GPUs.
 
 Production work still requires a generic expert-parallel grouped-GEMM
-operator, all-to-all token dispatch, and registered FlashMLA/DeepGEMM kernels.
+kernel, all-to-all token dispatch, and registered FlashMLA/DeepGEMM kernels.
+The reduced example uses a tensorized expert kernel with an AutoDist EP
+transform rule; `ep_constraints.yaml` can force expert partitioning.

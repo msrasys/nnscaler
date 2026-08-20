@@ -164,7 +164,7 @@ def _rdgather_worker(async_op):
 
     tensor = _get_tensor(shape)
     otensor = nnscaler.runtime.adapter.rdgather(
-        tensor, shape, torch.float32, dim=0, srcs=[1,2], dst=0)
+        tensor, shape, torch.float32, dim=0, srcs=[1,2], dst=0, async_op=async_op)
 
     if async_op:
         otensor = nnscaler.runtime.executor.AsyncCommHandler().wait(otensor)
