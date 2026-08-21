@@ -886,10 +886,18 @@ Replace this toy operation with ring attention, zigzag attention, or another CP-
 implementation in a real model. The outer sequence boundaries, sampler, and reducer design remain
 applicable.
 
-### 3.9 Why the residual temporarily restores a larger sequence shard
+### 3.9 Keep the plan-level sequence shard across residual blocks
 
-You do not need to add communication for correctness; nnScaler generates the required adapters. This
-section matters only when optimizing communication or activation memory.
+There are two different sequence partitions:
+
+1. The explicit `ep_scale_unit_chunk` before the layer loop splits the sequence across scale units
+    at the same EP lane, reducing `[B, 128, H]` to `[B, 64, H]`.
+2. The plan-level EP policy splits that scale-unit-local activation across the ranks in one plan,
+    reducing `[B, 64, H]` to `[B, 32, H]`.
+
+The model already places the explicit cross-scale chunk before all layers and its matching
+all-gather after all layers. The policy must also keep the inner plan-level shard through every
+residual path and addition.
 
 Consider one reference block:
 
@@ -897,8 +905,7 @@ Consider one reference block:
 output = x + routed_expert(x, ...)
 ```
 
-After the outer cross-scale chunk, each scale unit holds half of the sequence, so `x` has shape
-`[B, 64, H]`. The two branches then use different layouts:
+If the policy partitions only `routed_expert`, the two branches request different layouts:
 
 ```text
                             residual branch: x [B, 64, H]
@@ -911,19 +918,38 @@ x [B, 64, H]                                                     add [B, 64, H]
                             all-gather       -> [B, 64, H]
 ```
 
-The `routed_expert` transform rule applies only to the expert branch. It splits that branch across
-the two EP ranks, but the residual branch remains `[B, 64, H]`. Because `torch.add` requires
-matching layouts, nnScaler gathers the expert output back to `[B, 64, H]` before the addition.
+Because `torch.add` requires matching layouts, that policy gathers after every `routed_expert` and
+splits again in the next block. The reference policy avoids this by partitioning each residual add
+on the same sequence dimension:
 
-The next block repeats the process: its expert branch is split from `64` to `32`, then gathered
-back to `64` for the residual addition. Thus every `routed_expert` computes on `S/CP=32`, while
-tensors at residual boundaries use the larger scale-unit-local shape `S/(CP/EP)=64`. The complete
-global sequence `S=128` is restored only by the final outer all-gather.
+```python
+def cp_ep_policy(graph, compute_config):
+    for node in get_pas_ops(graph):
+        if node.fn == routed_expert:
+            yield OpPlan(node, partition=OpPartition(input=1, dim=0))
+        elif node.fn == torch.add and ContextExpertBlock in node.module_class_chain:
+            yield OpPlan(node, partition=OpPartition(input=0, dim=1))
+```
 
-This is correct but adds one gather and one split around each residual boundary. To avoid that
-overhead, the residual path and addition must also use a compatible `S/CP` partition, or the
-complete block must be represented by one custom operator whose transform rule preserves that
-partition.
+Both consumers of the first block input now request the same `[B, 32, H]` shard. The add preserves
+that layout, so its output feeds the next block directly. nnScaler can therefore hoist the inner
+split before the first residual fork and sink the matching gather after the final residual add:
+
+```text
+explicit cross-scale chunk       [B, 128, H] -> [B, 64, H]
+one plan-level EP split          [B,  64, H] -> [B, 32, H]
+all residual/expert blocks       [B,  32, H] -> [B, 32, H]
+one plan-level EP gather         [B,  32, H] -> [B, 64, H]
+explicit cross-scale all-gather  [B,  64, H] -> [B, 128, H]
+```
+
+The split must occur before `x` branches into the first residual and expert paths, not merely inside
+the first `routed_expert` call. Likewise, the gather must occur after the last residual add, not
+between the last `routed_expert` and that add. Every operation between those boundaries must support
+the same sequence partition; an incompatible replicated consumer would introduce another adapter.
+
+The static reference test checks that all three `routed_expert` calls share exactly one generated
+plan-level chunk and one generated plan-level all-gather on every rank.
 
 ### 3.10 Weight reducer configuration
 

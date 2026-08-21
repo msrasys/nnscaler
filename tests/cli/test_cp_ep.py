@@ -502,6 +502,10 @@ def cp_ep_policy(graph, compute_config: ComputeConfig):
             # Selecting expert_weight dim 0 activates _EP_DISPATCH_COMBINE_RULE,
             # which simultaneously partitions activation sequence dim 1.
             yield OpPlan(node, partition=OpPartition(input=1, dim=0))
+        elif node.fn == torch.add and ContextExpertBlock in node.module_class_chain:
+            # Keep the routed activation partitioned through the residual add,
+            # so the next layer can reuse the same sequence shard.
+            yield OpPlan(node, partition=OpPartition(input=0, dim=1))
 
 
 def cp_param_clss_fn(trainer_args: TrainerArgs, parameter_fqn: str) -> dict:
@@ -706,6 +710,14 @@ def test_cp4_ep2_runtime8_static(tmp_path):
             (num_experts // 2, hidden_size, hidden_size)),
     ] * trainer_args.model.args['num_layers'])
 
+    shared_sequence_partition_pattern = (
+        r'nnscaler\.runtime\.adapter\.chunk\('
+        + (
+            r'[\s\S]*?tests\.cli\.test_cp_ep\.routed_expert\('
+            r'[\s\S]*?torch\.add\('
+        ) * trainer_args.model.args['num_layers']
+        + r'[\s\S]*?nnscaler\.runtime\.adapter\.all_gather\('
+    )
     for rank in range(compute_config.runtime_ngpus):
         module_class = _load_parallel_module_class(
             ContextExpertModel,
@@ -729,6 +741,37 @@ def test_cp4_ep2_runtime8_static(tmp_path):
             (start, stop)
             for _, start, stop in expert_metas
         } == {expected_slice}
+
+        # Keep one plan-level sequence shard through every residual/expert
+        # layer instead of splitting and gathering around each routed_expert.
+        assert len(_gencode_contains(
+            tmp_path,
+            ContextExpertModel,
+            rank,
+            r'nnscaler\.runtime\.adapter\.chunk\(',
+            instance_name=instance_name,
+        )) == 1
+        assert len(_gencode_contains(
+            tmp_path,
+            ContextExpertModel,
+            rank,
+            r'nnscaler\.runtime\.adapter\.all_gather\(',
+            instance_name=instance_name,
+        )) == 1
+        assert len(_gencode_contains(
+            tmp_path,
+            ContextExpertModel,
+            rank,
+            r'tests\.cli\.test_cp_ep\.routed_expert\(',
+            instance_name=instance_name,
+        )) == trainer_args.model.args['num_layers']
+        assert _gencode_contains(
+            tmp_path,
+            ContextExpertModel,
+            rank,
+            shared_sequence_partition_pattern,
+            instance_name=instance_name,
+        )
 
         # Generated reducers must follow the same repeated expert ownership.
         expected_ranks = '[0, 2, 4, 6]' if rank % 2 == 0 else '[1, 3, 5, 7]'
