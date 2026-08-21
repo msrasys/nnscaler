@@ -88,6 +88,13 @@ __all__ = [
 ]
 
 
+def _validate_scale_unit_sizes(plan_ngpus: int, num_scale_units: int) -> None:
+    if plan_ngpus <= 0:
+        raise ValueError(f'plan_ngpus must be positive, but got {plan_ngpus}')
+    if num_scale_units <= 0:
+        raise ValueError(f'num_scale_units must be positive, but got {num_scale_units}')
+
+
 def dp_scale_unit_ranks(plan_ngpus: int, num_scale_units: int = 1, rank: Optional[int] = None) -> tuple[int, ...]:
     """
     Get ranks in the current contiguous scale-unit DP group.
@@ -105,8 +112,9 @@ def dp_scale_unit_ranks(plan_ngpus: int, num_scale_units: int = 1, rank: Optiona
     Returns:
         tuple[int, ...]: Global ranks in the current scale-unit DP group.
     """
-    rank = dist.get_rank() if rank is None else rank
+    _validate_scale_unit_sizes(plan_ngpus, num_scale_units)
     group_size = plan_ngpus * num_scale_units
+    rank = dist.get_rank() if rank is None else rank
     first_rank = rank // group_size * group_size
     return tuple(range(first_rank, first_rank + group_size))
 
@@ -133,8 +141,9 @@ def ep_scale_unit_ranks(
     Returns:
         tuple[int, ...]: Global ranks in the current expert-parallel scale-unit group.
     """
-    rank = dist.get_rank() if rank is None else rank
+    _validate_scale_unit_sizes(plan_ngpus, num_scale_units)
     group_size = plan_ngpus * num_scale_units
+    rank = dist.get_rank() if rank is None else rank
     first_rank = rank // group_size * group_size
     return tuple(range(first_rank, first_rank + group_size))
 
@@ -173,8 +182,9 @@ def ep_scale_unit_lane_ranks(
         tuple[int, ...]: Global ranks in the current rank's plan-local lane,
             ordered by scale-unit index.
     """
-    rank = dist.get_rank() if rank is None else rank
+    _validate_scale_unit_sizes(plan_ngpus, num_scale_units)
     group_size = plan_ngpus * num_scale_units
+    rank = dist.get_rank() if rank is None else rank
     group_start = rank // group_size * group_size
     lane = rank % plan_ngpus
     return tuple(range(group_start + lane, group_start + group_size, plan_ngpus))
@@ -193,6 +203,7 @@ class _DpScaleUnitChunk(torch.autograd.Function):
 
     @staticmethod
     def fake_forward(x: torch.Tensor, plan_ngpus: int, num_scale_units: int, dim: int) -> torch.Tensor:
+        _validate_scale_unit_sizes(plan_ngpus, num_scale_units)
         group_size = plan_ngpus * num_scale_units
         if x.shape[dim] % group_size != 0:
             raise ValueError('tensor dimension must be divisible by group_size')
@@ -212,6 +223,7 @@ class _DpScaleUnitAllGather(torch.autograd.Function):
 
     @staticmethod
     def fake_forward(x: torch.Tensor, plan_ngpus: int, num_scale_units: int, dim: int) -> torch.Tensor:
+        _validate_scale_unit_sizes(plan_ngpus, num_scale_units)
         group_size = plan_ngpus * num_scale_units
         return torch.cat([x] * group_size, dim=dim)
 
@@ -232,6 +244,7 @@ def dp_scale_unit_chunk(x: torch.Tensor, plan_ngpus: int, num_scale_units: int, 
     Returns:
         torch.Tensor: This rank's chunk of ``x``.
     """
+    _validate_scale_unit_sizes(plan_ngpus, num_scale_units)
     return _DpScaleUnitChunk.apply(x, plan_ngpus, num_scale_units, dim)
 
 
@@ -251,6 +264,7 @@ def dp_scale_unit_all_gather(x: torch.Tensor, plan_ngpus: int, num_scale_units: 
     Returns:
         torch.Tensor: Full tensor replicated on all ranks in the DP group.
     """
+    _validate_scale_unit_sizes(plan_ngpus, num_scale_units)
     return _DpScaleUnitAllGather.apply(x, plan_ngpus, num_scale_units, dim)
 
 
@@ -293,6 +307,7 @@ class _EpScaleUnitChunk(torch.autograd.Function):
 
     @staticmethod
     def fake_forward(x: torch.Tensor, plan_ngpus: int, num_scale_units: int, dim: int) -> torch.Tensor:
+        _validate_scale_unit_sizes(plan_ngpus, num_scale_units)
         if x.shape[dim] % num_scale_units != 0:
             raise ValueError('tensor dimension must be divisible by num_scale_units')
         return x.chunk(num_scale_units, dim=dim)[0]
@@ -320,6 +335,7 @@ class _EpScaleUnitAllGather(torch.autograd.Function):
 
     @staticmethod
     def fake_forward(x: torch.Tensor, plan_ngpus: int, num_scale_units: int, dim: int) -> torch.Tensor:
+        _validate_scale_unit_sizes(plan_ngpus, num_scale_units)
         return torch.cat([x] * num_scale_units, dim=dim)
 
 
@@ -349,6 +365,7 @@ def ep_scale_unit_chunk(
     Returns:
         torch.Tensor: This scale unit's chunk for the current lane.
     """
+    _validate_scale_unit_sizes(plan_ngpus, num_scale_units)
     return _EpScaleUnitChunk.apply(x, plan_ngpus, num_scale_units, dim)
 
 
@@ -376,6 +393,7 @@ def ep_scale_unit_all_gather(
     Returns:
         torch.Tensor: Full tensor replicated across the same-lane ranks.
     """
+    _validate_scale_unit_sizes(plan_ngpus, num_scale_units)
     return _EpScaleUnitAllGather.apply(x, plan_ngpus, num_scale_units, dim)
 
 

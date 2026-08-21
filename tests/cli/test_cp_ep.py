@@ -555,9 +555,12 @@ def _check_expert_bucket(trainer: Trainer, expected_nreplicas: int):
             matched_parameters.update(matched)
 
     assert matched_parameters == expert_parameters.keys()
-    expert_slices = {metadata.slicers[0] for metadata in expert_parameters.values()}
+    expert_slices = {
+        (metadata.slicers[0].start, metadata.slicers[0].stop, metadata.slicers[0].step)
+        for metadata in expert_parameters.values()
+    }
     assert len(expert_slices) == 1
-    return next(iter(expert_slices))
+    return slice(*next(iter(expert_slices)))
 
 
 def cp_ep_worker(
