@@ -2,12 +2,14 @@
 #  Licensed under the MIT License.
 
 from pathlib import Path
+from typing import Callable
+
 import pytest
 import torch
 
 import nnscaler
 from nnscaler.cli.trainer_args import (
-    load_type, ComputeConfig, OptionalComputeConfig, OptionalReducerConfig, TrainerArgs,
+    load_type, ComputeConfig, OptimizerConfig, OptionalComputeConfig, OptionalReducerConfig, TrainerArgs,
     _resolve_precision, _to_precision, _get_tensor_dtype,
     _deserialize_int_or_dict_of_ints,
 )
@@ -177,6 +179,66 @@ def test_batch_size_config_must_be_positive(cli_args):
     config_path = str(Path(__file__).with_name('trainer_args.yaml').resolve())
     with pytest.raises(ValueError, match='must (not be empty|be positive)|values must be positive'):
         TrainerArgs.from_cli(['-f', config_path, *cli_args])
+
+
+def _normalize_param_clss_fn(param_clss_fn: Callable):
+    trainer_args = object.__new__(TrainerArgs)
+    optimizer_config = OptimizerConfig(param_clss_fn=param_clss_fn)
+    return trainer_args, optimizer_config.get_normalized_param_clss_fn(trainer_args)
+
+
+def test_normalize_param_clss_fn_preserves_legacy_callback():
+    def param_clss_fn(value):
+        return value, 'legacy'
+
+    _, normalized = _normalize_param_clss_fn(param_clss_fn)
+
+    assert normalized('weight') == ('weight', 'legacy')
+
+
+def test_normalize_param_clss_fn_passes_trainer_args():
+    def param_clss_fn(context, value):
+        return context, value
+
+    trainer_args, normalized = _normalize_param_clss_fn(param_clss_fn)
+
+    assert normalized('weight') == (trainer_args, 'weight')
+
+
+def test_normalize_param_clss_fn_uses_parameter_count():
+    def param_clss_fn(context, value=None):
+        return context, value
+
+    trainer_args, normalized = _normalize_param_clss_fn(param_clss_fn)
+
+    assert normalized('weight') == (trainer_args, 'weight')
+
+
+def test_normalize_param_clss_fn_rejects_invalid_signature():
+    def param_clss_fn():
+        return None
+
+    with pytest.raises(TypeError, match='must accept either'):
+        _normalize_param_clss_fn(param_clss_fn)
+
+
+@pytest.mark.parametrize('param_clss_fn', [
+    lambda trainer_args, **kwargs: None,
+    lambda trainer_args, *, parameter_name: None,
+])
+def test_normalize_param_clss_fn_rejects_unbindable_signature(param_clss_fn):
+    with pytest.raises(TypeError, match='must accept either'):
+        _normalize_param_clss_fn(param_clss_fn)
+
+
+def test_normalize_param_clss_fn_preserves_callback_type_error():
+    def param_clss_fn(context, value):
+        raise TypeError('callback failure')
+
+    _, normalized = _normalize_param_clss_fn(param_clss_fn)
+
+    with pytest.raises(TypeError, match='callback failure'):
+        normalized('weight')
 
 
 # --- grad dtype tests ---

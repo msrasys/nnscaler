@@ -1,0 +1,85 @@
+vars:
+  hidden_size: 16
+  sequence_length: 7
+  micro_batch_size: 4
+  dp_sharded: false
+
+compute_config:
+  plan_ngpus: 2
+  runtime_ngpus: 4
+  constant_folding: true
+  use_zero: 0
+  use_end2end: true
+  reducer_replicated_params: true
+
+run_mode: run
+pas_policy: tests.cli.test_simulated_dp.simulated_dp_policy
+dummy_sample_gen_fn: tests.cli.test_simulated_dp.dp_sharded_dummy_sample
+micro_batch_size: $(vars.micro_batch_size)
+global_batch_size: 8
+max_train_steps: 50
+seed: 0
+init_env_fn: tests.cli.test_simulated_dp.init_scale_unit_groups
+
+model:
+  type: tests.cli.test_simulated_dp.LeadingSimulatedDPModel
+  args:
+    hidden_size: $(vars.hidden_size)
+    scale_unit_size: $(compute_config.plan_ngpus)
+    dp_sharded: $(vars.dp_sharded)
+
+optimizer:
+  type: torch.optim.Adam
+  param_clss_fn: tests.cli.test_simulated_dp.dp_sharded_simulated_dp_param_clss_fn
+  args:
+    lr: 0.01
+
+dataset:
+  type: tests.cli.test_simulated_dp.DPShardedSimulatedDPDataset
+  train_args:
+    hidden_size: $(vars.hidden_size)
+    sequence_length: $(vars.sequence_length)
+    size: 8
+    dp_sharded: $(vars.dp_sharded)
+    plan_ngpus: $(compute_config.plan_ngpus)
+    runtime_ngpus: $(compute_config.runtime_ngpus)
+    logical_micro_batch_size: $(vars.micro_batch_size)
+  val_args:
+    hidden_size: $(vars.hidden_size)
+    sequence_length: $(vars.sequence_length)
+    size: 8
+    dp_sharded: $(vars.dp_sharded)
+    plan_ngpus: $(compute_config.plan_ngpus)
+    runtime_ngpus: $(compute_config.runtime_ngpus)
+    logical_micro_batch_size: $(vars.micro_batch_size)
+
+dataset_sampler:
+  type: tests.cli.test_simulated_dp.ScaleUnitDPShardedSampler
+  train_args:
+    dp_sharded: $(vars.dp_sharded)
+    plan_ngpus: $(compute_config.plan_ngpus)
+    shuffle: false
+  val_args:
+    dp_sharded: $(vars.dp_sharded)
+    plan_ngpus: $(compute_config.plan_ngpus)
+    shuffle: false
+
+dataloader:
+  type: tests.cli.test_simulated_dp.ScaleUnitDPShardedDataLoader
+  train_args:
+    plan_ngpus: $(compute_config.plan_ngpus)
+    dp_sharded: $(vars.dp_sharded)
+    stage: train
+    drop_last: true
+    shuffle: false
+  val_args:
+    plan_ngpus: $(compute_config.plan_ngpus)
+    dp_sharded: $(vars.dp_sharded)
+    stage: val
+    drop_last: true
+    shuffle: false
+
+checkpoint:
+  keep_last_n_checkpoints: 1
+  every_n_train_steps: 50
+  save_type: deduped
