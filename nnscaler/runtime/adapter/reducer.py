@@ -262,12 +262,13 @@ class Bucket:
                  param_cls: Any = None,
                  params_info: Dict[torch.nn.Parameter, ReducerParamInfo] = None,
                  nreplicas: int = 1,
+                 use_none_grad: bool = False,
     ):
         """
         Create a communication unit for parameter allreduce.
 
         One allreduce will be called for all gradients associated to the parameters.
-        The parameters are assumed to participate in backward and generate gradient.
+        Parameters unused across all reducer ranks retain a ``None`` gradient.
 
         Args:
             params (List[torch.nn.Parameter]): the parameters
@@ -288,6 +289,7 @@ class Bucket:
             align_size (int): the alignment size in bytes for each parameter
             param_cls (Any): the class of the parameters
             nreplicas (int): divisor applied to gradients after all-reduce (default 1)
+            use_none_grad (bool): whether a bucket unused on all ranks keeps a ``None`` gradient
         """
 
         self._params: List[torch.nn.Parameter] = params
@@ -304,11 +306,13 @@ class Bucket:
         self._async_param_cnt: int = 0  # flag for triggering async communication
         self._async_handle = None  # asynchrounous communication handler
         self._hooks: List[Tuple[Any, RemovableHandle]] = []
+        self._params_with_grad: Set[torch.nn.Parameter] = set()
 
         self._async: bool = async_op
         self._zero: int = zero
         self._zero_use_reduce_scatter = zero_use_reduce_scatter
         self._nreplicas: int = nreplicas
+        self._use_none_grad: bool = use_none_grad
         # number of gradient accumulation steps, used for async reducer to determine
         # when to trigger allreduce
         # 0 means we will rely on Flag.skip_reducer to determine when to trigger allreduce,
@@ -467,8 +471,8 @@ class Bucket:
 
         The post-backward will change the generated gradient from `.grad` to `self._contiguous_grads`.
         The `.grad` will always keep as None until the finish of allreduce sync.
-        After allreduce sync, each parameter will be reset by its `.grad` attribute, which
-        shares the same storage from `self._contiguous_grads`.
+        After allreduce sync, each used parameter will be reset by its `.grad` attribute,
+        which shares the same storage from `self._contiguous_grads`.
 
         This should only be called once during the construction of bucket.
         """
@@ -476,6 +480,8 @@ class Bucket:
         @torch.no_grad()
         def post_grad_hook(param: torch.nn.Parameter, *unused): # pragma: no cover
             # stream = DeviceGroup().get_stream('reducer')
+            if self._use_none_grad:
+                self._params_with_grad.add(param)
             ofst = self._pofset[param]
             rank = torch.distributed.get_rank()
             # TODO: need to handle sparse gradients in torch.nn.Embedding
@@ -594,6 +600,27 @@ class Bucket:
         the completion of allreduce.
         """
         rank = torch.distributed.get_rank(group=self._group)
+        if self._use_none_grad:
+            grad_presence = torch.tensor(
+                [param in self._params_with_grad for param in self._params],
+                dtype=torch.int32,
+                device=self._contiguous_grads.device,
+            )
+            if self._wsz > 1:
+                torch.distributed.all_reduce(
+                    grad_presence, op=torch.distributed.ReduceOp.MAX, group=self._group)
+            num_params_with_grad = int(grad_presence.sum().item())
+            if num_params_with_grad not in (0, len(self._params)):
+                raise RuntimeError(
+                    "use_none_grad requires all parameters in the same bucket "
+                    "to be used in the same iteration"
+                )
+            if num_params_with_grad == 0:
+                self._param_for_optimizer.grad = None
+                for param in self._params:
+                    assert param.grad is None
+                return
+
         # async
         if self._async:
             if CudaTimer().enabled and CudaTimer().predefined:
@@ -629,7 +656,7 @@ class Bucket:
         # apply nreplicas divisor if needed
         if self._nreplicas != 1:
             self._contiguous_grads.div_(self._nreplicas)
-        # grads = self._contiguous_grads.clone()
+
         for param in self._params:
             assert param.grad is None
             pofst = self._pofset[param]
@@ -717,6 +744,7 @@ class Bucket:
         """Reset status."""
         self._async_param_cnt = 0
         self._async_handle = None
+        self._params_with_grad.clear()
 
     def sleep(self):
         """
@@ -765,6 +793,7 @@ class Bucket:
         state.pop(fields._group, None)
         state.pop(fields._async_handle, None)
         state.pop(fields._async_param_cnt, None)
+        state.pop(fields._params_with_grad, None)
         state.pop(fields._zero_subgroup, None)
         state.pop(fields._zero_crossgroup, None)
 
@@ -810,6 +839,7 @@ class Reducer:
         zero: int = 0, zero_ngroups: int = 1,
         zero_use_reduce_scatter: bool = False,
         zero_param_level_sharding: bool = False,
+        use_none_grad: bool = False,
         align_size: int = ALIGNED_BYTES,
         nreplicas: int = 1,
     ):
@@ -832,6 +862,7 @@ class Reducer:
             zero_use_reduce_scatter (bool): whether to use reduce scatter for zero optimization
             zero_param_level_sharding (bool): whether to use parameter-level sharding in ZeRO
                 This flag is required when use parameter-level optimizers(like Muon)
+            use_none_grad (bool): whether a bucket unused on all ranks keeps a ``None`` gradient
             align_size (int): the alignment size in bytes for each parameter
             nreplicas (int): divisor applied to gradients after all-reduce.
                 For replicated weights where each rank already has the full gradient,
@@ -858,6 +889,7 @@ class Reducer:
         self._zero: int = int(zero)
         self._zero_use_reduce_scatter = zero_use_reduce_scatter
         self._zero_param_level_sharding = zero_param_level_sharding and self._zero > 0
+        self._use_none_grad = use_none_grad
         self._align_size: int = align_size
         self._nreplicas: int = nreplicas
         # number of gradient accumulation steps, used for async reducer to determine
@@ -1282,6 +1314,7 @@ class Reducer:
                 param_cls=param_cls,
                 params_info=self._params_info,
                 nreplicas=self._nreplicas,
+                use_none_grad=self._use_none_grad,
             )
             buckets.append(bucket)
         torch.cuda.empty_cache()

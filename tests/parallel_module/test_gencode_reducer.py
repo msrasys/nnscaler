@@ -35,7 +35,7 @@ def test_codegen_normal_split(tmp_path):
         m,
         {'x': torch.randn(2, 4)},
         normal_linear_split_policy,
-        ComputeConfig(2, 4),
+        ComputeConfig(2, 4, reducer_none_grad=True),
         gen_savedir=tmp_path,
         load_module=False,
         reuse='override',
@@ -43,6 +43,12 @@ def test_codegen_normal_split(tmp_path):
 
     assert _gencode_contains(tmp_path, NormalLinearModule, 0,
         r"nnscaler.runtime.adapter.Reducer\(ranks=\[0, 1, 2, 3\].*nreplicas=1\)"
+    )
+    assert _gencode_contains(tmp_path, NormalLinearModule, 0,
+        r"def __init__\(.*reducer_none_grad=True.*\)"
+    )
+    assert _gencode_contains(tmp_path, NormalLinearModule, 0,
+        r"nnscaler.runtime.adapter.Reducer\(.*use_none_grad=reducer_none_grad.*\)"
     )
     # generated reducer:
     # self.wreducer32 = nnscaler.runtime.adapter.Reducer(ranks=[0, 1, 2, 3], reduce_op='sum', async_op=async_op, zero=0, max_bucket_size_bytes=max_bucket_size_bytes, zero_use_reduce_scatter=zero_use_reduce_scatter, zero_param_level_sharding=zero_param_level_sharding,zero_ngroups=1,nreplicas=1)

@@ -560,6 +560,7 @@ class ModuleCodeGen(FuncEmission):
                         f'max_bucket_size_bytes={CompileFlag.max_reducer_bucket}',
                         f'zero_use_reduce_scatter={CompileFlag.zero_use_reduce_scatter}',
                         f'zero_param_level_sharding={CompileFlag.zero_param_level_sharding}',
+                        f'reducer_none_grad={CompileFlag.reducer_none_grad}',
                         f'**kwargs',
                     ]
                 ) as ib:
@@ -824,6 +825,7 @@ class ModuleCodeGen(FuncEmission):
         async_op = CompileFlag.async_reducer if not as_parallel_module else 'async_op'
         zero_use_reduce_scatter = CompileFlag.zero_use_reduce_scatter if not as_parallel_module else 'zero_use_reduce_scatter'
         zero_param_level_sharding = CompileFlag.zero_param_level_sharding if not as_parallel_module else 'zero_param_level_sharding'
+        reducer_none_grad = CompileFlag.reducer_none_grad if not as_parallel_module else 'reducer_none_grad'
 
         zero = CompileFlag.use_zero
         zero_ngroups = CompileFlag.zero_ngroups
@@ -836,6 +838,7 @@ class ModuleCodeGen(FuncEmission):
             "async_op={async_op}, zero={zero}, max_bucket_size_bytes={max_nbytes}, "
             "zero_use_reduce_scatter={zero_use_reduce_scatter}, "
             "zero_param_level_sharding={zero_param_level_sharding}, "
+            "use_none_grad={reducer_none_grad}, "
             "zero_ngroups={zero_ngroups}, "
             "nreplicas={nreplicas})"
         )
@@ -851,6 +854,7 @@ class ModuleCodeGen(FuncEmission):
             async_op=async_op, zero=zero, max_nbytes=max_nbytes,
             zero_ngroups=zero_ngroups, zero_use_reduce_scatter=zero_use_reduce_scatter,
             zero_param_level_sharding=zero_param_level_sharding,
+            reducer_none_grad=reducer_none_grad,
             nreplicas=nreplicas
         )
         self.model_init_statements.append(init_code)

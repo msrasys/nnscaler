@@ -141,6 +141,84 @@ def reducer_test():
 test_reducer_2gpu = partial(torchrun, 2, reducer_test)
 
 
+def reducer_unused_param_test():
+    nnscaler.init()
+
+    rank = torch.distributed.get_rank()
+    device = torch.cuda.current_device()
+
+    default_used = torch.nn.Parameter(torch.tensor([1.0], device=device))
+    default_unused = torch.nn.Parameter(torch.tensor([1.0], device=device))
+    default_reducer = Reducer([0, 1], async_op=False, max_bucket_size_bytes=16)
+    default_reducer.add_param(default_used)
+    default_reducer.add_param(default_unused)
+    default_reducer.build_buckets()
+    default_used.square().backward()
+    default_reducer.sync_grads()
+
+    # The default behavior materializes a zero gradient for an unused bucket.
+    assert default_unused.grad is not None
+    assert torch.count_nonzero(default_unused.grad) == 0
+
+    always_used = torch.nn.Parameter(torch.tensor([1.0], device=device))
+    branch_only = torch.nn.Parameter(torch.tensor([1.0], device=device))
+
+    reducer = Reducer(
+        [0, 1],
+        async_op=False,
+        max_bucket_size_bytes=16,
+        use_none_grad=True,
+    )
+    reducer.add_param(always_used)
+    reducer.add_param(branch_only)
+    reducer.build_buckets()
+
+    optimizer = torch.optim.Adam(reducer.parameters_for_optimizer(), lr=0.1)
+
+    optimizer.zero_grad(set_to_none=True)
+    reducer.zero_grad()
+    loss = always_used.square()
+    if rank == 0:
+        loss = loss + branch_only.square()
+    loss.backward()
+    reducer.sync_grads()
+
+    # A parameter used on any reducer rank receives the reduced gradient on every rank.
+    assert branch_only.grad is not None
+    assert torch.count_nonzero(branch_only.grad) > 0
+    optimizer.step()
+
+    branch_only_after_first_step = branch_only.detach().clone()
+
+    optimizer.zero_grad(set_to_none=True)
+    reducer.zero_grad()
+    always_used.square().backward()
+    reducer.sync_grads()
+
+    # A parameter unused on every reducer rank keeps grad=None, so Adam skips it.
+    assert branch_only.grad is None
+    optimizer.step()
+    assert torch.equal(branch_only, branch_only_after_first_step)
+
+    partial_bucket_used = torch.nn.Parameter(torch.tensor([1.0], device=device))
+    partial_bucket_unused = torch.nn.Parameter(torch.tensor([1.0], device=device))
+    partial_bucket_reducer = Reducer(
+        [0, 1],
+        async_op=False,
+        max_bucket_size_bytes=32,
+        use_none_grad=True,
+    )
+    partial_bucket_reducer.add_param(partial_bucket_used)
+    partial_bucket_reducer.add_param(partial_bucket_unused)
+    partial_bucket_reducer.build_buckets()
+    partial_bucket_used.square().backward()
+    with pytest.raises(RuntimeError, match="all parameters in the same bucket"):
+        partial_bucket_reducer.sync_grads()
+
+
+test_reducer_unused_param_2gpu = partial(torchrun, 2, reducer_unused_param_test)
+
+
 def test_flatten_param_info_dtype():
     params = [
         torch.nn.Parameter(torch.zeros(2, dtype=torch.float16)),

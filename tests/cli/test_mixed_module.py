@@ -33,6 +33,49 @@ class SecondBranchDataset(FirstBranchDataset):
         }
 
 
+class SequentialBranchDataset(torch.utils.data.Dataset):
+    def __init__(self, dim: int, size: int = 16):
+        if size % 2 != 0:
+            raise ValueError(f'size must be even, got {size}')
+        generator = torch.Generator().manual_seed(0)
+        self.data = torch.randn(size, dim, generator=generator)
+        self.target = torch.rand(size, dim, generator=generator)
+
+    def __getitem__(self, idx: int):
+        data_key = 'data1' if idx < len(self) // 2 else 'data2'
+        return {
+            data_key: self.data[idx],
+            'target': self.target[idx],
+        }
+
+    def __len__(self):
+        return len(self.data)
+
+
+_reducer_none_grad_weight_history = []
+
+
+def record_reducer_none_grad_weights(trainer: Trainer):
+    _reducer_none_grad_weight_history.append({
+        'mlp0': trainer.model.mlp0.layers[0].weight.detach().cpu().clone(),
+        'mlp1': trainer.model.mlp1.layers[0].weight.detach().cpu().clone(),
+    })
+
+
+def branch_param_clss_fn(param_name: str) -> int:
+    if param_name.startswith('mlp0.'):
+        return 0
+    if param_name.startswith('mlp1.'):
+        return 1
+    return 2
+
+
+def shared_branch_param_clss_fn(param_name: str) -> int:
+    if param_name.startswith(('mlp0.', 'mlp1.')):
+        return 0
+    return 1
+
+
 def mixed1_worker(save_dir, config_file):
     save_dir = Path(save_dir)
     stem = Path(config_file).stem
@@ -286,6 +329,58 @@ def test_conditional_parallel_module_sync(tmp_path):
         assert_equal(state, active_only_states[index])
 
 
+def rank_dependent_parallel_module_worker(save_dir):
+    config_path = str(Path(__file__).with_name('trainer_args_mixed3.yaml').resolve())
+    parallel_module_args = []
+    for index, module_type in enumerate([
+        'tests.cli.common.MixModuleMLP',
+        'tests.cli.common.MixModuleMLP2',
+    ]):
+        prefix = f'--model.parallel_modules.{index}'
+        parallel_module_args.extend([
+            f'{prefix}.type', module_type,
+            f'{prefix}.args.dim', '16',
+            f'{prefix}.args.nlayers', '16',
+            f'{prefix}.forward_args_gen_fn', 'tests.cli.common.forward_args_gen_fn',
+        ])
+
+    trainer = Trainer([
+        '-f', config_path,
+        '--compute_config.plan_ngpus', '1',
+        '--compute_config.runtime_ngpus', '2',
+        '--compute_config.reducer_none_grad', 'true',
+        '--max_epochs', '1',
+        '--max_train_steps', '1',
+        '--dataset.type', 'tests.cli.common.BranchedSimpleDataset',
+        '--dataset.train_args.size', '8',
+        '--dataset.val_args.size', '4',
+        '--enable_progress_bar', 'false',
+        '--gen_savedir', str(Path(save_dir) / 'gen'),
+        '--checkpoint.no_save', 'true',
+        *parallel_module_args,
+    ])
+    trainer.run()
+
+    optimizer_state = trainer.optimizer.state_dict()['state']
+    for prefix in ('mlp0', 'mlp1'):
+        location = trainer.optimizer._extra_state.parallel_module_locs[prefix]
+        assert all(
+            index in optimizer_state
+            for index in range(location.offset, location.offset + location.count)
+        )
+
+    return {
+        prefix: [param.detach().cpu().clone() for param in getattr(trainer.model, prefix).parameters()]
+        for prefix in ('mlp0', 'mlp1')
+    }
+
+
+@pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.device_count() < 2, reason='lack of gpu devices')
+def test_rank_dependent_parallel_module_sync(tmp_path):
+    results = launch_torchrun(2, rank_dependent_parallel_module_worker, tmp_path)
+    assert_equal(results[0], results[1])
+
+
 def conditional_parallel_module_switch_worker(save_dir, resume_from_merged):
     save_dir = Path(save_dir)
     run_name = 'merged_resume' if resume_from_merged else 'sharded_resume'
@@ -354,6 +449,164 @@ def conditional_parallel_module_switch_worker(save_dir, resume_from_merged):
 def test_conditional_parallel_module_switch_branches(tmp_path):
     launch_torchrun(2, conditional_parallel_module_switch_worker, tmp_path, False)
     launch_torchrun(2, conditional_parallel_module_switch_worker, tmp_path, True)
+
+    sharded_resume = torch.load(tmp_path / 'sharded_resume' / 'result.pt', weights_only=False)
+    merged_resume = torch.load(tmp_path / 'merged_resume' / 'result.pt', weights_only=False)
+    assert_equal(sharded_resume['model'], merged_resume['model'])
+    assert_equal(sharded_resume['optimizer'], merged_resume['optimizer'])
+
+    branch1 = torch.load(tmp_path / 'merged_resume' / 'branch1.pt', weights_only=False)
+    original_module = BranchedMixedModule(dim=16, nlayers=16)
+    branch2_state_indices = {
+        index for index, (name, _) in enumerate(original_module.named_parameters())
+        if name.startswith('mlp1.')
+    }
+    assert branch2_state_indices.isdisjoint(branch1['optimizer']['state'])
+    assert branch2_state_indices.issubset(merged_resume['optimizer']['state'])
+
+
+def reducer_none_grad_worker(save_dir, use_none_grad):
+    _reducer_none_grad_weight_history.clear()
+    save_dir = Path(save_dir) / str(use_none_grad)
+    config_path = str(Path(__file__).with_name('trainer_args_mixed3.yaml').resolve())
+    trainer = Trainer([
+        '-f', config_path,
+        '--compute_config.plan_ngpus', '1',
+        '--compute_config.runtime_ngpus', '2',
+        '--max_epochs', '1',
+        '--max_train_steps', '2',
+        '--max_val_steps', '1',
+        '--dataset.type', 'tests.cli.test_mixed_module.SequentialBranchDataset',
+        '--dataset.train_args.size', '16',
+        '--dataset.val_args.size', '8',
+        '--enable_progress_bar', 'false',
+        '--gen_savedir', str(save_dir / 'gen'),
+        '--checkpoint.no_save', 'true',
+        '--model.non_parallel_params_reducer_config.reducer_none_grad', str(use_none_grad),
+        '--optimizer.param_clss_fn', 'tests.cli.test_mixed_module.branch_param_clss_fn',
+        '--hook.after_optimizer_step',
+        'tests.cli.test_mixed_module.record_reducer_none_grad_weights',
+    ])
+    trainer.run()
+
+    reducer = trainer.optimizer._non_parallel_module_reducer
+    assert reducer._use_none_grad is use_none_grad
+    assert {bucket.param_cls[0] for bucket in reducer.buckets} == {0, 1, 2}
+    assert len(_reducer_none_grad_weight_history) == 2
+    return _reducer_none_grad_weight_history
+
+
+@pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.device_count() < 2, reason='lack of gpu devices')
+def test_reducer_none_grad_end2end(tmp_path):
+    zero_grad_history = launch_torchrun(2, reducer_none_grad_worker, tmp_path, False)
+    none_grad_history = launch_torchrun(2, reducer_none_grad_worker, tmp_path, True)
+
+    for rank in range(2):
+        assert_equal(zero_grad_history[rank][0], none_grad_history[rank][0])
+
+        # mlp0 is active in the first step and inactive in the second step.
+        assert not torch.equal(
+            zero_grad_history[rank][0]['mlp0'],
+            zero_grad_history[rank][1]['mlp0'],
+        )
+        assert torch.equal(
+            none_grad_history[rank][0]['mlp0'],
+            none_grad_history[rank][1]['mlp0'],
+        )
+
+        # mlp1 takes the opposite branch and must be updated in the second step.
+        assert not torch.equal(
+            none_grad_history[rank][0]['mlp1'],
+            none_grad_history[rank][1]['mlp1'],
+        )
+
+    assert_equal(zero_grad_history[0], zero_grad_history[1])
+    assert_equal(none_grad_history[0], none_grad_history[1])
+
+
+def reducer_none_grad_partial_bucket_worker(save_dir):
+    config_path = str(Path(__file__).with_name('trainer_args_mixed3.yaml').resolve())
+    trainer = Trainer([
+        '-f', config_path,
+        '--compute_config.plan_ngpus', '1',
+        '--compute_config.runtime_ngpus', '2',
+        '--max_epochs', '1',
+        '--max_train_steps', '1',
+        '--dataset.type', 'tests.cli.test_mixed_module.FirstBranchDataset',
+        '--dataset.train_args.size', '8',
+        '--dataset.val_args.size', '4',
+        '--enable_progress_bar', 'false',
+        '--gen_savedir', str(Path(save_dir) / 'gen'),
+        '--checkpoint.no_save', 'true',
+        '--model.non_parallel_params_reducer_config.reducer_none_grad', 'true',
+        '--optimizer.param_clss_fn',
+        'tests.cli.test_mixed_module.shared_branch_param_clss_fn',
+    ])
+
+    with pytest.raises(RuntimeError, match='all parameters in the same bucket'):
+        trainer.run()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.device_count() < 2, reason='lack of gpu devices')
+def test_reducer_none_grad_partial_bucket_raises(tmp_path):
+    launch_torchrun(2, reducer_none_grad_partial_bucket_worker, tmp_path)
+
+
+def reducer_none_grad_checkpoint_worker(save_dir, resume_from_merged):
+    run_name = 'merged_resume' if resume_from_merged else 'sharded_resume'
+    run_dir = Path(save_dir) / run_name
+    config_path = str(Path(__file__).with_name('trainer_args_mixed3.yaml').resolve())
+    common_args = [
+        '-f', config_path,
+        '--compute_config.plan_ngpus', '1',
+        '--compute_config.runtime_ngpus', '2',
+        '--dataset.train_args.size', '8',
+        '--dataset.val_args.size', '4',
+        '--enable_progress_bar', 'false',
+        '--gen_savedir', str(run_dir / 'gen'),
+        '--checkpoint.save_type', 'sharded',
+        '--checkpoint.save_dir', str(run_dir / 'ckpt'),
+        '--model.non_parallel_params_reducer_config.reducer_none_grad', 'true',
+        '--optimizer.param_clss_fn', 'tests.cli.test_mixed_module.branch_param_clss_fn',
+    ]
+
+    trainer = Trainer([
+        *common_args,
+        '--max_epochs', '1',
+        '--max_train_steps', '1',
+        '--dataset.type', 'tests.cli.test_mixed_module.FirstBranchDataset',
+    ])
+    trainer.run()
+    torch.distributed.barrier()
+    if trainer.rank == 0:
+        Trainer.merge_checkpoint(
+            list((run_dir / 'ckpt' / 'last').glob('*.ckpt')),
+            run_dir / 'branch1.pt',
+        )
+    torch.distributed.barrier()
+
+    trainer = Trainer([
+        *common_args,
+        '--max_epochs', '2',
+        '--max_train_steps', '2',
+        '--dataset.type', 'tests.cli.test_mixed_module.SecondBranchDataset',
+        '--checkpoint.resume_from.checkpoint',
+        str(run_dir / 'branch1.pt') if resume_from_merged else 'last',
+    ])
+    trainer.run()
+    torch.distributed.barrier()
+    if trainer.rank == 0:
+        Trainer.merge_checkpoint(
+            list((run_dir / 'ckpt' / 'last').glob('*.ckpt')),
+            run_dir / 'result.pt',
+        )
+    torch.distributed.barrier()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.device_count() < 2, reason='lack of gpu devices')
+def test_reducer_none_grad_checkpoint_roundtrip(tmp_path):
+    launch_torchrun(2, reducer_none_grad_checkpoint_worker, tmp_path, False)
+    launch_torchrun(2, reducer_none_grad_checkpoint_worker, tmp_path, True)
 
     sharded_resume = torch.load(tmp_path / 'sharded_resume' / 'result.pt', weights_only=False)
     merged_resume = torch.load(tmp_path / 'merged_resume' / 'result.pt', weights_only=False)

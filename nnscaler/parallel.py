@@ -151,6 +151,16 @@ class ComputeConfig:
     # When True, replicated weights will also go through all-reduce (with nreplicas division),
     # ensuring gradient consistency across ranks. Default is False.
     reducer_replicated_params: bool = False
+    # whether to use None grad for parameters that are not used in the current iteration.
+    # This is useful for models with dynamic control flow, where some parameters may not be used
+    # in certain iterations.
+    # Note: in current implementation, the parameters are grouped into buckets,
+    # so if you want to set this flag to True,
+    # you must make sure that all parameters in the same bucket are used in the same iteration,
+    # otherwise, errors will be raised.
+    # Note2: This doesn't make async/zero3 work with dynamic control flow,
+    # because the async/zero3 reducer will always assume all parameters are used in the current iteration.
+    reducer_none_grad: bool = False
 
     # PAS policy settings
     # you can also put any other settings that can affect code generation here.
@@ -452,6 +462,7 @@ def _compile_flags(compute_config: ComputeConfig):
         trace_strategy=compute_config.trace_strategy,
         zero_param_level_sharding=compute_config.zero_param_level_sharding,
         reducer_replicated_params=compute_config.reducer_replicated_params,
+        reducer_none_grad=compute_config.reducer_none_grad,
         use_fbw=compute_config.use_fbw,
     )
 
@@ -1666,6 +1677,7 @@ def build_optimizer(
                 'max_bucket_size_bytes': compute_config.max_bucket_size_bytes,
                 'zero_use_reduce_scatter': compute_config.zero_use_reduce_scatter,
                 'zero_ngroups': compute_config.zero_ngroups,
+                'use_none_grad': compute_config.reducer_none_grad,
             }
         else:
             reducer_config = {
@@ -1674,6 +1686,9 @@ def build_optimizer(
                 'max_bucket_size_bytes': None,
                 'zero_use_reduce_scatter': False,
                 'zero_ngroups': 1,
+                # TODO: a better default value for use_none_grad?
+                # currently let's use the same value as the first parallel module
+                'use_none_grad': compute_configs[0].reducer_none_grad,
             }
         non_parallel_module_reducer_config = replace(
             compute_config or compute_configs[0],
@@ -1683,6 +1698,7 @@ def build_optimizer(
                 if reducer_config['max_bucket_size_bytes'] else None,
             zero_use_reduce_scatter=reducer_config['zero_use_reduce_scatter'],
             zero_ngroups=reducer_config['zero_ngroups'],
+            reducer_none_grad=reducer_config['use_none_grad'],
         )
         non_parallel_module_reducer = Reducer(group, **reducer_config)
         for param in non_parallel_parameters:
@@ -1843,17 +1859,31 @@ def build_optimizer(
             return module._sync_grad_required
         return getattr(module, _SYNC_GRAD_REQUIRED_ATTR, False)
 
-    def _reset_sync_grad_required():
-        if not isinstance(module, ParallelModule):
-            setattr(module, _SYNC_GRAD_REQUIRED_ATTR, False)
-
     def _sync_shard_grad(self):
         with _runtime_flags(skip_reducer=False):
             if _sync_grad_required():
-                _reset_sync_grad_required()  # reentrant safe
-                for m in parallel_modules:
+                if isinstance(module, ParallelModule):
+                    # there is no non-parallel module reducer in this case,
+                    # so we can just call sync_grad() directly
+                    module.sync_grad()
+                    return
+
+                setattr(module, _SYNC_GRAD_REQUIRED_ATTR, False) # reentrant safe
+                sync_activity = torch.tensor(
+                    [m._sync_grad_required for m in parallel_modules],
+                    dtype=torch.int32,
+                    device=torch.cuda.current_device(),
+                )
+                torch.distributed.all_reduce(sync_activity, op=torch.distributed.ReduceOp.MAX)
+
+                # TODO: Async reducers and ZeRO-3 issue collectives from backward hooks,
+                # before activity can be synchronized here. They still require every
+                # parameter to be used on every rank.
+                for m, active in zip(parallel_modules, sync_activity.tolist()):
+                    m._sync_grad_required = bool(active)
                     m.sync_grad()
 
+                # always sync non-parallel module reducer.
                 if non_parallel_module_reducer:
                     non_parallel_module_reducer.sync_grads()
 
@@ -2287,7 +2317,8 @@ def merge_state_dicts(
             npp_start = ret_states_cur_index - num_npp
             npp_states = {}
             for loc in range(npp_start, ret_states_cur_index):
-                npp_states[loc - npp_start] = ret_states.pop(loc)
+                if loc in ret_states:
+                    npp_states[loc - npp_start] = ret_states.pop(loc)
 
             # merge back npp_states to ret_states, the location is determined by non_parallel_param_locs
             ret_new_states = {}
@@ -2295,7 +2326,8 @@ def merge_state_dicts(
             for i in range(ret_states_cur_index):
                 if npp_inserted < len(npp_locs) and i == npp_locs[npp_inserted]:
                     # the position for non-parallel parameters
-                    ret_new_states[i] = npp_states[npp_inserted]
+                    if npp_inserted in npp_states:
+                        ret_new_states[i] = npp_states[npp_inserted]
                     npp_inserted += 1
                 elif i - npp_inserted in ret_states:
                     # as `npp_inserted` non-parallel parameters are inserted
@@ -2503,7 +2535,11 @@ def _construct_optim_state_zero3(
 ):
     # state for each parameter in the parallel module
     new_states = _construct_optim_state_nonzero(module, orig_param_dict)
-    param_state_map = {p: new_states[idx] for idx, p in enumerate(module.parameters())}
+    param_state_map = {
+        p: new_states[idx]
+        for idx, p in enumerate(module.parameters())
+        if idx in new_states
+    }
 
     state_dict, opt_param_idx = {}, 0
     opt_param = module.parameters_for_optimizer()
@@ -2513,6 +2549,12 @@ def _construct_optim_state_zero3(
             bucket: Bucket
             # one bucket corresponds to one flattened param
             assert len(opt_param[opt_param_idx].shape) == 1
+            state_presence = [param in param_state_map for param in bucket.params]
+            if not any(state_presence):
+                opt_param_idx += 1
+                continue
+            if not all(state_presence):
+                raise ValueError("Inconsistent optimizer state within one reducer bucket")
             chunk_size = bucket._contiguous_params.shape[0]
             opt_states = {}
             for param in bucket.params:
@@ -2543,7 +2585,8 @@ def _construct_optim_state_zero3(
         reducer_pids.update(id(p) for p in reducer.params)
     for param in module.parameters():
         if id(param) not in reducer_pids:
-            state_dict[opt_param_idx] = param_state_map[param]
+            if param in param_state_map:
+                state_dict[opt_param_idx] = param_state_map[param]
             opt_param_idx += 1
 
     return state_dict
@@ -2582,6 +2625,16 @@ def _construct_optim_state_zero(
         for bucket in reducer.buckets:
             # one bucket corresponds to one flattened param
             assert len(opt_param[opt_param_idx].shape) == 1
+            sliced_states = [
+                _get_optimizer_state_of_param(param, param_ids, local_names)
+                for param in bucket.params
+            ]
+            state_presence = [state is not None for state in sliced_states]
+            if not any(state_presence):
+                opt_param_idx += 1
+                continue
+            if not all(state_presence):
+                raise ValueError("Inconsistent optimizer state within one reducer bucket")
             assert bucket._contiguous_params.shape[0] % len(sub_ranks) == 0
             chunk_size = bucket._contiguous_params.shape[0] // len(sub_ranks)
             # the flattened param is in the range [bucket_chunk_start, bucket_chunk_end)
@@ -2592,9 +2645,8 @@ def _construct_optim_state_zero(
             # param_offset: the param's start offset in the contiguous buffer
             # chunk_offset: the offset of the current rank corresponding chunk
             step, opt_states, opt_state_keys = None, {}, None
-            for param in bucket.params:
+            for param, sliced_new_val in zip(bucket.params, sliced_states):
                 param_offset = reducer.get_param_info(param).bucket_param_buffer_start
-                sliced_new_val = _get_optimizer_state_of_param(param, param_ids, local_names)
                 # there are padding in the chunk, so `param.numel()` doesn't work here
                 param_numel = bucket.get_aligned_numel(param)
                 # init the chunk's optimizer state
@@ -2664,7 +2716,8 @@ def _construct_optim_state_zero(
     for param in module.parameters():
         if id(param) not in reducer_pids:
             sliced_new_val = _get_optimizer_state_of_param(param, param_ids, local_names)
-            state_dict[opt_param_idx] = sliced_new_val
+            if sliced_new_val is not None:
+                state_dict[opt_param_idx] = sliced_new_val
             opt_param_idx += 1
     return state_dict
 
@@ -2678,10 +2731,22 @@ def _construct_optim_state_nonzero(
 
     new_states: dict[int, dict[str, torch.Tensor]] = {}
     for index, (local_name, _) in enumerate(module.named_parameters()):
-        new_states[index] = _extract_new_state(
+        state = _extract_new_state(
             local_name, orig_param_dict, dist_param_map, param_area_map,
             module.get_zero3_attr_meta(local_name)
         )
+        if state is not None:
+            new_states[index] = state
+
+    param_state_map = {
+        param: index in new_states
+        for index, param in enumerate(module.parameters())
+    }
+    for reducer in module.reducers:
+        for bucket in reducer.buckets:
+            state_presence = [param_state_map[param] for param in bucket.params]
+            if any(state_presence) and not all(state_presence):
+                raise ValueError("Inconsistent optimizer state within one reducer bucket")
 
     return new_states
 
@@ -2692,11 +2757,14 @@ def _extract_new_state(
         dist_param_map: Dict[str, str],
         param_area_map: Dict[str, AttrMeta],
         zero3_info: Optional[Zero3AttrMeta] = None
-) -> Dict[str, torch.Tensor]:
+    ) -> Optional[Dict[str, torch.Tensor]]:
     name = '_'.join(local_name.split('_')[:-1]) # remove the integer suffix
     assert name in dist_param_map
     attr_meta = param_area_map[local_name]
-    new_val = orig_param_dict[dist_param_map[name]]
+    orig_name = dist_param_map[name]
+    if orig_name not in orig_param_dict:
+        return None
+    new_val = orig_param_dict[orig_name]
     sliced_new_val = {}
     for key in new_val:
         if key in ('step',):

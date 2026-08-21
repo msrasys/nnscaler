@@ -237,6 +237,7 @@ class OptionalReducerConfig:
     zero_use_reduce_scatter: Optional[bool] = None
     use_async_reducer: Optional[bool] = None
     reducer_bucket_cap_mb: Optional[float] = None
+    reducer_none_grad: Optional[bool] = None
 
     def resolve(self, compute_config: ComputeConfig, **kwargs) -> ComputeConfig:
         replace_values = {
