@@ -82,4 +82,9 @@ def test_scale_unit_fake_helpers_require_positive_sizes(
     invalid_name,
 ):
     with pytest.raises(ValueError, match=rf'{invalid_name} must be positive'):
-        fake_forward(torch.ones(2), plan_ngpus, num_scale_units, dim=0)
+        fake_forward(
+            torch.ones(2),
+            plan_ngpus,
+            num_scale_units,
+            dim=0,
+        )
