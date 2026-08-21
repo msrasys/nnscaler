@@ -102,32 +102,26 @@ class MixedPrecisionF16OptimizerMixin(ScaleDelayedOptimizerMixin):
         # we do this to handle the merge of sharded checkpoint in nnscaler
         assert 'state' in state_dict, f'state not found in state_dict: {state_dict.keys()}'
         assert isinstance(state_dict['state'], dict), f'state is not a dict: {type(state_dict["state"])}'
-        assert len(self.fp32_params) == len(state_dict['state']), \
-                f'len(fp32_params) != len(state[state]): {len(self.fp32_params)} != {len(state_dict["state"])}'
-        assert 'exp_avg' in state_dict['state'][0], f'currently only verified for adam-like optimizer'
-        for key, value in state_dict['state'].items():
-            assert self.fp32_params[key].shape == value['exp_avg'].shape, f'Shape mismatch: {value["exp_avg"].shape} vs {self.fp32_params[key].shape}'
-            # .detach(): save tensor instead of Parameter.
-            value['fp32_params'] = self.fp32_params[key].detach()
+        fp32_params = self._get_fp32_params_for_state_dict(state_dict)
+        for key, fp32_param in fp32_params.items():
+            state_dict['state'].setdefault(key, {})['fp32_params'] = fp32_param
 
         return state_dict
+
+    def _get_fp32_params_for_state_dict(self, state_dict):
+        for key, value in state_dict['state'].items():
+            assert 'exp_avg' in value, f'currently only verified for adam-like optimizer'
+            assert self.fp32_params[key].shape == value['exp_avg'].shape, f'Shape mismatch: {value["exp_avg"].shape} vs {self.fp32_params[key].shape}'
+        return {
+            key: fp32_param.detach()
+            for key, fp32_param in enumerate(self.fp32_params)
+        }
 
     def load_state_dict(self, state_dict):
         """Load an optimizer state dict.
         This will also load the fp32_params from the state
         """
-        if 'state' in state_dict and len(state_dict['state']) > 0 and 'fp32_params' in state_dict['state'][0]:
-            logger.info('try to load fp32_params from state_dict in f16_optimizer')
-            assert isinstance(self.fp32_params, list), f'fp32_params is not a list: {type(self.fp32_params)}'
-            device = torch.cuda.current_device()
-            for i, param in enumerate(self.fp32_params):
-                ckpt_param = state_dict['state'][i]['fp32_params']
-                assert param.shape == ckpt_param.shape, f'Shape mismatch: {param.shape} vs {ckpt_param.shape}'
-                logger.info(f'param {i}, fp16 norm: {param.data.detach().norm().item()}, fp32 norm: {ckpt_param.data.detach().norm().item()}')
-                param.data = state_dict['state'][i]['fp32_params'].data.to(device)
-                # pop to avoid store a redundant copy in the wrapped optimizer
-                state_dict['state'][i].pop('fp32_params')
-        else:
+        if not self._load_fp32_params(state_dict):
             logger.warning('fp32_params not found in state_dict, will sync from fp16 params to fp32 params')
             self._sync_fp16_params_to_fp32()
 
@@ -136,6 +130,32 @@ class MixedPrecisionF16OptimizerMixin(ScaleDelayedOptimizerMixin):
 
         super().load_state_dict(state_dict)
         self._fp32_params_loaded = True
+
+    def _load_fp32_params(self, state_dict):
+        if 'state' not in state_dict or not state_dict['state']:
+            return False
+
+        state_count = len(state_dict['state'])
+        fp32_param_state_count = sum(1 for state in state_dict['state'].values() if 'fp32_params' in state)
+        if fp32_param_state_count == 0:
+            return False
+        if fp32_param_state_count != state_count:
+            raise RuntimeError(
+                f'fp32_params found in {fp32_param_state_count} out of {state_count} states, '
+                f'but all states should have fp32_params'
+            )
+
+        logger.info('try to load fp32_params from state_dict in f16_optimizer')
+        assert isinstance(self.fp32_params, list), f'fp32_params is not a list: {type(self.fp32_params)}'
+        device = torch.cuda.current_device()
+        for i, param in enumerate(self.fp32_params):
+            ckpt_param = state_dict['state'][i]['fp32_params']
+            assert param.shape == ckpt_param.shape, f'Shape mismatch: {param.shape} vs {ckpt_param.shape}'
+            logger.info(f'param {i}, fp16 norm: {param.data.detach().norm().item()}, fp32 norm: {ckpt_param.data.detach().norm().item()}')
+            param.data = state_dict['state'][i]['fp32_params'].data.to(device)
+            # pop to avoid store a redundant copy in the wrapped optimizer
+            state_dict['state'][i].pop('fp32_params')
+        return True
 
     def _sync_f16_grads_to_fp32(self):
         # copy FP16 grads to FP32
@@ -210,3 +230,61 @@ class MixedPrecisionAdamW(MixedPrecisionF16OptimizerMixin, torch.optim.AdamW):
         self.fp32_params = self.build_fp32_params(self.f16_params)
         kwargs = {**unfolded_kwargs, **kwargs}
         super().__init__(self.fp32_params, **kwargs)
+
+
+import nnscaler.runtime.dion_optimizer as _dion_optimizer
+_DionMuon = getattr(_dion_optimizer, 'Muon', None)
+
+
+if _DionMuon is not None:
+    class MixedPrecisionDionMuon(MixedPrecisionF16OptimizerMixin, _DionMuon):
+        """Dion Muon with BF16/FP16 model parameters and FP32 optimizer state."""
+
+        _fp32_state_key = 'fp32_params'
+
+        def __init__(self, params, **kwargs):
+            flattened_f16_params, unfolded_kwargs = self._unfold_params(params)
+            kwargs = {**unfolded_kwargs, **kwargs}
+
+            self.f16_params, flat_map = self.unflatten_params(flattened_f16_params)
+            self.fp32_params = self.build_fp32_params(self.f16_params)
+            super().__init__(
+                self.fp32_params,
+                flat_map=flat_map,
+                **kwargs,
+            )
+
+        def _get_fp32_params_for_state_dict(self, state_dict):
+            fp32_states = {
+                index: {self._fp32_state_key: param.detach()}
+                for index, param in enumerate(self.fp32_params)
+            }
+            flat_states = self._flatten_state(
+                fp32_states,
+                self._fp32_state_key,
+                torch.float32,
+            )
+            return {
+                index: state[self._fp32_state_key]
+                for index, state in flat_states.items()
+            }
+
+        def _load_fp32_params(self, state_dict):
+            flat_states = {
+                index: {self._fp32_state_key: state[self._fp32_state_key]}
+                for index, state in state_dict['state'].items()
+                if self._fp32_state_key in state
+            }
+            if not flat_states:
+                return not self.fp32_params
+
+            fp32_states = self._unflatten_state(
+                flat_states,
+                self._fp32_state_key,
+                torch.float32,
+            )
+            loaded = not self.fp32_params or super()._load_fp32_params(
+                {'state': fp32_states})
+            for state in state_dict['state'].values():
+                state.pop(self._fp32_state_key, None)
+            return loaded
