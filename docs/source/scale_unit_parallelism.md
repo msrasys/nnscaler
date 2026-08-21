@@ -1,10 +1,18 @@
 # Extending Parallelism Within and Across Scale Units
 
-This guide explains two useful parallel patterns that extend nnScaler's normal plan-level parallelism:
+This guide explains two useful parallel patterns that extend nnScaler's normal plan-level
+parallelism:
 
-1. **Simulated data parallelism inside one scale unit**: most of the model runs with tensor parallelism (TP), while a slow, non-partitionable module is replicated across the ranks in each scale unit. To avoid redundant computation, its input batch is sharded across those ranks, and the outputs are gathered before the model resumes tensor-parallel execution. (We also support dp cross multiple scale units, but that looks not very useful in practice, so we do not document it here.)
+1. **Simulated data parallelism inside one scale unit**: most of the model runs with tensor
+   parallelism (TP), while a slow, non-partitionable module is replicated across the ranks in each
+   scale unit. To avoid redundant computation, its input batch is sharded across those ranks, and
+   the outputs are gathered before the model resumes tensor-parallel execution. The same helpers can
+   span adjacent scale units when `num_scale_units > 1`; this guide focuses on the common
+   single-unit case, while `test_dp_across_scale_units` covers the extension.
 
-2. **Context parallelism across scale units with expert parallelism inside each plan**: `plan_ngpus` remains small enough to partition expert weights sensibly, while several scale units cooperate on one long sequence.
+2. **Context parallelism across scale units with expert parallelism inside each plan**: `plan_ngpus`
+   remains small enough to partition expert weights sensibly, while several scale units cooperate on
+   one long sequence.
 
 Runnable references:
 
@@ -14,13 +22,20 @@ Runnable references:
 - `tests/cli/test_cp_ep.py`
 - `tests/cli/trainer_args_cp_ep.yaml`
 
-This document assumes basic PyTorch knowledge. It explains the nnScaler-specific pieces from the beginning: rank topology, dataset sampling, trace inputs, custom Autograd boundaries, policies, parameter reducers, and validation.
+Reusable topology, differentiable communication, and reducer-configuration helpers live in
+`nnscaler.cli.scale_unit_parallelism`. Application code should import these helpers instead of
+copying the test implementations.
+
+This document assumes basic PyTorch knowledge. It explains the nnScaler-specific pieces from the
+beginning: rank topology, dataset sampling, trace inputs, custom Autograd boundaries, policies,
+parameter reducers, and validation.
 
 ## 1. Concepts You Need First
 
 ### 1.1 `plan_ngpus`, `runtime_ngpus`, and scale units
 
-`plan_ngpus` is the number of GPUs described by one compiled nnScaler plan. `runtime_ngpus` must be divisible by `plan_ngpus`. nnScaler then repeats the plan across scale units:
+`plan_ngpus` is the number of GPUs described by one compiled nnScaler plan. `runtime_ngpus` must be
+divisible by `plan_ngpus`. nnScaler then repeats the plan across scale units:
 
 ```text
 num_scale_units = runtime_ngpus // plan_ngpus
@@ -41,15 +56,20 @@ produces this layout:
 | 0 | `[0, 1]` |
 | 1 | `[2, 3]` |
 
-The same two-device plan runs in both units. Plan device 0 expands to global ranks `[0, 2]`, and plan device 1 expands to global ranks `[1, 3]`.
+The same two-device plan runs in both units. Plan device 0 expands to global ranks `[0, 2]`, and
+plan device 1 expands to global ranks `[1, 3]`.
 
 ## 2. Pattern One: Simulated DP Inside a Scale Unit
 
 ### 2.1 When to use it
 
-Assume most of a model works well with TP, but one submodule is unsuitable for partitioning because it has dynamic shapes, complex control flow, or an unsupported implementation. Replicating that submodule normally makes every rank in a scale unit repeat the same expensive work.
+Assume most of a model works well with TP, but one submodule is unsuitable for partitioning because
+it has dynamic shapes, complex control flow, or an unsupported implementation. Replicating that
+submodule normally makes every rank in a scale unit repeat the same expensive work.
 
-In this pattern, custom Autograd Functions shard and gather the batch only around the slow module. The nnScaler policy continues to describe TP partitioning for the surrounding modules and leaves the slow custom operator replicated.
+In this pattern, custom Autograd Functions shard and gather the batch only around the slow module.
+The nnScaler policy continues to describe TP partitioning for the surrounding modules and leaves the
+slow custom operator replicated.
 
 The desired model flow is:
 
@@ -83,12 +103,15 @@ For `plan_ngpus=2` and `runtime_ngpus=4`, this distributes data by scale unit:
 
 Important properties:
 
-- ranks 0 and 1 use the same sampler stream and therefore receive the same sample indices and batch contents;
+- ranks 0 and 1 use the same sampler stream and therefore receive the same sample indices and batch
+  contents;
 - ranks 2 and 3 use another shared sampler stream;
 - A and B are different portions of the global training batch;
 - no custom sampler is required for this pattern.
 
-In the reference test, `shuffle: false`, dataset size is 8, and `micro_batch_size` is 4. The first step therefore maps samples `[0,1,2,3]` to ranks 0/1 and samples `[4,5,6,7]` to ranks 2/3. With shuffling enabled, rely on sampler-stream equality rather than fixed indices.
+In the reference test, `shuffle: false`, dataset size is 8, and `micro_batch_size` is 4. The first
+step therefore maps samples `[0,1,2,3]` to ranks 0/1 and samples `[4,5,6,7]` to ranks 2/3. With
+shuffling enabled, rely on sampler-stream equality rather than fixed indices.
 
 For example:
 
@@ -97,7 +120,8 @@ micro_batch_size: 4
 global_batch_size: 8
 ```
 
-Each scale unit receives four samples. After the manual split, each slow-module replica processes two samples.
+Each scale unit receives four samples. After the manual split, each slow-module replica processes
+two samples.
 
 Trainer uses this consistency rule:
 
@@ -124,26 +148,35 @@ The reasons are:
 2. the custom chunk operator's fake function describes the rank-local output `[2, S, H]`;
 3. nnScaler needs both layouts to construct correct forward and backward IR.
 
-This custom boundary performs an equal `torch.chunk`, so the traced batch dimension must be divisible by the chunk group size. This is a requirement of this implementation, not a general nnScaler tracing rule.
+This custom boundary performs an equal `torch.chunk`, so the traced batch dimension must be
+divisible by the chunk group size. This is a requirement of this implementation, not a general
+nnScaler tracing rule.
 
 #### Variant: the slow module is first
 
-If the slow module is the first model operation, the dataloader can provide its batch shards directly. In the reference `dp_sharded` mode:
+If the slow module is the first model operation, the dataloader can provide its batch shards
+directly. In the reference `dp_sharded` mode:
 
 - every rank receives a disjoint slice of its scale unit's sampler batch;
 - `micro_batch_size=4` remains the logical batch seen by one scale unit;
-- each runtime dataloader yields `4 / plan_ngpus = 2` samples per rank, and gathering those slices reconstructs the original scale-unit batch in order;
+- each runtime dataloader yields `4 / plan_ngpus = 2` samples per rank, and gathering those slices
+  reconstructs the original scale-unit batch in order;
 - `dummy_sample_gen_fn` supplies the same rank-local shape `[2,S,H]` for tracing;
 - the slow module therefore traces and executes with `[2,S,H]`;
 - a scale-unit all-gather after the slow module restores `[4,S,H]` before TP begins.
 
-No entry collective or runtime chunk is needed. The exit wrapper uses the standard all-gather `fake_fn`, which expands the traced rank-local batch from `[2,S,H]` to the logical `[4,S,H]` shape.
+No entry collective or runtime chunk is needed. The exit wrapper uses the standard all-gather
+`fake_fn`, which expands the traced rank-local batch from `[2,S,H]` to the logical `[4,S,H]` shape.
 
-The reducer settings are otherwise the same as the standard pattern: enable `reducer_replicated_params`, isolate the slow parameters with `param_clss_fn`, and set their bucket's `reducer_nreplicas=1`. The reference test verifies that these parameters use the all-rank reducer while preserving the sum of complementary rank-local gradients.
+The reducer settings are otherwise the same as the standard pattern: enable
+`reducer_replicated_params`, isolate the slow parameters with `param_clss_fn`, and set their
+bucket's `reducer_nreplicas=1`. The reference test verifies that these parameters use the all-rank
+reducer while preserving the sum of complementary rank-local gradients.
 
 ### 2.4 Create the scale-unit communication groups
 
-The custom operators call collectives directly. Create every required process group on every rank, in the same order, before model execution:
+The custom operators call collectives directly. Create every required process group on every rank,
+in the same order, before model execution:
 
 ```python
 from nnscaler.runtime.device import DeviceGroup
@@ -151,13 +184,14 @@ from nnscaler.runtime.device import DeviceGroup
 
 def init_scale_unit_groups(trainer):
     cfg = trainer.train_args.compute_config
-    group_size = cfg.plan_ngpus
+    num_scale_units = trainer.train_args.model.args.get('num_scale_units', 1)
+    group_size = cfg.plan_ngpus * num_scale_units
     world_size = torch.distributed.get_world_size()
 
     if world_size != cfg.runtime_ngpus:
         raise ValueError("world size and runtime_ngpus do not match")
     if world_size % group_size:
-        raise ValueError("runtime_ngpus must be divisible by plan_ngpus")
+        raise ValueError("runtime_ngpus must be divisible by DP group size")
 
     for first_rank in range(0, world_size, group_size):
         ranks = tuple(range(first_rank, first_rank + group_size))
@@ -170,17 +204,23 @@ Reference it from Trainer YAML:
 init_env_fn: your_module.init_scale_unit_groups
 ```
 
-For `plan=2, runtime=4`, this creates `[0, 1]` and `[2, 3]`.
+For `plan=2`, `runtime=4`, and `num_scale_units=1`, this creates `[0, 1]` and `[2, 3]`. Setting
+`num_scale_units=2` creates the single group `[0, 1, 2, 3]` instead.
 
-Note: generally nnscaler has already created the plan-level process groups for TP. We have this manual initializer just for safety.
+nnScaler generally creates the plan-level groups needed by TP, but cross-scale groups are
+application-defined. Keep the explicit initializer so custom collectives never depend on ranks
+lazily creating different subgroups in different orders.
 
 ### 2.5 Find the current scale-unit ranks
 
 ```python
-def scale_unit_ranks(group_size):
-    rank = torch.distributed.get_rank()
-    first_rank = rank // group_size * group_size
-    return tuple(range(first_rank, first_rank + group_size))
+from nnscaler.cli.scale_unit_parallelism import dp_scale_unit_ranks
+
+
+ranks = dp_scale_unit_ranks(
+    plan_ngpus=2,
+    num_scale_units=1,
+)
 ```
 
 Examples:
@@ -190,18 +230,22 @@ rank 0 or 1 -> [0, 1]
 rank 2 or 3 -> [2, 3]
 ```
 
+At runtime, the helper uses the current distributed rank. Its optional `rank` argument is useful for
+static topology checks. The DP group size is `plan_ngpus * num_scale_units`; keep
+`num_scale_units=1` for the pattern in this section.
+
 ### 2.6 Entry boundary: chunk forward, all-gather backward
 
 ```python
-class ScaleUnitChunk(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx, x, group_size):
-        ctx.ranks = scale_unit_ranks(group_size)
-        return chunk(x, dim=0, ranks=ctx.ranks)
+from nnscaler.cli.scale_unit_parallelism import dp_scale_unit_chunk
 
-    @staticmethod
-    def backward(ctx, grad):
-        return all_gather(grad, dim=0, ranks=ctx.ranks), None
+
+x = dp_scale_unit_chunk(
+    x,
+    plan_ngpus=self.scale_unit_size,
+    num_scale_units=1,
+    dim=0,
+)
 ```
 
 Forward behavior for microbatch A:
@@ -211,92 +255,96 @@ rank 0: A[0:2]
 rank 1: A[2:4]
 ```
 
-Backward must all-gather because the pre-module consumed the complete batch before the boundary. It therefore expects the complete input gradient.
+`dp_scale_unit_chunk` is differentiable: forward selects the current rank's equal chunk, while
+backward all-gathers those gradients. Backward must gather because the pre-module consumed the
+complete batch before the boundary and therefore expects the complete input gradient.
 
 ### 2.7 Exit boundary: all-gather forward, chunk backward
 
 ```python
-class ScaleUnitAllGather(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx, x, group_size):
-        ctx.ranks = scale_unit_ranks(group_size)
-        return all_gather(x, dim=0, ranks=ctx.ranks)
+from nnscaler.cli.scale_unit_parallelism import dp_scale_unit_all_gather
 
-    @staticmethod
-    def backward(ctx, grad):
-        return chunk(grad, dim=0, ranks=ctx.ranks), None
+
+x = dp_scale_unit_all_gather(
+    x,
+    plan_ngpus=self.scale_unit_size,
+    num_scale_units=1,
+    dim=0,
+)
 ```
 
-Forward gathers the slow-module outputs back into the complete batch.
+Forward gathers the slow-module outputs back into the complete batch; backward selects the matching
+rank-local gradient chunk.
 
-The registered output of `scale_unit_all_gather` is a replicated full tensor. nnScaler therefore adapts every downstream gradient back to that full layout before invoking `ScaleUnitAllGather.backward`. Once its preconditions hold, the backward `chunk` is correct regardless of the downstream TP layout.
+The registered output of `dp_scale_unit_all_gather` is a replicated full tensor. nnScaler therefore
+adapts every downstream gradient back to that full layout before invoking the helper's backward
+operation. Once its preconditions hold, the backward `chunk` is correct regardless of the downstream
+TP layout.
 
-For example, the reference post linear is partitioned over output features. Each TP rank computes only one contribution to the gradient of the replicated linear input:
+For example, the reference post linear is partitioned over output features. Each TP rank computes
+only one contribution to the gradient of the replicated linear input:
 
 ```text
 full input gradient = sum(rank-local input-gradient contributions)
 ```
 
-nnScaler consequently inserts `identity_allreduce`: its forward is identity, and its backward performs that sum. `ScaleUnitAllGather.backward` then receives the complete gradient and selects the batch shard belonging to the current rank. If the post linear is replicated instead, its local input gradient is already complete and nnScaler inserts no adapter at this boundary. Other TP layouts may require a different adapter, but the gradient delivered to `ScaleUnitAllGather.backward` must still match its replicated full output.
+nnScaler consequently inserts `identity_allreduce`: its forward is identity, and its backward
+performs that sum. The all-gather helper's backward then receives the complete gradient and selects
+the batch shard belonging to the current rank. If the post linear is replicated instead, its local
+input gradient is already complete and nnScaler inserts no adapter at this boundary. Other TP
+layouts may require a different adapter, but the gradient delivered to the helper's backward must
+still match its replicated full output.
 
-Do not manually add another all-reduce at this boundary. That would reduce the gradient twice in layouts where nnScaler already generated the reduction.
+Do not manually add another all-reduce at this boundary. That would reduce the gradient twice in
+layouts where nnScaler already generated the reduction.
 
-`ScaleUnitAllGather` itself is not valid for uneven or ragged batch shards. For example, suppose data-dependent filtering leaves rank 0 with output shape `[1,S,H]` and rank 1 with `[2,S,H]`. The runtime `all_gather` expects equal local shapes, the registered annotation assumes an output batch of `group_size * b`, and backward cannot recover the shards with equal `chunk`. Such a module needs a variable-size gather with saved per-rank offsets, plus a backward operation that slices using those offsets.
+`dp_scale_unit_all_gather` is not valid for uneven or ragged batch shards. For example, suppose
+data-dependent filtering leaves rank 0 with output shape `[1,S,H]` and rank 1 with `[2,S,H]`. The
+runtime `all_gather` expects equal local shapes, and backward cannot recover the shards with equal
+`chunk`. Such a module needs a variable-size gather with saved per-rank offsets, plus a backward
+operation that slices using those offsets.
 
-### 2.8 Register communication wrappers with fake functions
+### 2.8 Registered communication helpers and opaque fake functions
 
-Distributed communication cannot run during tracing. Register plain wrapper functions and provide lightweight `fake_fn` implementations:
+Distributed communication cannot run during tracing. The public `dp_scale_unit_chunk` and
+`dp_scale_unit_all_gather` functions are already registered nnScaler operations with fake
+implementations that compute their output shapes without communicating. Do not register another
+wrapper around them.
 
-```python
-def fake_chunk(x, group_size):
-    if x.shape[0] % group_size:
-        raise ValueError("batch size must be divisible by group_size")
-    return x.chunk(group_size, dim=0)[0]
-
-
-def fake_all_gather(x, group_size):
-    return torch.cat([x] * group_size, dim=0)
-
-
-@nnscaler.register_op(
-    '(group_size b) s^ h^ -> b s^ h^',
-    fake_fn=fake_chunk,
-)
-def scale_unit_chunk(x, group_size):
-    return ScaleUnitChunk.apply(x, group_size)
-
-
-@nnscaler.register_op(
-    'b s^ h^ -> (group_size b) s^ h^',
-    fake_fn=fake_all_gather,
-)
-def scale_unit_all_gather(x, group_size):
-    return ScaleUnitAllGather.apply(x, group_size)
-```
-
-The fake function need not reproduce runtime values or communication, but it must preserve output metadata:
+You still need a fake function for the opaque slow operation itself. It need not reproduce runtime
+values, but it must preserve output metadata:
 
 - output shape;
 - output dtype;
 - output `requires_grad` state.
 
-If the activation input already requires gradients, cloning it preserves the required output metadata:
+If the activation input already requires gradients, cloning it preserves the required output
+metadata:
 
 ```python
 def fake_slow_block(x, *weights):
     return x.clone()
 ```
 
-At model entry, dataloader tensors normally do not require gradients. For a registered opaque operation with trainable weight inputs, return a fresh tensor whose `requires_grad` flag is set when it is created:
+At model entry, dataloader tensors normally do not require gradients. For a registered opaque
+operation with trainable weight inputs, return a fresh tensor whose `requires_grad` flag is set when
+it is created:
 
 ```python
 def fake_slow_block(x, *weights):
     return torch.randn_like(x, requires_grad=True)
 ```
 
-The fake values themselves are irrelevant. Because the weights are explicit registered-op inputs, marking the output differentiable is sufficient for nnScaler to create their gradient metadata and reducers. Do not set `requires_grad=True` on an existing non-leaf `x.clone()` result; PyTorch rejects changing that flag on non-leaf tensors. If the fake output has `requires_grad=False`, backward IR stops at the opaque operator and the required reducers or activation-gradient adapters are not generated.
+The fake values themselves are irrelevant. Because the weights are explicit registered-op inputs,
+marking the output differentiable is sufficient for nnScaler to create their gradient metadata and
+reducers. Do not set `requires_grad=True` on an existing non-leaf `x.clone()` result; PyTorch
+rejects changing that flag on non-leaf tensors. If the fake output has `requires_grad=False`,
+backward IR stops at the opaque operator and the required reducers or activation-gradient adapters
+are not generated.
 
-Register a module-level callable wrapper. If the operation uses module parameters, pass their tensors explicitly as operator arguments; the registered callable itself is not a parameter-owning `nn.Module`. See `tests/cli/test_simulated_dp.py`.
+Register a module-level callable wrapper. If the operation uses module parameters, pass their
+tensors explicitly as operator arguments; the registered callable itself is not a parameter-owning
+`nn.Module`. See `tests/cli/test_simulated_dp.py`.
 
 ### 2.9 Place the boundaries around only the slow region
 
@@ -304,19 +352,31 @@ Register a module-level callable wrapper. If the operation uses module parameter
 def forward(self, data):
     x = self.pre(data['data'])
 
-    x = scale_unit_chunk(x, group_size=self.scale_unit_size)
+    x = dp_scale_unit_chunk(
+        x,
+        plan_ngpus=self.scale_unit_size,
+        num_scale_units=1,
+        dim=0,
+    )
     x = self.dynamic_block(x)
-    x = scale_unit_all_gather(x, group_size=self.scale_unit_size)
+    x = dp_scale_unit_all_gather(
+        x,
+        plan_ngpus=self.scale_unit_size,
+        num_scale_units=1,
+        dim=0,
+    )
 
     output = self.post(x)
     return loss_fn(output, data['target'])
 ```
 
-The pre- and post-modules remain under the normal TP policy. Only the opaque slow region is enclosed by the manual boundaries.
+The pre- and post-modules remain under the normal TP policy. Only the opaque slow region is enclosed
+by the manual boundaries.
 
 ### 2.10 Do not partition the slow module in the policy
 
-The slow module must remain opaque and fully replicated. A policy can still partition the surrounding modules:
+The slow module must remain opaque and fully replicated. A policy can still partition the
+surrounding modules:
 
 ```python
 def policy(graph, cfg):
@@ -335,7 +395,9 @@ Do not return a partitioned `OpPlan` for the slow custom operator.
 
 The slow-module parameters are complete replicas on every rank.
 
-In ordinary replicated execution, ranks inside a scale unit see the same batch, so their parameter gradients are duplicates. In simulated DP, those ranks see complementary batch shards, so their gradients are complementary contributions that must be summed.
+In ordinary replicated execution, ranks inside a scale unit see the same batch, so their parameter
+gradients are duplicates. In simulated DP, those ranks see complementary batch shards, so their
+gradients are complementary contributions that must be summed.
 
 Enable reducers for replicated parameters:
 
@@ -344,24 +406,32 @@ compute_config:
   reducer_replicated_params: true
 ```
 
-Classify all slow-module parameters into a separate bucket and override its post-reduction divisor:
+Classify all slow-module parameters into a separate bucket and override its post-reduction divisor
+with the public helper:
 
 ```python
-from nnscaler.runtime.adapter.reducer import ParamBucketConfig
+from nnscaler.cli.scale_unit_parallelism import dp_scale_unit_param_config
 
 
-def param_clss_fn(parameter_fqn):
+def param_clss_fn(trainer_args, parameter_fqn):
     if parameter_fqn.startswith('dynamic_block.'):
-        return ParamBucketConfig(reducer_nreplicas=1)
-    return ParamBucketConfig()
+        return dp_scale_unit_param_config(trainer_args)
+    return {}
 ```
 
-`reducer_nreplicas` is the divisor applied after the bucket's gradient collective. With a SUM reducer:
+Trainer accepts either `(parameter_fqn)` or `(trainer_args, parameter_fqn)` classifiers.
+`dp_scale_unit_param_config` is designed for the two-argument form and returns a
+`ParamBucketConfig`-compatible mapping with `reducer_nreplicas=1`.
+
+`reducer_nreplicas` is the divisor applied after the bucket's gradient collective. With a SUM
+reducer:
 
 - `1` preserves the sum of complementary batch-shard gradients;
 - `plan_ngpus` averages duplicate gradients from normal replicated execution.
 
-It does not change reducer ranks or collective type. Values greater than one require SUM reduction semantics. Distinct resolved `ParamBucketConfig` values force parameters into different buckets, preventing normal replicated parameters from sharing the simulated-DP divisor.
+It does not change reducer ranks or collective type. Values greater than one require SUM reduction
+semantics. Distinct resolved bucket configurations force parameters into different buckets,
+preventing normal replicated parameters from sharing the simulated-DP divisor.
 
 Trainer YAML:
 
@@ -375,7 +445,8 @@ optimizer:
 
 ### 2.12 Minimal Trainer configuration
 
-The model, policy, group initializer, and parameter classifier must be importable by fully qualified name:
+The model, policy, group initializer, and parameter classifier must be importable by fully qualified
+name:
 
 ```yaml
 compute_config:
@@ -402,7 +473,8 @@ optimizer:
         lr: 0.001
 ```
 
-Dataset and dataloader settings remain model-specific. The default Trainer sampler is intentional for this pattern.
+Dataset and dataloader settings remain model-specific. The default Trainer sampler is intentional
+for this pattern.
 
 ### 2.13 Simulated-DP checklist
 
@@ -414,14 +486,18 @@ Dataset and dataloader settings remain model-specific. The default Trainer sampl
 - [ ] Every fake output preserves `requires_grad`.
 - [ ] Slow-module parameters are complete replicas.
 - [ ] Slow parameters occupy buckets with `reducer_nreplicas=1`.
-- [ ] Generated forward/backward code has the expected adapter direction and communication ranks between the output gather and downstream TP.
-- [ ] Multi-step model and optimizer checkpoints match an unsharded baseline within an appropriate floating-point tolerance.
+- [ ] Generated forward/backward code has the expected adapter direction and communication ranks
+      between the output gather and downstream TP.
+- [ ] Multi-step model and optimizer checkpoints match an unsharded baseline within an appropriate
+      floating-point tolerance.
 
 ## 3. Pattern Two: CP Across Scale Units with EP Inside Each Plan
 
 ### 3.1 Target topology
 
-In this pattern, custom Autograd Functions split and gather sequence shards across scale units. Within each plan, `TransformRule` and `OpPlan` describe the paired sequence and expert-weight partition used by the EP operator.
+In this pattern, custom Autograd Functions split and gather sequence shards across scale units.
+Within each plan, `TransformRule` and `OpPlan` describe the paired sequence and expert-weight
+partition used by the EP operator.
 
 The reference files exercise two related topologies:
 
@@ -439,7 +515,9 @@ CP = 4
 runtime_ngpus = 8
 ```
 
-CP and EP reuse ranks in this design. This is not an orthogonal `CP x EP = 8` mesh. `context_parallel_size` means the number of ranks that cooperate on one logical input, independent of the total runtime world size.
+CP and EP reuse ranks in this design. This is not an orthogonal `CP x EP = 8` mesh.
+`context_parallel_size` means the number of ranks that cooperate on one logical input, independent
+of the total runtime world size.
 
 Every four contiguous ranks cooperate on one input:
 
@@ -461,9 +539,14 @@ Within each CP group, the sequence is ultimately split four ways:
 | 6 | Third quarter of B | experts `[0:2]` |
 | 7 | Fourth quarter of B | experts `[2:4]` |
 
-Weights are partitioned only two ways by EP, while sequence activations are partitioned four ways by CP. This prevents expert weights from being split as finely as `runtime_ngpus`.
+Weights are partitioned only two ways by EP, while sequence activations are partitioned four ways by
+CP. This prevents expert weights from being split as finely as `runtime_ngpus`.
 
-The live `runtime_ngpus=4` test has only the first CP group. All four ranks cooperate on one input stream. The eight-rank topology is always checked by a CPU static compile test that verifies both independent CP groups, generated shapes, expert slices, and reducer groups. When eight GPUs are available, a separate live test executes its collectives and compares training checkpoints with the unsharded baseline.
+The live `runtime_ngpus=4` test has only the first CP group. All four ranks cooperate on one input
+stream. The eight-rank topology is always checked by a CPU static compile test that verifies both
+independent CP groups, generated shapes, expert slices, and reducer groups. When eight GPUs are
+available, a separate live test executes its collectives and compares training checkpoints with the
+unsharded baseline.
 
 ### 3.2 What each rank reads from the dataset
 
@@ -508,9 +591,12 @@ self.sampler = torch.utils.data.DistributedSampler(
 )
 ```
 
-Do not use Trainer's default sampler for this pattern. The default sampler gives every scale unit different data, so two units cannot cooperate on the same long sequence.
+Do not use Trainer's default sampler for this pattern. The default sampler gives every scale unit
+different data, so two units cannot cooperate on the same long sequence.
 
-For the live `runtime=4` test there are only two scale units, both in the same CP group. The inner `DistributedSampler` therefore has one replica, and both scale units read the same sample stream. For `runtime=8`, scale units 0/1 map to CP sampler replica 0 and scale units 2/3 map to replica 1.
+For the live `runtime=4` test there are only two scale units, both in the same CP group. The inner
+`DistributedSampler` therefore has one replica, and both scale units read the same sample stream.
+For `runtime=8`, scale units 0/1 map to CP sampler replica 0 and scale units 2/3 map to replica 1.
 
 ### 3.3 What the trace input must look like
 
@@ -536,7 +622,8 @@ Outer cross-scale chunk                  [B,  64, H]
 EP TransformRule sequence partition      [B,  32, H]
 ```
 
-The outer fake chunk divides by `CP / EP`, which is the number of scale units cooperating on one CP input. The plan-level EP transform then divides by `EP`. Together they produce `S / CP`.
+The outer fake chunk divides by `CP / EP`, which is the number of scale units cooperating on one CP
+input. The plan-level EP transform then divides by `EP`. Together they produce `S / CP`.
 
 ### 3.4 Required process groups
 
@@ -579,9 +666,25 @@ experts [0:2] -> [0,2,4,6]
 experts [2:4] -> [1,3,5,7]
 ```
 
-These span all data replicas that own the same expert-weight shard. They are generated by nnScaler's reducer setup; they are not created by the manual group-initialization loop used for the custom collectives.
+These span all data replicas that own the same expert-weight shard. They are generated by nnScaler's
+reducer setup; they are not created by the manual group-initialization loop used for the custom
+collectives.
 
 Every manually created process group must be created by all ranks in the same deterministic order.
+
+The public topology helpers return the two group shapes used by custom CP operations:
+
+```python
+from nnscaler.cli.scale_unit_parallelism import (
+    ep_scale_unit_lane_ranks,
+    ep_scale_unit_ranks,
+)
+
+
+assert ep_scale_unit_ranks(2, 2, rank=0) == (0, 1, 2, 3)
+assert ep_scale_unit_lane_ranks(2, 2, rank=0) == (0, 2)
+assert ep_scale_unit_lane_ranks(2, 2, rank=1) == (1, 3)
+```
 
 A minimal initializer is:
 
@@ -624,14 +727,16 @@ nnScaler initializes reducer groups separately from the generated weight layout.
 
 ### 3.5 Outer cross-unit sequence boundaries
 
-The entry boundary does not immediately split on the complete four-rank CP group. It first splits between scale units at the same EP lane:
+The entry boundary does not immediately split on the complete four-rank CP group. It first splits
+between scale units at the same EP lane:
 
 ```text
 [0,2]: input A -> rank 0 first half, rank 2 second half
 [1,3]: input A -> rank 1 first half, rank 3 second half
 ```
 
-The EP policy then partitions each half again inside `[0,1]` and `[2,3]`, yielding four sequence quarters.
+The EP policy then partitions each half again inside `[0,1]` and `[2,3]`, yielding four sequence
+quarters.
 
 The custom Autograd semantics are:
 
@@ -640,7 +745,41 @@ Entry: forward chunk(sequence), backward all-gather(sequence)
 Exit:  forward all-gather(sequence), backward chunk(sequence)
 ```
 
-In the reference policy, nnScaler first reconciles the plan-level EP output layout for the scale-unit-local consumer. The manual all-gather then combines the two scale-unit halves into the complete sequence. The exact nnScaler adapter is layout-dependent; inspect generated code if the surrounding policy changes.
+Use the public lane-aware helpers at the model boundary:
+
+```python
+from nnscaler.cli.scale_unit_parallelism import (
+    ep_scale_unit_all_gather,
+    ep_scale_unit_chunk,
+)
+
+
+num_scale_units = context_parallel_size // expert_parallel_size
+x = ep_scale_unit_chunk(
+    x,
+    plan_ngpus=expert_parallel_size,
+    num_scale_units=num_scale_units,
+    dim=1,
+)
+
+# Run the context/expert region while the sequence is partitioned.
+
+x = ep_scale_unit_all_gather(
+    x,
+    plan_ngpus=expert_parallel_size,
+    num_scale_units=num_scale_units,
+    dim=1,
+)
+```
+
+Both helpers communicate among the ranks returned by `ep_scale_unit_lane_ranks`. Use
+`ep_scale_unit_ranks` when an operation, such as the reference context mix, must communicate across
+the complete contiguous CP group instead.
+
+In the reference policy, nnScaler first reconciles the plan-level EP output layout for the
+scale-unit-local consumer. The manual all-gather then combines the two scale-unit halves into the
+complete sequence. The exact nnScaler adapter is layout-dependent; inspect generated code if the
+surrounding policy changes.
 
 ### 3.6 The custom EP operator must partition sequence and experts together
 
@@ -668,7 +807,8 @@ def policy(graph, cfg):
             yield OpPlan(node, partition=OpPartition(input=1, dim=0))
 ```
 
-When the runtime custom operator is called, nnScaler has already partitioned both the activation sequence and expert weights. The operator must not split sequence again.
+When the runtime custom operator is called, nnScaler has already partitioned both the activation
+sequence and expert weights. The operator must not split sequence again.
 
 ### 3.7 EP dispatch, local expert computation, and combine
 
@@ -701,18 +841,22 @@ The implementation then performs these steps:
 8. Run a second all-to-all to return outputs to their source ranks.
 9. Recover the original rank-local token-block order.
 
-The test omits a real router. It assumes consecutive token blocks are already ordered by destination expert. A real MoE must:
+The test omits a real router. It assumes consecutive token blocks are already ordered by destination
+expert. A real MoE must:
 
 - compute expert assignments;
 - permute tokens by destination expert;
 - communicate variable split sizes when routing is uneven;
 - perform the inverse permutation after combine.
 
-The `nnscaler.runtime.adapter.nn.alltoall_alltoall` operation used by the test has an autograd implementation whose backward performs the inverse exchange. Do not assume an arbitrary raw all-to-all API is differentiable.
+The `nnscaler.runtime.adapter.nn.alltoall_alltoall` operation used by the test has an autograd
+implementation whose backward performs the inverse exchange. Do not assume an arbitrary raw
+all-to-all API is differentiable.
 
 ### 3.8 Simulating a globally context-dependent attention operation
 
-`GlobalContextMix` is not an attention implementation. It keeps only the properties relevant to CP testing:
+`GlobalContextMix` is not an attention implementation. It keeps only the properties relevant to CP
+testing:
 
 - every local output depends on the complete sequence;
 - forward requires communication over one CP group;
@@ -726,17 +870,26 @@ output = local_x + global_sum(local_x) / (
 )
 ```
 
-The communication group is `[0,1,2,3]` for input A or `[4,5,6,7]` for input B. Independent inputs never communicate with one another.
+The communication group is `[0,1,2,3]` for input A or `[4,5,6,7]` for input B. Independent inputs
+never communicate with one another.
 
-The non-CP baseline deliberately skips the outer sequence chunk. The custom sampler still gives every scale unit inside the CP group the same complete input. After the plan-level EP sequence split, the two scale units hold duplicate EP shards, so the context sum contains two copies and the denominator uses `context_replicas=2`.
+The non-CP baseline deliberately skips the outer sequence chunk. The custom sampler still gives
+every scale unit inside the CP group the same complete input. After the plan-level EP sequence
+split, the two scale units hold duplicate EP shards, so the context sum contains two copies and the
+denominator uses `context_replicas=2`.
 
-This baseline interpretation depends on the sampler invariant. It is valid in the live `runtime=4` test because both scale units belong to the single CP group and map to the same sampler replica. If the sampler gives those units different data, `context_replicas=2` is incorrect.
+This baseline interpretation depends on the sampler invariant. It is valid in the live `runtime=4`
+test because both scale units belong to the single CP group and map to the same sampler replica. If
+the sampler gives those units different data, `context_replicas=2` is incorrect.
 
-Replace this toy operation with ring attention, zigzag attention, or another CP-aware attention implementation in a real model. The outer sequence boundaries, sampler, and reducer design remain applicable.
+Replace this toy operation with ring attention, zigzag attention, or another CP-aware attention
+implementation in a real model. The outer sequence boundaries, sampler, and reducer design remain
+applicable.
 
 ### 3.9 Why the residual temporarily restores a larger sequence shard
 
-You do not need to add communication for correctness; nnScaler generates the required adapters. This section matters only when optimizing communication or activation memory.
+You do not need to add communication for correctness; nnScaler generates the required adapters. This
+section matters only when optimizing communication or activation memory.
 
 Consider one reference block:
 
@@ -744,7 +897,8 @@ Consider one reference block:
 output = x + routed_expert(x, ...)
 ```
 
-After the outer cross-scale chunk, each scale unit holds half of the sequence, so `x` has shape `[B, 64, H]`. The two branches then use different layouts:
+After the outer cross-scale chunk, each scale unit holds half of the sequence, so `x` has shape
+`[B, 64, H]`. The two branches then use different layouts:
 
 ```text
                             residual branch: x [B, 64, H]
@@ -757,26 +911,50 @@ x [B, 64, H]                                                     add [B, 64, H]
                             all-gather       -> [B, 64, H]
 ```
 
-The `routed_expert` transform rule applies only to the expert branch. It splits that branch across the two EP ranks, but the residual branch remains `[B, 64, H]`. Because `torch.add` requires matching layouts, nnScaler gathers the expert output back to `[B, 64, H]` before the addition.
+The `routed_expert` transform rule applies only to the expert branch. It splits that branch across
+the two EP ranks, but the residual branch remains `[B, 64, H]`. Because `torch.add` requires
+matching layouts, nnScaler gathers the expert output back to `[B, 64, H]` before the addition.
 
-The next block repeats the process: its expert branch is split from `64` to `32`, then gathered back to `64` for the residual addition. Thus every `routed_expert` computes on `S/CP=32`, while tensors at residual boundaries use the larger scale-unit-local shape `S/(CP/EP)=64`. The complete global sequence `S=128` is restored only by the final outer all-gather.
+The next block repeats the process: its expert branch is split from `64` to `32`, then gathered
+back to `64` for the residual addition. Thus every `routed_expert` computes on `S/CP=32`, while
+tensors at residual boundaries use the larger scale-unit-local shape `S/(CP/EP)=64`. The complete
+global sequence `S=128` is restored only by the final outer all-gather.
 
-This is correct but adds one gather and one split around each residual boundary. To avoid that overhead, the residual path and addition must also use a compatible `S/CP` partition, or the complete block must be represented by one custom operator whose transform rule preserves that partition.
+This is correct but adds one gather and one split around each residual boundary. To avoid that
+overhead, the residual path and addition must also use a compatible `S/CP` partition, or the
+complete block must be represented by one custom operator whose transform rule preserves that
+partition.
 
 ### 3.10 Weight reducer configuration
 
-CP alone is not a reason to override `reducer_nreplicas`. This value is a structural divisor applied after a bucket's gradient collective: it accounts for identical gradient contributions computed more than once. It does not choose the reducer ranks, and it should not be used to implement the global mean over distinct samples or tokens.
+CP alone is not a reason to override `reducer_nreplicas`. This value is a structural divisor
+applied after a bucket's gradient collective: it accounts for identical gradient contributions
+computed more than once. It does not choose the reducer ranks, and it should not be used to
+implement the global mean over distinct samples or tokens.
 
 Apply the following rule independently to each weight bucket:
 
-- if ranks compute the same weight-shard gradient from the same data and computation, those contributions are duplicates and the post-reduction sum must be divided by the duplicate count;
-- if ranks compute contributions from disjoint samples, sequence shards, or routed tokens, those contributions are complementary and must remain summed at this stage;
-- if nnScaler's generated reducer already represents the plan-level TP or EP layout correctly, inherit its `nreplicas` value instead of overriding it;
-- override the bucket only when manual communication changes the duplicate count in a way that the generated plan cannot express.
+- if ranks compute the same weight-shard gradient from the same data and computation, those
+  contributions are duplicates and the post-reduction sum must be divided by the duplicate count;
+- if ranks compute contributions from disjoint samples, sequence shards, or routed tokens, those
+  contributions are complementary and must remain summed at this stage;
+- if nnScaler's generated reducer already represents the plan-level TP or EP layout correctly,
+  inherit its `nreplicas` value instead of overriding it;
+- override the bucket only when manual communication changes the duplicate count in a way that the
+  generated plan cannot express.
 
-The module type is not the deciding factor. A non-attention weight outside the manually sharded CP region is unaffected and should keep its existing reducer configuration. A non-attention MLP or expert weight inside that region may receive complementary token shards, while an attention implementation may synchronize its own weight gradients internally. Inspect the actual gradient ownership and generated reducer rather than applying one setting to all attention or all non-attention parameters.
+The module type is not the deciding factor. A non-attention weight outside the manually sharded CP
+region is unaffected and should keep its existing reducer configuration. A non-attention MLP or
+expert weight inside that region may receive complementary token shards, while an attention
+implementation may synchronize its own weight gradients internally. Inspect the actual gradient
+ownership and generated reducer rather than applying one setting to all attention or all
+non-attention parameters.
 
-In the reference CP+EP graph, expert weights are partitioned by the plan. nnScaler already generates SUM reducers with `nreplicas=1` for corresponding expert shards, so the CP run does not need a `param_clss_fn` override. For the eight-rank topology, the reducers are:
+In the reference CP+EP graph, expert weights are partitioned by the plan. nnScaler already generates
+SUM reducers with `nreplicas=1` for corresponding expert shards, so the CP run does not need a
+`param_clss_fn` override. `ep_scale_unit_param_config(trainer_args)` returns an empty mapping that
+explicitly preserves those generated settings; it is useful when one shared classifier handles
+multiple modes, but is not required. For the eight-rank topology, the reducers are:
 
 ```text
 experts [0:2] -> ranks [0,2,4,6]
@@ -785,13 +963,15 @@ experts [2:4] -> ranks [1,3,5,7]
 
 For the live four-rank topology, the corresponding groups are `[0,2]` and `[1,3]`.
 
-The test-only non-CP baseline is different: it deliberately repeats one complete input in every scale unit of a CP group. Only that baseline overrides the generated divisor:
+The test-only non-CP baseline is different: it deliberately repeats one complete input in every
+scale unit of a CP group. Only that baseline overrides the generated divisor:
 
 ```text
 reducer_nreplicas = scale_units_per_cp_group = CP / EP
 ```
 
-This averages the deliberately duplicated baseline gradients and exists only for correctness comparison. It is not a general CP or EP setting.
+This averages the deliberately duplicated baseline gradients and exists only for correctness
+comparison. It is not a general CP or EP setting.
 
 ### 3.11 Trainer global-batch accounting
 
@@ -806,13 +986,15 @@ global_batch_size
 
 This counts scale-unit microbatches. It does not directly count unique CP inputs.
 
-When the sampler assigns one unique microbatch to every CP group, the number of unique samples represented in one micro-step is:
+When the sampler assigns one unique microbatch to every CP group, the number of unique samples
+represented in one micro-step is:
 
 ```text
 micro_batch_size * (runtime_ngpus // context_parallel_size)
 ```
 
-This formula is conditional on the sampler invariant; it is not a replacement for Trainer's global-batch validation.
+This formula is conditional on the sampler invariant; it is not a replacement for Trainer's
+global-batch validation.
 
 Several independent settings affect normalization at different stages:
 
@@ -821,9 +1003,14 @@ Several independent settings affect normalization at different stages:
 - Trainer reducer pre-hooks compensate for its scale-factor reduction path;
 - `reducer_nreplicas` divides a reducer bucket after that bucket's collective.
 
-The reference CP run uses `optimizer.grad_reduction: sum` and inherits the generated `nreplicas=1` for EP weight shards. Only its deliberately duplicated non-CP baseline overrides `reducer_nreplicas`.
+The reference CP run uses `optimizer.grad_reduction: sum` and inherits the generated `nreplicas=1`
+for EP weight shards. Only its deliberately duplicated non-CP baseline overrides
+`reducer_nreplicas`.
 
-For a real training job, decide whether the intended loss is a sum or mean over unique samples or tokens. Configure `grad_reduction`, `loss_reduction`, `grad_reduce_divisor`, or a custom `aggregate_outputs_fn` accordingly. Do not assume Trainer's scale-unit count is automatically the desired CP sample denominator.
+For a real training job, decide whether the intended loss is a sum or mean over unique samples or
+tokens. Configure `grad_reduction`, `loss_reduction`, `grad_reduce_divisor`, or a custom
+`aggregate_outputs_fn` accordingly. Do not assume Trainer's scale-unit count is automatically the
+desired CP sample denominator.
 
 ### 3.12 CP+EP configuration constraints
 
@@ -842,7 +1029,10 @@ The fixed-size toy router also requires:
 local_sequence % (EP * local_experts) == 0
 ```
 
-Because `local_experts = num_experts / EP` in this test, this is equivalent to `local_sequence % num_experts == 0`. It is a constraint of the toy equal-block reshape, not a general EP requirement. A real dynamic router should use variable split-size all-to-all and does not need equal token counts per expert.
+Because `local_experts = num_experts / EP` in this test, this is equivalent to
+`local_sequence % num_experts == 0`. It is a constraint of the toy equal-block reshape, not a
+general EP requirement. A real dynamic router should use variable split-size all-to-all and does not
+need equal token counts per expert.
 
 ### 3.13 Minimal Trainer configuration
 
@@ -887,9 +1077,13 @@ dataset_sampler:
         expert_parallel_size: $(compute_config.plan_ngpus)
 ```
 
-`global_batch_size=8` is Trainer's scale-unit accounting value. With this sampler, the number of unique samples in the micro-step is `micro_batch_size * runtime_ngpus / context_parallel_size = 4`. Review Section 3.11 before choosing mean-versus-sum semantics for a production loss.
+`global_batch_size=8` is Trainer's scale-unit accounting value. With this sampler, the number of
+unique samples in the micro-step is `micro_batch_size * runtime_ngpus / context_parallel_size = 4`.
+Review Section 3.11 before choosing mean-versus-sum semantics for a production loss.
 
-EP weights are partitioned by the plan, so nnScaler automatically creates cross-scale reducers for matching shards. Neither `param_clss_fn` nor `reducer_replicated_params` is required for those partitioned expert weights in this CP configuration.
+EP weights are partitioned by the plan, so nnScaler automatically creates cross-scale reducers for
+matching shards. Neither `param_clss_fn` nor `reducer_replicated_params` is required for those
+partitioned expert weights in this CP configuration.
 
 ### 3.14 CP+EP checklist
 
@@ -902,7 +1096,8 @@ EP weights are partitioned by the plan, so nnScaler automatically creates cross-
 - [ ] Runtime EP all-to-all stays inside one scale unit.
 - [ ] Context-dependent communication stays inside one complete CP group.
 - [ ] Expert-shard reducers span all data replicas owning that shard.
-- [ ] Existing reducer divisors are preserved unless manual sharding changes the number of duplicate gradient contributions.
+- [ ] Existing reducer divisors are preserved unless manual sharding changes the number of duplicate
+      gradient contributions.
 - [ ] Static generated-code checks confirm rank-local sequence and weight shapes.
 - [ ] Real multi-GPU execution is tested when enough devices are available.
 
@@ -946,13 +1141,17 @@ Use these rules:
 
 ### 4.4 Results do not match at `1e-8`
 
-Full-batch and sharded GEMMs may use different float32 accumulation orders. Mathematical equivalence does not imply bitwise equality.
+Full-batch and sharded GEMMs may use different float32 accumulation orders. Mathematical equivalence
+does not imply bitwise equality.
 
-The reference test uses `atol=rtol=1e-6` for multi-step checkpoint comparison. Choose tolerances from a reproducible baseline for the model and dtype being tested; do not use a larger tolerance to hide a systematic scaling error.
+The reference test uses `atol=rtol=1e-6` for multi-step checkpoint comparison. Choose tolerances
+from a reproducible baseline for the model and dtype being tested; do not use a larger tolerance to
+hide a systematic scaling error.
 
 ### 4.5 Not enough GPUs to validate a topology
 
-The reference static test combines `load_module=False` with `@replace_all_device_with('cpu')` to generate rank-specific modules without loading or running them on GPUs. It then inspects:
+The reference static test combines `load_module=False` with `@replace_all_device_with('cpu')` to
+generate rank-specific modules without loading or running them on GPUs. It then inspects:
 
 - selected custom-operator input and weight shapes captured from the transformed graph;
 - expert-weight slices on each rank;
@@ -962,26 +1161,39 @@ The reference static test combines `load_module=False` with `@replace_all_device
 
 `tests/cli/test_cp_ep.py::test_cp4_ep2_runtime8_static` demonstrates this workflow.
 
-A compile-only check cannot validate NCCL communication, collective ordering, runtime buffers, or numerical correctness. Run a real distributed test before production deployment.
+A compile-only check cannot validate NCCL communication, collective ordering, runtime buffers, or
+numerical correctness. Run a real distributed test before production deployment.
 
 ## 5. Minimum Validation Procedure
 
 1. **Single-device reference**: verify the original model's forward and backward results.
 2. **One-plan baseline**: run only the original TP or EP policy.
-3. **Enable manual boundaries**: compare forward outputs and the boundary shapes that matter to the new layout.
+3. **Enable manual boundaries**: compare forward outputs and the boundary shapes that matter to the
+   new layout.
 4. **Inspect generated code**: verify adapter direction and communication ranks.
 5. **Inspect reducers**: verify rank groups, bucket membership, and `nreplicas`.
 6. **Train for multiple steps**: compare model and optimizer checkpoints, not only one loss value.
-7. **Add focused gradient checks when needed**: the reference tests compare checkpoint state and selected metadata; they do not compare every intermediate or every parameter gradient directly.
-8. **Expand runtime topology**: compile statically first if hardware is unavailable, then run on the real topology.
+7. **Add focused gradient checks when needed**: the reference tests compare checkpoint state and
+   selected metadata; they do not compare every intermediate or every parameter gradient directly.
+8. **Expand runtime topology**: compile statically first if hardware is unavailable, then run on the
+   real topology.
 
 ## 6. Choosing a Pattern
 
 Use simulated DP inside a scale unit when:
 
-- only one submodule cannot use TP;
-- samples are independent inside that submodule;
-- ranks in one unit should process different batch samples.
+- most of the model benefits from TP, but one expensive region must remain replicated because it has
+    dynamic shapes, unsupported operators, or control flow that is unsuitable for partitioning;
+- the replicated region processes samples independently, so splitting the batch does not change its
+    semantics or require communication inside the region;
+- the chosen batch dimension can be divided into equal rank-local shards, and the region produces
+    equal-shaped outputs that can be gathered before downstream TP resumes;
+- avoiding duplicate computation is worth the entry chunk and exit all-gather cost;
+- the replicated parameters receive complementary gradient contributions, so their reducer bucket
+    can preserve the SUM with `reducer_nreplicas=1`.
+
+Do not use this fixed-size pattern when the region depends on cross-sample state or produces ragged
+rank-local outputs. Those cases require additional synchronization or variable-size collectives.
 
 Use CP across scale units with EP inside the plan when:
 
@@ -992,4 +1204,5 @@ Use CP across scale units with EP inside the plan when:
 
 Both patterns follow the same principle:
 
-> Manually express only the runtime data layout that lies outside the nnScaler plan. Keep weight and activation partitions that fit inside the plan in the nnScaler policy.
+> Manually express only the runtime data layout that lies outside the nnScaler plan. Keep weight and
+> activation partitions that fit inside the plan in the nnScaler policy.
