@@ -7,7 +7,7 @@ import torch.distributed as dist
 import torch.nn.functional as F
 
 import nnscaler
-from nnscaler.cli.scale_unit_dp import (
+from nnscaler.cli.scale_unit_parallelism import (
     inner_scale_unit_all_gather,
     inner_scale_unit_chunk,
     inner_scale_unit_param_config,
@@ -439,14 +439,14 @@ def test_simulated_dp_with_dp_sharded_input(tmp_path):
             gen_savedir,
             LeadingSimulatedDPModel,
             rank,
-            r'nnscaler\.cli\.scale_unit_dp\.inner_scale_unit_all_gather\(',
+            r'nnscaler\.cli\.scale_unit_parallelism\.inner_scale_unit_all_gather\(',
             instance_name='dp_sharded',
         )
         assert not _gencode_contains(
             gen_savedir,
             LeadingSimulatedDPModel,
             rank,
-            r'nnscaler\.cli\.scale_unit_dp\.inner_scale_unit_chunk\(',
+            r'nnscaler\.cli\.scale_unit_parallelism\.inner_scale_unit_chunk\(',
             instance_name='dp_sharded',
         )
 

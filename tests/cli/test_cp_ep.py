@@ -24,7 +24,7 @@ import torch.distributed as dist
 import torch.nn.functional as F
 
 import nnscaler
-from nnscaler.cli.scale_unit_dp import (
+from nnscaler.cli.scale_unit_parallelism import (
     cross_scale_unit_param_config,
     cross_scale_unit_all_gather,
     cross_scale_unit_chunk,
