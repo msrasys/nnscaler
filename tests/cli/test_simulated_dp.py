@@ -8,9 +8,9 @@ import torch.nn.functional as F
 
 import nnscaler
 from nnscaler.cli.scale_unit_parallelism import (
-    inner_scale_unit_all_gather,
-    inner_scale_unit_chunk,
-    inner_scale_unit_param_config,
+    dp_scale_unit_all_gather,
+    dp_scale_unit_chunk,
+    dp_scale_unit_param_config,
 )
 from nnscaler.cli.trainer import Trainer
 from nnscaler.cli.trainer_args import TrainerArgs
@@ -95,21 +95,38 @@ class DynamicShapeSubmodel(torch.nn.Module):
 
 
 class SimulatedDPModel(torch.nn.Module):
-    def __init__(self, hidden_size: int, scale_unit_size: int, use_scale_unit_dp: bool) -> None:
+    def __init__(
+        self,
+        hidden_size: int,
+        scale_unit_size: int,
+        use_scale_unit_dp: bool,
+        num_scale_units: int = 1,
+    ) -> None:
         super().__init__()
         self.pre = ProjectionModule(hidden_size)
         self.dynamic_block = DynamicShapeSubmodel(hidden_size)
         self.post = ProjectionModule(hidden_size)
         self.scale_unit_size = scale_unit_size
         self.use_scale_unit_dp = use_scale_unit_dp
+        self.num_scale_units = num_scale_units
 
     def forward(self, data) -> torch.Tensor:
         x = self.pre(data['data'])
         if self.use_scale_unit_dp:
-            x = inner_scale_unit_chunk(x, plan_ngpus=self.scale_unit_size, dim=0)
+            x = dp_scale_unit_chunk(
+                x,
+                plan_ngpus=self.scale_unit_size,
+                num_scale_units=self.num_scale_units,
+                dim=0,
+            )
         x = self.dynamic_block(x)
         if self.use_scale_unit_dp:
-            x = inner_scale_unit_all_gather(x, plan_ngpus=self.scale_unit_size, dim=0)
+            x = dp_scale_unit_all_gather(
+                x,
+                plan_ngpus=self.scale_unit_size,
+                num_scale_units=self.num_scale_units,
+                dim=0,
+            )
         output = self.post(x)
         return F.mse_loss(output, data['target'])
 
@@ -200,6 +217,20 @@ class ScaleUnitDPShardedSampler(torch.utils.data.DistributedSampler):
         super().__init__(dataset, num_replicas=num_replicas, rank=rank, **kwargs)
 
 
+class ScaleUnitGroupSampler(torch.utils.data.DistributedSampler):
+    """Replay one sampler stream in adjacent scale units of a DP group."""
+
+    def __init__(self, dataset, num_replicas, rank, num_scale_units: int, **kwargs) -> None:
+        if num_replicas % num_scale_units:
+            raise ValueError('number of scale units must be divisible by num_scale_units')
+        super().__init__(
+            dataset,
+            num_replicas=num_replicas // num_scale_units,
+            rank=rank // num_scale_units,
+            **kwargs,
+        )
+
+
 class ScaleUnitDPShardedDataLoader(torch.utils.data.DataLoader):
     """Convert Trainer's logical micro-batch size to a rank-local batch size."""
 
@@ -248,7 +279,12 @@ def dp_sharded_dummy_sample(trainer_args: TrainerArgs):
 class LeadingSimulatedDPModel(torch.nn.Module):
     """Run the opaque block directly on rank-local data at model entry."""
 
-    def __init__(self, hidden_size: int, scale_unit_size: int, dp_sharded: bool) -> None:
+    def __init__(
+        self,
+        hidden_size: int,
+        scale_unit_size: int,
+        dp_sharded: bool,
+    ) -> None:
         super().__init__()
         self.dynamic_block = DynamicShapeSubmodel(hidden_size)
         self.post = ProjectionModule(hidden_size)
@@ -259,8 +295,18 @@ class LeadingSimulatedDPModel(torch.nn.Module):
         x = self.dynamic_block(data['data'])
         target = data['target']
         if self.dp_sharded:
-            x = inner_scale_unit_all_gather(x, plan_ngpus=self.scale_unit_size, dim=0)
-            target = inner_scale_unit_all_gather(target, plan_ngpus=self.scale_unit_size, dim=0)
+            x = dp_scale_unit_all_gather(
+                x,
+                plan_ngpus=self.scale_unit_size,
+                num_scale_units=1,
+                dim=0,
+            )
+            target = dp_scale_unit_all_gather(
+                target,
+                plan_ngpus=self.scale_unit_size,
+                num_scale_units=1,
+                dim=0,
+            )
         output = self.post(x)
         return F.mse_loss(output, target)
 
@@ -277,7 +323,7 @@ def simulated_dp_policy(graph, compute_config: ComputeConfig):
 
 def simulated_dp_param_clss_fn(trainer_args: TrainerArgs, parameter_fqn: str) -> dict:
     if parameter_fqn.startswith('dynamic_block.'):
-        return inner_scale_unit_param_config(trainer_args)
+        return dp_scale_unit_param_config(trainer_args)
     return {}
 
 
@@ -287,8 +333,24 @@ def dp_sharded_simulated_dp_param_clss_fn(
 ) -> dict:
     if parameter_fqn.startswith('dynamic_block.') \
             and trainer_args.get_resolved_var('dp_sharded'):
-        return inner_scale_unit_param_config(trainer_args)
+        return dp_scale_unit_param_config(trainer_args)
     return {}
+
+
+def cross_scale_unit_simulated_dp_param_clss_fn(
+    trainer_args: TrainerArgs,
+    parameter_fqn: str,
+) -> dict:
+    if not parameter_fqn.startswith('dynamic_block.'):
+        return {}
+    if trainer_args.model.args['use_scale_unit_dp']:
+        return dp_scale_unit_param_config(trainer_args)
+    return {
+        'reducer_nreplicas': (
+            trainer_args.compute_config.plan_ngpus
+            * trainer_args.model.args['num_scale_units']
+        ),
+    }
 
 
 def _check_dynamic_block_buckets(
@@ -439,14 +501,14 @@ def test_simulated_dp_with_dp_sharded_input(tmp_path):
             gen_savedir,
             LeadingSimulatedDPModel,
             rank,
-            r'nnscaler\.cli\.scale_unit_parallelism\.inner_scale_unit_all_gather\(',
+            r'nnscaler\.cli\.scale_unit_parallelism\.dp_scale_unit_all_gather\(',
             instance_name='dp_sharded',
         )
         assert not _gencode_contains(
             gen_savedir,
             LeadingSimulatedDPModel,
             rank,
-            r'nnscaler\.cli\.scale_unit_parallelism\.inner_scale_unit_chunk\(',
+            r'nnscaler\.cli\.scale_unit_parallelism\.dp_scale_unit_chunk\(',
             instance_name='dp_sharded',
         )
 
@@ -454,3 +516,56 @@ def test_simulated_dp_with_dp_sharded_input(tmp_path):
     dp_sharded = torch.load(tmp_path / 'dp_sharded.pt', weights_only=False)
     assert_close(baseline['model'], dp_sharded['model'], atol=1e-6, rtol=1e-6)
     assert_close(baseline['optimizer'], dp_sharded['optimizer'], atol=1e-6, rtol=1e-6)
+
+
+def _dp_across_scale_units_worker(save_dir, use_scale_unit_dp: bool):
+    run_name = 'cross_scale_dp' if use_scale_unit_dp else 'cross_scale_baseline'
+    save_dir = Path(save_dir)
+    checkpoint_dir = save_dir / run_name / 'checkpoints'
+    num_scale_units = 2
+    args = [
+        '-f', str(CONFIG_PATH),
+        '--instance_name', run_name,
+        '--model.args.use_scale_unit_dp', str(use_scale_unit_dp),
+        '--model.args.num_scale_units', str(num_scale_units),
+        '--dataset_sampler.type', 'tests.cli.test_simulated_dp.ScaleUnitGroupSampler',
+        '--dataset_sampler.train_args.num_scale_units', str(num_scale_units),
+        '--dataset_sampler.val_args.num_scale_units', str(num_scale_units),
+        '--optimizer.param_clss_fn',
+        'tests.cli.test_simulated_dp.cross_scale_unit_simulated_dp_param_clss_fn',
+        '--gen_savedir', str(save_dir / run_name / 'generated'),
+        '--checkpoint.save_dir', str(checkpoint_dir),
+        '--checkpoint.every_n_train_steps', '50',
+        '--enable_progress_bar', 'false',
+    ]
+
+    trainer = Trainer(args)
+    trainer.run()
+    group_size = trainer.train_args.compute_config.plan_ngpus * num_scale_units
+    _check_dynamic_block_buckets(
+        trainer,
+        expected_nreplicas=1 if use_scale_unit_dp else group_size,
+        expected_ranks=tuple(range(group_size)),
+    )
+
+    if trainer.rank == 0:
+        Trainer.merge_checkpoint(
+            list((checkpoint_dir / 'last').glob('*.ckpt')),
+            save_dir / f'{run_name}.pt',
+        )
+    dist.barrier()
+    return tuple(sorted(_OPAQUE_BATCH_SIZES))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.device_count() < 4, reason='lack of gpu devices')
+def test_dp_across_scale_units(tmp_path):
+    baseline_results = launch_torchrun(4, _dp_across_scale_units_worker, tmp_path, False)
+    dp_results = launch_torchrun(4, _dp_across_scale_units_worker, tmp_path, True)
+
+    assert set(baseline_results.values()) == {(4,)}
+    assert set(dp_results.values()) == {(1,)}
+
+    baseline = torch.load(tmp_path / 'cross_scale_baseline.pt', weights_only=False)
+    simulated = torch.load(tmp_path / 'cross_scale_dp.pt', weights_only=False)
+    assert_close(baseline['model'], simulated['model'], atol=1e-6, rtol=1e-6)
+    assert_close(baseline['optimizer'], simulated['optimizer'], atol=1e-6, rtol=1e-6)

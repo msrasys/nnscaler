@@ -2,7 +2,8 @@
 
 This guide explains two useful parallel patterns that extend nnScaler's normal plan-level parallelism:
 
-1. **Simulated data parallelism inside one scale unit**: most of the model runs with tensor parallelism (TP), while a slow, non-partitionable module is replicated across the ranks in each scale unit. To avoid redundant computation, its input batch is sharded across those ranks, and the outputs are gathered before the model resumes tensor-parallel execution.
+1. **Simulated data parallelism inside one scale unit**: most of the model runs with tensor parallelism (TP), while a slow, non-partitionable module is replicated across the ranks in each scale unit. To avoid redundant computation, its input batch is sharded across those ranks, and the outputs are gathered before the model resumes tensor-parallel execution. (We also support dp cross multiple scale units, but that looks not very useful in practice, so we do not document it here.)
+
 2. **Context parallelism across scale units with expert parallelism inside each plan**: `plan_ngpus` remains small enough to partition expert weights sensibly, while several scale units cooperate on one long sequence.
 
 Runnable references:

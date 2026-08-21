@@ -1,11 +1,65 @@
 #  Copyright (c) Microsoft Corporation.
 #  Licensed under the MIT License.
 
-"""Rank topology and differentiable collectives for nnScaler scale units.
+"""Parallelism helpers within and across nnScaler scale units.
 
-The helpers distinguish communication within one scale unit from communication
-across the same plan-local lane of adjacent scale units. All chunk/gather
-operations require equal-sized shards.
+An nnScaler plan describes ``plan_ngpus`` ranks and is repeated at runtime as
+one or more scale units. This module supports two ways to use those ranks:
+
+DP over scale units
+-------------------
+``dp_scale_unit_*`` treats every rank in ``num_scale_units`` adjacent scale
+units as one data-parallel group. The group size is
+``plan_ngpus * num_scale_units``. This is useful when a replicated or opaque
+region should process one logical batch without repeating the same computation
+on every rank. All ranks have the same computational role and own equivalent
+copies of the region's parameters; only their data shards differ.
+
+Use :func:`dp_scale_unit_chunk` before the region to split the chosen tensor
+dimension over all ranks in the group, then use
+:func:`dp_scale_unit_all_gather` to restore the full tensor afterward. Parameters
+that consume these complementary data shards should be assigned the bucket
+configuration returned by :func:`dp_scale_unit_param_config`, which preserves
+the SUM of their gradient contributions.
+
+EP across scale units
+---------------------
+``ep_scale_unit_*`` assumes each scale unit runs the same expert-parallel plan.
+A rank's offset inside the plan is its *lane*; the same lane in different scale
+units owns the same expert shard. Activation partitioning across scale units
+therefore communicates only among corresponding lanes, using
+:func:`ep_scale_unit_chunk` and :func:`ep_scale_unit_all_gather`. The complete
+contiguous union of those scale units, returned by
+:func:`ep_scale_unit_ranks`, can be used for context-wide communication.
+
+Plan-level EP already determines the reducer groups for matching expert shards,
+so :func:`ep_scale_unit_param_config` inherits the generated reducer settings.
+
+Reducer semantics
+-----------------
+Parameter ownership and gradient duplication are separate concerns:
+
+* Parameter ownership determines the reducer group. In DP, all ranks own the
+    same complete parameters. In EP, different lanes own different expert shards,
+    so only ranks in matching lanes reduce the same parameters.
+* Gradient duplication determines ``reducer_nreplicas``. Contributions from
+    disjoint samples, sequence shards, or routed tokens are complementary and
+    must remain summed. Only completely repeated contributions should be divided
+    by their repetition count.
+
+The manual DP split is outside the compiled plan, so the compiler cannot infer
+that formerly equivalent replicas now process complementary data. Therefore
+:func:`dp_scale_unit_param_config` sets ``reducer_nreplicas=1``. In the EP case,
+the plan already describes expert ownership and its generated reducers normally
+have the correct divisor, so :func:`ep_scale_unit_param_config` leaves them
+unchanged. This is not an unconditional EP rule: if matching expert replicas
+repeat the same data and computation, their bucket still needs a divisor equal
+to that actual repetition count.
+
+All chunk/gather helpers are differentiable: chunk forward pairs with
+all-gather backward, and all-gather forward pairs with chunk backward. They
+require equal-sized shards, and every required process group must be created by
+all ranks in the same deterministic order before execution.
 """
 
 from typing import Optional, TYPE_CHECKING
@@ -22,42 +76,48 @@ if TYPE_CHECKING:
 
 
 __all__ = [
-    'scale_unit_ranks',
-    'cross_scale_unit_ranks',
-    'cross_scale_unit_lane_ranks',
-    'inner_scale_unit_chunk',
-    'inner_scale_unit_all_gather',
-    'inner_scale_unit_param_config',
-    'cross_scale_unit_chunk',
-    'cross_scale_unit_all_gather',
-    'cross_scale_unit_param_config',
+    'dp_scale_unit_ranks',
+    'ep_scale_unit_ranks',
+    'ep_scale_unit_lane_ranks',
+    'dp_scale_unit_chunk',
+    'dp_scale_unit_all_gather',
+    'dp_scale_unit_param_config',
+    'ep_scale_unit_chunk',
+    'ep_scale_unit_all_gather',
+    'ep_scale_unit_param_config',
 ]
 
 
-def scale_unit_ranks(plan_ngpus: int, rank: Optional[int] = None) -> tuple[int, ...]:
+def dp_scale_unit_ranks(plan_ngpus: int, num_scale_units: int = 1, rank: Optional[int] = None) -> tuple[int, ...]:
     """
-    Get the ranks of the current scale unit.
+    Get ranks in the current contiguous scale-unit DP group.
+
+    The group contains every plan lane from ``num_scale_units`` adjacent scale
+    units. For ``plan_ngpus=2`` and ``num_scale_units=2``, ranks 0-3 form one
+    DP group and ranks 4-7 form the next group.
 
     Args:
         plan_ngpus (int): Number of ranks in one scale unit.
-        rank (Optional[int]): Global rank whose scale unit is requested. Uses
+        num_scale_units (int): Number of adjacent scale units in one group.
+        rank (Optional[int]): Global rank whose DP group is requested. Uses
             the current distributed rank when omitted.
 
     Returns:
-        tuple[int, ...]: Ranks of the current scale unit.
+        tuple[int, ...]: Global ranks in the current scale-unit DP group.
     """
     rank = dist.get_rank() if rank is None else rank
-    first_rank = rank // plan_ngpus * plan_ngpus
-    return tuple(range(first_rank, first_rank + plan_ngpus))
+    group_size = plan_ngpus * num_scale_units
+    first_rank = rank // group_size * group_size
+    return tuple(range(first_rank, first_rank + group_size))
 
 
-def cross_scale_unit_ranks(
+def ep_scale_unit_ranks(
     plan_ngpus: int,
     num_scale_units: int,
     rank: Optional[int] = None,
 ) -> tuple[int, ...]:
     """
-    Get the contiguous ranks in the current cross-scale-unit group.
+    Get the contiguous ranks in the current expert-parallel scale-unit group.
 
     A group contains ``num_scale_units`` adjacent scale units, with
     ``plan_ngpus`` ranks in each unit. For example, with ``plan_ngpus=2`` and
@@ -71,7 +131,7 @@ def cross_scale_unit_ranks(
             current distributed rank when omitted.
 
     Returns:
-        tuple[int, ...]: Global ranks in the current cross-scale-unit group.
+        tuple[int, ...]: Global ranks in the current expert-parallel scale-unit group.
     """
     rank = dist.get_rank() if rank is None else rank
     group_size = plan_ngpus * num_scale_units
@@ -79,7 +139,7 @@ def cross_scale_unit_ranks(
     return tuple(range(first_rank, first_rank + group_size))
 
 
-def cross_scale_unit_lane_ranks(
+def ep_scale_unit_lane_ranks(
     plan_ngpus: int,
     num_scale_units: int,
     rank: Optional[int] = None,
@@ -120,80 +180,84 @@ def cross_scale_unit_lane_ranks(
     return tuple(range(group_start + lane, group_start + group_size, plan_ngpus))
 
 
-class _InnerScaleUnitChunk(torch.autograd.Function):
+class _DpScaleUnitChunk(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, x: torch.Tensor, plan_ngpus: int, dim: int) -> torch.Tensor:
-        ctx.ranks = scale_unit_ranks(plan_ngpus)
+    def forward(ctx, x: torch.Tensor, plan_ngpus: int, num_scale_units: int, dim: int) -> torch.Tensor:
+        ctx.ranks = dp_scale_unit_ranks(plan_ngpus, num_scale_units)
         ctx.dim = dim
         return chunk(x, dim=ctx.dim, ranks=ctx.ranks)
 
     @staticmethod
     def backward(ctx, grad: torch.Tensor):
-        return all_gather(grad, dim=ctx.dim, ranks=ctx.ranks), None, None
+        return all_gather(grad, dim=ctx.dim, ranks=ctx.ranks), None, None, None
 
     @staticmethod
-    def fake_forward(x: torch.Tensor, plan_ngpus: int, dim: int) -> torch.Tensor:
-        if x.shape[dim] % plan_ngpus != 0:
-            raise ValueError('tensor dimension must be divisible by plan_ngpus')
-        return x.chunk(plan_ngpus, dim=dim)[0]
+    def fake_forward(x: torch.Tensor, plan_ngpus: int, num_scale_units: int, dim: int) -> torch.Tensor:
+        group_size = plan_ngpus * num_scale_units
+        if x.shape[dim] % group_size != 0:
+            raise ValueError('tensor dimension must be divisible by group_size')
+        return x.chunk(group_size, dim=dim)[0]
 
 
-class _InnerScaleUnitAllGather(torch.autograd.Function):
+class _DpScaleUnitAllGather(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, x: torch.Tensor, plan_ngpus: int, dim: int) -> torch.Tensor:
-        ctx.ranks = scale_unit_ranks(plan_ngpus)
+    def forward(ctx, x: torch.Tensor, plan_ngpus: int, num_scale_units: int, dim: int) -> torch.Tensor:
+        ctx.ranks = dp_scale_unit_ranks(plan_ngpus, num_scale_units)
         ctx.dim = dim
         return all_gather(x, dim=ctx.dim, ranks=ctx.ranks)
 
     @staticmethod
     def backward(ctx, grad: torch.Tensor):
-        return chunk(grad, dim=ctx.dim, ranks=ctx.ranks), None, None
+        return chunk(grad, dim=ctx.dim, ranks=ctx.ranks), None, None, None
 
     @staticmethod
-    def fake_forward(x: torch.Tensor, plan_ngpus: int, dim: int) -> torch.Tensor:
-        return torch.cat([x] * plan_ngpus, dim=dim)
+    def fake_forward(x: torch.Tensor, plan_ngpus: int, num_scale_units: int, dim: int) -> torch.Tensor:
+        group_size = plan_ngpus * num_scale_units
+        return torch.cat([x] * group_size, dim=dim)
 
 
-@nnscaler.register_op('? -> ?', fake_fn=_InnerScaleUnitChunk.fake_forward)
-def inner_scale_unit_chunk(x: torch.Tensor, plan_ngpus: int, dim: int) -> torch.Tensor:
-    """Split ``x`` across ranks in the current scale unit.
+@nnscaler.register_op('? -> ?', fake_fn=_DpScaleUnitChunk.fake_forward)
+def dp_scale_unit_chunk(x: torch.Tensor, plan_ngpus: int, num_scale_units: int, dim: int) -> torch.Tensor:
+    """Split ``x`` across a contiguous scale-unit DP group.
 
     Forward selects this rank's equal chunk along ``dim``; backward gathers all
     chunks to reconstruct the input gradient.
 
     Args:
-        x (torch.Tensor): Full tensor available on every rank in the scale unit.
-        plan_ngpus (int): Number of ranks in the scale unit.
+        x (torch.Tensor): Full tensor available on every rank in the DP group.
+        plan_ngpus (int): Number of ranks in one scale unit.
+        num_scale_units (int): Number of adjacent scale units in the group.
         dim (int): Dimension to split.
 
     Returns:
         torch.Tensor: This rank's chunk of ``x``.
     """
-    return _InnerScaleUnitChunk.apply(x, plan_ngpus, dim)
+    return _DpScaleUnitChunk.apply(x, plan_ngpus, num_scale_units, dim)
 
 
-@nnscaler.register_op('? -> ?', fake_fn=_InnerScaleUnitAllGather.fake_forward)
-def inner_scale_unit_all_gather(x: torch.Tensor, plan_ngpus: int, dim: int) -> torch.Tensor:
-    """Gather equal chunks from ranks in the current scale unit.
+@nnscaler.register_op('? -> ?', fake_fn=_DpScaleUnitAllGather.fake_forward)
+def dp_scale_unit_all_gather(x: torch.Tensor, plan_ngpus: int, num_scale_units: int, dim: int) -> torch.Tensor:
+    """Gather equal chunks from a contiguous scale-unit DP group.
 
     Forward concatenates along ``dim``; backward selects this rank's matching
     chunk from the full output gradient.
 
     Args:
         x (torch.Tensor): This rank's equal-sized local chunk.
-        plan_ngpus (int): Number of ranks in the scale unit.
+        plan_ngpus (int): Number of ranks in one scale unit.
+        num_scale_units (int): Number of adjacent scale units in the group.
         dim (int): Dimension along which chunks are concatenated.
 
     Returns:
-        torch.Tensor: Full tensor replicated on the scale-unit ranks.
+        torch.Tensor: Full tensor replicated on all ranks in the DP group.
     """
-    return _InnerScaleUnitAllGather.apply(x, plan_ngpus, dim)
+    return _DpScaleUnitAllGather.apply(x, plan_ngpus, num_scale_units, dim)
 
 
-def inner_scale_unit_param_config(trainer_args: 'TrainerArgs') -> dict:
-    """Return bucket settings for parameters consuming inner-unit data shards.
+def dp_scale_unit_param_config(trainer_args: 'TrainerArgs') -> dict:
+    """Return bucket settings for parameters consuming DP-group data shards.
 
-    Ranks in one scale unit process complementary data, so their gradient
+    Ranks in the DP group process complementary data, so their gradient
     contributions must remain summed after the reducer collective.
 
     Args:
@@ -207,7 +271,7 @@ def inner_scale_unit_param_config(trainer_args: 'TrainerArgs') -> dict:
     return dict(reducer_nreplicas=1)
 
 
-class _CrossScaleUnitChunk(torch.autograd.Function):
+class _EpScaleUnitChunk(torch.autograd.Function):
     @staticmethod
     def forward(
         ctx,
@@ -216,7 +280,7 @@ class _CrossScaleUnitChunk(torch.autograd.Function):
         num_scale_units: int,
         dim: int,
     ) -> torch.Tensor:
-        ctx.ranks = cross_scale_unit_lane_ranks(
+        ctx.ranks = ep_scale_unit_lane_ranks(
             plan_ngpus,
             num_scale_units,
         )
@@ -234,7 +298,7 @@ class _CrossScaleUnitChunk(torch.autograd.Function):
         return x.chunk(num_scale_units, dim=dim)[0]
 
 
-class _CrossScaleUnitAllGather(torch.autograd.Function):
+class _EpScaleUnitAllGather(torch.autograd.Function):
     @staticmethod
     def forward(
         ctx,
@@ -243,7 +307,7 @@ class _CrossScaleUnitAllGather(torch.autograd.Function):
         num_scale_units: int,
         dim: int,
     ) -> torch.Tensor:
-        ctx.ranks = cross_scale_unit_lane_ranks(
+        ctx.ranks = ep_scale_unit_lane_ranks(
             plan_ngpus,
             num_scale_units,
         )
@@ -261,9 +325,9 @@ class _CrossScaleUnitAllGather(torch.autograd.Function):
 
 @nnscaler.register_op(
     '? -> ?',
-    fake_fn=_CrossScaleUnitChunk.fake_forward,
+    fake_fn=_EpScaleUnitChunk.fake_forward,
 )
-def cross_scale_unit_chunk(
+def ep_scale_unit_chunk(
     x: torch.Tensor,
     plan_ngpus: int,
     num_scale_units: int,
@@ -271,7 +335,7 @@ def cross_scale_unit_chunk(
 ) -> torch.Tensor:
     """Split ``x`` across the same lane of adjacent scale units.
 
-    The communication group is returned by :func:`cross_scale_unit_lane_ranks`.
+    The communication group is returned by :func:`ep_scale_unit_lane_ranks`.
     Forward selects this rank's equal chunk along ``dim``; backward gathers the
     chunks to reconstruct the input gradient.
 
@@ -285,14 +349,14 @@ def cross_scale_unit_chunk(
     Returns:
         torch.Tensor: This scale unit's chunk for the current lane.
     """
-    return _CrossScaleUnitChunk.apply(x, plan_ngpus, num_scale_units, dim)
+    return _EpScaleUnitChunk.apply(x, plan_ngpus, num_scale_units, dim)
 
 
 @nnscaler.register_op(
     '? -> ?',
-    fake_fn=_CrossScaleUnitAllGather.fake_forward,
+    fake_fn=_EpScaleUnitAllGather.fake_forward,
 )
-def cross_scale_unit_all_gather(
+def ep_scale_unit_all_gather(
     x: torch.Tensor,
     plan_ngpus: int,
     num_scale_units: int,
@@ -312,15 +376,16 @@ def cross_scale_unit_all_gather(
     Returns:
         torch.Tensor: Full tensor replicated across the same-lane ranks.
     """
-    return _CrossScaleUnitAllGather.apply(x, plan_ngpus, num_scale_units, dim)
+    return _EpScaleUnitAllGather.apply(x, plan_ngpus, num_scale_units, dim)
 
 
-def cross_scale_unit_param_config(trainer_args: 'TrainerArgs') -> dict:
-    """Return bucket settings for cross-scale-unit data partitioning.
+def ep_scale_unit_param_config(trainer_args: 'TrainerArgs') -> dict:
+    """Return bucket settings for EP activation sharding across scale units.
 
-    Cross-scale-unit chunk/gather does not by itself change the replica count
-    inferred from the plan-level parameter layout, so parameters should inherit
-    their generated reducer configuration.
+    Corresponding lanes in different scale units own the same plan-level expert
+    shard. Splitting activations among those lanes does not change the parameter
+    replica count inferred from the EP weight layout, so parameters should
+    inherit their generated reducer configuration.
 
     Args:
         trainer_args (TrainerArgs): Trainer configuration. Accepted so this

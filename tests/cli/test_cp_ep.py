@@ -25,12 +25,11 @@ import torch.nn.functional as F
 
 import nnscaler
 from nnscaler.cli.scale_unit_parallelism import (
-    cross_scale_unit_param_config,
-    cross_scale_unit_all_gather,
-    cross_scale_unit_chunk,
-    cross_scale_unit_lane_ranks,
-    cross_scale_unit_ranks,
-    scale_unit_ranks,
+    ep_scale_unit_param_config,
+    ep_scale_unit_all_gather,
+    ep_scale_unit_chunk,
+    ep_scale_unit_lane_ranks,
+    ep_scale_unit_ranks,
 )
 from nnscaler.cli.trainer import Trainer
 from nnscaler.cli.trainer_args import TrainerArgs
@@ -150,7 +149,7 @@ class _GlobalContextMix(torch.autograd.Function):
     ) -> torch.Tensor:
         # ranks == [0, 1, 2, 3] or [4, 5, 6, 7]
         # for CP=4, EP=2, runtime_ngpus=8
-        ctx.ranks = cross_scale_unit_ranks(
+        ctx.ranks = ep_scale_unit_ranks(
             expert_parallel_size,
             context_parallel_size // expert_parallel_size,
         )
@@ -237,7 +236,10 @@ def routed_expert(
     # rank 2/3 -> [2, 3]
     # rank 4/5 -> [4, 5]
     # rank 6/7 -> [6, 7]
-    expert_parallel_ranks = scale_unit_ranks(expert_parallel_size)
+    expert_parallel_ranks = ep_scale_unit_ranks(
+        expert_parallel_size,
+        num_scale_units=1,
+    )
     _LAST_EXPERT_SEQUENCE_LENGTH = x.shape[1]
 
     # Model a context-dependent operation (similar to attention) before expert
@@ -440,10 +442,10 @@ class ContextExpertModel(torch.nn.Module):
         if self.use_context_parallel:
             # Stage 1 of sequence partitioning:
             # [0, 2] (and [1, 3]) split S into two scale-unit halves.
-            # after cross_scale_unit_chunk,
+            # after ep_scale_unit_chunk,
             # [0, 1] have the first half of the sequence
             # and [2, 3] have the second half.
-            x = cross_scale_unit_chunk(
+            x = ep_scale_unit_chunk(
                 x,
                 plan_ngpus=self.expert_parallel_size,
                 num_scale_units=self.num_scale_units,
@@ -472,7 +474,7 @@ class ContextExpertModel(torch.nn.Module):
         if self.use_context_parallel:
             # nnscaler first combines EP quarters inside each scale unit; this
             # boundary then gathers the two scale-unit halves into full S.
-            output = cross_scale_unit_all_gather(
+            output = ep_scale_unit_all_gather(
                 output,
                 plan_ngpus=self.expert_parallel_size,
                 num_scale_units=self.num_scale_units,
@@ -504,7 +506,7 @@ def cp_ep_policy(graph, compute_config: ComputeConfig):
 
 def cp_param_clss_fn(trainer_args: TrainerArgs, parameter_fqn: str) -> dict:
     if parameter_fqn.startswith('layers.') and parameter_fqn.endswith('.expert_weight'):
-        return cross_scale_unit_param_config(trainer_args)
+        return ep_scale_unit_param_config(trainer_args)
     return {}
 
 
@@ -542,7 +544,7 @@ def _check_expert_bucket(trainer: Trainer, expected_nreplicas: int):
             # Same expert shards synchronize over [0,2,4,6] or [1,3,5,7].
             # This spans both scale units and, for runtime=8, both CP input groups.
             compute_config = trainer.train_args.compute_config
-            assert reducer.ranks == cross_scale_unit_lane_ranks(
+            assert reducer.ranks == ep_scale_unit_lane_ranks(
                 compute_config.plan_ngpus,
                 compute_config.runtime_ngpus // compute_config.plan_ngpus,
             )
@@ -627,7 +629,7 @@ def test_cp4_ep2_runtime8_static(tmp_path):
 
     # Two independent inputs are processed by [0,4) and [4,8).
     assert {
-        rank: cross_scale_unit_ranks(2, 2, rank)
+        rank: ep_scale_unit_ranks(2, 2, rank)
         for rank in range(8)
     } == {
         0: (0, 1, 2, 3), 1: (0, 1, 2, 3),
@@ -638,7 +640,7 @@ def test_cp4_ep2_runtime8_static(tmp_path):
     # The outer CP boundary communicates only between same-EP-lane scale units
     # inside one input group; it never mixes input A with input B.
     assert {
-        rank: cross_scale_unit_lane_ranks(2, 2, rank)
+        rank: ep_scale_unit_lane_ranks(2, 2, rank)
         for rank in range(8)
     } == {
         0: (0, 2), 1: (1, 3), 2: (0, 2), 3: (1, 3),
@@ -646,7 +648,7 @@ def test_cp4_ep2_runtime8_static(tmp_path):
     }
     # Weight gradients synchronize globally by expert ownership, not by input.
     assert {
-        rank: cross_scale_unit_lane_ranks(2, 4, rank)
+        rank: ep_scale_unit_lane_ranks(2, 4, rank)
         for rank in range(8)
     } == {
         0: (0, 2, 4, 6), 1: (1, 3, 5, 7),
