@@ -428,7 +428,8 @@ The reference files exercise two related topologies:
 | Validation | `plan_ngpus` | `context_parallel_size` | `runtime_ngpus` | CP groups |
 |---|---:|---:|---:|---|
 | Live distributed test | 2 | 4 | 4 | `[0,1,2,3]` |
-| CPU compile-only test | 2 | 4 | 8 | `[0,1,2,3]`, `[4,5,6,7]` |
+| Live distributed test (when eight GPUs are available) | 2 | 4 | 8 | `[0,1,2,3]`, `[4,5,6,7]` |
+| CPU static compile test | 2 | 4 | 8 | `[0,1,2,3]`, `[4,5,6,7]` |
 
 The eight-rank topology is the more complete example:
 
@@ -462,7 +463,7 @@ Within each CP group, the sequence is ultimately split four ways:
 
 Weights are partitioned only two ways by EP, while sequence activations are partitioned four ways by CP. This prevents expert weights from being split as finely as `runtime_ngpus`.
 
-The live `runtime_ngpus=4` test has only the first CP group. All four ranks cooperate on one input stream. The eight-rank test does not execute collectives; it statically verifies that a second, independent CP group is generated correctly.
+The live `runtime_ngpus=4` test has only the first CP group. All four ranks cooperate on one input stream. The eight-rank topology is always checked by a CPU static compile test that verifies both independent CP groups, generated shapes, expert slices, and reducer groups. When eight GPUs are available, a separate live test executes its collectives and compares training checkpoints with the unsharded baseline.
 
 ### 3.2 What each rank reads from the dataset
 

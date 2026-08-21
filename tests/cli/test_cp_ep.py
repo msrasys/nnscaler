@@ -607,10 +607,6 @@ def cp_ep_worker(
     return _LAST_EXPERT_SEQUENCE_LENGTH, expert_slice.start, expert_slice.stop
 
 
-@pytest.mark.skipif(
-    torch.cuda.is_available() and torch.cuda.device_count() >= 8,
-    reason='covered by the real eight-GPU test',
-)
 @replace_all_device_with('cpu')
 def test_cp4_ep2_runtime8_static(tmp_path):
     # No eight-GPU machine is required: compile eight rank-specific modules on

@@ -424,10 +424,15 @@ class OptimizerConfig:
             return None
 
         signature = inspect.signature(param_clss_fn)
-        if len(signature.parameters) == 1:
-            return param_clss_fn
-        if len(signature.parameters) == 2:
-            return functools.partial(param_clss_fn, trainer_args)
+        try:
+            if len(signature.parameters) == 1:
+                signature.bind('parameter_name')
+                return param_clss_fn
+            if len(signature.parameters) == 2:
+                signature.bind(trainer_args, 'parameter_name')
+                return functools.partial(param_clss_fn, trainer_args)
+        except TypeError:
+            pass
 
         raise TypeError(
             "`optimizer.param_clss_fn` must accept either `(parameter_name)` or "

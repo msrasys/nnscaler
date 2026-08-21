@@ -222,6 +222,15 @@ def test_normalize_param_clss_fn_rejects_invalid_signature():
         _normalize_param_clss_fn(param_clss_fn)
 
 
+@pytest.mark.parametrize('param_clss_fn', [
+    lambda trainer_args, **kwargs: None,
+    lambda trainer_args, *, parameter_name: None,
+])
+def test_normalize_param_clss_fn_rejects_unbindable_signature(param_clss_fn):
+    with pytest.raises(TypeError, match='must accept either'):
+        _normalize_param_clss_fn(param_clss_fn)
+
+
 def test_normalize_param_clss_fn_preserves_callback_type_error():
     def param_clss_fn(context, value):
         raise TypeError('callback failure')
