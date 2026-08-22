@@ -837,11 +837,30 @@ def stage_backward_weight(
     weights: Iterator[Parameter], param_groups: list[dict[str, Any]], retain_graph=False
 ) -> tuple[torch.Tensor | None, ...]:
     weights = tuple(weights)
-    grad_acc_to_weight = {}
-    for weight in weights:
-        grad_acc_to_weight[_get_grad_fn_or_grad_acc(weight)] = weight
+    grad_acc_to_weight = None
+    grad_weights = None
 
-    grad_weights = tuple(weight for weight in weights if weight.requires_grad)
+    def get_weight_metadata():
+        """Build the full parameter/AccumulateGrad map only when required.
+
+        Fine-grained FBW commonly calls this function only to drain custom
+        callbacks. Expert wgrad may already have been published at the DeepEP
+        dispatch boundary, while Linear callbacks can accumulate directly
+        into reducer-owned storage. Neither case needs an alias GraphTask or a
+        scan of every stage parameter. Lazily constructing this map avoids
+        repeating that Python/autograd work for every segment and microbatch.
+        """
+        nonlocal grad_acc_to_weight, grad_weights
+        if grad_acc_to_weight is None:
+            grad_weights = tuple(
+                weight for weight in weights if weight.requires_grad
+            )
+            grad_acc_to_weight = {
+                _get_grad_fn_or_grad_acc(weight): weight
+                for weight in weights
+            }
+        return grad_acc_to_weight, grad_weights
+
     contributions: dict[int, list[torch.Tensor]] = collections.defaultdict(list)
     reducer_accumulated_weights: set[torch.Tensor] = set()
 
@@ -887,14 +906,21 @@ def stage_backward_weight(
     # Phase-aware custom Functions retained their actual GEMM operands during
     # I. Compute those dWeights directly, then map aliases/views back to the
     # generated stage parameters without re-entering the model GraphTask.
+    # A module-level W action commonly contains several projections (for
+    # example Q/K/V/O).  Entering autograd once per projection repeatedly
+    # traverses the same generated weight-alias graph and adds a sizeable
+    # Python/GraphTask launch cost to every microbatch.  Run the direct GEMM
+    # callbacks first, then map all of their results to the stage parameters in
+    # one GraphTask.  Autograd preserves the sum when a root is referenced by
+    # more than one contribution.
+    custom_roots: list[torch.Tensor] = []
+    custom_root_grads: list[torch.Tensor] = []
     with _fbw_phase("weight"):
         for state in param_groups:
             for task in state.pop("deferred_tasks", ()):
                 task_contributions = task()
                 if task_contributions is None:
                     continue
-                custom_roots: list[torch.Tensor] = []
-                custom_root_grads: list[torch.Tensor] = []
                 for target, grad in task_contributions:
                     if grad is None:
                         # A phase-aware custom kernel may have accumulated
@@ -909,22 +935,28 @@ def stage_backward_weight(
                         continue
                     custom_roots.append(target)
                     custom_root_grads.append(grad)
-                if custom_roots and grad_weights:
-                    custom_grads = torch.autograd.grad(
-                        custom_roots,
-                        grad_weights,
-                        grad_outputs=custom_root_grads,
-                        allow_unused=True,
-                        retain_graph=False,
-                    )
-                    for weight, grad in zip(
-                        grad_weights, custom_grads, strict=True
-                    ):
-                        if grad is not None:
-                            record_contribution(weight, grad, deferred=True)
-                custom_roots.clear()
-                custom_root_grads.clear()
-                custom_grads = ()
+        if custom_roots:
+            _, active_grad_weights = get_weight_metadata()
+        else:
+            active_grad_weights = ()
+        if custom_roots and active_grad_weights:
+            custom_grads = torch.autograd.grad(
+                custom_roots,
+                active_grad_weights,
+                grad_outputs=custom_root_grads,
+                allow_unused=True,
+                retain_graph=False,
+            )
+            for weight, grad in zip(
+                active_grad_weights, custom_grads, strict=True
+            ):
+                if grad is not None:
+                    record_contribution(weight, grad, deferred=True)
+        else:
+            custom_grads = ()
+    custom_roots.clear()
+    custom_root_grads.clear()
+    custom_grads = ()
 
     active_param_groups = [
         param_group
@@ -935,6 +967,10 @@ def stage_backward_weight(
             for grad in grads_tuple
         )
     ]
+    if active_param_groups:
+        active_grad_acc_to_weight, _ = get_weight_metadata()
+    else:
+        active_grad_acc_to_weight = {}
     last_active_group = active_param_groups[-1] if active_param_groups else None
     for param_group in param_groups:
         intermediates = param_group.get("intermediates", [])
@@ -981,7 +1017,7 @@ def stage_backward_weight(
                 ):
                     if grad is not None:
                         record_contribution(
-                            grad_acc_to_weight[grad_acc], grad
+                            active_grad_acc_to_weight[grad_acc], grad
                         )
 
             param_group.pop("grads", None)
@@ -997,7 +1033,11 @@ def stage_backward_weight(
 
     accumulation_roots: list[torch.Tensor] = []
     accumulation_grads: list[torch.Tensor] = []
-    for weight in grad_weights:
+    if contributions:
+        _, contribution_grad_weights = get_weight_metadata()
+    else:
+        contribution_grad_weights = ()
+    for weight in contribution_grad_weights:
         weight_contributions = contributions.get(id(weight), ())
         if not weight_contributions:
             continue

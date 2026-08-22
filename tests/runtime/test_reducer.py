@@ -18,17 +18,19 @@ from nnscaler.compiler import compile
 from nnscaler.utils import load_model
 from nnscaler.graph import IRGraph
 from nnscaler.ir.operator import IRFwOperation
-from nnscaler.flags import CompileFlag
+from nnscaler.flags import CompileFlag, RuntimeFlag
 from nnscaler.runtime.adapter.reducer import (
     FlattenParamInfo,
     Reducer,
     ReducerParamInfo,
     accumulate_reducer_grad,
+    claim_reducer_grad_accumulator,
     complete_reducer_grad,
     defer_reducer_grad,
     get_reducer_grad_accumulator,
     has_reducer_grad_accumulator,
     mark_reducer_grad_ready,
+    prepare_deferred_reducer_grad,
 )
 from nnscaler.runtime.device import DeviceGroup
 from ..launch_torchrun import launch_torchrun, torchrun
@@ -630,6 +632,63 @@ def test_reducer_grad_accumulator_exposes_parameter_shaped_buffer():
 
 
 @mock_reducer_env(0, 2)
+def test_claim_reducer_grad_accumulator_tracks_first_contribution():
+    param = torch.nn.Parameter(torch.zeros(3, 2))
+    reducer = Reducer([0, 1])
+    reducer.add_param(param)
+    reducer.build_buckets()
+    bucket = reducer.buckets[0]
+
+    accumulator, first = claim_reducer_grad_accumulator(param)
+    assert accumulator is not None
+    assert first
+    accumulator.fill_(1)
+
+    same_accumulator, first = claim_reducer_grad_accumulator(param)
+    assert same_accumulator is not None
+    assert same_accumulator.data_ptr() == accumulator.data_ptr()
+    assert not first
+
+    bucket.reset()
+    _, first = claim_reducer_grad_accumulator(param)
+    assert first
+
+
+@mock_reducer_env(0, 2)
+def test_claim_reducer_grad_accumulator_observes_native_contribution():
+    param = torch.nn.Parameter(torch.zeros(2))
+    reducer = Reducer([0, 1])
+    reducer.add_param(param)
+    reducer.build_buckets()
+
+    (param * 3.0).sum().backward()
+
+    accumulator, first = claim_reducer_grad_accumulator(param)
+    assert accumulator is not None
+    assert not first
+    torch.testing.assert_close(accumulator, torch.tensor([3.0, 3.0]))
+
+
+@mock_reducer_env(0, 2)
+def test_prepare_deferred_reducer_grad_caches_completion_state():
+    param = torch.nn.Parameter(torch.zeros(2))
+    reducer = Reducer([0, 1], async_op=True)
+    reducer.add_param(param)
+    reducer.build_buckets()
+    bucket = reducer.buckets[0]
+    bucket._launch_async_reduce = Mock()
+
+    accumulator, first, complete = prepare_deferred_reducer_grad(param)
+    assert first
+    accumulator.copy_(torch.tensor([1.0, 2.0]))
+    bucket._launch_async_reduce.assert_not_called()
+
+    complete(param)
+    bucket._launch_async_reduce.assert_called_once_with()
+    assert bucket._async_seen_param_cnt[param] == 1
+
+
+@mock_reducer_env(0, 2)
 def test_reducer_grad_registration_keeps_parameter_picklable():
     param = torch.nn.Parameter(torch.zeros(2))
     reducer = Reducer([0, 1])
@@ -799,6 +858,68 @@ def test_manual_grad_slice_zero3_reduces_by_owner_and_postevicts_param():
     )
     assert param.grad is None
     assert param.shape == (info.numel_with_padding(),)
+
+
+@mock_reducer_env(0, 2)
+def test_manual_full_grad_zero3_uses_native_reduce_scatter():
+    param = torch.nn.Parameter(torch.zeros(8))
+    reducer = Reducer([0, 1], zero=3)
+    reducer.add_param(param)
+    reducer.build_buckets()
+    bucket = reducer.buckets[0]
+    info = reducer.get_z3_info(param)
+    param.data = torch.zeros(info.shape)
+
+    def reduce_scatter(output, input, **kwargs):
+        output.copy_(input[:output.numel()])
+
+    with (
+        patch(
+            'torch.distributed.reduce_scatter_tensor',
+            side_effect=reduce_scatter,
+        ) as reduce_scatter_mock,
+        patch('torch.distributed.all_reduce') as all_reduce,
+    ):
+        _ManualReducerGrad.apply(
+            param, [(torch.arange(1.0, 9.0), 0)]
+        ).backward()
+
+    reduce_scatter_mock.assert_called_once_with(
+        ANY,
+        ANY,
+        op=bucket._reduce_op,
+        group=bucket._zero_subgroup,
+    )
+    all_reduce.assert_not_called()
+    offset = bucket._pofset[param]
+    torch.testing.assert_close(
+        bucket._contiguous_grads[offset:offset + info.numel()],
+        torch.tensor([1.0, 2.0, 3.0, 4.0]),
+    )
+
+
+@mock_reducer_env(0, 2)
+def test_sync_grads_drains_final_native_module_weight_first():
+    param = torch.nn.Parameter(torch.zeros(2))
+    reducer = Reducer([0, 1])
+    reducer.add_param(param)
+    reducer.build_buckets()
+
+    order = []
+    reducer.buckets[0].sync_grads = Mock(
+        side_effect=lambda: order.append('reducer')
+    )
+    with (
+        patch.object(RuntimeFlag, 'fbw_native_module_overlap', True),
+        patch(
+                'nnscaler.runtime.executor.Executor.'
+                'finish_native_module_weight_tasks',
+                side_effect=lambda **kwargs: order.append('weight'),
+            ),
+    ):
+        reducer.sync_grads()
+
+    assert order == ['weight', 'reducer']
 
 
 def _manual_grad_slice_zero3_distributed_worker():

@@ -7,7 +7,13 @@ import pytest
 import torch
 from torch.utils.checkpoint import checkpoint
 
-from nnscaler.runtime.executor import Executor
+import nnscaler.runtime.executor as executor_module
+from nnscaler.runtime.executor import (
+    AsyncCommHandler,
+    Executor,
+    _partition_fine_grained_weight_tasks,
+    _partition_fine_grained_param_groups,
+)
 from nnscaler.runtime._patch_torch import configure_fbw_runtime
 from nnscaler.runtime._patch_torch_checkpoint import ReusableGraphExecGroup
 from nnscaler.flags import RuntimeFlag
@@ -27,6 +33,378 @@ def _make_linears(dtype=torch.float64):
     actual = torch.nn.Linear(8, 16, dtype=dtype)
     actual.load_state_dict(reference.state_dict())
     return reference, actual
+
+
+def _fine_grained_task(schedule_group=...):
+    def task():
+        return ()
+
+    if schedule_group is not ...:
+        task._nnscaler_fbw_schedule_group = schedule_group
+    return task
+
+
+def _ordered_fine_grained_task(order, schedule_group=...):
+    task = _fine_grained_task(schedule_group)
+    task._nnscaler_fbw_registration_order = order
+    return task
+
+
+def test_fine_grained_weight_partition_preserves_legacy_tasks():
+    tasks = [_fine_grained_task(), _fine_grained_task()]
+
+    eager, delayed, delayed_group = _partition_fine_grained_weight_tasks(
+        tasks
+    )
+
+    assert eager == []
+    assert delayed == tasks
+    assert delayed_group is None
+
+
+def test_fine_grained_weight_partition_delays_one_module_group():
+    attention_2 = _fine_grained_task(2)
+    inline_expert = _fine_grained_task(None)
+    attention_1_qkv = _fine_grained_task(1)
+    legacy = _fine_grained_task()
+    attention_1_o = _fine_grained_task(1)
+    tasks = [
+        attention_2,
+        inline_expert,
+        attention_1_qkv,
+        legacy,
+        attention_1_o,
+    ]
+
+    eager, delayed, delayed_group = _partition_fine_grained_weight_tasks(
+        tasks
+    )
+
+    # Autograd visits layers in reverse forward order, so the last explicit
+    # group is the first layer whose attention wgrad may cross the P2P edge.
+    assert delayed_group == 1
+    assert eager == [attention_2, inline_expert]
+    assert delayed == [attention_1_qkv, legacy, attention_1_o]
+
+
+def test_fine_grained_weight_partition_inlines_explicit_none_tasks():
+    tasks = [_fine_grained_task(None), _fine_grained_task(None)]
+
+    eager, delayed, delayed_group = _partition_fine_grained_weight_tasks(
+        tasks
+    )
+
+    assert eager == tasks
+    assert delayed == []
+    assert delayed_group is None
+
+
+def test_fine_grained_weight_partition_skips_oversized_whole_group(
+    monkeypatch,
+):
+    fitting = _fine_grained_task('fitting')
+    oversized_1 = _fine_grained_task('oversized')
+    oversized_2 = _fine_grained_task('oversized')
+    fitting._nnscaler_fbw_targets = (torch.empty(6),)
+    oversized_1._nnscaler_fbw_targets = (torch.empty(5),)
+    oversized_2._nnscaler_fbw_targets = (torch.empty(5),)
+    monkeypatch.setattr(
+        executor_module,
+        '_FBW_NATIVE_MODULE_MAX_GROUP_WEIGHT_ELEMENTS',
+        8,
+    )
+
+    eager, delayed, delayed_group = _partition_fine_grained_weight_tasks([
+        fitting,
+        oversized_1,
+        oversized_2,
+    ])
+
+    assert delayed_group == 'fitting'
+    assert eager == [oversized_1, oversized_2]
+    assert delayed == [fitting]
+
+
+def test_fine_grained_weight_partition_respects_cost_and_memory_budget(
+    monkeypatch,
+):
+    fitting = _fine_grained_task('fitting')
+    costly = _fine_grained_task('costly')
+    memory_heavy = _fine_grained_task('memory-heavy')
+    for task in (fitting, costly, memory_heavy):
+        task._nnscaler_fbw_targets = (torch.empty(1),)
+    fitting._nnscaler_fbw_cost_fma = 4
+    fitting._nnscaler_fbw_retained_bytes = 4
+    costly._nnscaler_fbw_cost_fma = 9
+    costly._nnscaler_fbw_retained_bytes = 4
+    memory_heavy._nnscaler_fbw_cost_fma = 4
+    memory_heavy._nnscaler_fbw_retained_bytes = 9
+    monkeypatch.setattr(
+        executor_module, '_FBW_NATIVE_MODULE_MAX_GROUP_FMA', 8
+    )
+    monkeypatch.setattr(
+        executor_module, '_FBW_NATIVE_MODULE_MAX_PENDING_BYTES', 8
+    )
+
+    eager, delayed, delayed_group = _partition_fine_grained_weight_tasks([
+        fitting, costly, memory_heavy,
+    ])
+
+    assert delayed_group == 'fitting'
+    assert eager == [costly, memory_heavy]
+    assert delayed == [fitting]
+
+
+def test_fine_grained_param_groups_select_one_global_module():
+    later_layer = _ordered_fine_grained_task(1, ('attention_qkv', 2))
+    shared_ffn = _ordered_fine_grained_task(2, ('shared_ffn', 1))
+    first_layer_q = _ordered_fine_grained_task(
+        3, (('attention_qkv', 1), 0)
+    )
+    first_layer_v = _ordered_fine_grained_task(
+        5, (('attention_qkv', 1), 2)
+    )
+    inline_expert = _ordered_fine_grained_task(4, None)
+    param_groups = [
+        {'deferred_tasks': [later_layer, first_layer_q]},
+        {'deferred_tasks': [shared_ffn, inline_expert, first_layer_v]},
+    ]
+
+    partitions, delayed_group = _partition_fine_grained_param_groups(
+        param_groups
+    )
+
+    assert delayed_group == (('attention_qkv', 1), 2)
+    assert partitions == [
+        ([later_layer, first_layer_q], []),
+        ([shared_ffn, inline_expert], [first_layer_v]),
+    ]
+
+
+def test_fine_grained_param_groups_skip_oversized_whole_group(monkeypatch):
+    fitting = _ordered_fine_grained_task(1, 'fitting')
+    oversized_1 = _ordered_fine_grained_task(2, 'oversized')
+    oversized_2 = _ordered_fine_grained_task(3, 'oversized')
+    fitting._nnscaler_fbw_targets = (torch.empty(6),)
+    oversized_1._nnscaler_fbw_targets = (torch.empty(5),)
+    oversized_2._nnscaler_fbw_targets = (torch.empty(5),)
+    monkeypatch.setattr(
+        executor_module,
+        '_FBW_NATIVE_MODULE_MAX_GROUP_WEIGHT_ELEMENTS',
+        8,
+    )
+    param_groups = [
+        {'deferred_tasks': [fitting, oversized_1]},
+        {'deferred_tasks': [oversized_2]},
+    ]
+
+    partitions, delayed_group = _partition_fine_grained_param_groups(
+        param_groups
+    )
+
+    assert delayed_group == 'fitting'
+    assert partitions == [
+        ([oversized_1], [fitting]),
+        ([oversized_2], []),
+    ]
+
+
+def test_fine_grained_param_groups_preserve_legacy_callbacks():
+    legacy_1 = _fine_grained_task()
+    legacy_2 = _fine_grained_task()
+    param_groups = [
+        {'deferred_tasks': [legacy_1]},
+        {'deferred_tasks': [legacy_2]},
+    ]
+
+    partitions, delayed_group = _partition_fine_grained_param_groups(
+        param_groups
+    )
+
+    assert delayed_group is None
+    assert partitions == [([], [legacy_1]), ([], [legacy_2])]
+
+
+def test_native_module_fbw_delays_only_first_forward_group_until_p2p():
+    executed = []
+
+    class ModuleLinear(torch.autograd.Function):
+        @staticmethod
+        def forward(ctx, input_tensor, weight, schedule_group):
+            ctx.save_for_backward(input_tensor, weight)
+            ctx.schedule_group = schedule_group
+            return input_tensor @ weight.t()
+
+        @staticmethod
+        def backward(ctx, output_grad):
+            input_tensor, weight = ctx.saved_tensors
+            input_grad = output_grad @ weight
+            weight_grad = output_grad.t() @ input_tensor
+            if RuntimeFlag.fbw_native_module_phase:
+                def backward_dw(
+                    weight=weight,
+                    weight_grad=weight_grad,
+                    schedule_group=ctx.schedule_group,
+                ):
+                    executed.append(schedule_group)
+                    weight.grad = weight_grad
+                    return ()
+
+                backward_dw._nnscaler_fbw_self_finalizing = True
+                RuntimeFlag.defer_fbw_weight_task(
+                    backward_dw,
+                    (weight,),
+                    schedule_group=ctx.schedule_group,
+                )
+                return input_grad, None, None
+            return input_grad, weight_grad, None
+
+    class TwoLinears(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.first = torch.nn.Parameter(torch.randn(8, 8))
+            self.last = torch.nn.Parameter(torch.randn(8, 8))
+
+        def forward(self, input_tensor):
+            hidden = ModuleLinear.apply(input_tensor, self.first, 'first')
+            return ModuleLinear.apply(hidden, self.last, 'last')
+
+    torch.manual_seed(53)
+    reference = TwoLinears()
+    actual = TwoLinears()
+    actual.load_state_dict(reference.state_dict())
+    input_data = torch.randn(4, 8)
+    output_grad = torch.randn(4, 8)
+
+    reference_input = input_data.clone().requires_grad_()
+    reference(reference_input).backward(output_grad)
+
+    previous = RuntimeFlag.fbw_native_module_overlap
+    RuntimeFlag.fbw_native_module_overlap = True
+    try:
+        actual_input = input_data.clone().requires_grad_()
+        output = Executor.fexecute('native_module', actual, actual_input)
+        input_grad = Executor.backward(
+            'native_module', [actual_input], [output], [output_grad]
+        )
+
+        torch.testing.assert_close(input_grad, reference_input.grad)
+        # Backward visits the last forward module first. It is completed in the
+        # GraphTask tail; the first forward module is the one retained for P2P.
+        assert executed == ['last']
+        assert actual.last.grad is not None
+        assert actual.first.grad is None
+
+        AsyncCommHandler().begin_send_bundle(('test',))
+        AsyncCommHandler().end_send_bundle(run_native_weight_tasks=True)
+        assert executed == ['last', 'first']
+
+        class FakeWork:
+            def wait(self):
+                executed.append('recv_wait')
+
+        recv_tensor = torch.empty(1)
+        AsyncCommHandler().submit(recv_tensor, [FakeWork()])
+        AsyncCommHandler().wait(recv_tensor)
+        assert executed == ['last', 'first', 'recv_wait']
+        torch.testing.assert_close(actual.first.grad, reference.first.grad)
+        torch.testing.assert_close(actual.last.grad, reference.last.grad)
+        Executor.check_clear()
+    finally:
+        RuntimeFlag.fbw_native_module_overlap = previous
+
+
+def test_native_module_fbw_can_wait_for_real_receive_window():
+    executed = []
+
+    def backward_dw():
+        executed.append('weight')
+        return ()
+
+    backward_dw._nnscaler_fbw_self_finalizing = True
+    Executor._native_module_weight_tasks = [backward_dw]
+    Executor._native_module_weight_segment = 'segment'
+    AsyncCommHandler().begin_send_bundle(('test',))
+    AsyncCommHandler().end_send_bundle(run_native_weight_tasks=False)
+    assert executed == []
+
+    # ``sync_tensors`` polls completed sends immediately before waiting on
+    # receives.  That nonblocking poll must not consume the retained W.
+    AsyncCommHandler().drain_sends(wait=False)
+    assert executed == []
+
+    class FakeWork:
+        def is_completed(self):
+            return False
+
+        def wait(self):
+            executed.append('recv_wait')
+
+    recv_tensor = torch.empty(1)
+    AsyncCommHandler().submit(recv_tensor, [FakeWork()])
+    AsyncCommHandler().wait(recv_tensor)
+    assert executed == ['weight', 'recv_wait']
+    Executor.check_clear()
+
+
+def test_native_module_fbw_does_not_fill_completed_receive():
+    executed = []
+
+    def backward_dw():
+        executed.append('weight')
+        return ()
+
+    backward_dw._nnscaler_fbw_self_finalizing = True
+    Executor._native_module_weight_tasks = [backward_dw]
+    Executor._native_module_weight_segment = 'segment'
+    class CompletedWork:
+        def is_completed(self):
+            return True
+
+        def wait(self):
+            executed.append('recv_wait')
+
+    recv_tensor = torch.empty(1)
+    AsyncCommHandler().submit(recv_tensor, [CompletedWork()])
+    AsyncCommHandler().wait(recv_tensor)
+    assert executed == ['recv_wait']
+
+    # The completed receive had no useful window. The pending W remains for
+    # the next real wait or the reducer/iteration correctness fallback.
+    Executor.finish_native_module_weight_tasks(force=True)
+    assert executed == ['recv_wait', 'weight']
+    Executor.check_clear()
+
+
+def test_native_module_fbw_keeps_fifo_until_matching_segment_reenters():
+    executed = []
+
+    def make_task(name, retained_bytes):
+        def task():
+            executed.append(name)
+            return ()
+
+        task._nnscaler_fbw_self_finalizing = True
+        task._nnscaler_fbw_retained_bytes = retained_bytes
+        return task
+
+    Executor._enqueue_native_module_weight_tasks(
+        'first', [make_task('first', 16)]
+    )
+    Executor._enqueue_native_module_weight_tasks(
+        'second', [make_task('second', 32)]
+    )
+    assert Executor._native_module_weight_pending_bytes == 48
+
+    # An unrelated GraphTask does not consume useful pending work. Re-entering
+    # the second segment drains the FIFO through it, preserving collective
+    # ordering across ranks.
+    Executor.finish_native_module_weight_tasks(segment='other')
+    assert executed == []
+    Executor.finish_native_module_weight_tasks(segment='second')
+    assert executed == ['first', 'second']
+    assert Executor._native_module_weight_pending_bytes == 0
+    Executor.check_clear()
 
 
 def test_split_backward_matches_full_backward():

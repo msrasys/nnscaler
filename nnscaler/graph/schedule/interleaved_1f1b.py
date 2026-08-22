@@ -136,7 +136,13 @@ def _get_1f1b_rank_ops(
     backward_stage_index,
     num_1f1b_microbatches=0,
     enable_zero_bubble=False,
+    max_weight_backwards_per_cooldown=1,
 ):
+    if max_weight_backwards_per_cooldown <= 0:
+        raise ValueError(
+            "max_weight_backwards_per_cooldown must be positive, got "
+            f"{max_weight_backwards_per_cooldown}"
+        )
     # All stages start with handling microbatch 0
     fwd_stage_mb_index: Dict[int, int] = defaultdict(int)
     bwd_stage_mb_index: Dict[int, int] = defaultdict(int)
@@ -160,6 +166,25 @@ def _get_1f1b_rank_ops(
 
     backward_op_ids = []
     weight_op_count = 0
+
+    def append_ready_weight_ops(max_count):
+        nonlocal weight_op_count
+        num_ready_weights = len(backward_op_ids) - weight_op_count
+        for _ in range(min(max_count, num_ready_weights)):
+            weight_stage_index = backward_stage_index(
+                backward_op_ids[weight_op_count]
+            )
+            weight_stage_mb_index[weight_stage_index] = (
+                weight_mb_index := weight_stage_mb_index[weight_stage_index]
+            ) + 1
+            rank_ops.append(
+                _Action(
+                    weight_stage_index,
+                    _ComputationType.BACKWARD_WEIGHT,
+                    weight_mb_index,
+                )
+            )
+            weight_op_count += 1
 
     FULL_BACKWARD_OR_BACKWARD_INPUT = (
         BACKWARD_INPUT if enable_zero_bubble else FULL_BACKWARD
@@ -198,20 +223,7 @@ def _get_1f1b_rank_ops(
             backward_op_ids.append(op)
 
             if enable_zero_bubble and op - warmup_ops >= num_1f1b_microbatches:
-                weight_stage_index = backward_stage_index(
-                    backward_op_ids[weight_op_count]
-                )
-                weight_stage_mb_index[weight_stage_index] = (
-                    weight_mb_index := weight_stage_mb_index[weight_stage_index]
-                ) + 1
-                rank_ops.append(
-                    _Action(
-                        weight_stage_index,
-                        _ComputationType.BACKWARD_WEIGHT,
-                        weight_mb_index,
-                    )
-                )
-                weight_op_count += 1
+                append_ready_weight_ops(1)
         # Cooldown phase
         else:
             # During cooldown phase, we need steps to align with 1f1b happening in other ranks
@@ -229,20 +241,12 @@ def _get_1f1b_rank_ops(
             backward_op_ids.append(op)
 
             if enable_zero_bubble and op - warmup_ops >= num_1f1b_microbatches:
-                weight_stage_index = backward_stage_index(
-                    backward_op_ids[weight_op_count]
-                )
-                weight_stage_mb_index[weight_stage_index] = (
-                    weight_mb_index := weight_stage_mb_index[weight_stage_index]
-                ) + 1
-                rank_ops.append(
-                    _Action(
-                        weight_stage_index,
-                        _ComputationType.BACKWARD_WEIGHT,
-                        weight_mb_index,
-                    )
-                )
-                weight_op_count += 1
+                # Fine-grained W is much shorter than a full transformer-layer
+                # I. Consume several ready W actions in a cooldown window so
+                # the initial delayed-W backlog does not become a serialized
+                # tail. The caller derives this bound from measured I/W cost;
+                # the delayed-W count independently bounds retained memory.
+                append_ready_weight_ops(max_weight_backwards_per_cooldown)
 
     while enable_zero_bubble and weight_op_count < len(backward_op_ids):
         weight_stage_index = backward_stage_index(backward_op_ids[weight_op_count])

@@ -9,6 +9,9 @@ import os
 from typing import Any, Callable
 
 
+_FBW_SCHEDULE_GROUP_UNSET = object()
+
+
 def _to_bool(s: str, default=False) -> bool:
     val = os.environ.get(s, default=default)
     return bool(int(val))
@@ -115,19 +118,52 @@ class RuntimeFlag:
     # ``defer_fbw_weight_task`` leave work for the scheduled dWeight phase.
     # The generic NNScaler graph-splitting path remains the default.
     fbw_accumulate_undeferred_grads: bool = False
-
+    # Once a pipeline segment has discovered which module-level dWeight group
+    # crosses its P2P boundary, later microbatches can compute every other
+    # grouped Linear directly in I. ``None`` means the segment is still in its
+    # one-time discovery pass.
+    fbw_schedule_groups: frozenset[Any] | None = None
+    # Megatron-style module-local delayed wgrad inside an otherwise native
+    # pipeline backward. The ordinary GraphTask still owns every parameter
+    # except explicitly annotated Linear callbacks. Executor.backward retains
+    # at most one selected module group until the following P2P send has been
+    # enqueued, avoiding the fixed cost and cooldown tail of stage-level FBW.
+    fbw_native_module_overlap: bool = False
+    # True only while Executor.backward collects callbacks for the native
+    # module-local path. Keep this separate from ``fbw_phase == "input"`` so
+    # unrelated phase-aware kernels retain their ordinary native backward.
+    fbw_native_module_phase: bool = False
     @classmethod
     def defer_fbw_weight_task(
         cls,
         callback: Callable[[], Any],
         targets: tuple[Any, ...],
+        *,
+        schedule_group: Any = _FBW_SCHEDULE_GROUP_UNSET,
     ) -> None:
-        if cls.fbw_phase != "input" or cls.fbw_deferred_tasks is None:
+        if (
+            cls.fbw_phase != "input"
+            and not cls.fbw_native_module_phase
+        ) or cls.fbw_deferred_tasks is None:
             raise RuntimeError(
                 "dWeight tasks can only be registered by the split-backward "
                 "dInput phase"
             )
         callback._nnscaler_fbw_targets = targets
+        # A task with an explicit schedule group participates in fine-grained
+        # delayed-wgrad scheduling. ``None`` means complete it before dInput
+        # returns; a non-None value groups module-level tasks that must move as
+        # one unit. Tasks registered through the legacy API remain untouched.
+        if schedule_group is not _FBW_SCHEDULE_GROUP_UNSET:
+            callback._nnscaler_fbw_schedule_group = schedule_group
+        # ``stage_backward_input_selective`` may distribute callbacks across
+        # several parameter groups.  Preserve the original autograd
+        # registration order so the executor can still choose one movable W
+        # group across the whole pipeline segment instead of one per
+        # parameter group.
+        callback._nnscaler_fbw_registration_order = len(
+            cls.fbw_deferred_tasks
+        )
         cls.fbw_deferred_tasks.append(callback)
 
     # if True, skip model.zero_grad().

@@ -240,7 +240,7 @@ def test_schedule_groups_adjacent_pipeline_sends_into_one_bundle():
     assert events == {
         0: [('reserve', ((0, 1),))],
         1: [('begin', ((0, 1),))],
-        2: [('end', ((0, 1),))],
+        2: [('end_forward', ((0, 1),))],
     }
 
 
@@ -256,11 +256,11 @@ def test_schedule_does_not_merge_forward_and_backward_send_bundles():
         0: [
             ('reserve', ((0, 1),)),
             ('begin', ((0, 1),)),
-            ('end', ((0, 1),)),
+            ('end_backward', ((0, 1),)),
         ],
         1: [
             ('reserve', ((0, 1),)),
             ('begin', ((0, 1),)),
-            ('end', ((0, 1),)),
+            ('end_forward', ((0, 1),)),
         ],
     }

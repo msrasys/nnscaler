@@ -173,10 +173,18 @@ class ScheduleCodeGen(FuncEmission):
             methods = {
                 'reserve': 'reserve_send_bundle',
                 'begin': 'begin_send_bundle',
-            } if before_node else {'end': 'end_send_bundle'}
+            } if before_node else {
+                'end_forward': 'end_send_bundle',
+                'end_backward': 'end_send_bundle',
+            }
             for event_name, bundle_key in events:
                 if method_name := methods.get(event_name):
-                    args = repr(bundle_key) if event_name != 'end' else ''
+                    if event_name in ('reserve', 'begin'):
+                        args = repr(bundle_key)
+                    elif event_name == 'end_backward':
+                        args = 'run_native_weight_tasks=True'
+                    else:
+                        args = 'run_native_weight_tasks=False'
                     _append_code(
                         fb,
                         'nnscaler.runtime.executor.AsyncCommHandler()'
@@ -492,7 +500,8 @@ class ScheduleCodeGen(FuncEmission):
                     break
             events.setdefault(reserve_line, []).append(('reserve', key))
             events.setdefault(line, []).append(('begin', key))
-            events.setdefault(end, []).append(('end', key))
+            end_event = 'end_forward' if is_forward else 'end_backward'
+            events.setdefault(end, []).append((end_event, key))
             line = end + 1
         return events
 

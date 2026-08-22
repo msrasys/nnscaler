@@ -292,6 +292,13 @@ class ComputeConfig:
             )
             if max_pending is not None:
                 scheduler_kwargs['max_pending_weight_backwards'] = max_pending
+            cooldown_batch = self.pas_config.get(
+                'zero_bubble_max_weight_backwards_per_cooldown'
+            )
+            if cooldown_batch is not None:
+                scheduler_kwargs[
+                    'max_weight_backwards_per_cooldown'
+                ] = cooldown_batch
         plan = sched(
             graph,
             pipeline_nmicros,

@@ -80,9 +80,10 @@ def test_pipeline_codegen_emits_split_backward(tmp_path, pipeline_scheduler):
             r'nnscaler\.runtime\.executor\.(backward_input|backward_weight)\(',
         )
         if pipeline_scheduler == '1f1b_interleaved_zero_bubble' \
-                and rank == 1:
-            # Rank 1 delays W by one I, including across cooldown. This checks
-            # that the generated program is not merely adjacent I/W pairs.
+                and rank == 0:
+            # The first rank has the longer backward cooldown and delays W by
+            # one I. This checks that the generated program is not merely
+            # adjacent I/W pairs.
             assert split_actions[:2] == [
                 'backward_input',
                 'backward_input',

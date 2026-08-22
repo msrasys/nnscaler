@@ -21,6 +21,11 @@ from nnscaler.parallel import ComputeConfig, parallelize, build_optimizer
 from nnscaler.ir.operator import IRFwOperation, IRDataOperation
 from nnscaler.graph.segment import IRSegment
 from nnscaler.graph.schedule.predefined import PredefinedSched
+from nnscaler.graph.schedule.interleaved_1f1b import (
+    BACKWARD_INPUT,
+    BACKWARD_WEIGHT,
+    _get_1f1b_rank_ops,
+)
 from tests.utils import clear_dir_on_rank0, init_random, PYTEST_RUN_ID
 from tests.launch_torchrun import torchrun
 from tests.parallel_module.common import assert_equal
@@ -42,6 +47,89 @@ class Model(torch.nn.Module):
         x = self.fc3(x)
         x = self.fc4(x)
         return x.sum()
+
+
+def _zero_bubble_rank_ops(rank, cooldown_batch):
+    n_local_stages = 4
+    pp_group_size = 4
+    num_microbatches = 8
+    num_rounds = max(1, num_microbatches // pp_group_size)
+    microbatches_per_round = num_microbatches // num_rounds
+    microbatch_ops = n_local_stages * num_microbatches
+    warmup_ops = min(
+        (n_local_stages - 1) * microbatches_per_round
+        + 2 * (pp_group_size - 1 - rank),
+        microbatch_ops,
+    )
+
+    def forward_stage_index(step):
+        local_index = (
+            step // microbatches_per_round
+        ) % n_local_stages
+        return local_index * pp_group_size + rank
+
+    def backward_stage_index(step):
+        local_index = (
+            n_local_stages
+            - 1
+            - ((step - warmup_ops) // microbatches_per_round)
+            % n_local_stages
+        )
+        return local_index * pp_group_size + rank
+
+    return [
+        op for op in _get_1f1b_rank_ops(
+            n_local_stages,
+            pp_group_size,
+            warmup_ops,
+            microbatch_ops - warmup_ops,
+            warmup_ops,
+            rank,
+            forward_stage_index,
+            backward_stage_index,
+            num_1f1b_microbatches=pp_group_size - 1 - rank,
+            enable_zero_bubble=True,
+            max_weight_backwards_per_cooldown=cooldown_batch,
+        ) if op is not None
+    ]
+
+
+def test_zero_bubble_cooldown_batch_drains_delayed_weight_tail():
+    for rank in range(4):
+        original = _zero_bubble_rank_ops(rank, cooldown_batch=1)
+        batched = _zero_bubble_rank_ops(rank, cooldown_batch=2)
+
+        original_last_i = max(
+            index for index, op in enumerate(original)
+            if op.computation_type == BACKWARD_INPUT
+        )
+        batched_last_i = max(
+            index for index, op in enumerate(batched)
+            if op.computation_type == BACKWARD_INPUT
+        )
+        assert len(original[original_last_i + 1:]) == 4 - rank
+        assert len(batched[batched_last_i + 1:]) == 1
+
+        input_positions = {
+            (op.stage_index, op.microbatch_index): index
+            for index, op in enumerate(batched)
+            if op.computation_type == BACKWARD_INPUT
+        }
+        weight_positions = {
+            (op.stage_index, op.microbatch_index): index
+            for index, op in enumerate(batched)
+            if op.computation_type == BACKWARD_WEIGHT
+        }
+        assert input_positions.keys() == weight_positions.keys()
+        assert all(
+            input_positions[key] < weight_positions[key]
+            for key in input_positions
+        )
+
+
+def test_zero_bubble_cooldown_batch_must_be_positive():
+    with pytest.raises(ValueError, match='must be positive'):
+        _zero_bubble_rank_ops(0, cooldown_batch=0)
 
 
 def policy_1f1b(graph, cfg):

@@ -90,6 +90,78 @@ def get_reducer_grad_accumulator(
     ].view(info.shape)
 
 
+def claim_reducer_grad_accumulator(
+    param: torch.nn.Parameter,
+) -> Tuple[Optional[torch.Tensor], bool]:
+    """Return a direct grad buffer and whether this is its first contribution.
+
+    Delayed Linear wgrad can write the first contribution with ``mm`` instead
+    of reading a zeroed main-grad buffer through ``addmm``.  The bucket tracks
+    native and manual contributions as well, so this remains correct when a
+    parameter receives gradients through more than one autograd path.
+    """
+    bucket = _get_reducer_bucket(param)
+    if bucket is None or param not in bucket._pofset or bucket._z3:
+        return None, False
+    info = bucket._params_info[param]
+    offset = bucket._pofset[param]
+    accumulator = bucket._contiguous_grads[
+        offset:offset + math.prod(info.shape)
+    ].view(info.shape)
+    first_contribution = param not in bucket._grad_accumulator_initialized
+    bucket._grad_accumulator_initialized.add(param)
+    return accumulator, first_contribution
+
+
+def prepare_deferred_reducer_grad(
+    param: torch.nn.Parameter,
+) -> Optional[Tuple[torch.Tensor, bool, Callable[[torch.nn.Parameter], None]]]:
+    """Prepare a direct delayed-wgrad contribution once during dInput.
+
+    Module-local delayed wgrad runs on the pipeline scheduler's hot path.  A
+    callback that repeatedly resolves the parameter's bucket, accumulator,
+    and completion state can cost more CPU time than its small GEMM.  Resolve
+    that stable state while the callback is registered and return the bound
+    bucket completion method for use after the GEMM is launched.
+
+    ZeRO-3 is intentionally excluded because it requires a complete gradient
+    contribution before selecting the locally owned shard.
+    """
+    bucket = _get_reducer_bucket(param)
+    if bucket is None or param not in bucket._pofset or bucket._z3:
+        return None
+    info = bucket._params_info[param]
+    offset = bucket._pofset[param]
+    accumulator = bucket._contiguous_grads[
+        offset:offset + math.prod(info.shape)
+    ].view(info.shape)
+    first_contribution = param not in bucket._grad_accumulator_initialized
+    bucket._grad_accumulator_initialized.add(param)
+    bucket.defer_grad(param)
+    return accumulator, first_contribution, bucket.complete_manual_grad
+
+
+def prepare_manual_reducer_grad_publisher(
+    param: torch.nn.Parameter,
+) -> Optional[Tuple[Callable[[torch.Tensor], None], Callable[[], None]]]:
+    """Bind a manual-gradient publisher to its stable reducer bucket.
+
+    Expert ``backward_dw`` publishes two gradients at every layer and
+    microbatch.  Repeating the global weak-reference lookup in both
+    ``accumulate_reducer_grad`` and ``complete_reducer_grad`` puts Python on
+    the dispatch-backward critical path.  Reducer ownership is fixed for the
+    model lifetime, so callers may cache these bound operations just like a
+    module caches its post-wgrad hook in Megatron.
+    """
+    bucket = _get_reducer_bucket(param)
+    if bucket is None or param not in bucket._pofset:
+        return None
+    return (
+        partial(bucket.accumulate_grad, param),
+        partial(bucket.complete_manual_grad, param),
+    )
+
+
 @torch.no_grad()
 def accumulate_reducer_grad(
     param: torch.nn.Parameter,
@@ -476,6 +548,11 @@ class Bucket:
         # scheduled W completes the contribution later.  This mirrors
         # Megatron's skip_backward_post_hook/backward_dw lifecycle.
         self._deferred_grad_pending: Set[torch.nn.Parameter] = set()
+        # Parameters whose reducer-owned main-grad slice already contains at
+        # least one contribution in the current optimizer step.  This lets a
+        # direct dWeight GEMM use beta=0 exactly once without inspecting or
+        # synchronizing the CUDA buffer.
+        self._grad_accumulator_initialized: Set[torch.nn.Parameter] = set()
         self._hooks: List[Tuple[Any, RemovableHandle]] = []
 
         self._async: bool = async_op
@@ -666,6 +743,7 @@ class Bucket:
                         "mark_reducer_grad_ready(param) before returning None."
                     )
             elif self._z3:
+                self._grad_accumulator_initialized.add(param)
                 z3_info = self._reducer.get_z3_info(param)
                 grad = param.grad.data.view(-1)
                 padded_numel = z3_info.numel_with_padding() * self._zgroup_sz
@@ -688,6 +766,7 @@ class Bucket:
                 self._contiguous_grads[ofst:ofst+z3_info.numel()]\
                     .add_(output[0:z3_info.end-z3_info.start])
             else:
+                self._grad_accumulator_initialized.add(param)
                 self._contiguous_grads[ofst:ofst+param.numel()].add_(param.grad.data.view(-1))
 
             param.grad = None
@@ -770,9 +849,45 @@ class Bucket:
                 f"{self._contiguous_grads.device}."
             )
 
+        self._grad_accumulator_initialized.add(param)
+
         ofst = self._pofset[param]
         if not self._z3:
             self._contiguous_grads[ofst + offset:ofst + end].add_(grad)
+            return
+
+        # Deferred module-level dWeight callbacks normally produce the full
+        # parameter gradient.  Preserve the native ZeRO-3 communication in
+        # that common case: reduce-scatter once into this rank's shard.  The
+        # older arbitrary-slice fallback below must all-reduce each slice so
+        # every owner can select its intersection; using it for a full tensor
+        # needlessly communicates and materializes the full reduced result on
+        # every rank.
+        if offset == 0 and grad.numel() == param_numel:
+            z3_info = self._reducer.get_z3_info(param)
+            shard_numel = z3_info.numel_with_padding()
+            padded_numel = shard_numel * self._zgroup_sz
+            if grad.numel() < padded_numel:
+                grad = torch.nn.functional.pad(
+                    grad,
+                    (0, padded_numel - grad.numel()),
+                    mode='constant',
+                    value=0.0,
+                )
+            output = torch.empty(
+                shard_numel,
+                device=grad.device,
+                dtype=grad.dtype,
+            )
+            torch.distributed.reduce_scatter_tensor(
+                output,
+                grad,
+                op=self._reduce_op,
+                group=self._zero_subgroup,
+            )
+            self._contiguous_grads[ofst:ofst + z3_info.numel()].add_(
+                output[:z3_info.end - z3_info.start]
+            )
             return
 
         # ZeRO-3 normally reduce-scatters a complete ``param.grad`` in the
@@ -1022,6 +1137,7 @@ class Bucket:
         self._async_seen_param_cnt = {p: 0 for p in self._params}
         self._manual_grad_pending.clear()
         self._deferred_grad_pending.clear()
+        self._grad_accumulator_initialized.clear()
 
     def sleep(self):
         """
@@ -1081,6 +1197,7 @@ class Bucket:
         state.pop(fields._post_hooks, None)
         state.pop(fields._manual_grad_pending, None)
         state.pop(fields._deferred_grad_pending, None)
+        state.pop(fields._grad_accumulator_initialized, None)
 
         # remove reducer reference
         state.pop(fields._reducer, None)
@@ -1097,6 +1214,7 @@ class Bucket:
         bucket._reducer = reducer
         bucket._manual_grad_pending = set()
         bucket._deferred_grad_pending = set()
+        bucket._grad_accumulator_initialized = set()
         set_fparam_meta(bucket._param_for_optimizer, bucket._flatten_param_info)
 
         for param in bucket._params:
@@ -1620,6 +1738,16 @@ class Reducer:
         synchronize gradients using allreduce (non-zero) or reduce-scatter (zero)
         """
         if RuntimeFlag.skip_reducer: return
+        # A native module-local backward normally drains its one retained
+        # dWeight after the following pipeline send has been submitted.  The
+        # final backward on a rank can have no following P2P boundary, though,
+        # so finish that last callback before validating async-reducer counts.
+        # This is the same placement as Megatron's final ``backward_dw()``:
+        # after post-backward communication and before gradient reduction.
+        if RuntimeFlag.fbw_native_module_overlap:
+            from nnscaler.runtime.executor import Executor
+
+            Executor.finish_native_module_weight_tasks(force=True)
         for bucket in self._buckets:
             bucket.sync_grads()
 

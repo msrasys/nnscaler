@@ -318,13 +318,15 @@ class PredefinedSched:
         num_stages: int,
         *,
         max_pending_weight_backwards: int | None = None,
+        max_weight_backwards_per_cooldown: int = 1,
     ) -> SchedulePlan:
         """Interleaved ZB1P schedule with F/I/W actions in every phase.
 
         Keep the same warmup as Megatron's interleaved 1F1B schedule so that an
         input backward is not issued before its downstream gradient can be
-        ready. Weight backward is delayed by ``rank`` input-backward actions
-        and fills otherwise idle slots through steady state and cooldown.
+        ready. Earlier pipeline ranks delay more weight-backward actions,
+        matching their larger backward cooldown bubbles; the last rank keeps
+        I/W adjacent because it has no downstream cooldown distance to fill.
         """
         if num_microbatches <= 0:
             raise ValueError(
@@ -335,6 +337,11 @@ class PredefinedSched:
             raise ValueError(
                 'max_pending_weight_backwards must be > 0, got '
                 f'{max_pending_weight_backwards}'
+            )
+        if max_weight_backwards_per_cooldown <= 0:
+            raise ValueError(
+                'max_weight_backwards_per_cooldown must be > 0, got '
+                f'{max_weight_backwards_per_cooldown}'
             )
 
         segments: List[IRSegment] = graph.select(
@@ -402,7 +409,14 @@ class PredefinedSched:
                 )
                 return local_index * pp_group_size + rank
 
-            weight_backward_delay = rank
+            # The earliest pipeline rank has the longest backward cooldown:
+            # after it sends dInput downstream it still has to wait for later
+            # I actions to travel back through the pipeline.  That is where
+            # movable W work can hide.  Delaying by ``rank`` did the opposite:
+            # rank 0 (the rank with the largest cooldown bubble) always ran
+            # I/W adjacently, while the last rank accumulated the longest W
+            # tail.  Count distance from the last rank instead.
+            weight_backward_delay = pp_group_size - 1 - rank
             if max_pending_weight_backwards is not None:
                 # A delay of d produces at most d + 1 pending I states before
                 # the first W. Cap that queue for models whose retained
@@ -423,6 +437,9 @@ class PredefinedSched:
                 backward_stage_index,
                 num_1f1b_microbatches=weight_backward_delay,
                 enable_zero_bubble=True,
+                max_weight_backwards_per_cooldown=(
+                    max_weight_backwards_per_cooldown
+                ),
             )
             sequence = []
             for op in rank_ops:

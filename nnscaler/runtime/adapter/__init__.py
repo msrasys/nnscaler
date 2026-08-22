@@ -10,4 +10,5 @@ from nnscaler.runtime.adapter.reducer import (
     defer_reducer_grad,
     has_reducer_grad_accumulator,
     mark_reducer_grad_ready,
+    prepare_deferred_reducer_grad,
 )
