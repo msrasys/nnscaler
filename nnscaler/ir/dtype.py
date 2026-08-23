@@ -20,6 +20,12 @@ class DTypeInfo:
         torch.float32: 4,
         torch.bfloat16: 2,
         torch.float16: 2,
+        # FP8 values can be present in traced graphs and need storage-size
+        # accounting here; they are intentionally excluded from promotion rules.
+        torch.float8_e4m3fn: 1,
+        torch.float8_e5m2: 1,
+        torch.float8_e4m3fnuz: 1,
+        torch.float8_e5m2fnuz: 1,
         torch.int64: 8,
         torch.int32: 4,
         torch.int16: 2,

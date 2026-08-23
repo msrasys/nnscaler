@@ -331,6 +331,27 @@ class Executor:
         grads = tuple(t.grad for t in input_tensors)
         assert all(grad is not None for grad in grads), "RuntimeError: got gradient None"
 
+        # ``fexecute`` deliberately detaches segment inputs.  Preserve the
+        # normal PyTorch ``retain_grad`` contract for callers that need a
+        # gradient to cross from an end-to-end generated subgraph back into an
+        # outer eager graph.
+        grad_by_input_id = {
+            tid: dtensor.grad
+            for tid, dtensor in saved_pairs
+            if torch.is_tensor(dtensor) and dtensor.requires_grad
+        }
+        for tensor in requested_input_tensors:
+            if (
+                torch.is_tensor(tensor)
+                and tensor.retains_grad
+                and (grad := grad_by_input_id.get(id(tensor))) is not None
+            ):
+                tensor.grad = (
+                    grad.detach()
+                    if tensor.grad is None
+                    else tensor.grad + grad.detach()
+                )
+
         if    len(grads) == 0: return None
         elif  len(grads) == 1: return grads[0]
         else: return grads

@@ -319,8 +319,10 @@ def mixin_module(model: torch.nn.Module, optimizer: torch.optim.Optimizer):
         return params_info
 
     model.set_grad_accumulation_steps = types.MethodType(set_grad_accumulation_steps, model)
-    model.train_step = types.MethodType(train_step, model)
-    model.infer_step = types.MethodType(infer_step, model)
+    if not callable(getattr(model, 'train_step', None)):
+        model.train_step = types.MethodType(train_step, model)
+    if not callable(getattr(model, 'infer_step', None)):
+        model.infer_step = types.MethodType(infer_step, model)
     model.parameters_for_calc_gnorm = types.MethodType(parameters_for_calc_gnorm, model)
     return model
 

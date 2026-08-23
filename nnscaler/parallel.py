@@ -1515,8 +1515,14 @@ def build_optimizer(
     if isinstance(module, CubeModule) and not isinstance(module, ParallelModule):
         raise RuntimeError("Old style CubeModule is not supported")
 
-    # only the root module can be end2end module.
-    if any(m != module and isinstance(m, ParallelModule) and  m.compute_config.use_end2end for m in module.modules()):
+    # End-to-end submodules need an outer wrapper that delegates train_step and
+    # handles gradients crossing the submodule boundary explicitly.
+    nested_end2end = [
+        m for m in module.modules()
+        if m is not module and isinstance(m, ParallelModule)
+        and m.compute_config.use_end2end
+    ]
+    if nested_end2end and not getattr(module, 'supports_nested_end2end', False):
         raise RuntimeError("End2End module cannot be nested in another module")
 
     is_hybrid = getattr(optimizer_fn, 'is_hybrid', False)
