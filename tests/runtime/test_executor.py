@@ -76,6 +76,57 @@ def test_backward_preserves_retained_outer_input_grad():
         Executor.clear()
 
 
+def test_input_grad_callback_resumes_outer_autograd_once():
+    Executor.clear()
+    try:
+        weight = torch.nn.Parameter(torch.tensor(2.0))
+        outer_input = weight * 3
+        output = Executor.fexecute(
+            'segment', lambda tensor, _metadata: torch.sin(tensor),
+            outer_input, {'kind': 'non_tensor_input'},
+        )
+        callback_grads = []
+
+        def resume_outer_backward(grad):
+            callback_grads.append(grad)
+            torch.autograd.backward(outer_input, grad)
+
+        Executor.register_input_grad_callback(outer_input, resume_outer_backward)
+        actual = Executor.backward(
+            'segment', (outer_input,), (output,), (torch.ones_like(output),),
+        )
+
+        expected = torch.cos(outer_input)
+        assert torch.equal(actual, expected)
+        assert len(callback_grads) == 1
+        assert torch.equal(callback_grads[0], expected)
+        assert torch.equal(weight.grad, expected * 3)
+        Executor.check_clear()
+    finally:
+        Executor.clear()
+
+
+def test_split_backward_runs_input_grad_callback():
+    weight = torch.nn.Parameter(torch.tensor(2.0))
+    outer_input = weight * 3
+    segment_input = outer_input.reshape(1, 1)
+    linear = torch.nn.Linear(1, 1, bias=False)
+    output = Executor.fexecute('segment', linear, segment_input)
+
+    def resume_outer_backward(grad):
+        torch.autograd.backward(outer_input, grad.reshape(()))
+
+    Executor.register_input_grad_callback(segment_input, resume_outer_backward)
+    Executor.backward_input(
+        'segment', [segment_input], [output],
+        [torch.ones_like(output)], linear.parameters(),
+    )
+
+    assert weight.grad is not None
+    Executor.backward_weight('segment', linear.parameters())
+    Executor.check_clear()
+
+
 def test_deferred_pseudo_free_waits_for_all_sends():
     Executor.clear()
     try:

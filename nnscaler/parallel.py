@@ -923,8 +923,20 @@ def _gencode(
         execplan = Grouping.apply(execplan)
 
     # code generation
-    assert len(execplan.graph.device) == compute_config.plan_ngpus, f"{execplan.graph.device}"
-    mgener = ModuleCodeGen(execplan, compute_config.runtime_ngpus)
+    if (
+        not execplan.graph.device
+        or min(execplan.graph.device) < 0
+        or max(execplan.graph.device) >= compute_config.plan_ngpus
+    ):
+        raise RuntimeError(
+            "Graph devices must be a non-empty subset of the NNScaler plan: "
+            f"devices={execplan.graph.device} plan_ngpus={compute_config.plan_ngpus}"
+        )
+    mgener = ModuleCodeGen(
+        execplan,
+        compute_config.runtime_ngpus,
+        plan_ndevs=compute_config.plan_ngpus,
+    )
     sgener = None
     if compute_config.use_end2end:
         sgener = ScheduleCodeGen(execplan, compute_config.runtime_ngpus)

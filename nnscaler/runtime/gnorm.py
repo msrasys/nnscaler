@@ -299,7 +299,10 @@ def clip_gnorm(
         device = localparams[0].device
         break
     else:
-        raise RuntimeError('no parameters found')
+        # A parallel policy may intentionally leave this rank inactive.  It
+        # still has to participate in the world-wide norm reduction so active
+        # ranks do not deadlock, contributing zero to the result.
+        device = torch.device('cuda', torch.cuda.current_device())
 
     total_grad_square = torch.tensor(0.0, dtype=torch.float64, device=device)
     grads = []

@@ -62,6 +62,40 @@ def test_codegen():
         launch_torchrun(1, _gencode_worker, tempdir)
 
 
+def _first_device_only(graph, _config):
+    from nnscaler.ir import IRDataOperation, IRFwOperation
+
+    for node in graph.select(ntype=(IRFwOperation, IRDataOperation)):
+        graph.assign(node, 0)
+    return graph
+
+
+@replace_all_device_with('cpu')
+def test_codegen_supports_inactive_plan_rank():
+    with tempfile.TemporaryDirectory() as tempdir:
+        parallelize(
+            Module0(),
+            {'x': torch.tensor([[1.0, 2.0, 3.0]])},
+            _first_device_only,
+            ComputeConfig(2, 4),
+            gen_savedir=tempdir,
+            load_module=False,
+        )
+        assert _gencode_contains(
+            tempdir,
+            Module0,
+            1,
+            r"This ParallelModule rank is inactive",
+        )
+        assert _gencode_contains(tempdir, Module0, 2, r"torch\.nn\.functional\.linear")
+        assert _gencode_contains(
+            tempdir,
+            Module0,
+            3,
+            r"This ParallelModule rank is inactive",
+        )
+
+
 class SliceModule(torch.nn.Module):
     def __init__(self):
         super().__init__()
