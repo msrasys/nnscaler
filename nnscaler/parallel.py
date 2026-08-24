@@ -867,27 +867,25 @@ def _gen_rank_code(
     sgener: Optional[ScheduleCodeGen],
     compute_config: ComputeConfig,
     forward_args: Dict[str, Any],
-    compile_flags: Dict[str, Any],
     rank: int,
     outfile: str,
 ) -> Tuple[int, Dict[str, Any]]:
     attr_meta_map = {}
-    with _flags(CompileFlag, **compile_flags):
-        mgener.gen(
-            rank,
-            forward_args=forward_args,
+    mgener.gen(
+        rank,
+        forward_args=forward_args,
+        outfile=outfile,
+        attach=False,
+        as_parallel_module=True,
+        end2end_mode=compute_config.use_end2end,
+        out_attr_meta_map=attr_meta_map,
+    )
+    if sgener is not None:
+        sgener.gen(
+            device=rank,
             outfile=outfile,
-            attach=False,
-            as_parallel_module=True,
-            end2end_mode=compute_config.use_end2end,
-            out_attr_meta_map=attr_meta_map,
+            attach=True,
         )
-        if sgener is not None:
-            sgener.gen(
-                device=rank,
-                outfile=outfile,
-                attach=True,
-            )
     return rank, attr_meta_map[rank]
 
 
@@ -1051,21 +1049,14 @@ def _gencode(
     # code generation
     assert len(repr_execplan.graph.device) == compute_config.plan_ngpus, f"{repr_execplan.graph.device}"
 
-    # prepare process shared codegen objects
+    # Prepare codegen objects to serialize into each worker task.
     mgener = ModuleCodeGen(repr_execplan, compute_config.runtime_ngpus)
     sgener = None
     attr_merged_meta_map = {}
     if compute_config.use_end2end:
         sgener = ScheduleCodeGen(execplan, compute_config.runtime_ngpus)
-    # this is necessary because we need to pass the compile flags to the child processes,
-    # and CompileFlag has only class-level attributes, so we need to convert it to a dict.
-    compile_flags = {
-        name: value
-        for name, value in vars(CompileFlag).items()
-        if not name.startswith('_')
-    }
 
-    codegen_args = (mgener, sgener, compute_config, forward_args, compile_flags)
+    codegen_args = (mgener, sgener, compute_config, forward_args)
     rank_args = [
         (rank, str(outdir / _GENCODE_FILE_TEMPLATE.format(rank)))
         for rank in range(compute_config.runtime_ngpus)
@@ -1077,8 +1068,11 @@ def _gencode(
         # ExecutePlan is too complex. default recursion limit is too low for dill to serialize it.
         with recursion_limit(DILL_RECURSION_LIMIT, increase_only=True):
             dilled_codegen = dill.dumps(codegen_args)
-        # Avoid inheriting parent CUDA/PyTorch runtime state through fork.
-        mp_context = multiprocessing.get_context('spawn')
+        # TODO: `spawn` is supposed to use when CUDA is used.
+        # But it is really hard to pass all global objects to subprocesses.
+        # As we never use pytorch during code generation,
+        # it should be safe to use `fork`
+        mp_context = multiprocessing.get_context('fork')
         with ProcessPoolExecutor(max_workers=max_workers, mp_context=mp_context) as executor:
             futures = [
                 executor.submit(_gen_rank_code_worker, dilled_codegen, *rank_arg)

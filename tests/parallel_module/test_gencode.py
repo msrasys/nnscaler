@@ -45,6 +45,23 @@ class Module0(torch.nn.Module):
         return self.linear(x)
 
 
+def emit_multiprocess_customized_add(node, args, kwargs, runtime_devid, plan_ndevs, runtime_ndevs):
+    kw_pairs = [f'{key}={value}' for key, value in kwargs.items()]
+    return f"torch.add({', '.join(list(args) + kw_pairs)})"
+
+nnscaler.register_op(
+    '*, * -> *',
+    emit_fn=emit_multiprocess_customized_add,
+)
+def multiprocess_customized_add(x, y):
+    return x + y
+
+
+class MultiprocessCustomizedEmitModule(torch.nn.Module):
+    def forward(self, x, y):
+        return multiprocess_customized_add(x, y)
+
+
 def _gencode_worker(tempdir):
     init_distributed()
     m = Module0()
@@ -85,6 +102,27 @@ def test_codegen_multiprocess():
             )
     finally:
         CompileFlag.line_timer = old_line_timer
+
+
+@replace_all_device_with('cpu')
+def test_codegen_multiprocess_customized_emit(tmp_path):
+    parallelize(
+        MultiprocessCustomizedEmitModule(),
+        {'x': torch.randn(2, 4), 'y': torch.randn(2, 4)},
+        'data',
+        ComputeConfig(1, 2),
+        gen_savedir=tmp_path,
+        load_module=False,
+        max_workers=2,
+    )
+
+    for rank in range(2):
+        assert _gencode_contains(
+            tmp_path,
+            MultiprocessCustomizedEmitModule,
+            rank,
+            r'torch\.add\(',
+        )
 
 
 @pytest.mark.parametrize('max_workers', [1.5, '2'])
