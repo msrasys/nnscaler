@@ -72,9 +72,12 @@ from nnscaler.utils import (
     copy_dynamic,
     broadcast_files,
     first,
+    recursion_limit,
 )
 
 logger = logging.getLogger(__name__)
+
+DILL_RECURSION_LIMIT = 10000
 
 _PREDEFINE_SCHEDS: Dict[str, Callable[[IRGraph, int, int], SchedulePlan]] = {}
 _PREDEFINED_INFERENCE_SCHEDS = ['infer_pipe']
@@ -864,35 +867,45 @@ def _gen_rank_code(
     sgener: Optional[ScheduleCodeGen],
     compute_config: ComputeConfig,
     forward_args: Dict[str, Any],
+    compile_flags: Dict[str, Any],
     rank: int,
     outfile: str,
 ) -> Tuple[int, Dict[str, Any]]:
     attr_meta_map = {}
-    mgener.gen(
-        rank,
-        forward_args=forward_args,
-        outfile=outfile,
-        attach=False,
-        as_parallel_module=True,
-        end2end_mode=compute_config.use_end2end,
-        out_attr_meta_map=attr_meta_map,
-    )
-    if sgener is not None:
-        sgener.gen(
-            device=rank,
+    with _flags(CompileFlag, **compile_flags):
+        mgener.gen(
+            rank,
+            forward_args=forward_args,
             outfile=outfile,
-            attach=True,
+            attach=False,
+            as_parallel_module=True,
+            end2end_mode=compute_config.use_end2end,
+            out_attr_meta_map=attr_meta_map,
         )
+        if sgener is not None:
+            sgener.gen(
+                device=rank,
+                outfile=outfile,
+                attach=True,
+            )
     return rank, attr_meta_map[rank]
 
 
-_GenRankCodeArgs = Tuple[ModuleCodeGen, Optional[ScheduleCodeGen], ComputeConfig, Dict[str, Any]]
+_GenRankCodeArgs = Tuple[
+    ModuleCodeGen,
+    Optional[ScheduleCodeGen],
+    ComputeConfig,
+    Dict[str, Any],
+    Dict[str, Any],
+]
 _gen_rank_code_worker_args: Optional[_GenRankCodeArgs] = None
 
 
-def _init_gen_rank_code_worker(codegen_args: _GenRankCodeArgs) -> None:
+def _init_gen_rank_code_worker(dilled_codegen: bytes) -> None:
     global _gen_rank_code_worker_args
-    _gen_rank_code_worker_args = codegen_args
+    # IRObjects back-reference their owning cells, making large graph pickle traversals deep.
+    with recursion_limit(DILL_RECURSION_LIMIT, increase_only=True):
+        _gen_rank_code_worker_args = dill.loads(dilled_codegen)
 
 
 def _gen_rank_code_worker(
@@ -901,7 +914,8 @@ def _gen_rank_code_worker(
 ) -> bytes:
     if _gen_rank_code_worker_args is None:
         raise RuntimeError('Code generation worker is not initialized')
-    return dill.dumps(_gen_rank_code(*_gen_rank_code_worker_args, rank, outfile))
+    with recursion_limit(DILL_RECURSION_LIMIT, increase_only=True):
+        return dill.dumps(_gen_rank_code(*_gen_rank_code_worker_args, rank, outfile))
 
 
 def _gencode(
@@ -937,6 +951,8 @@ def _gencode(
         autoset_requires_grad (bool): whether to automatically set the requires_grad of input tensors.
         max_workers (int): the maximum number of worker processes to use.
             When max_workers is 1, code generation will be done in the main process.
+            When max_workers is greater than 1, the caller must use an import-safe entry
+            point guarded by ``if __name__ == '__main__':`` because workers use spawn.
     Returns:
         RegenStatus: which part is regenerated.
     """
@@ -1059,7 +1075,22 @@ def _gencode(
     if compute_config.use_end2end:
         sgener = ScheduleCodeGen(execplan, compute_config.runtime_ngpus)
 
-    codegen_args = (mgener, sgener, compute_config, forward_args)
+    # this is necessary because we are using `spawn`,
+    # and need to pass the compile flags to the child processes
+    # Currently we assume only two global configs are needed in codegen:
+    # 1. CompileFlag (passed explicitly to _gen_rank_code)
+    # 2. CustomizedOps.kOpEmit (will is cached in nnscaler.codegen.frontend_mapping.Sign2EmitRule)
+    # IDGenerator state is ignored,because it doesn't affect codegen
+    # TODO: Are there more global configs?
+    #      `fork` can keep all global state, but python doesn't recommend it for CUDA/PyTorch,
+    #       and `spawn` is more robust.
+    compile_flags = {
+        name: value
+        for name, value in vars(CompileFlag).items()
+        if not name.startswith('_')
+    }
+
+    codegen_args = (mgener, sgener, compute_config, forward_args, compile_flags)
     rank_args = [
         (rank, str(outdir / _GENCODE_FILE_TEMPLATE.format(rank)))
         for rank in range(compute_config.runtime_ngpus)
@@ -1067,20 +1098,17 @@ def _gencode(
     if max_workers == 1 or compute_config.runtime_ngpus == 1:
         rank_results = [_gen_rank_code(*codegen_args, *rank_arg) for rank_arg in rank_args]
     else:
-        # TODO: `spawn` is supposed to use when CUDA is used.
-        # But it is really hard to pass all global objects to subprocesses.
-        # As we never use pytorch during code generation,
-        # it should be safe to use `fork`
-        mp_context = multiprocessing.get_context('fork')
-        # Under fork, we can pass local objects to subprocesses in `initargs`
-        # without serialization.
-        # those objects will be stored in global variable `_gen_rank_code_worker_args`
-        # in subprocesses.
+        # pickle doesn't work for graph/codegen objects, so use dill for worker payloads.
+        # ExecutePlan is too complex. default recursion limit is too low for dill to serialize it.
+        with recursion_limit(DILL_RECURSION_LIMIT, increase_only=True):
+            dilled_codegen = dill.dumps(codegen_args)
+        # Avoid inheriting parent CUDA/PyTorch runtime state through fork.
+        mp_context = multiprocessing.get_context('spawn')
         with ProcessPoolExecutor(
             max_workers=max_workers,
             mp_context=mp_context,
             initializer=_init_gen_rank_code_worker,
-            initargs=(codegen_args,),
+            initargs=(dilled_codegen,),
         ) as executor:
             futures = [
                 executor.submit(_gen_rank_code_worker, *rank_arg)
@@ -1255,6 +1283,8 @@ def parallelize(
             and this argument is mainly for non-end2end module.
         max_workers (int): the maximum number of worker processes to use for code generation.
             When max_workers is 1, code generation will be done in the main process.
+            When max_workers is greater than 1, the caller must use an import-safe entry
+            point guarded by ``if __name__ == '__main__':`` because workers use spawn.
     Returns:
         Union[ParallelModule, Type[ParallelModule], None]:
             if load_module flag is set, return the converted ParallelModule object or class

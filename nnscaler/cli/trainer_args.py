@@ -958,7 +958,8 @@ class TrainerArgs(PrecisionMixin, PolicyMixin):
     # auto: automatically decide the reuse strategy (moo for compile, match for run)
     # Or one of match/override/moo/graph (see `nnscaler.ReuseType`)
     gen_reuse: str = 'auto'
-    # the number of workers for generating code.
+    # The number of workers for generating code. Values greater than 1 require
+    # an import-safe entry point guarded by `if __name__ == '__main__':`.
     gen_max_workers: int = 1
     pas_policy: str = 'autodist'
     broadcast_strategy: str = 'all'
