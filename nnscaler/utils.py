@@ -31,6 +31,24 @@ import torch
 _logger = logging.getLogger(__name__)
 
 
+@contextmanager
+def recursion_limit(limit: int, *, increase_only: bool = False) -> Generator[None, None, None]:
+    """Temporarily set the Python recursion limit.
+
+    When ``increase_only`` is true, do nothing if ``limit`` does not exceed the
+    current recursion limit.
+    """
+    previous_limit = sys.getrecursionlimit()
+    if increase_only and limit <= previous_limit:
+        yield
+        return
+    try:
+        sys.setrecursionlimit(limit)
+        yield
+    finally:
+        sys.setrecursionlimit(previous_limit)
+
+
 def print_each_rank(msg: str, rank_only: Optional[int] = None, logger: Optional[logging.Logger] = None):
     """Logging the message.
 

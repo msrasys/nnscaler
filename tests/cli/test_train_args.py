@@ -1,6 +1,7 @@
 #  Copyright (c) Microsoft Corporation.
 #  Licensed under the MIT License.
 
+from dataclasses import replace
 from pathlib import Path
 import pytest
 import torch
@@ -135,6 +136,19 @@ def test_arg_merge_resolve():
     assert args.dataset.train_args['dim'] == 22
     assert args.dataset.val_args['dim'] == 22
     assert args.vars['hello'] == args.compute_config.plan_ngpus
+
+
+@pytest.mark.parametrize('gen_max_workers', [1.5, '2'])
+def test_gen_max_workers_type(gen_max_workers):
+    config_path = str(Path(__file__).with_name('trainer_args.yaml').resolve())
+    args = TrainerArgs.from_cli([
+        '-f', config_path,
+        '--compute_config.plan_ngpus', '1',
+        '--compute_config.runtime_ngpus', '1',
+    ])
+
+    with pytest.raises(TypeError, match='gen_max_workers must be an int'):
+        replace(args, gen_max_workers=gen_max_workers)
 
 
 
