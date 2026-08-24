@@ -889,15 +889,22 @@ def _gen_rank_code(
     return rank, attr_meta_map[rank]
 
 
+_GenRankCodeArgs = Tuple[ModuleCodeGen, Optional[ScheduleCodeGen], ComputeConfig, Dict[str, Any]]
+_gen_rank_code_worker_args: Optional[_GenRankCodeArgs] = None
+
+
+def _init_gen_rank_code_worker(codegen_args: _GenRankCodeArgs) -> None:
+    global _gen_rank_code_worker_args
+    _gen_rank_code_worker_args = codegen_args
+
+
 def _gen_rank_code_worker(
-        dilled_codegen: bytes,
         rank: int,
         outfile: str,
 ) -> bytes:
-    # IRObjects back-reference their owning cells, making large graph pickle traversals deep.
-    with recursion_limit(DILL_RECURSION_LIMIT, increase_only=True):
-        codegen_args = dill.loads(dilled_codegen)
-        return dill.dumps(_gen_rank_code(*codegen_args, rank, outfile))
+    if _gen_rank_code_worker_args is None:
+        raise RuntimeError('Code generation worker is not initialized')
+    return dill.dumps(_gen_rank_code(*_gen_rank_code_worker_args, rank, outfile))
 
 
 def _gencode(
@@ -1049,7 +1056,6 @@ def _gencode(
     # code generation
     assert len(repr_execplan.graph.device) == compute_config.plan_ngpus, f"{repr_execplan.graph.device}"
 
-    # Prepare codegen objects to serialize into each worker task.
     mgener = ModuleCodeGen(repr_execplan, compute_config.runtime_ngpus)
     sgener = None
     attr_merged_meta_map = {}
@@ -1064,18 +1070,23 @@ def _gencode(
     if max_workers == 1 or compute_config.runtime_ngpus == 1:
         rank_results = [_gen_rank_code(*codegen_args, *rank_arg) for rank_arg in rank_args]
     else:
-        # pickle doesn't work for graph/codegen objects, so use dill for worker payloads.
-        # ExecutePlan is too complex. default recursion limit is too low for dill to serialize it.
-        with recursion_limit(DILL_RECURSION_LIMIT, increase_only=True):
-            dilled_codegen = dill.dumps(codegen_args)
         # TODO: `spawn` is supposed to use when CUDA is used.
         # But it is really hard to pass all global objects to subprocesses.
         # As we never use pytorch during code generation,
         # it should be safe to use `fork`
         mp_context = multiprocessing.get_context('fork')
-        with ProcessPoolExecutor(max_workers=max_workers, mp_context=mp_context) as executor:
+        # Under fork, we can pass local objects to subprocesses in `initargs`
+        # without serialization.
+        # those objects will be stored in global variable `_gen_rank_code_worker_args`
+        # in subprocesses.
+        with ProcessPoolExecutor(
+            max_workers=max_workers,
+            mp_context=mp_context,
+            initializer=_init_gen_rank_code_worker,
+            initargs=(codegen_args,),
+        ) as executor:
             futures = [
-                executor.submit(_gen_rank_code_worker, dilled_codegen, *rank_arg)
+                executor.submit(_gen_rank_code_worker, *rank_arg)
                 for rank_arg in rank_args
             ]
             rank_results = [dill.loads(future.result()) for future in futures]

@@ -88,18 +88,18 @@ def test_codegen_multiprocess():
         with tempfile.TemporaryDirectory() as tempdir:
             m_new = _to_cube_model(
                 Module0(),
-                ComputeConfig(1, 2),
+                ComputeConfig(1, 4),
                 cube_savedir=tempdir,
                 load_module=False,
                 max_workers=2,
             )
             assert m_new is None
-            assert _gencode_contains(tempdir, Module0, 0, r'rank = 0')
-            assert _gencode_contains(tempdir, Module0, 1, r'rank = 1')
-            assert _gencode_contains(
-                tempdir, Module0, 1,
-                r'nnscaler\.runtime\.function\.print_time',
-            )
+            for rank in range(4):
+                assert _gencode_contains(tempdir, Module0, rank, rf'rank = {rank}')
+                assert _gencode_contains(
+                    tempdir, Module0, rank,
+                    r'nnscaler\.runtime\.function\.print_time',
+                )
     finally:
         CompileFlag.line_timer = old_line_timer
 
