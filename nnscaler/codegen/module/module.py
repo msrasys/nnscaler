@@ -91,7 +91,8 @@ class ModuleCodeGen(FuncEmission):
         execplan: ExecutionPlan,
         runtime_ndevs: Optional[int] = None,
         *,
-        scale_ndevs: Optional[int] = None
+        scale_ndevs: Optional[int] = None,
+        plan_ndevs: Optional[int] = None,
     ) -> None:
         """
         Create Module code generator
@@ -106,12 +107,17 @@ class ModuleCodeGen(FuncEmission):
         self.devices: Tuple[int] = tuple(sorted(execplan.graph.device))
         if self.devices != tuple(range(len(self.devices))):
             raise ValueError(f'device must be consecutive')
+        self.plan_ndevs = len(self.devices) if plan_ndevs is None else plan_ndevs
+        if not self.devices or self.plan_ndevs < 1 or self.devices[-1] >= self.plan_ndevs:
+            raise ValueError(
+                f'graph devices {self.devices} must fit within plan_ndevs={self.plan_ndevs}'
+            )
 
         if scale_ndevs is not None:
             _logger.warning("scale_ndevs is deprecated, please use runtime_ndevs instead")
             if runtime_ndevs is not None:
                 raise ValueError("You cannot use runtime_ndevs and scale_ndevs at the same time")
-        self.runtime_ndevs: int = runtime_ndevs or scale_ndevs or len(self.devices)
+        self.runtime_ndevs: int = runtime_ndevs or scale_ndevs or self.plan_ndevs
         # we will scale the graph as data parallelism
         # when we have more devices than the number of devices used in the graph
         # we need to do two things:
@@ -119,9 +125,9 @@ class ModuleCodeGen(FuncEmission):
         # 2. update node devices when emitting code (via scale)
         # TODO: Move the logic of scaling to a separate class (Maybe as a PlanPass?)
         #   It is too bad to put the scaling logic in the codegen
-        if self.runtime_ndevs % len(self.devices) != 0:
-            raise ValueError(f'runtime_ndevs must be a multiple of {len(self.devices)}')
-        self.enable_dp = self.runtime_ndevs > len(self.devices)
+        if self.runtime_ndevs % self.plan_ndevs != 0:
+            raise ValueError(f'runtime_ndevs must be a multiple of {self.plan_ndevs}')
+        self.enable_dp = self.runtime_ndevs > self.plan_ndevs
 
         self.init_code: List[str] = [
             '########## Generated Model Code ###########',
@@ -275,14 +281,14 @@ class ModuleCodeGen(FuncEmission):
                     zero_comm_groups.append(zero_crossgroup)
             return zero_comm_groups
 
-        nreplica = self.runtime_ndevs // len(self.devices)
+        nreplica = self.runtime_ndevs // self.plan_ndevs
         # scale communication groups
         graph = self.execplan.graph
         comm_groups = []
         # communication groups for parameters that are in reducers
         reducers: List[IRWeightReducer] = graph.select(ntype=IRWeightReducer)
         for reducer in reducers:
-            ranks = more_itertools.flatten(list(range(device, self.runtime_ndevs, len(self.devices))) \
+            ranks = more_itertools.flatten(list(range(device, self.runtime_ndevs, self.plan_ndevs)) \
                                            for device in reducer.device)
             ranks = tuple(sorted(ranks))
             comm_groups.append(ranks)
@@ -290,7 +296,7 @@ class ModuleCodeGen(FuncEmission):
             comm_groups.extend(_add_comm_for_group_zero(ranks))
         # communication groups for parameters that are outside reducers
         for device in self.devices:
-            ranks = list(range(device, self.runtime_ndevs, len(self.devices)))
+            ranks = list(range(device, self.runtime_ndevs, self.plan_ndevs))
             if len(ranks) > 1:
                 comm_groups.append(ranks)
                 # add comm groups for group ZeRO
@@ -302,7 +308,7 @@ class ModuleCodeGen(FuncEmission):
                 if isinstance(prim, CollectivePrim):
                     ranks = np.array(tuple(sorted(prim.kwargs['ranks'])), dtype=int)
                     for i in range(nreplica):
-                        shifted_ranks = tuple(ranks + i * len(self.devices))
+                        shifted_ranks = tuple(ranks + i * self.plan_ndevs)
                         shifted_ranks = tuple(int(rank) for rank in shifted_ranks)
                         if shifted_ranks not in comm_groups:
                             comm_groups.append(shifted_ranks)
@@ -311,7 +317,7 @@ class ModuleCodeGen(FuncEmission):
     def scale(self, node: IRCell, device: int) -> IRCell:
         if not self.enable_dp:
             return node
-        shift = (device // len(self.devices)) * len(self.devices)
+        shift = (device // self.plan_ndevs) * self.plan_ndevs
         if isinstance(node, IRAdapter):
             adapter = copy.copy(node)
             adapter._id = node.cid
@@ -342,7 +348,7 @@ class ModuleCodeGen(FuncEmission):
             ranks = list(node.device)
             scale_ranks = []
             for rank in ranks:
-                scale_ranks += list(range(rank, self.runtime_ndevs, len(self.devices)))
+                scale_ranks += list(range(rank, self.runtime_ndevs, self.plan_ndevs))
             reducer.device = sorted(scale_ranks)
             return reducer
         if isinstance(node, IRSegment) and node.isfw():
@@ -464,7 +470,7 @@ class ModuleCodeGen(FuncEmission):
         node_args: List[List[str]] = list()
         gen_nodes: List[IRCell] = list()
 
-        device_map = device % len(self.devices)
+        device_map = device % self.plan_ndevs
         sequence = self.execplan.seq(device_map)
         unrolled_seqs = []
         for node in sequence:
@@ -638,10 +644,12 @@ class ModuleCodeGen(FuncEmission):
                     cb.insert_body(fb.code)
 
             if as_parallel_module:
-                if not segment_idxs:
-                    raise RuntimeError("The graph has no segment, forward code cannot be generated.")
                 cb.insert_body('')
-                if not end2end_mode:
+                if not segment_idxs:
+                    with FunctionBlock(func_name='_forward_impl', args=['self', '*args', '**kwargs']) as fb:
+                        fb.insert_body("raise RuntimeError('This ParallelModule rank is inactive')")
+                    cb.insert_body(fb.code)
+                elif not end2end_mode:
                     if len(segment_idxs) > 1:
                         raise RuntimeError("The graph has more than one segment, forward code cannot be generated.")
                     segment_idx = segment_idxs[0]
@@ -1028,7 +1036,7 @@ class ModuleCodeGen(FuncEmission):
                                     f'we set clone_level=1 to avoid in-place modification issue.')
                     node.kwargs['clone_level'] = 1
 
-                code = self.emit_fnode(node, runtime_devid=runtime_devid, plan_ndevs=len(self.devices), runtime_ndevs=self.runtime_ndevs, prefix_attr='self.')
+                code = self.emit_fnode(node, runtime_devid=runtime_devid, plan_ndevs=self.plan_ndevs, runtime_ndevs=self.runtime_ndevs, prefix_attr='self.')
 
                 if not param_inputs or CompileFlag.use_zero <= 1:
                     node_code += code
