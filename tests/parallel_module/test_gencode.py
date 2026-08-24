@@ -47,9 +47,10 @@ class Module0(torch.nn.Module):
 
 def emit_multiprocess_customized_add(node, args, kwargs, runtime_devid, plan_ndevs, runtime_ndevs):
     kw_pairs = [f'{key}={value}' for key, value in kwargs.items()]
-    return f"torch.add({', '.join(list(args) + kw_pairs)})"
+    return f"torch.xadd({', '.join(list(args) + kw_pairs)})"
 
-nnscaler.register_op(
+
+@nnscaler.register_op(
     '*, * -> *',
     emit_fn=emit_multiprocess_customized_add,
 )
@@ -121,7 +122,7 @@ def test_codegen_multiprocess_customized_emit(tmp_path):
             tmp_path,
             MultiprocessCustomizedEmitModule,
             rank,
-            r'torch\.add\(',
+            r'torch\.xadd\(',
         )
 
 

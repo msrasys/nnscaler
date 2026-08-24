@@ -72,12 +72,9 @@ from nnscaler.utils import (
     copy_dynamic,
     broadcast_files,
     first,
-    recursion_limit,
 )
 
 logger = logging.getLogger(__name__)
-
-DILL_RECURSION_LIMIT = 10000
 
 _PREDEFINE_SCHEDS: Dict[str, Callable[[IRGraph, int, int], SchedulePlan]] = {}
 _PREDEFINED_INFERENCE_SCHEDS = ['infer_pipe']
