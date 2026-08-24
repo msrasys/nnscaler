@@ -141,6 +141,39 @@ class Executor:
     _weight_backward_states: Dict[str, List[_WeightBackwardState]] = dict()
     _backward_pre_hook: Optional[Callable] = None
 
+    _input_grad_callbacks: Dict[
+        int, Tuple[torch.Tensor, Callable[[torch.Tensor], None]]
+    ] = dict()
+
+    @staticmethod
+    def register_input_grad_callback(
+        tensor: torch.Tensor,
+        callback: Callable[[torch.Tensor], None],
+    ) -> None:
+        """Run ``callback`` once a detached segment produces ``tensor``'s grad."""
+        if not torch.is_tensor(tensor) or not tensor.requires_grad:
+            raise ValueError('input gradient callbacks require a grad-requiring tensor')
+        tensor_id = id(tensor)
+        if tensor_id in Executor._input_grad_callbacks:
+            raise RuntimeError('an input gradient callback is already registered')
+        # Keep the tensor alive so its id cannot be reused before the callback.
+        Executor._input_grad_callbacks[tensor_id] = (tensor, callback)
+
+    @staticmethod
+    def _run_input_grad_callbacks(
+        saved_pairs: TensorPairs,
+        grad_by_dtensor_id: Dict[int, Optional[torch.Tensor]],
+    ) -> None:
+        for tensor_id, dtensor in saved_pairs:
+            entry = Executor._input_grad_callbacks.pop(tensor_id, None)
+            if entry is None:
+                continue
+            grad = grad_by_dtensor_id.get(id(dtensor))
+            if grad is None:
+                raise RuntimeError('segment did not produce a registered input gradient')
+            _, callback = entry
+            callback(grad.detach())
+
     @staticmethod
     def _retained_inputs(input_tensors: Iterable[Any]) -> Dict[int, torch.Tensor]:
         """Caller tensors that asked to keep their gradient, keyed by id.
@@ -292,6 +325,15 @@ class Executor:
             retained_inputs, saved_pairs, {id(t): t.grad for t in input_tensors},
         )
 
+        Executor._run_input_grad_callbacks(
+            saved_pairs,
+            {
+                id(dtensor): dtensor.grad
+                for dtensor in dtensors
+                if torch.is_tensor(dtensor)
+            },
+        )
+
         if    len(grads) == 0: return None
         elif  len(grads) == 1: return grads[0]
         else: return grads
@@ -389,6 +431,7 @@ class Executor:
         grad_by_dtensor = dict(zip(map(id, unique_inputs), unique_grads))
         grads = tuple(grad_by_dtensor[id(tensor)] for tensor in input_tensors)
         Executor._restore_retained_grads(retained_inputs, saved_pairs, grad_by_dtensor)
+        Executor._run_input_grad_callbacks(saved_pairs, grad_by_dtensor)
         if len(grads) == 0: return None
         elif len(grads) == 1: return grads[0]
         else: return grads
@@ -461,6 +504,7 @@ class Executor:
         Executor._detach = dict()
         Executor._weight_backward_states = dict()
         Executor._backward_pre_hook = None
+        Executor._input_grad_callbacks = dict()
 
     @staticmethod
     def check_clear():
@@ -470,11 +514,14 @@ class Executor:
         for name, states in Executor._weight_backward_states.items():
             assert len(states) == 0, \
                 f"Fine remaining segment needs weight backward: {name}, remaining times: {len(states)}"
+        assert len(Executor._input_grad_callbacks) == 0, \
+            f"Input gradient callbacks remain: {len(Executor._input_grad_callbacks)}"
 
 
 fexecute = Executor.fexecute
 aexecute = Executor.aexecute
 backward = Executor.backward
+register_input_grad_callback = Executor.register_input_grad_callback
 backward_input = Executor.backward_input
 backward_weight = Executor.backward_weight
 sync_tensors = Executor.sync_tensors
