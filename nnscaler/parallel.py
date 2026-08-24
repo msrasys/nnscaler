@@ -1079,7 +1079,7 @@ def _gencode(
     # and need to pass the compile flags to the child processes
     # Currently we assume only two global configs are needed in codegen:
     # 1. CompileFlag (passed explicitly to _gen_rank_code)
-    # 2. CustomizedOps.kOpEmit (will is cached in nnscaler.codegen.frontend_mapping.Sign2EmitRule)
+    # 2. CustomizedOps.kOpEmit (is cached in nnscaler.codegen.frontend_mapping.Sign2EmitRule)
     # IDGenerator state is ignored,because it doesn't affect codegen
     # TODO: Are there more global configs?
     #      `fork` can keep all global state, but python doesn't recommend it for CUDA/PyTorch,
