@@ -163,6 +163,7 @@ def parallelize_graph(
         raise RuntimeError('assume there is no segment in the graph')
 
     search_out = _load_or_calc_parallel_plan(graph, autodist_config)
+    _logger.info(f'use plan with e2e time/s {1000 * search_out.e2e_time:.2f}ms')
     if autodist_config.legacy:
         return _parallelize_graph_legacy(graph, autodist_config, search_out)
     return _parallelize_graph_fn(graph, autodist_config, search_out)
@@ -199,7 +200,6 @@ def _parallelize_graph_fn(
     autodist_config: AutoDistConfig,
     search_out: PipelineSearchOutput,
 ) -> Iterable['OpPlan']:
-    _logger.info(f'use plan with e2e time/s {1000 * search_out.e2e_time:.2f}ms')
     pp_desc = search_out.desc
 
     cid2node: Dict[int, IRFwOperation] = dict()
@@ -238,7 +238,7 @@ def _parallelize_graph_fn(
 
         for cid in spmd_desc.partition_descs:
             if cid not in cid2node:
-                raise RuntimeError(f'node {cid} not found in {cid2node}, make sure the plan is correct')
+                raise RuntimeError(f'node {cid} not found in graph, make sure the plan is correct')
             if cid in planned_stages:
                 raise RuntimeError(f'node {cid} appears in multiple stages in the autodist plan')
             planned_stages[cid] = stage_id
@@ -250,7 +250,7 @@ def _parallelize_graph_fn(
     for recompute_id, group in enumerate(pp_desc.recompute_groups):
         for cid in group:
             if cid not in cid2node:
-                raise RuntimeError(f'recompute node {cid} not found in {cid2node}, make sure the plan is correct')
+                raise RuntimeError(f'recompute node {cid} not found in graph, make sure the plan is correct')
             if cid in recompute_ids:
                 raise RuntimeError(f'node {cid} appears in multiple recompute groups')
             recompute_ids[cid] = recompute_id
@@ -294,7 +294,6 @@ def _parallelize_graph_legacy(
     autodist_config: AutoDistConfig,
     search_out: PipelineSearchOutput,
 ) -> IRGraph:
-    _logger.info(f'use plan with e2e time/s {1000 * search_out.e2e_time:.2f}ms')
     pp_desc = search_out.desc
 
     cid2node: Dict[int, IRFwOperation] = dict()

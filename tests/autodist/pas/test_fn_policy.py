@@ -35,7 +35,23 @@ def test_multiple_update_freq_is_rejected(update_freq):
         pas_autodist(object(), config)
 
 
-@pytest.mark.parametrize('update_freq', [2, [2], (2, 2), {0: 2, 10: 2}])
+@pytest.mark.parametrize('update_freq', [0, -1, '0'])
+def test_non_positive_update_freq_is_rejected(update_freq):
+    config = ComputeConfig(1, 1, pas_config={'update_freq': update_freq})
+
+    with pytest.raises(ValueError, match='must be positive'):
+        pas_autodist(object(), config)
+
+
+@pytest.mark.parametrize('update_freq', [1.5, 'invalid', [2, 1.5]])
+def test_non_integer_update_freq_is_rejected(update_freq):
+    config = ComputeConfig(1, 1, pas_config={'update_freq': update_freq})
+
+    with pytest.raises(ValueError, match='must be int'):
+        pas_autodist(object(), config)
+
+
+@pytest.mark.parametrize('update_freq', [2, '2', [2], (2, 2), {0: 2, 10: 2}])
 def test_single_update_freq_is_supported(monkeypatch, tmp_path, update_freq):
     captured = {}
 
@@ -116,10 +132,10 @@ def test_autodist_rejects_zero3():
     'replicated_and_partition_pp.json',
     'replicated_and_partition_spmd.json',
 ])
-def test_shared_param_pipeline_fn(cfg_fname):
+def test_shared_param_pipeline_fn(cfg_fname, monkeypatch):
     batch_size, hidden_dim = 4, 1024
 
-    CompileFlag.dev_mode = True
+    monkeypatch.setattr(CompileFlag, 'dev_mode', True)
 
     with tempfile.TemporaryDirectory() as tempdir:
         model = Model(hidden_dim)

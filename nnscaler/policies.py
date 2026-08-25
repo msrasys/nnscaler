@@ -236,17 +236,24 @@ def pas_autodist(graph: IRGraph, cfg: 'ComputeConfig') -> Union[IRGraph, Iterabl
 
     update_freq_config = pas_cfg.get('update_freq', 1)
     if isinstance(update_freq_config, dict):
-        update_freqs = set(update_freq_config.values())
+        update_freqs = update_freq_config.values()
     elif isinstance(update_freq_config, (tuple, list)):
-        update_freqs = set(update_freq_config)
+        update_freqs = update_freq_config
     else:
-        update_freqs = {update_freq_config}
+        update_freqs = [update_freq_config]
+
+    if not all(isinstance(freq, int) or (isinstance(freq, str) and freq.isdigit()) for freq in update_freqs):
+        raise ValueError(f'update_freq must be int, but got {update_freq_config}')
+
+    update_freqs = set(int(freq) for freq in update_freqs)
 
     if len(update_freqs) != 1:
         raise ValueError(
             f'autodist only supports a single update_freq, but got {update_freq_config}'
         )
     update_freq = update_freqs.pop()
+    if update_freq <= 0:
+        raise ValueError(f'update_freq must be positive, but got {update_freq}')
 
     # optional parameters
 
