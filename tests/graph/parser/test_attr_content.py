@@ -51,15 +51,18 @@ def test_load_attr_content_only_reads_required_chunks(tmp_path: Path, monkeypatc
         sub_shape=(3,),
     )
 
-    loaded_files = []
+    load_calls = []
     torch_load = torch.load
 
     def record_load(filename, *args, **kwargs):
-        loaded_files.append(Path(filename).name)
+        load_calls.append((Path(filename).name, kwargs.copy()))
         return torch_load(filename, *args, **kwargs)
 
     monkeypatch.setattr(torch, 'load', record_load)
     module.load_attr_content(str(file_stem))
 
     assert torch.equal(module.local_weight, torch.arange(2, 5, dtype=torch.float32))
-    assert loaded_files == [FxModuleParser.ATTR_CONTENT_INDEX_FILE, 'fullmodel.pt.2']
+    assert load_calls == [
+        (FxModuleParser.ATTR_CONTENT_INDEX_FILE, {'weights_only': True}),
+        ('fullmodel.pt.2', {'mmap': True, 'weights_only': True}),
+    ]

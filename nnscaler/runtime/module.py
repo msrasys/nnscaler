@@ -412,7 +412,11 @@ class CubeModule(torch.nn.Module):
             for file_idx, attrs in sorted(chunk_to_attrs.items()):
                 # part_model contains a subset of attributes, where each attribute is a fulltensor
                 # fulltensor.tid -> torch.Tensor
-                part_model: Dict[int, torch.Tensor] = torch.load(filename + f'.{file_idx}')
+                part_model: Dict[int, torch.Tensor] = torch.load(
+                    filename + f'.{file_idx}',
+                    mmap=True,
+                    weights_only=True,
+                )
                 for attr_name, meta in attrs:
                     if meta.tid not in part_model:
                         raise RuntimeError(
