@@ -308,6 +308,7 @@ class ModuleParallelizeConfig:
     gen_reuse: Optional[str] = None
     pas_policy: Optional[str] = None
     broadcast_strategy: Optional[str] = None
+    codegen_workers: Optional[int] = None
     # sometimes you want to dynamically set the instance name
     # for example, you can set it to the hash of related files
     # In that case, we can pass a dict with callable __type field.
@@ -324,6 +325,13 @@ class ModuleParallelizeConfig:
 
         if self.tracing_from_weights and self.tracing_from_weights_prefix:
             raise ValueError("tracing_from_weights and tracing_from_weights_prefix must not be used together")
+
+        if self.codegen_workers is not None and (
+            isinstance(self.codegen_workers, bool)
+            or not isinstance(self.codegen_workers, int)
+            or self.codegen_workers < 1
+        ):
+            raise ValueError(f"codegen_workers must be a positive integer, got {self.codegen_workers}")
 
         if self.precision is not None:
             self.precision = _resolve_precision(self.precision)
@@ -954,6 +962,7 @@ class TrainerArgs(PrecisionMixin, PolicyMixin):
     gen_reuse: str = 'auto'
     pas_policy: str = 'autodist'
     broadcast_strategy: str = 'all'
+    codegen_workers: int = 1
     # sometimes you want to dynamically set the instance name
     # for example, you can set it to the hash of related files
     # In that case, we can pass a dict with callable __type field.
@@ -1056,6 +1065,13 @@ class TrainerArgs(PrecisionMixin, PolicyMixin):
 
         if self.broadcast_strategy not in [e.value for e in BroadcastGenFilesStrategy]:
             raise ValueError(f"Invalid broadcast_strategy {self.broadcast_strategy}")
+
+        if (
+            isinstance(self.codegen_workers, bool)
+            or not isinstance(self.codegen_workers, int)
+            or self.codegen_workers < 1
+        ):
+            raise ValueError(f"codegen_workers must be a positive integer, got {self.codegen_workers}")
 
         self.precision = _resolve_precision(self.precision)
 

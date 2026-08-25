@@ -14,12 +14,18 @@ from contextlib import contextmanager
 import logging
 import copy
 import os
+import pickle
+import shutil
+import subprocess
+import tempfile
+import time
 from collections import OrderedDict, defaultdict
 
 import torch
 import torch.distributed
 
 from nnscaler.codegen import ModuleCodeGen
+from nnscaler.codegen.serialization import codegen_pickle_recursion_limit
 from nnscaler.codegen.schedule.schedule import ScheduleCodeGen
 
 from nnscaler.execplan import ExecutionPlan
@@ -534,6 +540,10 @@ _GRAPH_DUMP_FILE = 'graph.ckp'
 _FORWARD_ARGS_DUMP_FILE = 'forward_args.pkl'
 
 
+class _CodegenWorkerError(RuntimeError):
+    """A local codegen subprocess failed and its captured logs are available."""
+
+
 class ReuseType(Enum):
     """The reuse type"""
     MATCH = 'match'        # reuse if present and match, error if present but not match, generate if not present.
@@ -663,33 +673,41 @@ def _prepare_and_check_reusable(
     is_graph_config_match = old_config is not None and old_config.graph_config == compute_config.graph_config
     trace_meta_files = [
         outdir / FxModuleParser.ATTR_CONTENT_FILE_0,  # just check the first is good enough
+        outdir / FxModuleParser.ATTR_CONTENT_INDEX_FILE,
         outdir / FxModuleParser.ATTR_MAP_FILE,
     ]
 
     if reuse == ReuseType.MATCH or reuse == ReuseType.MOO:
         # check if the module is already generated
         expected_output_files = [outdir / _GENCODE_FILE_TEMPLATE.format(rank) for rank in range(compute_config.runtime_ngpus)]
-        expected_output_files.extend([
-            outdir / ParallelModule.ATTR_META_FILE_TEMPLATE.format(rank)
-            for rank in range(compute_config.runtime_ngpus)
-        ])
         expected_output_files.extend(trace_meta_files)
         expected_output_files.append(config_file)
         expected_output_files.append(outdir / _GRAPH_DUMP_FILE)
         expected_output_files.append(outdir / _FORWARD_ARGS_DUMP_FILE)
         expected_output_files.append(outdir / ParallelModule.ORIGIN_MODULE_METADATA_FILE)
         expected_output_files.append(outdir / FxModuleParser.NON_PERSISTENT_BUFFER_FILE)
+        compact_expected_output_files = expected_output_files + [outdir / ParallelModule.ATTR_META_FILE]
+        legacy_expected_output_files = expected_output_files + [
+            outdir / ParallelModule.ATTR_META_FILE_TEMPLATE.format(rank)
+            for rank in range(compute_config.runtime_ngpus)
+        ]
         existing_output_files = [
             f for f in outdir.glob('*')
             if f.is_file() and (  # just take fullmodel.pt.0 to compare
                 not f.name.startswith(FxModuleParser.ATTR_CONTENT_FILE_STEM)
-                or f.name == FxModuleParser.ATTR_CONTENT_FILE_0
+                or f.name in (
+                    FxModuleParser.ATTR_CONTENT_FILE_0,
+                    FxModuleParser.ATTR_CONTENT_INDEX_FILE,
+                )
             )
         ]
         if existing_output_files:
-            if is_config_match \
-                and all([output_file.exists() for output_file in expected_output_files]) \
-                and len(existing_output_files) == len(expected_output_files):
+            output_files_match = any(
+                all(output_file.exists() for output_file in candidate)
+                and len(existing_output_files) == len(candidate)
+                for candidate in (compact_expected_output_files, legacy_expected_output_files)
+            )
+            if is_config_match and output_files_match:
                 reusable = True  # everything is matched.
             elif is_config_match \
                 and all(f.suffix != '.py'  for f in existing_output_files):
@@ -812,6 +830,7 @@ def _gencode(
         module_dtype:  Optional[torch.dtype] = None,
         module_fn: Optional[Callable[[], torch.nn.Module]] = None,
         autoset_requires_grad: bool = True,
+        codegen_workers: int = 1,
     ) -> RegenStatus:
     """
     Generate parallel module source code from a torch module, and save it to file.
@@ -832,9 +851,13 @@ def _gencode(
         module_dtype (Optional[torch.dtype]): the dtype of the module. Keep as it is when it is None.
         module_fn (Optional[Callable[[], torch.nn.Module]]): the function to create the module. Will use __init__ if it is None.
         autoset_requires_grad (bool): whether to automatically set the requires_grad of input tensors.
+        codegen_workers (int): number of local subprocesses used for per-rank code generation.
     Returns:
         RegenStatus: which part is regenerated.
     """
+    if isinstance(codegen_workers, bool) or not isinstance(codegen_workers, int) or codegen_workers < 1:
+        raise ValueError(f'codegen_workers must be a positive integer, got {codegen_workers!r}')
+
     graph_ckp = outdir / _GRAPH_DUMP_FILE
     forward_args_ckp = outdir / _FORWARD_ARGS_DUMP_FILE
     origin_module_metadata_ckp = outdir / ParallelModule.ORIGIN_MODULE_METADATA_FILE
@@ -940,27 +963,303 @@ def _gencode(
     sgener = None
     if compute_config.use_end2end:
         sgener = ScheduleCodeGen(execplan, compute_config.runtime_ngpus)
-    for rank in range(compute_config.runtime_ngpus):
-        fname = outdir / _GENCODE_FILE_TEMPLATE.format(rank)
-        attr_meta_map_fname = outdir / ParallelModule.ATTR_META_FILE_TEMPLATE.format(rank)
-        mgener.gen(rank,
-            forward_args=forward_args,
-            outfile=fname,
-            attach=False,
-            as_parallel_module=True,
-            end2end_mode=compute_config.use_end2end,
-            outfile_attr_meta_map=attr_meta_map_fname
+
+    actual_codegen_workers = min(codegen_workers, compute_config.runtime_ngpus)
+    if actual_codegen_workers > 1:
+        _gencode_in_subprocesses(
+            mgener,
+            sgener,
+            forward_args,
+            compute_config,
+            outdir,
+            actual_codegen_workers,
         )
-        # generate temporal schedule code only for end2end module
-        # because the code generated is wrong for non-end2end module.
-        if compute_config.use_end2end:
-            sgener.gen(
-                device=rank,
+        return ret
+
+    staging_dir = Path(tempfile.mkdtemp(prefix='.nnscaler-codegen-', dir=outdir))
+    try:
+        for rank in range(compute_config.runtime_ngpus):
+            fname = staging_dir / _GENCODE_FILE_TEMPLATE.format(rank)
+            attr_meta_map_fname = staging_dir / ParallelModule.ATTR_META_FILE_TEMPLATE.format(rank)
+            mgener.gen(rank,
+                forward_args=forward_args,
                 outfile=fname,
-                attach=True
+                attach=False,
+                as_parallel_module=True,
+                end2end_mode=compute_config.use_end2end,
+                outfile_attr_meta_map=attr_meta_map_fname
             )
+            # generate temporal schedule code only for end2end module
+            # because the code generated is wrong for non-end2end module.
+            if compute_config.use_end2end:
+                sgener.gen(
+                    device=rank,
+                    outfile=fname,
+                    attach=True
+                )
+        _compact_attr_meta_files(staging_dir, compute_config.runtime_ngpus)
+        _promote_codegen_outputs(staging_dir, outdir, compute_config.runtime_ngpus)
+    finally:
+        shutil.rmtree(staging_dir, ignore_errors=True)
 
     return ret
+
+
+def _compact_attr_meta_files(staging_dir: Path, runtime_ngpus: int) -> int:
+    """Deduplicate staged per-rank pickle payloads into one versioned metadata file."""
+    unique_payloads: list[bytes] = []
+    payload_to_variant: dict[bytes, int] = {}
+    rank_to_variant: list[int] = []
+    for rank in range(runtime_ngpus):
+        shard_file = staging_dir / ParallelModule.ATTR_META_FILE_TEMPLATE.format(rank)
+        payload = shard_file.read_bytes()
+        variant = payload_to_variant.get(payload)
+        if variant is None:
+            variant = len(unique_payloads)
+            payload_to_variant[payload] = variant
+            unique_payloads.append(payload)
+        rank_to_variant.append(variant)
+
+    compact_meta = {
+        'version': ParallelModule.ATTR_META_FORMAT_VERSION,
+        'unique_payloads': unique_payloads,
+        'rank_to_variant': rank_to_variant,
+    }
+    compact_file = staging_dir / ParallelModule.ATTR_META_FILE
+    temp_file = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode='wb',
+            prefix=f'.{ParallelModule.ATTR_META_FILE}.',
+            dir=staging_dir,
+            delete=False,
+        ) as stream:
+            temp_file = Path(stream.name)
+            pickle.dump(compact_meta, stream)
+        os.replace(temp_file, compact_file)
+    finally:
+        if temp_file is not None:
+            temp_file.unlink(missing_ok=True)
+
+    logger.info(
+        'Compacted %d per-rank attribute metadata files into %d unique variants',
+        runtime_ngpus,
+        len(unique_payloads),
+    )
+    return len(unique_payloads)
+
+
+def _remove_legacy_attr_meta_files(outdir: Path) -> None:
+    for path in outdir.glob(f'{ParallelModule.ATTR_META_FILE_PREFIX}*.pkl'):
+        rank = path.stem[len(ParallelModule.ATTR_META_FILE_PREFIX):]
+        if rank.isdigit():
+            path.unlink(missing_ok=True)
+
+
+def _promote_codegen_outputs(staging_dir: Path, outdir: Path, runtime_ngpus: int) -> None:
+    for rank in range(runtime_ngpus):
+        filename = _GENCODE_FILE_TEMPLATE.format(rank)
+        os.replace(staging_dir / filename, outdir / filename)
+    os.replace(
+        staging_dir / ParallelModule.ATTR_META_FILE,
+        outdir / ParallelModule.ATTR_META_FILE,
+    )
+    _remove_legacy_attr_meta_files(outdir)
+
+
+def _partition_codegen_ranks(runtime_ngpus: int, codegen_workers: int) -> list[tuple[int, int]]:
+    ranks_per_worker, extra_ranks = divmod(runtime_ngpus, codegen_workers)
+    ranges = []
+    rank_start = 0
+    for worker_id in range(codegen_workers):
+        rank_end = rank_start + ranks_per_worker + (worker_id < extra_ranks)
+        ranges.append((rank_start, rank_end))
+        rank_start = rank_end
+    return ranges
+
+
+def _compile_flag_snapshot() -> dict[str, object]:
+    return {
+        name: value
+        for name, value in vars(CompileFlag).items()
+        if not name.startswith('__') and not callable(value)
+    }
+
+
+def _worker_log_text(worker_records: list[dict[str, Any]]) -> str:
+    log_sections = []
+    for record in worker_records:
+        log_file = record['log_file']
+        try:
+            log_text = log_file.read_text(encoding='utf-8', errors='replace')
+        except OSError as exc:
+            log_text = f'<failed to read worker log: {exc}>'
+        # Bound the exception size while retaining the traceback at the end of each log.
+        if len(log_text) > 64 * 1024:
+            log_text = '<log truncated>\n' + log_text[-64 * 1024:]
+        rank_start, rank_end = record['rank_range']
+        log_sections.append(
+            f"worker {record['worker_id']} ranks [{rank_start}, {rank_end}) "
+            f"exit code {record['process'].poll()}:\n{log_text}"
+        )
+    return '\n\n'.join(log_sections)
+
+
+def _terminate_codegen_workers(worker_records: list[dict[str, Any]]) -> None:
+    for record in worker_records:
+        process = record['process']
+        if process.poll() is None:
+            process.terminate()
+    for record in worker_records:
+        process = record['process']
+        if process.poll() is None:
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+    for record in worker_records:
+        record['process'].wait()
+
+
+def _gencode_in_subprocesses(
+        module_codegen: ModuleCodeGen,
+        schedule_codegen: Optional[ScheduleCodeGen],
+        forward_args: Dict[str, Any],
+        compute_config: ComputeConfig,
+        outdir: Path,
+        codegen_workers: int,
+    ) -> None:
+    import dill
+    from nnscaler.graph.parser.register import CustomizedOps
+
+    rank_ranges = _partition_codegen_ranks(compute_config.runtime_ngpus, codegen_workers)
+    logger.info(
+        'Starting multi-process codegen for %d ranks with %d workers: %s',
+        compute_config.runtime_ngpus,
+        codegen_workers,
+        ', '.join(f'[{start}, {end})' for start, end in rank_ranges),
+    )
+    started_at = time.monotonic()
+    staging_dir = Path(tempfile.mkdtemp(prefix='.nnscaler-codegen-', dir=outdir))
+    payload_file = None
+    worker_records: list[dict[str, Any]] = []
+    try:
+        payload = {
+            'module_codegen': module_codegen,
+            'schedule_codegen': schedule_codegen,
+            'forward_args': forward_args,
+            'end2end_mode': compute_config.use_end2end,
+            'gencode_file_template': _GENCODE_FILE_TEMPLATE,
+            'compile_flags': _compile_flag_snapshot(),
+            'custom_op_emit_registry': dict(CustomizedOps.kOpEmit),
+        }
+        with tempfile.NamedTemporaryFile(prefix='nnscaler-codegen-', suffix='.dill', delete=False) as stream:
+            payload_file = Path(stream.name)
+            with codegen_pickle_recursion_limit():
+                dill.dump(payload, stream)
+
+        for worker_id, (rank_start, rank_end) in enumerate(rank_ranges):
+            log_file = staging_dir / f'worker{worker_id}.log'
+            log_stream = log_file.open('w', encoding='utf-8')
+            command = [
+                sys.executable,
+                '-m',
+                'nnscaler.codegen.worker',
+                '--payload',
+                str(payload_file),
+                '--outdir',
+                str(staging_dir),
+                '--rank-start',
+                str(rank_start),
+                '--rank-end',
+                str(rank_end),
+                '--worker-id',
+                str(worker_id),
+            ]
+            try:
+                process = subprocess.Popen(
+                    command,
+                    stdout=log_stream,
+                    stderr=subprocess.STDOUT,
+                )
+            except Exception:
+                log_stream.close()
+                raise
+            worker_records.append({
+                'worker_id': worker_id,
+                'rank_range': (rank_start, rank_end),
+                'process': process,
+                'log_file': log_file,
+                'log_stream': log_stream,
+                'started_at': time.monotonic(),
+            })
+
+        pending_worker_ids = set(range(codegen_workers))
+        failed_record = None
+        while pending_worker_ids and failed_record is None:
+            for worker_id in tuple(pending_worker_ids):
+                record = worker_records[worker_id]
+                return_code = record['process'].poll()
+                if return_code is None:
+                    continue
+                pending_worker_ids.remove(worker_id)
+                record['log_stream'].close()
+                if return_code != 0:
+                    failed_record = record
+                    break
+                rank_start, rank_end = record['rank_range']
+                logger.info(
+                    'Codegen worker %d completed ranks [%d, %d) in %.2f seconds',
+                    worker_id,
+                    rank_start,
+                    rank_end,
+                    time.monotonic() - record['started_at'],
+                )
+            if pending_worker_ids and failed_record is None:
+                time.sleep(0.05)
+
+        if failed_record is not None:
+            _terminate_codegen_workers(worker_records)
+            for record in worker_records:
+                if not record['log_stream'].closed:
+                    record['log_stream'].close()
+            raise _CodegenWorkerError(
+                f"Codegen worker {failed_record['worker_id']} failed; all worker logs follow:\n"
+                f'{_worker_log_text(worker_records)}'
+            )
+
+        missing_files = []
+        for rank in range(compute_config.runtime_ngpus):
+            for filename in (
+                _GENCODE_FILE_TEMPLATE.format(rank),
+                ParallelModule.ATTR_META_FILE_TEMPLATE.format(rank),
+            ):
+                if not (staging_dir / filename).is_file():
+                    missing_files.append(filename)
+        if missing_files:
+            raise _CodegenWorkerError(
+                f'Multi-process codegen did not produce expected files: {missing_files}; '
+                f'all worker logs follow:\n{_worker_log_text(worker_records)}'
+            )
+
+        _compact_attr_meta_files(staging_dir, compute_config.runtime_ngpus)
+        _promote_codegen_outputs(staging_dir, outdir, compute_config.runtime_ngpus)
+        logger.info(
+            'Multi-process codegen completed %d ranks with %d workers in %.2f seconds',
+            compute_config.runtime_ngpus,
+            codegen_workers,
+            time.monotonic() - started_at,
+        )
+    except BaseException:
+        _terminate_codegen_workers(worker_records)
+        for record in worker_records:
+            if not record['log_stream'].closed:
+                record['log_stream'].close()
+        raise
+    finally:
+        if payload_file is not None:
+            payload_file.unlink(missing_ok=True)
+        shutil.rmtree(staging_dir, ignore_errors=True)
 
 
 def _load_parallel_module_class(
@@ -1024,6 +1323,7 @@ def parallelize(
     build_module_buckets: bool = True,
     broadcast_strategy: Union[str, BroadcastGenFilesStrategy] = 'none',
     autoset_requires_grad: bool = True,
+    codegen_workers: int = 1,
 ) -> Union[None, ParallelModule, Type[ParallelModule]]:
     """
     Convert a torch.nn.Module object or class to ParallelModule object or class.
@@ -1113,11 +1413,17 @@ def parallelize(
             If true, we will automatically set requires_grad according to compute_config and tensor dtypes.
             Note set requires_grad to True for end2end module is not useful,
             and this argument is mainly for non-end2end module.
+        codegen_workers (int): number of local subprocesses used for per-rank code generation.
+            The actual number is capped at ``compute_config.runtime_ngpus``. A value of 1 keeps
+            code generation in the current process.
     Returns:
         Union[ParallelModule, Type[ParallelModule], None]:
             if load_module flag is set, return the converted ParallelModule object or class
             if load_module flag is not set, return None
     """
+    if isinstance(codegen_workers, bool) or not isinstance(codegen_workers, int) or codegen_workers < 1:
+        raise ValueError(f'codegen_workers must be a positive integer, got {codegen_workers!r}')
+
     if (
         isinstance(module_or_module_class, ParallelModule) or
         (inspect.isclass(module_or_module_class) and issubclass(module_or_module_class, ParallelModule))
@@ -1171,6 +1477,7 @@ def parallelize(
                         module_dtype=module_dtype,
                         module_fn=module_fn,
                         autoset_requires_grad=autoset_requires_grad,
+                        codegen_workers=codegen_workers,
                     )
             else:
                 regen_status = RegenStatus.NONE
@@ -1207,6 +1514,8 @@ def parallelize(
 
     # all nodes will raise an exception if the code generation is failed.
     if regen_status == RegenStatus.ERROR:
+        if isinstance(regen_exception, _CodegenWorkerError):
+            raise regen_exception
         raise RuntimeError("Code generation failed.") from regen_exception
 
     if broadcast_strategy != BroadcastGenFilesStrategy.NONE:
