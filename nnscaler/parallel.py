@@ -663,6 +663,7 @@ def _prepare_and_check_reusable(
     is_graph_config_match = old_config is not None and old_config.graph_config == compute_config.graph_config
     trace_meta_files = [
         outdir / FxModuleParser.ATTR_CONTENT_FILE_0,  # just check the first is good enough
+        outdir / FxModuleParser.ATTR_CONTENT_INDEX_FILE,
         outdir / FxModuleParser.ATTR_MAP_FILE,
     ]
 
@@ -683,7 +684,10 @@ def _prepare_and_check_reusable(
             f for f in outdir.glob('*')
             if f.is_file() and (  # just take fullmodel.pt.0 to compare
                 not f.name.startswith(FxModuleParser.ATTR_CONTENT_FILE_STEM)
-                or f.name == FxModuleParser.ATTR_CONTENT_FILE_0
+                or f.name in (
+                    FxModuleParser.ATTR_CONTENT_FILE_0,
+                    FxModuleParser.ATTR_CONTENT_INDEX_FILE,
+                )
             )
         ]
         if existing_output_files:
