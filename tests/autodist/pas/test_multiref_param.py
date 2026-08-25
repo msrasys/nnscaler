@@ -10,6 +10,7 @@ from pathlib import Path
 from nnscaler.graph.parser.converter import to_fx_graph, to_ir_graph
 from nnscaler.autodist.autodist_config import AutoDistConfig
 from nnscaler.autodist.apis import parallelize_graph
+from nnscaler.graph import IRGraph
 from nnscaler.parallel import ComputeConfig
 from nnscaler.policies import fn, OpPlan
 
@@ -35,9 +36,14 @@ class Model(torch.nn.Module):
         return x.sum()
 
 
+def test_legacy_default(tmp_path):
+    assert AutoDistConfig(profile_dir=tmp_path).legacy is True
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason='CUDA unavailable')
 @pytest.mark.parametrize('cfg_fname', ['all_replicated_pp.json', 'replicated_and_partition_pp.json', 'replicated_and_partition_spmd.json'])
-def test_shared_param_pipeline(cfg_fname):
+@pytest.mark.parametrize('legacy', [False, True])
+def test_shared_param_pipeline(cfg_fname, legacy):
     bsz, hidden_dim = 4, 1024
 
     CompileFlag.dev_mode = True
@@ -68,17 +74,22 @@ def test_shared_param_pipeline(cfg_fname):
 
         print(ir_graph.nodes())
         plan_path = Path(os.path.dirname(__file__)) / cfg_fname
-        cfg = AutoDistConfig(load_plan_path=plan_path, mesh_col=4)
+        cfg = AutoDistConfig(load_plan_path=plan_path, mesh_col=4, legacy=legacy)
         compute_config = ComputeConfig(
             4,
             4,
             use_end2end='pp' in cfg_fname,
             pas_config={'pipeline_nmicros': cfg.update_freq},
         )
-        op_plans = list(parallelize_graph(ir_graph, cfg))
-        assert op_plans and all(isinstance(plan, OpPlan) for plan in op_plans)
-        assert not ir_graph.select(ntype=IRSegment)
-        graph = fn(ir_graph, compute_config, lambda *_: op_plans)
+        result = parallelize_graph(ir_graph, cfg)
+        if legacy:
+            assert isinstance(result, IRGraph)
+            graph = result
+        else:
+            op_plans = list(result)
+            assert op_plans and all(isinstance(plan, OpPlan) for plan in op_plans)
+            assert not ir_graph.select(ntype=IRSegment)
+            graph = fn(ir_graph, compute_config, lambda *_: op_plans)
         if 'pp' in cfg_fname:
             assert isinstance(graph.nodes()[4], IRSegment)
             # check multiref is correctly inserted at the 1st IRSegment (pipeline stage)

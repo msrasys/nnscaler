@@ -47,7 +47,8 @@ def test_loss_output_identity():
 
     with tempfile.TemporaryDirectory() as tempdir:
         pas_cfg = {
-            'parallel_profile': False
+            'parallel_profile': False,
+            'legacy': False,
         }
         parallelize(
                 m,
@@ -193,7 +194,8 @@ class Decoder(torch.nn.Module):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.device_count() < 4, reason='lack of gpu devices')
-def test_activation_pp():
+@pytest.mark.parametrize('legacy', [False, True])
+def test_activation_pp(legacy):
     m = Decoder()
     m.train()
     torch.manual_seed(0)
@@ -206,6 +208,7 @@ def test_activation_pp():
             'load_plan_path': Path(__file__).parent / 'activation_pp.json',
             'pipeline_nstages': 2,
             'pipeline_pivots': 'Layer',
+            'legacy': legacy,
         }
         parallelize(
                 m,

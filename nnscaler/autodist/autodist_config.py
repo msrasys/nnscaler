@@ -125,6 +125,8 @@ class AutoDistConfig:
         Whether to disable the shared parameter constraint in spmd solver. When a parameter is shared by multiple modules,
         the spmd solver will force the parameter to be replicated to complicated adapter generation. However, user can disable
         it and provide customized partition constraints for those shared parameters.
+    - legacy (`bool`, *optional*, defaults to `True`):
+        Whether to use the legacy graph-transforming AutoDist implementation instead of generating plans for `policies.fn`.
     """
 
     def __init__(self,
@@ -162,6 +164,7 @@ class AutoDistConfig:
                  parallel_profile=True,
                  transient_mem_coef=2,
                  disable_shared_param_constraint=False,
+                 legacy=True,
                  **kwargs):
         self.pc_path = partition_constraints_path
         self.profile_dir = profile_dir
@@ -206,6 +209,7 @@ class AutoDistConfig:
         self.parallel_profile = parallel_profile
         self.transient_mem_coef = transient_mem_coef
         self.disable_shared_param_constraint = disable_shared_param_constraint
+        self.legacy = legacy
 
         ignored_keys = list(kwargs.keys())
         if ignored_keys:
