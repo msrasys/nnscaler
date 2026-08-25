@@ -235,15 +235,18 @@ def pas_autodist(graph: IRGraph, cfg: 'ComputeConfig') -> Union[IRGraph, Iterabl
     pas_cfg = cfg.pas_config
 
     update_freq_config = pas_cfg.get('update_freq', 1)
-    pipeline_nmicros = update_freq_config
     if isinstance(update_freq_config, dict):
-        pipeline_nmicros = sorted(set(update_freq_config.values()))
-        update_freq = update_freq_config[min(update_freq_config)]
+        update_freqs = set(update_freq_config.values())
     elif isinstance(update_freq_config, (tuple, list)):
-        pipeline_nmicros = list(update_freq_config)
-        update_freq = update_freq_config[0]
+        update_freqs = set(update_freq_config)
     else:
-        update_freq = update_freq_config
+        update_freqs = {update_freq_config}
+
+    if len(update_freqs) != 1:
+        raise ValueError(
+            f'autodist only supports a single update_freq, but got {update_freq_config}'
+        )
+    update_freq = update_freqs.pop()
 
     # optional parameters
 
@@ -254,19 +257,26 @@ def pas_autodist(graph: IRGraph, cfg: 'ComputeConfig') -> Union[IRGraph, Iterabl
     pipeline_nstages = pas_cfg.get('pipeline_nstages', 'auto')
 
     if pipeline_nstages == 'auto':
+        if cfg.inference_only:
+            # Currently we don't support pipeline, so disable pipeline for inference.
+            pipeline_nstages = 1
         if not pas_cfg.get('pipeline_pivots'):
             pipeline_nstages = 1
         if not cfg.use_end2end or cfg.use_async_reducer:
             pipeline_nstages = 1
     elif pipeline_nstages > 1:
+        if cfg.inference_only:
+            raise ValueError("pipeline_nstages > 1 is not supported for inference")
         # the user manually enabled pipeline, should not disable, so raise
         if not pas_cfg.get('pipeline_pivots'):
             raise ValueError("pipeline_pivots must be set to enable pipeline")
         if not cfg.use_end2end:
-            raise ValueError("explore_pipeline cannot be enabled if use_end2end is False")
+            raise ValueError("pipeline cannot be enabled if use_end2end is False")
         if cfg.use_async_reducer:
-            raise ValueError("explore_pipeline cannot be enabled if use_async_reducer is True")
+            raise ValueError("pipeline cannot be enabled if use_async_reducer is True")
     else:
+        if pipeline_nstages != 1:
+            raise ValueError(f"pipeline_nstages must be 1 or 'auto' or >1, but got {pipeline_nstages}")
         if pas_cfg.get('pipeline_pivots'):
             raise ValueError("pipeline_pivots must not be set because pipeline is disabled by pipeline_nstages<=1")
 
@@ -312,6 +322,8 @@ def pas_autodist(graph: IRGraph, cfg: 'ComputeConfig') -> Union[IRGraph, Iterabl
         memory_constraint = int(0.8 * torch.cuda.mem_get_info()[1] / 1024 /
                                 1024 / 1024)
     if cfg.use_zero:
+        if cfg.use_zero > 1:
+            raise ValueError(f"autodist only supports zero_stage 1, but got {cfg.use_zero}")
         zero_stage = 1
         zero_ngroups = cfg.zero_ngroups
     else:
@@ -378,8 +390,9 @@ def pas_autodist(graph: IRGraph, cfg: 'ComputeConfig') -> Union[IRGraph, Iterabl
         legacy=legacy,
     )
 
-    pas_cfg.setdefault('pipeline_nmicros', pipeline_nmicros)
-    return parallelize_graph(graph, autodist_cfg)
+    result = parallelize_graph(graph, autodist_cfg)
+    pas_cfg['pipeline_nmicros'] = update_freq
+    return result
 
 
 @dataclass(unsafe_hash=True, frozen=True)

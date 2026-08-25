@@ -282,7 +282,7 @@ def _parallelize_graph_fn(
         op_plans.append(OpPlan(
             op=node,
             recompute_id=recompute_ids.get(node.cid, -1),
-            stage_id=planned_stage_id or -1,
+            stage_id=planned_stage_id if planned_stage_id is not None else -1,
             partition=partition,
         ))
 

@@ -37,7 +37,7 @@ class ModelA(torch.nn.Module):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason='lack of gpu devices')
-def test_loss_output_identity():
+def test_loss_multiref():
     m = ModelA()
     m.train()
     torch.manual_seed(0)
@@ -47,8 +47,7 @@ def test_loss_output_identity():
 
     with tempfile.TemporaryDirectory() as tempdir:
         pas_cfg = {
-            'parallel_profile': False,
-            'legacy': False,
+            'parallel_profile': False
         }
         parallelize(
                 m,
@@ -60,7 +59,7 @@ def test_loss_output_identity():
                 load_module=False,
         )
 
-        assert len(_gencode_contains(tempdir, ModelA, 0, 'nnscaler.runtime.function.identity')) == 1
+        assert len(_gencode_contains(tempdir, ModelA, 0, '\.multiref')) == 1
 
 
 class ModelB(torch.nn.Module):
@@ -194,8 +193,7 @@ class Decoder(torch.nn.Module):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.device_count() < 4, reason='lack of gpu devices')
-@pytest.mark.parametrize('legacy', [False, True])
-def test_activation_pp(legacy):
+def test_activation_pp():
     m = Decoder()
     m.train()
     torch.manual_seed(0)
@@ -208,7 +206,6 @@ def test_activation_pp(legacy):
             'load_plan_path': Path(__file__).parent / 'activation_pp.json',
             'pipeline_nstages': 2,
             'pipeline_pivots': 'Layer',
-            'legacy': legacy,
         }
         parallelize(
                 m,
