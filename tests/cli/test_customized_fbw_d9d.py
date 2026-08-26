@@ -105,8 +105,9 @@ class _D9DStateStore:
 
     @classmethod
     def pop(cls, name: str) -> _D9DBackwardState:
-        assert cls.queues[name], f'No deferred weight backward for segment {name}'
-        return cls.queues[name].popleft()
+        queue = cls.queues.get(name)
+        assert queue, f'No deferred weight backward for segment {name}'
+        return queue.popleft()
 
     @classmethod
     def clear(cls) -> None:
@@ -115,6 +116,13 @@ class _D9DStateStore:
     @classmethod
     def check_clear(cls) -> None:
         assert all(not queue for queue in cls.queues.values())
+
+
+def test_d9d_state_store_failed_pop_does_not_create_queue():
+    _D9DStateStore.clear()
+    with pytest.raises(AssertionError, match='No deferred weight backward'):
+        _D9DStateStore.pop('missing')
+    assert 'missing' not in _D9DStateStore.queues
 
 
 class _OutputGradStats:
@@ -408,8 +416,7 @@ def _run_weight_backward(
                 # tuple. Replacing it with B's saved canonical tuple clamps each
                 # boundary and prevents roots from changing one another. The
                 # default argument binds this loop iteration's tuple instead of
-                # late-binding the final `grads` value. See the standalone
-                # `repro_fbw_boundary_clamp.py` for a 6 -> 12 -> 6 example.
+                # late-binding the final `grads` value.
                 for grads, intermediate in zip(
                     completed_grads,
                     param_group['intermediates'],

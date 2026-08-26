@@ -85,10 +85,11 @@ class _WeightGradStore:
 
     @classmethod
     def pop(cls, name: str) -> None:
-        assert cls.queues[name], f'No deferred weight backward for segment {name}'
+        queue = cls.queues.get(name)
+        assert queue, f'No deferred weight backward for segment {name}'
         # An empty list is a valid batch: the corresponding B simply found no
         # custom dW work. Only a missing batch indicates broken B/W pairing.
-        for callback in cls.queues[name].popleft():
+        for callback in queue.popleft():
             callback()
             cls.executed += 1
 
@@ -107,6 +108,13 @@ class _WeightGradStore:
         assert not cls.cache
         assert all(not queue for queue in cls.queues.values())
         assert cls.deferred == cls.executed
+
+
+def test_weight_grad_store_failed_pop_does_not_create_queue():
+    _WeightGradStore.clear()
+    with pytest.raises(AssertionError, match='No deferred weight backward'):
+        _WeightGradStore.pop('missing')
+    assert 'missing' not in _WeightGradStore.queues
 
 
 @nnscaler.register_op('a b, b c -> a c')

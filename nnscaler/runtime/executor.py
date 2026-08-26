@@ -298,9 +298,8 @@ class Executor:
                 )
 
         if len(output_tensors) == 0:
-            # when there are no output tensors(uncommon case)
-            # we still need to record a weight-backward state for this segment, so that
-            # the next call to backward_weight() can pop it and run the weight backward.
+            # Even without output tensors (an uncommon case), record a paired
+            # no-op state for the matching backward_weight call to consume.
             Executor._weight_backward_states.setdefault(name, []).append(
                 _WeightBackwardState(param_groups=[])
             )
