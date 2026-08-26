@@ -30,7 +30,7 @@ from .arg_parser import (
     _TYPE_KEY, _VALUE_TYPE_KEY, _VALUE_KEY,
     resolve_args
 )
-from .loggers.logger_base import LoggerBase
+from .loggers import LoggerBase, AsyncLogger
 from .train_hook import TrainHook
 from .serialization import Checkpointer
 
@@ -230,27 +230,33 @@ class AggregatedOutputs:
 
 
 @dataclass(frozen=True)
-class OptionalComputeConfig:
-    constant_folding: Optional[bool] = None
-    trace_strategy: Optional[str] = None
+class OptionalReducerConfig:
     use_zero: Optional[bool] = None
     zero_ngroups: Optional[int] = None
     zero_use_reduce_scatter: Optional[bool] = None
     use_async_reducer: Optional[bool] = None
     reducer_bucket_cap_mb: Optional[float] = None
 
-    pas_config: Optional[Dict[str, Any]] = None
-    user_config: Optional[Dict[str, Any]] = None
-
-    def resolve(self, compute_config: ComputeConfig) -> ComputeConfig:
+    def resolve(self, compute_config: ComputeConfig, **kwargs) -> ComputeConfig:
         replace_values = {
             k: v for k, v in asdict(self).items()
             if v is not None
         }
         resolved_values = asdict(compute_config)
+        resolved_values.update(kwargs)
         resolved_values.update(replace_values)
         resolved_values[fields(ComputeConfig).use_end2end] = False
+        resolved_values[fields(ComputeConfig).use_fbw] = False
         return ComputeConfig(**resolved_values)
+
+
+@dataclass(frozen=True)
+class OptionalComputeConfig(OptionalReducerConfig):
+    constant_folding: Optional[bool] = None
+    trace_strategy: Optional[str] = None
+
+    pas_config: Optional[Dict[str, Any]] = None
+    user_config: Optional[Dict[str, Any]] = None
 
 
 @dataclass
@@ -292,6 +298,7 @@ class ModuleParallelizeConfig:
     gen_reuse: Optional[str] = None
     pas_policy: Optional[str] = None
     broadcast_strategy: Optional[str] = None
+    codegen_workers: Optional[int] = None
     # sometimes you want to dynamically set the instance name
     # for example, you can set it to the hash of related files
     # In that case, we can pass a dict with callable __type field.
@@ -308,6 +315,13 @@ class ModuleParallelizeConfig:
 
         if self.tracing_from_weights and self.tracing_from_weights_prefix:
             raise ValueError("tracing_from_weights and tracing_from_weights_prefix must not be used together")
+
+        if self.codegen_workers is not None and (
+            isinstance(self.codegen_workers, bool)
+            or not isinstance(self.codegen_workers, int)
+            or self.codegen_workers < 1
+        ):
+            raise ValueError(f"codegen_workers must be a positive integer, got {self.codegen_workers}")
 
         if self.precision is not None:
             self.precision = _resolve_precision(self.precision)
@@ -333,6 +347,17 @@ class ModuleParallelizeConfig:
 class ModelConfig:
     type: str = None
     args: dict[str, Any] = field(default_factory=dict)
+    # The reducer config for non-parallel parameters
+    # If None, the global compute_config will be used
+    # with `use_async_reducer` set to False and `reducer_bucket_cap_mb` set to 0
+    # We need to disable async reducer and set reducer_bucket_cap_mb=0 for non-parallel parameters
+    # Because in most cases, non-parallel parameters are used when the compute graph is not static
+    # For example, some parameters are only used in some branches of the model,
+    # and they are not used in every forward/backward pass.
+    # In this case, the async reducer will not be able to reduce the gradients of these parameters,
+    # instead they will cause the training to hang
+    # because the async reducer is waiting forever for the gradients of these parameters to be reduced.
+    non_parallel_params_reducer_config: Optional[OptionalReducerConfig] = None
     # if parallel_modules is not empty,
     # these modules will be parallelized instead of the whole model
     # and sub modules (in the list of `parallel_modules`) in the model
@@ -448,9 +473,33 @@ class ResumeOptions:
     # If the memory is limited, we can save memory by only loading merged state dict in GPU 0 of each node
     # and broadcast trimmed state dict to other ranks in the same node
     # although this will be slower
-    # Only used when resuming from a merged checkpoint.
+    # Only used when resuming from a merged checkpoint or `with_merged` is True
     save_memory: bool = True
+    # Whether the filesystem is slow (e.g. a remote/network filesystem).
+    # When `True`, we reduce file reads: instead of letting the local rank 0 of every node
+    # read the checkpoint from disk, only the global rank 0 reads it.
+    # When `False`, every node's local rank 0 reads the file.
+    slow_fs: bool = False
+    # Behavior matrix for (slow_fs, save_memory)
+    # Behavior for each (slow_fs, save_memory) combination:
 
+    # For merged checkpoint file (`checkpoint` is a file),
+    # we have the following cases:
+    # | slow_fs | save_memory | who holds the dict on entry | action here                                                      |
+    # |---------|-------------|-----------------------------|------------------------------------------------------------------|
+    # | True    | True        | global rank 0               | broadcast to node leaders; trimmed broadcast distributes in-node |
+    # | True    | False       | global rank 0               | one-step broadcast to all ranks                                  |
+    # | False   | True        | each node's local rank 0    | trimmed broadcast distributes in-node                            |
+    # | False   | False       | file: all ranks             | none                                                       |
+
+    # For sharded checkpoint files (`checkpoint` is a directory and `with_merged` = `True`),
+    # we have the following cases:
+    # | slow_fs | save_memory | who holds the dict on entry | action here                                                      |
+    # |---------|-------------|-----------------------------|------------------------------------------------------------------|
+    # | True    | True        | global rank 0               | broadcast to node leaders; trimmed broadcast distributes in-node |
+    # | True    | False       | global rank 0               | one-step broadcast to all ranks                                  |
+    # | False   | True        | each node's local rank 0    | trimmed broadcast distributes in-node                            |
+    # | False   | False       | each node's local rank 0    | broadcast to the ranks in the node                               |
 
 @dataclass
 class SerializerOptions:
@@ -582,6 +631,47 @@ class LogConfig:
         if isinstance(self.type, str) and '.' not in self.type:
             # assume it is a built-in logger
             self.type = f'nnscaler.cli.loggers.{self.type}'
+
+
+@dataclass
+class LogsConfig:
+    async_logging: bool = False
+    # the number of workers for asynchronous logging.
+    # Only applicable when async_logging is True.
+    # be careful when setting this value.
+    # You need to make sure the underlying logging runner can support multiple workers.
+    max_workers: int = 1
+    logs: List[LogConfig] = field(default_factory=list)
+
+    def __post_init__(self):
+        if self.max_workers < 1:
+            raise ValueError("max_workers must be positive")
+
+    @classmethod
+    def deserialize(cls, data: Any) -> 'LogsConfig':
+        # backward compatibility: if the config is a list or dict of log config,
+        # we treat it as the `logs` field of LogsConfig
+        # So here we support two formats for LogsConfig:
+        # 1. LogsConfig format:
+        #    async_logging: true
+        #    max_workers: 1
+        #    logs:
+        #      - type: tensorboard
+        #        args:
+        #          log_dir: ./logs
+        # 2. List of LogConfig or dict of LogConfig:
+        #    - type: tensorboard
+        #      args:
+        #        log_dir: ./logs
+        if isinstance(data, (tuple, list)):
+            data = {'logs': data}
+        elif isinstance(data, dict) \
+            and not any(k in cls.__dataclass_fields__ for k in data.keys()):
+            # when passed from command line,
+            # it will be a dict with `0`, `1`, etc as the keys
+            data = {'logs': data}
+
+        return deserialize_dataclass(data, cls)
 
 
 @dataclass
@@ -862,6 +952,7 @@ class TrainerArgs(PrecisionMixin, PolicyMixin):
     gen_reuse: str = 'auto'
     pas_policy: str = 'autodist'
     broadcast_strategy: str = 'all'
+    codegen_workers: int = 1
     # sometimes you want to dynamically set the instance name
     # for example, you can set it to the hash of related files
     # In that case, we can pass a dict with callable __type field.
@@ -890,7 +981,11 @@ class TrainerArgs(PrecisionMixin, PolicyMixin):
     dataset_sampler: Optional[DatasetSamplerConfig] = None
     lr_scheduler: Optional[LRSchedulerConfig] = None
     checkpoint: CheckpointConfig = field(default_factory=CheckpointConfig)
-    log: List[LogConfig] = field(default_factory=list)
+    log: LogsConfig = field(default_factory=LogsConfig,
+        metadata={
+            'deserialize': LogsConfig.deserialize
+        }
+    )
     # It can be `HookConfig` or `HookMapConfig`
     hook: Union[HookConfig, HookMapConfig, None] = field(default=None, metadata={
         'deserialize': _deserialize_hook_config
@@ -961,6 +1056,13 @@ class TrainerArgs(PrecisionMixin, PolicyMixin):
         if self.broadcast_strategy not in [e.value for e in BroadcastGenFilesStrategy]:
             raise ValueError(f"Invalid broadcast_strategy {self.broadcast_strategy}")
 
+        if (
+            isinstance(self.codegen_workers, bool)
+            or not isinstance(self.codegen_workers, int)
+            or self.codegen_workers < 1
+        ):
+            raise ValueError(f"codegen_workers must be a positive integer, got {self.codegen_workers}")
+
         self.precision = _resolve_precision(self.precision)
 
         if not self.max_epochs and not self.max_train_steps:
@@ -990,6 +1092,17 @@ class TrainerArgs(PrecisionMixin, PolicyMixin):
             raise ValueError("dataset_sampler type is required")
         if self.lr_scheduler and not self.lr_scheduler.type:
             raise ValueError("lr_scheduler type is required")
+
+        if not isinstance(self.log, LogsConfig):
+            # backward compatibility: support list of log configs
+            if isinstance(self.log, (list, tuple)) and all(isinstance(i, LogConfig) for i in self.log):
+                # support list of log configs
+                self.log = LogsConfig(logs=self.log)
+            else:
+                raise ValueError(
+                    "Invalid log config. It must be a LogsConfig instance "
+                    "or a list of LogConfig instances."
+                )
 
         if isinstance(self.hook, dict):
             # if it is a dict, we will deserialize it to HookMapConfig
@@ -1165,8 +1278,18 @@ class TrainerArgs(PrecisionMixin, PolicyMixin):
     def create_parallel_optimizer(self, parallel_model: torch.nn.Module):
         kwargs = self.create_kwarg(self.optimizer.args)
         optimizer_class = load_type(self.optimizer.type)
+
+        npp_reducer_config = self.model.non_parallel_params_reducer_config \
+            or OptionalReducerConfig()
+        # if the user does not specify the reducer config,
+        # we will use the following default values (which are always safe) for the reducer config.
+        npp_compute_config = npp_reducer_config.resolve(
+            self.compute_config,
+            use_async_reducer=False,
+            reducer_bucket_cap_mb=0.0
+        )
         return build_optimizer(
-            parallel_model, optimizer_class, self.compute_config,
+            parallel_model, optimizer_class, npp_compute_config,
             self.optimizer.param_clss_fn,
             **kwargs
         )
@@ -1231,11 +1354,15 @@ class TrainerArgs(PrecisionMixin, PolicyMixin):
 
     def create_loggers(self) -> List['LoggerBase']:
         loggers = []
-        for log_config in self.log:
+        for log_config in self.log.logs:
             kwargs = self.create_kwarg(log_config.args)
             logger_class = load_type(log_config.type)
             loggers.append(logger_class(**kwargs))
-        return loggers
+
+        if loggers and self.log.async_logging:
+            return [AsyncLogger(loggers, max_workers=self.log.max_workers)]
+        else:
+            return loggers
 
     def create_hook(self) -> TrainHook:
         if not self.hook:

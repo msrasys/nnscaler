@@ -23,7 +23,7 @@ from ..launch_torchrun import launch_torchrun
 from .common import MixedModule, MixModuleMLP, MixModuleMLP3
 
 
-def trainer_logging_worker(save_dir):
+def trainer_logging_worker(save_dir, run_async):
     save_dir = Path(save_dir)
     config_path = str(Path(__file__).with_name('trainer_args.yaml').resolve())
     gen_savedir = save_dir / 'gen'
@@ -31,23 +31,52 @@ def trainer_logging_worker(save_dir):
     tb_log_savedir = log_savedir / 'tensorboard'
     wandb_log_savedir = log_savedir / 'wandb'
     # train 4 epcho in one time
-    trainer = Trainer([
-        '-f', config_path,
-        '--max_epochs', '2',
-        '--gen_savedir', str(gen_savedir),
-        '--compute_config.plan_ngpus', '2',
-        '--compute_config.runtime_ngpus', '4',
-        '--checkpoint.no_save', 'true',
-        '--log.0.type', 'nnscaler.cli.loggers.TensorBoardLogger',
-        '--log.0.args.name', 'test-cli',
-        '--log.0.args.root_dir', str(tb_log_savedir),
-        '--log.1.type', 'nnscaler.cli.loggers.WandbLogger',
-        '--log.1.args.name', 'test-cli',
-        '--log.1.args.dir', str(wandb_log_savedir),
-        '--log.1.args.project', 'nnscaler',
-        '--log.1.args.mode', 'offline',
-    ])
+    if not run_async:
+        # old format of log config
+        # async logging is disabled by default.
+        trainer = Trainer([
+            '-f', config_path,
+            '--max_epochs', '2',
+            '--gen_savedir', str(gen_savedir),
+            '--compute_config.plan_ngpus', '2',
+            '--compute_config.runtime_ngpus', '4',
+            '--checkpoint.no_save', 'true',
+            '--log.0.type', 'nnscaler.cli.loggers.TensorBoardLogger',
+            '--log.0.args.name', 'test-cli',
+            '--log.0.args.root_dir', str(tb_log_savedir),
+            '--log.1.type', 'nnscaler.cli.loggers.WandbLogger',
+            '--log.1.args.name', 'test-cli',
+            '--log.1.args.dir', str(wandb_log_savedir),
+            '--log.1.args.project', 'nnscaler',
+            '--log.1.args.mode', 'offline',
+        ])
+    else:
+        # new format of log config
+        # (async_logging enabled)
+        trainer = Trainer([
+            '-f', config_path,
+            '--max_epochs', '2',
+            '--gen_savedir', str(gen_savedir),
+            '--compute_config.plan_ngpus', '2',
+            '--compute_config.runtime_ngpus', '4',
+            '--checkpoint.no_save', 'true',
+            '--log.async_logging', 'true',
+            '--log.logs.0.type', 'nnscaler.cli.loggers.TensorBoardLogger',
+            '--log.logs.0.args.name', 'test-cli',
+            '--log.logs.0.args.root_dir', str(tb_log_savedir),
+            '--log.logs.1.type', 'nnscaler.cli.loggers.WandbLogger',
+            '--log.logs.1.args.name', 'test-cli',
+            '--log.logs.1.args.dir', str(wandb_log_savedir),
+            '--log.logs.1.args.project', 'nnscaler',
+            '--log.logs.1.args.mode', 'offline',
+        ])
     trainer.run()
+    if run_async:
+        assert len(trainer.loggers) == 1 and isinstance(trainer.loggers[0], nnscaler.cli.loggers.AsyncLogger)
+    else:
+        assert len(trainer.loggers) == 2 \
+            and isinstance(trainer.loggers[0], nnscaler.cli.loggers.TensorBoardLogger) \
+            and isinstance(trainer.loggers[1], nnscaler.cli.loggers.WandbLogger)
 
     torch.distributed.barrier()
 
@@ -65,10 +94,14 @@ def trainer_logging_worker(save_dir):
         assert len(wandb_run_db) == 1
         assert wandb_run_db[0].stat().st_size > 1000
 
+        shutil.rmtree(tb_log_savedir / 'test-cli')
+        shutil.rmtree(wandb_log_savedir / 'wandb')
+
 
 @pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.device_count() < 4, reason='lack of gpu devices')
 def test_trainer_logging(tmp_path):
-    launch_torchrun(4, trainer_logging_worker, tmp_path)
+    launch_torchrun(4, trainer_logging_worker, tmp_path, False)
+    launch_torchrun(4, trainer_logging_worker, tmp_path, True)
 
 
 @replace_all_device_with('cpu')
@@ -1147,6 +1180,23 @@ def trainer_resumable_dataloader(save_dir):
 
     torch.distributed.barrier()
 
+    ckpt2_2_savedir = save_dir / 'ckpt2_2'
+    ckpt2_2_savedir.mkdir(parents=True, exist_ok=True)
+    trainer = Trainer([
+            '-f', config_path_streaming,
+            '--precision', 'bf16',
+            '--optimizer.type', optimizer_type,
+            '--enable_progress_bar', 'false',
+            '--gen_savedir', str(gen_savedir),
+            '--checkpoint.save_type', save_type,
+            '--checkpoint.save_dir', str(ckpt2_2_savedir),
+            '--checkpoint.resume_from.checkpoint', str(ckpt2_savedir / 'merged.pt'),
+            '--checkpoint.resume_from.slow_fs', True,
+            '--checkpoint.resume_from.save_memory', False,
+            '--checkpoint.keep_last_n_checkpoints', '30',
+        ])
+    trainer.run()
+
     # resume for merged without dataloader states
     ckpt3_savedir = save_dir / 'ckpt3'
     trainer = Trainer([
@@ -1157,7 +1207,9 @@ def trainer_resumable_dataloader(save_dir):
         '--gen_savedir', str(gen_savedir),
         '--checkpoint.save_type', save_type,
         '--checkpoint.save_dir', str(ckpt3_savedir),
-        '--checkpoint.resume_from', str(ckpt2_savedir / 'merged2.pt'),
+        '--checkpoint.resume_from.checkpoint', str(ckpt2_savedir / 'merged2.pt'),
+        '--checkpoint.resume_from.slow_fs', True,
+        '--checkpoint.resume_from.save_memory', True,
         '--checkpoint.keep_last_n_checkpoints', '30',
     ])
     trainer.run()
@@ -1181,7 +1233,7 @@ def trainer_resumable_dataloader(save_dir):
         ])
         trainer.run()
         assert trainer.dataloader_resumed
-        assert 'Broadcasting merged checkpoint to all ranks.' in log.getvalue()  # no warning about dataloader states
+        assert 'Broadcasting merged checkpoint to in-node ranks.' in log.getvalue()  # no warning about dataloader states
 
     # resume from auto-merged with save_memory
     ckpt5_savedir = save_dir / 'ckpt5'
@@ -1203,6 +1255,45 @@ def trainer_resumable_dataloader(save_dir):
         assert trainer.dataloader_resumed
         assert 'Broadcasting trimmed checkpoint to all ranks.' in log.getvalue()  # no warning about dataloader states
 
+    # resume from auto-merged with slow_fs
+    ckpt6_savedir = save_dir / 'ckpt6'
+    with catch_log(logger) as log:
+        trainer = Trainer([
+            '-f', config_path_streaming,
+            '--precision', 'bf16',
+            '--optimizer.type', optimizer_type,
+            '--enable_progress_bar', 'false',
+            '--gen_savedir', str(gen_savedir),
+            '--checkpoint.save_type', save_type,
+            '--checkpoint.save_dir', str(ckpt6_savedir),
+            '--checkpoint.resume_from.checkpoint', str(ckpt1_savedir / '0002-0035'),
+            '--checkpoint.resume_from.with_merged', True,
+            '--checkpoint.resume_from.slow_fs', True,
+            '--checkpoint.resume_from.save_memory', True,
+            '--checkpoint.keep_last_n_checkpoints', '30',
+        ])
+        trainer.run()
+        assert trainer.dataloader_resumed
+        assert 'Broadcasting trimmed checkpoint to all ranks.' in log.getvalue()  # no warning about dataloader states
+        if trainer.rank == 0:
+            assert 'Broadcasting merged checkpoint to node leaders.' in log.getvalue()
+
+    ckpt6_1_savedir = save_dir / 'ckpt6_1'
+    trainer = Trainer([
+        '-f', config_path_streaming,
+        '--precision', 'bf16',
+        '--optimizer.type', optimizer_type,
+        '--enable_progress_bar', 'false',
+        '--gen_savedir', str(gen_savedir),
+        '--checkpoint.save_type', save_type,
+        '--checkpoint.save_dir', str(ckpt6_1_savedir),
+        '--checkpoint.resume_from.checkpoint', str(ckpt1_savedir / '0002-0035'),
+        '--checkpoint.resume_from.with_merged', True,
+        '--checkpoint.resume_from.slow_fs', True,
+        '--checkpoint.resume_from.save_memory', False,
+        '--checkpoint.keep_last_n_checkpoints', '30',
+    ])
+    trainer.run()
 
     if torch.distributed.get_rank() == 0:
         for i in range(4):
@@ -1211,9 +1302,12 @@ def trainer_resumable_dataloader(save_dir):
             y = torch.load(ckpt1_savedir / 'last' / f'{i}.ckpt', weights_only=False)
             z = torch.load(ckpt2_savedir / 'last' / f'{i}.ckpt', weights_only=False)
             z_1 = torch.load(ckpt2_1_savedir / 'last' / f'{i}.ckpt', weights_only=False)
+            z_2 = torch.load(ckpt2_2_savedir / 'last' / f'{i}.ckpt', weights_only=False)
             w = torch.load(ckpt3_savedir / 'last' / f'{i}.ckpt', weights_only=False)
             v = torch.load(ckpt4_savedir / 'last' / f'{i}.ckpt', weights_only=False)
             u = torch.load(ckpt5_savedir / 'last' / f'{i}.ckpt', weights_only=False)
+            t = torch.load(ckpt6_savedir / 'last' / f'{i}.ckpt', weights_only=False)
+            t_1 = torch.load(ckpt6_1_savedir / 'last' / f'{i}.ckpt', weights_only=False)
             assert 'dataloader' not in g
             assert 'dataloader' in x
             for key in ['model', 'optimizer', 'lr_scheduler', 'dataloader']:
@@ -1223,6 +1317,9 @@ def trainer_resumable_dataloader(save_dir):
                 assert_equal(x[key], v[key])
                 assert_equal(x[key], u[key])
                 assert_equal(x[key], z_1[key])
+                assert_equal(x[key], z_2[key])
+                assert_equal(x[key], t[key])
+                assert_equal(x[key], t_1[key])
                 if key != 'dataloader':
                     assert_equal(g[key], x[key])
 

@@ -509,10 +509,12 @@ class FuncEmission(CodeEmission):
             if len(non_colls) > 1:
                 if max(prims.index(p) for p in non_colls) + 1 != len(non_colls):
                     async_op = False
+                    _logger.warning("Non-collective primitives are not performed before collective primitives, async_op is disabled.")
             # check condition 2)
             devices = [set(p.device) for p in colls]
             if len(colls) > 1 and not all(devs == devices[0] for devs in devices[1:]):
                 async_op = False
+                _logger.warning("Collective primitives are not running on the same device group, async_op is disabled.")
 
         release_after_send = {}
         if async_op:

@@ -17,7 +17,11 @@ from nnscaler.compiler import compile
 from nnscaler.utils import load_model
 from nnscaler.ir.operator import IRFwOperation
 from nnscaler.runtime.module import CubeModule
-from nnscaler.runtime.gnorm import prepare_for_grad_clip, clip_gnorm
+from nnscaler.runtime.gnorm import (
+    _split_grads_for_apex_l2norm,
+    clip_gnorm,
+    prepare_for_grad_clip,
+)
 from nnscaler.runtime import gnorm as gnorm_module
 from nnscaler.flags import CompileFlag
 
@@ -77,6 +81,23 @@ class Module(torch.nn.Module):
         x = self.linear2(x)
         x = self.linear3(x)
         return torch.sum(x)
+
+
+def test_split_grads_for_apex_l2norm():
+    grad = torch.arange(20).reshape(4, 5)
+    small_grad = torch.arange(3)
+
+    apex_grads = _split_grads_for_apex_l2norm([grad, small_grad], max_tensor_numel=8)
+
+    assert [tensor.numel() for tensor in apex_grads] == [8, 8, 4, 3]
+    assert all(
+        tensor.untyped_storage().data_ptr() == grad.untyped_storage().data_ptr()
+        for tensor in apex_grads[:-1]
+    )
+    assert apex_grads[-1] is small_grad
+
+    apex_grads[1][0] = -1
+    assert grad.view(-1)[8] == -1
 
 
 def tensor_parallelism(graph, node: IRFwOperation, idx, dim, num):

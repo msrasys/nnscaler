@@ -21,6 +21,7 @@ from nnscaler.codegen.syntax.symtable import SymbolTable
 from nnscaler.codegen.lifecycle import LifeCycle
 from nnscaler.codegen.syntax.blocks import FunctionBlock, Block
 from chronotrigger.trace.integrations.nnscaler import (
+    PipelineAction,
     build_stage_ids,
     segment_trace_fields,
     wrap_generated_range,
@@ -30,6 +31,14 @@ from nnscaler.flags import CompileFlag
 
 
 _logger = logging.getLogger(__name__)
+
+
+fsign = '{outputs} = nnscaler.runtime.executor.fexecute({name}, {model}, *{inputs}, requires_grad={req_grad})'
+asign = '{outputs} = nnscaler.runtime.executor.aexecute({model}, *{inputs}, requires_grad={req_grad})'
+bsign = '{input_grads} = nnscaler.runtime.executor.backward({name}, {input_tensors}, {output_tensors}, {output_grads})'
+bi_sign = '{input_grads} = nnscaler.runtime.executor.backward_input({name}, {input_tensors}, {output_tensors}, {output_grads}, {weights})'
+bw_sign = 'nnscaler.runtime.executor.backward_weight({name}, {weights})'
+ssign = '{inputs} = nnscaler.runtime.executor.sync_tensors({inputs})'
 
 
 class ScheduleCodeGen(FuncEmission):
@@ -132,6 +141,15 @@ class ScheduleCodeGen(FuncEmission):
 
         last_stream = None
         buffered_codes = []
+
+
+        def to_tensor_names(val) -> str:
+            """
+            Return the tensor names in a complex data type.
+            Currently support complex data type of Dict, List, Tuple
+            """
+            objs = IR.get_objects(val)
+            return self.tuple_name([obj for obj in objs if isinstance(obj, IRTensor)])
 
         def _get_codes_with_stream_context(codes: List[str], stream: Optional[str]) -> List[str]:
             if stream is None:
@@ -266,6 +284,9 @@ class ScheduleCodeGen(FuncEmission):
                             produced_tids.add(out.tid)
                     _append_send_bundle_events(fb, bundle_events, before_node=False)
             # return code
+            if CompileFlag.async_comm:
+                _append_code(fb, 'nnscaler.runtime.executor.AsyncCommHandler().drain_sends()')
+                _append_code(fb, ssign.format(inputs=to_tensor_names(self.execplan.outputs())))
             outputs = self.return_name_complex(self.execplan.outputs())
             _append_code(fb, 'nnscaler.runtime.executor.AsyncCommHandler().drain()')
             code = f'return {outputs}'
@@ -326,6 +347,9 @@ class ScheduleCodeGen(FuncEmission):
                             infer_produced_tids.add(out.tid)
                     _append_send_bundle_events(fb, bundle_events, before_node=False)
                 # return code
+                if CompileFlag.async_comm:
+                    _append_code(fb, 'nnscaler.runtime.executor.AsyncCommHandler().drain_sends()')
+                    _append_code(fb, ssign.format(inputs=to_tensor_names(self.execplan.outputs())))
                 outputs = self.return_name_complex(self.execplan.outputs())
                 _append_code(fb, 'nnscaler.runtime.executor.AsyncCommHandler().drain()')
                 code = f'return {outputs}'
@@ -781,10 +805,6 @@ class ScheduleCodeGen(FuncEmission):
         """
         Emit node / subgraph code
         """
-        fsign = '{outputs} = nnscaler.runtime.executor.fexecute({name}, {model}, *{inputs}, requires_grad={req_grad})'
-        asign = '{outputs} = nnscaler.runtime.executor.aexecute({model}, *{inputs}, requires_grad={req_grad})'
-        bsign = '{input_grads} = nnscaler.runtime.executor.backward({name}, {input_tensors}, {output_tensors}, {output_grads})'
-
         node_inputs, node_outputs = node.inputs(), node.outputs()
         # the real inputs in gencode
         gen_inputs = node_inputs
@@ -834,6 +854,7 @@ class ScheduleCodeGen(FuncEmission):
                     entity=segment_name,
                     virtual_stage=virtual_stage,
                     micro_batch=micro_batch_id,
+                    pipeline_action=PipelineAction.FORWARD,
                     process_scope=False,
                 )
                 if post_hook:
@@ -873,20 +894,51 @@ class ScheduleCodeGen(FuncEmission):
                 input_tensors_str = self.tuple_name(input_tensors, skip_attr=True, prefix_attr='model.')
                 output_tensors_str = self.tuple_name(output_tensors, skip_attr=True, prefix_attr='model.')
                 output_grads_str = self.tuple_name(output_grads, skip_attr=True, prefix_attr='model.')
-                codes = [bsign.format(
-                    name = f"'{self.node_name(unwrap_node.mirror)}'", # always use name of fw segment
-                    input_grads = input_grads_str,
-                    input_tensors = input_tensors_str,
-                    output_tensors = output_tensors_str,
-                    output_grads = output_grads_str,
-                )]
-                codes = wrap_generated_range(
-                    codes,
-                    kind='BWD',
-                    entity=segment_name,
-                    virtual_stage=virtual_stage,
-                    micro_batch=micro_batch_id,
-                )
+                if CompileFlag.use_fbw:
+                    input_codes = [bi_sign.format(
+                        input_grads = input_grads_str,
+                        name = f"'{self.node_name(unwrap_node.mirror)}'", # always use name of fw segment
+                        input_tensors = input_tensors_str,
+                        output_tensors = output_tensors_str,
+                        output_grads = output_grads_str,
+                        weights = 'model.parameters()'
+                    )]
+                    codes = wrap_generated_range(
+                        input_codes,
+                        kind='BWD',
+                        entity=segment_name,
+                        virtual_stage=virtual_stage,
+                        micro_batch=micro_batch_id,
+                        pipeline_action=PipelineAction.INPUT_BACKWARD,
+                    )
+                    weight_codes = [bw_sign.format(
+                        name = f"'{self.node_name(unwrap_node.mirror)}'", # always use name of fw segment
+                        weights = 'model.parameters()'
+                    )]
+                    codes += wrap_generated_range(
+                        weight_codes,
+                        kind='BWD',
+                        entity=segment_name,
+                        virtual_stage=virtual_stage,
+                        micro_batch=micro_batch_id,
+                        pipeline_action=PipelineAction.WEIGHT_BACKWARD,
+                    )
+                else:
+                    codes = [bsign.format(
+                        name = f"'{self.node_name(unwrap_node.mirror)}'", # always use name of fw segment
+                        input_grads = input_grads_str,
+                        input_tensors = input_tensors_str,
+                        output_tensors = output_tensors_str,
+                        output_grads = output_grads_str
+                    )]
+                    codes = wrap_generated_range(
+                        codes,
+                        kind='BWD',
+                        entity=segment_name,
+                        virtual_stage=virtual_stage,
+                        micro_batch=micro_batch_id,
+                        pipeline_action=PipelineAction.BACKWARD,
+                    )
 
                 bwd_input_str = f'({input_tensors_str}, {output_tensors_str}, {output_grads_str})'
                 bwd_output_str = input_grads_str if len(input_grads) <= 1 else f'({input_grads_str})'

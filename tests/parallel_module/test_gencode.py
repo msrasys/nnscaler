@@ -383,24 +383,24 @@ class AttrModule(torch.nn.Module):
         return x + getattr(attr, 'a')
 
 
-def print_gencode(cubesave_dir, module_class, index=0):
-    from nnscaler.parallel import _PARALLEL_MODULE_NAMESPACE, _get_full_qualified_name, _DEFAULT_INSTANCE_NAME
-    from pathlib import Path
-    import re
-    namespace = f'{_PARALLEL_MODULE_NAMESPACE}.{_get_full_qualified_name(module_class)}.{_DEFAULT_INSTANCE_NAME}'
-    outdir: Path = cubesave_dir / Path(namespace.replace('.', '/').strip('/'))
-    filecontent = (outdir /f'gencode{index}.py').read_text()
-    print(filecontent)
-
-
-def _gencode_contains(cubesave_dir, module_class, index, search_re, *, instance_name=None):
+def print_gencode(cubesave_dir, module_class, index=0, instance_name=None):
     from nnscaler.parallel import _PARALLEL_MODULE_NAMESPACE, _get_full_qualified_name, _DEFAULT_INSTANCE_NAME
     from pathlib import Path
     import re
     namespace = f'{_PARALLEL_MODULE_NAMESPACE}.{_get_full_qualified_name(module_class)}.{instance_name or _DEFAULT_INSTANCE_NAME}'
     outdir: Path = cubesave_dir / Path(namespace.replace('.', '/').strip('/'))
     filecontent = (outdir /f'gencode{index}.py').read_text()
-    matches = re.findall(search_re, filecontent)
+    print(filecontent)
+
+
+def _gencode_contains(cubesave_dir, module_class, index, search_re, *, instance_name=None, flags=0):
+    from nnscaler.parallel import _PARALLEL_MODULE_NAMESPACE, _get_full_qualified_name, _DEFAULT_INSTANCE_NAME
+    from pathlib import Path
+    import re
+    namespace = f'{_PARALLEL_MODULE_NAMESPACE}.{_get_full_qualified_name(module_class)}.{instance_name or _DEFAULT_INSTANCE_NAME}'
+    outdir: Path = cubesave_dir / Path(namespace.replace('.', '/').strip('/'))
+    filecontent = (outdir /f'gencode{index}.py').read_text()
+    matches = re.findall(search_re, filecontent, flags)
     return matches
 
 

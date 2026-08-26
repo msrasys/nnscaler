@@ -380,34 +380,81 @@ class CubeModule(torch.nn.Module):
             filename (str): base file name (without '.0', '.1', etc.)
                 that saved with model parameters
         """
-        npartitions = 0
-        while os.path.isfile(filename + f'.{npartitions}'):
-            npartitions += 1
-        if npartitions == 0:
-            raise RuntimeError(f"Cannot find file {filename}.0 in load_attr_content")
+        index_filename = filename + '.index'
+        if not os.path.isfile(index_filename):
+            raise RuntimeError(f"Cannot find file {index_filename} in load_attr_content")
+        tid_to_chunk: Dict[int, int] = torch.load(index_filename, weights_only=True)
+        if not isinstance(tid_to_chunk, dict):
+            raise RuntimeError(f"Invalid attribute content index {index_filename}")
+
+        chunk_ids = set(tid_to_chunk.values())
+        if any(type(chunk_id) is not int or chunk_id < 0 for chunk_id in chunk_ids):
+            raise RuntimeError(f"Invalid chunk IDs in attribute content index {index_filename}")
+        npartitions = max(chunk_ids) + 1 if chunk_ids else 1
+        if chunk_ids and chunk_ids != set(range(npartitions)):
+            raise RuntimeError(f"Non-contiguous chunk IDs in attribute content index {index_filename}")
+
         with torch.no_grad():
-            _logger.info(f'loading partitioned model from {filename}, number of model parameter chunks: {npartitions}')
-            attr_names = set(self._fullmap.keys())
-            for file_idx in range(npartitions):
+            required_tids = {meta.tid for meta in self._fullmap.values()}
+            missing_tids = required_tids.difference(tid_to_chunk)
+            if missing_tids:
+                raise RuntimeError(
+                    f'attribute content index {index_filename} is missing tensor IDs: {sorted(missing_tids)}'
+                )
+            chunk_to_attrs = defaultdict(list)
+            for attr_name, meta in self._fullmap.items():
+                chunk_to_attrs[tid_to_chunk[meta.tid]].append((attr_name, meta))
+
+            _logger.info(
+                f'loading partitioned model from {filename}, '
+                f'number of model parameter chunks: {npartitions}, chunks required by this rank: {len(chunk_to_attrs)}'
+            )
+            for file_idx, attrs in sorted(chunk_to_attrs.items()):
                 # part_model contains a subset of attributes, where each attribute is a fulltensor
                 # fulltensor.tid -> torch.Tensor
-                part_model: Dict[int, torch.Tensor] = torch.load(filename + f'.{file_idx}')
-                loaded_name = set()
-                for attr_name in attr_names:
-                    meta = self._fullmap[attr_name]
+                part_model: Dict[int, torch.Tensor] = torch.load(
+                    filename + f'.{file_idx}',
+                    mmap=True,
+                    weights_only=True,
+                )
+                for attr_name, meta in attrs:
                     if meta.tid not in part_model:
-                        continue
+                        raise RuntimeError(
+                            f'tensor ID {meta.tid} for attribute {attr_name} is not in '
+                            f'{filename}.{file_idx}'
+                        )
                     attr = getattr(self, attr_name)
                     content = part_model[meta.tid][meta.slicers]
                     if meta.val_chunks != 1:
                         content = content / meta.val_chunks
                     attr.copy_(content)
-                    loaded_name.add(attr_name)
-                for name in loaded_name:
-                    attr_names.remove(name)
-            if len(attr_names) != 0:
-                raise RuntimeError(
-                    f'remaining graph parameters / buffers cannot find in model files: {list(attr_names)}')
+                del part_model
+
+    def load_np_buffer_content(self, filename: str):
+        """Load non-persistent buffer content from file.
+
+        Only loads attributes that are non-persistent buffers
+        (i.e., in self._non_persistent_buffers_set).
+
+        Args:
+            filename (str): file path to the npbuffer.pt file
+        """
+        if not self._non_persistent_buffers_set:
+            return
+        np_buffer_model: Dict[int, torch.Tensor] = torch.load(filename)
+        with torch.no_grad():
+            _logger.info(f'loading non-persistent buffers from {filename}')
+            for attr_name in self._non_persistent_buffers_set:
+                if attr_name not in self._fullmap:
+                    raise RuntimeError(f'non-persistent buffer {attr_name} not found in fullmap.')
+                meta = self._fullmap[attr_name]
+                if meta.tid not in np_buffer_model:
+                    raise RuntimeError(f'non-persistent buffer {attr_name} (tid={meta.tid}) not found in {filename}.')
+                attr = getattr(self, attr_name)
+                content = np_buffer_model[meta.tid][meta.slicers]
+                if meta.val_chunks != 1:
+                    content = content / meta.val_chunks
+                attr.copy_(content)
 
     def init_group(self, ranks: List[int]):
         if not all([isinstance(rank, int) for rank in ranks]):
@@ -637,6 +684,7 @@ class CubeModule(torch.nn.Module):
         # help understand the whole logic. In other words, the real plan_ngpus is <= len(model_state_dicts).
         plan_ngpus = len(model_state_dicts)
         # gather model states
+        _logger.info('start merge model states')
         full_model_state_dict = cls.merge_model_state_dicts(model_state_dicts, fullmaps[0: plan_ngpus], zero_idx_maps)
         _logger.info('finish merge model states')
         if optim_state_dicts is None:
@@ -1048,6 +1096,8 @@ class ParallelModule(CubeModule):
     EXTRA_STATE_KEY = 'CUBE_EXTRA_STATE'
     ATTR_META_FILE_PREFIX = 'attr_meta'
     ATTR_META_FILE_TEMPLATE = ATTR_META_FILE_PREFIX + '{}.pkl'  # 'attr_meta{}.pkl'
+    ATTR_META_FILE = ATTR_META_FILE_PREFIX + '.pkl'
+    ATTR_META_FORMAT_VERSION = 1
 
     # the rank of the module, will be assigned in the generated subclasses
     rank: int
@@ -1108,15 +1158,8 @@ class ParallelModule(CubeModule):
         from nnscaler.parallel import ComputeConfig
 
         super().__init_subclass__(**kwargs)
-        cls.attr_meta_maps = []
         cls.module_dir = Path(sys.modules[cls.__module__].__file__).parent
-
-        for rank in range(cls.world_size):
-            attr_map_file = cls.module_dir / cls.ATTR_META_FILE_TEMPLATE.format(rank)
-            with open(attr_map_file, 'rb') as f:
-                attr_meta_map = pickle.load(f)
-                attr_meta_map = {attr: AttrMeta(**meta) for attr, meta in attr_meta_map.items()}
-                cls.attr_meta_maps.append(attr_meta_map)
+        cls.attr_meta_maps = cls._load_attr_meta_maps(cls.module_dir, cls.world_size)
 
         cls.dist_param_map = torch.load(cls.module_dir / FxModuleParser.ATTR_MAP_FILE, weights_only=False)
         cls.compute_config = ComputeConfig.safe_load_from_file(
@@ -1124,6 +1167,69 @@ class ParallelModule(CubeModule):
             return_none_on_error=False
         )
         cls.origin_module_metadata = torch.load(cls.module_dir / cls.ORIGIN_MODULE_METADATA_FILE, weights_only=False)
+
+    @staticmethod
+    def _normalize_attr_meta_map(attr_meta_map: Any, source: Path) -> dict[str, AttrMeta]:
+        if not isinstance(attr_meta_map, dict):
+            raise RuntimeError(f'Invalid attribute metadata map in {source}: expected a dictionary')
+        try:
+            return {
+                attr: meta if isinstance(meta, AttrMeta) else AttrMeta(**meta)
+                for attr, meta in attr_meta_map.items()
+            }
+        except (TypeError, KeyError) as exc:
+            raise RuntimeError(f'Invalid attribute metadata map in {source}') from exc
+
+    @classmethod
+    def _load_attr_meta_maps(cls, module_dir: Path, world_size: int) -> list[dict[str, AttrMeta]]:
+        """Load compact metadata when present, with legacy per-rank shard fallback."""
+        compact_file = module_dir / cls.ATTR_META_FILE
+        if not compact_file.exists():
+            attr_meta_maps = []
+            for rank in range(world_size):
+                attr_map_file = module_dir / cls.ATTR_META_FILE_TEMPLATE.format(rank)
+                with attr_map_file.open('rb') as stream:
+                    attr_meta_map = pickle.load(stream)
+                attr_meta_maps.append(cls._normalize_attr_meta_map(attr_meta_map, attr_map_file))
+            return attr_meta_maps
+
+        with compact_file.open('rb') as stream:
+            compact_meta = pickle.load(stream)
+        if not isinstance(compact_meta, dict):
+            raise RuntimeError(f'Invalid compact attribute metadata in {compact_file}: expected a dictionary')
+        if compact_meta.get('version') != cls.ATTR_META_FORMAT_VERSION:
+            raise RuntimeError(
+                f'Unsupported compact attribute metadata version in {compact_file}: '
+                f"{compact_meta.get('version')!r}"
+            )
+
+        unique_payloads = compact_meta.get('unique_payloads')
+        rank_to_variant = compact_meta.get('rank_to_variant')
+        if not isinstance(unique_payloads, list) or not all(isinstance(payload, bytes) for payload in unique_payloads):
+            raise RuntimeError(f'Invalid unique payloads in compact attribute metadata {compact_file}')
+        if not isinstance(rank_to_variant, list) or len(rank_to_variant) != world_size:
+            raise RuntimeError(
+                f'Compact attribute metadata world size mismatch in {compact_file}: '
+                f'expected {world_size}, got '
+                f'{len(rank_to_variant) if isinstance(rank_to_variant, list) else type(rank_to_variant).__name__}'
+            )
+        if any(
+            isinstance(variant, bool)
+            or not isinstance(variant, int)
+            or variant < 0
+            or variant >= len(unique_payloads)
+            for variant in rank_to_variant
+        ):
+            raise RuntimeError(f'Invalid rank-to-variant index in compact attribute metadata {compact_file}')
+
+        unique_maps = []
+        for payload in unique_payloads:
+            try:
+                attr_meta_map = pickle.loads(payload)
+            except Exception as exc:
+                raise RuntimeError(f'Invalid payload in compact attribute metadata {compact_file}') from exc
+            unique_maps.append(cls._normalize_attr_meta_map(attr_meta_map, compact_file))
+        return [unique_maps[variant] for variant in rank_to_variant]
 
     @property
     def non_presistent_buffers_inited(self):
@@ -1166,6 +1272,14 @@ class ParallelModule(CubeModule):
         module_file = Path(sys.modules[self.__module__].__file__)
         if init_params:
             self.load_attr_content(str(module_file.with_name(f"{FxModuleParser.ATTR_CONTENT_FILE_STEM}")))
+        elif self._non_persistent_buffers_set:
+            # When init_params=False, only load non-persistent buffers from the small npbuffer.pt file.
+            # This avoids loading the large fullmodel.pt files when resuming from checkpoint,
+            # since checkpoint will provide the rest of the parameters/buffers.
+            np_buffer_file = module_file.with_name(FxModuleParser.NON_PERSISTENT_BUFFER_FILE)
+            if np_buffer_file.is_file():
+                self.load_np_buffer_content(str(np_buffer_file))
+                self._non_presistent_buffers_inited = True
 
         self._warn_uninitialized_non_persistent_buffers()
 
@@ -1327,6 +1441,16 @@ class ParallelModule(CubeModule):
             raise ValueError(f"Rank {rank} is out of range [0, {cls.world_size})")
         return cls.attr_meta_maps[rank]
 
+    def set_grad_accumulation_steps(self, steps: int):
+        """
+        Set the number of gradient accumulation steps for the module.
+
+        Args:
+            steps (int): the number of gradient accumulation steps
+        """
+        for reducer in self._reducers:
+            reducer.grad_accumulation_steps = steps
+
     def forward(self, *args, **kwargs):
         self._warn_uninitialized_non_persistent_buffers(raise_error=True)
         if self.training:
@@ -1463,6 +1587,7 @@ class ParallelModule(CubeModule):
         self._sync_grad_required = False
         sample_count = len(samples)
         dataloader = microbatches(samples, cycle=False)
+        self.set_grad_accumulation_steps(sample_count)
 
         if self.use_scheduler:
             if len(samples) != self.nmicros_per_scheduler_step:
