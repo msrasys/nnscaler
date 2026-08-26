@@ -440,6 +440,104 @@ class OpPlan:
             self.partitions = []
 
 
+@dataclass(frozen=True)
+class ModuleRecomputeResult:
+    """Result of applying recompute to traced module invocations."""
+
+    planned_groups: tuple[tuple[IRFwOperation, ...], ...]
+    applied_nodes: tuple[IRFwOperation, ...]
+    skipped_hook_ops: int = 0
+
+    @property
+    def planned_group_count(self) -> int:
+        return len(self.planned_groups)
+
+    @property
+    def planned_op_count(self) -> int:
+        return sum(len(group) for group in self.planned_groups)
+
+    @property
+    def applied_group_count(self) -> int:
+        return len({node.recompute for node in self.applied_nodes})
+
+    @property
+    def applied_op_count(self) -> int:
+        return len(self.applied_nodes)
+
+
+def apply_module_recompute(
+    graph: IRGraph,
+    module_types: type[torch.nn.Module] | Iterable[type[torch.nn.Module]],
+) -> ModuleRecomputeResult:
+    """Recompute each consecutive invocation of the requested module types.
+
+    Operators are grouped by their containing module type and FQN. A
+    non-matching or hooked operator terminates the current group, so a group
+    never spans unrelated work or an operator that cannot be replayed.
+
+    This function must be called before graph partition or replication.
+    ``IRGraph.recompute`` may trim operators that do not participate in a
+    backward graph; ``applied_nodes`` reports what actually remains marked.
+    """
+    if isinstance(module_types, type):
+        module_types = (module_types,)
+    else:
+        module_types = tuple(module_types)
+    if not all(
+        isinstance(module_type, type)
+        and issubclass(module_type, torch.nn.Module)
+        for module_type in module_types
+    ):
+        raise TypeError("module_types must contain torch.nn.Module classes")
+
+    groups: list[list[IRFwOperation]] = []
+    current_key = None
+    skipped_hook_ops = 0
+    for node in graph.select(ntype=IRFwOperation):
+        matched_type = next(
+            (
+                module_type
+                for module_type in module_types
+                if module_type in node.module_class_chain
+            ),
+            None,
+        )
+        if matched_type is None:
+            current_key = None
+            continue
+        if (
+            getattr(node, "pre_hook", None) is not None
+            or getattr(node, "post_hook", None) is not None
+        ):
+            skipped_hook_ops += 1
+            current_key = None
+            continue
+
+        key = (matched_type, node.get_module_fqn(matched_type))
+        if key != current_key:
+            groups.append([])
+            current_key = key
+        groups[-1].append(node)
+
+    planned_groups = tuple(
+        tuple(group) for group in groups if len(group) > 1
+    )
+    for group in planned_groups:
+        graph.recompute(list(group))
+
+    applied_nodes = tuple(
+        node
+        for group in planned_groups
+        for node in group
+        if node.recompute is not None
+    )
+    return ModuleRecomputeResult(
+        planned_groups=planned_groups,
+        applied_nodes=applied_nodes,
+        skipped_hook_ops=skipped_hook_ops,
+    )
+
+
 def get_layer_index(fqn: str) -> int:
     """
     Extract the layer index from full qualified name.

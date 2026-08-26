@@ -22,6 +22,81 @@ MBS = 2
 DIM = 16
 LAYERS = 16
 
+
+class RecomputeTarget(nn.Module):
+    pass
+
+
+class _FakeRecomputeNode:
+    def __init__(self, module_type=None, fqn="", *, hooked=False):
+        self.module_class_chain = [] if module_type is None else [module_type]
+        self._fqn = fqn
+        self.pre_hook = object() if hooked else None
+        self.post_hook = None
+        self.recompute = None
+
+    def get_module_fqn(self, module_type):
+        assert module_type in self.module_class_chain
+        return self._fqn
+
+
+class _FakeRecomputeGraph:
+    def __init__(self, nodes, *, applies_recompute=True):
+        self.nodes = nodes
+        self.applies_recompute = applies_recompute
+        self.recompute_calls = []
+
+    def select(self, ntype=None):
+        return self.nodes
+
+    def recompute(self, nodes):
+        self.recompute_calls.append(nodes)
+        if self.applies_recompute:
+            group_id = len(self.recompute_calls)
+            for node in nodes:
+                node.recompute = group_id
+
+
+def test_apply_module_recompute_groups_invocations_and_skips_hooks():
+    from nnscaler.policies import apply_module_recompute
+
+    nodes = [
+        _FakeRecomputeNode(),
+        _FakeRecomputeNode(RecomputeTarget, "blocks.0"),
+        _FakeRecomputeNode(RecomputeTarget, "blocks.0"),
+        _FakeRecomputeNode(),
+        _FakeRecomputeNode(RecomputeTarget, "blocks.0"),
+        _FakeRecomputeNode(RecomputeTarget, "blocks.0"),
+        _FakeRecomputeNode(RecomputeTarget, "blocks.1", hooked=True),
+        _FakeRecomputeNode(RecomputeTarget, "blocks.1"),
+        _FakeRecomputeNode(RecomputeTarget, "blocks.1"),
+        _FakeRecomputeNode(RecomputeTarget, "blocks.2"),
+    ]
+    graph = _FakeRecomputeGraph(nodes)
+
+    result = apply_module_recompute(graph, RecomputeTarget)
+
+    assert [len(group) for group in result.planned_groups] == [2, 2, 2]
+    assert result.planned_group_count == result.applied_group_count == 3
+    assert result.planned_op_count == result.applied_op_count == 6
+    assert result.skipped_hook_ops == 1
+
+
+def test_apply_module_recompute_reports_when_nothing_applies():
+    from nnscaler.policies import apply_module_recompute
+
+    nodes = [
+        _FakeRecomputeNode(RecomputeTarget, "blocks.0"),
+        _FakeRecomputeNode(RecomputeTarget, "blocks.0"),
+    ]
+    graph = _FakeRecomputeGraph(nodes, applies_recompute=False)
+
+    result = apply_module_recompute(graph, [RecomputeTarget])
+
+    assert result.planned_group_count == 1
+    assert result.planned_op_count == 2
+    assert result.applied_group_count == result.applied_op_count == 0
+
 class MLP(nn.Module):
     def __init__(self, dim: int = DIM, nlayers: int = LAYERS):
         init_random()
