@@ -52,8 +52,14 @@ class _ModuleTensorRef:
         self.shape = tensor.shape
         self.stride = tensor.stride()
         self.storage_offset = tensor.storage_offset()
+        self.version = tensor._version
 
     def unpack(self) -> torch.Tensor:
+        if self.owner._version != self.version:
+            raise RuntimeError(
+                'one of the variables needed for gradient computation has been modified by an inplace operation: '
+                f'tensor is at version {self.owner._version}; expected version {self.version} instead.'
+            )
         return torch.as_strided(
             self.owner,
             self.shape,

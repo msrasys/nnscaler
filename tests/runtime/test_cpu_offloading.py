@@ -134,6 +134,21 @@ def test_cpu_offload_skips_module_state_and_views():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason='lack of gpu devices')
+def test_cpu_offload_detects_inplace_module_tensor_mutation():
+    module = _TestParallelModule()
+    module.register_buffer('scale', torch.tensor([2.0, 3.0], device='cuda'))
+    tensor = torch.ones(2, device='cuda', requires_grad=True)
+
+    with _cpu_offload_context(module):
+        output = tensor * module.scale
+
+    module.scale.add_(10)
+
+    with pytest.raises(RuntimeError, match='modified by an inplace operation'):
+        output.sum().backward()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason='lack of gpu devices')
 def test_cpu_offload_saves_stale_parameter_views_as_metadata():
     module = _TestParallelModule()
     parameter = torch.nn.Parameter(torch.randn(8, 8, device='cuda'))

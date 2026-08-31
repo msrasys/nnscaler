@@ -2058,11 +2058,12 @@ class ParallelModule(CubeModule):
 
     def sleep(self):
         self._module_tensor_registry = None
-        super().sleep()
+        return super().sleep()
 
     def wake_up(self, device: Optional[Union[int, device]] = None):
         super().wake_up(device=device)
         self._module_tensor_registry = _ModuleTensorRegistry(self)
+        return self
 
     def _pack(
         self,
