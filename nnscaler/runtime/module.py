@@ -27,7 +27,7 @@ from nnscaler.runtime.dtensor import DTensor
 from nnscaler.runtime.adapter.reducer import Reducer
 from nnscaler.runtime.executor import Executor
 from nnscaler.runtime.gnorm import ParamsInfo
-from nnscaler.runtime.utils import microbatches, set_dparam_meta, get_dparam_meta
+from nnscaler.runtime.utils import microbatches, set_dparam_meta, get_dparam_meta, load_int_from_env
 from nnscaler.runtime.function import insert_backward_hook
 
 from nnscaler import __version__ as runtime_version
@@ -1149,6 +1149,9 @@ class ParallelModule(CubeModule):
     ATTR_META_FILE_TEMPLATE = ATTR_META_FILE_PREFIX + '{}.pkl'  # 'attr_meta{}.pkl'
     ATTR_META_MERGED_FILE = ATTR_META_FILE_PREFIX + '.merged.pkl'  # 'attr_meta.merged.pkl'
 
+    _PREFETCH_LEVEL_ENV_VAR = 'CPU_OFFLOADING_PREFETCH_LEVEL'
+    _PREFETCH_LEVEL_DEFAULT = 2
+
     # the rank of the module, will be assigned in the generated subclasses
     rank: int
     # the world size to run this module, will be assigned in the generated subclasses
@@ -1198,6 +1201,8 @@ class ParallelModule(CubeModule):
         self._backward_prefetched_params: dict[torch.nn.Parameter, int] = {}
         # the params that have been prefetched in forward
         self._forward_prefetched_params: set[torch.nn.Parameter] = set()
+        # load the CPU offloading prefetch level from environment variables
+        self.cpu_offloading_prefetch_level = load_int_from_env(self._PREFETCH_LEVEL_ENV_VAR, self._PREFETCH_LEVEL_DEFAULT)
 
     def __init_subclass__(cls, skip_init=False, **kwargs):
         # special case when we just fake a ParallelModule class
@@ -1471,7 +1476,7 @@ class ParallelModule(CubeModule):
         Offload activations while preserving ``save_params_hooks`` semantics.
         """
         from nnscaler.runtime.cpu_offloading import CPUOffloadContext
-        return CPUOffloadContext(self)
+        return CPUOffloadContext(self, self.cpu_offloading_prefetch_level)
 
     @classmethod
     def get_attr_meta_map(cls, rank=None):

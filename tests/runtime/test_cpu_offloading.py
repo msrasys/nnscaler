@@ -10,7 +10,7 @@ from nnscaler.runtime.cpu_offloading import (
     _ModuleTensorRef,
     _OffloadBatch,
     _OffloadedTensor,
-    prefetch_stream_name,
+    _PREFETCH_STREAM_NAME,
 )
 from nnscaler.runtime.module import _ModuleTensorRegistry, ParallelModule
 
@@ -19,6 +19,11 @@ class _TestParallelModule(ParallelModule, skip_init=True):
     def __init__(self):
         torch.nn.Module.__init__(self)
         self._module_tensor_registry = None
+
+
+class _ConfiguredTestParallelModule(ParallelModule, skip_init=True):
+    def __init__(self):
+        ParallelModule.__init__(self)
 
 
 def _cpu_offload_context(
@@ -34,9 +39,31 @@ def _offloaded_handles(context: CPUOffloadContext) -> list[_OffloadedTensor]:
     return context.batch.handles
 
 
+def test_cpu_offload_prefetch_level_configuration(monkeypatch):
+    monkeypatch.delenv(ParallelModule._PREFETCH_LEVEL_ENV_VAR, raising=False)
+    module = _ConfiguredTestParallelModule()
+    assert module.cpu_offloading_prefetch_level == ParallelModule._PREFETCH_LEVEL_DEFAULT
+    assert module.cpu_offloading_hooks().prefetch_level == ParallelModule._PREFETCH_LEVEL_DEFAULT
+
+    monkeypatch.setenv(ParallelModule._PREFETCH_LEVEL_ENV_VAR, '3')
+    assert module.cpu_offloading_prefetch_level == ParallelModule._PREFETCH_LEVEL_DEFAULT
+
+    configured_module = _ConfiguredTestParallelModule()
+    assert configured_module.cpu_offloading_prefetch_level == 3
+    configured_module.cpu_offloading_prefetch_level = 1
+    assert configured_module.cpu_offloading_hooks().prefetch_level == 1
+
+
+@pytest.mark.parametrize('value', ['invalid', '-1'])
+def test_cpu_offload_rejects_invalid_prefetch_level_env(monkeypatch, value):
+    monkeypatch.setenv(ParallelModule._PREFETCH_LEVEL_ENV_VAR, value)
+    with pytest.raises(ValueError, match=ParallelModule._PREFETCH_LEVEL_ENV_VAR):
+        _ConfiguredTestParallelModule()
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason='lack of gpu devices')
 def test_cpu_offload_uses_runtime_prefetch_stream():
-    assert _get_prefetch_stream() is device.DeviceGroup().get_stream(prefetch_stream_name)
+    assert _get_prefetch_stream() is device.DeviceGroup().get_stream(_PREFETCH_STREAM_NAME)
 
 
 @pytest.mark.skipif(
@@ -135,7 +162,7 @@ def test_cpu_offload_saves_stale_parameter_views_as_metadata():
 def test_parallel_module_cpu_offloading_hooks_preserve_zero3_views():
     class TestParallelModule(ParallelModule, skip_init=True):
         def __init__(self):
-            torch.nn.Module.__init__(self)
+            ParallelModule.__init__(self)
 
     weight_data = torch.randn(8, 8, device='cuda')
     module = TestParallelModule()

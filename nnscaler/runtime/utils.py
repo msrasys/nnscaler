@@ -6,6 +6,7 @@ r"""Runtime Utilities"""
 from typing import Any, List, TYPE_CHECKING, Optional, Union
 import logging
 import heapq
+import os
 
 import torch
 
@@ -310,3 +311,18 @@ def get_grad_dtype(param: torch.nn.Parameter) -> torch.dtype:
     Get the gradient dtype of a parameter.
     """
     return getattr(param, 'grad_dtype', param.dtype)
+
+
+def load_int_from_env(name: str, default: int) -> int:
+    value = os.environ.get(name, str(default))
+    try:
+        int_value = int(value)
+    except ValueError as error:
+        raise ValueError(
+            f'{name} must be a non-negative integer, got {value!r}'
+        ) from error
+    if int_value < 0:
+        raise ValueError(
+            f'{name} must be a non-negative integer, got {value!r}'
+        )
+    return int_value

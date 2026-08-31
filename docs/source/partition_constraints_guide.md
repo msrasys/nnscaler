@@ -95,7 +95,7 @@ class OpPlan:
     *   Operators with the same non-negative `offload_id` must be consecutive and belong to the same pipeline stage.
     *   `offload_id` and `recompute_id` cannot both be set on the same operator.
     *   Dense strided tensors are copied asynchronously through pinned CPU memory. Unsupported layouts remain on their original device.
-    *   Each CPU-offload context forms one batch linked to the preceding live context in process-local forward order. On the first unpack, the runtime loads the demanded tensor first, then prefetches whole batches in reverse pack order. The default prefetch level is 2, covering the current and immediately preceding batches; level 0 loads only on demand, while larger values follow more preceding batches.
+    *   Each CPU-offload context forms one batch linked to the preceding live context in process-local forward order. On the first unpack, the runtime loads the demanded tensor first, then prefetches whole batches in reverse pack order. `ParallelModule` reads `CPU_OFFLOADING_PREFETCH_LEVEL` once when the module is constructed; it defaults to 2 when unset, covering the current and immediately preceding batches. Level 0 loads only on demand, while larger values follow more preceding batches. Set `module.cpu_offloading_prefetch_level` after construction to override the value for that module instance.
     *   CPU-offload contexts must execute sequentially on one thread. Nested contexts and concurrent use from multiple threads are not supported.
 *   **`stage_id`** (default: -1):
     *   Used for Pipeline Parallelism assignment.

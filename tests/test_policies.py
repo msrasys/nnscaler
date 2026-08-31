@@ -392,6 +392,26 @@ def pipeline_cpu_offload_prefetch_policy(graph, cfg):
 
 
 @replace_all_device_with('cpu')
+def test_codegen_fn_cpu_offload_multiple_blocks(tmp_path):
+    parallelize(
+        FnPolicyModuleList(),
+        {'x': torch.randn(4, 4)},
+        pipeline_cpu_offload_prefetch_policy,
+        ComputeConfig(2, 2),
+        gen_savedir=tmp_path,
+        load_module=False,
+    )
+
+    for rank in range(2):
+        assert len(_gencode_contains(
+            tmp_path,
+            FnPolicyModuleList,
+            rank,
+            r'with self\.cpu_offloading_hooks\(\):',
+        )) == 2
+
+
+@replace_all_device_with('cpu')
 def test_codegen_fn_pipeline_cpu_offload(tmp_path):
     instance_name = 'cpu_offload_pipeline'
     parallelize(
@@ -460,8 +480,8 @@ def _pipeline_cpu_offload_runtime_worker(tempdir):
     original_context = cpu_offloading.CPUOffloadContext
 
     class RecordingContext(original_context):
-        def __init__(self, module):
-            super().__init__(module)
+        def __init__(self, module, prefetch_level):
+            super().__init__(module, prefetch_level)
             self.handle_ids = []
             contexts.append(self)
 

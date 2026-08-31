@@ -12,11 +12,11 @@ if TYPE_CHECKING:
     from nnscaler.runtime.module import ParallelModule
 
 
-prefetch_stream_name = 'cpu_offload_prefetch'
+_PREFETCH_STREAM_NAME = 'cpu_offload_prefetch'
 
 
 def _get_prefetch_stream() -> torch.cuda.Stream:
-    return nnscaler.runtime.device.DeviceGroup().get_stream(prefetch_stream_name)
+    return nnscaler.runtime.device.DeviceGroup().get_stream(_PREFETCH_STREAM_NAME)
 
 
 class _OffloadBatch:
@@ -122,7 +122,7 @@ class CPUOffloadContext:
 
         Args:
             module (ParallelModule): The module whose tensors will be offloaded.
-            prefetch_level (int, optional): The number of batches to prefetch. Defaults to 2.
+            prefetch_level (int): The number of batches to prefetch.
                 0: no prefetching, only offload on demand.
                 1: prefetch the current batch only (the tensors in the same offload context).
                 2: prefetch the current and the previous batch.
