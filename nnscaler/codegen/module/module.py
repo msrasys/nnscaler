@@ -922,7 +922,7 @@ class ModuleCodeGen(FuncEmission):
                 if offload_gid is None:
                     codes += group_codes
                 else:
-                    with Block('with torch.autograd.graph.save_on_cpu():') as offload_block:
+                    with Block('with self.cpu_offloading_hooks():') as offload_block:
                         offload_block.insert_body(group_codes)
                     codes += [''] + offload_block.code + ['']
             else:
