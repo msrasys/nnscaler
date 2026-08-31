@@ -4,9 +4,10 @@ import threading
 import weakref
 from typing import Any, Optional, TYPE_CHECKING
 
-import nnscaler.runtime
 import torch
 from torch.autograd.graph import saved_tensors_hooks
+
+from nnscaler.runtime.device import DeviceGroup
 
 if TYPE_CHECKING:
     from nnscaler.runtime.module import ParallelModule
@@ -16,7 +17,7 @@ _PREFETCH_STREAM_NAME = 'cpu_offload_prefetch'
 
 
 def _get_prefetch_stream() -> torch.cuda.Stream:
-    return nnscaler.runtime.device.DeviceGroup().get_stream(_PREFETCH_STREAM_NAME)
+    return DeviceGroup().get_stream(_PREFETCH_STREAM_NAME)
 
 
 class _OffloadBatch:

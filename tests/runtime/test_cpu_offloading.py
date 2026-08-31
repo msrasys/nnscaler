@@ -26,6 +26,13 @@ class _ConfiguredTestParallelModule(ParallelModule, skip_init=True):
         ParallelModule.__init__(self)
 
 
+@pytest.fixture(autouse=True)
+def _reset_offload_batch_chain():
+    _OffloadBatch.last_batch = None
+    yield
+    _OffloadBatch.last_batch = None
+
+
 def _cpu_offload_context(
     module: torch.nn.Module,
     prefetch_level: int = 2,
