@@ -57,7 +57,7 @@ chunk loading, and mmap loading.
 
 - [x] Use the feature's versioned compact metadata format as the canonical format.
 - [x] Keep main merged and legacy per-rank metadata fallbacks for backward
-  intended.
+  compatibility.
 - [x] Make multi-process workers emit data that compacts into the canonical format.
 - [x] Retain selective parameter-chunk loading.
 - [x] Retain mmap loading without keeping unnecessary mappings alive.
@@ -80,104 +80,243 @@ reducer behavior and manual gradient accumulation/readiness tracking.
 
 ## Proposed PR Stack
 
-The historical commits are not suitable PR boundaries: later commits repair or
-replace earlier implementations. Each PR below should be reconstructed from
-the final integration tree and must pass independently.
+The earlier 10-PR list was still too coarse. In particular, it combined
+selective loading with mmap, compact metadata with multi-process codegen,
+multiple segment-layout features, and several distinct VPP policy features.
+The target is now 18 candidate PRs. This number is not a quota: adjacent PRs
+may be combined only if extraction proves that neither side is independently
+correct and testable.
 
-### PR 1: Ignore non-tensor autodist cost outputs
+Historical commits are evidence of intent, not PR boundaries. Later commits
+repair or replace earlier implementations. Every PR must be reconstructed from
+the final integration tree on a fresh branch and must be correct by itself.
 
-- Scope: `nnscaler/autodist/cost_database.py`
-- Original intent: `bbc6889a`
-- Risk: low
-- Dependency: none
+### Independent runtime fixes
+
+#### PR 1: Ignore non-tensor autodist cost outputs
+
+- Scope: `nnscaler/autodist/cost_database.py`.
+- Original intent: `bbc6889a`.
+- Risk/dependency: low; none.
 - Gate: focused cost-database tests.
 
-### PR 2: Split oversized gradients before Apex L2 norm
+#### PR 2: Split oversized gradients before Apex L2 norm
 
-- Scope: `nnscaler/runtime/gnorm.py`, `tests/runtime/test_gnorm.py`
-- Original intent: `a2235d5e`
-- Risk: low
-- Dependency: none
-- Gate: gnorm unit tests, including large zero-copy gradient views.
+- Scope: `nnscaler/runtime/gnorm.py` and focused tests.
+- Original intent: `a2235d5e`.
+- Risk/dependency: low; none.
+- Gate: gnorm tests including oversized zero-copy gradient views.
 
-### PR 3: Handle sparse optimizer state in pipeline Muon runs
+#### PR 3: Handle sparse optimizer state in pipeline Muon runs
 
-- Scope: `runtime/f16_optimizer.py`, `runtime/hybrid_optimizer.py`, and the
-  smallest required reducer changes.
-- Original intent: `8035d6e1`
-- Risk: low to medium
-- Dependency: latest main reducer APIs.
-- Gate: sparse-state optimizer tests and one pipeline optimizer step.
+- Scope: the smallest changes in `f16_optimizer.py`, `hybrid_optimizer.py`, and
+  reducer state merging.
+- Original intent: `8035d6e1`.
+- Risk/dependency: low to medium; current main reducer API.
+- Gate: sparse optimizer-state unit tests and one pipeline optimizer step.
 
-### PR 4: Load only required full-model parameter chunks and use mmap
+### Full-model loading and code generation
 
-- Scope: parser attribute-content indexing and runtime parameter loading.
-- Original intent: `021b1f45`, `bafcc122`
-- Risk: medium
-- Dependency: main compact metadata format.
-- Gate: fresh generation, legacy loading if supported, selective chunk count,
-  mmap behavior, and multi-rank load.
+#### PR 4: Load only required full-model parameter chunks
 
-### PR 5: Multi-process per-rank code generation
+- Scope: parser attribute-content index and selective runtime chunk loading.
+- Original intent: `021b1f45` without the mmap follow-up.
+- Risk/dependency: medium; none beyond current main loading APIs.
+- Gate: indexed chunk selection, missing/corrupt index behavior, and multi-rank
+  loading.
 
-- Scope: `codegen/worker.py`, `codegen/serialization.py`, `parallel.py`, CLI
-  configuration, metadata compaction integration, and tests.
-- Original intent: `4395a258`, `40e5e197`
-- Risk: medium to high
-- Dependency: PR 4 only if shared metadata/loading helpers are retained there.
-- Gate: workers 1/2/8, deep payloads, worker crash cleanup, deterministic files,
-  reuse, and 48-rank generation.
+#### PR 5: Use mmap for full-model parameter chunks
 
-### PR 6: Ring-attention sequence-group and rank-order correctness
+- Scope: mmap lifetime and tensor loading only.
+- Original intent: `bafcc122`.
+- Risk/dependency: low to medium; PR 4.
+- Gate: parity with normal loading and no retained unnecessary mappings.
 
-- Scope: customized ring-attention operators and focused tests.
-- Original intent: `232eecf3`, `23f3d6f5` ring-attention portions.
-- Risk: medium
-- Dependency: none where possible.
-- Gate: return-LSE, variable-length, sequence groups, and reordered ranks.
+#### PR 6: Version and compact per-rank attribute metadata
 
-### PR 7: Narrow pipeline segment boundaries and preserve alias layouts
+- Scope: compact metadata format, deduplication, reuse detection, and fallback
+  readers for main merged and legacy per-rank formats.
+- Original intent: metadata portions of `4395a258` plus the integration
+  conflict resolution.
+- Risk/dependency: medium; none.
+- Gate: compact, main-merged, and legacy load/reuse tests.
 
-- Scope: segment expansion, IR tensor aliases, inter-RVD generation, execution
-  plan reuse, and boundary tests.
-- Original intent: `55030118`, `c86d3dfe`, `3d82460f`, `7209e211`, `c53d12a7`
-  boundary-layout portions.
-- Risk: high
-- Dependency: main segment/execplan APIs.
-- Gate: forward/backward parity, alias components, object boundaries, narrowed
-  layouts, and cross-stage resharding.
+#### PR 7: Generate ranks with multiple codegen workers
 
-### PR 8: Async pipeline P2P and safe output lifetime
+- Scope: worker process orchestration, staging/promotion, failure cleanup, and
+  robust serialization of deep payloads.
+- Original intent: worker portions of `4395a258` and `40e5e197`.
+- Risk/dependency: medium to high; PR 6.
+- Gate: 1/2/8 workers, deep payloads, deterministic outputs, worker failure,
+  reuse, and a 48-rank generation smoke test.
 
-- Scope: runtime communication handlers, dedicated process groups, generated
-  send/receive placement, drain semantics, and output pseudo-free.
-- Original intent: `0e842b84`, `115f1e83`, `68832cf6`, `1480d8c3`, `9a340d07`,
-  `59e7ac12` and relevant later fixes.
-- Risk: high
-- Dependency: PR 7 if narrowed boundary IDs are used by generated adapters.
-- Gate: sync/async numerical parity, multiple sends per output, backward order,
-  no use-after-free, no deadlock, and memory regression tests.
+Deep-payload serialization stays in this PR because a multi-process codegen
+implementation that fails on real deep graphs is not independently complete.
 
-### PR 9: Scheduled-pipeline reducer integration
+### Operator and collective correctness
 
-- Scope: scheduled reducer state, async/manual gradient accumulation, codegen
-  reducer placement, sparse optimizer interaction, and tests.
-- Original intent: `ad1176ae`, `969533c2` and later reducer fixes.
-- Risk: high
-- Dependency: PR 8 and latest main per-bucket reducer implementation.
-- Gate: async reducer on/off, None gradients, unused buckets, per-bucket config,
-  parameter sharding, and optimizer-step parity.
+#### PR 8: Support ring-attention sequence groups
 
-### PR 10: VPP colocated shared parameters and stage-local partition policy
+- Scope: variable-length ring attention, reordered sequence groups, return-LSE,
+  and focused operator tests.
+- Original intent: `232eecf3` and ring-attention portions of `969533c2`.
+- Risk/dependency: medium; none.
+- Gate: variable-length, return-LSE, reordered-rank, and sequence-group parity.
 
-- Scope: VPP shared-parameter multiref decisions, stage-local TP/EP dry-run,
-  fixed-policy hooks needed by applications, and focused pipeline tests.
-- Original intent: `cfc79cf4`, `97449e5a`, `24b66212` and final policy changes.
-- Risk: high
-- Dependency: PRs 7-9.
-- Gate: PP and interleaved VPP parity, shared weights reused on one physical
-  stage, shared weights spanning physical stages, TP/EP stage-local partition,
-  and application smoke tests.
+#### PR 9: Correct collective device and rank mapping
+
+- Scope: object collective device selection, MovePrim rank ordering, and runtime
+  collective mapping.
+- Original intent: `c86d3dfe` and non-ring portions of `23f3d6f5`.
+- Risk/dependency: medium; keep independent of narrowed boundaries where
+  possible.
+- Gate: reordered ranks, object collectives, and multi-group runtime tests.
+
+### IR layout and segment boundaries
+
+#### PR 10: Preserve tensor alias layout information
+
+- Scope: IR tensor alias/layout representation and the smallest execution-plan
+  support required to preserve it.
+- Original intent: alias foundation from `55030118` and `c53d12a7`.
+- Risk/dependency: high; current main IR APIs.
+- Gate: alias components, slicers, reuse, and serialization tests.
+
+#### PR 11: Narrow pipeline segment boundaries
+
+- Scope: segment expansion, narrowed input/output layouts, boundary generation,
+  and cross-stage adapter construction.
+- Original intent: remaining final behavior from `55030118`, `3d82460f`,
+  `7209e211`, and `c53d12a7`.
+- Risk/dependency: high; PRs 9 and 10.
+- Gate: forward/backward parity, tensor/object boundaries, narrowed layouts,
+  resharding, and peak-memory checks.
+
+### Interleaved VPP
+
+#### PR 12: Add interleaved VPP core execution
+
+- Scope: schedule-codegen correctness, auxiliary/non-tensor outputs, context
+  data alignment, cross-stage cache lifetime, and basic interleaved execution.
+- Original intent: final behavior derived from `e0558a72`, `def6ff29`,
+  `0598ec28`, and `25f9827e`.
+- Risk/dependency: high; current main pipeline APIs.
+- Gate: PP and interleaved VPP forward/backward/optimizer parity without
+  application-specific fixed policy.
+
+#### PR 13: Add fixed-policy interleaved VPP stage mapping
+
+- Scope: generic fixed-policy hooks and logical-to-physical stage mapping.
+- Original intent: policy portions of `97449e5a`.
+- Risk/dependency: medium to high; PR 12.
+- Gate: several PP/VPP stage counts, uneven chunks, and invalid-policy checks.
+
+#### PR 14: Keep colocated VPP shared parameters local
+
+- Scope: shared-parameter multiref decisions when logical stages map to the
+  same physical stage.
+- Original intent: `cfc79cf4` and final shared-parameter fixes.
+- Risk/dependency: medium; PR 12.
+- Gate: colocated and cross-physical-stage shared-weight tests.
+
+#### PR 15: Use stage-local TP/EP size during partition dry-run
+
+- Scope: stage-local partition degree selection only.
+- Original intent: `24b66212`.
+- Risk/dependency: medium; PR 12, and PR 13 if its policy interface is used.
+- Gate: heterogeneous stage-local TP/EP dry-run and generated partition checks.
+
+### Pipeline communication and reducer overlap
+
+#### PR 16: Add correct asynchronous pipeline P2P
+
+- Scope: async send/receive runtime support, dedicated process groups, backward
+  gradient ordering, drain semantics, and safe output pseudo-free/lifetime.
+- Original intent: correctness portions of `0e842b84`, `1480d8c3`,
+  `9a340d07`, and `59e7ac12`.
+- Risk/dependency: high; PRs 11 and 12.
+- Gate: sync/async numerical parity, repeated sends, backward ordering, no
+  use-after-free, no hang, and failure cleanup.
+
+Correctness and lifetime safety must stay together; an async P2P PR that can
+free a live send buffer is not independently mergeable.
+
+#### PR 17: Overlap pipeline P2P and reduce communication memory
+
+- Scope: early irecv posting, isend placement after compute, send bundles,
+  deferred waits, and remaining communication-memory optimizations.
+- Original intent: `115f1e83`, `68832cf6`, final parts of `3d82460f`, and
+  `7209e211`.
+- Risk/dependency: high; PR 16.
+- Gate: numerical parity, timeline/overlap evidence, peak memory, throughput,
+  and no new scheduling bubbles.
+
+#### PR 18: Integrate async reducer with scheduled pipelines
+
+- Scope: generated expected-contribution counts, manual gradient
+  accumulation/readiness, scheduled reducer state, and per-bucket main APIs.
+- Original intent: `ad1176ae`, reducer portions of `969533c2`, and later fixes.
+- Risk/dependency: high; PR 12 and current main reducer. Submit after PR 17 to
+  avoid overlapping scheduler reviews even though async P2P is not a strict
+  semantic requirement.
+- Gate: sync/async reducer parity, None/unused gradients, per-bucket options,
+  ZeRO parameter sharding, sparse optimizer state, and multi-step optimizer
+  parity.
+
+## PR Preparation, Review, and Submission Workflow
+
+No PR, remote branch, GitHub comment, or review reply will be created or posted
+without explicit user approval for that exact external action.
+
+For each PR, the assistant prepares a local review packet containing:
+
+1. A fresh local branch based on the latest `origin/main`, or on the preceding
+   local branch for a dependent stacked PR.
+2. A minimal reconstructed diff containing only that PR's feature and tests.
+3. Test commands and complete results, including known baseline failures.
+4. A draft PR title and body covering motivation, behavior, implementation,
+   tests, risk, compatibility, dependency, and rollback notes.
+5. Draft responses for any anticipated reviewer questions.
+
+The user then reviews both the code diff and PR text. Only after the user says
+to submit a specific PR should either party push the branch or create the PR.
+The default handoff is that the user performs the final push/submission. If the
+user explicitly asks the assistant to submit, the assistant must show the final
+title/body and target/base branches again before doing so.
+
+The same rule applies after submission: reviewer comments are analyzed locally,
+and proposed replies or code changes are shown to the user first. The assistant
+does not post a GitHub reply merely because it drafted one.
+
+### Parallel and stacked submission strategy
+
+- Independent small PRs may be opened in parallel in waves of roughly 4-6 so
+  different reviewers can make progress concurrently.
+- Dependent PRs use stacked branches. A child PR targets its parent branch, so
+  its GitHub diff contains only the child's incremental feature.
+- Dependent children may be prepared and opened as Draft PRs before the parent
+  merges. Do not mark a long stack ready for review all at once.
+- Keep an active stack no deeper than about 3-4 PRs. Deeper future work remains
+  local until earlier layers make review progress.
+- After a parent merges, rebase the child onto the latest `origin/main`, retarget
+  it to `main`, rerun its gates, and ask the user to review the refreshed diff.
+- Small reconstructed PR branches should normally be rebased onto current main
+  before submission. The historical 34-commit feature branch is merged rather
+  than rebased only because replaying its superseded history is unsafe.
+- The integration branch remains the complete behavioral reference and may
+  periodically merge main for end-to-end regression testing. It is not the base
+  branch for the reconstructed PRs.
+
+Suggested initial waves:
+
+- Wave 1, independent ready PRs: 1, 2, 3, 4, 8, and 9, subject to reviewer
+  capacity.
+- Stack A: PR 4 -> PR 5.
+- Stack B: PR 6 -> PR 7.
+- Stack C: PR 10 -> PR 11.
+- Stack D: PR 12 as the VPP root, with PRs 13-15 prepared as small dependent
+  branches or sibling Draft PRs.
+- Stack E: PR 16 -> PR 17 -> PR 18.
 
 ## Merge Validation Gates
 
