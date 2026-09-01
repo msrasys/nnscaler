@@ -265,8 +265,10 @@ free a live send buffer is not independently mergeable.
 
 ## PR Preparation, Review, and Submission Workflow
 
-No PR, remote branch, GitHub comment, or review reply will be created or posted
-without explicit user approval for that exact external action.
+The assistant may push prepared branches and open Draft PRs without requesting
+separate approval for every PR. Draft PRs must not be marked ready for review,
+merged, closed, or otherwise promoted without explicit user approval. GitHub
+review comments and replies also require explicit approval before posting.
 
 For each PR, the assistant prepares a local review packet containing:
 
@@ -274,15 +276,24 @@ For each PR, the assistant prepares a local review packet containing:
    local branch for a dependent stacked PR.
 2. A minimal reconstructed diff containing only that PR's feature and tests.
 3. Test commands and complete results, including known baseline failures.
-4. A draft PR title and body covering motivation, behavior, implementation,
-   tests, risk, compatibility, dependency, and rollback notes.
+4. A concise Draft PR title and body. `Summary` and `Motivation` content starts
+   immediately below its heading without an extra blank line. Do not add a
+   `Validation` section unless the user asks for one.
 5. Draft responses for any anticipated reviewer questions.
 
-The user then reviews both the code diff and PR text. Only after the user says
-to submit a specific PR should either party push the branch or create the PR.
-The default handoff is that the user performs the final push/submission. If the
-user explicitly asks the assistant to submit, the assistant must show the final
-title/body and target/base branches again before doing so.
+The user reviews and may edit the code and PR text after the Draft PR is
+created. A PR does not need to contain exactly one commit; reviewability and
+preserving review history take priority over a cosmetically compact history.
+
+Once a PR has been created, preserve its published commit history:
+
+- Apply fixes as new commits and push them normally.
+- Do not amend, rebase, squash, reset, force-push, or otherwise replace commits
+  already published to the PR branch.
+- Existing review conversations and inline comments may refer to exact commits
+  and lines, so a history rewrite is not harmless even for a Draft PR.
+- If rewriting published history is genuinely necessary, explain why and get
+  explicit user approval before doing it.
 
 The same rule applies after submission: reviewer comments are analyzed locally,
 and proposed replies or code changes are shown to the user first. The assistant
@@ -298,11 +309,12 @@ does not post a GitHub reply merely because it drafted one.
   merges. Do not mark a long stack ready for review all at once.
 - Keep an active stack no deeper than about 3-4 PRs. Deeper future work remains
   local until earlier layers make review progress.
-- After a parent merges, rebase the child onto the latest `origin/main`, retarget
-  it to `main`, rerun its gates, and ask the user to review the refreshed diff.
-- Small reconstructed PR branches should normally be rebased onto current main
-  before submission. The historical 34-commit feature branch is merged rather
-  than rebased only because replaying its superseded history is unsafe.
+- Before a Draft PR is created, its branch may be rebased onto current main.
+  After publication, do not rebase it without explicit user approval. When a
+  parent merges, first retarget the child to `main`; if cleanup is needed, use
+  additive commits or ask before rewriting history, then rerun its gates.
+- The historical 34-commit feature branch is merged rather than rebased because
+  replaying its superseded history is unsafe.
 - The integration branch remains the complete behavioral reference and may
   periodically merge main for end-to-end regression testing. It is not the base
   branch for the reconstructed PRs.
