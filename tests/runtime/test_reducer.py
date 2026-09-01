@@ -20,7 +20,9 @@ from nnscaler.graph import IRGraph
 from nnscaler.ir.operator import IRFwOperation
 from nnscaler.flags import CompileFlag
 from nnscaler.runtime.adapter.reducer import (
+    DEFAULT_ASYNC_REDUCER_BUCKET_CAP_MB,
     FlattenParamInfo,
+    ParamBucketConfig,
     Reducer,
     ReducerParamInfo,
     accumulate_reducer_grad,
@@ -149,6 +151,84 @@ def reducer_test():
     assert_parity(baseline, partial(reducer, False, False))
 
 test_reducer_2gpu = partial(torchrun, 2, reducer_test)
+
+
+def reducer_unused_param_test():
+    nnscaler.init()
+
+    rank = torch.distributed.get_rank()
+    device = torch.cuda.current_device()
+
+    default_used = torch.nn.Parameter(torch.tensor([1.0], device=device))
+    default_unused = torch.nn.Parameter(torch.tensor([1.0], device=device))
+    default_reducer = Reducer([0, 1], async_op=False, max_bucket_size_bytes=16)
+    default_reducer.add_param(default_used)
+    default_reducer.add_param(default_unused)
+    default_reducer.build_buckets()
+    default_used.square().backward()
+    default_reducer.sync_grads()
+
+    # The default behavior materializes a zero gradient for an unused bucket.
+    assert default_unused.grad is not None
+    assert torch.count_nonzero(default_unused.grad) == 0
+
+    always_used = torch.nn.Parameter(torch.tensor([1.0], device=device))
+    branch_only = torch.nn.Parameter(torch.tensor([1.0], device=device))
+
+    reducer = Reducer(
+        [0, 1],
+        async_op=False,
+        max_bucket_size_bytes=16,
+        use_none_grad=True,
+    )
+    reducer.add_param(always_used)
+    reducer.add_param(branch_only)
+    reducer.build_buckets()
+
+    optimizer = torch.optim.Adam(reducer.parameters_for_optimizer(), lr=0.1)
+
+    optimizer.zero_grad(set_to_none=True)
+    reducer.zero_grad()
+    loss = always_used.square()
+    if rank == 0:
+        loss = loss + branch_only.square()
+    loss.backward()
+    reducer.sync_grads()
+
+    # A parameter used on any reducer rank receives the reduced gradient on every rank.
+    assert branch_only.grad is not None
+    assert torch.count_nonzero(branch_only.grad) > 0
+    optimizer.step()
+
+    branch_only_after_first_step = branch_only.detach().clone()
+
+    optimizer.zero_grad(set_to_none=True)
+    reducer.zero_grad()
+    always_used.square().backward()
+    reducer.sync_grads()
+
+    # A parameter unused on every reducer rank keeps grad=None, so Adam skips it.
+    assert branch_only.grad is None
+    optimizer.step()
+    assert torch.equal(branch_only, branch_only_after_first_step)
+
+    partial_bucket_used = torch.nn.Parameter(torch.tensor([1.0], device=device))
+    partial_bucket_unused = torch.nn.Parameter(torch.tensor([1.0], device=device))
+    partial_bucket_reducer = Reducer(
+        [0, 1],
+        async_op=False,
+        max_bucket_size_bytes=32,
+        use_none_grad=True,
+    )
+    partial_bucket_reducer.add_param(partial_bucket_used)
+    partial_bucket_reducer.add_param(partial_bucket_unused)
+    partial_bucket_reducer.build_buckets()
+    partial_bucket_used.square().backward()
+    with pytest.raises(RuntimeError, match="all parameters in the same bucket"):
+        partial_bucket_reducer.sync_grads()
+
+
+test_reducer_unused_param_2gpu = partial(torchrun, 2, reducer_unused_param_test)
 
 
 def test_flatten_param_info_dtype():
@@ -352,7 +432,7 @@ def test_reducer_nreplicas():
     reducer.add_param(torch.nn.Parameter(torch.randn(4)))
     reducer.build_buckets()
     for bucket in reducer.buckets:
-        assert bucket._nreplicas == 3
+        assert bucket.nreplicas == 3
 
 
 def _add_scalar_params(reducer, num_params, param_clss=None, param_cls=None):
@@ -382,6 +462,104 @@ class _ManualReducerGrad(torch.autograd.Function):
             assert accumulate_reducer_grad(param, grad, offset)
         assert mark_reducer_grad_ready(param)
         return None, None
+
+
+@mock_reducer_env(0, 2)
+def test_reducer_build_per_bucket_options():
+    reducer = Reducer([0, 1], async_op=False, use_none_grad=True, nreplicas=2)
+    param_clss = {}
+    params = _add_scalar_params(reducer, 3)
+    param_clss[params[0]] = (0, ParamBucketConfig(
+        use_async_reducer=True,
+        reducer_bucket_cap_mb=0,
+        reducer_nreplicas=1,
+    ))
+    param_clss[params[1]] = (0, ParamBucketConfig(reducer_none_grad=False))
+    param_clss[params[2]] = ParamBucketConfig()
+
+    reducer.build_buckets(param_clss=param_clss)
+
+    buckets = list(reversed(reducer.buckets))
+    assert [bucket.param_cls[0] for bucket in buckets] == [(), (0,), (0,)]
+    assert [(bucket._async, bucket._use_none_grad) for bucket in buckets] == [
+        (False, True),
+        (False, False),
+        (True, True),
+    ]
+    assert [bucket.nreplicas for bucket in buckets] == [2, 2, 1]
+    assert [bucket.param_cls[-1].reducer_bucket_cap_mb for bucket in buckets] == [
+        0,
+        0,
+        DEFAULT_ASYNC_REDUCER_BUCKET_CAP_MB,
+    ]
+    assert set(reducer.get_opt_params().values()) == {(), (0,)}
+    assert all(bucket._flatten_param_info.params_info for bucket in buckets)
+
+
+@mock_reducer_env(0, 2)
+def test_reducer_per_bucket_nreplicas_scales_gradients(monkeypatch):
+    reducer = Reducer([0, 1], nreplicas=2)
+    inherited_param, sum_param = _add_scalar_params(reducer, 2)
+    reducer.build_buckets(param_clss={
+        inherited_param: (0, ParamBucketConfig()),
+        sum_param: (0, ParamBucketConfig(reducer_nreplicas=1)),
+    })
+
+    assert len(reducer.buckets) == 2
+    for bucket in reducer.buckets:
+        bucket._contiguous_grads.fill_(1.0)
+
+    def all_reduce(tensor, *args, **kwargs):
+        tensor.mul_(2)
+
+    monkeypatch.setattr(torch.distributed, 'all_reduce', all_reduce)
+    reducer.sync_grads()
+
+    assert inherited_param.grad.item() == 1.0
+    assert sum_param.grad.item() == 2.0
+
+
+@mock_reducer_env(0, 2)
+def test_reducer_per_bucket_nreplicas_validation():
+    reducer = Reducer([0, 1])
+    param = _add_scalar_params(reducer, 1)[0]
+    with pytest.raises(ValueError, match='reducer_nreplicas should be an integer greater than or equal to 1'):
+        reducer.build_buckets({param: ParamBucketConfig(reducer_nreplicas=0)})
+
+    reducer = Reducer([0, 1], reduce_op='avg')
+    param = _add_scalar_params(reducer, 1)[0]
+    with pytest.raises(ValueError, match='nreplicas should be used with sum reduce op'):
+        reducer.build_buckets({param: ParamBucketConfig(reducer_nreplicas=2)})
+
+
+@mock_reducer_env(0, 2)
+def test_reducer_build_per_bucket_max_size():
+    reducer = Reducer([0, 1])
+    param_clss = {}
+    params = _add_scalar_params(reducer, 4)
+    cap_16_bytes_mb = 16 / (1024 * 1024)
+    cap_32_bytes_mb = 32 / (1024 * 1024)
+    for param in params[:2]:
+        param_clss[param] = (0, ParamBucketConfig(reducer_bucket_cap_mb=cap_16_bytes_mb))
+    for param in params[2:]:
+        param_clss[param] = (1, ParamBucketConfig(reducer_bucket_cap_mb=cap_32_bytes_mb))
+
+    reducer.build_buckets(param_clss=param_clss)
+
+    buckets = list(reversed(reducer.buckets))
+    assert [len(bucket.params) for bucket in buckets] == [1, 1, 2]
+    assert [bucket.param_cls[-1].reducer_bucket_cap_mb for bucket in buckets] == [
+        cap_16_bytes_mb,
+        cap_16_bytes_mb,
+        cap_32_bytes_mb,
+    ]
+
+    invalid_reducer = Reducer([0, 1])
+    param = _add_scalar_params(invalid_reducer, 1)[0]
+    with pytest.raises(ValueError, match='reducer_bucket_cap_mb should be non-negative'):
+        invalid_reducer.build_buckets({
+            param: ParamBucketConfig(reducer_bucket_cap_mb=-1),
+        })
 
 
 @mock_reducer_env(0, 8)
@@ -437,7 +615,7 @@ def test_reducer_build_zero_param_level_sharding_keeps_param_classes_separate():
 
     buckets = list(reversed(reducer.buckets))
     assert [len(bucket.params) for bucket in buckets] == [9, 9]
-    assert [bucket.param_cls[0] for bucket in buckets] == [0, 1]
+    assert [bucket.param_cls[0] for bucket in buckets] == [(0,), (1,)]
 
 
 @mock_reducer_env(0, 8)
@@ -503,7 +681,7 @@ def test_reducer_build_zero_param_level_sharding_pads_with_classes():
     buckets = list(reversed(reducer.buckets))
     assert len(buckets) == 2
     assert [len(b.params) for b in buckets] == [3, 5]
-    assert [b.param_cls[0] for b in buckets] == [0, 1]
+    assert [b.param_cls[0] for b in buckets] == [(0,), (1,)]
     # each bucket buffer = 4 * 8 = 32
     assert buckets[0]._contiguous_params.numel() == 4 * 8
     assert buckets[1]._contiguous_params.numel() == 4 * 8

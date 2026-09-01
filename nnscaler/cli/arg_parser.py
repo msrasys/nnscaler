@@ -423,9 +423,9 @@ def _is_function_type(type_info):
 
 def _guess_deserialize_object(value):
     if isinstance(value, dict):
-        if _VALUE_KEY in value and _VALUE_TYPE_KEY in value and len(value) == 2:
-            # keep as it is if it is a value object
-            return value
+        value = factory_normalize(value)
+
+    if isinstance(value, dict):
         return {_guess_deserialize_object(k): _guess_deserialize_object(v) for k, v in value.items()}
     if isinstance(value, list):
         return [_guess_deserialize_object(v) for v in value]

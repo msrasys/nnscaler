@@ -10,6 +10,7 @@ import logging
 import inspect
 import contextlib
 import os
+import functools
 
 import torch
 import torch.utils
@@ -19,7 +20,7 @@ import yaml
 import torch
 
 import nnscaler
-from nnscaler.utils import enforce_zero_num_worker, fields, transform_recursively, load_type, copy_dynamic
+from nnscaler.utils import enforce_zero_num_worker, fields, transform_recursively, load_type, copy_dynamic, StepwiseConfig
 from nnscaler.parallel import ComputeConfig, build_optimizer, ReuseType, BroadcastGenFilesStrategy, _PREDEFINED_POLICIES
 from nnscaler.runtime.utils import set_grad_dtype
 
@@ -28,7 +29,8 @@ from .arg_parser import (
     deserialize_value_type,
     merge_args, parse_args, fn_field,
     _TYPE_KEY, _VALUE_TYPE_KEY, _VALUE_KEY,
-    resolve_args
+    resolve_args,
+    factory_normalize,
 )
 from .loggers import LoggerBase, AsyncLogger
 from .train_hook import TrainHook
@@ -236,6 +238,7 @@ class OptionalReducerConfig:
     zero_use_reduce_scatter: Optional[bool] = None
     use_async_reducer: Optional[bool] = None
     reducer_bucket_cap_mb: Optional[float] = None
+    reducer_none_grad: Optional[bool] = None
 
     def resolve(self, compute_config: ComputeConfig, **kwargs) -> ComputeConfig:
         replace_values = {
@@ -375,7 +378,10 @@ class OptimizerConfig:
     args: Dict[str, Any] = field(default_factory=dict)
     clip_gnorm: float = 0.0
 
-    param_clss_fn: Optional[Callable[[str], Any]] = fn_field(default=None)
+    param_clss_fn: Optional[Union[
+        Callable[[str], Any],
+        Callable[['TrainerArgs', str], Any],
+    ]] = fn_field(default=None)
     # loss reduction method
     # mean: average the loss over all micro-batches
     # sum: sum the loss of all micro-batches
@@ -405,13 +411,41 @@ class OptimizerConfig:
 
     def __post_init__(self):
         if self.grad_reduction not in ('sum', 'mean', 'per-token-mean'):
-            raise ValueError(f"Invalid gradient_accumulation {self.grad_reduction}")
+            raise ValueError(f"Invalid grad_reduction {self.grad_reduction}")
         if self.grad_reduction == 'per-token-mean' and not self.aggregate_outputs_fn:
             raise ValueError("aggregate_outputs_fn is required when grad_reduction is 'per-token-mean'")
         if self.loss_reduction == 'per-token-mean' and not self.aggregate_outputs_fn:
             raise ValueError("aggregate_outputs_fn is required when loss_reduction is 'per-token-mean'")
         if self.loss_reduction not in ('mean', 'sum', 'per-token-mean'):
             raise ValueError(f"Invalid loss_reduction {self.loss_reduction}")
+
+    def get_normalized_param_clss_fn(self, trainer_args: 'TrainerArgs') -> Optional[Callable[[str], Any]]:
+        """
+        Get a normalized param_clss_fn that only accepts parameter name as input,
+        which can be used directly in build_optimizer.
+
+        If the original param_clss_fn accepts (trainer_args, parameter_name),
+        it will be partially applied with the given trainer_args.
+        """
+        param_clss_fn = self.param_clss_fn
+        if param_clss_fn is None:
+            return None
+
+        signature = inspect.signature(param_clss_fn)
+        try:
+            if len(signature.parameters) == 1:
+                signature.bind('parameter_name')
+                return param_clss_fn
+            if len(signature.parameters) == 2:
+                signature.bind(trainer_args, 'parameter_name')
+                return functools.partial(param_clss_fn, trainer_args)
+        except TypeError:
+            pass
+
+        raise TypeError(
+            "`optimizer.param_clss_fn` must accept either `(parameter_name)` or "
+            f"`(trainer_args, parameter_name)`, but got signature {signature}."
+        )
 
 
 @dataclass
@@ -930,6 +964,20 @@ def _deserialize_hook_config(hook) -> Union[HookConfig, HookMapConfig]:
     raise ValueError(f"Invalid hook config {hook}.")
 
 
+def _deserialize_int_or_dict_of_ints(value: Any) -> Union[int, Dict[int, int]]:
+    if isinstance(value, str):
+        import ast
+        try:
+            value = ast.literal_eval(value)
+        except Exception:
+            pass
+
+    value = factory_normalize(value)
+    if isinstance(value, dict):
+        return {int(k): int(v) for k, v in value.items()}
+    return int(value)
+
+
 class _StepableContext(Protocol):
     def __enter__(self):
         ...
@@ -1001,11 +1049,19 @@ class TrainerArgs(PrecisionMixin, PolicyMixin):
     micro_batch_size: int = 1
     # You can set one of `global_batch_size` and `grad_accumulation_steps` option.
     # Please note if both are set, they must be consistent.
+    # When both are None, we will set them to the default values:
     # default is
     # global_batch_size = self.micro_batch_size*self.scaling_factor
     # grad_accumulation_steps = 1
-    global_batch_size: Optional[int] = None
-    grad_accumulation_steps: Optional[int] = None
+    # When they are dicts, the keys are the train steps,
+    # and the values are the corresponding values of global_batch_size or grad_accumulation_steps
+    # in that step.
+    global_batch_size: Optional[Union[int, Dict[int, int]]] = field(default=None, metadata={
+        'deserialize': _deserialize_int_or_dict_of_ints
+    })
+    grad_accumulation_steps: Optional[Union[int, Dict[int, int]]] = field(default=None, metadata={
+        'deserialize': _deserialize_int_or_dict_of_ints
+    })
 
     max_epochs: Optional[int] = None
     max_train_steps: Optional[int] = None
@@ -1032,17 +1088,50 @@ class TrainerArgs(PrecisionMixin, PolicyMixin):
         if not self.compute_config.use_end2end:
             raise ValueError("use_end2end must be True")
 
-        if not self.global_batch_size and not self.grad_accumulation_steps:
+        for name, value in (
+            ('global_batch_size', self.global_batch_size),
+            ('grad_accumulation_steps', self.grad_accumulation_steps),
+        ):
+            if isinstance(value, dict):
+                if not value:
+                    raise ValueError(f"`{name}` must not be empty")
+                if any(v <= 0 for v in value.values()):
+                    raise ValueError(f"`{name}` values must be positive")
+            elif value is not None and value <= 0:
+                raise ValueError(f"`{name}` must be positive")
+
+        if (self.global_batch_size is not None and self.grad_accumulation_steps is not None
+                and isinstance(self.global_batch_size, dict) != isinstance(self.grad_accumulation_steps, dict)):
+            raise ValueError("`global_batch_size` and `grad_accumulation_steps` must both be int or both be dict")
+
+        if self.global_batch_size is None and self.grad_accumulation_steps is None:
             self.global_batch_size = self.micro_batch_size*self.scaling_factor
             self.grad_accumulation_steps = 1
-        elif not self.global_batch_size:
-            self.global_batch_size = self.micro_batch_size*self.scaling_factor*self.grad_accumulation_steps
-        elif not self.grad_accumulation_steps:
-            self.grad_accumulation_steps = self.global_batch_size // (self.micro_batch_size*self.scaling_factor)
+        elif self.global_batch_size is None:
+            if isinstance(self.grad_accumulation_steps, dict):
+                self.global_batch_size = {k: self.micro_batch_size*self.scaling_factor*v for k, v in self.grad_accumulation_steps.items()}
+            else:
+                self.global_batch_size = self.micro_batch_size*self.scaling_factor*self.grad_accumulation_steps
+        elif self.grad_accumulation_steps is None:
+            if isinstance(self.global_batch_size, dict):
+                self.grad_accumulation_steps = {k: v // (self.micro_batch_size*self.scaling_factor) for k, v in self.global_batch_size.items()}
+            else:
+                self.grad_accumulation_steps = self.global_batch_size // (self.micro_batch_size*self.scaling_factor)
 
-        if self.global_batch_size != self.micro_batch_size*self.scaling_factor*self.grad_accumulation_steps:
-            raise ValueError(f"`global_batch_size` {self.global_batch_size} is not equal to `micro_batch_size*scaling_factor*grad_accumulation_steps` "
-                             f"{self.micro_batch_size*self.scaling_factor*self.grad_accumulation_steps}")
+        if isinstance(self.global_batch_size, int):
+            if self.global_batch_size != self.micro_batch_size*self.scaling_factor*self.grad_accumulation_steps:
+                raise ValueError(f"`global_batch_size` {self.global_batch_size} is not equal to `micro_batch_size*scaling_factor*grad_accumulation_steps` "
+                                f"{self.micro_batch_size*self.scaling_factor*self.grad_accumulation_steps}")
+        else:
+            if len(self.global_batch_size) != len(self.grad_accumulation_steps):
+                raise ValueError(f"`global_batch_size` and `grad_accumulation_steps` must have the same number of keys, "
+                                 f"but got {len(self.global_batch_size)} and {len(self.grad_accumulation_steps)}")
+            for k in self.global_batch_size.keys():
+                if k not in self.grad_accumulation_steps:
+                    raise ValueError(f"`global_batch_size` has key {k} but `grad_accumulation_steps` does not have it")
+                if self.global_batch_size[k] != self.micro_batch_size*self.scaling_factor*self.grad_accumulation_steps[k]:
+                    raise ValueError(f"`global_batch_size[{k}]` {self.global_batch_size[k]} is not equal to `micro_batch_size*scaling_factor*grad_accumulation_steps[{k}]` "
+                                    f"{self.micro_batch_size*self.scaling_factor*self.grad_accumulation_steps[k]}")
 
         if self.run_mode not in ('compile', 'run'):
             raise ValueError(f"Invalid run_mode {self.run_mode}")
@@ -1210,7 +1299,22 @@ class TrainerArgs(PrecisionMixin, PolicyMixin):
 
     @property
     def update_freq(self):
-        return self.global_batch_size // self.micro_batch_size // self.scaling_factor
+        if isinstance(self.global_batch_size, dict):
+            return {
+                k: v // self.micro_batch_size  // self.scaling_factor
+                for k, v in self.global_batch_size.items()
+            }
+        else:
+            return self.global_batch_size // self.micro_batch_size // self.scaling_factor
+
+    def update_freq_at(self, global_step: int) -> int:
+        """Return the number of microbatches (update_freq) active at ``global_step``.
+
+        When ``update_freq`` is a dict, its keys are global train-step thresholds:
+        the value of the largest key ``<= global_step`` is used, and the smallest
+        key's value applies before the first threshold.
+        """
+        return StepwiseConfig.value_at(self.update_freq, global_step)
 
     @property
     def enable_log_progress(self):
@@ -1290,7 +1394,7 @@ class TrainerArgs(PrecisionMixin, PolicyMixin):
         )
         return build_optimizer(
             parallel_model, optimizer_class, npp_compute_config,
-            self.optimizer.param_clss_fn,
+            self.optimizer.get_normalized_param_clss_fn(self),
             **kwargs
         )
 

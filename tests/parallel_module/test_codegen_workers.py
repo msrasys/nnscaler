@@ -200,6 +200,36 @@ def test_compact_attr_meta_validates_world_size_and_variant_indexes(tmp_path):
         ParallelModule._load_attr_meta_maps(tmp_path, 2)
 
 
+def test_main_merged_attr_meta_loading_expands_scale_units(tmp_path):
+    merged_maps = [
+        {},
+        {
+            'weight': {
+                'tid': 1,
+                'is_param': True,
+                'orig_name': 'weight',
+                'shape': (4, 4),
+                'slicers': (slice(None), slice(None)),
+                'val_chunks': 1,
+                'dtype': torch.float32,
+                'sub_shape': (4, 4),
+            },
+        },
+    ]
+    with (tmp_path / ParallelModule.ATTR_META_MERGED_FILE).open('wb') as stream:
+        pickle.dump(merged_maps, stream)
+
+    loaded_maps = ParallelModule._load_attr_meta_maps(
+        tmp_path,
+        4,
+        ComputeConfig(plan_ngpus=2, runtime_ngpus=4),
+    )
+    assert loaded_maps[0] is loaded_maps[2]
+    assert loaded_maps[1] is loaded_maps[3]
+    assert loaded_maps[0] == {}
+    assert loaded_maps[1]['weight'].orig_name == 'weight'
+
+
 @replace_all_device_with('cpu', force=True)
 def test_attr_meta_legacy_loading_and_reuse(tmp_path):
     root = tmp_path / 'legacy'

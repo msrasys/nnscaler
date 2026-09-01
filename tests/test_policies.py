@@ -480,6 +480,54 @@ def sched_1f1b_multi_stream(graph: IRGraph, num_microbatches: int, num_stages: i
     return sched
 
 
+def sched_1f1b_plan_local_streams(graph: IRGraph, num_microbatches: int, num_stages: int) -> SchedulePlan:
+    sched = sched_1f1b_multi_stream(graph, num_microbatches, num_stages)
+    sched.stream_config = StreamConfig(
+        dataloader=StreamContext(stream=f'dataloader_{num_microbatches}'),
+        inter_segment_move=StreamContext(stream=f'adapter_{num_microbatches}'),
+        result_broadcast=StreamContext(stream=f'adapter_{num_microbatches}'),
+    )
+    return sched
+
+
+@replace_all_device_with('cpu')
+def test_codegen_multi_scheduler_plan_local_streams(tmp_path):
+    parallelize(
+        FnPolicyModuleList(),
+        {'x': torch.randn(4, 4)},
+        megatron_ffn_policy_list,
+        ComputeConfig(4, 8, use_end2end=True,
+            pas_config={
+                'pipeline_nmicros': [2, 4],
+                'pipeline_size': 2,
+                'pipeline_scheduler': sched_1f1b_plan_local_streams,
+            }
+        ),
+        gen_savedir=tmp_path,
+        load_module=False,
+    )
+
+    for rank in range(8):
+        train_step_2, = _gencode_contains(
+            tmp_path, FnPolicyModuleList, rank,
+            r'def _train_step_2\([^)]*\):\n([\s\S]*?)\ndef _infer_step_2',
+        )
+        train_step_4, = _gencode_contains(
+            tmp_path, FnPolicyModuleList, rank,
+            r'def _train_step_4\([^)]*\):\n([\s\S]*?)\ndef _infer_step_4',
+        )
+
+        assert "get_stream('dataloader_2')" in train_step_2
+        assert "get_stream('adapter_2')" in train_step_2
+        assert "get_stream('dataloader_4')" not in train_step_2
+        assert "get_stream('adapter_4')" not in train_step_2
+
+        assert "get_stream('dataloader_4')" in train_step_4
+        assert "get_stream('adapter_4')" in train_step_4
+        assert "get_stream('dataloader_2')" not in train_step_4
+        assert "get_stream('adapter_2')" not in train_step_4
+
+
 @replace_all_device_with('cpu')
 def test_codegen_fn_pipeline_multi_streams(tmp_path):
     parallelize(

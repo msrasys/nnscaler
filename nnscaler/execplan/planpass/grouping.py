@@ -6,27 +6,33 @@ Operation grouping
 """
 from typing import List, Dict, Tuple
 
-from nnscaler.execplan import ExecutionPlan
+from nnscaler.execplan import ExecutionPlan, ExecutionPlanType
 from nnscaler.execplan.planpass.planpass import PlanPass
 from nnscaler.ir.adapter import IRAdapter
 from nnscaler.ir.adapter.prim import IdentityPrim
 from nnscaler.ir.operator import IRFwOperation
 from nnscaler.graph.function.pyfunc import IRPyFunc
+from nnscaler.graph.graph import IRSegment
 from nnscaler.ir.cten import IRCell
 
 from nnscaler.flags import CompileFlag
-        
+
 
 class Grouping(PlanPass):
 
     @staticmethod
-    def apply(execplan: ExecutionPlan) -> ExecutionPlan:
+    def apply(execplan: ExecutionPlanType) -> ExecutionPlanType:
         """
         Group contiguous differentiable operators segments
 
         Note non-differentiable IRAdapter with all identity operators will be
         removed from execution plan.
         """
+        if isinstance(execplan, dict) or execplan.graph.select(ntype=IRSegment):
+            # ignore the case of pipeline,
+            # because operator grouping is already done in scheduler.
+            return execplan
+
         graph = execplan.graph
         fgroups, bgroups = Grouping.group(execplan)
         for devid in execplan.devices():

@@ -1,0 +1,59 @@
+vars:
+  hidden_size: 16
+  sequence_length: 7
+
+compute_config:
+  plan_ngpus: 2
+  runtime_ngpus: 4
+  constant_folding: true
+  use_zero: 0
+  use_end2end: true
+  reducer_replicated_params: true
+
+run_mode: run
+pas_policy: tests.cli.test_simulated_dp.simulated_dp_policy
+micro_batch_size: 4
+global_batch_size: 8
+max_train_steps: 50
+seed: 0
+init_env_fn: tests.cli.test_simulated_dp.init_scale_unit_groups
+
+model:
+  type: tests.cli.test_simulated_dp.SimulatedDPModel
+  args:
+    hidden_size: $(vars.hidden_size)
+    scale_unit_size: $(compute_config.plan_ngpus)
+    use_scale_unit_dp: false
+
+optimizer:
+  type: torch.optim.Adam
+  args:
+    lr: 0.01
+
+dataset:
+  type: tests.cli.test_simulated_dp.SimulatedDPDataset
+  train_args:
+    hidden_size: $(vars.hidden_size)
+    sequence_length: $(vars.sequence_length)
+    size: 8
+  val_args:
+    hidden_size: $(vars.hidden_size)
+    sequence_length: $(vars.sequence_length)
+    size: 8
+
+dataset_sampler:
+  train_args:
+    shuffle: false
+
+dataloader:
+  train_args:
+    drop_last: true
+    shuffle: false
+  val_args:
+    drop_last: true
+    shuffle: false
+
+checkpoint:
+  keep_last_n_checkpoints: 1
+  every_n_train_steps: 1
+  save_type: deduped

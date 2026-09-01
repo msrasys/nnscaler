@@ -1,7 +1,7 @@
 #  Copyright (c) Microsoft Corporation.
 #  Licensed under the MIT License.
 
-from typing import Callable, Dict, List, Optional, Tuple, Any
+from typing import Callable, Dict, List, Optional, Tuple, Any, Union
 import copy
 import numpy as np
 import sys
@@ -587,3 +587,8 @@ class ExecutionPlan:
             for node in self._seq[devid]:
                 dscp += f'{node}\n'
         return dscp
+
+
+# a single execution plan, or a dict mapping the number of micro-batches to its
+# execution plan when multiple schedulers are enabled.
+ExecutionPlanType = Union[ExecutionPlan, Dict[int, ExecutionPlan]]

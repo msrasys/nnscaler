@@ -26,7 +26,7 @@ from nnscaler.parallel import (
     trimmed_broadcast_merged_state_dict,
     gather_full_model_state_dict,
 )
-from nnscaler.runtime.module import ParallelModule, ExtraState
+from nnscaler.runtime.module import AttrMeta, ParallelModule, ExtraState
 from nnscaler.runtime.gnorm import calcuate_gnorm
 
 from .common import CubeLinear, init_random, init_distributed, PASMegatron, assert_equal
@@ -53,6 +53,59 @@ class FcRelu_4_4(FcRelu):
         self.register_buffer('buffer', torch.ones(1, 4))
     def forward(self, x):
         return super().forward(x + self.buffer)
+
+
+def test_merge_sparse_optimizer_state():
+    fullmap = {
+        f'p{index}_{index}': AttrMeta(
+            index,
+            True,
+            f'p{index}',
+            (2,),
+            (slice(0, 2),),
+            1,
+            torch.float32,
+            (2,),
+        )
+        for index in range(2)
+    }
+    state = {
+        'step': torch.tensor(1.0),
+        'exp_avg': torch.ones(2),
+        'exp_avg_sq': torch.ones(2),
+    }
+
+    merged = ParallelModule.merge_opt_state_dicts(
+        [fullmap],
+        [{'state': {0: state}, 'param_groups': [{'params': [0, 1]}]}],
+    )
+
+    assert set(merged['state']) == {0}
+    assert merged['param_groups'][0]['params'] == [0, 1]
+
+    sharded_fullmaps = [
+        {
+            f'p0_{rank}': AttrMeta(
+                rank,
+                True,
+                'p0',
+                (4,),
+                (slice(rank * 2, (rank + 1) * 2),),
+                1,
+                torch.float32,
+                (2,),
+            )
+        }
+        for rank in range(2)
+    ]
+    with pytest.raises(ValueError, match='Incomplete optimizer state'):
+        ParallelModule.merge_opt_state_dicts(
+            sharded_fullmaps,
+            [
+                {'state': {0: state}, 'param_groups': [{'params': [0]}]},
+                {'state': {}, 'param_groups': [{'params': [0]}]},
+            ],
+        )
 
 
 def _to_cube_model(module, pas, compute_config, cube_savedir, instance_name, dummy_input = None):

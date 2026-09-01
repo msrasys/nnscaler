@@ -84,6 +84,20 @@ class CompileFlag:
     # ensuring gradient consistency across ranks. Default is False (original behavior).
     reducer_replicated_params = _to_bool('REDUCER_REPLICATED_PARAMS')
 
+    # whether to use None grad for parameters that are not used in the current iteration.
+    # This is useful for models with dynamic control flow, where some parameters may not be used
+    # in certain iterations.
+    # By default, this flag is False, which means all parameters will always
+    # have their gradients computed and stored, and their gradients will be set to 0.0
+    # if they are not used in the current iteration
+
+    # Note in current implementation, the parameters are grouped into buckets,
+    # so if you want to set this flag to True, you must make sure that all parameters in the same bucket are used in the same iteration,
+    # otherwise, errors will be raised.
+    # Note2: This doesn't make async/zero3 work with dynamic control flow,
+    # because the async/zero3 reducer will always assume all parameters are used in the current iteration.
+    reducer_none_grad = _to_bool('REDUCER_NONE_GRAD')
+
     # use automate mixture precision training, where weights, gradients
     # and optimizer status are kept in its original data type (can be float32),
     # but some of the forward operators will be converted to float16.

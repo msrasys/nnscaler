@@ -20,6 +20,7 @@ import subprocess
 import tempfile
 import time
 from collections import OrderedDict, defaultdict
+import pickle
 
 import torch
 import torch.distributed
@@ -47,7 +48,7 @@ from nnscaler.ir.operator import IRBpOperation, IRDataOperation
 from nnscaler.ir.tensor import IRFullTensor
 from nnscaler.ir.unique import IDGenerator
 
-from nnscaler.runtime.adapter.reducer import Bucket, Reducer, ParamZeroConfig
+from nnscaler.runtime.adapter.reducer import Bucket, Reducer, ParamBucketConfig
 from nnscaler.runtime.device import DeviceGroup
 from nnscaler.runtime.gnorm import calcuate_gnorm, clip_grads
 from nnscaler.runtime.module import (
@@ -73,8 +74,7 @@ from nnscaler.utils import (
     OptStateDict,
     copy_dynamic,
     broadcast_files,
-    broadcast_mixed_data,
-    gather_mixed_data,
+    first
 )
 
 logger = logging.getLogger(__name__)
@@ -157,6 +157,16 @@ class ComputeConfig:
     # When True, replicated weights will also go through all-reduce (with nreplicas division),
     # ensuring gradient consistency across ranks. Default is False.
     reducer_replicated_params: bool = False
+    # whether to use None grad for parameters that are not used in the current iteration.
+    # This is useful for models with dynamic control flow, where some parameters may not be used
+    # in certain iterations.
+    # Note: in current implementation, the parameters are grouped into buckets,
+    # so if you want to set this flag to True,
+    # you must make sure that all parameters in the same bucket are used in the same iteration,
+    # otherwise, errors will be raised.
+    # Note2: This doesn't make async/zero3 work with dynamic control flow,
+    # because the async/zero3 reducer will always assume all parameters are used in the current iteration.
+    reducer_none_grad: bool = False
 
     # PAS policy settings
     # you can also put any other settings that can affect code generation here.
@@ -215,7 +225,7 @@ class ComputeConfig:
             logger.warning("use_zero=2 is not supported. ZeRO stage 3 will be used instead.")
             super().__setattr__('use_zero', 3)
 
-        num_scale_units = self.runtime_ngpus // self.plan_ngpus
+        num_scale_units = self.num_scale_units
         if self.use_zero:
             if num_scale_units % self.zero_ngroups != 0:
                 raise ValueError(f"zero_ngroups {self.zero_ngroups} must be a divisor of runtime_ngpus/plan_ngpus {num_scale_units}.")
@@ -258,16 +268,20 @@ class ComputeConfig:
             self,
             graph: IRGraph,
             pipeline_nstages: int,
-            pipeline_nmicros: int,
+            pipeline_nmicros: Union[int, List[int]],
             pipeline_scheduler: Union[str, Callable[[IRGraph, int, int], SchedulePlan]]
-    ) -> Optional[SchedulePlan]:
+    ) -> Optional[Union[SchedulePlan, Dict[int, SchedulePlan]]]:
         """
         Apply the pipeline scheduler to the graph.
         """
         if not self.use_end2end:
             raise ValueError("pipeline is only supported in end2end mode")
-        if pipeline_nmicros <= 0:
+        if (isinstance(pipeline_nmicros, int) and pipeline_nmicros <= 0) or (
+            isinstance(pipeline_nmicros, (list, tuple)) and any(n <= 0 for n in pipeline_nmicros)
+        ):
             raise ValueError(f"pipeline_nmicros {pipeline_nmicros} must be > 0.")
+        if isinstance(pipeline_nmicros, (list, tuple))and len(pipeline_nmicros) == 0:
+            raise ValueError(f"pipeline_nmicros {pipeline_nmicros} must not be empty.")
         if pipeline_nstages <= 0:
             raise ValueError(f"pipeline_nstages {pipeline_nstages} must be > 0.")
         if self.inference_only and pipeline_scheduler not in _PREDEFINED_INFERENCE_SCHEDS:
@@ -290,7 +304,19 @@ class ComputeConfig:
             if not callable(pipeline_scheduler):
                 raise ValueError(f"pipeline_scheduler {pipeline_scheduler} is not str nor callable.")
             sched = pipeline_scheduler
-        return sched(graph, pipeline_nmicros, pipeline_nstages)
+
+        if isinstance(pipeline_nmicros, (list, tuple)) and len(pipeline_nmicros) == 1:
+            pipeline_nmicros = pipeline_nmicros[0]
+
+        if isinstance(pipeline_nmicros, int):
+            graph.bind_schedule(sched(graph, pipeline_nmicros, pipeline_nstages))
+        else:
+            scheds = {}
+            for num_micro in pipeline_nmicros:
+                scheds[num_micro] = sched(graph, num_micro, pipeline_nstages)
+            graph.bind_schedule(scheds)
+
+        return graph.sched
 
     @property
     def gpu_config(self) -> Dict[str, int]:
@@ -339,6 +365,13 @@ class ComputeConfig:
         return int(self.reducer_bucket_cap_mb * 1024 * 1024) \
             if self.reducer_bucket_cap_mb \
             else None
+
+    @property
+    def num_scale_units(self) -> int:
+        """
+        Get the number of scale units, which is `runtime_ngpus // plan_ngpus`.
+        """
+        return self.runtime_ngpus // self.plan_ngpus
 
     def get_sync_group(self) -> Tuple[List[int], torch.distributed.ProcessGroup]:
         """
@@ -435,6 +468,7 @@ def _compile_flags(compute_config: ComputeConfig):
         trace_strategy=compute_config.trace_strategy,
         zero_param_level_sharding=compute_config.zero_param_level_sharding,
         reducer_replicated_params=compute_config.reducer_replicated_params,
+        reducer_none_grad=compute_config.reducer_none_grad,
         use_fbw=compute_config.use_fbw,
     )
 
@@ -677,6 +711,9 @@ def _prepare_and_check_reusable(
         outdir / FxModuleParser.ATTR_MAP_FILE,
     ]
 
+    def _clean_old_attr_map_files() -> None:
+        _clean_files(outdir, f'{ParallelModule.ATTR_META_FILE_PREFIX}*.pkl')
+
     if reuse == ReuseType.MATCH or reuse == ReuseType.MOO:
         # check if the module is already generated
         expected_output_files = [outdir / _GENCODE_FILE_TEMPLATE.format(rank) for rank in range(compute_config.runtime_ngpus)]
@@ -686,11 +723,21 @@ def _prepare_and_check_reusable(
         expected_output_files.append(outdir / _FORWARD_ARGS_DUMP_FILE)
         expected_output_files.append(outdir / ParallelModule.ORIGIN_MODULE_METADATA_FILE)
         expected_output_files.append(outdir / FxModuleParser.NON_PERSISTENT_BUFFER_FILE)
-        compact_expected_output_files = expected_output_files + [outdir / ParallelModule.ATTR_META_FILE]
-        legacy_expected_output_files = expected_output_files + [
-            outdir / ParallelModule.ATTR_META_FILE_TEMPLATE.format(rank)
-            for rank in range(compute_config.runtime_ngpus)
-        ]
+        existing_attr_map_files = set(outdir.glob(f'{ParallelModule.ATTR_META_FILE_PREFIX}*.pkl'))
+
+        def _has_attr_map_file() -> bool:
+            compact_attr_map_files = {outdir / ParallelModule.ATTR_META_FILE}
+            merged_attr_map_files = {outdir / ParallelModule.ATTR_META_MERGED_FILE}
+            deprecated_attr_map_files = {
+                outdir / ParallelModule.ATTR_META_FILE_TEMPLATE.format(rank)
+                for rank in range(compute_config.runtime_ngpus)
+            }
+            return existing_attr_map_files in (
+                compact_attr_map_files,
+                merged_attr_map_files,
+                deprecated_attr_map_files,
+            )
+
         existing_output_files = [
             f for f in outdir.glob('*')
             if f.is_file() and (  # just take fullmodel.pt.0 to compare
@@ -699,15 +746,14 @@ def _prepare_and_check_reusable(
                     FxModuleParser.ATTR_CONTENT_FILE_0,
                     FxModuleParser.ATTR_CONTENT_INDEX_FILE,
                 )
-            )
+            ) and f not in existing_attr_map_files  # will manually check the attr map files
         ]
+
         if existing_output_files:
-            output_files_match = any(
-                all(output_file.exists() for output_file in candidate)
-                and len(existing_output_files) == len(candidate)
-                for candidate in (compact_expected_output_files, legacy_expected_output_files)
-            )
-            if is_config_match and output_files_match:
+            if is_config_match \
+                and all([output_file.exists() for output_file in expected_output_files]) \
+                and len(existing_output_files) == len(expected_output_files) \
+                and _has_attr_map_file():
                 reusable = True  # everything is matched.
             elif is_config_match \
                 and all(f.suffix != '.py'  for f in existing_output_files):
@@ -717,6 +763,7 @@ def _prepare_and_check_reusable(
                 logger.info(f'Output directory {outdir} is not empty. '
                             f'But no python source code is present. '
                             f'Will reuse the directory and the graph dump if present.')
+                _clean_old_attr_map_files()
                 # we have to trace the graph again if not all meta files are present.
                 if not all([meta_file.exists() for meta_file in trace_meta_files]):
                     _clean_files(outdir)
@@ -733,6 +780,7 @@ def _prepare_and_check_reusable(
                 elif is_graph_config_match:
                     # reuse the graph dump
                     _clean_files(outdir, '*.py')
+                    _clean_old_attr_map_files()
                 else:
                     _clean_files(outdir)
     else:
@@ -745,10 +793,11 @@ def _prepare_and_check_reusable(
             or not is_graph_config_match \
             or not all([meta_file.exists() for meta_file in trace_meta_files]):
             # we have to trace the graph again if not all meta files are present even when reuse=graph.
-            glob_pattern = '*'
+            _clean_files(outdir)
         else:
-            glob_pattern = '*.py'  # so we can keep graph dumps.
-        _clean_files(outdir, glob_pattern)
+            # graph dumps are not deleted.
+            _clean_files(outdir, '*.py')
+            _clean_old_attr_map_files()
 
     return outdir, reusable
 
@@ -932,11 +981,23 @@ def _gencode(
             raise RuntimeError(f"Node {node} device is not set")
     # anchor node removed in gener
     graph = IRAdapterGener.gen(graph, cost_fn=None)
+    # `graph.sched` can be a single `SchedulePlan` or a `Dict[int, SchedulePlan]`
+    # (one plan per number of micro-batches) when multiple schedulers are enabled.
     if graph.sched is not None:
-        graph.sched.apply()
+        for sched_plan in (
+            [graph.sched] if not isinstance(graph.sched, dict) else graph.sched.values()
+        ):
+            sched_plan.apply()
 
     if isinstance(graph.sched, SchedulePlan):
         execplan = ExecutionPlan.from_schedplan(graph.sched)
+    elif isinstance(graph.sched, dict):
+        # generate an independent execution plan for each schedule plan.
+        # `from_schedplan` does not mutate the shared graph, so this is safe.
+        execplan = {
+            nmicros: ExecutionPlan.from_schedplan(sched_plan)
+            for nmicros, sched_plan in graph.sched.items()
+        }
     else:
         execplan = ExecutionPlan.from_graph(graph)
 
@@ -945,9 +1006,14 @@ def _gencode(
     if not graph.sched:
         execplan = Grouping.apply(execplan)
 
+    # for a dict of execution plans (multiple schedulers), the module (non-schedule)
+    # code is identical across plans because they share the same graph, so we use a
+    # representative execution plan to generate the module code.
+    repr_execplan = first(execplan.values()) if isinstance(execplan, dict) else execplan
+
     # code generation
-    assert len(execplan.graph.device) == compute_config.plan_ngpus, f"{execplan.graph.device}"
-    mgener = ModuleCodeGen(execplan, compute_config.runtime_ngpus)
+    assert len(repr_execplan.graph.device) == compute_config.plan_ngpus, f"{repr_execplan.graph.device}"
+    mgener = ModuleCodeGen(repr_execplan, compute_config.runtime_ngpus)
     sgener = None
     if compute_config.use_end2end:
         sgener = ScheduleCodeGen(execplan, compute_config.runtime_ngpus)
@@ -1039,8 +1105,7 @@ def _compact_attr_meta_files(staging_dir: Path, runtime_ngpus: int) -> int:
 
 def _remove_legacy_attr_meta_files(outdir: Path) -> None:
     for path in outdir.glob(f'{ParallelModule.ATTR_META_FILE_PREFIX}*.pkl'):
-        rank = path.stem[len(ParallelModule.ATTR_META_FILE_PREFIX):]
-        if rank.isdigit():
+        if path.name != ParallelModule.ATTR_META_FILE:
             path.unlink(missing_ok=True)
 
 
@@ -1691,15 +1756,15 @@ HybridOptimizerT = TypeVar('HybridOptimizer', bound=torch.optim.Optimizer)
 PARAM_CLASS_TYPE = Union[
     # for hybrid optimizer, param_clss can be:
     Tuple[int, int],  # (optimizer_index, param_group_index)
-    Tuple[int, int, ParamZeroConfig],  # (optimizer_index, param_group_index, extra_info)
+    Tuple[int, int, ParamBucketConfig],  # (optimizer_index, param_group_index, extra_info)
     Tuple[int, int, dict[str, Any]],  # (optimizer_index, param_group_index, extra_info as dict)
     # for non-hybrid optimizer with param zero, param_clss can be:
-    Tuple[int, ParamZeroConfig],      # (reducer_bucket_sort, extra_info)
+    Tuple[int, ParamBucketConfig],      # (reducer_bucket_sort, extra_info)
     Tuple[int, dict[str, Any]],       # (reducer_bucket_sort, extra_info as dict)
-    Tuple[ParamZeroConfig],           # (extra_info)
+    Tuple[ParamBucketConfig],           # (extra_info)
     Tuple[dict[str, Any]],            # (extra_info as dict)
     int,                              # reducer_bucket_sort
-    ParamZeroConfig,                  # extra_info
+    ParamBucketConfig,                  # extra_info
     dict[str, Any],                   # extra_info as dict
 ]
 
@@ -1904,6 +1969,7 @@ def build_optimizer(
                 'max_bucket_size_bytes': compute_config.max_bucket_size_bytes,
                 'zero_use_reduce_scatter': compute_config.zero_use_reduce_scatter,
                 'zero_ngroups': compute_config.zero_ngroups,
+                'use_none_grad': compute_config.reducer_none_grad,
             }
         else:
             reducer_config = {
@@ -1912,6 +1978,9 @@ def build_optimizer(
                 'max_bucket_size_bytes': None,
                 'zero_use_reduce_scatter': False,
                 'zero_ngroups': 1,
+                # TODO: a better default value for use_none_grad?
+                # currently let's use the same value as the first parallel module
+                'use_none_grad': compute_configs[0].reducer_none_grad,
             }
         non_parallel_module_reducer_config = replace(
             compute_config or compute_configs[0],
@@ -1921,6 +1990,7 @@ def build_optimizer(
                 if reducer_config['max_bucket_size_bytes'] else None,
             zero_use_reduce_scatter=reducer_config['zero_use_reduce_scatter'],
             zero_ngroups=reducer_config['zero_ngroups'],
+            reducer_none_grad=reducer_config['use_none_grad'],
         )
         non_parallel_module_reducer = Reducer(group, **reducer_config)
         for param in non_parallel_parameters:
@@ -2081,17 +2151,31 @@ def build_optimizer(
             return module._sync_grad_required
         return getattr(module, _SYNC_GRAD_REQUIRED_ATTR, False)
 
-    def _reset_sync_grad_required():
-        if not isinstance(module, ParallelModule):
-            setattr(module, _SYNC_GRAD_REQUIRED_ATTR, False)
-
     def _sync_shard_grad(self):
         with _runtime_flags(skip_reducer=False):
             if _sync_grad_required():
-                _reset_sync_grad_required()  # reentrant safe
-                for m in parallel_modules:
+                if isinstance(module, ParallelModule):
+                    # there is no non-parallel module reducer in this case,
+                    # so we can just call sync_grad() directly
+                    module.sync_grad()
+                    return
+
+                setattr(module, _SYNC_GRAD_REQUIRED_ATTR, False) # reentrant safe
+                sync_activity = torch.tensor(
+                    [m._sync_grad_required for m in parallel_modules],
+                    dtype=torch.int32,
+                    device=torch.cuda.current_device(),
+                )
+                torch.distributed.all_reduce(sync_activity, op=torch.distributed.ReduceOp.MAX)
+
+                # TODO: Async reducers and ZeRO-3 issue collectives from backward hooks,
+                # before activity can be synchronized here. They still require every
+                # parameter to be used on every rank.
+                for m, active in zip(parallel_modules, sync_activity.tolist()):
+                    m._sync_grad_required = bool(active)
                     m.sync_grad()
 
+                # always sync non-parallel module reducer.
                 if non_parallel_module_reducer:
                     non_parallel_module_reducer.sync_grads()
 
@@ -2525,7 +2609,8 @@ def merge_state_dicts(
             npp_start = ret_states_cur_index - num_npp
             npp_states = {}
             for loc in range(npp_start, ret_states_cur_index):
-                npp_states[loc - npp_start] = ret_states.pop(loc)
+                if loc in ret_states:
+                    npp_states[loc - npp_start] = ret_states.pop(loc)
 
             # merge back npp_states to ret_states, the location is determined by non_parallel_param_locs
             ret_new_states = {}
@@ -2533,7 +2618,8 @@ def merge_state_dicts(
             for i in range(ret_states_cur_index):
                 if npp_inserted < len(npp_locs) and i == npp_locs[npp_inserted]:
                     # the position for non-parallel parameters
-                    ret_new_states[i] = npp_states[npp_inserted]
+                    if npp_inserted in npp_states:
+                        ret_new_states[i] = npp_states[npp_inserted]
                     npp_inserted += 1
                 elif i - npp_inserted in ret_states:
                     # as `npp_inserted` non-parallel parameters are inserted
@@ -2741,7 +2827,11 @@ def _construct_optim_state_zero3(
 ):
     # state for each parameter in the parallel module
     new_states = _construct_optim_state_nonzero(module, orig_param_dict)
-    param_state_map = {p: new_states[idx] for idx, p in enumerate(module.parameters())}
+    param_state_map = {
+        p: new_states[idx]
+        for idx, p in enumerate(module.parameters())
+        if idx in new_states
+    }
 
     state_dict, opt_param_idx = {}, 0
     opt_param = module.parameters_for_optimizer()
@@ -2751,6 +2841,12 @@ def _construct_optim_state_zero3(
             bucket: Bucket
             # one bucket corresponds to one flattened param
             assert len(opt_param[opt_param_idx].shape) == 1
+            state_presence = [param in param_state_map for param in bucket.params]
+            if not any(state_presence):
+                opt_param_idx += 1
+                continue
+            if not all(state_presence):
+                raise ValueError("Inconsistent optimizer state within one reducer bucket")
             chunk_size = bucket._contiguous_params.shape[0]
             opt_states = {}
             for param in bucket.params:
@@ -2781,7 +2877,8 @@ def _construct_optim_state_zero3(
         reducer_pids.update(id(p) for p in reducer.params)
     for param in module.parameters():
         if id(param) not in reducer_pids:
-            state_dict[opt_param_idx] = param_state_map[param]
+            if param in param_state_map:
+                state_dict[opt_param_idx] = param_state_map[param]
             opt_param_idx += 1
 
     return state_dict
@@ -2820,6 +2917,16 @@ def _construct_optim_state_zero(
         for bucket in reducer.buckets:
             # one bucket corresponds to one flattened param
             assert len(opt_param[opt_param_idx].shape) == 1
+            sliced_states = [
+                _get_optimizer_state_of_param(param, param_ids, local_names)
+                for param in bucket.params
+            ]
+            state_presence = [state is not None for state in sliced_states]
+            if not any(state_presence):
+                opt_param_idx += 1
+                continue
+            if not all(state_presence):
+                raise ValueError("Inconsistent optimizer state within one reducer bucket")
             assert bucket._contiguous_params.shape[0] % len(sub_ranks) == 0
             chunk_size = bucket._contiguous_params.shape[0] // len(sub_ranks)
             # the flattened param is in the range [bucket_chunk_start, bucket_chunk_end)
@@ -2830,9 +2937,8 @@ def _construct_optim_state_zero(
             # param_offset: the param's start offset in the contiguous buffer
             # chunk_offset: the offset of the current rank corresponding chunk
             step, opt_states, opt_state_keys = None, {}, None
-            for param in bucket.params:
+            for param, sliced_new_val in zip(bucket.params, sliced_states):
                 param_offset = reducer.get_param_info(param).bucket_param_buffer_start
-                sliced_new_val = _get_optimizer_state_of_param(param, param_ids, local_names)
                 # there are padding in the chunk, so `param.numel()` doesn't work here
                 param_numel = bucket.get_aligned_numel(param)
                 # init the chunk's optimizer state
@@ -2902,7 +3008,8 @@ def _construct_optim_state_zero(
     for param in module.parameters():
         if id(param) not in reducer_pids:
             sliced_new_val = _get_optimizer_state_of_param(param, param_ids, local_names)
-            state_dict[opt_param_idx] = sliced_new_val
+            if sliced_new_val is not None:
+                state_dict[opt_param_idx] = sliced_new_val
             opt_param_idx += 1
     return state_dict
 
@@ -2916,10 +3023,22 @@ def _construct_optim_state_nonzero(
 
     new_states: dict[int, dict[str, torch.Tensor]] = {}
     for index, (local_name, _) in enumerate(module.named_parameters()):
-        new_states[index] = _extract_new_state(
+        state = _extract_new_state(
             local_name, orig_param_dict, dist_param_map, param_area_map,
             module.get_zero3_attr_meta(local_name)
         )
+        if state is not None:
+            new_states[index] = state
+
+    param_state_map = {
+        param: index in new_states
+        for index, param in enumerate(module.parameters())
+    }
+    for reducer in module.reducers:
+        for bucket in reducer.buckets:
+            state_presence = [param_state_map[param] for param in bucket.params]
+            if any(state_presence) and not all(state_presence):
+                raise ValueError("Inconsistent optimizer state within one reducer bucket")
 
     return new_states
 
@@ -2930,11 +3049,14 @@ def _extract_new_state(
         dist_param_map: Dict[str, str],
         param_area_map: Dict[str, AttrMeta],
         zero3_info: Optional[Zero3AttrMeta] = None
-) -> Dict[str, torch.Tensor]:
+    ) -> Optional[Dict[str, torch.Tensor]]:
     name = '_'.join(local_name.split('_')[:-1]) # remove the integer suffix
     assert name in dist_param_map
     attr_meta = param_area_map[local_name]
-    new_val = orig_param_dict[dist_param_map[name]]
+    orig_name = dist_param_map[name]
+    if orig_name not in orig_param_dict:
+        return None
+    new_val = orig_param_dict[orig_name]
     sliced_new_val = {}
     for key in new_val:
         if key in ('step',):

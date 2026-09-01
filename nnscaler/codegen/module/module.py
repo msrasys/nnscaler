@@ -448,6 +448,7 @@ class ModuleCodeGen(FuncEmission):
         end2end_mode: bool = False,
         forward_args: Optional[Dict[str, Any]] = None,
         outfile_attr_meta_map: Optional[str] = None,
+        out_attr_meta_map: Optional[Dict[int, Dict[str, Dict[str, Any]]]] = None
     ) -> str:
         """
         Generate model implementation code based on the given graph.
@@ -537,6 +538,8 @@ class ModuleCodeGen(FuncEmission):
             forward_args (Dict[str, Any]): argument names and their default values of forward function, if None, use node inputs.
                 This is used only in parallel module.
             outfile_attr_meta_map (str): output file path for parameter mapping. None if don't save
+            out_attr_meta_map (Optional[Dict[int, Dict[str, Dict[str, Any]]]]): output mapping populated with
+                each device's attribute metadata map. None if the metadata is not needed by the caller.
 
         Returns:
             generated code
@@ -651,7 +654,17 @@ class ModuleCodeGen(FuncEmission):
             graph_sched = self.execplan.graph.sched
 
             cb.insert_body(f'use_scheduler = {graph_sched is not None}')
-            cb.insert_body(f'nmicros_per_scheduler_step = {graph_sched.nmicros if graph_sched is not None else 1}')
+            # `graph_sched` can be a single `SchedulePlan` or a `Dict[int, SchedulePlan]`
+            # (one plan per number of micro-batches) when multiple schedulers are enabled.
+            # `nmicros_per_scheduler_step` is a single int for a single scheduler, and a
+            # tuple of the supported micro-batch numbers when multiple schedulers are used.
+            if graph_sched is None:
+                nmicros_per_scheduler_step = 1
+            elif isinstance(graph_sched, dict):
+                nmicros_per_scheduler_step = tuple(sorted(graph_sched.keys()))
+            else:
+                nmicros_per_scheduler_step = graph_sched.nmicros
+            cb.insert_body(f'nmicros_per_scheduler_step = {nmicros_per_scheduler_step!r}')
             cb.insert_body(f'use_multi_streams = {self.execplan.use_multi_streams}')
             cb.insert_body(f'cuda_sync_required = {self.execplan.cuda_sync_required}')
 
@@ -671,6 +684,7 @@ class ModuleCodeGen(FuncEmission):
                         f'max_bucket_size_bytes={CompileFlag.max_reducer_bucket}',
                         f'zero_use_reduce_scatter={CompileFlag.zero_use_reduce_scatter}',
                         f'zero_param_level_sharding={CompileFlag.zero_param_level_sharding}',
+                        f'reducer_none_grad={CompileFlag.reducer_none_grad}',
                         f'**kwargs',
                     ]
                 ) as ib:
@@ -748,6 +762,9 @@ class ModuleCodeGen(FuncEmission):
         if outfile:
             with open(outfile, 'a' if attach else 'w') as f:
                 f.write(code)
+        # write attr_meta_map to out_attr_meta_map
+        if out_attr_meta_map is not None:
+            out_attr_meta_map[device] = attr_meta_map
 
         # clear used buffer
         self.clear()
@@ -945,6 +962,7 @@ class ModuleCodeGen(FuncEmission):
         async_op = CompileFlag.async_reducer if not as_parallel_module else 'async_op'
         zero_use_reduce_scatter = CompileFlag.zero_use_reduce_scatter if not as_parallel_module else 'zero_use_reduce_scatter'
         zero_param_level_sharding = CompileFlag.zero_param_level_sharding if not as_parallel_module else 'zero_param_level_sharding'
+        reducer_none_grad = CompileFlag.reducer_none_grad if not as_parallel_module else 'reducer_none_grad'
 
         zero = CompileFlag.use_zero
         zero_ngroups = CompileFlag.zero_ngroups
@@ -957,6 +975,7 @@ class ModuleCodeGen(FuncEmission):
             "async_op={async_op}, zero={zero}, max_bucket_size_bytes={max_nbytes}, "
             "zero_use_reduce_scatter={zero_use_reduce_scatter}, "
             "zero_param_level_sharding={zero_param_level_sharding}, "
+            "use_none_grad={reducer_none_grad}, "
             "zero_ngroups={zero_ngroups}, "
             "nreplicas={nreplicas})"
         )
@@ -972,6 +991,7 @@ class ModuleCodeGen(FuncEmission):
             async_op=async_op, zero=zero, max_nbytes=max_nbytes,
             zero_ngroups=zero_ngroups, zero_use_reduce_scatter=zero_use_reduce_scatter,
             zero_param_level_sharding=zero_param_level_sharding,
+            reducer_none_grad=reducer_none_grad,
             nreplicas=nreplicas
         )
         self.model_init_statements.append(init_code)

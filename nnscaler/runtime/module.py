@@ -194,8 +194,10 @@ class CubeModule(torch.nn.Module):
     use_scheduler: bool
     # the number of microbatches in one scheduler train/infer step
     # 1 if no scheduler is used.
+    # A single int when one scheduler is used, or a tuple of the supported
+    # micro-batch numbers when multiple schedulers are used.
     # will be assigned in the generated subclasses
-    nmicros_per_scheduler_step: int
+    nmicros_per_scheduler_step: Union[int, Tuple[int, ...]]
     # whether to use multi stream for communication and computation overlapping
     # this is a hint of overlapping
     # will be assigned in the generated subclasses
@@ -809,7 +811,7 @@ class CubeModule(torch.nn.Module):
             if isinstance(opt_idx, int):
                 # the param without reducer
                 assert opt_idx2ranks[opt_idx] is None
-                return optim_state_dicts[worker_idx]['state'][opt_idx]
+                return optim_state_dicts[worker_idx]['state'].get(opt_idx)
             else:
                 # the param in reducer bucket
                 opt_idx, pstart, pend, pshape = opt_idx
@@ -817,6 +819,15 @@ class CubeModule(torch.nn.Module):
                     assert param_shape == pshape, f'param shape {param_shape} vs pshape {pshape}'
                 ranks, bucket_size = opt_idx2ranks[opt_idx]
                 # parameters in reducer come first, so we can directly use opt_idx to index.
+                state_presence = [opt_idx in optim_state_dicts[rank]['state'] for rank in ranks]
+                if not any(state_presence):
+                    return None
+                if not all(state_presence):
+                    raise ValueError(
+                        f'Inconsistent optimizer state for bucket {opt_idx}: '
+                        f'present on ranks {[rank for rank, present in zip(ranks, state_presence) if present]}, '
+                        f'expected ranks {ranks}'
+                    )
                 bucket_states = [optim_state_dicts[rank]['state'][opt_idx] for rank in ranks]
                 return _retrieve_param_opt_state(
                     bucket_states,
@@ -830,6 +841,12 @@ class CubeModule(torch.nn.Module):
         # full_index: param IDs in the full optimizer state
         for full_index, param_name in enumerate(origin_parameter_names):
             _logger.info(f'start to handle optimizer state for param {param_name} with full_index {full_index}')
+            expected_state_tracks = {
+                tuple((slicer.start, slicer.step, slicer.stop) for slicer in meta.slicers)
+                for fullmap in fullmaps[0 : plan_ngpus]
+                for meta in fullmap.values()
+                if meta.is_param and meta.orig_name == param_name
+            }
             # zero_done_track is used to avoid re-merging the same parameter
             # in the optimizer state
             # zero_done_track_id: slicers
@@ -856,12 +873,12 @@ class CubeModule(torch.nn.Module):
                 # it aligns with the order of local `model.parameters()`
                 for local_index, meta in enumerate(param_fullmap):
                     if meta.orig_name != param_name: continue
-                    full_states.setdefault(full_index, {})
-
                     # TODO: support customized param groups, where each parameter has IDs
                     # specified from its own param_group
                     track_id = tuple((i.start, i.step, i.stop) for i in meta.slicers)
                     if zero_idx_maps is None:
+                        if local_index not in optim_state['state']:
+                            continue
                         states: Dict[str, torch.Tensor] = optim_state['state'][local_index]
                     else:
                         if track_id not in zero_done_track:
@@ -869,11 +886,17 @@ class CubeModule(torch.nn.Module):
                             # may not be stored locally in its optimizer state.
                             # _merge_opt_zero is for recovering the optimizer state corresponding to this parameter shard.
                             states: Dict[str, torch.Tensor] = _merge_opt_zero(meta.sub_shape, work_idx, local_index)
+                            if states is None:
+                                continue
                             zero_done_track.add(track_id)
                         else:
                             _logger.debug(f'rank {work_idx}: skip merging duplicated optimizer state for param {full_index} with slicers {meta.slicers}')
                             continue
 
+                    # delay the creation of full_states[full_index]
+                    # until we have a valid optimizer state for this parameter
+                    # so we don't leave empty dict for parameters without optimizer state
+                    full_states.setdefault(full_index, {})
                     for state_name in states.keys():
                         value = states[state_name]
                         # special handle for step: scalar tensor type
@@ -907,6 +930,14 @@ class CubeModule(torch.nn.Module):
                                 full_states[full_index][state_name][meta.slicers] = value
 
                     state_merge_track.add(track_id)
+
+            # make sure all the slices of this parameter are merged,
+            # otherwise it is an incomplete optimizer state (some slices of the parameter are missing)
+            if full_index in full_states and state_merge_track != expected_state_tracks:
+                raise ValueError(
+                    f'Incomplete optimizer state for parameter {param_name}: '
+                    f'found slices {state_merge_track}, expected {expected_state_tracks}'
+                )
 
         # handle additional state dict keys
         for optim_state_dict in optim_state_dicts[0 : plan_ngpus]:
@@ -1098,6 +1129,7 @@ class ParallelModule(CubeModule):
     ATTR_META_FILE_TEMPLATE = ATTR_META_FILE_PREFIX + '{}.pkl'  # 'attr_meta{}.pkl'
     ATTR_META_FILE = ATTR_META_FILE_PREFIX + '.pkl'
     ATTR_META_FORMAT_VERSION = 1
+    ATTR_META_MERGED_FILE = ATTR_META_FILE_PREFIX + '.merged.pkl'  # 'attr_meta.merged.pkl'
 
     # the rank of the module, will be assigned in the generated subclasses
     rank: int
@@ -1159,12 +1191,13 @@ class ParallelModule(CubeModule):
 
         super().__init_subclass__(**kwargs)
         cls.module_dir = Path(sys.modules[cls.__module__].__file__).parent
-        cls.attr_meta_maps = cls._load_attr_meta_maps(cls.module_dir, cls.world_size)
-
         cls.dist_param_map = torch.load(cls.module_dir / FxModuleParser.ATTR_MAP_FILE, weights_only=False)
         cls.compute_config = ComputeConfig.safe_load_from_file(
             cls.module_dir / cls.COMPUTE_CONFIG_FILE,
             return_none_on_error=False
+        )
+        cls.attr_meta_maps = cls._load_attr_meta_maps(
+            cls.module_dir, cls.world_size, cls.compute_config
         )
         cls.origin_module_metadata = torch.load(cls.module_dir / cls.ORIGIN_MODULE_METADATA_FILE, weights_only=False)
 
@@ -1181,10 +1214,50 @@ class ParallelModule(CubeModule):
             raise RuntimeError(f'Invalid attribute metadata map in {source}') from exc
 
     @classmethod
-    def _load_attr_meta_maps(cls, module_dir: Path, world_size: int) -> list[dict[str, AttrMeta]]:
-        """Load compact metadata when present, with legacy per-rank shard fallback."""
+    def _load_attr_meta_maps(
+        cls,
+        module_dir: Path,
+        world_size: int,
+        compute_config: Optional['ComputeConfig'] = None,
+    ) -> list[dict[str, AttrMeta]]:
+        """Load compact, main merged, or legacy per-rank attribute metadata."""
         compact_file = module_dir / cls.ATTR_META_FILE
         if not compact_file.exists():
+            merged_file = module_dir / cls.ATTR_META_MERGED_FILE
+            if merged_file.exists():
+                with merged_file.open('rb') as stream:
+                    merged_maps = pickle.load(stream)
+                if compute_config is not None:
+                    expected_plan_ngpus = compute_config.plan_ngpus
+                else:
+                    expected_plan_ngpus = len(merged_maps) if isinstance(merged_maps, list) else None
+                if not isinstance(merged_maps, list) or len(merged_maps) != expected_plan_ngpus:
+                    raise RuntimeError(
+                        f'Attribute metadata plan size mismatch in {merged_file}: '
+                        f'expected {expected_plan_ngpus}, got '
+                        f'{len(merged_maps) if isinstance(merged_maps, list) else type(merged_maps).__name__}'
+                    )
+                normalized_maps = [
+                    cls._normalize_attr_meta_map(attr_meta_map, merged_file)
+                    for attr_meta_map in merged_maps
+                ]
+                # Each scale unit repeats the same plan-rank metadata.
+                if compute_config is not None:
+                    num_scale_units = compute_config.num_scale_units
+                elif normalized_maps and world_size % len(normalized_maps) == 0:
+                    num_scale_units = world_size // len(normalized_maps)
+                else:
+                    raise RuntimeError(
+                        f'Cannot expand attribute metadata in {merged_file} to world size {world_size}'
+                    )
+                attr_meta_maps = normalized_maps * num_scale_units
+                if len(attr_meta_maps) != world_size:
+                    raise RuntimeError(
+                        f'Attribute metadata world size mismatch in {merged_file}: '
+                        f'expected {world_size}, got {len(attr_meta_maps)}'
+                    )
+                return attr_meta_maps
+
             attr_meta_maps = []
             for rank in range(world_size):
                 attr_map_file = module_dir / cls.ATTR_META_FILE_TEMPLATE.format(rank)
@@ -1590,8 +1663,11 @@ class ParallelModule(CubeModule):
         self.set_grad_accumulation_steps(sample_count)
 
         if self.use_scheduler:
-            if len(samples) != self.nmicros_per_scheduler_step:
-                raise ValueError(f"Expected {self.nmicros_per_scheduler_step} samples, but got {sample_count}")
+            valid_nmicros = self.nmicros_per_scheduler_step
+            if isinstance(valid_nmicros, int):
+                valid_nmicros = (valid_nmicros,)
+            if len(samples) not in valid_nmicros:
+                raise ValueError(f"Expected one of {valid_nmicros} samples, but got {sample_count}")
             # only one step, so begin/end are both True
             with accum_mode(begin=True, end=True):
                 return self._train_step(dataloader)
@@ -1622,8 +1698,11 @@ class ParallelModule(CubeModule):
         sample_count = len(samples)
         dataloader = microbatches(samples, cycle=False)
         if self.use_scheduler:
-            if len(samples) != self.nmicros_per_scheduler_step:
-                raise ValueError(f"Expected {self.nmicros_per_scheduler_step} samples, but got {sample_count}")
+            valid_nmicros = self.nmicros_per_scheduler_step
+            if isinstance(valid_nmicros, int):
+                valid_nmicros = (valid_nmicros,)
+            if len(samples) not in valid_nmicros:
+                raise ValueError(f"Expected one of {valid_nmicros} samples, but got {sample_count}")
             return self._infer_step(dataloader)
         else:
             outputs = []

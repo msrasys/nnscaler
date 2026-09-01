@@ -235,7 +235,9 @@ def pas_autodist(graph: IRGraph, cfg: 'ComputeConfig') -> IRGraph:
     pas_cfg = cfg.pas_config
 
     update_freq = pas_cfg.get('update_freq', 1)
-    if isinstance(update_freq, (tuple, list)):
+    if isinstance(update_freq, dict):
+        update_freq = update_freq[min(update_freq)]
+    elif isinstance(update_freq, (tuple, list)):
         update_freq = update_freq[0]
 
     # optional parameters
