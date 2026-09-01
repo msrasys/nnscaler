@@ -21,6 +21,10 @@ if TYPE_CHECKING:
     from nnscaler.runtime.module import CubeModule
 
 
+# Apex's L2 norm kernel uses 32-bit tensor sizes and chunk offsets internally.
+_APEX_L2NORM_MAX_TENSOR_NUMEL = 1 << 30
+
+
 @dataclass
 class ParamsInfo:
     # An instance of ParamsInfo corresponds to a group of parameters in cube reducer,
@@ -183,6 +187,20 @@ def prepare_for_grad_clip(cube_model: 'CubeModule', use_zero: int) -> Dict[int, 
     return nreplicas2localparams
 
 
+def _split_grads_for_apex_l2norm(
+    grads: List[torch.Tensor],
+    max_tensor_numel: int = _APEX_L2NORM_MAX_TENSOR_NUMEL,
+) -> List[torch.Tensor]:
+    """Split oversized gradients into zero-copy views safe for Apex indexing."""
+    apex_grads = []
+    for grad in grads:
+        if grad.numel() <= max_tensor_numel:
+            apex_grads.append(grad)
+        else:
+            apex_grads.extend(grad.view(-1).split(max_tensor_numel))
+    return apex_grads
+
+
 def _multi_tensor_total_norm(grads, chunk_size=2048 * 32) -> torch.Tensor:
     """
     Returns:
@@ -198,7 +216,7 @@ def _multi_tensor_total_norm(grads, chunk_size=2048 * 32) -> torch.Tensor:
             per_device_grads[device] = cur_device_grads
         cur_device_grads.append(grad)
     for device in per_device_grads.keys():
-        cur_device_grads = per_device_grads[device]
+        cur_device_grads = _split_grads_for_apex_l2norm(per_device_grads[device])
         if device.type == "cuda":
             # TODO(msb) return has_inf
             has_inf = torch.zeros((1, 1), dtype=torch.int, device=device)
