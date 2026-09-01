@@ -2,9 +2,11 @@
 #  Licensed under the MIT License.
 
 from typing import List
+from unittest.mock import Mock
 
 import nnscaler
 import nnscaler.runtime.adapter
+from nnscaler.runtime.adapter.collectives import _deserialize_object
 import torch
 import pytest
 
@@ -52,6 +54,22 @@ def _assert_object_collective_payload(obj):
     assert obj['cpu'].device.type == 'cpu'
     assert obj['cpu'].tolist() == [0, 1]
     assert obj['metadata'] == {'hello': 'world', 'count': 1}
+
+
+def test_deserialize_object_accepts_device_location(monkeypatch):
+    storage = Mock()
+    storage.cuda.return_value = storage
+
+    def load(_buffer, *, map_location, weights_only):
+        assert weights_only is False
+        assert map_location(storage, torch.device('cuda:7')) is storage
+        return 'loaded'
+
+    monkeypatch.setattr(torch, 'load', load)
+    monkeypatch.setattr(torch.cuda, 'current_device', lambda: 2)
+
+    assert _deserialize_object(b'payload') == 'loaded'
+    storage.cuda.assert_called_once_with(2)
 
 
 def _move_object_worker():

@@ -30,7 +30,7 @@ def _deserialize_object(payload: bytes):
     # Object collectives otherwise restore nested CUDA tensors on the sender's
     # device, which is invalid when an IRObject crosses pipeline stages.
     def map_location(storage, location):
-        if location.startswith('cuda'):
+        if str(location).startswith('cuda'):
             return storage.cuda(torch.cuda.current_device())
         return None
 
@@ -121,7 +121,11 @@ def all_gather(tensor: torch.Tensor, dim: int,
     tensor_list = [torch.empty_like(tensor) for _ in ranks]
     tensor_list[torch.distributed.get_rank(group)] = tensor.data
     work = torch.distributed.all_gather(tensor_list, tensor, group=group, async_op=async_op)
-    group_ranks = torch.distributed.get_process_group_ranks(group)
+    group_ranks = (
+        list(range(torch.distributed.get_world_size()))
+        if group is None
+        else torch.distributed.get_process_group_ranks(group)
+    )
     gather_order = tuple(group_ranks.index(rank) for rank in ranks)
 
     def concat_gathered(_):
