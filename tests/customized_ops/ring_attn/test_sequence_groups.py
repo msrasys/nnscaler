@@ -16,6 +16,7 @@ from nnscaler.customized_ops.ring_attention.ring_attn_varlen import (
 )
 from nnscaler.customized_ops.ring_attention.sliding_window_attn import (
     emit_ring as emit_sliding_window_ring,
+    wrap_sliding_window_attn_func,
 )
 from nnscaler.customized_ops.ring_attention.varlen_utils import (
     select_sequence_group_cu_seqlens,
@@ -50,6 +51,49 @@ def test_select_sequence_group_requires_packed_boundary_alignment():
     with pytest.raises(ValueError, match='must align'):
         select_sequence_group_cu_seqlens(
             combined, [0, 1], sequence_group_count=2)
+
+
+@pytest.mark.parametrize(
+    ('target', 'wrapper'),
+    [
+        (
+            'nnscaler.customized_ops.ring_attention.ring_attn_varlen.'
+            'flash_attn_varlen_func',
+            wrap_ring_attn_varlen_func,
+        ),
+        (
+            'nnscaler.customized_ops.ring_attention.sliding_window_attn.'
+            'flash_attn_varlen_func',
+            wrap_sliding_window_attn_func,
+        ),
+    ],
+)
+def test_single_rank_sequence_group_selects_local_cu_seqlens(
+    monkeypatch, target, wrapper,
+):
+    captured = {}
+
+    def flash_attn(q, _k, _v, cu_q, cu_k, max_q, max_k, **_kwargs):
+        captured.update(cu_q=cu_q, cu_k=cu_k, max_q=max_q, max_k=max_k)
+        return q
+
+    monkeypatch.setattr(target, flash_attn)
+    q = torch.randn(16, 2, 8)
+    combined = torch.tensor([0, 4, 16, 24, 32], dtype=torch.int32)
+
+    output = wrapper(
+        q, q, q, combined, combined, None,
+        process_group=[1],
+        sequence_parallel_size=1,
+        sequence_group_count=2,
+    )
+
+    assert output is q
+    expected = torch.tensor([0, 8, 16], dtype=torch.int32)
+    torch.testing.assert_close(captured['cu_q'], expected)
+    torch.testing.assert_close(captured['cu_k'], expected)
+    assert captured['max_q'] == 8
+    assert captured['max_k'] == 8
 
 
 class _FakeTensor:

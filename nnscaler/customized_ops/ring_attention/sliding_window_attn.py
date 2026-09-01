@@ -61,7 +61,7 @@ def wrap_sliding_window_attn_func(
     '''
     assert not return_attn_probs, "return_attn_probs is not supported"
     selected_sequence_group = False
-    if process_group is not None and len(process_group) > 1 and enable_ring:
+    if process_group is not None and enable_ring:
         if sequence_parallel_size is not None and len(process_group) != sequence_parallel_size:
             raise ValueError(
                 f"Generated process group size {len(process_group)} does not match "
