@@ -1,55 +1,45 @@
 #  Copyright (c) Microsoft Corporation.
 #  Licensed under the MIT License.
 
-from types import SimpleNamespace
 from unittest.mock import Mock
 
 import torch
 
 from nnscaler.autodist.cost_database import CostDatabase
-from nnscaler.graph.function.dimops import DimopSplit
-from nnscaler.ir.cten import IRObject, IRTensor
+from nnscaler.autodist.cube_operator import CubeOperator
+from nnscaler.autodist.op_partition import OpPartition
+from nnscaler.graph.function.dimops import IRDimops
+from nnscaler.ir.cten import IRObject
+from nnscaler.ir.tensor import IRFullTensor
 
 
-class _Rule:
+def _source_op(x, signature='test.source'):
+    return IRDimops(
+        _source_op, 'source', signature, ['a -> ?, a'], [x])
 
-    def inputs(self):
-        return [DimopSplit.R(), DimopSplit.R()]
 
-
-class _DimAlgorithm:
-
-    def infer(self, *_args):
-        return _Rule()
+def _destination_op(metadata, x, signature='test.destination'):
+    return IRDimops(
+        _destination_op, 'destination', signature, ['?, a -> a'],
+        [metadata, x])
 
 
 def test_estimate_comm_cost_ignores_non_tensor_edges(monkeypatch):
     metadata = IRObject(value='metadata')
-    activation = IRTensor(shape=(8,), dtype=torch.float32, requires_grad=True)
+    activation = IRFullTensor(
+        (8,), dtype=torch.float32, requires_grad=True).tosub()
 
-    src_cell = SimpleNamespace(outputs=lambda: [metadata, activation])
-    dst_cell = SimpleNamespace(
-        inputs=lambda: [metadata, activation],
-        algorithm=lambda _tag: _DimAlgorithm(),
-    )
-    src_operator = SimpleNamespace(
-        ir_cell=src_cell,
-        dim_id2pos=lambda _dim: (-1, -1),
-    )
-    dst_operator = SimpleNamespace(
-        ir_cell=dst_cell,
-        dim_id2pos=lambda _dim: (0, 0),
-    )
-    src_partition = SimpleNamespace(
-        operator=src_operator,
-        partition_dims=(-1,),
-        partition_nums=(2,),
-    )
-    dst_partition = SimpleNamespace(
-        operator=dst_operator,
-        partition_dims=('dim',),
-        partition_nums=(2,),
-    )
+    src_cell = _source_op(activation)
+    src_cell.set_output(0, metadata)
+    src_cell.set_output(1, activation)
+    dst_cell = _destination_op(metadata, activation)
+    dst_cell.set_output(0, IRFullTensor(
+        (8,), dtype=torch.float32, requires_grad=True).tosub())
+
+    src_partition = OpPartition(
+        (-1,), (2,), CubeOperator(src_cell))
+    dst_partition = OpPartition(
+        ('a',), (2,), CubeOperator(dst_cell))
 
     database = CostDatabase.__new__(CostDatabase)
     primitive_to_cost = Mock(return_value=0.5)
@@ -59,4 +49,4 @@ def test_estimate_comm_cost_ignores_non_tensor_edges(monkeypatch):
     primitive_to_cost.assert_not_called()
     assert database.estimate_comm_cost(src_partition, dst_partition, False) == 0.5
     primitive_to_cost.assert_called_once_with(
-        2, activation.byte_size(), 'all reduce')
+        2, activation.byte_size(), 'all gather')
