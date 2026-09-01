@@ -305,3 +305,47 @@ environment workaround is committed to the branch.
 - Decide separately whether B200 test tolerances should be hardware-aware;
   this integration intentionally does not hide those pre-existing failures.
 - Run the complete CI environment with all development dependencies installed.
+
+## Real YOCO VPP Parity (2026-09-01)
+
+Compared `yileiyang/yoco_pp` at `40e5e197` with the integration merge at
+`168b33f5` on one 8xB200 node. Both sides used the same llm-train commit
+`774d5e64`, independently generated code, seed 1, BF16 model precision,
+Attention/MoEExpert recompute, MTP1, Muon, and 8K sequence length.
+
+### Production-like PP2/EP4 run
+
+The production-like case used real phase1 mixture data, MXFP8, DeepEP, 8 VPP
+stages, and update frequency 8.
+
+| Run | First-step gnorm | First-step train loss |
+| --- | ---: | ---: |
+| yoco_pp run 1 | 1.602508902549744 | 17.47869037712033 |
+| yoco_pp run 2 | 1.602356791496277 | 17.47857553063220 |
+| integration run 1 | 1.602711677551270 | 17.47894038776614 |
+
+- Cross-branch gnorm relative difference: `1.2652e-4`.
+- Same-branch yoco_pp repeat gnorm relative difference: `9.4921e-5`.
+- Cross-branch loss relative difference: `1.4304e-5`.
+- Same-branch yoco_pp repeat loss relative difference: `6.5707e-6`.
+
+Therefore `1e-5` is below the observed run-to-run noise floor for the complete
+MXFP8+DeepEP production path and cannot be used by itself as a merge gate.
+
+### Deterministic VPP parity
+
+The strict parity cases retained the real 13.55B YOCO model and VPP execution,
+but used the fixed local debug dataset, BFloat16 quant mode, standard all-to-all
+instead of DeepEP, and deterministic algorithms. CUDA `bincount` was allowed in
+warn-only mode because it only produces per-source logging metrics and is not
+part of loss or gradient computation.
+
+| Configuration | yoco_pp gnorm | integration gnorm | gnorm relative diff | train loss diff |
+| --- | ---: | ---: | ---: | ---: |
+| PP2/EP4, 8 VPP stages, u8 | 1.779542922973633 | 1.779543161392212 | `1.3398e-7` | exactly zero |
+| PP4/EP2, 16 VPP stages, u16 | 1.775534987449646 | 1.775534987449646 | exactly zero | exactly zero |
+
+Both configurations pass the requested first-step gnorm threshold of `1e-5`.
+PP4 also exercises a different physical-stage mapping and twice as many
+micro-batches. These results support mathematical consistency of the merged
+scheduler/reducer paths; they are not a steady-state performance benchmark.
