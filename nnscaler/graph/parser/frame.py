@@ -158,19 +158,24 @@ class Frame:
         model_pt_part_num = (total_size + params_per_file - 1) // params_per_file
 
         tid2value = {t.tid: val.cpu() for t, (_, val) in self._attr_map.items()}
+        tids = list(tid2value)
         # it can be zero if there is no param in the module (self._attr_map is empty)
         if model_pt_part_num <= 1:
-            torch.save(tid2value, f'{save_file_stem}.0')
+            chunks = [tids]
         else:
-            tids = list(tid2value.keys())
             assert len(tids) > 0, "Empty attr map"
             chunk_size = (len(tids) + model_pt_part_num - 1) // model_pt_part_num
             chunks = [tids[i:min(i + chunk_size, len(tids))] for i in
                       range(0, len(tids), chunk_size)]
-            for idx, chunk in enumerate(chunks):
-                assert len(chunk) > 0, f"Empty chunk {idx}"
-                part = {k: tid2value[k] for k in chunk}
-                torch.save(part, f'{save_file_stem}.{idx}')
+
+        tid_to_chunk = {}
+        for idx, chunk in enumerate(chunks):
+            torch.save({tid: tid2value[tid] for tid in chunk}, f'{save_file_stem}.{idx}')
+            tid_to_chunk.update((tid, idx) for tid in chunk)
+
+        # Keep the index separate from the tensor chunks so each rank can find
+        # the chunks it needs without deserializing every full-model tensor.
+        torch.save(tid_to_chunk, f'{save_file_stem}.index')
 
     def save_np_buffer_content(self, save_file: str):
         """

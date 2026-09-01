@@ -48,6 +48,7 @@ def test_to_graph():
         assert ir_graph is not None
         assert (Path(tempdir) / FxModuleParser.ATTR_MAP_FILE).exists()
         assert (Path(tempdir) / FxModuleParser.ATTR_CONTENT_FILE_0).exists()
+        assert (Path(tempdir) / FxModuleParser.ATTR_CONTENT_INDEX_FILE).exists()
         assert ir_graph.name == 'MyModule'
         inputs = ir_graph.inputs()
         assert len(inputs) == 2
