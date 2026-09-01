@@ -14,6 +14,7 @@ from nnscaler.runtime.hybrid_optimizer import (
     HybridOptConfig,
     HybridOptimizer,
     HybridSubOptConfig,
+    HybridSubOptParamGroupConfig,
     ScaleDelayedOptimizerMixin,
 )
 from tests.parallel_module.common import assert_close, assert_equal
@@ -35,6 +36,46 @@ def test_empty_optimizer_partitions():
     assert optimizer.optimizers[0].param_groups[0]['params'] == [param]
     assert optimizer.optimizers[1].param_groups[0]['params'] == []
     assert optimizer.optimizers[2].param_groups[0]['params'] == []
+
+
+def test_empty_optimizer_preserves_configured_param_groups():
+    optimizer = HybridOptimizer(
+        [],
+        {},
+        HybridOptConfig(optimizers=[HybridSubOptConfig(
+            type=torch.optim.AdamW,
+            param_groups=[
+                HybridSubOptParamGroupConfig(options={'lr': 0.1}),
+                HybridSubOptParamGroupConfig(options={'lr': 0.2}),
+            ],
+        )]),
+    )
+
+    assert [
+        group['params'] for group in optimizer.optimizers[0].param_groups
+    ] == [[], []]
+    assert [group['lr'] for group in optimizer.optimizers[0].param_groups] == [
+        0.1,
+        0.2,
+    ]
+
+
+def test_optimizer_materializes_missing_param_groups():
+    param = torch.nn.Parameter(torch.ones(1))
+    optimizer = HybridOptimizer(
+        [param],
+        {param: (0, 1)},
+        HybridOptConfig(optimizers=[HybridSubOptConfig(
+            type=torch.optim.AdamW,
+            param_groups=[
+                HybridSubOptParamGroupConfig(options={'lr': 0.1}),
+                HybridSubOptParamGroupConfig(options={'lr': 0.2}),
+            ],
+        )]),
+    )
+
+    assert optimizer.optimizers[0].param_groups[0]['params'] == []
+    assert optimizer.optimizers[0].param_groups[1]['params'] == [param]
 
 
 def param_clss_fn(param_name: str) -> tuple[int, int]:

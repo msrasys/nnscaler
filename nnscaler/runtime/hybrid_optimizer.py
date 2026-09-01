@@ -184,22 +184,26 @@ class HybridOptimizer(torch.optim.Optimizer, TrainHookHost, TrainHook):
 
         for idx, opt_config in enumerate(config.optimizers):
             param_groups = opt_param_groups[idx]
-            if len(param_groups) > 1:
-                if len(param_groups) != len(opt_config.param_groups):
-                    raise ValueError(f"Expected {len(opt_config.param_groups)} param groups, got {len(param_groups)}")
-                # param group indices must be consecutive.
-                if max(param_groups.keys()) != len(opt_config.param_groups) - 1:
-                    raise ValueError(f"Param group indices must be consecutive. We have {len(opt_config.param_groups)} groups, got max group id {max(param_groups.keys())}")
-                for param_group_idx, param_group in param_groups.items():
-                    param_group.update(opt_config.param_groups[param_group_idx].options)
+            if opt_config.param_groups:
+                expected_group_ids = set(range(len(opt_config.param_groups)))
+                unexpected_group_ids = set(param_groups).difference(
+                    expected_group_ids)
+                if unexpected_group_ids:
+                    raise ValueError(
+                        f"Unexpected param group indices {sorted(unexpected_group_ids)}; "
+                        f"expected indices in [0, {len(opt_config.param_groups)})"
+                    )
+                optimizer_params = []
+                for group_id, group_config in enumerate(opt_config.param_groups):
+                    param_group = param_groups.get(group_id, {'params': []})
+                    param_group.update(group_config.options)
+                    optimizer_params.append(param_group)
             else:
-                if len(opt_config.param_groups) > 1:
-                    raise ValueError(f"Expected at most 1 param group, got {len(opt_config.param_groups)}")
-                if opt_config.param_groups:
-                    param_groups[0].update(opt_config.param_groups[0].options)
-            optimizer_params = list(param_groups.values())
-            if not optimizer_params:
-                optimizer_params = [{'params': []}]
+                if set(param_groups).difference({0}):
+                    raise ValueError(
+                        f"Expected param group index 0, got {sorted(param_groups)}"
+                    )
+                optimizer_params = [param_groups.get(0, {'params': []})]
             optimizer = opt_config.type(optimizer_params, **opt_config.options)
             self.optimizers.append(optimizer)
 
