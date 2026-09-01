@@ -384,7 +384,10 @@ class CubeModule(torch.nn.Module):
         """
         index_filename = filename + '.index'
         if not os.path.isfile(index_filename):
-            raise RuntimeError(f"Cannot find file {index_filename} in load_attr_content")
+            raise RuntimeError(
+                f"Cannot find attribute content index {index_filename}; "
+                "regenerate the generated model files with this nnScaler version"
+            )
         tid_to_chunk: Dict[int, int] = torch.load(index_filename, weights_only=True)
         if not isinstance(tid_to_chunk, dict):
             raise RuntimeError(f"Invalid attribute content index {index_filename}")
@@ -414,7 +417,8 @@ class CubeModule(torch.nn.Module):
             for file_idx, attrs in sorted(chunk_to_attrs.items()):
                 # part_model contains a subset of attributes, where each attribute is a fulltensor
                 # fulltensor.tid -> torch.Tensor
-                part_model: Dict[int, torch.Tensor] = torch.load(filename + f'.{file_idx}')
+                part_model: Dict[int, torch.Tensor] = torch.load(
+                    filename + f'.{file_idx}', weights_only=True)
                 for attr_name, meta in attrs:
                     if meta.tid not in part_model:
                         raise RuntimeError(
