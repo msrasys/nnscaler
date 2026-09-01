@@ -8,8 +8,11 @@ To avoid other potential parity issues that may have influence the gradient valu
 we use weight data as gradient, and calculate its norm to verify the correctness
 of gnorm calculation.
 """
-import torch
 from functools import partial
+from math import prod
+
+import pytest
+import torch
 
 import nnscaler
 from nnscaler.compiler import compile
@@ -57,6 +60,42 @@ def test_split_grads_for_apex_l2norm():
 
     apex_grads[1][0] = -1
     assert grad.view(-1)[8] == -1
+
+
+@pytest.mark.parametrize(
+    ('shape', 'memory_format'),
+    [
+        ((2, 3, 4, 5), torch.channels_last),
+        ((2, 3, 4, 5, 6), torch.channels_last_3d),
+    ],
+)
+def test_split_channels_last_grads_for_apex_l2norm(shape, memory_format):
+    grad = torch.arange(prod(shape)).reshape(shape)
+    grad = grad.contiguous(memory_format=memory_format)
+
+    apex_grads = _split_grads_for_apex_l2norm(
+        [grad], max_tensor_numel=grad.numel() // 2)
+
+    assert [tensor.numel() for tensor in apex_grads] == [
+        grad.numel() // 2,
+        grad.numel() - grad.numel() // 2,
+    ]
+    assert all(
+        tensor.untyped_storage().data_ptr() == grad.untyped_storage().data_ptr()
+        for tensor in apex_grads
+    )
+
+    apex_grads[1][0] = -1
+    physical_grad = grad.as_strided(
+        (grad.numel(),), (1,), grad.storage_offset())
+    assert physical_grad[grad.numel() // 2] == -1
+
+
+def test_split_grads_for_apex_l2norm_rejects_strided_layout():
+    grad = torch.arange(20).reshape(4, 5).t()
+
+    with pytest.raises(ValueError, match='only supports contiguous'):
+        _split_grads_for_apex_l2norm([grad], max_tensor_numel=8)
 
 
 def tensor_parallelism(graph, node: IRFwOperation, idx, dim, num):
