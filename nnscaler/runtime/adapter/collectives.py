@@ -9,6 +9,7 @@ for non-autograd (e.g., inference) scenarios.
 Every collective is implemented using out-of-place semantics.
 """
 
+import io
 from typing import List, Tuple, Optional
 import warnings
 import torch
@@ -17,6 +18,24 @@ from nnscaler.runtime.device import DeviceGroup
 from nnscaler.profiler.timer import CudaTimer
 
 from nnscaler.runtime.executor import AsyncCommHandler
+
+
+def _serialize_object(obj) -> bytes:
+    buffer = io.BytesIO()
+    torch.save(obj, buffer)
+    return buffer.getvalue()
+
+
+def _deserialize_object(payload: bytes):
+    # Object collectives otherwise restore nested CUDA tensors on the sender's
+    # device, which is invalid when an IRObject crosses pipeline stages.
+    def map_location(storage, location):
+        if location.startswith('cuda'):
+            return storage.cuda(torch.cuda.current_device())
+        return None
+
+    return torch.load(
+        io.BytesIO(payload), map_location=map_location, weights_only=False)
 
 
 def move(tensor: Optional[torch.Tensor], shape: Tuple[int], dtype: torch.dtype, src: int, dst: int, async_op=False):
@@ -63,12 +82,12 @@ def move_object(obj, src: int, dst: int, async_op=False):
     CudaTimer().start(field_name='comm', predefined=True)
     rank = torch.distributed.get_rank()
     if rank == src:
-        torch.distributed.send_object_list([obj], dst=dst)
+        torch.distributed.send_object_list([_serialize_object(obj)], dst=dst)
     else:
         assert rank == dst
         obj_list = [None]
         torch.distributed.recv_object_list(obj_list, src=src)
-        obj = obj_list[0]
+        obj = _deserialize_object(obj_list[0])
     CudaTimer().stop(field_name='comm', predefined=True)
     return obj
 
@@ -102,12 +121,17 @@ def all_gather(tensor: torch.Tensor, dim: int,
     tensor_list = [torch.empty_like(tensor) for _ in ranks]
     tensor_list[torch.distributed.get_rank(group)] = tensor.data
     work = torch.distributed.all_gather(tensor_list, tensor, group=group, async_op=async_op)
+    group_ranks = torch.distributed.get_process_group_ranks(group)
+    gather_order = tuple(group_ranks.index(rank) for rank in ranks)
+
+    def concat_gathered(_):
+        return torch.concat(tuple(tensor_list[index] for index in gather_order), dim=dim)
+
     if work:
-        allgather_callback = lambda t: torch.concat(tuple(tensor_list), dim=dim)
-        AsyncCommHandler().submit(tensor, [work], allgather_callback)
+        AsyncCommHandler().submit(tensor, [work], concat_gathered)
         otensor = tensor
     else:
-        otensor = torch.concat(tuple(tensor_list), dim=dim)
+        otensor = concat_gathered(tensor)
     if not async_op:
         CudaTimer().stop(field_name='comm', predefined=True)
     return otensor
@@ -202,8 +226,7 @@ def chunk(itensor: torch.Tensor, dim: int, ranks: Tuple[int], async_op=False) ->
 
     ranks (Tuple[int]): the order of split tensor.
     """
-    group = DeviceGroup().get_group(ranks)
-    idx = torch.distributed.get_rank(group)
+    idx = tuple(ranks).index(torch.distributed.get_rank())
     with torch.no_grad():
         otensor = itensor.chunk(len(ranks), dim)[idx]
         otensor = otensor.detach()
@@ -363,12 +386,13 @@ def broadcast_object(obj, src: int, ranks: List[int], async_op=False):
     rank = torch.distributed.get_rank()
     group = DeviceGroup().get_group(ranks)
     if rank == src:
-        torch.distributed.broadcast_object_list([obj], src=src, group=group)
+        torch.distributed.broadcast_object_list(
+            [_serialize_object(obj)], src=src, group=group)
     else:
         assert rank in ranks
         obj_list = [None]
         torch.distributed.broadcast_object_list(obj_list, src=src, group=group)
-        obj = obj_list[0]
+        obj = _deserialize_object(obj_list[0])
 
     CudaTimer().stop(field_name='comm', predefined=True)
     return obj
