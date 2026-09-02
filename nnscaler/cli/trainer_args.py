@@ -958,8 +958,13 @@ class TrainerArgs(PrecisionMixin, PolicyMixin):
     # auto: automatically decide the reuse strategy (moo for compile, match for run)
     # Or one of match/override/moo/graph (see `nnscaler.ReuseType`)
     gen_reuse: str = 'auto'
-    # The number of workers for generating code. Values greater than 1 require
+    # The number of workers for generating code.
     # an import-safe entry point guarded by `if __name__ == '__main__':`.
+    # When `gen_max_workers` is greater than 1, the code generation will use multiple processes.
+    # If the graph is large, and/or the runtime_ngpus is large,
+    # you may want to increase this number to speed up code generation.
+    # Note that increasing this number will also increase memory usage and startup time,
+    # and also introduce the overhead of inter-process communication.
     gen_max_workers: int = 1
     pas_policy: str = 'autodist'
     broadcast_strategy: str = 'all'
