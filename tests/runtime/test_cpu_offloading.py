@@ -49,23 +49,35 @@ def _offloaded_handles(context: CPUOffloadContext) -> list[_OffloadedTensor]:
 def test_cpu_offload_prefetch_level_configuration(monkeypatch):
     monkeypatch.delenv(ParallelModule._PREFETCH_LEVEL_ENV_VAR, raising=False)
     module = _ConfiguredTestParallelModule()
-    assert module.cpu_offloading_prefetch_level == ParallelModule._PREFETCH_LEVEL_DEFAULT
-    assert module.cpu_offloading_hooks().prefetch_level == ParallelModule._PREFETCH_LEVEL_DEFAULT
+    assert CPUOffloadContext(module).prefetch_level == 2
+    assert module.cpu_offloading_prefetch_level == 2
+    assert module.cpu_offloading_hooks().prefetch_level == 2
 
     monkeypatch.setenv(ParallelModule._PREFETCH_LEVEL_ENV_VAR, '3')
-    assert module.cpu_offloading_prefetch_level == ParallelModule._PREFETCH_LEVEL_DEFAULT
+    assert module.cpu_offloading_prefetch_level == 2
 
     configured_module = _ConfiguredTestParallelModule()
     assert configured_module.cpu_offloading_prefetch_level == 3
     configured_module.cpu_offloading_prefetch_level = 1
     assert configured_module.cpu_offloading_hooks().prefetch_level == 1
 
+    monkeypatch.setenv(ParallelModule._PREFETCH_LEVEL_ENV_VAR, '-2')
+    configured_module = _ConfiguredTestParallelModule()
+    assert configured_module.cpu_offloading_prefetch_level == -2
+    assert configured_module.cpu_offloading_hooks().prefetch_level == -2
 
-@pytest.mark.parametrize('value', ['invalid', '-1'])
+
+@pytest.mark.parametrize('value', ['invalid', '1.5'])
 def test_cpu_offload_rejects_invalid_prefetch_level_env(monkeypatch, value):
     monkeypatch.setenv(ParallelModule._PREFETCH_LEVEL_ENV_VAR, value)
     with pytest.raises(ValueError, match=ParallelModule._PREFETCH_LEVEL_ENV_VAR):
         _ConfiguredTestParallelModule()
+
+
+@pytest.mark.parametrize('value', [True, False, 1.5, None])
+def test_cpu_offload_rejects_non_integer_prefetch_level(value):
+    with pytest.raises(ValueError, match='prefetch_level must be an integer'):
+        CPUOffloadContext(_TestParallelModule(), prefetch_level=value)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason='lack of gpu devices')
@@ -285,10 +297,13 @@ def test_cpu_offload_transfers_are_non_blocking():
 @pytest.mark.parametrize(
     ('prefetch_level', 'expected_order'),
     [
-        (0, [(2, 0)]),
-        (1, [(2, 0), (2, 1)]),
-        (2, [(2, 0), (2, 1), (1, 1), (1, 0)]),
-        (3, [(2, 0), (2, 1), (1, 1), (1, 0), (0, 1), (0, 0)]),
+        (0, [(2, 1)]),
+        (1, [(2, 1), (2, 0)]),
+        (2, [(2, 1), (2, 0), (1, 1)]),
+        (3, [(2, 1), (2, 0), (1, 1), (1, 0)]),
+        (-1, [(2, 1), (2, 0)]),
+        (-2, [(2, 1), (2, 0), (1, 1), (1, 0)]),
+        (-3, [(2, 1), (2, 0), (1, 1), (1, 0), (0, 1), (0, 0)]),
     ],
 )
 def test_cpu_offload_prefetch_level(prefetch_level, expected_order):
@@ -318,17 +333,54 @@ def test_cpu_offload_prefetch_level(prefetch_level, expected_order):
             ):
                 if handle.device_tensor is None:
                     prefetch_order.append((batch_idx, handle_idx))
-                original_prefetch()
+                return original_prefetch()
 
             handle.prefetch = record_prefetch
 
-    contexts[2]._unpack(handles_by_batch[2][0])
+    contexts[2]._unpack(handles_by_batch[2][1])
 
     assert prefetch_order == expected_order
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason='lack of gpu devices')
-def test_default_prefetch_advances_one_batch_per_backward():
+def test_tensor_prefetch_advances_from_demanded_tensor():
+    module = _TestParallelModule()
+    contexts = []
+    handles_by_batch = []
+    prefetch_order = []
+
+    for batch_idx in range(2):
+        context = _cpu_offload_context(module, prefetch_level=2)
+        with context:
+            handles = [
+                context._pack(torch.randn(8, device='cuda'))
+                for _ in range(3)
+            ]
+        contexts.append(context)
+        handles_by_batch.append(handles)
+        for handle_idx, handle in enumerate(handles):
+            original_prefetch = handle.prefetch
+
+            def record_prefetch(
+                batch_idx=batch_idx,
+                handle_idx=handle_idx,
+                handle=handle,
+                original_prefetch=original_prefetch,
+            ):
+                if handle.device_tensor is None:
+                    prefetch_order.append((batch_idx, handle_idx))
+                return original_prefetch()
+
+            handle.prefetch = record_prefetch
+
+    contexts[1]._unpack(handles_by_batch[1][2])
+    contexts[1]._unpack(handles_by_batch[1][1])
+
+    assert prefetch_order == [(1, 2), (1, 1), (1, 0), (0, 2)]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason='lack of gpu devices')
+def test_batch_prefetch_advances_one_batch_per_backward():
     _OffloadBatch.last_batch = None
     prefetch_order = []
     module = _TestParallelModule()
@@ -336,7 +388,7 @@ def test_default_prefetch_advances_one_batch_per_backward():
     handles_by_batch = []
 
     for batch_idx in range(3):
-        context = _cpu_offload_context(module)
+        context = _cpu_offload_context(module, prefetch_level=-2)
         with context:
             handles = [
                 context._pack(torch.randn(8, device='cuda')),
@@ -355,7 +407,7 @@ def test_default_prefetch_advances_one_batch_per_backward():
             ):
                 if handle.device_tensor is None:
                     prefetch_order.append((batch_idx, handle_idx))
-                original_prefetch()
+                return original_prefetch()
 
             handle.prefetch = record_prefetch
 
@@ -376,7 +428,7 @@ def test_triggered_batch_stops_prefetch_at_segment_boundary():
     handles = []
 
     for _ in range(3):
-        context = _cpu_offload_context(module)
+        context = _cpu_offload_context(module, prefetch_level=-2)
         with context:
             handle = context._pack(torch.randn(8, device='cuda'))
         contexts.append(context)
@@ -415,15 +467,15 @@ def test_filo_handles_multiple_forward_calls():
     module = _TestParallelModule()
 
     def forward(tensor):
-        context0 = _cpu_offload_context(module)
+        context0 = _cpu_offload_context(module, prefetch_level=-2)
         with context0:
             hidden = tensor.sin()
 
-        empty_context = _cpu_offload_context(module)
+        empty_context = _cpu_offload_context(module, prefetch_level=-2)
         with empty_context:
             hidden = hidden + 1
 
-        context1 = _cpu_offload_context(module)
+        context1 = _cpu_offload_context(module, prefetch_level=-2)
         with context1:
             output = hidden.cos()
         return output, context0, empty_context, context1

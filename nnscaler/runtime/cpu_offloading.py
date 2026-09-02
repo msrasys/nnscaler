@@ -46,6 +46,21 @@ class _OffloadBatch:
             if previous is not None:
                 previous.prefetch(prefetch_level=prefetch_level - 1)
 
+    def prefetch_tensors(self, handle: '_OffloadedTensor', count: int) -> None:
+        handle_idx = self.handles.index(handle)
+        handles = self.handles[:handle_idx]
+        batch: Optional[_OffloadBatch] = self
+        while count > 0:
+            for handle in reversed(handles):
+                handle.prefetch()
+                count -= 1
+                if count == 0:
+                    return
+            batch = batch.previous() if batch.previous is not None else None
+            if batch is None:
+                return
+            handles = batch.handles
+
 
 class _ModuleTensorRef:
     def __init__(self, owner: torch.Tensor, tensor: torch.Tensor) -> None:
@@ -117,7 +132,7 @@ class _OffloadedTensor:
 
 
 class CPUOffloadContext:
-    """Offload saved tensors and prefetch linked batches in reverse forward order.
+    """Offload saved tensors and prefetch them in reverse forward order.
 
     Contexts must be entered and exited sequentially on one thread. Nested or
     concurrent use is unsupported because batch ordering is process-global.
@@ -129,10 +144,13 @@ class CPUOffloadContext:
 
         Args:
             module (ParallelModule): The module whose tensors will be offloaded.
-            prefetch_level (int): The number of batches to prefetch.
+            prefetch_level (int): How far to prefetch after loading the demanded tensor.
                 0: no prefetching, only offload on demand.
-                1: prefetch the current batch only (the tensors in the same offload context).
-                2: prefetch the current and the previous batch.
+                Positive values set a tensor lookahead in reverse pack order:
+                1 prefetches the next tensor, 2 prefetches the next two, and so
+                on, continuing into previous batches when necessary.
+                Negative values count batches: -1 prefetches the current batch,
+                -2 prefetches the current and previous batch, and so on.
                 ...
             Batch ordering:
                 Each successfully completed, non-empty context becomes the
@@ -146,8 +164,8 @@ class CPUOffloadContext:
                 during backward. The chain therefore doesn't work well for
                 prefetching across stage boundaries.
         """
-        if not isinstance(prefetch_level, int) or prefetch_level < 0:
-            raise ValueError(f'prefetch_level must be a non-negative integer, got {prefetch_level}')
+        if isinstance(prefetch_level, bool) or not isinstance(prefetch_level, int):
+            raise ValueError(f'prefetch_level must be an integer, got {prefetch_level}')
 
         self.batch = _OffloadBatch()
         self.module = module
@@ -198,9 +216,11 @@ class CPUOffloadContext:
             return value.unpack()
         if not isinstance(value, _OffloadedTensor):
             return value
-        # Submit the demanded tensor first, then prefetch the configured number
-        # of linked batches in reverse pack order.
+        # Submit the demanded tensor first, then prefetch the configured batch
+        # or tensor window in reverse pack order.
         value.prefetch()
         if self.prefetch_level > 0:
-            self.batch.prefetch(prefetch_level=self.prefetch_level)
+            self.batch.prefetch_tensors(value, self.prefetch_level)
+        elif self.prefetch_level < 0:
+            self.batch.prefetch(prefetch_level=-self.prefetch_level)
         return value.unpack()

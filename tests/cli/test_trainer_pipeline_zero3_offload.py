@@ -43,7 +43,9 @@ def pipeline_zero3_cpu_offload_policy(graph, cfg):
     return _pipeline_policy(graph, cpu_offload=True)
 
 
-def _trainer_worker(save_dir, run_name, policy, expect_cpu_offload):
+def _trainer_worker(save_dir, run_name, policy, prefetch_level):
+    import os
+
     import nnscaler.runtime.cpu_offloading as cpu_offloading
 
     save_dir = Path(save_dir)
@@ -54,9 +56,16 @@ def _trainer_worker(save_dir, run_name, policy, expect_cpu_offload):
     instance_name = f'instance_{run_name}'
 
     offloaded_tensors = 0
+    observed_prefetch_levels = set()
     original_context = cpu_offloading.CPUOffloadContext
+    prefetch_level_env = 'CPU_OFFLOADING_PREFETCH_LEVEL'
+    original_prefetch_level = os.environ.get(prefetch_level_env)
 
     class RecordingContext(original_context):
+        def __init__(self, module, context_prefetch_level):
+            super().__init__(module, context_prefetch_level)
+            observed_prefetch_levels.add(context_prefetch_level)
+
         def _pack(self, tensor):
             nonlocal offloaded_tensors
             packed = super()._pack(tensor)
@@ -64,8 +73,9 @@ def _trainer_worker(save_dir, run_name, policy, expect_cpu_offload):
                 offloaded_tensors += 1
             return packed
 
-    if expect_cpu_offload:
+    if prefetch_level is not None:
         cpu_offloading.CPUOffloadContext = RecordingContext
+        os.environ[prefetch_level_env] = str(prefetch_level)
 
     try:
         trainer = Trainer([
@@ -81,6 +91,10 @@ def _trainer_worker(save_dir, run_name, policy, expect_cpu_offload):
         trainer.run()
     finally:
         cpu_offloading.CPUOffloadContext = original_context
+        if original_prefetch_level is None:
+            os.environ.pop(prefetch_level_env, None)
+        else:
+            os.environ[prefetch_level_env] = original_prefetch_level
 
     assert trainer.model.use_scheduler
     assert trainer.model.nmicros_per_scheduler_step == 4
@@ -88,8 +102,9 @@ def _trainer_worker(save_dir, run_name, policy, expect_cpu_offload):
     assert trainer.model.compute_config.pas_config['pipeline_nstages'] == 2
     assert all(reducer.zero3 for reducer in trainer.model.reducers)
 
-    if expect_cpu_offload:
+    if prefetch_level is not None:
         assert offloaded_tensors > 0
+        assert observed_prefetch_levels == {prefetch_level}
         assert _gencode_contains(
             gen_savedir,
             MLP,
@@ -120,18 +135,22 @@ def test_trainer_pipeline_zero3_cpu_offload(tmp_path):
         tmp_path,
         'baseline',
         f'{module_name}.pipeline_zero3_policy',
-        False,
-    )
-    launch_torchrun(
-        4,
-        _trainer_worker,
-        tmp_path,
-        'cpu_offload',
-        f'{module_name}.pipeline_zero3_cpu_offload_policy',
-        True,
+        None,
     )
 
     baseline = torch.load(tmp_path / 'baseline.pt', weights_only=False)
-    cpu_offload = torch.load(tmp_path / 'cpu_offload.pt', weights_only=False)
-    assert_equal(cpu_offload['model'], baseline['model'])
-    assert_equal(cpu_offload['optimizer'], baseline['optimizer'])
+    for run_name, prefetch_level in (
+        ('cpu_offload_tensor_2', 2),
+        ('cpu_offload_batch_2', -2),
+    ):
+        launch_torchrun(
+            4,
+            _trainer_worker,
+            tmp_path,
+            run_name,
+            f'{module_name}.pipeline_zero3_cpu_offload_policy',
+            prefetch_level,
+        )
+        cpu_offload = torch.load(tmp_path / f'{run_name}.pt', weights_only=False)
+        assert_equal(cpu_offload['model'], baseline['model'])
+        assert_equal(cpu_offload['optimizer'], baseline['optimizer'])

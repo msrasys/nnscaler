@@ -316,13 +316,6 @@ def get_grad_dtype(param: torch.nn.Parameter) -> torch.dtype:
 def load_int_from_env(name: str, default: int) -> int:
     value = os.environ.get(name, str(default))
     try:
-        int_value = int(value)
+        return int(value)
     except ValueError as error:
-        raise ValueError(
-            f'{name} must be a non-negative integer, got {value!r}'
-        ) from error
-    if int_value < 0:
-        raise ValueError(
-            f'{name} must be a non-negative integer, got {value!r}'
-        )
-    return int_value
+        raise ValueError(f'{name} must be an integer, got {value!r}') from error
