@@ -1100,7 +1100,10 @@ def _gencode(
     else:
         # pickle doesn't work for graph/codegen objects, so use dill for worker payloads.
         # ExecutePlan is too complex. default recursion limit is too low for dill to serialize it.
-        with recursion_limit(DILL_RECURSION_LIMIT, increase_only=True):
+        # To further reduce the serialization overhead,
+        # we use a custom pickling context that removes `_cell` from IRObject's state.
+        # TODO: Currently it looks safe, but should we restore `_cell`(using similar approach as IRGraph.from_dill) after pickling
+        with recursion_limit(DILL_RECURSION_LIMIT, increase_only=True), graph.no_cell_pickle_context():
             dilled_codegen = dill.dumps(codegen_args)
         # Avoid inheriting parent CUDA/PyTorch runtime state through fork.
         mp_context = multiprocessing.get_context('spawn')
