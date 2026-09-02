@@ -963,8 +963,7 @@ class TrainerArgs(PrecisionMixin, PolicyMixin):
     # When `gen_max_workers` is greater than 1, the code generation will use multiple processes.
     # If the graph is large, and/or the runtime_ngpus is large,
     # you may want to increase this number to speed up code generation.
-    # Note that increasing this number will also increase memory usage and startup time,
-    # and also introduce the overhead of inter-process communication.
+    # Note that increasing this number will also introduce the overhead of inter-process communication.
     gen_max_workers: int = 1
     pas_policy: str = 'autodist'
     broadcast_strategy: str = 'all'
