@@ -159,10 +159,15 @@ class CPUOffloadContext:
                 execution order.
 
                 This order is valid for non-pipeline execution and within one
-                pipeline stage. Across pipeline stages, however, process-local
+                pipeline stage for single forward pass.
+                Across pipeline stages, however, process-local
                 forward order does not describe which batch will be adjacent
                 during backward. The chain therefore doesn't work well for
                 prefetching across stage boundaries.
+
+                When multiple forward passes occur before backward(i.e. accumulation of gradients),
+                the chain may not accurately reflect the true backward order,
+                potentially affecting prefetching efficiency.
         """
         if isinstance(prefetch_level, bool) or not isinstance(prefetch_level, int):
             raise ValueError(f'prefetch_level must be an integer, got {prefetch_level}')

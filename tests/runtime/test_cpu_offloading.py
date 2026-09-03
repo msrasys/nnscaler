@@ -229,9 +229,9 @@ def test_parallel_module_cpu_offloading_hooks_preserve_zero3_views():
     expected_output.sum().backward()
 
     assert module_tensor_refs
-    assert torch.allclose(output, expected_output)
-    assert torch.allclose(tensor.grad, expected_tensor.grad)
-    assert torch.allclose(module.weight.grad, expected_weight.grad)
+    assert torch.equal(output, expected_output)
+    assert torch.equal(tensor.grad, expected_tensor.grad)
+    assert torch.equal(module.weight.grad, expected_weight.grad)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason='lack of gpu devices')
@@ -248,20 +248,20 @@ def test_linear_parameter_is_not_copied_by_activation_offload():
     with context:
         output = torch.nn.functional.linear(tensor, parameter).sin()
     expected = torch.nn.functional.linear(expected_tensor, expected_parameter).sin()
-    offloaded_numel = sum(
-        handle.host_tensor.numel() for handle in _offloaded_handles(context)
-    )
 
     output.sum().backward()
     expected.sum().backward()
 
-    assert offloaded_numel < parameter.numel()
-    assert torch.allclose(tensor.grad, expected_tensor.grad)
-    assert torch.allclose(parameter.grad, expected_parameter.grad)
+    assert len(_offloaded_handles(context))  == 2  # parameter are not offloaded.
+    assert torch.equal(tensor.grad, expected_tensor.grad)
+    assert torch.equal(parameter.grad, expected_parameter.grad)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason='lack of gpu devices')
 def test_cpu_offload_transfers_are_non_blocking():
+    """
+    Test that CPU offload transfers are non-blocking.
+    """
     module = _TestParallelModule()
     with _cpu_offload_context(module):
         pass
@@ -273,6 +273,7 @@ def test_cpu_offload_transfers_are_non_blocking():
         output_warmup = tensor.square()
     del output_warmup
     torch.cuda.synchronize()
+    # enqueue a long task, so that any subsequent non-blocking transfers can't be done immediately
     torch.cuda._sleep(2_000_000_000)
 
     context = _cpu_offload_context(module)
@@ -284,9 +285,13 @@ def test_cpu_offload_transfers_are_non_blocking():
 
     assert handles
     assert all(handle.host_tensor.is_pinned() for handle in handles)
+    # At this point, the D2H transfers should still be in progress for some handles.
+    # but cpu work has been done.
     assert any(not handle.d2h_event.query() for handle in handles), elapsed
 
     handles[0].prefetch()
+    # Prefetch the first handle to initiate H2D transfer.
+    # At this point, the H2D transfer should still be in progress for some handles.
     assert any(not handle.h2d_event.query() for handle in handles)
 
     output.sum().backward()
@@ -459,7 +464,7 @@ def test_cpu_offload_preserves_non_contiguous_layout():
     output.sum().backward()
     expected_output.sum().backward()
 
-    assert torch.allclose(base.grad, expected_base.grad)
+    assert torch.equal(base.grad, expected_base.grad)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason='lack of gpu devices')
