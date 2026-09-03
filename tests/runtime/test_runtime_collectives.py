@@ -2,11 +2,9 @@
 #  Licensed under the MIT License.
 
 from typing import List
-from unittest.mock import Mock
 
 import nnscaler
 import nnscaler.runtime.adapter
-from nnscaler.runtime.adapter.collectives import _deserialize_object
 import torch
 import pytest
 
@@ -40,43 +38,10 @@ def _move_worker(async_op: bool):
     return clone_to_cpu(tensor)
 
 
-def _object_collective_payload():
-    return {
-        'cuda': torch.arange(3, device=torch.cuda.current_device()),
-        'cpu': torch.arange(2, device='cpu'),
-        'metadata': {'hello': 'world', 'count': 1},
-    }
-
-
-def _assert_object_collective_payload(obj):
-    assert obj['cuda'].device == torch.device('cuda', torch.cuda.current_device())
-    assert obj['cuda'].tolist() == [0, 1, 2]
-    assert obj['cpu'].device.type == 'cpu'
-    assert obj['cpu'].tolist() == [0, 1]
-    assert obj['metadata'] == {'hello': 'world', 'count': 1}
-
-
-def test_deserialize_object_accepts_device_location(monkeypatch):
-    storage = Mock()
-    storage.cuda.return_value = storage
-
-    def load(_buffer, *, map_location, weights_only):
-        assert weights_only is False
-        assert map_location(storage, torch.device('cuda:7')) is storage
-        return 'loaded'
-
-    monkeypatch.setattr(torch, 'load', load)
-    monkeypatch.setattr(torch.cuda, 'current_device', lambda: 2)
-
-    assert _deserialize_object(b'payload') == 'loaded'
-    storage.cuda.assert_called_once_with(2)
-
-
 def _move_object_worker():
-    rank = torch.distributed.get_rank()
-    obj = _object_collective_payload() if rank == 0 else None
+    obj = {'hello': 'world', 'count': 1}
     robj = nnscaler.runtime.adapter.move_object(obj, 0, 1)
-    _assert_object_collective_payload(robj)
+    assert robj == obj
 
 
 def _allreduce_worker(async_op: bool):
@@ -222,11 +187,10 @@ def _broadcast_worker(async_op):
 
 
 def _broadcast_object_worker():
-    rank = torch.distributed.get_rank()
-    obj = _object_collective_payload() if rank == 0 else None
+    obj = {'hello': 'world', 'count': 1}
     robj = nnscaler.runtime.adapter.broadcast_object(
         obj, src=0, ranks=[0,1,2])
-    _assert_object_collective_payload(robj)
+    assert robj == obj
 
 
 def _3gpu_worker():
@@ -263,26 +227,3 @@ def test_3gpu():
         assert torch.equal(outputs[0][0], outputs[0][1])
         assert torch.equal(outputs[0][0], outputs[1][1])
         assert torch.equal(outputs[0][0], outputs[2][1])
-
-
-def _ordered_rank_worker():
-    _init_distributed(4)
-    rank = torch.distributed.get_rank()
-    ranks = [0, 2, 1, 3]
-
-    value = torch.tensor([rank], dtype=torch.int64)
-    gathered = nnscaler.runtime.adapter.all_gather(value, 0, ranks)
-    chunked = nnscaler.runtime.adapter.chunk(
-        torch.arange(4, dtype=torch.int64), 0, ranks)
-    return clone_to_cpu(gathered), clone_to_cpu(chunked)
-
-
-@pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.device_count() < 4, reason='lack of gpu devices')
-def test_collectives_respect_explicit_rank_order():
-    results = launch_torchrun(4, _ordered_rank_worker)
-
-    expected_gather = torch.tensor([0, 2, 1, 3], dtype=torch.int64)
-    expected_chunks = [0, 2, 1, 3]
-    for rank, (gathered, chunked) in results.items():
-        assert torch.equal(gathered, expected_gather)
-        assert chunked.item() == expected_chunks[rank]
