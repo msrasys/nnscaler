@@ -547,14 +547,15 @@ def NewTensor(data, *, dtype=None, device=None,
         size = data.shape
     elif isinstance(data, IRObject):
         size = torch.tensor(data.value).shape
+    elif not isinstance(data, np.ndarray):
+        size = np.array(data).shape
     else:
-        # for non-IRObject instance, we will always convert to list
-        # through torch.tensor, since we cannot guarantee the `data`
-        # instance to be executable for its `repr(data)` string
-        # in gencode
-        val = torch.tensor(data)
-        size = val.shape
-        val = val.tolist()
+        # `repr(data)` is wrong for np.ndarray
+        # (will output something like `array([1,2])`, which is not valid in gencode)
+        # so we convert it to a list using `data.tolist()`
+        val = data.tolist()
+        size = data.shape
+
     size = size if len(size) > 0 else (1,)  # for scalar
 
     kwargs = {'data': val, 'requires_grad': requires_grad,

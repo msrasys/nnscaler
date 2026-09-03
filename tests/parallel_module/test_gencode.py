@@ -834,7 +834,7 @@ def test_codegen_arange():
         )
         assert m_new is None
         # never fold torch.Tensor.item() to constant
-        assert _gencode_contains(tempdir, ArangeModule, 0, '.*nnscaler.runtime.function.arange\(start=0, end=.*, step=1.*')
+        assert _gencode_contains(tempdir, ArangeModule, 0, r'.*nnscaler.runtime.function.arange\(start=0, end=.*, step=1.*')
 
 
 class MinModule(torch.nn.Module):

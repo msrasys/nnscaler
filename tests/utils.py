@@ -4,6 +4,7 @@
 import os
 import re
 import sys
+import inspect
 from typing import Optional, Tuple, Type, Union, Pattern
 from contextlib import contextmanager
 from typing import Callable
@@ -235,7 +236,10 @@ def create_mock_pg(prefix_store, rank, world_size, timeout):
     return MockProcessGroup(rank, world_size)
 
 
-dist.Backend.register_backend('cube_mock_pg', create_mock_pg)
+register_backend_kwargs = {}
+if 'devices' in inspect.signature(dist.Backend.register_backend).parameters:
+    register_backend_kwargs['devices'] = ['cpu', 'cuda']
+dist.Backend.register_backend('cube_mock_pg', create_mock_pg, **register_backend_kwargs)
 
 
 def mock_init_dist(rank, world_size):

@@ -51,9 +51,19 @@ class AutocastInfo:
     def from_context(cls):
         # use function pair [torch.autocast_increment_nesting, torch.autocast_decrement_nesting] to get the nesting number
         torch.autocast_increment_nesting()
+        # PyTorch 2.4+ provides device-aware APIs, avoiding deprecation warnings
+        # on newer releases.
+        if torch.__version__ >= (2, 4, 0):
+            cpu_enabled = torch.is_autocast_enabled('cpu')
+            cpu_dtype = torch.get_autocast_dtype('cpu')
+            cuda_dtype = torch.get_autocast_dtype('cuda')
+        else:
+            # PyTorch 2.0-2.3 requires the legacy per-device APIs.
+            cpu_enabled = torch.is_autocast_cpu_enabled()
+            cpu_dtype = torch.get_autocast_cpu_dtype()
+            cuda_dtype = torch.get_autocast_gpu_dtype()
         return cls(torch.autocast_decrement_nesting(),  torch.is_autocast_cache_enabled(),
-                   torch.is_autocast_cpu_enabled(), torch.get_autocast_cpu_dtype(),
-                   torch.is_autocast_enabled(), torch.get_autocast_gpu_dtype())
+                   cpu_enabled, cpu_dtype, torch.is_autocast_enabled(), cuda_dtype)
 
 
 @dataclass
