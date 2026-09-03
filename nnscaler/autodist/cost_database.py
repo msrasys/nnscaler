@@ -21,6 +21,7 @@ from nnscaler.graph.function.dimops import DimopSplit, IRDimops
 import nnscaler.resources
 
 from .autodist_config import AutoDistConfig
+from .op_partition import OpPartition
 
 _logger = logging.getLogger(__name__)
 
@@ -461,7 +462,12 @@ class CostDatabase:
 
         return comm_time
 
-    def estimate_comm_cost(self, src_p, dst_p, is_forward) -> float:
+    def estimate_comm_cost(
+        self,
+        src_p: OpPartition,
+        dst_p: OpPartition,
+        is_forward: bool,
+    ) -> float:
         """
         Estimate communication cost between src partition and dst partition.
         Currently the communication is only for activation tensors.
@@ -568,7 +574,11 @@ class CostDatabase:
                 dst_idx, dst_dim, dst_p_num)
         cost = 0.0
         for i, src_t in enumerate(src_p.operator.ir_cell.outputs()):
+            if not isinstance(src_t, IRTensor):
+                continue
             for j, dst_t in enumerate(dst_p.operator.ir_cell.inputs()):
+                if not isinstance(dst_t, IRTensor):
+                    continue
                 if src_t == dst_t:
                     if not is_forward and not src_t.requires_grad:
                         # if the activation does not require grad,
