@@ -392,45 +392,41 @@ class CubeModule(torch.nn.Module):
         if not isinstance(tid_to_chunk, dict):
             raise RuntimeError(f"Invalid attribute content index {index_filename}")
 
-        chunk_ids = set(tid_to_chunk.values())
-        if any(type(chunk_id) is not int or chunk_id < 0 for chunk_id in chunk_ids):
-            raise RuntimeError(f"Invalid chunk IDs in attribute content index {index_filename}")
-        npartitions = max(chunk_ids) + 1 if chunk_ids else 1
-        if chunk_ids and chunk_ids != set(range(npartitions)):
-            raise RuntimeError(f"Non-contiguous chunk IDs in attribute content index {index_filename}")
-
         with torch.no_grad():
-            required_tids = {meta.tid for meta in self._fullmap.values()}
-            missing_tids = required_tids.difference(tid_to_chunk)
-            if missing_tids:
+            try:
+                required_chunks = {
+                    tid_to_chunk[meta.tid] for meta in self._fullmap.values()
+                }
+            except KeyError as exc:
                 raise RuntimeError(
-                    f'attribute content index {index_filename} is missing tensor IDs: {sorted(missing_tids)}'
-                )
-            chunk_to_attrs = defaultdict(list)
-            for attr_name, meta in self._fullmap.items():
-                chunk_to_attrs[tid_to_chunk[meta.tid]].append((attr_name, meta))
+                    f'attribute content index {index_filename} is missing tensor ID {exc.args[0]}'
+                ) from exc
 
             _logger.info(
                 f'loading partitioned model from {filename}, '
-                f'number of model parameter chunks: {npartitions}, chunks required by this rank: {len(chunk_to_attrs)}'
+                f'chunks required by this rank: {len(required_chunks)}'
             )
-            for file_idx, attrs in sorted(chunk_to_attrs.items()):
+            attr_names = set(self._fullmap)
+            for file_idx in sorted(required_chunks):
                 # part_model contains a subset of attributes, where each attribute is a fulltensor
                 # fulltensor.tid -> torch.Tensor
                 part_model: Dict[int, torch.Tensor] = torch.load(
                     filename + f'.{file_idx}', weights_only=True)
-                for attr_name, meta in attrs:
+                loaded_names = set()
+                for attr_name in attr_names:
+                    meta = self._fullmap[attr_name]
                     if meta.tid not in part_model:
-                        raise RuntimeError(
-                            f'tensor ID {meta.tid} for attribute {attr_name} is not in '
-                            f'{filename}.{file_idx}'
-                        )
+                        continue
                     attr = getattr(self, attr_name)
                     content = part_model[meta.tid][meta.slicers]
                     if meta.val_chunks != 1:
                         content = content / meta.val_chunks
                     attr.copy_(content)
-                del part_model
+                    loaded_names.add(attr_name)
+                attr_names.difference_update(loaded_names)
+            if attr_names:
+                raise RuntimeError(
+                    f'remaining graph parameters / buffers cannot find in model files: {list(attr_names)}')
 
     def load_np_buffer_content(self, filename: str):
         """Load non-persistent buffer content from file.
