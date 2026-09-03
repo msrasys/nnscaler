@@ -1141,18 +1141,20 @@ class IRGraph(IRSegment):
 
     # =================== Helpers ====================
 
-    def dumps(self) -> str:
-        """
-        Dump the graph into binary by dill
-        """
-        # FIXME: dump doesn't support customized op
-        class PicklingContextSave:
+    @staticmethod
+    def no_cell_pickle_context():
+        class PicklingContextNoCell:
             def __enter__(self):
                 IRObject.__getstate__ = IRObject.getstate_for_dump
             def __exit__(self, exc_type, exc_value, traceback):
                 IRObject.__getstate__ = lambda self: self.__dict__.copy()
+        return PicklingContextNoCell()
 
-        with PicklingContextSave():
+    def dumps(self) -> str:
+        """
+        Dump the graph into binary by dill
+        """
+        with self.no_cell_pickle_context():
             save = (IDGenerator().get_states(), self)
             return dill.dumps(save)
 

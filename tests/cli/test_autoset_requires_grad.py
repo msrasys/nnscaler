@@ -25,10 +25,12 @@ def test_end2end(tmp_path):
         '--checkpoint.no_save', 'true',
         '--run_mode', 'compile',
         '--broadcast_strategy', 'none',
+        '--gen_max_workers', '3',
     ])
     with patch('nnscaler.cli.mixed_module.nnscaler.parallelize') as mocked_parallelize:
         trainer.run()
         assert mocked_parallelize.call_args.kwargs['autoset_requires_grad'] is True
+        assert mocked_parallelize.call_args.kwargs['max_workers'] == 3
 
 
 @replace_all_device_with('cpu')
@@ -52,3 +54,4 @@ def test_not_end2end(tmp_path, autoset_requires_grad):
     with patch('nnscaler.cli.mixed_module.nnscaler.parallelize') as mocked_parallelize:
         trainer.run()
         assert mocked_parallelize.call_args.kwargs['autoset_requires_grad'] is autoset_requires_grad
+        assert mocked_parallelize.call_args.kwargs['max_workers'] == 1
