@@ -242,40 +242,62 @@ def wrap_pruned_yoco_attn_varlen_func(
         return (dense_output, None) if return_lse else dense_output
 
     compact_q = q.index_select(0, active_idx)
-    max_compact_q = max_seqlen_q or int(
-        (compact_cu_q[1:] - compact_cu_q[:-1]).max().item())
+    if max_seqlen_q is None:
+        max_seqlen_q = int(
+            (cu_seqlens_q[1:] - cu_seqlens_q[:-1]).max().item())
     if max_seqlen_k is None:
         max_seqlen_k = int(
             (cu_seqlens_k[1:] - cu_seqlens_k[:-1]).max().item())
 
+    # FA4 releases before varlen aux-tensor backward support reject the custom
+    # original-position mask during profiling and training. Run each packed
+    # sequence as fixed-length attention instead. The target long-context job
+    # has one sequence, so this remains one attention launch while preserving
+    # compatibility with packed batches and older FA4 builds.
+    compact_outputs = []
+    compact_lses = []
+    zero_query_offset = compact_cu_q.new_zeros(1)
     window_left = window_size[0]
-    if window_left is not None and window_left > 0:
-        mask_mod = _original_position_window_mask
-        aux_tensors = [
-            compact_positions,
-            compact_cu_q,
-            (compact_positions - int(window_left)).contiguous(),
-        ]
-    else:
-        mask_mod = _original_position_causal_mask
-        aux_tensors = [compact_positions, compact_cu_q]
+    query_offsets = compact_cu_q.tolist()
+    key_offsets = cu_seqlens_k.tolist()
+    for sequence_idx in range(len(query_offsets) - 1):
+        query_start = query_offsets[sequence_idx]
+        query_end = query_offsets[sequence_idx + 1]
+        if query_start == query_end:
+            continue
+        key_start = key_offsets[sequence_idx]
+        key_end = key_offsets[sequence_idx + 1]
+        sequence_positions = compact_positions[query_start:query_end]
+        if window_left is not None and window_left > 0:
+            mask_mod = _original_position_window_mask
+            aux_tensors = [
+                sequence_positions,
+                zero_query_offset,
+                (sequence_positions - int(window_left)).contiguous(),
+            ]
+        else:
+            mask_mod = _original_position_causal_mask
+            aux_tensors = [sequence_positions, zero_query_offset]
 
-    compact_output, softmax_lse = flash_attn_cute_varlen_func(
-        compact_q,
-        k,
-        v,
-        cu_seqlens_q=compact_cu_q,
-        cu_seqlens_k=cu_seqlens_k,
-        max_seqlen_q=max_compact_q,
-        max_seqlen_k=max_seqlen_k,
-        softmax_scale=softmax_scale,
-        causal=False,
-        window_size=(None, None),
-        deterministic=deterministic,
-        mask_mod=mask_mod,
-        aux_tensors=aux_tensors,
-        return_lse=True,
-    )
+        sequence_output, sequence_lse = flash_attn_cute_varlen_func(
+            compact_q[query_start:query_end].unsqueeze(0),
+            k[key_start:key_end].unsqueeze(0),
+            v[key_start:key_end].unsqueeze(0),
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_k=max_seqlen_k,
+            softmax_scale=softmax_scale,
+            causal=False,
+            window_size=(None, None),
+            deterministic=deterministic,
+            mask_mod=mask_mod,
+            aux_tensors=aux_tensors,
+            return_lse=True,
+        )
+        compact_outputs.append(sequence_output.squeeze(0))
+        compact_lses.append(sequence_lse.squeeze(0))
+
+    compact_output = torch.cat(compact_outputs, dim=0)
+    softmax_lse = torch.cat(compact_lses, dim=-1)
     dense_output = compact_output.new_zeros(
         q.size(0), compact_output.size(1), compact_output.size(2))
     dense_output = torch.index_copy(

@@ -10,6 +10,7 @@ from torch import nn
 
 from flash_attn.cute import flash_attn_varlen_func
 
+import nnscaler.customized_ops.ring_attention.pruned_yoco_attn_varlen as pruned_yoco_attn
 from nnscaler.codegen.emit import FuncEmission
 from nnscaler.customized_ops.ring_attention.pruned_yoco_attn_varlen import (
     _PRUNED_YOCO_CAUSAL_MASK_CUTE_HASH,
@@ -52,6 +53,61 @@ def test_pruned_attention_masks_have_stable_precompile_cache_keys():
     assert _original_position_window_mask.__cute_hash__ == (
         _PRUNED_YOCO_WINDOW_MASK_CUTE_HASH
     )
+
+
+def test_pruned_attention_uses_fixed_calls_and_skips_empty_packed_sequence(
+    monkeypatch,
+):
+    calls = []
+
+    def fake_fixed_attention(q, k, v, **kwargs):
+        calls.append((q.shape, k.shape, tuple(kwargs)))
+        dependency = (k.reshape(-1)[0] + v.reshape(-1)[0]) * 0
+        output = q + dependency
+        lse = q.new_zeros(q.size(0), q.size(2), q.size(1)) + dependency
+        return output, lse
+
+    monkeypatch.setattr(
+        pruned_yoco_attn,
+        'flash_attn_cute_varlen_func',
+        fake_fixed_attention,
+    )
+    q = torch.randn(10, 4, 8, requires_grad=True)
+    k = torch.randn(10, 2, 8, requires_grad=True)
+    v = torch.randn(10, 2, 8, requires_grad=True)
+    query_mask = torch.tensor(
+        [False, False, False, False, False, True, False, True, False, False]
+    )
+    positions = torch.tensor(
+        [0, 1, 2, 3, 0, 1, 2, 3, 4, 5], dtype=torch.int32)
+    cu_seqlens = torch.tensor([0, 4, 10], dtype=torch.int32)
+
+    output, lse = wrap_pruned_yoco_attn_varlen_func(
+        q,
+        k,
+        v,
+        query_mask,
+        positions,
+        cu_seqlens,
+        cu_seqlens,
+        None,
+        enable_ring=False,
+        cp_size=1,
+        kv_is_gathered=True,
+    )
+
+    assert len(calls) == 1
+    q_shape, k_shape, kwarg_names = calls[0]
+    assert q_shape == (1, 2, 4, 8)
+    assert k_shape == (1, 6, 2, 8)
+    assert 'cu_seqlens_q' not in kwarg_names
+    assert 'cu_seqlens_k' not in kwarg_names
+    assert lse.shape == (4, 2)
+    assert torch.count_nonzero(output[~query_mask]) == 0
+    output.sum().backward()
+    assert q.grad is not None
+    assert k.grad is not None
+    assert v.grad is not None
 
 
 def test_pruned_attention_cp_group_survives_codegen():
