@@ -84,6 +84,79 @@ def wrap_maybe_unshuffle(
     return unshuffle_varlen(hidden_states, cu_seqlens, cp_ranks, local_process_group)
 
 
+def wrap_maybe_shuffle_with_query_metadata(
+    hidden_states: Tensor,
+    query_mask: Tensor,
+    query_positions: Tensor,
+    cu_seqlens: Tensor,
+    enable_ring: bool = True,
+    process_group: Tuple[int] = None,
+    cp_size: Optional[int] = None,
+    require_full_plan_sequence_partition: bool = False,
+):
+    """Move hidden state and pruning metadata to identical zigzag ownership."""
+    if cp_size is not None:
+        if not isinstance(cp_size, int) or isinstance(cp_size, bool) or cp_size < 1:
+            raise ValueError(f"cp_size must be a positive int or None, got {cp_size!r}")
+        if process_group is not None and len(process_group) != cp_size:
+            raise ValueError(
+                f"process_group size ({len(process_group)}) must match cp_size ({cp_size})")
+        if cp_size == 1:
+            enable_ring = False
+    if process_group is None or len(process_group) == 1 or not enable_ring:
+        return hidden_states, query_mask, query_positions
+    local_process_group = _resolve_local_process_group(process_group)
+    cp_ranks = _get_cp_ranks(local_process_group)
+    return (
+        shuffle_varlen(hidden_states, cu_seqlens, cp_ranks, local_process_group),
+        shuffle_varlen(query_mask, cu_seqlens, cp_ranks, local_process_group),
+        shuffle_varlen(query_positions, cu_seqlens, cp_ranks, local_process_group),
+    )
+
+
+def wrap_maybe_shuffle_with_query_and_mtp_metadata(
+    hidden_states: Tensor,
+    query_mask: Tensor,
+    query_positions: Tensor,
+    mtp_input_ids: Tensor,
+    mtp_query_masks: Tensor,
+    cu_seqlens: Tensor,
+    enable_ring: bool = True,
+    process_group: Tuple[int] = None,
+    cp_size: Optional[int] = None,
+    require_full_plan_sequence_partition: bool = False,
+):
+    """Shuffle every tensor needed by pruned cross and MTP execution."""
+    if cp_size is not None:
+        if not isinstance(cp_size, int) or isinstance(cp_size, bool) or cp_size < 1:
+            raise ValueError(f"cp_size must be a positive int or None, got {cp_size!r}")
+        if process_group is not None and len(process_group) != cp_size:
+            raise ValueError(
+                f"process_group size ({len(process_group)}) must match cp_size ({cp_size})")
+        if cp_size == 1:
+            enable_ring = False
+    if process_group is None or len(process_group) == 1 or not enable_ring:
+        return (
+            hidden_states,
+            query_mask,
+            query_positions,
+            mtp_input_ids,
+            mtp_query_masks,
+        )
+    local_process_group = _resolve_local_process_group(process_group)
+    cp_ranks = _get_cp_ranks(local_process_group)
+    return tuple(
+        shuffle_varlen(tensor, cu_seqlens, cp_ranks, local_process_group)
+        for tensor in (
+            hidden_states,
+            query_mask,
+            query_positions,
+            mtp_input_ids,
+            mtp_query_masks,
+        )
+    )
+
+
 def emit_ring(
     node: IRDimops,
     args: List[str],
@@ -186,6 +259,28 @@ def maybe_anno(hidden_states, cu_seqlens, *args, **kwargs) -> str:
     return "l h, e^ -> l h"
 
 
+def shuffle_with_query_metadata_anno(
+    hidden_states, query_mask, query_positions, cu_seqlens, *args, **kwargs,
+) -> str:
+    return "l h, l, l, e^ -> l h, l, l"
+
+
+def shuffle_with_query_and_mtp_metadata_anno(
+    hidden_states,
+    query_mask,
+    query_positions,
+    mtp_input_ids,
+    mtp_query_masks,
+    cu_seqlens,
+    *args,
+    **kwargs,
+) -> str:
+    return (
+        "l h, l, l, l m, l m, e^ -> "
+        "l h, l, l, l m, l m"
+    )
+
+
 def _profile_tensor(shape, dtype, device, requires_grad=False):
     if dtype.is_floating_point or dtype.is_complex:
         return torch.randn(
@@ -217,5 +312,52 @@ def input_gen_fn(node: IRDimops):
     )
 
 
+def query_metadata_input_gen_fn(node: IRDimops):
+    hidden_states = node.inputs()[0]
+    device = torch.cuda.current_device()
+    seqlen = hidden_states.shape[0]
+    return (
+        _profile_tensor(
+            hidden_states.shape,
+            hidden_states.dtype,
+            device,
+            hidden_states.requires_grad,
+        ),
+        torch.ones(seqlen, dtype=torch.bool, device=device),
+        torch.arange(seqlen, dtype=torch.int32, device=device),
+        torch.tensor([0, seqlen], dtype=torch.int32, device=device),
+    )
+
+
+def query_and_mtp_metadata_input_gen_fn(node: IRDimops):
+    hidden_states = node.inputs()[0]
+    mtp_depth = node.inputs()[3].shape[1]
+    device = torch.cuda.current_device()
+    seqlen = hidden_states.shape[0]
+    return (
+        _profile_tensor(
+            hidden_states.shape,
+            hidden_states.dtype,
+            device,
+            hidden_states.requires_grad,
+        ),
+        torch.ones(seqlen, dtype=torch.bool, device=device),
+        torch.arange(seqlen, dtype=torch.int32, device=device),
+        torch.zeros(seqlen, mtp_depth, dtype=torch.long, device=device),
+        torch.ones(seqlen, mtp_depth, dtype=torch.bool, device=device),
+        torch.tensor([0, seqlen], dtype=torch.int32, device=device),
+    )
+
+
 register_op(maybe_anno, emit_fn=emit_ring, input_gen_fn=input_gen_fn)(wrap_maybe_shuffle)
 register_op(maybe_anno, emit_fn=emit_ring, input_gen_fn=input_gen_fn)(wrap_maybe_unshuffle)
+register_op(
+    shuffle_with_query_metadata_anno,
+    emit_fn=emit_ring,
+    input_gen_fn=query_metadata_input_gen_fn,
+)(wrap_maybe_shuffle_with_query_metadata)
+register_op(
+    shuffle_with_query_and_mtp_metadata_anno,
+    emit_fn=emit_ring,
+    input_gen_fn=query_and_mtp_metadata_input_gen_fn,
+)(wrap_maybe_shuffle_with_query_and_mtp_metadata)

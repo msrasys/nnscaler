@@ -11,6 +11,12 @@ from .sliding_window_attn import wrap_sliding_window_attn_func
 
 from .zigzag_allgather_attn_varlen import wrap_zigzag_allgather_attn_varlen_func
 
-from .maybe_shuffle import wrap_maybe_shuffle, wrap_maybe_unshuffle
+from .maybe_shuffle import (
+    wrap_maybe_shuffle,
+    wrap_maybe_shuffle_with_query_and_mtp_metadata,
+    wrap_maybe_shuffle_with_query_metadata,
+    wrap_maybe_unshuffle,
+)
 
 from .yoco_kv import wrap_yoco_kv_allgather
+from .pruned_yoco_attn_varlen import wrap_pruned_yoco_attn_varlen_func
