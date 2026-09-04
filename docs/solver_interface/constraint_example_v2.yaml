@@ -1,0 +1,50 @@
+# V2 Constraint Example
+#
+# This file demonstrates the new unified constraint format for nnScaler's
+# autodist solver.  Pass it via:
+#
+#   ComputeConfig(pas_config={'constraints_path': 'constraint_example_v2.yaml'})
+#
+# or load programmatically:
+#
+#   from nnscaler.autodist.constraints import ConstraintSet
+#   cs = ConstraintSet.from_yaml_file('constraint_example_v2.yaml')
+
+partition_constraints:
+  # Pin attention layers 0-15 to TP on dimension (input_idx=0, dim_idx=2)
+  - module_class: "LlamaAttention"
+    layer_range: [0, 16]
+    allowed_dims: ["0,2"]
+
+  # Force MLP gate projections in layers 16-31 to replicate
+  - module_class: "LlamaMLP"
+    op_name: "torch.nn.functional.linear"
+    layer_range: [16, 32]
+    force_replicate: true
+
+  # Limit embedding TP degree to 2
+  - op_name: "torch.nn.functional.embedding"
+    max_partition_degree: 2
+
+  # Pin all layer-norm parameters to replicate
+  - param_name_pattern: ".*layer_norm.*"
+    force_replicate: true
+
+  # Forbid partitioning on a specific dimension for a custom op
+  - op_name: "my_custom_op"
+    forbidden_dims: ["1,0"]
+
+  # Assign a specific operator to pipeline stage 0
+  - op_name: "torch.nn.functional.embedding"
+    stage_id: 0
+
+  # Force recompute for decoder layers 8-24
+  - module_class: "LlamaDecoderLayer"
+    layer_range: [8, 24]
+    recompute: true
+
+scheduler_constraint:
+  allowed_schedulers: ["1f1b", "1f1b_plus"]
+  max_bubble_ratio: 0.15
+  max_stages: 4
+  min_microbatches: 8
