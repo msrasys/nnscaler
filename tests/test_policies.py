@@ -66,6 +66,35 @@ def test_autodist():
         assert m_new is None
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason='lack of gpu devices')
+def test_autodist_reuse_does_not_mutate_compute_config():
+    with tempfile.TemporaryDirectory() as tempdir:
+        compute_config = ComputeConfig(
+            1,
+            1,
+            use_end2end=True,
+            pas_config={
+                'update_freq': 1,
+                'parallel_profile': False,
+                'legacy': False,
+                'mem_constraint': 1,
+            },
+        )
+        expected_pas_config = compute_config.pas_config.copy()
+
+        for _ in range(2):
+            parallelize(
+                MLP(),
+                {'data': dummy_data()},
+                'autodist',
+                compute_config,
+                gen_savedir=tempdir,
+                reuse='match',
+                load_module=False,
+            )
+            assert compute_config.pas_config == expected_pas_config
+
+
 def test_call_name():
     assert get_called_self_module_name('self.up_proj(x)') == 'up_proj'
     assert get_called_self_module_name('self.act_fn(self.gate_proj(x))') == 'act_fn'

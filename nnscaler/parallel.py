@@ -1231,12 +1231,14 @@ def parallelize(
             if not reusable:
                 config_file = outdir / ParallelModule.COMPUTE_CONFIG_FILE
                 ComputeConfig.safe_dump_to_file(compute_config, config_file)  # always refresh compute config
-                with _compile_flags(compute_config):
+                # Deep copy the compute config to avoid modifying the original one during code generation.
+                gencode_compute_config = copy.deepcopy(compute_config)
+                with _compile_flags(gencode_compute_config):
                     regen_status = _gencode(
                         module_or_module_class,
                         dummy_forward_args,
                         pas_policy,
-                        compute_config,
+                        gencode_compute_config,
                         outdir,
                         module_dtype=module_dtype,
                         module_fn=module_fn,
