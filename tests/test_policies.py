@@ -48,16 +48,17 @@ def dummy_data(device=None):
     }
 
 
-@pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.device_count() < 4, reason='lack of gpu devices')
+@replace_all_device_with('cpu')
 def test_autodist():
     with tempfile.TemporaryDirectory() as tempdir:
         m_new = parallelize(
             MLP(),
-            {'data': dummy_data(torch.cuda.current_device())},
+            {'data': dummy_data()},
             'autodist',
             ComputeConfig(2, 4, pas_config={
                     'update_freq': 1,
                     'task_name': 'test_autodist',
+                    'parallel_profile': False,
                     'mem_constraint': 1,
             }),
             gen_savedir=tempdir,
