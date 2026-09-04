@@ -201,7 +201,8 @@ class MixedPrecisionAdam(MixedPrecisionF16OptimizerMixin, torch.optim.Adam):
         self.f16_params, unfolded_kwargs = self._unfold_params(params)
         self.fp32_params = self.build_fp32_params(self.f16_params)
         kwargs = {**unfolded_kwargs, **kwargs}
-        super().__init__(self.fp32_params, **kwargs)
+        opt_params = self.fp32_params if self.fp32_params else [{'params': []}]
+        super().__init__(opt_params, **kwargs)
 
 
 class MixedPrecisionAdamW(MixedPrecisionF16OptimizerMixin, torch.optim.AdamW):
@@ -209,4 +210,5 @@ class MixedPrecisionAdamW(MixedPrecisionF16OptimizerMixin, torch.optim.AdamW):
         self.f16_params, unfolded_kwargs = self._unfold_params(params)
         self.fp32_params = self.build_fp32_params(self.f16_params)
         kwargs = {**unfolded_kwargs, **kwargs}
-        super().__init__(self.fp32_params, **kwargs)
+        opt_params = self.fp32_params if self.fp32_params else [{'params': []}]
+        super().__init__(opt_params, **kwargs)
