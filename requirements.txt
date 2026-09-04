@@ -1,7 +1,7 @@
 dill
 matplotlib
 more-itertools
-numpy>=1.23.0
+numpy>=1.23.5
 psutil
 pulp
 pybind11<3.0.0
