@@ -70,7 +70,7 @@ def test_follow_rope():
                                dummy_input,
                                attr_savedir=tempdir,
                                constant_folding=True)
-        '''
+        r'''
         the computation graph is as follows:
         q_proj      fullslice                    fullslice                          k_proj
           |            |                            |                                |
@@ -188,7 +188,7 @@ def test_follow_attention():
                                attr_savedir=tempdir,
                                constant_folding=True)
         print(ir_graph.nodes())
-        '''
+        _graph_description = r'''
         the computation graph is as follows:
         2linear    3linear    4linear
            |         |         |

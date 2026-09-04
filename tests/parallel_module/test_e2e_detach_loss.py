@@ -105,7 +105,7 @@ def worker_pipeline_2x2(model_cls):
             )
 
         if pm.rank in [2, 3]:
-            assert len(_gencode_contains(tempdir, model_cls, pm.rank, 'detach\(\)')) == 4
+            assert len(_gencode_contains(tempdir, model_cls, pm.rank, r'detach\(\)')) == 4
 
         samples = [torch.randn([2048, 4096], dtype=torch.float32, device=torch.cuda.current_device()) for _ in range(4)]
         ret = pm.train_step(samples)
@@ -171,7 +171,7 @@ def worker_pipeline_2(model_cls):
         pm.to(torch.cuda.current_device())
 
         if pm.rank == 1:
-            assert len(_gencode_contains(tempdir, model_cls, pm.rank, 'detach\(\)')) == 4
+            assert len(_gencode_contains(tempdir, model_cls, pm.rank, r'detach\(\)')) == 4
         samples = [torch.randn([2048, 4096], dtype=torch.float32, device=torch.cuda.current_device()) for _ in range(4)]
         ret = pm.train_step(samples)
         mem0 = get_mem()

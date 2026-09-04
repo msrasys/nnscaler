@@ -1040,7 +1040,7 @@ class CubeModule(torch.nn.Module):
             raise ValueError(f'nnscaler does not support passing dtype {dtype} to to()')
         if convert_to_format is not None:
             raise ValueError(f'nnscaler does not support passing convert_to_format {convert_to_format} to to()')
-        if non_blocking is not None:
+        if non_blocking:
             warnings.warn(f'nnscaler moves tensors in a blocking approach currently')
 
         # after _parse_to `device` must in type of torch.device
