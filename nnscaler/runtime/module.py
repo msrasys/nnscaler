@@ -387,14 +387,26 @@ class CubeModule(torch.nn.Module):
             npartitions += 1
         if npartitions == 0:
             raise RuntimeError(f"Cannot find file {filename}.0 in load_attr_content")
+
+        index_filename = filename + '.index'
+        required_chunks = None
+        if os.path.isfile(index_filename):
+            tid_to_chunk: Dict[int, int] = torch.load(index_filename)
+            required_chunks = {
+                tid_to_chunk[meta.tid] for meta in self._fullmap.values()
+            }
+
         with torch.no_grad():
             _logger.info(f'loading partitioned model from {filename}, number of model parameter chunks: {npartitions}')
-            attr_names = set(self._fullmap.keys())
+            attr_names = set(self._fullmap)
             for file_idx in range(npartitions):
+                if required_chunks is not None and file_idx not in required_chunks:
+                    continue
                 # part_model contains a subset of attributes, where each attribute is a fulltensor
                 # fulltensor.tid -> torch.Tensor
-                part_model: Dict[int, torch.Tensor] = torch.load(filename + f'.{file_idx}')
-                loaded_name = set()
+                part_model: Dict[int, torch.Tensor] = torch.load(
+                    filename + f'.{file_idx}', weights_only=True)
+                loaded_names = set()
                 for attr_name in attr_names:
                     meta = self._fullmap[attr_name]
                     if meta.tid not in part_model:
@@ -404,10 +416,9 @@ class CubeModule(torch.nn.Module):
                     if meta.val_chunks != 1:
                         content = content / meta.val_chunks
                     attr.copy_(content)
-                    loaded_name.add(attr_name)
-                for name in loaded_name:
-                    attr_names.remove(name)
-            if len(attr_names) != 0:
+                    loaded_names.add(attr_name)
+                attr_names.difference_update(loaded_names)
+            if attr_names:
                 raise RuntimeError(
                     f'remaining graph parameters / buffers cannot find in model files: {list(attr_names)}')
 
