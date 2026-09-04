@@ -56,14 +56,16 @@ class AutocastInfo:
         if torch.__version__ >= (2, 4, 0):
             cpu_enabled = torch.is_autocast_enabled('cpu')
             cpu_dtype = torch.get_autocast_dtype('cpu')
+            cuda_enabled = torch.is_autocast_enabled('cuda')
             cuda_dtype = torch.get_autocast_dtype('cuda')
         else:
             # PyTorch 2.0-2.3 requires the legacy per-device APIs.
             cpu_enabled = torch.is_autocast_cpu_enabled()
             cpu_dtype = torch.get_autocast_cpu_dtype()
+            cuda_enabled = torch.is_autocast_enabled()
             cuda_dtype = torch.get_autocast_gpu_dtype()
         return cls(torch.autocast_decrement_nesting(),  torch.is_autocast_cache_enabled(),
-                   cpu_enabled, cpu_dtype, torch.is_autocast_enabled(), cuda_dtype)
+                   cpu_enabled, cpu_dtype, cuda_enabled, cuda_dtype)
 
 
 @dataclass
