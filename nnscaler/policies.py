@@ -389,7 +389,8 @@ class OpPlan:
     OpPlan represents the distributed plan for an operator.
     """
     op: IRFwOperation
-    recompute_id: int = -1  # -1 means no recompute
+    recompute_id: int = -1   # -1 means no recompute
+    offload_id: int = -1     # -1 means no saved-tensor CPU offload
     stage_id: int = -1       # pipeline stage id, -1 means following the previous op's stage
 
     # user defined meta data for hooks
@@ -431,6 +432,16 @@ class OpPlan:
     partitions: List[OpPartition | None] = field(default_factory=list)  # multiple partition plans
 
     def __post_init__(self):
+        if self.recompute_id < -1:
+            raise ValueError("recompute_id must be -1 or non-negative")
+        if self.offload_id < -1:
+            raise ValueError("offload_id must be -1 or non-negative")
+        if self.stage_id < -1:
+            raise ValueError("stage_id must be -1 or non-negative")
+
+        if self.recompute_id >= 0 and self.offload_id >= 0:
+            raise ValueError("recompute_id and offload_id cannot both be set for the same operator")
+
         if self.partition is not None and len(self.partitions) > 0:
             raise ValueError("Only one of partition and partitions can be set")
 
@@ -794,6 +805,7 @@ def _duplicate_dataloader_index_ops_per_stage(graph: IRGraph, op_plans: dict) ->
         copy_node._device = ()
         copy_node._mirror = None
         copy_node.recompute = None
+        copy_node.offload = None
         copy_node.comment = 'fn: clone dataloader index op in consumer stage'
 
         # rewire inputs: recurse into sinkable inputs, keep dataloader/constant inputs
@@ -935,6 +947,9 @@ def fn(
     recompute_groups: dict[int, list[IRFwOperation]] = {}
     recompute_last_id: int = -1
     recompute_group_stages: dict[int, int] = {}
+    offload_groups: dict[int, list[IRFwOperation]] = {}
+    offload_last_id: int = -1
+    offload_group_stages: dict[int, int] = {}
 
     pp_stages: list[list[IRFwOperation]] = [[]]
     pp_cur_stage_id = 0
@@ -1109,6 +1124,20 @@ def fn(
 
         recompute_last_id = op_plan.recompute_id
 
+        if op_plan.offload_id != -1:
+            if op_plan.offload_id in offload_group_stages:
+                if offload_group_stages[op_plan.offload_id] != op_plan.stage_id:
+                    raise ValueError("All ops in an offload group must be in the same stage")
+            else:
+                offload_group_stages[op_plan.offload_id] = op_plan.stage_id
+
+            if op_plan.offload_id != offload_last_id and op_plan.offload_id in offload_groups:
+                raise ValueError("Nodes in an offload group must be continuous.")
+
+            offload_groups.setdefault(op_plan.offload_id, []).append(op_plan.op)
+
+        offload_last_id = op_plan.offload_id
+
         # update pipeline stages
         if op_plan.stage_id == pp_cur_stage_id:
             pp_stages[pp_cur_stage_id].append(op_plan.op)
@@ -1153,6 +1182,9 @@ def fn(
         if len(group) <= 1:
             continue
         graph.recompute(group)
+
+    for group in offload_groups.values():
+        graph.offload(group)
 
     # add multiref for shared parameters across stages
     # note that we have constrained that shared parameters cannot be partitioned in SPMDSolver, other input tensors

@@ -895,30 +895,44 @@ class ModuleCodeGen(FuncEmission):
         ]
         ```
 
-        Nodes in the segment will group into recompute region
+        Nodes in the segment will group into recompute and CPU-offload regions.
 
         The fields storing intermediate codes that are populated by this method:
         - NONE
         """
         nodes : List[IRCell] = segment.nodes()
         lifetime = LifeCycle(nodes, segment.inputs(), segment.outputs())
-        rc_groups: List[List[IRCell]] = list(
-            more_itertools.split_when(nodes, lambda prev, curr: prev.recompute != curr.recompute))
+        groups: List[List[IRCell]] = list(more_itertools.split_when(
+            nodes,
+            lambda prev, curr: (
+                prev.recompute != curr.recompute or prev.offload != curr.offload
+            ),
+        ))
 
         codes: List[str] = []
-        for rc_group in rc_groups:
-            assert len(rc_group) > 0
-            gid: Optional[int] = rc_group[0].recompute
+        for group in groups:
+            assert len(group) > 0
+            gid: Optional[int] = group[0].recompute
+            offload_gid: Optional[int] = group[0].offload
+            assert gid is None or offload_gid is None, f"Recompute and offload cannot be enabled at the same time: {group}"
+
+            group_codes: List[str] = []
             if gid is None:
-                codes += self._emit_nodes(rc_group, lifetime, runtime_devid)
+                group_codes += self._emit_nodes(group, lifetime, runtime_devid)
+                if offload_gid is None:
+                    codes += group_codes
+                else:
+                    with Block('with self.cpu_offloading_hooks():') as offload_block:
+                        offload_block.insert_body(group_codes)
+                    codes += [''] + offload_block.code + ['']
             else:
                 # get recompute excution code
-                rc_segment = segment.create_segment(rc_group)
-                rc_codes = self._emit_recompute(rc_group,
+                rc_segment = segment.create_segment(group)
+                rc_codes = self._emit_recompute(group,
                     rc_segment.inputs(), rc_segment.outputs(), lifetime, runtime_devid)
                 codes += rc_codes
                 # release input tensors after exiting a RC group:
-                last_node = rc_group[-1]
+                last_node = group[-1]
                 line = lifetime.get_line(last_node)
                 if last_node != nodes[-1]: # skip if it is the last node
                     inputs_to_rel = [t for t in rc_segment.inputs() if lifetime.releasable_after_line(t, line)]
