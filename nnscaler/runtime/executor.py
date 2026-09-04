@@ -6,10 +6,12 @@ Executor for runtime
 """
 import atexit
 
+from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Tuple, Any, Callable, List, Dict, Iterable, Optional, Union, Iterator
+from typing import Tuple, Any, Callable, List, Dict, Iterable, Optional, Union, Generator, Set, TypedDict
 import torch
 import logging
+from torch.autograd.graph import Node
 from torch.distributed import Work
 
 from ._patch_torch import stage_backward_input, stage_backward_weight
@@ -112,9 +114,27 @@ def AsyncCommHandler() -> _AsyncCommHandler:
 TensorPairs = List[Tuple[int, torch.Tensor]]
 
 
+class _FBWParamGroupRequired(TypedDict):
+    params: Set[Node]
+    intermediates: Union[Set[Node], List[Node]]
+
+
+class FBWParamGroup(_FBWParamGroupRequired, total=False):
+    """Mutable graph-boundary state shared by B and W.
+
+    Graph analysis creates the required ``params`` and ``intermediates`` keys,
+    with intermediates initially stored as a set. B normalizes that set to a
+    list, then its Node pre-hooks lazily add ``grads``. Each list slot matches
+    one intermediate; each tuple slot matches that Node's output index. Slots
+    remain ``None`` until the corresponding pre-hook runs.
+    """
+
+    grads: List[Optional[Tuple[Optional[torch.Tensor], ...]]]
+
+
 @dataclass
 class _WeightBackwardState:
-    param_groups: Optional[List[Dict[str, Any]]] = None
+    param_groups: Optional[List[FBWParamGroup]] = None
     output_tensors: Optional[Tuple[torch.Tensor, ...]] = None
     output_tensor_grads: Optional[Tuple[Optional[torch.Tensor], ...]] = None
 
@@ -278,6 +298,8 @@ class Executor:
                 )
 
         if len(output_tensors) == 0:
+            # Even without output tensors (an uncommon case), record a paired
+            # no-op state for the matching backward_weight call to consume.
             Executor._weight_backward_states.setdefault(name, []).append(
                 _WeightBackwardState(param_groups=[])
             )
@@ -419,6 +441,32 @@ backward = Executor.backward
 backward_input = Executor.backward_input
 backward_weight = Executor.backward_weight
 sync_tensors = Executor.sync_tensors
+
+
+@contextmanager
+def custom_fbw(
+    backward_input_fn: Callable,
+    backward_weight_fn: Callable,
+) -> Generator[None, None, None]:
+    """Temporarily replace the FBW functions used by generated schedules.
+
+    Schedule code resolves the module-level ``backward_input`` and
+    ``backward_weight`` attributes at runtime. Replacements must keep the same
+    call signatures as the corresponding :class:`Executor` methods.
+    """
+    if not callable(backward_input_fn) or not callable(backward_weight_fn):
+        raise TypeError("backward_input_fn and backward_weight_fn must be callable")
+
+    global backward_input, backward_weight
+    previous_backward_input = backward_input
+    previous_backward_weight = backward_weight
+    backward_input = backward_input_fn
+    backward_weight = backward_weight_fn
+    try:
+        yield
+    finally:
+        backward_input = previous_backward_input
+        backward_weight = previous_backward_weight
 
 
 # register checking for normal exit
