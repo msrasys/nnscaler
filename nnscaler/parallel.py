@@ -697,7 +697,6 @@ def _prepare_and_check_reusable(
     is_graph_config_match = old_config is not None and old_config.graph_config == compute_config.graph_config
     trace_meta_files = [
         outdir / FxModuleParser.ATTR_CONTENT_FILE_0,  # just check the first is good enough
-        outdir / FxModuleParser.ATTR_CONTENT_INDEX_FILE,
         outdir / FxModuleParser.ATTR_MAP_FILE,
     ]
 
@@ -713,6 +712,9 @@ def _prepare_and_check_reusable(
         expected_output_files.append(outdir / _FORWARD_ARGS_DUMP_FILE)
         expected_output_files.append(outdir / ParallelModule.ORIGIN_MODULE_METADATA_FILE)
         expected_output_files.append(outdir / FxModuleParser.NON_PERSISTENT_BUFFER_FILE)
+        index_file = outdir / FxModuleParser.ATTR_CONTENT_INDEX_FILE
+        if index_file.exists():
+            expected_output_files.append(index_file)
 
         existing_attr_map_files = set(outdir.glob(f'{ParallelModule.ATTR_META_FILE_PREFIX}*.pkl'))
 

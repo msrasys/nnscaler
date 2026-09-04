@@ -382,32 +382,26 @@ class CubeModule(torch.nn.Module):
             filename (str): base file name (without '.0', '.1', etc.)
                 that saved with model parameters
         """
+        npartitions = 0
+        while os.path.isfile(filename + f'.{npartitions}'):
+            npartitions += 1
+        if npartitions == 0:
+            raise RuntimeError(f"Cannot find file {filename}.0 in load_attr_content")
+
         index_filename = filename + '.index'
-        if not os.path.isfile(index_filename):
-            raise RuntimeError(
-                f"Cannot find attribute content index {index_filename}; "
-                "regenerate the generated model files with this nnScaler version"
-            )
-        tid_to_chunk: Dict[int, int] = torch.load(index_filename, weights_only=True)
-        if not isinstance(tid_to_chunk, dict):
-            raise RuntimeError(f"Invalid attribute content index {index_filename}")
+        required_chunks = None
+        if os.path.isfile(index_filename):
+            tid_to_chunk: Dict[int, int] = torch.load(index_filename)
+            required_chunks = {
+                tid_to_chunk[meta.tid] for meta in self._fullmap.values()
+            }
 
         with torch.no_grad():
-            try:
-                required_chunks = {
-                    tid_to_chunk[meta.tid] for meta in self._fullmap.values()
-                }
-            except KeyError as exc:
-                raise RuntimeError(
-                    f'attribute content index {index_filename} is missing tensor ID {exc.args[0]}'
-                ) from exc
-
-            _logger.info(
-                f'loading partitioned model from {filename}, '
-                f'chunks required by this rank: {len(required_chunks)}'
-            )
+            _logger.info(f'loading partitioned model from {filename}, number of model parameter chunks: {npartitions}')
             attr_names = set(self._fullmap)
-            for file_idx in sorted(required_chunks):
+            for file_idx in range(npartitions):
+                if required_chunks is not None and file_idx not in required_chunks:
+                    continue
                 # part_model contains a subset of attributes, where each attribute is a fulltensor
                 # fulltensor.tid -> torch.Tensor
                 part_model: Dict[int, torch.Tensor] = torch.load(
