@@ -14,13 +14,26 @@ Basic Usage
 .. code-block:: python
 
     from nnscaler.autodist.autodist_config import AutoDistConfig
-    
+
     # Basic configuration
     config = AutoDistConfig(
         task_name='my_experiment',
         memory_constraint=32,  # 32GB memory limit
         recompute_modules='transformer.layer'  # Recompute transformer layers
     )
+
+Execution Modes
+---------------
+
+AutoDist supports two ways to apply a searched or loaded plan:
+
+- ``legacy=True`` (default) applies the plan directly to the IR graph. This preserves the original AutoDist behavior.
+- ``legacy=False`` converts the plan to ``OpPlan`` objects and lets ``nnscaler.policies.fn`` perform graph staging,
+  partitioning, device assignment, and scheduling. Pipeline plans in this mode use the same tensor-parallel degree
+  for every stage.
+
+When AutoDist is selected through ``ComputeConfig(pas_config=...)``, set ``legacy`` in ``pas_config``. The default
+remains ``True`` for backward compatibility.
 
 Configuration Parameters
 ------------------------
@@ -32,8 +45,12 @@ Task Configuration
     The name of the current task to distinguish different runs. Used for naming saved plans and logs.
 
     .. code-block:: python
-    
+
         config = AutoDistConfig(task_name='bert_large_training')
+
+**legacy** (*bool*, optional, default: ``True``)
+    Whether to use the original graph-rewriting implementation. Set this to ``False`` to return ``OpPlan`` objects
+    for the general ``fn`` policy implementation.
 
 Memory Management
 ~~~~~~~~~~~~~~~~~
@@ -45,7 +62,7 @@ Memory Management
     The memory constraint for each device in GB. AutoDist will ensure that the parallelization plan fits within this memory limit.
 
     .. code-block:: python
-    
+
         config = AutoDistConfig(memory_constraint=80)  # 80GB A100
 
 **memory_granularity** (*int*, optional, default: ``1``)
@@ -53,7 +70,7 @@ Memory Management
 
 **transient_mem_coef** (*float*, optional, default: ``2``)
     Coefficient for estimating transient memory size. Formula: ``transient_mem_size = transient_mem_coef * (1st_largest_infer_mem + 2nd_largest_infer_mem)``.
-    
+
     Reduce this value if operators consume/generate very large tensors (≥4GB).
 
 Optimizer Configuration
@@ -61,18 +78,18 @@ Optimizer Configuration
 
 **opt_resident_coef** (*int*, optional, default: ``2``)
     Coefficient for optimizer resident state compared to model weight size.
-    
+
     Common cases:
-    
+
     - FP32 training with Adam: ``2`` (FP32 momentum1 + FP32 momentum2)
     - FP16/BF16 training with Adam: ``6`` (FP32 momentum1 + FP32 momentum2 + FP32 weight)
     - FP16/BF16 training with memory-efficient Adam: ``4`` (FP32 momentum1 + FP32 momentum2)
 
 **opt_transient_coef** (*int*, optional, default: ``0``)
     Coefficient for optimizer transient state compared to model weight size.
-    
+
     Common cases:
-    
+
     - FP32 training with Adam: ``0``
     - FP16/BF16 training with Adam without internal cast: ``2`` (FP32 gradient)
     - FP16/BF16 training with memory-efficient Adam without internal cast: ``4`` (FP32 weight + FP32 gradient)
@@ -82,20 +99,20 @@ Recomputation
 
 **recompute_modules** (*str*, optional, default: ``''``)
     Module names to recompute, separated by commas. Recomputation trades computation for memory by not storing intermediate activations during forward pass and recomputing them during backward pass. Note that recomputation still requires storing some tensors for gradient computation, so the memory savings depend on the specific model structure and recomputation granularity.
-    
+
     Examples:
-    
+
     .. code-block:: python
-    
+
         # Recompute specific modules
         config = AutoDistConfig(recompute_modules='transformer.layer,attention')
-        
+
         # Recompute entire model
         config = AutoDistConfig(recompute_modules='ROOT')
-        
+
         # Recompute multiple specific modules
         config = AutoDistConfig(recompute_modules='encoder.layer,decoder.layer')
-    
+
     **Note**: Module names can be any suffix of the full module name. For example, ``layer`` will match ``transformer.layer``, ``encoder.layer``, etc. ``ROOT`` recomputes the entire model but may not always provide maximum memory savings due to the need to store intermediate tensors for backward pass.
 
 ZeRO Optimization
@@ -103,9 +120,12 @@ ZeRO Optimization
 
 **zero_stage** (*int*, optional, default: ``0``)
     ZeRO optimization stage (see `ZeRO paper <https://arxiv.org/abs/1910.02054>`_).
-    
+
     - ``0``: No ZeRO optimization
     - ``1``: Optimizer state partitioning
+
+    AutoDist does not model ZeRO-3. When using AutoDist through ``ComputeConfig``, ``use_zero`` must therefore be
+    ``0`` or ``1``.
 
 **zero_ngroups** (*int*, optional, default: ``1``)
     Number of ZeRO groups to balance memory usage and communication cost. Larger values use more memory but reduce communication overhead.
@@ -115,16 +135,19 @@ Pipeline Parallelism
 
 **pipeline_pivots** (*str*, optional, default: ``''``)
     Module names that serve as pipeline stage boundaries, separated by commas.
-    
+
     .. code-block:: python
-    
+
         config = AutoDistConfig(pipeline_pivots='encoder,decoder')
 
 **pipeline_nstages** (*int* or *'auto'*, optional, default: ``'auto'``)
     Number of pipeline stages. Set to ``1`` to disable pipeline parallelism.
-    
+
     - ``'auto'``: Automatically determine optimal number of stages
     - ``int``: Fixed number of stages
+
+    Pipeline inference is currently unsupported by the AutoDist PAS policy. In inference mode, ``'auto'`` is reduced
+    to one stage, and an explicit value greater than one is rejected.
 
 **pipeline_scheduler** (*str*, optional, default: ``'1f1b'``)
     Pipeline scheduling strategy. Currently only supports ``'1f1b'`` (1-forward-1-backward).
@@ -151,7 +174,12 @@ Mesh and Parallelism
     Micro batch size for gradient accumulation.
 
 **update_freq** (*int*, optional, default: ``1``)
-    Update frequency. The effective batch size is micro_batch_size × update_freq.
+    Update frequency. The effective batch size is micro_batch_size × update_freq. AutoDist supports one positive
+    update frequency per compiled model. When using the Trainer, a step-dependent configuration is accepted only if
+    all entries resolve to the same value.
+
+    In ``legacy=False`` mode this value is also used as ``pipeline_nmicros`` by ``fn``. ``pipeline_nmicros`` is
+    derived internally and is not a separate AutoDist configuration option.
 
 Profiling and Search
 ~~~~~~~~~~~~~~~~~~~~
@@ -170,7 +198,7 @@ Profiling and Search
 
 **solver** (*str*, optional, default: ``'dp'``)
     Solver algorithm for SPMD parallelism:
-    
+
     - ``'dp'``: Dynamic programming
     - ``'ilp'``: Integer linear programming
 
@@ -187,7 +215,7 @@ Plan Management
     Path to save the generated parallelization plan for reuse.
 
 **partition_constraints_path** (*str*, optional, default: ``''``)
-    Path to partition constraints file. See :doc:`solver_interface/partition_constraints` for details.
+    Path to partition constraints file. See :doc:`solver_interface/partition_constraint` for details.
 
 Training Configuration
 ~~~~~~~~~~~~~~~~~~~~~~
@@ -225,7 +253,7 @@ High Memory Training
     )
 
 Pipeline Parallelism
-~~~~~~~~~~~~~~~~~~~
+~~~~~~~~~~~~~~~~~~~~
 
 .. code-block:: python
 
@@ -263,7 +291,7 @@ Best Practices
 
 1. **Start Simple**: Begin with default settings and gradually tune parameters based on your needs.
 
-2. **Memory Tuning**: 
+2. **Memory Tuning**:
    - Consider ``recompute_modules`` for memory savings, but note that more aggressive recomputation (like ``'ROOT'``) doesn't always provide maximum memory savings
    - Adjust ``memory_constraint`` based on your hardware
    - Fine-tune optimizer coefficients based on your training setup
@@ -289,7 +317,7 @@ Troubleshooting
 **Out of Memory Errors**
     - Reduce ``memory_constraint``
     - Experiment with different ``recompute_modules`` strategies (selective recomputation may be more effective than ``'ROOT'``)
-    - Increase ``zero_ngroups`` or enable higher ZeRO stages
+    - Enable ZeRO stage 1 or tune ``zero_ngroups``
     - Reduce ``transient_mem_coef``
 
 **Slow Plan Generation**

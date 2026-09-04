@@ -229,16 +229,31 @@ def pas_hybrid(graph: IRGraph, cfg: 'ComputeConfig'):
     return graph
 
 
-def pas_autodist(graph: IRGraph, cfg: 'ComputeConfig') -> IRGraph:
+def pas_autodist(graph: IRGraph, cfg: 'ComputeConfig') -> Union[IRGraph, Iterable['OpPlan']]:
     from nnscaler.autodist.util import get_default_profile_path
 
     pas_cfg = cfg.pas_config
 
-    update_freq = pas_cfg.get('update_freq', 1)
-    if isinstance(update_freq, dict):
-        update_freq = update_freq[min(update_freq)]
-    elif isinstance(update_freq, (tuple, list)):
-        update_freq = update_freq[0]
+    update_freq_config = pas_cfg.get('update_freq', 1)
+    if isinstance(update_freq_config, dict):
+        update_freqs = update_freq_config.values()
+    elif isinstance(update_freq_config, (tuple, list)):
+        update_freqs = update_freq_config
+    else:
+        update_freqs = [update_freq_config]
+
+    if not all(isinstance(freq, int) or (isinstance(freq, str) and freq.isdigit()) for freq in update_freqs):
+        raise ValueError(f'update_freq must be int, but got {update_freq_config}')
+
+    update_freqs = set(int(freq) for freq in update_freqs)
+
+    if len(update_freqs) != 1:
+        raise ValueError(
+            f'autodist only supports a single update_freq, but got {update_freq_config}'
+        )
+    update_freq = update_freqs.pop()
+    if update_freq <= 0:
+        raise ValueError(f'update_freq must be positive, but got {update_freq}')
 
     # optional parameters
 
@@ -249,19 +264,26 @@ def pas_autodist(graph: IRGraph, cfg: 'ComputeConfig') -> IRGraph:
     pipeline_nstages = pas_cfg.get('pipeline_nstages', 'auto')
 
     if pipeline_nstages == 'auto':
+        if cfg.inference_only:
+            # Currently we don't support pipeline, so disable pipeline for inference.
+            pipeline_nstages = 1
         if not pas_cfg.get('pipeline_pivots'):
             pipeline_nstages = 1
         if not cfg.use_end2end or cfg.use_async_reducer:
             pipeline_nstages = 1
     elif pipeline_nstages > 1:
+        if cfg.inference_only:
+            raise ValueError("pipeline_nstages > 1 is not supported for inference")
         # the user manually enabled pipeline, should not disable, so raise
         if not pas_cfg.get('pipeline_pivots'):
             raise ValueError("pipeline_pivots must be set to enable pipeline")
         if not cfg.use_end2end:
-            raise ValueError("explore_pipeline cannot be enabled if use_end2end is False")
+            raise ValueError("pipeline cannot be enabled if use_end2end is False")
         if cfg.use_async_reducer:
-            raise ValueError("explore_pipeline cannot be enabled if use_async_reducer is True")
+            raise ValueError("pipeline cannot be enabled if use_async_reducer is True")
     else:
+        if pipeline_nstages != 1:
+            raise ValueError(f"pipeline_nstages must be 1 or 'auto' or >1, but got {pipeline_nstages}")
         if pas_cfg.get('pipeline_pivots'):
             raise ValueError("pipeline_pivots must not be set because pipeline is disabled by pipeline_nstages<=1")
 
@@ -299,6 +321,7 @@ def pas_autodist(graph: IRGraph, cfg: 'ComputeConfig') -> IRGraph:
     transient_mem_coef = pas_cfg.get('transient_mem_coef', 2)
     disable_shared_param_constraint = pas_cfg.get('disable_shared_param_constraint', False)
     solver = pas_cfg.get('solver', 'dp')
+    legacy = pas_cfg.get('legacy', True)
 
     task_name = f'{task_name}_{cfg.plan_ngpus}gpus_{update_freq}update_freq'
     if memory_constraint == -1:
@@ -306,6 +329,8 @@ def pas_autodist(graph: IRGraph, cfg: 'ComputeConfig') -> IRGraph:
         memory_constraint = int(0.8 * torch.cuda.mem_get_info()[1] / 1024 /
                                 1024 / 1024)
     if cfg.use_zero:
+        if cfg.use_zero > 1:
+            raise ValueError(f"autodist only supports zero_stage 1, but got {cfg.use_zero}")
         zero_stage = 1
         zero_ngroups = cfg.zero_ngroups
     else:
@@ -369,9 +394,12 @@ def pas_autodist(graph: IRGraph, cfg: 'ComputeConfig') -> IRGraph:
         transient_mem_coef=transient_mem_coef,
         disable_shared_param_constraint=disable_shared_param_constraint,
         solver=solver,
+        legacy=legacy,
     )
 
-    return parallelize_graph(graph, autodist_cfg)
+    result = parallelize_graph(graph, autodist_cfg)
+    pas_cfg['pipeline_nmicros'] = update_freq
+    return result
 
 
 @dataclass(unsafe_hash=True, frozen=True)

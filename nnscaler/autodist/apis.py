@@ -7,7 +7,7 @@ import logging
 import re
 from collections import defaultdict
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, Iterable, List, TYPE_CHECKING, Union
 
 from nnscaler.graph import IRGraph
 from nnscaler.graph.function import IRDimops
@@ -25,6 +25,9 @@ from .model_graph import ModelGraph, estimate_mem_lower_bound
 from .pipeline_solver import calc_optimal_pp_plan
 from .spmd_solver import analysis_pretty_printer, calc_optimal_spmd_plan
 from .util import partition_node, replica
+
+if TYPE_CHECKING:
+    from nnscaler.policies import OpPlan
 
 _logger = logging.getLogger(__name__)
 
@@ -99,7 +102,11 @@ def calc_parallel_plan(graph: IRGraph,
     ]
 
     if autodist_config.pipeline_enabled:
-        pp_out = calc_optimal_pp_plan(autodist_graph, autodist_config)
+        pp_out = calc_optimal_pp_plan(
+            autodist_graph,
+            autodist_config,
+            uniform_tp=not autodist_config.legacy,
+        )
     else:
         pp_out = calc_optimal_spmd_plan(autodist_graph, autodist_config)
     pp_out.desc.recompute_groups = recompute_groups
@@ -129,12 +136,43 @@ def _write_plan_json(plan_json, f):
     f.write(text)
 
 
-def parallelize_graph(graph: IRGraph,
-                      autodist_config: AutoDistConfig) -> IRGraph:
+def parallelize_graph(
+    graph: IRGraph,
+    autodist_config: AutoDistConfig,
+) -> Union[IRGraph, Iterable['OpPlan']]:
+    """Apply AutoDist using either the legacy or ``policies.fn`` path.
+
+    With ``autodist_config.legacy=True``, this function transforms and returns
+    the graph directly. Otherwise, it returns ``OpPlan`` objects; graph staging,
+    partitioning, device assignment, and scheduling are handled by ``policies.fn``.
+
+    The ``OpPlan`` path supports only plans where every pipeline stage
+    uses the same number of devices. Each operator must be either replicated or
+    partitioned along one input dimension using all devices in its stage.
+
+    Args:
+        graph: The unsegmented IR graph to plan.
+        autodist_config: Configuration used to search for or load an AutoDist plan.
+
+    Returns:
+        The transformed graph in legacy mode, otherwise operator plans describing
+        stage placement, recomputation, and partitioning.
+    """
     segments: List[IRSegment] = graph.select(ntype=IRSegment)
     if segments:
         raise RuntimeError('assume there is no segment in the graph')
 
+    search_out = _load_or_calc_parallel_plan(graph, autodist_config)
+    _logger.info(f'use plan with e2e time/s {1000 * search_out.e2e_time:.2f}ms')
+    if autodist_config.legacy:
+        return _parallelize_graph_legacy(graph, autodist_config, search_out)
+    return _parallelize_graph_fn(graph, autodist_config, search_out)
+
+
+def _load_or_calc_parallel_plan(
+    graph: IRGraph,
+    autodist_config: AutoDistConfig,
+) -> PipelineSearchOutput:
     if autodist_config.load_plan_path:
         _logger.info(f'load plan from {autodist_config.load_plan_path}')
         with open(autodist_config.load_plan_path, 'r') as f:
@@ -154,7 +192,108 @@ def parallelize_graph(graph: IRGraph,
             with open(autodist_config.save_plan_path, 'w') as f:
                 _write_plan_json(plan_json, f)
 
-    _logger.info(f'use plan with e2e time/s {1000 * search_out.e2e_time:.2f}ms')
+    return search_out
+
+
+def _parallelize_graph_fn(
+    graph: IRGraph,
+    autodist_config: AutoDistConfig,
+    search_out: PipelineSearchOutput,
+) -> Iterable['OpPlan']:
+    pp_desc = search_out.desc
+
+    cid2node: Dict[int, IRFwOperation] = dict()
+    for node in graph.nodes():
+        if isinstance(node, IRFwOperation):
+            cid2node[node.cid] = node
+
+    nstages = len(pp_desc.spmd_descs)
+    if autodist_config.pipeline_nstages != 'auto' and nstages != autodist_config.pipeline_nstages:
+        raise RuntimeError("pipeline_nstages doesn't match the number of stages (based on your pipeline_pivots config) in the plan")
+
+    if pp_desc.mesh_desc.ngpus != autodist_config.mesh_desc.ngpus:
+        raise RuntimeError(
+            f'plan uses {pp_desc.mesh_desc.ngpus} devices, but autodist config has '
+            f'{autodist_config.mesh_desc.ngpus}'
+        )
+
+    # key: node cid
+    # value: stage id
+    planned_stages: dict[int, int] = {}
+    if pp_desc.mesh_desc.ngpus % nstages != 0:
+        raise RuntimeError(
+            f'autodist plan uses {pp_desc.mesh_desc.ngpus} devices across {nstages} stages, '
+            'but fn requires the same number of devices per stage'
+        )
+    tp_size = pp_desc.mesh_desc.ngpus // nstages
+
+    for stage_id, spmd_desc in enumerate(pp_desc.spmd_descs):
+        if not spmd_desc.partition_descs:
+            raise RuntimeError(f'autodist plan stage {stage_id} is empty')
+        if spmd_desc.mesh_desc.ngpus != tp_size:
+            raise RuntimeError(
+                f'autodist plan stage {stage_id} uses {spmd_desc.mesh_desc.ngpus} devices, '
+                f'but fn automatically assigns {tp_size} devices per stage'
+            )
+
+        for cid in spmd_desc.partition_descs:
+            if cid not in cid2node:
+                raise RuntimeError(f'node {cid} not found in graph, make sure the plan is correct')
+            if cid in planned_stages:
+                raise RuntimeError(f'node {cid} appears in multiple stages in the autodist plan')
+            planned_stages[cid] = stage_id
+
+        stage_info_str = f'stage {stage_id} with {tp_size} devices and mem {search_out.stage_mems[stage_id]:.2f} GB'
+        _logger.info(f'\nautodist plan analysis for {stage_info_str}:\n\n{analysis_pretty_printer(spmd_desc.analysis)}')
+
+    recompute_ids: dict[int, int] = {}
+    for recompute_id, group in enumerate(pp_desc.recompute_groups):
+        for cid in group:
+            if cid not in cid2node:
+                raise RuntimeError(f'recompute node {cid} not found in graph, make sure the plan is correct')
+            if cid in recompute_ids:
+                raise RuntimeError(f'node {cid} appears in multiple recompute groups')
+            recompute_ids[cid] = recompute_id
+
+    from nnscaler.policies import OpPartition, OpPlan
+
+    op_plans = []
+    for node in graph.select(ntype=IRFwOperation):
+        planned_stage_id = planned_stages.get(node.cid)
+        partition = None
+        if planned_stage_id is not None:
+            partition_desc = pp_desc.spmd_descs[planned_stage_id].partition_descs[node.cid]
+            if len(partition_desc.desc) != 1:
+                raise RuntimeError(f'node {node} is partitioned along multiple dims')
+
+            (input_idx, dim), partition_num = partition_desc.desc[0]
+            if partition_num != tp_size:
+                raise RuntimeError(
+                    f'node {node.cid} uses partition degree {partition_num}, but stage '
+                    f'{planned_stage_id} has {tp_size} devices'
+                )
+            if (input_idx, dim) == (-1, -1):
+                partition = None
+            elif input_idx >= 0 and dim >= 0:
+                partition = OpPartition(input=input_idx, dim=dim)
+            else:
+                raise RuntimeError(f'invalid partition description {partition_desc.desc} for node {node.cid}')
+
+        op_plans.append(OpPlan(
+            op=node,
+            recompute_id=recompute_ids.get(node.cid, -1),
+            stage_id=planned_stage_id if planned_stage_id is not None else -1,
+            partition=partition,
+        ))
+
+    return op_plans
+
+
+def _parallelize_graph_legacy(
+    graph: IRGraph,
+    autodist_config: AutoDistConfig,
+    search_out: PipelineSearchOutput,
+) -> IRGraph:
     pp_desc = search_out.desc
 
     cid2node: Dict[int, IRFwOperation] = dict()
@@ -285,7 +424,6 @@ def collect_tensor_split_info(graph: IRGraph, pp_desc: PipelineSearchOutput):
     This function populates the `tensor_split_info` dictionary with details about each tensor's partitioning
     across different stages, including whether they are replicated or partitioned.
     """
-
     tensor_split_info = defaultdict(dict)
     for ftensor in graph.full_tensors():
         if ftensor.is_grad():
