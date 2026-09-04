@@ -124,6 +124,9 @@ the final integration tree on a fresh branch and must be correct by itself.
 - Risk/dependency: medium; none beyond current main loading APIs.
 - Gate: indexed chunk selection, missing/corrupt index behavior, and multi-rank
   loading.
+- Follow-up: update `_broadcast_gen_files` so each node receives only the
+  full-model chunks required by its local ranks. Keep this separate from the
+  on-disk selective-loading PR.
 
 #### PR 5: Use mmap for full-model parameter chunks
 
