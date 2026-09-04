@@ -238,12 +238,20 @@ def test_trainer_muon_resume_correctness_zero_ngroups(tmp_path, name):
 @pytest.mark.parametrize('name', available_optimizers)
 def test_trainer_muon_resume_correctness_zero_ngroups_hybrid_param_config(tmp_path, name):
     config_file = 'trainer_args_muon_hybrid.yaml'
+    optimizer_options = []
+    if name == 'dion':
+        # Dion's default Polar Express amplifies tiny rounding differences from
+        # different ZeRO parameter layouts. Use Newton-Schulz to test layout equivalence.
+        optimizer_options = [
+            '--optimizer.args.config.optimizers.1.options.use_polar_express', False,
+        ]
 
     launch_torchrun(4, trainer_muon_worker, tmp_path, config_file, '1', [
         '--compute_config.use_zero', 1,
         '--compute_config.runtime_ngpus', 4,
         '--optimizer.args.config.optimizers.1.type', get_optimizer_type(name),
         '--optimizer.param_clss_fn', 'tests.cli.test_trainer_muon.param_clss_fn2',
+        *optimizer_options,
     ])
 
     launch_torchrun(4, trainer_muon_worker, tmp_path, config_file, '2', [
@@ -252,16 +260,15 @@ def test_trainer_muon_resume_correctness_zero_ngroups_hybrid_param_config(tmp_pa
         '--compute_config.runtime_ngpus', 4,
         '--optimizer.args.config.optimizers.1.type', get_optimizer_type(name),
         '--optimizer.param_clss_fn', 'tests.cli.test_trainer_muon.param_clss_fn2',
+        *optimizer_options,
     ])
 
-    if name != 'dion':
-        # with dion muon, the following check will fail.
-        # TODO: investigate why
-        zero0_ckpt = torch.load(tmp_path / '1' / 'result.pt', weights_only=False)
-        zero1_ckpt = torch.load(tmp_path / '2' / 'result.pt', weights_only=False)
+    zero0_ckpt = torch.load(tmp_path / '1' / 'result.pt', weights_only=False)
+    zero1_ckpt = torch.load(tmp_path / '2' / 'result.pt', weights_only=False)
 
-        assert_close(zero0_ckpt['model'], zero1_ckpt['model'], atol=5e-3)
-        assert_close(zero0_ckpt['optimizer']['state'], zero1_ckpt['optimizer']['state'], atol=5e-3)
+    atol = 1e-6 # if name == 'dion' else 5e-3
+    assert_close(zero0_ckpt['model'], zero1_ckpt['model'], atol=atol)
+    assert_close(zero0_ckpt['optimizer']['state'], zero1_ckpt['optimizer']['state'], atol=atol)
 
 
 def param_clss_fn(param_name: str) -> tuple[int, int]:
