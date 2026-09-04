@@ -192,12 +192,12 @@ class HybridOptimizer(torch.optim.Optimizer, TrainHookHost, TrainHook):
                     raise ValueError(f"Param group indices must be consecutive. We have {len(opt_config.param_groups)} groups, got max group id {max(param_groups.keys())}")
                 for param_group_idx, param_group in param_groups.items():
                     param_group.update(opt_config.param_groups[param_group_idx].options)
-            else:
+            elif len(param_groups) == 1:
                 if len(opt_config.param_groups) > 1:
                     raise ValueError(f"Expected at most 1 param group, got {len(opt_config.param_groups)}")
-                if opt_config.param_groups and param_groups:
+                if opt_config.param_groups:
                     param_groups[0].update(opt_config.param_groups[0].options)
-            if not param_groups:
+            else:
                 param_groups[0] = {'params': []}
                 if opt_config.param_groups:
                     param_groups[0].update(opt_config.param_groups[0].options)
