@@ -4,20 +4,16 @@
 """Exact query-pruned YOCO attention with dense NNScaler-visible shapes."""
 
 from collections import OrderedDict
-from typing import Optional, Tuple
+from typing import List, Optional, Tuple
 
 import torch
 from torch import Tensor
 
 try:
-    import cutlass.cute as cute
-    import flash_attn.cute.utils as cute_utils
     from flash_attn.cute import (
         flash_attn_varlen_func as flash_attn_cute_varlen_func,
     )
 except ImportError:
-    cute = None
-    cute_utils = None
     flash_attn_cute_varlen_func = None
 
 from nnscaler.graph.function.dimops import IRDimops
@@ -31,58 +27,6 @@ from .zigzag_allgather_attn_varlen import emit_ring
 
 _QUERY_METADATA_CACHE_MAXSIZE = 8
 _QUERY_METADATA_CACHE = OrderedDict()
-
-# Cross-repository cache ABI shared with llm-train's static-kernel
-# precompiler. FA4 persists compiled functions under ``mask_mod.__cute_hash__``;
-# bump the matching version there whenever either mask's semantics change.
-_PRUNED_YOCO_CAUSAL_MASK_CUTE_HASH = "pruned-yoco-original-position-causal-v1"
-_PRUNED_YOCO_WINDOW_MASK_CUTE_HASH = "pruned-yoco-original-position-window-v1"
-
-
-if cute is not None:
-    @cute.jit
-    def _original_position_causal_mask(
-        batch_idx,
-        head_idx,
-        q_idx,
-        kv_idx,
-        seqlen_info,
-        aux_tensors,
-    ):
-        q_positions, q_offsets = aux_tensors
-        batch = cute_utils.ssa_to_scalar(batch_idx)
-        query = cute_utils.ssa_to_scalar(q_idx)
-        original_position = q_positions[q_offsets[batch] + query]
-        return kv_idx <= original_position
-
-
-    @cute.jit
-    def _original_position_window_mask(
-        batch_idx,
-        head_idx,
-        q_idx,
-        kv_idx,
-        seqlen_info,
-        aux_tensors,
-    ):
-        q_positions, q_offsets, q_window_starts = aux_tensors
-        batch = cute_utils.ssa_to_scalar(batch_idx)
-        query = cute_utils.ssa_to_scalar(q_idx)
-        original_position = q_positions[q_offsets[batch] + query]
-        return (kv_idx <= original_position) & (
-            kv_idx >= q_window_starts[q_offsets[batch] + query]
-        )
-
-
-    _original_position_causal_mask.__cute_hash__ = (
-        _PRUNED_YOCO_CAUSAL_MASK_CUTE_HASH
-    )
-    _original_position_window_mask.__cute_hash__ = (
-        _PRUNED_YOCO_WINDOW_MASK_CUTE_HASH
-    )
-else:
-    _original_position_causal_mask = None
-    _original_position_window_mask = None
 
 
 def _local_sequence_lengths(cu_seqlens_q: Tensor, cp_size: int) -> Tensor:
@@ -159,6 +103,29 @@ def _cached_compact_query_metadata(
     if len(_QUERY_METADATA_CACHE) > _QUERY_METADATA_CACHE_MAXSIZE:
         _QUERY_METADATA_CACHE.popitem(last=False)
     return metadata
+
+
+def _consecutive_position_runs(
+    positions: Tensor,
+) -> List[Tuple[int, int, int]]:
+    """Return compact-row runs whose original positions are consecutive.
+
+    Each tuple contains ``(row_start, row_end, last_position)``.  A standard
+    causal attention call over a run and the K/V prefix ending at
+    ``last_position`` has exactly the same mask as the corresponding rows in
+    dense self attention, including FlashAttention's bottom-right alignment.
+    """
+    if positions.numel() == 0:
+        return []
+    host_positions = positions.tolist()
+    runs = []
+    row_start = 0
+    for row in range(1, len(host_positions)):
+        if host_positions[row] != host_positions[row - 1] + 1:
+            runs.append((row_start, row, host_positions[row - 1]))
+            row_start = row
+    runs.append((row_start, len(host_positions), host_positions[-1]))
+    return runs
 
 
 def wrap_pruned_yoco_attn_varlen_func(
@@ -249,15 +216,16 @@ def wrap_pruned_yoco_attn_varlen_func(
         max_seqlen_k = int(
             (cu_seqlens_k[1:] - cu_seqlens_k[:-1]).max().item())
 
-    # FA4 releases before varlen aux-tensor backward support reject the custom
-    # original-position mask during profiling and training. Run each packed
-    # sequence as fixed-length attention instead. The target long-context job
-    # has one sequence, so this remains one attention launch while preserving
-    # compatibility with packed batches and older FA4 builds.
+    # FA4 4.0.0b13 produces incorrect gradients for mask_mod + aux_tensors on
+    # SM100 even though its forward result is exact.  Avoid that backward path:
+    # split selected Q rows into consecutive original-position runs and use an
+    # ordinary causal varlen call against the K/V prefix ending at each run.
+    # For a run [start, end], bottom-right causal alignment against K[:end+1]
+    # maps query row zero back to original position ``start``.  Sliding-window
+    # attention follows the same alignment.
     compact_outputs = []
     compact_lses = []
-    zero_query_offset = compact_cu_q.new_zeros(1)
-    window_left = window_size[0]
+    cute_window_size = tuple(None if item == -1 else item for item in window_size)
     query_offsets = compact_cu_q.tolist()
     key_offsets = cu_seqlens_k.tolist()
     for sequence_idx in range(len(query_offsets) - 1):
@@ -266,35 +234,48 @@ def wrap_pruned_yoco_attn_varlen_func(
         if query_start == query_end:
             continue
         key_start = key_offsets[sequence_idx]
-        key_end = key_offsets[sequence_idx + 1]
         sequence_positions = compact_positions[query_start:query_end]
-        if window_left is not None and window_left > 0:
-            mask_mod = _original_position_window_mask
-            aux_tensors = [
-                sequence_positions,
-                zero_query_offset,
-                (sequence_positions - int(window_left)).contiguous(),
-            ]
-        else:
-            mask_mod = _original_position_causal_mask
-            aux_tensors = [sequence_positions, zero_query_offset]
-
-        sequence_output, sequence_lse = flash_attn_cute_varlen_func(
-            compact_q[query_start:query_end].unsqueeze(0),
-            k[key_start:key_end].unsqueeze(0),
-            v[key_start:key_end].unsqueeze(0),
-            max_seqlen_q=max_seqlen_q,
-            max_seqlen_k=max_seqlen_k,
-            softmax_scale=softmax_scale,
-            causal=False,
-            window_size=(None, None),
-            deterministic=deterministic,
-            mask_mod=mask_mod,
-            aux_tensors=aux_tensors,
-            return_lse=True,
-        )
-        compact_outputs.append(sequence_output.squeeze(0))
-        compact_lses.append(sequence_lse.squeeze(0))
+        sequence_key_length = key_offsets[sequence_idx + 1] - key_start
+        for run_start, run_end, last_position in _consecutive_position_runs(
+            sequence_positions
+        ):
+            if last_position < 0 or last_position >= sequence_key_length:
+                raise ValueError(
+                    "query position falls outside its packed K/V sequence: "
+                    f"position={last_position}, length={sequence_key_length}"
+                )
+            run_q_start = query_start + run_start
+            run_q_end = query_start + run_end
+            run_q = compact_q[run_q_start:run_q_end]
+            run_kv_end = key_start + last_position + 1
+            run_k = k[key_start:run_kv_end]
+            run_v = v[key_start:run_kv_end]
+            run_cu_q = torch.tensor(
+                [0, run_q.size(0)],
+                dtype=cu_seqlens_q.dtype,
+                device=cu_seqlens_q.device,
+            )
+            run_cu_k = torch.tensor(
+                [0, run_k.size(0)],
+                dtype=cu_seqlens_k.dtype,
+                device=cu_seqlens_k.device,
+            )
+            run_output, run_lse = flash_attn_cute_varlen_func(
+                run_q,
+                run_k,
+                run_v,
+                cu_seqlens_q=run_cu_q,
+                cu_seqlens_k=run_cu_k,
+                max_seqlen_q=max_seqlen_q,
+                max_seqlen_k=max_seqlen_k,
+                softmax_scale=softmax_scale,
+                causal=True,
+                window_size=cute_window_size,
+                deterministic=deterministic,
+                return_lse=True,
+            )
+            compact_outputs.append(run_output)
+            compact_lses.append(run_lse)
 
     compact_output = torch.cat(compact_outputs, dim=0)
     softmax_lse = torch.cat(compact_lses, dim=-1)

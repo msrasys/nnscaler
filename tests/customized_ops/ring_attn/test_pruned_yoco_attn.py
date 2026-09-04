@@ -13,10 +13,6 @@ from flash_attn.cute import flash_attn_varlen_func
 import nnscaler.customized_ops.ring_attention.pruned_yoco_attn_varlen as pruned_yoco_attn
 from nnscaler.codegen.emit import FuncEmission
 from nnscaler.customized_ops.ring_attention.pruned_yoco_attn_varlen import (
-    _PRUNED_YOCO_CAUSAL_MASK_CUTE_HASH,
-    _PRUNED_YOCO_WINDOW_MASK_CUTE_HASH,
-    _original_position_causal_mask,
-    _original_position_window_mask,
     wrap_pruned_yoco_attn_varlen_func,
 )
 from nnscaler.customized_ops.ring_attention.yoco_kv import (
@@ -46,31 +42,22 @@ class _PrunedAttentionModule(nn.Module):
         return output
 
 
-def test_pruned_attention_masks_have_stable_precompile_cache_keys():
-    assert _original_position_causal_mask.__cute_hash__ == (
-        _PRUNED_YOCO_CAUSAL_MASK_CUTE_HASH
-    )
-    assert _original_position_window_mask.__cute_hash__ == (
-        _PRUNED_YOCO_WINDOW_MASK_CUTE_HASH
-    )
-
-
-def test_pruned_attention_uses_fixed_calls_and_skips_empty_packed_sequence(
+def test_pruned_attention_uses_standard_causal_runs_and_skips_empty_sequence(
     monkeypatch,
 ):
     calls = []
 
-    def fake_fixed_attention(q, k, v, **kwargs):
-        calls.append((q.shape, k.shape, tuple(kwargs)))
+    def fake_varlen_attention(q, k, v, **kwargs):
+        calls.append((q.shape, k.shape, kwargs))
         dependency = (k.reshape(-1)[0] + v.reshape(-1)[0]) * 0
         output = q + dependency
-        lse = q.new_zeros(q.size(0), q.size(2), q.size(1)) + dependency
+        lse = q.new_zeros(q.size(1), q.size(0)) + dependency
         return output, lse
 
     monkeypatch.setattr(
         pruned_yoco_attn,
         'flash_attn_cute_varlen_func',
-        fake_fixed_attention,
+        fake_varlen_attention,
     )
     q = torch.randn(10, 4, 8, requires_grad=True)
     k = torch.randn(10, 2, 8, requires_grad=True)
@@ -96,12 +83,15 @@ def test_pruned_attention_uses_fixed_calls_and_skips_empty_packed_sequence(
         kv_is_gathered=True,
     )
 
-    assert len(calls) == 1
-    q_shape, k_shape, kwarg_names = calls[0]
-    assert q_shape == (1, 2, 4, 8)
-    assert k_shape == (1, 6, 2, 8)
-    assert 'cu_seqlens_q' not in kwarg_names
-    assert 'cu_seqlens_k' not in kwarg_names
+    assert len(calls) == 2
+    assert [call[0] for call in calls] == [(1, 4, 8), (1, 4, 8)]
+    assert [call[1] for call in calls] == [(2, 2, 8), (4, 2, 8)]
+    for _, _, kwargs in calls:
+        assert kwargs['causal'] is True
+        assert 'cu_seqlens_q' in kwargs
+        assert 'cu_seqlens_k' in kwargs
+        assert 'mask_mod' not in kwargs
+        assert 'aux_tensors' not in kwargs
     assert lse.shape == (4, 2)
     assert torch.count_nonzero(output[~query_mask]) == 0
     output.sum().backward()
@@ -140,7 +130,7 @@ def test_pruned_attention_cp_group_survives_codegen():
 @pytest.mark.skipif(
     not torch.cuda.is_available()
     or torch.cuda.get_device_capability()[0] < 10,
-    reason='FA4 query-position masks require Blackwell',
+    reason='FA4 query-pruned attention requires Blackwell',
 )
 @pytest.mark.parametrize('window_size', [(-1, -1), (2, 0)])
 def test_pruned_attention_matches_dense_reference(window_size):
@@ -200,7 +190,17 @@ def test_pruned_attention_matches_dense_reference(window_size):
     q.grad = k.grad = v.grad = None
     expected[query_mask].backward(grad[query_mask])
     for actual_grad, expected_grad in zip(actual_grads, (q.grad, k.grad, v.grad)):
-        torch.testing.assert_close(actual_grad, expected_grad)
+        # Splitting non-consecutive queries into standard causal calls changes
+        # BF16 accumulation order slightly.  This still rejects the broken
+        # mask_mod backward, whose max error is O(1e2) for this fixture.
+        torch.testing.assert_close(
+            actual_grad.float().norm(),
+            expected_grad.float().norm(),
+            atol=2e-3,
+            rtol=2e-3,
+        )
+        torch.testing.assert_close(
+            actual_grad, expected_grad, atol=2e-2, rtol=2e-2)
 
 
 def _cp2_pruned_attention_worker():
