@@ -3,7 +3,9 @@
 
 """Exact query-pruned YOCO attention with dense NNScaler-visible shapes."""
 
+from bisect import bisect_left, bisect_right
 from collections import OrderedDict
+from dataclasses import dataclass
 from typing import List, Optional, Tuple
 
 import torch
@@ -29,84 +31,156 @@ _QUERY_METADATA_CACHE_MAXSIZE = 8
 _QUERY_METADATA_CACHE = OrderedDict()
 
 
-def _local_sequence_lengths(cu_seqlens_q: Tensor, cp_size: int) -> Tensor:
-    sequence_lengths = cu_seqlens_q[1:] - cu_seqlens_q[:-1]
-    if cp_size == 1:
-        return sequence_lengths
-    if torch.any(sequence_lengths % (2 * cp_size) != 0):
+@dataclass
+class _QueryRunBatch:
+    # None means the batch already covers Q in its original dense order.
+    query_indices: Optional[Tensor]
+    cu_seqlens_q: Tensor
+    cu_seqlens_k: Tensor
+    key_start: int
+    key_end: int
+
+
+@dataclass
+class _QueryRunMetadata:
+    batches: List[_QueryRunBatch]
+    output_indices: Optional[Tensor]
+    lse_indices: Optional[Tensor]
+    max_seqlen_q: int
+    max_seqlen_k: int
+
+
+@torch.inference_mode(False)
+@torch.no_grad()
+def _query_run_metadata(
+    query_mask: Tensor,
+    query_positions: Tensor,
+    cu_seqlens_q: Tensor,
+    cu_seqlens_k: Tensor,
+    cp_size: int,
+) -> _QueryRunMetadata:
+    # Copy metadata once per mask/layout, rather than synchronizing for every
+    # sequence and every layer. Each round takes at most one run per sequence,
+    # so its K/V prefixes never overlap and can share the original K/V storage.
+    query_offsets = cu_seqlens_q.tolist()
+    key_offsets = cu_seqlens_k.tolist()
+    if len(query_offsets) != len(key_offsets):
+        raise ValueError("Q and K/V must describe the same packed sequences")
+    sequence_lengths = [
+        end - start for start, end in zip(query_offsets, query_offsets[1:])
+    ]
+    if cp_size > 1 and any(length % (2 * cp_size) for length in sequence_lengths):
         raise ValueError(
             "query-pruned YOCO attention requires every sequence length to "
             f"be divisible by 2 * cp_size ({2 * cp_size})"
         )
-    return sequence_lengths // cp_size
-
-
-def _compact_query_metadata(
-    query_mask: Tensor,
-    query_positions: Tensor,
-    cu_seqlens_q: Tensor,
-    cp_size: int,
-):
-    local_sequence_lengths = _local_sequence_lengths(cu_seqlens_q, cp_size)
-    local_cu = torch.zeros(
-        local_sequence_lengths.numel() + 1,
-        dtype=cu_seqlens_q.dtype,
-        device=cu_seqlens_q.device,
-    )
-    local_cu[1:] = torch.cumsum(local_sequence_lengths, dim=0)
-    if local_cu[-1].item() != query_mask.numel():
+    local_tokens = sum(sequence_lengths) // cp_size
+    if local_tokens != query_mask.numel():
         raise ValueError(
             "query mask length does not match the local zigzag token layout: "
-            f"mask={query_mask.numel()}, expected={local_cu[-1].item()}"
+            f"mask={query_mask.numel()}, expected={local_tokens}"
         )
 
     active_idx = torch.nonzero(query_mask.bool(), as_tuple=False).flatten()
-    active_counts = torch.stack([
-        query_mask[local_cu[index]:local_cu[index + 1]].sum(dtype=torch.int32)
-        for index in range(local_sequence_lengths.numel())
-    ])
-    compact_cu = torch.zeros_like(local_cu)
-    compact_cu[1:] = torch.cumsum(active_counts, dim=0)
-    compact_positions = query_positions.index_select(0, active_idx).to(torch.int32)
-    return active_idx, compact_positions.contiguous(), compact_cu.contiguous()
+    active_rows = active_idx.tolist()
+    positions = query_positions.index_select(0, active_idx).tolist()
+    rounds = []
+    local_end = query_start = 0
+    for sequence_idx, length in enumerate(sequence_lengths):
+        local_end += length // cp_size
+        query_end = bisect_left(active_rows, local_end, lo=query_start)
+        key_start = key_offsets[sequence_idx]
+        key_length = key_offsets[sequence_idx + 1] - key_start
+        for round_idx, (start, end, last_position) in enumerate(
+            _consecutive_position_runs(positions[query_start:query_end])
+        ):
+            if positions[query_start + start] < 0 or last_position >= key_length:
+                raise ValueError(
+                    "query position falls outside its packed K/V sequence: "
+                    f"position={last_position}, length={key_length}"
+                )
+            if round_idx == len(rounds):
+                rounds.append([])
+            rounds[round_idx].append((
+                query_start + start, query_start + end,
+                key_start, key_start + last_position + 1,
+            ))
+        query_start = query_end
+
+    batches = []
+    output_rows = []
+    for runs in rounds:
+        rows = []
+        cu_q, cu_k = [0], [0]
+        key_start = key_end = runs[0][2]
+        for start, end, run_key_start, run_key_end in runs:
+            if run_key_start > key_end:
+                # An empty-Q sequence consumes the unused K/V gap, preserving
+                # the next prefix's offset without copying or duplicating K/V.
+                # Keep original sequence boundaries inside the gap so no
+                # dummy K sequence exceeds the caller's max_seqlen_k bound.
+                for gap_end in key_offsets[
+                    bisect_right(key_offsets, key_end):
+                    bisect_right(key_offsets, run_key_start)
+                ]:
+                    cu_q.append(cu_q[-1])
+                    cu_k.append(gap_end - key_start)
+            rows.extend(active_rows[start:end])
+            cu_q.append(cu_q[-1] + end - start)
+            cu_k.append(run_key_end - key_start)
+            key_end = run_key_end
+        indices = (
+            None if len(rows) == query_mask.numel()
+            else torch.tensor(rows, dtype=torch.long, device=query_mask.device)
+        )
+        batches.append(_QueryRunBatch(
+            indices,
+            torch.tensor(cu_q, dtype=cu_seqlens_q.dtype, device=cu_seqlens_q.device),
+            torch.tensor(cu_k, dtype=cu_seqlens_k.dtype, device=cu_seqlens_k.device),
+            key_start,
+            key_end,
+        ))
+        output_rows.extend(rows)
+
+    output_indices = (
+        None if len(batches) == 1 and batches[0].query_indices is None
+        else torch.tensor(output_rows, dtype=torch.long, device=query_mask.device)
+    )
+    # Outputs are batched by run number; the public LSE remains in compact Q
+    # order, just as it was when runs were executed sequence by sequence.
+    lse_indices = output_indices.argsort() if len(batches) > 1 else None
+    return _QueryRunMetadata(
+        batches, output_indices, lse_indices,
+        max(sequence_lengths, default=0),
+        max((end - start for start, end in zip(
+            key_offsets, key_offsets[1:])), default=0),
+    )
 
 
-def _cached_compact_query_metadata(
+def _cached_query_run_metadata(
     query_mask: Tensor,
     query_positions: Tensor,
     cu_seqlens_q: Tensor,
+    cu_seqlens_k: Tensor,
     cp_size: int,
 ):
-    key = (
-        id(query_mask),
-        query_mask._version,
-        id(query_positions),
-        query_positions._version,
-        id(cu_seqlens_q),
-        cu_seqlens_q._version,
-        cp_size,
-    )
+    tensors = (query_mask, query_positions, cu_seqlens_q, cu_seqlens_k)
+    key = tuple((id(tensor), tensor._version) for tensor in tensors) + (cp_size,)
     cached = _QUERY_METADATA_CACHE.get(key)
     if cached is not None:
-        cached_mask, cached_positions, cached_cu, metadata = cached
-        if (
-            cached_mask is query_mask
-            and cached_positions is query_positions
-            and cached_cu is cu_seqlens_q
-        ):
+        cached_tensors, metadata = cached
+        if all(old is new for old, new in zip(cached_tensors, tensors)):
             _QUERY_METADATA_CACHE.move_to_end(key)
             return metadata
-    metadata = _compact_query_metadata(
-        query_mask, query_positions, cu_seqlens_q, cp_size)
-    _QUERY_METADATA_CACHE[key] = (
-        query_mask, query_positions, cu_seqlens_q, metadata)
+    metadata = _query_run_metadata(*tensors, cp_size)
+    _QUERY_METADATA_CACHE[key] = (tensors, metadata)
     if len(_QUERY_METADATA_CACHE) > _QUERY_METADATA_CACHE_MAXSIZE:
         _QUERY_METADATA_CACHE.popitem(last=False)
     return metadata
 
 
 def _consecutive_position_runs(
-    positions: Tensor,
+    positions: List[int],
 ) -> List[Tuple[int, int, int]]:
     """Return compact-row runs whose original positions are consecutive.
 
@@ -115,16 +189,15 @@ def _consecutive_position_runs(
     ``last_position`` has exactly the same mask as the corresponding rows in
     dense self attention, including FlashAttention's bottom-right alignment.
     """
-    if positions.numel() == 0:
+    if not positions:
         return []
-    host_positions = positions.tolist()
     runs = []
     row_start = 0
-    for row in range(1, len(host_positions)):
-        if host_positions[row] != host_positions[row - 1] + 1:
-            runs.append((row_start, row, host_positions[row - 1]))
+    for row in range(1, len(positions)):
+        if positions[row] != positions[row - 1] + 1:
+            runs.append((row_start, row, positions[row - 1]))
             row_start = row
-    runs.append((row_start, len(host_positions), host_positions[-1]))
+    runs.append((row_start, len(positions), positions[-1]))
     return runs
 
 
@@ -189,13 +262,14 @@ def wrap_pruned_yoco_attn_varlen_func(
         k = allgather_reducescatter(k, 0, cp_ranks)
         v = allgather_reducescatter(v, 0, cp_ranks)
 
-    active_idx, compact_positions, compact_cu_q = _cached_compact_query_metadata(
+    metadata = _cached_query_run_metadata(
         query_mask,
         query_positions,
         cu_seqlens_q,
+        cu_seqlens_k,
         resolved_cp_size,
     )
-    if active_idx.numel() == 0:
+    if not metadata.batches:
         # Keep every projection and the shared K/V gather in the autograd
         # graph.  In particular, all CP ranks must enter the gather's
         # reduce-scatter backward even when one rank owns no active queries.
@@ -208,81 +282,62 @@ def wrap_pruned_yoco_attn_varlen_func(
             q.size(0), q.size(1), v.size(-1)) + zero_dependency
         return (dense_output, None) if return_lse else dense_output
 
-    compact_q = q.index_select(0, active_idx)
     if max_seqlen_q is None:
-        max_seqlen_q = int(
-            (cu_seqlens_q[1:] - cu_seqlens_q[:-1]).max().item())
+        max_seqlen_q = metadata.max_seqlen_q
     if max_seqlen_k is None:
-        max_seqlen_k = int(
-            (cu_seqlens_k[1:] - cu_seqlens_k[:-1]).max().item())
+        max_seqlen_k = metadata.max_seqlen_k
 
-    # FA4 4.0.0b13 produces incorrect gradients for mask_mod + aux_tensors on
-    # SM100 even though its forward result is exact.  Avoid that backward path:
-    # split selected Q rows into consecutive original-position runs and use an
-    # ordinary causal varlen call against the K/V prefix ending at each run.
+    # FA4 4.0.0b13's varlen autograd wrapper drops mask_mod in backward.
+    # Fixed in 4.0.0b17: https://github.com/Dao-AILab/flash-attention/pull/2616.
+    # Support older runtimes by splitting Q into consecutive original-position
+    # runs and batching runs from different sequences against their K/V prefixes.
     # For a run [start, end], bottom-right causal alignment against K[:end+1]
     # maps query row zero back to original position ``start``.  Sliding-window
     # attention follows the same alignment.
     compact_outputs = []
     compact_lses = []
     cute_window_size = tuple(None if item == -1 else item for item in window_size)
-    query_offsets = compact_cu_q.tolist()
-    key_offsets = cu_seqlens_k.tolist()
-    for sequence_idx in range(len(query_offsets) - 1):
-        query_start = query_offsets[sequence_idx]
-        query_end = query_offsets[sequence_idx + 1]
-        if query_start == query_end:
-            continue
-        key_start = key_offsets[sequence_idx]
-        sequence_positions = compact_positions[query_start:query_end]
-        sequence_key_length = key_offsets[sequence_idx + 1] - key_start
-        for run_start, run_end, last_position in _consecutive_position_runs(
-            sequence_positions
-        ):
-            if last_position < 0 or last_position >= sequence_key_length:
-                raise ValueError(
-                    "query position falls outside its packed K/V sequence: "
-                    f"position={last_position}, length={sequence_key_length}"
-                )
-            run_q_start = query_start + run_start
-            run_q_end = query_start + run_end
-            run_q = compact_q[run_q_start:run_q_end]
-            run_kv_end = key_start + last_position + 1
-            run_k = k[key_start:run_kv_end]
-            run_v = v[key_start:run_kv_end]
-            run_cu_q = torch.tensor(
-                [0, run_q.size(0)],
-                dtype=cu_seqlens_q.dtype,
-                device=cu_seqlens_q.device,
-            )
-            run_cu_k = torch.tensor(
-                [0, run_k.size(0)],
-                dtype=cu_seqlens_k.dtype,
-                device=cu_seqlens_k.device,
-            )
-            run_output, run_lse = flash_attn_cute_varlen_func(
-                run_q,
-                run_k,
-                run_v,
-                cu_seqlens_q=run_cu_q,
-                cu_seqlens_k=run_cu_k,
-                max_seqlen_q=max_seqlen_q,
-                max_seqlen_k=max_seqlen_k,
-                softmax_scale=softmax_scale,
-                causal=True,
-                window_size=cute_window_size,
-                deterministic=deterministic,
-                return_lse=True,
-            )
-            compact_outputs.append(run_output)
-            compact_lses.append(run_lse)
+    for batch in metadata.batches:
+        batch_q = (
+            q if batch.query_indices is None
+            else q.index_select(0, batch.query_indices)
+        )
+        full_kv = batch.key_start == 0 and batch.key_end == k.size(0)
+        batch_k = k if full_kv else k[batch.key_start:batch.key_end]
+        batch_v = v if full_kv else v[batch.key_start:batch.key_end]
+        batch_output, batch_lse = flash_attn_cute_varlen_func(
+            batch_q,
+            batch_k,
+            batch_v,
+            cu_seqlens_q=batch.cu_seqlens_q,
+            cu_seqlens_k=batch.cu_seqlens_k,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_k=max_seqlen_k,
+            softmax_scale=softmax_scale,
+            causal=True,
+            window_size=cute_window_size,
+            deterministic=deterministic,
+            return_lse=True,
+        )
+        compact_outputs.append(batch_output)
+        compact_lses.append(batch_lse)
 
-    compact_output = torch.cat(compact_outputs, dim=0)
-    softmax_lse = torch.cat(compact_lses, dim=-1)
+    compact_output = (
+        compact_outputs[0] if len(compact_outputs) == 1
+        else torch.cat(compact_outputs, dim=0)
+    )
+    softmax_lse = (
+        compact_lses[0] if len(compact_lses) == 1
+        else torch.cat(compact_lses, dim=-1)
+    )
+    if metadata.lse_indices is not None:
+        softmax_lse = softmax_lse.index_select(-1, metadata.lse_indices)
+    if metadata.output_indices is None:
+        return (compact_output, softmax_lse) if return_lse else compact_output
     dense_output = compact_output.new_zeros(
         q.size(0), compact_output.size(1), compact_output.size(2))
     dense_output = torch.index_copy(
-        dense_output, 0, active_idx, compact_output)
+        dense_output, 0, metadata.output_indices, compact_output)
     return (dense_output, softmax_lse) if return_lse else dense_output
 
 
