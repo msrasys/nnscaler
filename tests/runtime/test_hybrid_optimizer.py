@@ -9,9 +9,47 @@ import pytest
 import torch.distributed
 
 from nnscaler.cli.trainer import Trainer
-from nnscaler.runtime.hybrid_optimizer import ScaleDelayedOptimizerMixin
+from nnscaler.runtime.f16_optimizer import MixedPrecisionAdamW
+from nnscaler.runtime.hybrid_optimizer import (
+    HybridOptConfig,
+    HybridOptimizer,
+    HybridSubOptConfig,
+    HybridSubOptParamGroupConfig,
+    ScaleDelayedOptimizerMixin,
+)
 from tests.parallel_module.common import assert_close, assert_equal
 from ..launch_torchrun import launch_torchrun
+
+
+def test_empty_optimizer_partitions():
+    param = torch.nn.Parameter(torch.ones(1))
+    optimizer = HybridOptimizer(
+        [param],
+        {param: (0, 0)},
+        HybridOptConfig(optimizers=[
+            HybridSubOptConfig(type=torch.optim.Adam),
+            HybridSubOptConfig(type=torch.optim.AdamW),
+            HybridSubOptConfig(type=MixedPrecisionAdamW),
+        ]),
+    )
+
+    assert optimizer.optimizers[0].param_groups[0]['params'] == [param]
+    assert optimizer.optimizers[1].param_groups[0]['params'] == []
+    assert optimizer.optimizers[2].param_groups[0]['params'] == []
+
+
+def test_empty_optimizer_preserves_configured_options():
+    optimizer = HybridOptimizer(
+        [],
+        {},
+        HybridOptConfig(optimizers=[HybridSubOptConfig(
+            type=torch.optim.AdamW,
+            param_groups=[HybridSubOptParamGroupConfig(options={'lr': 0.1})],
+        )]),
+    )
+
+    assert optimizer.optimizers[0].param_groups[0]['params'] == []
+    assert optimizer.optimizers[0].param_groups[0]['lr'] == 0.1
 
 
 def param_clss_fn(param_name: str) -> tuple[int, int]:
