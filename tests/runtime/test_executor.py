@@ -5,6 +5,7 @@ import pytest
 import torch
 
 from nnscaler.runtime.executor import Executor
+from nnscaler.runtime.module import ParallelModule
 
 
 @pytest.fixture(autouse=True)
@@ -185,6 +186,22 @@ def test_split_backward_applies_backward_pre_hook_once():
     torch.testing.assert_close(actual.weight.grad, reference.weight.grad)
     torch.testing.assert_close(actual.bias.grad, reference.bias.grad)
     Executor.check_clear()
+
+
+def test_loss_scaling_ignores_aux_output_without_grad():
+    module = ParallelModule.__new__(ParallelModule)
+    module._scale_loss([False], lambda loss: loss * 2)
+    hook = Executor._backward_pre_hook
+
+    activation = torch.ones(2)
+    aux = torch.tensor(3.0)
+    _, outputs, _ = hook([], [activation, aux], [torch.ones_like(activation), None])
+    assert outputs[0] is activation
+    assert outputs[1] is aux
+
+    loss = torch.tensor(4.0)
+    _, outputs, _ = hook([], [loss], [None])
+    assert outputs[0] == 8
 
 
 def test_backward_weight_requires_pending_input_backward():

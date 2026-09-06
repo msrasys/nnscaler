@@ -32,6 +32,10 @@ class LifeCycle:
 
         self.lifetime.update((tsin, 0) for tsin in graph_inputs if is_activation(tsin))
 
+        produced_tids = {
+            tensor.tid for tensor in graph_inputs if isinstance(tensor, IRSubTensor)
+        }
+
         for i, node in enumerate(nodes):
 
             outputs : Iterable[IRObject]
@@ -54,8 +58,10 @@ class LifeCycle:
                     # and delete them after the backward call to save memory.
                     fw_inputs, fw_outputs, output_grads, input_grads = \
                         func_emission.get_backward_callsite_io_tensors(node)
-                    # remove loss gradient
-                    output_grads = [t for t in output_grads if not t.is_loss()]
+                    output_grads = [
+                        tensor for tensor in output_grads
+                        if not tensor.is_loss() and tensor.tid in produced_tids
+                    ]
 
                     outputs = input_grads
                     inputs = list(itertools.chain(fw_inputs, fw_outputs, output_grads))
@@ -69,6 +75,12 @@ class LifeCycle:
 
             # "fast-forward" all inputs to the current statement, namely after 'i'-th node.
             self.lifetime.update((tin, i) for tin in IRSegment.get_objects_from_complex(inputs) if is_activation(tin))
+
+            produced_tids.update(
+                tensor.tid
+                for tensor in IRSegment.get_objects_from_complex(node.outputs())
+                if isinstance(tensor, IRSubTensor)
+            )
 
 
         # Here (i+1) is always greater than 'len(nodes)'

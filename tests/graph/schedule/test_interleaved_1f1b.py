@@ -13,7 +13,10 @@ from pathlib import Path
 
 import nnscaler
 from nnscaler import parallelize, ComputeConfig, ParallelModule
+from nnscaler.codegen.schedule.schedule import ScheduleCodeGen
+from nnscaler.execplan.execplan import ExeReuseCell
 from nnscaler.parallel import build_optimizer, sync_grad_when, merge_state_dicts
+from nnscaler.ir.cten import IRCell, IRObject
 from nnscaler.ir.tensor import IRFullTensor
 from nnscaler.graph import IRGraph
 from nnscaler.ir.adapter import IRAdapter
@@ -41,11 +44,12 @@ class Model(torch.nn.Module):
         x = self.fc2(x)
         x = self.fc3(x)
         x = self.fc4(x)
-        return x.sum()
+        return x.sum(), x.mean()
 
 
 def policy_1f1b(graph, cfg):
     data_loader, fc1, fc2, fc3, fc4, loss = graph.nodes()[:6]
+    aux = graph.nodes()[6]
     graph.staging([fc1, fc3,])
     stages = graph.select(ntype=IRSegment, flatten=False)
     stages = [s for s in stages if s.isfw()]
@@ -62,6 +66,7 @@ def policy_1f1b(graph, cfg):
     graph.assign(fc3, 1)
     graph.assign(fc4, 1)
     graph.assign(loss, 1)
+    graph.assign(aux, 1)
 
     PredefinedSched.sched_1f1b(graph, cfg.pas_config['n_micro_batches'], len(stages))
 
@@ -70,6 +75,7 @@ def policy_1f1b(graph, cfg):
 
 def policy_1f1b_interleaved(graph, cfg):
     data_loader, fc1, fc2, fc3, fc4, loss = graph.nodes()[:6]
+    aux = graph.nodes()[6]
     graph.staging([fc1, fc2, fc3, fc4])
     stages = graph.select(ntype=IRSegment, flatten=False)
     stages = [s for s in stages if s.isfw()]
@@ -92,6 +98,7 @@ def policy_1f1b_interleaved(graph, cfg):
     graph.assign(identity, 1)
     graph.assign(fc4, 1)
     graph.assign(loss, 1)
+    graph.assign(aux, 1)
 
     PredefinedSched.sched_1f1b_interleaved(graph, cfg.pas_config['n_micro_batches'], len(stages))
 
@@ -119,6 +126,36 @@ def _train_pp(model: ParallelModule, num_replicas, rank):
         optimizer.zero_grad()
         results.append(clone_to_cpu_recursively(model.state_dict()))
     return results
+
+
+def test_nontensor_fallback_uses_matching_microbatch():
+    values = [IRObject('getitem_scale'), IRObject('getitem_length')]
+    cell = IRCell('segment', 'segment', 2, 0)
+    for index, value in enumerate(values):
+        cell.set_input(index, value)
+    node = ExeReuseCell(cell, values, [], micro_batch_id=3)
+    codegen = ScheduleCodeGen.__new__(ScheduleCodeGen)
+    produced = set()
+    getitems = {
+        'getitem_context': ('context', 'samples'),
+        'getitem_scale': ('scale', 'getitem_context'),
+        'getitem_length': ('length', 'getitem_context'),
+    }
+
+    codes = codegen._emit_missing_nontensor_inputs(
+        node, produced, getitems, 'dataloader_7',
+        {'sample_reads': {}, 'fallback_vars': {}},
+    )
+
+    scale, length = values
+    assert codes == [
+        '_samples_3 = dataloader_7.get_micro_batch(3)',
+        f"_object_{scale.tid}_0 = _operator.getitem(_samples_3, 'context')",
+        f"getitem_scale_{scale.tid} = _operator.getitem(_object_{scale.tid}_0, 'scale')",
+        f"_object_{length.tid}_0 = _operator.getitem(_samples_3, 'context')",
+        f"getitem_length_{length.tid} = _operator.getitem(_object_{length.tid}_0, 'length')",
+    ]
+    assert produced == {value.tid for value in values}
 
 
 def worker_pipeline_2(n_micro_batches):
