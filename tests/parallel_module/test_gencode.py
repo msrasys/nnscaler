@@ -25,14 +25,15 @@ from .common import init_distributed
 from ..launch_torchrun import launch_torchrun
 from ..utils import replace_all_device_with, raises_with_cause
 
-def _to_cube_model(module, compute_config, cube_savedir, load_module):
+def _to_cube_model(module, compute_config, cube_savedir, load_module, max_workers=1):
     return parallelize(
         module,
         {'x': torch.tensor([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])},
         'data',
         compute_config,
         gen_savedir=cube_savedir,
-        load_module=load_module
+        load_module=load_module,
+        max_workers=max_workers,
     )
 
 class Module0(torch.nn.Module):
@@ -42,6 +43,24 @@ class Module0(torch.nn.Module):
 
     def forward(self, x):
         return self.linear(x)
+
+
+def emit_multiprocess_customized_add(node, args, kwargs, runtime_devid, plan_ndevs, runtime_ndevs):
+    kw_pairs = [f'{key}={value}' for key, value in kwargs.items()]
+    return f"torch.xadd({', '.join(list(args) + kw_pairs)})"
+
+
+@nnscaler.register_op(
+    '*, * -> *',
+    emit_fn=emit_multiprocess_customized_add,
+)
+def multiprocess_customized_add(x, y):
+    return x + y
+
+
+class MultiprocessCustomizedEmitModule(torch.nn.Module):
+    def forward(self, x, y):
+        return multiprocess_customized_add(x, y)
 
 
 def _gencode_worker(tempdir):
@@ -60,6 +79,63 @@ def test_codegen():
         m_new = _to_cube_model(m, ComputeConfig(2, 4), cube_savedir=tempdir, load_module=False)
         assert m_new is None
         launch_torchrun(1, _gencode_worker, tempdir)
+
+
+@replace_all_device_with('cpu')
+def test_codegen_multiprocess():
+    old_line_timer = CompileFlag.line_timer
+    try:
+        CompileFlag.line_timer = True
+        with tempfile.TemporaryDirectory() as tempdir:
+            m_new = _to_cube_model(
+                Module0(),
+                ComputeConfig(1, 4),
+                cube_savedir=tempdir,
+                load_module=False,
+                max_workers=2,
+            )
+            assert m_new is None
+            for rank in range(4):
+                assert _gencode_contains(tempdir, Module0, rank, rf'rank = {rank}')
+                assert _gencode_contains(
+                    tempdir, Module0, rank,
+                    r'nnscaler\.runtime\.function\.print_time',
+                )
+    finally:
+        CompileFlag.line_timer = old_line_timer
+
+
+@replace_all_device_with('cpu')
+def test_codegen_multiprocess_customized_emit(tmp_path):
+    parallelize(
+        MultiprocessCustomizedEmitModule(),
+        {'x': torch.randn(2, 4), 'y': torch.randn(2, 4)},
+        'data',
+        ComputeConfig(1, 2),
+        gen_savedir=tmp_path,
+        load_module=False,
+        max_workers=2,
+    )
+
+    for rank in range(2):
+        assert _gencode_contains(
+            tmp_path,
+            MultiprocessCustomizedEmitModule,
+            rank,
+            r'torch\.xadd\(',
+        )
+
+
+@pytest.mark.parametrize('max_workers', [1.5, '2'])
+def test_codegen_max_workers_type(max_workers):
+    with pytest.raises(TypeError, match='max_workers must be an int'):
+        _to_cube_model(
+            Module0(),
+            ComputeConfig(1, 1),
+            cube_savedir='unused',
+            load_module=False,
+            max_workers=max_workers,
+        )
 
 
 class SliceModule(torch.nn.Module):

@@ -76,6 +76,7 @@ def test_gencode_correct_dataloader_order(tmp_path):
         gen_savedir=tmp_path,
         load_module=False,
         reuse='override',
+        max_workers=2,
     )
     # the dataloader order should be the same across different ranks,
     # otherwise it may cause weird bugs.

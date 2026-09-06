@@ -24,6 +24,9 @@ class Sign2EmitRule:
             SELF_GETATTR_SIG: self.emit_self_getattr,
             'nnscaler.runtime.function.ifexpr': self.emit_ifexpr,
         }
+        # save the customized emit rules for operators registered by `nnscaler.register_op`
+        # so we can safely pickle the Sign2EmitRule object for multiprocess codegen
+        self._customized_op_emit = dict(CustomizedOps.kOpEmit)
 
     def map(self, signature: str) -> Callable:
         """Get the emit rule for the given signature
@@ -34,8 +37,8 @@ class Sign2EmitRule:
         Returns:
             Callable: emit rule that takes the node, args (List[str]) and kwargs (Dict[str, str]) as input
         """
-        if signature in CustomizedOps.kOpEmit:
-            return CustomizedOps.kOpEmit[signature]
+        if signature in self._customized_op_emit:
+            return self._customized_op_emit[signature]
         else:
             return self._sign2rule.get(signature, self.emit_common)
 

@@ -3,6 +3,7 @@
 
 from pathlib import Path
 
+import pytest
 import torch
 
 from nnscaler.graph.parser import FxModuleParser
@@ -30,13 +31,19 @@ def test_save_attr_content_index(tmp_path: Path):
         assert torch.equal(torch.load(f'{file_stem}.{idx}', weights_only=True)[tensor.tid], value)
 
 
-def test_load_attr_content_only_reads_required_chunks(tmp_path: Path, monkeypatch):
+@pytest.mark.parametrize('with_index', [True, False])
+def test_load_attr_content_reads_compatible_chunks(
+    tmp_path: Path, monkeypatch, with_index: bool,
+):
     file_stem = tmp_path / FxModuleParser.ATTR_CONTENT_FILE_STEM
     torch.save({10: torch.full((4,), 10.0)}, f'{file_stem}.0')
-    # This chunk must never be opened by the loader.
-    Path(f'{file_stem}.1').write_bytes(b'not a torch checkpoint')
+    torch.save({20: torch.full((4,), 20.0)}, f'{file_stem}.1')
     torch.save({30: torch.arange(8, dtype=torch.float32)}, f'{file_stem}.2')
-    torch.save({10: 0, 20: 1, 30: 2}, tmp_path / FxModuleParser.ATTR_CONTENT_INDEX_FILE)
+    if with_index:
+        torch.save(
+            {10: 0, 20: 1, 30: 2},
+            tmp_path / FxModuleParser.ATTR_CONTENT_INDEX_FILE,
+        )
 
     module = CubeModule()
     module.register_parameter('local_weight', torch.nn.Parameter(torch.empty(3)))
@@ -51,18 +58,25 @@ def test_load_attr_content_only_reads_required_chunks(tmp_path: Path, monkeypatc
         sub_shape=(3,),
     )
 
-    load_calls = []
+    loaded_files = []
     torch_load = torch.load
 
     def record_load(filename, *args, **kwargs):
-        load_calls.append((Path(filename).name, kwargs.copy()))
+        loaded_files.append((Path(filename).name, kwargs.copy()))
         return torch_load(filename, *args, **kwargs)
 
     monkeypatch.setattr(torch, 'load', record_load)
     module.load_attr_content(str(file_stem))
 
     assert torch.equal(module.local_weight, torch.arange(2, 5, dtype=torch.float32))
-    assert load_calls == [
-        (FxModuleParser.ATTR_CONTENT_INDEX_FILE, {'weights_only': True}),
-        ('fullmodel.pt.2', {'mmap': True, 'weights_only': True}),
-    ]
+    if with_index:
+        assert loaded_files == [
+            (FxModuleParser.ATTR_CONTENT_INDEX_FILE, {}),
+            ('fullmodel.pt.2', {'mmap': True, 'weights_only': True}),
+        ]
+    else:
+        assert loaded_files == [
+            ('fullmodel.pt.0', {'mmap': True, 'weights_only': True}),
+            ('fullmodel.pt.1', {'mmap': True, 'weights_only': True}),
+            ('fullmodel.pt.2', {'mmap': True, 'weights_only': True}),
+        ]

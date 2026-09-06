@@ -197,7 +197,23 @@ def _split_grads_for_apex_l2norm(
         if grad.numel() <= max_tensor_numel:
             apex_grads.append(grad)
         else:
-            apex_grads.extend(grad.view(-1).split(max_tensor_numel))
+            if grad.is_contiguous():
+                flat_grad = grad.view(-1)
+            elif (
+                grad.ndim == 4
+                and grad.is_contiguous(memory_format=torch.channels_last)
+            ) or (
+                grad.ndim == 5
+                and grad.is_contiguous(memory_format=torch.channels_last_3d)
+            ):
+                flat_grad = grad.as_strided(
+                    (grad.numel(),), (1,), grad.storage_offset())
+            else:
+                raise ValueError(
+                    'Apex L2 norm only supports contiguous, channels-last, '
+                    'or channels-last-3d gradients'
+                )
+            apex_grads.extend(flat_grad.split(max_tensor_numel))
     return apex_grads
 
 
@@ -216,8 +232,9 @@ def _multi_tensor_total_norm(grads, chunk_size=2048 * 32) -> torch.Tensor:
             per_device_grads[device] = cur_device_grads
         cur_device_grads.append(grad)
     for device in per_device_grads.keys():
-        cur_device_grads = _split_grads_for_apex_l2norm(per_device_grads[device])
+        cur_device_grads = per_device_grads[device]
         if device.type == "cuda":
+            cur_device_grads = _split_grads_for_apex_l2norm(cur_device_grads)
             # TODO(msb) return has_inf
             has_inf = torch.zeros((1, 1), dtype=torch.int, device=device)
             with torch.cuda.device(device):

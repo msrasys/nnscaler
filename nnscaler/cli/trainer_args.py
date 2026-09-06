@@ -998,9 +998,17 @@ class TrainerArgs(PrecisionMixin, PolicyMixin):
     # auto: automatically decide the reuse strategy (moo for compile, match for run)
     # Or one of match/override/moo/graph (see `nnscaler.ReuseType`)
     gen_reuse: str = 'auto'
+    # The number of workers for generating code.
+    # an import-safe entry point guarded by `if __name__ == '__main__':`.
+    # When `gen_max_workers` is greater than 1, the code generation will use multiple processes.
+    # If the graph is large, and/or the runtime_ngpus is large,
+    # you may want to increase this number to speed up code generation.
+    # Note that increasing this number will also introduce the overhead of inter-process communication.
+    gen_max_workers: int = 1
     pas_policy: str = 'autodist'
     broadcast_strategy: str = 'all'
-    codegen_workers: int = 1
+    # Backward-compatible alias for gen_max_workers.
+    codegen_workers: Optional[int] = None
     # sometimes you want to dynamically set the instance name
     # for example, you can set it to the hash of related files
     # In that case, we can pass a dict with callable __type field.
@@ -1142,10 +1150,17 @@ class TrainerArgs(PrecisionMixin, PolicyMixin):
         else:
             self.gen_reuse = 'moo' if self.run_mode == 'compile' else 'match'
 
+        if not isinstance(self.gen_max_workers, int):
+            raise TypeError(
+                f"gen_max_workers must be an int, but got {type(self.gen_max_workers).__name__}"
+            )
+        if self.gen_max_workers < 1:
+            raise ValueError("gen_max_workers must be positive")
+
         if self.broadcast_strategy not in [e.value for e in BroadcastGenFilesStrategy]:
             raise ValueError(f"Invalid broadcast_strategy {self.broadcast_strategy}")
 
-        if (
+        if self.codegen_workers is not None and (
             isinstance(self.codegen_workers, bool)
             or not isinstance(self.codegen_workers, int)
             or self.codegen_workers < 1

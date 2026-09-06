@@ -192,15 +192,16 @@ class HybridOptimizer(torch.optim.Optimizer, TrainHookHost, TrainHook):
                     raise ValueError(f"Param group indices must be consecutive. We have {len(opt_config.param_groups)} groups, got max group id {max(param_groups.keys())}")
                 for param_group_idx, param_group in param_groups.items():
                     param_group.update(opt_config.param_groups[param_group_idx].options)
-            else:
+            elif len(param_groups) == 1:
                 if len(opt_config.param_groups) > 1:
                     raise ValueError(f"Expected at most 1 param group, got {len(opt_config.param_groups)}")
                 if opt_config.param_groups:
                     param_groups[0].update(opt_config.param_groups[0].options)
-            optimizer_params = list(param_groups.values())
-            if not optimizer_params:
-                optimizer_params = [{'params': []}]
-            optimizer = opt_config.type(optimizer_params, **opt_config.options)
+            else:
+                param_groups[0] = {'params': []}
+                if opt_config.param_groups:
+                    param_groups[0].update(opt_config.param_groups[0].options)
+            optimizer = opt_config.type(param_groups.values(), **opt_config.options)
             self.optimizers.append(optimizer)
 
         # map from param global index to (optimizer_idx, param_idx)

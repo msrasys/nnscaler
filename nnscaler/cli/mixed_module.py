@@ -118,7 +118,7 @@ class ModuleParallelizeConfigAdapter(PrecisionMixin, PolicyMixin):
         return (
             self.parallel_module.codegen_workers
             if self.parallel_module and self.parallel_module.codegen_workers is not None
-            else self.trainer_args.codegen_workers
+            else self.trainer_args.codegen_workers or self.trainer_args.gen_max_workers
         )
 
     @property
@@ -241,9 +241,9 @@ class ModuleParallelizeConfigAdapter(PrecisionMixin, PolicyMixin):
             reuse=self.gen_reuse,
             instance_name=self.instance_name,
             broadcast_strategy=self.broadcast_strategy,
-            codegen_workers=self.codegen_workers,
             load_module=load_module,
             autoset_requires_grad=self.autoset_requires_grad,
+            max_workers=self.codegen_workers,
         )
         if load_module:
             pmodel = pmodel_class(init_params=init_params, build_buckets=False)
