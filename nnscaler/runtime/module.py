@@ -405,7 +405,7 @@ class CubeModule(torch.nn.Module):
                 # part_model contains a subset of attributes, where each attribute is a fulltensor
                 # fulltensor.tid -> torch.Tensor
                 part_model: Dict[int, torch.Tensor] = torch.load(
-                    filename + f'.{file_idx}', weights_only=True)
+                    filename + f'.{file_idx}', mmap=True, weights_only=True)
                 loaded_names = set()
                 for attr_name in attr_names:
                     meta = self._fullmap[attr_name]

@@ -62,7 +62,11 @@ def test_load_attr_content_reads_compatible_chunks(
     torch_load = torch.load
 
     def record_load(filename, *args, **kwargs):
-        loaded_files.append((Path(filename).name, kwargs.get('weights_only')))
+        loaded_files.append((
+            Path(filename).name,
+            kwargs.get('mmap'),
+            kwargs.get('weights_only'),
+        ))
         return torch_load(filename, *args, **kwargs)
 
     monkeypatch.setattr(torch, 'load', record_load)
@@ -71,12 +75,12 @@ def test_load_attr_content_reads_compatible_chunks(
     assert torch.equal(module.local_weight, torch.arange(2, 5, dtype=torch.float32))
     if with_index:
         assert loaded_files == [
-            (FxModuleParser.ATTR_CONTENT_INDEX_FILE, None),
-            ('fullmodel.pt.2', True),
+            (FxModuleParser.ATTR_CONTENT_INDEX_FILE, None, None),
+            ('fullmodel.pt.2', True, True),
         ]
     else:
         assert loaded_files == [
-            ('fullmodel.pt.0', True),
-            ('fullmodel.pt.1', True),
-            ('fullmodel.pt.2', True),
+            ('fullmodel.pt.0', True, True),
+            ('fullmodel.pt.1', True, True),
+            ('fullmodel.pt.2', True, True),
         ]
