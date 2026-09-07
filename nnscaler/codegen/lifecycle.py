@@ -8,6 +8,7 @@ from nnscaler.ir.cten import IRCell, IRTensor, IRObject
 from nnscaler.ir.tensor import IRSubTensor
 from nnscaler.graph.segment import IRSegment
 from nnscaler.execplan.execplan import ExeReuseCell
+from nnscaler.graph.schedule.schedplan import ScheduleAction
 
 from nnscaler.codegen.emit import FuncEmission
 
@@ -48,17 +49,27 @@ class LifeCycle:
                     inputs = node.inputs()
                 # backward segment
                 else:
-                    # in `_train_step`, we will explicitly call backward to generate gradients.
-                    # When pipeline is enabled, there will be multiple backward calls in the same segment.
-                    # So we also need to track the temporary gradient tensors
-                    # and delete them after the backward call to save memory.
-                    fw_inputs, fw_outputs, output_grads, input_grads = \
-                        func_emission.get_backward_callsite_io_tensors(node)
-                    # remove loss gradient
-                    output_grads = [t for t in output_grads if not t.is_loss()]
+                    action = node.action if isinstance(node, ExeReuseCell) else None
+                    # when the action is BACKWARD_WEIGHT and there is post_hook,
+                    # we need to delay all inputs or outputs until the post_hook is executed
+                    if (
+                        action == ScheduleAction.BACKWARD_WEIGHT
+                        and node.cell.post_hook is None
+                    ):
+                        outputs = ()
+                        inputs = ()
+                    else:
+                        # in `_train_step`, we will explicitly call backward to generate gradients.
+                        # When pipeline is enabled, there will be multiple backward calls in the same segment.
+                        # So we also need to track the temporary gradient tensors
+                        # and delete them after the backward call to save memory.
+                        fw_inputs, fw_outputs, output_grads, input_grads = \
+                            func_emission.get_backward_callsite_io_tensors(node)
+                        # remove loss gradient
+                        output_grads = [t for t in output_grads if not t.is_loss()]
 
-                    outputs = input_grads
-                    inputs = list(itertools.chain(fw_inputs, fw_outputs, output_grads))
+                        outputs = input_grads
+                        inputs = list(itertools.chain(fw_inputs, fw_outputs, output_grads))
             else:
                 outputs = node.outputs()
                 inputs = node.inputs()

@@ -11,7 +11,7 @@ from nnscaler.ir.tensor import IRSubTensor, IRFullTensor
 from nnscaler.ir.adapter import IRAdapter, IRWeightReducer
 from nnscaler.ir.operator import IRBpOperation, IRFwOperation, IRDataOperation
 from nnscaler.graph.graph import IRGraph, IRSegment
-from nnscaler.graph.schedule.schedplan import SchedulePlan, Block, StreamContext
+from nnscaler.graph.schedule.schedplan import Block, ScheduleAction, SchedulePlan, StreamContext
 
 
 class ExeReuseCell(IRCell):
@@ -22,8 +22,13 @@ class ExeReuseCell(IRCell):
     execute on a same code piece.
     """
 
-    def __init__(self, cell: IRCell,
-                 inputs: List[IRSubTensor], outputs: List[IRSubTensor]):
+    def __init__(
+        self,
+        cell: IRCell,
+        inputs: List[IRSubTensor],
+        outputs: List[IRSubTensor],
+        action: Optional[ScheduleAction] = None,
+    ):
         """
         Args:
             cell: The original IRCell to be reused.
@@ -31,6 +36,7 @@ class ExeReuseCell(IRCell):
                 Each ExeReuseCell will have different id for different micro-batches.
             outputs: A list of IRSubTensor objects representing the new outputs for the reused cell.
                 Each ExeReuseCell will have different id for different micro-batches.
+            action: The schedule action this cell executes, if it comes from a SchedulePlan.
         """
         assert len(inputs) == len(cell.inputs())
         assert len(outputs) == len(cell.outputs()), (
@@ -43,6 +49,7 @@ class ExeReuseCell(IRCell):
         for idx, t in enumerate(outputs):
             self.set_output(idx, t)
         self._cell: IRCell = cell
+        self._action = action
         self._cached_dispatched: Dict[int, ExeReuseCell] = {}
 
     @property
@@ -52,6 +59,10 @@ class ExeReuseCell(IRCell):
     @property
     def cell(self) -> IRCell:
         return self._cell
+
+    @property
+    def action(self) -> Optional[ScheduleAction]:
+        return self._action
 
     def isfw(self) -> bool:
         return self._cell.isfw()
@@ -104,7 +115,12 @@ class ExeReuseCell(IRCell):
                 t = new_t
             expanded_outputs.append(t)
 
-        reuse = ExeReuseCell(dispatch_cell, expanded_inputs, expanded_outputs)
+        reuse = ExeReuseCell(
+            dispatch_cell,
+            expanded_inputs,
+            expanded_outputs,
+            action=self._action,
+        )
         reuse._id = self._id
         reuse._op_context = self._op_context
         if _mirror and self.mirror is not None:
@@ -168,6 +184,18 @@ class ExecutionPlan:
             return t
 
         micro_fcells: Dict[(int, IRCell), ExeReuseCell] = {}
+        def make_reuse(
+            cell: IRCell,
+            micro_idx: int,
+            action: Optional[ScheduleAction] = None,
+        ) -> ExeReuseCell:
+            return ExeReuseCell(
+                cell,
+                [get(t, micro_idx) for t in cell.inputs()],
+                [get(t, micro_idx) for t in cell.outputs()],
+                action=action,
+            )
+
         def block2reuse(node: Block) -> ExeReuseCell:
             # Note: we set op_context for forward and backward seperately.
             # But as forward/backward are paired
@@ -177,23 +205,29 @@ class ExecutionPlan:
                 key = (node.mid, node.content)
                 if key in micro_fcells:
                     return micro_fcells[key]
-                inputs = [get(t, node.mid) for t in node.content.inputs()]
-                outputs = [get(t, node.mid) for t in node.content.outputs()]
-                cell = ExeReuseCell(node.content, inputs, outputs)
+                cell = make_reuse(node.content, node.mid)
                 if node.stream_context is not None:
                     cell.set_op_context('stream_context', node.stream_context)
                 if isinstance(node.content.mirror, IRCell):
-                    minputs = [get(t, node.mid) for t in node.content.mirror.inputs()]
-                    moutputs = [get(t, node.mid) for t in node.content.mirror.outputs()]
-                    mcell = ExeReuseCell(node.content.mirror, minputs, moutputs)
+                    mcell = make_reuse(node.content.mirror, node.mid)
                     IRCell.make_pair(cell, mcell)
                 micro_fcells[key] = cell
                 return cell
             else:
-                mcell = block2reuse(Block(node.content.mirror, node.mid, node.span))
+                if node.action == ScheduleAction.BACKWARD:
+                    # set pair for forward and backward actions.
+                    mcell = block2reuse(Block(node.content.mirror, node.mid, node.span)).mirror
+                else:
+                    # for I/W backward, we create a new reuse cell for the current action
+                    # and pair it with its forward mirror.
+                    # in this case, the forward saved in `micro_fcells` will not be used
+                    # instead we create a new forward reuse cell and pair it with the current backward cell.
+                    mcell = make_reuse(node.content, node.mid, node.action)
+                    fmirror = make_reuse(node.content.mirror, node.mid)
+                    IRCell.make_pair(fmirror, mcell)
                 if node.stream_context is not None:
-                    mcell.mirror.set_op_context('stream_context', node.stream_context)
-                return mcell.mirror
+                    mcell.set_op_context('stream_context', node.stream_context)
+                return mcell
 
         topo_seqs: List[IRCell] = []
         for block in schedplan.nodes():
