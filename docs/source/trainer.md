@@ -1473,8 +1473,17 @@ of `ComputeConfig` as a dictionary.
     support Adam-like optimizers. It will automatically choose the best
     partition for you by balancing the memory usage and speed. It has
     the following configurations.
+    - `legacy (bool)`: Use the original graph-rewriting AutoDist
+      implementation. Default is `True`. Set it to `False` to convert
+      the AutoDist result to `OpPlan` objects and apply it through the
+      general `fn` policy. In this mode all pipeline stages use the same
+      tensor-parallel degree.
     - `update_freq (int)`: the update frequency when training the
-      module. Default is 1. Optional.
+      module. Default is 1. AutoDist supports one distinct value per
+      compiled model. Step-dependent configurations are rejected when
+      they contain different values. For the `fn` implementation,
+      `pipeline_nmicros` is derived from this value and must not be
+      configured separately.
     - `mem_constraint (float)`: The memory constraint in each device in
       GB. Optional.
     - `task_name (str)`: The name of the current task to distinguish
@@ -1499,6 +1508,10 @@ of `ComputeConfig` as a dictionary.
       constraints file. Optional.
     - `recompute_modules (str)`: The module names to recompute,
       separated by `,`. For example, `module1,module2`. Optional.
+    - `pipeline_nstages`: The number of pipeline stages, or `"auto"`.
+      Default is `"auto"`. Pipeline requires `pipeline_pivots`. Pipeline
+      inference is currently unsupported: inference with `"auto"` uses
+      one stage, while an explicit value greater than one is rejected.
     - `pipeline_pivots (str)`: If set, autodist will try pipeline
       parallelism to find the best partition plan. It specifies the
       module names to pivot the pipeline, separated by `,`. For example,
@@ -1514,7 +1527,7 @@ of `ComputeConfig` as a dictionary.
       Optional.
     - `max_partition_degree`: Max degree when partitioning an operator /
       node. When pipeline parallelism is enabled to explore
-      (`explore_pipeline` is True), user can change the value to
+      (through `pipeline_pivots`), user can change the value to
       constrain the plan to be composed of stages that span on less or
       equal to `max_partition_degree` devices (recommend to set
       `max_partition_degree` to the number of devices in a node to avoid
@@ -1527,6 +1540,9 @@ of `ComputeConfig` as a dictionary.
       when some operators consume or generate a large tensor (>= 4GB).
       In this case, you can set `transient_mem_coef` to a smaller value
       to relax the constraint. Default is `2`. Optional.
+
+    AutoDist supports `ComputeConfig.use_zero` values `0` and `1`.
+    ZeRO-3 is not represented by the AutoDist cost model and is rejected.
 
 You can also put any other settings that can affect code generation
 here. but please prefix the keys with `_` to avoid conflicts with
@@ -1541,6 +1557,7 @@ compute_config = ComputeConfig(
     use_zero=...,
     pas_config={
         '__pas_name': ...,   # addtional configurations that can affect code generation.
+        'legacy': ...,
         'update_freq': ...,
         'mem_constraint': ...,
         'task_name': ...,
@@ -1554,7 +1571,9 @@ compute_config = ComputeConfig(
         'save_plan_path': ...,
         'partition_constraints_path': ...,
         'recompute_modules': ...,
+        'pipeline_nstages': ...,
         'pipeline_pivots': ...,
+        'pipeline_scheduler': ...,
         'use_apex_fused_adam_v2': ...,
     },
 )

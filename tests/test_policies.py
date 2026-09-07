@@ -40,16 +40,15 @@ class MLP(nn.Module):
         return loss
 
 
-def dummy_data():
+def dummy_data(device=None):
+    kwargs = {'device': device} if device is not None else {}
     return {
-        'data': torch.randn(
-            MBS, DIM, device=torch.cuda.current_device()),
-        'target': torch.rand(
-            MBS, DIM, device=torch.cuda.current_device())
+        'data': torch.randn(MBS, DIM, **kwargs),
+        'target': torch.rand(MBS, DIM, **kwargs),
     }
 
 
-@pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.device_count() < 4, reason='lack of gpu devices')
+@replace_all_device_with('cpu')
 def test_autodist():
     with tempfile.TemporaryDirectory() as tempdir:
         m_new = parallelize(
@@ -59,11 +58,42 @@ def test_autodist():
             ComputeConfig(2, 4, pas_config={
                     'update_freq': 1,
                     'task_name': 'test_autodist',
+                    'parallel_profile': False,
+                    'mem_constraint': 1,
             }),
             gen_savedir=tempdir,
             load_module=False
         )
         assert m_new is None
+
+
+@replace_all_device_with('cpu')
+def test_autodist_reuse_does_not_mutate_compute_config():
+    with tempfile.TemporaryDirectory() as tempdir:
+        compute_config = ComputeConfig(
+            1,
+            1,
+            use_end2end=True,
+            pas_config={
+                'update_freq': 1,
+                'parallel_profile': False,
+                'legacy': False,
+                'mem_constraint': 1,
+            },
+        )
+        expected_pas_config = compute_config.pas_config.copy()
+
+        for _ in range(2):
+            parallelize(
+                MLP(),
+                {'data': dummy_data()},
+                'autodist',
+                compute_config,
+                gen_savedir=tempdir,
+                reuse='match',
+                load_module=False,
+            )
+            assert compute_config.pas_config == expected_pas_config
 
 
 def test_call_name():
