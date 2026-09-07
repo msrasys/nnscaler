@@ -98,6 +98,20 @@ def policy_1f1b_interleaved(graph, cfg):
     return graph
 
 
+def policy_explicit_fbw(graph, cfg):
+    from tests.test_policies import sched_explicit_fbw
+
+    graph = policy_1f1b(graph, cfg)
+    num_microbatches = cfg.pas_config['n_micro_batches']
+    num_stages = len([
+        segment
+        for segment in graph.select(ntype=IRSegment, flatten=False)
+        if segment.isfw()
+    ])
+    sched_explicit_fbw(graph, num_microbatches, num_stages)
+    return graph
+
+
 def _train_pp(model: ParallelModule, num_replicas, rank):
     mbs = model.nmicros_per_scheduler_step
     assert model.use_scheduler
@@ -121,7 +135,7 @@ def _train_pp(model: ParallelModule, num_replicas, rank):
     return results
 
 
-def worker_pipeline_2(n_micro_batches):
+def worker_pipeline_2(n_micro_batches, explicit_fbw=False):
     nnscaler.init()
     torch.manual_seed(0)
     if torch.cuda.is_available():
@@ -129,9 +143,17 @@ def worker_pipeline_2(n_micro_batches):
     m = Model()
     m.train()
     trace_data = torch.randn([2, 32], dtype=torch.float32, device=torch.cuda.current_device())
-    cfg = ComputeConfig(2, 2, use_end2end=True, pas_config=dict(n_micro_batches=n_micro_batches))
+    cfg = ComputeConfig(
+        2,
+        2,
+        use_end2end=True,
+        use_fbw=explicit_fbw,
+        pas_config=dict(n_micro_batches=n_micro_batches),
+    )
+    comparison_policy = policy_explicit_fbw if explicit_fbw else policy_1f1b_interleaved
+    comparison_name = 'explicit_fbw' if explicit_fbw else '1f1b_interleaved'
 
-    with clear_dir_on_rank0(Path(tempfile.gettempdir()) / f'test_1f1b_interleaved_{PYTEST_RUN_ID}') as tempdir:
+    with clear_dir_on_rank0(Path(tempfile.gettempdir()) / f'test_{comparison_name}_{PYTEST_RUN_ID}') as tempdir:
         pm_1f1b = parallelize(
                 m,
                 {'x': trace_data},
@@ -141,19 +163,31 @@ def worker_pipeline_2(n_micro_batches):
                 gen_savedir=tempdir,
                 instance_name='1f1b',
         ).cuda()
-        pm_1f1b_interleaved = parallelize(
+        pm_comparison = parallelize(
                 m,
                 {'x': trace_data},
-                policy_1f1b_interleaved,
+                comparison_policy,
                 cfg,
                 reuse='override',
                 gen_savedir=tempdir,
-                instance_name='1f1b_interleaved',
+                instance_name=comparison_name,
         ).cuda()
+        if explicit_fbw:
+            calls = _gencode_contains(
+                tempdir,
+                Model,
+                torch.distributed.get_rank(),
+                r'nnscaler\.runtime\.executor\.(backward_input|backward_weight)\(',
+                instance_name=comparison_name,
+            )
+            assert calls == (
+                ['backward_input'] * n_micro_batches
+                + ['backward_weight'] * n_micro_batches
+            )
 
     results_1f1b = _train_pp(pm_1f1b, 1, 0)
-    results_1f1b_interleaved = _train_pp(pm_1f1b_interleaved, 1, 0)
-    return (results_1f1b, results_1f1b_interleaved)
+    results_comparison = _train_pp(pm_comparison, 1, 0)
+    return results_1f1b, results_comparison
 
 
 @pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.device_count() < 2, reason='lack of gpu devices')
@@ -169,4 +203,18 @@ def test_interleaved_1f1b(n_micro_batches):
         assert_equal(
             merge_state_dicts([results_1f1b0[i], results_1f1b1[i]]),
             merge_state_dicts([results_1f1b_interleaved0[i], results_1f1b_interleaved1[i]])
+        )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.device_count() < 2, reason='lack of gpu devices')
+def test_explicit_fbw():
+    results = launch_torchrun(2, worker_pipeline_2, 4, True)
+    implicit0, explicit0 = results[0]
+    implicit1, explicit1 = results[1]
+
+    assert len(implicit0) == len(explicit0)
+    for step in range(len(implicit0)):
+        assert_equal(
+            merge_state_dicts([implicit0[step], implicit1[step]]),
+            merge_state_dicts([explicit0[step], explicit1[step]]),
         )

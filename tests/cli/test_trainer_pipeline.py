@@ -82,19 +82,23 @@ def test_trainer_pipeline(tmp_path):
             '--compute_config.use_fbw', 'True'
         ]
     )
+    launch_torchrun(4, trainer_worker_pipeline, tmp_path, 'trainer_args_pipeline.yaml',
+        'explicit_fbw_async',
+        [
+            '--compute_config.pas_config.pipeline_scheduler', 'tests.test_policies.sched_explicit_fbw',
+            '--compute_config.use_async_comm', 'True',
+            '--compute_config.use_fbw', 'True',
+        ]
+    )
 
     merged_files = list((tmp_path).glob('merged_*.pt'))
-    assert len(merged_files) == 5
+    assert len(merged_files) == 6
     merged_state_dicts = [torch.load(merged_file, weights_only=False) for merged_file in merged_files]
 
-    assert_equal(merged_state_dicts[0]['model'], merged_state_dicts[1]['model'])
-    assert_equal(merged_state_dicts[0]['optimizer'], merged_state_dicts[1]['optimizer'])
-    assert_equal(merged_state_dicts[0]['model'], merged_state_dicts[2]['model'])
-    assert_equal(merged_state_dicts[0]['optimizer'], merged_state_dicts[2]['optimizer'])
-    assert_equal(merged_state_dicts[0]['model'], merged_state_dicts[3]['model'])
-    assert_equal(merged_state_dicts[0]['optimizer'], merged_state_dicts[3]['optimizer'])
-    assert_equal(merged_state_dicts[0]['model'], merged_state_dicts[4]['model'])
-    assert_equal(merged_state_dicts[0]['optimizer'], merged_state_dicts[4]['optimizer'])
+    reference = merged_state_dicts[0]
+    for state_dict in merged_state_dicts[1:]:
+        assert_equal(reference['model'], state_dict['model'])
+        assert_equal(reference['optimizer'], state_dict['optimizer'])
 
     # when compute_config.use_async_comm is True, and compute_config.use_fbw is True
     # the code will look like:

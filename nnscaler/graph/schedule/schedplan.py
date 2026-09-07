@@ -53,7 +53,7 @@ Some implementation details:
 
 How to create a SchedulePlan for users:
 1) Create a SchedulePlan with the graph and number of micro-batches.
-2) Add segments to the plan by `add_segment` or `insert_step` interface, and specify stream context for each segment if needed.
+2) Add segments to the plan by `add_segment` or `insert_step` interface, and specify an action or stream context if needed.
 3) Set `stream_config` property to set stream configuration for other operations.
 4) Call `finish` to mark done.
 
@@ -61,7 +61,7 @@ How to create a SchedulePlan for users:
 
 from typing import Dict, List,  Optional, Tuple, Set, Union
 from dataclasses import dataclass, field
-from enum import IntEnum
+from enum import Enum, IntEnum
 
 from nnscaler.ir.cten import IRCell
 from nnscaler.ir.adapter import IRAdapter
@@ -71,6 +71,18 @@ from nnscaler.ir.operator import IRDataOperation
 from nnscaler.graph.graph import IRGraph
 from nnscaler.graph.segment import IRSegment
 from nnscaler.flags import CompileFlag
+
+
+class ScheduleAction(str, Enum):
+    """An explicitly scheduled portion of a backward segment.
+
+    Explicit input- and weight-backward actions may be separated by other
+    actions, but must retain their per-segment microbatch order.
+    """
+    FORWARD = 'F'
+    BACKWARD = 'B'
+    BACKWARD_INPUT = 'I'
+    BACKWARD_WEIGHT = 'W'
 
 
 @dataclass
@@ -108,7 +120,14 @@ class Block:
     that is executed with input data of a given micro-batch index.
     """
 
-    def __init__(self, cell: IRCell, micro_batch_id: int, span: int, stream_context: Optional[StreamContext] = None) -> None:
+    def __init__(
+        self,
+        cell: IRCell,
+        micro_batch_id: int,
+        span: int,
+        stream_context: Optional[StreamContext] = None,
+        action: Optional[ScheduleAction] = None,
+    ) -> None:
         """Create an execution block with IRCell on microbatch index. The
         block will take `span` steps to finish execution.
         """
@@ -117,14 +136,30 @@ class Block:
         self._micro_batch_id: int = micro_batch_id
         self._span = span
         self._stream_context: Optional[StreamContext] = stream_context
+        if action is not None:
+            if not isinstance(cell, IRSegment):
+                raise ValueError('Schedule actions can only be assigned to segments')
+            action = ScheduleAction(action)
+            if cell.isfw() and action != ScheduleAction.FORWARD:
+                raise ValueError('Forward segments can only be assigned forward actions')
+            if not cell.isfw() and action == ScheduleAction.FORWARD:
+                raise ValueError('Backward segments can only be assigned backward actions')
+        elif isinstance(cell, IRSegment):
+            if cell.isfw():
+                action = ScheduleAction.FORWARD
+            else:
+                action = ScheduleAction.BACKWARD
+        self._action: Optional[ScheduleAction] = action
 
     def __eq__(self, other):
-        if isinstance(other, Block):
-            return other.content == self.content and other.mid == self.mid
-        return False
+        return isinstance(other, Block) and (
+            other.content == self.content
+            and other.mid == self.mid
+            and other.action == self.action
+        )
 
     def __hash__(self) -> int:
-        return hash((self._content, self._micro_batch_id))
+        return hash((self._content, self._micro_batch_id, self._action))
 
     @property
     def device(self) -> Tuple[int]:
@@ -146,8 +181,15 @@ class Block:
     def stream_context(self) -> Optional['StreamContext']:
         return self._stream_context
 
+    @property
+    def action(self) -> Optional[ScheduleAction]:
+        return self._action
+
     def __repr__(self) -> str:
-        return f"{self._content.cid}{'f' if self.content.isfw() else 'b'}{self._micro_batch_id}"
+        action = self._action.value.lower() if self._action is not None else (
+            'f' if self.content.isfw() else 'b'
+        )
+        return f"{self._content.cid}{action}{self._micro_batch_id}"
 
 
 class ScheduleDependency:
@@ -190,6 +232,10 @@ class ScheduleDependency:
         self.reducers = self.graph.select(ntype=IRWeightReducer, flatten=False)
 
     def depends(self, prev: Block, next: Block) -> bool:
+        # BACKWARD_WEIGHT action can be executed independently
+        # given the BACKWARD_INPUT action has been executed ( this check will be done later in `validate`)
+        if ScheduleAction.BACKWARD_WEIGHT in (prev.action, next.action):
+            return False
         return prev.mid == next.mid and self.graph.depends(prev.content, next.content)
 
 
@@ -294,6 +340,7 @@ class PlanBase:
         seg: IRSegment, micro_batch_id: int,
         step: int, span: Optional[int] = 1,
         stream_context: Optional[StreamContext] = None,
+        action: Optional[ScheduleAction] = None,
     ) -> Block:
         """Add a segment to be executed with micro_batch_id data at step.
 
@@ -304,11 +351,12 @@ class PlanBase:
             micro_batch_id (int): the micro-batch id to execute the segment
             step (int): the step to execute the segment
             span (int): the time step costs to execute the segment
+            action (ScheduleAction): the portion of the segment to execute
 
         Returns:
             block (Block): the block representing the segment
         """
-        block = Block(seg, micro_batch_id, span, stream_context)
+        block = Block(seg, micro_batch_id, span, stream_context, action)
         self.add_block(block, step)
         return block
 
@@ -317,6 +365,7 @@ class PlanBase:
         step: int, seg: IRSegment,
         micro_batch_id: int, span: Optional[int] = 1,
         stream_context: Optional[StreamContext] = None,
+        action: Optional[ScheduleAction] = None,
     ) -> Block:
         """Insert `span` steps at current `step`.
 
@@ -327,6 +376,7 @@ class PlanBase:
             seg (IRSegment): the segment to insert
             micro_batch_id (int): the micro-batch id to execute the segment
             span (int): the time step costs to execute the segment
+            action (ScheduleAction): the portion of the segment to execute
 
         Returns:
             block (Block): the block representing the segment
@@ -341,7 +391,7 @@ class PlanBase:
                 raise NotImplementedError(
                     f"Cannot shift the block {block} that is in execution on step {step}")
         # insert
-        block = Block(seg, micro_batch_id, span, stream_context)
+        block = Block(seg, micro_batch_id, span, stream_context, action)
         for _ in range(span):
             self._step_blocks.insert(step, [block])
             self._step_devices.insert(step, set(seg.device))
@@ -526,11 +576,53 @@ class SchedulePlan(PlanBase):
         Returns:
             valid (bool): whether the plan is valid
         """
+        if not self._validate_explicit_backward_actions():
+            return False
+
         for block1 in self._blocks:
             for block2 in self._blocks:
                 if self._dependency.depends(block1, block2):
                     if self.start(block1) + block1.span > self.start(block2):
                         return False
+        return True
+
+    def _validate_explicit_backward_actions(self) -> bool:
+        # key: (block.mid, forward_segment),
+        # value: dict of block.action -> block
+        mid_segments = {}
+        for block in self._blocks:
+            if not isinstance(block.content, IRSegment):
+                continue
+            if block.content.isfw():
+                key = (block.mid, block.content)
+            else:
+                key = (block.mid, block.content.mirror)
+            if key not in mid_segments:
+                mid_segments[key] = {}
+            mid_segments[key][block.action] = block
+
+        for _, blocks in mid_segments.items():
+            f_block= blocks.get(ScheduleAction.FORWARD)
+            b_block= blocks.get(ScheduleAction.BACKWARD)
+            i_block= blocks.get(ScheduleAction.BACKWARD_INPUT)
+            w_block= blocks.get(ScheduleAction.BACKWARD_WEIGHT)
+
+            if not f_block:
+                return False
+
+            if b_block:  # fb
+                if any((i_block, w_block)):
+                    return False
+                if self.start(f_block) + f_block.span > self.start(b_block):
+                    return False
+
+            if not b_block: # fiw
+                if not all((i_block, w_block)):
+                    return False
+                if self.start(f_block) + f_block.span > self.start(i_block):
+                    return False
+                if self.start(i_block) + i_block.span > self.start(w_block):
+                    return False
         return True
 
     def _place_adapters(self):
@@ -561,7 +653,9 @@ class SchedulePlan(PlanBase):
             for step in range(self.nsteps):
                 blocks = self.start_blocks(step)
                 assert all(isinstance(blk, Block) for blk in blocks)
-                segments = [block.content for block in blocks]
+                # ignoring backward weight actions
+                # as adapter should be placed after I/B actions
+                segments = [block.content for block in blocks if block.action != ScheduleAction.BACKWARD_WEIGHT]
                 mids = [block.mid for block in blocks]
                 if sender in segments:
                     span = blocks[segments.index(sender)].span
@@ -593,7 +687,7 @@ class SchedulePlan(PlanBase):
             if (idx + 1) % 3 == 0:
                 dscp += '\n'
 
-        dscp += '\nAnnotation: i(f/b)j = segment i on executing (forward/backward) microbatch j'
+        dscp += '\nAnnotation: i(f/b/i/w)j = segment i action on microbatch j'
         for devid in sorted(self.device):
             timeline = '\n'
             step = 0
@@ -605,7 +699,10 @@ class SchedulePlan(PlanBase):
                         have_block = True
                         break
                 if have_block:
-                    blk_repr = f"{sids[block.content]}{'f' if block.content.isfw() else 'b'}{block.mid}"
+                    action = block.action.value.lower() if block.action is not None else (
+                        'f' if block.content.isfw() else 'b'
+                    )
+                    blk_repr = f"{sids[block.content]}{action}{block.mid}"
                     timeline += f" {'-'.join([blk_repr] * block.span)}"
                     step += block.span
                 else:
