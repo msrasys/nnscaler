@@ -4,6 +4,7 @@
 import pytest
 import torch
 
+import nnscaler.runtime.executor as executor
 from nnscaler.runtime.executor import Executor
 
 
@@ -191,3 +192,34 @@ def test_backward_weight_requires_pending_input_backward():
     module = torch.nn.Linear(8, 16)
     with pytest.raises(RuntimeError, match='No pending weight backward'):
         Executor.backward_weight('linear', module.parameters())
+
+
+def test_custom_fbw_restores_module_symbols():
+    original_input = executor.backward_input
+    original_weight = executor.backward_weight
+
+    def outer_input(*args, **kwargs):
+        pass
+
+    def outer_weight(*args, **kwargs):
+        pass
+
+    def inner_input(*args, **kwargs):
+        pass
+
+    def inner_weight(*args, **kwargs):
+        pass
+
+    with pytest.raises(RuntimeError, match='expected'):
+        with executor.custom_fbw(outer_input, outer_weight):
+            assert executor.backward_input is outer_input
+            assert executor.backward_weight is outer_weight
+            with executor.custom_fbw(inner_input, inner_weight):
+                assert executor.backward_input is inner_input
+                assert executor.backward_weight is inner_weight
+            assert executor.backward_input is outer_input
+            assert executor.backward_weight is outer_weight
+            raise RuntimeError('expected')
+
+    assert executor.backward_input is original_input
+    assert executor.backward_weight is original_weight

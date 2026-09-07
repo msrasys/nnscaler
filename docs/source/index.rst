@@ -122,6 +122,7 @@ For any questions or inquiries, please contact us at nnscaler@service.microsoft.
    :caption: Advanced Usages
 
    parallel_module
+   fbw
    scale_unit_parallelism
    dimops
    verify_op
