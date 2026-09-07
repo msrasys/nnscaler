@@ -717,6 +717,9 @@ def _prepare_and_check_reusable(
         expected_output_files.append(outdir / _FORWARD_ARGS_DUMP_FILE)
         expected_output_files.append(outdir / ParallelModule.ORIGIN_MODULE_METADATA_FILE)
         expected_output_files.append(outdir / FxModuleParser.NON_PERSISTENT_BUFFER_FILE)
+        index_file = outdir / FxModuleParser.ATTR_CONTENT_INDEX_FILE
+        if index_file.exists():
+            expected_output_files.append(index_file)
 
         existing_attr_map_files = set(outdir.glob(f'{ParallelModule.ATTR_META_FILE_PREFIX}*.pkl'))
 
@@ -738,7 +741,10 @@ def _prepare_and_check_reusable(
             f for f in outdir.glob('*')
             if f.is_file() and (  # just take fullmodel.pt.0 to compare
                 not f.name.startswith(FxModuleParser.ATTR_CONTENT_FILE_STEM)
-                or f.name == FxModuleParser.ATTR_CONTENT_FILE_0
+                or f.name in (
+                    FxModuleParser.ATTR_CONTENT_FILE_0,
+                    FxModuleParser.ATTR_CONTENT_INDEX_FILE,
+                )
             ) and f not in existing_attr_map_files  # will manually check the attr map files
         ]
 

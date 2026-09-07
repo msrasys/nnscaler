@@ -11,6 +11,7 @@ import torch
 import shutil
 
 from nnscaler.graph.parser import FxModuleParser
+from nnscaler.graph.parser.frame import Frame
 from nnscaler.parallel import ReuseType, parallelize, ComputeConfig, _load_parallel_module_class
 from nnscaler.runtime.module import ParallelModule
 
@@ -46,6 +47,53 @@ class MyModule(torch.nn.Module):
 
     def forward(self, x):
         return self.linear(x)
+
+
+@replace_all_device_with('cpu')
+@pytest.mark.parametrize('reuse', [ReuseType.MATCH, ReuseType.MOO])
+def test_reuse_without_attr_content_index(tmp_path, reuse):
+    _to_cube_model(
+        MyModule, ComputeConfig(1, 1), tmp_path, ReuseType.MATCH,
+        'legacy', load_module=False,
+    )
+    module_path = next(
+        tmp_path.rglob(FxModuleParser.ATTR_CONTENT_INDEX_FILE)).parent
+    index_file = module_path / FxModuleParser.ATTR_CONTENT_INDEX_FILE
+    index_file.unlink()
+    code_mtime = (module_path / 'gencode0.py').stat().st_mtime_ns
+
+    _to_cube_model(
+        MyModule, ComputeConfig(1, 1), tmp_path, reuse,
+        'legacy', load_module=False,
+    )
+
+    assert not index_file.exists()
+    assert (module_path / 'gencode0.py').stat().st_mtime_ns == code_mtime
+
+
+@replace_all_device_with('cpu')
+def test_override_clears_attr_content_index(tmp_path, monkeypatch):
+    _to_cube_model(
+        MyModule, ComputeConfig(1, 1), tmp_path, ReuseType.MATCH,
+        'override_index', load_module=False,
+    )
+    module_path = next(
+        tmp_path.rglob(FxModuleParser.ATTR_CONTENT_INDEX_FILE)).parent
+    index_file = module_path / FxModuleParser.ATTR_CONTENT_INDEX_FILE
+
+    save_attr_content = Frame.save_attr_content
+
+    def check_index_was_cleared(self, save_file_stem, params_per_file=1024 * 1024 * 1024):
+        assert not index_file.exists()
+        return save_attr_content(self, save_file_stem, params_per_file)
+
+    monkeypatch.setattr(Frame, 'save_attr_content', check_index_was_cleared)
+    _to_cube_model(
+        MyModule, ComputeConfig(1, 1), tmp_path, ReuseType.OVERRIDE,
+        'override_index', load_module=False,
+    )
+
+    assert index_file.exists()
 
 
 @replace_all_device_with('cpu')
