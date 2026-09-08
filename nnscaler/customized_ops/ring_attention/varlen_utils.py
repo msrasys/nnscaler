@@ -29,6 +29,56 @@ _A2A_CACHE_MAXSIZE = 128
 _A2A_CACHE = OrderedDict()
 
 
+def select_sequence_group_cu_seqlens(
+    cu_seqlens: Tensor,
+    process_group: List[int],
+    sequence_group_count: int,
+) -> Tensor:
+    """Select packed-sequence boundaries for one context-parallel group.
+
+    A data-downsampled input can contain metadata for several independent data
+    shards even though each context-parallel group owns only one shard. During
+    tracing ``process_group`` is absent and callers keep the combined metadata;
+    generated distributed code supplies the group so this function selects and
+    rebases the corresponding shard boundaries.
+    """
+    sequence_group_count = int(sequence_group_count)
+    if sequence_group_count <= 1:
+        return cu_seqlens
+    if not process_group:
+        raise ValueError("process_group is required when sequence_group_count > 1")
+    if cu_seqlens.dim() != 1 or cu_seqlens.numel() < 2:
+        raise ValueError(f"cu_seqlens must be a non-empty 1D prefix sum, got {cu_seqlens.shape}")
+
+    sequence_parallel_size = len(process_group)
+    stage_size = sequence_parallel_size * sequence_group_count
+    group_index = (process_group[0] % stage_size) // sequence_parallel_size
+    total_tokens = int(cu_seqlens[-1].item())
+    if total_tokens % sequence_group_count != 0:
+        raise ValueError(
+            f"Packed token count {total_tokens} is not divisible by "
+            f"sequence_group_count={sequence_group_count}"
+        )
+    tokens_per_group = total_tokens // sequence_group_count
+    group_start = group_index * tokens_per_group
+    group_end = group_start + tokens_per_group
+    bounds = torch.tensor(
+        [group_start, group_end], dtype=cu_seqlens.dtype, device=cu_seqlens.device)
+    indices = torch.searchsorted(cu_seqlens, bounds)
+    left, right = int(indices[0].item()), int(indices[1].item())
+    if (
+        left >= cu_seqlens.numel()
+        or right >= cu_seqlens.numel()
+        or int(cu_seqlens[left].item()) != group_start
+        or int(cu_seqlens[right].item()) != group_end
+    ):
+        raise ValueError(
+            "Sequence-group boundaries must align with packed sequence boundaries: "
+            f"group=[{group_start}, {group_end}], cu_seqlens={cu_seqlens.tolist()}"
+        )
+    return cu_seqlens[left:right + 1] - group_start
+
+
 def _all_to_all_varlen(tensor: Tensor, input_split_sizes: List[int],
                         output_split_sizes: List[int], group: dist.ProcessGroup) -> Tensor:
     """All-to-all with variable split sizes along dim 0."""
