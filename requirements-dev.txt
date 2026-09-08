@@ -3,6 +3,7 @@ coverage
 furo
 mock
 myst-parser
+numpy>=1.23.5
 pre-commit
 pytest
 pytest-cov<7.0.0
