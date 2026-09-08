@@ -1107,6 +1107,8 @@ class IRGraph(IRSegment):
             return self.recompute(nodes.nodes())
 
         else:
+            if any(fnode.offload is not None for fnode in nodes):
+                raise ValueError("Recompute and CPU offload cannot be applied to the same operator")
             segments = [self.segment(node) for node in nodes]
             assert all(segment == segments[0] for segment in segments), \
                 "Cross-segment recompute is not allowed yet"
@@ -1137,6 +1139,25 @@ class IRGraph(IRSegment):
             nodes = nodes[:end]
             for fnode in nodes:
                 fnode.recompute = recompute_group_id
+        return True
+
+    def offload(self, nodes: Union[IRSegment, List[IRFwOperation]]) -> bool:
+        """Offload tensors saved for backward by a sequence of forward nodes to CPU."""
+        assert all(isinstance(node, IRFwOperation) for node in nodes) or isinstance(nodes, IRSegment), \
+            "Require forward nodes or a single segment"
+
+        if isinstance(nodes, IRSegment):
+            assert nodes.isfw() and (not nodes.isbw()), "Only forward IRSegment can offload"
+            return self.offload(nodes.nodes())
+
+        if any(fnode.recompute is not None for fnode in nodes):
+            raise ValueError("Recompute and CPU offload cannot be applied to the same operator")
+        segments = [self.segment(node) for node in nodes]
+        assert all(segment == segments[0] for segment in segments), \
+            "Cross-segment offload is not allowed"
+        offload_group_id = IDGenerator().gen_cell_id()
+        for fnode in nodes:
+            fnode.offload = offload_group_id
         return True
 
     # =================== Helpers ====================
@@ -1255,11 +1276,12 @@ class IRGraph(IRSegment):
     def copy_node_meta_info(src_node: Union[IRFwOperation, IRDataOperation], dest_node: Union[IRFwOperation, IRDataOperation]):
         """
         Copy meta information from src_node to dest_node.
-        Current copy fields: ['recompute', 'comment', 'op_context', 'module_stack', 'device',
+        Current copy fields: ['recompute', 'offload', 'comment', 'op_context', 'module_stack', 'device',
         'hook_meta', 'pre_hook', 'post_hook']
         """
         if isinstance(src_node, IRFwOperation):
             dest_node.recompute = src_node.recompute
+            dest_node.offload = src_node.offload
         if isinstance(src_node.comment, str):
             dest_node.comment = src_node.comment
         if src_node.op_context is not None:

@@ -672,7 +672,7 @@ class IRAdapterGener:
         _logger.info("finish reordering producer and consumer")
 
     @staticmethod
-    def gen_activation(graph: IRGraph, allow_recompute: bool = True, cost_fn: Optional[Callable] = None) -> IRGraph:
+    def gen_activation(graph: IRGraph, *, allow_recompute: bool = True, allow_offload: bool = True, cost_fn: Optional[Callable] = None) -> IRGraph:
         """
         Generate adapter for activation tensors.
         The forward/backward adapter is inserted before the first consumers of its full tensor.
@@ -696,6 +696,8 @@ class IRAdapterGener:
             graph (IRGraph): the graph the requires for adapter.
             allow_recompute (bool): Allow adapter recomputes. If this enables, all adapters will be
                 set to the same recompute group with its consumed node.
+            allow_offload (bool): Allow adapter offloading. If this enables, adapters may be offloaded
+                to CPU to save GPU memory.
             cost_fn (Callable | None): takes an IRAdapterPrim and outputs a cost in float.
                 default to be None, which will use communication volume.
 
@@ -715,15 +717,15 @@ class IRAdapterGener:
         # replace the segment input/output with per-device narrowed input/output, if possible.
         graph.expand()
 
-        IRAdapterGener._gen_activation(graph, allow_recompute=allow_recompute, cost_fn=cost_fn)
+        IRAdapterGener._gen_activation(graph, allow_recompute=allow_recompute, allow_offload=allow_offload, cost_fn=cost_fn)
         # generate adapter for each segment
         for segment in segments:
-            IRAdapterGener._gen_activation(segment, allow_recompute=allow_recompute, cost_fn=cost_fn)
+            IRAdapterGener._gen_activation(segment, allow_recompute=allow_recompute, allow_offload=allow_offload, cost_fn=cost_fn)
 
         return graph
 
     @staticmethod
-    def _gen_activation(graph: IRSegment, allow_recompute: bool = True, cost_fn: Optional[Callable] = None) -> IRSegment:
+    def _gen_activation(graph: IRSegment, *, allow_recompute: bool = True, allow_offload: bool = True, cost_fn: Optional[Callable] = None) -> IRSegment:
         def skip(ptensors: List[IRSubTensor], ctensors: List[IRSubTensor]) -> bool:
             # e.g., loss or parameter/buffer
             if len(ptensors) == 0 or len(ctensors) == 0:
@@ -854,6 +856,11 @@ class IRAdapterGener:
                         prev_node = graph.node(fidx-1)
                         if isinstance(prev_node, (IRFwOperation, IRAdapter)):
                             fadapter.recompute = prev_node.recompute
+                if allow_offload:
+                    if fidx > CellPosition(tuple([0])):
+                        prev_node = graph.node(fidx-1)
+                        if isinstance(prev_node, (IRFwOperation, IRAdapter)):
+                            fadapter.offload = prev_node.offload
 
                 # insert backward adapter
                 if badapter is not None:
@@ -1057,6 +1064,8 @@ class IRAdapterGener:
             # get recomput group
             rcid = set(producer.recompute for producer in devops[devid])
             rcid = list(rcid)[0] if len(rcid) == 1 else None
+            offload_ids = set(producer.offload for producer in devops[devid])
+            offload_id = list(offload_ids)[0] if len(offload_ids) == 1 else None
 
             # split dimension case
             if split_dim:
@@ -1121,6 +1130,7 @@ class IRAdapterGener:
                     node.set_output(0, output)
                     node.device = devid
                     node.recompute = rcid
+                    node.offload = offload_id
                     graph.insert(node, graph.index(ptensor.cell) + 1)
                     lhs = output
                 # remove last node for adaptation
@@ -1150,6 +1160,7 @@ class IRAdapterGener:
             else:
                 node.device = devid
                 node.recompute = rcid
+                node.offload = offload_id
                 # insert
                 max_fid = max(graph.index(producer) for producer in devops[devid])
                 graph.finsert(node, max_fid + 1)
@@ -1242,6 +1253,7 @@ class IRAdapterGener:
             min_fidx = min(graph.index(consumer) for consumer in devops[devid])
             # set recompute id
             multiref.recompute = graph.node(min_fidx).recompute
+            multiref.offload = graph.node(min_fidx).offload
             graph.finsert(multiref, min_fidx)
 
     @staticmethod
@@ -1260,9 +1272,11 @@ class IRAdapterGener:
             # setup recompute
             idx = graph.index(multiref).indices[0]
             recompute = None
+            offload = None
             neighbor = graph.node(idx-1) if idx > 0 else graph.node(idx+1)
             if isinstance(neighbor, IRFwOperation):
                 recompute = neighbor.recompute
+                offload = neighbor.offload
 
             ftensor: IRFullTensor = multiref.input(0).parent
             multirefs = []
@@ -1284,6 +1298,7 @@ class IRAdapterGener:
                         mr.set_output(idx, output)
                     mr.device = tensor.device
                     mr.recompute = recompute
+                    mr.offload = offload
                     multirefs.append(mr)
             # otherwise replicate: usually for weight / graph inputs
             else:
@@ -1297,6 +1312,7 @@ class IRAdapterGener:
                     mr = multiref.replicate()
                     mr.device = devid
                     mr.recompute = recompute
+                    mr.offload = offload
                     multirefs.append(mr)
             assert len(multirefs) > 0
             # remove original multiref
