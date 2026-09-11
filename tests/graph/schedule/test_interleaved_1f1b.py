@@ -98,17 +98,15 @@ def policy_1f1b_interleaved(graph, cfg):
     return graph
 
 
-def policy_explicit_fbw(graph, cfg):
-    from tests.test_policies import sched_explicit_fbw_overlap
-
-    graph = policy_1f1b(graph, cfg)
+def policy_zero_bubble(graph, cfg):
+    graph = policy_1f1b_interleaved(graph, cfg)
     num_microbatches = cfg.pas_config['n_micro_batches']
     num_stages = len([
         segment
         for segment in graph.select(ntype=IRSegment, flatten=False)
         if segment.isfw()
     ])
-    sched_explicit_fbw_overlap(graph, num_microbatches, num_stages)
+    PredefinedSched.sched_zero_bubble(graph, num_microbatches, num_stages)
     return graph
 
 
@@ -135,7 +133,7 @@ def _train_pp(model: ParallelModule, num_replicas, rank):
     return results
 
 
-def worker_pipeline_2(n_micro_batches, explicit_fbw=False):
+def worker_pipeline_2(n_micro_batches, zero_bubble=False):
     nnscaler.init()
     torch.manual_seed(0)
     if torch.cuda.is_available():
@@ -149,8 +147,8 @@ def worker_pipeline_2(n_micro_batches, explicit_fbw=False):
         use_end2end=True,
         pas_config=dict(n_micro_batches=n_micro_batches),
     )
-    comparison_policy = policy_explicit_fbw if explicit_fbw else policy_1f1b_interleaved
-    comparison_name = 'explicit_fbw' if explicit_fbw else '1f1b_interleaved'
+    comparison_policy = policy_zero_bubble if zero_bubble else policy_1f1b_interleaved
+    comparison_name = 'zero_bubble' if zero_bubble else '1f1b_interleaved'
 
     with clear_dir_on_rank0(Path(tempfile.gettempdir()) / f'test_{comparison_name}_{PYTEST_RUN_ID}') as tempdir:
         pm_1f1b = parallelize(
@@ -171,7 +169,7 @@ def worker_pipeline_2(n_micro_batches, explicit_fbw=False):
                 gen_savedir=tempdir,
                 instance_name=comparison_name,
         ).cuda()
-        if explicit_fbw:
+        if zero_bubble:
             calls = _gencode_contains(
                 tempdir,
                 Model,
@@ -179,8 +177,8 @@ def worker_pipeline_2(n_micro_batches, explicit_fbw=False):
                 r'nnscaler\.runtime\.executor\.(backward_input|backward_weight)\(',
                 instance_name=comparison_name,
             )
-            assert calls.count('backward_input') == n_micro_batches
-            assert calls.count('backward_weight') == n_micro_batches
+            assert calls.count('backward_input') == 2 * n_micro_batches
+            assert calls.count('backward_weight') == 2 * n_micro_batches
 
     results_1f1b = _train_pp(pm_1f1b, 1, 0)
     results_comparison = _train_pp(pm_comparison, 1, 0)
@@ -204,7 +202,7 @@ def test_interleaved_1f1b(n_micro_batches):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.device_count() < 2, reason='lack of gpu devices')
-def test_explicit_fbw():
+def test_zero_bubble():
     results = launch_torchrun(2, worker_pipeline_2, 4, True)
     implicit0, explicit0 = results[0]
     implicit1, explicit1 = results[1]

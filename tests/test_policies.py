@@ -476,52 +476,6 @@ def sched_explicit_fbw(graph: IRGraph, num_microbatches: int, num_stages: int) -
     return schedule
 
 
-def sched_explicit_fbw_overlap(graph: IRGraph, num_microbatches: int, num_stages: int) -> SchedulePlan:
-    if num_stages != 2 or num_microbatches < 2:
-        raise ValueError('overlap test schedule requires two stages and at least two microbatches')
-    forward_segments = [
-        segment
-        for segment in graph.select(ntype=IRSegment, flatten=False)
-        if segment.isfw()
-    ]
-    assert len(forward_segments) == num_stages
-
-    schedule = SchedulePlan(graph, num_microbatches)
-    for mid in range(num_microbatches):
-        for stage, segment in enumerate(forward_segments):
-            schedule.add_segment(segment, mid, mid + stage)
-
-    input_start = num_microbatches + num_stages - 1
-    overlap_step = input_start + num_microbatches
-    schedule.add_segment(
-        forward_segments[-1].mirror,
-        0,
-        overlap_step,
-        action=ScheduleAction.BACKWARD_WEIGHT,
-    )
-    for mid in range(num_microbatches):
-        for stage, segment in enumerate(reversed(forward_segments)):
-            schedule.add_segment(
-                segment.mirror,
-                mid,
-                input_start + mid + stage,
-                action=ScheduleAction.BACKWARD_INPUT,
-            )
-
-    weight_start = overlap_step + 1
-    for stage, segment in enumerate(forward_segments):
-        first_mid = 1 if stage == num_stages - 1 else 0
-        for order, mid in enumerate(range(first_mid, num_microbatches)):
-            schedule.add_segment(
-                segment.mirror,
-                mid,
-                weight_start + order,
-                action=ScheduleAction.BACKWARD_WEIGHT,
-            )
-    schedule.finish()
-    return schedule
-
-
 def sched_explicit_fbw_non_fifo(graph: IRGraph, num_microbatches: int, num_stages: int) -> SchedulePlan:
     schedule = _build_explicit_fbw(
         graph,
@@ -697,7 +651,7 @@ def test_codegen_multi_scheduler_plan_local_streams(tmp_path):
 
 
 @replace_all_device_with('cpu')
-def test_codegen_explicit_fbw_multi_scheduler(tmp_path):
+def test_codegen_zero_bubble_multi_scheduler(tmp_path):
     parallelize(
         FnPolicyModuleList(),
         {'x': torch.randn(4, 4)},
@@ -709,15 +663,16 @@ def test_codegen_explicit_fbw_multi_scheduler(tmp_path):
             pas_config={
                 'pipeline_nmicros': [2, 4],
                 'pipeline_size': 2,
-                'pipeline_scheduler': sched_explicit_fbw,
+                'pipeline_scheduler': 'zero_bubble',
             },
         ),
         gen_savedir=tmp_path,
         load_module=False,
     )
 
-    for rank in range(8):
-        for num_microbatches in (2, 4):
+    for num_microbatches in (2, 4):
+        has_weight_before_last_input = False
+        for rank in range(8):
             train_step, = _gencode_contains(
                 tmp_path,
                 FnPolicyModuleList,
@@ -726,7 +681,11 @@ def test_codegen_explicit_fbw_multi_scheduler(tmp_path):
             )
             assert train_step.count('executor.backward_input(') == num_microbatches
             assert train_step.count('executor.backward_weight(') == num_microbatches
-            assert train_step.rfind('executor.backward_input(') < train_step.find('executor.backward_weight(')
+            has_weight_before_last_input |= (
+                train_step.find('executor.backward_weight(')
+                < train_step.rfind('executor.backward_input(')
+            )
+        assert has_weight_before_last_input
 
 
 @replace_all_device_with('cpu')

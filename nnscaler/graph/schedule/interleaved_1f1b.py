@@ -262,16 +262,85 @@ def _get_1f1b_rank_ops(
     return rank_ops
 
 
-# use `self` here since it is a member function in torch, refer to
-# https://github.com/pytorch/pytorch/blob/main/torch/distributed/pipelining/schedules.py#L1999
-def _calculate_single_rank_operations(self, rank):
+def _add_bubbles_to_actions(
+    actions: Dict[int, List[Optional[_Action]]],
+    pp_group_size: int,
+    num_stages_global: int,
+) -> Dict[int, List[Optional[_Action]]]:
+    """Align per-rank ZB1P actions by inserting dependency bubbles.
+
+    Adapted from PyTorch's
+    ``ScheduleInterleavedZeroBubble._add_bubbles_to_actions``:
+    https://github.com/pytorch/pytorch/blob/v2.10.0/torch/distributed/pipelining/schedules.py
+
+    nnScaler additionally checks I/W dependencies because SchedulePlan uses a
+    global step-based dependency model, and reports malformed streams instead
+    of looping forever when no rank can make progress.
+    """
+    def need_bubble(stage, op, microbatch, seen_ops):
+        if op == FORWARD:
+            return stage != 0 and (stage - 1, op, microbatch) not in seen_ops
+        if op == BACKWARD_INPUT:
+            return (
+                stage != num_stages_global - 1
+                and (stage + 1, op, microbatch) not in seen_ops
+            )
+        if op == BACKWARD_WEIGHT:
+            return (stage, BACKWARD_INPUT, microbatch) not in seen_ops
+        raise ValueError(f'Unsupported zero-bubble action: {op}')
+
+    seen_ops = set()
+    result = {rank: [] for rank in range(pp_group_size)}
+    next_pointer = {rank: 0 for rank in range(pp_group_size)}
+
+    while True:
+        should_stop = True
+        made_progress = False
+        temp_seen_ops = set()
+
+        for rank in range(pp_group_size):
+            timestamp = next_pointer[rank]
+            if timestamp >= len(actions[rank]):
+                continue
+
+            should_stop = False
+            if actions[rank][timestamp] is not None:
+                temp_action = actions[rank][timestamp]
+                stage_index, op, microbatch = temp_action
+                if not need_bubble(stage_index, op, microbatch, seen_ops):
+                    result[rank].append(temp_action)
+                    temp_seen_ops.add((stage_index, op, microbatch))
+                    next_pointer[rank] += 1
+                    made_progress = True
+                else:
+                    result[rank].append(None)
+            else:
+                next_pointer[rank] += 1
+                result[rank].append(None)
+                made_progress = True
+
+        seen_ops.update(temp_seen_ops)
+        if should_stop:
+            break
+        if not made_progress:
+            raise RuntimeError('zero_bubble schedule cannot make progress')
+
+    return result
+
+
+# Unified adaptation of PyTorch v2.10.0's
+# ScheduleInterleaved1F1B._calculate_single_rank_operations and
+# ScheduleInterleavedZeroBubble._calculate_single_rank_operations:
+# https://github.com/pytorch/pytorch/blob/v2.10.0/torch/distributed/pipelining/schedules.py
+def _calculate_single_rank_operations(self, rank, enable_zero_bubble=False):
     def get_rank_warmup_ops(rank):
         # Warms up operations for last stage
         warmups_ops_last_stage = (
             self.n_local_stages - 1
         ) * self.microbatches_per_round
-        # Increment warmup operations by 2 for each hop away from the last stage
-        multiply_factor = 2
+        # Increment warmup for each hop away from the last stage. PyTorch uses
+        # factor 2 for interleaved 1F1B and factor 1 for interleaved ZB1P.
+        multiply_factor = 1 if enable_zero_bubble else 2
         warmup_ops = warmups_ops_last_stage + multiply_factor * (
             (self.pp_group_size - 1) - rank
         )
@@ -288,7 +357,7 @@ def _calculate_single_rank_operations(self, rank):
     # total ops encompass both forward and backward ops
     total_ops = warmup_ops + fwd_bwd_ops + cooldown_ops
     # warmup_ops + fwd_bwd_ops * 2 + cooldown_ops == microbatch_ops * 2
-    logger.info(
+    logger.debug(
         "rank %s, warmup_ops %s, 1f1b %s, cooldown_ops %s total_ops %s",
         rank,
         warmup_ops,
@@ -321,4 +390,6 @@ def _calculate_single_rank_operations(self, rank):
         rank,
         forward_stage_index,
         backward_stage_index,
+        num_1f1b_microbatches=rank if enable_zero_bubble else 0,
+        enable_zero_bubble=enable_zero_bubble,
     )

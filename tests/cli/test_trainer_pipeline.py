@@ -89,9 +89,16 @@ def test_trainer_pipeline(tmp_path):
             '--compute_config.use_async_comm', 'True',
         ]
     )
+    # Fill the last input-backward bubble on one stage with ready weight-backward work.
+    launch_torchrun(4, trainer_worker_pipeline, tmp_path, 'trainer_args_pipeline.yaml',
+        'zero_bubble',
+        [
+            '--compute_config.pas_config.pipeline_scheduler', 'zero_bubble',
+        ]
+    )
 
     merged_files = list((tmp_path).glob('merged_*.pt'))
-    assert len(merged_files) == 6
+    assert len(merged_files) == 7
     merged_state_dicts = [torch.load(merged_file, weights_only=False) for merged_file in merged_files]
 
     reference = merged_state_dicts[0]
