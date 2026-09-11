@@ -550,6 +550,66 @@ def sched_explicit_fbw_duplicate(graph: IRGraph, num_microbatches: int, num_stag
     return schedule
 
 
+def sched_explicit_fbw_mixed(graph: IRGraph, num_microbatches: int, num_stages: int) -> SchedulePlan:
+    if num_microbatches != 2:
+        raise ValueError('mixed test schedule requires two microbatches')
+    schedule = _build_explicit_fbw(
+        graph,
+        num_microbatches,
+        num_stages,
+        backward_mids=[0],
+    )
+    forward_segments = [
+        segment
+        for segment in graph.select(ntype=IRSegment, flatten=False)
+        if segment.isfw()
+    ]
+    backward_start = schedule.nsteps
+    for stage, segment in enumerate(reversed(forward_segments)):
+        schedule.add_segment(
+            segment.mirror,
+            1,
+            backward_start + stage,
+            action=ScheduleAction.BACKWARD,
+        )
+    schedule.finish()
+    return schedule
+
+
+def sched_explicit_fbw_mixed_non_fifo_weight(
+    graph: IRGraph,
+    num_microbatches: int,
+    num_stages: int,
+) -> SchedulePlan:
+    if num_microbatches != 2:
+        raise ValueError('mixed test schedule requires two microbatches')
+    schedule = _build_explicit_fbw(
+        graph,
+        num_microbatches,
+        num_stages,
+        backward_mids=[0],
+    )
+    forward_segments = [
+        segment
+        for segment in graph.select(ntype=IRSegment, flatten=False)
+        if segment.isfw()
+    ]
+    weight_start = min(
+        schedule.start(block)
+        for block in schedule.all_blocks()
+        if block.action == ScheduleAction.BACKWARD_WEIGHT
+    )
+    for stage, segment in enumerate(reversed(forward_segments)):
+        schedule.insert_step(
+            weight_start + stage,
+            segment.mirror,
+            1,
+            action=ScheduleAction.BACKWARD,
+        )
+    schedule.finish()
+    return schedule
+
+
 def sched_1f1b_multi_stream(graph: IRGraph, num_microbatches: int, num_stages: int) -> SchedulePlan:
     if num_microbatches <= 0:
         raise ValueError(f"expected num_microbatches > 0, but got {num_microbatches} ")
@@ -696,16 +756,20 @@ def test_codegen_explicit_fbw_without_flag(tmp_path):
 
 @replace_all_device_with('cpu')
 @pytest.mark.parametrize(
-    'scheduler',
-    [sched_explicit_fbw_non_fifo, sched_explicit_fbw_duplicate],
+    ('scheduler', 'use_fbw'),
+    [
+        (sched_explicit_fbw_non_fifo, False),
+        (sched_explicit_fbw_duplicate, False),
+        (sched_explicit_fbw_mixed_non_fifo_weight, True),
+    ],
 )
-def test_codegen_rejects_invalid_explicit_fbw(tmp_path, scheduler):
+def test_codegen_rejects_invalid_explicit_fbw(tmp_path, scheduler, use_fbw):
     with raises_with_cause(AssertionError, match='schedule plan is not valid'):
         parallelize(
             FnPolicyModuleList(),
             {'x': torch.randn(4, 4)},
             megatron_ffn_policy_list,
-            ComputeConfig(4, 8, use_end2end=True, pas_config={
+            ComputeConfig(4, 8, use_end2end=True, use_fbw=use_fbw, pas_config={
                 'pipeline_nmicros': 2,
                 'pipeline_size': 2,
                 'pipeline_scheduler': scheduler,
@@ -713,6 +777,30 @@ def test_codegen_rejects_invalid_explicit_fbw(tmp_path, scheduler):
             gen_savedir=tmp_path,
             load_module=False,
         )
+
+
+@replace_all_device_with('cpu')
+@pytest.mark.parametrize(
+    ('scheduler', 'use_fbw'),
+    [
+        (sched_explicit_fbw_mixed, False),
+        (sched_explicit_fbw_mixed, True),
+        (sched_explicit_fbw_mixed_non_fifo_weight, False),
+    ],
+)
+def test_codegen_allows_valid_mixed_fbw(tmp_path, scheduler, use_fbw):
+    parallelize(
+        FnPolicyModuleList(),
+        {'x': torch.randn(4, 4)},
+        megatron_ffn_policy_list,
+        ComputeConfig(4, 8, use_end2end=True, use_fbw=use_fbw, pas_config={
+            'pipeline_nmicros': 2,
+            'pipeline_size': 2,
+            'pipeline_scheduler': scheduler,
+        }),
+        gen_savedir=tmp_path,
+        load_module=False,
+    )
 
 
 @replace_all_device_with('cpu')
