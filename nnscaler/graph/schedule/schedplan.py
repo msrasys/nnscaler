@@ -634,13 +634,20 @@ class SchedulePlan(PlanBase):
         # per-segment FIFO queues, so their producer and consumer orders must match.
         for actions in segment_actions.values():
             forwards = sorted(actions.get(ScheduleAction.FORWARD, ()), key=self.start)
+            input_backwards = list(actions.get(ScheduleAction.BACKWARD_INPUT, ()))
+            weight_backwards = list(actions.get(ScheduleAction.BACKWARD_WEIGHT, ()))
+            full_backwards = actions.get(ScheduleAction.BACKWARD, ())
             backwards = sorted(
                 actions.get(ScheduleAction.BACKWARD, [])
                 + actions.get(ScheduleAction.BACKWARD_INPUT, []),
                 key=self.start,
             )
-            inputs = sorted(actions.get(ScheduleAction.BACKWARD_INPUT, ()), key=self.start)
-            weights = sorted(actions.get(ScheduleAction.BACKWARD_WEIGHT, ()), key=self.start)
+            if CompileFlag.use_fbw:
+                # Codegen splits B into I and W, so include B in both FIFO queues.
+                input_backwards.extend(full_backwards)
+                weight_backwards.extend(full_backwards)
+            inputs = sorted(input_backwards, key=self.start)
+            weights = sorted(weight_backwards, key=self.start)
             if [block.mid for block in forwards] != [block.mid for block in backwards]:
                 return False
             if [block.mid for block in inputs] != [block.mid for block in weights]:
