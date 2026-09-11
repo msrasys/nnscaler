@@ -11,6 +11,7 @@ from nnscaler.ir.operator import IRDataOperation, IRFwOperation
 from nnscaler.ir.tensor import IRSubTensor
 from nnscaler.ir.adapter import IRWeightReducer, IRAdapter
 from nnscaler.graph.graph import IRSegment
+from nnscaler.graph.schedule.schedplan import ScheduleAction
 
 from nnscaler.execplan.execplan import ExecutionPlan, ExeReuseCell, ExecutionPlanType
 
@@ -261,7 +262,15 @@ class ScheduleCodeGen(FuncEmission):
                 for line, node in enumerate(device_nodes):
                     codes = self.emit_node(execplan, node)
 
-                    if use_scheduler and _is_backward_segment(node) and CompileFlag.use_fbw:
+                    if (
+                        use_scheduler
+                        and _is_backward_segment(node)
+                        and isinstance(node, ExeReuseCell)
+                        and node.action == ScheduleAction.BACKWARD
+                        and CompileFlag.use_fbw
+                    ):
+                        # old-fashion backward handling
+                        # when use_fbw is enabled, but no I/W action is specified.
                         if prev_backward_node is not None:
                             _append_skip_flag(prev_backward_node)
                             _append_code(fb, prev_backward_weight_codes, self._get_node_stream(execplan, prev_backward_node))
@@ -471,10 +480,17 @@ class ScheduleCodeGen(FuncEmission):
                         outputs_str=outputs if len(node_outputs) <= 1 else f'({outputs})'
                     )
             else:
+                # node is IRSegment in non-pipeline mode
+                # so node.action is undefined, and we need to manually set it to BACKWARD
+                action = (
+                    node.action
+                    if isinstance(node, ExeReuseCell)
+                    else ScheduleAction.BACKWARD
+                )
+
                 # get gradient computation arguments
                 input_tensors, output_tensors, output_grads, input_grads = \
                         self.get_backward_callsite_io_tensors(node)
-                gen_inputs = (input_tensors, output_tensors, output_grads)
                 # special handle for loss
                 for idx, tensor in enumerate(output_grads):
                     if isinstance(tensor, IRSubTensor) and tensor.is_loss():
@@ -484,33 +500,50 @@ class ScheduleCodeGen(FuncEmission):
                 input_tensors_str = self.tuple_name(input_tensors, skip_attr=True, prefix_attr='model.')
                 output_tensors_str = self.tuple_name(output_tensors, skip_attr=True, prefix_attr='model.')
                 output_grads_str = self.tuple_name(output_grads, skip_attr=True, prefix_attr='model.')
-                if CompileFlag.use_fbw:
-                    codes = [bi_sign.format(
-                        input_grads = input_grads_str,
-                        name = f"'{self.node_name(unwrap_node.mirror)}'", # always use name of fw segment
-                        input_tensors = input_tensors_str,
-                        output_tensors = output_tensors_str,
-                        output_grads = output_grads_str,
-                        weights = 'model.parameters()'
-                    )]
-                    codes.append(bw_sign.format(
-                        name = f"'{self.node_name(unwrap_node.mirror)}'", # always use name of fw segment
-                        weights = 'model.parameters()'
-                    ))
+                segment_name = f"'{self.node_name(unwrap_node.mirror)}'"
+
+                b_code = bsign.format(
+                    name = segment_name,
+                    input_grads = input_grads_str,
+                    input_tensors = input_tensors_str,
+                    output_tensors = output_tensors_str,
+                    output_grads = output_grads_str
+                )
+                bi_code = bi_sign.format(
+                    input_grads = input_grads_str,
+                    name = segment_name,
+                    input_tensors = input_tensors_str,
+                    output_tensors = output_tensors_str,
+                    output_grads = output_grads_str,
+                    weights = 'model.parameters()'
+                )
+                bw_code = bw_sign.format(
+                    name=segment_name,
+                    weights='model.parameters()',
+                )
+
+                if action == ScheduleAction.BACKWARD_WEIGHT:
+                    gen_inputs = (
+                        (input_tensors, output_tensors, output_grads, input_grads)
+                        if post_hook else ()
+                    )
+                    codes = [bw_code]
                 else:
-                    codes = [bsign.format(
-                        name = f"'{self.node_name(unwrap_node.mirror)}'", # always use name of fw segment
-                        input_grads = input_grads_str,
-                        input_tensors = input_tensors_str,
-                        output_tensors = output_tensors_str,
-                        output_grads = output_grads_str
-                    )]
+                    gen_inputs = (input_tensors, output_tensors, output_grads)
+                    if action == ScheduleAction.BACKWARD:
+                        if CompileFlag.use_fbw:
+                            codes = [bi_code, bw_code]
+                        else:
+                            codes = [b_code]
+                    else:
+                        assert action == ScheduleAction.BACKWARD_INPUT, "Unexpected action type"
+                        codes = [bi_code]
 
                 bwd_input_str = f'({input_tensors_str}, {output_tensors_str}, {output_grads_str})'
                 bwd_output_str = input_grads_str if len(input_grads) <= 1 else f'({input_grads_str})'
-                if pre_hook:
+                if pre_hook and action != ScheduleAction.BACKWARD_WEIGHT:
                     codes = self._emit_segment_hook_code(pre_hook, hook_meta, bwd_input_str, is_pre=True) + codes
-                if post_hook:
+                if post_hook and action != ScheduleAction.BACKWARD_INPUT:
                     codes = codes + self._emit_segment_hook_code(post_hook, hook_meta, bwd_input_str, is_pre=False, outputs_str=bwd_output_str)
 
                 """
@@ -523,12 +556,15 @@ class ScheduleCodeGen(FuncEmission):
                 operation here so that the backward graph's tensors can be deallocated right after the
                 backward pass.
                 """
-                plan_outputs = IRCell.get_objects_from_complex(execplan.outputs())
-                for tensor in output_tensors:
-                    if not isinstance(tensor, IRTensor):
-                        continue
-                    if tensor in plan_outputs:
-                        codes.append(self.emit_detach(tensor))
+                # We don't need to do this in W backward pass,
+                # because the `.detach()` operation has already been handled in B or I backward pass.
+                if action in (ScheduleAction.BACKWARD, ScheduleAction.BACKWARD_INPUT):
+                    plan_outputs = IRCell.get_objects_from_complex(execplan.outputs())
+                    for tensor in output_tensors:
+                        if not isinstance(tensor, IRTensor):
+                            continue
+                        if tensor in plan_outputs:
+                            codes.append(self.emit_detach(tensor))
 
         elif isinstance(unwrap_node, IRDataOperation):
             codes = [f'{outputs} = {unwrap_node.signature}(*{inputs})']
