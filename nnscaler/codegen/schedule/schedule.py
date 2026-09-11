@@ -480,7 +480,13 @@ class ScheduleCodeGen(FuncEmission):
                         outputs_str=outputs if len(node_outputs) <= 1 else f'({outputs})'
                     )
             else:
-                action = node.action if isinstance(node, ExeReuseCell) else None
+                # node is IRSegment in non-pipeline mode
+                # so node.action is undefined, and we need to manually set it to BACKWARD
+                action = (
+                    node.action
+                    if isinstance(node, ExeReuseCell)
+                    else ScheduleAction.BACKWARD
+                )
 
                 # get gradient computation arguments
                 input_tensors, output_tensors, output_grads, input_grads = \
