@@ -99,7 +99,7 @@ def policy_1f1b_interleaved(graph, cfg):
 
 
 def policy_explicit_fbw(graph, cfg):
-    from tests.test_policies import sched_explicit_fbw
+    from tests.test_policies import sched_explicit_fbw_overlap
 
     graph = policy_1f1b(graph, cfg)
     num_microbatches = cfg.pas_config['n_micro_batches']
@@ -108,7 +108,7 @@ def policy_explicit_fbw(graph, cfg):
         for segment in graph.select(ntype=IRSegment, flatten=False)
         if segment.isfw()
     ])
-    sched_explicit_fbw(graph, num_microbatches, num_stages)
+    sched_explicit_fbw_overlap(graph, num_microbatches, num_stages)
     return graph
 
 
@@ -147,7 +147,6 @@ def worker_pipeline_2(n_micro_batches, explicit_fbw=False):
         2,
         2,
         use_end2end=True,
-        use_fbw=explicit_fbw,
         pas_config=dict(n_micro_batches=n_micro_batches),
     )
     comparison_policy = policy_explicit_fbw if explicit_fbw else policy_1f1b_interleaved
@@ -180,10 +179,8 @@ def worker_pipeline_2(n_micro_batches, explicit_fbw=False):
                 r'nnscaler\.runtime\.executor\.(backward_input|backward_weight)\(',
                 instance_name=comparison_name,
             )
-            assert calls == (
-                ['backward_input'] * n_micro_batches
-                + ['backward_weight'] * n_micro_batches
-            )
+            assert calls.count('backward_input') == n_micro_batches
+            assert calls.count('backward_weight') == n_micro_batches
 
     results_1f1b = _train_pp(pm_1f1b, 1, 0)
     results_comparison = _train_pp(pm_comparison, 1, 0)

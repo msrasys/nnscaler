@@ -192,11 +192,22 @@ class ExecutionPlan:
                 key = (node.mid, node.content)
                 if key in micro_fcells:
                     return micro_fcells[key]
-                cell = make_reuse(node.content, node.mid)
+                cell = make_reuse(node.content, node.mid, node.action)
                 if node.stream_context is not None:
                     cell.set_op_context('stream_context', node.stream_context)
                 if isinstance(node.content.mirror, IRCell):
-                    mcell = make_reuse(node.content.mirror, node.mid)
+                    mcell = make_reuse(
+                        node.content.mirror,
+                        node.mid,
+                        # Block has no mirror, so we can't get the mirror action from it directly.
+                        # but we can infer it from the type of the original cell.
+                        # as we says below,
+                        # the mirror forward segment is always paired with the B segment.
+                        # I/W segments will have their own virtual forward segments as mirrors.
+                        ScheduleAction.BACKWARD
+                        if isinstance(node.content, IRSegment)
+                        else None,
+                    )
                     IRCell.make_pair(cell, mcell)
                 micro_fcells[key] = cell
                 return cell
@@ -205,6 +216,9 @@ class ExecutionPlan:
                     # set pair for forward and backward actions.
                     mcell = block2reuse(Block(node.content.mirror, node.mid, node.span)).mirror
                 else:
+                    # all backward segments need to have mirrors for further processing.
+                    # (mainly to get the correct inputs/outputs,
+                    # bacause backward segments have already modified the inputs/outputs of their forward counterparts.)
                     # for I/W backward, we create a new reuse cell for the current action
                     # and pair it with its forward mirror.
                     # in this case, the forward saved in `micro_fcells` will not be used

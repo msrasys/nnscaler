@@ -87,7 +87,6 @@ def test_trainer_pipeline(tmp_path):
         [
             '--compute_config.pas_config.pipeline_scheduler', 'tests.test_policies.sched_explicit_fbw',
             '--compute_config.use_async_comm', 'True',
-            '--compute_config.use_fbw', 'True',
         ]
     )
 

@@ -587,9 +587,13 @@ class SchedulePlan(PlanBase):
         return True
 
     def _validate_explicit_backward_actions(self) -> bool:
+        if not self.graph.train:
+            return True
+
         # key: (block.mid, forward_segment),
         # value: dict of block.action -> block
         mid_segments = {}
+        segment_actions = {}
         for block in self._blocks:
             if not isinstance(block.content, IRSegment):
                 continue
@@ -597,9 +601,11 @@ class SchedulePlan(PlanBase):
                 key = (block.mid, block.content)
             else:
                 key = (block.mid, block.content.mirror)
-            if key not in mid_segments:
-                mid_segments[key] = {}
-            mid_segments[key][block.action] = block
+            blocks = mid_segments.setdefault(key, {})
+            if block.action in blocks:
+                return False
+            blocks[block.action] = block
+            segment_actions.setdefault(key[1], {}).setdefault(block.action, []).append(block)
 
         for _, blocks in mid_segments.items():
             f_block= blocks.get(ScheduleAction.FORWARD)
@@ -623,6 +629,22 @@ class SchedulePlan(PlanBase):
                     return False
                 if self.start(i_block) + i_block.span > self.start(w_block):
                     return False
+
+        # Executor consumes both forward states and deferred weight states through
+        # per-segment FIFO queues, so their producer and consumer orders must match.
+        for actions in segment_actions.values():
+            forwards = sorted(actions.get(ScheduleAction.FORWARD, ()), key=self.start)
+            backwards = sorted(
+                actions.get(ScheduleAction.BACKWARD, [])
+                + actions.get(ScheduleAction.BACKWARD_INPUT, []),
+                key=self.start,
+            )
+            inputs = sorted(actions.get(ScheduleAction.BACKWARD_INPUT, ()), key=self.start)
+            weights = sorted(actions.get(ScheduleAction.BACKWARD_WEIGHT, ()), key=self.start)
+            if [block.mid for block in forwards] != [block.mid for block in backwards]:
+                return False
+            if [block.mid for block in inputs] != [block.mid for block in weights]:
+                return False
         return True
 
     def _place_adapters(self):
@@ -651,11 +673,14 @@ class SchedulePlan(PlanBase):
 
             # find sender step and insert adapter
             for step in range(self.nsteps):
-                blocks = self.start_blocks(step)
+                blocks = tuple(
+                    block for block in self.start_blocks(step)
+                    if block.action != ScheduleAction.BACKWARD_WEIGHT
+                )
                 assert all(isinstance(blk, Block) for blk in blocks)
                 # ignoring backward weight actions
                 # as adapter should be placed after I/B actions
-                segments = [block.content for block in blocks if block.action != ScheduleAction.BACKWARD_WEIGHT]
+                segments = [block.content for block in blocks]
                 mids = [block.mid for block in blocks]
                 if sender in segments:
                     span = blocks[segments.index(sender)].span

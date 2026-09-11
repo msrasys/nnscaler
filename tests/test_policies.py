@@ -427,7 +427,12 @@ def test_codegen_fn_pipeline(tmp_path):
     assert True
 
 
-def sched_explicit_fbw(graph: IRGraph, num_microbatches: int, num_stages: int) -> SchedulePlan:
+def _build_explicit_fbw(
+    graph: IRGraph,
+    num_microbatches: int,
+    num_stages: int,
+    backward_mids: Optional[Iterable[int]] = None,
+) -> SchedulePlan:
     if num_microbatches <= 0:
         raise ValueError(f'expected num_microbatches > 0, but got {num_microbatches}')
     forward_segments = [
@@ -443,6 +448,57 @@ def sched_explicit_fbw(graph: IRGraph, num_microbatches: int, num_stages: int) -
             schedule.add_segment(segment, mid, mid + stage)
 
     input_start = num_microbatches + num_stages - 1
+    backward_mids = list(range(num_microbatches) if backward_mids is None else backward_mids)
+    for order, mid in enumerate(backward_mids):
+        for stage, segment in enumerate(reversed(forward_segments)):
+            schedule.add_segment(
+                segment.mirror,
+                mid,
+                input_start + order + stage,
+                action=ScheduleAction.BACKWARD_INPUT,
+            )
+
+    weight_start = input_start + num_microbatches + num_stages - 1
+    for order, mid in enumerate(backward_mids):
+        for segment in forward_segments:
+            schedule.add_segment(
+                segment.mirror,
+                mid,
+                weight_start + order,
+                action=ScheduleAction.BACKWARD_WEIGHT,
+            )
+    return schedule
+
+
+def sched_explicit_fbw(graph: IRGraph, num_microbatches: int, num_stages: int) -> SchedulePlan:
+    schedule = _build_explicit_fbw(graph, num_microbatches, num_stages)
+    schedule.finish()
+    return schedule
+
+
+def sched_explicit_fbw_overlap(graph: IRGraph, num_microbatches: int, num_stages: int) -> SchedulePlan:
+    if num_stages != 2 or num_microbatches < 2:
+        raise ValueError('overlap test schedule requires two stages and at least two microbatches')
+    forward_segments = [
+        segment
+        for segment in graph.select(ntype=IRSegment, flatten=False)
+        if segment.isfw()
+    ]
+    assert len(forward_segments) == num_stages
+
+    schedule = SchedulePlan(graph, num_microbatches)
+    for mid in range(num_microbatches):
+        for stage, segment in enumerate(forward_segments):
+            schedule.add_segment(segment, mid, mid + stage)
+
+    input_start = num_microbatches + num_stages - 1
+    overlap_step = input_start + num_microbatches
+    schedule.add_segment(
+        forward_segments[-1].mirror,
+        0,
+        overlap_step,
+        action=ScheduleAction.BACKWARD_WEIGHT,
+    )
     for mid in range(num_microbatches):
         for stage, segment in enumerate(reversed(forward_segments)):
             schedule.add_segment(
@@ -452,15 +508,44 @@ def sched_explicit_fbw(graph: IRGraph, num_microbatches: int, num_stages: int) -
                 action=ScheduleAction.BACKWARD_INPUT,
             )
 
-    weight_start = input_start + num_microbatches + num_stages - 1
-    for mid in range(num_microbatches):
-        for segment in forward_segments:
+    weight_start = overlap_step + 1
+    for stage, segment in enumerate(forward_segments):
+        first_mid = 1 if stage == num_stages - 1 else 0
+        for order, mid in enumerate(range(first_mid, num_microbatches)):
             schedule.add_segment(
                 segment.mirror,
                 mid,
-                weight_start + mid,
+                weight_start + order,
                 action=ScheduleAction.BACKWARD_WEIGHT,
             )
+    schedule.finish()
+    return schedule
+
+
+def sched_explicit_fbw_non_fifo(graph: IRGraph, num_microbatches: int, num_stages: int) -> SchedulePlan:
+    schedule = _build_explicit_fbw(
+        graph,
+        num_microbatches,
+        num_stages,
+        backward_mids=reversed(range(num_microbatches)),
+    )
+    schedule.finish()
+    return schedule
+
+
+def sched_explicit_fbw_duplicate(graph: IRGraph, num_microbatches: int, num_stages: int) -> SchedulePlan:
+    schedule = _build_explicit_fbw(graph, num_microbatches, num_stages)
+    forward_segment = next(
+        segment
+        for segment in graph.select(ntype=IRSegment, flatten=False)
+        if segment.isfw()
+    )
+    schedule.add_segment(
+        forward_segment.mirror,
+        0,
+        schedule.nsteps,
+        action=ScheduleAction.BACKWARD_INPUT,
+    )
     schedule.finish()
     return schedule
 
@@ -561,7 +646,6 @@ def test_codegen_explicit_fbw_multi_scheduler(tmp_path):
             4,
             8,
             use_end2end=True,
-            use_fbw=True,
             pas_config={
                 'pipeline_nmicros': [2, 4],
                 'pipeline_size': 2,
@@ -586,8 +670,37 @@ def test_codegen_explicit_fbw_multi_scheduler(tmp_path):
 
 
 @replace_all_device_with('cpu')
-def test_codegen_explicit_fbw_requires_flag(tmp_path):
-    with raises_with_cause(RuntimeError, match='Explicit I/W schedule actions require use_fbw=True'):
+def test_codegen_explicit_fbw_without_flag(tmp_path):
+    parallelize(
+        FnPolicyModuleList(),
+        {'x': torch.randn(4, 4)},
+        megatron_ffn_policy_list,
+        ComputeConfig(4, 8, use_end2end=True, pas_config={
+            'pipeline_nmicros': 2,
+            'pipeline_size': 2,
+            'pipeline_scheduler': sched_explicit_fbw,
+        }),
+        gen_savedir=tmp_path,
+        load_module=False,
+    )
+    for rank in range(8):
+        assert len(_gencode_contains(
+            tmp_path, FnPolicyModuleList, rank,
+            r'nnscaler\.runtime\.executor\.backward_input\(',
+        )) == 2
+        assert len(_gencode_contains(
+            tmp_path, FnPolicyModuleList, rank,
+            r'nnscaler\.runtime\.executor\.backward_weight\(',
+        )) == 2
+
+
+@replace_all_device_with('cpu')
+@pytest.mark.parametrize(
+    'scheduler',
+    [sched_explicit_fbw_non_fifo, sched_explicit_fbw_duplicate],
+)
+def test_codegen_rejects_invalid_explicit_fbw(tmp_path, scheduler):
+    with raises_with_cause(AssertionError, match='schedule plan is not valid'):
         parallelize(
             FnPolicyModuleList(),
             {'x': torch.randn(4, 4)},
@@ -595,7 +708,7 @@ def test_codegen_explicit_fbw_requires_flag(tmp_path):
             ComputeConfig(4, 8, use_end2end=True, pas_config={
                 'pipeline_nmicros': 2,
                 'pipeline_size': 2,
-                'pipeline_scheduler': sched_explicit_fbw,
+                'pipeline_scheduler': scheduler,
             }),
             gen_savedir=tmp_path,
             load_module=False,
@@ -748,7 +861,7 @@ def test_codegen_fn_pipeline_segment_hooks(tmp_path, explicit_fbw):
         FnPolicyModuleList(),
         {'x': torch.randn(4, 4)},
         megatron_ffn_policy_list,
-        ComputeConfig(4, 8, use_end2end=True, use_fbw=explicit_fbw,
+        ComputeConfig(4, 8, use_end2end=True,
             pas_config={
                 'pipeline_nmicros': 2,
                 'pipeline_size': 2,
