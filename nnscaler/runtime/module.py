@@ -396,6 +396,8 @@ class CubeModule(torch.nn.Module):
                 tid_to_chunk[meta.tid] for meta in self._fullmap.values()
             }
 
+        # mmap was added in PyTorch 2.1; PyTorch 2.0 remains supported.
+        mmap_kwargs = {'mmap': True} if torch.__version__ >= (2, 1) else {}
         with torch.no_grad():
             _logger.info(f'loading partitioned model from {filename}, number of model parameter chunks: {npartitions}')
             attr_names = set(self._fullmap)
@@ -405,7 +407,7 @@ class CubeModule(torch.nn.Module):
                 # part_model contains a subset of attributes, where each attribute is a fulltensor
                 # fulltensor.tid -> torch.Tensor
                 part_model: Dict[int, torch.Tensor] = torch.load(
-                    filename + f'.{file_idx}', weights_only=True)
+                    filename + f'.{file_idx}', weights_only=True, **mmap_kwargs)
                 loaded_names = set()
                 for attr_name in attr_names:
                     meta = self._fullmap[attr_name]
