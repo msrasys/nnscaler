@@ -19,7 +19,7 @@ from nnscaler.ir.tensor import IRFullTensor, IRSubTensor, ValueMap
 from nnscaler.ir.operator import IRFwOperation, IRDataOperation
 
 from nnscaler.ir.adapter import IRAdapter, IRWeightReducer
-from nnscaler.ir.adapter.prim import IRAdapterPrim, ObjectMovePrim
+from nnscaler.ir.adapter.prim import IRAdapterPrim, ObjectBroadcastPrim, ObjectMovePrim
 from nnscaler.graph.function.function import Accum, Cat, MultiRef
 from nnscaler.flags import CompileFlag
 
@@ -630,6 +630,68 @@ class IRAdapterGener:
         return graph
 
     @staticmethod
+    def gen_object_adapter(
+        pobjects: List[IRObject],
+        cobjects: List[IRObject],
+    ) -> Optional[IRAdapter]:
+        """Generate whole-object communication between replicated placements.
+
+        Unlike tensors, an IRObject cannot be spatially or value partitioned. Map
+        remote consumers evenly to producer replicas and use only point-to-point
+        moves or broadcasts of the complete object.
+        """
+        if not pobjects or not cobjects:
+            return None
+
+        if any(len(obj.device) != 1 for obj in pobjects + cobjects):
+            raise ValueError("IRObject adapter generation expects one device per placement")
+
+        # expand_devices has already removed duplicate placements. Keep its
+        # ordering because producer/consumer replicas are laid out in that order.
+        producers = {obj.device[0]: obj for obj in pobjects}
+        consumers = {obj.device[0]: obj for obj in cobjects}
+        remote_consumers = [
+            obj for devid, obj in consumers.items()
+            if devid not in producers
+        ]
+        if not remote_consumers:
+            return None
+
+        # Split consecutive consumer replicas evenly across producer replicas.
+        # This preserves scale-unit grouping, e.g. producers [0, 4] and consumers
+        # [1, 2, 3, 5, 6, 7] become broadcasts [0..3] and [4..7].
+        producer_objects = list(producers.values())
+        group_size, extra = divmod(len(remote_consumers), len(producer_objects))
+        offset = 0
+        adapter_inputs = []
+        adapter_outputs = []
+        prims = []
+        for idx, producer in enumerate(producer_objects):
+            size = group_size + (1 if idx < extra else 0)
+            targets = remote_consumers[offset:offset + size]
+            offset += size
+            if not targets:
+                continue
+
+            adapter_inputs.append(producer)
+            if len(targets) == 1:
+                adapter_outputs.extend(targets)
+                prims.append(ObjectMovePrim([producer], targets))
+                continue
+
+            # A broadcast includes its source rank as an output. Prefer the
+            # local consumer placement; otherwise reuse the producer object.
+            outputs = list(targets)
+            outputs.append(consumers.get(producer.device[0], producer))
+            adapter_outputs.extend(outputs)
+            prims.append(ObjectBroadcastPrim([producer], outputs))
+
+        adapter = IRAdapter(adapter_inputs, adapter_outputs)
+        adapter.prims = prims
+        return adapter
+
+
+    @staticmethod
     def _local_optimize(graph: IRSegment):
         # Here are two optimization passes that are applied before generating communication adapters:
         # - local producer fusion: If an operator is partitioned and there are multiple
@@ -871,14 +933,8 @@ class IRAdapterGener:
                 _logger.info(f'generated {_cnt} activation adapters')
         _logger.info(f'finish generating {_cnt} activation adapters')
 
-        # generate adapter for non-tensor IRObjects (inter-device only)
-        # Non-tensor objects are always replicated, so only inter-device
-        # transfer (producer devices disjoint from consumer devices) is needed.
-        # No backward pass is needed for non-tensor objects.
-        # TODO: We separately handle non-tensor objects here
-        # because the implementation is quite different from tensor objects,
-        # and we also want to avoid regression on tensor adapter generation.
-        # In the future, we may want to unify the implementation of tensor and non-tensor adapter generation,
+        # Generate adapters for non-tensor IRObjects. Objects are replicated, so
+        # only forward, inter-device transfers are needed.
         _obj_cnt = 0
         for fobj in graph.full_objects():
             if isinstance(fobj, IRFullTensor):
@@ -890,8 +946,7 @@ class IRAdapterGener:
             fpobjects = expand_devices(fpobjects, producer=True)
 
             fconsumers = graph.consumers(fobj)
-            fcobjects = graph.ctensors(fobj)
-            fcobjects = expand_devices(fcobjects, consumer=True)
+            fcobjects = expand_devices(graph.ctensors(fobj), consumer=True)
             if fobj in output_consumer:
                 out_fcobjs = tuple(fwop.input(0) for fwop in output_consumer[fobj])
                 out_fcobjs = expand_devices(out_fcobjs, consumer=True)
@@ -899,96 +954,33 @@ class IRAdapterGener:
                 out_fcobjs = ()
 
             if not out_fcobjs and all(isinstance(c, IRDataOperation) for c in fconsumers):
-                # skip if all consumers are data operation (dataloader), as they will be automatically handled by the adapter of their input tensors.
+                # Dataloader objects are moved together with their input tensors.
                 continue
 
-            # We create 1-dim fake full tensor and subtensor for non-tensor objects
-            # to reuse the existing adapter generation algorithm for tensor objects.
-            # The device attribute of the subtensor's dummy cell is used to
-            # indicate the device of the non-tensor object
-            fake_ftensor = IRFullTensor((1,), name=f'{fobj.name}_fake_ftensor')
-            def _get_fake_subtensor(device: Tuple[int,...]) -> IRSubTensor:
-                subtensor = fake_ftensor.tosub()
-                # create a dummy cell for device assignment.
-                # because we can't assign device attribute to an IRObject.
-                subtensor.cell = IRCell(
-                    name=f'{fobj.name}_fake_subtensor',
-                    signature='dummy',
-                    input_length=1, output_length=1
-                )
-                subtensor.cell.device = device
-                return subtensor
-
-            def _index_by_device(obj: IRObject, obj_list: List[IRObject]) -> int:
-                for idx, o in enumerate(obj_list):
-                    if o.device == obj.device:
-                        return idx
-                raise ValueError(f"Object {obj} not found in list")
-
-            # Convert the generated adapter prims for fake subtensors back to adapter prims for non-tensor objects.
-            # The adapter structure (e.g., prims, input/output ordering) is the same
-            # with the adapter for fake subtensors,
-            # but the tensor objects in the adapter are replaced by non-tensor objects.
-            def _fix_prim(pobjs, cobjs, fptensors, fctensors, prim: IRAdapterPrim) -> IRAdapterPrim:
-                from nnscaler.ir.adapter.prim import ObjectMovePrim, MovePrim, BroadcastPrim, ObjectBroadcastPrim
-                if isinstance(prim, MovePrim):
-                    return ObjectMovePrim(
-                        [pobjs[_index_by_device(pi, fptensors)] for pi in prim.inputs()],
-                        [cobjs[_index_by_device(pi, fctensors)] for pi in prim.outputs()]
-                    )
-                elif isinstance(prim, BroadcastPrim):
-                    return ObjectBroadcastPrim(
-                        [pobjs[_index_by_device(pi, fptensors)] for pi in prim.inputs()],
-                        [cobjs[_index_by_device(pi, fctensors)] for pi in prim.outputs()]
-                    )
-                else:
-                    raise ValueError(f"Not support for prim other than MovePrim and BroadcastPrim for non-tensor objects.\n"
-                                     f"Failed prim: {prim}")
-
-            def _fix_adapter(pobjs, cobjs, fptensors, fctensors, adapter: IRAdapter) -> IRAdapter:
-                new_adapter = IRAdapter(
-                    [pobjs[_index_by_device(pi, fptensors)] for pi in adapter.inputs()],
-                    [cobjs[_index_by_device(pi, fctensors)] for pi in adapter.outputs()]
-                )
-                new_adapter.prims = [_fix_prim(pobjs, cobjs, fptensors, fctensors, prim) for prim in adapter.prims]
-                return new_adapter
-
-            fptensors = [_get_fake_subtensor(fpobj.device) for fpobj in fpobjects]
-            fctensors = [_get_fake_subtensor(fcobj.device) for fcobj in fcobjects]
             fadapters = []
 
-            # (activation -> activation) generation: generate communication adapters
-            # between producer operators and consumer adapters.
-            if not skip(fptensors, fctensors):
-                fadapter = ConcurrentGener.gen(fptensors, fctensors, [], [], cost_fn)
-                if fadapter is not None:
-                    fadapters.append(_fix_adapter(fpobjects, fcobjects, fptensors, fctensors, fadapter))
+            fadapter = IRAdapterGener.gen_object_adapter(fpobjects, fcobjects)
+            if fadapter is not None:
+                fadapters.append(fadapter)
 
-            # (activation -> graph/segment output) generation: generate communication adapters between
-            # producer operators and graph/segment output tensors.
             if out_fcobjs:
-                fctensors = [_get_fake_subtensor(fcobj.device) for fcobj in out_fcobjs]
-                # skip if the output is same with activation tensor
                 if set(out_fcobjs) == set(fcobjects) and \
                    set(t.device[0] for t in out_fcobjs) == set(t.device[0] for t in fcobjects):
                     pass
-                elif not skip(fptensors, fctensors):
-                    fadapter = ConcurrentGener.gen(fptensors, fctensors, [], [], cost_fn)
+                else:
+                    fadapter = IRAdapterGener.gen_object_adapter(fpobjects, out_fcobjs)
                     if fadapter is not None:
-                        fadapters.append(_fix_adapter(fpobjects, out_fcobjs, fptensors, fctensors, fadapter))
+                        fadapters.append(fadapter)
 
             for fadapter in fadapters:
-                if len(fconsumers) > 0:
+                if fconsumers:
                     fidx = min(graph.multi_index(fconsumers))
                 else:
                     for fidx, node in enumerate(graph.nodes()[::-1]):
                         if node.isfw():
-                            fidx = CellPosition(tuple([graph.nnodes - fidx]))
+                            fidx = CellPosition((graph.nnodes - fidx,))
                             break
                 graph.insert(fadapter, fidx)
-                # no recompute for non-tensor object adapter
-                # as they are inter-device only and are inserted in execute plan.
-                # instead of inside segment.
 
             _obj_cnt += 1
         _logger.info(f'finish generating adapters for {_obj_cnt} non-tensor objects')
