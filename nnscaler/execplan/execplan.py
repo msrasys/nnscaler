@@ -53,46 +53,60 @@ class ExeReuseCell(IRCell):
         if devid in self._cached_dispatched:
             return self._cached_dispatched[devid]
 
-        inputs = []
-        for t, cell_t in zip(self._inputs, self._cell.inputs()):
-            if isinstance(cell_t, IRObject) and devid not in cell_t.device:
-                continue
-            inputs.append(t)
-        outputs = []
-        for t, cell_t in zip(self._outputs, self._cell.outputs()):
-            if isinstance(cell_t, IRObject) and devid not in cell_t.device:
-                continue
-            outputs.append(t)
-
-        # inputs and outputs of dispatched cell should be aligned with inputs/outputs,
         dispatch_cell = self._cell.dispatch(devid)
-        expanded_inputs = []
-        assert len(inputs) == len(dispatch_cell.inputs()), \
-            f"inputs length mismatch: {dispatch_cell}\ninputs: {inputs}\ndispatch_cell.inputs(): {dispatch_cell.inputs()}"
-        assert len(outputs) == len(dispatch_cell.outputs()), \
-            f"outputs length mismatch: {dispatch_cell}\noutputs: {outputs}\ndispatch_cell.outputs(): {dispatch_cell.outputs()}"
 
-        for t, cell_t in zip(inputs, dispatch_cell.inputs()):
-            if isinstance(t, IRSubTensor) and t.shape != cell_t.shape:
-                assert isinstance(cell_t, IRSubTensor), f"Expected IRSubTensor, got {type(cell_t)}"
-                new_t = t.parent.select(cell_t.indmap, cell_t.valmap)
-                if t.grad is not None:
-                    assert isinstance(cell_t.grad, IRSubTensor), f"Expected IRSubTensor, got {type(cell_t.grad)}"
-                    new_t.grad = t.grad.parent.select(cell_t.grad.indmap, cell_t.grad.valmap)
-                t = new_t
-            expanded_inputs.append(t)
-        expanded_outputs = []
-        for t, cell_t in zip(outputs, dispatch_cell.outputs()):
-            if isinstance(t, IRSubTensor) and t.shape != cell_t.shape:
-                assert isinstance(cell_t, IRSubTensor), f"Expected IRSubTensor, got {type(cell_t)}"
-                new_t = t.parent.select(cell_t.indmap, cell_t.valmap)
-                if t.grad is not None:
-                    assert isinstance(cell_t.grad, IRSubTensor), f"Expected IRSubTensor, got {type(cell_t.grad)}"
-                    new_t.grad = t.grad.parent.select(cell_t.grad.indmap, cell_t.grad.valmap)
-                t = new_t
-            expanded_outputs.append(t)
+        def align_with_dispatched(cell_objs, reuse_objs, dispatched_objs):
+            pairs = list(zip(cell_objs, reuse_objs))
+            used = set()
+            aligned = []
+            for dispatched_obj in dispatched_objs:
+                if isinstance(dispatched_obj, IRSubTensor):
+                    exact = [
+                        idx for idx, (cell_obj, _) in enumerate(pairs)
+                        if idx not in used and isinstance(cell_obj, IRSubTensor)
+                        and cell_obj.tid == dispatched_obj.tid
+                    ]
+                    parent_matches = [
+                        idx for idx, (cell_obj, _) in enumerate(pairs)
+                        if idx not in used and isinstance(cell_obj, IRSubTensor)
+                        and cell_obj.parent.tid == dispatched_obj.parent.tid
+                    ]
+                    candidates = exact[:1] if exact else parent_matches
+                else:
+                    candidates = [
+                        idx for idx, (cell_obj, _) in enumerate(pairs)
+                        if idx not in used
+                        and (cell_obj is dispatched_obj or cell_obj == dispatched_obj)
+                    ][:1]
+                assert len(candidates) == 1, (
+                    f"Cannot align dispatched reuse object {dispatched_obj} "
+                    f"from cell {self._cell}: candidates={candidates}"
+                )
+                match_idx = candidates[0]
+                used.add(match_idx)
+                reuse_obj = pairs[match_idx][1]
+                if isinstance(reuse_obj, IRSubTensor) and isinstance(dispatched_obj, IRSubTensor) \
+                        and (reuse_obj.indmap != dispatched_obj.indmap
+                             or reuse_obj.valmap != dispatched_obj.valmap):
+                    grad = reuse_obj.grad
+                    narrowed = reuse_obj.parent.select(dispatched_obj.indmap, dispatched_obj.valmap)
+                    if grad is not None:
+                        assert isinstance(dispatched_obj.grad, IRSubTensor), \
+                            f"Expected IRSubTensor, got {type(dispatched_obj.grad)}"
+                        narrowed.grad = grad.parent.select(dispatched_obj.grad.indmap, dispatched_obj.grad.valmap)
+                    reuse_obj = narrowed
+                aligned.append(reuse_obj)
+            return aligned
 
-        reuse = ExeReuseCell(dispatch_cell, expanded_inputs, expanded_outputs)
+        inputs = align_with_dispatched(
+            self._cell.inputs(), self._inputs, dispatch_cell.inputs()
+        )
+        outputs = align_with_dispatched(
+            self._cell.outputs(), self._outputs, dispatch_cell.outputs()
+        )
+        reuse = ExeReuseCell(
+            dispatch_cell, inputs, outputs,
+        )
         reuse._id = self._id
         reuse._op_context = self._op_context
         if _mirror and self.mirror is not None:
@@ -265,7 +279,11 @@ class ExecutionPlan:
             for idx in range(len(nodes)):
                 node = nodes[idx]
                 # print(f'handling {node}')
-                if len(node.device) == 1: continue  # no need for dispatch
+                if len(node.device) == 1:
+                    # Narrowed segment IO must also be applied on a single device.
+                    unwrap = node.cell if isinstance(node, ExeReuseCell) else node
+                    if not isinstance(unwrap, IRSegment) or unwrap.expander is None:
+                        continue
                 dnode = cached_dispatch(node, devid, dispatched)
                 nodes[idx] = dnode
 
