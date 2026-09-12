@@ -238,7 +238,17 @@ def _compute_tp_info(
 
 def calc_optimal_pp_plan(
         model_graph: ModelGraph,
-        autodist_config: AutoDistConfig) -> PipelineSearchOutput:
+        autodist_config: AutoDistConfig,
+        uniform_tp: bool = False
+) -> PipelineSearchOutput:
+    """Search for the optimal pipeline plan.
+
+    Args:
+        model_graph: The model graph to partition.
+        autodist_config: AutoDist search configuration.
+        uniform_tp: Only consider plans whose stages use the same TP degree.
+            Defaults to ``False`` to preserve heterogeneous-stage search.
+    """
     # TODO: based on experience, tensor parallelism should <= 8
     legal_tp_degrees = _calc_legal_tp_degrees(
         min(8, autodist_config.mesh_desc.col))
@@ -283,6 +293,8 @@ def calc_optimal_pp_plan(
                         next_pp = pp - tp
                         for next_tp in range(1, next_pp - (s - 1) + 1 + 1):
                             if next_tp not in legal_tp_degrees:
+                                continue
+                            if uniform_tp and next_tp != tp:
                                 continue
                             prev_idx = (s - 1, next_pp, next_tp, j)
                             if prev_idx not in T:
