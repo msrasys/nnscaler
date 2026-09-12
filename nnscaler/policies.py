@@ -189,7 +189,10 @@ def pas_hybrid(graph: IRGraph, cfg: 'ComputeConfig'):
         nstages = cfg.plan_ngpus
     nmicros = cfg.pas_config['pipeline_nmicros']
     scheduler = cfg.pas_config.get('pipeline_scheduler', '1f1b')
-    pp_size = cfg.pas_config.get('pp_size', nstages)
+    pp_size = _get_configured_pipeline_size(cfg.pas_config, nstages)
+
+    if pp_size < 1:
+        raise ValueError('pp_size must be >= 1 when set')
 
     if nstages % pp_size != 0:
         raise ValueError(f'invalid pp_size {pp_size} for nstages {nstages}')
@@ -855,6 +858,22 @@ def _duplicate_dataloader_index_ops_per_stage(graph: IRGraph, op_plans: dict) ->
             op_plans.pop(node, None)
 
 
+def _get_configured_pipeline_size(pas_config, default):
+    """Resolve physical PP groups independently of the logical stage count.
+
+    ``pp_size`` is shared with the hybrid policy; ``pipeline_size`` remains
+    accepted for existing fn policies. Conflicting settings must not silently
+    change stage placement or the TP/EP degree within a physical group.
+    """
+    pp_size = pas_config.get('pp_size')
+    pipeline_size = pas_config.get('pipeline_size')
+    if pp_size is not None and pipeline_size is not None and pp_size != pipeline_size:
+        raise ValueError('pp_size and pipeline_size must match when both are set')
+    if pp_size is not None:
+        return pp_size
+    return pipeline_size if pipeline_size is not None else default
+
+
 def fn(
         graph: IRGraph, cfg: 'ComputeConfig',
         policy: Union[
@@ -929,7 +948,11 @@ def fn(
 
     nstages: int = len(stages)
     # not all schedulers support pp_size < nstages
-    pp_size = cfg.pas_config.get('pipeline_size', nstages)
+    pp_size = _get_configured_pipeline_size(cfg.pas_config, nstages)
+    if pp_size < 1:
+        raise ValueError('pp_size must be >= 1 when set')
+    if ngpus % pp_size != 0:
+        raise ValueError(f'invalid pp_size {pp_size} for ngpus {ngpus}')
     tp_size = ngpus // pp_size
 
     recompute_groups: dict[int, list[IRFwOperation]] = {}
