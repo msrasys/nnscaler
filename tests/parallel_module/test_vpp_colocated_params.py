@@ -88,5 +88,6 @@ def colocated_worker(async_reducer=False):
 
 @pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.device_count() < 4,
                     reason='requires 4 GPUs')
-def test_colocated_vpp_matches_unpartitioned_optimizer_steps():
-    assert all(launch_torchrun(4, colocated_worker).values())
+@pytest.mark.parametrize('async_reducer', [False, True])
+def test_colocated_vpp_matches_unpartitioned_optimizer_steps(async_reducer):
+    assert all(launch_torchrun(4, colocated_worker, async_reducer).values())
