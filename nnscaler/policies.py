@@ -1164,6 +1164,14 @@ def fn(
             continue
         splits = set(k for v in stage_info.values() for k in v)
         find_replicated = 'rr' in splits or 'rn' in splits
+        # Repeated logical stages can share the same physical parameter and
+        # gradient buffer. Keep it local when every use has the same layout;
+        # multiref would instead transmit it as an activation between stages.
+        colocated_vpp_param = (
+            nstages > pp_size and len(stage_info) > 1
+            and len({stage_id % pp_size for stage_id in stage_info}) == 1
+            and len(splits) == 1
+        )
         splits = list(splits)
         # For safety, we will add multiref when detecting shared param are all replicated for pipeline parallelism.
         # The reason is that stages may have different number of devices, it is hard to synchronize gradients directly
@@ -1183,7 +1191,10 @@ def fn(
         # 4. (2) and (3): if the param is shared across stages and is replicated in at least one stage.
         #    Note: the case when some is replicated and some is partitioned is handled by (1).
 
-        if len(splits) > 1 or (pp_multiref_replicated_params and len(stage_info) > 1 and find_replicated):
+        if len(splits) > 1 or (
+            pp_multiref_replicated_params and len(stage_info) > 1
+            and find_replicated and not colocated_vpp_param
+        ):
             _logger.info(f'add multiref for shared param {ftensor}')
             consumers = graph.consumers(ftensor)
             multiref_node = graph.multiref(ftensor, comment='shared param')
