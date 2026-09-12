@@ -41,6 +41,8 @@ class CompileFlag:
     # ============== runtime ====================
     dev_mode = _to_bool('SINGLE_DEV_MODE')  # allow to use python xx.py
     async_comm = _to_bool('ASYNC_COMM')
+    # Release eligible pipeline outputs only after their sends complete.
+    pipeline_output_pseudo_free = _to_bool('PIPELINE_OUTPUT_PSEUDO_FREE', True)
     line_timer = _to_bool('LINE_TIMER')
 
     # ============== reducer ==================
