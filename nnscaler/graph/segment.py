@@ -1323,6 +1323,7 @@ class IRSegmentExpander:
 
     @staticmethod
     def _is_layout_alias(node: IRCell) -> bool:
+        """Whether an op forwards activation storage without computing or cloning it."""
         from nnscaler.runtime.function.function import identity, multiref
 
         return node.fn == identity or (
@@ -1333,6 +1334,12 @@ class IRSegmentExpander:
         )
 
     def _layout_alias_component(self, ftensor: IRFullTensor) -> Set[IRFullTensor]:
+        """Follow same-shaped identity/multiref edges in both directions.
+
+        Staging gives these aliases full-sized IO even when the surrounding
+        compute ops use shards. Their declared IO is therefore not a demand
+        for a full tensor; the non-alias producers and consumers decide that.
+        """
         component = set()
         pending = [ftensor]
         while pending:
@@ -1356,20 +1363,25 @@ class IRSegmentExpander:
         self,
         ftensor: IRFullTensor,
     ) -> Optional[Dict[int, IRSubTensor]]:
+        """Find one consistent, disjoint compute partition per segment device.
+
+        For example, ``x -> identity -> y`` may feed ``y[:4]`` on device 0
+        and ``y[4:]`` on device 1. Both x and y can use those boundary shards.
+        A real full-tensor use, conflicting local views, or cross-device
+        overlap requires keeping the full boundary and its adapters.
+        """
+        # Inspect real compute edges throughout the alias component. Looking
+        # only at ftensor would see the full-sized identity and miss its shards.
         tensors = []
         for parent in self._layout_alias_component(ftensor):
-            tensors.extend(
-                tensor for node in self._segment.producers(parent)
-                if not self._is_layout_alias(node)
-                for tensor in node.oobjs()
-                if isinstance(tensor, IRSubTensor) and tensor.parent == parent
-            )
-            tensors.extend(
-                tensor for node in self._segment.consumers(parent)
-                if not self._is_layout_alias(node)
-                for tensor in node.iobjs()
-                if isinstance(tensor, IRSubTensor) and tensor.parent == parent
-            )
+            nodes = self._segment.producers(parent) + self._segment.consumers(parent)
+            for node in nodes:
+                if self._is_layout_alias(node):
+                    continue
+                tensors.extend(
+                    tensor for tensor in node.iobjs() + node.oobjs()
+                    if isinstance(tensor, IRSubTensor) and tensor.parent == parent
+                )
         if not tensors:
             return None
 
@@ -1377,6 +1389,8 @@ class IRSegmentExpander:
         if any(tensor.indmap == full_indmap and tensor.valmap == (0, 1) for tensor in tensors):
             return None
 
+        # Express each alias's shard on the requested boundary tensor. Every
+        # compute use on a device must agree on this same index/value partition.
         partitions = {}
         for tensor in tensors:
             for device in tensor.device:
@@ -1394,8 +1408,11 @@ class IRSegmentExpander:
         if set(partitions) != set(self._segment.device):
             return None
         values = list(partitions.values())
-        if any(lhs != rhs and lhs.overlap(rhs) for idx, lhs in enumerate(values) for rhs in values[idx + 1:]):
-            return None
+        for idx, lhs in enumerate(values):
+            # These entries belong to distinct devices. Equal subtensors are
+            # replicas, since IRSubTensor equality does not include placement.
+            if any(lhs.overlap(rhs) for rhs in values[idx + 1:]):
+                return None
         return partitions
 
     def _try_narrow_segment_ctensors(self, ftensor: IRFullTensor) -> Optional[Dict[int, IRSubTensor]]:
@@ -1411,7 +1428,6 @@ class IRSegmentExpander:
         consumption patterns.
 
         Args:
-            segment: the consuming segment
             ftensor: the full tensor consumed by the segment
 
         Returns:
