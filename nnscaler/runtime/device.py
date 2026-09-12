@@ -95,18 +95,10 @@ class _DeviceGroup:
         return self.groups[rank_bits]
 
     def get_p2p_group(self, src: int, dst: int):
-        """
-        Return the dedicated two-rank process group and local group ranks for src/dst.
-        """
+        """Return the pair's dedicated group, or None for the default group."""
         if not self.use_p2p_groups or src == dst:
-            return None, None, None
-        pair = (src, dst) if src < dst else (dst, src)
-        group = self.p2p_groups.get(pair)
-        if group is None:
-            return None, None, None
-        group_src = 0 if src == pair[0] else 1
-        group_dst = 0 if dst == pair[0] else 1
-        return group, group_src, group_dst
+            return None
+        return self.p2p_groups.get(tuple(sorted((src, dst))))
 
 
     def init_p2p_groups(self, pairs):

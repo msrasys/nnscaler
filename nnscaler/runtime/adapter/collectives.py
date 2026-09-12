@@ -17,9 +17,7 @@ import torch
 from nnscaler.runtime.device import DeviceGroup
 from nnscaler.profiler.timer import CudaTimer
 
-from nnscaler.runtime.executor import (
-    AsyncCommHandler, defer_pseudo_free_tensor, complete_deferred_pseudo_free_tensor, pseudo_free_tensor,
-)
+from nnscaler.runtime.executor import AsyncCommHandler
 
 
 def _serialize_object(obj) -> bytes:
@@ -46,7 +44,6 @@ def move(
     src: int,
     dst: int,
     async_op=False,
-    release_after_send: Optional[torch.Tensor] = None,
 ):
     """
     Move a tensor from source device to destination device.
@@ -55,43 +52,25 @@ def move(
         CudaTimer().start(field_name='comm', predefined=True)
     rank = torch.distributed.get_rank()
     work = None
-    group, group_src, group_dst = DeviceGroup().get_p2p_group(src, dst)
+    group = DeviceGroup().get_p2p_group(src, dst)
     if rank == src:
         tensor = tensor.contiguous() if not tensor.is_contiguous() else tensor
         assert torch.is_tensor(tensor)
         if async_op:
-            if group is None:
-                work = torch.distributed.isend(tensor, dst)
-            else:
-                work = torch.distributed.isend(tensor, group=group, dst=dst)
-            callback = None
-            if release_after_send is not None:
-                defer_pseudo_free_tensor(release_after_send)
-                callback = lambda: complete_deferred_pseudo_free_tensor(release_after_send)
-            AsyncCommHandler().hold_send(tensor, work, callback=callback)
+            work = torch.distributed.isend(tensor, group=group, dst=dst)
+            AsyncCommHandler().hold_send(tensor, work)
         else:
-            if group is None:
-                torch.distributed.send(tensor, dst)
-            else:
-                torch.distributed.send(tensor, group=group, dst=dst)
-            if release_after_send is not None:
-                pseudo_free_tensor(release_after_send)
+            torch.distributed.send(tensor, group=group, dst=dst)
     else:
         assert rank == dst
         tensor = torch.empty(shape, dtype=dtype,
             device=torch.cuda.current_device()
         )
         if async_op:
-            if group is None:
-                work = torch.distributed.irecv(tensor, src)
-            else:
-                work = torch.distributed.irecv(tensor, group=group, src=src)
+            work = torch.distributed.irecv(tensor, group=group, src=src)
             AsyncCommHandler().submit(tensor, [work])
         else:
-            if group is None:
-                torch.distributed.recv(tensor, src)
-            else:
-                torch.distributed.recv(tensor, group=group, src=src)
+            torch.distributed.recv(tensor, group=group, src=src)
     if not async_op:
         CudaTimer().stop(field_name='comm', predefined=True)
     return tensor
@@ -338,20 +317,14 @@ def rdgather(itensor: torch.Tensor, shape: Tuple[int], dtype: torch.dtype,
         for src in srcs:
             tensor = torch.empty(shape, dtype=dtype, device=torch.cuda.current_device())
             recv_tensors.append(tensor)
-            group, group_src, _ = DeviceGroup().get_p2p_group(src, dst)
+            group = DeviceGroup().get_p2p_group(src, dst)
             if async_op:
-                if group is None:
-                    work = torch.distributed.irecv(tensor, src)
-                else:
-                    work = torch.distributed.irecv(
-                        tensor, group=group, src=src)
+                work = torch.distributed.irecv(
+                    tensor, group=group, src=src)
                 works.append(work)
             else:
-                if group is None:
-                    torch.distributed.recv(tensor, src)
-                else:
-                    torch.distributed.recv(
-                        tensor, group=group, src=src)
+                torch.distributed.recv(
+                    tensor, group=group, src=src)
 
         if async_op:
             rdgather_callback = lambda t: torch.cat(tuple(recv_tensors), dim=dim)
@@ -362,20 +335,14 @@ def rdgather(itensor: torch.Tensor, shape: Tuple[int], dtype: torch.dtype,
     else:
         assert rank in srcs
         otensor = itensor.contiguous() if not itensor.is_contiguous() else itensor
-        group, _, group_dst = DeviceGroup().get_p2p_group(rank, dst)
+        group = DeviceGroup().get_p2p_group(rank, dst)
         if async_op:
-            if group is None:
-                work = torch.distributed.isend(otensor, dst)
-            else:
-                work = torch.distributed.isend(
-                    otensor, group=group, dst=dst)
+            work = torch.distributed.isend(
+                otensor, group=group, dst=dst)
             AsyncCommHandler().hold_send(otensor, work)
         else:
-            if group is None:
-                torch.distributed.send(otensor, dst)
-            else:
-                torch.distributed.send(
-                    otensor, group=group, dst=dst)
+            torch.distributed.send(
+                otensor, group=group, dst=dst)
     if not async_op:
         CudaTimer().stop(field_name='comm', predefined=True)
     return otensor
