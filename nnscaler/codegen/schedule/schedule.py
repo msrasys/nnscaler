@@ -1,7 +1,7 @@
 #  Copyright (c) Microsoft Corporation.
 #  Licensed under the MIT License.
 
-from typing import List, Optional, Tuple, Union, Dict
+from typing import List, Optional, Tuple, Union, Dict, NamedTuple
 import copy
 import inspect
 import logging
@@ -32,6 +32,12 @@ bi_sign = '{input_grads} = nnscaler.runtime.executor.backward_input({name}, {inp
 bw_sign = 'nnscaler.runtime.executor.backward_weight({name}, {weights})'
 bw_fn_name = 'nnscaler.runtime.executor.backward_weight'
 ssign = '{inputs} = nnscaler.runtime.executor.sync_tensors({inputs})'
+
+
+class _SampleAccess(NamedTuple):
+    """A constant-key lookup path rooted at an original dataloader output."""
+    sample_tid: int
+    lookups: Tuple[Tuple[str, Tuple[str, ...]], ...]
 
 
 class ScheduleCodeGen(FuncEmission):
@@ -156,7 +162,7 @@ class ScheduleCodeGen(FuncEmission):
             if not isinstance(cell, IRDataOperation) or not isinstance(node, ExeReuseCell):
                 continue
             for output in node.outputs():
-                if isinstance(output, IRObject) and self.tensor_name(output).startswith('samples_'):
+                if isinstance(output, IRObject) and not isinstance(output, IRTensor):
                     sample_reads[node.micro_batch_id] = (self.tensor_name(output), output.tid)
                     break
 
@@ -451,13 +457,21 @@ class ScheduleCodeGen(FuncEmission):
                     for record_event in stream_context.record_events:
                         events.add(record_event)
 
-    @staticmethod
-    def _var_prefix(name: str) -> str:
-        return name.rsplit('_', 1)[0] if '_' in name else name
+    def _collect_getitem_info(self, execplan: ExecutionPlan) -> Dict[int, _SampleAccess]:
+        """Record replayable sample accesses using original IR IDs, not names.
 
-    def _collect_getitem_info(self, execplan: ExecutionPlan):
-        info = {}
-        for node in execplan.graph.nodes(flatten=True):
+        An interleaved rank may need ``data['context'].get('scale', 1)``
+        without scheduling the original lookup ops locally. Record that path
+        once, including dict.get defaults, so each microbatch can replay it.
+        Only constant arguments and paths rooted at the dataloader are safe.
+        """
+        nodes = execplan.graph.nodes(flatten=True)
+        sample_tids = {
+            output.tid for node in nodes if isinstance(node, IRDataOperation)
+            for output in node.outputs() if isinstance(output, IRObject)
+        }
+        lookups = {}
+        for node in nodes:
             if not isinstance(node, IRFwOperation) or node.signature not in {
                 '_operator.getitem', 'builtins.dict.get',
             }:
@@ -465,14 +479,27 @@ class ScheduleCodeGen(FuncEmission):
             output = node.output(0)
             if isinstance(output, IRTensor) or not isinstance(output, IRObject):
                 continue
-            key = node.input(1)
-            key = key.value if isinstance(key, IRObject) else key
-            if not isinstance(key, str):
-                continue
             source = node.input(0)
-            source_prefix = self._var_prefix(self.tensor_name(source)) \
-                if isinstance(source, IRObject) else None
-            info[self._var_prefix(self.tensor_name(output))] = key, source_prefix
+            if not isinstance(source, IRObject) or isinstance(source, IRTensor):
+                continue
+            args = node.inputs()[1:]
+            if any(not obj.is_constant for obj in IR.get_objects(args)):
+                continue
+            args = IR.try_unwrap(args)
+            if not isinstance(args[0], str):
+                continue
+            function = 'dict.get' if node.signature == 'builtins.dict.get' else node.signature
+            lookups[output.tid] = source.tid, function, tuple(self.tensor_name(arg) for arg in args)
+
+        info = {}
+        for output_tid in lookups:
+            source_tid = output_tid
+            path = []
+            while source_tid in lookups:
+                source_tid, function, args = lookups[source_tid]
+                path.append((function, args))
+            if source_tid in sample_tids:
+                info[output_tid] = _SampleAccess(source_tid, tuple(reversed(path)))
         return info
 
     def _emit_missing_nontensor_inputs(
@@ -483,34 +510,33 @@ class ScheduleCodeGen(FuncEmission):
         dataloader_var,
         fallback_state,
     ):
+        """Replay missing metadata accesses against this microbatch's sample.
+
+        ExeReuseCell pairs original inputs with their microbatch instances.
+        Prefer an already-produced input, then a scheduled sample read, and
+        finally random access. Random access must not advance the dataloader.
+        """
         if produced_tids is None or not getitem_info:
             return []
 
         codes = []
         micro_batch_id = node.micro_batch_id if isinstance(node, ExeReuseCell) else None
-        for obj in node.inputs():
+        cell = node.cell if isinstance(node, ExeReuseCell) else node
+        input_pairs = list(zip(cell.inputs(), node.inputs()))
+        available = {
+            original.tid: self.tensor_name(actual)
+            for original, actual in input_pairs
+            if isinstance(original, IRObject) and isinstance(actual, IRObject)
+            and actual.tid in produced_tids
+        }
+        for original, obj in input_pairs:
             if not isinstance(obj, IRObject) or isinstance(obj, IRTensor) or obj.tid in produced_tids:
                 continue
-
-            prefix = self._var_prefix(self.tensor_name(obj))
-            if prefix not in getitem_info:
+            access = getitem_info.get(original.tid)
+            if access is None:
                 continue
 
-            keys = []
-            source_prefix = prefix
-            while source_prefix in getitem_info:
-                key, source_prefix = getitem_info[source_prefix]
-                keys.append(key)
-                if source_prefix is None:
-                    break
-            keys.reverse()
-
-            source_var = next((
-                self.tensor_name(other)
-                for other in node.inputs()
-                if isinstance(other, IRObject)
-                and self._var_prefix(self.tensor_name(other)) == source_prefix
-            ), None)
+            source_var = available.get(access.sample_tid)
             if source_var is None and dataloader_var and micro_batch_id is not None:
                 sample = fallback_state['sample_reads'].get(micro_batch_id)
                 if sample is not None and sample[1] in produced_tids:
@@ -526,11 +552,10 @@ class ScheduleCodeGen(FuncEmission):
             if source_var is None:
                 continue
 
-            for index, key in enumerate(keys[:-1]):
-                next_var = f'_object_{obj.tid}_{index}'
-                codes.append(f'{next_var} = _operator.getitem({source_var}, {key!r})')
-                source_var = next_var
-            codes.append(f'{self.tensor_name(obj)} = _operator.getitem({source_var}, {keys[-1]!r})')
+            expression = source_var
+            for function, args in access.lookups:
+                expression = f'{function}({expression}, {", ".join(args)})'
+            codes.append(f'{self.tensor_name(obj)} = {expression}')
             produced_tids.add(obj.tid)
         return codes
 
