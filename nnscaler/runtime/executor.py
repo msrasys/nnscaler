@@ -99,6 +99,17 @@ class _AsyncCommHandler:
         assert len(self._works) == 0 and len(self._callbacks) == 0 and len(self._send_holds) == 0, \
             f"AsyncCommHandler not cleared: works={len(self._works)}, callbacks={len(self._callbacks)}, send_holds={len(self._send_holds)}"
 
+    def drain(self):
+        """Complete sends and discard receives whose callbacks need no consumer."""
+        self.drain_sends()
+        for tensor, works in list(self._works.items()):
+            if self._callbacks.get(tensor) is not None:
+                continue
+            if not isinstance(works, torch.Tensor):
+                for work in works:
+                    work.wait()
+            self._works.pop(tensor, None)
+            self._callbacks.pop(tensor, None)
 
 _instance: Optional[_AsyncCommHandler] = None
 
@@ -199,8 +210,18 @@ class Executor:
         saved_pairs = Executor._detach[name].pop(0)
         tensor_ids: List[int] = [pair[0] for pair in saved_pairs]
         dtensors: List[torch.Tensor] = [pair[1] for pair in saved_pairs]
-        for t in input_tensors:
-            if id(t) not in tensor_ids:
+        requested_input_tensors = input_tensors
+        requested_tensor_ids = [
+            id(t) for t in requested_input_tensors if torch.is_tensor(t)
+        ]
+        dtensor_by_input_id = {
+            tid: dtensor
+            for tid, dtensor in saved_pairs
+            if torch.is_tensor(dtensor)
+        }
+
+        for t in requested_input_tensors:
+            if torch.is_tensor(t) and id(t) not in tensor_ids:
                 import traceback
                 _logger.warning(
                     f"rank {torch.distributed.get_rank()}: input {name} doesn't match. "
@@ -212,7 +233,8 @@ class Executor:
         if len(output_tensors) == 0: return None
 
         input_tensors = []
-        for t in dtensors:
+        for tid in requested_tensor_ids:
+            t = dtensor_by_input_id.get(tid)
             if torch.is_tensor(t) and t.requires_grad:
                 t.retain_grad()
                 input_tensors.append(t)
