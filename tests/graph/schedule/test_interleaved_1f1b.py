@@ -41,11 +41,12 @@ class Model(torch.nn.Module):
         x = self.fc2(x)
         x = self.fc3(x)
         x = self.fc4(x)
-        return x.sum()
+        return x.sum(), x.mean()
 
 
 def policy_1f1b(graph, cfg):
     data_loader, fc1, fc2, fc3, fc4, loss = graph.nodes()[:6]
+    aux = graph.nodes()[6]
     graph.staging([fc1, fc3,])
     stages = graph.select(ntype=IRSegment, flatten=False)
     stages = [s for s in stages if s.isfw()]
@@ -62,6 +63,7 @@ def policy_1f1b(graph, cfg):
     graph.assign(fc3, 1)
     graph.assign(fc4, 1)
     graph.assign(loss, 1)
+    graph.assign(aux, 1)
 
     PredefinedSched.sched_1f1b(graph, cfg.pas_config['n_micro_batches'], len(stages))
 
@@ -70,6 +72,7 @@ def policy_1f1b(graph, cfg):
 
 def policy_1f1b_interleaved(graph, cfg):
     data_loader, fc1, fc2, fc3, fc4, loss = graph.nodes()[:6]
+    aux = graph.nodes()[6]
     graph.staging([fc1, fc2, fc3, fc4])
     stages = graph.select(ntype=IRSegment, flatten=False)
     stages = [s for s in stages if s.isfw()]
@@ -92,6 +95,7 @@ def policy_1f1b_interleaved(graph, cfg):
     graph.assign(identity, 1)
     graph.assign(fc4, 1)
     graph.assign(loss, 1)
+    graph.assign(aux, 1)
 
     PredefinedSched.sched_1f1b_interleaved(graph, cfg.pas_config['n_micro_batches'], len(stages))
 
