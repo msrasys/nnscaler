@@ -5,6 +5,7 @@ from pathlib import Path
 
 import pytest
 import torch
+from torch.torch_version import TorchVersion
 
 from nnscaler.graph.parser import FxModuleParser
 from nnscaler.graph.parser.frame import Frame
@@ -32,8 +33,9 @@ def test_save_attr_content_index(tmp_path: Path):
 
 
 @pytest.mark.parametrize('with_index', [True, False])
+@pytest.mark.parametrize('torch_version', ['2.0.1', str(torch.__version__)])
 def test_load_attr_content_reads_compatible_chunks(
-    tmp_path: Path, monkeypatch, with_index: bool,
+    tmp_path: Path, monkeypatch, with_index: bool, torch_version: str,
 ):
     file_stem = tmp_path / FxModuleParser.ATTR_CONTENT_FILE_STEM
     torch.save({10: torch.full((4,), 10.0)}, f'{file_stem}.0')
@@ -60,8 +62,12 @@ def test_load_attr_content_reads_compatible_chunks(
 
     loaded_files = []
     torch_load = torch.load
+    supports_mmap = TorchVersion(torch_version) >= (2, 1)
 
     def record_load(filename, *args, **kwargs):
+        # Emulate the older loader API as well as checking the restored weights.
+        if not supports_mmap and 'mmap' in kwargs:
+            raise TypeError("load() got an unexpected keyword argument 'mmap'")
         loaded_files.append((
             Path(filename).name,
             kwargs.get('mmap'),
@@ -70,17 +76,19 @@ def test_load_attr_content_reads_compatible_chunks(
         return torch_load(filename, *args, **kwargs)
 
     monkeypatch.setattr(torch, 'load', record_load)
+    monkeypatch.setattr(torch, '__version__', TorchVersion(torch_version))
     module.load_attr_content(str(file_stem))
 
     assert torch.equal(module.local_weight, torch.arange(2, 5, dtype=torch.float32))
+    expected_mmap = True if supports_mmap else None
     if with_index:
         assert loaded_files == [
             (FxModuleParser.ATTR_CONTENT_INDEX_FILE, None, None),
-            ('fullmodel.pt.2', True, True),
+            ('fullmodel.pt.2', expected_mmap, True),
         ]
     else:
         assert loaded_files == [
-            ('fullmodel.pt.0', True, True),
-            ('fullmodel.pt.1', True, True),
-            ('fullmodel.pt.2', True, True),
+            ('fullmodel.pt.0', expected_mmap, True),
+            ('fullmodel.pt.1', expected_mmap, True),
+            ('fullmodel.pt.2', expected_mmap, True),
         ]
