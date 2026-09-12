@@ -6,7 +6,6 @@ from functools import partial
 from dataclasses import dataclass
 import math
 import logging
-import weakref
 import torch
 from torch.utils.hooks import RemovableHandle
 
@@ -22,83 +21,6 @@ if TYPE_CHECKING:
 
 
 _logger = logging.getLogger(__name__)
-
-
-_REDUCER_BUCKET_REFS: Dict[
-    int, Tuple[weakref.ReferenceType, weakref.ReferenceType]
-] = {}
-
-
-def _register_reducer_bucket(param: torch.nn.Parameter, bucket: 'Bucket') -> None:
-    """Associate a parameter with its bucket without mutating the parameter.
-
-    Parameters include their Python attributes when pickled, so storing a
-    ``weakref.ref`` directly on one makes ``torch.save(param)`` fail. Key the
-    lookup by object identity instead and verify the weak referent on access to
-    protect against Python object-id reuse.
-    """
-    key = id(param)
-
-    def remove_stale(param_ref, key=key):
-        entry = _REDUCER_BUCKET_REFS.get(key)
-        if entry is not None and entry[0] is param_ref:
-            _REDUCER_BUCKET_REFS.pop(key, None)
-
-    param_ref = weakref.ref(param, remove_stale)
-    _REDUCER_BUCKET_REFS[key] = (param_ref, weakref.ref(bucket))
-
-
-def _get_reducer_bucket(param: torch.nn.Parameter) -> Optional['Bucket']:
-    """Return the reducer bucket owning ``param``, if one has been built."""
-    entry = _REDUCER_BUCKET_REFS.get(id(param))
-    if entry is None or entry[0]() is not param:
-        return None
-    bucket = entry[1]()
-    if bucket is None:
-        _REDUCER_BUCKET_REFS.pop(id(param), None)
-    return bucket
-
-
-def has_reducer_grad_accumulator(param: torch.nn.Parameter) -> bool:
-    """Whether ``param`` can accumulate a manually-computed gradient via its reducer."""
-    bucket = _get_reducer_bucket(param)
-    return bucket is not None and param in bucket._pofset
-
-
-@torch.no_grad()
-def accumulate_reducer_grad(
-    param: torch.nn.Parameter,
-    grad: torch.Tensor,
-    offset: int = 0,
-) -> bool:
-    """Accumulate a flat parameter-gradient slice directly into its reducer.
-
-    This is intended for custom autograd functions that compute parameter
-    gradients themselves and therefore return ``None`` for that parameter.
-    ``offset`` is measured in elements in the original, flattened parameter.
-    The function returns ``False`` when the parameter is not owned by a
-    reducer, allowing callers to use their normal autograd path instead.
-
-    Call :func:`mark_reducer_grad_ready` exactly once after all slices for one
-    backward contribution have been accumulated and before the custom
-    autograd function returns ``None``. The parameter's ``AccumulateGrad``
-    hook then completes the normal reducer lifecycle.
-    """
-    bucket = _get_reducer_bucket(param)
-    if bucket is None:
-        return False
-    bucket.accumulate_grad(param, grad, offset)
-    return True
-
-
-@torch.no_grad()
-def mark_reducer_grad_ready(param: torch.nn.Parameter) -> bool:
-    """Signal that one manually-computed gradient contribution is complete."""
-    bucket = _get_reducer_bucket(param)
-    if bucket is None:
-        return False
-    bucket.mark_grad_ready(param)
-    return True
 
 
 # According to https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#device-memory-accesses
@@ -456,18 +378,11 @@ class Bucket:
         self._reduce_op = reduce_op
         self._group = group
         self._wsz: int = torch.distributed.get_world_size(group=self._group)
-        self._async_param_cnt: int = 0  # local gradient contributions seen by async reducer
+        self._async_param_cnt: int = 0  # flag for triggering async communication
         self._async_handle = None  # asynchrounous communication handler
-        # Scheduled pipeline can run multiple backward segments that contribute
-        # to the same bucket before the bucket is ready to reduce.
-        self._async_expected_param_cnt: Dict[torch.nn.Parameter, int] = {p: 1 for p in self._params}
-        self._async_seen_param_cnt: Dict[torch.nn.Parameter, int] = {p: 0 for p in self._params}
-        self._async_expected_total: int = len(self._params)
-        # Parameters whose custom autograd function accumulated gradients
-        # directly into this bucket. AccumulateGrad still runs when that
-        # function returns None; it consumes this marker and performs the
-        # normal reducer completion lifecycle exactly once.
-        self._manual_grad_pending: Set[torch.nn.Parameter] = set()
+        self._async_expected_param_cnt: Optional[Dict[torch.nn.Parameter, int]] = None
+        self._async_seen_param_cnt: Dict[torch.nn.Parameter, int] = {}
+        self._async_expected_total = 0
         self._hooks: List[Tuple[Any, RemovableHandle]] = []
         self._params_with_grad: Set[torch.nn.Parameter] = set()
 
@@ -522,8 +437,6 @@ class Bucket:
 
         # only async will enable contiguous gradient
         self.build()
-        for param in self._params:
-            _register_reducer_bucket(param, self)
         self.register_hooks()
 
     @property
@@ -654,17 +567,8 @@ class Bucket:
                 self._params_with_grad.add(param)
             ofst = self._pofset[param]
             rank = torch.distributed.get_rank()
-            manually_accumulated = param in self._manual_grad_pending
-            self._manual_grad_pending.discard(param)
             # TODO: need to handle sparse gradients in torch.nn.Embedding
-            if param.grad is None:
-                if not manually_accumulated:
-                    raise RuntimeError(
-                        "Reducer AccumulateGrad hook received no gradient. If a custom "
-                        "autograd function computes this gradient manually, call "
-                        "mark_reducer_grad_ready(param) before returning None."
-                    )
-            elif self._z3:
+            if self._z3:
                 z3_info = self._reducer.get_z3_info(param)
                 grad = param.grad.data.view(-1)
                 padded_numel = z3_info.numel_with_padding() * self._zgroup_sz
@@ -699,25 +603,66 @@ class Bucket:
             if not self._grad_accumulation_steps and RuntimeFlag.skip_reducer:
                 return
 
+            self._async_param_cnt += 1
+
             # perform all-reduce
             if self._async:
-                if self._grad_accumulation_steps:
+                if self._async_expected_param_cnt is not None:
+                    expected = self._async_expected_param_cnt[param]
+                    seen = self._async_seen_param_cnt.get(param, 0) + 1
+                    self._async_seen_param_cnt[param] = seen
+                    if seen > expected:
+                        raise RuntimeError(
+                            f"Async reducer received {seen}/{expected} expected "
+                            "gradient contributions for a scheduled parameter."
+                        )
+                    target_cnt = self._async_expected_total
+                elif self._grad_accumulation_steps:
                     target_cnt = self._grad_accumulation_steps * len(self._params)
-                    self._async_param_cnt += 1
-                    if self._async_param_cnt > target_cnt:
+                else:
+                    target_cnt = len(self._params)
+
+                if self._async_param_cnt > target_cnt:
+                    if self._grad_accumulation_steps:
                         raise RuntimeError(
                             f"Asynchronous Reducer received more gradients than expected "
                             f"({self._async_param_cnt} > {target_cnt} = "
                             f"grad_accumulation_steps({self._grad_accumulation_steps}) * num_params({len(self._params)})). "
                             f"Make sure `grad_accumulation_steps` matches the actual number of gradient accumulation steps per optimizer step."
                         )
-                    if self._async_param_cnt == target_cnt:
-                        self._launch_async_reduce()
-                else:
-                    # Scheduled PP/VPP can contribute a different number of
-                    # gradients per parameter, so use generated per-parameter
-                    # counts instead of a uniform accumulation multiplier.
-                    self._mark_async_param_ready(param)
+                    raise RuntimeError(
+                        f"Detected gradient accumulation with asynchronous Reducer "
+                        f"({self._async_param_cnt} > {target_cnt} = num_params). "
+                        f"Run with `nnscaler.accum_mode` (or set `grad_accumulation_steps`) to manage gradient synchronization."
+                    )
+                if self._async_param_cnt == target_cnt:
+                    # apply pre hooks
+                    self._apply_pre_hooks()
+                    # communication
+                    if self._zero == 1 and self._zero_use_reduce_scatter:
+                        # when zero3 is used, the parameters and gradients are already sharded in reducer
+                        # so only allreduce is needed
+                        if self._zgroup_sz == self._wsz:
+                            rank = torch.distributed.get_rank(group=self._group)
+                            shards = list(self._contiguous_grads.chunk(self._wsz, dim=0))
+                            # inplace reduce scatter is supported
+                            # see https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/api/colls.html#c.ncclReduceScatter
+                            self._async_handle = torch.distributed.reduce_scatter(
+                                shards[rank], shards, op=self._reduce_op,
+                                group=self._group, async_op=True)
+                        else:
+                            assert False, "group zero + reducescatter is not supported in async mode, " \
+                                            "because the two steps (allreduce, reducescatter) use " \
+                                            "two communication groups, which may induce deadlock."
+                            self._group_reduce_scatter()
+                    elif self._zero > 1:
+                        self._async_handle = torch.distributed.all_reduce(
+                            self._contiguous_grads, op=self._reduce_op,
+                            group=self._zero_crossgroup, async_op=True)
+                    else:
+                        self._async_handle = torch.distributed.all_reduce(
+                            self._contiguous_grads, op=self._reduce_op,
+                            group=self._group, async_op=True)
 
         for param in self._params:
             # same trick with FSDP and Megatron
@@ -747,6 +692,7 @@ class Bucket:
         The `.grad` attribute for each parameter will also be set after
         the completion of allreduce.
         """
+        rank = torch.distributed.get_rank(group=self._group)
         if self._use_none_grad:
             grad_presence = torch.tensor(
                 [param in self._params_with_grad for param in self._params],
@@ -767,22 +713,39 @@ class Bucket:
                 for param in self._params:
                     assert param.grad is None
                 return
+
         # async
         if self._async:
             if CudaTimer().enabled and CudaTimer().predefined:
                 _logger.warning(
                     f'CudaTimer: the communication time of async reducer will not be recorded in `comm`')
-            if self._async_handle is not None:
-                self._async_handle.wait()
-            else:
+            if self._async_handle is None:
                 raise RuntimeError(
-                    "Async reducer did not launch gradient synchronization before sync_grads(). "
-                    f"Received {self._async_param_cnt}/{self._async_expected_total} expected "
-                    "parameter-gradient contributions. This usually means the scheduled backward "
-                    "plan did not match the reducer's async accumulation expectations."
+                    "The async reducer's asynchronous gradient synchronization was never triggered, "
+                    "which means no gradient was produced for the parameters in this reducer on this step. "
+                    "This usually happens when some parameters are not used, "
+                    "or are used outside a `torch.enable_grad` context, in the forward pass. "
+                    "Please make sure every parameter in this reducer is used under `torch.enable_grad` "
+                    "in EVERY forward pass, or disable the async reducer."
                 )
+            self._async_handle.wait()
         else:
-            self._sync_contiguous_grads()
+            CudaTimer().start('comm', predefined=True)
+            # apply pre-hooks
+            self._apply_pre_hooks()
+            # synchrnoize gradients
+            if self._zero == 1 and self._zero_use_reduce_scatter:
+                self._group_reduce_scatter()
+            elif self._zero > 1:
+                torch.distributed.all_reduce(
+                    self._contiguous_grads,
+                    op=self._reduce_op,
+                    group=self._zero_crossgroup
+                )
+            else:
+                torch.distributed.all_reduce(
+                    self._contiguous_grads, op=self._reduce_op, group=self._group)
+            CudaTimer().stop('comm', predefined=True)
         # apply nreplicas divisor if needed
         if self._nreplicas != 1:
             self._contiguous_grads.div_(self._nreplicas)
@@ -808,142 +771,6 @@ class Bucket:
 
         # apply post-hooks
         self._apply_post_hooks()
-
-    @torch.no_grad()
-    def accumulate_grad(
-        self,
-        param: torch.nn.Parameter,
-        grad: torch.Tensor,
-        offset: int = 0,
-    ):
-        """Accumulate a manually-computed flat gradient slice for ``param``."""
-        if param not in self._pofset:
-            raise ValueError("Parameter is not owned by this reducer bucket.")
-        if not torch.is_tensor(grad):
-            raise TypeError(f"grad must be a tensor, got {type(grad)}")
-
-        info = self._params_info[param]
-        param_numel = math.prod(info.shape)
-        offset = int(offset)
-        grad = grad.reshape(-1)
-        end = offset + grad.numel()
-        if offset < 0 or end > param_numel:
-            raise ValueError(
-                f"Gradient slice [{offset}, {end}) is outside parameter with "
-                f"{param_numel} elements."
-            )
-        if grad.device != self._contiguous_grads.device:
-            raise ValueError(
-                f"Gradient device {grad.device} does not match reducer device "
-                f"{self._contiguous_grads.device}."
-            )
-
-        ofst = self._pofset[param]
-        if not self._z3:
-            self._contiguous_grads[ofst + offset:ofst + end].add_(grad)
-            return
-
-        # ZeRO-3 normally reduce-scatters a complete ``param.grad`` in the
-        # AccumulateGrad hook. For a manually-produced slice, all-reduce only
-        # that slice and retain its intersection with this rank's shard. This
-        # is equivalent to reduce-scatter while keeping temporary storage
-        # bounded by the caller's chunk size.
-        shard_numel = info.numel_with_padding()
-        local_rank = torch.distributed.get_rank(group=self._zero_subgroup)
-        torch.distributed.all_reduce(
-            grad,
-            op=self._reduce_op,
-            group=self._zero_subgroup,
-        )
-        shard_start = local_rank * shard_numel
-        shard_end = shard_start + shard_numel
-        overlap_start = max(offset, shard_start)
-        overlap_end = min(end, shard_end, param_numel)
-        if overlap_start < overlap_end:
-            grad_slice = grad[
-                overlap_start - offset:overlap_end - offset
-            ]
-            local_start = ofst + overlap_start - shard_start
-            self._contiguous_grads[
-                local_start:local_start + grad_slice.numel()
-            ].add_(grad_slice)
-
-
-    @torch.no_grad()
-    def mark_grad_ready(self, param: torch.nn.Parameter):
-        """Defer manual-gradient completion to the parameter's AccumulateGrad hook."""
-        if param not in self._pofset:
-            raise ValueError("Parameter is not owned by this reducer bucket.")
-        self._manual_grad_pending.add(param)
-
-
-    def _sync_contiguous_grads(self):
-        CudaTimer().start('comm', predefined=True)
-        # apply pre-hooks
-        self._apply_pre_hooks()
-        # synchronize gradients
-        if self._zero == 1 and self._zero_use_reduce_scatter:
-            self._group_reduce_scatter()
-        elif self._zero > 1:
-            torch.distributed.all_reduce(
-                self._contiguous_grads,
-                op=self._reduce_op,
-                group=self._zero_crossgroup
-            )
-        else:
-            torch.distributed.all_reduce(
-                self._contiguous_grads, op=self._reduce_op, group=self._group)
-        CudaTimer().stop('comm', predefined=True)
-
-
-    def _mark_async_param_ready(self, param: torch.nn.Parameter):
-        expected = self._async_expected_param_cnt.get(param, 1)
-        seen = self._async_seen_param_cnt.get(param, 0) + 1
-        self._async_seen_param_cnt[param] = seen
-        self._async_param_cnt += 1
-
-        if seen > expected or self._async_param_cnt > self._async_expected_total:
-            raise RuntimeError(
-                "Detected more async reducer gradient contributions than expected. "
-                f"param_seen={seen}/{expected}, "
-                f"bucket_seen={self._async_param_cnt}/{self._async_expected_total}. "
-                "Please check the scheduled pipeline accumulation plan."
-            )
-        if self._async_param_cnt == self._async_expected_total:
-            self._launch_async_reduce()
-
-
-    def _launch_async_reduce(self):
-        if self._async_handle is not None:
-            raise RuntimeError("Async reducer tried to launch gradient synchronization more than once.")
-        # apply pre hooks
-        self._apply_pre_hooks()
-        # communication
-        if self._zero == 1 and self._zero_use_reduce_scatter:
-            # when zero3 is used, the parameters and gradients are already sharded in reducer
-            # so only allreduce is needed
-            if self._zgroup_sz == self._wsz:
-                rank = torch.distributed.get_rank(group=self._group)
-                shards = list(self._contiguous_grads.chunk(self._wsz, dim=0))
-                # inplace reduce scatter is supported
-                # see https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/api/colls.html#c.ncclReduceScatter
-                self._async_handle = torch.distributed.reduce_scatter(
-                    shards[rank], shards, op=self._reduce_op,
-                    group=self._group, async_op=True)
-            else:
-                assert False, "group zero + reducescatter is not supported in async mode, " \
-                                "because the two steps (allreduce, reducescatter) use " \
-                                "two communication groups, which may induce deadlock."
-                self._group_reduce_scatter()
-        elif self._zero > 1:
-            self._async_handle = torch.distributed.all_reduce(
-                self._contiguous_grads, op=self._reduce_op,
-                group=self._zero_crossgroup, async_op=True)
-        else:
-            self._async_handle = torch.distributed.all_reduce(
-                self._contiguous_grads, op=self._reduce_op,
-                group=self._group, async_op=True)
-
 
     def set_async_grad_expected_counts(self, param_counts: Dict[torch.nn.Parameter, int]):
         # A reused parameter can contribute from several local stages in each
@@ -1024,8 +851,7 @@ class Bucket:
         """Reset status."""
         self._async_param_cnt = 0
         self._async_handle = None
-        self._async_seen_param_cnt = {p: 0 for p in self._params}
-        self._manual_grad_pending.clear()
+        self._async_seen_param_cnt.clear()
         self._params_with_grad.clear()
 
     def sleep(self):
@@ -1051,8 +877,6 @@ class Bucket:
         # https://github.com/pytorch/pytorch/blob/38a492d40d7ebb2856cb120df337c6cdac244528/torch/csrc/autograd/variable.cpp#L473
         # To make the resuming process safe, re-register them here.
         self._hooks = []
-        for param in self._params:
-            _register_reducer_bucket(param, self)
         self.register_hooks()
 
     def _pack(
@@ -1085,7 +909,6 @@ class Bucket:
         state.pop(fields._hooks, None)
         state.pop(fields._pre_hooks, None)
         state.pop(fields._post_hooks, None)
-        state.pop(fields._manual_grad_pending, None)
 
         # remove reducer reference
         state.pop(fields._reducer, None)
@@ -1100,7 +923,6 @@ class Bucket:
         bucket = object.__new__(cls)
         bucket.__dict__.update(state)
         bucket._reducer = reducer
-        bucket._manual_grad_pending = set()
         set_fparam_meta(bucket._param_for_optimizer, bucket._flatten_param_info)
 
         for param in bucket._params:
