@@ -361,11 +361,50 @@ class IRAdapterGener:
             for sub in sub_ws:
                 grad = sub.grad
                 dev = sub.device[0]
-                device_grads.setdefault(dev, []).append(grad)
+                # Colocated logical consumers can refer to the same physical
+                # gradient partition. Count each local value range once.
+                device_grads.setdefault(dev, set()).add(grad.valmap)
 
-            return all(ValueMap.is_complete(
-                [grad.valmap for grad in grads]) for grads in device_grads.values()
-            )
+            return all(ValueMap.is_complete(maps) for maps in device_grads.values())
+
+        def _is_colocated_grad_partition(sub_ws: List[IRSubTensor]) -> bool:
+            """Whether logical consumers reuse one grad partition per device.
+
+            Interleaved pipeline stages can be colocated on the same physical
+            rank.  When they share a parameter, ``sub_ws`` contains one entry
+            per logical consumer, while those consumers intentionally reuse the
+            same physical sub-weight and gradient partition.  Reducer layout
+            must therefore be validated against the distinct physical devices,
+            not the number of logical entries.
+            """
+            device_valmaps = {}
+            for sub_weight in sub_ws:
+                device_valmaps.setdefault(sub_weight.device[0], set()).add(
+                    sub_weight.grad.valmap
+                )
+            if any(len(valmaps) != 1 for valmaps in device_valmaps.values()):
+                return False
+            return ValueMap.is_complete([
+                next(iter(device_valmaps[device]))
+                for device in sorted(device_valmaps)
+            ])
+
+        def _is_colocated_weight_partition(
+            sub_ws: List[IRSubTensor], num_consumers: int
+        ) -> bool:
+            """Whether partitioned weights are reused by colocated VPP stages."""
+            unique_sub_weights = set(sub_ws)
+            physical_devices = {sub_weight.device[0] for sub_weight in sub_ws}
+            if len(unique_sub_weights) != len(physical_devices):
+                return False
+            for sub_weight in unique_sub_weights:
+                if sum(item == sub_weight for item in sub_ws) != num_consumers:
+                    return False
+                if len(sub_weight_devices[sub_weight]) != 1:
+                    return False
+                if not ValueMap.is_complete([sub_weight.grad.valmap]):
+                    return False
+            return True
 
         reducer_info: List[Tuple[IRSubTensor, list[int], int]] = []
         for weight in sub_weights:
@@ -393,8 +432,19 @@ class IRAdapterGener:
                     # | 3    | [3:4]           | c0(0/2) c1(2/4) c2(3/4) |
                     # all weights in different ranks are different (different portion of the full weight)
                     # no reducer is needed
-                    assert len(deduped_grad_valmaps) == num_consumers
-                elif len(deduped_grad_valmaps) == num_consumers: # replicated + no-grad-reduce
+                    if (
+                        len(deduped_grad_valmaps) != num_consumers
+                        and not _is_colocated_weight_partition(
+                            sub_ws, num_consumers
+                        )
+                    ):
+                        raise RuntimeError(
+                            "Detected an incomplete partitioned weight layout "
+                            f"for weight {weight}"
+                        )
+                elif _is_grad_replicated(sub_ws): # replicated + no-grad-reduce
+                    # Equal numbers of devices and logical consumers do not
+                    # imply complete local gradients. Check the actual ranges.
                     # all gradients are full (valmap == (i, num_consumers))
                     # for example, 4 gpus, 3 consumers (c0, c1, c2), weights shape (4, 4)
                     # | rank | weight portions | gradient valmap |
@@ -415,7 +465,14 @@ class IRAdapterGener:
                         pass
                 else:  # replicated + grad-reduce
                     assert len(deduped_sub_ws) == 1
-                    assert len(deduped_grad_valmaps) == len(sub_ws)
+                    if (
+                        len(deduped_grad_valmaps) != len(sub_ws)
+                        and not _is_colocated_grad_partition(sub_ws)
+                    ):
+                        raise RuntimeError(
+                            "Detected an incomplete replicated grad-reduce "
+                            f"layout for weight {weight}"
+                        )
                     # all gradients are partitioned
                     # generate reducer to sum the partitioned gradients across device groups
                     # for example, 4 gpus, 3 consumers (c0, c1, c2), weights shape (4, 4)
