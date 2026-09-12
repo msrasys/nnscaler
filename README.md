@@ -43,9 +43,9 @@ For **_DNN system experts_**, they can leverage nnScaler to explore new DNN para
 
 Install the following packages before the installation of nnScaler:
 
-    Python >= 3.9, < 3.11 (3.10 is recommanded)
+    Python >= 3.10
 
-    PyTorch >= 2.0, < 2.4 (2.2.0 is recommanded)
+    PyTorch >= 2.14, < 2.15
 
 ### Install nnScaler from source
 Execute below commands in nnScaler directory: 
@@ -65,9 +65,12 @@ Besides, to avoid *cppimport* error, it also needs to include nnScaler directory
 
 ### Prerequisite for Llama-3
 
-Install packages required to run Llama-3. Besides, a certain version of CUDA library is needed during flash-attn installation. For example, [CUDA V11.8](https://developer.nvidia.com/cuda-11-8-0-download-archive) is needed if using PyTorch 2.20. 
+Install the packages required to run Llama-3. Build FlashAttention and Apex
+against the same CUDA or ROCm toolkit used by the installed PyTorch 2.14
+package. Verify the toolkit version with
+`python -c "import torch; print(torch.__version__, torch.version.cuda)"`.
 
-    python -m pip install transformers==4.40.0 flash-attn==2.5.5 tensorboard
+    python -m pip install -r examples/llama/requirements.txt
 
 ### Model Access
 

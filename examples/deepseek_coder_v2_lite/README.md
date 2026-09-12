@@ -10,21 +10,26 @@ To run this example, you need to install the following packages:
 
 ```text
 nnscaler
+torch>=2.14,<2.15
 transformers==4.40.0
 datasets==3.6.0
+numpy<2
 apex
 flash-attn
-grouped_gemm==1.1.4
+grouped_gemm @ git+https://github.com/fanshiqing/grouped_gemm@v1.1.4
 ```
 
-We recommend to launch the script under a Nvidia docker directly, like `nvidia/pytorch:24.02-py3`. You can find grouped_gemm at https://github.com/fanshiqing/grouped_gemm.
+We recommend using an NVIDIA container with PyTorch 2.14 and a CUDA toolkit
+matching `torch.version.cuda`. Apex, FlashAttention, and grouped GEMM must be
+built against that same toolkit. You can find grouped_gemm at
+https://github.com/fanshiqing/grouped_gemm.
 
 ## Data Preparation
 
 Like the *llama3_8B_128K* example, [bookcorpus](https://huggingface.co/datasets/bookcorpus) dataset is used for training. You can use the following command directly
 
 ```bash
-python bookcorpus.py --data_path_or_name bookcorpus/bookcorpus --tokenizer_path_or_name deepseek-ai/DeepSeek-Coder-V2-Lite-Base --save_path ./bookcorpus_2k --sequence_length 2048
+python ../llama/bookcorpus.py --data_path_or_name bookcorpus/bookcorpus --tokenizer_path_or_name deepseek-ai/DeepSeek-Coder-V2-Lite-Base --save_path ./bookcorpus_2k --sequence_length 2048
 ```
 
 ## Training

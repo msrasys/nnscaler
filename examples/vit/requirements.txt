@@ -1,5 +1,4 @@
-transformers
 datasets
-transformers[torch]
-torch
+transformers[torch]>=4.48,<5
+torch>=2.14,<2.15
 torchvision

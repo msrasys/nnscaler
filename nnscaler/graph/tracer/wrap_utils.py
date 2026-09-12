@@ -583,7 +583,7 @@ wrapped_cls_to_orig_cls[torch_autocast_wrapper_clz] = orig_func.torch_autocast
 def torch_assert_wrapper(condition, message):
     if orig_func.isinstance(condition, cct.ConcreteProxy):
         condition = condition.value
-    return orig_func.isinstance(condition, message)
+    return orig_func.torch_assert(condition, message)
 
 
 @functools.wraps(orig_func.isinstance)

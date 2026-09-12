@@ -215,7 +215,7 @@ if __name__ == '__main__':
     args = TrainingArguments(
         f"test-cifar-10",
         save_strategy="epoch",
-        evaluation_strategy="epoch",
+        eval_strategy="epoch",
         learning_rate=float(trainer_args['optimizer']['args']['lr']),
         per_device_train_batch_size=int(trainer_args['micro_batch_size']),
         max_grad_norm=float(trainer_args['optimizer']['clip_gnorm']),

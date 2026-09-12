@@ -75,8 +75,10 @@ def _check_torch_version():
     import logging
     torch_version = str(torch.__version__).split('+')[0]
     torch_version = tuple(int(v) for v in torch_version.split('.')[:2])
-    if torch_version < (2, 0):
-        logging.warning(f"expected PyTorch version >= 2.0 but got {torch_version}")
+    if not (2, 14) <= torch_version < (2, 15):
+        logging.warning(
+            f"expected PyTorch version >= 2.14 and < 2.15 but got {torch_version}"
+        )
 
 
 _check_torch_version()

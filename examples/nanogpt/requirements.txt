@@ -3,6 +3,6 @@ lightning
 numpy
 requests
 tiktoken
-torch
+torch>=2.14,<2.15
 tqdm
-transformers
+transformers>=4.48,<5

@@ -29,8 +29,11 @@ You can find related documents and examples at `nnScaler <https://nnscaler.readt
 To speed up the training,
 `apex <https://github.com/NVIDIA/apex>`_ and `flash-attn <https://github.com/Dao-AILab/flash-attention>`_ are required.
 You can install them by following instructions in their official repositories.
-We also recommend to launch training in a docker directly,
-like ``nvidia/pytorch:24.02-py3`` and ``rocm/pytorch:rocm6.2.3_ubuntu22.04_py3.10_pytorch_release_2.3.0``.
+We recommend using a container with PyTorch 2.14 and a matching CUDA or ROCm
+toolkit. Apex and FlashAttention must be built against the same toolkit used
+by the installed PyTorch package. Verify the environment with
+``python -c "import torch; print(torch.__version__, torch.version.cuda)"``
+before building either extension.
 
 ****************
 Supported Models

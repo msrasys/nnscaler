@@ -45,10 +45,7 @@ except ImportError:
 try:
     from grouped_gemm.ops import gmm
 except ImportError:
-    raise ImportError(
-        "Grouped GEMM is not available. Please run "
-        "`pip install git+https://github.com/fanshiqing/grouped_gemm@v1.0`."
-    )
+    gmm = None
 
 
 def rmsnorm_fwd(self, hidden_states):
@@ -180,8 +177,8 @@ class NNScalerDeepseekFlashAttention2(DeepseekV2FlashAttention2):
             # Handle the case where the model is quantized
             if hasattr(self.config, "_pre_quantization_dtype"):
                 target_dtype = self.config._pre_quantization_dtype
-            elif torch.is_autocast_enabled():
-                target_dtype = torch.get_autocast_gpu_dtype()
+            elif torch.is_autocast_enabled('cuda'):
+                target_dtype = torch.get_autocast_dtype('cuda')
             else:
                 target_dtype = (
                     self.q_proj.weight.dtype
@@ -485,6 +482,11 @@ register_op(f'n l h^, (n l) 6, (n l) 6, 1, E+ d+ h^, E+ d+ h^, E+ h^ d+ -> n l h
 
 
 def nnscaler_deepseek_init():
+    if gmm is None:
+        raise ImportError(
+            "Grouped GEMM is not available. Please run "
+            "`pip install git+https://github.com/fanshiqing/grouped_gemm@v1.1.4`."
+        )
     ATTENTION_CLASSES['flash_attention_2'] = NNScalerDeepseekFlashAttention2
     DeepseekV2RMSNorm.forward = rmsnorm_fwd
     MoEGate.forward = moe_gate_fwd

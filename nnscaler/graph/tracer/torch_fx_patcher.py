@@ -203,63 +203,12 @@ class TorchFXPatcher:
         if is_useless_iter(node):
             return False
 
-        if node.op in {"placeholder", "output"}:
-            return True
-
-        # Check if an impure function.
-        if node.op == "call_function":
-            schema = getattr(node.target, "_schema", None)
-            if schema is not None and schema.is_mutable:
-                # impure since it mutates inputs
-                return True
-
-            if impure_random:
-                if getattr(node.target, "_nondeterministic_seeded", False):
-                    # impure since it mutates RNG state
-                    return True
-
-            # Handle Python random functions that don't have _nondeterministic_seeded
-            # but still affect global RNG state (issue #151524)
-            # These should be impure regardless of impure_random setting to maintain
-            # consistency between eager and compiled execution
-            _random_functions = {
-                torch.rand,
-                torch.randn,
-                torch.randint,
-                torch.randperm,
-                torch.rand_like,
-                torch.randn_like,
-                torch.randint_like,
-                torch.normal,
-                torch.poisson,
-                torch.bernoulli,
-                torch.multinomial,
-            }
-
-            if node.target in _random_functions:
-                # All random operations are impure to ensure consistent behavior
-                # between eager and compiled execution, regardless of generator usage
-                return True
-
-            return node.target in _side_effectful_functions
-
         # NOTE by nnscaler: we assume all method end with "_" is inplace operation,
         # and we take all inplace operations impure.
-        if node.op == "call_method":
-            return node.target.endswith("_")
+        if node.op == "call_method" and node.target.endswith("_"):
+            return True
 
-        # Check if an impure module.
-        if node.op == "call_module":
-            assert (
-                node.graph.owning_module is not None
-            ), "self.graph.owning_module not set for purity check"
-            target_mod = node.graph.owning_module.get_submodule(node.target)
-            assert (
-                target_mod is not None
-            ), f"Did not find expected submodule target {node.target}"
-            return getattr(target_mod, "_is_impure", False)
-
-        return False
+        return TorchFXPatcher.is_impure_ori(node, impure_random)
 
     def __enter__(self):
         TorchFXPatcher.fx_graph.magic_methods = self.magic_methods_new

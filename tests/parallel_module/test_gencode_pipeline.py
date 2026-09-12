@@ -5,6 +5,7 @@ import pytest
 
 from nnscaler import parallelize, ComputeConfig
 from tests.parallel_module.test_gencode import replace_all_device_with, _gencode_contains, print_gencode
+from tests.utils import multiprocessing_semaphore_available
 
 
 class PPModule1(torch.nn.Module):
@@ -56,6 +57,10 @@ def pp_pas(graph, cfg, nlayers_per_stage=2):
 
 
 @replace_all_device_with('cpu')
+@pytest.mark.skipif(
+    not multiprocessing_semaphore_available(),
+    reason='multiprocessing semaphores are unavailable',
+)
 def test_gencode_correct_dataloader_order(tmp_path):
     m = PPModule1(return_type=3)
     m.train()

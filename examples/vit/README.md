@@ -21,7 +21,7 @@ The implementation is inspired by [here](https://medium.com/@supersjgk/fine-tuni
 
 ### Run
 
-First go to `examples/vit` directory, You can use the following command to run the example:
+Run the following commands from the repository root:
 
 1. Use transformer.train() to train the model
     - `python examples/vit/vit_cli.py`: will use `DataParallel` to train the model.
@@ -30,7 +30,7 @@ First go to `examples/vit` directory, You can use the following command to run t
     - `torchrun --nproc_per_node=<gpus> --nnodes=<nodes> examples/vit/vit_cli.py`: will use `DistributedDataParallel` to train the model.
 
 2. Use nnscaler to train the model
-    `torchrun --nproc_per_node=<gpus> --nnodes=<nodes> $(which nnscaler-train) -f train_cli_args.yaml`
+    `torchrun --nproc_per_node=<gpus> --nnodes=<nodes> $(which nnscaler-train) -f examples/vit/train_cli_args.yaml`
 
 In order to be consistent with `transformers.train()`,
 we use dataloader/scheduler from `transformers`.

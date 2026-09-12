@@ -393,7 +393,10 @@ class CubeModule(torch.nn.Module):
             for file_idx in range(npartitions):
                 # part_model contains a subset of attributes, where each attribute is a fulltensor
                 # fulltensor.tid -> torch.Tensor
-                part_model: Dict[int, torch.Tensor] = torch.load(filename + f'.{file_idx}')
+                part_model: Dict[int, torch.Tensor] = torch.load(
+                    filename + f'.{file_idx}',
+                    weights_only=True,
+                )
                 loaded_name = set()
                 for attr_name in attr_names:
                     meta = self._fullmap[attr_name]
@@ -422,7 +425,10 @@ class CubeModule(torch.nn.Module):
         """
         if not self._non_persistent_buffers_set:
             return
-        np_buffer_model: Dict[int, torch.Tensor] = torch.load(filename)
+        np_buffer_model: Dict[int, torch.Tensor] = torch.load(
+            filename,
+            weights_only=True,
+        )
         with torch.no_grad():
             _logger.info(f'loading non-persistent buffers from {filename}')
             for attr_name in self._non_persistent_buffers_set:

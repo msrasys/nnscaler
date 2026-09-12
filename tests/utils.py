@@ -9,6 +9,7 @@ from contextlib import contextmanager
 from typing import Callable
 import functools
 import math
+import multiprocessing
 import random
 from datetime import timedelta
 from pathlib import Path
@@ -28,6 +29,14 @@ from nnscaler.runtime.device import DeviceGroup, CompileFlag
 
 MASTER_PORT = os.environ.get("MASTER_PORT", "29401")
 PYTEST_RUN_ID = MASTER_PORT
+
+
+def multiprocessing_semaphore_available() -> bool:
+    try:
+        multiprocessing.get_context('spawn').Lock()
+    except OSError:
+        return False
+    return True
 
 
 def init_parameter(model: torch.nn.Module, seed: int = 0):

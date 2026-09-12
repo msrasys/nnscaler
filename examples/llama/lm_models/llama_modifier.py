@@ -87,8 +87,8 @@ class NNScalerLlamaFlashAttention2(LlamaAttention):
 
         input_dtype = query_states.dtype
         if input_dtype == torch.float32:
-            if torch.is_autocast_enabled():
-                target_dtype = torch.get_autocast_gpu_dtype()
+            if torch.is_autocast_enabled('cuda'):
+                target_dtype = torch.get_autocast_dtype('cuda')
             # Handle the case where the model is quantized
             elif hasattr(self.config, "_pre_quantization_dtype"):
                 target_dtype = self.config._pre_quantization_dtype
@@ -122,4 +122,3 @@ class NNScalerLlamaFlashAttention2(LlamaAttention):
             attn_weights = None
 
         return attn_output, attn_weights, past_key_value
-

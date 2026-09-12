@@ -23,7 +23,11 @@ from nnscaler.utils import mark_dynamic
 
 from .common import init_distributed
 from ..launch_torchrun import launch_torchrun
-from ..utils import replace_all_device_with, raises_with_cause
+from ..utils import (
+    multiprocessing_semaphore_available,
+    replace_all_device_with,
+    raises_with_cause,
+)
 
 def _to_cube_model(module, compute_config, cube_savedir, load_module, max_workers=1):
     return parallelize(
@@ -82,6 +86,10 @@ def test_codegen():
 
 
 @replace_all_device_with('cpu')
+@pytest.mark.skipif(
+    not multiprocessing_semaphore_available(),
+    reason='multiprocessing semaphores are unavailable',
+)
 def test_codegen_multiprocess():
     old_line_timer = CompileFlag.line_timer
     try:
@@ -106,6 +114,10 @@ def test_codegen_multiprocess():
 
 
 @replace_all_device_with('cpu')
+@pytest.mark.skipif(
+    not multiprocessing_semaphore_available(),
+    reason='multiprocessing semaphores are unavailable',
+)
 def test_codegen_multiprocess_customized_emit(tmp_path):
     parallelize(
         MultiprocessCustomizedEmitModule(),

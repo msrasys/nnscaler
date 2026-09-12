@@ -52,8 +52,8 @@ class AutocastInfo:
         # use function pair [torch.autocast_increment_nesting, torch.autocast_decrement_nesting] to get the nesting number
         torch.autocast_increment_nesting()
         return cls(torch.autocast_decrement_nesting(),  torch.is_autocast_cache_enabled(),
-                   torch.is_autocast_cpu_enabled(), torch.get_autocast_cpu_dtype(),
-                   torch.is_autocast_enabled(), torch.get_autocast_gpu_dtype())
+                   torch.is_autocast_enabled('cpu'), torch.get_autocast_dtype('cpu'),
+                   torch.is_autocast_enabled('cuda'), torch.get_autocast_dtype('cuda'))
 
 
 @dataclass
