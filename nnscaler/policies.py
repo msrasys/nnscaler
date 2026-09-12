@@ -1231,22 +1231,8 @@ def fn(
 
     tensor_splits.update(new_tensor_splits)
 
-    def move_following_stage_splits(
-        old_ftensor: IRFullTensor,
-        new_ftensor: IRFullTensor,
-        stage_id: int,
-    ) -> None:
-        old_stage_info = tensor_splits.setdefault(old_ftensor, {})
-        new_stage_info = tensor_splits.setdefault(new_ftensor, {})
-        for following_stage_id, splits in list(old_stage_info.items()):
-            if following_stage_id <= stage_id:
-                continue
-            new_stage_info.setdefault(following_stage_id, set()).update(splits)
-            del old_stage_info[following_stage_id]
-
-
-    # Stage first so graph.group/create_segment see the original graph. Adapter
-    # generation can narrow compatible segment boundaries back to per-device IO.
+    # Stage before partitioning; the expander can subsequently narrow
+    # compatible boundaries to their per-device layouts.
     if pp_enabled:
         graph.staging([s[0] for s in pp_stages])
         pp_segs: list[IRSegment] = graph.select(ntype=IRSegment, flatten=False)
@@ -1262,25 +1248,24 @@ def fn(
                 # these nodes are usually added for data transfer between stages in graph.staging
                 # TODO: is it possible to have TP here?
                 op_plans[node] = OpPlan(op=node, stage_id=stage_id, partition=None)
-                input_tensors = [t for t in node.inputs() if isinstance(t, IRSubTensor)]
-                output_tensors = [t for t in node.outputs() if isinstance(t, IRSubTensor)]
-                if len(input_tensors) == 1 and len(output_tensors) == 1:
-                    input_ftensor = input_tensors[0].parent
-                    output_ftensor = output_tensors[0].parent
-                    # Staging identities are replicated. Record both the
-                    # identity input and its newly-created output so subsequent
-                    # activation multiref decisions see the real consumers.
-                    tensor_splits.setdefault(input_ftensor, {})[stage_id] = {'rn'}
+                # only real tensors participate in tensor_splits bookkeeping;
+                # identity nodes added for non-tensor IRObject transfer have no splits.
+                if isinstance(node.input(0), IRSubTensor):
+                    assert isinstance(node.output(0), IRSubTensor)
+                    # 'rn' means `identity` is replicated
+                    tensor_splits.setdefault(node.input(0).parent, {})[stage_id] = {'rn'}
                     op_partition_maps[node] = {}
                     tensor_splits.update(
-                        _get_new_node_outputs_splits(
-                            node, stage, op_plans, op_partition_maps
-                        )
+                        _get_new_node_outputs_splits(node, stage, op_plans, op_partition_maps)
                     )
-                    move_following_stage_splits(
-                        input_ftensor,
-                        output_ftensor,
-                        stage_id,
+
+                    # If the tensor is a segment output,
+                    # we need to move the split info in the following stages.
+                    _move_tensor_splits(
+                        tensor_splits,
+                        old_ftensor=node.input(0).parent,
+                        new_ftensor=node.output(0).parent,
+                        stage_id=stage_id,
                     )
 
     for stage_id, seg in enumerate(pp_segs):
@@ -1288,21 +1273,23 @@ def fn(
             if not isinstance(sub_tensor, IRSubTensor):
                 continue
             if seg.consumers(sub_tensor.parent):
-                old_ftensor = sub_tensor.parent
                 ident_op = _identity_segment_output(graph, sub_tensor, seg, pp_segs)
-                new_ftensor = ident_op.output(0).parent
+                # Replicate the identity; let the expander narrow its layout.
                 op_plans[ident_op] = OpPlan(op=ident_op, stage_id=stage_id, partition=None)
-                # The identity itself is replicated. Let the split comparison
-                # below decide whether the original activation needs multiref;
-                # adding one unconditionally breaks no-grad-reduce outputs.
-                tensor_splits.setdefault(old_ftensor, {}).setdefault(
-                    stage_id, set()
-                ).add('rn')
+                # 'rn' means `ident_op` is replicated
+                tensor_splits[sub_tensor.parent].setdefault(stage_id, set()).add('rn')
                 op_partition_maps[ident_op] = {}
-                # `ident_op` consumes the old tensor in this stage. Its output is a
-                # new full tensor that replaces uses in following stages, so move
-                # those split records to the new tensor before activation multiref.
-                move_following_stage_splits(old_ftensor, new_ftensor, stage_id)
+
+                # the tensor is a segment output,
+                # we have replaced the original output tensor with the identity output tensor
+                # in `_identity_segment_output`,
+                # but we still need to move the split info in the following stages.
+                _move_tensor_splits(
+                    tensor_splits,
+                    old_ftensor=ident_op.input(0).parent,
+                    new_ftensor=ident_op.output(0).parent,
+                    stage_id=stage_id,
+                )
 
     # add multiref to an activation tensor when the states of the tensor and its grad are different
     # among consumers and current segment's outputs
