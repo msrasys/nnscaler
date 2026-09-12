@@ -159,3 +159,15 @@ def test_from_complex(tosub, requires_grad):
         and y.shape == (2,) and y.origin_shape == (2,) and y.dtype == torch.float \
         and y.requires_grad == rgt and not y.is_constant \
         and y.name == 'n'
+
+
+def test_index_with_same_parent_prefers_exact_and_rejects_ambiguity():
+    full = IRFullTensor((8,))
+    left = full.select(((0, 4),), (0, 1))
+    right = full.select(((4, 8),), (0, 1))
+
+    assert IR.index_with_same_parent(right, [left, right]) == 1
+
+    other = full.select(((2, 6),), (0, 1))
+    assert IR.index_with_same_parent(other, [left, right]) is None
+    assert IR.index_with_same_parent(other, [left]) == 0

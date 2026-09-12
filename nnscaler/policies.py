@@ -1231,16 +1231,8 @@ def fn(
 
     tensor_splits.update(new_tensor_splits)
 
-    # set pipeline stages
-    # Note we must stage graph before any transformation to the graph,
-    #      which is required by graph.group and graph.create_segment to work correctly.
-    # The consequence is that the inputs and outputs of the segment will always be complete tensors.
-    # For example:
-    # If the output subtensor of last operator in stage 0 can
-    # exactly fit into the input subtensor of the first operator in stage 1,
-    # we still need to insert adapters to
-    # collect the subtensors into a complete tensor as the output of stage 0,
-    # and then split it again as the input of stage 1.
+    # Stage before partitioning; the expander can subsequently narrow
+    # compatible boundaries to their per-device layouts.
     if pp_enabled:
         graph.staging([s[0] for s in pp_stages])
         pp_segs: list[IRSegment] = graph.select(ntype=IRSegment, flatten=False)
@@ -1256,13 +1248,13 @@ def fn(
                 # these nodes are usually added for data transfer between stages in graph.staging
                 # TODO: is it possible to have TP here?
                 op_plans[node] = OpPlan(op=node, stage_id=stage_id, partition=None)
-                assert len(stage.consumers(node.input(0).parent)) == 1, "Internal Error: identity node input should only be consumed by identity node itself    ."
                 # only real tensors participate in tensor_splits bookkeeping;
                 # identity nodes added for non-tensor IRObject transfer have no splits.
                 if isinstance(node.input(0), IRSubTensor):
                     assert isinstance(node.output(0), IRSubTensor)
                     # 'rn' means `identity` is replicated
-                    tensor_splits[node.input(0).parent][stage_id] = set(['rn'])
+                    tensor_splits.setdefault(node.input(0).parent, {})[stage_id] = {'rn'}
+                    op_partition_maps[node] = {}
                     tensor_splits.update(
                         _get_new_node_outputs_splits(node, stage, op_plans, op_partition_maps)
                     )
@@ -1282,9 +1274,7 @@ def fn(
                 continue
             if seg.consumers(sub_tensor.parent):
                 ident_op = _identity_segment_output(graph, sub_tensor, seg, pp_segs)
-                # always replicate the identity operator
-                # even when the original tensor is partitioned
-                # as it is the output of segment which needs a complete tensor.
+                # Replicate the identity; let the expander narrow its layout.
                 op_plans[ident_op] = OpPlan(op=ident_op, stage_id=stage_id, partition=None)
                 # 'rn' means `ident_op` is replicated
                 tensor_splits[sub_tensor.parent].setdefault(stage_id, set()).add('rn')
