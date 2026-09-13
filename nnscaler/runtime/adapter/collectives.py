@@ -102,7 +102,8 @@ def all_gather(tensor: torch.Tensor, dim: int,
     tensor_list = [torch.empty_like(tensor) for _ in ranks]
     tensor_list[torch.distributed.get_rank(group)] = tensor.data
     work = torch.distributed.all_gather(tensor_list, tensor, group=group, async_op=async_op)
-    group_ranks = torch.distributed.get_process_group_ranks(group)
+    group_ranks = torch.distributed.get_process_group_ranks(
+        group if group is not None else torch.distributed.group.WORLD)
     gather_order = tuple(group_ranks.index(rank) for rank in ranks)
 
     def concat_gathered(_):
