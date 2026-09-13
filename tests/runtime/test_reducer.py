@@ -611,6 +611,8 @@ def test_manual_grad_ready_uses_async_vpp_expected_contribution_count():
     reducer = Reducer([0, 1], async_op=True)
     reducer.add_param(param)
     reducer.build_buckets()
+    # train_step installs this uniform count before the generated schedule.
+    reducer.grad_accumulation_steps = 1
     reducer.set_async_grad_expected_counts({param: 2})
     bucket = reducer.buckets[0]
     bucket._launch_async_reduce = Mock()

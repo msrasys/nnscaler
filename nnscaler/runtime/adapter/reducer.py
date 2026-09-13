@@ -835,6 +835,8 @@ class Bucket:
                 group=self._group, async_op=True)
 
     def set_async_grad_expected_counts(self, param_counts: Dict[torch.nn.Parameter, int]):
+        # Scheduled counts already include every microbatch and local stage.
+        self._grad_accumulation_steps = 0
         self._async_expected_param_cnt = {}
         for param in self._params:
             count = int(param_counts.get(param, 1))
