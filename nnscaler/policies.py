@@ -951,6 +951,8 @@ def fn(
     pp_size = _get_configured_pipeline_size(cfg.pas_config, nstages)
     if pp_size < 1:
         raise ValueError('pp_size must be >= 1 when set')
+    if nstages % pp_size != 0:
+        raise ValueError(f'invalid pp_size {pp_size} for nstages {nstages}')
     if ngpus % pp_size != 0:
         raise ValueError(f'invalid pp_size {pp_size} for ngpus {ngpus}')
     tp_size = ngpus // pp_size
@@ -1163,8 +1165,6 @@ def fn(
             raise ValueError("pipeline_size must be >= 1 when pipeline is enabled")
         if not nmicros:
             raise ValueError("nmicros must be set when pipeline is enabled")
-        if nstages % pp_size != 0:
-            raise ValueError(f'invalid pipeline_size {pp_size} for nstages {nstages}')
         if ngpus % pp_size != 0:
             raise ValueError(f'invalid pipeline_size {pp_size} for ngpus {ngpus}')
     else:

@@ -1540,6 +1540,23 @@ class InterleavedPolicyModule(FnPolicyModuleList):
 
 
 @replace_all_device_with('cpu')
+@pytest.mark.parametrize('pipeline_size_key', ['pp_size', 'pipeline_size'])
+def test_fn_rejects_invalid_stage_grouping_before_partitioning(tmp_path, mocker, pipeline_size_key):
+    from nnscaler.algorithm.ops.dimops import DimSplitEinops
+    from nnscaler.graph.parser import convert_model
+    from nnscaler.policies import fn
+    graph = convert_model(InterleavedPolicyModule(), {'x': torch.randn(4, 4)}, tmp_path)
+    cfg = ComputeConfig(6, 6, use_end2end=True, pas_config={
+        pipeline_size_key: 3, 'pipeline_nmicros': 4,
+        'pipeline_scheduler': '1f1b_interleaved',
+    })
+    instantiate = mocker.spy(DimSplitEinops, 'instantiate')
+    with pytest.raises(ValueError, match='nstages 4'):
+        fn(graph, cfg, megatron_ffn_policy_list)
+    instantiate.assert_not_called()
+
+
+@replace_all_device_with('cpu')
 def test_fn_interleaved_physical_stage_assignment(tmp_path):
     parallelize(
         InterleavedPolicyModule(), {'x': torch.randn(4, 4)},
