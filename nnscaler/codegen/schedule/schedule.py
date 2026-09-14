@@ -257,11 +257,40 @@ class ScheduleCodeGen(FuncEmission):
                             f'{id(node) not in last_backward_node_oids !r}'
                         )
 
-                prev_backward_node = None
-                prev_backward_weight_codes = []
+                pending_weight_node = None
+                pending_weight_codes = []
+                pending_weight_release_codes = []
+
+                def _flush_pending_weight():
+                    nonlocal pending_weight_node
+                    if pending_weight_node is None:
+                        return
+                    _append_skip_flag(pending_weight_node)
+                    _append_code(
+                        fb,
+                        pending_weight_codes,
+                        self._get_node_stream(execplan, pending_weight_node),
+                    )
+                    if pending_weight_release_codes:
+                        _append_code(fb, pending_weight_release_codes)
+                    pending_weight_node = None
+                    pending_weight_codes.clear()
+                    # release code will be deferred.
+                    pending_weight_release_codes.clear()
+
                 for line, node in enumerate(device_nodes):
                     codes = self.emit_node(execplan, node)
-
+                    tensors = lifetime.release_tensors_after_line(line)
+                    release_codes = (
+                        [self.emit_release(tensors)]
+                        if tensors
+                        else []
+                    )
+                    # Convert X -> W -> Adapter -> X
+                    # To X -> Adapter -> W -> X
+                    # This reordering ensures that communication adapters can start
+                    # before the weight backward computation, allowing for better
+                    # overlap of asynchronous communication and computation.
                     if (
                         use_scheduler
                         and _is_backward_segment(node)
@@ -269,18 +298,33 @@ class ScheduleCodeGen(FuncEmission):
                         and node.action == ScheduleAction.BACKWARD
                         and CompileFlag.use_fbw
                     ):
-                        # old-fashion backward handling
+                        # old-fashioned backward handling
                         # when use_fbw is enabled, but no I/W action is specified.
-                        if prev_backward_node is not None:
-                            _append_skip_flag(prev_backward_node)
-                            _append_code(fb, prev_backward_weight_codes, self._get_node_stream(execplan, prev_backward_node))
-                        prev_backward_node = node
+                        _flush_pending_weight()
+                        pending_weight_node = node
                         codes_input, codes_weight = _split_backward_codes(codes)
-                        prev_backward_weight_codes = codes_weight
+                        pending_weight_codes.extend(codes_weight)
+                        pending_weight_release_codes.extend(release_codes)
+                        release_codes = []
                         _append_code(fb, codes_input, self._get_node_stream(execplan, node))
+                    elif (
+                        use_scheduler
+                        and _is_backward_segment(node)
+                        and isinstance(node, ExeReuseCell)
+                        and node.action == ScheduleAction.BACKWARD_WEIGHT
+                    ):
+                        # Let following communication adapters start before W so
+                        # asynchronous communication can overlap weight backward.
+                        # Releases from W and moved adapters are also deferred so
+                        # W post-hooks can still access all of their inputs.
+                        _flush_pending_weight()
+                        pending_weight_node = node
+                        pending_weight_codes.extend(codes)
+                        pending_weight_release_codes.extend(release_codes)
+                        release_codes = []
                     else:
-                        if prev_backward_node is not None:
-                            if _is_adapter(node) and _depends_totally_on(node, prev_backward_node):
+                        if pending_weight_node is not None:
+                            if _is_adapter(node) and _depends_totally_on(node, pending_weight_node):
                                 # if the next node is an adapter that depends on the last backward,
                                 # we need to emit the adapter before the last backward_weight codes
                                 # TODO: `_depends_totally_on` looks unnecessary,
@@ -290,11 +334,10 @@ class ScheduleCodeGen(FuncEmission):
                                 # So all adapters should be emitted before the last backward_weight codes.
                                 _append_skip_flag(node) # should no-op for adapters.
                                 _append_code(fb, codes, self._get_node_stream(execplan, node))
+                                pending_weight_release_codes.extend(release_codes)
+                                release_codes = []
                             else:
-                                _append_skip_flag(prev_backward_node)
-                                _append_code(fb, prev_backward_weight_codes, self._get_node_stream(execplan, prev_backward_node))
-                                prev_backward_node = None
-                                prev_backward_weight_codes = []
+                                _flush_pending_weight()
                                 _append_skip_flag(node)
                                 _append_code(fb, codes, self._get_node_stream(execplan, node))
                         else:
@@ -302,13 +345,10 @@ class ScheduleCodeGen(FuncEmission):
                             _append_code(fb, codes, self._get_node_stream(execplan, node))
 
                     # release
-                    tensors = lifetime.release_tensors_after_line(line)
-                    if len(tensors) > 0 : # not necessarily to have one after each line
-                        _append_code(fb, self.emit_release(tensors))
+                    if release_codes:
+                        _append_code(fb, release_codes)
 
-                if prev_backward_node is not None:
-                    _append_skip_flag(prev_backward_node)
-                    _append_code(fb, prev_backward_weight_codes, self._get_node_stream(execplan, prev_backward_node))
+                _flush_pending_weight()
 
             # return code
             if CompileFlag.async_comm:

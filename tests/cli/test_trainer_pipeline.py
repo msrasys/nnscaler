@@ -95,6 +95,7 @@ def test_trainer_pipeline(tmp_path):
         'zero_bubble',
         [
             '--compute_config.pas_config.pipeline_scheduler', 'zero_bubble',
+            '--compute_config.use_async_comm', 'True',
         ]
     )
 
