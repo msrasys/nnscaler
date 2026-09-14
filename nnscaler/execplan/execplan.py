@@ -201,7 +201,7 @@ class ExecutionPlan:
                         node.mid,
                         # Block has no mirror, so we can't get the mirror action from it directly.
                         # but we can infer it from the type of the original cell.
-                        # as we says below,
+                        # as described below,
                         # the mirror forward segment is always paired with the B segment.
                         # I/W segments will have their own virtual forward segments as mirrors.
                         ScheduleAction.BACKWARD
@@ -218,11 +218,14 @@ class ExecutionPlan:
                 else:
                     # all backward segments need to have mirrors for further processing.
                     # (mainly to get the correct inputs/outputs,
-                    # bacause backward segments have already modified the inputs/outputs of their forward counterparts.)
+                    # because backward segments have already modified the inputs/outputs of their forward counterparts.)
                     # for I/W backward, we create a new reuse cell for the current action
                     # and pair it with its forward mirror.
                     # in this case, the forward saved in `micro_fcells` will not be used
                     # instead we create a new forward reuse cell and pair it with the current backward cell.
+                    # Note irobject ids of inputs and outputs of the new reuse cells
+                    # will be exactly the same with the original ones
+                    # which can ensure the compute graph can be correctly constructed.
                     mcell = make_reuse(node.content, node.mid, node.action)
                     fmirror = make_reuse(node.content.mirror, node.mid)
                     IRCell.make_pair(fmirror, mcell)
