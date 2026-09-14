@@ -265,4 +265,3 @@ def test_split_backward_runs_input_grad_callback():
     assert weight.grad is not None
     Executor.backward_weight('segment', linear.parameters())
     Executor.check_clear()
-
