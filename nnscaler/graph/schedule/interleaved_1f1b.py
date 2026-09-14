@@ -267,15 +267,105 @@ def _add_bubbles_to_actions(
     pp_group_size: int,
     num_stages_global: int,
 ) -> Dict[int, List[Optional[_Action]]]:
-    """Align per-rank ZB1P actions by inserting dependency bubbles.
+    """Insert bubbles that align per-rank ZB1P actions into global steps.
 
-    Adapted from PyTorch's
+    ``_calculate_single_rank_operations`` generates one ordered action stream
+    for each pipeline rank. Those streams preserve each rank's local execution
+    order, but an action may still appear before its producer on another rank.
+    This function walks all streams together and inserts ``None`` bubbles until
+    every emitted action satisfies the cross-stage dependencies represented by
+    :class:`SchedulePlan`.
+
+    Each iteration of the outer loop creates one global step. ``next_pointer``
+    identifies the next unconsumed action on every rank. A ready action is added
+    to ``result`` and advances its pointer. A blocked action contributes a
+    bubble for that step and keeps its pointer unchanged so it can be retried in
+    the next step. An input ``None`` is an intentional bubble from the local
+    stream; it is copied to the result and consumed immediately.
+
+    The dependency rules are:
+
+    * ``F(s, m)`` waits for ``F(s - 1, m)``, except at the first stage.
+    * ``I(s, m)`` waits for ``I(s + 1, m)``, except at the last stage.
+    * ``W(s, m)`` waits for ``I(s, m)`` on the same stage.
+
+    Actions emitted in the current step are accumulated in ``temp_seen_ops``
+    and become visible through ``seen_ops`` only after every rank has been
+    visited. Consequently, a producer and its consumer cannot occupy the same
+    global step: the producer must finish before the consumer starts. The local
+    streams are assumed to already preserve same-rank ordering such as F before
+    I; this pass supplies the missing cross-rank alignment and explicit I-to-W
+    ordering.
+
+    This implementation is adapted from PyTorch v2.10.0's
     ``ScheduleInterleavedZeroBubble._add_bubbles_to_actions``:
     https://github.com/pytorch/pytorch/blob/v2.10.0/torch/distributed/pipelining/schedules.py
 
-    nnScaler additionally checks I/W dependencies because SchedulePlan uses a
-    global step-based dependency model, and reports malformed streams instead
-    of looping forever when no rank can make progress.
+    PyTorch's pass checks forward and full-backward dependencies, but does not
+    explicitly align separate I/W actions. This is valid in PyTorch because its
+    compute-only columns are not execution barriers. ``_prepare_schedule_with_comms``
+    later discards the ``None`` placeholders and calls ``_add_send_recv``, which
+    inserts SEND_B/RECV_B actions and reorders each rank's executable sequence
+    according to communication readiness. The runtime also waits for RECV_B
+    before executing a non-last-stage I action.
+
+    For example, consider two ranks, one local stage per rank, and one
+    microbatch. PyTorch's compute-only table puts ``0I0`` and ``1I0`` in the
+    same column:
+
+    .. code-block:: text
+
+        step       0      1      2      3
+        rank 0    0F0    ---    0I0    0W0
+        rank 1    ---    1F0    1I0    1W0
+
+    This does not mean they run simultaneously. Communication lowering turns
+    the relevant part into the following happens-before chain:
+
+    .. code-block:: text
+
+        rank 1: 1I0 -> 1SEND_B0
+                         |
+                         v
+        rank 0:       0RECV_B0 -> 0I0
+
+    Thus ``1I0`` computes the gradient first, SEND_B/RECV_B transfers it, and
+    only then can ``0I0`` run. The lowered and dependency-simulated PyTorch
+    schedule places ``1I0`` at step 3, SEND_B/RECV_B at step 4, and ``0I0`` at
+    step 5.
+
+    nnScaler does not have this later PyTorch schedule-lowering pass. Its
+    SchedulePlan columns directly define dependency ordering and validation, so
+    the compute schedule itself must express the I dependency. nnScaler extends
+    ``need_bubble`` with explicit I/W rules and produces:
+
+    .. code-block:: text
+
+        step       0      1      2      3      4
+        rank 0    0F0    ---    ---    0I0    0W0
+        rank 1    ---    1F0    1I0    1W0    ---
+
+    At step 3, ``0I0`` and ``1W0`` may run together because both depend on the
+    already completed ``1I0`` and neither consumes the other's output. The
+    extra bubble therefore does not add a mathematical dependency absent from
+    PyTorch; it represents earlier, in SchedulePlan, an ordering that PyTorch
+    materializes later while inserting communication actions.
+
+    Args:
+        actions: Mapping from pipeline rank to its ordered local ZB1P stream.
+            Entries are F/I/W actions or ``None`` bubbles.
+        pp_group_size: Number of pipeline ranks (device groups).
+        num_stages_global: Total number of stages across all pipeline ranks.
+
+    Returns:
+        A rank-to-action mapping aligned to global steps. Result rows may have
+        different lengths because a finished rank is not padded with trailing
+        ``None`` entries; omitted trailing entries are semantically idle.
+
+    Raises:
+        ValueError: If a stream contains an action other than F, I, or W.
+        RuntimeError: If unfinished streams exist but no rank can consume an
+            action, indicating malformed or cyclic local action ordering.
     """
     def need_bubble(stage, op, microbatch, seen_ops):
         if op == FORWARD:
