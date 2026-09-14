@@ -5,6 +5,8 @@ import pytest
 import torch
 
 import nnscaler.runtime.executor as executor
+from nnscaler.parallel import ComputeConfig
+from nnscaler.runtime import _patch_torch
 from nnscaler.runtime.executor import Executor
 
 
@@ -223,3 +225,46 @@ def test_custom_fbw_restores_module_symbols():
 
     assert executor.backward_input is original_input
     assert executor.backward_weight is original_weight
+
+
+def test_custom_fbw_config_does_not_require_default_backend(monkeypatch):
+    monkeypatch.setattr(_patch_torch, 'FBW_SUPPORTED', False)
+
+    config = ComputeConfig(
+        plan_ngpus=1,
+        runtime_ngpus=1,
+        use_end2end=True,
+        use_fbw=True,
+    )
+
+    assert config.use_fbw
+
+
+def test_custom_fbw_grad_coverage_accepts_split_gradients():
+    stage_input = torch.randn(2, 4, requires_grad=True)
+    weight = torch.nn.Parameter(torch.randn(4, 4))
+    output = stage_input @ weight
+    output_grad = torch.ones_like(output)
+
+    def backward_input(name, input_tensors, output_tensors, output_grads, weights):
+        torch.autograd.backward(
+            output_tensors,
+            grad_tensors=output_grads,
+            inputs=input_tensors,
+            retain_graph=True,
+        )
+        return input_tensors[0].grad
+
+    def backward_weight(name, weights):
+        weight_grad = stage_input.detach().T @ output_grad
+        torch.autograd.backward((weight,), grad_tensors=(weight_grad,))
+
+    with executor.custom_fbw(
+        backward_input,
+        backward_weight,
+        check_grad_coverage=True,
+    ):
+        executor.backward_input(
+            'segment', [stage_input], [output], [output_grad], (weight,)
+        )
+        executor.backward_weight('segment', (weight,))

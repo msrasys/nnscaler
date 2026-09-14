@@ -498,6 +498,40 @@ def _d9d_backward_weight(
             )
 
 
+def test_d9d_grad_coverage_detects_parameter_derived_activation():
+    stage_input = torch.randn(2, 4, requires_grad=True)
+    unreachable = torch.nn.Parameter(torch.randn(4, 4))
+    parameter_input = torch.nn.Parameter(torch.randn(2, 4))
+    weight = torch.nn.Parameter(torch.randn(4, 4))
+    weights = (unreachable, parameter_input, weight)
+
+    def segment(input_tensor: torch.Tensor) -> torch.Tensor:
+        return input_tensor + _D9DLinearFunction.apply(
+            torch.tanh(parameter_input), weight
+        )
+
+    Executor.clear()
+    _D9DStateStore.clear()
+    _GlobalGradContext.reset()
+    try:
+        output = Executor.fexecute('segment', segment, stage_input)
+        output_grad = torch.ones_like(output)
+        with executor.custom_fbw(
+            _d9d_backward_input,
+            _d9d_backward_weight,
+            check_grad_coverage=True,
+        ):
+            executor.backward_input(
+                'segment', [stage_input], [output], [output_grad], weights
+            )
+            with pytest.raises(RuntimeError, match=r'parameter indices \[1\]'):
+                executor.backward_weight('segment', weights)
+    finally:
+        Executor.clear()
+        _D9DStateStore.clear()
+        _GlobalGradContext.reset()
+
+
 def _trainer_args(work_dir: Path, mode: str) -> TrainerArgs:
     # d9d_async verifies that synchronizing at B entry is sufficient before
     # graph state is retained for the delayed W traversal.
