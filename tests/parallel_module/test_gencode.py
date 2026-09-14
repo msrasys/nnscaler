@@ -2453,4 +2453,3 @@ def test_codegen_supports_inactive_plan_rank():
             3,
             r"This ParallelModule rank is inactive",
         )
-
