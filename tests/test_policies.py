@@ -789,6 +789,69 @@ def test_codegen_zero_bubble_multi_scheduler(tmp_path):
 
 
 @replace_all_device_with('cpu')
+@pytest.mark.parametrize(
+    ('pipeline_scheduler', 'use_fbw'),
+    [
+        ('zero_bubble', False),
+        ('1f1b', True),
+    ],
+)
+def test_codegen_zero3_keeps_weight_before_adapters(
+    tmp_path,
+    pipeline_scheduler,
+    use_fbw,
+):
+    parallelize(
+        FnPolicyModuleList(),
+        {'x': torch.randn(4, 4)},
+        megatron_ffn_policy_list,
+        ComputeConfig(
+            4,
+            8,
+            use_end2end=True,
+            use_zero=3,
+            use_fbw=use_fbw,
+            use_async_comm=True,
+            pas_config={
+                'pipeline_nmicros': 2,
+                'pipeline_size': 2,
+                'pipeline_scheduler': pipeline_scheduler,
+            },
+        ),
+        gen_savedir=tmp_path,
+        load_module=False,
+    )
+    train_step, = _gencode_contains(
+        tmp_path,
+        FnPolicyModuleList,
+        0,
+        r'def _train_step\([^)]*\):\n([\s\S]*?)\ndef _infer_step',
+    )
+    input_positions = [
+        match.start()
+        for match in re.finditer(r'executor\.backward_input\(', train_step)
+    ]
+    weight_positions = [
+        match.start()
+        for match in re.finditer(r'executor\.backward_weight\(', train_step)
+    ]
+    recv_positions = [
+        match.start()
+        for match in re.finditer(
+            r'\w+ = nnscaler\.runtime\.executor\.aexecute\('
+            r'model\.adapter\d+, \*\(\), requires_grad=False\)',
+            train_step,
+        )
+    ]
+    assert len(input_positions) == len(weight_positions) == 2
+    assert not any(
+        input_pos < recv_pos < weight_pos
+        for input_pos, weight_pos in zip(input_positions, weight_positions)
+        for recv_pos in recv_positions
+    )
+
+
+@replace_all_device_with('cpu')
 def test_codegen_explicit_fbw_without_flag(tmp_path):
     parallelize(
         FnPolicyModuleList(),

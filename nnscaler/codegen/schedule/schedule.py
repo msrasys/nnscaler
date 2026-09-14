@@ -261,6 +261,11 @@ class ScheduleCodeGen(FuncEmission):
                 pending_weight_codes = []
                 pending_weight_release_codes = []
 
+                # W/adapter order is not supported with ZeRO-3
+                # when backward_weight computation is happening,
+                # the parameters have already been evicted, which leads to incorrect gradient computation if the adapter is placed after the weight.
+                allow_adapter_before_weight = CompileFlag.use_zero <= 1 and CompileFlag.async_comm
+
                 def _flush_pending_weight():
                     nonlocal pending_weight_node
                     if pending_weight_node is None:
@@ -324,7 +329,20 @@ class ScheduleCodeGen(FuncEmission):
                         release_codes = []
                     else:
                         if pending_weight_node is not None:
-                            if _is_adapter(node) and _depends_totally_on(node, pending_weight_node):
+                            # TODO:
+                            # Standard pipeline adapters only consume gradients
+                            # produced by I and do not require W to finish. A
+                            # custom schedule could theoretically encode a
+                            # W-to-adapter dependency with wait_events or
+                            # wait_streams; moving that adapter would invert the
+                            # intended order because event validation runs on the
+                            # original execution plan. Current schedulers do not
+                            # generate such a dependency.
+                            if (
+                                allow_adapter_before_weight
+                                and _is_adapter(node)
+                                and _depends_totally_on(node, pending_weight_node)
+                            ):
                                 # if the next node is an adapter that depends on the last backward,
                                 # we need to emit the adapter before the last backward_weight codes
                                 # TODO: `_depends_totally_on` looks unnecessary,
