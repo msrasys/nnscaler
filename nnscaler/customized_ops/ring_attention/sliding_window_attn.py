@@ -79,6 +79,8 @@ def wrap_sliding_window_attn_func(
     one rank, because it fetches KV tokens only from the previous rank.
     """
     assert not return_attn_probs, "return_attn_probs is not supported"
+    if int(sequence_group_count) < 1:
+        raise ValueError("sequence_group_count must be >= 1")
     selected_sequence_group = False
     if process_group is not None and enable_ring:
         if sequence_parallel_size is not None and len(process_group) != sequence_parallel_size:
@@ -224,6 +226,12 @@ def emit_ring(node: IRDimops, args: List[str], kwargs: Dict[str, str], runtime_d
                 raise ValueError(
                     f'sequence_parallel_size must divide the sequence partition degree, '
                     f'got sequence_parallel_size={group_size}, partition_degree={num}')
+            group_count = int(kwargs.get('sequence_group_count', '1'))
+            if group_count != num // group_size:
+                raise ValueError(
+                    f'sequence_group_count must equal partition_degree // sequence_parallel_size, '
+                    f'got sequence_group_count={group_count}, partition_degree={num}, '
+                    f'sequence_parallel_size={group_size}')
             partition_start = remainder // num * num
             group_start = partition_start + (remainder % num) // group_size * group_size
             scale_unit_dev_ids = [

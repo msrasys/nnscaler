@@ -53,6 +53,17 @@ def test_select_sequence_group_requires_packed_boundary_alignment():
             combined, [0, 1], sequence_group_count=2)
 
 
+@pytest.mark.parametrize('count', [0, -1])
+def test_sequence_group_count_must_be_positive(count):
+    boundaries = torch.tensor([0, 16], dtype=torch.int32)
+    with pytest.raises(ValueError, match='sequence_group_count must be >= 1'):
+        select_sequence_group_cu_seqlens(boundaries, [0], count)
+    q = torch.randn(16, 2, 8)
+    for wrapper in (wrap_ring_attn_varlen_func, wrap_sliding_window_attn_func):
+        with pytest.raises(ValueError, match='sequence_group_count must be >= 1'):
+            wrapper(q, q, q, boundaries, boundaries, None, sequence_group_count=count)
+
+
 @pytest.mark.parametrize(
     ('target', 'wrapper'),
     [
@@ -146,6 +157,17 @@ def test_emit_ring_treats_explicit_none_as_default_group_size(emit):
     )
 
     assert 'process_group=[0, 1, 2, 3]' in code
+
+
+@pytest.mark.parametrize('emit', [emit_varlen_ring, emit_sliding_window_ring])
+@pytest.mark.parametrize('count', ['0', '-1', '1', '3'])
+def test_emit_ring_rejects_mismatched_metadata_group_count(emit, count):
+    with pytest.raises(ValueError, match='sequence_group_count must equal'):
+        emit(
+            _FakeNode(), args=['q', 'k', 'v'],
+            kwargs={'sequence_parallel_size': '2', 'sequence_group_count': count},
+            runtime_devid=0, plan_ndevs=4, runtime_ndevs=4,
+        )
 
 
 def _sequence_group_attention_worker():

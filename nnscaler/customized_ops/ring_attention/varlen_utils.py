@@ -43,7 +43,9 @@ def select_sequence_group_cu_seqlens(
     rebases the corresponding shard boundaries.
     """
     sequence_group_count = int(sequence_group_count)
-    if sequence_group_count <= 1:
+    if sequence_group_count < 1:
+        raise ValueError("sequence_group_count must be >= 1")
+    if sequence_group_count == 1:
         return cu_seqlens
     if not process_group:
         raise ValueError("process_group is required when sequence_group_count > 1")
