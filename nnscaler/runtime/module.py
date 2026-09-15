@@ -1498,25 +1498,19 @@ class ParallelModule(CubeModule):
         def cube_scale(ins, outs, grads):
             nonlocal accum_idx
             # find loss
-            for idx in range(len(outs)):
-                # loss always requires to be a scalar, and its gradient should be None
-                if grads[idx] is None:
-                    assert idx == 0, "Loss must be the first output."
+            # The loss is the first output. Other outputs may also have no gradient.
+            if not grads or grads[0] is not None:
+                return ins, outs, grads
+            if is_dummy_batch and accum_idx >= len(is_dummy_batch):
+                raise RuntimeError(
+                    f"Expected {len(is_dummy_batch)} number of micro-batches, but got more than it."
+                )
+            mul_coef = 0.0 if is_dummy_batch and is_dummy_batch[accum_idx] else 1.0
 
-                    if is_dummy_batch and accum_idx >= len(is_dummy_batch):
-                        raise RuntimeError(
-                            f"Expected {len(is_dummy_batch)} number of micro-batches, but got more than it."
-                    )
-                    mul_coef = 0.0 if is_dummy_batch and is_dummy_batch[accum_idx] else 1.0
-
-                    if outs[idx].size() != torch.Size([]):
-                        raise ValueError(f"Expected scalar loss, but got {outs[idx].size()}.")
-                    if scale_fn:
-                        outs[idx] = mul_coef * scale_fn(outs[idx])
-                    else:
-                        outs[idx] = mul_coef * outs[idx]
-                    accum_idx += 1
-                    break
+            if outs[0].size() != torch.Size([]):
+                raise ValueError(f"Expected scalar loss, but got {outs[0].size()}.")
+            outs[0] = mul_coef * (scale_fn(outs[0]) if scale_fn else outs[0])
+            accum_idx += 1
             return ins, outs, grads
 
         Executor.register_backward_pre_hook(cube_scale)
