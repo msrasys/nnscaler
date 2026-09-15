@@ -469,8 +469,7 @@ def _shared_output_partition_policy(graph, cfg):
 @replace_all_device_with('cpu')
 def test_split_segment_with_shared_output(tmp_path):
     """
-    Shared output will prevent the segment output from being split,
-    TODO: we should support splitting the shared output, but currently we don't support it.
+    Shared outputs with compatible consumers can stay partitioned across stages.
     """
     m = SharedOutputSegmentModule()
     m.train()
@@ -491,63 +490,60 @@ def test_split_segment_with_shared_output(tmp_path):
         load_module=False,
         reuse='override',
     )
-    assert _gencode_contains(
+    assert not _gencode_contains(
         tmp_path, SharedOutputSegmentModule, 0, r'nnscaler.runtime.adapter.nn.allgather_split'
     )
 
-    # rank 0:
+    # after narrowing, no allgather_split should be present
     # def segment39(self, data_32):
     #     data_64 = nnscaler.runtime.adapter.chunk(data_32, dim=0, ranks=[0, 1])
     #     del data_32
-    #     # File "/data/weijiangxu/nnscaler/tests/parallel_module/test_gencode_pipeline.py", line 437, in forward,  x0 = data + self.w0
+    #     # File "/data/weijiangxu/nnscaler/tests/parallel_module/test_gencode_pipeline.py", line 438, in forward,  x0 = data + self.w0
     #     add_68 = torch.add(data_64, self.w0_66, alpha=1)
     #     del data_64
-    #     # create at IRAdapterGener:autoref, comment before transformation: fn activation
-    #     add_120, add_158 = nnscaler.runtime.function.multiref(add_68, times=2)
+    #     # created at IRAdapterGener:local_consumer_multiref
+    #     add_156, add_160 = nnscaler.runtime.function.multiref(add_68, times=2)
     #     del add_68
-    #     # File "/data/weijiangxu/nnscaler/tests/parallel_module/test_gencode_pipeline.py", line 438, in forward,  x1 = x0 + self.w1
-    #     add_1_72 = torch.add(add_120, self.w1_70, alpha=1)
-    #     del add_120
-    #     add_113 = nnscaler.runtime.adapter.nn.allgather_split(add_158, dim=0, ranks=[0, 1])
-    #     del add_158
+    #     # File "/data/weijiangxu/nnscaler/tests/parallel_module/test_gencode_pipeline.py", line 439, in forward,  x1 = x0 + self.w1
+    #     add_1_72 = torch.add(add_156, self.w1_70, alpha=1)
+    #     del add_156
     #     # fn identity for segment output
-    #     add_106 = nnscaler.runtime.function.identity(add_113)
-    #     del add_113
-    #     return add_106, add_1_72
+    #     add_148 = nnscaler.runtime.function.identity(add_160)
+    #     del add_160
+    #     return add_148, add_1_72
 
-    # def adapter202(self, add_106):
-    #     add_162 = nnscaler.runtime.adapter.chunk(add_106, dim=0, ranks=[0, 1])
-    #     _ = nnscaler.runtime.adapter.move(add_162, shape=(2, 4), dtype=torch.float32, src=0, dst=2)
+    # def adapter204(self, add_148):
+    #     _ = nnscaler.runtime.adapter.move(add_148, shape=(2, 4), dtype=torch.float32, src=0, dst=2)
     #     return
 
-    # def adapter232(self, add_1_72):
+    # def adapter234(self, add_1_72):
     #     _ = nnscaler.runtime.adapter.move(add_1_72, shape=(2, 4), dtype=torch.float32, src=0, dst=2)
     #     return
 
     # rank 2:
-    # def segment43(self, add_162, add_1_72):
+    # def segment43(self, add_148, add_1_72):
     #     # created at: segment dispatch: fix identity
-    #     add_1_128 = nnscaler.runtime.function.identity(add_1_72)
+    #     add_1_118 = nnscaler.runtime.function.identity(add_1_72)
     #     del add_1_72
     #     # created at: segment dispatch: fix identity
-    #     add_136 = nnscaler.runtime.function.identity(add_162)
-    #     del add_162
-    #     # File "/data/weijiangxu/nnscaler/tests/parallel_module/test_gencode_pipeline.py", line 440, in forward,  x2 = x1 + self.w2 + x0  # x0 is a shared output
-    #     add_2_76 = torch.add(add_1_128, self.w2_74, alpha=1)
-    #     del add_1_128
-    #     # File "/data/weijiangxu/nnscaler/tests/parallel_module/test_gencode_pipeline.py", line 440, in forward,  x2 = x1 + self.w2 + x0  # x0 is a shared output
-    #     add_3_78 = torch.add(add_2_76, add_136, alpha=1)
-    #     del add_136, add_2_76
-    #     # File "/data/weijiangxu/nnscaler/tests/parallel_module/test_gencode_pipeline.py", line 441, in forward,  x3 = x2 + self.w3
+    #     add_126 = nnscaler.runtime.function.identity(add_148)
+    #     del add_148
+    #     # File "/data/weijiangxu/nnscaler/tests/parallel_module/test_gencode_pipeline.py", line 441, in forward,  x2 = x1 + self.w2 + x0  # x0 is a shared output
+    #     add_2_76 = torch.add(add_1_118, self.w2_74, alpha=1)
+    #     del add_1_118
+    #     # File "/data/weijiangxu/nnscaler/tests/parallel_module/test_gencode_pipeline.py", line 441, in forward,  x2 = x1 + self.w2 + x0  # x0 is a shared output
+    #     add_3_78 = torch.add(add_2_76, add_126, alpha=1)
+    #     del add_126, add_2_76
+    #     # File "/data/weijiangxu/nnscaler/tests/parallel_module/test_gencode_pipeline.py", line 442, in forward,  x3 = x2 + self.w3
     #     add_4_82 = torch.add(add_3_78, self.w3_80, alpha=1)
     #     del add_3_78
     #     return add_4_82
 
-    # def adapter202(self):
-    #     add_162 = nnscaler.runtime.adapter.move((), shape=(2, 4), dtype=torch.float32, src=0, dst=2)
-    #     return add_162
+    # def adapter204(self):
+    #     add_148 = nnscaler.runtime.adapter.move((), shape=(2, 4), dtype=torch.float32, src=0, dst=2)
+    #     return add_148
 
-    # def adapter232(self):
+    # def adapter234(self):
     #     add_1_72 = nnscaler.runtime.adapter.move((), shape=(2, 4), dtype=torch.float32, src=0, dst=2)
     #     return add_1_72
 

@@ -934,6 +934,61 @@ def test_loss_explicit_multiref(tmp_path):
     #     return multiref_24, getattr_2_25
 
 
+class SharedOutputSplitModule(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.fc = torch.nn.Linear(10, 10)
+
+    def forward(self, x):
+        x = self.fc(x)
+        l = x.sum()
+        return l, x
+
+
+@replace_all_device_with('cpu')
+def test_shared_output_split_insert_identity(tmp_path):
+    m = SharedOutputSplitModule()
+    m.train()
+
+    trace_data = torch.randn([2, 10], dtype=torch.float32)
+    parallelize(
+            m,
+            {'x': trace_data},
+            _loss_data_policy,
+            ComputeConfig(2, 2, use_end2end=False),
+            reuse='override',
+            gen_savedir=tmp_path,
+            load_module=False,
+    )
+
+    assert _gencode_contains(tmp_path, SharedOutputSplitModule, 0, 'nnscaler.runtime.function.identity')
+    # nnscaler.runtime.adapter.nn.split_allgather
+    # and nnscaler.runtime.adapter.nn.allgather_split
+    # and nnscaler.runtime.adapter.nn.allreduce_identity
+    assert len(_gencode_contains(tmp_path, SharedOutputSplitModule, 0, 'nnscaler.runtime.adapter.nn.')) == 3
+    # code looks like:
+    # def segment96(self, x_15):
+    #     x_25 = nnscaler.runtime.adapter.nn.split_allgather(x_15, dim=0, ranks=[0, 1])
+    #     del x_15
+    #     # File "/data/weijiangxu/nnscaler/tests/parallel_module/test_gencode_partition.py", line 943, in forward,  x = self.fc(x)
+    #     linear_27 = torch.nn.functional.linear(x_25, self.fc_weight_18, self.fc_bias_19)
+    #     del x_25
+    #     # create at IRAdapterGener:autoref, comment before transformation: fn activation
+    #     linear_53, linear_57 = nnscaler.runtime.function.multiref(linear_27, times=2)
+    #     del linear_27
+    #     # File "/data/weijiangxu/nnscaler/tests/parallel_module/test_gencode_partition.py", line 944, in forward,  l = x.sum()
+    #     sum_1_29 = torch.sum(linear_53)
+    #     del linear_53
+    #     linear_42 = nnscaler.runtime.adapter.nn.allgather_split(linear_57, dim=0, ranks=[0, 1])
+    #     del linear_57
+    #     # fn identity for segment output
+    #     linear_33 = nnscaler.runtime.function.identity(linear_42)
+    #     del linear_42
+    #     sum_1_16 = nnscaler.runtime.adapter.nn.allreduce_identity(sum_1_29, ranks=[0, 1])
+    #     del sum_1_29
+    #     return sum_1_16, linear_33
+
+
 def _shared_output_partition_policy(graph, cfg):
     from nnscaler.policies import OpPlan, OpPartition, get_pas_ops
 
