@@ -248,12 +248,22 @@ def _assert_object_collective_payload(obj):
 
 
 def _ordered_rank_worker(async_op):
+    from unittest.mock import patch
     _init_distributed(4)
     rank = torch.distributed.get_rank()
     ranks = [0, 2, 1, 3]
 
+    get_group_ranks = torch.distributed.get_process_group_ranks
+
+    def explicit_group_ranks(group):
+        # Older PyTorch releases require an explicit ProcessGroup, even for WORLD.
+        if group is None:
+            raise KeyError(group)
+        return get_group_ranks(group)
+
     value = torch.tensor([rank], dtype=torch.int64)
-    gathered = nnscaler.runtime.adapter.all_gather(value, 0, ranks, async_op=async_op)
+    with patch.object(torch.distributed, 'get_process_group_ranks', explicit_group_ranks):
+        gathered = nnscaler.runtime.adapter.all_gather(value, 0, ranks, async_op=async_op)
     if async_op:
         gathered = nnscaler.runtime.executor.AsyncCommHandler().wait(gathered)
     chunked = nnscaler.runtime.adapter.chunk(
