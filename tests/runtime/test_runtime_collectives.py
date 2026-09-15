@@ -38,6 +38,21 @@ def _move_worker(async_op: bool):
     return clone_to_cpu(tensor)
 
 
+def _object_collective_payload():
+    return {
+        'cuda': torch.arange(3, device=torch.cuda.current_device()),
+        'cpu': torch.arange(2, device='cpu'),
+        'metadata': {'hello': 'world', 'count': 1},
+    }
+
+def _assert_object_collective_payload(obj):
+    assert obj['cuda'].device == torch.device('cuda', torch.cuda.current_device())
+    assert obj['cuda'].tolist() == [0, 1, 2]
+    assert obj['cpu'].device.type == 'cpu'
+    assert obj['cpu'].tolist() == [0, 1]
+    assert obj['metadata'] == {'hello': 'world', 'count': 1}
+
+
 def _move_object_worker():
     rank = torch.distributed.get_rank()
     obj = _object_collective_payload() if rank == 0 else None
@@ -229,22 +244,6 @@ def test_3gpu():
         assert torch.equal(outputs[0][0], outputs[0][1])
         assert torch.equal(outputs[0][0], outputs[1][1])
         assert torch.equal(outputs[0][0], outputs[2][1])
-
-
-def _object_collective_payload():
-    return {
-        'cuda': torch.arange(3, device=torch.cuda.current_device()),
-        'cpu': torch.arange(2, device='cpu'),
-        'metadata': {'hello': 'world', 'count': 1},
-    }
-
-
-def _assert_object_collective_payload(obj):
-    assert obj['cuda'].device == torch.device('cuda', torch.cuda.current_device())
-    assert obj['cuda'].tolist() == [0, 1, 2]
-    assert obj['cpu'].device.type == 'cpu'
-    assert obj['cpu'].tolist() == [0, 1]
-    assert obj['metadata'] == {'hello': 'world', 'count': 1}
 
 
 def _ordered_rank_worker(async_op):
