@@ -1107,6 +1107,7 @@ class IRGraph(IRSegment):
             return self.recompute(nodes.nodes())
 
         else:
+            assert len(nodes) > 0, "Cannot recompute empty list of nodes"
             if any(fnode.offload is not None for fnode in nodes):
                 raise ValueError("Recompute and CPU offload cannot be applied to the same operator")
             segments = [self.segment(node) for node in nodes]
@@ -1150,6 +1151,7 @@ class IRGraph(IRSegment):
             assert nodes.isfw() and (not nodes.isbw()), "Only forward IRSegment can offload"
             return self.offload(nodes.nodes())
 
+        assert len(nodes) > 0, "Cannot offload empty list of nodes"
         if any(fnode.recompute is not None for fnode in nodes):
             raise ValueError("Recompute and CPU offload cannot be applied to the same operator")
         segments = [self.segment(node) for node in nodes]
