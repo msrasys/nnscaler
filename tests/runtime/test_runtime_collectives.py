@@ -38,6 +38,21 @@ def _move_worker(async_op: bool):
     return clone_to_cpu(tensor)
 
 
+def _object_collective_payload():
+    return {
+        'cuda': torch.arange(3, device=torch.cuda.current_device()),
+        'cpu': torch.arange(2, device='cpu'),
+        'metadata': {'hello': 'world', 'count': 1},
+    }
+
+def _assert_object_collective_payload(obj):
+    assert obj['cuda'].device == torch.device('cuda', torch.cuda.current_device())
+    assert obj['cuda'].tolist() == [0, 1, 2]
+    assert obj['cpu'].device.type == 'cpu'
+    assert obj['cpu'].tolist() == [0, 1]
+    assert obj['metadata'] == {'hello': 'world', 'count': 1}
+
+
 def _move_object_worker():
     rank = torch.distributed.get_rank()
     obj = _object_collective_payload() if rank == 0 else None
@@ -231,29 +246,23 @@ def test_3gpu():
         assert torch.equal(outputs[0][0], outputs[2][1])
 
 
-def _object_collective_payload():
-    return {
-        'cuda': torch.arange(3, device=torch.cuda.current_device()),
-        'cpu': torch.arange(2, device='cpu'),
-        'metadata': {'hello': 'world', 'count': 1},
-    }
-
-
-def _assert_object_collective_payload(obj):
-    assert obj['cuda'].device == torch.device('cuda', torch.cuda.current_device())
-    assert obj['cuda'].tolist() == [0, 1, 2]
-    assert obj['cpu'].device.type == 'cpu'
-    assert obj['cpu'].tolist() == [0, 1]
-    assert obj['metadata'] == {'hello': 'world', 'count': 1}
-
-
 def _ordered_rank_worker(async_op):
+    from unittest.mock import patch
     _init_distributed(4)
     rank = torch.distributed.get_rank()
     ranks = [0, 2, 1, 3]
 
+    get_group_ranks = torch.distributed.get_process_group_ranks
+
+    def explicit_group_ranks(group):
+        # Older PyTorch releases require an explicit ProcessGroup, even for WORLD.
+        if group is None:
+            raise KeyError(group)
+        return get_group_ranks(group)
+
     value = torch.tensor([rank], dtype=torch.int64)
-    gathered = nnscaler.runtime.adapter.all_gather(value, 0, ranks, async_op=async_op)
+    with patch.object(torch.distributed, 'get_process_group_ranks', explicit_group_ranks):
+        gathered = nnscaler.runtime.adapter.all_gather(value, 0, ranks, async_op=async_op)
     if async_op:
         gathered = nnscaler.runtime.executor.AsyncCommHandler().wait(gathered)
     chunked = nnscaler.runtime.adapter.chunk(
