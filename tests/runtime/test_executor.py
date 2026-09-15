@@ -191,3 +191,24 @@ def test_backward_weight_requires_pending_input_backward():
     module = torch.nn.Linear(8, 16)
     with pytest.raises(RuntimeError, match='No pending weight backward'):
         Executor.backward_weight('linear', module.parameters())
+
+
+def test_backward_preserves_retained_outer_input_grad():
+    Executor.clear()
+    try:
+        leaf = torch.randn(4, 3, requires_grad=True)
+        outer_input = leaf * 2
+        outer_input.retain_grad()
+
+        output = Executor.fexecute('segment', torch.sin, outer_input)
+        expected = torch.cos(outer_input)
+        actual = Executor.backward(
+            'segment', (outer_input,), (output,), (torch.ones_like(output),),
+        )
+
+        assert torch.equal(actual, expected)
+        assert torch.equal(outer_input.grad, expected)
+        assert leaf.grad is None
+        Executor.check_clear()
+    finally:
+        Executor.clear()
