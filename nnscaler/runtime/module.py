@@ -396,6 +396,8 @@ class CubeModule(torch.nn.Module):
                 tid_to_chunk[meta.tid] for meta in self._fullmap.values()
             }
 
+        # TP/PP ranks use only part of each full-model chunk. mmap lets them
+        # page in the required tensor slices instead of eagerly reading it all.
         # mmap was added in PyTorch 2.1; PyTorch 2.0 remains supported.
         mmap_kwargs = {'mmap': True} if torch.__version__ >= (2, 1) else {}
         with torch.no_grad():
