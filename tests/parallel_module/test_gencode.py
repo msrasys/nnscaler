@@ -2453,3 +2453,21 @@ def test_codegen_supports_inactive_plan_rank():
             3,
             r"This ParallelModule rank is inactive",
         )
+
+
+@pytest.mark.parametrize('runtime_size, expected', [(8, [(0, 1)]), (16, [(0, 1), (8, 9)])])
+def test_partial_plan_p2p_pairs_use_complete_plan_stride(runtime_size, expected):
+    from types import SimpleNamespace
+    from nnscaler.codegen import ModuleCodeGen
+    from nnscaler.ir.adapter.prim import MovePrim
+
+    move = MovePrim([], [], shape=(1,), dtype='torch.float32', src=0, dst=1)
+    generator = object.__new__(ModuleCodeGen)
+    generator.devices = (0, 1)
+    generator.plan_ndevs = 8
+    generator.runtime_ndevs = runtime_size
+    generator.execplan = SimpleNamespace(graph=SimpleNamespace(
+        select=lambda **_kwargs: [SimpleNamespace(prims=[move])],
+    ))
+
+    assert generator.get_p2p_pairs() == expected

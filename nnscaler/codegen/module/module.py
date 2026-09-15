@@ -184,7 +184,7 @@ class ModuleCodeGen(FuncEmission):
         """
         Scale real P2P MovePrim endpoints to runtime devices.
         """
-        nreplica = self.runtime_ndevs // len(self.devices)
+        nreplica = self.runtime_ndevs // self.plan_ndevs
         pairs = set()
         for adapter in self.execplan.graph.select(ntype=IRAdapter):
             for prim in adapter.prims:
@@ -194,8 +194,8 @@ class ModuleCodeGen(FuncEmission):
                 if src is None or dst is None or src == dst:
                     continue
                 for i in range(nreplica):
-                    shifted_src = int(src) + i * len(self.devices)
-                    shifted_dst = int(dst) + i * len(self.devices)
+                    shifted_src = int(src) + i * self.plan_ndevs
+                    shifted_dst = int(dst) + i * self.plan_ndevs
                     pair = (shifted_src, shifted_dst) if shifted_src < shifted_dst else (shifted_dst, shifted_src)
                     pairs.add(pair)
         return sorted(pairs)
