@@ -267,8 +267,7 @@ def megatron_ffn_policy_list(graph, cfg):
 
 
 @replace_all_device_with('cpu')
-@pytest.mark.parametrize('pipeline_size_key', ['pp_size', 'pipeline_size'])
-def test_codegen_fn_pipeline(tmp_path, pipeline_size_key):
+def test_codegen_fn_pipeline(tmp_path):
     parallelize(
         FnPolicyModuleList(),
         {'x': torch.randn(4, 4)},
@@ -277,7 +276,7 @@ def test_codegen_fn_pipeline(tmp_path, pipeline_size_key):
         ComputeConfig(4, 4, use_end2end=True,
             pas_config={
                 'pipeline_nmicros': 2,
-                pipeline_size_key: 2,
+                'pipeline_size': 2,
             }
         ),
         gen_savedir=tmp_path,
@@ -1540,14 +1539,13 @@ class InterleavedPolicyModule(FnPolicyModuleList):
 
 
 @replace_all_device_with('cpu')
-@pytest.mark.parametrize('pipeline_size_key', ['pp_size', 'pipeline_size'])
-def test_fn_rejects_invalid_stage_grouping_before_partitioning(tmp_path, mocker, pipeline_size_key):
+def test_fn_rejects_invalid_stage_grouping_before_partitioning(tmp_path, mocker):
     from nnscaler.algorithm.ops.dimops import DimSplitEinops
     from nnscaler.graph.parser import convert_model
     from nnscaler.policies import fn
     graph = convert_model(InterleavedPolicyModule(), {'x': torch.randn(4, 4)}, tmp_path)
     cfg = ComputeConfig(6, 6, use_end2end=True, pas_config={
-        pipeline_size_key: 3, 'pipeline_nmicros': 4,
+        'pipeline_size': 3, 'pipeline_nmicros': 4,
         'pipeline_scheduler': '1f1b_interleaved',
     })
     instantiate = mocker.spy(DimSplitEinops, 'instantiate')
@@ -1562,7 +1560,7 @@ def test_fn_interleaved_physical_stage_assignment(tmp_path):
         InterleavedPolicyModule(), {'x': torch.randn(4, 4)},
         megatron_ffn_policy_list,
         ComputeConfig(4, 4, use_end2end=True, pas_config={
-            'pp_size': 2, 'pipeline_nmicros': 4,
+            'pipeline_size': 2, 'pipeline_nmicros': 4,
             'pipeline_scheduler': '1f1b_interleaved',
         }),
         gen_savedir=tmp_path, load_module=False,
@@ -1580,7 +1578,7 @@ def test_fn_interleaved_physical_stage_assignment(tmp_path):
 
 @pytest.mark.parametrize('policy_name', ['fn', 'hybrid'])
 @pytest.mark.parametrize('settings', [
-    {'pp_size': 0}, {'pp_size': 3}, {'pp_size': 2, 'pipeline_size': 1},
+    {'pipeline_size': 0}, {'pipeline_size': 3},
 ])
 def test_invalid_physical_pipeline_configuration(policy_name, settings):
     from nnscaler.policies import fn, pas_hybrid
@@ -1588,7 +1586,7 @@ def test_invalid_physical_pipeline_configuration(policy_name, settings):
     cfg = ComputeConfig(4, 4, use_end2end=True, pas_config={
         'pipeline_nstages': 4, 'pipeline_nmicros': 4, **settings,
     })
-    with pytest.raises(ValueError, match='pp_size'):
+    with pytest.raises(ValueError, match='pipeline_size'):
         if policy_name == 'fn':
             fn(graph, cfg, lambda graph, cfg: [])
         else:
