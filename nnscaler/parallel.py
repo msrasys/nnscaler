@@ -7,6 +7,7 @@ import types
 from typing import Callable, Any, Dict, Iterable, Optional, Tuple, Type, Union, TypeVar, List, Set, Literal
 from pathlib import Path
 import inspect
+import itertools
 import sys
 import importlib
 from dataclasses import dataclass, asdict, field, replace
@@ -618,6 +619,45 @@ def _prepare_namespace(
     return namespace, outdir
 
 
+def _config_difference_paths(saved, current, prefix=''):
+    """Report differing keys without logging arbitrary user-config values."""
+    if isinstance(saved, dict) and isinstance(current, dict):
+        for key in sorted(saved.keys() | current.keys(), key=str):
+            path = f'{prefix}.{key}' if prefix else str(key)
+            if key not in saved or key not in current:
+                yield path
+            else:
+                yield from _config_difference_paths(saved[key], current[key], path)
+    elif saved != current:
+        yield prefix
+
+
+def _reuse_mismatch_details(old_config, compute_config, is_config_match,
+                            existing_files, expected_candidates):
+    details = [f'ComputeConfig match: {is_config_match}.']
+    if not is_config_match:
+        if old_config is None:
+            details.append('Saved compute_config.pt is missing or could not be loaded.')
+        else:
+            try:
+                paths = list(itertools.islice(_config_difference_paths(
+                    asdict(old_config), asdict(compute_config)), 21))
+                details.append('Differing config fields: ' + ', '.join(paths[:20])
+                               + (', ...' if len(paths) > 20 else '') + '.')
+            except Exception:
+                details.append('Saved and current ComputeConfig could not be inspected.')
+    existing = set(existing_files)
+    expected = min((set(files) for files in expected_candidates),
+                   key=lambda files: len(files ^ existing))
+    for label, files in (('Missing files', expected - existing),
+                         ('Unexpected files', existing - expected)):
+        names = sorted(path.name for path in files)
+        if names:
+            details.append(f'{label}: ' + ', '.join(names[:20])
+                           + (', ...' if len(names) > 20 else '') + '.')
+    return ' '.join(details)
+
+
 def _prepare_and_check_reusable(
         gen_savedir: str,
         module_or_module_class: Union[Type[torch.nn.Module], torch.nn.Module],
@@ -721,10 +761,16 @@ def _prepare_and_check_reusable(
                 if not all([meta_file.exists() for meta_file in trace_meta_files]):
                     _clean_files(outdir)
             elif reuse == ReuseType.MATCH:
+                details = _reuse_mismatch_details(
+                    old_config, compute_config, is_config_match,
+                    existing_output_files,
+                    (compact_expected_output_files, legacy_expected_output_files))
                 raise RuntimeError(f'Output directory {outdir} is not empty. '
                                    f'And the existing files do not match with current config. '
-                                   f'You can remove the directory and try again, '
-                                   f'or set reuse to ReuseType.NONE/ReuseType.OVERRIDE to regenerate the code.')
+                                   f'{details} '
+                                   f'Check the source revision, launch arguments, and staged files. '
+                                   f'If regeneration is needed, regenerate the canonical package '
+                                   f'with the intended config and stage it again.')
             else:
                 assert reuse == ReuseType.MOO
                 if _is_any_gencode_loaded(namespace):
