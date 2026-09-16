@@ -1,4 +1,5 @@
 import re
+from functools import partial
 
 import torch
 import pytest
@@ -597,6 +598,11 @@ def test_shared_output_with_different_producer_partition(tmp_path):
             tmp_path, SharedOutputSegmentModule, rank,
             r'nnscaler\.runtime\.adapter\.nn\.allgather_split\(',
         )
+    for rank in (2, 3):
+        assert not _gencode_contains(
+            tmp_path, SharedOutputSegmentModule, rank,
+            r'nnscaler\.runtime\.adapter\.(?:nn\.)?(?:all_gather|allgather_split)\(',
+        )
 
     # rank 0
     # def segment39(self, data_32):
@@ -656,7 +662,7 @@ def test_shared_output_with_different_producer_partition(tmp_path):
 
 @replace_all_device_with('cpu')
 def test_shared_output_with_different_producer_partition_no_partition(tmp_path):
-    """The shared producer uses dim 1; its local use dim 0. and next-stage consumers use all"""
+    """The producer uses dim 1, the local consumer uses dim 0, and later consumers are replicated."""
     from nnscaler.ir import IRSubTensor
     from nnscaler.policies import OpPlan, OpPartition, get_pas_ops
 
@@ -664,7 +670,7 @@ def test_shared_output_with_different_producer_partition_no_partition(tmp_path):
         stage_id = 0
         for node in get_pas_ops(graph):
             if node.fn == torch.add:
-                dim = 0
+                op_partition = None
                 weight = node.input(1)
                 if isinstance(weight, IRSubTensor) and weight.is_param():
                     if weight.name in ['w0', 'w1']:
@@ -677,8 +683,6 @@ def test_shared_output_with_different_producer_partition_no_partition(tmp_path):
                         op_partition = OpPartition(input=0, dim=1)
                     elif weight.name == 'w1':
                         op_partition = OpPartition(input=0, dim=0)
-                    else:
-                        op_partition = None
                 yield OpPlan(node, stage_id=stage_id, partition=op_partition)
             else:
                 yield OpPlan(node, stage_id=stage_id, partition=None)
@@ -707,6 +711,11 @@ def test_shared_output_with_different_producer_partition_no_partition(tmp_path):
             tmp_path, SharedOutputSegmentModule, rank,
             r'nnscaler\.runtime\.adapter\.nn\.allgather_split\(',
         )
+    for rank in (2, 3):
+        assert len(_gencode_contains(
+            tmp_path, SharedOutputSegmentModule, rank,
+            r'nnscaler\.runtime\.adapter\.all_gather\(.*dim=0, ranks=\[2, 3\]',
+        )) == 2
 
     # rank 0
     # def segment29(self, data_32):
@@ -762,6 +771,74 @@ def test_shared_output_with_different_producer_partition_no_partition(tmp_path):
     #     add_4_42 = torch.add(add_3_40, self.w3_41, alpha=1)
     #     del add_3_40
     #     return add_4_42
+
+
+class SharedOutputBoundaryModule(SharedOutputSegmentModule):
+    def __init__(self, case):
+        super().__init__()
+        self.case = case
+
+    def forward(self, data):
+        if self.case == 'value_producer':
+            x0 = torch.matmul(data, self.w0)
+        else:
+            x0 = data + self.w0
+        x1 = x0 + self.w1
+        if self.case == 'incompatible_consumers':
+            x1 = x1 + torch.relu(x0)
+        x2 = x1 + self.w2 + x0 + x0
+        x3 = x2 + self.w3
+        x4 = x3 + self.w4
+        x5 = x4 + self.w5
+        loss = torch.pow(x5, 2).sum()
+        if self.case == 'final_output':
+            return loss, x0
+        return loss
+
+
+def _shared_output_boundary_policy(graph, cfg, case):
+    from nnscaler.ir import IRSubTensor
+    from nnscaler.policies import OpPlan, OpPartition, get_pas_ops
+
+    stage_id = 0
+    for node in get_pas_ops(graph):
+        partition = None
+        if node.fn in (torch.add, torch.matmul):
+            weight = node.input(1)
+            is_weight = isinstance(weight, IRSubTensor) and weight.is_param()
+            if is_weight:
+                stage_id = 0 if weight.name in ('w0', 'w1') else 1
+            if node.fn == torch.matmul:
+                partition = OpPartition(input=1, dim=0)
+            elif not (case == 'full_next_stage' and stage_id == 1):
+                partition = OpPartition(input=0, dim=0)
+                if is_weight and weight.name == 'w0':
+                    partition = None if case == 'replicated_producer' else OpPartition(input=0, dim=1)
+        yield OpPlan(node, stage_id=stage_id, partition=partition)
+
+
+@replace_all_device_with('cpu')
+@pytest.mark.parametrize('case', ['final_output', 'incompatible_consumers'])
+def test_shared_output_pipeline_boundary_codegen(tmp_path, case):
+    parallelize(
+        SharedOutputBoundaryModule(case).train(),
+        {'data': torch.randn(4, 4)},
+        pas_policy=partial(_shared_output_boundary_policy, case=case),
+        compute_config=ComputeConfig(
+            4, 4,
+            constant_folding=False,
+            use_end2end=True,
+            pas_config={'pipeline_nmicros': 3, 'pipeline_scheduler': '1f1b'},
+        ),
+        gen_savedir=tmp_path,
+        load_module=False,
+        reuse='override',
+    )
+    for rank in (0, 1):
+        assert _gencode_contains(
+            tmp_path, SharedOutputBoundaryModule, rank,
+            r'nnscaler\.runtime\.adapter\.nn\.allgather_split\(',
+        )
 
 
 class SharedInputSegmentModule(torch.nn.Module):

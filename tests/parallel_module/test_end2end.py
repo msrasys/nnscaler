@@ -9,14 +9,19 @@ PYTHONPATH=.:$PYTHONPATH torchrun \
 """
 
 from pathlib import Path
+from contextlib import ExitStack
+from copy import deepcopy
+from functools import partial
 import tempfile
 from typing import Dict, TypedDict
+from unittest.mock import patch
 import pytest
 import torch
 from torch import nn
 import torch.distributed
 
 import nnscaler
+from nnscaler.graph.segment import IRSegmentExpander
 from nnscaler.runtime.gnorm import calcuate_gnorm
 from nnscaler.runtime.utils import microbatches
 from nnscaler.runtime.module import ParallelModule
@@ -26,6 +31,7 @@ from ..launch_torchrun import clone_to_cpu_recursively, launch_torchrun
 from ..utils import replace_all_device_with, clear_dir_on_rank0, PYTEST_RUN_ID
 
 from .test_checkpoint import End2EndMLP
+from .test_gencode_pipeline import SharedOutputBoundaryModule, _shared_output_boundary_policy
 
 
 DATA_SIZE = 64
@@ -300,6 +306,83 @@ def test_end2end():
             model.eval()
             loss = model({key: v.cuda() for key, v in data.items()})
             assert torch.allclose(loss.cpu(), infer_result[i].cpu(), atol=1e-6, rtol=1e-6)
+
+
+def _shared_output_boundary_worker(gen_savedir, case):
+    init_distributed()
+    try:
+        init_random()
+        reference = SharedOutputBoundaryModule(case).train()
+        samples = [torch.randn(4, 4) for _ in range(3)]
+        with ExitStack() as stack:
+            output_narrowing = None
+            input_narrowing = None
+            if case in ('full_outputs', 'full_io'):
+                output_narrowing = stack.enter_context(patch.object(
+                    IRSegmentExpander, '_try_narrow_segment_ptensors', return_value=None,
+                ))
+            if case == 'full_io':
+                input_narrowing = stack.enter_context(patch.object(
+                    IRSegmentExpander, '_try_narrow_segment_ctensors', return_value=None,
+                ))
+            model = parallelize(
+                deepcopy(reference),
+                {'data': samples[0]},
+                pas_policy=partial(_shared_output_boundary_policy, case=case),
+                compute_config=ComputeConfig(
+                    4, 4,
+                    constant_folding=False,
+                    use_end2end=True,
+                    pas_config={'pipeline_nmicros': 3, 'pipeline_scheduler': '1f1b'},
+                ),
+                gen_savedir=gen_savedir,
+                reuse='override',
+            ).cuda()
+            if torch.distributed.get_rank() == 0:
+                if output_narrowing is not None:
+                    output_narrowing.assert_called()
+                if input_narrowing is not None:
+                    input_narrowing.assert_called()
+
+        optimizer = build_optimizer(model, torch.optim.SGD, lr=0.0)
+        expected_outputs = []
+        for sample in samples:
+            output = reference(sample)
+            loss = output[0] if isinstance(output, tuple) else output
+            loss.backward()
+            expected_outputs.append(output)
+        outputs = model.train_step(samples)
+        optimizer.step()
+        gradients = {name: parameter.grad for name, parameter in model.named_parameters()}
+        assert all(gradient is not None for gradient in gradients.values())
+        model._add_extra_state(gradients, '')
+        return clone_to_cpu_recursively({
+            'outputs': outputs,
+            'gradients': gradients,
+            'expected_outputs': expected_outputs,
+            'expected_gradients': {
+                name: parameter.grad for name, parameter in reference.named_parameters()
+            },
+        })
+    finally:
+        torch.distributed.destroy_process_group()
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 4, reason='requires 4 GPUs')
+@pytest.mark.parametrize('case', [
+    'compatible', 'final_output', 'incompatible_consumers', 'full_next_stage',
+    'replicated_producer', 'value_producer', 'full_outputs', 'full_io',
+])
+def test_shared_output_pipeline_outputs_and_gradients(tmp_path, case):
+    results = launch_torchrun(4, _shared_output_boundary_worker, tmp_path, case)
+    for result in results.values():
+        torch.testing.assert_close(
+            result['outputs'], result['expected_outputs'], rtol=1e-5, atol=1e-5,
+        )
+    gradients, _ = merge_state_dicts([result['gradients'] for result in results.values()])
+    torch.testing.assert_close(
+        gradients, results[0]['expected_gradients'], rtol=1e-5, atol=1e-5,
+    )
 
 
 class MLPShared(End2EndMLP):
