@@ -41,7 +41,7 @@ def shared_vpp_policy(graph, cfg):
     return fn(graph, cfg, plans)
 
 
-def colocated_worker(async_reducer=False):
+def colocated_worker(async_reducer=False, pipeline_multiref_replicated_params=True):
     nnscaler.init()
     # Full and partitioned batches can select different TF32 kernels. Use
     # full FP32 precision to test placement and accumulation independently.
@@ -52,7 +52,8 @@ def colocated_worker(async_reducer=False):
     reference_optimizer = torch.optim.SGD(reference.parameters(), lr=0.01)
     cfg = ComputeConfig(4, 4, use_end2end=True, use_async_reducer=async_reducer,
                         pas_config={'pipeline_size': 2, 'pipeline_nmicros': 4,
-                                    'pipeline_scheduler': '1f1b_interleaved'})
+                                    'pipeline_scheduler': '1f1b_interleaved',
+                                    'pipeline_multiref_replicated_params': pipeline_multiref_replicated_params})
     directory = Path(tempfile.gettempdir()) / f'colocated_vpp_{PYTEST_RUN_ID}'
     with clear_dir_on_rank0(directory) as tempdir:
         model = parallelize(source, {'x': torch.ones(8, 8)}, shared_vpp_policy,
@@ -88,5 +89,6 @@ def colocated_worker(async_reducer=False):
 
 @pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.device_count() < 4,
                     reason='requires 4 GPUs')
-def test_colocated_vpp_matches_unpartitioned_optimizer_steps():
-    assert all(launch_torchrun(4, colocated_worker).values())
+@pytest.mark.parametrize('pipeline_multiref_replicated_params', [False, True])
+def test_colocated_vpp_matches_unpartitioned_optimizer_steps(pipeline_multiref_replicated_params):
+    assert all(launch_torchrun(4, colocated_worker, False, pipeline_multiref_replicated_params).values())
