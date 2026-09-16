@@ -391,7 +391,7 @@ class CubeModule(torch.nn.Module):
         index_filename = filename + '.index'
         required_chunks = None
         if os.path.isfile(index_filename):
-            tid_to_chunk: Dict[int, int] = torch.load(index_filename)
+            tid_to_chunk: Dict[int, int] = torch.load(index_filename, weights_only=True)
             required_chunks = {
                 tid_to_chunk[meta.tid] for meta in self._fullmap.values()
             }
@@ -407,9 +407,10 @@ class CubeModule(torch.nn.Module):
                 if required_chunks is not None and file_idx not in required_chunks:
                     continue
                 # part_model contains a subset of attributes, where each attribute is a fulltensor
+                # Generated alongside model code; preserve serialized Tensor subclasses.
                 # fulltensor.tid -> torch.Tensor
                 part_model: Dict[int, torch.Tensor] = torch.load(
-                    filename + f'.{file_idx}', weights_only=True, **mmap_kwargs)
+                    filename + f'.{file_idx}', weights_only=False, **mmap_kwargs)
                 loaded_names = set()
                 for attr_name in attr_names:
                     meta = self._fullmap[attr_name]

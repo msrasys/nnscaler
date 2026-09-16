@@ -83,12 +83,38 @@ def test_load_attr_content_reads_compatible_chunks(
     expected_mmap = True if supports_mmap else None
     if with_index:
         assert loaded_files == [
-            (FxModuleParser.ATTR_CONTENT_INDEX_FILE, None, None),
-            ('fullmodel.pt.2', expected_mmap, True),
+            (FxModuleParser.ATTR_CONTENT_INDEX_FILE, None, True),
+            ('fullmodel.pt.2', expected_mmap, False),
         ]
     else:
         assert loaded_files == [
-            ('fullmodel.pt.0', expected_mmap, True),
-            ('fullmodel.pt.1', expected_mmap, True),
-            ('fullmodel.pt.2', expected_mmap, True),
+            ('fullmodel.pt.0', expected_mmap, False),
+            ('fullmodel.pt.1', expected_mmap, False),
+            ('fullmodel.pt.2', expected_mmap, False),
         ]
+
+
+class CustomTensor(torch.Tensor):
+    pass
+
+
+@pytest.mark.parametrize('with_index', [True, False])
+def test_load_attr_content_preserves_tensor_subclasses(tmp_path, with_index):
+    frame = Frame()
+    tensor = IRFullTensor((8,), name='weight')
+    value = torch.arange(8, dtype=torch.float32).as_subclass(CustomTensor)
+    frame.add_attr(tensor, value, 'weight')
+    file_stem = tmp_path / FxModuleParser.ATTR_CONTENT_FILE_STEM
+    frame.save_attr_content(file_stem)
+    assert isinstance(torch.load(f'{file_stem}.0', weights_only=False)[tensor.tid], CustomTensor)
+    if not with_index:
+        (tmp_path / FxModuleParser.ATTR_CONTENT_INDEX_FILE).unlink()
+
+    module = CubeModule()
+    module.register_parameter('local_weight', torch.nn.Parameter(torch.empty(3)))
+    module._fullmap['local_weight'] = AttrMeta(
+        tid=tensor.tid, is_param=True, orig_name='weight', shape=(8,),
+        slicers=(slice(2, 5),), val_chunks=1, dtype=torch.float32, sub_shape=(3,),
+    )
+    module.load_attr_content(str(file_stem))
+    torch.testing.assert_close(module.local_weight, torch.arange(2, 5, dtype=torch.float32))
