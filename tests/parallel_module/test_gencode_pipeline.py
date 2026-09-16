@@ -732,7 +732,7 @@ def test_shared_output_with_different_producer_partition_no_partition(tmp_path):
     for rank in (2, 3):
         assert len(_gencode_contains(
             tmp_path, SharedOutputSegmentModule, rank,
-            r'nnscaler\.runtime\.adapter\.all_gather\(.*dim=0, ranks=\[2, 3\]',
+            r'nnscaler\.runtime\.adapter\.all_gather\(.*dim=0, ranks=(?:\[2, 3\]|\(2, 3\))',
         )) == 2
 
     # rank 0
