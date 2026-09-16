@@ -1285,7 +1285,7 @@ def fn(
                 consumer_splits = tensor_splits[sub_tensor.parent].get(stage_id, set())
                 # Final graph outputs and incompatible layouts must stay replicated.
                 # Intermediate outputs can share the layout required by all local consumers.
-                # we will keep the original layout as it is,
+                # we will keep the consumer layout (the communication will definitely satisfy the existing consumer layout requirement)
                 # so we have more chance to optimize the compute graph in later stages.
                 # Communication will be generated correctly later no matter what the Identity layout is.
                 if pp_enabled and not is_tensor_in_output(sub_tensor.parent, graph) and len(consumer_splits) == 1:
