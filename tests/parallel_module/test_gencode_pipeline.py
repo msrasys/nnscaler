@@ -1,4 +1,5 @@
 import re
+from functools import partial
 
 import torch
 import pytest
@@ -467,7 +468,14 @@ def _shared_output_partition_policy(graph, cfg):
 
 
 @replace_all_device_with('cpu')
-def test_gencode_narrows_shared_segment_output(tmp_path):
+def test_split_segment_with_shared_output(tmp_path):
+    """Keep a shared activation sharded when producer and consumers use dim 0.
+
+    This three-stage pipeline has two TP ranks per stage. Stage 0 uses x0
+    locally to compute x1 and also exports x0 to stage 1. Rank 0 must not
+    gather x0 merely to pass it through the inserted output identity.
+    This is a codegen check; it does not execute distributed forward/backward.
+    """
     m = SharedOutputSegmentModule()
     m.train()
     parallelize(
@@ -490,6 +498,380 @@ def test_gencode_narrows_shared_segment_output(tmp_path):
     assert not _gencode_contains(
         tmp_path, SharedOutputSegmentModule, 0, r'nnscaler.runtime.adapter.nn.allgather_split'
     )
+
+    # after narrowing, no allgather_split should be present
+    # def segment39(self, data_32):
+    #     data_64 = nnscaler.runtime.adapter.chunk(data_32, dim=0, ranks=[0, 1])
+    #     del data_32
+    #     # File "/data/weijiangxu/nnscaler/tests/parallel_module/test_gencode_pipeline.py", line 438, in forward,  x0 = data + self.w0
+    #     add_68 = torch.add(data_64, self.w0_66, alpha=1)
+    #     del data_64
+    #     # created at IRAdapterGener:local_consumer_multiref
+    #     add_156, add_160 = nnscaler.runtime.function.multiref(add_68, times=2)
+    #     del add_68
+    #     # File "/data/weijiangxu/nnscaler/tests/parallel_module/test_gencode_pipeline.py", line 439, in forward,  x1 = x0 + self.w1
+    #     add_1_72 = torch.add(add_156, self.w1_70, alpha=1)
+    #     del add_156
+    #     # fn identity for segment output
+    #     add_148 = nnscaler.runtime.function.identity(add_160)
+    #     del add_160
+    #     return add_148, add_1_72
+
+    # def adapter204(self, add_148):
+    #     _ = nnscaler.runtime.adapter.move(add_148, shape=(2, 4), dtype=torch.float32, src=0, dst=2)
+    #     return
+
+    # def adapter234(self, add_1_72):
+    #     _ = nnscaler.runtime.adapter.move(add_1_72, shape=(2, 4), dtype=torch.float32, src=0, dst=2)
+    #     return
+
+    # rank 2:
+    # def segment43(self, add_148, add_1_72):
+    #     # created at: segment dispatch: fix identity
+    #     add_1_118 = nnscaler.runtime.function.identity(add_1_72)
+    #     del add_1_72
+    #     # created at: segment dispatch: fix identity
+    #     add_126 = nnscaler.runtime.function.identity(add_148)
+    #     del add_148
+    #     # File "/data/weijiangxu/nnscaler/tests/parallel_module/test_gencode_pipeline.py", line 441, in forward,  x2 = x1 + self.w2 + x0  # x0 is a shared output
+    #     add_2_76 = torch.add(add_1_118, self.w2_74, alpha=1)
+    #     del add_1_118
+    #     # File "/data/weijiangxu/nnscaler/tests/parallel_module/test_gencode_pipeline.py", line 441, in forward,  x2 = x1 + self.w2 + x0  # x0 is a shared output
+    #     add_3_78 = torch.add(add_2_76, add_126, alpha=1)
+    #     del add_126, add_2_76
+    #     # File "/data/weijiangxu/nnscaler/tests/parallel_module/test_gencode_pipeline.py", line 442, in forward,  x3 = x2 + self.w3
+    #     add_4_82 = torch.add(add_3_78, self.w3_80, alpha=1)
+    #     del add_3_78
+    #     return add_4_82
+
+    # def adapter204(self):
+    #     add_148 = nnscaler.runtime.adapter.move((), shape=(2, 4), dtype=torch.float32, src=0, dst=2)
+    #     return add_148
+
+    # def adapter234(self):
+    #     add_1_72 = nnscaler.runtime.adapter.move((), shape=(2, 4), dtype=torch.float32, src=0, dst=2)
+    #     return add_1_72
+
+
+@replace_all_device_with('cpu')
+def test_shared_output_with_different_producer_partition(tmp_path):
+    """Share one layout conversion between local use and cross-stage export.
+
+    Stage 0 produces x0 as column shards (dim 1), but its local consumer and
+    stage 1 both need row shards (dim 0). Each source rank must perform exactly
+    one all-to-all, then reuse its result for both branches without all-gather.
+    Receiver ranks must not gather the incoming shards either; otherwise the
+    redundant gather/resplit would only have moved to the receiving stage.
+    """
+    from nnscaler.ir import IRSubTensor
+    from nnscaler.policies import OpPlan, OpPartition, get_pas_ops
+
+    def policy(graph, cfg):
+        stage_id = 0
+        for node in get_pas_ops(graph):
+            if node.fn == torch.add:
+                dim = 0
+                weight = node.input(1)
+                if isinstance(weight, IRSubTensor) and weight.is_param():
+                    if weight.name in ['w0', 'w1']:
+                        stage_id = 0
+                    elif weight.name in ['w2', 'w3']:
+                        stage_id = 1
+                    elif weight.name in ['w4', 'w5']:
+                        stage_id = 2
+                    if weight.name == 'w0':
+                        dim = 1
+                yield OpPlan(node, stage_id=stage_id, partition=OpPartition(input=0, dim=dim))
+            else:
+                yield OpPlan(node, stage_id=stage_id, partition=None)
+
+    parallelize(
+        SharedOutputSegmentModule().train(),
+        {'data': torch.randn(4, 4)},
+        pas_policy=policy,
+        compute_config=ComputeConfig(
+            6, 6,
+            constant_folding=False,
+            use_end2end=True,
+            pas_config={'pipeline_nmicros': 3, 'pipeline_scheduler': '1f1b'},
+        ),
+        gen_savedir=tmp_path,
+        load_module=False,
+        reuse='override',
+    )
+    for rank in (0, 1):
+        # Convert columns to rows once, then share the row shards with both consumers.
+        assert len(_gencode_contains(
+            tmp_path, SharedOutputSegmentModule, rank,
+            r'nnscaler\.runtime\.adapter\.nn\.alltoall_alltoall\(.*idim=1, odim=0',
+        )) == 1
+        assert not _gencode_contains(
+            tmp_path, SharedOutputSegmentModule, rank,
+            r'nnscaler\.runtime\.adapter\.nn\.allgather_split\(',
+        )
+    for rank in (2, 3):
+        assert not _gencode_contains(
+            tmp_path, SharedOutputSegmentModule, rank,
+            r'nnscaler\.runtime\.adapter\.(?:nn\.)?(?:all_gather|allgather_split)\(',
+        )
+
+    # rank 0
+    # def segment39(self, data_32):
+    #     data_64 = nnscaler.runtime.adapter.chunk(data_32, dim=1, ranks=[0, 1])
+    #     del data_32
+    #     # File "/data/weijiangxu/nnscaler/tests/parallel_module/test_gencode_pipeline.py", line 438, in forward,  x0 = data + self.w0
+    #     add_68 = torch.add(data_64, self.w0_66, alpha=1)
+    #     del data_64
+    #     add_70 = nnscaler.runtime.adapter.nn.alltoall_alltoall(add_68, idim=1, odim=0, ranks=[0, 1])
+    #     del add_68
+    #     # created at IRAdapterGener:local_consumer_multiref
+    #     add_159, add_163 = nnscaler.runtime.function.multiref(add_70, times=2)
+    #     del add_70
+    #     # File "/data/weijiangxu/nnscaler/tests/parallel_module/test_gencode_pipeline.py", line 439, in forward,  x1 = x0 + self.w1
+    #     add_1_74 = torch.add(add_159, self.w1_72, alpha=1)
+    #     del add_159
+    #     # fn identity for segment output
+    #     add_150 = nnscaler.runtime.function.identity(add_163)
+    #     del add_163
+    #     return add_150, add_1_74
+
+    # def adapter204(self, add_1_74):
+    #     _ = nnscaler.runtime.adapter.move(add_1_74, shape=(2, 4), dtype=torch.float32, src=0, dst=2)
+    #     return
+
+    # def adapter234(self, add_150):
+    #     _ = nnscaler.runtime.adapter.move(add_150, shape=(2, 4), dtype=torch.float32, src=0, dst=2)
+    #     return
+
+    # rank 2
+    # def adapter204(self):
+    #     add_1_74 = nnscaler.runtime.adapter.move((), shape=(2, 4), dtype=torch.float32, src=0, dst=2)
+    #     return add_1_74
+
+    # def adapter234(self):
+    #     add_150 = nnscaler.runtime.adapter.move((), shape=(2, 4), dtype=torch.float32, src=0, dst=2)
+    #     return add_150
+
+    # def segment43(self, add_150, add_1_74):
+    #     # created at: segment dispatch: fix identity
+    #     add_1_120 = nnscaler.runtime.function.identity(add_1_74)
+    #     del add_1_74
+    #     # created at: segment dispatch: fix identity
+    #     add_128 = nnscaler.runtime.function.identity(add_150)
+    #     del add_150
+    #     # File "/data/weijiangxu/nnscaler/tests/parallel_module/test_gencode_pipeline.py", line 441, in forward,  x2 = x1 + self.w2 + x0  # x0 is a shared output
+    #     add_2_78 = torch.add(add_1_120, self.w2_76, alpha=1)
+    #     del add_1_120
+    #     # File "/data/weijiangxu/nnscaler/tests/parallel_module/test_gencode_pipeline.py", line 441, in forward,  x2 = x1 + self.w2 + x0  # x0 is a shared output
+    #     add_3_80 = torch.add(add_2_78, add_128, alpha=1)
+    #     del add_128, add_2_78
+    #     # File "/data/weijiangxu/nnscaler/tests/parallel_module/test_gencode_pipeline.py", line 442, in forward,  x3 = x2 + self.w3
+    #     add_4_84 = torch.add(add_3_80, self.w3_82, alpha=1)
+    #     del add_3_80
+    #     return add_4_84
+
+
+@replace_all_device_with('cpu')
+def test_shared_output_with_different_producer_partition_no_partition(tmp_path):
+    """Preserve required receiver gathers when later consumers are replicated.
+
+    Stage 0 produces x0 along dim 1 and uses it locally along dim 0, while
+    stages 1 and 2 use complete tensors. Source ranks must still share one
+    all-to-all conversion and export row shards without gathering locally.
+    Each stage-1 rank must gather both incoming tensors, x0 and x1. This guards
+    against removing necessary communication along with the redundant gather.
+    """
+    from nnscaler.ir import IRSubTensor
+    from nnscaler.policies import OpPlan, OpPartition, get_pas_ops
+
+    def policy(graph, cfg):
+        stage_id = 0
+        for node in get_pas_ops(graph):
+            if node.fn == torch.add:
+                op_partition = None
+                weight = node.input(1)
+                if isinstance(weight, IRSubTensor) and weight.is_param():
+                    if weight.name in ['w0', 'w1']:
+                        stage_id = 0
+                    elif weight.name in ['w2', 'w3']:
+                        stage_id = 1
+                    elif weight.name in ['w4', 'w5']:
+                        stage_id = 2
+                    if weight.name == 'w0':
+                        op_partition = OpPartition(input=0, dim=1)
+                    elif weight.name == 'w1':
+                        op_partition = OpPartition(input=0, dim=0)
+                yield OpPlan(node, stage_id=stage_id, partition=op_partition)
+            else:
+                yield OpPlan(node, stage_id=stage_id, partition=None)
+
+    parallelize(
+        SharedOutputSegmentModule().train(),
+        {'data': torch.randn(4, 4)},
+        pas_policy=policy,
+        compute_config=ComputeConfig(
+            6, 6,
+            constant_folding=False,
+            use_end2end=True,
+            pas_config={'pipeline_nmicros': 3, 'pipeline_scheduler': '1f1b'},
+        ),
+        gen_savedir=tmp_path,
+        load_module=False,
+        reuse='override',
+    )
+    for rank in (0, 1):
+        # Convert columns to rows once, then share the row shards with both consumers.
+        assert len(_gencode_contains(
+            tmp_path, SharedOutputSegmentModule, rank,
+            r'nnscaler\.runtime\.adapter\.nn\.alltoall_alltoall\(.*idim=1, odim=0',
+        )) == 1
+        assert not _gencode_contains(
+            tmp_path, SharedOutputSegmentModule, rank,
+            r'nnscaler\.runtime\.adapter\.nn\.allgather_split\(',
+        )
+    for rank in (2, 3):
+        assert len(_gencode_contains(
+            tmp_path, SharedOutputSegmentModule, rank,
+            r'nnscaler\.runtime\.adapter\.all_gather\(.*dim=0, ranks=\[2, 3\]',
+        )) == 2
+
+    # rank 0
+    # def segment29(self, data_32):
+    #     data_64 = nnscaler.runtime.adapter.chunk(data_32, dim=1, ranks=[0, 1])
+    #     del data_32
+    #     # File "/data/weijiangxu/nnscaler/tests/parallel_module/test_gencode_pipeline.py", line 438, in forward,  x0 = data + self.w0
+    #     add_68 = torch.add(data_64, self.w0_66, alpha=1)
+    #     del data_64
+    #     add_70 = nnscaler.runtime.adapter.nn.alltoall_alltoall(add_68, idim=1, odim=0, ranks=[0, 1])
+    #     del add_68
+    #     # created at IRAdapterGener:local_consumer_multiref
+    #     add_111, add_115 = nnscaler.runtime.function.multiref(add_70, times=2)
+    #     del add_70
+    #     # File "/data/weijiangxu/nnscaler/tests/parallel_module/test_gencode_pipeline.py", line 439, in forward,  x1 = x0 + self.w1
+    #     add_1_74 = torch.add(add_111, self.w1_72, alpha=1)
+    #     del add_111
+    #     # fn identity for segment output
+    #     add_102 = nnscaler.runtime.function.identity(add_115)
+    #     del add_115
+    #     return add_102, add_1_74
+
+    # def adapter150(self, add_1_74):
+    #     _ = nnscaler.runtime.adapter.move(add_1_74, shape=(2, 4), dtype=torch.float32, src=0, dst=2)
+    #     return
+
+    # def adapter210(self, add_102):
+    #     _ = nnscaler.runtime.adapter.move(add_102, shape=(2, 4), dtype=torch.float32, src=0, dst=2)
+    #     return
+
+    # rank 2
+    # def adapter150(self):
+    #     add_1_74 = nnscaler.runtime.adapter.move((), shape=(2, 4), dtype=torch.float32, src=0, dst=2)
+    #     add_1_37 = nnscaler.runtime.adapter.all_gather(add_1_74, dim=0, ranks=[2, 3])
+    #     return add_1_37
+
+    # def adapter210(self):
+    #     add_102 = nnscaler.runtime.adapter.move((), shape=(2, 4), dtype=torch.float32, src=0, dst=2)
+    #     add_90 = nnscaler.runtime.adapter.all_gather(add_102, dim=0, ranks=[2, 3])
+    #     return add_90
+
+    # def segment33(self, add_90, add_1_37):
+    #     add_1_82 = nnscaler.runtime.function.identity(add_1_37)
+    #     del add_1_37
+    #     add_78 = nnscaler.runtime.function.identity(add_90)
+    #     del add_90
+    #     # File "/data/weijiangxu/nnscaler/tests/parallel_module/test_gencode_pipeline.py", line 441, in forward,  x2 = x1 + self.w2 + x0  # x0 is a shared output
+    #     add_2_39 = torch.add(add_1_82, self.w2_38, alpha=1)
+    #     del add_1_82
+    #     # File "/data/weijiangxu/nnscaler/tests/parallel_module/test_gencode_pipeline.py", line 441, in forward,  x2 = x1 + self.w2 + x0  # x0 is a shared output
+    #     add_3_40 = torch.add(add_2_39, add_78, alpha=1)
+    #     del add_78, add_2_39
+    #     # File "/data/weijiangxu/nnscaler/tests/parallel_module/test_gencode_pipeline.py", line 442, in forward,  x3 = x2 + self.w3
+    #     add_4_42 = torch.add(add_3_40, self.w3_41, alpha=1)
+    #     del add_3_40
+    #     return add_4_42
+
+
+class SharedOutputBoundaryModule(SharedOutputSegmentModule):
+    def __init__(self, case):
+        super().__init__()
+        self.case = case
+
+    def forward(self, data):
+        if self.case == 'value_producer':
+            x0 = torch.matmul(data, self.w0)
+        else:
+            x0 = data + self.w0
+        x1 = x0 + self.w1
+        if self.case == 'incompatible_consumers':
+            x1 = x1 + torch.relu(x0)
+        x2 = x1 + self.w2 + x0 + x0
+        x3 = x2 + self.w3
+        x4 = x3 + self.w4
+        x5 = x4 + self.w5
+        loss = torch.pow(x5, 2).sum()
+        if self.case == 'final_output':
+            return loss, x0
+        return loss
+
+
+def _shared_output_boundary_policy(graph, cfg, case):
+    from nnscaler.ir import IRSubTensor
+    from nnscaler.policies import OpPlan, OpPartition, get_pas_ops
+
+    stage_id = 0
+    for node in get_pas_ops(graph):
+        partition = None
+        if node.fn in (torch.add, torch.matmul):
+            weight = node.input(1)
+            is_weight = isinstance(weight, IRSubTensor) and weight.is_param()
+            if is_weight:
+                stage_id = 0 if weight.name in ('w0', 'w1') else 1
+            if node.fn == torch.matmul:
+                partition = OpPartition(input=1, dim=0)
+            elif not (case == 'full_next_stage' and stage_id == 1):
+                partition = OpPartition(input=0, dim=0)
+                if is_weight and weight.name == 'w0':
+                    partition = None if case == 'replicated_producer' else OpPartition(input=0, dim=1)
+        yield OpPlan(node, stage_id=stage_id, partition=partition)
+
+
+@replace_all_device_with('cpu')
+@pytest.mark.parametrize('case', ['final_output', 'incompatible_consumers'])
+def test_shared_output_pipeline_boundary_codegen(tmp_path, case):
+    """Check full-value requirements in an actual two-stage, TP=2 pipeline.
+
+    final_output:
+        x0 is consumed inside the pipeline and also returned alongside loss
+        as a final graph output. Its output identity must remain replicated;
+        being a sharded internal activation must not make the return partial.
+    incompatible_consumers:
+        A dim-0 add and a replicated ReLU consume x0 in stage 0. Their split
+        requirements are {0, 'rn'}, so there is no single compatible layout
+        for the output identity to follow.
+
+    Both cases assert that source ranks retain an all-gather. These are
+    communication checks; the end-to-end companion test checks returned
+    values and parameter gradients for the same cases.
+    """
+    parallelize(
+        SharedOutputBoundaryModule(case).train(),
+        {'data': torch.randn(4, 4)},
+        pas_policy=partial(_shared_output_boundary_policy, case=case),
+        compute_config=ComputeConfig(
+            4, 4,
+            constant_folding=False,
+            use_end2end=True,
+            pas_config={'pipeline_nmicros': 3, 'pipeline_scheduler': '1f1b'},
+        ),
+        gen_savedir=tmp_path,
+        load_module=False,
+        reuse='override',
+    )
+    for rank in (0, 1):
+        assert _gencode_contains(
+            tmp_path, SharedOutputBoundaryModule, rank,
+            r'nnscaler\.runtime\.adapter\.nn\.allgather_split\(',
+        )
 
 
 class SharedInputSegmentModule(torch.nn.Module):
