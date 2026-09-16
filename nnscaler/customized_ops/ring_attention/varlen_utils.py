@@ -41,6 +41,10 @@ def select_sequence_group_cu_seqlens(
     tracing ``process_group`` is absent and callers keep the combined metadata;
     generated distributed code supplies the group so this function selects and
     rebases the corresponding shard boundaries.
+
+    Groups must have equal total token counts, and group boundaries must align
+    with sequence boundaries. Unequal group token totals are unsupported:
+    cu_seqlens records sequence boundaries without separate group offsets.
     """
     sequence_group_count = int(sequence_group_count)
     if sequence_group_count < 1:
