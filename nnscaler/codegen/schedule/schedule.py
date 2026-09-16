@@ -469,61 +469,6 @@ class ScheduleCodeGen(FuncEmission):
                     for record_event in stream_context.record_events:
                         events.add(record_event)
 
-    def _emit_async_recv_waits(
-        self,
-        node: IRCell,
-        pending_async_recvs: dict,
-        produced_tids: Optional[set],
-    ) -> List[str]:
-        codes = []
-        seen_tids = set()
-        for inp in self._node_wait_inputs(node, produced_tids):
-            if not isinstance(inp, IRObject) or inp.tid not in pending_async_recvs or inp.tid in seen_tids:
-                continue
-            seen_tids.add(inp.tid)
-            adapter, pending_out = pending_async_recvs.pop(inp.tid)
-            adapter_name = self.node_name(adapter)
-            tensor_name = self.tensor_name(pending_out)
-            req_grad = isinstance(pending_out, IRTensor) and pending_out.requires_grad
-            codes.append(
-                f'{tensor_name} = nnscaler.runtime.executor.aexecute('
-                f'model.{adapter_name}_wait, *({tensor_name}, ), requires_grad={req_grad})'
-            )
-        return codes
-
-
-    def _node_wait_inputs(self, node: IRCell, produced_tids: Optional[set]) -> List[IRObject]:
-        unwrap_node = self._unwrap_node(node)
-        if isinstance(unwrap_node, IRSegment) and not node.isfw():
-            input_tensors, output_tensors, output_grads, _ = self.get_backward_callsite_io_tensors(node)
-            if produced_tids is not None:
-                filtered_ot, filtered_og = [], []
-                for output_tensor, output_grad in zip(output_tensors, output_grads):
-                    if output_grad is None or (
-                        isinstance(output_grad, IRSubTensor)
-                        and output_grad.tid in produced_tids
-                    ):
-                        filtered_ot.append(output_tensor)
-                        filtered_og.append(output_grad)
-                output_tensors = filtered_ot
-                output_grads = filtered_og
-            return IR.get_objects((input_tensors, output_tensors, output_grads))
-        return IR.get_objects(node.inputs())
-
-
-    def _track_async_recv(self, node: IRCell, pending_async_recvs: dict):
-        unwrap_node = self._unwrap_node(node)
-        if not CompileFlag.async_comm or not isinstance(unwrap_node, IRAdapter) or not self.is_async_recv_adapter(unwrap_node):
-            return
-        for out in IR.get_objects(node.outputs()):
-            if isinstance(out, IRObject):
-                pending_async_recvs[out.tid] = (unwrap_node, out)
-
-
-    def _unwrap_node(self, node: IRCell) -> IRCell:
-        return node.cell if isinstance(node, ExeReuseCell) else node
-
-
     def _collect_getitem_info(self, execplan: ExecutionPlan) -> Dict[int, _SampleAccess]:
         """Record replayable sample accesses using original IR IDs, not names.
 
@@ -828,3 +773,53 @@ class ScheduleCodeGen(FuncEmission):
             codes = [f'nnscaler.runtime.function.print_time({repr(type_str)})'] + codes
 
         return self._emit_stream_context(stream_context, codes)
+
+    def _emit_async_recv_waits(
+        self,
+        node: IRCell,
+        pending_async_recvs: dict,
+        produced_tids: Optional[set],
+    ) -> List[str]:
+        codes = []
+        seen_tids = set()
+        for inp in self._node_wait_inputs(node, produced_tids):
+            if not isinstance(inp, IRObject) or inp.tid not in pending_async_recvs or inp.tid in seen_tids:
+                continue
+            seen_tids.add(inp.tid)
+            adapter, pending_out = pending_async_recvs.pop(inp.tid)
+            adapter_name = self.node_name(adapter)
+            tensor_name = self.tensor_name(pending_out)
+            req_grad = isinstance(pending_out, IRTensor) and pending_out.requires_grad
+            codes.append(
+                f'{tensor_name} = nnscaler.runtime.executor.aexecute('
+                f'model.{adapter_name}_wait, *({tensor_name}, ), requires_grad={req_grad})'
+            )
+        return codes
+
+
+    def _node_wait_inputs(self, node: IRCell, produced_tids: Optional[set]) -> List[IRObject]:
+        unwrap_node = node.cell if isinstance(node, ExeReuseCell) else node
+        if isinstance(unwrap_node, IRSegment) and not node.isfw():
+            input_tensors, output_tensors, output_grads, _ = self.get_backward_callsite_io_tensors(node)
+            if produced_tids is not None:
+                filtered_ot, filtered_og = [], []
+                for output_tensor, output_grad in zip(output_tensors, output_grads):
+                    if output_grad is None or (
+                        isinstance(output_grad, IRSubTensor)
+                        and output_grad.tid in produced_tids
+                    ):
+                        filtered_ot.append(output_tensor)
+                        filtered_og.append(output_grad)
+                output_tensors = filtered_ot
+                output_grads = filtered_og
+            return IR.get_objects((input_tensors, output_tensors, output_grads))
+        return IR.get_objects(node.inputs())
+
+
+    def _track_async_recv(self, node: IRCell, pending_async_recvs: dict):
+        unwrap_node = node.cell if isinstance(node, ExeReuseCell) else node
+        if not CompileFlag.async_comm or not isinstance(unwrap_node, IRAdapter) or not self.is_async_recv_adapter(unwrap_node):
+            return
+        for out in IR.get_objects(node.outputs()):
+            if isinstance(out, IRObject):
+                pending_async_recvs[out.tid] = (unwrap_node, out)
