@@ -256,13 +256,6 @@ class ComputeConfig:
             if self.inference_only:
                 raise ValueError("use_fbw is not supported in inference mode.")
 
-            from nnscaler.runtime._patch_torch import FBW_SUPPORTED
-            if not FBW_SUPPORTED:
-                raise ValueError(
-                    "fbw is not supported in the current environment. "
-                    "Please update pytorch(2.5.0+) and/or python(3.10+) to a higher version."
-                )
-
     def apply_pipeline_scheduler(
             self,
             graph: IRGraph,
