@@ -469,8 +469,12 @@ def _shared_output_partition_policy(graph, cfg):
 
 @replace_all_device_with('cpu')
 def test_split_segment_with_shared_output(tmp_path):
-    """
-    Shared outputs with compatible consumers can stay partitioned across stages.
+    """Keep a shared activation sharded when producer and consumers use dim 0.
+
+    This three-stage pipeline has two TP ranks per stage. Stage 0 uses x0
+    locally to compute x1 and also exports x0 to stage 1. Rank 0 must not
+    gather x0 merely to pass it through the inserted output identity.
+    This is a codegen check; it does not execute distributed forward/backward.
     """
     m = SharedOutputSegmentModule()
     m.train()
@@ -551,7 +555,14 @@ def test_split_segment_with_shared_output(tmp_path):
 
 @replace_all_device_with('cpu')
 def test_shared_output_with_different_producer_partition(tmp_path):
-    """The shared producer uses dim 1; its local and next-stage consumers use dim 0."""
+    """Share one layout conversion between local use and cross-stage export.
+
+    Stage 0 produces x0 as column shards (dim 1), but its local consumer and
+    stage 1 both need row shards (dim 0). Each source rank must perform exactly
+    one all-to-all, then reuse its result for both branches without all-gather.
+    Receiver ranks must not gather the incoming shards either; otherwise the
+    redundant gather/resplit would only have moved to the receiving stage.
+    """
     from nnscaler.ir import IRSubTensor
     from nnscaler.policies import OpPlan, OpPartition, get_pas_ops
 
@@ -662,7 +673,14 @@ def test_shared_output_with_different_producer_partition(tmp_path):
 
 @replace_all_device_with('cpu')
 def test_shared_output_with_different_producer_partition_no_partition(tmp_path):
-    """The producer uses dim 1, the local consumer uses dim 0, and later consumers are replicated."""
+    """Preserve required receiver gathers when later consumers are replicated.
+
+    Stage 0 produces x0 along dim 1 and uses it locally along dim 0, while
+    stages 1 and 2 use complete tensors. Source ranks must still share one
+    all-to-all conversion and export row shards without gathering locally.
+    Each stage-1 rank must gather both incoming tensors, x0 and x1. This guards
+    against removing necessary communication along with the redundant gather.
+    """
     from nnscaler.ir import IRSubTensor
     from nnscaler.policies import OpPlan, OpPartition, get_pas_ops
 
@@ -820,6 +838,21 @@ def _shared_output_boundary_policy(graph, cfg, case):
 @replace_all_device_with('cpu')
 @pytest.mark.parametrize('case', ['final_output', 'incompatible_consumers'])
 def test_shared_output_pipeline_boundary_codegen(tmp_path, case):
+    """Check full-value requirements in an actual two-stage, TP=2 pipeline.
+
+    final_output:
+        x0 is consumed inside the pipeline and also returned alongside loss
+        as a final graph output. Its output identity must remain replicated;
+        being a sharded internal activation must not make the return partial.
+    incompatible_consumers:
+        A dim-0 add and a replicated ReLU consume x0 in stage 0. Their split
+        requirements are {0, 'rn'}, so there is no single compatible layout
+        for the output identity to follow.
+
+    Both cases assert that source ranks retain an all-gather. These are
+    communication checks; the end-to-end companion test checks returned
+    values and parameter gradients for the same cases.
+    """
     parallelize(
         SharedOutputBoundaryModule(case).train(),
         {'data': torch.randn(4, 4)},

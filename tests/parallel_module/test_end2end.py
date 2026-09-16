@@ -374,6 +374,47 @@ def _shared_output_boundary_worker(gen_savedir, case):
     'replicated_producer', 'value_producer', 'full_outputs', 'full_io',
 ])
 def test_shared_output_pipeline_outputs_and_gradients(tmp_path, case):
+    """Check numerical correctness of shared-output layouts and their fallbacks.
+
+    All cases run a two-stage, TP=2 pipeline on four GPUs with three
+    microbatches. Repeated uses of x0 and a squared loss exercise gradient
+    accumulation across branches and microbatches. Compare every rank's
+    returned outputs and all merged parameter gradients with eager execution;
+    only the loss, not the optional auxiliary output, drives backward.
+
+    compatible:
+        The producer uses dim 1, while local and downstream consumers agree
+        on dim 0. Check forward and backward through the shared all-to-all
+        conversion; "compatible" refers to the consumers, not the producer.
+    final_output:
+        Also return x0 as an auxiliary graph output. Check that every rank
+        receives the full eager value and that exporting it does not alter
+        the gradients contributed by the loss.
+    incompatible_consumers:
+        Add a replicated local ReLU alongside the dim-0 consumer. Check that
+        the full-value fallback preserves both branches' gradient contributions.
+    full_next_stage:
+        Replicate all downstream adds while the local consumer still uses
+        dim 0. Check reconstruction of complete inputs and backward transfer.
+    replicated_producer:
+        Replicate the producer but keep consumers partitioned along dim 0.
+        Check that redistributing a full activation neither duplicates nor
+        drops parameter-gradient contributions.
+    value_producer:
+        Partition matmul along its contraction dimension, producing partial
+        sums rather than index shards. Check their combination for the dim-0
+        consumers and the corresponding parameter gradients.
+    full_outputs:
+        Force output narrowing to return None, leaving input narrowing enabled.
+        Check that fn's partitioned identity remains correct when adapters must
+        reconstruct complete segment outputs.
+    full_io:
+        Force both input and output narrowing to return None. Check the same
+        partitioned operators with full segment boundaries in both directions.
+
+    Communication counts are deliberately checked by the codegen tests, not
+    by this numerical regression.
+    """
     results = launch_torchrun(4, _shared_output_boundary_worker, tmp_path, case)
     for result in results.values():
         torch.testing.assert_close(

@@ -947,6 +947,14 @@ class SharedOutputSplitModule(torch.nn.Module):
 
 @replace_all_device_with('cpu')
 def test_shared_output_split_insert_identity(tmp_path):
+    """Keep shared final outputs complete in non-pipeline tensor parallelism.
+
+    The dim-0-partitioned linear result x is consumed by sum and also returned
+    alongside the loss. Check for an output identity and the three expected
+    differentiable adapters: input split, output all-gather, and loss reduction.
+    This is the non-pipeline baseline; the pipeline boundary tests separately
+    exercise the final-output guard with pipeline staging enabled.
+    """
     m = SharedOutputSplitModule()
     m.train()
 
