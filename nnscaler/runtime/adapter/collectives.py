@@ -9,7 +9,6 @@ for non-autograd (e.g., inference) scenarios.
 Every collective is implemented using out-of-place semantics.
 """
 
-import io
 from typing import List, Tuple, Optional
 import warnings
 import torch
@@ -18,23 +17,6 @@ from nnscaler.runtime.device import DeviceGroup
 from nnscaler.profiler.timer import CudaTimer
 
 from nnscaler.runtime.executor import AsyncCommHandler
-
-
-def _serialize_object(obj) -> bytes:
-    buffer = io.BytesIO()
-    torch.save(obj, buffer)
-    return buffer.getvalue()
-
-def _deserialize_object(payload: bytes):
-    # Object collectives otherwise restore nested CUDA tensors on the sender's
-    # device, which is invalid when an IRObject crosses pipeline stages.
-    def map_location(storage, location):
-        if location.startswith('cuda'):
-            return storage.cuda(torch.cuda.current_device())
-        return None
-
-    return torch.load(
-        io.BytesIO(payload), map_location=map_location, weights_only=False)
 
 
 def move(tensor: Optional[torch.Tensor], shape: Tuple[int], dtype: torch.dtype, src: int, dst: int, async_op=False):
@@ -81,12 +63,12 @@ def move_object(obj, src: int, dst: int, async_op=False):
     CudaTimer().start(field_name='comm', predefined=True)
     rank = torch.distributed.get_rank()
     if rank == src:
-        torch.distributed.send_object_list([_serialize_object(obj)], dst=dst)
+        torch.distributed.send_object_list([obj], dst=dst)
     else:
         assert rank == dst
         obj_list = [None]
         torch.distributed.recv_object_list(obj_list, src=src)
-        obj = _deserialize_object(obj_list[0])
+        obj = obj_list[0]
     CudaTimer().stop(field_name='comm', predefined=True)
     return obj
 
@@ -146,6 +128,11 @@ def reduce_scatter(tensor: torch.Tensor, dim: int,
     for idx, t in enumerate(itensors):
         itensors[idx] = t.contiguous() if not t.is_contiguous() else t
     group = DeviceGroup().get_group(ranks)
+    group_ranks = torch.distributed.get_process_group_ranks(
+        group if group is not None else torch.distributed.group.WORLD)
+    # Input chunks follow the requested layout; the backend scatters in
+    # communicator order. Map each destination rank to its logical chunk.
+    itensors = [itensors[ranks.index(rank)] for rank in group_ranks]
     otensor = torch.empty_like(itensors[0], requires_grad=False)
     work = torch.distributed.reduce_scatter(otensor, itensors, group=group, async_op=async_op)
     if work:
@@ -386,13 +373,12 @@ def broadcast_object(obj, src: int, ranks: List[int], async_op=False):
     rank = torch.distributed.get_rank()
     group = DeviceGroup().get_group(ranks)
     if rank == src:
-        torch.distributed.broadcast_object_list(
-            [_serialize_object(obj)], src=src, group=group)
+        torch.distributed.broadcast_object_list([obj], src=src, group=group)
     else:
         assert rank in ranks
         obj_list = [None]
         torch.distributed.broadcast_object_list(obj_list, src=src, group=group)
-        obj = _deserialize_object(obj_list[0])
+        obj = obj_list[0]
 
     CudaTimer().stop(field_name='comm', predefined=True)
     return obj
