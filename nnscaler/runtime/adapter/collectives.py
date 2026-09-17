@@ -128,6 +128,11 @@ def reduce_scatter(tensor: torch.Tensor, dim: int,
     for idx, t in enumerate(itensors):
         itensors[idx] = t.contiguous() if not t.is_contiguous() else t
     group = DeviceGroup().get_group(ranks)
+    group_ranks = torch.distributed.get_process_group_ranks(
+        group if group is not None else torch.distributed.group.WORLD)
+    # Input chunks follow the requested layout; the backend scatters in
+    # communicator order. Map each destination rank to its logical chunk.
+    itensors = [itensors[ranks.index(rank)] for rank in group_ranks]
     otensor = torch.empty_like(itensors[0], requires_grad=False)
     work = torch.distributed.reduce_scatter(otensor, itensors, group=group, async_op=async_op)
     if work:
