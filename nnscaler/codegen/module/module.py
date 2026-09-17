@@ -200,12 +200,13 @@ class ModuleCodeGen(FuncEmission):
             rest_params_replicated = []
             rest_params_partitioned = []
 
-            def collect_rest_params(segment):
+            def collect_rest_params(segment: IRSegment):
                 """Resursively collect parameters. Note parameters can be in sub-segments,
                 which is invisible to its top-level segment."""
                 for param in segment.attributes():
                     if not param.is_param(): continue
                     for ctensor in segment.ctensors(param):
+                        if ctensor.grad is None: continue  # consumer is in `torch.no_grad()` scope
                         if device not in ctensor.device: continue
                         if ctensor not in all_params:
                             # a same parameter can be consumed multiple times by different operators
@@ -1196,7 +1197,7 @@ class ModuleCodeGen(FuncEmission):
 
     def _get_param_first_used_pos(self, segment: IRSegment) -> Dict[IRFullTensor, int]:
         """
-        Get the first used node index of each parameter in the segment.
+        Get the first gradient-producing use's node index for each parameter.
         """
         # get all the parameters in the segment
         first_used_pos: Dict[IRFullTensor, int] = {}
@@ -1204,7 +1205,10 @@ class ModuleCodeGen(FuncEmission):
         for i, node in enumerate(segment.nodes()):
             # parameters are used as inputs of the node
             for tin in IRSegment.get_objects_from_complex(node.inputs()):
-                if isinstance(tin, IRSubTensor) and tin.is_param() and tin.parent not in first_used_pos:
+                if (
+                    isinstance(tin, IRSubTensor) and tin.is_param()
+                    and tin.grad is not None and tin.parent not in first_used_pos
+                ):
                     first_used_pos[tin.parent] = i
 
         return first_used_pos

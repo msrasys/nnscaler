@@ -733,7 +733,7 @@ class PPSharedMultipleConsumersModel(torch.nn.Module):
 
 @replace_all_device_with('cpu')
 @pytest.mark.parametrize('pipeline_multiref_replicated_params', [None, False, True])
-def test_pp_shared_model_complex_comsumers(tmp_path, pipeline_multiref_replicated_params):
+def test_pp_shared_model_complex_consumers(tmp_path, pipeline_multiref_replicated_params):
     m = PPSharedMultipleConsumersModel(4)
     m.train()
     parallelize(

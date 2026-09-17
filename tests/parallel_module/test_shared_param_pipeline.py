@@ -517,15 +517,20 @@ def check_pipeline_training(pm, reference):
         ]
         reference_optimizer.zero_grad()
         expected_losses = [reference(sample) for sample in samples]
-        torch.stack(expected_losses).sum().backward()
+        scaling_factor = pm.compute_config.runtime_ngpus // pm.compute_config.plan_ngpus
+        (torch.stack(expected_losses).sum() * scaling_factor).backward()
         losses = pm.train_step(samples)
         assert len(losses) == len(expected_losses)
         for actual, expected in zip(losses, expected_losses):
             torch.testing.assert_close(actual, expected)
         for name, meta in pm.fullmap.items():
+            expected_grad = reference_params[meta.orig_name].grad
+            if expected_grad is None:
+                assert getattr(pm, name).grad is None
+                continue
             torch.testing.assert_close(
                 getattr(pm, name).grad,
-                reference_params[meta.orig_name].grad[meta.slicers],
+                expected_grad[meta.slicers],
             )
         optimizer.step()
         reference_optimizer.step()
@@ -584,6 +589,84 @@ def test_colocated_shared_param_pipeline(multiref, repeat_first, async_reducer):
 @pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.device_count() < 4, reason='lack of gpu devices')
 def test_colocated_shared_param_pipeline_async_fbw():
     torchrun(4, worker_colocated_shared_param, None, True, True, True)
+
+
+class ColocatedNoGradModel(Model):
+    def __init__(self, train_first):
+        super().__init__()
+        self.other = nn.Parameter(torch.randn(16, 16))
+        self.unused = nn.Parameter(torch.randn(16, 16))
+        self.bias = nn.Parameter(torch.randn(16))
+        self.train_first = train_first
+
+    def forward(self, x):
+        with torch.no_grad():
+            auxiliary = x @ self.weight + x @ self.unused
+        y = x @ self.other
+        if self.train_first:
+            y = y + x @ self.weight
+        x = torch.sigmoid(y + auxiliary) + self.bias
+        x = x @ self.weight
+        return x.sum()
+
+
+def policy_colocated_no_grad(graph, cfg):
+    stage = 0
+    for node in get_pas_ops(graph):
+        if node.fn == torch.sigmoid:
+            stage = 1
+        elif node.fn == torch.matmul and stage == 1:
+            stage = 2
+        elif node.name == 'sum':
+            stage = 3
+        yield OpPlan(node, stage_id=stage, partition=OpPartition(0, 0))
+
+
+def worker_colocated_no_grad(plan_ngpus, async_reducer, train_first, use_zero, use_fbw):
+    nnscaler.init()
+    torch.manual_seed(0)
+    model = ColocatedNoGradModel(train_first).double()
+    reference = copy.deepcopy(model).cuda()
+    config = ComputeConfig(
+        plan_ngpus, 4, use_end2end=True, use_async_reducer=async_reducer,
+        use_zero=use_zero, use_fbw=use_fbw,
+        pas_config={
+            'pipeline_size': 2,
+            'pipeline_nmicros': 4,
+            'pipeline_scheduler': '1f1b_interleaved',
+        },
+    )
+    directory = Path(tempfile.gettempdir()) / f'test_colocated_no_grad_{PYTEST_RUN_ID}'
+    with clear_dir_on_rank0(directory) as tempdir:
+        pm = parallelize(
+            model, {'x': torch.ones(4, 16, dtype=torch.float64)},
+            policy_colocated_no_grad, config,
+            gen_savedir=tempdir, reuse='override',
+        ).cuda()
+        check_pipeline_training(pm, reference)
+        names = {getattr(pm, name): meta.orig_name for name, meta in pm.fullmap.items()}
+        counts = {}
+        for reducer in pm.reducers:
+            assert reducer._nreplicas == 1
+            counts.update({
+                names[param]: count for param, count in reducer._param_num_segments.items()
+            })
+        expected = {'other': 1, 'weight': 2 if train_first else 1} if 'weight' in names.values() else {'bias': 1}
+        assert counts == expected
+
+
+@pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.device_count() < 4, reason='lack of gpu devices')
+@pytest.mark.parametrize('plan_ngpus,async_reducer,train_first,use_zero,use_fbw', [
+    (4, False, False, False, False),
+    (4, True, False, False, False),
+    (4, True, True, False, False),
+    (2, False, False, False, False),
+    (2, True, False, False, False),
+    (2, True, True, True, False),
+    (4, True, False, True, True),
+])
+def test_colocated_no_grad_pipeline(plan_ngpus, async_reducer, train_first, use_zero, use_fbw):
+    torchrun(4, worker_colocated_no_grad, plan_ngpus, async_reducer, train_first, use_zero, use_fbw)
 
 
 def worker_shared_param_gradients(plan_ngpus, partition_input, partition_dim):
