@@ -246,11 +246,14 @@ def _ordered_rank_worker(async_op):
     value = torch.tensor([rank], dtype=torch.int64)
     with patch.object(torch.distributed, 'get_process_group_ranks', explicit_group_ranks):
         gathered = nnscaler.runtime.adapter.all_gather(value, 0, ranks, async_op=async_op)
+        reduced = nnscaler.runtime.adapter.reduce_scatter(
+            torch.arange(4, dtype=torch.int64) + rank * 10, 0, ranks, async_op=async_op)
     if async_op:
         gathered = nnscaler.runtime.executor.AsyncCommHandler().wait(gathered)
+        reduced = nnscaler.runtime.executor.AsyncCommHandler().wait(reduced)
     chunked = nnscaler.runtime.adapter.chunk(
         torch.arange(4, dtype=torch.int64), 0, ranks)
-    return clone_to_cpu(gathered), clone_to_cpu(chunked)
+    return clone_to_cpu(gathered), clone_to_cpu(chunked), clone_to_cpu(reduced)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.device_count() < 4, reason='lack of gpu devices')
@@ -260,6 +263,7 @@ def test_collectives_respect_explicit_rank_order(async_op):
 
     expected_gather = torch.tensor([0, 2, 1, 3], dtype=torch.int64)
     expected_chunks = [0, 2, 1, 3]
-    for rank, (gathered, chunked) in results.items():
+    for rank, (gathered, chunked, reduced) in results.items():
         assert torch.equal(gathered, expected_gather)
         assert chunked.item() == expected_chunks[rank]
+        assert reduced.item() == 60 + 4 * expected_chunks[rank]
