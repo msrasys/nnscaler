@@ -6,6 +6,7 @@ import torch.nn as nn
 import tempfile
 import shutil
 import contextlib
+import copy
 import pytest
 from pathlib import Path
 
@@ -16,6 +17,7 @@ from nnscaler.ir.tensor import IRFullTensor
 from nnscaler.graph import IRGraph
 from nnscaler.ir.adapter import IRAdapter
 from nnscaler.parallel import ComputeConfig, parallelize, build_optimizer
+from nnscaler.policies import OpPartition, OpPlan, get_pas_ops
 from nnscaler.ir.operator import IRFwOperation, IRDataOperation
 from nnscaler.graph.segment import IRSegment
 from nnscaler.graph.schedule.predefined import PredefinedSched
@@ -474,3 +476,136 @@ def test_shared_param_error2(model_cls):
                 gen_savedir=tempdir,
                 load_module=False,
             )
+
+
+class ColocatedSharedModel(Model):
+    def __init__(self, repeat_first):
+        super().__init__()
+        self.bias = nn.Parameter(torch.randn(16))
+        self.repeat_first = repeat_first
+
+    def forward(self, x):
+        x = torch.matmul(x, self.weight)
+        if self.repeat_first:
+            x = torch.matmul(x, self.weight)
+        x = x + self.bias
+        x = torch.matmul(x, self.weight)
+        return x.sum()
+
+
+def policy_colocated_shared_param(graph, cfg):
+    stage = 0
+    for node in get_pas_ops(graph):
+        if node.fn == torch.add:
+            stage = 1
+        elif node.fn == torch.matmul and stage == 1:
+            stage = 2
+        elif node.name == 'sum':
+            stage = 3
+        yield OpPlan(node, stage_id=stage, partition=OpPartition(0, 0))
+
+
+def check_pipeline_training(pm, reference):
+    optimizer = build_optimizer(pm, torch.optim.SGD, lr=0.001)
+    reference_optimizer = torch.optim.SGD(reference.parameters(), lr=0.001)
+    reference_params = dict(reference.named_parameters())
+    for step in range(2):
+        samples = [
+            torch.arange(64, device='cuda', dtype=torch.float64).reshape(4, 16) / 64
+            + micro * 0.1 + step * 0.01
+            for micro in range(4)
+        ]
+        reference_optimizer.zero_grad()
+        expected_losses = [reference(sample) for sample in samples]
+        torch.stack(expected_losses).sum().backward()
+        losses = pm.train_step(samples)
+        assert len(losses) == len(expected_losses)
+        for actual, expected in zip(losses, expected_losses):
+            torch.testing.assert_close(actual, expected)
+        for name, meta in pm.fullmap.items():
+            torch.testing.assert_close(
+                getattr(pm, name).grad,
+                reference_params[meta.orig_name].grad[meta.slicers],
+            )
+        optimizer.step()
+        reference_optimizer.step()
+        for name, meta in pm.fullmap.items():
+            torch.testing.assert_close(
+                getattr(pm, name),
+                reference_params[meta.orig_name][meta.slicers],
+            )
+        optimizer.zero_grad()
+
+
+def worker_colocated_shared_param(multiref, repeat_first):
+    nnscaler.init()
+    torch.manual_seed(0)
+    model = ColocatedSharedModel(repeat_first).double()
+    reference = copy.deepcopy(model).cuda()
+    config = ComputeConfig(
+        4, 4, use_end2end=True,
+        pas_config={
+            'pipeline_size': 2,
+            'pipeline_nmicros': 4,
+            'pipeline_scheduler': '1f1b_interleaved',
+            'pipeline_multiref_replicated_params': multiref,
+        },
+    )
+    directory = Path(tempfile.gettempdir()) / f'test_colocated_shared_param_{PYTEST_RUN_ID}'
+    with clear_dir_on_rank0(directory) as tempdir:
+        pm = parallelize(
+            model, {'x': torch.ones(4, 16, dtype=torch.float64)},
+            policy_colocated_shared_param, config,
+            gen_savedir=tempdir, reuse='override',
+        ).cuda()
+        expected_name = 'weight' if pm.rank < 2 else 'bias'
+        assert {meta.orig_name for meta in pm.fullmap.values()} == {expected_name}
+        check_pipeline_training(pm, reference)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.device_count() < 4, reason='lack of gpu devices')
+@pytest.mark.parametrize('multiref', [False, True])
+@pytest.mark.parametrize('repeat_first', [False, True])
+def test_colocated_shared_param_pipeline(multiref, repeat_first):
+    torchrun(4, worker_colocated_shared_param, multiref, repeat_first)
+
+
+def worker_shared_param_gradients(plan_ngpus, partition_input, partition_dim):
+    nnscaler.init()
+    torch.manual_seed(0)
+    model = Model().double()
+    reference = copy.deepcopy(model).cuda()
+
+    def policy(graph, cfg):
+        stage = -1
+        for node in get_pas_ops(graph):
+            partition = 'auto'
+            if node.fn == torch.matmul:
+                stage += 1
+                partition = OpPartition(partition_input, partition_dim)
+            yield OpPlan(node, stage_id=stage, partition=partition)
+
+    config = ComputeConfig(
+        plan_ngpus, plan_ngpus, use_end2end=True,
+        pas_config={
+            'pipeline_size': 2,
+            'pipeline_nmicros': 4,
+            'pipeline_multiref_replicated_params': False,
+        },
+    )
+    directory = Path(tempfile.gettempdir()) / f'test_shared_param_gradients_{PYTEST_RUN_ID}'
+    with clear_dir_on_rank0(directory) as tempdir:
+        pm = parallelize(
+            model, {'x': torch.ones(4, 16, dtype=torch.float64)}, policy, config,
+            gen_savedir=tempdir, reuse='override',
+        ).cuda()
+        assert len(pm.reducers) == 1
+        check_pipeline_training(pm, reference)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.device_count() < 4, reason='lack of gpu devices')
+@pytest.mark.parametrize('plan_ngpus,partition_input,partition_dim', [
+    (2, 0, 0), (4, 0, 0), (4, 1, 0), (4, 1, 1),
+])
+def test_shared_param_pipeline_gradients(plan_ngpus, partition_input, partition_dim):
+    torchrun(plan_ngpus, worker_shared_param_gradients, plan_ngpus, partition_input, partition_dim)

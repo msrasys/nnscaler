@@ -203,6 +203,7 @@ class IRAdapterGener:
         sub_weights : Dict[IRFullTensor, List[IRSubTensor]],
         sub_weight_consumers: Dict[IRSubTensor, List[IRFwOperation]],
         sub_weight_devices: Dict[IRSubTensor, Tuple[int,...]],
+        consumer_segments: Dict[IRCell, IRSegment],
         reduce_replicated_params: bool
     ):
         """
@@ -210,6 +211,7 @@ class IRAdapterGener:
             1. Devices of all consumers have been expanded so that each consumer is on one device.
             2. Devices of all weights have been expanded so that each weight is on one device.
             3. All consumers of the same weight tensor should be either all partitioned or all replicated.
+            4. Gradient value maps are inferred independently within each consumer segment.
 
         group devices for pipeline parallelism (PP)
         - TP (partition/replicate): all consumers' outputs are sub-tensors of the same IRFullTensor parent(s),
@@ -317,10 +319,7 @@ class IRAdapterGener:
 
                 Reducer will be generated for ranks (0, 2) and ranks (1, 3) respectively.
         """
-        # key: full weight tensor,
-        # value: a list of output object parent ids of the consumers
-        # so len(value) is the number of different consumers
-        ftensor_consumer_outputs: dict[IRFullTensor, set[frozenset[int]]] = {}
+        weights_with_outputs: Set[IRFullTensor] = set()
         # key: device id, value: device ids in the same device group
         dev_groups: dict[int, frozenset[int]] = {}
         # key: device id, value: output object parent ids of the consumers
@@ -330,7 +329,7 @@ class IRAdapterGener:
                 key = frozenset(obj.parent.tid for obj in IR.get_objects(consumer.outputs()))
                 if not key: # unlikely to happen
                     continue
-                ftensor_consumer_outputs.setdefault(subw.parent, set()).add(key)
+                weights_with_outputs.add(subw.parent)
                 for k in key:
                     assert len(consumer.device) == 1, f"Device should have been expanded here"
                     dev_tids_groups.setdefault(consumer.device[0], set()).add(k)
@@ -352,31 +351,25 @@ class IRAdapterGener:
             dgs = [dev_groups[sw.device[0]] for sw in sub_ws]
             return not all(dgs[0] == dg for dg in dgs)
 
-        def _is_grad_replicated(sub_ws: List[IRSubTensor]) -> bool:
-            grads = [w.grad for w in sub_ws]
-            if not all(w.grad.indmap == grads[0].indmap for w in sub_ws): # partitioned
-                return False
-
-            device_grads = {}
+        def _is_grad_complete(sub_ws: List[IRSubTensor], *, per_device: bool = True) -> bool:
+            """Check each weight slice's gradient coverage, locally or across devices."""
+            value_maps = {}
             for sub in sub_ws:
                 grad = sub.grad
-                dev = sub.device[0]
-                device_grads.setdefault(dev, []).append(grad)
-
-            return all(ValueMap.is_complete(
-                [grad.valmap for grad in grads]) for grads in device_grads.values()
-            )
+                device = sub.device[0] if per_device else None
+                # Contributions from different segments have independent value maps.
+                key = (consumer_segments[sub.cell], grad.indmap, device)
+                value_maps.setdefault(key, []).append(grad.valmap)
+            return all(ValueMap.is_complete(maps) for maps in value_maps.values())
 
         reducer_info: List[Tuple[IRSubTensor, list[int], int]] = []
         for weight in sub_weights:
-            if weight not in ftensor_consumer_outputs:
+            if weight not in weights_with_outputs:
                 # means all consumers have no outputs.
                 # unlikely to happen
                 continue
             sub_ws = sub_weights[weight]
             deduped_sub_ws = set(sub_ws)
-            num_consumers = len(ftensor_consumer_outputs[weight])
-            deduped_grad_valmaps = set(sw.grad.valmap for sw in sub_ws)
 
             weight_all_devices = set(sw.device[0] for sw in sub_ws)
             if len(weight_all_devices) == 1:  # single device, no reducer is needed
@@ -393,9 +386,10 @@ class IRAdapterGener:
                     # | 3    | [3:4]           | c0(0/2) c1(2/4) c2(3/4) |
                     # all weights in different ranks are different (different portion of the full weight)
                     # no reducer is needed
-                    assert len(deduped_grad_valmaps) == num_consumers
-                elif len(deduped_grad_valmaps) == num_consumers: # replicated + no-grad-reduce
-                    # all gradients are full (valmap == (i, num_consumers))
+                    if not _is_grad_complete(sub_ws):
+                        raise RuntimeError(f"Incomplete local gradients for weight {weight}")
+                elif _is_grad_complete(sub_ws): # replicated + no-grad-reduce
+                    # Each device has the full gradient after local accumulation.
                     # for example, 4 gpus, 3 consumers (c0, c1, c2), weights shape (4, 4)
                     # | rank | weight portions | gradient valmap |
                     # |------|-----------------| -----------------|
@@ -415,7 +409,8 @@ class IRAdapterGener:
                         pass
                 else:  # replicated + grad-reduce
                     assert len(deduped_sub_ws) == 1
-                    assert len(deduped_grad_valmaps) == len(sub_ws)
+                    if not _is_grad_complete(sub_ws, per_device=False):
+                        raise RuntimeError(f"Incomplete reduced gradients for weight {weight}")
                     # all gradients are partitioned
                     # generate reducer to sum the partitioned gradients across device groups
                     # for example, 4 gpus, 3 consumers (c0, c1, c2), weights shape (4, 4)
@@ -429,6 +424,8 @@ class IRAdapterGener:
                         devices = sub_weight_devices[sw]
                         reducer_info.append((sw, devices, 1))
             elif len(deduped_sub_ws) > 1: # PP + all partitioned
+                if not _is_grad_complete(sub_ws, per_device=False):
+                    raise RuntimeError(f"Incomplete reduced gradients for weight {weight}")
                 # for example, device group0 (0, 1) device group1(2, 3), weights shape (4, 4)
                 # device 0 and device 2 consume weight[:, :2],
                 # device 1 and device 3 consume weight[:, 2:],
@@ -445,7 +442,7 @@ class IRAdapterGener:
                 # | 5(dg2)   | [2:4]           | c3(0/1)|
                 for sw in deduped_sub_ws:
                     reducer_info.append((sw, sub_weight_devices[sw], 1))
-            elif _is_grad_replicated(sub_ws): # PP + all replicated + no-grad-reduce
+            elif _is_grad_complete(sub_ws): # PP + all replicated + no-grad-reduce
                 assert len(deduped_sub_ws) == 1
                 # all device groups should have the same size (same number of replicas)
                 # for example, 6 gpus, device group 0(0, 1) device group 1(2, 3) device group 2(4, 5), weights shape (4, 4)
@@ -491,7 +488,9 @@ class IRAdapterGener:
                 #         reducer_info.append((sw, sorted(group_devs), 1))
             else: # PP + all replicated + grad_reduce
                 assert len(deduped_sub_ws) == 1
-                # all gradients are partitioned
+                if not _is_grad_complete(sub_ws, per_device=False):
+                    raise RuntimeError(f"Incomplete reduced gradients for weight {weight}")
+                # Contributions across devices must be complementary.
                 # generate reducer to sum the partitioned gradients across devices
                 # for example, 6 gpus, device group 0(0, 1) device group 1(2, 3) device group 2(4, 5), weights shape (4, 4)
                 # 4 consumers (c0, c1, c2, c3), c0 in dg0, c1/c2 in dg1, c3 in dg2, weights shape (4, 4)
@@ -530,6 +529,7 @@ class IRAdapterGener:
         """
         sub_weights : Dict[IRFullTensor, List[IRSubTensor]] = dict()
         sub_weight_consumers: Dict[IRSubTensor, List[IRFwOperation]] = dict()
+        consumer_segments: Dict[IRCell, IRSegment] = dict()
 
         def collect_sub_weight(graph: IRSegment):
             nonlocal sub_weights, sub_weight_consumers
@@ -537,6 +537,7 @@ class IRAdapterGener:
                 if not ftensor.is_param(): continue
                 for ctensor, consumer in zip(graph.ctensors(ftensor), graph.consumers(ftensor)):
                     if ctensor.grad is None: continue
+                    consumer_segments[consumer] = graph
                     sub_weight_consumers.setdefault(ctensor, []).append(consumer)
                     sub_weights.setdefault(ftensor, []).append(ctensor)
             for segment in graph.select(ntype=IRSegment, flatten=False):
@@ -607,6 +608,7 @@ class IRAdapterGener:
             sub_weights=sub_weights,
             sub_weight_consumers=sub_weight_consumers,
             sub_weight_devices=sub_weight_devices,
+            consumer_segments=consumer_segments,
             reduce_replicated_params=CompileFlag.reducer_replicated_params,
         )
         # merge reducers with the same device group/number of grad replicas number/number of weight replicas
