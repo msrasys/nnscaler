@@ -542,7 +542,7 @@ def check_pipeline_training(pm, reference):
         torch.testing.assert_close(pm.infer_step(samples), [reference(sample) for sample in samples])
 
 
-def worker_colocated_shared_param(multiref, repeat_first):
+def worker_colocated_shared_param(multiref, repeat_first, async_reducer=False, use_fbw=False):
     nnscaler.init()
     torch.manual_seed(0)
     model = ColocatedSharedModel(repeat_first).double()
@@ -555,7 +555,8 @@ def worker_colocated_shared_param(multiref, repeat_first):
     if multiref != 'default':
         pas_config['pipeline_multiref_replicated_params'] = multiref
     config = ComputeConfig(
-        4, 4, use_end2end=True, pas_config=pas_config,
+        4, 4, use_end2end=True, use_async_reducer=async_reducer, use_fbw=use_fbw,
+        pas_config=pas_config,
     )
     directory = Path(tempfile.gettempdir()) / f'test_colocated_shared_param_{PYTEST_RUN_ID}'
     with clear_dir_on_rank0(directory) as tempdir:
@@ -567,14 +568,22 @@ def worker_colocated_shared_param(multiref, repeat_first):
         expected_name = 'weight' if pm.rank < 2 else 'bias'
         assert {meta.orig_name for meta in pm.fullmap.values()} == {expected_name}
         assert len(pm.reducers) == (0 if multiref is True and pm.rank < 2 else 1)
+        for reducer in pm.reducers:
+            assert set(reducer._param_num_segments.values()) == {2 if pm.rank < 2 else 1}
         check_pipeline_training(pm, reference)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.device_count() < 4, reason='lack of gpu devices')
 @pytest.mark.parametrize('multiref', ['default', None, False, True])
 @pytest.mark.parametrize('repeat_first', [False, True])
-def test_colocated_shared_param_pipeline(multiref, repeat_first):
-    torchrun(4, worker_colocated_shared_param, multiref, repeat_first)
+@pytest.mark.parametrize('async_reducer', [False, True])
+def test_colocated_shared_param_pipeline(multiref, repeat_first, async_reducer):
+    torchrun(4, worker_colocated_shared_param, multiref, repeat_first, async_reducer)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.device_count() < 4, reason='lack of gpu devices')
+def test_colocated_shared_param_pipeline_async_fbw():
+    torchrun(4, worker_colocated_shared_param, None, True, True, True)
 
 
 def worker_shared_param_gradients(plan_ngpus, partition_input, partition_dim):
