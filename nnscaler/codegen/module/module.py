@@ -474,11 +474,14 @@ class ModuleCodeGen(FuncEmission):
         # and the current implementation is clearer and more robust.
         # key: parameter tensor, value: (segment index, node index)
         param_first_used_pos: Dict[IRFullTensor, Tuple[int, int]] = {}
+        param_num_segments: Dict[IRFullTensor, int] = {}
         for i, n in enumerate(sequence):
             if isinstance(n, IRSegment) and n.isfw():
                 for k, v in self._get_param_first_used_pos(n).items():
                     if k not in param_first_used_pos:
                         param_first_used_pos[k] = (i, v)
+                    # Repeated uses within one backward call share one AccumulateGrad hook.
+                    param_num_segments[k] = param_num_segments.get(k, 0) + 1
 
         attr_meta_map = {}
         # emit code
@@ -491,7 +494,7 @@ class ModuleCodeGen(FuncEmission):
             elif isinstance(node, IRAdapter):
                 codes = self.emit_adapter(node, prefix_attr='self.', async_op=CompileFlag.async_comm)
             elif isinstance(node, IRWeightReducer):
-                self.init_reducer(node, device, param_first_used_pos, as_parallel_module)
+                self.init_reducer(node, device, param_first_used_pos, param_num_segments, as_parallel_module)
                 codes = self.emit_reducer(node)
             elif isinstance(node, IRBpOperation):
                 continue
@@ -810,7 +813,8 @@ class ModuleCodeGen(FuncEmission):
     def init_reducer(self,
         node: IRWeightReducer,
         device: int,
-        param_first_used_pos: Dict[IRFullTensor, int],
+        param_first_used_pos: Dict[IRFullTensor, Tuple[int, int]],
+        param_num_segments: Dict[IRFullTensor, int],
         as_parallel_module: bool = True,
     ) -> None:
         """
@@ -843,7 +847,7 @@ class ModuleCodeGen(FuncEmission):
             "nreplicas={nreplicas})"
         )
         reducer_add = 'self.add_reducer({reducer})'
-        add_param = '{reducer}.add_param({weight})'
+        add_param = '{reducer}.add_param({weight}{num_segments})'
         # create reducer in declare region
         weights = node.inputs()
         reducer_name = f'self.wreducer{node._id}'
@@ -860,12 +864,13 @@ class ModuleCodeGen(FuncEmission):
         self.model_init_statements.append(init_code)
         # sort weights by first used time (which is gradient all-reduce time in reverse order)
         # so that weights with similar gradient all-reduce time are bucketed together
-        weights = [
-            self.tensor_name(t, prefix_attr='self.')
-            for t in sorted(weights, key=lambda t: param_first_used_pos[t.parent])
-        ]
+        weights = sorted(weights, key=lambda t: param_first_used_pos[t.parent])
         for weight in weights:
-            add_param_code = add_param.format(reducer=reducer_name, weight=weight)
+            num_segments = param_num_segments[weight.parent]
+            add_param_code = add_param.format(
+                reducer=reducer_name, weight=self.tensor_name(weight, prefix_attr='self.'),
+                num_segments=f', num_segments={num_segments}' if num_segments > 1 else '',
+            )
             self.model_init_statements.append(add_param_code)
         add_code = reducer_add.format(reducer=reducer_name)
         self.model_init_statements.append(add_code)

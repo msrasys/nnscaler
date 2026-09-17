@@ -913,9 +913,7 @@ def fn(
     parameters across stages. True inserts multiref; False skips it.
     None (the default) decides per parameter: skip multiref when the sharing stages
     use the same layout and physical device group, otherwise insert it.
-    Mixed layouts always require multiref regardless
-    of this option. Retaining colocated parameters does not currently support
-    asynchronous reducers with multiple gradient hooks per parameter per microbatch.
+    Mixed layouts always require multiref regardless of this option.
 
     A good way to locate the operator will be like:
     1. Locate the module first by module_class_chain (`target_module in node.module_class_chain`)
