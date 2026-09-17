@@ -37,6 +37,7 @@ class FxModuleParser:
     ATTR_CONTENT_FILE_STEM = 'fullmodel.pt'
     ATTR_CONTENT_FILE_0 = 'fullmodel.pt.0'
     ATTR_CONTENT_FILE_FORMAT = '{stem}.{idx}'
+    ATTR_CONTENT_INDEX_FILE = ATTR_CONTENT_FILE_STEM + '.index'
     ATTR_MAP_FILE = 'dist_param_map.pt'
     NON_PERSISTENT_BUFFER_FILE = 'npbuffer.pt'
 
