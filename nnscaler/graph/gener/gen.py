@@ -389,7 +389,7 @@ class IRAdapterGener:
                     if not _is_grad_complete(sub_ws):
                         raise RuntimeError(f"Incomplete local gradients for weight {weight}")
                 elif _is_grad_complete(sub_ws): # replicated + no-grad-reduce
-                    # Each device has the full gradient after local accumulation.
+                    # Each device of each segment has the full gradient after local accumulation.
                     # for example, 4 gpus, 3 consumers (c0, c1, c2), weights shape (4, 4)
                     # | rank | weight portions | gradient valmap |
                     # |------|-----------------| -----------------|
@@ -397,6 +397,15 @@ class IRAdapterGener:
                     # | 1    | [0:4]           | c0(0/2) c1(2/4) c2(3/4) |
                     # | 2    | [0:4]           | c0(0/2) c1(2/4) c2(3/4) |
                     # | 3    | [0:4]           | c0(0/2) c1(2/4) c2(3/4) |
+                    #
+                    # Two segments s0/s1 colocated on ranks (0, 1), same full weight:
+                    # | rank | s0 gradient valmap | s1 gradient valmap |
+                    # |------|--------------------|--------------------|
+                    # | 0    | c0(0/1)            | c1(0/2) c2(1/2)    |
+                    # | 1    | c0(0/1)            | c1(0/2) c2(1/2)    |
+                    # Each segment is locally complete; ranks replicate g_s0 + g_s1.
+                    # The segments' value maps are independent, not overlapping
+                    # pieces of one gradient. Optional averaging uses replicas=2.
                     assert len(deduped_sub_ws) == 1
                     if reduce_replicated_params:
                         # generate reducer across all replicas for better convergence
@@ -420,6 +429,15 @@ class IRAdapterGener:
                     # | 1    | [0:4]           | c0(1/8) c1(9/16) c2(13/16) |
                     # | 2    | [0:4]           | c0(2/8) c1(10/16) c2(14/16) |
                     # | 3    | [0:4]           | c0(3/8) c1(11/16) c2(15/16) |
+                    #
+                    # Two segments s0/s1 colocated on ranks (0, 1), same full weight:
+                    # | rank | s0 gradient valmap | s1 gradient valmap |
+                    # |------|--------------------|--------------------|
+                    # | 0    | c0(0/2)            | c1(1/2)            |
+                    # | 1    | c0(1/2)            | c1(0/2)            |
+                    # Combining maps across segments would falsely look complete
+                    # on each rank. Each segment is complete only across ranks:
+                    # SUM with replicas=1 produces g_s0 + g_s1.
                     for sw in deduped_sub_ws:
                         devices = sub_weight_devices[sw]
                         reducer_info.append((sw, devices, 1))
@@ -455,6 +473,14 @@ class IRAdapterGener:
                 # | 3(dg1)   | [0:4]           | c1(0/2) c2(1/2) |
                 # | 4(dg2)   | [0:4]           | c3(0/1)|
                 # | 5(dg2)   | [0:4]           | c3(0/1)|
+                #
+                # Colocated PP segments, same full weight on all four ranks:
+                # | ranks | segments and gradient valmaps |
+                # |-------|-------------------------------|
+                # | 0, 1  | s0: c0(0/1); s2: c2(0/1)     |
+                # | 2, 3  | s1: c1(0/1); s3: c3(0/1)     |
+                # Every segment's contribution has two replicas. SUM over all
+                # ranks divided by replicas=2 yields g_s0 + g_s1 + g_s2 + g_s3.
                 first_group_size = len(dev_groups[sub_ws[0].device[0]])
                 if any(
                     len(dev_groups[sw.device[0]]) != first_group_size
@@ -502,6 +528,16 @@ class IRAdapterGener:
                 # | 3(dg1)   | [0:4]           | c1(1/4) c2(3/4) |
                 # | 4(dg2)   | [0:4]           | c3(0/2)|
                 # | 5(dg2)   | [0:4]           | c3(1/2)|
+                #
+                # Colocated PP segments, same full weight on all four ranks:
+                # | rank | segments and gradient valmaps |
+                # |------|-------------------------------|
+                # | 0    | s0: c0(0/2); s2: c2(1/2)     |
+                # | 1    | s0: c0(1/2); s2: c2(0/2)     |
+                # | 2    | s1: c1(0/2); s3: c3(1/2)     |
+                # | 3    | s1: c1(1/2); s3: c3(0/2)     |
+                # Coverage must be complete across ranks separately for s0..s3;
+                # SUM with replicas=1 combines all four segment contributions.
                 for sw in deduped_sub_ws:
                     devices = sub_weight_devices[sw]
                     reducer_info.append((sw, devices, 1))
