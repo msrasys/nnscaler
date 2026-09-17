@@ -77,7 +77,7 @@ The `OpPlan` class defines the strategy for a single operator.
 
 ```python
 class OpPlan:
-    def __init__(self, op, partition='auto', recompute_id=-1, stage_id=-1, ...):
+    def __init__(self, op, partition='auto', recompute_id=-1, offload_id=-1, stage_id=-1, ...):
         ...
 ```
 
@@ -90,9 +90,16 @@ class OpPlan:
     *   Used to group operators for Recompute (Gradient Checkpointing).
     *   Operators with the same non-negative `recompute_id` will be grouped into a single recomputation block.
     *   These operators with the same `recompute_id` should be consecutive in the graph.
+*   **`offload_id`** (default: -1):
+    *   Used to group operators whose tensors saved for backward are offloaded to CPU.
+    *   Operators with the same non-negative `offload_id` must be consecutive and belong to the same pipeline stage.
+    *   `offload_id` and `recompute_id` cannot both be set on the same operator.
+    *   Dense strided tensors are copied asynchronously through pinned CPU memory. Unsupported layouts remain on their original device.
+    *   Each CPU-offload context forms one batch linked to the preceding live context in process-local forward order. On unpack, the runtime loads the demanded tensor first and then follows the linked batches in reverse pack order. `ParallelModule` reads `CPU_OFFLOADING_PREFETCH_LEVEL` once when the module is constructed; it defaults to 2 when unset, prefetching the next two tensors. Positive levels define a tensor lookahead: 1 prefetches the next tensor after the demanded tensor, 2 prefetches the next two, and so on, continuing into preceding batches when necessary. Level 0 loads only on demand. Negative levels count whole batches instead: -1 prefetches the current batch, -2 covers the current and immediately preceding batches, and larger absolute values follow more preceding batches. Set `module.cpu_offloading_prefetch_level` after construction to override the value for that module instance.
+    *   CPU-offload contexts must execute sequentially on one thread. Nested contexts and concurrent use from multiple threads are not supported.
 *   **`stage_id`** (default: -1):
     *   Used for Pipeline Parallelism assignment.
-    *   These operators with the same `stage_id` should be consecutive in the graph.    
+    *   These operators with the same `stage_id` should be consecutive in the graph.
 *   **`pre_hook` / `post_hook`**:
     *   You can attach custom Python functions to be executed before or after the operator. See source code for signature details.
 
