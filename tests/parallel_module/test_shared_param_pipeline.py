@@ -547,14 +547,15 @@ def worker_colocated_shared_param(multiref, repeat_first):
     torch.manual_seed(0)
     model = ColocatedSharedModel(repeat_first).double()
     reference = copy.deepcopy(model).cuda()
+    pas_config = {
+        'pipeline_size': 2,
+        'pipeline_nmicros': 4,
+        'pipeline_scheduler': '1f1b_interleaved',
+    }
+    if multiref != 'default':
+        pas_config['pipeline_multiref_replicated_params'] = multiref
     config = ComputeConfig(
-        4, 4, use_end2end=True,
-        pas_config={
-            'pipeline_size': 2,
-            'pipeline_nmicros': 4,
-            'pipeline_scheduler': '1f1b_interleaved',
-            'pipeline_multiref_replicated_params': multiref,
-        },
+        4, 4, use_end2end=True, pas_config=pas_config,
     )
     directory = Path(tempfile.gettempdir()) / f'test_colocated_shared_param_{PYTEST_RUN_ID}'
     with clear_dir_on_rank0(directory) as tempdir:
@@ -565,11 +566,12 @@ def worker_colocated_shared_param(multiref, repeat_first):
         ).cuda()
         expected_name = 'weight' if pm.rank < 2 else 'bias'
         assert {meta.orig_name for meta in pm.fullmap.values()} == {expected_name}
+        assert len(pm.reducers) == (0 if multiref is True and pm.rank < 2 else 1)
         check_pipeline_training(pm, reference)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.device_count() < 4, reason='lack of gpu devices')
-@pytest.mark.parametrize('multiref', [False, True])
+@pytest.mark.parametrize('multiref', ['default', None, False, True])
 @pytest.mark.parametrize('repeat_first', [False, True])
 def test_colocated_shared_param_pipeline(multiref, repeat_first):
     torchrun(4, worker_colocated_shared_param, multiref, repeat_first)
