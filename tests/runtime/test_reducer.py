@@ -611,6 +611,7 @@ def test_manual_grad_ready_uses_async_vpp_expected_contribution_count():
     reducer = Reducer([0, 1], async_op=True)
     reducer.add_param(param)
     reducer.build_buckets()
+    reducer.grad_accumulation_steps = 1
     reducer.set_async_grad_expected_counts({param: 2})
     bucket = reducer.buckets[0]
     bucket._launch_async_reduce = Mock()
@@ -627,6 +628,57 @@ def test_manual_grad_ready_uses_async_vpp_expected_contribution_count():
     assert bucket._async_seen_param_cnt[param] == 2
     assert bucket._async_param_cnt == bucket._async_expected_total == 2
     assert param.grad is None
+
+
+@mock_reducer_env(0, 2)
+def test_scheduled_counts_override_uniform_accumulation_each_step():
+    ordinary = torch.nn.Parameter(torch.zeros(2))
+    shared = torch.nn.Parameter(torch.zeros(2))
+    reducer = Reducer([0, 1], async_op=True)
+    for param in (ordinary, shared):
+        reducer.add_param(param)
+    reducer.build_buckets()
+    assert len(reducer.buckets) == 1
+    bucket = reducer.buckets[0]
+    bucket._launch_async_reduce = Mock()
+
+    for microbatches in (12, 2):
+        with patch("torch.cuda.synchronize"):
+            reducer.zero_grad()
+        bucket._launch_async_reduce.reset_mock()
+        # ParallelModule.train_step sets this before the generated schedule.
+        reducer.grad_accumulation_steps = microbatches
+        reducer.set_async_grad_expected_counts({
+            ordinary: microbatches, shared: 3 * microbatches,
+        })
+        assert reducer.grad_accumulation_steps == bucket.grad_accumulation_steps == 0
+        for index in range(3 * microbatches):
+            loss = shared.sum() * 2
+            if index < microbatches:
+                loss = loss + ordinary.sum()
+            loss.backward()
+            if index < 3 * microbatches - 1:
+                bucket._launch_async_reduce.assert_not_called()
+        bucket._launch_async_reduce.assert_called_once_with()
+        assert bucket._async_seen_param_cnt == {
+            ordinary: microbatches, shared: 3 * microbatches,
+        }
+        for param, expected in ((ordinary, microbatches), (shared, 6 * microbatches)):
+            offset = bucket._pofset[param]
+            assert torch.equal(bucket._contiguous_grads[offset:offset + 2],
+                               torch.full((2,), float(expected)))
+        with pytest.raises(RuntimeError, match='more async reducer gradient contributions'):
+            shared.sum().backward()
+
+    # An ordinary unscheduled caller can explicitly select uniform mode again.
+    with patch("torch.cuda.synchronize"):
+        reducer.zero_grad()
+    reducer.grad_accumulation_steps = 2
+    bucket._launch_async_reduce.reset_mock()
+    (ordinary.sum() + shared.sum()).backward()
+    bucket._launch_async_reduce.assert_not_called()
+    (ordinary.sum() + shared.sum()).backward()
+    bucket._launch_async_reduce.assert_called_once_with()
 
 
 @mock_reducer_env(0, 2)

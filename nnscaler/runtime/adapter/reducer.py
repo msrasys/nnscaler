@@ -1517,6 +1517,9 @@ class Reducer:
         """
         if not self._async:
             return
+        # A scheduled PP/VPP plan supersedes train_step's uniform microbatch
+        # count: shared parameters can contribute in several backward segments.
+        self.grad_accumulation_steps = 0
         for bucket in self._buckets:
             bucket.set_async_grad_expected_counts(param_counts)
 
