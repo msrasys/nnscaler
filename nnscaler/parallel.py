@@ -1,6 +1,7 @@
 #  Copyright (c) Microsoft Corporation.
 #  Licensed under the MIT License.
 
+from concurrent.futures import ProcessPoolExecutor
 from enum import Enum
 from functools import partial
 import types
@@ -9,6 +10,7 @@ from pathlib import Path
 import inspect
 import sys
 import importlib
+import multiprocessing
 from dataclasses import dataclass, asdict, field, replace
 from contextlib import contextmanager
 import logging
@@ -17,6 +19,7 @@ import os
 from collections import OrderedDict, defaultdict
 import pickle
 
+import dill
 import torch
 import torch.distributed
 
@@ -68,11 +71,13 @@ from nnscaler.utils import (
     OptStateDict,
     copy_dynamic,
     broadcast_files,
-    first
+    first,
+    recursion_limit,
 )
 
 logger = logging.getLogger(__name__)
 
+DILL_RECURSION_LIMIT = 10000
 
 _PREDEFINE_SCHEDS: Dict[str, Callable[[IRGraph, int, int], SchedulePlan]] = {}
 _PREDEFINED_INFERENCE_SCHEDS = ['infer_pipe']
@@ -250,13 +255,6 @@ class ComputeConfig:
                 raise ValueError("use_fbw is only supported in end2end mode.")
             if self.inference_only:
                 raise ValueError("use_fbw is not supported in inference mode.")
-
-            from nnscaler.runtime._patch_torch import FBW_SUPPORTED
-            if not FBW_SUPPORTED:
-                raise ValueError(
-                    "fbw is not supported in the current environment. "
-                    "Please update pytorch(2.5.0+) and/or python(3.10+) to a higher version."
-                )
 
     def apply_pipeline_scheduler(
             self,
@@ -863,6 +861,62 @@ def _gen_graph(
     return graph, forward_args
 
 
+def _gen_rank_code(
+    mgener: ModuleCodeGen,
+    sgener: Optional[ScheduleCodeGen],
+    compute_config: ComputeConfig,
+    forward_args: Dict[str, Any],
+    compile_flags: Dict[str, Any],
+    rank: int,
+    outfile: str,
+) -> Tuple[int, Dict[str, Any]]:
+    attr_meta_map = {}
+    with _flags(CompileFlag, **compile_flags):
+        mgener.gen(
+            rank,
+            forward_args=forward_args,
+            outfile=outfile,
+            attach=False,
+            as_parallel_module=True,
+            end2end_mode=compute_config.use_end2end,
+            out_attr_meta_map=attr_meta_map,
+        )
+        if sgener is not None:
+            sgener.gen(
+                device=rank,
+                outfile=outfile,
+                attach=True,
+            )
+    return rank, attr_meta_map[rank]
+
+
+_GenRankCodeArgs = Tuple[
+    ModuleCodeGen,
+    Optional[ScheduleCodeGen],
+    ComputeConfig,
+    Dict[str, Any],
+    Dict[str, Any],
+]
+_gen_rank_code_worker_args: Optional[_GenRankCodeArgs] = None
+
+
+def _init_gen_rank_code_worker(dilled_codegen: bytes) -> None:
+    global _gen_rank_code_worker_args
+    # IRObjects back-reference their owning cells, making large graph pickle traversals deep.
+    with recursion_limit(DILL_RECURSION_LIMIT, increase_only=True):
+        _gen_rank_code_worker_args = dill.loads(dilled_codegen)
+
+
+def _gen_rank_code_worker(
+        rank: int,
+        outfile: str,
+) -> bytes:
+    if _gen_rank_code_worker_args is None:
+        raise RuntimeError('Code generation worker is not initialized')
+    with recursion_limit(DILL_RECURSION_LIMIT, increase_only=True):
+        return dill.dumps(_gen_rank_code(*_gen_rank_code_worker_args, rank, outfile))
+
+
 def _gencode(
         module_or_module_class: torch.nn.Module,
         dummy_forward_args: Dict[str, Any],
@@ -873,6 +927,7 @@ def _gencode(
         module_dtype:  Optional[torch.dtype] = None,
         module_fn: Optional[Callable[[], torch.nn.Module]] = None,
         autoset_requires_grad: bool = True,
+        max_workers: int = 1,
     ) -> RegenStatus:
     """
     Generate parallel module source code from a torch module, and save it to file.
@@ -893,9 +948,19 @@ def _gencode(
         module_dtype (Optional[torch.dtype]): the dtype of the module. Keep as it is when it is None.
         module_fn (Optional[Callable[[], torch.nn.Module]]): the function to create the module. Will use __init__ if it is None.
         autoset_requires_grad (bool): whether to automatically set the requires_grad of input tensors.
+        max_workers (int): the maximum number of worker processes to use.
+            When max_workers is 1, code generation will be done in the main process.
+            When max_workers is greater than 1, the caller must use an import-safe entry
+            point guarded by ``if __name__ == '__main__':`` because workers use spawn.
     Returns:
         RegenStatus: which part is regenerated.
     """
+
+    if not isinstance(max_workers, int):
+        raise TypeError(f"max_workers must be an int, but got {type(max_workers).__name__}")
+    if max_workers < 1:
+        raise ValueError(f"max_workers must be >= 1, but got {max_workers}")
+
     graph_ckp = outdir / _GRAPH_DUMP_FILE
     forward_args_ckp = outdir / _FORWARD_ARGS_DUMP_FILE
     origin_module_metadata_ckp = outdir / ParallelModule.ORIGIN_MODULE_METADATA_FILE
@@ -1002,30 +1067,58 @@ def _gencode(
 
     # code generation
     assert len(repr_execplan.graph.device) == compute_config.plan_ngpus, f"{repr_execplan.graph.device}"
+
     mgener = ModuleCodeGen(repr_execplan, compute_config.runtime_ngpus)
     sgener = None
     attr_merged_meta_map = {}
     if compute_config.use_end2end:
         sgener = ScheduleCodeGen(execplan, compute_config.runtime_ngpus)
-    for rank in range(compute_config.runtime_ngpus):
-        fname = outdir / _GENCODE_FILE_TEMPLATE.format(rank)
-        mgener.gen(
-            rank,
-            forward_args=forward_args,
-            outfile=fname,
-            attach=False,
-            as_parallel_module=True,
-            end2end_mode=compute_config.use_end2end,
-            out_attr_meta_map=attr_merged_meta_map,
-        )
-        # generate temporal schedule code only for end2end module
-        # because the code generated is wrong for non-end2end module.
-        if compute_config.use_end2end:
-            sgener.gen(
-                device=rank,
-                outfile=fname,
-                attach=True
-            )
+
+    # this is necessary because we are using `spawn`,
+    # and need to pass the compile flags to the child processes
+    # Currently we assume only two global configs are needed in codegen:
+    # 1. CompileFlag (passed explicitly to _gen_rank_code)
+    # 2. CustomizedOps.kOpEmit (is cached in nnscaler.codegen.frontend_mapping.Sign2EmitRule)
+    # IDGenerator state is ignored,because it doesn't affect codegen
+    # TODO: Are there more global configs?
+    #      `fork` can keep all global state, but python doesn't recommend it for CUDA/PyTorch,
+    #       and `spawn` is more robust.
+    compile_flags = {
+        name: value
+        for name, value in vars(CompileFlag).items()
+        if not name.startswith('_')
+    }
+
+    codegen_args = (mgener, sgener, compute_config, forward_args, compile_flags)
+    rank_args = [
+        (rank, str(outdir / _GENCODE_FILE_TEMPLATE.format(rank)))
+        for rank in range(compute_config.runtime_ngpus)
+    ]
+    if max_workers == 1 or compute_config.runtime_ngpus == 1:
+        rank_results = [_gen_rank_code(*codegen_args, *rank_arg) for rank_arg in rank_args]
+    else:
+        # pickle doesn't work for graph/codegen objects, so use dill for worker payloads.
+        # ExecutePlan is too complex. default recursion limit is too low for dill to serialize it.
+        # To further reduce the serialization overhead,
+        # we use a custom pickling context that removes `_cell` from IRObject's state.
+        # TODO: Currently it looks safe, but should we restore `_cell`(using similar approach as IRGraph.from_dill) after unpickling
+        with recursion_limit(DILL_RECURSION_LIMIT, increase_only=True), graph.no_cell_pickle_context():
+            dilled_codegen = dill.dumps(codegen_args)
+        # Avoid inheriting parent CUDA/PyTorch runtime state through fork.
+        mp_context = multiprocessing.get_context('spawn')
+        with ProcessPoolExecutor(
+            max_workers=max_workers,
+            mp_context=mp_context,
+            initializer=_init_gen_rank_code_worker,
+            initargs=(dilled_codegen,),
+        ) as executor:
+            futures = [
+                executor.submit(_gen_rank_code_worker, *rank_arg)
+                for rank_arg in rank_args
+            ]
+            rank_results = [dill.loads(future.result()) for future in futures]
+
+    attr_merged_meta_map.update(rank_results)
 
     for rank in range(compute_config.plan_ngpus, compute_config.runtime_ngpus):
         assert attr_merged_meta_map[rank] == attr_merged_meta_map[rank % compute_config.plan_ngpus], \
@@ -1100,6 +1193,7 @@ def parallelize(
     build_module_buckets: bool = True,
     broadcast_strategy: Union[str, BroadcastGenFilesStrategy] = 'none',
     autoset_requires_grad: bool = True,
+    max_workers: int = 1,
 ) -> Union[None, ParallelModule, Type[ParallelModule]]:
     """
     Convert a torch.nn.Module object or class to ParallelModule object or class.
@@ -1189,6 +1283,10 @@ def parallelize(
             If true, we will automatically set requires_grad according to compute_config and tensor dtypes.
             Note set requires_grad to True for end2end module is not useful,
             and this argument is mainly for non-end2end module.
+        max_workers (int): the maximum number of worker processes to use for code generation.
+            When max_workers is 1, code generation will be done in the main process.
+            When max_workers is greater than 1, the caller must use an import-safe entry
+            point guarded by ``if __name__ == '__main__':`` because workers use spawn.
     Returns:
         Union[ParallelModule, Type[ParallelModule], None]:
             if load_module flag is set, return the converted ParallelModule object or class
@@ -1206,6 +1304,11 @@ def parallelize(
         (inspect.isclass(module_or_module_class) and issubclass(module_or_module_class, CubeModule))
     ):
         raise RuntimeError("Old style CubeModule is not supported")
+
+    if not isinstance(max_workers, int):
+        raise TypeError(f"max_workers must be an int, but got {type(max_workers).__name__}")
+    if max_workers < 1:
+        raise ValueError(f"max_workers must be >= 1, but got {max_workers}")
 
     if isinstance(pas_policy, str):
         if not pas_policy in _PREDEFINED_POLICIES:
@@ -1237,16 +1340,19 @@ def parallelize(
             if not reusable:
                 config_file = outdir / ParallelModule.COMPUTE_CONFIG_FILE
                 ComputeConfig.safe_dump_to_file(compute_config, config_file)  # always refresh compute config
-                with _compile_flags(compute_config):
+                # Deep copy the compute config to avoid modifying the original one during code generation.
+                gencode_compute_config = copy.deepcopy(compute_config)
+                with _compile_flags(gencode_compute_config):
                     regen_status = _gencode(
                         module_or_module_class,
                         dummy_forward_args,
                         pas_policy,
-                        compute_config,
+                        gencode_compute_config,
                         outdir,
                         module_dtype=module_dtype,
                         module_fn=module_fn,
                         autoset_requires_grad=autoset_requires_grad,
+                        max_workers=max_workers
                     )
             else:
                 regen_status = RegenStatus.NONE

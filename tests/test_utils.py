@@ -3,13 +3,33 @@
 
 from collections import OrderedDict
 from dataclasses import dataclass
+import sys
 import pytest
 import torch
 
 from nnscaler.utils import (
     select_many, classproperty, fields, set_member_by_name, unchecked_fields,
-    transform_recursively, first, first_or, StepwiseConfig,
+    transform_recursively, first, first_or, StepwiseConfig, recursion_limit,
 )
+
+
+def test_recursion_limit():
+    original_limit = sys.getrecursionlimit()
+    temporary_limit = original_limit + 100
+
+    with recursion_limit(temporary_limit):
+        assert sys.getrecursionlimit() == temporary_limit
+
+        with recursion_limit(original_limit, increase_only=True):
+            assert sys.getrecursionlimit() == temporary_limit
+
+    assert sys.getrecursionlimit() == original_limit
+
+    with pytest.raises(RuntimeError):
+        with recursion_limit(temporary_limit):
+            raise RuntimeError
+
+    assert sys.getrecursionlimit() == original_limit
 
 
 def test_select_many():

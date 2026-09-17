@@ -973,6 +973,7 @@ def tracing_from_weights_worker(tmp_path):
             '--max_train_steps', '-1',
             '--compute_config.plan_ngpus', '1',
             '--compute_config.runtime_ngpus', '1',
+            '--gen_max_workers', '2',
             '--broadcast_strategy', 'none',
             '--model.type', 'tests.cli.common.MixedModule',
             *additional_args,

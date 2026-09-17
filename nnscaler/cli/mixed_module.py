@@ -235,6 +235,7 @@ class ModuleParallelizeConfigAdapter(PrecisionMixin, PolicyMixin):
             broadcast_strategy=self.broadcast_strategy,
             load_module=load_module,
             autoset_requires_grad=self.autoset_requires_grad,
+            max_workers=self.trainer_args.gen_max_workers,
         )
         if load_module:
             pmodel = pmodel_class(init_params=init_params, build_buckets=False)
