@@ -909,6 +909,14 @@ def fn(
         or get the full name of the parameter by `tensor.name`, etc.
     9. insert anchors in code with `nnscaler.anchor` to help locate the operator (intrusive way).
 
+    cfg.pas_config['pipeline_multiref_replicated_params'] controls shared replicated
+    parameters across stages. True inserts multiref; False skips it.
+    None (the default) decides per parameter: skip multiref when the sharing stages
+    use the same layout and physical device group, otherwise insert it.
+    Mixed layouts always require multiref regardless
+    of this option. Retaining colocated parameters does not currently support
+    asynchronous reducers with multiple gradient hooks per parameter per microbatch.
+
     A good way to locate the operator will be like:
     1. Locate the module first by module_class_chain (`target_module in node.module_class_chain`)
     2. If the module are used multiple times (e.g., in ModuleList),
@@ -1158,7 +1166,7 @@ def fn(
     nmicros = cfg.pas_config.get('pipeline_nmicros', None)
     scheduler = cfg.pas_config.get('pipeline_scheduler', '1f1b')
     pp_multiref_replicated_params = \
-        cfg.pas_config.get('pipeline_multiref_replicated_params', True)
+        cfg.pas_config.get('pipeline_multiref_replicated_params', None)
 
     if pp_enabled:
         if not cfg.use_end2end:
@@ -1192,8 +1200,18 @@ def fn(
             continue
         splits = set(k for v in stage_info.values() for k in v)
         find_replicated = 'rr' in splits or 'rn' in splits
+        multiref_replicated_param = pp_multiref_replicated_params
+        if multiref_replicated_param is None:
+            # Same-layout uses in stages on one physical device group can keep the parameter local.
+            is_colocated_param = (
+                nstages > pp_size and len(stage_info) > 1
+                # all uses are colocated on the same physical device group
+                and len({stage_id % pp_size for stage_id in stage_info}) == 1
+                and len(splits) == 1
+            )
+            multiref_replicated_param = not is_colocated_param
         splits = list(splits)
-        # For safety, we will add multiref when detecting shared param are all replicated for pipeline parallelism.
+        # Unless colocated uses are retained, add multiref for shared replicated parameters.
         # The reason is that stages may have different number of devices, it is hard to synchronize gradients directly
         # by inserting reducers although weights are all REPLICAED.
 
@@ -1211,7 +1229,7 @@ def fn(
         # 4. (2) and (3): if the param is shared across stages and is replicated in at least one stage.
         #    Note: the case when some is replicated and some is partitioned is handled by (1).
 
-        if len(splits) > 1 or (pp_multiref_replicated_params and len(stage_info) > 1 and find_replicated):
+        if len(splits) > 1 or (multiref_replicated_param and len(stage_info) > 1 and find_replicated):
             _logger.info(f'add multiref for shared param {ftensor}')
             consumers = graph.consumers(ftensor)
             multiref_node = graph.multiref(ftensor, comment='shared param')
