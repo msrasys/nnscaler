@@ -536,6 +536,11 @@ def check_pipeline_training(pm, reference):
             )
         optimizer.zero_grad()
 
+    with torch.inference_mode():
+        pm.eval()
+        reference.eval()
+        torch.testing.assert_close(pm.infer_step(samples), [reference(sample) for sample in samples])
+
 
 def worker_colocated_shared_param(multiref, repeat_first):
     nnscaler.init()
