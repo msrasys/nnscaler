@@ -35,7 +35,7 @@ class LlamaRotaryEmbedding(torch.nn.Module):
         return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
 
 
-class TestModule(torch.nn.Module):
+class RotaryEmbeddingModule(torch.nn.Module):
     def __init__(self) -> None:
         super().__init__()
         self.rotary_emb = LlamaRotaryEmbedding(128)
@@ -51,7 +51,7 @@ class TestModule(torch.nn.Module):
 @replace_all_device_with('cpu')
 def test_requires_grad():
     with tempfile.TemporaryDirectory() as tempdir:
-        model = TestModule()
+        model = RotaryEmbeddingModule()
         dummy_input = {'x': torch.rand(1, 100, 128), 'position_ids': torch.arange(0, 100, dtype=torch.int64).reshape(1, 100)}
         graph = convert_model(model, dummy_input, tempdir)
 
