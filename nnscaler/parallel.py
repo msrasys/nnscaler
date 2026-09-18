@@ -256,13 +256,6 @@ class ComputeConfig:
             if self.inference_only:
                 raise ValueError("use_fbw is not supported in inference mode.")
 
-            from nnscaler.runtime._patch_torch import FBW_SUPPORTED
-            if not FBW_SUPPORTED:
-                raise ValueError(
-                    "fbw is not supported in the current environment. "
-                    "Please update pytorch(2.5.0+) and/or python(3.10+) to a higher version."
-                )
-
     def apply_pipeline_scheduler(
             self,
             graph: IRGraph,
@@ -717,6 +710,9 @@ def _prepare_and_check_reusable(
         expected_output_files.append(outdir / _FORWARD_ARGS_DUMP_FILE)
         expected_output_files.append(outdir / ParallelModule.ORIGIN_MODULE_METADATA_FILE)
         expected_output_files.append(outdir / FxModuleParser.NON_PERSISTENT_BUFFER_FILE)
+        index_file = outdir / FxModuleParser.ATTR_CONTENT_INDEX_FILE
+        if index_file.exists():
+            expected_output_files.append(index_file)
 
         existing_attr_map_files = set(outdir.glob(f'{ParallelModule.ATTR_META_FILE_PREFIX}*.pkl'))
 
@@ -738,7 +734,10 @@ def _prepare_and_check_reusable(
             f for f in outdir.glob('*')
             if f.is_file() and (  # just take fullmodel.pt.0 to compare
                 not f.name.startswith(FxModuleParser.ATTR_CONTENT_FILE_STEM)
-                or f.name == FxModuleParser.ATTR_CONTENT_FILE_0
+                or f.name in (
+                    FxModuleParser.ATTR_CONTENT_FILE_0,
+                    FxModuleParser.ATTR_CONTENT_INDEX_FILE,
+                )
             ) and f not in existing_attr_map_files  # will manually check the attr map files
         ]
 
@@ -1341,12 +1340,14 @@ def parallelize(
             if not reusable:
                 config_file = outdir / ParallelModule.COMPUTE_CONFIG_FILE
                 ComputeConfig.safe_dump_to_file(compute_config, config_file)  # always refresh compute config
-                with _compile_flags(compute_config):
+                # Deep copy the compute config to avoid modifying the original one during code generation.
+                gencode_compute_config = copy.deepcopy(compute_config)
+                with _compile_flags(gencode_compute_config):
                     regen_status = _gencode(
                         module_or_module_class,
                         dummy_forward_args,
                         pas_policy,
-                        compute_config,
+                        gencode_compute_config,
                         outdir,
                         module_dtype=module_dtype,
                         module_fn=module_fn,
