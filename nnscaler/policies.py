@@ -189,12 +189,15 @@ def pas_hybrid(graph: IRGraph, cfg: 'ComputeConfig'):
         nstages = cfg.plan_ngpus
     nmicros = cfg.pas_config['pipeline_nmicros']
     scheduler = cfg.pas_config.get('pipeline_scheduler', '1f1b')
-    pp_size = cfg.pas_config.get('pp_size', nstages)
+    pp_size = cfg.pas_config.get('pipeline_size', nstages)
+
+    if pp_size < 1:
+        raise ValueError('pipeline_size must be >= 1 when set')
 
     if nstages % pp_size != 0:
-        raise ValueError(f'invalid pp_size {pp_size} for nstages {nstages}')
+        raise ValueError(f'invalid pipeline_size {pp_size} for nstages {nstages}')
     if ngpus % pp_size != 0:
-        raise ValueError(f'invalid pp_size {pp_size} for ngpus {ngpus}')
+        raise ValueError(f'invalid pipeline_size {pp_size} for ngpus {ngpus}')
     tp_size = ngpus // pp_size
 
 
@@ -970,6 +973,12 @@ def fn(
     nstages: int = len(stages)
     # not all schedulers support pp_size < nstages
     pp_size = cfg.pas_config.get('pipeline_size', nstages)
+    if pp_size < 1:
+        raise ValueError('pipeline_size must be >= 1 when set')
+    if nstages % pp_size != 0:
+        raise ValueError(f'invalid pipeline_size {pp_size} for nstages {nstages}')
+    if ngpus % pp_size != 0:
+        raise ValueError(f'invalid pipeline_size {pp_size} for ngpus {ngpus}')
     tp_size = ngpus // pp_size
 
     recompute_groups: dict[int, list[IRFwOperation]] = {}
@@ -1197,8 +1206,6 @@ def fn(
             raise ValueError("pipeline_size must be >= 1 when pipeline is enabled")
         if not nmicros:
             raise ValueError("nmicros must be set when pipeline is enabled")
-        if nstages % pp_size != 0:
-            raise ValueError(f'invalid pipeline_size {pp_size} for nstages {nstages}')
         if ngpus % pp_size != 0:
             raise ValueError(f'invalid pipeline_size {pp_size} for ngpus {ngpus}')
     else:
