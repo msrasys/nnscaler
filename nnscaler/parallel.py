@@ -1674,6 +1674,25 @@ class OptimizerExtraState:
             self.non_parallel_extra_state = ExtraState(**self.non_parallel_extra_state)
 
 
+def _complete_vision_optimizer_locs(extra: OptimizerExtraState) -> None:
+    """Represent llm-train first-stage ViT's empty ranks explicitly.
+
+    The VL wrapper appends Vision after the language ParallelModule. Its
+    first-stage policy assigns Vision to range(vision_worker_size) per plan;
+    full-plan Vision already has optimizer locations on every worker.
+    """
+    for name, config in extra.parallel_module_configs.items():
+        workers = config.user_config.get('vision_worker_size')
+        if workers is None or workers == config.plan_ngpus or name in extra.parallel_module_locs:
+            continue
+        if not 0 < workers < config.plan_ngpus or extra.rank % config.plan_ngpus < workers:
+            raise ValueError(f"Missing optimizer parameters on an active Vision worker: {name}, rank {extra.rank}.")
+        if name != next(reversed(extra.parallel_module_configs)):
+            raise ValueError("First-stage Vision must be the last parallel module in the VL optimizer.")
+        end = max((loc.offset + loc.count for loc in extra.parallel_module_locs.values()), default=0)
+        extra.parallel_module_locs[name] = ModuleParameterLocation(end, 0)
+
+
 class ParallelOptimizer(torch.optim.Optimizer):
     """
     A optimizer stub to support parallelized module.
@@ -2088,6 +2107,8 @@ def build_optimizer(
                     if non_parallel_module_use_zero else None,
     )
 
+    _complete_vision_optimizer_locs(optimizer._extra_state)
+
     orig_step = optimizer.step
     def _patched_step(self, closure=None):
         # Please note:
@@ -2348,6 +2369,8 @@ def _get_optimizer_state_dict_info(
     ] = {}
     for opt_state_dict in optimizer_state_dicts:
         opt_extra_state = OptimizerExtraState(**opt_state_dict[ParallelModule.EXTRA_STATE_KEY])
+        # Also accept checkpoints saved before empty Vision locations were recorded.
+        _complete_vision_optimizer_locs(opt_extra_state)
         if not _is_supported_optimizer(opt_extra_state.name):
             raise ValueError("Only Adam-like or Muon-like optimizers are supported.")
         opt_extra_states[opt_extra_state.rank] = opt_extra_state
@@ -3468,7 +3491,9 @@ def _broadcast_opt_state(optimizer_state_dict: OptStateDict, state_indexes: List
             value = optimizer_state_dict['state'][k][key]
             torch.distributed.broadcast(value.data, src=src_rank, group=curr_parallel_group)
 
-    torch.distributed.barrier()
+    # Partial-ownership modules (first-stage ViT) are absent on other PP ranks.
+    # Only the ranks participating in this broadcast must synchronize here.
+    torch.distributed.barrier(group=curr_parallel_group)
 
 
 def broadcast_weights(module: torch.nn.Module, stride_size: Optional[int] = None):
