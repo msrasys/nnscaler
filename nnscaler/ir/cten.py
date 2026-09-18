@@ -1260,12 +1260,20 @@ class IR:
         Returns:
             Optional[int]: The index of the tensor with the same parent, or None if not found.
         """
-        tensor_index_in_seg_output = None
-        for idx, seg_output in enumerate(tensors):
-            if seg_output.parent == tensor.parent:
-                tensor_index_in_seg_output = idx
-                break
-        return tensor_index_in_seg_output
+        exact = [
+            idx for idx, candidate in enumerate(tensors)
+            if isinstance(candidate, IRObject) and candidate.tid == tensor.tid
+        ]
+        if len(exact) == 1:
+            return exact[0]
+        if len(exact) > 1:
+            return None
+
+        parent_matches = [
+            idx for idx, candidate in enumerate(tensors)
+            if isinstance(candidate, IRObject) and candidate.parent == tensor.parent
+        ]
+        return parent_matches[0] if len(parent_matches) == 1 else None
 
 
 class IRTensor(IRObject):
