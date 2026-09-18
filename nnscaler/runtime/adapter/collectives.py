@@ -19,6 +19,12 @@ from nnscaler.profiler.timer import CudaTimer
 from nnscaler.runtime.executor import AsyncCommHandler
 
 
+def _get_group_ranks(group):
+    # Older PyTorch versions do not treat None as WORLD in this query.
+    return torch.distributed.get_process_group_ranks(
+        group if group is not None else torch.distributed.group.WORLD)
+
+
 def move(tensor: Optional[torch.Tensor], shape: Tuple[int], dtype: torch.dtype, src: int, dst: int, async_op=False):
     """
     Move a tensor from source device to destination device.
@@ -102,12 +108,17 @@ def all_gather(tensor: torch.Tensor, dim: int,
     tensor_list = [torch.empty_like(tensor) for _ in ranks]
     tensor_list[torch.distributed.get_rank(group)] = tensor.data
     work = torch.distributed.all_gather(tensor_list, tensor, group=group, async_op=async_op)
+    group_ranks = _get_group_ranks(group)
+    tensor_list = [tensor_list[group_ranks.index(rank)] for rank in ranks]
+
+    def concat_gathered(_):
+        return torch.concat(tuple(tensor_list), dim=dim)
+
     if work:
-        allgather_callback = lambda t: torch.concat(tuple(tensor_list), dim=dim)
-        AsyncCommHandler().submit(tensor, [work], allgather_callback)
+        AsyncCommHandler().submit(tensor, [work], concat_gathered)
         otensor = tensor
     else:
-        otensor = torch.concat(tuple(tensor_list), dim=dim)
+        otensor = concat_gathered(tensor)
     if not async_op:
         CudaTimer().stop(field_name='comm', predefined=True)
     return otensor
@@ -122,6 +133,10 @@ def reduce_scatter(tensor: torch.Tensor, dim: int,
     for idx, t in enumerate(itensors):
         itensors[idx] = t.contiguous() if not t.is_contiguous() else t
     group = DeviceGroup().get_group(ranks)
+    group_ranks = _get_group_ranks(group)
+    # Input chunks follow the requested layout; the backend scatters in
+    # communicator order. Map each destination rank to its logical chunk.
+    itensors = [itensors[ranks.index(rank)] for rank in group_ranks]
     otensor = torch.empty_like(itensors[0], requires_grad=False)
     work = torch.distributed.reduce_scatter(otensor, itensors, group=group, async_op=async_op)
     if work:
@@ -157,9 +172,12 @@ def all_to_all(tensor: torch.Tensor, idim: int, odim: int,
     itensors = list(tensor.chunk(len(ranks), dim=odim))
     for idx, itensor in enumerate(itensors):
         itensors[idx] = itensor.contiguous() if not itensor.is_contiguous() else itensor
-    otensors = [torch.empty_like(t) for t in itensors]
     group = DeviceGroup().get_group(ranks)
+    group_ranks = _get_group_ranks(group)
+    itensors = [itensors[ranks.index(rank)] for rank in group_ranks]
+    otensors = [torch.empty_like(t) for t in itensors]
     work = torch.distributed.all_to_all(otensors, itensors, group=group, async_op=async_op)
+    otensors = [otensors[group_ranks.index(rank)] for rank in ranks]
     if work:
         all2all_callback = lambda t: torch.concat(tuple(otensors), dim=idim)
         AsyncCommHandler().submit(tensor, [work], all2all_callback)
@@ -179,17 +197,24 @@ def all_to_all_single(tensor: torch.Tensor, idim: int, odim: int,
     tensor = tensor.transpose(0, odim) if odim != 0 else tensor
     tensor = tensor.contiguous() if not tensor.is_contiguous() else tensor
     group = DeviceGroup().get_group(ranks)
-    otensor = torch.empty_like(tensor)
-    work = torch.distributed.all_to_all_single(otensor, tensor, group=group, async_op=async_op)
+    group_ranks = _get_group_ranks(group)
+    if tuple(ranks) != tuple(group_ranks):
+        chunks = tensor.chunk(len(ranks), dim=0)
+        tensor = torch.cat([chunks[ranks.index(rank)] for rank in group_ranks], dim=0)
+    received = torch.empty_like(tensor)
+    work = torch.distributed.all_to_all_single(received, tensor, group=group, async_op=async_op)
 
-    def all2all_callback(t):
+    def all2all_callback(_):
+        t = received
         t = t.transpose(0, odim) if odim != 0 else t
-        return torch.concat(tuple(t.chunk(len(ranks), dim=odim)), dim=idim)
+        chunks = t.chunk(len(ranks), dim=odim)
+        return torch.cat([chunks[group_ranks.index(rank)] for rank in ranks], dim=idim)
 
     if work:
         AsyncCommHandler().submit(tensor, [work], all2all_callback)
+        otensor = tensor
     else:
-        otensor = all2all_callback(otensor)
+        otensor = all2all_callback(tensor)
 
     if not async_op:
         CudaTimer().stop(field_name='comm', predefined=True)
@@ -202,8 +227,7 @@ def chunk(itensor: torch.Tensor, dim: int, ranks: Tuple[int], async_op=False) ->
 
     ranks (Tuple[int]): the order of split tensor.
     """
-    group = DeviceGroup().get_group(ranks)
-    idx = torch.distributed.get_rank(group)
+    idx = tuple(ranks).index(torch.distributed.get_rank())
     with torch.no_grad():
         otensor = itensor.chunk(len(ranks), dim)[idx]
         otensor = otensor.detach()

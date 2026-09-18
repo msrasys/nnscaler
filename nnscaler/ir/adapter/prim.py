@@ -428,6 +428,8 @@ class AllGatherPrim(CollectivePrim):
     non-differentiabl all-to-all
     """
     def __init__(self, itensors: List[IRSubTensor], otensors: List[IRSubTensor], dim: int, **kwargs):
+        if 'ranks' not in kwargs and all(tensor.device for tensor in itensors):
+            kwargs['ranks'] = tuple(tensor.device[0] for tensor in itensors)
         super().__init__(itensors, otensors, dim=dim, **kwargs)
         self.signature = 'nnscaler.runtime.adapter.all_gather'
 
@@ -447,6 +449,8 @@ class ReduceScatterPrim(CollectivePrim):
     non-differential reduce-scatter
     """
     def __init__(self, itensors: List[IRSubTensor], otensors: List[IRSubTensor], dim: int, **kwargs):
+        if 'ranks' not in kwargs and all(tensor.device for tensor in otensors):
+            kwargs['ranks'] = tuple(tensor.device[0] for tensor in otensors)
         super().__init__(itensors, otensors, dim=dim, **kwargs)
         self.signature = 'nnscaler.runtime.adapter.reduce_scatter'
 
@@ -490,6 +494,8 @@ class AllToAllPrim(CollectivePrim):
         otensors: each rank hosts one tensor splitted by odim
         idim != odim
         """
+        if 'ranks' not in kwargs and all(tensor.device for tensor in itensors):
+            kwargs['ranks'] = tuple(tensor.device[0] for tensor in itensors)
         super().__init__(itensors, otensors, idim=idim, odim=odim, **kwargs)
         self.signature = 'nnscaler.runtime.adapter.all_to_all'
 
@@ -522,6 +528,8 @@ class ChunkPrim(CollectivePrim):
     split dimension in n chunks and take idx-th chunk
     """
     def __init__(self, itensors: List[IRSubTensor], otensors: List[IRSubTensor], dim: int, **kwargs):
+        if 'ranks' not in kwargs and all(tensor.device for tensor in otensors):
+            kwargs['ranks'] = tuple(tensor.device[0] for tensor in otensors)
         super().__init__(itensors, otensors, dim=dim, **kwargs)
         self.signature = 'nnscaler.runtime.adapter.chunk'
 
