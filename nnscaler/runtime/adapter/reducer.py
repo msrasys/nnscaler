@@ -380,6 +380,9 @@ class Bucket:
         self._wsz: int = torch.distributed.get_world_size(group=self._group)
         self._async_param_cnt: int = 0  # flag for triggering async communication
         self._async_handle = None  # asynchrounous communication handler
+        self._async_expected_param_cnt: Optional[Dict[torch.nn.Parameter, int]] = None
+        self._async_seen_param_cnt: Dict[torch.nn.Parameter, int] = {}
+        self._async_expected_total = 0
         self._hooks: List[Tuple[Any, RemovableHandle]] = []
         self._params_with_grad: Set[torch.nn.Parameter] = set()
 
@@ -604,7 +607,17 @@ class Bucket:
 
             # perform all-reduce
             if self._async:
-                if self._grad_accumulation_steps:
+                if self._async_expected_param_cnt is not None:
+                    expected = self._async_expected_param_cnt[param]
+                    seen = self._async_seen_param_cnt.get(param, 0) + 1
+                    self._async_seen_param_cnt[param] = seen
+                    if seen > expected:
+                        raise RuntimeError(
+                            f"Async reducer received {seen}/{expected} expected "
+                            "gradient contributions for a scheduled parameter."
+                        )
+                    target_cnt = self._async_expected_total
+                elif self._grad_accumulation_steps:
                     target_cnt = self._grad_accumulation_steps * len(self._params)
                 else:
                     target_cnt = len(self._params)
@@ -759,6 +772,20 @@ class Bucket:
         # apply post-hooks
         self._apply_post_hooks()
 
+    def set_async_grad_expected_counts(self, param_counts: Dict[torch.nn.Parameter, int]):
+        # A reused parameter can contribute from several local stages in each
+        # microbatch, so the scheduler supplies the full per-parameter count.
+        self._grad_accumulation_steps = 0
+        self._async_expected_param_cnt = {}
+        for param in self._params:
+            count = int(param_counts.get(param, 1))
+            if count <= 0:
+                raise ValueError(f"Expected positive async grad contribution count for {param}, got {count}")
+            self._async_expected_param_cnt[param] = count
+        self._async_expected_total = sum(self._async_expected_param_cnt.values())
+        self.reset()
+
+
     def gather_params(self):
         """
         All-gather parameters
@@ -824,6 +851,7 @@ class Bucket:
         """Reset status."""
         self._async_param_cnt = 0
         self._async_handle = None
+        self._async_seen_param_cnt.clear()
         self._params_with_grad.clear()
 
     def sleep(self):
@@ -1431,6 +1459,17 @@ class Reducer:
         if RuntimeFlag.skip_reducer: return
         for bucket in self._buckets:
             bucket.sync_grads()
+
+    def set_async_grad_expected_counts(self, param_counts: Dict[torch.nn.Parameter, int]):
+        """
+        Set how many local gradient contributions each parameter should receive
+        before an async bucket reduction can be launched.
+        """
+        if not self._async:
+            return
+        for bucket in self._buckets:
+            bucket.set_async_grad_expected_counts(param_counts)
+
 
     def get_z3_info(self, param: torch.nn.Parameter) -> ReducerParamInfo:
         """

@@ -3,7 +3,7 @@
 
 import pytest
 
-from nnscaler.ir.adapter.prim import AllGatherPrim, ChunkPrim, RVGatherPrim
+from nnscaler.ir.adapter.prim import AllGatherPrim, AllToAllPrim, ChunkPrim, ReduceScatterPrim, RVGatherPrim
 from nnscaler.ir.cten import IR
 from nnscaler.ir.tensor import IRFullTensor
 
@@ -36,5 +36,15 @@ def test_gather_and_chunk_preserve_layout_order(explicit_ranks):
     replicas = [_set_device(full.tosub(), rank) for rank in (2, 1)]
     kwargs = {} if explicit_ranks is None else {'ranks': explicit_ranks}
     for prim in (AllGatherPrim(shards, replicas, 0, **kwargs),
+                 ReduceScatterPrim(replicas, shards, 0, **kwargs),
                  ChunkPrim(replicas, shards, 0, **kwargs)):
         assert prim.kwargs['ranks'] == (explicit_ranks or (2, 1))
+
+
+def test_all_to_all_preserves_layout_order():
+    full = IRFullTensor((8, 8))
+    inputs = [_set_device(full.select(((i * 4, (i + 1) * 4), (0, 8)), (0, 1)), rank)
+              for i, rank in enumerate((2, 1))]
+    outputs = [_set_device(full.select(((0, 8), (i * 4, (i + 1) * 4)), (0, 1)), rank)
+               for i, rank in enumerate((2, 1))]
+    assert AllToAllPrim(inputs, outputs, 0, 1).kwargs['ranks'] == (2, 1)
