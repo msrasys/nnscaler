@@ -2419,3 +2419,55 @@ def test_fake_fn(tmp_path):
     #     add_xy_23 = tests.parallel_module.test_gencode.add_xy(linear_26, linear_1_27)
     #     del linear_26, linear_1_27
     #     return add_xy_23
+
+
+def _first_device_only(graph, _config):
+    from nnscaler.ir import IRDataOperation, IRFwOperation
+
+    for node in graph.select(ntype=(IRFwOperation, IRDataOperation)):
+        graph.assign(node, 0)
+    return graph
+
+
+@replace_all_device_with('cpu')
+def test_codegen_supports_inactive_plan_rank():
+    with tempfile.TemporaryDirectory() as tempdir:
+        parallelize(
+            Module0(),
+            {'x': torch.tensor([[1.0, 2.0, 3.0]])},
+            _first_device_only,
+            ComputeConfig(2, 4),
+            gen_savedir=tempdir,
+            load_module=False,
+        )
+        assert _gencode_contains(
+            tempdir,
+            Module0,
+            1,
+            r"This ParallelModule rank is inactive",
+        )
+        assert _gencode_contains(tempdir, Module0, 2, r"torch\.nn\.functional\.linear")
+        assert _gencode_contains(
+            tempdir,
+            Module0,
+            3,
+            r"This ParallelModule rank is inactive",
+        )
+
+
+@pytest.mark.parametrize('runtime_size, expected', [(8, [(0, 1)]), (16, [(0, 1), (8, 9)])])
+def test_partial_plan_p2p_pairs_use_complete_plan_stride(runtime_size, expected):
+    from types import SimpleNamespace
+    from nnscaler.codegen import ModuleCodeGen
+    from nnscaler.ir.adapter.prim import MovePrim
+
+    move = MovePrim([], [], shape=(1,), dtype='torch.float32', src=0, dst=1)
+    generator = object.__new__(ModuleCodeGen)
+    generator.devices = (0, 1)
+    generator.plan_ndevs = 8
+    generator.runtime_ndevs = runtime_size
+    generator.execplan = SimpleNamespace(graph=SimpleNamespace(
+        select=lambda **_kwargs: [SimpleNamespace(prims=[move])],
+    ))
+
+    assert generator.get_p2p_pairs() == expected
