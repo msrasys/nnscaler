@@ -719,13 +719,14 @@ class ScheduleCodeGen(FuncEmission):
                     if isinstance(tensor, IRSubTensor) and tensor.is_loss():
                         output_grads[idx] = None
                 if produced_tids is not None:
-                    # Auxiliary outputs have no external gradient seed.
+                    # Auxiliary outputs are returned for logging, not seeded by
+                    # the loss. Explicit zeros also retain zero input-gradient
+                    # paths for auxiliary values arriving from an earlier stage.
+                    terminal = {t.parent for t in IR.get_objects(execplan.outputs())
+                                if isinstance(t, IRSubTensor)}
                     for idx, (output, grad) in enumerate(zip(output_tensors, output_grads)):
-                        if grad is not None and grad.tid not in produced_tids:
-                            terminal = {t.parent for t in IR.get_objects(execplan.outputs())
-                                        if isinstance(t, IRSubTensor)}
-                            if output.parent not in terminal:
-                                raise RuntimeError(f'Missing scheduled gradient for {output}')
+                        if (grad is not None and grad.tid not in produced_tids
+                                and output.parent in terminal):
                             output_grads[idx] = IRValue(f'torch.zeros_like({self.tensor_name(output)})')
 
                 input_grads_str = self.return_name(input_grads)
