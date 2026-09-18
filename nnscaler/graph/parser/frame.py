@@ -158,9 +158,11 @@ class Frame:
         model_pt_part_num = (total_size + params_per_file - 1) // params_per_file
 
         tid2value = {t.tid: val.cpu() for t, (_, val) in self._attr_map.items()}
+        tid_to_chunk = {}
         # it can be zero if there is no param in the module (self._attr_map is empty)
         if model_pt_part_num <= 1:
             torch.save(tid2value, f'{save_file_stem}.0')
+            tid_to_chunk.update((tid, 0) for tid in tid2value)
         else:
             tids = list(tid2value.keys())
             assert len(tids) > 0, "Empty attr map"
@@ -171,6 +173,8 @@ class Frame:
                 assert len(chunk) > 0, f"Empty chunk {idx}"
                 part = {k: tid2value[k] for k in chunk}
                 torch.save(part, f'{save_file_stem}.{idx}')
+                tid_to_chunk.update((tid, idx) for tid in chunk)
+        torch.save(tid_to_chunk, f'{save_file_stem}.index')
 
     def save_np_buffer_content(self, save_file: str):
         """
