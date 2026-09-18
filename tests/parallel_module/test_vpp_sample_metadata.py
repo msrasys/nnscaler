@@ -15,7 +15,7 @@ from nnscaler.graph.schedule.predefined import PredefinedSched
 from nnscaler.graph.segment import IRSegment
 from nnscaler.ir.operator import IRDataOperation, IRFwOperation
 from nnscaler.ir.tensor import IRSubTensor
-from nnscaler.policies import get_pas_ops
+from nnscaler.policies import get_pas_ops, OpPlan
 from tests.launch_torchrun import launch_torchrun
 from tests.utils import PYTEST_RUN_ID, clear_dir_on_rank0, replace_all_device_with
 
@@ -63,6 +63,14 @@ def metadata_policy(graph, cfg):
     return graph
 
 
+def fn_metadata_policy(graph, cfg):
+    for op in get_pas_ops(graph):
+        stage = -1
+        if torch.nn.Linear in op.module_class_chain:
+            stage = int(op.get_module_fqn(torch.nn.Linear).split('.')[-1])
+        yield OpPlan(op, stage_id=stage, partition=None)
+
+
 def metadata_config():
     return ComputeConfig(2, 2, use_end2end=True, constant_folding=False,
                          pas_config={'pipeline_nmicros': 2})
@@ -108,7 +116,7 @@ def test_vpp_sample_metadata_codegen(tmp_path, metadata_stage):
             assert roots == [node.targets[0].id for node in random_reads]
 
 
-def metadata_worker(metadata_stage):
+def metadata_worker(metadata_stage, use_fn=False):
     nnscaler.init()
     torch.set_float32_matmul_precision('highest')
     torch.manual_seed(7)
@@ -116,9 +124,13 @@ def metadata_worker(metadata_stage):
     reference = copy.deepcopy(source).cuda()
     directory = Path(tempfile.gettempdir()) / f'metadata_vpp_{PYTEST_RUN_ID}'
     with clear_dir_on_rank0(directory) as tempdir:
+        cfg = metadata_config()
+        if use_fn:
+            cfg.pas_config.update(pipeline_size=2, pipeline_scheduler='1f1b_interleaved')
         model = parallelize(
             source, {'sample': {'x': torch.ones(2, 4), 'context': {'scale': -1}}},
-            metadata_policy, metadata_config(), gen_savedir=tempdir, reuse='override',
+            fn_metadata_policy if use_fn else metadata_policy,
+            cfg, gen_savedir=tempdir, reuse='override',
         ).cuda()
         samples = [
             {'x': torch.arange(8, device='cuda').reshape(2, 4).float() / 8,
@@ -145,3 +157,10 @@ def metadata_worker(metadata_stage):
 @pytest.mark.parametrize('metadata_stage', [2, 3])
 def test_vpp_sample_metadata_matches_eager(metadata_stage):
     assert all(launch_torchrun(2, metadata_worker, metadata_stage).values())
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason='requires 2 GPUs')
+@pytest.mark.parametrize('metadata_stage', [2, 3])
+def test_fn_sample_metadata_matches_eager(metadata_stage):
+    # This is a compatibility check; fn already handles this case on main.
+    assert all(launch_torchrun(2, metadata_worker, metadata_stage, True).values())

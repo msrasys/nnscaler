@@ -14,7 +14,7 @@ from nnscaler.graph.graph import IRSegment
 
 from nnscaler.execplan.execplan import ExecutionPlan, ExeReuseCell, ExecutionPlanType
 
-from nnscaler.codegen.emit import FuncEmission
+from nnscaler.codegen.emit import FuncEmission, IRValue
 from nnscaler.codegen.syntax.symtable import SymbolTable
 from nnscaler.codegen.lifecycle import LifeCycle
 from nnscaler.codegen.syntax.blocks import FunctionBlock, Block
@@ -655,13 +655,14 @@ class ScheduleCodeGen(FuncEmission):
                     if isinstance(tensor, IRSubTensor) and tensor.is_loss():
                         output_grads[idx] = None
                 if produced_tids is not None:
-                    pairs = [
-                        (output, grad)
-                        for output, grad in zip(output_tensors, output_grads)
-                        if grad is None or grad.tid in produced_tids
-                    ]
-                    output_tensors = [output for output, _ in pairs]
-                    output_grads = [grad for _, grad in pairs]
+                    # Auxiliary outputs have no external gradient seed.
+                    for idx, (output, grad) in enumerate(zip(output_tensors, output_grads)):
+                        if grad is not None and grad.tid not in produced_tids:
+                            terminal = {t.parent for t in IR.get_objects(execplan.outputs())
+                                        if isinstance(t, IRSubTensor)}
+                            if output.parent not in terminal:
+                                raise RuntimeError(f'Missing scheduled gradient for {output}')
+                            output_grads[idx] = IRValue(f'torch.zeros_like({self.tensor_name(output)})')
 
                 input_grads_str = self.return_name(input_grads)
                 input_tensors_str = self.tuple_name(input_tensors, skip_attr=True, prefix_attr='model.')
