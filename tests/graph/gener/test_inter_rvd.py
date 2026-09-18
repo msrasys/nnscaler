@@ -123,6 +123,22 @@ def test_one_f_case2():
     finally:
         CompileFlag.async_comm = old_value
 
+
+def test_inter_rvd_preserves_producer_permutation():
+    ftensor = IRFullTensor(shape=[32, 32], name='tensor', requires_grad=False)
+    src = RVDLayout.grid(
+        ftensor, r=1, v=1, dims=(1, 4), devices=(2, 0, 3, 1))
+    dst = RVDLayout.grid(
+        ftensor, r=2, v=1, dims=(1, 2), devices=(6, 5, 4, 7))
+
+    moves = [
+        (prim.kwargs['src'], prim.kwargs['dst'])
+        for prim in InterPathFinder.path(src, dst)
+        if prim.signature == 'nnscaler.runtime.adapter.move'
+    ]
+
+    assert moves == [(2, 6), (0, 4), (3, 7), (1, 5)]
+
 def test_all_f_cases_fix_placement():
     fshape = [128, 256, 512]
     ftensor = IRFullTensor(shape=fshape, name='tensor', requires_grad=False)
