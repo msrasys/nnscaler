@@ -42,6 +42,108 @@ class _SampleAccess(NamedTuple):
 
 class ScheduleCodeGen(FuncEmission):
 
+    def _collect_getitem_info(self, execplan: ExecutionPlan) -> Dict[int, _SampleAccess]:
+        """Record replayable sample accesses using original IR IDs, not names.
+
+        An interleaved rank may need ``data['context'].get('scale', 1)``
+        without scheduling the original lookup ops locally. Record that path
+        once, including dict.get defaults, so each microbatch can replay it.
+        Only constant arguments and paths rooted at the dataloader are safe.
+        """
+        nodes = execplan.graph.nodes(flatten=True)
+        sample_tids = {
+            output.tid for node in nodes if isinstance(node, IRDataOperation)
+            for output in node.outputs() if isinstance(output, IRObject)
+        }
+        lookups = {}
+        for node in nodes:
+            if not isinstance(node, IRFwOperation) or node.signature not in {
+                '_operator.getitem', 'builtins.dict.get',
+            }:
+                continue
+            output = node.output(0)
+            if isinstance(output, IRTensor) or not isinstance(output, IRObject):
+                continue
+            source = node.input(0)
+            if not isinstance(source, IRObject) or isinstance(source, IRTensor):
+                continue
+            args = node.inputs()[1:]
+            if any(not obj.is_constant for obj in IR.get_objects(args)):
+                continue
+            args = IR.try_unwrap(args)
+            if not isinstance(args[0], str):
+                continue
+            function = 'dict.get' if node.signature == 'builtins.dict.get' else node.signature
+            lookups[output.tid] = source.tid, function, tuple(self.tensor_name(arg) for arg in args)
+
+        info = {}
+        for output_tid in lookups:
+            source_tid = output_tid
+            path = []
+            while source_tid in lookups:
+                source_tid, function, args = lookups[source_tid]
+                path.append((function, args))
+            if source_tid in sample_tids:
+                info[output_tid] = _SampleAccess(source_tid, tuple(reversed(path)))
+        return info
+
+    def _emit_missing_nontensor_inputs(
+        self,
+        node,
+        produced_tids,
+        getitem_info,
+        dataloader_var,
+        fallback_state,
+    ):
+        """Replay missing metadata accesses against this microbatch's sample.
+
+        ExeReuseCell pairs original inputs with their microbatch instances.
+        Prefer an already-produced input, then a scheduled sample read, and
+        finally random access. Random access must not advance the dataloader.
+        """
+        if produced_tids is None or not getitem_info:
+            return []
+
+        codes = []
+        micro_batch_id = node.micro_batch_id if isinstance(node, ExeReuseCell) else None
+        cell = node.cell if isinstance(node, ExeReuseCell) else node
+        input_pairs = list(zip(cell.inputs(), node.inputs()))
+        available = {
+            original.tid: self.tensor_name(actual)
+            for original, actual in input_pairs
+            if isinstance(original, IRObject) and isinstance(actual, IRObject)
+            and actual.tid in produced_tids
+        }
+        for original, obj in input_pairs:
+            if not isinstance(obj, IRObject) or isinstance(obj, IRTensor) or obj.tid in produced_tids:
+                continue
+            access = getitem_info.get(original.tid)
+            if access is None:
+                continue
+
+            source_var = available.get(access.sample_tid)
+            if source_var is None and dataloader_var and micro_batch_id is not None:
+                sample = fallback_state['sample_reads'].get(micro_batch_id)
+                if sample is not None and sample[1] in produced_tids:
+                    source_var = sample[0]
+                else:
+                    source_var = fallback_state['fallback_vars'].get(micro_batch_id)
+                    if source_var is None:
+                        source_var = f'_samples_{micro_batch_id}'
+                        fallback_state['fallback_vars'][micro_batch_id] = source_var
+                        codes.append(
+                            f'{source_var} = {dataloader_var}.get_micro_batch({micro_batch_id})'
+                        )
+            if source_var is None:
+                continue
+
+            expression = source_var
+            for function, args in access.lookups:
+                expression = f'{function}({expression}, {", ".join(args)})'
+            codes.append(f'{self.tensor_name(obj)} = {expression}')
+            produced_tids.add(obj.tid)
+        return codes
+
     def __init__(
         self,
         execplan: ExecutionPlanType,
@@ -787,104 +889,3 @@ class ScheduleCodeGen(FuncEmission):
             if isinstance(out, IRObject):
                 pending_async_recvs[out.tid] = (unwrap_node, out)
 
-    def _collect_getitem_info(self, execplan: ExecutionPlan) -> Dict[int, _SampleAccess]:
-        """Record replayable sample accesses using original IR IDs, not names.
-
-        An interleaved rank may need ``data['context'].get('scale', 1)``
-        without scheduling the original lookup ops locally. Record that path
-        once, including dict.get defaults, so each microbatch can replay it.
-        Only constant arguments and paths rooted at the dataloader are safe.
-        """
-        nodes = execplan.graph.nodes(flatten=True)
-        sample_tids = {
-            output.tid for node in nodes if isinstance(node, IRDataOperation)
-            for output in node.outputs() if isinstance(output, IRObject)
-        }
-        lookups = {}
-        for node in nodes:
-            if not isinstance(node, IRFwOperation) or node.signature not in {
-                '_operator.getitem', 'builtins.dict.get',
-            }:
-                continue
-            output = node.output(0)
-            if isinstance(output, IRTensor) or not isinstance(output, IRObject):
-                continue
-            source = node.input(0)
-            if not isinstance(source, IRObject) or isinstance(source, IRTensor):
-                continue
-            args = node.inputs()[1:]
-            if any(not obj.is_constant for obj in IR.get_objects(args)):
-                continue
-            args = IR.try_unwrap(args)
-            if not isinstance(args[0], str):
-                continue
-            function = 'dict.get' if node.signature == 'builtins.dict.get' else node.signature
-            lookups[output.tid] = source.tid, function, tuple(self.tensor_name(arg) for arg in args)
-
-        info = {}
-        for output_tid in lookups:
-            source_tid = output_tid
-            path = []
-            while source_tid in lookups:
-                source_tid, function, args = lookups[source_tid]
-                path.append((function, args))
-            if source_tid in sample_tids:
-                info[output_tid] = _SampleAccess(source_tid, tuple(reversed(path)))
-        return info
-
-    def _emit_missing_nontensor_inputs(
-        self,
-        node,
-        produced_tids,
-        getitem_info,
-        dataloader_var,
-        fallback_state,
-    ):
-        """Replay missing metadata accesses against this microbatch's sample.
-
-        ExeReuseCell pairs original inputs with their microbatch instances.
-        Prefer an already-produced input, then a scheduled sample read, and
-        finally random access. Random access must not advance the dataloader.
-        """
-        if produced_tids is None or not getitem_info:
-            return []
-
-        codes = []
-        micro_batch_id = node.micro_batch_id if isinstance(node, ExeReuseCell) else None
-        cell = node.cell if isinstance(node, ExeReuseCell) else node
-        input_pairs = list(zip(cell.inputs(), node.inputs()))
-        available = {
-            original.tid: self.tensor_name(actual)
-            for original, actual in input_pairs
-            if isinstance(original, IRObject) and isinstance(actual, IRObject)
-            and actual.tid in produced_tids
-        }
-        for original, obj in input_pairs:
-            if not isinstance(obj, IRObject) or isinstance(obj, IRTensor) or obj.tid in produced_tids:
-                continue
-            access = getitem_info.get(original.tid)
-            if access is None:
-                continue
-
-            source_var = available.get(access.sample_tid)
-            if source_var is None and dataloader_var and micro_batch_id is not None:
-                sample = fallback_state['sample_reads'].get(micro_batch_id)
-                if sample is not None and sample[1] in produced_tids:
-                    source_var = sample[0]
-                else:
-                    source_var = fallback_state['fallback_vars'].get(micro_batch_id)
-                    if source_var is None:
-                        source_var = f'_samples_{micro_batch_id}'
-                        fallback_state['fallback_vars'][micro_batch_id] = source_var
-                        codes.append(
-                            f'{source_var} = {dataloader_var}.get_micro_batch({micro_batch_id})'
-                        )
-            if source_var is None:
-                continue
-
-            expression = source_var
-            for function, args in access.lookups:
-                expression = f'{function}({expression}, {", ".join(args)})'
-            codes.append(f'{self.tensor_name(obj)} = {expression}')
-            produced_tids.add(obj.tid)
-        return codes
