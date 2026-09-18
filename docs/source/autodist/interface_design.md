@@ -1,6 +1,6 @@
 # AutoDist Interface Design
 
-Similar to current user experiences in nnScaler, the entrance to *AutoDist* is a function that accepts a data flow graph and a resource descriptor as input. The function returns a rewritten graph. The core modules include:
+Similar to current user experiences in nnScaler, the entrance to *AutoDist* is a function that accepts a data flow graph and a resource descriptor as input. In legacy mode it returns a rewritten graph. With `legacy=False`, it returns `OpPlan` objects that are consumed by the general `nnscaler.policies.fn` implementation. The core modules include:
 1. *profile*: build cost models to provide the underlying solver with operator and communication information
 2. *dp_solver*: encapsulate existing dynamic programming logic
 
@@ -28,9 +28,11 @@ def rewrite_graph(graph: IRGraph, dist_policy) -> IRGraph:
     # transform the initial dataflow graph according to generated distributed policy
     pass
 
-def autodist(graph: IRGraph, resource: Resource) -> IRGraph:
+def autodist(graph: IRGraph, resource: Resource, legacy: bool = True):
     anno_graph = annotate_graph(graph)
     cost_model = profile(anno_graph, resource)
     dist_policy = dp_solver(anno_graph, cost_model)
-    return rewrite_graph(graph, dist_policy)
+    if legacy:
+        return rewrite_graph(graph, dist_policy)
+    return convert_to_op_plans(dist_policy)
 ```

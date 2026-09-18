@@ -1,12 +1,12 @@
 #  Copyright (c) Microsoft Corporation.
 #  Licensed under the MIT License.
 
-from typing import List, Optional, Tuple, Union, Dict, NamedTuple
+from typing import List, Optional, Tuple, Union, Dict
 import copy
 import inspect
 import logging
 
-from nnscaler.ir.cten import IRCell, IRObject, IRTensor, IR
+from nnscaler.ir.cten import IRCell, IRTensor, IR
 from nnscaler.ir.operator import IRDataOperation, IRFwOperation
 from nnscaler.ir.tensor import IRSubTensor
 from nnscaler.ir.adapter import IRWeightReducer, IRAdapter
@@ -14,7 +14,7 @@ from nnscaler.graph.graph import IRSegment
 
 from nnscaler.execplan.execplan import ExecutionPlan, ExeReuseCell, ExecutionPlanType
 
-from nnscaler.codegen.emit import FuncEmission
+from nnscaler.codegen.emit import FuncEmission, IRValue
 from nnscaler.codegen.syntax.symtable import SymbolTable
 from nnscaler.codegen.lifecycle import LifeCycle
 from nnscaler.codegen.syntax.blocks import FunctionBlock, Block
@@ -32,12 +32,6 @@ bi_sign = '{input_grads} = nnscaler.runtime.executor.backward_input({name}, {inp
 bw_sign = 'nnscaler.runtime.executor.backward_weight({name}, {weights})'
 bw_fn_name = 'nnscaler.runtime.executor.backward_weight'
 ssign = '{inputs} = nnscaler.runtime.executor.sync_tensors({inputs})'
-
-
-class _SampleAccess(NamedTuple):
-    """A constant-key lookup path rooted at an original dataloader output."""
-    sample_tid: int
-    lookups: Tuple[Tuple[str, Tuple[str, ...]], ...]
 
 
 class ScheduleCodeGen(FuncEmission):
@@ -83,7 +77,7 @@ class ScheduleCodeGen(FuncEmission):
         # model full code
         self.init_code: List[str] = [
             '\n\n########## Generated Schedule Code ###########',
-            'import torch', 'import nnscaler', 'import _operator', '']
+            'import torch', 'import nnscaler', '']
         # module member name
         self.symbols = SymbolTable()
 
@@ -151,20 +145,6 @@ class ScheduleCodeGen(FuncEmission):
         lifetime = LifeCycle(device_nodes, [], execplan.outputs())
 
         args = ['model'] + [self.tensor_name(t) for t in execplan.graph.inputs()]
-        getitem_info = self._collect_getitem_info(execplan)
-        dataloader_var = next((
-            self.tensor_name(t) for t in execplan.graph.inputs()
-            if self.tensor_name(t).startswith('dataloader_')
-        ), None)
-        sample_reads = {}
-        for node in device_nodes:
-            cell = node.cell if isinstance(node, ExeReuseCell) else node
-            if not isinstance(cell, IRDataOperation) or not isinstance(node, ExeReuseCell):
-                continue
-            for output in node.outputs():
-                if isinstance(output, IRObject) and not isinstance(output, IRTensor):
-                    sample_reads[node.micro_batch_id] = (self.tensor_name(output), output.tid)
-                    break
 
         last_stream = None
         buffered_codes = []
@@ -272,13 +252,6 @@ class ScheduleCodeGen(FuncEmission):
                             last_backwards[node.cell.cid] = node
                     last_backward_node_oids = [id(node) for node in last_backwards.values()]
 
-                produced_tids = {
-                    obj.tid
-                    for obj in IR.get_objects(execplan.graph.inputs())
-                    if isinstance(obj, IRObject)
-                }
-                fallback_state = {'sample_reads': sample_reads, 'fallback_vars': {}}
-
                 def _append_skip_flag(node: IRCell):
                     # when use scheduler, skip reducer if it is not the last backward of same segments
                     if use_scheduler and _is_backward_segment(node):
@@ -293,17 +266,12 @@ class ScheduleCodeGen(FuncEmission):
                     elif use_scheduler and isinstance(self._unwrap_node(node), IRWeightReducer):
                         _append_code(fb, 'nnscaler.flags.RuntimeFlag.skip_reducer = False')
 
+                produced_tids = {obj.tid for obj in IR.get_objects(execplan.graph.inputs())
+                                 if isinstance(obj, IRTensor)}
                 prev_backward_node = None
                 prev_backward_weight_codes = []
                 for line, node in enumerate(device_nodes):
-                    codes = self.emit_node(
-                        execplan,
-                        node,
-                        produced_tids=produced_tids,
-                        getitem_info=getitem_info,
-                        dataloader_var=dataloader_var,
-                        fallback_state=fallback_state,
-                    )
+                    codes = self.emit_node(execplan, node, produced_tids=produced_tids)
 
                     if use_scheduler and _is_backward_segment(node) and CompileFlag.use_fbw:
                         if prev_backward_node is not None:
@@ -340,10 +308,8 @@ class ScheduleCodeGen(FuncEmission):
                     tensors = lifetime.release_tensors_after_line(line)
                     if len(tensors) > 0 : # not necessarily to have one after each line
                         _append_code(fb, self.emit_release(tensors))
-                    produced_tids.update(
-                        obj.tid for obj in IR.get_objects(node.outputs())
-                        if isinstance(obj, IRObject)
-                    )
+                    produced_tids.update(obj.tid for obj in IR.get_objects(node.outputs())
+                                         if isinstance(obj, IRTensor))
 
                 if prev_backward_node is not None:
                     _append_skip_flag(prev_backward_node)
@@ -373,34 +339,16 @@ class ScheduleCodeGen(FuncEmission):
                 # body code
                 if len(device_nodes) == 0:
                     _append_code(fb, 'pass')
-                produced_tids = {
-                    obj.tid
-                    for obj in IR.get_objects(execplan.graph.inputs())
-                    if isinstance(obj, IRObject)
-                }
-                fallback_state = {'sample_reads': sample_reads, 'fallback_vars': {}}
                 for line, node in enumerate(device_nodes):
                     if not node.isfw(): continue  # skip backward segments and adapters
                     # execute
-                    codes = self.emit_node(
-                        execplan,
-                        node,
-                        force_no_grad=True,
-                        produced_tids=produced_tids,
-                        getitem_info=getitem_info,
-                        dataloader_var=dataloader_var,
-                        fallback_state=fallback_state,
-                    )
+                    codes = self.emit_node(execplan, node, force_no_grad=True)
                     _append_code(fb, codes, self._get_node_stream(execplan, node))
                     # release
                     tensors = lifetime.release_tensors_after_line(line)
                     tensors = [t for t in tensors if isinstance(t, IRTensor) and not t.is_grad()]
                     if len(tensors) > 0 : # not necessarily to have one after each line
                         _append_code(fb, self.emit_release(tensors))
-                    produced_tids.update(
-                        obj.tid for obj in IR.get_objects(node.outputs())
-                        if isinstance(obj, IRObject)
-                    )
                 # return code
                 if CompileFlag.async_comm:
                     _append_code(fb, 'nnscaler.runtime.executor.AsyncCommHandler().drain_sends()')
@@ -521,108 +469,6 @@ class ScheduleCodeGen(FuncEmission):
     def _unwrap_node(self, node: IRCell) -> IRCell:
         return node.cell if isinstance(node, ExeReuseCell) else node
 
-    def _collect_getitem_info(self, execplan: ExecutionPlan) -> Dict[int, _SampleAccess]:
-        """Record replayable sample accesses using original IR IDs, not names.
-
-        An interleaved rank may need ``data['context'].get('scale', 1)``
-        without scheduling the original lookup ops locally. Record that path
-        once, including dict.get defaults, so each microbatch can replay it.
-        Only constant arguments and paths rooted at the dataloader are safe.
-        """
-        nodes = execplan.graph.nodes(flatten=True)
-        sample_tids = {
-            output.tid for node in nodes if isinstance(node, IRDataOperation)
-            for output in node.outputs() if isinstance(output, IRObject)
-        }
-        lookups = {}
-        for node in nodes:
-            if not isinstance(node, IRFwOperation) or node.signature not in {
-                '_operator.getitem', 'builtins.dict.get',
-            }:
-                continue
-            output = node.output(0)
-            if isinstance(output, IRTensor) or not isinstance(output, IRObject):
-                continue
-            source = node.input(0)
-            if not isinstance(source, IRObject) or isinstance(source, IRTensor):
-                continue
-            args = node.inputs()[1:]
-            if any(not obj.is_constant for obj in IR.get_objects(args)):
-                continue
-            args = IR.try_unwrap(args)
-            if not isinstance(args[0], str):
-                continue
-            function = 'dict.get' if node.signature == 'builtins.dict.get' else node.signature
-            lookups[output.tid] = source.tid, function, tuple(self.tensor_name(arg) for arg in args)
-
-        info = {}
-        for output_tid in lookups:
-            source_tid = output_tid
-            path = []
-            while source_tid in lookups:
-                source_tid, function, args = lookups[source_tid]
-                path.append((function, args))
-            if source_tid in sample_tids:
-                info[output_tid] = _SampleAccess(source_tid, tuple(reversed(path)))
-        return info
-
-    def _emit_missing_nontensor_inputs(
-        self,
-        node,
-        produced_tids,
-        getitem_info,
-        dataloader_var,
-        fallback_state,
-    ):
-        """Replay missing metadata accesses against this microbatch's sample.
-
-        ExeReuseCell pairs original inputs with their microbatch instances.
-        Prefer an already-produced input, then a scheduled sample read, and
-        finally random access. Random access must not advance the dataloader.
-        """
-        if produced_tids is None or not getitem_info:
-            return []
-
-        codes = []
-        micro_batch_id = node.micro_batch_id if isinstance(node, ExeReuseCell) else None
-        cell = node.cell if isinstance(node, ExeReuseCell) else node
-        input_pairs = list(zip(cell.inputs(), node.inputs()))
-        available = {
-            original.tid: self.tensor_name(actual)
-            for original, actual in input_pairs
-            if isinstance(original, IRObject) and isinstance(actual, IRObject)
-            and actual.tid in produced_tids
-        }
-        for original, obj in input_pairs:
-            if not isinstance(obj, IRObject) or isinstance(obj, IRTensor) or obj.tid in produced_tids:
-                continue
-            access = getitem_info.get(original.tid)
-            if access is None:
-                continue
-
-            source_var = available.get(access.sample_tid)
-            if source_var is None and dataloader_var and micro_batch_id is not None:
-                sample = fallback_state['sample_reads'].get(micro_batch_id)
-                if sample is not None and sample[1] in produced_tids:
-                    source_var = sample[0]
-                else:
-                    source_var = fallback_state['fallback_vars'].get(micro_batch_id)
-                    if source_var is None:
-                        source_var = f'_samples_{micro_batch_id}'
-                        fallback_state['fallback_vars'][micro_batch_id] = source_var
-                        codes.append(
-                            f'{source_var} = {dataloader_var}.get_micro_batch({micro_batch_id})'
-                        )
-            if source_var is None:
-                continue
-
-            expression = source_var
-            for function, args in access.lookups:
-                expression = f'{function}({expression}, {", ".join(args)})'
-            codes.append(f'{self.tensor_name(obj)} = {expression}')
-            produced_tids.add(obj.tid)
-        return codes
-
     def _emit_segment_hook_code(
             self, hook, hook_meta,
             inputs_str: str,
@@ -655,17 +501,8 @@ class ScheduleCodeGen(FuncEmission):
         """
         return f'{self.tensor_name(tensor)} = {self.tensor_name(tensor)}.detach()'
 
-    def emit_node(
-        self,
-        execplan: ExecutionPlan,
-        node: IRCell,
-        force_no_grad: bool = False,
-        *,
-        produced_tids=None,
-        getitem_info=None,
-        dataloader_var=None,
-        fallback_state=None,
-    ) -> List[str]:
+    def emit_node(self, execplan: ExecutionPlan, node: IRCell, force_no_grad: bool = False,
+                  *, produced_tids=None) -> List[str]:
         """
         Emit node / subgraph code
         """
@@ -682,13 +519,6 @@ class ScheduleCodeGen(FuncEmission):
         unwrap_node = node.cell if isinstance(node, ExeReuseCell) else node
         name = self.node_name(unwrap_node)
         stream_context = self._get_node_stream_context(execplan, node)
-        prefix_codes = self._emit_missing_nontensor_inputs(
-            node,
-            produced_tids,
-            getitem_info,
-            dataloader_var,
-            fallback_state,
-        ) if node.isfw() else []
 
         if isinstance(unwrap_node, IRSegment):
             # segment hooks
@@ -719,13 +549,16 @@ class ScheduleCodeGen(FuncEmission):
                     if isinstance(tensor, IRSubTensor) and tensor.is_loss():
                         output_grads[idx] = None
                 if produced_tids is not None:
-                    pairs = [
-                        (output, grad)
-                        for output, grad in zip(output_tensors, output_grads)
-                        if grad is None or grad.tid in produced_tids
-                    ]
-                    output_tensors = [output for output, _ in pairs]
-                    output_grads = [grad for _, grad in pairs]
+                    # Auxiliary outputs are returned for logging, not seeded by
+                    # the loss. Explicit zeros also retain zero input-gradient
+                    # paths for auxiliary values arriving from an earlier stage.
+                    for idx, (output, grad) in enumerate(zip(output_tensors, output_grads)):
+                        if grad is not None and grad.tid not in produced_tids:
+                            terminal = {t.parent for t in IR.get_objects(execplan.outputs())
+                                        if isinstance(t, IRSubTensor)}
+                            if output.parent not in terminal:
+                                raise RuntimeError(f'Missing scheduled gradient for {output}')
+                            output_grads[idx] = IRValue(f'torch.zeros_like({self.tensor_name(output)})')
 
                 input_grads_str = self.return_name(input_grads)
                 input_tensors_str = self.tuple_name(input_tensors, skip_attr=True, prefix_attr='model.')
@@ -798,8 +631,6 @@ class ScheduleCodeGen(FuncEmission):
 
         else:
             raise RuntimeError(f"Unspported node type: {type(unwrap_node)}")
-
-        codes = prefix_codes + codes
 
         if stream_context and stream_context.stream:
             # register all input tensors to the current stream
