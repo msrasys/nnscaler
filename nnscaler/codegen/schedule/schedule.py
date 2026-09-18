@@ -14,7 +14,7 @@ from nnscaler.graph.graph import IRSegment
 
 from nnscaler.execplan.execplan import ExecutionPlan, ExeReuseCell, ExecutionPlanType
 
-from nnscaler.codegen.emit import FuncEmission
+from nnscaler.codegen.emit import FuncEmission, IRValue
 from nnscaler.codegen.syntax.symtable import SymbolTable
 from nnscaler.codegen.lifecycle import LifeCycle
 from nnscaler.codegen.syntax.blocks import FunctionBlock, Block
@@ -232,6 +232,10 @@ class ScheduleCodeGen(FuncEmission):
                     if execplan.zero_grad_stream_context else None
             )
 
+            if use_scheduler and CompileFlag.async_reducer:
+                for code in self._emit_async_reducer_expectations(device_nodes):
+                    _append_code(fb, code)
+
             # body code
             if len(device_nodes) == 0:
                 _append_code(fb, 'pass')
@@ -279,10 +283,16 @@ class ScheduleCodeGen(FuncEmission):
                 def _append_skip_flag(node: IRCell):
                     # when use scheduler, skip reducer if it is not the last backward of same segments
                     if use_scheduler and _is_backward_segment(node):
+                        skip_reducer = id(node) not in last_backward_node_oids
+                        if CompileFlag.async_reducer:
+                            # Every local contribution is counted; each bucket
+                            # starts reduction only after its complete count.
+                            skip_reducer = False
                         _append_code(fb,
-                            f'nnscaler.flags.RuntimeFlag.skip_reducer = '
-                            f'{id(node) not in last_backward_node_oids !r}'
+                            f'nnscaler.flags.RuntimeFlag.skip_reducer = {skip_reducer!r}'
                         )
+                    elif use_scheduler and isinstance(self._unwrap_node(node), IRWeightReducer):
+                        _append_code(fb, 'nnscaler.flags.RuntimeFlag.skip_reducer = False')
 
                 prev_backward_node = None
                 prev_backward_weight_codes = []
@@ -468,6 +478,60 @@ class ScheduleCodeGen(FuncEmission):
                 if stream_context.record_events:
                     for record_event in stream_context.record_events:
                         events.add(record_event)
+
+    def _emit_async_reducer_expectations(self, device_nodes: List[IRCell]) -> List[str]:
+        reducer_params: Dict[int, List[str]] = {}
+        for node in device_nodes:
+            unwrap_node = self._unwrap_node(node)
+            if not isinstance(unwrap_node, IRWeightReducer):
+                continue
+            reducer_params[unwrap_node._id] = [
+                self.tensor_name(t, prefix_attr='model.')
+                for t in unwrap_node.inputs()
+            ]
+
+        if not reducer_params:
+            return []
+
+        param_counts: Dict[str, int] = {}
+        for node in device_nodes:
+            unwrap_node = self._unwrap_node(node)
+            if not isinstance(unwrap_node, IRSegment) or unwrap_node.isfw():
+                continue
+            for pname in self._segment_parameter_names(unwrap_node):
+                param_counts[pname] = param_counts.get(pname, 0) + 1
+
+        codes = []
+        for reducer_id, param_names in sorted(reducer_params.items()):
+            entries = []
+            for pname in sorted(param_names):
+                count = param_counts.get(pname, 1)
+                entries.append(f'{pname}: {count}')
+            codes.append(
+                f'model.wreducer{reducer_id}.set_async_grad_expected_counts({{{", ".join(entries)}}})'
+            )
+        return codes
+
+
+    def _segment_parameter_names(self, node: IRSegment) -> List[str]:
+        if node.isfw():
+            fw_node = node
+        else:
+            fw_node = node.mirror
+        if not isinstance(fw_node, IRSegment):
+            return []
+
+        param_names = set()
+        for inner_node in fw_node.nodes(flatten=True):
+            for tensor in IRSegment.get_objects_from_complex([inner_node.inputs(), inner_node.kwargs]):
+                if not isinstance(tensor, IRSubTensor) or not tensor.is_param():
+                    continue
+                param_names.add(self.tensor_name(tensor, prefix_attr='model.'))
+        return sorted(param_names)
+
+
+    def _unwrap_node(self, node: IRCell) -> IRCell:
+        return node.cell if isinstance(node, ExeReuseCell) else node
 
     def _collect_getitem_info(self, execplan: ExecutionPlan) -> Dict[int, _SampleAccess]:
         """Record replayable sample accesses using original IR IDs, not names.
@@ -667,13 +731,14 @@ class ScheduleCodeGen(FuncEmission):
                     if isinstance(tensor, IRSubTensor) and tensor.is_loss():
                         output_grads[idx] = None
                 if produced_tids is not None:
-                    pairs = [
-                        (output, grad)
-                        for output, grad in zip(output_tensors, output_grads)
-                        if grad is None or grad.tid in produced_tids
-                    ]
-                    output_tensors = [output for output, _ in pairs]
-                    output_grads = [grad for _, grad in pairs]
+                    # Auxiliary outputs have no external gradient seed.
+                    for idx, (output, grad) in enumerate(zip(output_tensors, output_grads)):
+                        if grad is not None and grad.tid not in produced_tids:
+                            terminal = {t.parent for t in IR.get_objects(execplan.outputs())
+                                        if isinstance(t, IRSubTensor)}
+                            if output.parent not in terminal:
+                                raise RuntimeError(f'Missing scheduled gradient for {output}')
+                            output_grads[idx] = IRValue(f'torch.zeros_like({self.tensor_name(output)})')
 
                 input_grads_str = self.return_name(input_grads)
                 input_tensors_str = self.tuple_name(input_tensors, skip_attr=True, prefix_attr='model.')
