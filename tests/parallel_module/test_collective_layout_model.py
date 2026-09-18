@@ -10,74 +10,71 @@ import pytest
 import torch
 import nnscaler
 from nnscaler import ComputeConfig, parallelize, build_optimizer
-from nnscaler.ir.operator import IRDataOperation, IRFwOperation
-from nnscaler.runtime.device import DeviceGroup
+from nnscaler.policies import get_pas_ops, OpPlan
 from tests.launch_torchrun import launch_torchrun
 from tests.utils import PYTEST_RUN_ID, clear_dir_on_rank0, replace_all_device_with
 
 
-RANK_ORDER = (0, 2, 1, 3)
-
-
-class ReorderedMLP(torch.nn.Module):
+class PipelineMLP(torch.nn.Module):
     def __init__(self):
         super().__init__()
-        self.first = torch.nn.Linear(4, 8, bias=False)
-        self.second = torch.nn.Linear(8, 8, bias=False)
+        self.layers = torch.nn.ModuleList([
+            torch.nn.Linear(8, 8, bias=False) for _ in range(4)
+        ])
 
-    def forward(self, x):
-        y = self.second(self.first(x))
-        return (y * y).sum()
+    def forward(self, sample):
+        x = sample['x']
+        for layer in self.layers:
+            x = layer(x)
+        return x.square().sum()
 
 
-def reordered_policy(graph, cfg):
-    layout = cfg.pas_config['layout']
-    for node in list(graph.select(ntype=(IRDataOperation, IRFwOperation))):
-        name = node.input(1).name if node.fn == torch.nn.functional.linear else None
-        partition = (name == 'first.weight' and layout != 'split') or (name == 'second.weight' and layout != 'gather')
-        if partition:
-            dim = 1 if layout == 'split' else 0
-            parts = graph.partition(node, node.algorithm('dim'), idx=1, dim=dim, num=4)
-            for rank, part in zip(RANK_ORDER, parts):
-                graph.assign(part, rank)
-        else:
-            for rank, part in enumerate(graph.replicate(node, 4)):
-                graph.assign(part, rank)
-    return graph
+def pipeline_policy(graph, cfg):
+    # fn assigns devices. The user policy never specifies a rank permutation.
+    for op in get_pas_ops(graph):
+        stage = -1
+        if torch.nn.Linear in op.module_class_chain:
+            stage = int(op.get_module_fqn(torch.nn.Linear).split('.')[-1])
+        yield OpPlan(op, stage_id=stage, partition=None)
+
+
+def pipeline_config():
+    return ComputeConfig(8, 8, use_end2end=True, constant_folding=False,
+                         pas_config={'pipeline_size': 2, 'pipeline_nmicros': 4,
+                                     'pipeline_scheduler': '1f1b_interleaved'})
 
 
 @replace_all_device_with('cpu')
-@pytest.mark.parametrize('layout', ['gather', 'gather_reduce', 'split'])
-def test_reordered_mlp_codegen(tmp_path, layout):
-    parallelize(ReorderedMLP().double(), {'x': torch.ones(3, 4, dtype=torch.float64)},
-                reordered_policy, ComputeConfig(4, 4, use_end2end=True, pas_config={'layout': layout}),
-                gen_savedir=tmp_path, load_module=False, reuse='override')
-    gathers = []
+def test_fn_pipeline_generates_permuted_collectives(tmp_path):
+    parallelize(PipelineMLP(), {'sample': {'x': torch.ones(8, 8)}},
+                pipeline_policy, pipeline_config(), gen_savedir=tmp_path,
+                load_module=False, reuse='override')
+    ranks = []
     for path in tmp_path.rglob('gencode*.py'):
         for node in ast.walk(ast.parse(path.read_text())):
             if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
-                if node.func.attr in ('all_gather', 'allgather_split', 'allgather_reducescatter', 'split_allgather'):
-                    gathers.extend(ast.literal_eval(k.value) for k in node.keywords if k.arg == 'ranks')
-    assert gathers and all(tuple(ranks) == RANK_ORDER for ranks in gathers)
+                if node.func.attr in ('all_gather', 'chunk'):
+                    ranks.extend(ast.literal_eval(k.value) for k in node.keywords if k.arg == 'ranks')
+    # RVD communication planning can permute the four stage-local replicas.
+    assert any(tuple(order) != tuple(sorted(order)) for order in ranks)
 
 
-def reordered_worker(layout):
+def pipeline_worker():
     nnscaler.init()
-    assert DeviceGroup().get_group(RANK_ORDER) is None  # reuse WORLD
-    torch.manual_seed(17)
-    source = ReorderedMLP().double()
+    torch.manual_seed(7)
+    source = PipelineMLP()
     reference = copy.deepcopy(source).cuda()
-    reference_optimizer = torch.optim.SGD(reference.parameters(), lr=0.01)
+    reference_optimizer = torch.optim.SGD(reference.parameters(), lr=0.001)
     reference_params = dict(reference.named_parameters())
-    directory = Path(tempfile.gettempdir()) / f'reordered_mlp_{PYTEST_RUN_ID}'
+    directory = Path(tempfile.gettempdir()) / f'fn_collective_mlp_{PYTEST_RUN_ID}'
     with clear_dir_on_rank0(directory) as tempdir:
-        model = parallelize(source, {'x': torch.ones(3, 4, dtype=torch.float64)},
-                            reordered_policy, ComputeConfig(4, 4, use_end2end=True, pas_config={'layout': layout}),
+        model = parallelize(source, {'sample': {'x': torch.ones(8, 8)}},
+                            pipeline_policy, pipeline_config(),
                             gen_savedir=tempdir, reuse='override').cuda()
-        optimizer = build_optimizer(model, torch.optim.SGD, lr=0.01)
+        optimizer = build_optimizer(model, torch.optim.SGD, lr=0.001)
         for step in range(2):
-            samples = [(torch.arange(12, device='cuda', dtype=torch.float64).reshape(3, 4)
-                        + micro + step) / 12 for micro in range(2)]
+            samples = [{'x': torch.arange(64, device='cuda').reshape(8, 8).float() / 64 + micro + step}
+                       for micro in range(4)]
             reference_optimizer.zero_grad()
             expected = [reference(sample) for sample in samples]
             torch.stack(expected).sum().backward()
@@ -95,7 +92,6 @@ def reordered_worker(layout):
     return True
 
 
-@pytest.mark.skipif(torch.cuda.device_count() < 4, reason='requires 4 GPUs')
-@pytest.mark.parametrize('layout', ['gather', 'gather_reduce', 'split'])
-def test_reordered_mlp_matches_eager(layout):
-    assert all(launch_torchrun(4, reordered_worker, layout).values())
+@pytest.mark.skipif(torch.cuda.device_count() < 8, reason='requires 8 GPUs')
+def test_fn_pipeline_matches_eager():
+    assert all(launch_torchrun(8, pipeline_worker).values())
