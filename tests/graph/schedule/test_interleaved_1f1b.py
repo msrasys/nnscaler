@@ -125,7 +125,9 @@ def _train_pp(model: ParallelModule, num_replicas, rank):
     return results
 
 
-def worker_pipeline_2(n_micro_batches):
+def worker_pipeline_2(n_micro_batches, async_comm):
+    from nnscaler.flags import CompileFlag
+    CompileFlag.async_comm = async_comm
     nnscaler.init()
     torch.manual_seed(0)
     if torch.cuda.is_available():
@@ -162,8 +164,9 @@ def worker_pipeline_2(n_micro_batches):
 
 @pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.device_count() < 2, reason='lack of gpu devices')
 @pytest.mark.parametrize('n_micro_batches', [2, 4, 6])
-def test_interleaved_1f1b(n_micro_batches):
-    results = launch_torchrun(2, worker_pipeline_2, n_micro_batches)
+@pytest.mark.parametrize("async_comm", [False, True])
+def test_interleaved_1f1b(n_micro_batches, async_comm):
+    results = launch_torchrun(2, worker_pipeline_2, n_micro_batches, async_comm)
     results_1f1b0, results_1f1b_interleaved0 = results[0]
     results_1f1b1, results_1f1b_interleaved1 = results[1]
 
