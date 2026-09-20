@@ -243,11 +243,14 @@ def test_backward_preserves_retained_outer_input_grad():
         Executor.clear()
 
 
-def test_input_grad_callback_resumes_outer_autograd_once():
+@pytest.mark.parametrize('retain_grad', [False, True])
+def test_input_grad_callback_resumes_outer_autograd_once(retain_grad):
     Executor.clear()
     try:
         weight = torch.nn.Parameter(torch.tensor(2.0))
         outer_input = weight * 3
+        if retain_grad:
+            outer_input.retain_grad()
         output = Executor.fexecute(
             'segment', lambda tensor, _metadata: torch.sin(tensor),
             outer_input, {'kind': 'non_tensor_input'},
@@ -268,6 +271,8 @@ def test_input_grad_callback_resumes_outer_autograd_once():
         assert len(callback_grads) == 1
         assert torch.equal(callback_grads[0], expected)
         assert torch.equal(weight.grad, expected * 3)
+        if retain_grad:
+            torch.testing.assert_close(outer_input.grad, expected)
         Executor.check_clear()
     finally:
         Executor.clear()
@@ -295,6 +300,98 @@ def test_split_backward_runs_input_grad_callback():
     Executor.check_clear()
 
 
+@pytest.mark.parametrize('split', [False, True])
+@pytest.mark.parametrize('completed', [False, True])
+@pytest.mark.parametrize('repeats', [1, 2])
+def test_input_grad_callback_survives_async_replacement(monkeypatch, split, completed, repeats):
+    monkeypatch.setattr(torch.distributed, 'get_rank', lambda: 0)
+    leaf = torch.randn(2, 3, dtype=torch.float64, requires_grad=True)
+    boundary = leaf * 2
+    replacement = boundary.detach().clone().requires_grad_()
+    weight = torch.nn.Parameter(torch.randn(3, 4, dtype=torch.float64))
+    callbacks = []
+
+    class Work:
+        def is_completed(self):
+            return completed
+
+        def wait(self):
+            pass
+
+    def resume(grad):
+        callbacks.append(grad)
+        boundary.backward(grad)
+
+    Executor.register_input_grad_callback(boundary, resume)
+    executor.AsyncCommHandler().submit(boundary, [Work()], lambda tensor: replacement)
+    inputs = [boundary] * repeats
+    output = Executor.fexecute('segment', lambda *xs: sum(x @ weight for x in xs), *inputs)
+    expected = repeats * (torch.ones_like(output) @ weight.detach().T)
+    if split:
+        grad = Executor.backward_input(
+            'segment', inputs, [output], [torch.ones_like(output)], [weight],
+        )
+        Executor.backward_weight('segment', [weight])
+    else:
+        grad = Executor.backward('segment', inputs, [output], [torch.ones_like(output)])
+    assert len(callbacks) == 1
+    for value in (grad,) if repeats == 1 else grad:
+        torch.testing.assert_close(value, expected)
+    torch.testing.assert_close(leaf.grad, expected * 2)
+    torch.testing.assert_close(weight.grad, repeats * (boundary.detach().T @ torch.ones_like(output)))
+    Executor.check_clear()
+    executor.AsyncCommHandler().check_clear()
+
+
+@pytest.mark.parametrize('check_coverage', [False, True])
+@pytest.mark.parametrize('use_default', [False, True])
+def test_custom_fbw_dispatches_input_grad_callback(check_coverage, use_default):
+    leaf = torch.randn(2, 3, dtype=torch.float64, requires_grad=True)
+    boundary = leaf * 2
+    boundary.retain_grad()
+    weight = torch.nn.Parameter(torch.randn(3, 4, dtype=torch.float64))
+    reference_weight = weight.detach().clone().requires_grad_()
+    reference_input = boundary.detach().clone().requires_grad_()
+    (reference_input @ reference_weight).sum().backward()
+    output = Executor.fexecute('segment', lambda tensor: tensor @ weight, boundary)
+    callbacks = []
+    pending = {}
+
+    def custom_input(name, inputs, outputs, grads, weights):
+        pairs = Executor._detach[name].pop(0)
+        detached_inputs = [tensor for _, tensor in pairs if tensor.requires_grad]
+        result = torch.autograd.grad(outputs, detached_inputs, grads, retain_graph=True)
+        pending[name] = (outputs, grads)
+        return result[0] if len(result) == 1 else result
+
+    def custom_weight(name, weights):
+        outputs, grads = pending.pop(name)
+        torch.autograd.backward(outputs, grads, inputs=weights)
+
+    def resume(grad):
+        callbacks.append(grad)
+        boundary.backward(grad)
+
+    with executor.custom_fbw(
+        Executor.backward_input if use_default else custom_input,
+        Executor.backward_weight if use_default else custom_weight,
+        check_grad_coverage=check_coverage,
+    ):
+        # Registration happens inside the context, as in a generated schedule.
+        Executor.register_input_grad_callback(boundary, resume)
+        grad = executor.backward_input(
+            'segment', [boundary], [output], [torch.ones_like(output)], [weight],
+        )
+        assert len(callbacks) == 1
+        assert weight.grad is None
+        executor.backward_weight('segment', [weight])
+    torch.testing.assert_close(grad, reference_input.grad)
+    torch.testing.assert_close(boundary.grad, reference_input.grad)
+    torch.testing.assert_close(leaf.grad, reference_input.grad * 2)
+    torch.testing.assert_close(weight.grad, reference_weight.grad)
+    Executor.check_clear()
+
+
 def test_custom_fbw_restores_module_symbols():
     original_input = executor.backward_input
     original_weight = executor.backward_weight
@@ -313,12 +410,13 @@ def test_custom_fbw_restores_module_symbols():
 
     with pytest.raises(RuntimeError, match='expected'):
         with executor.custom_fbw(outer_input, outer_weight):
-            assert executor.backward_input is outer_input
+            outer_wrapper = executor.backward_input
+            assert outer_wrapper.__wrapped__ is outer_input
             assert executor.backward_weight is outer_weight
             with executor.custom_fbw(inner_input, inner_weight):
-                assert executor.backward_input is inner_input
+                assert executor.backward_input.__wrapped__ is inner_input
                 assert executor.backward_weight is inner_weight
-            assert executor.backward_input is outer_input
+            assert executor.backward_input is outer_wrapper
             assert executor.backward_weight is outer_weight
             raise RuntimeError('expected')
 
