@@ -709,3 +709,83 @@ def test_intra_scale_unit_reducers():
             assert reducer0.params[0].shape == torch.Size([128, 128])
             assert len(reducer1.params) == 1
             assert reducer1.params[0].shape == torch.Size([64, 128])
+
+
+@replace_all_device_with('cpu')
+def test_vpp_colocated_shared_allreduce():
+    """Logical VPP stages on the same ranks reuse physical grad partitions."""
+    graph = build_graph(model_cls=SimpleModule2ConsumersSP3)
+    [mul1, add, div, sum] = graph.select(ntype=IRFwOperation)
+    graph.group([mul1])
+    graph.group([add])
+    graph.group([div, sum])
+
+    for segment in graph.select(ntype=IRSegment, flatten=False):
+        if not segment.isfw():
+            continue
+        for node in segment.nodes():
+            if node in (mul1, add, div):
+                nodes = graph.partition(
+                    node, node.algorithm('dim'), idx=0, dim=0, num=2
+                )
+            else:
+                nodes = graph.replicate(node, 2)
+            for device, subnode in enumerate(nodes):
+                graph.assign(subnode, device)
+
+    graph = IRAdapterGener.gen_weight(graph)
+    reducers = graph.select(ntype=IRWeightReducer)
+    assert len(reducers) == 1
+    assert reducers[0].nreplicas == 1
+    assert reducers[0].device == (0, 1)
+
+
+@replace_all_device_with('cpu')
+def test_vpp_colocated_shared_partitioned_weight():
+    """Partitioned weights can likewise be reused by colocated VPP stages."""
+    graph = build_graph(model_cls=SimpleModule2ConsumersTp)
+    [matmul1, add, matmul2, sum] = graph.select(ntype=IRFwOperation)
+    graph.group([matmul1])
+    graph.group([add, matmul2, sum])
+
+    for segment in graph.select(ntype=IRSegment, flatten=False):
+        if not segment.isfw():
+            continue
+        for node in segment.nodes():
+            if node in (matmul1, add):
+                nodes = graph.partition(
+                    node, node.algorithm('dim'), idx=1, dim=0, num=2
+                )
+            else:
+                nodes = graph.replicate(node, 2)
+            for device, subnode in enumerate(nodes):
+                graph.assign(subnode, device)
+
+    graph = IRAdapterGener.gen_weight(graph)
+    assert not graph.select(ntype=IRWeightReducer)
+
+
+class TwoColocatedConsumers(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.weight = torch.nn.Parameter(torch.zeros(128))
+
+    def forward(self, x):
+        return (x * self.weight + self.weight).sum()
+
+
+@replace_all_device_with('cpu')
+def test_colocated_grad_reduce_when_consumers_equal_device_count():
+    graph = build_graph(model_cls=TwoColocatedConsumers)
+    mul, add, loss = graph.select(ntype=IRFwOperation)
+    graph.group([mul])
+    graph.group([add, loss])
+    for node in (mul, add, loss):
+        parts = graph.partition(node, node.algorithm('dim'), idx=0, dim=0, num=2)
+        for device, part in enumerate(parts):
+            graph.assign(part, device)
+    IRAdapterGener.gen_weight(graph)
+    reducers = graph.select(ntype=IRWeightReducer)
+    assert len(reducers) == 1
+    assert reducers[0].device == (0, 1)
+    assert reducers[0].nreplicas == 1
