@@ -21,7 +21,7 @@ IRDataOperation is recommended to be replicated to all devices.
 import ast
 from dataclasses import dataclass, field
 import logging
-from typing import Any, List, Literal, Optional, TYPE_CHECKING, Callable, Iterable, Union
+from typing import Any, List, Literal, Optional, Sequence, TYPE_CHECKING, Callable, Iterable, Union
 import random
 
 import torch
@@ -498,16 +498,25 @@ class ModuleRecomputeResult:
 def apply_module_recompute(
     graph: IRGraph,
     module_types: type[torch.nn.Module] | Iterable[type[torch.nn.Module]],
+    *,
+    op_plans: Optional[Sequence[OpPlan]] = None,
 ) -> ModuleRecomputeResult:
     """Recompute each consecutive invocation of the requested module types.
 
-    Operators are grouped by their containing module type and FQN. A
+    Operators are grouped by their containing module type, FQN and traced
+    invocation ID. Legacy traces without call IDs use contiguous FQN groups;
+    retrace them to distinguish adjacent calls to the same module. A
     non-matching or hooked operator terminates the current group, so a group
     never spans unrelated work or an operator that cannot be replayed.
 
     This function must be called before graph partition or replication.
     ``IRGraph.recompute`` may trim operators that do not participate in a
     backward graph; ``applied_nodes`` reports what actually remains marked.
+
+    With an ``fn`` policy, construct all ``OpPlan`` objects and their hooks
+    first, then pass that sequence as ``op_plans`` before returning it. Planned
+    hooks have not yet been attached to IR nodes and must be checked here.
+    Do not add hooks to selected nodes/plans after applying this helper.
     """
     if isinstance(module_types, type):
         module_types = (module_types,)
@@ -520,6 +529,7 @@ def apply_module_recompute(
     ):
         raise TypeError("module_types must contain torch.nn.Module classes")
 
+    plans = {} if op_plans is None else {plan.op: plan for plan in op_plans}
     groups: list[list[IRFwOperation]] = []
     current_key = None
     skipped_hook_ops = 0
@@ -535,15 +545,19 @@ def apply_module_recompute(
         if matched_type is None:
             current_key = None
             continue
+        plan = plans.get(node)
         if (
             getattr(node, "pre_hook", None) is not None
             or getattr(node, "post_hook", None) is not None
+            or (plan is not None and (plan.pre_hook is not None or plan.post_hook is not None))
         ):
             skipped_hook_ops += 1
             current_key = None
             continue
 
-        key = (matched_type, node.get_module_fqn(matched_type))
+        fqn = node.get_module_fqn(matched_type)
+        calls = getattr(node, 'module_call_stack', None) or {}
+        key = (matched_type, fqn, calls.get(fqn))
         if key != current_key:
             groups.append([])
             current_key = key
@@ -561,6 +575,8 @@ def apply_module_recompute(
         for node in group
         if node.recompute is not None
     )
+    for node in applied_nodes:
+        node._module_recompute_planned = True
     return ModuleRecomputeResult(
         planned_groups=planned_groups,
         applied_nodes=applied_nodes,
@@ -1100,6 +1116,15 @@ def fn(
     fw_nodes = dict.fromkeys(graph.select(ntype=IRFwOperation))
 
     for node in fw_nodes:
+        if (
+            getattr(node, '_module_recompute_planned', False)
+            and node.recompute is not None
+            and (op_plans[node].pre_hook is not None or op_plans[node].post_hook is not None)
+        ):
+            raise ValueError(
+                'Finalize OpPlan hooks and pass op_plans to apply_module_recompute '
+                'before returning the plans'
+            )
         node.hook_meta = op_plans[node].hook_meta
         node.pre_hook = op_plans[node].pre_hook
         node.post_hook = op_plans[node].post_hook
