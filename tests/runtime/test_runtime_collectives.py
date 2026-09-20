@@ -227,3 +227,59 @@ def test_3gpu():
         assert torch.equal(outputs[0][0], outputs[0][1])
         assert torch.equal(outputs[0][0], outputs[1][1])
         assert torch.equal(outputs[0][0], outputs[2][1])
+
+
+def _ordered_rank_worker(async_op, ranks):
+    from unittest.mock import patch
+    _init_distributed(4)
+    rank = torch.distributed.get_rank()
+
+    get_group_ranks = torch.distributed.get_process_group_ranks
+
+    def explicit_group_ranks(group):
+        # Older PyTorch releases require an explicit ProcessGroup, even for WORLD.
+        if group is None:
+            raise KeyError(group)
+        return get_group_ranks(group)
+
+    value = torch.tensor([rank], dtype=torch.int64)
+    with patch.object(torch.distributed, 'get_process_group_ranks', explicit_group_ranks):
+        gathered = nnscaler.runtime.adapter.all_gather(value, 0, ranks, async_op=async_op)
+        reduced = nnscaler.runtime.adapter.reduce_scatter(
+            torch.arange(4, dtype=torch.int64) + rank * 10, 0, ranks, async_op=async_op)
+        exchanges = []
+        for idim, odim in ((0, 1), (1, 0)):
+            for operation in ('all_to_all', 'all_to_all_single'):
+                value = torch.arange(16, dtype=torch.int64).reshape(4, 4) + rank * 100
+                exchanged = getattr(nnscaler.runtime.adapter, operation)(
+                    value, idim, odim, ranks, async_op=async_op)
+                if async_op:
+                    exchanged = nnscaler.runtime.executor.AsyncCommHandler().wait(exchanged)
+                exchanges.append(exchanged)
+    if async_op:
+        gathered = nnscaler.runtime.executor.AsyncCommHandler().wait(gathered)
+        reduced = nnscaler.runtime.executor.AsyncCommHandler().wait(reduced)
+    chunked = nnscaler.runtime.adapter.chunk(
+        torch.arange(4, dtype=torch.int64), 0, ranks)
+    return clone_to_cpu(gathered), clone_to_cpu(chunked), clone_to_cpu(reduced), [clone_to_cpu(t) for t in exchanges]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.device_count() < 4, reason='lack of gpu devices')
+@pytest.mark.parametrize("async_op", [False, True])
+@pytest.mark.parametrize('ranks', [(0, 1, 2, 3), (0, 2, 1, 3), (2, 0, 3, 1)])
+def test_collectives_respect_explicit_rank_order(async_op, ranks):
+    results = launch_torchrun(4, _ordered_rank_worker, async_op, ranks)
+
+    expected_gather = torch.tensor(ranks, dtype=torch.int64)
+    expected_chunks = [ranks.index(rank) for rank in range(4)]
+    for rank, (gathered, chunked, reduced, exchanges) in results.items():
+        assert torch.equal(gathered, expected_gather)
+        assert chunked.item() == expected_chunks[rank]
+        assert reduced.item() == 60 + 4 * expected_chunks[rank]
+        for index, (idim, odim) in enumerate(((0, 1), (1, 0))):
+            expected = torch.cat([
+                (torch.arange(16).reshape(4, 4) + source * 100).chunk(4, dim=odim)[expected_chunks[rank]]
+                for source in ranks
+            ], dim=idim)
+            assert torch.equal(exchanges[index * 2], expected)
+            assert torch.equal(exchanges[index * 2 + 1], expected)
