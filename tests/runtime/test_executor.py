@@ -303,11 +303,14 @@ def test_split_backward_runs_input_grad_callback():
 @pytest.mark.parametrize('split', [False, True])
 @pytest.mark.parametrize('completed', [False, True])
 @pytest.mark.parametrize('repeats', [1, 2])
-def test_input_grad_callback_survives_async_replacement(monkeypatch, split, completed, repeats):
+@pytest.mark.parametrize('replacement_requires_grad', [False, True])
+def test_input_grad_callback_survives_async_replacement(
+    monkeypatch, split, completed, repeats, replacement_requires_grad,
+):
     monkeypatch.setattr(torch.distributed, 'get_rank', lambda: 0)
     leaf = torch.randn(2, 3, dtype=torch.float64, requires_grad=True)
     boundary = leaf * 2
-    replacement = boundary.detach().clone().requires_grad_()
+    replacement = boundary.detach().clone().requires_grad_(replacement_requires_grad)
     weight = torch.nn.Parameter(torch.randn(3, 4, dtype=torch.float64))
     callbacks = []
 

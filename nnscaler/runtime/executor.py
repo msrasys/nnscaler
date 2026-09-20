@@ -203,8 +203,10 @@ class Executor:
 
         # everytime forward a segment, detach the tensor from previous graph
         mapping: Dict[int, torch.Tensor] = dict()
-        for itensor in input_tensors:
-            if torch.is_tensor(itensor) and itensor.requires_grad:
+        for original, itensor in zip(original_inputs, input_tensors):
+            # Collective callbacks concatenate receive buffers without an
+            # autograd edge; preserve the boundary's gradient requirement.
+            if torch.is_tensor(itensor) and (itensor.requires_grad or original.requires_grad):
                 mapping[id(itensor)] = itensor.detach().requires_grad_()
         input_dtensors = tuple(mapping[id(t)] if id(t) in mapping else t for t in input_tensors)
 
