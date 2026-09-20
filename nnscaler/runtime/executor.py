@@ -307,12 +307,17 @@ class Executor:
             for tid, dtensor in saved_pairs
             if torch.is_tensor(dtensor) and dtensor.requires_grad
         }
+        # A repeated input shares one detached tensor and its full gradient.
+        # Preserve per-occurrence return values, but copy that gradient once.
+        retained_input_ids = set()
         for tensor in requested_input_tensors:
             if (
                 torch.is_tensor(tensor)
                 and tensor.retains_grad
+                and id(tensor) not in retained_input_ids
                 and (grad := grad_by_input_id.get(id(tensor))) is not None
             ):
+                retained_input_ids.add(id(tensor))
                 tensor.grad = (
                     grad.detach()
                     if tensor.grad is None
