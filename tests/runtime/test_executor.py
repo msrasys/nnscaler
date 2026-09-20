@@ -4,6 +4,9 @@
 import pytest
 import torch
 
+import nnscaler.runtime.executor as executor
+from nnscaler.parallel import ComputeConfig
+from nnscaler.runtime import _patch_torch
 from nnscaler.runtime.executor import Executor
 
 
@@ -212,3 +215,77 @@ def test_backward_preserves_retained_outer_input_grad():
         Executor.check_clear()
     finally:
         Executor.clear()
+
+
+def test_custom_fbw_restores_module_symbols():
+    original_input = executor.backward_input
+    original_weight = executor.backward_weight
+
+    def outer_input(*args, **kwargs):
+        pass
+
+    def outer_weight(*args, **kwargs):
+        pass
+
+    def inner_input(*args, **kwargs):
+        pass
+
+    def inner_weight(*args, **kwargs):
+        pass
+
+    with pytest.raises(RuntimeError, match='expected'):
+        with executor.custom_fbw(outer_input, outer_weight):
+            assert executor.backward_input is outer_input
+            assert executor.backward_weight is outer_weight
+            with executor.custom_fbw(inner_input, inner_weight):
+                assert executor.backward_input is inner_input
+                assert executor.backward_weight is inner_weight
+            assert executor.backward_input is outer_input
+            assert executor.backward_weight is outer_weight
+            raise RuntimeError('expected')
+
+    assert executor.backward_input is original_input
+    assert executor.backward_weight is original_weight
+
+
+def test_custom_fbw_config_does_not_require_default_backend(monkeypatch):
+    monkeypatch.setattr(_patch_torch, 'FBW_SUPPORTED', False)
+
+    config = ComputeConfig(
+        plan_ngpus=1,
+        runtime_ngpus=1,
+        use_end2end=True,
+        use_fbw=True,
+    )
+
+    assert config.use_fbw
+
+
+def test_custom_fbw_grad_coverage_accepts_split_gradients():
+    stage_input = torch.randn(2, 4, requires_grad=True)
+    weight = torch.nn.Parameter(torch.randn(4, 4))
+    output = stage_input @ weight
+    output_grad = torch.ones_like(output)
+
+    def backward_input(name, input_tensors, output_tensors, output_grads, weights):
+        torch.autograd.backward(
+            output_tensors,
+            grad_tensors=output_grads,
+            inputs=input_tensors,
+            retain_graph=True,
+        )
+        return input_tensors[0].grad
+
+    def backward_weight(name, weights):
+        weight_grad = stage_input.detach().T @ output_grad
+        torch.autograd.backward((weight,), grad_tensors=(weight_grad,))
+
+    with executor.custom_fbw(
+        backward_input,
+        backward_weight,
+        check_grad_coverage=True,
+    ):
+        executor.backward_input(
+            'segment', [stage_input], [output], [output_grad], (weight,)
+        )
+        executor.backward_weight('segment', (weight,))

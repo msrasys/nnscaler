@@ -6,10 +6,12 @@ Executor for runtime
 """
 import atexit
 
+from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Tuple, Any, Callable, List, Dict, Iterable, Optional, Union, Iterator
+from typing import Tuple, Any, Callable, List, Dict, Iterable, Optional, Union, Generator, Set, TypedDict
 import torch
 import logging
+from torch.autograd.graph import Node
 from torch.distributed import Work
 
 from ._patch_torch import stage_backward_input, stage_backward_weight
@@ -112,9 +114,27 @@ def AsyncCommHandler() -> _AsyncCommHandler:
 TensorPairs = List[Tuple[int, torch.Tensor]]
 
 
+class _FBWParamGroupRequired(TypedDict):
+    params: Set[Node]
+    intermediates: Union[Set[Node], List[Node]]
+
+
+class FBWParamGroup(_FBWParamGroupRequired, total=False):
+    """Mutable graph-boundary state shared by B and W.
+
+    Graph analysis creates the required ``params`` and ``intermediates`` keys,
+    with intermediates initially stored as a set. B normalizes that set to a
+    list, then its Node pre-hooks lazily add ``grads``. Each list slot matches
+    one intermediate; each tuple slot matches that Node's output index. Slots
+    remain ``None`` until the corresponding pre-hook runs.
+    """
+
+    grads: List[Optional[Tuple[Optional[torch.Tensor], ...]]]
+
+
 @dataclass
 class _WeightBackwardState:
-    param_groups: Optional[List[Dict[str, Any]]] = None
+    param_groups: Optional[List[FBWParamGroup]] = None
     output_tensors: Optional[Tuple[torch.Tensor, ...]] = None
     output_tensor_grads: Optional[Tuple[Optional[torch.Tensor], ...]] = None
 
@@ -300,6 +320,8 @@ class Executor:
                 )
 
         if len(output_tensors) == 0:
+            # Even without output tensors (an uncommon case), record a paired
+            # no-op state for the matching backward_weight call to consume.
             Executor._weight_backward_states.setdefault(name, []).append(
                 _WeightBackwardState(param_groups=[])
             )
@@ -441,6 +463,144 @@ backward = Executor.backward
 backward_input = Executor.backward_input
 backward_weight = Executor.backward_weight
 sync_tensors = Executor.sync_tensors
+
+
+@contextmanager
+def _record_fbw_grads(indexed_weights, received):
+    """Record which indexed parameters receive an autograd contribution."""
+    handles = []
+
+    def make_hook(index):
+        def hook(grad):
+            # Tensor hooks run when autograd reaches the parameter's
+            # AccumulateGrad edge. They observe a contribution without relying
+            # on `.grad`, which reducers may move into a separate buffer.
+            if grad is not None:
+                received.add(index)
+            return grad
+        return hook
+
+    try:
+        # Keep the original index from the generated `weights` tuple so error
+        # messages still identify the right parameter after reachability
+        # filtering.
+        for index, weight in indexed_weights:
+            handles.append(weight.register_hook(make_hook(index)))
+        yield
+    finally:
+        # B and W install temporary hooks independently. Never leave diagnostic
+        # hooks attached after either implementation returns or raises.
+        for handle in handles:
+            handle.remove()
+
+
+def _checked_fbw(input_fn, weight_fn):
+    """Wrap a custom FBW pair with best-effort parameter coverage checks."""
+    # A segment can have several microbatches between B and W. Each B publishes
+    # one state and the matching W consumes the oldest state for that segment.
+    pending = {}
+
+    def checked_input(name, input_tensors, output_tensors, output_tensor_grads, weights):
+        weights = tuple(weights)
+        # Walk the output-side autograd graph before B can release any of it.
+        # AccumulateGrad nodes expose their leaf tensor through `variable`, so
+        # collecting those object ids identifies structurally reachable weights.
+        nodes = [tensor.grad_fn for tensor in output_tensors if tensor.requires_grad]
+        reachable = {id(tensor) for tensor in output_tensors if tensor.requires_grad}
+        visited = set()
+        while nodes:
+            node = nodes.pop()
+            if node is None or node in visited:
+                continue
+            visited.add(node)
+            variable = getattr(node, 'variable', None)
+            if variable is not None:
+                reachable.add(id(variable))
+            nodes.extend(parent for parent, _ in node.next_functions)
+        expected = tuple(
+            (index, weight)
+            for index, weight in enumerate(weights)
+            if weight.requires_grad and id(weight) in reachable
+        )
+        # Contributions may arrive in either B or W. Share one set across the
+        # paired calls and require every reachable parameter to appear at least
+        # once; this intentionally cannot prove that all contributions arrived.
+        received = set()
+        with _record_fbw_grads(expected, received):
+            result = input_fn(name, input_tensors, output_tensors, output_tensor_grads, weights)
+        pending.setdefault(name, []).append((expected, received))
+        return result
+
+    def checked_weight(name, weights):
+        queue = pending.get(name)
+        if not queue:
+            raise RuntimeError(f'FBW check: no pending B for segment {name!r}')
+        # Preserve generated schedule order when several microbatches of the
+        # same segment are pending.
+        expected, received = queue.pop(0)
+        with _record_fbw_grads(expected, received):
+            result = weight_fn(name, weights)
+        missing = [index for index, _ in expected if index not in received]
+        if missing:
+            raise RuntimeError(f'FBW check: segment {name!r}, reachable parameter indices {missing} received no gradient in B/W')
+        return result
+
+    return checked_input, checked_weight, pending
+
+
+@contextmanager
+def custom_fbw(
+    backward_input_fn: Callable,
+    backward_weight_fn: Callable,
+    *,
+    check_grad_coverage: bool = False,
+) -> Generator[None, None, None]:
+    """Temporarily replace the FBW functions used by generated schedules.
+
+    Schedule code resolves the module-level ``backward_input`` and
+    ``backward_weight`` attributes at runtime. Replacements must keep the same
+    call signatures as the corresponding :class:`Executor` methods.
+
+    ``check_grad_coverage`` enables strict diagnostics for graph-reachable
+    parameters receiving no gradient across a paired B/W call. Intentional
+    None gradients can trigger this check. It does not detect partial missing
+    contributions. Stop training on failure; gradient accumulation may already
+    have occurred. Direct calls to Executor methods bypass these wrappers.
+
+    Args:
+        backward_input_fn (Callable): Replacement function for backward input computation.
+        backward_weight_fn (Callable): Replacement function for backward weight computation.
+        check_grad_coverage (bool, optional):
+            Enable strict gradient coverage checking. Defaults to False.
+            Only turn this on for debugging purposes or when you need to ensure full gradient coverage.
+
+    Returns:
+        Generator[None, None, None]: Context manager for custom FBW functions.
+
+    """
+    if not callable(backward_input_fn) or not callable(backward_weight_fn):
+        raise TypeError("backward_input_fn and backward_weight_fn must be callable")
+
+    if check_grad_coverage:
+        backward_input_fn, backward_weight_fn, pending = _checked_fbw(
+            backward_input_fn, backward_weight_fn,
+        )
+    else:
+        pending = {}
+
+    global backward_input, backward_weight
+    previous_backward_input = backward_input
+    previous_backward_weight = backward_weight
+    backward_input = backward_input_fn
+    backward_weight = backward_weight_fn
+    try:
+        yield
+        if any(pending.values()):
+            raise RuntimeError('FBW check: unmatched B calls at context exit')
+    finally:
+        backward_input = previous_backward_input
+        backward_weight = previous_backward_weight
+        pending.clear()
 
 
 # register checking for normal exit
