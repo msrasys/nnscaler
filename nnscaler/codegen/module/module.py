@@ -14,7 +14,7 @@ from nnscaler.ir.cten import IRCell, IRTensor
 from nnscaler.ir.tensor import IRFullTensor, IRSubTensor
 from nnscaler.ir.operator import IRBpOperation, IRDataOperation, IRFwOperation
 from nnscaler.ir.adapter import IRWeightReducer, IRAdapter
-from nnscaler.ir.adapter.prim import CollectivePrim
+from nnscaler.ir.adapter.prim import CollectivePrim, MovePrim
 
 from nnscaler.graph.graph import IRSegment
 from nnscaler.graph.parser.register import CustomizedOps
@@ -173,6 +173,27 @@ class ModuleCodeGen(FuncEmission):
         # communication groups
         self.comm_groups: List[Tuple[int]] = self.get_comm_groups()
         self.add_scale_reducers()
+
+    def get_p2p_pairs(self):
+        """
+        Scale real P2P MovePrim endpoints to runtime devices.
+        """
+        nreplica = self.runtime_ndevs // len(self.devices)
+        pairs = set()
+        for adapter in self.execplan.graph.select(ntype=IRAdapter):
+            for prim in adapter.prims:
+                if not isinstance(prim, MovePrim):
+                    continue
+                src, dst = prim.kwargs['src'], prim.kwargs['dst']
+                if src is None or dst is None or src == dst:
+                    continue
+                for i in range(nreplica):
+                    shifted_src = int(src) + i * len(self.devices)
+                    shifted_dst = int(dst) + i * len(self.devices)
+                    pair = (shifted_src, shifted_dst) if shifted_src < shifted_dst else (shifted_dst, shifted_src)
+                    pairs.add(pair)
+        return sorted(pairs)
+
 
     def add_scale_reducers(self):
         """
@@ -489,7 +510,9 @@ class ModuleCodeGen(FuncEmission):
             elif isinstance(node, IRFwOperation):
                 raise RuntimeError(f"Unexcepted global-level op call: {node}")
             elif isinstance(node, IRAdapter):
-                codes = self.emit_adapter(node, prefix_attr='self.', async_op=CompileFlag.async_comm)
+                codes = self.emit_adapter(
+                    node, prefix_attr='self.', async_op=CompileFlag.async_comm,
+                )
             elif isinstance(node, IRWeightReducer):
                 self.init_reducer(node, device, param_first_used_pos, as_parallel_module)
                 codes = self.emit_reducer(node)
@@ -595,6 +618,14 @@ class ModuleCodeGen(FuncEmission):
                 if CompileFlag.use_jit and name.startswith('segment'):
                     cb.insert_body('@torch.jit.script_method')
                 cb.insert_body(fb.code)
+
+                if CompileFlag.async_comm and isinstance(node, IRAdapter) and self.is_async_recv_adapter(node):
+                    with FunctionBlock(func_name=f'{name}_wait', args=['self', '__pending']) as wait_fb:
+                        wait_fb.insert_body(self.emit_async_recv_adapter_wait(node))
+                        outputs = [self.tensor_name(t) for t in node.outputs()]
+                        wait_fb.insert_body(f"return {', '.join(outputs)}")
+                    cb.insert_body('')
+                    cb.insert_body(wait_fb.code)
 
                 if saved_tensors_hooks_needed:
                     with FunctionBlock(func_name=name, args=input_args) as fb:
@@ -725,6 +756,11 @@ class ModuleCodeGen(FuncEmission):
         for ranks in self.comm_groups:
             code = sign.format(ranks=list(ranks))
             self.model_init_statements.append(code)
+        p2p_pairs = self.get_p2p_pairs()
+        if CompileFlag.async_comm and p2p_pairs:
+            self.model_init_statements.append('# P2P communication groups')
+            self.model_init_statements.append(
+                f'nnscaler.runtime.device.DeviceGroup().init_p2p_groups(pairs={p2p_pairs})')
         self.model_init_statements.append(' ')
 
     def init_attributes(self, node: IRCell) -> dict[str, dict[str, Any]]:

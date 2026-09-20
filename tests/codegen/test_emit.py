@@ -1,12 +1,15 @@
 #  Copyright (c) Microsoft Corporation.
 #  Licensed under the MIT License.
 
+import torch
 import pytest
 from nnscaler.codegen.emit import CodeEmission, IRValue
 from nnscaler.ir.cten import IRObject
 from nnscaler.codegen.emit import FuncEmission
 from nnscaler.graph.function import Dropout
 from nnscaler.ir.tensor import IRFullTensor
+from nnscaler.ir.adapter import IRAdapter
+from nnscaler.ir.adapter.prim import ChunkPrim, MovePrim
 
 
 def test_tensor_name():
@@ -36,3 +39,51 @@ def test_emit_module_attr():
     code = FuncEmission().emit_fnode(dropout, runtime_devid=0, plan_ndevs=1, runtime_ndevs=1)
     print(code)
     assert 'training=self.training' in code[0]
+
+
+def test_async_receive_waits_before_local_chunk(monkeypatch):
+    import nnscaler
+
+    full = IRFullTensor((8,), name='received', dtype=torch.float32).tosub()
+    part = full.parent.select(((0, 4),), (0, 1))
+    adapter = IRAdapter([], [part])
+    adapter.device = [1]
+    full.cell = adapter
+    adapter.prims = [
+        MovePrim([], [full], shape=(8,), dtype='torch.float32', src=0, dst=1),
+        ChunkPrim([full], [part], dim=0, ranks=[1, 2]),
+    ]
+    pending = torch.zeros(8)
+    events = []
+    from nnscaler.runtime.executor import _AsyncCommHandler
+    handler = _AsyncCommHandler()
+    monkeypatch.setattr(nnscaler.runtime.executor, '_instance', handler)
+
+    class Work:
+        def wait(self):
+            events.append('wait')
+            pending.copy_(torch.arange(8, dtype=torch.float32))
+
+    def receive(*args, **kwargs):
+        events.append('receive')
+        handler.submit(pending, [Work()])
+        return pending
+
+    def chunk(tensor, **kwargs):
+        events.append('chunk')
+        return tensor[:4]
+
+    monkeypatch.setattr(nnscaler.runtime.adapter, 'move', receive)
+    monkeypatch.setattr(nnscaler.runtime.adapter, 'chunk', chunk)
+    emitter = FuncEmission()
+    namespace = {'nnscaler': nnscaler, 'torch': torch}
+    try:
+        exec('\n'.join(emitter.emit_adapter(adapter, async_op=True)), namespace)
+        assert events == ['receive']
+        namespace['__pending'] = namespace[emitter.tensor_name(part)]
+        exec('\n'.join(emitter.emit_async_recv_adapter_wait(adapter)), namespace)
+        assert events == ['receive', 'wait', 'chunk']
+        assert torch.equal(namespace[emitter.tensor_name(part)], torch.arange(4, dtype=torch.float32))
+        handler.check_clear()
+    finally:
+        handler.drain()

@@ -58,6 +58,12 @@ class _DeviceGroup:
 
         torch.cuda.set_device(self.local_rank)
         self.groups: Dict = { '1'*self.world_size: None }
+        self.p2p_groups: Dict[tuple[int, int], Optional[torch.distributed.ProcessGroup]] = {}
+        self.use_p2p_groups = (
+            not CompileFlag.dev_mode
+            and is_running_distributed()
+            and self.world_size > 1
+        )
         self.streams: Dict[str, torch.cuda.Stream] = {
             'default': torch.cuda.default_stream()}
         self.events: Dict[str, torch.cuda.Event] = {}
@@ -87,6 +93,39 @@ class _DeviceGroup:
             self.groups[rank_bits] = torch.distributed.new_group(
                 list(ranks), timeout=_LARGE_TIMEOUT)
         return self.groups[rank_bits]
+
+    def get_p2p_group(self, src: int, dst: int):
+        """Return the pair's dedicated group, or None for the default group."""
+        if not self.use_p2p_groups or src == dst:
+            return None
+        return self.p2p_groups.get(tuple(sorted((src, dst))))
+
+
+    def init_p2p_groups(self, pairs):
+        """
+        Create deterministic two-rank groups for P2P communication.
+
+        torch.distributed.new_group must be called by all ranks in the same order.
+        The generated module passes a global sorted list of actual P2P pairs.
+        """
+        if not self.use_p2p_groups:
+            return
+
+        normalized_pairs = []
+        for src, dst in pairs:
+            if src == dst:
+                continue
+            if src < 0 or src >= self.world_size or dst < 0 or dst >= self.world_size:
+                raise ValueError(f'P2P pair ({src}, {dst}) is out of world size {self.world_size}')
+            normalized_pairs.append((src, dst) if src < dst else (dst, src))
+        normalized_pairs = sorted(set(normalized_pairs))
+
+        for pair in normalized_pairs:
+            if pair not in self.p2p_groups:
+                self.p2p_groups[pair] = torch.distributed.new_group(
+                    list(pair), timeout=_LARGE_TIMEOUT)
+        torch.distributed.barrier()
+
 
     def long_barrier(self):
         """
