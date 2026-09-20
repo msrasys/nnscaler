@@ -5,9 +5,9 @@ from dataclasses import dataclass
 import dis
 import importlib
 import inspect
+import linecache
 from pathlib import Path
 import sys
-import traceback
 
 from typing import List, Tuple, Optional
 
@@ -88,15 +88,28 @@ class FrameRecord:
 
 def get_frame_record() -> Optional[FrameRecord]:
     # record code frame, include filename, line number, and function name
-    frame_record = None
     cube_path = str(Path(importlib.util.find_spec('nnscaler').origin).parent) + '/'  # the cube path
     torch_path = str(Path(importlib.util.find_spec('torch').origin).parent) + '/'  # the torch path
     ignore_dirs = [cube_path, torch_path]
-    # the last frame is the current frame [get_frame_record], so we need to skip it
-    for frame in traceback.extract_stack()[-2::-1]:
-        if any(p in frame.filename for p in ignore_dirs):
-            continue
-        frame_record = FrameRecord(frame.filename, frame.lineno, frame.line, frame.name)
-        break
-    return frame_record
-
+    # Only the nearest user frame is retained. Extracting the full stack first
+    # validates every source file in linecache, causing repeated filesystem I/O
+    # for framework frames that are then discarded (especially costly on NFS).
+    # Preserve tracebacklimit semantics: the old extraction included this frame.
+    limit = getattr(sys, 'tracebacklimit', None)
+    remaining = None if limit is None else max(0, limit - 1)
+    frame = sys._getframe(1)
+    try:
+        while frame is not None and (remaining is None or remaining > 0):
+            filename = frame.f_code.co_filename
+            if not any(p in filename for p in ignore_dirs):
+                linecache.lazycache(filename, frame.f_globals)
+                linecache.checkcache(filename)
+                line = linecache.getline(filename, frame.f_lineno).strip()
+                return FrameRecord(filename, frame.f_lineno, line, frame.f_code.co_name)
+            frame = frame.f_back
+            if remaining is not None:
+                remaining -= 1
+    finally:
+        # Do not retain frame references and their locals after tracing.
+        del frame
+    return None
