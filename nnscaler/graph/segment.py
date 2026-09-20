@@ -1454,6 +1454,25 @@ class IRSegmentExpander:
 
         return dev_unique
 
+    @staticmethod
+    def _map_grads(forward_ios, backward_ios, device):
+        candidates = [
+            tensor.grad for tensor in forward_ios
+            if isinstance(tensor, IRSubTensor) and tensor.grad is not None
+        ]
+        mapped = []
+        for backward_io in backward_ios:
+            if not isinstance(backward_io, IRSubTensor):
+                raise TypeError(f"Expected backward tensor IO, got {type(backward_io)}")
+            index = IR.index_with_same_parent(backward_io, candidates)
+            if index is None:
+                raise ValueError(
+                    f"Cannot map backward IO {backward_io} from forward gradients {candidates}"
+                )
+            mapped.append(IR.copy_and_set_object_device(candidates[index], device))
+        return mapped
+
+
     def get_per_device_inout(self):
         """
         Call this function after the graph is partitioned
@@ -1476,28 +1495,8 @@ class IRSegmentExpander:
             for devid in self._per_device_input:
                 inputs = self._per_device_input[devid]
                 outputs = self._per_device_output[devid]
-                # get backward graph inputs
-                output_grads = [IR.copy_and_set_object_device(t.grad, devid) for t in outputs if isinstance(t, IRSubTensor) and t.grad is not None]
-                # get backward graph outputs
-                input_grads = [IR.copy_and_set_object_device(t.grad, devid) for t in inputs if isinstance(t, IRSubTensor) and t.grad is not None]
-
-                # The backward per-device IO is built by filtering the forward IO
-                # grads, but it is later indexed positionally against
-                # seg_bw.inputs()/outputs() (see adjust_*_for_per_device_seg and
-                # is_partitioned_segment_io). Assert the positional co-indexing
-                # assumption holds: same length and parent-aligned with the
-                # backward segment's declared IO.
-                assert len(output_grads) == len(bw_inputs) \
-                    and all(g.parent == t.parent for g, t in zip(output_grads, bw_inputs)), \
-                    f"backward per-device input not co-indexed with backward segment inputs: " \
-                    f"{[g.parent for g in output_grads]} vs {[t.parent for t in bw_inputs]}"
-                assert len(input_grads) == len(bw_outputs) \
-                    and all(g.parent == t.parent for g, t in zip(input_grads, bw_outputs)), \
-                    f"backward per-device output not co-indexed with backward segment outputs: " \
-                    f"{[g.parent for g in input_grads]} vs {[t.parent for t in bw_outputs]}"
-
-                seg_bw.expander._per_device_input[devid] = output_grads
-                seg_bw.expander._per_device_output[devid] = input_grads
+                seg_bw.expander._per_device_input[devid] = self._map_grads(outputs, bw_inputs, devid)
+                seg_bw.expander._per_device_output[devid] = self._map_grads(inputs, bw_outputs, devid)
 
         return self._per_device_input, self._per_device_output
 
@@ -1555,7 +1554,8 @@ class IRSegmentExpander:
                 if isinstance(t, IRSubTensor) and t.parent == tensor.parent:
                     tensor_idx_in_input = idx
                     per_device_input: IRSubTensor = device_input_map[device][tensor_idx_in_input]
-                    if per_device_input.parent.shape == per_device_input.shape:
+                    if (per_device_input.parent.shape == per_device_input.shape
+                        and per_device_input.valmap == (0, 1)):
                         return None # no need to fix if the input is not partitioned
                     return per_device_input
             else:
@@ -1569,15 +1569,16 @@ class IRSegmentExpander:
                     node.input(0), segment.inputs(), node.device[0], device_input_map)
                 )
             ):
-                # input of segment is not shared with other nodes
-                # so its valmap must be (0, 1)
-                assert per_device_input.valmap == (0, 1)
                 new_node = Identity(per_device_input)
                 new_node.device = node.device
                 new_node.comment = f"created at: segment dispatch: fix identity"
                 new_node.set_output(0, node.output(0).parent.select(per_device_input.indmap, per_device_input.valmap))
                 if node.output(0).grad is not None:
-                    new_node.output(0).grad = node.output(0).grad.parent.select(per_device_input.indmap, (0, 1))
+                    grad = per_device_input.grad
+                    new_node.output(0).grad = node.output(0).grad.parent.select(
+                        grad.indmap if grad is not None else per_device_input.indmap,
+                        grad.valmap if grad is not None else (0, 1),
+                    )
                 new_bwnode = segment.create_bwop(new_node)
                 new_bwnode.device = node.device
                 replaced_nodes[node] = new_node

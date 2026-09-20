@@ -14,6 +14,7 @@ import nnscaler
 import nnscaler.graph.function.function as F
 from nnscaler.ir.tensor import IRFullTensor
 from nnscaler.graph import IRGraph
+from nnscaler.graph.segment import IRSegmentExpander
 from nnscaler.ir.adapter import IRAdapter
 from nnscaler.parallel import ComputeConfig, parallelize, build_optimizer
 from nnscaler.ir.operator import IRFwOperation, IRDataOperation
@@ -242,3 +243,18 @@ def test_infer_grad_no_grad(use_end2end):
     torchrun(2, worker_b, use_end2end)
     # should not raise any exception
     assert True
+
+
+def test_segment_expander_maps_backward_io_by_parent():
+    first = IRFullTensor((4,), requires_grad=True).tosub()
+    second = IRFullTensor((4,), requires_grad=True).tosub()
+    first.grad = first.parent.grad.tosub()
+    second.grad = second.parent.grad.tosub()
+
+    mapped = IRSegmentExpander._map_grads(
+        [first, second],
+        [second.grad, first.grad],
+        device=3,
+    )
+    assert [tensor.parent for tensor in mapped] == [second.grad.parent, first.grad.parent]
+    assert all(tensor.device == (3,) for tensor in mapped)
