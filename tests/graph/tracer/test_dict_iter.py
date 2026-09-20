@@ -19,7 +19,7 @@ def dict_items_as_input(x_items):
     return x_items
 
 
-class TestModule(torch.nn.Module):
+class DictIterModule(torch.nn.Module):
     def __init__(self):
         super().__init__()
         self.param = torch.nn.Parameter(torch.randn(5, 10))
@@ -35,7 +35,7 @@ class TestModule(torch.nn.Module):
 
 
 def test_dict_iter_metadata():
-    graph = concrete_trace(TestModule(),
+    graph = concrete_trace(DictIterModule(),
                            {'x': torch.randn(5, 10)},
                             autowrap_leaf_function={
                                 wrap_as_dict: wrap_utils.LeafWrapInfo([], True, None),
