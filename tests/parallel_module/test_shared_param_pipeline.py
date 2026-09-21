@@ -591,6 +591,63 @@ def test_colocated_shared_param_pipeline_async_fbw():
     torchrun(4, worker_colocated_shared_param, None, True, True, True)
 
 
+class UnevenColocatedSharedModel(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.weight = nn.Parameter(torch.randn(16, 16))
+        self.bias = nn.Parameter(torch.randn(16))
+
+    def forward(self, x):
+        x = torch.matmul(x, self.weight)
+        x = torch.matmul(x, self.weight)
+        x = torch.matmul(x, self.weight)
+        return (x + self.bias).sum()
+
+
+def policy_uneven_colocated_shared_param(graph, cfg):
+    stage = -1
+    for node in get_pas_ops(graph):
+        if node.fn in (torch.matmul, torch.add):
+            stage += 1
+        yield OpPlan(node, stage_id=stage, partition=OpPartition(0, 0))
+
+
+def worker_uneven_colocated_shared_param(async_reducer):
+    nnscaler.init()
+    torch.manual_seed(0)
+    model = UnevenColocatedSharedModel().double()
+    reference = copy.deepcopy(model).cuda()
+    config = ComputeConfig(
+        2, 2, use_end2end=True, use_async_reducer=async_reducer,
+        pas_config={
+            'pipeline_size': 1,
+            'pipeline_nmicros': 4,
+            'pipeline_scheduler': '1f1b_interleaved',
+        },
+    )
+    directory = Path(tempfile.gettempdir()) / f'test_uneven_colocated_shared_param_{PYTEST_RUN_ID}'
+    with clear_dir_on_rank0(directory) as tempdir:
+        pm = parallelize(
+            model, {'x': torch.ones(4, 16, dtype=torch.float64)},
+            policy_uneven_colocated_shared_param, config,
+            gen_savedir=tempdir, reuse='override',
+        ).cuda()
+        assert len(pm.reducers) == 1
+        reducer = pm.reducers[0]
+        registered_counts = {
+            meta.orig_name: reducer._param_num_segments[getattr(pm, name)]
+            for name, meta in pm.fullmap.items()
+        }
+        assert registered_counts == {'weight': 3, 'bias': 1}
+        check_pipeline_training(pm, reference)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.device_count() < 2, reason='lack of gpu devices')
+@pytest.mark.parametrize('async_reducer', [False, True])
+def test_uneven_colocated_shared_param_pipeline(async_reducer):
+    torchrun(2, worker_uneven_colocated_shared_param, async_reducer)
+
+
 class ColocatedNoGradModel(Model):
     def __init__(self, train_first):
         super().__init__()

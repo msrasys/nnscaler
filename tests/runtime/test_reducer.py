@@ -337,17 +337,18 @@ def test_flatten_param_info_cuda_device_and_synchronization(monkeypatch):
 
 
 @mock_reducer_env(0, 2)
-def test_async_reducer_shared_param_segments(monkeypatch):
+@pytest.mark.parametrize('num_segments', [2, 3])
+def test_async_reducer_shared_param_segments(monkeypatch, num_segments):
     monkeypatch.setattr(torch.cuda, 'synchronize', Mock())
     shared = torch.nn.Parameter(torch.ones(2))
     ordinary = torch.nn.Parameter(torch.ones(2))
     reducer = Reducer([0, 1], async_op=True)
-    reducer.add_param(shared, num_segments=2)
+    reducer.add_param(shared, num_segments=num_segments)
     reducer.add_param(ordinary)
     reducer.build_buckets()
     assert len(reducer.buckets) == 1
     bucket = reducer.buckets[0]
-    assert bucket._num_grads_per_microbatch == 3
+    assert bucket._num_grads_per_microbatch == num_segments + 1
 
     work = Mock()
     all_reduce = Mock(return_value=work)
@@ -359,19 +360,73 @@ def test_async_reducer_shared_param_segments(monkeypatch):
             (shared.sum() + shared.sum()).backward()
             ordinary.sum().backward()
             assert all_reduce.call_count == step
-            (3 * shared.sum()).backward()
-            assert all_reduce.call_count == step + int(micro == nmicros - 1)
-        assert bucket._async_param_cnt == nmicros * 3
+            for segment in range(1, num_segments):
+                (3 * shared.sum()).backward()
+                ready = micro == nmicros - 1 and segment == num_segments - 1
+                assert all_reduce.call_count == step + int(ready)
+        assert bucket._async_param_cnt == nmicros * (num_segments + 1)
         assert all_reduce.call_args.kwargs['async_op'] is True
         reducer.sync_grads()
         assert work.wait.call_count == step + 1
-        torch.testing.assert_close(shared.grad, torch.full_like(shared, 5 * nmicros))
+        expected_shared_grad = (2 + 3 * (num_segments - 1)) * nmicros
+        torch.testing.assert_close(shared.grad, torch.full_like(shared, expected_shared_grad))
         torch.testing.assert_close(ordinary.grad, torch.full_like(ordinary, nmicros))
         reducer.zero_grad()
         assert bucket._async_param_cnt == 0
     param_map = {param: torch.nn.Parameter(torch.empty_like(param)) for param in reducer.params}
     state = reducer._pack(param_map)
-    assert state['_param_num_segments'] == {param_map[shared]: 2, param_map[ordinary]: 1}
+    assert state['_param_num_segments'] == {param_map[shared]: num_segments, param_map[ordinary]: 1}
+
+
+@mock_reducer_env(0, 2)
+@pytest.mark.parametrize('nmicros', [1, 3])
+def test_async_reducer_rejects_excess_parameter_before_bucket_ready(monkeypatch, nmicros):
+    shared = torch.nn.Parameter(torch.ones(2))
+    ordinary = torch.nn.Parameter(torch.ones(2))
+    reducer = Reducer([0, 1], async_op=True)
+    reducer.add_param(shared, num_segments=3)
+    reducer.add_param(ordinary)
+    reducer.build_buckets()
+    assert len(reducer.buckets) == 1
+    bucket = reducer.buckets[0]
+    reducer.grad_accumulation_steps = nmicros
+    all_reduce = Mock()
+    monkeypatch.setattr(torch.distributed, 'all_reduce', all_reduce)
+
+    # Extra shared-parameter contributions must not stand in for the missing
+    # ordinary-parameter contribution, even when the bucket total would match.
+    for _ in range(3 * nmicros):
+        shared.sum().backward()
+    before = bucket._contiguous_grads.clone()
+    all_reduce.assert_not_called()
+    with pytest.raises(RuntimeError, match='parameter.*gradient contributions'):
+        shared.sum().backward()
+    all_reduce.assert_not_called()
+    torch.testing.assert_close(bucket._contiguous_grads, before)
+
+
+@mock_reducer_env(0, 2)
+def test_async_reducer_rejects_excess_before_modifying_inflight_buffer(monkeypatch):
+    shared = torch.nn.Parameter(torch.ones(2))
+    ordinary = torch.nn.Parameter(torch.ones(2))
+    reducer = Reducer([0, 1], async_op=True)
+    reducer.add_param(shared, num_segments=3)
+    reducer.add_param(ordinary)
+    reducer.build_buckets()
+    bucket = reducer.buckets[0]
+    reducer.grad_accumulation_steps = 1
+    all_reduce = Mock(return_value=Mock())
+    monkeypatch.setattr(torch.distributed, 'all_reduce', all_reduce)
+
+    for _ in range(3):
+        shared.sum().backward()
+    ordinary.sum().backward()
+    all_reduce.assert_called_once()
+    before = bucket._contiguous_grads.clone()
+    with pytest.raises(RuntimeError):
+        ordinary.sum().backward()
+    torch.testing.assert_close(bucket._contiguous_grads, before)
+    all_reduce.assert_called_once()
 
 
 @mock_reducer_env(0, 2)
