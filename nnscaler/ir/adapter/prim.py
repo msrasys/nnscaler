@@ -301,7 +301,8 @@ class RVScatterPrim(CollectivePrim):
             kwargs['src'] = itensors[0].device[0] if len(itensors[0].device) > 0 else None
             kwargs['dsts'] = tuple(otensor.device[0] if len(otensor.device) > 0 else None for otensor in otensors)
         shape, dtype, src, dsts = kwargs['shape'], kwargs['dtype'], kwargs['src'], kwargs['dsts']
-        super().__init__(itensors, otensors, shape=shape, dtype=dtype, src=src, dst=dsts)
+        super().__init__(itensors, otensors, shape=shape, dtype=dtype, src=src, dsts=dsts,
+                         ranks=kwargs.get('ranks', (src,) + tuple(dsts)))
         self.signature = 'nnscaler.runtime.adapter.rvscatter'
 
     def volume(self) -> int:
@@ -351,7 +352,8 @@ class RVGatherPrim(CollectivePrim):
             kwargs['srcs'] = tuple(itensor.device[0] if len(itensor.device) > 0 else None for itensor in itensors)
             kwargs['dst'] = otensors[0].device[0] if len(otensors[0].device) > 0 else None
         shape, dtype, srcs, dst = kwargs['shape'], kwargs['dtype'], kwargs['srcs'], kwargs['dst']
-        super().__init__(itensors, otensors, shape=shape, dtype=dtype, srcs=srcs, dst=dst)
+        super().__init__(itensors, otensors, shape=shape, dtype=dtype, srcs=srcs, dst=dst,
+                         ranks=kwargs.get('ranks', tuple(srcs) + (dst,)))
         self.signature = 'nnscaler.runtime.adapter.rvgather'
 
     def volume(self) -> int:
@@ -496,6 +498,13 @@ class AllToAllPrim(CollectivePrim):
         """
         if 'ranks' not in kwargs and all(tensor.device for tensor in itensors):
             kwargs['ranks'] = tuple(tensor.device[0] for tensor in itensors)
+        # Dispatch passes global layouts with only this rank's local tensors.
+        # Infer the destination order only while the full output layout is available.
+        if ('ranks' in kwargs and len(otensors) == len(kwargs['ranks'])
+                and all(tensor.device for tensor in otensors)):
+            dsts = tuple(tensor.device[0] for tensor in otensors)
+            if dsts != tuple(kwargs['ranks']):
+                kwargs.setdefault('dsts', dsts)
         super().__init__(itensors, otensors, idim=idim, odim=odim, **kwargs)
         self.signature = 'nnscaler.runtime.adapter.all_to_all'
 
@@ -625,7 +634,7 @@ class AllGatherSplitPrim(AllGatherPrim):
         self.signature = 'nnscaler.runtime.adapter.nn.allgather_split'
 
 
-class SplitAllGatherPrim(AllGatherPrim):
+class SplitAllGatherPrim(ChunkPrim):
     """
     forward: split
     backward: all-gather
