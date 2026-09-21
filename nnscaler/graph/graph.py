@@ -926,6 +926,9 @@ class IRGraph(IRSegment):
                     stage 5: t5 = identity(t4)
                              xx = consume(t5)
 
+            Graph outputs follow these identities to the last consuming stage.
+            Segment interfaces are then inferred from the updated graph outputs.
+
         Args:
             nodes Tuple[IRFwOperations]: the start forward node of each stage.
 
@@ -1053,6 +1056,7 @@ class IRGraph(IRSegment):
             for sid in range(psid + 1, end_sid):
                 # insert identity
                 op = insert_identity(out, sid)
+                self.replace_output(out, op.output(0))
                 out = op.output(0)
 
                 if isinstance(fobj, IRTensor):
