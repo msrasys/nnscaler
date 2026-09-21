@@ -3,21 +3,22 @@
 
 import tempfile
 from pathlib import Path
+from unittest.mock import patch
 import pytest
 import torch
-from nnscaler import parallelize, ComputeConfig
+from nnscaler import parallelize, ComputeConfig, init
 from nnscaler.parallel import merge_state_dicts
 from tests.launch_torchrun import launch_torchrun, clone_to_cpu_recursively
 from tests.utils import clear_dir_on_rank0, init_random, PYTEST_RUN_ID
-from tests.parallel_module.common import init_distributed
 from tests.parallel_module.test_gencode_pipeline import SplitSegmentModule, split_segment_pas
 
 
-def _narrowed_boundary_worker():
+def _narrowed_boundary_worker(async_comm):
     torch.set_float32_matmul_precision("highest")
     dim = 16
     nmicros = 4
-    init_distributed()
+    init()
+    torch.set_default_device(f'cuda:{torch.distributed.get_rank()}')
     with clear_dir_on_rank0(Path(tempfile.gettempdir()) / f'narrowed_boundary_{PYTEST_RUN_ID}') as tempdir:
         init_random()
         model = parallelize(
@@ -29,6 +30,7 @@ def _narrowed_boundary_worker():
                 4,
                 constant_folding=False,
                 use_end2end=True,
+                use_async_comm=async_comm,
                 pas_config={
                     'pipeline_nmicros': nmicros,
                     'pipeline_scheduler': '1f1b',
@@ -39,18 +41,33 @@ def _narrowed_boundary_worker():
         )
         model.cuda()
         init_random()
-        model.train_step([torch.randn(8, dim) for _ in range(nmicros)])
+        samples = [torch.randn(8, dim) for _ in range(nmicros)]
+        with patch('torch.distributed.isend', wraps=torch.distributed.isend) as send, \
+                patch('torch.distributed.irecv', wraps=torch.distributed.irecv) as recv:
+            losses = model.train_step(samples)
+            assert bool(send.call_count + recv.call_count) == async_comm
+            send.reset_mock()
+            recv.reset_mock()
+            model.eval()
+            inferred = model.infer_step(samples)
+            assert bool(send.call_count + recv.call_count) == async_comm
+        for actual, expected in zip(inferred, losses):
+            torch.testing.assert_close(actual, expected, atol=1e-5, rtol=1e-5)
+        from nnscaler.runtime.executor import Executor, AsyncCommHandler
+        Executor.check_clear()
+        AsyncCommHandler().check_clear()
         grads = {name: param.grad for name, param in model.named_parameters() if param.grad is not None}
         model._add_extra_state(grads, '')
         return clone_to_cpu_recursively(grads)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.device_count() < 4, reason='lack of gpu devices')
-def test_narrowed_pipeline_boundary():
+@pytest.mark.parametrize("async_comm", [False, True])
+def test_narrowed_pipeline_boundary(async_comm):
     torch.set_float32_matmul_precision("highest")
     dim = 16
     nmicros = 4
-    results = launch_torchrun(4, _narrowed_boundary_worker)
+    results = launch_torchrun(4, _narrowed_boundary_worker, async_comm)
     merged_grads, _ = merge_state_dicts([results[rank] for rank in range(4)])
 
     torch.cuda.set_device(0)

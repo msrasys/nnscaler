@@ -181,6 +181,7 @@ class Executor:
         """
         execute adapter
         """
+        input_tensors = Executor.sync_tensors(input_tensors)
         if not requires_grad:
             with torch.no_grad():
                 outputs = subgraph(*input_tensors)
