@@ -19,7 +19,7 @@ from nnscaler.ir.tensor import IRFullTensor, IRSubTensor, ValueMap
 from nnscaler.ir.operator import IRFwOperation, IRDataOperation
 
 from nnscaler.ir.adapter import IRAdapter, IRWeightReducer
-from nnscaler.ir.adapter.prim import IRAdapterPrim, ObjectBroadcastPrim, ObjectMovePrim
+from nnscaler.ir.adapter.prim import IRAdapterPrim
 from nnscaler.graph.function.function import Accum, Cat, MultiRef
 from nnscaler.flags import CompileFlag
 
@@ -630,68 +630,6 @@ class IRAdapterGener:
         return graph
 
     @staticmethod
-    def gen_object_adapter(
-        pobjects: List[IRObject],
-        cobjects: List[IRObject],
-    ) -> Optional[IRAdapter]:
-        """Generate whole-object communication between replicated placements.
-
-        Unlike tensors, an IRObject cannot be spatially or value partitioned. Map
-        remote consumers evenly to producer replicas and use only point-to-point
-        moves or broadcasts of the complete object.
-        """
-        if not pobjects or not cobjects:
-            return None
-
-        if any(len(obj.device) != 1 for obj in pobjects + cobjects):
-            raise ValueError("IRObject adapter generation expects one device per placement")
-
-        # expand_devices has already removed duplicate placements. Keep its
-        # ordering because producer/consumer replicas are laid out in that order.
-        producers = {obj.device[0]: obj for obj in pobjects}
-        consumers = {obj.device[0]: obj for obj in cobjects}
-        remote_consumers = [
-            obj for devid, obj in consumers.items()
-            if devid not in producers
-        ]
-        if not remote_consumers:
-            return None
-
-        # Split consecutive consumer replicas evenly across producer replicas.
-        # This preserves scale-unit grouping, e.g. producers [0, 4] and consumers
-        # [1, 2, 3, 5, 6, 7] become broadcasts [0..3] and [4..7].
-        producer_objects = list(producers.values())
-        group_size, extra = divmod(len(remote_consumers), len(producer_objects))
-        offset = 0
-        adapter_inputs = []
-        adapter_outputs = []
-        prims = []
-        for idx, producer in enumerate(producer_objects):
-            size = group_size + (1 if idx < extra else 0)
-            targets = remote_consumers[offset:offset + size]
-            offset += size
-            if not targets:
-                continue
-
-            adapter_inputs.append(producer)
-            if len(targets) == 1:
-                adapter_outputs.extend(targets)
-                prims.append(ObjectMovePrim([producer], targets))
-                continue
-
-            # A broadcast includes its source rank as an output. Prefer the
-            # local consumer placement; otherwise reuse the producer object.
-            outputs = list(targets)
-            outputs.append(consumers.get(producer.device[0], producer))
-            adapter_outputs.extend(outputs)
-            prims.append(ObjectBroadcastPrim([producer], outputs))
-
-        adapter = IRAdapter(adapter_inputs, adapter_outputs)
-        adapter.prims = prims
-        return adapter
-
-
-    @staticmethod
     def _local_optimize(graph: IRSegment):
         # Here are two optimization passes that are applied before generating communication adapters:
         # - local producer fusion: If an operator is partitioned and there are multiple
@@ -966,7 +904,7 @@ class IRAdapterGener:
 
             fadapters = []
 
-            fadapter = IRAdapterGener.gen_object_adapter(fpobjects, fcobjects)
+            fadapter = ConcurrentGener.gen_objects(fpobjects, fcobjects)
             if fadapter is not None:
                 fadapters.append(fadapter)
 
@@ -975,7 +913,7 @@ class IRAdapterGener:
                    set(t.device[0] for t in out_fcobjs) == set(t.device[0] for t in fcobjects):
                     pass
                 else:
-                    fadapter = IRAdapterGener.gen_object_adapter(fpobjects, out_fcobjs)
+                    fadapter = ConcurrentGener.gen_objects(fpobjects, out_fcobjs)
                     if fadapter is not None:
                         fadapters.append(fadapter)
 

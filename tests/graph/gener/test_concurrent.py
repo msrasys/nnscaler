@@ -2,10 +2,35 @@
 #  Licensed under the MIT License.
 
 import pytest
+from nnscaler.ir.cten import IR
 from nnscaler.ir.tensor import IRFullTensor
 from nnscaler.graph.gener.concurrent import ConcurrentGener, CompileFlag, \
     AllToAllPrim, ReduceScatterPrim, _logger
 from ...utils import catch_log
+
+
+@pytest.mark.parametrize('producer_ranks,consumer_ranks,expected', [
+    ([0], [1, 2], {0: {0, 1, 2}}),
+    ([0, 4], list(range(8)), {0: {0, 1, 2, 3}, 4: {4, 5, 6, 7}}),
+    ([0, 3], [1, 2, 4, 5, 6], {0: {0, 1, 2, 4}, 3: {3, 5, 6}}),
+    ([0, 2], [1, 3, 4], None),
+    ([0, 1], [0, 1, 2], None),
+    ([], [0], None),
+])
+def test_complete_tensor_replica_broadcast(producer_ranks, consumer_ranks, expected):
+    tensor = IRFullTensor((4, 4)).tosub()
+    producers = [IR.copy_and_set_object_device(tensor, rank) for rank in producer_ranks]
+    consumers = [IR.copy_and_set_object_device(tensor, rank) for rank in consumer_ranks]
+    fused, prims = ConcurrentGener.gen_subtensor_coll(consumers, producers, {})
+    assert fused == (expected is not None)
+    assert {prim.kwargs['src']: set(prim.device) for prim in prims} == (expected or {})
+
+
+def test_partial_tensor_is_not_a_complete_replica():
+    tensor = IRFullTensor((4,))
+    producer = IR.copy_and_set_object_device(tensor.select(((0, 2),), (0, 1)), 0)
+    consumers = [IR.copy_and_set_object_device(tensor.tosub(), rank) for rank in (1, 2)]
+    assert ConcurrentGener.gen_subtensor_coll(consumers, [producer], {}) == (False, [])
 
 
 def test_path_retry():
