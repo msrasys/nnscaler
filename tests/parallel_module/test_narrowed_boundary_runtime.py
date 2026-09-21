@@ -3,23 +3,22 @@
 
 import tempfile
 from pathlib import Path
+from unittest.mock import patch
 import pytest
 import torch
-from nnscaler import parallelize, ComputeConfig
+from nnscaler import parallelize, ComputeConfig, init
 from nnscaler.parallel import merge_state_dicts
 from tests.launch_torchrun import launch_torchrun, clone_to_cpu_recursively
 from tests.utils import clear_dir_on_rank0, init_random, PYTEST_RUN_ID
-from tests.parallel_module.common import init_distributed
 from tests.parallel_module.test_gencode_pipeline import SplitSegmentModule, split_segment_pas
 
 
 def _narrowed_boundary_worker(async_comm):
-    from nnscaler.flags import CompileFlag
-    CompileFlag.async_comm = async_comm
     torch.set_float32_matmul_precision("highest")
     dim = 16
     nmicros = 4
-    init_distributed()
+    init()
+    torch.set_default_device(f'cuda:{torch.distributed.get_rank()}')
     with clear_dir_on_rank0(Path(tempfile.gettempdir()) / f'narrowed_boundary_{PYTEST_RUN_ID}') as tempdir:
         init_random()
         model = parallelize(
@@ -31,6 +30,7 @@ def _narrowed_boundary_worker(async_comm):
                 4,
                 constant_folding=False,
                 use_end2end=True,
+                use_async_comm=async_comm,
                 pas_config={
                     'pipeline_nmicros': nmicros,
                     'pipeline_scheduler': '1f1b',
@@ -42,9 +42,15 @@ def _narrowed_boundary_worker(async_comm):
         model.cuda()
         init_random()
         samples = [torch.randn(8, dim) for _ in range(nmicros)]
-        losses = model.train_step(samples)
-        model.eval()
-        inferred = model.infer_step(samples)
+        with patch('torch.distributed.isend', wraps=torch.distributed.isend) as send, \
+                patch('torch.distributed.irecv', wraps=torch.distributed.irecv) as recv:
+            losses = model.train_step(samples)
+            assert bool(send.call_count + recv.call_count) == async_comm
+            send.reset_mock()
+            recv.reset_mock()
+            model.eval()
+            inferred = model.infer_step(samples)
+            assert bool(send.call_count + recv.call_count) == async_comm
         for actual, expected in zip(inferred, losses):
             torch.testing.assert_close(actual, expected, atol=1e-5, rtol=1e-5)
         from nnscaler.runtime.executor import Executor, AsyncCommHandler
