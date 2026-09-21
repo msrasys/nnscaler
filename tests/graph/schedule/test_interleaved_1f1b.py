@@ -122,8 +122,6 @@ def _train_pp(model: ParallelModule, num_replicas, rank):
 
 
 def worker_pipeline_2(n_micro_batches, async_comm):
-    from nnscaler.flags import CompileFlag
-    CompileFlag.async_comm = async_comm
     nnscaler.init()
     torch.manual_seed(0)
     if torch.cuda.is_available():
@@ -131,7 +129,7 @@ def worker_pipeline_2(n_micro_batches, async_comm):
     m = Model()
     m.train()
     trace_data = torch.randn([2, 32], dtype=torch.float32, device=torch.cuda.current_device())
-    cfg = ComputeConfig(2, 2, use_end2end=True, pas_config=dict(n_micro_batches=n_micro_batches))
+    cfg = ComputeConfig(2, 2, use_end2end=True, use_async_comm=async_comm, pas_config=dict(n_micro_batches=n_micro_batches))
 
     with clear_dir_on_rank0(Path(tempfile.gettempdir()) / f'test_1f1b_interleaved_{PYTEST_RUN_ID}') as tempdir:
         pm_1f1b = parallelize(

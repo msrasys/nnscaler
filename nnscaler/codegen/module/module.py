@@ -261,27 +261,6 @@ class ModuleCodeGen(FuncEmission):
         )
 
 
-    def get_p2p_pairs(self):
-        """
-        Scale real P2P MovePrim endpoints to runtime devices.
-        """
-        nreplica = self.runtime_ndevs // len(self.devices)
-        pairs = set()
-        for adapter in self.execplan.graph.select(ntype=IRAdapter):
-            for prim in adapter.prims:
-                if not isinstance(prim, MovePrim):
-                    continue
-                src, dst = prim.kwargs['src'], prim.kwargs['dst']
-                if src is None or dst is None or src == dst:
-                    continue
-                for i in range(nreplica):
-                    shifted_src = int(src) + i * len(self.devices)
-                    shifted_dst = int(dst) + i * len(self.devices)
-                    pair = (shifted_src, shifted_dst) if shifted_src < shifted_dst else (shifted_dst, shifted_src)
-                    pairs.add(pair)
-        return sorted(pairs)
-
-
     def add_scale_reducers(self):
         """
         Insert reducers to for scale scenario
@@ -711,14 +690,6 @@ class ModuleCodeGen(FuncEmission):
                     cb.insert_body('@torch.jit.script_method')
                 cb.insert_body(fb.code)
 
-                if CompileFlag.async_comm and isinstance(node, IRAdapter) and self.is_async_recv_adapter(node):
-                    with FunctionBlock(func_name=f'{name}_wait', args=['self', '__pending']) as wait_fb:
-                        wait_fb.insert_body(self.emit_async_recv_adapter_wait(node))
-                        outputs = [self.tensor_name(t) for t in node.outputs()]
-                        wait_fb.insert_body(f"return {', '.join(outputs)}")
-                    cb.insert_body('')
-                    cb.insert_body(wait_fb.code)
-
                 if saved_tensors_hooks_needed:
                     with FunctionBlock(func_name=name, args=input_args) as fb:
                         # call segment under save_params_hooks context
@@ -848,11 +819,6 @@ class ModuleCodeGen(FuncEmission):
         for ranks in self.comm_groups:
             code = sign.format(ranks=list(ranks))
             self.model_init_statements.append(code)
-        p2p_pairs = self.get_p2p_pairs()
-        if CompileFlag.async_comm and p2p_pairs:
-            self.model_init_statements.append('# P2P communication groups')
-            self.model_init_statements.append(
-                f'nnscaler.runtime.device.DeviceGroup().init_p2p_groups(pairs={p2p_pairs})')
         self.model_init_statements.append(' ')
 
     def init_attributes(self, node: IRCell) -> dict[str, dict[str, Any]]:
