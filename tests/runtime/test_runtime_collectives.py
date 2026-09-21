@@ -155,7 +155,7 @@ def _rdscatter_worker(async_op):
 
     if async_op:
         otensor = nnscaler.runtime.executor.AsyncCommHandler().wait(otensor)
-        nnscaler.runtime.executor.AsyncCommHandler().drain()
+        nnscaler.runtime.executor.AsyncCommHandler().drain_sends()
 
     return (clone_to_cpu(tensor), clone_to_cpu(otensor))
 
@@ -169,7 +169,7 @@ def _rdgather_worker(async_op):
 
     if async_op:
         otensor = nnscaler.runtime.executor.AsyncCommHandler().wait(otensor)
-        nnscaler.runtime.executor.AsyncCommHandler().drain()
+        nnscaler.runtime.executor.AsyncCommHandler().drain_sends()
 
     return (clone_to_cpu(tensor), clone_to_cpu(otensor))
 
@@ -184,7 +184,7 @@ def _broadcast_worker(async_op):
         tensor, shape, torch.float32, src=0, ranks=[0,1,2], async_op=async_op)
     if async_op:
         otensor = nnscaler.runtime.executor.AsyncCommHandler().wait(otensor)
-        nnscaler.runtime.executor.AsyncCommHandler().drain()
+        nnscaler.runtime.executor.AsyncCommHandler().drain_sends()
 
     return (clone_to_cpu(tensor), clone_to_cpu(otensor))
 
@@ -198,9 +198,6 @@ def _broadcast_object_worker():
 
 def _3gpu_worker():
     _init_distributed(3)
-    nnscaler.runtime.device.DeviceGroup().init_p2p_groups(
-        pairs=[(0, 1), (0, 2)],
-    )
     result = {}
     result['rdscatter'] = _rdscatter_worker(False)
     result['rdscatter_async'] = _rdscatter_worker(True)
@@ -314,7 +311,7 @@ def _rvscatter_worker(async_op):
 
     if async_op:
         otensor = nnscaler.runtime.executor.AsyncCommHandler().wait(otensor)
-        nnscaler.runtime.executor.AsyncCommHandler().drain()
+        nnscaler.runtime.executor.AsyncCommHandler().drain_sends()
 
     return (clone_to_cpu(tensor), clone_to_cpu(otensor))
 
@@ -327,6 +324,6 @@ def _rvgather_worker(async_op):
 
     if async_op:
         otensor = nnscaler.runtime.executor.AsyncCommHandler().wait(otensor)
-        nnscaler.runtime.executor.AsyncCommHandler().drain()
+        nnscaler.runtime.executor.AsyncCommHandler().drain_sends()
 
     return (clone_to_cpu(tensor), clone_to_cpu(otensor))

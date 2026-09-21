@@ -2455,19 +2455,19 @@ def test_codegen_supports_inactive_plan_rank():
         )
 
 
-@pytest.mark.parametrize('runtime_size, expected', [(8, [(0, 1)]), (16, [(0, 1), (8, 9)])])
-def test_partial_plan_p2p_pairs_use_complete_plan_stride(runtime_size, expected):
-    from types import SimpleNamespace
+@pytest.mark.parametrize('device, expected', [(0, (0, 1)), (8, (8, 9))])
+def test_partial_plan_p2p_scaling_uses_complete_plan_stride(device, expected):
     from nnscaler.codegen import ModuleCodeGen
+    from nnscaler.ir.adapter import IRAdapter
     from nnscaler.ir.adapter.prim import MovePrim
 
-    move = MovePrim([], [], shape=(1,), dtype='torch.float32', src=0, dst=1)
+    adapter = IRAdapter([], [])
+    adapter.prims = [MovePrim([], [], shape=(1,), dtype='torch.float32', src=0, dst=1)]
     generator = object.__new__(ModuleCodeGen)
     generator.devices = (0, 1)
     generator.plan_ndevs = 8
-    generator.runtime_ndevs = runtime_size
-    generator.execplan = SimpleNamespace(graph=SimpleNamespace(
-        select=lambda **_kwargs: [SimpleNamespace(prims=[move])],
-    ))
+    generator.runtime_ndevs = 16
+    generator.enable_dp = True
 
-    assert generator.get_p2p_pairs() == expected
+    scaled = generator.scale(adapter, device).prims[0]
+    assert (scaled.kwargs['src'], scaled.kwargs['dst']) == expected
