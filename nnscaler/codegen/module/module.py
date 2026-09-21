@@ -473,14 +473,15 @@ class ModuleCodeGen(FuncEmission):
         # Here we don't use tid to sort parameters
         # because that assumption may be not true in the future,
         # and the current implementation is clearer and more robust.
-        # key: parameter tensor, value: (segment index, node index)
+        # Keep the existing full-parameter order, but count each local shard
+        # separately because different shards may be used in different segments.
         param_first_used_pos: Dict[IRFullTensor, Tuple[int, int]] = {}
-        param_num_segments: Dict[IRFullTensor, int] = {}
+        param_num_segments: Dict[IRSubTensor, int] = {}
         for i, n in enumerate(sequence):
             if isinstance(n, IRSegment) and n.isfw():
                 for k, v in self._get_param_first_used_pos(n).items():
-                    if k not in param_first_used_pos:
-                        param_first_used_pos[k] = (i, v)
+                    if k.parent not in param_first_used_pos:
+                        param_first_used_pos[k.parent] = (i, v)
                     # Repeated uses within one backward call share one AccumulateGrad hook.
                     param_num_segments[k] = param_num_segments.get(k, 0) + 1
 
@@ -815,7 +816,7 @@ class ModuleCodeGen(FuncEmission):
         node: IRWeightReducer,
         device: int,
         param_first_used_pos: Dict[IRFullTensor, Tuple[int, int]],
-        param_num_segments: Dict[IRFullTensor, int],
+        param_num_segments: Dict[IRSubTensor, int],
         as_parallel_module: bool = True,
     ) -> None:
         """
@@ -867,7 +868,7 @@ class ModuleCodeGen(FuncEmission):
         # so that weights with similar gradient all-reduce time are bucketed together
         weights = sorted(weights, key=lambda t: param_first_used_pos[t.parent])
         for weight in weights:
-            num_segments = param_num_segments[weight.parent]
+            num_segments = param_num_segments[weight]
             add_param_code = add_param.format(
                 reducer=reducer_name, weight=self.tensor_name(weight, prefix_attr='self.'),
                 num_segments=f', num_segments={num_segments}' if num_segments > 1 else '',
@@ -1195,21 +1196,21 @@ class ModuleCodeGen(FuncEmission):
 
         return codes
 
-    def _get_param_first_used_pos(self, segment: IRSegment) -> Dict[IRFullTensor, int]:
+    def _get_param_first_used_pos(self, segment: IRSegment) -> Dict[IRSubTensor, int]:
         """
-        Get the first gradient-producing use's node index for each parameter.
+        Get the first gradient-producing use's node index for each local parameter shard.
         """
         # get all the parameters in the segment
-        first_used_pos: Dict[IRFullTensor, int] = {}
+        first_used_pos: Dict[IRSubTensor, int] = {}
 
         for i, node in enumerate(segment.nodes()):
             # parameters are used as inputs of the node
             for tin in IRSegment.get_objects_from_complex(node.inputs()):
                 if (
                     isinstance(tin, IRSubTensor) and tin.is_param()
-                    and tin.grad is not None and tin.parent not in first_used_pos
+                    and tin.grad is not None and tin not in first_used_pos
                 ):
-                    first_used_pos[tin.parent] = i
+                    first_used_pos[tin] = i
 
         return first_used_pos
 

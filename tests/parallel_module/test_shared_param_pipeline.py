@@ -21,7 +21,8 @@ from nnscaler.policies import OpPartition, OpPlan, get_pas_ops
 from nnscaler.ir.operator import IRFwOperation, IRDataOperation
 from nnscaler.graph.segment import IRSegment
 from nnscaler.graph.schedule.predefined import PredefinedSched
-from tests.utils import clear_dir_on_rank0, init_random, raises_with_cause, PYTEST_RUN_ID
+from nnscaler.graph.schedule.schedplan import SchedulePlan
+from tests.utils import clear_dir_on_rank0, init_random, raises_with_cause, replace_all_device_with, PYTEST_RUN_ID
 from tests.launch_torchrun import torchrun
 from tests.parallel_module.test_gencode import _gencode_contains, print_gencode
 
@@ -646,6 +647,138 @@ def worker_uneven_colocated_shared_param(async_reducer):
 @pytest.mark.parametrize('async_reducer', [False, True])
 def test_uneven_colocated_shared_param_pipeline(async_reducer):
     torchrun(2, worker_uneven_colocated_shared_param, async_reducer)
+
+
+class SharedShardModel(torch.nn.Module):
+    def __init__(self, uses):
+        super().__init__()
+        self.weight = nn.Parameter(torch.randn(8, 8) / 8)
+        self.uses = uses
+
+    def forward(self, x):
+        for _ in range(self.uses):
+            x = torch.matmul(x, self.weight)
+        return (x * x).sum()
+
+
+def policy_shared_shards(graph, cfg):
+    matmuls = [node for node in graph.select(ntype=IRFwOperation) if node.fn == torch.matmul]
+    # Rank 1 owns the right half in stages on (0, 1), and the left half
+    # in the stage on (1, 2). Both local parameters have the same shape.
+    starts = matmuls[:2] if cfg.pas_config['repeat_in_segment'] else matmuls
+    graph.staging(starts)
+    stages = [node for node in graph.select(ntype=IRSegment, flatten=False) if node.isfw()]
+    for index, stage in enumerate(stages):
+        devices = (0, 1) if index % 2 == 0 else (1, 2)
+        for node in list(stage.nodes()):
+            if node.fn == torch.matmul:
+                parts = graph.partition(node, node.algorithm('dim'), idx=1, dim=1, num=2)
+            else:
+                parts = graph.partition(node, node.algorithm('dim'), idx=0, dim=1, num=2)
+            for part, device in zip(parts, devices):
+                graph.assign(part, device)
+    for node in graph.select(ntype=IRDataOperation):
+        for device, replica in enumerate(graph.replicate(node, cfg.plan_ngpus)):
+            graph.assign(replica, device)
+    nmicros = cfg.pas_config['pipeline_nmicros']
+    schedule = SchedulePlan(graph, nmicros)
+    # Serialize overlapping stages so they never compete for the same rank.
+    sequence = stages + [stage.mirror for stage in reversed(stages)]
+    for micro in range(nmicros):
+        for step, stage in enumerate(sequence):
+            schedule.add_segment(stage, micro, micro * len(sequence) + step)
+    schedule.finish()
+    graph.bind_schedule(schedule)
+    return graph
+
+
+def shared_shard_config(async_reducer, repeat_in_segment, runtime_ngpus=3):
+    return ComputeConfig(
+        3, runtime_ngpus, use_end2end=True, use_async_reducer=async_reducer,
+        pas_config={'pipeline_nmicros': 2, 'repeat_in_segment': repeat_in_segment},
+    )
+
+
+def assert_shared_shard_counts(module, rank, uses, repeat_in_segment):
+    rank %= 3
+    counts = {}
+    for reducer in module.reducers:
+        for name, meta in module.fullmap.items():
+            parameter = getattr(module, name)
+            if parameter in reducer._param_num_segments:
+                assert meta.orig_name == 'weight'
+                assert tuple(parameter.shape) == (8, 4)
+                counts[meta.slicers[1].start] = reducer._param_num_segments[parameter]
+    first_group_count = 2 if uses == 3 and not repeat_in_segment else 1
+    expected = {0: first_group_count} if rank == 0 else {4: 1} if rank == 2 else {
+        4: first_group_count, 0: 1,
+    }
+    assert counts == expected
+
+
+@replace_all_device_with('cpu')
+@pytest.mark.parametrize('uses,repeat_in_segment', [(2, False), (3, False), (3, True)])
+def test_shared_shard_counts_codegen(tmp_path, uses, repeat_in_segment):
+    from nnscaler.parallel import _load_parallel_module_class
+    from tests.utils import new_empty
+
+    instance_name = f'shards_{uses}_{repeat_in_segment}'
+    parallelize(
+        SharedShardModel(uses), {'x': torch.ones(4, 8)}, policy_shared_shards,
+        shared_shard_config(True, repeat_in_segment),
+        gen_savedir=tmp_path, load_module=False, reuse='override', instance_name=instance_name,
+    )
+    for rank in range(3):
+        cls = _load_parallel_module_class(
+            SharedShardModel, gen_savedir=tmp_path, rank=rank, instance_name=instance_name,
+        )
+        module = new_empty(cls, device='cpu')
+        assert_shared_shard_counts(module, rank, uses, repeat_in_segment)
+
+
+def worker_shared_shard_counts(async_reducer, uses, repeat_in_segment):
+    nnscaler.init()
+    torch.manual_seed(0)
+    source = SharedShardModel(uses).double()
+    reference = copy.deepcopy(source).cuda()
+    directory = Path(tempfile.gettempdir()) / f'shared_shard_counts_{PYTEST_RUN_ID}'
+    with clear_dir_on_rank0(directory) as tempdir:
+        module = parallelize(
+            source, {'x': torch.ones(4, 8, dtype=torch.float64)}, policy_shared_shards,
+            shared_shard_config(async_reducer, repeat_in_segment, torch.distributed.get_world_size()),
+            gen_savedir=tempdir, reuse='override',
+        ).cuda()
+        rank = torch.distributed.get_rank()
+        assert_shared_shard_counts(module, rank, uses, repeat_in_segment)
+        optimizer = build_optimizer(module, torch.optim.SGD, lr=0.001)
+        reference_optimizer = torch.optim.SGD(reference.parameters(), lr=0.001)
+        for step in range(2):
+            samples = [
+                torch.arange(32, device='cuda', dtype=torch.float64).reshape(4, 8) / 32
+                + micro * 0.1 + step * 0.01
+                for micro in range(2)
+            ]
+            reference_optimizer.zero_grad()
+            losses = [reference(sample) for sample in samples]
+            scaling_factor = module.compute_config.runtime_ngpus // module.compute_config.plan_ngpus
+            (torch.stack(losses).sum() * scaling_factor).backward()
+            torch.testing.assert_close(module.train_step(samples), losses)
+            for name, meta in module.fullmap.items():
+                torch.testing.assert_close(getattr(module, name).grad, reference.weight.grad[meta.slicers])
+            optimizer.step()
+            reference_optimizer.step()
+            for name, meta in module.fullmap.items():
+                torch.testing.assert_close(getattr(module, name), reference.weight[meta.slicers])
+            optimizer.zero_grad()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.device_count() < 6, reason='lack of gpu devices')
+@pytest.mark.parametrize('async_reducer', [False, True])
+@pytest.mark.parametrize('uses,repeat_in_segment', [(2, False), (3, False), (3, True)])
+def test_shared_shard_counts_runtime(async_reducer, uses, repeat_in_segment):
+    # DP replicas give gradient reducers different groups from activation
+    # collectives in this deliberately overlapping pipeline layout.
+    torchrun(6, worker_shared_shard_counts, async_reducer, uses, repeat_in_segment)
 
 
 class ColocatedNoGradModel(Model):
