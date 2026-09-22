@@ -189,12 +189,15 @@ def pas_hybrid(graph: IRGraph, cfg: 'ComputeConfig'):
         nstages = cfg.plan_ngpus
     nmicros = cfg.pas_config['pipeline_nmicros']
     scheduler = cfg.pas_config.get('pipeline_scheduler', '1f1b')
-    pp_size = cfg.pas_config.get('pp_size', nstages)
+    pp_size = cfg.pas_config.get('pipeline_size', nstages)
+
+    if pp_size < 1:
+        raise ValueError('pipeline_size must be >= 1 when set')
 
     if nstages % pp_size != 0:
-        raise ValueError(f'invalid pp_size {pp_size} for nstages {nstages}')
+        raise ValueError(f'invalid pipeline_size {pp_size} for nstages {nstages}')
     if ngpus % pp_size != 0:
-        raise ValueError(f'invalid pp_size {pp_size} for ngpus {ngpus}')
+        raise ValueError(f'invalid pipeline_size {pp_size} for ngpus {ngpus}')
     tp_size = ngpus // pp_size
 
 
@@ -968,8 +971,25 @@ def fn(
         raise ValueError(f"Pipeline stage ids must be continuous and start from 0, but got {stages}")
 
     nstages: int = len(stages)
+    pp_enabled = nstages > 1
+    nmicros = cfg.pas_config.get('pipeline_nmicros', None)
     # not all schedulers support pp_size < nstages
     pp_size = cfg.pas_config.get('pipeline_size', nstages)
+    if pp_enabled:
+        if not cfg.use_end2end:
+            raise ValueError("Pipeline parallelism requires use_end2end to be True")
+        if pp_size < 1:
+            # not all schedulers support pp_size == 1
+            raise ValueError("pipeline_size must be >= 1 when pipeline is enabled")
+        if not nmicros:
+            raise ValueError("nmicros must be set when pipeline is enabled")
+        if nstages % pp_size != 0:
+            raise ValueError(f'invalid pipeline_size {pp_size} for nstages {nstages}')
+        if ngpus % pp_size != 0:
+            raise ValueError(f'invalid pipeline_size {pp_size} for ngpus {ngpus}')
+    else:
+        if pp_size != 1:
+            raise ValueError("pipeline_size must be 1 when pipeline is disabled")
     tp_size = ngpus // pp_size
 
     recompute_groups: dict[int, list[IRFwOperation]] = {}
@@ -1183,27 +1203,9 @@ def fn(
 
     pp_segs = [graph]
     assert nstages == len(pp_stages), "Internal Error: nstages should be equal to the number of pipeline stages"
-    pp_enabled = nstages > 1
-    nmicros = cfg.pas_config.get('pipeline_nmicros', None)
     scheduler = cfg.pas_config.get('pipeline_scheduler', '1f1b')
     pp_multiref_replicated_params = \
         cfg.pas_config.get('pipeline_multiref_replicated_params', True)
-
-    if pp_enabled:
-        if not cfg.use_end2end:
-            raise ValueError("Pipeline parallelism requires use_end2end to be True")
-        if pp_size < 1:
-            # not all schedulers support pp_size == 1
-            raise ValueError("pipeline_size must be >= 1 when pipeline is enabled")
-        if not nmicros:
-            raise ValueError("nmicros must be set when pipeline is enabled")
-        if nstages % pp_size != 0:
-            raise ValueError(f'invalid pipeline_size {pp_size} for nstages {nstages}')
-        if ngpus % pp_size != 0:
-            raise ValueError(f'invalid pipeline_size {pp_size} for ngpus {ngpus}')
-    else:
-        if pp_size != 1:
-            raise ValueError("pipeline_size must be 1 when pipeline is disabled")
 
     # set recompute groups
     for group in recompute_groups.values():
