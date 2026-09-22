@@ -110,8 +110,12 @@ original graph after stage IDs are resolved, before split bookkeeping,
 recompute/offload grouping, shared-parameter multiref, and `graph.staging`.
 A read-only pass resolves auxiliary output and unused cross-stage input detach
 sites. The insertion pass updates consumers, graph outputs, and plans using
-the native `Detach` operator, then rebuilds the backward graph through
-`IRGraph.backward`.
+the native `Detach` operator, then re-infers gradient metadata for both the
+source and detached tensors and updates their consumers' existing backward outputs.
+This includes consumers that keep the original input, since their gradient
+value maps can change when auxiliary gradient contributions are removed.
+The no-grad detach operators need no backward nodes; the other backward nodes
+are preserved rather than rebuilt globally.
 Only inserted detach outputs are marked `requires_grad=False`; existing
 forward flags are preserved. Detached outputs and boundaries isolate auxiliary
 branches from the loss, so conservative `True` flags inside those branches do

@@ -586,8 +586,8 @@ def _get_new_node_outputs_splits(node: IRFwOperation, stage: IRSegment, op_plans
 
 
 def _refresh_grads(segment: IRSegment, tensor: IRSubTensor):
-    if not tensor.requires_grad:
-        return
+    # A no-grad replacement still needs its consumers' old gradient outputs removed.
+    # so we need to refresh the gradients even if the tensor itself has no grad.
 
     consumers = segment.consumers(tensor.parent)
     if not consumers:
@@ -601,6 +601,7 @@ def _refresh_grads(segment: IRSegment, tensor: IRSubTensor):
         fins = [t for t in fwop.iobjs() if isinstance(t, IRSubTensor)]
         igrads = [t.grad for t in fins if t.grad is not None]
         with segment.mirror.update(fwop.mirror):
+            fwop.mirror.reset_outputs(len(igrads))
             for i, igrad in enumerate(igrads):
                 fwop.mirror.set_output(i, igrad)
 
@@ -697,7 +698,7 @@ def _pp_detach_aux_outputs(
     graph: IRGraph, op_plans: dict[IRFwOperation, OpPlan]
 ) -> None:
     """
-    Insert boundary/output detaches and rebuild the backward graph.
+    Insert boundary/output detaches and update affected backward outputs.
 
     Only the first output (loss) seeds backward. Other outputs are values
     to return, not additional backward roots.
@@ -777,32 +778,35 @@ def _pp_detach_aux_outputs(
             with graph.update(consumer):
                 consumer.replace_input(source, detach.output(0))
         graph.replace_output(source, detach.output(0))
-
+        # Source consumers need new value maps; detached consumers must drop old gradients.
         # Note here, the `IRTensor.requires_grad` isn't automatically updated
         # for the nodes affected directly or indirectly by the detach insertion
         # This will not affect the correctness/speed of the gradient computation.
         # so we skip this part.
-
-    # Rebuild gradient value maps and backward nodes for the edited forward graph.
-    # 1. clear all backward nodes
-    for index in range(len(graph._nodes) - 1, -1, -1):
-        if not isinstance(graph._nodes[index], IRBpOperation):
-            break
-        # Pop backward nodes from the tail without maintaining indexes per removal;
-        # rebuild the indexes once below, before gradient inference reads them.
-        node = graph._nodes.pop(index)
-        IRCell.make_pair(node.mirror, None)
-        IRCell.make_pair(None, node)
-
-    # 2. clear all grads
-    for node in graph.nodes():
-        for tensor in (*node.iobjs(), *node.oobjs()):
-            if isinstance(tensor, IRSubTensor):
-                tensor.grad = None
-
-    # 3. rebuild
-    graph._reorder_producer_consumer()
-    graph.backward(graph.output(0))
+        #
+        # Example: h and aux require grad in the original trace.
+        #
+        # Before:
+        #     h = encoder(x)                  # stage 0
+        #     y = middle(h)                   # stage 1
+        #     loss = head(y).sum()            # stage 2
+        #     aux = h.sin()                   # stage 2
+        #     return loss, aux
+        #
+        # After:
+        #     h = encoder(x)                  # stage 0
+        #     y = middle(h)                   # stage 1
+        #     h_aux = h.detach()              # end of stage 1; requires_grad=False
+        #     loss = head(y).sum()            # stage 2
+        #     aux = h_aux.sin()               # runtime: False; IR still says True
+        #     returned_aux = aux.detach()     # end of stage 2; requires_grad=False
+        #     return loss, returned_aux
+        #
+        # aux.requires_grad would be False if we retraced this rewritten code.
+        # We keep its original True in IR: the detached input/output already
+        # isolate this branch, while the loss path through h and y stays intact.
+        _refresh_grads(graph, source)
+        _refresh_grads(graph, detach.output(0))
 
 
 def _identity_segment_output(graph: IRGraph, tensor: IRSubTensor, segment: IRSegment, all_segments: List[IRSegment]) -> IRFwOperation:

@@ -11,10 +11,12 @@ import torch
 from torch.distributed.elastic.multiprocessing.errors import ChildFailedError
 
 import nnscaler
+import nnscaler.policies as policies
 from nnscaler import ComputeConfig, build_optimizer, parallelize
 from nnscaler.graph.graph import IRGraph
 from nnscaler.graph.segment import IRSegment
-from nnscaler.ir.operator import IRFwOperation
+from nnscaler.ir import IRSubTensor
+from nnscaler.ir.operator import IRBpOperation, IRFwOperation
 from nnscaler.policies import OpPartition, OpPlan, get_layer_index, get_pas_ops
 from nnscaler.runtime.function import identity
 from tests.launch_torchrun import launch_torchrun
@@ -274,6 +276,56 @@ def test_fn_aux_memory_regions(use_fbw, memory_mode, model_cls):
     assert all(launch_torchrun(
         4, worker_aux_output, model_cls, ('implicit',), unused_stage_input_policy, use_fbw, memory_mode,
     ).values())
+
+
+# Removing an aux gradient also changes the live consumer's value map.
+# Update both existing backward nodes, including an empty output list for sin.
+@replace_all_device_with('cpu')
+@pytest.mark.parametrize('model_cls', [
+    PipelineWithUnusedStageInputs, PipelineWithSinAux, PipelineWithSharedWeight,
+])
+def test_fn_aux_updates_backward_locally(tmp_path, monkeypatch, model_cls):
+    insert = policies._pp_detach_aux_outputs
+    checked = []
+
+    def checked_insert(graph, plans):
+        backward_ids = [node.cid for node in graph.select(ntype=IRBpOperation)]
+        layer, = [
+            node for node in plans
+            if node.fqn == 'layers.1' and torch.nn.Linear in node.module_class_chain
+        ]
+        source = layer.input(0)
+        aux, = [node for node in graph.consumers(source.parent) if node != layer]
+        assert source.grad.valmap == (0, 2)
+        assert aux.input(0).grad.valmap == (1, 2)
+
+        insert(graph, plans)
+
+        assert [node.cid for node in graph.select(ntype=IRBpOperation)] == backward_ids
+        assert layer.input(0) == source
+        assert layer.input(0).grad.valmap == (0, 1)
+        assert aux.input(0).parent != source.parent
+        assert aux.input(0).grad is None
+        for node in (layer, aux):
+            assert node.mirror.outputs() == tuple(
+                tensor.grad for tensor in node.iobjs()
+                if isinstance(tensor, IRSubTensor) and tensor.grad is not None
+            )
+        detaches = [
+            node for node in plans if node.comment == 'fn detached pipeline output'
+        ]
+        assert detaches and all(node.mirror is None for node in detaches)
+        checked.append(True)
+
+    monkeypatch.setattr(policies, '_pp_detach_aux_outputs', checked_insert)
+    parallelize(
+        model_cls('data'), {'x': torch.ones(4, 4)}, unused_stage_input_policy,
+        ComputeConfig(4, 4, use_end2end=True, pas_config={
+            'pipeline_size': 2, 'pipeline_nmicros': 4, 'pipeline_scheduler': '1f1b_interleaved',
+        }),
+        gen_savedir=tmp_path, load_module=False, reuse='override',
+    )
+    assert checked == [True]
 
 
 # Input flags cannot determine output flags: sin may retain conservative True,
