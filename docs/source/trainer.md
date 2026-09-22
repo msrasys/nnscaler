@@ -1439,9 +1439,11 @@ of `ComputeConfig` as a dictionary.
       is `1`
 3.  `pp`: pipeline parallelism + data parallelism. It will do model
     parallelism inside a scale unit, and run data parallelism across
-    scale units. It requires the `use_end2end` be true. It has two
-    configurations `pipeline_nmicros` and `pipeline_scheduler`. See
-    `hybrid` policy for more details.
+    scale units. It requires `use_end2end=True` and delegates to `hybrid`.
+    `pipeline_nstages` must be `plan_ngpus` or `"auto"` (which resolves to
+    `plan_ngpus`); this restriction applies only to the built-in `pp` policy.
+    With the default `pipeline_size`, each stage uses one GPU.
+    See `hybrid` below for the shared configurations.
 4.  `data`: tensor parallelism on batch dimension. It has no
     configurations.
 5.  `hybrid`: pipeline parallelism + tensor parallelism + data
@@ -1449,26 +1451,30 @@ of `ComputeConfig` as a dictionary.
     0 dimension) inside a scale unit, and run data parallelism across
     scale units. It requires the `use_end2end` to be true. It has the
     following configurations.
-    - `pipeline_nstages`: the number of stages in the pipeline, or
-      `"auto"` (let autodist to decide). Default is `"auto"`. Optional.
-      - If `pipeline_nstages` is `"auto"` and `pipeline_pivots` is
-        specified, it will use pipeline. (The number of stages will be
-        determined automatically by autodist)
-      - If `pipeline_nstages` is `"auto"` and `pipeline_pivots` is not
-        specified, it will not use pipeline.
-      - If `pipeline_nstages` is a 1, pipeline will not be used.
-        (`pipeline_pivots` must not be set)
-      - If `pipeline_nstages` is a number > 1, pipeline will be used.
-        (`pipeline_pivots` must be set)
+    - `pipeline_nstages`: the number of logical stages. Default is
+      `"auto"`, which resolves to `plan_ngpus`. The policy divides forward
+      operators into this many stages; it does not run AutoDist or read
+      `pipeline_pivots`.
+    - `pipeline_size`: the number of physical pipeline device groups.
+      Defaults to the resolved `pipeline_nstages`. It must be positive and
+      divide both `pipeline_nstages` and `plan_ngpus`. Each group contains
+      `plan_ngpus // pipeline_size` GPUs, and logical stage `i` is assigned
+      to group `i % pipeline_size`. More logical stages than physical groups
+      require a compatible scheduler, such as `1f1b_interleaved`.
+      Use this key in `pas_config`; the former `pp_size` key is no longer read.
     - `pipeline_nmicros`: the number of microbatches in the pipeline.
       Required.
-    - `pipeline_scheduler`: the scheduler name for the pipeline. Current
-      we support four schedulers in training
-      `1f1b`/`1f1b_plus`/`1f1b_interleaved`/`gpipe`/`chimera_direct` (4
-      stages pipeline only), and one scheduler in inference
-      `infer_pipe`. Default is `1f1b`. Optional.
-    - `pp_size`: the pipeline parallelism size. Default is
-      `pipeline_nstages`. Optional.
+    - `pipeline_scheduler`: the scheduler name. Training schedulers are
+      `1f1b`, `1f1b_plus`, `1f1b_interleaved`, `gpipe`, and `chimera_direct`
+      (four logical stages only); inference uses `infer_pipe`. Default is
+      `1f1b`. `1f1b_interleaved` requires the microbatch count to be a
+      multiple of `pipeline_size`.
+
+    For example, `plan_ngpus=8`, `pipeline_nstages=4`, and `pipeline_size=2`
+    create two groups of four GPUs. Stages 0 and 2 use GPUs `[0, 1, 2, 3]`,
+    and stages 1 and 3 use `[4, 5, 6, 7]`. Use `1f1b_interleaved` with, for
+    example, `pipeline_nmicros=4` for this layout.
+
 6.  `autodist`: the recommended policy for most cases. Currently it only
     support Adam-like optimizers. It will automatically choose the best
     partition for you by balancing the memory usage and speed. It has
