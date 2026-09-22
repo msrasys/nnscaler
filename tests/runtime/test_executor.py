@@ -196,6 +196,67 @@ def test_backward_weight_requires_pending_input_backward():
         Executor.backward_weight('linear', module.parameters())
 
 
+@pytest.mark.parametrize('use_fbw', [False, True])
+def test_backward_rejects_missing_input_gradient(use_fbw):
+    class Module(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.tensor(2., dtype=torch.float64))
+            self.aux_weight = torch.nn.Parameter(torch.tensor(3., dtype=torch.float64))
+
+        def forward(self, x, unused):
+            return (x * self.weight).sum(), (unused * self.aux_weight).data
+
+    module = Module()
+    x = torch.ones(2, 3, dtype=torch.float64, requires_grad=True)
+    unused = torch.ones(4, 2, dtype=torch.float64).t().requires_grad_()
+    loss, _ = Executor.fexecute('unused_input', module, x, unused)
+    saved_inputs = [tensor for _, tensor in Executor._detach['unused_input'][0]]
+
+    if use_fbw:
+        with pytest.raises(AssertionError, match='got gradient None'):
+            Executor.backward_input(
+                'unused_input', [x, unused], [loss], [None], module.parameters(),
+            )
+        assert module.weight.grad is None
+        Executor.backward_weight('unused_input', module.parameters())
+    else:
+        with pytest.raises(AssertionError, match='got gradient None'):
+            Executor.backward('unused_input', [x, unused], [loss], [None])
+        torch.testing.assert_close(saved_inputs[0].grad, torch.full_like(x, 2))
+
+    assert saved_inputs[1].grad is None
+    torch.testing.assert_close(module.weight.grad, torch.tensor(6., dtype=torch.float64))
+    assert module.aux_weight.grad is None
+    assert x.grad is None and unused.grad is None
+    Executor.check_clear()
+
+
+@pytest.mark.parametrize('use_fbw', [False, True])
+@pytest.mark.parametrize('ninputs', [0, 1, 2])
+def test_backward_without_output_roots_preserves_state_pairing(use_fbw, ninputs):
+    weight = torch.nn.Parameter(torch.tensor(2., dtype=torch.float64))
+    inputs = [
+        torch.randn(2, idx + 1, dtype=torch.float64, requires_grad=True)
+        for idx in range(ninputs)
+    ]
+    Executor.fexecute(
+        'no_roots', lambda *args: tuple((value * weight).data for value in args),
+        *inputs,
+    )
+    if use_fbw:
+        grads = Executor.backward_input('no_roots', inputs, [], [], [weight])
+        assert len(Executor._weight_backward_states['no_roots']) == 1
+        Executor.backward_weight('no_roots', [weight])
+    else:
+        grads = Executor.backward('no_roots', inputs, [], [])
+
+    assert grads is None
+    assert weight.grad is None
+    assert all(tensor.grad is None for tensor in inputs)
+    Executor.check_clear()
+
+
 def test_custom_fbw_restores_module_symbols():
     original_input = executor.backward_input
     original_weight = executor.backward_weight

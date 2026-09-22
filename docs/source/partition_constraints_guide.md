@@ -103,6 +103,54 @@ class OpPlan:
 *   **`pre_hook` / `post_hook`**:
     *   You can attach custom Python functions to be executed before or after the operator. See source code for signature details.
 
+### Pipeline auxiliary outputs
+
+With an end-to-end pipeline function policy, auxiliary views are inserted on the
+original graph after stage IDs are resolved, before split bookkeeping,
+recompute/offload grouping, shared-parameter multiref, and `graph.staging`.
+A read-only pass resolves auxiliary output and unused cross-stage input detach
+sites. The insertion pass updates consumers, graph outputs, and plans using
+the native `Detach` operator, then re-infers gradient metadata for both the
+source and detached tensors and updates their consumers' existing backward outputs.
+This includes consumers that keep the original input, since their gradient
+value maps can change when auxiliary gradient contributions are removed.
+The no-grad detach operators need no backward nodes; the other backward nodes
+are preserved rather than rebuilt globally.
+Only inserted detach outputs are marked `requires_grad=False`; existing
+forward flags are preserved. Detached outputs and boundaries isolate auxiliary
+branches from the loss, so conservative `True` flags inside those branches do
+not reconnect runtime autograd. Inferring output flags from input flags would
+be unsafe for operators that create grad-enabled tensors internally. An output
+that no longer requires grad at runtime can retain a redundant detach.
+Staging then infers the stage interfaces without auxiliary-output postprocessing.
+New operators inherit the recompute/offload region at their insertion position
+through their `OpPlan`, just like handwritten operators.
+The original activation stays differentiable through
+its last loss-dependent stage; later auxiliary-only consumers receive detached views.
+Shared parameters' auxiliary-only remote uses are detached at the owning stage,
+before multiref can create separate differentiable aliases for those consumers.
+Returned parameters are detached in the same original-graph pass.
+Inserted detaches use `OpPlan(partition='auto')` and the ordinary TP path.
+Dimension partitions can be propagated; value-partitioned inputs are combined
+by the usual adapters before a replicated detach. Producerless parameters
+use the normal replicated fallback, so their storage layout may change.
+No TP-specific detach handling, later backward pruning, adapter/codegen
+compensation, or runtime zero filling is added.
+User-written `.data` and `.detach()` outputs follow the same activation analysis.
+
+The analysis is conservative for opaque operators: a live output retains all
+declared input gradients. External inputs retain the existing behavior.
+Stages with no differentiable
+outputs remain unsupported.
+
+Unused parameters in TP reducers retain the normal reducer semantics:
+`reducer_none_grad=False` can materialize zeros. To preserve eager `grad=None`
+and avoid weight decay on unused weights, enable `reducer_none_grad` and keep
+used and unused parameters in separate buckets.
+
+The runtime requires every declared input gradient to be present. Missing
+gradients raise an error rather than being replaced with zeros.
+
 ### Example: Custom Partitioning and Recomputation
 
 This example demonstrates how to:

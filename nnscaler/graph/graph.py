@@ -926,6 +926,9 @@ class IRGraph(IRSegment):
                     stage 5: t5 = identity(t4)
                              xx = consume(t5)
 
+            Graph outputs follow these identities to the last consuming stage.
+            Segment interfaces are then inferred from the updated graph outputs.
+
         Args:
             nodes Tuple[IRFwOperations]: the start forward node of each stage.
 
@@ -1053,6 +1056,7 @@ class IRGraph(IRSegment):
             for sid in range(psid + 1, end_sid):
                 # insert identity
                 op = insert_identity(out, sid)
+                self.replace_output(out, op.output(0))
                 out = op.output(0)
 
                 if isinstance(fobj, IRTensor):
@@ -1068,6 +1072,8 @@ class IRGraph(IRSegment):
                             grad = fgrad.select(pobj.indmap, valmap)
                             curr_valmap = curr_valmap.map((1, 2)) if cidx != nconsumers - 1 else curr_valmap
                         # update forward consumer
+                        # TODO: Replace all occurrences of repeated inputs (e.g. x + x)
+                        # and their backward outputs; see test_codegen_fn_pipeline_repeated_input.
                         idx = consumer.inputs().index(pobj)
                         tensor = consumer.input(idx)
                         with self.update(consumer) as consumer:

@@ -586,8 +586,8 @@ def _get_new_node_outputs_splits(node: IRFwOperation, stage: IRSegment, op_plans
 
 
 def _refresh_grads(segment: IRSegment, tensor: IRSubTensor):
-    if not tensor.requires_grad:
-        return
+    # A no-grad replacement still needs its consumers' old gradient outputs removed.
+    # so we need to refresh the gradients even if the tensor itself has no grad.
 
     consumers = segment.consumers(tensor.parent)
     if not consumers:
@@ -601,8 +601,215 @@ def _refresh_grads(segment: IRSegment, tensor: IRSubTensor):
         fins = [t for t in fwop.iobjs() if isinstance(t, IRSubTensor)]
         igrads = [t.grad for t in fins if t.grad is not None]
         with segment.mirror.update(fwop.mirror):
+            fwop.mirror.reset_outputs(len(igrads))
             for i, igrad in enumerate(igrads):
                 fwop.mirror.set_output(i, igrad)
+
+
+def _pp_get_aux_outputs(
+    graph: IRGraph, op_plans: dict[IRFwOperation, OpPlan],
+) -> dict[IRSubTensor, tuple[Optional[IRFwOperation], int, int, tuple[IRFwOperation, ...]]]:
+    """Resolve output and boundary detach sites without editing the original graph.
+
+    Args:
+        graph: The untransformed graph, before staging or TP.
+        op_plans: Operator plans with resolved stage IDs.
+
+    Returns:
+        A dict mapping each source tensor to
+        ``(producer, stage_id, position, consumers)``:
+
+        * producer: The source's forward producer, or None for attributes.
+        * stage_id: The insertion stage, not necessarily the producer's stage.
+          Activations stay differentiable through their last loss-dependent
+          stage (at least their producer's stage); attributes use their earliest
+          consumer stage.
+        * position: Zero-based index of that stage's last op in graph.nodes().
+          The detach is inserted after this op.
+        * consumers: Only the operators whose source inputs must be rewired to
+          the detached view; other consumers keep the differentiable source.
+          An empty tuple means only a graph output needs detaching. A source
+          that is also a graph output must have that output replaced as well.
+
+        Returns an empty dict when the loss has no gradient or no detaches
+        are needed.
+    """
+    # Even handwritten `return loss, aux.data` can leave a stage input unused
+    # by backward. Thus an empty output search does not mean no boundary cuts.
+    loss = graph.output(0)
+    if loss.grad is None:
+        return {}  # don't need to update the graph if loss has no gradient (inference mode)
+
+    aux_outputs = {
+        tensor for tensor in graph.oobjs()
+        if isinstance(tensor, IRSubTensor) and not tensor.is_loss() and tensor.requires_grad
+    }
+
+    # get all nodes that are live for backward tracking
+    live = {loss.grad.parent}  # set of live tensor parents for backward tracking
+    live_nodes = set()
+    for node in graph.select(ntype=IRBpOperation):
+        if any(tensor.parent in live for tensor in node.inputs()):
+            live_nodes.add(node.mirror)
+            live.update(tensor.parent for tensor in node.outputs())
+
+    stage_ends = {
+        op_plans[node].stage_id: position
+        for position, node in enumerate(graph.nodes()) if node in op_plans
+    }
+    expanded = {}
+    for tensor in graph.full_tensors():
+        if tensor.is_grad() or not tensor.requires_grad or tensor.is_loss():
+            continue
+        consumers = graph.consumers(tensor)
+        if tensor.is_attr():
+            # A directly returned attribute can be in the graph without any operator consumer.
+            if not consumers:
+                # example of this case:
+                # loss = self.linear(x).sum()
+                # return loss, self.unused_weight
+                raise RuntimeError(
+                    f"Cannot return weight {tensor} with no consumers as a graph output: "
+                    "its pipeline stage cannot be determined."
+                )
+
+            producer = None
+            detach_stage = min(op_plans[node].stage_id for node in consumers)
+            detached_consumers = [
+                node for node in consumers
+                if node not in live_nodes and op_plans[node].stage_id != detach_stage
+            ]
+        else:
+            producers = graph.producers(tensor)
+            if not producers or not isinstance(producers[0], IRFwOperation):
+                continue
+            producer = producers[0]
+
+            detach_stage = max(
+                [op_plans[producer].stage_id] +
+                [op_plans[node].stage_id for node in consumers if node in live_nodes] # can be empty
+            )
+            detached_consumers = [node for node in consumers if op_plans[node].stage_id > detach_stage]
+
+        tensor_sub = tensor.tosub()
+        if tensor_sub in aux_outputs or detached_consumers:
+            expanded[tensor_sub] = (producer, detach_stage, stage_ends[detach_stage], tuple(detached_consumers))
+    return expanded
+
+
+def _pp_detach_aux_outputs(
+    graph: IRGraph, op_plans: dict[IRFwOperation, OpPlan]
+) -> None:
+    """
+    Insert boundary/output detaches and update affected backward outputs.
+
+    Only the first output (loss) seeds backward. Other outputs are values
+    to return, not additional backward roots.
+    If we don't purge these auxiliary outputs, the backward will fail.
+
+    Examples:
+    1. Return an intermediate activation without detaching the loss path.
+        Before:
+            h = encoder(x)                  # stage 0
+            loss = head(h).sum()            # stage 1
+            return loss, h
+
+        After:
+            h = encoder(x)                  # stage 0
+            loss = head(h).sum()            # stage 1
+            returned_h = h.detach()         # end of stage 1
+            return loss, returned_h
+
+        head still consumes the original h, so loss still updates encoder.
+        Only the returned view is detached.
+
+        The backward of the last stage will fail if we don't detach the auxiliary outputs.
+
+    2. Cut a cross-stage input used only by an auxiliary branch.
+
+        Before:
+            h = encoder(x)                  # stage 0
+            y = middle(h)                   # stage 1
+            aux = aux_head(h)               # stage 2
+            loss = loss_head(y).sum()       # stage 2
+            return loss, aux.data
+
+        After:
+            h = encoder(x)                  # stage 0
+            y = middle(h)                   # stage 1
+            aux_input = h.detach()          # end of stage 1
+            aux = aux_head(aux_input)       # stage 2
+            loss = loss_head(y).sum()       # stage 2
+            return loss, aux.data
+
+        Returning aux.data already detaches the output, but stage 2 still
+        declares h as a backward input even though its loss uses only y.
+        Detaching that input avoids a missing gradient from stage 2.
+        The cut is after middle(h), preserving the loss path through stage 1.
+
+        Stage 1 will fail if we don't detach the cross-stage input used only by the auxiliary branch.
+    """
+    from nnscaler.graph.function.function import Detach
+    sites = _pp_get_aux_outputs(graph, op_plans)
+    if not sites:
+        return
+
+    # Sort the sites by their position in descending order
+    # to ensure that insertions do not affect subsequent positions.
+    # Note it is not a problem if multiple detach nodes are inserted at the same position
+    sorted_sites = sorted(sites.items(), key=lambda x: x[1][2], reverse=True)
+    for source, (_, stage_id, position, consumers) in sorted_sites:
+        detach = Detach(source)
+        detach.comment = 'fn detached pipeline output'
+        output = source.parent.like()
+        output.requires_grad = False
+        detach.set_output(0, output.tosub())
+        # get the plan for the operation currently at the insertion position.
+        # the detach node will follow the OpPlan of the operation at the insertion position.
+        plan = op_plans[graph._nodes[position]]
+        graph.insert(detach, position + 1)
+        # Infer the detach partition from its input, keeping the memory region.
+        # Note if the input is value partitioned,
+        # the detach node will introduce an all-reduce communication.
+        # But as it is the output of segments and value partitioning can't go through segments
+        # all-reduce will be inserted anyway, so it is not a real problem.
+        op_plans[detach] = OpPlan(
+            detach, stage_id=stage_id, partition='auto',
+            recompute_id=plan.recompute_id, offload_id=plan.offload_id,
+        )
+        for consumer in consumers:
+            with graph.update(consumer):
+                consumer.replace_input(source, detach.output(0))
+        graph.replace_output(source, detach.output(0))
+        # Source consumers need new value maps; detached consumers must drop old gradients.
+        # Note here, the `IRTensor.requires_grad` isn't automatically updated
+        # for the nodes affected directly or indirectly by the detach insertion
+        # This will not affect the correctness/speed of the gradient computation.
+        # so we skip this part.
+        #
+        # Example: h and aux require grad in the original trace.
+        #
+        # Before:
+        #     h = encoder(x)                  # stage 0
+        #     y = middle(h)                   # stage 1
+        #     loss = head(y).sum()            # stage 2
+        #     aux = h.sin()                   # stage 2
+        #     return loss, aux
+        #
+        # After:
+        #     h = encoder(x)                  # stage 0
+        #     y = middle(h)                   # stage 1
+        #     h_aux = h.detach()              # end of stage 1; requires_grad=False
+        #     loss = head(y).sum()            # stage 2
+        #     aux = h_aux.sin()               # runtime: False; IR still says True
+        #     returned_aux = aux.detach()     # end of stage 2; requires_grad=False
+        #     return loss, returned_aux
+        #
+        # aux.requires_grad would be False if we retraced this rewritten code.
+        # We keep its original True in IR: the detached input/output already
+        # isolate this branch, while the loss path through h and y stays intact.
+        _refresh_grads(graph, source)
+        _refresh_grads(graph, detach.output(0))
 
 
 def _identity_segment_output(graph: IRGraph, tensor: IRSubTensor, segment: IRSegment, all_segments: List[IRSegment]) -> IRFwOperation:
@@ -709,6 +916,8 @@ def _identity_segment_output(graph: IRGraph, tensor: IRSubTensor, segment: IRSeg
                     producer.replace_output(tensor.grad, fwop.output(0).grad)
 
     _refresh_grads(segment, tensor)
+    # The replacements above also change other segments' forward/backward interfaces.
+    graph._reorder_producer_consumer()
 
     return fwop
 
@@ -971,6 +1180,11 @@ def fn(
     # not all schedulers support pp_size < nstages
     pp_size = cfg.pas_config.get('pipeline_size', nstages)
     tp_size = ngpus // pp_size
+
+    # Plan the inserted nodes together with user operators, before any
+    # recompute/offload grouping, tensor-split bookkeeping or graph rewrites.
+    if nstages > 1:
+        _pp_detach_aux_outputs(graph, op_plans)
 
     recompute_groups: dict[int, list[IRFwOperation]] = {}
     recompute_last_id: int = -1
