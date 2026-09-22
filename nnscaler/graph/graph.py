@@ -1072,6 +1072,8 @@ class IRGraph(IRSegment):
                             grad = fgrad.select(pobj.indmap, valmap)
                             curr_valmap = curr_valmap.map((1, 2)) if cidx != nconsumers - 1 else curr_valmap
                         # update forward consumer
+                        # TODO: Replace all occurrences of repeated inputs (e.g. x + x)
+                        # and their backward outputs; see test_codegen_fn_pipeline_repeated_input.
                         idx = consumer.inputs().index(pobj)
                         tensor = consumer.input(idx)
                         with self.update(consumer) as consumer:
