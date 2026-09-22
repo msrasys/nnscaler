@@ -1,12 +1,15 @@
 #  Copyright (c) Microsoft Corporation.
 #  Licensed under the MIT License.
 
+import copy
 import inspect
 import tempfile
 import re
 from contextlib import nullcontext
 from typing import Union
 from functools import partial
+from dataclasses import replace
+from pathlib import Path
 
 import torch
 import torch.nn.functional as F
@@ -20,10 +23,11 @@ from nnscaler.graph.parser.mapping import SignFx2Op
 from nnscaler.ir.cten import IR, IRObject
 from nnscaler.parallel import _load_parallel_module_class, parallelize, ComputeConfig, CubeModule, _gen_graph
 from nnscaler.utils import mark_dynamic
+from nnscaler.policies import fn, get_pas_ops, OpPlan
 
 from .common import init_distributed
 from ..launch_torchrun import launch_torchrun
-from ..utils import replace_all_device_with, raises_with_cause
+from ..utils import replace_all_device_with, raises_with_cause, clear_dir_on_rank0, PYTEST_RUN_ID
 
 def _to_cube_model(module, compute_config, cube_savedir, load_module, max_workers=1):
     return parallelize(
@@ -2419,3 +2423,106 @@ def test_fake_fn(tmp_path):
     #     add_xy_23 = tests.parallel_module.test_gencode.add_xy(linear_26, linear_1_27)
     #     del linear_26, linear_1_27
     #     return add_xy_23
+
+
+def _first_device_only(graph, config):
+    # Like a first-stage encoder: fn plans the active submodule on one device,
+    # while parallelize retains the full plan for inactive ranks and DP offsets.
+    def plans(graph, _config):
+        return (OpPlan(node, partition=None) for node in get_pas_ops(graph))
+    return fn(graph, replace(config, plan_ngpus=1), plans)
+
+
+@replace_all_device_with('cpu')
+def test_codegen_supports_inactive_plan_rank():
+    with tempfile.TemporaryDirectory() as tempdir:
+        parallelize(
+            Module0(),
+            {'x': torch.tensor([[1.0, 2.0, 3.0]])},
+            _first_device_only,
+            ComputeConfig(2, 4),
+            gen_savedir=tempdir,
+            load_module=False,
+        )
+        assert _gencode_contains(
+            tempdir,
+            Module0,
+            1,
+            r"This ParallelModule rank is inactive",
+        )
+        assert _gencode_contains(tempdir, Module0, 2, r"torch\.nn\.functional\.linear")
+        assert _gencode_contains(
+            tempdir,
+            Module0,
+            3,
+            r"This ParallelModule rank is inactive",
+        )
+
+
+def _partial_plan_worker():
+    nnscaler.init()
+    torch.manual_seed(7)
+    source = Module0()
+    reference = copy.deepcopy(source).cuda()
+    reference_optimizer = torch.optim.SGD(reference.parameters(), lr=0.01)
+    reference_params = dict(reference.named_parameters())
+    rank = torch.distributed.get_rank()
+    active = rank % 2 == 0
+    directory = Path(tempfile.gettempdir()) / f'partial_plan_{PYTEST_RUN_ID}'
+    with clear_dir_on_rank0(directory) as tempdir:
+        model = parallelize(source, {'x': torch.ones(2, 3)}, _first_device_only,
+                            ComputeConfig(2, 4), gen_savedir=tempdir, reuse='override').cuda()
+        assert bool(list(model.parameters())) == active
+        if not active:
+            with pytest.raises(RuntimeError, match='rank is inactive'):
+                model(torch.ones(2, 3, device='cuda'))
+        optimizer = torch.optim.SGD(model.parameters(), lr=0.01) if active else None
+        for step in range(2):
+            samples = [torch.arange(6, device='cuda').reshape(2, 3).float() / 6 + replica + step
+                       for replica in range(2)]
+            model.zero_grad()
+            reference_optimizer.zero_grad()
+            expected = [reference(sample) for sample in samples]
+            sum(output.square().sum() for output in expected).backward()
+            if active:
+                actual = model(samples[rank // 2])
+                torch.testing.assert_close(actual, expected[rank // 2])
+                actual.square().sum().backward()
+            model.sync_grad()
+            norm, grads = model.clip_gnorm()
+            expected_norm = torch.cat([param.grad.flatten() for param in reference.parameters()]).norm()
+            torch.testing.assert_close(norm, expected_norm)
+            assert bool(grads) == active
+            for name, meta in model.fullmap.items():
+                torch.testing.assert_close(getattr(model, name).grad,
+                                           reference_params[meta.orig_name].grad[meta.slicers])
+            if active:
+                optimizer.step()
+            reference_optimizer.step()
+            for name, meta in model.fullmap.items():
+                torch.testing.assert_close(getattr(model, name),
+                                           reference_params[meta.orig_name][meta.slicers])
+    return True
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 4, reason='requires 4 GPUs')
+def test_fn_partial_plan_matches_eager():
+    assert all(launch_torchrun(4, _partial_plan_worker).values())
+
+
+@pytest.mark.parametrize('device, expected', [(0, (0, 1)), (8, (8, 9))])
+def test_partial_plan_p2p_scaling_uses_complete_plan_stride(device, expected):
+    from nnscaler.codegen import ModuleCodeGen
+    from nnscaler.ir.adapter import IRAdapter
+    from nnscaler.ir.adapter.prim import MovePrim
+
+    adapter = IRAdapter([], [])
+    adapter.prims = [MovePrim([], [], shape=(1,), dtype='torch.float32', src=0, dst=1)]
+    generator = object.__new__(ModuleCodeGen)
+    generator.devices = (0, 1)
+    generator.plan_ndevs = 8
+    generator.runtime_ndevs = 16
+    generator.enable_dp = True
+
+    scaled = generator.scale(adapter, device).prims[0]
+    assert (scaled.kwargs['src'], scaled.kwargs['dst']) == expected
