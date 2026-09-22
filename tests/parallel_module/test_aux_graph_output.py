@@ -492,7 +492,7 @@ class PipelineWithUnusedWeight(torch.nn.Module):
 @pytest.mark.parametrize('return_weight', [False, True])
 def test_fn_unused_weight_output(tmp_path, return_weight):
     expected_error = (
-        raises_with_cause(RuntimeError, match='with no consumers')
+        raises_with_cause(RuntimeError, match='weight .* with no consumers as a graph output')
         if return_weight else contextlib.nullcontext()
     )
     with expected_error:

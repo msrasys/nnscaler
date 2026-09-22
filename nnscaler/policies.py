@@ -668,7 +668,10 @@ def _pp_get_aux_outputs(
                 # example of this case:
                 # loss = self.linear(x).sum()
                 # return loss, self.unused_weight
-                raise RuntimeError(f"You cannot have a weight as an graph output {tensor} with no consumers.")
+                raise RuntimeError(
+                    f"Cannot return weight {tensor} with no consumers as a graph output: "
+                    "its pipeline stage cannot be determined."
+                )
 
             producer = None
             detach_stage = min(op_plans[node].stage_id for node in consumers)
@@ -767,7 +770,7 @@ def _pp_detach_aux_outputs(
         graph.insert(detach, position + 1)
         # Infer the detach partition from its input, keeping the memory region.
         # Note if the input is value partitioned,
-        # the detach node will introduce a all-reduce communication.
+        # the detach node will introduce an all-reduce communication.
         # But as it is the output of segments and value partitioning can't go through segments
         # all-reduce will be inserted anyway, so it is not a real problem.
         op_plans[detach] = OpPlan(
