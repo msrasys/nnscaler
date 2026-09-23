@@ -185,6 +185,10 @@ def all_to_all(tensor: torch.Tensor, idim: int, odim: int,
         itensors[idx] = itensor.contiguous() if not itensor.is_contiguous() else itensor
     group = DeviceGroup().get_group(ranks)
     group_ranks = _get_group_ranks(group)
+    # RVDLayout orders ranks/dsts by shard indmaps, not numeric rank. For a
+    # length-4 axis, ranks=(2, 1, 0, 3) places slices [0:1], [1:2], [2:3],
+    # [3:4] on those ranks respectively. Send in dsts order and concatenate
+    # in ranks order, translating both to/from the backend's group order.
     itensors = [itensors[dsts.index(rank)] for rank in group_ranks]
     otensors = [torch.empty_like(t) for t in itensors]
     work = torch.distributed.all_to_all(otensors, itensors, group=group, async_op=async_op)
@@ -225,6 +229,8 @@ def all_to_all_single(tensor: torch.Tensor, idim: int, odim: int,
 
     if work:
         AsyncCommHandler().submit(tensor, [work], all2all_callback)
+        # Return the tensor registered as the async handle. wait(tensor) runs
+        # the callback and returns the output assembled from received.
         otensor = tensor
     else:
         otensor = all2all_callback(tensor)
