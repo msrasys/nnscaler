@@ -1,6 +1,7 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 
+import ast
 import copy
 import tempfile
 from pathlib import Path
@@ -11,7 +12,7 @@ import nnscaler
 from nnscaler import ComputeConfig, parallelize, build_optimizer
 from nnscaler.policies import get_pas_ops, OpPlan
 from tests.launch_torchrun import launch_torchrun
-from tests.utils import PYTEST_RUN_ID, clear_dir_on_rank0
+from tests.utils import PYTEST_RUN_ID, clear_dir_on_rank0, replace_all_device_with
 
 
 class InterStageMLP(torch.nn.Module):
@@ -41,6 +42,27 @@ def inter_stage_config():
     return ComputeConfig(8, 8, use_end2end=True, constant_folding=False,
                          pas_config={'pipeline_size': 2, 'pipeline_nmicros': 4,
                                      'pipeline_scheduler': '1f1b_interleaved'})
+
+
+@replace_all_device_with('cpu', force=True)
+def test_fn_inter_stage_gencode_prefers_matching_peers(tmp_path):
+    """Check the placement preference in generated communication for a real model."""
+    parallelize(InterStageMLP(), {'sample': {'x': torch.ones(8, 8)}},
+                inter_stage_policy, inter_stage_config(),
+                gen_savedir=tmp_path, reuse='override', load_module=False)
+    peers = set()
+    files = list(tmp_path.rglob('gencode*.py'))
+    assert len(files) == 8
+    for path in files:
+        for node in ast.walk(ast.parse(path.read_text())):
+            if isinstance(node, ast.Call) and ast.unparse(node.func) == 'nnscaler.runtime.adapter.move':
+                kwargs = {kw.arg: ast.literal_eval(kw.value) for kw in node.keywords
+                          if kw.arg in ('src', 'dst')}
+                if kwargs['src'] < 4:
+                    peers.add((kwargs['src'], kwargs['dst']))
+    # This model permits matching relative ranks for transfers from 0..3 to
+    # 4..7. Other boundaries may require a permutation to align shard layouts.
+    assert peers == {(r, r + 4) for r in range(4)}
 
 
 def inter_stage_worker():
@@ -78,4 +100,5 @@ def inter_stage_worker():
 
 @pytest.mark.skipif(torch.cuda.device_count() < 8, reason='requires 8 GPUs')
 def test_fn_inter_stage_layout_matches_eager():
+    """Check two-step losses, gradients and updates; peer order is tested above."""
     assert all(launch_torchrun(8, inter_stage_worker).values())
