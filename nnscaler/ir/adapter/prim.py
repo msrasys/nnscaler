@@ -645,7 +645,8 @@ class SplitAllGatherPrim(ChunkPrim):
 
     def volume(self) -> int:
         """Per-rank backward ring-all-gather volume, in elements."""
-        return self.input(0).nelement() - self.output(0).nelement()
+        ndevs = len(self.kwargs['ranks']) or len(self.outputs())
+        return (ndevs - 1) * self.output(0).nelement()
 
 
 class AllToAllAllToAllPrim(AllToAllPrim):
