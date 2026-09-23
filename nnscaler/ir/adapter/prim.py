@@ -643,6 +643,10 @@ class SplitAllGatherPrim(ChunkPrim):
         super().__init__(itensors, otensors, dim, **kwargs)
         self.signature = 'nnscaler.runtime.adapter.nn.split_allgather'
 
+    def volume(self) -> int:
+        """Per-rank backward ring-all-gather volume, in elements."""
+        return self.input(0).nelement() - self.output(0).nelement()
+
 
 class AllToAllAllToAllPrim(AllToAllPrim):
     """

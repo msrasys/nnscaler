@@ -99,6 +99,63 @@ def test_one_sided_shard_order_does_not_follow_replica_order(primitive):
     assert prim.kwargs['ranks'] == (2, 0, 3, 1)
 
 
+@pytest.mark.parametrize('dim', [0, 1])
+@pytest.mark.parametrize('ranks', [None, (7,), (7, 2), (8, 2, 5), (2, 0, 3, 1)])
+def test_split_allgather_volume_matches_backward_allgather(dim, ranks):
+    full = IRFullTensor((12, 12))
+    ndevs = len(ranks) if ranks is not None else 4
+    replicas = [full.tosub() for _ in range(ndevs)]
+    shards = full.tosub().split_dim(dim, ndevs)
+    if ranks is not None:
+        replicas = [_set_device(tensor, rank) for tensor, rank in zip(replicas, sorted(ranks))]
+        shards = [_set_device(tensor, rank) for tensor, rank in zip(shards, ranks)]
+
+    backward = AllGatherPrim(shards, replicas, dim)
+    fused = primitives.SplitAllGatherPrim(replicas, shards, dim)
+    assert fused.volume() == backward.volume()
+    if ranks is not None:
+        assert fused.kwargs['ranks'] == ranks
+        for rank in ranks:
+            # Dispatch retains one input/output but still communicates with the whole group.
+            assert fused.dispatch(rank).volume() == backward.volume()
+
+
+def test_split_allgather_fusion_preserves_backward_volume():
+    from nnscaler.codegen import ModuleCodeGen
+    from nnscaler.execplan.planpass.fusion import DiffFusion
+    from nnscaler.ir.cten import IRCell
+
+    full = IRFullTensor((32,), requires_grad=True)
+    ranks = (2, 0, 3, 1)
+    replicas = [_set_device(full.tosub(), rank) for rank in sorted(ranks)]
+    shards = [_set_device(tensor, rank) for tensor, rank in zip(full.tosub().split_dim(0, 4), ranks)]
+    grad_shards = [_set_device(full.grad.select(t.indmap, t.valmap), t.device[0]) for t in shards]
+    grad_replicas = [_set_device(full.grad.tosub(), t.device[0]) for t in replicas]
+    forward = IRAdapter(replicas, shards)
+    forward.prims = [ChunkPrim(replicas, shards, 0)]
+    backward = IRAdapter(grad_shards, grad_replicas)
+    backward.prims = [AllGatherPrim(grad_shards, grad_replicas, 0)]
+    IRCell.make_pair(forward, backward)
+    expected = backward.prims[0].volume()
+    assert expected == 24
+
+    generator = object.__new__(ModuleCodeGen)
+    generator.devices = (0, 1, 2, 3)
+    generator.runtime_ndevs = 8
+    generator.enable_dp = True
+    for rank in ranks:
+        # ExecutionPlan dispatches adapters before DiffFusion runs.
+        local = forward.dispatch(rank)
+        assert DiffFusion.nnfuse(local)
+        fused = local.prims[0]
+        assert fused.signature == 'nnscaler.runtime.adapter.nn.split_allgather'
+        assert fused.kwargs['ranks'] == ranks
+        assert fused.volume() == expected
+        scaled = generator.scale(local, rank + 4).prims[0]
+        assert tuple(scaled.kwargs['ranks']) == tuple(r + 4 for r in ranks)
+        assert scaled.volume() == expected
+
+
 @pytest.mark.parametrize('primitive,runtime', [
     (primitives.RVScatterPrim, collectives.rvscatter),
     (primitives.RVGatherPrim, collectives.rvgather),
