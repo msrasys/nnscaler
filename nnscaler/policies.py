@@ -1315,14 +1315,25 @@ def fn(
             if not isinstance(sub_tensor, IRSubTensor):
                 continue
             if seg.consumers(sub_tensor.parent):
+                output_dim = None
+                consumer_splits = tensor_splits[sub_tensor.parent].get(stage_id, set())
+                # Final graph outputs and incompatible layouts must stay replicated.
+                # Intermediate outputs can share the layout required by all local consumers.
+                # we will keep the consumer layout (the communication will definitely satisfy the existing consumer layout requirement)
+                # so we have more chance to optimize the compute graph in later stages.
+                # Communication will be generated correctly later no matter what the Identity layout is.
+                if pp_enabled and not is_tensor_in_output(sub_tensor.parent, graph) and len(consumer_splits) == 1:
+                    split = list(consumer_splits)[0]
+                    if isinstance(split, int):
+                        output_dim = split
+
                 ident_op = _identity_segment_output(graph, sub_tensor, seg, pp_segs)
-                # always replicate the identity operator
-                # even when the original tensor is partitioned
-                # as it is the output of segment which needs a complete tensor.
-                op_plans[ident_op] = OpPlan(op=ident_op, stage_id=stage_id, partition=None)
-                # 'rn' means `ident_op` is replicated
-                tensor_splits[sub_tensor.parent].setdefault(stage_id, set()).add('rn')
-                op_partition_maps[ident_op] = {}
+                partition = OpPartition(input=0, dim=output_dim) if output_dim is not None else None
+                op_plans[ident_op] = OpPlan(op=ident_op, stage_id=stage_id, partition=partition)
+                tensor_splits[sub_tensor.parent].setdefault(stage_id, set()).add(
+                    output_dim if output_dim is not None else 'rn'
+                )
+                op_partition_maps[ident_op] = {0: output_dim} if output_dim is not None else {}
 
                 # the tensor is a segment output,
                 # we have replaced the original output tensor with the identity output tensor
