@@ -368,6 +368,7 @@ class Bucket:
         """
 
         self._params: List[torch.nn.Parameter] = params
+        self._num_grads_per_microbatch = sum(reducer._param_num_segments[p] for p in params)
         self._param_cls: Any = param_cls
         self._params_info: Dict[torch.nn.Parameter, ReducerParamInfo] = {
             p: params_info[p] for p in self._params
@@ -604,22 +605,20 @@ class Bucket:
 
             # perform all-reduce
             if self._async:
-                if self._grad_accumulation_steps:
-                    target_cnt = self._grad_accumulation_steps * len(self._params)
-                else:
-                    target_cnt = len(self._params)
+                target_cnt = (self._grad_accumulation_steps or 1) * self._num_grads_per_microbatch
 
                 if self._async_param_cnt > target_cnt:
                     if self._grad_accumulation_steps:
                         raise RuntimeError(
                             f"Asynchronous Reducer received more gradients than expected "
                             f"({self._async_param_cnt} > {target_cnt} = "
-                            f"grad_accumulation_steps({self._grad_accumulation_steps}) * num_params({len(self._params)})). "
+                            f"grad_accumulation_steps({self._grad_accumulation_steps}) * "
+                            f"num_grads_per_microbatch({self._num_grads_per_microbatch})). "
                             f"Make sure `grad_accumulation_steps` matches the actual number of gradient accumulation steps per optimizer step."
                         )
                     raise RuntimeError(
                         f"Detected gradient accumulation with asynchronous Reducer "
-                        f"({self._async_param_cnt} > {target_cnt} = num_params). "
+                        f"({self._async_param_cnt} > {target_cnt} = num_grads_per_microbatch). "
                         f"Run with `nnscaler.accum_mode` (or set `grad_accumulation_steps`) to manage gradient synchronization."
                     )
                 if self._async_param_cnt == target_cnt:
@@ -948,6 +947,7 @@ class Reducer:
         """
         # the parameters with same class will be consecutive in the list.
         self._params: List[torch.nn.Parameter] = list()
+        self._param_num_segments: Dict[torch.nn.Parameter, int] = {}
         self._param_clss: Dict[torch.nn.Parameter, Any] = dict()  # the class of each parameter, used for sorting
         self._param_ids: Set[int] = set()
         self._numel: int = 0
@@ -1098,7 +1098,7 @@ class Reducer:
         for bucket in self._buckets:
             bucket.grad_accumulation_steps = value
 
-    def add_param(self, param: torch.nn.Parameter):
+    def add_param(self, param: torch.nn.Parameter, *, num_segments: int = 1):
         """
         Add a parameter to the reducer
 
@@ -1107,12 +1107,17 @@ class Reducer:
         will show less benefits.
 
         @param param torch.nn.Parameter: the added parameter
+        @param num_segments int: number of local segments whose backward produces
+            a gradient for this parameter per microbatch (default 1).
         """
+        if not isinstance(num_segments, int) or num_segments < 1:
+            raise ValueError(f"num_segments must be a positive integer, got {num_segments}")
         if param.data.data_ptr() in self._param_ids:
             _logger.warning(
                 f'rank [{torch.distributed.get_rank()}]: detected duplicated or shared parameters, ignored.')
             return
         self._params.append(param)
+        self._param_num_segments[param] = num_segments
         self._param_ids.add(param.data.data_ptr())
         self._numel += param.numel()
 
@@ -1647,6 +1652,7 @@ class Reducer:
         state[fields._params] = [param_map[p] for p in self._params]
         state[fields._params_info] = {param_map[p]: info for p, info in self._params_info.items()}
         state[fields._param_clss] = {param_map[p]: param_cls for p, param_cls in self._param_clss.items()}
+        state[fields._param_num_segments] = {param_map[p]: count for p, count in self._param_num_segments.items()}
         state[fields._contiguous_params] = torch.empty_like(self._contiguous_params, device='meta')
         state[fields._contiguous_grads] = torch.empty_like(self._contiguous_grads, device='meta')
 
