@@ -2,9 +2,16 @@
 #  Licensed under the MIT License.
 
 from collections import OrderedDict
+from concurrent.futures import ThreadPoolExecutor
+import logging
+import os
+import time
 from typing import List, Any, Dict, Tuple, Optional
 from nnscaler.ir.cten import IRTensor
 import torch
+
+
+_logger = logging.getLogger(__name__)
 
 
 class Frame:
@@ -142,40 +149,61 @@ class Frame:
                 return tensor
         return None
 
-    def save_attr_content(self, save_file_stem: str, params_per_file: int = 1024 * 1024 * 1024):
+    def save_attr_content(self, save_file_stem: str, params_per_file: int = 1024 * 1024 * 1024,
+                          *, max_workers: Optional[int] = None):
         """
         Save attribute content into file.
 
         Args:
             save_file_stem (str): stem file name. Actual file name will be `save_file_stem`.0, `save_file_stem`.1, etc.
             params_per_file (int): number of params per file,default is 1 billion
+            max_workers (int): maximum number of concurrent checkpoint writers.
+                CPU tensors are shared read-only; no copies are sent to worker
+                processes. An oversized tensor stays in one file.
 
         Returns:
             None
         """
-        #TODO: use FxModuleParser.ATTR_CONTENT_FILE_FORMAT to name the files.
-        total_size = sum([val.numel() for _, (_, val) in self._attr_map.items()])
-        model_pt_part_num = (total_size + params_per_file - 1) // params_per_file
-
+        if max_workers is None:
+            max_workers = int(os.environ.get('NNSCALER_WEIGHT_SAVE_WORKERS', '4'))
+        if params_per_file < 1 or max_workers < 1:
+            raise ValueError('params_per_file and max_workers must be positive')
+        started = time.perf_counter()
         tid2value = {t.tid: val.cpu() for t, (_, val) in self._attr_map.items()}
-        tids = list(tid2value)
-        # it can be zero if there is no param in the module (self._attr_map is empty)
-        if model_pt_part_num <= 1:
-            chunks = [tids]
+        chunks, chunk, count = [], [], 0
+        for tid, value in tid2value.items():
+            if chunk and count + value.numel() > params_per_file:
+                chunks.append(chunk)
+                chunk, count = [], 0
+            chunk.append(tid)
+            count += value.numel()
+        if chunk or not chunks:
+            chunks.append(chunk)
+
+        workers = min(max_workers, len(chunks))
+        nbytes = sum(value.numel() * value.element_size() for value in tid2value.values())
+        _logger.info('Saving initial weights: %.2f GiB in %d files with %d writers',
+                     nbytes / 1024**3, len(chunks), workers)
+
+        def save_chunk(idx):
+            torch.save({tid: tid2value[tid] for tid in chunks[idx]}, f'{save_file_stem}.{idx}')
+
+        if workers == 1:
+            for idx in range(len(chunks)):
+                save_chunk(idx)
         else:
-            assert len(tids) > 0, "Empty attr map"
-            chunk_size = (len(tids) + model_pt_part_num - 1) // model_pt_part_num
-            chunks = [tids[i:min(i + chunk_size, len(tids))] for i in
-                      range(0, len(tids), chunk_size)]
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                # Observe every exception before publishing the completed index.
+                list(pool.map(save_chunk, range(len(chunks))))
 
         tid_to_chunk = {}
         for idx, chunk in enumerate(chunks):
-            torch.save({tid: tid2value[tid] for tid in chunk}, f'{save_file_stem}.{idx}')
             tid_to_chunk.update((tid, idx) for tid in chunk)
 
         # Keep the index separate from the tensor chunks so each rank can find
         # the chunks it needs without deserializing every full-model tensor.
         torch.save(tid_to_chunk, f'{save_file_stem}.index')
+        _logger.info('Saved initial weights in %.2f seconds', time.perf_counter() - started)
 
     def save_np_buffer_content(self, save_file: str):
         """

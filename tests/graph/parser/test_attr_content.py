@@ -3,6 +3,7 @@
 
 from pathlib import Path
 
+import pytest
 import torch
 
 from nnscaler.graph.parser import FxModuleParser
@@ -66,3 +67,48 @@ def test_load_attr_content_only_reads_required_chunks(tmp_path: Path, monkeypatc
         (FxModuleParser.ATTR_CONTENT_INDEX_FILE, {'weights_only': True}),
         ('fullmodel.pt.2', {'mmap': True, 'weights_only': True}),
     ]
+
+
+@pytest.mark.parametrize('workers', [1, 4])
+def test_save_attr_content_balances_elements_and_preserves_values(tmp_path, workers):
+    frame = Frame()
+    base = torch.arange(48, dtype=torch.float32).reshape(6, 8)
+    values = [base[:, ::2], torch.arange(3, dtype=torch.bfloat16),
+              torch.arange(3, dtype=torch.int64), base.t()]
+    tensors = [IRFullTensor(tuple(value.shape), name=f'w{i}', dtype=value.dtype)
+               for i, value in enumerate(values)]
+    for i, (tensor, value) in enumerate(zip(tensors, values)):
+        frame.add_attr(tensor, value, f'w{i}')
+    stem = tmp_path/'fullmodel.pt'
+    frame.save_attr_content(stem, params_per_file=8, max_workers=workers)
+    index = torch.load(f'{stem}.index', weights_only=True)
+    assert index == {tensors[0].tid: 0, tensors[1].tid: 1,
+                     tensors[2].tid: 1, tensors[3].tid: 2}
+    for tensor, value in zip(tensors, values):
+        actual = torch.load(f'{stem}.{index[tensor.tid]}', mmap=True, weights_only=True)[tensor.tid]
+        assert torch.equal(actual, value)
+        assert actual.dtype == value.dtype
+        assert actual.stride() == value.stride()
+
+
+def test_save_attr_content_failure_does_not_publish_index(tmp_path, monkeypatch):
+    frame = Frame()
+    for i in range(4):
+        frame.add_attr(IRFullTensor((4,), name=f'w{i}'), torch.ones(4), f'w{i}')
+    save = torch.save
+    def fail_one(obj, filename, **kwargs):
+        if str(filename).endswith('.1'):
+            raise OSError('injected write failure')
+        save(obj, filename, **kwargs)
+    monkeypatch.setattr(torch, 'save', fail_one)
+    stem = tmp_path/'fullmodel.pt'
+    with pytest.raises(OSError, match='injected write failure'):
+        frame.save_attr_content(stem, params_per_file=4)
+    assert not Path(f'{stem}.index').exists()
+
+
+def test_save_empty_attr_content(tmp_path):
+    stem = tmp_path/'fullmodel.pt'
+    Frame().save_attr_content(stem)
+    assert torch.load(f'{stem}.0', weights_only=True) == {}
+    assert torch.load(f'{stem}.index', weights_only=True) == {}

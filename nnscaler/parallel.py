@@ -826,12 +826,17 @@ def _gen_graph(
         # so it can connect to other parts of the graph correctly
         requires_grad=not end2end_mode if autoset_requires_grad else None
     )
+    started = time.perf_counter()
+    logger.info('Tracing %s', type(module).__name__)
     fx_graph = parser.to_fx_graph(module, dummy_forward_args)
+    logger.info('FX tracing completed in %.2f seconds', time.perf_counter() - started)
 
     # generate ir logic graph
+    started = time.perf_counter()
     graph = parser.to_ir_graph(
         fx_graph, dummy_forward_args, outdir, constant_folding
     )
+    logger.info('IR parsing and initial weight saving completed in %.2f seconds', time.perf_counter() - started)
 
     # generate dummy inputs for logic graph
     # that is, generate IRObject/IRFullTensor for fx graph dummy input
@@ -960,7 +965,9 @@ def _gencode(
         graph = IRGraph.load(graph_ckp)
         forward_args = torch.load(forward_args_ckp, weights_only=False)
 
+    started = time.perf_counter()
     graph = pas_policy(graph, compute_config)
+    logger.info('Partitioning and scheduling completed in %.2f seconds', time.perf_counter() - started)
     if not isinstance(graph, IRGraph):
         raise RuntimeError("Expected policy return IRGraph")
 
@@ -1227,6 +1234,8 @@ def _gencode_in_subprocesses(
                     command,
                     stdout=log_stream,
                     stderr=subprocess.STDOUT,
+                    env={**os.environ, 'OMP_NUM_THREADS': '1',
+                         'MKL_NUM_THREADS': '1', 'OPENBLAS_NUM_THREADS': '1'},
                 )
             except Exception:
                 log_stream.close()
