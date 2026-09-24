@@ -22,6 +22,170 @@ MBS = 2
 DIM = 16
 LAYERS = 16
 
+
+class RecomputeTarget(nn.Module):
+    pass
+
+
+class ReusedRecomputeBlock(nn.Module):
+    def forward(self, x):
+        return x.sin().cos()
+
+
+class ReusedRecomputeModel(nn.Module):
+    def __init__(self, direct_forward=False):
+        super().__init__()
+        self.block = ReusedRecomputeBlock()
+        self.direct_forward = direct_forward
+
+    def forward(self, x):
+        for _ in range(2):
+            x = self.block.forward(x) if self.direct_forward else self.block(x)
+        return x.sum()
+
+
+@replace_all_device_with('cpu')
+@pytest.mark.parametrize('direct_forward', [False, True])
+def test_apply_module_recompute_separates_adjacent_reused_module_calls(tmp_path, direct_forward):
+    from nnscaler.graph.parser.converter import to_fx_graph, to_ir_graph
+    from nnscaler.policies import apply_module_recompute
+
+    inputs = {'x': torch.randn(2, 4, requires_grad=True)}
+    traced = to_fx_graph(ReusedRecomputeModel(direct_forward), inputs)
+    graph = to_ir_graph(traced, inputs, attr_savedir=tmp_path, constant_folding=False)
+    graph.backward(graph.output(0))
+    result = apply_module_recompute(graph, ReusedRecomputeBlock)
+
+    assert [len(group) for group in result.planned_groups] == [2, 2]
+    assert result.applied_group_count == 2
+
+
+class HookRecomputeBlock(nn.Module):
+    def forward(self, x):
+        return x.sin().cos().tanh().sin().cos()
+
+
+class HookRecomputeModel(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.block = HookRecomputeBlock()
+
+    def forward(self, x):
+        return self.block(x).sum()
+
+
+@replace_all_device_with('cpu')
+@pytest.mark.parametrize('hook_kind', ['pre_hook', 'post_hook'])
+@pytest.mark.parametrize('pass_plans', [False, True])
+def test_apply_module_recompute_excludes_planned_hooks_from_codegen(tmp_path, hook_kind, pass_plans):
+    import ast
+    from nnscaler.policies import OpPlan, apply_module_recompute
+
+    def policy(graph, cfg):
+        plans = [OpPlan(op) for op in get_pas_ops(graph)]
+        hooked = next(plan for plan in plans if plan.op.fn == torch.tanh)
+        setattr(hooked, hook_kind, hello)
+        result = apply_module_recompute(
+            graph, HookRecomputeBlock, op_plans=plans if pass_plans else None,
+        )
+        if pass_plans:
+            assert result.skipped_hook_ops == 1
+            assert result.planned_group_count == 2
+            assert hooked.op.recompute is None
+        return plans
+
+    if not pass_plans:
+        with pytest.raises(RuntimeError, match='Code generation failed') as exc:
+            parallelize(
+                HookRecomputeModel(), {'x': torch.randn(2, 4, requires_grad=True)}, policy,
+                ComputeConfig(1, 1), gen_savedir=tmp_path, load_module=False,
+            )
+        assert isinstance(exc.value.__cause__, ValueError)
+        assert 'pass op_plans' in str(exc.value.__cause__)
+        return
+
+    parallelize(
+        HookRecomputeModel(), {'x': torch.randn(2, 4, requires_grad=True)}, policy,
+        ComputeConfig(1, 1), gen_savedir=tmp_path, load_module=False,
+    )
+    generated = next(tmp_path.rglob('gencode0.py')).read_text()
+    recomputes = [node for node in ast.walk(ast.parse(generated))
+                  if isinstance(node, ast.FunctionDef) and node.name.startswith('recompute')]
+    assert len(recomputes) == 2
+    assert all('tests.test_policies.hello' not in ast.unparse(node) for node in recomputes)
+    assert generated.count('tests.test_policies.hello(') == 1
+
+
+class _FakeRecomputeNode:
+    def __init__(self, module_type=None, fqn="", *, hooked=False):
+        self.module_class_chain = [] if module_type is None else [module_type]
+        self._fqn = fqn
+        self.pre_hook = object() if hooked else None
+        self.post_hook = None
+        self.recompute = None
+
+    def get_module_fqn(self, module_type):
+        assert module_type in self.module_class_chain
+        return self._fqn
+
+
+class _FakeRecomputeGraph:
+    def __init__(self, nodes, *, applies_recompute=True):
+        self.nodes = nodes
+        self.applies_recompute = applies_recompute
+        self.recompute_calls = []
+
+    def select(self, ntype=None):
+        return self.nodes
+
+    def recompute(self, nodes):
+        self.recompute_calls.append(nodes)
+        if self.applies_recompute:
+            group_id = len(self.recompute_calls)
+            for node in nodes:
+                node.recompute = group_id
+
+
+def test_apply_module_recompute_groups_invocations_and_skips_hooks():
+    from nnscaler.policies import apply_module_recompute
+
+    nodes = [
+        _FakeRecomputeNode(),
+        _FakeRecomputeNode(RecomputeTarget, "blocks.0"),
+        _FakeRecomputeNode(RecomputeTarget, "blocks.0"),
+        _FakeRecomputeNode(),
+        _FakeRecomputeNode(RecomputeTarget, "blocks.0"),
+        _FakeRecomputeNode(RecomputeTarget, "blocks.0"),
+        _FakeRecomputeNode(RecomputeTarget, "blocks.1", hooked=True),
+        _FakeRecomputeNode(RecomputeTarget, "blocks.1"),
+        _FakeRecomputeNode(RecomputeTarget, "blocks.1"),
+        _FakeRecomputeNode(RecomputeTarget, "blocks.2"),
+    ]
+    graph = _FakeRecomputeGraph(nodes)
+
+    result = apply_module_recompute(graph, RecomputeTarget)
+
+    assert [len(group) for group in result.planned_groups] == [2, 2, 2]
+    assert result.planned_group_count == result.applied_group_count == 3
+    assert result.planned_op_count == result.applied_op_count == 6
+    assert result.skipped_hook_ops == 1
+
+
+def test_apply_module_recompute_reports_when_nothing_applies():
+    from nnscaler.policies import apply_module_recompute
+
+    nodes = [
+        _FakeRecomputeNode(RecomputeTarget, "blocks.0"),
+        _FakeRecomputeNode(RecomputeTarget, "blocks.0"),
+    ]
+    graph = _FakeRecomputeGraph(nodes, applies_recompute=False)
+
+    result = apply_module_recompute(graph, [RecomputeTarget])
+
+    assert result.planned_group_count == 1
+    assert result.planned_op_count == 2
+    assert result.applied_group_count == result.applied_op_count == 0
+
 class MLP(nn.Module):
     def __init__(self, dim: int = DIM, nlayers: int = LAYERS):
         init_random()
