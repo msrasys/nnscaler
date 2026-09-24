@@ -196,6 +196,53 @@ def test_backward_weight_requires_pending_input_backward():
         Executor.backward_weight('linear', module.parameters())
 
 
+@pytest.mark.parametrize('repeats', [1, 2, 3])
+def test_backward_retains_repeated_boundary_input_once(repeats):
+    leaf = torch.randn(4, 3, dtype=torch.float64, requires_grad=True)
+    outer_input = leaf * 2
+    outer_input.retain_grad()
+    reference = outer_input.detach().requires_grad_()
+
+    def segment(*inputs):
+        return sum((index + 1) * tensor.sin() for index, tensor in enumerate(inputs))
+
+    # Separate segments accumulate, while repeated arguments within one segment
+    # must not multiply the already-accumulated detached input gradient.
+    for step in range(2):
+        expected = sum(range(1, repeats + 1)) * reference.cos()
+        segment(*([reference] * repeats)).sum().backward()
+        output = Executor.fexecute('segment', segment, *([outer_input] * repeats))
+        grads = Executor.backward(
+            'segment', [outer_input] * repeats, [output], [torch.ones_like(output)],
+        )
+        for grad in (grads,) if repeats == 1 else grads:
+            torch.testing.assert_close(grad, expected)
+        torch.testing.assert_close(outer_input.grad, reference.grad)
+        assert leaf.grad is None
+    Executor.check_clear()
+
+
+def test_backward_preserves_retained_outer_input_grad():
+    Executor.clear()
+    try:
+        leaf = torch.randn(4, 3, requires_grad=True)
+        outer_input = leaf * 2
+        outer_input.retain_grad()
+
+        output = Executor.fexecute('segment', torch.sin, outer_input)
+        expected = torch.cos(outer_input)
+        actual = Executor.backward(
+            'segment', (outer_input,), (output,), (torch.ones_like(output),),
+        )
+
+        assert torch.equal(actual, expected)
+        assert torch.equal(outer_input.grad, expected)
+        assert leaf.grad is None
+        Executor.check_clear()
+    finally:
+        Executor.clear()
+
+
 def test_custom_fbw_restores_module_symbols():
     original_input = executor.backward_input
     original_weight = executor.backward_weight
