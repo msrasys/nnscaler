@@ -9,6 +9,9 @@ from nnscaler.graph.function.dimops import DimopSplit, TransformRule
 from nnscaler.graph.parser.register import CustomizedOps
 import tempfile
 import torch
+import pytest
+from unittest.mock import patch
+from nnscaler.flags import CompileFlag
 
 from ...utils import replace_all_device_with
 
@@ -309,3 +312,37 @@ def test_register_fake_fn():
         for node, p_name in zip(ir_graph.nodes(), ['linear', 'linear', 'add_xy']):
             profile_name = get_func(node)[0].__qualname__
             assert profile_name == p_name, f'{profile_name} should be {p_name}'
+
+
+_fake_input_devices = []
+
+
+def shape_only_add(x, weight):
+    _fake_input_devices.append((x.device.type, weight.device.type))
+    return x.new_zeros(x.shape, requires_grad=x.requires_grad or weight.requires_grad)
+
+
+@nnscaler.register_op('a b, a b -> a b', fake_fn=shape_only_add)
+def real_shape_only_add(x, weight):
+    raise AssertionError('runtime kernel must not run during tracing')
+
+
+class ShapeOnlyModel(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.weight = torch.nn.Parameter(torch.ones(4, 8))
+
+    def forward(self, x):
+        return real_shape_only_add(x, self.weight)
+
+
+@pytest.mark.parametrize('strategy', ['cpu', 'cuda_run_cpu_offload', 'reuse_cache'])
+def test_fake_keeps_original_inputs_and_runtime_operator(tmp_path, strategy):
+    _fake_input_devices.clear()
+    with patch.object(CompileFlag, 'trace_strategy', strategy):
+        graph = convert_model(ShapeOnlyModel(), {'x': torch.ones(4, 8)}, tmp_path, False)
+    assert _fake_input_devices == [('cpu', 'cpu')]
+    node = graph.nodes()[0]
+    assert get_func(node)[0] is real_shape_only_add
+    assert node.output(0).shape == (4, 8)
+    assert node.output(0).requires_grad

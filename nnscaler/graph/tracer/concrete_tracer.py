@@ -256,14 +256,23 @@ class ConcreteTracer(TracerBase):
 
             args_unwrapped = pytree_utils.tree_map_only(ep.ConcreteProxy, unwrap_nested_proxy, args)
             kwargs_unwrapped = pytree_utils.tree_map_only(ep.ConcreteProxy, unwrap_nested_proxy, kwargs)
+
+            def run_target():
+                if node_target is not None and node_target is not target:
+                    # A registered fake substitutes execution, not the emitted
+                    # operator. Use the existing tracer values: transferring
+                    # an entire weight tensor to CUDA defeats a shape-only fake.
+                    return target(*args_unwrapped, **kwargs_unwrapped), args_unwrapped, kwargs_unwrapped
+                return self.strategy.run_target(kind, target, args_unwrapped, kwargs_unwrapped)
+
             # A lot of autograd functions are using torch.compile
             # We must revert the patcher to the original function so torch.compile can work.
             # (For non-torch.compile functions, this is not necessary, but it is safe to do so.)
             if self.need_revert(target) or wrap_utils.is_autograd_apply(target):
                 with self.patcher.revert():
-                    value_unwrapped, args_run, kwargs_run = self.strategy.run_target(kind, target, args_unwrapped, kwargs_unwrapped)
+                    value_unwrapped, args_run, kwargs_run = run_target()
             else:
-                value_unwrapped, args_run, kwargs_run = self.strategy.run_target(kind, target, args_unwrapped, kwargs_unwrapped)
+                value_unwrapped, args_run, kwargs_run = run_target()
 
             # because setitem is an inplace operation and will not return the obj, so here is a workaound to record node result
             node_result = args_run[0] if kind == "call_function" and target == orig_func.setitem else value_unwrapped
