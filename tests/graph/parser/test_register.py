@@ -336,12 +336,15 @@ class ShapeOnlyModel(torch.nn.Module):
         return real_shape_only_add(x, self.weight)
 
 
-@pytest.mark.parametrize('strategy', ['cpu', 'cuda_run_cpu_offload', 'reuse_cache'])
+@pytest.mark.parametrize('strategy', ['cpu', 'cuda_run_cpu_offload', 'reuse_cache', 'meta', 'cuda'])
 def test_fake_keeps_original_inputs_and_runtime_operator(tmp_path, strategy):
+    if strategy == 'cuda' and not torch.cuda.is_available():
+        pytest.skip('CUDA required')
     _fake_input_devices.clear()
     with patch.object(CompileFlag, 'trace_strategy', strategy):
         graph = convert_model(ShapeOnlyModel(), {'x': torch.ones(4, 8)}, tmp_path, False)
-    assert _fake_input_devices == [('cpu', 'cpu')]
+    device = strategy if strategy in ('meta', 'cuda') else 'cpu'
+    assert _fake_input_devices == [(device, device)]
     node = graph.nodes()[0]
     assert get_func(node)[0] is real_shape_only_add
     assert node.output(0).shape == (4, 8)

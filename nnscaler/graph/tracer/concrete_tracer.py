@@ -258,7 +258,8 @@ class ConcreteTracer(TracerBase):
             kwargs_unwrapped = pytree_utils.tree_map_only(ep.ConcreteProxy, unwrap_nested_proxy, kwargs)
 
             def run_target():
-                if node_target is not None and node_target is not target:
+                if (node_target is not None and node_target is not target
+                        and self.strategy.main_device == 'cpu'):
                     # A registered fake substitutes execution, not the emitted
                     # operator. Use the existing tracer values: transferring
                     # an entire weight tensor to CUDA defeats a shape-only fake.

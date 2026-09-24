@@ -1182,7 +1182,7 @@ def _gencode_in_subprocesses(
         outdir: Path,
         codegen_workers: int,
     ) -> None:
-    import dill
+    import cloudpickle
     from nnscaler.graph.parser.register import CustomizedOps
 
     rank_ranges = _partition_codegen_ranks(compute_config.runtime_ngpus, codegen_workers)
@@ -1209,7 +1209,9 @@ def _gencode_in_subprocesses(
         with tempfile.NamedTemporaryFile(prefix='nnscaler-codegen-', suffix='.dill', delete=False) as stream:
             payload_file = Path(stream.name)
             with codegen_pickle_recursion_limit():
-                dill.dump(payload, stream)
+                # Keep support for registered-op closures while using the C
+                # pickler for the large graph shared by all codegen workers.
+                cloudpickle.dump(payload, stream)
 
         for worker_id, (rank_start, rank_end) in enumerate(rank_ranges):
             log_file = staging_dir / f'worker{worker_id}.log'

@@ -180,9 +180,10 @@ def register_op(annotation: Union[str, Callable], name: Optional[str] = None,
         fake_fn (Callable): a lightweight substitute for runtime_fn during tracing.
             It must have the same signature (inputs and outputs) as runtime_fn so that
             the two are interchangeable.
-            It receives tensors on their current tracing devices, without the
-            real operator's CUDA/offload transfers, and must preserve output
-            shape, dtype and differentiability. Generated code calls runtime_fn.
+            CPU/offload tracing passes the existing tensors without moving them
+            to CUDA; pure CUDA/meta tracing retains its device placement. The
+            substitute must preserve output shape, dtype and differentiability.
+            Generated code calls runtime_fn.
             If fake_fn is None, runtime_fn will be used directly,
             which may cause errors if runtime_fn contains operations
             that cannot run during tracing (e.g., distributed communication ops).

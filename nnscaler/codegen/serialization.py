@@ -8,7 +8,7 @@ import sys
 
 
 # Partitioned training graphs can be substantially deeper than Python's
-# default recursion limit. dill follows those object links recursively while
+# default recursion limit. Picklers follow those object links recursively while
 # writing and reading the multi-process codegen payload.
 CODEGEN_PICKLE_RECURSION_LIMIT = 10_000
 
