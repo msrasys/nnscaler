@@ -147,6 +147,42 @@ def test_2gpu():
         assert torch.equal(outputs[1][1], out1)
 
 
+def _async_input_callback_worker():
+    from nnscaler.runtime.executor import Executor, AsyncCommHandler
+
+    _init_distributed(2)
+    rank = torch.distributed.get_rank()
+    for collective in ('all_gather', 'all_to_all'):
+        for split in (False, True):
+            source = torch.full((2, 4), float(rank), device=torch.cuda.current_device(), requires_grad=True)
+            if collective == 'all_gather':
+                placeholder = nnscaler.runtime.adapter.all_gather(source, 0, [0, 1], async_op=True)
+                expected_input = torch.cat([torch.full_like(source, float(r)) for r in (0, 1)])
+            else:
+                placeholder = nnscaler.runtime.adapter.all_to_all(source, 0, 1, [0, 1], async_op=True)
+                expected_input = torch.cat([torch.full_like(source[:, :2], float(r)) for r in (0, 1)])
+            callbacks = []
+            Executor.register_input_grad_callback(placeholder, callbacks.append)
+            output = Executor.fexecute('async', lambda x, y: x.sin() + y.sin(), placeholder, placeholder)
+            torch.testing.assert_close(output, 2 * expected_input.sin())
+            if split:
+                grads = Executor.backward_input('async', [placeholder] * 2, [output], [torch.ones_like(output)], [])
+                Executor.backward_weight('async', [])
+            else:
+                grads = Executor.backward('async', [placeholder] * 2, [output], [torch.ones_like(output)])
+            assert len(callbacks) == 1
+            for grad in (*grads, callbacks[0]):
+                torch.testing.assert_close(grad, 2 * expected_input.cos())
+            Executor.check_clear()
+            AsyncCommHandler().check_clear()
+    torch.distributed.destroy_process_group()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.device_count() < 2, reason='lack of gpu devices')
+def test_2gpu_async_input_callbacks():
+    launch_torchrun(2, _async_input_callback_worker)
+
+
 def _rdscatter_worker(async_op):
     shape = [128, 256]
 
