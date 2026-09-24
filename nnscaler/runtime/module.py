@@ -1271,7 +1271,11 @@ class ParallelModule(CubeModule):
         self._non_presistent_buffers_inited = init_params or not self._non_persistent_buffers_set
         module_file = Path(sys.modules[self.__module__].__file__)
         if init_params:
-            self.load_attr_content(str(module_file.with_name(f"{FxModuleParser.ATTR_CONTENT_FILE_STEM}")))
+            if self.compute_config.user_config.get('shard_init', False):
+                from .initialization import PLAN_FILE, load_module_parameters
+                load_module_parameters(self, module_file.with_name(PLAN_FILE))
+            else:
+                self.load_attr_content(str(module_file.with_name(f"{FxModuleParser.ATTR_CONTENT_FILE_STEM}")))
         elif self._non_persistent_buffers_set:
             # When init_params=False, only load non-persistent buffers from the small npbuffer.pt file.
             # This avoids loading the large fullmodel.pt files when resuming from checkpoint,

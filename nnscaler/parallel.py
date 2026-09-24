@@ -716,6 +716,9 @@ def _prepare_and_check_reusable(
         outdir / FxModuleParser.ATTR_CONTENT_INDEX_FILE,
         outdir / FxModuleParser.ATTR_MAP_FILE,
     ]
+    if compute_config.user_config.get('shard_init', False):
+        from .runtime.initialization import PLAN_FILE
+        trace_meta_files = [outdir / PLAN_FILE, outdir / FxModuleParser.ATTR_MAP_FILE]
 
     if reuse == ReuseType.MATCH or reuse == ReuseType.MOO:
         # check if the module is already generated
@@ -812,7 +815,8 @@ def _gen_graph(
     IDGenerator().clear()
     disable_global_graph()
 
-    module.cpu()
+    if not hasattr(module, '_nnscaler_init_plan'):
+        module.cpu()
     forward_args_default = _get_arg_default_values(module.forward)
     for v in forward_args_default.values():
         if v is not inspect.Parameter.empty and not isinstance(v, (int, str, float, bool, type(None))):
@@ -913,7 +917,10 @@ def _gencode(
         ret = RegenStatus.ALL
         if is_module_class:
             try:
-                if module_fn is None:
+                if compute_config.user_config.get('shard_init', False):
+                    from .runtime.initialization import construct
+                    module = construct(module_fn or module_or_module_class, module_dtype, outdir)
+                elif module_fn is None:
                     # it should only have 1 `self` parameter
                     if len(inspect.signature(module_or_module_class.__init__).parameters) > 1:
                         raise ValueError("Module class __init__ should be parameter-free.")
@@ -925,6 +932,8 @@ def _gencode(
             except Exception as e:
                 raise RuntimeError(f"Error when creating module instance.") from e
         else:
+            if compute_config.user_config.get('shard_init', False):
+                raise ValueError('shard_init requires a module class/factory to record initialization')
             module = module_or_module_class
 
         if module_dtype is not None:
@@ -1467,6 +1476,13 @@ def parallelize(
             if load_module flag is set, return the converted ParallelModule object or class
             if load_module flag is not set, return None
     """
+    if compute_config.user_config.get('shard_init', False):
+        from .runtime.initialization import PLAN_VERSION, SCHEME
+        compute_config = replace(compute_config, user_config={
+            **compute_config.user_config, 'shard_init_scheme': SCHEME,
+            'shard_init_plan_version': PLAN_VERSION,
+        })
+
     if isinstance(codegen_workers, bool) or not isinstance(codegen_workers, int) or codegen_workers < 1:
         raise ValueError(f'codegen_workers must be a positive integer, got {codegen_workers!r}')
 

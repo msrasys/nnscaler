@@ -2,6 +2,7 @@
 #  Licensed under the MIT License.
 
 import time
+from contextlib import nullcontext
 from typing import TYPE_CHECKING, Any, Tuple, Dict, Callable, Type
 
 import torch
@@ -201,6 +202,143 @@ class MetaStrategy(BaseTraceStrategy):
         return self._place_module_to(model, device='cpu')
 
 
+class DeferredStrategy(BaseTraceStrategy):
+    """Trace metadata where possible; materialize only the next concrete op.
+
+    Parameter recipes stay on the source module, never full parameter values.
+    Pure PyTorch expressions run on meta tensors. Custom kernels or reads of
+    tensor values evaluate their dependencies with temporary real parameters.
+    Returned trace samples are detached to avoid retaining parameter storage
+    through autograd, while preserving the observed requires_grad metadata.
+    """
+    _name = 'deferred'
+
+    def __init__(self, tracer):
+        super().__init__(tracer, 'cpu')
+        self.expressions = {}
+        self.parameters = {}
+        self.cache = {}
+
+    def place_model(self, model):
+        self.plan = model._nnscaler_init_plan
+        self.parameters = {id(p): (p, name) for name, p in model.named_parameters()}
+        return model
+
+    @staticmethod
+    def _invoke(kind, target, args, kwargs):
+        if kind == 'call_method':
+            return getattr(args[0], target)(*args[1:], **kwargs)
+        return target(*args, **kwargs)
+
+    @staticmethod
+    def _detach(value):
+        def detach(tensor):
+            return tensor.detach().requires_grad_(tensor.requires_grad)
+        return pytree_utils.tree_map_only(torch.Tensor, detach, value)
+
+    def _remember(self, value, kind, target, args, kwargs):
+        leaves, spec = pytree_utils.tree_flatten(value)
+        expression = (kind, target, args, kwargs)
+        for index, leaf in enumerate(leaves):
+            if isinstance(leaf, torch.Tensor) and leaf.is_meta:
+                self.expressions[id(leaf)] = (leaf, expression, index)
+
+    def _materialize(self, tensor, device, cache):
+        if not tensor.is_meta:
+            return tensor.to(device).requires_grad_(tensor.requires_grad)
+        key = id(tensor)
+        if key in self.parameters:
+            from nnscaler.runtime.initialization import initialize
+            _, name = self.parameters[key]
+            out = torch.empty(tuple(tensor.shape), dtype=tensor.dtype, device=device)
+            initialize(self.plan, name, (slice(None),)*tensor.ndim, out=out, _trace=True)
+            out.untyped_storage()._nnscaler_trace_temporary = True
+            return out.requires_grad_(tensor.requires_grad)
+        if key in cache:
+            return cache[key]
+        if key not in self.expressions:
+            raise RuntimeError('Untracked meta tensor during deferred tracing')
+        _, (kind, target, args, kwargs), index = self.expressions[key]
+        real_args, real_kwargs = pytree_utils.tree_map_only(
+            torch.Tensor, lambda t: self._materialize(t, device, cache), (args, kwargs))
+        value = self._detach(self._invoke(kind, target, real_args, real_kwargs))
+        result = pytree_utils.tree_flatten(value)[0][index]
+        result.untyped_storage()._nnscaler_trace_temporary = True
+        cache[key] = result
+        return result
+
+    def _concrete(self, kind, target, args, kwargs):
+        from nnscaler.flags import CompileFlag
+        device = 'cpu' if CompileFlag.trace_strategy == 'cpu' else 'cuda'
+        cache = {}
+        real_args, real_kwargs = pytree_utils.tree_map_only(
+            torch.Tensor, lambda t: self._materialize(t, device, cache), (args, kwargs))
+        value = self._detach(self._invoke(kind, target, real_args, real_kwargs))
+        with torch.no_grad():
+            value, = self._place_tensors_to(value, device='cpu')
+        # Keep proxies for attributes as meta tensors, so the graph does not
+        # accumulate one real CPU/GPU parameter for every operator visited.
+        return value, args, kwargs
+
+    def run_target(self, kind, target, args, kwargs):
+        from nnscaler.flags import CompileFlag
+        # Preserve the existing shape-cache semantics selected by llm-train,
+        # without caching concrete parameter arguments/storage along with it.
+        cacheable = (CompileFlag.trace_strategy == 'reuse_cache'
+                     and kind in ('call_function', 'call_method')
+                     and getattr(target, '__module__', '') != 'builtins')
+        key = ReuseCacheStrategy.hash_input(kind, target, args, kwargs) if cacheable else None
+        if cacheable and key in self.cache:
+            return self.cache[key], args, kwargs
+        result = self._run_deferred(kind, target, args, kwargs)
+        if cacheable:
+            self.cache[key] = result[0]
+        return result
+
+    def _run_deferred(self, kind, target, args, kwargs):
+        if kind not in ('call_function', 'call_method'):
+            return super().run_target(kind, target, args, kwargs)
+        leaves = pytree_utils.tree_flatten((args, kwargs))[0]
+        has_meta = any(isinstance(t, torch.Tensor) and t.is_meta for t in leaves)
+        if target is getattr and has_meta and args[1] in ('device', 'is_cuda', 'is_meta'):
+            from nnscaler.flags import CompileFlag
+            on_cpu = CompileFlag.trace_strategy in ('cpu', 'reuse_cache')
+            device = torch.device('cpu') if on_cpu else torch.device('cuda', torch.cuda.current_device())
+            value = device if args[1] == 'device' else (device.type == 'cuda' if args[1] == 'is_cuda' else False)
+            return value, args, kwargs
+        # Registered custom kernels keep their original concrete implementation.
+        # Builtin/PyTorch shape propagation can avoid allocating activations too.
+        module = getattr(target, '__module__', '') or ''
+        standard = kind == 'call_method' or module.startswith(('torch', '_operator', 'operator', 'builtins'))
+        from .wrap_utils import is_autograd_apply
+        standard = standard and not is_autograd_apply(target)
+        if not has_meta:
+            if not standard and any(isinstance(t, torch.Tensor) for t in leaves):
+                return self._concrete(kind, target, args, kwargs)
+            return super().run_target(kind, target, args, kwargs)
+        name = target if isinstance(target, str) else getattr(target, '__name__', '')
+        # Trailing '_' denotes mutation for tensor methods/PyTorch functions,
+        # not Python operators such as operator.is_ (``weight is None``).
+        tensor_operation = kind == 'call_method' or module.startswith('torch')
+        if tensor_operation and name.endswith('_') and not name.endswith('__'):
+            raise NotImplementedError('In-place operations on deferred tensors require an explicit tracing rule')
+        if standard:
+            def to_meta(t):
+                return t.to('meta').requires_grad_(t.requires_grad)
+            meta_args, meta_kwargs = pytree_utils.tree_map_only(torch.Tensor, to_meta, (args, kwargs))
+            try:
+                # Meta kernels use Python shape checks (e.g. type(x) is bool).
+                # They must see real builtins, not the tracer's replacements.
+                context = self.tracer.patcher.revert() if self.tracer.patcher.patch_mode else nullcontext()
+                with context:
+                    value = self._invoke(kind, target, meta_args, meta_kwargs)
+            except (NotImplementedError, RuntimeError):
+                return self._concrete(kind, target, args, kwargs)
+            self._remember(value, kind, target, args, kwargs)
+            return value, args, kwargs
+        return self._concrete(kind, target, args, kwargs)
+
+
 class CudaRunCpuOffloadStrategy(BaseTraceStrategy):
     """
     This is the previous tracer run target logic (nnscaler <= v0.2).
@@ -332,6 +470,7 @@ TRACE_STRATEGY: Dict[str, Type[BaseTraceStrategy]] = {
     CpuStrategy._name: CpuStrategy,
     CudaStrategy._name: CudaStrategy,
     MetaStrategy._name: MetaStrategy,
+    DeferredStrategy._name: DeferredStrategy,
     CudaRunCpuOffloadStrategy._name: CudaRunCpuOffloadStrategy,
     ReuseCacheStrategy._name: ReuseCacheStrategy,
 }

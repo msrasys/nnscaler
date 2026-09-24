@@ -153,6 +153,11 @@ class Frame:
         Returns:
             None
         """
+        from pathlib import Path
+        from nnscaler.runtime.initialization import PLAN_FILE, save_trace_attributes
+        if (Path(save_file_stem).parent / PLAN_FILE).is_file():
+            save_trace_attributes(Path(save_file_stem).parent, self._attr_map)
+            return
         #TODO: use FxModuleParser.ATTR_CONTENT_FILE_FORMAT to name the files.
         total_size = sum([val.numel() for _, (_, val) in self._attr_map.items()])
         model_pt_part_num = (total_size + params_per_file - 1) // params_per_file

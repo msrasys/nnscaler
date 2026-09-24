@@ -8,6 +8,7 @@ from dataclasses import asdict, replace
 import inspect
 import copy
 import logging
+from contextlib import nullcontext
 from functools import partial
 
 import nnscaler
@@ -75,7 +76,15 @@ class ModuleParallelizeConfigAdapter(PrecisionMixin, PolicyMixin):
     def compute_config(self):
         if self.parallel_module:
             if self.parallel_module.compute_config is not None:
-                return self.parallel_module.compute_config.resolve(self.trainer_args.compute_config)
+                resolved = self.parallel_module.compute_config.resolve(self.trainer_args.compute_config)
+                # Subgraphs such as Vision replace user_config; inherit the
+                # initialization mode unless that subgraph explicitly overrides it.
+                if 'shard_init' in self.trainer_args.compute_config.user_config:
+                    resolved.user_config.setdefault(
+                        'shard_init',
+                        self.trainer_args.compute_config.user_config['shard_init'],
+                    )
+                return resolved
             else:
                 return replace(self.trainer_args.compute_config, use_end2end=False)
         else:
@@ -215,11 +224,15 @@ class ModuleParallelizeConfigAdapter(PrecisionMixin, PolicyMixin):
         compute_config.pas_config['use_bf16'] = self.param_dtype == torch.bfloat16
         compute_config.pas_config['use_fp16'] = self.param_dtype == torch.float16
 
+        model_args = self.trainer_args.model.args
+        if compute_config.user_config.get('shard_init', False):
+            from nnscaler.runtime.initialization import portable_checkpoint_arguments
+            model_args = portable_checkpoint_arguments(model_args)
         compute_config.user_config['__from_trainer_args'] = {
             'mbs': self.trainer_args.micro_batch_size,
             'gbs': self.trainer_args.global_batch_size,
             'precision': self.trainer_args.precision,
-            'model_args': self.trainer_args.model.args,
+            'model_args': model_args,
             'autoset_requires_grad': self.autoset_requires_grad
         }
         return compute_config
@@ -246,7 +259,13 @@ class ModuleParallelizeConfigAdapter(PrecisionMixin, PolicyMixin):
             autoset_requires_grad=self.autoset_requires_grad,
         )
         if load_module:
-            pmodel = pmodel_class(init_params=init_params, build_buckets=False)
+            device_context = (
+                torch.device('cuda', torch.cuda.current_device())
+                if pmodel_class.compute_config.user_config.get('shard_init', False)
+                else nullcontext()
+            )
+            with device_context:
+                pmodel = pmodel_class(init_params=init_params, build_buckets=False)
             self.set_grad_dtype(pmodel)
             if build_buckets:
                 pmodel.build_buckets()
