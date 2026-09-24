@@ -176,6 +176,10 @@ class BaseTraceStrategy:
         """
         return self._run_target(kind, target, args, kwargs)
 
+    def clear_cache(self) -> None:
+        """Release execution-only state after each trace, including failures."""
+        pass
+
 
 class CpuStrategy(BaseTraceStrategy):
     """
@@ -281,6 +285,10 @@ class ReuseCacheStrategy(CudaRunCpuOffloadStrategy):
         # some ops don't use gpu, so directly run them on cpu and don't cache them
         # TODO: add functions to optimize the cache memory cost.
         self.force_cpu_ops = []
+
+    def clear_cache(self) -> None:
+        self.cache.clear()
+        self.cache_size = 0
 
     def force_cpu_run(self, kind, target):
         if kind == 'call_function':

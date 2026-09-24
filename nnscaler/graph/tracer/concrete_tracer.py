@@ -791,11 +791,15 @@ class ConcreteTracer(TracerBase):
                     self.create_node('output', 'output', (self.create_arg(results),),
                                      {}, type_expr=fn.__annotations__.get('return', None), node_result=node_result)
         finally:
-            _retain_weight_consistency(self.root)
-            # clean up caches
-            for func in self.cached_function:
-                if func is not None:
-                    func.cache_clear()
+            try:
+                _retain_weight_consistency(self.root)
+            finally:
+                # Tracer and strategy reference each other. Don't retain all
+                # cached activations until cyclic GC happens to collect them.
+                self.strategy.clear_cache()
+                for func in self.cached_function:
+                    if func is not None:
+                        func.cache_clear()
 
         return self.graph
 

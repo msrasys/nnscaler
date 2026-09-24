@@ -179,6 +179,22 @@ The generated files include:
 2. trace files: graph dump (`graph.ckp`), forward args dump (`forward_args.pkl`), origin module metadata (`origin_module_metadata.pt`), init weights (`fullmodel.pt.*`), param name mapping (`dist_param_map.pt`)
 3. code: generated code files (`gencode*.py`)
 
+Initial-weight files are written concurrently from read-only CPU tensors.
+`NNSCALER_WEIGHT_SAVE_WORKERS` sets the positive writer count (default: 4).
+Set it to 1 to serialize writes on storage that does not benefit from concurrency.
+The existing `fullmodel.pt.*` / `fullmodel.pt.index` format is preserved; the index
+is written only after every weight file succeeds. Tensors are not sliced into
+views just to meet the file-size target, which would risk serializing their
+entire backing storage repeatedly.
+
+Multi-process code generation uses `cloudpickle` for its temporary worker
+payload, including registered-op closures. This does not change persisted
+graphs or training checkpoint formats. Codegen workers limit their CPU tensor
+threads to one; the parent can use more threads for initialization and tracing.
+The `reuse_cache` tracing strategy releases its execution-only tensor cache
+after each trace, including failed traces, before initial weights are written.
+Recorded graph metadata and tensors referenced by the model are retained.
+
 ```python
 class BroadcastGenFilesStrategy(Enum):
     NONE = 'none'
