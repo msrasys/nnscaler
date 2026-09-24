@@ -3,7 +3,7 @@
 
 from typing import List, Dict, Tuple, Any, Callable, Optional, Set, Union, TYPE_CHECKING
 from functools import partial
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import math
 import logging
 import weakref
@@ -951,11 +951,17 @@ class Bucket:
         fields = unchecked_fields(self)
         state[fields._params] = [param_map[p] for p in self._params]
         state[fields._params_info] = {param_map[p]: info for p, info in self._params_info.items()}
-        state[fields._flatten_param_info].params_info = state[fields._params_info]
+        state[fields._flatten_param_info] = replace(
+            self._flatten_param_info, params_info=state[fields._params_info])
         state[fields._pofset] = {param_map[p]: ofst for p, ofst in self._pofset.items()}
         state[fields._param_for_optimizer] = torch.nn.Parameter(torch.empty_like(self._param_for_optimizer, device='meta'))
         state[fields._contiguous_params] = torch.empty_like(self._contiguous_params, device='meta')
         state[fields._contiguous_grads] = torch.empty_like(self._contiguous_grads, device='meta')
+
+        # These dictionaries also use parameters as keys. Leaving real keys
+        # here serializes their complete (possibly shared) CUDA storage.
+        for name in ('_async_expected_param_cnt', '_async_seen_param_cnt'):
+            state[name] = {param_map[p]: count for p, count in getattr(self, name).items()}
 
         # remove torch handles
         state.pop(fields._group, None)
