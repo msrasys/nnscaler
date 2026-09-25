@@ -34,6 +34,8 @@ class CompileFlag:
     disable_code_line_info = _to_bool('DISABLE_CODE_LINE_INFO')  # will add original code information in generated code, note that this will make trace slow
     # how to execute the functions during trace, available choices ['cpu', 'cuda', 'meta', 'cuda_run_cpu_offload', 'reuse_cache']
     trace_strategy = os.environ.get('TRACE_STRATEGY', default='cuda_run_cpu_offload')
+    # Maximum concurrent initial-weight shard writes during parsing. Use 1 for serial saves.
+    attr_save_workers = _to_int('ATTR_SAVE_WORKERS', default=8)
     # reduce scatter adapter can reduce the communication cost, and improve the performance
     # but sometimes it may cause communication bugs, so we provide an option to enable/disable it
     disable_reduce_scatter_adapter = _to_bool('DISABLE_REDUCE_SCATTER_ADAPTER', False)

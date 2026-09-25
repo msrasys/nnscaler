@@ -898,6 +898,25 @@ Please note
 - `init_env_fn` (`str`): The function to initialize the environment.
   Default is `None`.
 
+### Initial weight saving during compilation
+
+Compilation saves initial weights to `fullmodel.pt.0`, `fullmodel.pt.1`, etc.
+Set the environment variable `ATTR_SAVE_WORKERS` before starting Python to
+control concurrent shard writes (a positive integer, default `8`). Set it to
+`1` for serial saving. This setting is independent of `codegen_workers`,
+which controls per-rank code generation.
+
+At most `ATTR_SAVE_WORKERS` shard writes are queued or running at once.
+Writer threads share the CPU tensors prepared by the parser without copying
+the model into worker processes; the complete CPU tensor set still resides in
+memory. Shard contents, numbering, and the loading format are unchanged.
+Each file is written to a temporary file in the destination directory and
+renamed into place. The old index is removed before rewriting shards, and
+`fullmodel.pt.index` is published only after all writes succeed. If saving
+fails, the error propagates after active writers finish, temporary files are
+cleaned up, and completed shards may remain without an index. Logs report
+the writer count, each shard's save duration, and the overall save duration.
+
 ### Debug Config
 
 ``` python

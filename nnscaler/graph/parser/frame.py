@@ -2,9 +2,31 @@
 #  Licensed under the MIT License.
 
 from collections import OrderedDict
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+from itertools import islice
+import logging
+from pathlib import Path
+import time
 from typing import List, Any, Dict, Tuple, Optional
+from uuid import uuid4
+
+from nnscaler.flags import CompileFlag
 from nnscaler.ir.cten import IRTensor
 import torch
+
+
+_logger = logging.getLogger(__name__)
+
+
+def _atomic_torch_save(content: Any, path: Path):
+    # Keep the temporary file on the destination filesystem so rename is atomic.
+    # Pass a path to torch.save to retain its native file writer.
+    temp_path = path.with_name(f'.{path.name}.{uuid4().hex}.tmp')
+    try:
+        torch.save(content, temp_path)
+        temp_path.replace(path)
+    finally:
+        temp_path.unlink(missing_ok=True)
 
 
 class Frame:
@@ -142,17 +164,33 @@ class Frame:
                 return tensor
         return None
 
-    def save_attr_content(self, save_file_stem: str, params_per_file: int = 1024 * 1024 * 1024):
+    def save_attr_content(
+        self,
+        save_file_stem: str,
+        params_per_file: int = 1024 * 1024 * 1024,
+        max_workers: Optional[int] = None,
+    ):
         """
         Save attribute content into file.
 
         Args:
             save_file_stem (str): stem file name. Actual file name will be `save_file_stem`.0, `save_file_stem`.1, etc.
             params_per_file (int): number of params per file,default is 1 billion
+            max_workers (Optional[int]): maximum queued/running shard saves. Defaults to
+                CompileFlag.attr_save_workers (ATTR_SAVE_WORKERS, default 8). Use 1 for serial saves.
+
+        CPU tensors are shared by the writer threads and must not be modified during saving.
+        Each file is published atomically; the index is published only after all shards succeed.
+        On write failure, in-flight writers are joined and no index is left. Completed shards may remain.
 
         Returns:
             None
         """
+        if max_workers is None:
+            max_workers = CompileFlag.attr_save_workers
+        if isinstance(max_workers, bool) or not isinstance(max_workers, int) or max_workers < 1:
+            raise ValueError(f'attr save max_workers (ATTR_SAVE_WORKERS) must be a positive integer, got {max_workers!r}')
+
         #TODO: use FxModuleParser.ATTR_CONTENT_FILE_FORMAT to name the files.
         total_size = sum([val.numel() for _, (_, val) in self._attr_map.items()])
         model_pt_part_num = (total_size + params_per_file - 1) // params_per_file
@@ -168,14 +206,46 @@ class Frame:
             chunks = [tids[i:min(i + chunk_size, len(tids))] for i in
                       range(0, len(tids), chunk_size)]
 
-        tid_to_chunk = {}
-        for idx, chunk in enumerate(chunks):
-            torch.save({tid: tid2value[tid] for tid in chunk}, f'{save_file_stem}.{idx}')
-            tid_to_chunk.update((tid, idx) for tid in chunk)
+        max_workers = min(max_workers, len(chunks))
+        tid_to_chunk = {tid: idx for idx, chunk in enumerate(chunks) for tid in chunk}
+        index_path = Path(f'{save_file_stem}.index')
+        # An older index must not advertise partially overwritten shards after a failed retry.
+        index_path.unlink(missing_ok=True)
+        started = time.perf_counter()
+        _logger.info('Saving %d attribute chunks to %s with %d writer(s)', len(chunks), save_file_stem, max_workers)
+
+        def save_chunk(idx, chunk):
+            chunk_started = time.perf_counter()
+            # Build only the active shard dictionaries; all tensor storage stays shared.
+            _atomic_torch_save({tid: tid2value[tid] for tid in chunk}, Path(f'{save_file_stem}.{idx}'))
+            _logger.info('Saved attribute chunk %d/%d in %.2fs', idx + 1, len(chunks), time.perf_counter() - chunk_started)
+
+        if max_workers == 1:
+            for idx, chunk in enumerate(chunks):
+                save_chunk(idx, chunk)
+        else:
+            chunk_iter = iter(enumerate(chunks))
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                pending = set()
+                try:
+                    for idx, chunk in islice(chunk_iter, max_workers):
+                        pending.add(executor.submit(save_chunk, idx, chunk))
+                    while pending:
+                        done, pending = wait(pending, return_when=FIRST_COMPLETED)
+                        # Check every completed write before submitting more work.
+                        for future in done:
+                            future.result()
+                        for idx, chunk in islice(chunk_iter, len(done)):
+                            pending.add(executor.submit(save_chunk, idx, chunk))
+                finally:
+                    # Running writes cannot be cancelled; the executor joins them on exit.
+                    for future in pending:
+                        future.cancel()
 
         # Keep the index separate from the tensor chunks so each rank can find
         # the chunks it needs without deserializing every full-model tensor.
-        torch.save(tid_to_chunk, f'{save_file_stem}.index')
+        _atomic_torch_save(tid_to_chunk, index_path)
+        _logger.info('Saved attribute content and index to %s in %.2fs', save_file_stem, time.perf_counter() - started)
 
     def save_np_buffer_content(self, save_file: str):
         """
