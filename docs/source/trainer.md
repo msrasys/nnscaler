@@ -1409,7 +1409,14 @@ class ReuseType(Enum):
 ```
 
 We call it a `match` when the `ComputeConfig` is the same with the
-previous run.
+previous run. The VL trainer's
+`user_config.__from_trainer_args.model_args.model_args.vision_encoder_path`
+is excluded from code and graph reuse comparisons, including for packages
+generated before this exception was added. This allows the same Vision checkpoint
+to be staged at a different local path. Path values are retained in runtime
+arguments and serialized metadata; only comparisons ignore them.
+Other configuration fields and package completeness are
+still checked; changing the Vision architecture requires regenerating the code.
 
 1.  `MATCH`: Reuse if match, error if not match, generate if no previous
     gerenated code exists.

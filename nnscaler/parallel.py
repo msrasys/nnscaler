@@ -95,6 +95,26 @@ for k, v in policies.__dict__.items():
         _PREDEFINED_POLICIES[k[len(_PREDEFINED_POLICIES_NAME_PREFIX):]] = v
 
 
+def _user_config_for_reuse(user_config: Dict[str, Any]) -> Dict[str, Any]:
+    """Ignore the VL checkpoint's location, preserving its model configuration.
+
+    Training can stage the same Vision weights in a per-job local directory.
+    Normalize both saved and current configs so existing packages remain usable.
+    Copy only the dictionaries on this path; never change runtime model args or
+    the saved config, and do not ignore similarly named keys elsewhere.
+    """
+    result = user_config.copy()
+    current = result
+    for key in ('__from_trainer_args', 'model_args', 'model_args'):
+        child = current.get(key)
+        if not isinstance(child, dict):
+            return user_config
+        current[key] = child.copy()
+        current = current[key]
+    current.pop('vision_encoder_path', None)
+    return result
+
+
 @dataclass(frozen=True)
 class ComputeConfig:
     plan_ngpus: int
@@ -304,7 +324,7 @@ class ComputeConfig:
     def graph_config(self) -> Dict[str, Any]:
       return {
             'constant_folding': self.constant_folding,
-            'user_config': self.user_config,
+            'user_config': _user_config_for_reuse(self.user_config),
             'inference_only': self.inference_only, # there will be no backward nodes in the graph in inference mode
             'end2end_mode': self.use_end2end,  # end2end_mode can affect the graph generation.
             'trace_strategy': self.trace_strategy,  # different strategy might lead to different graph
@@ -400,11 +420,13 @@ class ComputeConfig:
     @classmethod
     def safe_equals(cls, a: Optional['ComputeConfig'], b: Optional['ComputeConfig']) -> bool:
         """
-        Return False if a and b are from incompatible version of ComputeConfig
-        This is only for backward compatibility, and will be removed in future
-        and can use `==` when we save dict version of ComputeConfig to file.
+        Compare configs for reuse, allowing the VL checkpoint path to change.
+        Return False for incompatible versions of ComputeConfig.
         """
         try:
+            if isinstance(a, cls) and isinstance(b, cls):
+                a = replace(a, user_config=_user_config_for_reuse(a.user_config))
+                b = replace(b, user_config=_user_config_for_reuse(b.user_config))
             return a == b
         except AttributeError:
             logger.warning("Failed to compare ComputeConfig. They are incompatible.")
@@ -640,8 +662,11 @@ def _reuse_mismatch_details(old_config, compute_config, is_config_match,
             details.append('Saved compute_config.pt is missing or could not be loaded.')
         else:
             try:
+                saved, current = asdict(old_config), asdict(compute_config)
+                for config in (saved, current):
+                    config['user_config'] = _user_config_for_reuse(config['user_config'])
                 paths = list(itertools.islice(_config_difference_paths(
-                    asdict(old_config), asdict(compute_config)), 21))
+                    saved, current), 21))
                 details.append('Differing config fields: ' + ', '.join(paths[:20])
                                + (', ...' if len(paths) > 20 else '') + '.')
             except Exception:
