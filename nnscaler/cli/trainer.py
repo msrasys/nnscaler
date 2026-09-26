@@ -34,6 +34,20 @@ from .serialization import Checkpointer
 logger = logging.getLogger(__name__)
 
 
+def _model_config_for_checkpoint_merge(model_config: Dict[str, Any]) -> Dict[str, Any]:
+    """Compare VL model identity independently of rank-local weight staging.
+
+    Only the known wrapper model argument is excluded. Keep equally named
+    keys elsewhere, and never rewrite saved or runtime model configurations.
+    """
+    args = model_config.get('args')
+    if not isinstance(args, dict) or not isinstance(args.get('model_args'), dict):
+        return model_config
+    model_args = args['model_args'].copy()
+    model_args.pop('vision_encoder_path', None)
+    return {**model_config, 'args': {**args, 'model_args': model_args}}
+
+
 @dataclass
 class TrainStatus:
     best_loss = float('inf')
@@ -270,11 +284,13 @@ class Trainer:
                 # we pop optimizer state to save cpu memory
                 state_dict.pop('optimizer', None)
             state_dicts.append(state_dict)
+        reference_model_config = _model_config_for_checkpoint_merge(state_dicts[0]['train_args']['model'])
         for i in range(1, len(state_dicts)):
             # NOTE: train_args can be different in different ranks
             # for example, profiling related args can be different,
             # so we don't want to enforce them to be the same across ranks.
-            if state_dicts[i]['train_args']['model'] != state_dicts[0]['train_args']['model']:
+            model_config = _model_config_for_checkpoint_merge(state_dicts[i]['train_args']['model'])
+            if model_config != reference_model_config:
                 raise ValueError(f"model config in {checkpoint_files[i]} is different from {checkpoint_files[0]}")
             if state_dicts[i].get('lr_scheduler', None) != state_dicts[0].get('lr_scheduler', None):
                 raise ValueError(f"lr_scheduler state in {checkpoint_files[i]} is different from {checkpoint_files[0]}")

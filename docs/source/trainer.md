@@ -772,6 +772,12 @@ Where `ResumeOptions` and `SerializerOptions` are:
     (without saving). `False` means will load the sharded checkpoint
     files. `None` means will load sharded if world size is unchanged,
     and merged otherwise. Only used when `checkpoint` is a directory.
+    When comparing model configurations across checkpoint ranks, only
+    `model.args.model_args.vision_encoder_path` is ignored, allowing the same
+    Vision weights to be staged at different node-local paths. Other model
+    fields and learning-rate scheduler state must still match. This comparison
+    does not rewrite checkpoint metadata; the merged result retains the first
+    input checkpoint's model configuration.
   - `save_memory` (`bool`): If the memory is limited, only load merged
     state dict in GPU 0 of each node and broadcast trimmed state dict to
     other ranks. Although slower, this saves memory. Only used when
