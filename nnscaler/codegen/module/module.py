@@ -1,7 +1,8 @@
 #  Copyright (c) Microsoft Corporation.
 #  Licensed under the MIT License.
 
-from typing import List, Optional, Tuple, Dict, Any, Literal, Set
+from typing import List, Optional, Tuple, Dict, Any, Literal, Set, BinaryIO, Union
+from os import PathLike
 import more_itertools
 import logging
 import copy
@@ -453,7 +454,7 @@ class ModuleCodeGen(FuncEmission):
         as_parallel_module: bool = False,
         end2end_mode: bool = False,
         forward_args: Optional[Dict[str, Any]] = None,
-        outfile_attr_meta_map: Optional[str] = None,
+        outfile_attr_meta_map: Optional[Union[str, bytes, PathLike, BinaryIO]] = None,
     ) -> str:
         """
         Generate model implementation code based on the given graph.
@@ -542,7 +543,8 @@ class ModuleCodeGen(FuncEmission):
                 This is used only in parallel module.
             forward_args (Dict[str, Any]): argument names and their default values of forward function, if None, use node inputs.
                 This is used only in parallel module.
-            outfile_attr_meta_map (str): output file path for parameter mapping. None if don't save
+            outfile_attr_meta_map: output path or caller-owned binary stream for parameter mapping.
+                None if don't save. Streams are written at their current position and are not closed.
 
         Returns:
             generated code
@@ -646,8 +648,11 @@ class ModuleCodeGen(FuncEmission):
             node_args.append(args)
 
         if outfile_attr_meta_map:
-            with open(outfile_attr_meta_map, 'wb') as f:
-                pickle.dump(attr_meta_map, f)
+            if isinstance(outfile_attr_meta_map, (str, bytes, PathLike)):
+                with open(outfile_attr_meta_map, 'wb') as f:
+                    pickle.dump(attr_meta_map, f)
+            else:
+                pickle.dump(attr_meta_map, outfile_attr_meta_map)
 
         # generate full code
         with ClassBlock(

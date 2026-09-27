@@ -904,6 +904,32 @@ Please note
 - `init_env_fn` (`str`): The function to initialize the environment.
   Default is `None`.
 
+### Multi-process code-generation payloads
+
+With `codegen_workers > 1`, NNScaler serializes the code-generation plan once
+before launching local workers. It uses the C pickle implementation for the
+graph, restores importable registered-op factories by signature, and uses dill
+for non-importable functions such as local emitters. Cached graphs use the same
+fast path. Unsupported payloads fall back to whole-payload dill serialization.
+No additional setting is required; generated code and metadata formats stay
+the same.
+
+The parent log reports `Serialized codegen payload with pickle` (or `dill` for
+fallback), the payload size, and serialization time. Worker logs separately
+report payload loading time. This optimization reduces work before workers
+start; it does not change worker count or model parallelism.
+
+Each worker collects rank attribute metadata in memory and writes one temporary
+bundle after its entire rank range succeeds. For example, 1584 ranks with 32
+workers produce 32 temporary metadata bundles. Metadata is deduplicated within
+each worker; the parent validates rank coverage and merges bundles in rank
+order into the existing `attr_meta.pkl` format. Generated Python files, initial
+weights, and runtime metadata loading are unchanged. No per-rank metadata
+files are written by multi-process codegen, and temporary bundles are removed
+with the staging directory. Serial codegen retains its per-rank staging path.
+The parent log reports bundle count, rank count, unique variants, and merge
+time.
+
 ### Initial weight saving during compilation
 
 Compilation saves initial weights to `fullmodel.pt.0`, `fullmodel.pt.1`, etc.

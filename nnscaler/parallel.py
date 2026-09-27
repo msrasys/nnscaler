@@ -15,7 +15,6 @@ from contextlib import contextmanager
 import logging
 import copy
 import os
-import pickle
 import shutil
 import subprocess
 import tempfile
@@ -26,7 +25,8 @@ import torch
 import torch.distributed
 
 from nnscaler.codegen import ModuleCodeGen
-from nnscaler.codegen.serialization import codegen_pickle_recursion_limit
+from nnscaler.codegen.metadata import compact_metadata_payloads, compact_worker_metadata, worker_metadata_filename
+from nnscaler.codegen.serialization import dump_codegen_payload
 from nnscaler.codegen.schedule.schedule import ScheduleCodeGen
 
 from nnscaler.execplan import ExecutionPlan
@@ -1078,46 +1078,16 @@ def _gencode(
 
 def _compact_attr_meta_files(staging_dir: Path, runtime_ngpus: int) -> int:
     """Deduplicate staged per-rank pickle payloads into one versioned metadata file."""
-    unique_payloads: list[bytes] = []
-    payload_to_variant: dict[bytes, int] = {}
-    rank_to_variant: list[int] = []
-    for rank in range(runtime_ngpus):
-        shard_file = staging_dir / ParallelModule.ATTR_META_FILE_TEMPLATE.format(rank)
-        payload = shard_file.read_bytes()
-        variant = payload_to_variant.get(payload)
-        if variant is None:
-            variant = len(unique_payloads)
-            payload_to_variant[payload] = variant
-            unique_payloads.append(payload)
-        rank_to_variant.append(variant)
-
-    compact_meta = {
-        'version': ParallelModule.ATTR_META_FORMAT_VERSION,
-        'unique_payloads': unique_payloads,
-        'rank_to_variant': rank_to_variant,
-    }
-    compact_file = staging_dir / ParallelModule.ATTR_META_FILE
-    temp_file = None
-    try:
-        with tempfile.NamedTemporaryFile(
-            mode='wb',
-            prefix=f'.{ParallelModule.ATTR_META_FILE}.',
-            dir=staging_dir,
-            delete=False,
-        ) as stream:
-            temp_file = Path(stream.name)
-            pickle.dump(compact_meta, stream)
-        os.replace(temp_file, compact_file)
-    finally:
-        if temp_file is not None:
-            temp_file.unlink(missing_ok=True)
-
+    count = compact_metadata_payloads(staging_dir, (
+        (staging_dir / ParallelModule.ATTR_META_FILE_TEMPLATE.format(rank)).read_bytes()
+        for rank in range(runtime_ngpus)
+    ))
     logger.info(
         'Compacted %d per-rank attribute metadata files into %d unique variants',
         runtime_ngpus,
-        len(unique_payloads),
+        count,
     )
-    return len(unique_payloads)
+    return count
 
 
 def _remove_legacy_attr_meta_files(outdir: Path) -> None:
@@ -1200,7 +1170,6 @@ def _gencode_in_subprocesses(
         outdir: Path,
         codegen_workers: int,
     ) -> None:
-    import dill
     from nnscaler.graph.parser.register import CustomizedOps
 
     rank_ranges = _partition_codegen_ranks(compute_config.runtime_ngpus, codegen_workers)
@@ -1224,10 +1193,17 @@ def _gencode_in_subprocesses(
             'compile_flags': _compile_flag_snapshot(),
             'custom_op_emit_registry': dict(CustomizedOps.kOpEmit),
         }
-        with tempfile.NamedTemporaryFile(prefix='nnscaler-codegen-', suffix='.dill', delete=False) as stream:
+        serialization_started = time.monotonic()
+        with tempfile.NamedTemporaryFile(prefix='nnscaler-codegen-', suffix='.pkl', delete=False) as stream:
             payload_file = Path(stream.name)
-            with codegen_pickle_recursion_limit():
-                dill.dump(payload, stream)
+            serializer = dump_codegen_payload(payload, stream)
+            payload_bytes = stream.tell()
+        logger.info(
+            'Serialized codegen payload with %s: %.2f MiB in %.2f seconds',
+            serializer,
+            payload_bytes / (1024 * 1024),
+            time.monotonic() - serialization_started,
+        )
 
         for worker_id, (rank_start, rank_end) in enumerate(rank_ranges):
             log_file = staging_dir / f'worker{worker_id}.log'
@@ -1301,19 +1277,23 @@ def _gencode_in_subprocesses(
 
         missing_files = []
         for rank in range(compute_config.runtime_ngpus):
-            for filename in (
-                _GENCODE_FILE_TEMPLATE.format(rank),
-                ParallelModule.ATTR_META_FILE_TEMPLATE.format(rank),
-            ):
-                if not (staging_dir / filename).is_file():
-                    missing_files.append(filename)
+            filename = _GENCODE_FILE_TEMPLATE.format(rank)
+            if not (staging_dir / filename).is_file():
+                missing_files.append(filename)
+        for rank_start, rank_end in rank_ranges:
+            filename = worker_metadata_filename(rank_start, rank_end)
+            if not (staging_dir / filename).is_file():
+                missing_files.append(filename)
         if missing_files:
             raise _CodegenWorkerError(
                 f'Multi-process codegen did not produce expected files: {missing_files}; '
                 f'all worker logs follow:\n{_worker_log_text(worker_records)}'
             )
 
-        _compact_attr_meta_files(staging_dir, compute_config.runtime_ngpus)
+        metadata_started = time.monotonic()
+        variants = compact_worker_metadata(staging_dir, rank_ranges, compute_config.runtime_ngpus)
+        logger.info('Compacted %d worker metadata bundles covering %d ranks into %d unique variants in %.2f seconds',
+                    len(rank_ranges), compute_config.runtime_ngpus, variants, time.monotonic() - metadata_started)
         _promote_codegen_outputs(staging_dir, outdir, compute_config.runtime_ngpus)
         logger.info(
             'Multi-process codegen completed %d ranks with %d workers in %.2f seconds',

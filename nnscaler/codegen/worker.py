@@ -4,16 +4,15 @@
 """Subprocess entry point for multi-process per-rank code generation."""
 
 import argparse
+import io
 import logging
 from pathlib import Path
 import time
 
-import dill
-
-from nnscaler.codegen.serialization import codegen_pickle_recursion_limit
+from nnscaler.codegen.serialization import load_codegen_payload
+from nnscaler.codegen.metadata import AttributeMetadata
 from nnscaler.flags import CompileFlag
 from nnscaler.graph.parser.register import CustomizedOps
-from nnscaler.runtime.module import ParallelModule
 
 
 logger = logging.getLogger(__name__)
@@ -25,9 +24,10 @@ def _restore_compile_flags(flags: dict[str, object]) -> None:
 
 
 def generate_rank_range(payload_file: Path, outdir: Path, rank_start: int, rank_end: int) -> None:
+    started_at = time.monotonic()
     with payload_file.open('rb') as payload_stream:
-        with codegen_pickle_recursion_limit():
-            payload = dill.load(payload_stream)
+        payload = load_codegen_payload(payload_stream)
+    logger.info('Loaded codegen payload in %.2f seconds', time.monotonic() - started_at)
 
     _restore_compile_flags(payload['compile_flags'])
     CustomizedOps.kOpEmit.clear()
@@ -39,20 +39,25 @@ def generate_rank_range(payload_file: Path, outdir: Path, rank_start: int, rank_
     end2end_mode = payload['end2end_mode']
     gencode_file_template = payload['gencode_file_template']
 
+    metadata = AttributeMetadata()
     for rank in range(rank_start, rank_end):
         code_file = outdir / gencode_file_template.format(rank)
-        attr_meta_file = outdir / ParallelModule.ATTR_META_FILE_TEMPLATE.format(rank)
-        module_codegen.gen(
-            rank,
-            forward_args=forward_args,
-            outfile=code_file,
-            attach=False,
-            as_parallel_module=True,
-            end2end_mode=end2end_mode,
-            outfile_attr_meta_map=attr_meta_file,
-        )
-        if end2end_mode:
-            schedule_codegen.gen(device=rank, outfile=code_file, attach=True)
+        with io.BytesIO() as attr_meta_stream:
+            module_codegen.gen(
+                rank,
+                forward_args=forward_args,
+                outfile=code_file,
+                attach=False,
+                as_parallel_module=True,
+                end2end_mode=end2end_mode,
+                outfile_attr_meta_map=attr_meta_stream,
+            )
+            if end2end_mode:
+                schedule_codegen.gen(device=rank, outfile=code_file, attach=True)
+            metadata.add(attr_meta_stream.getvalue())
+    metadata.write_worker_bundle(outdir, rank_start, rank_end)
+    logger.info('Saved metadata bundle for ranks [%d, %d) with %d unique variants',
+                rank_start, rank_end, len(metadata.unique_payloads))
 
 
 def main() -> None:
