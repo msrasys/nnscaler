@@ -53,6 +53,18 @@ class IRGraph(IRSegment):
         self._sched = None  # the schedule strategy
         self._expander = None  # the graph expander
 
+    def start_partition_recording(self) -> None:
+        if hasattr(self, "_partition_records"):
+            raise RuntimeError("Partition recording is already active")
+        self._partition_records = []
+
+    def stop_partition_recording(self) -> List[Tuple[IRFwOperation, Dict[str, Any]]]:
+        if not hasattr(self, "_partition_records"):
+            raise RuntimeError("Partition recording is not active")
+        records = self._partition_records
+        del self._partition_records
+        return records
+
     @property
     def train(self) -> bool:
         """!
@@ -406,6 +418,9 @@ class IRGraph(IRSegment):
         fnodes = algo.instantiate(**config)
         if not fnodes:
             raise ValueError(f"Fail to partition node: {node}. Please check your config: {config}.")
+        partition_records = getattr(self, "_partition_records", None)
+        if partition_records is not None and isinstance(node, IRDimops):
+            partition_records.append((node, dict(config)))
 
         # insert forward node
         fsegment: IRSegment = self.segment(node)

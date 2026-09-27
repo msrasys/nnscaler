@@ -6,6 +6,7 @@ from .parallel import (
     ParallelModule,
     ComputeConfig,
     ReuseType,
+    AnnotationVerification,
     BroadcastGenFilesStrategy,
     parallelize,
     build_optimizer,

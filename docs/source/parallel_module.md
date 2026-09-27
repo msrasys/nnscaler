@@ -169,6 +169,37 @@ def train(model: ParallelizedPipelinedLLM, data):
         optimizer.zero_grad()
 ```
 
+## Verifying operator annotations
+
+`parallelize` can validate the partition contracts declared by dimops
+annotations:
+
+```python
+parallelize(
+    model,
+    dummy_forward_args,
+    pas_policy,
+    compute_config,
+    verify_annotations="static",
+)
+```
+
+The supported modes are:
+
+- `off` (default): do not perform additional annotation verification.
+- `static`: check before applying the policy that feasible two-way partitions
+  are accepted by each operator's dimension algorithm.
+- `used`: execute and compare only the partitions selected by the policy.
+- `all`: execute and compare every feasible two-way partition declared by the
+  annotations.
+
+The dynamic `used` and `all` modes compare each rank with a single-device
+reference, including the loss, input gradients, and any state registered with
+`verify_setup_fn` and `verify_state_fn`. They launch child distributed
+processes and therefore must run before `torch.distributed` is initialized.
+Use them during an AOT compilation step, normally with `load_module=False`.
+Successful dynamic checks are cached below the generated module directory.
+
 ## BroadcastGenFilesStrategy
 
 The broadcast strategy for new generated files.
@@ -260,6 +291,9 @@ def parallelize(
     init_module_params: bool = True,
     build_module_buckets: bool = True,
     broadcast_strategy: Union[str, BroadcastGenFilesStrategy] = 'none',
+    autoset_requires_grad: bool = True,
+    max_workers: int = 1,
+    verify_annotations: Union[AnnotationVerification, str] = AnnotationVerification.OFF,
 ) -> Union[None, ParallelModule, Type[ParallelModule]]:
 ```
 It has the following parameters:
@@ -307,6 +341,10 @@ Leave it as true unless you have a specific reason to defer bucket building (e.g
 - `module_fn` (`Optional[Callable[[], torch.nn.Module]]`): the function to create the module. Will use `__init__` if it is None. This parameter is only used when `module_or_module_class` is a module class.
 
 - `broadcast_strategy` (`Union[str, BroadcastGenFilesStrategy]`): the broadcast strategy for new generated files.
+
+- `verify_annotations` (`Union[AnnotationVerification, str]`): optionally
+  validate dimops partition contracts. See
+  [Verifying operator annotations](#verifying-operator-annotations).
 
 Note:
 

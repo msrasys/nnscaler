@@ -13,6 +13,24 @@ python utility/verify_ops/verify_graph_operations.py \
 The command exits nonzero when a partition differs from the reference or
 cannot be verified.
 
+The same checks can be requested while compiling:
+
+```python
+parallelize(
+    model,
+    dummy_forward_args,
+    policy,
+    compute_config,
+    verify_annotations="static",  # "off", "static", "used", or "all"
+)
+```
+
+`off` is the default. `static` checks partition feasibility without executing
+distributed code. `used` dynamically verifies only partitions selected by the
+policy, while `all` dynamically verifies every feasible two-way partition.
+Dynamic verification must run before `torch.distributed` is initialized, for
+example in an AOT compile step with `load_module=False`.
+
 Stateful custom operators can register importable, zero-argument lifecycle
 callbacks:
 

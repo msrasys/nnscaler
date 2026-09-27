@@ -33,15 +33,21 @@ from nnscaler.execplan.planpass.grouping import Grouping
 from nnscaler.graph import IRGraph
 from nnscaler.graph import parser
 from nnscaler.graph.function.anchor import IRGraphAnchor
+from nnscaler.graph.function.dimops import IRDimops
 from nnscaler.graph.function.pyfunc import IRPyFunc
 from nnscaler.graph.function.wrapnn import convert_to_wrapnn, wrapnn
 from nnscaler.graph.gener.gen import IRAdapterGener
 from nnscaler.graph.parser import FxModuleParser
 from nnscaler.graph.schedule.predefined import PredefinedSched
 from nnscaler.graph.schedule.schedplan import SchedulePlan
+from nnscaler.graph.verification import (
+    AnnotationVerification,
+    validate_graph_annotations,
+    verify_op_partitions,
+)
 
 from nnscaler.ir.cten import IRObject, IRTensor, IR
-from nnscaler.ir.operator import IRBpOperation, IRDataOperation
+from nnscaler.ir.operator import IRBpOperation, IRDataOperation, IRFwOperation
 from nnscaler.ir.tensor import IRFullTensor
 from nnscaler.ir.unique import IDGenerator
 
@@ -619,7 +625,66 @@ class RegenStatus(Enum):
     NONE = 'none'   # nothing is regenerated.
     ALL = 'all'     # everything is regenerated, including graph and code
     CODE = 'code'   # only code is regenerated.
-    ERROR = 'error' # error occurs during generation.
+    ERROR = 'error' # error occurs during generation
+
+
+def _used_partition_options(
+    records: List[Tuple[IRFwOperation, Dict[str, Any]]],
+) -> List[Tuple[IRDimops, List[Dict[str, int]]]]:
+    grouped: Dict[int, Tuple[IRDimops, List[Dict[str, int]]]] = {}
+    for node, config in records:
+        if not isinstance(node, IRDimops):
+            continue
+        try:
+            option = {
+                "idx": int(config["idx"]),
+                "dim": int(config["dim"]),
+                "num": int(config["num"]),
+            }
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError(
+                f"Cannot verify partition config {config!r} for {node.signature}"
+            ) from exc
+        entry = grouped.setdefault(id(node), (node, []))
+        if option not in entry[1]:
+            entry[1].append(option)
+    return list(grouped.values())
+
+
+def _apply_policy_with_annotation_verification(
+    graph: IRGraph,
+    pas_policy: Callable[[IRGraph, ComputeConfig], IRGraph],
+    compute_config: ComputeConfig,
+    verification: AnnotationVerification,
+    verification_dir: Path,
+) -> IRGraph:
+    if verification in (
+        AnnotationVerification.STATIC,
+        AnnotationVerification.ALL,
+    ):
+        validate_graph_annotations(graph)
+    if verification == AnnotationVerification.ALL:
+        if not verify_op_partitions(graph, verification_dir):
+            raise RuntimeError("Annotation verification failed")
+
+    if verification != AnnotationVerification.USED:
+        return pas_policy(graph, compute_config)
+
+    graph.start_partition_recording()
+    try:
+        partitioned_graph = pas_policy(graph, compute_config)
+    finally:
+        records = graph.stop_partition_recording()
+
+    used_options = _used_partition_options(records)
+    validate_graph_annotations(graph, used_options)
+    if used_options and not verify_op_partitions(
+        graph,
+        verification_dir,
+        used_options,
+    ):
+        raise RuntimeError("Annotation verification failed")
+    return partitioned_graph
 
 
 def _prepare_namespace(
@@ -928,6 +993,7 @@ def _gencode(
         module_fn: Optional[Callable[[], torch.nn.Module]] = None,
         autoset_requires_grad: bool = True,
         max_workers: int = 1,
+        verify_annotations: AnnotationVerification = AnnotationVerification.OFF,
     ) -> RegenStatus:
     """
     Generate parallel module source code from a torch module, and save it to file.
@@ -1017,7 +1083,13 @@ def _gencode(
         graph = IRGraph.load(graph_ckp)
         forward_args = torch.load(forward_args_ckp, weights_only=False)
 
-    graph = pas_policy(graph, compute_config)
+    graph = _apply_policy_with_annotation_verification(
+        graph,
+        pas_policy,
+        compute_config,
+        verify_annotations,
+        outdir / "annotation_verification",
+    )
     if not isinstance(graph, IRGraph):
         raise RuntimeError("Expected policy return IRGraph")
 
@@ -1194,6 +1266,7 @@ def parallelize(
     broadcast_strategy: Union[str, BroadcastGenFilesStrategy] = 'none',
     autoset_requires_grad: bool = True,
     max_workers: int = 1,
+    verify_annotations: Union[AnnotationVerification, str] = AnnotationVerification.OFF,
 ) -> Union[None, ParallelModule, Type[ParallelModule]]:
     """
     Convert a torch.nn.Module object or class to ParallelModule object or class.
@@ -1287,6 +1360,11 @@ def parallelize(
             When max_workers is 1, code generation will be done in the main process.
             When max_workers is greater than 1, the caller must use an import-safe entry
             point guarded by ``if __name__ == '__main__':`` because workers use spawn.
+        verify_annotations (AnnotationVerification | str): controls custom-op
+            annotation verification. ``off`` disables it, ``static`` checks
+            partition feasibility without execution, ``used`` dynamically
+            verifies partitions selected by the policy, and ``all`` dynamically
+            verifies every feasible two-way partition. Default: ``off``.
     Returns:
         Union[ParallelModule, Type[ParallelModule], None]:
             if load_module flag is set, return the converted ParallelModule object or class
@@ -1322,6 +1400,26 @@ def parallelize(
     is_module_class = inspect.isclass(module_or_module_class)
     module_class = module_or_module_class if is_module_class else module_or_module_class.__class__
     reuse = ReuseType(reuse) if isinstance(reuse, str) else reuse
+    verify_annotations = (
+        AnnotationVerification(verify_annotations)
+        if isinstance(verify_annotations, str)
+        else verify_annotations
+    )
+    if not isinstance(verify_annotations, AnnotationVerification):
+        raise TypeError(
+            "verify_annotations must be an AnnotationVerification or string"
+        )
+    if (
+        verify_annotations in (
+            AnnotationVerification.USED,
+            AnnotationVerification.ALL,
+        )
+        and torch.distributed.is_initialized()
+    ):
+        raise RuntimeError(
+            "Dynamic annotation verification must run before initializing "
+            "torch.distributed; use load_module=False in an AOT compile step"
+        )
     broadcast_strategy = BroadcastGenFilesStrategy(broadcast_strategy) if isinstance(broadcast_strategy, str) else broadcast_strategy
 
     # Call it here just to ensure the device group is initialized.
@@ -1352,11 +1450,21 @@ def parallelize(
                         module_dtype=module_dtype,
                         module_fn=module_fn,
                         autoset_requires_grad=autoset_requires_grad,
-                        max_workers=max_workers
+                        max_workers=max_workers,
+                        verify_annotations=verify_annotations,
                     )
             else:
                 regen_status = RegenStatus.NONE
                 logger.info(f"Reuse generated code in {outdir}")
+                if verify_annotations != AnnotationVerification.OFF:
+                    graph = IRGraph.load(outdir / _GRAPH_DUMP_FILE)
+                    _apply_policy_with_annotation_verification(
+                        graph,
+                        pas_policy,
+                        copy.deepcopy(compute_config),
+                        verify_annotations,
+                        outdir / "annotation_verification",
+                    )
     except Exception as e:
         logger.exception(f"Error during code generation: {e}")
         regen_status = RegenStatus.ERROR
