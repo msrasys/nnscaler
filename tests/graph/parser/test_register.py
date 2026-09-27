@@ -8,6 +8,7 @@ from nnscaler.codegen.emit import FuncEmission
 from nnscaler.graph.function.dimops import DimopSplit, TransformRule
 from nnscaler.graph.parser.register import CustomizedOps
 import tempfile
+import pytest
 import torch
 
 from ...utils import replace_all_device_with
@@ -282,6 +283,58 @@ def test_kw_args():
 
 def fake_add_xy(x: torch.Tensor, y: torch.Tensor):
     return x
+
+
+_verification_state = {"calls": 0}
+
+
+def verification_setup():
+    _verification_state["calls"] = 0
+
+
+def verification_state():
+    return dict(_verification_state)
+
+
+@nnscaler.register_op(
+    "a, a -> a",
+    verify_setup_fn=verification_setup,
+    verify_state_fn=verification_state,
+)
+def verified_add(x: torch.Tensor, y: torch.Tensor):
+    _verification_state["calls"] += 1
+    return x + y
+
+
+def verification_target(x: torch.Tensor):
+    return x
+
+
+def test_register_verification_callbacks():
+    signature = f"{verified_add.__module__}.{verified_add.__name__}"
+    verification = CustomizedOps.kOpVerification[signature]
+    assert verification.setup_fn is verification_setup
+    assert verification.state_fn is verification_state
+
+
+def test_register_rejects_non_importable_verification_callback():
+    def local_setup():
+        pass
+
+    with pytest.raises(ValueError, match="importable"):
+        nnscaler.register_op(
+            "a -> a", verify_setup_fn=local_setup,
+        )(verification_target)
+
+
+def test_register_rejects_verification_callback_arguments():
+    def setup_with_arg(value):
+        return value
+
+    with pytest.raises(ValueError, match="must not accept arguments"):
+        nnscaler.register_op(
+            "a -> a", verify_setup_fn=setup_with_arg,
+        )(verification_target)
 
 
 @nnscaler.register_op('*, * -> *', fake_fn=fake_add_xy)

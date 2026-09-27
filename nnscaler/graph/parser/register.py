@@ -5,7 +5,8 @@
 Register cutomized function
 """
 
-from typing import Dict, Callable, Optional, Union, List, Tuple
+from dataclasses import dataclass
+from typing import Any, Dict, Callable, Optional, Union, List, Tuple
 from functools import partial
 import inspect
 import logging
@@ -18,6 +19,40 @@ from nnscaler.graph.tracer.wrap_utils import is_autograd_apply, is_autograd_op
 from nnscaler.ir.operator import IRTensor, IRFwOperation
 
 _logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class OpVerification:
+    """Optional lifecycle callbacks for partition-contract verification."""
+
+    setup_fn: Optional[Callable[[], None]] = None
+    state_fn: Optional[Callable[[], Any]] = None
+
+
+def _validate_verification_callback(
+    callback: Optional[Callable], name: str,
+) -> None:
+    if callback is None:
+        return
+    if not callable(callback):
+        raise TypeError(f"Expected {name} to be callable")
+    if inspect.signature(callback).parameters:
+        raise ValueError(f"{name} must not accept arguments")
+    module = inspect.getmodule(callback)
+    qualname = getattr(callback, "__qualname__", "")
+    importable_qualname = (
+        qualname
+        and "<locals>" not in qualname
+        and all(part.isidentifier() for part in qualname.split("."))
+    )
+    if (
+        module is None
+        or module.__name__ == "__main__"
+        or not importable_qualname
+    ):
+        raise ValueError(
+            f"{name} must be an importable module-level function or static method"
+        )
 
 
 class CustomizedOps:
@@ -40,6 +75,8 @@ class CustomizedOps:
     # It accepts the IRFwOperation as input and returns the list of input tensors, which is used
     # during operator profiling.
     kOpInputGen: Dict[str, Callable[[IRFwOperation], List[torch.Tensor]]] = {}
+    # signature -> optional partition-verification lifecycle callbacks
+    kOpVerification: Dict[str, OpVerification] = {}
 
     @staticmethod
     def map(signature: str) -> Callable:
@@ -66,7 +103,8 @@ class CustomizedOps:
         *,
         emit_fn: Callable[[IRFwOperation, List[str], Dict[str, str], int, int, int], str] = None,
         input_gen_fn: Callable[[IRFwOperation], List[torch.Tensor]] = None,
-        fake_fn: Optional[Callable] = None
+        fake_fn: Optional[Callable] = None,
+        verification: Optional[OpVerification] = None,
     ) -> None:
         """Register an operator
 
@@ -86,6 +124,8 @@ class CustomizedOps:
                 If fake_fn is None, runtime_fn will be used,
                 which may cause errors if runtime_fn contains operations
                 that cannot run during tracing (e.g., distributed communication ops).
+            verification (OpVerification): optional setup and state snapshot
+                callbacks used by the offline partition-contract verifier.
         Returns:
             None
         """
@@ -101,6 +141,8 @@ class CustomizedOps:
             CustomizedOps.kOpEmit[signature] = emit_fn
         if input_gen_fn is not None:
             CustomizedOps.kOpInputGen[signature] = input_gen_fn
+        if verification is not None:
+            CustomizedOps.kOpVerification[signature] = verification
 
 
 def register_op(annotation: Union[str, Callable], name: Optional[str] = None,
@@ -110,6 +152,8 @@ def register_op(annotation: Union[str, Callable], name: Optional[str] = None,
                 transform_rules: Tuple[TransformRule] = None,
                 input_gen_fn: Callable[[IRFwOperation], List[torch.Tensor]] = None,
                 fake_fn: Optional[Callable] = None,
+                verify_setup_fn: Optional[Callable[[], None]] = None,
+                verify_state_fn: Optional[Callable[[], Any]] = None,
     ) -> Callable:
     """
     Register a function with IRDimops annotations.
@@ -184,6 +228,14 @@ def register_op(annotation: Union[str, Callable], name: Optional[str] = None,
             which may cause errors if runtime_fn contains operations
             that cannot run during tracing (e.g., distributed communication ops).
             Default: None.
+        verify_setup_fn (Callable): optional importable, zero-argument callback
+            invoked before each single-device or distributed verification run.
+            Use it to initialize process-local runtime state.
+            Default: None.
+        verify_state_fn (Callable): optional importable, zero-argument callback
+            returning the full logical runtime state after a verification run.
+            The verifier compares this state with the reference on every rank.
+            Default: None.
 
     Returns:
         fn (Callable): the runtime function
@@ -197,6 +249,14 @@ def register_op(annotation: Union[str, Callable], name: Optional[str] = None,
 
         if fake_fn is not None and not callable(fake_fn):
             raise TypeError("Expected a fake function")
+
+        _validate_verification_callback(verify_setup_fn, "verify_setup_fn")
+        _validate_verification_callback(verify_state_fn, "verify_state_fn")
+        verification = (
+            OpVerification(verify_setup_fn, verify_state_fn)
+            if verify_setup_fn is not None or verify_state_fn is not None
+            else None
+        )
 
         # TODO: add support for autograd function in the future
         if fake_fn is not None and is_autograd_op(fn):
@@ -305,7 +365,8 @@ def register_op(annotation: Union[str, Callable], name: Optional[str] = None,
             fsig, udfop, code, fn,
             emit_fn=emit_fn,
             input_gen_fn=input_gen_fn,
-            fake_fn=fake_fn
+            fake_fn=fake_fn,
+            verification=verification,
         )
         return fn
 

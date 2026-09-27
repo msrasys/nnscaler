@@ -1,10 +1,12 @@
 import argparse
+import importlib
 import os
 import sys
 import torch
 from nnscaler.graph.function.dimops import DimAnno, IRDimops, OpAnno
 from nnscaler.graph.graph import IRGraph
 from nnscaler.ir.cten import IRObject, IRTensor
+from nnscaler.graph.parser.register import CustomizedOps
 from pathlib import Path
 import logging
 
@@ -27,7 +29,7 @@ def load_verified_ops(outdir: Path):
     verified_ops_file = outdir / _VERIFIED_OPS_FILE_NAME
     if verified_ops_file.exists():
         logger.info(f"{verified_ops_file} exists, load it.")
-        return torch.load(verified_ops_file)
+        return torch.load(verified_ops_file, weights_only=False)
     else:
         logger.info(f"{verified_ops_file} does not exist, start from scratch.")
         return set()
@@ -39,7 +41,68 @@ def save_verified_ops(outdir: Path, verified_ops: set):
     logger.info(f"Verification results saved to {verified_ops_file}")
 
 
-def verify_op_partitions(graph: IRGraph, outdir: Path):
+def _import_customized_op(signature: str) -> None:
+    if CustomizedOps.exist(signature):
+        return
+    if signature.startswith((
+        "torch.",
+        "_operator.",
+        "nnscaler.runtime.function.",
+    )):
+        return
+    parts = signature.split(".")
+    for end in range(len(parts) - 1, 0, -1):
+        module_name = ".".join(parts[:end])
+        try:
+            importlib.import_module(module_name)
+        except ModuleNotFoundError as exc:
+            if exc.name == module_name or module_name.startswith(
+                f"{exc.name}."
+            ):
+                continue
+            raise
+        if CustomizedOps.exist(signature):
+            return
+
+
+def _callable_expression(callback) -> str:
+    return f"{callback.__module__}.{callback.__qualname__}"
+
+
+def _verification_code(signature: str):
+    _import_customized_op(signature)
+    if not CustomizedOps.exist(signature):
+        return "", "", "None"
+
+    runtime_fn = CustomizedOps.kOpRuntime[signature]
+    verification = CustomizedOps.kOpVerification.get(signature)
+    callbacks = []
+    if verification is not None:
+        callbacks = [
+            callback
+            for callback in (verification.setup_fn, verification.state_fn)
+            if callback is not None
+        ]
+
+    modules = {runtime_fn.__module__}
+    modules.update(callback.__module__ for callback in callbacks)
+    import_code = "\n".join(
+        f"import {module_name}" for module_name in sorted(modules)
+    )
+    setup_call = (
+        f"{_callable_expression(verification.setup_fn)}()"
+        if verification is not None and verification.setup_fn is not None
+        else ""
+    )
+    state_call = (
+        f"{_callable_expression(verification.state_fn)}()"
+        if verification is not None and verification.state_fn is not None
+        else "None"
+    )
+    return import_code, setup_call, state_call
+
+
+def verify_op_partitions(graph: IRGraph, outdir: Path) -> bool:
     """
     Test if the partitioned ops in the graph are computationally correct.
 
@@ -48,7 +111,7 @@ def verify_op_partitions(graph: IRGraph, outdir: Path):
         outdir (Path): the directory to save the verified ops
 
     Returns:
-        None
+        bool: whether all partition contracts were verified successfully.
     """
     from verify_dimops import (
         VerifyConfig,
@@ -58,6 +121,7 @@ def verify_op_partitions(graph: IRGraph, outdir: Path):
 
     verified_ops = load_verified_ops(outdir)
     skipped_nodes = []
+    failed_nodes = []
 
     gnodes = graph.nodes(flatten=True)
     for idx, node in enumerate(gnodes):
@@ -66,7 +130,12 @@ def verify_op_partitions(graph: IRGraph, outdir: Path):
         if node.isfw() and isinstance(node, IRDimops):
             ins_info = [
                 (
-                    TensorInfo("shape", _input.shape)
+                    TensorInfo(
+                        "shape",
+                        _input.shape,
+                        dtype=_input.dtype or torch.float32,
+                        requires_grad=_input.requires_grad,
+                    )
                     if isinstance(_input, IRTensor)
                     else TensorInfo(
                         "value",
@@ -82,7 +151,12 @@ def verify_op_partitions(graph: IRGraph, outdir: Path):
 
             outs_info = [
                 (
-                    TensorInfo("shape", output.shape)
+                    TensorInfo(
+                        "shape",
+                        output.shape,
+                        dtype=output.dtype or torch.float32,
+                        requires_grad=output.requires_grad,
+                    )
                     if isinstance(output, IRTensor)
                     else TensorInfo(
                         "value",
@@ -91,7 +165,13 @@ def verify_op_partitions(graph: IRGraph, outdir: Path):
                 )
                 for output in node.outputs()
             ]
-            if (node.signature, tuple(ins_info + outs_info)) in verified_ops:
+            verification_key = (
+                node.signature,
+                repr(node.anno),
+                tuple(ins_info + outs_info),
+                repr(node.kwargs),
+            )
+            if verification_key in verified_ops:
                 logger.info(f"{node.signature} has been verified before, skip.")
                 continue
 
@@ -101,31 +181,47 @@ def verify_op_partitions(graph: IRGraph, outdir: Path):
 
             logger.info(f"Candidate partition options: {parti_options}")
 
-            verify_config = VerifyConfig(
-                fsig=node.signature,
-                args=ins_info,
-                kwargs=node.kwargs,
-                noutputs=len(node.outputs()),
-                parti_options=parti_options,
-            )
             try:
+                import_code, setup_call, state_call = _verification_code(
+                    node.signature
+                )
+                verify_config = VerifyConfig(
+                    fsig=node.signature,
+                    args=ins_info,
+                    kwargs=node.kwargs,
+                    noutputs=len(node.outputs()),
+                    parti_options=parti_options,
+                    import_customized_func=import_code,
+                    setup_call=setup_call,
+                    state_call=state_call,
+                )
                 iscorrect = verify_partition_options(verify_config)
             except Exception as e:
-                logger.warning(
-                    f"Verification failed for {node.signature}, {e}, please manually verify."
+                logger.exception(
+                    f"Verification could not run for {node.signature}: {e}"
                 )
-                iscorrect = True  # fake true to skip this node
+                failed_nodes.append(node.signature)
+                continue
             if not iscorrect:
-                logger.warning(f"Verification failed for {node.signature}, continuing execution.")
+                logger.error(f"Verification failed for {node.signature}.")
+                failed_nodes.append(node.signature)
                 continue
 
-            verified_ops.add((node.signature, tuple(ins_info + outs_info)))
+            verified_ops.add(verification_key)
             save_verified_ops(outdir, verified_ops)
 
     if skipped_nodes:
         logger.info("Skipped the following nodes due to empty ins_info:")
         for node_info in skipped_nodes:
             logger.info(f" - {node_info}")
+    if failed_nodes:
+        logger.error(
+            "Partition verification failed for: %s",
+            ", ".join(sorted(set(failed_nodes))),
+        )
+        return False
+    return True
+
 
 def main():
     parser = argparse.ArgumentParser(
@@ -154,7 +250,8 @@ def main():
         outdir = _DEFAULT_CACHE_DIR
 
     outdir.mkdir(parents=True, exist_ok=True)
-    verify_op_partitions(graph, outdir)
+    if not verify_op_partitions(graph, outdir):
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":

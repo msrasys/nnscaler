@@ -9,6 +9,7 @@ NOTE: only consider partitioning along one dimension currently
 """
 
 import os
+import sys
 from typing import Dict, List, Tuple, Any, Union
 from dataclasses import dataclass, field
 import logging
@@ -50,17 +51,17 @@ class TestModule(torch.nn.Module):
         super(TestModule, self).__init__()
 
     def forward(self, {args}):
-        # Add clone to resolve the issue:
-        # a leaf Variable that requires grad is being used in an in-place operation.
         {clone_args}
 
         {func_sig_call}
 
         out = 0
-        for one_out in [{outputs}]:
+        for output_index, one_out in enumerate([{outputs}]):
             if not isinstance(one_out, torch.Tensor):
                 continue
-            out += torch.sum(one_out)
+            values = one_out.reshape(-1).float()
+            weights = torch.cumsum(torch.ones_like(values), dim=0)
+            out += (output_index + 1) * torch.sum(values * weights)
         return out
 
 model = TestModule() #.to(torch.float16)
@@ -71,12 +72,22 @@ module_template_single_main = """
 {args}, = torch.load('{func_sig}_inputs.pt', map_location=torch.device('cuda:0'))
 
 model = model.cuda()
+{setup_call}
 
 single_loss = model({args})
-single_loss.backward()
+if single_loss.requires_grad:
+    single_loss.backward()
 
 grad_tensors = {grad_tensors}
-torch.save([grad_tensors, single_loss], '{func_sig}_loss_single.pt')
+verification_state = {state_call}
+torch.save(
+    {{
+        'gradients': grad_tensors,
+        'loss': single_loss.detach(),
+        'state': verification_state,
+    }},
+    '{func_sig}_loss_single.pt',
+)
 print('single gpu loss: ', single_loss)
 """
 
@@ -87,6 +98,7 @@ nnscaler.init()
 rank_id = torch.distributed.get_rank()
 
 {args}, = torch.load('{func_sig}_inputs.pt', map_location=torch.device(f'cuda:{{rank_id}}'))
+{setup_call}
 
 def policy(graph: IRGraph, resource) -> IRGraph:
     ngpus = 2
@@ -115,12 +127,22 @@ parallel_model = parallelize(
 )
 
 parallel_model.train()
+{setup_call}
 
 parallel_loss = parallel_model({args})
-parallel_loss.backward()
+if parallel_loss.requires_grad:
+    parallel_loss.backward()
 
 grad_tensors = {grad_tensors}
-torch.save([grad_tensors, parallel_loss], '{func_sig}_loss_para_'+str(rank_id)+'.pt')
+verification_state = {state_call}
+torch.save(
+    {{
+        'gradients': grad_tensors,
+        'loss': parallel_loss.detach(),
+        'state': verification_state,
+    }},
+    '{func_sig}_loss_para_'+str(rank_id)+'.pt',
+)
 print('two gpus loss: ', parallel_loss)
 """
 
@@ -139,7 +161,12 @@ class TensorInfo:
         value = self.value
         if isinstance(value, slice):
             value = (value.start, value.stop, value.step)
-        return hash((self.value_form, value))
+        return hash((
+            self.value_form,
+            value,
+            self.dtype,
+            self.requires_grad,
+        ))
 
 
 @dataclass
@@ -150,6 +177,8 @@ class VerifyConfig:
     noutputs: int
     parti_options: List[Dict[str, int]]
     import_customized_func: str = ""
+    setup_call: str = ""
+    state_call: str = "None"
     non_grad_indices: List[int] = field(default_factory=list)
 
 
@@ -266,6 +295,15 @@ def _create_op_inputs(verify_config: VerifyConfig) -> List[Any]:
                 # Special handling:add in the model generates values that cannot be partitioned
                 inputs.append(torch.randn(4, dtype=tensor_info.dtype, requires_grad=tensor_info.requires_grad))
             else:
+                shape = tensor_info.value
+                if tensor_info.dtype == torch.bool:
+                    inputs.append(torch.rand(shape) > 0.5)
+                    continue
+                if not (tensor_info.dtype.is_floating_point or tensor_info.dtype.is_complex):
+                    inputs.append(
+                        torch.randint(0, 10, shape, dtype=tensor_info.dtype)
+                    )
+                    continue
                 if tensor_info.value == ():
                     inputs.append(
                         torch.randn(
@@ -289,13 +327,89 @@ def _create_op_inputs(verify_config: VerifyConfig) -> List[Any]:
     return inputs
 
 
+def _remove_file(path: str) -> None:
+    try:
+        os.remove(path)
+    except FileNotFoundError:
+        pass
+
+
+def _run_checked(command: List[str]) -> None:
+    subprocess.run(command, check=True)
+
+
+def _assert_close_tree(
+    expected: Any,
+    actual: Any,
+    *,
+    path: str,
+    rtol: float = 1e-3,
+    atol: float = 1e-5,
+) -> None:
+    if isinstance(expected, torch.Tensor):
+        if not isinstance(actual, torch.Tensor):
+            raise AssertionError(
+                f"{path} type mismatch: Tensor != {type(actual).__name__}"
+            )
+        if expected.shape != actual.shape:
+            raise AssertionError(
+                f"{path} shape mismatch: {expected.shape} != {actual.shape}"
+            )
+        if expected.dtype != actual.dtype:
+            raise AssertionError(
+                f"{path} dtype mismatch: {expected.dtype} != {actual.dtype}"
+            )
+        if expected.is_floating_point() or expected.is_complex():
+            if not torch.allclose(expected, actual, rtol=rtol, atol=atol):
+                max_error = torch.max(torch.abs(expected - actual)).item()
+                raise AssertionError(
+                    f"{path} mismatch: max absolute error {max_error}"
+                )
+        elif not torch.equal(expected, actual):
+            raise AssertionError(f"{path} tensor values differ")
+        return
+    if type(expected) is not type(actual):
+        raise AssertionError(
+            f"{path} type mismatch: "
+            f"{type(expected).__name__} != {type(actual).__name__}"
+        )
+    if isinstance(expected, dict):
+        if expected.keys() != actual.keys():
+            raise AssertionError(
+                f"{path} keys mismatch: {expected.keys()} != {actual.keys()}"
+            )
+        for key in expected:
+            _assert_close_tree(
+                expected[key], actual[key], path=f"{path}[{key!r}]",
+                rtol=rtol, atol=atol,
+            )
+        return
+    if isinstance(expected, (list, tuple)):
+        if len(expected) != len(actual):
+            raise AssertionError(
+                f"{path} length mismatch: {len(expected)} != {len(actual)}"
+            )
+        for index, (expected_item, actual_item) in enumerate(
+            zip(expected, actual)
+        ):
+            _assert_close_tree(
+                expected_item, actual_item, path=f"{path}[{index}]",
+                rtol=rtol, atol=atol,
+            )
+        return
+    if expected != actual:
+        raise AssertionError(f"{path} mismatch: {expected!r} != {actual!r}")
+
+
 def verify_partition_options(verify_config: VerifyConfig) -> bool:
     errors = []
     try:
         logger.info(f"Verifying partitions of {verify_config.fsig}...")
         inputs = _create_op_inputs(verify_config)
-        torch.save(inputs, f"{verify_config.fsig}_inputs.pt")
-        logger.info(f"Input tensors saved to {verify_config.fsig}_inputs.pt")
+        inputs_path = f"{verify_config.fsig}_inputs.pt"
+        single_result_path = f"{verify_config.fsig}_loss_single.pt"
+        torch.save(inputs, inputs_path)
+        logger.info(f"Input tensors saved to {inputs_path}")
 
         outputs_str = ", ".join([f"_out{i}" for i in range(verify_config.noutputs)])
 
@@ -321,24 +435,11 @@ def verify_partition_options(verify_config: VerifyConfig) -> bool:
         else:
             func_call = f"{outputs_str} = {func_sig_call}({kwargs_str})"
 
-        clone_args_right = ", ".join(
-            [
-                f"_in{i}.clone()"
-                for i, tinfo in enumerate(verify_config.args)
-                if tinfo.value_form == "shape"
-            ]
+        clone_args = "\n        ".join(
+            f"_in{i} = _in{i}.clone()"
+            for i, tinfo in enumerate(verify_config.args)
+            if tinfo.value_form == "shape"
         )
-        if clone_args_right:
-            clone_args_left = ", ".join(
-                [
-                    f"_in{i}"
-                    for i, tinfo in enumerate(verify_config.args)
-                    if tinfo.value_form == "shape"
-                ]
-            )
-            clone_args = f"{clone_args_left} = {clone_args_right}"
-        else:
-            clone_args = ""
 
         dummy_input_str = (
             "{"
@@ -354,6 +455,7 @@ def verify_partition_options(verify_config: VerifyConfig) -> bool:
                     for i in range(len(verify_config.args))
                     if i not in verify_config.non_grad_indices
                     and verify_config.args[i].value_form == "shape"
+                    and verify_config.args[i].requires_grad
                 ]
             )
             + "]"
@@ -367,17 +469,22 @@ def verify_partition_options(verify_config: VerifyConfig) -> bool:
             func_sig_call=func_call,
             outputs=outputs_str,
             grad_tensors=grad_tensors,
+            setup_call=verify_config.setup_call,
+            state_call=verify_config.state_call,
         )
         with open(_SINGLE_GPU_TEST_FILE, "w") as f:
             f.write(module_single_str)
         logger.info("Generated test code for single gpu and running...")
-        subprocess.run(["rm", "-f", f"{verify_config.fsig}_loss_single.pt"])
-        subprocess.run(["python", _SINGLE_GPU_TEST_FILE])
+        _remove_file(single_result_path)
+        _run_checked([sys.executable, _SINGLE_GPU_TEST_FILE])
         logger.info(
-            f"Single GPU test completed. Output saved to {verify_config.fsig}_loss_single.pt"
+            f"Single GPU test completed. Output saved to {single_result_path}"
         )
         logger.info(f"verify_config: {verify_config}")
         logger.info(f"verify_config.parti_options: {verify_config.parti_options}")
+        single = torch.load(
+            single_result_path, map_location="cpu", weights_only=False
+        )
 
         for poption in verify_config.parti_options:
             try:
@@ -394,59 +501,56 @@ def verify_partition_options(verify_config: VerifyConfig) -> bool:
                     grad_tensors=grad_tensors,
                     idx=poption["idx"],
                     dim=poption["dim"],
+                    setup_call=verify_config.setup_call,
+                    state_call=verify_config.state_call,
                 )
                 with open(_TWO_GPUS_TEST_FILE, "w") as f:
                     f.write(module_para_str)
                 logger.info("Generated test code for two gpus.")
 
-                subprocess.run(["rm", "-f", f"{verify_config.fsig}_loss_para_0.pt"])
-                subprocess.run(["rm", "-f", f"{verify_config.fsig}_loss_para_1.pt"])
-                subprocess.run(
+                para_paths = [
+                    f"{verify_config.fsig}_loss_para_{rank}.pt"
+                    for rank in range(2)
+                ]
+                for path in para_paths:
+                    _remove_file(path)
+                _run_checked(
                     [
-                        "torchrun",
-                        "--nproc_per_node=2",
+                        sys.executable,
+                        "-m",
+                        "torch.distributed.run",
+                        "--standalone",
                         "--nnodes=1",
-                        "--rdzv-endpoint=localhost:23457",
+                        "--nproc_per_node=2",
                         _TWO_GPUS_TEST_FILE,
                     ]
                 )
                 logger.info(
-                    f"Two GPU test completed. Outputs saved to {verify_config.fsig}_loss_para_0.pt and {verify_config.fsig}_loss_para_1.pt"
+                    f"Two GPU test completed. Outputs saved to {para_paths}"
                 )
-                single = torch.load(f"{verify_config.fsig}_loss_single.pt")
-                logger.info(
-                    f"Loading single loss from: {verify_config.fsig}_loss_single.pt"
-                )
-                para0 = torch.load(f"{verify_config.fsig}_loss_para_0.pt")
-                para1 = torch.load(f"{verify_config.fsig}_loss_para_1.pt")
+                parallel = [
+                    torch.load(path, map_location="cpu", weights_only=False)
+                    for path in para_paths
+                ]
 
-                logger.info(f"Single loss: {single[1]}")
-                logger.info(f"Multi-GPU loss (para0): {para0[1]}")
-                logger.info(f"Multi-GPU loss (para1): {para1[1]}")
-
-                assert torch.allclose(
-                    single[1], para0[1], rtol=1e-3, atol=1e-5
-                ), f"Loss mismatch between single and multi-GPU (para0)"
-                assert torch.equal(
-                    para0[1], para1[1].to(para0[1])
-                ), f"Loss mismatch between multi-GPU (para0 and para1)"
-
-                for i in range(len(single[0])):
-                    if single[0][i] is None or para0[0][i] is None:
-                        logger.debug(
-                            f"Skipping comparison for index {i} because it is None"
-                        )
-                        continue
-                    logger.debug(f"Absolute error: {single[0][i] - para0[0][i]}")
-                    logger.debug(
-                        f"Relative error: {(single[0][i] - para0[0][i]) / single[0][i]}"
+                logger.info(f"Single loss: {single['loss']}")
+                for rank, result in enumerate(parallel):
+                    logger.info(
+                        f"Multi-GPU loss (rank {rank}): {result['loss']}"
                     )
-                    assert torch.allclose(
-                        single[0][i], para0[0][i], rtol=1e-3, atol=1e-5
-                    ), f"Gradient mismatch between single and multi-GPU (para0)"
-                    assert torch.equal(
-                        para0[0][i], para1[0][i].to(para0[0][i])
-                    ), f"Gradient mismatch between multi-GPU (para0 and para1)"
+                    _assert_close_tree(
+                        single["loss"], result["loss"],
+                        path=f"rank {rank} loss",
+                    )
+                    _assert_close_tree(
+                        single["gradients"], result["gradients"],
+                        path=f"rank {rank} gradients",
+                    )
+                    if verify_config.state_call != "None":
+                        _assert_close_tree(
+                            single["state"], result["state"],
+                            path=f"rank {rank} state",
+                        )
 
                 logger.info(
                     f"{verify_config.fsig} of partition {poption} passed the allclose comparison."
