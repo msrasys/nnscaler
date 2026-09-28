@@ -2,6 +2,7 @@
 # Licensed under the MIT License.
 
 import copy
+from collections import Counter
 import tempfile
 from pathlib import Path
 from types import SimpleNamespace
@@ -15,6 +16,7 @@ from nnscaler.flags import CompileFlag
 from nnscaler.ir.operator import IRFwOperation, IRDataOperation
 from nnscaler.policies import OpPlan, get_pas_ops
 from tests.launch_torchrun import launch_torchrun
+from tests.parallel_module.test_gencode import _gencode_contains
 from tests.utils import PYTEST_RUN_ID, clear_dir_on_rank0, replace_all_device_with
 
 
@@ -64,28 +66,79 @@ def config():
 
 def broadcast_policy(graph, cfg):
     # fn/OpPlan assigns uniform per-stage device groups, not per-op rank subsets.
-    # Explicit placement keeps a single metadata producer, with rank 0 optionally
-    # included among its consumers.
+    # Explicit placement preserves independently selected producer/consumer ranks.
     ranks = cfg.pas_config['consumer_ranks']
     for node in graph.select(ntype=IRFwOperation):
         if node.signature.endswith('.make_metadata'):
-            graph.assign(node, 0)
+            producer_ranks = cfg.pas_config.get('producer_ranks', (0,))
+            for rank, replica in zip(producer_ranks, graph.replicate(node, len(producer_ranks))):
+                graph.assign(replica, rank)
         else:
             for rank, replica in zip(ranks, graph.replicate(node, len(ranks))):
                 graph.assign(replica, rank)
     for node in graph.select(ntype=IRDataOperation):
-        for rank, replica in enumerate(graph.replicate(node, 3)):
+        for rank, replica in enumerate(graph.replicate(node, cfg.plan_ngpus)):
             graph.assign(replica, rank)
     return graph
+
+
+@replace_all_device_with('cpu')
+@pytest.mark.parametrize('producer_ranks,consumer_ranks', [
+    ([0], [1, 2]),
+    ([0, 2], [1, 3, 4]),
+    ([0, 1, 2], [3, 4, 5, 6, 7]),
+    ([0, 4], list(range(8))),
+    ([4, 0], [7, 1, 6, 2, 5, 3]),
+    ([0, 1, 2], [2, 3]),
+    ([0, 0], [0, 1, 1, 2]),
+    ([0, 1], [1]),
+    ([0], [0]),
+])
+@pytest.mark.parametrize('disable_fusion', [False, True])
+def test_object_adapter_covers_remote_consumers(tmp_path, monkeypatch, producer_ranks, consumer_ranks, disable_fusion):
+    # Duplicate placements represent the same replica on a device.
+    producer_ranks = tuple(dict.fromkeys(producer_ranks))
+    consumer_ranks = tuple(dict.fromkeys(consumer_ranks))
+    ngpus = max(producer_ranks + consumer_ranks) + 1
+    monkeypatch.setattr(CompileFlag, 'disable_comm_fusion', disable_fusion)
+    parallelize(
+        TensorAndMetadata().double(), {'x': torch.ones(2, 4, dtype=torch.float64)},
+        broadcast_policy,
+        ComputeConfig(ngpus, ngpus, use_end2end=True, constant_folding=False,
+                      pas_config={'producer_ranks': producer_ranks, 'consumer_ranks': consumer_ranks}),
+        gen_savedir=tmp_path, load_module=False, reuse='override',
+    )
+    received = Counter()
+    for rank in range(ngpus):
+        moves = _gencode_contains(
+            tmp_path, TensorAndMetadata, rank,
+            r'nnscaler\.runtime\.adapter\.move_object\([^\n]*?src=(\d+), dst=(\d+)\)',
+        )
+        broadcasts = _gencode_contains(
+            tmp_path, TensorAndMetadata, rank,
+            r'nnscaler\.runtime\.adapter\.broadcast_object\([^\n]*?src=(\d+), ranks=[\[(]([\d, ]+)[\])]\)',
+        )
+        for src, dst in moves:
+            assert int(src) in producer_ranks
+            if rank != int(src):
+                assert int(dst) == rank
+                received[rank] += 1
+        for src, ranks in broadcasts:
+            assert int(src) in producer_ranks
+            if rank != int(src):
+                assert rank in [int(value) for value in ranks.split(',') if value.strip()]
+                received[rank] += 1
+    assert received == Counter({rank: 1 for rank in set(consumer_ranks) - set(producer_ranks)})
 
 
 @replace_all_device_with('cpu')
 def test_tensor_and_metadata_use_distinct_primitives(tmp_path):
     parallelize(TensorAndMetadata().double(), {'x': torch.ones(2, 4, dtype=torch.float64)},
                 metadata_policy, config(), gen_savedir=tmp_path, load_module=False, reuse='override')
-    source = '\n'.join(p.read_text() for p in tmp_path.rglob('gencode*.py'))
-    assert 'nnscaler.runtime.adapter.move(' in source
-    assert 'nnscaler.runtime.adapter.move_object(' in source
+    for primitive in ('move', 'move_object'):
+        assert any(_gencode_contains(tmp_path, TensorAndMetadata, rank,
+                                     rf'nnscaler\.runtime\.adapter\.{primitive}\(')
+                   for rank in range(2))
 
 
 @replace_all_device_with('cpu')
@@ -100,8 +153,8 @@ def test_metadata_fanout_codegen(tmp_path, monkeypatch, disable_fusion, disable_
                 gen_savedir=tmp_path, load_module=False, reuse='override')
     primitive = 'move_object' if disable_fusion else 'broadcast_object'
     for rank in range(3):
-        source = next(tmp_path.rglob(f'gencode{rank}.py')).read_text()
-        assert f'nnscaler.runtime.adapter.{primitive}(' in source
+        assert _gencode_contains(tmp_path, TensorAndMetadata, rank,
+                                 rf'nnscaler\.runtime\.adapter\.{primitive}\(')
 
 
 def transport_worker():

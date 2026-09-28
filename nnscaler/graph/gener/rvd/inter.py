@@ -128,7 +128,8 @@ class InterTransition:
     @staticmethod
     def transitionable(src_rvd: TRVD, dst_rvd: TRVD) -> Optional[Callable]:
         """
-        Check wheter a primitive exists to transform src_rvd to dst_rvd
+        Check whether a primitive exists to transform src_rvd to dst_rvd.
+        Changed factors must be integer multiples or divisors of each other.
 
         @param src_rvd TRVD: source RVD
         @param dst_rvd TRVD: destination RVD
@@ -143,6 +144,9 @@ class InterTransition:
         # only support one dimension change
         # this only happens when the device number changes
         if len(incd) + len(decd) != 1: return trans_fn
+        # Floor-divided chunk counts would silently omit destinations for uneven factors.
+        if any(max(d1, d2) % min(d1, d2) != 0 for d1, d2 in zip(src_rvd, dst_rvd)):
+            return None
         if len(incd) == 1:
             incd = incd[0]
             if incd == 0: # incr
