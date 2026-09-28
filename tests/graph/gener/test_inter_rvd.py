@@ -3,6 +3,7 @@
 
 from typing import List, Tuple
 import nnscaler
+import pytest
 from nnscaler.flags import CompileFlag
 from nnscaler.ir.tensor import IRFullTensor
 from nnscaler.graph.gener.rvd.layout import RVDLayout, RVDInspector
@@ -122,6 +123,28 @@ def test_one_f_case2():
         assert fprims[3].device == [2, 3]
     finally:
         CompileFlag.async_comm = old_value
+
+
+@pytest.mark.parametrize('replicas,dims,expected', [
+    (2, (1, 2), [(2, 6), (0, 4), (3, 7), (1, 5)]),
+    # A fully sharded consumer fixes ownership, so the preferred pairing cannot align.
+    (1, (1, 4), [(2, 6), (0, 5), (3, 4), (1, 7)]),
+])
+def test_inter_rvd_peer_order(replicas, dims, expected):
+    ftensor = IRFullTensor(shape=[32, 32], name='tensor', requires_grad=False)
+    src = RVDLayout.grid(
+        ftensor, r=1, v=1, dims=(1, 4), devices=(2, 0, 3, 1))
+    dst = RVDLayout.grid(
+        ftensor, r=replicas, v=1, dims=dims, devices=(6, 5, 4, 7))
+
+    moves = [
+        (prim.kwargs['src'], prim.kwargs['dst'])
+        for prim in InterPathFinder.path(src, dst)
+        if prim.signature == 'nnscaler.runtime.adapter.move'
+    ]
+
+    assert moves == expected
+
 
 def test_all_f_cases_fix_placement():
     fshape = [128, 256, 512]

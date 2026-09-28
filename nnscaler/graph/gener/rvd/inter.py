@@ -301,8 +301,15 @@ class InterPathFinder:
         assert producer_out_devs is not None, f"Can't find inter-rvd producer out device placement"
 
         # setup consumer primitives and entry device placement
+        candidates = sorted(cdev_space)
+        if candidates and len(candidates[0]) == len(producer_out_devs):
+            peer_map = dict(zip(sorted(producer_out_devs), sorted(candidates[0])))
+            preferred = tuple(peer_map[device] for device in producer_out_devs)
+            if preferred in cdev_space:
+                candidates.remove(preferred)
+            candidates.insert(0, preferred)
         consumer_entry_devs = None
-        for cdevs in cdev_space:
+        for cdevs in candidates:
             clayout = RVDLayout.grid(
                 olayout.ftensor, r=crvds[0][0], v=crvds[0][1],
                 dims=crvds[0][2:], devices=cdevs)
