@@ -180,7 +180,7 @@ The generated files include:
 3. code: generated code files (`gencode*.py`)
 
 Initial-weight files are written concurrently from read-only CPU tensors.
-`NNSCALER_WEIGHT_SAVE_WORKERS` sets the positive writer count (default: 4).
+`ATTR_SAVE_WORKERS` sets the positive writer count (default: 8).
 Set it to 1 to serialize writes on storage that does not benefit from concurrency.
 The existing `fullmodel.pt.*` / `fullmodel.pt.index` format is preserved; the index
 is written only after every weight file succeeds. Tensors are not sliced into
@@ -188,7 +188,7 @@ views just to meet the file-size target, which would risk serializing their
 entire backing storage repeatedly.
 
 Multi-process code generation uses `cloudpickle` for its temporary worker
-payload, including registered-op closures. This does not change persisted
+payload, including registered-op closures, with a whole-payload dill fallback. This does not change persisted
 graphs or training checkpoint formats. Codegen workers limit their CPU tensor
 threads to one; the parent can use more threads for initialization and tracing.
 The `reuse_cache` tracing strategy releases its execution-only tensor cache

@@ -772,6 +772,12 @@ Where `ResumeOptions` and `SerializerOptions` are:
     (without saving). `False` means will load the sharded checkpoint
     files. `None` means will load sharded if world size is unchanged,
     and merged otherwise. Only used when `checkpoint` is a directory.
+    When comparing model configurations across checkpoint ranks, only
+    `model.args.model_args.vision_encoder_path` is ignored, allowing the same
+    Vision weights to be staged at different node-local paths. Other model
+    fields and learning-rate scheduler state must still match. This comparison
+    does not rewrite checkpoint metadata; the merged result retains the first
+    input checkpoint's model configuration.
   - `save_memory` (`bool`): If the memory is limited, only load merged
     state dict in GPU 0 of each node and broadcast trimmed state dict to
     other ranks. Although slower, this saves memory. Only used when
@@ -897,6 +903,56 @@ Please note
 - `seed` (`Optional[int]`): The random seed. Default is `None`.
 - `init_env_fn` (`str`): The function to initialize the environment.
   Default is `None`.
+
+### Multi-process code-generation payloads
+
+With `codegen_workers > 1`, NNScaler serializes the code-generation plan once
+before launching local workers. It uses cloudpickle for the
+whole object graph, including local functions and their shared captured state.
+Cached graphs use the same path. Unsupported payloads fall back to whole-payload
+dill serialization; disk I/O errors propagate without retrying.
+No additional setting is required; generated code and metadata formats stay
+the same.
+
+The parent log reports `Serialized codegen payload with cloudpickle` (or `dill` for
+fallback), the payload size, and serialization time. Worker logs separately
+report payload loading time. This optimization reduces work before workers
+start; it does not change worker count or model parallelism.
+
+Each worker collects rank attribute metadata in memory and writes one temporary
+bundle after its entire rank range succeeds. For example, 1584 ranks with 32
+workers produce 32 temporary metadata bundles. Metadata is deduplicated within
+each worker; the parent validates rank coverage and merges bundles in rank
+order into the existing `attr_meta.pkl` format. Generated Python files, initial
+weights, and runtime metadata loading are unchanged. No per-rank metadata
+files are written by multi-process codegen, and temporary bundles are removed
+with the staging directory. Serial codegen retains its per-rank staging path.
+The parent log reports bundle count, rank count, unique variants, and merge
+time.
+
+### Initial weight saving during compilation
+
+Compilation saves initial weights to `fullmodel.pt.0`, `fullmodel.pt.1`, etc.
+Set the environment variable `ATTR_SAVE_WORKERS` before starting Python to
+control concurrent shard writes (a positive integer, default `8`). Set it to
+`1` for serial saving. The older `NNSCALER_WEIGHT_SAVE_WORKERS` variable is a
+fallback when `ATTR_SAVE_WORKERS` is unset. This setting is independent of `codegen_workers`,
+which controls per-rank code generation.
+
+At most `ATTR_SAVE_WORKERS` shard writes are queued or running at once.
+Writer threads share the CPU tensors prepared by the parser without copying
+the model into worker processes; the complete CPU tensor set still resides in
+memory. Files target 2 GiB of tensor storage, counting shared storage once and
+keeping its views together. A storage larger than the target occupies one file;
+tensors are never split. File groupings may change, but tensor values and the
+index/loading format remain unchanged. Explicit `params_per_file` calls retain
+element-count units; `bytes_per_file` selects a different byte target.
+Each file is written to a temporary file in the destination directory and
+renamed into place. The old index is removed before rewriting shards, and
+`fullmodel.pt.index` is published only after all writes succeed. If saving
+fails, the error propagates after active writers finish, temporary files are
+cleaned up, and completed shards may remain without an index. Logs report
+the writer count, each shard's save duration, and the overall save duration.
 
 ### Debug Config
 
@@ -1409,7 +1465,14 @@ class ReuseType(Enum):
 ```
 
 We call it a `match` when the `ComputeConfig` is the same with the
-previous run.
+previous run. The VL trainer's
+`user_config.__from_trainer_args.model_args.model_args.vision_encoder_path`
+is excluded from code and graph reuse comparisons, including for packages
+generated before this exception was added. This allows the same Vision checkpoint
+to be staged at a different local path. Path values are retained in runtime
+arguments and serialized metadata; only comparisons ignore them.
+Other configuration fields and package completeness are
+still checked; changing the Vision architecture requires regenerating the code.
 
 1.  `MATCH`: Reuse if match, error if not match, generate if no previous
     gerenated code exists.

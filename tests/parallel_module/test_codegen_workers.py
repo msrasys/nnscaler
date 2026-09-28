@@ -10,6 +10,8 @@ import pytest
 import torch
 
 import nnscaler
+from nnscaler.codegen.serialization import dump_codegen_payload
+from nnscaler.codegen.metadata import compact_worker_metadata, worker_metadata_filename
 from nnscaler.parallel import (
     ComputeConfig,
     _compact_attr_meta_files,
@@ -52,6 +54,25 @@ def _custom_neg(x):
 class _CustomEmitModel(torch.nn.Module):
     def forward(self, x):
         return _custom_neg(x)
+
+
+def _make_local_emitter():
+    operation = 'torch.neg'
+
+    def emit(node, args, kwargs, runtime_devid, plan_ndevs, runtime_ndevs):
+        return f'{operation}({args[0]})'
+
+    return emit
+
+
+@nnscaler.register_op('* -> *', emit_fn=_make_local_emitter())
+def _custom_local_emit_neg(x):
+    return -x
+
+
+class _LocalEmitModel(torch.nn.Module):
+    def forward(self, x):
+        return _custom_local_emit_neg(x)
 
 
 def _generated_module_dir(root: Path) -> Path:
@@ -98,9 +119,28 @@ def _load_compact_raw_maps(module_dir: Path) -> tuple[dict, list[dict]]:
         (_RegularModel, False),
         (_End2EndModel, True),
         (_CustomEmitModel, False),
+        (_LocalEmitModel, False),
     ],
 )
-def test_multi_process_codegen_matches_serial(tmp_path, model_factory, use_end2end):
+def test_multi_process_codegen_matches_serial(tmp_path, model_factory, use_end2end, monkeypatch):
+    serializers = []
+    bundles = []
+
+    def record_serializer(payload, stream):
+        serializer = dump_codegen_payload(payload, stream)
+        serializers.append(serializer)
+        return serializer
+
+    monkeypatch.setattr('nnscaler.parallel.dump_codegen_payload', record_serializer)
+
+    def inspect_bundles(staging_dir, rank_ranges, runtime_ngpus):
+        assert not list(staging_dir.glob('attr_meta[0-9]*.pkl'))
+        paths = list(staging_dir.glob('attr_meta_worker_*.pkl'))
+        assert len(paths) == len(rank_ranges)
+        bundles.extend(paths)
+        return compact_worker_metadata(staging_dir, rank_ranges, runtime_ngpus)
+
+    monkeypatch.setattr('nnscaler.parallel.compact_worker_metadata', inspect_bundles)
     serial_dir = _generate(
         tmp_path / 'serial',
         model_factory(),
@@ -113,6 +153,8 @@ def test_multi_process_codegen_matches_serial(tmp_path, model_factory, use_end2e
         codegen_workers=2,
         use_end2end=use_end2end,
     )
+    assert serializers == ['cloudpickle']
+    assert len(bundles) == 2
 
     for rank in range(2):
         assert (serial_dir / f'gencode{rank}.py').read_bytes() == (
@@ -126,11 +168,32 @@ def test_multi_process_codegen_matches_serial(tmp_path, model_factory, use_end2e
     assert parallel_compact_meta['version'] == ParallelModule.ATTR_META_FORMAT_VERSION
     assert not list(serial_dir.glob('attr_meta[0-9]*.pkl'))
     assert not list(parallel_dir.glob('attr_meta[0-9]*.pkl'))
+    assert not list(parallel_dir.glob('attr_meta_worker_*.pkl'))
+    assert (serial_dir / ParallelModule.ATTR_META_FILE).read_bytes() == (parallel_dir / ParallelModule.ATTR_META_FILE).read_bytes()
 
     if model_factory is _End2EndModel:
         assert '_train_step' in (parallel_dir / 'gencode0.py').read_text()
-    if model_factory is _CustomEmitModel:
+    if model_factory in (_CustomEmitModel, _LocalEmitModel):
         assert 'torch.neg' in (parallel_dir / 'gencode0.py').read_text()
+
+
+@replace_all_device_with('cpu', force=True)
+def test_codegen_workers_reuse_cached_custom_op_graph(tmp_path, monkeypatch):
+    module_dir = _generate(tmp_path, _LocalEmitModel(), codegen_workers=1, use_end2end=False)
+    expected_code = [(module_dir / f'gencode{rank}.py').read_bytes() for rank in range(2)]
+    expected_meta = _load_compact_raw_maps(module_dir)
+    serializers = []
+
+    def record_serializer(payload, stream):
+        serializer = dump_codegen_payload(payload, stream)
+        serializers.append(serializer)
+        return serializer
+
+    monkeypatch.setattr('nnscaler.parallel.dump_codegen_payload', record_serializer)
+    _generate(tmp_path, _LocalEmitModel(), codegen_workers=2, use_end2end=False, reuse='graph')
+    assert serializers == ['cloudpickle']
+    assert [(module_dir / f'gencode{rank}.py').read_bytes() for rank in range(2)] == expected_code
+    assert _load_compact_raw_maps(module_dir) == expected_meta
 
 
 @pytest.mark.parametrize('codegen_workers', [0, -1, True])
@@ -245,8 +308,7 @@ class _FailingModuleCodeGen:
         if rank == 2:
             time.sleep(30)
         Path(outfile).write_text(f'rank {rank}\n')
-        with Path(outfile_attr_meta_map).open('wb') as stream:
-            pickle.dump({'rank': rank}, stream)
+        pickle.dump({'rank': rank}, outfile_attr_meta_map)
 
 
 class _PayloadDepthModuleCodeGen:
@@ -267,8 +329,7 @@ class _PayloadDepthModuleCodeGen:
             depth += 1
             nested = nested[0]
         Path(outfile).write_text(f'{rank}:{depth}\n')
-        with Path(outfile_attr_meta_map).open('wb') as stream:
-            pickle.dump({}, stream)
+        pickle.dump({}, outfile_attr_meta_map)
 
 
 def test_multi_process_codegen_serializes_deep_payload(tmp_path):
@@ -319,3 +380,30 @@ def test_worker_failure_terminates_siblings_and_cleans_staging(tmp_path):
     assert not list(tmp_path.glob('.nnscaler-codegen-*'))
     assert final_code.read_text() == 'old code'
     assert final_attr_meta.read_bytes() == b'old metadata'
+
+
+@pytest.mark.parametrize('failure', ['missing', 'invalid_range'])
+def test_invalid_worker_metadata_preserves_previous_outputs(tmp_path, monkeypatch, failure):
+    final_code = tmp_path / 'gencode0.py'
+    final_meta = tmp_path / ParallelModule.ATTR_META_FILE
+    final_code.write_text('old code')
+    final_meta.write_bytes(b'old metadata')
+    original = compact_worker_metadata
+
+    def corrupt_and_compact(staging_dir, rank_ranges, runtime_ngpus):
+        bundle_file = staging_dir / worker_metadata_filename(*rank_ranges[0])
+        if failure == 'missing':
+            bundle_file.unlink()
+        else:
+            bundle = pickle.loads(bundle_file.read_bytes())
+            bundle['rank_start'] = 1
+            bundle_file.write_bytes(pickle.dumps(bundle))
+        return original(staging_dir, rank_ranges, runtime_ngpus)
+
+    monkeypatch.setattr('nnscaler.parallel.compact_worker_metadata', corrupt_and_compact)
+    with pytest.raises((FileNotFoundError, RuntimeError)):
+        _gencode_in_subprocesses(_PayloadDepthModuleCodeGen(), None, {'nested': None},
+                                ComputeConfig(1, 2), tmp_path, 2)
+    assert final_code.read_text() == 'old code'
+    assert final_meta.read_bytes() == b'old metadata'
+    assert not list(tmp_path.glob('.nnscaler-codegen-*'))
