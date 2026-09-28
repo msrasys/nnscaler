@@ -37,15 +37,16 @@ def codegen_pickle_recursion_limit():
 
 class _CodegenPickler(cloudpickle.CloudPickler):
     def reducer_override(self, obj):
+        reduction = super().reducer_override(obj)
         # Cloudpickle preserves captured objects, but recreates closure cells
         # separately for each function. Rebinding a shared nonlocal would then
         # silently change behavior. Keep dill's shared-cell memo in that case.
-        if isinstance(obj, types.FunctionType) and obj.__closure__:
+        if reduction is not NotImplemented and isinstance(obj, types.FunctionType) and obj.__closure__:
             freevars = obj.__code__.co_freevars
             if any(inst.opname in ('STORE_DEREF', 'DELETE_DEREF') and inst.argval in freevars
                    for inst in dis.get_instructions(obj)):
                 raise pickle.PicklingError('codegen function rebinds captured state')
-        return super().reducer_override(obj)
+        return reduction
 
 
 def dump_codegen_payload(payload: dict[str, Any], stream: BinaryIO) -> str:
