@@ -131,7 +131,10 @@ def _verification_code(signature: str):
             if callback is not None
         ]
 
-    modules = {runtime_fn.__module__}
+    modules = set()
+    runtime_module = getattr(runtime_fn, "__module__", None)
+    if runtime_module is not None:
+        modules.add(runtime_module)
     runtime_owner = getattr(runtime_fn, "__self__", None)
     runtime_owner_module = getattr(runtime_owner, "__module__", None)
     if runtime_owner_module is not None:

@@ -5,10 +5,29 @@
 
 from typing import Optional, Tuple
 from functools import reduce
+from functools import cache
+import inspect
 import operator
 
 import torch
 import torch.distributed as dist
+
+
+@cache
+def _get_default_args(func):
+    spec = inspect.getfullargspec(func)
+    defaults = spec.defaults if spec.defaults is not None else ()
+    padded_defaults = (None,) * (len(spec.args) - len(defaults)) + defaults
+    args = dict(zip(spec.args, padded_defaults))
+    if "softcap" in args:
+        args["softcap"] = 0.0
+    return args
+
+
+def get_default_args(func):
+    if inspect.isfunction(func):
+        return _get_default_args(func)
+    return _get_default_args(func._init_fn)
 
 
 # copy from megatron/core/utils.py
@@ -119,6 +138,7 @@ class RingComm:
             raise RuntimeError("wait called before commit")
         for req in self._reqs:
             req.wait()
+        torch.cuda.current_stream().synchronize()
         self._reqs = None
         self._ops = []
 

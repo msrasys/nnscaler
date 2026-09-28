@@ -14,10 +14,16 @@ transformers==4.40.0
 datasets==3.6.0
 apex
 flash-attn
-grouped_gemm==1.1.4
+grouped_gemm @ git+https://github.com/fanshiqing/grouped_gemm@v1.1.4
 ```
 
-We recommend to launch the script under a Nvidia docker directly, like `nvidia/pytorch:24.02-py3`. You can find grouped_gemm at https://github.com/fanshiqing/grouped_gemm.
+We recommend launching the script in an NVIDIA container such as `nvidia/pytorch:24.02-py3`. `grouped_gemm` is a CUDA extension and is required when the optimized MoE path executes, but it is not required merely to import the modeling module for static annotation verification. Install the tested fork and tag with:
+
+```bash
+pip install 'grouped_gemm @ git+https://github.com/fanshiqing/grouped_gemm@v1.1.4'
+```
+
+If the CUDA extension is unavailable, training fails with an actionable error when the grouped GEMM path is first used; the example does not substitute a different computation silently.
 
 ## Data Preparation
 
@@ -75,6 +81,6 @@ We have tested the training script on 8xH100 and each step takes about 2s. A ste
 
 To improve the performance, we recommend to
 
-- Replace the cutlass kernel with better ones. Current script is based on grouped_gemm@v1.14.
+- Replace the cutlass kernel with better ones. Current script is based on grouped_gemm@v1.1.4.
 - Fuse more kernels like rope and memory slicing in attention.
 - There are about 16 * 8 = 128 GB space used to store the optimizer states. Adding more devices helps to save more memory and nnScaler can find a better plan then.

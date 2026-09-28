@@ -205,6 +205,7 @@ class RingComm:
             raise RuntimeError("wait called before commit")
         for req in self._reqs:
             req.wait()
+        torch.cuda.current_stream().synchronize()
         self._reqs = None
         self._ops = []
 

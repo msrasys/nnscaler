@@ -535,6 +535,13 @@ class type_wrapper_clz:
     # used to track the original class
     _fx_wrapped_ori_clz = orig_func.type
 
+    @staticmethod
+    def __instancecheck__(cls, instance):
+        # torch._dynamo calls type.__instancecheck__(cls, instance) directly.
+        if orig_func.isinstance(instance, cct.ConcreteProxy):
+            instance = instance.value
+        return orig_func.type.__instancecheck__(cls, instance)
+
     def __new__(cls, obj_or_name, *args):
         # case 1: class type(name, bases, dict, **kwds)
         if orig_func.len(args) > 0:

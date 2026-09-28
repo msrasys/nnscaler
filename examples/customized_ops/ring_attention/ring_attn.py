@@ -30,7 +30,19 @@ def wrap_ring_attn_func(q: Tensor, k: Tensor, v: Tensor, softmax_scale: Tensor=N
         # to the behavior of the original flash_attn_func.
         if softmax_scale is None:
             softmax_scale = q.shape[-1] ** (-0.5)
-        output = flash_attn_func(q, k, v, 0.0, softmax_scale, causal)
+        output = flash_attn_func(
+            q,
+            k,
+            v,
+            dropout_p=dropout_p,
+            softmax_scale=softmax_scale,
+            causal=causal,
+            window_size=window_size,
+            softcap=softcap,
+            alibi_slopes=alibi_slopes,
+            deterministic=deterministic,
+            return_attn_probs=return_attn_probs,
+        )
         return output
 
     assert len(q.shape) == 4, "q must have shape [bs, ql, qh, dim]"

@@ -44,11 +44,23 @@ except ImportError:
 
 try:
     from grouped_gemm.ops import gmm
-except ImportError:
-    raise ImportError(
-        "Grouped GEMM is not available. Please run "
-        "`pip install git+https://github.com/fanshiqing/grouped_gemm@v1.0`."
-    )
+except ImportError as exc:
+    gmm = None
+    _grouped_gemm_import_error = exc
+else:
+    _grouped_gemm_import_error = None
+
+
+def _require_grouped_gemm():
+    if gmm is None:
+        raise ImportError(
+            "The DeepSeek training path requires the grouped_gemm CUDA extension. "
+            "Install the tested version with "
+            "`pip install 'grouped_gemm @ git+https://github.com/fanshiqing/grouped_gemm@v1.1.4'`. "
+            "The modeling module can be imported without this optional runtime dependency, "
+            "but nnscaler_moe_gmm cannot execute."
+        ) from _grouped_gemm_import_error
+    return gmm
 
 
 def rmsnorm_fwd(self, hidden_states):
@@ -409,7 +421,8 @@ def nnscaler_moe_gmm(
     hidden_states: torch.Tensor, topk_idx: torch.Tensor, topk_weight: torch.Tensor, aux_loss: torch.Tensor, 
     gate_projs: torch.Tensor, up_projs: torch.Tensor, down_projs: torch.Tensor,
     n_routed_experts: int, local_expert_start: int, local_expert_end: int):
-    
+    grouped_gemm = _require_grouped_gemm()
+
     orig_shape = hidden_states.shape
     hidden_states = hidden_states.reshape(-1, hidden_states.shape[-1])
     topk_weight = topk_weight.reshape(-1, topk_weight.shape[-1])
@@ -430,10 +443,10 @@ def nnscaler_moe_gmm(
 
     permuted_inputs, row_id_map = permute(local_hidden_states, local_idx)
 
-    fc1_output = gmm(permuted_inputs, gate_projs, tokens_per_expert, trans_b=True)
-    fc2_output = gmm(permuted_inputs, up_projs, tokens_per_expert, trans_b=True)
+    fc1_output = grouped_gemm(permuted_inputs, gate_projs, tokens_per_expert, trans_b=True)
+    fc2_output = grouped_gemm(permuted_inputs, up_projs, tokens_per_expert, trans_b=True)
     intermediate_parallel = torch.nn.functional.silu(fc1_output) * fc2_output
-    expert_outs = gmm(intermediate_parallel, down_projs, tokens_per_expert, trans_b=True)
+    expert_outs = grouped_gemm(intermediate_parallel, down_projs, tokens_per_expert, trans_b=True)
 
     y = unpermute(expert_outs, row_id_map)
     y = y * local_prob

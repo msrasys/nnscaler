@@ -70,8 +70,23 @@ register_op(flash_attention_anno)(_flash_attention_forward)
 from typing import Optional, Tuple
 import torch
 from transformers.utils import is_flash_attn_greater_or_equal_2_10
-from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 from transformers import modeling_flash_attention_utils
+
+try:
+    # Public registration API in Transformers versions that use the functional
+    # attention interface.
+    from transformers import AttentionInterface
+except ImportError:
+    try:
+        # AttentionInterface existed here before it was exported at package level.
+        from transformers.modeling_utils import AttentionInterface
+    except ImportError:
+        AttentionInterface = None
+
+try:
+    from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
+except ImportError:
+    ALL_ATTENTION_FUNCTIONS = None
 
 _use_top_left_mask = not is_flash_attn_greater_or_equal_2_10()
 
@@ -136,4 +151,7 @@ def flash_attention_forward(
     return attn_output, None
 
 
-ALL_ATTENTION_FUNCTIONS["flash_attention_2"] = flash_attention_forward
+if AttentionInterface is not None:
+    AttentionInterface.register("flash_attention_2", flash_attention_forward)
+elif ALL_ATTENTION_FUNCTIONS is not None:
+    ALL_ATTENTION_FUNCTIONS["flash_attention_2"] = flash_attention_forward

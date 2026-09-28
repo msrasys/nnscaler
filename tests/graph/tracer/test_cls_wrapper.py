@@ -4,9 +4,17 @@
 import torch
 import pytest
 
+import nnscaler
 from nnscaler.graph.parser.converter import to_fx_graph
 
 from ...utils import replace_all_device_with
+
+
+class TypeInstanceCheckModule(torch.nn.Module):
+
+    def forward(self, x):
+        assert type.__instancecheck__(torch.Tensor, x)
+        return x + 0
 
 
 @replace_all_device_with('cpu')
@@ -41,3 +49,16 @@ def test_cls_wrapper():
     #     linear_bias = self.linear.bias
     #     linear = torch._C._nn.linear(fill, linear_weight, linear_bias);  fill = linear_weight = linear_bias = None
     #     return linear
+
+
+@replace_all_device_with('cpu')
+def test_type_instancecheck_during_parallelize(tmp_path):
+    nnscaler.parallelize(
+        TypeInstanceCheckModule(),
+        {'x': torch.randn(2, 4)},
+        'dp',
+        nnscaler.ComputeConfig(1, 1),
+        gen_savedir=tmp_path,
+        reuse='override',
+        load_module=False,
+    )
