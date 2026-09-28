@@ -888,10 +888,14 @@ class CubeModule(torch.nn.Module):
                         states: Dict[str, torch.Tensor] = _merge_opt_zero(meta.sub_shape, work_idx, local_index)
                         if states is None:
                             continue
-                        zero_done_track.add(track_id)
                     else:
                         _logger.debug(f'rank {work_idx}: skip merging duplicated optimizer state for param {full_index} with slicers {meta.slicers}')
                         continue
+
+                if not states:
+                    continue
+                if zero_idx_maps is not None:
+                    zero_done_track.add(track_id)
 
                 # delay the creation of full_states[full_index]
                 # until we have a valid optimizer state for this parameter

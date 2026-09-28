@@ -107,6 +107,15 @@ def test_merge_sparse_optimizer_state():
             ],
         )
 
+    with pytest.raises(ValueError, match='Incomplete optimizer state'):
+        ParallelModule.merge_opt_state_dicts(
+            sharded_fullmaps,
+            [
+                {'state': {0: {}}, 'param_groups': [{'params': [0]}]},
+                {'state': {0: state}, 'param_groups': [{'params': [0]}]},
+            ],
+        )
+
 
 def test_merge_sharded_optimizer_states_with_multiple_parameters():
     fullmaps = []
