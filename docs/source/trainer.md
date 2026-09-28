@@ -910,7 +910,8 @@ With `codegen_workers > 1`, NNScaler serializes the code-generation plan once
 before launching local workers. It uses cloudpickle for the
 whole object graph, including local functions and their shared captured state.
 Cached graphs use the same path. Unsupported payloads fall back to whole-payload
-dill serialization; disk I/O errors propagate without retrying.
+dill serialization. Functions that rebind captured variables also use dill to
+preserve shared closure cells. Disk I/O errors propagate without retrying.
 No additional setting is required; generated code and metadata formats stay
 the same.
 

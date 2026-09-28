@@ -6,14 +6,13 @@ import subprocess
 import sys
 from types import SimpleNamespace
 
-import cloudpickle
 import dill
 import pickle
 import pytest
 import torch
 
 from nnscaler import register_op
-from nnscaler.codegen.serialization import dump_codegen_payload, load_codegen_payload
+from nnscaler.codegen.serialization import dump_codegen_payload, load_codegen_payload, _CodegenPickler
 from nnscaler.graph.parser.register import CustomizedOps
 from nnscaler.graph.function.function import _reshape_anno
 
@@ -211,11 +210,11 @@ def test_io_errors_do_not_retry_with_dill(monkeypatch):
 
 @pytest.mark.parametrize('error', [pickle.PicklingError, TypeError, AttributeError, RecursionError])
 def test_fallback_replaces_partial_payload(monkeypatch, error):
-    def fail_dump(payload, stream, **kwargs):
+    def fail_dump(self, payload):
         stream.write(b'partial cloudpickle payload' * 100)
         raise error('unsupported object')
 
-    monkeypatch.setattr(cloudpickle, 'dump', fail_dump)
+    monkeypatch.setattr(_CodegenPickler, 'dump', fail_dump)
     state = []
     def append(value):
         state.append(value)
@@ -228,3 +227,30 @@ def test_fallback_replaces_partial_payload(monkeypatch, error):
     restored['append'](42)
     assert restored['state'] == [42]
     assert stream.read() == b''
+
+
+@pytest.mark.parametrize('delete', [False, True])
+def test_nonlocal_rebinding_keeps_shared_closure_cells(delete):
+    state = 0
+
+    def increment():
+        nonlocal state
+        state += 1
+
+    def clear():
+        nonlocal state
+        del state
+
+    def read():
+        return state
+
+    stream = io.BytesIO()
+    assert dump_codegen_payload({'change': clear if delete else increment, 'read': read}, stream) == 'dill'
+    stream.seek(0)
+    restored = load_codegen_payload(stream)
+    restored['change']()
+    if delete:
+        with pytest.raises(NameError):
+            restored['read']()
+    else:
+        assert restored['read']() == 1

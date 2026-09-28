@@ -4,9 +4,11 @@
 """Helpers for serializing code-generation state."""
 
 from contextlib import contextmanager
+import dis
 import logging
 import pickle
 import sys
+import types
 from typing import Any, BinaryIO
 
 import cloudpickle
@@ -33,6 +35,19 @@ def codegen_pickle_recursion_limit():
             sys.setrecursionlimit(previous_limit)
 
 
+class _CodegenPickler(cloudpickle.CloudPickler):
+    def reducer_override(self, obj):
+        # Cloudpickle preserves captured objects, but recreates closure cells
+        # separately for each function. Rebinding a shared nonlocal would then
+        # silently change behavior. Keep dill's shared-cell memo in that case.
+        if isinstance(obj, types.FunctionType) and obj.__closure__:
+            freevars = obj.__code__.co_freevars
+            if any(inst.opname in ('STORE_DEREF', 'DELETE_DEREF') and inst.argval in freevars
+                   for inst in dis.get_instructions(obj)):
+                raise pickle.PicklingError('codegen function rebinds captured state')
+        return super().reducer_override(obj)
+
+
 def dump_codegen_payload(payload: dict[str, Any], stream: BinaryIO) -> str:
     """Serialize one shared object graph, falling back to legacy dill if needed.
 
@@ -42,7 +57,7 @@ def dump_codegen_payload(payload: dict[str, Any], stream: BinaryIO) -> str:
     offset = stream.tell()
     with codegen_pickle_recursion_limit():
         try:
-            cloudpickle.dump(payload, stream, protocol=pickle.HIGHEST_PROTOCOL)
+            _CodegenPickler(stream, protocol=pickle.HIGHEST_PROTOCOL).dump(payload)
         except (pickle.PicklingError, AttributeError, TypeError, RecursionError) as exc:
             _logger.info('Cloudpickle unavailable for codegen payload; falling back to dill: %s', exc)
             stream.seek(offset)
