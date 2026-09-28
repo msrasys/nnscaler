@@ -108,6 +108,56 @@ def test_merge_sparse_optimizer_state():
         )
 
 
+def test_merge_sharded_optimizer_states_with_multiple_parameters():
+    fullmaps = []
+    optimizer_state_dicts = []
+    for rank in range(2):
+        fullmaps.append({
+            'buffer': AttrMeta(
+                2,
+                False,
+                'buffer',
+                (1,),
+                (slice(0, 1),),
+                1,
+                torch.float32,
+                (1,),
+            ),
+            **{
+                f'p{param}': AttrMeta(
+                    param,
+                    True,
+                    f'p{param}',
+                    (2,),
+                    (slice(rank, rank + 1),),
+                    1,
+                    torch.float32,
+                    (1,),
+                )
+                for param in range(2)
+            },
+        })
+        optimizer_state_dicts.append({
+            'state': {
+                param: {
+                    'step': torch.tensor(1.0),
+                    'exp_avg': torch.tensor([rank * 10 + param], dtype=torch.float32),
+                    'exp_avg_sq': torch.tensor([rank * 10 + param + 1], dtype=torch.float32),
+                }
+                for param in range(2)
+            },
+            'param_groups': [{'params': [0, 1]}],
+        })
+
+    merged = ParallelModule.merge_opt_state_dicts(fullmaps, optimizer_state_dicts)
+
+    torch.testing.assert_close(merged['state'][0]['exp_avg'], torch.tensor([0.0, 10.0]))
+    torch.testing.assert_close(merged['state'][0]['exp_avg_sq'], torch.tensor([1.0, 11.0]))
+    torch.testing.assert_close(merged['state'][1]['exp_avg'], torch.tensor([1.0, 11.0]))
+    torch.testing.assert_close(merged['state'][1]['exp_avg_sq'], torch.tensor([2.0, 12.0]))
+    assert merged['param_groups'][0]['params'] == [0, 1]
+
+
 def _to_cube_model(module, pas, compute_config, cube_savedir, instance_name, dummy_input = None):
     return parallelize(
         module,
