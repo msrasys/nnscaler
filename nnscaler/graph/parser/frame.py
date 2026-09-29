@@ -202,7 +202,22 @@ class Frame:
             if value is not None and (isinstance(value, bool) or not isinstance(value, int) or value < 1):
                 raise ValueError(f'{name} must be a positive integer')
 
-        tid2value = {t.tid: val.cpu() for t, (_, val) in self._attr_map.items()}
+        tid2value, cpu_storages = {}, {}
+        for tensor, (_, value) in self._attr_map.items():
+            if value.device.type != 'cpu':
+                # Copy each source storage once; per-tensor .cpu() loses aliases
+                # and rebases the offsets of views before packing can see them.
+                storage = value.untyped_storage()
+                if storage._cdata not in cpu_storages:
+                    cpu_storages[storage._cdata] = storage.cpu()
+                host = torch.empty(0, dtype=value.dtype, device='cpu').set_(
+                    cpu_storages[storage._cdata], value.storage_offset(), value.size(), value.stride())
+                if value.is_conj():
+                    host = host.conj()
+                if value.is_neg():
+                    host = host._neg_view()
+                value = host.requires_grad_(value.requires_grad)
+            tid2value[tensor.tid] = value
         if params_per_file is not None:
             groups = [([tid], value.numel()) for tid, value in tid2value.items()]
             limit = params_per_file

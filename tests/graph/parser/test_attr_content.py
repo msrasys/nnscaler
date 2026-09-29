@@ -3,6 +3,7 @@
 
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+import runpy
 from threading import Barrier, Event, Lock
 
 import pytest
@@ -283,11 +284,14 @@ def test_save_empty_attr_content(tmp_path):
 
 
 @pytest.mark.parametrize('workers', [1, 4])
-def test_save_attr_content_packs_bytes_and_preserves_storage_aliases(tmp_path, workers):
+@pytest.mark.parametrize('device', ['cpu', pytest.param('cuda', marks=pytest.mark.skipif(
+    not torch.cuda.is_available(), reason='CUDA required'))])
+def test_save_attr_content_packs_bytes_and_preserves_storage_aliases(tmp_path, workers, device):
     frame = Frame()
-    base = torch.arange(20, dtype=torch.float32)
-    values = [torch.arange(4, dtype=torch.bfloat16), torch.arange(4, dtype=torch.float32),
-              base[3:7], torch.arange(3, dtype=torch.bfloat16), base[::2]]
+    base = torch.arange(20, dtype=torch.float32, device=device, requires_grad=True)
+    values = [torch.arange(4, dtype=torch.bfloat16, device=device),
+              torch.arange(4, dtype=torch.float32, device=device), base[3:7],
+              torch.arange(3, dtype=torch.bfloat16, device=device), base[::2]]
     tensors = [IRFullTensor(tuple(value.shape), name=f'w{i}', dtype=value.dtype)
                for i, value in enumerate(values)]
     for i, (tensor, value) in enumerate(zip(tensors, values)):
@@ -299,13 +303,65 @@ def test_save_attr_content_packs_bytes_and_preserves_storage_aliases(tmp_path, w
     chunks = [torch.load(f'{stem}.{i}', mmap=True, weights_only=True) for i in range(3)]
     for tensor, expected in zip(tensors, values):
         actual = chunks[index[tensor.tid]][tensor.tid]
-        assert torch.equal(actual, expected)
+        assert torch.equal(actual, expected.cpu())
         assert actual.dtype == expected.dtype
         assert actual.stride() == expected.stride()
         assert actual.storage_offset() == expected.storage_offset()
+        assert actual.requires_grad == expected.requires_grad
     a, b = (chunks[1][tensors[i].tid] for i in (2, 4))
+    assert a is not b
     assert a.untyped_storage()._cdata == b.untyped_storage()._cdata
     assert a.untyped_storage().nbytes() == base.untyped_storage().nbytes()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason='CUDA required')
+def test_cuda_trace_saves_shared_attribute_storage(tmp_path, monkeypatch):
+    from nnscaler.graph.parser.converter import to_fx_graph, to_ir_graph
+
+    class Model(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            storage = torch.arange(20, device='cuda', dtype=torch.float32)
+            self.weight = torch.nn.Parameter(storage[3:7])
+            self.register_buffer('offset', storage[1:9:2])
+
+        def forward(self, x):
+            return x * self.weight + self.offset
+
+    monkeypatch.setattr(CompileFlag, 'trace_strategy', 'cuda')
+    model = Model()
+    inputs = {'x': torch.ones(4, device='cuda')}
+    traced = to_fx_graph(model, inputs)
+    assert traced.weight.is_cuda and traced.offset.is_cuda
+    assert traced.weight.storage_offset() == 3 and traced.offset.storage_offset() == 1
+    graph = to_ir_graph(traced, inputs, tmp_path, constant_folding=False)
+    saved = torch.load(tmp_path / FxModuleParser.ATTR_CONTENT_FILE_0, weights_only=True)
+    attrs = {tensor.name: saved[tensor.tid] for tensor in graph.attributes()}
+    for name in ('weight', 'offset'):
+        expected, actual = getattr(model, name), attrs[name]
+        assert torch.equal(actual, expected.cpu())
+        assert actual.stride() == expected.stride()
+        assert actual.storage_offset() == expected.storage_offset()
+    assert attrs['weight'].untyped_storage()._cdata == attrs['offset'].untyped_storage()._cdata
+
+
+@pytest.mark.parametrize('primary,legacy,expected', [
+    (None, None, 8), (None, '3', 3), ('4', '3', 4), ('4', 'invalid', 4),
+    ('invalid', '3', None), (None, 'invalid', None),
+])
+def test_attr_save_workers_environment_precedence(monkeypatch, primary, legacy, expected):
+    import nnscaler.flags
+
+    for name, value in [('ATTR_SAVE_WORKERS', primary), ('NNSCALER_WEIGHT_SAVE_WORKERS', legacy)]:
+        if value is None:
+            monkeypatch.delenv(name, raising=False)
+        else:
+            monkeypatch.setenv(name, value)
+    if expected is None:
+        with pytest.raises(ValueError):
+            runpy.run_path(nnscaler.flags.__file__)
+    else:
+        assert runpy.run_path(nnscaler.flags.__file__)['CompileFlag'].attr_save_workers == expected
 
 
 @pytest.mark.parametrize('option', ['params_per_file', 'bytes_per_file'])
