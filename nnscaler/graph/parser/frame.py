@@ -167,21 +167,16 @@ class Frame:
     def save_attr_content(
         self,
         save_file_stem: str,
-        params_per_file: Optional[int] = None,
+        params_per_file: int = 1024 * 1024 * 1024,
         max_workers: Optional[int] = None,
-        *,
-        bytes_per_file: Optional[int] = None,
     ):
         """
         Save attribute content into file.
 
         Args:
             save_file_stem (str): stem file name. Actual file name will be `save_file_stem`.0, `save_file_stem`.1, etc.
-            params_per_file (Optional[int]): legacy target element count per file.
-                Cannot be combined with bytes_per_file.
-            bytes_per_file (Optional[int]): target tensor storage bytes per file,
-                default 2 GiB when params_per_file is not specified. Shared-storage
-                tensors stay together; an oversized storage is saved intact.
+            params_per_file (int): target element count per file, default 1024**3.
+                Tensors are saved whole; an oversized tensor occupies one file.
             max_workers (Optional[int]): maximum queued/running shard saves. Defaults to
                 CompileFlag.attr_save_workers (ATTR_SAVE_WORKERS, default 8). Use 1 for serial saves.
 
@@ -196,11 +191,8 @@ class Frame:
             max_workers = CompileFlag.attr_save_workers
         if isinstance(max_workers, bool) or not isinstance(max_workers, int) or max_workers < 1:
             raise ValueError(f'attr save max_workers (ATTR_SAVE_WORKERS) must be a positive integer, got {max_workers!r}')
-        if params_per_file is not None and bytes_per_file is not None:
-            raise ValueError('Specify only one of params_per_file and bytes_per_file')
-        for name, value in (('params_per_file', params_per_file), ('bytes_per_file', bytes_per_file)):
-            if value is not None and (isinstance(value, bool) or not isinstance(value, int) or value < 1):
-                raise ValueError(f'{name} must be a positive integer')
+        if isinstance(params_per_file, bool) or not isinstance(params_per_file, int) or params_per_file < 1:
+            raise ValueError('params_per_file must be a positive integer')
 
         tid2value, cpu_storages = {}, {}
         for tensor, (_, value) in self._attr_map.items():
@@ -218,27 +210,14 @@ class Frame:
                     host = host._neg_view()
                 value = host.requires_grad_(value.requires_grad)
             tid2value[tensor.tid] = value
-        if params_per_file is not None:
-            groups = [([tid], value.numel()) for tid, value in tid2value.items()]
-            limit = params_per_file
-        else:
-            # torch.save writes whole storages, including unused portions of a
-            # view. Group aliases before packing, preserving offsets/strides and
-            # avoiding writing their shared storage in multiple shards.
-            storages = {}
-            for tid, value in tid2value.items():
-                storage = value.untyped_storage()
-                group, _ = storages.setdefault(storage._cdata, ([], storage.nbytes()))
-                group.append(tid)
-            groups = storages.values()
-            limit = bytes_per_file if bytes_per_file is not None else 2 * 1024**3
         chunks, chunk, size = [], [], 0
-        for tids, nbytes in groups:
-            if chunk and size + nbytes > limit:
+        for tid, value in tid2value.items():
+            numel = value.numel()
+            if chunk and size + numel > params_per_file:
                 chunks.append(chunk)
                 chunk, size = [], 0
-            chunk.extend(tids)
-            size += nbytes
+            chunk.append(tid)
+            size += numel
         if chunk or not chunks:
             chunks.append(chunk)
 

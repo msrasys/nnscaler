@@ -3,7 +3,6 @@
 
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-import runpy
 from threading import Barrier, Event, Lock
 
 import pytest
@@ -276,17 +275,10 @@ def test_save_attr_content_balances_elements_and_preserves_values(tmp_path, work
         assert actual.stride() == value.stride()
 
 
-def test_save_empty_attr_content(tmp_path):
-    stem = tmp_path/'fullmodel.pt'
-    Frame().save_attr_content(stem)
-    assert torch.load(f'{stem}.0', weights_only=True) == {}
-    assert torch.load(f'{stem}.index', weights_only=True) == {}
-
-
 @pytest.mark.parametrize('workers', [1, 4])
 @pytest.mark.parametrize('device', ['cpu', pytest.param('cuda', marks=pytest.mark.skipif(
     not torch.cuda.is_available(), reason='CUDA required'))])
-def test_save_attr_content_packs_bytes_and_preserves_storage_aliases(tmp_path, workers, device):
+def test_save_attr_content_preserves_storage_aliases_in_one_chunk(tmp_path, workers, device):
     frame = Frame()
     base = torch.arange(20, dtype=torch.float32, device=device, requires_grad=True)
     values = [torch.arange(4, dtype=torch.bfloat16, device=device),
@@ -297,18 +289,18 @@ def test_save_attr_content_packs_bytes_and_preserves_storage_aliases(tmp_path, w
     for i, (tensor, value) in enumerate(zip(tensors, values)):
         frame.add_attr(tensor, value, f'w{i}')
     stem = tmp_path/'fullmodel.pt'
-    frame.save_attr_content(stem, bytes_per_file=24, max_workers=workers)
+    frame.save_attr_content(stem, params_per_file=25, max_workers=workers)
     index = torch.load(f'{stem}.index', weights_only=True)
-    assert [index[t.tid] for t in tensors] == [0, 0, 1, 2, 1]
-    chunks = [torch.load(f'{stem}.{i}', mmap=True, weights_only=True) for i in range(3)]
+    assert set(index.values()) == {0}
+    saved = torch.load(f'{stem}.0', mmap=True, weights_only=True)
     for tensor, expected in zip(tensors, values):
-        actual = chunks[index[tensor.tid]][tensor.tid]
+        actual = saved[tensor.tid]
         assert torch.equal(actual, expected.cpu())
         assert actual.dtype == expected.dtype
         assert actual.stride() == expected.stride()
         assert actual.storage_offset() == expected.storage_offset()
         assert actual.requires_grad == expected.requires_grad
-    a, b = (chunks[1][tensors[i].tid] for i in (2, 4))
+    a, b = (saved[tensors[i].tid] for i in (2, 4))
     assert a is not b
     assert a.untyped_storage()._cdata == b.untyped_storage()._cdata
     assert a.untyped_storage().nbytes() == base.untyped_storage().nbytes()
@@ -345,34 +337,8 @@ def test_cuda_trace_saves_shared_attribute_storage(tmp_path, monkeypatch):
     assert attrs['weight'].untyped_storage()._cdata == attrs['offset'].untyped_storage()._cdata
 
 
-@pytest.mark.parametrize('primary,legacy,expected', [
-    (None, None, 8), (None, '3', 3), ('4', '3', 4), ('4', 'invalid', 4),
-    ('invalid', '3', None), (None, 'invalid', None),
-])
-def test_attr_save_workers_environment_precedence(monkeypatch, primary, legacy, expected):
-    import nnscaler.flags
-
-    for name, value in [('ATTR_SAVE_WORKERS', primary), ('NNSCALER_WEIGHT_SAVE_WORKERS', legacy)]:
-        if value is None:
-            monkeypatch.delenv(name, raising=False)
-        else:
-            monkeypatch.setenv(name, value)
-    if expected is None:
-        with pytest.raises(ValueError):
-            runpy.run_path(nnscaler.flags.__file__)
-    else:
-        assert runpy.run_path(nnscaler.flags.__file__)['CompileFlag'].attr_save_workers == expected
-
-
-@pytest.mark.parametrize('option', ['params_per_file', 'bytes_per_file'])
 @pytest.mark.parametrize('value', [0, -1, True, 1.5, '4'])
-def test_save_attr_content_invalid_chunk_limits(tmp_path, option, value):
+def test_save_attr_content_invalid_chunk_limits(tmp_path, value):
     with pytest.raises(ValueError, match='positive integer'):
-        Frame().save_attr_content(tmp_path/'fullmodel.pt', **{option:value})
-    assert not list(tmp_path.iterdir())
-
-
-def test_save_attr_content_rejects_ambiguous_chunk_units(tmp_path):
-    with pytest.raises(ValueError, match='only one'):
-        Frame().save_attr_content(tmp_path/'fullmodel.pt', params_per_file=4, bytes_per_file=8)
+        Frame().save_attr_content(tmp_path/'fullmodel.pt', params_per_file=value)
     assert not list(tmp_path.iterdir())

@@ -935,18 +935,16 @@ time.
 Compilation saves initial weights to `fullmodel.pt.0`, `fullmodel.pt.1`, etc.
 Set the environment variable `ATTR_SAVE_WORKERS` before starting Python to
 control concurrent shard writes (a positive integer, default `8`). Set it to
-`1` for serial saving. The older `NNSCALER_WEIGHT_SAVE_WORKERS` variable is a
-fallback when `ATTR_SAVE_WORKERS` is unset. This setting is independent of `codegen_workers`,
+`1` for serial saving. This setting is independent of `codegen_workers`,
 which controls per-rank code generation.
 
 At most `ATTR_SAVE_WORKERS` shard writes are queued or running at once.
 Writer threads share the CPU tensors prepared by the parser without copying
 the model into worker processes; the complete CPU tensor set still resides in
-memory. Files target 2 GiB of tensor storage, counting shared storage once and
-keeping its views together. A storage larger than the target occupies one file;
-tensors are never split. File groupings may change, but tensor values and the
-index/loading format remain unchanged. Explicit `params_per_file` calls retain
-element-count units; `bytes_per_file` selects a different byte target.
+memory. Files are grouped by cumulative tensor element count
+(`params_per_file`, default `1024**3`). Tensors are never split; a tensor larger
+than the target occupies one file. File groupings may change, but tensor values
+and the index/loading format remain unchanged.
 Each file is written to a temporary file in the destination directory and
 renamed into place. The old index is removed before rewriting shards, and
 `fullmodel.pt.index` is published only after all writes succeed. If saving

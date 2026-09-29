@@ -35,7 +35,7 @@ class CompileFlag:
     # how to execute the functions during trace, available choices ['cpu', 'cuda', 'meta', 'cuda_run_cpu_offload', 'reuse_cache']
     trace_strategy = os.environ.get('TRACE_STRATEGY', default='cuda_run_cpu_offload')
     # Maximum concurrent initial-weight shard writes during parsing. Use 1 for serial saves.
-    attr_save_workers = _to_int('ATTR_SAVE_WORKERS', default=os.environ.get('NNSCALER_WEIGHT_SAVE_WORKERS', 8))
+    attr_save_workers = _to_int('ATTR_SAVE_WORKERS', default=8)
     # reduce scatter adapter can reduce the communication cost, and improve the performance
     # but sometimes it may cause communication bugs, so we provide an option to enable/disable it
     disable_reduce_scatter_adapter = _to_bool('DISABLE_REDUCE_SCATTER_ADAPTER', False)
