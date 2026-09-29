@@ -19,7 +19,7 @@ from .parallel import (
     trimmed_broadcast_merged_state_dict,
     load_merged_state_dict_from_rank,
 )
-from nnscaler.graph.parser.register import register_op
+from nnscaler.graph.parser.register import register_op, update_op
 from nnscaler.runtime.function.function import (
     anchor,
     constant_folding,

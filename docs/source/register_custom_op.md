@@ -166,6 +166,31 @@ def allreduce_linear(x: torch.Tensor, weight: torch.Tensor):
     return out
 ```
 
+### Fake Function for a Built-in Operator
+
+Use `update_op` when an operator is already supported by nnScaler but needs
+updated optional metadata such as a lightweight implementation for tracing:
+
+```python
+def fake_add(x, y, *, alpha=1):
+    return x
+
+nnscaler.update_op(torch.add, fake_fn=fake_add)
+```
+
+`update_op` can also override `op_create_fn`, `code`, `emit_fn`, and
+`input_gen_fn`. For a system-defined operator, `op_create_fn` defaults to its
+existing `SignFx2Op` mapping with the operator signature bound, and `code`
+defaults to an empty string. Empty code definitions are not emitted into
+generated modules.
+
+`update_op` requires the runtime callable to already exist in `CustomizedOps`
+or `SignFx2Op`. Its signature is resolved from those registries. Use
+`register_op` to add an unknown operator.
+
+The fake function is only executed during tracing. The traced graph and
+generated code continue to use the original operator.
+
 ### When You Don't Need `fake_fn`
 
 If your function can run normally during tracing (e.g., it only uses standard PyTorch ops), you don't need `fake_fn` — just omit it:

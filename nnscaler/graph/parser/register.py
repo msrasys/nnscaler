@@ -40,6 +40,8 @@ class CustomizedOps:
     # It accepts the IRFwOperation as input and returns the list of input tensors, which is used
     # during operator profiling.
     kOpInputGen: Dict[str, Callable[[IRFwOperation], List[torch.Tensor]]] = {}
+    # runtime function -> signature
+    kOpSigs: dict[Callable, str] = {}
 
     @staticmethod
     def map(signature: str) -> Callable:
@@ -59,6 +61,14 @@ class CustomizedOps:
     def exist(signature: str) -> bool:
         """Check if the signature is registered"""
         return signature in CustomizedOps.kOpMap
+
+    @staticmethod
+    def get_fake_runtime(runtime_fn: Callable) -> Optional[Callable]:
+        """Get the fake runtime registered for an exact runtime callable."""
+        sig = CustomizedOps.kOpSigs.get(runtime_fn)
+        if sig is not None:
+            return CustomizedOps.kOpFakeRuntime.get(sig)
+        return None
 
     @staticmethod
     def register(
@@ -95,6 +105,7 @@ class CustomizedOps:
         assert signature not in CustomizedOps.kOpMap, f"function {signature} is already registered"
         CustomizedOps.kOpMap[signature] = op_create_fn
         CustomizedOps.kOpRuntime[signature] = runtime_fn
+        CustomizedOps.kOpSigs[runtime_fn] = signature
         CustomizedOps.kOpFakeRuntime[signature] = fake_fn
         CustomizedOps.kOpCodeDef[signature] = code
         if emit_fn is not None:
@@ -315,3 +326,80 @@ def register_op(annotation: Union[str, Callable], name: Optional[str] = None,
 # [Deprecated] register_op alias
 # Will remove in future.
 register = register_op
+no_change = object()
+
+
+def update_op(
+    runtime_fn: Callable,
+    *,
+    op_create_fn: Optional[Callable] = no_change,
+    code: Optional[str] = no_change,
+    emit_fn: Callable[[IRFwOperation, List[str], Dict[str, str], int, int, int], str] = no_change,
+    input_gen_fn: Callable[[IRFwOperation], List[torch.Tensor]] = no_change,
+    fake_fn: Optional[Callable] = no_change,
+) -> Callable:
+    """Update optional metadata for an existing operator.
+
+    Unspecified metadata keeps using the existing customized or system-defined
+    value.
+    """
+    if not callable(runtime_fn):
+        raise TypeError("Expected a runtime function")
+    if fake_fn is not no_change and fake_fn is not None and not callable(fake_fn):
+        raise TypeError("Expected a fake function")
+    if op_create_fn is not no_change and op_create_fn is not None and not callable(op_create_fn):
+        raise TypeError("Expected an op creation function")
+    if code is not no_change and code is not None and not isinstance(code, str):
+        raise TypeError("Expected code to be a string")
+    if emit_fn is not no_change and emit_fn is not None and not callable(emit_fn):
+        raise TypeError("Expected an emit function")
+    if input_gen_fn is not no_change and input_gen_fn is not None and not callable(input_gen_fn):
+        raise TypeError("Expected an input generator function")
+    if fake_fn is not no_change and fake_fn is not None and is_autograd_op(runtime_fn):
+        raise ValueError("Autograd function cannot have fake runtime function. "
+                         "Please wrap the autograd function and register the wrapper function instead.")
+
+    from nnscaler.graph.parser.mapping import SignFx2Op
+
+    signature = SignFx2Op.rmap(runtime_fn)
+    if signature is None:
+        raise ValueError(f"{runtime_fn} is not an existing operator")
+
+    system_op_create_fn = None
+    if signature in SignFx2Op.kOpMap:
+        system_op_create_fn = partial(SignFx2Op.kOpMap[signature], signature=signature)
+
+    # Materialize system defaults so an updated built-in has the same complete
+    # CustomizedOps entry as an operator registered through register_op.
+    if signature not in CustomizedOps.kOpMap:
+        CustomizedOps.kOpMap[signature] = system_op_create_fn
+        CustomizedOps.kOpCodeDef[signature] = ''
+        CustomizedOps.kOpFakeRuntime[signature] = None
+
+    CustomizedOps.kOpRuntime[signature] = runtime_fn
+
+    if op_create_fn is not no_change:
+        if op_create_fn is None:
+            if system_op_create_fn is None:
+                raise ValueError(f"{runtime_fn} has no system-defined op creation function")
+            CustomizedOps.kOpMap[signature] = system_op_create_fn
+        else:
+            CustomizedOps.kOpMap[signature] = op_create_fn
+
+    if code is not no_change:
+        CustomizedOps.kOpCodeDef[signature] = code or ''
+    if fake_fn is not no_change:
+        CustomizedOps.kOpFakeRuntime[signature] = fake_fn
+
+    if emit_fn is not no_change:
+        if emit_fn is None:
+            CustomizedOps.kOpEmit.pop(signature, None)
+        else:
+            CustomizedOps.kOpEmit[signature] = emit_fn
+    if input_gen_fn is not no_change:
+        if input_gen_fn is None:
+            CustomizedOps.kOpInputGen.pop(signature, None)
+        else:
+            CustomizedOps.kOpInputGen[signature] = input_gen_fn
+
+    return runtime_fn

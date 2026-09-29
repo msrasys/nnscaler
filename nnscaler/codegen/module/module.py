@@ -140,6 +140,8 @@ class ModuleCodeGen(FuncEmission):
 
         # customized op code
         for op_impl in set(CustomizedOps.kOpCodeDef.values()):
+            if not op_impl:
+                continue
             # self.init_code.append('@torch.jit.script')
             self.init_code.append(op_impl)
             self.init_code += ['']

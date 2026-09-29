@@ -256,14 +256,26 @@ class ConcreteTracer(TracerBase):
 
             args_unwrapped = pytree_utils.tree_map_only(ep.ConcreteProxy, unwrap_nested_proxy, args)
             kwargs_unwrapped = pytree_utils.tree_map_only(ep.ConcreteProxy, unwrap_nested_proxy, kwargs)
+            runtime_target = None
+            if kind == 'call_method' and args_unwrapped:
+                from nnscaler.graph.parser.register import CustomizedOps
+
+                runtime_fn = getattr(type(args_unwrapped[0]), target, None)
+                runtime_target = CustomizedOps.get_fake_runtime(runtime_fn)
             # A lot of autograd functions are using torch.compile
             # We must revert the patcher to the original function so torch.compile can work.
             # (For non-torch.compile functions, this is not necessary, but it is safe to do so.)
-            if self.need_revert(target) or wrap_utils.is_autograd_apply(target):
+            target_to_run = runtime_target if runtime_target is not None else target
+            kind_to_run = 'call_function' if runtime_target is not None else kind
+            if self.need_revert(target_to_run) or wrap_utils.is_autograd_apply(target_to_run):
                 with self.patcher.revert():
-                    value_unwrapped, args_run, kwargs_run = self.strategy.run_target(kind, target, args_unwrapped, kwargs_unwrapped)
+                    value_unwrapped, args_run, kwargs_run = self.strategy.run_target(
+                        kind_to_run, target_to_run, args_unwrapped, kwargs_unwrapped
+                    )
             else:
-                value_unwrapped, args_run, kwargs_run = self.strategy.run_target(kind, target, args_unwrapped, kwargs_unwrapped)
+                value_unwrapped, args_run, kwargs_run = self.strategy.run_target(
+                    kind_to_run, target_to_run, args_unwrapped, kwargs_unwrapped
+                )
 
             # because setitem is an inplace operation and will not return the obj, so here is a workaound to record node result
             node_result = args_run[0] if kind == "call_function" and target == orig_func.setitem else value_unwrapped
@@ -666,7 +678,7 @@ class ConcreteTracer(TracerBase):
         autowrap_leaf_class = autowrap_leaf_class if autowrap_leaf_class is not None else {}
         operator_patch_backlist = operator_patch_backlist if operator_patch_backlist is not None else []
 
-        self.autowrap_leaf_function = {**autowrap_leaf_function, **wrap_utils.default_autowrap_leaf_function}
+        self.autowrap_leaf_function = {**wrap_utils.default_autowrap_leaf_function, **autowrap_leaf_function}
         self.autowrap_leaf_class = {**autowrap_leaf_class, **wrap_utils.default_autowrap_leaf_class}
         if isinstance(root, torch.nn.Module):
             self.root = root

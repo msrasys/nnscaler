@@ -2,13 +2,15 @@
 #  Licensed under the MIT License.
 
 import nnscaler
-from nnscaler.graph.parser.converter import convert_model
+from nnscaler.graph.parser.converter import convert_model, to_fx_graph
 from nnscaler.profiler.database import get_func
 from nnscaler.codegen.emit import FuncEmission
 from nnscaler.graph.function.dimops import DimopSplit, TransformRule
+from nnscaler.graph.parser.mapping import SignFx2Op
 from nnscaler.graph.parser.register import CustomizedOps
 import tempfile
 import torch
+import pytest
 
 from ...utils import replace_all_device_with
 
@@ -309,3 +311,143 @@ def test_register_fake_fn():
         for node, p_name in zip(ir_graph.nodes(), ['linear', 'linear', 'add_xy']):
             profile_name = get_func(node)[0].__qualname__
             assert profile_name == p_name, f'{profile_name} should be {p_name}'
+
+
+class BuiltinFunctionFakeFnModel(torch.nn.Module):
+    def forward(self, x, y):
+        return torch.add(x, y)
+
+
+def _remove_updated_op(signature):
+    for registry in (
+        CustomizedOps.kOpMap,
+        CustomizedOps.kOpRuntime,
+        CustomizedOps.kOpFakeRuntime,
+        CustomizedOps.kOpCodeDef,
+        CustomizedOps.kOpEmit,
+        CustomizedOps.kOpInputGen,
+    ):
+        registry.pop(signature, None)
+
+
+def test_update_builtin_function_fake_fn():
+    calls = []
+
+    def fake_add(x, y):
+        calls.append((x, y))
+        return x
+
+    nnscaler.update_op(torch.add, fake_fn=fake_add)
+    try:
+        op_create_fn = CustomizedOps.kOpMap['torch.add']
+        assert op_create_fn.func is SignFx2Op.kOpMap['torch.add']
+        assert op_create_fn.keywords == {'signature': 'torch.add'}
+        assert CustomizedOps.kOpCodeDef['torch.add'] == ''
+        assert CustomizedOps.kOpRuntime['torch.add'] is torch.add
+        traced = to_fx_graph(
+            BuiltinFunctionFakeFnModel(),
+            {'x': torch.rand(10, 10), 'y': torch.rand(10, 10)},
+        )
+    finally:
+        _remove_updated_op('torch.add')
+
+    node = next(node for node in traced.graph.nodes if node.op == 'call_function')
+    assert len(calls) == 1
+    assert node.target is torch.add
+
+
+def test_update_op_preserves_existing_fields():
+    def fake_add(x, y):
+        return x
+
+    def emit_add(*args, **kwargs):
+        return 'updated_add'
+
+    def generate_inputs(node):
+        return []
+
+    def create_add(*args, signature=None, **kwargs):
+        return None
+
+    nnscaler.update_op(torch.add, fake_fn=fake_add)
+    nnscaler.update_op(
+        torch.add,
+        op_create_fn=create_add,
+        code='def updated_add(): pass',
+        emit_fn=emit_add,
+        input_gen_fn=generate_inputs,
+    )
+    try:
+        assert CustomizedOps.kOpMap['torch.add'] is create_add
+        assert CustomizedOps.kOpRuntime['torch.add'] is torch.add
+        assert CustomizedOps.kOpFakeRuntime['torch.add'] is fake_add
+        assert CustomizedOps.kOpCodeDef['torch.add'] == 'def updated_add(): pass'
+        assert CustomizedOps.kOpEmit['torch.add'] is emit_add
+        assert CustomizedOps.kOpInputGen['torch.add'] is generate_inputs
+        assert SignFx2Op.map('torch.add').func is create_add
+    finally:
+        _remove_updated_op('torch.add')
+
+
+def test_update_op_clears_optional_fields():
+    def fake_add(x, y):
+        return x
+
+    def emit_add(*args, **kwargs):
+        return 'updated_add'
+
+    def generate_inputs(node):
+        return []
+
+    nnscaler.update_op(
+        torch.add,
+        code='def updated_add(): pass',
+        fake_fn=fake_add,
+        emit_fn=emit_add,
+        input_gen_fn=generate_inputs,
+    )
+    nnscaler.update_op(
+        torch.add,
+        code=None,
+        fake_fn=None,
+        emit_fn=None,
+        input_gen_fn=None,
+    )
+    try:
+        assert CustomizedOps.kOpCodeDef['torch.add'] == ''
+        assert CustomizedOps.kOpFakeRuntime['torch.add'] is None
+        assert 'torch.add' not in CustomizedOps.kOpEmit
+        assert 'torch.add' not in CustomizedOps.kOpInputGen
+    finally:
+        _remove_updated_op('torch.add')
+
+
+def test_update_customized_op_by_runtime_fn():
+    signature = 'tests.graph.parser.test_register.add_xy'
+    original_fake_fn = CustomizedOps.kOpFakeRuntime[signature]
+
+    def updated_fake_add(x, y):
+        return y
+
+    nnscaler.update_op(add_xy, fake_fn=updated_fake_add)
+    try:
+        assert CustomizedOps.kOpRuntime[signature] is add_xy
+        assert CustomizedOps.kOpFakeRuntime[signature] is updated_fake_add
+    finally:
+        CustomizedOps.kOpFakeRuntime[signature] = original_fake_fn
+
+
+def unregistered_op(x):
+    return x
+
+
+def test_update_rejects_unregistered_op():
+    def create_unregistered_op(*args, signature=None, **kwargs):
+        return None
+
+    with pytest.raises(ValueError, match='is not an existing operator'):
+        nnscaler.update_op(
+            unregistered_op,
+            op_create_fn=create_unregistered_op,
+            code='def unregistered_op(x): return x',
+        )

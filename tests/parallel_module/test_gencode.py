@@ -17,6 +17,7 @@ from nnscaler.flags import CompileFlag
 import nnscaler.graph.function.dimops
 from nnscaler.graph.function.pyfunc import IRPyFunc
 from nnscaler.graph.parser.mapping import SignFx2Op
+from nnscaler.graph.parser.register import CustomizedOps
 from nnscaler.ir.cten import IR, IRObject
 from nnscaler.parallel import _load_parallel_module_class, parallelize, ComputeConfig, CubeModule, _gen_graph
 from nnscaler.utils import mark_dynamic
@@ -2419,3 +2420,38 @@ def test_fake_fn(tmp_path):
     #     add_xy_23 = tests.parallel_module.test_gencode.add_xy(linear_26, linear_1_27)
     #     del linear_26, linear_1_27
     #     return add_xy_23
+
+
+class BuiltinFakeFnModel(torch.nn.Module):
+    def forward(self, x, y):
+        return torch.add(x, y)
+
+
+@replace_all_device_with('cpu')
+def test_update_builtin_fake_fn(tmp_path):
+    def fake_add(x, y):
+        return x
+
+    nnscaler.update_op(torch.add, fake_fn=fake_add)
+    try:
+        parallelize(
+            BuiltinFakeFnModel(),
+            {'x': torch.randn(10, 10), 'y': torch.randn(10, 10)},
+            'dp',
+            ComputeConfig(1, 2),
+            gen_savedir=tmp_path,
+            load_module=False,
+            reuse='override',
+        )
+    finally:
+        for registry in (
+            CustomizedOps.kOpMap,
+            CustomizedOps.kOpRuntime,
+            CustomizedOps.kOpFakeRuntime,
+            CustomizedOps.kOpCodeDef,
+            CustomizedOps.kOpEmit,
+            CustomizedOps.kOpInputGen,
+        ):
+            registry.pop('torch.add', None)
+
+    assert _gencode_contains(tmp_path, BuiltinFakeFnModel, 0, 'torch.add')
