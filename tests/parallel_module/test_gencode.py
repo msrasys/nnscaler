@@ -2427,9 +2427,24 @@ class BuiltinFakeFnModel(torch.nn.Module):
         return torch.add(x, y)
 
 
+def _remove_updated_torch_add():
+    for registry in (
+        CustomizedOps.kOpMap,
+        CustomizedOps.kOpRuntime,
+        CustomizedOps.kOpFakeRuntime,
+        CustomizedOps.kOpCodeDef,
+        CustomizedOps.kOpEmit,
+        CustomizedOps.kOpInputGen,
+    ):
+        registry.pop('torch.add', None)
+
+
 @replace_all_device_with('cpu')
 def test_update_builtin_fake_fn(tmp_path):
+    calls = []
+
     def fake_add(x, y):
+        calls.append((x, y))
         return x
 
     nnscaler.update_op(torch.add, fake_fn=fake_add)
@@ -2444,14 +2459,79 @@ def test_update_builtin_fake_fn(tmp_path):
             reuse='override',
         )
     finally:
-        for registry in (
-            CustomizedOps.kOpMap,
-            CustomizedOps.kOpRuntime,
-            CustomizedOps.kOpFakeRuntime,
-            CustomizedOps.kOpCodeDef,
-            CustomizedOps.kOpEmit,
-            CustomizedOps.kOpInputGen,
-        ):
-            registry.pop('torch.add', None)
+        _remove_updated_torch_add()
 
+    assert len(calls) == 1
     assert _gencode_contains(tmp_path, BuiltinFakeFnModel, 0, 'torch.add')
+    assert not _gencode_contains(tmp_path, BuiltinFakeFnModel, 0, 'fake_add')
+
+
+@replace_all_device_with('cpu')
+def test_update_builtin_op_create_fn(tmp_path):
+    def create_sub(*args, signature=None, **kwargs):
+        return SignFx2Op.kOpMap['torch.sub'](*args, signature='torch.sub', **kwargs)
+
+    nnscaler.update_op(torch.add, op_create_fn=create_sub)
+    try:
+        parallelize(
+            BuiltinFakeFnModel(),
+            {'x': torch.randn(10, 10), 'y': torch.randn(10, 10)},
+            'dp',
+            ComputeConfig(1, 2),
+            gen_savedir=tmp_path,
+            load_module=False,
+            reuse='override',
+        )
+    finally:
+        _remove_updated_torch_add()
+
+    assert _gencode_contains(tmp_path, BuiltinFakeFnModel, 0, r'torch\.sub\(')
+
+
+@replace_all_device_with('cpu')
+def test_update_builtin_emit_fn(tmp_path):
+    def emit_sub(node, args, kwargs, runtime_devid, plan_ndevs, runtime_ndevs):
+        operands = list(args) + [f'{key}={value}' for key, value in kwargs.items()]
+        return f"torch.sub({', '.join(operands)})"
+
+    nnscaler.update_op(torch.add, emit_fn=emit_sub)
+    try:
+        parallelize(
+            BuiltinFakeFnModel(),
+            {'x': torch.randn(10, 10), 'y': torch.randn(10, 10)},
+            'dp',
+            ComputeConfig(1, 2),
+            gen_savedir=tmp_path,
+            load_module=False,
+            reuse='override',
+        )
+    finally:
+        _remove_updated_torch_add()
+
+    assert _gencode_contains(tmp_path, BuiltinFakeFnModel, 0, r'torch\.sub\(')
+
+
+@replace_all_device_with('cpu')
+def test_update_builtin_code(tmp_path):
+    code = 'def updated_add_runtime(x, y):\n    return torch.add(x, y)'
+
+    nnscaler.update_op(torch.add, code=code)
+    try:
+        parallelize(
+            BuiltinFakeFnModel(),
+            {'x': torch.randn(10, 10), 'y': torch.randn(10, 10)},
+            'dp',
+            ComputeConfig(1, 2),
+            gen_savedir=tmp_path,
+            load_module=False,
+            reuse='override',
+        )
+    finally:
+        _remove_updated_torch_add()
+
+    assert _gencode_contains(
+        tmp_path,
+        BuiltinFakeFnModel,
+        0,
+        r'def updated_add_runtime\(x, y\):\n    return torch\.add\(x, y\)',
+    )

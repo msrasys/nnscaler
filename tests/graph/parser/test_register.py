@@ -2,12 +2,13 @@
 #  Licensed under the MIT License.
 
 import nnscaler
-from nnscaler.graph.parser.converter import convert_model, to_fx_graph
-from nnscaler.profiler.database import get_func
+from nnscaler.graph.parser.converter import convert_model, to_fx_graph, to_ir_graph
+from nnscaler.profiler.database import get_func, profile
 from nnscaler.codegen.emit import FuncEmission
 from nnscaler.graph.function.dimops import DimopSplit, TransformRule
 from nnscaler.graph.parser.mapping import SignFx2Op
 from nnscaler.graph.parser.register import CustomizedOps
+from nnscaler.utils import get_full_qualified_name
 import tempfile
 import torch
 import pytest
@@ -40,7 +41,11 @@ class MockAGF(torch.autograd.Function):
     def backward(ctx, grad):
         return grad, grad
 
-nnscaler.register_op('*, * -> *')(MockAGF.apply)
+nnscaler.register_op('*, * -> *')(MockAGF)
+
+
+def test_autograd_class_registration_uses_apply_name():
+    assert CustomizedOps.kOpRuntime[get_full_qualified_name(MockAGF)] == MockAGF.apply
 
 
 class MockModel(torch.nn.Module):
@@ -328,6 +333,11 @@ class BuiltinMethodFakeFnModel(torch.nn.Module):
         return x.add(y)
 
 
+class BuiltinInplaceMethodFakeFnModel(torch.nn.Module):
+    def forward(self, x, y):
+        return x.add_(y)
+
+
 def _remove_updated_op(signature):
     for registry in (
         CustomizedOps.kOpMap,
@@ -349,11 +359,10 @@ def test_update_builtin_function_fake_fn():
 
     nnscaler.update_op(torch.add, fake_fn=fake_add)
     try:
-        op_create_fn = CustomizedOps.kOpMap['torch.add']
-        assert op_create_fn.func is SignFx2Op.kOpMap['torch.add']
-        assert op_create_fn.keywords == {'signature': 'torch.add'}
-        assert CustomizedOps.kOpCodeDef['torch.add'] == ''
+        assert 'torch.add' not in CustomizedOps.kOpMap
+        assert 'torch.add' not in CustomizedOps.kOpCodeDef
         assert CustomizedOps.kOpRuntime['torch.add'] is torch.add
+        assert CustomizedOps.kOpFakeRuntime['torch.add'] is fake_add
         traced = to_fx_graph(
             BuiltinFunctionFakeFnModel(),
             {'x': torch.rand(10, 10), 'y': torch.rand(10, 10)},
@@ -380,7 +389,7 @@ def test_update_builtin_descriptor_fake_fn():
             {'x': torch.rand(10, 10), 'y': torch.rand(10, 10)},
         )
     finally:
-        _remove_updated_op('torch.add')
+        _remove_updated_op('torch.Tensor.add')
 
     node = next(node for node in traced.graph.nodes if node.op == 'call_method')
     assert len(calls) == 1
@@ -401,11 +410,35 @@ def test_update_builtin_method_fake_fn():
             {'x': torch.rand(10, 10), 'y': torch.rand(10, 10)},
         )
     finally:
-        _remove_updated_op('torch.add')
+        _remove_updated_op('torch.Tensor.add')
 
     node = next(node for node in traced.graph.nodes if node.op == 'call_method')
     assert len(calls) == 1
     assert node.target == 'add'
+
+
+def test_update_builtin_inplace_method_fake_fn():
+    calls = []
+
+    def fake_add_(x, y):
+        calls.append((x, y))
+        return x
+
+    nnscaler.update_op(torch.Tensor.add_, fake_fn=fake_add_)
+    try:
+        dummy_input = {'x': torch.rand(10, 10), 'y': torch.rand(10, 10)}
+        original_x = dummy_input['x'].clone()
+        traced = to_fx_graph(BuiltinInplaceMethodFakeFnModel(), dummy_input)
+        with tempfile.TemporaryDirectory() as tempdir:
+            ir_graph = to_ir_graph(traced, dummy_input, tempdir, constant_folding=False)
+    finally:
+        _remove_updated_op('torch.Tensor.add_')
+
+    node = next(node for node in traced.graph.nodes if node.op == 'call_method')
+    assert len(calls) == 1
+    assert torch.equal(dummy_input['x'], original_x)
+    assert node.target == 'add_'
+    assert ir_graph.nodes()[-1].signature == 'torch.Tensor.add_'
 
 
 def test_update_op_preserves_existing_fields():
@@ -466,12 +499,41 @@ def test_update_op_clears_optional_fields():
         input_gen_fn=None,
     )
     try:
-        assert CustomizedOps.kOpCodeDef['torch.add'] == ''
-        assert CustomizedOps.kOpFakeRuntime['torch.add'] is None
+        assert 'torch.add' not in CustomizedOps.kOpCodeDef
+        assert 'torch.add' not in CustomizedOps.kOpFakeRuntime
         assert 'torch.add' not in CustomizedOps.kOpEmit
         assert 'torch.add' not in CustomizedOps.kOpInputGen
     finally:
         _remove_updated_op('torch.add')
+
+
+def test_update_builtin_input_gen_fn_used_by_profiler():
+    class InputGenCalled(Exception):
+        pass
+
+    calls = []
+
+    def generate_inputs(node):
+        calls.append(node)
+        raise InputGenCalled
+
+    nnscaler.update_op(torch.add, input_gen_fn=generate_inputs)
+    try:
+        with tempfile.TemporaryDirectory() as tempdir:
+            ir_graph = convert_model(
+                BuiltinFunctionFakeFnModel(),
+                {'x': torch.rand(10, 10), 'y': torch.rand(10, 10)},
+                tempdir,
+                False,
+            )
+        node = ir_graph.nodes()[0]
+        func, shapes, dtypes, requires_grads, values, kwargs = get_func(node)
+        with pytest.raises(InputGenCalled):
+            profile(node, func, shapes, dtypes, requires_grads, values, **kwargs)
+    finally:
+        _remove_updated_op('torch.add')
+
+    assert calls == [node]
 
 
 def test_update_customized_op_by_runtime_fn():
@@ -493,13 +555,20 @@ def unregistered_op(x):
     return x
 
 
-def test_update_rejects_unregistered_op():
+def test_update_unregistered_op_metadata():
     def create_unregistered_op(*args, signature=None, **kwargs):
         return None
 
-    with pytest.raises(ValueError, match='is not an existing operator'):
+    signature = get_full_qualified_name(unregistered_op)
+    try:
         nnscaler.update_op(
             unregistered_op,
             op_create_fn=create_unregistered_op,
             code='def unregistered_op(x): return x',
         )
+        assert CustomizedOps.kOpMap[signature] is create_unregistered_op
+        assert CustomizedOps.kOpCodeDef[signature] == 'def unregistered_op(x): return x'
+        assert CustomizedOps.kOpRuntime[signature] is unregistered_op
+        assert signature not in CustomizedOps.kOpFakeRuntime
+    finally:
+        _remove_updated_op(signature)

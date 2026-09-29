@@ -3,25 +3,13 @@
 
 from typing import Callable, Tuple, Union
 from functools import partial
-from itertools import chain
 
 import nnscaler.graph.function as function
 from nnscaler.ir.operator import IRFwOperation
 from nnscaler.graph.parser.register import CustomizedOps
-from nnscaler.utils import load_type, select_many
 
 
 class SignFx2Op:
-    def rmap(runtime_fn: Callable) -> str:
-        """
-        Get the operator signature corresponding to the given runtime function.
-        """
-        if runtime_fn in CustomizedOps.kOpSigs:
-            return CustomizedOps.kOpSigs[runtime_fn]
-        if runtime_fn in SignFx2Op.kOpSigs:
-            return SignFx2Op.kOpSigs[runtime_fn]
-        return None
-
     @staticmethod
     def map(signature: str) -> Callable[..., Union[IRFwOperation, int, float]]:
         """
@@ -286,42 +274,3 @@ class SignFx2Op:
         __tttemplate('split'): function.Split,
         __ttemplate('topk'): function.Topk,
     }
-
-    @staticmethod
-    def _alt_sigs(signature: str) -> list[str]:
-        # get alternative signature mapping for torch.Tensor and torch functions.
-        if signature.startswith('torch.Tensor.'):
-            return ['torch.' + signature[len('torch.Tensor.'):]]
-        elif signature.startswith('torch.'):
-            return ['torch.Tensor.' + signature[len('torch.'):]]
-        else:
-            return []
-
-    @staticmethod
-    def _op_sigs() -> dict[Callable, str]:
-        """Get the registered signature for each loadable runtime callable."""
-        sigs: dict[Callable, str] = {}
-
-        # Iterate over both the original and alternative signatures.
-        # original signatures will override alternative signatures if both exist.
-        for signature in SignFx2Op.kOpMap:
-            for alt_sig in SignFx2Op._alt_sigs(signature):
-                try:
-                    runtime_fn = load_type(alt_sig)
-                    sigs[runtime_fn] = signature
-                except RuntimeError:
-                    continue
-
-        for signature in SignFx2Op.kOpMap:
-            try:
-                runtime_fn = load_type(signature)
-            except RuntimeError:
-                # Some mappings target version-specific PyTorch symbols.
-                continue
-            sigs[runtime_fn] = signature
-        return sigs
-
-    kOpSigs: dict[Callable, str] = {}
-
-
-SignFx2Op.kOpSigs = SignFx2Op._op_sigs()

@@ -83,13 +83,12 @@ def to_fx_graph(model: torch.nn.Module, dummy_input) -> torch.fx.GraphModule:
     # torch function/operators/builtins/... are automatically handled as leaf functions by concrete trace
     # filter out torch.autograd.Function.apply as concrete trace already treats them as leaf function
     leaf_functions = {
-        CustomizedOps.kOpRuntime[sign]: LeafWrapInfo(
-            [], True, CustomizedOps.kOpFakeRuntime[sign],
+        runtime_fn: LeafWrapInfo(
+            [], True, CustomizedOps.kOpFakeRuntime.get(signature),
             replace_traced_code=False,
         )
-        for sign in CustomizedOps.kOpMap
-        if CustomizedOps.kOpRuntime[sign]
-        and not is_autograd_apply(CustomizedOps.kOpRuntime[sign])
+        for signature, runtime_fn in CustomizedOps.kOpRuntime.items()
+        if not is_autograd_apply(runtime_fn)
     }
 
     # importlib functions

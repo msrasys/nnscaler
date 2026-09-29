@@ -179,14 +179,15 @@ nnscaler.update_op(torch.add, fake_fn=fake_add)
 ```
 
 `update_op` can also override `op_create_fn`, `code`, `emit_fn`, and
-`input_gen_fn`. For a system-defined operator, `op_create_fn` defaults to its
-existing `SignFx2Op` mapping with the operator signature bound, and `code`
-defaults to an empty string. Empty code definitions are not emitted into
-generated modules.
+`input_gen_fn`. The runtime callable is always recorded, while each optional
+field is independent: unspecified fields keep their existing customized or
+system-defined behavior and are not materialized in `CustomizedOps`. Pass
+`None` to remove an existing override.
 
-`update_op` requires the runtime callable to already exist in `CustomizedOps`
-or `SignFx2Op`. Its signature is resolved from those registries. Use
-`register_op` to add an unknown operator.
+The signature is derived from the runtime callable. `update_op` can attach
+metadata to an operator that is not yet registered, but such an operator still
+needs an `op_create_fn` before the parser can create its IR node. Use
+`register_op` when registering all metadata for a new operator at once.
 
 The fake function is only executed during tracing. The traced graph and
 generated code continue to use the original operator.

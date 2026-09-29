@@ -16,6 +16,7 @@ from torch import ScriptFunction
 from nnscaler.graph.function.dimops import IRDimops, OpAnno, TransformRule
 from nnscaler.graph.tracer.wrap_utils import is_autograd_apply, is_autograd_op
 from nnscaler.ir.operator import IRTensor, IRFwOperation
+from nnscaler.utils import get_full_qualified_name
 
 _logger = logging.getLogger(__name__)
 
@@ -40,9 +41,6 @@ class CustomizedOps:
     # It accepts the IRFwOperation as input and returns the list of input tensors, which is used
     # during operator profiling.
     kOpInputGen: Dict[str, Callable[[IRFwOperation], List[torch.Tensor]]] = {}
-    # runtime function -> signature
-    kOpSigs: dict[Callable, str] = {}
-
     @staticmethod
     def map(signature: str) -> Callable:
         """Get IRDimop creation function by signature
@@ -61,14 +59,6 @@ class CustomizedOps:
     def exist(signature: str) -> bool:
         """Check if the signature is registered"""
         return signature in CustomizedOps.kOpMap
-
-    @staticmethod
-    def get_fake_runtime(runtime_fn: Callable) -> Optional[Callable]:
-        """Get the fake runtime registered for an exact runtime callable."""
-        sig = CustomizedOps.kOpSigs.get(runtime_fn)
-        if sig is not None:
-            return CustomizedOps.kOpFakeRuntime.get(sig)
-        return None
 
     @staticmethod
     def register(
@@ -105,7 +95,6 @@ class CustomizedOps:
         assert signature not in CustomizedOps.kOpMap, f"function {signature} is already registered"
         CustomizedOps.kOpMap[signature] = op_create_fn
         CustomizedOps.kOpRuntime[signature] = runtime_fn
-        CustomizedOps.kOpSigs[runtime_fn] = signature
         CustomizedOps.kOpFakeRuntime[signature] = fake_fn
         CustomizedOps.kOpCodeDef[signature] = code
         if emit_fn is not None:
@@ -359,43 +348,33 @@ def update_op(
         raise ValueError("Autograd function cannot have fake runtime function. "
                          "Please wrap the autograd function and register the wrapper function instead.")
 
-    from nnscaler.graph.parser.mapping import SignFx2Op
-
-    signature = SignFx2Op.rmap(runtime_fn)
-    if signature is None:
-        raise ValueError(f"{runtime_fn} is not an existing operator")
-
-    system_op_create_fn = None
-    if signature in SignFx2Op.kOpMap:
-        system_op_create_fn = partial(SignFx2Op.kOpMap[signature], signature=signature)
-
-    # Materialize system defaults so an updated built-in has the same complete
-    # CustomizedOps entry as an operator registered through register_op.
-    if signature not in CustomizedOps.kOpMap:
-        CustomizedOps.kOpMap[signature] = system_op_create_fn
-        CustomizedOps.kOpCodeDef[signature] = ''
-        CustomizedOps.kOpFakeRuntime[signature] = None
-
+    signature = get_full_qualified_name(runtime_fn)
     CustomizedOps.kOpRuntime[signature] = runtime_fn
 
     if op_create_fn is not no_change:
         if op_create_fn is None:
-            if system_op_create_fn is None:
-                raise ValueError(f"{runtime_fn} has no system-defined op creation function")
-            CustomizedOps.kOpMap[signature] = system_op_create_fn
+            CustomizedOps.kOpMap.pop(signature, None)
         else:
             CustomizedOps.kOpMap[signature] = op_create_fn
 
     if code is not no_change:
-        CustomizedOps.kOpCodeDef[signature] = code or ''
+        if code is None:
+            CustomizedOps.kOpCodeDef.pop(signature, None)
+        else:
+            CustomizedOps.kOpCodeDef[signature] = code
+
     if fake_fn is not no_change:
-        CustomizedOps.kOpFakeRuntime[signature] = fake_fn
+        if fake_fn is None:
+            CustomizedOps.kOpFakeRuntime.pop(signature, None)
+        else:
+            CustomizedOps.kOpFakeRuntime[signature] = fake_fn
 
     if emit_fn is not no_change:
         if emit_fn is None:
             CustomizedOps.kOpEmit.pop(signature, None)
         else:
             CustomizedOps.kOpEmit[signature] = emit_fn
+
     if input_gen_fn is not no_change:
         if input_gen_fn is None:
             CustomizedOps.kOpInputGen.pop(signature, None)
