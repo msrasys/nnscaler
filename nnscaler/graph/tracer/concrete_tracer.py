@@ -261,9 +261,11 @@ class ConcreteTracer(TracerBase):
                 wrap_info = self.autowrap_leaf_function.get(node_target)
                 if (wrap_info is not None and wrap_info.fake_fn_on_cpu
                         and self.strategy.main_device == 'cpu'):
-                    # Only explicitly CPU-capable fakes bypass device placement.
-                    # Other fakes retain the selected strategy's execution path.
-                    return target(*args_unwrapped, **kwargs_unwrapped), args_unwrapped, kwargs_unwrapped
+                    # Module.cpu() does not move unregistered tensor attributes.
+                    # Place all fake inputs on CPU without a CUDA round trip.
+                    return self.strategy._run_call_function_on(
+                        target, args_unwrapped, kwargs_unwrapped, device='cpu',
+                    )
                 return self.strategy.run_target(kind, target, args_unwrapped, kwargs_unwrapped)
 
             # A lot of autograd functions are using torch.compile

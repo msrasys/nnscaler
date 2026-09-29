@@ -364,3 +364,32 @@ def test_fake_device_opt_in_preserves_metadata_and_runtime_operator(tmp_path, st
 def test_cpu_fake_opt_in_requires_a_fake():
     with pytest.raises(ValueError, match='requires fake_fn'):
         nnscaler.register_op('a b, a b -> a b', fake_fn_on_cpu=True)(mock_add)
+
+
+@nnscaler.register_op('a b, a b -> a b', fake_fn=mock_add, fake_fn_on_cpu=True)
+def real_mixed_device_add(x, y):
+    raise AssertionError('runtime kernel must not run during tracing')
+
+
+class MixedDeviceFakeModel(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        # Ordinary tensor attributes are not moved by Module.cpu().
+        self.extra = torch.ones(4, 8, device='cuda', dtype=torch.bfloat16, requires_grad=True)
+
+    def forward(self, x):
+        return real_mixed_device_add(x, y=self.extra)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason='CUDA required')
+@pytest.mark.parametrize('strategy', ['cpu', 'cuda_run_cpu_offload', 'reuse_cache'])
+def test_cpu_fake_moves_unregistered_cuda_tensor(tmp_path, strategy):
+    with patch.object(CompileFlag, 'trace_strategy', strategy):
+        graph = convert_model(
+            MixedDeviceFakeModel(), {'x': torch.ones(4, 8, dtype=torch.bfloat16)}, tmp_path, False,
+        )
+    node = graph.nodes()[0]
+    assert get_func(node)[0] is real_mixed_device_add
+    assert node.output(0).shape == (4, 8)
+    assert node.output(0).dtype == torch.bfloat16
+    assert node.output(0).requires_grad
