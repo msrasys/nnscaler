@@ -944,9 +944,12 @@ class IRAdapterGener:
                         [cobjs[_index_by_device(pi, fctensors)] for pi in prim.outputs()]
                     )
                 elif isinstance(prim, BroadcastPrim):
+                    source = pobjs[_index_by_device(prim.input(0), fptensors)]
+                    # The source participates in the broadcast even when it is not a consumer.
                     return ObjectBroadcastPrim(
-                        [pobjs[_index_by_device(pi, fptensors)] for pi in prim.inputs()],
-                        [cobjs[_index_by_device(pi, fctensors)] for pi in prim.outputs()]
+                        [source],
+                        [source if pi.device == source.device else cobjs[_index_by_device(pi, fctensors)]
+                         for pi in prim.outputs()]
                     )
                 else:
                     raise ValueError(f"Not support for prim other than MovePrim and BroadcastPrim for non-tensor objects.\n"
