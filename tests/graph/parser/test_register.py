@@ -419,6 +419,7 @@ def test_get_torch_op_aliases_does_not_match_functional_by_name():
     assert 'torch.nn.functional.relu' not in _get_torch_op_aliases(torch.relu)
 
 
+@replace_all_device_with('cpu')
 def test_functional_fake_fn_does_not_override_same_name_torch_op():
     calls = []
 
