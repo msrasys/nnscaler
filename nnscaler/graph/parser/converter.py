@@ -5,7 +5,6 @@ from typing import Any, Dict, Union
 import logging
 from pathlib import Path
 import operator
-from types import MethodDescriptorType
 import warnings
 
 from nnscaler.ir.tensor import IRFullTensor
@@ -91,7 +90,6 @@ def to_fx_graph(model: torch.nn.Module, dummy_input) -> torch.fx.GraphModule:
         for sign in CustomizedOps.kOpMap
         if CustomizedOps.kOpRuntime[sign]
         and not is_autograd_apply(CustomizedOps.kOpRuntime[sign])
-        and not isinstance(CustomizedOps.kOpRuntime[sign], MethodDescriptorType)
     }
 
     # importlib functions

@@ -318,6 +318,16 @@ class BuiltinFunctionFakeFnModel(torch.nn.Module):
         return torch.add(x, y)
 
 
+class BuiltinDescriptorFakeFnModel(torch.nn.Module):
+    def forward(self, x, y):
+        return torch.Tensor.add(x, y)
+
+
+class BuiltinMethodFakeFnModel(torch.nn.Module):
+    def forward(self, x, y):
+        return x.add(y)
+
+
 def _remove_updated_op(signature):
     for registry in (
         CustomizedOps.kOpMap,
@@ -354,6 +364,48 @@ def test_update_builtin_function_fake_fn():
     node = next(node for node in traced.graph.nodes if node.op == 'call_function')
     assert len(calls) == 1
     assert node.target is torch.add
+
+
+def test_update_builtin_descriptor_fake_fn():
+    calls = []
+
+    def fake_add(x, y):
+        calls.append((x, y))
+        return x
+
+    nnscaler.update_op(torch.Tensor.add, fake_fn=fake_add)
+    try:
+        traced = to_fx_graph(
+            BuiltinDescriptorFakeFnModel(),
+            {'x': torch.rand(10, 10), 'y': torch.rand(10, 10)},
+        )
+    finally:
+        _remove_updated_op('torch.add')
+
+    node = next(node for node in traced.graph.nodes if node.op == 'call_method')
+    assert len(calls) == 1
+    assert node.target == 'add'
+
+
+def test_update_builtin_method_fake_fn():
+    calls = []
+
+    def fake_add(x, y):
+        calls.append((x, y))
+        return x
+
+    nnscaler.update_op(torch.Tensor.add, fake_fn=fake_add)
+    try:
+        traced = to_fx_graph(
+            BuiltinMethodFakeFnModel(),
+            {'x': torch.rand(10, 10), 'y': torch.rand(10, 10)},
+        )
+    finally:
+        _remove_updated_op('torch.add')
+
+    node = next(node for node in traced.graph.nodes if node.op == 'call_method')
+    assert len(calls) == 1
+    assert node.target == 'add'
 
 
 def test_update_op_preserves_existing_fields():

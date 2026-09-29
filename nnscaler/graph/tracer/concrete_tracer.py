@@ -96,6 +96,7 @@ class ConcreteTracer(TracerBase):
         self.strategy = TRACE_STRATEGY[strategy](self)
         self.record_frames = record_frames
         self.patcher = FunctionPatcher()
+        self.autowrap_leaf_function: Dict[Callable, wrap_utils.LeafWrapInfo] = {}
 
         # When we concrete executing some functions,
         # we need revert all the patched function to the unpatched version to ensure the correctness of some underlying code.
@@ -258,10 +259,10 @@ class ConcreteTracer(TracerBase):
             kwargs_unwrapped = pytree_utils.tree_map_only(ep.ConcreteProxy, unwrap_nested_proxy, kwargs)
             runtime_target = None
             if kind == 'call_method' and args_unwrapped:
-                from nnscaler.graph.parser.register import CustomizedOps
-
-                runtime_fn = getattr(type(args_unwrapped[0]), target, None)
-                runtime_target = CustomizedOps.get_fake_runtime(runtime_fn)
+                # The method may already be leaf-wrapped; unwrap it to match the original callable used as the leaf key.
+                runtime_fn = inspect.unwrap(getattr(type(args_unwrapped[0]), target, None))
+                leaf_info = self.autowrap_leaf_function.get(runtime_fn)
+                runtime_target = leaf_info.replacement if leaf_info is not None else None
             # A lot of autograd functions are using torch.compile
             # We must revert the patcher to the original function so torch.compile can work.
             # (For non-torch.compile functions, this is not necessary, but it is safe to do so.)
