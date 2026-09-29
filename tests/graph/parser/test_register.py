@@ -7,10 +7,11 @@ from nnscaler.profiler.database import get_func, profile
 from nnscaler.codegen.emit import FuncEmission
 from nnscaler.graph.function.dimops import DimopSplit, TransformRule
 from nnscaler.graph.parser.mapping import SignFx2Op
-from nnscaler.graph.parser.register import CustomizedOps
-from nnscaler.utils import get_full_qualified_name
+from nnscaler.graph.parser.register import CustomizedOps, _get_torch_op_aliases
+from nnscaler.utils import get_full_qualified_name, load_type
 import tempfile
 import torch
+import torch.nn.functional as F
 import pytest
 
 from ...utils import replace_all_device_with
@@ -341,15 +342,77 @@ class BuiltinInplaceMethodFakeFnModel(torch.nn.Module):
 
 
 def _remove_updated_op(signature):
-    for registry in (
-        CustomizedOps.kOpMap,
-        CustomizedOps.kOpRuntime,
-        CustomizedOps.kOpFakeRuntime,
-        CustomizedOps.kOpCodeDef,
-        CustomizedOps.kOpEmit,
-        CustomizedOps.kOpInputGen,
-    ):
-        registry.pop(signature, None)
+    for alias in _get_torch_op_aliases(signature):
+        for registry in (
+            CustomizedOps.kOpMap,
+            CustomizedOps.kOpRuntime,
+            CustomizedOps.kOpFakeRuntime,
+            CustomizedOps.kOpCodeDef,
+            CustomizedOps.kOpEmit,
+            CustomizedOps.kOpInputGen,
+        ):
+            registry.pop(alias, None)
+
+
+@pytest.mark.parametrize(
+    ('runtime_fn', 'expected'),
+    [
+        (
+            torch.add,
+            {
+                'torch.add',
+                'torch.Tensor.add',
+            },
+        ),
+        (
+            torch.Tensor.add_,
+            {
+                'torch.Tensor.add_',
+            },
+        ),
+        (
+            F.linear,
+            {'torch.nn.functional.linear', 'torch._C._nn.linear'},
+        ),
+        (
+            torch.relu,
+            {
+                'torch.relu',
+                'torch.Tensor.relu',
+                'torch.nn.functional.relu',
+            },
+        ),
+    ],
+)
+def test_get_torch_op_aliases_from_runtime(runtime_fn, expected):
+    aliases = _get_torch_op_aliases(runtime_fn)
+    assert expected.issubset(aliases)
+    assert len(aliases) == len(set(aliases))
+    for alias in aliases:
+        assert callable(load_type(alias))
+
+
+def test_get_torch_op_aliases_is_symmetric():
+    expected = set(_get_torch_op_aliases(torch.add))
+    assert 'torch.Tensor.add_' not in expected
+    assert not any(alias.startswith('_operator.') for alias in expected)
+    for runtime_fn in (torch.add, torch.Tensor.add):
+        assert set(_get_torch_op_aliases(runtime_fn)) == expected
+
+
+def test_get_torch_op_aliases_scans_runtime_namespaces(monkeypatch):
+    monkeypatch.setattr(torch, 'nnscaler_test_add_alias', torch.add, raising=False)
+    assert 'torch.nnscaler_test_add_alias' in _get_torch_op_aliases(torch.add)
+
+
+def test_get_torch_op_aliases_keeps_custom_op_independent():
+    signature = get_full_qualified_name(mock_add)
+    assert _get_torch_op_aliases(mock_add) == (signature,)
+    assert _get_torch_op_aliases(signature) == (signature,)
+
+
+def test_get_torch_op_aliases_does_not_flatten_nested_torch_namespaces():
+    assert _get_torch_op_aliases(torch.linalg.norm) == ('torch._C._linalg.linalg_norm',)
 
 
 def test_update_builtin_function_fake_fn():
@@ -465,6 +528,14 @@ def test_update_op_preserves_existing_fields():
         input_gen_fn=generate_inputs,
     )
     try:
+        aliases = _get_torch_op_aliases('torch.add')
+        for alias in aliases:
+            assert CustomizedOps.kOpMap[alias] is create_add
+            assert callable(CustomizedOps.kOpRuntime[alias])
+            assert CustomizedOps.kOpFakeRuntime[alias] is fake_add
+            assert CustomizedOps.kOpCodeDef[alias] == 'def updated_add(): pass'
+            assert CustomizedOps.kOpEmit[alias] is emit_add
+            assert CustomizedOps.kOpInputGen[alias] is generate_inputs
         assert CustomizedOps.kOpMap['torch.add'] is create_add
         assert CustomizedOps.kOpRuntime['torch.add'] is torch.add
         assert CustomizedOps.kOpFakeRuntime['torch.add'] is fake_add
@@ -486,8 +557,12 @@ def test_update_op_clears_optional_fields():
     def generate_inputs(node):
         return []
 
+    def create_add(*args, signature=None, **kwargs):
+        return None
+
     nnscaler.update_op(
         torch.add,
+        op_create_fn=create_add,
         code='def updated_add(): pass',
         fake_fn=fake_add,
         emit_fn=emit_add,
@@ -495,16 +570,19 @@ def test_update_op_clears_optional_fields():
     )
     nnscaler.update_op(
         torch.add,
+        op_create_fn=None,
         code=None,
         fake_fn=None,
         emit_fn=None,
         input_gen_fn=None,
     )
     try:
-        assert 'torch.add' not in CustomizedOps.kOpCodeDef
-        assert 'torch.add' not in CustomizedOps.kOpFakeRuntime
-        assert 'torch.add' not in CustomizedOps.kOpEmit
-        assert 'torch.add' not in CustomizedOps.kOpInputGen
+        aliases = _get_torch_op_aliases('torch.add')
+        assert all(alias not in CustomizedOps.kOpMap for alias in aliases)
+        assert all(alias not in CustomizedOps.kOpCodeDef for alias in aliases)
+        assert all(alias not in CustomizedOps.kOpFakeRuntime for alias in aliases)
+        assert all(alias not in CustomizedOps.kOpEmit for alias in aliases)
+        assert all(alias not in CustomizedOps.kOpInputGen for alias in aliases)
     finally:
         _remove_updated_op('torch.add')
 

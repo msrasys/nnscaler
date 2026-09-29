@@ -16,7 +16,7 @@ from torch import ScriptFunction
 from nnscaler.graph.function.dimops import IRDimops, OpAnno, TransformRule
 from nnscaler.graph.tracer.wrap_utils import is_autograd_apply, is_autograd_op
 from nnscaler.ir.operator import IRTensor, IRFwOperation
-from nnscaler.utils import get_full_qualified_name
+from nnscaler.utils import get_full_qualified_name, load_type
 
 _logger = logging.getLogger(__name__)
 
@@ -318,6 +318,64 @@ register = register_op
 no_change = object()
 
 
+_PUBLIC_NAMESPACES = (
+    ('torch', torch),
+    ('torch.Tensor', torch.Tensor),
+    ('torch.nn.functional', torch.nn.functional),
+)
+
+_RUNTIME_NAMESPACES = _PUBLIC_NAMESPACES + (
+    ('torch.functional', torch.functional),
+    ('torch._C._nn', torch._C._nn),
+)
+
+
+def _get_torch_op_aliases(runtime_fn: Union[str, Callable]) -> tuple[str, ...]:
+    """
+    Return runtime and same-name public aliases for a PyTorch operator.
+    Currently we don't take inplace operators into account (torch.Tensor.add_ for example).
+    And we also don't consider operator overloads (like __add__ for example).
+    """
+    if isinstance(runtime_fn, str):
+        signature = runtime_fn
+        try:
+            runtime_fn = load_type(signature)
+        except RuntimeError:
+            return (signature,)
+    else:
+        signature = get_full_qualified_name(runtime_fn)
+
+    if not signature.startswith('torch.'):
+        return (signature,)
+
+    aliases = [signature]
+    name = getattr(runtime_fn, '__name__', None)
+    module = getattr(runtime_fn, '__module__', None)
+    if name and module:
+        aliases.append(f'{module}.{name}')
+
+    # identity check
+    #  F.linear -> torch._C._nn.linear
+    for namespace_name, namespace in _RUNTIME_NAMESPACES:
+        aliases.extend(
+            f'{namespace_name}.{alias_name}'
+            for alias_name, value in vars(namespace).items()
+            if value is runtime_fn
+        )
+
+    # name check
+    # torch.relu -> F.relu
+    # note that they don't have to be the same object,
+    # just the same name in the public namespace
+    if name:
+        aliases.extend(
+            f'{namespace_name}.{name}'
+            for namespace_name, namespace in _PUBLIC_NAMESPACES
+            if callable(getattr(namespace, name, None))
+        )
+    return tuple(dict.fromkeys(aliases))
+
+
 def update_op(
     runtime_fn: Callable,
     *,
@@ -330,7 +388,7 @@ def update_op(
     """Update optional metadata for an existing operator.
 
     Unspecified metadata keeps using the existing customized or system-defined
-    value.
+    value. Updates are applied to every known alias of the runtime function.
     """
     if not callable(runtime_fn):
         raise TypeError("Expected a runtime function")
@@ -348,37 +406,41 @@ def update_op(
         raise ValueError("Autograd function cannot have fake runtime function. "
                          "Please wrap the autograd function and register the wrapper function instead.")
 
-    signature = get_full_qualified_name(runtime_fn)
-    CustomizedOps.kOpRuntime[signature] = runtime_fn
+    signatures = _get_torch_op_aliases(runtime_fn)
+    for alias in signatures:
+        try:
+            CustomizedOps.kOpRuntime[alias] = load_type(alias)
+        except RuntimeError:
+            CustomizedOps.kOpRuntime[alias] = runtime_fn
 
-    if op_create_fn is not no_change:
-        if op_create_fn is None:
-            CustomizedOps.kOpMap.pop(signature, None)
-        else:
-            CustomizedOps.kOpMap[signature] = op_create_fn
+        if op_create_fn is not no_change:
+            if op_create_fn is None:
+                CustomizedOps.kOpMap.pop(alias, None)
+            else:
+                CustomizedOps.kOpMap[alias] = op_create_fn
 
-    if code is not no_change:
-        if code is None:
-            CustomizedOps.kOpCodeDef.pop(signature, None)
-        else:
-            CustomizedOps.kOpCodeDef[signature] = code
+        if code is not no_change:
+            if code is None:
+                CustomizedOps.kOpCodeDef.pop(alias, None)
+            else:
+                CustomizedOps.kOpCodeDef[alias] = code
 
-    if fake_fn is not no_change:
-        if fake_fn is None:
-            CustomizedOps.kOpFakeRuntime.pop(signature, None)
-        else:
-            CustomizedOps.kOpFakeRuntime[signature] = fake_fn
+        if fake_fn is not no_change:
+            if fake_fn is None:
+                CustomizedOps.kOpFakeRuntime.pop(alias, None)
+            else:
+                CustomizedOps.kOpFakeRuntime[alias] = fake_fn
 
-    if emit_fn is not no_change:
-        if emit_fn is None:
-            CustomizedOps.kOpEmit.pop(signature, None)
-        else:
-            CustomizedOps.kOpEmit[signature] = emit_fn
+        if emit_fn is not no_change:
+            if emit_fn is None:
+                CustomizedOps.kOpEmit.pop(alias, None)
+            else:
+                CustomizedOps.kOpEmit[alias] = emit_fn
 
-    if input_gen_fn is not no_change:
-        if input_gen_fn is None:
-            CustomizedOps.kOpInputGen.pop(signature, None)
-        else:
-            CustomizedOps.kOpInputGen[signature] = input_gen_fn
+        if input_gen_fn is not no_change:
+            if input_gen_fn is None:
+                CustomizedOps.kOpInputGen.pop(alias, None)
+            else:
+                CustomizedOps.kOpInputGen[alias] = input_gen_fn
 
     return runtime_fn

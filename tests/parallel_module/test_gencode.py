@@ -17,7 +17,7 @@ from nnscaler.flags import CompileFlag
 import nnscaler.graph.function.dimops
 from nnscaler.graph.function.pyfunc import IRPyFunc
 from nnscaler.graph.parser.mapping import SignFx2Op
-from nnscaler.graph.parser.register import CustomizedOps
+from nnscaler.graph.parser.register import CustomizedOps, _get_torch_op_aliases
 from nnscaler.ir.cten import IR, IRObject
 from nnscaler.parallel import _load_parallel_module_class, parallelize, ComputeConfig, CubeModule, _gen_graph
 from nnscaler.utils import mark_dynamic
@@ -2432,16 +2432,27 @@ class BuiltinInplaceFakeEmitModel(torch.nn.Module):
         return x.add_(y)
 
 
-def _remove_updated_torch_add():
-    for registry in (
-        CustomizedOps.kOpMap,
-        CustomizedOps.kOpRuntime,
-        CustomizedOps.kOpFakeRuntime,
-        CustomizedOps.kOpCodeDef,
-        CustomizedOps.kOpEmit,
-        CustomizedOps.kOpInputGen,
-    ):
-        registry.pop('torch.add', None)
+class BuiltinTensorAddEmitModel(torch.nn.Module):
+    def forward(self, x, y):
+        return torch.Tensor.add(x, y)
+
+
+class BuiltinBoundAddEmitModel(torch.nn.Module):
+    def forward(self, x, y):
+        return x.add(y)
+
+
+def _remove_updated_torch_add(runtime_fn=torch.add):
+    for alias in _get_torch_op_aliases(runtime_fn):
+        for registry in (
+            CustomizedOps.kOpMap,
+            CustomizedOps.kOpRuntime,
+            CustomizedOps.kOpFakeRuntime,
+            CustomizedOps.kOpCodeDef,
+            CustomizedOps.kOpEmit,
+            CustomizedOps.kOpInputGen,
+        ):
+            registry.pop(alias, None)
 
 
 @replace_all_device_with('cpu')
@@ -2516,6 +2527,33 @@ def test_update_builtin_emit_fn(tmp_path):
     assert _gencode_contains(tmp_path, BuiltinFakeFnModel, 0, r'torch\.sub\(')
 
 
+@pytest.mark.parametrize(
+    'model_type',
+    [BuiltinFakeFnModel, BuiltinTensorAddEmitModel, BuiltinBoundAddEmitModel],
+)
+@replace_all_device_with('cpu')
+def test_update_tensor_add_emit_fn_alias(tmp_path, model_type):
+    def emit_sub(node, args, kwargs, runtime_devid, plan_ndevs, runtime_ndevs):
+        operands = list(args) + [f'{key}={value}' for key, value in kwargs.items()]
+        return f"torch.sub({', '.join(operands)})"
+
+    nnscaler.update_op(torch.Tensor.add, emit_fn=emit_sub)
+    try:
+        parallelize(
+            model_type(),
+            {'x': torch.randn(10, 10), 'y': torch.randn(10, 10)},
+            'dp',
+            ComputeConfig(1, 2),
+            gen_savedir=tmp_path,
+            load_module=False,
+            reuse='override',
+        )
+    finally:
+        _remove_updated_torch_add()
+
+    assert _gencode_contains(tmp_path, model_type, 0, r'torch\.sub\(')
+
+
 @replace_all_device_with('cpu')
 def test_update_builtin_code(tmp_path):
     code = 'def updated_add_runtime(x, y):\n    return torch.add(x, y)'
@@ -2565,15 +2603,7 @@ def test_update_builtin_inplace_fake_and_emit(tmp_path):
             reuse='override',
         )
     finally:
-        for registry in (
-            CustomizedOps.kOpMap,
-            CustomizedOps.kOpRuntime,
-            CustomizedOps.kOpFakeRuntime,
-            CustomizedOps.kOpCodeDef,
-            CustomizedOps.kOpEmit,
-            CustomizedOps.kOpInputGen,
-        ):
-            registry.pop('torch.Tensor.add_', None)
+        _remove_updated_torch_add(torch.Tensor.add_)
 
     torch.testing.assert_close(dummy_input['x'], original_x)
     assert _gencode_contains(
