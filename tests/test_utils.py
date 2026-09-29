@@ -153,6 +153,7 @@ def test_get_full_qualified_name_decorated(fn, qualname):
         (torch.Tensor.add, 'torch.Tensor.add'),
         (torch.Tensor.add_, 'torch.Tensor.add_'),
         (torch.Tensor.size, 'torch.Tensor.size'),
+        (torch.nn.functional.linear, 'torch.nn.functional.linear'),
         (torch.nn.functional.relu, 'torch.nn.functional.relu'),
         (QualifiedNameAutogradFunction, f'{__name__}.QualifiedNameAutogradFunction.apply'),
         (QualifiedNameAutogradFunction.apply, f'{__name__}.QualifiedNameAutogradFunction.apply'),

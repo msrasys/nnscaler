@@ -45,7 +45,9 @@ nnscaler.register_op('*, * -> *')(MockAGF)
 
 
 def test_autograd_class_registration_uses_apply_name():
-    assert CustomizedOps.kOpRuntime[get_full_qualified_name(MockAGF)] == MockAGF.apply
+    runtime_fn = CustomizedOps.kOpRuntime[get_full_qualified_name(MockAGF)]
+    assert runtime_fn.__self__ is MockAGF
+    assert runtime_fn.__name__ == 'apply'
 
 
 class MockModel(torch.nn.Module):

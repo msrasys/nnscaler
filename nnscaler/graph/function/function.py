@@ -2851,6 +2851,7 @@ def ScaledDotProductAttention(query, key, value, attn_mask=None, dropout_p=0.0,
 
     For a common attention, the generated anno is like (a e d^, a b^ d^, a b^ c -> a e c).
     """
+    signature = 'torch.nn.functional.scaled_dot_product_attention'
     if not isinstance(query, IRTensor) or not isinstance(key, IRTensor) or not isinstance(value, IRTensor):
         raise ValueError(f'query: {query}, key: {key}, value: {value} should be IRTensor, something went wrong.')
     gener = iter(string.ascii_lowercase)

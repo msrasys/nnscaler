@@ -762,6 +762,13 @@ def load_type(type_name: str):
 def get_full_qualified_name(fn: Callable, *, apply_autograd_function: bool = True) -> str:
     """
     Get the import-style fully qualified name of a callable.
+
+    Note: This function provides a standard way to obtain the fully qualified name of a callable,
+    There are other functions in this repo that may provide alternative ways to obtain fully qualified names,
+    When the results from this function differ from other methods,
+    this function's output should be considered the standard reference,
+    and other methods should be updated to align with this standard.
+
     Args:
         fn (Callable): The callable to get the fully qualified name for.
         apply_autograd_function (bool, optional): Whether to append `.apply` for autograd.Function subclasses. Defaults to True.
@@ -797,6 +804,9 @@ def get_full_qualified_name(fn: Callable, *, apply_autograd_function: bool = Tru
         return f'torch.Tensor.{name}'
     if name and getattr(torch, name, None) is fn:
         return f'torch.{name}'
+    # torch._C._nn.linear -> torch.nn.functional.linear
+    if name and getattr(torch.nn.functional, name, None) is fn:
+        return f'torch.nn.functional.{name}'
 
     # Python functions and methods normally provide both fields directly.
     module = getattr(fn, '__module__', None)

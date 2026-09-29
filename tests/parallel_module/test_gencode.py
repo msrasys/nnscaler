@@ -2427,6 +2427,11 @@ class BuiltinFakeFnModel(torch.nn.Module):
         return torch.add(x, y)
 
 
+class BuiltinInplaceFakeEmitModel(torch.nn.Module):
+    def forward(self, x, y):
+        return x.add_(y)
+
+
 def _remove_updated_torch_add():
     for registry in (
         CustomizedOps.kOpMap,
@@ -2535,3 +2540,43 @@ def test_update_builtin_code(tmp_path):
         0,
         r'def updated_add_runtime\(x, y\):\n    return torch\.add\(x, y\)',
     )
+
+
+@replace_all_device_with('cpu')
+def test_update_builtin_inplace_fake_and_emit(tmp_path):
+    def emit_add(node, args, kwargs, runtime_devid, plan_ndevs, runtime_ndevs):
+        operands = list(args) + [f'{key}={value}' for key, value in kwargs.items()]
+        return f"torch.add({', '.join(operands)})"
+
+    dummy_input = {
+        'x': torch.randn(10, 10),
+        'y': torch.randn(10, 10),
+    }
+    original_x = dummy_input['x'].clone()
+    nnscaler.update_op(torch.Tensor.add_, fake_fn=torch.add, emit_fn=emit_add)
+    try:
+        parallelize(
+            BuiltinInplaceFakeEmitModel(),
+            dummy_input,
+            'dp',
+            ComputeConfig(1, 2),
+            gen_savedir=tmp_path,
+            load_module=False,
+            reuse='override',
+        )
+    finally:
+        for registry in (
+            CustomizedOps.kOpMap,
+            CustomizedOps.kOpRuntime,
+            CustomizedOps.kOpFakeRuntime,
+            CustomizedOps.kOpCodeDef,
+            CustomizedOps.kOpEmit,
+            CustomizedOps.kOpInputGen,
+        ):
+            registry.pop('torch.Tensor.add_', None)
+
+    torch.testing.assert_close(dummy_input['x'], original_x)
+    assert _gencode_contains(
+        tmp_path, BuiltinInplaceFakeEmitModel, 0, r'torch\.add\(')
+    assert not _gencode_contains(
+        tmp_path, BuiltinInplaceFakeEmitModel, 0, r'torch\.Tensor\.add_\(')
