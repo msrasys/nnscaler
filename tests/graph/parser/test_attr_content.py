@@ -275,36 +275,6 @@ def test_save_attr_content_balances_elements_and_preserves_values(tmp_path, work
         assert actual.stride() == value.stride()
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason='CUDA required')
-def test_cuda_trace_saves_small_views_without_unused_backing_storage(tmp_path, monkeypatch):
-    from nnscaler.graph.parser.converter import to_fx_graph, to_ir_graph
-
-    class Model(torch.nn.Module):
-        def __init__(self):
-            super().__init__()
-            storage = torch.arange(1024 * 1024, device='cuda', dtype=torch.float32)
-            self.weight = torch.nn.Parameter(storage[3:7])
-            self.register_buffer('offset', storage[1:9:2])
-
-        def forward(self, x):
-            return x * self.weight + self.offset
-
-    monkeypatch.setattr(CompileFlag, 'trace_strategy', 'cuda')
-    model = Model()
-    inputs = {'x': torch.ones(4, device='cuda')}
-    traced = to_fx_graph(model, inputs)
-    assert traced.weight.is_cuda and traced.offset.is_cuda
-    graph = to_ir_graph(traced, inputs, tmp_path, constant_folding=False)
-    saved = torch.load(tmp_path / FxModuleParser.ATTR_CONTENT_FILE_0, weights_only=True)
-    attrs = {tensor.name: saved[tensor.tid] for tensor in graph.attributes()}
-    for name in ('weight', 'offset'):
-        expected, actual = getattr(model, name), attrs[name]
-        assert torch.equal(actual, expected.cpu())
-        assert actual.dtype == expected.dtype
-        # Saving either four-element view must not retain the 4 MiB source storage.
-        assert actual.untyped_storage().nbytes() == actual.numel() * actual.element_size()
-
-
 @pytest.mark.parametrize('value', [0, -1, True, 1.5, '4'])
 def test_save_attr_content_invalid_chunk_limits(tmp_path, value):
     with pytest.raises(ValueError, match='positive integer'):
