@@ -56,6 +56,38 @@ def pp_pas(graph, cfg, nlayers_per_stage=2):
 
 
 @replace_all_device_with('cpu')
+@pytest.mark.parametrize('num_microbatches', [1, 4])
+def test_gencode_zero_bubble(tmp_path, num_microbatches):
+    parallelize(
+        PPModule1(nlayers=4),
+        {'data': torch.randn(8, 1024)},
+        pas_policy=lambda graph, cfg: pp_pas(graph, cfg, nlayers_per_stage=1),
+        compute_config=ComputeConfig(4, 4, use_end2end=True, pas_config={
+            'pipeline_nmicros': num_microbatches,
+            'pipeline_nstages': 4,
+            'pipeline_scheduler': 'zero_bubble',
+        }),
+        gen_savedir=tmp_path,
+        load_module=False,
+        reuse='override',
+    )
+
+    for rank in range(4):
+        assert len(_gencode_contains(
+            tmp_path,
+            PPModule1,
+            rank,
+            r'nnscaler\.runtime\.executor\.backward_input\(',
+        )) == num_microbatches
+        assert len(_gencode_contains(
+            tmp_path,
+            PPModule1,
+            rank,
+            r'nnscaler\.runtime\.executor\.backward_weight\(',
+        )) == num_microbatches
+
+
+@replace_all_device_with('cpu')
 def test_gencode_correct_dataloader_order(tmp_path):
     m = PPModule1(return_type=3)
     m.train()
