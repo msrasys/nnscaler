@@ -166,6 +166,41 @@ def allreduce_linear(x: torch.Tensor, weight: torch.Tensor):
     return out
 ```
 
+### Fake Function for a Built-in Operator
+
+Use `update_op` when an operator is already supported by nnScaler but needs
+updated optional metadata such as a lightweight implementation for tracing:
+
+```python
+def fake_add(x, y, *, alpha=1):
+    return x
+
+nnscaler.update_op(torch.add, fake_fn=fake_add)
+```
+
+`update_op` can also override `op_create_fn`, `code`, `emit_fn`, and
+`input_gen_fn`. The runtime callable is always recorded, while each optional
+field is independent: unspecified fields keep their existing customized or
+system-defined behavior and are not materialized in `CustomizedOps`. Pass
+`None` to remove an existing override.
+
+Aliases discovered from the loaded PyTorch runtime share the same update.
+nnScaler includes paths that reference the same runtime callable and bridges
+same-name operators between `torch` and `torch.Tensor`. For example, updating
+either `torch.add` or `torch.Tensor.add` updates both signatures, so metadata
+still applies after parser method normalization. Different
+`torch.nn.functional` wrappers are not inferred from their names. In-place
+variants and `operator` functions are also not inferred as aliases. Custom
+operators are not expanded by these PyTorch-specific rules.
+
+The signature is derived from the runtime callable. `update_op` can attach
+metadata to an operator that is not yet registered, but such an operator still
+needs an `op_create_fn` before the parser can create its IR node. Use
+`register_op` when registering all metadata for a new operator at once.
+
+The fake function is only executed during tracing. The traced graph and
+generated code continue to use the original operator.
+
 ### When You Don't Need `fake_fn`
 
 If your function can run normally during tracing (e.g., it only uses standard PyTorch ops), you don't need `fake_fn` — just omit it:

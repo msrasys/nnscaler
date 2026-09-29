@@ -16,6 +16,7 @@ from torch import ScriptFunction
 from nnscaler.graph.function.dimops import IRDimops, OpAnno, TransformRule
 from nnscaler.graph.tracer.wrap_utils import is_autograd_apply, is_autograd_op
 from nnscaler.ir.operator import IRTensor, IRFwOperation
+from nnscaler.utils import get_full_qualified_name, load_type
 
 _logger = logging.getLogger(__name__)
 
@@ -40,7 +41,6 @@ class CustomizedOps:
     # It accepts the IRFwOperation as input and returns the list of input tensors, which is used
     # during operator profiling.
     kOpInputGen: Dict[str, Callable[[IRFwOperation], List[torch.Tensor]]] = {}
-
     @staticmethod
     def map(signature: str) -> Callable:
         """Get IRDimop creation function by signature
@@ -315,3 +315,124 @@ def register_op(annotation: Union[str, Callable], name: Optional[str] = None,
 # [Deprecated] register_op alias
 # Will remove in future.
 register = register_op
+no_change = object()
+
+
+_TORCH_TENSOR_NAMESPACES = (
+    ('torch', torch),
+    ('torch.Tensor', torch.Tensor),
+)
+
+_RUNTIME_NAMESPACES = _TORCH_TENSOR_NAMESPACES + (
+    ('torch.nn.functional', torch.nn.functional),
+    ('torch.functional', torch.functional),
+    ('torch._C._nn', torch._C._nn),
+)
+
+
+def _get_torch_op_aliases(runtime_fn: Union[str, Callable]) -> tuple[str, ...]:
+    """
+    Return runtime aliases and same-name torch/Tensor aliases for a PyTorch operator.
+    Currently we don't take inplace operators into account (torch.Tensor.add_ for example).
+    And we also don't consider operator overloads (like __add__ for example).
+    """
+    if isinstance(runtime_fn, str):
+        signature = runtime_fn
+        try:
+            runtime_fn = load_type(signature)
+        except RuntimeError:
+            return (signature,)
+    else:
+        signature = get_full_qualified_name(runtime_fn)
+
+    aliases = [signature]
+    for namespace_name, namespace in _RUNTIME_NAMESPACES:
+        aliases.extend(
+            f'{namespace_name}.{alias_name}'
+            for alias_name, value in vars(namespace).items()
+            if value is runtime_fn
+        )
+
+    name = getattr(runtime_fn, '__name__', None)
+    torch_tensor_alias = name and any(
+        getattr(namespace, name, None) is runtime_fn
+        for _, namespace in _TORCH_TENSOR_NAMESPACES
+    )
+    # torch.add and torch.Tensor.add are normalized to the same parser signature.
+    if torch_tensor_alias:
+        aliases.extend(
+            f'{namespace_name}.{name}'
+            for namespace_name, namespace in _TORCH_TENSOR_NAMESPACES
+            if callable(getattr(namespace, name, None))
+        )
+    return tuple(dict.fromkeys(aliases))
+
+
+def update_op(
+    runtime_fn: Callable,
+    *,
+    op_create_fn: Optional[Callable] = no_change,
+    code: Optional[str] = no_change,
+    emit_fn: Callable[[IRFwOperation, List[str], Dict[str, str], int, int, int], str] = no_change,
+    input_gen_fn: Callable[[IRFwOperation], List[torch.Tensor]] = no_change,
+    fake_fn: Optional[Callable] = no_change,
+) -> Callable:
+    """Update optional metadata for an existing operator.
+
+    Unspecified metadata keeps using the existing customized or system-defined
+    value. Updates are applied to every known alias of the runtime function.
+    """
+    if not callable(runtime_fn):
+        raise TypeError("Expected a runtime function")
+    if fake_fn is not no_change and fake_fn is not None and not callable(fake_fn):
+        raise TypeError("Expected a fake function")
+    if op_create_fn is not no_change and op_create_fn is not None and not callable(op_create_fn):
+        raise TypeError("Expected an op creation function")
+    if code is not no_change and code is not None and not isinstance(code, str):
+        raise TypeError("Expected code to be a string")
+    if emit_fn is not no_change and emit_fn is not None and not callable(emit_fn):
+        raise TypeError("Expected an emit function")
+    if input_gen_fn is not no_change and input_gen_fn is not None and not callable(input_gen_fn):
+        raise TypeError("Expected an input generator function")
+    if fake_fn is not no_change and fake_fn is not None and is_autograd_op(runtime_fn):
+        raise ValueError("Autograd function cannot have fake runtime function. "
+                         "Please wrap the autograd function and register the wrapper function instead.")
+
+    signatures = _get_torch_op_aliases(runtime_fn)
+    for alias in signatures:
+        try:
+            CustomizedOps.kOpRuntime[alias] = load_type(alias)
+        except RuntimeError:
+            CustomizedOps.kOpRuntime[alias] = runtime_fn
+
+        if op_create_fn is not no_change:
+            if op_create_fn is None:
+                CustomizedOps.kOpMap.pop(alias, None)
+            else:
+                CustomizedOps.kOpMap[alias] = op_create_fn
+
+        if code is not no_change:
+            if code is None:
+                CustomizedOps.kOpCodeDef.pop(alias, None)
+            else:
+                CustomizedOps.kOpCodeDef[alias] = code
+
+        if fake_fn is not no_change:
+            if fake_fn is None:
+                CustomizedOps.kOpFakeRuntime.pop(alias, None)
+            else:
+                CustomizedOps.kOpFakeRuntime[alias] = fake_fn
+
+        if emit_fn is not no_change:
+            if emit_fn is None:
+                CustomizedOps.kOpEmit.pop(alias, None)
+            else:
+                CustomizedOps.kOpEmit[alias] = emit_fn
+
+        if input_gen_fn is not no_change:
+            if input_gen_fn is None:
+                CustomizedOps.kOpInputGen.pop(alias, None)
+            else:
+                CustomizedOps.kOpInputGen[alias] = input_gen_fn
+
+    return runtime_fn

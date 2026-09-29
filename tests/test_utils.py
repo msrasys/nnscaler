@@ -3,14 +3,181 @@
 
 from collections import OrderedDict
 from dataclasses import dataclass
+import functools
 import sys
 import pytest
 import torch
 
 from nnscaler.utils import (
-    select_many, classproperty, fields, set_member_by_name, unchecked_fields,
+    select_many, classproperty, fields, get_full_qualified_name, set_member_by_name, unchecked_fields,
     transform_recursively, first, first_or, StepwiseConfig, recursion_limit,
 )
+
+
+def qualified_module_function():
+    pass
+
+
+class QualifiedNameFixture:
+    def member(self):
+        pass
+
+    @staticmethod
+    def static_method():
+        pass
+
+    @classmethod
+    def class_method(cls):
+        pass
+
+    class Nested:
+        def member(self):
+            pass
+
+        @staticmethod
+        def static_method():
+            pass
+
+        @classmethod
+        def class_method(cls):
+            pass
+
+
+def wraps_decorator(fn):
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        return fn(*args, **kwargs)
+
+    return wrapper
+
+
+def wrapped_protocol_decorator(fn):
+    def wrapper(*args, **kwargs):
+        return fn(*args, **kwargs)
+
+    wrapper.__wrapped__ = fn
+    return wrapper
+
+
+def opaque_decorator(fn):
+    def wrapper(*args, **kwargs):
+        return fn(*args, **kwargs)
+
+    return wrapper
+
+
+@wraps_decorator
+def wraps_decorated_function():
+    pass
+
+
+@wrapped_protocol_decorator
+def wrapped_protocol_function():
+    pass
+
+
+class DecoratedQualifiedNameFixture:
+    @wraps_decorator
+    def member(self):
+        pass
+
+    @staticmethod
+    @wraps_decorator
+    def static_method():
+        pass
+
+    @classmethod
+    @wraps_decorator
+    def class_method(cls):
+        pass
+
+
+class QualifiedNameAutogradFunction(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x):
+        return x
+
+
+@torch.jit.script
+def qualified_script_function(x: torch.Tensor):
+    return x
+
+
+@pytest.mark.parametrize(
+    ('fn', 'qualname'),
+    [
+        (qualified_module_function, 'qualified_module_function'),
+        (QualifiedNameFixture.member, 'QualifiedNameFixture.member'),
+        (QualifiedNameFixture().member, 'QualifiedNameFixture.member'),
+        (QualifiedNameFixture.static_method, 'QualifiedNameFixture.static_method'),
+        (QualifiedNameFixture.class_method, 'QualifiedNameFixture.class_method'),
+        (QualifiedNameFixture.Nested.member, 'QualifiedNameFixture.Nested.member'),
+        (QualifiedNameFixture.Nested().member, 'QualifiedNameFixture.Nested.member'),
+        (QualifiedNameFixture.Nested.static_method, 'QualifiedNameFixture.Nested.static_method'),
+        (QualifiedNameFixture.Nested.class_method, 'QualifiedNameFixture.Nested.class_method'),
+    ],
+)
+def test_get_full_qualified_name(fn, qualname):
+    assert get_full_qualified_name(fn) == f'{__name__}.{qualname}'
+
+
+def test_get_full_qualified_name_descriptor_objects():
+    assert get_full_qualified_name(QualifiedNameFixture.__dict__['static_method']) == \
+        f'{__name__}.QualifiedNameFixture.static_method'
+    assert get_full_qualified_name(QualifiedNameFixture.__dict__['class_method']) == \
+        f'{__name__}.QualifiedNameFixture.class_method'
+    assert get_full_qualified_name(str.upper) == 'builtins.str.upper'
+    assert get_full_qualified_name(dict.fromkeys) == 'builtins.dict.fromkeys'
+
+
+@pytest.mark.parametrize(
+    ('fn', 'qualname'),
+    [
+        (wraps_decorated_function, 'wraps_decorated_function'),
+        (wrapped_protocol_function, 'wrapped_protocol_function'),
+        (DecoratedQualifiedNameFixture.member, 'DecoratedQualifiedNameFixture.member'),
+        (DecoratedQualifiedNameFixture().member, 'DecoratedQualifiedNameFixture.member'),
+        (DecoratedQualifiedNameFixture.static_method, 'DecoratedQualifiedNameFixture.static_method'),
+        (DecoratedQualifiedNameFixture.class_method, 'DecoratedQualifiedNameFixture.class_method'),
+    ],
+)
+def test_get_full_qualified_name_decorated(fn, qualname):
+    assert get_full_qualified_name(fn) == f'{__name__}.{qualname}'
+
+
+@pytest.mark.parametrize(
+    ('fn', 'qualified_name'),
+    [
+        (torch.add, 'torch.add'),
+        (torch.Tensor.add, 'torch.Tensor.add'),
+        (torch.Tensor.add_, 'torch.Tensor.add_'),
+        (torch.Tensor.size, 'torch.Tensor.size'),
+        (torch.nn.functional.linear, 'torch.nn.functional.linear'),
+        (torch.nn.functional.relu, 'torch.nn.functional.relu'),
+        (QualifiedNameAutogradFunction, f'{__name__}.QualifiedNameAutogradFunction.apply'),
+        (QualifiedNameAutogradFunction.apply, f'{__name__}.QualifiedNameAutogradFunction.apply'),
+        (qualified_script_function, f'{__name__}.qualified_script_function'),
+    ],
+)
+def test_get_full_qualified_name_torch(fn, qualified_name):
+    assert get_full_qualified_name(fn) == qualified_name
+
+
+def test_get_full_qualified_name_rejects_local_function():
+    def local_function():
+        pass
+
+    with pytest.raises(ValueError, match='not defined at an importable'):
+        get_full_qualified_name(local_function)
+
+
+def test_get_full_qualified_name_rejects_opaque_decorator():
+    @opaque_decorator
+    def decorated_function():
+        pass
+
+    with pytest.raises(ValueError, match='not defined at an importable'):
+        get_full_qualified_name(decorated_function)
 
 
 def test_recursion_limit():
@@ -556,5 +723,3 @@ def test_stepwise_steps_per_period_max_total_steps(config, items, max_total_step
         StepwiseConfig.value_at(result, e) for e in range(last_period)
     )
     assert consumed < max_total_steps or last_period == 0
-
-

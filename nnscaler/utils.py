@@ -759,6 +759,81 @@ def load_type(type_name: str):
         raise RuntimeError(f"Failed to load type {type_name}") from e
 
 
+def get_full_qualified_name(fn: Callable, *, apply_autograd_function: bool = True) -> str:
+    """
+    Get the import-style fully qualified name of a callable.
+
+    Note: This function provides a standard way to obtain the fully qualified name of a callable,
+    There are other functions in this repo that may provide alternative ways to obtain fully qualified names,
+    When the results from this function differ from other methods,
+    this function's output should be considered the standard reference,
+    and other methods should be updated to align with this standard.
+
+    Args:
+        fn (Callable): The callable to get the fully qualified name for.
+        apply_autograd_function (bool, optional): Whether to append `.apply` for autograd.Function subclasses. Defaults to True.
+
+    Returns:
+        str: The fully qualified name of the callable.
+    """
+    if apply_autograd_function and inspect.isclass(fn) and issubclass(fn, torch.autograd.Function):
+        return f'{fn.__module__}.{fn.__qualname__}.apply'
+    if isinstance(fn, torch.ScriptFunction):
+        # ScriptFunction metadata describes the wrapper type; use the original Python function.
+        fn = fn._torchdynamo_inline
+    bound_self = getattr(fn, '__self__', None)
+    # Raw descriptors obtained from Class.__dict__ expose the underlying function via __func__.
+    if isinstance(fn, (staticmethod, classmethod)):
+        fn = fn.__func__
+    # Bound instance methods and classmethods also expose their original function via __func__.
+    if inspect.ismethod(fn):
+        fn = fn.__func__
+    # Follow functools.wraps/update_wrapper and any decorator implementing the __wrapped__ protocol.
+    fn = inspect.unwrap(fn)
+    # Reject non-callable descriptor payloads before inspecting function metadata.
+    if not callable(fn):
+        raise TypeError(f"Expected a callable, but got {type(fn)}")
+
+    qualname = getattr(fn, '__qualname__', None)
+    name = qualname.rsplit('.', 1)[-1] if qualname else getattr(fn, '__name__', None)
+    if name == 'apply' and inspect.isclass(bound_self) and issubclass(bound_self, torch.autograd.Function):
+        return f'{bound_self.__module__}.{bound_self.__qualname__}.apply'
+
+    # PyTorch C callables expose internal owner names; prefer their public import paths.
+    if name and getattr(torch.Tensor, name, None) is fn:
+        return f'torch.Tensor.{name}'
+    if name and getattr(torch, name, None) is fn:
+        return f'torch.{name}'
+    # torch._C._nn.linear -> torch.nn.functional.linear
+    if name and getattr(torch.nn.functional, name, None) is fn:
+        return f'torch.nn.functional.{name}'
+
+    # Python functions and methods normally provide both fields directly.
+    module = getattr(fn, '__module__', None)
+
+    # C-level method descriptors expose their defining class through __objclass__.
+    owner = getattr(fn, '__objclass__', None)
+    if owner is None:
+        # Built-in classmethods such as dict.fromkeys expose the owner through __self__.
+        if inspect.isclass(bound_self):
+            owner = bound_self
+    # Some built-in callables omit __module__, so use the defining class's module.
+    if module is None and owner is not None:
+        module = owner.__module__
+    # Build a qualified name from the owner when a built-in callable omits __qualname__.
+    if qualname is None and owner is not None:
+        qualname = f'{owner.__qualname__}.{name}'
+
+    # A fully qualified name requires both a module path and a name within that module.
+    if not module or not qualname:
+        raise ValueError(f"Cannot determine the fully qualified name of {fn}")
+    # Local functions, lambdas, and similarly synthetic names cannot be resolved by attribute lookup.
+    if '<locals>' in qualname or any(not part.isidentifier() for part in qualname.split('.')):
+        raise ValueError(f"{fn} is not defined at an importable module or class scope")
+    # Join the importable module path with the function's class-aware qualified name.
+    return f'{module}.{qualname}'
+
+
 class accum_mode:
     """Make cube execution in gradient accumulation mode.
 
