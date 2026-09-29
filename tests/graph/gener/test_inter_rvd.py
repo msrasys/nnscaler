@@ -2,14 +2,34 @@
 #  Licensed under the MIT License.
 
 from typing import List, Tuple
+import pytest
 import nnscaler
 from nnscaler.flags import CompileFlag
 from nnscaler.ir.tensor import IRFullTensor
 from nnscaler.graph.gener.rvd.layout import RVDLayout, RVDInspector
-from nnscaler.graph.gener.rvd.inter import InterPathFinder
+from nnscaler.graph.gener.rvd.inter import InterPathFinder, InterTransition
 import numpy as np
 
 from .test_intra_rvd import enable_reduce_scatter_adapter  # noqa
+
+
+@pytest.mark.parametrize('axis', [0, 1, 2])
+@pytest.mark.parametrize('source,target', [(2, 3), (3, 2), (3, 5), (5, 3)])
+def test_inter_transition_rejects_non_integral_changes(axis, source, target):
+    src, dst = [1, 1, 1], [1, 1, 1]
+    src[axis], dst[axis] = source, target
+    assert InterTransition.transitionable(tuple(src), tuple(dst)) is None
+
+
+@pytest.mark.parametrize('axis', [0, 1, 2])
+@pytest.mark.parametrize('source,target', [(1, 1), (2, 4), (4, 2)])
+def test_inter_transition_preserves_integral_changes(axis, source, target):
+    src, dst = [1, 1, 1], [1, 1, 1]
+    src[axis], dst[axis] = source, target
+    transition = InterTransition.transitionable(tuple(src), tuple(dst))
+    assert transition is not None
+    actual, _ = transition(tuple(src), chunks=max(source, target) // min(source, target))
+    assert tuple(actual) == tuple(dst)
 
 
 def factors(k: int, num: int) -> List[Tuple[int]]:

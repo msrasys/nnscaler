@@ -10,12 +10,11 @@ import numpy as np
 import logging
 from contextlib import contextmanager
 
-from nnscaler.ir.cten import IRObject
-from nnscaler.ir.tensor import IRTensor, IRFullTensor, IRSubTensor, IndexMap, ValueMap
+from nnscaler.ir.tensor import IRFullTensor, IRSubTensor, IndexMap, ValueMap
 from nnscaler.ir.adapter.prim import IRAdapterPrim, ReduceScatterPrim, AllToAllPrim
 from nnscaler.ir.adapter import IRAdapter
 from nnscaler.ir.adapter.prim import SelectPrim, MovePrim, SumPrim, MergeDimPrim
-from nnscaler.ir.adapter.prim import BroadcastPrim, ObjectMovePrim, ObjectBroadcastPrim
+from nnscaler.ir.adapter.prim import BroadcastPrim
 
 from nnscaler.graph.gener.rvd.layout import RVDLayout
 from nnscaler.graph.gener.rvd.intra import IntraPathFinder
@@ -42,49 +41,6 @@ def _temp_disable_reduce_scatter_adapter():
 
 
 class ConcurrentGener:
-
-    @staticmethod
-    def _group_replica_consumers(
-        producers: List[IRObject], consumers: List[IRObject],
-    ) -> List[Tuple[IRObject, List[IRObject]]]:
-        """Assign remote consumers evenly to interchangeable, complete replicas."""
-        sources, targets = {}, {}
-        for obj in producers:
-            sources.setdefault(obj.device[0], obj)
-        for obj in consumers:
-            if obj.device[0] not in sources:
-                targets.setdefault(obj.device[0], obj)
-        size, extra = divmod(len(targets), len(sources))
-        targets = list(targets.values())
-        groups, start = [], 0
-        for index, source in enumerate(sources.values()):
-            end = start + size + (index < extra)
-            groups.append((source, targets[start:end]))
-            start = end
-        return groups
-
-    @staticmethod
-    def gen_objects(pobjects: List[IRObject], cobjects: List[IRObject]) -> Optional[IRAdapter]:
-        """Generate forward communication for replicas of one non-tensor object."""
-        if not pobjects or not cobjects:
-            return None
-        if any(len(obj.device) != 1 for obj in pobjects + cobjects):
-            raise ValueError("Expected one device per object placement")
-        if any(isinstance(obj, IRTensor) or obj != pobjects[0] for obj in pobjects + cobjects):
-            raise ValueError("Expected replicas of one non-tensor IRObject")
-
-        prims = []
-        for source, targets in ConcurrentGener._group_replica_consumers(pobjects, cobjects):
-            if len(targets) > 1 and not CompileFlag.disable_comm_fusion:
-                prims.append(ObjectBroadcastPrim([source], targets + [source]))
-            else:
-                prims.extend(ObjectMovePrim([source], [target]) for target in targets)
-        if not prims:
-            return None
-        # Collective participants may include the source even when it is not a consumer.
-        adapter = IRAdapter(pobjects, cobjects)
-        adapter.prims = prims
-        return adapter
 
     @staticmethod
     def gen(fptensors: List[IRSubTensor], fctensors: List[IRSubTensor],
@@ -330,15 +286,41 @@ class ConcurrentGener:
         @return success bool: whether succeed in generate collective
         @return prims List[IRAdapterPrim]: the primitives for adapter
         """
+        ret = False
+        prims = []
+        fuse_broadcast = True
+        # check broadcast
         if len(ptensors) >= len(ctensors) or len(ptensors) == 0:
-            return False, []
-        if not all(ptensor == ctensor for ptensor in ptensors for ctensor in ctensors):
-            return False, []
-        groups = ConcurrentGener._group_replica_consumers(ptensors, ctensors)
-        # Preserve the send/recv fallback unless every source has multiple targets.
-        if any(len(targets) < 2 for _, targets in groups):
-            return False, []
-        return True, [BroadcastPrim([source], targets + [source]) for source, targets in groups]
+            fuse_broadcast = False
+        else:
+            for ptensor in ptensors:
+                if not all(ptensor == ctensor for ctensor in ctensors):
+                    fuse_broadcast = False
+                    break
+        # fuse to broadcast
+        if fuse_broadcast:
+            cdev_tensors, pdev_tensors = dict(), dict()
+            for ptensor in ptensors:
+                pdev_tensors.setdefault(ptensor.device[0], []).append(ptensor)
+            for ctensor in ctensors:
+                # not consider self-transmission
+                if ctensor.device[0] in pdev_tensors: continue
+                cdev_tensors.setdefault(ctensor.device[0], []).append(ctensor)
+            if len(cdev_tensors) // len(pdev_tensors) <= 1: # can simply use send recv
+                return False, []
+            pdevs = list(pdev_tensors.keys())
+            cdevs = list(cdev_tensors.keys())
+            broadcast_ndevs = len(cdevs) // len(pdevs)
+            start = 0
+            for idx, pdev in enumerate(pdevs):
+                addone = 1 if idx < (len(cdevs) % len(pdevs)) else 0
+                end = start + broadcast_ndevs + addone
+                pdev_ctensors = [cdev_tensors[devid][0] for devid in cdevs[start:end]]
+                pdev_ctensors += [pdev_tensors[pdev][0]]
+                prims.append(BroadcastPrim([pdev_tensors[pdev][0]], pdev_ctensors))
+                start = end
+            ret = True
+        return ret, prims
 
     @staticmethod
     def gen_subtensor(ctensor: IRSubTensor, ptensors: List[IRSubTensor], workload: Dict[int, int]) -> List[IRAdapterPrim]:
