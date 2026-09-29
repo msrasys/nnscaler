@@ -61,11 +61,13 @@ class LeafWrapInfo:
     replacement: If not `None`, we will use it to run this function instead of the original function/class when tracing
         Such as ModuleList.__getitem__, we can use operator.getitem to replace it.
     replace_traced_code: If set to true, we will replace the traced code of this function/class too.
+    fake_fn_on_cpu: The fake replacement supports existing CPU inputs in CPU/offload tracing.
     """
     extra_locs: List[Location] = field(default_factory=list)
     is_force_trace: bool = False
     replacement: Union[None, Callable, Type] = None
     replace_traced_code: bool = True
+    fake_fn_on_cpu: bool = False
 
 
 default_autowrap_leaf_function: Dict[Any, LeafWrapInfo] = {

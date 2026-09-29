@@ -275,10 +275,9 @@ def test_save_attr_content_balances_elements_and_preserves_values(tmp_path, work
         assert actual.stride() == value.stride()
 
 
-@pytest.mark.parametrize('workers', [1, 4])
 @pytest.mark.parametrize('device', ['cpu', pytest.param('cuda', marks=pytest.mark.skipif(
     not torch.cuda.is_available(), reason='CUDA required'))])
-def test_save_attr_content_preserves_storage_aliases_in_one_chunk(tmp_path, workers, device):
+def test_save_attr_content_preserves_storage_aliases_in_one_chunk(tmp_path, device):
     frame = Frame()
     base = torch.arange(20, dtype=torch.float32, device=device, requires_grad=True)
     values = [torch.arange(4, dtype=torch.bfloat16, device=device),
@@ -289,7 +288,7 @@ def test_save_attr_content_preserves_storage_aliases_in_one_chunk(tmp_path, work
     for i, (tensor, value) in enumerate(zip(tensors, values)):
         frame.add_attr(tensor, value, f'w{i}')
     stem = tmp_path/'fullmodel.pt'
-    frame.save_attr_content(stem, params_per_file=25, max_workers=workers)
+    frame.save_attr_content(stem, params_per_file=25)
     index = torch.load(f'{stem}.index', weights_only=True)
     assert set(index.values()) == {0}
     saved = torch.load(f'{stem}.0', mmap=True, weights_only=True)

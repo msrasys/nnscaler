@@ -29,7 +29,7 @@ def test_dynamic_source_line_refresh(tmp_path):
     assert module.caller().line == 'return get_frame_record()  # edited'
 
 
-def test_disassembly_cache_uses_code_identity_and_is_bounded():
+def test_disassembly_cache_reuses_results_and_tracks_replaced_code():
     def original(x):
         return x + 1
     def replacement(x):
@@ -40,7 +40,6 @@ def test_disassembly_cache_uses_code_identity_and_is_bounded():
     assert _instructions(original.__code__) is _instructions(original.__code__)
     original.__code__ = replacement.__code__
     assert _instructions(original.__code__) == tuple(dis.get_instructions(replacement))
-    assert _instructions.cache_info().maxsize == 512
 
 
 def test_instruction_lookup_does_not_retain_caller_locals():

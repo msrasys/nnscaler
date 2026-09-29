@@ -179,13 +179,8 @@ The generated files include:
 2. trace files: graph dump (`graph.ckp`), forward args dump (`forward_args.pkl`), origin module metadata (`origin_module_metadata.pt`), init weights (`fullmodel.pt.*`), param name mapping (`dist_param_map.pt`)
 3. code: generated code files (`gencode*.py`)
 
-Initial-weight files are written concurrently from read-only CPU tensors.
-`ATTR_SAVE_WORKERS` sets the positive writer count (default: 8).
-Set it to 1 to serialize writes on storage that does not benefit from concurrency.
-The existing `fullmodel.pt.*` / `fullmodel.pt.index` format is preserved; the index
-is written only after every weight file succeeds. Tensors are not sliced into
-views just to meet the file-size target, which would risk serializing their
-entire backing storage repeatedly.
+See [initial weight saving](trainer.md#initial-weight-saving-during-compilation)
+for writer concurrency and weight-file grouping.
 
 Codegen workers limit their CPU tensor threads to one; the parent can use
 more threads for initialization and tracing.
