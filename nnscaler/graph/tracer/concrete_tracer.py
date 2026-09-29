@@ -91,6 +91,8 @@ class ConcreteTracer(TracerBase):
         super().__init__()
         self.scope = Scope("", None)
         self.module_stack = collections.OrderedDict()
+        self.module_call_stack = collections.OrderedDict()
+        self.module_call_count = 0
         self.node_name_to_scope = {}
         self.call_expr_stack = []
         self.strategy = TRACE_STRATEGY[strategy](self)
@@ -215,6 +217,7 @@ class ConcreteTracer(TracerBase):
             node.meta['nn_module_stack'] = copy.copy(self.module_stack)
         else:
             node.meta['nn_module_stack'] = collections.OrderedDict()
+        node.meta['nn_module_call_stack'] = copy.copy(self.module_call_stack)
 
         if self.call_expr_stack:
             last_call_expr = None

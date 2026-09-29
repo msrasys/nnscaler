@@ -78,6 +78,7 @@ class IRCell:
         self._comment: Optional[str] = None
         # the module stack that preserves the hierarchy information
         self._module_stack: Optional[OrderedDict[str, Any]] = None
+        self._module_call_stack: Optional[OrderedDict[str, int]] = None
         # the original call expression
         # Note:
         # 1. some cells may not have call expression if the cell is not from function call (e.g., __getitem__)
@@ -423,6 +424,15 @@ class IRCell:
         Set the module stack
         """
         self._module_stack = stack
+
+    @property
+    def module_call_stack(self) -> Optional[OrderedDict[str, int]]:
+        """Per-trace invocation IDs keyed by the FQNs in ``module_stack``."""
+        return getattr(self, '_module_call_stack', None)
+
+    @module_call_stack.setter
+    def module_call_stack(self, stack: Optional[OrderedDict[str, int]]):
+        self._module_call_stack = stack
 
     @property
     def module_class_chain(self) -> list[type[torch.nn.Module]]:

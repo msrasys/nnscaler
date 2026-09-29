@@ -539,6 +539,7 @@ class FxModuleParser:
         ir_node.op_context = node.meta.get('op_context')
         module_stack = node.meta.get('nn_module_stack')
         ir_node.module_stack = module_stack
+        ir_node.module_call_stack = node.meta.get('nn_module_call_stack')
         ir_node.call_expr = node.meta.get('call_expr')
         comment = str(node.meta.get('frame_record', ''))
         if comment:

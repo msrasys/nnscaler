@@ -365,12 +365,15 @@ def create_wrapped_module_call(tracer: 'ConcreteTracer'):
             module_qualified_name = tracer.get_path_of_module(mod)
             with ScopeContextManager(tracer.scope, Scope(module_qualified_name, type(mod))) as _scope:
                 tracer.module_stack[_scope.module_path] = _scope.module_type
+                tracer.module_call_count += 1
+                tracer.module_call_stack[_scope.module_path] = tracer.module_call_count
                 if not tracer.is_leaf_module(mod, module_qualified_name):
                     autowrap_check(tracer, mod.__dict__)
                     ret_val = orig_func.torch_module_call(mod, *args, **kwargs)
                 else:
                     ret_val = tracer.create_proxy('call_module', module_qualified_name, args, kwargs)
                 key, _ = tracer.module_stack.popitem(last=True)
+                tracer.module_call_stack.pop(key)
                 assert key == _scope.module_path, f" Unexpected key {key}"
             return ret_val
     return module_call_wrapper
@@ -389,6 +392,8 @@ def create_wrapped_nn_module_func(tracer: 'ConcreteTracer', mod: torch.nn.Module
             if _scope.module_path not in tracer.module_stack:
                 need_pop = True
                 tracer.module_stack[_scope.module_path] = _scope.module_type
+                tracer.module_call_count += 1
+                tracer.module_call_stack[_scope.module_path] = tracer.module_call_count
             elif _scope.module_path != list(tracer.module_stack)[-1]:
                 raise RuntimeError(f'Scope not match: {_scope.module_path} vs {list(tracer.module_stack)[-1]}')
             # has tracer means in tracing progress
@@ -402,6 +407,7 @@ def create_wrapped_nn_module_func(tracer: 'ConcreteTracer', mod: torch.nn.Module
                 result = orig_fn(*args, **kwargs)
             if need_pop:
                 key, _ = tracer.module_stack.popitem(last=True)
+                tracer.module_call_stack.pop(key)
                 assert key == _scope.module_path, f" Unexpected key {key}"
         return result
 
