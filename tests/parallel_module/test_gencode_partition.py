@@ -691,21 +691,18 @@ class PPSharedModel(torch.nn.Module):
 
 
 @replace_all_device_with('cpu')
-@pytest.mark.parametrize('pipeline_multiref_replicated_params', [False, True])
+@pytest.mark.parametrize('pipeline_multiref_replicated_params', ['default', None, False, True])
 def test_pp_shared_model(tmp_path, pipeline_multiref_replicated_params):
     m = PPSharedModel(4)
     m.train()
+    pas_config = {'pipeline_nmicros': 2, 'pipeline_size': 2}
+    if pipeline_multiref_replicated_params != 'default':
+        pas_config['pipeline_multiref_replicated_params'] = pipeline_multiref_replicated_params
     parallelize(
         m,
         {'x': torch.randn(4, 4)},
         _pp_shared_policy,
-        ComputeConfig(2, 4, use_end2end=True,
-            pas_config={
-                'pipeline_nmicros': 2,
-                'pipeline_size': 2,
-                'pipeline_multiref_replicated_params': pipeline_multiref_replicated_params,
-            }
-        ),
+        ComputeConfig(2, 4, use_end2end=True, pas_config=pas_config),
         gen_savedir=tmp_path,
         load_module=False,
         reuse='override',
@@ -714,7 +711,7 @@ def test_pp_shared_model(tmp_path, pipeline_multiref_replicated_params):
     # and only it should register it as a parameter
     # (the other stage gets it as a non-parameter shared input)
     for rank in range(4):
-        if rank % 2 == 0 or not pipeline_multiref_replicated_params:
+        if rank % 2 == 0 or pipeline_multiref_replicated_params is False:
             assert _gencode_contains(tmp_path, PPSharedModel, rank, r'self.register_parameter\(')
         else:
             assert not _gencode_contains(tmp_path, PPSharedModel, rank, r'self.register_parameter\(')
@@ -735,7 +732,8 @@ class PPSharedMultipleConsumersModel(torch.nn.Module):
 
 
 @replace_all_device_with('cpu')
-def test_pp_shared_model_complex_comsumers(tmp_path):
+@pytest.mark.parametrize('pipeline_multiref_replicated_params', [None, False, True])
+def test_pp_shared_model_complex_consumers(tmp_path, pipeline_multiref_replicated_params):
     m = PPSharedMultipleConsumersModel(4)
     m.train()
     parallelize(
@@ -746,7 +744,7 @@ def test_pp_shared_model_complex_comsumers(tmp_path):
             pas_config={
                 'pipeline_nmicros': 2,
                 'pipeline_size': 2,
-                'pipeline_multiref_replicated_params': True,
+                'pipeline_multiref_replicated_params': pipeline_multiref_replicated_params,
             }
         ),
         gen_savedir=tmp_path,
