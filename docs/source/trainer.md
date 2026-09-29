@@ -907,15 +907,14 @@ Please note
 ### Multi-process code-generation payloads
 
 With `codegen_workers > 1`, NNScaler serializes the code-generation plan once
-before launching local workers. It uses cloudpickle for the
-whole object graph, including local functions and their shared captured state.
-Cached graphs use the same path. Unsupported payloads fall back to whole-payload
-dill serialization. Functions that rebind captured variables also use dill to
-preserve shared closure cells. Disk I/O errors propagate without retrying.
+before launching local workers. It uses the C pickle implementation for the
+graph, restores importable registered-op factories by signature, and uses dill
+for non-importable functions such as local emitters. Cached graphs use the same
+fast path. Unsupported payloads fall back to whole-payload dill serialization.
 No additional setting is required; generated code and metadata formats stay
 the same.
 
-The parent log reports `Serialized codegen payload with cloudpickle` (or `dill` for
+The parent log reports `Serialized codegen payload with pickle` (or `dill` for
 fallback), the payload size, and serialization time. Worker logs separately
 report payload loading time. This optimization reduces work before workers
 start; it does not change worker count or model parallelism.

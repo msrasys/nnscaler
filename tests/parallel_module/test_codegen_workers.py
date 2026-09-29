@@ -153,7 +153,7 @@ def test_multi_process_codegen_matches_serial(tmp_path, model_factory, use_end2e
         codegen_workers=2,
         use_end2end=use_end2end,
     )
-    assert serializers == ['cloudpickle']
+    assert serializers == ['pickle']
     assert len(bundles) == 2
 
     for rank in range(2):
@@ -191,7 +191,7 @@ def test_codegen_workers_reuse_cached_custom_op_graph(tmp_path, monkeypatch):
 
     monkeypatch.setattr('nnscaler.parallel.dump_codegen_payload', record_serializer)
     _generate(tmp_path, _LocalEmitModel(), codegen_workers=2, use_end2end=False, reuse='graph')
-    assert serializers == ['cloudpickle']
+    assert serializers == ['pickle']
     assert [(module_dir / f'gencode{rank}.py').read_bytes() for rank in range(2)] == expected_code
     assert _load_compact_raw_maps(module_dir) == expected_meta
 

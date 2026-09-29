@@ -7,12 +7,11 @@ import sys
 from types import SimpleNamespace
 
 import dill
-import pickle
 import pytest
 import torch
 
 from nnscaler import register_op
-from nnscaler.codegen.serialization import dump_codegen_payload, load_codegen_payload, _CodegenPickler
+from nnscaler.codegen.serialization import dump_codegen_payload, load_codegen_payload
 from nnscaler.graph.parser.register import CustomizedOps
 from nnscaler.graph.function.function import _reshape_anno
 
@@ -62,7 +61,7 @@ def test_cached_registered_factories_load_in_fresh_process(tmp_path):
     }
     path = tmp_path / 'payload.pkl'
     with path.open('wb') as stream:
-        assert dump_codegen_payload(payload, stream) == 'cloudpickle'
+        assert dump_codegen_payload(payload, stream) == 'pickle'
     # No pre-import of this test module: the factory resolver must import it,
     # including the module of an autograd subclass whose apply is inherited.
     subprocess.run([sys.executable, '-c', '''
@@ -73,7 +72,7 @@ from nnscaler.ir.tensor import IRFullTensor
 with open(sys.argv[1], 'rb') as stream:
     payload = load_codegen_payload(stream)
 for factory, signature in zip(payload['factories'], payload['signatures']):
-    assert callable(factory)
+    assert factory is CustomizedOps.kOpMap[signature]
     node = factory(IRFullTensor((2, 3)).tosub(), signature=signature)
     assert node.signature == signature
 for node, factory in zip(payload['module_codegen'].execplan.graph.nodes(flatten=True), payload['factories']):
@@ -92,7 +91,7 @@ def test_fast_payload_preserves_links_and_local_emitter():
     node.parent = node
     payload = {'node': node, 'alias': node, 'tensor': tensor, 'emitter': emit}
     stream = io.BytesIO()
-    assert dump_codegen_payload(payload, stream) == 'cloudpickle'
+    assert dump_codegen_payload(payload, stream) == 'pickle'
     stream.seek(0)
     restored = load_codegen_payload(stream)
     assert restored['node'] is restored['alias']
@@ -112,7 +111,7 @@ def test_factory_registered_only_in_parent_loads_in_worker(tmp_path, monkeypatch
     register_op('a b -> a b')(_registered_during_setup)
     path = tmp_path / 'dynamic.pkl'
     with path.open('wb') as stream:
-        assert dump_codegen_payload({'factory': CustomizedOps.kOpMap[signature]}, stream) == 'cloudpickle'
+        assert dump_codegen_payload({'factory': CustomizedOps.kOpMap[signature]}, stream) == 'pickle'
     subprocess.run([sys.executable, '-c', '''
 import sys
 from nnscaler.codegen.serialization import load_codegen_payload
@@ -127,7 +126,7 @@ assert node.signature == signature
 ''', str(path), signature], check=True, timeout=60)
 
 
-def test_shared_closure_state_keeps_aliases():
+def test_shared_closure_state_uses_whole_payload_fallback():
     state = []
 
     def append(value):
@@ -137,7 +136,7 @@ def test_shared_closure_state_keeps_aliases():
         return state
 
     stream = io.BytesIO()
-    assert dump_codegen_payload({'append': append, 'read': read}, stream) == 'cloudpickle'
+    assert dump_codegen_payload({'append': append, 'read': read}, stream) == 'dill'
     stream.seek(0)
     restored = load_codegen_payload(stream)
     restored['append'](42)
@@ -154,7 +153,7 @@ def test_mutable_callable_state_keeps_alias_to_payload(capture):
         def append(value, target=state):
             target.append(value)
     stream = io.BytesIO()
-    assert dump_codegen_payload({'append': append, 'state': state}, stream) == 'cloudpickle'
+    assert dump_codegen_payload({'append': append, 'state': state}, stream) == 'dill'
     stream.seek(0)
     restored = load_codegen_payload(stream)
     restored['append'](42)
@@ -166,20 +165,21 @@ def test_reshape_partition_rules_keep_fast_path():
     kwargs = {'size': (2, 2, 6)}
     expected = rules[0].modifier()(kwargs, 0, 0, 2, 0)
     stream = io.BytesIO()
-    assert dump_codegen_payload({'rules': rules}, stream) == 'cloudpickle'
+    assert dump_codegen_payload({'rules': rules}, stream) == 'pickle'
     stream.seek(0)
     restored = load_codegen_payload(stream)
     assert restored['rules'][0].modifier()(kwargs, 0, 0, 2, 0) == expected
     assert kwargs == {'size': (2, 2, 6)}
 
 
-def test_local_class_preserves_fast_path():
+def test_local_class_fallback_replaces_partial_pickle():
     class LocalConfig:
         value = 42
 
     stream = io.BytesIO(b'prefix')
     stream.seek(6)
-    assert dump_codegen_payload({'data': b'x' * 100_000, 'config': LocalConfig()}, stream) == 'cloudpickle'
+    # Force the fast pickler to write data before encountering the local class.
+    assert dump_codegen_payload({'data': b'x' * 100_000, 'config': LocalConfig()}, stream) == 'dill'
     assert stream.getvalue().startswith(b'prefix')
     stream.seek(6)
     restored = load_codegen_payload(stream)
@@ -206,51 +206,3 @@ def test_io_errors_do_not_retry_with_dill(monkeypatch):
     monkeypatch.setattr(dill, 'dump', unexpected_fallback)
     with pytest.raises(OSError, match='disk full'):
         dump_codegen_payload({'data': b'x' * 100_000}, BrokenStream())
-
-
-@pytest.mark.parametrize('error', [pickle.PicklingError, TypeError, AttributeError, RecursionError])
-def test_fallback_replaces_partial_payload(monkeypatch, error):
-    def fail_dump(self, payload):
-        stream.write(b'partial cloudpickle payload' * 100)
-        raise error('unsupported object')
-
-    monkeypatch.setattr(_CodegenPickler, 'dump', fail_dump)
-    state = []
-    def append(value):
-        state.append(value)
-    stream = io.BytesIO(b'prefix')
-    stream.seek(6)
-    assert dump_codegen_payload({'append': append, 'state': state}, stream) == 'dill'
-    assert stream.getvalue().startswith(b'prefix')
-    stream.seek(6)
-    restored = load_codegen_payload(stream)
-    restored['append'](42)
-    assert restored['state'] == [42]
-    assert stream.read() == b''
-
-
-@pytest.mark.parametrize('delete', [False, True])
-def test_nonlocal_rebinding_keeps_shared_closure_cells(delete):
-    state = 0
-
-    def increment():
-        nonlocal state
-        state += 1
-
-    def clear():
-        nonlocal state
-        del state
-
-    def read():
-        return state
-
-    stream = io.BytesIO()
-    assert dump_codegen_payload({'change': clear if delete else increment, 'read': read}, stream) == 'dill'
-    stream.seek(0)
-    restored = load_codegen_payload(stream)
-    restored['change']()
-    if delete:
-        with pytest.raises(NameError):
-            restored['read']()
-    else:
-        assert restored['read']() == 1

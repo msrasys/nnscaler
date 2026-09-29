@@ -187,10 +187,8 @@ is written only after every weight file succeeds. Tensors are not sliced into
 views just to meet the file-size target, which would risk serializing their
 entire backing storage repeatedly.
 
-Multi-process code generation uses `cloudpickle` for its temporary worker
-payload, including registered-op closures, with a whole-payload dill fallback. This does not change persisted
-graphs or training checkpoint formats. Codegen workers limit their CPU tensor
-threads to one; the parent can use more threads for initialization and tracing.
+Codegen workers limit their CPU tensor threads to one; the parent can use
+more threads for initialization and tracing.
 The `reuse_cache` tracing strategy releases its execution-only tensor cache
 after each trace, including failed traces, before initial weights are written.
 Recorded graph metadata and tensors referenced by the model are retained.
