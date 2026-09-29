@@ -341,6 +341,21 @@ class BuiltinInplaceMethodFakeFnModel(torch.nn.Module):
         return x.add_(y)
 
 
+class BuiltinBatchNormModel(torch.nn.Module):
+    def forward(self, x, weight, bias, running_mean, running_var):
+        return torch.batch_norm(
+            x,
+            weight,
+            bias,
+            running_mean,
+            running_var,
+            False,
+            0.1,
+            1e-5,
+            False,
+        )
+
+
 def _remove_updated_op(signature):
     for alias in _get_torch_op_aliases(signature):
         for registry in (
@@ -379,7 +394,6 @@ def _remove_updated_op(signature):
             {
                 'torch.relu',
                 'torch.Tensor.relu',
-                'torch.nn.functional.relu',
             },
         ),
     ],
@@ -398,6 +412,47 @@ def test_get_torch_op_aliases_is_symmetric():
     assert not any(alias.startswith('_operator.') for alias in expected)
     for runtime_fn in (torch.add, torch.Tensor.add):
         assert set(_get_torch_op_aliases(runtime_fn)) == expected
+
+
+def test_get_torch_op_aliases_does_not_match_functional_by_name():
+    assert _get_torch_op_aliases(F.batch_norm) == ('torch.nn.functional.batch_norm',)
+    assert 'torch.nn.functional.relu' not in _get_torch_op_aliases(torch.relu)
+
+
+def test_functional_fake_fn_does_not_override_same_name_torch_op():
+    calls = []
+
+    def fake_batch_norm(
+        input,
+        running_mean,
+        running_var,
+        weight=None,
+        bias=None,
+        training=False,
+        momentum=0.1,
+        eps=1e-5,
+    ):
+        calls.append(input)
+        return input
+
+    nnscaler.update_op(F.batch_norm, fake_fn=fake_batch_norm)
+    try:
+        traced = to_fx_graph(
+            BuiltinBatchNormModel(),
+            {
+                'x': torch.randn(2, 3, 4, 4),
+                'weight': torch.ones(3),
+                'bias': torch.zeros(3),
+                'running_mean': torch.zeros(3),
+                'running_var': torch.ones(3),
+            },
+        )
+    finally:
+        _remove_updated_op(F.batch_norm)
+
+    assert not calls
+    node = next(node for node in traced.graph.nodes if node.op == 'call_function')
+    assert node.target is torch.batch_norm
 
 
 def test_get_torch_op_aliases_scans_runtime_namespaces(monkeypatch):

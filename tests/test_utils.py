@@ -98,10 +98,9 @@ class QualifiedNameAutogradFunction(torch.autograd.Function):
         return x
 
 
-with pytest.warns(DeprecationWarning, match=r'`torch\.jit\.script` is deprecated'):
-    @torch.jit.script
-    def qualified_script_function(x: torch.Tensor):
-        return x
+@torch.jit.script
+def qualified_script_function(x: torch.Tensor):
+    return x
 
 
 @pytest.mark.parametrize(

@@ -318,13 +318,13 @@ register = register_op
 no_change = object()
 
 
-_PUBLIC_NAMESPACES = (
+_TORCH_TENSOR_NAMESPACES = (
     ('torch', torch),
     ('torch.Tensor', torch.Tensor),
-    ('torch.nn.functional', torch.nn.functional),
 )
 
-_RUNTIME_NAMESPACES = _PUBLIC_NAMESPACES + (
+_RUNTIME_NAMESPACES = _TORCH_TENSOR_NAMESPACES + (
+    ('torch.nn.functional', torch.nn.functional),
     ('torch.functional', torch.functional),
     ('torch._C._nn', torch._C._nn),
 )
@@ -332,7 +332,7 @@ _RUNTIME_NAMESPACES = _PUBLIC_NAMESPACES + (
 
 def _get_torch_op_aliases(runtime_fn: Union[str, Callable]) -> tuple[str, ...]:
     """
-    Return runtime and same-name public aliases for a PyTorch operator.
+    Return runtime aliases and same-name torch/Tensor aliases for a PyTorch operator.
     Currently we don't take inplace operators into account (torch.Tensor.add_ for example).
     And we also don't consider operator overloads (like __add__ for example).
     """
@@ -345,17 +345,7 @@ def _get_torch_op_aliases(runtime_fn: Union[str, Callable]) -> tuple[str, ...]:
     else:
         signature = get_full_qualified_name(runtime_fn)
 
-    if not signature.startswith('torch.'):
-        return (signature,)
-
     aliases = [signature]
-    name = getattr(runtime_fn, '__name__', None)
-    module = getattr(runtime_fn, '__module__', None)
-    if name and module:
-        aliases.append(f'{module}.{name}')
-
-    # identity check
-    #  F.linear -> torch._C._nn.linear
     for namespace_name, namespace in _RUNTIME_NAMESPACES:
         aliases.extend(
             f'{namespace_name}.{alias_name}'
@@ -363,14 +353,16 @@ def _get_torch_op_aliases(runtime_fn: Union[str, Callable]) -> tuple[str, ...]:
             if value is runtime_fn
         )
 
-    # name check
-    # torch.relu -> F.relu
-    # note that they don't have to be the same object,
-    # just the same name in the public namespace
-    if name:
+    name = getattr(runtime_fn, '__name__', None)
+    torch_tensor_alias = name and any(
+        getattr(namespace, name, None) is runtime_fn
+        for _, namespace in _TORCH_TENSOR_NAMESPACES
+    )
+    # torch.add and torch.Tensor.add are normalized to the same parser signature.
+    if torch_tensor_alias:
         aliases.extend(
             f'{namespace_name}.{name}'
-            for namespace_name, namespace in _PUBLIC_NAMESPACES
+            for namespace_name, namespace in _TORCH_TENSOR_NAMESPACES
             if callable(getattr(namespace, name, None))
         )
     return tuple(dict.fromkeys(aliases))

@@ -185,12 +185,13 @@ system-defined behavior and are not materialized in `CustomizedOps`. Pass
 `None` to remove an existing override.
 
 Aliases discovered from the loaded PyTorch runtime share the same update.
-nnScaler includes the callable's runtime implementation path and same-name
-aliases from `torch`, `torch.Tensor`, and `torch.nn.functional`. For example,
-updating `torch.Tensor.add` also updates `torch.add`, so metadata still applies
-after parser signature normalization. In-place variants and `operator`
-functions are not inferred as aliases. Custom operators are not expanded by
-these PyTorch-specific rules.
+nnScaler includes paths that reference the same runtime callable and bridges
+same-name operators between `torch` and `torch.Tensor`. For example, updating
+either `torch.add` or `torch.Tensor.add` updates both signatures, so metadata
+still applies after parser method normalization. Different
+`torch.nn.functional` wrappers are not inferred from their names. In-place
+variants and `operator` functions are also not inferred as aliases. Custom
+operators are not expanded by these PyTorch-specific rules.
 
 The signature is derived from the runtime callable. `update_op` can attach
 metadata to an operator that is not yet registered, but such an operator still
