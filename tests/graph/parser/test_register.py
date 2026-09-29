@@ -471,6 +471,7 @@ def test_get_torch_op_aliases_does_not_flatten_nested_torch_namespaces():
     assert _get_torch_op_aliases(torch.linalg.norm) == ('torch._C._linalg.linalg_norm',)
 
 
+@replace_all_device_with('cpu')
 def test_update_builtin_function_fake_fn():
     calls = []
 
@@ -496,6 +497,7 @@ def test_update_builtin_function_fake_fn():
     assert node.target is torch.add
 
 
+@replace_all_device_with('cpu')
 def test_update_builtin_descriptor_fake_fn():
     calls = []
 
@@ -517,6 +519,7 @@ def test_update_builtin_descriptor_fake_fn():
     assert node.target == 'add'
 
 
+@replace_all_device_with('cpu')
 def test_update_builtin_method_fake_fn():
     calls = []
 
@@ -538,6 +541,7 @@ def test_update_builtin_method_fake_fn():
     assert node.target == 'add'
 
 
+@replace_all_device_with('cpu')
 def test_update_builtin_inplace_method_fake_fn():
     calls = []
 
@@ -643,6 +647,7 @@ def test_update_op_clears_optional_fields():
         _remove_updated_op('torch.add')
 
 
+@replace_all_device_with('cpu')
 def test_update_builtin_input_gen_fn_used_by_profiler():
     class InputGenCalled(Exception):
         pass
