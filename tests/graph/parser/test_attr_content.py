@@ -275,44 +275,14 @@ def test_save_attr_content_balances_elements_and_preserves_values(tmp_path, work
         assert actual.stride() == value.stride()
 
 
-@pytest.mark.parametrize('device', ['cpu', pytest.param('cuda', marks=pytest.mark.skipif(
-    not torch.cuda.is_available(), reason='CUDA required'))])
-def test_save_attr_content_preserves_storage_aliases_in_one_chunk(tmp_path, device):
-    frame = Frame()
-    base = torch.arange(20, dtype=torch.float32, device=device, requires_grad=True)
-    values = [torch.arange(4, dtype=torch.bfloat16, device=device),
-              torch.arange(4, dtype=torch.float32, device=device), base[3:7],
-              torch.arange(3, dtype=torch.bfloat16, device=device), base[::2]]
-    tensors = [IRFullTensor(tuple(value.shape), name=f'w{i}', dtype=value.dtype)
-               for i, value in enumerate(values)]
-    for i, (tensor, value) in enumerate(zip(tensors, values)):
-        frame.add_attr(tensor, value, f'w{i}')
-    stem = tmp_path/'fullmodel.pt'
-    frame.save_attr_content(stem, params_per_file=25)
-    index = torch.load(f'{stem}.index', weights_only=True)
-    assert set(index.values()) == {0}
-    saved = torch.load(f'{stem}.0', mmap=True, weights_only=True)
-    for tensor, expected in zip(tensors, values):
-        actual = saved[tensor.tid]
-        assert torch.equal(actual, expected.cpu())
-        assert actual.dtype == expected.dtype
-        assert actual.stride() == expected.stride()
-        assert actual.storage_offset() == expected.storage_offset()
-        assert actual.requires_grad == expected.requires_grad
-    a, b = (saved[tensors[i].tid] for i in (2, 4))
-    assert a is not b
-    assert a.untyped_storage()._cdata == b.untyped_storage()._cdata
-    assert a.untyped_storage().nbytes() == base.untyped_storage().nbytes()
-
-
 @pytest.mark.skipif(not torch.cuda.is_available(), reason='CUDA required')
-def test_cuda_trace_saves_shared_attribute_storage(tmp_path, monkeypatch):
+def test_cuda_trace_saves_small_views_without_unused_backing_storage(tmp_path, monkeypatch):
     from nnscaler.graph.parser.converter import to_fx_graph, to_ir_graph
 
     class Model(torch.nn.Module):
         def __init__(self):
             super().__init__()
-            storage = torch.arange(20, device='cuda', dtype=torch.float32)
+            storage = torch.arange(1024 * 1024, device='cuda', dtype=torch.float32)
             self.weight = torch.nn.Parameter(storage[3:7])
             self.register_buffer('offset', storage[1:9:2])
 
@@ -324,16 +294,15 @@ def test_cuda_trace_saves_shared_attribute_storage(tmp_path, monkeypatch):
     inputs = {'x': torch.ones(4, device='cuda')}
     traced = to_fx_graph(model, inputs)
     assert traced.weight.is_cuda and traced.offset.is_cuda
-    assert traced.weight.storage_offset() == 3 and traced.offset.storage_offset() == 1
     graph = to_ir_graph(traced, inputs, tmp_path, constant_folding=False)
     saved = torch.load(tmp_path / FxModuleParser.ATTR_CONTENT_FILE_0, weights_only=True)
     attrs = {tensor.name: saved[tensor.tid] for tensor in graph.attributes()}
     for name in ('weight', 'offset'):
         expected, actual = getattr(model, name), attrs[name]
         assert torch.equal(actual, expected.cpu())
-        assert actual.stride() == expected.stride()
-        assert actual.storage_offset() == expected.storage_offset()
-    assert attrs['weight'].untyped_storage()._cdata == attrs['offset'].untyped_storage()._cdata
+        assert actual.dtype == expected.dtype
+        # Saving either four-element view must not retain the 4 MiB source storage.
+        assert actual.untyped_storage().nbytes() == actual.numel() * actual.element_size()
 
 
 @pytest.mark.parametrize('value', [0, -1, True, 1.5, '4'])

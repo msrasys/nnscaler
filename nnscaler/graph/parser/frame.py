@@ -194,22 +194,7 @@ class Frame:
         if isinstance(params_per_file, bool) or not isinstance(params_per_file, int) or params_per_file < 1:
             raise ValueError('params_per_file must be a positive integer')
 
-        tid2value, cpu_storages = {}, {}
-        for tensor, (_, value) in self._attr_map.items():
-            if value.device.type != 'cpu':
-                # Copy each source storage once; per-tensor .cpu() loses aliases
-                # and rebases the offsets of views before packing can see them.
-                storage = value.untyped_storage()
-                if storage._cdata not in cpu_storages:
-                    cpu_storages[storage._cdata] = storage.cpu()
-                host = torch.empty(0, dtype=value.dtype, device='cpu').set_(
-                    cpu_storages[storage._cdata], value.storage_offset(), value.size(), value.stride())
-                if value.is_conj():
-                    host = host.conj()
-                if value.is_neg():
-                    host = host._neg_view()
-                value = host.requires_grad_(value.requires_grad)
-            tid2value[tensor.tid] = value
+        tid2value = {t.tid: val.cpu() for t, (_, val) in self._attr_map.items()}
         chunks, chunk, size = [], [], 0
         for tid, value in tid2value.items():
             numel = value.numel()
