@@ -352,6 +352,9 @@ def create_wrapped_module_getattribute(tracer: 'ConcreteTracer'):
             return tracer.create_proxy('get_attr', tracer.path_of_parameter[id(attr_val)], (), {})
         elif id(attr_val) in tracer.path_of_buffer:
             return tracer.create_proxy('get_attr', tracer.path_of_buffer[id(attr_val)], (), {})
+        elif orig_func.isinstance(attr_val, torch.Tensor) and attr_val in tracer.tensor_attrs:
+            # Preserve ordinary tensor attributes before execution moves their values.
+            return tracer.create_proxy('get_attr', tracer.tensor_attrs[attr_val], (), {})
         return attr_val
     return module_getattribute_wrapper
 
