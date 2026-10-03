@@ -78,7 +78,18 @@ class BaseTraceStrategy:
         # To handle this case, we need manually set the `requires_grad` field after device placement operation.
         if device not in ['cpu', 'cuda', 'meta']:
             raise ValueError(f'unsupported device type: {device}')
-        return pytree_utils.tree_map_only(torch.Tensor, lambda x: x.to(device).requires_grad_(x.requires_grad), args)
+        # A result may be an input (identity/in-place ops), and arguments may
+        # repeat a tensor. Preserve that identity and transfer each object once.
+        # Distinct views remain distinct; sharing a storage alone is not enough.
+        moved = {}
+
+        def place(tensor):
+            key = id(tensor)
+            if key not in moved:
+                moved[key] = tensor.to(device).requires_grad_(tensor.requires_grad)
+            return moved[key]
+
+        return pytree_utils.tree_map_only(torch.Tensor, place, args)
 
     def run_placeholder(self, target: Target, args: Tuple[Any, ...], kwargs: Dict[str, Any]) -> Tuple[Any, Tuple, Dict]:
         return self.tracer.placeholder_dict[target], args, kwargs
@@ -164,6 +175,10 @@ class BaseTraceStrategy:
             kind (str) : one of "placeholder", "call_function", "call_method", "call_module", "get_attr", "output".
         """
         return self._run_target(kind, target, args, kwargs)
+
+    def clear_cache(self) -> None:
+        """Release execution-only state after each trace, including failures."""
+        pass
 
 
 class CpuStrategy(BaseTraceStrategy):
@@ -270,6 +285,10 @@ class ReuseCacheStrategy(CudaRunCpuOffloadStrategy):
         # some ops don't use gpu, so directly run them on cpu and don't cache them
         # TODO: add functions to optimize the cache memory cost.
         self.force_cpu_ops = []
+
+    def clear_cache(self) -> None:
+        self.cache.clear()
+        self.cache_size = 0
 
     def force_cpu_run(self, kind, target):
         if kind == 'call_function':

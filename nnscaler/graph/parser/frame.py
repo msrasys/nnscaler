@@ -175,7 +175,8 @@ class Frame:
 
         Args:
             save_file_stem (str): stem file name. Actual file name will be `save_file_stem`.0, `save_file_stem`.1, etc.
-            params_per_file (int): number of params per file,default is 1 billion
+            params_per_file (int): target element count per file, default 1024**3.
+                Tensors are saved whole; an oversized tensor occupies one file.
             max_workers (Optional[int]): maximum queued/running shard saves. Defaults to
                 CompileFlag.attr_save_workers (ATTR_SAVE_WORKERS, default 8). Use 1 for serial saves.
 
@@ -190,21 +191,20 @@ class Frame:
             max_workers = CompileFlag.attr_save_workers
         if isinstance(max_workers, bool) or not isinstance(max_workers, int) or max_workers < 1:
             raise ValueError(f'attr save max_workers (ATTR_SAVE_WORKERS) must be a positive integer, got {max_workers!r}')
-
-        #TODO: use FxModuleParser.ATTR_CONTENT_FILE_FORMAT to name the files.
-        total_size = sum([val.numel() for _, (_, val) in self._attr_map.items()])
-        model_pt_part_num = (total_size + params_per_file - 1) // params_per_file
+        if isinstance(params_per_file, bool) or not isinstance(params_per_file, int) or params_per_file < 1:
+            raise ValueError('params_per_file must be a positive integer')
 
         tid2value = {t.tid: val.cpu() for t, (_, val) in self._attr_map.items()}
-        tids = list(tid2value)
-        # it can be zero if there is no param in the module (self._attr_map is empty)
-        if model_pt_part_num <= 1:
-            chunks = [tids]
-        else:
-            assert len(tids) > 0, "Empty attr map"
-            chunk_size = (len(tids) + model_pt_part_num - 1) // model_pt_part_num
-            chunks = [tids[i:min(i + chunk_size, len(tids))] for i in
-                      range(0, len(tids), chunk_size)]
+        chunks, chunk, size = [], [], 0
+        for tid, value in tid2value.items():
+            numel = value.numel()
+            if chunk and size + numel > params_per_file:
+                chunks.append(chunk)
+                chunk, size = [], 0
+            chunk.append(tid)
+            size += numel
+        if chunk or not chunks:
+            chunks.append(chunk)
 
         max_workers = min(max_workers, len(chunks))
         tid_to_chunk = {tid: idx for idx, chunk in enumerate(chunks) for tid in chunk}

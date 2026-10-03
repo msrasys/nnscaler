@@ -256,14 +256,26 @@ class ConcreteTracer(TracerBase):
 
             args_unwrapped = pytree_utils.tree_map_only(ep.ConcreteProxy, unwrap_nested_proxy, args)
             kwargs_unwrapped = pytree_utils.tree_map_only(ep.ConcreteProxy, unwrap_nested_proxy, kwargs)
+
+            def run_target():
+                wrap_info = self.autowrap_leaf_function.get(node_target)
+                if (wrap_info is not None and wrap_info.fake_fn_on_cpu
+                        and self.strategy.main_device == 'cpu'):
+                    # Module.cpu() does not move unregistered tensor attributes.
+                    # Place all fake inputs on CPU without a CUDA round trip.
+                    return self.strategy._run_call_function_on(
+                        target, args_unwrapped, kwargs_unwrapped, device='cpu',
+                    )
+                return self.strategy.run_target(kind, target, args_unwrapped, kwargs_unwrapped)
+
             # A lot of autograd functions are using torch.compile
             # We must revert the patcher to the original function so torch.compile can work.
             # (For non-torch.compile functions, this is not necessary, but it is safe to do so.)
             if self.need_revert(target) or wrap_utils.is_autograd_apply(target):
                 with self.patcher.revert():
-                    value_unwrapped, args_run, kwargs_run = self.strategy.run_target(kind, target, args_unwrapped, kwargs_unwrapped)
+                    value_unwrapped, args_run, kwargs_run = run_target()
             else:
-                value_unwrapped, args_run, kwargs_run = self.strategy.run_target(kind, target, args_unwrapped, kwargs_unwrapped)
+                value_unwrapped, args_run, kwargs_run = run_target()
 
             # because setitem is an inplace operation and will not return the obj, so here is a workaound to record node result
             node_result = args_run[0] if kind == "call_function" and target == orig_func.setitem else value_unwrapped
@@ -781,11 +793,15 @@ class ConcreteTracer(TracerBase):
                     self.create_node('output', 'output', (self.create_arg(results),),
                                      {}, type_expr=fn.__annotations__.get('return', None), node_result=node_result)
         finally:
-            _retain_weight_consistency(self.root)
-            # clean up caches
-            for func in self.cached_function:
-                if func is not None:
-                    func.cache_clear()
+            try:
+                _retain_weight_consistency(self.root)
+            finally:
+                # Tracer and strategy reference each other. Don't retain all
+                # cached activations until cyclic GC happens to collect them.
+                self.strategy.clear_cache()
+                for func in self.cached_function:
+                    if func is not None:
+                        func.cache_clear()
 
         return self.graph
 

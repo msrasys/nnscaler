@@ -251,3 +251,32 @@ def test_load_attr_content_only_reads_required_chunks(tmp_path: Path, monkeypatc
         (FxModuleParser.ATTR_CONTENT_INDEX_FILE, {'weights_only': True}),
         ('fullmodel.pt.2', {'mmap': True, 'weights_only': True}),
     ]
+
+
+@pytest.mark.parametrize('workers', [1, 4])
+def test_save_attr_content_balances_elements_and_preserves_values(tmp_path, workers):
+    frame = Frame()
+    base = torch.arange(48, dtype=torch.float32).reshape(6, 8)
+    values = [base[:, ::2], torch.arange(3, dtype=torch.bfloat16),
+              torch.arange(3, dtype=torch.int64), base.t()]
+    tensors = [IRFullTensor(tuple(value.shape), name=f'w{i}', dtype=value.dtype)
+               for i, value in enumerate(values)]
+    for i, (tensor, value) in enumerate(zip(tensors, values)):
+        frame.add_attr(tensor, value, f'w{i}')
+    stem = tmp_path/'fullmodel.pt'
+    frame.save_attr_content(stem, params_per_file=8, max_workers=workers)
+    index = torch.load(f'{stem}.index', weights_only=True)
+    assert index == {tensors[0].tid: 0, tensors[1].tid: 1,
+                     tensors[2].tid: 1, tensors[3].tid: 2}
+    for tensor, value in zip(tensors, values):
+        actual = torch.load(f'{stem}.{index[tensor.tid]}', mmap=True, weights_only=True)[tensor.tid]
+        assert torch.equal(actual, value)
+        assert actual.dtype == value.dtype
+        assert actual.stride() == value.stride()
+
+
+@pytest.mark.parametrize('value', [0, -1, True, 1.5, '4'])
+def test_save_attr_content_invalid_chunk_limits(tmp_path, value):
+    with pytest.raises(ValueError, match='positive integer'):
+        Frame().save_attr_content(tmp_path/'fullmodel.pt', params_per_file=value)
+    assert not list(tmp_path.iterdir())

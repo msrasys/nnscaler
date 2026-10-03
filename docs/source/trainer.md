@@ -941,7 +941,10 @@ which controls per-rank code generation.
 At most `ATTR_SAVE_WORKERS` shard writes are queued or running at once.
 Writer threads share the CPU tensors prepared by the parser without copying
 the model into worker processes; the complete CPU tensor set still resides in
-memory. Shard contents, numbering, and the loading format are unchanged.
+memory. Files are grouped by cumulative tensor element count
+(`params_per_file`, default `1024**3`). Tensors are never split; a tensor larger
+than the target occupies one file. File groupings may change, but tensor values
+and the index/loading format remain unchanged.
 Each file is written to a temporary file in the destination directory and
 renamed into place. The old index is removed before rewriting shards, and
 `fullmodel.pt.index` is published only after all writes succeed. If saving

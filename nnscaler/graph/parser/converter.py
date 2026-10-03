@@ -86,6 +86,7 @@ def to_fx_graph(model: torch.nn.Module, dummy_input) -> torch.fx.GraphModule:
         CustomizedOps.kOpRuntime[sign]: LeafWrapInfo(
             [], True, CustomizedOps.kOpFakeRuntime[sign],
             replace_traced_code=False,
+            fake_fn_on_cpu=CustomizedOps.kOpFakeRuntimeCPU.get(sign, False),
         )
         for sign in CustomizedOps.kOpMap
         if CustomizedOps.kOpRuntime[sign] and not is_autograd_apply(CustomizedOps.kOpRuntime[sign])

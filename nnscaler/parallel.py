@@ -1228,6 +1228,8 @@ def _gencode_in_subprocesses(
                     command,
                     stdout=log_stream,
                     stderr=subprocess.STDOUT,
+                    env={**os.environ, 'OMP_NUM_THREADS': '1',
+                         'MKL_NUM_THREADS': '1', 'OPENBLAS_NUM_THREADS': '1'},
                 )
             except Exception:
                 log_stream.close()

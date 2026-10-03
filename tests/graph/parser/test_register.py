@@ -2,13 +2,16 @@
 #  Licensed under the MIT License.
 
 import nnscaler
-from nnscaler.graph.parser.converter import convert_model
+from nnscaler.graph.parser.converter import convert_model, to_fx_graph, to_ir_graph
 from nnscaler.profiler.database import get_func
 from nnscaler.codegen.emit import FuncEmission
 from nnscaler.graph.function.dimops import DimopSplit, TransformRule
 from nnscaler.graph.parser.register import CustomizedOps
 import tempfile
 import torch
+import pytest
+from unittest.mock import patch
+from nnscaler.flags import CompileFlag
 
 from ...utils import replace_all_device_with
 
@@ -309,3 +312,102 @@ def test_register_fake_fn():
         for node, p_name in zip(ir_graph.nodes(), ['linear', 'linear', 'add_xy']):
             profile_name = get_func(node)[0].__qualname__
             assert profile_name == p_name, f'{profile_name} should be {p_name}'
+
+
+_fake_input_devices = []
+
+
+def shape_only_add(x, weight):
+    _fake_input_devices.append((x.device.type, weight.device.type))
+    return x.new_zeros(x.shape, requires_grad=x.requires_grad or weight.requires_grad)
+
+
+@nnscaler.register_op('a b, a b -> a b', fake_fn=shape_only_add, fake_fn_on_cpu=True)
+def real_shape_only_add(x, weight):
+    raise AssertionError('runtime kernel must not run during tracing')
+
+
+@nnscaler.register_op('a b, a b -> a b', fake_fn=shape_only_add)
+def real_strategy_add(x, weight):
+    raise AssertionError('runtime kernel must not run during tracing')
+
+
+class ShapeOnlyModel(torch.nn.Module):
+    def __init__(self, cpu_fake):
+        super().__init__()
+        self.cpu_fake = cpu_fake
+        self.weight = torch.nn.Parameter(torch.ones(4, 8, dtype=torch.bfloat16))
+
+    def forward(self, x):
+        if self.cpu_fake:
+            return real_shape_only_add(x, self.weight)
+        return real_strategy_add(x, self.weight)
+
+
+@pytest.mark.parametrize('cpu_fake', [False, True])
+@pytest.mark.parametrize('strategy', ['cpu', 'cuda_run_cpu_offload', 'reuse_cache', 'meta', 'cuda'])
+def test_fake_device_opt_in_preserves_metadata_and_runtime_operator(tmp_path, strategy, cpu_fake):
+    device = strategy if strategy in ('cpu', 'meta', 'cuda') else ('cpu' if cpu_fake else 'cuda')
+    if device == 'cuda' and not torch.cuda.is_available():
+        pytest.skip('CUDA required')
+    _fake_input_devices.clear()
+    with patch.object(CompileFlag, 'trace_strategy', strategy):
+        graph = convert_model(ShapeOnlyModel(cpu_fake), {'x': torch.ones(4, 8, dtype=torch.bfloat16)}, tmp_path, False)
+    assert _fake_input_devices == [(device, device)]
+    node = graph.nodes()[0]
+    assert get_func(node)[0] is (real_shape_only_add if cpu_fake else real_strategy_add)
+    assert node.output(0).shape == (4, 8)
+    assert node.output(0).dtype == torch.bfloat16
+    assert node.output(0).requires_grad
+
+
+def test_cpu_fake_opt_in_requires_a_fake():
+    with pytest.raises(ValueError, match='requires fake_fn'):
+        nnscaler.register_op('a b, a b -> a b', fake_fn_on_cpu=True)(mock_add)
+
+
+def fake_mixed_device_add(x, y):
+    assert x.device.type == y.device.type == 'cpu'
+    return x + y
+
+
+@nnscaler.register_op('a b, a b -> a b', fake_fn=fake_mixed_device_add, fake_fn_on_cpu=True)
+def real_mixed_device_add(x, y):
+    assert x.device.type == y.device.type == 'cuda'
+    return x + y
+
+
+class MixedDeviceFakeModel(torch.nn.Module):
+    def __init__(self, use_kwargs):
+        super().__init__()
+        self.use_kwargs = use_kwargs
+        # Ordinary tensor attributes are not moved by Module.cpu().
+        self.extra = torch.ones(4, 8, device='cuda', dtype=torch.bfloat16, requires_grad=True)
+
+    def forward(self, x):
+        if self.use_kwargs:
+            return real_mixed_device_add(x, y=self.extra)
+        return real_mixed_device_add(x, self.extra)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason='CUDA required')
+@pytest.mark.parametrize('strategy', ['cpu', 'cuda_run_cpu_offload', 'reuse_cache'])
+@pytest.mark.parametrize('use_kwargs', [False, True])
+def test_cpu_fake_moves_unregistered_cuda_tensor(tmp_path, strategy, use_kwargs):
+    model = MixedDeviceFakeModel(use_kwargs)
+    inputs = {'x': torch.ones(4, 8, dtype=torch.bfloat16)}
+    with patch.object(CompileFlag, 'trace_strategy', strategy):
+        traced = to_fx_graph(model, inputs)
+        graph = to_ir_graph(traced, inputs, tmp_path, False)
+    assert [node.target for node in traced.graph.nodes if node.op == 'get_attr'] == ['extra']
+    assert traced.extra is model.extra
+    x = inputs['x'].cuda()
+    torch.testing.assert_close(traced(x), x + model.extra)
+    # Replacing the attribute must affect execution, rather than reading a tracing copy.
+    traced.extra = torch.full_like(model.extra, 3)
+    torch.testing.assert_close(traced(x), x + traced.extra)
+    node = graph.nodes()[0]
+    assert get_func(node)[0] is real_mixed_device_add
+    assert node.output(0).shape == (4, 8)
+    assert node.output(0).dtype == torch.bfloat16
+    assert node.output(0).requires_grad

@@ -179,6 +179,15 @@ The generated files include:
 2. trace files: graph dump (`graph.ckp`), forward args dump (`forward_args.pkl`), origin module metadata (`origin_module_metadata.pt`), init weights (`fullmodel.pt.*`), param name mapping (`dist_param_map.pt`)
 3. code: generated code files (`gencode*.py`)
 
+See [initial weight saving](trainer.md#initial-weight-saving-during-compilation)
+for writer concurrency and weight-file grouping.
+
+Codegen workers limit their CPU tensor threads to one; the parent can use
+more threads for initialization and tracing.
+The `reuse_cache` tracing strategy releases its execution-only tensor cache
+after each trace, including failed traces, before initial weights are written.
+Recorded graph metadata and tensors referenced by the model are retained.
+
 ```python
 class BroadcastGenFilesStrategy(Enum):
     NONE = 'none'

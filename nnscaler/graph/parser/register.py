@@ -30,6 +30,8 @@ class CustomizedOps:
     # signature -> fake runtime function
     # TODO: autograd function cannot have fake runtime function now
     kOpFakeRuntime: Dict[str, Optional[Callable]] = {}
+    # signature -> whether the fake may run on CPU during CPU/offload tracing
+    kOpFakeRuntimeCPU: Dict[str, bool] = {}
     # signature -> runtime function implementation code
     kOpCodeDef: Dict[str, str] = {}
     # signature -> special emit function, will not store if emit_fn is None
@@ -66,7 +68,8 @@ class CustomizedOps:
         *,
         emit_fn: Callable[[IRFwOperation, List[str], Dict[str, str], int, int, int], str] = None,
         input_gen_fn: Callable[[IRFwOperation], List[torch.Tensor]] = None,
-        fake_fn: Optional[Callable] = None
+        fake_fn: Optional[Callable] = None,
+        fake_fn_on_cpu: bool = False,
     ) -> None:
         """Register an operator
 
@@ -86,6 +89,8 @@ class CustomizedOps:
                 If fake_fn is None, runtime_fn will be used,
                 which may cause errors if runtime_fn contains operations
                 that cannot run during tracing (e.g., distributed communication ops).
+            fake_fn_on_cpu (bool): allow fake_fn to use existing CPU tensors in
+                CPU/offload tracing. Defaults to the strategy's device placement.
         Returns:
             None
         """
@@ -96,6 +101,7 @@ class CustomizedOps:
         CustomizedOps.kOpMap[signature] = op_create_fn
         CustomizedOps.kOpRuntime[signature] = runtime_fn
         CustomizedOps.kOpFakeRuntime[signature] = fake_fn
+        CustomizedOps.kOpFakeRuntimeCPU[signature] = fake_fn_on_cpu
         CustomizedOps.kOpCodeDef[signature] = code
         if emit_fn is not None:
             CustomizedOps.kOpEmit[signature] = emit_fn
@@ -110,6 +116,7 @@ def register_op(annotation: Union[str, Callable], name: Optional[str] = None,
                 transform_rules: Tuple[TransformRule] = None,
                 input_gen_fn: Callable[[IRFwOperation], List[torch.Tensor]] = None,
                 fake_fn: Optional[Callable] = None,
+                fake_fn_on_cpu: bool = False,
     ) -> Callable:
     """
     Register a function with IRDimops annotations.
@@ -180,10 +187,17 @@ def register_op(annotation: Union[str, Callable], name: Optional[str] = None,
         fake_fn (Callable): a lightweight substitute for runtime_fn during tracing.
             It must have the same signature (inputs and outputs) as runtime_fn so that
             the two are interchangeable.
+            The substitute must preserve output shape, dtype and differentiability.
+            Generated code calls runtime_fn.
             If fake_fn is None, runtime_fn will be used directly,
             which may cause errors if runtime_fn contains operations
             that cannot run during tracing (e.g., distributed communication ops).
             Default: None.
+
+        fake_fn_on_cpu (bool): opt into executing fake_fn on the existing CPU
+            tensors in CPU/offload tracing, avoiding CUDA transfers. The fake
+            must support CPU inputs. Pure CUDA/meta tracing keeps its device
+            placement. Defaults to False, preserving the strategy's behavior.
 
     Returns:
         fn (Callable): the runtime function
@@ -197,6 +211,8 @@ def register_op(annotation: Union[str, Callable], name: Optional[str] = None,
 
         if fake_fn is not None and not callable(fake_fn):
             raise TypeError("Expected a fake function")
+        if fake_fn_on_cpu and fake_fn is None:
+            raise ValueError('fake_fn_on_cpu requires fake_fn')
 
         # TODO: add support for autograd function in the future
         if fake_fn is not None and is_autograd_op(fn):
@@ -305,7 +321,8 @@ def register_op(annotation: Union[str, Callable], name: Optional[str] = None,
             fsig, udfop, code, fn,
             emit_fn=emit_fn,
             input_gen_fn=input_gen_fn,
-            fake_fn=fake_fn
+            fake_fn=fake_fn,
+            fake_fn_on_cpu=fake_fn_on_cpu,
         )
         return fn
 
