@@ -13,6 +13,8 @@ import warnings
 from pathlib import Path
 from dataclasses import dataclass, asdict
 from collections import defaultdict
+from contextlib import contextmanager
+from contextvars import ContextVar
 import math
 
 import torch
@@ -39,6 +41,17 @@ if TYPE_CHECKING:
 
 
 _logger = logging.getLogger(__name__)
+_strict_merged_loading = ContextVar('nnscaler_strict_merged_loading', default=False)
+
+
+@contextmanager
+def strict_merged_loading():
+    """Check ParallelModule keys during the ordinary recursive load pass."""
+    token = _strict_merged_loading.set(True)
+    try:
+        yield
+    finally:
+        _strict_merged_loading.reset(token)
 
 
 @dataclass
@@ -1791,7 +1804,8 @@ class ParallelModule(CubeModule):
         else:
             for hook in self._load_state_dict_pre_hooks.values():
                 hook(state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs)
-            new_missing_keys = self.load_merged_state_dict(state_dict, prefix, strict=False)
+            new_missing_keys = self.load_merged_state_dict(
+                state_dict, prefix, strict=_strict_merged_loading.get())
             if strict:
                 missing_keys.extend(new_missing_keys)
 

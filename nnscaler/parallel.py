@@ -11,7 +11,7 @@ import itertools
 import sys
 import importlib
 from dataclasses import dataclass, asdict, field, replace
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 import logging
 import copy
 import os
@@ -60,6 +60,7 @@ from nnscaler.runtime.module import (
     ExtraState,
     dedup_attrs,
     NonParallelModule,
+    strict_merged_loading,
 )
 
 from nnscaler.flags import CompileFlag, RuntimeFlag
@@ -2655,7 +2656,24 @@ def merge_state_dicts(
     return ret_state_dict, ret_opt_state_dict
 
 
+@contextmanager
+def _merged_load_cpu_threads():
+    requested = int(os.environ.get('NNSCALER_MERGED_LOAD_THREADS', '0'))
+    if requested < 0:
+        raise ValueError('NNSCALER_MERGED_LOAD_THREADS must be nonnegative')
+    previous = torch.get_num_threads()
+    changed = requested > 0 and requested != previous
+    if changed:
+        torch.set_num_threads(requested)
+    try:
+        yield
+    finally:
+        if changed:
+            torch.set_num_threads(previous)
+
+
 @torch.no_grad()
+@_merged_load_cpu_threads()
 def load_merged_state_dict(
     module: torch.nn.Module,
     module_state_dict: Dict[str, Any],
@@ -2685,12 +2703,23 @@ def load_merged_state_dict(
     # non ParallelModule parameters will be loaded here
     # there will be mismatched keys if the module is a ParallelModule or contains ParallelModule
     # so we need to ignore the mismatched keys
-    module.load_state_dict(module_state_dict, strict=False)
-    # load ParallelModule state dicts
-    for name, child_module in module.named_modules():
-        if isinstance(child_module, ParallelModule):
-            prefix = name + '.' if name else ''
-            child_module.load_merged_state_dict(module_state_dict, prefix=prefix)
+    single_pass = os.environ.get('NNSCALER_MERGED_LOAD_ONCE', '0') == '1'
+    single_pass = single_pass and (
+        getattr(module.load_state_dict, '__func__', None) is torch.nn.Module.load_state_dict
+    )
+    # Legacy inputs with per-module extra state retain the original two-pass
+    # path. A genuine merged dict has original parameter names and no such state.
+    single_pass = single_pass and not any(
+        (name + '.' if name else '') + child.EXTRA_STATE_KEY in module_state_dict
+        for name, child in module.named_modules() if isinstance(child, ParallelModule)
+    )
+    with strict_merged_loading() if single_pass else nullcontext():
+        module.load_state_dict(module_state_dict, strict=False)
+    if not single_pass:
+        for name, child_module in module.named_modules():
+            if isinstance(child_module, ParallelModule):
+                prefix = name + '.' if name else ''
+                child_module.load_merged_state_dict(module_state_dict, prefix=prefix)
 
     if optimizer is not None and optimizer_state_dict is not None:
         new_optimizer_state_dict = _trim_optimizer_merged_state_dict(module, optimizer._extra_state, optimizer_state_dict, device='cpu')

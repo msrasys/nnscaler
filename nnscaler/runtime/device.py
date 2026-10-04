@@ -21,6 +21,7 @@ _LARGE_TIMEOUT = datetime.timedelta(seconds=21600)
 class _DeviceGroup:
     def __init__(self):
         self._is_pg_initer = False
+        self._local_group_init = os.environ.get('NNSCALER_LOCAL_GROUP_INIT', '0') == '1'
         if CompileFlag.dev_mode or not is_running_distributed():
             self.rank = 0
             self.world_size = 1
@@ -34,7 +35,10 @@ class _DeviceGroup:
                 # thousands of global singleton/P2P groups. The opt-in lazy
                 # path keeps the same group order and barriers, initializing
                 # each communicator when its members first use it instead.
-                eager_groups = os.environ.get('NNSCALER_EAGER_GROUP_INIT', '1') != '0'
+                eager_groups = (
+                    os.environ.get('NNSCALER_EAGER_GROUP_INIT', '1') != '0'
+                    and not self._local_group_init
+                )
                 if torch.__version__ >= (2, 3) and eager_groups:
                     torch.distributed.init_process_group(
                         backend='nccl', timeout=_LARGE_TIMEOUT,
@@ -63,6 +67,9 @@ class _DeviceGroup:
             self.node_rank = int(os.environ.get('GROUP_RANK'))
 
         torch.cuda.set_device(self.local_rank)
+        if self._local_group_init and not CompileFlag.dev_mode and is_running_distributed():
+            from nnscaler.runtime.group_init import check_local_group_support
+            check_local_group_support()
         self.groups: Dict = { '1'*self.world_size: None }
         self.p2p_groups: Dict[tuple[int, int], Optional[torch.distributed.ProcessGroup]] = {}
         self.use_p2p_groups = (
@@ -96,8 +103,13 @@ class _DeviceGroup:
             return None
         rank_bits = self.bitmap(ranks)
         if rank_bits not in self.groups:
-            self.groups[rank_bits] = torch.distributed.new_group(
-                list(ranks), timeout=_LARGE_TIMEOUT)
+            if self._local_group_init:
+                from nnscaler.runtime.group_init import new_local_group
+                self.groups[rank_bits] = new_local_group(
+                    ranks, namespace='collective', timeout=_LARGE_TIMEOUT)
+            else:
+                self.groups[rank_bits] = torch.distributed.new_group(
+                    list(ranks), timeout=_LARGE_TIMEOUT)
         return self.groups[rank_bits]
 
     def init_p2p_groups(self, pairs):
@@ -121,8 +133,13 @@ class _DeviceGroup:
 
         for pair in normalized_pairs:
             if pair not in self.p2p_groups:
-                self.p2p_groups[pair] = torch.distributed.new_group(
-                    list(pair), timeout=_LARGE_TIMEOUT)
+                if self._local_group_init:
+                    from nnscaler.runtime.group_init import new_local_group
+                    self.p2p_groups[pair] = new_local_group(
+                        pair, namespace='p2p', timeout=_LARGE_TIMEOUT)
+                else:
+                    self.p2p_groups[pair] = torch.distributed.new_group(
+                        list(pair), timeout=_LARGE_TIMEOUT)
         torch.distributed.barrier()
 
     def get_p2p_group(self, src: int, dst: int):
