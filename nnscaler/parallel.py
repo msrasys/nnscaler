@@ -689,6 +689,7 @@ def _prepare_and_check_reusable(
         compute_config: ComputeConfig,
         instance_name: Optional[str] = None,
         reuse: ReuseType = ReuseType.MATCH,
+        allow_missing_init_weights: bool = False,
     ) -> Tuple[str, bool]:
     """
     Prepare the output directory for code generation, and also check if the existing code is reusable.
@@ -751,6 +752,11 @@ def _prepare_and_check_reusable(
         expected_output_files.append(outdir / _FORWARD_ARGS_DUMP_FILE)
         expected_output_files.append(outdir / ParallelModule.ORIGIN_MODULE_METADATA_FILE)
         expected_output_files.append(outdir / FxModuleParser.NON_PERSISTENT_BUFFER_FILE)
+        # A resume-only staged package can omit initial weights, which would
+        # be overwritten by the checkpoint. All code, configuration, mapping,
+        # graph metadata, and non-persistent buffers are still mandatory.
+        if allow_missing_init_weights and not (outdir / FxModuleParser.ATTR_CONTENT_FILE_0).exists():
+            expected_output_files.remove(outdir / FxModuleParser.ATTR_CONTENT_FILE_0)
         compact_expected_output_files = expected_output_files + [outdir / ParallelModule.ATTR_META_FILE]
         legacy_expected_output_files = expected_output_files + [
             outdir / ParallelModule.ATTR_META_FILE_TEMPLATE.format(rank)
@@ -1373,6 +1379,7 @@ def parallelize(
     module_dtype:  Optional[torch.dtype] = None,
     module_fn: Optional[Callable[[], torch.nn.Module]] = None,
     init_module_params: bool = True,
+    allow_missing_init_weights: bool = False,
     build_module_buckets: bool = True,
     broadcast_strategy: Union[str, BroadcastGenFilesStrategy] = 'none',
     autoset_requires_grad: bool = True,
@@ -1456,6 +1463,11 @@ def parallelize(
             so it is only used when module_or_module_class is a module object, and load_module is true.
             Please leave it to true until you have a good reason to change it.
         module_dtype (Optional[torch.dtype]): the dtype of the module. Keep the module as it is if it is None.
+        allow_missing_init_weights (bool): accept a resume-only generated package without
+            initial fullmodel.pt.<n> shards. Code, compute configuration, attribute metadata
+            and non-persistent buffers are still checked. The caller must construct the
+            generated class with init_params=False and restore its weights before use.
+            This does not skip initialization or relax checkpoint validation by itself.
         module_fn (Optional[Callable[[], torch.nn.Module]]): the function to create the module. Will use __init__ if it is None.
         broadcast_strategy (Union[str, BroadcastGenFilesStrategy]): the broadcast strategy for generated files.
             Please note that the broadcasting will only be done in torchrun environment,
@@ -1516,7 +1528,9 @@ def parallelize(
         # generate code only in node0
         # if it is not in a torchrun environment, just generate.
         if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
-            outdir, reusable = _prepare_and_check_reusable(gen_savedir, module_class, compute_config, instance_name, reuse)
+            outdir, reusable = _prepare_and_check_reusable(
+                gen_savedir, module_class, compute_config, instance_name, reuse,
+                allow_missing_init_weights=allow_missing_init_weights)
             if not reusable:
                 config_file = outdir / ParallelModule.COMPUTE_CONFIG_FILE
                 ComputeConfig.safe_dump_to_file(compute_config, config_file)  # always refresh compute config

@@ -2,6 +2,7 @@
 #  Licensed under the MIT License.
 
 import types
+import os
 import torch
 from typing import Any, Optional
 from dataclasses import asdict, replace
@@ -244,9 +245,18 @@ class ModuleParallelizeConfigAdapter(PrecisionMixin, PolicyMixin):
             codegen_workers=self.codegen_workers,
             load_module=load_module,
             autoset_requires_grad=self.autoset_requires_grad,
+            allow_missing_init_weights=not init_params,
         )
         if load_module:
-            pmodel = pmodel_class(init_params=init_params, build_buckets=False)
+            if (not init_params and torch.cuda.is_available()
+                    and os.environ.get('NNSCALER_RESUME_INIT_ON_CUDA', '0') == '1'):
+                # The checkpoint supplies these values. Avoid allocating
+                # untouched CPU parameter storage and copying it to CUDA.
+                # npbuffer.pt still initializes non-persistent buffers.
+                with torch.device('cuda', torch.cuda.current_device()):
+                    pmodel = pmodel_class(init_params=False, build_buckets=False)
+            else:
+                pmodel = pmodel_class(init_params=init_params, build_buckets=False)
             self.set_grad_dtype(pmodel)
             if build_buckets:
                 pmodel.build_buckets()
