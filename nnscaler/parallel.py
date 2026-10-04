@@ -2707,19 +2707,30 @@ def load_merged_state_dict(
     single_pass = single_pass and (
         getattr(module.load_state_dict, '__func__', None) is torch.nn.Module.load_state_dict
     )
-    # Legacy inputs with per-module extra state retain the original two-pass
-    # path. A genuine merged dict has original parameter names and no such state.
-    single_pass = single_pass and not any(
-        (name + '.' if name else '') + child.EXTRA_STATE_KEY in module_state_dict
+    parallel_modules = [
+        (name + '.' if name else '', child)
         for name, child in module.named_modules() if isinstance(child, ParallelModule)
+    ]
+    # Legacy inputs with per-module extra state retain the original two-pass
+    # path. Custom handlers need not call our merged-loading implementation,
+    # so they also require the explicit pass rather than silently missing data.
+    single_pass = single_pass and all(
+        prefix + child.EXTRA_STATE_KEY not in module_state_dict
+        and getattr(child._load_from_state_dict, '__func__', None)
+        is ParallelModule._load_from_state_dict
+        for prefix, child in parallel_modules
     )
+    if single_pass:
+        # Shared modules can have only their canonical prefix in a merged
+        # checkpoint. Strict recursive loading would check the aliases too.
+        visits = sum(isinstance(child, ParallelModule)
+                     for _, child in module.named_modules(remove_duplicate=False))
+        single_pass = visits == len(parallel_modules)
     with strict_merged_loading() if single_pass else nullcontext():
         module.load_state_dict(module_state_dict, strict=False)
     if not single_pass:
-        for name, child_module in module.named_modules():
-            if isinstance(child_module, ParallelModule):
-                prefix = name + '.' if name else ''
-                child_module.load_merged_state_dict(module_state_dict, prefix=prefix)
+        for prefix, child_module in parallel_modules:
+            child_module.load_merged_state_dict(module_state_dict, prefix=prefix)
 
     if optimizer is not None and optimizer_state_dict is not None:
         new_optimizer_state_dict = _trim_optimizer_merged_state_dict(module, optimizer._extra_state, optimizer_state_dict, device='cpu')
@@ -2936,110 +2947,69 @@ def _construct_optim_state_zero(
             key: original parameter name
             value: the state dict for each attribute, e.g. 'step', 'exp_avg', 'exp_avg_sq' are keys
     """
-    dist_param_map = module.dist_param_map  # name in parallel module (without tid suffix) -> name in origin module
-    param_area_map = module.fullmap         # str -> AttrMeta
-    def _get_optimizer_state_of_param(param, param_ids, local_names):
-        # find the parameter's optimizer state and pick the slices induced by tensor parallelism
-        param_idx = param_ids.index(id(param))
-        local_name = local_names[param_idx]
-        return _extract_new_state(local_name, orig_param_dict, dist_param_map, param_area_map)
-
-    # prepare param ids and corresponding local param names
-    param_ids, local_names = [], []
-    for local_name, param in module.named_parameters():
-        param_ids.append(id(param))
-        local_names.append(local_name)
+    # Resolve identity once instead of scanning all parameters for each bucket.
+    local_names = {id(param): name for name, param in module.named_parameters()}
     state_dict, opt_param_idx = {}, 0
     opt_param = module.parameters_for_optimizer()
-    # first load the params' optimizer state for the reducers's flattened params
     for reducer in module.reducers:
         rank_idx, sub_ranks = module._get_zero_subranks(reducer)
         for bucket in reducer.buckets:
-            # one bucket corresponds to one flattened param
             assert len(opt_param[opt_param_idx].shape) == 1
             assert bucket._contiguous_params.shape[0] % len(sub_ranks) == 0
             chunk_size = bucket._contiguous_params.shape[0] // len(sub_ranks)
-            # the flattened param is in the range [bucket_chunk_start, bucket_chunk_end)
-            bucket_chunk_start = rank_idx * chunk_size
-            bucket_chunk_end = (rank_idx + 1) * chunk_size
-            # NOTE: assume the traverse order of params is consistent
-            # with them in contiguous buffer.
-            # param_offset: the param's start offset in the contiguous buffer
-            # chunk_offset: the offset of the current rank corresponding chunk
-            step, opt_states, opt_state_keys = None, {}, None
+            chunk_start = rank_idx * chunk_size
+            chunk_end = chunk_start + chunk_size
+            opt_states, state_keys, step = {}, None, None
             for param in bucket.params:
-                param_offset = reducer.get_param_info(param).bucket_param_buffer_start
-                sliced_new_val = _get_optimizer_state_of_param(param, param_ids, local_names)
-                # there are padding in the chunk, so `param.numel()` doesn't work here
-                param_numel = bucket.get_aligned_numel(param)
-                # init the chunk's optimizer state
-                if opt_state_keys is None:
-                    opt_state_keys = [key for key in sliced_new_val]
-                    if 'step' in sliced_new_val:
-                        step = sliced_new_val['step']
-                    if 'step' in sliced_new_val:
-                        opt_state_keys.remove('step')
-                    for key in opt_state_keys:
-                        opt_states[key] = torch.zeros([chunk_size], dtype=sliced_new_val[key].dtype,
-                                                        device='cpu', requires_grad=False)
-                # copy the param's slices to the optimizer's chunk
-                for key in opt_state_keys:
-                    sliced_new_val[key] = sliced_new_val[key].view(-1)
+                local_name = local_names[id(param)]
+                meta = module.fullmap[local_name]
+                original_name = module.dist_param_map[local_name.rsplit('_', 1)[0]]
+                source_state = orig_param_dict[original_name]
+                if state_keys is None:
+                    state_keys = [key for key in source_state if key != 'step']
+                    step = source_state.get('step')
+                    for key in state_keys:
+                        # Match true division's dtype, including integer states.
+                        dtype = torch.result_type(source_state[key], 1.0)
+                        opt_states[key] = torch.zeros(chunk_size, dtype=dtype, device='cpu')
 
-                # parameter range: <>
-                # bucket range: []
-                # in the following branches, we check the range including paddings.
-                # but in branch body, we only copy the valid range (without paddings) but update the chunk_offset with paddings.
-                if param_offset < bucket_chunk_start \
-                    and bucket_chunk_start < param_offset + param_numel < bucket_chunk_end:
-                    # case: < [ > ]
-                    copy_size = param_offset + param_numel - bucket_chunk_start
-                    copy_size_without_padding = param_offset + param.numel() - bucket_chunk_start
-                    chunk_offset = 0
-                    if copy_size_without_padding > 0:
-                        for key in opt_state_keys:
-                            opt_states[key][chunk_offset:chunk_offset+copy_size_without_padding] = sliced_new_val[key][-copy_size_without_padding:]
-                elif bucket_chunk_start <= param_offset < bucket_chunk_end \
-                    and bucket_chunk_start <= param_offset + param_numel < bucket_chunk_end:
-                    # case: [ <  > ]
-                    chunk_offset = param_offset - bucket_chunk_start
-                    for key in opt_state_keys:
-                        opt_states[key][chunk_offset:chunk_offset+param.numel()] = sliced_new_val[key][:]
-                elif bucket_chunk_start <= param_offset < bucket_chunk_end \
-                    and param_offset + param_numel >= bucket_chunk_end:
-                    # case: [ < ] >
-                    copy_size = bucket_chunk_end - param_offset
-                    copy_size_without_padding = min(copy_size, param.numel())
-                    chunk_offset = param_offset - bucket_chunk_start
-                    for key in opt_state_keys:
-                        opt_states[key][chunk_offset:chunk_offset+copy_size_without_padding] = sliced_new_val[key][:copy_size_without_padding]
-                elif param_offset < bucket_chunk_start \
-                    and param_offset + param_numel >= bucket_chunk_end:
-                    # case: < [ ] >
-                    copy_size = bucket_chunk_end - bucket_chunk_start
-                    copy_size_without_padding = min(copy_size, param_offset + param.numel() - bucket_chunk_start)
-                    chunk_offset = 0
-                    if copy_size_without_padding > 0:
-                        for key in opt_state_keys:
-                            opt_states[key][chunk_offset:chunk_offset + copy_size_without_padding] \
-                                = sliced_new_val[key][bucket_chunk_start-param_offset:bucket_chunk_start-param_offset + copy_size_without_padding]
-                else:
-                    # case: [] <>, <> []
-                    logger.debug(f'Skipped: parameter range({param_offset},{param_offset + param_numel}) vs. bucket range({bucket_chunk_start},{bucket_chunk_end})')
+                param_start = reducer.get_param_info(param).bucket_param_buffer_start
+                # Intersect only real parameter data. Padding stays zero, even
+                # when this rank's chunk starts or ends entirely inside padding.
+                start = max(param_start, chunk_start)
+                end = min(param_start + param.numel(), chunk_end)
+                if start >= end:
+                    continue
+                for key in state_keys:
+                    source = source_state[key][meta.slicers]
+                    destination = opt_states[key][start - chunk_start:end - chunk_start]
+                    if start == param_start and end == param_start + param.numel():
+                        # Preserve strided TP views without flattening a copy.
+                        destination = destination.view(source.shape)
+                    else:
+                        source = source.reshape(-1)[start - param_start:end - param_start]
+                    # Write directly into owned final storage, with exactly the
+                    # original division (including /1), without allocating a
+                    # full-parameter division result or aliasing the checkpoint.
+                    if (source.device == destination.device
+                            and torch.result_type(source, 1.0) == destination.dtype):
+                        torch.div(source, meta.val_chunks, out=destination)
+                    else:
+                        # Preserve source-device arithmetic and its rounding
+                        # before a device/dtype conversion, as in the old path.
+                        destination.copy_(source / meta.val_chunks)
 
+            # Preserve the original field order as well as its values.
             if step is not None:
                 opt_states['step'] = step
             state_dict[opt_param_idx] = opt_states
             opt_param_idx += 1
-    # load the params' optimizer state that are not in reducers
-    # this part corresponds to nnscaler/runtime/module.py: parameters_for_optimizer
-    reducer_pids = set()
-    for reducer in module.reducers:
-        reducer_pids.update(id(p) for p in reducer.params)
+
+    reducer_pids = {id(param) for reducer in module.reducers for param in reducer.params}
     for param in module.parameters():
         if id(param) not in reducer_pids:
-            sliced_new_val = _get_optimizer_state_of_param(param, param_ids, local_names)
-            state_dict[opt_param_idx] = sliced_new_val
+            state_dict[opt_param_idx] = _extract_new_state(
+                local_names[id(param)], orig_param_dict, module.dist_param_map, module.fullmap)
             opt_param_idx += 1
     return state_dict
 

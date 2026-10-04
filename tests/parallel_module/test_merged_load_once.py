@@ -59,3 +59,28 @@ def test_thread_setting_restored_on_success_and_failure(monkeypatch):
     with pytest.raises(RuntimeError):
         load_merged_state_dict(module, {}, device='cpu')
     assert torch.get_num_threads() == before
+
+
+def test_custom_parallel_load_handler_keeps_explicit_fallback(monkeypatch):
+    class CustomParallel(MinimalParallel, skip_init=True):
+        def _load_from_state_dict(self, *args, **kwargs):
+            # A user-defined module need not run ParallelModule's handler.
+            pass
+
+    monkeypatch.setenv('NNSCALER_MERGED_LOAD_ONCE', '1')
+    root = torch.nn.Module()
+    root.child = CustomParallel()
+    expected = torch.arange(4, dtype=torch.float32)
+    load_merged_state_dict(root, {'child.original_weight': expected}, device='cpu')
+    assert len(root.child.loads) == 1
+    torch.testing.assert_close(root.child.weight, expected, rtol=0, atol=0)
+
+
+def test_shared_parallel_module_keeps_canonical_prefix_fallback(monkeypatch):
+    monkeypatch.setenv('NNSCALER_MERGED_LOAD_ONCE', '1')
+    root = torch.nn.Module()
+    root.first = MinimalParallel()
+    root.alias = root.first
+    expected = torch.arange(4, dtype=torch.float32)
+    load_merged_state_dict(root, {'first.original_weight': expected}, device='cpu')
+    torch.testing.assert_close(root.first.weight, expected, rtol=0, atol=0)
