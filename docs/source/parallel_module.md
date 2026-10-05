@@ -554,6 +554,37 @@ def load_deduped_state_dict(
 ) -> None:
 ```
 
+## Staging generated artifacts for resume
+
+`nnscaler.stage_gencode` copies a generated package to a new directory. For
+checkpoint resume, initial weights can be omitted to reduce storage and transfer:
+
+```python
+import nnscaler
+
+summary = nnscaler.stage_gencode(
+    "/shared/complete-gencode", "/local/ssd/resume-gencode",
+    resume_only=True,
+    dry_run=False,
+)
+```
+
+The application selects and validates its checkpoint and destination. NNScaler
+owns the package layout and the rules for omitting initial weights. Only numeric
+`fullmodel.pt.<n>` shards in recognized generated module directories are omitted;
+non-persistent buffers, code and metadata are retained. The source is untouched,
+existing destinations and package symlinks are rejected, and failed copies clean
+up their temporary destination. `dry_run=True` reports file and byte counts
+without copying. The default `resume_only=False` copies all available files
+except Python bytecode caches.
+
+This performs lightweight structural checks without loading pickle payloads.
+Normal runtime checks of the compute configuration and checkpoint still apply.
+A resume-only copy must be used with `init_params=False`, followed by loading a
+checkpoint before executing the model. Preserve a complete package for training
+from scratch. The API does not inspect or select checkpoints and does not require
+an application-specific model, tokenizer, dataloader or trainer.
+
 ## Dataset
 
 We use the same dataset/dataloader as pytorch. For example, you can use `torch.utils.data.DistributedSampler` to create a distributed sampler.
