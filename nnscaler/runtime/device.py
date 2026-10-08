@@ -30,16 +30,10 @@ class _DeviceGroup:
             self.node_rank = 0
         else:
             if not torch.distributed.is_initialized():
-                # Binding a device eagerly also makes every later new_group
-                # perform NCCL communicator splitting. Large PP jobs create
-                # thousands of global singleton/P2P groups. The opt-in lazy
-                # path keeps the same group order and barriers, initializing
-                # each communicator when its members first use it instead.
-                eager_groups = (
-                    os.environ.get('NNSCALER_EAGER_GROUP_INIT', '1') != '0'
-                    and not self._local_group_init
-                )
-                if torch.__version__ >= (2, 3) and eager_groups:
+                # Keep normal initialization device-bound. Member-only groups
+                # require an unbound parent: NCCL communicator splitting from
+                # a bound parent would also require nonmembers to participate.
+                if torch.__version__ >= (2, 3) and not self._local_group_init:
                     torch.distributed.init_process_group(
                         backend='nccl', timeout=_LARGE_TIMEOUT,
                         device_id=torch.device('cuda', int(os.environ.get('LOCAL_RANK'))),
