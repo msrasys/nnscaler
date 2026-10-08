@@ -78,7 +78,7 @@ class SeedShapeModule(torch.nn.Module):
 
 @patch('torch.cuda.is_available', lambda: False)
 @pytest.mark.parametrize('reuse', [ReuseType.MOO, ReuseType.GRAPH])
-@pytest.mark.parametrize('strategy', ['recreate', 'capture'])
+@pytest.mark.parametrize('strategy', ['model', 'capture'])
 def test_param_init_seed_retraces_constructor_structure(tmp_path, reuse, strategy):
     from ..utils import mock_cube_env, mock_dist
 
@@ -105,7 +105,7 @@ def test_param_init_seed_retraces_constructor_structure(tmp_path, reuse, strateg
 @patch('torch.cuda.is_available', lambda: False)
 @replace_all_device_with('cpu', force=True)
 @pytest.mark.parametrize('reuse', [ReuseType.MOO, ReuseType.GRAPH])
-@pytest.mark.parametrize('strategy', ['file', 'recreate', 'capture', 'custom'])
+@pytest.mark.parametrize('strategy', ['file', 'model', 'capture', 'custom'])
 def test_param_init_seed_cache_reuse(tmp_path, reuse, strategy):
     constructors = []
     graph_mtimes = []
@@ -132,7 +132,7 @@ def test_param_init_seed_cache_reuse(tmp_path, reuse, strategy):
 @replace_all_device_with('cpu', force=True)
 def test_param_init_strategy_reuse(tmp_path):
     local_graph_mtime = None
-    for strategy in ('file', 'recreate', 'capture', 'custom', 'file'):
+    for strategy in ('file', 'model', 'capture', 'custom', 'file'):
         kwargs = dict(
             gen_savedir=tmp_path, instance_name='init_strategy',
             load_module=False, reuse='moo',
@@ -154,7 +154,7 @@ def test_param_init_strategy_reuse(tmp_path):
         parallelize(MyModule, {'x': torch.ones(2, 3)}, 'dp', config, **{**kwargs, 'reuse': 'match'})
         assert graph_file.stat().st_mtime_ns == graph_mtime
         assert (module_dir / 'gencode0.py').stat().st_mtime_ns == code_mtime
-        if strategy == 'recreate':
+        if strategy == 'model':
             local_graph_mtime = graph_mtime
         elif strategy in ('capture', 'custom'):
             assert graph_mtime == local_graph_mtime
@@ -163,7 +163,7 @@ def test_param_init_strategy_reuse(tmp_path):
 @patch('torch.cuda.is_available', lambda: False)
 @replace_all_device_with('cpu', force=True)
 @pytest.mark.parametrize('strategy', [
-    ParamInitStrategy.FILE, ParamInitStrategy.RECREATE,
+    ParamInitStrategy.FILE, ParamInitStrategy.MODEL,
     ParamInitStrategy.CAPTURE, ParamInitStrategy.CUSTOM,
 ])
 @pytest.mark.parametrize('reuse', [ReuseType.MOO, ReuseType.GRAPH])

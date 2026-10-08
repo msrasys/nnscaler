@@ -19,15 +19,14 @@ from nnscaler import ComputeConfig, ParamInitStrategy
 from nnscaler.cli import Trainer, TrainerArgs
 from nnscaler.cli.trainer_args import OptionalComputeConfig
 from nnscaler.graph.parser import FxModuleParser
-from nnscaler.runtime.deferred_initialization import DeferredInitialization
-from nnscaler.runtime.initialization import create_init_module
+from nnscaler.runtime.initialization import DeferredInitialization, create_init_module
 from nnscaler.runtime.module import ParallelModule
 from tests.launch_torchrun import launch_torchrun
 from tests.parallel_module.common import assert_equal
 
 
 STRATEGIES = (
-    ParamInitStrategy.FILE, ParamInitStrategy.RECREATE,
+    ParamInitStrategy.FILE, ParamInitStrategy.MODEL,
     ParamInitStrategy.CAPTURE, ParamInitStrategy.CUSTOM,
 )
 NON_FILE_STRATEGIES = tuple(s for s in STRATEGIES if s != ParamInitStrategy.FILE)
@@ -300,7 +299,7 @@ def _worker_parity(save_dir, policy, zero):
                 ))
             resumed.run()
         assert InitModel.constructions == before + (
-            strategy in (ParamInitStrategy.RECREATE, ParamInitStrategy.CAPTURE)
+            strategy in (ParamInitStrategy.MODEL, ParamInitStrategy.CAPTURE)
             and bool(resumed.model.get_non_persistent_buffers())
         )
         assert resumed.train_status.finished_train_steps == 3
@@ -311,8 +310,8 @@ def _worker_parity(save_dir, policy, zero):
     if torch.distributed.get_rank() == 0:
         for key in ('model', 'optimizer'):
             assert_equal(results[ParamInitStrategy.FILE, True][key],
-                         results[ParamInitStrategy.RECREATE, True][key])
-            assert_equal(results[ParamInitStrategy.RECREATE, True][key],
+                         results[ParamInitStrategy.MODEL, True][key])
+            assert_equal(results[ParamInitStrategy.MODEL, True][key],
                          results[ParamInitStrategy.CUSTOM, True][key])
             assert_equal(results[ParamInitStrategy.CAPTURE, True][key],
                          results[ParamInitStrategy.CAPTURE, False][key])
@@ -353,7 +352,7 @@ def _worker_mismatch(save_dir, strategy, mismatch):
 
 
 @pytest.mark.skipif(torch.cuda.device_count() < 4, reason='requires four GPUs')
-@pytest.mark.parametrize('strategy', ['recreate', 'capture', 'custom'])
+@pytest.mark.parametrize('strategy', ['model', 'capture', 'custom'])
 @pytest.mark.parametrize('mismatch', ['weight', 'buffer', 'non_persistent'])
 def test_cli_param_init_mismatch(tmp_path, strategy, mismatch):
     launch_torchrun(4, _worker_mismatch, tmp_path, strategy, mismatch)
@@ -361,7 +360,7 @@ def test_cli_param_init_mismatch(tmp_path, strategy, mismatch):
 
 def _worker_source_buffers(save_dir):
     nnscaler.init()
-    for strategy in (ParamInitStrategy.RECREATE, ParamInitStrategy.CAPTURE):
+    for strategy in (ParamInitStrategy.MODEL, ParamInitStrategy.CAPTURE):
         # Independently random NP buffers follow this strategy's stream, while derived
         # buffers must agree with its own weight (never an eager/captured mixture).
         expected = _reference(strategy, mismatch='non_persistent')
@@ -386,7 +385,7 @@ def test_cli_param_init_source_buffers(tmp_path):
 
 def _worker_source_instance(save_dir):
     nnscaler.init()
-    for strategy in (ParamInitStrategy.RECREATE, ParamInitStrategy.CAPTURE):
+    for strategy in (ParamInitStrategy.MODEL, ParamInitStrategy.CAPTURE):
         source = create_init_module(InitModel, None, None, seed=1234)
         with torch.no_grad():
             for tensor in source.parameters():
@@ -588,7 +587,7 @@ def test_cli_param_init_broadcast(tmp_path):
 
 def _worker_mixed(save_dir):
     save_dir = Path(save_dir)
-    for strategy in (ParamInitStrategy.RECREATE, ParamInitStrategy.CAPTURE):
+    for strategy in (ParamInitStrategy.MODEL, ParamInitStrategy.CAPTURE):
         trainer = Trainer([
             '-f', str(Path(__file__).with_name('trainer_args_mixed1.yaml')),
             '--compute_config.param_init_strategy', strategy,

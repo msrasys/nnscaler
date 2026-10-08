@@ -1337,7 +1337,7 @@ class ParallelModule(CubeModule):
             self.build_buckets()
 
     def _init_from_module(self, module: Optional[torch.nn.Module], *, init_params: bool = True) -> None:
-        from nnscaler.runtime.deferred_initialization import DeferredInitialization
+        from nnscaler.runtime.initialization import DeferredInitialization
         from nnscaler.parallel import ParamInitStrategy
 
         attrs = {

@@ -660,7 +660,7 @@ Please Note:
 
 ### Compute Config
 
-`param_init_strategy` selects `file` (default, file-backed), `recreate`
+`param_init_strategy` selects `file` (default, file-backed), `model`
 (full runtime reconstruction), `capture` (selective full-tensor materialization),
 or `custom` (the original class's `__partial__init__` local-shard callback).
 Only `file` saves/loads `fullmodel.pt.*` and `npbuffer.pt`; all other strategies

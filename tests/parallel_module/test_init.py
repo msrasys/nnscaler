@@ -72,7 +72,7 @@ def test_capture_constructor_default_dtype(tmp_path):
 
 
 @pytest.mark.parametrize('strategy', [
-    ParamInitStrategy.FILE, ParamInitStrategy.RECREATE,
+    ParamInitStrategy.FILE, ParamInitStrategy.MODEL,
     ParamInitStrategy.CAPTURE, ParamInitStrategy.CUSTOM,
 ])
 def test_param_init_config(strategy):
@@ -92,7 +92,7 @@ def test_param_init_defaults_and_seed_boundaries():
 def test_param_init_graph_config():
     configs = [
         ComputeConfig(1, 1, param_init_strategy=strategy)
-        for strategy in ('recreate', 'capture', 'custom')
+        for strategy in ('model', 'capture', 'custom')
     ]
     assert all(config.graph_config == configs[0].graph_config for config in configs)
     assert ComputeConfig(1, 1).graph_config != configs[0].graph_config
@@ -168,7 +168,7 @@ def test_custom_init_classmethod(tmp_path):
 
 @patch('torch.cuda.is_available', lambda: False)
 @replace_all_device_with('cpu', force=True)
-@pytest.mark.parametrize('strategy', ['recreate', 'capture', 'custom'])
+@pytest.mark.parametrize('strategy', ['model', 'capture', 'custom'])
 @pytest.mark.parametrize('source_instance', [False, True])
 def test_param_init_callback_attachment(tmp_path, strategy, source_instance):
     source = LocalInitModule() if source_instance else LocalInitModule
@@ -200,7 +200,7 @@ def test_param_init_callback_attachment(tmp_path, strategy, source_instance):
 @patch('torch.cuda.is_available', lambda: False)
 def test_param_init_strategy_reload(tmp_path):
     graph_mtime = None
-    for strategy in ('recreate', 'custom', 'capture', 'recreate'):
+    for strategy in ('model', 'custom', 'capture', 'model'):
         config = ComputeConfig(1, 1, param_init_strategy=strategy, trace_strategy='cpu')
         with mock_cube_env(0, 1), mock_dist(0, 1), patch('torch.distributed.barrier'), \
                 patch('torch.distributed.broadcast_object_list'):
@@ -229,7 +229,7 @@ def test_param_init_strategy_reload(tmp_path):
 
 def _local_init_worker(tmp_path):
     nnscaler.init()
-    for strategy in ('recreate', 'capture'):
+    for strategy in ('model', 'capture'):
         torch.manual_seed(1234)
         original = LocalInitModule().eval()
         expected = {
@@ -251,7 +251,7 @@ def _local_init_worker(tmp_path):
     # Directly imported code needs an explicit source, not an implicit fallback to disk.
     parallelize(
         LocalInitModule, {'x': torch.ones(2, 4)}, 'dp',
-        ComputeConfig(1, 2, param_init_strategy='recreate'),
+        ComputeConfig(1, 2, param_init_strategy='model'),
         gen_savedir=tmp_path, instance_name='direct', load_module=False,
     )
     generated = _load_parallel_module_class(LocalInitModule, gen_savedir=tmp_path, instance_name='direct')

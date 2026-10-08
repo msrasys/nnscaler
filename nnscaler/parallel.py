@@ -101,15 +101,15 @@ class ParamInitStrategy:
     Parameter initialization strategy type
     Possible values are:
     'file'     : load parameters from fullmodel.pt
-    'recreate' : recreate original module, and load its parameters
+    'model'    : load its parameters from the model itself (the model will be created internally)
     'capture'  : capture parameters via `TorchDispatchMode`.
                  Note in current implementation, all work will be done in `cpu`,
                  and this may not capture all parameters accurately.
-    'custom'   : use the original module's `__partial__init__(attr_meta_map)` method
+    'custom'   : use the original module's `__partial__init__(attr_meta_map: Dict[str, AttrMeta])` method
                  if `capture` doesn't meet your requirement.
     """
     FILE = 'file'
-    RECREATE = 'recreate'
+    MODEL = 'model'
     CAPTURE = 'capture'
     CUSTOM = 'custom'
 
@@ -228,7 +228,7 @@ class ComputeConfig:
     param_init_seed: int = 1234
 
     def __post_init__(self):
-        strategies = (ParamInitStrategy.FILE, ParamInitStrategy.RECREATE, ParamInitStrategy.CAPTURE, ParamInitStrategy.CUSTOM)
+        strategies = (ParamInitStrategy.FILE, ParamInitStrategy.MODEL, ParamInitStrategy.CAPTURE, ParamInitStrategy.CUSTOM)
         if self.param_init_strategy not in strategies:
             raise ValueError(f"param_init_strategy must be one of {strategies}.")
         if type(self.param_init_seed) is not int or not 0 <= self.param_init_seed < 2 ** 32:
@@ -1490,7 +1490,7 @@ def parallelize(
         else:
             init_kwargs = (
                 {'init_module': module_or_module_class}
-                if compute_config.param_init_strategy in (ParamInitStrategy.RECREATE, ParamInitStrategy.CAPTURE) else {}
+                if compute_config.param_init_strategy in (ParamInitStrategy.MODEL, ParamInitStrategy.CAPTURE) else {}
             )
             if compute_config.param_init_strategy != ParamInitStrategy.FILE and module_dtype is not None:
                 module_or_module_class.to(dtype=module_dtype)

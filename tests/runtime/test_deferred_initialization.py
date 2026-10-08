@@ -10,7 +10,7 @@ import pytest
 import torch
 from torch.utils._python_dispatch import TorchDispatchMode
 
-from nnscaler.runtime.deferred_initialization import DeferredInitialization
+from nnscaler.runtime.initialization import DeferredInitialization
 
 
 class AllocationRecorder(TorchDispatchMode):

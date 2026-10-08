@@ -20,14 +20,14 @@ The above restrictions are necessary for the pipeline parallelism to work. Of co
 | Strategy | Behavior |
 | --- | --- |
 | `FILE` / `"file"` (default) | Save and load `fullmodel.pt.*` and `npbuffer.pt`, preserving file-backed initialization. |
-| `RECREATE` / `"recreate"` | Reconstruct the full original model at runtime and copy its local parameter and buffer slices. |
+| `MODEL` / `"model"` | Reconstruct the full original model at runtime and copy its local parameter and buffer slices. |
 | `CAPTURE` / `"capture"` | Capture runtime construction without parameter storage, materialize required full tensors one at a time, and copy their local slices. |
 | `CUSTOM` / `"custom"` | Call the original class's `__partial__init__` callback to initialize local shards directly, without running its full constructor at runtime. |
 
 Non-file strategies save and distribute metadata, but no `fullmodel.pt.*` or
 `npbuffer.pt`. Parameters, persistent buffers and non-persistent buffers all come
 from the selected strategy; there is no mixing with trace-time buffer files.
-`recreate` and `capture` use the original class or `module_fn`. When `parallelize`
+`model` and `capture` use the original class or `module_fn`. When `parallelize`
 receives an existing instance, they use its values without reinitializing it.
 `custom` always invokes the callback, even when given an existing instance.
 No strategy calls `reset_parameters` on generated shards. Shared parameters and
@@ -47,7 +47,7 @@ Constructors and callbacks must still be deterministic and rank-independent.
 ### Capture limitations
 
 Capture uses deterministic per-operation random streams. Its random samples
-intentionally differ from eager `recreate`/trace-time initialization, even with the
+intentionally differ from eager `model`/trace-time initialization, even with the
 same seed; supported initializers retain distribution arguments, full shapes and
 dtype conversions. It is selective full-tensor materialization, **not** direct
 shard initialization: a large full tensor or dependency chain may still exceed
@@ -93,7 +93,7 @@ are supported, but constructors must initialize all values used in the model to
 ensure deterministic parameters. Reading uninitialized values is not rejected.
 External tensor clones and dtype conversions are deferred as well.
 Existing external tensor data must remain
-unchanged until materialization finishes. Use `recreate`, `file`, `custom`,
+unchanged until materialization finishes. Use `model`, `file`, `custom`,
 or an already initialized source instance for unsupported constructors.
 
 ### Custom shard initialization
@@ -178,14 +178,14 @@ replica checking.
 For checkpoint resume, `file` loads non-persistent buffers from
 `npbuffer.pt`; non-file strategies reconstruct just the needed non-persistent
 buffers through their source/callback path. Checkpoint parameters and persistent
-buffers are not overwritten. `recreate` may therefore still construct a full model
+buffers are not overwritten. `model` may therefore still construct a full model
 on resume; `capture` materializes required buffer dependencies, and `custom`
 receives the buffer-only map.
 Load generated classes through `parallelize` to attach the original factory or
-custom callback. For `recreate`/`capture`, an original instance may instead be
+custom callback. For `model`/`capture`, an original instance may instead be
 passed as `GeneratedModel(init_module=original_model)`. Ordinary tensor attributes
 converted into buffers by tracing must be available through their original names.
-For `recreate`/`capture`, tensors used by `forward` must therefore be exposed as
+For `model`/`capture`, tensors used by `forward` must therefore be exposed as
 source-model attributes or registered buffers. Tracer-only constants synthesized
 from globals or forward-local tensors cannot be reconstructed by looking up the
 original model; use `file` or provide them through `custom` initialization instead.

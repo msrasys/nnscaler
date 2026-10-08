@@ -110,7 +110,7 @@ def _local_module(strategy):
     return module
 
 
-@pytest.mark.parametrize('strategy', [ParamInitStrategy.RECREATE, ParamInitStrategy.CAPTURE])
+@pytest.mark.parametrize('strategy', [ParamInitStrategy.MODEL, ParamInitStrategy.CAPTURE])
 def test_source_strategy_preserves_buffer_dependency_on_init_and_resume(strategy):
     module = _local_module(strategy)
     with patch.object(module, 'load_np_buffer_content', side_effect=AssertionError('buffer file read')):
@@ -200,7 +200,7 @@ def test_partial_initializer_seed_and_failure_restore_rng():
         create_partial_init_weights(torch.nn.Module, {}, seed=17)
 
 
-@pytest.mark.parametrize('strategy', [ParamInitStrategy.RECREATE, ParamInitStrategy.CAPTURE, ParamInitStrategy.CUSTOM])
+@pytest.mark.parametrize('strategy', [ParamInitStrategy.MODEL, ParamInitStrategy.CAPTURE, ParamInitStrategy.CUSTOM])
 def test_resume_without_nonpersistent_buffers_skips_initializers(strategy):
     module = _local_module(strategy)
     del module.copy_local
