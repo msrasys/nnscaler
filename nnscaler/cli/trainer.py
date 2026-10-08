@@ -4,23 +4,25 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, asdict
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 from pathlib import Path
 import sys, os
 import copy
+import hashlib
 import warnings
 import shutil
 import logging
 import time
 
 import torch
-import torch.distributed
+import torch.distributed as dist
 from torch.utils.data import DataLoader
 import psutil
 
 from tqdm import tqdm
 
 import nnscaler
+from nnscaler.parallel import ParamInitStrategy
 from nnscaler.runtime.device import DeviceGroup
 from nnscaler.utils import broadcast_mixed_data, is_running_distributed, StepwiseConfig
 from nnscaler.runtime.module import ParallelModule
@@ -32,6 +34,79 @@ from .serialization import Checkpointer
 
 
 logger = logging.getLogger(__name__)
+
+
+def _initialization_digest(tensor: torch.Tensor) -> str:
+    digest = hashlib.sha256()
+    value = tensor.detach().cpu().contiguous().reshape(-1).view(torch.uint8)
+    digest.update(repr((str(tensor.dtype), tuple(tensor.shape))).encode())
+    digest.update(value.numpy())
+    return digest.hexdigest()
+
+
+def check_param_init(model: torch.nn.Module) -> None:
+    """Check stored initial replicas across the whole model after bucket construction."""
+    hashes: Dict[Tuple[Any, ...], str] = {}
+    error = None
+    try:
+        for prefix, module in model.named_modules():
+            if isinstance(module, ParallelModule):
+                if module.compute_config.param_init_strategy == ParamInitStrategy.FILE:
+                    continue
+                for attr, meta in module.fullmap.items():
+                    tensor = getattr(module, attr)
+                    zero_meta = module.get_zero3_attr_meta(attr)
+                    zero_range = None
+                    if zero_meta is not None:
+                        if zero_meta.start >= zero_meta.end:
+                            continue
+                        zero_range = (zero_meta.start, zero_meta.end)
+                        # Compare retained values only, excluding ZeRO-3 padding.
+                        # (BTW, tensor doesn't contain padding in zero1 case)
+                        tensor = tensor.reshape(-1)[:zero_meta.end - zero_meta.start]
+                    slicers = (slice(None),) * len(meta.shape) if meta.slicers is Ellipsis else meta.slicers
+                    # Only the same TP/PP shard and ZeRO-3 interval are replicas.
+                    key = (
+                        'parallel', prefix, meta.orig_name, tuple(meta.shape),
+                        tuple(s.indices(size) for s, size in zip(slicers, meta.shape)),
+                        meta.val_chunks, zero_range,
+                    )
+                    hashes[key] = _initialization_digest(tensor)
+            else:
+                for name, tensor in (
+                    list(module.named_parameters(recurse=False))
+                    + list(module.named_buffers(recurse=False))
+                ):
+                    hashes[('module', prefix, name)] = _initialization_digest(tensor)
+    except Exception as exc:
+        # Every rank must reach the same collective even if local hashing fails.
+        error = exc
+
+    if not dist.is_initialized() or dist.get_world_size() == 1:
+        if error is not None:
+            raise error
+        return
+
+    payload = (hashes, None if error is None else f'{type(error).__name__}: {error}')
+    gathered: List[Optional[Tuple[Dict[Tuple[Any, ...], str], Optional[str]]]] = [None] * dist.get_world_size()
+    dist.all_gather_object(gathered, payload)
+
+    failures = []
+    mismatches = []
+    references = {}
+    for rank, (rank_hashes, failure) in enumerate(gathered):
+        if failure is not None:
+            failures.append(f'rank {rank}: {failure}')
+        for key, digest in rank_hashes.items():
+            owner, reference = references.setdefault(key, (rank, digest))
+            if digest != reference:
+                mismatches.append(f'{key!r} (ranks {owner}, {rank})')
+
+    if failures:
+        raise RuntimeError("Parameter initialization failed: " + "; ".join(failures)) from error
+
+    if mismatches:
+        raise RuntimeError("Parameter initialization differs across ranks: " + "; ".join(mismatches))
 
 
 @dataclass
@@ -143,10 +218,11 @@ class Trainer:
 
         # When resuming from checkpoint, skip loading the full init weights
         # (fullmodel.pt) since they will be overridden by the checkpoint.
-        # Only non-persistent buffers will be loaded from the small npbuffer.pt file.
+        # Non-persistent buffers are restored using the configured initialization strategy.
         is_resuming = self.train_args.checkpoint.get_resume_checkpoint() is not None
         init_params = not is_resuming
 
+        check_init = self.train_args.debug.param_init_check and init_params and not compile_only
         pmodel = parallelize_model(
             self.train_args, self.dummy_input,
             load_module=not compile_only,
@@ -224,6 +300,9 @@ class Trainer:
                 )
         self.model.cuda()
         self.optimizer = self.train_args.create_parallel_optimizer(self.model)
+        if check_init:
+            assert self.model is not None
+            check_param_init(self.model)
         # unify the interface of ParallelModule and partial-parallelized model
         self.model = mixin_module(self.model, self.optimizer)
         # Here we carefully scale down the gradient locally with 1/scale_factor before reduce,

@@ -32,7 +32,7 @@ from nnscaler.runtime.function import insert_backward_hook
 
 from nnscaler import __version__ as runtime_version
 from nnscaler.flags import CompileFlag
-from nnscaler.utils import accum_mode, classproperty, unchecked_fields
+from nnscaler.utils import accum_mode, classproperty, get_member_by_name, unchecked_fields
 
 if TYPE_CHECKING:
     from nnscaler.parallel import ComputeConfig
@@ -1186,6 +1186,13 @@ class ParallelModule(CubeModule):
     dist_param_map: dict[str, str]
     compute_config: 'ComputeConfig'
     origin_module_metadata: OriginModuleMetadata
+    # function to initialize the module, should return an instance of the original Module
+    # will be assigned when parallel module is loaded via `parallelize`
+    _init_module_fn: ClassVar[Optional[Callable[[], torch.nn.Module]]] = None
+    # function to partially initialize the module,
+    # should return a dictionary mapping from attribute names to tensors
+    # will be assigned when parallel module is loaded via `parallelize`
+    _partial_init_fn: ClassVar[Optional[Callable[[Dict[str, AttrMeta]], Dict[str, torch.Tensor]]]] = None
 
     def __init__(self):
         if self.__class__  == ParallelModule:  # not init via super().__init__()
@@ -1280,14 +1287,16 @@ class ParallelModule(CubeModule):
             else:
                 _logger.warning(_non_persistent_buffers_load_warning)
 
-    def _post_init(self, init_params=True, build_buckets=True):
+    def _post_init(self, init_params=True, build_buckets=True, *, init_module: Optional[torch.nn.Module] = None):
         """
         This is post init function to further initialize the model. Should be called by subclass's __init__().
 
         Args:
             init_params (bool): whether to load model init parameters. Default True.
+                Note we will always try to load non-persistent buffers regardless of the init_params flag.
             build_buckets (bool): whether to build buckets for the model. Default True.
                 If it is False, you must manually call `build_buckets()` later before use this module.
+            init_module: original module instance for independent initialization.
         """
         # Here we check the rank to load the module file name
         # Current we don't check rank when we are not in distributed mode
@@ -1296,18 +1305,21 @@ class ParallelModule(CubeModule):
         # if dist.is_initialized() and self.rank != dist.get_rank():
         #     raise RuntimeError(f"The rank to load this module file name is expected to be {self._rank}, but got {dist.get_rank()}")
 
-        self._non_presistent_buffers_inited = init_params or not self._non_persistent_buffers_set
-        module_file = Path(sys.modules[self.__module__].__file__)
-        if init_params:
-            self.load_attr_content(str(module_file.with_name(f"{FxModuleParser.ATTR_CONTENT_FILE_STEM}")))
-        elif self._non_persistent_buffers_set:
-            # When init_params=False, only load non-persistent buffers from the small npbuffer.pt file.
-            # This avoids loading the large fullmodel.pt files when resuming from checkpoint,
-            # since checkpoint will provide the rest of the parameters/buffers.
-            np_buffer_file = module_file.with_name(FxModuleParser.NON_PERSISTENT_BUFFER_FILE)
-            if np_buffer_file.is_file():
-                self.load_np_buffer_content(str(np_buffer_file))
+        from nnscaler.parallel import ParamInitStrategy
+
+        self._non_presistent_buffers_inited = not self._non_persistent_buffers_set
+        if self.compute_config.param_init_strategy == ParamInitStrategy.FILE:
+            if init_params:
+                self.load_attr_content(str(self.module_dir / FxModuleParser.ATTR_CONTENT_FILE_STEM))
                 self._non_presistent_buffers_inited = True
+            elif self._non_persistent_buffers_set:
+                np_buffer_file = self.module_dir / FxModuleParser.NON_PERSISTENT_BUFFER_FILE
+                if np_buffer_file.is_file():
+                    self.load_np_buffer_content(str(np_buffer_file))
+                    self._non_presistent_buffers_inited = True
+        else:
+            self._init_from_module(init_module, init_params=init_params)
+            self._non_presistent_buffers_inited = True
 
         self._warn_uninitialized_non_persistent_buffers()
 
@@ -1323,6 +1335,90 @@ class ParallelModule(CubeModule):
 
         if build_buckets:
             self.build_buckets()
+
+    def _init_from_module(self, module: Optional[torch.nn.Module], *, init_params: bool = True) -> None:
+        from nnscaler.runtime.deferred_initialization import DeferredInitialization
+        from nnscaler.parallel import ParamInitStrategy
+
+        attrs = {
+            attr: meta for attr, meta in self._fullmap.items()
+            if init_params or attr in self._non_persistent_buffers_set
+        }
+        if not attrs:
+            return
+
+        strategy = self.compute_config.param_init_strategy
+        if strategy == ParamInitStrategy.CUSTOM:
+            initializer = type(self)._partial_init_fn
+            if initializer is None:
+                raise RuntimeError("custom initialization requires parallelize() with the original module.")
+            values = initializer(dict(attrs))
+            if not isinstance(values, dict):
+                raise RuntimeError("__partial__init__ must return a dictionary of local tensors.")
+            if values.keys() != attrs.keys():
+                missing = sorted(set(attrs) - set(values))
+                unexpected = sorted(repr(key) for key in set(values) - set(attrs))
+                raise RuntimeError(
+                    f"Invalid __partial__init__ result: missing attributes {missing}, "
+                    f"unexpected attributes {unexpected}."
+                )
+            with torch.no_grad():
+                for attr, meta in attrs.items():
+                    value = values[attr]
+                    target = getattr(self, attr)
+                    if (
+                        not isinstance(value, torch.Tensor) or value.is_meta
+                        or value.shape != target.shape or value.dtype != target.dtype
+                    ):
+                        raise RuntimeError(
+                            f"Invalid __partial__init__ tensor for {attr}: "
+                            f"expected shape {tuple(target.shape)} and dtype {target.dtype}."
+                        )
+                    target.copy_(value if meta.val_chunks == 1 else value / meta.val_chunks)
+            return
+
+        capture = None
+        if module is None:
+            factory = type(self)._init_module_fn
+            if factory is None:
+                raise RuntimeError(
+                    "Independent initialization requires parallelize() with the original "
+                    "module class/module_fn, or an init_module instance."
+                )
+            if strategy == ParamInitStrategy.CAPTURE:
+                with DeferredInitialization() as capture:
+                    module = factory()
+            else:
+                module = factory()
+
+        # Group by source identity so shared weights are materialized once, copied to
+        # all local slices, then released before materializing the next source tensor.
+        source_attrs = {}
+        for attr, meta in attrs.items():
+            source = get_member_by_name(module, meta.orig_name)
+            if (
+                not isinstance(source, torch.Tensor)
+                or tuple(source.shape) != tuple(meta.shape)
+                or source.dtype != meta.dtype
+            ):
+                raise RuntimeError(
+                    f"Invalid initialization tensor for {meta.orig_name}: "
+                    f"expected shape {meta.shape} and dtype {meta.dtype}."
+                )
+            if id(source) not in source_attrs:
+                source_attrs[id(source)] = (source, [])
+            source_attrs[id(source)][1].append((attr, meta))
+
+        with torch.no_grad():
+            for source, entries in source_attrs.values():
+                value = source if capture is None else capture.materialize(source)
+                for attr, meta in entries:
+                    content = value[meta.slicers]
+                    if meta.val_chunks != 1:
+                        content = content / meta.val_chunks
+                    getattr(self, attr).copy_(content)
+                    del content
+                del value
 
     def build_buckets(self, param_clss: Optional[dict[torch.nn.Parameter, Any]]=None):
         """

@@ -139,6 +139,8 @@ def to_ir_graph(
     dummy_input: Dict[str, Any],
     attr_savedir: Union[str, Path],
     constant_folding: bool = True,
+    *,
+    save_weights: bool = True,
 ) -> IRGraph:
     """Convert torch.fx.GraphModule based model into IRGraph
 
@@ -149,6 +151,7 @@ def to_ir_graph(
         constant_folding (bool):
             whether to enable constant folding. Default True.
         attr_savedir (Union[str, Path]): directory to save content (attribtes)
+        save_weights (bool): whether to save full-model tensors and non-persistent buffer contents.
 
     Returns:
         IRGraph: IRGraph of model
@@ -161,6 +164,7 @@ def to_ir_graph(
             attr_savedir=attr_savedir,
             constant_folding=constant_folding,
             save_content=True,
+            save_weights=save_weights,
         )
     module_name = traced_model.__class__.__name__
 
