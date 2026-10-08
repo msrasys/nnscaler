@@ -6,6 +6,7 @@ from time import sleep
 import sys
 import tempfile
 import pickle
+import random
 import pytest
 import torch
 import shutil
@@ -66,6 +67,41 @@ class SeedBufferModule(MyModule):
         return self.linear(x) + self.offset
 
 
+class SeedShapeModule(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.weight = torch.nn.Parameter(torch.ones(random.choice([2, 3])))
+
+    def forward(self, x):
+        return x * self.weight
+
+
+@patch('torch.cuda.is_available', lambda: False)
+@pytest.mark.parametrize('reuse', [ReuseType.MOO, ReuseType.GRAPH])
+@pytest.mark.parametrize('strategy', ['recreate', 'capture'])
+def test_param_init_seed_retraces_constructor_structure(tmp_path, reuse, strategy):
+    from ..utils import mock_cube_env, mock_dist
+
+    instance_name = f'{strategy}_{reuse.value}'
+    with mock_cube_env(0, 1), mock_dist(0, 1), patch('torch.distributed.barrier'), \
+            patch('torch.distributed.broadcast_object_list'):
+        parallelize(
+            SeedShapeModule, {'x': torch.ones(1)}, 'dp',
+            ComputeConfig(1, 1, param_init_strategy=strategy, param_init_seed=1, trace_strategy='cpu'),
+            gen_savedir=tmp_path, instance_name=instance_name, load_module=False,
+        )
+        generated = parallelize(
+            SeedShapeModule, {'x': torch.ones(1)}, 'dp',
+            ComputeConfig(1, 1, param_init_strategy=strategy, param_init_seed=5, trace_strategy='cpu'),
+            gen_savedir=tmp_path, instance_name=instance_name, reuse=reuse,
+        )
+        model = generated(build_buckets=False)
+    assert len(model.fullmap) == 1
+    for attr, meta in model.fullmap.items():
+        assert meta.shape == (3,)
+        assert torch.equal(getattr(model, attr), torch.ones(3))
+
+
 @patch('torch.cuda.is_available', lambda: False)
 @replace_all_device_with('cpu', force=True)
 @pytest.mark.parametrize('reuse', [ReuseType.MOO, ReuseType.GRAPH])
@@ -73,7 +109,7 @@ class SeedBufferModule(MyModule):
 def test_param_init_seed_cache_reuse(tmp_path, reuse, strategy):
     constructors = []
     graph_mtimes = []
-    for index, seed in enumerate((17, 18)):
+    for seed in (17, 18):
         with patch.object(SeedBufferModule, '__init__', autospec=True, wraps=None) as constructor:
             def construct(module):
                 MyModule.__init__(module)
@@ -84,14 +120,12 @@ def test_param_init_seed_cache_reuse(tmp_path, reuse, strategy):
                 SeedBufferModule, ComputeConfig(1, 1, param_init_strategy=strategy, param_init_seed=seed),
                 tmp_path, reuse, 'seed', load_module=False,
             )
-            assert constructor.call_count == int(index == 0 or strategy == 'file')
+            assert constructor.call_count == 1
         assert bool(list(tmp_path.rglob(FxModuleParser.NON_PERSISTENT_BUFFER_FILE))) == (strategy == 'file')
         graph_mtimes.append(next(tmp_path.rglob('graph.ckp')).stat().st_mtime_ns)
-    assert (graph_mtimes[0] != graph_mtimes[1]) == (strategy == 'file')
-    if strategy == 'file':
-        assert not torch.equal(constructors[0], constructors[1])
-    else:
-        assert len(constructors) == 1
+    assert graph_mtimes[0] != graph_mtimes[1]
+    assert len(constructors) == 2
+    assert not torch.equal(constructors[0], constructors[1])
 
 
 @patch('torch.cuda.is_available', lambda: False)
@@ -112,7 +146,6 @@ def test_param_init_strategy_reuse(tmp_path):
             parallelize(MyModule, {'x': torch.ones(2, 3)}, 'dp', config, **kwargs)
         module_dir = next(tmp_path.rglob(ParallelModule.COMPUTE_CONFIG_FILE)).parent
         assert bool(list(module_dir.glob('fullmodel.pt*'))) == (strategy == 'file')
-        assert not (module_dir / 'init_constants.pt').exists()
         assert (module_dir / FxModuleParser.NON_PERSISTENT_BUFFER_FILE).exists() == (strategy == 'file')
         assert (module_dir / FxModuleParser.ATTR_MAP_FILE).exists()
         graph_file = next(module_dir.glob('graph*'))

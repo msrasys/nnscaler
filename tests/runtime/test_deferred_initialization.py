@@ -267,6 +267,27 @@ def test_factories_and_conversions(factory):
     assert torch.equal(materialized, expected)
 
 
+@pytest.mark.parametrize("factory", [
+    lambda: torch.full((4,), 1.00000001),
+    lambda: torch.empty(4).fill_(1.00000001),
+    lambda: torch.arange(0, 1, 0.1),
+    lambda: torch.full((4,), 1),
+])
+def test_factory_dtype_is_independent_of_replay_default(factory):
+    previous = torch.get_default_dtype()
+    try:
+        torch.set_default_dtype(torch.float64)
+        expected = factory()
+        with DeferredInitialization() as capture:
+            tensor = factory()
+        torch.set_default_dtype(torch.float32)
+        actual = capture.materialize(tensor)
+        assert actual.dtype == expected.dtype
+        assert torch.equal(actual, expected)
+    finally:
+        torch.set_default_dtype(previous)
+
+
 @pytest.mark.parametrize("data", [2, [], [1], [1, 2, 3], [[1, 2], [3, 4]]])
 @pytest.mark.parametrize("dtype", [
     torch.bool, torch.int64, torch.float32, torch.float64, torch.complex64,
@@ -711,7 +732,7 @@ def test_partial_writes_initialize_empty_and_preserve_snapshots():
 
 def test_capture_lifecycle_and_constructor_failure():
     capture = DeferredInitialization()
-    with pytest.raises(RuntimeError, match="param_init_strategy='file'"):
+    with pytest.raises(RuntimeError, match="unsupported operation.*_local_scalar_dense"):
         with capture:
             torch.ones(()).item()
     assert not torch.ones(1).is_meta
@@ -752,7 +773,7 @@ def test_replay_error_restores_rng_and_releases_dependency_cache():
         destination.copy_(source)
     before = torch.get_rng_state()
     with AllocationRecorder() as recorder:
-        with pytest.raises(RuntimeError, match="replay failed.*param_init_strategy='file'"), FailingCopy():
+        with pytest.raises(RuntimeError, match="replay failed: injected replay failure"), FailingCopy():
             capture.materialize(destination)
     gc.collect()
     assert all(reference() is None for _, reference in recorder.outputs)

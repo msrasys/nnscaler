@@ -252,6 +252,9 @@ class DeferredInitialization(TorchDispatchMode):
 
         # Replay creates a private CPU generator from seed, not the mutable original.
         recipe_kwargs.pop("generator", None)
+        if any(arg.name == "dtype" for arg in func._schema.arguments):
+            # The constructor may restore the default dtype before replay.
+            recipe_kwargs["dtype"] = result.dtype
         node = _Node(result, func, recipe_args, recipe_kwargs, seed)
         return self._register(result, node)
 

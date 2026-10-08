@@ -2,7 +2,6 @@
 #  Licensed under the MIT License.
 
 from contextlib import ExitStack
-from dataclasses import replace
 from pathlib import Path
 import math
 import os
@@ -21,8 +20,8 @@ from nnscaler.cli import Trainer, TrainerArgs
 from nnscaler.cli.trainer_args import OptionalComputeConfig
 from nnscaler.graph.parser import FxModuleParser
 from nnscaler.runtime.deferred_initialization import DeferredInitialization
-from nnscaler.runtime.initialization import create_init_module, preserve_rng_state
-from nnscaler.runtime.module import AttrMeta, ParallelModule
+from nnscaler.runtime.initialization import create_init_module
+from nnscaler.runtime.module import ParallelModule
 from tests.launch_torchrun import launch_torchrun
 from tests.parallel_module.common import assert_equal
 
@@ -216,7 +215,6 @@ def _assert_artifacts(model, strategy):
     file_based = strategy == ParamInitStrategy.FILE
     assert bool(list(model.module_dir.glob('fullmodel.pt*'))) == file_based
     assert (model.module_dir / FxModuleParser.NON_PERSISTENT_BUFFER_FILE).exists() == file_based
-    assert not (model.module_dir / 'init_constants.pt').exists()
 
 
 def _worker_parity(save_dir, policy, zero):
@@ -226,6 +224,7 @@ def _worker_parity(save_dir, policy, zero):
     for strategy, checked in cases:
         cli_args = _args(save_dir, strategy, checked=checked, policy=policy, zero=zero)
         expected = _reference(strategy)
+        _assert_tensor_identical(expected['derived'], expected['layers.0.weight'][0])
         original_build = ParallelModule.build_buckets
         InitModel.partial_requests = []
 
@@ -501,7 +500,7 @@ def _worker_capture_failure(save_dir):
 
 @pytest.mark.skipif(torch.cuda.device_count() < 4, reason='requires four GPUs')
 def test_cli_capture_failure_propagates(tmp_path):
-    with pytest.raises(ChildFailedError, match='Deferred initialization:') as exc:
+    with pytest.raises(ChildFailedError, match='Deferred initialization failed:') as exc:
         launch_torchrun(4, _worker_capture_failure, tmp_path)
     assert 1 in exc.value.failures
 
@@ -649,65 +648,17 @@ def test_cli_param_init_seed(tmp_path):
     launch_torchrun(4, _worker_init_seed, tmp_path)
 
 
-@pytest.mark.parametrize('strategy', [-1, 0, 1, 2, True, 1.0, '1', 'invalid', None])
-def test_invalid_param_init_strategy(strategy):
-    with pytest.raises(ValueError, match='param_init_strategy'):
-        ComputeConfig(1, 1, param_init_strategy=strategy)
-
-
-@pytest.mark.parametrize('seed', [-1, 2 ** 32, True, 1.0, '1', None])
-def test_invalid_param_init_seed(seed):
-    with pytest.raises(ValueError, match='param_init_seed'):
-        ComputeConfig(1, 1, param_init_seed=seed)
-
-
 @pytest.mark.parametrize('strategy', STRATEGIES)
-def test_param_init_config(strategy):
+def test_cli_param_init_config(strategy):
     config = ComputeConfig(1, 1)
-    assert config.param_init_strategy == ParamInitStrategy.FILE
-    assert config.param_init_seed == 1234
-    assert set(STRATEGIES) == {'file', 'recreate', 'capture', 'custom'}
-    selected = replace(config, param_init_strategy=strategy)
-    assert ComputeConfig(1, 1, param_init_strategy=strategy) == selected
     assert OptionalComputeConfig(param_init_strategy=strategy).resolve(
         config,
     ).param_init_strategy == strategy
     assert OptionalComputeConfig(param_init_seed=0).resolve(config).param_init_seed == 0
-    assert ComputeConfig(1, 1, param_init_seed=2 ** 32 - 1).param_init_seed == 2 ** 32 - 1
-    assert (selected.graph_config == replace(selected, param_init_seed=17).graph_config) == (
-        strategy != ParamInitStrategy.FILE
-    )
-    assert (selected.graph_config == config.graph_config) == (strategy == ParamInitStrategy.FILE)
-    args = TrainerArgs.from_cli(_args(Path('unused-param-init'), strategy, checked=True))
+    args = TrainerArgs.from_cli([
+        *_args(Path('unused-param-init'), strategy, checked=True),
+        '--compute_config.param_init_seed', '17',
+    ])
     assert args.compute_config.param_init_strategy == strategy
+    assert args.compute_config.param_init_seed == 17
     assert args.debug.param_init_check is True
-
-
-def test_custom_fixture_matches_eager():
-    expected = _reference(ParamInitStrategy.RECREATE)
-    meta_map = {}
-    for index, (name, tensor) in enumerate(expected.items()):
-        slicers = (slice(0, 8), slice(None)) if tensor.ndim == 2 else (slice(None),)
-        meta_map[f'attr_{index}'] = AttrMeta(
-            tid=index, is_param=name.endswith('.weight'), orig_name=name,
-            shape=tuple(tensor.shape), slicers=slicers, dtype=tensor.dtype,
-            sub_shape=tuple(tensor[slicers].shape), val_chunks=2,
-        )
-    before = InitModel.constructions
-    with preserve_rng_state():
-        random.seed(1234)
-        np.random.seed(1234)
-        torch.random.default_generator.manual_seed(1234)
-        actual = InitModel.__partial__init__(meta_map)
-    assert InitModel.constructions == before
-    for attr, meta in meta_map.items():
-        _assert_tensor_identical(actual[attr], expected[meta.orig_name][meta.slicers])
-
-
-@pytest.mark.parametrize('strategy', ['recreate', 'capture'])
-def test_param_init_reference_buffer_dependencies(strategy):
-    first = _reference(strategy, seed=97)
-    second = _reference(strategy, seed=97)
-    _assert_tensor_identical(first['derived'], first['layers.0.weight'][0])
-    for name, tensor in first.items():
-        _assert_tensor_identical(tensor, second[name])

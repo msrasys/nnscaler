@@ -358,8 +358,8 @@ class ComputeConfig:
             'trace_strategy': self.trace_strategy,  # different strategy might lead to different graph
             # we will retrace the graph on fullmodel.pt file requirement change.
             'param_init': self.param_init_strategy != ParamInitStrategy.FILE,
-            # Only file initialization embeds seeded weights in the cached artifacts.
-            'param_init_seed': self.param_init_seed if self.param_init_strategy == ParamInitStrategy.FILE else None,
+            # Constructor randomness can affect graph structure as well as weights.
+            'param_init_seed': self.param_init_seed,
         }
 
     @property

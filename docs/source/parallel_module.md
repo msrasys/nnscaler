@@ -78,7 +78,7 @@ are supported only when all of their underlying operations are supported.
 Capture supports a bounded set of operations. Data-dependent
 constructor branches (such as reading a deferred parameter with `.item()`) and
 unsupported operations raise an error rather than silently allocating a full model.
-In-place `add_`, `sub_`, `mul_`, and `div_` support scalar operands on initialized
+In-place `add_`, `sub_`, `mul_`, and `div_` support scalar operands on
 contiguous tensors or views; tensor operands are unsupported. Division also supports
 `rounding_mode="floor"` and `"trunc"`.
 Only operations inside the capture context are replayed. Later value mutations of
@@ -154,7 +154,7 @@ compilation.
 
 ### Replica checking and checkpoint resume
 
-The CLI-only `debug.param_init_check=True` (default `False`) exchanges hashes,
+The CLI-only `debug.param_init_check=True` (default `True`) exchanges hashes,
 not weights, and requires bitwise equality without tolerance. The trainer checks
 the whole initialized model after optimizer construction, when all reducer buckets
 have been built, including buckets deferred for parameter classification.
@@ -185,6 +185,10 @@ Load generated classes through `parallelize` to attach the original factory or
 custom callback. For `recreate`/`capture`, an original instance may instead be
 passed as `GeneratedModel(init_module=original_model)`. Ordinary tensor attributes
 converted into buffers by tracing must be available through their original names.
+For `recreate`/`capture`, tensors used by `forward` must therefore be exposed as
+source-model attributes or registered buffers. Tracer-only constants synthesized
+from globals or forward-local tensors cannot be reconstructed by looking up the
+original model; use `file` or provide them through `custom` initialization instead.
 
 CLI configuration:
 
@@ -200,10 +204,10 @@ seed: 1234
 The equivalent CLI overrides are `--compute_config.param_init_strategy capture`,
 `--debug.param_init_check true` and `--compute_config.param_init_seed 1234`.
 Changing between file-backed and independent initialization, or changing the
-file-backed initialization seed, requires retracing (use `gen_reuse: moo` or a fresh
-generated-code directory). Switching between non-file strategies or changing their
-initialization seed can reuse the graph, though the generated configuration is
-updated. The CLI-only
+initialization seed for any strategy, requires retracing (use `gen_reuse: moo` or a
+fresh generated-code directory). Constructor randomness can change model structure,
+not just tensor values. Switching between non-file strategies with the same seed
+can reuse the graph, though the generated configuration is updated. The CLI-only
 `debug.param_init_check` does not affect generated code or graph reuse.
 As with other configuration changes, `moo` cannot replace generated code
 already imported in the current process; use a fresh process or instance name.

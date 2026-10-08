@@ -918,7 +918,7 @@ Please note
 @dataclass
 class DebugConfig:
     check_gradient_sync_cross_devices: bool = True
-    param_init_check: bool = False
+    param_init_check: bool = True
     profile: Optional[ProfileConfig] = None
 ```
 
@@ -931,7 +931,7 @@ class DebugConfig:
 - `param_init_check` (`bool`): Check bitwise equality of initialized parameters and
   buffers across ranks after optimizer construction, once all reducer buckets are
   built. This does not change when buckets are built. Parallelization errors
-  propagate without running this check. Default is `False`.
+  propagate without running this check. Default is `True`.
   Non-file `ParallelModule` tensors are keyed by module path and
   logical shard, so only identical replicas are compared; different or overlapping
   shards are not compared. ZeRO-3 parameters are checked in their stored sharded

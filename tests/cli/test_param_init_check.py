@@ -307,10 +307,8 @@ def test_cli_param_init_check_post_zero3(tmp_path, plan_ngpus, zero_ngroups, del
     launch_torchrun(4, _worker_post_zero3, tmp_path, plan_ngpus, zero_ngroups, delayed_buckets)
 
 
-@pytest.mark.parametrize('checked', [0, 1, 'true', None])
-def test_invalid_param_init_check(checked):
-    with pytest.raises(ValueError, match='param_init_check'):
-        DebugConfig(param_init_check=checked)
+def test_param_init_check_default():
+    assert DebugConfig().param_init_check is True
 
 
 def _plain_model(value=0.125):

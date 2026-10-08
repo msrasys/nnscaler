@@ -41,6 +41,36 @@ class LocalInitModule(MyModule):
         }
 
 
+class DefaultDtypeInitModule(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        previous = torch.get_default_dtype()
+        try:
+            torch.set_default_dtype(torch.float64)
+            self.weight = torch.nn.Parameter(torch.full((4,), 1.00000001))
+        finally:
+            torch.set_default_dtype(previous)
+
+    def forward(self, x):
+        return x * self.weight
+
+
+@patch('torch.cuda.is_available', lambda: False)
+def test_capture_constructor_default_dtype(tmp_path):
+    with mock_cube_env(0, 1), mock_dist(0, 1), patch('torch.distributed.barrier'), \
+            patch('torch.distributed.broadcast_object_list'):
+        generated = parallelize(
+            DefaultDtypeInitModule, {'x': torch.ones(4, dtype=torch.float64)}, 'dp',
+            ComputeConfig(1, 1, param_init_strategy='capture', trace_strategy='cpu'),
+            gen_savedir=tmp_path,
+        )
+        module = generated(build_buckets=False)
+    for attr, meta in module.fullmap.items():
+        actual = getattr(module, attr)
+        assert actual.dtype == torch.float64
+        assert torch.equal(actual, torch.full(meta.sub_shape, 1.00000001, dtype=torch.float64))
+
+
 @pytest.mark.parametrize('strategy', [
     ParamInitStrategy.FILE, ParamInitStrategy.RECREATE,
     ParamInitStrategy.CAPTURE, ParamInitStrategy.CUSTOM,
@@ -49,6 +79,14 @@ def test_param_init_config(strategy):
     config = ComputeConfig(1, 1, param_init_strategy=strategy)
     assert config.param_init_strategy == strategy
     assert nnscaler.ParamInitStrategy is ParamInitStrategy
+
+
+def test_param_init_defaults_and_seed_boundaries():
+    config = ComputeConfig(1, 1)
+    assert config.param_init_strategy == ParamInitStrategy.FILE
+    assert config.param_init_seed == 1234
+    for seed in (0, 2 ** 32 - 1):
+        assert ComputeConfig(1, 1, param_init_seed=seed).param_init_seed == seed
 
 
 def test_param_init_graph_config():
@@ -60,18 +98,18 @@ def test_param_init_graph_config():
     assert ComputeConfig(1, 1).graph_config != configs[0].graph_config
     assert ComputeConfig(1, 1).graph_config != ComputeConfig(1, 1, param_init_seed=77).graph_config
     for config in configs:
-        assert config.graph_config == ComputeConfig(
+        assert config.graph_config != ComputeConfig(
             1, 1, param_init_strategy=config.param_init_strategy, param_init_seed=77,
         ).graph_config
 
 
-@pytest.mark.parametrize('strategy', [False, True, 0, 1, None, 'invalid', 'fullmodel', [], {}])
+@pytest.mark.parametrize('strategy', [False, True, -1, 0, 1, 2, 1.0, None, '1', 'invalid', 'fullmodel', [], {}])
 def test_param_init_config_invalid_strategy(strategy):
     with pytest.raises(ValueError, match='param_init_strategy'):
         ComputeConfig(1, 1, param_init_strategy=strategy)
 
 
-@pytest.mark.parametrize('seed', [True, -1, 2 ** 32, 1.5, '1234'])
+@pytest.mark.parametrize('seed', [True, -1, 2 ** 32, 1.0, 1.5, '1234', None])
 def test_param_init_config_invalid_seed(seed):
     with pytest.raises(ValueError, match='param_init_seed'):
         ComputeConfig(1, 1, param_init_seed=seed)
