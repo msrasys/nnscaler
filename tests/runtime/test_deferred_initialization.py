@@ -262,6 +262,7 @@ def test_factories_and_conversions(factory):
     with DeferredInitialization() as capture:
         actual = factory()
     assert actual.is_meta
+    assert capture._storage(actual).node.operation is None
     materialized = capture.materialize(actual)
     assert materialized.dtype == expected.dtype
     assert torch.equal(materialized, expected)
@@ -272,6 +273,9 @@ def test_factories_and_conversions(factory):
     lambda: torch.empty(4).fill_(1.00000001),
     lambda: torch.arange(0, 1, 0.1),
     lambda: torch.full((4,), 1),
+    lambda: torch.full((4,), 1 + 2j),
+    lambda: torch.full((4,), 1.00000001, dtype=torch.float32),
+    lambda: torch.full_like(torch.empty(4, dtype=torch.float32), 1.00000001),
 ])
 def test_factory_dtype_is_independent_of_replay_default(factory):
     previous = torch.get_default_dtype()
@@ -284,6 +288,7 @@ def test_factory_dtype_is_independent_of_replay_default(factory):
         actual = capture.materialize(tensor)
         assert actual.dtype == expected.dtype
         assert torch.equal(actual, expected)
+        assert torch.get_default_dtype() == torch.float32
     finally:
         torch.set_default_dtype(previous)
 
@@ -677,8 +682,8 @@ def test_out_overloads_are_rejected(operation):
 
 
 @pytest.mark.parametrize("factory, message", [
-    (lambda: torch.ones(3).sum(), "unsupported operation"),
-    (lambda: torch.ones(()).item(), "_local_scalar_dense"),
+    (lambda: torch.ones(3).sin_(), "unsupported mutation"),
+    (lambda: torch.ones(3).resize_(5), "unsupported mutation"),
     (lambda: torch.ones(3, 4).t().fill_(1), "noncontiguous mutation"),
     (lambda: torch.ones(3).add_(torch.ones(3)), "tensor-valued arithmetic"),
     (lambda: torch.empty_strided((3, 4), (0, 1)), "overlapping"),
@@ -732,9 +737,9 @@ def test_partial_writes_initialize_empty_and_preserve_snapshots():
 
 def test_capture_lifecycle_and_constructor_failure():
     capture = DeferredInitialization()
-    with pytest.raises(RuntimeError, match="unsupported operation.*_local_scalar_dense"):
+    with pytest.raises(RuntimeError, match="unsupported mutation.*sin_"):
         with capture:
-            torch.ones(()).item()
+            torch.ones(3).sin_()
     assert not torch.ones(1).is_meta
     with pytest.raises(RuntimeError, match="cannot be reused"):
         with capture:
@@ -875,3 +880,364 @@ def test_actual_cpu_allocation_events_exclude_unselected_weights():
     with profile(activities=[ProfilerActivity.CPU], profile_memory=True, acc_events=True) as replay:
         selected = capture.materialize(model[0].weight)
     assert allocated_bytes(replay) == selected.numel() * selected.element_size()
+
+
+def test_generic_pure_operations_and_historical_inputs():
+    def factory():
+        x = torch.arange(12, dtype=torch.float64).reshape(3, 4)
+        y = torch.sin(x) + torch.cos(x)
+        z = torch.tril((y / 2).pow(2))
+        result = z.sum(1) + z.mean(1)
+        x.fill_(99)
+        return result
+
+    expected = factory()
+    with DeferredInitialization() as capture:
+        result = factory()
+    assert result.is_meta
+    assert capture._storage(result).node.operation is None
+    torch.testing.assert_close(capture.materialize(result), expected)
+
+
+@pytest.mark.parametrize("dtype", [None, torch.complex128])
+def test_generic_complex_reduction_preserves_computation_dtype(dtype):
+    def factory():
+        return torch.linalg.vector_norm(torch.ones(4, dtype=torch.complex64), dtype=dtype)
+
+    expected = factory()
+    with DeferredInitialization() as capture:
+        result = factory()
+    torch.testing.assert_close(capture.materialize(result), expected, rtol=0, atol=0)
+
+
+def test_generic_multioutput_shared_operation_and_mutation():
+    with DeferredInitialization() as capture:
+        source = torch.arange(12, dtype=torch.float64).reshape(4, 3)
+        q, r = torch.linalg.qr(source)
+        assert capture._storage(q).node.operation is capture._storage(r).node.operation
+        assert capture._storage(q).node.operation is not None
+        before = q.clone()
+        combined = q @ r
+        q.t()[0].fill_(2)
+        maxima, indices = torch.max(combined, dim=1)
+    expected_q, _ = torch.linalg.qr(torch.arange(12, dtype=torch.float64).reshape(4, 3))
+    torch.testing.assert_close(capture.materialize(before), expected_q)
+    expected_q[:, 0].fill_(2)
+    torch.testing.assert_close(capture.materialize(q), expected_q)
+    torch.testing.assert_close(capture.materialize(maxima), torch.arange(2, 12, 3, dtype=torch.float64))
+    assert torch.equal(capture.materialize(indices), torch.full((4,), 2, dtype=torch.int64))
+
+    class QRRecorder(TorchDispatchMode):
+        calls = 0
+
+        def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+            if func == torch.ops.aten.linalg_qr.default:
+                self.calls += 1
+            return func(*args, **(kwargs or {}))
+
+    with QRRecorder() as recorder:
+        capture.materialize(combined)
+    assert recorder.calls == 1
+
+
+def test_generic_captures_default_dtype():
+    previous = torch.get_default_dtype()
+    try:
+        torch.set_default_dtype(torch.float64)
+        with DeferredInitialization() as capture:
+            result = torch.arange(4).sin()
+        torch.set_default_dtype(torch.float32)
+        actual = capture.materialize(result)
+        assert actual.dtype == torch.float64
+        assert torch.get_default_dtype() == torch.float32
+        torch.testing.assert_close(actual, torch.arange(4).double().sin())
+    finally:
+        torch.set_default_dtype(previous)
+
+
+def test_data_dependent_fallback_control_flow_and_later_operations(caplog):
+    with DeferredInitialization() as capture:
+        x = torch.arange(6)
+        positions = torch.nonzero(x > 2).flatten()
+        count = positions.sum().item()
+        assert count == 12
+        result = positions.sin() if count > 10 else positions.cos()
+        positions[0].fill_(5)
+        changed = positions + 1
+        x.fill_(99)
+    torch.testing.assert_close(capture.materialize(result), torch.tensor([3, 4, 5]).sin())
+    assert torch.equal(capture.materialize(changed), torch.tensor([6, 5, 6]))
+    assert "fallback" in caplog.text.lower()
+    first = capture.materialize(positions)
+    first.fill_(42)
+    assert torch.equal(capture.materialize(positions), torch.tensor([5, 4, 5]))
+
+
+def test_generic_tagged_random_is_stable_and_preserves_rng():
+    state = torch.get_rng_state()
+    generator = torch.Generator().manual_seed(14)
+    generator_state = generator.get_state()
+    with DeferredInitialization() as capture:
+        gamma = torch.ops.aten._standard_gamma.default(torch.ones(64), generator=generator)
+        values, mask = torch.ops.aten.native_dropout.default(torch.ones(64), 0.3, True)
+    for result in (gamma, values, mask):
+        assert torch.equal(capture.materialize(result), capture.materialize(result))
+    assert torch.equal(capture.materialize(values), capture.materialize(mask) / 0.7)
+    assert torch.equal(torch.get_rng_state(), state)
+    assert torch.equal(generator.get_state(), generator_state)
+
+
+def test_random_control_flow_uses_same_values_as_replay():
+    state = torch.get_rng_state()
+    with DeferredInitialization() as capture:
+        x = torch.randn(32)
+        total = x.sum().item()
+        factor = 2 if total > 0 else 3
+        result = x * factor
+    with torch.random.fork_rng(devices=[]):
+        torch.rand(100)
+        materialized = capture.materialize(x)
+        assert materialized.sum().item() == total
+        assert torch.equal(capture.materialize(result), materialized * factor)
+    assert torch.equal(torch.get_rng_state(), state)
+
+
+def test_trunc_normal_and_partial_unary_writes():
+    with DeferredInitialization() as capture:
+        x = torch.empty(256)
+        torch.nn.init.trunc_normal_(x, mean=0.2, std=0.4, a=-0.5, b=0.8)
+        random_node = capture._storage(x).node
+        while random_node.seed is None:
+            random_node = random_node.previous
+        seed = random_node.seed
+        before = x.clone()
+        x[3:8].clamp_(-0.1, 0.1)
+    original = capture.materialize(before)
+    assert original.min() >= -0.5
+    assert original.max() <= 0.8
+    with torch.random.fork_rng(devices=[]):
+        torch.random.default_generator.manual_seed(seed)
+        reference = torch.nn.init.trunc_normal_(
+            torch.empty(256), mean=0.2, std=0.4, a=-0.5, b=0.8,
+        )
+    torch.testing.assert_close(original, reference, rtol=0, atol=0)
+    expected = original.clone()
+    expected[3:8].clamp_(-0.1, 0.1)
+    torch.testing.assert_close(capture.materialize(x), expected)
+
+
+def test_generic_invalid_inputs_are_not_fallback(caplog):
+    with DeferredInitialization():
+        with pytest.raises(RuntimeError):
+            torch.ones(2, 3) @ torch.ones(4, 5)
+    assert "fallback" not in caplog.text.lower()
+
+
+@pytest.mark.parametrize("operation", [
+    lambda x: x.split(2),
+    lambda x: x.unbind(0),
+    lambda x: x.diagonal(),
+])
+def test_generic_aliasing_outputs_are_rejected(operation):
+    with DeferredInitialization() as capture:
+        source = torch.ones(4, 4)
+        with pytest.raises(RuntimeError, match="unsupported aliasing operation"):
+            operation(source)
+        source[0].fill_(3)
+    expected = torch.ones(4, 4)
+    expected[0].fill_(3)
+    assert torch.equal(capture.materialize(source), expected)
+
+
+def test_missing_meta_custom_operation_replays_shared_outputs_and_preserves_rng(caplog):
+    from torch.multiprocessing.reductions import StorageWeakRef
+
+    calls = []
+    output_storages = []
+    lib = torch.library.Library("deferred_init_test", "FRAGMENT")
+    lib.define("data_op(Tensor x) -> (Tensor, Tensor)", tags=(torch.Tag.nondeterministic_seeded,))
+
+    def implementation(x):
+        calls.append(1)
+        outputs = x + random.random() + np.random.rand() + torch.rand_like(x), x.nonzero()
+        output_storages.extend(StorageWeakRef(value.untyped_storage()) for value in outputs)
+        return outputs
+
+    lib.impl("data_op", implementation, "CPU")
+    state = torch.get_rng_state()
+    python_state = random.getstate()
+    numpy_state = np.random.get_state()
+    with AllocationRecorder() as recorder, DeferredInitialization() as capture:
+        source = torch.arange(4, dtype=torch.float32)
+        first, second = torch.ops.deferred_init_test.data_op(source)
+        downstream = first.sin() + second.sum()
+        source.fill_(99)
+    assert calls == [1]
+    assert any(device == "cpu" for device, _ in recorder.outputs)
+    assert all(storage.expired() for storage in output_storages)
+    with torch.random.fork_rng(devices=[]):
+        torch.random.default_generator.manual_seed(999)
+        actual = capture.materialize(downstream)
+    assert calls == [1, 1]
+    assert all(storage.expired() for storage in output_storages)
+    first_value = capture.materialize(first)
+    torch.testing.assert_close(actual, first_value.sin() + 6)
+    first_value.zero_()
+    torch.testing.assert_close(capture.materialize(downstream), actual)
+    assert torch.equal(capture.materialize(second), torch.tensor([[1], [2], [3]]))
+    assert calls == [1] * 5
+    del first_value
+    assert all(storage.expired() for storage in output_storages)
+    assert torch.equal(torch.get_rng_state(), state)
+    assert random.getstate() == python_state
+    current_numpy = np.random.get_state()
+    assert current_numpy[0] == numpy_state[0]
+    assert np.array_equal(current_numpy[1], numpy_state[1])
+    assert current_numpy[2:] == numpy_state[2:]
+    assert "concrete fallback" in caplog.text
+
+
+def test_factory_missing_meta_fallback_replays_with_captured_dtype(caplog):
+    class MissingMetaFactory(TorchDispatchMode):
+        calls = 0
+
+        def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+            kwargs = kwargs or {}
+            if func == torch.ops.aten.ones.default:
+                if kwargs.get("device") == torch.device("meta"):
+                    raise NotImplementedError("implementation unavailable")
+                self.calls += 1
+            return func(*args, **kwargs)
+
+    previous_dtype = torch.get_default_dtype()
+    try:
+        torch.set_default_dtype(torch.float64)
+        with MissingMetaFactory() as recorder, DeferredInitialization() as capture:
+            tensor = torch.ones(4)
+            downstream = tensor.sin()
+        assert tensor.is_meta
+        assert recorder.calls == 1
+        torch.set_default_dtype(torch.float32)
+        with recorder:
+            first = capture.materialize(tensor)
+            first.zero_()
+            actual = capture.materialize(downstream)
+        assert recorder.calls == 3
+        assert actual.dtype == torch.float64
+        torch.testing.assert_close(actual, torch.ones(4, dtype=torch.float64).sin())
+        assert "concrete fallback" in caplog.text
+    finally:
+        torch.set_default_dtype(previous_dtype)
+
+
+@pytest.mark.parametrize("use_generator", [False, True])
+def test_generic_positional_generator_and_following_arguments(use_generator):
+    namespace = f"deferred_init_generator_{int(use_generator)}"
+    lib = torch.library.Library(namespace, "FRAGMENT")
+    lib.define(
+        "sample(Tensor x, Generator? generator=None, float offset=0.) -> Tensor",
+        tags=(torch.Tag.nondeterministic_seeded,),
+    )
+    lib.impl("sample", lambda x, generator=None, offset=0.: x.clone(), "Meta")
+
+    def cpu(x, generator=None, offset=0.):
+        return torch.rand(x.shape, dtype=x.dtype, generator=generator if use_generator else None) + offset
+
+    lib.impl("sample", cpu, "CPU")
+    generator = torch.Generator().manual_seed(42)
+    generator_state = generator.get_state()
+    state = torch.get_rng_state()
+    with DeferredInitialization() as capture:
+        result = getattr(torch.ops, namespace).sample(torch.ones(8), generator, 3.)
+    seed = (42 + capture._calls * 0x9E3779B97F4A7C15) % (2 ** 63)
+    with torch.random.fork_rng(devices=[]):
+        torch.random.default_generator.manual_seed(seed)
+        expected = cpu(torch.ones(8), torch.Generator().manual_seed(seed), 3.)
+    torch.testing.assert_close(capture.materialize(result), expected, rtol=0, atol=0)
+    assert torch.equal(generator.get_state(), generator_state)
+    generator.manual_seed(100)
+    assert torch.equal(capture.materialize(result), expected)
+    assert torch.equal(torch.get_rng_state(), state)
+    assert not torch.equal(generator.get_state(), generator_state)
+
+
+@pytest.mark.parametrize("operation", ["erfinv_", "clamp_"])
+def test_unary_writes_reject_external_and_noncontiguous(operation):
+    external = torch.ones(3)
+    arguments = (-1, 1) if operation == "clamp_" else ()
+    with DeferredInitialization():
+        with pytest.raises(RuntimeError, match="mutation of external data"):
+            getattr(external, operation)(*arguments)
+        with pytest.raises(RuntimeError, match="noncontiguous mutation"):
+            getattr(torch.ones(3, 4).t(), operation)(*arguments)
+
+
+@pytest.mark.parametrize("tag", [
+    torch.Tag.dynamic_output_shape, torch.Tag.data_dependent_output,
+])
+def test_custom_dynamic_shape_fallback(tag):
+    namespace = f"deferred_init_{tag.name}"
+    lib = torch.library.Library(namespace, "FRAGMENT")
+    lib.define("positions(Tensor x) -> Tensor", tags=(tag,))
+    lib.impl("positions", lambda x: x.nonzero(), "CPU")
+    meta_calls = []
+
+    @torch.library.register_fake(f"{namespace}::positions", lib=lib)
+    def fake(x):
+        meta_calls.append(1)
+        return x.new_empty((torch.library.get_ctx().new_dynamic_size(), 1), dtype=torch.int64)
+
+    with DeferredInitialization() as capture:
+        result = getattr(torch.ops, namespace).positions(torch.arange(4))
+        downstream = result + 2
+    assert torch.equal(capture.materialize(downstream), torch.tensor([[3], [4], [5]]))
+    assert meta_calls == []
+
+
+def test_custom_meta_error_is_not_hidden(caplog):
+    lib = torch.library.Library("deferred_init_invalid_meta", "FRAGMENT")
+    lib.define("invalid(Tensor x) -> Tensor")
+    calls = []
+    lib.impl("invalid", lambda x: calls.append(1) or x.clone(), "CPU")
+
+    def meta(x):
+        raise RuntimeError("invalid input in custom meta kernel")
+
+    lib.impl("invalid", meta, "Meta")
+    with DeferredInitialization():
+        with pytest.raises(RuntimeError, match="invalid input in custom meta kernel"):
+            torch.ops.deferred_init_invalid_meta.invalid(torch.ones(3))
+    assert calls == []
+    assert "concrete fallback" not in caplog.text
+
+
+def test_generic_replay_failure_restores_rng_and_dtype():
+    lib = torch.library.Library("deferred_init_invalid_replay", "FRAGMENT")
+    lib.define("invalid(Tensor x) -> Tensor")
+    lib.impl("invalid", lambda x: x.clone(), "Meta")
+
+    def cpu(x):
+        torch.rand(1)
+        random.random()
+        np.random.rand()
+        raise RuntimeError("custom replay failure")
+
+    lib.impl("invalid", cpu, "CPU")
+    previous_dtype = torch.get_default_dtype()
+    try:
+        torch.set_default_dtype(torch.float64)
+        with DeferredInitialization() as capture:
+            result = torch.ops.deferred_init_invalid_replay.invalid(torch.ones(3))
+        torch.set_default_dtype(torch.float32)
+        state = torch.get_rng_state()
+        python_state = random.getstate()
+        numpy_state = np.random.get_state()
+        with pytest.raises(RuntimeError, match="custom replay failure"):
+            capture.materialize(result)
+        assert torch.get_default_dtype() == torch.float32
+        assert torch.equal(torch.get_rng_state(), state)
+        assert random.getstate() == python_state
+        assert np.array_equal(np.random.get_state()[1], numpy_state[1])
+        assert np.random.get_state()[2:] == numpy_state[2:]
+    finally:
+        torch.set_default_dtype(previous_dtype)

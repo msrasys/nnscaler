@@ -3,19 +3,28 @@
 
 """In-memory initialization of generated modules.
 
-Deferred initialization captures constructors without storage for selective,
-CPU-only replay. It is not a general lazy tensor implementation. Only the operations
-listed below are supported; data-dependent constructors must use file or model initialization.
-Random operations use independent seeds, not eager PyTorch's random-number stream.
-Existing real tensor inputs are borrowed, not copied, and must remain unchanged
-until replay. ``torch.tensor`` literals allocate before dispatch; their real
-storage is retained by the captured recipes, so these allocations are not deferred.
+Deferred initialization records pure dispatched operations using meta tensors for
+selective CPU replay. Data-dependent tags and meta NotImplementedError trigger a
+logged concrete execution during capture; tensor results are then discarded.
+This supports scalar control flow but is not a general lazy tensor implementation:
+mutations and aliasing operations still require explicit support.
+
+Replay restores the captured default dtype. Supported random operations, including
+generically recorded operators tagged as seeded nondeterministic, use independent
+per-operation seeds rather than eager PyTorch's random-number stream. Meta execution
+does not isolate RNG side effects. Custom-operator replay preserves Python, NumPy,
+torch CPU and current-device CUDA RNG states; native random replay uses private
+generators or scoped CPU RNG.
+Existing real inputs are borrowed and must remain unchanged until
+replay. ``torch.tensor`` literals allocate before dispatch, and concrete fallback
+temporarily allocates real storage, so these allocations are not deferred.
 """
 
 from __future__ import annotations
 
 from contextlib import contextmanager, nullcontext
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+import logging
 import random
 from typing import TYPE_CHECKING, Any, Callable, Dict, Optional, Type
 
@@ -25,6 +34,19 @@ from torch.utils._python_dispatch import TorchDispatchMode
 
 if TYPE_CHECKING:
     from nnscaler.runtime.module import AttrMeta
+
+
+_logger = logging.getLogger(__name__)
+
+
+@contextmanager
+def _default_dtype(dtype):
+    previous = torch.get_default_dtype()
+    try:
+        torch.set_default_dtype(dtype)
+        yield
+    finally:
+        torch.set_default_dtype(previous)
 
 
 @contextmanager
@@ -106,14 +128,28 @@ def _map(value, transform):
 
 @dataclass(eq=False)
 class _Node:
-    tensor: torch.Tensor  # Meta-only layout template, never a real parameter cache.
+    # Meta-only layout template; None for a shared structured/scalar result.
+    tensor: Optional[torch.Tensor]
+    # Captured operator to replay; None for projection nodes.
     func: Any
+    # Positional arguments with tensor dependencies snapshotted; excludes the write destination.
     args: Any
+    # Snapshotted keyword arguments; generators are replaced during replay using seed.
     kwargs: Any
+    # Per-operation random seed; None when no seeded replay is needed.
     seed: Optional[int] = None
-    mutation: bool = False
+    # Old storage version copied into a fresh buffer before this write.
+    # None for full overwrites that do not need the old contents, and for non-write nodes.
     previous: Optional["_Node"] = None
+    # Write destination layout (shape, stride, storage_offset) within that fresh buffer.
+    # A non-None value identifies a write node.
     target: Any = None
+    # Capture-time default dtype, temporarily restored when executing the operator.
+    default_dtype: torch.dtype = field(default_factory=torch.get_default_dtype)
+    # Shared producer for a projection node; its result is indexed, not copied or modified.
+    operation: Optional["_Node"] = None
+    # Index/key path from operation's structured result to this tensor; otherwise empty.
+    projection: tuple = ()
 
 
 @dataclass
@@ -147,40 +183,44 @@ class DeferredInitialization(TorchDispatchMode):
             model = factory()
         weight = capture.materialize(model.weight)
 
-    Allocating operators produce meta tensors. Recipes retain only meta metadata
-    and explicitly supplied external data. Each materialization has an ephemeral
-    dependency cache; copied weights may require replaying their source weights,
-    but unrelated parameters are never evaluated. Repeated calls are independent.
+    Pure dispatched operators normally produce meta tensors and dependency
+    recipes, including projections of shared multi-output operations. When an
+    operator lacks meta support or needs data, capture replays its dependencies
+    on CPU to determine output metadata. Tensor results return to the capture
+    graph as meta tensors; scalar results can drive constructor control flow.
+    Fallback therefore trades capture-time memory for broader constructor support.
+
+    Each materialization evaluates only reachable dependencies with an ephemeral
+    cache. Copied weights may require replaying their sources. Fallback operations
+    are replayed like ordinary operations, without retaining concrete results
+    between calls. Recipes capture the default dtype and random
+    seeds; random values are repeatable but need not match eager initialization.
 
     Empty allocations are replayed without initializing their values, like eager
-    PyTorch. Partial writes require a contiguous destination view. Arbitrary
-    computations, overlapping layouts, tensor-valued arithmetic mutations, and
-    value-dependent control flow are unsupported. Capture is single-use.
+    PyTorch. Supported writes require a contiguous destination view; these include
+    scalar arithmetic, ``erfinv_`` and scalar ``clamp_``. External writes, ``out=``,
+    other mutations, tensor-valued arithmetic mutations, unsupported aliasing
+    operators and overlapping allocation layouts are rejected. Capture is single-use,
+    and public ``materialize`` calls must occur after leaving the context.
     Only initialization inside the context is replayed; later value mutations of
     captured meta tensors are ignored. Do not change their metadata afterwards.
     """
 
-    _factories = {
-        "empty", "empty_strided", "zeros", "ones", "full", "rand", "randn", "arange",
-        "empty_like", "zeros_like", "ones_like", "full_like", "new_empty",
-        "new_empty_strided", "new_zeros", "new_ones", "new_full",
-        "rand_like", "randn_like", "randint", "randint_like", "randperm",
-    }
     _views = {
         "detach", "alias", "view", "_unsafe_view", "transpose", "t", "permute",
         "slice", "select", "unsqueeze", "squeeze", "expand",
     }
-    # _to_copy is aten name for tensor.to(...) when tensor copying is happening.
-    _copies = {"clone", "_to_copy"}
     _arithmetic_writes = {"add_", "sub_", "mul_", "div_"}
+    _unary_writes = {"erfinv_", "clamp_"}
     _random_writes = {
         "uniform_", "normal_", "random_", "bernoulli_", "exponential_",
         "geometric_", "log_normal_", "cauchy_",
     }
     _sampling = {"normal", "bernoulli", "poisson", "multinomial"}
+    _random_factories = {"rand", "randn", "randint", "randperm"}
     _random_like = {"rand_like", "randn_like", "randint_like"}
-    _writes = {"fill_", "zero_", "copy_"} | _arithmetic_writes | _random_writes
-    _random = {"rand", "randn", "randint", "randperm"} | _random_like | _random_writes | _sampling
+    _writes = {"fill_", "zero_", "copy_"} | _arithmetic_writes | _random_writes | _unary_writes
+    _random = _random_factories | _random_like | _random_writes | _sampling
 
     def __init__(self):
         super().__init__()
@@ -257,21 +297,16 @@ class DeferredInitialization(TorchDispatchMode):
         if any(arg.is_out for arg in func._schema.arguments):
             raise _unsupported(f"out= overload {func}")
 
-        # Unlike other supported random operators, poisson accepts a positional generator.
-        if name == "poisson" and len(args) > 1:
-            kwargs["generator"] = args[1]
-            args = args[:1]
-
         if name in self._views:
             return self._view(func, args, kwargs)
         if name in self._writes:
             return self._write(func, name, args, kwargs)
         if name == "lift_fresh":
-            return self._lift_fresh(args[0])
-        if name in self._factories or name in self._copies or name in self._sampling:
-            return self._factory_copy(func, name, args, kwargs)
+            # Literals already own real storage before dispatch; borrow it and
+            # use the ordinary clone recipe for independent materializations.
+            return self._op(torch.ops.aten.clone.default, "clone", args, kwargs)
 
-        raise _unsupported(f"unsupported operation {func}")
+        return self._op(func, name, args, kwargs)
 
     def _view(self, func, args, kwargs):
         # Views share the producer's recipe with a different layout,
@@ -284,45 +319,86 @@ class DeferredInitialization(TorchDispatchMode):
             raise _unsupported(f"view {func} unexpectedly allocated new storage")
         return result
 
-    def _lift_fresh(self, tensor):
-        # torch.tensor literals already have real storage before dispatch.
-        # Retain the literal's real data and replay it as a clone.
-        source = self._snapshot(tensor)
-        result = torch.empty_strided(tensor.shape, tensor.stride(),
-                                     dtype=tensor.dtype, device="meta")
-        node = _Node(result, torch.ops.aten.clone.default, (source,), {})
-        return self._register(result, node)
+    def _op(self, func, name, args, kwargs):
+        """Capture factories, copies and other pure operations using meta execution.
 
-    def _factory_copy(self, func, name, args, kwargs):
-        seed = self._seed(name, kwargs)
+        Single tensors use a direct recipe, just like factory allocations.
+        Structured outputs project a shared recipe; missing-meta/data-dependent
+        kernels execute temporarily to determine output metadata and scalar values.
+        """
+        # Alias annotations describe storage sharing; is_write marks mutation.
+        # Mutation should be handled explicitly in `self._write`
+        # Reject remaining writes here rather than record them as pure operations.
+        if any(arg.alias_info is not None and arg.alias_info.is_write
+               for arg in func._schema.arguments):
+            raise _unsupported(f"unsupported mutation {func}")
 
+        # Alias-returning operators (like view/slice) should be handled in `self._view`.
+        if any(ret.alias_info is not None for ret in func._schema.returns):
+            raise _unsupported(f"unsupported aliasing operation {func}")
+
+        # Handle generator arguments by moving them to kwargs and truncating args.
+        # because some functions accept the generator as a positional argument (like poisson),
+        # we move it to kwargs to standardize handling.
+        for index, arg in enumerate(func._schema.arguments):
+            if arg.name == "generator" and index < len(args):
+                kwargs.update((schema.name, value) for schema, value in
+                              zip(func._schema.arguments[index:], args[index:]))
+                args = args[:index]
+                break
+
+        random_op = torch.Tag.nondeterministic_seeded in func.tags
+        seed = self._seed(name, kwargs, random_op=random_op)
         recipe_args = _map(args, self._snapshot)
         recipe_kwargs = _map(kwargs, self._snapshot)
+        recipe_kwargs.pop("generator", None)
+        node = _Node(None, func, recipe_args, recipe_kwargs, seed)
 
-        # Execute on meta for output metadata only; real allocation waits for replay.
         meta_kwargs = _map(kwargs, self._to_meta)
+        if "generator" in meta_kwargs:
+            meta_kwargs["generator"] = None
         if any(arg.name == "device" for arg in func._schema.arguments):
             meta_kwargs["device"] = torch.device("meta")
-        if "generator" in meta_kwargs:
-            # Meta execution must not use the caller's CPU/CUDA generator.
-            meta_kwargs["generator"] = None
         meta_args = _map(args, self._to_meta)
 
-        if name == "randint_like" and isinstance(args[1], torch.Tensor):
-            # PyTorch 2.10's Tensor overload loses strides on meta. Match eager
-            # and replay layout using empty_like without reading the bound.
-            meta_kwargs.pop("generator", None)
-            result = torch.empty_like(meta_args[0], **meta_kwargs)
+        reason = None
+        if any(tag in func.tags for tag in (
+            torch.Tag.data_dependent_output,   # .item
+            torch.Tag.dynamic_output_shape,    # .nonzero/unique_dim
+        )):
+            reason = "operator output requires concrete data"
         else:
-            result = func(*meta_args, **meta_kwargs)
+            try:
+                if name == "randint_like" and isinstance(args[1], torch.Tensor):
+                    # PyTorch 2.10's Tensor overload loses strides on meta.
+                    # Match eager/replay layout without reading the bound.
+                    meta_kwargs.pop("generator", None)
+                    result = torch.empty_like(meta_args[0], **meta_kwargs)
+                else:
+                    result = func(*meta_args, **meta_kwargs)
+            except NotImplementedError as exc:
+                reason = str(exc)
 
-        # Replay creates a private CPU generator from seed, not the mutable original.
-        recipe_kwargs.pop("generator", None)
-        if any(arg.name == "dtype" for arg in func._schema.arguments):
-            # The constructor may restore the default dtype before replay.
-            recipe_kwargs["dtype"] = result.dtype
-        node = _Node(result, func, recipe_args, recipe_kwargs, seed)
-        return self._register(result, node)
+        if reason is not None:
+            _logger.warning("Deferred initialization concrete fallback for %s: %s", func, reason)
+            result = _map(self._replay(node), self._to_meta)
+
+        if isinstance(result, torch.Tensor):
+            node.tensor = result
+            return self._register(result, node)
+
+        def register(value, path=()):
+            if isinstance(value, (tuple, list)):
+                return type(value)(register(item, path + (index,))
+                                   for index, item in enumerate(value))
+            if isinstance(value, dict):
+                return {key: register(item, path + (key,)) for key, item in value.items()}
+            if isinstance(value, torch.Tensor):
+                projection = _Node(value, None, (), {}, operation=node, projection=path)
+                return self._register(value, projection)
+            return value
+
+        return register(result)
 
     def _to_meta(self, value):
         if isinstance(value, torch.Tensor):
@@ -333,8 +409,8 @@ class DeferredInitialization(TorchDispatchMode):
             return torch.empty_strided(value.shape, value.stride(), dtype=value.dtype, device="meta")
         return value
 
-    def _seed(self, name, kwargs):
-        if name not in self._random:
+    def _seed(self, name, kwargs, *, random_op=False):
+        if name not in self._random and not random_op:
             return None
         generator = kwargs.get("generator")
         initial = torch.initial_seed() if generator is None else generator.initial_seed()
@@ -352,13 +428,13 @@ class DeferredInitialization(TorchDispatchMode):
         # previous and _Read entries in args/kwargs already form a dependency DAG.
         # Tensor arithmetic needs broadcast, dtype, aliasing and historical-value
         # semantics validated before enabling it.
-        if name in self._arithmetic_writes and any(
-            isinstance(value, torch.Tensor) for value in args[1:]
+        if name in self._arithmetic_writes | self._unary_writes and any(
+            isinstance(value, torch.Tensor) for value in (*args[1:], *kwargs.values())
         ):
             raise _unsupported(f"tensor-valued arithmetic in {func}")
 
         full = _layout(tensor) == _layout(storage.tensor)
-        needs_previous = not full or name in self._arithmetic_writes
+        needs_previous = not full or name in self._arithmetic_writes | self._unary_writes
 
         # capture the arguments and keyword arguments for the node
         # so we can later replay the operation with the exact same arguments and keyword arguments.
@@ -366,10 +442,9 @@ class DeferredInitialization(TorchDispatchMode):
         recipe_kwargs = _map(kwargs, self._snapshot)
         seed = self._seed(name, kwargs)
         # remove the generator from the captured keyword arguments
-        # we will replace it with `torch.Generator(device="cpu").manual_seed(node.seed)`
-        # when the node is actually evaluated.
+        # replay replaces it with a private CPU generator using node.seed.
         recipe_kwargs.pop("generator", None)
-        node = _Node(storage.tensor, func, recipe_args, recipe_kwargs, seed, True,
+        node = _Node(storage.tensor, func, recipe_args, recipe_kwargs, seed,
                      storage.node if needs_previous else None, _layout(tensor))
 
         # result is fake
@@ -388,9 +463,12 @@ class DeferredInitialization(TorchDispatchMode):
 
         The captured recipes form a DAG, not just a chain of writes:
 
-        - ``_Node`` records an operator, its arguments, a meta output template,
-          and an optional per-operation random seed.
-        - ``_Read`` entries in node args/kwargs reference a specific producer
+        - ``_Node`` directly records a factory, copy, write or single-output pure
+          operator with its arguments, capture-time default dtype and random seed.
+          Structured outputs instead project one shared recipe node through
+          ``operation``/``projection``; that shared node has no tensor template.
+          Concrete fallback uses the same recipes and is re-executed as needed.
+        - ``_Read`` entries in recipe args/kwargs reference a specific producer
           node and a view layout (shape, stride, storage offset).
         - Empty allocations are ordinary nodes. All tensor arguments reference
           their original producers, even when an operator only needs their layout.
@@ -412,14 +490,16 @@ class DeferredInitialization(TorchDispatchMode):
         After capture ends, snapshot the requested tensor and recursively resolve
         only its reachable dependencies. ``resolve`` reconstructs reads with
         ``as_strided`` and validates external versions before moving external
-        inputs to CPU. ``evaluate`` resolves operator arguments, creates a private
-        CPU generator from the saved seed when present, and executes the operator.
+        inputs to CPU. ``execute`` resolves operator arguments, creates a private
+        CPU generator or scoped CPU RNG state from the saved seed when present,
+        and executes the operator under its captured default dtype.
         Mutation nodes allocate a new buffer, copy ``previous`` if required, then
         write through the target view; this leaves older node values unchanged.
 
         A per-call cache evaluates each shared node at most once. Replay runs
         under ``no_grad`` and clears the cache even on failure; separate calls
-        recompute dependencies. Selection is by node, not individual elements:
+        recompute dependencies, including fallback operations.
+        Selection is by node, not individual elements:
         requesting a small view may still materialize its full producer. No final
         clone is added, so returned views may retain larger storage and external
         CPU inputs may share storage with the result. The original meta tensor is
@@ -428,6 +508,11 @@ class DeferredInitialization(TorchDispatchMode):
         if self._active:
             raise _unsupported("materialize must be called after leaving capture")
         value = self._snapshot(tensor)
+        return self._replay(value)
+
+    def _replay(self, value):
+        # Dispatch temporarily removes this mode while invoking its handler;
+        # fallback can replay here without disabling other observers/modes.
         cache = {}
 
         def resolve(item: _Read | _External | Any):
@@ -437,41 +522,62 @@ class DeferredInitialization(TorchDispatchMode):
                 if item.tensor._version != item.version:
                     raise _unsupported("external tensor data changed after capture")
                 return item.tensor.detach().to(device="cpu")
+            if isinstance(item, _Node):
+                return evaluate(item)
             return item
 
-        def evaluate(node: _Node):
+        def evaluate(node):
             if node in cache:
                 return cache[node]
-
-            args = _map(node.args, resolve)
-            kwargs = _map(node.kwargs, resolve)
-            if node.seed is not None:
-                kwargs["generator"] = torch.Generator(device="cpu").manual_seed(node.seed)
-
-            if node.mutation:
+            if node.operation is not None:
+                result = evaluate(node.operation)
+                for index in node.projection:
+                    result = result[index]
+            elif node.target is not None:
                 result = torch.empty_strided(node.tensor.shape, node.tensor.stride(),
                                              dtype=node.tensor.dtype, device="cpu")
                 if node.previous is not None:
                     result.copy_(evaluate(node.previous))
-                node.func(result.as_strided(*node.target), *args, **kwargs)
+                execute(node, result.as_strided(*node.target))
             else:
-                name = node.func._schema.name.split("::")[-1]
-                if any(arg.name == "device" for arg in node.func._schema.arguments):
-                    kwargs["device"] = torch.device("cpu")
-
-                # many random-like aten functions doesn't accept a generator directly
-                if name in self._random_like:
-                    # Older *_like APIs do not accept a generator.
-                    kwargs.pop("generator")
-                    with torch.random.fork_rng(devices=[]):
-                        torch.random.default_generator.manual_seed(node.seed)
-                        result = getattr(torch, name)(*args, **kwargs)
-                elif name in {"rand", "randn", "randint", "randperm"}:
-                    result = getattr(torch, name)(*args, **kwargs)
-                else:
-                    result = node.func(*args, **kwargs)
+                result = execute(node)
             cache[node] = result
             return result
+
+        def execute(node, target=None):
+            args = _map(node.args, resolve)
+            kwargs = _map(node.kwargs, resolve)
+            func = node.func
+            name = func._schema.name.split("::")[-1]
+            custom = not func._schema.name.startswith("aten::")
+            accepts_generator = any(arg.name == "generator" for arg in func._schema.arguments)
+            if node.seed is not None and (accepts_generator or name in self._random_factories):
+                kwargs["generator"] = torch.Generator(device="cpu").manual_seed(node.seed)
+            if target is not None:
+                args = (target, *args)
+            elif any(arg.name == "device" for arg in func._schema.arguments):
+                kwargs["device"] = torch.device("cpu")
+
+            # ATen uses private generators or the CPU RNG scope below. Custom
+            # kernels may also use Python/NumPy/CUDA RNG. Avoid allocating RNG
+            # snapshots for native deterministic operations and private generators.
+            with _default_dtype(node.default_dtype), (
+                preserve_rng_state() if custom else nullcontext()
+            ):
+                if name in self._random_like:
+                    # Use the Python API's overload selection, including tensor
+                    # bounds, but support older *_like APIs without generators.
+                    kwargs.pop("generator", None)
+                    func = getattr(torch, name)
+                elif name in self._random_factories:
+                    func = getattr(torch, name)
+                if node.seed is not None and (
+                    custom or name in self._random_like or "generator" not in kwargs
+                ):
+                    with torch.random.fork_rng(devices=[]):
+                        torch.random.default_generator.manual_seed(node.seed)
+                        return func(*args, **kwargs)
+                return func(*args, **kwargs)
 
         try:
             with torch.no_grad():

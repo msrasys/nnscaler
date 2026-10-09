@@ -21,7 +21,7 @@ The above restrictions are necessary for the pipeline parallelism to work. Of co
 | --- | --- |
 | `FILE` / `"file"` (default) | Save and load `fullmodel.pt.*` and `npbuffer.pt`, preserving file-backed initialization. |
 | `MODEL` / `"model"` | Reconstruct the full original model at runtime and copy its local parameter and buffer slices. |
-| `CAPTURE` / `"capture"` | Capture runtime construction without parameter storage, materialize required full tensors one at a time, and copy their local slices. |
+| `CAPTURE` / `"capture"` | Defer runtime tensor construction where possible, materialize required full tensors and copy their local slices. Operations requiring concrete data execute during capture. |
 | `CUSTOM` / `"custom"` | Call the original class's `__partial__init__` callback to initialize local shards directly, without running its full constructor at runtime. |
 
 Non-file strategies save and distribute metadata, but no `fullmodel.pt.*` or
@@ -58,10 +58,73 @@ producer's full storage, and external CPU inputs may share storage with the resu
 ParallelModule copies the required slices into its parameters and releases the
 temporary result afterwards.
 
-Supported random operations include `rand`, `randn`, `randint`, `randperm`,
-`rand_like`, `randn_like`, `randint_like`, `normal`, `bernoulli`, `poisson`, and
-`multinomial`, plus in-place `uniform_`, `normal_`, `random_`, `bernoulli_`,
-`exponential_`, `geometric_`, `log_normal_`, and `cauchy_`.
+#### Deferred operations and concrete fallback
+
+Capture records factories, copies, sampling and ordinary non-mutating tensor
+operations through one dependency-graph path, and executes their meta kernels to
+determine output metadata. These operations do
+not require a mathematical-operator allowlist: examples include `sin`, `cos`,
+out-of-place arithmetic, `pow`, `tril`, matrix multiplication and reductions.
+Multiple tensor outputs reference the same operation. Tensor aliases and mutation
+still require separate handling; having a meta kernel alone does not establish
+that an operation is safe to replay.
+
+When an operation requires concrete data or has no meta implementation, capture
+materializes its dependencies and executes it on CPU during construction. This
+allows scalar reads such as `.item()` to drive Python control flow. Tensor results
+are converted to meta tensors and their temporary real storage is released.
+Fallback operations retain recipes, not concrete results, and are re-executed
+during materialization like ordinary operations. Shared nodes execute once per
+materialization call; separate calls recompute their dependencies.
+Fallback is logged. Invalid arguments and ordinary execution errors are not
+silently converted into successful results.
+
+Operators tagged `data_dependent_output` or `dynamic_output_shape` execute
+concretely without attempting meta execution, including `.item()` and `nonzero`.
+Other operators first try meta execution and fall back on `NotImplementedError`,
+without matching exception text. Other exceptions, including `RuntimeError`,
+propagate; errors in concrete execution also propagate.
+Custom operators using data-dependent fake/meta kernels must declare the
+appropriate output tag. Custom operators must declare mutation, alias and
+randomness accurately in their schemas/tags; arbitrary external side effects
+cannot be inferred or made safely replayable.
+
+Fallback can temporarily allocate a full parameter and its dependencies.
+Capture is therefore best-effort deferred
+initialization, not a guarantee of storage-free construction. It still does not
+fall back to constructing a second, complete eager model. CPU-only replay cannot
+execute operators that require a CUDA-only implementation.
+
+The following table lists common supported operations and the explicitly handled
+view/mutation subset, not a whitelist of pure operators. Names are ATen base names;
+composite Python APIs and specific overloads remain subject to the restrictions
+below.
+
+| Category | Supported operator names |
+| --- | --- |
+| Allocation and deterministic factories | `empty`, `empty_strided`, `zeros`, `ones`, `full`, `arange`, `empty_like`, `zeros_like`, `ones_like`, `full_like`, `new_empty`, `new_empty_strided`, `new_zeros`, `new_ones`, `new_full` |
+| Random factories | `rand`, `randn`, `randint`, `randperm`, `rand_like`, `randn_like`, `randint_like` |
+| Sampling | `normal`, `bernoulli`, `poisson`, `multinomial` |
+| Views and aliases | `detach`, `alias`, `view`, `_unsafe_view`, `transpose`, `t`, `permute`, `slice`, `select`, `unsqueeze`, `squeeze`, `expand` |
+| Copies and conversions | `clone`, `_to_copy` (copying `Tensor.to(...)`) |
+| In-place initialization | `fill_`, `zero_`, `copy_`, `uniform_`, `normal_`, `random_`, `bernoulli_`, `exponential_`, `geometric_`, `log_normal_`, `cauchy_` |
+| In-place scalar arithmetic | `add_`, `sub_`, `mul_`, `div_` |
+| In-place unary initialization | `erfinv_`, `clamp_` with scalar bounds (including the operations used by PyTorch 2.10 truncated normal) |
+| Tensor literals | `lift_fresh` (the dispatch path for `torch.tensor(...)`) |
+
+Both `w * 2` and contiguous `w.mul_(2)` can be captured. `w.copy_(other)` records
+a tensor dependency, but `w.add_(other_tensor)` remains outside the supported
+mutation subset. Arbitrary in-place operators and `out=` overloads are not made
+safe merely by concrete fallback: they could modify shared storage or invalidate
+earlier snapshots.
+Alias-returning operators outside the explicit view paths, such as `split`,
+`unbind` and `diagonal`, are still rejected. Consequently, iterating over a tensor
+may be unsupported even though indexing it is supported.
+
+Capture applies to all dispatched operations inside its context, including
+temporary tensors and buffers, not just parameter writes. It does not affect the
+model's normal forward execution outside capture.
+
 All tensor inputs retain their producer dependencies, including templates of
 like/new factories. Replay evaluates these producers even if only their layout
 is needed, which can add computation and temporary memory.
@@ -71,13 +134,25 @@ their initial seed only: their current state and device are not replayed, and
 capture/replay do not advance them. Replay uses CPU RNG: most operations use
 private generators; random-like operations temporarily seed the default CPU
 generator in a context that restores its state, including on failure.
-Do not run random-like replay concurrently with other users of the global CPU RNG.
+Generic seeded-random operators are recognized through PyTorch's
+`nondeterministic_seeded` tag and use a captured per-operation seed. Meta execution
+does not isolate RNG side effects: random draws made by a meta implementation can
+affect subsequent constructor code. Random-dependent constructor branches are not
+guaranteed to match eager construction. The outer seeded initialization scope
+still restores caller RNG states on exit. Custom-operator replay preserves Python,
+NumPy, CPU and current-device CUDA RNG state.
+Native replay uses private generators or a scoped CPU RNG only
+where needed, avoiding RNG-state allocations for deterministic native operations.
+Replay also temporarily restores the captured default dtype, including implicit
+integer-to-floating promotion. Operator dtype arguments are replayed as supplied,
+not inferred from output dtype. Do not run replay concurrently with unrelated
+users of these process-global RNG/default-dtype settings.
 `out=` overloads remain unsupported. Composite initializers and distribution APIs
 are supported only when all of their underlying operations are supported.
 
-Capture supports a bounded set of operations. Data-dependent
-constructor branches (such as reading a deferred parameter with `.item()`) and
-unsupported operations raise an error rather than silently allocating a full model.
+Data-dependent constructor branches are resolved during capture, not recorded as
+dynamic branches in the DAG. Subsequent replay must use the same values that
+selected the branch. Constructors must remain deterministic and rank-independent.
 In-place `add_`, `sub_`, `mul_`, and `div_` support scalar operands on
 contiguous tensors or views; tensor operands are unsupported. Division also supports
 `rounding_mode="floor"` and `"trunc"`.
@@ -95,6 +170,48 @@ External tensor clones and dtype conversions are deferred as well.
 Existing external tensor data must remain
 unchanged until materialization finishes. Use `model`, `file`, `custom`,
 or an already initialized source instance for unsupported constructors.
+
+#### Representative model initialization compatibility
+
+The following snapshot checks **constructor capture and initialization replay**,
+not forward execution, `parallelize`, pretrained loading, or bitwise equality with
+eager random initialization. Model versions matter: inspect the complete
+constructor, including temporary tensors, buffers and `post_init()`, rather than
+only its weight initializer.
+
+Runtime probes used PyTorch **2.10.0+cu128**, Transformers **4.57.6**, and
+torchvision **0.25.0**. HF probes used small configurations with one layer, hidden
+size 16 and two attention heads; GPT-2/Llama used vocabulary size 32 and sequence
+capacity 16, and ViT used image size 16 and patch size 8. ResNets used their
+standard architectures with `weights=None`. Every named parameter and buffer
+(including nonpersistent buffers) was materialized for successful captures,
+checking CPU placement, shape, dtype and finite values.
+
+| Model | Evidence | Result with the current capture implementation |
+| --- | --- | --- |
+| torchvision ResNet-18 / ResNet-50 | Runtime capture and replay; [constructor source][capture-resnet] | Passed for all 122 / 320 named parameter and buffer entries. Convolution Kaiming initialization and normalization constants use supported operations. |
+| HF `GPT2LMHeadModel` | Runtime capture and replay; [attention constructor][capture-gpt2] | Passed for 18 entries, including the `tril` causal-mask buffer. The constructed model retains its tied embedding/head parameter identity. |
+| HF `LlamaForCausalLM` | Runtime capture and replay; [default RoPE initializer][capture-llama-rope] | Passed for 13 entries, including RoPE inverse-frequency arithmetic. |
+| HF `ViTModel` | Runtime capture and replay; [model initializer][capture-hf-vit] and [PyTorch truncated normal][capture-trunc-normal] | Passed for 24 entries, including truncated normal with `erfinv_` and `clamp_`. |
+| timm `VisionTransformer` 1.0.30 | **Source analysis only**; timm was not installed. [Constructor][capture-timm-vit], [drop-path schedule][capture-timm-drop], [initializer][capture-timm-init] | `linspace`, scalar reads and truncated normal are now supported, but tensor iteration in the drop-path schedule requires unsupported `unbind`. Skipping the final weight initializer does not skip this schedule. |
+
+All five runtime probes additionally compared buffers exactly with eager
+construction, repeated capture/replay with the same seed to compare tensor
+digests, and checked that CPU RNG state was preserved. These results establish
+initialization compatibility only for the tested configurations, not arbitrary
+variants or future library versions. A separate four-GPU CLI regression exercises
+generic trigonometric initialization, truncated normal, `nonzero` and `.item()`
+fallback, checks local initialization against captured references, and runs two
+training steps.
+
+[capture-resnet]: https://github.com/pytorch/vision/blob/8ac84ee75afb1c327902156b5336f56ad63b7e2f/torchvision/models/resnet.py#L197
+[capture-gpt2]: https://github.com/huggingface/transformers/blob/753d61104116eefc8ffc977327b441ee0c8d599f/src/transformers/models/gpt2/modeling_gpt2.py#L156
+[capture-llama-rope]: https://github.com/huggingface/transformers/blob/753d61104116eefc8ffc977327b441ee0c8d599f/src/transformers/modeling_rope_utils.py#L123
+[capture-hf-vit]: https://github.com/huggingface/transformers/blob/753d61104116eefc8ffc977327b441ee0c8d599f/src/transformers/models/vit/modeling_vit.py#L389
+[capture-trunc-normal]: https://github.com/pytorch/pytorch/blob/449b1768410104d3ed79d3bcfe4ba1d65c7f22c0/torch/nn/init.py#L86
+[capture-timm-vit]: https://github.com/huggingface/pytorch-image-models/blob/0df212b369a5385b16dfe513d5143a7311ea1ddc/timm/models/vision_transformer.py#L840
+[capture-timm-drop]: https://github.com/huggingface/pytorch-image-models/blob/0df212b369a5385b16dfe513d5143a7311ea1ddc/timm/layers/drop.py#L215
+[capture-timm-init]: https://github.com/huggingface/pytorch-image-models/blob/0df212b369a5385b16dfe513d5143a7311ea1ddc/timm/layers/weight_init.py#L19
 
 ### Custom shard initialization
 

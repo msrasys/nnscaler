@@ -140,6 +140,20 @@ class RandomInitModel(InitModel):
                 layer.weight.mul_(0.001)
 
 
+class GenericInitModel(InitModel):
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        with torch.no_grad():
+            positions = torch.arange(16, dtype=torch.float32) / 16
+            selected = torch.nonzero(positions > 0.5)
+            self.offset.copy_((positions.sin() + positions.cos()) / selected.sum())
+            count = selected.shape[0]
+            scale = positions.sum().item() / count
+            for layer in self.layers:
+                torch.nn.init.trunc_normal_(layer.weight, std=0.01, a=-0.02, b=0.02)
+                layer.weight.copy_(layer.weight.sin() * scale)
+
+
 def init_dummy_sample(args):
     return {
         'data': torch.ones(args.micro_batch_size, 16),
@@ -454,16 +468,16 @@ def test_cli_selective_initialization(tmp_path):
     launch_torchrun(4, _worker_selective_initialization, tmp_path)
 
 
-def _worker_random_initialization(save_dir):
+def _worker_random_initialization(save_dir, model_class):
     with DeferredInitialization() as capture:
-        source = create_init_module(RandomInitModel, None, None, seed=1234)
+        source = create_init_module(model_class, None, None, seed=1234)
     expected = {
         name: capture.materialize(value)
         for name, value in list(source.named_parameters(remove_duplicate=False))
         + list(source.named_buffers(remove_duplicate=False)) + [('constant', source.constant)]
     }
     args = _args(Path(save_dir), ParamInitStrategy.CAPTURE, checked=True)
-    args += ['--model.type', f'{__name__}.RandomInitModel']
+    args += ['--model.type', f'{__name__}.{model_class.__name__}']
     original_build = ParallelModule.build_buckets
 
     def checked_build(model, *args, **kwargs):
@@ -478,15 +492,17 @@ def _worker_random_initialization(save_dir):
 
 
 @pytest.mark.skipif(torch.cuda.device_count() < 4, reason='requires four GPUs')
-def test_cli_random_initialization(tmp_path):
-    launch_torchrun(4, _worker_random_initialization, tmp_path)
+@pytest.mark.parametrize('model_class', [RandomInitModel, GenericInitModel])
+def test_cli_random_initialization(tmp_path, model_class):
+    launch_torchrun(4, _worker_random_initialization, tmp_path, model_class)
 
 
 class UnsupportedInitModel(InitModel):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         if torch.distributed.is_initialized() and torch.distributed.get_rank() == 1:
-            self.layers[0].weight.sum().item()
+            with torch.no_grad():
+                self.layers[0].weight.sin_()
 
 
 def _worker_capture_failure(save_dir):
