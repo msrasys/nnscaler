@@ -11,7 +11,7 @@ import itertools
 import sys
 import importlib
 from dataclasses import dataclass, asdict, field, replace
-from contextlib import contextmanager, nullcontext
+from contextlib import contextmanager
 import logging
 import copy
 import os
@@ -60,7 +60,8 @@ from nnscaler.runtime.module import (
     ExtraState,
     dedup_attrs,
     NonParallelModule,
-    strict_merged_loading,
+    merged_load_session,
+    load_merged_module,
 )
 
 from nnscaler.flags import CompileFlag, RuntimeFlag
@@ -2703,34 +2704,18 @@ def load_merged_state_dict(
     # non ParallelModule parameters will be loaded here
     # there will be mismatched keys if the module is a ParallelModule or contains ParallelModule
     # so we need to ignore the mismatched keys
-    single_pass = os.environ.get('NNSCALER_MERGED_LOAD_ONCE', '0') == '1'
-    single_pass = single_pass and (
-        getattr(module.load_state_dict, '__func__', None) is torch.nn.Module.load_state_dict
-    )
+    load_once = os.environ.get('NNSCALER_MERGED_LOAD_ONCE', '0') == '1'
     parallel_modules = [
         (name + '.' if name else '', child)
         for name, child in module.named_modules() if isinstance(child, ParallelModule)
     ]
-    # Legacy inputs with per-module extra state retain the original two-pass
-    # path. Custom handlers need not call our merged-loading implementation,
-    # so they also require the explicit pass rather than silently missing data.
-    single_pass = single_pass and all(
-        prefix + child.EXTRA_STATE_KEY not in module_state_dict
-        and getattr(child._load_from_state_dict, '__func__', None)
-        is ParallelModule._load_from_state_dict
-        for prefix, child in parallel_modules
-    )
-    if single_pass:
-        # Shared modules can have only their canonical prefix in a merged
-        # checkpoint. Strict recursive loading would check the aliases too.
-        visits = sum(isinstance(child, ParallelModule)
-                     for _, child in module.named_modules(remove_duplicate=False))
-        single_pass = visits == len(parallel_modules)
-    with strict_merged_loading() if single_pass else nullcontext():
+    # Keep the explicit pass for custom/legacy handlers that do not load merged
+    # parameters recursively. Completed loads are recorded only for this call;
+    # the explicit pass still checks missing keys without copying values twice.
+    with merged_load_session(load_once):
         module.load_state_dict(module_state_dict, strict=False)
-    if not single_pass:
         for prefix, child_module in parallel_modules:
-            child_module.load_merged_state_dict(module_state_dict, prefix=prefix)
+            load_merged_module(child_module, module_state_dict, prefix=prefix)
 
     if optimizer is not None and optimizer_state_dict is not None:
         new_optimizer_state_dict = _trim_optimizer_merged_state_dict(module, optimizer._extra_state, optimizer_state_dict, device='cpu')

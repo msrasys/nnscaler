@@ -19,7 +19,6 @@ from .parallel import (
     trimmed_broadcast_merged_state_dict,
     load_merged_state_dict_from_rank,
 )
-from .codegen.artifacts import stage_gencode
 from nnscaler.graph.parser.register import register_op
 from nnscaler.runtime.function.function import (
     anchor,
