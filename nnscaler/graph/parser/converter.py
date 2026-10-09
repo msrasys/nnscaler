@@ -1,7 +1,7 @@
 #  Copyright (c) Microsoft Corporation.
 #  Licensed under the MIT License.
 
-from typing import Any, Dict, Union
+from typing import Any, Dict, Optional, Union
 import logging
 from pathlib import Path
 import operator
@@ -141,6 +141,7 @@ def to_ir_graph(
     constant_folding: bool = True,
     *,
     save_weights: bool = True,
+    save_np_buffers: Optional[bool] = None,
 ) -> IRGraph:
     """Convert torch.fx.GraphModule based model into IRGraph
 
@@ -151,7 +152,8 @@ def to_ir_graph(
         constant_folding (bool):
             whether to enable constant folding. Default True.
         attr_savedir (Union[str, Path]): directory to save content (attribtes)
-        save_weights (bool): whether to save full-model tensors and non-persistent buffer contents.
+        save_weights (bool): whether to save full-model tensors.
+        save_np_buffers (Optional[bool]): whether to save non-persistent buffers; defaults to save_weights.
 
     Returns:
         IRGraph: IRGraph of model
@@ -165,6 +167,7 @@ def to_ir_graph(
             constant_folding=constant_folding,
             save_content=True,
             save_weights=save_weights,
+            save_np_buffers=save_np_buffers,
         )
     module_name = traced_model.__class__.__name__
 

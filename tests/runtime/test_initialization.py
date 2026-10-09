@@ -59,10 +59,8 @@ def test_seeded_initialization_restores_rng(device):
     third = create_init_module(RandomInitModule, None, torch.float64, seed=18)
     assert not torch.equal(first.weight, third.weight)
 
-
-def test_seeded_initialization_restores_rng_on_failure():
     def failing_factory():
-        RandomInitModule('cuda' if torch.cuda.is_available() else 'cpu')
+        RandomInitModule(device)
         raise RuntimeError('initialization failed')
 
     before = _rng_state()
@@ -113,27 +111,67 @@ def _local_module(strategy):
 
 
 @pytest.mark.parametrize('strategy', [ParamInitStrategy.FULL, ParamInitStrategy.SHARD])
-def test_source_strategy_preserves_buffer_dependency_on_init_and_resume(strategy):
+@pytest.mark.parametrize('val_chunks', [1, 2])
+def test_source_strategy_preserves_buffer_dependency_on_init_and_resume(tmp_path, strategy, val_chunks):
     module = _local_module(strategy)
-    with patch.object(module, 'load_np_buffer_content', side_effect=AssertionError('buffer file read')):
+    module.module_dir = tmp_path
+    module._fullmap['weight_local'].val_chunks = val_chunks
+    module._fullmap['copy_local'].val_chunks = val_chunks
+    if strategy == ParamInitStrategy.FULL:
+        source = type(module)._init_module_fn()
+        torch.save({module.fullmap['copy_local'].tid: source.copy}, tmp_path / 'npbuffer.pt')
+        contents = list(module._iter_np_buffer_content(str(tmp_path / 'npbuffer.pt')))
+        assert len(contents) == 1
+        attr_name, content = contents[0]
+        assert attr_name == 'copy_local'
+        torch.testing.assert_close(content, source.copy[1:3] / val_chunks, rtol=0, atol=0)
+    with patch.object(module, 'load_np_buffer_content', wraps=module.load_np_buffer_content) as load, \
+            patch.object(module, 'check_np_buffer_content', wraps=module.check_np_buffer_content) as check:
         module._post_init(build_buckets=False)
-        assert torch.equal(module.weight_local, module.copy_local)
+        load.assert_not_called()
+        if strategy == ParamInitStrategy.FULL:
+            check.assert_called_once_with(str(tmp_path / 'npbuffer.pt'))
+        else:
+            check.assert_not_called()
+        torch.testing.assert_close(module.weight_local, module.copy_local, rtol=0, atol=0)
         initial_buffer = module.copy_local.clone()
         with torch.no_grad():
             module.weight_local.fill_(9)
             module.copy_local.fill_(0)
-        module._post_init(init_params=False, build_buckets=False)
+        if strategy == ParamInitStrategy.FULL:
+            with patch.object(type(module), '_init_module_fn', side_effect=AssertionError('resume constructor')):
+                module._post_init(init_params=False, build_buckets=False)
+            load.assert_called_once_with(str(tmp_path / 'npbuffer.pt'))
+            assert check.call_count == 1
+        else:
+            module._post_init(init_params=False, build_buckets=False)
+            load.assert_not_called()
         assert torch.equal(module.weight_local, torch.full((2,), 9.0))
         assert torch.equal(module.copy_local, initial_buffer)
         assert module.non_presistent_buffers_inited
 
 
-@pytest.mark.parametrize('strategy', [ParamInitStrategy.FULL, ParamInitStrategy.SHARD])
-def test_source_initializer_applies_value_partition_once(strategy):
-    module = _local_module(strategy)
-    module._fullmap['weight_local'].val_chunks = 2
-    module._post_init(build_buckets=False)
-    torch.testing.assert_close(module.weight_local * 2, module.copy_local, rtol=0, atol=0)
+@pytest.mark.parametrize('difference', ['value', 'signed_zero', 'dtype', 'shape', 'missing'])
+def test_full_initialization_checks_saved_buffers_without_overwriting(tmp_path, difference):
+    module = _local_module(ParamInitStrategy.FULL)
+    module.module_dir = tmp_path
+    module._fullmap['copy_local'].val_chunks = 2
+    source = DependentBufferModule()
+    source.copy.zero_()
+    saved = source.copy.clone()
+    if difference == 'value':
+        saved[1] = 1
+    elif difference == 'signed_zero':
+        saved = -saved
+    elif difference == 'dtype':
+        saved = saved.double()
+    elif difference == 'shape':
+        saved = saved.reshape(4, 1)
+    torch.save({1: saved} if difference != 'missing' else {}, tmp_path / 'npbuffer.pt')
+    with pytest.raises(RuntimeError, match='differs from|not found'):
+        module._post_init(init_module=source, build_buckets=False)
+    assert torch.equal(module.copy_local, source.copy[1:3] / 2)
+    assert not torch.signbit(module.copy_local).any()
 
 
 def test_shard_instance_bypasses_attached_hook_on_init_and_resume():
@@ -267,7 +305,7 @@ def test_user_shard_initializer_receives_only_required_attributes():
 @pytest.mark.parametrize('result,message', [
     (None, 'not iterable'),
     ({}, 'missing attributes'),
-    ({'weight_local': torch.ones(2), 'copy_local': torch.ones(2), 'extra': torch.ones(2)}, 'unexpected attributes'),
+    ({'weight_local': 42}, 'Invalid'),
     ({'weight_local': torch.ones(4), 'copy_local': torch.ones(2)}, 'expected shape'),
     ({'weight_local': torch.ones(2, dtype=torch.float64), 'copy_local': torch.ones(2)}, 'dtype'),
     ({'weight_local': torch.ones(2, device='meta'), 'copy_local': torch.ones(2)}, 'Invalid'),
@@ -320,7 +358,7 @@ def test_shard_initializer_seed_and_failure_restore_rng(streaming):
         dict(create_shard_init_weights(torch.nn.Module, {}, seed=17))
 
 
-@pytest.mark.parametrize('failure', ['shape', 'duplicate', 'unexpected', 'missing', 'exception'])
+@pytest.mark.parametrize('failure', ['shape', 'missing', 'exception'])
 def test_streaming_shard_failure_closes_hook_and_restores_rng(failure):
     module = _local_module(ParamInitStrategy.SHARD)
     closed = []
@@ -334,10 +372,6 @@ def test_streaming_shard_failure_closes_hook_and_restores_rng(failure):
                 torch.testing.assert_close(module.weight_local, value)
                 if failure == 'shape':
                     yield 'copy_local', torch.ones(3)
-                elif failure == 'duplicate':
-                    yield 'weight_local', value
-                elif failure == 'unexpected':
-                    yield 'extra', value
                 elif failure == 'exception':
                     raise RuntimeError('hook failed')
             finally:

@@ -102,6 +102,7 @@ class ParamInitStrategy:
     Possible values are:
     'file'     : load parameters from fullmodel.pt
     'full'     : initialize a full original model and copy its local parameter slices.
+                 Save non-persistent buffers to npbuffer.pt for resume without reconstruction.
     'shard'    : use the original module's `__shard__init__(attr_meta_map)` method
                  when defined, otherwise capture construction via `TorchDispatchMode`
                  and replay required tensors on CPU to produce local slices.
@@ -727,10 +728,9 @@ def _prepare_and_check_reusable(
     is_graph_config_match = old_config is not None and old_config.graph_config == compute_config.graph_config
     trace_meta_files = [outdir / FxModuleParser.ATTR_MAP_FILE]
     if compute_config.param_init_strategy == ParamInitStrategy.FILE:
-        trace_meta_files.extend([
-            outdir / FxModuleParser.ATTR_CONTENT_FILE_0,  # just check the first is good enough
-            outdir / FxModuleParser.NON_PERSISTENT_BUFFER_FILE,
-        ])
+        trace_meta_files.append(outdir / FxModuleParser.ATTR_CONTENT_FILE_0)
+    if compute_config.param_init_strategy != ParamInitStrategy.SHARD:
+        trace_meta_files.append(outdir / FxModuleParser.NON_PERSISTENT_BUFFER_FILE)
 
     def _clean_old_attr_map_files() -> None:
         _clean_files(outdir, f'{ParallelModule.ATTR_META_FILE_PREFIX}[0-9]*.pkl')
@@ -824,6 +824,8 @@ def _prepare_and_check_reusable(
             _clean_files(outdir, '*.py')
             _clean_old_attr_map_files()
 
+    if not reusable and compute_config.param_init_strategy == ParamInitStrategy.SHARD:
+        _clean_files(outdir, FxModuleParser.NON_PERSISTENT_BUFFER_FILE)
     return outdir, reusable
 
 
@@ -836,6 +838,7 @@ def _gen_graph(
     inference_only: bool = False,
     autoset_requires_grad: bool = True,
     save_weights: bool = False,
+    save_np_buffers: Optional[bool] = None,
 ):
     # reset environment
     IDGenerator().clear()
@@ -861,6 +864,7 @@ def _gen_graph(
     graph = parser.to_ir_graph(
         fx_graph, dummy_forward_args, outdir, constant_folding,
         save_weights=save_weights,
+        save_np_buffers=save_np_buffers,
     )
 
     # generate dummy inputs for logic graph
@@ -1038,6 +1042,7 @@ def _gencode(
                 inference_only=compute_config.inference_only,
                 autoset_requires_grad=autoset_requires_grad,
                 save_weights=compute_config.param_init_strategy == ParamInitStrategy.FILE,
+                save_np_buffers=compute_config.param_init_strategy != ParamInitStrategy.SHARD,
             )
 
         graph.dump(graph_ckp)

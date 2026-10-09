@@ -429,31 +429,43 @@ class CubeModule(torch.nn.Module):
                 raise RuntimeError(
                     f'remaining graph parameters / buffers cannot find in model files: {list(attr_names)}')
 
-    def load_np_buffer_content(self, filename: str):
-        """Load non-persistent buffer content from file.
-
-        Only loads attributes that are non-persistent buffers
-        (i.e., in self._non_persistent_buffers_set).
-
-        Args:
-            filename (str): file path to the npbuffer.pt file
-        """
+    def _iter_np_buffer_content(self, filename: str) -> Generator[Tuple[str, torch.Tensor], None, None]:
+        """Yield (attribute name, local content) from npbuffer.pt, including value-partition scaling."""
         if not self._non_persistent_buffers_set:
             return
         np_buffer_model: Dict[int, torch.Tensor] = torch.load(filename)
+        for attr_name in self._non_persistent_buffers_set:
+            if attr_name not in self._fullmap:
+                raise RuntimeError(f'non-persistent buffer {attr_name} not found in fullmap.')
+            meta = self._fullmap[attr_name]
+            if meta.tid not in np_buffer_model:
+                raise RuntimeError(f'non-persistent buffer {attr_name} (tid={meta.tid}) not found in {filename}.')
+            content = np_buffer_model[meta.tid][meta.slicers]
+            if meta.val_chunks != 1:
+                content = content / meta.val_chunks
+            yield attr_name, content
+
+    def load_np_buffer_content(self, filename: str):
+        """Copy saved local non-persistent buffer contents into the module."""
         with torch.no_grad():
             _logger.info(f'loading non-persistent buffers from {filename}')
-            for attr_name in self._non_persistent_buffers_set:
-                if attr_name not in self._fullmap:
-                    raise RuntimeError(f'non-persistent buffer {attr_name} not found in fullmap.')
-                meta = self._fullmap[attr_name]
-                if meta.tid not in np_buffer_model:
-                    raise RuntimeError(f'non-persistent buffer {attr_name} (tid={meta.tid}) not found in {filename}.')
+            for attr_name, content in self._iter_np_buffer_content(filename):
+                getattr(self, attr_name).copy_(content)
+
+    def check_np_buffer_content(self, filename: str):
+        """Compare local non-persistent buffers bitwise with saved contents without overwriting them."""
+        with torch.no_grad():
+            _logger.info(f'checking non-persistent buffers from {filename}')
+            for attr_name, content in self._iter_np_buffer_content(filename):
                 attr = getattr(self, attr_name)
-                content = np_buffer_model[meta.tid][meta.slicers]
-                if meta.val_chunks != 1:
-                    content = content / meta.val_chunks
-                attr.copy_(content)
+                if attr.shape != content.shape or attr.dtype != content.dtype or not torch.equal(
+                    attr.detach().cpu().contiguous().reshape(-1).view(torch.uint8),
+                    content.detach().cpu().contiguous().reshape(-1).view(torch.uint8),
+                ):
+                    raise RuntimeError(
+                        f'non-persistent buffer {self._fullmap[attr_name].orig_name} ({attr_name}) differs from {filename}. '
+                        'FULL initialization must match the saved buffers used for resume.'
+                    )
 
     def init_group(self, ranks: List[int]):
         if not all([isinstance(rank, int) for rank in ranks]):
@@ -1309,17 +1321,35 @@ class ParallelModule(CubeModule):
 
         from nnscaler.parallel import ParamInitStrategy
 
-        self._non_presistent_buffers_inited = not self._non_persistent_buffers_set
-        if self.compute_config.param_init_strategy == ParamInitStrategy.FILE:
-            if init_params:
-                self.load_attr_content(str(self.module_dir / FxModuleParser.ATTR_CONTENT_FILE_STEM))
-                self._non_presistent_buffers_inited = True
-            elif self._non_persistent_buffers_set:
+        def _load_np_buffer():
+            if self._non_persistent_buffers_set:
                 np_buffer_file = self.module_dir / FxModuleParser.NON_PERSISTENT_BUFFER_FILE
                 if np_buffer_file.is_file():
                     self.load_np_buffer_content(str(np_buffer_file))
                     self._non_presistent_buffers_inited = True
+
+        def _check_np_buffer():
+            if self._non_persistent_buffers_set:
+                np_buffer_file = self.module_dir / FxModuleParser.NON_PERSISTENT_BUFFER_FILE
+                self.check_np_buffer_content(str(np_buffer_file))
+
+        self._non_presistent_buffers_inited = not self._non_persistent_buffers_set
+        strategy = self.compute_config.param_init_strategy
+        if strategy == ParamInitStrategy.FILE:
+            if init_params:
+                self.load_attr_content(str(self.module_dir / FxModuleParser.ATTR_CONTENT_FILE_STEM))
+                self._non_presistent_buffers_inited = True
+            else:
+                _load_np_buffer()
+        elif strategy == ParamInitStrategy.FULL:
+            if init_params:
+                self._init_from_module(init_module, init_params=True)
+                _check_np_buffer()
+                self._non_presistent_buffers_inited = True
+            else:
+                _load_np_buffer()
         else:
+            assert strategy == ParamInitStrategy.SHARD
             self._init_from_module(init_module, init_params=init_params)
             self._non_presistent_buffers_inited = True
 

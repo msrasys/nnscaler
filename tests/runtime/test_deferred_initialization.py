@@ -75,22 +75,27 @@ def test_previous_full_parameter_storage_expires_before_next_call():
             torch.nn.Linear(16, 16) for _ in range(3)
         ]).double()
         snapshots = [parameter.detach().clone() for parameter in model.parameters()]
-    previous_storage = None
-    for parameter in list(model.parameters()) + snapshots:
-        assert previous_storage is None or previous_storage.expired()
-        assert all(source.is_meta for source in model.parameters())
-        value = capture.materialize(parameter)
-        previous_storage = StorageWeakRef(value.untyped_storage())
-        assert not previous_storage.expired()
+    tensors = list(model.parameters()) + snapshots
+    assert all(tensor.is_meta for tensor in tensors)
+    for tensor in tensors:
+        value = capture.materialize(tensor)
+        storage = StorageWeakRef(value.untyped_storage())
+        assert not storage.expired()
         del value
         # Refcounting must release storage immediately, without a gc.collect().
-        assert previous_storage.expired()
+        assert storage.expired()
+    assert all(tensor.is_meta for tensor in tensors)
 
 
-def test_versions_shared_parameters_and_partial_writes():
+@pytest.mark.parametrize("factory", [
+    pytest.param(lambda: torch.ones(3, 4), id="factory"),
+    pytest.param(lambda: torch.tensor([[1., 2.], [3., 4.]]), id="literal"),
+])
+def test_versions_shared_parameters_and_partial_writes(factory):
+    initial = factory()
     with DeferredInitialization() as capture:
         module = torch.nn.Module()
-        module.first = torch.nn.Parameter(torch.ones(3, 4))
+        module.first = torch.nn.Parameter(factory())
         module.second = module.first
         with torch.no_grad():
             copied_before = module.first.clone()
@@ -100,23 +105,32 @@ def test_versions_shared_parameters_and_partial_writes():
             module.second.mul_(2)
             module.first.add_(3)
     assert module.first is module.second
-    expected = torch.ones(3, 4)
+    expected = initial.clone()
     expected[1] = 5
-    assert torch.equal(capture.materialize(copied_before), torch.ones(3, 4))
+    assert torch.equal(capture.materialize(copied_before), initial)
     assert torch.equal(capture.materialize(copied_after), expected)
     assert torch.equal(capture.materialize(module.first), expected * 2 + 3)
     assert torch.equal(capture.materialize(module.second), expected * 2 + 3)
 
 
-@pytest.mark.parametrize("operation", ["add_", "sub_", "mul_", "div_"])
-@pytest.mark.parametrize("partial", [False, True])
-@pytest.mark.parametrize("dtype", [torch.float16, torch.float32, torch.float64])
-def test_scalar_arithmetic_preserves_previous_values(operation, partial, dtype):
+@pytest.mark.parametrize("operation,kwargs,dtype,partial", [
+    pytest.param(operation, kwargs, dtype, partial, id=f"{operation}-{kwargs}-{dtype}-{partial}")
+    for operation, kwargs, dtypes in [
+        ("add_", {"alpha": 3}, [torch.float16, torch.float32, torch.float64]),
+        ("sub_", {"alpha": 3}, [torch.float16, torch.float32, torch.float64]),
+        ("mul_", {}, [torch.float16, torch.float32, torch.float64]),
+        ("div_", {}, [torch.float16, torch.float32, torch.float64]),
+        ("div_", {"rounding_mode": "floor"}, [torch.int64, torch.float32]),
+        ("div_", {"rounding_mode": "trunc"}, [torch.int64, torch.float32]),
+    ]
+    for dtype in dtypes
+    for partial in ([False] if "rounding_mode" in kwargs else [False, True])
+])
+def test_scalar_arithmetic_preserves_previous_values(operation, kwargs, dtype, partial):
     def initialize():
-        tensor = torch.arange(-4, 4, dtype=dtype)
+        tensor = torch.arange(-5, 5, dtype=dtype)
         before = tensor.clone()
         target = tensor[1:6] if partial else tensor
-        kwargs = {"alpha": 3} if operation in {"add_", "sub_"} else {}
         getattr(target, operation)(2, **kwargs)
         after = target.clone()
         return tensor, before, after
@@ -126,16 +140,6 @@ def test_scalar_arithmetic_preserves_previous_values(operation, partial, dtype):
         actual = initialize()
     for tensor, reference in zip(actual, expected):
         torch.testing.assert_close(capture.materialize(tensor), reference, rtol=0, atol=0)
-
-
-@pytest.mark.parametrize("rounding_mode", ["floor", "trunc"])
-@pytest.mark.parametrize("dtype", [torch.int64, torch.float32])
-def test_scalar_division_rounding_mode(rounding_mode, dtype):
-    expected = torch.arange(-5, 5, dtype=dtype).div_(2, rounding_mode=rounding_mode)
-    with DeferredInitialization() as capture:
-        tensor = torch.arange(-5, 5, dtype=dtype)
-        tensor.div_(2, rounding_mode=rounding_mode)
-    torch.testing.assert_close(capture.materialize(tensor), expected, rtol=0, atol=0)
 
 
 @pytest.mark.parametrize("operation", ["add_", "sub_", "mul_", "div_"])
@@ -149,15 +153,6 @@ def test_arithmetic_on_empty_preserves_allocation_dependency(operation):
     assert actual.shape == (3,)
     assert actual.dtype == tensor.dtype
     assert actual.device.type == "cpu"
-
-
-@pytest.mark.parametrize("operation", ["add_", "sub_", "mul_", "div_"])
-def test_arithmetic_rejects_tensor_operands(operation):
-    with DeferredInitialization():
-        tensor = torch.ones(3)
-        other = torch.ones(3)
-        with pytest.raises(RuntimeError, match="tensor-valued arithmetic"):
-            getattr(tensor, operation)(other)
 
 
 def test_noncontiguous_read_and_post_copy_source_mutation():
@@ -358,6 +353,7 @@ def test_factories_and_conversions(factory):
     lambda: torch.full((4,), 1 + 2j),
     lambda: torch.full((4,), 1.00000001, dtype=torch.float32),
     lambda: torch.full_like(torch.empty(4, dtype=torch.float32), 1.00000001),
+    pytest.param(lambda: torch.arange(4).sin(), id="generic-sin"),
 ])
 def test_factory_dtype_is_independent_of_replay_default(factory):
     previous = torch.get_default_dtype()
@@ -393,52 +389,38 @@ def test_tensor_literals(data, dtype):
     assert torch.equal(capture.materialize(tensor), expected)
 
 
-def test_tensor_literal_view_mutation_preserves_clone():
-    with DeferredInitialization() as capture:
-        tensor = torch.tensor([[1., 2.], [3., 4.]])
-        before = tensor.clone()
-        tensor[0].fill_(7)
-    assert torch.equal(capture.materialize(before), torch.tensor([[1., 2.], [3., 4.]]))
-    assert torch.equal(capture.materialize(tensor), torch.tensor([[7., 7.], [3., 4.]]))
+@pytest.mark.parametrize("explicit_generator", [False, True])
+def test_rng_determinism_private_generators_and_capture_state(explicit_generator):
+    generator = torch.Generator() if explicit_generator else None
+    rng = generator if generator is not None else torch.random.default_generator
 
-
-def test_rng_determinism_private_generators_and_capture_state():
     def factory():
-        return [torch.rand(7), torch.randn(7), torch.empty(7).normal_(2, 3)]
+        return [
+            torch.rand(7, generator=generator),
+            torch.randn(7, generator=generator),
+            torch.empty(7).normal_(2, 3, generator=generator),
+            torch.empty(7).uniform_(generator=generator),
+        ]
 
-    original = torch.get_rng_state()
-    try:
-        torch.manual_seed(923)
-        state = torch.get_rng_state()
+    with torch.random.fork_rng(devices=[]):
+        rng.manual_seed(923)
+        state = rng.get_state()
+        global_state = torch.get_rng_state()
         with DeferredInitialization() as first_capture:
             first = factory()
-        assert torch.equal(torch.get_rng_state(), state)
+        assert torch.equal(rng.get_state(), state)
         with DeferredInitialization() as second_capture:
             second = factory()
         for a, b in zip(reversed(first), reversed(second)):
             expected = first_capture.materialize(a)
-            assert torch.equal(torch.get_rng_state(), state)
+            assert torch.equal(rng.get_state(), state)
             assert torch.equal(second_capture.materialize(b), expected)
-        torch.manual_seed(924)
+        assert not torch.equal(first_capture.materialize(first[0]), first_capture.materialize(first[-1]))
+        assert torch.equal(torch.get_rng_state(), global_state)
+        rng.manual_seed(924)
         with DeferredInitialization() as third_capture:
             third = factory()
         assert not torch.equal(first_capture.materialize(first[0]), third_capture.materialize(third[0]))
-    finally:
-        torch.set_rng_state(original)
-
-
-def test_explicit_generator_seed_and_state():
-    generator = torch.Generator().manual_seed(132)
-    state = generator.get_state()
-    with DeferredInitialization() as capture:
-        first = torch.rand(8, generator=generator)
-        second = torch.empty(8).uniform_(generator=generator)
-    assert torch.equal(generator.get_state(), state)
-    before = torch.get_rng_state()
-    assert torch.equal(capture.materialize(first), capture.materialize(first))
-    assert not torch.equal(capture.materialize(first), capture.materialize(second))
-    assert torch.equal(generator.get_state(), state)
-    assert torch.equal(torch.get_rng_state(), before)
 
 
 @pytest.mark.parametrize("factory", [
@@ -490,13 +472,16 @@ def test_extended_random_replay(factory, explicit_generator):
         assert torch.equal(generator.get_state(), generator_state)
 
 
-@pytest.mark.parametrize("factory", [
-    pytest.param(lambda x: torch.rand_like(x), id="rand-like"),
-    pytest.param(lambda x: torch.randn_like(x), id="randn-like"),
-    pytest.param(lambda x: torch.randint_like(x, 7), id="randint-like-high"),
-    pytest.param(lambda x: torch.randint_like(x, -4, 7), id="randint-like-low-high"),
+@pytest.mark.parametrize("factory,dtype", [
+    pytest.param(factory, dtype, id=f"{name}-{dtype}")
+    for name, factory, dtypes in [
+        ("rand-like", torch.rand_like, [torch.float32, torch.float64, torch.complex64]),
+        ("randn-like", torch.randn_like, [torch.float32, torch.float64, torch.complex64]),
+        ("randint-like-high", lambda x: torch.randint_like(x, 7), [torch.float32, torch.float64]),
+        ("randint-like-low-high", lambda x: torch.randint_like(x, -4, 7), [torch.float32, torch.float64]),
+    ]
+    for dtype in dtypes
 ])
-@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
 def test_random_like_accepts_empty_template(factory, dtype):
     with DeferredInitialization() as capture:
         tensor = factory(torch.empty(4, 8, dtype=dtype).t())
@@ -543,8 +528,11 @@ def test_random_like_replay_failure_restores_rng(name, monkeypatch):
     not hasattr(torch.ops.aten.randint_like, "Tensor"),
     reason="requires the tensor upper-bound overload",
 )
-@pytest.mark.parametrize("source", ["literal", "computed", "external"])
-@pytest.mark.parametrize("explicit_generator", [False, True])
+@pytest.mark.parametrize("source,explicit_generator", [
+    (source, explicit_generator)
+    for source in ["literal", "computed", "external"]
+    for explicit_generator in [False, True]
+] + [("partial", False)])
 def test_randint_like_tensor_bound(source, explicit_generator):
     external = torch.tensor(7)
     generator = torch.Generator().manual_seed(132) if explicit_generator else None
@@ -554,6 +542,10 @@ def test_randint_like_tensor_bound(source, explicit_generator):
             high = torch.tensor(7)
         elif source == "computed":
             high = torch.full((), 3, dtype=torch.int64).add_(4)
+        elif source == "partial":
+            bounds = torch.empty(2, dtype=torch.int64)
+            bounds[0].fill_(7)
+            high = bounds[0]
         else:
             high = external
         template = torch.empty(4, 8, dtype=torch.int64).t()
@@ -566,6 +558,8 @@ def test_randint_like_tensor_bound(source, explicit_generator):
         generator=torch.Generator().manual_seed(seed),
     )
     actual = capture.materialize(sample)
+    assert actual.device.type == "cpu"
+    assert ((actual >= 0) & (actual < 7)).all()
     assert torch.equal(actual, expected)
     assert actual.stride() == expected.stride()
     assert torch.equal(capture.materialize(sample), expected)
@@ -576,37 +570,19 @@ def test_randint_like_tensor_bound(source, explicit_generator):
             capture.materialize(sample)
 
 
-@pytest.mark.skipif(
-    not hasattr(torch.ops.aten.randint_like, "Tensor"),
-    reason="requires the tensor upper-bound overload",
-)
-def test_randint_like_can_use_partially_initialized_tensor_bound():
-    with DeferredInitialization() as capture:
-        bounds = torch.empty(2, dtype=torch.int64)
-        bounds[0].fill_(7)
-        tensor = torch.randint_like(torch.empty(8), bounds[0])
-    actual = capture.materialize(tensor)
-    assert actual.device.type == "cpu"
-    assert ((actual >= 0) & (actual < 7)).all()
-    assert torch.equal(actual, capture.materialize(tensor))
-
-
-def test_bernoulli_tensor_probability_uses_layout_only_template():
+@pytest.mark.parametrize("sample", [
+    pytest.param(torch.bernoulli, id="probability-input"),
+    pytest.param(
+        lambda probabilities, **kwargs: torch.ops.aten.bernoulli.Tensor(
+            torch.empty(4, 8), probabilities, **kwargs,
+        ),
+        id="empty-template",
+    ),
+])
+def test_sampling_dependencies_and_partial_random_writes(sample):
     with DeferredInitialization() as capture:
         probabilities = torch.full((4, 8), 0.25)
-        sample = torch.ops.aten.bernoulli.Tensor(torch.empty(4, 8), probabilities)
-        probabilities.fill_(1.)
-    expected = torch.empty(4, 8).bernoulli_(
-        torch.full((4, 8), 0.25),
-        generator=torch.Generator().manual_seed(capture._storage(sample).node.seed),
-    )
-    assert torch.equal(capture.materialize(sample), expected)
-
-
-def test_sampling_dependencies_and_partial_random_writes():
-    with DeferredInitialization() as capture:
-        probabilities = torch.full((4, 8), 0.25)
-        sample = torch.bernoulli(probabilities)
+        sampled = sample(probabilities)
         mean = torch.full((4, 8), 3.)
         normal = torch.normal(mean, 0.5)
         destination = torch.ones(4, 8)
@@ -615,11 +591,11 @@ def test_sampling_dependencies_and_partial_random_writes():
         probabilities.zero_()
         mean.fill_(20.)
     assert torch.equal(capture.materialize(before), torch.ones(4, 8))
-    sample_seed = capture._storage(sample).node.seed
-    expected = torch.bernoulli(
+    sample_seed = capture._storage(sampled).node.seed
+    expected = sample(
         torch.full((4, 8), 0.25), generator=torch.Generator().manual_seed(sample_seed),
     )
-    assert torch.equal(capture.materialize(sample), expected)
+    assert torch.equal(capture.materialize(sampled), expected)
     normal_seed = capture._storage(normal).node.seed
     expected_normal = torch.normal(
         torch.full((4, 8), 3.), 0.5, generator=torch.Generator().manual_seed(normal_seed),
@@ -631,17 +607,6 @@ def test_sampling_dependencies_and_partial_random_writes():
         torch.full((8,), 0.25), generator=torch.Generator().manual_seed(write_seed),
     )
     assert torch.equal(capture.materialize(destination), expected_destination)
-
-
-@pytest.mark.parametrize("operation", ["rand_like", "randn_like"])
-def test_complex_random_like(operation):
-    factory = getattr(torch, operation)
-    with DeferredInitialization() as capture:
-        tensor = factory(torch.empty(8, dtype=torch.complex64))
-    with torch.random.fork_rng(devices=[]):
-        torch.manual_seed(capture._storage(tensor).node.seed)
-        expected = factory(torch.empty(8, dtype=torch.complex64))
-    assert torch.equal(capture.materialize(tensor), expected)
 
 
 def test_randint_like_dtype_and_memory_format():
@@ -674,26 +639,6 @@ def test_sampling_external_cuda_input_and_generator():
     probabilities.fill_(0.75)
     with pytest.raises(RuntimeError, match="external tensor data changed"):
         capture.materialize(tensor)
-
-
-@pytest.mark.parametrize("operation", ["exponential_", "geometric_", "log_normal_", "cauchy_"])
-def test_random_writes_reject_external_destination(operation):
-    external = torch.ones(8)
-    with DeferredInitialization():
-        with pytest.raises(RuntimeError, match="mutation of external data"):
-            getattr(external, operation)(0.5)
-    assert torch.equal(external, torch.ones(8))
-
-
-@pytest.mark.parametrize("factory", [
-    lambda out: torch.randint(5, (8,), out=out),
-    lambda out: torch.randperm(8, out=out),
-    lambda out: torch.multinomial(torch.ones(8), 8, out=out),
-])
-def test_extended_random_rejects_out(factory):
-    with DeferredInitialization():
-        with pytest.raises(RuntimeError, match="out= overload"):
-            factory(torch.empty(8, dtype=torch.int64))
 
 
 @pytest.mark.parametrize("copy", [
@@ -739,26 +684,32 @@ def test_external_data_and_replay_failure_cleanup():
     assert torch.equal(capture.materialize(independent), torch.ones(7))
 
 
-@pytest.mark.parametrize("operation", [
-    pytest.param(lambda x, out: torch.ones(3, out=out), id="factory-out"),
-    pytest.param(lambda x, out: torch.add(x, 2, out=out), id="add-out"),
+@pytest.mark.parametrize("operation,dtype", [
+    pytest.param(lambda x, out: torch.ones(3, out=out), torch.float32, id="factory-out"),
+    pytest.param(lambda x, out: torch.add(x, 2, out=out), torch.float32, id="add-out"),
     pytest.param(
-        lambda x, out: torch.ops.aten.add.Scalar_out(x, 2, out=out),
+        lambda x, out: torch.ops.aten.add.Scalar_out(x, 2, out=out), torch.float32,
         id="scalar-out",
     ),
     pytest.param(
-        lambda x, out: torch.aminmax(x, out=(out[0], out[1])),
+        lambda x, out: torch.aminmax(x, out=(out[0], out[1])), torch.float32,
         id="min-max-outputs",
     ),
     pytest.param(
-        lambda x, out: torch.sort(x, out=(out, torch.empty(3, dtype=torch.int64))),
+        lambda x, out: torch.sort(x, out=(out, torch.empty(3, dtype=torch.int64))), torch.float32,
         id="values-indices-outputs",
     ),
+    pytest.param(lambda x, out: torch.randint(5, (3,), out=out), torch.int64, id="randint-out"),
+    pytest.param(lambda x, out: torch.randperm(3, out=out), torch.int64, id="randperm-out"),
+    pytest.param(
+        lambda x, out: torch.multinomial(x, 3, out=out), torch.int64,
+        id="multinomial-out",
+    ),
 ])
-def test_out_overloads_are_rejected(operation):
+def test_out_overloads_are_rejected(operation, dtype):
     with DeferredInitialization():
         source = torch.ones(3)
-        destination = torch.empty(3)
+        destination = torch.empty(3, dtype=dtype)
         with pytest.raises(RuntimeError, match="out= overload"):
             operation(source, destination)
 
@@ -767,7 +718,13 @@ def test_out_overloads_are_rejected(operation):
     (lambda: torch.ones(3).sin_(), "unsupported mutation"),
     (lambda: torch.ones(3).resize_(5), "unsupported mutation"),
     (lambda: torch.ones(3, 4).t().fill_(1), "noncontiguous mutation"),
-    (lambda: torch.ones(3).add_(torch.ones(3)), "tensor-valued arithmetic"),
+    *[
+        pytest.param(
+            lambda operation=operation: getattr(torch.ones(3), operation)(torch.ones(3)),
+            "tensor-valued arithmetic", id=f"tensor-{operation}",
+        )
+        for operation in ("add_", "sub_", "mul_", "div_")
+    ],
     (lambda: torch.empty_strided((3, 4), (0, 1)), "overlapping"),
 ])
 def test_unsupported_constructors_fail_explicitly(factory, message):
@@ -796,13 +753,6 @@ def test_empty_allocation_materialization(factory):
     assert actual.untyped_storage() is not capture.materialize(empty).untyped_storage()
 
 
-def test_untracked_meta_rejected():
-    with DeferredInitialization() as capture:
-        pass
-    with pytest.raises(RuntimeError, match="untracked meta"):
-        capture.materialize(torch.empty(3, device="meta"))
-
-
 def test_partial_writes_initialize_empty_and_preserve_snapshots():
     with DeferredInitialization() as capture:
         tensor = torch.empty(3, 4)
@@ -817,7 +767,7 @@ def test_partial_writes_initialize_empty_and_preserve_snapshots():
     assert torch.equal(capture.materialize(tensor), expected)
 
 
-def test_capture_lifecycle_and_constructor_failure():
+def test_capture_lifecycle_and_usage_errors():
     capture = DeferredInitialization()
     with pytest.raises(RuntimeError, match="unsupported mutation.*sin_"):
         with capture:
@@ -830,6 +780,8 @@ def test_capture_lifecycle_and_constructor_failure():
         value = torch.ones(1)
         with pytest.raises(RuntimeError, match="after leaving capture"):
             another.materialize(value)
+    with pytest.raises(RuntimeError, match="untracked meta"):
+        another.materialize(torch.empty(3, device="meta"))
 
 
 @pytest.mark.parametrize("mutation", ["parameter", "view", "reset_parameters"])
@@ -1020,21 +972,6 @@ def test_generic_multioutput_shared_operation_and_mutation():
     with QRRecorder() as recorder:
         capture.materialize(combined)
     assert recorder.calls == 1
-
-
-def test_generic_captures_default_dtype():
-    previous = torch.get_default_dtype()
-    try:
-        torch.set_default_dtype(torch.float64)
-        with DeferredInitialization() as capture:
-            result = torch.arange(4).sin()
-        torch.set_default_dtype(torch.float32)
-        actual = capture.materialize(result)
-        assert actual.dtype == torch.float64
-        assert torch.get_default_dtype() == torch.float32
-        torch.testing.assert_close(actual, torch.arange(4).double().sin())
-    finally:
-        torch.set_default_dtype(previous)
 
 
 def test_data_dependent_fallback_control_flow_and_later_operations(caplog):
@@ -1242,15 +1179,22 @@ def test_generic_positional_generator_and_following_arguments(use_generator):
     assert not torch.equal(generator.get_state(), generator_state)
 
 
-@pytest.mark.parametrize("operation", ["erfinv_", "clamp_"])
-def test_unary_writes_reject_external_and_noncontiguous(operation):
+@pytest.mark.parametrize("operation,arguments", [
+    ("erfinv_", ()),
+    ("clamp_", (-1, 1)),
+    ("exponential_", (0.5,)),
+    ("geometric_", (0.5,)),
+    ("log_normal_", (0.5,)),
+    ("cauchy_", (0.5,)),
+])
+def test_writes_reject_external_and_noncontiguous(operation, arguments):
     external = torch.ones(3)
-    arguments = (-1, 1) if operation == "clamp_" else ()
     with DeferredInitialization():
         with pytest.raises(RuntimeError, match="mutation of external data"):
             getattr(external, operation)(*arguments)
         with pytest.raises(RuntimeError, match="noncontiguous mutation"):
             getattr(torch.ones(3, 4).t(), operation)(*arguments)
+    assert torch.equal(external, torch.ones(3))
 
 
 @pytest.mark.parametrize("tag", [

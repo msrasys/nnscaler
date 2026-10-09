@@ -121,7 +121,7 @@ def test_param_init_seed_cache_reuse(tmp_path, reuse, strategy):
                 tmp_path, reuse, 'seed', load_module=False,
             )
             assert constructor.call_count == 1
-        assert bool(list(tmp_path.rglob(FxModuleParser.NON_PERSISTENT_BUFFER_FILE))) == (strategy == 'file')
+        assert bool(list(tmp_path.rglob(FxModuleParser.NON_PERSISTENT_BUFFER_FILE))) == (strategy != 'shard')
         graph_mtimes.append(next(tmp_path.rglob('graph.ckp')).stat().st_mtime_ns)
     assert graph_mtimes[0] != graph_mtimes[1]
     assert len(constructors) == 2
@@ -139,14 +139,13 @@ def test_param_init_strategy_reuse(tmp_path):
         )
         config = ComputeConfig(1, 1, param_init_strategy=strategy)
         if strategy != 'file':
-            with patch.object(Frame, 'save_attr_content', side_effect=AssertionError('fullmodel write')), \
-                    patch.object(Frame, 'save_np_buffer_content', side_effect=AssertionError('npbuffer write')):
+            with patch.object(Frame, 'save_attr_content', side_effect=AssertionError('fullmodel write')):
                 parallelize(MyModule, {'x': torch.ones(2, 3)}, 'dp', config, **kwargs)
         else:
             parallelize(MyModule, {'x': torch.ones(2, 3)}, 'dp', config, **kwargs)
         module_dir = next(tmp_path.rglob(ParallelModule.COMPUTE_CONFIG_FILE)).parent
         assert bool(list(module_dir.glob('fullmodel.pt*'))) == (strategy == 'file')
-        assert (module_dir / FxModuleParser.NON_PERSISTENT_BUFFER_FILE).exists() == (strategy == 'file')
+        assert (module_dir / FxModuleParser.NON_PERSISTENT_BUFFER_FILE).exists() == (strategy != 'shard')
         assert (module_dir / FxModuleParser.ATTR_MAP_FILE).exists()
         graph_file = next(module_dir.glob('graph*'))
         graph_mtime = graph_file.stat().st_mtime_ns
@@ -173,7 +172,7 @@ def test_reuse_without_np_buffer_content(tmp_path, strategy, reuse):
     buffer_file = module_dir / FxModuleParser.NON_PERSISTENT_BUFFER_FILE
     graph_file = module_dir / 'graph.ckp'
     graph_mtime = graph_file.stat().st_mtime_ns
-    if strategy == ParamInitStrategy.FILE:
+    if strategy != ParamInitStrategy.SHARD:
         buffer_file.unlink()
         with raises_with_cause(RuntimeError, match='existing files do not match'):
             _to_cube_model(MyModule, config, tmp_path, ReuseType.MATCH, 'npbuffer', load_module=False)
@@ -181,8 +180,8 @@ def test_reuse_without_np_buffer_content(tmp_path, strategy, reuse):
         assert not buffer_file.exists()
         _to_cube_model(MyModule, config, tmp_path, ReuseType.MATCH, 'npbuffer', load_module=False)
     _to_cube_model(MyModule, config, tmp_path, reuse, 'npbuffer', load_module=False)
-    assert buffer_file.is_file() == (strategy == ParamInitStrategy.FILE)
-    assert (graph_file.stat().st_mtime_ns != graph_mtime) == (strategy == ParamInitStrategy.FILE)
+    assert buffer_file.is_file() == (strategy != ParamInitStrategy.SHARD)
+    assert (graph_file.stat().st_mtime_ns != graph_mtime) == (strategy != ParamInitStrategy.SHARD)
 
 
 @replace_all_device_with('cpu')

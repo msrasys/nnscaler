@@ -145,7 +145,8 @@ def test_record_metadata():
 
 
 @replace_all_device_with('cpu')
-def test_npbuffer_saved():
+@pytest.mark.parametrize('save_weights', [False, True])
+def test_npbuffer_saved(save_weights):
     """Test that npbuffer.pt is saved during tracing and contains only non-persistent buffer data."""
     class ModuleWithNPBuffer(torch.nn.Module):
         def __init__(self):
@@ -162,10 +163,13 @@ def test_npbuffer_saved():
     fx_graph = to_fx_graph(module, dummy_input)
 
     with tempfile.TemporaryDirectory() as tempdir:
-        ir_graph = to_ir_graph(fx_graph, dummy_input, attr_savedir=tempdir, constant_folding=False)
+        ir_graph = to_ir_graph(
+            fx_graph, dummy_input, attr_savedir=tempdir, constant_folding=False,
+            save_weights=save_weights, save_np_buffers=True,
+        )
         assert ir_graph is not None
         assert (Path(tempdir) / FxModuleParser.ATTR_MAP_FILE).exists()
-        assert (Path(tempdir) / FxModuleParser.ATTR_CONTENT_FILE_0).exists()
+        assert (Path(tempdir) / FxModuleParser.ATTR_CONTENT_FILE_0).exists() == save_weights
         assert (Path(tempdir) / FxModuleParser.NON_PERSISTENT_BUFFER_FILE).exists()
 
         # Verify npbuffer.pt content
@@ -190,7 +194,10 @@ def test_npbuffer_saved():
     fx_graph2 = to_fx_graph(module2, dummy_input)
 
     with tempfile.TemporaryDirectory() as tempdir:
-        ir_graph2 = to_ir_graph(fx_graph2, dummy_input, attr_savedir=tempdir, constant_folding=False)
+        ir_graph2 = to_ir_graph(
+            fx_graph2, dummy_input, attr_savedir=tempdir, constant_folding=False,
+            save_weights=save_weights, save_np_buffers=True,
+        )
         assert (Path(tempdir) / FxModuleParser.NON_PERSISTENT_BUFFER_FILE).exists()
         npbuffer_data2 = torch.load(Path(tempdir) / FxModuleParser.NON_PERSISTENT_BUFFER_FILE)
         assert len(npbuffer_data2) == 0  # no non-persistent buffers

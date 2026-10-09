@@ -26,14 +26,21 @@ equivalent `nnscaler.ParamInitStrategy` constant:
 | Strategy | How runtime initialization works |
 | --- | --- |
 | `"file"` / `FILE` (default) | Load parameters and buffers from `fullmodel.pt.*` and `npbuffer.pt`. |
-| `"full"` / `FULL` | Construct the full original model, then copy the slices needed by this rank. |
+| `"full"` / `FULL` | Construct the full original model for initial weights. Save non-persistent buffers in `npbuffer.pt` and load them directly on resume. |
 | `"shard"` / `SHARD` | Use `__shard__init__` if defined; otherwise capture the constructor and replay only the tensors needed by this rank. |
 
-Choose `full` to avoid weight files while keeping ordinary constructor behavior.
+Choose `full` to avoid `fullmodel.pt.*` while keeping ordinary constructor behavior.
 Choose `shard` to reduce runtime initialization memory, with the
-[capture limitations](#automatic-capture) described below. Neither strategy saves
-or loads the weight files; generated code and metadata are still required.
+[capture limitations](#automatic-capture) described below. Only `shard` avoids both
+`fullmodel.pt.*` and `npbuffer.pt`; generated code and metadata are still required.
 Construction uses the original class, or the `module_fn` supplied to `parallelize`.
+
+On first initialization, `full` checks that each local non-persistent buffer
+matches its saved slice in `npbuffer.pt` bitwise (after value-partition scaling).
+A mismatch raises an error without overwriting the model's values. This check is
+independent of the CLI replica check and also applies to supplied model instances.
+Use `broadcast_strategy="all"` or make this file available on every node yourself;
+`no_weights` excludes it.
 
 ```python
 import nnscaler
@@ -208,12 +215,14 @@ and [Trainer Compute Config](./trainer.md#compute-config) for a YAML example.
   supply them through a shard hook.
 - **Checkpoint resume:** `init_params=False` initializes only non-persistent
   buffers, leaving parameters and persistent buffers for checkpoint loading.
-  `file` reads `npbuffer.pt`; `full` may still construct a full model; `shard`
-  receives a buffer-only map and initializes those buffers and any dependencies.
+  Both `file` and `full` read `npbuffer.pt`, without constructing the original
+  model or invoking a hook. `shard` receives a buffer-only map and initializes
+  those buffers and any dependencies.
 - **Cache reuse:** Switching between `file` and a non-file strategy, or changing
   `param_init_seed`, requires retracing (`gen_reuse: moo` or a fresh generated-code
-  directory). Switching between `full` and `shard` with the same seed can reuse
-  the graph. `debug.param_init_check` does not affect generated code. If generated
+  directory). `full` to `shard` with the same seed can reuse the graph; the reverse
+  requires retracing to create `npbuffer.pt`. Missing `npbuffer.pt` also requires
+  retracing for `file` and `full`. `debug.param_init_check` does not affect generated code. If generated
   code is already imported, use a fresh process or instance name; `moo` cannot
   replace an imported module.
 

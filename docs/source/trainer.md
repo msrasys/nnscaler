@@ -680,7 +680,7 @@ To avoid saving and loading `fullmodel.pt.*`, set `param_init_strategy`:
 | Value | Runtime initialization |
 | --- | --- |
 | `file` (default) | Load saved parameters and buffers. |
-| `full` | Construct the original model on each rank and copy local slices. |
+| `full` | Construct the original model on each rank; resume reads non-persistent buffers from `npbuffer.pt` without reconstructing it. |
 | `shard` | Use the model's `__shard__init__` hook, or automatically capture and replay the required tensors. |
 
 For example:
@@ -697,6 +697,8 @@ debug:
 `param_init_seed` defaults to `1234` and is separate from the training `seed`.
 Set `debug.param_init_check: false` to skip replica checking; see
 [Debug Config](#debug-config) for what the check covers.
+For `full`, first initialization always checks that local non-persistent buffers
+match `npbuffer.pt` bitwise, even when replica checking is disabled.
 
 All strategies still construct a full model during compilation. For memory
 limits, hook signatures, checkpoint resume and cache reuse, see

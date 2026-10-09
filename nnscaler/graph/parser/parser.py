@@ -49,6 +49,7 @@ class FxModuleParser:
               save_content: bool = True,
               constant_folding: bool = False,
               save_weights: bool = True,
+              save_np_buffers: Optional[bool] = None,
         ):
         """Parse torch.fx module into cube IR
 
@@ -60,7 +61,8 @@ class FxModuleParser:
             attr_savedir (str): the directory to save the attribute content
             save_content (bool): whether to save the content of the module
             constant_folding (bool): whether to parse the module with constant folding
-            save_weights (bool): whether to save full-model tensors and non-persistent buffer contents.
+            save_weights (bool): whether to save full-model tensors.
+            save_np_buffers (Optional[bool]): whether to save non-persistent buffers; defaults to save_weights.
         """
 
         self.module = module
@@ -72,6 +74,7 @@ class FxModuleParser:
         self.save_content = save_content
         self.constant_folding = constant_folding
         self.save_weights = save_weights
+        self.save_np_buffers = save_weights if save_np_buffers is None else save_np_buffers
 
         self.frame = Frame()
         self.value_tracker = ValueTracker()
@@ -158,6 +161,7 @@ class FxModuleParser:
             attr_savedir = Path(self.attr_savedir)
             if self.save_weights:
                 self.frame.save_attr_content(attr_savedir / self.ATTR_CONTENT_FILE_STEM)
+            if self.save_np_buffers:
                 self.frame.save_np_buffer_content(attr_savedir / self.NON_PERSISTENT_BUFFER_FILE)
             self.frame.save_attr_map(attr_savedir / self.ATTR_MAP_FILE)
 
@@ -658,6 +662,7 @@ def parse_fx_module(
     save_content: bool = True,
     constant_folding: bool = False,
     save_weights: bool = True,
+    save_np_buffers: Optional[bool] = None,
 ) -> Tuple[List[IRObject], List[IRFwOperation], List[IRObject]]:
     """Parse torch.fx module into cube IR
 
@@ -668,7 +673,8 @@ def parse_fx_module(
         dummy_inputs (Dict[str, Any]): the dummy inputs to run the module
         attr_savedir (str): the directory to save the attribute content
         constant_folding (bool): whether to parse the module with constant folding
-        save_weights (bool): whether to save full-model tensors and non-persistent buffer contents.
+        save_weights (bool): whether to save full-model tensors.
+        save_np_buffers (Optional[bool]): whether to save non-persistent buffers; defaults to save_weights.
 
     Returns:
         inputs (List[IRObject]): the input IRObjects
@@ -682,4 +688,5 @@ def parse_fx_module(
         save_content=save_content,
         constant_folding=constant_folding,
         save_weights=save_weights,
+        save_np_buffers=save_np_buffers,
     ).parse()

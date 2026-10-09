@@ -15,7 +15,7 @@ from nnscaler.cli import Trainer, TrainerArgs
 from nnscaler.cli.trainer import check_param_init
 from nnscaler.cli.trainer_args import DebugConfig, ModelConfig, ModuleParallelizeConfig, ResumeOptions
 from nnscaler.runtime.module import AttrMeta, ParallelModule, Zero3AttrMeta
-from tests.cli.test_weight_init import _args
+from tests.cli.test_weight_init import _args, _assert_artifacts
 from tests.launch_torchrun import launch_torchrun
 
 
@@ -134,7 +134,8 @@ def _worker_whole_model(save_dir, strategy, delayed_buckets=False):
     assert bool(classifications) == delayed_buckets
     assert trainer.train_status.finished_train_steps == 1
     for module in (trainer.model.first, trainer.model.second):
-        assert bool(list(module.module_dir.glob('fullmodel.pt*'))) == (strategy == ParamInitStrategy.FILE)
+        assert module.compute_config.param_init_strategy == strategy
+        _assert_artifacts(module, strategy)
 
     mismatches = ['parameter', 'buffer', 'nonpersistent']
     if strategy != ParamInitStrategy.FILE:
