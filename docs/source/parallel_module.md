@@ -14,214 +14,142 @@ The above restrictions are necessary for the pipeline parallelism to work. Of co
 
 ## Weight initialization
 
-`ComputeConfig.param_init_strategy` accepts a string value. The plain
-`nnscaler.ParamInitStrategy` class provides the following string constants:
+By default, nnScaler saves the original model's weights during compilation and
+loads them when creating each parallel model. To avoid this weight-file I/O, use
+`full` or `shard`.
 
-| Strategy | Behavior |
+### Choose a strategy
+
+Set `ComputeConfig.param_init_strategy` to one of these strings, or use the
+equivalent `nnscaler.ParamInitStrategy` constant:
+
+| Strategy | How runtime initialization works |
 | --- | --- |
-| `FILE` / `"file"` (default) | Save and load `fullmodel.pt.*` and `npbuffer.pt`, preserving file-backed initialization. |
-| `MODEL` / `"model"` | Reconstruct the full original model at runtime and copy its local parameter and buffer slices. |
-| `CAPTURE` / `"capture"` | Defer runtime tensor construction where possible, materialize required full tensors and copy their local slices. Operations requiring concrete data execute during capture. |
-| `CUSTOM` / `"custom"` | Call the original class's `__partial__init__` callback to initialize local shards directly, without running its full constructor at runtime. |
+| `"file"` / `FILE` (default) | Load parameters and buffers from `fullmodel.pt.*` and `npbuffer.pt`. |
+| `"full"` / `FULL` | Construct the full original model, then copy the slices needed by this rank. |
+| `"shard"` / `SHARD` | Use `__shard__init__` if defined; otherwise capture the constructor and replay only the tensors needed by this rank. |
 
-Non-file strategies save and distribute metadata, but no `fullmodel.pt.*` or
-`npbuffer.pt`. Parameters, persistent buffers and non-persistent buffers all come
-from the selected strategy; there is no mixing with trace-time buffer files.
-`model` and `capture` use the original class or `module_fn`. When `parallelize`
-receives an existing instance, they use its values without reinitializing it.
-`custom` always invokes the callback, even when given an existing instance.
-No strategy calls `reset_parameters` on generated shards. Shared parameters and
-value partitions retain their mapping semantics; ZeRO buckets are built afterward.
+Choose `full` to avoid weight files while keeping ordinary constructor behavior.
+Choose `shard` to reduce runtime initialization memory, with the
+[capture limitations](#automatic-capture) described below. Neither strategy saves
+or loads the weight files; generated code and metadata are still required.
+Construction uses the original class, or the `module_fn` supplied to `parallelize`.
 
-`ComputeConfig.param_init_seed` (default `1234`, integer in `[0, 2**32)`) controls
-initialization independently of the CLI training `seed`. Compilation
-constructs the full real model eagerly for **all** strategies; constructors
-are seeded for Python, NumPy, PyTorch CPU and the current CUDA device. Runtime
-construction or custom callbacks use the same isolated seed scope. Caller RNG
-states are restored, including on failure; rank-zero tracing also preserves them.
-Other CUDA devices and custom generators are not seeded.
-The `file` strategy saves the seeded construction values; supplied instances are
-not reseeded.
-Constructors and callbacks must still be deterministic and rank-independent.
+```python
+import nnscaler
 
-### Capture limitations
+config = nnscaler.ComputeConfig(
+    plan_ngpus=2,
+    runtime_ngpus=2,
+    param_init_strategy=nnscaler.ParamInitStrategy.SHARD,
+    param_init_seed=1234,
+)
+```
 
-Capture uses deterministic per-operation random streams. Its random samples
-intentionally differ from eager `model`/trace-time initialization, even with the
-same seed; supported initializers retain distribution arguments, full shapes and
-dtype conversions. It is selective full-tensor materialization, **not** direct
-shard initialization: a large full tensor or dependency chain may still exceed
-memory. Model structure, operation metadata, constructor side effects, external
-tensor data, generated shard storage and reducer buckets are not eliminated.
-Materialization does not add a final copy: returned views may retain their
-producer's full storage, and external CPU inputs may share storage with the result.
-ParallelModule copies the required slices into its parameters and releases the
-temporary result afterwards.
+**An existing model instance takes priority.** For `full` and `shard`,
+`parallelize(original_model, ...)` uses that instance's current values, without
+reconstructing it, reseeding it, or calling `__shard__init__`. The same applies to
+`GeneratedModel(init_module=original_model)`. Hook validation and binding in
+`parallelize` are unchanged.
 
-#### Deferred operations and concrete fallback
+**All strategies still construct a full real model during compilation.**
+These options change runtime initialization, not tracing.
 
-Capture records factories, copies, sampling and ordinary non-mutating tensor
-operations through one dependency-graph path, and executes their meta kernels to
-determine output metadata. These operations do
-not require a mathematical-operator allowlist: examples include `sin`, `cos`,
-out-of-place arithmetic, `pow`, `tril`, matrix multiplication and reductions.
-Multiple tensor outputs reference the same operation. Tensor aliases and mutation
-still require separate handling; having a meta kernel alone does not establish
-that an operation is safe to replay.
+### Automatic capture
 
-When an operation requires concrete data or has no meta implementation, capture
-materializes its dependencies and executes it on CPU during construction. This
-allows scalar reads such as `.item()` to drive Python control flow. Tensor results
-are converted to meta tensors and their temporary real storage is released.
-Fallback operations retain recipes, not concrete results, and are re-executed
-during materialization like ordinary operations. Shared nodes execute once per
-materialization call; separate calls recompute their dependencies.
-Fallback is logged. Invalid arguments and ordinary execution errors are not
-silently converted into successful results.
+With `shard` and no user hook, nnScaler records the original constructor's tensor
+operations, then replays the tensors needed by this rank. It copies each local
+slice into the parallel model before releasing the temporary result.
 
-Operators tagged `data_dependent_output` or `dynamic_output_shape` execute
-concretely without attempting meta execution, including `.item()` and `nonzero`.
-Other operators first try meta execution and fall back on `NotImplementedError`,
-without matching exception text. Other exceptions, including `RuntimeError`,
-propagate; errors in concrete execution also propagate.
-Custom operators using data-dependent fake/meta kernels must declare the
-appropriate output tag. Custom operators must declare mutation, alias and
-randomness accurately in their schemas/tags; arbitrary external side effects
-cannot be inferred or made safely replayable.
+This is **selective full-tensor initialization**, not direct shard generation:
+materializing a tensor still allocates its full shape and any dependencies.
+Use a [shard hook](#write-a-shard-initializer) when even one full tensor is too
+large. Capture uses per-operation random streams, so its values need not match
+eager `full` initialization with the same seed.
 
-Fallback can temporarily allocate a full parameter and its dependencies.
-Capture is therefore best-effort deferred
-initialization, not a guarantee of storage-free construction. It still does not
-fall back to constructing a second, complete eager model. CPU-only replay cannot
-execute operators that require a CUDA-only implementation.
+#### Supported operations
 
-The following table lists common supported operations and the explicitly handled
-view/mutation subset, not a whitelist of pure operators. Names are ATen base names;
-composite Python APIs and specific overloads remain subject to the restrictions
-below.
+Ordinary non-mutating operators are captured generically, including arithmetic,
+`sin`, `cos`, `tril`, matrix multiplication and reductions. Views and mutations
+require explicit support:
 
-| Category | Supported operator names |
+| Category | Supported operations |
 | --- | --- |
-| Allocation and deterministic factories | `empty`, `empty_strided`, `zeros`, `ones`, `full`, `arange`, `empty_like`, `zeros_like`, `ones_like`, `full_like`, `new_empty`, `new_empty_strided`, `new_zeros`, `new_ones`, `new_full` |
-| Random factories | `rand`, `randn`, `randint`, `randperm`, `rand_like`, `randn_like`, `randint_like` |
-| Sampling | `normal`, `bernoulli`, `poisson`, `multinomial` |
-| Views and aliases | `detach`, `alias`, `view`, `_unsafe_view`, `transpose`, `t`, `permute`, `slice`, `select`, `unsqueeze`, `squeeze`, `expand` |
-| Copies and conversions | `clone`, `_to_copy` (copying `Tensor.to(...)`) |
-| In-place initialization | `fill_`, `zero_`, `copy_`, `uniform_`, `normal_`, `random_`, `bernoulli_`, `exponential_`, `geometric_`, `log_normal_`, `cauchy_` |
-| In-place scalar arithmetic | `add_`, `sub_`, `mul_`, `div_` |
-| In-place unary initialization | `erfinv_`, `clamp_` with scalar bounds (including the operations used by PyTorch 2.10 truncated normal) |
-| Tensor literals | `lift_fresh` (the dispatch path for `torch.tensor(...)`) |
+| Factories and sampling | `empty`, `zeros`, `ones`, `full`, `arange`, `linspace`, `rand`, `randn`, `randint`, `randperm`, like/new factories, `normal`, `bernoulli`, `poisson`, `multinomial` |
+| Views | `detach`, `alias`, `view`, `_unsafe_view`, `transpose`, `t`, `permute`, `slice`, `select`, `unsqueeze`, `squeeze`, `expand` |
+| Copies | `clone`, copying `to`, `copy_` |
+| In-place initialization | `fill_`, `zero_`, `uniform_`, `normal_`, `random_`, `bernoulli_`, `exponential_`, `geometric_`, `log_normal_`, `cauchy_`, `erfinv_`, scalar-bound `clamp_` |
+| In-place arithmetic | `add_`, `sub_`, `mul_`, `div_` with scalar operands on contiguous tensors or views |
 
-Both `w * 2` and contiguous `w.mul_(2)` can be captured. `w.copy_(other)` records
-a tensor dependency, but `w.add_(other_tensor)` remains outside the supported
-mutation subset. Arbitrary in-place operators and `out=` overloads are not made
-safe merely by concrete fallback: they could modify shared storage or invalidate
-earlier snapshots.
-Alias-returning operators outside the explicit view paths, such as `split`,
-`unbind` and `diagonal`, are still rejected. Consequently, iterating over a tensor
-may be unsupported even though indexing it is supported.
+The table uses ATen operator names; composite APIs work only if their underlying
+operations are supported. Important limits:
 
-Capture applies to all dispatched operations inside its context, including
-temporary tensors and buffers, not just parameter writes. It does not affect the
-model's normal forward execution outside capture.
+- `out=` overloads, noncontiguous mutations, tensor-operand in-place arithmetic,
+  and unlisted alias operations such as `split`, `unbind` and `diagonal` are
+  unsupported. Tensor iteration can therefore fail even when indexing works.
+- Data-dependent operations such as `.item()` and `nonzero`, and operations
+  without a meta implementation, use a logged CPU fallback during capture.
+  This can allocate full tensors. Recipes are replayed later; constructor
+  branches are decided during capture, not reevaluated as dynamic branches.
+- Replay requires CPU implementations. Custom operators must accurately declare
+  mutation, aliasing and randomness; external side effects are not replay-safe.
+- Tensor literals and external tensor data can retain real storage. Keep external
+  inputs unchanged until initialization finishes, and initialize every value
+  before reading it; `empty` contents remain unspecified.
+- Explicit random generators contribute their initial seed, not their current
+  state or device. Avoid concurrent initialization with other users of
+  process-global RNG or default-dtype settings.
 
-All tensor inputs retain their producer dependencies, including templates of
-like/new factories. Replay evaluates these producers even if only their layout
-is needed, which can add computation and temporary memory.
-`randint_like` also captures tensor upper-bound dependencies on PyTorch versions
-that support that overload. Explicit generators contribute
-their initial seed only: their current state and device are not replayed, and
-capture/replay do not advance them. Replay uses CPU RNG: most operations use
-private generators; random-like operations temporarily seed the default CPU
-generator in a context that restores its state, including on failure.
-Generic seeded-random operators are recognized through PyTorch's
-`nondeterministic_seeded` tag and use a captured per-operation seed. Meta execution
-does not isolate RNG side effects: random draws made by a meta implementation can
-affect subsequent constructor code. Random-dependent constructor branches are not
-guaranteed to match eager construction. The outer seeded initialization scope
-still restores caller RNG states on exit. Custom-operator replay preserves Python,
-NumPy, CPU and current-device CUDA RNG state.
-Native replay uses private generators or a scoped CPU RNG only
-where needed, avoiding RNG-state allocations for deterministic native operations.
-Replay also temporarily restores the captured default dtype, including implicit
-integer-to-floating promotion. Operator dtype arguments are replayed as supplied,
-not inferred from output dtype. Do not run replay concurrently with unrelated
-users of these process-global RNG/default-dtype settings.
-`out=` overloads remain unsupported. Composite initializers and distribution APIs
-are supported only when all of their underlying operations are supported.
+If capture cannot handle a constructor, use `full`, `file`, a supplied initialized
+instance, or a shard hook. Capture does not silently reconstruct a full eager
+model on failure.
 
-Data-dependent constructor branches are resolved during capture, not recorded as
-dynamic branches in the DAG. Subsequent replay must use the same values that
-selected the branch. Constructors must remain deterministic and rank-independent.
-In-place `add_`, `sub_`, `mul_`, and `div_` support scalar operands on
-contiguous tensors or views; tensor operands are unsupported. Division also supports
-`rounding_mode="floor"` and `"trunc"`.
-Only operations inside the capture context are replayed. Later value mutations of
-captured meta tensors are ignored rather than version-checked; changing their
-metadata after capture is unsupported.
-`torch.tensor` literals are supported, including multi-element and empty tensors,
-but allocate real storage before dispatch. Captured recipes retain that storage
-for replay, so capture does not save this portion of memory.
-Noncontiguous mutations are unsupported. Empty allocations are ordinary replay
-nodes; their contents remain unspecified, just as in eager PyTorch. Partial writes
-are supported, but constructors must initialize all values used in the model to
-ensure deterministic parameters. Reading uninitialized values is not rejected.
-External tensor clones and dtype conversions are deferred as well.
-Existing external tensor data must remain
-unchanged until materialization finishes. Use `model`, `file`, `custom`,
-or an already initialized source instance for unsupported constructors.
+#### Compatibility snapshot
 
-#### Representative model initialization compatibility
+Constructor capture/replay was tested with PyTorch **2.10.0+cu128**,
+Transformers **4.57.6**, and torchvision **0.25.0**:
 
-The following snapshot checks **constructor capture and initialization replay**,
-not forward execution, `parallelize`, pretrained loading, or bitwise equality with
-eager random initialization. Model versions matter: inspect the complete
-constructor, including temporary tensors, buffers and `post_init()`, rather than
-only its weight initializer.
-
-Runtime probes used PyTorch **2.10.0+cu128**, Transformers **4.57.6**, and
-torchvision **0.25.0**. HF probes used small configurations with one layer, hidden
-size 16 and two attention heads; GPT-2/Llama used vocabulary size 32 and sequence
-capacity 16, and ViT used image size 16 and patch size 8. ResNets used their
-standard architectures with `weights=None`. Every named parameter and buffer
-(including nonpersistent buffers) was materialized for successful captures,
-checking CPU placement, shape, dtype and finite values.
-
-| Model | Evidence | Result with the current capture implementation |
+| Models | Configuration | Result |
 | --- | --- | --- |
-| torchvision ResNet-18 / ResNet-50 | Runtime capture and replay; [constructor source][capture-resnet] | Passed for all 122 / 320 named parameter and buffer entries. Convolution Kaiming initialization and normalization constants use supported operations. |
-| HF `GPT2LMHeadModel` | Runtime capture and replay; [attention constructor][capture-gpt2] | Passed for 18 entries, including the `tril` causal-mask buffer. The constructed model retains its tied embedding/head parameter identity. |
-| HF `LlamaForCausalLM` | Runtime capture and replay; [default RoPE initializer][capture-llama-rope] | Passed for 13 entries, including RoPE inverse-frequency arithmetic. |
-| HF `ViTModel` | Runtime capture and replay; [model initializer][capture-hf-vit] and [PyTorch truncated normal][capture-trunc-normal] | Passed for 24 entries, including truncated normal with `erfinv_` and `clamp_`. |
-| timm `VisionTransformer` 1.0.30 | **Source analysis only**; timm was not installed. [Constructor][capture-timm-vit], [drop-path schedule][capture-timm-drop], [initializer][capture-timm-init] | `linspace`, scalar reads and truncated normal are now supported, but tensor iteration in the drop-path schedule requires unsupported `unbind`. Skipping the final weight initializer does not skip this schedule. |
+| torchvision ResNet-18 / ResNet-50 | Standard models, `weights=None` | Passed |
+| HF `GPT2LMHeadModel` / `LlamaForCausalLM` | One layer, hidden size 16, two heads, vocabulary 32, sequence capacity 16 | Passed, including causal-mask / RoPE buffers |
+| HF `ViTModel` | One layer, hidden size 16, two heads, image size 16, patch size 8 | Passed, including truncated-normal initialization |
 
-All five runtime probes additionally compared buffers exactly with eager
-construction, repeated capture/replay with the same seed to compare tensor
-digests, and checked that CPU RNG state was preserved. These results establish
-initialization compatibility only for the tested configurations, not arbitrary
-variants or future library versions. A separate four-GPU CLI regression exercises
-generic trigonometric initialization, truncated normal, `nonzero` and `.item()`
-fallback, checks local initialization against captured references, and runs two
-training steps.
+These probes checked all parameter/buffer shapes, dtypes, finite values, seeded
+repeatability, eager buffer equality and CPU RNG restoration. They do **not**
+certify pretrained loading, full distributed execution, other configurations or
+equality with eager random weights.
 
-[capture-resnet]: https://github.com/pytorch/vision/blob/8ac84ee75afb1c327902156b5336f56ad63b7e2f/torchvision/models/resnet.py#L197
-[capture-gpt2]: https://github.com/huggingface/transformers/blob/753d61104116eefc8ffc977327b441ee0c8d599f/src/transformers/models/gpt2/modeling_gpt2.py#L156
-[capture-llama-rope]: https://github.com/huggingface/transformers/blob/753d61104116eefc8ffc977327b441ee0c8d599f/src/transformers/modeling_rope_utils.py#L123
-[capture-hf-vit]: https://github.com/huggingface/transformers/blob/753d61104116eefc8ffc977327b441ee0c8d599f/src/transformers/models/vit/modeling_vit.py#L389
-[capture-trunc-normal]: https://github.com/pytorch/pytorch/blob/449b1768410104d3ed79d3bcfe4ba1d65c7f22c0/torch/nn/init.py#L86
-[capture-timm-vit]: https://github.com/huggingface/pytorch-image-models/blob/0df212b369a5385b16dfe513d5143a7311ea1ddc/timm/models/vision_transformer.py#L840
-[capture-timm-drop]: https://github.com/huggingface/pytorch-image-models/blob/0df212b369a5385b16dfe513d5143a7311ea1ddc/timm/layers/drop.py#L215
-[capture-timm-init]: https://github.com/huggingface/pytorch-image-models/blob/0df212b369a5385b16dfe513d5143a7311ea1ddc/timm/layers/weight_init.py#L19
+timm `VisionTransformer` **1.0.30** was inspected but not run: its
+[drop-path schedule](https://github.com/huggingface/pytorch-image-models/blob/0df212b369a5385b16dfe513d5143a7311ea1ddc/timm/layers/drop.py#L215)
+iterates over a tensor, requiring unsupported `unbind`.
 
-### Custom shard initialization
+### Write a shard initializer
 
-The original class must define a staticmethod or classmethod named
-`__partial__init__` accepting only the attribute metadata map. Its keys are
-**generated attribute names**, and values describe the original name, full shape,
-local slices, dtype and `sub_shape`. Return a dictionary with the same keys and
-tensors of exactly `meta.dtype` and `meta.sub_shape`. The callback must initialize
-both parameters and buffers requested by the map. It receives only required
-attributes, not necessarily every attribute in the original model.
+Define `__shard__init__` on the original model class to replace automatic capture.
+It must be a staticmethod or classmethod callable with one positional metadata
+map. Additional optional arguments are allowed.
+
+Signature (shown as a staticmethod):
+
+```python
+from typing import Dict, Iterable, Tuple, Union
+import torch
+from nnscaler.runtime.module import AttrMeta
+
+@staticmethod
+def __shard__init__(
+    attr_meta_map: Dict[str, AttrMeta],
+) -> Union[Iterable[Tuple[str, torch.Tensor]], Dict[str, torch.Tensor]]:
+    ...
+```
+
+The map contains only the parameters and buffers requested by this rank.
+Its keys are **generated attribute names**; each `AttrMeta` provides `orig_name`,
+the full `shape`, local `slicers`, `sub_shape`, `dtype` and `val_chunks`.
+
+For example, this hook computes an `arange` weight's local slice directly from
+global coordinates, without allocating the full weight:
 
 ```python
 class Model(torch.nn.Module):
@@ -230,105 +158,69 @@ class Model(torch.nn.Module):
         self.weight = torch.nn.Parameter(torch.arange(64.0).reshape(8, 8))
 
     @staticmethod
-    def __partial__init__(attr_meta_map):
-        values = {}
+    def __shard__init__(attr_meta_map):
         for name, meta in attr_meta_map.items():
             if meta.orig_name != "weight":
                 raise ValueError(f"Unexpected attribute: {meta.orig_name}")
             row_slice, col_slice = meta.slicers
             rows = torch.arange(*row_slice.indices(meta.shape[0]), dtype=meta.dtype)
             cols = torch.arange(*col_slice.indices(meta.shape[1]), dtype=meta.dtype)
-            values[name] = rows[:, None] * meta.shape[1] + cols[None, :]
-            assert values[name].shape == meta.sub_shape
-        return values
+            value = rows[:, None] * meta.shape[1] + cols[None, :]
+            assert value.shape == meta.sub_shape
+            yield name, value
 
     def forward(self, x):
         return x @ self.weight
-
-config = nnscaler.ComputeConfig(
-    plan_ngpus=2, runtime_ngpus=2,
-    param_init_strategy=nnscaler.ParamInitStrategy.CUSTOM,
-)
 ```
 
-Use `meta.orig_name` and `meta.slicers` to implement attribute-specific initializers.
-Return the logical slice **before division by `val_chunks`**; the runtime applies
-value-partition scaling. The example computes the slice from global element
-coordinates without allocating the full tensor.
+The hook must follow three rules:
 
-**An attribute's values must not depend on which other keys are requested or their
-iteration order.** Resume requests only non-persistent buffers, and pipeline ranks
-request different maps. A fixed global seed does not satisfy this contract if a
-callback consumes random numbers sequentially while iterating the supplied map.
-Prefer constants, deterministic global-coordinate formulas, or stable
-per-logical-attribute random streams with consistent global element indexing.
-Do not use Python's process-randomized `hash()` to derive per-attribute seeds.
-Random initialization must give identical values to replicas and preserve
-consistent overlapping elements across sharding layouts; the replica checker
-does not validate overlaps between distinct layouts. The callback need not
-reproduce eager constructor values. The full constructor still runs during
-compilation.
+1. **Return exactly the requested tensors.** Yield each `(name, tensor)` once,
+   with real data of `meta.sub_shape` and `meta.dtype`. Yield values **before**
+   division by `val_chunks`; nnScaler applies that scaling. Invalid outputs raise
+   errors rather than falling back to capture.
+2. **Stream to save memory.** nnScaler copies each tensor before advancing the
+   iterator, so reusable scratch-buffer views are safe. A dictionary return is
+   also accepted, but retains all its tensors until consumed.
+3. **Make values independent of the requested subset and order.** Pipeline ranks
+   and checkpoint resume can request different maps. For random initialization,
+   use stable per-attribute seeds and global element coordinates, not one random
+   stream consumed in map order or Python's randomized `hash()`. Replicas and
+   overlapping slices must agree; values need not match the eager constructor.
 
-### Replica checking and checkpoint resume
+### Seeds and replica checking
 
-The CLI-only `debug.param_init_check=True` (default `True`) exchanges hashes,
-not weights, and requires bitwise equality without tolerance. The trainer checks
-the whole initialized model after optimizer construction, when all reducer buckets
-have been built, including buckets deferred for parameter classification.
-For non-file `ParallelModule` instances, parameters and buffers are compared only
-between identical logical shard replicas: the module path, original name, full
-shape, slices and value partition must match. For ZeRO-3 parameters, the retained
-flattened interval must also match; padding and empty intervals are excluded.
-The check reads local shards directly without reconstructing full parameters.
-Different or overlapping shards are
-not compared merely because they belong to the same original tensor. A shard used
-on only one rank has no replica to compare. In particular, ZeRO-3 initialization
-differences in data discarded during sharding cannot be detected by this check.
-File-backed `ParallelModule` instances
-are skipped. Ordinary module parameters and buffers are checked across all ranks.
-Mixed models, including multiple parallel modules, are supported; module paths
-keep tensors from different submodules distinct. Resume and compile-only runs skip
-this check. Direct `parallelize` and generated-module construction do not perform
-replica checking.
+`param_init_seed` defaults to `1234` and must be an integer in `[0, 2**32)`.
+It is independent of the CLI training `seed`. Constructor and hook execution,
+including generator iteration, runs in an isolated seed scope covering Python,
+NumPy, PyTorch CPU and the current CUDA device. Caller RNG states are restored,
+including on failure. Other CUDA devices and custom generators are not seeded.
+Constructors and hooks must still be deterministic and rank-independent.
 
-`init_params=False` skips parameter/persistent-buffer initialization.
-For checkpoint resume, `file` loads non-persistent buffers from
-`npbuffer.pt`; non-file strategies reconstruct just the needed non-persistent
-buffers through their source/callback path. Checkpoint parameters and persistent
-buffers are not overwritten. `model` may therefore still construct a full model
-on resume; `capture` materializes required buffer dependencies, and `custom`
-receives the buffer-only map.
-Load generated classes through `parallelize` to attach the original factory or
-custom callback. For `model`/`capture`, an original instance may instead be
-passed as `GeneratedModel(init_module=original_model)`. Ordinary tensor attributes
-converted into buffers by tracing must be available through their original names.
-For `model`/`capture`, tensors used by `forward` must therefore be exposed as
-source-model attributes or registered buffers. Tracer-only constants synthesized
-from globals or forward-local tensors cannot be reconstructed by looking up the
-original model; use `file` or provide them through `custom` initialization instead.
+The CLI trainer enables `debug.param_init_check` by default to compare hashes of
+replicated weights with **bitwise equality**. This is not a check of overlapping
+but different shards, nor is it run by direct `parallelize` calls. See
+[Trainer Debug Config](./trainer.md#debug-config) for its scope and limitations,
+and [Trainer Compute Config](./trainer.md#compute-config) for a YAML example.
 
-CLI configuration:
+### Loading, resume and generated-code reuse
 
-```yaml
-compute_config:
-  param_init_strategy: capture
-  param_init_seed: 1234
-debug:
-  param_init_check: true
-seed: 1234
-```
-
-The equivalent CLI overrides are `--compute_config.param_init_strategy capture`,
-`--debug.param_init_check true` and `--compute_config.param_init_seed 1234`.
-Changing between file-backed and independent initialization, or changing the
-initialization seed for any strategy, requires retracing (use `gen_reuse: moo` or a
-fresh generated-code directory). Constructor randomness can change model structure,
-not just tensor values. Switching between non-file strategies with the same seed
-can reuse the graph, though the generated configuration is updated. The CLI-only
-`debug.param_init_check` does not affect generated code or graph reuse.
-As with other configuration changes, `moo` cannot replace generated code
-already imported in the current process; use a fresh process or instance name.
-Missing `npbuffer.pt` invalidates only file-backed caches.
+- **Loading:** Use `parallelize` to attach the original factory or shard hook to
+  a generated class, or pass `init_module` when constructing it. `full` and
+  automatic capture require tensors to be available by their original attribute
+  names, including tensor attributes promoted to buffers by tracing. For
+  forward-local or global constants synthesized by the tracer, use `file` or
+  supply them through a shard hook.
+- **Checkpoint resume:** `init_params=False` initializes only non-persistent
+  buffers, leaving parameters and persistent buffers for checkpoint loading.
+  `file` reads `npbuffer.pt`; `full` may still construct a full model; `shard`
+  receives a buffer-only map and initializes those buffers and any dependencies.
+- **Cache reuse:** Switching between `file` and a non-file strategy, or changing
+  `param_init_seed`, requires retracing (`gen_reuse: moo` or a fresh generated-code
+  directory). Switching between `full` and `shard` with the same seed can reuse
+  the graph. `debug.param_init_check` does not affect generated code. If generated
+  code is already imported, use a fresh process or instance name; `moo` cannot
+  replace an imported module.
 
 ## Examples
 

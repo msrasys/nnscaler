@@ -26,10 +26,8 @@ from tests.parallel_module.common import assert_equal
 
 
 STRATEGIES = (
-    ParamInitStrategy.FILE, ParamInitStrategy.MODEL,
-    ParamInitStrategy.CAPTURE, ParamInitStrategy.CUSTOM,
+    ParamInitStrategy.FILE, ParamInitStrategy.FULL, ParamInitStrategy.SHARD,
 )
-NON_FILE_STRATEGIES = tuple(s for s in STRATEGIES if s != ParamInitStrategy.FILE)
 
 
 def _assert_tensor_identical(actual, expected):
@@ -43,7 +41,6 @@ def _assert_tensor_identical(actual, expected):
 class InitModel(torch.nn.Module):
     initial_parameters = {}
     constructions = 0
-    partial_requests = []
 
     def __init__(self, dim=16, nlayers=16, mismatch=''):
         super().__init__()
@@ -71,41 +68,6 @@ class InitModel(torch.nn.Module):
                     self.constant.add_(1)
         type(self).initial_parameters = dict(self.named_parameters(remove_duplicate=False))
 
-    @staticmethod
-    def __partial__init__(attr_meta_map):
-        InitModel.partial_requests.append(dict(attr_meta_map))
-        requested = {meta.orig_name for meta in attr_meta_map.values()}
-        tensors = {}
-        # Reuse one scratch matrix to advance the eager Linear initialization stream.
-        # Only requested tensors (and the derived buffer's dependency) are retained.
-        scratch = torch.empty(16, 16)
-        for index in range(16):
-            torch.nn.init.kaiming_uniform_(scratch, a=math.sqrt(5))
-            name = f'layers.{index}.weight'
-            if name in requested:
-                tensors[name] = scratch.clone()
-            if index == 0:
-                if 'shared.weight' in requested:
-                    tensors['shared.weight'] = scratch.clone()
-                if 'derived' in requested:
-                    tensors['derived'] = scratch[0].clone()
-        scale = random.random() + np.random.rand()
-        offset = torch.rand(16)
-        if 'scale' in requested:
-            tensors['scale'] = torch.full((16,), scale)
-        if 'offset' in requested:
-            tensors['offset'] = offset
-        if 'scalar' in requested:
-            tensors['scalar'] = torch.tensor([0.125], dtype=torch.float64)
-        if 'constant' in requested:
-            tensors['constant'] = torch.tensor([0.25])
-        result = {
-            attr: tensors[meta.orig_name][meta.slicers].to(dtype=meta.dtype).clone()
-            for attr, meta in attr_meta_map.items()
-        }
-        assert all(tuple(result[attr].shape) == meta.sub_shape for attr, meta in attr_meta_map.items())
-        return result
-
     def forward(self, data):
         x = self.shared(data['data'])
         for layer in self.layers:
@@ -113,6 +75,53 @@ class InitModel(torch.nn.Module):
         x = x * self.scale + self.offset + self.scalar.float() + self.derived
         x = x + self.constant
         return self.loss_fn(torch.sigmoid(x.float()), data['target'].float())
+
+
+class HookInitModel(InitModel):
+    shard_requests = []
+
+    @staticmethod
+    def __shard__init__(attr_meta_map):
+        HookInitModel.shard_requests.append(dict(attr_meta_map))
+
+        def shards(orig_name, tensor):
+            for attr, meta in attr_meta_map.items():
+                if meta.orig_name == orig_name:
+                    value = tensor[meta.slicers].to(dtype=meta.dtype)
+                    assert tuple(value.shape) == meta.sub_shape
+                    yield attr, value
+
+        # Reuse one scratch matrix to advance the eager Linear initialization stream.
+        # Each yielded view must be copied before the next initialization overwrites it.
+        scratch = torch.empty(16, 16)
+        for index in range(16):
+            torch.nn.init.kaiming_uniform_(scratch, a=math.sqrt(5))
+            yield from shards(f'layers.{index}.weight', scratch)
+            if index == 0:
+                yield from shards('shared.weight', scratch)
+                yield from shards('derived', scratch[0])
+        scale = random.random() + np.random.rand()
+        offset = torch.rand(16)
+        yield from shards('scale', torch.full((16,), scale))
+        yield from shards('offset', offset)
+        yield from shards('scalar', torch.tensor([0.125], dtype=torch.float64))
+        yield from shards('constant', torch.tensor([0.25]))
+
+
+class ClassmethodHookInitModel(HookInitModel):
+    @classmethod
+    def __shard__init__(cls, attr_meta_map):
+        assert cls is ClassmethodHookInitModel
+        yield from super().__shard__init__(attr_meta_map)
+
+
+INIT_CASES = (
+    (ParamInitStrategy.FILE, InitModel),
+    (ParamInitStrategy.FULL, InitModel),
+    (ParamInitStrategy.SHARD, InitModel),
+    (ParamInitStrategy.SHARD, HookInitModel),
+)
+NON_FILE_CASES = tuple(case for case in INIT_CASES if case[0] != ParamInitStrategy.FILE)
 
 
 class RandomInitModel(InitModel):
@@ -161,11 +170,12 @@ def init_dummy_sample(args):
     }
 
 
-def _args(save_dir, strategy, *, checked=False, policy='tp', zero=0, mismatch=''):
-    name = f'{strategy}-{checked}'
+def _args(save_dir, strategy, *, checked=False, policy='tp', zero=0, mismatch='',
+          model_class=InitModel):
+    name = f'{strategy}-{model_class.__name__}-{checked}'
     return [
         '-f', str(Path(__file__).with_name('trainer_args.yaml')),
-        '--model.type', f'{__name__}.InitModel',
+        '--model.type', f'{__name__}.{model_class.__name__}',
         '--model.args.nlayers', '16',
         '--model.args.mismatch', mismatch,
         '--dummy_sample_gen_fn', f'{__name__}.init_dummy_sample',
@@ -191,17 +201,17 @@ def _args(save_dir, strategy, *, checked=False, policy='tp', zero=0, mismatch=''
     ]
 
 
-def _reference(strategy, seed=1234, mismatch=''):
-    factory = lambda: InitModel(mismatch=mismatch)
-    if strategy == ParamInitStrategy.CAPTURE:
+def _reference(strategy, seed=1234, mismatch='', model_class=InitModel):
+    factory = lambda: model_class(mismatch=mismatch)
+    if strategy == ParamInitStrategy.SHARD and not hasattr(model_class, '__shard__init__'):
         with DeferredInitialization() as capture:
-            model = create_init_module(InitModel, factory, None, seed=seed)
+            model = create_init_module(model_class, factory, None, seed=seed)
         return {
             name: capture.materialize(value)
             for name, value in list(model.named_parameters(remove_duplicate=False))
             + list(model.named_buffers(remove_duplicate=False)) + [('constant', model.constant)]
         }
-    model = create_init_module(InitModel, factory, None, seed=seed)
+    model = create_init_module(model_class, factory, None, seed=seed)
     return {
         name: value.detach().clone()
         for name, value in list(model.named_parameters(remove_duplicate=False))
@@ -233,18 +243,19 @@ def _assert_artifacts(model, strategy):
 def _worker_parity(save_dir, policy, zero):
     save_dir = Path(save_dir)
     results = {}
-    cases = [(s, True) for s in STRATEGIES] + [(ParamInitStrategy.CAPTURE, False)]
-    for strategy, checked in cases:
-        cli_args = _args(save_dir, strategy, checked=checked, policy=policy, zero=zero)
-        expected = _reference(strategy)
+    cases = [(s, cls, True) for s, cls in INIT_CASES] + [(ParamInitStrategy.SHARD, InitModel, False)]
+    for strategy, model_class, checked in cases:
+        cli_args = _args(save_dir, strategy, checked=checked, policy=policy, zero=zero,
+                         model_class=model_class)
+        expected = _reference(strategy, model_class=model_class)
         _assert_tensor_identical(expected['derived'], expected['layers.0.weight'][0])
         original_build = ParallelModule.build_buckets
-        InitModel.partial_requests = []
+        HookInitModel.shard_requests = []
 
         def checked_build(model, *args, **kwargs):
             _assert_initialized(model, expected)
-            if strategy == ParamInitStrategy.CUSTOM:
-                assert InitModel.partial_requests == ([model.fullmap] if model.fullmap else [])
+            if model_class is HookInitModel:
+                assert HookInitModel.shard_requests == ([model.fullmap] if model.fullmap else [])
             return original_build(model, *args, **kwargs)
 
         with ExitStack() as stack:
@@ -261,12 +272,14 @@ def _worker_parity(save_dir, policy, zero):
         assert trainer.train_status.finished_train_steps == 2
         _assert_artifacts(trainer.model, strategy)
         if trainer.rank == 0:
-            checkpoint_dir = save_dir / f'ckpt-{strategy}-{checked}' / 'last'
-            results[strategy, checked] = Trainer._merge_checkpoint(list(checkpoint_dir.glob('*.ckpt')))
+            checkpoint_dir = save_dir / f'ckpt-{strategy}-{model_class.__name__}-{checked}' / 'last'
+            results[strategy, model_class, checked] = Trainer._merge_checkpoint(
+                list(checkpoint_dir.glob('*.ckpt')),
+            )
         torch.distributed.barrier()
 
-        before = InitModel.constructions
-        InitModel.partial_requests = []
+        before = model_class.constructions
+        HookInitModel.shard_requests = []
         resumed = Trainer([*cli_args, '--max_train_steps', '3', '--checkpoint.resume_from', 'last'])
         original_initialize = ParallelModule._init_from_module
         resume_initializations = []
@@ -284,12 +297,12 @@ def _worker_parity(save_dir, policy, zero):
 
         def checked_resume_build(model, *args, **kwargs):
             _assert_initialized(model, expected, non_persistent_only=True)
-            if strategy == ParamInitStrategy.CUSTOM:
+            if model_class is HookInitModel:
                 np_meta_map = {
                     attr: meta for attr, meta in model.fullmap.items()
                     if attr in model.get_non_persistent_buffers()
                 }
-                assert InitModel.partial_requests == ([np_meta_map] if np_meta_map else [])
+                assert HookInitModel.shard_requests == ([np_meta_map] if np_meta_map else [])
                 assert all(not meta.is_param for meta in np_meta_map.values())
             return original_build(model, *args, **kwargs)
 
@@ -303,17 +316,17 @@ def _worker_parity(save_dir, policy, zero):
                 'nnscaler.cli.trainer.check_param_init',
                 side_effect=AssertionError('resume checked checkpoint initialization'),
             ))
-            if strategy in (ParamInitStrategy.FILE, ParamInitStrategy.CUSTOM):
+            if strategy == ParamInitStrategy.FILE or model_class is HookInitModel:
                 stack.enter_context(patch.object(
-                    InitModel, '__init__', side_effect=AssertionError('unexpected source construction'),
+                    model_class, '__init__', side_effect=AssertionError('unexpected source construction'),
                 ))
             if strategy != ParamInitStrategy.FILE:
                 stack.enter_context(patch.object(
                     ParallelModule, 'load_np_buffer_content', side_effect=AssertionError('resume read npbuffer'),
                 ))
             resumed.run()
-        assert InitModel.constructions == before + (
-            strategy in (ParamInitStrategy.MODEL, ParamInitStrategy.CAPTURE)
+        assert model_class.constructions == before + (
+            strategy != ParamInitStrategy.FILE and model_class is InitModel
             and bool(resumed.model.get_non_persistent_buffers())
         )
         assert resumed.train_status.finished_train_steps == 3
@@ -323,12 +336,12 @@ def _worker_parity(save_dir, policy, zero):
 
     if torch.distributed.get_rank() == 0:
         for key in ('model', 'optimizer'):
-            assert_equal(results[ParamInitStrategy.FILE, True][key],
-                         results[ParamInitStrategy.MODEL, True][key])
-            assert_equal(results[ParamInitStrategy.MODEL, True][key],
-                         results[ParamInitStrategy.CUSTOM, True][key])
-            assert_equal(results[ParamInitStrategy.CAPTURE, True][key],
-                         results[ParamInitStrategy.CAPTURE, False][key])
+            assert_equal(results[ParamInitStrategy.FILE, InitModel, True][key],
+                         results[ParamInitStrategy.FULL, InitModel, True][key])
+            assert_equal(results[ParamInitStrategy.FULL, InitModel, True][key],
+                         results[ParamInitStrategy.SHARD, HookInitModel, True][key])
+            assert_equal(results[ParamInitStrategy.SHARD, InitModel, True][key],
+                         results[ParamInitStrategy.SHARD, InitModel, False][key])
 
 
 @pytest.mark.skipif(torch.cuda.device_count() < 4, reason='requires four GPUs')
@@ -337,28 +350,30 @@ def test_cli_param_init_parity(tmp_path, policy, zero):
     launch_torchrun(4, _worker_parity, tmp_path, policy, zero)
 
 
-def _worker_mismatch(save_dir, strategy, mismatch):
-    original_partial = InitModel.__partial__init__
+def _worker_mismatch(save_dir, strategy, model_class, mismatch):
+    original_hook = HookInitModel.__shard__init__
 
-    def mismatched_partial(meta_map):
-        values = original_partial(meta_map)
-        if torch.distributed.get_rank() == 2:
-            for name, meta in meta_map.items():
+    def mismatched_hook(meta_map):
+        for name, value in original_hook(meta_map):
+            value = value.clone()
+            meta = meta_map[name]
+            if torch.distributed.get_rank() == 2:
                 if mismatch == 'weight' and meta.is_param:
-                    values[name].add_(1)
+                    value.add_(1)
                 elif mismatch == 'buffer' and meta.orig_name == 'scalar':
-                    values[name].add_(2 ** -45)
+                    value.add_(2 ** -45)
                 elif mismatch == 'non_persistent' and meta.orig_name in ('offset', 'constant'):
-                    values[name].add_(1)
-        return values
+                    value.add_(1)
+            yield name, value
 
-    with patch.object(InitModel, '__partial__init__', staticmethod(mismatched_partial)):
-        trainer = Trainer(_args(Path(save_dir), strategy, checked=True, mismatch=mismatch))
+    with patch.object(HookInitModel, '__shard__init__', staticmethod(mismatched_hook)):
+        trainer = Trainer(_args(Path(save_dir), strategy, checked=True, mismatch=mismatch,
+                                model_class=model_class))
         with pytest.raises(RuntimeError, match='initialization differs across ranks'):
             trainer.run()
         # Rank 2 is a replica of rank 0, not simply a different TP shard.
         torch.distributed.barrier()
-        unchecked = Trainer(_args(Path(save_dir), strategy, mismatch=mismatch))
+        unchecked = Trainer(_args(Path(save_dir), strategy, mismatch=mismatch, model_class=model_class))
         with patch('nnscaler.cli.trainer.check_param_init',
                    side_effect=AssertionError('disabled param_init_check compared weights')):
             unchecked.run()
@@ -366,15 +381,15 @@ def _worker_mismatch(save_dir, strategy, mismatch):
 
 
 @pytest.mark.skipif(torch.cuda.device_count() < 4, reason='requires four GPUs')
-@pytest.mark.parametrize('strategy', ['model', 'capture', 'custom'])
+@pytest.mark.parametrize('strategy,model_class', NON_FILE_CASES)
 @pytest.mark.parametrize('mismatch', ['weight', 'buffer', 'non_persistent'])
-def test_cli_param_init_mismatch(tmp_path, strategy, mismatch):
-    launch_torchrun(4, _worker_mismatch, tmp_path, strategy, mismatch)
+def test_cli_param_init_mismatch(tmp_path, strategy, model_class, mismatch):
+    launch_torchrun(4, _worker_mismatch, tmp_path, strategy, model_class, mismatch)
 
 
 def _worker_source_buffers(save_dir):
     nnscaler.init()
-    for strategy in (ParamInitStrategy.MODEL, ParamInitStrategy.CAPTURE):
+    for strategy in (ParamInitStrategy.FULL, ParamInitStrategy.SHARD):
         # Independently random NP buffers follow this strategy's stream, while derived
         # buffers must agree with its own weight (never an eager/captured mixture).
         expected = _reference(strategy, mismatch='non_persistent')
@@ -399,8 +414,10 @@ def test_cli_param_init_source_buffers(tmp_path):
 
 def _worker_source_instance(save_dir):
     nnscaler.init()
-    for strategy in (ParamInitStrategy.MODEL, ParamInitStrategy.CAPTURE):
-        source = create_init_module(InitModel, None, None, seed=1234)
+    cases = (*NON_FILE_CASES, (ParamInitStrategy.SHARD, ClassmethodHookInitModel),
+             (ParamInitStrategy.FULL, HookInitModel))
+    for strategy, model_class in cases:
+        source = create_init_module(model_class, None, None, seed=1234)
         with torch.no_grad():
             for tensor in source.parameters():
                 tensor.add_(0.75)
@@ -412,8 +429,9 @@ def _worker_source_instance(save_dir):
             for name, value in list(source.named_parameters(remove_duplicate=False))
             + list(source.named_buffers(remove_duplicate=False)) + [('constant', source.constant)]
         }
+        HookInitModel.shard_requests = []
         with patch.object(
-            InitModel, '__init__', side_effect=AssertionError('recreated supplied instance'),
+            model_class, '__init__', side_effect=AssertionError('recreated supplied instance'),
         ), patch.object(
             DeferredInitialization, 'materialize', side_effect=AssertionError('replayed supplied tensor'),
         ):
@@ -422,11 +440,12 @@ def _worker_source_instance(save_dir):
                 {'data': {'data': torch.ones(2, 16), 'target': torch.full((2, 16), 0.5)}},
                 'tp',
                 ComputeConfig(2, 4, param_init_strategy=strategy),
-                gen_savedir=Path(save_dir) / strategy,
+                gen_savedir=Path(save_dir) / f'{strategy}-{model_class.__name__}',
                 build_module_buckets=False,
             )
         _assert_initialized(model, expected)
         _assert_artifacts(model, strategy)
+        assert HookInitModel.shard_requests == []
 
 
 @pytest.mark.skipif(torch.cuda.device_count() < 4, reason='requires four GPUs')
@@ -435,7 +454,7 @@ def test_cli_param_init_source_instance(tmp_path):
 
 
 def _worker_selective_initialization(save_dir):
-    trainer = Trainer(_args(Path(save_dir), ParamInitStrategy.CAPTURE, policy='hybrid', checked=True))
+    trainer = Trainer(_args(Path(save_dir), ParamInitStrategy.SHARD, policy='hybrid', checked=True))
     materialized = []
     storages = []
     original_materialize = DeferredInitialization.materialize
@@ -476,7 +495,7 @@ def _worker_random_initialization(save_dir, model_class):
         for name, value in list(source.named_parameters(remove_duplicate=False))
         + list(source.named_buffers(remove_duplicate=False)) + [('constant', source.constant)]
     }
-    args = _args(Path(save_dir), ParamInitStrategy.CAPTURE, checked=True)
+    args = _args(Path(save_dir), ParamInitStrategy.SHARD, checked=True)
     args += ['--model.type', f'{__name__}.{model_class.__name__}']
     original_build = ParallelModule.build_buckets
 
@@ -488,7 +507,7 @@ def _worker_random_initialization(save_dir, model_class):
         trainer = Trainer(args)
         trainer.run()
     assert trainer.train_status.finished_train_steps == 2
-    _assert_artifacts(trainer.model, ParamInitStrategy.CAPTURE)
+    _assert_artifacts(trainer.model, ParamInitStrategy.SHARD)
 
 
 @pytest.mark.skipif(torch.cuda.device_count() < 4, reason='requires four GPUs')
@@ -507,7 +526,7 @@ class UnsupportedInitModel(InitModel):
 
 def _worker_capture_failure(save_dir):
     trainer = Trainer([
-        *_args(Path(save_dir), ParamInitStrategy.CAPTURE, checked=True),
+        *_args(Path(save_dir), ParamInitStrategy.SHARD, checked=True),
         '--model.type', f'{__name__}.UnsupportedInitModel',
     ])
     trainer.run()
@@ -520,16 +539,15 @@ def test_cli_capture_failure_propagates(tmp_path):
     assert 1 in exc.value.failures
 
 
-def _worker_custom_contract(save_dir):
-    cli_args = _args(Path(save_dir), ParamInitStrategy.CUSTOM, checked=True)
+def _worker_shard_contract(save_dir):
+    cli_args = _args(Path(save_dir), ParamInitStrategy.SHARD, checked=True, model_class=HookInitModel)
     Trainer([*cli_args, '--run_mode', 'compile']).run()
-    valid_hook = InitModel.__partial__init__
+    valid_hook = HookInitModel.__shard__init__
+    closed = []
 
     def invalid_hook(meta_map, case):
-        result = valid_hook(meta_map)
+        result = {name: value.clone() for name, value in valid_hook(meta_map)}
         name = next(iter(result))
-        if case == 'result':
-            return list(result.values())
         if case == 'missing':
             result.pop(name)
         elif case == 'extra':
@@ -542,33 +560,59 @@ def _worker_custom_contract(save_dir):
             result[name] = result[name].to(torch.int64)
         elif case == 'meta':
             result[name] = torch.empty_like(result[name], device='meta')
-        return result
+        try:
+            if case == 'malformed':
+                yield (name,)
+            elif case == 'duplicate':
+                yield name, result[name]
+            yield from result.items()
+        finally:
+            closed.append(case)
 
-    for case in ('absent', 'hook', 'non_static', 'result', 'missing', 'extra', 'type', 'shape', 'dtype', 'meta'):
+    for case in ('hook', 'non_static', 'result', 'malformed', 'duplicate', 'missing',
+                 'extra', 'type', 'shape', 'dtype', 'meta'):
         trainer = Trainer(cli_args)
         hook = (
             None if case == 'hook' else
             (lambda self, meta_map: valid_hook(meta_map)) if case == 'non_static' else
+            staticmethod(lambda meta_map: 42) if case == 'result' else
             staticmethod(lambda meta_map: invalid_hook(meta_map, case))
         )
-        with patch.object(InitModel, '__partial__init__', hook), patch.object(
-            InitModel, '__init__', side_effect=AssertionError('custom constructed source'),
+        with patch.object(HookInitModel, '__shard__init__', hook), patch.object(
+            HookInitModel, '__init__', side_effect=AssertionError('hook constructed source'),
         ):
-            if case == 'absent':
-                del InitModel.__partial__init__
-            with pytest.raises((RuntimeError, ValueError, TypeError), match='partial|initialization'):
+            error_type = TypeError if case == 'result' else (RuntimeError, ValueError, TypeError)
+            message = 'not iterable' if case == 'result' else 'shard|initialization'
+            with pytest.raises(error_type, match=message):
                 trainer.run()
+        if case not in ('hook', 'non_static', 'result'):
+            assert closed[-1:] == [case]
         torch.distributed.barrier()
-    trainer = Trainer(cli_args)
-    with patch.object(InitModel, '__init__', side_effect=AssertionError('custom constructed source')):
-        trainer.run()
-    _assert_artifacts(trainer.model, ParamInitStrategy.CUSTOM)
-    assert trainer.train_status.finished_train_steps == 2
+    expected = _reference(ParamInitStrategy.SHARD, model_class=HookInitModel)
+    original_build = ParallelModule.build_buckets
+
+    def checked_build(model, *args, **kwargs):
+        _assert_initialized(model, expected)
+        return original_build(model, *args, **kwargs)
+
+    def dict_hook(meta_map):
+        return {name: value.clone() for name, value in valid_hook(meta_map)}
+
+    for hook in (valid_hook, dict_hook):
+        trainer = Trainer(cli_args)
+        with patch.object(
+            HookInitModel, '__shard__init__', staticmethod(hook),
+        ), patch.object(
+            HookInitModel, '__init__', side_effect=AssertionError('hook constructed source'),
+        ), patch.object(ParallelModule, 'build_buckets', checked_build):
+            trainer.run()
+        _assert_artifacts(trainer.model, ParamInitStrategy.SHARD)
+        assert trainer.train_status.finished_train_steps == 2
 
 
 @pytest.mark.skipif(torch.cuda.device_count() < 4, reason='requires four GPUs')
-def test_cli_custom_param_init_contract(tmp_path):
-    launch_torchrun(4, _worker_custom_contract, tmp_path)
+def test_cli_shard_param_init_contract(tmp_path):
+    launch_torchrun(4, _worker_shard_contract, tmp_path)
 
 
 def _worker_broadcast(save_dir):
@@ -577,19 +621,19 @@ def _worker_broadcast(save_dir):
     nnscaler.init()
     rank = torch.distributed.get_rank()
     save_dir = Path(save_dir)
-    for strategy in NON_FILE_STRATEGIES:
+    for strategy, model_class in NON_FILE_CASES:
         cli_args = [
-            *_args(save_dir, strategy, checked=True),
+            *_args(save_dir, strategy, checked=True, model_class=model_class),
             '--gen_savedir', str(save_dir / f'node{rank // 2}' / 'gen'),
             '--precision', 'bf16',
         ]
         Trainer([*cli_args, '--run_mode', 'compile']).run()
-        before = InitModel.constructions
+        before = model_class.constructions
         trainer = Trainer(cli_args)
         with patch.object(ParallelModule, 'load_attr_content', side_effect=AssertionError('fullmodel read')):
             trainer.run()
-        assert InitModel.constructions == before + (
-            strategy != ParamInitStrategy.CUSTOM and bool(trainer.model.fullmap)
+        assert model_class.constructions == before + (
+            model_class is InitModel and bool(trainer.model.fullmap)
         )
         _assert_artifacts(trainer.model, strategy)
         assert all(p.dtype == torch.bfloat16 for p in trainer.model.parameters())
@@ -603,7 +647,7 @@ def test_cli_param_init_broadcast(tmp_path):
 
 def _worker_mixed(save_dir):
     save_dir = Path(save_dir)
-    for strategy in (ParamInitStrategy.MODEL, ParamInitStrategy.CAPTURE):
+    for strategy in (ParamInitStrategy.FULL, ParamInitStrategy.SHARD):
         trainer = Trainer([
             '-f', str(Path(__file__).with_name('trainer_args_mixed1.yaml')),
             '--compute_config.param_init_strategy', strategy,
@@ -639,11 +683,11 @@ def skew_initialization_rng(trainer):
 
 def _worker_init_seed(save_dir):
     nnscaler.init()
-    for index, strategy in enumerate(NON_FILE_STRATEGIES):
+    for index, (strategy, model_class) in enumerate(NON_FILE_CASES):
         seed = 97 + index
-        expected = _reference(strategy, seed)
+        expected = _reference(strategy, seed, model_class=model_class)
         trainer = Trainer([
-            *_args(Path(save_dir), strategy, checked=True),
+            *_args(Path(save_dir), strategy, checked=True, model_class=model_class),
             '--compute_config.param_init_seed', str(seed),
             '--init_env_fn', f'{__name__}.skew_initialization_rng',
         ])

@@ -3,7 +3,8 @@
 
 import functools
 import pickle
-from typing import Callable, List, Set, Dict, Tuple, Optional, TYPE_CHECKING, Any, Union, ClassVar
+from contextlib import closing
+from typing import Callable, List, Set, Dict, Tuple, Optional, TYPE_CHECKING, Any, Union, ClassVar, Generator
 from typing_extensions import Self
 import logging
 import os
@@ -1189,10 +1190,11 @@ class ParallelModule(CubeModule):
     # function to initialize the module, should return an instance of the original Module
     # will be assigned when parallel module is loaded via `parallelize`
     _init_module_fn: ClassVar[Optional[Callable[[], torch.nn.Module]]] = None
-    # function to partially initialize the module,
-    # should return a dictionary mapping from attribute names to tensors
+    # optional seeded wrapper yielding user-initialized local tensors with generated attribute names
     # will be assigned when parallel module is loaded via `parallelize`
-    _partial_init_fn: ClassVar[Optional[Callable[[Dict[str, AttrMeta]], Dict[str, torch.Tensor]]]] = None
+    _shard_init_fn: ClassVar[
+        Optional[Callable[[Dict[str, AttrMeta]], Generator[Tuple[str, torch.Tensor], None, None]]]
+    ] = None
 
     def __init__(self):
         if self.__class__  == ParallelModule:  # not init via super().__init__()
@@ -1337,7 +1339,7 @@ class ParallelModule(CubeModule):
             self.build_buckets()
 
     def _init_from_module(self, module: Optional[torch.nn.Module], *, init_params: bool = True) -> None:
-        from nnscaler.runtime.initialization import DeferredInitialization
+        from nnscaler.runtime.initialization import capture_init_weights
         from nnscaler.parallel import ParamInitStrategy
 
         attrs = {
@@ -1348,36 +1350,41 @@ class ParallelModule(CubeModule):
             return
 
         strategy = self.compute_config.param_init_strategy
-        if strategy == ParamInitStrategy.CUSTOM:
-            initializer = type(self)._partial_init_fn
+        if strategy == ParamInitStrategy.SHARD and module is None:
+            initializer = type(self)._shard_init_fn
             if initializer is None:
-                raise RuntimeError("custom initialization requires parallelize() with the original module.")
-            values = initializer(dict(attrs))
-            if not isinstance(values, dict):
-                raise RuntimeError("__partial__init__ must return a dictionary of local tensors.")
-            if values.keys() != attrs.keys():
-                missing = sorted(set(attrs) - set(values))
-                unexpected = sorted(repr(key) for key in set(values) - set(attrs))
-                raise RuntimeError(
-                    f"Invalid __partial__init__ result: missing attributes {missing}, "
-                    f"unexpected attributes {unexpected}."
+                initializer = functools.partial(
+                    capture_init_weights, module_fn=type(self)._init_module_fn, module=module,
                 )
-            with torch.no_grad():
-                for attr, meta in attrs.items():
-                    value = values[attr]
+            seen = set()
+            with torch.no_grad(), closing(initializer(dict(attrs))) as values:
+                for item in values:
+                    if not isinstance(item, (tuple, list)) or len(item) != 2:
+                        raise RuntimeError("__shard__init__ must yield (attribute_name, tensor) pairs.")
+                    attr, value = item
+                    if not isinstance(attr, str) or attr not in attrs:
+                        raise RuntimeError(f"Invalid __shard__init__ result: unexpected attributes [{attr!r}].")
+                    if attr in seen:
+                        raise RuntimeError(f"Invalid __shard__init__ result: duplicate attribute {attr!r}.")
+                    meta = attrs[attr]
                     target = getattr(self, attr)
                     if (
                         not isinstance(value, torch.Tensor) or value.is_meta
                         or value.shape != target.shape or value.dtype != target.dtype
                     ):
                         raise RuntimeError(
-                            f"Invalid __partial__init__ tensor for {attr}: "
+                            f"Invalid __shard__init__ tensor for {attr}: "
                             f"expected shape {tuple(target.shape)} and dtype {target.dtype}."
                         )
                     target.copy_(value if meta.val_chunks == 1 else value / meta.val_chunks)
+                    seen.add(attr)
+                    # Do not retain the previous view while requesting the next full producer.
+                    del item, value
+                missing = sorted(set(attrs) - seen)
+                if missing:
+                    raise RuntimeError(f"Invalid __shard__init__ result: missing attributes {missing}.")
             return
 
-        capture = None
         if module is None:
             factory = type(self)._init_module_fn
             if factory is None:
@@ -1385,40 +1392,25 @@ class ParallelModule(CubeModule):
                     "Independent initialization requires parallelize() with the original "
                     "module class/module_fn, or an init_module instance."
                 )
-            if strategy == ParamInitStrategy.CAPTURE:
-                with DeferredInitialization() as capture:
-                    module = factory()
-            else:
-                module = factory()
-
-        # Group by source identity so shared weights are materialized once, copied to
-        # all local slices, then released before materializing the next source tensor.
-        source_attrs = {}
-        for attr, meta in attrs.items():
-            source = get_member_by_name(module, meta.orig_name)
-            if (
-                not isinstance(source, torch.Tensor)
-                or tuple(source.shape) != tuple(meta.shape)
-                or source.dtype != meta.dtype
-            ):
-                raise RuntimeError(
-                    f"Invalid initialization tensor for {meta.orig_name}: "
-                    f"expected shape {meta.shape} and dtype {meta.dtype}."
-                )
-            if id(source) not in source_attrs:
-                source_attrs[id(source)] = (source, [])
-            source_attrs[id(source)][1].append((attr, meta))
+            module = factory()
 
         with torch.no_grad():
-            for source, entries in source_attrs.values():
-                value = source if capture is None else capture.materialize(source)
-                for attr, meta in entries:
-                    content = value[meta.slicers]
-                    if meta.val_chunks != 1:
-                        content = content / meta.val_chunks
-                    getattr(self, attr).copy_(content)
-                    del content
-                del value
+            for attr, meta in attrs.items():
+                source = get_member_by_name(module, meta.orig_name)
+                if (
+                    not isinstance(source, torch.Tensor)
+                    or tuple(source.shape) != tuple(meta.shape)
+                    or source.dtype != meta.dtype
+                ):
+                    raise RuntimeError(
+                        f"Invalid initialization tensor for {meta.orig_name}: "
+                        f"expected shape {meta.shape} and dtype {meta.dtype}."
+                    )
+                content = source[meta.slicers]
+                if meta.val_chunks != 1:
+                    content = content / meta.val_chunks
+                getattr(self, attr).copy_(content)
+                del content
 
     def build_buckets(self, param_clss: Optional[dict[torch.nn.Parameter, Any]]=None):
         """

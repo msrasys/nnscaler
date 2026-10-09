@@ -48,7 +48,7 @@ from nnscaler.ir.unique import IDGenerator
 from nnscaler.runtime.adapter.reducer import Bucket, Reducer, ParamBucketConfig
 from nnscaler.runtime.device import DeviceGroup
 from nnscaler.runtime.initialization import (
-    create_init_module, create_partial_init_weights,
+    create_init_module, create_shard_init_weights,
 )
 from nnscaler.runtime.gnorm import calcuate_gnorm, clip_grads
 from nnscaler.runtime.module import (
@@ -101,17 +101,14 @@ class ParamInitStrategy:
     Parameter initialization strategy type
     Possible values are:
     'file'     : load parameters from fullmodel.pt
-    'model'    : load its parameters from the model itself (the model will be created internally)
-    'capture'  : capture parameters via `TorchDispatchMode`.
-                 Note in current implementation, all work will be done in `cpu`,
-                 and this may not capture all parameters accurately.
-    'custom'   : use the original module's `__partial__init__(attr_meta_map: Dict[str, AttrMeta])` method
-                 if `capture` doesn't meet your requirement.
+    'full'     : initialize a full original model and copy its local parameter slices.
+    'shard'    : use the original module's `__shard__init__(attr_meta_map)` method
+                 when defined, otherwise capture construction via `TorchDispatchMode`
+                 and replay required tensors on CPU to produce local slices.
     """
     FILE = 'file'
-    MODEL = 'model'
-    CAPTURE = 'capture'
-    CUSTOM = 'custom'
+    FULL = 'full'
+    SHARD = 'shard'
 
 
 @dataclass(frozen=True)
@@ -228,7 +225,7 @@ class ComputeConfig:
     param_init_seed: int = 1234
 
     def __post_init__(self):
-        strategies = (ParamInitStrategy.FILE, ParamInitStrategy.MODEL, ParamInitStrategy.CAPTURE, ParamInitStrategy.CUSTOM)
+        strategies = (ParamInitStrategy.FILE, ParamInitStrategy.FULL, ParamInitStrategy.SHARD)
         if self.param_init_strategy not in strategies:
             raise ValueError(f"param_init_strategy must be one of {strategies}.")
         if type(self.param_init_seed) is not int or not 0 <= self.param_init_seed < 2 ** 32:
@@ -1358,19 +1355,21 @@ def parallelize(
 
     is_module_class = inspect.isclass(module_or_module_class)
     module_class = module_or_module_class if is_module_class else module_or_module_class.__class__
-    if compute_config.param_init_strategy == ParamInitStrategy.CUSTOM:
-        callback = getattr(module_class, '__partial__init__', None)
-        descriptor = inspect.getattr_static(module_class, '__partial__init__', None)
+
+    has_shard_initializer = hasattr(module_class, '__shard__init__')
+    if compute_config.param_init_strategy == ParamInitStrategy.SHARD and has_shard_initializer:
+        callback = getattr(module_class, '__shard__init__')
+        descriptor = inspect.getattr_static(module_class, '__shard__init__')
         if not callable(callback) or not isinstance(descriptor, (staticmethod, classmethod)):
             raise ValueError(
-                "custom param_init_strategy requires a callable staticmethod or classmethod "
-                "__partial__init__(attr_meta_map) on the original module class."
+                "shard param_init_strategy requires __shard__init__(attr_meta_map) "
+                "to be a callable staticmethod or classmethod on the original module class."
             )
-        parameters = list(inspect.signature(callback).parameters.values())
-        if len(parameters) != 1 or parameters[0].kind not in (
-            inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD,
-        ):
-            raise ValueError("__partial__init__ must accept only the attr_meta_map argument.")
+        try:
+            inspect.signature(callback).bind({})
+        except TypeError:
+            raise ValueError("__shard__init__ must support a call with one positional attr_meta_map argument.")
+
     reuse = ReuseType(reuse) if isinstance(reuse, str) else reuse
     broadcast_strategy = BroadcastGenFilesStrategy(broadcast_strategy) if isinstance(broadcast_strategy, str) else broadcast_strategy
 
@@ -1476,9 +1475,11 @@ def parallelize(
             gen_savedir=gen_savedir,
             instance_name=instance_name,
         )
-        if compute_config.param_init_strategy == ParamInitStrategy.CUSTOM:
-            parallel_module_class._partial_init_fn = staticmethod(partial(
-                create_partial_init_weights, module_class, seed=compute_config.param_init_seed,
+        parallel_module_class._shard_init_fn = None
+        parallel_module_class._init_module_fn = None
+        if compute_config.param_init_strategy == ParamInitStrategy.SHARD and has_shard_initializer:
+            parallel_module_class._shard_init_fn = staticmethod(partial(
+                create_shard_init_weights, module_class, seed=compute_config.param_init_seed,
             ))
         elif compute_config.param_init_strategy != ParamInitStrategy.FILE:
             parallel_module_class._init_module_fn = staticmethod(partial(
@@ -1490,7 +1491,7 @@ def parallelize(
         else:
             init_kwargs = (
                 {'init_module': module_or_module_class}
-                if compute_config.param_init_strategy in (ParamInitStrategy.MODEL, ParamInitStrategy.CAPTURE) else {}
+                if compute_config.param_init_strategy != ParamInitStrategy.FILE else {}
             )
             if compute_config.param_init_strategy != ParamInitStrategy.FILE and module_dtype is not None:
                 module_or_module_class.to(dtype=module_dtype)

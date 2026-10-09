@@ -660,20 +660,6 @@ Please Note:
 
 ### Compute Config
 
-`param_init_strategy` selects `file` (default, file-backed), `model`
-(full runtime reconstruction), `capture` (selective full-tensor materialization),
-or `custom` (the original class's `__partial__init__` local-shard callback).
-Only `file` saves/loads `fullmodel.pt.*` and `npbuffer.pt`; all other strategies
-initialize parameters and buffers without those files. Capture random samples
-differ from eager initialization. Compilation always constructs a full real model.
-`param_init_seed` (default `1234`) controls isolated initialization
-independently of training `seed`. For example, pass
-`--compute_config.param_init_strategy capture --debug.param_init_check true --compute_config.param_init_seed 1234 --seed 1234`.
-The optional initialization check belongs to [Debug Config](#debug-config), not
-`ComputeConfig`. See
-[Weight initialization](./parallel_module.md#weight-initialization) for RNG,
-memory, generated-artifact and checkpoint-resume requirements.
-
 All compute configs are put in `compute_config` (`ComputeConfig`).
 Please refer to [`ComputeConfig`](#appendix-computeconfig) for more information.
 
@@ -686,6 +672,35 @@ An end2end module is a module which satisfies:
   other argument should have default value, and use its default value in
   `module.forward` function.
 - the first return value of `module.forward` is the loss (scalar tensor)
+
+#### Weight initialization
+
+To avoid saving and loading `fullmodel.pt.*`, set `param_init_strategy`:
+
+| Value | Runtime initialization |
+| --- | --- |
+| `file` (default) | Load saved parameters and buffers. |
+| `full` | Construct the original model on each rank and copy local slices. |
+| `shard` | Use the model's `__shard__init__` hook, or automatically capture and replay the required tensors. |
+
+For example:
+
+```yaml
+compute_config:
+  use_end2end: true
+  param_init_strategy: shard
+  param_init_seed: 1234
+debug:
+  param_init_check: true
+```
+
+`param_init_seed` defaults to `1234` and is separate from the training `seed`.
+Set `debug.param_init_check: false` to skip replica checking; see
+[Debug Config](#debug-config) for what the check covers.
+
+All strategies still construct a full model during compilation. For memory
+limits, hook signatures, checkpoint resume and cache reuse, see
+[Weight initialization](./parallel_module.md#weight-initialization).
 
 ### Checkpoint Config
 
@@ -928,21 +943,18 @@ class DebugConfig:
   each ZeRO group; if ZeRO is not enabled, will check the gradient
   across each nnscaler scale unit. This helps to find bugs related to
   gradient updates during training. Default is `True`.
-- `param_init_check` (`bool`): Check bitwise equality of initialized parameters and
-  buffers across ranks after optimizer construction, once all reducer buckets are
-  built. This does not change when buckets are built. Parallelization errors
-  propagate without running this check. Default is `True`.
-  Non-file `ParallelModule` tensors are keyed by module path and
-  logical shard, so only identical replicas are compared; different or overlapping
-  shards are not compared. ZeRO-3 parameters are checked in their stored sharded
-  form using the retained interval, excluding padding and empty intervals; full
-  parameters are not reconstructed. A shard without another replica cannot be
-  compared, and differences in discarded data cannot be detected.
-  File-backed parallel modules are skipped. Ordinary
-  module parameters and buffers are checked across all ranks, including in mixed
-  models with multiple parallel modules. Module paths keep different submodules
-  distinct. Resume and compile-only runs skip the check. This is a CLI trainer
-  check, not part of direct `parallelize` or generated-module construction.
+- `param_init_check` (`bool`, default `True`): Compare hashes of initialized
+  parameters and buffers across ranks, requiring bitwise equality. Runs after
+  optimizer/reducer construction, including ZeRO-3 sharding.
+  - **Compared:** identical logical shard replicas in non-file `ParallelModule`
+    instances, plus ordinary module parameters and buffers across ranks.
+    Different submodules are checked separately.
+  - **Not compared:** different or merely overlapping shards, shards without
+    replicas, and file-backed `ParallelModule` instances. With ZeRO-3, only
+    identical retained intervals are compared, excluding padding; discarded
+    values cannot be checked and full parameters are not reconstructed.
+  - **Skipped:** checkpoint resume and compile-only runs. This is a CLI trainer
+    check, not part of direct `parallelize` or generated-module construction.
 - `profile` (`Optional[ProfileConfig]`): Profiling configuration using
   `torch.profiler.profile`. Set to `None` (default) to disable profiling.
   When set, the profiler will wrap the training loop and call `profiler.step()`

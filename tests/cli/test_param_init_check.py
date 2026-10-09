@@ -182,9 +182,9 @@ def _worker_whole_model(save_dir, strategy, delayed_buckets=False):
 @pytest.mark.skipif(torch.cuda.device_count() < 4, reason='requires four GPUs')
 @pytest.mark.parametrize('strategy,delayed_buckets', [
     (ParamInitStrategy.FILE, False),
-    (ParamInitStrategy.MODEL, False),
-    (ParamInitStrategy.CAPTURE, False),
-    (ParamInitStrategy.MODEL, True),
+    (ParamInitStrategy.FULL, False),
+    (ParamInitStrategy.SHARD, False),
+    (ParamInitStrategy.FULL, True),
 ])
 def test_cli_param_init_check_whole_model(tmp_path, strategy, delayed_buckets):
     launch_torchrun(4, _worker_whole_model, tmp_path, strategy, delayed_buckets)
@@ -211,7 +211,7 @@ class ZeroCheckModel(torch.nn.Module):
 
 
 def _worker_post_zero3(save_dir, plan_ngpus, zero_ngroups, delayed_buckets):
-    args = _mixed_args(save_dir, ParamInitStrategy.MODEL)
+    args = _mixed_args(save_dir, ParamInitStrategy.FULL)
     args.compute_config = replace(
         args.compute_config, plan_ngpus=plan_ngpus, use_zero=3, zero_ngroups=zero_ngroups,
     )
@@ -373,7 +373,7 @@ def test_check_tensor_representation(difference):
                     'initialization differs across ranks')
 
 
-def _parallel_stub(value, *, strategy=ParamInitStrategy.MODEL, shape=(4,), start=0, chunks=1):
+def _parallel_stub(value, *, strategy=ParamInitStrategy.FULL, shape=(4,), start=0, chunks=1):
     class LocalModule(ParallelModule, skip_init=True):
         pass
 
@@ -476,7 +476,7 @@ def test_check_file_module_excludes_only_parallel_tensors():
 
 @pytest.mark.parametrize('checked', [False, True])
 def test_parallelize_failure_skips_check(tmp_path, checked):
-    trainer = Trainer(train_args=_mixed_args(tmp_path, ParamInitStrategy.MODEL, checked))
+    trainer = Trainer(train_args=_mixed_args(tmp_path, ParamInitStrategy.FULL, checked))
     error = ValueError('source construction failed')
     with patch('nnscaler.cli.trainer.is_running_distributed', return_value=False), patch.object(
         trainer.train_args, 'init_env',

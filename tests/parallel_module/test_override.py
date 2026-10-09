@@ -51,7 +51,7 @@ class MyModule(torch.nn.Module):
         return self.linear(x)
 
     @staticmethod
-    def __partial__init__(attr_meta_map):
+    def __shard__init__(attr_meta_map):
         return {
             name: torch.zeros(meta.sub_shape, dtype=meta.dtype)
             for name, meta in attr_meta_map.items()
@@ -78,7 +78,7 @@ class SeedShapeModule(torch.nn.Module):
 
 @patch('torch.cuda.is_available', lambda: False)
 @pytest.mark.parametrize('reuse', [ReuseType.MOO, ReuseType.GRAPH])
-@pytest.mark.parametrize('strategy', ['model', 'capture'])
+@pytest.mark.parametrize('strategy', ['full', 'shard'])
 def test_param_init_seed_retraces_constructor_structure(tmp_path, reuse, strategy):
     from ..utils import mock_cube_env, mock_dist
 
@@ -105,7 +105,7 @@ def test_param_init_seed_retraces_constructor_structure(tmp_path, reuse, strateg
 @patch('torch.cuda.is_available', lambda: False)
 @replace_all_device_with('cpu', force=True)
 @pytest.mark.parametrize('reuse', [ReuseType.MOO, ReuseType.GRAPH])
-@pytest.mark.parametrize('strategy', ['file', 'model', 'capture', 'custom'])
+@pytest.mark.parametrize('strategy', ['file', 'full', 'shard'])
 def test_param_init_seed_cache_reuse(tmp_path, reuse, strategy):
     constructors = []
     graph_mtimes = []
@@ -132,7 +132,7 @@ def test_param_init_seed_cache_reuse(tmp_path, reuse, strategy):
 @replace_all_device_with('cpu', force=True)
 def test_param_init_strategy_reuse(tmp_path):
     local_graph_mtime = None
-    for strategy in ('file', 'model', 'capture', 'custom', 'file'):
+    for strategy in ('file', 'full', 'shard', 'file'):
         kwargs = dict(
             gen_savedir=tmp_path, instance_name='init_strategy',
             load_module=False, reuse='moo',
@@ -154,17 +154,16 @@ def test_param_init_strategy_reuse(tmp_path):
         parallelize(MyModule, {'x': torch.ones(2, 3)}, 'dp', config, **{**kwargs, 'reuse': 'match'})
         assert graph_file.stat().st_mtime_ns == graph_mtime
         assert (module_dir / 'gencode0.py').stat().st_mtime_ns == code_mtime
-        if strategy == 'model':
+        if strategy == 'full':
             local_graph_mtime = graph_mtime
-        elif strategy in ('capture', 'custom'):
+        elif strategy == 'shard':
             assert graph_mtime == local_graph_mtime
 
 
 @patch('torch.cuda.is_available', lambda: False)
 @replace_all_device_with('cpu', force=True)
 @pytest.mark.parametrize('strategy', [
-    ParamInitStrategy.FILE, ParamInitStrategy.MODEL,
-    ParamInitStrategy.CAPTURE, ParamInitStrategy.CUSTOM,
+    ParamInitStrategy.FILE, ParamInitStrategy.FULL, ParamInitStrategy.SHARD,
 ])
 @pytest.mark.parametrize('reuse', [ReuseType.MOO, ReuseType.GRAPH])
 def test_reuse_without_np_buffer_content(tmp_path, strategy, reuse):

@@ -26,11 +26,13 @@ from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field
 import logging
 import random
-from typing import TYPE_CHECKING, Any, Callable, Dict, Optional, Type
+from typing import TYPE_CHECKING, Any, Callable, Dict, Generator, Optional, Type
 
 import numpy as np
 import torch
 from torch.utils._python_dispatch import TorchDispatchMode
+
+from nnscaler.utils import get_member_by_name
 
 if TYPE_CHECKING:
     from nnscaler.runtime.module import AttrMeta
@@ -92,20 +94,77 @@ def create_init_module(
     return module
 
 
-def create_partial_init_weights(
+def create_shard_init_weights(
     module_class: Type[torch.nn.Module],
     attr_meta_map: Dict[str, "AttrMeta"],
     *,
     seed: int,
-) -> Dict[str, torch.Tensor]:
-    initializer = getattr(module_class, '__partial__init__', None)
+) -> Generator[tuple[str, torch.Tensor], None, None]:
+    """Yield user-provided shards with lazy execution inside the initialization RNG scope."""
+    initializer = getattr(module_class, '__shard__init__', None)
     if not callable(initializer):
         raise RuntimeError(
-            "custom initialization requires the original module to define "
-            "__partial__init__(attr_meta_map) as a staticmethod or classmethod."
+            "A shard initializer must define "
+            "__shard__init__(attr_meta_map) as a staticmethod or classmethod."
         )
     with _initialization_rng(seed):
-        return initializer(attr_meta_map)
+        values = initializer(attr_meta_map)
+        if isinstance(values, dict):
+            values = values.items()
+        yield from values
+
+
+def _get_init_source_groups(
+    module: torch.nn.Module, attr_meta_map: Dict[str, "AttrMeta"],
+) -> Dict[int, tuple[torch.Tensor, list[tuple[str, "AttrMeta"]]]]:
+    groups = {}
+    for attr, meta in attr_meta_map.items():
+        source = get_member_by_name(module, meta.orig_name)
+        if (
+            not isinstance(source, torch.Tensor)
+            or tuple(source.shape) != tuple(meta.shape)
+            or source.dtype != meta.dtype
+        ):
+            raise RuntimeError(
+                f"Invalid initialization tensor for {meta.orig_name}: "
+                f"expected shape {meta.shape} and dtype {meta.dtype}."
+            )
+        if id(source) not in groups:
+            groups[id(source)] = (source, [])
+        groups[id(source)][1].append((attr, meta))
+    return groups
+
+
+def capture_init_weights(
+    attr_meta_map: Dict[str, "AttrMeta"],
+    *,
+    module_fn: Optional[Callable[[], torch.nn.Module]] = None,
+    module: Optional[torch.nn.Module] = None,
+) -> Generator[tuple[str, torch.Tensor], None, None]:
+    """Implement the __shard__init__ contract using captured construction.
+
+    The bound factory supplies constructor arguments, dtype and initialization seed.
+    A supplied instance is used as-is. Yield local views without value-division;
+    ParallelModule copies each view before advancing and applies val_chunks.
+    Consumers must release each view before requesting the next source tensor.
+    """
+    if not attr_meta_map:
+        return
+    capture = None
+    if module is None:
+        if module_fn is None:
+            raise RuntimeError(
+                "Independent initialization requires parallelize() with the original "
+                "module class/module_fn, or an init_module instance."
+            )
+        with DeferredInitialization() as capture:
+            module = module_fn()
+    with torch.no_grad():
+        for source, entries in _get_init_source_groups(module, attr_meta_map).values():
+            value = source if capture is None else capture.materialize(source)
+            for attr, meta in entries:
+                yield attr, value[meta.slicers]
+            del value
 
 
 def _unsupported(reason):
