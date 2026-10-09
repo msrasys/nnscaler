@@ -33,6 +33,21 @@ Choose `full` to avoid `fullmodel.pt.*` while keeping ordinary constructor behav
 Choose `shard` to reduce runtime initialization memory, with the
 [capture limitations](#automatic-capture) described below. Only `shard` avoids both
 `fullmodel.pt.*` and `npbuffer.pt`; generated code and metadata are still required.
+
+The parser APIs use a single `save_level` argument with `AttrSaveLevel`
+(imported from `nnscaler.graph.parser`):
+
+| Level | Saved attribute files |
+| --- | --- |
+| `NONE` | None |
+| `M` | `dist_param_map.pt` |
+| `N` | `npbuffer.pt` |
+| `F` | `fullmodel.pt.*`, including parameters and both persistent and non-persistent buffers |
+| `MN` | `dist_param_map.pt` and `npbuffer.pt` |
+| `ALL` (default) | All three categories |
+
+`parallelize` selects `ALL` for `file`, `MN` for `full`,
+and `M` for `shard`.
 Construction uses the original class, or the `module_fn` supplied to `parallelize`.
 
 On first initialization, `full` checks that each local non-persistent buffer

@@ -3,6 +3,7 @@
 
 import torch
 import logging
+from enum import IntEnum
 from pathlib import Path
 from typing import Any, List, Tuple, Callable, Union, Dict, Type, Optional
 
@@ -29,6 +30,19 @@ _logger = logging.getLogger(__name__)
 SELF_GETATTR_SIG = 'self_getattr'
 
 
+class AttrSaveLevel(IntEnum):
+    """Attribute file selections, with one bit per artifact category."""
+
+    NONE = 0
+
+    M = 1  # Attribute name mapping (dist_param_map.pt).
+    N = 2  # Non-persistent buffers (npbuffer.pt).
+    F = 4  # Full attribute contents, including parameters and all buffers (fullmodel.pt.*).
+
+    MN = 3 # M + N
+    ALL = 7
+
+
 class FxModuleParser:
     """
     torch.fx module parser
@@ -44,12 +58,10 @@ class FxModuleParser:
     def __init__(self,
               module: torch.fx.GraphModule,
               dummy_inputs: Dict[str, Any],
-              attr_savedir='./',
+              attr_savedir: Union[str, Path] = './',
               *,
-              save_content: bool = True,
+              save_level: AttrSaveLevel = AttrSaveLevel.ALL,
               constant_folding: bool = False,
-              save_weights: bool = True,
-              save_np_buffers: Optional[bool] = None,
         ):
         """Parse torch.fx module into cube IR
 
@@ -58,11 +70,9 @@ class FxModuleParser:
         Args:
             module (torch.fx.GraphModule): the torch.fx module
             dummy_inputs (Dict[str, Any]): the dummy inputs to run the module
-            attr_savedir (str): the directory to save the attribute content
-            save_content (bool): whether to save the content of the module
+            attr_savedir (Union[str, Path]): the directory to save the attribute content
+            save_level (AttrSaveLevel): attribute files to save; defaults to ALL.
             constant_folding (bool): whether to parse the module with constant folding
-            save_weights (bool): whether to save full-model tensors.
-            save_np_buffers (Optional[bool]): whether to save non-persistent buffers; defaults to save_weights.
         """
 
         self.module = module
@@ -71,10 +81,8 @@ class FxModuleParser:
         assert isinstance(dummy_inputs, dict), f"Expected dummy inputs to parse module, but got {dummy_inputs} of type {type(dummy_inputs)}"
 
         self.attr_savedir = attr_savedir
-        self.save_content = save_content
+        self.save_level = AttrSaveLevel(save_level)
         self.constant_folding = constant_folding
-        self.save_weights = save_weights
-        self.save_np_buffers = save_weights if save_np_buffers is None else save_np_buffers
 
         self.frame = Frame()
         self.value_tracker = ValueTracker()
@@ -157,13 +165,14 @@ class FxModuleParser:
         # even if a tuple/list is returned, it is still just one output
         assert len(outputs) == 1, f"Expect only one output, but got {len(outputs)}"
 
-        if self.save_content:
+        if self.save_level != AttrSaveLevel.NONE:
             attr_savedir = Path(self.attr_savedir)
-            if self.save_weights:
+            if self.save_level & AttrSaveLevel.F:
                 self.frame.save_attr_content(attr_savedir / self.ATTR_CONTENT_FILE_STEM)
-            if self.save_np_buffers:
+            if self.save_level & AttrSaveLevel.N:
                 self.frame.save_np_buffer_content(attr_savedir / self.NON_PERSISTENT_BUFFER_FILE)
-            self.frame.save_attr_map(attr_savedir / self.ATTR_MAP_FILE)
+            if self.save_level & AttrSaveLevel.M:
+                self.frame.save_attr_map(attr_savedir / self.ATTR_MAP_FILE)
 
         self.frame.pop_var()
         return inputs, all_ir_nodes, outputs
@@ -657,12 +666,10 @@ class FxModuleParser:
 def parse_fx_module(
     module: torch.fx.GraphModule,
     dummy_inputs: Dict[str, Any],
-    attr_savedir='./',
+    attr_savedir: Union[str, Path] = './',
     *,
-    save_content: bool = True,
+    save_level: AttrSaveLevel = AttrSaveLevel.ALL,
     constant_folding: bool = False,
-    save_weights: bool = True,
-    save_np_buffers: Optional[bool] = None,
 ) -> Tuple[List[IRObject], List[IRFwOperation], List[IRObject]]:
     """Parse torch.fx module into cube IR
 
@@ -671,10 +678,9 @@ def parse_fx_module(
     Args:
         module (torch.fx.GraphModule): the torch.fx module
         dummy_inputs (Dict[str, Any]): the dummy inputs to run the module
-        attr_savedir (str): the directory to save the attribute content
+        attr_savedir (Union[str, Path]): the directory to save the attribute content
+        save_level (AttrSaveLevel): attribute files to save; defaults to ALL.
         constant_folding (bool): whether to parse the module with constant folding
-        save_weights (bool): whether to save full-model tensors.
-        save_np_buffers (Optional[bool]): whether to save non-persistent buffers; defaults to save_weights.
 
     Returns:
         inputs (List[IRObject]): the input IRObjects
@@ -685,8 +691,6 @@ def parse_fx_module(
         module,
         dummy_inputs,
         attr_savedir,
-        save_content=save_content,
+        save_level=save_level,
         constant_folding=constant_folding,
-        save_weights=save_weights,
-        save_np_buffers=save_np_buffers,
     ).parse()

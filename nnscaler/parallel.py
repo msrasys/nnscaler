@@ -837,8 +837,7 @@ def _gen_graph(
     end2end_mode: bool = False,
     inference_only: bool = False,
     autoset_requires_grad: bool = True,
-    save_weights: bool = False,
-    save_np_buffers: Optional[bool] = None,
+    save_level: parser.AttrSaveLevel = parser.AttrSaveLevel.ALL,
 ):
     # reset environment
     IDGenerator().clear()
@@ -863,8 +862,7 @@ def _gen_graph(
     # generate ir logic graph
     graph = parser.to_ir_graph(
         fx_graph, dummy_forward_args, outdir, constant_folding,
-        save_weights=save_weights,
-        save_np_buffers=save_np_buffers,
+        save_level=save_level,
     )
 
     # generate dummy inputs for logic graph
@@ -1041,8 +1039,11 @@ def _gencode(
                 constant_folding=compute_config.constant_folding, end2end_mode=compute_config.use_end2end,
                 inference_only=compute_config.inference_only,
                 autoset_requires_grad=autoset_requires_grad,
-                save_weights=compute_config.param_init_strategy == ParamInitStrategy.FILE,
-                save_np_buffers=compute_config.param_init_strategy != ParamInitStrategy.SHARD,
+                save_level={
+                    ParamInitStrategy.FILE: parser.AttrSaveLevel.ALL,
+                    ParamInitStrategy.FULL: parser.AttrSaveLevel.MN,
+                    ParamInitStrategy.SHARD: parser.AttrSaveLevel.M,
+                }[compute_config.param_init_strategy],
             )
 
         graph.dump(graph_ckp)
