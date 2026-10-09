@@ -30,6 +30,34 @@ import torch
 _logger = logging.getLogger(__name__)
 
 
+def run_on_rank0(fn: Callable[[], Any]) -> Any:
+    """Run a metadata operation once and share its result or failure.
+
+    All ranks of the initialized default group must call this in the same
+    order. Outside distributed execution, call ``fn`` directly. Intended for
+    small, picklable metadata, never tensor checkpoint payloads. This does not
+    cache across invocations, so a later resume sees newly published files.
+    """
+    dist = torch.distributed
+    if not dist.is_available() or not dist.is_initialized():
+        return fn()
+    outcome = [None]
+    if dist.get_rank() == 0:
+        try:
+            value = fn()
+            # Detect unpicklable results before peers enter their receive.
+            import pickle
+            pickle.dumps(value)
+            outcome[0] = (True, value)
+        except Exception as exc:
+            outcome[0] = (False, f'{type(exc).__name__}: {exc}')
+    dist.broadcast_object_list(outcome, src=0)
+    success, value = outcome[0]
+    if not success:
+        raise RuntimeError(f'Rank 0 metadata operation failed: {value}')
+    return value
+
+
 def print_each_rank(msg: str, rank_only: Optional[int] = None, logger: Optional[logging.Logger] = None):
     """Logging the message.
 

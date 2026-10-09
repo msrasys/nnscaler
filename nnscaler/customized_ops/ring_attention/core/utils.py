@@ -103,6 +103,12 @@ def call_flash_attn_cute_varlen_func(func, *args, return_lse=False, **kwargs):
     exposes it as a tensor output, so missing LSE is an explicit runtime error
     instead of returning ``None``.
     """
+    # Generated plans may contain deterministic=False from their trace. Honor
+    # an explicitly enabled runtime determinism policy even when reusing that
+    # plan; otherwise PyTorch's mode silently leaves CuTe backward unordered.
+    if torch.are_deterministic_algorithms_enabled():
+        kwargs['deterministic'] = True
+
     if _supports_return_lse(func):
         kwargs["return_lse"] = bool(return_lse)
 

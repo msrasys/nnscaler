@@ -50,6 +50,7 @@ from nnscaler.ir.unique import IDGenerator
 
 from nnscaler.runtime.adapter.reducer import Bucket, Reducer, ParamZeroConfig
 from nnscaler.runtime.device import DeviceGroup
+from nnscaler.runtime.checkpoint_broadcast import broadcast_checkpoint_tensors
 from nnscaler.runtime.gnorm import calcuate_gnorm, clip_grads
 from nnscaler.runtime.module import (
     AttrMeta,
@@ -3330,15 +3331,21 @@ def load_deduped_state_dict(
 
         torch.distributed.barrier()
 
-        # broadcast weights in parallel modules inside dedup group (most time it is the 1st scale unit)
-        # Implementation of `deduped_state_dict` can guarantee that the first rank in each rank group always has the weights
+        # Restore one membership at a time in a deterministic global order.
+        # Only members synchronize between batches; nonmembers no longer enter
+        # a world barrier for every individual parameter. The world barrier at
+        # the end of this phase still precedes cross-scale-unit propagation.
+        group_keys = defaultdict(list)
         for key_name, ranks in local_name2ranks.items():
             if len(ranks) <= 1:
                 continue
-            prefix, local_name = key_name
-            if cur_rank in ranks:
+            group_keys[tuple(ranks)].append(key_name)
+        for ranks, keys in sorted(group_keys.items()):
+            if cur_rank not in ranks:
+                continue
+            broadcast_group = DeviceGroup().get_group(ranks)
+            for prefix, local_name in keys:
                 key = f'{prefix}.{local_name}' if prefix else local_name
-                broadcast_group = DeviceGroup().get_group(ranks)
                 assert prefix in no_zero3_pms, f'Prefix {prefix} not found in parallel_modules: {list(no_zero3_pms.keys())}.'
                 pm = no_zero3_pms[prefix]
                 assert hasattr(pm, local_name), f'Local name {local_name} not found in {pm}.'
@@ -3370,7 +3377,7 @@ def load_deduped_state_dict(
                                 f'At rank {cur_rank}, the attribute {key} is already loaded, ' \
                                 f'but not equal to the broadcasted tensor from rank {ranks[0]}.'
 
-            torch.distributed.barrier()
+            torch.distributed.barrier(group=broadcast_group)
 
         for key in missing_keys:
             split_names = key.split('.')
@@ -3444,57 +3451,39 @@ def _broadcast_opt_state(optimizer_state_dict: OptStateDict, state_indexes: List
             src=src_rank,
             group=curr_parallel_group,
     )
-    state_indexes = list(sent[0])
-    if rank != src_rank:
-        for k, v in sent[0].items():
-            optimizer_state_dict['state'][k] = {
-                key: torch.zeros(value[0], dtype=value[1], device=torch.cuda.current_device())
-                for key, value in v.items()
-            }
-    else:
-        for idx in state_indexes:
-           for key, value in optimizer_state_dict['state'][idx].items():
-               optimizer_state_dict['state'][idx][key] = optimizer_state_dict['state'][idx][key].cuda()
-
-    # broadcast step
-    # step is too small, so we can just broadcast all of them all together
-    # some adam/adamw optimizers may not have step in their state dict
-    # so we need to check if 'step' is in the state dict
-    step_state_indexes = [k for k in state_indexes if 'step' in optimizer_state_dict['state'][k]]
-    if step_state_indexes:
-        assert all(
-            optimizer_state_dict['state'][k]['step'].dtype ==
-            optimizer_state_dict['state'][step_state_indexes[0]]['step'].dtype and
-            optimizer_state_dict['state'][k]['step'].shape ==
-            optimizer_state_dict['state'][step_state_indexes[0]]['step'].shape
-            for k in step_state_indexes
+    # Preserve checkpoint dictionary order: optimizer state restoration and
+    # subsequent allocation order must not change just to pipeline transfers.
+    entries = [(idx, key, shape, dtype)
+               for idx, fields in sent[0].items()
+               for key, (shape, dtype) in fields.items() if key != 'step']
+    step_indices = [idx for idx, fields in sent[0].items() if 'step' in fields]
+    step_values = {}
+    device = torch.device('cuda', torch.cuda.current_device())
+    if step_indices:
+        shape, dtype = sent[0][step_indices[0]]['step']
+        if any(sent[0][idx]['step'] != (shape, dtype) for idx in step_indices):
+            raise ValueError('Optimizer step tensors must have matching shapes and dtypes')
+        stacked = (torch.stack([optimizer_state_dict['state'][idx]['step'].to(device)
+                                for idx in step_indices]) if rank == src_rank else None)
+        step_stack, = broadcast_checkpoint_tensors(
+            [stacked] if stacked is not None else None,
+            [(tuple([len(step_indices), *shape]), dtype)],
+            src=src_rank, group=curr_parallel_group, device=device,
         )
-        if rank == src_rank:
-            step_stack = torch.stack(
-                [optimizer_state_dict['state'][k]['step'] for k in step_state_indexes]
-            )
-        else:
-            step_stack = torch.zeros(
-                len(step_state_indexes),
-                dtype=optimizer_state_dict['state'][step_state_indexes[0]]['step'].dtype,
-                device=torch.cuda.current_device()
-            )
-        torch.distributed.broadcast(step_stack, src=src_rank, group=curr_parallel_group)
-        if rank != src_rank:
-            for k, v in zip(step_state_indexes, step_stack):
-                optimizer_state_dict['state'][k]['step'].copy_(v)
-
-    # broadcast other states
-    # TODO: can be slow?
-    for k in state_indexes:
-        keys = sorted(optimizer_state_dict['state'][k].keys())
-        # for mixed precision f16 optimizer, we will add custom keys
-        # assert set(keys) == {'step', 'exp_avg', 'exp_avg_sq'}
-        if 'step' in keys:
-            keys.remove('step')  # we have done step in previous.
-        for key in keys:
-            value = optimizer_state_dict['state'][k][key]
-            torch.distributed.broadcast(value.data, src=src_rank, group=curr_parallel_group)
+        step_values = {idx: value.clone() for idx, value in zip(step_indices, step_stack)}
+    values = ([optimizer_state_dict['state'][idx][key] for idx, key, _, _ in entries]
+              if rank == src_rank else None)
+    restored = broadcast_checkpoint_tensors(
+        values, [(shape, dtype) for _, _, shape, dtype in entries],
+        src=src_rank, group=curr_parallel_group,
+        device=device,
+    )
+    values_by_key = {(idx, key): value for (idx, key, _, _), value in zip(entries, restored)}
+    for idx, fields in sent[0].items():
+        optimizer_state_dict['state'][idx] = {
+            key: step_values[idx] if key == 'step' else values_by_key[idx, key]
+            for key in fields
+        }
 
     # Partial-ownership modules (first-stage ViT) are absent on other PP ranks.
     # Only the ranks participating in this broadcast must synchronize here.

@@ -19,6 +19,21 @@ pytest.importorskip("flash_attn")
 from nnscaler.customized_ops.ring_attention.core.utils import call_flash_attn_cute_varlen_func
 
 
+@pytest.mark.parametrize('runtime_enabled', [False, True])
+@pytest.mark.parametrize('compiled_value', [False, True])
+def test_cute_runtime_determinism_overrides_reused_plan(monkeypatch, runtime_enabled, compiled_value):
+    monkeypatch.setattr(torch, 'are_deterministic_algorithms_enabled', lambda: runtime_enabled)
+    observed = []
+    def fake_cute_func(x, *, deterministic=False, return_lse=False):
+        observed.append(deterministic)
+        return x, torch.zeros_like(x)
+    x = torch.ones(2)
+    output, _ = call_flash_attn_cute_varlen_func(
+        fake_cute_func, x, deterministic=compiled_value, return_lse=True)
+    assert torch.equal(output, x)
+    assert observed == [runtime_enabled or compiled_value]
+
+
 def test_call_flash_attn_cute_varlen_func_passes_return_lse_by_name():
     calls = {}
 
