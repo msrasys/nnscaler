@@ -176,6 +176,88 @@ def test_noncontiguous_read_and_post_copy_source_mutation():
     assert torch.equal(capture.materialize(transposed), torch.full((4, 3), 99.0))
 
 
+@pytest.mark.parametrize("shape,dim", [
+    ((3, 4), 0),
+    ((3, 4), 1),
+    ((3, 4), -1),
+    ((4,), 0),
+    ((0, 4), 0),
+    ((3, 0), 0),
+])
+def test_unbind_views_share_recipe(shape, dim):
+    expected = torch.arange(torch.Size(shape).numel(), dtype=torch.float32).reshape(shape)
+    with DeferredInitialization() as capture:
+        source = torch.arange(expected.numel(), dtype=expected.dtype).reshape(shape)
+        node = capture._storage(source).node
+        parts = source.unbind(dim=dim)
+        assert capture._storage(source).node is node
+        assert all(part.is_meta and capture._storage(part) is capture._storage(source)
+                   for part in parts)
+    references = expected.unbind(dim)
+    assert len(parts) == len(references)
+    for part, reference in zip(parts, references):
+        torch.testing.assert_close(capture.materialize(part), reference, rtol=0, atol=0)
+
+
+def test_unbind_views_preserve_mutation_history():
+    def initialize():
+        source = torch.arange(20, dtype=torch.float32).reshape(5, 4)
+        first, second, third = source[1:4].unbind()
+        before = first.clone()
+        first.fill_(7)
+        after = source.clone()
+        second.copy_(third)
+        source.add_(2)
+        return source, first, second, third, before, after
+
+    expected = initialize()
+    with DeferredInitialization() as capture:
+        actual = initialize()
+    for tensor, reference in zip(actual, expected):
+        torch.testing.assert_close(capture.materialize(tensor), reference, rtol=0, atol=0)
+
+
+def test_unbind_noncontiguous_views_are_readable_but_not_writable():
+    with DeferredInitialization() as capture:
+        source = torch.arange(12, dtype=torch.float32).reshape(3, 4)
+        column = source.unbind(1)[2]
+        before = column.clone()
+        with pytest.raises(RuntimeError, match="noncontiguous mutation"):
+            column.fill_(7)
+        source.fill_(9)
+    assert torch.equal(capture.materialize(before), torch.tensor([2., 6., 10.]))
+    assert torch.equal(capture.materialize(column), torch.full((3,), 9.))
+
+
+def test_unbind_external_views_preserve_snapshot():
+    source = torch.arange(12, dtype=torch.float32).reshape(3, 4)
+    with DeferredInitialization() as capture:
+        parts = source.unbind(1)
+        copied = parts[2].clone()
+    assert all(part.untyped_storage() is source.untyped_storage() for part in parts)
+    assert torch.equal(capture.materialize(copied), source[:, 2])
+    source.add_(1)
+    with pytest.raises(RuntimeError, match="external tensor data changed"):
+        capture.materialize(copied)
+
+
+def test_unbind_tensor_iteration_in_constructor():
+    class Model(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            schedule = [value.item() for value in torch.linspace(0, 0.2, 3)]
+            self.layers = torch.nn.ModuleList([torch.nn.Linear(4, 4) for _ in schedule])
+            with torch.no_grad():
+                for layer, value in zip(self.layers, schedule):
+                    layer.weight.fill_(value)
+
+    expected = Model()
+    with DeferredInitialization() as capture:
+        actual = Model()
+    for layer, reference in zip(actual.layers, expected.layers):
+        assert torch.equal(capture.materialize(layer.weight), reference.weight)
+
+
 @pytest.mark.parametrize("factory", [
     pytest.param(lambda x: torch.zeros_like(x), id="zeros-like"),
     pytest.param(lambda x: torch.rand_like(x), id="rand-like"),
@@ -1035,7 +1117,6 @@ def test_generic_invalid_inputs_are_not_fallback(caplog):
 
 @pytest.mark.parametrize("operation", [
     lambda x: x.split(2),
-    lambda x: x.unbind(0),
     lambda x: x.diagonal(),
 ])
 def test_generic_aliasing_outputs_are_rejected(operation):

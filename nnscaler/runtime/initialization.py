@@ -267,7 +267,7 @@ class DeferredInitialization(TorchDispatchMode):
 
     _views = {
         "detach", "alias", "view", "_unsafe_view", "transpose", "t", "permute",
-        "slice", "select", "unsqueeze", "squeeze", "expand",
+        "slice", "select", "unsqueeze", "squeeze", "expand", "unbind",
     }
     _arithmetic_writes = {"add_", "sub_", "mul_", "div_"}
     _unary_writes = {"erfinv_", "clamp_"}
@@ -374,8 +374,10 @@ class DeferredInitialization(TorchDispatchMode):
         if storage is None and args[0].is_meta:
             raise _unsupported(f"view of an untracked meta tensor in {func}")
         result = func(*args, **kwargs)
-        if result.untyped_storage() is not args[0].untyped_storage():
-            raise _unsupported(f"view {func} unexpectedly allocated new storage")
+        views = result if isinstance(result, (tuple, list)) else (result,)
+        for view in views:
+            if view.untyped_storage() is not args[0].untyped_storage():
+                raise _unsupported(f"view {func} unexpectedly allocated new storage")
         return result
 
     def _op(self, func, name, args, kwargs):

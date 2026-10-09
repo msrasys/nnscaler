@@ -158,9 +158,10 @@ class GenericInitModel(InitModel):
             self.offset.copy_((positions.sin() + positions.cos()) / selected.sum())
             count = selected.shape[0]
             scale = positions.sum().item() / count
-            for layer in self.layers:
+            scales = [value.item() for value in torch.linspace(0.5, 1.0, len(self.layers))]
+            for layer, layer_scale in zip(self.layers, scales):
                 torch.nn.init.trunc_normal_(layer.weight, std=0.01, a=-0.02, b=0.02)
-                layer.weight.copy_(layer.weight.sin() * scale)
+                layer.weight.copy_(layer.weight.sin() * scale * layer_scale)
 
 
 def init_dummy_sample(args):

@@ -76,7 +76,7 @@ require explicit support:
 | Category | Supported operations |
 | --- | --- |
 | Factories and sampling | `empty`, `zeros`, `ones`, `full`, `arange`, `linspace`, `rand`, `randn`, `randint`, `randperm`, like/new factories, `normal`, `bernoulli`, `poisson`, `multinomial` |
-| Views | `detach`, `alias`, `view`, `_unsafe_view`, `transpose`, `t`, `permute`, `slice`, `select`, `unsqueeze`, `squeeze`, `expand` |
+| Views | `detach`, `alias`, `view`, `_unsafe_view`, `transpose`, `t`, `permute`, `slice`, `select`, `unsqueeze`, `squeeze`, `expand`, `unbind` (including tensor iteration) |
 | Copies | `clone`, copying `to`, `copy_` |
 | In-place initialization | `fill_`, `zero_`, `uniform_`, `normal_`, `random_`, `bernoulli_`, `exponential_`, `geometric_`, `log_normal_`, `cauchy_`, `erfinv_`, scalar-bound `clamp_` |
 | In-place arithmetic | `add_`, `sub_`, `mul_`, `div_` with scalar operands on contiguous tensors or views |
@@ -85,8 +85,7 @@ The table uses ATen operator names; composite APIs work only if their underlying
 operations are supported. Important limits:
 
 - `out=` overloads, noncontiguous mutations, tensor-operand in-place arithmetic,
-  and unlisted alias operations such as `split`, `unbind` and `diagonal` are
-  unsupported. Tensor iteration can therefore fail even when indexing works.
+  and unlisted alias operations such as `split` and `diagonal` are unsupported.
 - Data-dependent operations such as `.item()` and `nonzero`, and operations
   without a meta implementation, use a logged CPU fallback during capture.
   This can allocate full tensors. Recipes are replayed later; constructor
@@ -119,10 +118,6 @@ These probes checked all parameter/buffer shapes, dtypes, finite values, seeded
 repeatability, eager buffer equality and CPU RNG restoration. They do **not**
 certify pretrained loading, full distributed execution, other configurations or
 equality with eager random weights.
-
-timm `VisionTransformer` **1.0.30** was inspected but not run: its
-[drop-path schedule](https://github.com/huggingface/pytorch-image-models/blob/0df212b369a5385b16dfe513d5143a7311ea1ddc/timm/layers/drop.py#L215)
-iterates over a tensor, requiring unsupported `unbind`.
 
 ### Write a shard initializer
 
