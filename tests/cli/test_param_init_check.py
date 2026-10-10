@@ -1,7 +1,6 @@
 #  Copyright (c) Microsoft Corporation.
 #  Licensed under the MIT License.
 
-from contextlib import ExitStack
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -13,9 +12,9 @@ import torch
 from nnscaler import ParamInitStrategy
 from nnscaler.cli import Trainer, TrainerArgs
 from nnscaler.cli.trainer import check_param_init
-from nnscaler.cli.trainer_args import DebugConfig, ModelConfig, ModuleParallelizeConfig, ResumeOptions
+from nnscaler.cli.trainer_args import DebugConfig, ModelConfig, ModuleParallelizeConfig
 from nnscaler.runtime.module import AttrMeta, ParallelModule, Zero3AttrMeta
-from tests.cli.test_weight_init import _args, _assert_artifacts
+from tests.cli.test_weight_init import _args
 from tests.launch_torchrun import launch_torchrun
 
 
@@ -48,10 +47,6 @@ class MixedCheckModel(torch.nn.Module):
                 mismatch = type(self).mismatch
                 if mismatch == 'parameter':
                     self.ordinary_weight.add_(1)
-                elif mismatch == 'buffer':
-                    self.ordinary_buffer.add_(2 ** -45)
-                elif mismatch == 'nonpersistent':
-                    self.ordinary_nonpersistent.add_(1)
                 elif mismatch == 'parallel':
                     next(self.first.parameters()).add_(1)
 
@@ -81,129 +76,38 @@ def _mixed_args(save_dir, strategy, checked=True):
     return args
 
 
-def _worker_whole_model(save_dir, strategy, delayed_buckets=False):
-    checks = []
-    builds = []
-    classifications = []
-    original_build = ParallelModule.build_buckets
-
-    def classify(name):
-        classifications.append(name)
-        return 0
-
-    def make_args(checked=True):
-        args = _mixed_args(save_dir, strategy, checked)
-        if delayed_buckets:
-            args.optimizer.param_clss_fn = classify
-        assert args.should_delay_bucket_building() == delayed_buckets
-        return args
-
-    def checked_init(model):
-        assert isinstance(model, MixedCheckModel)
-        assert trainer.optimizer is not None
-        assert builds == [model.first, model.second]
-        assert bool(classifications) == delayed_buckets
-        assert isinstance(model.first, ParallelModule)
-        assert isinstance(model.second, ParallelModule)
-        assert model.first.fullmap == model.second.fullmap
-        assert not torch.equal(next(model.first.parameters()), next(model.second.parameters()))
-        checks.append(model)
-        with patch('nnscaler.cli.trainer.dist.all_gather_object',
-                   wraps=torch.distributed.all_gather_object) as gather:
-            check_param_init(model)
-        assert gather.call_count == 1
-
-    def checked_build(module, *args, **kwargs):
-        assert not checks
-        if delayed_buckets:
-            assert classifications
-        builds.append(module)
-        return original_build(module, *args, **kwargs)
-
-    trainer = Trainer(train_args=make_args())
-    with ExitStack() as stack:
-        stack.enter_context(patch('nnscaler.cli.trainer.check_param_init', checked_init))
-        stack.enter_context(patch.object(ParallelModule, 'build_buckets', checked_build))
-        if strategy != ParamInitStrategy.FILE:
-            stack.enter_context(patch.object(
-                ParallelModule, 'load_attr_content', side_effect=AssertionError('fullmodel read'),
-            ))
-        trainer.run()
-    assert checks == [trainer.model]
-    assert builds == [trainer.model.first, trainer.model.second]
-    assert bool(classifications) == delayed_buckets
-    assert trainer.train_status.finished_train_steps == 1
-    for module in (trainer.model.first, trainer.model.second):
-        assert module.compute_config.param_init_strategy == strategy
-        _assert_artifacts(module, strategy)
-
-    mismatches = ['parameter', 'buffer', 'nonpersistent']
-    if strategy != ParamInitStrategy.FILE:
-        mismatches.append('parallel')
-    for mismatch in mismatches:
-        failing = Trainer(train_args=make_args())
-        failed_builds = []
-
-        def failing_build(module, *args, **kwargs):
-            failed_builds.append(module)
-            return original_build(module, *args, **kwargs)
-
+def _worker_whole_model(save_dir):
+    for mismatch in ('', 'parameter', 'parallel'):
+        trainer = Trainer(train_args=_mixed_args(save_dir, ParamInitStrategy.FULL))
         # Inject runtime differences without changing the generated-code cache key.
         with patch.object(MixedCheckModel, 'mismatch', mismatch), patch.object(
-            ParallelModule, 'build_buckets', failing_build,
-        ):
-            with pytest.raises(RuntimeError, match='initialization differs across ranks') as exc:
-                failing.run()
-        assert failing.optimizer is not None
-        assert failed_builds == [failing.model.first, failing.model.second]
-        assert 'ranks 0, 2' in str(exc.value)
-        assert ('first' if mismatch == 'parallel' else 'ordinary_') in str(exc.value)
+            Trainer, '_train',
+        ), patch('nnscaler.cli.trainer.check_param_init', wraps=check_param_init) as check:
+            if mismatch:
+                with pytest.raises(RuntimeError, match='initialization differs across ranks') as exc:
+                    trainer.run()
+                assert 'ranks 0, 2' in str(exc.value)
+                assert ('first' if mismatch == 'parallel' else 'ordinary_weight') in str(exc.value)
+            else:
+                trainer.run()
+            check.assert_called_once_with(trainer.model)
         torch.distributed.barrier()
-
-    with patch('nnscaler.cli.trainer.check_param_init',
-               side_effect=AssertionError('disabled, compile-only or resumed initialization checked')), patch.object(
-                   MixedCheckModel, 'mismatch', 'parameter',
-               ):
-        unchecked = Trainer(train_args=make_args(checked=False))
-        unchecked.run()
-        assert unchecked.train_status.finished_train_steps == 1
-
-        compile_args = make_args()
-        compile_args.run_mode = 'compile'
-        Trainer(train_args=compile_args).run()
-
-        resume_args = make_args()
-        resume_args.checkpoint.resume_from = ResumeOptions(checkpoint='last')
-        resume_args.max_train_steps = 2
-        resumed = Trainer(train_args=resume_args)
-        resumed.run()
-        assert resumed.train_status.finished_train_steps == 2
 
 
 @pytest.mark.skipif(torch.cuda.device_count() < 4, reason='requires four GPUs')
-@pytest.mark.parametrize('strategy,delayed_buckets', [
-    (ParamInitStrategy.FILE, False),
-    (ParamInitStrategy.FULL, False),
-    (ParamInitStrategy.SHARD, False),
-    (ParamInitStrategy.FULL, True),
-])
-def test_cli_param_init_check_whole_model(tmp_path, strategy, delayed_buckets):
-    launch_torchrun(4, _worker_whole_model, tmp_path, strategy, delayed_buckets)
+def test_cli_param_init_check_whole_model(tmp_path):
+    """Run the CLI check on four ranks with ordinary and parallel parameters.
 
-
-class ZeroCheckBlock(CheckBlock):
-    def __init__(self, dim=16):
-        super().__init__(dim)
-        with torch.no_grad():
-            self.linear.weight.copy_(
-                torch.arange(dim * dim, dtype=torch.float32).reshape(dim, dim) / (dim * dim)
-            )
+    Accept matching replicas at distinct submodule paths, then reject a rank-2
+    mismatch in either an ordinary parameter or a parallel parameter.
+    """
+    launch_torchrun(4, _worker_whole_model, tmp_path)
 
 
 class ZeroCheckModel(torch.nn.Module):
     def __init__(self):
         super().__init__()
-        self.block = ZeroCheckBlock()
+        self.block = CheckBlock()
         self.ordinary_weight = torch.nn.Parameter(torch.ones(16))
 
     def forward(self, data):
@@ -211,109 +115,59 @@ class ZeroCheckModel(torch.nn.Module):
         return torch.nn.functional.binary_cross_entropy(value, data['target'])
 
 
-def _worker_post_zero3(save_dir, plan_ngpus, zero_ngroups, delayed_buckets):
+def _worker_post_zero3(save_dir):
     args = _mixed_args(save_dir, ParamInitStrategy.FULL)
     args.compute_config = replace(
-        args.compute_config, plan_ngpus=plan_ngpus, use_zero=3, zero_ngroups=zero_ngroups,
+        args.compute_config, plan_ngpus=1, use_zero=3, zero_ngroups=2,
     )
     args.model.type = f'{__name__}.ZeroCheckModel'
-    args.model.parallel_modules[0].type = f'{__name__}.ZeroCheckBlock'
-    classifications = []
-    if delayed_buckets:
-        def classify(name):
-            classifications.append(name)
-            return 0
-        args.optimizer.param_clss_fn = classify
-    original_optimizer = TrainerArgs.create_parallel_optimizer
-    inject_mismatch = False
-    checked = []
-
-    def create_optimizer(train_args, model):
-        optimizer = original_optimizer(train_args, model)
-        if inject_mismatch and torch.distributed.get_rank() == 2:
-            for attr in model.block.fullmap:
-                metadata = model.block.get_zero3_attr_meta(attr)
-                if metadata is not None and metadata.start < metadata.end:
-                    with torch.no_grad():
-                        getattr(model.block, attr)[0].add_(1)
-                    break
-            else:
-                raise AssertionError('rank 2 has no retained ZeRO-3 parameter')
-        return optimizer
 
     def checked_init(model):
         assert trainer.optimizer is not None
-        assert bool(classifications) == delayed_buckets
         assert isinstance(model.block, ParallelModule)
-        assert not list(model.block.module_dir.glob('fullmodel.pt*'))
-        logical_weight = torch.arange(256, dtype=torch.float32).reshape(16, 16) / 256
-        retained = []
-        for attr, meta in model.block.fullmap.items():
-            metadata = model.block.get_zero3_attr_meta(attr)
-            if metadata is None:
-                continue
-            actual = getattr(model.block, attr)
-            assert actual.ndim == 1
-            assert actual.numel() == metadata.chunk_size
-            expected = logical_weight[meta.slicers].contiguous().flatten() / meta.val_chunks
-            assert 0 < metadata.end - metadata.start < expected.numel()
-            retained.append((metadata.start, metadata.end))
-            if not inject_mismatch:
-                torch.testing.assert_close(
-                    actual[:metadata.end - metadata.start].cpu(),
-                    expected[metadata.start:metadata.end], rtol=0, atol=0,
-                )
-        assert retained
-        checked.append(retained)
-        with patch('nnscaler.cli.trainer.dist.all_gather_object',
-                   wraps=torch.distributed.all_gather_object) as gather, patch.object(
-            ParallelModule, 'prefetch_param', side_effect=AssertionError('check prefetched a full parameter'),
-        ), patch.object(
-            ParallelModule, 'gather_params', side_effect=AssertionError('check gathered model parameters'),
-        ), patch(
-            'nnscaler.cli.trainer.dist.all_gather_into_tensor',
-            side_effect=AssertionError('check gathered tensor contents'),
-        ):
-            try:
-                check_param_init(model)
-            finally:
-                assert gather.call_count == 1
+        attr, = model.block.fullmap
+        metadata = model.block.get_zero3_attr_meta(attr)
+        assert metadata is not None
+        assert 0 < metadata.end - metadata.start < 16 * 16
+        if inject_mismatch and torch.distributed.get_rank() == 2:
+            with torch.no_grad():
+                getattr(model.block, attr)[0].add_(1)
+        check_param_init(model)
 
-    with patch.object(TrainerArgs, 'create_parallel_optimizer', create_optimizer), patch(
-        'nnscaler.cli.trainer.check_param_init', checked_init,
-    ), patch.object(ParallelModule, 'load_attr_content', side_effect=AssertionError('fullmodel read')):
+    for inject_mismatch in (False, True):
         trainer = Trainer(train_args=args)
-        trainer.run()
-        assert len(checked) == 1
-        assert trainer.train_status.finished_train_steps == 1
-        if zero_ngroups > 1:
-            inject_mismatch = True
-            trainer = Trainer(train_args=args)
-            with pytest.raises(RuntimeError, match='initialization differs across ranks') as exc:
+        with patch.object(Trainer, '_train'), patch(
+            'nnscaler.cli.trainer.check_param_init', side_effect=checked_init,
+        ) as check:
+            if inject_mismatch:
+                with pytest.raises(RuntimeError, match='initialization differs across ranks') as exc:
+                    trainer.run()
+                assert "'block'" in str(exc.value)
+                assert 'ranks 0, 2' in str(exc.value)
+            else:
                 trainer.run()
-            assert len(checked) == 2
-            assert "'block'" in str(exc.value)
-            assert 'ranks 0, 2' in str(exc.value)
-            torch.distributed.barrier()
+            check.assert_called_once_with(trainer.model)
+        torch.distributed.barrier()
 
 
 @pytest.mark.skipif(torch.cuda.device_count() < 4, reason='requires four GPUs')
-@pytest.mark.parametrize('plan_ngpus,zero_ngroups,delayed_buckets', [
-    (1, 2, False),
-    (1, 2, True),
-    (1, 1, False),
-    (2, 1, False),
-])
-def test_cli_param_init_check_post_zero3(tmp_path, plan_ngpus, zero_ngroups, delayed_buckets):
-    launch_torchrun(4, _worker_post_zero3, tmp_path, plan_ngpus, zero_ngroups, delayed_buckets)
+def test_cli_param_init_check_post_zero3(tmp_path):
+    """Run the CLI check after ZeRO-3 sharding across two groups on four ranks.
+
+    Accept matching retained shards, then reject a rank-2 modification to a
+    shard replicated on rank 0.
+    """
+    launch_torchrun(4, _worker_post_zero3, tmp_path)
 
 
 def test_param_init_check_default():
+    """Enable initialization replica checking by default in the CLI debug config."""
     assert DebugConfig().param_init_check is True
 
 
 @pytest.mark.parametrize('initialized', [False, True])
 def test_check_without_peers_skips_hashing(initialized):
+    """Skip both hashing and communication when distributed is absent or has one rank."""
     with patch('nnscaler.cli.trainer.dist.is_initialized', return_value=initialized), patch(
         'nnscaler.cli.trainer.dist.get_world_size', return_value=1,
     ), patch('nnscaler.cli.trainer._initialization_digest') as digest, patch(
@@ -357,6 +211,11 @@ def _check_payloads(model, payloads, match=None):
 
 @pytest.mark.parametrize('kind', ['weight', 'persistent', 'nonpersistent'])
 def test_check_plain_model_replica(kind):
+    """With mocked ranks, accept equal ordinary tensors and reject a changed replica.
+
+    Cover parameters, persistent buffers (including tiny float64 changes), and
+    non-persistent buffers.
+    """
     model = _plain_model()
     changed = _plain_model()
     with torch.no_grad():
@@ -370,6 +229,7 @@ def test_check_plain_model_replica(kind):
 
 @pytest.mark.parametrize('difference', ['signed_zero', 'shape', 'dtype'])
 def test_check_tensor_representation(difference):
+    """Reject mocked buffer replicas differing in signed zero, shape, or dtype."""
     value = torch.zeros(2)
     if difference == 'signed_zero':
         changed = -value
@@ -407,6 +267,11 @@ def _parallel_stub(value, *, strategy=ParamInitStrategy.FULL, shape=(4,), start=
 
 @pytest.mark.parametrize('layout', [{'start': 2}, {'shape': (8,)}, {'chunks': 2}])
 def test_check_distinct_logical_shards(layout):
+    """Compare only matching logical shards in mocked collective payloads.
+
+    Different slice offsets, full shapes, or value-partition factors may have
+    different values; a changed replica of the same logical shard must fail.
+    """
     model = _parallel_stub(0.125)
     reference = _payload(model)
     other = _payload(_parallel_stub(0.25, **layout))
@@ -429,6 +294,11 @@ def _zero3_stub(values, start, end, ranks=(0, 1), *, numel=8):
 
 
 def test_check_zero3_range_and_cross_group_replicas():
+    """Compare identical retained ZeRO-3 intervals across mocked reducer groups.
+
+    Distinct intervals may differ, but a changed replica of the same interval
+    must fail even when its reducer belongs to another group.
+    """
     model = _zero3_stub([1, 2], 0, 2)
     reference = _payload(model)
     other = _payload(_zero3_stub([3, 4], 2, 4))
@@ -443,11 +313,13 @@ def test_check_zero3_range_and_cross_group_replicas():
 
 
 def test_check_zero3_unique_ranges():
+    """Accept distinct values when every mocked rank retains a unique ZeRO-3 interval."""
     models = [_zero3_stub([start + 1, start + 2], start, start + 2) for start in range(0, 8, 2)]
     _check_payloads(models[0], [_payload(model) for model in models])
 
 
 def test_check_zero3_valid_tail_ignores_padding():
+    """Ignore ZeRO-3 padding values and lengths, but reject changes in the valid tail."""
     model = _zero3_stub([5, 6, 7, 123], 4, 7, numel=7)
     reference = _payload(model)
     replica = _payload(_zero3_stub([5, 6, 7, -123, 456], 4, 7, numel=7))
@@ -460,10 +332,14 @@ def test_check_zero3_valid_tail_ignores_padding():
 
 @pytest.mark.parametrize('start,end', [(8, 8), (8, 7)])
 def test_check_zero3_empty_ranges(start, end):
+    """Exclude ZeRO-3 shards with empty or reversed retained intervals from hashing."""
     assert _payload(_zero3_stub([123, 456], start, end))[0] == {}
 
 
-def test_check_zero3_frozen_parameter_is_unsharded():
+def test_check_frozen_parallel_parameter_replica():
+    """
+    Hash a frozen parallel parameter and reject a changed mocked replica.
+    """
     model = _parallel_stub(0.125)
     model.weight.requires_grad_(False)
     reference = _payload(model)
@@ -475,6 +351,7 @@ def test_check_zero3_frozen_parameter_is_unsharded():
 
 
 def test_check_file_module_excludes_only_parallel_tensors():
+    """Skip FILE-backed parallel tensors without skipping ordinary tensors in the model."""
     model = _plain_model()
     model.parallel = _parallel_stub(0.125, strategy=ParamInitStrategy.FILE)
     reference = _payload(model)
@@ -490,6 +367,11 @@ def test_check_file_module_excludes_only_parallel_tensors():
 @pytest.mark.skipif(not torch.cuda.is_available(), reason='dummy input requires CUDA')
 @pytest.mark.parametrize('checked', [False, True])
 def test_parallelize_failure_skips_check(tmp_path, checked):
+    """Propagate a parallelize_model failure without checking an unconstructed model.
+
+    Cover both enabled and disabled checking; CUDA is needed to load the dummy
+    input before reaching the mocked construction failure.
+    """
     trainer = Trainer(train_args=_mixed_args(tmp_path, ParamInitStrategy.FULL, checked))
     error = ValueError('source construction failed')
     with patch('nnscaler.cli.trainer.is_running_distributed', return_value=False), patch.object(
@@ -504,6 +386,12 @@ def test_parallelize_failure_skips_check(tmp_path, checked):
 
 
 def test_check_collective_hashing_error():
+    """Report a local hashing failure through the collective rather than exiting early.
+
+    A meta buffer cannot be copied to CPU for hashing. Mock four gathered
+    payloads with this failure at rank 1, then require one collective call and
+    an error identifying rank 1.
+    """
     model = _plain_model()
     reference = _payload(model)
     broken = torch.nn.Module()

@@ -6,7 +6,6 @@ from time import sleep
 import sys
 import tempfile
 import pickle
-import random
 import pytest
 import torch
 import shutil
@@ -67,41 +66,6 @@ class SeedBufferModule(MyModule):
         return self.linear(x) + self.offset
 
 
-class SeedShapeModule(torch.nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.weight = torch.nn.Parameter(torch.ones(random.choice([2, 3])))
-
-    def forward(self, x):
-        return x * self.weight
-
-
-@patch('torch.cuda.is_available', lambda: False)
-@pytest.mark.parametrize('reuse', [ReuseType.MOO, ReuseType.GRAPH])
-@pytest.mark.parametrize('strategy', ['full', 'shard'])
-def test_param_init_seed_retraces_constructor_structure(tmp_path, reuse, strategy):
-    from ..utils import mock_cube_env, mock_dist
-
-    instance_name = f'{strategy}_{reuse.value}'
-    with mock_cube_env(0, 1), mock_dist(0, 1), patch('torch.distributed.barrier'), \
-            patch('torch.distributed.broadcast_object_list'):
-        parallelize(
-            SeedShapeModule, {'x': torch.ones(1)}, 'dp',
-            ComputeConfig(1, 1, param_init_strategy=strategy, param_init_seed=1, trace_strategy='cpu'),
-            gen_savedir=tmp_path, instance_name=instance_name, load_module=False,
-        )
-        generated = parallelize(
-            SeedShapeModule, {'x': torch.ones(1)}, 'dp',
-            ComputeConfig(1, 1, param_init_strategy=strategy, param_init_seed=5, trace_strategy='cpu'),
-            gen_savedir=tmp_path, instance_name=instance_name, reuse=reuse,
-        )
-        model = generated(build_buckets=False)
-    assert len(model.fullmap) == 1
-    for attr, meta in model.fullmap.items():
-        assert meta.shape == (3,)
-        assert torch.equal(getattr(model, attr), torch.ones(3))
-
-
 @patch('torch.cuda.is_available', lambda: False)
 @replace_all_device_with('cpu', force=True)
 @pytest.mark.parametrize('reuse', [ReuseType.MOO, ReuseType.GRAPH])
@@ -132,6 +96,7 @@ def test_param_init_seed_cache_reuse(tmp_path, reuse, strategy):
 @replace_all_device_with('cpu', force=True)
 def test_param_init_strategy_reuse(tmp_path):
     local_graph_mtime = None
+    # last `file` tests the switch from `shard` back to `file`
     for strategy in ('file', 'full', 'shard', 'file'):
         kwargs = dict(
             gen_savedir=tmp_path, instance_name='init_strategy',

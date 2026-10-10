@@ -163,6 +163,7 @@ def test_shard_init_accepts_single_argument_call(tmp_path, wrap):
 @pytest.mark.parametrize('module_class', [LocalInitModule, ShardInitModule])
 @pytest.mark.parametrize('source_instance', [False, True])
 def test_param_init_callback_attachment(tmp_path, strategy, module_class, source_instance):
+    """Test that the parameter initialization callback is correctly attached to the generated module."""
     source = module_class() if source_instance else module_class
     has_hook = strategy == 'shard' and module_class is ShardInitModule
     uses_hook = has_hook and not source_instance
@@ -212,6 +213,9 @@ def test_param_init_strategy_reload(tmp_path):
                 module = generated(build_buckets=False)
                 assert module.compute_config.param_init_strategy == strategy
                 current_mtime = (module.module_dir / 'graph.ckp').stat().st_mtime_ns
+                # reuse graph when full->shard transition occurs
+                # but can't reuse the graph when shard->full transition occurs
+                # because full needs extra npbuffer.pt file.
                 if graph_mtime is not None:
                     assert (current_mtime == graph_mtime) == (strategy == 'shard')
                 graph_mtime = current_mtime
@@ -227,6 +231,7 @@ def test_param_init_strategy_reload(tmp_path):
 
 def _local_init_worker(tmp_path):
     nnscaler.init()
+    # test paralle module always use the weights from the original module if provided
     for strategy in ('full', 'shard'):
         torch.manual_seed(1234)
         original = LocalInitModule().eval()

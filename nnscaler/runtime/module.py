@@ -1200,10 +1200,10 @@ class ParallelModule(CubeModule):
     compute_config: 'ComputeConfig'
     origin_module_metadata: OriginModuleMetadata
     # function to initialize the module, should return an instance of the original Module
-    # will be assigned when parallel module is loaded via `parallelize`
+    # Set by parallelize for FULL, or SHARD without a user __shard__init__.
     _init_module_fn: ClassVar[Optional[Callable[[], torch.nn.Module]]] = None
     # optional seeded wrapper yielding user-initialized local tensors with generated attribute names
-    # will be assigned when parallel module is loaded via `parallelize`
+    # Set by parallelize for SHARD with a user __shard__init__.
     _shard_init_fn: ClassVar[
         Optional[Callable[[Dict[str, AttrMeta]], Generator[Tuple[str, torch.Tensor], None, None]]]
     ] = None

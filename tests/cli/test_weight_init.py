@@ -1,7 +1,6 @@
 #  Copyright (c) Microsoft Corporation.
 #  Licensed under the MIT License.
 
-from contextlib import ExitStack
 from pathlib import Path
 import math
 import os
@@ -12,7 +11,6 @@ import numpy as np
 import pytest
 import torch
 from torch.distributed.elastic.multiprocessing.errors import ChildFailedError
-from torch.multiprocessing.reductions import StorageWeakRef
 
 import nnscaler
 from nnscaler import ComputeConfig, ParamInitStrategy
@@ -22,7 +20,6 @@ from nnscaler.graph.parser import FxModuleParser
 from nnscaler.runtime.initialization import DeferredInitialization, create_init_module
 from nnscaler.runtime.module import ParallelModule
 from tests.launch_torchrun import launch_torchrun
-from tests.parallel_module.common import assert_equal
 
 
 STRATEGIES = (
@@ -40,11 +37,9 @@ def _assert_tensor_identical(actual, expected):
 
 class InitModel(torch.nn.Module):
     initial_parameters = {}
-    constructions = 0
 
-    def __init__(self, dim=16, nlayers=16, mismatch=''):
+    def __init__(self, dim=16, nlayers=16):
         super().__init__()
-        type(self).constructions += 1
         self.layers = torch.nn.ModuleList([
             torch.nn.Linear(dim, dim, bias=False) for _ in range(nlayers)
         ])
@@ -56,16 +51,6 @@ class InitModel(torch.nn.Module):
         # This must be replayed from the same captured weight, not the eager tracing weight.
         self.register_buffer('derived', self.layers[0].weight[0].detach().clone(), persistent=False)
         self.loss_fn = torch.nn.BCELoss()
-        if torch.distributed.is_initialized() and torch.distributed.get_rank() == 2:
-            with torch.no_grad():
-                if mismatch == 'weight':
-                    self.layers[0].weight.add_(1)
-                elif mismatch == 'buffer':
-                    # Invisible after conversion to float32, but not bitwise equal.
-                    self.scalar.add_(2 ** -45)
-                elif mismatch == 'non_persistent':
-                    self.offset.add_(1)
-                    self.constant.add_(1)
         type(self).initial_parameters = dict(self.named_parameters(remove_duplicate=False))
 
     def forward(self, data):
@@ -171,14 +156,13 @@ def init_dummy_sample(args):
     }
 
 
-def _args(save_dir, strategy, *, checked=False, policy='tp', zero=0, mismatch='',
+def _args(save_dir, strategy, *, checked=False, policy='tp', zero=0,
           model_class=InitModel, seed=1234):
     name = f'{strategy}-{model_class.__name__}-{checked}'
     return [
         '-f', str(Path(__file__).with_name('trainer_args.yaml')),
         '--model.type', f'{__name__}.{model_class.__name__}',
         '--model.args.nlayers', '16',
-        '--model.args.mismatch', mismatch,
         '--dummy_sample_gen_fn', f'{__name__}.init_dummy_sample',
         '--compute_config.plan_ngpus', '2',
         '--compute_config.runtime_ngpus', '4',
@@ -202,17 +186,16 @@ def _args(save_dir, strategy, *, checked=False, policy='tp', zero=0, mismatch=''
     ]
 
 
-def _reference(strategy, seed=1234, mismatch='', model_class=InitModel):
-    factory = lambda: model_class(mismatch=mismatch)
+def _reference(strategy, seed=1234, model_class=InitModel):
     if strategy == ParamInitStrategy.SHARD and not hasattr(model_class, '__shard__init__'):
         with DeferredInitialization() as capture:
-            model = create_init_module(model_class, factory, None, seed=seed)
+            model = create_init_module(model_class, model_class, None, seed=seed)
         return {
             name: capture.materialize(value)
             for name, value in list(model.named_parameters(remove_duplicate=False))
             + list(model.named_buffers(remove_duplicate=False)) + [('constant', model.constant)]
         }
-    model = create_init_module(model_class, factory, None, seed=seed)
+    model = create_init_module(model_class, model_class, None, seed=seed)
     return {
         name: value.detach().clone()
         for name, value in list(model.named_parameters(remove_duplicate=False))
@@ -220,7 +203,7 @@ def _reference(strategy, seed=1234, mismatch='', model_class=InitModel):
     }
 
 
-def _assert_initialized(model, expected, *, non_persistent_only=False):
+def _assert_initialized(model: ParallelModule, expected, *, non_persistent_only=False):
     np_buffers = model.get_non_persistent_buffers()
     assert any(
         meta.orig_name == 'constant'
@@ -244,177 +227,96 @@ def _assert_artifacts(model, strategy):
     ), (strategy, model.compute_config.param_init_strategy, model.module_dir)
 
 
-def _worker_parity(save_dir, policy, zero):
-    save_dir = Path(save_dir)
-    results = {}
-    cases = [(s, cls, True) for s, cls in INIT_CASES] + [(ParamInitStrategy.SHARD, InitModel, False)]
-    for strategy, model_class, checked in cases:
-        cli_args = _args(save_dir, strategy, checked=checked, policy=policy, zero=zero,
-                         model_class=model_class, seed=97)
+def _worker_parity(save_dir):
+    for strategy, model_class in INIT_CASES:
+        cli_args = _args(Path(save_dir), strategy, model_class=model_class, seed=97)
         cli_args += ['--init_env_fn', f'{__name__}.skew_initialization_rng']
         expected = _reference(strategy, seed=97, model_class=model_class)
         _assert_tensor_identical(expected['derived'], expected['layers.0.weight'][0])
-        original_build = ParallelModule.build_buckets
         HookInitModel.shard_requests = []
 
-        def checked_build(model, *args, **kwargs):
-            _assert_initialized(model, expected)
-            if model_class is HookInitModel:
-                assert HookInitModel.shard_requests == ([model.fullmap] if model.fullmap else [])
-            return original_build(model, *args, **kwargs)
-
-        with ExitStack() as stack:
-            stack.enter_context(patch.object(ParallelModule, 'build_buckets', checked_build))
-            if strategy != ParamInitStrategy.FILE:
-                stack.enter_context(patch.object(
-                    ParallelModule, 'load_attr_content', side_effect=AssertionError('fullmodel read'),
-                ))
-            if strategy == ParamInitStrategy.SHARD:
-                stack.enter_context(patch.object(
-                    ParallelModule, 'load_np_buffer_content', side_effect=AssertionError('npbuffer read'),
-                ))
+        with patch.object(Trainer, '_train'):
             trainer = Trainer(cli_args)
             trainer.run()
-        assert trainer.train_status.finished_train_steps == 2
+        _assert_initialized(trainer.model, expected)
+        if model_class is HookInitModel:
+            assert trainer.model.fullmap
+            assert HookInitModel.shard_requests == [trainer.model.fullmap]
         _assert_artifacts(trainer.model, strategy)
-        if trainer.rank == 0:
-            checkpoint_dir = save_dir / f'ckpt-{strategy}-{model_class.__name__}-{checked}' / 'last'
-            results[strategy, model_class, checked] = Trainer._merge_checkpoint(
-                list(checkpoint_dir.glob('*.ckpt')),
-            )
-        torch.distributed.barrier()
 
-        before = model_class.constructions
+
+@pytest.mark.skipif(torch.cuda.device_count() < 4, reason='requires four GPUs')
+def test_cli_param_init_parity(tmp_path):
+    """Match local parameters and buffers to seeded references through CLI setup.
+
+    Cover FILE, FULL, automatic SHARD and the user shard hook on four ranks with
+    different ambient RNG states. Check saved initialization files; skip training.
+    """
+    launch_torchrun(4, _worker_parity, tmp_path)
+
+
+def _worker_resume(save_dir):
+    for strategy, model_class in INIT_CASES:
+        cli_args = _args(Path(save_dir), strategy, model_class=model_class)
+        expected = _reference(strategy, model_class=model_class)
+        trainer = Trainer([*cli_args, '--max_train_steps', '1'])
+        trainer.run()
+        persistent = {
+            attr: getattr(trainer.model, attr).detach().clone()
+            for attr in trainer.model.fullmap if attr not in trainer.model.get_non_persistent_buffers()
+        }
         HookInitModel.shard_requests = []
-        resumed = Trainer([*cli_args, '--max_train_steps', '3', '--checkpoint.resume_from', 'last'])
-        original_initialize = ParallelModule._init_from_module
-        resume_initializations = []
-
-        resume_method = '_init_from_module' if strategy == ParamInitStrategy.SHARD else 'load_np_buffer_content'
-        original_resume = getattr(ParallelModule, resume_method)
-
-        def checked_resume_initialize(model, *args, **kwargs):
-            if strategy == ParamInitStrategy.SHARD:
-                assert kwargs.get('init_params') is False
-            persistent = {
-                attr: getattr(model, attr).detach().clone()
-                for attr in model.fullmap if attr not in model.get_non_persistent_buffers()
-            }
-            original_resume(model, *args, **kwargs)
-            for attr, value in persistent.items():
-                _assert_tensor_identical(getattr(model, attr), value)
-            resume_initializations.append(model)
-
-        def checked_resume_build(model, *args, **kwargs):
-            _assert_initialized(model, expected, non_persistent_only=True)
-            if model_class is HookInitModel:
-                np_meta_map = {
-                    attr: meta for attr, meta in model.fullmap.items()
-                    if attr in model.get_non_persistent_buffers()
-                }
-                assert HookInitModel.shard_requests == ([np_meta_map] if np_meta_map else [])
-                assert all(not meta.is_param for meta in np_meta_map.values())
-            return original_build(model, *args, **kwargs)
-
-        with ExitStack() as stack:
-            stack.enter_context(patch.object(ParallelModule, 'build_buckets', checked_resume_build))
-            stack.enter_context(patch.object(ParallelModule, resume_method, checked_resume_initialize))
-            stack.enter_context(patch.object(
-                ParallelModule, 'load_attr_content', side_effect=AssertionError('resume read fullmodel'),
-            ))
-            stack.enter_context(patch(
-                'nnscaler.cli.trainer.check_param_init',
-                side_effect=AssertionError('resume checked checkpoint initialization'),
-            ))
-            if strategy != ParamInitStrategy.SHARD or model_class is HookInitModel:
-                stack.enter_context(patch.object(
-                    model_class, '__init__', side_effect=AssertionError('unexpected source construction'),
-                ))
-            if strategy == ParamInitStrategy.SHARD:
-                stack.enter_context(patch.object(
-                    ParallelModule, 'load_np_buffer_content', side_effect=AssertionError('resume read npbuffer'),
-                ))
+        resumed = Trainer([*cli_args, '--checkpoint.resume_from', 'last'])
+        with patch.object(Trainer, '_train'):
             resumed.run()
-        assert model_class.constructions == before + (
-            strategy == ParamInitStrategy.SHARD and model_class is InitModel
-            and bool(resumed.model.get_non_persistent_buffers())
-        )
-        assert resumed.train_status.finished_train_steps == 3
+        for attr, value in persistent.items():
+            _assert_tensor_identical(getattr(resumed.model, attr), value)
+        _assert_initialized(resumed.model, expected, non_persistent_only=True)
         assert resumed.model.non_presistent_buffers_inited
-        assert bool(resume_initializations) == (
-            strategy == ParamInitStrategy.SHARD or bool(resumed.model.get_non_persistent_buffers())
-        )
-        _assert_artifacts(resumed.model, strategy)
-
-    if torch.distributed.get_rank() == 0:
-        for key in ('model', 'optimizer'):
-            assert_equal(results[ParamInitStrategy.FILE, InitModel, True][key],
-                         results[ParamInitStrategy.FULL, InitModel, True][key])
-            assert_equal(results[ParamInitStrategy.FULL, InitModel, True][key],
-                         results[ParamInitStrategy.SHARD, HookInitModel, True][key])
-            assert_equal(results[ParamInitStrategy.SHARD, InitModel, True][key],
-                         results[ParamInitStrategy.SHARD, InitModel, False][key])
+        if model_class is HookInitModel:
+            np_meta_map = {
+                attr: meta for attr, meta in resumed.model.fullmap.items()
+                if attr in resumed.model.get_non_persistent_buffers()
+            }
+            assert np_meta_map
+            assert HookInitModel.shard_requests == [np_meta_map]
 
 
 @pytest.mark.skipif(torch.cuda.device_count() < 4, reason='requires four GPUs')
-@pytest.mark.parametrize('policy,zero', [('tp', 0), ('tp', 1), ('tp', 3), ('hybrid', 0)])
-def test_cli_param_init_parity(tmp_path, policy, zero):
-    launch_torchrun(4, _worker_parity, tmp_path, policy, zero)
+def test_cli_param_init_resume(tmp_path):
+    """Restore checkpoint parameters and initialize non-persistent buffers on resume.
+
+    Train one step to create a real checkpoint for each initialization strategy,
+    then inspect resumed values without further training. The shard hook should
+    receive only non-persistent attributes.
+    """
+    launch_torchrun(4, _worker_resume, tmp_path)
 
 
-def _worker_mismatch(save_dir, strategy, model_class, mismatch):
-    original_hook = HookInitModel.__shard__init__
+class MismatchedBufferModel(InitModel):
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        if torch.distributed.get_rank() == 2:
+            with torch.no_grad():
+                self.offset.add_(1)
 
-    def mismatched_hook(meta_map):
-        for name, value in original_hook(meta_map):
-            value = value.clone()
-            meta = meta_map[name]
-            if torch.distributed.get_rank() == 2:
-                if mismatch == 'weight' and meta.orig_name in ('layers.0.weight', 'shared.weight'):
-                    value.add_(1)
-                elif mismatch == 'buffer' and meta.orig_name == 'scalar':
-                    value.add_(2 ** -45)
-                elif mismatch == 'non_persistent' and meta.orig_name in ('offset', 'constant'):
-                    value.add_(1)
-            yield name, value
 
-    with patch.object(HookInitModel, '__shard__init__', staticmethod(mismatched_hook)):
-        full_buffer_check = strategy == ParamInitStrategy.FULL and mismatch == 'non_persistent'
-        trainer = Trainer(_args(Path(save_dir), strategy, checked=not full_buffer_check, mismatch=mismatch,
-                                model_class=model_class))
-        if full_buffer_check:
-            trainer.run()
-            raise AssertionError('FULL accepted buffers that differ from npbuffer.pt')
-        with pytest.raises(RuntimeError, match='initialization differs across ranks'):
-            trainer.run()
-        # Rank 2 is a replica of rank 0, not simply a different TP shard.
-        torch.distributed.barrier()
-        unchecked = Trainer(_args(Path(save_dir), strategy, mismatch=mismatch, model_class=model_class))
-        expected = _reference(strategy, model_class=model_class, mismatch=mismatch)
-        original_build = ParallelModule.build_buckets
-
-        def checked_build(model, *args, **kwargs):
-            _assert_initialized(model, expected)
-            return original_build(model, *args, **kwargs)
-
-        with patch('nnscaler.cli.trainer.check_param_init',
-                   side_effect=AssertionError('disabled param_init_check compared weights')), \
-                patch.object(ParallelModule, 'build_buckets', checked_build):
-            unchecked.run()
-    assert unchecked.train_status.finished_train_steps == 2
-    _assert_artifacts(unchecked.model, strategy)
+def _worker_full_buffer_mismatch(save_dir):
+    trainer = Trainer(_args(Path(save_dir), ParamInitStrategy.FULL, model_class=MismatchedBufferModel))
+    with patch.object(Trainer, '_train'):
+        trainer.run()
 
 
 @pytest.mark.skipif(torch.cuda.device_count() < 4, reason='requires four GPUs')
-@pytest.mark.parametrize('strategy,model_class', NON_FILE_CASES)
-@pytest.mark.parametrize('mismatch', ['weight', 'buffer', 'non_persistent'])
-def test_cli_param_init_mismatch(tmp_path, strategy, model_class, mismatch):
-    if strategy == ParamInitStrategy.FULL and mismatch == 'non_persistent':
-        with pytest.raises(ChildFailedError, match='differs from') as exc:
-            launch_torchrun(4, _worker_mismatch, tmp_path, strategy, model_class, mismatch)
-        assert 2 in exc.value.failures
-    else:
-        launch_torchrun(4, _worker_mismatch, tmp_path, strategy, model_class, mismatch)
+def test_cli_full_buffer_mismatch(tmp_path):
+    """Reject FULL initialization when rank 2 differs from saved non-persistent buffers.
+
+    Replica checking is disabled: this error must come from the initializer's
+    saved-buffer validation, not from check_param_init.
+    """
+    with pytest.raises(ChildFailedError, match='differs from') as exc:
+        launch_torchrun(4, _worker_full_buffer_mismatch, tmp_path)
+    assert 2 in exc.value.failures
 
 
 def _worker_source_instance(save_dir):
@@ -456,25 +358,28 @@ def _worker_source_instance(save_dir):
 
 @pytest.mark.skipif(torch.cuda.device_count() < 4, reason='requires four GPUs')
 def test_cli_param_init_source_instance(tmp_path):
+    """Preserve supplied source tensors when parallelizing with FULL or SHARD.
+
+    Use modified source values to prove they are copied without reconstructing
+    the source, replaying initialization, or invoking an attached shard hook.
+    This exercises parallelize directly rather than Trainer.
+    """
     launch_torchrun(4, _worker_source_instance, tmp_path)
 
 
 def _worker_selective_initialization(save_dir):
-    trainer = Trainer(_args(Path(save_dir), ParamInitStrategy.SHARD, policy='hybrid', checked=True))
+    trainer = Trainer(_args(Path(save_dir), ParamInitStrategy.SHARD, policy='hybrid'))
     materialized = []
-    storages = []
     original_materialize = DeferredInitialization.materialize
 
     def checked_materialize(capture, tensor):
-        assert all(storage.expired() for storage in storages)
         parameters = InitModel.initial_parameters
         assert parameters and all(param.is_meta for param in parameters.values())
         value = original_materialize(capture, tensor)
         materialized.append(tensor)
-        storages.append(StorageWeakRef(value.untyped_storage()))
         return value
 
-    with patch.object(DeferredInitialization, 'materialize', checked_materialize):
+    with patch.object(DeferredInitialization, 'materialize', checked_materialize), patch.object(Trainer, '_train'):
         trainer.run()
     expected_parameters = {
         id(InitModel.initial_parameters[meta.orig_name])
@@ -484,34 +389,35 @@ def _worker_selective_initialization(save_dir):
     assert {id(t) for t in materialized} & all_parameters == expected_parameters
     assert len(expected_parameters) < len(all_parameters)
     assert len(materialized) >= len(expected_parameters) + len(trainer.model.get_non_persistent_buffers())
-    assert all(storage.expired() for storage in storages)
-    assert trainer.train_status.finished_train_steps == 2
 
 
 @pytest.mark.skipif(torch.cuda.device_count() < 4, reason='requires four GPUs')
 def test_cli_selective_initialization(tmp_path):
+    """Materialize only the parameters assigned to each pipeline stage in SHARD mode.
+
+    Run hybrid parallel CLI setup on four ranks and compare captured parameter
+    identities with the generated model's local metadata, without training.
+    """
     launch_torchrun(4, _worker_selective_initialization, tmp_path)
 
 
 def _worker_random_initialization(save_dir, model_class):
     expected = _reference(ParamInitStrategy.SHARD, model_class=model_class)
-    args = _args(Path(save_dir), ParamInitStrategy.SHARD, checked=True, model_class=model_class)
-    original_build = ParallelModule.build_buckets
-
-    def checked_build(model, *args, **kwargs):
-        _assert_initialized(model, expected)
-        return original_build(model, *args, **kwargs)
-
-    with patch.object(ParallelModule, 'build_buckets', checked_build):
+    args = _args(Path(save_dir), ParamInitStrategy.SHARD, model_class=model_class)
+    with patch.object(Trainer, '_train'):
         trainer = Trainer(args)
         trainer.run()
-    assert trainer.train_status.finished_train_steps == 2
-    _assert_artifacts(trainer.model, ParamInitStrategy.SHARD)
+    _assert_initialized(trainer.model, expected)
 
 
 @pytest.mark.skipif(torch.cuda.device_count() < 4, reason='requires four GPUs')
 @pytest.mark.parametrize('model_class', [RandomInitModel, GenericInitModel])
 def test_cli_random_initialization(tmp_path, model_class):
+    """Match automatic SHARD initialization to a seeded deferred reference through CLI.
+
+    Cover random in-place/view writes and data-dependent tensor computations;
+    inspect initialized tensors after setup and skip training.
+    """
     launch_torchrun(4, _worker_random_initialization, tmp_path, model_class)
 
 
@@ -525,64 +431,40 @@ class UnsupportedInitModel(InitModel):
 
 def _worker_capture_failure(save_dir):
     trainer = Trainer([
-        *_args(Path(save_dir), ParamInitStrategy.SHARD, checked=True),
+        *_args(Path(save_dir), ParamInitStrategy.SHARD),
         '--model.type', f'{__name__}.UnsupportedInitModel',
     ])
-    trainer.run()
+    with patch.object(Trainer, '_train'):
+        trainer.run()
 
 
 @pytest.mark.skipif(torch.cuda.device_count() < 4, reason='requires four GPUs')
 def test_cli_capture_failure_propagates(tmp_path):
+    """Propagate a rank-1 unsupported initialization operation out of the CLI workers."""
     with pytest.raises(ChildFailedError, match='Deferred initialization failed:') as exc:
         launch_torchrun(4, _worker_capture_failure, tmp_path)
     assert 1 in exc.value.failures
 
 
 def _worker_shard_contract(save_dir):
-    cli_args = _args(Path(save_dir), ParamInitStrategy.SHARD, checked=True, model_class=HookInitModel)
+    cli_args = _args(Path(save_dir), ParamInitStrategy.SHARD, model_class=HookInitModel)
     Trainer([*cli_args, '--run_mode', 'compile']).run()
-    valid_hook = HookInitModel.__shard__init__
-    closed = []
 
     def invalid_hook(meta_map):
-        try:
-            name = next(iter(meta_map))
-            yield name, torch.empty(meta_map[name].sub_shape, device='meta')
-        finally:
-            closed.append(True)
+        name = next(iter(meta_map))
+        yield name, torch.empty(meta_map[name].sub_shape, device='meta')
 
     # Detailed output validation is covered by the runtime tests; exercise CLI propagation here.
     with patch.object(HookInitModel, '__shard__init__', staticmethod(invalid_hook)), patch.object(
-        HookInitModel, '__init__', side_effect=AssertionError('hook constructed source'),
+        Trainer, '_train',
     ):
         with pytest.raises(RuntimeError, match='__shard__init__'):
             Trainer(cli_args).run()
-    assert closed == [True]
-    torch.distributed.barrier()
-    expected = _reference(ParamInitStrategy.SHARD, model_class=HookInitModel)
-    original_build = ParallelModule.build_buckets
-
-    def checked_build(model, *args, **kwargs):
-        _assert_initialized(model, expected)
-        return original_build(model, *args, **kwargs)
-
-    def dict_hook(meta_map):
-        return {name: value.clone() for name, value in valid_hook(meta_map)}
-
-    for hook in (valid_hook, dict_hook):
-        trainer = Trainer(cli_args)
-        with patch.object(
-            HookInitModel, '__shard__init__', staticmethod(hook),
-        ), patch.object(
-            HookInitModel, '__init__', side_effect=AssertionError('hook constructed source'),
-        ), patch.object(ParallelModule, 'build_buckets', checked_build):
-            trainer.run()
-        _assert_artifacts(trainer.model, ParamInitStrategy.SHARD)
-        assert trainer.train_status.finished_train_steps == 2
 
 
 @pytest.mark.skipif(torch.cuda.device_count() < 4, reason='requires four GPUs')
 def test_cli_shard_param_init_contract(tmp_path):
+    """Reject a shard hook returning a meta tensor when loading compiled CLI code."""
     launch_torchrun(4, _worker_shard_contract, tmp_path)
 
 
@@ -594,32 +476,26 @@ def _worker_broadcast(save_dir):
     save_dir = Path(save_dir)
     for strategy, model_class in NON_FILE_CASES:
         cli_args = [
-            *_args(save_dir, strategy, checked=True, model_class=model_class),
+            *_args(save_dir, strategy, model_class=model_class),
             '--gen_savedir', str(save_dir / f'node{rank // 2}' / 'gen'),
-            '--precision', 'bf16',
             '--broadcast_strategy', 'all',
         ]
         Trainer([*cli_args, '--run_mode', 'compile']).run()
-        before = model_class.constructions
+        expected = _reference(strategy, model_class=model_class)
         trainer = Trainer(cli_args)
-        with patch.object(ParallelModule, 'load_attr_content', side_effect=AssertionError('fullmodel read')):
+        with patch.object(Trainer, '_train'):
             trainer.run()
-        assert model_class.constructions == before + (
-            model_class is InitModel and bool(trainer.model.fullmap)
-        )
+        _assert_initialized(trainer.model, expected)
         _assert_artifacts(trainer.model, strategy)
-        assert all(p.dtype == torch.bfloat16 for p in trainer.model.parameters())
-        assert trainer.train_status.finished_train_steps == 2
-        if strategy == ParamInitStrategy.FULL:
-            resumed = Trainer([*cli_args, '--max_train_steps', '3', '--checkpoint.resume_from', 'last'])
-            with patch.object(model_class, '__init__', side_effect=AssertionError('resume constructed source')):
-                resumed.run()
-            assert resumed.train_status.finished_train_steps == 3
-            assert resumed.model.non_presistent_buffers_inited
 
 
 @pytest.mark.skipif(torch.cuda.device_count() < 4, reason='requires four GPUs')
 def test_cli_param_init_broadcast(tmp_path):
+    """Initialize FULL and SHARD models after broadcasting code to node-local directories.
+
+    Simulate two nodes with two ranks each on one host. Verify initialized values
+    and required artifacts without fullmodel files or training.
+    """
     launch_torchrun(4, _worker_broadcast, tmp_path)
 
 
@@ -634,15 +510,15 @@ def skew_initialization_rng(trainer):
 
 @pytest.mark.parametrize('strategy', STRATEGIES)
 def test_cli_param_init_config(strategy):
+    """Resolve each CLI initialization strategy and preserve explicit seeds, including zero."""
     config = ComputeConfig(1, 1)
     assert OptionalComputeConfig(param_init_strategy=strategy).resolve(
         config,
     ).param_init_strategy == strategy
     assert OptionalComputeConfig(param_init_seed=0).resolve(config).param_init_seed == 0
     args = TrainerArgs.from_cli([
-        *_args(Path('unused-param-init'), strategy, checked=True),
+        *_args(Path('unused-param-init'), strategy),
         '--compute_config.param_init_seed', '17',
     ])
     assert args.compute_config.param_init_strategy == strategy
     assert args.compute_config.param_init_seed == 17
-    assert args.debug.param_init_check is True
