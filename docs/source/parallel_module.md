@@ -46,6 +46,9 @@ The parser APIs use a single `save_level` argument with `AttrSaveLevel`
 | `MN` | `dist_param_map.pt` and `npbuffer.pt` |
 | `ALL` (default) | All three categories |
 
+`AttrSaveLevel` is an `IntFlag`; levels can be combined with bitwise OR,
+for example `AttrSaveLevel.M | AttrSaveLevel.F`.
+
 `parallelize` selects `ALL` for `file`, `MN` for `full`,
 and `M` for `shard`.
 Construction uses the original class, or the `module_fn` supplied to `parallelize`.

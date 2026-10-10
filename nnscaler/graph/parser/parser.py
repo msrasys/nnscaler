@@ -3,7 +3,7 @@
 
 import torch
 import logging
-from enum import IntEnum
+from enum import IntFlag
 from pathlib import Path
 from typing import Any, List, Tuple, Callable, Union, Dict, Type, Optional
 
@@ -30,7 +30,7 @@ _logger = logging.getLogger(__name__)
 SELF_GETATTR_SIG = 'self_getattr'
 
 
-class AttrSaveLevel(IntEnum):
+class AttrSaveLevel(IntFlag):
     """Attribute file selections, with one bit per artifact category."""
 
     NONE = 0
@@ -39,8 +39,8 @@ class AttrSaveLevel(IntEnum):
     N = 2  # Non-persistent buffers (npbuffer.pt).
     F = 4  # Full attribute contents, including parameters and all buffers (fullmodel.pt.*).
 
-    MN = 3 # M + N
-    ALL = 7
+    MN = M | N
+    ALL = M | N | F
 
 
 class FxModuleParser:

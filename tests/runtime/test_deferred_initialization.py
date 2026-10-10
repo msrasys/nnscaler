@@ -1251,6 +1251,7 @@ def test_python_matrix_initializers():
     assert torch.equal(values, capture.materialize(sparse))
 
 
+@pytest.mark.skipif(torch.__version__ < (2, 2), reason='Library.define tags require PyTorch 2.2+')
 def test_python_initializer_inside_concrete_fallback(python_trunc_normal, caplog):
     """Execute, rather than recapture, an initializer inside a real custom-op fallback."""
     lib = torch.library.Library('deferred_python_initializer_test', 'DEF')
@@ -1292,6 +1293,7 @@ def test_generic_aliasing_outputs_are_rejected(operation):
     assert torch.equal(capture.materialize(source), expected)
 
 
+@pytest.mark.skipif(torch.__version__ < (2, 2), reason='Library.define tags require PyTorch 2.2+')
 @pytest.mark.parametrize('use_cuda_rng', [False, True])
 def test_missing_meta_custom_operation_replays_shared_outputs_and_preserves_rng(caplog, use_cuda_rng):
     from torch.multiprocessing.reductions import StorageWeakRef
@@ -1396,6 +1398,7 @@ def test_factory_missing_meta_fallback_replays_with_captured_dtype(caplog):
         torch.set_default_dtype(previous_dtype)
 
 
+@pytest.mark.skipif(torch.__version__ < (2, 2), reason='Library.define tags require PyTorch 2.2+')
 @pytest.mark.parametrize("use_generator", [False, True])
 def test_generic_positional_generator_and_following_arguments(use_generator):
     namespace = f"deferred_init_generator_{int(use_generator)}"
@@ -1446,6 +1449,7 @@ def test_writes_reject_external_and_noncontiguous(operation, arguments):
     assert torch.equal(external, torch.ones(3))
 
 
+@pytest.mark.skipif(torch.__version__ < (2, 4), reason='torch.library.register_fake requires PyTorch 2.4+')
 @pytest.mark.parametrize("tag", [
     torch.Tag.dynamic_output_shape, torch.Tag.data_dependent_output,
 ])

@@ -151,6 +151,8 @@ def test_record_metadata():
     (AttrSaveLevel.N, {'npbuffer.pt'}),
     (AttrSaveLevel.F, {'fullmodel.pt.0', 'fullmodel.pt.index'}),
     (AttrSaveLevel.MN, {'dist_param_map.pt', 'npbuffer.pt'}),
+    (AttrSaveLevel.M | AttrSaveLevel.F, {'dist_param_map.pt', 'fullmodel.pt.0', 'fullmodel.pt.index'}),
+    (AttrSaveLevel.N | AttrSaveLevel.F, {'npbuffer.pt', 'fullmodel.pt.0', 'fullmodel.pt.index'}),
     (AttrSaveLevel.ALL, {'dist_param_map.pt', 'npbuffer.pt', 'fullmodel.pt.0', 'fullmodel.pt.index'}),
 ])
 def test_attribute_save_levels(save_level, expected_files):
