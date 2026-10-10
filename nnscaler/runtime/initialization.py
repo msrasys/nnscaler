@@ -70,7 +70,8 @@ def _initialization_rng(seed: Optional[int]):
     with preserve_rng_state() if seed is not None else nullcontext():
         if seed is not None:
             random.seed(seed)
-            np.random.seed(seed)
+            # Deferred node seeds are 63-bit; NumPy's legacy RNG accepts 32-bit seeds.
+            np.random.seed(seed % (2 ** 32))
             # torch.manual_seed also changes other CUDA devices, outside the saved RNG scope.
             torch.random.default_generator.manual_seed(seed)
             if torch.cuda.is_available():
@@ -589,25 +590,27 @@ class DeferredInitialization(TorchDispatchMode):
                 return evaluate(item)
             return item
 
-        def evaluate(node):
+        def evaluate(node: _Node):
             if node in cache:
                 return cache[node]
-            if node.operation is not None:
+            if node.operation is not None:  # virtual node for a projected result
                 result = evaluate(node.operation)
                 for index in node.projection:
                     result = result[index]
-            elif node.target is not None:
+            elif node.target is not None:  # inplace write node
+                # allocate a full tensor for the inplace write (target is the location being written to)
                 result = torch.empty_strided(node.tensor.shape, node.tensor.stride(),
                                              dtype=node.tensor.dtype, device="cpu")
                 if node.previous is not None:
                     result.copy_(evaluate(node.previous))
+                # inplace write to result
                 execute(node, result.as_strided(*node.target))
-            else:
+            else:  # normal node
                 result = execute(node)
             cache[node] = result
             return result
 
-        def execute(node, target=None):
+        def execute(node: _Node, target: Optional[torch.Tensor] = None):
             args = _map(node.args, resolve)
             kwargs = _map(node.kwargs, resolve)
             func = node.func
@@ -625,7 +628,8 @@ class DeferredInitialization(TorchDispatchMode):
             # kernels may also use Python/NumPy/CUDA RNG. Avoid allocating RNG
             # snapshots for native deterministic operations and private generators.
             with _default_dtype(node.default_dtype), (
-                preserve_rng_state() if custom else nullcontext()
+                (_initialization_rng(node.seed) if node.seed is not None else preserve_rng_state())
+                if custom else nullcontext()
             ):
                 if name in self._random_like:
                     # Use the Python API's overload selection, including tensor
@@ -634,9 +638,10 @@ class DeferredInitialization(TorchDispatchMode):
                     func = getattr(torch, name)
                 elif name in self._random_factories:
                     func = getattr(torch, name)
-                if node.seed is not None and (
-                    custom or name in self._random_like or "generator" not in kwargs
+                if not custom and node.seed is not None and (
+                    name in self._random_like or "generator" not in kwargs
                 ):
+                    # use global RNG if the operation does not accept a generator
                     with torch.random.fork_rng(devices=[]):
                         torch.random.default_generator.manual_seed(node.seed)
                         return func(*args, **kwargs)

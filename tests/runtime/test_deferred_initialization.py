@@ -10,7 +10,7 @@ import pytest
 import torch
 from torch.utils._python_dispatch import TorchDispatchMode
 
-from nnscaler.runtime.initialization import DeferredInitialization
+from nnscaler.runtime.initialization import DeferredInitialization, preserve_rng_state
 
 
 class AllocationRecorder(TorchDispatchMode):
@@ -1070,17 +1070,25 @@ def test_generic_aliasing_outputs_are_rejected(operation):
     assert torch.equal(capture.materialize(source), expected)
 
 
-def test_missing_meta_custom_operation_replays_shared_outputs_and_preserves_rng(caplog):
+@pytest.mark.parametrize('use_cuda_rng', [False, True])
+def test_missing_meta_custom_operation_replays_shared_outputs_and_preserves_rng(caplog, use_cuda_rng):
     from torch.multiprocessing.reductions import StorageWeakRef
+
+    if use_cuda_rng and not torch.cuda.is_available():
+        pytest.skip('requires CUDA RNG')
 
     calls = []
     output_storages = []
-    lib = torch.library.Library("deferred_init_test", "FRAGMENT")
+    namespace = f"deferred_init_test_{int(use_cuda_rng)}"
+    lib = torch.library.Library(namespace, "FRAGMENT")
     lib.define("data_op(Tensor x) -> (Tensor, Tensor)", tags=(torch.Tag.nondeterministic_seeded,))
 
     def implementation(x):
         calls.append(1)
-        outputs = x + random.random() + np.random.rand() + torch.rand_like(x), x.nonzero()
+        value = x + random.random() + np.random.rand() + torch.rand_like(x)
+        if use_cuda_rng:
+            value = value + torch.rand((), device='cuda').cpu()
+        outputs = value, x.nonzero()
         output_storages.extend(StorageWeakRef(value.untyped_storage()) for value in outputs)
         return outputs
 
@@ -1088,18 +1096,28 @@ def test_missing_meta_custom_operation_replays_shared_outputs_and_preserves_rng(
     state = torch.get_rng_state()
     python_state = random.getstate()
     numpy_state = np.random.get_state()
+    cuda_state = torch.cuda.get_rng_state() if use_cuda_rng else None
     with AllocationRecorder() as recorder, DeferredInitialization() as capture:
         source = torch.arange(4, dtype=torch.float32)
-        first, second = torch.ops.deferred_init_test.data_op(source)
+        first, second = getattr(torch.ops, namespace).data_op(source)
         downstream = first.sin() + second.sum()
         source.fill_(99)
     assert calls == [1]
     assert any(device == "cpu" for device, _ in recorder.outputs)
     # the output storages should be expired after use in replay.
     assert all(storage.expired() for storage in output_storages)
-    with torch.random.fork_rng(devices=[]):
+    with preserve_rng_state():
+        random.seed(999)
+        np.random.seed(999)
         torch.random.default_generator.manual_seed(999)
+        if use_cuda_rng:
+            torch.cuda.manual_seed(999)
+            replay_cuda_state = torch.cuda.get_rng_state()
         actual = capture.materialize(downstream)
+        assert random.getstate() == random.Random(999).getstate()
+        assert np.array_equal(np.random.get_state()[1], np.random.RandomState(999).get_state()[1])
+        if use_cuda_rng:
+            assert torch.equal(torch.cuda.get_rng_state(), replay_cuda_state)
     assert calls == [1, 1]
     assert all(storage.expired() for storage in output_storages)
     first_value = capture.materialize(first)
@@ -1116,6 +1134,8 @@ def test_missing_meta_custom_operation_replays_shared_outputs_and_preserves_rng(
     assert current_numpy[0] == numpy_state[0]
     assert np.array_equal(current_numpy[1], numpy_state[1])
     assert current_numpy[2:] == numpy_state[2:]
+    if use_cuda_rng:
+        assert torch.equal(torch.cuda.get_rng_state(), cuda_state)
     assert "concrete fallback" in caplog.text
 
 

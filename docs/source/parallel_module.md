@@ -114,6 +114,9 @@ operations are supported. Important limits:
   branches are decided during capture, not reevaluated as dynamic branches.
 - Replay requires CPU implementations. Custom operators must accurately declare
   mutation, aliasing and randomness; external side effects are not replay-safe.
+  For seeded custom operators, replay seeds Python, NumPy, PyTorch CPU and the
+  current CUDA device from the captured node seed, restoring caller RNG states
+  afterward. NumPy uses the seed modulo `2**32`.
 - Tensor literals and external tensor data can retain real storage. Keep external
   inputs unchanged until initialization finishes, and initialize every value
   before reading it; `empty` contents remain unspecified.

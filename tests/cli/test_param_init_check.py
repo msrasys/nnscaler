@@ -312,6 +312,18 @@ def test_param_init_check_default():
     assert DebugConfig().param_init_check is True
 
 
+@pytest.mark.parametrize('initialized', [False, True])
+def test_check_without_peers_skips_hashing(initialized):
+    with patch('nnscaler.cli.trainer.dist.is_initialized', return_value=initialized), patch(
+        'nnscaler.cli.trainer.dist.get_world_size', return_value=1,
+    ), patch('nnscaler.cli.trainer._initialization_digest') as digest, patch(
+        'nnscaler.cli.trainer.dist.all_gather_object',
+    ) as gather:
+        check_param_init(_plain_model())
+        digest.assert_not_called()
+        gather.assert_not_called()
+
+
 def _plain_model(value=0.125):
     model = torch.nn.Module()
     model.weight = torch.nn.Parameter(torch.ones(2))

@@ -46,6 +46,9 @@ def _initialization_digest(tensor: torch.Tensor) -> str:
 
 def check_param_init(model: torch.nn.Module) -> None:
     """Check stored initial replicas across the whole model after bucket construction."""
+    if not dist.is_initialized() or dist.get_world_size() == 1:
+        return
+
     hashes: Dict[Tuple[Any, ...], str] = {}
     error = None
     try:
@@ -81,11 +84,6 @@ def check_param_init(model: torch.nn.Module) -> None:
     except Exception as exc:
         # Every rank must reach the same collective even if local hashing fails.
         error = exc
-
-    if not dist.is_initialized() or dist.get_world_size() == 1:
-        if error is not None:
-            raise error
-        return
 
     payload = (hashes, None if error is None else f'{type(error).__name__}: {error}')
     gathered: List[Optional[Tuple[Dict[Tuple[Any, ...], str], Optional[str]]]] = [None] * dist.get_world_size()

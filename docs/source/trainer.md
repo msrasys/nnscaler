@@ -955,7 +955,8 @@ class DebugConfig:
     replicas, and file-backed `ParallelModule` instances. With ZeRO-3, only
     identical retained intervals are compared, excluding padding; discarded
     values cannot be checked and full parameters are not reconstructed.
-  - **Skipped:** checkpoint resume and compile-only runs. This is a CLI trainer
+  - **Skipped:** checkpoint resume, compile-only runs, and non-distributed or
+    single-rank runs (without computing tensor hashes). This is a CLI trainer
     check, not part of direct `parallelize` or generated-module construction.
 - `profile` (`Optional[ProfileConfig]`): Profiling configuration using
   `torch.profiler.profile`. Set to `None` (default) to disable profiling.
