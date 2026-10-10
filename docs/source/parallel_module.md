@@ -121,6 +121,19 @@ operations are supported. Important limits:
   state or device. Avoid concurrent initialization with other users of
   process-global RNG or default-dtype settings.
 
+The following `torch.nn.init` functions fail automatic capture with PyTorch
+**2.10.0+cu128**, even for ordinary contiguous floating-point parameters:
+
+| Function | Unsupported underlying operation |
+| --- | --- |
+| `eye_` | `torch.eye(..., out=tensor)` uses an `out=` overload. |
+| `orthogonal_` | The wide-matrix path uses the metadata mutation `t_()`; the tall-matrix path fails at `q *= ph`, a noncontiguous, tensor-operand in-place multiplication after QR. |
+| `sparse_` | Indexed assignment uses `aten.index_put_`. |
+
+Their deprecated aliases without the trailing underscore have the same
+limitations. Noncontiguous initialization targets are also unsupported, even
+for otherwise supported initializers such as `uniform_` and `normal_`.
+
 If capture cannot handle a constructor, use `full`, `file`, a supplied initialized
 instance, or a shard hook. Capture does not silently reconstruct a full eager
 model on failure.

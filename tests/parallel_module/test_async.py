@@ -448,7 +448,7 @@ def _gpu_worker_interleaved_pp(tempdir, tp_size=1):
                 pipeline_nmicros=update_freq,
                 pipeline_nstages=stages,
                 pipeline_scheduler='1f1b_interleaved',
-                pp_size=pp_size,
+                pipeline_size=pp_size,
             )
         ),
         gen_savedir=tempdir,
@@ -471,7 +471,7 @@ def _gpu_worker_interleaved_pp(tempdir, tp_size=1):
                 pipeline_nmicros=update_freq,
                 pipeline_nstages=stages,
                 pipeline_scheduler='1f1b_interleaved',
-                pp_size=pp_size,
+                pipeline_size=pp_size,
             )
         ),
         gen_savedir=tempdir,

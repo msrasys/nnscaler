@@ -420,6 +420,7 @@ def test_rng_determinism_private_generators_and_capture_state(explicit_generator
         rng.manual_seed(924)
         with DeferredInitialization() as third_capture:
             third = factory()
+        # The captures use different RNG seeds (923 vs 924), so replayed random values should differ.
         assert not torch.equal(first_capture.materialize(first[0]), third_capture.materialize(third[0]))
 
 
@@ -903,6 +904,7 @@ def test_actual_cpu_allocation_events_exclude_unselected_weights():
     with profile(activities=[ProfilerActivity.CPU], profile_memory=True, acc_events=True) as eager:
         eager_model, eager_snapshots = factory()
     expected_bytes = sum(weight.numel() * weight.element_size() for weight in eager_model.parameters())
+    # original weights + their clones
     assert allocated_bytes(eager) >= 2 * expected_bytes
     del eager_model, eager_snapshots
 
@@ -1025,6 +1027,7 @@ def test_trunc_normal_and_partial_unary_writes():
     with DeferredInitialization() as capture:
         x = torch.empty(256)
         torch.nn.init.trunc_normal_(x, mean=0.2, std=0.4, a=-0.5, b=0.8)
+        # `trunc_normal_` will generate a lot of torch function calls.
         random_node = capture._storage(x).node
         while random_node.seed is None:
             random_node = random_node.previous
@@ -1092,6 +1095,7 @@ def test_missing_meta_custom_operation_replays_shared_outputs_and_preserves_rng(
         source.fill_(99)
     assert calls == [1]
     assert any(device == "cpu" for device, _ in recorder.outputs)
+    # the output storages should be expired after use in replay.
     assert all(storage.expired() for storage in output_storages)
     with torch.random.fork_rng(devices=[]):
         torch.random.default_generator.manual_seed(999)
@@ -1099,9 +1103,9 @@ def test_missing_meta_custom_operation_replays_shared_outputs_and_preserves_rng(
     assert calls == [1, 1]
     assert all(storage.expired() for storage in output_storages)
     first_value = capture.materialize(first)
-    torch.testing.assert_close(actual, first_value.sin() + 6)
+    torch.testing.assert_close(actual, first_value.sin() + 6, rtol=0, atol=0)
     first_value.zero_()
-    torch.testing.assert_close(capture.materialize(downstream), actual)
+    torch.testing.assert_close(capture.materialize(downstream), actual, rtol=0, atol=0)
     assert torch.equal(capture.materialize(second), torch.tensor([[1], [2], [3]]))
     assert calls == [1] * 5
     del first_value
@@ -1134,15 +1138,17 @@ def test_factory_missing_meta_fallback_replays_with_captured_dtype(caplog):
             tensor = torch.ones(4)
             downstream = tensor.sin()
         assert tensor.is_meta
+        # 1 capture fallback
         assert recorder.calls == 1
         torch.set_default_dtype(torch.float32)
         with recorder:
             first = capture.materialize(tensor)
             first.zero_()
             actual = capture.materialize(downstream)
+        # 1 capture fallback + 2 materialize
         assert recorder.calls == 3
         assert actual.dtype == torch.float64
-        torch.testing.assert_close(actual, torch.ones(4, dtype=torch.float64).sin())
+        torch.testing.assert_close(actual, torch.ones(4, dtype=torch.float64).sin(), rtol=0, atol=0)
         assert "concrete fallback" in caplog.text
     finally:
         torch.set_default_dtype(previous_dtype)
@@ -1167,7 +1173,8 @@ def test_generic_positional_generator_and_following_arguments(use_generator):
     state = torch.get_rng_state()
     with DeferredInitialization() as capture:
         result = getattr(torch.ops, namespace).sample(torch.ones(8), generator, 3.)
-    seed = (42 + capture._calls * 0x9E3779B97F4A7C15) % (2 ** 63)
+    seed = capture._storage(result).node.seed
+    assert seed is not None
     with torch.random.fork_rng(devices=[]):
         torch.random.default_generator.manual_seed(seed)
         expected = cpu(torch.ones(8), torch.Generator().manual_seed(seed), 3.)

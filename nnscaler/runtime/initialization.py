@@ -395,6 +395,8 @@ class DeferredInitialization(TorchDispatchMode):
             raise _unsupported(f"unsupported mutation {func}")
 
         # Alias-returning operators (like view/slice) should be handled in `self._view`.
+        # note x.to(x.dtype) will be intercepted in higher level
+        # and will not go to `__torch_dispatch__`
         if any(ret.alias_info is not None for ret in func._schema.returns):
             raise _unsupported(f"unsupported aliasing operation {func}")
 

@@ -256,6 +256,7 @@ def test_capture_initializer_streams_into_model_and_releases_full_sources():
     assert calls == [(4, 6), (6, 4), ()]
     assert all(storage.expired() for storage in full_storages)
     reference = Source()
+    # note first/second/view(weight/tied/transposed) are not shared the same storage here.
     for name, meta in attrs.items():
         value = getattr(module, name)
         assert value.shape == meta.sub_shape
@@ -386,6 +387,9 @@ def test_streaming_shard_failure_closes_hook_and_restores_rng(failure):
 
 
 def test_capture_initializer_yields_views_without_cloning():
+    """
+    Test capture_init_weights yields views without cloning.
+    """
     module = _local_module(ParamInitStrategy.SHARD)
     stream = capture_init_weights(module.fullmap, module_fn=type(module)._init_module_fn)
     try:
@@ -425,6 +429,7 @@ def test_streaming_user_hook_releases_each_source_before_next_allocation():
 @pytest.mark.parametrize('strategy', [ParamInitStrategy.FULL, ParamInitStrategy.SHARD])
 def test_resume_without_nonpersistent_buffers_skips_initializers(strategy):
     module = _local_module(strategy)
+    # Simulate the scenario where non-persistent buffers are missing after loading the module.
     del module.copy_local
     del module._fullmap['copy_local']
     with patch.object(type(module), '_init_module_fn', side_effect=AssertionError('constructor')), patch.object(
