@@ -1155,6 +1155,9 @@ def python_trunc_normal(monkeypatch):
 
     monkeypatch.setattr(torch.nn.init, '_no_grad_trunc_normal_', initializer)
     monkeypatch.setattr(torch, '__version__', torch.torch_version.TorchVersion('2.12.0'))
+    # Emulate the routing registered at import time on PyTorch 2.12+.
+    monkeypatch.setattr(DeferredInitialization, '_writes', DeferredInitialization._writes | {'trunc_normal_'})
+    monkeypatch.setattr(DeferredInitialization, '_random', DeferredInitialization._random | {'trunc_normal_'})
     return initializer
 
 
@@ -1231,6 +1234,21 @@ def test_python_trunc_normal_preserves_layout_and_rng(python_trunc_normal, parti
     assert torch.equal(capture.materialize(x), expected)
     assert torch.equal(generator.get_state(), generator_state)
     assert torch.equal(torch.get_rng_state(), rng_state)
+
+
+def test_python_matrix_initializers():
+    """Replay eye_, orthogonal_ and sparse_ through their public initialization APIs."""
+    with DeferredInitialization() as capture:
+        eye = torch.nn.init.eye_(torch.empty(4, 4))
+        orthogonal = torch.nn.init.orthogonal_(torch.empty(4, 4))
+        sparse = torch.nn.init.sparse_(torch.empty(4, 4), sparsity=0.5)
+
+    assert torch.equal(capture.materialize(eye), torch.eye(4))
+    q = capture.materialize(orthogonal)
+    torch.testing.assert_close(q.T @ q, torch.eye(4), rtol=1e-5, atol=1e-6)
+    values = capture.materialize(sparse)
+    assert ((values == 0).sum(dim=0) >= 2).all()
+    assert torch.equal(values, capture.materialize(sparse))
 
 
 def test_python_initializer_inside_concrete_fallback(python_trunc_normal, caplog):

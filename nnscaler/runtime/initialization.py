@@ -194,7 +194,7 @@ def _map(value, transform):
 class PyFunction:
     """A Python callable using the same schema, tags and operation names as dispatch.
 
-    Writes/views use DeferredInitialization's existing supported-name sets.
+    Registered writes/views extend DeferredInitialization's routing.
     Writes preserve metadata and return their first argument; pure functions
     return fresh tensors. Use ``call_with_normalized_args`` at the constructor entry.
     """
@@ -234,22 +234,6 @@ class PyFunction:
         options = {name: bound.arguments.pop(name) for name in ("generator", "device")
                    if name in bound.arguments}
         return self(*bound.args, **bound.kwargs, **options)
-
-
-# Key: (module owning the function, attribute name).
-# Value: (operator schema, dispatch tags, predicate evaluated on entry to enable the patch).
-_PYTHON_FUNCTION_PATCHES: dict[
-    tuple[ModuleType, str], tuple[str, tuple[torch.Tag, ...], Callable[[], bool]]
-] = {
-    # PyTorch 2.12+ skips meta initialization before dispatch. Patch the helper
-    # so existing aliases of the public initializer also capture the whole call.
-    (torch.nn.init, "_no_grad_trunc_normal_"): (
-        "python::trunc_normal_(Tensor(a!) tensor, float mean, float std, float a, float b, "
-        "Generator? generator=None) -> Tensor(a!)",
-        (torch.Tag.nondeterministic_seeded,),
-        lambda: torch.__version__ >= (2, 12),
-    ),
-}
 
 
 @dataclass(eq=False)
@@ -340,7 +324,7 @@ class DeferredInitialization(TorchDispatchMode):
     _unary_writes = {"erfinv_", "clamp_"}
     _random_writes = {
         "uniform_", "normal_", "random_", "bernoulli_", "exponential_",
-        "geometric_", "log_normal_", "cauchy_", "trunc_normal_",
+        "geometric_", "log_normal_", "cauchy_",
     }
     _sampling = {"normal", "bernoulli", "poisson", "multinomial"}
     _random_factories = {"rand", "randn", "randint", "randperm"}
@@ -736,3 +720,55 @@ class DeferredInitialization(TorchDispatchMode):
             raise _unsupported(f"replay failed: {exc}") from exc
         finally:
             cache.clear()
+
+
+# Key: (module owning the function, attribute name).
+# Value: (operator schema, dispatch tags, predicate evaluated on entry to enable the patch).
+# Registered writes must fully initialize the destination view, preserving its metadata.
+_PYTHON_FUNCTION_PATCHES: dict[
+    tuple[ModuleType, str], tuple[str, tuple[torch.Tag, ...], Callable[[], bool]]
+] = {
+    # PyTorch 2.12+ skips meta initialization before dispatch. Patch the helper
+    # so existing aliases of the public initializer also capture the whole call.
+    (torch.nn.init, "_no_grad_trunc_normal_"): (
+        "python::trunc_normal_(Tensor(a!) tensor, float mean, float std, float a, float b, "
+        "Generator? generator=None) -> Tensor(a!)",
+        (torch.Tag.nondeterministic_seeded,),
+        lambda: torch.__version__ >= (2, 12),
+    ),
+    (torch.nn.init, "eye_"): (
+        "python::eye_(Tensor(a!) tensor) -> Tensor(a!)",
+        (),
+        lambda: True,
+    ),
+    # PyTorch 2.0-2.1 lacks generator arguments; replay must use the scoped RNG
+    # without passing that keyword. PyTorch 2.2+ accepts a private generator.
+    (torch.nn.init, "orthogonal_"): (
+        "python::orthogonal_(Tensor(a!) tensor, float gain=1"
+        + (", Generator? generator=None" if torch.__version__ >= (2, 2) else "")
+        + ") -> Tensor(a!)",
+        (torch.Tag.nondeterministic_seeded,),
+        lambda: True,
+    ),
+    (torch.nn.init, "sparse_"): (
+        "python::sparse_(Tensor(a!) tensor, float sparsity, float std=0.01"
+        + (", Generator? generator=None" if torch.__version__ >= (2, 2) else "")
+        + ") -> Tensor(a!)",
+        (torch.Tag.nondeterministic_seeded,),
+        lambda: True,
+    ),
+}
+
+# Classify enabled names once; predicates are checked again on context entry.
+for _schema_text, _tags, _should_patch in _PYTHON_FUNCTION_PATCHES.values():
+    if not _should_patch():
+        continue
+    _schema = torch._C.parse_schema(_schema_text)
+    _name = _schema.name.split("::")[-1]
+    _alias = _schema.arguments[0].alias_info if _schema.arguments else None
+    if _alias is not None and _alias.is_write:
+        DeferredInitialization._writes.add(_name)
+    elif any(ret.alias_info is not None for ret in _schema.returns):
+        DeferredInitialization._views.add(_name)
+    if torch.Tag.nondeterministic_seeded in _tags:
+        DeferredInitialization._random.add(_name)
