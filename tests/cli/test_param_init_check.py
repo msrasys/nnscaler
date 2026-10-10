@@ -475,6 +475,7 @@ def test_check_file_module_excludes_only_parallel_tensors():
                     'initialization differs across ranks')
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason='dummy input requires CUDA')
 @pytest.mark.parametrize('checked', [False, True])
 def test_parallelize_failure_skips_check(tmp_path, checked):
     trainer = Trainer(train_args=_mixed_args(tmp_path, ParamInitStrategy.FULL, checked))
