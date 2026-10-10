@@ -2,16 +2,18 @@
 #  Licensed under the MIT License.
 
 import tempfile
+import sys
+from unittest.mock import patch
 import pytest
 
 import torch
 
 import nnscaler
-from nnscaler.parallel import _load_parallel_module_class, parallelize, ComputeConfig
+from nnscaler.parallel import _load_parallel_module_class, parallelize, ComputeConfig, ParamInitStrategy
 
 from ..launch_torchrun import launch_torchrun
 from .common import CubeLinear, init_distributed, init_random
-from ..utils import new_empty, replace_all_device_with, mock_dist, clear_dir_on_rank0
+from ..utils import new_empty, replace_all_device_with, mock_dist, mock_cube_env, clear_dir_on_rank0
 
 class MyModule(torch.nn.Module):
     def __init__(self):
@@ -20,6 +22,270 @@ class MyModule(torch.nn.Module):
 
     def forward(self, x):
         return self.linear(x)
+
+
+class LocalInitModule(MyModule):
+    def __init__(self):
+        super().__init__()
+        self.register_buffer('scalar', torch.tensor(0.5), persistent=False)
+        self.register_buffer('transposed', torch.arange(20.0).reshape(4, 5).t())
+
+    def forward(self, x):
+        return self.linear(x) + self.scalar + self.transposed.sum()
+
+
+class ShardInitModule(LocalInitModule):
+    @staticmethod
+    def __shard__init__(attr_meta_map):
+        return {
+            name: torch.full(meta.sub_shape, 0.25, dtype=meta.dtype)
+            for name, meta in attr_meta_map.items()
+        }
+
+
+class DefaultDtypeInitModule(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        previous = torch.get_default_dtype()
+        try:
+            torch.set_default_dtype(torch.float64)
+            self.weight = torch.nn.Parameter(torch.full((4,), 1.00000001))
+        finally:
+            torch.set_default_dtype(previous)
+
+    def forward(self, x):
+        return x * self.weight
+
+
+@patch('torch.cuda.is_available', lambda: False)
+def test_capture_constructor_default_dtype(tmp_path):
+    with mock_cube_env(0, 1), mock_dist(0, 1), patch('torch.distributed.barrier'), \
+            patch('torch.distributed.broadcast_object_list'):
+        generated = parallelize(
+            DefaultDtypeInitModule, {'x': torch.ones(4, dtype=torch.float64)}, 'dp',
+            ComputeConfig(1, 1, param_init_strategy='shard', trace_strategy='cpu'),
+            gen_savedir=tmp_path,
+        )
+        module = generated(build_buckets=False)
+    for attr, meta in module.fullmap.items():
+        actual = getattr(module, attr)
+        assert actual.dtype == torch.float64
+        assert torch.equal(actual, torch.full(meta.sub_shape, 1.00000001, dtype=torch.float64))
+
+
+def test_param_init_config():
+    assert nnscaler.ParamInitStrategy is ParamInitStrategy
+    config = ComputeConfig(1, 1)
+    assert config.param_init_strategy == ParamInitStrategy.FILE
+    assert config.param_init_seed == 1234
+    for seed in (0, 2 ** 32 - 1):
+        assert ComputeConfig(1, 1, param_init_seed=seed).param_init_seed == seed
+
+    configs = {strategy: ComputeConfig(1, 1, param_init_strategy=strategy)
+               for strategy in ('file', 'full', 'shard')}
+    assert configs['full'].graph_config == configs['shard'].graph_config
+    assert configs['file'].graph_config != configs['full'].graph_config
+    for strategy, config in configs.items():
+        assert config.param_init_strategy == strategy
+        assert config.graph_config != ComputeConfig(
+            1, 1, param_init_strategy=strategy, param_init_seed=77,
+        ).graph_config
+
+
+@pytest.mark.parametrize('field,value', [
+    ('param_init_strategy', value)
+    for value in (False, True, -1, 0, 1, 2, 1.0, None, '1', 'invalid', 'fullmodel', [], {},
+                  'model', 'capture', 'custom')
+] + [
+    ('param_init_seed', value) for value in (True, -1, 2 ** 32, 1.0, 1.5, '1234', None)
+])
+def test_param_init_config_invalid(field, value):
+    with pytest.raises(ValueError, match=field):
+        ComputeConfig(1, 1, **{field: value})
+
+
+@pytest.mark.parametrize('callback', [
+    lambda self, attr_meta_map: {},
+    staticmethod(lambda attr_meta_map, extra: {}),
+    staticmethod(lambda attr_meta_map, *, extra: {}),
+    staticmethod(lambda *, attr_meta_map: {}),
+    staticmethod(lambda **kwargs: {}),
+    staticmethod(lambda: {}),
+    staticmethod(None),
+    None,
+])
+@pytest.mark.parametrize('source_instance', [False, True])
+def test_shard_init_invalid_callback(tmp_path, callback, source_instance):
+    source = ShardInitModule() if source_instance else ShardInitModule
+    with patch.object(ShardInitModule, '__shard__init__', callback):
+        with pytest.raises(ValueError, match='__shard__init__'):
+            parallelize(
+                source, {'x': torch.ones(2, 4)}, 'dp',
+                ComputeConfig(1, 1, param_init_strategy='shard'),
+                gen_savedir=tmp_path, load_module=False,
+            )
+
+
+@patch('torch.cuda.is_available', lambda: False)
+@pytest.mark.parametrize('wrap', [
+    lambda fn: staticmethod(lambda attrs, /: fn(attrs)),
+    lambda fn: staticmethod(lambda attrs, extra=None: fn(attrs)),
+    lambda fn: staticmethod(lambda attrs, *, extra=None: fn(attrs)),
+    lambda fn: staticmethod(lambda attrs, **kwargs: fn(attrs)),
+    lambda fn: staticmethod(lambda *args, **kwargs: fn(*args, **kwargs)),
+    lambda fn: classmethod(lambda cls, attrs, extra=None: fn(attrs, cls)),
+], ids=['positional-only', 'optional-positional', 'optional-keyword', 'kwargs', 'variadic', 'classmethod'])
+def test_shard_init_accepts_single_argument_call(tmp_path, wrap):
+    calls = []
+
+    def initialize(attrs, cls=ShardInitModule):
+        assert cls is ShardInitModule
+        calls.append(dict(attrs))
+        return {name: torch.full(meta.sub_shape, 0.75, dtype=meta.dtype)
+                for name, meta in attrs.items()}
+
+    with patch.object(ShardInitModule, '__shard__init__', wrap(initialize)), \
+            mock_cube_env(0, 1), mock_dist(0, 1), patch('torch.distributed.barrier'), \
+            patch('torch.distributed.broadcast_object_list'):
+        generated = parallelize(
+            ShardInitModule, {'x': torch.ones(2, 4)}, 'dp',
+            ComputeConfig(1, 1, param_init_strategy='shard', trace_strategy='cpu'),
+            gen_savedir=tmp_path,
+        )
+        module = generated(build_buckets=False)
+    assert calls == [module.fullmap]
+    for name, meta in module.fullmap.items():
+        assert torch.equal(getattr(module, name), torch.full(meta.sub_shape, 0.75, dtype=meta.dtype))
+
+
+@patch('torch.cuda.is_available', lambda: False)
+@pytest.mark.parametrize('strategy', ['full', 'shard'])
+@pytest.mark.parametrize('module_class', [LocalInitModule, ShardInitModule])
+@pytest.mark.parametrize('source_instance', [False, True])
+def test_param_init_callback_attachment(tmp_path, strategy, module_class, source_instance):
+    """Test that the parameter initialization callback is correctly attached to the generated module."""
+    source = module_class() if source_instance else module_class
+    has_hook = strategy == 'shard' and module_class is ShardInitModule
+    uses_hook = has_hook and not source_instance
+    config = ComputeConfig(1, 1, param_init_strategy=strategy, trace_strategy='cpu')
+    with mock_cube_env(0, 1), mock_dist(0, 1), patch('torch.distributed.barrier'), \
+            patch('torch.distributed.broadcast_object_list'):
+        model_or_class = parallelize(
+            source, {'x': torch.ones(2, 4)}, 'dp', config,
+            gen_savedir=tmp_path, build_module_buckets=False,
+            instance_name=f'{strategy}_{source_instance}',
+        )
+        generated = type(model_or_class) if source_instance else model_or_class
+        assert (generated._shard_init_fn is None) == (not has_hook)
+        assert (generated._init_module_fn is None) == has_hook
+        assert callable(generated._shard_init_fn if has_hook else generated._init_module_fn)
+        if uses_hook:
+            with patch.object(module_class, '__init__', side_effect=AssertionError('full constructor')):
+                model = generated(build_buckets=False)
+            for name, meta in model.fullmap.items():
+                expected = torch.full(meta.sub_shape, 0.25, dtype=meta.dtype)
+                assert torch.equal(getattr(model, name), expected)
+        else:
+            model = model_or_class if source_instance else generated(build_buckets=False)
+        assert all(torch.isfinite(parameter).all() for parameter in model.parameters())
+        if source_instance:
+            tensors = dict(list(source.named_parameters()) + list(source.named_buffers()))
+            for name, meta in model_or_class.fullmap.items():
+                assert torch.equal(getattr(model_or_class, name), tensors[meta.orig_name][meta.slicers])
+        assert not list(tmp_path.rglob('fullmodel.pt*'))
+        assert bool(list(tmp_path.rglob('npbuffer.pt'))) == (strategy == 'full')
+
+
+@patch('torch.cuda.is_available', lambda: False)
+def test_param_init_strategy_reload(tmp_path):
+    graph_mtime = None
+    for strategy in ('full', 'shard', 'full'):
+        config = ComputeConfig(1, 1, param_init_strategy=strategy, trace_strategy='cpu')
+        with mock_cube_env(0, 1), mock_dist(0, 1), patch('torch.distributed.barrier'), \
+                patch('torch.distributed.broadcast_object_list'):
+            generated = parallelize(
+                ShardInitModule, {'x': torch.ones(2, 4)}, 'dp', config,
+                gen_savedir=tmp_path, instance_name='strategy_reload', reuse='moo',
+            )
+            try:
+                assert (generated._init_module_fn is None) == (strategy == 'shard')
+                assert (generated._shard_init_fn is None) == (strategy != 'shard')
+                module = generated(build_buckets=False)
+                assert module.compute_config.param_init_strategy == strategy
+                current_mtime = (module.module_dir / 'graph.ckp').stat().st_mtime_ns
+                # reuse graph when full->shard transition occurs
+                # but can't reuse the graph when shard->full transition occurs
+                # because full needs extra npbuffer.pt file.
+                if graph_mtime is not None:
+                    assert (current_mtime == graph_mtime) == (strategy == 'shard')
+                graph_mtime = current_mtime
+                assert not list(module.module_dir.glob('fullmodel.pt*'))
+                assert (module.module_dir / 'npbuffer.pt').exists() == (strategy == 'full')
+                if strategy == 'shard':
+                    for name, meta in module.fullmap.items():
+                        assert torch.equal(getattr(module, name), torch.full(meta.sub_shape, 0.25, dtype=meta.dtype))
+            finally:
+                # MOO cannot replace loaded code; emulate a fresh process for the next strategy.
+                sys.modules.pop(generated.__module__)
+
+
+def _local_init_worker(tmp_path):
+    nnscaler.init()
+    # test paralle module always use the weights from the original module if provided
+    for strategy in ('full', 'shard'):
+        torch.manual_seed(1234)
+        original = LocalInitModule().eval()
+        expected = {
+            name: tensor.detach().to(torch.bfloat16).clone()
+            for name, tensor in list(original.named_parameters()) + list(original.named_buffers())
+        }
+        config = ComputeConfig(1, 2, param_init_strategy=strategy, param_init_seed=4321)
+        sample = {'x': torch.ones(2, 4, dtype=torch.bfloat16)}
+        model = parallelize(
+            original, sample, 'dp', config,
+            gen_savedir=tmp_path, instance_name=f'instance{strategy}',
+            module_dtype=torch.bfloat16,
+        )
+        assert not model.training
+        for attr, meta in model.fullmap.items():
+            assert torch.equal(getattr(model, attr).cpu(), expected[meta.orig_name][meta.slicers])
+        assert not list(model.module_dir.glob('fullmodel.pt*'))
+
+    # Fresh initialization needs a source; resume only needs the saved buffers.
+    parallelize(
+        LocalInitModule, {'x': torch.ones(2, 4)}, 'dp',
+        ComputeConfig(1, 2, param_init_strategy='full'),
+        gen_savedir=tmp_path, instance_name='direct', load_module=False,
+    )
+    generated = _load_parallel_module_class(LocalInitModule, gen_savedir=tmp_path, instance_name='direct')
+    with pytest.raises(RuntimeError, match='Independent initialization requires parallelize'):
+        generated()
+    with patch.object(LocalInitModule, '__init__', side_effect=AssertionError('resume constructed source')):
+        resumed = generated(init_params=False)
+    assert resumed.non_presistent_buffers_inited
+    torch.manual_seed(1234)
+    source = LocalInitModule()
+    model = generated(init_module=source)
+    assert model.non_presistent_buffers_inited
+    assert all(tensor.item() == 0.5 for tensor in model.get_non_persistent_buffers().values())
+    resumed = generated(init_params=False, init_module=source)
+    assert resumed.non_presistent_buffers_inited
+    missing_source = LocalInitModule()
+    del missing_source.transposed
+    with pytest.raises(AttributeError, match='transposed'):
+        generated(init_module=missing_source)
+
+    torch.distributed.barrier()
+    if torch.distributed.get_rank() == 0:
+        (model.module_dir / 'npbuffer.pt').unlink()
+    torch.distributed.barrier()
+    with pytest.raises(FileNotFoundError, match='npbuffer.pt'):
+        generated(init_module=source, build_buckets=False)
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason='requires two GPUs')
+def test_local_init_instance(tmp_path):
+    launch_torchrun(2, _local_init_worker, tmp_path)
 
 
 def _init_params_worker():

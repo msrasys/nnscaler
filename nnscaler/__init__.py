@@ -3,6 +3,7 @@
 
 from .version import __version__
 from .parallel import (
+    ParamInitStrategy,
     ParallelModule,
     ComputeConfig,
     ReuseType,

@@ -8,7 +8,12 @@ import pytest
 import torch
 import torch.distributed as dist
 
-pytest.importorskip("flash_attn")
+# Skip all tests if flash_attn_func is not available
+try:
+    from flash_attn import flash_attn_func
+except ImportError:
+    pytest.skip("flash_attn_func not available", allow_module_level=True)
+
 
 from nnscaler.customized_ops.ring_attention.ring_attn_varlen import (
     emit_ring as emit_varlen_ring,

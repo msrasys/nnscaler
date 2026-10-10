@@ -9,10 +9,11 @@ import pickle
 import pytest
 import torch
 import shutil
+from unittest.mock import patch
 
 from nnscaler.graph.parser import FxModuleParser
 from nnscaler.graph.parser.frame import Frame
-from nnscaler.parallel import ReuseType, parallelize, ComputeConfig, _load_parallel_module_class
+from nnscaler.parallel import ReuseType, parallelize, ComputeConfig, ParamInitStrategy, _load_parallel_module_class
 from nnscaler.runtime.module import ParallelModule
 
 from ..utils import new_empty, replace_all_device_with, raises_with_cause
@@ -47,6 +48,105 @@ class MyModule(torch.nn.Module):
 
     def forward(self, x):
         return self.linear(x)
+
+    @staticmethod
+    def __shard__init__(attr_meta_map):
+        return {
+            name: torch.zeros(meta.sub_shape, dtype=meta.dtype)
+            for name, meta in attr_meta_map.items()
+        }
+
+
+class SeedBufferModule(MyModule):
+    def __init__(self):
+        super().__init__()
+        self.register_buffer('offset', torch.rand(1), persistent=False)
+
+    def forward(self, x):
+        return self.linear(x) + self.offset
+
+
+@patch('torch.cuda.is_available', lambda: False)
+@replace_all_device_with('cpu', force=True)
+@pytest.mark.parametrize('reuse', [ReuseType.MOO, ReuseType.GRAPH])
+@pytest.mark.parametrize('strategy', ['file', 'full', 'shard'])
+def test_param_init_seed_cache_reuse(tmp_path, reuse, strategy):
+    constructors = []
+    graph_mtimes = []
+    for seed in (17, 18):
+        with patch.object(SeedBufferModule, '__init__', autospec=True, wraps=None) as constructor:
+            def construct(module):
+                MyModule.__init__(module)
+                module.register_buffer('offset', torch.rand(1), persistent=False)
+                constructors.append(module.offset.clone())
+            constructor.side_effect = construct
+            _to_cube_model(
+                SeedBufferModule, ComputeConfig(1, 1, param_init_strategy=strategy, param_init_seed=seed),
+                tmp_path, reuse, 'seed', load_module=False,
+            )
+            assert constructor.call_count == 1
+        assert bool(list(tmp_path.rglob(FxModuleParser.NON_PERSISTENT_BUFFER_FILE))) == (strategy != 'shard')
+        graph_mtimes.append(next(tmp_path.rglob('graph.ckp')).stat().st_mtime_ns)
+    assert graph_mtimes[0] != graph_mtimes[1]
+    assert len(constructors) == 2
+    assert not torch.equal(constructors[0], constructors[1])
+
+
+@patch('torch.cuda.is_available', lambda: False)
+@replace_all_device_with('cpu', force=True)
+def test_param_init_strategy_reuse(tmp_path):
+    local_graph_mtime = None
+    # last `file` tests the switch from `shard` back to `file`
+    for strategy in ('file', 'full', 'shard', 'file'):
+        kwargs = dict(
+            gen_savedir=tmp_path, instance_name='init_strategy',
+            load_module=False, reuse='moo',
+        )
+        config = ComputeConfig(1, 1, param_init_strategy=strategy)
+        if strategy != 'file':
+            with patch.object(Frame, 'save_attr_content', side_effect=AssertionError('fullmodel write')):
+                parallelize(MyModule, {'x': torch.ones(2, 3)}, 'dp', config, **kwargs)
+        else:
+            parallelize(MyModule, {'x': torch.ones(2, 3)}, 'dp', config, **kwargs)
+        module_dir = next(tmp_path.rglob(ParallelModule.COMPUTE_CONFIG_FILE)).parent
+        assert bool(list(module_dir.glob('fullmodel.pt*'))) == (strategy == 'file')
+        assert (module_dir / FxModuleParser.NON_PERSISTENT_BUFFER_FILE).exists() == (strategy != 'shard')
+        assert (module_dir / FxModuleParser.ATTR_MAP_FILE).exists()
+        graph_file = next(module_dir.glob('graph*'))
+        graph_mtime = graph_file.stat().st_mtime_ns
+        code_mtime = (module_dir / 'gencode0.py').stat().st_mtime_ns
+        parallelize(MyModule, {'x': torch.ones(2, 3)}, 'dp', config, **{**kwargs, 'reuse': 'match'})
+        assert graph_file.stat().st_mtime_ns == graph_mtime
+        assert (module_dir / 'gencode0.py').stat().st_mtime_ns == code_mtime
+        if strategy == 'full':
+            local_graph_mtime = graph_mtime
+        elif strategy == 'shard':
+            assert graph_mtime == local_graph_mtime
+
+
+@patch('torch.cuda.is_available', lambda: False)
+@replace_all_device_with('cpu', force=True)
+@pytest.mark.parametrize('strategy', [
+    ParamInitStrategy.FILE, ParamInitStrategy.FULL, ParamInitStrategy.SHARD,
+])
+@pytest.mark.parametrize('reuse', [ReuseType.MOO, ReuseType.GRAPH])
+def test_reuse_without_np_buffer_content(tmp_path, strategy, reuse):
+    config = ComputeConfig(1, 1, param_init_strategy=strategy)
+    _to_cube_model(MyModule, config, tmp_path, ReuseType.MATCH, 'npbuffer', load_module=False)
+    module_dir = next(tmp_path.rglob(ParallelModule.COMPUTE_CONFIG_FILE)).parent
+    buffer_file = module_dir / FxModuleParser.NON_PERSISTENT_BUFFER_FILE
+    graph_file = module_dir / 'graph.ckp'
+    graph_mtime = graph_file.stat().st_mtime_ns
+    if strategy != ParamInitStrategy.SHARD:
+        buffer_file.unlink()
+        with raises_with_cause(RuntimeError, match='existing files do not match'):
+            _to_cube_model(MyModule, config, tmp_path, ReuseType.MATCH, 'npbuffer', load_module=False)
+    else:
+        assert not buffer_file.exists()
+        _to_cube_model(MyModule, config, tmp_path, ReuseType.MATCH, 'npbuffer', load_module=False)
+    _to_cube_model(MyModule, config, tmp_path, reuse, 'npbuffer', load_module=False)
+    assert buffer_file.is_file() == (strategy != ParamInitStrategy.SHARD)
+    assert (graph_file.stat().st_mtime_ns != graph_mtime) == (strategy != ParamInitStrategy.SHARD)
 
 
 @replace_all_device_with('cpu')
@@ -118,7 +218,7 @@ def test_override():
         cmodule2_p = dict(cmodule2.named_parameters())
         cmodule3_p = dict(cmodule3.named_parameters())
         keys = cmodule3_p.keys()
-        assert any(not torch.equal(cmodule2_p[key], cmodule3_p[key]) for key in keys)
+        assert all(torch.equal(cmodule2_p[key], cmodule3_p[key]) for key in keys)
 
         # MATCH  | unmatch | raise error
         _to_cube_model(MyModule, ComputeConfig(1, 1),tempdir, ReuseType.MATCH, 'm0')
@@ -173,7 +273,15 @@ def test_override():
         shutil.copy(test5_module_path / 'gencode0.py', test5_module_path / 'gencode1.py')
 
         # OVERRIDE   | match | generate
-        cmodule2 = _to_cube_model(MyModule, ComputeConfig(1, 1), tempdir, ReuseType.OVERRIDE, 'test3')
+        original_init = MyModule.__init__
+
+        def changed_init(module):
+            original_init(module)
+            with torch.no_grad():
+                module.linear.weight.add_(1)
+
+        with patch.object(MyModule, '__init__', changed_init):
+            cmodule2 = _to_cube_model(MyModule, ComputeConfig(1, 1), tempdir, ReuseType.OVERRIDE, 'test3')
         cmodule2_p = dict(cmodule2.named_parameters())
         cmodule1_p = dict(cmodule1.named_parameters())
         keys = cmodule2_p.keys()

@@ -12,6 +12,273 @@ An end2end module is a module which satisfies:
 
 The above restrictions are necessary for the pipeline parallelism to work. Of course, you can still use the parallel module without pipeline parallelism for end2end modules.
 
+## Weight initialization
+
+By default, nnScaler saves the original model's weights during compilation and
+loads them when creating each parallel model. To avoid this weight-file I/O, use
+`full` or `shard`.
+
+### Choose a strategy
+
+Set `ComputeConfig.param_init_strategy` to one of these strings, or use the
+equivalent `nnscaler.ParamInitStrategy` constant:
+
+| Strategy | How runtime initialization works |
+| --- | --- |
+| `"file"` / `FILE` (default) | Load parameters and buffers from `fullmodel.pt.*` and `npbuffer.pt`. |
+| `"full"` / `FULL` | Construct the full original model for initial weights. Save non-persistent buffers in `npbuffer.pt` and load them directly on resume. |
+| `"shard"` / `SHARD` | Use `__shard__init__` if defined; otherwise capture the constructor and replay only the tensors needed by this rank. |
+
+Choose `full` to avoid `fullmodel.pt.*` while keeping ordinary constructor behavior.
+Choose `shard` to reduce runtime initialization memory, with the
+[capture limitations](#automatic-capture) described below. Only `shard` avoids both
+`fullmodel.pt.*` and `npbuffer.pt`; generated code and metadata are still required.
+
+The parser APIs use a single `save_level` argument with `AttrSaveLevel`
+(imported from `nnscaler.graph.parser`):
+
+| Level | Saved attribute files |
+| --- | --- |
+| `NONE` | None |
+| `M` | `dist_param_map.pt` |
+| `N` | `npbuffer.pt` |
+| `F` | `fullmodel.pt.*`, including parameters and both persistent and non-persistent buffers |
+| `MN` | `dist_param_map.pt` and `npbuffer.pt` |
+| `ALL` (default) | All three categories |
+
+`AttrSaveLevel` is an `IntFlag`; levels can be combined with bitwise OR,
+for example `AttrSaveLevel.M | AttrSaveLevel.F`.
+
+`parallelize` selects `ALL` for `file`, `MN` for `full`,
+and `M` for `shard`.
+Construction uses the original class, or the `module_fn` supplied to `parallelize`.
+
+On first initialization, `full` checks that each local non-persistent buffer
+matches its saved slice in `npbuffer.pt` bitwise (after value-partition scaling).
+A mismatch raises an error without overwriting the model's values. This check is
+independent of the CLI replica check and also applies to supplied model instances.
+Use `broadcast_strategy="all"` or make this file available on every node yourself;
+`no_weights` excludes it.
+
+```python
+import nnscaler
+
+config = nnscaler.ComputeConfig(
+    plan_ngpus=2,
+    runtime_ngpus=2,
+    param_init_strategy=nnscaler.ParamInitStrategy.SHARD,
+    param_init_seed=1234,
+)
+```
+
+**An existing model instance takes priority.** For `full` and `shard`,
+`parallelize(original_model, ...)` uses that instance's current values, without
+reconstructing it, reseeding it, or calling `__shard__init__`. The same applies to
+`GeneratedModel(init_module=original_model)`. Hook validation and binding in
+`parallelize` are unchanged.
+
+**All strategies still construct a full real model during compilation.**
+These options change runtime initialization, not tracing.
+
+### Automatic capture
+
+With `shard` and no user hook, nnScaler records the original constructor's tensor
+operations, then replays the tensors needed by this rank. It copies each local
+slice into the parallel model before releasing the temporary result.
+
+This is **selective full-tensor initialization**, not direct shard generation:
+materializing a tensor still allocates its full shape and any dependencies.
+Use a [shard hook](#write-a-shard-initializer) when even one full tensor is too
+large. Capture uses per-operation random streams, so its values need not match
+eager `full` initialization with the same seed.
+
+#### Supported operations
+
+Ordinary non-mutating operators are captured generically, including arithmetic,
+`sin`, `cos`, `tril`, matrix multiplication and reductions. Views and mutations
+require explicit support:
+
+| Category | Supported operations |
+| --- | --- |
+| Factories and sampling | `empty`, `zeros`, `ones`, `full`, `arange`, `linspace`, `rand`, `randn`, `randint`, `randperm`, like/new factories, `normal`, `bernoulli`, `poisson`, `multinomial` |
+| Views | `detach`, `alias`, `view`, `_unsafe_view`, `transpose`, `t`, `permute`, `slice`, `select`, `unsqueeze`, `squeeze`, `expand`, `unbind` (including tensor iteration) |
+| Copies | `clone`, copying `to`, `copy_` |
+| In-place initialization | `fill_`, `zero_`, `uniform_`, `normal_`, `random_`, `bernoulli_`, `exponential_`, `geometric_`, `log_normal_`, `cauchy_`, `erfinv_`, scalar-bound `clamp_` |
+| In-place arithmetic | `add_`, `sub_`, `mul_`, `div_` with scalar operands on contiguous tensors or views |
+| Whole Python functions | `torch.nn.init.eye_`, `orthogonal_`, `sparse_`; `trunc_normal_` on PyTorch 2.12+ |
+
+Except for the last row, the table uses ATen operator names; composite APIs work
+only if their underlying operations are supported.
+
+PyTorch 2.12+ skips `trunc_normal_` on meta tensors. nnScaler captures its Python
+helper as one seeded, in-place operation and replays the installed PyTorch
+implementation on CPU. PyTorch 2.0-2.11 retains operator-level capture.
+`eye_`, `orthogonal_` and `sparse_` are also captured as whole in-place functions,
+so their internal `out=`, QR/transposes and indexed writes execute only during
+CPU replay. `eye_` is deterministic; the other two use per-operation random seeds.
+The registered functions are patched only inside the capture context and restored on exit,
+including exceptional exits; nested contexts restore the enclosing patch.
+Internally, `PyFunction` supplies the same schema and tags as dispatched operators.
+After the class definition, entries whose predicates pass populate the class's
+routing sets from schema alias annotations and randomness tags. Names need not be
+maintained in separate lists; predicates are checked again on context entry.
+Registered functions reuse the existing mutation restrictions and dependency
+handling. Registered writes must fully initialize their destination view without
+changing its metadata; arbitrary read-modify-write functions are not supported.
+Each dispatch mode receives the `PyFunction` object with that mode temporarily
+popped. Calling `func(...)` forwards to the next lower mode; once the stack is
+empty, the function executes (or returns the meta target for a write).
+This is explicit internal registration, not interception of arbitrary Python functions.
+
+Important limits:
+
+- `out=` overloads, noncontiguous mutations, tensor-operand in-place arithmetic,
+  and unlisted alias operations such as `split` and `diagonal` are unsupported.
+- Data-dependent operations such as `.item()` and `nonzero`, and operations
+  without a meta implementation, use a logged CPU fallback during capture.
+  This can allocate full tensors. Recipes are replayed later; constructor
+  branches are decided during capture, not reevaluated as dynamic branches.
+- Replay requires CPU implementations. Custom operators must accurately declare
+  mutation, aliasing and randomness; external side effects are not replay-safe.
+  For seeded custom operators, replay seeds Python, NumPy, PyTorch CPU and the
+  current CUDA device from the captured node seed, restoring caller RNG states
+  afterward. NumPy uses the seed modulo `2**32`.
+- Tensor literals and external tensor data can retain real storage. Keep external
+  inputs unchanged until initialization finishes, and initialize every value
+  before reading it; `empty` contents remain unspecified.
+- Explicit random generators contribute their initial seed, not their current
+  state or device. Avoid concurrent initialization with other users of
+  process-global RNG or default-dtype settings.
+
+Call `eye_`, `orthogonal_` and `sparse_` through `torch.nn.init` during capture.
+Unlike `trunc_normal_`, these functions have no separate helper to patch:
+references saved before entering capture (for example,
+`from torch.nn.init import orthogonal_`) and deprecated aliases without the
+trailing underscore are not covered by whole-function capture.
+Targets must still be contiguous, and replay requires a dtype supported by the
+original CPU implementation (including QR for `orthogonal_`). Noncontiguous
+targets remain unsupported even for initializers such as `uniform_` and `normal_`.
+
+If capture cannot handle a constructor, use `full`, `file`, a supplied initialized
+instance, or a shard hook. Capture does not silently reconstruct a full eager
+model on failure.
+
+#### Compatibility snapshot
+
+Constructor capture/replay was tested with PyTorch **2.10.0+cu128**,
+Transformers **4.57.6**, and torchvision **0.25.0**:
+
+| Models | Configuration | Result |
+| --- | --- | --- |
+| torchvision ResNet-18 / ResNet-50 | Standard models, `weights=None` | Passed |
+| HF `GPT2LMHeadModel` / `LlamaForCausalLM` | One layer, hidden size 16, two heads, vocabulary 32, sequence capacity 16 | Passed, including causal-mask / RoPE buffers |
+| HF `ViTModel` | One layer, hidden size 16, two heads, image size 16, patch size 8 | Passed, including truncated-normal initialization |
+
+These probes checked all parameter/buffer shapes, dtypes, finite values, seeded
+repeatability, eager buffer equality and CPU RNG restoration. They do **not**
+certify pretrained loading, full distributed execution, other configurations or
+equality with eager random weights.
+
+### Write a shard initializer
+
+Define `__shard__init__` on the original model class to replace automatic capture.
+It must be a staticmethod or classmethod callable with one positional metadata
+map. Additional optional arguments are allowed.
+
+Signature (shown as a staticmethod):
+
+```python
+from typing import Dict, Iterable, Tuple, Union
+import torch
+from nnscaler.runtime.module import AttrMeta
+
+@staticmethod
+def __shard__init__(
+    attr_meta_map: Dict[str, AttrMeta],
+) -> Union[Iterable[Tuple[str, torch.Tensor]], Dict[str, torch.Tensor]]:
+    ...
+```
+
+The map contains only the parameters and buffers requested by this rank.
+Its keys are **generated attribute names**; each `AttrMeta` provides `orig_name`,
+the full `shape`, local `slicers`, `sub_shape`, `dtype` and `val_chunks`.
+
+For example, this hook computes an `arange` weight's local slice directly from
+global coordinates, without allocating the full weight:
+
+```python
+class Model(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.weight = torch.nn.Parameter(torch.arange(64.0).reshape(8, 8))
+
+    @staticmethod
+    def __shard__init__(attr_meta_map):
+        for name, meta in attr_meta_map.items():
+            if meta.orig_name != "weight":
+                raise ValueError(f"Unexpected attribute: {meta.orig_name}")
+            row_slice, col_slice = meta.slicers
+            rows = torch.arange(*row_slice.indices(meta.shape[0]), dtype=meta.dtype)
+            cols = torch.arange(*col_slice.indices(meta.shape[1]), dtype=meta.dtype)
+            value = rows[:, None] * meta.shape[1] + cols[None, :]
+            assert value.shape == meta.sub_shape
+            yield name, value
+
+    def forward(self, x):
+        return x @ self.weight
+```
+
+The hook must follow three rules:
+
+1. **Return exactly the requested tensors.** Yield each `(name, tensor)` once,
+   with real data of `meta.sub_shape` and `meta.dtype`. Yield values **before**
+   division by `val_chunks`; nnScaler applies that scaling. Invalid outputs raise
+   errors rather than falling back to capture.
+2. **Stream to save memory.** nnScaler copies each tensor before advancing the
+   iterator, so reusable scratch-buffer views are safe. A dictionary return is
+   also accepted, but retains all its tensors until consumed.
+3. **Make values independent of the requested subset and order.** Pipeline ranks
+   and checkpoint resume can request different maps. For random initialization,
+   use stable per-attribute seeds and global element coordinates, not one random
+   stream consumed in map order or Python's randomized `hash()`. Replicas and
+   overlapping slices must agree; values need not match the eager constructor.
+
+### Seeds and replica checking
+
+`param_init_seed` defaults to `1234` and must be an integer in `[0, 2**32)`.
+It is independent of the CLI training `seed`. Constructor and hook execution,
+including generator iteration, runs in an isolated seed scope covering Python,
+NumPy, PyTorch CPU and the current CUDA device. Caller RNG states are restored,
+including on failure. Other CUDA devices and custom generators are not seeded.
+Constructors and hooks must still be deterministic and rank-independent.
+
+The CLI trainer enables `debug.param_init_check` by default to compare hashes of
+replicated weights with **bitwise equality**. This is not a check of overlapping
+but different shards, nor is it run by direct `parallelize` calls. See
+[Trainer Debug Config](./trainer.md#debug-config) for its scope and limitations,
+and [Trainer Compute Config](./trainer.md#compute-config) for a YAML example.
+
+### Loading, resume and generated-code reuse
+
+- **Loading:** Use `parallelize` to attach the original factory or shard hook to
+  a generated class, or pass `init_module` when constructing it. `full` and
+  automatic capture require tensors to be available by their original attribute
+  names, including tensor attributes promoted to buffers by tracing. For
+  forward-local or global constants synthesized by the tracer, use `file` or
+  supply them through a shard hook.
+- **Checkpoint resume:** `init_params=False` initializes only non-persistent
+  buffers, leaving parameters and persistent buffers for checkpoint loading.
+  Both `file` and `full` read `npbuffer.pt`, without constructing the original
+  model or invoking a hook. `shard` receives a buffer-only map and initializes
+  those buffers and any dependencies.
+- **Cache reuse:** Switching between `file` and a non-file strategy, or changing
+  `param_init_seed`, requires retracing (`gen_reuse: moo` or a fresh generated-code
+  directory). `full` to `shard` with the same seed can reuse the graph; the reverse
+  requires retracing to create `npbuffer.pt`. Missing `npbuffer.pt` also requires
+  retracing for `file` and `full`. `debug.param_init_check` does not affect generated code. If generated
+  code is already imported, use a fresh process or instance name; `moo` cannot
+  replace an imported module.
+
 ## Examples
 
 - Example 1: Parallelize the whole module
