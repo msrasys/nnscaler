@@ -4,13 +4,14 @@
 import gc
 import random
 import weakref
+from contextlib import ExitStack
 
 import numpy as np
 import pytest
 import torch
-from torch.utils._python_dispatch import TorchDispatchMode
+from torch.utils._python_dispatch import TorchDispatchMode, _get_current_dispatch_mode_stack
 
-from nnscaler.runtime.initialization import DeferredInitialization, preserve_rng_state
+from nnscaler.runtime.initialization import DeferredInitialization, PyFunction, preserve_rng_state
 
 
 class AllocationRecorder(TorchDispatchMode):
@@ -1027,7 +1028,7 @@ def test_trunc_normal_and_partial_unary_writes():
     with DeferredInitialization() as capture:
         x = torch.empty(256)
         torch.nn.init.trunc_normal_(x, mean=0.2, std=0.4, a=-0.5, b=0.8)
-        # `trunc_normal_` will generate a lot of torch function calls.
+        # PyTorch <=2.11 decomposes this initializer into several ATen nodes.
         random_node = capture._storage(x).node
         while random_node.seed is None:
             random_node = random_node.previous
@@ -1046,6 +1047,209 @@ def test_trunc_normal_and_partial_unary_writes():
     expected = original.clone()
     expected[3:8].clamp_(-0.1, 0.1)
     torch.testing.assert_close(capture.materialize(x), expected)
+
+
+@pytest.mark.parametrize('fail', [False, True])
+def test_python_function_observer_order(fail):
+    """Redispatch one PyFunction through every observer, restoring the stack on errors."""
+    events = []
+
+    def function(x):
+        events.append('body')
+        assert not _get_current_dispatch_mode_stack()
+        if fail:
+            raise ValueError('body failed')
+        return x + 1
+
+    operation = PyFunction(function, 'python::increment(Tensor x) -> Tensor')
+
+    class Observer(TorchDispatchMode):
+        def __init__(self, name):
+            super().__init__()
+            self.name = name
+
+        def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+            if not isinstance(func, PyFunction):
+                return func(*args, **(kwargs or {}))
+            assert func is operation
+            events.append(f'{self.name}:enter')
+            try:
+                return func(*args, **(kwargs or {}))
+            finally:
+                events.append(f'{self.name}:exit')
+
+    x = torch.arange(4)
+    with Observer('outer'), DeferredInitialization() as capture, Observer('inner'):
+        before = _get_current_dispatch_mode_stack()
+        if fail:
+            with pytest.raises(ValueError, match='body failed'):
+                operation.call_with_normalized_args(x)
+        else:
+            result = operation.call_with_normalized_args(x)
+        assert _get_current_dispatch_mode_stack() == before
+    assert events == ['inner:enter', 'outer:enter', 'body', 'outer:exit', 'inner:exit']
+    if not fail:
+        assert torch.equal(capture.materialize(result), x + 1)
+
+
+def test_python_function_fallback_observers(caplog):
+    """Lower observers see concrete fallback; upper observers see the original call."""
+    seen = {'lower': [], 'upper': []}
+    operation = PyFunction(lambda x: torch.nonzero(x), 'python::nonzero(Tensor x) -> Tensor')
+
+    class Observer(TorchDispatchMode):
+        def __init__(self, name):
+            super().__init__()
+            self.name = name
+
+        def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+            if isinstance(func, PyFunction):
+                assert func is operation
+                seen[self.name].append(args[0].device.type)
+            return func(*args, **(kwargs or {}))
+
+    with Observer('lower'), DeferredInitialization() as capture, Observer('upper'):
+        result = operation.call_with_normalized_args(torch.arange(4))
+    assert seen == {'lower': ['meta', 'cpu'], 'upper': ['meta']}
+    with Observer('lower'):
+        actual = capture.materialize(result)
+    assert seen['lower'] == ['meta', 'cpu', 'cpu']
+    assert torch.equal(actual, torch.tensor([[1], [2], [3]]))
+    assert 'fallback' in caplog.text.lower()
+
+
+def test_python_function_seeded_factory_restores_rng():
+    """Reuse tagged-op replay and normalize positional generator/device arguments."""
+    def factory(shape, generator=None, device='cpu', scale=2):
+        return torch.rand(shape, device=device, generator=generator) * scale
+
+    operation = PyFunction(
+        factory,
+        'python::factory(int[] shape, Generator? generator=None, Device device="cpu", int scale=2) -> Tensor',
+        tags=(torch.Tag.nondeterministic_seeded,),
+    )
+    generator = torch.Generator().manual_seed(17)
+    generator_state = generator.get_state()
+    with preserve_rng_state():
+        torch_state = torch.get_rng_state()
+        with DeferredInitialization() as capture:
+            result = operation.call_with_normalized_args((8,), generator, 'cpu', 2)
+        seed = capture._storage(result).node.seed
+        actual = capture.materialize(result)
+        assert torch.equal(actual, capture.materialize(result))
+        assert torch.equal(torch.get_rng_state(), torch_state)
+        assert torch.equal(generator.get_state(), generator_state)
+        expected = factory((8,), torch.Generator().manual_seed(seed))
+        assert torch.equal(actual, expected)
+
+
+@pytest.fixture
+def python_trunc_normal(monkeypatch):
+    original = torch.nn.init._no_grad_trunc_normal_
+
+    def initializer(tensor, mean, std, a, b, generator=None):
+        # Reproduce PyTorch 2.12+'s meta early return on older test runtimes.
+        if tensor.is_meta:
+            return tensor
+        return original(tensor, mean, std, a, b, generator=generator)
+
+    monkeypatch.setattr(torch.nn.init, '_no_grad_trunc_normal_', initializer)
+    monkeypatch.setattr(torch, '__version__', torch.torch_version.TorchVersion('2.12.0'))
+    return initializer
+
+
+@pytest.mark.parametrize('version, enabled', [('2.11.0', False), ('2.12.0', True)])
+def test_python_initializer_patch_predicate(monkeypatch, version, enabled):
+    """Evaluate each patch's version predicate when entering, not when importing."""
+    original = torch.nn.init._no_grad_trunc_normal_
+    monkeypatch.setattr(torch, '__version__', torch.torch_version.TorchVersion(version))
+    with DeferredInitialization():
+        assert (torch.nn.init._no_grad_trunc_normal_ is not original) == enabled
+    assert torch.nn.init._no_grad_trunc_normal_ is original
+
+
+def test_python_initializer_patch_lifetime(python_trunc_normal):
+    """Restore each enclosing helper on normal/exceptional exit, including nested captures."""
+    original = torch.nn.init._no_grad_trunc_normal_
+    with DeferredInitialization():
+        outer_helper = torch.nn.init._no_grad_trunc_normal_
+        assert outer_helper is not original
+        with DeferredInitialization():
+            assert torch.nn.init._no_grad_trunc_normal_ is not outer_helper
+        assert torch.nn.init._no_grad_trunc_normal_ is outer_helper
+        with pytest.raises(ValueError, match='constructor failed'):
+            with DeferredInitialization():
+                assert torch.nn.init._no_grad_trunc_normal_ is not outer_helper
+                raise ValueError('constructor failed')
+        assert torch.nn.init._no_grad_trunc_normal_ is outer_helper
+    assert torch.nn.init._no_grad_trunc_normal_ is original
+
+
+@pytest.mark.parametrize('stage', ['transfer', 'mode'])
+def test_python_initializer_patch_entry_failure(python_trunc_normal, monkeypatch, stage):
+    """Patch transfer and mode-entry failures restore patches without leaking a mode."""
+    original = torch.nn.init._no_grad_trunc_normal_
+    original_modes = _get_current_dispatch_mode_stack()
+
+    def fail_enter(self):
+        raise RuntimeError('entry failed')
+
+    target, name = (ExitStack, 'pop_all') if stage == 'transfer' else (TorchDispatchMode, '__enter__')
+    monkeypatch.setattr(target, name, fail_enter)
+    capture = DeferredInitialization()
+    with pytest.raises(RuntimeError, match='entry failed'):
+        with capture:
+            pytest.fail('entry should have failed')
+    assert torch.nn.init._no_grad_trunc_normal_ is original
+    assert _get_current_dispatch_mode_stack() == original_modes
+    assert not capture._active
+
+
+@pytest.mark.parametrize('partial', [False, True])
+def test_python_trunc_normal_preserves_layout_and_rng(python_trunc_normal, partial):
+    """Preserve snapshots and untouched elements; full overwrites need no old storage value."""
+    generator = torch.Generator().manual_seed(17)
+    generator_state = generator.get_state()
+    rng_state = torch.get_rng_state()
+    region = slice(3, 12) if partial else slice(None)
+    with DeferredInitialization() as capture:
+        x = torch.full((16,), 0.25)
+        before = x.clone()
+        target = x[region]
+        assert torch.nn.init.trunc_normal_(
+            target, mean=0.2, std=0.4, a=-0.5, b=0.8, generator=generator,
+        ) is target
+        node = capture._storage(x).node
+        assert node.func.func is python_trunc_normal
+        assert (node.previous is not None) == partial
+    expected = torch.full((16,), 0.25)
+    torch.nn.init.trunc_normal_(
+        expected[region], mean=0.2, std=0.4, a=-0.5, b=0.8,
+        generator=torch.Generator().manual_seed(node.seed),
+    )
+    assert torch.equal(capture.materialize(before), torch.full((16,), 0.25))
+    assert torch.equal(capture.materialize(x), expected)
+    assert torch.equal(generator.get_state(), generator_state)
+    assert torch.equal(torch.get_rng_state(), rng_state)
+
+
+def test_python_initializer_inside_concrete_fallback(python_trunc_normal, caplog):
+    """Execute, rather than recapture, an initializer inside a real custom-op fallback."""
+    lib = torch.library.Library('deferred_python_initializer_test', 'DEF')
+    lib.define('initialize(Tensor template) -> Tensor', tags=(torch.Tag.nondeterministic_seeded,))
+    lib.impl(
+        'initialize',
+        lambda template: torch.nn.init.trunc_normal_(torch.empty_like(template), a=-0.5, b=0.8),
+        'CPU',
+    )
+    with DeferredInitialization() as capture:
+        result = torch.ops.deferred_python_initializer_test.initialize(torch.ones(32))
+        total = result.sum().item()
+    actual = capture.materialize(result)
+    assert actual.sum().item() == total
+    assert torch.equal(actual, capture.materialize(result))
+    assert actual.min() >= -0.5 and actual.max() <= 0.8
+    assert 'fallback' in caplog.text.lower()
 
 
 def test_generic_invalid_inputs_are_not_fallback(caplog):

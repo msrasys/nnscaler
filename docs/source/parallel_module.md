@@ -102,9 +102,25 @@ require explicit support:
 | Copies | `clone`, copying `to`, `copy_` |
 | In-place initialization | `fill_`, `zero_`, `uniform_`, `normal_`, `random_`, `bernoulli_`, `exponential_`, `geometric_`, `log_normal_`, `cauchy_`, `erfinv_`, scalar-bound `clamp_` |
 | In-place arithmetic | `add_`, `sub_`, `mul_`, `div_` with scalar operands on contiguous tensors or views |
+| Whole Python functions | `torch.nn.init.trunc_normal_` on PyTorch 2.12+ |
 
-The table uses ATen operator names; composite APIs work only if their underlying
-operations are supported. Important limits:
+Except for the last row, the table uses ATen operator names; composite APIs work
+only if their underlying operations are supported.
+
+PyTorch 2.12+ skips `trunc_normal_` on meta tensors. nnScaler captures its Python
+helper as one seeded, in-place operation and replays the installed PyTorch
+implementation on CPU. PyTorch 2.0-2.11 retains operator-level capture.
+The helper is patched only inside the capture context and restored on exit,
+including exceptional exits; nested contexts restore the enclosing patch.
+Internally, `PyFunction` supplies the same schema and tags as dispatched operators.
+It uses the existing supported operation names to select the op, write or view
+path, including their existing mutation restrictions and dependency handling.
+Each dispatch mode receives the `PyFunction` object with that mode temporarily
+popped. Calling `func(...)` forwards to the next lower mode; once the stack is
+empty, the function executes (or returns the meta target for a write).
+This is explicit internal registration, not interception of arbitrary Python functions.
+
+Important limits:
 
 - `out=` overloads, noncontiguous mutations, tensor-operand in-place arithmetic,
   and unlisted alias operations such as `split` and `diagonal` are unsupported.

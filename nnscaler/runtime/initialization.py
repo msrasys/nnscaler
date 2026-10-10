@@ -22,15 +22,19 @@ temporarily allocates real storage, so these allocations are not deferred.
 
 from __future__ import annotations
 
-from contextlib import contextmanager, nullcontext
+from contextlib import ExitStack, contextmanager, nullcontext
 from dataclasses import dataclass, field
+import inspect
 import logging
 import random
+from types import ModuleType
 from typing import TYPE_CHECKING, Any, Callable, Dict, Generator, Optional, Type
 
 import numpy as np
 import torch
-from torch.utils._python_dispatch import TorchDispatchMode
+from torch.utils._python_dispatch import (
+    TorchDispatchMode, _get_current_dispatch_mode_stack, _pop_mode_temporarily,
+)
 
 from nnscaler.utils import get_member_by_name
 
@@ -187,10 +191,72 @@ def _map(value, transform):
 
 
 @dataclass(eq=False)
+class PyFunction:
+    """A Python callable using the same schema, tags and operation names as dispatch.
+
+    Writes/views use DeferredInitialization's existing supported-name sets.
+    Writes preserve metadata and return their first argument; pure functions
+    return fresh tensors. Use ``call_with_normalized_args`` at the constructor entry.
+    """
+
+    func: Callable[..., Any]
+    schema: str
+    tags: tuple = ()
+    _schema: torch.FunctionSchema = field(init=False, repr=False)
+    signature: inspect.Signature = field(init=False, repr=False)
+
+    def __post_init__(self):
+        self._schema = torch._C.parse_schema(self.schema)
+        self.signature = inspect.signature(self.func)
+
+    def __call__(self, *args, **kwargs):
+        # Like dispatcher redispatch, each handler runs with only the lower modes
+        # active. Calling func(...) forwards this same PyFunction to the next mode.
+        if _get_current_dispatch_mode_stack():
+            with _pop_mode_temporarily() as mode:
+                return mode.__torch_dispatch__(self, (), args, kwargs)
+        # In-place Python initializers need no meta execution, only the write recipe.
+        if args and isinstance(args[0], torch.Tensor) and args[0].is_meta:
+            # Schema alias_info describes storage aliasing: Tensor(a) shares alias
+            # set "a"; Tensor(a!) also marks a write (is_write). Without an alias
+            # annotation, alias_info is None. Aliasing alone does not imply mutation.
+            # TODO: this may not right for all functions.
+            #       we should check its correctness for each specific function.
+            alias = self._schema.arguments[0].alias_info
+            if alias is not None and alias.is_write:
+                return args[0]
+        return self.func(*args, **kwargs)
+
+    def call_with_normalized_args(self, *args, **kwargs):
+        bound = self.signature.bind(*args, **kwargs)
+        bound.apply_defaults()
+        # Keep replay-controlled arguments out of the positional recipe.
+        options = {name: bound.arguments.pop(name) for name in ("generator", "device")
+                   if name in bound.arguments}
+        return self(*bound.args, **bound.kwargs, **options)
+
+
+# Key: (module owning the function, attribute name).
+# Value: (operator schema, dispatch tags, predicate evaluated on entry to enable the patch).
+_PYTHON_FUNCTION_PATCHES: dict[
+    tuple[ModuleType, str], tuple[str, tuple[torch.Tag, ...], Callable[[], bool]]
+] = {
+    # PyTorch 2.12+ skips meta initialization before dispatch. Patch the helper
+    # so existing aliases of the public initializer also capture the whole call.
+    (torch.nn.init, "_no_grad_trunc_normal_"): (
+        "python::trunc_normal_(Tensor(a!) tensor, float mean, float std, float a, float b, "
+        "Generator? generator=None) -> Tensor(a!)",
+        (torch.Tag.nondeterministic_seeded,),
+        lambda: torch.__version__ >= (2, 12),
+    ),
+}
+
+
+@dataclass(eq=False)
 class _Node:
     # Meta-only layout template; None for a shared structured/scalar result.
     tensor: Optional[torch.Tensor]
-    # Captured operator to replay; None for projection nodes.
+    # Captured operator or PyFunction; None for projection nodes.
     func: Any
     # Positional arguments with tensor dependencies snapshotted; excludes the write destination.
     args: Any
@@ -274,7 +340,7 @@ class DeferredInitialization(TorchDispatchMode):
     _unary_writes = {"erfinv_", "clamp_"}
     _random_writes = {
         "uniform_", "normal_", "random_", "bernoulli_", "exponential_",
-        "geometric_", "log_normal_", "cauchy_",
+        "geometric_", "log_normal_", "cauchy_", "trunc_normal_",
     }
     _sampling = {"normal", "bernoulli", "poisson", "multinomial"}
     _random_factories = {"rand", "randn", "randint", "randperm"}
@@ -295,12 +361,28 @@ class DeferredInitialization(TorchDispatchMode):
     def __enter__(self):
         if self._used:
             raise _unsupported("a capture context cannot be reused")
-        self._used = self._active = True
-        return super().__enter__()
+        self._used = True
+        with ExitStack() as patches:
+            for (module, name), (schema, tags, should_patch) in _PYTHON_FUNCTION_PATCHES.items():
+                if should_patch():
+                    original = getattr(module, name)
+                    patches.callback(setattr, module, name, original)
+                    setattr(module, name, PyFunction(original, schema, tags).call_with_normalized_args)
+            self._patches = patches.pop_all()
+        try:
+            result = super().__enter__()
+        except BaseException:
+            self._patches.close()
+            raise
+        self._active = True
+        return result
 
     def __exit__(self, *args):
         self._active = False
-        return super().__exit__(*args)
+        try:
+            return super().__exit__(*args)
+        finally:
+            self._patches.close()
 
     def _storage(self, tensor: torch.Tensor):
         if tensor.layout != torch.strided:
@@ -342,7 +424,7 @@ class DeferredInitialization(TorchDispatchMode):
         self._storages[tensor.untyped_storage()] = _Storage(tensor, node)
         return tensor
 
-    def __torch_dispatch__(self, func: torch._ops.OpOverload, types, args=(), kwargs=None):
+    def __torch_dispatch__(self, func: torch._ops.OpOverload | PyFunction, types, args=(), kwargs=None):
         kwargs = dict(kwargs or {})
         # Schema names are "namespace::operator" (e.g. "aten::add"), without the overload suffix;
         # overload_name is an operator-specific string, not an enum or a fixed set:
