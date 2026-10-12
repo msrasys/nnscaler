@@ -324,7 +324,7 @@ class DeferredInitialization(TorchDispatchMode):
     seeds; random values are repeatable but need not match eager initialization.
 
     Empty allocations are replayed without initializing their values, like eager
-    PyTorch. Supported writes require a contiguous destination view; these include
+    PyTorch. Supported writes require a provably non-overlapping destination view; these include
     scalar/tensor arithmetic, ``erfinv_`` and ``clamp_``. Tensor arithmetic operands
     may alias the target only with the same dtype/layout or disjoint byte spans.
     External writes, ``out=``, other mutations, unsupported aliasing
@@ -569,9 +569,27 @@ class DeferredInitialization(TorchDispatchMode):
         storage = self._storage(tensor)
         if storage is None:
             raise _unsupported(f"mutation of external data in {func}")
-        if not tensor.is_contiguous():
-            raise _unsupported(f"noncontiguous mutation in {func}")
 
+        # Check for potentially overlapping mutations in non-contiguous tensors.
+        # for example, if two elements share the same memory location due to non-contiguous layout,
+        # it could lead to overlapping mutations.
+        # the following check ensures that no two elements in the tensor share the same memory location.
+        # (but this is a conservative check and may reject some valid layouts)
+        if tensor.numel() and not tensor.is_contiguous():
+            # Largest element offset reached by dimensions already checked.
+            max_offset = 0
+            # Process (stride, size) dimensions from smallest stride to largest.
+            for stride, size in sorted(zip(tensor.stride(), tensor.shape)):
+                if size <= 1:
+                    continue
+                # The next copy must start beyond the current copy's last element.
+                # Otherwise their bounding intervals overlap; conservatively reject.
+                if stride <= max_offset:
+                    raise _unsupported(f"potentially overlapping mutation in {func}")
+                max_offset += (size - 1) * stride
+
+        # the following check ensures that arithmetic and unary writes do not overlap with tensors in the args[1:].
+        # (but this is a conservative check and may reject some valid layouts)
         if name in self._arithmetic_writes | self._unary_writes and tensor.numel():
             start, end = _byte_span(tensor)
             for value in (*args[1:], *kwargs.values()):

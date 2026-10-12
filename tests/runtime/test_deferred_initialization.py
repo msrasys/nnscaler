@@ -314,16 +314,48 @@ def test_unbind_views_preserve_mutation_history():
         torch.testing.assert_close(capture.materialize(tensor), reference, rtol=0, atol=0)
 
 
-def test_unbind_noncontiguous_views_are_readable_but_not_writable():
+def test_unbind_noncontiguous_writes_preserve_history():
     with DeferredInitialization() as capture:
         source = torch.arange(12, dtype=torch.float32).reshape(3, 4)
         column = source.unbind(1)[2]
         before = column.clone()
-        with pytest.raises(RuntimeError, match="noncontiguous mutation"):
-            column.fill_(7)
+        column.fill_(7)
+        after = source.clone()
         source.fill_(9)
     assert torch.equal(capture.materialize(before), torch.tensor([2., 6., 10.]))
+    expected = torch.arange(12, dtype=torch.float32).reshape(3, 4)
+    expected[:, 2] = 7
+    assert torch.equal(capture.materialize(after), expected)
     assert torch.equal(capture.materialize(column), torch.full((3,), 9.))
+
+
+@pytest.mark.parametrize("layout", ["transpose", "column", "strided", "empty"])
+@pytest.mark.parametrize("operation", ["fill_", "copy_", "add_", "clamp_"])
+def test_noncontiguous_writes_match_eager(layout, operation):
+    def initialize():
+        tensor = torch.arange(24, dtype=torch.float32).reshape(3, 4, 2)
+        if layout == "transpose":
+            target = tensor.transpose(0, 1)
+        elif layout == "column":
+            target = tensor[:, :, 0]
+        elif layout == "strided":
+            target = tensor[:, ::2, :]
+        else:
+            target = tensor[:0].transpose(0, 1)
+        before = tensor.clone()
+        if operation == "fill_":
+            target.fill_(7)
+        elif operation == "clamp_":
+            target.clamp_(max=torch.full((), 7.))
+        else:
+            getattr(target, operation)(torch.full(target.shape, 7.))
+        return tensor, before
+
+    expected = initialize()
+    with DeferredInitialization() as capture:
+        actual = initialize()
+    for tensor, reference in zip(actual, expected):
+        torch.testing.assert_close(capture.materialize(tensor), reference, rtol=0, atol=0)
 
 
 def test_unbind_external_views_preserve_snapshot():
@@ -820,7 +852,7 @@ def test_out_overloads_are_rejected(operation, dtype):
 @pytest.mark.parametrize("factory, message", [
     (lambda: torch.ones(3).sin_(), "unsupported mutation"),
     (lambda: torch.ones(3).resize_(5), "unsupported mutation"),
-    (lambda: torch.ones(3, 4).t().fill_(1), "noncontiguous mutation"),
+    (lambda: torch.ones(1, 4).expand(3, 4).fill_(1), "overlapping mutation"),
     (lambda: torch.empty_strided((3, 4), (0, 1)), "overlapping"),
 ])
 def test_unsupported_constructors_fail_explicitly(factory, message):
@@ -1533,13 +1565,13 @@ def test_generic_positional_generator_and_following_arguments(use_generator):
     ("log_normal_", (0.5,)),
     ("cauchy_", (0.5,)),
 ])
-def test_writes_reject_external_and_noncontiguous(operation, arguments):
+def test_writes_reject_external_and_overlapping(operation, arguments):
     external = torch.ones(3)
     with DeferredInitialization():
         with pytest.raises(RuntimeError, match="mutation of external data"):
             getattr(external, operation)(*arguments)
-        with pytest.raises(RuntimeError, match="noncontiguous mutation"):
-            getattr(torch.ones(3, 4).t(), operation)(*arguments)
+        with pytest.raises(RuntimeError, match="overlapping mutation"):
+            getattr(torch.ones(1, 4).expand(3, 4), operation)(*arguments)
     assert torch.equal(external, torch.ones(3))
 
 

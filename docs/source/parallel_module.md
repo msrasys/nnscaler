@@ -104,7 +104,7 @@ require explicit support:
 | Views | `detach`, `alias`, `view`, `_unsafe_view`, `transpose`, `t`, `permute`, `slice`, `select`, `unsqueeze`, `squeeze`, `expand`, `unbind` (including tensor iteration) |
 | Copies | `clone`, copying `to`, `copy_` |
 | In-place initialization | `fill_`, `zero_`, `uniform_`, `normal_`, `random_`, `bernoulli_`, `exponential_`, `geometric_`, `log_normal_`, `cauchy_`, `erfinv_`, scalar/tensor-bound `clamp_` |
-| In-place arithmetic | `add_`, `sub_`, `mul_`, `div_` with scalar or tensor operands on contiguous tensors or views |
+| In-place arithmetic | `add_`, `sub_`, `mul_`, `div_` with scalar or tensor operands on non-overlapping tensors or views |
 | Whole Python functions | `torch.nn.init.eye_`, `orthogonal_`, `sparse_`; `trunc_normal_` on PyTorch 2.12+ |
 
 Except for the last row, the table uses ATen operator names; composite APIs work
@@ -132,8 +132,9 @@ This is explicit internal registration, not interception of arbitrary Python fun
 
 Important limits:
 
-- `out=` overloads, noncontiguous mutations, and unlisted alias operations such
-  as `split` and `diagonal` are unsupported.
+- `out=` overloads and unlisted alias operations such as `split` and `diagonal`
+  are unsupported. Writes allow transposes and strided slices when stride analysis
+  proves that destination elements do not overlap; unproven layouts are rejected.
 - Tensor operands of in-place arithmetic and `clamp_` may share the destination's
   storage only with identical dtype, shape, strides and offset, or disjoint bounding
   byte spans. Other overlaps are conservatively rejected, including stride gaps:
