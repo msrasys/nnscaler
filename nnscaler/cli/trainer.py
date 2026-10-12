@@ -8,7 +8,6 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 from pathlib import Path
 import sys, os
 import copy
-import hashlib
 import warnings
 import shutil
 import logging
@@ -18,6 +17,7 @@ import torch
 import torch.distributed as dist
 from torch.utils.data import DataLoader
 import psutil
+import xxhash
 
 from tqdm import tqdm
 
@@ -37,7 +37,7 @@ logger = logging.getLogger(__name__)
 
 
 def _initialization_digest(tensor: torch.Tensor) -> str:
-    digest = hashlib.sha256()
+    digest = xxhash.xxh3_128()
     value = tensor.detach().cpu().contiguous().reshape(-1).view(torch.uint8)
     digest.update(repr((str(tensor.dtype), tuple(tensor.shape))).encode())
     digest.update(value.numpy())

@@ -227,16 +227,27 @@ def test_check_plain_model_replica(kind):
                     'initialization differs across ranks')
 
 
-@pytest.mark.parametrize('difference', ['signed_zero', 'shape', 'dtype'])
-def test_check_tensor_representation(difference):
-    """Reject mocked buffer replicas differing in signed zero, shape, or dtype."""
-    value = torch.zeros(2)
+@pytest.mark.parametrize('device', [
+    'cpu',
+    pytest.param('cuda', marks=pytest.mark.skipif(
+        not torch.cuda.is_available(), reason='requires CUDA',
+    )),
+])
+@pytest.mark.parametrize('difference', ['signed_zero', 'shape', 'dtype', 'repeated_value', 'order'])
+def test_check_tensor_representation(difference, device):
+    """Reject mocked replicas differing in representation, repeated values, or order."""
+    value = torch.zeros(2, device=device)
     if difference == 'signed_zero':
         changed = -value
     elif difference == 'shape':
         changed = value.reshape(1, 2)
-    else:
+    elif difference == 'dtype':
         changed = value.double()
+    elif difference == 'repeated_value':
+        changed = torch.ones_like(value)
+    else:
+        value = torch.arange(4, dtype=torch.float32, device=device)
+        changed = value.flip(0)
     model = torch.nn.Module()
     model.register_buffer('value', value)
     replica = torch.nn.Module()

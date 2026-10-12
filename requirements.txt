@@ -9,3 +9,4 @@ pyyaml
 torch>=2.0
 tqdm
 safetensors
+xxhash>=3.0.0

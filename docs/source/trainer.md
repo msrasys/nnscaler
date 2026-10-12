@@ -948,6 +948,8 @@ class DebugConfig:
 - `param_init_check` (`bool`, default `True`): Compare hashes of initialized
   parameters and buffers across ranks, requiring bitwise equality. Runs after
   optimizer/reducer construction, including ZeRO-3 sharding.
+  Uses XXH3-128 over dtype, shape, and raw tensor bytes on CPU; GPU tensors
+  are copied to CPU one at a time. Only digests and metadata are exchanged.
   - **Compared:** identical logical shard replicas in non-file `ParallelModule`
     instances, plus ordinary module parameters and buffers across ranks.
     Different submodules are checked separately.
