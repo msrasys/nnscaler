@@ -1530,7 +1530,7 @@ def test_generic_invalid_inputs_are_not_fallback(caplog):
 
 
 @pytest.mark.parametrize("operation", [
-    lambda x: x.diagonal(),
+    lambda x: torch.view_as_complex(x.reshape(8, 2)),
 ])
 def test_generic_aliasing_outputs_are_rejected(operation):
     with DeferredInitialization() as capture:

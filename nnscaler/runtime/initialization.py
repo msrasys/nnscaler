@@ -356,6 +356,7 @@ class DeferredInitialization(TorchDispatchMode):
     _views = {
         "detach", "alias", "view", "_unsafe_view", "transpose", "t", "permute",
         "slice", "select", "unsqueeze", "squeeze", "expand", "unbind", "split", "split_with_sizes",
+        "diagonal", "unfold", "as_strided",
     }
     _arithmetic_writes = {"add_", "sub_", "mul_", "div_"}
     _unary_writes = {"erfinv_", "clamp_"}
