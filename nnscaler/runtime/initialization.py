@@ -181,7 +181,17 @@ def _unsupported(reason):
 
 
 def _layout(tensor):
-    return (tuple(tensor.shape), tuple(tensor.stride()), tensor.storage_offset())
+    # Shape, stride and element offset are expressed in the view's dtype.
+    return (tuple(tensor.shape), tuple(tensor.stride()), tensor.storage_offset(), tensor.dtype)
+
+
+def _restore_view(tensor, layout):
+    shape, stride, offset, dtype = layout
+    if tensor.dtype == dtype:
+        return tensor.as_strided(shape, stride, offset)
+    # Reinterpret bytes without converting values; view(dtype) alone requires compatible strides.
+    return torch.empty(0, dtype=dtype, device=tensor.device).set_(
+        tensor.untyped_storage(), offset, shape, stride)
 
 
 def _byte_span(tensor):
@@ -308,7 +318,7 @@ class _Storage:
 @dataclass
 class _Read:
     node: _Node
-    layout: tuple[tuple[int, ...], tuple[int, ...], int]  # (shape, stride, storage_offset)
+    layout: tuple[tuple[int, ...], tuple[int, ...], int, torch.dtype]  # (shape, stride, storage_offset, dtype)
 
 
 @dataclass
@@ -357,6 +367,7 @@ class DeferredInitialization(TorchDispatchMode):
         "detach", "alias", "view", "_unsafe_view", "transpose", "t", "permute",
         "slice", "select", "unsqueeze", "squeeze", "expand", "unbind", "split", "split_with_sizes",
         "diagonal", "unfold", "as_strided",
+        "view_as_real", "view_as_complex",
     }
     _arithmetic_writes = {"add_", "sub_", "mul_", "div_"}
     _unary_writes = {"erfinv_", "clamp_"}
@@ -668,7 +679,7 @@ class DeferredInitialization(TorchDispatchMode):
           ``operation``/``projection``; that shared node has no tensor template.
           Concrete fallback uses the same recipes and is re-executed as needed.
         - ``_Read`` entries in recipe args/kwargs reference a specific producer
-          node and a view layout (shape, stride, storage offset).
+          node and a view layout (shape, stride, storage offset, dtype).
         - Empty allocations are ordinary nodes. All tensor arguments reference
           their original producers, even when an operator only needs their layout.
         - A mutation node's ``previous`` references the destination's old value
@@ -687,8 +698,8 @@ class DeferredInitialization(TorchDispatchMode):
             N2: full((2,), 7) -- args[0]._Read -+
 
         After capture ends, snapshot the requested tensor and recursively resolve
-        only its reachable dependencies. ``resolve`` reconstructs reads with
-        ``as_strided`` and validates external versions before moving external
+        only its reachable dependencies. ``resolve`` reconstructs storage views
+        in their recorded dtype and validates external versions before moving external
         inputs to the replay device. ``execute`` resolves operator arguments, creates a private
         generator or scoped RNG state on that device from the saved seed when present,
         and executes the operator under its captured default dtype.
@@ -717,7 +728,7 @@ class DeferredInitialization(TorchDispatchMode):
 
         def resolve(item: _Read | _External | Any):
             if isinstance(item, _Read):
-                return evaluate(item.node).as_strided(*item.layout)
+                return _restore_view(evaluate(item.node), item.layout)
             if isinstance(item, _External):
                 if item.tensor._version != item.version:
                     raise _unsupported("external tensor data changed after capture")
@@ -740,7 +751,7 @@ class DeferredInitialization(TorchDispatchMode):
                 if node.previous is not None:
                     result.copy_(evaluate(node.previous))
                 # inplace write to result
-                execute(node, result.as_strided(*node.target))
+                execute(node, _restore_view(result, node.target))
             else:  # normal node
                 result = execute(node)
             cache[node] = result

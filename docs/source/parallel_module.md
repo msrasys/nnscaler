@@ -112,7 +112,7 @@ require explicit support:
 | Category | Supported operations |
 | --- | --- |
 | Factories and sampling | `empty`, `zeros`, `ones`, `full`, `arange`, `linspace`, `rand`, `randn`, `randint`, `randperm`, like/new factories, `normal`, `bernoulli`, `poisson`, `multinomial` |
-| Views | `detach`, `alias`, `view`, `_unsafe_view`, `transpose`, `t`, `permute`, `slice`, `select`, `unsqueeze`, `squeeze`, `expand`, `unbind` (including tensor iteration), `split`, `split_with_sizes`, `diagonal`, `unfold`, `as_strided` |
+| Views | `detach`, `alias`, `view` (shape or dtype), `_unsafe_view`, `transpose`, `t`, `permute`, `slice`, `select`, `unsqueeze`, `squeeze`, `expand`, `unbind` (including tensor iteration), `split`, `split_with_sizes`, `diagonal`, `unfold`, `as_strided`, `view_as_real`, `view_as_complex` |
 | Copies | `clone`, copying `to`, `copy_` |
 | In-place initialization | `fill_`, `zero_`, `uniform_`, `normal_`, `random_`, `bernoulli_`, `exponential_`, `geometric_`, `log_normal_`, `cauchy_`, `erfinv_`, scalar/tensor-bound `clamp_` |
 | In-place arithmetic | `add_`, `sub_`, `mul_`, `div_` with scalar or tensor operands on non-overlapping tensors or views |
@@ -144,7 +144,7 @@ This is explicit internal registration, not interception of arbitrary Python fun
 
 Important limits:
 
-- `out=` overloads and unlisted alias operations such as `view_as_complex`
+- `out=` overloads and unlisted alias operations such as `_conj`
   are unsupported. Writes allow transposes and strided slices when stride analysis
   proves that destination elements do not overlap; unproven layouts are rejected.
 - Tensor operands of in-place arithmetic and `clamp_` may share the destination's
