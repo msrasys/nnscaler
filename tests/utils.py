@@ -6,7 +6,7 @@ import re
 import sys
 import inspect
 from typing import Optional, Tuple, Type, Union, Pattern
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager, nullcontext
 from typing import Callable
 import functools
 import math
@@ -14,12 +14,14 @@ import random
 from datetime import timedelta
 from pathlib import Path
 import shutil
+from unittest.mock import patch
 
 import numpy as np
 
 import torch
 import torch.distributed as dist
 import torch.distributed.distributed_c10d as c10d
+from torch.utils._python_dispatch import TorchDispatchMode
 
 from nnscaler.parallel import ComputeConfig
 import nnscaler
@@ -109,6 +111,11 @@ def assert_parity(baseline_fn: Callable, compile_fn: Callable, atol: float=1e-3)
 
 @contextmanager
 def replace_all_device_with(device='cpu', force=False):
+    """Redirect tensor allocation, CUDA contexts and RNG to the test device.
+
+    Meta allocations are preserved at dispatch so deferred capture stays symbolic.
+    CPU/meta replacements emulate CUDA RNG using the CPU generator.
+    """
     if not force and torch.cuda.is_available():
         # do not replace device if cuda is available
         yield
@@ -120,11 +127,32 @@ def replace_all_device_with(device='cpu', force=False):
     orig_cuda = torch.Tensor.cuda
     orig_cpu = torch.Tensor.cpu
     orig_is_cuda = torch.Tensor.is_cuda
+    orig_generator = torch.Generator
+    target_device = torch.device(device)
+
+    class ReplaceDevice(TorchDispatchMode):
+        def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+            kwargs = dict(kwargs or {})
+            requested = kwargs.get('device')
+            if requested is not None and torch.device(requested).type != 'meta':
+                kwargs['device'] = target_device
+            return func(*args, **kwargs)
+
+    class GeneratorMeta(type(orig_generator)):
+        def __instancecheck__(cls, value):
+            return isinstance(value, orig_generator)
+
+    class Generator(orig_generator, metaclass=GeneratorMeta):
+        def __new__(cls, device='cpu'):
+            # Meta has no generator; random meta kernels only need metadata.
+            return super().__new__(cls, device='cpu' if target_device.type == 'meta' else target_device)
 
     def patch_tensor_constructor(fn):
         orig_func = getattr(fn, '__cube_orig_func__', fn)  # to support nested patching
         def wrapper(*args, **kwargs):
-            kwargs["device"] =device
+            # Meta kernels can call Python factories internally; keep those allocations symbolic.
+            if kwargs.get("device") is None or torch.device(kwargs["device"]).type != 'meta':
+                kwargs["device"] = device
             return orig_func(*args, **kwargs)
         wrapper.__name__ = orig_func.__name__
         wrapper.__qualname__ = orig_func.__qualname__
@@ -136,7 +164,7 @@ def replace_all_device_with(device='cpu', force=False):
         return wrapper
     # these constructors are enough for most cases
     patched_tensor_constructor_names = [
-        'empty', 'zeros', 'ones', 'full', 'eye',
+        'empty', 'empty_strided', 'zeros', 'ones', 'full', 'eye',
         'linspace', 'logspace', 'arange',
         'rand', 'randn', 'randint', 'randperm',
         'randn_like', 'rand_like', 'randint_like',
@@ -203,7 +231,18 @@ def replace_all_device_with(device='cpu', force=False):
                 wrap_utils.default_autowrap_leaf_function[
                     patched_tensor_constructors[tf_name]
                 ] = leaf_info
-        yield
+        with ExitStack() as stack:
+            stack.enter_context(patch('torch.Generator', Generator))
+            if target_device.type in ('cpu', 'meta'):
+                stack.enter_context(patch('torch.cuda.device', lambda device: nullcontext()))
+                stack.enter_context(patch('torch.cuda.set_device', lambda device: None))
+                stack.enter_context(patch('torch.cuda.current_device', lambda: 0))
+                stack.enter_context(patch('torch.cuda.get_rng_state', lambda device='cuda': torch.get_rng_state()))
+                stack.enter_context(patch('torch.cuda.set_rng_state', lambda state, device='cuda': torch.set_rng_state(state)))
+                stack.enter_context(patch('torch.cuda.manual_seed', torch.random.default_generator.manual_seed))
+                stack.enter_context(patch('torch.cuda.manual_seed_all', torch.random.default_generator.manual_seed))
+            stack.enter_context(ReplaceDevice())
+            yield
     finally:
         for tf_name, fn in patched_tensor_constructors.items():
             leaf_info = wrap_utils.default_autowrap_leaf_function.pop(fn, None)

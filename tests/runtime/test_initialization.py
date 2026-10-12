@@ -16,6 +16,7 @@ from nnscaler.runtime.initialization import (
 )
 from nnscaler.runtime.module import AttrMeta, ParallelModule
 from tests.parallel_module.common import assert_equal
+from tests.utils import replace_all_device_with
 
 
 class RandomInitModule(torch.nn.Module):
@@ -112,7 +113,7 @@ def _local_module(strategy):
 
 @pytest.mark.parametrize('strategy', [ParamInitStrategy.FULL, ParamInitStrategy.SHARD])
 @pytest.mark.parametrize('val_chunks', [1, 2])
-@patch('nnscaler.runtime.initialization.capture_init_weights', partial(capture_init_weights, device='cpu'))
+@replace_all_device_with('cpu', force=True)
 def test_source_strategy_preserves_buffer_dependency_on_init_and_resume(tmp_path, strategy, val_chunks):
     module = _local_module(strategy)
     module.module_dir = tmp_path
@@ -205,7 +206,7 @@ def test_source_initializer_validates_tensor_metadata(strategy, value):
         module._post_init(init_module=source, build_buckets=False)
 
 
-@patch('nnscaler.runtime.initialization.capture_init_weights', partial(capture_init_weights, device='cpu'))
+@replace_all_device_with('cpu', force=True)
 def test_capture_initializer_streams_into_model_and_releases_full_sources():
     from torch.multiprocessing.reductions import StorageWeakRef
 

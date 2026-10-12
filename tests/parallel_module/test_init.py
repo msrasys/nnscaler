@@ -3,7 +3,6 @@
 
 import tempfile
 import sys
-from functools import partial
 from unittest.mock import patch
 import pytest
 
@@ -11,7 +10,6 @@ import torch
 
 import nnscaler
 from nnscaler.parallel import _load_parallel_module_class, parallelize, ComputeConfig, ParamInitStrategy
-from nnscaler.runtime.initialization import capture_init_weights
 
 from ..launch_torchrun import launch_torchrun
 from .common import CubeLinear, init_distributed, init_random
@@ -60,7 +58,7 @@ class DefaultDtypeInitModule(torch.nn.Module):
 
 
 @patch('torch.cuda.is_available', lambda: False)
-@patch('nnscaler.runtime.initialization.capture_init_weights', partial(capture_init_weights, device='cpu'))
+@replace_all_device_with('cpu', force=True)
 def test_capture_constructor_default_dtype(tmp_path):
     with mock_cube_env(0, 1), mock_dist(0, 1), patch('torch.distributed.barrier'), \
             patch('torch.distributed.broadcast_object_list'):
@@ -165,7 +163,7 @@ def test_shard_init_accepts_single_argument_call(tmp_path, wrap):
 @pytest.mark.parametrize('strategy', ['full', 'shard'])
 @pytest.mark.parametrize('module_class', [LocalInitModule, ShardInitModule])
 @pytest.mark.parametrize('source_instance', [False, True])
-@patch('nnscaler.runtime.initialization.capture_init_weights', partial(capture_init_weights, device='cpu'))
+@replace_all_device_with('cpu', force=True)
 def test_param_init_callback_attachment(tmp_path, strategy, module_class, source_instance):
     """Test that the parameter initialization callback is correctly attached to the generated module."""
     source = module_class() if source_instance else module_class
