@@ -92,6 +92,17 @@ Use a [shard hook](#write-a-shard-initializer) when even one full tensor is too
 large. Capture uses per-operation random streams, so its values need not match
 eager `full` initialization with the same seed.
 
+`DeferredInitialization(device="cpu")` chooses one device for both capture-time
+concrete fallback and subsequent `materialize(tensor)` calls, defaulting to CPU.
+`capture_init_weights(..., device="cuda")`, used by automatic SHARD initialization,
+defaults to the current CUDA device. Both accept `"cpu"`, `"cuda"` or an explicit
+`torch.device`; unindexed CUDA is pinned to the current device when the capture
+object is constructed. Supplied model instances are used as-is.
+Full source tensors and intermediate values therefore consume temporary GPU memory.
+CPU and CUDA random samples may differ, but fallback and materialization use the
+same device and captured random seeds.
+There is no automatic CPU fallback if CUDA replay fails.
+
 #### Supported operations
 
 Ordinary non-mutating operators are captured generically, including arithmetic,
@@ -112,10 +123,10 @@ only if their underlying operations are supported.
 
 PyTorch 2.12+ skips `trunc_normal_` on meta tensors. nnScaler captures its Python
 helper as one seeded, in-place operation and replays the installed PyTorch
-implementation on CPU. PyTorch 2.0-2.11 retains operator-level capture.
+implementation on the replay device. PyTorch 2.0-2.11 retains operator-level capture.
 `eye_`, `orthogonal_` and `sparse_` are also captured as whole in-place functions,
 so their internal `out=`, QR/transposes and indexed writes execute only during
-CPU replay. `eye_` is deterministic; the other two use per-operation random seeds.
+replay. `eye_` is deterministic; the other two use per-operation random seeds.
 The registered functions are patched only inside the capture context and restored on exit,
 including exceptional exits; nested contexts restore the enclosing patch.
 Internally, `PyFunction` supplies the same schema and tags as dispatched operators.
@@ -141,10 +152,10 @@ Important limits:
   replay reads historical values from separate storage, which would otherwise
   change overlapping read/write behavior even when eager PyTorch does not reject it.
 - Data-dependent operations such as `.item()` and `nonzero`, and operations
-  without a meta implementation, use a logged CPU fallback during capture.
+  without a meta implementation, use a logged concrete fallback on the configured device during capture.
   This can allocate full tensors. Recipes are replayed later; constructor
   branches are decided during capture, not reevaluated as dynamic branches.
-- Replay requires CPU implementations. Custom operators must accurately declare
+- Replay requires implementations on the selected device. Custom operators must accurately declare
   mutation, aliasing and randomness; external side effects are not replay-safe.
   For seeded custom operators, replay seeds Python, NumPy, PyTorch CPU and the
   current CUDA device from the captured node seed, restoring caller RNG states
@@ -161,9 +172,9 @@ Unlike `trunc_normal_`, these functions have no separate helper to patch:
 references saved before entering capture (for example,
 `from torch.nn.init import orthogonal_`) and deprecated aliases without the
 trailing underscore are not covered by whole-function capture.
-Targets must still be contiguous, and replay requires a dtype supported by the
-original CPU implementation (including QR for `orthogonal_`). Noncontiguous
-targets remain unsupported even for initializers such as `uniform_` and `normal_`.
+Targets must satisfy the non-overlap checks above, and replay requires a dtype and
+layout supported by the original implementation on the selected device (including
+QR for `orthogonal_`).
 
 If capture cannot handle a constructor, use `full`, `file`, a supplied initialized
 instance, or a shard hook. Capture does not silently reconstruct a full eager

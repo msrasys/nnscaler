@@ -386,15 +386,21 @@ def test_streaming_shard_failure_closes_hook_and_restores_rng(failure):
     assert_equal(before, _rng_state())
 
 
-def test_capture_initializer_yields_views_without_cloning():
+@pytest.mark.parametrize('device', [None, 'cpu', 'cuda:0'])
+def test_capture_initializer_yields_views_without_cloning(device):
     """
     Test capture_init_weights yields views without cloning.
     """
+    if device != 'cpu' and not torch.cuda.is_available():
+        pytest.skip('requires CUDA')
     module = _local_module(ParamInitStrategy.SHARD)
-    stream = capture_init_weights(module.fullmap, module_fn=type(module)._init_module_fn)
+    kwargs = {} if device is None else {'device': torch.device(device)}
+    stream = capture_init_weights(module.fullmap, module_fn=type(module)._init_module_fn, **kwargs)
     try:
         name, value = next(stream)
         assert name == 'weight_local'
+        expected_device = torch.device('cuda', torch.cuda.current_device()) if device is None else torch.device(device)
+        assert value.device == expected_device
         assert value.shape == (2,)
         assert value.untyped_storage().nbytes() == 4 * value.element_size()
         assert value.storage_offset() == 1

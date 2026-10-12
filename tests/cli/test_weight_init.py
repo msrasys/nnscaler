@@ -191,7 +191,7 @@ def _args(save_dir, strategy, *, checked=False, policy='tp', zero=0,
 
 def _reference(strategy, seed=1234, model_class=InitModel):
     if strategy == ParamInitStrategy.SHARD and not hasattr(model_class, '__shard__init__'):
-        with DeferredInitialization() as capture:
+        with DeferredInitialization(device="cuda") as capture:
             model = create_init_module(model_class, model_class, None, seed=seed)
         return {
             name: capture.materialize(value)
@@ -378,7 +378,10 @@ def _worker_selective_initialization(save_dir):
     def checked_materialize(capture, tensor):
         parameters = InitModel.initial_parameters
         assert parameters and all(param.is_meta for param in parameters.values())
+        local_rank = int(os.environ['LOCAL_RANK'])
+        assert torch.cuda.current_device() == local_rank
         value = original_materialize(capture, tensor)
+        assert value.device == torch.device('cuda', local_rank)
         materialized.append(tensor)
         return value
 
@@ -400,6 +403,7 @@ def test_cli_selective_initialization(tmp_path):
 
     Run hybrid parallel CLI setup on four ranks and compare captured parameter
     identities with the generated model's local metadata, without training.
+    Each replayed tensor must reside on that rank's local CUDA device.
     """
     launch_torchrun(4, _worker_selective_initialization, tmp_path)
 

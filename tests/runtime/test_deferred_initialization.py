@@ -29,6 +29,82 @@ class AllocationRecorder(TorchDispatchMode):
         return result
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("device", [None, "cuda", "cpu", "cuda:0"])
+def test_materialize_device_and_rng(device):
+    external = torch.arange(12, dtype=torch.float32).reshape(3, 4)
+    kwargs = {} if device is None else {"device": torch.device(device)}
+    with DeferredInitialization(**kwargs) as capture:
+        tensor = torch.empty(3, 4)
+        tensor.normal_()
+        tensor[:, ::2].add_(external[:, ::2])
+        result = tensor + torch.rand_like(tensor)
+        orthogonal = torch.empty(4, 4)
+        torch.nn.init.orthogonal_(orthogonal)
+    cpu_rng = torch.get_rng_state().clone()
+    cuda_rng = torch.cuda.get_rng_state().clone()
+    python_rng, numpy_rng = random.getstate(), np.random.get_state()
+    actual = capture.materialize(result)
+    expected_device = torch.device("cpu") if device in (None, "cpu") else torch.device("cuda", torch.cuda.current_device())
+    assert actual.device == expected_device
+    assert torch.isfinite(actual).all()
+    assert torch.equal(actual, capture.materialize(result))
+    matrix = capture.materialize(orthogonal)
+    torch.testing.assert_close(matrix @ matrix.t(), torch.eye(4, device=matrix.device), atol=1e-5, rtol=1e-5)
+    assert torch.equal(cpu_rng, torch.get_rng_state())
+    assert torch.equal(cuda_rng, torch.cuda.get_rng_state())
+    assert random.getstate() == python_rng
+    numpy_after = np.random.get_state()
+    assert numpy_after[0] == numpy_rng[0]
+    assert np.array_equal(numpy_after[1], numpy_rng[1])
+    assert numpy_after[2:] == numpy_rng[2:]
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="requires two GPUs")
+def test_materialize_explicit_cuda_device_restores_current_device():
+    with torch.cuda.device(0):
+        with DeferredInitialization(device="cuda:1") as capture:
+            result = torch.rand_like(torch.ones(8))
+        states = torch.cuda.get_rng_state_all()
+        first = capture.materialize(result)
+        second = capture.materialize(result)
+        assert first.device == torch.device("cuda:1")
+        assert torch.equal(first, second)
+        assert torch.cuda.current_device() == 0
+        assert all(torch.equal(before, after) for before, after in zip(states, torch.cuda.get_rng_state_all()))
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="requires two GPUs")
+def test_capture_pins_current_cuda_device():
+    with torch.cuda.device(0):
+        capture = DeferredInitialization(device="cuda")
+    with torch.cuda.device(1):
+        with capture:
+            tensor = torch.randn(32)
+            total = tensor.sum().item()
+        actual = capture.materialize(tensor)
+        assert actual.device == torch.device("cuda:0")
+        assert actual.sum().item() == total
+        assert torch.cuda.current_device() == 1
+
+
+def test_capture_rejects_meta_device():
+    with pytest.raises(RuntimeError, match="replay device must be CPU or CUDA"):
+        DeferredInitialization(device="meta")
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_cuda_materialize_after_capture_fallback(caplog):
+    with DeferredInitialization(device="cuda") as capture:
+        tensor = torch.randn(64)
+        indices = (tensor > 0).nonzero()
+    assert "concrete fallback" in caplog.text
+    actual = capture.materialize(indices)
+    assert actual.is_cuda
+    assert actual.shape == indices.shape
+    assert torch.equal(actual, (capture.materialize(tensor) > 0).nonzero())
+
+
 def test_standard_constructors_are_meta_and_selective():
     with AllocationRecorder() as construction, DeferredInitialization() as capture:
         model = torch.nn.ModuleDict({
@@ -1135,9 +1211,13 @@ def test_generic_tagged_random_is_stable_and_preserves_rng():
     assert torch.equal(generator.get_state(), generator_state)
 
 
-def test_random_control_flow_uses_same_values_as_replay():
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+def test_random_control_flow_uses_same_values_as_replay(device):
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("requires CUDA")
     state = torch.get_rng_state()
-    with DeferredInitialization() as capture:
+    cuda_state = torch.cuda.get_rng_state() if device == "cuda" else None
+    with DeferredInitialization(device=device) as capture:
         x = torch.randn(32)
         total = x.sum().item()
         factor = 2 if total > 0 else 3
@@ -1148,6 +1228,8 @@ def test_random_control_flow_uses_same_values_as_replay():
         assert materialized.sum().item() == total
         assert torch.equal(capture.materialize(result), materialized * factor)
     assert torch.equal(torch.get_rng_state(), state)
+    if cuda_state is not None:
+        assert torch.equal(torch.cuda.get_rng_state(), cuda_state)
 
 
 def test_trunc_normal_and_partial_unary_writes():

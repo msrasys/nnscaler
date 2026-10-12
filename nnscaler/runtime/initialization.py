@@ -4,7 +4,7 @@
 """In-memory initialization of generated modules.
 
 Deferred initialization records pure dispatched operations using meta tensors for
-selective CPU replay. Data-dependent tags and meta NotImplementedError trigger a
+selective CPU/CUDA replay. Data-dependent tags and meta NotImplementedError trigger a
 logged concrete execution during capture; tensor results are then discarded.
 This supports scalar control flow but is not a general lazy tensor implementation:
 mutations and aliasing operations still require explicit support.
@@ -14,7 +14,7 @@ generically recorded operators tagged as seeded nondeterministic, use independen
 per-operation seeds rather than eager PyTorch's random-number stream. Meta execution
 does not isolate RNG side effects. Custom-operator replay preserves Python, NumPy,
 torch CPU and current-device CUDA RNG states; native random replay uses private
-generators or scoped CPU RNG.
+generators or scoped RNG on the replay device.
 Existing real inputs are borrowed and must remain unchanged until
 replay. ``torch.tensor`` literals allocate before dispatch, and concrete fallback
 temporarily allocates real storage, so these allocations are not deferred.
@@ -145,10 +145,12 @@ def capture_init_weights(
     *,
     module_fn: Optional[Callable[[], torch.nn.Module]] = None,
     module: Optional[torch.nn.Module] = None,
+    device: str | torch.device = "cuda",
 ) -> Generator[tuple[str, torch.Tensor], None, None]:
     """Implement the __shard__init__ contract using captured construction.
 
     The bound factory supplies constructor arguments, dtype and initialization seed.
+    Concrete fallback and captured tensor replay use ``device`` (CUDA by default).
     A supplied instance is used as-is. Yield local views without value-division;
     ParallelModule copies each view before advancing and applies val_chunks.
     Consumers must release each view before requesting the next source tensor.
@@ -162,7 +164,7 @@ def capture_init_weights(
                 "Independent initialization requires parallelize() with the original "
                 "module class/module_fn, or an init_module instance."
             )
-        with DeferredInitialization() as capture:
+        with DeferredInitialization(device=device) as capture:
             module = module_fn()
     with torch.no_grad():
         for source, entries in _get_init_source_groups(module, attr_meta_map).values():
@@ -302,7 +304,7 @@ class _External:
 
 
 class DeferredInitialization(TorchDispatchMode):
-    """Capture a model factory, then materialize individual tensors on CPU.
+    """Capture a model factory, then materialize individual tensors on CPU or CUDA.
 
     Example::
 
@@ -313,7 +315,7 @@ class DeferredInitialization(TorchDispatchMode):
     Pure dispatched operators normally produce meta tensors and dependency
     recipes, including projections of shared multi-output operations. When an
     operator lacks meta support or needs data, capture replays its dependencies
-    on CPU to determine output metadata. Tensor results return to the capture
+    on the configured device to determine output metadata. Tensor results return to the capture
     graph as meta tensors; scalar results can drive constructor control flow.
     Fallback therefore trades capture-time memory for broader constructor support.
 
@@ -350,8 +352,15 @@ class DeferredInitialization(TorchDispatchMode):
     _writes = {"fill_", "zero_", "copy_"} | _arithmetic_writes | _random_writes | _unary_writes
     _random = _random_factories | _random_like | _random_writes | _sampling
 
-    def __init__(self):
+    def __init__(self, device: str | torch.device = "cpu"):
         super().__init__()
+        device = torch.device(device)
+        if device.type not in ("cpu", "cuda"):
+            raise _unsupported(f"replay device must be CPU or CUDA, got {device}")
+        # Pin unindexed CUDA so fallback and materialization cannot follow different current devices.
+        if device.type == "cuda" and device.index is None:
+            device = torch.device("cuda", torch.cuda.current_device())
+        self._device = device
         # Maps untyped storage pointers to storage metadata.
         # only track tensors created within the capture context
         # external tensors are not tracked
@@ -612,7 +621,7 @@ class DeferredInitialization(TorchDispatchMode):
         recipe_kwargs = _map(kwargs, self._snapshot)
         seed = self._seed(name, kwargs)
         # remove the generator from the captured keyword arguments
-        # replay replaces it with a private CPU generator using node.seed.
+        # replay replaces it with a private generator using node.seed.
         recipe_kwargs.pop("generator", None)
         node = _Node(storage.tensor, func, recipe_args, recipe_kwargs, seed,
                      storage.node if needs_previous else None, _layout(tensor))
@@ -629,7 +638,9 @@ class DeferredInitialization(TorchDispatchMode):
 
     def materialize(self, tensor: torch.Tensor) -> torch.Tensor:
         """
-        Replay just ``tensor`` and its dependencies, returning CPU data without a final copy.
+        Replay just ``tensor`` and its dependencies on the device chosen at construction.
+        Capture-time concrete fallback uses the same device. CPU and CUDA random samples
+        may differ; data-dependent constructor decisions are not reevaluated as branches.
 
         The captured recipes form a DAG, not just a chain of writes:
 
@@ -660,8 +671,8 @@ class DeferredInitialization(TorchDispatchMode):
         After capture ends, snapshot the requested tensor and recursively resolve
         only its reachable dependencies. ``resolve`` reconstructs reads with
         ``as_strided`` and validates external versions before moving external
-        inputs to CPU. ``execute`` resolves operator arguments, creates a private
-        CPU generator or scoped CPU RNG state from the saved seed when present,
+        inputs to the replay device. ``execute`` resolves operator arguments, creates a private
+        generator or scoped RNG state on that device from the saved seed when present,
         and executes the operator under its captured default dtype.
         Mutation nodes allocate a new buffer, copy ``previous`` if required, then
         write through the target view; this leaves older node values unchanged.
@@ -672,7 +683,7 @@ class DeferredInitialization(TorchDispatchMode):
         Selection is by node, not individual elements:
         requesting a small view may still materialize its full producer. No final
         clone is added, so returned views may retain larger storage and external
-        CPU inputs may share storage with the result. The original meta tensor is
+        inputs already on the replay device may share storage with the result. The original meta tensor is
         not replaced or populated.
         """
         if self._active:
@@ -684,6 +695,7 @@ class DeferredInitialization(TorchDispatchMode):
         # Dispatch temporarily removes this mode while invoking its handler;
         # fallback can replay here without disabling other observers/modes.
         cache = {}
+        device = self._device
 
         def resolve(item: _Read | _External | Any):
             if isinstance(item, _Read):
@@ -691,7 +703,7 @@ class DeferredInitialization(TorchDispatchMode):
             if isinstance(item, _External):
                 if item.tensor._version != item.version:
                     raise _unsupported("external tensor data changed after capture")
-                return item.tensor.detach().to(device="cpu")
+                return item.tensor.detach().to(device=device)
             if isinstance(item, _Node):
                 return evaluate(item)
             return item
@@ -706,7 +718,7 @@ class DeferredInitialization(TorchDispatchMode):
             elif node.target is not None:  # inplace write node
                 # allocate a full tensor for the inplace write (target is the location being written to)
                 result = torch.empty_strided(node.tensor.shape, node.tensor.stride(),
-                                             dtype=node.tensor.dtype, device="cpu")
+                                             dtype=node.tensor.dtype, device=device)
                 if node.previous is not None:
                     result.copy_(evaluate(node.previous))
                 # inplace write to result
@@ -724,13 +736,13 @@ class DeferredInitialization(TorchDispatchMode):
             custom = not func._schema.name.startswith("aten::")
             accepts_generator = any(arg.name == "generator" for arg in func._schema.arguments)
             if node.seed is not None and (accepts_generator or name in self._random_factories):
-                kwargs["generator"] = torch.Generator(device="cpu").manual_seed(node.seed)
+                kwargs["generator"] = torch.Generator(device=device).manual_seed(node.seed)
             if target is not None:
                 args = (target, *args)
             elif any(arg.name == "device" for arg in func._schema.arguments):
-                kwargs["device"] = torch.device("cpu")
+                kwargs["device"] = device
 
-            # ATen uses private generators or the CPU RNG scope below. Custom
+            # ATen uses private generators or the device RNG scope below. Custom
             # kernels may also use Python/NumPy/CUDA RNG. Avoid allocating RNG
             # snapshots for native deterministic operations and private generators.
             with _default_dtype(node.default_dtype), (
@@ -748,13 +760,20 @@ class DeferredInitialization(TorchDispatchMode):
                     name in self._random_like or "generator" not in kwargs
                 ):
                     # use global RNG if the operation does not accept a generator
-                    with torch.random.fork_rng(devices=[]):
-                        torch.random.default_generator.manual_seed(node.seed)
+                    with torch.random.fork_rng(
+                        devices=[torch.cuda.current_device()] if device.type == "cuda" else [],
+                    ):
+                        if device.type == "cuda":
+                            torch.cuda.manual_seed(node.seed)
+                        else:
+                            torch.random.default_generator.manual_seed(node.seed)
                         return func(*args, **kwargs)
                 return func(*args, **kwargs)
 
         try:
-            with torch.no_grad():
+            with torch.no_grad(), (
+                torch.cuda.device(device) if device.type == "cuda" else nullcontext()
+            ):
                 return resolve(value)
         except Exception as exc:
             raise _unsupported(f"replay failed: {exc}") from exc
