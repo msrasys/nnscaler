@@ -446,21 +446,64 @@ def test_unbind_external_views_preserve_snapshot():
         capture.materialize(copied)
 
 
-def test_unbind_tensor_iteration_in_constructor():
+@pytest.mark.parametrize("device", [
+    "cpu", pytest.param("cuda", marks=pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")),
+])
+@pytest.mark.parametrize("stagewise", [False, True])
+def test_unbind_tensor_iteration_in_constructor(device, stagewise):
     class Model(torch.nn.Module):
         def __init__(self):
             super().__init__()
-            schedule = [value.item() for value in torch.linspace(0, 0.2, 3)]
+            rates = torch.linspace(0, 0.2, 3, device="cpu")
+            if stagewise:
+                schedule = [value for stage in rates.split([1, 2]) for value in stage.tolist()]
+            else:
+                schedule = [value.item() for value in rates]
             self.layers = torch.nn.ModuleList([torch.nn.Linear(4, 4) for _ in schedule])
             with torch.no_grad():
                 for layer, value in zip(self.layers, schedule):
                     layer.weight.fill_(value)
 
     expected = Model()
-    with DeferredInitialization() as capture:
+    with DeferredInitialization(device=device) as capture:
         actual = Model()
     for layer, reference in zip(actual.layers, expected.layers):
-        assert torch.equal(capture.materialize(layer.weight), reference.weight)
+        assert torch.equal(capture.materialize(layer.weight).cpu(), reference.weight)
+
+
+@pytest.mark.parametrize("sections", [2, [2, 3], [0, 5, 0]])
+def test_split_views_preserve_mutation_history(sections):
+    with DeferredInitialization() as capture:
+        source = torch.arange(10, dtype=torch.float32).reshape(5, 2)
+        parts = source.split(sections)
+        before = [part.clone() for part in parts]
+        parts[1].fill_(7)
+    expected = torch.arange(10, dtype=torch.float32).reshape(5, 2)
+    for part, reference in zip(before, expected.split(sections)):
+        assert torch.equal(capture.materialize(part), reference)
+    expected.split(sections)[1].fill_(7)
+    assert torch.equal(capture.materialize(source), expected)
+
+
+@pytest.mark.parametrize("shape", [(), (0,), (2, 3)])
+@pytest.mark.parametrize("fail", [False, True])
+def test_tolist_fallback_and_restore(shape, fail):
+    original = torch.Tensor.tolist
+    try:
+        with DeferredInitialization() as capture:
+            value = torch.randn(shape)
+            result = value.tolist()
+            assert torch.Tensor.tolist is not original
+            enclosing = torch.Tensor.tolist
+            with DeferredInitialization():
+                pass
+            assert torch.Tensor.tolist is enclosing
+            if fail:
+                raise ValueError("exit capture")
+    except ValueError as exc:
+        assert fail and str(exc) == "exit capture"
+    assert torch.Tensor.tolist is original
+    assert result == capture.materialize(value).tolist()
 
 
 @pytest.mark.parametrize("factory", [
@@ -1487,7 +1530,6 @@ def test_generic_invalid_inputs_are_not_fallback(caplog):
 
 
 @pytest.mark.parametrize("operation", [
-    lambda x: x.split(2),
     lambda x: x.diagonal(),
 ])
 def test_generic_aliasing_outputs_are_rejected(operation):

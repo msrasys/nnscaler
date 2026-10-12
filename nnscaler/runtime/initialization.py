@@ -226,7 +226,24 @@ class PyFunction:
 
     def __post_init__(self):
         self._schema = torch._C.parse_schema(self.schema)
-        self.signature = inspect.signature(self.func)
+        try:
+            self.signature = inspect.signature(self.func)
+        except ValueError:
+            # Builtins such as Tensor.tolist expose no Python signature.
+            self.signature = inspect.Signature([
+                inspect.Parameter(
+                    arg.name,
+                    inspect.Parameter.KEYWORD_ONLY if arg.kwarg_only else inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                    default=arg.default_value if arg.has_default_value() else inspect.Parameter.empty,
+                )
+                for arg in self._schema.arguments
+            ])
+
+    def as_function(self):
+        # A plain function binds self when installed on Tensor, unlike a bound PyFunction method.
+        def call(*args, **kwargs):
+            return self.call_with_normalized_args(*args, **kwargs)
+        return call
 
     def __call__(self, *args, **kwargs):
         # Like dispatcher redispatch, each handler runs with only the lower modes
@@ -338,7 +355,7 @@ class DeferredInitialization(TorchDispatchMode):
 
     _views = {
         "detach", "alias", "view", "_unsafe_view", "transpose", "t", "permute",
-        "slice", "select", "unsqueeze", "squeeze", "expand", "unbind",
+        "slice", "select", "unsqueeze", "squeeze", "expand", "unbind", "split", "split_with_sizes",
     }
     _arithmetic_writes = {"add_", "sub_", "mul_", "div_"}
     _unary_writes = {"erfinv_", "clamp_"}
@@ -378,7 +395,7 @@ class DeferredInitialization(TorchDispatchMode):
                 if should_patch():
                     original = getattr(module, name)
                     patches.callback(setattr, module, name, original)
-                    setattr(module, name, PyFunction(original, schema, tags).call_with_normalized_args)
+                    setattr(module, name, PyFunction(original, schema, tags).as_function())
             self._patches = patches.pop_all()
         try:
             result = super().__enter__()
@@ -781,12 +798,18 @@ class DeferredInitialization(TorchDispatchMode):
             cache.clear()
 
 
-# Key: (module owning the function, attribute name).
+# Key: (module or class owning the function, attribute name).
 # Value: (operator schema, dispatch tags, predicate evaluated on entry to enable the patch).
 # Registered writes must fully initialize the destination view, preserving its metadata.
 _PYTHON_FUNCTION_PATCHES: dict[
-    tuple[ModuleType, str], tuple[str, tuple[torch.Tag, ...], Callable[[], bool]]
+    tuple[ModuleType | type, str], tuple[str, tuple[torch.Tag, ...], Callable[[], bool]]
 ] = {
+    # Tensor.tolist bypasses ATen scalar dispatch, unlike Tensor.item.
+    (torch.Tensor, "tolist"): (
+        "python::tolist(Tensor self) -> Any",
+        (torch.Tag.data_dependent_output,),
+        lambda: True,
+    ),
     # PyTorch 2.12+ skips meta initialization before dispatch. Patch the helper
     # so existing aliases of the public initializer also capture the whole call.
     (torch.nn.init, "_no_grad_trunc_normal_"): (

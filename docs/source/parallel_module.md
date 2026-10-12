@@ -112,7 +112,7 @@ require explicit support:
 | Category | Supported operations |
 | --- | --- |
 | Factories and sampling | `empty`, `zeros`, `ones`, `full`, `arange`, `linspace`, `rand`, `randn`, `randint`, `randperm`, like/new factories, `normal`, `bernoulli`, `poisson`, `multinomial` |
-| Views | `detach`, `alias`, `view`, `_unsafe_view`, `transpose`, `t`, `permute`, `slice`, `select`, `unsqueeze`, `squeeze`, `expand`, `unbind` (including tensor iteration) |
+| Views | `detach`, `alias`, `view`, `_unsafe_view`, `transpose`, `t`, `permute`, `slice`, `select`, `unsqueeze`, `squeeze`, `expand`, `unbind` (including tensor iteration), `split`, `split_with_sizes` |
 | Copies | `clone`, copying `to`, `copy_` |
 | In-place initialization | `fill_`, `zero_`, `uniform_`, `normal_`, `random_`, `bernoulli_`, `exponential_`, `geometric_`, `log_normal_`, `cauchy_`, `erfinv_`, scalar/tensor-bound `clamp_` |
 | In-place arithmetic | `add_`, `sub_`, `mul_`, `div_` with scalar or tensor operands on non-overlapping tensors or views |
@@ -130,6 +130,7 @@ replay. `eye_` is deterministic; the other two use per-operation random seeds.
 The registered functions are patched only inside the capture context and restored on exit,
 including exceptional exits; nested contexts restore the enclosing patch.
 Internally, `PyFunction` supplies the same schema and tags as dispatched operators.
+`Tensor.tolist` uses the same registry with a data-dependent tag to reuse concrete fallback.
 After the class definition, entries whose predicates pass populate the class's
 routing sets from schema alias annotations and randomness tags. Names need not be
 maintained in separate lists; predicates are checked again on context entry.
@@ -143,7 +144,7 @@ This is explicit internal registration, not interception of arbitrary Python fun
 
 Important limits:
 
-- `out=` overloads and unlisted alias operations such as `split` and `diagonal`
+- `out=` overloads and unlisted alias operations such as `diagonal`
   are unsupported. Writes allow transposes and strided slices when stride analysis
   proves that destination elements do not overlap; unproven layouts are rejected.
 - Tensor operands of in-place arithmetic and `clamp_` may share the destination's
@@ -151,7 +152,7 @@ Important limits:
   byte spans. Other overlaps are conservatively rejected, including stride gaps:
   replay reads historical values from separate storage, which would otherwise
   change overlapping read/write behavior even when eager PyTorch does not reject it.
-- Data-dependent operations such as `.item()` and `nonzero`, and operations
+- Data-dependent operations such as `.item()`, `.tolist()` and `nonzero`, and operations
   without a meta implementation, use a logged concrete fallback on the configured device during capture.
   This can allocate full tensors. Recipes are replayed later; constructor
   branches are decided during capture, not reevaluated as dynamic branches.
