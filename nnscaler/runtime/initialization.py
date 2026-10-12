@@ -182,6 +182,16 @@ def _layout(tensor):
     return (tuple(tensor.shape), tuple(tensor.stride()), tensor.storage_offset())
 
 
+def _byte_span(tensor):
+    # Nonempty tensor's bounding interval (start byte, exclusive end byte).
+    # This includes unused gaps between strided elements, not just occupied bytes.
+    # Disjoint spans prove no overlap; intersecting spans only indicate possible
+    # overlap, so the caller may conservatively reject actually disjoint views.
+    start = tensor.storage_offset()
+    end = start + sum((size - 1) * stride for size, stride in zip(tensor.shape, tensor.stride())) + 1
+    return start * tensor.element_size(), end * tensor.element_size()
+
+
 def _map(value, transform):
     if isinstance(value, (tuple, list)):
         return type(value)(_map(item, transform) for item in value)
@@ -190,6 +200,13 @@ def _map(value, transform):
     return transform(value)
 
 
+# An alternative is to route patched Python functions through torch.library
+# operators, letting the dispatcher handle mode chaining. For example:
+#     lib = torch.library.Library("deferred_python_initializer", "DEF")
+#     lib.define(...)
+#     lib.impl(...)
+# Capture could store the original callable and replay metadata so registrations
+# can be removed on exit.
 @dataclass(eq=False)
 class PyFunction:
     """A Python callable using the same schema, tags and operation names as dispatch.
@@ -308,8 +325,9 @@ class DeferredInitialization(TorchDispatchMode):
 
     Empty allocations are replayed without initializing their values, like eager
     PyTorch. Supported writes require a contiguous destination view; these include
-    scalar arithmetic, ``erfinv_`` and scalar ``clamp_``. External writes, ``out=``,
-    other mutations, tensor-valued arithmetic mutations, unsupported aliasing
+    scalar/tensor arithmetic, ``erfinv_`` and ``clamp_``. Tensor arithmetic operands
+    may alias the target only with the same dtype/layout or disjoint byte spans.
+    External writes, ``out=``, other mutations, unsupported aliasing
     operators and overlapping allocation layouts are rejected. Capture is single-use,
     and public ``materialize`` calls must occur after leaving the context.
     Only initialization inside the context is replayed; later value mutations of
@@ -554,14 +572,18 @@ class DeferredInitialization(TorchDispatchMode):
         if not tensor.is_contiguous():
             raise _unsupported(f"noncontiguous mutation in {func}")
 
-        # This is a support-scope restriction, not a single-chain limitation:
-        # previous and _Read entries in args/kwargs already form a dependency DAG.
-        # Tensor arithmetic needs broadcast, dtype, aliasing and historical-value
-        # semantics validated before enabling it.
-        if name in self._arithmetic_writes | self._unary_writes and any(
-            isinstance(value, torch.Tensor) for value in (*args[1:], *kwargs.values())
-        ):
-            raise _unsupported(f"tensor-valued arithmetic in {func}")
+        if name in self._arithmetic_writes | self._unary_writes and tensor.numel():
+            start, end = _byte_span(tensor)
+            for value in (*args[1:], *kwargs.values()):
+                if not isinstance(value, torch.Tensor) or not value.numel() or self._storage(value) is not storage:
+                    continue
+                if value.dtype == tensor.dtype and _layout(value) == _layout(tensor):
+                    continue
+                other_start, other_end = _byte_span(value)
+                # Replay writes a fresh buffer but reads old nodes, removing physical
+                # aliasing. Reject possible cross-element overlap before it is lost.
+                if start < other_end and other_start < end:
+                    raise _unsupported(f"overlapping tensor operand in {func}")
 
         full = _layout(tensor) == _layout(storage.tensor)
         needs_previous = not full or name in self._arithmetic_writes | self._unary_writes

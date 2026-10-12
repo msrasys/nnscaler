@@ -147,6 +147,9 @@ class GenericInitModel(InitModel):
             for layer, layer_scale in zip(self.layers, scales):
                 torch.nn.init.trunc_normal_(layer.weight, std=0.01, a=-0.02, b=0.02)
                 layer.weight.copy_(layer.weight.sin() * scale * layer_scale)
+                layer.weight.add_(positions, alpha=0.001)
+                layer.weight[:8].add_(layer.weight[8:], alpha=0.1)
+                layer.weight.clamp_(min=torch.full((), -0.03), max=torch.full((), 0.03))
 
 
 def init_dummy_sample(args):
@@ -415,8 +418,9 @@ def _worker_random_initialization(save_dir, model_class):
 def test_cli_random_initialization(tmp_path, model_class):
     """Match automatic SHARD initialization to a seeded deferred reference through CLI.
 
-    Cover random in-place/view writes and data-dependent tensor computations;
-    inspect initialized tensors after setup and skip training.
+    Cover random in-place/view writes, tensor arithmetic with disjoint aliases,
+    and data-dependent tensor computations; inspect initialized tensors after
+    setup and skip training.
     """
     launch_torchrun(4, _worker_random_initialization, tmp_path, model_class)
 

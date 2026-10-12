@@ -143,6 +143,107 @@ def test_scalar_arithmetic_preserves_previous_values(operation, kwargs, dtype, p
         torch.testing.assert_close(capture.materialize(tensor), reference, rtol=0, atol=0)
 
 
+@pytest.mark.parametrize("operation", ["add_", "sub_", "mul_", "div_", "clamp_"])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32, torch.float64])
+@pytest.mark.parametrize("operand", ["broadcast", "transposed", "self", "same-view", "disjoint", "empty"])
+def test_tensor_arithmetic_preserves_aliases_and_history(operation, dtype, operand):
+    class Model(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.arange(1, 17, dtype=dtype).reshape(4, 4).clone())
+            with torch.no_grad():
+                source = torch.linspace(0.5, 2.5, 8, dtype=torch.float32).reshape(4, 2)
+                target = self.weight[1:3]
+                if operand == "broadcast":
+                    rhs = source[:1].t()
+                elif operand == "transposed":
+                    rhs = source.t()
+                elif operand == "self":
+                    rhs = target
+                elif operand == "same-view":
+                    rhs = self.weight[1:3].view(2, 4)
+                elif operand == "disjoint":
+                    target, rhs = self.weight[:2], self.weight[2:]
+                else:
+                    target, rhs = self.weight[:0], self.weight[:0]
+                self.before = self.weight.clone()
+                if operation == "clamp_":
+                    target.clamp_(min=rhs, max=torch.full((), 12.))
+                else:
+                    kwargs = {"alpha": 0.7} if operation in ("add_", "sub_") else {}
+                    getattr(target, operation)(rhs, **kwargs)
+                self.after = self.weight.clone()
+                source.fill_(99)
+                self.weight.add_(1)
+                self.rhs = rhs
+
+    expected = Model()
+    with DeferredInitialization() as capture:
+        actual = Model()
+    for name in ("weight", "before", "after", "rhs"):
+        torch.testing.assert_close(
+            capture.materialize(getattr(actual, name)), getattr(expected, name), rtol=0, atol=0,
+        )
+
+
+@pytest.mark.parametrize("operation", ["add_", "sub_", "mul_", "div_", "clamp_"])
+@pytest.mark.parametrize("overlap", ["partial", "strided", "broadcast", "transpose", "stride-gaps"])
+def test_tensor_arithmetic_rejects_overlapping_operands(operation, overlap):
+    class Model(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.arange(1., 17.).reshape(4, 4).clone())
+            with torch.no_grad():
+                if overlap == "partial":
+                    target, rhs = self.weight[1:], self.weight[:-1]
+                elif overlap == "strided":
+                    target, rhs = self.weight.flatten()[2:10], self.weight.flatten()[::2]
+                elif overlap == "broadcast":
+                    target, rhs = self.weight, self.weight[:1]
+                elif overlap == "transpose":
+                    target, rhs = self.weight, self.weight.t()
+                else:
+                    target, rhs = self.weight.flatten()[1:3], self.weight.flatten()[::8]
+                if operation == "clamp_":
+                    target.clamp_(max=rhs)
+                else:
+                    getattr(target, operation)(rhs)
+
+    with pytest.raises(RuntimeError, match="overlapping tensor operand"):
+        with DeferredInitialization():
+            Model()
+
+
+@pytest.mark.parametrize("operation", ["add_", "sub_", "mul_", "div_"])
+@pytest.mark.parametrize("invalid", ["broadcast", "dtype"])
+def test_tensor_arithmetic_rejects_invalid_inputs(operation, invalid):
+    def initialize():
+        target = torch.ones(3, dtype=torch.int64 if invalid == "dtype" else torch.float32)
+        rhs = torch.full((3 if invalid == "dtype" else 4,), 0.5)
+        getattr(target, operation)(rhs)
+        return target
+
+    with pytest.raises(RuntimeError):
+        initialize()
+    with pytest.raises(RuntimeError):
+        with DeferredInitialization() as capture:
+            target = initialize()
+        capture.materialize(target)
+
+
+@pytest.mark.parametrize("rounding_mode", ["floor", "trunc"])
+def test_tensor_integer_division(rounding_mode):
+    def initialize():
+        target = torch.arange(-5, 5)
+        target.div_(torch.full((1,), 2), rounding_mode=rounding_mode)
+        return target
+
+    expected = initialize()
+    with DeferredInitialization() as capture:
+        actual = initialize()
+    torch.testing.assert_close(capture.materialize(actual), expected, rtol=0, atol=0)
+
+
 @pytest.mark.parametrize("operation", ["add_", "sub_", "mul_", "div_"])
 def test_arithmetic_on_empty_preserves_allocation_dependency(operation):
     with DeferredInitialization() as capture:
@@ -720,13 +821,6 @@ def test_out_overloads_are_rejected(operation, dtype):
     (lambda: torch.ones(3).sin_(), "unsupported mutation"),
     (lambda: torch.ones(3).resize_(5), "unsupported mutation"),
     (lambda: torch.ones(3, 4).t().fill_(1), "noncontiguous mutation"),
-    *[
-        pytest.param(
-            lambda operation=operation: getattr(torch.ones(3), operation)(torch.ones(3)),
-            "tensor-valued arithmetic", id=f"tensor-{operation}",
-        )
-        for operation in ("add_", "sub_", "mul_", "div_")
-    ],
     (lambda: torch.empty_strided((3, 4), (0, 1)), "overlapping"),
 ])
 def test_unsupported_constructors_fail_explicitly(factory, message):
