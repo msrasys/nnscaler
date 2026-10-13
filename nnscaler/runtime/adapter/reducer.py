@@ -24,6 +24,11 @@ if TYPE_CHECKING:
 _logger = logging.getLogger(__name__)
 
 
+# None denotes WORLD; this sentinel denotes a singleton group without a communicator.
+SINGLETON_GROUP = object()
+OptionalProcessGroup = Union[torch.distributed.ProcessGroup, None, object]
+
+
 _REDUCER_BUCKET_REFS: Dict[
     int, Tuple[weakref.ReferenceType, weakref.ReferenceType]
 ] = {}
@@ -332,9 +337,9 @@ class Bucket:
                  param_buffer: torch.Tensor, grad_buffer: torch.Tensor,
                  start: int, stop: int,
                  reduce_op: torch.distributed.ReduceOp,
-                 group: torch.distributed.ProcessGroup, async_op: bool, zero: int,
-                 zero_subgroup: torch.distributed.ProcessGroup = None,
-                 zero_crossgroup: torch.distributed.ProcessGroup = None,
+                 group: Optional[torch.distributed.ProcessGroup], async_op: bool, zero: int,
+                 zero_subgroup: OptionalProcessGroup = None,
+                 zero_crossgroup: OptionalProcessGroup = SINGLETON_GROUP,
                  zero_use_reduce_scatter: bool = False,
                  align_size: int = ALIGNED_BYTES,
                  param_cls: Any = None,
@@ -360,8 +365,9 @@ class Bucket:
             async_op (bool): whether to use asynchronous operation
             zero (int): whether to use zero optimization on gradients, currently only 0/1/3 are supported
                 zero=2 will be treated as zero=3
-            zero_subgroup (torch.distributed.ProcessGroup): the subgroup for zero optimization the current rank belongs to
-            zero_crossgroup (torch.distributed.ProcessGroup): the communication group for cross zero group allreduce when reduce scatter is enabled
+            zero_subgroup: the ZeRO subgroup; None denotes WORLD and SINGLETON_GROUP denotes a singleton
+            zero_crossgroup: the cross-subgroup reduction group; None denotes WORLD,
+                while SINGLETON_GROUP requires no cross-subgroup reduction
             zero_use_reduce_scatter (bool): whether to use reduce scatter for zero optimization
             align_size (int): the alignment size in bytes for each parameter
             param_cls (Any): the class of the parameters
@@ -425,9 +431,18 @@ class Bucket:
         self._numel: int = sum(p.numel() for p in self._params)
         self._aligned_numel: int = sum(_aligned_nelement(p.nelement(), p.element_size(), self._align_size) for p in self._params)
 
-        self._zero_subgroup = self._group if zero_subgroup is None else zero_subgroup
-        self._zgroup_sz: int = torch.distributed.get_world_size(group=self._zero_subgroup)
+        # Active ZeRO requires a real subgroup; singleton sharding is disabled by Reducer.
+        if self._zero and zero_subgroup is SINGLETON_GROUP:
+            raise ValueError("ZeRO sharding requires a non-singleton subgroup")
+        self._zero_subgroup = zero_subgroup
+        self._zgroup_sz: int = (
+            1 if self._zero_subgroup is SINGLETON_GROUP
+            else torch.distributed.get_world_size(group=self._zero_subgroup)
+        )
         self._zero_crossgroup = zero_crossgroup
+        if (self._zero > 1 or self._zero == 1 and self._zero_use_reduce_scatter) \
+                and self._zgroup_sz < self._wsz and zero_crossgroup is SINGLETON_GROUP:
+            raise ValueError("Reduction across multiple ZeRO subgroups requires a non-singleton cross-group")
         # ZeRO-1 optimizer shards are partitioned within the ZeRO subgroup, not the full reducer group.
         # For ZeRO-3, the parameters are already partitioned in the reducer, so the full reducer group is used for allreduce.
         opt_num_chunks = self._zgroup_sz if self._zero == 1 else 1
@@ -483,6 +498,12 @@ class Bucket:
         if not isinstance(steps, int) or steps < 0:
             raise ValueError(f"grad_accumulation_steps should be a non-negative integer, but got {steps}")
         self._grad_accumulation_steps = steps
+
+    @property
+    def _async_target_cnt(self) -> int:
+        if self._grad_accumulation_steps:
+            return self._grad_accumulation_steps * len(self._params)
+        return self._async_expected_total
 
     def get_aligned_numel(self, param) -> int:
         """
@@ -732,15 +753,18 @@ class Bucket:
             if CudaTimer().enabled and CudaTimer().predefined:
                 _logger.warning(
                     f'CudaTimer: the communication time of async reducer will not be recorded in `comm`')
-            if self._async_handle is not None:
-                self._async_handle.wait()
-            else:
+            if self._async_param_cnt != self._async_target_cnt:
                 raise RuntimeError(
                     "Async reducer did not launch gradient synchronization before sync_grads(). "
-                    f"Received {self._async_param_cnt}/{self._async_expected_total} expected "
+                    f"Received {self._async_param_cnt}/{self._async_target_cnt} expected "
                     "parameter-gradient contributions. This usually means the scheduled backward "
                     "plan did not match the reducer's async accumulation expectations."
                 )
+            if self._async_handle is not None:
+                self._async_handle.wait()
+            else:
+                # Single-subgroup ZeRO-3 is already reduced by the parameter hooks.
+                assert self._z3 and self._zero_crossgroup is SINGLETON_GROUP
         else:
             self._sync_contiguous_grads()
         # apply nreplicas divisor if needed
@@ -776,7 +800,10 @@ class Bucket:
         # synchronize gradients
         if self._zero == 1 and self._zero_use_reduce_scatter:
             self._group_reduce_scatter()
-        elif self._zero > 1:
+        elif self._z3:
+            if self._zero_crossgroup is SINGLETON_GROUP:
+                CudaTimer().stop('comm', predefined=True)
+                return
             torch.distributed.all_reduce(
                 self._contiguous_grads,
                 op=self._reduce_op,
@@ -825,10 +852,11 @@ class Bucket:
                                 "because the two steps (allreduce, reducescatter) use " \
                                 "two communication groups, which may induce deadlock."
                 self._group_reduce_scatter()
-        elif self._zero > 1:
-            self._async_handle = torch.distributed.all_reduce(
-                self._contiguous_grads, op=self._reduce_op,
-                group=self._zero_crossgroup, async_op=True)
+        elif self._z3:
+            if self._zero_crossgroup is not SINGLETON_GROUP:
+                self._async_handle = torch.distributed.all_reduce(
+                    self._contiguous_grads, op=self._reduce_op,
+                    group=self._zero_crossgroup, async_op=True)
         else:
             self._async_handle = torch.distributed.all_reduce(
                 self._contiguous_grads, op=self._reduce_op,
@@ -1107,6 +1135,8 @@ class Reducer:
             if zero_ngroups > 1:
                 raise ValueError("reduce scatter is not supported when zero_ngroups > 1")
 
+        self._zero_subgroup: OptionalProcessGroup
+        self._zero_crossgroup: OptionalProcessGroup
         if zero_ngroups > 1:
             assert self._zero, f"USE_ZERO must be set when ZERO_NUM_GROUPS is larger than 1"
             assert len(ranks) % zero_ngroups == 0, f"length of ranks {ranks} must be divisible by zero factor {zero_ngroups}"
@@ -1116,7 +1146,9 @@ class Reducer:
             sub_ranks = ranks[group_idx * zgroup_sz : (group_idx + 1) * zgroup_sz]
             if len(sub_ranks) > 1:
                 assert DeviceGroup().group_exists(sub_ranks), f"zero subgroup {sub_ranks} does not exist in comm groups"
-            self._zero_subgroup = DeviceGroup().get_group(sub_ranks)
+                self._zero_subgroup = DeviceGroup().get_group(sub_ranks)
+            else:
+                self._zero_subgroup = SINGLETON_GROUP
             self._zero_subranks = sub_ranks
             # crossgroup is for the allreduce across zero subgroups, it is only used when
             # reduce scatter is enabled and the number of zero subgroups is larger than 1.
@@ -1131,19 +1163,17 @@ class Reducer:
             zero_ngroups = 1  # we force zero_ngroups to 1 when zero is not used
             self._zero_subgroup = self._group
             self._zero_subranks = ranks
-            # trivial crossgroup for single rank
-            self._zero_crossgroup = DeviceGroup().get_group([torch.distributed.get_rank()])
+            # No cross-subgroup reduction is needed with only one ZeRO subgroup.
+            self._zero_crossgroup = SINGLETON_GROUP
             self._zero_crossranks = [torch.distributed.get_rank()]
 
         self._zero_ngroups = zero_ngroups
-
         # when zero is disabled, zero_size has no meaning,
         # but we set it to world size for simplicity of implementation
-        self._zero_size = torch.distributed.get_world_size(group=self._zero_subgroup)
+        self._zero_size = len(self._zero_subranks)
         if self._zero_size == 1:
             self._zero = 0  # disable zero when only one rank in subgroup
         self._z3 = self._zero > 1
-        self._z3_rank = torch.distributed.get_rank(group=self._zero_subgroup)
 
     @property
     def zero_ngroups(self) -> int:
@@ -1281,12 +1311,13 @@ class Reducer:
 
         # step 0: param split for zero3
         if self._z3:
+            z3_rank = torch.distributed.get_rank(group=self._zero_subgroup)
             for param in self._params:
                 if not param.requires_grad:
                     continue
 
                 chunk_size = (param.numel() + self._zero_size - 1) // self._zero_size
-                start = self._z3_rank * chunk_size
+                start = z3_rank * chunk_size
                 end = min(start + chunk_size, param.numel())
                 self._params_info[param] = ReducerParamInfo(shape=param.shape, start=start, end=end)
                 # clone the data so original param can be released

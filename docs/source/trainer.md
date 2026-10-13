@@ -1392,6 +1392,13 @@ We can categorize the fields into 4 categories:
       - `3`: ZeRO stage 3 (optimizer state + gradient + parameter sharding).
       (Passing `2` is also accepted and is treated as ZeRO stage 3.)
     - `zero_ngroups`: the number of ZeRO groups. Default is `1`.
+      ZeRO sharding is disabled when each subgroup contains only one rank.
+      With ZeRO stage 3 and a single subgroup, gradient reduce-scatter already
+      completes the reduction; no single-rank cross-group all-reduce is needed.
+      Internally, singleton ZeRO communication groups use `SINGLETON_GROUP`
+      without creating a communicator, distinct from PyTorch's `None`, which
+      denotes the WORLD group. Active sharding groups are validated when
+      constructing buckets rather than before each collective.
     - `zero_use_reduce_scatter`: whether to use reduce-scatter for ZeRO. Only effective when `use_zero != 0` and `zero_ngroups == 1`. May introduce parity issues in some cases; use with caution. Default is `False`.
     - `zero_param_level_sharding`: whether to shard parameters at parameter level (instead of element level) in ZeRO. Only effective when `use_zero != 0`. Must be set to `True` when using the Muon optimizer. May introduce padding. Default is `False`.
     - `inference_only`: whether to generate code for inference only. If
