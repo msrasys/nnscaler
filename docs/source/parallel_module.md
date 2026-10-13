@@ -116,6 +116,7 @@ require explicit support:
 | Copies | `clone`, copying `to`, `copy_` |
 | In-place initialization | `fill_`, `zero_`, `uniform_`, `normal_`, `random_`, `bernoulli_`, `exponential_`, `geometric_`, `log_normal_`, `cauchy_`, scalar/tensor-bound `clamp_`, `clamp_min_`, `clamp_max_` |
 | In-place arithmetic | `add_`, `sub_`, `mul_`, `div_`, `pow_`, `addcmul_`, `addcdiv_`, `lerp_`, `masked_fill_`, `abs_`, `neg_`, `reciprocal_`, `sqrt_`, `rsqrt_`, `floor_divide_`, `fmod_`, `remainder_`, `copysign_`, `heaviside_`, `hypot_`, `nextafter_`, `gcd_`, `lcm_` |
+| Indexed writes | `scatter_`, `scatter_add_`, `scatter_reduce_`, `index_add_`, `index_copy_`, `index_fill_`, `index_put_`, `index_reduce_`, `put_`, `_index_put_impl_` |
 | In-place transcendental functions | `sin_`, `cos_`, `tan_`, `asin_`, `acos_`, `atan_`, `atan2_`, `sinh_`, `cosh_`, `tanh_`, `asinh_`, `acosh_`, `atanh_`, `sinc_`, `deg2rad_`, `rad2deg_`, `exp_`, `exp2_`, `expm1_`, `log_`, `log2_`, `log10_`, `log1p_`, `logit_`, `xlogy_` |
 | In-place special functions | `erf_`, `erfc_`, `erfinv_`, `digamma_`, `polygamma_`, `lgamma_`, `mvlgamma_`, `igamma_`, `igammac_`, `i0_` |
 | In-place activations and value transforms | `relu_`, `leaky_relu_`, `elu_`, `celu_`, `gelu_`, `sigmoid_`, `silu_`, `mish_`, `hardsigmoid_`, `hardswish_`, `hardtanh_`, `threshold_`, `floor_`, `ceil_`, `round_`, `trunc_`, `frac_`, `sign_`, `sgn_`, `nan_to_num_`, `conj_physical_` |
@@ -131,6 +132,10 @@ already decompose to supported operations. `rrelu_` in training mode does not:
 its underlying `rrelu_with_noise_` also writes a separate noise tensor.
 All writes retain the non-overlapping-layout restrictions below and the installed
 PyTorch implementation's device, dtype and shape requirements.
+Constructors must be valid under eager PyTorch; capture/replay does not reproduce
+every native input-validation error. Indexed writes preserve the previous value
+of elements not selected by the indices. Native nondeterminism (for example,
+some repeated-index writes and floating-point reductions) is not eliminated by replay.
 
 PyTorch 2.12+ skips `trunc_normal_` on meta tensors. nnScaler captures its Python
 helper as one seeded, in-place operation and replays the installed PyTorch
@@ -163,11 +168,12 @@ Important limits:
   byte spans. Other overlaps are conservatively rejected, including stride gaps:
   replay reads historical values from separate storage, which would otherwise
   change overlapping read/write behavior even when eager PyTorch does not reject it.
-- Indexed writes (`scatter_`, `index_put_`, etc.), `masked_scatter_`, `addmm_`,
-  `addmv_` and `baddbmm_` need stronger operand-alias handling and remain unsupported.
+- `masked_scatter_`, `addmm_`, `addmv_` and `baddbmm_` remain unsupported:
+  eager can accept overlapping operands whose results change when replay separates their storage.
   Tensor-list/multiple-destination writes also require additional tracking.
   Metadata/storage mutations such as `transpose_`, `resize_` and `set_` cannot
-  reuse the value-write path. Sparse, nested, MKLDNN and named tensors are unsupported.
+  reuse the value-write path because they can change templates shared by older recipe nodes.
+  Sparse, nested, MKLDNN and named tensors are unsupported.
   `ldexp_` currently decomposes to an unsupported `out=` overload.
 - Non-mutating data-dependent operations such as `.item()`, `.tolist()` and `nonzero`, and pure operations
   without a meta implementation, use a logged concrete fallback on the configured device during capture.

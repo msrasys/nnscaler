@@ -361,8 +361,24 @@ class DeferredInitialization(TorchDispatchMode):
     and public ``materialize`` calls must occur after leaving the context.
     Only initialization inside the context is replayed; later value mutations of
     captured meta tensors are ignored. Do not change their metadata afterwards.
+    Constructors must be valid under eager PyTorch; capture/replay does not
+    reproduce every native input-validation error.
     """
 
+    # Not supported by name registration alone:
+    # - masked_scatter_, addmm_, addmv_, baddbmm_: eager can accept source/target
+    #   overlap, but replay separates their storage and can change the result.
+    # - transpose_, t_, swapaxes_, swapdims_, squeeze_, unsqueeze_, as_strided_,
+    #   resize_, resize_as_, set_: metadata/storage changes can mutate templates
+    #   shared by older recipe nodes, breaking historical values.
+    # - _conj, _neg_view: layouts do not retain conjugate/negative view bits.
+    # - _foreach_*_ and rrelu_with_noise_ (training rrelu_): replay tracks only one
+    #   write target, not a tensor list or the separately mutated noise tensor.
+    # - out= (including ldexp_'s mul.out): output buffers need explicit tracking;
+    #   these overloads are rejected before name-based dispatch.
+    # - Sparse/nested/MKLDNN/named tensors need additional layout or meta support.
+    # - Sobol state mutators and _reshape_from_tensor need concrete state/shape
+    #   data; the pure-op fallback does not cover the write/view paths.
     _views = {
         "detach", "alias", "view", "_unsafe_view", "transpose", "t", "permute",
         "slice", "select", "unsqueeze", "squeeze", "expand", "unbind", "split", "split_with_sizes",
@@ -370,14 +386,18 @@ class DeferredInitialization(TorchDispatchMode):
         "view_as_real", "view_as_complex", "_reshape_alias", "unsafe_split",
         "unsafe_split_with_sizes", "slice_inverse",
     }
+    # Indexed writes also need the previous value, even for a full target view:
+    # indices may leave some elements untouched.
     _arithmetic_writes = {
-        "__ilshift__", "__irshift__", "_add_relu_", "add_", "addbmm_", "addcdiv_",
+        "__ilshift__", "__irshift__", "_add_relu_", "_index_put_impl_", "add_", "addbmm_", "addcdiv_",
         "addcmul_", "addr_", "atan2_", "bitwise_and_", "bitwise_left_shift_",
         "bitwise_or_", "bitwise_right_shift_", "bitwise_xor_", "copysign_", "div_",
         "embedding_renorm_", "eq_", "floor_divide_", "fmod_", "gcd_", "ge_", "gt_",
-        "heaviside_", "hypot_", "igamma_", "igammac_", "lcm_", "le_", "lerp_",
+        "heaviside_", "hypot_", "igamma_", "igammac_", "index_add_", "index_copy_",
+        "index_fill_", "index_put_", "index_reduce_", "lcm_", "le_", "lerp_",
         "logical_and_", "logical_or_", "logical_xor_", "lt_", "masked_fill_",
-        "mul_", "ne_", "nextafter_", "pow_", "remainder_", "sub_", "xlogy_",
+        "mul_", "ne_", "nextafter_", "pow_", "put_", "remainder_",
+        "scatter_", "scatter_add_", "scatter_reduce_", "sub_", "xlogy_",
     }
     _unary_writes = {
         "abs_", "acos_", "acosh_", "asin_", "asinh_", "atan_", "atanh_",
