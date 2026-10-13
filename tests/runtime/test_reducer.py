@@ -18,7 +18,9 @@ from nnscaler.ir.operator import IRFwOperation
 from nnscaler.flags import CompileFlag
 from nnscaler.runtime.adapter.reducer import (
     DEFAULT_ASYNC_REDUCER_BUCKET_CAP_MB,
+    Bucket,
     FlattenParamInfo,
+    SINGLETON_GROUP,
     ParamBucketConfig,
     Reducer,
     ReducerParamInfo,
@@ -357,6 +359,73 @@ def test_reducer_build():
     assert buckets[3]._aligned_numel == 12
     assert buckets[4].numel == 1
     assert buckets[4]._aligned_numel == 4
+
+
+@mock_reducer_env(0, 2)
+@pytest.mark.parametrize('num_params', [1, 2])
+def test_bucket_async_target_cnt(num_params):
+    reducer = Reducer([0, 1])
+    for _ in range(num_params):
+        reducer.add_param(torch.nn.Parameter(torch.randn(2, 4)))
+    reducer.build_buckets()
+    bucket = reducer.buckets[0]
+    assert bucket._async_target_cnt == num_params
+    for steps in (3, 1, 0):
+        bucket.grad_accumulation_steps = steps
+        assert bucket._async_target_cnt == (steps or 1) * num_params
+
+
+@mock_reducer_env(0, 4)
+# Each case specifies the ZeRO stage and number of subgroups.
+@pytest.mark.parametrize('zero,zero_ngroups', [(0, 1), (1, 1), (1, 2), (1, 4), (3, 1), (3, 2), (3, 4)])
+def test_reducer_zero_group_states(zero, zero_ngroups):
+    for ranks in ([0, 1], [2, 3], [0, 2], [1, 3]):
+        DeviceGroup().get_group(ranks)
+    reducer = Reducer([0, 1, 2, 3], zero=zero, zero_ngroups=zero_ngroups)
+    reducer.add_param(torch.nn.Parameter(torch.randn(2, 4)))
+    reducer.build_buckets()
+
+    if zero_ngroups == 1:
+        assert reducer._zero_subgroup is None  # WORLD is a real group, not SINGLETON_GROUP.
+        assert reducer._zero_crossgroup is SINGLETON_GROUP
+    elif zero_ngroups == 4:
+        assert reducer._zero_subgroup is SINGLETON_GROUP
+        assert reducer._zero_crossgroup is None  # The cross-group is WORLD.
+        assert reducer.zero == 0
+    else:
+        assert torch.distributed.get_world_size(reducer._zero_subgroup) == 2
+        assert torch.distributed.get_world_size(reducer._zero_crossgroup) == 2
+
+    for bucket in reducer.buckets:
+        assert bucket._zero_subgroup is reducer._zero_subgroup
+        assert bucket._zero_crossgroup is reducer._zero_crossgroup
+        assert bucket._zgroup_sz == 4 // zero_ngroups
+
+
+@mock_reducer_env(0, 4)
+@pytest.mark.parametrize('zero', [1, 3])
+@pytest.mark.parametrize('singleton_subgroup', [True, False])
+def test_bucket_rejects_singleton_sharding_groups(zero, singleton_subgroup):
+    reducer = Reducer([0, 1, 2, 3])
+    subgroup = SINGLETON_GROUP if singleton_subgroup else DeviceGroup().get_group([0, 1])
+    message = "non-singleton subgroup" if singleton_subgroup else "non-singleton cross-group"
+    with pytest.raises(ValueError, match=message):
+        Bucket(
+            reducer=reducer,
+            params=[],
+            param_buffer=torch.empty(0),
+            grad_buffer=torch.empty(0),
+            start=0,
+            stop=0,
+            reduce_op=torch.distributed.ReduceOp.SUM,
+            group=None,
+            async_op=False,
+            zero=zero,
+            zero_subgroup=subgroup,
+            zero_crossgroup=SINGLETON_GROUP,
+            zero_use_reduce_scatter=zero == 1,
+            params_info={},
+        )
 
 
 @mock_reducer_env(0, 2)

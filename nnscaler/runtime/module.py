@@ -1394,11 +1394,14 @@ class ParallelModule(CubeModule):
     def prefetch_param(self, param: torch.nn.Parameter):
         """
         Gather the full parameter tensor for FSDP.
+        Parameters whose reducers have disabled ZeRO-3 are left unchanged.
 
         Args:
             param (torch.nn.Parameter): the local parameter to gather
         """
         reducer = self._reducers[self._param_reducer_map[param]]
+        if not reducer.zero3:
+            return
         reducer.prefetch_param(param)
         self._forward_prefetched_params.add(param)
 
@@ -1406,11 +1409,14 @@ class ParallelModule(CubeModule):
     def postevict_param(self, param: torch.nn.Parameter):
         """
         Release the full parameter tensor for zero3.
+        Parameters whose reducers have disabled ZeRO-3 are left unchanged.
 
         Args:
             param (torch.nn.Parameter): the local parameter
         """
         reducer = self._reducers[self._param_reducer_map[param]]
+        if not reducer.zero3:
+            return
         reducer.postevict_param(param)
         self._forward_prefetched_params.discard(param)
 
@@ -1425,6 +1431,8 @@ class ParallelModule(CubeModule):
         """
         if not input.requires_grad:
             # if input does not require grad, we cannot register backward hook on it
+            return input
+        if not self._reducers[self._param_reducer_map[param]].zero3:
             return input
 
         @torch.no_grad()
@@ -1441,6 +1449,8 @@ class ParallelModule(CubeModule):
         """
         if not activation.requires_grad:
             # if activation does not require grad, we cannot register backward hook on it
+            return activation
+        if not self._reducers[self._param_reducer_map[param]].zero3:
             return activation
 
         @torch.no_grad()

@@ -24,7 +24,7 @@ from nnscaler.execplan import ExecutionPlan
 from nnscaler.execplan.execplan import ExeReuseCell
 
 from nnscaler.codegen.syntax.symtable import SymbolTable
-from nnscaler.codegen.syntax.blocks import ClassBlock, ForBlock, FunctionBlock, Block
+from nnscaler.codegen.syntax.blocks import ClassBlock, FunctionBlock, Block
 
 from nnscaler.codegen.emit import FuncEmission
 from nnscaler.codegen.module.autograd import AutogradAdapterCodeGen
@@ -715,11 +715,6 @@ class ModuleCodeGen(FuncEmission):
         - `model_init_statements`
         """
         sign = 'self.init_group(ranks={ranks})'
-        # create single rank communication group
-        self.model_init_statements.append('# single rank communication groups')
-        with ForBlock(var='rank', iters=f'range({self.runtime_ndevs})') as fb:
-            fb.insert_body(sign.format(ranks='[rank]'))
-        self.model_init_statements.extend(fb.code)
         # create communication group
         self.model_init_statements.append('# communication groups')
         for ranks in self.comm_groups:
