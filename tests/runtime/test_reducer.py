@@ -313,6 +313,7 @@ def test_reducer_zero_group_states(zero, zero_ngroups):
     reducer.add_param(torch.nn.Parameter(torch.randn(2, 4)))
     reducer.build_buckets()
 
+    assert len(reducer._zero_crossranks) == reducer.zero_ngroups
     if zero_ngroups == 1:
         assert reducer._zero_subgroup is None  # WORLD is a real group, not SINGLETON_GROUP.
         assert reducer._zero_crossgroup is SINGLETON_GROUP
