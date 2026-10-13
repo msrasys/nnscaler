@@ -349,6 +349,57 @@ def test_noncontiguous_read_and_post_copy_source_mutation():
     assert torch.equal(capture.materialize(transposed), torch.full((4, 3), 99.0))
 
 
+# Each case specifies the initial shape and its metadata-only mutation.
+@pytest.mark.parametrize("shape, operation", [
+    pytest.param((3, 4), lambda x: x.transpose_(0, 1), id="transpose"),
+    pytest.param((3, 4), lambda x: x.t_(), id="t"),
+    pytest.param((3, 4), lambda x: x.swapaxes_(0, 1), id="swapaxes"),
+    pytest.param((3, 4), lambda x: x.swapdims_(0, 1), id="swapdims"),
+    pytest.param((3, 1, 4), lambda x: x.squeeze_(), id="squeeze"),
+    pytest.param((3, 1, 4), lambda x: x.squeeze_(1), id="squeeze-dim"),
+    pytest.param((1, 3, 1, 4), lambda x: x.squeeze_((0, 2)), id="squeeze-dims"),
+    pytest.param((3, 4), lambda x: x.unsqueeze_(1), id="unsqueeze"),
+    pytest.param((3, 4), lambda x: x.as_strided_((2, 3), (4, 1), 1), id="as-strided"),
+])
+@pytest.mark.parametrize("device", [
+    "cpu",
+    pytest.param("cuda", marks=pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")),
+])
+def test_inplace_views_preserve_history_and_aliases(shape, operation, device):
+    class Model(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            # clone() makes the captured producer also be the tensor whose metadata is mutated.
+            source = torch.arange(torch.Size(shape).numel(), dtype=torch.float32, device=device)
+            self.register_buffer("weight", source.reshape(shape).clone())
+            self.weight.add_(1)
+            self.alias = self.weight.detach()
+            self.before = self.weight.clone()
+            assert operation(self.weight) is self.weight
+            self.after_view = self.weight.clone()
+            self.weight[0].add_(10)
+            self.after_write = self.weight.clone()
+            self.alias[-1].fill_(-5)
+
+    expected = Model()
+    with DeferredInitialization(device) as capture:
+        model = Model()
+    for name in ("weight", "alias", "before", "after_view", "after_write"):
+        reference = getattr(expected, name)
+        for _ in range(2):
+            actual = capture.materialize(getattr(model, name))
+            torch.testing.assert_close(actual, reference, rtol=0, atol=0)
+            assert actual.stride() == reference.stride()
+            assert actual.storage_offset() == reference.storage_offset()
+
+    external = torch.empty(shape, device=device)
+    version = external._version
+    with DeferredInitialization(device), pytest.raises(RuntimeError, match="mutation of external data"):
+        operation(external)
+    assert external.shape == shape
+    assert external._version == version
+
+
 @pytest.mark.parametrize("shape,dim", [
     ((3, 4), 0),
     ((3, 4), 1),

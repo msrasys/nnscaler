@@ -365,12 +365,10 @@ class DeferredInitialization(TorchDispatchMode):
     reproduce every native input-validation error.
     """
 
-    # Not supported by name registration alone:
+    # Remaining unsupported operations:
     # - masked_scatter_, addmm_, addmv_, baddbmm_: eager can accept source/target
     #   overlap, but replay separates their storage and can change the result.
-    # - transpose_, t_, swapaxes_, swapdims_, squeeze_, unsqueeze_, as_strided_,
-    #   resize_, resize_as_, set_: metadata/storage changes can mutate templates
-    #   shared by older recipe nodes, breaking historical values.
+    # - resize_, resize_as_, set_: can change storage size/identity, not just layout.
     # - _conj, _neg_view: layouts do not retain conjugate/negative view bits.
     # - _foreach_*_ and rrelu_with_noise_ (training rrelu_): replay tracks only one
     #   write target, not a tensor list or the separately mutated noise tensor.
@@ -380,9 +378,9 @@ class DeferredInitialization(TorchDispatchMode):
     # - Sobol state mutators and _reshape_from_tensor need concrete state/shape
     #   data; the pure-op fallback does not cover the write/view paths.
     _views = {
-        "detach", "alias", "view", "_unsafe_view", "transpose", "t", "permute",
-        "slice", "select", "unsqueeze", "squeeze", "expand", "unbind", "split", "split_with_sizes",
-        "diagonal", "unfold", "as_strided",
+        "detach", "alias", "view", "_unsafe_view", "transpose", "transpose_", "t", "t_", "permute",
+        "slice", "select", "unsqueeze", "unsqueeze_", "squeeze", "squeeze_",
+        "expand", "unbind", "split", "split_with_sizes", "diagonal", "unfold", "as_strided", "as_strided_",
         "view_as_real", "view_as_complex", "_reshape_alias", "unsafe_split",
         "unsafe_split_with_sizes", "slice_inverse",
     }
@@ -503,7 +501,8 @@ class DeferredInitialization(TorchDispatchMode):
         # Conservatively reject both overlapping and indeterminate allocation layouts.
         if torch._debug_has_internal_overlap(tensor) != 0:
             raise _unsupported("allocations with overlapping or non-dense strides")
-        self._storages[tensor.untyped_storage()] = _Storage(tensor, node)
+        # Share storage, but keep the allocation layout independent of in-place view metadata.
+        self._storages[tensor.untyped_storage()] = _Storage(tensor.detach(), node)
         return tensor
 
     def __torch_dispatch__(self, func: torch._ops.OpOverload | PyFunction, types, args=(), kwargs=None):
@@ -538,6 +537,8 @@ class DeferredInitialization(TorchDispatchMode):
         storage = self._storage(args[0])
         if storage is None and args[0].is_meta:
             raise _unsupported(f"view of an untracked meta tensor in {func}")
+        if storage is None and func._schema.is_mutable:
+            raise _unsupported(f"mutation of external data in {func}")
         result = func(*args, **kwargs)
         views = result if isinstance(result, (tuple, list)) else (result,)
         for view in views:
