@@ -162,12 +162,9 @@ class Trainer:
         init_params = not is_resuming
         # Trainer owns a CUDA model (see self.model.cuda() below). On resume,
         # allocate generated tensors there directly; the checkpoint fills them.
-        # Preserve an opt-out for A/B comparisons without changing the generic
-        # construction API's CPU/default-device behavior.
         init_device = (
             torch.device('cuda', torch.cuda.current_device())
             if is_resuming and not compile_only
-            and os.environ.get('NNSCALER_RESUME_INIT_ON_CUDA', '1') != '0'
             else None
         )
 

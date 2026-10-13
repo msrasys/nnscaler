@@ -3,6 +3,7 @@
 
 from typing import Any, Callable, Protocol, Type
 from pathlib import Path
+import re
 import shutil
 import time
 import logging
@@ -10,6 +11,7 @@ import logging
 import torch
 
 from nnscaler.runtime.serialization import load, save
+from nnscaler.utils import run_on_rank0
 
 
 logger = logging.getLogger(__name__)
@@ -143,6 +145,8 @@ class Checkpointer:
     # TODO: make it configurable
     CHECKPOINT_FILE_NAME_FORMAT: str = '{rank}{suffix}'
     CHECKPOINT_FILE_FORMAT: str = '{epoch:04d}-{step:04d}/' + CHECKPOINT_FILE_NAME_FORMAT
+    # Also accept legacy epochN-stepN names when selecting a resume directory.
+    _CHECKPOINT_DIR_PATTERN = re.compile(r'(?:epoch)?([0-9]+)-(?:step)?([0-9]+)\Z')
     CHECKPOINT_LAST_DIR_NAME: str = 'last'
     CHECKPOINT_BEST_DIR_NAME: str = 'best'
     CHECKPOINT_MERGED_FILE_NAME: str = 'merged{suffix}'
@@ -224,6 +228,38 @@ class Checkpointer:
 
     def get_best_dir_name(self) -> str:
         return self.CHECKPOINT_BEST_DIR_NAME
+
+    @classmethod
+    def find_latest_checkpoint(cls, directory: str | Path) -> str | None:
+        """Select the directory with the greatest numeric (epoch, step).
+
+        All ranks of the default process group must call this in the same
+        order: rank 0 scans once and shares the selected name or scan error.
+        Without a process group, scan locally. Each call takes a fresh snapshot.
+
+        This only selects a path; Trainer still validates checkpoint files and
+        their contents. An incomplete newest checkpoint is not silently skipped.
+        No numbered directory means None; the 'last'/'best' aliases are unchanged.
+        """
+        directory = Path(directory)
+
+        def discover():
+            candidates = []
+            if not directory.exists():
+                return None
+            ignored = 0
+            for path in directory.iterdir():
+                match = cls._CHECKPOINT_DIR_PATTERN.fullmatch(path.name)
+                if match is not None and path.is_dir():
+                    candidates.append((int(match[1]), int(match[2]), path.name))
+                elif '-' in path.name:
+                    ignored += 1
+            if ignored:
+                logger.info('Ignored %d non-checkpoint names while finding the latest checkpoint', ignored)
+            return max(candidates)[2] if candidates else None
+
+        name = run_on_rank0(discover)
+        return str(directory / name) if name is not None else None
 
     def load(self, f: str | Path, *, device='cpu') -> Any:
         """

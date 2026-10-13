@@ -21,7 +21,7 @@ _LARGE_TIMEOUT = datetime.timedelta(seconds=21600)
 class _DeviceGroup:
     def __init__(self):
         self._is_pg_initer = False
-        self._local_group_init = os.environ.get('NNSCALER_LOCAL_GROUP_INIT', '0') == '1'
+        self._local_group_init = False
         if CompileFlag.dev_mode or not is_running_distributed():
             self.rank = 0
             self.world_size = 1
@@ -30,18 +30,11 @@ class _DeviceGroup:
             self.node_rank = 0
         else:
             if not torch.distributed.is_initialized():
-                # Keep normal initialization device-bound. Member-only groups
-                # require an unbound parent: NCCL communicator splitting from
-                # a bound parent would also require nonmembers to participate.
-                if torch.__version__ >= (2, 3) and not self._local_group_init:
-                    torch.distributed.init_process_group(
-                        backend='nccl', timeout=_LARGE_TIMEOUT,
-                        device_id=torch.device('cuda', int(os.environ.get('LOCAL_RANK'))),
-                    )
-                else:
-                    torch.distributed.init_process_group(
-                        backend='nccl', timeout=_LARGE_TIMEOUT,
-                    )
+                # An unbound parent allows subgroups to be created by members
+                # alone; communicator splitting would require nonmembers too.
+                torch.distributed.init_process_group(
+                    backend='nccl', timeout=_LARGE_TIMEOUT,
+                )
                 self._is_pg_initer = True
 
             # disable it for now due to connection refused error when nnodes > 1
@@ -61,9 +54,9 @@ class _DeviceGroup:
             self.node_rank = int(os.environ.get('GROUP_RANK'))
 
         torch.cuda.set_device(self.local_rank)
-        if self._local_group_init and not CompileFlag.dev_mode and is_running_distributed():
-            from nnscaler.runtime.group_init import check_local_group_support
-            check_local_group_support()
+        if not CompileFlag.dev_mode and is_running_distributed():
+            from nnscaler.runtime.group_init import supports_local_groups
+            self._local_group_init = supports_local_groups()
         self.groups: Dict = { '1'*self.world_size: None }
         self.p2p_groups: Dict[tuple[int, int], Optional[torch.distributed.ProcessGroup]] = {}
         self.use_p2p_groups = (
@@ -92,6 +85,8 @@ class _DeviceGroup:
         Create and return rank groups on-demand
 
         None will be returned if length of ranks are equal to world size
+        All ranks must declare groups in the same order, including nonmembers.
+        The backend decides whether nonmembers need to perform the creation.
         """
         if len(ranks) == self.world_size:
             return None
@@ -110,8 +105,8 @@ class _DeviceGroup:
         """
         Create deterministic two-rank groups for P2P communication.
 
-        torch.distributed.new_group must be called by all ranks in the same order.
-        The generated module passes a global sorted list of actual P2P pairs.
+        All ranks must call this with the same global list of actual P2P pairs.
+        Backend selection and member-only creation stay inside DeviceGroup.
         """
         if not self.use_p2p_groups:
             return

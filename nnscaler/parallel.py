@@ -18,6 +18,7 @@ import os
 import shutil
 import subprocess
 import tempfile
+import threading
 import time
 from collections import OrderedDict, defaultdict
 
@@ -2658,20 +2659,52 @@ def merge_state_dicts(
     return ret_state_dict, ret_opt_state_dict
 
 
+_merged_load_lock = threading.RLock()
+
+
+def _checkpoint_load_num_threads():
+    """Bound the restore pool by CPU affinity and visible cgroup-v2 quotas."""
+    cpus = (len(os.sched_getaffinity(0)) if hasattr(os, 'sched_getaffinity')
+            else os.cpu_count() or 1)
+    root = Path('/sys/fs/cgroup')
+    directories = {root}
+    try:
+        for entry in Path('/proc/self/cgroup').read_text().splitlines():
+            if entry.startswith('0::'):
+                group = root / entry[3:].lstrip('/')
+                directories.update(p for p in (group, *group.parents)
+                                   if p.is_relative_to(root))
+    except OSError:
+        pass
+    # The mount root covers cgroup namespaces; ancestors can impose a tighter
+    # quota than the process's own group. Missing quotas leave affinity intact.
+    for directory in directories:
+        try:
+            quota, period = (directory / 'cpu.max').read_text().split()
+        except OSError:
+            continue
+        if quota != 'max':
+            cpus = min(cpus, max(1, int(quota) // int(period)))
+    local_ranks = max(1, int(os.environ.get('LOCAL_WORLD_SIZE', '1')))
+    return max(1, min(8, cpus // local_ranks))
+
+
 @contextmanager
 def _merged_load_cpu_threads():
-    requested = int(os.environ.get('NNSCALER_MERGED_LOAD_THREADS', '0'))
-    if requested < 0:
-        raise ValueError('NNSCALER_MERGED_LOAD_THREADS must be nonnegative')
-    previous = torch.get_num_threads()
-    changed = requested > 0 and requested != previous
-    if changed:
-        torch.set_num_threads(requested)
-    try:
-        yield
-    finally:
+    # torchrun usually sets one CPU thread. Restoration benefits from a small
+    # pool, shared across this node's ranks; training keeps its original pool.
+    # Serialize restores within a process because set_num_threads is global.
+    with _merged_load_lock:
+        requested = _checkpoint_load_num_threads()
+        previous = torch.get_num_threads()
+        changed = requested != previous
         if changed:
-            torch.set_num_threads(previous)
+            torch.set_num_threads(requested)
+        try:
+            yield
+        finally:
+            if changed:
+                torch.set_num_threads(previous)
 
 
 @torch.no_grad()
@@ -2705,7 +2738,6 @@ def load_merged_state_dict(
     # non ParallelModule parameters will be loaded here
     # there will be mismatched keys if the module is a ParallelModule or contains ParallelModule
     # so we need to ignore the mismatched keys
-    load_once = os.environ.get('NNSCALER_MERGED_LOAD_ONCE', '0') == '1'
     parallel_modules = [
         (name + '.' if name else '', child)
         for name, child in module.named_modules() if isinstance(child, ParallelModule)
@@ -2713,7 +2745,7 @@ def load_merged_state_dict(
     # Keep the explicit pass for custom/legacy handlers that do not load merged
     # parameters recursively. Completed loads are recorded only for this call;
     # the explicit pass still checks missing keys without copying values twice.
-    with merged_load_session(load_once):
+    with merged_load_session(module):
         module.load_state_dict(module_state_dict, strict=False)
         for prefix, child_module in parallel_modules:
             load_merged_module(child_module, module_state_dict, prefix=prefix)

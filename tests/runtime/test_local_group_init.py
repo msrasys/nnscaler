@@ -1,8 +1,42 @@
 from types import SimpleNamespace
 from unittest.mock import Mock
 
+import pytest
 import torch.distributed as dist
 from nnscaler.runtime import group_init
+
+
+@pytest.mark.parametrize('bound,backend,supported', [
+    (None, 'nccl', True), (object(), 'nccl', False), (None, 'gloo', False),
+])
+def test_external_world_compatibility(monkeypatch, bound, backend, supported):
+    default = Mock(bound_device_id=bound)
+    monkeypatch.setattr(group_init.c10d, '_get_default_group', lambda: default)
+    monkeypatch.setattr(dist, 'get_backend', lambda _: backend)
+    assert group_init.supports_local_groups() is supported
+
+
+def test_missing_internal_api_uses_public_implementation(monkeypatch):
+    monkeypatch.setattr(group_init.c10d, '_new_process_group_helper', None)
+    assert not group_init.supports_local_groups()
+
+
+def test_extra_required_argument_uses_public_implementation(monkeypatch):
+    def incompatible(group_size, group_rank, global_ranks_in_group, backend,
+                     store, group_name, timeout, *, new_required_argument):
+        pytest.fail('unsupported internal function must not be called')
+    monkeypatch.setattr(group_init.c10d, '_new_process_group_helper', incompatible)
+    assert not group_init.supports_local_groups()
+
+
+def test_keyword_only_helper_is_supported(monkeypatch):
+    def helper(*, group_name, store, backend, global_ranks_in_group,
+               group_rank, group_size, timeout):
+        pass
+    monkeypatch.setattr(group_init.c10d, '_new_process_group_helper', helper)
+    monkeypatch.setattr(group_init.c10d, '_get_default_group', lambda: Mock(bound_device_id=None))
+    monkeypatch.setattr(dist, 'get_backend', lambda _: 'nccl')
+    assert group_init.supports_local_groups()
 
 
 def install_world(monkeypatch, rank, count, world_size=6):
@@ -14,8 +48,10 @@ def install_world(monkeypatch, rank, count, world_size=6):
     monkeypatch.setattr(group_init.c10d, '_get_default_group', lambda: default)
     monkeypatch.setattr(dist, 'get_rank', lambda: rank)
     monkeypatch.setattr(dist, 'get_world_size', lambda: world_size)
-    def create(*args, **kwargs):
-        calls.append((args, kwargs))
+    def create(*, group_name, store, backend, global_ranks_in_group,
+               group_rank, group_size, timeout):
+        calls.append({'group_name': group_name, 'ranks': global_ranks_in_group,
+                      'group_rank': group_rank, 'group_size': group_size})
         return Mock(), Mock()
     monkeypatch.setattr(group_init.c10d, '_new_process_group_helper', create)
     return calls, world
@@ -28,7 +64,7 @@ def test_names_independent_of_unrelated_history_and_namespace(monkeypatch):
         for namespace in ['collective', 'p2p', 'collective']:
             pg = group_init.new_local_group([2, 0], namespace=namespace, timeout=1)
             assert world.pg_group_ranks[pg] == {0: 0, 2: 1}
-        names.append([call[0][5] for call in calls])
+        names.append([call['group_name'] for call in calls])
     assert names[0] == names[1]
     assert len(set(names[0])) == 3
 
@@ -48,7 +84,7 @@ def test_requested_init_barrier_is_group_local(monkeypatch):
     group_init.new_local_group([0, 2], namespace='p2p', timeout=7)
     assert len(barriers) == 1
     assert barriers[0][0] == 2 and barriers[0][3:] == (2, 7)
-    assert barriers[0][2] == calls[0][0][5]
+    assert barriers[0][2] == calls[0]['group_name']
 
 
 def test_pp3_ep16_dp33_only_creates_local_memberships(monkeypatch):

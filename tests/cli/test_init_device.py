@@ -44,8 +44,6 @@ def make_adapter(monkeypatch, tmp_path, *, fail=False):
 @pytest.mark.parametrize('init_device', [None, 'cpu', 'meta'])
 def test_explicit_device_scopes_only_generated_construction(monkeypatch, tmp_path, init_params, init_device):
     adapter, calls, _ = make_adapter(monkeypatch, tmp_path)
-    # The old experiment variable must not override a library caller's device.
-    monkeypatch.setenv('NNSCALER_RESUME_INIT_ON_CUDA', '1')
     result = adapter.parallelize({}, init_params=init_params, init_device=init_device)
     expected = init_device or 'cpu'
     assert result.weight.device.type == expected
@@ -108,12 +106,7 @@ def test_whole_and_mixed_paths_forward_explicit_device(monkeypatch, mixed):
 
 @pytest.mark.parametrize('resuming', [False, True])
 @pytest.mark.parametrize('compile_only', [False, True])
-@pytest.mark.parametrize('override', [None, '0', '1'])
-def test_trainer_defaults_resume_to_cuda_with_opt_out(monkeypatch, resuming, compile_only, override):
-    if override is None:
-        monkeypatch.delenv('NNSCALER_RESUME_INIT_ON_CUDA', raising=False)
-    else:
-        monkeypatch.setenv('NNSCALER_RESUME_INIT_ON_CUDA', override)
+def test_trainer_allocates_resume_parameters_on_cuda(monkeypatch, resuming, compile_only):
     monkeypatch.setattr(trainer_module, 'is_running_distributed', lambda: False)
     monkeypatch.setattr(torch.cuda, 'current_device', lambda: 2)
     trainer = object.__new__(Trainer)
@@ -136,5 +129,5 @@ def test_trainer_defaults_resume_to_cuda_with_opt_out(monkeypatch, resuming, com
     with pytest.raises(ReachedConstruction):
         trainer._setup()
     assert calls[0]['init_params'] == (not resuming)
-    expected = torch.device('cuda', 2) if resuming and not compile_only and override != '0' else None
+    expected = torch.device('cuda', 2) if resuming and not compile_only else None
     assert calls[0]['init_device'] == expected

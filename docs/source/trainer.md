@@ -675,6 +675,39 @@ An end2end module is a module which satisfies:
 
 ### Checkpoint Config
 
+Checkpoint paths use Checkpointer's `{epoch:04d}-{step:04d}/{rank}{suffix}`
+format. Applications that do not maintain a `last` directory can call
+`Checkpointer.find_latest_checkpoint(save_dir)` and pass its result as the
+resume path. All ranks must call it in the same order: rank 0 scans and shares
+the newest numeric `(epoch, step)` directory, or `None` if none exists. Outside
+distributed execution it scans locally. Each call discovers current directories;
+it does not cache the selection or skip validation of an incomplete checkpoint.
+Existing `last` and `best` resume behavior is unchanged.
+
+Resume startup reuses the normal checkpoint formats and topology validation:
+
+- Generated modules allocate empty parameters directly on the current CUDA
+  device, then load checkpoint values. Their initial `fullmodel.pt.*` files can
+  be omitted for resume; generated code, mappings and non-persistent buffers
+  must still be present. Fresh training still requires initial weights.
+- Merged recovery avoids repeating standard module loads within one restore.
+  Custom loading callbacks retain the original passes because they can change
+  destination weights. Loading a later checkpoint always loads again.
+- Merged optimizer reconstruction writes owned ZeRO slices directly and uses a
+  temporary CPU pool of at most eight threads, bounded by CPU affinity, visible
+  cgroup quotas and local rank count. The prior thread count is restored on exit.
+- Deduplicated recovery groups parameter synchronization by membership and
+  uploads optimizer states in bounded chunks. Two pinned CPU buffers use at
+  most 128 MiB; source tensors and final destination storage are additional.
+
+NNScaler-created NCCL worlds use an unbound default group so compatible
+subgroups can be created by members only. All ranks must still declare groups
+in the same order. Existing externally device-bound worlds, non-NCCL backends
+or unsupported private APIs use public subgroup creation. The compatibility
+bridge is in `runtime/group_init.py`; applications do not manage group names.
+PyTorch upgrades require communication regression tests, including overlapping
+groups, P2P and teardown. This optimization is not specific to resume.
+
  ``` python
  @dataclass
  class CheckpointConfig:

@@ -44,15 +44,37 @@ _logger = logging.getLogger(__name__)
 _merged_load_visits = ContextVar('nnscaler_merged_load_visits', default=None)
 
 
+def _can_reuse_merged_load(module):
+    # Custom loaders and hooks may change destination weights without changing
+    # checkpoint tensors (including through .data, which bypasses versions).
+    # Keep the original two-pass behavior unless all handlers are known.
+    for child in module.modules():
+        if getattr(child.load_state_dict, '__func__', None) is not torch.nn.Module.load_state_dict:
+            return False
+        if getattr(child._load_from_state_dict, '__func__', None) not in (
+                torch.nn.Module._load_from_state_dict, ParallelModule._load_from_state_dict):
+            return False
+        if child._load_state_dict_post_hooks:
+            return False
+        for wrapped_hook in child._load_state_dict_pre_hooks.values():
+            hook = getattr(wrapped_hook, 'hook', wrapped_hook)
+            if getattr(hook, '__func__', None) is not ParallelModule._pre_load_state_dict_hook:
+                return False
+    return True
+
+
 @contextmanager
-def merged_load_session(enabled=True):
+def merged_load_session(module=None):
     """Deduplicate successful module loads within one restore invocation.
 
     Nested restores get independent records. Never retain a loaded flag on the
     module: a subsequent restore must write checkpoint values again.
+    A supplied module with custom loading callbacks keeps the original passes,
+    since callbacks can mutate destination weights independently of the source.
     """
     parent = _merged_load_visits.get()
-    token = _merged_load_visits.set({} if enabled else None)
+    visits = {} if module is None or _can_reuse_merged_load(module) else None
+    token = _merged_load_visits.set(visits)
     try:
         yield
     finally:
