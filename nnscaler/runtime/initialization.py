@@ -368,7 +368,6 @@ class DeferredInitialization(TorchDispatchMode):
     # Remaining unsupported operations:
     # - masked_scatter_, addmm_, addmv_, baddbmm_: eager can accept source/target
     #   overlap, but replay separates their storage and can change the result.
-    # - resize_, resize_as_, set_: can change storage size/identity, not just layout.
     # - _conj, _neg_view: layouts do not retain conjugate/negative view bits.
     # - _foreach_*_ and rrelu_with_noise_ (training rrelu_): replay tracks only one
     #   write target, not a tensor list or the separately mutated noise tensor.
@@ -382,7 +381,7 @@ class DeferredInitialization(TorchDispatchMode):
         "slice", "select", "unsqueeze", "unsqueeze_", "squeeze", "squeeze_",
         "expand", "unbind", "split", "split_with_sizes", "diagonal", "unfold", "as_strided", "as_strided_",
         "view_as_real", "view_as_complex", "_reshape_alias", "unsafe_split",
-        "unsafe_split_with_sizes", "slice_inverse",
+        "unsafe_split_with_sizes", "slice_inverse", "resize_", "resize_as_", "set_",
     }
     # Indexed writes also need the previous value, even for a full target view:
     # indices may leave some elements untouched.
@@ -532,18 +531,58 @@ class DeferredInitialization(TorchDispatchMode):
         return self._op(func, name, args, kwargs)
 
     def _view(self, func, args, kwargs):
-        # Views share the producer's recipe with a different layout,
-        # so no new initialization node is needed.
+        # Views normally share a producer's recipe; storage growth needs a new version.
         storage = self._storage(args[0])
         if storage is None and args[0].is_meta:
             raise _unsupported(f"view of an untracked meta tensor in {func}")
         if storage is None and func._schema.is_mutable:
             raise _unsupported(f"mutation of external data in {func}")
+        if func._schema.name == "aten::set_" and len(args) > 1:
+            # make sure set_ only operates on captured storage
+            source = args[1]
+            # source can be a tensor or a storage
+            source_storage = source.untyped_storage() if isinstance(source, torch.Tensor) else source
+            if source_storage not in self._storages:
+                raise _unsupported("set_ source must have captured storage")
+        # Captured tensors only change meta state here; replay restores their resulting layouts.
         result = func(*args, **kwargs)
         views = result if isinstance(result, (tuple, list)) else (result,)
         for view in views:
             if view.untyped_storage() is not args[0].untyped_storage():
                 raise _unsupported(f"view {func} unexpectedly allocated new storage")
+        if func._schema.is_mutable:
+            # set_(source) may now refer to a different, already captured storage.
+            # even the storage size is changed (data_ptr is changed)
+            # storage as a key in self._storages is still the same,
+            # even if its size changes.
+            storage = self._storage(result)
+            if storage is None:
+                # untracked storage is only allowed for empty set_() calls (empty storage)
+                if func._schema.name != "aten::set_" or len(args) != 1 or result.numel():
+                    raise _unsupported(f"view {func} produced untracked storage")
+                # set_() starts an independent empty recipe; aliases keep the old storage.
+                node = _Node(result, torch.ops.aten.empty.memory_format, ([0],), {"dtype": result.dtype})
+                self._register(result, node)
+            else:
+                # The fixed template describes recorded capacity, not the resized view's size.
+                # Shrinking within that capacity keeps the old recipe and its hidden tail.
+                old_size = storage.tensor.numel() * storage.tensor.element_size()
+                new_size = result.untyped_storage().nbytes()
+
+                if new_size > old_size:
+                    # Copy physical bytes, preserving aliases across dtypes and layouts.
+                    # The new tail remains uninitialized. Layout: (shape, stride, offset, dtype).
+                    prefix = ((old_size,), (1,), 0, torch.uint8)
+                    template = torch.empty(new_size, dtype=torch.uint8, device="meta")
+                    previous = _Read(storage.node, prefix)
+                    # Pass the old prefix as a copy_ operand, leaving node.previous unset:
+                    # its full-tensor copy would fail when allocation shapes differ.
+                    # Live aliases advance to this version; old _Read snapshots stay unchanged.
+                    storage.node = _Node(template, torch.ops.aten.copy_.default, (previous,), {}, target=prefix)
+                    storage.tensor = template
+                # Otherwise, the new size fits within the old capacity;
+                # it reuse the existing storage without allocating new memory.
+                # no action needed.
         return result
 
     def _op(self, func, name, args, kwargs):

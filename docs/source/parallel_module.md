@@ -114,6 +114,7 @@ require explicit support:
 | Factories and sampling | `empty`, `zeros`, `ones`, `full`, `arange`, `linspace`, `rand`, `randn`, `randint`, `randperm`, like/new factories, `normal`, `bernoulli`, `poisson`, `multinomial` |
 | Views | `detach`, `alias`, `view` (shape or dtype), `_unsafe_view`, `_reshape_alias`, `transpose`, `transpose_`, `t`, `t_`, `permute`, `slice`, `slice_inverse`, `select`, `unsqueeze`, `unsqueeze_`, `squeeze`, `squeeze_`, `expand`, `unbind` (including tensor iteration), `split`, `split_with_sizes`, `unsafe_split`, `unsafe_split_with_sizes`, `diagonal`, `unfold`, `as_strided`, `as_strided_`, `view_as_real`, `view_as_complex` |
 | Copies | `clone`, copying `to`, `copy_` |
+| Storage changes | `resize_`, `resize_as_`, `set_()` and `set_` with a captured tensor or storage, including offset/size/stride overloads |
 | In-place initialization | `fill_`, `zero_`, `uniform_`, `normal_`, `random_`, `bernoulli_`, `exponential_`, `geometric_`, `log_normal_`, `cauchy_`, scalar/tensor-bound `clamp_`, `clamp_min_`, `clamp_max_` |
 | In-place arithmetic | `add_`, `sub_`, `mul_`, `div_`, `pow_`, `addcmul_`, `addcdiv_`, `lerp_`, `masked_fill_`, `abs_`, `neg_`, `reciprocal_`, `sqrt_`, `rsqrt_`, `floor_divide_`, `fmod_`, `remainder_`, `copysign_`, `heaviside_`, `hypot_`, `nextafter_`, `gcd_`, `lcm_` |
 | Indexed writes | `scatter_`, `scatter_add_`, `scatter_reduce_`, `index_add_`, `index_copy_`, `index_fill_`, `index_put_`, `index_reduce_`, `put_`, `_index_put_impl_` |
@@ -138,6 +139,14 @@ not external tensors. They preserve historical layouts and existing aliases:
 the storage allocation template is detached, sharing storage but keeping independent
 shape/stride metadata without copying tensor data. Historical values are preserved
 by recipe dependencies, not by detaching the template.
+`resize_` and `resize_as_` preserve existing storage contents, including data outside
+a temporarily shrunken view. Growth creates a new storage version by copying the
+old byte prefix; newly allocated bytes remain uninitialized. Existing aliases see
+subsequent writes while earlier snapshots keep their original values.
+`set_` rebinds the destination to a captured source storage without copying it;
+old aliases stay on the previous storage. `set_()` resets the destination to an
+independent empty storage. Uncaptured `set_` sources and external destinations
+are rejected.
 Constructors must be valid under eager PyTorch; capture/replay does not reproduce
 every native input-validation error. Indexed writes preserve the previous value
 of elements not selected by the indices. Native nondeterminism (for example,
@@ -177,8 +186,6 @@ Important limits:
 - `masked_scatter_`, `addmm_`, `addmv_` and `baddbmm_` remain unsupported:
   eager can accept overlapping operands whose results change when replay separates their storage.
   Tensor-list/multiple-destination writes also require additional tracking.
-  Other metadata/storage mutations remain unsupported; `resize_` and `set_`
-  can change storage size/identity rather than only shape and strides.
   Sparse, nested, MKLDNN and named tensors are unsupported.
   `ldexp_` currently decomposes to an unsupported `out=` overload.
 - Non-mutating data-dependent operations such as `.item()`, `.tolist()` and `nonzero`, and pure operations

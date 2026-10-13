@@ -400,6 +400,83 @@ def test_inplace_views_preserve_history_and_aliases(shape, operation, device):
     assert external._version == version
 
 
+# Each case gives the mutation and the first newly allocated element to initialize, if any.
+@pytest.mark.parametrize("operation, initialize_from", [
+    pytest.param(lambda x, y: x.resize_(3, 2), None, id="resize-shape"),
+    pytest.param(lambda x, y: x.resize_(3, 4), 6, id="resize-grow"),
+    pytest.param(lambda x, y: x.resize_(3), None, id="resize-shrink"),
+    pytest.param(lambda x, y: x.resize_(0).resize_(3, 4), 6, id="resize-regrow"),
+    pytest.param(lambda x, y: x.resize_as_(y), 6, id="resize-as-grow"),
+    pytest.param(lambda x, y: x.resize_as_(y[:, :2]), None, id="resize-as-shape"),
+    pytest.param(lambda x, y: x[1:].resize_(3, 3), 3, id="resize-offset"),
+    pytest.param(lambda x, y: x.t_().resize_(3, 4), 6, id="resize-transposed"),
+    pytest.param(lambda x, y: x.set_(source=y), None, id="set-tensor"),
+    pytest.param(lambda x, y: x.set_(y.t()), None, id="set-view"),
+    pytest.param(lambda x, y: x.set_(y, 1, (2, 3), (4, 1)), None, id="set-tensor-offset"),
+    pytest.param(lambda x, y: x.set_(y.untyped_storage()), None, id="set-storage"),
+    pytest.param(lambda x, y: x.set_(y.untyped_storage(), 1, (2, 3), (4, 1)), None, id="set-storage-offset"),
+    pytest.param(lambda x, y: x.set_(y.untyped_storage(), 4, (4, 4), (4, 1)), 8, id="set-grow"),
+    pytest.param(lambda x, y: x.set_(), None, id="set-empty"),
+    pytest.param(lambda x, y: x.set_().resize_as_(y), 0, id="set-empty-grow"),
+    pytest.param(lambda x, y: x.set_(x), None, id="set-self"),
+    pytest.param(
+        lambda x, y: torch.empty(0, dtype=torch.int64, device=x.device).set_(
+            y.untyped_storage(), 0, (8,), (1,),
+        ),
+        6, id="set-reinterpret-grow",
+    ),
+])
+@pytest.mark.parametrize("device", [
+    "cpu",
+    pytest.param("cuda", marks=pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")),
+])
+def test_storage_mutations_preserve_history_and_aliases(operation, initialize_from, device):
+    class Model(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.register_buffer("weight", torch.arange(6., device=device).reshape(2, 3).clone())
+            self.register_buffer("source", (torch.arange(12., device=device) + 30).reshape(3, 4).clone())
+            self.weight.add_(1)
+            self.old_alias = self.weight.detach()
+            self.before = self.weight.clone()
+            self.source_before = self.source.clone()
+            self.weight = operation(self.weight, self.source)
+            if initialize_from is not None:
+                self.weight.view(-1)[initialize_from:].fill_(7)
+            if self.weight.numel():
+                self.weight[0].fill_(11)
+            self.after = self.weight.clone()
+            self.old_alias[0].fill_(13)
+            self.source[0].fill_(17)
+
+    expected = Model()
+    with DeferredInitialization(device) as capture:
+        model = Model()
+    for name in ("weight", "source", "old_alias", "before", "source_before", "after"):
+        reference = getattr(expected, name)
+        for _ in range(2):
+            actual = capture.materialize(getattr(model, name))
+            torch.testing.assert_close(actual, reference, rtol=0, atol=0)
+            assert actual.stride() == reference.stride()
+            assert actual.storage_offset() == reference.storage_offset()
+
+
+def test_set_rejects_uncaptured_storage():
+    external = torch.arange(6.)
+    untracked_meta = torch.empty(6, device="meta")
+    version = external._version
+    with DeferredInitialization() as capture:
+        target = torch.ones(3)
+        for source in (external, external.untyped_storage(), untracked_meta):
+            with pytest.raises(RuntimeError, match="set_ source must have captured storage"):
+                target.set_(source)
+        with pytest.raises(RuntimeError, match="mutation of external data"):
+            external.set_(target)
+    assert external._version == version
+    assert torch.equal(external, torch.arange(6.))
+    assert torch.equal(capture.materialize(target), torch.ones(3))
+
+
 @pytest.mark.parametrize("shape,dim", [
     ((3, 4), 0),
     ((3, 4), 1),
@@ -1021,7 +1098,7 @@ def test_out_overloads_are_rejected(operation, dtype):
 
 @pytest.mark.parametrize("factory, message", [
     (lambda: torch.ones(2, 2).addmm_(torch.eye(2), torch.eye(2)), "unsupported mutation"),
-    (lambda: torch.ones(3).resize_(5), "unsupported mutation"),
+    (lambda: torch._foreach_add_([torch.ones(3)], 1), "unsupported mutation"),
     (lambda: torch.ones(1, 4).expand(3, 4).fill_(1), "overlapping mutation"),
     (lambda: torch.empty_strided((3, 4), (0, 1)), "overlapping"),
 ])
