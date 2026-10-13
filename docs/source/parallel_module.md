@@ -112,14 +112,25 @@ require explicit support:
 | Category | Supported operations |
 | --- | --- |
 | Factories and sampling | `empty`, `zeros`, `ones`, `full`, `arange`, `linspace`, `rand`, `randn`, `randint`, `randperm`, like/new factories, `normal`, `bernoulli`, `poisson`, `multinomial` |
-| Views | `detach`, `alias`, `view` (shape or dtype), `_unsafe_view`, `transpose`, `t`, `permute`, `slice`, `select`, `unsqueeze`, `squeeze`, `expand`, `unbind` (including tensor iteration), `split`, `split_with_sizes`, `diagonal`, `unfold`, `as_strided`, `view_as_real`, `view_as_complex` |
+| Views | `detach`, `alias`, `view` (shape or dtype), `_unsafe_view`, `_reshape_alias`, `transpose`, `t`, `permute`, `slice`, `slice_inverse`, `select`, `unsqueeze`, `squeeze`, `expand`, `unbind` (including tensor iteration), `split`, `split_with_sizes`, `unsafe_split`, `unsafe_split_with_sizes`, `diagonal`, `unfold`, `as_strided`, `view_as_real`, `view_as_complex` |
 | Copies | `clone`, copying `to`, `copy_` |
-| In-place initialization | `fill_`, `zero_`, `uniform_`, `normal_`, `random_`, `bernoulli_`, `exponential_`, `geometric_`, `log_normal_`, `cauchy_`, `erfinv_`, scalar/tensor-bound `clamp_` |
-| In-place arithmetic | `add_`, `sub_`, `mul_`, `div_` with scalar or tensor operands on non-overlapping tensors or views |
+| In-place initialization | `fill_`, `zero_`, `uniform_`, `normal_`, `random_`, `bernoulli_`, `exponential_`, `geometric_`, `log_normal_`, `cauchy_`, scalar/tensor-bound `clamp_`, `clamp_min_`, `clamp_max_` |
+| In-place arithmetic | `add_`, `sub_`, `mul_`, `div_`, `pow_`, `addcmul_`, `addcdiv_`, `lerp_`, `masked_fill_`, `abs_`, `neg_`, `reciprocal_`, `sqrt_`, `rsqrt_`, `floor_divide_`, `fmod_`, `remainder_`, `copysign_`, `heaviside_`, `hypot_`, `nextafter_`, `gcd_`, `lcm_` |
+| In-place transcendental functions | `sin_`, `cos_`, `tan_`, `asin_`, `acos_`, `atan_`, `atan2_`, `sinh_`, `cosh_`, `tanh_`, `asinh_`, `acosh_`, `atanh_`, `sinc_`, `deg2rad_`, `rad2deg_`, `exp_`, `exp2_`, `expm1_`, `log_`, `log2_`, `log10_`, `log1p_`, `logit_`, `xlogy_` |
+| In-place special functions | `erf_`, `erfc_`, `erfinv_`, `digamma_`, `polygamma_`, `lgamma_`, `mvlgamma_`, `igamma_`, `igammac_`, `i0_` |
+| In-place activations and value transforms | `relu_`, `leaky_relu_`, `elu_`, `celu_`, `gelu_`, `sigmoid_`, `silu_`, `mish_`, `hardsigmoid_`, `hardswish_`, `hardtanh_`, `threshold_`, `floor_`, `ceil_`, `round_`, `trunc_`, `frac_`, `sign_`, `sgn_`, `nan_to_num_`, `conj_physical_` |
+| In-place comparisons and logic | `eq_`, `ne_`, `lt_`, `le_`, `gt_`, `ge_`, `logical_not_`, `logical_and_`, `logical_or_`, `logical_xor_`, `bitwise_not_`, `bitwise_and_`, `bitwise_or_`, `bitwise_xor_`, `bitwise_left_shift_`, `bitwise_right_shift_`, `__ilshift__`, `__irshift__` |
+| Other in-place value operations | `cumsum_`, `cumprod_`, `tril_`, `triu_`, `renorm_`, `embedding_renorm_`, `addbmm_`, `addr_`, `_add_relu_` (CPU), `_fill_mem_eff_dropout_mask_` (CUDA, explicit seed/offset) |
 | Whole Python functions | `torch.nn.init.eye_`, `orthogonal_`, `sparse_`; `trunc_normal_` on PyTorch 2.12+ |
 
 Except for the last row, the table uses ATen operator names; composite APIs work
 only if their underlying operations are supported.
+For example, `square_`, `float_power_`, `fill_diagonal_`, `clip_`, `selu_`,
+`relu6_`, arithmetic/comparison spelling aliases, and the in-place dropout families
+already decompose to supported operations. `rrelu_` in training mode does not:
+its underlying `rrelu_with_noise_` also writes a separate noise tensor.
+All writes retain the non-overlapping-layout restrictions below and the installed
+PyTorch implementation's device, dtype and shape requirements.
 
 PyTorch 2.12+ skips `trunc_normal_` on meta tensors. nnScaler captures its Python
 helper as one seeded, in-place operation and replays the installed PyTorch
@@ -144,18 +155,26 @@ This is explicit internal registration, not interception of arbitrary Python fun
 
 Important limits:
 
-- `out=` overloads and unlisted alias operations such as `_conj`
+- `out=` overloads and unlisted alias operations such as `_conj` and `_neg_view`
   are unsupported. Writes allow transposes and strided slices when stride analysis
   proves that destination elements do not overlap; unproven layouts are rejected.
-- Tensor operands of in-place arithmetic and `clamp_` may share the destination's
+- Tensor operands of arithmetic, comparison, logical and clipping writes may share the destination's
   storage only with identical dtype, shape, strides and offset, or disjoint bounding
   byte spans. Other overlaps are conservatively rejected, including stride gaps:
   replay reads historical values from separate storage, which would otherwise
   change overlapping read/write behavior even when eager PyTorch does not reject it.
-- Data-dependent operations such as `.item()`, `.tolist()` and `nonzero`, and operations
+- Indexed writes (`scatter_`, `index_put_`, etc.), `masked_scatter_`, `addmm_`,
+  `addmv_` and `baddbmm_` need stronger operand-alias handling and remain unsupported.
+  Tensor-list/multiple-destination writes also require additional tracking.
+  Metadata/storage mutations such as `transpose_`, `resize_` and `set_` cannot
+  reuse the value-write path. Sparse, nested, MKLDNN and named tensors are unsupported.
+  `ldexp_` currently decomposes to an unsupported `out=` overload.
+- Non-mutating data-dependent operations such as `.item()`, `.tolist()` and `nonzero`, and pure operations
   without a meta implementation, use a logged concrete fallback on the configured device during capture.
   This can allocate full tensors. Recipes are replayed later; constructor
   branches are decided during capture, not reevaluated as dynamic branches.
+  This fallback does not cover mutations without usable meta implementations
+  (for example, the low-level Sobol state mutators).
 - Replay requires implementations on the selected device. Custom operators must accurately declare
   mutation, aliasing and randomness; external side effects are not replay-safe.
   For seeded custom operators, replay seeds Python, NumPy, PyTorch CPU and the

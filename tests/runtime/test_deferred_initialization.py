@@ -969,7 +969,7 @@ def test_out_overloads_are_rejected(operation, dtype):
 
 
 @pytest.mark.parametrize("factory, message", [
-    (lambda: torch.ones(3).sin_(), "unsupported mutation"),
+    (lambda: torch.ones(3).scatter_(0, torch.tensor([0, 2]), 2.), "unsupported mutation"),
     (lambda: torch.ones(3).resize_(5), "unsupported mutation"),
     (lambda: torch.ones(1, 4).expand(3, 4).fill_(1), "overlapping mutation"),
     (lambda: torch.empty_strided((3, 4), (0, 1)), "overlapping"),
@@ -1016,9 +1016,9 @@ def test_partial_writes_initialize_empty_and_preserve_snapshots():
 
 def test_capture_lifecycle_and_usage_errors():
     capture = DeferredInitialization()
-    with pytest.raises(RuntimeError, match="unsupported mutation.*sin_"):
+    with pytest.raises(RuntimeError, match="unsupported mutation.*scatter_"):
         with capture:
-            torch.ones(3).sin_()
+            torch.ones(3).scatter_(0, torch.tensor([0, 2]), 2.)
     assert not torch.ones(1).is_meta
     with pytest.raises(RuntimeError, match="cannot be reused"):
         with capture:

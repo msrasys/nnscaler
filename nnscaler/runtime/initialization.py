@@ -367,10 +367,30 @@ class DeferredInitialization(TorchDispatchMode):
         "detach", "alias", "view", "_unsafe_view", "transpose", "t", "permute",
         "slice", "select", "unsqueeze", "squeeze", "expand", "unbind", "split", "split_with_sizes",
         "diagonal", "unfold", "as_strided",
-        "view_as_real", "view_as_complex",
+        "view_as_real", "view_as_complex", "_reshape_alias", "unsafe_split",
+        "unsafe_split_with_sizes", "slice_inverse",
     }
-    _arithmetic_writes = {"add_", "sub_", "mul_", "div_"}
-    _unary_writes = {"erfinv_", "clamp_"}
+    _arithmetic_writes = {
+        "__ilshift__", "__irshift__", "_add_relu_", "add_", "addbmm_", "addcdiv_",
+        "addcmul_", "addr_", "atan2_", "bitwise_and_", "bitwise_left_shift_",
+        "bitwise_or_", "bitwise_right_shift_", "bitwise_xor_", "copysign_", "div_",
+        "embedding_renorm_", "eq_", "floor_divide_", "fmod_", "gcd_", "ge_", "gt_",
+        "heaviside_", "hypot_", "igamma_", "igammac_", "lcm_", "le_", "lerp_",
+        "logical_and_", "logical_or_", "logical_xor_", "lt_", "masked_fill_",
+        "mul_", "ne_", "nextafter_", "pow_", "remainder_", "sub_", "xlogy_",
+    }
+    _unary_writes = {
+        "abs_", "acos_", "acosh_", "asin_", "asinh_", "atan_", "atanh_",
+        "bitwise_not_", "ceil_", "celu_", "clamp_", "clamp_max_", "clamp_min_",
+        "conj_physical_", "cos_", "cosh_", "cumprod_", "cumsum_", "deg2rad_",
+        "digamma_", "elu_", "erf_", "erfc_", "erfinv_", "exp_", "exp2_", "expm1_",
+        "floor_", "frac_", "gelu_", "hardsigmoid_", "hardswish_", "hardtanh_",
+        "i0_", "leaky_relu_", "lgamma_", "log_", "log10_", "log1p_", "log2_",
+        "logical_not_", "logit_", "mish_", "mvlgamma_", "nan_to_num_", "neg_",
+        "polygamma_", "rad2deg_", "reciprocal_", "relu_", "renorm_", "round_",
+        "rsqrt_", "sgn_", "sigmoid_", "sign_", "silu_", "sin_", "sinc_", "sinh_",
+        "sqrt_", "tan_", "tanh_", "threshold_", "tril_", "triu_", "trunc_",
+    }
     _random_writes = {
         "uniform_", "normal_", "random_", "bernoulli_", "exponential_",
         "geometric_", "log_normal_", "cauchy_",
@@ -378,7 +398,9 @@ class DeferredInitialization(TorchDispatchMode):
     _sampling = {"normal", "bernoulli", "poisson", "multinomial"}
     _random_factories = {"rand", "randn", "randint", "randperm"}
     _random_like = {"rand_like", "randn_like", "randint_like"}
-    _writes = {"fill_", "zero_", "copy_"} | _arithmetic_writes | _random_writes | _unary_writes
+    _writes = {
+        "fill_", "zero_", "copy_", "_fill_mem_eff_dropout_mask_",
+    } | _arithmetic_writes | _random_writes | _unary_writes
     _random = _random_factories | _random_like | _random_writes | _sampling
 
     def __init__(self, device: str | torch.device = "cpu"):
