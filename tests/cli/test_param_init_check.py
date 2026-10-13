@@ -2,6 +2,7 @@
 #  Licensed under the MIT License.
 
 from dataclasses import replace
+from datetime import timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -90,7 +91,7 @@ def _worker_whole_model(save_dir):
                 assert ('first' if mismatch == 'parallel' else 'ordinary_weight') in str(exc.value)
             else:
                 trainer.run()
-            check.assert_called_once_with(trainer.model)
+            check.assert_called_once_with(trainer.model, npb_only=False)
         torch.distributed.barrier()
 
 
@@ -122,7 +123,8 @@ def _worker_post_zero3(save_dir):
     )
     args.model.type = f'{__name__}.ZeroCheckModel'
 
-    def checked_init(model):
+    def checked_init(model, *, npb_only):
+        assert not npb_only
         assert trainer.optimizer is not None
         assert isinstance(model.block, ParallelModule)
         attr, = model.block.fullmap
@@ -146,7 +148,7 @@ def _worker_post_zero3(save_dir):
                 assert 'ranks 0, 2' in str(exc.value)
             else:
                 trainer.run()
-            check.assert_called_once_with(trainer.model)
+            check.assert_called_once_with(trainer.model, npb_only=False)
         torch.distributed.barrier()
 
 
@@ -186,31 +188,32 @@ def _plain_model(value=0.125):
     return model
 
 
-def _payload(model):
+def _payload(model, *, npb_only=False):
     with patch('nnscaler.cli.trainer.dist.is_initialized', return_value=True), patch(
         'nnscaler.cli.trainer.dist.get_world_size', return_value=4,
     ), patch('nnscaler.cli.trainer.dist.all_gather_object') as gather:
         gather.side_effect = lambda outputs, value: outputs.__setitem__(slice(None), [value] * 4)
-        check_param_init(model)
+        check_param_init(model, npb_only=npb_only)
         gather.assert_called_once()
         return gather.call_args.args[1]
 
 
-def _check_payloads(model, payloads, match=None):
+def _check_payloads(model, payloads, match=None, *, npb_only=False):
     with patch('nnscaler.cli.trainer.dist.is_initialized', return_value=True), patch(
         'nnscaler.cli.trainer.dist.get_world_size', return_value=4,
     ), patch('nnscaler.cli.trainer.dist.all_gather_object') as gather:
         gather.side_effect = lambda outputs, value: outputs.__setitem__(slice(None), payloads)
         if match is None:
-            check_param_init(model)
+            check_param_init(model, npb_only=npb_only)
         else:
             with pytest.raises(RuntimeError, match=match):
-                check_param_init(model)
+                check_param_init(model, npb_only=npb_only)
         gather.assert_called_once()
 
 
 @pytest.mark.parametrize('kind', ['weight', 'persistent', 'nonpersistent'])
-def test_check_plain_model_replica(kind):
+@pytest.mark.parametrize('npb_only', [False, True])
+def test_check_plain_model_replica(kind, npb_only):
     """With mocked ranks, accept equal ordinary tensors and reject a changed replica.
 
     Cover parameters, persistent buffers (including tiny float64 changes), and
@@ -220,11 +223,14 @@ def test_check_plain_model_replica(kind):
     changed = _plain_model()
     with torch.no_grad():
         getattr(changed, kind).add_(2 ** -45 if kind == 'persistent' else 1)
-    reference = _payload(model)
-    assert len(reference[0]) == 3
-    _check_payloads(model, [reference] * 4)
-    _check_payloads(model, [reference, reference, _payload(changed), reference],
-                    'initialization differs across ranks')
+    reference = _payload(model, npb_only=npb_only)
+    assert len(reference[0]) == (1 if npb_only else 3)
+    _check_payloads(model, [reference] * 4, npb_only=npb_only)
+    mismatch = 'initialization differs across ranks' if not npb_only or kind == 'nonpersistent' else None
+    _check_payloads(
+        model, [reference, reference, _payload(changed, npb_only=npb_only), reference],
+        mismatch, npb_only=npb_only,
+    )
 
 
 @pytest.mark.parametrize('device', [
@@ -290,6 +296,39 @@ def test_check_distinct_logical_shards(layout):
     changed_replica = _payload(_parallel_stub(0.5))
     _check_payloads(model, [reference, other, changed_replica, other],
                     'initialization differs across ranks')
+
+
+@pytest.mark.parametrize('strategy', [
+    ParamInitStrategy.FILE, ParamInitStrategy.FULL, ParamInitStrategy.SHARD,
+])
+def test_check_parallel_nonpersistent_buffers_only(strategy):
+    """On resume, check SHARD non-persistent buffers and skip FILE/FULL modules."""
+    model = torch.nn.Module()
+    model.shard = _parallel_stub(0.125, strategy=ParamInitStrategy.SHARD)
+    model.other = _parallel_stub(0.125, strategy=strategy)
+    for module in (model.shard, model.other):
+        for name in ('persistent', 'nonpersistent'):
+            module.register_buffer(name, torch.ones(2), persistent=name == 'persistent')
+            module._fullmap[name] = replace(module.fullmap['weight'], is_param=False, orig_name=name)
+    reference = _payload(model, npb_only=True)
+    assert len(reference[0]) == (2 if strategy == ParamInitStrategy.SHARD else 1)
+    with torch.no_grad():
+        model.shard.weight.add_(1)
+        model.shard.persistent.add_(1)
+        model.other.weight.add_(1)
+        model.other.persistent.add_(1)
+    assert _payload(model, npb_only=True) == reference
+    model.other.nonpersistent.add_(1)
+    _check_payloads(
+        model, [reference, reference, _payload(model, npb_only=True), reference],
+        'initialization differs across ranks' if strategy == ParamInitStrategy.SHARD else None,
+        npb_only=True,
+    )
+    model.shard.nonpersistent.add_(1)
+    _check_payloads(
+        model, [reference, reference, _payload(model, npb_only=True), reference],
+        'initialization differs across ranks', npb_only=True,
+    )
 
 
 def _zero3_stub(values, start, end, ranks=(0, 1), *, numel=8):
@@ -373,6 +412,53 @@ def test_check_file_module_excludes_only_parallel_tensors():
         model.weight.add_(1)
     _check_payloads(model, [reference, reference, _payload(model), reference],
                     'initialization differs across ranks')
+
+
+@pytest.mark.parametrize('strategy', [ParamInitStrategy.FILE, ParamInitStrategy.FULL, None])
+def test_check_empty_resume_payload_participates(strategy):
+    """Ranks without eligible tensors still send an empty payload to the collective."""
+    model = torch.nn.Module()
+    if strategy is not None:
+        model.parallel = _parallel_stub(0.125, strategy=strategy)
+    with patch('nnscaler.cli.trainer._initialization_digest') as digest:
+        assert _payload(model, npb_only=True) == ({}, None)
+        digest.assert_not_called()
+
+
+def _worker_check_empty_rank():
+    torch.distributed.init_process_group('gloo', timeout=timedelta(seconds=30))
+    try:
+        rank = torch.distributed.get_rank()
+        for npb_only in (False, True):
+            for mismatch in (False, True):
+                strategy = ParamInitStrategy.FILE if rank == 0 else ParamInitStrategy.SHARD
+                model = _parallel_stub(0.125, strategy=strategy)
+                model.register_buffer('nonpersistent', torch.ones(2), persistent=False)
+                model._fullmap['nonpersistent'] = replace(
+                    model.fullmap['weight'], is_param=False, orig_name='nonpersistent',
+                )
+                if mismatch and rank == 2:
+                    with torch.no_grad():
+                        (model.nonpersistent if npb_only else model.weight).add_(1)
+                with patch(
+                    'nnscaler.cli.trainer.dist.all_gather_object',
+                    wraps=torch.distributed.all_gather_object,
+                ) as gather:
+                    if mismatch:
+                        with pytest.raises(RuntimeError, match='ranks 1, 2'):
+                            check_param_init(model, npb_only=npb_only)
+                    else:
+                        check_param_init(model, npb_only=npb_only)
+                    gather.assert_called_once()
+                    if rank == 0:
+                        assert gather.call_args.args[1] == ({}, None)
+    finally:
+        torch.distributed.destroy_process_group()
+
+
+def test_check_empty_rank_collective():
+    """An empty rank participates and observes both matches and mismatches among peers."""
+    launch_torchrun(4, _worker_check_empty_rank)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason='dummy input requires CUDA')

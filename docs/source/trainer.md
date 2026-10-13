@@ -957,7 +957,11 @@ class DebugConfig:
     replicas, and file-backed `ParallelModule` instances. With ZeRO-3, only
     identical retained intervals are compared, excluding padding; discarded
     values cannot be checked and full parameters are not reconstructed.
-  - **Skipped:** checkpoint resume, compile-only runs, and non-distributed or
+  - **Resume:** compare only non-persistent buffers in `shard` parallel modules
+    and ordinary modules. Skip `file`/`full` parallel modules, parameters, and
+    persistent buffers. Ranks with no eligible tensors still participate in
+    the collective with empty hashes.
+  - **Skipped:** compile-only runs and non-distributed or
     single-rank runs (without computing tensor hashes). This is a CLI trainer
     check, not part of direct `parallelize` or generated-module construction.
 - `profile` (`Optional[ProfileConfig]`): Profiling configuration using

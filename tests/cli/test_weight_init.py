@@ -15,6 +15,7 @@ from torch.distributed.elastic.multiprocessing.errors import ChildFailedError
 import nnscaler
 from nnscaler import ComputeConfig, ParamInitStrategy
 from nnscaler.cli import Trainer, TrainerArgs
+from nnscaler.cli.trainer import _initialization_digest, check_param_init
 from nnscaler.cli.trainer_args import OptionalComputeConfig
 from nnscaler.graph.parser import FxModuleParser
 from nnscaler.runtime.initialization import DeferredInitialization, create_init_module
@@ -258,20 +259,42 @@ def test_cli_param_init_parity(tmp_path):
     launch_torchrun(4, _worker_parity, tmp_path)
 
 
-def _worker_resume(save_dir):
+def _worker_resume(save_dir, checked):
     for strategy, model_class in INIT_CASES:
-        cli_args = _args(Path(save_dir), strategy, model_class=model_class)
+        cli_args = _args(Path(save_dir), strategy, model_class=model_class, checked=checked)
         expected = _reference(strategy, model_class=model_class)
         trainer = Trainer([*cli_args, '--max_train_steps', '1'])
-        trainer.run()
+        with patch('nnscaler.cli.trainer.check_param_init', wraps=check_param_init) as check, patch(
+            'nnscaler.cli.trainer._initialization_digest', wraps=_initialization_digest,
+        ) as digest:
+            trainer.run()
+        if checked:
+            check.assert_called_once_with(trainer.model, npb_only=False)
+        else:
+            check.assert_not_called()
+        assert digest.call_count == (
+            len(trainer.model.fullmap) if checked and strategy != ParamInitStrategy.FILE else 0
+        )
         persistent = {
             attr: getattr(trainer.model, attr).detach().clone()
             for attr in trainer.model.fullmap if attr not in trainer.model.get_non_persistent_buffers()
         }
         HookInitModel.shard_requests = []
         resumed = Trainer([*cli_args, '--checkpoint.resume_from', 'last'])
-        with patch.object(Trainer, '_train'):
+        with patch.object(Trainer, '_train'), patch(
+            'nnscaler.cli.trainer.check_param_init', wraps=check_param_init,
+        ) as check, patch(
+            'nnscaler.cli.trainer._initialization_digest', wraps=_initialization_digest,
+        ) as digest:
             resumed.run()
+        if checked:
+            check.assert_called_once_with(resumed.model, npb_only=True)
+        else:
+            check.assert_not_called()
+        assert digest.call_count == (
+            len(resumed.model.get_non_persistent_buffers())
+            if checked and strategy == ParamInitStrategy.SHARD else 0
+        )
         for attr, value in persistent.items():
             _assert_tensor_identical(getattr(resumed.model, attr), value)
         _assert_initialized(resumed.model, expected, non_persistent_only=True)
@@ -284,16 +307,32 @@ def _worker_resume(save_dir):
             assert np_meta_map
             assert HookInitModel.shard_requests == [np_meta_map]
 
+        if checked and strategy == ParamInitStrategy.SHARD:
+            def check_mismatched_buffer(model, *, npb_only):
+                assert npb_only
+                if torch.distributed.get_rank() == 2:
+                    next(iter(model.get_non_persistent_buffers().values())).add_(1)
+                check_param_init(model, npb_only=npb_only)
+
+            mismatched = Trainer([*cli_args, '--checkpoint.resume_from', 'last'])
+            with patch.object(Trainer, '_train'), patch(
+                'nnscaler.cli.trainer.check_param_init', side_effect=check_mismatched_buffer,
+            ), pytest.raises(RuntimeError, match='initialization differs across ranks'):
+                mismatched.run()
+        torch.distributed.barrier()
+
 
 @pytest.mark.skipif(torch.cuda.device_count() < 4, reason='requires four GPUs')
-def test_cli_param_init_resume(tmp_path):
+@pytest.mark.parametrize('checked', [False, True])
+def test_cli_param_init_resume(tmp_path, checked):
     """Restore checkpoint parameters and initialize non-persistent buffers on resume.
 
     Train one step to create a real checkpoint for each initialization strategy,
     then inspect resumed values without further training. The shard hook should
-    receive only non-persistent attributes.
+    receive only non-persistent attributes. Replica checking on resume runs only
+    for SHARD and rejects a rank-local non-persistent buffer mismatch.
     """
-    launch_torchrun(4, _worker_resume, tmp_path)
+    launch_torchrun(4, _worker_resume, tmp_path, checked)
 
 
 class MismatchedBufferModel(InitModel):

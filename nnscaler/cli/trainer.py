@@ -44,8 +44,8 @@ def _initialization_digest(tensor: torch.Tensor) -> str:
     return digest.hexdigest()
 
 
-def check_param_init(model: torch.nn.Module) -> None:
-    """Check stored initial replicas across the whole model after bucket construction."""
+def check_param_init(model: torch.nn.Module, *, npb_only: bool = False) -> None:
+    """Check initial replicas, or only SHARD non-persistent buffers on resume."""
     if not dist.is_initialized() or dist.get_world_size() == 1:
         return
 
@@ -54,9 +54,14 @@ def check_param_init(model: torch.nn.Module) -> None:
     try:
         for prefix, module in model.named_modules():
             if isinstance(module, ParallelModule):
-                if module.compute_config.param_init_strategy == ParamInitStrategy.FILE:
+                strategy = module.compute_config.param_init_strategy
+                if strategy == ParamInitStrategy.FILE or (
+                    npb_only and strategy != ParamInitStrategy.SHARD
+                ):
                     continue
                 for attr, meta in module.fullmap.items():
+                    if npb_only and attr not in module._non_persistent_buffers_set:
+                        continue
                     tensor = getattr(module, attr)
                     zero_meta = module.get_zero3_attr_meta(attr)
                     zero_range = None
@@ -80,6 +85,8 @@ def check_param_init(model: torch.nn.Module) -> None:
                     list(module.named_parameters(recurse=False))
                     + list(module.named_buffers(recurse=False))
                 ):
+                    if npb_only and name not in module._non_persistent_buffers_set:
+                        continue
                     hashes[('module', prefix, name)] = _initialization_digest(tensor)
     except Exception as exc:
         # Every rank must reach the same collective even if local hashing fails.
@@ -220,7 +227,7 @@ class Trainer:
         is_resuming = self.train_args.checkpoint.get_resume_checkpoint() is not None
         init_params = not is_resuming
 
-        check_init = self.train_args.debug.param_init_check and init_params and not compile_only
+        check_init = self.train_args.debug.param_init_check and not compile_only
         pmodel = parallelize_model(
             self.train_args, self.dummy_input,
             load_module=not compile_only,
@@ -300,7 +307,7 @@ class Trainer:
         self.optimizer = self.train_args.create_parallel_optimizer(self.model)
         if check_init:
             assert self.model is not None
-            check_param_init(self.model)
+            check_param_init(self.model, npb_only=not init_params)
         # unify the interface of ParallelModule and partial-parallelized model
         self.model = mixin_module(self.model, self.optimizer)
         # Here we carefully scale down the gradient locally with 1/scale_factor before reduce,
