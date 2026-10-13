@@ -434,6 +434,10 @@ class Bucket:
         if (self._zero > 1 or self._zero == 1 and self._zero_use_reduce_scatter) \
                 and self._zgroup_sz < self._wsz and zero_crossgroup is SINGLETON_GROUP:
             raise ValueError("Reduction across multiple ZeRO subgroups requires a non-singleton cross-group")
+        self._zcgroup_sz: int = (
+            1 if self._zero_crossgroup is SINGLETON_GROUP
+            else torch.distributed.get_world_size(group=self._zero_crossgroup)
+        )
         # ZeRO-1 optimizer shards are partitioned within the ZeRO subgroup, not the full reducer group.
         # For ZeRO-3, the parameters are already partitioned in the reducer, so the full reducer group is used for allreduce.
         opt_num_chunks = self._zgroup_sz if self._zero == 1 else 1
@@ -659,7 +663,7 @@ class Bucket:
                                             "two communication groups, which may induce deadlock."
                             self._group_reduce_scatter()
                     elif self._z3:
-                        if self._zero_crossgroup is not SINGLETON_GROUP:
+                        if self._zcgroup_sz > 1:
                             self._async_handle = torch.distributed.all_reduce(
                                 self._contiguous_grads, op=self._reduce_op,
                                 group=self._zero_crossgroup, async_op=True)
@@ -736,7 +740,7 @@ class Bucket:
                 self._async_handle.wait()
             else:
                 # Single-subgroup ZeRO-3 is already reduced by the parameter hooks.
-                assert self._z3 and self._zero_crossgroup is SINGLETON_GROUP
+                assert self._z3 and self._zcgroup_sz == 1
         else:
             CudaTimer().start('comm', predefined=True)
             # apply pre-hooks
@@ -745,7 +749,7 @@ class Bucket:
             if self._zero == 1 and self._zero_use_reduce_scatter:
                 self._group_reduce_scatter()
             elif self._z3:
-                if self._zero_crossgroup is not SINGLETON_GROUP:
+                if self._zcgroup_sz > 1:
                     torch.distributed.all_reduce(
                         self._contiguous_grads, op=self._reduce_op,
                         group=self._zero_crossgroup)
