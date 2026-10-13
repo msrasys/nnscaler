@@ -700,14 +700,6 @@ Resume startup reuses the normal checkpoint formats and topology validation:
   uploads optimizer states in bounded chunks. Two pinned CPU buffers use at
   most 128 MiB; source tensors and final destination storage are additional.
 
-NNScaler-created NCCL worlds use an unbound default group so compatible
-subgroups can be created by members only. All ranks must still declare groups
-in the same order. Existing externally device-bound worlds, non-NCCL backends
-or unsupported private APIs use public subgroup creation. The compatibility
-bridge is in `runtime/group_init.py`; applications do not manage group names.
-PyTorch upgrades require communication regression tests, including overlapping
-groups, P2P and teardown. This optimization is not specific to resume.
-
  ``` python
  @dataclass
  class CheckpointConfig:

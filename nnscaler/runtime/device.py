@@ -21,7 +21,6 @@ _LARGE_TIMEOUT = datetime.timedelta(seconds=21600)
 class _DeviceGroup:
     def __init__(self):
         self._is_pg_initer = False
-        self._local_group_init = False
         if CompileFlag.dev_mode or not is_running_distributed():
             self.rank = 0
             self.world_size = 1
@@ -30,11 +29,15 @@ class _DeviceGroup:
             self.node_rank = 0
         else:
             if not torch.distributed.is_initialized():
-                # An unbound parent allows subgroups to be created by members
-                # alone; communicator splitting would require nonmembers too.
-                torch.distributed.init_process_group(
-                    backend='nccl', timeout=_LARGE_TIMEOUT,
-                )
+                if torch.__version__ >= (2, 3):
+                    torch.distributed.init_process_group(
+                        backend='nccl', timeout=_LARGE_TIMEOUT,
+                        device_id=int(os.environ.get('LOCAL_RANK')),
+                    )
+                else:
+                    torch.distributed.init_process_group(
+                        backend='nccl', timeout=_LARGE_TIMEOUT,
+                    )
                 self._is_pg_initer = True
 
             # disable it for now due to connection refused error when nnodes > 1
@@ -54,9 +57,6 @@ class _DeviceGroup:
             self.node_rank = int(os.environ.get('GROUP_RANK'))
 
         torch.cuda.set_device(self.local_rank)
-        if not CompileFlag.dev_mode and is_running_distributed():
-            from nnscaler.runtime.group_init import supports_local_groups
-            self._local_group_init = supports_local_groups()
         self.groups: Dict = { '1'*self.world_size: None }
         self.p2p_groups: Dict[tuple[int, int], Optional[torch.distributed.ProcessGroup]] = {}
         self.use_p2p_groups = (
@@ -85,28 +85,21 @@ class _DeviceGroup:
         Create and return rank groups on-demand
 
         None will be returned if length of ranks are equal to world size
-        All ranks must declare groups in the same order, including nonmembers.
-        The backend decides whether nonmembers need to perform the creation.
         """
         if len(ranks) == self.world_size:
             return None
         rank_bits = self.bitmap(ranks)
         if rank_bits not in self.groups:
-            if self._local_group_init:
-                from nnscaler.runtime.group_init import new_local_group
-                self.groups[rank_bits] = new_local_group(
-                    ranks, namespace='collective', timeout=_LARGE_TIMEOUT)
-            else:
-                self.groups[rank_bits] = torch.distributed.new_group(
-                    list(ranks), timeout=_LARGE_TIMEOUT)
+            self.groups[rank_bits] = torch.distributed.new_group(
+                list(ranks), timeout=_LARGE_TIMEOUT)
         return self.groups[rank_bits]
 
     def init_p2p_groups(self, pairs):
         """
         Create deterministic two-rank groups for P2P communication.
 
-        All ranks must call this with the same global list of actual P2P pairs.
-        Backend selection and member-only creation stay inside DeviceGroup.
+        torch.distributed.new_group must be called by all ranks in the same order.
+        The generated module passes a global sorted list of actual P2P pairs.
         """
         if not self.use_p2p_groups:
             return
@@ -122,13 +115,8 @@ class _DeviceGroup:
 
         for pair in normalized_pairs:
             if pair not in self.p2p_groups:
-                if self._local_group_init:
-                    from nnscaler.runtime.group_init import new_local_group
-                    self.p2p_groups[pair] = new_local_group(
-                        pair, namespace='p2p', timeout=_LARGE_TIMEOUT)
-                else:
-                    self.p2p_groups[pair] = torch.distributed.new_group(
-                        list(pair), timeout=_LARGE_TIMEOUT)
+                self.p2p_groups[pair] = torch.distributed.new_group(
+                    list(pair), timeout=_LARGE_TIMEOUT)
         torch.distributed.barrier()
 
     def get_p2p_group(self, src: int, dst: int):
