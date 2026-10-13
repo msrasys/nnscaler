@@ -211,8 +211,11 @@ def _no_single_rank_groups_worker(save_dir):
 
                 if async_op:
                     # Reset must not leave the no-communication ZeRO-3 bucket marked ready.
-                    with pytest.raises(RuntimeError, match='never triggered'):
-                        model.reducers[0].buckets[0].sync_grads()
+                    bucket = model.reducers[0].buckets[0]
+                    with pytest.raises(
+                        RuntimeError, match=f'received 0 of {bucket._async_target_cnt} expected gradient hooks',
+                    ):
+                        bucket.sync_grads()
                     if zero == 3 and zero_ngroups == 1:
                         # A no-op cross-group still requires all accumulation steps.
                         reducer = model.reducers[0]
@@ -222,7 +225,10 @@ def _no_single_rank_groups_worker(save_dir):
                         param.sum().backward()
                         assert 0 < bucket._async_param_cnt < bucket._async_target_cnt
                         assert bucket._async_handle is None
-                        with pytest.raises(RuntimeError, match='never triggered'):
+                        with pytest.raises(
+                            RuntimeError,
+                            match=f'received {bucket._async_param_cnt} of {bucket._async_target_cnt} expected gradient hooks',
+                        ):
                             bucket.sync_grads()
 
 

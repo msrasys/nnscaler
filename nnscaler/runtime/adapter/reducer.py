@@ -729,8 +729,9 @@ class Bucket:
                     f'CudaTimer: the communication time of async reducer will not be recorded in `comm`')
             if self._async_param_cnt != self._async_target_cnt:
                 raise RuntimeError(
-                    "The async reducer's asynchronous gradient synchronization was never triggered, "
-                    "which means no gradient was produced for the parameters in this reducer on this step. "
+                    "The async reducer's asynchronous gradient synchronization was never triggered: "
+                    f"received {self._async_param_cnt} of {self._async_target_cnt} expected gradient hooks. "
+                    "Some parameter gradients are missing or gradient accumulation is incomplete. "
                     "This usually happens when some parameters are not used, "
                     "or are used outside a `torch.enable_grad` context, in the forward pass. "
                     "Please make sure every parameter in this reducer is used under `torch.enable_grad` "
