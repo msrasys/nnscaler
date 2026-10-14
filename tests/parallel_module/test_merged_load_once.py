@@ -1,29 +1,45 @@
 import pytest
 import torch
 from pathlib import Path
+from functools import wraps
+from types import SimpleNamespace
 
 from nnscaler.parallel import load_merged_state_dict, _merged_load_cpu_threads, _checkpoint_load_num_threads
-from nnscaler.runtime.module import ParallelModule, load_merged_module, merged_load_session
+from nnscaler.runtime.module import AttrMeta, ParallelModule, load_merged_module, merged_load_session
 
 
 class MinimalParallel(ParallelModule, skip_init=True):
+    rank = 0
+    world_size = 1
+    compute_config = SimpleNamespace(use_zero=0)
+    dist_param_map = {'weight': 'original_weight'}
+    attr_meta_maps = [{'weight': AttrMeta(
+        tid=0, is_param=True, orig_name='original_weight', shape=(4,),
+        slicers=(slice(None),), val_chunks=1, dtype=torch.float32, sub_shape=(4,))}]
+
     def __init__(self):
         torch.nn.Module.__init__(self)
         self.weight = torch.nn.Parameter(torch.zeros(4))
+        self._fullmap = self.attr_meta_maps[0]
+        self._non_presistent_buffers_inited = True
         self.loads = []
 
     def to(self, *args, **kwargs):
         return torch.nn.Module.to(self, *args, **kwargs)
 
-    def load_merged_state_dict(self, state_dict, prefix='', strict=True):
+
+@pytest.fixture(autouse=True)
+def record_default_loader_calls(monkeypatch):
+    # Exercise the real default loader. Overriding it in MinimalParallel would
+    # test a custom loader, which must retain the original two-pass behavior.
+    original = ParallelModule.load_merged_state_dict
+
+    @wraps(original)
+    def record(self, state_dict, prefix='', strict=True):
         self.loads.append((strict, torch.get_num_threads()))
-        key = prefix + 'original_weight'
-        if key not in state_dict:
-            if strict:
-                raise RuntimeError('Missing key(s) in state_dict')
-            return [key]
-        self.weight.data.copy_(state_dict[key])
-        return []
+        return original(self, state_dict, prefix, strict)
+
+    monkeypatch.setattr(ParallelModule, 'load_merged_state_dict', record)
 
 
 def test_standard_load_deduplicates_only_within_one_restore():
@@ -36,6 +52,31 @@ def test_standard_load_deduplicates_only_within_one_restore():
     load_merged_state_dict(root, state, device='cpu')
     assert len(root.child.loads) == 2
     torch.testing.assert_close(root.child.weight, state['child.original_weight'], rtol=0, atol=0)
+
+
+@pytest.mark.parametrize('override', ['subclass', 'instance'])
+def test_custom_merged_loader_keeps_strict_validation(override):
+    from types import MethodType
+
+    calls = []
+
+    def custom_load(self, state_dict, prefix='', strict=True):
+        calls.append(strict)
+        if strict and not torch.isfinite(state_dict[prefix + 'original_weight']).all():
+            raise ValueError('custom strict validation')
+        return MinimalParallel.load_merged_state_dict(self, state_dict, prefix, strict)
+
+    class CustomParallel(MinimalParallel, skip_init=True):
+        load_merged_state_dict = custom_load
+
+    root = torch.nn.Module()
+    root.child = CustomParallel() if override == 'subclass' else MinimalParallel()
+    if override == 'instance':
+        root.child.load_merged_state_dict = MethodType(custom_load, root.child)
+
+    with pytest.raises(ValueError, match='custom strict validation'):
+        load_merged_state_dict(root, {'child.original_weight': torch.full((4,), float('nan'))}, device='cpu')
+    assert calls == [False, True]
 
 
 @pytest.mark.parametrize('bound_hook', [False, True])

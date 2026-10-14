@@ -3,8 +3,78 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from torch.utils._python_dispatch import TorchDispatchMode
+from torch.utils._pytree import tree_leaves
 
-from nnscaler.parallel import _construct_optim_state_zero
+from nnscaler.parallel import _construct_optim_state_zero, _copy_optim_state_slice
+
+
+class AllocationSizes(TorchDispatchMode):
+    def __init__(self):
+        super().__init__()
+        self.sizes = []
+
+    def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+        kwargs = kwargs or {}
+        inputs = {value.untyped_storage().data_ptr()
+                  for value in tree_leaves((args, kwargs)) if isinstance(value, torch.Tensor)}
+        result = func(*args, **kwargs)
+        for value in tree_leaves(result):
+            if isinstance(value, torch.Tensor) and value.untyped_storage().data_ptr() not in inputs:
+                self.sizes.append(value.untyped_storage().nbytes())
+        return result
+
+
+@pytest.mark.parametrize('layout', ['contiguous', 'cropped', 'transposed', 'permuted', 'expanded'])
+@pytest.mark.parametrize('dtype', [torch.float32, torch.bfloat16, torch.int64])
+def test_logical_slice_values_rounding_and_allocation(layout, dtype):
+    base = torch.arange(7 * 9 * 11).reshape(7, 9, 11).to(dtype)
+    source = {
+        'contiguous': base,
+        'cropped': base[1:6, 1:8, 2:9],
+        'transposed': base[0].t(),
+        'permuted': base.permute(2, 0, 1),
+        'expanded': base[:1].expand(7, -1, -1),
+    }[layout]
+    expected = (source / 3).flatten().float()
+    original = source.clone()
+    size = source.numel()
+    for offset, count in [(0, size), (1, 1), (1, size - 2), (size // 3, size // 2), (size - 1, 1), (size, 0)]:
+        destination = torch.empty(count, dtype=torch.float32)
+        with AllocationSizes() as allocations:
+            _copy_optim_state_slice(destination, source, offset, 3)
+        torch.testing.assert_close(destination, expected[offset:offset + count], rtol=0, atol=0)
+        assert max(allocations.sizes, default=0) <= count * destination.element_size()
+    torch.testing.assert_close(source, original, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize('dtype', [torch.float32, torch.bfloat16])
+def test_partial_tp_restore_does_not_allocate_the_full_parameter(dtype):
+    # Cropped matrix rows cannot be flattened as a view. ZeRO boundaries also
+    # cut through rows, so restoring one shard must handle partial edge rows.
+    source = torch.arange(32 * 80, dtype=torch.float32).reshape(32, 80).to(dtype)
+    slicers = (slice(None), slice(5, 69))
+    param = torch.nn.Parameter(torch.empty(32, 64, dtype=dtype))
+    opt_param = torch.empty(260, dtype=dtype)
+    bucket = SimpleNamespace(params=[param], _contiguous_params=torch.empty(2080))
+    reducer = SimpleNamespace(params=[param], buckets=[bucket], get_param_info=lambda p:
+                              SimpleNamespace(bucket_param_buffer_start=8))
+    module = SimpleNamespace(
+        dist_param_map={'p': 'original'},
+        fullmap={'p_0': SimpleNamespace(slicers=slicers, val_chunks=3)},
+        named_parameters=lambda: iter([('p_0', param)]), parameters=lambda: iter([param]),
+        reducers=[reducer], parameters_for_optimizer=lambda: [opt_param],
+    )
+    expected = torch.zeros(2080, dtype=dtype)
+    expected[8:2056] = (source[slicers] / 3).flatten()
+    original = source.clone()
+    for rank in range(8):
+        module._get_zero_subranks = lambda r: (rank, list(range(8)))
+        with AllocationSizes() as allocations:
+            result = _construct_optim_state_zero(module, {'original': {'exp_avg': source}})
+        torch.testing.assert_close(result[0]['exp_avg'], expected.chunk(8)[rank], rtol=0, atol=0)
+        assert max(allocations.sizes, default=0) <= 260 * source.element_size()
+    torch.testing.assert_close(source, original, rtol=0, atol=0)
 
 
 @pytest.mark.parametrize('dtype', [torch.float32, torch.bfloat16])

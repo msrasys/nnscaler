@@ -54,6 +54,11 @@ def _can_reuse_merged_load(module):
         if getattr(child._load_from_state_dict, '__func__', None) not in (
                 torch.nn.Module._load_from_state_dict, ParallelModule._load_from_state_dict):
             return False
+        if (isinstance(child, ParallelModule)
+                and getattr(child.load_merged_state_dict, '__func__', None)
+                is not ParallelModule.load_merged_state_dict):
+            # A custom loader may do more than check missing keys under strict=True.
+            return False
         if child._load_state_dict_post_hooks:
             return False
         for wrapped_hook in child._load_state_dict_pre_hooks.values():

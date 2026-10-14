@@ -2953,6 +2953,45 @@ def _construct_optim_state_zero3(
     return state_dict
 
 
+def _copy_optim_state_slice(destination: torch.Tensor, source: torch.Tensor,
+                           offset: int, val_chunks: int):
+    """Divide a logical flat slice into owned storage without flattening a copy."""
+    count = destination.numel()
+    if count == 0:
+        return
+    if offset == 0 and count == source.numel():
+        destination = destination.view(source.shape)
+    elif source.is_contiguous():
+        source = source.view(-1)[offset:offset + count]
+    else:
+        # Split a strided range into at most two partial edge rows and one
+        # complete middle block. All source slices remain views; recursion is
+        # needed only at the edges, not once for every row of a large tensor.
+        row_size = source.numel() // source.shape[0]
+        row, start = divmod(offset, row_size)
+        copied = 0
+        if start:
+            copied = min(row_size - start, count)
+            _copy_optim_state_slice(destination[:copied], source[row], start, val_chunks)
+            row += 1
+        rows, tail = divmod(count - copied, row_size)
+        if rows:
+            end = copied + rows * row_size
+            _copy_optim_state_slice(destination[copied:end], source[row:row + rows], 0, val_chunks)
+            copied = end
+        if tail:
+            _copy_optim_state_slice(destination[copied:], source[row + rows], 0, val_chunks)
+        return
+
+    # Keep the original division, including /1. A device/dtype conversion must
+    # happen after source arithmetic to preserve its rounding.
+    if (source.device == destination.device
+            and torch.result_type(source, 1.0) == destination.dtype):
+        torch.div(source, val_chunks, out=destination)
+    else:
+        destination.copy_(source / val_chunks)
+
+
 def _construct_optim_state_zero(
         module: ParallelModule,
         orig_param_dict: Dict[str, Dict[str, Any]],
@@ -3001,21 +3040,7 @@ def _construct_optim_state_zero(
                 for key in state_keys:
                     source = source_state[key][meta.slicers]
                     destination = opt_states[key][start - chunk_start:end - chunk_start]
-                    if start == param_start and end == param_start + param.numel():
-                        # Preserve strided TP views without flattening a copy.
-                        destination = destination.view(source.shape)
-                    else:
-                        source = source.reshape(-1)[start - param_start:end - param_start]
-                    # Write directly into owned final storage, with exactly the
-                    # original division (including /1), without allocating a
-                    # full-parameter division result or aliasing the checkpoint.
-                    if (source.device == destination.device
-                            and torch.result_type(source, 1.0) == destination.dtype):
-                        torch.div(source, meta.val_chunks, out=destination)
-                    else:
-                        # Preserve source-device arithmetic and its rounding
-                        # before a device/dtype conversion, as in the old path.
-                        destination.copy_(source / meta.val_chunks)
+                    _copy_optim_state_slice(destination, source, start - param_start, meta.val_chunks)
 
             # Preserve the original field order as well as its values.
             if step is not None:
