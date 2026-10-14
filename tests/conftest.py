@@ -41,9 +41,13 @@ def pytest_collection_modifyitems(session, config, items: list[pytest.Function])
         # it is very easy to break the following tests, so run them first
         if item.fspath.basename == 'test_policies.py':
             return 0
-        if item.originalname == 'test_trainer_correctness':
+        if item.fspath.basename == 'test_shared_param_pipeline.py':
             return 1
-        if item.fspath.basename == 'test_trainer.py':
+        if item.fspath.basename == 'test_object_tensor_transport.py':
             return 2
-        return 3
+        if item.originalname == 'test_trainer_correctness':
+            return 100
+        if item.fspath.basename == 'test_trainer.py':
+            return 200
+        return 10000
     items.sort(key=policy_first)
