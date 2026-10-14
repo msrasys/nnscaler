@@ -38,6 +38,25 @@ def test_standard_load_deduplicates_only_within_one_restore():
     torch.testing.assert_close(root.child.weight, state['child.original_weight'], rtol=0, atol=0)
 
 
+@pytest.mark.parametrize('bound_hook', [False, True])
+def test_builtin_pre_load_hook_keeps_deduplication(monkeypatch, bound_hook):
+    root = torch.nn.Module()
+    root.child = MinimalParallel()
+    monkeypatch.setattr(root.child, '_warn_uninitialized_non_persistent_buffers', lambda: None)
+    if bound_hook:
+        root.child._register_load_state_dict_pre_hook(root.child._pre_load_state_dict_hook)
+    else:
+        # Match ParallelModule._post_init's actual registration form.
+        root.child._register_load_state_dict_pre_hook(
+            ParallelModule._pre_load_state_dict_hook, with_module=True)
+    state = {'child.original_weight': torch.arange(4, dtype=torch.float32)}
+
+    load_merged_state_dict(root, state, device='cpu')
+
+    assert len(root.child.loads) == 1
+    torch.testing.assert_close(root.child.weight, state['child.original_weight'], rtol=0, atol=0)
+
+
 def test_custom_post_load_hook_preserves_values_hooks_and_strictness():
     root = torch.nn.Module()
     root.child = MinimalParallel()

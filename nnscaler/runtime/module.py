@@ -58,7 +58,7 @@ def _can_reuse_merged_load(module):
             return False
         for wrapped_hook in child._load_state_dict_pre_hooks.values():
             hook = getattr(wrapped_hook, 'hook', wrapped_hook)
-            if getattr(hook, '__func__', None) is not ParallelModule._pre_load_state_dict_hook:
+            if getattr(hook, '__func__', hook) is not ParallelModule._pre_load_state_dict_hook:
                 return False
     return True
 
