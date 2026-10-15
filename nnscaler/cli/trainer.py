@@ -345,7 +345,10 @@ class Trainer:
         self.optimizer = self.train_args.create_parallel_optimizer(self.model)
         if check_init:
             assert self.model is not None
+            logger.info("Checking parameter consistency across all ranks.")
             check_param_init(self.model, npb_only=not init_params)
+            logger.info("Parameter consistency check completed.")
+
         # unify the interface of ParallelModule and partial-parallelized model
         self.model = mixin_module(self.model, self.optimizer)
         # Here we carefully scale down the gradient locally with 1/scale_factor before reduce,
