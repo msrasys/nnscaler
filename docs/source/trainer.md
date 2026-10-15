@@ -810,10 +810,11 @@ Where `ResumeOptions` and `SerializerOptions` are:
 
 Please note
 
-When resuming, Trainer constructs generated-module parameters and buffers
+Trainer constructs generated-module parameters and buffers
 directly on the current CUDA device, avoiding a CPU allocation followed by
-a CUDA copy. Fresh training and compile-only runs retain their existing
-initialization behavior. Non-persistent buffers still use the existing
+a CUDA copy. Fresh training still loads the generated initial weights,
+while resume loads checkpoint weights. Compile-only runs do not enter a
+CUDA construction scope. Non-persistent buffers still use the existing
 initialization files, since they are not saved in checkpoints.
 
 Library callers of `nnscaler.cli.mixed_module.parallelize_model` or

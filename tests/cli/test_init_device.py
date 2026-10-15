@@ -110,7 +110,7 @@ def test_whole_and_mixed_paths_forward_explicit_device(monkeypatch, mixed):
 
 @pytest.mark.parametrize('resuming', [False, True])
 @pytest.mark.parametrize('compile_only', [False, True])
-def test_trainer_allocates_resume_parameters_on_cuda(monkeypatch, resuming, compile_only):
+def test_trainer_allocates_generated_parameters_on_cuda(monkeypatch, resuming, compile_only):
     monkeypatch.setattr(trainer_module, 'is_running_distributed', lambda: False)
     monkeypatch.setattr(torch.cuda, 'current_device', lambda: 2)
     trainer = object.__new__(Trainer)
@@ -133,7 +133,7 @@ def test_trainer_allocates_resume_parameters_on_cuda(monkeypatch, resuming, comp
     with pytest.raises(ReachedConstruction):
         trainer._setup()
     assert calls[0]['init_params'] == (not resuming)
-    expected = torch.device('cuda', 2) if resuming and not compile_only else None
+    expected = torch.device('cuda', 2) if not compile_only else None
     assert calls[0]['init_device'] == expected
 
 
@@ -151,7 +151,8 @@ class ModelWithBuffer(torch.nn.Module):
     'cpu',
     pytest.param('cuda:0', marks=pytest.mark.skipif(not torch.cuda.is_available(), reason='no gpu')),
 ])
-def test_generated_module_placement_and_non_persistent_buffer(tmp_path, device):
+@pytest.mark.parametrize('init_params', [False, True])
+def test_generated_module_placement_and_non_persistent_buffer(tmp_path, device, init_params):
     args = SimpleNamespace(
         model_type=ModelWithBuffer, create_model=ModelWithBuffer,
         model=SimpleNamespace(args={}), compute_config=ComputeConfig(1, 1, trace_strategy='cpu'),
@@ -168,11 +169,13 @@ def test_generated_module_placement_and_non_persistent_buffer(tmp_path, device):
         )
         try:
             model = adapter.parallelize(
-                torch.ones(4), init_params=False, build_buckets=False, init_device=device,
+                torch.ones(4), init_params=init_params, build_buckets=False, init_device=device,
             )
         finally:
             torch.distributed.destroy_process_group()
     assert all(t.device == torch.device(device) for t in list(model.parameters()) + list(model.buffers()))
     assert model.non_presistent_buffers_inited
+    if init_params:
+        torch.testing.assert_close(next(model.parameters()).cpu(), torch.ones(4))
     torch.testing.assert_close(next(model.buffers()).cpu(), torch.full((4,), 2.0))
     assert torch.empty(0).device.type == 'cpu'
