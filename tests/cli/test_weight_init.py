@@ -1,6 +1,7 @@
 #  Copyright (c) Microsoft Corporation.
 #  Licensed under the MIT License.
 
+from contextlib import nullcontext
 from pathlib import Path
 import math
 import os
@@ -199,7 +200,9 @@ def _reference(strategy, seed=1234, model_class=InitModel):
             for name, value in list(model.named_parameters(remove_duplicate=False))
             + list(model.named_buffers(remove_duplicate=False)) + [('constant', model.constant)]
         }
-    model = create_init_module(model_class, model_class, None, seed=seed)
+    # Custom SHARD hooks inherit CUDA as their default device.
+    with torch.device('cuda') if strategy == ParamInitStrategy.SHARD else nullcontext():
+        model = create_init_module(model_class, model_class, None, seed=seed)
     return {
         name: value.detach().clone()
         for name, value in list(model.named_parameters(remove_duplicate=False))
