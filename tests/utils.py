@@ -21,6 +21,7 @@ import numpy as np
 import torch
 import torch.distributed as dist
 import torch.distributed.distributed_c10d as c10d
+from torch._C._distributed_c10d import _create_work_from_future
 from torch.utils._python_dispatch import TorchDispatchMode
 
 from nnscaler.parallel import ComputeConfig
@@ -269,6 +270,20 @@ class MockProcessGroup(dist.ProcessGroup):
 
     def getBackendName(self):
         return "cube_mock_pg"
+
+    def _completed_work(self, tensors: list[torch.Tensor]) -> dist.Work:
+        # No-op collectives are correct only when there are no peer ranks.
+        if self.size() != 1:
+            raise NotImplementedError("MockProcessGroup collectives only support a single rank")
+        future = torch.futures.Future()
+        future.set_result(tensors)
+        return _create_work_from_future(future)
+
+    def barrier(self, opts=None):
+        return self._completed_work([])
+
+    def broadcast(self, tensors, opts=None):
+        return self._completed_work(tensors)
 
 
 def create_mock_pg(prefix_store, rank, world_size, timeout):
