@@ -810,6 +810,20 @@ Where `ResumeOptions` and `SerializerOptions` are:
 
 Please note
 
+When resuming, Trainer constructs generated-module parameters and buffers
+directly on the current CUDA device, avoiding a CPU allocation followed by
+a CUDA copy. Fresh training and compile-only runs retain their existing
+initialization behavior. Non-persistent buffers still use the existing
+initialization files, since they are not saved in checkpoints.
+
+Library callers of `nnscaler.cli.mixed_module.parallelize_model` or
+`ModuleParallelizeConfigAdapter.parallelize` can explicitly select placement
+with `init_device` (a device string or `torch.device`). Its default, `None`,
+preserves the caller's default device independently of `init_params`.
+The device scope covers only generated-module construction, not tracing or
+original model factories. Subsequent bucket building still places parameters
+on CUDA; use `build_buckets=False` to retain CPU construction.
+
 1.  When the parallel plan is changed (i.e you re-trace the model with
     different configurations), the checkpoints become incompatible, and
     can't be loaded any more. You must firstly merge the checkpoints to

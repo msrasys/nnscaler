@@ -264,6 +264,13 @@ class Trainer:
         # Non-persistent buffers are restored using the configured initialization strategy.
         is_resuming = self.train_args.checkpoint.get_resume_checkpoint() is not None
         init_params = not is_resuming
+        # Trainer owns a CUDA model (see self.model.cuda() below). On resume,
+        # allocate generated tensors there directly; the checkpoint fills them.
+        init_device = (
+            torch.device('cuda', torch.cuda.current_device())
+            if is_resuming and not compile_only
+            else None
+        )
 
         check_init = self.train_args.debug.param_init_check and not compile_only
         pmodel = parallelize_model(
@@ -272,6 +279,7 @@ class Trainer:
             build_buckets=not self.train_args.should_delay_bucket_building(),
             checkpointer=self.checkpointer,
             init_params=init_params,
+            init_device=init_device,
         )
         if compile_only:
             return
