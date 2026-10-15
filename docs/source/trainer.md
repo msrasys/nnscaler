@@ -817,13 +817,14 @@ while resume loads checkpoint weights. Compile-only runs do not enter a
 CUDA construction scope. Non-persistent buffers still use the existing
 initialization files, since they are not saved in checkpoints.
 
-Library callers of `nnscaler.cli.mixed_module.parallelize_model` or
-`ModuleParallelizeConfigAdapter.parallelize` can explicitly select placement
-with `init_device` (a device string or `torch.device`). Its default, `None`,
-preserves the caller's default device independently of `init_params`.
+Similarly, passing a model instance to `nnscaler.parallelize` constructs the
+generated model directly on the current CUDA device, even with
+`build_module_buckets=False`. Loading model instances requires CUDA.
 The device scope covers only generated-module construction, not tracing or
-original model factories. Subsequent bucket building still places parameters
-on CUDA; use `build_buckets=False` to retain CPU construction.
+original model factories. With a model class input, `nnscaler.parallelize`
+returns the generated class without constructing an instance; its constructor
+remains unchanged. Compile-only runs (`load_module=False`) do not enter a
+CUDA construction scope.
 
 1.  When the parallel plan is changed (i.e you re-trace the model with
     different configurations), the checkpoints become incompatible, and
