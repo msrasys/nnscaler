@@ -810,21 +810,9 @@ Where `ResumeOptions` and `SerializerOptions` are:
 
 Please note
 
-Trainer constructs generated-module parameters and buffers
-directly on the current CUDA device, avoiding a CPU allocation followed by
-a CUDA copy. Fresh training still loads the generated initial weights,
-while resume loads checkpoint weights. Compile-only runs do not enter a
-CUDA construction scope. Non-persistent buffers still use the existing
-initialization files, since they are not saved in checkpoints.
-
-Similarly, passing a model instance to `nnscaler.parallelize` constructs the
-generated model directly on the current CUDA device, even with
-`build_module_buckets=False`. Loading model instances requires CUDA.
-The device scope covers only generated-module construction, not tracing or
-original model factories. With a model class input, `nnscaler.parallelize`
-returns the generated class without constructing an instance; its constructor
-remains unchanged. Compile-only runs (`load_module=False`) do not enter a
-CUDA construction scope.
+Trainer creates generated models directly on the current CUDA device for both
+fresh training and checkpoint resume, avoiding intermediate CPU allocations
+and copies.
 
 1.  When the parallel plan is changed (i.e you re-trace the model with
     different configurations), the checkpoints become incompatible, and
