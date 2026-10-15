@@ -9,14 +9,45 @@ from unittest.mock import patch
 
 import pytest
 import torch
+import xxhash
 
 from nnscaler import ParamInitStrategy
 from nnscaler.cli import Trainer, TrainerArgs
-from nnscaler.cli.trainer import check_param_init
+from nnscaler.cli.trainer import _initialization_digest, check_param_init
 from nnscaler.cli.trainer_args import DebugConfig, ModelConfig, ModuleParallelizeConfig
 from nnscaler.runtime.module import AttrMeta, ParallelModule, Zero3AttrMeta
 from tests.cli.test_weight_init import _args
 from tests.launch_torchrun import launch_torchrun
+
+
+def test_initialization_digest_pinned_chunks():
+    """Preserve digests and reuse buffers across boundaries, dtypes and layouts."""
+    chunk_size = 8 * 1024**2
+    for device in (['cpu', 'cuda'] if torch.cuda.is_available() else ['cpu']):
+        buffers = []
+        for dtype in (torch.bfloat16, torch.float32):
+            elements = chunk_size // torch.empty((), dtype=dtype).element_size()
+            source = torch.arange(3 * elements + 20, device=device).to(dtype)
+            tensors = [source[3:3 + size] for size in (
+                0, 1, elements - 1, elements, elements + 1, 3 * elements + 17,
+            )]
+            tensors.extend([source[3], source[:30].reshape(5, 6).t()])
+            for tensor in tensors:
+                expected = xxhash.xxh3_128()
+                # Metadata contains the dtype followed by the logical shape.
+                expected.update(repr((str(tensor.dtype), tuple(tensor.shape))).encode())
+                expected.update(
+                    tensor.detach().cpu().contiguous().reshape(-1).view(torch.uint8).numpy()
+                )
+                pointers = [b.data_ptr() for b in buffers]
+                assert _initialization_digest(tensor, buffers) == expected.hexdigest()
+                if pointers:
+                    assert [b.data_ptr() for b in buffers] == pointers
+        if device == 'cpu':
+            assert not buffers
+        else:
+            assert len(buffers) == 2
+            assert all(b.is_pinned() and b.numel() == chunk_size for b in buffers)
 
 
 class CheckBlock(torch.nn.Module):

@@ -948,8 +948,12 @@ class DebugConfig:
 - `param_init_check` (`bool`, default `True`): Compare hashes of initialized
   parameters and buffers across ranks, requiring bitwise equality. Runs after
   optimizer/reducer construction, including ZeRO-3 sharding.
-  Uses XXH3-128 over dtype, shape, and raw tensor bytes on CPU; GPU tensors
-  are copied to CPU one at a time. Only digests and metadata are exchanged.
+  Uses XXH3-128 over dtype, shape, and raw tensor bytes on CPU. Contiguous CUDA
+  tensors are copied in chunks using two reusable 8 MiB pinned CPU buffers,
+  overlapping the next copy on the current CUDA stream with CPU hashing of the
+  previous chunk. These buffers are allocated lazily once per check.
+  CPU and non-contiguous tensors retain the synchronous path. Only digests and
+  metadata are exchanged.
   - **Compared:** identical logical shard replicas in non-file `ParallelModule`
     instances, plus ordinary module parameters and buffers across ranks.
     Different submodules are checked separately.

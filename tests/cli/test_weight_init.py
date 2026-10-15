@@ -473,7 +473,7 @@ class UnsupportedInitModel(InitModel):
         super().__init__(**kwargs)
         if torch.distributed.is_initialized() and torch.distributed.get_rank() == 1:
             with torch.no_grad():
-                self.layers[0].weight.sin_()
+                torch._foreach_add_([self.layers[0].weight], 1)
 
 
 def _worker_capture_failure(save_dir):
