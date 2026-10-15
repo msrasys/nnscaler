@@ -105,14 +105,14 @@ def create_shard_init_weights(
     *,
     seed: int,
 ) -> Generator[tuple[str, torch.Tensor], None, None]:
-    """Yield user-provided shards with lazy execution inside the initialization RNG scope."""
+    """Yield user-provided shards lazily with CUDA as the default device and scoped RNG."""
     initializer = getattr(module_class, '__shard__init__', None)
     if not callable(initializer):
         raise RuntimeError(
             "A shard initializer must define "
             "__shard__init__(attr_meta_map) as a staticmethod or classmethod."
         )
-    with _initialization_rng(seed):
+    with torch.device('cuda'), _initialization_rng(seed):
         values = initializer(attr_meta_map)
         if isinstance(values, dict):
             values = values.items()
@@ -164,7 +164,7 @@ def capture_init_weights(
                 "Independent initialization requires parallelize() with the original "
                 "module class/module_fn, or an init_module instance."
             )
-        with DeferredInitialization(device=device) as capture:
+        with torch.device(device), DeferredInitialization(device=device) as capture:
             module = module_fn()
     with torch.no_grad():
         for source, entries in _get_init_source_groups(module, attr_meta_map).values():

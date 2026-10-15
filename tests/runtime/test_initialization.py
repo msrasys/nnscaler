@@ -275,6 +275,7 @@ def test_empty_capture_initializer_skips_constructor():
     assert list(capture_init_weights({}, module_fn=fail)) == []
 
 
+@replace_all_device_with('cpu', force=True)
 def test_user_shard_initializer_receives_only_required_attributes():
     module = _local_module(ParamInitStrategy.SHARD)
     calls = []
@@ -320,6 +321,7 @@ def test_user_shard_initializer_receives_only_required_attributes():
     ([('weight_local',)], 'pairs'),
     (['weight_local'], 'pairs'),
 ])
+@replace_all_device_with('cpu', force=True)
 def test_user_shard_initializer_validates_local_results(result, message):
     module = _local_module(ParamInitStrategy.SHARD)
 
@@ -332,6 +334,7 @@ def test_user_shard_initializer_validates_local_results(result, message):
 
 
 @pytest.mark.parametrize('streaming', [False, True])
+@replace_all_device_with('cpu', force=True)
 def test_shard_initializer_seed_and_failure_restore_rng(streaming):
     class CustomModule(torch.nn.Module):
         fail = False
@@ -363,6 +366,7 @@ def test_shard_initializer_seed_and_failure_restore_rng(streaming):
 
 
 @pytest.mark.parametrize('failure', ['shape', 'missing', 'exception'])
+@replace_all_device_with('cpu', force=True)
 def test_streaming_shard_failure_closes_hook_and_restores_rng(failure):
     module = _local_module(ParamInitStrategy.SHARD)
     closed = []
@@ -411,6 +415,7 @@ def test_capture_initializer_yields_views_without_cloning(device):
         stream.close()
 
 
+@replace_all_device_with('cpu', force=True)
 def test_streaming_user_hook_releases_each_source_before_next_allocation():
     from torch.multiprocessing.reductions import StorageWeakRef
 

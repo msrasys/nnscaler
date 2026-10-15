@@ -810,9 +810,9 @@ Where `ResumeOptions` and `SerializerOptions` are:
 
 Please note
 
-Trainer creates generated models directly on the current CUDA device for both
-fresh training and checkpoint resume, avoiding intermediate CPU allocations
-and copies.
+Generated modules allocate parameters and buffers directly on the current CUDA
+device. SHARD initialization uses CUDA as the default device. This applies
+to both fresh training and checkpoint resume.
 
 1.  When the parallel plan is changed (i.e you re-trace the model with
     different configurations), the checkpoints become incompatible, and

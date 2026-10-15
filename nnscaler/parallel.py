@@ -1503,8 +1503,7 @@ def parallelize(
             )
             if compute_config.param_init_strategy != ParamInitStrategy.FILE and module_dtype is not None:
                 module_or_module_class.to(dtype=module_dtype)
-            with torch.device('cuda'):
-                parallel_module = parallel_module_class(init_module_params, build_module_buckets, **init_kwargs)
+            parallel_module = parallel_module_class(init_module_params, build_module_buckets, **init_kwargs)
             parallel_module.train(module_or_module_class.training)  # set training state to the same as original module
             return parallel_module
 
