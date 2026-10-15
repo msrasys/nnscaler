@@ -1,3 +1,5 @@
+import warnings
+
 from .muon_optimizer import MuonMixin
 
 
@@ -7,5 +9,10 @@ try:
     class Muon(MuonMixin, _Muon):
         momentum_buffer_name = 'momentum'
 
-except ImportError:
-    pass
+except ModuleNotFoundError as e:
+    if e.name != 'dion':
+        raise
+    warnings.warn(
+        'Dion is not installed. Dion Muon optimizers are unavailable.',
+        stacklevel=2,
+    )
