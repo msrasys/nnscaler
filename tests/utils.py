@@ -358,6 +358,7 @@ def mock_dist(rank, world_size):
 def mock_cube_env(rank, world_size):
     old_device_group = nnscaler.runtime.device._instance
     old_dev_mode = CompileFlag.dev_mode
+    current_device = torch.cuda.current_device() if torch.cuda.is_available() else 0
     used_cuda_fns = ['set_device', 'current_device', 'default_stream']
     old_cuda_fns = {
         fname: getattr(torch.cuda, fname)
@@ -373,6 +374,8 @@ def mock_cube_env(rank, world_size):
         CompileFlag.dev_mode = False
         for fname, fn in old_cuda_fns.items():
             setattr(torch.cuda, fname, lambda *args, **kwargs: None)
+        # RNG preservation requires a device index, not a no-op return value.
+        torch.cuda.current_device = lambda: current_device
         os.environ['RANK'] = os.environ['LOCAL_RANK'] = str(rank)
         os.environ['WORLD_SIZE'] = os.environ['LOCAL_WORLD_SIZE'] = str(world_size)
         os.environ['GROUP_RANK'] = '0'
