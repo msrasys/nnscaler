@@ -545,7 +545,15 @@ class CubeModule(torch.nn.Module):
     def init_group(self, ranks: List[int]):
         if not all([isinstance(rank, int) for rank in ranks]):
             raise TypeError("Expected ranks to be List[int]")
-        DeviceGroup().get_group(ranks)
+        manager = DeviceGroup()
+        # Older generated modules declare singleton groups one at a time.
+        # Precreate the partition on their first declaration as well.
+        if len(ranks) == 1 and not manager.group_exists(ranks):
+            manager.init_groups([[rank] for rank in range(manager.world_size)])
+        manager.get_group(ranks)
+
+    def init_groups(self, groups: List[List[int]]):
+        DeviceGroup().init_groups(groups)
 
     def get_checkpoint(self, optimizer: torch.optim.Optimizer = None):
         state_dict = super().state_dict()

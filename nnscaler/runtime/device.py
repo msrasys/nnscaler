@@ -58,6 +58,8 @@ class _DeviceGroup:
 
         torch.cuda.set_device(self.local_rank)
         self.groups: Dict = { '1'*self.world_size: None }
+        self._split_auxiliary_groups: List[torch.distributed.ProcessGroup] = []
+        self._sync_groups = {}
         self.p2p_groups: Dict[tuple[int, int], Optional[torch.distributed.ProcessGroup]] = {}
         self.use_p2p_groups = (
             not CompileFlag.dev_mode
@@ -94,11 +96,35 @@ class _DeviceGroup:
                 list(ranks), timeout=_LARGE_TIMEOUT)
         return self.groups[rank_bits]
 
+    def init_groups(self, groups):
+        """Collectively create a group list, batching disjoint memberships.
+
+        Every rank must call this with the same groups, even nonmembers. Cached
+        groups are reused. Unsupported runtimes keep the normal creation path.
+        """
+        from nnscaler.runtime.group_init import create_groups
+
+        pending = set()
+        for ranks in groups:
+            ranks = tuple(sorted(ranks))
+            if not ranks or len(set(ranks)) != len(ranks):
+                raise ValueError('Communication group ranks must be nonempty and unique')
+            if any(not isinstance(rank, int) or rank < 0 or rank >= self.world_size for rank in ranks):
+                raise ValueError(f'Communication group rank outside world size {self.world_size}')
+            if not self.group_exists(ranks):
+                pending.add(ranks)
+        created = create_groups(
+            sorted(pending), rank=self.rank, world_size=self.world_size,
+            timeout=_LARGE_TIMEOUT, auxiliary_groups=self._split_auxiliary_groups,
+        )
+        for ranks, group in created.items():
+            self.groups[self.bitmap(ranks)] = group
+
     def init_p2p_groups(self, pairs):
         """
         Create deterministic two-rank groups for P2P communication.
 
-        torch.distributed.new_group must be called by all ranks in the same order.
+        All ranks must call this method in the same order.
         The generated module passes a global sorted list of actual P2P pairs.
         """
         if not self.use_p2p_groups:
@@ -113,11 +139,30 @@ class _DeviceGroup:
             normalized_pairs.append((src, dst) if src < dst else (dst, src))
         normalized_pairs = sorted(set(normalized_pairs))
 
-        for pair in normalized_pairs:
-            if pair not in self.p2p_groups:
-                self.p2p_groups[pair] = torch.distributed.new_group(
-                    list(pair), timeout=_LARGE_TIMEOUT)
+        from nnscaler.runtime.group_init import create_groups
+        self.p2p_groups.update(create_groups(
+            [pair for pair in normalized_pairs if pair not in self.p2p_groups],
+            rank=self.rank, world_size=self.world_size, timeout=_LARGE_TIMEOUT,
+            auxiliary_groups=self._split_auxiliary_groups,
+        ))
         torch.distributed.barrier()
+
+    def get_sync_group(self, stride: int, world_size: int):
+        """Cache strided replica groups for this distributed runtime.
+
+        The first call for a layout is collective, including nonmembers. Later
+        calls only look up the current rank's group. Return a fresh rank list so
+        callers cannot mutate the cached membership.
+        """
+        if not 0 < stride <= world_size <= self.world_size or world_size % stride:
+            raise ValueError('Sync group size must be a positive multiple of its stride within the world')
+        key = (stride, world_size)
+        if key not in self._sync_groups:
+            self.init_groups([list(range(i, world_size, stride)) for i in range(stride)])
+            ranks = tuple(range(self.rank % stride, world_size, stride))
+            self._sync_groups[key] = (ranks, self.get_group(ranks))
+        ranks, group = self._sync_groups[key]
+        return list(ranks), group
 
     def get_p2p_group(self, src: int, dst: int):
         """

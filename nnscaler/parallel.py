@@ -377,16 +377,7 @@ class ComputeConfig:
         Returns:
             Tuple[List[int], torch.distributed.ProcessGroup]: return the rank list of the group and its torch.distributed group
         """
-        rank = torch.distributed.get_rank()
-        # create all groups
-        plan_ngpus = self.plan_ngpus
-        runtime_ngpus = self.runtime_ngpus
-        for i in range(plan_ngpus):
-            DeviceGroup().get_group(
-                list(range(i, runtime_ngpus, plan_ngpus))
-            )
-        rank_list = list(range(rank % plan_ngpus, runtime_ngpus, plan_ngpus))
-        return rank_list, DeviceGroup().get_group(rank_list)
+        return DeviceGroup().get_sync_group(self.plan_ngpus, self.runtime_ngpus)
 
     @classmethod
     def safe_dump_to_file(cls, cfg: 'ComputeConfig', file: Union[str, Path]) -> None:

@@ -844,17 +844,14 @@ class ModuleCodeGen(FuncEmission):
         The fields storing intermediate codes that are populated by this method:
         - `model_init_statements`
         """
-        sign = 'self.init_group(ranks={ranks})'
         # create single rank communication group
         self.model_init_statements.append('# single rank communication groups')
-        with ForBlock(var='rank', iters=f'range({self.runtime_ndevs})') as fb:
-            fb.insert_body(sign.format(ranks='[rank]'))
-        self.model_init_statements.extend(fb.code)
+        self.model_init_statements.append(
+            f'self.init_groups([[rank] for rank in range({self.runtime_ndevs})])')
         # create communication group
         self.model_init_statements.append('# communication groups')
-        for ranks in self.comm_groups:
-            code = sign.format(ranks=list(ranks))
-            self.model_init_statements.append(code)
+        self.model_init_statements.append(
+            f'self.init_groups({[list(ranks) for ranks in self.comm_groups]})')
         p2p_pairs = self.get_p2p_pairs()
         if p2p_pairs:
             self.model_init_statements.append('# P2P communication groups')

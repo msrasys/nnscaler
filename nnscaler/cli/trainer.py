@@ -210,13 +210,14 @@ class Trainer:
             )
         )
         self.local_rank0 = self.local_ranks[0]
-        # create local process groups
-        for local_rank0 in range(0, self.world_size, self.local_world_size):
-            DeviceGroup().get_group(list(range(local_rank0, local_rank0 + self.local_world_size)))
         # the local rank 0 of every node, used to broadcast checkpoint across nodes
         # when `slow_fs` is enabled (see `_load_checkpoint`)
         self.node_leader_ranks = list(range(0, self.world_size, self.local_world_size))
-        DeviceGroup().get_group(self.node_leader_ranks)
+        local_groups = [
+            list(range(local_rank0, local_rank0 + self.local_world_size))
+            for local_rank0 in range(0, self.world_size, self.local_world_size)
+        ]
+        DeviceGroup().init_groups(local_groups + [self.node_leader_ranks])
 
         self.total_train_steps_per_epoch = len(self.dataloader['train']) // self.train_args.update_freq
         if len(self.dataloader['train']) % self.train_args.update_freq != 0:
@@ -871,13 +872,7 @@ class Trainer:
                 return [rank], None
 
             from nnscaler.runtime.device import DeviceGroup
-            # make sure all needed device groups have been created to make safe
-            for i in range(group_size):
-                DeviceGroup().get_group(
-                    list(range(i, runtime_ngpus, group_size))
-                )
-            rank_list = list(range(rank % group_size, runtime_ngpus, group_size))
-            return rank_list, DeviceGroup().get_group(rank_list)
+            return DeviceGroup().get_sync_group(group_size, runtime_ngpus)
 
         rank_list, sync_group = get_optimizer_sync_group()
 
