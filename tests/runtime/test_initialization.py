@@ -256,7 +256,7 @@ def test_capture_initializer_streams_into_model_and_releases_full_sources():
     type(module)._init_module_fn = staticmethod(partial(create_init_module, Source, None, None, seed=17))
     with patch.object(DeferredInitialization, 'materialize', record):
         module._post_init(build_buckets=False)
-    assert calls == [(4, 6), (6, 4), ()]
+    assert calls == [(4, 6), (4, 6), (6, 4), ()]
     assert all(storage.expired() for storage in full_storages)
     reference = Source()
     # note first/second/view(weight/tied/transposed) are not shared the same storage here.

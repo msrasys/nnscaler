@@ -119,27 +119,6 @@ def create_shard_init_weights(
         yield from values
 
 
-def _get_init_source_groups(
-    module: torch.nn.Module, attr_meta_map: Dict[str, "AttrMeta"],
-) -> Dict[int, tuple[torch.Tensor, list[tuple[str, "AttrMeta"]]]]:
-    groups = {}
-    for attr, meta in attr_meta_map.items():
-        source = get_member_by_name(module, meta.orig_name)
-        if (
-            not isinstance(source, torch.Tensor)
-            or tuple(source.shape) != tuple(meta.shape)
-            or source.dtype != meta.dtype
-        ):
-            raise RuntimeError(
-                f"Invalid initialization tensor for {meta.orig_name}: "
-                f"expected shape {meta.shape} and dtype {meta.dtype}."
-            )
-        if id(source) not in groups:
-            groups[id(source)] = (source, [])
-        groups[id(source)][1].append((attr, meta))
-    return groups
-
-
 def capture_init_weights(
     attr_meta_map: Dict[str, "AttrMeta"],
     *,
@@ -167,10 +146,19 @@ def capture_init_weights(
         with torch.device(device), DeferredInitialization(device=device) as capture:
             module = module_fn()
     with torch.no_grad():
-        for source, entries in _get_init_source_groups(module, attr_meta_map).values():
+        for attr, meta in attr_meta_map.items():
+            source = get_member_by_name(module, meta.orig_name)
+            if (
+                not isinstance(source, torch.Tensor)
+                or tuple(source.shape) != tuple(meta.shape)
+                or source.dtype != meta.dtype
+            ):
+                raise RuntimeError(
+                    f"Invalid initialization tensor for {meta.orig_name}: "
+                    f"expected shape {meta.shape} and dtype {meta.dtype}."
+                )
             value = source if capture is None else capture.materialize(source)
-            for attr, meta in entries:
-                yield attr, value[meta.slicers]
+            yield attr, value[meta.slicers]
             del value
 
 

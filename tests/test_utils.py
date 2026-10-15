@@ -7,6 +7,7 @@ import sys
 from unittest.mock import patch
 import pytest
 import torch
+from torch.utils._device import _device_constructors
 
 from nnscaler.utils import (
     select_many, classproperty, fields, set_member_by_name, unchecked_fields,
@@ -17,6 +18,9 @@ from tests.utils import replace_all_device_with
 
 @pytest.mark.parametrize('fail', [False, True])
 def test_replace_devices_context_rng_and_restore(fail):
+    # _device_constructors caches the tensor factory identities used by torch.device.
+    # Start cold so earlier tests cannot hide mock-induced cache pollution.
+    _device_constructors.cache_clear()
     originals = {
         'generator': torch.Generator,
         'device': torch.cuda.device,
@@ -33,6 +37,8 @@ def test_replace_devices_context_rng_and_restore(fail):
     with patch('torch.cuda._lazy_init', side_effect=AssertionError('real CUDA initialization')):
         try:
             with replace_all_device_with('cpu', force=True):
+                with torch.device('cuda'):
+                    assert torch.empty(0).device.type == 'cpu'
                 with torch.cuda.device(3):
                     torch.cuda.set_device(2)
                     assert torch.cuda.current_device() == 0
@@ -66,6 +72,8 @@ def test_replace_devices_context_rng_and_restore(fail):
                  'set_rng_state', 'manual_seed', 'manual_seed_all'):
         assert getattr(torch.cuda, name) is originals[name]
     assert torch.equal(torch.get_rng_state(), state)
+    with torch.device('meta'):
+        assert torch.empty(0).is_meta
 
 
 def test_replace_devices_deferred_capture_and_fallback():
@@ -629,4 +637,3 @@ def test_stepwise_steps_per_period_max_total_steps(config, items, max_total_step
         StepwiseConfig.value_at(result, e) for e in range(last_period)
     )
     assert consumed < max_total_steps or last_period == 0
-

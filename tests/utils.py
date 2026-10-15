@@ -123,7 +123,10 @@ def replace_all_device_with(device='cpu', force=False):
         return
 
     from nnscaler.graph.tracer import wrap_utils
+    from torch.utils._device import _device_constructors
 
+    # Cache real factory identities before mocking; torch.device reuses this set.
+    _device_constructors()
     orig_to = torch.Tensor.to
     orig_cuda = torch.Tensor.cuda
     orig_cpu = torch.Tensor.cpu
