@@ -810,7 +810,12 @@ Where `ResumeOptions` and `SerializerOptions` are:
 
 Please note
 
-1.  When the parallel plan is changed (i.e you re-trace the model with
+1.  If only generated parameter/buffer names change after re-tracing, sharded
+    and deduped loading automatically aligns names using checkpoint metadata.
+    Original model names, module prefixes, shard layouts and optimizer
+    parameter order/layout must remain unchanged. Incompatible or ambiguous
+    mappings raise an error. Merged checkpoints are unaffected.
+    When the parallel plan is changed (i.e you re-trace the model with
     different configurations), the checkpoints become incompatible, and
     can't be loaded any more. You must firstly merge the checkpoints to
     a merged checkpoint with `Trainer.merge_checkpoint` and then load

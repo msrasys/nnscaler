@@ -800,6 +800,28 @@ On the other hand, a lot of weights/state in the module and the optimizer will b
 We provide two functions to help you save/load the merged checkpoint for the parallel module,
 and two other functions to help you save/load the deduped state dicts for the parallel module.
 
+### `align_state_dict_names`
+
+Sharded and deduped loading automatically aligns generated parameter/buffer
+names if only these names change after re-tracing. No option is needed:
+
+```python
+nnscaler.load_sharded_state_dict(
+    model, state_dict['model'], optimizer, state_dict['optimizer'],
+)
+# For deduped checkpoints, use load_deduped_state_dict instead.
+```
+
+The underlying `nnscaler.align_state_dict_names(model, model_state_dict)`
+adapter can also be called directly. It matches original names and shard metadata, ignoring tensor IDs.
+It returns a shallow copy (tensors are not copied), updates parallel-module
+metadata, and leaves non-parallel-module keys unchanged. It also works when a
+deduped rank holds only metadata. Missing metadata, ambiguous matches, changed
+sharding, or changed optimizer parameter order/layout raise `ValueError`.
+Module prefixes and original model names must remain unchanged. This is not
+a resharding or optimizer-state migration API; use a merged checkpoint for
+parallel-plan changes.
+
 ### `merge_state_dicts`
 ```python
 def merge_state_dicts(
