@@ -89,10 +89,9 @@ def create_init_module(
     module_dtype: Optional[torch.dtype],
     *,
     seed: Optional[int] = None,
-    device: str | torch.device = "cpu",
 ) -> torch.nn.Module:
-    """Construct a source module with scoped RNG and CPU as the default device."""
-    with torch.device(device), _initialization_rng(seed):
+    """Construct a source module with scoped RNG, inheriting the caller's device context."""
+    with _initialization_rng(seed):
         module = module_class() if module_fn is None else module_fn()
         if type(module) is not module_class:
             raise ValueError(f"module_fn should return a {module_class} instance.")
@@ -107,14 +106,14 @@ def create_shard_init_weights(
     *,
     seed: int,
 ) -> Generator[tuple[str, torch.Tensor], None, None]:
-    """Yield user-provided shards lazily with CUDA as the default device and scoped RNG."""
+    """Run the hook and its lazy iteration with scoped RNG in the caller's device context."""
     initializer = getattr(module_class, '__shard__init__', None)
     if not callable(initializer):
         raise RuntimeError(
             "A shard initializer must define "
             "__shard__init__(attr_meta_map) as a staticmethod or classmethod."
         )
-    with torch.device('cuda'), _initialization_rng(seed):
+    with _initialization_rng(seed):
         values = initializer(attr_meta_map)
         if isinstance(values, dict):
             values = values.items()
@@ -126,12 +125,11 @@ def capture_init_weights(
     *,
     module_fn: Optional[Callable[[], torch.nn.Module]] = None,
     module: Optional[torch.nn.Module] = None,
-    device: str | torch.device = "cuda",
 ) -> Generator[tuple[str, torch.Tensor], None, None]:
     """Implement the __shard__init__ contract using captured construction.
 
     The bound factory supplies constructor arguments, dtype and initialization seed.
-    Concrete fallback and captured tensor replay use ``device`` (CUDA by default).
+    Concrete fallback and captured tensor replay use the caller's device at capture time.
     A supplied instance is used as-is. Yield local views without value-division;
     ParallelModule copies each view before advancing and applies val_chunks.
     Consumers must release each view before requesting the next source tensor.
@@ -145,7 +143,8 @@ def capture_init_weights(
                 "Independent initialization requires parallelize() with the original "
                 "module class/module_fn, or an init_module instance."
             )
-        with torch.device(device), DeferredInitialization(device=device) as capture:
+        # Resolve before dispatch can temporarily remove the default-device context.
+        with DeferredInitialization(device=torch.empty(0).device) as capture:
             module = module_fn()
     with torch.no_grad():
         for attr, meta in attr_meta_map.items():

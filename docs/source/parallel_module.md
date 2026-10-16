@@ -122,12 +122,33 @@ execution during tracing or on meta tensors during SHARD capture:
 
 #### Source construction and tracing
 
-`create_init_module` defaults to CPU, but accepts an explicit `device` for internal
-callers. Its context also covers dtype conversion and is restored on return or
-failure. Explicit devices in the supplied factory are still honored.
-Automatic SHARD binds this helper with `device="cuda"` inside
-`DeferredInitialization`; capture can therefore produce meta tensors while
-replaying real tensors on CUDA.
+Device handling has two layers:
+
+- **Device-management layer:** tracing and FULL source entrypoints select CPU.
+  The generated module's SHARD initialization entrypoint selects CUDA when no
+  original instance is supplied. Its context covers automatic capture or the
+  custom hook's entire iteration and closing, including failure cleanup.
+  These contexts are restored on return or failure. `torch.device(...)` sets the
+  default factory device; it does not change CUDA's current device.
+- **Construction layer:** `create_init_module`, `create_shard_init_weights` and
+  `capture_init_weights` inherit the caller's device context. None accepts a
+  device-selection parameter or implicitly selects CPU/CUDA. The SHARD helpers
+  are generators, so the caller's context must cover iteration, not just creation.
+
+`DeferredInitialization` is a separate replay backend, not part of this
+context-inheriting construction layer. Its explicit `device` controls concrete
+fallback and materialization, independently of the surrounding default-device
+context. Before entering capture, `capture_init_weights` reads the caller's device
+once and passes it explicitly to this backend. Later default-device changes do not
+redirect replay. Automatic SHARD provides the CUDA context at its high-level
+entrypoint, including direct construction of a generated class. The backend's
+implementation and interface are unchanged.
+
+The shared `create_init_module` helper only handles construction, exact-type
+validation, dtype conversion, and scoped RNG. It has no device argument and
+inherits the calling stage's device context. Calling it directly does not
+implicitly select CPU. Explicit device arguments in user factories are still
+honored; automatic capture can produce meta tensors before CUDA materialization.
 
 Construction and tracing are separate: `trace_strategy="cpu"` runs on CPU;
 `"cuda"` places the model and execution on CUDA; `"meta"` keeps the model on CPU
@@ -198,13 +219,17 @@ Use a [shard hook](#write-a-shard-initializer) when even one full tensor is too
 large. Capture uses per-operation random streams, so its values need not match
 eager `full` initialization with the same seed.
 
-`DeferredInitialization(device="cpu")` chooses one device for both capture-time
-concrete fallback and subsequent `materialize(tensor)` calls, defaulting to CPU.
-`capture_init_weights(..., device="cuda")`, used by automatic SHARD initialization,
-defaults to the current CUDA device. Both accept `"cpu"`, `"cuda"` or an explicit
-`torch.device`; unindexed CUDA is pinned to the current device when the capture
-object is constructed. Supplied model instances are used as-is.
-Full source tensors and intermediate values therefore consume temporary GPU memory.
+`DeferredInitialization(device="cpu")` explicitly selects the device for
+capture-time concrete fallback and subsequent `materialize(tensor)` calls,
+regardless of the surrounding default-device context. This standalone utility
+defaults to CPU and accepts `"cpu"`, `"cuda"` or an explicit `torch.device`;
+unindexed CUDA is pinned to the current device when the capture object is constructed.
+`capture_init_weights` instead inherits the caller's device on its first iteration
+and passes that device to the backend. For standalone use, put iteration inside a
+CPU or CUDA context; automatic SHARD supplies CUDA. Constructor factories inherit
+that same context, while supplied model instances bypass capture and replay.
+Automatic SHARD's full source tensors and intermediate values therefore consume
+temporary GPU memory.
 CPU and CUDA random samples may differ, but fallback and materialization use the
 same device and captured random seeds.
 There is no automatic CPU fallback if CUDA replay fails.

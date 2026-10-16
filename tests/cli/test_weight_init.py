@@ -192,18 +192,16 @@ def _args(save_dir, strategy, *, checked=False, policy='tp', zero=0,
 
 def _reference(strategy, seed=1234, model_class=InitModel):
     if strategy == ParamInitStrategy.SHARD and not hasattr(model_class, '__shard__init__'):
-        with DeferredInitialization(device="cuda") as capture:
-            model = create_init_module(model_class, model_class, None, seed=seed, device='cuda')
+        with torch.device('cuda'), DeferredInitialization(device="cuda") as capture:
+            model = create_init_module(model_class, model_class, None, seed=seed)
         return {
             name: capture.materialize(value)
             for name, value in list(model.named_parameters(remove_duplicate=False))
             + list(model.named_buffers(remove_duplicate=False)) + [('constant', model.constant)]
         }
     # Custom SHARD hooks inherit CUDA as their default device.
-    model = create_init_module(
-        model_class, model_class, None, seed=seed,
-        device='cuda' if strategy == ParamInitStrategy.SHARD else 'cpu',
-    )
+    with torch.device('cuda' if strategy == ParamInitStrategy.SHARD else 'cpu'):
+        model = create_init_module(model_class, model_class, None, seed=seed)
     return {
         name: value.detach().clone()
         for name, value in list(model.named_parameters(remove_duplicate=False))

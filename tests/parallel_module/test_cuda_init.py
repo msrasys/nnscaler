@@ -5,6 +5,7 @@ import pytest
 import torch
 
 from nnscaler import ComputeConfig, ParallelModule, parallelize
+from nnscaler.runtime.initialization import DeferredInitialization
 from tests.utils import mock_cube_env, mock_dist
 
 
@@ -20,19 +21,46 @@ class ModelWithBuffer(torch.nn.Module):
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason='no gpu')
 @pytest.mark.parametrize('init_params', [False, True])
-def test_parallelize_constructs_on_cuda_without_buckets(tmp_path, init_params):
-    """Verify public and direct SHARD construction allocate on CUDA and restore non-persistent buffers."""
+def test_parallelize_constructs_on_cuda_without_buckets(tmp_path, init_params, monkeypatch):
+    """Verify source/target devices for instance, direct, and factory construction."""
     expected = torch.device('cuda', torch.cuda.current_device())
     original = ModelWithBuffer().eval()
+    construction_devices = []
+    materialize = DeferredInitialization.materialize
+
+    def materialize_on_cuda(capture, tensor):
+        value = materialize(capture, tensor)
+        assert value.device == expected
+        return value
+
+    monkeypatch.setattr(DeferredInitialization, 'materialize', materialize_on_cuda)
+
+    def factory():
+        source = ModelWithBuffer().eval()
+        construction_devices.append(source.weight.device.type)
+        return source
+
     with mock_cube_env(0, 1), mock_dist(0, 1):
-        model = parallelize(
-            original, {'x': torch.ones(4)}, 'dp',
-            ComputeConfig(1, 1, trace_strategy='cpu', param_init_strategy='shard'), gen_savedir=tmp_path,
-            init_module_params=init_params, build_module_buckets=False,
-        )
-        assert not model.training
+        with torch.device('cuda'):
+            model = parallelize(
+                original, {'x': torch.ones(4)}, 'dp',
+                ComputeConfig(1, 1, trace_strategy='cpu', param_init_strategy='shard'), gen_savedir=tmp_path,
+                instance_name='shard_instance',
+                init_module_params=init_params, build_module_buckets=False,
+            )
+            assert not model.training
+            generated = parallelize(
+                ModelWithBuffer, {'x': torch.ones(4)}, 'dp',
+                ComputeConfig(1, 1, trace_strategy='cpu', param_init_strategy='shard'), gen_savedir=tmp_path,
+                instance_name='shard_factory', module_fn=factory,
+            )
+            assert torch.empty(0).device == expected
+        assert torch.empty(0).device.type == 'cpu'
         direct_model = type(model)(init_params=init_params, build_buckets=False)
-        for instance in (model, direct_model):
+        factory_model = generated(init_params=init_params, build_buckets=False)
+        assert torch.empty(0).device.type == 'cpu'
+        assert construction_devices == ['cpu', 'meta']
+        for instance in (model, direct_model, factory_model):
             assert all(t.device == expected for t in list(instance.parameters()) + list(instance.buffers()))
             assert instance.non_presistent_buffers_inited
             if init_params:

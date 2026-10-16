@@ -1012,10 +1012,11 @@ def _gencode(
                     # it should only have 1 `self` parameter
                     if len(inspect.signature(module_or_module_class.__init__).parameters) > 1:
                         raise ValueError("Module class __init__ should be parameter-free.")
-                module = create_init_module(
-                    module_or_module_class, module_fn, module_dtype,
-                    seed=compute_config.param_init_seed,
-                )
+                with torch.device('cpu'):
+                    module = create_init_module(
+                        module_or_module_class, module_fn, module_dtype,
+                        seed=compute_config.param_init_seed,
+                    )
             except Exception as e:
                 raise RuntimeError(f"Error when creating module instance.") from e
         else:
@@ -1494,7 +1495,6 @@ def parallelize(
             parallel_module_class._init_module_fn = staticmethod(partial(
                 create_init_module, module_class, module_fn, module_dtype,
                 seed=compute_config.param_init_seed,
-                device='cuda' if compute_config.param_init_strategy == ParamInitStrategy.SHARD else 'cpu',
             ))
         if is_module_class:
             return parallel_module_class
