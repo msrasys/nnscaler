@@ -20,11 +20,9 @@ from nnscaler.graph import IRGraph
 from nnscaler.ir.operator import IRFwOperation
 from nnscaler.flags import CompileFlag
 from nnscaler.runtime.adapter.reducer import (
-    DEFAULT_ASYNC_REDUCER_BUCKET_CAP_MB,
     Bucket,
     FlattenParamInfo,
     SINGLETON_GROUP,
-    ParamBucketConfig,
     Reducer,
     ReducerParamInfo,
     accumulate_reducer_grad,
@@ -724,6 +722,7 @@ def test_scheduled_counts_override_uniform_accumulation_each_step():
             ordinary: microbatches, shared: 3 * microbatches,
         })
         assert reducer.grad_accumulation_steps == bucket.grad_accumulation_steps == 0
+        assert bucket._async_target_cnt == 4 * microbatches
         for index in range(3 * microbatches):
             loss = shared.sum() * 2
             if index < microbatches:
