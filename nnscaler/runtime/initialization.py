@@ -147,6 +147,9 @@ def capture_init_weights(
         with DeferredInitialization(device=torch.empty(0).device) as capture:
             module = module_fn()
     with torch.no_grad():
+        # Param/buffer aliasing are not allowed in ParallelModule
+        # Each attr in attr_meta_map will have its own original source tensor.
+        # so we don't need to worry about materializing shared sources multiple times.
         for attr, meta in attr_meta_map.items():
             source = get_member_by_name(module, meta.orig_name)
             if (
