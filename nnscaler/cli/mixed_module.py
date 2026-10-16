@@ -238,7 +238,8 @@ class ModuleParallelizeConfigAdapter(PrecisionMixin, PolicyMixin):
             max_workers=self.trainer_args.gen_max_workers,
         )
         if load_module:
-            pmodel = pmodel_class(init_params=init_params, build_buckets=False)
+            with torch.device('cuda'):
+                pmodel = pmodel_class(init_params=init_params, build_buckets=False)
             self.set_grad_dtype(pmodel)
             if build_buckets:
                 pmodel.build_buckets()

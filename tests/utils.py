@@ -21,6 +21,7 @@ import numpy as np
 import torch
 import torch.distributed as dist
 import torch.distributed.distributed_c10d as c10d
+from torch._C._distributed_c10d import _create_work_from_future
 from torch.utils._python_dispatch import TorchDispatchMode
 
 from nnscaler.parallel import ComputeConfig
@@ -122,7 +123,10 @@ def replace_all_device_with(device='cpu', force=False):
         return
 
     from nnscaler.graph.tracer import wrap_utils
+    from torch.utils._device import _device_constructors
 
+    # Cache real factory identities before mocking; torch.device reuses this set.
+    _device_constructors()
     orig_to = torch.Tensor.to
     orig_cuda = torch.Tensor.cuda
     orig_cpu = torch.Tensor.cpu
@@ -270,6 +274,20 @@ class MockProcessGroup(dist.ProcessGroup):
     def getBackendName(self):
         return "cube_mock_pg"
 
+    def _completed_work(self, tensors: list[torch.Tensor]) -> dist.Work:
+        # No-op collectives are correct only when there are no peer ranks.
+        if self.size() != 1:
+            raise NotImplementedError("MockProcessGroup collectives only support a single rank")
+        future = torch.futures.Future()
+        future.set_result(tensors)
+        return _create_work_from_future(future)
+
+    def barrier(self, opts=None):
+        return self._completed_work([])
+
+    def broadcast(self, tensors, opts=None):
+        return self._completed_work(tensors)
+
 
 def create_mock_pg(prefix_store, rank, world_size, timeout):
     return MockProcessGroup(rank, world_size)
@@ -343,6 +361,7 @@ def mock_dist(rank, world_size):
 def mock_cube_env(rank, world_size):
     old_device_group = nnscaler.runtime.device._instance
     old_dev_mode = CompileFlag.dev_mode
+    current_device = torch.cuda.current_device() if torch.cuda.is_available() else 0
     used_cuda_fns = ['set_device', 'current_device', 'default_stream']
     old_cuda_fns = {
         fname: getattr(torch.cuda, fname)
@@ -358,6 +377,8 @@ def mock_cube_env(rank, world_size):
         CompileFlag.dev_mode = False
         for fname, fn in old_cuda_fns.items():
             setattr(torch.cuda, fname, lambda *args, **kwargs: None)
+        # RNG preservation requires a device index, not a no-op return value.
+        torch.cuda.current_device = lambda: current_device
         os.environ['RANK'] = os.environ['LOCAL_RANK'] = str(rank)
         os.environ['WORLD_SIZE'] = os.environ['LOCAL_WORLD_SIZE'] = str(world_size)
         os.environ['GROUP_RANK'] = '0'

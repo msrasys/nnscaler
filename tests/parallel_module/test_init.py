@@ -128,6 +128,7 @@ def test_shard_init_invalid_callback(tmp_path, callback, source_instance):
 
 
 @patch('torch.cuda.is_available', lambda: False)
+@replace_all_device_with('cpu', force=True)
 @pytest.mark.parametrize('wrap', [
     lambda fn: staticmethod(lambda attrs, /: fn(attrs)),
     lambda fn: staticmethod(lambda attrs, extra=None: fn(attrs)),
@@ -199,6 +200,7 @@ def test_param_init_callback_attachment(tmp_path, strategy, module_class, source
 
 
 @patch('torch.cuda.is_available', lambda: False)
+@replace_all_device_with('cpu', force=True)
 def test_param_init_strategy_reload(tmp_path):
     graph_mtime = None
     for strategy in ('full', 'shard', 'full'):

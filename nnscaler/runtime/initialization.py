@@ -90,6 +90,7 @@ def create_init_module(
     *,
     seed: Optional[int] = None,
 ) -> torch.nn.Module:
+    """Construct a source module with scoped RNG, inheriting the caller's device context."""
     with _initialization_rng(seed):
         module = module_class() if module_fn is None else module_fn()
         if type(module) is not module_class:
@@ -105,7 +106,7 @@ def create_shard_init_weights(
     *,
     seed: int,
 ) -> Generator[tuple[str, torch.Tensor], None, None]:
-    """Yield user-provided shards with lazy execution inside the initialization RNG scope."""
+    """Run the hook and its lazy iteration with scoped RNG in the caller's device context."""
     initializer = getattr(module_class, '__shard__init__', None)
     if not callable(initializer):
         raise RuntimeError(
@@ -119,38 +120,16 @@ def create_shard_init_weights(
         yield from values
 
 
-def _get_init_source_groups(
-    module: torch.nn.Module, attr_meta_map: Dict[str, "AttrMeta"],
-) -> Dict[int, tuple[torch.Tensor, list[tuple[str, "AttrMeta"]]]]:
-    groups = {}
-    for attr, meta in attr_meta_map.items():
-        source = get_member_by_name(module, meta.orig_name)
-        if (
-            not isinstance(source, torch.Tensor)
-            or tuple(source.shape) != tuple(meta.shape)
-            or source.dtype != meta.dtype
-        ):
-            raise RuntimeError(
-                f"Invalid initialization tensor for {meta.orig_name}: "
-                f"expected shape {meta.shape} and dtype {meta.dtype}."
-            )
-        if id(source) not in groups:
-            groups[id(source)] = (source, [])
-        groups[id(source)][1].append((attr, meta))
-    return groups
-
-
 def capture_init_weights(
     attr_meta_map: Dict[str, "AttrMeta"],
     *,
     module_fn: Optional[Callable[[], torch.nn.Module]] = None,
     module: Optional[torch.nn.Module] = None,
-    device: str | torch.device = "cuda",
 ) -> Generator[tuple[str, torch.Tensor], None, None]:
     """Implement the __shard__init__ contract using captured construction.
 
     The bound factory supplies constructor arguments, dtype and initialization seed.
-    Concrete fallback and captured tensor replay use ``device`` (CUDA by default).
+    Concrete fallback and captured tensor replay use the caller's device at capture time.
     A supplied instance is used as-is. Yield local views without value-division;
     ParallelModule copies each view before advancing and applies val_chunks.
     Consumers must release each view before requesting the next source tensor.
@@ -164,13 +143,26 @@ def capture_init_weights(
                 "Independent initialization requires parallelize() with the original "
                 "module class/module_fn, or an init_module instance."
             )
-        with DeferredInitialization(device=device) as capture:
+        # Resolve before dispatch can temporarily remove the default-device context.
+        with DeferredInitialization(device=torch.empty(0).device) as capture:
             module = module_fn()
     with torch.no_grad():
-        for source, entries in _get_init_source_groups(module, attr_meta_map).values():
+        # Param/buffer aliasing are not allowed in ParallelModule
+        # Each attr in attr_meta_map will have its own original source tensor.
+        # so we don't need to worry about materializing shared sources multiple times.
+        for attr, meta in attr_meta_map.items():
+            source = get_member_by_name(module, meta.orig_name)
+            if (
+                not isinstance(source, torch.Tensor)
+                or tuple(source.shape) != tuple(meta.shape)
+                or source.dtype != meta.dtype
+            ):
+                raise RuntimeError(
+                    f"Invalid initialization tensor for {meta.orig_name}: "
+                    f"expected shape {meta.shape} and dtype {meta.dtype}."
+                )
             value = source if capture is None else capture.materialize(source)
-            for attr, meta in entries:
-                yield attr, value[meta.slicers]
+            yield attr, value[meta.slicers]
             del value
 
 

@@ -1395,7 +1395,7 @@ class ParallelModule(CubeModule):
                     capture_init_weights, module_fn=type(self)._init_module_fn, module=module,
                 )
             seen = set()
-            with torch.no_grad(), closing(initializer(dict(attrs))) as values:
+            with torch.device('cuda'), torch.no_grad(), closing(initializer(dict(attrs))) as values:
                 for item in values:
                     if not isinstance(item, (tuple, list)) or len(item) != 2:
                         raise RuntimeError("__shard__init__ must yield (attribute_name, tensor) pairs.")
@@ -1430,7 +1430,8 @@ class ParallelModule(CubeModule):
                     "Independent initialization requires parallelize() with the original "
                     "module class/module_fn, or an init_module instance."
                 )
-            module = factory()
+            with torch.device('cpu'):
+                module = factory()
 
         with torch.no_grad():
             for attr, meta in attrs.items():
