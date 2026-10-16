@@ -4,7 +4,7 @@
 import pytest
 import torch
 
-from nnscaler import ComputeConfig, parallelize
+from nnscaler import ComputeConfig, ParallelModule, parallelize
 from tests.utils import mock_cube_env, mock_dist
 
 
@@ -38,6 +38,49 @@ def test_parallelize_constructs_on_cuda_without_buckets(tmp_path, init_params):
             if init_params:
                 assert torch.equal(next(instance.parameters()).cpu(), torch.ones(4))
             assert torch.equal(next(instance.buffers()).cpu(), torch.full((4,), 2.0))
+    assert torch.empty(0).device.type == 'cpu'
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason='no gpu')
+def test_legacy_file_constructor_allocates_on_cuda(tmp_path, monkeypatch):
+    """Reuse pre-CUDA FILE code and verify parameters/buffers are on CUDA before initialization."""
+    expected = torch.device('cuda', torch.cuda.current_device())
+    register_parameter = ParallelModule.register_parameter
+    register_buffer = ParallelModule.register_buffer
+
+    def check_parameter(module, name, value):
+        assert value.device == expected
+        return register_parameter(module, name, value)
+
+    def check_buffer(module, name, value, persistent=True):
+        assert value.device == expected
+        return register_buffer(module, name, value, persistent=persistent)
+
+    monkeypatch.setattr(ParallelModule, 'register_parameter', check_parameter)
+    monkeypatch.setattr(ParallelModule, 'register_buffer', check_buffer)
+    original = ModelWithBuffer().eval()
+    config = ComputeConfig(1, 1, trace_strategy='cpu', param_init_strategy='file')
+    with mock_cube_env(0, 1), mock_dist(0, 1):
+        parallelize(
+            original, {'x': torch.ones(4)}, 'dp', config,
+            gen_savedir=tmp_path, instance_name='legacy_file', load_module=False,
+        )
+        sources = {}
+        for path in tmp_path.rglob('gencode*.py'):
+            code = path.read_text()
+            legacy_code = code.replace(", device='cuda'", "")
+            assert legacy_code != code
+            path.write_text(legacy_code)
+            sources[path] = legacy_code
+        assert sources
+        model = parallelize(
+            original, {'x': torch.ones(4)}, 'dp', config,
+            gen_savedir=tmp_path, instance_name='legacy_file', build_module_buckets=False,
+        )
+        assert model.non_presistent_buffers_inited
+        assert torch.equal(next(model.parameters()).cpu(), torch.ones(4))
+        assert torch.equal(next(model.buffers()).cpu(), torch.full((4,), 2.0))
+        assert all(path.read_text() == code for path, code in sources.items())
     assert torch.empty(0).device.type == 'cpu'
 
 

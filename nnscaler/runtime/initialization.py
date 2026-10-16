@@ -89,8 +89,10 @@ def create_init_module(
     module_dtype: Optional[torch.dtype],
     *,
     seed: Optional[int] = None,
+    device: str | torch.device = "cpu",
 ) -> torch.nn.Module:
-    with _initialization_rng(seed):
+    """Construct a source module with scoped RNG and CPU as the default device."""
+    with torch.device(device), _initialization_rng(seed):
         module = module_class() if module_fn is None else module_fn()
         if type(module) is not module_class:
             raise ValueError(f"module_fn should return a {module_class} instance.")

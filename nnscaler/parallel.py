@@ -103,9 +103,10 @@ class ParamInitStrategy:
     'file'     : load parameters from fullmodel.pt
     'full'     : initialize a full original model and copy its local parameter slices.
                  Save non-persistent buffers to npbuffer.pt for resume without reconstruction.
+                 The initialization is done on CPU to ensure consistency across devices.
     'shard'    : use the original module's `__shard__init__(attr_meta_map)` method
                  when defined, otherwise capture construction via `TorchDispatchMode`
-                 and replay required tensors on CPU to produce local slices.
+                 and replay required tensors on GPU to produce local slices.
     """
     FILE = 'file'
     FULL = 'full'
@@ -1493,6 +1494,7 @@ def parallelize(
             parallel_module_class._init_module_fn = staticmethod(partial(
                 create_init_module, module_class, module_fn, module_dtype,
                 seed=compute_config.param_init_seed,
+                device='cuda' if compute_config.param_init_strategy == ParamInitStrategy.SHARD else 'cpu',
             ))
         if is_module_class:
             return parallel_module_class
@@ -1503,7 +1505,8 @@ def parallelize(
             )
             if compute_config.param_init_strategy != ParamInitStrategy.FILE and module_dtype is not None:
                 module_or_module_class.to(dtype=module_dtype)
-            parallel_module = parallel_module_class(init_module_params, build_module_buckets, **init_kwargs)
+            with torch.device('cuda'):
+                parallel_module = parallel_module_class(init_module_params, build_module_buckets, **init_kwargs)
             parallel_module.train(module_or_module_class.training)  # set training state to the same as original module
             return parallel_module
 

@@ -1,7 +1,6 @@
 #  Copyright (c) Microsoft Corporation.
 #  Licensed under the MIT License.
 
-from contextlib import nullcontext
 from pathlib import Path
 import math
 import os
@@ -194,15 +193,17 @@ def _args(save_dir, strategy, *, checked=False, policy='tp', zero=0,
 def _reference(strategy, seed=1234, model_class=InitModel):
     if strategy == ParamInitStrategy.SHARD and not hasattr(model_class, '__shard__init__'):
         with DeferredInitialization(device="cuda") as capture:
-            model = create_init_module(model_class, model_class, None, seed=seed)
+            model = create_init_module(model_class, model_class, None, seed=seed, device='cuda')
         return {
             name: capture.materialize(value)
             for name, value in list(model.named_parameters(remove_duplicate=False))
             + list(model.named_buffers(remove_duplicate=False)) + [('constant', model.constant)]
         }
     # Custom SHARD hooks inherit CUDA as their default device.
-    with torch.device('cuda') if strategy == ParamInitStrategy.SHARD else nullcontext():
-        model = create_init_module(model_class, model_class, None, seed=seed)
+    model = create_init_module(
+        model_class, model_class, None, seed=seed,
+        device='cuda' if strategy == ParamInitStrategy.SHARD else 'cpu',
+    )
     return {
         name: value.detach().clone()
         for name, value in list(model.named_parameters(remove_duplicate=False))

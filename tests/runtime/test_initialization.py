@@ -43,21 +43,24 @@ def test_seeded_initialization_restores_rng(device):
         pytest.skip('requires CUDA')
     before = _rng_state()
     first = create_init_module(
-        RandomInitModule, lambda: RandomInitModule(device), torch.float64, seed=17,
+        RandomInitModule, lambda: RandomInitModule(device), torch.float64, seed=17, device=device,
     )
+    assert first.weight.device.type == device
     assert_equal(before, _rng_state())
     random.random()
     np.random.rand(13)
     torch.rand(19)
     torch.rand(23, device=device)
     before = _rng_state()
-    second = create_init_module(
-        RandomInitModule, lambda: RandomInitModule(device), torch.float64, seed=17,
-    )
+    with torch.device('meta'):
+        second = create_init_module(
+            RandomInitModule, lambda: RandomInitModule(device), torch.float64, seed=17, device=device,
+        )
+        assert torch.empty(0).is_meta
     assert_equal(before, _rng_state())
     assert_equal(first.state_dict(), second.state_dict())
     assert all(t.dtype == torch.float64 for t in first.state_dict().values())
-    third = create_init_module(RandomInitModule, None, torch.float64, seed=18)
+    third = create_init_module(RandomInitModule, None, torch.float64, seed=18, device=device)
     assert not torch.equal(first.weight, third.weight)
 
     def failing_factory():
@@ -66,7 +69,7 @@ def test_seeded_initialization_restores_rng(device):
 
     before = _rng_state()
     with pytest.raises(RuntimeError, match='initialization failed'):
-        create_init_module(RandomInitModule, failing_factory, None, seed=19)
+        create_init_module(RandomInitModule, failing_factory, None, seed=19, device=device)
     assert_equal(before, _rng_state())
 
 
@@ -74,7 +77,10 @@ def test_unseeded_initialization_preserves_existing_behavior():
     cpu_state = torch.get_rng_state()
     numpy_state = np.random.get_state()
     python_state = random.getstate()
-    create_init_module(RandomInitModule, None, None)
+    with torch.device('meta'):
+        module = create_init_module(RandomInitModule, None, None)
+        assert all(value.device.type == 'cpu' for value in module.state_dict().values())
+        assert torch.empty(0).is_meta
     assert not torch.equal(cpu_state, torch.get_rng_state())
     assert numpy_state[2] != np.random.get_state()[2]
     assert python_state != random.getstate()
