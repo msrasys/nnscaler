@@ -10,7 +10,8 @@ import torch
 from torch import nn
 
 from nnscaler.parallel import ComputeConfig, parallelize, build_optimizer, \
-    merge_state_dicts, load_merged_state_dict, \
+    merge_state_dicts, prepare_state_dict_merge, merge_model_state_dicts, \
+    merge_optimizer_state_dicts, load_merged_state_dict, \
     deduped_state_dict, load_deduped_state_dict
 from nnscaler.runtime.module import ParallelModule
 
@@ -166,6 +167,13 @@ def _check_deduped(model: torch.nn.Module, ckpt_dir):
 
     assert_equal(merged_model_state_dicts, merged_model_state_dicts_dedup)
     assert_equal(merged_optimizer_state_dict, merged_optimizer_state_dict_dedup)
+    merge_plan = prepare_state_dict_merge(
+        dedupped_model_state_dicts, dedupped_optimizer_state_dicts,
+    )
+    assert_equal(merge_model_state_dicts(merge_plan), merged_model_state_dicts)
+    assert_equal(
+        merge_optimizer_state_dicts(merge_plan), merged_optimizer_state_dict,
+    )
 
     # check deduped state dicts can be loaded to the model
     # which should output the same state dict as the original model

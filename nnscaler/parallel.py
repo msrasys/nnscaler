@@ -2641,6 +2641,239 @@ def merge_state_dicts(
     return ret_state_dict, ret_opt_state_dict
 
 
+@dataclass
+class StateDictMergePlan:
+    module_state_dicts: List[Dict[str, Any]]
+    pm_extra_states: Dict[Tuple[str, ...], List[ExtraState]]
+    pm_state_dicts: Dict[Tuple[str, ...], List[Dict[str, Any]]]
+    non_pm_state_dict: Dict[str, Any]
+    optimizer_state_dicts: Optional[List[Dict[str, Any]]] = None
+    opt_extra_states: Optional[List[OptimizerExtraState]] = None
+    opt_state_dicts: Optional[Dict[str, List[Dict[str, Any]]]] = None
+    optimizer_template: Optional[Dict[str, Any]] = None
+
+
+def _state_dict_rank(state_dict: Dict[str, Any]) -> int:
+    for key in state_dict:
+        if key.split('.')[-1] == ParallelModule.EXTRA_STATE_KEY:
+            return state_dict[key]['rank']
+    raise ValueError("Invalid state dict: no rank found.")
+
+
+def _rank_ordered_state_dicts(
+    state_dicts: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    ordered = [None] * len(state_dicts)
+    for state_dict in state_dicts:
+        rank = _state_dict_rank(state_dict)
+        if rank >= len(state_dicts):
+            raise ValueError(
+                f"Invalid rank {rank} in state_dicts with length {len(state_dicts)}."
+            )
+        if ordered[rank] is not None:
+            raise ValueError(f"Duplicate rank {rank} in state_dicts.")
+        ordered[rank] = state_dict
+    return ordered
+
+
+def prepare_state_dict_merge(
+    module_state_dicts: List[Dict[str, Any]],
+    optimizer_state_dicts: Optional[List[Dict[str, Any]]] = None,
+) -> StateDictMergePlan:
+    """Parse rank state and mappings once for phased model/optimizer merging."""
+    if not module_state_dicts:
+        raise ValueError("model_state_dicts should not be empty.")
+    module_state_dicts = _rank_ordered_state_dicts(module_state_dicts)
+    pm_extra_states, pm_state_dicts, non_pm_state_dict = \
+        _get_parallel_module_state_dict_info(module_state_dicts)
+    if optimizer_state_dicts is None:
+        return StateDictMergePlan(
+            module_state_dicts, pm_extra_states, pm_state_dicts, non_pm_state_dict,
+        )
+    optimizer_state_dicts = _rank_ordered_state_dicts(optimizer_state_dicts)
+    opt_extra_states, opt_state_dicts, optimizer_template = \
+        _get_optimizer_state_dict_info(optimizer_state_dicts)
+    return StateDictMergePlan(
+        module_state_dicts, pm_extra_states, pm_state_dicts, non_pm_state_dict,
+        optimizer_state_dicts, opt_extra_states, opt_state_dicts, optimizer_template,
+    )
+
+
+@torch.no_grad()
+def merge_model_state_dicts(plan: StateDictMergePlan) -> Dict[str, Any]:
+    """Merge only model state from a prepared plan."""
+    ret_state_dict = dict(plan.non_pm_state_dict)
+    for module_key, state_dicts_for_merge in plan.pm_state_dicts.items():
+        extra_states = plan.pm_extra_states[module_key]
+        module_prefix = '.'.join(module_key)
+        zero_idx_maps = [
+            (e.model_idx2opt_idx, e.opt_idx2ranks, e.zero, e.zero3_param_metadata)
+            for e in extra_states
+        ]
+        if not extra_states[0].compute_config.use_zero:
+            zero_idx_maps = None
+        merged_state_dict = ParallelModule.merge_model_state_dicts(
+            state_dicts_for_merge,
+            [e.param_area_map for e in extra_states[:len(state_dicts_for_merge)]],
+            zero_idx_maps,
+        )
+        shared_param_names = extra_states[0].origin_shared_param_names
+        for name in extra_states[0].origin_state_dict_names:
+            key = name if not module_prefix else f'{module_prefix}.{name}'
+            if name in merged_state_dict:
+                ret_state_dict[key] = merged_state_dict[name]
+                continue
+            name_in_merged = _get_valid_name_from_merged_model(
+                name, shared_param_names, merged_state_dict,
+            )
+            if name_in_merged is not None:
+                ret_state_dict[key] = merged_state_dict[name_in_merged]
+                key_in_merged = (
+                    name_in_merged if not module_prefix
+                    else f'{module_prefix}.{name_in_merged}'
+                )
+                logger.warning(
+                    f"Missing param/buffer {key} in merged_model_state_dict, "
+                    f"safely using its shared param/buffer {key_in_merged} as {key}."
+                )
+            else:
+                logger.warning(
+                    f"Missing param/buffer {key} in merged_model_state_dict, "
+                    f"high likely because {key} is created but not used in your model."
+                )
+    return ret_state_dict
+
+
+@torch.no_grad()
+def merge_optimizer_state_dicts(plan: StateDictMergePlan) -> Dict[str, Any]:
+    """Merge only optimizer state from a prepared plan."""
+    if plan.optimizer_state_dicts is None:
+        raise ValueError("The merge plan does not contain optimizer state dicts.")
+    ret_opt_state_dict = copy.deepcopy(plan.optimizer_template)
+    opt_new_pm_states: Dict[
+        ModuleParameterLocation, Tuple[Dict[int, Any], str, List[str]]
+    ] = {}
+    for module_key, extra_states in plan.pm_extra_states.items():
+        module_prefix = '.'.join(module_key)
+        zero_idx_maps = [
+            (e.model_idx2opt_idx, e.opt_idx2ranks, e.zero, e.zero3_param_metadata)
+            for e in extra_states
+        ]
+        if not extra_states[0].compute_config.use_zero:
+            zero_idx_maps = None
+        merged_opt_state_dict = ParallelModule.merge_opt_state_dicts(
+            [e.param_area_map for e in extra_states],
+            plan.opt_state_dicts[module_prefix],
+            zero_idx_maps,
+        )
+        opt_module_locs = [
+            plan.opt_extra_states[index].parallel_module_locs[module_prefix]
+            for index in range(len(plan.opt_extra_states))
+        ]
+        opt_new_pm_states[opt_module_locs[0]] = (
+            merged_opt_state_dict['state'],
+            module_prefix,
+            extra_states[0].origin_param_names,
+        )
+
+    pm_orig_param_names = {
+        '.'.join(module_key): ParallelModule.get_origin_parameter_names(
+            [e.param_area_map for e in extra_states]
+        )
+        for module_key, extra_states in plan.pm_extra_states.items()
+    }
+    if _NON_PARALLEL_MODULE_ATTR_NAME in plan.opt_state_dicts:
+        assert _NON_PARALLEL_MODULE_ATTR_NAME in \
+            plan.opt_extra_states[0].parallel_module_locs
+        npp_merged_opt_state_dict = ParallelModule.merge_opt_state_dicts(
+            [e.non_parallel_extra_state.param_area_map for e in plan.opt_extra_states],
+            plan.opt_state_dicts[_NON_PARALLEL_MODULE_ATTR_NAME],
+            [
+                (
+                    e.non_parallel_extra_state.model_idx2opt_idx,
+                    e.non_parallel_extra_state.opt_idx2ranks,
+                    e.non_parallel_extra_state.zero,
+                    e.non_parallel_extra_state.zero3_param_metadata,
+                )
+                for e in plan.opt_extra_states
+            ],
+        )
+        opt_new_pm_states[
+            plan.opt_extra_states[0].parallel_module_locs[
+                _NON_PARALLEL_MODULE_ATTR_NAME
+            ]
+        ] = (
+            npp_merged_opt_state_dict['state'],
+            _NON_PARALLEL_MODULE_ATTR_NAME,
+            plan.opt_extra_states[0].non_parallel_extra_state.origin_param_names,
+        )
+        pm_orig_param_names[_NON_PARALLEL_MODULE_ATTR_NAME] = \
+            ParallelModule.get_origin_parameter_names([
+                e.non_parallel_extra_state.param_area_map
+                for e in plan.opt_extra_states
+            ])
+
+    orig_states = plan.optimizer_state_dicts[0]['state']
+    ret_states = {}
+    sorted_pm_locs = sorted(opt_new_pm_states, key=lambda location: location.offset)
+    assert len(plan.optimizer_state_dicts[0]['param_groups']) == 1
+    orig_effective_state_len = len(
+        plan.optimizer_state_dicts[0]['param_groups'][0]['params']
+    )
+    orig_cur_index = 0
+    ret_states_cur_index = 0
+    sorted_pm_locs_cur_index = 0
+    while orig_cur_index < orig_effective_state_len:
+        if (
+            sorted_pm_locs_cur_index >= len(sorted_pm_locs)
+            or orig_cur_index < sorted_pm_locs[sorted_pm_locs_cur_index].offset
+        ):
+            if orig_cur_index in orig_states:
+                ret_states[ret_states_cur_index] = orig_states[orig_cur_index]
+            orig_cur_index += 1
+            ret_states_cur_index += 1
+            continue
+        pm_loc = sorted_pm_locs[sorted_pm_locs_cur_index]
+        state, module_prefix, original_param_names = opt_new_pm_states[pm_loc]
+        named_state = {
+            pm_orig_param_names[module_prefix][index]: value
+            for index, value in state.items()
+        }
+        for index, name in enumerate(original_param_names):
+            if name in named_state:
+                ret_states[ret_states_cur_index + index] = named_state[name]
+        ret_states_cur_index += len(original_param_names)
+        orig_cur_index += pm_loc.count
+        sorted_pm_locs_cur_index += 1
+
+    if _NON_PARALLEL_MODULE_ATTR_NAME in plan.opt_state_dicts:
+        npp_locs = plan.opt_extra_states[0].non_parallel_param_locs
+        assert all(
+            extra.non_parallel_param_locs == npp_locs
+            for extra in plan.opt_extra_states
+        ), "All ranks should have the same non_parallel_param_locs in optimizer extra state."
+        num_npp = len(npp_locs)
+        npp_start = ret_states_cur_index - num_npp
+        npp_states = {
+            location - npp_start: ret_states.pop(location)
+            for location in range(npp_start, ret_states_cur_index)
+        }
+        reordered_states = {}
+        npp_inserted = 0
+        for index in range(ret_states_cur_index):
+            if npp_inserted < len(npp_locs) and index == npp_locs[npp_inserted]:
+                reordered_states[index] = npp_states[npp_inserted]
+                npp_inserted += 1
+            elif index - npp_inserted in ret_states:
+                reordered_states[index] = ret_states[index - npp_inserted]
+        ret_states = reordered_states
+
+    ret_opt_state_dict['state'] = ret_states
+    ret_opt_state_dict['param_groups'][0]['params'] = \
+        list(range(ret_states_cur_index))
+    return ret_opt_state_dict
+
+
 @torch.no_grad()
 def load_merged_state_dict(
     module: torch.nn.Module,

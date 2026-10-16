@@ -271,7 +271,7 @@ class Trainer:
         self.hook.after_setup(self)
 
     @classmethod
-    def _merge_checkpoint(cls, checkpoint_files: List[str],
+    def _load_checkpoint_merge_states(cls, checkpoint_files: List[str],
         *,
         model_only: bool = False,
         checkpointer: Optional[Checkpointer] = None,
@@ -294,13 +294,10 @@ class Trainer:
                 raise ValueError(f"model config in {checkpoint_files[i]} is different from {checkpoint_files[0]}")
             if state_dicts[i].get('lr_scheduler', None) != state_dicts[0].get('lr_scheduler', None):
                 raise ValueError(f"lr_scheduler state in {checkpoint_files[i]} is different from {checkpoint_files[0]}")
+        return state_dicts
 
-        module_state_dict, opt_state_dict = nnscaler.merge_state_dicts(
-            [s['model'] for s in state_dicts],
-            [s['optimizer'] for s in state_dicts] if not model_only else None,
-        )
-        if model_only:
-            return {'model': module_state_dict}
+    @classmethod
+    def _build_merged_checkpoint_metadata(cls, state_dicts: List[Dict[str, Any]]):
         train_args = copy.deepcopy(state_dicts[0]['train_args'])
         train_args['checkpoint']['save_type'] = 'merged'
 
@@ -311,24 +308,45 @@ class Trainer:
         # for extra keys (including `dataloader` and `rng_states`), we will not merge them.
         # Intead we will collect them from all state_dicts
         extra_keys: Dict[str, list] = {}
-        for s in state_dicts:
-            extra_keys.update({k: [] for k in s.keys() if k not in global_keys})
+        for state_dict in state_dicts:
+            extra_keys.update({
+                key: [] for key in state_dict if key not in global_keys
+            })
         if extra_keys:
             sorted_state_dicts = sorted(state_dicts, key=lambda x: x['rank'])
-            for s in sorted_state_dicts:
-                for k in extra_keys:
-                    extra_keys[k].append(s.get(k, None))
+            for state_dict in sorted_state_dicts:
+                for key in extra_keys:
+                    extra_keys[key].append(state_dict.get(key, None))
 
-        merged_state_dict = {
-            'model': module_state_dict,
-            'optimizer': opt_state_dict,
+        return {
             'lr_scheduler': state_dicts[0].get('lr_scheduler', None),
             'train_status': state_dicts[0]['train_status'],
             'train_args': train_args,
             'nnscaler': state_dicts[0]['nnscaler'],
             **extra_keys,
         }
-        return merged_state_dict
+
+    @classmethod
+    def _merge_checkpoint(cls, checkpoint_files: List[str],
+        *,
+        model_only: bool = False,
+        checkpointer: Optional[Checkpointer] = None,
+    ):
+        state_dicts = cls._load_checkpoint_merge_states(
+            checkpoint_files, model_only=model_only, checkpointer=checkpointer,
+        )
+
+        module_state_dict, opt_state_dict = nnscaler.merge_state_dicts(
+            [s['model'] for s in state_dicts],
+            [s['optimizer'] for s in state_dicts] if not model_only else None,
+        )
+        if model_only:
+            return {'model': module_state_dict}
+        return {
+            'model': module_state_dict,
+            'optimizer': opt_state_dict,
+            **cls._build_merged_checkpoint_metadata(state_dicts),
+        }
 
     def _broadcast_merged_state_dict(
         self,
