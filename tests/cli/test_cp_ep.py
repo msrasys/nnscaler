@@ -179,9 +179,9 @@ def _fake_routed_expert(
     context_replicas: int,
     context_parallel_size: int,
 ) -> torch.Tensor:
-    # Preserve shape and requires_grad during tracing. The real dispatch and
-    # expert computation are emitted through routed_expert below.
-    return x.clone()
+    # Dataloader inputs need no gradient, but expert weights do. Preserve that
+    # dependency so tracing emits the expert backward and its reducer.
+    return x.clone() + expert_weight.sum() * 0
 
 
 _EP_DISPATCH_COMBINE_RULE = TransformRule(
@@ -219,7 +219,7 @@ def routed_expert(
     computes those experts, and sends the results back to the source ranks.
 
     For the test configuration ``EP=2`` and ``local_experts=2``, an input with
-    sequence length 32 is viewed as four blocks of 8 tokens::
+    sequence length 32 is routed round-robin into four blocks of 8 tokens::
 
         source rank's tokens: [rank0/expert0, rank0/expert1,
                                rank1/expert0, rank1/expert1]
@@ -261,11 +261,13 @@ def routed_expert(
         )
     tokens_per_expert = local_sequence // num_routing_blocks
 
-    # Arrange the sequence as [destination EP rank, local expert, tokens].
+    # Route by token position modulo the expert count, then arrange tokens as
+    # [destination EP rank, local expert, tokens]. CP shard offsets are divisible
+    # by the expert count, so changing the CP size preserves expert assignment.
     # all-to-all splits dimension 1 into one equally sized message per peer.
     #
     # Example: EP=2, local_experts=2, local_sequence=32, so each block has
-    # tokens_per_expert=8. On every source rank, the 32 tokens are interpreted as:
+    # tokens_per_expert=8. On every source rank, the 32 tokens are permuted into:
     #
     #   [dst rank 0 / expert 0 / 8 tokens,
     #    dst rank 0 / expert 1 / 8 tokens,
@@ -282,16 +284,16 @@ def routed_expert(
     #
     # and rank 1 receives the corresponding blocks for experts 2 and 3.
     #
-    # A real MoE would first permute tokens according to router decisions. This
-    # toy example omits that permutation and treats each consecutive 8-token
-    # block as if the router had already assigned it to the indicated expert.
+    # A real MoE uses learned router decisions instead of this fixed round-robin
+    # permutation. Assigning contiguous blocks of the original local sequence
+    # would change a token's expert when CP changes the local sequence length.
     dispatch_input = x.reshape(
         batch,
+        tokens_per_expert,
         expert_parallel_size,
         local_experts,
-        tokens_per_expert,
         hidden,
-    ).reshape(batch, local_sequence, hidden)
+    ).permute(0, 2, 3, 1, 4).reshape(batch, local_sequence, hidden)
     dispatched = alltoall_alltoall(
         dispatch_input,
         idim=1,
@@ -357,8 +359,8 @@ def routed_expert(
     #   [experts 0,1 output from owner rank 0,
     #    experts 2,3 output from owner rank 1]
     #
-    # This matches its pre-dispatch block order, so combined has the same shape
-    # and token order as x.
+    # This matches its pre-dispatch block order. Undo the routing permutation
+    # after combine to restore the original token order.
     combine_input = expert_outputs.reshape(
         batch,
         local_experts,
@@ -372,7 +374,9 @@ def routed_expert(
         odim=1,
         ranks=expert_parallel_ranks,
     )
-    return combined
+    return combined.reshape(
+        batch, expert_parallel_size, local_experts, tokens_per_expert, hidden,
+    ).permute(0, 3, 1, 2, 4).reshape(batch, local_sequence, hidden)
 
 
 class ContextExpertBlock(torch.nn.Module):
@@ -684,6 +688,7 @@ def test_cp4_ep2_runtime8_static(tmp_path):
     def capture_policy(graph, cfg):
         graph = fn(graph, cfg, cp_ep_policy)
         routed_nodes = graph.select(name='routed_expert')
+        assert all(node.input(1).grad is not None for node in routed_nodes)
         local_routed_shapes.extend(
             (node.device[0], node.input(0).shape, node.input(1).shape)
             for node in routed_nodes
@@ -719,7 +724,7 @@ def test_cp4_ep2_runtime8_static(tmp_path):
             r'[\s\S]*?tests\.cli\.test_cp_ep\.routed_expert\('
             r'[\s\S]*?torch\.add\('
         ) * trainer_args.model.args['num_layers']
-        + r'[\s\S]*?nnscaler\.runtime\.adapter\.all_gather\('
+        + r'[\s\S]*?nnscaler\.runtime\.adapter\.nn\.allgather_split\('
     )
     for rank in range(compute_config.runtime_ngpus):
         module_class = _load_parallel_module_class(
@@ -758,7 +763,7 @@ def test_cp4_ep2_runtime8_static(tmp_path):
             tmp_path,
             ContextExpertModel,
             rank,
-            r'nnscaler\.runtime\.adapter\.all_gather\(',
+            r'nnscaler\.runtime\.adapter\.nn\.allgather_split\(',
             instance_name=instance_name,
         )) == 1
         assert len(_gencode_contains(
@@ -830,6 +835,9 @@ def test_cp4_ep2_runtime8(tmp_path):
 
     baseline = torch.load(tmp_path / 'baseline.pt', weights_only=False)
     context_parallel = torch.load(tmp_path / 'cp.pt', weights_only=False)
+    # Equal checkpoints alone also pass when neither run trains its experts.
+    assert baseline['optimizer']['state']
+    assert all(state['exp_avg'].count_nonzero() > 0 for state in baseline['optimizer']['state'].values())
     assert_close(baseline['model'], context_parallel['model'], atol=1e-6, rtol=1e-6)
     assert_close(baseline['optimizer'], context_parallel['optimizer'], atol=1e-6, rtol=1e-6)
 
@@ -862,5 +870,8 @@ def test_cp_across_scale_units_with_ep(tmp_path):
 
     baseline = torch.load(tmp_path / 'baseline.pt', weights_only=False)
     context_parallel = torch.load(tmp_path / 'cp.pt', weights_only=False)
+    # Equal checkpoints alone also pass when neither run trains its experts.
+    assert baseline['optimizer']['state']
+    assert all(state['exp_avg'].count_nonzero() > 0 for state in baseline['optimizer']['state'].values())
     assert_close(baseline['model'], context_parallel['model'], atol=1e-6, rtol=1e-6)
     assert_close(baseline['optimizer'], context_parallel['optimizer'], atol=1e-6, rtol=1e-6)

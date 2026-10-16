@@ -5,8 +5,9 @@ import torch
 
 from nnscaler.cli.trainer import Trainer
 
+from tests.cli.common import MLP
 from tests.launch_torchrun import launch_torchrun
-from tests.parallel_module.common import assert_equal
+from tests.parallel_module.common import assert_close, assert_equal
 
 
 def trainer_worker_pipeline(save_dir, config_file, run_name=None, additional_args=None):
@@ -188,6 +189,91 @@ def test_trainer_pipeline_async(tmp_path):
     assert_equal(merged_state_dicts[0]['optimizer'], merged_state_dicts[2]['optimizer'])
 
 
+class ColocatedSharedMLP(MLP):
+    def forward(self, data):
+        x = data['data']
+        for layer in (0, 0, 1, 0, 1):
+            x = self.layers[layer](x)
+        return self.loss_fn(torch.sigmoid(x), data['target'])
+
+
+def colocated_shared_pipeline_pas(graph, cfg):
+    from nnscaler.policies import OpPlan, OpPartition, get_pas_ops
+
+    # With 4 ranks and pipeline_size=2, each physical pipeline group has 2 ranks:
+    # segment 0: layer 0 twice, on ranks (0, 1)
+    # segment 1: layer 1 once,  on ranks (2, 3)
+    # segment 2: layer 0 once,  on ranks (0, 1)
+    # segment 3: layer 1 once,  on ranks (2, 3), followed by the loss.
+    # Each weight produces 2 gradient hooks per microbatch, not its total use count.
+    linear_stages = iter((0, 0, 1, 2, 3))
+    stage = 0
+    for node in get_pas_ops(graph):
+        if node.fn == torch.nn.functional.linear:
+            stage = next(linear_stages)
+            partition = OpPartition(0, 0)
+        else:
+            partition = 'auto'
+        yield OpPlan(node, stage_id=stage, partition=partition)
+
+
+def trainer_worker_colocated_shared_pipeline(save_dir, run_name, async_reducer, use_fbw):
+    save_dir = Path(save_dir)
+    ckpt_savedir = save_dir / run_name / 'ckpt'
+    trainer = Trainer([
+        '-f', Path(__file__).with_name('trainer_args_pipeline.yaml').resolve(),
+        '--model.type', 'tests.cli.test_trainer_pipeline.ColocatedSharedMLP',
+        '--model.args.nlayers', '2',
+        '--pas_policy', 'tests.cli.test_trainer_pipeline.colocated_shared_pipeline_pas',
+        '--compute_config.plan_ngpus', '4',
+        '--compute_config.pas_config.pipeline_size', '2',
+        '--compute_config.pas_config.pipeline_scheduler', '1f1b_interleaved',
+        '--compute_config.use_async_reducer', str(async_reducer),
+        '--compute_config.use_fbw', str(use_fbw),
+        '--global_batch_size', '8',
+        '--max_train_steps', '3',
+        '--enable_progress_bar', 'False',
+        '--instance_name', f'instance_{run_name}',
+        '--gen_savedir', str(save_dir / run_name / 'gen'),
+        '--checkpoint.save_dir', str(ckpt_savedir),
+    ])
+    trainer.run()
+    assert trainer.train_status.finished_train_steps == 3
+    assert trainer.model.use_scheduler
+    assert trainer.model.nmicros_per_scheduler_step == 4
+    expected_name = f'layers.{trainer.rank // 2}.weight'
+    assert {meta.orig_name for meta in trainer.model.fullmap.values()} == {expected_name}
+    assert len(trainer.model.reducers) == 1
+    reducer = trainer.model.reducers[0]
+    assert set(reducer._param_num_segments.values()) == {2}
+    assert reducer.buckets
+    for bucket in reducer.buckets:
+        assert bucket._async == async_reducer
+        assert bucket._num_grads_per_microbatch == 2
+
+    if trainer.rank == 0:
+        checkpoints = list((ckpt_savedir / 'last').glob('*.ckpt'))
+        assert len(checkpoints) == 4
+        Trainer.merge_checkpoint(checkpoints, save_dir / f'merged_{run_name}.pt')
+    torch.distributed.barrier()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.device_count() < 4, reason='lack of gpu devices')
+def test_trainer_pipeline_colocated_shared_params_async(tmp_path):
+    runs = [('sync', False, False), ('async', True, False), ('async_fbw', True, True)]
+    for run_name, async_reducer, use_fbw in runs:
+        launch_torchrun(
+            4, trainer_worker_colocated_shared_pipeline,
+            tmp_path, run_name, async_reducer, use_fbw,
+        )
+
+    baseline = torch.load(tmp_path / 'merged_sync.pt', weights_only=False)
+    for run_name in ('async', 'async_fbw'):
+        actual = torch.load(tmp_path / f'merged_{run_name}.pt', weights_only=False)
+        assert_close(baseline['model'], actual['model'])
+        assert_close(baseline['optimizer'], actual['optimizer'])
+
+
 def trainer_worker_multi_sched(save_dir, config_file):
     save_dir = Path(save_dir)
     config_path = Path(__file__).with_name(config_file).resolve()
@@ -250,4 +336,3 @@ def trainer_worker_multi_sched(save_dir, config_file):
 @pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.device_count() < 4, reason='lack of gpu devices')
 def test_trainer_pipeline_multi_sched(tmp_path):
     launch_torchrun(4, trainer_worker_multi_sched, tmp_path, 'trainer_args_pipeline_multi_sched.yaml')
-
