@@ -1,10 +1,12 @@
 import torch
 import torch.nn.functional as F
+import pytest
+from unittest.mock import patch
 
 
 import nnscaler
-from nnscaler.parallel import parallelize, ComputeConfig
-from tests.utils import replace_all_device_with
+from nnscaler.parallel import parallelize, ComputeConfig, _load_parallel_module_class
+from tests.utils import replace_all_device_with, new_empty
 
 from .test_gencode import _gencode_contains, print_gencode
 
@@ -17,6 +19,33 @@ class NormalLinearModule(torch.nn.Module):
     def forward(self, x):
         # weight = self.weight / self.weight.norm(dim=1, keepdim=True).clamp_min(1e-6)
         return F.linear(x, self.weight)
+
+
+@replace_all_device_with('cpu')
+# Each case specifies the ZeRO stage and number of subgroups.
+@pytest.mark.parametrize('zero,zero_ngroups', [(0, 1), (1, 1), (1, 2), (1, 4), (3, 1), (3, 2), (3, 4)])
+def test_codegen_no_single_rank_groups(tmp_path, zero, zero_ngroups):
+    parallelize(
+        NormalLinearModule(),
+        {'x': torch.randn(2, 4)},
+        'dp',
+        ComputeConfig(1, 4, use_zero=zero, zero_ngroups=zero_ngroups, trace_strategy='cpu'),
+        gen_savedir=tmp_path,
+        load_module=False,
+    )
+    for rank in range(4):
+        assert not _gencode_contains(
+            tmp_path, NormalLinearModule, rank, r'self\.init_group\(ranks=\[rank\]\)',
+        )
+        assert not _gencode_contains(
+            tmp_path, NormalLinearModule, rank, r'self\.init_group\(ranks=\[\d+\]\)',
+        )
+        assert _gencode_contains(
+            tmp_path, NormalLinearModule, rank, r'self\.init_group\(ranks=\[0, 1, 2, 3\]\)',
+        )
+        assert bool(_gencode_contains(
+            tmp_path, NormalLinearModule, rank, r'self\.prefetch_param\(',
+        )) == (zero == 3)
 
 
 def normal_linear_split_policy(graph, cfg):
@@ -122,6 +151,50 @@ class MixedLinearModule(torch.nn.Module):
     def forward(self, x):
         weight = self.weight1 / self.weight1.norm(dim=1, keepdim=True).clamp_min(1e-6)
         return F.linear(x, weight) + F.linear(x, self.weight2)
+
+
+@replace_all_device_with('cpu')
+def test_zero3_mixed_subgroup_sizes(tmp_path):
+    from nnscaler.policies import get_pas_ops, OpPlan, OpPartition
+
+    def policy(graph, cfg):
+        linears = [node for node in get_pas_ops(graph) if node.name == 'linear']
+        yield OpPlan(linears[0], partition=OpPartition(input=0, dim=0))
+        yield OpPlan(linears[1], partition=OpPartition(input=1, dim=0))
+
+    parallelize(
+        MixedLinearModule(),
+        {'x': torch.randn(2, 4)},
+        policy,
+        ComputeConfig(
+            2, 4, use_zero=3, zero_ngroups=2,
+            reducer_replicated_params=True, trace_strategy='cpu',
+        ),
+        gen_savedir=tmp_path,
+        load_module=False,
+    )
+    for rank in range(4):
+        assert _gencode_contains(
+            tmp_path, MixedLinearModule, rank, r'self\.prefetch_param\(self\.weight1_\d+\)',
+        )
+        assert _gencode_contains(
+            tmp_path, MixedLinearModule, rank, r'self\.prefetch_param\(self\.weight2_\d+\)',
+        )
+        module_class = _load_parallel_module_class(MixedLinearModule, gen_savedir=tmp_path, rank=rank)
+        model = new_empty(module_class, device='cpu')
+        assert {reducer.zero3 for reducer in model.reducers} == {False, True}
+        for reducer in model.reducers:
+            for param in reducer.params:
+                with patch.object(reducer, 'prefetch_param') as prefetch, patch.object(reducer, 'postevict_param') as evict:
+                    model.prefetch_param(param)
+                    assert (param in model._forward_prefetched_params) == reducer.zero3
+                    model.postevict_param(param)
+                    assert param not in model._forward_prefetched_params
+                    assert prefetch.call_count == int(reducer.zero3)
+                    assert evict.call_count == int(reducer.zero3)
+                    activation = torch.randn(2, 8, requires_grad=True, device='cpu')
+                    assert (model.backward_prefetch_param(activation, param, 0) is activation) != reducer.zero3
+                    assert (model.backward_postevict_param(activation, param, 0) is activation) != reducer.zero3
 
 
 @replace_all_device_with('cpu')
