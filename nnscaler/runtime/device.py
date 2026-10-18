@@ -13,6 +13,7 @@ import datetime
 
 from nnscaler.flags import CompileFlag
 from nnscaler.utils import is_running_distributed
+from nnscaler.runtime.topology import init_process_group
 
 _logger = logging.getLogger(__name__)
 _LARGE_TIMEOUT = datetime.timedelta(seconds=21600)
@@ -30,9 +31,9 @@ class _DeviceGroup:
         else:
             if not torch.distributed.is_initialized():
                 if torch.__version__ >= (2, 3):
-                    torch.distributed.init_process_group(
+                    init_process_group(
                         backend='nccl', timeout=_LARGE_TIMEOUT,
-                        device_id=int(os.environ.get('LOCAL_RANK')),
+                        device_id=torch.device('cuda', int(os.environ.get('LOCAL_RANK'))),
                     )
                 else:
                     torch.distributed.init_process_group(
@@ -58,7 +59,7 @@ class _DeviceGroup:
 
         torch.cuda.set_device(self.local_rank)
         self.groups: Dict = { '1'*self.world_size: None }
-        self._split_auxiliary_groups: List[torch.distributed.ProcessGroup] = []
+        self._created_groups: List = []
         self._sync_groups = {}
         self.p2p_groups: Dict[tuple[int, int], Optional[torch.distributed.ProcessGroup]] = {}
         self.use_p2p_groups = (
@@ -71,9 +72,17 @@ class _DeviceGroup:
         self.events: Dict[str, torch.cuda.Event] = {}
 
     def close(self):
-        if self._is_pg_initer:
-            torch.distributed.destroy_process_group()
-            self._is_pg_initer = False
+        if torch.distributed.is_initialized():
+            # PyTorch sorts all groups by name on WORLD destruction. Split
+            # names can differ across ranks, so release owned groups in the
+            # common declaration order before destroying the parent.
+            for group in reversed(self._created_groups):
+                if group is not None and group != torch.distributed.GroupMember.NON_GROUP_MEMBER:
+                    torch.distributed.destroy_process_group(group)
+            if self._is_pg_initer:
+                torch.distributed.destroy_process_group()
+        self._created_groups.clear()
+        self._is_pg_initer = False
 
     def group_exists(self, ranks):
         """
@@ -94,6 +103,7 @@ class _DeviceGroup:
         if rank_bits not in self.groups:
             self.groups[rank_bits] = torch.distributed.new_group(
                 list(ranks), timeout=_LARGE_TIMEOUT)
+            self._created_groups.append(self.groups[rank_bits])
         return self.groups[rank_bits]
 
     def init_groups(self, groups):
@@ -113,12 +123,10 @@ class _DeviceGroup:
                 raise ValueError(f'Communication group rank outside world size {self.world_size}')
             if not self.group_exists(ranks):
                 pending.add(ranks)
-        created = create_groups(
-            sorted(pending), rank=self.rank, world_size=self.world_size,
-            timeout=_LARGE_TIMEOUT, auxiliary_groups=self._split_auxiliary_groups,
-        )
+        created = create_groups(sorted(pending), timeout=_LARGE_TIMEOUT)
         for ranks, group in created.items():
             self.groups[self.bitmap(ranks)] = group
+            self._created_groups.append(group)
 
     def init_p2p_groups(self, pairs):
         """
@@ -140,11 +148,12 @@ class _DeviceGroup:
         normalized_pairs = sorted(set(normalized_pairs))
 
         from nnscaler.runtime.group_init import create_groups
-        self.p2p_groups.update(create_groups(
+        created = create_groups(
             [pair for pair in normalized_pairs if pair not in self.p2p_groups],
-            rank=self.rank, world_size=self.world_size, timeout=_LARGE_TIMEOUT,
-            auxiliary_groups=self._split_auxiliary_groups,
-        ))
+            timeout=_LARGE_TIMEOUT,
+        )
+        self.p2p_groups.update(created)
+        self._created_groups.extend(created.values())
         torch.distributed.barrier()
 
     def get_sync_group(self, stride: int, world_size: int):

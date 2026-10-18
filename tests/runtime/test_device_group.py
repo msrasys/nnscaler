@@ -44,18 +44,19 @@ def _batched_group_worker(directory):
     from nnscaler.runtime.device import DeviceGroup, uninit_device
     from nnscaler.runtime.module import CubeModule
     from nnscaler.runtime import group_init
-    group_init._MIN_GROUPS_PER_ROUND = 1
 
     rank = int(os.environ['RANK'])
     torch.cuda.set_device(rank)
     for generation in range(2):
-        # Batched new_group must also work after default-group reinitialization.
+        # Unsupported WORLD reinitialization must use the ordinary fallback.
         dist.init_process_group('nccl', rank=rank, world_size=4,
                                 init_method=f'file://{Path(directory) / str(generation)}',
                                 device_id=torch.device('cuda', rank), timeout=timedelta(seconds=60))
         manager = DeviceGroup()
         groups = [[0, 1], [2, 3], [0, 2]]
+        registry_before = len(dist.distributed_c10d._world.pg_names)
         manager.init_groups(groups)
+        assert len(dist.distributed_c10d._world.pg_names) - registry_before == 1 + int(rank in [0, 2])
         # Legacy generated code's single-group declarations remain supported.
         for member in range(4):
             CubeModule.init_group(None, [member])

@@ -11,6 +11,8 @@ import torch.distributed as dist
 from nnscaler.runtime import group_init
 from nnscaler.runtime.device import _DeviceGroup
 
+TIMEOUT = timedelta(seconds=30)
+
 
 def test_partition_groups_are_disjoint_complete_and_order_independent():
     groups = [(0, 1), (2, 3), (0, 2), (1, 3), (0,), (1,), (2,), (3,)]
@@ -37,182 +39,150 @@ def test_production_layout_batches():
     assert len(group_init.partition_groups(pairs)) == 3
 
 
-def fake_split(monkeypatch, rank, world_size):
+def fake_backend(monkeypatch, rank):
     calls = []
-    monkeypatch.setattr(group_init, '_MIN_GROUPS_PER_ROUND', 1)
-    monkeypatch.setattr(group_init, '_split_device', lambda: torch.device('cpu'))
+    monkeypatch.setattr(group_init, '_split_context', lambda: (torch.device('cpu'), True))
     monkeypatch.setattr(dist, 'all_reduce', lambda *a, **kw: None)
+    monkeypatch.setattr(dist, 'get_rank', lambda: rank)
+    monkeypatch.setattr(dist, 'barrier', lambda: None)
 
-    def split(ranks, *, timeout, use_local_synchronization):
-        assert use_local_synchronization and rank in ranks
-        calls.append(ranks)
-        return tuple(ranks)
+    def split(*, split_ranks, timeout):
+        calls.append(('split', split_ranks))
+        return next((tuple(ranks) for ranks in split_ranks if rank in ranks), None)
 
-    monkeypatch.setattr(dist, 'new_group', split)
+    def ordinary(ranks, *, timeout):
+        calls.append(('ordinary', ranks))
+        return tuple(ranks) if rank in ranks else dist.GroupMember.NON_GROUP_MEMBER
+
+    monkeypatch.setattr(dist, 'split_group', split, raising=False)
+    monkeypatch.setattr(dist, 'new_group', ordinary)
     return calls
 
 
 @pytest.mark.parametrize('rank', range(6))
-def test_partial_rounds_keep_names_balanced_without_merging_pairs(monkeypatch, rank):
-    calls = fake_split(monkeypatch, rank, 6)
+def test_sparse_rounds_do_not_add_groups_and_normalize_nonmembers(monkeypatch, rank):
+    calls = fake_backend(monkeypatch, rank)
     pairs = [(0, 2), (0, 4), (1, 3), (1, 5), (2, 4), (3, 5)]
-    extra = []
-    result = group_init.create_groups(pairs, rank=rank, world_size=6,
-                                      timeout=timedelta(seconds=30), auxiliary_groups=extra)
-    assert len(calls) == 3
-    assert extra == [(rank,)]
+    result = group_init.create_groups(pairs, timeout=TIMEOUT)
+    assert len(calls) == 3 and all(kind == 'split' for kind, _ in calls)
+    assert {tuple(ranks) for _, batch in calls for ranks in batch} == set(pairs)
     for pair in pairs:
         assert result[pair] == (pair if rank in pair else dist.GroupMember.NON_GROUP_MEMBER)
 
 
-def test_different_existing_histories_use_original_collective_path(monkeypatch):
-    calls = fake_split(monkeypatch, 0, 4)
-    new_groups = []
-
-    def disagreement(value, **kwargs):
-        value[0] = 10
-        value[1] = -9
-
-    monkeypatch.setattr(dist, 'all_reduce', disagreement)
-    monkeypatch.setattr(dist, 'new_group', lambda ranks, **kw: new_groups.append(ranks) or tuple(ranks))
-    result = group_init.create_groups([(0, 1), (2, 3)], rank=0, world_size=4,
-                                      timeout=timedelta(seconds=30), auxiliary_groups=[])
-    assert not calls
-    assert new_groups == [[0, 1], [2, 3]]
-    assert result[(0, 1)] == (0, 1)
+def test_one_sparse_group_uses_ordinary_creation(monkeypatch):
+    calls = fake_backend(monkeypatch, 3)
+    result = group_init.create_groups([(0, 2)], timeout=TIMEOUT)
+    assert calls == [('ordinary', [0, 2])]
+    assert result[(0, 2)] == dist.GroupMember.NON_GROUP_MEMBER
 
 
-def test_different_plans_fail_before_any_split(monkeypatch):
-    calls = fake_split(monkeypatch, 0, 4)
+def test_all_ranks_fall_back_if_one_backend_cannot_split(monkeypatch):
+    calls = fake_backend(monkeypatch, 0)
+    monkeypatch.setattr(dist, 'all_reduce', lambda value, **kw: value.__setitem__(0, 0))
+    group_init.create_groups([(0, 1), (2, 3)], timeout=TIMEOUT)
+    assert calls == [('ordinary', [0, 1]), ('ordinary', [2, 3])]
 
-    def disagreement(value, **kwargs):
-        value[2] = 10
-        value[3] = -9
 
-    monkeypatch.setattr(dist, 'all_reduce', disagreement)
+def test_different_plans_fail_before_creation(monkeypatch):
+    calls = fake_backend(monkeypatch, 0)
+    monkeypatch.setattr(dist, 'all_reduce', lambda value, **kw: value.__setitem__(1, value[1] - 1))
     with pytest.raises(ValueError, match='different pending'):
-        group_init.create_groups([(0, 1), (2, 3)], rank=0, world_size=4,
-                                 timeout=timedelta(seconds=30), auxiliary_groups=[])
+        group_init.create_groups([(0, 1), (2, 3)], timeout=TIMEOUT)
     assert not calls
 
 
-def test_unsupported_backend_keeps_new_group(monkeypatch):
-    monkeypatch.setattr(group_init, '_split_device', lambda: None)
-    calls = []
-    monkeypatch.setattr(dist, 'new_group', lambda ranks, **kw: calls.append(ranks) or tuple(ranks))
-    result = group_init.create_groups([(0, 1), (2, 3)], rank=0, world_size=4,
-                                      timeout=timedelta(seconds=30), auxiliary_groups=[])
-    assert calls == [[0, 1], [2, 3]]
-    assert result[(2, 3)] == (2, 3)
+def test_unbound_backend_keeps_ordinary_creation(monkeypatch):
+    calls = fake_backend(monkeypatch, 0)
+    monkeypatch.setattr(group_init, '_split_context', lambda: None)
+    group_init.create_groups([(0, 1), (2, 3)], timeout=TIMEOUT)
+    assert calls == [('ordinary', [0, 1]), ('ordinary', [2, 3])]
 
 
-def test_device_group_reuses_memberships_and_world(monkeypatch):
-    manager = object.__new__(_DeviceGroup)
-    manager.rank, manager.world_size = 0, 4
-    manager.groups = {'1111': None}
-    manager._split_auxiliary_groups = []
-    calls = fake_split(monkeypatch, 0, 4)
-    manager.init_groups([[0, 1], [2, 3], [1, 0], [0, 1, 2, 3]])
+def manager(rank=0, world=4):
+    value = object.__new__(_DeviceGroup)
+    value.rank, value.world_size = rank, world
+    value.groups = {'1' * world: None}
+    value._created_groups = []
+    value._sync_groups, value.p2p_groups = {}, {}
+    value.use_p2p_groups = True
+    return value
+
+
+def test_cache_reuses_memberships_and_world(monkeypatch):
+    device = manager()
+    calls = fake_backend(monkeypatch, 0)
+    device.init_groups([[0, 1], [2, 3], [1, 0], [0, 1, 2, 3]])
     assert len(calls) == 1
-    assert manager.get_group([1, 0]) == (0, 1)
-    assert manager.get_group([0, 1, 2, 3]) is None
-    manager.init_groups([[2, 3], [0, 1]])
+    assert device.get_group([1, 0]) == (0, 1)
+    assert device.get_group([0, 1, 2, 3]) is None
+    device.init_groups([[2, 3], [0, 1]])
     assert len(calls) == 1
 
 
 @pytest.mark.parametrize('ranks', [[], [0, 0], [-1], [4]])
 def test_invalid_memberships_are_rejected(ranks):
-    manager = object.__new__(_DeviceGroup)
-    manager.world_size = 4
     with pytest.raises(ValueError):
-        manager.init_groups([ranks])
+        manager().init_groups([ranks])
 
 
-def test_sync_group_caches_topology_and_does_not_expose_mutable_ranks(monkeypatch):
-    manager = object.__new__(_DeviceGroup)
-    manager.rank, manager.world_size = 3, 6
-    manager.groups = {'111111': None}
-    manager._split_auxiliary_groups = []
-    manager._sync_groups = {}
-    calls = fake_split(monkeypatch, 3, 6)
-    ranks, group = manager.get_sync_group(2, 6)
+def test_sync_cache_does_not_expose_mutable_ranks(monkeypatch):
+    device = manager(3, 6)
+    calls = fake_backend(monkeypatch, 3)
+    ranks, group = device.get_sync_group(2, 6)
     assert ranks == [1, 3, 5] and group == (1, 3, 5)
     ranks.clear()
-    assert manager.get_sync_group(2, 6) == ([1, 3, 5], group)
+    assert device.get_sync_group(2, 6) == ([1, 3, 5], group)
     assert len(calls) == 1
-    assert manager.get_sync_group(1, 6) == (list(range(6)), None)
-    assert len(calls) == 1
+    assert device.get_sync_group(1, 6) == (list(range(6)), None)
 
 
-def test_p2p_groups_keep_separate_communicators(monkeypatch):
-    manager = object.__new__(_DeviceGroup)
-    manager.rank, manager.world_size = 0, 4
-    manager.use_p2p_groups = True
-    manager.groups, manager.p2p_groups = {'1111': None}, {}
-    manager._split_auxiliary_groups = []
-    calls = fake_split(monkeypatch, 0, 4)
-    monkeypatch.setattr(dist, 'barrier', lambda: None)
-    manager.init_groups([[0, 1], [2, 3]])
-    manager.init_p2p_groups([(1, 0), (2, 3), (0, 0)])
+def test_p2p_groups_have_separate_cache(monkeypatch):
+    device = manager()
+    calls = fake_backend(monkeypatch, 0)
+    device.init_groups([[0, 1], [2, 3]])
+    device.init_p2p_groups([(1, 0), (2, 3), (0, 0)])
     assert len(calls) == 2
-    assert manager.get_p2p_group(1, 0) == ((0, 1), 1, 0)
-    manager.init_p2p_groups([(0, 1), (3, 2)])
+    assert device.get_p2p_group(1, 0) == ((0, 1), 1, 0)
+    device.init_p2p_groups([(0, 1), (3, 2)])
     assert len(calls) == 2
 
 
-def test_single_partial_group_keeps_registration_counts_balanced(monkeypatch):
-    calls = fake_split(monkeypatch, 3, 4)
-    extra = []
-    group_init.create_groups([(0, 2)], rank=3, world_size=4,
-                             timeout=timedelta(seconds=30), auxiliary_groups=extra)
-    assert calls == [[3]]
-    assert extra == [(3,)]
-
-
-def test_creation_failure_propagates(monkeypatch):
-    fake_split(monkeypatch, 0, 4)
-    calls = []
-    def fail(*args, **kwargs):
-        calls.append(kwargs)
+def test_backend_errors_are_not_hidden_by_retry(monkeypatch):
+    fake_backend(monkeypatch, 0)
+    def fail(**kwargs):
         raise RuntimeError('backend split failure')
-    monkeypatch.setattr(dist, 'new_group', fail)
+    monkeypatch.setattr(dist, 'split_group', fail)
     with pytest.raises(RuntimeError, match='backend split failure'):
-        group_init.create_groups([(0, 1), (2, 3)], rank=0, world_size=4,
-                                 timeout=timedelta(seconds=30), auxiliary_groups=[])
-    assert len(calls) == 1 and calls[0]['use_local_synchronization']
+        group_init.create_groups([(0, 1), (2, 3)], timeout=TIMEOUT)
 
 
-def test_small_fanout_uses_original_path(monkeypatch):
-    calls = []
-    monkeypatch.setattr(dist, 'new_group', lambda ranks, **kw: calls.append(kw) or tuple(ranks))
-    group_init.create_groups([(0, 1), (2, 3)], rank=0, world_size=4,
-                             timeout=timedelta(seconds=30), auxiliary_groups=[])
-    assert len(calls) == 2
-    assert all('use_local_synchronization' not in call for call in calls)
+def test_close_releases_owned_groups_before_world(monkeypatch):
+    device = manager()
+    device._is_pg_initer = True
+    device._created_groups = ['first', dist.GroupMember.NON_GROUP_MEMBER, 'second']
+    monkeypatch.setattr(dist, 'is_initialized', lambda: True)
+    closed = []
+    monkeypatch.setattr(dist, 'destroy_process_group', lambda group='world': closed.append(group))
+    device.close()
+    assert closed == ['second', 'first', 'world']
+    assert not device._created_groups and not device._is_pg_initer
 
 
-def test_nccl_color_collision_uses_original_path(monkeypatch):
-    fake_split(monkeypatch, 0, 4)
-    monkeypatch.setattr(group_init.c10d, '_process_group_color', lambda ranks: 42)
-    calls = []
-    monkeypatch.setattr(dist, 'new_group', lambda ranks, **kw: calls.append(kw) or tuple(ranks))
-    group_init.create_groups([(0, 1), (2, 3)], rank=0, world_size=4,
-                             timeout=timedelta(seconds=30), auxiliary_groups=[])
-    assert len(calls) == 2
-    assert all('use_local_synchronization' not in call for call in calls)
-
-
-@pytest.mark.parametrize('bound,backend,supports,eligible', [
-    (True, 'nccl', True, True),
-    (False, 'nccl', True, False),
-    (True, 'gloo', True, False),
-    (True, 'nccl', None, False),
+@pytest.mark.parametrize('bound,backend,uid,rank_map,expected', [
+    (True, 'nccl', 0, [], True),
+    (True, 'nccl', 7, [], False),
+    (True, 'nccl', 7, [0, 1], True),
+    (False, 'nccl', 0, [], None),
+    (True, 'gloo', 0, [], None),
 ])
-def test_only_bound_splittable_nccl_uses_batching(monkeypatch, bound, backend, supports, eligible):
+def test_split_capability_including_world_reinitialization(monkeypatch, bound, backend, uid, rank_map, expected):
     device = torch.device('cuda', 0)
-    native = SimpleNamespace() if supports is None else SimpleNamespace(supports_splitting=supports)
+    native = SimpleNamespace(supports_splitting=True, uid=uid,
+                             options=SimpleNamespace(global_ranks_in_group=rank_map))
     parent = SimpleNamespace(bound_device_id=device if bound else None, _get_backend=lambda _: native)
     monkeypatch.setattr(dist, 'group', SimpleNamespace(WORLD=parent))
     monkeypatch.setattr(dist, 'is_initialized', lambda: True)
     monkeypatch.setattr(dist, 'get_backend', lambda _: backend)
-    assert group_init._split_device() == (device if eligible else None)
+    monkeypatch.setattr(dist, 'split_group', lambda **kw: None, raising=False)
+    assert group_init._split_context() == (None if expected is None else (device, expected))
