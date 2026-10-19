@@ -120,12 +120,14 @@ class _DeviceGroup:
 
     def _new_groups(self, ranks: List[List[int]]):
         # split_group was introduced in PyTorch 2.5 and requires a bound NCCL WORLD.
+        default_pg = torch.distributed.group.WORLD
         use_split = (
             torch.__version__ >= (2, 5)
             and torch.distributed.get_backend() == 'nccl'
             # init_process_group(device_id=...) eagerly initializes the NCCL communicator
             # instead of waiting for the first communication; split_group requires this binding.
-            and torch.distributed.group.WORLD.bound_device_id is not None
+            and default_pg.bound_device_id is not None
+            and default_pg._get_backend(default_pg.bound_device_id).supports_splitting
         )
         if use_split:
             group = torch.distributed.split_group(

@@ -33,7 +33,10 @@ def test_batched_group_initialization():
     with mock_cube_env(0, 4), mock_dist(0, 4):
         device = DeviceGroup()
         module = CubeModule()
-        world = SimpleNamespace(bound_device_id=torch.device('cuda', 0))
+        backend = SimpleNamespace(supports_splitting=True)
+        world = SimpleNamespace(
+            bound_device_id=torch.device('cuda', 0), _get_backend=lambda _: backend,
+        )
         with patch.object(torch, '__version__', TorchVersion('2.5.0')), \
                 patch.object(dist, 'get_backend', return_value='nccl'), \
                 patch.object(dist, 'group', SimpleNamespace(WORLD=world)), \
@@ -57,6 +60,12 @@ def test_batched_group_initialization():
             assert device.get_groups([]) == []
             assert split.call_count == 4
             new.assert_not_called()
+            backend.supports_splitting = False
+            assert device.get_groups([[0, 3]]) == [new.return_value]
+            assert device.get_groups([[0, 3]]) == [new.return_value]
+            new.assert_called_once()
+            assert new.call_args.args[0] == [0, 3]
+            assert split.call_count == 4
 
 
 def _barrier_worker():

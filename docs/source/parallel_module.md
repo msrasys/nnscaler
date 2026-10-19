@@ -22,7 +22,8 @@ membership, and batches groups with disjoint rank memberships.
 P2P and collective operations with the same members reuse the same process group.
 
 On PyTorch 2.5 and later, initialization uses one `torch.distributed.split_group`
-call per batch when WORLD uses NCCL and has a bound `device_id`. Otherwise,
+call per batch when WORLD uses NCCL, has a bound `device_id`, and its device
+backend reports `supports_splitting=True`. Otherwise,
 including older PyTorch versions or an externally initialized WORLD without a
 bound device, groups are created sequentially with `new_group`.
 All WORLD ranks must initialize the generated modules in the same order,
