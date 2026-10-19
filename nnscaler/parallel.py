@@ -3369,13 +3369,15 @@ def load_deduped_state_dict(
                     local_name2ranks[key].append(rank)
 
         # create process groups for broadcasting
+        broadcast_groups = []
         for key, ranks in local_name2ranks.items():
             if len(ranks) <= 1:
                 continue
             # should have sorted.
             ranks.sort()
             logger.debug(f'At rank {cur_rank}, create groups for ranks: {ranks}.')
-            DeviceGroup().get_group(ranks)
+            broadcast_groups.append(ranks)
+        DeviceGroup().get_groups(broadcast_groups)
 
         torch.distributed.barrier()
 

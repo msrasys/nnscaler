@@ -112,11 +112,14 @@ def manager(rank=0, world=4):
 def test_cache_reuses_memberships_and_world(monkeypatch):
     device = manager()
     calls = fake_backend(monkeypatch, 0)
-    device.init_groups([[0, 1], [2, 3], [1, 0], [0, 1, 2, 3]])
+    groups = device.get_groups([[2, 3], [0, 1], [1, 0], [0, 1, 2, 3]])
+    assert groups == [dist.GroupMember.NON_GROUP_MEMBER, (0, 1), (0, 1), None]
+    assert groups[1] is groups[2]
     assert len(calls) == 1
     assert device.get_group([1, 0]) == (0, 1)
     assert device.get_group([0, 1, 2, 3]) is None
-    device.init_groups([[2, 3], [0, 1]])
+    assert device.init_groups([[2, 3], [0, 1]]) is None
+    assert device.get_groups([]) == []
     assert len(calls) == 1
 
 
@@ -183,6 +186,10 @@ def test_single_group_registration_reuses_the_handle(monkeypatch):
     group = device.get_group([0, 1])
     assert device.get_group([1, 0]) is group
     device.get_group([2, 3])
+    assert device._owned_groups == [group]
+    with pytest.raises(AssertionError):
+        device._register_group(device.groups, device.bitmap([0, 1]), object())
+    assert device.get_group([0, 1]) is group
     assert device._owned_groups == [group]
 
 

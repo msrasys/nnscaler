@@ -2,7 +2,6 @@
 #  Licensed under the MIT License.
 
 from .version import __version__
-from .runtime.topology import init_process_group
 from .parallel import (
     ParallelModule,
     ComputeConfig,
