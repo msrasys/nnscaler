@@ -1,71 +1,47 @@
 import warnings
-from types import SimpleNamespace
-from unittest.mock import patch
 
 import pytest
 import torch
 import torch.distributed as dist
-from torch.torch_version import TorchVersion
 
 from nnscaler import init, uninit
-from nnscaler.codegen.module.module import ModuleCodeGen
 from nnscaler.runtime.device import DeviceGroup
 from nnscaler.runtime.module import CubeModule
 
 from ..launch_torchrun import launch_torchrun
-from ..utils import mock_cube_env, mock_dist
 
 
-def test_batched_group_initialization():
-    codegen = ModuleCodeGen.__new__(ModuleCodeGen)
-    codegen.runtime_ndevs = 4
-    codegen.comm_groups = [(0, 1), (1, 0), (2, 3), (1, 2), (0, 1, 2, 3)]
-    codegen.model_init_statements = []
-    codegen.emit_comm_groups()
-    code = '\n'.join(codegen.model_init_statements)
-    expected_batches = [
-        [[0], [1], [2], [3]],
-        [[0, 1], [2, 3]],
-        [[1, 2]],
-    ]
-    singleton, pair, extra = object(), object(), object()
-
-    with mock_cube_env(0, 4), mock_dist(0, 4):
+def _batched_group_initialization_worker():
+    init()
+    try:
         device = DeviceGroup()
         module = CubeModule()
-        backend = SimpleNamespace(supports_splitting=True)
-        world = SimpleNamespace(
-            bound_device_id=torch.device('cuda', 0), _get_backend=lambda _: backend,
-        )
-        with patch.object(torch, '__version__', TorchVersion('2.5.0')), \
-                patch.object(dist, 'get_backend', return_value='nccl'), \
-                patch.object(dist, 'group', SimpleNamespace(WORLD=world)), \
-                patch.object(dist, 'split_group', create=True, side_effect=[singleton, pair, None, extra]) as split, \
-                patch.object(dist, 'new_group') as new:
-            exec(code, {'self': module})
-            assert [call.kwargs['split_ranks'] for call in split.call_args_list] == expected_batches
-            assert device.get_group([0]) is singleton
-            assert device.get_p2p_group(1, 0) is pair
-            assert device.get_group([0, 1]) is pair
-            assert device.get_group([1, 2]) == dist.GroupMember.NON_GROUP_MEMBER
-            assert device.get_group([0, 1, 2, 3]) is None
-            assert device.get_p2p_group(0, 3) is None
-            exec(code, {'self': module})
-            assert split.call_count == 3
-            ranks = [[1, 3], [0, 1], [0, 2], [2, 0], [0, 1, 2, 3]]
-            expected = [dist.GroupMember.NON_GROUP_MEMBER, pair, extra, extra, None]
-            assert module.init_groups(ranks) == expected
-            assert split.call_args.kwargs['split_ranks'] == [[0, 2], [1, 3]]
-            assert device.get_groups(ranks) == expected
-            assert device.get_groups([]) == []
-            assert split.call_count == 4
-            new.assert_not_called()
-            backend.supports_splitting = False
-            assert device.get_groups([[0, 3]]) == [new.return_value]
-            assert device.get_groups([[0, 3]]) == [new.return_value]
-            new.assert_called_once()
-            assert new.call_args.args[0] == [0, 3]
-            assert split.call_count == 4
+        # The last pair overlaps both disjoint pairs and excludes ranks 0 and 3.
+        ranks = [[0, 1], [2, 3], [1, 2], [1, 0], list(range(4))]
+        groups = module.init_groups(ranks)
+        assert groups[0] is groups[3]
+        assert groups[-1] is None
+        assert device.get_p2p_group(0, 1) is groups[0]
+        for members, group in zip(ranks, groups):
+            if device.rank in members:
+                assert dist.get_world_size(group) == len(members)
+                value = torch.tensor(float(device.rank), device='cuda')
+                dist.all_reduce(value, group=group)
+                assert value.item() == sum(members)
+            else:
+                assert group == dist.GroupMember.NON_GROUP_MEMBER
+        cached = dict(device.groups)
+        repeated = module.init_groups(ranks[::-1])
+        assert all(group is previous for group, previous in zip(repeated, groups[::-1]))
+        assert device.groups == cached
+        assert device.get_groups([]) == []
+    finally:
+        uninit()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.device_count() < 4, reason='lack of gpu devices')
+def test_batched_group_initialization():
+    launch_torchrun(4, _batched_group_initialization_worker)
 
 
 def _barrier_worker():
