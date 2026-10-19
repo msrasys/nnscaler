@@ -53,7 +53,7 @@ class _DeviceGroup:
                 if torch.__version__ >= (2, 3):
                     torch.distributed.init_process_group(
                         backend='nccl', timeout=_LARGE_TIMEOUT,
-                        device_id=int(os.environ.get('LOCAL_RANK')),
+                        device_id=torch.device('cuda', int(os.environ.get('LOCAL_RANK'))),
                     )
                 else:
                     torch.distributed.init_process_group(
