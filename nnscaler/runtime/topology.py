@@ -138,11 +138,69 @@ def _node_plan(local_size):
         directory = Path(os.environ.get('XDG_CACHE_HOME', Path.home() / '.cache')) / 'nnscaler' / 'nccl-topology'
         directory.mkdir(parents=True, exist_ok=True)
         path = directory / (key + '.xml')
-        return dict(ready=True, cached=_valid_cache(path), path=str(path),
-                    raw=str(directory / f'.{key}.{uuid.uuid4().hex}.raw.xml'))
+        return dict(available=True, cache_hit=_valid_cache(path), cache_path=str(path),
+                    dump_path=str(directory / f'.{key}.{uuid.uuid4().hex}.raw.xml'))
     except (OSError, ValueError) as error:
         _logger.debug('NCCL topology caching unavailable: %s', error)
-        return dict(ready=False, cached=False)
+        return dict(available=False, cache_hit=False)
+
+
+def _rendezvous_kwargs(kwargs):
+    """Return initialization arguments with a resolved Store, or None if invalid."""
+    rank, world_size = kwargs.get('rank', -1), kwargs.get('world_size', -1)
+    if kwargs.get('store') is not None:
+        if kwargs.get('init_method') or rank < 0 or world_size <= 0:
+            return None  # Let PyTorch report invalid arguments in the ordinary path.
+        return kwargs
+    timeout = kwargs.get('timeout') or getattr(constants, 'default_pg_nccl_timeout', constants.default_pg_timeout)
+    method = kwargs.get('init_method') or 'env://'
+    store, rank, world_size = next(dist.rendezvous(method, rank, world_size, timeout=timeout))
+    store.set_timeout(timeout)
+    resolved = dict(kwargs, store=dist.PrefixStore('default_pg', store), rank=rank, world_size=world_size)
+    resolved.pop('init_method', None)
+    return resolved
+
+
+def _coordinate_cache(store, *, rank, world_size, local_size, leader, user_override):
+    """Choose one cache mode for all ranks and return this node's file plan."""
+    store.set(f'override/{rank}', str(int(user_override)))
+    if rank == 0:
+        overrides = store.multi_get([f'override/{i}' for i in range(world_size)])
+        store.set('external', str(int(any(value == b'1' for value in overrides))))
+    if store.get('external') == b'1':
+        return 'disabled', None
+    if rank == leader:
+        store.set(str(leader), json.dumps(_node_plan(local_size)))
+    if rank == 0:
+        plans = [json.loads(store.get(str(i))) for i in range(0, world_size, local_size)]
+        # Export adds NCCL bootstrap collectives. Even a partial cache miss must
+        # select the same export path on every rank; user overrides bypass it.
+        if not all(plan['available'] for plan in plans):
+            mode = 'disabled'
+        elif all(plan['cache_hit'] for plan in plans):
+            mode = 'cached'
+        else:
+            mode = 'dump'
+        store.set('mode', mode)
+    return store.get('mode').decode(), json.loads(store.get(str(leader)))
+
+
+def _publish_cache(plan):
+    """Save a completed topology dump and return its cache path, or an empty string."""
+    cache_path, dump_path = Path(plan['cache_path']), Path(plan['dump_path'])
+    try:
+        data = _clean_xml(dump_path.read_bytes())
+        _atomic_write(cache_path, data)
+        _atomic_write(cache_path.with_suffix('.sha256'), hashlib.sha256(data).hexdigest().encode())
+        return str(cache_path)
+    except (OSError, ValueError, ET.ParseError) as error:
+        _logger.warning('Continuing without NCCL topology cache: %s', error)
+        return ''
+    finally:
+        try:
+            dump_path.unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 def _restore(name, value):
@@ -162,18 +220,19 @@ def init_process_group(backend=None, **kwargs):
     communicators are cached.
     """
     kwargs['backend'] = backend
-    with _topology_cache(kwargs):
-        return dist.init_process_group(**kwargs)
+    with _topology_cache(kwargs) as init_kwargs:
+        return dist.init_process_group(**init_kwargs)
 
 
 @contextmanager
 def _topology_cache(kwargs):
     """Prepare topology before WORLD initialization and publish its cache after.
 
-    Update initialization kwargs to share the rendezvous Store. Temporary dump
-    settings are restored on failure; a new cache is published only on success.
+    Yield prepared initialization arguments without changing the caller's dict.
+    Restore temporary dump settings on failure; publish a cache only on success.
     """
     global _managed_file
+    kwargs = kwargs.copy()
     backend = kwargs['backend']
     device = kwargs.get('device_id')
     if isinstance(device, int):
@@ -181,88 +240,51 @@ def _topology_cache(kwargs):
     if (dist.is_initialized() or backend != 'nccl' or device is None
             or device.type != 'cuda' or not dist.is_nccl_available()
             or 'LOCAL_WORLD_SIZE' not in os.environ):
-        yield
+        yield kwargs
         return
     if os.environ.get(_INPUT) == _managed_file and _managed_file is not None:
         os.environ.pop(_INPUT)
         _managed_file = None
     user_override = _has_topology_override()
 
-    timeout = kwargs.get('timeout') or getattr(constants, 'default_pg_nccl_timeout', constants.default_pg_timeout)
-    rank, world = kwargs.get('rank', -1), kwargs.get('world_size', -1)
-    store = kwargs.get('store')
-    if store is None:
-        method = kwargs.pop('init_method', None) or 'env://'
-        store, rank, world = next(dist.rendezvous(method, rank, world, timeout=timeout))
-        store.set_timeout(timeout)
-        store = dist.PrefixStore('default_pg', store)
-        kwargs.update(store=store, rank=rank, world_size=world)
-    elif kwargs.get('init_method') or rank < 0 or world <= 0:
-        yield
+    resolved = _rendezvous_kwargs(kwargs)
+    if resolved is None:
+        yield kwargs
         return
+    kwargs = resolved
+    rank, world_size = kwargs['rank'], kwargs['world_size']
 
     local_size = int(os.environ['LOCAL_WORLD_SIZE'])
     local_rank = int(os.environ['LOCAL_RANK'])
-    if local_size <= 0 or world % local_size or local_rank != rank % local_size:
+    if local_size <= 0 or world_size % local_size or local_rank != rank % local_size:
         raise ValueError('NCCL topology caching requires homogeneous torchrun nodes')
     leader = rank - local_rank
     token = f'{os.environ.get("TORCHELASTIC_RESTART_COUNT", "0")}-{next(_generation)}'
-    coordination = dist.PrefixStore(f'nnscaler-topology/{token}', store)
-    # An override on even one rank disables automatic export everywhere; taking
-    # different dump branches would introduce mismatched bootstrap collectives.
-    coordination.set(f'override/{rank}', str(int(user_override)))
-    if rank == 0:
-        overrides = coordination.multi_get([f'override/{i}' for i in range(world)])
-        coordination.set('external', str(int(any(value == b'1' for value in overrides))))
-    if coordination.get('external') == b'1':
-        yield
-        return
-    if local_rank == 0:
-        coordination.set(str(leader), json.dumps(_node_plan(local_size)))
-    if rank == 0:
-        plans = [json.loads(coordination.get(str(i))) for i in range(0, world, local_size)]
-        # Dumping introduces extra NCCL bootstrap collectives. All ranks must
-        # make the same choice, including when only some nodes have a cache hit.
-        mode = ('disabled' if not all(p['ready'] for p in plans) else
-                'cached' if all(p['cached'] for p in plans) else 'dump')
-        coordination.set('mode', mode)
-    mode = coordination.get('mode').decode()
-    plan = json.loads(coordination.get(str(leader)))
+    coordination = dist.PrefixStore(f'nnscaler-topology/{token}', kwargs['store'])
+    mode, plan = _coordinate_cache(
+        coordination, rank=rank, world_size=world_size,
+        local_size=local_size, leader=leader, user_override=user_override)
     if mode == 'disabled':
-        yield
+        yield kwargs
         return
 
-    path = Path(plan['path'])
+    cache_path = Path(plan['cache_path'])
     old_dump, old_rank = os.environ.get(_DUMP), os.environ.get(_DUMP_RANK)
     if mode == 'cached':
-        if _valid_cache(path):
-            os.environ[_INPUT] = _managed_file = str(path)
+        if _valid_cache(cache_path):
+            os.environ[_INPUT] = _managed_file = str(cache_path)
     else:
-        os.environ[_DUMP] = plan['raw']
+        os.environ[_DUMP] = plan['dump_path']
         os.environ[_DUMP_RANK] = str(leader)
     try:
-        yield
+        yield kwargs
     finally:
         _restore(_DUMP, old_dump)
         _restore(_DUMP_RANK, old_rank)
 
     if mode == 'dump':
-        if local_rank == 0:
-            raw = Path(plan['raw'])
-            try:
-                data = _clean_xml(raw.read_bytes())
-                _atomic_write(path, data)
-                _atomic_write(path.with_suffix('.sha256'), hashlib.sha256(data).hexdigest().encode())
-                ready = str(path)
-            except (OSError, ValueError, ET.ParseError) as error:
-                _logger.warning('Continuing without NCCL topology cache: %s', error)
-                ready = ''
-            finally:
-                try:
-                    raw.unlink(missing_ok=True)
-                except OSError:
-                    pass
-            coordination.set(f'ready/{leader}', ready)
-        ready = coordination.get(f'ready/{leader}').decode()
-        if ready and _valid_cache(Path(ready)):
-            os.environ[_INPUT] = _managed_file = ready
+        if rank == leader:
+            coordination.set(f'ready/{leader}', _publish_cache(plan))
+        published_path = coordination.get(f'ready/{leader}').decode()
+        if published_path and _valid_cache(Path(published_path)):
+            os.environ[_INPUT] = _managed_file = published_path

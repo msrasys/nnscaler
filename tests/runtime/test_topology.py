@@ -73,22 +73,22 @@ def test_node_plan_reuses_cache_and_allocates_unique_dump_paths(monkeypatch, tmp
     monkeypatch.setenv('XDG_CACHE_HOME', str(tmp_path))
     monkeypatch.setattr(topology, '_fingerprint', lambda size: f'node-{size}')
     first = topology._node_plan(8)
-    assert first['ready'] and not first['cached']
-    path = Path(first['path'])
+    assert first['available'] and not first['cache_hit']
+    path = Path(first['cache_path'])
     data = topology._clean_xml(RAW)
     topology._atomic_write(path, data)
     topology._atomic_write(path.with_suffix('.sha256'), hashlib.sha256(data).hexdigest().encode())
     second = topology._node_plan(8)
-    assert second['cached'] and second['path'] == first['path']
-    assert second['raw'] != first['raw']
-    assert not topology._node_plan(4)['cached']
+    assert second['cache_hit'] and second['cache_path'] == first['cache_path']
+    assert second['dump_path'] != first['dump_path']
+    assert not topology._node_plan(4)['cache_hit']
 
 
 def test_inventory_failure_disables_cache(monkeypatch):
     def unavailable(size):
         raise OSError('missing GPU inventory')
     monkeypatch.setattr(topology, '_fingerprint', unavailable)
-    assert topology._node_plan(8) == {'ready': False, 'cached': False}
+    assert topology._node_plan(8) == {'available': False, 'cache_hit': False}
 
 
 @pytest.mark.parametrize('override', ['NCCL_TOPO_FILE', 'NCCL_TOPO_DUMP_FILE'])
@@ -133,7 +133,7 @@ def cache_init(monkeypatch, tmp_path):
 
 @pytest.mark.parametrize('cached', [False, True])
 def test_cache_surrounds_initialization(monkeypatch, cache_init, cached):
-    path = Path(topology._node_plan(1)['path'])
+    path = Path(topology._node_plan(1)['cache_path'])
     if cached:
         data = topology._clean_xml(RAW)
         topology._atomic_write(path, data)
@@ -166,7 +166,7 @@ def test_cache_surrounds_initialization(monkeypatch, cache_init, cached):
 
 
 def test_initialization_failure_restores_dump_settings_without_publishing(monkeypatch, cache_init):
-    path = Path(topology._node_plan(1)['path'])
+    path = Path(topology._node_plan(1)['cache_path'])
     monkeypatch.setenv(topology._DUMP_RANK, '17')
     failure = RuntimeError('WORLD initialization failed')
     calls = []
@@ -189,7 +189,7 @@ def test_initialization_failure_restores_dump_settings_without_publishing(monkey
 
 
 def test_unavailable_cache_still_initializes_once(monkeypatch, cache_init):
-    monkeypatch.setattr(topology, '_node_plan', lambda size: dict(ready=False, cached=False))
+    monkeypatch.setattr(topology, '_node_plan', lambda size: dict(available=False, cache_hit=False))
     calls = []
     result = object()
 
@@ -201,6 +201,33 @@ def test_unavailable_cache_still_initializes_once(monkeypatch, cache_init):
     monkeypatch.setattr(dist, 'init_process_group', initialize)
     assert topology.init_process_group(**cache_init) is result
     assert len(calls) == 1
+
+
+def test_rendezvous_returns_prepared_args_without_mutating_input(monkeypatch):
+    store = dist.HashStore()
+    supplied = dict(backend='nccl', init_method='file:///example', rank=-1, world_size=-1)
+    calls = []
+
+    def rendezvous(method, rank, world_size, *, timeout):
+        calls.append((method, rank, world_size))
+        return iter([(store, 0, 2)])
+
+    monkeypatch.setattr(dist, 'rendezvous', rendezvous)
+    resolved = topology._rendezvous_kwargs(supplied)
+    assert calls == [('file:///example', -1, -1)]
+    assert supplied == dict(backend='nccl', init_method='file:///example', rank=-1, world_size=-1)
+    assert resolved['rank'] == 0 and resolved['world_size'] == 2
+    assert 'init_method' not in resolved
+    resolved['store'].set('probe', 'value')
+    assert store.check(['default_pg/probe'])
+
+
+def test_topology_context_yields_args_without_mutating_input(cache_init):
+    original = cache_init.copy()
+    with topology._topology_cache(cache_init) as prepared:
+        assert prepared['device_id'] == torch.device('cuda', 0)
+        Path(os.environ[topology._DUMP]).write_bytes(RAW)
+    assert cache_init == original
 
 
 def _topology_cache_worker(directory):

@@ -59,7 +59,7 @@ class _DeviceGroup:
 
         torch.cuda.set_device(self.local_rank)
         self.groups: Dict = { '1'*self.world_size: None }
-        self._created_groups: List = []
+        self._owned_groups: List = []
         self._sync_groups = {}
         self.p2p_groups: Dict[tuple[int, int], Optional[torch.distributed.ProcessGroup]] = {}
         self.use_p2p_groups = (
@@ -76,13 +76,18 @@ class _DeviceGroup:
             # PyTorch sorts all groups by name on WORLD destruction. Split
             # names can differ across ranks, so release owned groups in the
             # common declaration order before destroying the parent.
-            for group in reversed(self._created_groups):
-                if group is not None and group != torch.distributed.GroupMember.NON_GROUP_MEMBER:
-                    torch.distributed.destroy_process_group(group)
+            for group in reversed(self._owned_groups):
+                torch.distributed.destroy_process_group(group)
             if self._is_pg_initer:
                 torch.distributed.destroy_process_group()
-        self._created_groups.clear()
+        self._owned_groups.clear()
         self._is_pg_initer = False
+
+    def _register_group(self, cache, key, group):
+        """Cache every lookup result; own only this rank's live subgroup handles."""
+        cache[key] = group
+        if group is not None and group != torch.distributed.GroupMember.NON_GROUP_MEMBER:
+            self._owned_groups.append(group)
 
     def group_exists(self, ranks):
         """
@@ -101,9 +106,9 @@ class _DeviceGroup:
             return None
         rank_bits = self.bitmap(ranks)
         if rank_bits not in self.groups:
-            self.groups[rank_bits] = torch.distributed.new_group(
+            group = torch.distributed.new_group(
                 list(ranks), timeout=_LARGE_TIMEOUT)
-            self._created_groups.append(self.groups[rank_bits])
+            self._register_group(self.groups, rank_bits, group)
         return self.groups[rank_bits]
 
     def init_groups(self, groups):
@@ -125,8 +130,7 @@ class _DeviceGroup:
                 pending.add(ranks)
         created = create_groups(sorted(pending), timeout=_LARGE_TIMEOUT)
         for ranks, group in created.items():
-            self.groups[self.bitmap(ranks)] = group
-            self._created_groups.append(group)
+            self._register_group(self.groups, self.bitmap(ranks), group)
 
     def init_p2p_groups(self, pairs):
         """
@@ -152,8 +156,8 @@ class _DeviceGroup:
             [pair for pair in normalized_pairs if pair not in self.p2p_groups],
             timeout=_LARGE_TIMEOUT,
         )
-        self.p2p_groups.update(created)
-        self._created_groups.extend(created.values())
+        for pair, group in created.items():
+            self._register_group(self.p2p_groups, pair, group)
         torch.distributed.barrier()
 
     def get_sync_group(self, stride: int, world_size: int):

@@ -856,7 +856,7 @@ class ModuleCodeGen(FuncEmission):
         if p2p_pairs:
             self.model_init_statements.append('# P2P communication groups')
             self.model_init_statements.append(
-                f'nnscaler.runtime.device.DeviceGroup().init_p2p_groups(pairs={p2p_pairs})')
+                f'self.init_p2p_groups(pairs={p2p_pairs})')
         self.model_init_statements.append(' ')
 
     def init_attributes(self, node: IRCell) -> dict[str, dict[str, Any]]:

@@ -103,7 +103,7 @@ def manager(rank=0, world=4):
     value = object.__new__(_DeviceGroup)
     value.rank, value.world_size = rank, world
     value.groups = {'1' * world: None}
-    value._created_groups = []
+    value._owned_groups = []
     value._sync_groups, value.p2p_groups = {}, {}
     value.use_p2p_groups = True
     return value
@@ -144,8 +144,11 @@ def test_p2p_groups_have_separate_cache(monkeypatch):
     device.init_p2p_groups([(1, 0), (2, 3), (0, 0)])
     assert len(calls) == 2
     assert device.get_p2p_group(1, 0) == ((0, 1), 1, 0)
+    assert device.get_p2p_group(0, 1)[0] is not device.get_group([0, 1])
+    assert len(device._owned_groups) == 2
     device.init_p2p_groups([(0, 1), (3, 2)])
     assert len(calls) == 2
+    assert len(device._owned_groups) == 2
 
 
 def test_backend_errors_are_not_hidden_by_retry(monkeypatch):
@@ -157,16 +160,38 @@ def test_backend_errors_are_not_hidden_by_retry(monkeypatch):
         group_init.create_groups([(0, 1), (2, 3)], timeout=TIMEOUT)
 
 
-def test_close_releases_owned_groups_before_world(monkeypatch):
+@pytest.mark.parametrize('owns_world', [False, True])
+def test_close_releases_only_owned_handles_in_reverse_order(monkeypatch, owns_world):
     device = manager()
-    device._is_pg_initer = True
-    device._created_groups = ['first', dist.GroupMember.NON_GROUP_MEMBER, 'second']
+    device._is_pg_initer = owns_world
+    for key, group in [('world', None), ('first', 'first'),
+                       ('nonmember', dist.GroupMember.NON_GROUP_MEMBER), ('second', 'second')]:
+        device._register_group(device.groups, key, group)
+    assert device.groups['nonmember'] == dist.GroupMember.NON_GROUP_MEMBER
+    assert device._owned_groups == ['first', 'second']
     monkeypatch.setattr(dist, 'is_initialized', lambda: True)
     closed = []
     monkeypatch.setattr(dist, 'destroy_process_group', lambda group='world': closed.append(group))
     device.close()
-    assert closed == ['second', 'first', 'world']
-    assert not device._created_groups and not device._is_pg_initer
+    assert closed == ['second', 'first'] + (['world'] if owns_world else [])
+    assert not device._owned_groups and not device._is_pg_initer
+
+
+def test_single_group_registration_reuses_the_handle(monkeypatch):
+    device = manager()
+    fake_backend(monkeypatch, 0)
+    group = device.get_group([0, 1])
+    assert device.get_group([1, 0]) is group
+    device.get_group([2, 3])
+    assert device._owned_groups == [group]
+
+
+def test_plan_agreement_uses_one_collective(monkeypatch):
+    fake_backend(monkeypatch, 0)
+    reductions = []
+    monkeypatch.setattr(dist, 'all_reduce', lambda value, **kw: reductions.append(value))
+    group_init.create_groups([(0, 1), (2, 3)], timeout=TIMEOUT)
+    assert len(reductions) == 1
 
 
 @pytest.mark.parametrize('bound,backend,uid,rank_map,expected', [

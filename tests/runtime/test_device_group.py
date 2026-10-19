@@ -43,7 +43,6 @@ def test_barrier_warning():
 def _batched_group_worker(directory):
     from nnscaler.runtime.device import DeviceGroup, uninit_device
     from nnscaler.runtime.module import CubeModule
-    from nnscaler.runtime import group_init
 
     rank = int(os.environ['RANK'])
     torch.cuda.set_device(rank)
@@ -69,7 +68,7 @@ def _batched_group_worker(directory):
                 dist.all_reduce(value, group=manager.get_group(members))
                 assert value.item() == sum(i + 1 for i in members)
         pairs = [(0, 1), (0, 2), (1, 2), (2, 3)]
-        manager.init_p2p_groups(pairs)
+        CubeModule.init_p2p_groups(None, pairs)
         if rank in [0, 1]:
             assert manager.get_p2p_group(0, 1)[0] is not manager.get_group([0, 1])
         for src, dst in pairs:

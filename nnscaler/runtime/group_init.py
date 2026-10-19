@@ -40,6 +40,23 @@ def _split_context():
     return device, supported
 
 
+def _agree_on_split(groups):
+    """Validate the shared group plan and require split support on every rank."""
+    context = _split_context()
+    if context is None:
+        return False
+    device, supported = context
+    signature = int.from_bytes(hashlib.sha256(repr(groups).encode()).digest()[:8], 'big') >> 1
+    # One MIN reduction computes all(supported), min(signature), -max(signature).
+    # Equal minimum and maximum mean every rank supplied the same plan hash.
+    agreement = torch.tensor([int(supported), signature, -signature], dtype=torch.int64, device=device)
+    dist.all_reduce(agreement, op=dist.ReduceOp.MIN)
+    all_supported, min_signature, neg_max_signature = agreement.tolist()
+    if min_signature != -neg_max_signature:
+        raise ValueError('Ranks supplied different pending communication groups')
+    return bool(all_supported)
+
+
 def create_groups(groups, *, timeout):
     """All WORLD ranks declare the same memberships in the same call order.
 
@@ -48,17 +65,7 @@ def create_groups(groups, *, timeout):
     """
     if not groups:
         return {}
-    context = _split_context()
-    can_split = False
-    if context is not None:
-        device, supported = context
-        signature = int.from_bytes(hashlib.sha256(repr(groups).encode()).digest()[:8], 'big') >> 1
-        agreement = torch.tensor([int(supported), signature, -signature], dtype=torch.int64, device=device)
-        dist.all_reduce(agreement, op=dist.ReduceOp.MIN)
-        can_split, minimum, negative_maximum = agreement.tolist()
-        if minimum != -negative_maximum:
-            raise ValueError('Ranks supplied different pending communication groups')
-    if not can_split:
+    if not _agree_on_split(groups):
         return {ranks: dist.new_group(list(ranks), timeout=timeout) for ranks in groups}
 
     rank = dist.get_rank()
