@@ -721,7 +721,7 @@ class ModuleCodeGen(FuncEmission):
 
     def emit_comm_groups(self):
         """
-        Collect groups that all runtime devices initialize through get_groups.
+        Collect groups that all runtime devices initialize through init_groups.
 
         The fields storing intermediate codes that are populated by this method:
         - `model_init_statements`
@@ -729,7 +729,7 @@ class ModuleCodeGen(FuncEmission):
         groups = [[rank] for rank in range(self.runtime_ndevs)]
         groups.extend(list(ranks) for ranks in self.comm_groups)
         self.model_init_statements.append('# communication groups')
-        self.model_init_statements.append(f'self.get_groups(ranks={groups})')
+        self.model_init_statements.append(f'self.init_groups(ranks={groups})')
         self.model_init_statements.append(' ')
 
     def init_attributes(self, node: IRCell) -> dict[str, dict[str, Any]]:

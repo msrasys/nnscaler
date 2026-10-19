@@ -15,7 +15,7 @@ The above restrictions are necessary for the pipeline parallelism to work. Of co
 ## Communication group initialization
 
 Generated modules initialize their communication groups automatically through
-`CubeModule.get_groups(ranks)`, which delegates to `DeviceGroup().get_groups(ranks)`.
+`CubeModule.init_groups(ranks)`, which delegates to `DeviceGroup().get_groups(ranks)`.
 Code generation collects singleton, collective, reducer, ZeRO, and P2P groups.
 At runtime, `get_groups` deduplicates groups, reuses WORLD for full-world
 membership, and batches groups with disjoint rank memberships.

@@ -51,7 +51,7 @@ def test_batched_group_initialization():
             assert split.call_count == 3
             ranks = [[1, 3], [0, 1], [0, 2], [2, 0], [0, 1, 2, 3]]
             expected = [dist.GroupMember.NON_GROUP_MEMBER, pair, extra, extra, None]
-            assert module.get_groups(ranks) == expected
+            assert module.init_groups(ranks) == expected
             assert split.call_args.kwargs['split_ranks'] == [[0, 2], [1, 3]]
             assert device.get_groups(ranks) == expected
             assert device.get_groups([]) == []
