@@ -472,6 +472,9 @@ class CubeModule(torch.nn.Module):
             raise TypeError("Expected ranks to be List[int]")
         DeviceGroup().get_group(ranks)
 
+    def get_groups(self, ranks: List[List[int]]):
+        return DeviceGroup().get_groups(ranks)
+
     def get_checkpoint(self, optimizer: torch.optim.Optimizer = None):
         state_dict = super().state_dict()
         # backward compatibility

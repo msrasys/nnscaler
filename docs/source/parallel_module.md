@@ -12,6 +12,32 @@ An end2end module is a module which satisfies:
 
 The above restrictions are necessary for the pipeline parallelism to work. Of course, you can still use the parallel module without pipeline parallelism for end2end modules.
 
+## Communication group initialization
+
+Generated modules initialize their communication groups automatically through
+`CubeModule.get_groups(ranks)`, which delegates to `DeviceGroup().get_groups(ranks)`.
+Code generation collects singleton, collective, reducer, ZeRO, and P2P groups.
+At runtime, `get_groups` deduplicates groups, reuses WORLD for full-world
+membership, and batches groups with disjoint rank memberships.
+P2P and collective operations with the same members reuse the same process group.
+
+On PyTorch 2.5 and later, initialization uses one `torch.distributed.split_group`
+call per batch when WORLD uses NCCL and has a bound `device_id`. Otherwise,
+including older PyTorch versions or an externally initialized WORLD without a
+bound device, groups are created sequentially with `new_group`.
+All WORLD ranks must initialize the generated modules in the same order,
+including ranks outside a particular subgroup.
+
+For groups needed at runtime, `DeviceGroup().get_groups(ranks)` accepts a list of
+rank lists and automatically deduplicates and batches them using the same logic
+as generated modules. It returns groups in input order, preserving duplicate
+entries and returning `None` for WORLD. Existing groups are reused. All WORLD
+ranks must call it with the same memberships, including nonmembers.
+
+The existing `CubeModule.init_group(ranks)` API remains unchanged. Standalone P2P
+adapter calls use WORLD when their pair group has not been initialized.
+Regenerate previously compiled modules to use batched initialization.
+
 ## Weight initialization
 
 By default, nnScaler saves the original model's weights during compilation and

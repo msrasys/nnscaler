@@ -18,6 +18,27 @@ _logger = logging.getLogger(__name__)
 _LARGE_TIMEOUT = datetime.timedelta(seconds=21600)
 
 
+def _group_batches(groups: List[List[int]], world_size: int) -> List[List[List[int]]]:
+    """Deduplicate non-WORLD groups and pack them into deterministic disjoint batches."""
+    batches = []
+    memberships = []
+    unique_groups = {
+        # dedup and ignore WORLD groups
+        tuple(sorted(ranks)) for ranks in groups if len(ranks) < world_size
+    }
+    # Order by size, then rank membership, so all singleton groups share a batch.
+    for ranks in sorted(unique_groups, key=lambda ranks: (len(ranks), ranks)):
+        for batch, assigned in zip(batches, memberships):
+            if assigned.isdisjoint(ranks):
+                batch.append(list(ranks))
+                assigned.update(ranks)
+                break
+        else:
+            batches.append([list(ranks)])
+            memberships.append(set(ranks))
+    return batches
+
+
 class _DeviceGroup:
     def __init__(self):
         self._is_pg_initer = False
@@ -88,6 +109,48 @@ class _DeviceGroup:
                 list(ranks), timeout=_LARGE_TIMEOUT)
         return self.groups[rank_bits]
 
+    def get_groups(self, ranks: List[List[int]]):
+        """Create groups in disjoint batches and return them in input order.
+
+        All WORLD ranks must call with the same memberships. Cached groups are
+        reused; WORLD returns None and nonmembers follow get_group's behavior.
+        """
+        self._init_groups(_group_batches(ranks, self.world_size))
+        return [self.get_group(members) for members in ranks]
+
+    def _new_groups(self, ranks: List[List[int]]):
+        # split_group was introduced in PyTorch 2.5 and requires a bound NCCL WORLD.
+        use_split = (
+            torch.__version__ >= (2, 5)
+            and torch.distributed.get_backend() == 'nccl'
+            # init_process_group(device_id=...) eagerly initializes the NCCL communicator
+            # instead of waiting for the first communication; split_group requires this binding.
+            and torch.distributed.group.WORLD.bound_device_id is not None
+        )
+        if use_split:
+            group = torch.distributed.split_group(
+                split_ranks=ranks, timeout=_LARGE_TIMEOUT)
+            # None from split_group means nonmembership, not WORLD.
+            for members in ranks:
+                yield group if self.rank in members else torch.distributed.GroupMember.NON_GROUP_MEMBER
+        else:
+            _logger.warning("Falling back to torch.distributed.new_group due to unsupported split_group.")
+            for members in ranks:
+                yield torch.distributed.new_group(members, timeout=_LARGE_TIMEOUT)
+
+    def _init_groups(self, group_batches: List[List[List[int]]]):
+        """Create disjoint group batches, with all WORLD ranks participating."""
+        for batch in group_batches:
+            pending = [ranks for ranks in batch if not self.group_exists(ranks)]
+            if pending:
+                for ranks, group in zip(pending, self._new_groups(pending)):
+                    self.groups[self.bitmap(ranks)] = group
+
+    def get_p2p_group(self, src: int, dst: int):
+        """Look up a shared group without creating one; unregistered pairs use WORLD."""
+        # Only the endpoints call this, whereas group creation requires all WORLD ranks.
+        return self.groups.get(self.bitmap((src, dst)))
+
     def long_barrier(self):
         """
         Barrier synchronization with very long timeout
@@ -135,16 +198,17 @@ class _DeviceGroup:
         grid = np.arange(cnt).reshape(tuple(group_num))
         dims = list(range(len(group_num)))
         outputs = []
+        groups = []
         for dim, num in enumerate(group_num):
             remain = np.prod(np.delete(group_num, dim))
             order = tuple(dims[:dim] + dims[dim+1:] + [dim])
             grid_dim = np.transpose(grid, order).reshape((remain,num))
             grid_dim = grid_dim.tolist()
+            groups.extend(grid_dim)
             for ranks in grid_dim:
-                # initialize group
-                _ = self.get_group(ranks)
                 if self.rank in ranks:
                     outputs.append(ranks)
+        self.get_groups(groups)
         assert len(outputs) == len(group_num)
         return outputs
 
