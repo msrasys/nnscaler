@@ -114,6 +114,95 @@ def test_unbound_initialization_is_unchanged(monkeypatch):
     assert calls == [{'backend': 'nccl'}]
 
 
+@pytest.fixture
+def cache_init(monkeypatch, tmp_path):
+    monkeypatch.setattr(dist, 'is_initialized', lambda: False)
+    monkeypatch.setattr(dist, 'is_nccl_available', lambda: True)
+    monkeypatch.setattr(topology, '_managed_file', None)
+    monkeypatch.setattr(topology, '_configuration', lambda: {})
+    monkeypatch.setattr(topology, '_fingerprint', lambda size: f'node-{size}')
+    monkeypatch.setenv('LOCAL_WORLD_SIZE', '1')
+    monkeypatch.setenv('LOCAL_RANK', '0')
+    monkeypatch.setenv('XDG_CACHE_HOME', str(tmp_path))
+    for name in (topology._INPUT, topology._DUMP, topology._DUMP_RANK):
+        # Restore the original environment even if initialization adds a key.
+        monkeypatch.setenv(name, '')
+        monkeypatch.delenv(name)
+    return dict(backend='nccl', device_id=0, store=dist.HashStore(), rank=0, world_size=1)
+
+
+@pytest.mark.parametrize('cached', [False, True])
+def test_cache_surrounds_initialization(monkeypatch, cache_init, cached):
+    path = Path(topology._node_plan(1)['path'])
+    if cached:
+        data = topology._clean_xml(RAW)
+        topology._atomic_write(path, data)
+        topology._atomic_write(path.with_suffix('.sha256'), hashlib.sha256(data).hexdigest().encode())
+    calls, dumps = [], []
+    result = object()
+
+    def initialize(**kwargs):
+        calls.append(kwargs)
+        assert kwargs == {**cache_init, 'device_id': torch.device('cuda', 0)}
+        if cached:
+            assert os.environ[topology._INPUT] == str(path)
+            assert topology._DUMP not in os.environ
+        else:
+            assert topology._INPUT not in os.environ
+            assert os.environ[topology._DUMP_RANK] == '0'
+            assert not path.exists()
+            raw = Path(os.environ[topology._DUMP])
+            raw.write_bytes(RAW)
+            dumps.append(raw)
+        return result
+
+    monkeypatch.setattr(dist, 'init_process_group', initialize)
+    assert topology.init_process_group(**cache_init) is result
+    assert len(calls) == 1
+    assert topology._valid_cache(path)
+    assert os.environ[topology._INPUT] == str(path)
+    assert topology._DUMP not in os.environ and topology._DUMP_RANK not in os.environ
+    assert all(not raw.exists() for raw in dumps)
+
+
+def test_initialization_failure_restores_dump_settings_without_publishing(monkeypatch, cache_init):
+    path = Path(topology._node_plan(1)['path'])
+    monkeypatch.setenv(topology._DUMP_RANK, '17')
+    failure = RuntimeError('WORLD initialization failed')
+    calls = []
+
+    def initialize(**kwargs):
+        calls.append(kwargs)
+        assert os.environ[topology._DUMP_RANK] == '0'
+        Path(os.environ[topology._DUMP]).write_bytes(RAW)
+        raise failure
+
+    monkeypatch.setattr(dist, 'init_process_group', initialize)
+    with pytest.raises(RuntimeError) as caught:
+        topology.init_process_group(**cache_init)
+    assert caught.value is failure
+    assert len(calls) == 1
+    assert topology._DUMP not in os.environ
+    assert os.environ[topology._DUMP_RANK] == '17'
+    assert topology._INPUT not in os.environ
+    assert not path.exists() and not path.with_suffix('.sha256').exists()
+
+
+def test_unavailable_cache_still_initializes_once(monkeypatch, cache_init):
+    monkeypatch.setattr(topology, '_node_plan', lambda size: dict(ready=False, cached=False))
+    calls = []
+    result = object()
+
+    def initialize(**kwargs):
+        calls.append(kwargs)
+        assert topology._DUMP not in os.environ and topology._INPUT not in os.environ
+        return result
+
+    monkeypatch.setattr(dist, 'init_process_group', initialize)
+    assert topology.init_process_group(**cache_init) is result
+    assert len(calls) == 1
+
+
 def _topology_cache_worker(directory):
     rank = int(os.environ['RANK'])
     device = torch.device('cuda', int(os.environ['LOCAL_RANK']))

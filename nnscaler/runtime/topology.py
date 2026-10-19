@@ -2,6 +2,7 @@
 # Licensed under the MIT License.
 
 """Reuse node-local NCCL hardware topology without changing user overrides."""
+from contextlib import contextmanager
 import hashlib
 import itertools
 import json
@@ -160,15 +161,28 @@ def init_process_group(backend=None, **kwargs):
     and NCCL_TOPO_DUMP_FILE settings take precedence. No GPU ranks or live
     communicators are cached.
     """
-    global _managed_file
     kwargs['backend'] = backend
+    with _topology_cache(kwargs):
+        return dist.init_process_group(**kwargs)
+
+
+@contextmanager
+def _topology_cache(kwargs):
+    """Prepare topology before WORLD initialization and publish its cache after.
+
+    Update initialization kwargs to share the rendezvous Store. Temporary dump
+    settings are restored on failure; a new cache is published only on success.
+    """
+    global _managed_file
+    backend = kwargs['backend']
     device = kwargs.get('device_id')
     if isinstance(device, int):
         device = kwargs['device_id'] = torch.device('cuda', device)
     if (dist.is_initialized() or backend != 'nccl' or device is None
             or device.type != 'cuda' or not dist.is_nccl_available()
             or 'LOCAL_WORLD_SIZE' not in os.environ):
-        return dist.init_process_group(**kwargs)
+        yield
+        return
     if os.environ.get(_INPUT) == _managed_file and _managed_file is not None:
         os.environ.pop(_INPUT)
         _managed_file = None
@@ -184,7 +198,8 @@ def init_process_group(backend=None, **kwargs):
         store = dist.PrefixStore('default_pg', store)
         kwargs.update(store=store, rank=rank, world_size=world)
     elif kwargs.get('init_method') or rank < 0 or world <= 0:
-        return dist.init_process_group(**kwargs)
+        yield
+        return
 
     local_size = int(os.environ['LOCAL_WORLD_SIZE'])
     local_rank = int(os.environ['LOCAL_RANK'])
@@ -200,7 +215,8 @@ def init_process_group(backend=None, **kwargs):
         overrides = coordination.multi_get([f'override/{i}' for i in range(world)])
         coordination.set('external', str(int(any(value == b'1' for value in overrides))))
     if coordination.get('external') == b'1':
-        return dist.init_process_group(**kwargs)
+        yield
+        return
     if local_rank == 0:
         coordination.set(str(leader), json.dumps(_node_plan(local_size)))
     if rank == 0:
@@ -213,7 +229,8 @@ def init_process_group(backend=None, **kwargs):
     mode = coordination.get('mode').decode()
     plan = json.loads(coordination.get(str(leader)))
     if mode == 'disabled':
-        return dist.init_process_group(**kwargs)
+        yield
+        return
 
     path = Path(plan['path'])
     old_dump, old_rank = os.environ.get(_DUMP), os.environ.get(_DUMP_RANK)
@@ -224,7 +241,7 @@ def init_process_group(backend=None, **kwargs):
         os.environ[_DUMP] = plan['raw']
         os.environ[_DUMP_RANK] = str(leader)
     try:
-        result = dist.init_process_group(**kwargs)
+        yield
     finally:
         _restore(_DUMP, old_dump)
         _restore(_DUMP_RANK, old_rank)
@@ -249,4 +266,3 @@ def init_process_group(backend=None, **kwargs):
         ready = coordination.get(f'ready/{leader}').decode()
         if ready and _valid_cache(Path(ready)):
             os.environ[_INPUT] = _managed_file = ready
-    return result
