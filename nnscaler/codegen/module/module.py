@@ -844,14 +844,10 @@ class ModuleCodeGen(FuncEmission):
         The fields storing intermediate codes that are populated by this method:
         - `model_init_statements`
         """
-        # create single rank communication group
-        self.model_init_statements.append('# single rank communication groups')
-        self.model_init_statements.append(
-            f'self.init_groups([[rank] for rank in range({self.runtime_ndevs})])')
-        # create communication group
         self.model_init_statements.append('# communication groups')
         self.model_init_statements.append(
-            f'self.init_groups({[list(ranks) for ranks in self.comm_groups]})')
+            f'self.init_groups([[rank] for rank in range({self.runtime_ndevs})] + '
+            f'{[list(ranks) for ranks in self.comm_groups]})')
         p2p_pairs = self.get_p2p_pairs()
         if p2p_pairs:
             self.model_init_statements.append('# P2P communication groups')

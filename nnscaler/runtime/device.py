@@ -59,7 +59,6 @@ class _DeviceGroup:
         torch.cuda.set_device(self.local_rank)
         self.groups: Dict = { '1'*self.world_size: None }
         self._owned_groups: List = []
-        self._sync_groups = {}
         self.p2p_groups: Dict[tuple[int, int], Optional[torch.distributed.ProcessGroup]] = {}
         self.use_p2p_groups = (
             not CompileFlag.dev_mode
@@ -170,21 +169,16 @@ class _DeviceGroup:
         torch.distributed.barrier()
 
     def get_sync_group(self, stride: int, world_size: int):
-        """Cache strided replica groups for this distributed runtime.
+        """Return this rank's strided replica group, reusing existing handles.
 
-        The first call for a layout is collective, including nonmembers. Later
-        calls only look up the current rank's group. Return a fresh rank list so
-        callers cannot mutate the cached membership.
+        All WORLD ranks must participate when creating a new layout.
         """
         if not 0 < stride <= world_size <= self.world_size or world_size % stride:
             raise ValueError('Sync group size must be a positive multiple of its stride within the world')
-        key = (stride, world_size)
-        if key not in self._sync_groups:
-            groups = self.get_groups([list(range(i, world_size, stride)) for i in range(stride)])
-            ranks = tuple(range(self.rank % stride, world_size, stride))
-            self._sync_groups[key] = (ranks, groups[self.rank % stride])
-        ranks, group = self._sync_groups[key]
-        return list(ranks), group
+        rank_lists = [list(range(i, world_size, stride)) for i in range(stride)]
+        groups = self.get_groups(rank_lists)
+        index = self.rank % stride
+        return rank_lists[index], groups[index]
 
     def get_p2p_group(self, src: int, dst: int):
         """

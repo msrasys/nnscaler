@@ -104,7 +104,7 @@ def manager(rank=0, world=4):
     value.rank, value.world_size = rank, world
     value.groups = {'1' * world: None}
     value._owned_groups = []
-    value._sync_groups, value.p2p_groups = {}, {}
+    value.p2p_groups = {}
     value.use_p2p_groups = True
     return value
 
@@ -129,7 +129,7 @@ def test_invalid_memberships_are_rejected(ranks):
         manager().init_groups([ranks])
 
 
-def test_sync_cache_does_not_expose_mutable_ranks(monkeypatch):
+def test_sync_group_reuses_handles_and_returns_fresh_ranks(monkeypatch):
     device = manager(3, 6)
     calls = fake_backend(monkeypatch, 3)
     ranks, group = device.get_sync_group(2, 6)
