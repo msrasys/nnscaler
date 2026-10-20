@@ -341,6 +341,11 @@ class BuiltinDescriptorFakeFnModel(torch.nn.Module):
         return torch.Tensor.add(x, y)
 
 
+class TensorWithOverriddenAdd(torch.Tensor):
+    def add(self, other):
+        raise AssertionError("The overridden method should be replaced by the fake")
+
+
 class BuiltinMethodFakeFnModel(torch.nn.Module):
     def forward(self, x, y):
         return x.add(y)
@@ -520,6 +525,31 @@ def test_update_builtin_descriptor_fake_fn():
         traced = to_fx_graph(
             BuiltinDescriptorFakeFnModel(),
             {'x': torch.rand(10, 10), 'y': torch.rand(10, 10)},
+        )
+    finally:
+        _remove_updated_op('torch.Tensor.add')
+
+    node = next(node for node in traced.graph.nodes if node.op == 'call_method')
+    assert len(calls) == 1
+    assert node.target == 'add'
+
+
+@replace_all_device_with('cpu')
+def test_update_builtin_descriptor_passes_fake_to_overridden_method():
+    calls = []
+
+    def fake_add(x, y):
+        calls.append((x, y))
+        return x
+
+    nnscaler.update_op(torch.Tensor.add, fake_fn=fake_add)
+    try:
+        traced = to_fx_graph(
+            BuiltinDescriptorFakeFnModel(),
+            {
+                'x': torch.rand(10, 10).as_subclass(TensorWithOverriddenAdd),
+                'y': torch.rand(10, 10),
+            },
         )
     finally:
         _remove_updated_op('torch.Tensor.add')

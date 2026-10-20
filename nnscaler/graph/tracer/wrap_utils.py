@@ -223,9 +223,17 @@ def create_wrapped_leaf_func(func: Callable, *, replace_func: Optional[Callable]
             if tracer is None:
                 return func(*args, **kwargs)
             else:
-                # Preserve call_method unless the replacement is also meant to replace the traced code.
-                if is_method and (replace_func is None or not replace_traced_code):
-                    return tracer.create_proxy('call_method', method_name, args, kwargs)
+                if is_method:
+                    # replace the method call with the replacement function
+                    if replace_func is not None and replace_traced_code:
+                        return tracer.create_proxy('call_function', replace_func, args, kwargs)
+                    return tracer.create_proxy(
+                        'call_method',
+                        replace_func if replace_func is not None else method_name,
+                        args,
+                        kwargs,
+                        node_target=method_name if replace_func is not None else None,
+                    )
                 elif replace_func is None:
                     return tracer.create_proxy('call_function', func, args, kwargs)
                 else:

@@ -257,17 +257,24 @@ class ConcreteTracer(TracerBase):
 
             args_unwrapped = pytree_utils.tree_map_only(ep.ConcreteProxy, unwrap_nested_proxy, args)
             kwargs_unwrapped = pytree_utils.tree_map_only(ep.ConcreteProxy, unwrap_nested_proxy, kwargs)
-            runtime_target = None
-            if kind == 'call_method' and args_unwrapped:
-                # The method may already be leaf-wrapped; unwrap it to match the original callable used as the leaf key.
-                runtime_fn = inspect.unwrap(getattr(type(args_unwrapped[0]), target, None))
-                leaf_info = self.autowrap_leaf_function.get(runtime_fn)
-                runtime_target = leaf_info.replacement if leaf_info is not None else None
+
+            # A callable target is a tracing-only replacement supplied by a leaf wrapper.
+            # Direct method calls provide only a name, so resolve their replacement from the receiver.
+            method_execution_target = None
+            if kind == 'call_method':
+                if callable(target):
+                    # A call_method target is normally a method name. A callable is a tracing-only replacement.
+                    method_execution_target = target
+                elif args_unwrapped:
+                    runtime_fn = inspect.unwrap(getattr(type(args_unwrapped[0]), target, None))
+                    leaf_info = self.autowrap_leaf_function.get(runtime_fn)
+                    method_execution_target = leaf_info.replacement if leaf_info is not None else None
             # A lot of autograd functions are using torch.compile
             # We must revert the patcher to the original function so torch.compile can work.
             # (For non-torch.compile functions, this is not necessary, but it is safe to do so.)
-            target_to_run = runtime_target if runtime_target is not None else target
-            kind_to_run = 'call_function' if runtime_target is not None else kind
+            target_to_run = method_execution_target if method_execution_target is not None else target
+            kind_to_run = 'call_function' if method_execution_target is not None else kind
+
             if self.need_revert(target_to_run) or wrap_utils.is_autograd_apply(target_to_run):
                 with self.patcher.revert():
                     value_unwrapped, args_run, kwargs_run = self.strategy.run_target(
