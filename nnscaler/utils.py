@@ -806,6 +806,14 @@ def get_full_qualified_name(fn: Callable, *, apply_autograd_function: bool = Tru
     Returns:
         str: The fully qualified name of the callable.
     """
+    qualname = _get_full_qualified_name(fn, apply_autograd_function=apply_autograd_function)
+    # Local functions, lambdas, and similarly synthetic names cannot be resolved by attribute lookup.
+    if '<locals>' in qualname or any(not part.isidentifier() for part in qualname.split('.')):
+        raise ValueError(f"{fn} is not defined at an importable module or class scope")
+    return qualname
+
+
+def _get_full_qualified_name(fn: Callable, *, apply_autograd_function: bool = True) -> str:
     if apply_autograd_function and inspect.isclass(fn) and issubclass(fn, torch.autograd.Function):
         return f'{fn.__module__}.{fn.__qualname__}.apply'
     if isinstance(fn, torch.ScriptFunction):
@@ -857,9 +865,6 @@ def get_full_qualified_name(fn: Callable, *, apply_autograd_function: bool = Tru
     # A fully qualified name requires both a module path and a name within that module.
     if not module or not qualname:
         raise ValueError(f"Cannot determine the fully qualified name of {fn}")
-    # Local functions, lambdas, and similarly synthetic names cannot be resolved by attribute lookup.
-    if '<locals>' in qualname or any(not part.isidentifier() for part in qualname.split('.')):
-        raise ValueError(f"{fn} is not defined at an importable module or class scope")
     # Join the importable module path with the function's class-aware qualified name.
     return f'{module}.{qualname}'
 

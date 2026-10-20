@@ -261,6 +261,16 @@ def test_get_full_qualified_name_rejects_local_function():
         get_full_qualified_name(local_function)
 
 
+@pytest.mark.parametrize('use_apply', [False, True])
+def test_get_full_qualified_name_rejects_local_autograd_function(use_apply):
+    class LocalFunction(torch.autograd.Function):
+        pass
+
+    target = LocalFunction.apply if use_apply else LocalFunction
+    with pytest.raises(ValueError, match='not defined at an importable'):
+        get_full_qualified_name(target)
+
+
 def test_get_full_qualified_name_rejects_opaque_decorator():
     @opaque_decorator
     def decorated_function():
