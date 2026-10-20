@@ -778,6 +778,7 @@ def _get_public_torch_callable_name(fn: Callable) -> Optional[str]:
             if getattr(namespace, name, None) is fn:
                 return f'{namespace_name}.{name}'
 
+    # Restrict different-name alias lookup to Torch C callables, e.g. linalg_norm -> torch.linalg.norm.
     module = getattr(fn, '__module__', None)
     if not isinstance(module, str) or not module.startswith('torch._C'):
         return None
