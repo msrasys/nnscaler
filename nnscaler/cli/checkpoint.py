@@ -154,6 +154,8 @@ if __name__ == '__main__':
         # never broadcast generated files.
         train_args.broadcast_strategy = 'none'
         train_args.checkpoint.resume_from = None
+        # Offline rank simulation cannot run cross-rank initialization checks.
+        train_args.debug.param_init_check = False
         _distribute_checkpoint(train_args, from_, to_)
     else:
         raise ValueError(f"Unknown command: {argv[0]}")

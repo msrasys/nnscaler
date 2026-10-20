@@ -13,7 +13,7 @@ from nnscaler.graph.parser.register import CustomizedOps
 from nnscaler.graph import IRGraph
 from nnscaler.flags import CompileFlag
 
-from nnscaler.graph.parser import parse_fx_module
+from nnscaler.graph.parser import AttrSaveLevel, parse_fx_module
 from nnscaler.graph.tracer import concrete_trace
 from nnscaler.graph.tracer.wrap_utils import Location, is_autograd_apply, LeafWrapInfo
 from nnscaler.graph.tracer.torch_fx_patcher import side_effectful_inplace_ops
@@ -162,6 +162,8 @@ def to_ir_graph(
     dummy_input: Dict[str, Any],
     attr_savedir: Union[str, Path],
     constant_folding: bool = True,
+    *,
+    save_level: AttrSaveLevel = AttrSaveLevel.ALL,
 ) -> IRGraph:
     """Convert torch.fx.GraphModule based model into IRGraph
 
@@ -172,6 +174,7 @@ def to_ir_graph(
         constant_folding (bool):
             whether to enable constant folding. Default True.
         attr_savedir (Union[str, Path]): directory to save content (attribtes)
+        save_level (AttrSaveLevel): attribute files to save; defaults to ALL.
 
     Returns:
         IRGraph: IRGraph of model
@@ -183,7 +186,7 @@ def to_ir_graph(
             traced_model, dummy_input,
             attr_savedir=attr_savedir,
             constant_folding=constant_folding,
-            save_content=True,
+            save_level=save_level,
         )
     module_name = traced_model.__class__.__name__
 
