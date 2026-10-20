@@ -168,8 +168,8 @@ def allreduce_linear(x: torch.Tensor, weight: torch.Tensor):
 
 ### Fake Function for a Built-in Operator
 
-Use `update_op` when an operator is already supported by nnScaler but needs
-updated optional metadata such as a lightweight implementation for tracing:
+Use `update_op` to override metadata for an existing tracer leaf or registered
+operator, for example with a lightweight implementation for tracing:
 
 ```python
 def fake_add(x, y, *, alpha=1):
@@ -179,29 +179,24 @@ nnscaler.update_op(torch.add, fake_fn=fake_add)
 ```
 
 `update_op` can also override `op_create_fn`, `code`, `emit_fn`, and
-`input_gen_fn`. The runtime callable is always recorded, while each optional
-field is independent: unspecified fields keep their existing customized or
-system-defined behavior and are not materialized in `CustomizedOps`. Pass
-`None` to remove an existing override. An operator registered with
-`register_op` cannot remove its only `op_create_fn` unless it was already a
-tracer leaf or has a system creator to fall back to.
+`input_gen_fn`. Omitted fields keep their current behavior; `None` removes a
+customized override. Removing `op_create_fn` requires an existing tracer leaf
+or system creator to fall back to.
 
-Aliases discovered from the loaded PyTorch runtime share the same update.
-nnScaler includes paths that reference the same runtime callable and bridges
-same-name operators between `torch` and `torch.Tensor`. For example, updating
-either `torch.add` or `torch.Tensor.add` updates both signatures, so metadata
-still applies after parser method normalization. Different
-`torch.nn.functional` wrappers are not inferred from their names. In-place
-variants and `operator` functions are also not inferred as aliases. Custom
-operators are not expanded by these PyTorch-specific rules.
+Updates cover discovered PyTorch identity aliases and same-name `torch` /
+`torch.Tensor` methods: updating `torch.add` also updates `torch.Tensor.add`.
+Different functional wrappers, in-place counterparts, and `operator` functions
+are not inferred as aliases. Custom operators and Autograd `Function.apply`
+use a single canonical signature.
 
-The signature is derived from the runtime callable. `update_op` only modifies
-operators that are already tracer leaves or registered with `register_op`.
-Built-in Torch functions and Tensor methods are normally tracer leaves even
-when nnScaler has no dedicated IR creator for them. Use `register_op` for a new
-Python operator that the tracer would otherwise trace through. Torch functions
-that are reached only through the tracer's `__torch_function__` fallback are
-not supported by `update_op`; they must first be made explicit wrapped leaves.
+Dunder paths are excluded: `Tensor.__add__` and `Tensor.__pow__` are rejected.
+If a dunder attribute is the same object as an ordinary method (for example,
+`Tensor.__abs__ is Tensor.abs`), it is accepted under the ordinary name only.
+
+An existing leaf does not need a dedicated IR creator to use `update_op`.
+Use `register_op` for a new Python operator that would otherwise be traced
+through. Functions reached only through the generic `__torch_function__`
+fallback are not supported; they must first become explicit wrapped leaves.
 
 The fake function is only executed during tracing. The traced graph and
 generated code continue to use the original operator.

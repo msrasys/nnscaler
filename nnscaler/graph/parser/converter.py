@@ -2,6 +2,7 @@
 #  Licensed under the MIT License.
 
 from typing import Any, Dict, Union
+import importlib
 import logging
 from pathlib import Path
 import operator
@@ -16,6 +17,7 @@ from nnscaler.graph.parser import parse_fx_module
 from nnscaler.graph.tracer import concrete_trace
 from nnscaler.graph.tracer.wrap_utils import Location, is_autograd_apply, LeafWrapInfo
 from nnscaler.graph.tracer.torch_fx_patcher import side_effectful_inplace_ops
+from nnscaler.utils import load_type
 
 import nnscaler.runtime.function as cube_rt_function
 
@@ -24,6 +26,35 @@ import torch.fx
 from torch.autograd.graph import saved_tensors_hooks
 
 _logger = logging.getLogger(__name__)
+
+
+def _customized_leaf_functions() -> Dict[Any, LeafWrapInfo]:
+    leaf_functions = {}
+    for signature, runtime_fn in CustomizedOps.kOpRuntime.items():
+        if is_autograd_apply(runtime_fn):
+            continue
+
+        leaf_info = leaf_functions.get(runtime_fn)
+        if leaf_info is None:
+            leaf_info = LeafWrapInfo([], True, None, replace_traced_code=False)
+            leaf_functions[runtime_fn] = leaf_info
+        leaf_info.replacement = CustomizedOps.kOpFakeRuntime.get(signature)
+
+        # find the location of the function in its namespace
+        # Note if a function has multiple aliases
+        # we will add all locations to the extra_locs of the leaf info
+        namespace_name, attr_name = signature.rsplit('.', 1)
+        try:
+            namespace = importlib.import_module(namespace_name)
+        except ModuleNotFoundError:
+            # when namespace is not a module, it might be a class/variable/etc
+            namespace = load_type(namespace_name)
+        if getattr(namespace, attr_name, None) is not runtime_fn:
+            raise RuntimeError(
+                f"Registered operator {signature} no longer resolves to its registered runtime function"
+            )
+        leaf_info.extra_locs.append(Location(namespace, attr_name))
+    return leaf_functions
 
 
 class no_save_tensor_hook(saved_tensors_hooks):
@@ -82,18 +113,10 @@ def to_fx_graph(model: torch.nn.Module, dummy_input) -> torch.fx.GraphModule:
     # get user registered functions, and treat them as leaf functions
     # torch function/operators/builtins/... are automatically handled as leaf functions by concrete trace
     # filter out torch.autograd.Function.apply as concrete trace already treats them as leaf function
-    leaf_functions = {
-        runtime_fn: LeafWrapInfo(
-            [], True, CustomizedOps.kOpFakeRuntime.get(signature),
-            replace_traced_code=False,
-        )
-        for signature, runtime_fn in CustomizedOps.kOpRuntime.items()
-        if not is_autograd_apply(runtime_fn)
-    }
+    leaf_functions = _customized_leaf_functions()
 
     # importlib functions
     # currently only import_module is handled in the code
-    import importlib
     leaf_functions.update({
         func: LeafWrapInfo([Location(importlib, func.__name__)], False, None)
         for func in [importlib.import_module]

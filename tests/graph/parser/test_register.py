@@ -371,8 +371,16 @@ class BuiltinBatchNormModel(torch.nn.Module):
         )
 
 
+class BuiltinLinearModel(torch.nn.Module):
+    def forward(self, x, weight):
+        return F.linear(x, weight)
+
+
 def _remove_updated_op(signature):
-    for alias in _get_torch_op_aliases(signature):
+    if not isinstance(signature, str):
+        signature = get_full_qualified_name(signature)
+    aliases = _get_torch_op_aliases(load_type(signature)) if signature.startswith('torch.') else (signature,)
+    for alias in aliases:
         for registry in (
             CustomizedOps.kOpMap,
             CustomizedOps.kOpRuntime,
@@ -421,12 +429,47 @@ def test_get_torch_op_aliases_from_runtime(runtime_fn, expected):
         assert callable(load_type(alias))
 
 
-def test_get_torch_op_aliases_is_symmetric():
-    expected = set(_get_torch_op_aliases(torch.add))
-    assert 'torch.Tensor.add_' not in expected
+@pytest.mark.parametrize('runtime_fn', [torch.add, torch.abs])
+def test_get_torch_op_aliases_is_symmetric(runtime_fn):
+    expected = set(_get_torch_op_aliases(runtime_fn))
+    assert f'torch.Tensor.{runtime_fn.__name__}' in expected
+    assert f'torch.Tensor.{runtime_fn.__name__}_' not in expected
     assert not any(alias.startswith('_operator.') for alias in expected)
-    for runtime_fn in (torch.add, torch.Tensor.add):
-        assert set(_get_torch_op_aliases(runtime_fn)) == expected
+    assert not any(
+        alias.rsplit('.', 1)[-1].startswith('__') and alias.endswith('__')
+        for alias in expected
+    )
+    assert set(_get_torch_op_aliases(getattr(torch.Tensor, runtime_fn.__name__))) == expected
+
+
+@pytest.mark.parametrize('runtime_fn', [
+    torch.Tensor.__add__,
+    torch.Tensor.__pow__,
+    torch.Tensor.dtype.__get__,
+])
+def test_tensor_dunder_update_is_rejected(runtime_fn):
+    runtimes = dict(CustomizedOps.kOpRuntime)
+    fakes = dict(CustomizedOps.kOpFakeRuntime)
+    with pytest.raises(ValueError, match='[Dd]under'):
+        nnscaler.update_op(runtime_fn, fake_fn=lambda x, y: x)
+    assert CustomizedOps.kOpRuntime == runtimes
+    assert CustomizedOps.kOpFakeRuntime == fakes
+
+@pytest.mark.parametrize(
+    ('public_fn', 'internal_signature'),
+    [
+        (torch.linalg.norm, 'torch._C._linalg.linalg_norm'),
+        (torch.fft.fft, 'torch._C._fft.fft_fft'),
+        (torch.special.gammaln, 'torch._C._special.special_gammaln'),
+    ],
+)
+def test_get_torch_op_aliases_is_symmetric_with_internal_alias(public_fn, internal_signature):
+    aliases = _get_torch_op_aliases(public_fn)
+    assert aliases[0] == get_full_qualified_name(public_fn)
+    expected = set(aliases)
+
+    assert internal_signature in expected
+    assert set(_get_torch_op_aliases(load_type(internal_signature))) == expected
 
 
 def test_get_torch_op_aliases_does_not_match_functional_by_name():
@@ -471,19 +514,55 @@ def test_functional_fake_fn_does_not_override_same_name_torch_op():
     assert node.target is torch.batch_norm
 
 
+@replace_all_device_with('cpu')
+def test_update_builtin_functional_alias_uses_fake_fn():
+    calls = []
+
+    def fake_linear(x, weight):
+        calls.append((x, weight))
+        return x
+
+    nnscaler.update_op(F.linear, fake_fn=fake_linear)
+    try:
+        traced = to_fx_graph(
+            BuiltinLinearModel(),
+            {
+                'x': torch.randn(2, 3),
+                'weight': torch.randn(3, 3),
+            },
+        )
+    finally:
+        _remove_updated_op('torch.nn.functional.linear')
+
+    assert len(calls) == 1
+    node = next(node for node in traced.graph.nodes if node.op == 'call_function')
+    assert node.target is F.linear
+
+
 def test_get_torch_op_aliases_scans_runtime_namespaces(monkeypatch):
     monkeypatch.setattr(torch, 'nnscaler_test_add_alias', torch.add, raising=False)
     assert 'torch.nnscaler_test_add_alias' in _get_torch_op_aliases(torch.add)
 
 
-def test_get_torch_op_aliases_keeps_custom_op_independent():
-    signature = get_full_qualified_name(mock_add)
-    assert _get_torch_op_aliases(mock_add) == (signature,)
-    assert _get_torch_op_aliases(signature) == (signature,)
+def test_update_custom_op_does_not_expand_torch_aliases(monkeypatch):
+    def unexpected_alias_lookup(runtime_fn):
+        raise AssertionError("Custom operators must not use Torch alias discovery")
+
+    monkeypatch.setitem(nnscaler.update_op.__globals__, '_get_torch_op_aliases', unexpected_alias_lookup)
+    for runtime_fn in (mock_add, MockAGF, MockAGF.apply):
+        assert nnscaler.update_op(runtime_fn) is runtime_fn
+        assert get_full_qualified_name(runtime_fn) in CustomizedOps.kOpRuntime
 
 
-def test_get_torch_op_aliases_preserves_public_nested_torch_namespace():
-    assert _get_torch_op_aliases(torch.linalg.norm) == ('torch.linalg.norm',)
+def test_trace_rejects_stale_registered_location(monkeypatch):
+    signature = f'{__name__}.mock_add'
+    monkeypatch.setattr(__name__ + '.mock_add', torch.add)
+
+    with pytest.raises(RuntimeError, match=f'Registered operator {signature} no longer resolves'):
+        to_fx_graph(
+            BuiltinFunctionFakeFnModel(),
+            {'x': torch.randn(2, 3), 'y': torch.randn(2, 3)},
+        )
 
 
 @replace_all_device_with('cpu')
@@ -628,7 +707,7 @@ def test_update_op_preserves_existing_fields():
         input_gen_fn=generate_inputs,
     )
     try:
-        aliases = _get_torch_op_aliases('torch.add')
+        aliases = _get_torch_op_aliases(torch.add)
         for alias in aliases:
             assert CustomizedOps.kOpMap[alias] is create_add
             assert callable(CustomizedOps.kOpRuntime[alias])
@@ -677,7 +756,7 @@ def test_update_op_clears_optional_fields():
         input_gen_fn=None,
     )
     try:
-        aliases = _get_torch_op_aliases('torch.add')
+        aliases = _get_torch_op_aliases(torch.add)
         assert all(alias not in CustomizedOps.kOpMap for alias in aliases)
         assert all(alias not in CustomizedOps.kOpCodeDef for alias in aliases)
         assert all(alias not in CustomizedOps.kOpFakeRuntime for alias in aliases)

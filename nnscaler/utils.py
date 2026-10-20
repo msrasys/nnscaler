@@ -759,6 +759,7 @@ def load_type(type_name: str):
         raise RuntimeError(f"Failed to load type {type_name}") from e
 
 
+# Each entry is (import path, namespace object).
 _PUBLIC_TORCH_NAMESPACES = (
     ('torch.Tensor', torch.Tensor),
     ('torch', torch),

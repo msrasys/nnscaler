@@ -615,6 +615,12 @@ class ConcreteTracer(TracerBase):
                         default_tracer=self if wrap_info.is_force_trace else None,
                         replace_traced_code=wrap_info.replace_traced_code,
                     )
+
+            deduplicated_locations = []
+            for loc in locations:
+                if not any(existing.ns is loc.ns and existing.name == loc.name for existing in deduplicated_locations):
+                    deduplicated_locations.append(loc)
+            locations = tuple(deduplicated_locations)
             wrapped_leaf_leaves[func] = (locations, wrapped)
 
         for clz, wrap_info in leaf_class.items():

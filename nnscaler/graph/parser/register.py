@@ -5,7 +5,7 @@
 Register cutomized function
 """
 
-from typing import Dict, Callable, Optional, Union, List, Tuple
+from typing import Callable, Dict, List, Optional, Tuple, Union
 from functools import partial
 import inspect
 import logging
@@ -20,7 +20,7 @@ from nnscaler.graph.tracer.wrap_utils import (
     is_default_leaf_function,
 )
 from nnscaler.ir.operator import IRTensor, IRFwOperation
-from nnscaler.utils import get_full_qualified_name, load_type
+from nnscaler.utils import _PUBLIC_TORCH_NAMESPACES, get_full_qualified_name, load_type
 
 _logger = logging.getLogger(__name__)
 
@@ -322,54 +322,57 @@ register = register_op
 no_change = object()
 
 
+# Each entry is (import path, namespace object).
 _TORCH_TENSOR_NAMESPACES = (
     ('torch', torch),
     ('torch.Tensor', torch.Tensor),
 )
 
-_RUNTIME_NAMESPACES = _TORCH_TENSOR_NAMESPACES + (
-    ('torch.nn.functional', torch.nn.functional),
-    ('torch.functional', torch.functional),
+_RUNTIME_NAMESPACES = _PUBLIC_TORCH_NAMESPACES + (
     ('torch._C._nn', torch._C._nn),
+    ('torch._C._linalg', torch._C._linalg),
+    ('torch._C._fft', torch._C._fft),
+    ('torch._C._special', torch._C._special),
 )
 
 
-def _get_torch_op_aliases(runtime_fn: Union[str, Callable]) -> tuple[str, ...]:
+def _get_torch_op_aliases(runtime_fn: Callable) -> tuple[str, ...]:
     """
     Return runtime aliases and same-name torch/Tensor aliases for a PyTorch operator.
-    Currently we don't take inplace operators into account (torch.Tensor.add_ for example).
-    And we also don't consider operator overloads (like __add__ for example).
+    Dunder locations are excluded, and dunder-only callables are unsupported.
+    Inplace/out-of-place counterparts are not inferred.
     """
-    if isinstance(runtime_fn, str):
-        signature = runtime_fn
-        try:
-            runtime_fn = load_type(signature)
-        except RuntimeError:
-            return (signature,)
-    else:
-        signature = get_full_qualified_name(runtime_fn)
-
-    aliases = [signature]
-    for namespace_name, namespace in _RUNTIME_NAMESPACES:
-        aliases.extend(
-            f'{namespace_name}.{alias_name}'
-            for alias_name, value in vars(namespace).items()
-            if value is runtime_fn
-        )
-
     name = getattr(runtime_fn, '__name__', None)
-    torch_tensor_alias = name and any(
-        getattr(namespace, name, None) is runtime_fn
+    if name and name.startswith('__') and name.endswith('__'):
+        raise ValueError("Dunder operator entry points are not supported by update_op")
+    signature = get_full_qualified_name(runtime_fn)
+    aliases = []
+
+    candidates = [runtime_fn]
+
+    # Module-inherited attributes such as torch.__eq__ are not Torch operators.
+    bridge_functions = [
+        vars(namespace).get(name) if inspect.ismodule(namespace) else getattr(namespace, name, None)
         for _, namespace in _TORCH_TENSOR_NAMESPACES
-    )
-    # torch.add and torch.Tensor.add are normalized to the same parser signature.
-    if torch_tensor_alias:
-        aliases.extend(
-            f'{namespace_name}.{name}'
-            for namespace_name, namespace in _TORCH_TENSOR_NAMESPACES
-            if callable(getattr(namespace, name, None))
-        )
-    return tuple(dict.fromkeys(aliases))
+    ] if name else []
+    # torch.add and torch.Tensor.add share a parser signature despite different identities.
+    if any(candidate is runtime_fn for candidate in bridge_functions):
+        for (namespace_name, _), candidate in zip(_TORCH_TENSOR_NAMESPACES, bridge_functions):
+            if callable(candidate):
+                aliases.append(f'{namespace_name}.{name}')
+                candidates.append(candidate)
+
+    for namespace_name, namespace in _RUNTIME_NAMESPACES:
+        for alias_name, value in vars(namespace).items():
+            if alias_name.startswith('__') and alias_name.endswith('__'):
+                continue
+            if any(value is candidate for candidate in candidates):
+                aliases.append(f'{namespace_name}.{alias_name}')
+
+    if not aliases:
+        raise ValueError(f"No non-dunder runtime alias found for {signature}")
+
+    return tuple(dict.fromkeys([signature] + aliases))
 
 
 def _is_existing_tracer_leaf(runtime_fn: Callable, signatures: tuple[str, ...]) -> bool:
@@ -403,6 +406,8 @@ def update_op(
     for an ordinary Python function that the tracer would otherwise trace
     through. Pass an importable function or unbound method such as
     ``torch.Tensor.add`` rather than an instance-bound method such as ``x.add``.
+    Dunder locations such as ``torch.Tensor.__add__`` are not aliases.
+    Callables exposed only through dunder locations are rejected.
 
     ``fake_fn`` replaces execution only while concrete values are collected
     during tracing. The FX node keeps ``runtime_fn`` as its target, so generated
@@ -457,7 +462,15 @@ def update_op(
         raise ValueError("Autograd function cannot have fake runtime function. "
                          "Please wrap the autograd function and register the wrapper function instead.")
 
-    signatures = _get_torch_op_aliases(runtime_fn)
+    name = getattr(runtime_fn, '__name__', None)
+    if name and name.startswith('__') and name.endswith('__'):
+        raise ValueError("Dunder operator entry points are not supported by update_op")
+    signature = get_full_qualified_name(runtime_fn)
+    signatures = (
+        _get_torch_op_aliases(runtime_fn)
+        if signature.startswith('torch.') and not is_autograd_apply(runtime_fn)
+        else (signature,)
+    )
     # Import locally because mapping imports this module to access CustomizedOps.
     from nnscaler.graph.parser.mapping import SignFx2Op
     is_tracer_leaf = _is_existing_tracer_leaf(runtime_fn, signatures)
