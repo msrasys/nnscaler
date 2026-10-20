@@ -482,8 +482,8 @@ def test_get_torch_op_aliases_keeps_custom_op_independent():
     assert _get_torch_op_aliases(signature) == (signature,)
 
 
-def test_get_torch_op_aliases_does_not_flatten_nested_torch_namespaces():
-    assert _get_torch_op_aliases(torch.linalg.norm) == ('torch._C._linalg.linalg_norm',)
+def test_get_torch_op_aliases_preserves_public_nested_torch_namespace():
+    assert _get_torch_op_aliases(torch.linalg.norm) == ('torch.linalg.norm',)
 
 
 @replace_all_device_with('cpu')

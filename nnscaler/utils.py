@@ -759,6 +759,34 @@ def load_type(type_name: str):
         raise RuntimeError(f"Failed to load type {type_name}") from e
 
 
+_PUBLIC_TORCH_NAMESPACES = (
+    ('torch.Tensor', torch.Tensor),
+    ('torch', torch),
+    ('torch.nn.functional', torch.nn.functional),
+    ('torch.functional', torch.functional),
+    ('torch.linalg', torch.linalg),
+    ('torch.fft', torch.fft),
+    ('torch.special', torch.special),
+)
+
+
+def _get_public_torch_callable_name(fn: Callable) -> Optional[str]:
+    name = getattr(fn, '__name__', None)
+    if name:
+        for namespace_name, namespace in _PUBLIC_TORCH_NAMESPACES:
+            if getattr(namespace, name, None) is fn:
+                return f'{namespace_name}.{name}'
+
+    module = getattr(fn, '__module__', None)
+    if not isinstance(module, str) or not module.startswith('torch._C'):
+        return None
+    for namespace_name, namespace in _PUBLIC_TORCH_NAMESPACES:
+        for alias, value in vars(namespace).items():
+            if value is fn:
+                return f'{namespace_name}.{alias}'
+    return None
+
+
 def get_full_qualified_name(fn: Callable, *, apply_autograd_function: bool = True) -> str:
     """
     Get the import-style fully qualified name of a callable.
@@ -781,6 +809,10 @@ def get_full_qualified_name(fn: Callable, *, apply_autograd_function: bool = Tru
     if isinstance(fn, torch.ScriptFunction):
         # ScriptFunction metadata describes the wrapper type; use the original Python function.
         fn = fn._torchdynamo_inline
+    # Public PyTorch wrappers may unwrap to non-importable local implementation functions.
+    public_torch_name = _get_public_torch_callable_name(fn)
+    if public_torch_name is not None:
+        return public_torch_name
     bound_self = getattr(fn, '__self__', None)
     # Raw descriptors obtained from Class.__dict__ expose the underlying function via __func__.
     if isinstance(fn, (staticmethod, classmethod)):
@@ -800,13 +832,9 @@ def get_full_qualified_name(fn: Callable, *, apply_autograd_function: bool = Tru
         return f'{bound_self.__module__}.{bound_self.__qualname__}.apply'
 
     # PyTorch C callables expose internal owner names; prefer their public import paths.
-    if name and getattr(torch.Tensor, name, None) is fn:
-        return f'torch.Tensor.{name}'
-    if name and getattr(torch, name, None) is fn:
-        return f'torch.{name}'
-    # torch._C._nn.linear -> torch.nn.functional.linear
-    if name and getattr(torch.nn.functional, name, None) is fn:
-        return f'torch.nn.functional.{name}'
+    public_torch_name = _get_public_torch_callable_name(fn)
+    if public_torch_name is not None:
+        return public_torch_name
 
     # Python functions and methods normally provide both fields directly.
     module = getattr(fn, '__module__', None)

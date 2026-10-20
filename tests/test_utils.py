@@ -9,7 +9,7 @@ import pytest
 import torch
 
 from nnscaler.utils import (
-    select_many, classproperty, fields, get_full_qualified_name, set_member_by_name, unchecked_fields,
+    select_many, classproperty, fields, get_full_qualified_name, load_type, set_member_by_name, unchecked_fields,
     transform_recursively, first, first_or, StepwiseConfig, recursion_limit,
 )
 
@@ -161,6 +161,23 @@ def test_get_full_qualified_name_decorated(fn, qualname):
 )
 def test_get_full_qualified_name_torch(fn, qualified_name):
     assert get_full_qualified_name(fn) == qualified_name
+
+
+@pytest.mark.parametrize(
+    ('fn', 'qualified_name'),
+    [
+        (torch.unique, 'torch.unique'),
+        (torch.nn.functional.max_pool2d, 'torch.nn.functional.max_pool2d'),
+        (torch.linalg.norm, 'torch.linalg.norm'),
+        (torch.fft.fft, 'torch.fft.fft'),
+        (torch.special.gammaln, 'torch.special.gammaln'),
+    ],
+)
+def test_get_full_qualified_name_public_torch_op(fn, qualified_name):
+    signature = get_full_qualified_name(fn)
+
+    assert signature == qualified_name
+    assert load_type(signature) is fn
 
 
 def test_get_full_qualified_name_rejects_local_function():
