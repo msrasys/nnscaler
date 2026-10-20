@@ -45,6 +45,16 @@ class MockAGF(torch.autograd.Function):
 nnscaler.register_op('*, * -> *')(MockAGF)
 
 
+class UnregisteredAGF(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x):
+        return x
+
+    @staticmethod
+    def backward(ctx, grad):
+        return grad
+
+
 def test_autograd_class_registration_uses_apply_name():
     runtime_fn = CustomizedOps.kOpRuntime[get_full_qualified_name(MockAGF)]
     assert runtime_fn.__self__ is MockAGF
@@ -692,24 +702,79 @@ def test_update_customized_op_by_runtime_fn():
         CustomizedOps.kOpFakeRuntime[signature] = original_fake_fn
 
 
+def test_update_customized_op_cannot_remove_op_create_fn():
+    signature = get_full_qualified_name(add_xy)
+    original_op_create_fn = CustomizedOps.kOpMap[signature]
+
+    with pytest.raises(ValueError, match='has no existing tracer leaf or system op creator to fall back to'):
+        nnscaler.update_op(add_xy, op_create_fn=None)
+
+    assert CustomizedOps.kOpMap[signature] is original_op_create_fn
+
+
+def test_update_existing_leaf_can_remove_op_create_fn():
+    def create_batch_norm(*args, signature=None, **kwargs):
+        return None
+
+    signature = get_full_qualified_name(F.batch_norm)
+    nnscaler.update_op(F.batch_norm, op_create_fn=create_batch_norm)
+    try:
+        assert CustomizedOps.kOpMap[signature] is create_batch_norm
+        nnscaler.update_op(F.batch_norm, op_create_fn=None)
+        assert signature not in CustomizedOps.kOpMap
+    finally:
+        _remove_updated_op(F.batch_norm)
+
+
+@pytest.mark.parametrize('runtime_fn', [UnregisteredAGF, UnregisteredAGF.apply])
+def test_update_unregistered_autograd_leaf(runtime_fn):
+    def create_autograd_op(*args, signature=None, **kwargs):
+        return None
+
+    signature = get_full_qualified_name(UnregisteredAGF)
+    nnscaler.update_op(runtime_fn, op_create_fn=create_autograd_op)
+    try:
+        assert CustomizedOps.kOpMap[signature] is create_autograd_op
+        registered_runtime = CustomizedOps.kOpRuntime[signature]
+        assert registered_runtime.__self__ is UnregisteredAGF
+        assert registered_runtime.__name__ == 'apply'
+    finally:
+        _remove_updated_op(signature)
+
+
+@pytest.mark.parametrize('runtime_fn', [UnregisteredAGF, UnregisteredAGF.apply])
+def test_update_autograd_leaf_rejects_fake_fn(runtime_fn):
+    with pytest.raises(ValueError, match='Autograd function cannot have fake runtime function'):
+        nnscaler.update_op(runtime_fn, fake_fn=lambda x: x)
+
+
 def unregistered_op(x):
     return x
 
 
-def test_update_unregistered_op_metadata():
+def test_update_non_leaf_unregistered_op_raises():
     def create_unregistered_op(*args, signature=None, **kwargs):
         return None
 
     signature = get_full_qualified_name(unregistered_op)
-    try:
+    with pytest.raises(KeyError, match='is neither an existing tracer leaf nor a registered operator'):
         nnscaler.update_op(
             unregistered_op,
             op_create_fn=create_unregistered_op,
             code='def unregistered_op(x): return x',
         )
-        assert CustomizedOps.kOpMap[signature] is create_unregistered_op
-        assert CustomizedOps.kOpCodeDef[signature] == 'def unregistered_op(x): return x'
-        assert CustomizedOps.kOpRuntime[signature] is unregistered_op
-        assert signature not in CustomizedOps.kOpFakeRuntime
-    finally:
-        _remove_updated_op(signature)
+
+    for registry in (
+        CustomizedOps.kOpMap,
+        CustomizedOps.kOpRuntime,
+        CustomizedOps.kOpFakeRuntime,
+        CustomizedOps.kOpCodeDef,
+        CustomizedOps.kOpEmit,
+        CustomizedOps.kOpInputGen,
+    ):
+        assert signature not in registry
+
+
+def test_update_unwrapped_torch_override_raises():
+    with pytest.raises(KeyError, match='is neither an existing tracer leaf nor a registered operator'):
+        nnscaler.update_op(torch.linalg.norm, fake_fn=lambda x: x)

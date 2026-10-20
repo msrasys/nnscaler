@@ -14,6 +14,7 @@ from typing import Any, Dict, Optional, Type, List, Callable, Union, TYPE_CHECKI
 import math
 import torch
 from torch.fx.proxy import Scope, ScopeContextManager
+from torch.overrides import is_tensor_method_or_property
 
 import nnscaler.graph.tracer as cct
 from . import pytree_utils, orig_func, operator_patcher
@@ -419,6 +420,15 @@ def is_autograd_op(func) -> bool:
     except TypeError:
         # if func is not a class, then it is not an autograd function
         return False
+
+
+def is_default_leaf_function(func: Callable) -> bool:
+    """Whether concrete tracing already treats a callable as a leaf."""
+    return (
+        func in default_autowrap_leaf_function
+        or is_autograd_apply(func)
+        or is_tensor_method_or_property(func)
+    )
 
 
 def create_wrapped_autograd_apply(default_tracer: 'ConcreteTracer'):

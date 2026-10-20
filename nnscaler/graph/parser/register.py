@@ -14,7 +14,11 @@ import torch
 from torch import ScriptFunction
 
 from nnscaler.graph.function.dimops import IRDimops, OpAnno, TransformRule
-from nnscaler.graph.tracer.wrap_utils import is_autograd_apply, is_autograd_op
+from nnscaler.graph.tracer.wrap_utils import (
+    is_autograd_apply,
+    is_autograd_op,
+    is_default_leaf_function,
+)
 from nnscaler.ir.operator import IRTensor, IRFwOperation
 from nnscaler.utils import get_full_qualified_name, load_type
 
@@ -368,6 +372,19 @@ def _get_torch_op_aliases(runtime_fn: Union[str, Callable]) -> tuple[str, ...]:
     return tuple(dict.fromkeys(aliases))
 
 
+def _is_existing_tracer_leaf(runtime_fn: Callable, signatures: tuple[str, ...]) -> bool:
+    candidates = {runtime_fn}
+    for signature in signatures:
+        try:
+            candidates.add(load_type(signature))
+        except RuntimeError:
+            pass
+    return any(
+        is_default_leaf_function(candidate)
+        for candidate in candidates
+    )
+
+
 def update_op(
     runtime_fn: Callable,
     *,
@@ -377,13 +394,55 @@ def update_op(
     input_gen_fn: Callable[[IRFwOperation], List[torch.Tensor]] = no_change,
     fake_fn: Optional[Callable] = no_change,
 ) -> Callable:
-    """Update optional metadata for an existing operator.
+    """Update metadata for an operator already recognized by tracing or parsing.
 
-    Unspecified metadata keeps using the existing customized or system-defined
-    value. Updates are applied to every known alias of the runtime function.
+    The target must either have an existing IR creator or already be a callable
+    leaf in concrete tracing. Existing callable leaves include default wrapped
+    functions, callable Tensor methods or properties, and
+    ``torch.autograd.Function.apply``. Use :func:`register_op`
+    for an ordinary Python function that the tracer would otherwise trace
+    through. Pass an importable function or unbound method such as
+    ``torch.Tensor.add`` rather than an instance-bound method such as ``x.add``.
+
+    ``fake_fn`` replaces execution only while concrete values are collected
+    during tracing. The FX node keeps ``runtime_fn`` as its target, so generated
+    runtime code does not call the fake. A PyTorch callable may have multiple
+    patch locations, such as ``torch.linalg.norm`` and its internal ``torch._C``
+    callable; all locations that reference the same callable use the fake while
+    preserving the same node target.
+
+    Updates are propagated to identity aliases discovered in supported PyTorch
+    namespaces, plus the same-name ``torch``/``torch.Tensor`` bridge used by
+    parser method normalization.
+
+    Each optional argument is independent. Leaving it as ``no_change`` keeps
+    the current customized or system-defined behavior. Passing ``None`` removes
+    the corresponding customized override. An ``op_create_fn`` override can be
+    removed only when the operator remains representable through an existing
+    tracer leaf or a system creator; removing the only creator of a custom
+    operator is rejected.
+
+    Autograd Function classes are normalized to their ``apply`` method.
+    Autograd Functions cannot use ``fake_fn``; wrap the call in a plain
+    function and register that wrapper when fake tracing behavior is required.
+
+    Args:
+        runtime_fn: Original operator callable whose identity is preserved in
+            the traced graph.
+        op_create_fn: Optional IR creation override.
+        code: Optional runtime implementation source.
+        emit_fn: Optional code emission override.
+        input_gen_fn: Optional profiler input generator override.
+        fake_fn: Optional tracing-only runtime replacement.
+
+    Returns:
+        The callable originally passed as ``runtime_fn``.
     """
     if not callable(runtime_fn):
         raise TypeError("Expected a runtime function")
+    original_runtime_fn = runtime_fn
+    if is_autograd_op(runtime_fn):
+        runtime_fn = runtime_fn.apply
     if fake_fn is not no_change and fake_fn is not None and not callable(fake_fn):
         raise TypeError("Expected a fake function")
     if op_create_fn is not no_change and op_create_fn is not None and not callable(op_create_fn):
@@ -394,11 +453,31 @@ def update_op(
         raise TypeError("Expected an emit function")
     if input_gen_fn is not no_change and input_gen_fn is not None and not callable(input_gen_fn):
         raise TypeError("Expected an input generator function")
-    if fake_fn is not no_change and fake_fn is not None and is_autograd_op(runtime_fn):
+    if fake_fn is not no_change and fake_fn is not None and is_autograd_apply(runtime_fn):
         raise ValueError("Autograd function cannot have fake runtime function. "
                          "Please wrap the autograd function and register the wrapper function instead.")
 
     signatures = _get_torch_op_aliases(runtime_fn)
+    # Import locally because mapping imports this module to access CustomizedOps.
+    from nnscaler.graph.parser.mapping import SignFx2Op
+    is_tracer_leaf = _is_existing_tracer_leaf(runtime_fn, signatures)
+    if not is_tracer_leaf and not any(SignFx2Op.exist(signature) for signature in signatures):
+        raise KeyError(
+            f"{signatures[0]} is neither an existing tracer leaf nor a registered operator. "
+            "Please use register_op to register a new operator."
+        )
+
+    # we can't remove op_create_fn for custom ops.
+    if (
+        op_create_fn is None
+        and not is_tracer_leaf
+        and not any(signature in SignFx2Op.kOpMap for signature in signatures)
+    ):
+        raise ValueError(
+            f"{signatures[0]} has no existing tracer leaf or system op creator to fall back to. "
+            "A custom operator's op_create_fn cannot be deleted."
+        )
+
     for alias in signatures:
         try:
             CustomizedOps.kOpRuntime[alias] = load_type(alias)
@@ -435,4 +514,4 @@ def update_op(
             else:
                 CustomizedOps.kOpInputGen[alias] = input_gen_fn
 
-    return runtime_fn
+    return original_runtime_fn

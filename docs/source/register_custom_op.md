@@ -182,7 +182,9 @@ nnscaler.update_op(torch.add, fake_fn=fake_add)
 `input_gen_fn`. The runtime callable is always recorded, while each optional
 field is independent: unspecified fields keep their existing customized or
 system-defined behavior and are not materialized in `CustomizedOps`. Pass
-`None` to remove an existing override.
+`None` to remove an existing override. An operator registered with
+`register_op` cannot remove its only `op_create_fn` unless it was already a
+tracer leaf or has a system creator to fall back to.
 
 Aliases discovered from the loaded PyTorch runtime share the same update.
 nnScaler includes paths that reference the same runtime callable and bridges
@@ -193,10 +195,13 @@ still applies after parser method normalization. Different
 variants and `operator` functions are also not inferred as aliases. Custom
 operators are not expanded by these PyTorch-specific rules.
 
-The signature is derived from the runtime callable. `update_op` can attach
-metadata to an operator that is not yet registered, but such an operator still
-needs an `op_create_fn` before the parser can create its IR node. Use
-`register_op` when registering all metadata for a new operator at once.
+The signature is derived from the runtime callable. `update_op` only modifies
+operators that are already tracer leaves or registered with `register_op`.
+Built-in Torch functions and Tensor methods are normally tracer leaves even
+when nnScaler has no dedicated IR creator for them. Use `register_op` for a new
+Python operator that the tracer would otherwise trace through. Torch functions
+that are reached only through the tracer's `__torch_function__` fallback are
+not supported by `update_op`; they must first be made explicit wrapped leaves.
 
 The fake function is only executed during tracing. The traced graph and
 generated code continue to use the original operator.
