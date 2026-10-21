@@ -3,24 +3,45 @@
 
 """Create communication groups in deterministic, non-overlapping rounds."""
 import hashlib
+import struct
+import sys
 
 import torch
 import torch.distributed as dist
 
 
+def _split_color(ranks):
+    """PyTorch 2.9--2.11's native genNcclSplitColor on 64-bit Linux.
+
+    The public split_group uses this C++ hash, not distributed_c10d's Python
+    _process_group_color. Equal colors in one split merge unrelated groups.
+    Keep the supported-version check in _split_context in sync with this hash.
+    """
+    value = 0
+    for rank in ranks:
+        value ^= rank + 0x9e3779b9 + (value << 6) + (value >> 2)
+        value &= (1 << 64) - 1
+    if value >= 1 << 63:
+        value -= 1 << 64
+    return abs(value) % ((1 << 31) - 1)
+
+
 def partition_groups(groups):
-    """Pack memberships into rounds without putting a rank in two groups."""
-    batches, occupied = [], []
+    """Pack groups into rounds with disjoint ranks and distinct split colors."""
+    batches, occupied, colors = [], [], []
     for ranks in sorted(set(groups), key=lambda ranks: (-len(ranks), ranks)):
         members = set(ranks)
-        for batch, used in zip(batches, occupied):
-            if members.isdisjoint(used):
+        color = _split_color(ranks)
+        for batch, used, used_colors in zip(batches, occupied, colors):
+            if members.isdisjoint(used) and color not in used_colors:
                 batch.append(ranks)
                 used.update(members)
+                used_colors.add(color)
                 break
         else:
             batches.append([ranks])
             occupied.append(members)
+            colors.append({color})
     return batches
 
 
@@ -33,6 +54,9 @@ def _split_context():
         return None
     backend = parent._get_backend(device)
     supported = callable(getattr(dist, 'split_group', None)) and getattr(backend, 'supports_splitting', False)
+    # Unknown native color implementations must use individually created groups.
+    supported = (supported and sys.platform == 'linux' and struct.calcsize('P') == 8
+                 and (2, 9) <= torch.__version__ < (2, 12))
     # Some PyTorch builds index an empty WORLD rank map after reinitialization.
     # Do not attempt the split: this failure is a native crash, not an exception.
     rank_map = getattr(getattr(backend, 'options', None), 'global_ranks_in_group', ())

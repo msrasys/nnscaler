@@ -41,6 +41,7 @@ def test_barrier_warning():
 
 
 def _batched_group_worker(directory):
+    from nnscaler.runtime import group_init
     from nnscaler.runtime.device import DeviceGroup, uninit_device
     from nnscaler.runtime.module import CubeModule
 
@@ -56,6 +57,12 @@ def _batched_group_worker(directory):
         groups = [[0, 1], [2, 3], [0, 2]] if world == 4 else [[0], [1]]
         registry_before = len(dist.distributed_c10d._world.pg_names)
         manager.init_groups(groups)
+        if group_init._split_context()[1]:
+            # Check the compatibility hash against the actual native backend,
+            # not distributed_c10d's different Python color function.
+            members = groups[rank // 2] if world == 4 else groups[rank]
+            backend = manager.get_group(members)._get_backend(torch.device('cuda', rank))
+            assert backend.options.split_color == group_init._split_color(members)
         assert len(dist.distributed_c10d._world.pg_names) - registry_before == sum(rank in members for members in groups)
         # Legacy generated code's single-group declarations remain supported.
         for member in range(world):

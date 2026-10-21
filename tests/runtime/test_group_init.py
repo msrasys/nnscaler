@@ -23,6 +23,8 @@ def test_partition_groups_are_disjoint_complete_and_order_independent():
     for batch in batches:
         ranks = [rank for group in batch for rank in group]
         assert len(ranks) == len(set(ranks))
+        colors = [group_init._split_color(group) for group in batch]
+        assert len(colors) == len(set(colors))
 
 
 def test_production_layout_batches():
@@ -36,7 +38,19 @@ def test_production_layout_batches():
     pairs = [(base + lane + a * stage, base + lane + b * stage)
              for base in range(0, world, scale) for lane in range(stage)
              for a, b in [(0, 1), (0, 2), (1, 2)]]
-    assert len(group_init.partition_groups(pairs)) == 3
+    batches = group_init.partition_groups(pairs)
+    assert len(batches) == 3
+    assert {group for batch in batches for group in batch} == set(pairs)
+    # These disjoint pairs collided in the production 1584-rank job. NCCL
+    # merged them, making rank 1355 receive from its own actual NCCL rank.
+    left, right = (1348, 1380), (1355, 1387)
+    assert group_init._split_color(left) == group_init._split_color(right) == 1301438770
+    assert not any(left in batch and right in batch for batch in batches)
+    for batch in batches:
+        members = [rank for group in batch for rank in group]
+        assert len(members) == len(set(members))
+        colors = [group_init._split_color(group) for group in batch]
+        assert len(colors) == len(set(colors))
 
 
 def fake_backend(monkeypatch, rank):
@@ -75,6 +89,15 @@ def test_one_sparse_group_uses_ordinary_creation(monkeypatch):
     result = group_init.create_groups([(0, 2)], timeout=TIMEOUT)
     assert calls == [('ordinary', [0, 2])]
     assert result[(0, 2)] == dist.GroupMember.NON_GROUP_MEMBER
+
+
+def test_native_color_collision_uses_separate_creation(monkeypatch):
+    calls = fake_backend(monkeypatch, 1355)
+    groups = [(1348, 1380), (1355, 1387)]
+    result = group_init.create_groups(groups, timeout=TIMEOUT)
+    assert calls == [('ordinary', list(group)) for group in groups]
+    assert result[groups[0]] == dist.GroupMember.NON_GROUP_MEMBER
+    assert result[groups[1]] == groups[1]
 
 
 def test_all_ranks_fall_back_if_one_backend_cannot_split(monkeypatch):
@@ -209,6 +232,7 @@ def test_plan_agreement_uses_one_collective(monkeypatch):
     (True, 'gloo', 0, [], None),
 ])
 def test_split_capability_including_world_reinitialization(monkeypatch, bound, backend, uid, rank_map, expected):
+    monkeypatch.setattr(torch, '__version__', torch.torch_version.TorchVersion('2.10.0'))
     device = torch.device('cuda', 0)
     native = SimpleNamespace(supports_splitting=True, uid=uid,
                              options=SimpleNamespace(global_ranks_in_group=rank_map))
@@ -218,3 +242,22 @@ def test_split_capability_including_world_reinitialization(monkeypatch, bound, b
     monkeypatch.setattr(dist, 'get_backend', lambda _: backend)
     monkeypatch.setattr(dist, 'split_group', lambda **kw: None, raising=False)
     assert group_init._split_context() == (None if expected is None else (device, expected))
+
+
+@pytest.mark.parametrize('version,supported', [
+    ('2.8.0', False), ('2.9.0', True), ('2.10.0', True),
+    ('2.11.0a0+eb65b36914.nv26.02', True), ('2.12.0', False),
+])
+def test_unknown_split_color_versions_use_ordinary_groups(monkeypatch, version, supported):
+    device = torch.device('cuda', 0)
+    backend = SimpleNamespace(supports_splitting=True, uid=0,
+                              options=SimpleNamespace(global_ranks_in_group=[]))
+    parent = SimpleNamespace(bound_device_id=device, _get_backend=lambda _: backend)
+    monkeypatch.setattr(dist, 'group', SimpleNamespace(WORLD=parent))
+    monkeypatch.setattr(dist, 'is_initialized', lambda: True)
+    monkeypatch.setattr(dist, 'get_backend', lambda _: 'nccl')
+    monkeypatch.setattr(dist, 'split_group', lambda **kw: None, raising=False)
+    monkeypatch.setattr(torch, '__version__', torch.torch_version.TorchVersion(version))
+    monkeypatch.setattr(group_init.sys, 'platform', 'linux')
+    monkeypatch.setattr(group_init.struct, 'calcsize', lambda _: 8)
+    assert group_init._split_context() == (device, supported)
