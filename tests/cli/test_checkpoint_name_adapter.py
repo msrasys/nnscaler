@@ -23,7 +23,9 @@ class RetracedModel(nn.Module):
         self.extra_op = extra_op
         self.fc1 = nn.Linear(4, 4)
         self.fc2 = nn.Linear(4, 4)
+        self.scale = nn.Parameter(torch.tensor(1.0))
         self.register_buffer('offset', torch.ones(4))
+        self.register_buffer('scalar_offset', torch.tensor(0.5))
 
     def forward(self, data):
         x = data['data']
@@ -32,6 +34,7 @@ class RetracedModel(nn.Module):
         if self.extra_op:
             x = x + 0.0
         output = self.fc2(nn.functional.relu(self.fc1(x + self.offset)))
+        output = output * self.scale + self.scalar_offset
         return nn.functional.mse_loss(output, data['target'])
 
 
@@ -55,6 +58,8 @@ def _assert_model_state_equal(expected, actual):
     assert len(actual_names) == len(actual_meta.param_area_map) == len(expected_meta.param_area_map)
     for name, meta in expected_meta.param_area_map.items():
         actual_name = actual_names[meta.orig_name]
+        if not meta.shape:
+            assert meta.slicers == actual_meta.param_area_map[actual_name].slicers == ()
         assert replace(meta, tid=0) == replace(actual_meta.param_area_map[actual_name], tid=0)
         assert_equal(expected[name], actual[actual_name])
 
@@ -130,3 +135,62 @@ def _retrace_worker(savedir, plan_ngpus, use_zero, save_type):
 @pytest.mark.parametrize('save_type', ['sharded', 'deduped'])
 def test_load_retraced_sharded_and_deduped(tmp_path, plan_ngpus, use_zero, save_type):
     launch_torchrun(2, _retrace_worker, str(tmp_path), plan_ngpus, use_zero, save_type)
+
+
+def _scalar_checkpoint_worker(savedir, save_type):
+    savedir = Path(savedir)
+    trainer = _train(savedir, 2, 1, save_type, 'original', 1)
+    old_state = copy.deepcopy(trainer.model.state_dict())
+    old_optimizer_state = copy.deepcopy(trainer.optimizer.state_dict())
+    legacy_dir = savedir / 'legacy'
+
+    if trainer.rank == 0:
+        checkpointer = trainer.checkpointer
+        checkpoint_files = checkpointer.list_checkpoints(savedir / 'original' / 'last')
+        assert len(checkpoint_files) == 2
+        merged_file = savedir / 'merged.ckpt'
+        Trainer.merge_checkpoint(checkpoint_files, merged_file, checkpointer=checkpointer)
+        merged = checkpointer.load(merged_file)
+        eager = RetracedModel()
+        eager.load_state_dict(merged['model'])
+        optimizer = torch.optim.Adam(eager.parameters())
+        optimizer.load_state_dict(merged['optimizer'])
+        for name in ('scale', 'scalar_offset'):
+            local_name = next(
+                key for key, meta in trainer.model.fullmap.items() if meta.orig_name == name
+            )
+            assert merged['model'][name].shape == torch.Size([])
+            assert_equal(merged['model'][name], getattr(trainer.model, local_name).detach().cpu())
+        for key in ('exp_avg', 'exp_avg_sq'):
+            assert optimizer.state[eager.scale][key].shape == torch.Size([])
+
+        legacy_dir.mkdir()
+        for path in checkpoint_files:
+            checkpoint = checkpointer.load(path)
+            metadata = checkpoint['model'][ParallelModule.EXTRA_STATE_KEY]
+            for meta in metadata['param_area_map'].values():
+                if not meta['shape']:
+                    meta['slicers'] = Ellipsis
+            checkpointer.save_for_rank(checkpoint, legacy_dir, metadata['rank'])
+        checkpointer.flush()
+        legacy_merged_file = savedir / 'legacy_merged.ckpt'
+        Trainer.merge_checkpoint(
+            checkpointer.list_checkpoints(legacy_dir), legacy_merged_file, checkpointer=checkpointer,
+        )
+        legacy_merged = checkpointer.load(legacy_merged_file)
+        assert_equal(legacy_merged['model'], merged['model'])
+        assert_equal(legacy_merged['optimizer'], merged['optimizer'])
+
+    torch.distributed.barrier()
+    resumed = _train(
+        savedir, 2, 1, save_type, 'legacy_resume', 2, extra_op=True, resume_from=legacy_dir,
+    )
+    _assert_model_state_equal(old_state, resumed.resumed_model_state)
+    _assert_optimizer_state_equal(old_optimizer_state, resumed.resumed_optimizer_state)
+    torch.distributed.destroy_process_group()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.device_count() < 2, reason='lack of gpu devices')
+@pytest.mark.parametrize('save_type', ['sharded', 'deduped'])
+def test_load_and_merge_scalar_checkpoint(tmp_path, save_type):
+    launch_torchrun(2, _scalar_checkpoint_worker, str(tmp_path), save_type)

@@ -499,6 +499,11 @@ Module prefixes and original model names must remain unchanged. This is not
 a resharding or optimizer-state migration API; use a merged checkpoint for
 parallel-plan changes.
 
+Scalar parameters and buffers use an empty tuple (`()`) for their metadata
+slicers. Legacy `Ellipsis` slicers (and `'...'` in generated metadata files)
+are normalized when metadata is constructed or unpickled, so older checkpoints
+and generated modules remain supported.
+
 ### `merge_state_dicts`
 ```python
 def merge_state_dicts(

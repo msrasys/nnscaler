@@ -52,7 +52,7 @@ class AttrMeta:
     orig_name: str
     # shape of the full tensor
     shape: Tuple[int, ...]
-    # list of slicers to index the full tensor
+    # Per-dimension slices; an empty tuple indexes a scalar tensor.
     slicers: Tuple[slice, ...]
     # the number of the partitioned values, usually 1
     # (i.e., no partition on value -> no need to sum up)
@@ -62,6 +62,16 @@ class AttrMeta:
     # shape of the sub tensor
     # it should be the shape of full_tensor[slicers]
     sub_shape: Tuple[int, ...]
+
+    def __post_init__(self):
+        # Older generated modules use Ellipsis; their metadata files use '...'.
+        if not self.shape:
+            self.slicers = ()
+
+    def __setstate__(self, state):
+        # Legacy CubeModule checkpoints pickle AttrMeta instances directly.
+        self.__dict__.update(state)
+        self.__post_init__()
 
     def get_local_numel(self):
         return math.prod(self.sub_shape)

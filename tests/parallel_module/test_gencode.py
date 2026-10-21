@@ -1457,7 +1457,7 @@ def test_codegen_scalar_tensor(tmp_path):
     #     # communication groups
 
     #     self.register_buffer('num_batches_tracked_33', torch.empty((), dtype=torch.int64), persistent=True)
-    #     self.add_full_map('num_batches_tracked_33', 2, False, 'num_batches_tracked', (), ..., 1)
+    #     self.add_full_map('num_batches_tracked_33', 2, False, 'num_batches_tracked', (), (), 1)
 
     #     self.register_parameter('proj_weight_35', torch.nn.Parameter(torch.empty((1024, 1024), dtype=torch.float32)))
     #     self.add_full_map('proj_weight_35', 4, True, 'proj.weight', (1024, 1024), (slice(0, 1024, None), slice(0, 1024, None)), 1)
@@ -1491,7 +1491,7 @@ def test_codegen_scalar_tensor(tmp_path):
     assert _gencode_contains(tmp_path, ScalarTensorModule, 0,
         r"self\.register_buffer\('num_batches_tracked_\d+', torch\.empty\(\(\), dtype=torch\.int64\), persistent=True\)")
     assert _gencode_contains(tmp_path, ScalarTensorModule, 0,
-        r"self\.add_full_map\('num_batches_tracked_\d+', \d+, False, 'num_batches_tracked', \(\), \.\.\., 1\)")
+        r"self\.add_full_map\('num_batches_tracked_\d+', \d+, False, 'num_batches_tracked', \(\), \(\), 1\)")
 
 
 class ImportlibModel(torch.nn.Module):

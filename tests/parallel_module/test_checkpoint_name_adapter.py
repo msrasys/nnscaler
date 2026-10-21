@@ -2,6 +2,7 @@
 #  Licensed under the MIT License.
 
 import copy
+import io
 from dataclasses import replace
 
 import pytest
@@ -89,11 +90,31 @@ def test_rename_parallel_submodules_without_changing_regular_module():
     assert adapted['decoder.buffer_202'] is state['decoder.buffer_22']
 
 
-def test_reject_changed_parameter_shape():
-    old = _ParallelModuleStub(10, width=2)
-    new = _ParallelModuleStub(100, width=4)
+@pytest.mark.parametrize('change', ['add', 'remove', 'shape', 'dtype'])
+def test_reject_parameter_changes(change):
+    old = _ParallelModuleStub(10)
+    new = _ParallelModuleStub(
+        100, width=4 if change == 'shape' else 2,
+        dtype=torch.float64 if change == 'dtype' else torch.float32,
+    )
 
-    with pytest.raises(ValueError, match='expected one match'):
+    if change == 'add':
+        new.register_parameter('extra_999', nn.Parameter(torch.ones(2)))
+        new._fullmap['extra_999'] = replace(
+            new._fullmap['weight_100'], tid=999, orig_name='extra',
+        )
+        new.dist_param_map['extra'] = 'extra'
+        new.origin_module_metadata.origin_param_names.append('extra')
+        new.origin_module_metadata.origin_state_dict_names.append('extra')
+    elif change == 'remove':
+        del new.bias_101
+        del new._fullmap['bias_101']
+        del new.dist_param_map['bias']
+        new.origin_module_metadata.origin_param_names.remove('bias')
+        new.origin_module_metadata.origin_state_dict_names.remove('bias')
+
+    message = 'origin_param_names changed' if change in ('add', 'remove') else 'expected one match'
+    with pytest.raises(ValueError, match=message):
         nnscaler.align_state_dict_names(new, old.state_dict())
 
 
@@ -111,12 +132,48 @@ def test_reject_different_shards_of_same_parameter():
         nnscaler.align_state_dict_names(new, old.state_dict())
 
 
-def test_reject_changed_parameter_dtype():
-    old = _ParallelModuleStub(10, dtype=torch.float32)
-    new = _ParallelModuleStub(100, dtype=torch.float64)
+@pytest.mark.parametrize('kind', ['parameter', 'buffer'])
+@pytest.mark.parametrize('slicers', [(), Ellipsis, '...'])
+def test_align_scalar_tensor(kind, slicers):
+    old, new = _ParallelModuleStub(10), _ParallelModuleStub(100)
+    # Generated names for the old and newly traced scalar tensor.
+    names = ('weight_10', 'weight_100') if kind == 'parameter' else ('buffer_12', 'buffer_102')
+    for module, name in zip((old, new), names):
+        delattr(module, name)
+        tensor = torch.tensor(3.0)
+        if kind == 'parameter':
+            module.register_parameter(name, nn.Parameter(tensor))
+        else:
+            module.register_buffer(name, tensor)
+        module._fullmap[name] = replace(
+            module._fullmap[name], shape=(), sub_shape=(),
+            slicers=slicers if module is old else (),
+        )
+        assert module._fullmap[name].slicers == ()
 
-    with pytest.raises(ValueError, match='expected one match'):
-        nnscaler.align_state_dict_names(new, old.state_dict())
+    state = old.state_dict()
+    state[ParallelModule.EXTRA_STATE_KEY]['param_area_map'][names[0]]['slicers'] = slicers
+    adapted = nnscaler.align_state_dict_names(new, state)
+    assert adapted[names[1]] is state[names[0]]
+    assert adapted[names[1]].shape == torch.Size([])
+    assert state[ParallelModule.EXTRA_STATE_KEY]['param_area_map'][names[0]]['slicers'] == slicers
+
+    # Newly saved metadata also loads into modules generated with the old slicers.
+    state = new.state_dict()
+    adapted = nnscaler.align_state_dict_names(old, state)
+    assert adapted[names[0]] is state[names[1]]
+
+
+@pytest.mark.parametrize('slicers', [Ellipsis, '...'])
+def test_load_pickled_legacy_scalar_metadata(slicers):
+    meta = AttrMeta(1, True, 'weight', (), (), 1, torch.float32, ())
+    # Simulate an AttrMeta instance saved before scalar slicers were normalized.
+    meta.slicers = slicers
+    checkpoint = io.BytesIO()
+    torch.save({'param_area_map': {'weight_1': meta}}, checkpoint)
+    checkpoint.seek(0)
+    restored = torch.load(checkpoint, weights_only=False)['param_area_map']['weight_1']
+    assert restored == replace(meta, slicers=())
 
 
 @pytest.mark.parametrize('source', ['checkpoint', 'module'])
