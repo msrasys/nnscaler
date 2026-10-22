@@ -1,6 +1,7 @@
 #  Copyright (c) Microsoft Corporation.
 #  Licensed under the MIT License.
 
+import re
 import tempfile
 from typing import *
 
@@ -11,7 +12,7 @@ import torch.nn as nn
 from nnscaler.parallel import ComputeConfig, _load_parallel_module_class, parallelize
 from nnscaler.policies import get_called_self_module_name, get_pas_ops
 from nnscaler.graph.graph import IRGraph, IRSegment
-from nnscaler.graph.schedule.schedplan import SchedulePlan, StreamConfig, StreamContext
+from nnscaler.graph.schedule.schedplan import ScheduleAction, SchedulePlan, StreamConfig, StreamContext
 from tests.launch_torchrun import launch_torchrun
 from tests.parallel_module.common import FFN, init_distributed
 from tests.parallel_module.test_gencode import _gencode_contains, print_gencode
@@ -709,6 +710,213 @@ def test_codegen_fn_pipeline(tmp_path):
     assert True
 
 
+def _build_explicit_fbw(
+    graph: IRGraph,
+    num_microbatches: int,
+    num_stages: int,
+    backward_mids: Optional[Iterable[int]] = None,
+) -> SchedulePlan:
+    """Build a simple schedule with explicitly separated I and W actions.
+
+    This is a test helper rather than a performance-oriented pipeline
+    scheduler. It creates three non-overlapping waves:
+
+    1. All microbatches run forward through the stages in pipeline order.
+    2. Microbatches listed in ``backward_mids`` run input-backward through the
+       stages in reverse pipeline order.
+    3. The same microbatches run weight-backward on every stage.
+
+    For logical stage ``s``, microbatch ``m``, and position ``order`` of ``m``
+    in ``backward_mids``, the start steps are:
+
+    .. code-block:: text
+
+        F(s, m):                  m + s
+        I(s, backward_mids[order]):
+            num_microbatches + num_stages - 1
+            + order + (num_stages - 1 - s)
+        W(s, backward_mids[order]):
+            2 * (num_microbatches + num_stages - 1) + order
+
+    For two stages and two microbatches, the default ordering is equivalent to:
+
+    .. code-block:: text
+
+        step:     0    1    2    3    4    5    6    7
+        stage 0: 0F0  0F1  ---  ---  0I0  0I1  0W0  0W1
+        stage 1: ---  1F0  1F1  1I0  1I1  ---  1W0  1W1
+
+    ``backward_mids`` controls both which microbatches receive explicit I/W
+    actions and their per-segment consumption order. Passing ``None`` selects
+    every microbatch in ascending order, which matches the FIFO order in which
+    forward states were produced. Passing a subset leaves the other
+    microbatches without backward actions so a caller can append full B actions
+    and construct a mixed B/I/W schedule. Passing a reordered iterable, such as
+    ``reversed(range(num_microbatches))``, deliberately creates a non-FIFO
+    schedule for validation tests.
+
+    Weight actions for different stages share a step because stages are placed
+    on disjoint device groups in these tests. For a given stage, their order is
+    still exactly the order of ``backward_mids``. I actions are scheduled far
+    enough before W actions that every ``F -> I -> W`` dependency holds unless
+    a caller intentionally mutates the returned plan.
+
+    The helper intentionally does not call :meth:`SchedulePlan.finish`.
+    Callers may first add duplicate actions, append full backward actions, or
+    insert actions at specific steps to exercise validation boundaries; the
+    caller then invokes ``finish()`` and asserts whether the resulting schedule
+    is accepted or rejected.
+
+    Args:
+        graph: Staged training graph whose forward segments and backward
+            mirrors are already available.
+        num_microbatches: Number of forward microbatches in the schedule. Must
+            be positive.
+        num_stages: Expected number of forward segments in ``graph``.
+        backward_mids: Optional iterable defining the microbatches and order for
+            explicit I/W actions. Defaults to all microbatches in ascending
+            order.
+
+    Returns:
+        An unfinished :class:`SchedulePlan` ready for a test-specific mutation
+        or a final ``finish()`` call.
+
+    Raises:
+        ValueError: If ``num_microbatches`` is not positive.
+        AssertionError: If the graph's number of forward segments differs from
+            ``num_stages``.
+    """
+    if num_microbatches <= 0:
+        raise ValueError(f'expected num_microbatches > 0, but got {num_microbatches}')
+    forward_segments = [
+        segment
+        for segment in graph.select(ntype=IRSegment, flatten=False)
+        if segment.isfw()
+    ]
+    assert len(forward_segments) == num_stages
+
+    schedule = SchedulePlan(graph, num_microbatches)
+    for mid in range(num_microbatches):
+        for stage, segment in enumerate(forward_segments):
+            schedule.add_segment(segment, mid, mid + stage)
+
+    input_start = num_microbatches + num_stages - 1
+    backward_mids = list(range(num_microbatches) if backward_mids is None else backward_mids)
+    for order, mid in enumerate(backward_mids):
+        for stage, segment in enumerate(reversed(forward_segments)):
+            schedule.add_segment(
+                segment.mirror,
+                mid,
+                input_start + order + stage,
+                action=ScheduleAction.BACKWARD_INPUT,
+            )
+
+    weight_start = input_start + num_microbatches + num_stages - 1
+    for order, mid in enumerate(backward_mids):
+        for segment in forward_segments:
+            schedule.add_segment(
+                segment.mirror,
+                mid,
+                weight_start + order,
+                action=ScheduleAction.BACKWARD_WEIGHT,
+            )
+    return schedule
+
+
+def sched_explicit_fbw(graph: IRGraph, num_microbatches: int, num_stages: int) -> SchedulePlan:
+    schedule = _build_explicit_fbw(graph, num_microbatches, num_stages)
+    schedule.finish()
+    return schedule
+
+
+def sched_explicit_fbw_non_fifo(graph: IRGraph, num_microbatches: int, num_stages: int) -> SchedulePlan:
+    schedule = _build_explicit_fbw(
+        graph,
+        num_microbatches,
+        num_stages,
+        backward_mids=reversed(range(num_microbatches)),
+    )
+    schedule.finish()
+    return schedule
+
+
+def sched_explicit_fbw_duplicate(graph: IRGraph, num_microbatches: int, num_stages: int) -> SchedulePlan:
+    schedule = _build_explicit_fbw(graph, num_microbatches, num_stages)
+    forward_segment = next(
+        segment
+        for segment in graph.select(ntype=IRSegment, flatten=False)
+        if segment.isfw()
+    )
+    schedule.add_segment(
+        forward_segment.mirror,
+        0,
+        schedule.nsteps,
+        action=ScheduleAction.BACKWARD_INPUT,
+    )
+    schedule.finish()
+    return schedule
+
+
+def sched_explicit_fbw_mixed(graph: IRGraph, num_microbatches: int, num_stages: int) -> SchedulePlan:
+    if num_microbatches != 2:
+        raise ValueError('mixed test schedule requires two microbatches')
+    schedule = _build_explicit_fbw(
+        graph,
+        num_microbatches,
+        num_stages,
+        backward_mids=[0],
+    )
+    forward_segments = [
+        segment
+        for segment in graph.select(ntype=IRSegment, flatten=False)
+        if segment.isfw()
+    ]
+    backward_start = schedule.nsteps
+    for stage, segment in enumerate(reversed(forward_segments)):
+        schedule.add_segment(
+            segment.mirror,
+            1,
+            backward_start + stage,
+            action=ScheduleAction.BACKWARD,
+        )
+    schedule.finish()
+    return schedule
+
+
+def sched_explicit_fbw_mixed_non_fifo_weight(
+    graph: IRGraph,
+    num_microbatches: int,
+    num_stages: int,
+) -> SchedulePlan:
+    if num_microbatches != 2:
+        raise ValueError('mixed test schedule requires two microbatches')
+    schedule = _build_explicit_fbw(
+        graph,
+        num_microbatches,
+        num_stages,
+        backward_mids=[0],
+    )
+    forward_segments = [
+        segment
+        for segment in graph.select(ntype=IRSegment, flatten=False)
+        if segment.isfw()
+    ]
+    weight_start = min(
+        schedule.start(block)
+        for block in schedule.all_blocks()
+        if block.action == ScheduleAction.BACKWARD_WEIGHT
+    )
+    for stage, segment in enumerate(reversed(forward_segments)):
+        schedule.insert_step(
+            weight_start + stage,
+            segment.mirror,
+            1,
+            action=ScheduleAction.BACKWARD,
+        )
+    schedule.finish()
+    return schedule
+
+
 def sched_1f1b_multi_stream(graph: IRGraph, num_microbatches: int, num_stages: int) -> SchedulePlan:
     if num_microbatches <= 0:
         raise ValueError(f"expected num_microbatches > 0, but got {num_microbatches} ")
@@ -793,6 +1001,210 @@ def test_codegen_multi_scheduler_plan_local_streams(tmp_path):
         assert "get_stream('adapter_4')" in train_step_4
         assert "get_stream('dataloader_2')" not in train_step_4
         assert "get_stream('adapter_2')" not in train_step_4
+
+
+@replace_all_device_with('cpu')
+def test_codegen_zero_bubble_multi_scheduler(tmp_path):
+    parallelize(
+        FnPolicyModuleList(),
+        {'x': torch.randn(4, 4)},
+        megatron_ffn_policy_list,
+        ComputeConfig(
+            4,
+            8,
+            use_end2end=True,
+            use_async_comm=True,
+            pas_config={
+                'pipeline_nmicros': [2, 4],
+                'pipeline_size': 2,
+                'pipeline_scheduler': sched_zero_bubble_with_hooks,
+            },
+        ),
+        gen_savedir=tmp_path,
+        load_module=False,
+    )
+
+    for num_microbatches in (2, 4):
+        has_weight_before_last_input = False
+        for rank in range(8):
+            train_step, = _gencode_contains(
+                tmp_path,
+                FnPolicyModuleList,
+                rank,
+                rf'def _train_step_{num_microbatches}\([^)]*\):\n([\s\S]*?)\ndef _infer_step_{num_microbatches}',
+            )
+            assert train_step.count('executor.backward_input(') == num_microbatches
+            assert train_step.count('executor.backward_weight(') == num_microbatches
+            assert len(re.findall(
+                r'executor\.backward_weight\([^\n]+\)\n'
+                r'\s+tests\.test_policies\.segment_mirror_post_hook\([^\n]+\)\n'
+                r'\s+del ',
+                train_step,
+            )) == num_microbatches
+            has_weight_before_last_input |= (
+                train_step.find('executor.backward_weight(')
+                < train_step.rfind('executor.backward_input(')
+            )
+            if rank == 0:
+                input_positions = [
+                    match.start()
+                    for match in re.finditer(r'executor\.backward_input\(', train_step)
+                ]
+                weight_positions = [
+                    match.start()
+                    for match in re.finditer(r'executor\.backward_weight\(', train_step)
+                ]
+                recv_positions = [
+                    match.start()
+                    for match in re.finditer(
+                        r'\w+ = nnscaler\.runtime\.executor\.aexecute\('
+                        r'model\.adapter\d+, \*\(\), requires_grad=False\)',
+                        train_step,
+                    )
+                ]
+                assert any(
+                    input_pos < recv_pos < weight_pos
+                    for input_pos, weight_pos in zip(input_positions, weight_positions)
+                    for recv_pos in recv_positions
+                )
+        assert has_weight_before_last_input
+
+
+@replace_all_device_with('cpu')
+@pytest.mark.parametrize(
+    ('pipeline_scheduler', 'use_fbw'),
+    [
+        ('zero_bubble', False),
+        ('1f1b', True),
+    ],
+)
+def test_codegen_zero3_keeps_weight_before_adapters(
+    tmp_path,
+    pipeline_scheduler,
+    use_fbw,
+):
+    parallelize(
+        FnPolicyModuleList(),
+        {'x': torch.randn(4, 4)},
+        megatron_ffn_policy_list,
+        ComputeConfig(
+            4,
+            8,
+            use_end2end=True,
+            use_zero=3,
+            use_fbw=use_fbw,
+            use_async_comm=True,
+            pas_config={
+                'pipeline_nmicros': 2,
+                'pipeline_size': 2,
+                'pipeline_scheduler': pipeline_scheduler,
+            },
+        ),
+        gen_savedir=tmp_path,
+        load_module=False,
+    )
+    train_step, = _gencode_contains(
+        tmp_path,
+        FnPolicyModuleList,
+        0,
+        r'def _train_step\([^)]*\):\n([\s\S]*?)\ndef _infer_step',
+    )
+    input_positions = [
+        match.start()
+        for match in re.finditer(r'executor\.backward_input\(', train_step)
+    ]
+    weight_positions = [
+        match.start()
+        for match in re.finditer(r'executor\.backward_weight\(', train_step)
+    ]
+    recv_positions = [
+        match.start()
+        for match in re.finditer(
+            r'\w+ = nnscaler\.runtime\.executor\.aexecute\('
+            r'model\.adapter\d+, \*\(\), requires_grad=False\)',
+            train_step,
+        )
+    ]
+    assert len(input_positions) == len(weight_positions) == 2
+    assert not any(
+        input_pos < recv_pos < weight_pos
+        for input_pos, weight_pos in zip(input_positions, weight_positions)
+        for recv_pos in recv_positions
+    )
+
+
+@replace_all_device_with('cpu')
+def test_codegen_explicit_fbw_without_flag(tmp_path):
+    parallelize(
+        FnPolicyModuleList(),
+        {'x': torch.randn(4, 4)},
+        megatron_ffn_policy_list,
+        ComputeConfig(4, 8, use_end2end=True, pas_config={
+            'pipeline_nmicros': 2,
+            'pipeline_size': 2,
+            'pipeline_scheduler': sched_explicit_fbw,
+        }),
+        gen_savedir=tmp_path,
+        load_module=False,
+    )
+    for rank in range(8):
+        assert len(_gencode_contains(
+            tmp_path, FnPolicyModuleList, rank,
+            r'nnscaler\.runtime\.executor\.backward_input\(',
+        )) == 2
+        assert len(_gencode_contains(
+            tmp_path, FnPolicyModuleList, rank,
+            r'nnscaler\.runtime\.executor\.backward_weight\(',
+        )) == 2
+
+
+@replace_all_device_with('cpu')
+@pytest.mark.parametrize(
+    ('scheduler', 'use_fbw'),
+    [
+        (sched_explicit_fbw_non_fifo, False),
+        (sched_explicit_fbw_duplicate, False),
+        (sched_explicit_fbw_mixed_non_fifo_weight, True),
+    ],
+)
+def test_codegen_rejects_invalid_explicit_fbw(tmp_path, scheduler, use_fbw):
+    with raises_with_cause(AssertionError, match='schedule plan is not valid'):
+        parallelize(
+            FnPolicyModuleList(),
+            {'x': torch.randn(4, 4)},
+            megatron_ffn_policy_list,
+            ComputeConfig(4, 8, use_end2end=True, use_fbw=use_fbw, pas_config={
+                'pipeline_nmicros': 2,
+                'pipeline_size': 2,
+                'pipeline_scheduler': scheduler,
+            }),
+            gen_savedir=tmp_path,
+            load_module=False,
+        )
+
+
+@replace_all_device_with('cpu')
+@pytest.mark.parametrize(
+    ('scheduler', 'use_fbw'),
+    [
+        (sched_explicit_fbw_mixed, False),
+        (sched_explicit_fbw_mixed, True),
+        (sched_explicit_fbw_mixed_non_fifo_weight, False),
+    ],
+)
+def test_codegen_allows_valid_mixed_fbw(tmp_path, scheduler, use_fbw):
+    parallelize(
+        FnPolicyModuleList(),
+        {'x': torch.randn(4, 4)},
+        megatron_ffn_policy_list,
+        ComputeConfig(4, 8, use_end2end=True, use_fbw=use_fbw, pas_config={
+            'pipeline_nmicros': 2,
+            'pipeline_size': 2,
+            'pipeline_scheduler': scheduler,
+        }),
+        gen_savedir=tmp_path,
+        load_module=False,
+    )
 
 
 @replace_all_device_with('cpu')
@@ -909,11 +1321,9 @@ def segment_mirror_post_hook(module, meta, inputs, kwargs, outputs):
     print(f'segment post_hook: {meta}')
 
 
-def sched_1f1b_with_hooks(graph: IRGraph, num_microbatches: int, num_stages: int) -> SchedulePlan:
-    from nnscaler.graph.schedule.predefined import PredefinedSched
+def _set_segment_hooks(graph: IRGraph) -> None:
     segments: List[IRSegment] = graph.select(ntype=IRSegment, flatten=False)
     fsegs = [seg for seg in segments if seg.isfw()]
-    # set hooks on segments directly
     for sid, seg in enumerate(fsegs):
         seg.pre_hook = segment_pre_hook
         seg.post_hook = segment_post_hook
@@ -923,11 +1333,28 @@ def sched_1f1b_with_hooks(graph: IRGraph, num_microbatches: int, num_stages: int
             seg.mirror.post_hook = segment_mirror_post_hook
             seg.mirror.hook_meta = f'stage{sid}_mirror'
 
+
+def sched_1f1b_with_hooks(graph: IRGraph, num_microbatches: int, num_stages: int) -> SchedulePlan:
+    from nnscaler.graph.schedule.predefined import PredefinedSched
+    _set_segment_hooks(graph)
     return PredefinedSched.sched_1f1b(graph, num_microbatches, num_stages)
 
 
+def sched_explicit_fbw_with_hooks(graph: IRGraph, num_microbatches: int, num_stages: int) -> SchedulePlan:
+    _set_segment_hooks(graph)
+    return sched_explicit_fbw(graph, num_microbatches, num_stages)
+
+
+def sched_zero_bubble_with_hooks(graph: IRGraph, num_microbatches: int, num_stages: int) -> SchedulePlan:
+    from nnscaler.graph.schedule.predefined import PredefinedSched
+    _set_segment_hooks(graph)
+    return PredefinedSched.sched_zero_bubble(graph, num_microbatches, num_stages)
+
+
 @replace_all_device_with('cpu')
-def test_codegen_fn_pipeline_segment_hooks(tmp_path):
+@pytest.mark.parametrize('explicit_fbw', [False, True])
+def test_codegen_fn_pipeline_segment_hooks(tmp_path, explicit_fbw):
+    scheduler = sched_explicit_fbw_with_hooks if explicit_fbw else sched_1f1b_with_hooks
     parallelize(
         FnPolicyModuleList(),
         {'x': torch.randn(4, 4)},
@@ -936,7 +1363,7 @@ def test_codegen_fn_pipeline_segment_hooks(tmp_path):
             pas_config={
                 'pipeline_nmicros': 2,
                 'pipeline_size': 2,
-                'pipeline_scheduler': sched_1f1b_with_hooks,
+                'pipeline_scheduler': scheduler,
             }
         ),
         gen_savedir=tmp_path,
@@ -960,6 +1387,53 @@ def test_codegen_fn_pipeline_segment_hooks(tmp_path):
     assert len(_gencode_contains(
         tmp_path, FnPolicyModuleList, 0,
         r"tests\.test_policies\.segment_mirror_post_hook\(model, 'stage0_mirror', \(\(\), \(dropout_.*, \), \(gdropout_.*, \)\), {}, _\)"
+    )) == 2
+    if explicit_fbw:
+        events = _gencode_contains(
+            tmp_path,
+            FnPolicyModuleList,
+            0,
+            r'(segment_mirror_pre_hook|backward_input|backward_weight|segment_mirror_post_hook)\(',
+        )
+        assert events == [
+            'segment_mirror_pre_hook', 'backward_input',
+            'segment_mirror_pre_hook', 'backward_input',
+            'backward_weight', 'segment_mirror_post_hook',
+            'backward_weight', 'segment_mirror_post_hook',
+        ]
+
+
+@replace_all_device_with('cpu')
+def test_codegen_legacy_fbw_post_hook_lifetime(tmp_path):
+    parallelize(
+        FnPolicyModuleList(),
+        {'x': torch.randn(4, 4)},
+        megatron_ffn_policy_list,
+        ComputeConfig(
+            4,
+            8,
+            use_end2end=True,
+            use_fbw=True,
+            pas_config={
+                'pipeline_nmicros': 2,
+                'pipeline_size': 2,
+                'pipeline_scheduler': sched_1f1b_with_hooks,
+            },
+        ),
+        gen_savedir=tmp_path,
+        load_module=False,
+    )
+    train_step, = _gencode_contains(
+        tmp_path,
+        FnPolicyModuleList,
+        0,
+        r'def _train_step\([^)]*\):\n([\s\S]*?)\ndef _infer_step',
+    )
+    assert len(re.findall(
+        r'executor\.backward_weight\([^\n]+\)\n'
+        r'\s+tests\.test_policies\.segment_mirror_post_hook\([^\n]+\)\n'
+        r'\s+del ',
+        train_step,
     )) == 2
 
     # rank0 generated code should look like:
