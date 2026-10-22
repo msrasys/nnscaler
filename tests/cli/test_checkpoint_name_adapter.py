@@ -11,7 +11,7 @@ from torch import nn
 
 from nnscaler.cli.trainer import Trainer
 from nnscaler.policies import OpPartition, OpPlan, get_pas_ops
-from nnscaler.runtime.module import ExtraState, ParallelModule
+from nnscaler.runtime.module import ExtraState, ParallelModule, Zero3AttrMeta
 
 from ..launch_torchrun import launch_torchrun
 from ..parallel_module.common import assert_equal
@@ -113,6 +113,29 @@ def _retrace_worker(savedir, plan_ngpus, use_zero, save_type):
     interrupted = _train(savedir, plan_ngpus, use_zero, save_type, 'old', 1)
     old_state = copy.deepcopy(interrupted.model.state_dict())
     old_optimizer_state = copy.deepcopy(interrupted.optimizer.state_dict())
+    if use_zero == 3:
+        metadata = ExtraState(**old_state[ParallelModule.EXTRA_STATE_KEY])
+        assert metadata.zero3_param_metadata
+        assert all(isinstance(meta, Zero3AttrMeta) for meta in metadata.zero3_param_metadata.values())
+        if interrupted.rank == 0:
+            checkpointer = interrupted.checkpointer
+            merged_file = savedir / 'zero3_model.ckpt'
+            Trainer.merge_checkpoint(
+                checkpointer.list_checkpoints(savedir / 'old' / 'last'), merged_file,
+                model_only=True, checkpointer=checkpointer,
+            )
+            merged = checkpointer.load(merged_file)
+            eager = RetracedModel()
+            eager.load_state_dict(merged['model'])
+            for name, meta in metadata.param_area_map.items():
+                expected = merged['model'][meta.orig_name]
+                actual = old_state[name].cpu()
+                zero3_meta = metadata.zero3_param_metadata.get(name)
+                if zero3_meta is not None:
+                    expected = expected.view(-1)[zero3_meta.start:zero3_meta.end]
+                    actual = actual[:zero3_meta.end - zero3_meta.start]
+                assert_equal(expected, actual)
+        torch.distributed.barrier()
 
     resumed = _train(
         savedir, plan_ngpus, use_zero, save_type, 'new', 2,

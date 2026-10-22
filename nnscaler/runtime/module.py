@@ -103,6 +103,20 @@ class Zero3AttrMeta:
     # chunk size of the sub tensor, can be bigger than end - start due to padding
     chunk_size: int
 
+    @classmethod
+    def normalize_mapping(
+        cls,
+        metadata: Optional[Dict[str, Union[dict, 'Zero3AttrMeta', None]]],
+    ) -> Optional[Dict[str, 'Zero3AttrMeta']]:
+        if metadata is None:
+            return None
+        # Old checkpoints contain dictionaries and None entries for non-ZeRO3 parameters.
+        return {
+            name: cls(**meta) if isinstance(meta, dict) else meta
+            for name, meta in metadata.items()
+            if meta is not None
+        }
+
 
 def dedup_attrs(rank2attr_area_map: Dict[int, Dict[str, Dict[str, AttrMeta]]]) -> Dict[int, Dict[str, Dict[str, AttrMeta]]]:
     '''
@@ -549,7 +563,10 @@ class CubeModule(torch.nn.Module):
         #  value: Dict[ tuple(start, step, stop) , filled chunk]
         #  used to track how many elements have been filled for each zero3 parameter
         zero3_current_filled: Dict[str, Dict[Tuple[Tuple[int, int, int], ...], List[Tuple[int, int]]]] = {}
-        zero3_param_metadatas = [info[-1] for info in zero_idx_maps] if zero_idx_maps is not None else [None] * len(state_dicts)
+        zero3_param_metadatas = [
+            Zero3AttrMeta.normalize_mapping(info[-1])
+            for info in zero_idx_maps
+        ] if zero_idx_maps is not None else [None] * len(state_dicts)
         # gather param/buffer full tensor
         for rank, (model_state_dict, local_fullmap, zero3_param_metadata) in enumerate(zip(state_dicts, fullmaps, zero3_param_metadatas)):
             for local_name, meta in local_fullmap.items():
@@ -584,7 +601,7 @@ class CubeModule(torch.nn.Module):
                             raise ValueError("Invalid tensor as a ZeRO3 parameter, expected a 1D tensor.")
                         curr_filled = zero3_current_filled.setdefault(meta.orig_name, {}).setdefault(state_dict_merge_track_id, [])
                         curr_z3_info = zero3_param_metadata[local_name]
-                        curr_start, curr_end = curr_z3_info['start'], curr_z3_info['end']
+                        curr_start, curr_end = curr_z3_info.start, curr_z3_info.end
                         fill_len = curr_end - curr_start
                         if (curr_start, curr_end) in curr_filled:
                             # already filled, let's check consistency
@@ -1098,7 +1115,14 @@ class ZeroMetadata:
     # 1: zero1
     # > 1: zero3
     zero: int = 0
-    zero3_param_metadata: Optional[Dict[str, Dict]] = None
+    zero3_param_metadata: Optional[Dict[str, Zero3AttrMeta]] = None
+
+    def __post_init__(self):
+        self.zero3_param_metadata = Zero3AttrMeta.normalize_mapping(self.zero3_param_metadata)
+
+    def __setstate__(self, state):
+        self.__dict__.update(state)
+        self.__post_init__()
 
 
 @dataclass
@@ -1124,7 +1148,9 @@ class ParallelModuleConfig:
 
 @dataclass
 class ExtraState(ZeroMetadata, OriginModuleMetadata, ParallelModuleConfig):
-    pass
+    def __post_init__(self):
+        ParallelModuleConfig.__post_init__(self)
+        ZeroMetadata.__post_init__(self)
 
 
 class _ModuleTensorRegistry:
@@ -1361,13 +1387,16 @@ class ParallelModule(CubeModule):
                 attr_name = model_params[param]
                 param_attr = self._fullmap[attr_name]
                 zero3_info = reducer.get_z3_info(param)
+                if zero3_info is None:
+                    # not a ZeRO-3 parameter, keep the mapping free of None entries
+                    continue
                 self._zero3_param_metadata[attr_name] = Zero3AttrMeta(
                     attr_name=attr_name,
                     orig_name=param_attr.orig_name,
-                    start = zero3_info.start,
-                    end = zero3_info.end,
+                    start=zero3_info.start,
+                    end=zero3_info.end,
                     chunk_size=zero3_info.numel_with_padding(),
-                ) if zero3_info is not None else None
+                )
 
         self._zero_metadata = self._get_zero_metadata()
         # all parameters and buffers are ready now
@@ -2216,9 +2245,7 @@ class NonParallelModule(ParallelModule, skip_init=True):
             origin_state_dict_names=list(params.keys()),
             origin_shared_param_names=[],  # TODO: shared param support
         )
-        self._zero3_param_metadata: dict[str, Zero3AttrMeta] = {
-            n: None for n in local_name2params.keys()
-        }
+        self._zero3_param_metadata: Dict[str, Zero3AttrMeta] = {}
         self._zero_metadata = self._get_zero_metadata()
 
     def parameters(self, recurse: bool = True):

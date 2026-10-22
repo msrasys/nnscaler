@@ -3,7 +3,7 @@
 
 import copy
 import io
-from dataclasses import replace
+from dataclasses import asdict, replace
 
 import pytest
 import torch
@@ -11,7 +11,7 @@ from torch import nn
 
 import nnscaler
 from nnscaler.parallel import ComputeConfig
-from nnscaler.runtime.module import AttrMeta, OriginModuleMetadata, ParallelModule, ZeroMetadata
+from nnscaler.runtime.module import AttrMeta, ExtraState, OriginModuleMetadata, ParallelModule, Zero3AttrMeta, ZeroMetadata
 
 from .common import assert_equal
 
@@ -64,6 +64,51 @@ def test_rename_parameters_and_buffers_without_copying_tensors():
     assert_equal(adapted[ParallelModule.EXTRA_STATE_KEY], new.state_dict()[ParallelModule.EXTRA_STATE_KEY])
     assert adapted._metadata is state._metadata
     assert_equal(state, before)
+
+
+@pytest.mark.parametrize('legacy', [False, True])
+def test_zero3_metadata_round_trip(legacy):
+    meta = Zero3AttrMeta('weight', 'weight_10', 0, 2, 2)
+    mapping = {'weight_10': asdict(meta) if legacy else meta}
+    if legacy:
+        mapping['bias_11'] = None
+    module = _ParallelModuleStub(10)
+    module._zero_metadata = ZeroMetadata(zero=3, zero3_param_metadata=mapping)
+    assert module._zero_metadata.zero3_param_metadata == {'weight_10': meta}
+
+    state = module.state_dict()[ParallelModule.EXTRA_STATE_KEY]
+    assert state['zero3_param_metadata'] == {'weight_10': asdict(meta)}
+    state['zero3_param_metadata'] = mapping
+    extra = ExtraState(**state)
+    assert extra.zero3_param_metadata == {'weight_10': meta}
+    assert isinstance(extra.param_area_map['weight_10'], AttrMeta)
+
+    # Loading directly pickled legacy metadata must normalize it as well.
+    extra.zero3_param_metadata = mapping
+    checkpoint = io.BytesIO()
+    torch.save(extra, checkpoint)
+    checkpoint.seek(0)
+    restored = torch.load(checkpoint, weights_only=False)
+    assert restored.zero3_param_metadata == {'weight_10': meta}
+
+
+@pytest.mark.parametrize('legacy', [False, True])
+def test_merge_zero3_metadata(legacy):
+    module = _ParallelModuleStub(10)
+    fullmap = {'weight_10': module._fullmap['weight_10']}
+    zero_idx_maps = []
+    for rank in range(2):
+        meta = Zero3AttrMeta('weight', 'weight_10', rank, rank + 1, 1)
+        mapping = {'weight_10': asdict(meta) if legacy else meta}
+        if legacy:
+            mapping['bias_11'] = None
+        # Entries contain model-to-optimizer indices, bucket information, ZeRO level, and shard metadata.
+        zero_idx_maps.append((None, None, 3, mapping))
+    merged = ParallelModule.merge_model_state_dicts(
+        [{'weight_10': torch.tensor([1.0])}, {'weight_10': torch.tensor([2.0])}],
+        [fullmap, fullmap], zero_idx_maps,
+    )
+    assert_equal(merged, {'weight': torch.tensor([1.0, 2.0])})
 
 
 def test_rename_parallel_submodules_without_changing_regular_module():

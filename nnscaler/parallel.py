@@ -3427,13 +3427,8 @@ def align_state_dict_names(
         key['slicers'] = tuple((s.start, s.stop, s.step) for s in meta.slicers)
         return tuple(key.values())
 
-    def zero3_attr_meta_identity(meta: Union[Zero3AttrMeta, Dict[str, Any], None]) -> tuple:
-        if meta is None:
-            return tuple()
-        if isinstance(meta, Zero3AttrMeta):
-            key = asdict(meta)
-        else:
-            key = copy.copy(meta)
+    def zero3_attr_meta_identity(meta: Zero3AttrMeta) -> tuple:
+        key = asdict(meta)
         key.pop('attr_name', None)
         return tuple(key.values())
 
