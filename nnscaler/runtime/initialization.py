@@ -120,6 +120,28 @@ def create_shard_init_weights(
         yield from values
 
 
+def _get_init_source_groups(
+    module: torch.nn.Module, attr_meta_map: Dict[str, "AttrMeta"],
+) -> Dict[int, tuple[torch.Tensor, list[tuple[str, "AttrMeta"]]]]:
+    # Source identity -> (source tensor, [(local attribute name, metadata), ...]).
+    groups: Dict[int, tuple[torch.Tensor, list[tuple[str, "AttrMeta"]]]] = {}
+    for attr, meta in attr_meta_map.items():
+        source = get_member_by_name(module, meta.orig_name)
+        if (
+            not isinstance(source, torch.Tensor)
+            or tuple(source.shape) != tuple(meta.shape)
+            or source.dtype != meta.dtype
+        ):
+            raise RuntimeError(
+                f"Invalid initialization tensor for {meta.orig_name}: "
+                f"expected shape {meta.shape} and dtype {meta.dtype}."
+            )
+        if id(source) not in groups:
+            groups[id(source)] = (source, [])
+        groups[id(source)][1].append((attr, meta))
+    return groups
+
+
 def capture_init_weights(
     attr_meta_map: Dict[str, "AttrMeta"],
     *,
@@ -147,22 +169,11 @@ def capture_init_weights(
         with DeferredInitialization(device=torch.empty(0).device) as capture:
             module = module_fn()
     with torch.no_grad():
-        # Param/buffer aliasing are not allowed in ParallelModule
-        # Each attr in attr_meta_map will have its own original source tensor.
-        # so we don't need to worry about materializing shared sources multiple times.
-        for attr, meta in attr_meta_map.items():
-            source = get_member_by_name(module, meta.orig_name)
-            if (
-                not isinstance(source, torch.Tensor)
-                or tuple(source.shape) != tuple(meta.shape)
-                or source.dtype != meta.dtype
-            ):
-                raise RuntimeError(
-                    f"Invalid initialization tensor for {meta.orig_name}: "
-                    f"expected shape {meta.shape} and dtype {meta.dtype}."
-                )
+        # Multiple local attributes can use one source; replay it once for all slices.
+        for source, entries in _get_init_source_groups(module, attr_meta_map).values():
             value = source if capture is None else capture.materialize(source)
-            yield attr, value[meta.slicers]
+            for attr, meta in entries:
+                yield attr, value[meta.slicers]
             del value
 
 

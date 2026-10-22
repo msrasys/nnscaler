@@ -211,7 +211,10 @@ calls `cuda()` on the assembled model before constructing its optimizer.
 
 With `shard` and no user hook, nnScaler records the original constructor's tensor
 operations, then replays the tensors needed by this rank. It copies each local
-slice into the parallel model before releasing the temporary result.
+slice into the parallel model before releasing the temporary result. Local
+attributes referencing the same source tensor object share one materialization;
+all their slices are copied before the full result is released. Distinct tensor
+objects are replayed separately, even if they share storage.
 
 This is **selective full-tensor initialization**, not direct shard generation:
 materializing a tensor still allocates its full shape and any dependencies.

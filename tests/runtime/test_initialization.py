@@ -233,6 +233,7 @@ def test_capture_initializer_streams_into_model_and_releases_full_sources():
             self.register_buffer('scalar', torch.full((), 0.5))
             self.unused = torch.nn.Parameter(torch.ones(17))
 
+    # Local name, source name, full shape, slices, local shape.
     specs = [
         ('first', 'weight', (4, 6), (slice(0, 2), slice(1, 4)), (2, 3)),
         ('second', 'tied', (4, 6), (slice(2, 4), slice(2, 5)), (2, 3)),
@@ -270,7 +271,7 @@ def test_capture_initializer_streams_into_model_and_releases_full_sources():
     type(module)._init_module_fn = staticmethod(partial(create_init_module, Source, None, None, seed=17))
     with patch.object(DeferredInitialization, 'materialize', record):
         module._post_init(build_buckets=False)
-    assert calls == [(4, 6), (4, 6), (6, 4), ()]
+    assert calls == [(4, 6), (6, 4), ()]
     assert all(storage.expired() for storage in full_storages)
     reference = Source()
     # note first/second/view(weight/tied/transposed) are not shared the same storage here.
