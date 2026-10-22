@@ -2,6 +2,7 @@
 #  Licensed under the MIT License.
 
 import random
+from contextlib import nullcontext
 from functools import partial
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -42,22 +43,28 @@ def test_seeded_initialization_restores_rng(device):
     if device == 'cuda' and not torch.cuda.is_available():
         pytest.skip('requires CUDA')
     before = _rng_state()
-    first = create_init_module(
-        RandomInitModule, lambda: RandomInitModule(device), torch.float64, seed=17,
-    )
+    with torch.device(device):
+        first = create_init_module(
+            RandomInitModule, lambda: RandomInitModule(device), torch.float64, seed=17,
+        )
+    assert first.weight.device.type == device
     assert_equal(before, _rng_state())
     random.random()
     np.random.rand(13)
     torch.rand(19)
     torch.rand(23, device=device)
     before = _rng_state()
-    second = create_init_module(
-        RandomInitModule, lambda: RandomInitModule(device), torch.float64, seed=17,
-    )
+    with torch.device('meta'):
+        with torch.device(device):
+            second = create_init_module(
+                RandomInitModule, lambda: RandomInitModule(device), torch.float64, seed=17,
+            )
+        assert torch.empty(0).is_meta
     assert_equal(before, _rng_state())
     assert_equal(first.state_dict(), second.state_dict())
     assert all(t.dtype == torch.float64 for t in first.state_dict().values())
-    third = create_init_module(RandomInitModule, None, torch.float64, seed=18)
+    with torch.device(device):
+        third = create_init_module(RandomInitModule, None, torch.float64, seed=18)
     assert not torch.equal(first.weight, third.weight)
 
     def failing_factory():
@@ -65,8 +72,10 @@ def test_seeded_initialization_restores_rng(device):
         raise RuntimeError('initialization failed')
 
     before = _rng_state()
-    with pytest.raises(RuntimeError, match='initialization failed'):
-        create_init_module(RandomInitModule, failing_factory, None, seed=19)
+    with torch.device('meta'):
+        with pytest.raises(RuntimeError, match='initialization failed'), torch.device(device):
+            create_init_module(RandomInitModule, failing_factory, None, seed=19)
+        assert torch.empty(0).is_meta
     assert_equal(before, _rng_state())
 
 
@@ -74,10 +83,15 @@ def test_unseeded_initialization_preserves_existing_behavior():
     cpu_state = torch.get_rng_state()
     numpy_state = np.random.get_state()
     python_state = random.getstate()
-    create_init_module(RandomInitModule, None, None)
+    with torch.device('cpu'):
+        module = create_init_module(RandomInitModule, None, None)
+        assert all(value.device.type == 'cpu' for value in module.state_dict().values())
     assert not torch.equal(cpu_state, torch.get_rng_state())
     assert numpy_state[2] != np.random.get_state()[2]
     assert python_state != random.getstate()
+    with torch.device('meta'):
+        module = create_init_module(RandomInitModule, None, None)
+        assert module.weight.is_meta
 
 
 class DependentBufferModule(torch.nn.Module):
@@ -219,6 +233,7 @@ def test_capture_initializer_streams_into_model_and_releases_full_sources():
             self.register_buffer('scalar', torch.full((), 0.5))
             self.unused = torch.nn.Parameter(torch.ones(17))
 
+    # Local name, source name, full shape, slices, local shape.
     specs = [
         ('first', 'weight', (4, 6), (slice(0, 2), slice(1, 4)), (2, 3)),
         ('second', 'tied', (4, 6), (slice(2, 4), slice(2, 5)), (2, 3)),
@@ -275,6 +290,7 @@ def test_empty_capture_initializer_skips_constructor():
     assert list(capture_init_weights({}, module_fn=fail)) == []
 
 
+@replace_all_device_with('cpu', force=True)
 def test_user_shard_initializer_receives_only_required_attributes():
     module = _local_module(ParamInitStrategy.SHARD)
     calls = []
@@ -320,6 +336,7 @@ def test_user_shard_initializer_receives_only_required_attributes():
     ([('weight_local',)], 'pairs'),
     (['weight_local'], 'pairs'),
 ])
+@replace_all_device_with('cpu', force=True)
 def test_user_shard_initializer_validates_local_results(result, message):
     module = _local_module(ParamInitStrategy.SHARD)
 
@@ -346,7 +363,11 @@ def test_shard_initializer_seed_and_failure_restore_rng(streaming):
             return generate() if streaming else dict(generate())
 
     before = _rng_state()
-    first = dict(create_shard_init_weights(CustomModule, {}, seed=17))
+    with torch.device('meta'):
+        with torch.device('cpu'):
+            first = dict(create_shard_init_weights(CustomModule, {}, seed=17))
+        assert first['value'].device.type == 'cpu'
+        assert torch.empty(0).is_meta
     assert_equal(before, _rng_state())
     torch.rand(11)
     random.random()
@@ -355,14 +376,17 @@ def test_shard_initializer_seed_and_failure_restore_rng(streaming):
     assert_equal(first, second)
     before = _rng_state()
     CustomModule.fail = True
-    with pytest.raises(RuntimeError, match='custom initialization failed'):
-        dict(create_shard_init_weights(CustomModule, {}, seed=17))
+    with torch.device('meta'):
+        with pytest.raises(RuntimeError, match='custom initialization failed'), torch.device('cpu'):
+            dict(create_shard_init_weights(CustomModule, {}, seed=17))
+        assert torch.empty(0).is_meta
     assert_equal(before, _rng_state())
     with pytest.raises(RuntimeError, match='__shard__init__'):
         dict(create_shard_init_weights(torch.nn.Module, {}, seed=17))
 
 
 @pytest.mark.parametrize('failure', ['shape', 'missing', 'exception'])
+@replace_all_device_with('cpu', force=True)
 def test_streaming_shard_failure_closes_hook_and_restores_rng(failure):
     module = _local_module(ParamInitStrategy.SHARD)
     closed = []
@@ -394,23 +418,30 @@ def test_capture_initializer_yields_views_without_cloning(device):
     """
     Test capture_init_weights yields views without cloning.
     """
-    if device != 'cpu' and not torch.cuda.is_available():
+    if device is not None and torch.device(device).type == 'cuda' and not torch.cuda.is_available():
         pytest.skip('requires CUDA')
     module = _local_module(ParamInitStrategy.SHARD)
-    kwargs = {} if device is None else {'device': torch.device(device)}
-    stream = capture_init_weights(module.fullmap, module_fn=type(module)._init_module_fn, **kwargs)
+    stream = capture_init_weights(module.fullmap, module_fn=type(module)._init_module_fn)
+    expected_device = torch.device(device or 'cpu')
     try:
-        name, value = next(stream)
+        with torch.device(device) if device is not None else nullcontext():
+            name, value = next(stream)
         assert name == 'weight_local'
-        expected_device = torch.device('cuda', torch.cuda.current_device()) if device is None else torch.device(device)
         assert value.device == expected_device
         assert value.shape == (2,)
         assert value.untyped_storage().nbytes() == 4 * value.element_size()
         assert value.storage_offset() == 1
+        with torch.device('meta'):
+            name, buffer = next(stream)
+            assert torch.empty(0).is_meta
+        assert name == 'copy_local'
+        assert buffer.device == expected_device
+        torch.testing.assert_close(buffer, value)
     finally:
         stream.close()
 
 
+@replace_all_device_with('cpu', force=True)
 def test_streaming_user_hook_releases_each_source_before_next_allocation():
     from torch.multiprocessing.reductions import StorageWeakRef
 

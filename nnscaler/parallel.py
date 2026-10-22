@@ -103,9 +103,10 @@ class ParamInitStrategy:
     'file'     : load parameters from fullmodel.pt
     'full'     : initialize a full original model and copy its local parameter slices.
                  Save non-persistent buffers to npbuffer.pt for resume without reconstruction.
+                 The initialization is done on CPU to ensure consistency across devices.
     'shard'    : use the original module's `__shard__init__(attr_meta_map)` method
                  when defined, otherwise capture construction via `TorchDispatchMode`
-                 and replay required tensors on CPU to produce local slices.
+                 and replay required tensors on GPU to produce local slices.
     """
     FILE = 'file'
     FULL = 'full'
@@ -1011,10 +1012,11 @@ def _gencode(
                     # it should only have 1 `self` parameter
                     if len(inspect.signature(module_or_module_class.__init__).parameters) > 1:
                         raise ValueError("Module class __init__ should be parameter-free.")
-                module = create_init_module(
-                    module_or_module_class, module_fn, module_dtype,
-                    seed=compute_config.param_init_seed,
-                )
+                with torch.device('cpu'):
+                    module = create_init_module(
+                        module_or_module_class, module_fn, module_dtype,
+                        seed=compute_config.param_init_seed,
+                    )
             except Exception as e:
                 raise RuntimeError(f"Error when creating module instance.") from e
         else:
@@ -1251,6 +1253,8 @@ def parallelize(
     if the input is a module object.
     * The module object will be copied to cpu to handle possible insufficient gpu memory.
     * The training flag will be the same as the original module
+    * The generated module's parameters and buffers are constructed directly on the current CUDA
+      device, even when build_module_buckets is false. Tracing retains its configured device.
 
     This function can be used to convert both module object and module class to parallel module or parallel module class.
     Among key-value arguments,
@@ -1501,7 +1505,8 @@ def parallelize(
             )
             if compute_config.param_init_strategy != ParamInitStrategy.FILE and module_dtype is not None:
                 module_or_module_class.to(dtype=module_dtype)
-            parallel_module = parallel_module_class(init_module_params, build_module_buckets, **init_kwargs)
+            with torch.device('cuda'):
+                parallel_module = parallel_module_class(init_module_params, build_module_buckets, **init_kwargs)
             parallel_module.train(module_or_module_class.training)  # set training state to the same as original module
             return parallel_module
 

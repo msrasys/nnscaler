@@ -57,7 +57,7 @@ class ModuleCodeGen(FuncEmission):
         E.g. (lines are split into `List[str]`)
         ```python
         self.init_group(ranks=[0, 1, 2, 3])
-        self.weight_63 = torch.nn.Parameter(torch.empty((2048, 8192), dtype=torch.float32))
+        self.weight_63 = torch.nn.Parameter(torch.empty((2048, 8192), dtype=torch.float32, device='cuda'))
         self.add_full_map('weight_63', 3, (slice(0, 2048, None), slice(0, 8192, None)), 1)
         ```
 
@@ -748,8 +748,14 @@ class ModuleCodeGen(FuncEmission):
         return attr_meta_map
 
     def _init_attributes(self, node: IRCell, attr_meta_map: Dict[str, Any]):
-        psign = "self.register_parameter('{name}', torch.nn.Parameter(torch.empty({shape}, dtype={dtype})))"
-        bsign = "self.register_buffer('{name}', torch.empty({shape}, dtype={dtype}), persistent={persistent})"
+        psign = (
+            "self.register_parameter('{name}', "
+            "torch.nn.Parameter(torch.empty({shape}, dtype={dtype}, device='cuda')))"
+        )
+        bsign = (
+            "self.register_buffer('{name}', "
+            "torch.empty({shape}, dtype={dtype}, device='cuda'), persistent={persistent})"
+        )
         map_sign = "self.add_full_map('{attr}', {tid}, {is_param}, '{orig_name}', {shape}, {slicers}, {val_chunks})"
         if not isinstance(node, IRSegment):
             for itensor in node.inputs():

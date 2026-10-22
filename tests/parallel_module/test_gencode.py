@@ -1457,17 +1457,17 @@ def test_codegen_scalar_tensor(tmp_path):
     #     super().__init__()
     #     # communication groups
 
-    #     self.register_buffer('num_batches_tracked_33', torch.empty((), dtype=torch.int64), persistent=True)
+    #     self.register_buffer('num_batches_tracked_33', torch.empty((), dtype=torch.int64, device='cuda'), persistent=True)
     #     self.add_full_map('num_batches_tracked_33', 2, False, 'num_batches_tracked', (), ..., 1)
 
-    #     self.register_parameter('proj_weight_35', torch.nn.Parameter(torch.empty((1024, 1024), dtype=torch.float32)))
+    #     self.register_parameter('proj_weight_35', torch.nn.Parameter(torch.empty((1024, 1024), dtype=torch.float32, device='cuda')))
     #     self.add_full_map('proj_weight_35', 4, True, 'proj.weight', (1024, 1024), (slice(0, 1024, None), slice(0, 1024, None)), 1)
 
-    #     self.register_parameter('scale_37', torch.nn.Parameter(torch.empty((64,), dtype=torch.float32)))
+    #     self.register_parameter('scale_37', torch.nn.Parameter(torch.empty((64,), dtype=torch.float32, device='cuda')))
     #     self.add_full_map('scale_37', 8, True, 'scale', (64,), (slice(0, 64, None),), 1)
 
 
-    #     self._post_init(init_params)
+    #     self._post_init(init_params, build_buckets, init_module=init_module)
 
     # def segment41(self, x_43):
     #     # File "/home/weijiangxu/MagicCube/tests/parallel_module/test_gencode.py", line 990, in forward,  self.num_batches_tracked.add_(1)
@@ -1490,7 +1490,7 @@ def test_codegen_scalar_tensor(tmp_path):
     #     return sum_2_32
 
     assert _gencode_contains(tmp_path, ScalarTensorModule, 0,
-        r"self\.register_buffer\('num_batches_tracked_\d+', torch\.empty\(\(\), dtype=torch\.int64\), persistent=True\)")
+        r"self\.register_buffer\('num_batches_tracked_\d+', torch\.empty\(\(\), dtype=torch\.int64, device='cuda'\), persistent=True\)")
     assert _gencode_contains(tmp_path, ScalarTensorModule, 0,
         r"self\.add_full_map\('num_batches_tracked_\d+', \d+, False, 'num_batches_tracked', \(\), \.\.\., 1\)")
 

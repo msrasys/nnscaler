@@ -80,11 +80,141 @@ reconstructing it, reseeding it, or calling `__shard__init__`. The same applies 
 **All strategies still construct a full real model during compilation.**
 These options change runtime initialization, not tracing.
 
+### Device placement during construction
+
+The **original/source module** provides initialization values; the **generated
+parallel module** owns this rank's parameters and buffers. Their devices need not
+be the same. CUDA below means the current CUDA device, normally selected per rank
+by `nnscaler.init()` or `torch.cuda.set_device()`.
+
+#### Device rules
+
+These are the normal construction rules, not a prohibition on temporary GPU
+execution during tracing or on meta tensors during SHARD capture:
+
+| Stage or input | Device rule |
+| --- | --- |
+| Tracing | When an original model must be constructed, use CPU as the default device, for every initialization strategy. Tracing may move the model or submodules to GPU according to `trace_strategy`. |
+| Existing original model supplied for `FULL` or `SHARD` | Read initialization weights directly from that instance. Do not reconstruct it or call a shard hook. This takes priority over the automatic source-construction rules below. |
+| Automatically constructed `FULL` source | Construct a full real model with CPU as the default device, even inside the generated constructor's CUDA context. |
+| `SHARD` without a supplied original instance | Automatic capture normally uses meta storage; concrete fallback and weight materialization use CUDA. A custom hook need not construct an original model and runs with CUDA as the default device, including lazy iteration. |
+| Generated parallel module | Allocate parameters and buffers on CUDA. New generated code specifies CUDA explicitly; public/CLI construction also supplies a CUDA context for cached legacy `FILE` code. |
+
+#### Important boundaries
+
+- **Default device is not a strict device check.** A default-device context affects
+  factories without an explicit device; it does not move existing tensors or
+  override explicit device arguments. A `FULL` factory can explicitly return a
+  CUDA model, and a custom SHARD hook can explicitly yield CPU tensors that are
+  then copied to CUDA. Current initialization does not reject these cases merely
+  because of their devices.
+- **Instance priority does not guarantee device preservation.** When tracing runs,
+  nnScaler calls `module.cpu()` on the supplied instance itself and moves dummy
+  inputs to CPU before applying `trace_strategy`. The original device is not
+  automatically restored. For example, with CPU tracing, a supplied CUDA model
+  remains on CPU, and FULL/SHARD subsequently read weights from that same CPU
+  instance. Reusing an already compiled graph can avoid this move. Do not assume
+  that supplying a CUDA model always avoids CPU transfers.
+- **Bare legacy `FILE` classes need a caller-provided CUDA context.** Public/CLI
+  entrypoints supply it; direct construction of an imported legacy class does not.
+  CPU allocation can therefore occur before a later `build_buckets()` migration.
+  See the [construction entries and example below](#generated-parallel-modules).
+
+#### Source construction and tracing
+
+Device handling has two layers:
+
+- **Device-management layer:** tracing and FULL source entrypoints select CPU.
+  The generated module's SHARD initialization entrypoint selects CUDA when no
+  original instance is supplied. Its context covers automatic capture or the
+  custom hook's entire iteration and closing, including failure cleanup.
+  These contexts are restored on return or failure. `torch.device(...)` sets the
+  default factory device; it does not change CUDA's current device.
+- **Construction layer:** `create_init_module`, `create_shard_init_weights` and
+  `capture_init_weights` inherit the caller's device context. None accepts a
+  device-selection parameter or implicitly selects CPU/CUDA. The SHARD helpers
+  are generators, so the caller's context must cover iteration, not just creation.
+
+`DeferredInitialization` is a separate replay backend, not part of this
+context-inheriting construction layer. Its explicit `device` controls concrete
+fallback and materialization, independently of the surrounding default-device
+context. Before entering capture, `capture_init_weights` reads the caller's device
+once and passes it explicitly to this backend. Later default-device changes do not
+redirect replay. Automatic SHARD provides the CUDA context at its high-level
+entrypoint, including direct construction of a generated class. The backend's
+implementation and interface are unchanged.
+
+The shared `create_init_module` helper only handles construction, exact-type
+validation, dtype conversion, and scoped RNG. It has no device argument and
+inherits the calling stage's device context. Calling it directly does not
+implicitly select CPU. Explicit device arguments in user factories are still
+honored; automatic capture can produce meta tensors before CUDA materialization.
+
+Construction and tracing are separate: `trace_strategy="cpu"` runs on CPU;
+`"cuda"` places the model and execution on CUDA; `"meta"` keeps the model on CPU
+and executes symbolically. The default `"cuda_run_cpu_offload"` places the model
+and intermediate results on CPU while running operations on CUDA; its
+`call_module` path temporarily moves the called submodule to CUDA and then back
+to CPU. It retries on CPU after CUDA OOM. These tracing-time device moves are
+allowed; they are separate from runtime weight initialization.
+
+#### Generated parallel modules
+
+| Construction entry | Parameter and buffer allocation |
+| --- | --- |
+| `parallelize(original_model, ...)` | The generated constructor runs inside `torch.device("cuda")`. |
+| Trainer/CLI construction, including selected parallel submodules | The adapter runs the generated constructor inside `torch.device("cuda")`. |
+| Direct construction of newly generated code, e.g. `GeneratedModel(...)` | Generated parameter and buffer factories explicitly specify `device="cuda"`, independently of the surrounding default-device context. |
+| Cached legacy `FILE` code through `parallelize` or Trainer/CLI | Older factories omit `device`; the enclosing CUDA context makes them allocate directly on CUDA without regenerating the code. |
+| Direct construction/import of legacy `FILE` code | No nnScaler construction context is added automatically. Wrap construction in a CUDA context to avoid initial CPU allocations. Otherwise the legacy factories follow the ambient PyTorch default device, normally CPU. |
+
+For direct construction of legacy `FILE` code:
+
+```python
+with torch.device("cuda"):
+    model = GeneratedModel(build_buckets=False)
+```
+
+`parallelize(ModelClass, ...)` returns a generated class, not a generated instance.
+`load_module=False` does not construct a generated instance either.
+`build_buckets=False` does not change the allocation rules above.
+`build_buckets()` calls `cuda()`, but this later migration is not a substitute
+for a CUDA construction context when using legacy code directly.
+Production generated-module allocation and automatic `SHARD` replay require CUDA;
+they do not silently fall back to CPU when CUDA is unavailable.
+
+#### Value loading, resume, and mixed models
+
+Direct CUDA allocation does **not** mean every initialization operation avoids CPU:
+
+- `FILE` reads CPU-saved tensors from weight files (using mmap where supported),
+  slices them, and copies the required values into CUDA targets.
+- `FULL` normally slices and applies value-partition scaling on its CPU source,
+  then copies local values to CUDA. Explicitly placed or supplied sources can
+  instead reside on CUDA.
+- Automatic `SHARD` materializes full producer tensors and dependencies on CUDA,
+  then copies local views into CUDA targets. Custom hooks or supplied sources
+  that explicitly use CPU can still require CPU-to-CUDA copies.
+
+With `init_params=False`, generated parameters are still allocated according to
+the rules above, but their values are left for checkpoint loading. `FILE` and
+`FULL` restore non-persistent buffers from `npbuffer.pt` without constructing a
+source model. `SHARD` captures/replays or calls its hook only when non-persistent
+attributes need initialization, requesting just those attributes.
+
+When Trainer parallelizes only selected submodules, the ordinary outer model
+and non-parallel children follow their own factory/default-device behavior,
+normally CPU. Generated children follow the CUDA rules above. Trainer later
+calls `cuda()` on the assembled model before constructing its optimizer.
+
 ### Automatic capture
 
 With `shard` and no user hook, nnScaler records the original constructor's tensor
 operations, then replays the tensors needed by this rank. It copies each local
-slice into the parallel model before releasing the temporary result.
+slice into the parallel model before releasing the temporary result. Local
+attributes referencing the same source tensor object share one materialization;
+all their slices are copied before the full result is released. Distinct tensor
+objects are replayed separately, even if they share storage.
 
 This is **selective full-tensor initialization**, not direct shard generation:
 materializing a tensor still allocates its full shape and any dependencies.
@@ -92,13 +222,17 @@ Use a [shard hook](#write-a-shard-initializer) when even one full tensor is too
 large. Capture uses per-operation random streams, so its values need not match
 eager `full` initialization with the same seed.
 
-`DeferredInitialization(device="cpu")` chooses one device for both capture-time
-concrete fallback and subsequent `materialize(tensor)` calls, defaulting to CPU.
-`capture_init_weights(..., device="cuda")`, used by automatic SHARD initialization,
-defaults to the current CUDA device. Both accept `"cpu"`, `"cuda"` or an explicit
-`torch.device`; unindexed CUDA is pinned to the current device when the capture
-object is constructed. Supplied model instances are used as-is.
-Full source tensors and intermediate values therefore consume temporary GPU memory.
+`DeferredInitialization(device="cpu")` explicitly selects the device for
+capture-time concrete fallback and subsequent `materialize(tensor)` calls,
+regardless of the surrounding default-device context. This standalone utility
+defaults to CPU and accepts `"cpu"`, `"cuda"` or an explicit `torch.device`;
+unindexed CUDA is pinned to the current device when the capture object is constructed.
+`capture_init_weights` instead inherits the caller's device on its first iteration
+and passes that device to the backend. For standalone use, put iteration inside a
+CPU or CUDA context; automatic SHARD supplies CUDA. Constructor factories inherit
+that same context, while supplied model instances bypass capture and replay.
+Automatic SHARD's full source tensors and intermediate values therefore consume
+temporary GPU memory.
 CPU and CUDA random samples may differ, but fallback and materialization use the
 same device and captured random seeds.
 There is no automatic CPU fallback if CUDA replay fails.
