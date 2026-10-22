@@ -5,6 +5,7 @@ from typing import Any, Dict, Union
 import logging
 from pathlib import Path
 import operator
+import threading
 import warnings
 
 from nnscaler.ir.tensor import IRFullTensor
@@ -121,6 +122,20 @@ def to_fx_graph(model: torch.nn.Module, dummy_input) -> torch.fx.GraphModule:
         warnings.filterwarnings("ignore", message=
             ".*does not reference an nn.Module, nn.Parameter, or buffer, which is what 'get_attr' Nodes typically target"
         )
+        current_thread = threading.current_thread()
+        other_threads = [
+            f'{thread.name} (type={type(thread).__module__}.{type(thread).__qualname__}, '
+            f'ident={thread.ident}, daemon={thread.daemon})'
+            for thread in threading.enumerate()
+            if thread is not current_thread and thread.is_alive()
+        ]
+        if other_threads:
+            _logger.warning(
+                'Other live Python threads detected before concrete_trace: %s. '
+                'Tracing temporarily patches process-wide functions; concurrent Python execution '
+                'may interfere with tracing and produce an incorrect graph.',
+                '; '.join(other_threads),
+            )
         traced_model = concrete_trace(
             model,
             dummy_input,
