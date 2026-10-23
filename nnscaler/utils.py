@@ -192,9 +192,9 @@ def setup_stride_broadcast_group(stride_size: int) -> BroadcastGroup:
     """
     rank = torch.distributed.get_rank()
     world_size = torch.distributed.get_world_size()
-    for i in range(stride_size):
-        ranks = list(range(i, world_size, stride_size))
-        nnscaler.runtime.device.DeviceGroup().get_group(ranks)
+    nnscaler.runtime.device.DeviceGroup().get_groups([
+        list(range(i, world_size, stride_size)) for i in range(stride_size)
+    ])
 
     curr_parallel_group_ranks = list(range(rank % stride_size, world_size, stride_size))
     curr_parallel_group = nnscaler.runtime.device.DeviceGroup().get_group(curr_parallel_group_ranks)
@@ -1059,9 +1059,9 @@ def broadcast_files(
     local_rank = curr_rank % local_world_size
 
     # create groups, make sure all groups are created correctly
-    for i in range(local_world_size):
-        group_ranks = list(range(i, world_size, local_world_size))
-        DeviceGroup().get_group(group_ranks)
+    DeviceGroup().get_groups([
+        list(range(i, world_size, local_world_size)) for i in range(local_world_size)
+    ])
 
     # collect file sizes and broadcast
     if curr_rank == 0:

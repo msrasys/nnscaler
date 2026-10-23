@@ -414,10 +414,9 @@ class ComputeConfig:
         # create all groups
         plan_ngpus = self.plan_ngpus
         runtime_ngpus = self.runtime_ngpus
-        for i in range(plan_ngpus):
-            DeviceGroup().get_group(
-                list(range(i, runtime_ngpus, plan_ngpus))
-            )
+        DeviceGroup().get_groups([
+            list(range(i, runtime_ngpus, plan_ngpus)) for i in range(plan_ngpus)
+        ])
         rank_list = list(range(rank % plan_ngpus, runtime_ngpus, plan_ngpus))
         return rank_list, DeviceGroup().get_group(rank_list)
 
@@ -3242,13 +3241,15 @@ def load_deduped_state_dict(
                     local_name2ranks[key].append(rank)
 
         # create process groups for broadcasting
+        broadcast_groups = []
         for key, ranks in local_name2ranks.items():
             if len(ranks) <= 1:
                 continue
             # should have sorted.
             ranks.sort()
             logger.debug(f'At rank {cur_rank}, create groups for ranks: {ranks}.')
-            DeviceGroup().get_group(ranks)
+            broadcast_groups.append(ranks)
+        DeviceGroup().get_groups(broadcast_groups)
 
         torch.distributed.barrier()
 

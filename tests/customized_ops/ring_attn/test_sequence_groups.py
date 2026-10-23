@@ -179,9 +179,8 @@ def _sequence_group_attention_worker():
     dist.init_process_group(backend='nccl')
     nnscaler.init()
 
-    groups = ([0, 1], [2, 3])
-    for ranks in groups:
-        DeviceGroup().get_group(ranks)
+    groups = [[0, 1], [2, 3]]
+    DeviceGroup().get_groups(groups)
 
     rank = dist.get_rank()
     group_index = rank // 2

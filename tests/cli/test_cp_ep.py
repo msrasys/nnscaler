@@ -72,21 +72,24 @@ def init_cp_ep_groups(trainer: Trainer) -> None:
     _SCALE_UNITS_PER_CONTEXT_GROUP = context_parallel_size // expert_parallel_size
 
     # Groups used by all-to-all dispatch/combine inside each EP unit.
-    for first_rank in range(0, world_size, expert_parallel_size):
-        DeviceGroup().get_group(tuple(range(first_rank, first_rank + expert_parallel_size)))
+    groups = [
+        list(range(first_rank, first_rank + expert_parallel_size))
+        for first_rank in range(0, world_size, expert_parallel_size)
+    ]
 
     # Full CP groups are used by context-dependent communication. Their
     # same-EP-lane subgroups are used by the outer sequence chunk/all-gather.
     for first_rank in range(0, world_size, context_parallel_size):
-        DeviceGroup().get_group(tuple(range(first_rank, first_rank + context_parallel_size)))
+        groups.append(list(range(first_rank, first_rank + context_parallel_size)))
         for expert_lane in range(expert_parallel_size):
-            DeviceGroup().get_group(tuple(
+            groups.append(list(
                 range(
                     first_rank + expert_lane,
                     first_rank + context_parallel_size,
                     expert_parallel_size,
                 )
             ))
+    DeviceGroup().get_groups(groups)
 
 
 class ContextGroupSampler(torch.utils.data.Sampler):
