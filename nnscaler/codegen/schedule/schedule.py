@@ -14,7 +14,7 @@ from nnscaler.graph.graph import IRSegment
 
 from nnscaler.execplan.execplan import ExecutionPlan, ExeReuseCell, ExecutionPlanType
 
-from nnscaler.codegen.emit import FuncEmission
+from nnscaler.codegen.emit import FuncEmission, IRValue
 from nnscaler.codegen.syntax.symtable import SymbolTable
 from nnscaler.codegen.lifecycle import LifeCycle
 from nnscaler.codegen.syntax.blocks import FunctionBlock, Block
@@ -256,10 +256,12 @@ class ScheduleCodeGen(FuncEmission):
                             f'{id(node) not in last_backward_node_oids !r}'
                         )
 
+                produced_tids = {obj.tid for obj in IR.get_objects(execplan.graph.inputs())
+                                 if isinstance(obj, IRTensor)}
                 prev_backward_node = None
                 prev_backward_weight_codes = []
                 for line, node in enumerate(device_nodes):
-                    codes = self.emit_node(execplan, node)
+                    codes = self.emit_node(execplan, node, produced_tids=produced_tids)
 
                     if use_scheduler and _is_backward_segment(node) and CompileFlag.use_fbw:
                         if prev_backward_node is not None:
@@ -296,6 +298,8 @@ class ScheduleCodeGen(FuncEmission):
                     tensors = lifetime.release_tensors_after_line(line)
                     if len(tensors) > 0 : # not necessarily to have one after each line
                         _append_code(fb, self.emit_release(tensors))
+                    produced_tids.update(obj.tid for obj in IR.get_objects(node.outputs())
+                                         if isinstance(obj, IRTensor))
 
                 if prev_backward_node is not None:
                     _append_skip_flag(prev_backward_node)
@@ -433,7 +437,8 @@ class ScheduleCodeGen(FuncEmission):
         """
         return f'{self.tensor_name(tensor)} = {self.tensor_name(tensor)}.detach()'
 
-    def emit_node(self, execplan: ExecutionPlan, node: IRCell, force_no_grad: bool = False) -> List[str]:
+    def emit_node(self, execplan: ExecutionPlan, node: IRCell, force_no_grad: bool = False,
+                  *, produced_tids=None) -> List[str]:
         """
         Emit node / subgraph code
         """
@@ -479,6 +484,16 @@ class ScheduleCodeGen(FuncEmission):
                 for idx, tensor in enumerate(output_grads):
                     if isinstance(tensor, IRSubTensor) and tensor.is_loss():
                         output_grads[idx] = None
+                if produced_tids is not None:
+                    # Auxiliary outputs are returned for logging, not seeded by
+                    # the loss. Explicit zeros also retain zero input-gradient
+                    # paths for auxiliary values arriving from an earlier stage.
+                    terminal = {t.parent for t in IR.get_objects(execplan.outputs())
+                                if isinstance(t, IRSubTensor)}
+                    for idx, (output, grad) in enumerate(zip(output_tensors, output_grads)):
+                        if (grad is not None and grad.tid not in produced_tids
+                                and output.parent in terminal):
+                            output_grads[idx] = IRValue(f'torch.zeros_like({self.tensor_name(output)})')
 
                 input_grads_str = self.return_name(input_grads)
                 input_tensors_str = self.tuple_name(input_tensors, skip_attr=True, prefix_attr='model.')
