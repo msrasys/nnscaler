@@ -18,7 +18,7 @@ from .common import assert_equal
 
 class _ParallelModuleStub(ParallelModule, skip_init=True):
     # Real compilation and loading are covered by the CLI resume tests.
-    def __init__(self, tid, *, width=2, dtype=torch.float32):
+    def __init__(self, tid, *, width=2, dtype=torch.float32, buffer_shards=False):
         nn.Module.__init__(self)
         self.rank = 0
         self.compute_config = ComputeConfig(1, 1)
@@ -42,6 +42,12 @@ class _ParallelModuleStub(ParallelModule, skip_init=True):
                 orig_name=name, shape=(width,), slicers=(slice(0, width),),
                 val_chunks=1, dtype=dtype, sub_shape=(width,),
             )
+        if buffer_shards:
+            buffer_name = f'buffer_{tid + 2}'
+            self.register_buffer(buffer_name + '_shard', getattr(self, buffer_name)[:1].clone())
+            self._fullmap[buffer_name + '_shard'] = replace(
+                self._fullmap[buffer_name], slicers=(slice(0, 1),), sub_shape=(1,),
+            )
         self._register_state_dict_hook(self._save_metadata)
 
     @staticmethod
@@ -49,15 +55,20 @@ class _ParallelModuleStub(ParallelModule, skip_init=True):
         module._add_extra_state(state_dict, prefix)
 
 
-def test_rename_parameters_and_buffers_without_copying_tensors():
-    old = _ParallelModuleStub(10)
-    new = _ParallelModuleStub(100)
+@pytest.mark.parametrize('with_buffer_shard', [False, True])
+def test_rename_parameters_and_buffers_without_copying_tensors(with_buffer_shard):
+    old = _ParallelModuleStub(10, buffer_shards=with_buffer_shard)
+    new = _ParallelModuleStub(100, buffer_shards=with_buffer_shard)
     state = old.state_dict()
     before = copy.deepcopy(state)
 
     adapted = nnscaler.align_state_dict_names(new, state)
 
-    assert set(adapted) == {'weight_100', 'bias_101', 'buffer_102', ParallelModule.EXTRA_STATE_KEY}
+    expected_names = {'weight_100', 'bias_101', 'buffer_102', ParallelModule.EXTRA_STATE_KEY}
+    if with_buffer_shard:
+        expected_names.add('buffer_102_shard')
+        assert adapted['buffer_102_shard'] is state['buffer_12_shard']
+    assert set(adapted) == expected_names
     assert adapted['weight_100'] is state['weight_10']
     assert adapted['bias_101'] is state['bias_11']
     assert adapted['buffer_102'] is state['buffer_12']
@@ -222,7 +233,7 @@ def test_load_pickled_legacy_scalar_metadata(slicers):
 
 
 @pytest.mark.parametrize('source', ['checkpoint', 'module'])
-def test_reject_two_shards_with_same_original_name(source):
+def test_reject_incompatible_parameter_shards(source):
     old = _ParallelModuleStub(10)
     new = _ParallelModuleStub(100)
     module = old if source == 'checkpoint' else new
@@ -234,7 +245,20 @@ def test_reject_two_shards_with_same_original_name(source):
         module._fullmap[weight_name], tid=999, slicers=(slice(2, 4),),
     )
 
-    with pytest.raises(AssertionError, match=f'Duplicate original names in {source} param_area_map'):
+    with pytest.raises(ValueError, match='expected one match'):
+        nnscaler.align_state_dict_names(new, old.state_dict())
+
+
+@pytest.mark.parametrize('source', ['checkpoint', 'module'])
+def test_reject_ambiguous_buffer_shards(source):
+    old = _ParallelModuleStub(10, buffer_shards=True)
+    new = _ParallelModuleStub(100, buffer_shards=True)
+    module = old if source == 'checkpoint' else new
+    buffer_name = 'buffer_12' if source == 'checkpoint' else 'buffer_102'
+    module._fullmap[buffer_name + '_shard'] = replace(module._fullmap[buffer_name], tid=999)
+
+    message = 'expected one match' if source == 'checkpoint' else 'ambiguous shard metadata'
+    with pytest.raises(ValueError, match=message):
         nnscaler.align_state_dict_names(new, old.state_dict())
 
 

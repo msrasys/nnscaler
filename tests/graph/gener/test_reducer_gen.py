@@ -246,6 +246,26 @@ def test_tp_partitioned_weight_2_consumers():
 
 
 @replace_all_device_with('cpu')
+def test_tp_partitioned_weight_2_consumers_mismatched_devices():
+    # Both consumers partition param1 the same way, but their partitions are assigned to
+    # devices in opposite orders, so each device holds two different sub-tensors of param1.
+    graph = build_graph(model_cls=SimpleModule2ConsumersTp)
+    [matmul1, add, matmul2, sum] = graph.select(ntype=IRFwOperation)
+    for node in graph.select(ntype=IRFwOperation):
+        if node in (matmul1, add):
+            nodes = graph.partition(node, node.algorithm('dim'), idx=1, dim=0, num=2)
+        else:
+            nodes = graph.replicate(node, 2)
+        if node == add:
+            nodes = nodes[::-1]
+        for device, sn in enumerate(nodes):
+            graph.assign(sn, device)
+
+    with pytest.raises(RuntimeError, match='multiple different sub-tensors on device'):
+        IRAdapterGener.gen_weight(graph)
+
+
+@replace_all_device_with('cpu')
 def test_replicated_2_consumers_1gpu():
     graph = build_graph(model_cls=SimpleModule2ConsumersTp)
     [matmul1, add, matmul2, sum] = graph.select(ntype=IRFwOperation)

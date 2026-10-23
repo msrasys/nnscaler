@@ -240,8 +240,16 @@ class CubeModule(torch.nn.Module):
         super().__init__()
         self._reducers: List[Reducer] = list()
         # self._fullmap is mapping from the name of local attribute tensor
-        # to its corresponding fulltensor meta
-        # please note there can be multiple entries with same tid
+        # to its corresponding fulltensor meta.
+        # A trainable parameter has at most one entry per full tensor on a rank,
+        # which is enforced by IRAdapterGener.gen_weight. Attributes without gradient
+        # (frozen parameters and buffers) are not checked there, so they may still have
+        # multiple entries with the same tid when consumed with different partitions.
+
+        # Entries are inserted in attribute registration order, so the `is_param` entries
+        # follow the order of `self.parameters()`. Checkpoint merging counts them to recover
+        # the model parameter index (the keys of `ZeroMetadata.model_idx2opt_idx`), which
+        # `_get_zero_metadata` asserts.
         self._fullmap : Dict[str, AttrMeta] = dict()
 
     def get_non_persistent_buffers(self) -> Dict[str, torch.Tensor]:
@@ -1105,9 +1113,11 @@ class OriginModuleMetadata:
 
 @dataclass
 class ZeroMetadata:
-    # a mapping from the index of the parameter in the model
-    # to (optimizer_index, the start and end in the bucket, the shape of the parameter)
-    model_idx2opt_idx: Optional[Dict] = None
+    # a mapping from the index of the parameter in the model (`self.parameters()` order) to
+    #   - (optimizer_index, start and end offsets in the bucket, shape of the parameter)
+    #     if the parameter is in a reducer bucket
+    #   - optimizer_index if the parameter is not in any bucket
+    model_idx2opt_idx: Optional[Dict[int, Union[int, Tuple[int, int, int, torch.Size]]]] = None
     # a mapping from optimizer_index to the related bucket information (sub_ranks, bucket_size)
     opt_idx2ranks: Optional[Dict] = None
     # the level of zero optimization
@@ -1805,6 +1815,11 @@ class ParallelModule(CubeModule):
         # value: (sub_ranks, bucket_size), If value is None, then the parameter is not in a bucket
         opt_idx2ranks: Dict[int, Optional[Tuple[List[int], int]]] = {}
         model_params_id = [id(param) for param in self.parameters()]
+        # Checkpoint merging recovers the model parameter index by counting `is_param`
+        # entries of the fullmap in order, so that order must match `self.parameters()`.
+        assert [name for name, meta in self._fullmap.items() if meta.is_param] \
+            == [name for name, _ in self.named_parameters()], \
+            "fullmap parameter order must match named_parameters order"
 
         for reducer in self.reducers:
             _, sub_ranks = self._get_zero_subranks(reducer)
@@ -2009,7 +2024,7 @@ class ParallelModule(CubeModule):
             origname_tid_map = {meta.orig_name: meta.tid for meta in attr_meta_map.values()}
             tid_info = defaultdict(list)
             for attr, meta in attr_meta_map.items():
-                tid_info[meta.tid].append((attr, meta.slicers, meta.val_chunks))  # multiple params may share the same tid
+                tid_info[meta.tid].append((attr, meta.slicers, meta.val_chunks))  # frozen params or buffers may share the same tid
 
             for orig_param_name in orig_param_names:
                 if orig_param_name not in origname_tid_map:

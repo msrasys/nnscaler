@@ -3457,21 +3457,19 @@ def align_state_dict_names(
             if getattr(old, field_name) != getattr(current, field_name):
                 raise ValueError(f"Cannot align {extra_key}: original model metadata {field_name} changed; load a merged checkpoint instead")
 
-        assert len({meta.orig_name for meta in old.param_area_map.values()}) == len(old.param_area_map), \
-            f"Duplicate original names in checkpoint param_area_map for {extra_key}"
-        assert len({meta.orig_name for meta in current.param_area_map.values()}) == len(current.param_area_map), \
-            f"Duplicate original names in module param_area_map for {extra_key}"
-
         candidates: Dict[tuple, str] = {
             attr_meta_identity(meta): name
             for name, meta in current.param_area_map.items()
         }
+        if len(candidates) != len(current.param_area_map):
+            raise ValueError(f"Cannot align {extra_key}: ambiguous shard metadata in module param_area_map")
 
         # Map old parameter names to new parameter names
         name_map: Dict[str, str] = {}
 
         for old_name, meta in old.param_area_map.items():
-            match = candidates.get(attr_meta_identity(meta))
+            # Consume each match once to keep the old and new shard names in one-to-one correspondence.
+            match = candidates.pop(attr_meta_identity(meta), None)
             if match is None:
                 raise ValueError(
                     f"Cannot align {prefix}{old_name}: expected one match for "
@@ -3479,7 +3477,7 @@ def align_state_dict_names(
                 )
             name_map[old_name] = match
 
-        if len(name_map) != len(current.param_area_map):
+        if candidates:
             raise ValueError(f"Cannot align {extra_key}: parameter names are missing from shard metadata")
 
         # Optimizer state uses positional IDs (or bucket offsets), not model keys.

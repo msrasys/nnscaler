@@ -592,6 +592,20 @@ class IRAdapterGener:
                         f"FullTensor weight: {ftensor}\n"
                         f"Consumers:\n{nl.join([repr(w.cell) for w in sub_ws])}\n"
                     )
+            # Reducer generation assumes distinct weight shards reside on distinct devices.
+            # Reject multiple distinct shards of the same weight on one device
+            device_sub_ws: Dict[int, Set[IRSubTensor]] = {}
+            for sw in sub_ws:
+                device_sub_ws.setdefault(sw.device[0], set()).add(sw)
+            for device, sws in device_sub_ws.items():
+                if len(sws) > 1:
+                    nl = '\n'
+                    raise RuntimeError(
+                        f"Detected a weight with multiple different sub-tensors on device {device}.\n"
+                        f"To achieve this, users need to call `graph.multiref(weight)` inside the policy.\n"
+                        f"FullTensor weight: {ftensor}\n"
+                        f"Sub-tensors on device {device}:\n{nl.join(repr(sw) for sw in sws)}\n"
+                    )
 
         # record sub-weight consumer devices (reducers are filtered later based on device count)
         sub_weight_devices: Dict[IRSubTensor, Tuple[int,...]] = dict()
