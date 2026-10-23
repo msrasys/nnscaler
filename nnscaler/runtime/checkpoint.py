@@ -190,6 +190,10 @@ def load_from_rank_state_dicts(
             raise ValueError("The target optimizer must be created by build_optimizer.")
         if not _is_supported_optimizer(target_opt_extra.name):
             raise ValueError("Only Adam-like or Muon-like optimizers are supported.")
+        if not optimizer:
+            raise ValueError("The target optimizer must be provided.")
+        if type(optimizer).__name__ != target_opt_extra.name:
+            raise ValueError(f"The target optimizer must be of type {target_opt_extra.name}.")
         if len(optimizer.param_groups) != 1:
             raise ValueError("Only a single optimizer parameter group is supported.")
 
@@ -200,19 +204,38 @@ def load_from_rank_state_dicts(
         optimizer_state_dicts = _sort_state_dicts(optimizer_state_dicts)
         opt_extra_states, opt_states, opt_metadata = _get_optimizer_state_dict_info(optimizer_state_dicts)
 
+    # non-parallel modules
     model_getters = {
         name: partial(non_parallel_states.__getitem__, name) for name in non_parallel_states
     }
     optimizer_getters = {}
-    if opt_extra_states is not None and _NON_PARALLEL_MODULE_ATTR_NAME in opt_states:
-        reader = _ModuleStateReader(
-            [extra.non_parallel_extra_state for extra in opt_extra_states],
-            [], opt_states[_NON_PARALLEL_MODULE_ATTR_NAME],
-        )
-        for name in reader.entries:
-            if reader.has_optimizer(name):
-                optimizer_getters[name] = partial(reader.read_optimizer, name)
+    if opt_extra_states is not None:
+        if _NON_PARALLEL_MODULE_ATTR_NAME in opt_states:  # zero 1
+            reader = _ModuleStateReader(
+                [extra.non_parallel_extra_state for extra in opt_extra_states],
+                [], opt_states[_NON_PARALLEL_MODULE_ATTR_NAME],
+            )
+            for name in reader.entries:
+                if reader.has_optimizer(name):
+                    optimizer_getters[name] = partial(reader.read_optimizer, name)
+        else: # no zero
+            # Non-parallel parameters outside ZeRO buckets retain their registration order.
+            # we will read the non-parallel optimizer state from rank 0
+            target_param_names = {name for name, param in module.named_parameters() if param.requires_grad}
+            non_parallel_names = [name for name in non_parallel_states if name in target_param_names]
+            locations = opt_extra_states[0].parallel_module_locs.values()
+            parallel_indices = {index for loc in locations for index in range(loc.offset, loc.offset + loc.count)}
+            source_indices = [
+                index for index in optimizer_state_dicts[0]['param_groups'][0]['params']
+                if index not in parallel_indices
+            ]
+            if len(non_parallel_names) != len(source_indices):
+                raise ValueError("Cannot match non-parallel optimizer parameters to the target model.")
+            for name, index in zip(non_parallel_names, source_indices):
+                if optimizer_state_dicts[0]['state'].get(index):
+                    optimizer_getters[name] = partial(copy.deepcopy, optimizer_state_dicts[0]['state'][index])
 
+    # parallel modules
     for module_path, extras in extra_states.items():
         if any(extra is None for extra in extras):
             raise ValueError(f"Missing checkpoint metadata for parallel module {'.'.join(module_path)}.")
@@ -224,24 +247,6 @@ def load_from_rank_state_dicts(
         for name in reader.entries:
             if reader.has_optimizer(name):
                 optimizer_getters[prefix + name] = partial(reader.read_optimizer, name)
-
-    if opt_extra_states is not None:
-        # Non-parallel parameters outside ZeRO buckets retain their registration order.
-        target_param_names = {name for name, param in module.named_parameters() if param.requires_grad}
-        non_parallel_names = [
-            name for name in non_parallel_states if name in target_param_names
-        ] if _NON_PARALLEL_MODULE_ATTR_NAME not in opt_states else []
-        locations = opt_extra_states[0].parallel_module_locs.values()
-        parallel_indices = {index for loc in locations for index in range(loc.offset, loc.offset + loc.count)}
-        source_indices = [
-            index for index in optimizer_state_dicts[0]['param_groups'][0]['params']
-            if index not in parallel_indices
-        ]
-        if len(non_parallel_names) != len(source_indices):
-            raise ValueError("Cannot match non-parallel optimizer parameters to the target model.")
-        for name, index in zip(non_parallel_names, source_indices):
-            if optimizer_state_dicts[0]['state'].get(index):
-                optimizer_getters[name] = partial(copy.deepcopy, optimizer_state_dicts[0]['state'][index])
 
     device = device if device is not None else torch.cuda.current_device()
     module.to(device)
@@ -263,8 +268,11 @@ def load_from_rank_state_dicts(
 
     if optimizer_state_dicts is None:
         return
-    assert optimizer is not None and target_opt_extra is not None and opt_metadata is not None
+
     local_optimizer_state = {}
+    # `parallel_module_locs` offsets index `optimizer.param_groups[0]['params']`, the parameter
+    # sequence handed to the optimizer by build_optimizer. Under ZeRO that sequence holds the
+    # reducers' flat bucket parameters instead of the module's own parameters.
     parallel_indices = set()
     for prefix, loc in target_opt_extra.parallel_module_locs.items():
         child = get_member_by_name(module, prefix)
@@ -278,6 +286,8 @@ def load_from_rank_state_dicts(
         states = _construct_optim_state(child, orig_states)
         local_optimizer_state.update({loc.offset + index: state for index, state in states.items()})
 
+    # Remaining indices are non-parallel parameters outside ZeRO buckets. Check the index first:
+    # flat bucket parameters inside `parallel_indices` are not in `module.named_parameters()`.
     param_names = {param: name for name, param in module.named_parameters()}
     for index, param in enumerate(optimizer.param_groups[0]['params']):
         if index not in parallel_indices and param_names[param] in optimizer_getters:

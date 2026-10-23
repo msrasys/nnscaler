@@ -1550,9 +1550,15 @@ class OptimizerExtraState:
         non_parallel parameters will become a virtual ParallelModule,
         and its information will also be saved in `parallel_module_locs` and `parallel_module_configs`
 
-        non_parallel_extra_state: the extra state for non-parallel modules
-            (equivalent to the data saved as key `ParallelModule.EXTRA_STATE_KEY` in state dict)
-        non_parallel_param_locs: the parameter locations for non-parallel parameters.
+        non_parallel_extra_state: extra state of the virtual ParallelModule that wraps the
+            trainable non-parallel parameters when ZeRO is applied to them (an `ExtraState`,
+            the same content a ParallelModule stores under `ParallelModule.EXTRA_STATE_KEY`).
+        non_parallel_param_locs: indices of the trainable non-parallel parameters in
+            `module.parameters()` order, i.e. their positions in the merged (non-ZeRO) optimizer state.
+
+        Both are None unless ZeRO is applied to non-parallel parameters, which requires
+        `compute_config.use_zero`, `plan_ngpus != runtime_ngpus`, and at least one non-empty
+        non-parallel parameter. Non-parallel parameters only use ZeRO-1.
     """
     rank: int
     name: str
@@ -1681,7 +1687,9 @@ def hybrid(
     ...
 hybrid.is_hybrid = True  # mark this function as hybrid optimizer factory
 
-
+# Attribute names used for zero information for non-parallel modules
+# None if there are no non-parallel modules or zero is not used for them.
+# It is also the key of `OptimizerExtraState.parallel_module_locs` for non-parallel modules.
 _NON_PARALLEL_MODULE_ATTR_NAME = '_nnscaler_non_parallel_module_'
 _SYNC_GRAD_REQUIRED_ATTR = '_nnscaler_sync_grad_required'
 
@@ -2222,6 +2230,31 @@ def _get_optimizer_state_dict_info(
     Dict[str, Any]
 ]:
     """
+    Split per-rank optimizer state dicts into the pieces needed for merging.
+
+    Args:
+        optimizer_state_dicts: optimizer state dicts of all ranks, each produced by
+            `optimizer.state_dict()` of an optimizer built with `build_optimizer`, so each
+            contains `ParallelModule.EXTRA_STATE_KEY` with an `OptimizerExtraState`.
+
+    Returns:
+        opt_extra_states: `OptimizerExtraState` of every rank, indexed by rank.
+        opt_state_dicts: optimizer states of each parallel module, split by module.
+            key: module prefix as in `OptimizerExtraState.parallel_module_locs`
+                (including `_NON_PARALLEL_MODULE_ATTR_NAME` when ZeRO is applied to
+                non-parallel parameters).
+            value: a list indexed by rank with `optimizer_dedup_group_size` items of that module;
+                only ranks inside the dedup group are filled, the rest stay empty.
+                Each item is `{'state': {...}, 'param_groups': [...]}` where `state` maps the
+                parameter index *within the module* (global index minus `loc.offset`) to its
+                optimizer state, and only parameters with a state are present. `param_groups` is a
+                deep copy of the rank's param_groups kept to satisfy the merge helpers; its
+                `params` list is not meaningful.
+        ret_opt_state_dict: skeleton of the merged optimizer state dict: `{'state': {}}` plus deep
+            copies of all other top-level keys (e.g. `param_groups`) from the input state dicts,
+            assumed identical across ranks. Non-parallel parameters' states are not collected here;
+            callers read them from the input state dicts by index.
+
     An example of optimizer state dict:
     {
         'state': {
