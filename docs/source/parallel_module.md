@@ -21,11 +21,14 @@ At runtime, `get_groups` deduplicates groups, reuses WORLD for full-world
 membership, and batches groups with disjoint rank memberships.
 P2P and collective operations with the same members reuse the same process group.
 
-On PyTorch 2.5 and later, initialization uses one `torch.distributed.split_group`
+On PyTorch 2.11.0 and later, initialization uses one `torch.distributed.split_group`
 call per batch when WORLD uses NCCL, has a bound `device_id`, and its device
 backend reports `supports_splitting=True`. Otherwise,
 including older PyTorch versions or an externally initialized WORLD without a
 bound device, groups are created sequentially with `new_group`.
+PyTorch versions before 2.11.0, including 2.11.0 prereleases, use sequential
+creation to avoid NCCL split-color hash collisions fixed in
+[pytorch/pytorch#173687](https://github.com/pytorch/pytorch/pull/173687).
 All WORLD ranks must initialize the generated modules in the same order,
 including ranks outside a particular subgroup.
 
