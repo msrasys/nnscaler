@@ -5,7 +5,7 @@ from concurrent.futures import ProcessPoolExecutor
 from enum import Enum
 from functools import partial
 import types
-from typing import Callable, Any, Dict, Iterable, Optional, Tuple, Type, Union, TypeVar, List, Set, Literal
+from typing import Callable, Any, Dict, Iterable, Mapping, Optional, Tuple, Type, Union, TypeVar, List, Set, Literal
 from pathlib import Path
 import inspect
 import sys
@@ -47,6 +47,7 @@ from nnscaler.ir.unique import IDGenerator
 
 from nnscaler.runtime.adapter.reducer import Bucket, Reducer, ParamBucketConfig
 from nnscaler.runtime.device import DeviceGroup
+from nnscaler.runtime.checkpoint import load_from_rank_state_dicts  # re-exported by nnscaler
 from nnscaler.runtime.initialization import (
     create_init_module, create_shard_init_weights,
 )
@@ -2292,6 +2293,25 @@ def _get_optimizer_state_dict_info(
     return opt_extra_states, opt_state_dicts, ret_opt_state_dict
 
 
+def _get_state_dict_rank(state_dict: Dict[str, Any]) -> int:
+    for k in state_dict:
+        if k.split('.')[-1] == ParallelModule.EXTRA_STATE_KEY:
+            return state_dict[k]['rank']
+    raise ValueError("Invalid state dict: no rank found.")
+
+
+def _sort_state_dicts(state_dicts: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    sorted_state_dicts =[None] * len(state_dicts)
+    for state_dict in state_dicts:
+        rank = _get_state_dict_rank(state_dict)
+        if rank >= len(state_dicts):
+            raise ValueError(f"Invalid rank {rank} in state_dicts with length {len(state_dicts)}.")
+        if sorted_state_dicts[rank] is not None:
+            raise ValueError(f"Duplicate rank {rank} in state_dicts.")
+        sorted_state_dicts[rank] = state_dict
+    return sorted_state_dicts
+
+
 @torch.no_grad()
 def merge_state_dicts(
     module_state_dicts: List[Dict[str, Any]],
@@ -2325,23 +2345,6 @@ def merge_state_dicts(
     """
     if not module_state_dicts:
         raise ValueError("model_state_dicts should not be empty.")
-
-    def _get_state_dict_rank(state_dict: Dict[str, Any]) -> int:
-        for k in state_dict:
-            if k.split('.')[-1] == ParallelModule.EXTRA_STATE_KEY:
-                return state_dict[k]['rank']
-        raise ValueError("Invalid state dict: no rank found.")
-
-    def _sort_state_dicts(state_dicts: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        sorted_state_dicts =[None] * len(state_dicts)
-        for state_dict in state_dicts:
-            rank = _get_state_dict_rank(state_dict)
-            if rank >= len(state_dicts):
-                raise ValueError(f"Invalid rank {rank} in state_dicts with length {len(state_dicts)}.")
-            if sorted_state_dicts[rank] is not None:
-                raise ValueError(f"Duplicate rank {rank} in state_dicts.")
-            sorted_state_dicts[rank] = state_dict
-        return sorted_state_dicts
 
     # sort state dicts by rank
     module_state_dicts = _sort_state_dicts(module_state_dicts)
@@ -2705,17 +2708,21 @@ def _opt_load_merged_state_dict(module: ParallelModule, states: Dict[int, Dict[s
         if not orig_param_dict:
             return {}
 
-        if module.compute_config.use_zero == 1:
-            return _construct_optim_state_zero(module, orig_param_dict)
-        elif module.compute_config.use_zero > 1:
-            return _construct_optim_state_zero3(module, orig_param_dict)
-        else:
-            return _construct_optim_state_nonzero(module, orig_param_dict)
+        return _construct_optim_state(module, orig_param_dict)
+
+
+def _construct_optim_state(module: ParallelModule, orig_param_dict: Mapping[str, Dict[str, Any]]):
+    if module.compute_config.use_zero == 1:
+        return _construct_optim_state_zero(module, orig_param_dict)
+    elif module.compute_config.use_zero > 1:
+        return _construct_optim_state_zero3(module, orig_param_dict)
+    else:
+        return _construct_optim_state_nonzero(module, orig_param_dict)
 
 
 def _construct_optim_state_zero3(
         module: ParallelModule,
-        orig_param_dict: Dict[str, Dict[str, Any]]
+        orig_param_dict: Mapping[str, Dict[str, Any]]
 ):
     # state for each parameter in the parallel module
     new_states = _construct_optim_state_nonzero(module, orig_param_dict)
@@ -2778,7 +2785,7 @@ def _construct_optim_state_zero3(
 
 def _construct_optim_state_zero(
         module: ParallelModule,
-        orig_param_dict: Dict[str, Dict[str, Any]],
+        orig_param_dict: Mapping[str, Dict[str, Any]],
 ):
     """
     Construct the optimizer state for a ParallelModule with ZeRO optimization.
@@ -2908,7 +2915,7 @@ def _construct_optim_state_zero(
 
 def _construct_optim_state_nonzero(
         module: ParallelModule,
-        orig_param_dict: Dict[str, Dict[str, Any]]
+        orig_param_dict: Mapping[str, Dict[str, Any]]
 ):
     dist_param_map = module.dist_param_map  # name in parallel module (without tid suffix) -> name in origin module
     param_area_map = module.fullmap         # str -> AttrMeta
@@ -2937,7 +2944,7 @@ def _construct_optim_state_nonzero(
 
 def _extract_new_state(
         local_name: str,
-        orig_param_dict: Dict[str, Dict[str, Any]],
+        orig_param_dict: Mapping[str, Dict[str, Any]],
         dist_param_map: Dict[str, str],
         param_area_map: Dict[str, AttrMeta],
         zero3_info: Optional[Zero3AttrMeta] = None

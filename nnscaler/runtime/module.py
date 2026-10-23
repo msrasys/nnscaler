@@ -4,7 +4,7 @@
 import functools
 import pickle
 from contextlib import closing
-from typing import Callable, List, Set, Dict, Tuple, Optional, TYPE_CHECKING, Any, Union, ClassVar, Generator
+from typing import Callable, List, Set, Dict, Tuple, Optional, TYPE_CHECKING, Any, Union, ClassVar, Generator, Mapping
 from typing_extensions import Self
 import logging
 import os
@@ -86,6 +86,25 @@ class AttrMeta:
             if sub != orig:
                 partitioned_dims.append(dim)
         return partitioned_dims
+
+
+# Per-rank ZeRO information consumed by the state dict merge helpers (the `zero_idx_maps`
+# argument), one item per rank in rank order. Each item follows the field order of `ZeroMetadata`:
+#   0. model_idx2opt_idx: model parameter index (`parameters()` order) ->
+#      (optimizer_index, start, end, shape) for a parameter inside a reducer bucket,
+#      or optimizer_index for a parameter outside any bucket.
+#   1. opt_idx2ranks: optimizer_index -> (sub_ranks, bucket_size) of the bucket,
+#      or None for a parameter outside any bucket.
+#   2. zero: ZeRO level, 1 for ZeRO-1 and > 1 for ZeRO-3.
+#   3. zero3_param_metadata: local attribute name -> `asdict(Zero3AttrMeta)` of its ZeRO-3 shard,
+#      None when ZeRO-3 is not used.
+# Checkpoints from older versions may provide only the first two items (ZeRO-1 assumed) or three items.
+ZeroIdxMap = Tuple[
+    Dict[int, Union[int, Tuple[int, int, int, torch.Size]]],
+    Dict[int, Optional[Tuple[List[int], int]]],
+    int,
+    Optional[Dict[str, Dict]],
+]
 
 
 @dataclass
@@ -553,7 +572,7 @@ class CubeModule(torch.nn.Module):
         cls,
         state_dicts: List[Dict],
         fullmaps: List[Dict[str, AttrMeta]],
-        zero_idx_maps: Optional[List[Dict]] = None
+        zero_idx_maps: Optional[List[ZeroIdxMap]] = None
     ):
         """Merge model states from multiple shard into a single-model state.
         Here we assume the order of state_dicts and fullmaps are aligned, and is the same as the rank order.
@@ -565,7 +584,8 @@ class CubeModule(torch.nn.Module):
         Args:
             state_dicts (List[Dict[str, torch.Tensor]]): per-rank local model state dict from model.state_dict()
             fullmaps (List[Dict[str, AttrMeta]]): per-rank fullmap
-            zero_idx_maps (Optional[List[Dict]]): zero information for the model, `None` if zero is not enabled
+            zero_idx_maps (Optional[List[ZeroIdxMap]]): per-rank ZeRO information in rank order,
+                see `ZeroIdxMap`. `None` if ZeRO is not enabled.
 
         Returns:
             full_state_dicts (List[Dict[str, torch.Tensor]]): Full model state dict
@@ -670,7 +690,7 @@ class CubeModule(torch.nn.Module):
 
     @classmethod
     def merge_partial_states(cls, state_dicts: List,
-                             zero_idx_maps=None):
+                             zero_idx_maps: Optional[List[ZeroIdxMap]] = None):
         """Merge model and optimizer states from different shard into a single-model state.
 
         Warnings:
@@ -684,7 +704,8 @@ class CubeModule(torch.nn.Module):
                 * optim_state_dicts (Optional[List[Dict]]): per-rank optimizer state dict from optimizer.state_dict()
                 * dist_param_map: deprecated, will be removed in the future.
                 * fullmaps (List[Dict[str, AttrMeta]]): per-rank fullmap
-            zero_idx_maps (Optional[List[Dict]]): zero information for the model, `None` if zero is not enabled
+            zero_idx_maps (Optional[List[ZeroIdxMap]]): per-rank ZeRO information in rank order,
+                see `ZeroIdxMap`. `None` if ZeRO is not enabled.
 
         Returns:
             Dict[str, torch.Tensor]: Full model state dict
@@ -705,7 +726,7 @@ class CubeModule(torch.nn.Module):
         fullmaps: List[Dict[str, AttrMeta]],
         model_state_dicts: List[Dict[str, torch.Tensor]],
         optim_state_dicts: Optional[List[Dict[str, Any]]] = None,
-        zero_idx_maps: Optional[List[Dict]] = None
+        zero_idx_maps: Optional[List[ZeroIdxMap]] = None
     ) -> Tuple[Dict[str, torch.Tensor], Optional[Dict[str, Any]]]:
         """Merge model and optimizer states from different shard into a single-model state.
 
@@ -722,7 +743,8 @@ class CubeModule(torch.nn.Module):
             fullmaps (List[Dict[str, AttrMeta]]): per-rank fullmap
             model_state_dicts (List[Dict[str, torch.Tensor]]): per-rank model state dict from model.state_dict()
             optim_state_dicts (Optional[List[Dict]]): per-rank optimizer state dict from optimizer.state_dict()
-            zero_idx_maps (Optional[List[Dict]]): zero information for the model, `None` if zero is not enabled
+            zero_idx_maps (Optional[List[ZeroIdxMap]]): per-rank ZeRO information in rank order,
+                see `ZeroIdxMap`. `None` if ZeRO is not enabled.
 
         Returns:
             Dict[str, torch.Tensor]: Full model state dict
@@ -745,8 +767,30 @@ class CubeModule(torch.nn.Module):
         cls,
         fullmaps: List[Dict[str, AttrMeta]],
         optim_state_dicts: Optional[List[Dict[str, Any]]] = None,
-        zero_idx_maps: Optional[List[Dict]] = None
+        zero_idx_maps: Optional[List[ZeroIdxMap]] = None
     ):
+        """Merge optimizer states from different shards into a single-model optimizer state.
+
+        `fullmaps` should always have the information for all ranks.
+        To support checkpoint deduplication, `optim_state_dicts` can contain only the first
+        `dedup_group_size` items.
+
+        Warnings:
+            * This function only supports merging optimizer states of Adam-like optimizers,
+            in which the optimizer state is expected to contain 'state' keyword.
+            * Only support single parameter group, i.e., code implementations like: `torch.optim.Adam(model.parameters(), lr=0.1)`
+
+        Args:
+            fullmaps (List[Dict[str, AttrMeta]]): per-rank fullmap
+            optim_state_dicts (List[Dict[str, Any]]): per-rank optimizer state dict from optimizer.state_dict()
+            zero_idx_maps (Optional[List[ZeroIdxMap]]): per-rank ZeRO information in rank order,
+                see `ZeroIdxMap`. `None` if ZeRO is not enabled.
+
+        Returns:
+            Dict[str, Any]: Full optimizer state dict. Parameter indices in 'state' follow
+            `get_origin_parameter_names(fullmaps)`. Other keys (e.g. 'param_groups') are inherited
+            from the input state dicts, with 'params' reset to the full parameter index list.
+        """
         plan_ngpus = len(optim_state_dicts)
         # gather optimizer states
         full_optim_state_dict: Dict[str, Any] = {}  # param_id -> Dict[state_name, value]
@@ -2123,10 +2167,11 @@ class ParallelModule(CubeModule):
 
     def trim_merged_state_dict(
             self,
-            state_dict: Dict[str, Any],
+            state_dict: Mapping[str, Any],
             prefix: str = '',
             *,
             device=None,
+            copy: bool = False,
     ) -> Dict[str, Any]:
         """
         Trim the merged state dict to only keep the parameters needed for the module.
@@ -2135,6 +2180,8 @@ class ParallelModule(CubeModule):
         Args:
             state_dict (Dict[str, Any]): the merged state dict
             prefix (str): the prefix of the model state dict in the merged state dict
+            copy (bool): Copy trimmed tensors into independent storage. This allows
+                a lazy input mapping to release each reconstructed full tensor.
 
         Returns:
             Dict[str, Any]: the trimmed state dict
@@ -2166,7 +2213,7 @@ class ParallelModule(CubeModule):
                     if nchunks != 1:
                         content = content / nchunks
                     if self.compute_config.use_zero <= 1 or self._zero3_param_metadata.get(attr, None) is None:
-                        trimmed_state_dict[prefix + attr] = content.to(device)
+                        trimmed_state_dict[prefix + attr] = content.to(device, copy=copy)
                     else:
                         z3_info = self._zero3_param_metadata[attr]
                         start, end, chunk_size = z3_info.start, z3_info.end, z3_info.chunk_size
@@ -2180,7 +2227,7 @@ class ParallelModule(CubeModule):
                                 value=0.0,
                             )
                         else:
-                            trimmed_state_dict[prefix + attr] = content.reshape(-1)[start:end].to(device)
+                            trimmed_state_dict[prefix + attr] = content.reshape(-1)[start:end].to(device, copy=copy)
 
         return trimmed_state_dict
 
