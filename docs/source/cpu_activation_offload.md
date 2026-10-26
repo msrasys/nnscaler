@@ -51,6 +51,13 @@ output or YOCO cache at restore time, it is reused without H2D or a second GPU
 allocation. This does **not** free external owners. The runtime never resizes
 live user storage or overwrites pipeline inputs to force a memory reduction.
 
+Reload buffers are allocated on the current compute stream by default, so they
+can reuse its allocator arena. The H2D stream joins the already-enqueued compute
+prefix before writing into the allocation, then signals readiness to backward.
+`reload_on_compute_stream=False` retains the copy-stream allocation path for
+controlled comparisons. This does not remove transfer dependencies or pin all
+future groups on the GPU.
+
 Restored GPU storage is retained by the shared saved record until the final
 backward consumer releases it. Repeated saves/reads therefore do not cause
 repeated H2D. With `retain_graph=True`, saved records remain alive until the

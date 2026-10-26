@@ -28,11 +28,16 @@ class CPUOffloadConfig:
     max_inflight_bytes: int = 512 * 1024**2
     max_prefetch_bytes: int = 512 * 1024**2
     prefetch_groups: int = 1
+    reload_on_compute_stream: bool = True
     # Leave headroom for the dataloader, optimizer, compilation and other ranks.
     host_reserve_bytes: int = 32 * 1024**3
 
     def __post_init__(self):
         for name, value in vars(self).items():
+            if name == 'reload_on_compute_stream':
+                if not isinstance(value, bool):
+                    raise ValueError('reload_on_compute_stream must be a bool')
+                continue
             if isinstance(value, bool) or not isinstance(value, int) or value < 0:
                 raise ValueError(f'{name} must be a non-negative integer, got {value!r}')
 
@@ -288,9 +293,20 @@ class _StorageRecord:
                     self.pool.prefetched += self.size
                     self.speculative = True
                 stream = self.manager.h2d_stream
+                if self.manager.config.reload_on_compute_stream:
+                    # Reuse the compute stream's allocator arena. A block may
+                    # still be in use by work already enqueued there, so the
+                    # copy stream must join that prefix before overwriting it.
+                    consumer = torch.cuda.current_stream(self.device)
+                    self.device_tensor = torch.empty(self.size, dtype=torch.uint8, device=self.device)
+                    stream.wait_stream(consumer)
                 with torch.cuda.stream(stream):
                     stream.wait_event(self.d2h_event)
-                    self.device_tensor = self.host[:self.size].to(self.device, non_blocking=True)
+                    if self.device_tensor is None:
+                        self.device_tensor = self.host[:self.size].to(self.device, non_blocking=True)
+                    else:
+                        self.device_tensor.copy_(self.host[:self.size], non_blocking=True)
+                        self.device_tensor.record_stream(stream)
                     self.h2d_event = torch.cuda.Event()
                     self.h2d_event.record(stream)
                 self.pool.stats['h2d_bytes'] += self.size
