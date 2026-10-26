@@ -76,9 +76,9 @@ def test_apply_module_recompute_groups_invocations_and_skips_hooks():
 
     result = apply_module_recompute(graph, RecomputeTarget)
 
-    assert [len(group) for group in result.planned_groups] == [2, 2, 2]
-    assert result.planned_group_count == result.applied_group_count == 3
-    assert result.planned_op_count == result.applied_op_count == 6
+    assert [len(group) for group in result.planned_groups] == [2, 2, 2, 1]
+    assert result.planned_group_count == result.applied_group_count == 4
+    assert result.planned_op_count == result.applied_op_count == 7
     assert result.skipped_hook_ops == 1
 
 
@@ -1818,3 +1818,22 @@ def test_partial_offload_does_not_silently_split_recompute(tmp_path):
         parallelize(FnPolicyModule(), {'x': torch.randn(2, 4)},
                     partial_combined_memory_graph_policy, ComputeConfig(1, 1),
                     gen_savedir=tmp_path, load_module=False)
+
+
+class SingleOperationCheckpointModule(torch.nn.Module):
+    def forward(self, x):
+        return torch.sin(x * 2).square()
+
+
+def single_operation_checkpoint_policy(graph, cfg):
+    from nnscaler.policies import OpPlan
+    for node in get_pas_ops(graph):
+        yield OpPlan(node, recompute_id=0 if node.fn == torch.sin else -1)
+
+
+@replace_all_device_with('cpu')
+def test_explicit_single_operation_checkpoint_is_emitted(tmp_path):
+    parallelize(SingleOperationCheckpointModule(), {'x': torch.randn(8, 8)},
+                single_operation_checkpoint_policy, ComputeConfig(1, 1),
+                gen_savedir=tmp_path, load_module=False)
+    assert _gencode_contains(tmp_path, SingleOperationCheckpointModule, 0, r'ckpt\.checkpoint\(')

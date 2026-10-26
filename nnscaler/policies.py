@@ -528,9 +528,7 @@ def apply_module_recompute(
             current_key = key
         groups[-1].append(node)
 
-    planned_groups = tuple(
-        tuple(group) for group in groups if len(group) > 1
-    )
+    planned_groups = tuple(tuple(group) for group in groups)
     for group in planned_groups:
         graph.recompute(list(group))
 
@@ -1344,8 +1342,6 @@ def fn(
 
     # set recompute groups
     for group in recompute_groups.values():
-        if len(group) <= 1:
-            continue
         graph.recompute(group)
 
     for group in offload_groups.values():
