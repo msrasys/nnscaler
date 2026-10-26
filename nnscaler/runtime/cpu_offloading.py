@@ -36,7 +36,8 @@ Everything is configurable through environment variables (read once):
 
 ``CPU_OFFLOADING_MIN_BYTES``       smallest tensor to offload (default 1 MiB)
 ``CPU_OFFLOADING_PREFETCH_GROUPS`` groups prefetched ahead of the demanded one
-                                   inside a context (default 1)
+                                   inside a context (default 2)
+``CPU_OFFLOADING_DEBUG``           log the saved tensors of each group once
 ``CPU_OFFLOADING_DISABLE``         set to 1 to turn offloading into a no-op
 ``CPU_OFFLOADING_PREFETCH_LEVEL``  legacy knob from the first prototype; it is
                                    still accepted but ignored.
@@ -427,7 +428,12 @@ class OffloadManager:
 
     def __init__(self) -> None:
         self.min_bytes = load_int_from_env('CPU_OFFLOADING_MIN_BYTES', 1 << 20)
-        self.lookahead_groups = load_int_from_env('CPU_OFFLOADING_PREFETCH_GROUPS', 1)
+        self.lookahead_groups = load_int_from_env('CPU_OFFLOADING_PREFETCH_GROUPS', 2)
+        # CPU_OFFLOADING_DEBUG=1 logs the saved tensors of the first execution
+        # of every offload group (shape/dtype/bytes) so users can see what a
+        # planning choice actually moves.
+        self.debug = load_int_from_env('CPU_OFFLOADING_DEBUG', 0) != 0
+        self._debugged_groups: set = set()
         self.enabled = load_int_from_env('CPU_OFFLOADING_DISABLE', 0) == 0
         # a forward whose own backward is scheduled within this many segment
         # executions gains nothing from offloading (the tensors would come back
@@ -611,6 +617,11 @@ class CPUOffloadContext:
         result = hooks.__exit__(exc_type, exc_value, traceback)
         if exc_type is None and self.batch is not None:
             self.batch.done()
+            if self.manager.debug and self.group_id not in self.manager._debugged_groups:
+                self.manager._debugged_groups.add(self.group_id)
+                _logger.info(
+                    f'[cpu_offload] group {self.group_id}: {len(self.batch.handles)} saved tensors, '
+                    f'{len(self.batch.regions)} regions, {self.batch.nbytes / 2**20:.1f} MiB offloaded')
         return result
 
     def _pack(self, tensor: torch.Tensor) -> Any:
@@ -640,7 +651,12 @@ class CPUOffloadContext:
             return tensor
 
         assert self.batch is not None
-        return self.batch.append(tensor)
+        handle = self.batch.append(tensor)
+        if self.manager.debug and self.group_id not in self.manager._debugged_groups:
+            _logger.info(
+                f'[cpu_offload] group {self.group_id}: shape={tuple(tensor.shape)} '
+                f'dtype={tensor.dtype} bytes={nbytes} contiguous={tensor.is_contiguous()}')
+        return handle
 
     def _unpack(self, value: Any) -> torch.Tensor:
         if isinstance(value, _ModuleTensorRef):

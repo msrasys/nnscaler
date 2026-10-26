@@ -102,7 +102,21 @@ non-contiguous saved tensors come back with their original strides.
 `offload_stats()` returns per-step counters: bytes offloaded, deduplicated,
 prefetched, number of unpacks that had to wait for a copy (`stalls`), time
 spent in the hooks, pinned pool size, contexts still pending.  llm-train logs
-them as `offload_*` training metrics.
+them as `offload_*` training metrics.  `CPU_OFFLOADING_DEBUG=1` logs the
+shape, dtype and size of every tensor saved by the first execution of each
+offload group, which is the quickest way to see what a planning choice moves.
+
+## Sizing against the link
+
+Measured on an 8x B200 node (PCIe Gen5): D2H 38.6 GB/s, H2D 55.6 GB/s,
+pinned allocation 0.38 s/GB.  Offloading every tensor saved by a 15B YOCO-MoE
+`Attention` module at seq 8192 moved 121 GB per step on rank 0 (PP2 x EP4,
+8 micro-batches), more than the link can carry within the 4.6 s step, and the
+step slowed to 10.1 s.  Offloading only the attention kernel's saved tensors
+(q, k, v, out, lse) and recomputing the projections/norms around it cuts the
+volume by ~3.6x; the rule of thumb is that offloaded bytes per step divided by
+the slower link direction must stay well below the step time, with the rest of
+the slack covering the burstiness of 1F1B phases.
 
 ## Choosing what to offload
 
