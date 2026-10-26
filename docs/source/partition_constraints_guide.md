@@ -76,23 +76,29 @@ If you choose to manually partition operators (especially for complex communicat
 The `OpPlan` class defines the strategy for a single operator.
 
 ```python
-class OpPlan:
-    def __init__(self, op, partition='auto', recompute_id=-1, stage_id=-1, ...):
-        ...
+OpPlan(op=node, partition=None, recompute_id=-1, offload_id=-1, stage_id=-1)
 ```
 
 *   **`op`**: The graph node (`IRFwOperation`) this plan applies to.
 *   **`partition`**: define the partitioning strategy.
     *   `OpPartition(input=i, dim=d)`: Partition the operator based on the `d`-th dimension of its `i`-th input tensor.
-    *   `'auto'` (default): Tries to follow the partition of its inputs. If no input is partitioned, it just replicate the operator.
-    *   `None`: Force the operator to be replicated (no partitioning).
+    *   `'auto'`: Tries to follow the partition of its inputs. If no input is partitioned, it just replicate the operator.
+    *   `None` (default): Force the operator to be replicated (no partitioning).
 *   **`recompute_id`** (default: -1):
     *   Used to group operators for Recompute (Gradient Checkpointing).
     *   Operators with the same non-negative `recompute_id` will be grouped into a single recomputation block.
     *   These operators with the same `recompute_id` should be consecutive in the graph.
+*   **`offload_id`** (default: -1):
+    *   Used to group operators whose tensors saved for backward are offloaded to CPU.
+    *   Operators with the same non-negative `offload_id` must be consecutive and belong to the same pipeline stage.
+    *   May be combined with `recompute_id`: checkpoint inputs are offloaded, while intermediates are recomputed on GPU. Select whole recompute regions.
+    *   Saved strided CUDA storages retain their dtype/layout. Parameters, buffers, explicitly resident weights and small tensors are excluded.
+    *   `ComputeConfig.cpu_offload` accepts `CPUOffloadConfig` (or its dictionary form), including a process-shared CPU pool budget and bounded speculative prefetch.
+    *   Generated schedules prefetch the next backward's microbatch/virtual-stage scope during the preceding local F/B action. Group hooks provide lookahead within a scope and support ordinary autograd.
+    *   See [CPU activation offloading](cpu_activation_offload.md) for lifecycle, budgets and limitations.
 *   **`stage_id`** (default: -1):
     *   Used for Pipeline Parallelism assignment.
-    *   These operators with the same `stage_id` should be consecutive in the graph.    
+    *   These operators with the same `stage_id` should be consecutive in the graph.
 *   **`pre_hook` / `post_hook`**:
     *   You can attach custom Python functions to be executed before or after the operator. See source code for signature details.
 

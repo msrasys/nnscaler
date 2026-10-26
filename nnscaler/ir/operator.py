@@ -29,6 +29,7 @@ class IRFwOperation(IRCell):
         """
         # recompute schedule
         self._recompute = None
+        self._offload = None
         self._constant_foldable = constant_foldable
         super().__init__(name, signature, len(inputs), num_outputs)
 
@@ -109,6 +110,23 @@ class IRFwOperation(IRCell):
             assert self._recompute == group_id, "The operator is set to recompute in another recompute group."
         self._recompute = group_id
 
+    @property
+    def offload(self) -> Optional[int]:
+        """Get the saved-tensor CPU-offload group id."""
+        # let's use getattr for backward compatibility,
+        # in case the graph is loaded from an older version
+        # where the attribute might not exist
+        return getattr(self, '_offload', None)
+
+    @offload.setter
+    def offload(self, group_id: Optional[int]):
+        """Set the saved-tensor CPU-offload group id."""
+        assert group_id is None or isinstance(group_id, int), "Expect None or int"
+        current_group_id = self.offload
+        if isinstance(group_id, int) and current_group_id is not None:
+            assert current_group_id == group_id, "The operator is set to offload in another offload group."
+        self._offload = group_id
+
     def algorithms(self) -> List[GenericDistAlgo]:
         """
         get all algorithms from algorithm factory
@@ -155,6 +173,7 @@ class IRFwOperation(IRCell):
             cpy.set_kwarg(name, value)
         cpy._mirror = None
         cpy.recompute = self.recompute
+        cpy.offload = self.offload
         return cpy
 
     def __repr__(self) -> str:

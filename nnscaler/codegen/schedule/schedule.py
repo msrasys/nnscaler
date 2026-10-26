@@ -232,6 +232,16 @@ class ScheduleCodeGen(FuncEmission):
                     'fallback_vars_by_mid': {},
                 }
                 pending_async_recvs = {}
+                # A prefetch hint names the actual next local F/B action. VPP
+                # forward order alone cannot identify its microbatch/chunk.
+                compute_nodes = [n for n in device_nodes if isinstance(
+                    n.cell if isinstance(n, ExeReuseCell) else n, IRSegment)]
+                next_compute = {id(a): b for a, b in zip(compute_nodes, compute_nodes[1:])}
+                self._immediate_backward_forwards = {
+                    id(a) for a, b in zip(compute_nodes, compute_nodes[1:])
+                    if a.isfw() and not b.isfw()
+                    and self._activation_scope_key(a) == self._activation_scope_key(b)
+                }
                 for line, node in enumerate(device_nodes):
                     unwrap_node = node.cell if isinstance(node, ExeReuseCell) else node
                     bundle_events = send_bundle_ranges.get(line, ())
@@ -254,6 +264,12 @@ class ScheduleCodeGen(FuncEmission):
                         )
                     elif use_scheduler and isinstance(unwrap_node, IRWeightReducer):
                         _append_code(fb, 'nnscaler.flags.RuntimeFlag.skip_reducer = False')
+                    following = next_compute.get(id(node))
+                    if following is not None and not following.isfw():
+                        target = following.cell if isinstance(following, ExeReuseCell) else following
+                        if self._has_activation_offload(target.mirror):
+                            key = self._activation_scope_key(following)
+                            _append_code(fb, f'model.prefetch_activation({key!r})', self._get_node_stream(node))
                     codes = self.emit_node(
                         node,
                         produced_tids=produced_tids,
@@ -787,6 +803,17 @@ class ScheduleCodeGen(FuncEmission):
         """
         return f'{self.tensor_name(tensor)} = {self.tensor_name(tensor)}.detach()'
 
+    @staticmethod
+    def _has_activation_offload(segment):
+        return any(getattr(n, 'offload', None) is not None for n in segment.nodes())
+
+    def _activation_scope_key(self, node):
+        segment = node.cell if isinstance(node, ExeReuseCell) else node
+        if not segment.isfw():
+            segment = segment.mirror
+        mid = node.micro_batch_id if isinstance(node, ExeReuseCell) else None
+        return self.node_name(segment), mid
+
     def emit_node(self, node: IRCell, force_no_grad: bool = False,
                   produced_tids: set = None, getitem_info: dict = None,
                   dataloader_var: str = None, fallback_state: dict = None) -> List[str]:
@@ -908,6 +935,21 @@ class ScheduleCodeGen(FuncEmission):
                         continue
                     if tensor in plan_outputs:
                         codes.append(self.emit_detach(tensor))
+
+            forward_segment = unwrap_node if node.isfw() else unwrap_node.mirror
+            if self._has_activation_offload(forward_segment) and not force_no_grad:
+                key = self._activation_scope_key(node)
+                if node.isfw():
+                    immediate = id(node) in getattr(self, '_immediate_backward_forwards', set())
+                    with Block(f'with model.activation_offload_scope({key!r}, immediate_backward={immediate!r}):') as scope_block:
+                        scope_block.insert_body(codes)
+                    codes = scope_block.code
+                else:
+                    with Block('try:') as backward_block:
+                        backward_block.insert_body(codes)
+                    with Block('finally:') as finish_block:
+                        finish_block.insert_body(f'model.finish_activation_offload({key!r})')
+                    codes = backward_block.code + finish_block.code
 
         elif isinstance(unwrap_node, IRDataOperation):
             already_produced = False

@@ -35,6 +35,7 @@ class IRAdapter(IRCell):
 
         # recompute group id
         self._recompute = None
+        self._offload = None
 
         # setup whether this adapter is for forward stage
         # non-tensor IRObject is always forward (not gradient)
@@ -98,6 +99,22 @@ class IRAdapter(IRCell):
             assert self._recompute == group_id, "The operator is set to recompute in another recompute group."
         self._recompute = group_id
 
+    @property
+    def offload(self) -> Optional[int]:
+        """Get the saved-tensor CPU-offload group id."""
+        # let's use getattr for backward compatibility,
+        # in case the attribute is not set in older versions of the graph
+        return getattr(self, '_offload', None)
+
+    @offload.setter
+    def offload(self, group_id: Optional[int]):
+        """Set the saved-tensor CPU-offload group id."""
+        assert group_id is None or isinstance(group_id, int), "Expect None or int"
+        current_group_id = self.offload
+        if isinstance(group_id, int) and current_group_id is not None:
+            assert current_group_id == group_id, "The operator is set to offload in another offload group."
+        self._offload = group_id
+
     def dispatch(self, devid: int, _mirror: bool = True):
         """
         Instantiate the adapter to a specific rank.
@@ -134,6 +151,7 @@ class IRAdapter(IRCell):
         fadapter.differentiable = self.differentiable
         fadapter.custom = self.custom
         fadapter.recompute = self.recompute
+        fadapter.offload = self.offload
         fadapter.op_context = self.op_context
         # dispatch for mirror
         if _mirror and isinstance(self.mirror, IRAdapter):
@@ -149,7 +167,7 @@ class IRAdapter(IRCell):
         """
         adapters : List[IRAdapter] = adapters
         assert all(isinstance(n, IRAdapter) for n in adapters)
-        # TODO: check recompute consistency
+        # TODO: check recompute and cpu-offload consistency
         itensors = []
         otensors = []
         prims = []

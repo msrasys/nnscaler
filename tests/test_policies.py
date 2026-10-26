@@ -16,7 +16,7 @@ from tests.launch_torchrun import launch_torchrun
 from tests.parallel_module.common import FFN, init_distributed
 from tests.parallel_module.test_gencode import _gencode_contains, print_gencode
 
-from .utils import init_random, replace_all_device_with
+from .utils import init_random, raises_with_cause, replace_all_device_with
 
 MBS = 2
 DIM = 16
@@ -150,6 +150,15 @@ def test_call_name():
     assert get_called_self_module_name('self.up_proj(x).transpose()') == ''
 
 
+def test_op_plan_combines_recompute_with_cpu_offload():
+    from nnscaler.ir.operator import IRFwOperation
+    from nnscaler.policies import OpPlan
+
+    node = IRFwOperation('test', 'test', inputs=[], num_outputs=0)
+    plan = OpPlan(node, recompute_id=0, offload_id=0)
+    assert plan.recompute_id == plan.offload_id == 0
+
+
 class FnPolicyModule(torch.nn.Module):
     def __init__(self):
         super().__init__()
@@ -160,6 +169,23 @@ class FnPolicyModule(torch.nn.Module):
         x =  self.ffn(x)
         x = x + 3
         return x
+
+
+def combined_memory_graph_policy(graph, cfg):
+    nodes = get_pas_ops(graph)
+    graph.offload(nodes)
+    graph.recompute(nodes)
+    for node in nodes:
+        graph.assign(node, 0)
+    return graph
+
+
+@replace_all_device_with('cpu')
+def test_graph_policy_combines_recompute_with_cpu_offload(tmp_path):
+    parallelize(FnPolicyModule(), {'x': torch.randn(2, 4)},
+                combined_memory_graph_policy, ComputeConfig(1, 1),
+                gen_savedir=tmp_path, load_module=False)
+    assert _gencode_contains(tmp_path, FnPolicyModule, 0, r'ckpt\.checkpoint\(')
 
 
 def megatron_ffn_policy(graph, cfg):
@@ -212,6 +238,89 @@ def megatron_ffn_policy_auto(graph, cfg):
         else:
             # other ops
             yield OpPlan(node, partition='auto')
+
+
+def cpu_offload_ffn_policy(graph, cfg):
+    for plan in megatron_ffn_policy(graph, cfg):
+        plan.offload_id = 0
+        yield plan
+
+
+@replace_all_device_with('cpu')
+def test_codegen_fn_cpu_offload(tmp_path):
+    parallelize(
+        FnPolicyModule(),
+        {'x': torch.randn(2, 4)},
+        cpu_offload_ffn_policy,
+        ComputeConfig(2, 2),
+        gen_savedir=tmp_path,
+        load_module=False,
+    )
+
+    for rank in range(2):
+        assert len(_gencode_contains(
+            tmp_path,
+            FnPolicyModule,
+            rank,
+            r'with self\.cpu_offloading_hooks\((?:tail=True)?\) as _offload:',
+        )) == 1
+
+
+@replace_all_device_with('cpu')
+def test_codegen_fn_cpu_offload_zero3(tmp_path):
+    parallelize(
+        FnPolicyModule(),
+        {'x': torch.randn(2, 4)},
+        cpu_offload_ffn_policy,
+        ComputeConfig(1, 2, use_zero=3),
+        gen_savedir=tmp_path,
+        load_module=False,
+    )
+
+    assert _gencode_contains(
+        tmp_path,
+        FnPolicyModule,
+        0,
+        r'with self\.save_params_hooks\(\):',
+    )
+    assert _gencode_contains(
+        tmp_path,
+        FnPolicyModule,
+        0,
+        r'with self\.cpu_offloading_hooks\((?:tail=True)?\) as _offload:',
+    )
+
+
+def _cpu_offload_runtime_worker(tempdir):
+    init_distributed()
+    model = FnPolicyModule()
+    expected_input = torch.randn(2, 4, requires_grad=True)
+    expected_output = model(expected_input)
+    expected_output.sum().backward()
+
+    parallel_model = parallelize(
+        model,
+        {'x': torch.randn(2, 4)},
+        cpu_offload_ffn_policy,
+        ComputeConfig(1, 1, cpu_offload={'min_tensor_bytes': 0}),
+        gen_savedir=tempdir,
+        instance_name='cpu_offload_runtime',
+        load_module=True,
+    )
+    actual_input = expected_input.detach().clone().requires_grad_()
+    actual_output = parallel_model(actual_input)
+    actual_output.sum().backward()
+
+    assert torch.allclose(actual_output, expected_output)
+    assert torch.allclose(actual_input.grad, expected_input.grad)
+    stats = parallel_model.activation_offload_stats()
+    assert stats['d2h_bytes'] > 0
+    assert stats['live_cpu_bytes'] == 0
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason='lack of gpu devices')
+def test_codegen_fn_cpu_offload_runtime(tmp_path):
+    launch_torchrun(1, _cpu_offload_runtime_worker, str(tmp_path))
 
 
 @replace_all_device_with('cpu')
@@ -339,6 +448,123 @@ def megatron_ffn_policy_list(graph, cfg):
         else:
             # other ops
             yield OpPlan(node, recompute_id=ffn_idx, stage_id=ffn_idx, partition='auto')
+
+
+def megatron_ffn_offload_policy_list(graph, cfg):
+    for plan in megatron_ffn_policy_list(graph, cfg):
+        plan.offload_id = plan.recompute_id
+        plan.recompute_id = -1
+        yield plan
+
+
+def pipeline_cpu_offload_prefetch_policy(graph, cfg):
+    from nnscaler.policies import OpPlan, get_layer_index
+
+    for node in get_pas_ops(graph):
+        if FFNDropout in node.module_class_chain:
+            ffn_idx = get_layer_index(node.fqn)
+            yield OpPlan(node, offload_id=ffn_idx, stage_id=ffn_idx // 2)
+
+
+@replace_all_device_with('cpu')
+def test_codegen_fn_cpu_offload_multiple_blocks(tmp_path):
+    parallelize(
+        FnPolicyModuleList(),
+        {'x': torch.randn(4, 4)},
+        pipeline_cpu_offload_prefetch_policy,
+        ComputeConfig(2, 2),
+        gen_savedir=tmp_path,
+        load_module=False,
+    )
+
+    for rank in range(2):
+        assert len(_gencode_contains(
+            tmp_path,
+            FnPolicyModuleList,
+            rank,
+            r'with self\.cpu_offloading_hooks\((?:tail=True)?\) as _offload:',
+        )) == 2
+
+
+@replace_all_device_with('cpu')
+def test_codegen_fn_pipeline_cpu_offload(tmp_path):
+    instance_name = 'cpu_offload_pipeline'
+    parallelize(
+        FnPolicyModuleList(),
+        {'x': torch.randn(4, 4)},
+        megatron_ffn_offload_policy_list,
+        ComputeConfig(4, 4, use_end2end=True,
+            pas_config={
+                'pipeline_nmicros': 2,
+                'pipeline_size': 2,
+            }
+        ),
+        gen_savedir=tmp_path,
+        instance_name=instance_name,
+        load_module=False,
+    )
+
+    for rank in range(4):
+        assert len(_gencode_contains(
+            tmp_path,
+            FnPolicyModuleList,
+            rank,
+            r'with self\.cpu_offloading_hooks\((?:tail=True)?\) as _offload:',
+            instance_name=instance_name,
+        )) == 1
+        assert not _gencode_contains(
+            tmp_path,
+            FnPolicyModuleList,
+            rank,
+            r'ckpt\.checkpoint\(',
+            instance_name=instance_name,
+        )
+
+
+def _pipeline_cpu_offload_runtime_worker(tempdir):
+    import nnscaler.runtime.cpu_offloading as cpu_offloading
+
+    init_distributed()
+    model = FnPolicyModuleList(ffn_layers=4)
+    parallel_model = parallelize(
+        model,
+        {'x': torch.randn(4, 4)},
+        pipeline_cpu_offload_prefetch_policy,
+        ComputeConfig(2, 2, use_end2end=True,
+            pas_config={
+                'pipeline_nmicros': 2,
+                'pipeline_size': 2,
+            }
+        ),
+        gen_savedir=tempdir,
+        instance_name='cpu_offload_pipeline_runtime',
+        load_module=True,
+    )
+
+    rank = torch.distributed.get_rank()
+    assert len(_gencode_contains(
+        tempdir,
+        FnPolicyModuleList,
+        rank,
+        r'with self\.cpu_offloading_hooks\((?:tail=True)?\) as _offload:',
+        instance_name='cpu_offload_pipeline_runtime',
+    )) == 2
+
+    from dataclasses import replace
+    parallel_model.compute_config = replace(parallel_model.compute_config, cpu_offload={'min_tensor_bytes': 0})
+    samples = [torch.randn(4, 4) for _ in range(2)]
+    parallel_model.train_step(samples)
+    stats = parallel_model.activation_offload_stats()
+    assert stats['offloaded_storages'] > 0
+    assert stats['prefetch_loads'] > 0
+    assert stats['live_cpu_bytes'] == 0
+    assert all(param.grad is not None for param in parallel_model.parameters())
+    assert all(torch.isfinite(param.grad).all() for param in parallel_model.parameters())
+
+
+@pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.device_count() < 2, reason='lack of gpu devices')
+def test_pipeline_cpu_offload_runtime(tmp_path):
+    launch_torchrun(2, _pipeline_cpu_offload_runtime_worker, str(tmp_path))
 
 
 @replace_all_device_with('cpu')
@@ -1573,3 +1799,22 @@ def test_codegen_fsdp(tmp_path):
     #     with self.save_params_hooks():
     #         return self.segment105_impl(x_49)
     assert True
+
+
+def partial_combined_memory_graph_policy(graph, cfg):
+    nodes = get_pas_ops(graph)
+    graph.recompute(nodes)
+    selected = [node for node in nodes if node.recompute is not None]
+    assert len(selected) > 1
+    graph.offload(selected[:1])
+    for node in nodes:
+        graph.assign(node, 0)
+    return graph
+
+
+@replace_all_device_with('cpu')
+def test_partial_offload_does_not_silently_split_recompute(tmp_path):
+    with raises_with_cause(ValueError, match='entire recompute region'):
+        parallelize(FnPolicyModule(), {'x': torch.randn(2, 4)},
+                    partial_combined_memory_graph_policy, ComputeConfig(1, 1),
+                    gen_savedir=tmp_path, load_module=False)

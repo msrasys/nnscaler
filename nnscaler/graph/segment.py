@@ -1635,6 +1635,7 @@ class IRSegmentExpander:
                 if node.comment is not None:
                     new_node.comment = node.comment
                 new_node.recompute = node.recompute
+                new_node.offload = node.offload
                 new_node.op_context = node.op_context
                 for index, output in enumerate(node.outputs()):
                     if isinstance(output, IRSubTensor):

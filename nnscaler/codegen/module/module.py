@@ -1020,37 +1020,63 @@ class ModuleCodeGen(FuncEmission):
         ]
         ```
 
-        Nodes in the segment will group into recompute region
+        Nodes in the segment will group into recompute and CPU-offload regions.
 
         The fields storing intermediate codes that are populated by this method:
         - NONE
         """
         nodes : List[IRCell] = segment.nodes()
         lifetime = LifeCycle(nodes, segment.inputs(), segment.outputs())
-        rc_groups: List[List[IRCell]] = list(
-            more_itertools.split_when(nodes, lambda prev, curr: prev.recompute != curr.recompute))
+        groups: List[List[IRCell]] = list(more_itertools.split_when(
+            nodes,
+            lambda prev, curr: (
+                prev.recompute != curr.recompute
+                or (prev.recompute is None and prev.offload != curr.offload)
+            ),
+        ))
 
         codes: List[str] = []
-        for rc_group in rc_groups:
-            assert len(rc_group) > 0
-            gid: Optional[int] = rc_group[0].recompute
-            if gid is None:
-                codes += self._emit_nodes(rc_group, lifetime, runtime_devid)
+        last_offload_group = next((g for g in reversed(groups) if g[0].offload is not None), None)
+        for group in groups:
+            assert len(group) > 0
+            rc_gid: Optional[int] = group[0].recompute
+            offload_gid: Optional[int] = group[0].offload
+            if rc_gid is not None and len({node.offload is not None for node in group}) > 1:
+                missing = [(node.name, node.cid) for node in group if node.offload is None]
+                raise ValueError('Offload selection must cover an entire recompute region; '
+                                 f'select the same or an enclosing module. '
+                                 f'Recompute group {rc_gid}, unselected nodes: {missing[:20]}')
+
+            group_segment = segment.create_segment(group) if rc_gid is not None or offload_gid is not None else None
+            if rc_gid is None:
+                group_codes = self._emit_nodes(group, lifetime, runtime_devid)
             else:
                 # get recompute excution code
-                rc_segment = segment.create_segment(rc_group)
-                rc_codes = self._emit_recompute(rc_group,
-                    rc_segment.inputs(), rc_segment.outputs(), lifetime, runtime_devid)
-                codes += rc_codes
+                group_codes = self._emit_recompute(group,
+                    group_segment.inputs(), group_segment.outputs(), lifetime, runtime_devid)
+            if offload_gid is not None:
+                # Outside checkpoint(): capture checkpoint inputs, not replay intermediates.
+                tail_arg = 'tail=True' if group is last_offload_group else ''
+                with Block(f'with self.cpu_offloading_hooks({tail_arg}) as _offload:') as offload_block:
+                    offload_block.insert_body(group_codes)
+                group_codes = offload_block.code
+                output_names = self.tuple_name(group_segment.outputs(), prefix_attr='self.')
+                group_codes += [f'_offload.watch({output_names})']
+            codes += group_codes
+            if rc_gid is not None:
                 # release input tensors after exiting a RC group:
-                last_node = rc_group[-1]
+                last_node = group[-1]
                 line = lifetime.get_line(last_node)
                 if last_node != nodes[-1]: # skip if it is the last node
-                    inputs_to_rel = [t for t in rc_segment.inputs() if lifetime.releasable_after_line(t, line)]
+                    inputs_to_rel = [t for t in group_segment.inputs() if lifetime.releasable_after_line(t, line)]
                     if len(inputs_to_rel) > 0:
                         del_stmt = self.emit_release(inputs_to_rel)
                         codes.append(del_stmt)
 
+        if any(node.offload is not None for node in nodes):
+            with Block('with self.activation_offload_scope():') as scope_block:
+                scope_block.insert_body(codes)
+            codes = scope_block.code
         return codes
 
     def _emit_nodes(self, nodes: List[IRCell], lifecycle: LifeCycle, runtime_devid: int) -> List[str]:

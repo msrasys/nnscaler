@@ -51,6 +51,7 @@ from nnscaler.ir.unique import IDGenerator
 
 from nnscaler.runtime.adapter.reducer import Bucket, Reducer, ParamZeroConfig
 from nnscaler.runtime.device import DeviceGroup
+from nnscaler.runtime.cpu_offloading import CPUOffloadConfig
 from nnscaler.runtime.checkpoint_broadcast import broadcast_checkpoint_tensors
 from nnscaler.runtime.gnorm import calcuate_gnorm, clip_grads
 from nnscaler.runtime.module import (
@@ -217,7 +218,14 @@ class ComputeConfig:
     # ```
     user_config: Dict[str, Any] = field(default_factory=dict)
 
+    # A dict is accepted to support dataclasses.asdict serialization.
+    cpu_offload: Optional[CPUOffloadConfig] = None
+
     def __post_init__(self):
+        if isinstance(self.cpu_offload, dict):
+            super().__setattr__('cpu_offload', CPUOffloadConfig(**self.cpu_offload))
+        elif self.cpu_offload is not None and not isinstance(self.cpu_offload, CPUOffloadConfig):
+            raise TypeError('cpu_offload must be CPUOffloadConfig or a dictionary')
         if self.plan_ngpus <= 0:
             raise ValueError(f"plan_ngpus {self.plan_ngpus} must be > 0")
         if self.runtime_ngpus is None:
