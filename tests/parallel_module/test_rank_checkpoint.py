@@ -17,6 +17,7 @@ from nnscaler import (
     merge_state_dicts,
     parallelize,
 )
+from nnscaler.flags import RuntimeFlag
 from nnscaler.runtime import checkpoint
 from nnscaler.runtime.module import ParallelModule
 
@@ -43,7 +44,10 @@ class CheckpointModel(torch.nn.Module):
         return (self.second(self.first(x)) + self.offset + self.cache).sum()
 
 
-def test_load_from_rank_state_dicts_cpu(tmp_path):
+def test_load_from_rank_state_dicts_cpu(tmp_path, monkeypatch):
+    # build_optimizer sets these process-wide runtime flags; restore them for later tests.
+    for flag in ('skip_reducer', 'skip_zero_grad'):
+        monkeypatch.setattr(RuntimeFlag, flag, getattr(RuntimeFlag, flag))
     with mock_reducer_env(0, 1), patch('torch.distributed.barrier'), \
             patch('torch.distributed.broadcast_object_list'):
         source = parallelize(
@@ -108,6 +112,7 @@ def test_gather_region():
             assert_equal(checkpoint._gather_region(target, shards), full[target])
     scalar = torch.tensor(3.0)
     assert_equal(checkpoint._gather_region((), [checkpoint._Shard((), None, scalar)]), scalar)
+    assert_equal(checkpoint._gather_region((), [checkpoint._Shard((), (0, 1), scalar.reshape(1))]), scalar)
     # Overlapping shards are allowed; a gap is not, even if the element count matches.
     overlapping = [checkpoint._Shard(box, None, full.clone())] + column_shards
     assert_equal(checkpoint._gather_region(box, overlapping), full)

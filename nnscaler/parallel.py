@@ -3623,7 +3623,9 @@ def align_state_dict_names(
         if new_key in adapted:
             raise ValueError(f"Cannot align checkpoint names: key collision at {new_key}")
         adapted[new_key] = extra_states.get(key, value)
-    logger.info("Aligned %s checkpoint parameter/buffer names", sum(k != v for k, v in key_map.items()))
+
+    if aligned_num := sum(k != v for k, v in key_map.items()):
+        logger.info("Aligned %s checkpoint parameter/buffer names", aligned_num)
     return adapted
 
 

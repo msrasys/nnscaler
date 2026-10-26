@@ -309,3 +309,17 @@ class MLPObj(nn.Module):
         x = torch.sigmoid(x)
         loss = self.loss_fn(x, data['target'])
         return loss, loss.data
+
+
+def row_tp_policy(graph, cfg):
+    """
+    Partition every linear weight along its input dimension (row parallelism).
+    The predefined `tp` policy splits these weights along dim 0, so checkpoints saved
+    with `tp` have a different parameter layout under the same compute config.
+    """
+    from nnscaler.policies import get_pas_ops, OpPlan, OpPartition
+    for node in get_pas_ops(graph):
+        if node.fn == torch.nn.functional.linear:
+            yield OpPlan(node, partition=OpPartition(input=1, dim=1))
+        else:
+            yield OpPlan(node, partition='auto')

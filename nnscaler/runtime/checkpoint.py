@@ -95,7 +95,7 @@ def _gather_region(target: Tuple[slice, ...], shards: List[_Shard]) -> torch.Ten
         # shard = full[box].reshape(-1)[start:end]
         start, end = flat
         box_shape = [b.stop - b.start for b in box]
-        if dst.is_contiguous() and all(r.stop - r.start == n for r, n in zip(src_index[1:], box_shape[1:])):
+        if src_index and dst.is_contiguous() and all(r.stop - r.start == n for r, n in zip(src_index[1:], box_shape[1:])):
             # The intersection is a run of leading-dim rows, contiguous in the flattened box.
             row = math.prod(box_shape[1:])
             # lo/hi: the range in data
@@ -190,6 +190,12 @@ class _ModuleStateReader:
             if zero3 is not None and tuple(data.shape) != tuple(meta.sub_shape):
                 flat = (int(zero3.start), int(zero3.end))
             shards.setdefault((_track_id(meta.slicers), flat), _Shard(meta.slicers, flat, data))
+        if not shards:
+            raise ValueError(
+                f"No checkpoint shard found for {name}: entries "
+                f"{[(rank, local_name) for rank, local_name, _, _ in self.entries[name]]}, "
+                f"model states of {len(self.model_states)} ranks with keys "
+                f"{[sorted(state)[:6] for state in self.model_states]}")
         return _gather_region(target, list(shards.values()))
 
     def _optimizer_sources(self, name: str) -> List[_OptimizerSource]:

@@ -4,6 +4,7 @@
 from typing import Any, TypedDict
 import contextlib
 import os
+import zipfile
 import pickle
 import base64
 import copy
@@ -33,13 +34,14 @@ def torch_load(f, **kwargs) -> Any:
     """
     `torch.load` that memory-maps the file so tensors are paged in on demand and the
     page cache is shared across processes on the same host. mmap needs PyTorch >= 2.1
-    (2.0 is still supported), a file path, and the default zipfile format.
+    (2.0 is still supported), a file path, and the zipfile format; legacy checkpoints
+    saved with `_use_new_zipfile_serialization=False` are loaded without mmap.
 
     The returned tensors alias the file: truncating it in place while they are alive raises
     SIGBUS, whereas unlinking or renaming over it is safe. Writers in this project therefore
     unlink first (`torch_save`, `save`).
     """
-    if torch.__version__ >= (2, 1) and isinstance(f, (str, os.PathLike)):
+    if torch.__version__ >= (2, 1) and isinstance(f, (str, os.PathLike)) and zipfile.is_zipfile(f):
         kwargs.setdefault('mmap', True)
     return torch.load(f, **kwargs)
 

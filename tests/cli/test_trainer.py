@@ -1284,6 +1284,51 @@ def trainer_resumable_dataloader(save_dir):
         if trainer.rank == 0:
             assert 'Broadcasting merged checkpoint to node leaders.' in log.getvalue()
 
+    # resume from sharded files with a changed compute_config:
+    # each rank assembles its own shard from all rank files
+    ckpt7_savedir = save_dir / 'ckpt7'
+    with catch_log(logger) as log:
+        trainer = Trainer([
+            '-f', config_path_streaming,
+            '--precision', 'bf16',
+            '--optimizer.type', optimizer_type,
+            '--enable_progress_bar', 'false',
+            '--gen_savedir', str(save_dir / 'gen_async'),  # compute_config differs from gen_savedir's
+            '--compute_config.use_async_reducer', True,
+            '--checkpoint.save_type', save_type,
+            '--checkpoint.save_dir', str(ckpt7_savedir),
+            '--checkpoint.resume_from.checkpoint', str(ckpt1_savedir / '0002-0035'),
+            '--checkpoint.keep_last_n_checkpoints', '30',
+        ])
+        trainer.run()
+        assert trainer.dataloader_resumed
+        assert 'each rank assembles its own shard' in log.getvalue()
+        assert 'Broadcasting' not in log.getvalue()
+
+    # resume from sharded files with the same compute_config but a different parameter
+    # layout (weights split along another dim): detected through AttrMeta, resharded from all rank files
+    ckpt8_savedir = save_dir / 'ckpt8'
+    with catch_log(logger) as log:
+        trainer = Trainer([
+            '-f', config_path_streaming,
+            '--precision', 'bf16',
+            '--optimizer.type', optimizer_type,
+            '--enable_progress_bar', 'false',
+            '--gen_savedir', str(save_dir / 'gen_row_tp'),
+            # a new instance name gives the generated module a new Python module name;
+            # otherwise the already imported tp module would be reused in this process
+            '--instance_name', 'row_tp',
+            '--pas_policy', 'tests.cli.common.row_tp_policy',
+            '--checkpoint.save_type', save_type,
+            '--checkpoint.save_dir', str(ckpt8_savedir),
+            '--checkpoint.resume_from.checkpoint', str(ckpt1_savedir / '0002-0035'),
+            '--checkpoint.keep_last_n_checkpoints', '30',
+        ])
+        trainer.run()
+        assert trainer.dataloader_resumed
+        assert 'cannot be loaded directly' in log.getvalue()
+        assert 'each rank assembles its own shard' in log.getvalue()
+
     ckpt6_1_savedir = save_dir / 'ckpt6_1'
     trainer = Trainer([
         '-f', config_path_streaming,
@@ -1314,6 +1359,12 @@ def trainer_resumable_dataloader(save_dir):
             u = torch.load(ckpt5_savedir / 'last' / f'{i}.ckpt', weights_only=False)
             t = torch.load(ckpt6_savedir / 'last' / f'{i}.ckpt', weights_only=False)
             t_1 = torch.load(ckpt6_1_savedir / 'last' / f'{i}.ckpt', weights_only=False)
+            s = torch.load(ckpt7_savedir / 'last' / f'{i}.ckpt', weights_only=False)
+            r = torch.load(ckpt8_savedir / 'last' / f'{i}.ckpt', weights_only=False)
+            # a different pas_policy changes the shard layout and reduction order,
+            # so only the non-model state is compared
+            for key in ['lr_scheduler', 'dataloader']:
+                assert_equal(x[key], r[key])
             assert 'dataloader' not in g
             assert 'dataloader' in x
             for key in ['model', 'optimizer', 'lr_scheduler', 'dataloader']:
@@ -1326,6 +1377,7 @@ def trainer_resumable_dataloader(save_dir):
                 assert_equal(x[key], z_2[key])
                 assert_equal(x[key], t[key])
                 assert_equal(x[key], t_1[key])
+                assert_equal(x[key], s[key])
                 if key != 'dataloader':
                     assert_equal(g[key], x[key])
 
