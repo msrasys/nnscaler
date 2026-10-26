@@ -2,6 +2,8 @@
 #  Licensed under the MIT License.
 
 import copy
+import math
+from dataclasses import dataclass
 from collections import defaultdict
 from collections.abc import Mapping
 from functools import partial
@@ -35,8 +37,108 @@ class _LazyStateDict(Mapping[str, Any]):
         return key in self.getters
 
 
+@dataclass
+class _Shard:
+    """
+    One shard of an original tensor: full tensor -> box (TP) -> optional flat range
+    (ZeRO-3 model shard or ZeRO optimizer bucket chunk) -> data, i.e.
+    ``full[box].reshape(-1)[flat[0]:flat[1]] == data``, or ``full[box] == data`` when `flat` is None.
+    """
+    # the region of the full tensor covered by the TP shard, one slice per dimension
+    box: Tuple[slice, ...]
+    # the range of the flattened box this shard holds; None means the whole box
+    flat: Optional[Tuple[int, int]]
+    # box shaped when `flat` is None, otherwise 1D holding at least `flat[1] - flat[0]` elements
+    data: torch.Tensor
+
+
+@dataclass
+class _OptimizerSource:
+    """
+    An optimizer state holding part of a parameter, i.e. for each state key
+    ``full[box].reshape(-1)[flat[0]:flat[1]] == state[key][data_slice[0]:data_slice[1]]``.
+    """
+    # the region of the full parameter covered by the TP shard, one slice per dimension
+    box: Tuple[slice, ...]
+    # the range of the flattened box held by this source; None means the whole box
+    flat: Optional[Tuple[int, int]]
+    # the rank's optimizer state for this parameter, or for the whole bucket containing it
+    state: Dict[str, Any]
+    # where `flat` lives inside each state tensor of a bucket; None when the state tensors are box shaped
+    data_slice: Optional[Tuple[int, int]]
+
+    def shard(self, key: str) -> _Shard:
+        data = self.state[key]
+        if self.data_slice is not None:
+            data = data[self.data_slice[0]:self.data_slice[1]]
+        return _Shard(self.box, self.flat, data)
+
+
+def _gather_region(target: Tuple[slice, ...], shards: List[_Shard]) -> torch.Tensor:
+    """Assemble `full[target]` from the shards overlapping it without materializing `full`."""
+    out = torch.empty([t.stop - t.start for t in target], dtype=shards[0].data.dtype, device='cpu')
+    # elements written by some shard
+    # TODO: Consider using a more efficient data structure for covered regions if needed.
+    covered = torch.zeros(out.shape, dtype=torch.bool, device='cpu')
+    for shard in shards:
+        box, flat, data = shard.box, shard.flat, shard.data
+        inter = [slice(max(t.start, b.start), min(t.stop, b.stop)) for t, b in zip(target, box)]
+        if any(i.start >= i.stop for i in inter):
+            continue
+        dst_index = tuple(slice(i.start - t.start, i.stop - t.start) for i, t in zip(inter, target))
+        dst, dst_covered = out[dst_index], covered[dst_index]
+        src_index = [slice(i.start - b.start, i.stop - b.start) for i, b in zip(inter, box)]
+        if flat is None:
+            dst.copy_(data[tuple(src_index)])
+            dst_covered.fill_(True)
+            continue
+        # shard = full[box].reshape(-1)[start:end]
+        start, end = flat
+        box_shape = [b.stop - b.start for b in box]
+        if dst.is_contiguous() and all(r.stop - r.start == n for r, n in zip(src_index[1:], box_shape[1:])):
+            # The intersection is a run of leading-dim rows, contiguous in the flattened box.
+            row = math.prod(box_shape[1:])
+            # lo/hi: the range in data
+            # src_index[0].start/stop: the unflattened range (superset of data)
+            lo, hi = max(src_index[0].start * row, start), min(src_index[0].stop * row, end)
+            if lo < hi:
+                run = slice(lo - src_index[0].start * row, hi - src_index[0].start * row)
+                dst.view(-1)[run] = data[lo - start:hi - start]
+                dst_covered.view(-1)[run] = True
+            continue
+
+        # General case: positions of the intersection inside the flattened box.
+        # idx will hold the flattened indices of the intersection within the flattened box.
+        idx = torch.zeros([r.stop - r.start for r in src_index], dtype=torch.int64, device='cpu')
+        stride = 1
+        for dim in reversed(range(len(src_index))):
+            shape = [1] * len(src_index)
+            shape[dim] = src_index[dim].stop - src_index[dim].start
+            idx += (torch.arange(src_index[dim].start, src_index[dim].stop, device='cpu') * stride).view(shape)
+            stride *= box_shape[dim]
+        mask = (idx >= start) & (idx < end)
+        dst[mask] = data[(idx[mask] - start).to(data.device)].to(dst.device)
+        dst_covered[mask] = True
+
+    if not covered.all():
+        raise ValueError(
+            f"Incomplete checkpoint shards: {int((~covered).sum())} of {out.numel()} elements "
+            f"in region {target} are not covered by any shard.")
+    return out
+
+
+class _LazyRegion:
+    """Stands in for one full tensor: indexing with slicers assembles only that region."""
+
+    def __init__(self, read_region: Callable[[Tuple[slice, ...]], torch.Tensor]):
+        self.read_region = read_region
+
+    def __getitem__(self, slicers: Tuple[slice, ...]) -> torch.Tensor:
+        return self.read_region(slicers)
+
+
 class _ModuleStateReader:
-    """Reconstruct one original attribute from a parallel module's checkpoint."""
+    """Assemble regions of original tensors from a parallel module's per-rank checkpoint."""
 
     def __init__(
         self,
@@ -47,12 +149,6 @@ class _ModuleStateReader:
         self.extra_states = extra_states
         self.model_states = model_states
         self.optimizer_states = optimizer_states
-        # Entries contain model-to-optimizer indices, bucket ranks, ZeRO version,
-        # and per-parameter ZeRO-3 intervals.
-        self.zero_maps = [
-            (extra.model_idx2opt_idx, extra.opt_idx2ranks, extra.zero, extra.zero3_param_metadata)
-            for extra in extra_states
-        ] if any(extra.zero for extra in extra_states) else None
         # Entries contain rank, local attribute name, model parameter index, and metadata.
         # Note here param_index is consistent with `model_idx2opt_idx.keys()`
         self.entries: Dict[str, List[Tuple[int, str, Optional[int], AttrMeta]]] = defaultdict(list)
@@ -78,70 +174,91 @@ class _ModuleStateReader:
                 for name in names:
                     self.model_names.setdefault(name, canonical)
 
-    def read_model(self, name: str) -> torch.Tensor:
-        name = self.model_names[name]
-        fullmaps = [{} for _ in self.model_states]
-        states = [{} for _ in self.model_states]
+    def read_model(self, name: str) -> _LazyRegion:
+        return _LazyRegion(partial(self._read_model_region, self.model_names[name]))
+
+    def _read_model_region(self, name: str, target: Tuple[slice, ...]) -> torch.Tensor:
+        shards: Dict[Tuple, _Shard] = {}  # deduplicate replicas by (slicers, flat range)
         for rank, local_name, _, meta in self.entries[name]:
-            if rank < len(states) and local_name in self.model_states[rank]:
-                fullmaps[rank][local_name] = meta
-                states[rank][local_name] = self.model_states[rank][local_name]
-        return ParallelModule.merge_model_state_dicts(states, fullmaps, self.zero_maps)[name]
+            if rank >= len(self.model_states) or local_name not in self.model_states[rank]:
+                continue
+            if meta.val_chunks != 1:
+                raise NotImplementedError("Value-partitioned parameters are not supported.")
+            data = self.model_states[rank][local_name]
+            flat = None
+            zero3 = (self.extra_states[rank].zero3_param_metadata or {}).get(local_name)
+            if zero3 is not None and tuple(data.shape) != tuple(meta.sub_shape):
+                flat = (int(zero3.start), int(zero3.end))
+            shards.setdefault((_track_id(meta.slicers), flat), _Shard(meta.slicers, flat, data))
+        return _gather_region(target, list(shards.values()))
+
+    def _optimizer_sources(self, name: str) -> List[_OptimizerSource]:
+        """Optimizer states holding parts of `name`, one per distinct shard."""
+        if self.optimizer_states is None:
+            return []
+        sources, seen = [], set()
+        for rank, _, index, meta in self.entries[name]:
+            track = _track_id(meta.slicers)
+            if index is None or rank >= len(self.optimizer_states) or track in seen:
+                continue
+            seen.add(track)
+            extra = self.extra_states[rank]
+            opt_idx = extra.model_idx2opt_idx[index] if extra.zero else index
+            if isinstance(opt_idx, int):
+                state = self.optimizer_states[rank]['state'].get(opt_idx)
+                if state:
+                    sources.append(_OptimizerSource(meta.slicers, None, state, None))
+                continue
+            # The parameter lives in [pstart, pend) of a reducer bucket that is spread over `ranks`.
+            opt_idx, pstart, pend, _ = opt_idx
+            ranks, bucket_size = extra.opt_idx2ranks[opt_idx]
+            slice_len, total = pend - pstart, math.prod(meta.sub_shape)
+            for i, r in enumerate(ranks):
+                state = self.optimizer_states[r]['state'].get(opt_idx)
+                if not state:
+                    continue
+                if extra.zero == 1:
+                    # Each rank holds one equal chunk of the whole bucket.
+                    chunk = bucket_size // len(ranks)
+                    lo, hi = max(pstart, i * chunk), min(pend, (i + 1) * chunk)
+                    if lo < hi:
+                        # full_tensor[meta.slicers].view(-1)[lo - pstart:hi - pstart]
+                        #  = state[(lo - i * chunk):(hi - i * chunk)]
+                        sources.append(_OptimizerSource(meta.slicers, (lo - pstart, hi - pstart), state, (lo - i * chunk, hi - i * chunk)))
+                else:
+                    # ZeRO-3: each rank holds the i-th slice of length `slice_len` of the parameter.
+                    lo = i * slice_len
+                    if lo >= total:
+                        break
+                    hi = min(lo + slice_len, total)
+                    # full_tensor[meta.slicers].view(-1)[lo:hi]
+                    #  = state[pstart:pstart + hi - lo]
+                    sources.append(_OptimizerSource(meta.slicers, (lo, hi), state, (pstart, pstart + hi - lo)))
+        return sources
 
     def has_optimizer(self, name: str) -> bool:
-        if self.optimizer_states is None:
-            return False
-        for rank, _, index, _ in self.entries[name]:
-            if index is None or rank >= len(self.optimizer_states):
-                continue
-            extra = self.extra_states[rank]
-            opt_index = extra.model_idx2opt_idx[index] if extra.zero else index
-            if isinstance(opt_index, tuple):
-                opt_index = opt_index[0]
-            if self.optimizer_states[rank]['state'].get(opt_index):
-                return True
-        return False
+        return bool(self._optimizer_sources(name))
 
     def read_optimizer(self, name: str) -> Dict[str, Any]:
-        assert self.optimizer_states is not None
-        fullmaps = [{} for _ in self.extra_states]
-        # value: a list of parameter indices for each rank
-        # Note: there is only one param index per rank for each parameter
-        #       in most cases.(see `CubeModule._fullmap`)
-        indices = [[] for _ in self.extra_states]
-        for rank, local_name, param_index, meta in self.entries[name]:
-            if param_index is not None:
-                indices[rank].append(param_index)
-                fullmaps[rank][local_name] = meta
-
-        zero_maps = None
-        if self.zero_maps is not None:
-            # Filtering fullmaps renumbers model indices, but bucket indices stay unchanged.
-            zero_maps = [
-                (
-                    {new: extra.model_idx2opt_idx[old] for new, old in enumerate(rank_indices)},
-                    extra.opt_idx2ranks, extra.zero, extra.zero3_param_metadata,
-                )
-                for extra, rank_indices in zip(self.extra_states, indices)
-            ]
-            # The merge helper looks up `state[opt_idx]` with the original bucket indices, so keep
-            # each rank's full state dict (by reference, nothing is copied). Only the requested
-            # parameter's [pstart:pend] range of its bucket is read and materialized.
-            states = [{'state': state['state']} for state in self.optimizer_states]
-        else:
-            states = [
-                {'state': {
-                    new: state['state'][old] for new, old in enumerate(rank_indices)
-                    if old in state['state']
-                }}
-                for state, rank_indices in zip(self.optimizer_states, indices)
-            ]
-        # Do not pass param_groups: the merge helper rewrites their parameter indices.
-        state = ParallelModule.merge_opt_state_dicts(fullmaps, states, zero_maps)['state'][0]
-        # Adam keeps step on CPU, where optimizer.load_state_dict may retain its storage.
-        if isinstance(state.get('step'), torch.Tensor):
-            state['step'] = state['step'].clone()
+        sources = self._optimizer_sources(name)
+        state = {
+            key: _LazyRegion(partial(self._read_optimizer_region, sources, key))
+            for key in sources[0].state if key != 'step'
+        }
+        if 'step' in sources[0].state:
+            step = sources[0].state['step']
+            # Adam keeps step on CPU, where optimizer.load_state_dict may retain its storage.
+            state['step'] = step.clone() if isinstance(step, torch.Tensor) else step
         return state
+
+    @staticmethod
+    def _read_optimizer_region(sources: List[_OptimizerSource], key: str, target: Tuple[slice, ...]) -> torch.Tensor:
+        return _gather_region(target, [source.shard(key) for source in sources])
+
+
+def _track_id(slicers: Tuple[slice, ...]) -> Tuple[Tuple[Any, Any, Any], ...]:
+    # slice objects are not hashable before Python 3.12
+    return tuple((s.start, s.step, s.stop) for s in slicers)
 
 
 @torch.no_grad()
@@ -160,8 +277,8 @@ def load_from_rank_state_dicts(
     All source checkpoint ranks must be accessible in this process, including their
     nnscaler metadata. Tensor payloads may be deduplicated as in merge_state_dicts.
     Source and target TP, PP, ZeRO and bucket layouts may differ.
-    Only original parameters needed by the target rank are reconstructed, one at a
-    time, on CPU. Target-local model and optimizer state dicts are then loaded using
+    Only the regions of original parameters needed by the target rank are assembled,
+    one at a time, on CPU. Target-local model and optimizer state dicts are then loaded using
     their standard load_state_dict methods. No checkpoint communication is performed.
 
     Args:
@@ -255,14 +372,17 @@ def load_from_rank_state_dicts(
     for prefix, child in module.named_modules():
         prefix = prefix + '.' if prefix else ''
         if isinstance(child, ParallelModule):
-            local_model_state.update(child.trim_merged_state_dict(model_reader, prefix, device='cpu', copy=True))
+            local_model_state.update(child.trim_merged_state_dict(model_reader, prefix, device='cpu'))
             child._add_extra_state(local_model_state, prefix)
         else:
             own_state = {}
             child._save_to_state_dict(own_state, prefix, False)
-            for name in own_state:
+            for name, tensor in own_state.items():
                 if name in model_reader:
-                    local_model_state[name] = model_reader[name]
+                    value = model_reader[name]
+                    if isinstance(value, _LazyRegion):  # a parallel module's parameter, take it whole
+                        value = value[tuple(slice(0, n) for n in tensor.shape)]
+                    local_model_state[name] = value
     module.load_state_dict(local_model_state, strict=strict)
     del local_model_state
 
@@ -291,7 +411,11 @@ def load_from_rank_state_dicts(
     param_names = {param: name for name, param in module.named_parameters()}
     for index, param in enumerate(optimizer.param_groups[0]['params']):
         if index not in parallel_indices and param_names[param] in optimizer_getters:
-            local_optimizer_state[index] = optimizer_getters[param_names[param]]()
+            whole = tuple(slice(0, n) for n in param.shape)
+            local_optimizer_state[index] = {
+                key: value[whole] if isinstance(value, _LazyRegion) else value
+                for key, value in optimizer_getters[param_names[param]]().items()
+            }
     opt_metadata['state'] = local_optimizer_state
     opt_metadata['param_groups'][0]['params'] = list(range(len(optimizer.param_groups[0]['params'])))
     optimizer.load_state_dict(opt_metadata)

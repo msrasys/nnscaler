@@ -897,8 +897,8 @@ Rank order does not matter. No communication is performed between processes.
 
 Unlike `merge_state_dicts` followed by `load_merged_state_dict`, the full merged
 model and optimizer state dicts are never materialized. Besides the input state dicts,
-the extra memory is roughly one original parameter at a time plus the target-local
-state dicts.
+the extra memory is roughly one target-local shard at a time plus the target-local
+state dicts. Only the source shards overlapping the target shard are read.
 
 With `strict=True`, all target model parameters and persistent buffers must be
 available. Source keys not needed by the target rank are ignored. Omit the optimizer

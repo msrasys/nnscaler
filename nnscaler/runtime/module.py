@@ -1197,6 +1197,7 @@ class ZeroMetadata:
     # 1: zero1
     # > 1: zero3
     zero: int = 0
+    # a mapping from parameter names (local names) to their zero3 attribute metadata
     zero3_param_metadata: Optional[Dict[str, Zero3AttrMeta]] = None
 
     def __post_init__(self):
@@ -2178,7 +2179,6 @@ class ParallelModule(CubeModule):
             prefix: str = '',
             *,
             device=None,
-            copy: bool = False,
     ) -> Dict[str, Any]:
         """
         Trim the merged state dict to only keep the parameters needed for the module.
@@ -2187,8 +2187,6 @@ class ParallelModule(CubeModule):
         Args:
             state_dict (Dict[str, Any]): the merged state dict
             prefix (str): the prefix of the model state dict in the merged state dict
-            copy (bool): Copy trimmed tensors into independent storage. This allows
-                a lazy input mapping to release each reconstructed full tensor.
 
         Returns:
             Dict[str, Any]: the trimmed state dict
@@ -2220,7 +2218,7 @@ class ParallelModule(CubeModule):
                     if nchunks != 1:
                         content = content / nchunks
                     if self.compute_config.use_zero <= 1 or self._zero3_param_metadata.get(attr, None) is None:
-                        trimmed_state_dict[prefix + attr] = content.to(device, copy=copy)
+                        trimmed_state_dict[prefix + attr] = content.to(device)
                     else:
                         z3_info = self._zero3_param_metadata[attr]
                         start, end, chunk_size = z3_info.start, z3_info.end, z3_info.chunk_size
@@ -2234,7 +2232,7 @@ class ParallelModule(CubeModule):
                                 value=0.0,
                             )
                         else:
-                            trimmed_state_dict[prefix + attr] = content.reshape(-1)[start:end].to(device, copy=copy)
+                            trimmed_state_dict[prefix + attr] = content.reshape(-1)[start:end].to(device)
 
         return trimmed_state_dict
 

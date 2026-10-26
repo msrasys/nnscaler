@@ -17,6 +17,7 @@ from nnscaler import (
     merge_state_dicts,
     parallelize,
 )
+from nnscaler.runtime import checkpoint
 from nnscaler.runtime.module import ParallelModule
 
 from .common import assert_equal, init_distributed
@@ -66,18 +67,17 @@ def test_load_from_rank_state_dicts_cpu(tmp_path):
         target_opt.state.clear()
 
         refs = []
-        merge_model = ParallelModule.merge_model_state_dicts
+        gather_region = checkpoint._gather_region
 
-        def read_one(*args, **kwargs):
-            state = merge_model(*args, **kwargs)
-            assert len(state) == 1
-            refs.extend(weakref.ref(tensor) for tensor in state.values())
-            # The trim loop can retain the previous full tensor until the next read returns.
-            assert sum(ref() is not None for ref in refs) <= 2
-            return state
+        def gather_one(region, shards):
+            out = gather_region(region, shards)
+            assert list(out.shape) == [s.stop - s.start for s in region]
+            refs.append(weakref.ref(out))
+            return out
 
-        with patch.object(ParallelModule, 'merge_model_state_dicts', side_effect=read_one):
+        with patch.object(checkpoint, '_gather_region', side_effect=gather_one):
             load_from_rank_state_dicts(target, models, target_opt, optimizers, device='cpu')
+        # Regions are the target-local shards; nothing keeps them alive after loading.
         assert refs and all(ref() is None for ref in refs)
         assert_equal(expected, _snapshot(target, target_opt))
         assert_equal(snapshot, [models, optimizers])
@@ -95,6 +95,24 @@ def test_load_from_rank_state_dicts_cpu(tmp_path):
         empty_optimizers[0]['state'].clear()
         load_from_rank_state_dicts(target, models, target_opt, empty_optimizers, device='cpu')
         assert not target_opt.state
+
+
+def test_gather_region():
+    full = torch.arange(6 * 8, dtype=torch.float32).view(6, 8)
+    box = (slice(0, 6), slice(0, 8))
+    # Column shards (box shaped), row shards flattened in ZeRO-3 style, and a scalar.
+    column_shards = [checkpoint._Shard((slice(0, 6), slice(c, c + 4)), None, full[:, c:c + 4].clone()) for c in (0, 4)]
+    flat_shards = [checkpoint._Shard(box, (lo, hi), full.reshape(-1)[lo:hi].clone()) for lo, hi in ((0, 20), (20, 40), (40, 48))]
+    for shards in (column_shards, flat_shards):
+        for target in ((slice(1, 5), slice(2, 7)), (slice(0, 3), slice(0, 8)), (slice(3, 6), slice(5, 8))):
+            assert_equal(checkpoint._gather_region(target, shards), full[target])
+    scalar = torch.tensor(3.0)
+    assert_equal(checkpoint._gather_region((), [checkpoint._Shard((), None, scalar)]), scalar)
+    # Overlapping shards are allowed; a gap is not, even if the element count matches.
+    overlapping = [checkpoint._Shard(box, None, full.clone())] + column_shards
+    assert_equal(checkpoint._gather_region(box, overlapping), full)
+    with pytest.raises(ValueError, match='Incomplete checkpoint shards'):
+        checkpoint._gather_region(box, [column_shards[0], column_shards[0]])
 
 
 class MixedCheckpointModel(torch.nn.Module):
@@ -185,7 +203,7 @@ def _load_rank_checkpoint_worker(tmp_path, source_zero, target_zero, mixed):
         for state in incomplete:
             if state[ParallelModule.EXTRA_STATE_KEY]['rank'] == 1:
                 state['state'].clear()
-        with pytest.raises(ValueError, match='Incomplete optimizer state'):
+        with pytest.raises(ValueError, match='Incomplete checkpoint shards'):
             load_from_rank_state_dicts(target, models, target_opt, incomplete)
     torch.distributed.destroy_process_group()
 
