@@ -109,7 +109,7 @@ def _trainer_worker(save_dir, run_name, policy, prefetch_level):
             gen_savedir,
             MLP,
             trainer.rank,
-            r'with self\.cpu_offloading_hooks\(\):',
+            r'with self\.cpu_offloading_hooks\(\d+\):',
             instance_name=instance_name,
         )
     else:

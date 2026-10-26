@@ -1603,12 +1603,17 @@ class ParallelModule(CubeModule):
 
         return saved_tensors_hooks(pack, unpack)
 
-    def cpu_offloading_hooks(self) -> 'CPUOffloadContext':
+    def cpu_offloading_hooks(self, group_id: Optional[int] = None) -> 'CPUOffloadContext':
         """
-        Offload activations while preserving ``save_params_hooks`` semantics.
+        Offload activations saved inside the ``with`` block while preserving
+        ``save_params_hooks`` semantics.
+
+        Args:
+            group_id (Optional[int]): static offload group id from planning;
+                only used for bookkeeping/diagnostics.
         """
         from nnscaler.runtime.cpu_offloading import CPUOffloadContext
-        return CPUOffloadContext(self, self.cpu_offloading_prefetch_level)
+        return CPUOffloadContext(self, self.cpu_offloading_prefetch_level, group_id=group_id)
 
     @classmethod
     def get_attr_meta_map(cls, rank=None):

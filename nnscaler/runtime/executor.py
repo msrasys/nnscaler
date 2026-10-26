@@ -246,7 +246,15 @@ class Executor:
         saved_pairs = [(id(itensor), dtensor) for itensor, dtensor in zip(input_tensors, input_dtensors)]
         Executor._detach.setdefault(name, []).append(saved_pairs)
 
-        outputs = subgraph(*input_dtensors)
+        # CPU offloading records which offload groups run inside this segment
+        # execution so their backward can be prefetched in the right order.
+        from nnscaler.runtime.cpu_offloading import OffloadManager
+        offload_manager = OffloadManager.get()
+        offload_ctx = offload_manager.begin_forward(name)
+        try:
+            outputs = subgraph(*input_dtensors)
+        finally:
+            offload_manager.end_forward(offload_ctx)
         return outputs
 
     @staticmethod
@@ -351,12 +359,16 @@ class Executor:
                 pseudo_free_output_ids.append(id(tensor))
                 backward_roots.append(edge)
 
+        from nnscaler.runtime.cpu_offloading import OffloadManager
+        offload_manager = OffloadManager.get()
+        offload_ctx = offload_manager.begin_backward(name)
         try:
             torch.autograd.backward(
                 backward_roots,
                 grad_tensors=dedup_output_tensor_grads,
             )
         finally:
+            offload_manager.end_backward(offload_ctx)
             for tensor_id in pseudo_free_output_ids:
                 Executor._pseudo_free_grad_edges.pop(tensor_id, None)
                 Executor._pseudo_free_pending_sends.pop(tensor_id, None)

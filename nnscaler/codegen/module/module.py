@@ -1045,7 +1045,7 @@ class ModuleCodeGen(FuncEmission):
                 codes += self._emit_nodes(group, lifetime, runtime_devid)
             elif offload_gid is not None:
                 group_codes = self._emit_nodes(group, lifetime, runtime_devid)
-                with Block('with self.cpu_offloading_hooks():') as offload_block:
+                with Block(f'with self.cpu_offloading_hooks({offload_gid}):') as offload_block:
                     offload_block.insert_body(group_codes)
                 codes += [''] + offload_block.code + ['']
             else:

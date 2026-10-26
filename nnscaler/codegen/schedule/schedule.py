@@ -232,6 +232,42 @@ class ScheduleCodeGen(FuncEmission):
                     'fallback_vars_by_mid': {},
                 }
                 pending_async_recvs = {}
+                # CPU offloading: tell the runtime which segment's backward
+                # comes next so its saved tensors are prefetched while the
+                # current backward is still computing.
+                next_backward_name: Dict[int, str] = {}
+                # forward line -> number of segment executions between this
+                # forward and its own backward (same segment, same micro-batch)
+                forward_backward_distance: Dict[int, int] = {}
+                if use_scheduler and self._graph_has_offload():
+                    def _is_forward_segment(node: IRCell) -> bool:
+                        unwrap = node.cell if isinstance(node, ExeReuseCell) else node
+                        return isinstance(unwrap, IRSegment) and unwrap.isfw()
+                    backward_lines = [
+                        (line, self.node_name((node.cell if isinstance(node, ExeReuseCell) else node).mirror))
+                        for line, node in enumerate(device_nodes) if _is_backward_segment(node)
+                    ]
+                    for (line, _), (_, nxt_name) in zip(backward_lines, backward_lines[1:]):
+                        next_backward_name[line] = nxt_name
+                    segment_lines = [
+                        line for line, node in enumerate(device_nodes)
+                        if _is_forward_segment(node) or _is_backward_segment(node)
+                    ]
+                    for pos, line in enumerate(segment_lines):
+                        node = device_nodes[line]
+                        if not _is_forward_segment(node):
+                            continue
+                        fw_name = self.node_name(node.cell if isinstance(node, ExeReuseCell) else node)
+                        fw_mid = node.micro_batch_id if isinstance(node, ExeReuseCell) else None
+                        for later_pos in range(pos + 1, len(segment_lines)):
+                            later = device_nodes[segment_lines[later_pos]]
+                            if not _is_backward_segment(later):
+                                continue
+                            later_unwrap = later.cell if isinstance(later, ExeReuseCell) else later
+                            later_mid = later.micro_batch_id if isinstance(later, ExeReuseCell) else None
+                            if self.node_name(later_unwrap.mirror) == fw_name and later_mid == fw_mid:
+                                forward_backward_distance[line] = later_pos - pos - 1
+                                break
                 for line, node in enumerate(device_nodes):
                     unwrap_node = node.cell if isinstance(node, ExeReuseCell) else node
                     bundle_events = send_bundle_ranges.get(line, ())
@@ -254,6 +290,14 @@ class ScheduleCodeGen(FuncEmission):
                         )
                     elif use_scheduler and isinstance(unwrap_node, IRWeightReducer):
                         _append_code(fb, 'nnscaler.flags.RuntimeFlag.skip_reducer = False')
+                    if line in next_backward_name:
+                        _append_code(fb,
+                            'nnscaler.runtime.cpu_offloading.prefetch_next_backward('
+                            f'{next_backward_name[line]!r})')
+                    if line in forward_backward_distance:
+                        _append_code(fb,
+                            'nnscaler.runtime.cpu_offloading.hint_forward('
+                            f'{self.node_name(unwrap_node)!r}, {forward_backward_distance[line]})')
                     codes = self.emit_node(
                         node,
                         produced_tids=produced_tids,
@@ -780,6 +824,13 @@ class ScheduleCodeGen(FuncEmission):
             return [f'{fsig}(model, {repr(hook_meta)}, {inputs_str}, {kwargs})']
         else:
             return [f'{fsig}(model, {repr(hook_meta)}, {inputs_str}, {kwargs}, {outputs_str})']
+
+    def _graph_has_offload(self) -> bool:
+        """Whether any forward operator of the plan is in a CPU offload group."""
+        for node in self.execplan.graph.select(ntype=IRFwOperation, flatten=True):
+            if getattr(node, 'offload', None) is not None:
+                return True
+        return False
 
     def emit_detach(self, tensor: IRTensor) -> str:
         """

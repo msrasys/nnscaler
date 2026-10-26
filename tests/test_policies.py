@@ -265,7 +265,7 @@ def test_codegen_fn_cpu_offload(tmp_path):
             tmp_path,
             FnPolicyModule,
             rank,
-            r'with self\.cpu_offloading_hooks\(\):',
+            r'with self\.cpu_offloading_hooks\(\d+\):',
         )) == 1
 
 
@@ -290,7 +290,7 @@ def test_codegen_fn_cpu_offload_zero3(tmp_path):
         tmp_path,
         FnPolicyModule,
         0,
-        r'with self\.cpu_offloading_hooks\(\):',
+        r'with self\.cpu_offloading_hooks\(\d+\):',
     )
 
 
@@ -482,7 +482,7 @@ def test_codegen_fn_cpu_offload_multiple_blocks(tmp_path):
             tmp_path,
             FnPolicyModuleList,
             rank,
-            r'with self\.cpu_offloading_hooks\(\):',
+            r'with self\.cpu_offloading_hooks\(\d+\):',
         )) == 2
 
 
@@ -509,7 +509,7 @@ def test_codegen_fn_pipeline_cpu_offload(tmp_path):
             tmp_path,
             FnPolicyModuleList,
             rank,
-            r'with self\.cpu_offloading_hooks\(\):',
+            r'with self\.cpu_offloading_hooks\(\d+\):',
             instance_name=instance_name,
         )) == 1
         assert not _gencode_contains(
@@ -546,7 +546,7 @@ def _pipeline_cpu_offload_runtime_worker(tempdir):
         tempdir,
         FnPolicyModuleList,
         rank,
-        r'with self\.cpu_offloading_hooks\(\):',
+        r'with self\.cpu_offloading_hooks\(\d+\):',
         instance_name='cpu_offload_pipeline_runtime',
     )) == 2
 

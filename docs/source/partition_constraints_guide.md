@@ -91,12 +91,13 @@ class OpPlan:
     *   Operators with the same non-negative `recompute_id` will be grouped into a single recomputation block.
     *   These operators with the same `recompute_id` should be consecutive in the graph.
 *   **`offload_id`** (default: -1):
-    *   Used to group operators whose tensors saved for backward are offloaded to CPU.
+    *   Used to group operators whose tensors saved for backward are offloaded to pinned CPU memory and prefetched back before their backward.
     *   Operators with the same non-negative `offload_id` must be consecutive and belong to the same pipeline stage.
     *   `offload_id` and `recompute_id` cannot both be set on the same operator.
-    *   Dense strided tensors are copied asynchronously through pinned CPU memory. Unsupported layouts remain on their original device.
-    *   Each CPU-offload context forms one batch linked to the preceding live context in process-local forward order. On unpack, the runtime loads the demanded tensor first and then follows the linked batches in reverse pack order. `ParallelModule` reads `CPU_OFFLOADING_PREFETCH_LEVEL` once when the module is constructed; it defaults to 2 when unset, prefetching the next two tensors. Positive levels define a tensor lookahead: 1 prefetches the next tensor after the demanded tensor, 2 prefetches the next two, and so on, continuing into preceding batches when necessary. Level 0 loads only on demand. Negative levels count whole batches instead: -1 prefetches the current batch, -2 covers the current and immediately preceding batches, and larger absolute values follow more preceding batches. Set `module.cpu_offloading_prefetch_level` after construction to override the value for that module instance.
-    *   CPU-offload contexts must execute sequentially on one thread. Nested contexts and concurrent use from multiple threads are not supported.
+    *   Dense strided CUDA tensors of at least `CPU_OFFLOADING_MIN_BYTES` (default 1 MiB) are copied on a dedicated D2H stream; parameters/buffers and small or non-strided tensors stay on the device. Views sharing a storage region are copied once.
+    *   Prefetch order follows the execution contexts opened by `Executor.fexecute`/`Executor.backward`: within one segment execution groups are reloaded in reverse forward order (`CPU_OFFLOADING_PREFETCH_GROUPS` groups ahead, default 1); across micro-batches the backward of a segment consumes contexts in forward order (FIFO), which is exact for 1F1B, interleaved 1F1B and gradient accumulation. Scheduled pipeline code additionally calls `prefetch_next_backward(name)` before every backward and `hint_forward(name, distance)` before every forward; a forward whose own backward is fewer than `CPU_OFFLOADING_MIN_BACKWARD_DISTANCE` (default 1) segment executions away is not offloaded.
+    *   Pinned host buffers are pooled in geometric size classes and reused across steps (`CPU_OFFLOADING_POOL_MAX_GB` bounds the free list). `CPU_OFFLOADING_DISABLE=1` turns the contexts into no-ops; `CPU_OFFLOADING_PREFETCH_LEVEL` from the first prototype is accepted but ignored.
+    *   See `nnscaler/runtime/cpu_offloading.py` for the runtime and `docs/source/cpu_offloading.md` for the design.
 *   **`stage_id`** (default: -1):
     *   Used for Pipeline Parallelism assignment.
     *   These operators with the same `stage_id` should be consecutive in the graph.

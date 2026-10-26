@@ -1,0 +1,118 @@
+# CPU activation offloading
+
+Activation memory of a pipeline stage is dominated by the saved tensors of the
+micro-batches that are in flight between their forward and their backward.
+Recomputation trades this memory for compute (attention recompute roughly costs
+one extra attention forward per layer).  CPU offloading instead copies the saved
+tensors to pinned host memory right after the forward and brings them back just
+before the backward, using copy engines that otherwise sit idle.
+
+The feature has three layers.  Only the first one is specific to how a model is
+planned; the other two are shared by every parallelization strategy.
+
+## 1. Planning: `OpPlan.offload_id`
+
+A policy marks consecutive forward operators with the same non-negative
+`offload_id`.  All tensors that autograd saves while those operators run are
+offloaded.  The granularity is therefore "whatever module boundary the policy
+chooses": an `Attention` call, a whole transformer `Block`, an MoE expert group.
+Constraints are the same as `recompute_id` (consecutive operators, one pipeline
+stage, never both recompute and offload on the same operator).
+
+`IRGraph.offload(nodes)` is the graph-level entry; `nnscaler.policies.fn`
+applies the ids from `OpPlan`.  Adapters and multirefs inserted between marked
+operators inherit the group of their neighbour so a group stays contiguous
+after partitioning.
+
+## 2. Code generation
+
+`ModuleCodeGen` wraps every offload group of a segment in
+
+```python
+with self.cpu_offloading_hooks(<group_id>):
+    ...  # operators of the group
+```
+
+which installs `torch.autograd.graph.saved_tensors_hooks`.  When the graph is
+scheduled (pipeline parallelism), `ScheduleCodeGen` also emits two hints into
+`_train_step`, derived from the static schedule it is already unrolling:
+
+* `hint_forward(segment, distance)` before every `fexecute`: the number of
+  segment executions between this forward and its own backward.  A distance
+  below `CPU_OFFLOADING_MIN_BACKWARD_DISTANCE` (default 1) disables offloading
+  for that execution, e.g. the last pipeline stage in 1F1B, where F and B of a
+  micro-batch are adjacent and offloading could only add a stall.
+* `prefetch_next_backward(segment)` before every backward: the segment whose
+  backward comes next, so its first group can be reloaded while the current
+  backward computes.
+
+Both hints are optional.  Without them (eager execution, non-scheduled graphs)
+the runtime falls back to demand-driven prefetching.
+
+## 3. Runtime: `nnscaler.runtime.cpu_offloading`
+
+### Execution contexts give the backward order
+
+`Executor.fexecute(name, ...)` opens an execution context for the segment; the
+offload groups that run inside it are appended in forward order; finished
+contexts are queued per segment name.  `Executor.backward(name, ...)` pops the
+oldest queued context of that name.  This encodes two facts that hold for
+1F1B, interleaved 1F1B and plain gradient accumulation:
+
+* within one segment execution, groups are consumed in reverse forward order
+  (last group first);
+* across micro-batches, a given segment's backward consumes contexts in the
+  order their forwards ran (FIFO).
+
+So no profiling or warm-up iteration is needed to learn the order, unlike
+Megatron's fine-grained offloading which records it during the first step.
+
+### Pack
+
+For each saved tensor: skip non-CUDA, non-strided, parameters/buffers (a
+lightweight reference is kept instead, which also preserves ZeRO-3 semantics)
+and tensors smaller than `CPU_OFFLOADING_MIN_BYTES` (1 MiB).  Otherwise the byte
+range of its storage that the view touches is copied on the dedicated D2H
+stream after `wait_stream(compute)`; the device storage is `record_stream`ed
+on the D2H stream so the caching allocator cannot reuse it before the copy
+has finished, and the Python reference is dropped so the memory is released as
+soon as the forward no longer needs it.  Views of the same storage range inside
+one group share one host region (q/k/v views of a fused projection, transposes
+saved by several operators).  Strong references to the packed storages are
+kept until the group ends so addresses cannot be recycled and mistaken for a
+duplicate.
+
+Host buffers come from a pinned pool with geometric size classes (ratio 1.25),
+so tensors whose shapes vary every step (MoE expert inputs) still reuse
+buffers.  `cudaHostAlloc` costs about 0.3 ms per MiB, so pooling is what makes
+steady-state overhead small.
+
+### Unpack and prefetch
+
+Unpacking a tensor issues (or waits for) the H2D copy of its region on the
+H2D stream and makes the compute stream wait on the copy event.  It also
+prefetches the `CPU_OFFLOADING_PREFETCH_GROUPS` preceding groups of the same
+context.  `begin_backward` and `prefetch_next_backward` prefetch the last
+group(s) of the context that is about to run.  `end_backward` returns the host
+buffers of the context to the pool.  Views are rebuilt with `as_strided`, so
+non-contiguous saved tensors come back with their original strides.
+
+### Diagnostics
+
+`offload_stats()` returns per-step counters: bytes offloaded, deduplicated,
+prefetched, number of unpacks that had to wait for a copy (`stalls`), time
+spent in the hooks, pinned pool size, contexts still pending.  llm-train logs
+them as `offload_*` training metrics.
+
+## Choosing what to offload
+
+The copy time of a group must hide behind the compute that runs between its
+forward and its backward.  Per transformer block and micro-batch, attention
+saves roughly `4 * S * H * D` elements (q, k, v, o) plus the log-sum-exp; a
+whole block additionally saves the MoE inputs, expert activations and
+normalisation inputs.  With PCIe Gen5 (~50 GB/s per direction) and a 1F1B
+window of several micro-batches there is ample slack for attention tensors on
+large models, while offloading whole blocks of an MoE model can saturate the
+link in the cooldown phase (every step is backward-only there).  Mixing is the
+intended usage: recompute the cheap, large-footprint pieces (RMSNorm, SwiGLU,
+MoE activation), offload the expensive ones (attention, expert FC1 inputs).
