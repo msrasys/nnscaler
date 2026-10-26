@@ -24,6 +24,7 @@ from torch.autograd.graph import saved_tensors_hooks
 from nnscaler.graph.parser import FxModuleParser
 
 from nnscaler.runtime.device import DeviceGroup
+from nnscaler.runtime.serialization import torch_load
 from nnscaler.runtime.dtensor import DTensor
 from nnscaler.runtime.adapter.reducer import Reducer
 from nnscaler.runtime.executor import Executor
@@ -449,10 +450,8 @@ class CubeModule(torch.nn.Module):
                 tid_to_chunk[meta.tid] for meta in self._fullmap.values()
             }
 
-        # TP/PP ranks use only part of each full-model chunk. mmap lets them
-        # page in the required tensor slices instead of eagerly reading it all.
-        # mmap was added in PyTorch 2.1; PyTorch 2.0 remains supported.
-        mmap_kwargs = {'mmap': True} if torch.__version__ >= (2, 1) else {}
+        # TP/PP ranks use only part of each full-model chunk; torch_load memory-maps
+        # the file so only the required tensor slices are paged in.
         with torch.no_grad():
             _logger.info(f'loading partitioned model from {filename}, number of model parameter chunks: {npartitions}')
             attr_names = set(self._fullmap)
@@ -462,8 +461,7 @@ class CubeModule(torch.nn.Module):
                 # part_model contains a subset of attributes, where each attribute is a fulltensor
                 # Generated alongside model code; preserve serialized Tensor subclasses.
                 # fulltensor.tid -> torch.Tensor
-                part_model: Dict[int, torch.Tensor] = torch.load(
-                    filename + f'.{file_idx}', weights_only=False, **mmap_kwargs)
+                part_model: Dict[int, torch.Tensor] = torch_load(filename + f'.{file_idx}', weights_only=False)
                 loaded_names = set()
                 for attr_name in attr_names:
                     meta = self._fullmap[attr_name]
@@ -484,7 +482,7 @@ class CubeModule(torch.nn.Module):
         """Yield (attribute name, local content) from npbuffer.pt, including value-partition scaling."""
         if not self._non_persistent_buffers_set:
             return
-        np_buffer_model: Dict[int, torch.Tensor] = torch.load(filename)
+        np_buffer_model: Dict[int, torch.Tensor] = torch_load(filename, map_location='cpu')
         for attr_name in self._non_persistent_buffers_set:
             if attr_name not in self._fullmap:
                 raise RuntimeError(f'non-persistent buffer {attr_name} not found in fullmap.')
@@ -1053,6 +1051,15 @@ class CubeModule(torch.nn.Module):
 
     @classmethod
     def merge_checkpoints(cls, filename_prefix='dist_checkpoint'):
+        """
+        Deprecated: use `nnscaler.merge_state_dicts` on the per-rank state dicts instead.
+        This helper predates the ParallelModule state dict format and will be removed.
+        """
+        warnings.warn(
+            "ParallelModule.merge_checkpoints is deprecated and will be removed; "
+            "use nnscaler.merge_state_dicts instead.",
+            DeprecationWarning, stacklevel=2,
+        )
         ckpts = {}
         for rank in range(DeviceGroup().world_size):
             filename = f"{filename_prefix}-{rank}.ckpt"

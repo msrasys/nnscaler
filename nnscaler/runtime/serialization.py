@@ -2,6 +2,8 @@
 #  Licensed under the MIT License.
 
 from typing import Any, TypedDict
+import contextlib
+import os
 import pickle
 import base64
 import copy
@@ -27,6 +29,39 @@ class _Index:
         return f"_Index({self.index})"
 
 
+def torch_load(f, **kwargs) -> Any:
+    """
+    `torch.load` that memory-maps the file so tensors are paged in on demand and the
+    page cache is shared across processes on the same host. mmap needs PyTorch >= 2.1
+    (2.0 is still supported), a file path, and the default zipfile format.
+
+    The returned tensors alias the file: truncating it in place while they are alive raises
+    SIGBUS, whereas unlinking or renaming over it is safe. Writers in this project therefore
+    unlink first (`torch_save`, `save`).
+    """
+    if torch.__version__ >= (2, 1) and isinstance(f, (str, os.PathLike)):
+        kwargs.setdefault('mmap', True)
+    return torch.load(f, **kwargs)
+
+
+def _remove_before_save(f) -> None:
+    """
+    Unlink `f` before rewriting it. `torch.save` and safetensors' `save_file` truncate an
+    existing file in place, which raises SIGBUS in processes that still memory-map the old
+    content (`torch_load`, safetensors lazy loading). Unlinking keeps the old inode alive for
+    them. It is metadata-only, unlike rename, which some remote mounts implement as a copy.
+    """
+    if isinstance(f, (str, os.PathLike)):
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(f)
+
+
+def torch_save(obj: Any, f, **kwargs) -> None:
+    """`torch.save` that unlinks an existing file first, see `_remove_before_save`."""
+    _remove_before_save(f)
+    torch.save(obj, f, **kwargs)
+
+
 def save(obj: Any, f, *, format="safetensors") -> None:
     """
     Saves an object containing tensors into a safetensors file.
@@ -40,7 +75,7 @@ def save(obj: Any, f, *, format="safetensors") -> None:
             The format to save the object. Currently `"safetensors"` and `"pt"` is supported.
     """
     if format == 'pt':
-        torch.save(obj, f)
+        torch_save(obj, f)
         return
 
     if format != 'safetensors':
@@ -72,6 +107,7 @@ def save(obj: Any, f, *, format="safetensors") -> None:
             return idx
         return o
     metadata = transform_recursively(obj, transform_fn, target_types=(torch.Tensor,))
+    _remove_before_save(f)
     save_file(tensors, f, metadata={
         'obj': base64.b64encode(pickle.dumps(metadata)).decode('utf-8'),
         'nnscaler': __version__
@@ -208,7 +244,7 @@ def load(f, *, device="cpu", format="safetensors", lazy=False) -> LazyLoader | A
             loaded into memory.
     """
     if format == 'pt':
-        return torch.load(f, map_location=device, weights_only=False)
+        return torch_load(f, map_location=device, weights_only=False)
     if format != 'safetensors':
         raise ValueError(f"Unsupported format: {format}")
 

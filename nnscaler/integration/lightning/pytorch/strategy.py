@@ -59,6 +59,7 @@ from lightning.pytorch.utilities.model_helpers import is_overridden
 from lightning.pytorch.utilities.rank_zero import WarningCache, rank_zero_info, rank_zero_warn
 from lightning.pytorch.utilities import GradClipAlgorithmType
 
+from nnscaler.runtime.serialization import torch_load, torch_save
 import nnscaler
 from nnscaler.integration.lightning.utils import inplace_optimizer_fn
 from nnscaler.runtime.device import DeviceGroup
@@ -499,7 +500,7 @@ class NnScalerStrategy(ParallelStrategy):
         if opt_state:
             checkpoint[self._opt_name_key] = [opt_state]
 
-        torch.save(checkpoint, path / f'{self.global_rank}.pt')
+        torch_save(checkpoint, path / f'{self.global_rank}.pt')
 
     @override
     def load_checkpoint(
@@ -517,9 +518,9 @@ class NnScalerStrategy(ParallelStrategy):
             raise FileNotFoundError(f"Checkpoint file {path} not found.")
 
         if path.is_dir():
-            state_dict: dict = torch.load(path / f'{self.global_rank}.pt', weights_only=False)
+            state_dict: dict = torch_load(path / f'{self.global_rank}.pt', weights_only=False)
         else:
-            state_dict: dict = torch.load(path, weights_only=False)
+            state_dict: dict = torch_load(path, weights_only=False)
         nnscaler_extra_state = state_dict.pop(self._nnscaler_extra_state_key)
         # load the extra states of the pl module
         self._lightning_module.load_state_dict(nnscaler_extra_state[self._pl_module_name_key], strict=False)
@@ -554,7 +555,7 @@ class NnScalerStrategy(ParallelStrategy):
             checkpoint_files: The list of checkpoint files to merge.
             output_file: The output file path.
         """
-        state_dicts = [torch.load(f, map_location='cpu', weights_only=False) for f in checkpoint_files]
+        state_dicts = [torch_load(f, map_location='cpu', weights_only=False) for f in checkpoint_files]
 
         module_state_dicts = [s[cls._module_name_key] for s in state_dicts]
         opt_state_dicts = None
@@ -571,7 +572,7 @@ class NnScalerStrategy(ParallelStrategy):
         merged_state_dict[cls._opt_name_key] = [merged_opt_state_dict]
         merged_state_dict[cls._nnscaler_extra_state_key][cls._state_dict_type_key] = 'merged'
 
-        torch.save(merged_state_dict, output_file)
+        torch_save(merged_state_dict, output_file)
 
     @classmethod
     @override
