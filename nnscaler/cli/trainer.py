@@ -664,14 +664,12 @@ class Trainer:
                 if len(rank_ckpt_files) != self.world_size:
                     logger.warning(f"World size changed from {len(rank_ckpt_files)} to {self.world_size}.")
                 else:
+                    # `_align_rank_file` checks everything that makes the file loadable (parallel
+                    # layout, ZeRO buckets, parameter order); other compute_config changes are fine.
                     state_dict = self.checkpointer.load_for_rank(resume_from, self.rank)
-                    if state_dict['train_args']['compute_config'] != asdict(self.train_args.compute_config):
-                        logger.warning("compute_config changed.")
+                    state_dict['model'] = self._align_rank_file(state_dict['model'])
+                    if state_dict['model'] is None:
                         state_dict = None
-                    else:
-                        state_dict['model'] = self._align_rank_file(state_dict['model'])
-                        if state_dict['model'] is None:
-                            state_dict = None
                 # A layout change may affect only some ranks (e.g. one pipeline stage), but the
                 # sharded loaders synchronize all ranks, so every rank must take the same path.
                 reshard = [None] * self.world_size

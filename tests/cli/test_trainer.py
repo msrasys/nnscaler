@@ -1284,8 +1284,8 @@ def trainer_resumable_dataloader(save_dir):
         if trainer.rank == 0:
             assert 'Broadcasting merged checkpoint to node leaders.' in log.getvalue()
 
-    # resume from sharded files with a changed compute_config:
-    # each rank assembles its own shard from all rank files
+    # resume from sharded files with a changed compute_config that leaves the layout intact:
+    # each rank still loads its own file directly
     ckpt7_savedir = save_dir / 'ckpt7'
     with catch_log(logger) as log:
         trainer = Trainer([
@@ -1302,7 +1302,7 @@ def trainer_resumable_dataloader(save_dir):
         ])
         trainer.run()
         assert trainer.dataloader_resumed
-        assert 'each rank assembles its own shard' in log.getvalue()
+        assert 'each rank assembles its own shard' not in log.getvalue()
         assert 'Broadcasting' not in log.getvalue()
 
     # resume from sharded files with the same compute_config but a different parameter

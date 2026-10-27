@@ -801,8 +801,9 @@ Where `ResumeOptions` and `SerializerOptions` are:
   - `with_merged` (`Optional[bool]`): Whether to merge the checkpoint
     files when loading. `True` merges all rank files into a full state
     dict and then trims and broadcasts it. `False` or `None` lets each
-    rank load its own file; when the world size or the compute config
-    changed, every rank instead reads all rank files and assembles only
+    rank load its own file; when the world size changed or the file's
+    parallel layout no longer matches the model, every rank instead reads
+    all rank files and assembles only
     its own shard, without merging or broadcasting (`save_memory` and
     `slow_fs` do not apply then). Only used when `checkpoint` is a directory.
   - `save_memory` (`bool`): If the memory is limited, only load merged

@@ -495,9 +495,10 @@ class ResumeOptions:
     # Only used when `checkpoint` is a directory.
     # `True`: merge all rank files into a full state dict, then trim and broadcast it.
     # `False` / `None`: each rank loads its own file. When that is impossible because the
-    #    world size or the compute config changed, every rank reads all rank files and
-    #    assembles only its own shard (`nnscaler.load_from_rank_state_dicts`), without
-    #    merging or broadcasting; `save_memory` and `slow_fs` do not apply then.
+    #    world size changed or the file's parallel layout no longer matches the model, every
+    #    rank reads all rank files and assembles only its own shard
+    #    (`nnscaler.load_from_rank_state_dicts`), without merging or broadcasting;
+    #    `save_memory` and `slow_fs` do not apply then.
     with_merged: Optional[bool] = None
     # If the memory is limited, we can save memory by only loading merged state dict in GPU 0 of each node
     # and broadcast trimmed state dict to other ranks in the same node
