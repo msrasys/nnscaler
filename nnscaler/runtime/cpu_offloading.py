@@ -419,6 +419,10 @@ class _OffloadGroup:
         return any((record := ref()) is not None and record.d2h_event is not None
                    for ref in self.records)
 
+    def has_pending_loads(self):
+        return any((record := ref()) is not None and record.d2h_event is not None
+                   and record.device_tensor is None for ref in self.records)
+
     def prefetch(self, *, from_schedule=False):
         for ref in reversed(self.records):
             if (record := ref()) is not None:
@@ -431,7 +435,7 @@ class _OffloadGroup:
         group = self.previous
         remaining = self.scope.manager.config.prefetch_groups
         while group is not None and remaining:
-            if group.has_offloaded_records():
+            if group.has_pending_loads():
                 group.prefetch()
                 remaining -= 1
             group = group.previous
@@ -497,7 +501,7 @@ class _ForwardScope:
         for group in reversed(self.groups):
             if not remaining:
                 break
-            if group.has_offloaded_records():
+            if group.has_pending_loads():
                 group.prefetch(from_schedule=True)
                 remaining -= 1
 

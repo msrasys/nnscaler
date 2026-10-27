@@ -180,6 +180,32 @@ def test_scope_prefetch_depth_obeys_shared_byte_window(count, budget, loaded):
 
 
 @cuda
+@pytest.mark.parametrize('entry', ['scope', 'group'])
+def test_prefetch_depth_skips_groups_whose_shared_storage_is_already_loaded(entry):
+    module = OffloadModule(scope_prefetch_groups=2, prefetch_groups=1)
+    a = torch.randn(64,64,device='cuda',requires_grad=True) + 1
+    b = torch.randn(64,64,device='cuda',requires_grad=True) + 1
+    ys = []
+    with module.activation_offload_scope(('shared',0)):
+        for value in (a,b,b,b):
+            with module.cpu_offloading_hooks() as group:
+                y = value.sin()
+            group.watch(y)
+            ys.append(y)
+    del a,b,value
+    scope = module._get_activation_offload_manager().scopes[('shared',0)]
+    if entry == 'scope':
+        module.prefetch_activation(('shared',0))
+    else:
+        scope.groups[-1].backward_entry()
+    assert scope.groups[0].records[0]().device_tensor is not None
+    assert scope.groups[1].records[0]().device_tensor is not None
+    sum(y.sum() for y in ys).backward()
+    module.finish_activation_offload(('shared',0))
+    assert module.activation_offload_stats()['live_cpu_bytes'] == 0
+
+
+@cuda
 @pytest.mark.parametrize('recompute', [False, True])
 def test_parity_and_checkpoint_boundary_only(recompute):
     module = OffloadModule()

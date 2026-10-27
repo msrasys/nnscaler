@@ -63,6 +63,8 @@ resident. Scopes without schedule distance metadata retain ordinary offloading.
 `scope_prefetch_groups` (default 1) controls how many backward-entry groups the
 schedule preloads. `prefetch_groups` controls lookahead inside backward; setting
 it to 0 still disables all speculative loading. Both use the same byte budget.
+Groups whose shared storages are already restored do not consume lookahead
+depth, so repeated checkpoint boundaries cannot hide the next pending transfer.
 
 Reload buffers are allocated on the current compute stream by default, so they
 can reuse its allocator arena. The H2D stream joins the already-enqueued compute
