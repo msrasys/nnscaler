@@ -1,7 +1,6 @@
 #  Copyright (c) Microsoft Corporation.
 #  Licensed under the MIT License.
 
-import copy
 import math
 from dataclasses import dataclass
 from collections import defaultdict
@@ -366,6 +365,23 @@ class _ModuleStateReader:
         return _gather_region(target, [source.shard(key) for source in sources], flat)
 
 
+def _non_parallel_optimizer_state(state: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    A non-parallel parameter's optimizer state, taken from the checkpoint by reference like
+    merge_state_dicts does.
+
+    `optimizer.load_state_dict` moves state tensors to the parameter's device, which copies them
+    for GPU training, but keeps `step` on CPU as it is. Without a clone the optimizer would then
+    share `step` with the checkpoint dict and its in-place `step += 1` would modify the caller's
+    input. The other tensors are not cloned: they only alias the input for CPU training, which is
+    not supported, and cloning them here would copy every state on each read.
+    """
+    return {
+        key: value.clone() if key == 'step' and isinstance(value, torch.Tensor) else value
+        for key, value in state.items()
+    }
+
+
 def _track_id(slicers: Tuple[slice, ...]) -> Tuple[Tuple[Any, Any, Any], ...]:
     # slice objects are not hashable before Python 3.12
     return tuple((s.start, s.step, s.stop) for s in slicers)
@@ -413,12 +429,12 @@ def load_from_rank_state_dicts(
         raise ValueError("module_state_dicts should not be empty.")
     target_opt_extra: Optional[OptimizerExtraState] = getattr(optimizer, '_extra_state', None)
     if optimizer_state_dicts is not None:
+        if optimizer is None:
+            raise ValueError("The target optimizer must be provided.")
         if target_opt_extra is None:
             raise ValueError("The target optimizer must be created by build_optimizer.")
         if not _is_supported_optimizer(target_opt_extra.name):
             raise ValueError("Only Adam-like or Muon-like optimizers are supported.")
-        if not optimizer:
-            raise ValueError("The target optimizer must be provided.")
         if type(optimizer).__name__ != target_opt_extra.name:
             raise ValueError(f"The target optimizer must be of type {target_opt_extra.name}.")
 
@@ -461,7 +477,7 @@ def load_from_rank_state_dicts(
                 raise ValueError("Cannot match non-parallel optimizer parameters to the target model.")
             for name, index in zip(non_parallel_names, source_indices):
                 if optimizer_state_dicts[0]['state'].get(index):
-                    optimizer_getters[name] = partial(copy.deepcopy, optimizer_state_dicts[0]['state'][index])
+                    optimizer_getters[name] = partial(_non_parallel_optimizer_state, optimizer_state_dicts[0]['state'][index])
 
     # parallel modules
     for module_path, extras in extra_states.items():
