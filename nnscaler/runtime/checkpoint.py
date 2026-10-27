@@ -317,8 +317,6 @@ def load_from_rank_state_dicts(
             raise ValueError("The target optimizer must be provided.")
         if type(optimizer).__name__ != target_opt_extra.name:
             raise ValueError(f"The target optimizer must be of type {target_opt_extra.name}.")
-        if len(optimizer.param_groups) != 1:
-            raise ValueError("Only a single optimizer parameter group is supported.")
 
     module_state_dicts = _sort_state_dicts(module_state_dicts)
     extra_states, model_states, non_parallel_states = _get_parallel_module_state_dict_info(module_state_dicts)
@@ -326,6 +324,9 @@ def load_from_rank_state_dicts(
     if optimizer_state_dicts is not None:
         optimizer_state_dicts = _sort_state_dicts(optimizer_state_dicts)
         opt_extra_states, opt_states, opt_metadata = _get_optimizer_state_dict_info(optimizer_state_dicts)
+        # HybridOptimizer packs its children into one group in the state dict, as merge_state_dicts expects.
+        if len(opt_metadata['param_groups']) != 1:
+            raise ValueError("Only a single optimizer parameter group is supported.")
 
     # non-parallel modules
     model_getters = {
@@ -412,16 +413,28 @@ def load_from_rank_state_dicts(
         states = _construct_optim_state(child, orig_states)
         local_optimizer_state.update({loc.offset + index: state for index, state in states.items()})
 
-    # Remaining indices are non-parallel parameters outside ZeRO buckets. Check the index first:
-    # flat bucket parameters inside `parallel_indices` are not in `module.named_parameters()`.
-    param_names = {param: name for name, param in module.named_parameters()}
-    for index, param in enumerate(optimizer.param_groups[0]['params']):
-        if index not in parallel_indices and param_names[param] in optimizer_getters:
+    # The remaining indices belong to the trainable non-parallel parameters outside ZeRO buckets,
+    # which build_optimizer hands to the optimizer in registration order. Derive them from the
+    # module rather than `optimizer.param_groups`, whose entries may be wrapped (e.g. the FP32
+    # copies of MixedPrecisionAdam or the concatenated child groups of HybridOptimizer).
+    parallel_params = {
+        id(param) for child in module.modules() if isinstance(child, ParallelModule) for param in child.parameters()
+    }
+    non_parallel = [
+        (name, param) for name, param in module.named_parameters()
+        if param.requires_grad and id(param) not in parallel_params
+    ] if _NON_PARALLEL_MODULE_ATTR_NAME not in target_opt_extra.parallel_module_locs else []
+    total = len(parallel_indices) + len(non_parallel)
+    non_parallel_indices = [index for index in range(total) if index not in parallel_indices]
+    if len(non_parallel_indices) != len(non_parallel):  # locs reach beyond the parameters handed to the optimizer
+        raise ValueError("The optimizer's parameter layout does not match the module.")
+    for index, (name, param) in zip(non_parallel_indices, non_parallel):
+        if name in optimizer_getters:
             whole = tuple(slice(0, n) for n in param.shape)
             local_optimizer_state[index] = {
                 key: value[whole] if isinstance(value, _LazyRegion) else value
-                for key, value in optimizer_getters[param_names[param]]().items()
+                for key, value in optimizer_getters[name]().items()
             }
     opt_metadata['state'] = local_optimizer_state
-    opt_metadata['param_groups'][0]['params'] = list(range(len(optimizer.param_groups[0]['params'])))
+    opt_metadata['param_groups'][0]['params'] = list(range(total))
     optimizer.load_state_dict(opt_metadata)

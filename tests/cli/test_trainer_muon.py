@@ -7,6 +7,8 @@ import pytest
 
 from nnscaler.cli.trainer import Trainer
 from tests.launch_torchrun import launch_torchrun
+from nnscaler.cli.trainer import logger
+from tests.utils import catch_log
 from tests.parallel_module.common import assert_close, assert_equal
 
 available_optimizers = []
@@ -269,6 +271,86 @@ def test_trainer_muon_resume_correctness_zero_ngroups_hybrid_param_config(tmp_pa
     atol = 1e-6 # if name == 'dion' else 5e-3
     assert_close(zero0_ckpt['model'], zero1_ckpt['model'], atol=atol)
     assert_close(zero0_ckpt['optimizer']['state'], zero1_ckpt['optimizer']['state'], atol=atol)
+
+
+def trainer_hybrid_reshard_worker(save_dir, config_file, additional_options, targets):
+    """
+    Save a checkpoint with the config file's layout, then resume it into each target layout
+    twice: resharding the rank files directly (`with_merged=False` falls back to
+    `load_from_rank_state_dicts` because the compute config changed) and merging them first.
+    Both resumed runs must end with identical model and optimizer states.
+    """
+    save_dir = Path(save_dir)
+    config_path = Path(__file__).with_name(config_file).resolve()
+    source_dir = save_dir / 'source'
+    trainer = Trainer([
+        '-f', config_path,
+        '--max_epochs', '1',
+        '--gen_savedir', str(source_dir / 'gen'),
+        '--checkpoint.save_dir', str(source_dir / 'ckpt'),
+        *additional_options,
+    ])
+    trainer.run()
+    torch.distributed.barrier()
+
+    for target, options in targets.items():
+        results = {}
+        for mode, with_merged in (('reshard', 'false'), ('merged', 'true')):
+            work_dir = save_dir / target / mode
+            with catch_log(logger) as log:
+                trainer = Trainer([
+                    '-f', config_path,
+                    '--max_epochs', '2',
+                    # a new instance name gives the generated module a new Python module name,
+                    # otherwise the already imported source module would be reused in this process
+                    '--instance_name', target,
+                    '--gen_savedir', str(save_dir / target / 'gen'),
+                    '--checkpoint.save_dir', str(work_dir),
+                    '--checkpoint.resume_from.checkpoint', str(source_dir / 'ckpt' / 'last'),
+                    '--checkpoint.resume_from.with_merged', with_merged,
+                    *additional_options,
+                    *options,
+                ])
+                trainer.run()
+            assert ('each rank assembles its own shard' in log.getvalue()) == (mode == 'reshard')
+            torch.distributed.barrier()
+            results[mode] = torch.load(work_dir / 'last' / f'{trainer.rank}.ckpt', weights_only=False)
+        for key in ('model', 'optimizer'):
+            assert_equal(results['reshard'][key], results['merged'][key])
+
+
+@pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.device_count() < 2, reason='lack of gpu devices')
+@pytest.mark.parametrize('name', available_optimizers)
+def test_trainer_hybrid_reshard(tmp_path, name):
+    # HybridOptimizer with a MixedPrecisionAdamW child and a Muon child, resumed from a
+    # data-parallel checkpoint into a batch-partitioned plan and into ZeRO-1 buckets.
+    # Muon forbids partitioning its weights on the last two dims, so no weight TP here.
+    config_file = 'trainer_args_muon_hybrid.yaml'
+    launch_torchrun(2, trainer_hybrid_reshard_worker, tmp_path, config_file, [
+        '--optimizer.args.config.optimizers.1.type', get_optimizer_type(name),
+    ], {
+        'data': ['--compute_config.plan_ngpus', '2', '--pas_policy', 'data'],
+        'zero1': ['--compute_config.use_zero', '1', '--compute_config.zero_param_level_sharding', 'True'],
+        'adam_tp': ['--compute_config.plan_ngpus', '2', '--pas_policy', 'tests.cli.test_trainer_muon.adam_tp_policy'],
+        'adam_tp_zero1': [
+            '--compute_config.plan_ngpus', '2', '--pas_policy', 'tests.cli.test_trainer_muon.adam_tp_policy',
+            '--compute_config.use_zero', '1', '--compute_config.zero_param_level_sharding', 'True',
+        ],
+    })
+
+
+def adam_tp_policy(graph, cfg):
+    """
+    Partition only the linear weights that `param_clss_fn` assigns to MixedPrecisionAdamW along
+    their output dimension; the weights handled by Muon stay replicated, as Muon forbids
+    partitioning them on the last two dimensions.
+    """
+    from nnscaler.policies import get_pas_ops, OpPlan, OpPartition
+    for node in get_pas_ops(graph):
+        if node.fn == torch.nn.functional.linear and param_clss_fn(node.input(1).name)[0] == 0:
+            yield OpPlan(node, partition=OpPartition(input=1, dim=0))
+        else:
+            yield OpPlan(node)
 
 
 def param_clss_fn(param_name: str) -> tuple[int, int]:
