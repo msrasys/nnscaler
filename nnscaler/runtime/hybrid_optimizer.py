@@ -108,7 +108,9 @@ class ScaleDelayedOptimizerMixin(TrainHook):
         Performs a single optimization step.
         """
         # apply the accumulated multiply factor to grads
-        if self._multiply_factor != 1.0:
+        # A clipping coefficient can live on CUDA. Keep the scalar on device
+        # instead of synchronizing the host just to skip multiplication by one.
+        if isinstance(self._multiply_factor, torch.Tensor) or self._multiply_factor != 1.0:
             for pg_idx in range(len(self.param_groups)):
                 for p in self.param_groups[pg_idx]['params']:
                     if p.grad is not None:

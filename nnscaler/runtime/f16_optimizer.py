@@ -139,6 +139,10 @@ class MixedPrecisionF16OptimizerMixin(ScaleDelayedOptimizerMixin):
 
     def _sync_f16_grads_to_fp32(self):
         # copy FP16 grads to FP32
+        # Clipping produces a device scalar. Testing its value in Python would
+        # synchronize once per parameter; multiplication by one is harmless.
+        multiply_factor = self._multiply_factor
+        needs_scale = isinstance(multiply_factor, torch.Tensor) or multiply_factor != 1.0
         for p, p32 in zip(self.f16_params, self.fp32_params):
             if not p.requires_grad:
                 continue
@@ -149,8 +153,8 @@ class MixedPrecisionF16OptimizerMixin(ScaleDelayedOptimizerMixin):
                     p32.grad.data.copy_(p.grad.data)
             else:
                 p32.grad = torch.zeros_like(p.data, dtype=torch.float)
-            if self._multiply_factor != 1.0:
-                p32.grad.mul_(self._multiply_factor)
+            if needs_scale:
+                p32.grad.mul_(multiply_factor)
         self._multiply_factor = 1.0
 
     def _sync_fp32_params_to_f16(self):
