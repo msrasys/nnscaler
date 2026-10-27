@@ -1614,8 +1614,8 @@ class ParallelModule(CubeModule):
             self._activation_offload_manager = manager
         return manager
 
-    def activation_offload_scope(self, key=None, *, immediate_backward=False):
-        return self._get_activation_offload_manager().scope(key, immediate_backward)
+    def activation_offload_scope(self, key=None, *, immediate_backward=False, backward_distance=None):
+        return self._get_activation_offload_manager().scope(key, immediate_backward, backward_distance)
 
     def prefetch_activation(self, key):
         self._get_activation_offload_manager().prefetch(key)

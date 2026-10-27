@@ -28,8 +28,11 @@ class CPUOffloadConfig:
     max_inflight_bytes: int = 512 * 1024**2
     max_prefetch_bytes: int = 512 * 1024**2
     prefetch_groups: int = 1
+    scope_prefetch_groups: int = 1
     reload_on_compute_stream: bool = True
     skip_retained_inputs: bool = True
+    pool_slab_bytes: int = 0
+    min_offload_gap: int = 0
     # Leave headroom for the dataloader, optimizer, compilation and other ranks.
     host_reserve_bytes: int = 32 * 1024**3
 
@@ -180,10 +183,16 @@ def _shared_pool(config):
     with _pools_lock:
         pool = _pools.get(os.getpid())
         if pool is None:
-            pool = _OffloadPool(config)
+            if config.pool_slab_bytes:
+                from nnscaler.runtime.activation_pool import SlabOffloadPool
+                pool = SlabOffloadPool(config)
+            else:
+                pool = _OffloadPool(config)
             _pools[os.getpid()] = pool
         elif pool.config.max_cpu_bytes != config.max_cpu_bytes:
             raise ValueError('All CPU-offloading modules in a process must use the same max_cpu_bytes')
+        elif pool.config.pool_slab_bytes != config.pool_slab_bytes:
+            raise ValueError('All CPU-offloading modules in a process must use the same pool_slab_bytes')
         return pool
 
 
@@ -228,7 +237,8 @@ def _version_tracker(tensor):
 
 
 class _StorageRecord:
-    def __init__(self, tensor, manager, host):
+    def __init__(self, tensor, manager, host=None):
+        self.live_saves = 0
         self.manager, self.pool = manager, manager.pool
         self.device = tensor.device
         self.producer_stream = torch.cuda.current_stream(tensor.device)
@@ -248,10 +258,21 @@ class _StorageRecord:
         if self.version_tracker._version != self.version:
             raise RuntimeError('An activation saved for backward was modified by an inplace operation')
 
+    def prepare_offload(self):
+        with self.lock:
+            if self.d2h_event is not None:
+                return False
+            self.check_version()
+            if self.host is None:
+                self.host = self.pool.acquire(self.size)
+            return self.host is not None
+
     def offload(self):
         with self.lock:
             if self.d2h_event is not None:
-                return
+                return False
+            if self.host is None and not self.prepare_offload():
+                return False
             self.check_version()
             manager = self.manager
             stream = manager.d2h_stream
@@ -265,6 +286,7 @@ class _StorageRecord:
             self.pool.stats['d2h_bytes'] += self.size
             self.pool.stats['offloaded_storages'] += 1
             self.source = None
+            return True
 
     def prefetch(self, *, demanded=False, from_schedule=False):
         with self.lock:
@@ -343,6 +365,7 @@ class _StorageRecord:
 class _SavedTensor:
     def __init__(self, tensor, record):
         self.record = record
+        record.live_saves += 1
         self.shape, self.stride = tensor.shape, tensor.stride()
         self.offset, self.dtype = tensor.storage_offset(), tensor.dtype
         self.version_tracker, self.version = _version_tracker(tensor), tensor._version
@@ -351,6 +374,9 @@ class _SavedTensor:
         if self.version_tracker._version != self.version:
             raise RuntimeError('An activation saved for backward was modified by an inplace operation')
         return self.record.unpack(self)
+
+    def __del__(self):
+        self.record.live_saves -= 1
 
 
 class _OffloadGroup:
@@ -365,13 +391,25 @@ class _OffloadGroup:
         # Admit before a region starts, then enqueue its whole batch without
         # host waits between copies. Wait once for each producing stream.
         manager = self.scope.manager
+        pending = []
+        for record in self.pending:
+            if record.live_saves:
+                pending.append(record)
+            else:
+                # A checkpoint with no saved intermediates can discard its
+                # input saver before leaving the region. No backward will ask
+                # for this record, so its staging reference must not cause DMA.
+                manager.pool.stats['discarded_save_bytes'] += record.size
+                manager.pool.stats['discarded_save_storages'] += 1
+        # Finish host allocation before starting the batch of DMA submissions.
+        # Cold pinned allocations must not create gaps between its copies.
+        pending = [record for record in pending if record.prepare_offload()]
         producers = {record.producer_stream.cuda_stream: record.producer_stream
-                     for record in self.pending}
+                     for record in pending}
         for stream in producers.values():
             manager.d2h_stream.wait_stream(stream)
-        for record in self.pending:
-            record.offload()
-        if self.pending:
+        copied = sum(bool(record.offload()) for record in pending)
+        if copied:
             manager.pool.stats['d2h_committed_groups'] += 1
             manager.pool.stats['peak_queued_d2h_bytes'] = max(
                 manager.pool.stats['peak_queued_d2h_bytes'], manager.inflight_bytes)
@@ -443,9 +481,11 @@ def mark_retained_scope_tensors(values):
 
 
 class _ForwardScope:
-    def __init__(self, manager, immediate_backward=False):
+    def __init__(self, manager, immediate_backward=False, backward_distance=None):
         self.manager = manager
         self.immediate_backward = immediate_backward
+        self.keep_resident = (backward_distance is not None
+                              and backward_distance < manager.config.min_offload_gap)
         self.groups = []
         self.retained_storages = set()
         self.retained_saved = set()
@@ -453,10 +493,13 @@ class _ForwardScope:
     def prefetch(self):
         # Shape-only ops, filtered tensors and checkpoint tails can create
         # empty regions. They must not hide the actual backward entry group.
+        remaining = self.manager.config.scope_prefetch_groups
         for group in reversed(self.groups):
+            if not remaining:
+                break
             if group.has_offloaded_records():
                 group.prefetch(from_schedule=True)
-                break
+                remaining -= 1
 
 
 class ActivationOffloadManager:
@@ -485,12 +528,12 @@ class ActivationOffloadManager:
             self.pool.stats['d2h_throttles'] += 1
 
     @contextmanager
-    def scope(self, key=None, immediate_backward=False):
+    def scope(self, key=None, immediate_backward=False, backward_distance=None):
         current = _scope.get()
         if key is None and current is not None and current.manager is self:
             yield current
             return
-        scope = _ForwardScope(self, immediate_backward)
+        scope = _ForwardScope(self, immediate_backward, backward_distance)
         if key is not None:
             if key in self.scopes:
                 raise RuntimeError(f'Duplicate activation forward scope: {key}')
@@ -546,10 +589,9 @@ class ActivationOffloadManager:
         if record is not None and record.storage_ref() is storage:
             self.pool.stats['deduplicated_saves'] += 1
         else:
-            host = self.pool.acquire(size)
-            if host is None:
-                return _ResidentTensorRef(tensor)
-            record = _StorageRecord(tensor, self, host)
+            # Reserve pinned memory only when the completed group still has
+            # a backward consumer. Budget failures retain record.source on GPU.
+            record = _StorageRecord(tensor, self)
             self.records[key] = record
             group.pending.append(record)
         group.records.append(weakref.ref(record))
@@ -572,7 +614,8 @@ class CPUOffloadContext:
         self._scope_context = self.manager.scope()
         scope = self._scope_context.__enter__()
         try:
-            if torch.is_grad_enabled() and not (self.tail and scope.immediate_backward):
+            if (torch.is_grad_enabled() and not scope.keep_resident
+                    and not (self.tail and scope.immediate_backward)):
                 self.manager.throttle(0)
             self.group = _OffloadGroup(scope)
             self._hooks = saved_tensors_hooks(self._pack, self._unpack)
@@ -593,11 +636,13 @@ class CPUOffloadContext:
             self._scope_context.__exit__(exc_type, exc_value, traceback)
 
     def _pack(self, tensor):
-        if self.tail and self.group.scope.immediate_backward:
+        if self.group.scope.keep_resident or (self.tail and self.group.scope.immediate_backward):
             owner = self.manager.module().find_buffer_or_param_owner(tensor) if tensor.layout == torch.strided else None
             if owner is not None:
                 return _ModuleTensorRef(owner, tensor)
-            self.manager.pool.stats['immediate_backward_resident_bytes'] += tensor.numel() * tensor.element_size()
+            label = ('short_scope_resident_bytes' if self.group.scope.keep_resident
+                     else 'immediate_backward_resident_bytes')
+            self.manager.pool.stats[label] += tensor.numel() * tensor.element_size()
             return _ResidentTensorRef(tensor)
         return self.manager.pack(tensor, self.group)
 
@@ -613,4 +658,5 @@ class CPUOffloadContext:
         return value
 
     def watch(self, outputs):
-        self.group.watch(outputs)
+        if not self.group.scope.keep_resident:
+            self.group.watch(outputs)

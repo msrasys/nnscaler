@@ -237,6 +237,13 @@ class ScheduleCodeGen(FuncEmission):
                 compute_nodes = [n for n in device_nodes if isinstance(
                     n.cell if isinstance(n, ExeReuseCell) else n, IRSegment)]
                 next_compute = {id(a): b for a, b in zip(compute_nodes, compute_nodes[1:])}
+                backward_positions = {self._activation_scope_key(n): i
+                                      for i, n in enumerate(compute_nodes) if not n.isfw()}
+                self._activation_backward_distances = {
+                    id(n): backward_positions[self._activation_scope_key(n)] - i
+                    for i, n in enumerate(compute_nodes)
+                    if n.isfw() and self._activation_scope_key(n) in backward_positions
+                }
                 self._immediate_backward_forwards = {
                     id(a) for a, b in zip(compute_nodes, compute_nodes[1:])
                     if a.isfw() and not b.isfw()
@@ -941,7 +948,8 @@ class ScheduleCodeGen(FuncEmission):
                 key = self._activation_scope_key(node)
                 if node.isfw():
                     immediate = id(node) in getattr(self, '_immediate_backward_forwards', set())
-                    with Block(f'with model.activation_offload_scope({key!r}, immediate_backward={immediate!r}):') as scope_block:
+                    distance = getattr(self, '_activation_backward_distances', {}).get(id(node))
+                    with Block(f'with model.activation_offload_scope({key!r}, immediate_backward={immediate!r}, backward_distance={distance!r}):') as scope_block:
                         scope_block.insert_body(codes)
                     codes = scope_block.code
                 else:

@@ -49,6 +49,55 @@ cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason='CUDA required')
 
 
 @cuda
+def test_pinned_slab_budget_pending_events_and_coalescing():
+    mib = 1024**2
+    module = OffloadModule(max_cpu_bytes=8*mib, pool_slab_bytes=8*mib)
+    pool = module._get_activation_offload_manager().pool
+    a, b, c = (pool.acquire(n*mib) for n in (3, 3, 1))
+    assert all(x is not None for x in (a,b,c))
+    b.fill_(2);c.fill_(3)
+    pointer = a.data_ptr()
+    ready = [False]
+    event = SimpleNamespace(query=lambda: ready[0])
+    pool.release(a, event)
+    assert pool.acquire(2*mib) is None  # in-flight slot cannot be overwritten
+    ready[0] = True
+    restored = pool.acquire(3*mib)
+    assert restored.data_ptr() == pointer
+    restored.fill_(9)
+    assert (b == 2).all() and (c == 3).all()
+    for buffer in (restored,b,c):pool.release(buffer, None)
+    stats = pool.snapshot()
+    assert stats['live_cpu_bytes'] == stats['live_pinned_bytes'] == 0
+    assert stats['allocated_pinned_bytes'] == stats['free_slab_bytes'] == 8*mib
+    whole = pool.acquire(8*mib)
+    assert whole is not None and pool.snapshot()['pool_slabs'] == 1
+    pool.release(whole, None)
+
+
+@cuda
+def test_slab_backed_activation_restoration_is_exact():
+    mib = 1024**2
+    module = OffloadModule(max_cpu_bytes=8*mib, pool_slab_bytes=8*mib)
+    x = torch.randn(768,1024,device='cuda',requires_grad=True)
+    z = torch.randn(256,1024,device='cuda',requires_grad=True)
+    fn = lambda: x.sin().cos().sum() + z.sin().sum()
+    reference = torch.autograd.grad(fn(), (x,z))
+    with module.activation_offload_scope('slab'):
+        with module.cpu_offloading_hooks() as group:
+            y = fn()
+        group.watch(y)
+    module.prefetch_activation('slab')
+    actual = torch.autograd.grad(y, (x,z))
+    module.finish_activation_offload('slab')
+    for a,b in zip(actual,reference):torch.testing.assert_close(a,b,atol=0,rtol=0)
+    stats = module.activation_offload_stats()
+    assert stats['budget_fallback_bytes'] == stats['live_cpu_bytes'] == 0
+    assert stats['d2h_bytes'] == 7*mib
+    assert stats['allocated_pinned_bytes'] == 8*mib
+
+
+@cuda
 @pytest.mark.parametrize('skip', [False, True])
 def test_executor_retained_inputs_skip_only_unreclaimable_storage(skip):
     from nnscaler.runtime.executor import Executor
@@ -73,6 +122,61 @@ def test_executor_retained_inputs_skip_only_unreclaimable_storage(skip):
     assert stats['live_cpu_bytes'] == 0
     assert stats.get('retained_input_bytes', 0) == (x.numel() * x.element_size() if skip else 0)
     assert not module._get_activation_offload_manager().scopes
+
+
+@cuda
+@pytest.mark.parametrize('distance,offloads', [(None, 2), (1, 0), (3, 2)])
+def test_short_scope_policy_uses_scheduled_distance(distance, offloads):
+    module = OffloadModule(min_offload_gap=2)
+    x = torch.randn(64,64,device='cuda',requires_grad=True)
+    expected, = torch.autograd.grad(x.sin().cos().sum(),x)
+    with module.activation_offload_scope('gap', backward_distance=distance):
+        with module.cpu_offloading_hooks() as group:
+            y = x.sin().cos()
+        group.watch(y)
+    module.prefetch_activation('gap')
+    actual, = torch.autograd.grad(y.sum(),x)
+    module.finish_activation_offload('gap')
+    torch.testing.assert_close(actual,expected,atol=0,rtol=0)
+    stats=module.activation_offload_stats()
+    assert stats['offloaded_storages'] == offloads
+    assert stats['live_cpu_bytes'] == 0
+
+
+@cuda
+def test_checkpoint_without_saved_intermediates_does_not_copy_dead_input():
+    module = OffloadModule()
+    x = torch.randn(64,64,device='cuda',requires_grad=True)
+    with module.activation_offload_scope('no-replay'):
+        with module.cpu_offloading_hooks() as group:
+            y = checkpoint(lambda value: value + 1, x, use_reentrant=False)
+        group.watch(y)
+    actual, = torch.autograd.grad(y.sum(),x)
+    module.finish_activation_offload('no-replay')
+    torch.testing.assert_close(actual,torch.ones_like(x),atol=0,rtol=0)
+    stats = module.activation_offload_stats()
+    assert stats['d2h_bytes'] == 0
+    assert stats['live_cpu_bytes'] == 0
+    assert stats['allocated_pinned_bytes'] == 0
+
+
+@cuda
+@pytest.mark.parametrize('count,budget,loaded', [(1, 65536, 1), (3, 65536, 3), (3, 16384, 1)])
+def test_scope_prefetch_depth_obeys_shared_byte_window(count, budget, loaded):
+    module = OffloadModule(scope_prefetch_groups=count, max_prefetch_bytes=budget)
+    ys = []
+    with module.activation_offload_scope(('depth',0)):
+        for _ in range(3):
+            with module.cpu_offloading_hooks() as group:
+                y = (torch.randn(64,64,device='cuda',requires_grad=True)+1).sin()
+            group.watch(y)
+            ys.append(y)
+    module.prefetch_activation(('depth',0))
+    scope = module._get_activation_offload_manager().scopes[('depth',0)]
+    assert sum(group.records[0]().device_tensor is not None for group in scope.groups) == loaded
+    sum(y.sum() for y in ys).backward()
+    module.finish_activation_offload(('depth',0))
+    assert module.activation_offload_stats()['live_cpu_bytes'] == 0
 
 
 @cuda

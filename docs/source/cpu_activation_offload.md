@@ -51,6 +51,19 @@ output or YOCO cache at restore time, it is reused without H2D or a second GPU
 allocation. This does **not** free external owners. The runtime never resizes
 live user storage or overwrites pipeline inputs to force a memory reduction.
 
+Executor-retained segment inputs are excluded per forward scope before any CPU
+allocation (`skip_retained_inputs=True`). Saves discarded before group commit,
+such as a checkpoint with no saved intermediates, also avoid allocation and DMA.
+Only live records reserve pinned buffers, before the group's copies are submitted.
+
+`min_offload_gap` optionally keeps an entire scope on GPU when fewer than this
+many local F/B actions separate its forward and backward. The default 0 preserves
+ordinary selection; 2 additionally keeps immediately-followed-backward scopes
+resident. Scopes without schedule distance metadata retain ordinary offloading.
+`scope_prefetch_groups` (default 1) controls how many backward-entry groups the
+schedule preloads. `prefetch_groups` controls lookahead inside backward; setting
+it to 0 still disables all speculative loading. Both use the same byte budget.
+
 Reload buffers are allocated on the current compute stream by default, so they
 can reuse its allocator arena. The H2D stream joins the already-enqueued compute
 prefix before writing into the allocation, then signals readiness to backward.
@@ -79,6 +92,16 @@ Reuse chooses the smallest available buffer large enough for a request. A
 buffer stays charged while idle; the pool does not evict old size classes to
 allocate new ones. Workloads with very variable shapes can therefore fall back
 to resident storage before all idle bytes are useful.
+
+An optional `pool_slab_bytes` enables event-safe suballocation from persistent
+power-of-two pinned slabs. Leases have exact logical lengths and 256-byte aligned
+slots; adjacent free slots coalesce after transfer events complete. The budget
+charges whole slabs, including free space. All modules in a process must agree
+on this setting. `live_pinned_bytes` then counts slabs with active leases once,
+while `live_cpu_bytes` counts their logical lease lengths. Slabs are opt-in:
+individual buffers can be more efficient when activation sizes already match
+allocator size classes. Inspect real pool capacity and process memory before
+choosing a slab size.
 
 When the budget or host headroom is insufficient, that tensor stays on GPU;
 there is no implicit recomputation. `/proc/meminfo` and visible cgroup v2 ancestor
