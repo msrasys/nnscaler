@@ -470,7 +470,10 @@ class Trainer:
         """
         suffix = ParallelModule.EXTRA_STATE_KEY
         saved = {key[:-len(suffix)] for key in module_state_dict if key.endswith(suffix)}
-        current = {f'{prefix}.' if prefix else '' for prefix, m in self.model.named_modules() if isinstance(m, ParallelModule)}
+        current = {
+            f'{prefix}.' if prefix else ''
+            for prefix, m in self.model.named_modules(remove_duplicate=False) if isinstance(m, ParallelModule)
+        }
         if saved != current:
             logger.warning(f"Parallel modules in the checkpoint {sorted(saved)} differ from the model's {sorted(current)}.")
             return None

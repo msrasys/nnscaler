@@ -37,6 +37,7 @@ class CheckpointModel(torch.nn.Module):
         self.first = torch.nn.Linear(4, 4)
         self.second = torch.nn.Linear(4, 4)
         self.second.weight = self.first.weight
+        self.alias = self.first  # the same submodule under a second name: state under both prefixes
         self.register_buffer('offset', torch.arange(4.))
         self.register_buffer('cache', torch.ones(4), persistent=False)
 

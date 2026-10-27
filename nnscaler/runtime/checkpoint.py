@@ -450,7 +450,8 @@ def load_from_rank_state_dicts(
     module.to(device)
     model_reader = _LazyStateDict(model_getters)
     local_model_state = {}
-    for prefix, child in module.named_modules():
+    # a submodule registered under several names needs state under every prefix
+    for prefix, child in module.named_modules(remove_duplicate=False):
         prefix = prefix + '.' if prefix else ''
         if isinstance(child, ParallelModule):
             local_model_state.update(child.trim_merged_state_dict(model_reader, prefix, device='cpu'))
