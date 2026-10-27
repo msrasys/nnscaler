@@ -106,6 +106,22 @@ them as `offload_*` training metrics.  `CPU_OFFLOADING_DEBUG=1` logs the
 shape, dtype and size of every tensor saved by the first execution of each
 offload group, which is the quickest way to see what a planning choice moves.
 
+## Host memory locality
+
+Pinned buffers are allocated on the NUMA node of the thread that first touches
+them.  When every GPU of a node streams through pinned memory that lives on the
+other socket, the copies share the inter-socket link: on a 4x A6000 host the
+per-GPU D2H rate fell from 26 GB/s (one GPU alone) to 8-12 GB/s with four GPUs
+copying concurrently, and whole-Block offload spent 8-9 s of copy-engine time
+per step on 61 GB.  With each process bound to the CPUs local to its GPU all
+four GPUs sustain 26 GB/s D2H and 25 GB/s H2D at the same time.  The manager
+therefore pins the calling thread to `/sys/bus/pci/devices/<gpu>/local_cpulist`
+when it is created (`CPU_OFFLOADING_NUMA_AFFINITY=0` disables this), which is
+the same measure Megatron's `set_ideal_affinity_for_current_gpu` takes.
+`offload_d2h_s` / `offload_h2d_s` (summed copy durations) and `offload_stall_s`
+(time the compute stream waited for a reload) tell whether copies are slow or
+merely late.
+
 ## Sizing against the link
 
 Measured on an 8x B200 node (PCIe Gen5): D2H 38.6 GB/s, H2D 55.6 GB/s,
