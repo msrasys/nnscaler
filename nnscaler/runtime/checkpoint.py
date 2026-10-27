@@ -53,6 +53,22 @@ class _Shard:
 
 
 @dataclass
+class _Entry:
+    """One local attribute of a rank's parallel module holding part of an original tensor."""
+    rank: int
+    # attribute name in the generated module
+    local_name: str
+    # index among the module's parameters, consistent with `ZeroMetadata.model_idx2opt_idx` keys;
+    # None for buffers
+    param_index: Optional[int]
+    meta: AttrMeta
+
+    def in_model_states(self, model_states: List[Dict[str, Any]]) -> bool:
+        """Whether the (possibly deduplicated) model states hold this attribute's tensor."""
+        return self.rank < len(model_states) and self.local_name in model_states[self.rank]
+
+
+@dataclass
 class _OptimizerSource:
     """
     An optimizer state holding part of a parameter, i.e. for each state key
@@ -172,6 +188,10 @@ class LazyTensor(Protocol):
     @property
     def dtype(self) -> torch.dtype: ...
 
+    @property
+    def shape(self) -> Tuple[int, ...]:
+        """Shape of the full tensor."""
+
     def slice_tensor(self, slicers: Tuple[slice, ...], flat: Optional[Tuple[int, int]] = None) -> torch.Tensor:
         """`full[slicers]`, or `full[slicers].reshape(-1)[flat[0]:flat[1]]` when `flat` is given."""
 
@@ -192,9 +212,15 @@ def slice_tensor(value: Union[torch.Tensor, LazyTensor], slicers: Tuple[slice, .
 class _LazyRegion:
     """A `LazyTensor` backed by a region reader of a checkpoint."""
 
-    def __init__(self, read_region: Callable[[Tuple[slice, ...], Optional[Tuple[int, int]]], torch.Tensor], dtype: torch.dtype):
+    def __init__(
+        self,
+        read_region: Callable[[Tuple[slice, ...], Optional[Tuple[int, int]]], torch.Tensor],
+        dtype: torch.dtype,
+        shape: Tuple[int, ...],
+    ):
         self.read_region = read_region
         self.dtype = dtype
+        self.shape = tuple(shape)
 
     def slice_tensor(self, slicers: Tuple[slice, ...], flat: Optional[Tuple[int, int]] = None) -> torch.Tensor:
         return self.read_region(slicers, flat)
@@ -215,14 +241,13 @@ class _ModuleStateReader:
         self.extra_states = extra_states
         self.model_states = model_states
         self.optimizer_states = optimizer_states
-        # Entries contain rank, local attribute name, model parameter index, and metadata.
-        # Note here param_index is consistent with `model_idx2opt_idx.keys()`
-        self.entries: Dict[str, List[Tuple[int, str, Optional[int], AttrMeta]]] = defaultdict(list)
+        # original name -> its local attributes on every rank
+        self.entries: Dict[str, List[_Entry]] = defaultdict(list)
         for rank, extra in enumerate(extra_states):
             param_index = 0
             for name, meta in extra.param_area_map.items():
                 self.entries[meta.orig_name].append(
-                    (rank, name, param_index if meta.is_param else None, meta)
+                    _Entry(rank, name, param_index if meta.is_param else None, meta)
                 )
                 param_index += int(meta.is_param)
 
@@ -231,8 +256,7 @@ class _ModuleStateReader:
         # but if there are shared parameter names, we map them to the canonical names
         self.model_names = {
             name: name for name, entries in self.entries.items()
-            if any(rank < len(model_states) and local_name in model_states[rank]
-                   for rank, local_name, _, _ in entries)
+            if any(entry.in_model_states(model_states) for entry in entries)
         }
         for names in extra_states[0].origin_shared_param_names:
             canonical = first_or(names, lambda name: name in self.model_names, default=None)
@@ -243,17 +267,17 @@ class _ModuleStateReader:
     def read_model(self, name: str) -> _LazyRegion:
         name = self.model_names[name]
         # `model_names` only lists names with at least one shard present, so this cannot fail
-        rank, local_name, _, _ = first(
-            self.entries[name],
-            lambda entry: entry[0] < len(self.model_states) and entry[1] in self.model_states[entry[0]],
-        )
-        return _LazyRegion(partial(self._read_model_region, name), self.model_states[rank][local_name].dtype)
+        entry = first(self.entries[name], lambda entry: entry.in_model_states(self.model_states))
+        return _LazyRegion(
+            partial(self._read_model_region, name),
+            self.model_states[entry.rank][entry.local_name].dtype, self.entries[name][0].meta.shape)
 
     def _read_model_region(self, name: str, target: Tuple[slice, ...], flat: Optional[Tuple[int, int]] = None) -> torch.Tensor:
         shards: Dict[Tuple, _Shard] = {}  # deduplicate replicas by (slicers, flat range)
-        for rank, local_name, _, meta in self.entries[name]:
-            if rank >= len(self.model_states) or local_name not in self.model_states[rank]:
+        for entry in self.entries[name]:
+            if not entry.in_model_states(self.model_states):
                 continue
+            rank, local_name, meta = entry.rank, entry.local_name, entry.meta
             if meta.val_chunks != 1:
                 raise NotImplementedError("Value-partitioned parameters are not supported.")
             data = self.model_states[rank][local_name]
@@ -265,7 +289,7 @@ class _ModuleStateReader:
         if not shards:
             raise ValueError(
                 f"No checkpoint shard found for {name}: entries "
-                f"{[(rank, local_name) for rank, local_name, _, _ in self.entries[name]]}, "
+                f"{[(entry.rank, entry.local_name) for entry in self.entries[name]]}, "
                 f"model states of {len(self.model_states)} ranks with keys "
                 f"{[sorted(state)[:6] for state in self.model_states]}")
         return _gather_region(target, list(shards.values()), flat)
@@ -275,7 +299,8 @@ class _ModuleStateReader:
         if self.optimizer_states is None:
             return []
         sources, seen = [], set()
-        for rank, _, index, meta in self.entries[name]:
+        for entry in self.entries[name]:
+            rank, index, meta = entry.rank, entry.param_index, entry.meta
             track = _track_id(meta.slicers)
             if index is None or rank >= len(self.optimizer_states) or track in seen:
                 continue
@@ -320,7 +345,12 @@ class _ModuleStateReader:
     def read_optimizer(self, name: str) -> Dict[str, Any]:
         sources = self._optimizer_sources(name)
         state = {
-            key: _LazyRegion(partial(self._read_optimizer_region, sources, key), sources[0].state[key].dtype)
+            key: _LazyRegion(
+                partial(
+                    self._read_optimizer_region, sources, key),
+                    sources[0].state[key].dtype,
+                    self.entries[name][0].meta.shape
+                )
             for key in sources[0].state if key != 'step'
         }
         if 'step' in sources[0].state:
@@ -459,11 +489,13 @@ def load_from_rank_state_dicts(
         else:
             own_state = {}
             child._save_to_state_dict(own_state, prefix, False)
-            for name, tensor in own_state.items():
+            for name, _ in own_state.items():
                 if name in model_reader:
                     value = model_reader[name]
-                    if isinstance(value, LazyTensor):  # a parallel module's parameter, take it whole
-                        value = value[tuple(slice(0, n) for n in tensor.shape)]
+                    if isinstance(value, LazyTensor):
+                        # a parallel module's parameter: take the whole source tensor, so that
+                        # load_state_dict still reports a shape mismatch with this target
+                        value = value[tuple(slice(0, n) for n in value.shape)]
                     local_model_state[name] = value
     module.load_state_dict(local_model_state, strict=strict)
     del local_model_state
@@ -503,11 +535,10 @@ def load_from_rank_state_dicts(
     non_parallel_indices = [index for index in range(total) if index not in parallel_indices]
     if len(non_parallel_indices) != len(non_parallel):  # locs reach beyond the parameters handed to the optimizer
         raise ValueError("The optimizer's parameter layout does not match the module.")
-    for index, (name, param) in zip(non_parallel_indices, non_parallel):
+    for index, (name, _) in zip(non_parallel_indices, non_parallel):
         if name in optimizer_getters:
-            whole = tuple(slice(0, n) for n in param.shape)
             local_optimizer_state[index] = {
-                key: value[whole] if isinstance(value, LazyTensor) else value
+                key: value[tuple(slice(0, n) for n in value.shape)] if isinstance(value, LazyTensor) else value
                 for key, value in optimizer_getters[name]().items()
             }
     opt_metadata['state'] = local_optimizer_state

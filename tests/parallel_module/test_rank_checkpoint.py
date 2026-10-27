@@ -96,6 +96,11 @@ def test_load_from_rank_state_dicts_cpu(tmp_path, monkeypatch):
             load_from_rank_state_dicts(target, missing, device='cpu')
         with pytest.raises(ValueError, match='Duplicate rank'):
             load_from_rank_state_dicts(target, models * 2, device='cpu')
+        # a plain module whose tensor is smaller than the checkpoint's must not load a sub-region
+        smaller = CheckpointModel()
+        smaller.offset = torch.zeros(2)
+        with pytest.raises(RuntimeError, match='size mismatch'):
+            load_from_rank_state_dicts(smaller, models, device='cpu')
         empty_optimizers = copy.deepcopy(optimizers)
         empty_optimizers[0]['state'].clear()
         load_from_rank_state_dicts(target, models, target_opt, empty_optimizers, device='cpu')
