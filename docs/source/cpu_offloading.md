@@ -109,18 +109,50 @@ offload group, which is the quickest way to see what a planning choice moves.
 ## Host memory locality
 
 Pinned buffers are allocated on the NUMA node of the thread that first touches
-them.  When every GPU of a node streams through pinned memory that lives on the
-other socket, the copies share the inter-socket link: on a 4x A6000 host the
-per-GPU D2H rate fell from 26 GB/s (one GPU alone) to 8-12 GB/s with four GPUs
-copying concurrently, and whole-Block offload spent 8-9 s of copy-engine time
-per step on 61 GB.  With each process bound to the CPUs local to its GPU all
-four GPUs sustain 26 GB/s D2H and 25 GB/s H2D at the same time.  The manager
-therefore pins the calling thread to `/sys/bus/pci/devices/<gpu>/local_cpulist`
-when it is created (`CPU_OFFLOADING_NUMA_AFFINITY=0` disables this), which is
-the same measure Megatron's `set_ideal_affinity_for_current_gpu` takes.
+them.  When GPUs of one node stream through pinned memory that lives on the
+other socket, the copies share the inter-socket link.  On an 8x B200 node the
+concurrent per-GPU D2H rate varied between 18 and 52 GB/s with default
+placement and reached 35-57 GB/s when every process was bound to its GPU's
+socket.  Launchers frequently confine all ranks to the CPUs of one socket, so
+the manager does not rely on CPU affinity: by default it wraps every pinned
+allocation in `set_mempolicy(MPOL_BIND, <gpu numa node>)`
+(`CPU_OFFLOADING_NUMA_MEMBIND=0` disables), reading the node from
+`/sys/bus/pci/devices/<gpu>/numa_node`.  `CPU_OFFLOADING_NUMA_AFFINITY=1`
+additionally pins the main thread to the GPU's local CPUs, the measure
+Megatron's `set_ideal_affinity_for_current_gpu` takes.  The decision is logged
+once per rank as `[cpu_offload] GPU i: NUMA node n, pinned memory membind=on`.
 `offload_d2h_s` / `offload_h2d_s` (summed copy durations) and `offload_stall_s`
 (time the compute stream waited for a reload) tell whether copies are slow or
 merely late.
+
+## Bounded copy windows
+
+CUDA multiplexes streams onto a small number of hardware work queues
+(`CUDA_DEVICE_MAX_CONNECTIONS`, default 8).  If thousands of memcpys sit in
+the copy streams' queues, kernel launches on the compute stream block behind
+them on the host even though the streams are independent, and copies and
+compute end up serialised.  An Nsight trace of whole-Block offload on 4x A6000
+showed exactly that: 16 s of kernels in a 38 s window, 21 s with no kernel
+running, and only 30% of the memcpy time overlapping with kernels, while the
+compute stream waited on reload events for 0.4 s in total.
+
+`CPU_OFFLOADING_MAX_INFLIGHT_COPIES` bounds the memcpys queued per direction;
+further copies wait in a software queue and are issued from the next
+pack/unpack/hint call (`pump`) once earlier copies completed, and a tensor
+demanded before its reload was issued bypasses the window (`forced_h2d`).
+On the A6000 reproduction a window of 8 did not improve step time (the host
+cost turned out to be the per-copy CUDA API work and pinned allocations, not
+queue blocking), so the window is off by default (0) and kept as a knob.  With
+window 2 the reloads arrived late (`stall_s` doubled); if a window is used it
+should stay well above the prefetch depth times the regions per group.
+
+Per copy, the host spends roughly 80 µs issuing a D2H (two events, wait,
+memcpy, record_stream) and 120 µs issuing an H2D (allocation on the consumer
+stream plus the same).  With 720 regions per step (attention kernel offload on
+the 15B model) that is ~0.1 s per step; with ~6000 regions per step (every
+tensor of every Block) it reaches ~3 s and starves the GPU.  Coalescing the
+regions of a group into one copy is the natural next step for such
+configurations.
 
 ## Sizing against the link
 

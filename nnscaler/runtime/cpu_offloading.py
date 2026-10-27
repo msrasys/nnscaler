@@ -41,9 +41,13 @@ Everything is configurable through environment variables (read once):
 ``CPU_OFFLOADING_DISABLE``         set to 1 to turn offloading into a no-op
 ``CPU_OFFLOADING_FAKE_COPY``       1 = keep tensors on the GPU but run all the
                                    bookkeeping (A/B test for overheads)
+``CPU_OFFLOADING_MAX_INFLIGHT_COPIES`` memcpys queued per direction (default 0 =
+                                   unbounded)
 ``CPU_OFFLOADING_TIMING``          0 disables the CUDA-event based timings
-``CPU_OFFLOADING_NUMA_AFFINITY``   0 disables pinning the main thread to the
-                                   GPU's NUMA-local CPUs (on by default)
+``CPU_OFFLOADING_NUMA_MEMBIND``    1 (default) allocates pinned memory on the
+                                   GPU's NUMA node via set_mempolicy
+``CPU_OFFLOADING_NUMA_AFFINITY``   1 additionally pins the main thread to the
+                                   GPU's local CPUs (default 0)
 ``CPU_OFFLOADING_PREFETCH_LEVEL``  legacy knob from the first prototype; it is
                                    still accepted but ignored.
 """
@@ -86,6 +90,83 @@ def _get_d2h_stream() -> torch.cuda.Stream:
 
 
 # ---------------------------------------------------------------------------
+# NUMA placement of pinned memory
+# ---------------------------------------------------------------------------
+
+_MPOL_DEFAULT = 0
+_MPOL_BIND = 2
+_SYS_SET_MEMPOLICY = 238  # x86_64 / aarch64 share this number
+
+
+def _gpu_numa_info(device_index: int) -> Tuple[Optional[int], set]:
+    """Return (numa_node, local_cpus) of a CUDA device from sysfs, or (None, set())."""
+    try:
+        props = torch.cuda.get_device_properties(device_index)
+        bus = f'{props.pci_domain_id:04x}:{props.pci_bus_id:02x}:{props.pci_device_id:02x}.0'
+        base = f'/sys/bus/pci/devices/{bus}'
+        with open(f'{base}/numa_node') as f:
+            node = int(f.read().strip())
+        with open(f'{base}/local_cpulist') as f:
+            spec = f.read().strip()
+        cpus: set = set()
+        for part in spec.split(','):
+            if not part:
+                continue
+            lo, _, hi = part.partition('-')
+            cpus.update(range(int(lo), int(hi or lo) + 1))
+        return (node if node >= 0 else None), cpus
+    except (OSError, AttributeError, ValueError):
+        return None, set()
+
+
+class _MemPolicy:
+    """Temporarily bind page allocation of the calling thread to one NUMA node.
+
+    Pinned host pages are placed on the node of the thread that first touches
+    them; ``set_mempolicy(MPOL_BIND)`` makes that the GPU's node regardless of
+    where the CPU affinity of the process points (launchers often confine all
+    ranks to one socket).  Only the allocation is wrapped; the policy is reset
+    to the default afterwards.
+    """
+
+    def __init__(self, node: Optional[int]) -> None:
+        self.node = node
+        self._libc = None
+        self.failed = False
+
+    def _call(self, mode: int, node: Optional[int]) -> None:
+        import ctypes
+        if self._libc is None:
+            self._libc = ctypes.CDLL(None, use_errno=True)
+        if node is None:
+            rc = self._libc.syscall(_SYS_SET_MEMPOLICY, mode, None, 0)
+        else:
+            words = node // 64 + 1
+            mask = (ctypes.c_ulong * words)()
+            mask[node // 64] = 1 << (node % 64)
+            rc = self._libc.syscall(_SYS_SET_MEMPOLICY, mode, mask, words * 64 + 1)
+        if rc != 0:
+            errno = ctypes.get_errno()
+            raise OSError(errno, os.strerror(errno))
+
+    def __enter__(self) -> '_MemPolicy':
+        if self.node is not None and not self.failed:
+            try:
+                self._call(_MPOL_BIND, self.node)
+            except OSError as error:
+                self.failed = True
+                _logger.warning(f'[cpu_offload] set_mempolicy(MPOL_BIND, node {self.node}) failed: {error}')
+        return self
+
+    def __exit__(self, *exc) -> None:
+        if self.node is not None and not self.failed:
+            try:
+                self._call(_MPOL_DEFAULT, None)
+            except OSError:  # pragma: no cover
+                pass
+
+
+# ---------------------------------------------------------------------------
 # pinned host memory pool
 # ---------------------------------------------------------------------------
 
@@ -105,13 +186,15 @@ class _PinnedPool:
     _RATIO = 1.25
 
     def __init__(self) -> None:
-        self._free: Dict[int, List[Tuple[torch.Tensor, Optional[torch.cuda.Event]]]] = collections.defaultdict(list)
+        self._free: Dict[int, Deque[Tuple[torch.Tensor, Optional[torch.cuda.Event]]]] = collections.defaultdict(collections.deque)
         self._lock = threading.Lock()
         self.allocated_bytes = 0   # bytes currently owned by the pool (free + in use)
         self.free_bytes = 0
         self.allocations = 0
         self.waits = 0
         self.max_free_bytes = load_int_from_env('CPU_OFFLOADING_POOL_MAX_GB', 0) << 30
+        # set by the manager once the GPU's NUMA node is known
+        self.mempolicy = _MemPolicy(None)
 
     @classmethod
     def size_class(cls, nbytes: int) -> int:
@@ -125,20 +208,17 @@ class _PinnedPool:
         with self._lock:
             bucket = self._free.get(size)
             if bucket:
-                # Prefer a buffer whose previous H2D copy has finished so the
-                # D2H stream never has to wait behind H2D traffic.
-                for idx in range(len(bucket) - 1, -1, -1):
-                    buf, event = bucket[idx]
-                    if event is None or event.query():
-                        bucket.pop(idx)
-                        self.free_bytes -= size
-                        return buf
-                buf, event = bucket.pop()
+                # FIFO reuse: the buffer released longest ago is the one whose
+                # previous H2D copy is most likely finished.  One event query
+                # at most; scanning the bucket costs more CPU than it saves.
+                buf, event = bucket.popleft()
                 self.free_bytes -= size
-                stream.wait_event(event)
-                self.waits += 1
+                if event is not None and not event.query():
+                    stream.wait_event(event)
+                    self.waits += 1
                 return buf
-        buf = torch.empty(size, dtype=torch.uint8, pin_memory=True)
+        with self.mempolicy:
+            buf = torch.empty(size, dtype=torch.uint8, pin_memory=True)
         with self._lock:
             self.allocated_bytes += size
             self.allocations += 1
@@ -181,12 +261,20 @@ def _covered_bytes(tensor: torch.Tensor) -> Tuple[int, int]:
 
 
 class _HostRegion:
-    """One contiguous byte range of a device storage living in pinned memory."""
+    """One contiguous byte range of a device storage living in pinned memory.
+
+    Copies are *scheduled* through the manager, which keeps at most
+    ``max_inflight`` memcpys per direction queued on the copy streams.  CUDA
+    multiplexes streams onto a handful of hardware work queues; thousands of
+    queued memcpys block the host when it launches compute kernels, which
+    serialises copies and compute even though they sit on different streams.
+    """
 
     __slots__ = (
         'manager', 'batch', 'device', 'nbytes', 'host', 'd2h_event',
         'device_tensor', 'h2d_event', 'lock', 'pending_views', 'released',
-        'd2h_start', 'h2d_start', 'timed',
+        'd2h_start', 'h2d_start', 'timed', 'src', 'ready_event', 'd2h_issued',
+        'h2d_issued', 'consumer_stream',
     )
 
     def __init__(self, manager: 'OffloadManager', batch: '_OffloadBatch',
@@ -196,74 +284,111 @@ class _HostRegion:
         self.device = storage_view.device
         self.nbytes = storage_view.numel()
         self.lock = threading.Lock()
+        self.host: Optional[torch.Tensor] = None
         self.device_tensor: Optional[torch.Tensor] = None
+        self.d2h_event: Optional[torch.cuda.Event] = None
         self.h2d_event: Optional[torch.cuda.Event] = None
+        self.d2h_start: Optional[torch.cuda.Event] = None
         self.h2d_start: Optional[torch.cuda.Event] = None
         self.pending_views = 0
         self.released = False
         self.timed = manager.timing
+        self.d2h_issued = False
+        self.h2d_issued = False
+        self.consumer_stream: Optional[torch.cuda.Stream] = None
+        manager.stats.offloaded_bytes += self.nbytes
+        manager.stats.offloaded_regions += 1
 
         if manager.fake_copy:
             # A/B switch: keep the tensor on the device, exercise everything else.
-            self.host = None  # type: ignore[assignment]
+            self.src = None
             self.device_tensor = storage_view
             self.d2h_event = torch.cuda.Event()
             self.d2h_event.record(torch.cuda.current_stream(self.device))
-            self.d2h_start = None
-            manager.stats.offloaded_bytes += self.nbytes
-            manager.stats.offloaded_regions += 1
+            self.d2h_issued = self.h2d_issued = True
             return
 
-        d2h = manager.d2h_stream
-        current = torch.cuda.current_stream(self.device)
-        self.host = manager.pool.acquire(self.nbytes, d2h)
-        # the copy must observe every kernel that produced the tensor
-        d2h.wait_stream(current)
+        # Keep the device memory alive until the copy is issued; the copy must
+        # observe every kernel that produced the tensor, so remember where the
+        # producer stream is right now.
+        self.src = storage_view
+        self.ready_event = torch.cuda.Event()
+        self.ready_event.record(torch.cuda.current_stream(self.device))
+        manager.schedule_d2h(self)
+
+    # -- D2H -----------------------------------------------------------------
+    def issue_d2h(self) -> None:
+        """Enqueue the D2H copy (called by the manager under its lock)."""
+        if self.d2h_issued:
+            return
+        self.d2h_issued = True
+        t0 = time.perf_counter()
+        d2h = self.manager.d2h_stream
+        self.host = self.manager.pool.acquire(self.nbytes, d2h)
+        self.manager.stats.acquire_seconds += time.perf_counter() - t0
+        t0 = time.perf_counter()
         with torch.cuda.stream(d2h):
-            self.d2h_start = torch.cuda.Event(enable_timing=True) if self.timed else None
-            if self.d2h_start is not None:
+            d2h.wait_event(self.ready_event)
+            if self.timed:
+                self.d2h_start = torch.cuda.Event(enable_timing=True)
                 self.d2h_start.record(d2h)
-            self.host[:self.nbytes].copy_(storage_view, non_blocking=True)
+            self.host[:self.nbytes].copy_(self.src, non_blocking=True)
             # the caching allocator must not hand the device memory to anybody
             # until the D2H copy has finished
-            storage_view.record_stream(d2h)
+            self.src.record_stream(d2h)
             self.d2h_event = torch.cuda.Event(enable_timing=self.timed)
             self.d2h_event.record(d2h)
-        manager.stats.offloaded_bytes += self.nbytes
-        manager.stats.offloaded_regions += 1
+        self.src = None
+        self.manager.stats.d2h_issue_seconds += time.perf_counter() - t0
         if self.timed:
-            manager.track_d2h(self)
+            self.manager.track_d2h(self)
 
+    # -- H2D -----------------------------------------------------------------
     def prefetch(self) -> None:
+        """Ask for the H2D copy; it is issued now or when the window has room."""
+        if self.device_tensor is not None or self.released or self.h2d_issued:
+            return
         with self.lock:
-            if self.device_tensor is not None or self.released:
-                return
-            h2d = self.manager.h2d_stream
-            # Allocate on the consumer's stream: the caching allocator keeps a
-            # pool per stream, allocating on the copy stream would strand the
-            # memory there (see TransformerEngine's cpu_offload).
-            consumer = torch.cuda.current_stream(self.device)
-            self.device_tensor = torch.empty(self.nbytes, dtype=torch.uint8, device=self.device)
-            with torch.cuda.stream(h2d):
-                h2d.wait_event(self.d2h_event)
-                # the allocation above is ordered on the consumer stream; the
-                # copy on h2d must not start before that stream reaches it
-                h2d.wait_stream(consumer)
-                self.h2d_start = torch.cuda.Event(enable_timing=True) if self.timed else None
-                if self.h2d_start is not None:
-                    self.h2d_start.record(h2d)
-                self.device_tensor.copy_(self.host[:self.nbytes], non_blocking=True)
-                self.device_tensor.record_stream(h2d)
-                self.h2d_event = torch.cuda.Event(enable_timing=self.timed)
-                self.h2d_event.record(h2d)
-            self.manager.stats.prefetched_bytes += self.nbytes
-            self.manager.stats.prefetched_regions += 1
+            if self.consumer_stream is None:
+                self.consumer_stream = torch.cuda.current_stream(self.device)
+        self.manager.schedule_h2d(self)
+
+    def issue_h2d(self) -> None:
+        """Enqueue the H2D copy (called by the manager under its lock)."""
+        if self.h2d_issued or self.released:
+            return
+        self.h2d_issued = True
+        if not self.d2h_issued:
+            self.issue_d2h()
+        t0 = time.perf_counter()
+        h2d = self.manager.h2d_stream
+        consumer = self.consumer_stream or torch.cuda.current_stream(self.device)
+        # Allocate on the consumer's stream: the caching allocator keeps a pool
+        # per stream, allocating on the copy stream would strand the memory
+        # there (see TransformerEngine's cpu_offload).
+        with torch.cuda.stream(consumer):
+            device_tensor = torch.empty(self.nbytes, dtype=torch.uint8, device=self.device)
+        with torch.cuda.stream(h2d):
+            h2d.wait_event(self.d2h_event)
+            h2d.wait_stream(consumer)
             if self.timed:
-                self.manager.track_h2d(self)
+                self.h2d_start = torch.cuda.Event(enable_timing=True)
+                self.h2d_start.record(h2d)
+            device_tensor.copy_(self.host[:self.nbytes], non_blocking=True)
+            device_tensor.record_stream(h2d)
+            self.h2d_event = torch.cuda.Event(enable_timing=self.timed)
+            self.h2d_event.record(h2d)
+        self.device_tensor = device_tensor
+        self.manager.stats.h2d_issue_seconds += time.perf_counter() - t0
+        self.manager.stats.prefetched_bytes += self.nbytes
+        self.manager.stats.prefetched_regions += 1
+        if self.timed:
+            self.manager.track_h2d(self)
 
     def fetch(self) -> torch.Tensor:
         """Return the device copy, blocking the current stream on the H2D copy."""
-        self.prefetch()
+        if self.device_tensor is None:
+            self.manager.force_h2d(self)
         assert self.device_tensor is not None
         if self.manager.fake_copy:
             return self.device_tensor
@@ -302,9 +427,10 @@ class _HostRegion:
                 return
             self.released = True
             self.device_tensor = None
+            self.src = None
             if self.host is not None:
                 self.manager.pool.release(self.host, self.h2d_event)
-                self.host = None  # type: ignore[assignment]
+                self.host = None
 
 
 @dataclass(eq=False)
@@ -474,16 +600,26 @@ class OffloadStats:
     h2d_ms: float = 0.0          # summed H2D copy durations
     d2h_backlog_bytes: int = 0   # bytes whose D2H copy had not finished at step end
     pool_waits: int = 0
+    deferred_d2h: int = 0        # copies that had to wait for the window
+    acquire_seconds: float = 0.0   # CPU time in the pinned pool
+    d2h_issue_seconds: float = 0.0 # CPU time enqueueing D2H copies
+    h2d_issue_seconds: float = 0.0 # CPU time enqueueing H2D copies
+    deferred_h2d: int = 0
+    forced_h2d: int = 0          # reloads issued on demand (prefetch came too late)
     pool_allocated_bytes: int = 0
     pool_allocations: int = 0
 
     def reset(self) -> None:
         for name in ('offloaded_bytes', 'offloaded_regions', 'deduplicated_bytes',
                      'prefetched_bytes', 'prefetched_regions', 'stalls', 'skipped_small_bytes',
-                     'packed_tensors', 'd2h_backlog_bytes', 'pool_waits'):
+                     'packed_tensors', 'd2h_backlog_bytes', 'pool_waits',
+                     'deferred_d2h', 'deferred_h2d', 'forced_h2d'):
             setattr(self, name, 0)
         self.pack_seconds = 0.0
         self.unpack_seconds = 0.0
+        self.acquire_seconds = 0.0
+        self.d2h_issue_seconds = 0.0
+        self.h2d_issue_seconds = 0.0
         self.stall_ms = 0.0
         self.d2h_ms = 0.0
         self.h2d_ms = 0.0
@@ -514,6 +650,14 @@ class OffloadManager:
         self._timed_d2h: List[_HostRegion] = []
         self._timed_h2d: List[_HostRegion] = []
         self._timed_stalls: List[Tuple[torch.cuda.Event, torch.cuda.Event]] = []
+        # Bounded copy windows per direction (see _HostRegion docstring).
+        # 0 disables the throttle.
+        self.max_inflight = load_int_from_env('CPU_OFFLOADING_MAX_INFLIGHT_COPIES', 0)
+        self._copy_lock = threading.Lock()
+        self._inflight_d2h: Deque[_HostRegion] = collections.deque()
+        self._pending_d2h: Deque[_HostRegion] = collections.deque()
+        self._inflight_h2d: Deque[_HostRegion] = collections.deque()
+        self._pending_h2d: Deque[_HostRegion] = collections.deque()
         self.enabled = load_int_from_env('CPU_OFFLOADING_DISABLE', 0) == 0
         # a forward whose own backward is scheduled within this many segment
         # executions gains nothing from offloading (the tensors would come back
@@ -541,41 +685,52 @@ class OffloadManager:
             cls._instance.bind_numa_affinity()
         return cls._instance
 
-    def bind_numa_affinity(self) -> None:
-        """Pin the calling thread to the CPUs local to the current GPU.
-
-        Pinned host buffers are physically allocated on the NUMA node of the
-        thread that first touches them.  Without this, several GPUs copying
-        through pinned memory on the remote socket share the inter-socket link:
-        on a 4x A6000 box per-GPU D2H bandwidth dropped from 26 GB/s to
-        8-12 GB/s, with binding every GPU keeps 26 GB/s.  Disable with
-        ``CPU_OFFLOADING_NUMA_AFFINITY=0``.  Must run before the pinned pool is
-        used; the pool is filled from the forward (main) thread.
-        """
-        if load_int_from_env('CPU_OFFLOADING_NUMA_AFFINITY', 1) == 0 or not torch.cuda.is_available():
-            return
-        try:
-            props = torch.cuda.get_device_properties(torch.cuda.current_device())
-            bus = f'{props.pci_domain_id:04x}:{props.pci_bus_id:02x}:{props.pci_device_id:02x}.0'
-            with open(f'/sys/bus/pci/devices/{bus}/local_cpulist') as f:
-                spec = f.read().strip()
-            cpus: set = set()
-            for part in spec.split(','):
-                lo, _, hi = part.partition('-')
-                cpus.update(range(int(lo), int(hi or lo) + 1))
-            allowed = os.sched_getaffinity(0)
-            cpus &= allowed
-            if not cpus or cpus == allowed:
-                return
-            os.sched_setaffinity(0, cpus)
-            _logger.info(f'[cpu_offload] bound thread to NUMA-local CPUs of GPU {bus}: {spec}')
-        except (OSError, AttributeError, ValueError) as error:  # pragma: no cover - platform dependent
-            _logger.warning(f'[cpu_offload] could not set NUMA affinity: {error}')
-
     @classmethod
     def reset(cls) -> None:
         cls._instance = None
         _OffloadBatch.last_batch = None
+
+    def bind_numa_affinity(self) -> None:
+        """Place pinned memory on the GPU's NUMA node.
+
+        Two mechanisms, both derived from ``/sys/bus/pci/devices/<gpu>``:
+
+        * ``CPU_OFFLOADING_NUMA_MEMBIND`` (default 1): wrap pinned allocations
+          in ``set_mempolicy(MPOL_BIND, gpu_node)``.  Works even when the
+          launcher confined the process to CPUs of another socket.
+        * ``CPU_OFFLOADING_NUMA_AFFINITY`` (default 0): additionally pin the
+          calling thread to the GPU's local CPUs (what Megatron does).
+
+        Several GPUs streaming through pinned pages on the remote socket share
+        the inter-socket link; on an 8x B200 node per-GPU D2H varied between
+        18 and 52 GB/s unbound versus 35-57 GB/s bound.
+        """
+        if not torch.cuda.is_available():
+            return
+        device_index = torch.cuda.current_device()
+        node, cpus = _gpu_numa_info(device_index)
+        membind = load_int_from_env('CPU_OFFLOADING_NUMA_MEMBIND', 1) != 0
+        affinity = load_int_from_env('CPU_OFFLOADING_NUMA_AFFINITY', 0) != 0
+        if node is None:
+            _logger.info(f'[cpu_offload] GPU {device_index}: NUMA node unknown, pinned memory not bound')
+            return
+        if membind:
+            self.pool.mempolicy = _MemPolicy(node)
+        bound_cpus = ''
+        if affinity and cpus:
+            try:
+                allowed = os.sched_getaffinity(0)
+                target = cpus & allowed
+                if target and target != allowed:
+                    os.sched_setaffinity(0, target)
+                    bound_cpus = f', thread affinity -> {len(target)} local CPUs'
+                elif not target:
+                    bound_cpus = ', local CPUs not in the allowed set (affinity unchanged)'
+            except OSError as error:  # pragma: no cover
+                bound_cpus = f', affinity failed: {error}'
+        _logger.info(
+            f'[cpu_offload] GPU {device_index}: NUMA node {node}, '
+            f'pinned memory membind={"on" if membind else "off"}{bound_cpus}')
 
     # -- streams --------------------------------------------------------
     @property
@@ -589,6 +744,65 @@ class OffloadManager:
         if self._h2d_stream is None:
             self._h2d_stream = _get_prefetch_stream()
         return self._h2d_stream
+
+    # -- copy scheduling -----------------------------------------------------
+    def _drain(self, inflight: Deque[_HostRegion], direction: str) -> None:
+        while inflight:
+            region = inflight[0]
+            event = region.d2h_event if direction == 'd2h' else region.h2d_event
+            if event is None or not event.query():
+                break
+            inflight.popleft()
+
+    def pump(self) -> None:
+        """Issue deferred copies whose window has room.  Cheap; called often."""
+        if self.fake_copy:
+            return
+        with self._copy_lock:
+            self._drain(self._inflight_d2h, 'd2h')
+            while self._pending_d2h and (not self.max_inflight or len(self._inflight_d2h) < self.max_inflight):
+                region = self._pending_d2h.popleft()
+                if region.released or region.d2h_issued:
+                    continue
+                region.issue_d2h()
+                self._inflight_d2h.append(region)
+            self._drain(self._inflight_h2d, 'h2d')
+            while self._pending_h2d and (not self.max_inflight or len(self._inflight_h2d) < self.max_inflight):
+                region = self._pending_h2d.popleft()
+                if region.released or region.h2d_issued:
+                    continue
+                region.issue_h2d()
+                self._inflight_h2d.append(region)
+
+    def schedule_d2h(self, region: _HostRegion) -> None:
+        with self._copy_lock:
+            self._drain(self._inflight_d2h, 'd2h')
+            if not self.max_inflight or len(self._inflight_d2h) < self.max_inflight:
+                region.issue_d2h()
+                self._inflight_d2h.append(region)
+            else:
+                self._pending_d2h.append(region)
+                self.stats.deferred_d2h += 1
+
+    def schedule_h2d(self, region: _HostRegion) -> None:
+        with self._copy_lock:
+            self._drain(self._inflight_h2d, 'h2d')
+            if not self.max_inflight or len(self._inflight_h2d) < self.max_inflight:
+                region.issue_h2d()
+                self._inflight_h2d.append(region)
+            else:
+                self._pending_h2d.append(region)
+                self.stats.deferred_h2d += 1
+
+    def force_h2d(self, region: _HostRegion) -> None:
+        """The tensor is needed now: bypass the window."""
+        with self._copy_lock:
+            if region.device_tensor is None and not region.h2d_issued:
+                if region.consumer_stream is None:
+                    region.consumer_stream = torch.cuda.current_stream(region.device)
+                region.issue_h2d()
+                self._inflight_h2d.append(region)
+                self.stats.forced_h2d += 1
 
     # -- execution contexts (driven by Executor) --------------------------
     def hint_forward(self, name: str, backward_distance: int) -> None:
@@ -609,6 +823,7 @@ class OffloadManager:
         return ctx
 
     def end_forward(self, ctx: _ExecContext) -> None:
+        self.pump()
         with self.lock:
             assert self._forward_stack and self._forward_stack[-1] is ctx, 'unbalanced begin/end_forward'
             self._forward_stack.pop()
@@ -628,6 +843,7 @@ class OffloadManager:
         return ctx
 
     def end_backward(self, ctx: Optional[_ExecContext]) -> None:
+        self.pump()
         if ctx is None:
             return
         with self.lock:
@@ -639,6 +855,7 @@ class OffloadManager:
 
     def prefetch_next_backward(self, name: str) -> None:
         """Hint emitted by the scheduler: the next backward will be ``name``."""
+        self.pump()
         with self.lock:
             queue = self._pending.get(name)
             ctx = queue[0] if queue else None
@@ -657,6 +874,7 @@ class OffloadManager:
         return batch
 
     def on_unpack(self, handle: _OffloadedTensor) -> None:
+        self.pump()
         batch = handle.region.batch
         batch.prefetch()
         ctx = batch.context
@@ -712,6 +930,8 @@ class OffloadManager:
                 self.stats.stall_ms += before.elapsed_time(after)
             else:
                 keep_stalls.append((before, after))
+        with self._copy_lock:
+            backlog += sum(r.nbytes for r in self._pending_d2h)
         self.stats.d2h_backlog_bytes = backlog
         with self.lock:
             self._timed_d2h = keep_d2h + self._timed_d2h
@@ -811,6 +1031,7 @@ class CPUOffloadContext:
             return tensor
 
         assert self.batch is not None
+        self.manager.pump()
         handle = self.batch.append(tensor)
         if self.manager.debug and self.group_id not in self.manager._debugged_groups:
             _logger.info(
