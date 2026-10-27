@@ -133,6 +133,20 @@ def _gather_region(
                 covered[lo - flat[0]:hi - flat[0]] = True
             continue
         # General case: positions of the intersection elements in both flattened boxes.
+        if dst_index:
+            # Keep only the leading-dim rows touched by both flattened ranges, so the position
+            # grids scale with the requested chunk rather than with the whole intersection.
+            # A flattened range covers whole rows except at its two ends, so the grids exceed
+            # the chunk by at most two rows (each `prod(shape[1:])` elements). The mask below
+            # still trims those partial end rows to the exact ranges.
+            shift = src_index[0].start - dst_index[0].start  # source row = target row + shift
+            row_t, row_s = math.prod(target_shape[1:]), math.prod(box_shape[1:])
+            lo = max(dst_index[0].start, flat[0] // row_t, src_flat[0] // row_s - shift)
+            hi = min(dst_index[0].stop, -(-flat[1] // row_t), -(-src_flat[1] // row_s) - shift)
+            if lo >= hi:
+                continue
+            dst_index = (slice(lo, hi),) + dst_index[1:]
+            src_index = (slice(lo + shift, hi + shift),) + src_index[1:]
         target_positions = _flat_positions(dst_index, target_shape)
         source_positions = _flat_positions(src_index, box_shape)
         mask = (target_positions >= flat[0]) & (target_positions < flat[1]) \
