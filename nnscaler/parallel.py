@@ -47,7 +47,7 @@ from nnscaler.ir.unique import IDGenerator
 
 from nnscaler.runtime.adapter.reducer import Bucket, Reducer, ParamBucketConfig
 from nnscaler.runtime.device import DeviceGroup
-from nnscaler.runtime.checkpoint import load_from_rank_state_dicts  # re-exported by nnscaler
+from nnscaler.runtime.checkpoint import load_from_rank_state_dicts, slice_tensor  # the former is re-exported by nnscaler
 from nnscaler.runtime.initialization import (
     create_init_module, create_shard_init_weights,
 )
@@ -2830,11 +2830,15 @@ def _construct_optim_state_zero(
     """
     dist_param_map = module.dist_param_map  # name in parallel module (without tid suffix) -> name in origin module
     param_area_map = module.fullmap         # str -> AttrMeta
-    def _get_optimizer_state_of_param(param, param_ids, local_names):
+    def _get_optimizer_state_of_param(param, param_ids, local_names, flat=None):
         # find the parameter's optimizer state and pick the slices induced by tensor parallelism
         param_idx = param_ids.index(id(param))
         local_name = local_names[param_idx]
-        return _extract_new_state(local_name, orig_param_dict, dist_param_map, param_area_map)
+        return _extract_new_state(local_name, orig_param_dict, dist_param_map, param_area_map, flat=flat)
+
+    def _orig_name_of_param(param, param_ids, local_names):
+        local_name = local_names[param_ids.index(id(param))]
+        return dist_param_map['_'.join(local_name.split('_')[:-1])]
 
     # prepare param ids and corresponding local param names
     param_ids, local_names = [], []
@@ -2849,11 +2853,8 @@ def _construct_optim_state_zero(
         for bucket in reducer.buckets:
             # one bucket corresponds to one flattened param
             assert len(opt_param[opt_param_idx].shape) == 1
-            sliced_states = [
-                _get_optimizer_state_of_param(param, param_ids, local_names)
-                for param in bucket.params
-            ]
-            state_presence = [state is not None for state in sliced_states]
+            orig_names = [_orig_name_of_param(param, param_ids, local_names) for param in bucket.params]
+            state_presence = [orig_name in orig_param_dict for orig_name in orig_names]
             if not any(state_presence):
                 opt_param_idx += 1
                 continue
@@ -2864,69 +2865,36 @@ def _construct_optim_state_zero(
             # the flattened param is in the range [bucket_chunk_start, bucket_chunk_end)
             bucket_chunk_start = rank_idx * chunk_size
             bucket_chunk_end = (rank_idx + 1) * chunk_size
+            # keys, dtypes and step are shared by the bucket (its params belong to one optimizer
+            # param group); take them from the first param without reading its data
+            # (a lazy checkpoint reader exposes dtype)
+            first_state = orig_param_dict[orig_names[0]]
+            step = first_state.get('step')
+            opt_state_keys = [key for key in first_state if key != 'step']
+            for orig_name in orig_names[1:]:
+                if set(orig_param_dict[orig_name]) != set(first_state):
+                    raise ValueError(
+                        f"Optimizer state keys of {orig_name} differ from {orig_names[0]} within one reducer bucket.")
+            opt_states = {
+                key: torch.zeros([chunk_size], dtype=first_state[key].dtype, device='cpu', requires_grad=False)
+                for key in opt_state_keys
+            }
             # NOTE: assume the traverse order of params is consistent
             # with them in contiguous buffer.
-            # param_offset: the param's start offset in the contiguous buffer
-            # chunk_offset: the offset of the current rank corresponding chunk
-            step, opt_states, opt_state_keys = None, {}, None
-            for param, sliced_new_val in zip(bucket.params, sliced_states):
+            for param in bucket.params:
+                # param_offset: the param's start offset in the contiguous buffer
                 param_offset = reducer.get_param_info(param).bucket_param_buffer_start
-                # there are padding in the chunk, so `param.numel()` doesn't work here
-                param_numel = bucket.get_aligned_numel(param)
-                # init the chunk's optimizer state
-                if opt_state_keys is None:
-                    opt_state_keys = [key for key in sliced_new_val]
-                    if 'step' in sliced_new_val:
-                        step = sliced_new_val['step']
-                    if 'step' in sliced_new_val:
-                        opt_state_keys.remove('step')
-                    for key in opt_state_keys:
-                        opt_states[key] = torch.zeros([chunk_size], dtype=sliced_new_val[key].dtype,
-                                                        device='cpu', requires_grad=False)
-                # copy the param's slices to the optimizer's chunk
+                # overlap of the param (its padding excluded) with this rank's chunk
+                lo = max(param_offset, bucket_chunk_start)
+                hi = min(param_offset + param.numel(), bucket_chunk_end)
+                if lo >= hi:
+                    continue
+                # read only the overlapping range of the param's flattened shard
+                sliced_new_val = _get_optimizer_state_of_param(
+                    param, param_ids, local_names, flat=(lo - param_offset, hi - param_offset))
+                chunk_offset = lo - bucket_chunk_start
                 for key in opt_state_keys:
-                    sliced_new_val[key] = sliced_new_val[key].view(-1)
-
-                # parameter range: <>
-                # bucket range: []
-                # in the following branches, we check the range including paddings.
-                # but in branch body, we only copy the valid range (without paddings) but update the chunk_offset with paddings.
-                if param_offset < bucket_chunk_start \
-                    and bucket_chunk_start < param_offset + param_numel < bucket_chunk_end:
-                    # case: < [ > ]
-                    copy_size = param_offset + param_numel - bucket_chunk_start
-                    copy_size_without_padding = param_offset + param.numel() - bucket_chunk_start
-                    chunk_offset = 0
-                    if copy_size_without_padding > 0:
-                        for key in opt_state_keys:
-                            opt_states[key][chunk_offset:chunk_offset+copy_size_without_padding] = sliced_new_val[key][-copy_size_without_padding:]
-                elif bucket_chunk_start <= param_offset < bucket_chunk_end \
-                    and bucket_chunk_start <= param_offset + param_numel < bucket_chunk_end:
-                    # case: [ <  > ]
-                    chunk_offset = param_offset - bucket_chunk_start
-                    for key in opt_state_keys:
-                        opt_states[key][chunk_offset:chunk_offset+param.numel()] = sliced_new_val[key][:]
-                elif bucket_chunk_start <= param_offset < bucket_chunk_end \
-                    and param_offset + param_numel >= bucket_chunk_end:
-                    # case: [ < ] >
-                    copy_size = bucket_chunk_end - param_offset
-                    copy_size_without_padding = min(copy_size, param.numel())
-                    chunk_offset = param_offset - bucket_chunk_start
-                    for key in opt_state_keys:
-                        opt_states[key][chunk_offset:chunk_offset+copy_size_without_padding] = sliced_new_val[key][:copy_size_without_padding]
-                elif param_offset < bucket_chunk_start \
-                    and param_offset + param_numel >= bucket_chunk_end:
-                    # case: < [ ] >
-                    copy_size = bucket_chunk_end - bucket_chunk_start
-                    copy_size_without_padding = min(copy_size, param_offset + param.numel() - bucket_chunk_start)
-                    chunk_offset = 0
-                    if copy_size_without_padding > 0:
-                        for key in opt_state_keys:
-                            opt_states[key][chunk_offset:chunk_offset + copy_size_without_padding] \
-                                = sliced_new_val[key][bucket_chunk_start-param_offset:bucket_chunk_start-param_offset + copy_size_without_padding]
-                else:
-                    # case: [] <>, <> []
-                    logger.debug(f'Skipped: parameter range({param_offset},{param_offset + param_numel}) vs. bucket range({bucket_chunk_start},{bucket_chunk_end})')
+                    opt_states[key][chunk_offset:chunk_offset + hi - lo] = sliced_new_val[key]
 
             if step is not None:
                 opt_states['step'] = step
@@ -2980,8 +2948,14 @@ def _extract_new_state(
         orig_param_dict: Mapping[str, Dict[str, Any]],
         dist_param_map: Dict[str, str],
         param_area_map: Dict[str, AttrMeta],
-        zero3_info: Optional[Zero3AttrMeta] = None
+        zero3_info: Optional[Zero3AttrMeta] = None,
+        flat: Optional[Tuple[int, int]] = None,
     ) -> Optional[Dict[str, torch.Tensor]]:
+    """
+    `flat` restricts the result to a range of the parameter's flattened local shard, so a lazy
+    checkpoint reader assembles only that range. With `zero3_info` the range is its chunk
+    instead, so the two are mutually exclusive.
+    """
     name = '_'.join(local_name.split('_')[:-1]) # remove the integer suffix
     assert name in dist_param_map
     attr_meta = param_area_map[local_name]
@@ -2989,14 +2963,17 @@ def _extract_new_state(
     if orig_name not in orig_param_dict:
         return None
     new_val = orig_param_dict[orig_name]
+    if zero3_info is not None:
+        if flat is not None:
+            raise ValueError("`flat` and `zero3_info` are mutually exclusive.")
+        flat = (zero3_info.start, zero3_info.end)
     sliced_new_val = {}
     for key in new_val:
         if key in ('step',):
             sliced_new_val[key] = new_val[key]
         else:
-            sliced_new_val[key] = new_val[key][attr_meta.slicers] / attr_meta.val_chunks
+            sliced_new_val[key] = slice_tensor(new_val[key], attr_meta.slicers, flat) / attr_meta.val_chunks
             if zero3_info is not None:
-                sliced_new_val[key] = sliced_new_val[key].view(-1)[zero3_info.start:zero3_info.end]
                 if sliced_new_val[key].numel() < zero3_info.chunk_size:
                     # padding if needed
                     sliced_new_val[key] = torch.nn.functional.pad(

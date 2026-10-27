@@ -2191,6 +2191,9 @@ class ParallelModule(CubeModule):
         Returns:
             Dict[str, Any]: the trimmed state dict
         """
+        # nnscaler.runtime.checkpoint imports this module, so import its helper lazily here.
+        from nnscaler.runtime.checkpoint import slice_tensor
+
         device = device or torch.cuda.current_device()
         trimmed_state_dict = {}
 
@@ -2214,25 +2217,18 @@ class ParallelModule(CubeModule):
                 param_value = state_dict[orig_param_name_with_prefix]
                 tid = origname_tid_map[orig_param_name]
                 for attr, slicer, nchunks in tid_info[tid]:
-                    content: torch.Tensor = param_value[slicer]
+                    z3_info = self._zero3_param_metadata.get(attr) if self.compute_config.use_zero > 1 else None
+                    # ZeRO-3: read only this rank's chunk of the (possibly tensor-parallel) region
+                    content: torch.Tensor = slice_tensor(
+                        param_value, slicer, None if z3_info is None else (z3_info.start, z3_info.end))
                     if nchunks != 1:
                         content = content / nchunks
-                    if self.compute_config.use_zero <= 1 or self._zero3_param_metadata.get(attr, None) is None:
-                        trimmed_state_dict[prefix + attr] = content.to(device)
-                    else:
-                        z3_info = self._zero3_param_metadata[attr]
-                        start, end, chunk_size = z3_info.start, z3_info.end, z3_info.chunk_size
-                        if end - start < chunk_size:
-                            # need padding
-                            padding = chunk_size - (end - start)
-                            trimmed_state_dict[prefix + attr] = torch.nn.functional.pad(
-                                content.view(-1)[start:end].to(device),
-                                (0, padding),
-                                mode='constant',
-                                value=0.0,
-                            )
-                        else:
-                            trimmed_state_dict[prefix + attr] = content.reshape(-1)[start:end].to(device)
+                    content = content.to(device)
+                    if z3_info is not None and z3_info.end - z3_info.start < z3_info.chunk_size:
+                        # need padding
+                        padding = z3_info.chunk_size - (z3_info.end - z3_info.start)
+                        content = torch.nn.functional.pad(content, (0, padding), mode='constant', value=0.0)
+                    trimmed_state_dict[prefix + attr] = content
 
         return trimmed_state_dict
 

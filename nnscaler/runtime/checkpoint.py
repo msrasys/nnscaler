@@ -7,11 +7,11 @@ from dataclasses import dataclass
 from collections import defaultdict
 from collections.abc import Mapping
 from functools import partial
-from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple, Union, TYPE_CHECKING
+from typing import Any, Callable, Dict, Iterator, List, Optional, Protocol, Tuple, Union, TYPE_CHECKING, runtime_checkable
 
 import torch
 
-from nnscaler.utils import first_or, get_member_by_name
+from nnscaler.utils import first, first_or, get_member_by_name
 from nnscaler.runtime.module import AttrMeta, ExtraState, ParallelModule
 
 if TYPE_CHECKING:
@@ -74,67 +74,119 @@ class _OptimizerSource:
         return _Shard(self.box, self.flat, data)
 
 
-def _gather_region(target: Tuple[slice, ...], shards: List[_Shard]) -> torch.Tensor:
-    """Assemble `full[target]` from the shards overlapping it without materializing `full`."""
-    out = torch.empty([t.stop - t.start for t in target], dtype=shards[0].data.dtype, device='cpu')
-    # elements written by some shard
-    # TODO: Consider using a more efficient data structure for covered regions if needed.
-    covered = torch.zeros(out.shape, dtype=torch.bool, device='cpu')
+def _flat_positions(index: Tuple[slice, ...], box_shape: List[int]) -> torch.Tensor:
+    """Row-major positions of the sub-box `index` inside the flattened box of shape `box_shape`."""
+    positions = torch.zeros([i.stop - i.start for i in index], dtype=torch.int64, device='cpu')
+    stride = 1
+    for dim in reversed(range(len(index))):
+        shape = [1] * len(index)
+        shape[dim] = index[dim].stop - index[dim].start
+        positions += (torch.arange(index[dim].start, index[dim].stop, device='cpu') * stride).view(shape)
+        stride *= box_shape[dim]
+    return positions
+
+
+def _gather_region(
+    target: Tuple[slice, ...], shards: List[_Shard], flat: Optional[Tuple[int, int]] = None,
+) -> torch.Tensor:
+    """
+    Assemble `full[target]`, or `full[target].reshape(-1)[flat[0]:flat[1]]` when `flat` is given
+    (a ZeRO-3 chunk of the target box), from the shards overlapping it without materializing `full`.
+    """
+    target_shape = [t.stop - t.start for t in target]
+    # Treat every side as a range of its flattened box; a whole box is the range (0, numel).
+    whole_target = flat is None
+    flat = flat or (0, math.prod(target_shape))
+    out = torch.empty(flat[1] - flat[0], dtype=shards[0].data.dtype, device='cpu')
+    covered = torch.zeros(out.shape, dtype=torch.bool, device='cpu')  # elements written by some shard
     for shard in shards:
-        box, flat, data = shard.box, shard.flat, shard.data
+        box, box_shape = shard.box, [b.stop - b.start for b in shard.box]
         inter = [slice(max(t.start, b.start), min(t.stop, b.stop)) for t, b in zip(target, box)]
         if any(i.start >= i.stop for i in inter):
             continue
+        # dst_index is offset relative to the target box
+        # src_index is offset relative to the shard box
         dst_index = tuple(slice(i.start - t.start, i.stop - t.start) for i, t in zip(inter, target))
-        dst, dst_covered = out[dst_index], covered[dst_index]
-        src_index = [slice(i.start - b.start, i.stop - b.start) for i, b in zip(inter, box)]
-        if flat is None:
-            dst.copy_(data[tuple(src_index)])
-            dst_covered.fill_(True)
+        src_index = tuple(slice(i.start - b.start, i.stop - b.start) for i, b in zip(inter, box))
+        if whole_target and shard.flat is None:
+            # two plain boxes: a strided copy of the intersection
+            out.view(target_shape)[dst_index].copy_(shard.data[src_index])
+            covered.view(target_shape)[dst_index] = True
             continue
-        # shard = full[box].reshape(-1)[start:end]
-        start, end = flat
-        box_shape = [b.stop - b.start for b in box]
-        if src_index and dst.is_contiguous() and all(r.stop - r.start == n for r, n in zip(src_index[1:], box_shape[1:])):
-            # The intersection is a run of leading-dim rows, contiguous in the flattened box.
-            row = math.prod(box_shape[1:])
-            # lo/hi: the range in data
-            # src_index[0].start/stop: the unflattened range (superset of data)
-            lo, hi = max(src_index[0].start * row, start), min(src_index[0].stop * row, end)
+        # The remaining paths work in the flattened boxes; a whole box is the range (0, numel).
+        src_flat = shard.flat or (0, math.prod(box_shape))
+        data = shard.data if shard.flat else shard.data.reshape(-1)  # a view for contiguous data
+        if dst_index and all(i.stop - i.start == m == n for i, m, n in zip(inter[1:], target_shape[1:], box_shape[1:])):
+            # The intersection is a run of leading-dim rows, contiguous in both flattened
+            # spaces with `source position = target position + shift`.
+            row = math.prod(target_shape[1:])
+            # src_index and dst_index have been aligned
+            # shard.data[src_index] corresponds to out[dst_index]
+            # so when we compare positions in the flattened space, we need to account for the shift.
+            shift = (src_index[0].start - dst_index[0].start) * row
+            lo = max(dst_index[0].start * row, flat[0], src_flat[0] - shift)
+            hi = min(dst_index[0].stop * row, flat[1], src_flat[1] - shift)
             if lo < hi:
-                run = slice(lo - src_index[0].start * row, hi - src_index[0].start * row)
-                dst.view(-1)[run] = data[lo - start:hi - start]
-                dst_covered.view(-1)[run] = True
+                # lo/hi are index of full[target].reshape(-1) in the flattened space
+                # so we need to subtract flat[0] to get the index relative to the flattened target box.
+                out[lo - flat[0]:hi - flat[0]] = data[lo + shift - src_flat[0]:hi + shift - src_flat[0]]
+                covered[lo - flat[0]:hi - flat[0]] = True
             continue
-
-        # General case: positions of the intersection inside the flattened box.
-        # idx will hold the flattened indices of the intersection within the flattened box.
-        idx = torch.zeros([r.stop - r.start for r in src_index], dtype=torch.int64, device='cpu')
-        stride = 1
-        for dim in reversed(range(len(src_index))):
-            shape = [1] * len(src_index)
-            shape[dim] = src_index[dim].stop - src_index[dim].start
-            idx += (torch.arange(src_index[dim].start, src_index[dim].stop, device='cpu') * stride).view(shape)
-            stride *= box_shape[dim]
-        mask = (idx >= start) & (idx < end)
-        dst[mask] = data[(idx[mask] - start).to(data.device)].to(dst.device)
-        dst_covered[mask] = True
+        # General case: positions of the intersection elements in both flattened boxes.
+        target_positions = _flat_positions(dst_index, target_shape)
+        source_positions = _flat_positions(src_index, box_shape)
+        mask = (target_positions >= flat[0]) & (target_positions < flat[1]) \
+            & (source_positions >= src_flat[0]) & (source_positions < src_flat[1])
+        positions = target_positions[mask] - flat[0]
+        out[positions] = data[(source_positions[mask] - src_flat[0]).to(data.device)].to('cpu')
+        covered[positions] = True
 
     if not covered.all():
         raise ValueError(
             f"Incomplete checkpoint shards: {int((~covered).sum())} of {out.numel()} elements "
-            f"in region {target} are not covered by any shard.")
-    return out
+            f"in region {target}{'' if whole_target else f' flat range {flat}'} are not covered by any shard.")
+    return out.view(target_shape) if whole_target else out
+
+
+@runtime_checkable
+class LazyTensor(Protocol):
+    """
+    Stands in for one full tensor in a state dict: indexing with slicers, or `slice_tensor`,
+    assembles only the requested region instead of materializing the full tensor.
+    """
+
+    @property
+    def dtype(self) -> torch.dtype: ...
+
+    def slice_tensor(self, slicers: Tuple[slice, ...], flat: Optional[Tuple[int, int]] = None) -> torch.Tensor:
+        """`full[slicers]`, or `full[slicers].reshape(-1)[flat[0]:flat[1]]` when `flat` is given."""
+
+    def __getitem__(self, slicers: Tuple[slice, ...]) -> torch.Tensor: ...
+
+
+def slice_tensor(value: Union[torch.Tensor, LazyTensor], slicers: Tuple[slice, ...], flat: Optional[Tuple[int, int]] = None) -> torch.Tensor:
+    """
+    `value[slicers]`, or `value[slicers].reshape(-1)[flat[0]:flat[1]]` when `flat` is given,
+    for a tensor or a `LazyTensor`, which assembles only that region.
+    """
+    if isinstance(value, LazyTensor):
+        return value.slice_tensor(slicers, flat)
+    value = value[slicers]
+    return value if flat is None else value.reshape(-1)[flat[0]:flat[1]]
 
 
 class _LazyRegion:
-    """Stands in for one full tensor: indexing with slicers assembles only that region."""
+    """A `LazyTensor` backed by a region reader of a checkpoint."""
 
-    def __init__(self, read_region: Callable[[Tuple[slice, ...]], torch.Tensor]):
+    def __init__(self, read_region: Callable[[Tuple[slice, ...], Optional[Tuple[int, int]]], torch.Tensor], dtype: torch.dtype):
         self.read_region = read_region
+        self.dtype = dtype
+
+    def slice_tensor(self, slicers: Tuple[slice, ...], flat: Optional[Tuple[int, int]] = None) -> torch.Tensor:
+        return self.read_region(slicers, flat)
 
     def __getitem__(self, slicers: Tuple[slice, ...]) -> torch.Tensor:
-        return self.read_region(slicers)
+        return self.slice_tensor(slicers)
 
 
 class _ModuleStateReader:
@@ -175,9 +227,15 @@ class _ModuleStateReader:
                     self.model_names.setdefault(name, canonical)
 
     def read_model(self, name: str) -> _LazyRegion:
-        return _LazyRegion(partial(self._read_model_region, self.model_names[name]))
+        name = self.model_names[name]
+        # `model_names` only lists names with at least one shard present, so this cannot fail
+        rank, local_name, _, _ = first(
+            self.entries[name],
+            lambda entry: entry[0] < len(self.model_states) and entry[1] in self.model_states[entry[0]],
+        )
+        return _LazyRegion(partial(self._read_model_region, name), self.model_states[rank][local_name].dtype)
 
-    def _read_model_region(self, name: str, target: Tuple[slice, ...]) -> torch.Tensor:
+    def _read_model_region(self, name: str, target: Tuple[slice, ...], flat: Optional[Tuple[int, int]] = None) -> torch.Tensor:
         shards: Dict[Tuple, _Shard] = {}  # deduplicate replicas by (slicers, flat range)
         for rank, local_name, _, meta in self.entries[name]:
             if rank >= len(self.model_states) or local_name not in self.model_states[rank]:
@@ -185,18 +243,18 @@ class _ModuleStateReader:
             if meta.val_chunks != 1:
                 raise NotImplementedError("Value-partitioned parameters are not supported.")
             data = self.model_states[rank][local_name]
-            flat = None
+            shard_flat = None
             zero3 = (self.extra_states[rank].zero3_param_metadata or {}).get(local_name)
             if zero3 is not None and tuple(data.shape) != tuple(meta.sub_shape):
-                flat = (int(zero3.start), int(zero3.end))
-            shards.setdefault((_track_id(meta.slicers), flat), _Shard(meta.slicers, flat, data))
+                shard_flat = (int(zero3.start), int(zero3.end))
+            shards.setdefault((_track_id(meta.slicers), shard_flat), _Shard(meta.slicers, shard_flat, data))
         if not shards:
             raise ValueError(
                 f"No checkpoint shard found for {name}: entries "
                 f"{[(rank, local_name) for rank, local_name, _, _ in self.entries[name]]}, "
                 f"model states of {len(self.model_states)} ranks with keys "
                 f"{[sorted(state)[:6] for state in self.model_states]}")
-        return _gather_region(target, list(shards.values()))
+        return _gather_region(target, list(shards.values()), flat)
 
     def _optimizer_sources(self, name: str) -> List[_OptimizerSource]:
         """Optimizer states holding parts of `name`, one per distinct shard."""
@@ -248,7 +306,7 @@ class _ModuleStateReader:
     def read_optimizer(self, name: str) -> Dict[str, Any]:
         sources = self._optimizer_sources(name)
         state = {
-            key: _LazyRegion(partial(self._read_optimizer_region, sources, key))
+            key: _LazyRegion(partial(self._read_optimizer_region, sources, key), sources[0].state[key].dtype)
             for key in sources[0].state if key != 'step'
         }
         if 'step' in sources[0].state:
@@ -258,8 +316,10 @@ class _ModuleStateReader:
         return state
 
     @staticmethod
-    def _read_optimizer_region(sources: List[_OptimizerSource], key: str, target: Tuple[slice, ...]) -> torch.Tensor:
-        return _gather_region(target, [source.shard(key) for source in sources])
+    def _read_optimizer_region(
+        sources: List[_OptimizerSource], key: str, target: Tuple[slice, ...], flat: Optional[Tuple[int, int]] = None,
+    ) -> torch.Tensor:
+        return _gather_region(target, [source.shard(key) for source in sources], flat)
 
 
 def _track_id(slicers: Tuple[slice, ...]) -> Tuple[Tuple[Any, Any, Any], ...]:
@@ -387,7 +447,7 @@ def load_from_rank_state_dicts(
             for name, tensor in own_state.items():
                 if name in model_reader:
                     value = model_reader[name]
-                    if isinstance(value, _LazyRegion):  # a parallel module's parameter, take it whole
+                    if isinstance(value, LazyTensor):  # a parallel module's parameter, take it whole
                         value = value[tuple(slice(0, n) for n in tensor.shape)]
                     local_model_state[name] = value
     module.load_state_dict(local_model_state, strict=strict)
@@ -432,7 +492,7 @@ def load_from_rank_state_dicts(
         if name in optimizer_getters:
             whole = tuple(slice(0, n) for n in param.shape)
             local_optimizer_state[index] = {
-                key: value[whole] if isinstance(value, _LazyRegion) else value
+                key: value[whole] if isinstance(value, LazyTensor) else value
                 for key, value in optimizer_getters[name]().items()
             }
     opt_metadata['state'] = local_optimizer_state

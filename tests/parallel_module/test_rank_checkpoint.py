@@ -73,9 +73,9 @@ def test_load_from_rank_state_dicts_cpu(tmp_path, monkeypatch):
         refs = []
         gather_region = checkpoint._gather_region
 
-        def gather_one(region, shards):
-            out = gather_region(region, shards)
-            assert list(out.shape) == [s.stop - s.start for s in region]
+        def gather_one(region, shards, flat=None):
+            out = gather_region(region, shards, flat)
+            assert list(out.shape) == ([s.stop - s.start for s in region] if flat is None else [flat[1] - flat[0]])
             refs.append(weakref.ref(out))
             return out
 
@@ -113,6 +113,14 @@ def test_gather_region():
     scalar = torch.tensor(3.0)
     assert_equal(checkpoint._gather_region((), [checkpoint._Shard((), None, scalar)]), scalar)
     assert_equal(checkpoint._gather_region((), [checkpoint._Shard((), (0, 1), scalar.reshape(1))]), scalar)
+    # Flattened target ranges (ZeRO-3 chunks of a box) from box shards and from flat shards,
+    # with row-aligned boxes (contiguous runs) and column-split boxes (scattered positions).
+    row_shards = [checkpoint._Shard((slice(r, r + 3), slice(0, 8)), None, full[r:r + 3].clone()) for r in (0, 3)]
+    for shards in (column_shards, flat_shards, row_shards):
+        for target in (box, (slice(1, 5), slice(0, 8)), (slice(2, 6), slice(3, 8))):
+            region = full[target].reshape(-1)
+            for lo, hi in ((0, region.numel()), (5, 17), (region.numel() - 4, region.numel())):
+                assert_equal(checkpoint._gather_region(target, shards, (lo, hi)), region[lo:hi])
     # Overlapping shards are allowed; a gap is not, even if the element count matches.
     overlapping = [checkpoint._Shard(box, None, full.clone())] + column_shards
     assert_equal(checkpoint._gather_region(box, overlapping), full)
