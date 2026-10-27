@@ -1326,7 +1326,8 @@ def trainer_resumable_dataloader(save_dir):
         ])
         trainer.run()
         assert trainer.dataloader_resumed
-        assert 'cannot be loaded directly' in log.getvalue()
+        # rejected either by the shard metadata or, on ranks whose bucket count changed, by the optimizer layout
+        assert 'cannot be loaded directly' in log.getvalue() or 'differs from the current optimizer' in log.getvalue()
         assert 'each rank assembles its own shard' in log.getvalue()
 
     ckpt6_1_savedir = save_dir / 'ckpt6_1'
@@ -1380,6 +1381,54 @@ def trainer_resumable_dataloader(save_dir):
                 assert_equal(x[key], s[key])
                 if key != 'dataloader':
                     assert_equal(g[key], x[key])
+
+
+def trainer_resume_non_parallel_zero_worker(save_dir):
+    """
+    Turning ZeRO off for the non-parallel parameters leaves the ParallelModules' metadata
+    unchanged but changes the optimizer layout, so the rank files cannot be loaded directly;
+    resuming must reshard them and match resuming from the merged checkpoint.
+    """
+    save_dir = Path(save_dir)
+    config_path = str(Path(__file__).with_name('trainer_args_mixed1.yaml').resolve())
+    source_dir = save_dir / 'source'
+    trainer = Trainer([
+        '-f', config_path,
+        '--max_epochs', '1',
+        '--enable_progress_bar', 'false',
+        '--gen_savedir', str(save_dir / 'gen'),
+        '--checkpoint.save_dir', str(source_dir),
+    ])
+    trainer.run()
+    torch.distributed.barrier()
+
+    results = {}
+    for mode, with_merged in (('reshard', 'false'), ('merged', 'true')):
+        work_dir = save_dir / mode
+        with catch_log(logger) as log:
+            trainer = Trainer([
+                '-f', config_path,
+                '--max_epochs', '2',
+                '--enable_progress_bar', 'false',
+                '--gen_savedir', str(save_dir / 'gen'),
+                '--model.non_parallel_params_reducer_config.use_zero', 'false',
+                '--checkpoint.save_dir', str(work_dir),
+                '--checkpoint.resume_from.checkpoint', str(source_dir / 'last'),
+                '--checkpoint.resume_from.with_merged', with_merged,
+            ])
+            trainer.run()
+        assert ('each rank assembles its own shard' in log.getvalue()) == (mode == 'reshard')
+        if mode == 'reshard':
+            assert 'differs from the current optimizer' in log.getvalue()
+        torch.distributed.barrier()
+        results[mode] = torch.load(work_dir / 'last' / f'{trainer.rank}.ckpt', weights_only=False)
+    for key in ('model', 'optimizer'):
+        assert_equal(results['reshard'][key], results['merged'][key])
+
+
+@pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.device_count() < 4, reason='lack of gpu devices')
+def test_trainer_resume_non_parallel_zero(tmp_path):
+    launch_torchrun(4, trainer_resume_non_parallel_zero_worker, tmp_path)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.device_count() < 4, reason='lack of gpu devices')
