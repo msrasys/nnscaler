@@ -29,14 +29,15 @@ class CPUOffloadConfig:
     max_prefetch_bytes: int = 512 * 1024**2
     prefetch_groups: int = 1
     reload_on_compute_stream: bool = True
+    skip_retained_inputs: bool = True
     # Leave headroom for the dataloader, optimizer, compilation and other ranks.
     host_reserve_bytes: int = 32 * 1024**3
 
     def __post_init__(self):
         for name, value in vars(self).items():
-            if name == 'reload_on_compute_stream':
+            if name in ('reload_on_compute_stream', 'skip_retained_inputs'):
                 if not isinstance(value, bool):
-                    raise ValueError('reload_on_compute_stream must be a bool')
+                    raise ValueError(f'{name} must be a bool')
                 continue
             if isinstance(value, bool) or not isinstance(value, int) or value < 0:
                 raise ValueError(f'{name} must be a non-negative integer, got {value!r}')
@@ -419,11 +420,35 @@ class _OffloadGroup:
 _scope = ContextVar('nnscaler_activation_offload_scope', default=None)
 
 
+def mark_retained_scope_tensors(values):
+    """Exclude storage already retained by the executor until backward.
+
+    Identities belong to this forward scope, not the tensor or process. The
+    executor's saved inputs provide the strong references; this set adds none.
+    """
+    scope = _scope.get()
+    if scope is None or not scope.manager.config.skip_retained_inputs:
+        return
+    def visit(value):
+        if torch.is_tensor(value):
+            if value.device.type == 'cuda' and value.layout == torch.strided:
+                scope.retained_storages.add((value.device, value.untyped_storage()._cdata))
+        elif isinstance(value, (tuple, list)):
+            for item in value:
+                visit(item)
+        elif isinstance(value, dict):
+            for item in value.values():
+                visit(item)
+    visit(values)
+
+
 class _ForwardScope:
     def __init__(self, manager, immediate_backward=False):
         self.manager = manager
         self.immediate_backward = immediate_backward
         self.groups = []
+        self.retained_storages = set()
+        self.retained_saved = set()
 
     def prefetch(self):
         # Shape-only ops, filtered tensors and checkpoint tails can create
@@ -498,6 +523,14 @@ class ActivationOffloadManager:
         if owner is not None:
             return _ModuleTensorRef(owner, tensor)
         storage = tensor.untyped_storage()
+        identity = (tensor.device, storage._cdata)
+        if identity in group.scope.retained_storages:
+            key = (*identity, tensor._version)
+            if key not in group.scope.retained_saved:
+                group.scope.retained_saved.add(key)
+                self.pool.stats['retained_input_bytes'] += storage.nbytes()
+                self.pool.stats['retained_input_storages'] += 1
+            return _ResidentTensorRef(tensor)
         if (getattr(storage, '_nnscaler_activation_resident', False)
                 or tensor.is_conj() or tensor.is_neg() or torch.is_inference(tensor)):
             return _ResidentTensorRef(tensor)

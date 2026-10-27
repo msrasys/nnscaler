@@ -246,6 +246,11 @@ class Executor:
         saved_pairs = [(id(itensor), dtensor) for itensor, dtensor in zip(input_tensors, input_dtensors)]
         Executor._detach.setdefault(name, []).append(saved_pairs)
 
+        # These input objects already stay alive through this segment's
+        # backward. Copying their storage to the host cannot release it.
+        from nnscaler.runtime.cpu_offloading import mark_retained_scope_tensors
+        mark_retained_scope_tensors(input_dtensors)
+
         outputs = subgraph(*input_dtensors)
         return outputs
 

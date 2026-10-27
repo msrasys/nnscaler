@@ -49,6 +49,33 @@ cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason='CUDA required')
 
 
 @cuda
+@pytest.mark.parametrize('skip', [False, True])
+def test_executor_retained_inputs_skip_only_unreclaimable_storage(skip):
+    from nnscaler.runtime.executor import Executor
+    module = OffloadModule(skip_retained_inputs=skip)
+    x = torch.randn(64, 64, device='cuda', requires_grad=True)
+    expected = torch.autograd.grad(x.sin().cos().sum(), x)[0]
+    def forward(value):
+        with module.cpu_offloading_hooks() as group:
+            result = value.sin().cos()
+        group.watch(result)
+        return result
+    key = ('retained-input-test', 0)
+    with module.activation_offload_scope(key):
+        y = Executor.fexecute('retained-input-test', forward, x)
+    module.prefetch_activation(key)
+    actual = Executor.backward('retained-input-test', [x], [y], [torch.ones_like(y)])
+    module.finish_activation_offload(key)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    stats = module.activation_offload_stats()
+    assert stats['offloaded_storages'] == (1 if skip else 2)
+    assert stats['d2h_bytes'] == x.numel() * x.element_size() * (1 if skip else 2)
+    assert stats['live_cpu_bytes'] == 0
+    assert stats.get('retained_input_bytes', 0) == (x.numel() * x.element_size() if skip else 0)
+    assert not module._get_activation_offload_manager().scopes
+
+
+@cuda
 @pytest.mark.parametrize('recompute', [False, True])
 def test_parity_and_checkpoint_boundary_only(recompute):
     module = OffloadModule()
