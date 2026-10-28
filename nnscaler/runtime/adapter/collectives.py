@@ -39,6 +39,20 @@ def _all_to_all_destinations(ranks, dsts):
     return dsts
 
 
+def _async_result(tensor, work, callback):
+    # A producer may also feed a local branch. Only the result gets a pending
+    # identity; a view retains input storage and its grad edge without a copy.
+    result = tensor.view_as(tensor)
+
+    def complete(_):
+        # AsyncCommHandler keys work by id. Keep this exact Tensor alive until
+        # completion even if its caller drops the result, preventing id reuse.
+        return callback(result)
+
+    AsyncCommHandler().submit(result, [work], complete)
+    return result
+
+
 def _serialize_object(obj) -> bytes:
     buffer = io.BytesIO()
     torch.save(obj, buffer)
@@ -174,8 +188,7 @@ def all_gather(tensor: torch.Tensor, dim: int,
         return torch.concat(tuple(tensor_list[index] for index in gather_order), dim=dim)
 
     if work:
-        AsyncCommHandler().submit(tensor, [work], concat_gathered)
-        otensor = tensor
+        otensor = _async_result(tensor, work, concat_gathered)
     else:
         otensor = concat_gathered(tensor)
     if not async_op:
@@ -247,8 +260,7 @@ def all_to_all(tensor: torch.Tensor, idim: int, odim: int,
     otensors = [otensors[group_ranks.index(rank)] for rank in ranks]
     if work:
         all2all_callback = lambda t: torch.concat(tuple(otensors), dim=idim)
-        AsyncCommHandler().submit(tensor, [work], all2all_callback)
-        otensor = tensor
+        otensor = _async_result(tensor, work, all2all_callback)
     else:
         otensor = torch.concat(tuple(otensors), dim=idim)
     if not async_op:
@@ -280,10 +292,9 @@ def all_to_all_single(tensor: torch.Tensor, idim: int, odim: int,
         return torch.cat([chunks[group_ranks.index(rank)] for rank in ranks], dim=idim)
 
     if work:
-        AsyncCommHandler().submit(tensor, [work], all2all_callback)
-        # Return the tensor registered as the async handle. wait(tensor) runs
-        # the callback and returns the output assembled from received.
-        otensor = tensor
+        # Keep the pending result distinct from the producer, without copying
+        # its payload. wait(otensor) assembles the real output from received.
+        otensor = _async_result(tensor, work, all2all_callback)
     else:
         otensor = all2all_callback(tensor)
 
