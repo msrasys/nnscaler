@@ -566,6 +566,7 @@ class Bucket:
         @torch.no_grad()
         def post_grad_hook(param: torch.nn.Parameter, *unused): # pragma: no cover
             # stream = DeviceGroup().get_stream('reducer')
+            self._validate_async_contribution(param)
             ofst = self._pofset[param]
             rank = torch.distributed.get_rank()
             manually_accumulated = param in self._manual_grad_pending
@@ -615,23 +616,7 @@ class Bucket:
 
             # perform all-reduce
             if self._async:
-                if self._grad_accumulation_steps:
-                    target_cnt = self._grad_accumulation_steps * len(self._params)
-                    self._async_param_cnt += 1
-                    if self._async_param_cnt > target_cnt:
-                        raise RuntimeError(
-                            f"Asynchronous Reducer received more gradients than expected "
-                            f"({self._async_param_cnt} > {target_cnt} = "
-                            f"grad_accumulation_steps({self._grad_accumulation_steps}) * num_params({len(self._params)})). "
-                            f"Make sure `grad_accumulation_steps` matches the actual number of gradient accumulation steps per optimizer step."
-                        )
-                    if self._async_param_cnt == target_cnt:
-                        self._launch_async_reduce()
-                else:
-                    # Scheduled PP/VPP can contribute a different number of
-                    # gradients per parameter, so use generated per-parameter
-                    # counts instead of a uniform accumulation multiplier.
-                    self._mark_async_param_ready(param)
+                self._mark_async_param_ready(param)
 
         for param in self._params:
             # same trick with FSDP and Megatron
@@ -683,6 +668,9 @@ class Bucket:
                 f"{self._contiguous_grads.device}."
             )
 
+        # Manual gradients reach the buffer before AccumulateGrad. Check each
+        # slice without consuming a contribution; the hook commits it once.
+        self._validate_async_contribution(param)
         ofst = self._pofset[param]
         if not self._z3:
             self._contiguous_grads[ofst + offset:ofst + end].add_(grad)
@@ -787,20 +775,34 @@ class Bucket:
                 self._contiguous_grads, op=self._reduce_op, group=self._group)
         CudaTimer().stop('comm', predefined=True)
 
-    def _mark_async_param_ready(self, param: torch.nn.Parameter):
-        expected = self._async_expected_param_cnt.get(param, 1)
+    def _validate_async_contribution(self, param: torch.nn.Parameter):
+        if not self._async:
+            return
+        # Even a skipped reducer hook may not overwrite an in-flight buffer.
+        if self._async_handle is not None:
+            raise RuntimeError(
+                "Detected more async reducer gradient contributions than expected: "
+                "the bucket reduction is already in flight."
+            )
+        if not self._grad_accumulation_steps and RuntimeFlag.skip_reducer:
+            return
+        expected = self._grad_accumulation_steps or self._async_expected_param_cnt.get(param, 1)
+        total = self._grad_accumulation_steps * len(self._params) or self._async_expected_total
         seen = self._async_seen_param_cnt.get(param, 0) + 1
-        self._async_seen_param_cnt[param] = seen
-        self._async_param_cnt += 1
-
-        if seen > expected or self._async_param_cnt > self._async_expected_total:
+        if seen > expected or self._async_param_cnt + 1 > total:
             raise RuntimeError(
                 "Detected more async reducer gradient contributions than expected. "
                 f"param_seen={seen}/{expected}, "
-                f"bucket_seen={self._async_param_cnt}/{self._async_expected_total}. "
+                f"bucket_seen={self._async_param_cnt + 1}/{total}. "
                 "Please check the scheduled pipeline accumulation plan."
             )
-        if self._async_param_cnt == self._async_expected_total:
+
+    def _mark_async_param_ready(self, param: torch.nn.Parameter):
+        self._validate_async_contribution(param)
+        self._async_seen_param_cnt[param] = self._async_seen_param_cnt.get(param, 0) + 1
+        self._async_param_cnt += 1
+        total = self._grad_accumulation_steps * len(self._params) or self._async_expected_total
+        if self._async_param_cnt == total:
             self._launch_async_reduce()
 
     def _launch_async_reduce(self):
