@@ -36,6 +36,15 @@ storage offsets. Shared storage/views with the same version share one record,
 including across regions and live forward scopes of a compiled module. Tensor
 identity is not inferred from shape or allocator address alone.
 
+Releasing a graph also releases offload contexts and scope/group metadata when
+Python cyclic garbage collection is disabled. The forward scope owns its group
+list; groups only weakly reference that scope and retain the manager and previous
+groups needed for backward lookahead. Exiting a region drops the saved-hook
+context manager to break its bound-method cycle. Autograd continues to own the
+unpack callback while a saved value is live, including with `retain_graph=True`.
+Output traversal is iterative so a self-referencing visitor cannot retain
+autograd nodes, boundary inputs or their gradients.
+
 ## Immutability contract
 
 An activation saved by an offload context and every alias of its storage must

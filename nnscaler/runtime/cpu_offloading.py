@@ -462,12 +462,22 @@ def _iter_tensors(values):
 
 class _OffloadGroup:
     def __init__(self, scope):
-        self.scope = scope
+        # The scope owns its groups for schedule lookahead. A strong reverse
+        # link would leak every group's metadata when cyclic GC is disabled.
+        # Backward only needs the manager and previous-group chain; the scope
+        # itself is needed only while packing tensors in the active forward.
+        self._scope = weakref.ref(scope)
+        self.manager = scope.manager
+        self.keep_resident = scope.keep_resident
         self.records = []
         self.pending = []
         self.producer_events = None
         self.previous = scope.groups[-1] if scope.groups else None
         scope.groups.append(self)
+
+    @property
+    def scope(self):
+        return self._scope()
 
     def capture_producer_event(self, stream):
         if self.producer_events is None:
@@ -479,12 +489,12 @@ class _OffloadGroup:
         # Re-record within this group; commit enqueues waits only after all
         # saves. The latest snapshot covers every earlier save on this stream.
         event.record(stream)
-        self.scope.manager.pool.stats['saved_tensor_event_records'] += 1
+        self.manager.pool.stats['saved_tensor_event_records'] += 1
 
     def commit(self):
         # Admit before a region starts, then enqueue its whole batch without
         # host waits between copies. Wait once for each producing stream.
-        manager = self.scope.manager
+        manager = self.manager
         pending = []
         for record in self.pending:
             if record.live_saves:
@@ -531,11 +541,11 @@ class _OffloadGroup:
                 record.prefetch(from_schedule=from_schedule)
 
     def backward_entry(self, *unused):
-        if not self.scope.manager.config.prefetch_groups:
+        if not self.manager.config.prefetch_groups:
             return
         self.prefetch()
         group = self.previous
-        remaining = self.scope.manager.config.prefetch_groups
+        remaining = self.manager.config.prefetch_groups
         while group is not None and remaining:
             if group.has_pending_loads():
                 group.prefetch()
@@ -735,6 +745,7 @@ class CPUOffloadContext:
             self._hooks = saved_tensors_hooks(self._pack, self._unpack)
             self._hooks.__enter__()
         except BaseException as error:
+            self._hooks = None
             self._scope_context.__exit__(type(error), error, error.__traceback__)
             raise
         return self
@@ -747,6 +758,10 @@ class CPUOffloadContext:
             else:
                 self.group.pending.clear()
         finally:
+            # saved_tensors_hooks stores bound pack/unpack methods, so keeping
+            # it here creates context -> hooks -> context. Autograd owns the
+            # unpack method for as long as each saved value still needs it.
+            self._hooks = None
             self._scope_context.__exit__(exc_type, exc_value, traceback)
 
     def _pack(self, tensor):
@@ -772,5 +787,5 @@ class CPUOffloadContext:
         return value
 
     def watch(self, outputs):
-        if not self.group.scope.keep_resident:
+        if not self.group.keep_resident:
             self.group.watch(outputs)

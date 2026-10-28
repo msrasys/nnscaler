@@ -73,8 +73,56 @@ def test_compute_config_roundtrip(tmp_path):
 cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason='CUDA required')
 
 
+@pytest.mark.parametrize('scoped', [False, True])
+@pytest.mark.parametrize('abort', [False, True])
+def test_offload_metadata_is_released_without_cyclic_gc(monkeypatch, scoped, abort):
+    from nnscaler.runtime.cpu_offloading import ActivationOffloadManager, CPUOffloadContext
+
+    # Exercise the real scope, group and hook ownership on CPU. No CUDA
+    # allocations or transfers are needed to expose these reference cycles.
+    monkeypatch.setattr(torch.cuda, 'is_available', lambda: False)
+    module = torch.nn.Module()
+    manager = ActivationOffloadManager(module, CPUOffloadConfig())
+    module._get_activation_offload_manager = lambda: manager
+    enabled = gc.isenabled()
+    gc.disable()
+    try:
+        for step in range(8):
+            outer = manager.scope(step) if scoped else None
+            if outer is not None:
+                outer.__enter__()
+            context = CPUOffloadContext(module)
+            context.__enter__()
+            scope_ref = weakref.ref(context.group.scope)
+            group_ref = weakref.ref(context.group)
+            context_ref = weakref.ref(context)
+            x = torch.randn(8, requires_grad=True)
+            y = x.sin()
+            context.watch(y)
+            if abort:
+                error = RuntimeError('forward failed')
+                context.__exit__(RuntimeError, error, None)
+            else:
+                context.__exit__(None, None, None)
+            if outer is not None:
+                outer.__exit__(None, None, None)
+            if not abort:
+                y.sum().backward(retain_graph=True)
+                y.sum().backward()
+                torch.testing.assert_close(x.grad, 2 * x.cos())
+            manager.finish(step)
+            del context, outer, x, y
+            assert context_ref() is None, 'saved_tensors_hooks retained its bound context'
+            assert group_ref() is None, 'offload group retained after graph release'
+            assert scope_ref() is None, 'scope/group ownership forms a reference cycle'
+    finally:
+        if enabled:
+            gc.enable()
+        gc.collect()
+
+
 def test_watch_releases_autograd_nodes_without_cyclic_gc():
-    from nnscaler.runtime.cpu_offloading import _OffloadGroup
+    from nnscaler.runtime.cpu_offloading import _ForwardScope, _OffloadGroup
 
     class Sentinel:
         pass
@@ -93,8 +141,7 @@ def test_watch_releases_autograd_nodes_without_cyclic_gc():
     enabled = gc.isenabled()
     gc.disable()
     try:
-        scope = SimpleNamespace(groups=[], manager=SimpleNamespace(
-            config=CPUOffloadConfig(prefetch_groups=0)))
+        scope = _ForwardScope(SimpleNamespace(config=CPUOffloadConfig(prefetch_groups=0)))
         group = _OffloadGroup(scope)
         sentinel = Sentinel()
         observed = weakref.ref(sentinel)
@@ -125,10 +172,16 @@ def test_repeated_offload_steps_do_not_retain_cuda_payloads_with_gc_disabled():
             with module.activation_offload_scope(step):
                 with module.cpu_offloading_hooks() as group:
                     loss = value.sin().cos().sum()
+                    scope_ref = weakref.ref(group.group.scope)
+                    group_ref = weakref.ref(group.group)
+                    context_ref = weakref.ref(group)
                 group.watch({'nested': (loss, loss)})
             loss.backward()
             module.finish_activation_offload(step)
             del loss, value, group
+            assert context_ref() is None
+            assert group_ref() is None
+            assert scope_ref() is None
             torch.cuda.synchronize()
             samples.append(torch.cuda.memory_allocated())
         assert max(samples[3:]) - min(samples[3:]) < 1024**2, samples
