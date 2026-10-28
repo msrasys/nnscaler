@@ -15,6 +15,7 @@ from .parallel import (
     load_deduped_state_dict,
     broadcast_weights,
     load_sharded_state_dict,
+    align_state_dict_names,
     sync_grad_when,
     trimmed_broadcast_merged_state_dict,
     load_merged_state_dict_from_rank,

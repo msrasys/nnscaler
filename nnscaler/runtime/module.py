@@ -139,7 +139,7 @@ class AttrMeta:
     orig_name: str
     # shape of the full tensor
     shape: Tuple[int, ...]
-    # list of slicers to index the full tensor
+    # Per-dimension slices; an empty tuple indexes a scalar tensor.
     slicers: Tuple[slice, ...]
     # the number of the partitioned values, usually 1
     # (i.e., no partition on value -> no need to sum up)
@@ -149,6 +149,17 @@ class AttrMeta:
     # shape of the sub tensor
     # it should be the shape of full_tensor[slicers]
     sub_shape: Tuple[int, ...]
+
+    def __post_init__(self):
+        # Legacy generated metadata represents scalar indexing as Ellipsis/'...'.
+        if not self.shape:
+            self.slicers = ()
+            # The old IR represented scalars with a synthetic one-element axis.
+            self.sub_shape = ()
+
+    def __setstate__(self, state):
+        self.__dict__.update(state)
+        self.__post_init__()
 
     def get_local_numel(self):
         return math.prod(self.sub_shape)
@@ -700,7 +711,9 @@ class CubeModule(torch.nn.Module):
                             raise ValueError("Invalid tensor as a ZeRO3 parameter, expected a 1D tensor.")
                         curr_filled = zero3_current_filled.setdefault(meta.orig_name, {}).setdefault(state_dict_merge_track_id, [])
                         curr_z3_info = zero3_param_metadata[local_name]
-                        curr_start, curr_end = curr_z3_info['start'], curr_z3_info['end']
+                        if isinstance(curr_z3_info, dict):
+                            curr_z3_info = Zero3AttrMeta(**curr_z3_info)
+                        curr_start, curr_end = curr_z3_info.start, curr_z3_info.end
                         fill_len = curr_end - curr_start
                         if (curr_start, curr_end) in curr_filled:
                             # already filled, let's check consistency

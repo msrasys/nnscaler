@@ -475,6 +475,37 @@ Move all parameters and buffers back to GPU and reallocate reducer memory. This 
 You can save/load the checkpoints for parallel modules.
 Each rank will save/load its own checkpoint just like a normal module.
 
+`nnscaler.load_sharded_state_dict` and `nnscaler.load_deduped_state_dict`
+automatically align generated parameter and buffer names after re-tracing.
+`nnscaler.align_state_dict_names(module, state_dict)` exposes the same adapter
+and returns a shallow dictionary copy while retaining the original tensor
+objects and dictionary metadata. The source state dictionary is not modified.
+Only generated names and tensor IDs may change: original names, module prefixes,
+tensor dtype/shape, each shard's layout, and optimizer parameter/bucket order
+must remain compatible. Ambiguous or incompatible metadata raises `ValueError`;
+load a merged checkpoint for a changed parallel layout. Multiple distinct shards
+of one original parameter on a rank are matched by their complete shard identity.
+Legacy scalar metadata using Ellipsis or a synthetic one-element dimension is
+normalized when loaded.
+
+When an optimizer is supplied, loading also checks its global parameter layout
+before changing weights. Optimizers returned by `build_optimizer` use their
+saved module locations and uncompiled parameter names. Legacy checkpoints that
+do not identify uncompiled parameters cannot prove their order and must use a
+merged checkpoint. A raw PyTorch optimizer used with sharded loading must save
+`param_names` in each parameter group; positional IDs alone do not identify which
+parameter owns a momentum/state tensor. For example, construct its group with
+`{'params': [p for n, p in model.named_parameters()], 'param_names': [n for n, p in model.named_parameters()]}`.
+Raw named groups are checked against the actual target optimizer parameters, so
+unrelated model dictionary ordering does not affect a compatible restore.
+Deduped optimizer loading requires the `build_optimizer` metadata used by its
+broadcast layout. Model-only loading is independent of optimizer ordering.
+The optional uncompiled parameter-name list is an optimizer top-level key,
+`_nnscaler_non_parallel_param_names`, emitted only when those parameters exist.
+The existing `CUBE_EXTRA_STATE` schema remains unchanged, so older readers can
+still parse and merge these checkpoints; they do not enforce the new ordering
+checks. Reverting code does not make a structurally incompatible resume safe.
+
 Note: The only exception is the non-persistent buffers, which will remain uninitialized after loading the checkpoints, because they are not saved in the state dict. To make sure all the buffers are initialized, you must initialize the module with `init_params=True`.
 
 You can also merge the checkpoints from different ranks into a single checkpoint.

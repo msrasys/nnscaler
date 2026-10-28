@@ -1820,6 +1820,9 @@ hybrid.is_hybrid = True  # mark this function as hybrid optimizer factory
 
 _NON_PARALLEL_MODULE_ATTR_NAME = '_nnscaler_non_parallel_module_'
 _SYNC_GRAD_REQUIRED_ATTR = '_nnscaler_sync_grad_required'
+# Keep optional identity metadata outside the strict OptimizerExtraState
+# schema: older readers ignore/copy unknown optimizer top-level keys.
+_OPTIMIZER_NON_PARALLEL_NAMES_KEY = '_nnscaler_non_parallel_param_names'
 
 
 def _mark_sync_grad_required(module: torch.nn.Module, inputs, output) -> None:
@@ -2111,6 +2114,7 @@ def build_optimizer(
         object.__setattr__(module, _SYNC_GRAD_REQUIRED_ATTR, False)
         module.register_forward_hook(_mark_sync_grad_required)
     optimizer._non_parallel_module_reducer = non_parallel_module_reducer
+    optimizer._non_parallel_param_names = [param_original_names[p] for p in non_parallel_parameters]
     optimizer._extra_state = OptimizerExtraState(
             rank=torch.distributed.get_rank(),
             name=type(optimizer).__name__,
@@ -2169,12 +2173,15 @@ def build_optimizer(
     def _patched_state_dict(self):
         state_dict = orig_state_dict()
         state_dict[ParallelModule.EXTRA_STATE_KEY] = asdict(optimizer._extra_state)
+        if self._non_parallel_param_names:
+            state_dict[_OPTIMIZER_NON_PARALLEL_NAMES_KEY] = list(self._non_parallel_param_names)
         return state_dict
     optimizer.state_dict = types.MethodType(_patched_state_dict, optimizer)
 
     orig_load_state_dict = optimizer.load_state_dict
     def _patched_load_state_dict(self, state_dict):
         state_dict.pop(ParallelModule.EXTRA_STATE_KEY, None)
+        state_dict.pop(_OPTIMIZER_NON_PARALLEL_NAMES_KEY, None)
         orig_load_state_dict(state_dict)
     optimizer.load_state_dict = types.MethodType(_patched_load_state_dict, optimizer)
 
@@ -3374,6 +3381,14 @@ def load_deduped_state_dict(
     Returns:
         None
     """
+    if optimizer is not None and optimizer_state_dict is not None and not isinstance(
+            getattr(optimizer, '_extra_state', None), OptimizerExtraState):
+        raise ValueError('Deduped optimizer loading requires build_optimizer layout metadata')
+    module_state_dict = align_state_dict_names(
+        module, module_state_dict, optimizer=optimizer, optimizer_state_dict=optimizer_state_dict,
+    )
+    if optimizer_state_dict is not None:
+        optimizer_state_dict = _copy_optimizer_state_metadata(optimizer_state_dict)
     device = device or torch.cuda.current_device()
     cur_rank = torch.distributed.get_rank()
 
@@ -3638,6 +3653,231 @@ def _broadcast_weights(module: torch.nn.Module, stride_size: int):
 
 
 @torch.no_grad()
+def align_state_dict_names(
+    module: torch.nn.Module,
+    module_state_dict: Dict[str, Any],
+    *,
+    optimizer: Optional[torch.optim.Optimizer] = None,
+    optimizer_state_dict: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """
+    Align generated ParallelModule parameter/buffer names in a per-rank checkpoint.
+
+    Match by original name and shard metadata, ignoring generated names and tensor
+    IDs. Return a shallow copy without copying tensors or modifying the input.
+    Module prefixes, original names, partitioning and optimizer parameter order
+    must be unchanged. Missing metadata or ambiguous/incompatible matches raise
+    ValueError. This adapter is for sharded/deduped, not merged, state dicts.
+    When restoring an optimizer, also validate its global module locations or
+    saved param_names before loading any weights. Model key order is not an
+    optimizer ordering contract.
+    """
+    def attr_meta_identity(meta: AttrMeta) -> tuple:
+        key = asdict(meta)
+        # Remove tensor ID from the key as it is not used for identity
+        key.pop('tid', None)
+        # slice is not hashable in old versions of Python
+        key['slicers'] = tuple((s.start, s.stop, s.step) for s in meta.slicers)
+        return tuple(key.values())
+
+    def zero3_attr_meta_identity(meta: Union[Zero3AttrMeta, dict]) -> tuple:
+        # Keep vl_pp metadata storage unchanged; accept both persisted forms.
+        key = asdict(Zero3AttrMeta(**meta)) if isinstance(meta, dict) else asdict(meta)
+        key.pop('attr_name', None)
+        return tuple(key.values())
+
+    key_map: Dict[str, str] = {}
+    extra_states: Dict[str, Any] = {}
+    for prefix, pm in module.named_modules():
+        if not isinstance(pm, ParallelModule):
+            continue
+        prefix = f'{prefix}.' if prefix else ''
+        extra_key = f'{prefix}{ParallelModule.EXTRA_STATE_KEY}'
+        if extra_key not in module_state_dict:
+            raise ValueError(f"Cannot align checkpoint names: missing {extra_key}")
+        old = ExtraState(**module_state_dict[extra_key])
+        current_state: Dict[str, Any] = {}
+        pm._add_extra_state(current_state, prefix)
+        current = ExtraState(**current_state[extra_key])
+
+        if old.rank != current.rank:
+            raise ValueError(f"Cannot align {extra_key}: checkpoint rank changed")
+
+        for field_name in ('plan_ngpus', 'runtime_ngpus', 'use_zero', 'zero_ngroups'):
+            if getattr(old.compute_config, field_name) != getattr(current.compute_config, field_name):
+                raise ValueError(f"Cannot align {extra_key}: {field_name} changed; load a merged checkpoint instead")
+
+        for field_name in ('origin_param_names', 'origin_state_dict_names', 'origin_shared_param_names'):
+            if getattr(old, field_name) != getattr(current, field_name):
+                raise ValueError(f"Cannot align {extra_key}: original model metadata {field_name} changed; load a merged checkpoint instead")
+
+        candidates: Dict[tuple, str] = {
+            attr_meta_identity(meta): name
+            for name, meta in current.param_area_map.items()
+        }
+        if len(candidates) != len(current.param_area_map):
+            raise ValueError(f"Cannot align {extra_key}: ambiguous shard metadata in module param_area_map")
+
+        # Map old parameter names to new parameter names
+        name_map: Dict[str, str] = {}
+
+        for old_name, meta in old.param_area_map.items():
+            # Consume each match once to keep the old and new shard names in one-to-one correspondence.
+            match = candidates.pop(attr_meta_identity(meta), None)
+            if match is None:
+                raise ValueError(
+                    f"Cannot align {prefix}{old_name}: expected one match for "
+                    f"{meta.orig_name} with the same shard metadata, found {match}"
+                )
+            name_map[old_name] = match
+
+        if candidates:
+            raise ValueError(f"Cannot align {extra_key}: parameter names are missing from shard metadata")
+
+        # Optimizer state uses positional IDs (or bucket offsets), not model keys.
+        if any(name not in name_map for name in old.cube_param_names):
+            raise ValueError(f"Cannot align {extra_key}: optimizer parameter names are missing from shard metadata")
+        if [name_map[name] for name in old.cube_param_names] != current.cube_param_names:
+            raise ValueError(f"Cannot align {extra_key}: optimizer parameter order changed")
+        for field_name in ('zero', 'model_idx2opt_idx', 'opt_idx2ranks'):
+            if getattr(old, field_name) != getattr(current, field_name):
+                raise ValueError(f"Cannot align {extra_key}: optimizer layout {field_name} changed")
+
+        # zero3 config
+        if any(name not in name_map for name, meta in (old.zero3_param_metadata or {}).items() if meta is not None):
+            raise ValueError(f'Cannot align {extra_key}: ZeRO-3 names are missing from shard metadata')
+        old_zero3 = {
+            name_map[name]: zero3_attr_meta_identity(meta)
+            for name, meta in old.zero3_param_metadata.items() if meta is not None
+        } if old.zero3_param_metadata else {}
+        new_zero3 = {
+            name: zero3_attr_meta_identity(meta)
+            for name, meta in current.zero3_param_metadata.items() if meta is not None
+        } if current.zero3_param_metadata else {}
+        if old_zero3 != new_zero3:
+            raise ValueError(f"Cannot align {extra_key}: ZeRO-3 parameter layout changed")
+
+        for name, meta in old.param_area_map.items():
+            # Deduped checkpoints legitimately omit tensors, but any payload
+            # that is present must agree with the metadata being aligned.
+            if f'{prefix}{name}' not in module_state_dict:
+                continue
+            value = module_state_dict[f'{prefix}{name}']
+            zero3_meta = (old.zero3_param_metadata or {}).get(name)
+            if isinstance(zero3_meta, dict):
+                zero3_meta = Zero3AttrMeta(**zero3_meta)
+            expected_shape = (zero3_meta.chunk_size,) if zero3_meta is not None else tuple(meta.sub_shape)
+            if not isinstance(value, torch.Tensor) or value.dtype != meta.dtype or tuple(value.shape) != expected_shape:
+                raise ValueError(f'Cannot align {prefix}{name}: tensor dtype or shape does not match shard metadata')
+
+        key_map.update({f'{prefix}{old_name}': f'{prefix}{new_name}' for old_name, new_name in name_map.items()})
+        extra_states[extra_key] = current_state[extra_key]
+
+    if optimizer is not None and optimizer_state_dict is not None and extra_states:
+        _validate_optimizer_checkpoint_layout(module, optimizer, optimizer_state_dict, key_map)
+
+    # create a new adapted state dict with the same type of original state dict
+    # And this can also keep the `_metadata` attached to the dict if it exists
+    adapted = copy.copy(module_state_dict)
+    adapted.clear()
+    for key, value in module_state_dict.items():
+        new_key = key_map.get(key, key)
+        if new_key in adapted:
+            raise ValueError(f"Cannot align checkpoint names: key collision at {new_key}")
+        adapted[new_key] = extra_states.get(key, value)
+    logger.info("Aligned %s checkpoint parameter/buffer names", sum(k != v for k, v in key_map.items()))
+    return adapted
+
+
+def _validate_optimizer_checkpoint_layout(module, optimizer, state_dict, name_map):
+    """Validate positional optimizer IDs independently of model dictionary order."""
+    current = getattr(optimizer, '_extra_state', None)
+    if isinstance(current, OptimizerExtraState):
+        metadata = state_dict.get(ParallelModule.EXTRA_STATE_KEY)
+        if metadata is None:
+            raise ValueError('Cannot verify optimizer parameter order: checkpoint is missing optimizer layout metadata')
+        old = OptimizerExtraState(**metadata)
+        for field in ('rank', 'name', 'parallel_module_locs', 'non_parallel_param_locs'):
+            if getattr(old, field) != getattr(current, field):
+                raise ValueError(f'Cannot load optimizer: global parameter layout {field} changed')
+        if old.parallel_module_configs.keys() != current.parallel_module_configs.keys():
+            raise ValueError('Cannot load optimizer: parallel module locations changed')
+        old_nonparallel = old.non_parallel_extra_state
+        current_nonparallel = current.non_parallel_extra_state
+        if (old_nonparallel is None) != (current_nonparallel is None):
+            raise ValueError('Cannot load optimizer: non-parallel reducer layout changed')
+        if old_nonparallel is not None:
+            for field in ('zero', 'model_idx2opt_idx', 'opt_idx2ranks', 'cube_param_names',
+                          'origin_param_names', 'origin_shared_param_names'):
+                if getattr(old_nonparallel, field) != getattr(current_nonparallel, field):
+                    raise ValueError(f'Cannot load optimizer: non-parallel reducer layout {field} changed')
+            old_map = {name: replace(meta, tid=0) for name, meta in old_nonparallel.param_area_map.items()}
+            current_map = {name: replace(meta, tid=0) for name, meta in current_nonparallel.param_area_map.items()}
+            if old_map != current_map:
+                raise ValueError('Cannot load optimizer: non-parallel reducer shard layout changed')
+        old_names = state_dict.get(_OPTIMIZER_NON_PARALLEL_NAMES_KEY)
+        if old_names is None and old.non_parallel_extra_state is not None:
+            old_names = old.non_parallel_extra_state.origin_param_names
+        current_names = getattr(optimizer, '_non_parallel_param_names', None)
+        if current_names is None and current.non_parallel_extra_state is not None:
+            current_names = current.non_parallel_extra_state.origin_param_names
+        if old_names is None:
+            if current_names:
+                raise ValueError('Cannot verify optimizer parameter order for legacy non-parallel parameters; '
+                                 'load a merged checkpoint instead')
+            old_names = []
+        if old_names != (current_names or []):
+            raise ValueError('Cannot load optimizer: non-parallel parameter order changed')
+        current_groups = optimizer.state_dict()['param_groups']
+        saved_groups = state_dict['param_groups']
+        if ([group['params'] for group in saved_groups]
+                != [group['params'] for group in current_groups]):
+            raise ValueError('Cannot load optimizer: positional parameter-group layout changed')
+        return
+
+    # Raw PyTorch optimizer IDs have no parameter identity. A model state_dict
+    # may be reordered, and its order need not match optimizer construction.
+    # Require explicit saved names rather than guessing which momentum belongs
+    # to a parameter. Names map through the same checked shard-name alignment.
+    aliases = defaultdict(set)
+    for name, param in module.named_parameters(remove_duplicate=False):
+        aliases[id(param)].add(name)
+    saved_groups = state_dict.get('param_groups', [])
+    if len(saved_groups) != len(optimizer.param_groups):
+        raise ValueError('Cannot load optimizer: parameter-group layout changed')
+    for saved, current_group in zip(saved_groups, optimizer.param_groups):
+        names = saved.get('param_names')
+        if names is None:
+            raise ValueError('Cannot verify raw optimizer parameter order without saved param_names; '
+                             'use build_optimizer or a checkpoint with explicit parameter names')
+        if len(names) != len(saved['params']) or len(names) != len(current_group['params']):
+            raise ValueError('Cannot load optimizer: named parameter-group layout changed')
+        for name, param in zip(names, current_group['params']):
+            if not isinstance(name, str):
+                raise ValueError('Cannot verify raw optimizer parameter order: param_names must be strings')
+            if name_map.get(name, name) not in aliases[id(param)]:
+                raise ValueError('Cannot load optimizer: global named parameter order changed')
+
+
+def _copy_optimizer_state_metadata(state_dict, module=None, optimizer=None):
+    # The wrapped optimizer removes its extra state on load; hybrid optimizers
+    # also replace nested param-group IDs. Preserve caller-owned metadata while
+    # retaining tensor storage and bounded restore memory.
+    result = copy.copy(state_dict)
+    result['param_groups'] = copy.deepcopy(state_dict['param_groups'])
+    result['state'] = {index: copy.copy(state) for index, state in state_dict['state'].items()}
+    if module is not None and optimizer is not None and not isinstance(
+            getattr(optimizer, '_extra_state', None), OptimizerExtraState):
+        names = {id(param): name for name, param in module.named_parameters()}
+        for saved, current in zip(result['param_groups'], optimizer.param_groups):
+            if 'param_names' in saved:
+                # Subsequent raw-optimizer saves must refer to the newly
+                # generated names rather than stale checkpoint tensor IDs.
+                saved['param_names'] = [names[id(param)] for param in current['params']]
+    return result
+
+
+@torch.no_grad()
 def load_sharded_state_dict(
     module: torch.nn.Module,
     module_state_dict: Dict[str, Any],
@@ -3660,13 +3900,16 @@ def load_sharded_state_dict(
     Returns:
         None
     """
+    module_state_dict = align_state_dict_names(
+        module, module_state_dict, optimizer=optimizer, optimizer_state_dict=optimizer_state_dict,
+    )
 
     device = device or torch.cuda.current_device()
     module.to(device)
 
     module.load_state_dict(module_state_dict)
     if optimizer and optimizer_state_dict:
-        optimizer.load_state_dict(optimizer_state_dict)
+        optimizer.load_state_dict(_copy_optimizer_state_metadata(optimizer_state_dict, module, optimizer))
 
 
 def sync_grad_when(cond: bool):
