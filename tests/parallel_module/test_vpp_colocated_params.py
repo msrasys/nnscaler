@@ -14,6 +14,7 @@ from nnscaler import ComputeConfig, build_optimizer, parallelize
 from nnscaler.policies import OpPartition, OpPlan, fn, get_pas_ops
 from tests.launch_torchrun import launch_torchrun
 from tests.utils import PYTEST_RUN_ID, clear_dir_on_rank0
+from tests.parallel_module.test_collective_layout_model import requested_async_comm, assert_generated_comm_mode
 
 
 class ReusedBlocks(torch.nn.Module):
@@ -42,7 +43,15 @@ def shared_vpp_policy(graph, cfg):
     return fn(graph, cfg, plans)
 
 
-def colocated_worker(async_reducer=False, pipeline_multiref_replicated_params=True):
+def colocated_config(async_reducer=False, pipeline_multiref_replicated_params=True, use_async_comm=False):
+    return ComputeConfig(4, 4, use_end2end=True, use_async_reducer=async_reducer,
+                         use_async_comm=use_async_comm,
+                         pas_config={'pipeline_size': 2, 'pipeline_nmicros': 4,
+                                     'pipeline_scheduler': '1f1b_interleaved',
+                                     'pipeline_multiref_replicated_params': pipeline_multiref_replicated_params})
+
+
+def colocated_worker(async_reducer=False, pipeline_multiref_replicated_params=True, use_async_comm=False):
     nnscaler.init()
     errors = {'loss_max_abs': 0., 'gradient_max_abs': 0., 'weight_max_abs': 0.}
     # Full and partitioned batches can select different TF32 kernels. Use
@@ -52,14 +61,13 @@ def colocated_worker(async_reducer=False, pipeline_multiref_replicated_params=Tr
     source = ReusedBlocks()
     reference = copy.deepcopy(source).cuda()
     reference_optimizer = torch.optim.SGD(reference.parameters(), lr=0.01)
-    cfg = ComputeConfig(4, 4, use_end2end=True, use_async_reducer=async_reducer,
-                        pas_config={'pipeline_size': 2, 'pipeline_nmicros': 4,
-                                    'pipeline_scheduler': '1f1b_interleaved',
-                                    'pipeline_multiref_replicated_params': pipeline_multiref_replicated_params})
+    cfg = colocated_config(async_reducer, pipeline_multiref_replicated_params, use_async_comm)
     directory = Path(tempfile.gettempdir()) / f'colocated_vpp_{PYTEST_RUN_ID}'
     with clear_dir_on_rank0(directory) as tempdir:
         model = parallelize(source, {'x': torch.ones(8, 8)}, shared_vpp_policy,
                             cfg, gen_savedir=tempdir, reuse='override').cuda()
+        assert model.compute_config.use_async_comm is use_async_comm
+        generated_mode = assert_generated_comm_mode(tempdir, use_async_comm, pipeline=True)
         optimizer = build_optimizer(model, torch.optim.SGD, lr=0.01)
         expected_name = 'a.weight' if torch.distributed.get_rank() < 2 else 'b.weight'
         assert {meta.orig_name for meta in model.fullmap.values()} == {expected_name}
@@ -94,6 +102,7 @@ def colocated_worker(async_reducer=False, pipeline_multiref_replicated_params=Tr
     print('NNSCALER_TEST_METRICS ' + json.dumps({
         'case': 'colocated_vpp', 'rank': torch.distributed.get_rank(),
         'async_reducer': async_reducer, 'multiref': pipeline_multiref_replicated_params, **errors,
+        'async_comm': cfg.use_async_comm, 'generated_mode': generated_mode,
     }))
     return True
 
@@ -103,4 +112,5 @@ def colocated_worker(async_reducer=False, pipeline_multiref_replicated_params=Tr
 @pytest.mark.parametrize('async_reducer', [False, True])
 @pytest.mark.parametrize('pipeline_multiref_replicated_params', [False, True])
 def test_colocated_vpp_matches_unpartitioned_optimizer_steps(async_reducer, pipeline_multiref_replicated_params):
-    assert all(launch_torchrun(4, colocated_worker, async_reducer, pipeline_multiref_replicated_params).values())
+    assert all(launch_torchrun(4, colocated_worker, async_reducer,
+                             pipeline_multiref_replicated_params, requested_async_comm()).values())

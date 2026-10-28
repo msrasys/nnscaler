@@ -5,6 +5,7 @@ import ast
 import copy
 from dataclasses import replace
 import json
+import os
 import tempfile
 from pathlib import Path
 
@@ -41,8 +42,16 @@ def pipeline_policy(graph, cfg):
         yield OpPlan(op, stage_id=stage, partition=None)
 
 
-def pipeline_config():
+def requested_async_comm():
+    value = os.environ.get('ASYNC_COMM', '0')
+    if value not in ('0', '1'):
+        raise ValueError('ASYNC_COMM must be 0 or 1 for this test matrix')
+    return value == '1'
+
+
+def pipeline_config(use_async_comm=False):
     return ComputeConfig(8, 8, use_end2end=True, constant_folding=False,
+                         use_async_comm=use_async_comm,
                          pas_config={'pipeline_size': 2, 'pipeline_nmicros': 4,
                                      'pipeline_scheduler': '1f1b_interleaved'})
 
@@ -63,11 +72,57 @@ def mesh_policy(graph, cfg):
     return graph
 
 
-def model_case(ngpus):
+def model_case(ngpus, use_async_comm=False):
     if ngpus == 4:
         return (PipelineMLP(2), mesh_policy,
-                ComputeConfig(4, 4, use_end2end=True, constant_folding=False))
-    return PipelineMLP(), pipeline_policy, pipeline_config()
+                ComputeConfig(4, 4, use_end2end=True, constant_folding=False,
+                              use_async_comm=use_async_comm))
+    return PipelineMLP(), pipeline_policy, pipeline_config(use_async_comm)
+
+
+def assert_generated_comm_mode(directory, use_async_comm, *, pipeline):
+    """Check actual calls, preserving always-async P2P receive/wait scheduling."""
+    paths = list(directory.rglob('gencode*.py'))
+    assert paths
+    summary = {'files': len(paths), 'p2p_async_calls': 0,
+               'ordinary_async_calls': 0, 'ordinary_sync_calls': 0,
+               'receive_wait_methods': 0, 'output_sync_calls': 0}
+    ordinary = {'all_reduce', 'all_gather', 'reduce_scatter', 'all_to_all',
+                'all_to_all_single', 'broadcast', 'reduce', 'rvscatter', 'rvgather'}
+    for path in paths:
+        tree = ast.parse(path.read_text())
+        train = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == '_train_step')
+        train_calls = [ast.unparse(node.func) for node in ast.walk(train) if isinstance(node, ast.Call)]
+        # This is the async schedule's completion of returned communication
+        # results. P2P move calls remain asynchronous in both configurations.
+        expected_count = int(use_async_comm)
+        assert train_calls.count('nnscaler.runtime.executor.sync_tensors') == expected_count
+        assert train_calls.count('nnscaler.runtime.executor.AsyncCommHandler().drain_sends') == expected_count
+        summary['output_sync_calls'] += expected_count
+        for node in ast.walk(tree):
+            if isinstance(node, ast.FunctionDef) and node.name.startswith('adapter') and node.name.endswith('_wait'):
+                summary['receive_wait_methods'] += 1
+            if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
+                continue
+            signature = ast.unparse(node.func)
+            if not signature.startswith('nnscaler.runtime.adapter.'):
+                continue
+            if node.func.attr not in ordinary | {'move'}:
+                # Reducer constructors have a separate dynamic async_op option.
+                continue
+            options = {kw.arg: ast.literal_eval(kw.value) for kw in node.keywords if kw.arg == 'async_op'}
+            async_op = options.get('async_op', False)
+            if node.func.attr == 'move':
+                assert async_op is True, 'vl_pp retains two-phase P2P even with ordinary async communication disabled'
+                summary['p2p_async_calls'] += 1
+            elif node.func.attr in ordinary:
+                if not use_async_comm:
+                    assert async_op is False
+                summary['ordinary_async_calls' if async_op else 'ordinary_sync_calls'] += 1
+    if pipeline:
+        assert summary['p2p_async_calls'] > 0
+        assert summary['receive_wait_methods'] > 0
+    return summary
 
 
 @pytest.mark.parametrize('ngpus', [4, 8])
@@ -109,11 +164,11 @@ def test_mesh_dp_generates_shifted_collective_layouts(tmp_path):
     assert {(0, 2, 1, 3), (4, 6, 5, 7)} <= layouts
 
 
-def pipeline_worker(ngpus=8, runtime_ngpus=None):
+def pipeline_worker(ngpus=8, runtime_ngpus=None, use_async_comm=False):
     nnscaler.init()
     torch.set_float32_matmul_precision('highest')
     torch.manual_seed(7)
-    source, policy, config = model_case(ngpus)
+    source, policy, config = model_case(ngpus, use_async_comm)
     runtime_ngpus = runtime_ngpus or ngpus
     config = replace(config, runtime_ngpus=runtime_ngpus)
     replicas = runtime_ngpus // ngpus
@@ -122,15 +177,13 @@ def pipeline_worker(ngpus=8, runtime_ngpus=None):
     reference = copy.deepcopy(source).cuda()
     reference_optimizer = torch.optim.SGD(reference.parameters(), lr=0.001)
     reference_params = dict(reference.named_parameters())
-    directory = Path(tempfile.gettempdir()) / f'fn_collective_mlp_{ngpus}_{runtime_ngpus}_{PYTEST_RUN_ID}'
+    directory = Path(tempfile.gettempdir()) / f'fn_collective_mlp_{ngpus}_{runtime_ngpus}_async{int(use_async_comm)}_{PYTEST_RUN_ID}'
     with clear_dir_on_rank0(directory) as tempdir:
         model = parallelize(source, {'sample': {'x': torch.ones(8, 8)}},
                             policy, config,
                             gen_savedir=tempdir, reuse='override').cuda()
-        if ngpus == 8 and nnscaler.flags.CompileFlag.async_comm:
-            # Prove the ASYNC_COMM acceptance run actually generated async
-            # pipeline communication instead of silently exercising a sync path.
-            assert any('async_op=True' in path.read_text() for path in tempdir.rglob('gencode*.py'))
+        assert model.compute_config.use_async_comm is use_async_comm
+        generated_mode = assert_generated_comm_mode(tempdir, use_async_comm, pipeline=(ngpus == 8))
         optimizer = build_optimizer(model, torch.optim.SGD, lr=0.001)
         for step in range(2):
             replica_samples = [[
@@ -162,21 +215,22 @@ def pipeline_worker(ngpus=8, runtime_ngpus=None):
             optimizer.zero_grad()
     print('NNSCALER_TEST_METRICS ' + json.dumps({
         'case': 'collective_layout_model', 'plan_ngpus': ngpus, 'runtime_ngpus': runtime_ngpus,
-        'rank': torch.distributed.get_rank(), 'async_comm': nnscaler.flags.CompileFlag.async_comm, **errors,
+        'rank': torch.distributed.get_rank(), 'async_comm': config.use_async_comm,
+        'generated_mode': generated_mode, **errors,
     }))
     return True
 
 
 @pytest.mark.skipif(torch.cuda.device_count() < 4, reason='requires 4 GPUs')
 def test_fn_mesh_matches_eager():
-    assert all(launch_torchrun(4, pipeline_worker, 4).values())
+    assert all(launch_torchrun(4, pipeline_worker, 4, 4, requested_async_comm()).values())
 
 
 @pytest.mark.skipif(torch.cuda.device_count() < 8, reason='requires 8 GPUs')
 def test_fn_pipeline_matches_eager():
-    assert all(launch_torchrun(8, pipeline_worker).values())
+    assert all(launch_torchrun(8, pipeline_worker, 8, 8, requested_async_comm()).values())
 
 
 @pytest.mark.skipif(torch.cuda.device_count() < 8, reason='requires 8 GPUs')
 def test_fn_mesh_dp_scaling_matches_eager():
-    assert all(launch_torchrun(8, pipeline_worker, 4, 8).values())
+    assert all(launch_torchrun(8, pipeline_worker, 4, 8, requested_async_comm()).values())
