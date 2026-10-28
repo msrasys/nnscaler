@@ -812,12 +812,14 @@ nnscaler.load_sharded_state_dict(
 # For deduped checkpoints, use load_deduped_state_dict instead.
 ```
 
-The underlying `nnscaler.align_state_dict_names(model, model_state_dict)`
-adapter can also be called directly. It matches original names and shard metadata, ignoring tensor IDs.
+The underlying `nnscaler.align_state_dict_names(model, model_state_dict, optimizer, optimizer_state_dict)`
+adapter can also be called directly; the optimizer arguments are optional. It matches original
+names and shard metadata, ignoring tensor IDs.
 It returns a shallow copy (tensors are not copied), updates parallel-module
 metadata, and leaves non-parallel-module keys unchanged. It also works when a
 deduped rank holds only metadata. Missing metadata, ambiguous matches, changed
-sharding, or changed optimizer parameter order/layout raise `ValueError`.
+sharding, or changed optimizer parameter layout (including the ZeRO layout of
+non-parallel parameters) raise `ValueError`.
 Module prefixes and original model names must remain unchanged. This is not
 a resharding or optimizer-state migration API; use a merged checkpoint for
 parallel-plan changes.

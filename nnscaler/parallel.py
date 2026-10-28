@@ -47,7 +47,7 @@ from nnscaler.ir.unique import IDGenerator
 
 from nnscaler.runtime.adapter.reducer import Bucket, Reducer, ParamBucketConfig
 from nnscaler.runtime.device import DeviceGroup
-from nnscaler.runtime.checkpoint import load_from_rank_state_dicts, slice_tensor  # the former is re-exported by nnscaler
+from nnscaler.runtime.checkpoint import align_state_dict_names, load_from_rank_state_dicts, slice_tensor  # re-exported by nnscaler, except slice_tensor
 from nnscaler.runtime.initialization import (
     create_init_module, create_shard_init_weights,
 )
@@ -2715,6 +2715,8 @@ def _trim_optimizer_merged_state_dict(
     new_optimizer_state_dict['state'] = new_states
     new_optimizer_state_dict['param_groups'] = copy.deepcopy(optimizer_state_dict['param_groups'])
     new_optimizer_state_dict['param_groups'][0]['params'] = list(range(new_cur))
+    # the sharded loader checks the optimizer layout against it, as optimizer.state_dict() carries it
+    new_optimizer_state_dict[ParallelModule.EXTRA_STATE_KEY] = asdict(opt_extra_state)
 
     return new_optimizer_state_dict
 
@@ -3222,7 +3224,7 @@ def load_deduped_state_dict(
     Returns:
         None
     """
-    module_state_dict = align_state_dict_names(module, module_state_dict)
+    module_state_dict = align_state_dict_names(module, module_state_dict, optimizer, optimizer_state_dict)
     device = device or torch.cuda.current_device()
     cur_rank = torch.distributed.get_rank()
 
@@ -3495,117 +3497,6 @@ def _broadcast_weights(module: torch.nn.Module, stride_size: int):
 
 
 @torch.no_grad()
-def align_state_dict_names(
-    module: torch.nn.Module,
-    module_state_dict: Dict[str, Any],
-) -> Dict[str, Any]:
-    """
-    Align generated ParallelModule parameter/buffer names in a per-rank checkpoint.
-
-    Match by original name and shard metadata, ignoring generated names and tensor
-    IDs. Return a shallow copy without copying tensors or modifying the input.
-    Module prefixes, original names, partitioning and optimizer parameter order
-    must be unchanged. Missing metadata or ambiguous/incompatible matches raise
-    ValueError. This adapter is for sharded/deduped, not merged, state dicts.
-    """
-    def attr_meta_identity(meta: AttrMeta) -> tuple:
-        key = asdict(meta)
-        # Remove tensor ID from the key as it is not used for identity
-        key.pop('tid', None)
-        # slice is not hashable in old versions of Python
-        key['slicers'] = tuple((s.start, s.stop, s.step) for s in meta.slicers)
-        return tuple(key.values())
-
-    def zero3_attr_meta_identity(meta: Zero3AttrMeta) -> tuple:
-        key = asdict(meta)
-        key.pop('attr_name', None)
-        return tuple(key.values())
-
-    key_map: Dict[str, str] = {}
-    extra_states: Dict[str, Any] = {}
-    for prefix, pm in module.named_modules():
-        if not isinstance(pm, ParallelModule):
-            continue
-        prefix = f'{prefix}.' if prefix else ''
-        extra_key = f'{prefix}{ParallelModule.EXTRA_STATE_KEY}'
-        if extra_key not in module_state_dict:
-            raise ValueError(f"Cannot align checkpoint names: missing {extra_key}")
-        old = ExtraState(**module_state_dict[extra_key])
-        current_state: Dict[str, Any] = {}
-        pm._add_extra_state(current_state, prefix)
-        current = ExtraState(**current_state[extra_key])
-
-        if old.rank != current.rank:
-            raise ValueError(f"Cannot align {extra_key}: checkpoint rank changed")
-
-        for field_name in ('plan_ngpus', 'runtime_ngpus', 'use_zero', 'zero_ngroups'):
-            if getattr(old.compute_config, field_name) != getattr(current.compute_config, field_name):
-                raise ValueError(f"Cannot align {extra_key}: {field_name} changed; load a merged checkpoint instead")
-
-        for field_name in ('origin_param_names', 'origin_state_dict_names', 'origin_shared_param_names'):
-            if getattr(old, field_name) != getattr(current, field_name):
-                raise ValueError(f"Cannot align {extra_key}: original model metadata {field_name} changed; load a merged checkpoint instead")
-
-        candidates: Dict[tuple, str] = {
-            attr_meta_identity(meta): name
-            for name, meta in current.param_area_map.items()
-        }
-        if len(candidates) != len(current.param_area_map):
-            raise ValueError(f"Cannot align {extra_key}: ambiguous shard metadata in module param_area_map")
-
-        # Map old parameter names to new parameter names
-        name_map: Dict[str, str] = {}
-
-        for old_name, meta in old.param_area_map.items():
-            # Consume each match once to keep the old and new shard names in one-to-one correspondence.
-            match = candidates.pop(attr_meta_identity(meta), None)
-            if match is None:
-                raise ValueError(
-                    f"Cannot align {prefix}{old_name}: expected one match for "
-                    f"{meta.orig_name} with the same shard metadata, found {match}"
-                )
-            name_map[old_name] = match
-
-        if candidates:
-            raise ValueError(f"Cannot align {extra_key}: parameter names are missing from shard metadata")
-
-        # Optimizer state uses positional IDs (or bucket offsets), not model keys.
-        if [name_map[name] for name in old.cube_param_names] != current.cube_param_names:
-            raise ValueError(f"Cannot align {extra_key}: optimizer parameter order changed")
-        for field_name in ('zero', 'model_idx2opt_idx', 'opt_idx2ranks'):
-            if getattr(old, field_name) != getattr(current, field_name):
-                raise ValueError(f"Cannot align {extra_key}: optimizer layout {field_name} changed")
-
-        # zero3 config
-        old_zero3 = {
-            name_map[name]: zero3_attr_meta_identity(meta)
-            for name, meta in old.zero3_param_metadata.items()
-        } if old.zero3_param_metadata else {}
-        new_zero3 = {
-            name: zero3_attr_meta_identity(meta)
-            for name, meta in current.zero3_param_metadata.items()
-        } if current.zero3_param_metadata else {}
-        if old_zero3 != new_zero3:
-            raise ValueError(f"Cannot align {extra_key}: ZeRO-3 parameter layout changed")
-
-        key_map.update({f'{prefix}{old_name}': f'{prefix}{new_name}' for old_name, new_name in name_map.items()})
-        extra_states[extra_key] = current_state[extra_key]
-
-    # create a new adapted state dict with the same type of original state dict
-    # And this can also keep the `_metadata` attached to the dict if it exists
-    adapted = copy.copy(module_state_dict)
-    adapted.clear()
-    for key, value in module_state_dict.items():
-        new_key = key_map.get(key, key)
-        if new_key in adapted:
-            raise ValueError(f"Cannot align checkpoint names: key collision at {new_key}")
-        adapted[new_key] = extra_states.get(key, value)
-
-    if aligned_num := sum(k != v for k, v in key_map.items()):
-        logger.info("Aligned %s checkpoint parameter/buffer names", aligned_num)
-    return adapted
-
-
 @torch.no_grad()
 def load_sharded_state_dict(
     module: torch.nn.Module,
@@ -3630,7 +3521,7 @@ def load_sharded_state_dict(
         None
     """
 
-    module_state_dict = align_state_dict_names(module, module_state_dict)
+    module_state_dict = align_state_dict_names(module, module_state_dict, optimizer, optimizer_state_dict)
     device = device or torch.cuda.current_device()
     module.to(device)
 
@@ -4024,6 +3915,9 @@ def trimmed_broadcast_merged_state_dict(
                 if will_load_opt_state:
                     logger.info(f'At rank {cur_rank}: Receiving trimmed optimizer state dict from rank {src_rank}')
                     trimmed_opt_state_dict = _receive_trimmed_opt_state_dict(src_rank, group=pg)
+                    # only states and param groups are transferred; restore the extra state like
+                    # _trim_optimizer_merged_state_dict does on the source rank
+                    trimmed_opt_state_dict[ParallelModule.EXTRA_STATE_KEY] = asdict(optimizer._extra_state)
                 else:
                     trimmed_opt_state_dict = None
 

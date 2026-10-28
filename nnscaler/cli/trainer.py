@@ -466,21 +466,10 @@ class Trainer:
         """
         Return this rank's model state dict with names aligned to the current model when it can
         be loaded directly, else None. Loadable means the checkpoint holds exactly the model's
-        ParallelModules, `align_state_dict_names` accepts their shard metadata (generated names
-        and tensor IDs may differ), and the optimizer's parameter layout is unchanged. The aligned
-        dict makes the alignment inside `load_sharded_state_dict` / `load_deduped_state_dict` an
-        identity mapping.
+        ParallelModules and `align_state_dict_names` accepts the model and optimizer state dicts
+        (generated names and tensor IDs may differ). The aligned dict makes the alignment inside
+        `load_sharded_state_dict` / `load_deduped_state_dict` an identity mapping.
         """
-        if optimizer_state_dict is not None and self.optimizer is not None:
-            # The parallel modules' metadata does not cover the optimizer layout of non-parallel
-            # parameters (e.g. whether they are ZeRO bucket parameters), which the saved and
-            # current OptimizerExtraState locations do.
-            saved_locs = optimizer_state_dict.get(ParallelModule.EXTRA_STATE_KEY) or {}
-            current_locs = asdict(self.optimizer._extra_state)
-            for field_name in ('parallel_module_locs', 'non_parallel_param_locs'):
-                if saved_locs.get(field_name) != current_locs[field_name]:
-                    logger.warning(f"Optimizer parameter layout `{field_name}` of the checkpoint differs from the current optimizer.")
-                    return None
         suffix = ParallelModule.EXTRA_STATE_KEY
         saved = {key[:-len(suffix)] for key in module_state_dict if key.endswith(suffix)}
         current = {
@@ -491,7 +480,7 @@ class Trainer:
             logger.warning(f"Parallel modules in the checkpoint {sorted(saved)} differ from the model's {sorted(current)}.")
             return None
         try:
-            return align_state_dict_names(self.model, module_state_dict)
+            return align_state_dict_names(self.model, module_state_dict, self.optimizer, optimizer_state_dict)
         except ValueError as e:
             logger.warning(f"This rank's checkpoint file cannot be loaded directly: {e}")
             return None

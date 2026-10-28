@@ -1,8 +1,10 @@
 #  Copyright (c) Microsoft Corporation.
 #  Licensed under the MIT License.
 
+import copy
+import logging
 import math
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from collections import defaultdict
 from collections.abc import Mapping
 from functools import partial
@@ -11,10 +13,12 @@ from typing import Any, Callable, Dict, Iterator, List, Optional, Protocol, Tupl
 import torch
 
 from nnscaler.utils import first, first_or, get_member_by_name
-from nnscaler.runtime.module import AttrMeta, ExtraState, ParallelModule
+from nnscaler.runtime.module import AttrMeta, ExtraState, ParallelModule, Zero3AttrMeta
 
 if TYPE_CHECKING:
     from nnscaler.parallel import ParallelOptimizer
+
+logger = logging.getLogger(__name__)
 
 
 class _LazyStateDict(Mapping[str, Any]):
@@ -560,3 +564,159 @@ def load_from_rank_state_dicts(
     opt_metadata['state'] = local_optimizer_state
     opt_metadata['param_groups'][0]['params'] = list(range(total))
     optimizer.load_state_dict(opt_metadata)
+
+
+def align_extra_states(old: ExtraState, current: ExtraState, label: str = 'module') -> Dict[str, str]:
+    """
+    Check that a parallel module saved with extra state `old` can be loaded into the module with
+    extra state `current`: same rank, parallel layout, original model metadata, optimizer
+    parameter order, ZeRO index maps and ZeRO-3 layout; generated names and tensor IDs may
+    differ. Return the mapping from old to current local names, or raise ValueError.
+    """
+    def attr_meta_identity(meta: AttrMeta) -> tuple:
+        key = asdict(meta)
+        # Remove tensor ID from the key as it is not used for identity
+        key.pop('tid', None)
+        # slice is not hashable in old versions of Python
+        key['slicers'] = tuple((s.start, s.stop, s.step) for s in meta.slicers)
+        return tuple(key.values())
+
+    def zero3_attr_meta_identity(meta: Zero3AttrMeta) -> tuple:
+        key = asdict(meta)
+        key.pop('attr_name', None)
+        return tuple(key.values())
+
+    if old.rank != current.rank:
+        raise ValueError(f"Cannot align {label}: checkpoint rank changed")
+
+    for field_name in ('plan_ngpus', 'runtime_ngpus', 'use_zero', 'zero_ngroups'):
+        if getattr(old.compute_config, field_name) != getattr(current.compute_config, field_name):
+            raise ValueError(f"Cannot align {label}: {field_name} changed; load a merged checkpoint instead")
+
+    for field_name in ('origin_param_names', 'origin_state_dict_names', 'origin_shared_param_names'):
+        if getattr(old, field_name) != getattr(current, field_name):
+            raise ValueError(f"Cannot align {label}: original model metadata {field_name} changed; load a merged checkpoint instead")
+
+    candidates: Dict[tuple, str] = {
+        attr_meta_identity(meta): name
+        for name, meta in current.param_area_map.items()
+    }
+    if len(candidates) != len(current.param_area_map):
+        raise ValueError(f"Cannot align {label}: ambiguous shard metadata in module param_area_map")
+
+    # Map old parameter names to new parameter names
+    name_map: Dict[str, str] = {}
+
+    for old_name, meta in old.param_area_map.items():
+        # Consume each match once to keep the old and new shard names in one-to-one correspondence.
+        match = candidates.pop(attr_meta_identity(meta), None)
+        if match is None:
+            raise ValueError(
+                f"Cannot align {label} {old_name}: expected one match for "
+                f"{meta.orig_name} with the same shard metadata, found {match}"
+            )
+        name_map[old_name] = match
+
+    if candidates:
+        raise ValueError(f"Cannot align {label}: parameter names are missing from shard metadata")
+
+    # Optimizer state uses positional IDs (or bucket offsets), not model keys.
+    if [name_map[name] for name in old.cube_param_names] != current.cube_param_names:
+        raise ValueError(f"Cannot align {label}: optimizer parameter order changed")
+    for field_name in ('zero', 'model_idx2opt_idx', 'opt_idx2ranks'):
+        if getattr(old, field_name) != getattr(current, field_name):
+            raise ValueError(f"Cannot align {label}: optimizer layout {field_name} changed")
+
+    # zero3 config
+    old_zero3 = {
+        name_map[name]: zero3_attr_meta_identity(meta)
+        for name, meta in old.zero3_param_metadata.items()
+    } if old.zero3_param_metadata else {}
+    new_zero3 = {
+        name: zero3_attr_meta_identity(meta)
+        for name, meta in current.zero3_param_metadata.items()
+    } if current.zero3_param_metadata else {}
+    if old_zero3 != new_zero3:
+        raise ValueError(f"Cannot align {label}: ZeRO-3 parameter layout changed")
+
+    return name_map
+
+
+def _check_optimizer_layout(optimizer: torch.optim.Optimizer, optimizer_state_dict: Dict[str, Any]) -> None:
+    """
+    Raise ValueError unless the per-rank optimizer state dict fits the optimizer built by
+    `build_optimizer`. The model's extra states do not cover the optimizer side: the parameter
+    locations, and the virtual module formed by non-parallel parameters under ZeRO, whose bucket
+    layout (e.g. `zero_ngroups`) can change while every real parallel module stays the same.
+    """
+    from nnscaler.parallel import OptimizerExtraState  # nnscaler.parallel imports this module
+
+    current: Optional[OptimizerExtraState] = getattr(optimizer, '_extra_state', None)
+    if current is None:
+        raise ValueError("Cannot check the optimizer state dict: the optimizer must be created by build_optimizer")
+    if ParallelModule.EXTRA_STATE_KEY not in optimizer_state_dict:
+        raise ValueError(f"Cannot check the optimizer state dict: missing {ParallelModule.EXTRA_STATE_KEY}")
+    saved = OptimizerExtraState(**optimizer_state_dict[ParallelModule.EXTRA_STATE_KEY])
+    for field_name in ('parallel_module_locs', 'non_parallel_param_locs'):
+        if asdict(saved)[field_name] != asdict(current)[field_name]:
+            raise ValueError(f"Cannot load the optimizer state dict: {field_name} changed")
+    if (saved.non_parallel_extra_state is None) != (current.non_parallel_extra_state is None):
+        raise ValueError("Cannot load the optimizer state dict: ZeRO for non-parallel parameters was turned on or off")
+    if saved.non_parallel_extra_state is not None:
+        align_extra_states(saved.non_parallel_extra_state, current.non_parallel_extra_state, 'non-parallel parameters')
+
+
+def align_state_dict_names(
+    module: torch.nn.Module,
+    module_state_dict: Dict[str, Any],
+    optimizer: Optional[torch.optim.Optimizer] = None,
+    optimizer_state_dict: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """
+    Check a per-rank checkpoint against the current module (and optimizer) and align the
+    generated ParallelModule parameter/buffer names in it.
+
+    Match by original name and shard metadata, ignoring generated names and tensor
+    IDs. Return a shallow copy of the module state dict without copying tensors or
+    modifying the input. Module prefixes, original names and partitioning must be
+    unchanged. When `optimizer_state_dict` is given, `optimizer` must be created by
+    `build_optimizer`, and its parameter layout (parameter locations and the ZeRO
+    layout of non-parallel parameters) must be unchanged; optimizer states need no
+    renaming. Missing metadata or ambiguous/incompatible matches raise ValueError.
+    This adapter is for sharded/deduped, not merged, state dicts.
+    """
+    if optimizer_state_dict is not None:
+        if optimizer is None:
+            raise ValueError("Cannot check the optimizer state dict: the optimizer must be provided")
+        _check_optimizer_layout(optimizer, optimizer_state_dict)
+    key_map: Dict[str, str] = {}
+    extra_states: Dict[str, Any] = {}
+    for prefix, pm in module.named_modules():
+        if not isinstance(pm, ParallelModule):
+            continue
+        prefix = f'{prefix}.' if prefix else ''
+        extra_key = f'{prefix}{ParallelModule.EXTRA_STATE_KEY}'
+        if extra_key not in module_state_dict:
+            raise ValueError(f"Cannot align checkpoint names: missing {extra_key}")
+        old = ExtraState(**module_state_dict[extra_key])
+        current_state: Dict[str, Any] = {}
+        pm._add_extra_state(current_state, prefix)
+        current = ExtraState(**current_state[extra_key])
+
+        name_map = align_extra_states(old, current, extra_key)
+        key_map.update({f'{prefix}{old_name}': f'{prefix}{new_name}' for old_name, new_name in name_map.items()})
+        extra_states[extra_key] = current_state[extra_key]
+
+    # create a new adapted state dict with the same type of original state dict
+    # And this can also keep the `_metadata` attached to the dict if it exists
+    adapted = copy.copy(module_state_dict)
+    adapted.clear()
+    for key, value in module_state_dict.items():
+        new_key = key_map.get(key, key)
+        if new_key in adapted:
+            raise ValueError(f"Cannot align checkpoint names: key collision at {new_key}")
+        adapted[new_key] = extra_states.get(key, value)
+
+    if aligned_num := sum(k != v for k, v in key_map.items()):
+        logger.info("Aligned %s checkpoint parameter/buffer names", aligned_num)
+    return adapted
