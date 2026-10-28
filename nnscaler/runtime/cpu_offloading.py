@@ -44,12 +44,17 @@ class CPUOffloadConfig:
     # Zero disables this size-aware lifetime filter; unknown distances retain
     # the existing behavior (ordinary non-pipeline autograd has no schedule).
     min_offload_size_gap_bytes: int = 0
+    # Snapshot producer readiness at saved-tensor capture. Group commit can
+    # then overlap D2H with later compute that only reads immutable inputs.
+    # Custom asynchronous producers must join the saving stream before save;
+    # this option cannot infer producer completion from a tensor's allocation.
+    use_save_events: bool = False
     # Leave headroom for the dataloader, optimizer, compilation and other ranks.
     host_reserve_bytes: int = 32 * 1024**3
 
     def __post_init__(self):
         for name, value in vars(self).items():
-            if name in ('reload_on_compute_stream', 'skip_retained_inputs'):
+            if name in ('reload_on_compute_stream', 'skip_retained_inputs', 'use_save_events'):
                 if not isinstance(value, bool):
                     raise ValueError(f'{name} must be a bool')
                 continue
@@ -444,8 +449,21 @@ class _OffloadGroup:
         self.scope = scope
         self.records = []
         self.pending = []
+        self.producer_events = None
         self.previous = scope.groups[-1] if scope.groups else None
         scope.groups.append(self)
+
+    def capture_producer_event(self, stream):
+        if self.producer_events is None:
+            self.producer_events = {}
+        event = self.producer_events.get(stream.cuda_stream)
+        if event is None:
+            event = torch.cuda.Event()
+            self.producer_events[stream.cuda_stream] = event
+        # Re-record within this group; commit enqueues waits only after all
+        # saves. The latest snapshot covers every earlier save on this stream.
+        event.record(stream)
+        self.scope.manager.pool.stats['saved_tensor_event_records'] += 1
 
     def commit(self):
         # Admit before a region starts, then enqueue its whole batch without
@@ -467,7 +485,11 @@ class _OffloadGroup:
         producers = {record.producer_stream.cuda_stream: record.producer_stream
                      for record in pending}
         for stream in producers.values():
-            manager.d2h_stream.wait_stream(stream)
+            event = (self.producer_events or {}).get(stream.cuda_stream)
+            if event is None:
+                manager.d2h_stream.wait_stream(stream)
+            else:
+                manager.d2h_stream.wait_event(event)
         copied = sum(bool(record.offload()) for record in pending)
         if copied:
             manager.pool.stats['d2h_committed_groups'] += 1
@@ -677,6 +699,8 @@ class ActivationOffloadManager:
             # Reserve pinned memory only when the completed group still has
             # a backward consumer. Budget failures retain record.source on GPU.
             record = _StorageRecord(tensor, self)
+            if self.config.use_save_events:
+                group.capture_producer_event(record.producer_stream)
             self.records[key] = record
             group.pending.append(record)
         group.records.append(weakref.ref(record))

@@ -33,7 +33,8 @@ def collect():
 
 
 @pytest.mark.parametrize('field,value', [('max_cpu_bytes', -1), ('prefetch_groups', True),
-                                        ('max_prefetch_bytes', 1.5), ('min_offload_size_gap_bytes', -1)])
+                                        ('max_prefetch_bytes', 1.5), ('min_offload_size_gap_bytes', -1),
+                                        ('use_save_events', 1)])
 def test_invalid_config(field, value):
     with pytest.raises(ValueError, match=field):
         CPUOffloadConfig(**{field: value})
@@ -69,6 +70,81 @@ def test_compute_config_roundtrip(tmp_path):
 
 
 cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason='CUDA required')
+
+
+@cuda
+@pytest.mark.skipif(torch.version.cuda is None, reason='CUDA sleep ordering probe requires NVIDIA')
+@pytest.mark.parametrize('use_save_events', [False, True])
+def test_saved_tensor_events_do_not_wait_for_later_unrelated_compute(use_save_events):
+    module = OffloadModule(use_save_events=use_save_events)
+    manager = module._get_activation_offload_manager()
+    x = torch.randn(512, 1024, device='cuda', requires_grad=True)
+    fn = lambda value: value.sin().cos().sum()
+    expected = torch.autograd.grad(fn(x), x)[0]
+    # Cold cudaHostAlloc may synchronize the device. Test the steady-state
+    # dependency using a prewarmed pinned buffer, as normal training does.
+    host = manager.pool.acquire(x.numel() * x.element_size())
+    manager.pool.release(host, None)
+    torch.cuda.synchronize()
+    # A custom producer can use another stream, but must publish its result
+    # to the saving stream before capture (the local DeepEP wrappers do this).
+    payload = x.detach().clone()
+    producer = torch.cuda.Stream()
+    with torch.no_grad():
+        x.zero_()
+    producer.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(producer), torch.no_grad():
+        torch.cuda._sleep(100_000_000)
+        x.copy_(payload)
+    torch.cuda.current_stream().wait_stream(producer)
+    later = torch.cuda.Event()
+    with module.activation_offload_scope('ordering'):
+        with module.cpu_offloading_hooks() as group:
+            value = checkpoint(fn, x, use_reentrant=False)
+            torch.cuda._sleep(1_000_000_000)
+            later.record()
+        group.watch(value)
+    try:
+        manager.d2h_stream.synchronize()
+        overlapped = not later.query()
+    finally:
+        later.synchronize()
+    actual = torch.autograd.grad(value, x)[0]
+    module.finish_activation_offload('ordering')
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+    assert overlapped == use_save_events
+    assert bool(manager.pool.stats['saved_tensor_event_records']) == use_save_events
+    assert manager.pool.snapshot()['live_cpu_bytes'] == 0
+
+
+@cuda
+def test_saved_tensor_events_cover_later_saves_and_multiple_producer_streams():
+    module = OffloadModule(use_save_events=True)
+    x = torch.randn(512, 512, device='cuda', requires_grad=True)
+    def reference():
+        a = x.sin()
+        return a.cos().sum() + a.tanh().square().sum()
+    expected = torch.autograd.grad(reference(), x)[0]
+    first, second = torch.cuda.Stream(), torch.cuda.Stream()
+    first.wait_stream(torch.cuda.current_stream())
+    with module.activation_offload_scope('streams'):
+        with module.cpu_offloading_hooks() as group:
+            with torch.cuda.stream(first):
+                a = x.sin()
+                left = a.cos().sum()
+            second.wait_stream(first)
+            with torch.cuda.stream(second):
+                right = a.tanh().square().sum()
+                result = left + right
+            del a
+        group.watch(result)
+    module.prefetch_activation('streams')
+    actual = torch.autograd.grad(result, x)[0]
+    module.finish_activation_offload('streams')
+    torch.cuda.synchronize()
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+    assert len(group.group.producer_events) == 2
+    assert module.activation_offload_stats()['live_cpu_bytes'] == 0
 
 
 @cuda
@@ -152,9 +228,13 @@ def test_pinned_slab_budget_pending_events_and_coalescing():
 
 
 @cuda
-def test_slab_backed_activation_restoration_is_exact():
+@pytest.mark.parametrize('reload_on_compute_stream', [False, True])
+@pytest.mark.parametrize('use_save_events', [False, True])
+def test_slab_backed_activation_restoration_is_exact(reload_on_compute_stream, use_save_events):
     mib = 1024**2
-    module = OffloadModule(max_cpu_bytes=8*mib, pool_slab_bytes=8*mib)
+    module = OffloadModule(max_cpu_bytes=8*mib, pool_slab_bytes=8*mib,
+                           reload_on_compute_stream=reload_on_compute_stream,
+                           use_save_events=use_save_events)
     x = torch.randn(768,1024,device='cuda',requires_grad=True)
     z = torch.randn(256,1024,device='cuda',requires_grad=True)
     fn = lambda: x.sin().cos().sum() + z.sin().sum()
@@ -566,8 +646,9 @@ def test_custom_mutation_version_is_checked_before_prefetch():
 
 
 @cuda
-def test_restored_alias_mutation_cannot_silently_change_another_saved_view():
-    module = OffloadModule()
+@pytest.mark.parametrize('reload_on_compute_stream', [False, True])
+def test_restored_alias_mutation_cannot_silently_change_another_saved_view(reload_on_compute_stream):
+    module = OffloadModule(reload_on_compute_stream=reload_on_compute_stream)
     x = torch.randn(64, 64, device='cuda')
     with module.cpu_offloading_hooks() as group:
         first = group._pack(x)
