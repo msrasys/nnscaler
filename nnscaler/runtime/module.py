@@ -747,14 +747,16 @@ class CubeModule(torch.nn.Module):
         `merge_partial_states` will use this list to build the parameter order
         """
         origin_parameter_names: List[str] = []
+        seen_parameter_names: Set[str] = set()
         for local_fullmap in fullmaps:
             for _, meta in local_fullmap.items():
                 if not meta.is_param: continue
                 # shared parameters in CubeModule is already de-duplicated. So in the
                 # local model state, we will not have multiple parameters sharing with same content
                 # but in different names.
-                if meta.orig_name not in origin_parameter_names:
+                if meta.orig_name not in seen_parameter_names:
                     origin_parameter_names.append(meta.orig_name)
+                    seen_parameter_names.add(meta.orig_name)
         return origin_parameter_names
 
     @classmethod
@@ -855,6 +857,24 @@ class CubeModule(torch.nn.Module):
 
         # we follow the order of in origin parameter names to find each (partitioned)
         # parameter in the local model state, and assign the slice to the position.
+        # Index the local optimizer positions and shard coverage once. Buffers
+        # do not consume optimizer indices, even when interleaved with parameters.
+        param_entries = defaultdict(list)
+        expected_tracks = defaultdict(set)
+        for worker_idx, fullmap in enumerate(fullmaps):
+            local_index = 0
+            for meta in fullmap.values():
+                if not meta.is_param:
+                    continue
+                track_id = tuple((s.start, s.step, s.stop) for s in meta.slicers)
+                # Omitted optimizer ranks may be replicas, but they may also
+                # own a missing spatial shard. Coverage comes from all metadata;
+                # only supplied states can contribute entries to the merge.
+                if worker_idx < plan_ngpus:
+                    param_entries[meta.orig_name].append((worker_idx, local_index, meta, track_id))
+                expected_tracks[meta.orig_name].add(track_id)
+                local_index += 1
+
         full_optim_state_dict['state'] = {}
         full_states = full_optim_state_dict['state']
 
@@ -984,12 +1004,7 @@ class CubeModule(torch.nn.Module):
         # full_index: param IDs in the full optimizer state
         for full_index, param_name in enumerate(origin_parameter_names):
             _logger.info(f'start to handle optimizer state for param {param_name} with full_index {full_index}')
-            expected_state_tracks = {
-                tuple((s.start, s.step, s.stop) for s in meta.slicers)
-                for fullmap in fullmaps
-                for meta in fullmap.values()
-                if meta.is_param and meta.orig_name == param_name
-            }
+            expected_state_tracks = expected_tracks[param_name]
             # zero_done_track is used to avoid re-merging the same parameter
             # in the optimizer state
             # zero_done_track_id: slicers
@@ -1006,75 +1021,67 @@ class CubeModule(torch.nn.Module):
             # consequently, the parameter's optimizer state is also sharded.
             # This for loop is for merging the sharded parameter's optimizer state
             # into its original full state (i.e., the non-partitioned one).
-            for work_idx, (optim_state, fullmap) in enumerate(zip(optim_state_dicts[0 : plan_ngpus], fullmaps[0 : plan_ngpus])):
-                if 'state' not in optim_state: continue
-                # adam-like optimizers have optim_state['state']={} before any optimizer.step()
-                if not optim_state['state']: continue
-                # filter out non-param attributes as they don't appear in the optimizer state
-                param_fullmap = [meta for meta in fullmap.values() if meta.is_param]
-                # local index: param IDs in the local optimizer state, we assume
-                # it aligns with the order of local `model.parameters()`
-                for local_index, meta in enumerate(param_fullmap):
-                    if meta.orig_name != param_name: continue
-
-                    # TODO: support customized param groups, where each parameter has IDs
-                    # specified from its own param_group
-                    track_id = tuple((i.start, i.step, i.stop) for i in meta.slicers)
-                    if zero_idx_maps is None:
-                        states: Dict[str, torch.Tensor] = optim_state['state'].get(local_index)
+            for work_idx, local_index, meta, track_id in param_entries[param_name]:
+                optim_state = optim_state_dicts[work_idx]
+                if not optim_state.get('state'):
+                    continue
+                # TODO: support customized param groups, where each parameter has IDs
+                # specified from its own param_group
+                if zero_idx_maps is None:
+                    states: Dict[str, torch.Tensor] = optim_state['state'].get(local_index)
+                else:
+                    if track_id not in zero_done_track:
+                        # As ZeRO is applied, the optimizer state of this parameter (a shard)
+                        # may not be stored locally in its optimizer state.
+                        # _merge_opt_zero is for recovering the optimizer state corresponding to this parameter shard.
+                        states: Dict[str, torch.Tensor] = _merge_opt_zero(meta.sub_shape, work_idx, local_index)
                     else:
-                        if track_id not in zero_done_track:
-                            # As ZeRO is applied, the optimizer state of this parameter (a shard)
-                            # may not be stored locally in its optimizer state.
-                            # _merge_opt_zero is for recovering the optimizer state corresponding to this parameter shard.
-                            states: Dict[str, torch.Tensor] = _merge_opt_zero(meta.sub_shape, work_idx, local_index)
-                        else:
-                            _logger.debug(f'rank {work_idx}: skip merging duplicated optimizer state for param {full_index} with slicers {meta.slicers}')
-                            continue
-
-                    if not states:
+                        _logger.debug(f'rank {work_idx}: skip merging duplicated optimizer state for param {full_index} with slicers {meta.slicers}')
                         continue
-                    zero_done_track.add(track_id)
-                    if full_index in full_states and full_states[full_index].keys() != states.keys():
-                        raise ValueError(f'Inconsistent optimizer state keys for parameter {param_name}')
-                    full_states.setdefault(full_index, {})
-                    for state_name in states.keys():
-                        value = states[state_name]
-                        # special handle for step: scalar tensor type
-                        if state_name == 'step':
-                            if state_name in full_states[full_index]:
-                                if not cls._safe_tensor_equal(full_states[full_index][state_name], value):
-                                    raise ValueError(f"Conflict in merging {param_name}.{state_name} from rank {work_idx}")
-                            else:
-                                full_states[full_index][state_name] = value.cpu() if isinstance(value, torch.Tensor) else value
-                            continue
 
-                        # for non-tensor states
-                        if not isinstance(value, torch.Tensor):
-                            if state_name in full_states[full_index]:
-                                if full_states[full_index][state_name] != value:
-                                    raise ValueError(f"Conflict in merging {param_name}.{state_name} from rank {work_idx}")
-                            else:
-                                full_states[full_index][state_name] = value
-                                _logger.debug(f'non-tensor state {state_name} is merged for {full_index}')
-                        # for tensor states, like 'exp_avg'
+                if not states:
+                    continue
+                zero_done_track.add(track_id)
+                if full_index in full_states and full_states[full_index].keys() != states.keys():
+                    raise ValueError(f'Inconsistent optimizer state keys for parameter {param_name}')
+                full_states.setdefault(full_index, {})
+                for state_name in states.keys():
+                    value = states[state_name]
+                    # special handle for step: scalar tensor type
+                    if state_name == 'step':
+                        if state_name in full_states[full_index]:
+                            if not cls._safe_tensor_equal(full_states[full_index][state_name], value):
+                                raise ValueError(f"Conflict in merging {param_name}.{state_name} from rank {work_idx}")
                         else:
-                            if tuple(value.shape) != tuple(meta.sub_shape):
-                                raise ValueError(f'Invalid optimizer state shape for {param_name}.{state_name}')
-                            # create optimizer state tensor
-                            if state_name not in full_states[full_index]:
-                                full_states[full_index][state_name] = torch.empty(meta.shape, dtype=value.dtype, device='cpu')
-                            elif full_states[full_index][state_name].dtype != value.dtype:
-                                raise ValueError(f'Conflicting optimizer state dtype for {param_name}.{state_name}')
+                            full_states[full_index][state_name] = value.cpu() if isinstance(value, torch.Tensor) else value
+                        continue
 
-                            if track_id in state_merge_track:
-                                if not cls._safe_tensor_equal(full_states[full_index][state_name][meta.slicers], value):
-                                    raise ValueError(f"Conflict in merging {param_name}.{state_name} from rank {work_idx}")
-                            else:
-                                # assign with partial tensor
-                                full_states[full_index][state_name][meta.slicers] = value
+                    # for non-tensor states
+                    if not isinstance(value, torch.Tensor):
+                        if state_name in full_states[full_index]:
+                            if full_states[full_index][state_name] != value:
+                                raise ValueError(f"Conflict in merging {param_name}.{state_name} from rank {work_idx}")
+                        else:
+                            full_states[full_index][state_name] = value
+                            _logger.debug(f'non-tensor state {state_name} is merged for {full_index}')
+                    # for tensor states, like 'exp_avg'
+                    else:
+                        if tuple(value.shape) != tuple(meta.sub_shape):
+                            raise ValueError(f'Invalid optimizer state shape for {param_name}.{state_name}')
+                        # create optimizer state tensor
+                        if state_name not in full_states[full_index]:
+                            full_states[full_index][state_name] = torch.empty(meta.shape, dtype=value.dtype, device='cpu')
+                        elif full_states[full_index][state_name].dtype != value.dtype:
+                            raise ValueError(f'Conflicting optimizer state dtype for {param_name}.{state_name}')
 
-                    state_merge_track.add(track_id)
+                        if track_id in state_merge_track:
+                            if not cls._safe_tensor_equal(full_states[full_index][state_name][meta.slicers], value):
+                                raise ValueError(f"Conflict in merging {param_name}.{state_name} from rank {work_idx}")
+                        else:
+                            # assign with partial tensor
+                            full_states[full_index][state_name][meta.slicers] = value
+
+                state_merge_track.add(track_id)
 
             if full_index in full_states and state_merge_track != expected_state_tracks:
                 raise ValueError(f'Incomplete optimizer state for parameter {param_name}: '
