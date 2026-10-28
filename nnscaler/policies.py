@@ -189,8 +189,10 @@ def pas_hybrid(graph: IRGraph, cfg: 'ComputeConfig'):
         nstages = cfg.plan_ngpus
     nmicros = cfg.pas_config['pipeline_nmicros']
     scheduler = cfg.pas_config.get('pipeline_scheduler', '1f1b')
-    pp_size = cfg.pas_config.get('pp_size', nstages)
+    pp_size = _get_configured_pipeline_size(cfg.pas_config, nstages)
 
+    if pp_size < 1:
+        raise ValueError('pp_size must be >= 1 when set')
     if nstages % pp_size != 0:
         raise ValueError(f'invalid pp_size {pp_size} for nstages {nstages}')
     if ngpus % pp_size != 0:
@@ -1062,6 +1064,8 @@ def fn(
         raise ValueError("pp_size must be >= 1 when set")
     if ngpus % pp_size != 0:
         raise ValueError(f'invalid pp_size {pp_size} for ngpus {ngpus}')
+    if nstages % pp_size != 0:
+        raise ValueError(f'invalid pp_size {pp_size} for nstages {nstages}')
     op_partition_ngpus = ngpus // pp_size
 
     recompute_groups: dict[int, list[IRFwOperation]] = {}
