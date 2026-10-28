@@ -449,6 +449,9 @@ class ReduceScatterPrim(CollectivePrim):
     non-differential reduce-scatter
     """
     def __init__(self, itensors: List[IRSubTensor], otensors: List[IRSubTensor], dim: int, **kwargs):
+        # Chunk order follows logical output slices, not process-group order.
+        if 'ranks' not in kwargs and all(tensor.device for tensor in otensors):
+            kwargs['ranks'] = tuple(tensor.device[0] for tensor in otensors)
         super().__init__(itensors, otensors, dim=dim, **kwargs)
         self.signature = 'nnscaler.runtime.adapter.reduce_scatter'
 

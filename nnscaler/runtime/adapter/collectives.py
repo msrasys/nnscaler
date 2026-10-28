@@ -176,6 +176,11 @@ def reduce_scatter(tensor: torch.Tensor, dim: int,
     for idx, t in enumerate(itensors):
         itensors[idx] = t.contiguous() if not t.is_contiguous() else t
     group = DeviceGroup().get_group(ranks)
+    # The backend consumes chunks in process-group order. `ranks` describes
+    # logical tensor-slice order, which can differ after RVD inner_transpose.
+    group_ranks = torch.distributed.get_process_group_ranks(group)
+    logical_index = {rank: index for index, rank in enumerate(ranks)}
+    itensors = [itensors[logical_index[rank]] for rank in group_ranks]
     otensor = torch.empty_like(itensors[0], requires_grad=False)
     work = torch.distributed.reduce_scatter(otensor, itensors, group=group, async_op=async_op)
     if work:

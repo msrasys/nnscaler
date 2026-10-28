@@ -294,24 +294,95 @@ def test_3gpu():
         assert torch.equal(outputs[0][0], outputs[2][1])
 
 
-def _ordered_rank_worker():
+def _ordered_rank_worker(async_op):
     _init_distributed(4)
     rank = torch.distributed.get_rank()
     ranks = [0, 2, 1, 3]
 
     value = torch.tensor([rank], dtype=torch.int64)
-    gathered = nnscaler.runtime.adapter.all_gather(value, 0, ranks)
+    gathered = nnscaler.runtime.adapter.all_gather(value, 0, ranks, async_op=async_op)
+    if async_op:
+        gathered = nnscaler.runtime.executor.AsyncCommHandler().wait(gathered)
     chunked = nnscaler.runtime.adapter.chunk(
         torch.arange(4, dtype=torch.int64), 0, ranks)
-    return clone_to_cpu(gathered), clone_to_cpu(chunked)
+    tensor = torch.arange(16, dtype=torch.float64).reshape(2, 8) + rank * 100
+    scattered = nnscaler.runtime.adapter.reduce_scatter(tensor, 1, ranks, async_op=async_op)
+    if async_op:
+        scattered = nnscaler.runtime.executor.AsyncCommHandler().wait(scattered)
+    restored = nnscaler.runtime.adapter.all_gather(scattered, 1, ranks, async_op=async_op)
+    if async_op:
+        restored = nnscaler.runtime.executor.AsyncCommHandler().wait(restored)
+    return tuple(clone_to_cpu(t) for t in (gathered, chunked, scattered, restored))
 
 
 @pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.device_count() < 4, reason='lack of gpu devices')
-def test_collectives_respect_explicit_rank_order():
-    results = launch_torchrun(4, _ordered_rank_worker)
+@pytest.mark.parametrize('async_op', [False, True])
+def test_collectives_respect_explicit_rank_order(async_op):
+    results = launch_torchrun(4, _ordered_rank_worker, async_op)
 
     expected_gather = torch.tensor([0, 2, 1, 3], dtype=torch.int64)
     expected_chunks = [0, 2, 1, 3]
-    for rank, (gathered, chunked) in results.items():
+    expected_sum = 4 * torch.arange(16, dtype=torch.float64).reshape(2, 8) + 600
+    expected_scatter = expected_sum.chunk(4, dim=1)
+    for rank, (gathered, chunked, scattered, restored) in results.items():
         assert torch.equal(gathered, expected_gather)
         assert chunked.item() == expected_chunks[rank]
+        assert torch.equal(scattered, expected_scatter[expected_chunks[rank]])
+        assert torch.equal(restored, expected_sum)
+
+
+@pytest.mark.parametrize('ranks', [
+    tuple(range(8, 16)),
+    tuple(range(16, 32, 2)) + tuple(range(17, 32, 2)),
+    (32, 40, 34, 42, 36, 44, 38, 46),
+])
+@pytest.mark.parametrize('dim', [0, 3])
+@pytest.mark.parametrize('async_op', [False, True])
+def test_reduce_scatter_logical_rank_order_cpu(monkeypatch, ranks, dim, async_op):
+    # Emulate only the collective transport, using its process-group ordering.
+    # The runtime wrapper and tensor operations execute unchanged on CPU.
+    from types import SimpleNamespace
+    from nnscaler.runtime.adapter import collectives
+
+    group_ranks = sorted(ranks)
+    group = object()
+    calls = []
+    submitted = []
+
+    def get_group(requested):
+        assert tuple(requested) == ranks
+        return group
+
+    def reduce_scatter(output, inputs, group, async_op):
+        work = object()
+        calls.append((output, [t.clone() for t in inputs], work))
+        if len(calls) == len(group_ranks):
+            for index, (destination, _, _) in enumerate(calls):
+                destination.copy_(sum(call[1][index] for call in calls))
+        return work if async_op else None
+
+    monkeypatch.setattr(collectives, 'DeviceGroup', lambda: SimpleNamespace(get_group=get_group))
+    monkeypatch.setattr(collectives, 'CudaTimer', lambda: SimpleNamespace(
+        start=lambda **kwargs: None, stop=lambda **kwargs: None))
+    monkeypatch.setattr(collectives, 'AsyncCommHandler', lambda: SimpleNamespace(
+        submit=lambda tensor, works: submitted.append((tensor, works))))
+    monkeypatch.setattr(torch.distributed, 'get_process_group_ranks', lambda _: group_ranks)
+    monkeypatch.setattr(torch.distributed, 'reduce_scatter', reduce_scatter)
+
+    base = torch.arange(1024, dtype=torch.float64).reshape(256, 2, 2, 1)
+    if dim == 3:
+        base = base.transpose(0, 3)  # Actual MoE-stat shape, noncontiguous input.
+        assert not base.is_contiguous()
+    inputs = [base + index * 10000 for index in range(len(group_ranks))]
+    outputs = [collectives.reduce_scatter(t, dim, ranks, async_op) for t in inputs]
+
+    reduced = sum(inputs)
+    chunk_size = reduced.size(dim) // len(ranks)
+    for rank, actual in zip(group_ranks, outputs):
+        expected = reduced.narrow(dim, ranks.index(rank) * chunk_size, chunk_size)
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    assert len(submitted) == (len(ranks) if async_op else 0)
+    if async_op:
+        for (tensor, works), (output, _, work) in zip(submitted, calls):
+            assert tensor is output
+            assert works == [work]
