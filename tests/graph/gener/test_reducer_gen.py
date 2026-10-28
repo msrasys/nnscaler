@@ -763,3 +763,29 @@ def test_intra_scale_unit_reducers():
             assert reducer0.params[0].shape == torch.Size([128, 128])
             assert len(reducer1.params) == 1
             assert reducer1.params[0].shape == torch.Size([64, 128])
+
+
+class TwoColocatedConsumers(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.weight = torch.nn.Parameter(torch.zeros(128))
+
+    def forward(self, x):
+        return (x * self.weight + self.weight).sum()
+
+
+@replace_all_device_with('cpu')
+def test_colocated_grad_reduce_when_consumers_equal_device_count():
+    graph = build_graph(model_cls=TwoColocatedConsumers)
+    mul, add, loss = graph.select(ntype=IRFwOperation)
+    graph.group([mul])
+    graph.group([add, loss])
+    for node in (mul, add, loss):
+        parts = graph.partition(node, node.algorithm('dim'), idx=0, dim=0, num=2)
+        for device, part in enumerate(parts):
+            graph.assign(part, device)
+    IRAdapterGener.gen_weight(graph)
+    reducers = graph.select(ntype=IRWeightReducer)
+    assert len(reducers) == 1
+    assert reducers[0].device == (0, 1)
+    assert reducers[0].nreplicas == 1

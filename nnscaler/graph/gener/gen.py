@@ -365,11 +365,10 @@ class IRAdapterGener:
             for sub in sub_ws:
                 grad = sub.grad
                 dev = sub.device[0]
-                device_grads.setdefault(dev, []).append(grad)
+                # Colocated consumers can reuse one physical gradient range.
+                device_grads.setdefault(dev, set()).add(grad.valmap)
 
-            return all(ValueMap.is_complete(
-                [grad.valmap for grad in grads]) for grads in device_grads.values()
-            )
+            return all(ValueMap.is_complete(maps) for maps in device_grads.values())
 
         def _is_colocated_grad_partition(sub_ws: List[IRSubTensor]) -> bool:
             """Whether logical consumers reuse one grad partition per device.
@@ -446,7 +445,8 @@ class IRAdapterGener:
                             "Detected an incomplete partitioned weight layout "
                             f"for weight {weight}"
                         )
-                elif len(deduped_grad_valmaps) == num_consumers: # replicated + no-grad-reduce
+                elif _is_grad_replicated(sub_ws): # replicated + no-grad-reduce
+                    # Consumer counts do not establish completeness on each rank.
                     # all gradients are full (valmap == (i, num_consumers))
                     # for example, 4 gpus, 3 consumers (c0, c1, c2), weights shape (4, 4)
                     # | rank | weight portions | gradient valmap |
