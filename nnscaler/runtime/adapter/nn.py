@@ -7,7 +7,7 @@ primitives. This is typically used in the training with tensor
 parallelism scenario.
 """
 
-from typing import List, Tuple
+from typing import List, Tuple, Optional
 import torch
 
 from nnscaler.profiler.timer import CudaTimer
@@ -159,39 +159,42 @@ def split_allgather(tensor, dim: int, ranks: Tuple[int]) -> torch.Tensor:
 class AllToAllAllToAll(torch.autograd.Function):
 
     @staticmethod
-    def forward(ctx, itensor: torch.Tensor, idim: int, odim: int, ranks: Tuple[int]):
+    def forward(ctx, itensor: torch.Tensor, idim: int, odim: int, ranks: Tuple[int], dsts=None):
         ctx._ranks = ranks
+        ctx._dsts = ranks if dsts is None else dsts
         ctx._idim = idim
         ctx._odim = odim
-        return all_to_all(itensor, idim, odim, ranks)
+        return all_to_all(itensor, idim, odim, ranks, dsts=dsts)
 
     @staticmethod
     def backward(ctx, grad: torch.Tensor):
         ranks = ctx._ranks
         idim, odim = ctx._idim, ctx._odim
-        grad = all_to_all(grad, odim, idim, ranks)
-        return grad, None, None, None
+        grad = all_to_all(grad, odim, idim, ctx._dsts, dsts=ranks)
+        return grad, None, None, None, None
 
 
 class AllToAllAllToAllSingle(torch.autograd.Function):
 
     @staticmethod
-    def forward(ctx, itensor: torch.Tensor, idim: int, odim: int, ranks: Tuple[int]):
+    def forward(ctx, itensor: torch.Tensor, idim: int, odim: int, ranks: Tuple[int], dsts=None):
         ctx._ranks = ranks
+        ctx._dsts = ranks if dsts is None else dsts
         ctx._idim = idim
         ctx._odim = odim
-        return all_to_all_single(itensor, idim, odim, ranks)
+        return all_to_all_single(itensor, idim, odim, ranks, dsts=dsts)
 
     @staticmethod
     def backward(ctx, grad: torch.Tensor):
         ranks = ctx._ranks
         idim, odim = ctx._idim, ctx._odim
-        grad = all_to_all_single(grad, odim, idim, ranks)
-        return grad, None, None, None
+        grad = all_to_all_single(grad, odim, idim, ctx._dsts, dsts=ranks)
+        return grad, None, None, None, None
 
 
-def alltoall_alltoall(itensor: torch.Tensor, idim: int, odim: int, ranks: Tuple[int]) -> torch.Tensor:
-    return AllToAllAllToAllSingle.apply(itensor, idim, odim, ranks)
+def alltoall_alltoall(itensor: torch.Tensor, idim: int, odim: int, ranks: Tuple[int],
+                     dsts: Optional[Tuple[int, ...]] = None) -> torch.Tensor:
+    return AllToAllAllToAllSingle.apply(itensor, idim, odim, ranks, dsts)
 
 
 class ReduceBroadcast(torch.autograd.Function):
