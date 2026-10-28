@@ -524,7 +524,7 @@ def _pipeline_cpu_offload_runtime_worker(tempdir):
         def _unpack(self, value):
             if (
                 isinstance(value, cpu_offloading._OffloadedTensor)
-                and value.device_tensor is not None
+                and value.storage.device_tensor is not None
             ):
                 early_prefetched.add(id(value))
             return super()._unpack(value)
