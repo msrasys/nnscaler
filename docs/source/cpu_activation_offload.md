@@ -143,7 +143,11 @@ choosing a slab size.
 
 When the budget or host headroom is insufficient, that tensor stays on GPU;
 there is no implicit recomputation. `/proc/meminfo` and visible cgroup v2 ancestor
-limits constrain the allocation headroom check. The budget is not a bound on
+limits constrain the allocation headroom check. Clean inactive file-cache pages
+are treated as reclaimable (conservatively subtracting all dirty/writeback file
+pages); active file cache, anonymous and pinned memory remain charged. Missing
+cache statistics fall back to raw cgroup usage. This estimates allocation
+headroom without requesting cache eviction. The budget is not a bound on
 the entire process, OS allocation overhead, or PyTorch's separate pinned allocator cache. Leave room for
 model construction, optimizer state, dataloaders and other processes.
 

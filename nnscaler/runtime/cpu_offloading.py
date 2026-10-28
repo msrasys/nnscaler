@@ -53,6 +53,28 @@ class CPUOffloadConfig:
                 raise ValueError(f'{name} must be a non-negative integer, got {value!r}')
 
 
+def _cgroup_headroom(path):
+    """Estimate allocatable bytes without treating clean inactive cache as live.
+
+    Only inactive file pages are considered reclaimable, conservatively minus
+    all dirty/writeback file pages. Active cache, anonymous and pinned memory
+    remain charged. No cache eviction is requested by this function.
+    """
+    limit = (path / 'memory.max').read_text().strip()
+    if limit == 'max':
+        return None
+    used = int((path / 'memory.current').read_text())
+    reclaimable = 0
+    try:
+        stats = {key: int(value) for key, value in
+                 (line.split() for line in (path / 'memory.stat').read_text().splitlines())}
+        reclaimable = min(used, max(0, stats.get('inactive_file', 0)
+                                   - stats.get('file_dirty', 0) - stats.get('file_writeback', 0)))
+    except (OSError, ValueError):
+        pass  # Older/unavailable stats retain the conservative raw-usage check.
+    return max(0, int(limit) - used + reclaimable)
+
+
 def available_host_bytes():
     """Host availability constrained by every visible cgroup v2 ancestor."""
     values = {}
@@ -71,10 +93,9 @@ def available_host_bytes():
             path = root
         while True:
             try:
-                limit = (path / 'memory.max').read_text().strip()
-                if limit != 'max':
-                    used = int((path / 'memory.current').read_text())
-                    available = min(available, max(0, int(limit) - used))
+                headroom = _cgroup_headroom(path)
+                if headroom is not None:
+                    available = min(available, headroom)
             except (OSError, ValueError):
                 pass
             if path == root:

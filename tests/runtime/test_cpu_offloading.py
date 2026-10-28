@@ -39,6 +39,29 @@ def test_invalid_config(field, value):
         CPUOffloadConfig(**{field: value})
 
 
+@pytest.mark.parametrize('stats,expected', [
+    ('inactive_file 50\nfile_dirty 0\nfile_writeback 0\n', 60),
+    ('inactive_file 50\nfile_dirty 20\nfile_writeback 10\n', 30),
+    ('inactive_file 10\nfile_dirty 20\nfile_writeback 10\n', 10),
+    ('active_file 80\nanon 10\n', 10),
+    (None, 10),
+    ('inactive_file 1000\n', 100),  # Counter races cannot exceed the cgroup cap.
+])
+def test_cgroup_headroom_counts_only_clean_inactive_file_cache(tmp_path, stats, expected):
+    from nnscaler.runtime.cpu_offloading import _cgroup_headroom
+    (tmp_path / 'memory.max').write_text('100')
+    (tmp_path / 'memory.current').write_text('90')
+    if stats is not None:
+        (tmp_path / 'memory.stat').write_text(stats)
+    assert _cgroup_headroom(tmp_path) == expected
+
+
+def test_unlimited_cgroup_does_not_override_host_or_ancestor_limits(tmp_path):
+    from nnscaler.runtime.cpu_offloading import _cgroup_headroom
+    (tmp_path / 'memory.max').write_text('max')
+    assert _cgroup_headroom(tmp_path) is None
+
+
 def test_compute_config_roundtrip(tmp_path):
     config = ComputeConfig(1, 1, cpu_offload=CPUOffloadConfig(max_cpu_bytes=12345))
     torch.save(asdict(config), tmp_path / 'config.pt')
