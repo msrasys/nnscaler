@@ -18,6 +18,7 @@ class LifeCycle:
 
         graph_inputs = IRSegment.get_objects_from_complex(graph_inputs)
         graph_outputs = IRSegment.get_objects_from_complex(graph_outputs)
+        terminal = {tensor.parent for tensor in graph_outputs if isinstance(tensor, IRSubTensor)}
         func_emission = FuncEmission()
 
         self.nodes: Dict[IRCell, int] = {node: lid for lid, node in enumerate(nodes)}
@@ -59,8 +60,17 @@ class LifeCycle:
                     # and delete them after the backward call to save memory.
                     fw_inputs, fw_outputs, output_grads, input_grads = \
                         func_emission.get_backward_callsite_io_tensors(node)
-                    output_grads = [t for t in output_grads
-                                    if not t.is_loss() and t.tid in produced_tids]
+                    # Only terminal auxiliary gradients use inline zero seeds.
+                    # Internal gradients still have their normal dependencies.
+                    unseeded_aux_grads = {
+                        tensor.grad.tid for tensor in fw_outputs
+                        if tensor.parent in terminal and tensor.grad is not None
+                        and tensor.grad.tid not in produced_tids
+                    }
+                    output_grads = [
+                        tensor for tensor in output_grads
+                        if not tensor.is_loss() and tensor.tid not in unseeded_aux_grads
+                    ]
 
                     outputs = input_grads
                     inputs = list(itertools.chain(fw_inputs, fw_outputs, output_grads))

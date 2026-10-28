@@ -16,7 +16,7 @@ from nnscaler.graph.graph import IRSegment
 
 from nnscaler.execplan.execplan import ExecutionPlan, ExeReuseCell
 
-from nnscaler.codegen.emit import FuncEmission
+from nnscaler.codegen.emit import FuncEmission, IRValue
 from nnscaler.codegen.syntax.symtable import SymbolTable
 from nnscaler.codegen.lifecycle import LifeCycle
 from nnscaler.codegen.syntax.blocks import FunctionBlock, Block
@@ -499,17 +499,6 @@ class ScheduleCodeGen(FuncEmission):
         unwrap_node = self._unwrap_node(node)
         if isinstance(unwrap_node, IRSegment) and not node.isfw():
             input_tensors, output_tensors, output_grads, _ = self.get_backward_callsite_io_tensors(node)
-            if produced_tids is not None:
-                filtered_ot, filtered_og = [], []
-                for output_tensor, output_grad in zip(output_tensors, output_grads):
-                    if output_grad is None or (
-                        isinstance(output_grad, IRSubTensor)
-                        and output_grad.tid in produced_tids
-                    ):
-                        filtered_ot.append(output_tensor)
-                        filtered_og.append(output_grad)
-                output_tensors = filtered_ot
-                output_grads = filtered_og
             return IR.get_objects((input_tensors, output_tensors, output_grads))
         return IR.get_objects(node.inputs())
 
@@ -831,16 +820,14 @@ class ScheduleCodeGen(FuncEmission):
                         output_grads[idx] = None
 
                 if produced_tids is not None:
-                    filtered_ot, filtered_og = [], []
-                    for output_tensor, output_grad in zip(output_tensors, output_grads):
-                        if output_grad is None or (
-                            isinstance(output_grad, IRSubTensor)
-                            and output_grad.tid in produced_tids
-                        ):
-                            filtered_ot.append(output_tensor)
-                            filtered_og.append(output_grad)
-                    output_tensors = filtered_ot
-                    output_grads = filtered_og
+                    terminal = {tensor.parent for tensor in IR.get_objects(self.execplan.outputs())
+                                if isinstance(tensor, IRSubTensor)}
+                    for idx, (output, grad) in enumerate(zip(output_tensors, output_grads)):
+                        if (isinstance(grad, IRSubTensor) and grad.tid not in produced_tids
+                                and output.parent in terminal):
+                            # Logging-only terminal outputs need zero seeds,
+                            # including paths arriving from an earlier stage.
+                            output_grads[idx] = IRValue(f'torch.zeros_like({self.tensor_name(output)})')
 
                 gen_inputs = (input_tensors, output_tensors, output_grads)
                 input_grads_str = self.return_name(input_grads)
