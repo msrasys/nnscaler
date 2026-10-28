@@ -1,5 +1,6 @@
 # Copyright (c) Microsoft Corporation. Licensed under the MIT License.
 import gc
+import weakref
 from dataclasses import asdict
 from types import SimpleNamespace
 
@@ -70,6 +71,72 @@ def test_compute_config_roundtrip(tmp_path):
 
 
 cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason='CUDA required')
+
+
+def test_watch_releases_autograd_nodes_without_cyclic_gc():
+    from nnscaler.runtime.cpu_offloading import _OffloadGroup
+
+    class Sentinel:
+        pass
+
+    class Remember(torch.autograd.Function):
+        @staticmethod
+        def forward(ctx, value, sentinel):
+            ctx.sentinel = sentinel
+            return value.clone()
+
+        @staticmethod
+        def backward(ctx, grad):
+            return grad, None
+
+    gc.collect()
+    enabled = gc.isenabled()
+    gc.disable()
+    try:
+        scope = SimpleNamespace(groups=[], manager=SimpleNamespace(
+            config=CPUOffloadConfig(prefetch_groups=0)))
+        group = _OffloadGroup(scope)
+        sentinel = Sentinel()
+        observed = weakref.ref(sentinel)
+        source = torch.randn(8, requires_grad=True)
+        output = Remember.apply(source, sentinel)
+        group.watch({'first': [output], 'duplicates': (output, output)})
+        output.sum().backward()
+        del output, source, sentinel
+        # No gc.collect here: a graph retained by a self-referential visitor
+        # would survive indefinitely when training disables cyclic GC.
+        assert observed() is None
+    finally:
+        if enabled:
+            gc.enable()
+        gc.collect()
+
+
+@cuda
+def test_repeated_offload_steps_do_not_retain_cuda_payloads_with_gc_disabled():
+    module = OffloadModule()
+    gc.collect()
+    enabled = gc.isenabled()
+    gc.disable()
+    samples = []
+    try:
+        for step in range(24):
+            value = torch.randn(512, 512, device='cuda', requires_grad=True)
+            with module.activation_offload_scope(step):
+                with module.cpu_offloading_hooks() as group:
+                    loss = value.sin().cos().sum()
+                group.watch({'nested': (loss, loss)})
+            loss.backward()
+            module.finish_activation_offload(step)
+            del loss, value, group
+            torch.cuda.synchronize()
+            samples.append(torch.cuda.memory_allocated())
+        assert max(samples[3:]) - min(samples[3:]) < 1024**2, samples
+        assert module.activation_offload_stats()['live_cpu_bytes'] == 0
+    finally:
+        if enabled:
+            gc.enable()
+        gc.collect()
 
 
 @cuda

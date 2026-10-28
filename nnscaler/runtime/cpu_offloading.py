@@ -444,6 +444,22 @@ class _SavedTensor:
         self.record.live_saves -= 1
 
 
+def _iter_tensors(values):
+    """Walk nested values without a recursive closure retaining autograd nodes."""
+    pending = [values]
+    containers = set()
+    while pending:
+        value = pending.pop()
+        if torch.is_tensor(value):
+            yield value
+        elif isinstance(value, (tuple, list, dict)):
+            if id(value) in containers:
+                continue
+            containers.add(id(value))
+            items = tuple(value.values()) if isinstance(value, dict) else value
+            pending.extend(reversed(items))
+
+
 class _OffloadGroup:
     def __init__(self, scope):
         self.scope = scope
@@ -530,19 +546,12 @@ class _OffloadGroup:
         # Node prehooks execute before the group's backward compute, providing
         # overlap for the previous group without modifying outputs or aliasing.
         seen = set()
-        def visit(value):
-            if torch.is_tensor(value) and value.grad_fn is not None:
+        for value in _iter_tensors(outputs):
+            if value.grad_fn is not None:
                 node = value.grad_fn
                 if node not in seen:
                     seen.add(node)
                     node.register_prehook(self.backward_entry)
-            elif isinstance(value, (tuple, list)):
-                for item in value:
-                    visit(item)
-            elif isinstance(value, dict):
-                for item in value.values():
-                    visit(item)
-        visit(outputs)
 
 
 _scope = ContextVar('nnscaler_activation_offload_scope', default=None)
@@ -557,17 +566,9 @@ def mark_retained_scope_tensors(values):
     scope = _scope.get()
     if scope is None or not scope.manager.config.skip_retained_inputs:
         return
-    def visit(value):
-        if torch.is_tensor(value):
-            if value.device.type == 'cuda' and value.layout == torch.strided:
-                scope.retained_storages.add((value.device, value.untyped_storage()._cdata))
-        elif isinstance(value, (tuple, list)):
-            for item in value:
-                visit(item)
-        elif isinstance(value, dict):
-            for item in value.values():
-                visit(item)
-    visit(values)
+    for value in _iter_tensors(values):
+        if value.device.type == 'cuda' and value.layout == torch.strided:
+            scope.retained_storages.add((value.device, value.untyped_storage()._cdata))
 
 
 class _ForwardScope:
