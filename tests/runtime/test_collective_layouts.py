@@ -57,6 +57,15 @@ def _alltoall_layout_worker(subgroup, different_layout):
             ]
             loss = sum((part * grad).sum() for part, grad in zip(reference.chunk(count, dim=odim), gradients))
             loss.backward()
+            # The differentiable wrappers below are synchronous APIs. Also
+            # verify their inverse layout with actual asynchronous transport:
+            # the full eager gradient above is the independent numerical oracle.
+            for operation in (collectives.all_to_all, collectives.all_to_all_single):
+                handle = operation(gradients[dsts.index(rank)], odim, idim, dsts,
+                                   dsts=ranks, async_op=True)
+                actual_grad = AsyncCommHandler().wait(handle)
+                torch.testing.assert_close(actual_grad, reference.grad.chunk(count, dim=idim)[ranks.index(rank)])
+                AsyncCommHandler().check_clear()
             for operation in (nn.AllToAllAllToAll.apply, nn.alltoall_alltoall):
                 value = local.clone().requires_grad_()
                 # Construct arguments from IR metadata, so the old implementation

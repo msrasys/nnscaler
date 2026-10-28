@@ -95,6 +95,7 @@ def test_fn_pipeline_generates_permuted_collectives(tmp_path, ngpus):
 
 def pipeline_worker(ngpus=8):
     nnscaler.init()
+    torch.set_float32_matmul_precision('highest')
     torch.manual_seed(7)
     source, policy, config = model_case(ngpus)
     reference = copy.deepcopy(source).cuda()
@@ -105,6 +106,10 @@ def pipeline_worker(ngpus=8):
         model = parallelize(source, {'sample': {'x': torch.ones(8, 8)}},
                             policy, config,
                             gen_savedir=tempdir, reuse='override').cuda()
+        if ngpus == 8 and nnscaler.flags.CompileFlag.async_comm:
+            # Prove the ASYNC_COMM acceptance run actually generated async
+            # pipeline communication instead of silently exercising a sync path.
+            assert any('async_op=True' in path.read_text() for path in tempdir.rglob('gencode*.py'))
         optimizer = build_optimizer(model, torch.optim.SGD, lr=0.001)
         for step in range(2):
             samples = [{'x': torch.arange(64, device='cuda').reshape(8, 8).float() / 64 + micro + step}
