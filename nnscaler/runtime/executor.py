@@ -229,6 +229,7 @@ class Executor:
         """
         forward the sub-graph.
         """
+        original_inputs = input_tensors
         input_tensors = Executor.sync_tensors(input_tensors)
 
         if not requires_grad:
@@ -238,12 +239,15 @@ class Executor:
 
         # everytime forward a segment, detach the tensor from previous graph
         mapping: Dict[int, torch.Tensor] = dict()
-        for itensor in input_tensors:
-            if torch.is_tensor(itensor) and itensor.requires_grad:
+        for original, itensor in zip(original_inputs, input_tensors):
+            # A communication callback may materialize a new tensor without an
+            # autograd edge. The original boundary still needs its gradient.
+            if torch.is_tensor(itensor) and (itensor.requires_grad or original.requires_grad) \
+                    and id(itensor) not in mapping:
                 mapping[id(itensor)] = itensor.detach().requires_grad_()
         input_dtensors = tuple(mapping[id(t)] if id(t) in mapping else t for t in input_tensors)
 
-        saved_pairs = [(id(itensor), dtensor) for itensor, dtensor in zip(input_tensors, input_dtensors)]
+        saved_pairs = [(id(itensor), dtensor) for itensor, dtensor in zip(original_inputs, input_dtensors)]
         Executor._detach.setdefault(name, []).append(saved_pairs)
 
         outputs = subgraph(*input_dtensors)
@@ -254,6 +258,7 @@ class Executor:
         """
         execute adapter
         """
+        input_tensors = Executor.sync_tensors(input_tensors)
         if not requires_grad:
             with torch.no_grad():
                 outputs = subgraph(*input_tensors)
@@ -372,17 +377,7 @@ class Executor:
             for tid, dtensor in saved_pairs
             if torch.is_tensor(dtensor) and dtensor.requires_grad
         }
-        for tensor in requested_input_tensors:
-            if (
-                torch.is_tensor(tensor)
-                and tensor.retains_grad
-                and (grad := grad_by_input_id.get(id(tensor))) is not None
-            ):
-                tensor.grad = (
-                    grad.detach()
-                    if tensor.grad is None
-                    else tensor.grad + grad.detach()
-                )
+        Executor._accumulate_retained_input_grads(requested_input_tensors, grad_by_input_id)
 
         Executor._run_input_grad_callbacks(
             saved_pairs,
@@ -412,6 +407,7 @@ class Executor:
         """
         output_tensor_grads = Executor.sync_tensors(output_tensor_grads)
         weights = tuple(weights)
+        requested_input_tensors = input_tensors
 
         saved_pairs = Executor._detach[name].pop(0)
         tensor_ids: List[int] = [pair[0] for pair in saved_pairs]
@@ -470,17 +466,26 @@ class Executor:
             tensor.clone() if tensor._is_view() else tensor
             for tensor in dedup_output_tensors
         ]
-        grads, param_groups = stage_backward_input(
+        # The split helper installs one gradient hook per input. Repeated
+        # arguments share a leaf and must not install that hook repeatedly.
+        unique_inputs = list({id(tensor): tensor for tensor in input_tensors}.values())
+        unique_grads, param_groups = stage_backward_input(
             stage_outputs,
             dedup_output_tensor_grads,
-            input_tensors,
+            unique_inputs,
             iter(weights),
         )
+        grad_by_id = {id(tensor): grad for tensor, grad in zip(unique_inputs, unique_grads)}
+        grads = tuple(grad_by_id[id(tensor)] for tensor in input_tensors)
         Executor._weight_backward_states.setdefault(name, []).append(
             _WeightBackwardState(param_groups=param_groups)
         )
 
         assert all(grad is not None for grad in grads), "RuntimeError: got gradient None"
+        Executor._accumulate_retained_input_grads(
+            requested_input_tensors,
+            {tid: grad_by_id.get(id(tensor)) for tid, tensor in saved_pairs},
+        )
         Executor._run_input_grad_callbacks(
             saved_pairs,
             {id(tensor): grad for tensor, grad in zip(input_tensors, grads)},
@@ -520,12 +525,39 @@ class Executor:
             )
 
     @staticmethod
+    def _accumulate_retained_input_grads(input_tensors, grad_by_input_id):
+        retained_ids = set()
+        for tensor in input_tensors:
+            if (
+                torch.is_tensor(tensor)
+                and tensor.retains_grad
+                and id(tensor) not in retained_ids
+                and id(tensor) not in Executor._input_grad_callbacks
+                and (grad := grad_by_input_id.get(id(tensor))) is not None
+            ):
+                retained_ids.add(id(tensor))
+                # A callback that resumes outer autograd owns this update.
+                # Otherwise preserve retain_grad once per boundary identity.
+                tensor.grad = grad.detach() if tensor.grad is None else tensor.grad + grad.detach()
+
+    @staticmethod
     def sync_tensors(tensors: List[Any]) -> List[Any]:
         """
         Wait until the finish of synchornized tensors
         """
-        AsyncCommHandler().drain_sends(wait=False)
-        return [AsyncCommHandler().wait(t) if torch.is_tensor(t) else t for t in tensors]
+        handler = AsyncCommHandler()
+        handler.drain_sends(wait=False)
+        replacements = {}
+        result = []
+        for tensor in tensors:
+            if torch.is_tensor(tensor):
+                # wait consumes the pending entry. Every occurrence of a
+                # placeholder must resolve to the same completed tensor.
+                if id(tensor) not in replacements:
+                    replacements[id(tensor)] = handler.wait(tensor)
+                tensor = replacements[id(tensor)]
+            result.append(tensor)
+        return result
 
 
     @staticmethod
