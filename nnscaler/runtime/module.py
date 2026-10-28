@@ -1216,9 +1216,16 @@ class _ModuleTensorRegistry:
         if owner is not None:
             return owner
 
-        # A gathered ZeRO-3 parameter is absent from the storage snapshot.
+        # ZeRO-3 gather replaces a parameter's storage after this registry is
+        # built, so the parameter and its views can miss tensors_by_storage.
+        # The parameter object is unchanged:
+        # check tensor itself,
+        # then follow its _base chain to find a registered parameter by identity.
         base = tensor
         while base is not None and (owner := self.parameters_by_id.get(id(base))) is None:
+            # _base is the underlying tensor that a view is based on.
+            # v = p.T
+            # v._base is p  # True
             base = base._base
 
         return owner
