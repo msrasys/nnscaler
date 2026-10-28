@@ -13,6 +13,10 @@ import logging
 from torch.distributed import Work
 
 from ._patch_torch import stage_backward_input, stage_backward_weight
+from .pipeline_input import (
+    InputReference, InputGradSlot, make_releasable_input, release_input_tensor,
+    input_id, saved_input_id, is_grad_target, supports_input_slots,
+)
 
 
 _logger = logging.getLogger(__name__)
@@ -167,7 +171,7 @@ class AsyncCommHandler:
         )
 
 
-TensorPairs = List[Tuple[int, torch.Tensor]]
+TensorPairs = List[Tuple[Any, Any]]
 
 
 @dataclass
@@ -214,10 +218,16 @@ class Executor:
         saved_pairs: TensorPairs,
         grad_by_dtensor_id: Dict[int, Optional[torch.Tensor]],
     ) -> None:
-        for tensor_id, dtensor in saved_pairs:
-            entry = Executor._input_grad_callbacks.pop(tensor_id, None)
+        for key, dtensor in saved_pairs:
+            tensor_id = saved_input_id(key)
+            entry = Executor._input_grad_callbacks.get(tensor_id)
             if entry is None:
                 continue
+            if isinstance(key, InputReference) and key.original() is not entry[0]:
+                # The original input can now die before backward. Never run
+                # a callback registered on a later tensor that reused its id.
+                continue
+            Executor._input_grad_callbacks.pop(tensor_id)
             grad = grad_by_dtensor_id.get(id(dtensor))
             if grad is None:
                 raise RuntimeError('segment did not produce a registered input gradient')
@@ -225,11 +235,15 @@ class Executor:
             callback(grad.detach())
 
     @staticmethod
-    def fexecute(name: str, subgraph: Callable, *input_tensors: Tuple[Any], requires_grad=True):
+    def fexecute(name: str, subgraph: Callable, *input_tensors: Tuple[Any], requires_grad=True,
+                 release_inputs: Tuple[int, ...] = ()):
         """
         forward the sub-graph.
         """
         input_tensors = Executor.sync_tensors(input_tensors)
+        if any(isinstance(i, bool) or not isinstance(i, int) or not 0 <= i < len(input_tensors)
+               for i in release_inputs):
+            raise ValueError('release_inputs must contain valid input argument indices')
 
         if not requires_grad:
             with torch.no_grad():
@@ -238,20 +252,46 @@ class Executor:
 
         # everytime forward a segment, detach the tensor from previous graph
         mapping: Dict[int, torch.Tensor] = dict()
+        selected_ids = {id(input_tensors[i]) for i in release_inputs}
+        slots = {}
+        keys = {}
+        owner = getattr(subgraph, '__self__', None)
+        find_owner = getattr(owner, 'find_buffer_or_param_owner', None)
         for itensor in input_tensors:
             if torch.is_tensor(itensor) and itensor.requires_grad:
+                tid = id(itensor)
+                if tid in selected_ids:
+                    if tid in mapping:
+                        continue
+                    keys[tid] = InputReference(itensor)
+                    if (supports_input_slots(Executor._backward_pre_hook)
+                            and itensor.layout == torch.strided
+                            and itensor.dtype in _ALLOW_GRAD_DTYPES
+                            and not isinstance(itensor, torch.nn.Parameter)
+                            and not (find_owner and find_owner(itensor) is not None)
+                            and not getattr(itensor.untyped_storage(), '_nnscaler_activation_resident', False)):
+                        mapping[tid], slots[tid] = make_releasable_input(itensor)
+                        continue
                 mapping[id(itensor)] = itensor.detach().requires_grad_()
         input_dtensors = tuple(mapping[id(t)] if id(t) in mapping else t for t in input_tensors)
 
-        saved_pairs = [(id(itensor), dtensor) for itensor, dtensor in zip(input_tensors, input_dtensors)]
+        saved_pairs = [(keys.get(id(itensor), id(itensor)), slots.get(id(itensor), dtensor))
+                       for itensor, dtensor in zip(input_tensors, input_dtensors)]
         Executor._detach.setdefault(name, []).append(saved_pairs)
 
         # These input objects already stay alive through this segment's
         # backward. Copying their storage to the host cannot release it.
         from nnscaler.runtime.cpu_offloading import mark_retained_scope_tensors
-        mark_retained_scope_tensors(input_dtensors)
+        mark_retained_scope_tensors(tuple(dtensor for itensor, dtensor in zip(input_tensors, input_dtensors)
+                                         if id(itensor) not in slots))
 
-        outputs = subgraph(*input_dtensors)
+        try:
+            outputs = subgraph(*input_dtensors)
+        except BaseException:
+            if release_inputs:
+                pending = Executor._detach[name]
+                pending[:] = [pairs for pairs in pending if pairs is not saved_pairs]
+            raise
         return outputs
 
     @staticmethod
@@ -295,20 +335,20 @@ class Executor:
         output_tensor_grads = Executor.sync_tensors(output_tensor_grads)
 
         saved_pairs = Executor._detach[name].pop(0)
-        tensor_ids: List[int] = [pair[0] for pair in saved_pairs]
+        tensor_ids: List[int] = [saved_input_id(pair[0]) for pair in saved_pairs]
         dtensors: List[torch.Tensor] = [pair[1] for pair in saved_pairs]
         requested_input_tensors = input_tensors
         requested_tensor_ids = [
-            id(t) for t in requested_input_tensors if torch.is_tensor(t)
+            input_id(t) for t in requested_input_tensors if isinstance(t, (torch.Tensor, InputReference))
         ]
         dtensor_by_input_id = {
-            tid: dtensor
+            saved_input_id(tid): dtensor
             for tid, dtensor in saved_pairs
-            if torch.is_tensor(dtensor)
+            if isinstance(dtensor, (torch.Tensor, InputGradSlot))
         }
 
         for t in requested_input_tensors:
-            if torch.is_tensor(t) and id(t) not in tensor_ids:
+            if isinstance(t, (torch.Tensor, InputReference)) and input_id(t) not in tensor_ids:
                 import traceback
                 _logger.warning(
                     f"rank {torch.distributed.get_rank()}: input {name} doesn't match. "
@@ -322,7 +362,7 @@ class Executor:
         input_tensors = []
         for tid in requested_tensor_ids:
             t = dtensor_by_input_id.get(tid)
-            if torch.is_tensor(t) and t.requires_grad:
+            if is_grad_target(t):
                 t.retain_grad()
                 input_tensors.append(t)
 
@@ -339,6 +379,8 @@ class Executor:
 
         # apply hook before backward
         if Executor._backward_pre_hook is not None:
+            if any(isinstance(t, InputGradSlot) for t in input_tensors) and not supports_input_slots(Executor._backward_pre_hook):
+                raise RuntimeError('The backward hook changed after pipeline inputs were released; it must support input gradient slots')
             input_tensors, dedup_output_tensors, dedup_output_tensor_grads = \
                 Executor._backward_pre_hook(
                     input_tensors,
@@ -373,11 +415,13 @@ class Executor:
         # gradient to cross from an end-to-end generated subgraph back into an
         # outer eager graph.
         grad_by_input_id = {
-            tid: dtensor.grad
+            saved_input_id(tid): dtensor.grad
             for tid, dtensor in saved_pairs
-            if torch.is_tensor(dtensor) and dtensor.requires_grad
+            if is_grad_target(dtensor)
         }
         for tensor in requested_input_tensors:
+            if isinstance(tensor, InputReference):
+                tensor = tensor.original()
             if (
                 torch.is_tensor(tensor)
                 and tensor.retains_grad
@@ -394,9 +438,14 @@ class Executor:
             {
                 id(dtensor): dtensor.grad
                 for dtensor in dtensors
-                if torch.is_tensor(dtensor)
+                if isinstance(dtensor, (torch.Tensor, InputGradSlot))
             },
         )
+        for target in dtensors:
+            if isinstance(target, InputGradSlot):
+                # The returned gradients/callbacks own any still-needed data.
+                # An output retained by a caller must not keep dInput alive.
+                target.grad = None
 
         if    len(grads) == 0: return None
         elif  len(grads) == 1: return grads[0]
@@ -415,6 +464,8 @@ class Executor:
         ``backward_weight`` must later be called for the same segment name and
         in the same order as ``backward_input``.
         """
+        if any(isinstance(key, InputReference) for key, _ in Executor._detach[name][0]):
+            raise RuntimeError('Released pipeline inputs do not support split backward')
         output_tensor_grads = Executor.sync_tensors(output_tensor_grads)
         weights = tuple(weights)
 

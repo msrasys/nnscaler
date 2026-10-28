@@ -35,7 +35,7 @@ def collect():
 
 @pytest.mark.parametrize('field,value', [('max_cpu_bytes', -1), ('prefetch_groups', True),
                                         ('max_prefetch_bytes', 1.5), ('min_offload_size_gap_bytes', -1),
-                                        ('use_save_events', 1)])
+                                        ('use_save_events', 1), ('release_pipeline_inputs', 1)])
 def test_invalid_config(field, value):
     with pytest.raises(ValueError, match=field):
         CPUOffloadConfig(**{field: value})

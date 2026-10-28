@@ -45,6 +45,30 @@ unpack callback while a saved value is live, including with `retain_graph=True`.
 Output traversal is iterative so a self-referencing visitor cannot retain
 autograd nodes, boundary inputs or their gradients.
 
+### Experimental pipeline input release
+
+`CPUOffloadConfig(release_pipeline_inputs=True)` lets a generated pipeline
+schedule replace selected input variables with weak identity references after
+their final data read. The executor captures dInput in a small autograd boundary
+with an empty anchor instead of retaining a detached input leaf. Saved-tensor
+hooks can then release the original GPU allocation when no other owner needs
+it. No tensor's data pointer, shape or storage is modified to force reclamation.
+
+This option is disabled by default and requires regenerated code. It applies
+to ordinary pipeline backward, and rejects split input/weight backward. The
+analysis keeps local backward roots, returned tensors and attributes; adapter
+and segment-hook reads still count as data uses. Unknown global backward hooks
+keep tensor targets. The internal output-only loss-scaling hook supports the
+new targets; changing to an incompatible hook after forward raises an error.
+
+Bridged inputs must remain immutable, and custom operators must support a
+non-leaf input view. Normal alias ownership and CUDA stream lifetimes remain
+intact. Outside references, including a caller's tensor or a Vision callback,
+can still keep the allocation alive. This does not promise that every pipeline
+input will leave the GPU. Runtime/code-generation regressions pass, including a
+16 MiB CUDA ownership check with exact gradients; full-model validation and
+performance measurements are still required before recommending this option.
+
 ## Immutability contract
 
 An activation saved by an offload context and every alias of its storage must

@@ -521,6 +521,26 @@ def test_codegen_fn_pipeline_cpu_offload(tmp_path):
         )
 
 
+@replace_all_device_with('cpu')
+@pytest.mark.parametrize('release_inputs', [False, True])
+def test_codegen_fn_pipeline_input_references_are_opt_in(tmp_path, release_inputs):
+    import ast
+    model = FnPolicyModuleList(ffn_layers=4)
+    parallelize(
+        model, {'x': torch.randn(4, 4)}, pipeline_cpu_offload_prefetch_policy,
+        ComputeConfig(2, 2, use_end2end=True,
+            cpu_offload={'min_tensor_bytes': 0, 'release_pipeline_inputs': release_inputs},
+            pas_config={'pipeline_nmicros': 2, 'pipeline_size': 2}),
+        gen_savedir=tmp_path, instance_name='input_references', load_module=False,
+    )
+    sources = [path.read_text() for path in tmp_path.rglob('gencode*.py')]
+    assert sources
+    for source in sources:
+        ast.parse(source)
+    assert any('release_input_tensor(' in source for source in sources) == release_inputs
+    assert any('release_inputs=(' in source for source in sources) == release_inputs
+
+
 def _pipeline_cpu_offload_runtime_worker(tempdir):
     import nnscaler.runtime.cpu_offloading as cpu_offloading
 

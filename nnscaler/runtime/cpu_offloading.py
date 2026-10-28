@@ -49,12 +49,16 @@ class CPUOffloadConfig:
     # Custom asynchronous producers must join the saving stream before save;
     # this option cannot infer producer completion from a tensor's allocation.
     use_save_events: bool = False
+    # Opt-in pipeline input identities/gradient slots, allowing an input's
+    # storage to disappear after its final scheduled data read. Split input /
+    # weight backward is not supported by this option.
+    release_pipeline_inputs: bool = False
     # Leave headroom for the dataloader, optimizer, compilation and other ranks.
     host_reserve_bytes: int = 32 * 1024**3
 
     def __post_init__(self):
         for name, value in vars(self).items():
-            if name in ('reload_on_compute_stream', 'skip_retained_inputs', 'use_save_events'):
+            if name in ('reload_on_compute_stream', 'skip_retained_inputs', 'use_save_events', 'release_pipeline_inputs'):
                 if not isinstance(value, bool):
                     raise ValueError(f'{name} must be a bool')
                 continue

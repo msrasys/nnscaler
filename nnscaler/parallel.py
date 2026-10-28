@@ -1042,7 +1042,10 @@ def _gencode(
     )
     sgener = None
     if compute_config.use_end2end:
-        sgener = ScheduleCodeGen(execplan, compute_config.runtime_ngpus)
+        sgener = ScheduleCodeGen(
+            execplan, compute_config.runtime_ngpus,
+            release_pipeline_inputs=bool(compute_config.cpu_offload and compute_config.cpu_offload.release_pipeline_inputs),
+        )
 
     actual_codegen_workers = min(codegen_workers, compute_config.runtime_ngpus)
     if actual_codegen_workers > 1:

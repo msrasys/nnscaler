@@ -99,6 +99,49 @@ class LifeCycle:
         """
         return self.release.get(line_id, [])
 
+    def input_references_after_data_use(self, nodes, graph_outputs):
+        """Find inputs whose remaining schedule uses only identify gradients.
+
+        Keep backward roots, returned values, attributes and any tensor read
+        by a backward segment hook. Adapters and ordinary operations always
+        count as data consumers. The ordinary lifetime remains unchanged: the
+        lightweight input identity is deleted at that original final use.
+        """
+        emission = FuncEmission()
+        data_lifetime = {}
+        input_targets = set()
+        forward_inputs = set()
+        roots = set(IRSegment.get_objects_from_complex(graph_outputs))
+
+        def activations(values):
+            return (v for v in IRSegment.get_objects_from_complex(values)
+                    if isinstance(v, IRSubTensor) and not v.is_attr() and not v.is_grad())
+
+        for line, node in enumerate(nodes):
+            cell = node.cell if isinstance(node, ExeReuseCell) else node
+            if isinstance(cell, IRSegment) and not node.isfw():
+                fw_inputs, fw_outputs, output_grads, input_grads = emission.get_backward_callsite_io_tensors(node)
+                input_targets.update(activations(fw_inputs))
+                roots.update(activations(fw_outputs))
+                inputs = list(fw_outputs) + list(output_grads)
+                if cell.pre_hook or cell.post_hook:
+                    inputs.extend(fw_inputs)
+                outputs = input_grads
+            else:
+                inputs, outputs = node.inputs(), node.outputs()
+                if isinstance(cell, IRSegment):
+                    # Executor detaches top-level tensor arguments only.
+                    forward_inputs.update(v for v in node.inputs() if isinstance(v, IRSubTensor))
+            for value in activations((inputs, outputs)):
+                data_lifetime[value] = line
+
+        captures = {}
+        for value in input_targets & forward_inputs - roots:
+            line = data_lifetime.get(value)
+            if value.requires_grad and line is not None and line < self.lifetime[value]:
+                captures.setdefault(line, []).append(value)
+        return {line: sorted(values, key=lambda value: value.tid) for line, values in captures.items()}
+
     def release_tensors_after_node(self, node: IRCell) -> List[IRSubTensor]:
         """
         Get the releasable IRSubTensors after finish of executing of the node.

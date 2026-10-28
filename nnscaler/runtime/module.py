@@ -1767,6 +1767,9 @@ class ParallelModule(CubeModule):
                     break
             return ins, outs, grads
 
+        # Loss scaling only transforms output roots/gradients; it never reads
+        # segment input data and can accept input gradient slots.
+        cube_scale._nnscaler_supports_input_grad_slots = True
         Executor.register_backward_pre_hook(cube_scale)
 
     def train_step(self,
