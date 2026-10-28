@@ -33,7 +33,7 @@ def collect():
 
 
 @pytest.mark.parametrize('field,value', [('max_cpu_bytes', -1), ('prefetch_groups', True),
-                                        ('max_prefetch_bytes', 1.5)])
+                                        ('max_prefetch_bytes', 1.5), ('min_offload_size_gap_bytes', -1)])
 def test_invalid_config(field, value):
     with pytest.raises(ValueError, match=field):
         CPUOffloadConfig(**{field: value})
@@ -69,6 +69,59 @@ def test_compute_config_roundtrip(tmp_path):
 
 
 cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason='CUDA required')
+
+
+@cuda
+def test_size_and_schedule_distance_filter_uses_storage_and_preserves_views():
+    from nnscaler.runtime.cpu_offloading import _OffloadGroup, _ResidentTensorRef, _SavedTensor
+    mib = 1024**2
+    module = OffloadModule(min_offload_size_gap_bytes=6*mib)
+    manager = module._get_activation_offload_manager()
+    large = torch.randn(1024, 1024, device='cuda')
+    small = torch.randn(256, 256, device='cuda')
+    with module.activation_offload_scope('short', backward_distance=2) as scope:
+        group = _OffloadGroup(scope)
+        a = manager.pack(large, group)
+        b = manager.pack(large[:512], group)
+        c = manager.pack(small, group)
+        d = manager.pack(small[:128], group)
+        assert isinstance(a, _SavedTensor) and isinstance(b, _SavedTensor)
+        assert a.record is b.record
+        assert isinstance(c, _ResidentTensorRef) and isinstance(d, _ResidentTensorRef)
+        assert manager.pool.stats['size_gap_resident_storages'] == 1
+        assert manager.pool.stats['size_gap_resident_bytes'] == small.untyped_storage().nbytes()
+        group.commit()
+    torch.testing.assert_close(a.unpack(), large, atol=0, rtol=0)
+    torch.testing.assert_close(b.unpack(), large[:512], atol=0, rtol=0)
+    small.add_(1)
+    with pytest.raises(RuntimeError, match='modified by an inplace'):
+        c.unpack()
+    module.finish_activation_offload('short')
+    with module.activation_offload_scope('unknown') as scope:
+        group = _OffloadGroup(scope)
+        assert isinstance(manager.pack(small, group), _SavedTensor)
+    module.finish_activation_offload('unknown')
+
+
+@cuda
+@pytest.mark.parametrize('distance', [2, 64, None])
+def test_size_gap_filter_preserves_gradients_for_resident_and_offloaded_inputs(distance):
+    module = OffloadModule(min_offload_size_gap_bytes=2*1024**2)
+    large = torch.randn(512, 512, device='cuda', requires_grad=True)
+    small = torch.randn(128, 128, device='cuda', requires_grad=True)
+    def compute():
+        return large.sin().cos().sum() + small.sin().cos().sum()
+    expected = torch.autograd.grad(compute(), (large, small))
+    with module.activation_offload_scope('case', backward_distance=distance):
+        with module.cpu_offloading_hooks() as group:
+            value = compute()
+        group.watch(value)
+    module.prefetch_activation('case')
+    actual = torch.autograd.grad(value, (large, small))
+    module.finish_activation_offload('case')
+    for a, b in zip(actual, expected, strict=True):
+        torch.testing.assert_close(a, b, atol=0, rtol=0)
+    assert module.activation_offload_stats()['live_cpu_bytes'] == 0
 
 
 @cuda

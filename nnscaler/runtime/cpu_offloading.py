@@ -40,6 +40,10 @@ class CPUOffloadConfig:
     skip_retained_inputs: bool = True
     pool_slab_bytes: int = 0
     min_offload_gap: int = 0
+    # Minimum backing-storage bytes * scheduled local F/B action distance.
+    # Zero disables this size-aware lifetime filter; unknown distances retain
+    # the existing behavior (ordinary non-pipeline autograd has no schedule).
+    min_offload_size_gap_bytes: int = 0
     # Leave headroom for the dataloader, optimizer, compilation and other ranks.
     host_reserve_bytes: int = 32 * 1024**3
 
@@ -543,6 +547,7 @@ def mark_retained_scope_tensors(values):
 class _ForwardScope:
     def __init__(self, manager, immediate_backward=False, backward_distance=None):
         self.manager = manager
+        self.backward_distance = backward_distance
         self.immediate_backward = immediate_backward
         self.keep_resident = (backward_distance is not None
                               and backward_distance < manager.config.min_offload_gap)
@@ -642,6 +647,20 @@ class ActivationOffloadManager:
         size = storage.nbytes()
         # Avoid copying a huge backing allocation for a small slice.
         if size == 0 or size > 8 * tensor.numel() * tensor.element_size():
+            return _ResidentTensorRef(tensor)
+        if (self.config.min_offload_size_gap_bytes
+                and (distance := group.scope.backward_distance) is not None
+                and size * distance < self.config.min_offload_size_gap_bytes):
+            # Use storage size so ordinary views within one scope make the
+            # same decision. Keep SavedVariable's version check on this path.
+            seen = getattr(group.scope, '_size_gap_saved', None)
+            if seen is None:
+                seen = group.scope._size_gap_saved = set()
+            saved_key = (*identity, tensor._version)
+            if saved_key not in seen:
+                seen.add(saved_key)
+                self.pool.stats['size_gap_resident_bytes'] += size
+                self.pool.stats['size_gap_resident_storages'] += 1
             return _ResidentTensorRef(tensor)
         key = identity
         tensor.record_stream(torch.cuda.current_stream(tensor.device))
