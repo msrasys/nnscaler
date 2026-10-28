@@ -26,7 +26,7 @@ def test_resume_only_package_is_not_valid_for_fresh_training(tmp_path):
     with pytest.raises(RuntimeError,match='do not match'):
         _prepare_and_check_reusable(str(tmp_path),torch.nn.Linear,cfg)
 
-@pytest.mark.parametrize('missing',['npbuffer.pt','gencode0.py','fullmodel.pt.index'])
+@pytest.mark.parametrize('missing',['npbuffer.pt','gencode0.py',FxModuleParser.ATTR_MAP_FILE,ParallelModule.ATTR_META_FILE])
 def test_resume_still_requires_code_buffers_and_metadata(tmp_path,missing):
     cfg,folder=make_package(tmp_path)
     (folder/FxModuleParser.ATTR_CONTENT_FILE_0).unlink()
@@ -35,3 +35,15 @@ def test_resume_still_requires_code_buffers_and_metadata(tmp_path,missing):
     if missing=='gencode0.py':(folder/'unrecognized.py').touch()
     with pytest.raises(RuntimeError,match='do not match'):
         _prepare_and_check_reusable(str(tmp_path),torch.nn.Linear,cfg,allow_missing_init_weights=True)
+
+
+@pytest.mark.parametrize('allow_missing_init_weights', [False, True])
+def test_legacy_index_is_optional_for_fresh_and_resume_packages(tmp_path, allow_missing_init_weights):
+    cfg, folder = make_package(tmp_path)
+    (folder / FxModuleParser.ATTR_CONTENT_INDEX_FILE).unlink()
+    if allow_missing_init_weights:
+        (folder / FxModuleParser.ATTR_CONTENT_FILE_0).unlink()
+    assert _prepare_and_check_reusable(
+        str(tmp_path), torch.nn.Linear, cfg,
+        allow_missing_init_weights=allow_missing_init_weights,
+    )[1]

@@ -21,6 +21,7 @@ import torch
 import torch.distributed as dist
 from torch import device
 from torch.autograd.graph import saved_tensors_hooks
+from torch.torch_version import TorchVersion
 
 from nnscaler.graph.parser import FxModuleParser
 
@@ -467,29 +468,48 @@ class CubeModule(torch.nn.Module):
                 that saved with model parameters
         """
         index_filename = filename + '.index'
-        if not os.path.isfile(index_filename):
-            raise RuntimeError(f"Cannot find file {index_filename} in load_attr_content")
-        tid_to_chunk: Dict[int, int] = torch.load(index_filename, weights_only=True)
-        if not isinstance(tid_to_chunk, dict):
-            raise RuntimeError(f"Invalid attribute content index {index_filename}")
-
-        chunk_ids = set(tid_to_chunk.values())
-        if any(type(chunk_id) is not int or chunk_id < 0 for chunk_id in chunk_ids):
-            raise RuntimeError(f"Invalid chunk IDs in attribute content index {index_filename}")
-        npartitions = max(chunk_ids) + 1 if chunk_ids else 1
-        if chunk_ids and chunk_ids != set(range(npartitions)):
-            raise RuntimeError(f"Non-contiguous chunk IDs in attribute content index {index_filename}")
+        has_index = os.path.isfile(index_filename)
+        tid_to_chunk = None
+        if has_index:
+            tid_to_chunk: Dict[int, int] = torch.load(index_filename, weights_only=True)
+            if not isinstance(tid_to_chunk, dict):
+                raise RuntimeError(f"Invalid attribute content index {index_filename}")
+            chunk_ids = set(tid_to_chunk.values())
+            if any(type(chunk_id) is not int or chunk_id < 0 for chunk_id in chunk_ids):
+                raise RuntimeError(f"Invalid chunk IDs in attribute content index {index_filename}")
+            npartitions = max(chunk_ids) + 1 if chunk_ids else 1
+            if chunk_ids and chunk_ids != set(range(npartitions)):
+                raise RuntimeError(f"Non-contiguous chunk IDs in attribute content index {index_filename}")
+        else:
+            # Legacy generated packages have no index; inspect every chunk.
+            stem = Path(filename)
+            chunk_ids = {int(path.suffix[1:]) for path in stem.parent.glob(stem.name + '.*')
+                         if path.is_file() and path.suffix[1:].isdigit()}
+            npartitions = max(chunk_ids) + 1 if chunk_ids else 0
+            if not chunk_ids or chunk_ids != set(range(npartitions)):
+                raise RuntimeError(f'Missing attribute content chunks for {filename}')
 
         with torch.no_grad():
             required_tids = {meta.tid for meta in self._fullmap.values()}
-            missing_tids = required_tids.difference(tid_to_chunk)
+            missing_tids = required_tids.difference(tid_to_chunk) if has_index else set()
             if missing_tids:
                 raise RuntimeError(
                     f'attribute content index {index_filename} is missing tensor IDs: {sorted(missing_tids)}'
                 )
             chunk_to_attrs = defaultdict(list)
-            for attr_name, meta in self._fullmap.items():
-                chunk_to_attrs[tid_to_chunk[meta.tid]].append((attr_name, meta))
+            if has_index:
+                for attr_name, meta in self._fullmap.items():
+                    chunk_to_attrs[tid_to_chunk[meta.tid]].append((attr_name, meta))
+            else:
+                chunk_to_attrs = {idx: list(self._fullmap.items()) for idx in range(npartitions)}
+
+            # Only trusted, locally generated attribute chunks use the subclass-
+            # compatible unpickler. The separate integer index stays weights-only.
+            load_options = {'weights_only': False}
+            if TorchVersion(torch.__version__) >= (2, 1):
+                # TP/PP ranks only page in the slices of a full tensor they own.
+                load_options['mmap'] = True
+            loaded_tids = set()
 
             _logger.info(
                 f'loading partitioned model from {filename}, '
@@ -500,11 +520,12 @@ class CubeModule(torch.nn.Module):
                 # fulltensor.tid -> torch.Tensor
                 part_model: Dict[int, torch.Tensor] = torch.load(
                     filename + f'.{file_idx}',
-                    mmap=True,
-                    weights_only=True,
+                    **load_options,
                 )
                 for attr_name, meta in attrs:
                     if meta.tid not in part_model:
+                        if not has_index:
+                            continue
                         raise RuntimeError(
                             f'tensor ID {meta.tid} for attribute {attr_name} is not in '
                             f'{filename}.{file_idx}'
@@ -514,7 +535,11 @@ class CubeModule(torch.nn.Module):
                     if meta.val_chunks != 1:
                         content = content / meta.val_chunks
                     attr.copy_(content)
+                    loaded_tids.add(meta.tid)
                 del part_model
+            if required_tids.difference(loaded_tids):
+                raise RuntimeError(f'Missing tensor IDs in attribute content {filename}: '
+                                   f'{sorted(required_tids.difference(loaded_tids))}')
 
     def load_np_buffer_content(self, filename: str):
         """Load non-persistent buffer content from file.

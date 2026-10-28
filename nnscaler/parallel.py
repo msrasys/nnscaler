@@ -734,7 +734,6 @@ def _prepare_and_check_reusable(
     is_graph_config_match = old_config is not None and old_config.graph_config == compute_config.graph_config
     trace_meta_files = [
         outdir / FxModuleParser.ATTR_CONTENT_FILE_0,  # just check the first is good enough
-        outdir / FxModuleParser.ATTR_CONTENT_INDEX_FILE,
         outdir / FxModuleParser.ATTR_MAP_FILE,
     ]
 
@@ -742,6 +741,8 @@ def _prepare_and_check_reusable(
         # check if the module is already generated
         expected_output_files = [outdir / _GENCODE_FILE_TEMPLATE.format(rank) for rank in range(compute_config.runtime_ngpus)]
         expected_output_files.extend(trace_meta_files)
+        if (outdir / FxModuleParser.ATTR_CONTENT_INDEX_FILE).exists():
+            expected_output_files.append(outdir / FxModuleParser.ATTR_CONTENT_INDEX_FILE)
         expected_output_files.append(config_file)
         expected_output_files.append(outdir / _GRAPH_DUMP_FILE)
         expected_output_files.append(outdir / _FORWARD_ARGS_DUMP_FILE)
