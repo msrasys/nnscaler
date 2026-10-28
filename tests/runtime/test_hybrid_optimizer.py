@@ -9,9 +9,40 @@ import pytest
 import torch.distributed
 
 from nnscaler.cli.trainer import Trainer
-from nnscaler.runtime.hybrid_optimizer import ScaleDelayedOptimizerMixin
+from nnscaler.runtime.hybrid_optimizer import (
+    HybridOptimizer, HybridOptConfig, HybridSubOptConfig,
+    HybridSubOptParamGroupConfig, ScaleDelayedOptimizerMixin,
+)
 from tests.parallel_module.common import assert_close, assert_equal
 from ..launch_torchrun import launch_torchrun
+
+
+@pytest.mark.parametrize('has_local_parameter', [False, True])
+def test_empty_optimizer_preserves_configured_options(has_local_parameter):
+    param = torch.nn.Parameter(torch.ones(1))
+    optimizer = HybridOptimizer(
+        [param] if has_local_parameter else [],
+        {param: (0, 0)} if has_local_parameter else {},
+        HybridOptConfig(optimizers=[
+            HybridSubOptConfig(type=torch.optim.Adam),
+            HybridSubOptConfig(
+                type=torch.optim.AdamW,
+                param_groups=[HybridSubOptParamGroupConfig(
+                    options={'lr': 0.1, 'weight_decay': 0.25},
+                )],
+            ),
+        ]),
+    )
+    empty_group = optimizer.optimizers[1].param_groups[0]
+    assert empty_group['params'] == []
+    assert empty_group['lr'] == 0.1
+    assert empty_group['weight_decay'] == 0.25
+    if has_local_parameter:
+        param.grad = torch.ones_like(param)
+    optimizer.step()
+    saved = optimizer.state_dict()
+    optimizer.load_state_dict(saved)
+    assert optimizer.optimizers[1].param_groups[0]['lr'] == 0.1
 
 
 def param_clss_fn(param_name: str) -> tuple[int, int]:
