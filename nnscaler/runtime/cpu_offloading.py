@@ -625,8 +625,9 @@ class ActivationOffloadManager:
             # There is exactly one immutable version for a live saved storage.
             # Never fork a second record to tolerate mutation of a live save.
             record.check_version('repeated save')
-            if tensor._version != record.version:
-                _raise_activation_mutation('storage alias save', record.version, tensor._version)
+            # Compare each counter to its own captured value, not another
+            # tensor's numeric version. A restored view that reuses resident
+            # storage has the reload buffer's counter, also checked above.
             self.pool.stats['deduplicated_saves'] += 1
         else:
             # Reserve pinned memory only when the completed group still has

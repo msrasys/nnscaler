@@ -401,6 +401,22 @@ def test_version_tracker_does_not_retain_activation_storage():
     assert storage() is None
 
 
+def test_custom_op_mutation_schema_reports_an_otherwise_untracked_write():
+    from nnscaler.runtime.cpu_offloading import _ResidentTensorRef
+
+    @torch.library.custom_op('offload_contract_test::raw_write', mutates_args=('x',))
+    def raw_write(x: torch.Tensor) -> None:
+        # NumPy bypasses torch's in-place operators, like a raw-pointer kernel.
+        # The custom-op schema must report the write to the version counter.
+        x.detach().numpy().fill(2)
+
+    x = torch.ones(8)
+    saved = _ResidentTensorRef(x)
+    raw_write(x)
+    with pytest.raises(RuntimeError, match='resident unpack'):
+        saved.unpack()
+
+
 @pytest.mark.parametrize('dtype', [torch.float32, torch.float16, torch.bfloat16])
 def test_saved_storage_restores_views_with_shared_version_on_cpu(monkeypatch, dtype):
     from nnscaler.runtime.cpu_offloading import _StorageRecord, _SavedTensor
@@ -445,15 +461,20 @@ def test_repeated_save_cannot_fork_a_mutated_live_storage():
 
 
 @cuda
-def test_save_rejects_incompatible_alias_version_counter():
+def test_resaved_restored_view_reuses_the_same_immutable_record():
     module = OffloadModule()
     x = torch.ones(64, 64, device='cuda')
-    alias = torch.empty(0, device='cuda').set_(x.untyped_storage(), 0, x.shape, x.stride())
-    with pytest.raises(RuntimeError, match='storage alias save'):
-        with module.cpu_offloading_hooks() as group:
-            saved = group._pack(x)
-            group._pack(alias)
-    del saved
+    with module.cpu_offloading_hooks() as group:
+        first = group._pack(x)
+    restored = first.unpack()  # Original allocation is still owned by x.
+    with module.cpu_offloading_hooks() as group:
+        second = group._pack(restored.t())
+    assert first.record is second.record
+    restored.add_(1)
+    with pytest.raises(RuntimeError, match='inplace'):
+        first.unpack()
+    with pytest.raises(RuntimeError, match='inplace'):
+        second.unpack()
 
 
 @cuda
