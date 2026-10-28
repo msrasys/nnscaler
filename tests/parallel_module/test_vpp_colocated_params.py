@@ -2,6 +2,7 @@
 #  Licensed under the MIT License.
 
 import copy
+import json
 import tempfile
 from pathlib import Path
 
@@ -43,6 +44,7 @@ def shared_vpp_policy(graph, cfg):
 
 def colocated_worker(async_reducer=False, pipeline_multiref_replicated_params=True):
     nnscaler.init()
+    errors = {'loss_max_abs': 0., 'gradient_max_abs': 0., 'weight_max_abs': 0.}
     # Full and partitioned batches can select different TF32 kernels. Use
     # full FP32 precision to test placement and accumulation independently.
     torch.set_float32_matmul_precision('highest')
@@ -71,11 +73,14 @@ def colocated_worker(async_reducer=False, pipeline_multiref_replicated_params=Tr
             outputs = model.train_step(samples)
             for actual, expected in zip(outputs, expected_losses):
                 torch.testing.assert_close(actual, expected, atol=1e-6, rtol=1e-5)
+                errors['loss_max_abs'] = max(errors['loss_max_abs'], (actual - expected).abs().max().item())
             for name, meta in model.fullmap.items():
                 torch.testing.assert_close(
                     getattr(model, name).grad, reference_params[meta.orig_name].grad[meta.slicers],
                     atol=1e-6, rtol=1e-5,
                 )
+                errors['gradient_max_abs'] = max(errors['gradient_max_abs'],
+                    (getattr(model, name).grad - reference_params[meta.orig_name].grad[meta.slicers]).abs().max().item())
             optimizer.step()
             reference_optimizer.step()
             for name, meta in model.fullmap.items():
@@ -83,7 +88,13 @@ def colocated_worker(async_reducer=False, pipeline_multiref_replicated_params=Tr
                     getattr(model, name), reference_params[meta.orig_name][meta.slicers],
                     atol=1e-6, rtol=1e-5,
                 )
+                errors['weight_max_abs'] = max(errors['weight_max_abs'],
+                    (getattr(model, name) - reference_params[meta.orig_name][meta.slicers]).abs().max().item())
             optimizer.zero_grad()
+    print('NNSCALER_TEST_METRICS ' + json.dumps({
+        'case': 'colocated_vpp', 'rank': torch.distributed.get_rank(),
+        'async_reducer': async_reducer, 'multiref': pipeline_multiref_replicated_params, **errors,
+    }))
     return True
 
 

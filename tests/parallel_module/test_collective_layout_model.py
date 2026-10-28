@@ -3,6 +3,8 @@
 
 import ast
 import copy
+from dataclasses import replace
+import json
 import tempfile
 from pathlib import Path
 
@@ -93,15 +95,34 @@ def test_fn_pipeline_generates_permuted_collectives(tmp_path, ngpus):
                        for name, ranks in collectives)
 
 
-def pipeline_worker(ngpus=8):
+@replace_all_device_with('cpu')
+def test_mesh_dp_generates_shifted_collective_layouts(tmp_path):
+    source, policy, config = model_case(4)
+    parallelize(source, {'sample': {'x': torch.ones(8, 8)}}, policy,
+                replace(config, runtime_ngpus=8), gen_savedir=tmp_path,
+                load_module=False, reuse='override')
+    layouts = set()
+    for path in tmp_path.rglob('gencode*.py'):
+        for node in ast.walk(ast.parse(path.read_text())):
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == 'all_gather':
+                layouts.update(tuple(ast.literal_eval(k.value)) for k in node.keywords if k.arg == 'ranks')
+    assert {(0, 2, 1, 3), (4, 6, 5, 7)} <= layouts
+
+
+def pipeline_worker(ngpus=8, runtime_ngpus=None):
     nnscaler.init()
     torch.set_float32_matmul_precision('highest')
     torch.manual_seed(7)
     source, policy, config = model_case(ngpus)
+    runtime_ngpus = runtime_ngpus or ngpus
+    config = replace(config, runtime_ngpus=runtime_ngpus)
+    replicas = runtime_ngpus // ngpus
+    replica = torch.distributed.get_rank() // ngpus
+    errors = {'loss_max_abs': 0., 'gradient_max_abs': 0., 'weight_max_abs': 0.}
     reference = copy.deepcopy(source).cuda()
     reference_optimizer = torch.optim.SGD(reference.parameters(), lr=0.001)
     reference_params = dict(reference.named_parameters())
-    directory = Path(tempfile.gettempdir()) / f'fn_collective_mlp_{ngpus}_{PYTEST_RUN_ID}'
+    directory = Path(tempfile.gettempdir()) / f'fn_collective_mlp_{ngpus}_{runtime_ngpus}_{PYTEST_RUN_ID}'
     with clear_dir_on_rank0(directory) as tempdir:
         model = parallelize(source, {'sample': {'x': torch.ones(8, 8)}},
                             policy, config,
@@ -112,22 +133,37 @@ def pipeline_worker(ngpus=8):
             assert any('async_op=True' in path.read_text() for path in tempdir.rglob('gencode*.py'))
         optimizer = build_optimizer(model, torch.optim.SGD, lr=0.001)
         for step in range(2):
-            samples = [{'x': torch.arange(64, device='cuda').reshape(8, 8).float() / 64 + micro + step}
-                       for micro in range(4)]
+            replica_samples = [[
+                {'x': torch.arange(64, device='cuda').reshape(8, 8).float() / 64 + micro + step + dp / 4}
+                for micro in range(4)] for dp in range(replicas)]
             reference_optimizer.zero_grad()
-            expected = [reference(sample) for sample in samples]
-            torch.stack(expected).sum().backward()
-            actual = model.train_step(samples)
+            replica_losses = [[reference(sample) for sample in samples] for samples in replica_samples]
+            expected = replica_losses[replica]
+            # nnScaler's default DP reducer sums different data replicas; loss
+            # normalization is the caller's scale_fn responsibility.
+            torch.stack([loss for losses in replica_losses for loss in losses]).sum().backward()
+            actual = model.train_step(replica_samples[replica])
             torch.testing.assert_close(actual, expected)
+            errors['loss_max_abs'] = max(errors['loss_max_abs'], max(
+                (left - right).abs().max().item() for left, right in zip(actual, expected)))
             for name, meta in model.fullmap.items():
-                torch.testing.assert_close(getattr(model, name).grad,
-                                           reference_params[meta.orig_name].grad[meta.slicers])
+                actual_grad = getattr(model, name).grad
+                expected_grad = reference_params[meta.orig_name].grad[meta.slicers]
+                torch.testing.assert_close(actual_grad, expected_grad)
+                errors['gradient_max_abs'] = max(errors['gradient_max_abs'],
+                                                 (actual_grad - expected_grad).abs().max().item())
             optimizer.step()
             reference_optimizer.step()
             for name, meta in model.fullmap.items():
                 torch.testing.assert_close(getattr(model, name),
                                            reference_params[meta.orig_name][meta.slicers])
+                errors['weight_max_abs'] = max(errors['weight_max_abs'],
+                    (getattr(model, name) - reference_params[meta.orig_name][meta.slicers]).abs().max().item())
             optimizer.zero_grad()
+    print('NNSCALER_TEST_METRICS ' + json.dumps({
+        'case': 'collective_layout_model', 'plan_ngpus': ngpus, 'runtime_ngpus': runtime_ngpus,
+        'rank': torch.distributed.get_rank(), 'async_comm': nnscaler.flags.CompileFlag.async_comm, **errors,
+    }))
     return True
 
 
@@ -139,3 +175,8 @@ def test_fn_mesh_matches_eager():
 @pytest.mark.skipif(torch.cuda.device_count() < 8, reason='requires 8 GPUs')
 def test_fn_pipeline_matches_eager():
     assert all(launch_torchrun(8, pipeline_worker).values())
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 8, reason='requires 8 GPUs')
+def test_fn_mesh_dp_scaling_matches_eager():
+    assert all(launch_torchrun(8, pipeline_worker, 4, 8).values())

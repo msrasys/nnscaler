@@ -1,6 +1,7 @@
 #  Copyright (c) Microsoft Corporation.
 #  Licensed under the MIT License.
 
+import json
 import pytest
 import torch
 
@@ -29,6 +30,7 @@ def _alltoall_layout_worker(subgroup, different_layout):
     rank = torch.distributed.get_rank()
     ranks = (3, 0, 2) if subgroup else (2, 0, 3, 1)
     dsts = ((2, 3, 0) if subgroup else (1, 3, 0, 2)) if different_layout else ranks
+    errors = {'forward_max_abs': 0., 'backward_max_abs': 0.}
     # All ranks initialize a subgroup, including nonmembers.
     DeviceGroup().get_group(sorted(ranks))
     if rank in ranks:
@@ -47,6 +49,7 @@ def _alltoall_layout_worker(subgroup, different_layout):
                     if async_op:
                         actual = AsyncCommHandler().wait(actual)
                     torch.testing.assert_close(actual, expected)
+                    errors['forward_max_abs'] = max(errors['forward_max_abs'], (actual - expected).abs().max().item())
                     AsyncCommHandler().check_clear()
 
             reference = full_value.detach().clone().requires_grad_()
@@ -64,7 +67,9 @@ def _alltoall_layout_worker(subgroup, different_layout):
                 handle = operation(gradients[dsts.index(rank)], odim, idim, dsts,
                                    dsts=ranks, async_op=True)
                 actual_grad = AsyncCommHandler().wait(handle)
-                torch.testing.assert_close(actual_grad, reference.grad.chunk(count, dim=idim)[ranks.index(rank)])
+                expected_grad = reference.grad.chunk(count, dim=idim)[ranks.index(rank)]
+                torch.testing.assert_close(actual_grad, expected_grad)
+                errors['backward_max_abs'] = max(errors['backward_max_abs'], (actual_grad - expected_grad).abs().max().item())
                 AsyncCommHandler().check_clear()
             for operation in (nn.AllToAllAllToAll.apply, nn.alltoall_alltoall):
                 value = local.clone().requires_grad_()
@@ -76,8 +81,14 @@ def _alltoall_layout_worker(subgroup, different_layout):
                 actual = operation(*args)
                 torch.testing.assert_close(actual, expected)
                 actual.backward(gradients[dsts.index(rank)])
-                torch.testing.assert_close(value.grad, reference.grad.chunk(count, dim=idim)[ranks.index(rank)])
+                expected_grad = reference.grad.chunk(count, dim=idim)[ranks.index(rank)]
+                torch.testing.assert_close(value.grad, expected_grad)
+                errors['backward_max_abs'] = max(errors['backward_max_abs'], (value.grad - expected_grad).abs().max().item())
     torch.distributed.barrier()
+    print('NNSCALER_TEST_METRICS ' + json.dumps({
+        'case': 'alltoall_layouts', 'rank': rank, 'active': rank in ranks,
+        'subgroup': subgroup, 'different_layout': different_layout, **errors,
+    }))
 
 
 @pytest.mark.skipif(torch.cuda.device_count() < 4, reason='requires 4 GPUs')
