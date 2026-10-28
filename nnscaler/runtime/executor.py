@@ -546,7 +546,11 @@ class Executor:
         Wait until the finish of synchornized tensors
         """
         handler = AsyncCommHandler()
-        handler.drain_sends(wait=False)
+        # The scheduler may consume adapter inputs while constructing a send
+        # bundle. Wait for those inputs, but leave bundle ownership and source
+        # release to its explicit end/reserve operations.
+        if handler._active_send_bundle is None:
+            handler.drain_sends(wait=False)
         replacements = {}
         result = []
         for tensor in tensors:
