@@ -350,6 +350,7 @@ class FuncEmission(CodeEmission):
         codes = []
         input_name_overrides = input_name_overrides or {}
         release_after_send = release_after_send or {}
+        pending_outputs = set()
 
         def _input_name(inp: IRObject) -> str:
             if isinstance(inp, IRObject) and inp.tid in input_name_overrides:
@@ -358,6 +359,13 @@ class FuncEmission(CodeEmission):
 
         for prim in prims:
             prim_inputs = prim.inputs()
+            for inp in prim_inputs:
+                if isinstance(inp, IRObject) and inp.tid in pending_outputs:
+                    name = _input_name(inp)
+                    # A collective callback can replace its placeholder. Wait
+                    # before a transform or another collective consumes it.
+                    codes.append(f'{name} = nnscaler.runtime.executor.AsyncCommHandler().wait({name})')
+                    pending_outputs.remove(inp.tid)
             if len(prim_inputs) == 0:
                 itensors = '()'
             elif len(prim_inputs) == 1:
@@ -376,6 +384,8 @@ class FuncEmission(CodeEmission):
             if CompileFlag.line_timer:
                 codes.append(f'nnscaler.runtime.function.print_time({repr(prim.signature)})')
             codes.append(f'{outputs} = {prim.signature}({itensors}, {kwargs})')
+            if async_op and isinstance(prim, CommPrim):
+                pending_outputs.update(out.tid for out in prim.outputs() if isinstance(out, IRObject))
         return codes
 
     def _pipeline_output_release_after_send(
@@ -473,17 +483,9 @@ class FuncEmission(CodeEmission):
             return codes
 
         if async_op:
-            # note async_op can only be applied when primitives satisfy:
-            #   1) non-collective primitives perform before collective primitives.
-            #   2) collectives running on same nccl stream (i.e., same device group)
-            non_colls = [p for p in prims if not isinstance(p, CommPrim)]
+            # Local transforms wait for their dependencies in _emit_adapter_prims.
+            # Keep the existing restriction on multiple communication groups.
             colls = [p for p in prims if isinstance(p, CommPrim)]
-            # check condition 1)
-            if len(non_colls) > 1:
-                if max(prims.index(p) for p in non_colls) + 1 != len(non_colls):
-                    async_op = False
-                    _logger.warning("Non-collective primitives are not performed before collective primitives, async_op is disabled.")
-            # check condition 2)
             devices = [set(p.device) for p in colls]
             if len(colls) > 1 and not all(devs == devices[0] for devs in devices[1:]):
                 async_op = False
