@@ -15,7 +15,9 @@ from nnscaler.ir.cten import IRCell, IRTensor
 from nnscaler.ir.tensor import IRFullTensor, IRSubTensor
 from nnscaler.ir.operator import IRBpOperation, IRDataOperation, IRFwOperation
 from nnscaler.ir.adapter import IRWeightReducer, IRAdapter
-from nnscaler.ir.adapter.prim import CollectivePrim, IdentityPrim, MovePrim
+from nnscaler.ir.adapter.prim import (
+    CollectivePrim, IdentityPrim, MovePrim, ObjectMovePrim, RDScatterPrim, RDGatherPrim,
+)
 
 from nnscaler.graph.graph import IRSegment
 from nnscaler.graph.parser.register import CustomizedOps
@@ -381,22 +383,28 @@ class ModuleCodeGen(FuncEmission):
 
     def get_p2p_pairs(self):
         """
-        Scale real P2P MovePrim endpoints to runtime devices.
+        Scale all actual point-to-point endpoints to runtime devices.
         """
         nreplica = self.runtime_ndevs // self.plan_ndevs
         pairs = set()
         for adapter in self.execplan.graph.select(ntype=IRAdapter):
             for prim in adapter.prims:
-                if not isinstance(prim, MovePrim):
+                if isinstance(prim, (MovePrim, ObjectMovePrim)):
+                    endpoints = [(prim.kwargs['src'], prim.kwargs['dst'])]
+                elif isinstance(prim, RDScatterPrim):
+                    endpoints = [(prim.kwargs['src'], dst) for dst in prim.kwargs['dsts']]
+                elif isinstance(prim, RDGatherPrim):
+                    endpoints = [(src, prim.kwargs['dst']) for src in prim.kwargs['srcs']]
+                else:
                     continue
-                src, dst = prim.kwargs['src'], prim.kwargs['dst']
-                if src is None or dst is None or src == dst:
-                    continue
-                for i in range(nreplica):
-                    shifted_src = int(src) + i * self.plan_ndevs
-                    shifted_dst = int(dst) + i * self.plan_ndevs
-                    pair = (shifted_src, shifted_dst) if shifted_src < shifted_dst else (shifted_dst, shifted_src)
-                    pairs.add(pair)
+                for src, dst in endpoints:
+                    if src is None or dst is None or src == dst:
+                        continue
+                    for i in range(nreplica):
+                        shifted_src = int(src) + i * self.plan_ndevs
+                        shifted_dst = int(dst) + i * self.plan_ndevs
+                        pair = (shifted_src, shifted_dst) if shifted_src < shifted_dst else (shifted_dst, shifted_src)
+                        pairs.add(pair)
         return sorted(pairs)
 
     def scale(self, node: IRCell, device: int) -> IRCell:

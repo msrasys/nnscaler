@@ -78,9 +78,15 @@ def test_alltoall_layouts_and_backward(subgroup, different_layout):
     torchrun(4, _alltoall_layout_worker, subgroup, different_layout)
 
 
-def _rooted_layout_worker(async_op):
+def _rooted_layout_worker(async_op, dedicated_groups):
     _init_distributed(4)
     rank = torch.distributed.get_rank()
+    if dedicated_groups:
+        pairs = [(0, 1), (0, 2), (0, 3), (1, 3)]
+        DeviceGroup().init_p2p_groups(pairs)
+        for src, dst in pairs:
+            if rank in (src, dst):
+                assert DeviceGroup().get_p2p_group(src, dst)[0] is not None
     order = (3, 1, 2)
     group_order = (2, 0, 3, 1)
     full = IRFullTensor((12, 6), dtype=torch.float64)
@@ -147,8 +153,9 @@ def _rooted_layout_worker(async_op):
 
 @pytest.mark.skipif(torch.cuda.device_count() < 4, reason='requires 4 GPUs')
 @pytest.mark.parametrize('async_op', [False, True])
-def test_rooted_and_order_invariant_collective_layouts(async_op):
-    torchrun(4, _rooted_layout_worker, async_op)
+@pytest.mark.parametrize('dedicated_groups', [False, True])
+def test_rooted_and_order_invariant_collective_layouts(async_op, dedicated_groups):
+    torchrun(4, _rooted_layout_worker, async_op, dedicated_groups)
 
 
 def _autograd_layout_worker():
