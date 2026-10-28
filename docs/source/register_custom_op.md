@@ -350,6 +350,11 @@ We assume the module is SSA (static single-assignment), which means you should a
 
 However, if you have to do this, it's your responsibility to make sure the inplace operation is correct. And to help us track the dependencies between tensors, you must return all the input tensors that are changed in the custom operators.
 
+With CPU activation offloading, do not modify an activation or any storage
+alias while a saved backward value is live. Custom raw-pointer writes must
+maintain PyTorch version counters; merely returning the modified input is not
+enough to update its version. See the [offload immutability contract](cpu_activation_offload.md#immutability-contract).
+
 ```python
 # this is wrong
 # because x is changed inplace, but it is not returned.

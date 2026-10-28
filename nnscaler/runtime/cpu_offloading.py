@@ -6,6 +6,13 @@
 The graph selects regions. A scheduler may prefetch a scope by its execution
 key; ordinary autograd uses group output hooks. Neither storage identity nor
 backward order is inferred from a process-global stack of forward calls.
+
+Saved activations and their storage aliases must remain immutable until their
+backward consumers release them. All custom writes must maintain PyTorch's
+shared version counter. Raw-pointer/.data writes that bypass that counter and
+independently versioned storage aliases are outside this contract. Checks detect
+violations at save/transfer/unpack boundaries; they do not intercept writes or
+make an invalid program's asynchronous accesses race-free.
 """
 from collections import Counter, deque
 from contextlib import contextmanager
@@ -223,8 +230,18 @@ class _ResidentTensorRef:
         # saved_tensors_hooks bypasses PyTorch's normal SavedVariable check,
         # including on the resident/budget-fallback path. Restore that check.
         if self.version is not None and self.tensor._version != self.version:
-            raise RuntimeError('An activation saved for backward was modified by an inplace operation')
+            _raise_activation_mutation('resident unpack', self.version, self.tensor._version)
         return self.tensor
+
+
+def _raise_activation_mutation(phase, expected, actual):
+    raise RuntimeError(
+        f'CPU activation offload: an activation saved for backward was modified by an inplace operation '
+        f'({phase}: expected version {expected}, found {actual}). '
+        'Saved tensors and their storage aliases must remain immutable until backward releases them. '
+        'Custom operators must correctly update PyTorch version counters; writes bypassing those counters '
+        'and independently versioned storage aliases are unsupported.'
+    )
 
 
 def _version_tracker(tensor):
@@ -246,23 +263,29 @@ class _StorageRecord:
         self.host = host
         self.source = torch.empty(0, dtype=torch.uint8, device=tensor.device).set_(
             tensor.untyped_storage(), 0, (self.size,), (1,))
+        self.source_version = self.source._version
         self.version_tracker = _version_tracker(tensor)
         self.version = tensor._version
         self.storage_ref = weakref.ref(tensor.untyped_storage())
         self.device_tensor = None
+        self.restored_version = None
         self.d2h_event = self.h2d_event = None
         self.speculative = False
         self.lock = threading.RLock()
 
-    def check_version(self):
+    def check_version(self, phase='unpack'):
         if self.version_tracker._version != self.version:
-            raise RuntimeError('An activation saved for backward was modified by an inplace operation')
+            _raise_activation_mutation(phase, self.version, self.version_tracker._version)
+        if self.source is not None and self.source._version != self.source_version:
+            _raise_activation_mutation('resident storage ' + phase, self.source_version, self.source._version)
+        if self.restored_version is not None and self.device_tensor._version != self.restored_version:
+            _raise_activation_mutation('restored ' + phase, self.restored_version, self.device_tensor._version)
 
     def prepare_offload(self):
         with self.lock:
             if self.d2h_event is not None:
                 return False
-            self.check_version()
+            self.check_version('D2H preparation')
             if self.host is None:
                 self.host = self.pool.acquire(self.size)
             return self.host is not None
@@ -273,7 +296,7 @@ class _StorageRecord:
                 return False
             if self.host is None and not self.prepare_offload():
                 return False
-            self.check_version()
+            self.check_version('D2H submission')
             manager = self.manager
             stream = manager.d2h_stream
             with torch.cuda.stream(stream):
@@ -290,6 +313,7 @@ class _StorageRecord:
 
     def prefetch(self, *, demanded=False, from_schedule=False):
         with self.lock:
+            self.check_version('prefetch')
             if self.device_tensor is not None:
                 if demanded and self.speculative:
                     with self.pool.lock:
@@ -305,6 +329,7 @@ class _StorageRecord:
             if storage is not None and storage.nbytes() == self.size:
                 self.device_tensor = torch.empty(0, dtype=torch.uint8, device=self.device).set_(
                     storage, 0, (self.size,), (1,))
+                self.restored_version = self.device_tensor._version
                 self.h2d_event = self.d2h_event
                 self.pool.stats['resident_reused_bytes'] += self.size
                 return True
@@ -332,6 +357,7 @@ class _StorageRecord:
                         self.device_tensor.record_stream(stream)
                     self.h2d_event = torch.cuda.Event()
                     self.h2d_event.record(stream)
+                self.restored_version = self.device_tensor._version
                 self.pool.stats['h2d_bytes'] += self.size
                 self.pool.stats['demand_loads' if demanded else 'prefetch_loads'] += 1
                 if from_schedule:
@@ -348,9 +374,13 @@ class _StorageRecord:
             stream = torch.cuda.current_stream(self.device)
             stream.wait_event(self.h2d_event)
             raw.record_stream(stream)
-        result = torch.empty(0, dtype=value.dtype, device=self.device).set_(
-            raw.untyped_storage(), value.offset, value.shape, value.stride)
-        return result
+        # set_(storage) creates an independent version counter for every view.
+        # Reinterpret and as_strided instead so writes through any restored
+        # view are visible to the shared record on the next access. A storage
+        # may have unused trailing bytes smaller than one typed element.
+        usable = raw.numel() // value.element_size * value.element_size
+        typed = (raw if usable == raw.numel() else raw[:usable]).view(value.dtype)
+        return torch.as_strided(typed, value.shape, value.stride, value.offset)
 
     def __del__(self):
         # Saved references own records; groups and dedup tables only hold weakrefs.
@@ -368,11 +398,12 @@ class _SavedTensor:
         record.live_saves += 1
         self.shape, self.stride = tensor.shape, tensor.stride()
         self.offset, self.dtype = tensor.storage_offset(), tensor.dtype
+        self.element_size = tensor.element_size()
         self.version_tracker, self.version = _version_tracker(tensor), tensor._version
 
     def unpack(self):
         if self.version_tracker._version != self.version:
-            raise RuntimeError('An activation saved for backward was modified by an inplace operation')
+            _raise_activation_mutation('saved view unpack', self.version, self.version_tracker._version)
         return self.record.unpack(self)
 
     def __del__(self):
@@ -587,10 +618,15 @@ class ActivationOffloadManager:
         # Avoid copying a huge backing allocation for a small slice.
         if size == 0 or size > 8 * tensor.numel() * tensor.element_size():
             return _ResidentTensorRef(tensor)
-        key = (tensor.device, storage._cdata, tensor._version)
+        key = identity
         tensor.record_stream(torch.cuda.current_stream(tensor.device))
         record = self.records.get(key)
-        if record is not None and record.storage_ref() is storage:
+        if record is not None and record.live_saves and record.storage_ref() is storage:
+            # There is exactly one immutable version for a live saved storage.
+            # Never fork a second record to tolerate mutation of a live save.
+            record.check_version('repeated save')
+            if tensor._version != record.version:
+                _raise_activation_mutation('storage alias save', record.version, tensor._version)
             self.pool.stats['deduplicated_saves'] += 1
         else:
             # Reserve pinned memory only when the completed group still has

@@ -366,6 +366,162 @@ def test_inplace_version_check():
         y.sum().backward()
 
 
+@pytest.mark.parametrize('change', ['base', 'view', 'detach', 'custom_version'])
+def test_resident_saved_tensor_contract_on_cpu(change):
+    from nnscaler.runtime.cpu_offloading import _ResidentTensorRef
+    x = torch.randn(8, 8, requires_grad=True)
+    with torch.autograd.graph.saved_tensors_hooks(_ResidentTensorRef, lambda saved: saved.unpack()):
+        y = x.t().sin().sum()
+    with torch.no_grad():
+        if change == 'custom_version':
+            # A raw-pointer kernel must explicitly report its mutation.
+            torch.autograd.graph.increment_version(x)
+        elif change == 'base':
+            x.add_(1)
+        elif change == 'view':
+            x[:, :2].mul_(2)
+        else:
+            x.detach().zero_()
+    with pytest.raises(RuntimeError, match='expected version.*found.*Custom operators'):
+        y.backward()
+    assert x.grad is None
+
+
+def test_version_tracker_does_not_retain_activation_storage():
+    import weakref
+    from nnscaler.runtime.cpu_offloading import _version_tracker
+    x = torch.ones(32)
+    tracker = _version_tracker(x.t())
+    storage = weakref.ref(x.untyped_storage())
+    x.add_(1)
+    assert tracker._version == x._version
+    assert tracker.numel() == 0
+    del x
+    gc.collect()
+    assert storage() is None
+
+
+@pytest.mark.parametrize('dtype', [torch.float32, torch.float16, torch.bfloat16])
+def test_saved_storage_restores_views_with_shared_version_on_cpu(monkeypatch, dtype):
+    from nnscaler.runtime.cpu_offloading import _StorageRecord, _SavedTensor
+    monkeypatch.setattr(torch.cuda, 'current_stream', lambda device: None)
+    x = torch.arange(32).to(dtype).reshape(4, 8)
+    record = _StorageRecord(x, SimpleNamespace(pool=None))
+    saved = _SavedTensor(x[:, 1::2].t(), record)
+    restored = saved.unpack()
+    torch.testing.assert_close(restored, x[:, 1::2].t(), rtol=0, atol=0)
+    assert restored.stride() == saved.stride
+    assert restored.storage_offset() == saved.offset
+    restored.add_(1)
+    with pytest.raises(RuntimeError, match='resident storage unpack'):
+        saved.unpack()
+
+
+def test_saved_view_with_unused_trailing_storage_bytes(monkeypatch):
+    from nnscaler.runtime.cpu_offloading import _StorageRecord, _SavedTensor
+    monkeypatch.setattr(torch.cuda, 'current_stream', lambda device: None)
+    storage = torch.zeros(13, dtype=torch.uint8).untyped_storage()
+    x = torch.empty(0, dtype=torch.float32).set_(storage, 1, (2,), (1,))
+    x.fill_(3.0)
+    record = _StorageRecord(x, SimpleNamespace(pool=None))
+    restored = _SavedTensor(x, record).unpack()
+    assert torch.equal(restored, x)
+    assert restored.storage_offset() == 1
+
+
+@cuda
+def test_repeated_save_cannot_fork_a_mutated_live_storage():
+    module = OffloadModule()
+    x = torch.ones(64, 64, device='cuda')
+    with module.cpu_offloading_hooks() as first:
+        saved = first._pack(x)
+    torch.cuda.synchronize()  # Isolate version detection from invalid DMA races.
+    x.add_(1)
+    with pytest.raises(RuntimeError, match='repeated save'):
+        with module.cpu_offloading_hooks() as second:
+            second._pack(x.t())
+    assert len(module._get_activation_offload_manager().records) == 1
+    del saved
+
+
+@cuda
+def test_save_rejects_incompatible_alias_version_counter():
+    module = OffloadModule()
+    x = torch.ones(64, 64, device='cuda')
+    alias = torch.empty(0, device='cuda').set_(x.untyped_storage(), 0, x.shape, x.stride())
+    with pytest.raises(RuntimeError, match='storage alias save'):
+        with module.cpu_offloading_hooks() as group:
+            saved = group._pack(x)
+            group._pack(alias)
+    del saved
+
+
+@cuda
+def test_custom_mutation_version_is_checked_before_prefetch():
+    module = OffloadModule()
+    x = torch.ones(64, 64, device='cuda')
+    with module.cpu_offloading_hooks() as group:
+        saved = group._pack(x)
+    torch.autograd.graph.increment_version(x)
+    with pytest.raises(RuntimeError, match='prefetch'):
+        saved.record.prefetch()
+    del saved
+
+
+@cuda
+def test_restored_alias_mutation_cannot_silently_change_another_saved_view():
+    module = OffloadModule()
+    x = torch.randn(64, 64, device='cuda')
+    with module.cpu_offloading_hooks() as group:
+        first = group._pack(x)
+        second = group._pack(x.t())
+    assert first.record is second.record
+    del x
+    gc.collect()
+    restored = first.unpack()
+    assert module.activation_offload_stats()['h2d_bytes'] == 64 * 64 * 4
+    restored.mul_(2)
+    with pytest.raises(RuntimeError, match='restored unpack'):
+        second.unpack()
+
+
+@cuda
+def test_discarded_save_does_not_prohibit_later_inplace_and_save():
+    module = OffloadModule()
+    x = torch.ones(64, 64, device='cuda')
+    with module.cpu_offloading_hooks() as group:
+        old = group._pack(x)
+        del old
+        x.add_(1)
+        current = group._pack(x)
+    assert torch.equal(current.unpack(), x)
+    assert module.activation_offload_stats()['offloaded_storages'] == 1
+
+
+@cuda
+def test_inplace_before_first_save_is_supported():
+    class Double(torch.autograd.Function):
+        @staticmethod
+        def forward(ctx, x):
+            x.mul_(2)
+            ctx.mark_dirty(x)
+            ctx.save_for_backward(x)
+            return x
+
+        @staticmethod
+        def backward(ctx, grad):
+            (saved,) = ctx.saved_tensors
+            assert saved.shape == grad.shape
+            return grad * 2
+
+    module = OffloadModule()
+    x = torch.randn(64, 64, device='cuda', requires_grad=True)
+    with module.cpu_offloading_hooks():
+        loss = Double.apply(x + 0).square().sum()
+    loss.backward()
+    torch.testing.assert_close(x.grad, 8 * x, atol=0, rtol=0)
+
+
 @cuda
 def test_memory_is_released_after_forward_and_backward():
     module = OffloadModule()

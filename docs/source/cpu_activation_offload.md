@@ -36,6 +36,42 @@ storage offsets. Shared storage/views with the same version share one record,
 including across regions and live forward scopes of a compiled module. Tensor
 identity is not inferred from shape or allocator address alone.
 
+## Immutability contract
+
+An activation saved by an offload context and every alias of its storage must
+remain immutable until backward releases the saved values (including retained
+graphs). This applies outside the selected region too. In-place work before
+the first save, after all saves are released, or on unrelated tensors is allowed.
+The runtime supports one immutable version per live saved storage; it does not
+keep several snapshots to accommodate writes to that storage.
+
+The runtime retains version counters without retaining the original activation
+allocation. It checks them before repeated saves, D2H submission, prefetch and
+unpack. Restored views share the reload buffer's version counter, so modifying
+one cannot silently corrupt a later read through another view. Resident and
+budget-fallback saves also check versions. Violations raise an error identifying
+the observation point and expected/current versions. Checks introduce no CUDA
+synchronization. They detect violations at these boundaries, rather than
+intercepting writes or guaranteeing race-free execution of invalid programs.
+
+Custom operators must use `save_for_backward` for saved activations and maintain
+PyTorch's version counters for **all** writes. Ordinary PyTorch in-place
+operations do this. A raw-pointer CUDA/Triton writer must use the appropriate
+mutation registration, `ctx.mark_dirty` for a custom autograd Function, or
+`torch.autograd.graph.increment_version(tensor)`. Reporting a mutation makes it
+detectable; it does not authorize modifying a live saved activation.
+
+Writes through `.data` that bypass version tracking, raw kernels that do not
+report mutations, and aliases created with independent version counters (for
+example manual `set_(storage)`) are unsupported. Equal numeric `_version`
+values do not prove those aliases share a counter. Version checks cannot detect
+arbitrary hidden writes; the caller must uphold this operator contract. Normal
+views and `detach()` aliases share the original version counter and are covered.
+No graph alias analysis, automatic mutation repair, or extra tensor cloning is
+performed to support otherwise invalid mutations.
+
+## Scheduling
+
 A generated schedule keys each forward scope by `(segment, microbatch)`. Before
 the preceding local compute action, it issues a hint for the actual next
 backward scope. This works with ordinary PP and interleaved VPP; “one action
