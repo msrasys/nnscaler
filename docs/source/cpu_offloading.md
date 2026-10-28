@@ -154,6 +154,27 @@ tensor of every Block) it reaches ~3 s and starves the GPU.  Coalescing the
 regions of a group into one copy is the natural next step for such
 configurations.
 
+## Communication-exclusive windows
+
+An Nsight comparison on 8x B200 (PP2 x EP4, attention-kernel offload) between
+real copies and the fake-copy mode showed every compute kernel unchanged while
+DeepEP `intranode::dispatch` went from 1.3 ms to 5.5 ms per call and
+`combine` from 1.3 to 1.6 ms; summed over 288 dispatches per step that is the
+whole 1.4 s/step gap.  The all-to-all runs over NVLink, the copies over PCIe,
+but both pass through the GPU's I/O hub.  Kimi K2 reports the same effect
+("offloading may slightly affect EP traffic") and GLM-5 schedules offload
+around dispatch/combine.
+
+`comm_exclusive()` marks such a region on the current stream.  On entry the
+compute stream waits for every copy issued so far and a barrier event is
+recorded; copies issued until the region ends are ordered after it, so copies
+and the all-to-all never run at the same time and the copies drain in the
+compute windows between them.  llm-train wraps DeepEP dispatch/combine and the
+torch all-to-all fallback (`arch/offload_hooks.py`).  Copies can be split with
+`CPU_OFFLOADING_COPY_CHUNK_MB` so the wait at region entry is short;
+`CPU_OFFLOADING_COMM_EXCLUSIVE=0` disables the mechanism.  `comm_windows` in
+the stats counts the regions per step.
+
 ## Sizing against the link
 
 Measured on an 8x B200 node (PCIe Gen5): D2H 38.6 GB/s, H2D 55.6 GB/s,

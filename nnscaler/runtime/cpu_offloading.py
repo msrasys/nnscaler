@@ -39,8 +39,12 @@ Everything is configurable through environment variables (read once):
                                    inside a context (default 2)
 ``CPU_OFFLOADING_DEBUG``           log the saved tensors of each group once
 ``CPU_OFFLOADING_DISABLE``         set to 1 to turn offloading into a no-op
-``CPU_OFFLOADING_FAKE_COPY``       1 = keep tensors on the GPU but run all the
-                                   bookkeeping (A/B test for overheads)
+``CPU_OFFLOADING_FAKE_COPY``       1 = no copies at all; 2 = real D2H only;
+                                   3 = real D2H and H2D; in 2/3 the tensors
+                                   stay on the GPU (A/B tests for overheads)
+``CPU_OFFLOADING_COPY_CHUNK_MB``   split copies into chunks of this size (0 = off)
+``CPU_OFFLOADING_COMM_EXCLUSIVE``  0 disables the communication-exclusive windows
+                                   requested through ``comm_exclusive()``
 ``CPU_OFFLOADING_MAX_INFLIGHT_COPIES`` memcpys queued per direction (default 0 =
                                    unbounded)
 ``CPU_OFFLOADING_TIMING``          0 disables the CUDA-event based timings
@@ -274,7 +278,7 @@ class _HostRegion:
         'manager', 'batch', 'device', 'nbytes', 'host', 'd2h_event',
         'device_tensor', 'h2d_event', 'lock', 'pending_views', 'released',
         'd2h_start', 'h2d_start', 'timed', 'src', 'ready_event', 'd2h_issued',
-        'h2d_issued', 'consumer_stream',
+        'h2d_issued', 'consumer_stream', 'keep',
     )
 
     def __init__(self, manager: 'OffloadManager', batch: '_OffloadBatch',
@@ -299,6 +303,8 @@ class _HostRegion:
         manager.stats.offloaded_bytes += self.nbytes
         manager.stats.offloaded_regions += 1
 
+        # fake modes 2/3 keep the device tensor alive (no memory saving)
+        self.keep = storage_view if manager.fake_mode in (2, 3) else None
         if manager.fake_copy:
             # A/B switch: keep the tensor on the device, exercise everything else.
             self.src = None
@@ -329,10 +335,11 @@ class _HostRegion:
         t0 = time.perf_counter()
         with torch.cuda.stream(d2h):
             d2h.wait_event(self.ready_event)
+            self.manager.wait_comm_barrier(d2h)
             if self.timed:
                 self.d2h_start = torch.cuda.Event(enable_timing=True)
                 self.d2h_start.record(d2h)
-            self.host[:self.nbytes].copy_(self.src, non_blocking=True)
+            self.manager.chunked_copy(self.host[:self.nbytes], self.src)
             # the caching allocator must not hand the device memory to anybody
             # until the D2H copy has finished
             self.src.record_stream(d2h)
@@ -360,6 +367,11 @@ class _HostRegion:
         self.h2d_issued = True
         if not self.d2h_issued:
             self.issue_d2h()
+        if self.manager.fake_mode == 2:
+            # D2H only: the tensor never left the GPU
+            self.device_tensor = self.keep
+            self.h2d_event = self.d2h_event
+            return
         t0 = time.perf_counter()
         h2d = self.manager.h2d_stream
         consumer = self.consumer_stream or torch.cuda.current_stream(self.device)
@@ -371,14 +383,16 @@ class _HostRegion:
         with torch.cuda.stream(h2d):
             h2d.wait_event(self.d2h_event)
             h2d.wait_stream(consumer)
+            self.manager.wait_comm_barrier(h2d)
             if self.timed:
                 self.h2d_start = torch.cuda.Event(enable_timing=True)
                 self.h2d_start.record(h2d)
-            device_tensor.copy_(self.host[:self.nbytes], non_blocking=True)
+            self.manager.chunked_copy(device_tensor, self.host[:self.nbytes])
             device_tensor.record_stream(h2d)
             self.h2d_event = torch.cuda.Event(enable_timing=self.timed)
             self.h2d_event.record(h2d)
-        self.device_tensor = device_tensor
+        # mode 3: the copy happened, but consumers keep using the original
+        self.device_tensor = self.keep if self.manager.fake_mode == 3 else device_tensor
         self.manager.stats.h2d_issue_seconds += time.perf_counter() - t0
         self.manager.stats.prefetched_bytes += self.nbytes
         self.manager.stats.prefetched_regions += 1
@@ -415,7 +429,7 @@ class _HostRegion:
     def view_consumed(self) -> None:
         with self.lock:
             self.pending_views -= 1
-            if self.pending_views == 0 and not self.manager.fake_copy:
+            if self.pending_views == 0 and self.manager.fake_mode == 0:
                 # autograd keeps its own reference to the unpacked views; the
                 # region does not need to pin the device copy anymore
                 self.device_tensor = None
@@ -428,6 +442,7 @@ class _HostRegion:
             self.released = True
             self.device_tensor = None
             self.src = None
+            self.keep = None
             if self.host is not None:
                 self.manager.pool.release(self.host, self.h2d_event)
                 self.host = None
@@ -601,6 +616,7 @@ class OffloadStats:
     d2h_backlog_bytes: int = 0   # bytes whose D2H copy had not finished at step end
     pool_waits: int = 0
     deferred_d2h: int = 0        # copies that had to wait for the window
+    comm_windows: int = 0        # comm_exclusive regions entered
     acquire_seconds: float = 0.0   # CPU time in the pinned pool
     d2h_issue_seconds: float = 0.0 # CPU time enqueueing D2H copies
     h2d_issue_seconds: float = 0.0 # CPU time enqueueing H2D copies
@@ -613,7 +629,7 @@ class OffloadStats:
         for name in ('offloaded_bytes', 'offloaded_regions', 'deduplicated_bytes',
                      'prefetched_bytes', 'prefetched_regions', 'stalls', 'skipped_small_bytes',
                      'packed_tensors', 'd2h_backlog_bytes', 'pool_waits',
-                     'deferred_d2h', 'deferred_h2d', 'forced_h2d'):
+                     'deferred_d2h', 'deferred_h2d', 'forced_h2d', 'comm_windows'):
             setattr(self, name, 0)
         self.pack_seconds = 0.0
         self.unpack_seconds = 0.0
@@ -644,7 +660,17 @@ class OffloadManager:
         self._debugged_groups: set = set()
         # CPU_OFFLOADING_FAKE_COPY=1: go through planning, hooks, bookkeeping
         # and prefetch logic but never move bytes (A/B test for overheads).
-        self.fake_copy = load_int_from_env('CPU_OFFLOADING_FAKE_COPY', 0) != 0
+        # 0: real offload. 1: no copies at all. 2: real D2H, tensors stay on the
+        # GPU, no H2D. 3: real D2H and H2D into scratch, tensors stay on the GPU.
+        # Modes 2/3 isolate the effect of the PCIe traffic from memory effects.
+        self.fake_mode = load_int_from_env('CPU_OFFLOADING_FAKE_COPY', 0)
+        self.fake_copy = self.fake_mode == 1
+        # copies larger than this are issued in chunks (0 = whole region)
+        self.copy_chunk_bytes = load_int_from_env('CPU_OFFLOADING_COPY_CHUNK_MB', 0) << 20
+        # communication-exclusive windows (see comm_exclusive)
+        self.comm_exclusive_enabled = load_int_from_env('CPU_OFFLOADING_COMM_EXCLUSIVE', 1) != 0
+        self._comm_barrier: Optional[torch.cuda.Event] = None
+        self._comm_depth = 0
         # GPU-side timing with CUDA events; cheap, on by default.
         self.timing = load_int_from_env('CPU_OFFLOADING_TIMING', 1) != 0
         self._timed_d2h: List[_HostRegion] = []
@@ -744,6 +770,63 @@ class OffloadManager:
         if self._h2d_stream is None:
             self._h2d_stream = _get_prefetch_stream()
         return self._h2d_stream
+
+    # -- copy helpers --------------------------------------------------------
+    def chunked_copy(self, dst: torch.Tensor, src: torch.Tensor) -> None:
+        """``dst.copy_(src)`` on the current stream, optionally in chunks so a
+        single copy never occupies the engine for long (shorter waits at the
+        communication barrier)."""
+        chunk = self.copy_chunk_bytes
+        n = dst.numel()
+        if not chunk or n <= chunk:
+            dst.copy_(src, non_blocking=True)
+            return
+        for off in range(0, n, chunk):
+            dst[off:off + chunk].copy_(src[off:off + chunk], non_blocking=True)
+
+    def wait_comm_barrier(self, stream: torch.cuda.Stream) -> None:
+        """Order a copy after the last communication window (see comm_exclusive)."""
+        event = self._comm_barrier
+        if event is not None:
+            stream.wait_event(event)
+
+    def comm_begin(self) -> None:
+        """Entering a communication-heavy region on the current stream.
+
+        PCIe copies and NVLink all-to-all traffic contend inside the GPU's I/O
+        hub: on an 8x B200 node DeepEP intranode dispatch kernels took 4x
+        longer while offload copies were in flight.  Here the compute stream
+        waits for every copy issued so far, and copies issued until
+        ``comm_end`` are ordered after the region.
+        """
+        if not self.comm_exclusive_enabled or self.fake_copy:
+            return
+        self._comm_depth += 1
+        if self._comm_depth > 1:
+            return
+        current = torch.cuda.current_stream()
+        with self._copy_lock:
+            for stream in (self.d2h_stream, self.h2d_stream):
+                marker = torch.cuda.Event()
+                marker.record(stream)
+                current.wait_event(marker)
+            # copies issued from now on wait for the end of the region; record
+            # a provisional barrier at the start so nothing slips in between
+            barrier = torch.cuda.Event()
+            barrier.record(current)
+            self._comm_barrier = barrier
+        self.stats.comm_windows += 1
+
+    def comm_end(self) -> None:
+        if not self.comm_exclusive_enabled or self.fake_copy:
+            return
+        self._comm_depth -= 1
+        if self._comm_depth > 0:
+            return
+        barrier = torch.cuda.Event()
+        barrier.record(torch.cuda.current_stream())
+        with self._copy_lock:
+            self._comm_barrier = barrier
 
     # -- copy scheduling -----------------------------------------------------
     def _drain(self, inflight: Deque[_HostRegion], direction: str) -> None:
@@ -1056,6 +1139,30 @@ def prefetch_next_backward(name: str) -> None:
     manager = OffloadManager._instance
     if manager is not None and manager.enabled:
         manager.prefetch_next_backward(name)
+
+
+class comm_exclusive:
+    """Context manager marking a communication region on the current stream.
+
+    Usage in model code around all-to-all / pipeline P2P kernels::
+
+        with nnscaler.runtime.cpu_offloading.comm_exclusive():
+            out = dispatch(...)
+
+    No-op when offloading is not active.
+    """
+
+    def __enter__(self):
+        manager = OffloadManager._instance
+        self._manager = manager if manager is not None and manager.enabled else None
+        if self._manager is not None:
+            self._manager.comm_begin()
+        return self
+
+    def __exit__(self, *exc):
+        if self._manager is not None:
+            self._manager.comm_end()
+        return None
 
 
 def hint_forward(name: str, backward_distance: int) -> None:
