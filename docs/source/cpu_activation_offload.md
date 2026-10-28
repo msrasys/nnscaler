@@ -123,8 +123,9 @@ pool**, including idle reusable and in-flight buffers. Modules in one process mu
 CPU cap. The process pool persists between module instances, so destroying a
 module does not reset its allocation accounting. Allocation is lazy and uses
 actual tensor byte sizes. ATen rounds the underlying pinned allocation to a
-power of two; the budget charges that rounded capacity, while the Tensor keeps
-its requested size. `allocated_cpu_bytes` reports Tensor capacity and
+power of two; the pool exposes that already-charged capacity in its reusable
+tensor so slightly larger requests in the same size class can reuse it. Only
+requested activation bytes are transferred. `allocated_cpu_bytes` reports Tensor capacity and
 `allocated_pinned_bytes` reports the charged pinned blocks.
 Reuse chooses the smallest available buffer large enough for a request. A
 buffer stays charged while idle; the pool does not evict old size classes to

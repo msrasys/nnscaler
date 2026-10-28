@@ -697,7 +697,7 @@ def test_process_budget_survives_sequential_module_instances():
     assert stats['pool_reuses'] == 1
 
 
-def test_budget_charges_rounded_pinned_blocks_without_resizing_tensor(monkeypatch):
+def test_rounded_pinned_capacity_reuses_larger_requests_only_after_event(monkeypatch):
     import nnscaler.runtime.cpu_offloading as offload
     original_empty = torch.empty
     monkeypatch.setattr(offload, 'available_host_bytes', lambda: 1024**4)
@@ -707,14 +707,17 @@ def test_budget_charges_rounded_pinned_blocks_without_resizing_tensor(monkeypatc
     assert small.acquire(132000) is None  # tensor fits, its 262144-byte pinned block does not
     pool = offload._OffloadPool(CPUOffloadConfig(max_cpu_bytes=262144, host_reserve_bytes=0))
     buffer = pool.acquire(132000)
-    assert buffer.numel() == 132000
+    assert buffer.numel() == 262144
     stats = pool.snapshot()
-    assert stats['allocated_cpu_bytes'] == 132000
+    assert stats['allocated_cpu_bytes'] == 262144
     assert stats['allocated_pinned_bytes'] == stats['live_pinned_bytes'] == 262144
     assert pool.acquire(1) is None
-    pool.release(buffer, None)
+    ready = [False]
+    pool.release(buffer, SimpleNamespace(query=lambda: ready[0]))
     assert pool.snapshot()['live_pinned_bytes'] == 0
-    assert pool.acquire(130000) is buffer
+    assert pool.acquire(140000) is None  # Pending DMA still owns the block.
+    ready[0] = True
+    assert pool.acquire(140000) is buffer  # Same charged class, larger request.
     assert pool.snapshot()['allocated_pinned_bytes'] == 262144
     pool.release(buffer, None)
     pool.close()

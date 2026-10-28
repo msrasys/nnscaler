@@ -111,7 +111,7 @@ def mark_activation_resident(tensor: torch.Tensor) -> torch.Tensor:
 
 
 class _OffloadPool:
-    """Exact-size tensors, charged at the host allocator's rounded block size."""
+    """Reusable tensors sized to the host allocator's charged block capacity."""
     def __init__(self, config):
         self.config = config
         self.lock = threading.RLock()
@@ -128,7 +128,7 @@ class _OffloadPool:
     def allocation_charge(size):
         # ATen CachingHostAllocator rounds to PowerOf2Ceil before CUDA host
         # allocation (also reported by torch.cuda.memory.host_memory_stats).
-        # Account for that capacity without changing the tensor's logical size.
+        # Make the whole charged capacity available for subsequent leases.
         return 1 << (size - 1).bit_length() if size else 0
 
     def _reap(self):
@@ -157,8 +157,12 @@ class _OffloadPool:
                 if available_host_bytes() < charge + self.config.host_reserve_bytes:
                     self.stats['headroom_fallback_bytes'] += size
                     return None
-                buffer = torch.empty(size, dtype=torch.uint8, device='cpu', pin_memory=True)
-                self.allocated += size
+                # ATen already reserves this rounded capacity. Exposing it in
+                # the tensor lets a later, slightly larger request reuse the
+                # block instead of paying another cudaHostAlloc in the same
+                # size class. Transfers still use only record.size bytes.
+                buffer = torch.empty(charge, dtype=torch.uint8, device='cpu', pin_memory=True)
+                self.allocated += charge
                 self.allocated_pinned += charge
             self.live += buffer.numel()
             self.live_pinned += self.allocation_charge(buffer.numel())
@@ -334,7 +338,7 @@ class _StorageRecord:
 
     def prefetch(self, *, demanded=False, from_schedule=False):
         with self.lock:
-            self.check_version('prefetch')
+            self.check_version('unpack' if demanded else 'prefetch')
             if self.device_tensor is not None:
                 if demanded and self.speculative:
                     with self.pool.lock:
@@ -386,8 +390,8 @@ class _StorageRecord:
             return True
 
     def unpack(self, value):
-        self.check_version()
         if self.d2h_event is None:
+            self.check_version()
             raw = self.source
         else:
             self.prefetch(demanded=True)
@@ -420,11 +424,11 @@ class _SavedTensor:
         self.shape, self.stride = tensor.shape, tensor.stride()
         self.offset, self.dtype = tensor.storage_offset(), tensor.dtype
         self.element_size = tensor.element_size()
-        self.version_tracker, self.version = _version_tracker(tensor), tensor._version
+        # Supported source aliases share the record's original counter; views
+        # produced by unpack share its source/reload counter. Track those once
+        # per storage instead of allocating an empty tracker for every save.
 
     def unpack(self):
-        if self.version_tracker._version != self.version:
-            _raise_activation_mutation('saved view unpack', self.version, self.version_tracker._version)
         return self.record.unpack(self)
 
     def __del__(self):
