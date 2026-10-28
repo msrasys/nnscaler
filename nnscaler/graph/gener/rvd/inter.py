@@ -143,6 +143,10 @@ class InterTransition:
         # only support one dimension change
         # this only happens when the device number changes
         if len(incd) + len(decd) != 1: return trans_fn
+        # These primitives use integer chunk counts. Uneven changes must use
+        # another path rather than floor division that loses destination shards.
+        if any(max(d1, d2) % min(d1, d2) != 0 for d1, d2 in zip(src_rvd, dst_rvd)):
+            return None
         if len(incd) == 1:
             incd = incd[0]
             if incd == 0: # incr
