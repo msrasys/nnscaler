@@ -10,6 +10,7 @@ Every collective is implemented using out-of-place semantics.
 """
 
 import io
+import os
 from typing import List, Tuple, Optional
 import warnings
 import torch
@@ -43,6 +44,26 @@ def _deserialize_object(payload: bytes):
         io.BytesIO(payload), map_location=map_location, weights_only=False)
 
 
+def _async_pair_p2p(op, tensor, peer, group, group_peer):
+    """Opt-in batch API for one operation on an explicit two-rank group.
+
+    This isolates PyTorch's eager-group unbatched-P2P serialization without
+    changing message order, counts, tags or AsyncCommHandler ownership. Avoid
+    batching implicit/world groups: their first batch may require participants
+    outside this pair. Both pair members naturally participate in its first op.
+    """
+    if (os.environ.get('NNSCALER_BATCHED_P2P') == '1' and tensor.is_cuda
+            and group is not None and group.size() == 2):
+        # P2POp.peer is a global rank; the native fallback uses group-local ranks.
+        return torch.distributed.batch_isend_irecv([
+            torch.distributed.P2POp(op, tensor, peer=peer, group=group),
+        ])[0]
+    if group is None:
+        return op(tensor, peer)
+    keyword = 'group_dst' if op is torch.distributed.isend else 'group_src'
+    return op(tensor, group=group, **{keyword: group_peer})
+
+
 def move(
     tensor: Optional[torch.Tensor],
     shape: Tuple[int],
@@ -64,10 +85,7 @@ def move(
         tensor = tensor.contiguous() if not tensor.is_contiguous() else tensor
         assert torch.is_tensor(tensor)
         if async_op:
-            if group is None:
-                work = torch.distributed.isend(tensor, dst)
-            else:
-                work = torch.distributed.isend(tensor, group=group, group_dst=group_dst)
+            work = _async_pair_p2p(torch.distributed.isend, tensor, dst, group, group_dst)
             callback = None
             if release_after_send is not None:
                 defer_pseudo_free_tensor(release_after_send)
@@ -86,10 +104,7 @@ def move(
             device=torch.cuda.current_device()
         )
         if async_op:
-            if group is None:
-                work = torch.distributed.irecv(tensor, src)
-            else:
-                work = torch.distributed.irecv(tensor, group=group, group_src=group_src)
+            work = _async_pair_p2p(torch.distributed.irecv, tensor, src, group, group_src)
             AsyncCommHandler().submit(tensor, [work])
         else:
             if group is None:
@@ -344,11 +359,7 @@ def rdgather(itensor: torch.Tensor, shape: Tuple[int], dtype: torch.dtype,
             recv_tensors.append(tensor)
             group, group_src, _ = DeviceGroup().get_p2p_group(src, dst)
             if async_op:
-                if group is None:
-                    work = torch.distributed.irecv(tensor, src)
-                else:
-                    work = torch.distributed.irecv(
-                        tensor, group=group, group_src=group_src)
+                work = _async_pair_p2p(torch.distributed.irecv, tensor, src, group, group_src)
                 works.append(work)
             else:
                 if group is None:
@@ -368,11 +379,7 @@ def rdgather(itensor: torch.Tensor, shape: Tuple[int], dtype: torch.dtype,
         otensor = itensor.contiguous() if not itensor.is_contiguous() else itensor
         group, _, group_dst = DeviceGroup().get_p2p_group(rank, dst)
         if async_op:
-            if group is None:
-                work = torch.distributed.isend(otensor, dst)
-            else:
-                work = torch.distributed.isend(
-                    otensor, group=group, group_dst=group_dst)
+            work = _async_pair_p2p(torch.distributed.isend, otensor, dst, group, group_dst)
             AsyncCommHandler().hold_send(otensor, work)
         else:
             if group is None:
