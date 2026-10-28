@@ -119,6 +119,12 @@ class LifeCycle:
 
         for line, node in enumerate(nodes):
             cell = node.cell if isinstance(node, ExeReuseCell) else node
+            # Keyword/hook metadata can name data outside the segment's
+            # declared argument list. Keep it conservatively: this pass does
+            # not establish additional stream dependencies for hidden reads.
+            roots.update(activations(getattr(node, 'kwargs', {})))
+            if cell.pre_hook or cell.post_hook:
+                roots.update(activations(cell.hook_meta))
             if isinstance(cell, IRSegment) and not node.isfw():
                 fw_inputs, fw_outputs, output_grads, input_grads = emission.get_backward_callsite_io_tensors(node)
                 input_targets.update(activations(fw_inputs))

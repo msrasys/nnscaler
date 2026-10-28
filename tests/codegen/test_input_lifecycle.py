@@ -41,3 +41,10 @@ def test_input_identity_capture_follows_last_actual_read(monkeypatch, extra_read
 def test_data_needed_by_hook_backward_root_or_caller_is_retained(monkeypatch, reason):
     _, life, nodes, outputs = graph(monkeypatch, **{reason: True})
     assert life.input_references_after_data_use(nodes, outputs) == {}
+
+
+def test_tensor_named_by_hook_metadata_keeps_its_data_reference(monkeypatch):
+    x, life, nodes, outputs = graph(monkeypatch)
+    nodes[0].pre_hook = lambda *args: None
+    nodes[0].hook_meta = {'external_data': x}
+    assert life.input_references_after_data_use(nodes, outputs) == {}

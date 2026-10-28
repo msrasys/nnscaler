@@ -53,6 +53,8 @@ their final data read. The executor captures dInput in a small autograd boundary
 with an empty anchor instead of retaining a detached input leaf. Saved-tensor
 hooks can then release the original GPU allocation when no other owner needs
 it. No tensor's data pointer, shape or storage is modified to force reclamation.
+The gradient target owns its data and follows the leaf-gradient layout contract;
+an expanded incoming cotangent is not handed back as a borrowed input gradient.
 
 This option is disabled by default and requires regenerated code. It applies
 to ordinary pipeline backward, and rejects split input/weight backward. The
@@ -66,8 +68,10 @@ non-leaf input view. Normal alias ownership and CUDA stream lifetimes remain
 intact. Outside references, including a caller's tensor or a Vision callback,
 can still keep the allocation alive. This does not promise that every pipeline
 input will leave the GPU. Runtime/code-generation regressions pass, including a
-16 MiB CUDA ownership check with exact gradients; full-model validation and
-performance measurements are still required before recommending this option.
+16 MiB CUDA ownership check with exact gradients. Real Attention/MoE PP2/VPP4
+checks pass with actual input-reference use on both ranks, including the combined
+save-event/copy-stream/size-gap configuration. Full-model performance measurements
+are still required before recommending this option.
 
 ## Immutability contract
 

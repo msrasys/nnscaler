@@ -23,9 +23,34 @@ class InputGradSlot:
 
     def __init__(self, tensor):
         self.shape = tensor.shape
+        self.strides = tensor.stride()
         self.dtype = tensor.dtype
         self.device = tensor.device
         self.grad = None
+        # Match AccumulateGrad's layout contract without keeping the input.
+        # Dense permutations preserve their strides; sliced/expanded inputs
+        # receive a contiguous gradient. Unit dimensions do not affect density.
+        self.dense = True
+        expected = 1
+        for stride, size in sorted((stride, size) for size, stride in zip(self.shape, self.strides) if size > 1):
+            if stride != expected:
+                self.dense = False
+                break
+            expected *= size
+
+    def accumulate(self, grad):
+        if self.grad is None:
+            if self.dense:
+                self.grad = torch.empty_strided(self.shape, self.strides, dtype=self.dtype, device=self.device)
+            else:
+                self.grad = torch.empty(self.shape, dtype=self.dtype, device=self.device)
+            # Own the gradient, including when SumBackward supplies an expanded
+            # view of the incoming cotangent. Forwarding that borrowed view
+            # would expose overlapping strides and allow later writes to alter
+            # another gradient consumer's input.
+            self.grad.copy_(grad)
+        else:
+            self.grad.add_(grad)
 
     def retain_grad(self):
         pass  # The boundary's backward explicitly captures the gradient.
@@ -39,8 +64,7 @@ class _InputBoundary(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad):
-        slot = ctx.slot
-        slot.grad = grad if slot.grad is None else slot.grad + grad
+        ctx.slot.accumulate(grad)
         return None, None, None
 
 

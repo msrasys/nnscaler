@@ -96,6 +96,28 @@ def test_alias_and_noncontiguous_inputs_keep_independent_gradients():
     Executor.check_clear()
 
 
+@pytest.mark.parametrize('layout', ['contiguous', 'transpose', 'slice'])
+def test_input_gradients_keep_leaf_layout_and_do_not_alias_incoming_gradient(layout):
+    source = torch.randn(4, 4)
+    if layout == 'transpose':
+        source = source.t()
+    elif layout == 'slice':
+        source = source[:, :2]
+    x = source.requires_grad_()
+    gradients = []
+    for release in (False, True):
+        incoming = torch.tensor(2.0)
+        y = Executor.fexecute('s', lambda value: value.sum(), x, release_inputs=(0,) if release else ())
+        grad = Executor.backward('s', (release_input_tensor(x) if release else x,), (y,), (incoming,))
+        gradients.append(grad)
+        assert grad.untyped_storage()._cdata != incoming.untyped_storage()._cdata
+        grad.add_(1)  # A caller can reuse its input gradient independently.
+        assert incoming.item() == 2
+    assert gradients[0].stride() == gradients[1].stride()
+    torch.testing.assert_close(gradients[0], gradients[1], rtol=0, atol=0)
+    Executor.check_clear()
+
+
 def test_retained_outer_input_and_callback_are_preserved():
     weight = torch.nn.Parameter(torch.tensor(2.0))
     outer = weight * 3
@@ -178,6 +200,13 @@ def test_split_backward_with_released_inputs_is_rejected():
     y = Executor.fexecute('s', torch.sin, x, release_inputs=(0,))
     with pytest.raises(RuntimeError, match='do not support split backward'):
         Executor.backward_input('s', (release_input_tensor(x),), (y,), (torch.ones_like(y),), ())
+
+
+def test_compile_config_rejects_input_release_with_split_backward():
+    from nnscaler.parallel import ComputeConfig
+    with pytest.raises(ValueError, match='not supported with split backward'):
+        ComputeConfig(2, 2, use_end2end=True, use_fbw=True,
+                      cpu_offload={'release_pipeline_inputs': True})
 
 
 def test_forward_failure_discards_only_its_own_pending_input_state():

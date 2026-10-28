@@ -275,6 +275,8 @@ class ComputeConfig:
             raise ValueError("zero_use_reduce_scatter is only supported when zero_ngroups is 1.")
 
         if self.use_fbw:
+            if self.cpu_offload and self.cpu_offload.release_pipeline_inputs:
+                raise ValueError('Pipeline input release is not supported with split backward')
             if not self.use_end2end:
                 raise ValueError("use_fbw is only supported in end2end mode.")
             if self.inference_only:
