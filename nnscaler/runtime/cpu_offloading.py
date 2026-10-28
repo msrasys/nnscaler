@@ -490,6 +490,10 @@ class _OffloadGroup:
                 manager.d2h_stream.wait_stream(stream)
             else:
                 manager.d2h_stream.wait_event(event)
+        # CUDA owns the dependencies once waits are enqueued. Do not keep
+        # producer event objects alive in scope/group cycles until backward;
+        # transfer-completion events on each record remain intact.
+        self.producer_events = None
         copied = sum(bool(record.offload()) for record in pending)
         if copied:
             manager.pool.stats['d2h_committed_groups'] += 1

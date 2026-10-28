@@ -137,13 +137,14 @@ def test_saved_tensor_events_cover_later_saves_and_multiple_producer_streams():
                 right = a.tanh().square().sum()
                 result = left + right
             del a
+            assert len(group.group.producer_events) == 2
         group.watch(result)
+    assert group.group.producer_events is None
     module.prefetch_activation('streams')
     actual = torch.autograd.grad(result, x)[0]
     module.finish_activation_offload('streams')
     torch.cuda.synchronize()
     torch.testing.assert_close(actual, expected, atol=0, rtol=0)
-    assert len(group.group.producer_events) == 2
     assert module.activation_offload_stats()['live_cpu_bytes'] == 0
 
 
