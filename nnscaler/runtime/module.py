@@ -2,6 +2,7 @@
 #  Licensed under the MIT License.
 
 import functools
+import copy
 import pickle
 from typing import Callable, List, Set, Dict, Tuple, Optional, TYPE_CHECKING, Any, Union, ClassVar
 from typing_extensions import Self
@@ -858,6 +859,15 @@ class CubeModule(torch.nn.Module):
 
         def _retrieve_param_opt_state(bucket_states, pstart, pend, pshape, bucket_size, zero_version):
             assert bucket_size % len(bucket_states) == 0
+            for other in bucket_states[1:]:
+                if other.keys() != bucket_states[0].keys():
+                    raise ValueError('Inconsistent optimizer state keys within a ZeRO bucket')
+                if 'step' in other and not cls._safe_tensor_equal(other['step'], bucket_states[0]['step']):
+                    raise ValueError('Conflicting optimizer state step within a ZeRO bucket')
+                for key in other.keys() - {'step'}:
+                    if (other[key].shape != bucket_states[0][key].shape
+                            or other[key].dtype != bucket_states[0][key].dtype):
+                        raise ValueError('Inconsistent optimizer state tensors within a ZeRO bucket')
             opt_state_keys = list(bucket_states[0].keys())
             if 'step' in bucket_states[0]:
                 opt_state_keys.remove('step')
@@ -916,7 +926,8 @@ class CubeModule(torch.nn.Module):
 
             if 'step' in bucket_states[0]:
                 # make sure all steps are different tensors (with same value)
-                opt_states['step'] = bucket_states[0]['step'].cpu().clone()
+                step = bucket_states[0]['step']
+                opt_states['step'] = step.cpu().clone() if isinstance(step, torch.Tensor) else step
             return opt_states
 
         def _merge_opt_zero(param_shape, worker_idx, param_idx):
@@ -932,7 +943,7 @@ class CubeModule(torch.nn.Module):
             if isinstance(opt_idx, int):
                 # the param without reducer
                 assert opt_idx2ranks[opt_idx] is None
-                return optim_state_dicts[worker_idx]['state'][opt_idx]
+                return optim_state_dicts[worker_idx]['state'].get(opt_idx)
             else:
                 # the param in reducer bucket
                 opt_idx, pstart, pend, pshape = opt_idx
@@ -940,6 +951,13 @@ class CubeModule(torch.nn.Module):
                     assert param_shape == pshape, f'param shape {param_shape} vs pshape {pshape}'
                 ranks, bucket_size = opt_idx2ranks[opt_idx]
                 # parameters in reducer come first, so we can directly use opt_idx to index.
+                state_presence = [0 <= rank < plan_ngpus and bool(optim_state_dicts[rank]['state'].get(opt_idx))
+                                  for rank in ranks]
+                if not any(state_presence):
+                    return None
+                if not all(state_presence):
+                    raise ValueError(f'Inconsistent optimizer state for bucket {opt_idx}: '
+                                     f'expected ranks {ranks}')
                 bucket_states = [optim_state_dicts[rank]['state'][opt_idx] for rank in ranks]
                 return _retrieve_param_opt_state(
                     bucket_states,
@@ -953,6 +971,12 @@ class CubeModule(torch.nn.Module):
         # full_index: param IDs in the full optimizer state
         for full_index, param_name in enumerate(origin_parameter_names):
             _logger.info(f'start to handle optimizer state for param {param_name} with full_index {full_index}')
+            expected_state_tracks = {
+                tuple((s.start, s.step, s.stop) for s in meta.slicers)
+                for fullmap in fullmaps
+                for meta in fullmap.values()
+                if meta.is_param and meta.orig_name == param_name
+            }
             # zero_done_track is used to avoid re-merging the same parameter
             # in the optimizer state
             # zero_done_track_id: slicers
@@ -979,24 +1003,28 @@ class CubeModule(torch.nn.Module):
                 # it aligns with the order of local `model.parameters()`
                 for local_index, meta in enumerate(param_fullmap):
                     if meta.orig_name != param_name: continue
-                    full_states.setdefault(full_index, {})
 
                     # TODO: support customized param groups, where each parameter has IDs
                     # specified from its own param_group
                     track_id = tuple((i.start, i.step, i.stop) for i in meta.slicers)
                     if zero_idx_maps is None:
-                        states: Dict[str, torch.Tensor] = optim_state['state'][local_index]
+                        states: Dict[str, torch.Tensor] = optim_state['state'].get(local_index)
                     else:
                         if track_id not in zero_done_track:
                             # As ZeRO is applied, the optimizer state of this parameter (a shard)
                             # may not be stored locally in its optimizer state.
                             # _merge_opt_zero is for recovering the optimizer state corresponding to this parameter shard.
                             states: Dict[str, torch.Tensor] = _merge_opt_zero(meta.sub_shape, work_idx, local_index)
-                            zero_done_track.add(track_id)
                         else:
                             _logger.debug(f'rank {work_idx}: skip merging duplicated optimizer state for param {full_index} with slicers {meta.slicers}')
                             continue
 
+                    if not states:
+                        continue
+                    zero_done_track.add(track_id)
+                    if full_index in full_states and full_states[full_index].keys() != states.keys():
+                        raise ValueError(f'Inconsistent optimizer state keys for parameter {param_name}')
+                    full_states.setdefault(full_index, {})
                     for state_name in states.keys():
                         value = states[state_name]
                         # special handle for step: scalar tensor type
@@ -1005,7 +1033,7 @@ class CubeModule(torch.nn.Module):
                                 if not cls._safe_tensor_equal(full_states[full_index][state_name], value):
                                     raise ValueError(f"Conflict in merging {param_name}.{state_name} from rank {work_idx}")
                             else:
-                                full_states[full_index][state_name] = value.cpu()
+                                full_states[full_index][state_name] = value.cpu() if isinstance(value, torch.Tensor) else value
                             continue
 
                         # for non-tensor states
@@ -1018,9 +1046,13 @@ class CubeModule(torch.nn.Module):
                                 _logger.debug(f'non-tensor state {state_name} is merged for {full_index}')
                         # for tensor states, like 'exp_avg'
                         else:
+                            if tuple(value.shape) != tuple(meta.sub_shape):
+                                raise ValueError(f'Invalid optimizer state shape for {param_name}.{state_name}')
                             # create optimizer state tensor
                             if state_name not in full_states[full_index]:
                                 full_states[full_index][state_name] = torch.empty(meta.shape, dtype=value.dtype, device='cpu')
+                            elif full_states[full_index][state_name].dtype != value.dtype:
+                                raise ValueError(f'Conflicting optimizer state dtype for {param_name}.{state_name}')
 
                             if track_id in state_merge_track:
                                 if not cls._safe_tensor_equal(full_states[full_index][state_name][meta.slicers], value):
@@ -1031,6 +1063,9 @@ class CubeModule(torch.nn.Module):
 
                     state_merge_track.add(track_id)
 
+            if full_index in full_states and state_merge_track != expected_state_tracks:
+                raise ValueError(f'Incomplete optimizer state for parameter {param_name}: '
+                                 f'found slices {state_merge_track}, expected {expected_state_tracks}')
         # handle additional state dict keys
         for optim_state_dict in optim_state_dicts[0 : plan_ngpus]:
             for key in optim_state_dict.keys():
@@ -1039,7 +1074,8 @@ class CubeModule(torch.nn.Module):
                         _logger.info(f'overwrite optimizer state key {key}')
                     else:
                         _logger.info(f'inherit optimizer state key {key}')
-                    full_optim_state_dict[key] = optim_state_dict[key]
+                    full_optim_state_dict[key] = (copy.deepcopy(optim_state_dict[key])
+                                                 if key == 'param_groups' else optim_state_dict[key])
 
         # reset the param_groups params to the full parameter list
         if 'param_groups' in full_optim_state_dict:  # for backward compatibility
