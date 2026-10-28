@@ -8,8 +8,11 @@ To avoid other potential parity issues that may have influence the gradient valu
 we use weight data as gradient, and calculate its norm to verify the correctness
 of gnorm calculation.
 """
-import torch
 from functools import partial
+from math import prod
+
+import pytest
+import torch
 
 import nnscaler
 from nnscaler.compiler import compile
@@ -57,6 +60,73 @@ def test_split_grads_for_apex_l2norm():
 
     apex_grads[1][0] = -1
     assert grad.view(-1)[8] == -1
+
+
+@pytest.mark.parametrize(
+    ('shape', 'memory_format'),
+    [
+        ((2, 3, 4, 5), torch.channels_last),
+        ((2, 3, 4, 5, 6), torch.channels_last_3d),
+    ],
+)
+@pytest.mark.parametrize('storage_offset', [False, True])
+def test_split_channels_last_grads_for_apex_l2norm(shape, memory_format, storage_offset):
+    full_shape = (shape[0] + int(storage_offset), *shape[1:])
+    grad = torch.arange(prod(full_shape)).reshape(full_shape)
+    grad = grad.contiguous(memory_format=memory_format)[int(storage_offset):]
+
+    apex_grads = _split_grads_for_apex_l2norm(
+        [grad], max_tensor_numel=grad.numel() // 2)
+
+    assert [tensor.numel() for tensor in apex_grads] == [
+        grad.numel() // 2,
+        grad.numel() - grad.numel() // 2,
+    ]
+    assert all(
+        tensor.untyped_storage().data_ptr() == grad.untyped_storage().data_ptr()
+        for tensor in apex_grads
+    )
+    torch.testing.assert_close(
+        torch.linalg.vector_norm(torch.cat(apex_grads).float()),
+        torch.linalg.vector_norm(grad.float()),
+    )
+
+    apex_grads[1][0] = -1
+    physical_grad = grad.as_strided(
+        (grad.numel(),), (1,), grad.storage_offset())
+    assert physical_grad[grad.numel() // 2] == -1
+
+
+def test_split_grads_for_apex_l2norm_rejects_strided_layout():
+    grad = torch.arange(20).reshape(4, 5).t()
+
+    with pytest.raises(ValueError, match='only supports contiguous'):
+        _split_grads_for_apex_l2norm([grad], max_tensor_numel=8)
+
+
+def test_non_cuda_norm_does_not_apply_apex_layout_limits(monkeypatch):
+    import nnscaler.runtime.gnorm as gnorm
+
+    def unexpected_split(grads):
+        pytest.fail('CPU gradients must not pass through the Apex layout helper')
+
+    monkeypatch.setattr(gnorm, '_split_grads_for_apex_l2norm', unexpected_split)
+    with pytest.raises(AssertionError, match='non cuda device is not supported'):
+        gnorm._multi_tensor_total_norm([torch.arange(20.0).reshape(4, 5).t()])
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason='requires CUDA and Apex')
+@pytest.mark.parametrize('memory_format', [torch.channels_last, torch.channels_last_3d])
+def test_apex_norm_of_split_channels_last_gradients(monkeypatch, memory_format):
+    import nnscaler.runtime.gnorm as gnorm
+
+    shape = (3, 3, 4, 5) if memory_format == torch.channels_last else (3, 3, 4, 5, 2)
+    grad = torch.arange(prod(shape), device='cuda', dtype=torch.float32).reshape(shape)
+    grad = grad.contiguous(memory_format=memory_format)[1:]
+    monkeypatch.setattr(gnorm, '_split_grads_for_apex_l2norm',
+                        partial(_split_grads_for_apex_l2norm, max_tensor_numel=31))
+    torch.testing.assert_close(gnorm._multi_tensor_total_norm([grad]),
+                               torch.linalg.vector_norm(grad), rtol=1e-5, atol=1e-6)
 
 
 def tensor_parallelism(graph, node: IRFwOperation, idx, dim, num):
