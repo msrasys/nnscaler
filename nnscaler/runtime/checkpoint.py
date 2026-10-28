@@ -679,15 +679,14 @@ def align_state_dict_names(
     Match by original name and shard metadata, ignoring generated names and tensor
     IDs. Return a shallow copy of the module state dict without copying tensors or
     modifying the input. Module prefixes, original names and partitioning must be
-    unchanged. When `optimizer_state_dict` is given, `optimizer` must be created by
-    `build_optimizer`, and its parameter layout (parameter locations and the ZeRO
-    layout of non-parallel parameters) must be unchanged; optimizer states need no
-    renaming. Missing metadata or ambiguous/incompatible matches raise ValueError.
+    unchanged. When both `optimizer` and `optimizer_state_dict` are given, the optimizer
+    must be created by `build_optimizer`, and its parameter layout (parameter locations
+    and the ZeRO layout of non-parallel parameters) must be unchanged; optimizer states
+    need no renaming. Like the loaders, an optimizer state dict without an optimizer is
+    ignored. Missing metadata or ambiguous/incompatible matches raise ValueError.
     This adapter is for sharded/deduped, not merged, state dicts.
     """
-    if optimizer_state_dict is not None:
-        if optimizer is None:
-            raise ValueError("Cannot check the optimizer state dict: the optimizer must be provided")
+    if optimizer and optimizer_state_dict:
         _check_optimizer_layout(optimizer, optimizer_state_dict)
     key_map: Dict[str, str] = {}
     extra_states: Dict[str, Any] = {}
