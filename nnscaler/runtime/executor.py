@@ -14,7 +14,7 @@ from torch.distributed import Work
 
 from ._patch_torch import stage_backward_input, stage_backward_weight
 from .pipeline_input import (
-    InputReference, InputGradSlot, make_releasable_input, release_input_tensor,
+    InputReference, InputGradSlot, make_releasable_input, release_input_tensor as _make_input_reference,
     input_id, saved_input_id, is_grad_target, supports_input_slots,
 )
 
@@ -198,20 +198,55 @@ class Executor:
     _input_grad_callbacks: Dict[
         int, Tuple[torch.Tensor, Callable[[torch.Tensor], None]]
     ] = dict()
+    # Weak callback registrations are keyed by an identity object, not an
+    # integer tensor id that may be reused after forward data is released.
+    _released_input_grad_callbacks: Dict[InputReference, Tuple[Callable, Optional[Callable]]] = dict()
 
     @staticmethod
     def register_input_grad_callback(
         tensor: torch.Tensor,
         callback: Callable[[torch.Tensor], None],
+        *,
+        release_input: bool = False,
+        on_data_release: Optional[Callable[[], None]] = None,
     ) -> None:
-        """Run ``callback`` once a detached segment produces ``tensor``'s grad."""
+        """Run ``callback`` once a detached segment produces ``tensor``'s grad.
+
+        Weak registrations must precede forward. Their callback must retain
+        any required outer autograd edge independently of the input tensor.
+        ``on_data_release`` runs only at the schedule's final data-read marker.
+        """
         if not torch.is_tensor(tensor) or not tensor.requires_grad:
             raise ValueError('input gradient callbacks require a grad-requiring tensor')
         tensor_id = id(tensor)
-        if tensor_id in Executor._input_grad_callbacks:
+        if (tensor_id in Executor._input_grad_callbacks
+                or any(key.original() is tensor for key in Executor._released_input_grad_callbacks)):
             raise RuntimeError('an input gradient callback is already registered')
+        if not isinstance(release_input, bool) or (on_data_release is not None and not release_input):
+            raise ValueError('on_data_release requires a weak release_input callback')
+        if release_input:
+            for pending in Executor._detach.values():
+                for pairs in pending:
+                    if any((key.original() is tensor if isinstance(key, InputReference)
+                            else key == tensor_id) for key, _ in pairs):
+                        raise RuntimeError('A weak input gradient callback must be registered before forward')
+            Executor._released_input_grad_callbacks[InputReference(tensor)] = (callback, on_data_release)
+            return
         # Keep the tensor alive so its id cannot be reused before the callback.
         Executor._input_grad_callbacks[tensor_id] = (tensor, callback)
+
+    @staticmethod
+    def release_input_tensor(tensor):
+        reference = _make_input_reference(tensor)
+        if reference is tensor:
+            return reference
+        for key in tuple(Executor._released_input_grad_callbacks):
+            if key.original() is tensor:
+                callback, release = Executor._released_input_grad_callbacks[key]
+                if release is not None:
+                    Executor._released_input_grad_callbacks[key] = (callback, None)
+                    release()
+        return reference
 
     @staticmethod
     def _run_input_grad_callbacks(
@@ -219,6 +254,13 @@ class Executor:
         grad_by_dtensor_id: Dict[int, Optional[torch.Tensor]],
     ) -> None:
         for key, dtensor in saved_pairs:
+            if isinstance(key, InputReference) and key in Executor._released_input_grad_callbacks:
+                callback, _ = Executor._released_input_grad_callbacks.pop(key)
+                grad = grad_by_dtensor_id.get(id(dtensor))
+                if grad is None:
+                    raise RuntimeError('segment did not produce a registered input gradient')
+                callback(grad.detach())
+                continue
             tensor_id = saved_input_id(key)
             entry = Executor._input_grad_callbacks.get(tensor_id)
             if entry is None:
@@ -260,10 +302,14 @@ class Executor:
         for itensor in input_tensors:
             if torch.is_tensor(itensor) and itensor.requires_grad:
                 tid = id(itensor)
+                for key in Executor._released_input_grad_callbacks:
+                    if key.tensor_id == tid and key.original() is itensor:
+                        keys[tid] = key
+                        break
                 if tid in selected_ids:
                     if tid in mapping:
                         continue
-                    keys[tid] = InputReference(itensor)
+                    keys.setdefault(tid, InputReference(itensor))
                     if (supports_input_slots(Executor._backward_pre_hook)
                             and itensor.layout == torch.strided
                             and itensor.dtype in _ALLOW_GRAD_DTYPES
@@ -677,6 +723,7 @@ class Executor:
         Executor._weight_backward_states = dict()
         Executor._backward_pre_hook = None
         Executor._input_grad_callbacks = dict()
+        Executor._released_input_grad_callbacks = dict()
 
     @staticmethod
     def check_clear():
@@ -696,6 +743,8 @@ class Executor:
                 f"Fine remaining segment needs weight backward: {name}, remaining times: {len(states)}"
         assert len(Executor._input_grad_callbacks) == 0, \
             f"Input gradient callbacks remain: {len(Executor._input_grad_callbacks)}"
+        assert not Executor._released_input_grad_callbacks, \
+            f"Released input gradient callbacks remain: {len(Executor._released_input_grad_callbacks)}"
 
 
 fexecute = Executor.fexecute
@@ -707,6 +756,7 @@ complete_deferred_pseudo_free_tensor = Executor.complete_deferred_pseudo_free_te
 backward_input = Executor.backward_input
 backward_weight = Executor.backward_weight
 register_input_grad_callback = Executor.register_input_grad_callback
+release_input_tensor = Executor.release_input_tensor
 sync_tensors = Executor.sync_tensors
 
 

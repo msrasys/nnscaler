@@ -56,6 +56,13 @@ it. No tensor's data pointer, shape or storage is modified to force reclamation.
 The gradient target owns its data and follows the leaf-gradient layout contract;
 an expanded incoming cotangent is not handed back as a borrowed input gradient.
 
+An outer eager graph can register an input-gradient callback with
+`release_input=True` before forward. That registration holds a weak input
+identity and can invoke `on_data_release` at the generated final-read marker.
+The callback must retain its own required autograd edge; a saved tensor value
+still owned by autograd remains live. Weak registrations use identity objects
+so tensor-id reuse cannot redirect an older callback to a newer tensor.
+
 This option is disabled by default and requires regenerated code. It applies
 to ordinary pipeline backward, and rejects split input/weight backward. The
 analysis keeps local backward roots, returned tensors and attributes; adapter

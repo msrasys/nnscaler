@@ -159,6 +159,78 @@ def test_id_reuse_does_not_consume_a_new_tensors_callback():
     Executor.check_clear()
 
 
+def test_weak_outer_graph_callback_releases_data_before_backward():
+    weight = torch.nn.Parameter(torch.randn(4))
+    feature = weight * 3
+    edge = torch.autograd.graph.get_gradient_edge(feature)
+    storage = weakref.ref(feature.untyped_storage())
+    owners = {'feature': feature}
+    calls = []
+    def backward(grad):
+        nonlocal edge
+        calls.append('backward')
+        torch.autograd.backward(edge, grad)
+        edge = None
+    def release():
+        calls.append('release')
+        owners.clear()
+    Executor.register_input_grad_callback(feature, backward, release_input=True, on_data_release=release)
+    output = Executor.fexecute('s', torch.sum, feature, release_inputs=(0,))
+    reference = release_input_tensor(feature)
+    del feature
+    assert storage() is None and not owners and calls == ['release']
+    assert release_input_tensor(reference) is reference
+    grad = Executor.backward('s', (reference,), (output,), (None,))
+    assert calls == ['release', 'backward']
+    torch.testing.assert_close(grad, torch.ones(4), rtol=0, atol=0)
+    torch.testing.assert_close(weight.grad, torch.full((4,), 3.0), rtol=0, atol=0)
+    Executor.check_clear()
+
+
+def test_weak_callbacks_with_reused_tensor_ids_remain_distinct():
+    old = torch.randn(4, requires_grad=True)
+    calls = []
+    Executor.register_input_grad_callback(old, lambda grad: calls.append(('old', grad.clone())), release_input=True)
+    output = Executor.fexecute('old', torch.sum, old, release_inputs=(0,))
+    key = Executor._detach['old'][0][0][0]
+    reference = release_input_tensor(old)
+    del old
+    assert key.original() is None
+    new = torch.randn(4, requires_grad=True)
+    key.tensor_id = reference.tensor_id = id(new)
+    Executor.register_input_grad_callback(new, lambda grad: calls.append(('new', grad.clone())), release_input=True)
+    later = Executor.fexecute('new', lambda value: (value * 2).sum(), new, release_inputs=(0,))
+    Executor.backward('new', (release_input_tensor(new),), (later,), (None,))
+    Executor.backward('old', (reference,), (output,), (None,))
+    assert [name for name, _ in calls] == ['new', 'old']
+    torch.testing.assert_close(calls[0][1], torch.full((4,), 2.0), rtol=0, atol=0)
+    torch.testing.assert_close(calls[1][1], torch.ones(4), rtol=0, atol=0)
+    Executor.check_clear()
+
+
+def test_weak_callback_runs_on_first_backward_consumer_once():
+    x = torch.randn(4, requires_grad=True)
+    calls = []
+    Executor.register_input_grad_callback(x, calls.append, release_input=True)
+    first = Executor.fexecute('first', torch.sum, x, release_inputs=(0,))
+    second = Executor.fexecute('second', lambda value: (value * 2).sum(), x, release_inputs=(0,))
+    reference = release_input_tensor(x)
+    Executor.backward('second', (reference,), (second,), (None,))
+    Executor.backward('first', (reference,), (first,), (None,))
+    assert len(calls) == 1
+    torch.testing.assert_close(calls[0], torch.full((4,), 2.0), rtol=0, atol=0)
+    Executor.check_clear()
+
+
+def test_weak_callback_requires_registration_before_forward():
+    x = torch.randn(4, requires_grad=True)
+    y = Executor.fexecute('s', torch.sin, x, release_inputs=(0,))
+    with pytest.raises(RuntimeError, match='before forward'):
+        Executor.register_input_grad_callback(x, lambda grad: None, release_input=True)
+    Executor.backward('s', (release_input_tensor(x),), (y,), (torch.ones_like(y),))
+    Executor.check_clear()
+
+
 def test_unknown_backward_hook_keeps_tensor_targets():
     def hook(inputs, outputs, grads):
         assert all(torch.is_tensor(value) and value.is_leaf for value in inputs)
