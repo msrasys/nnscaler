@@ -22,6 +22,7 @@ import nnscaler
 from nnscaler.utils import enforce_zero_num_worker, fields, transform_recursively, load_type, copy_dynamic
 from nnscaler.parallel import ComputeConfig, build_optimizer, ReuseType, BroadcastGenFilesStrategy, _PREDEFINED_POLICIES
 from nnscaler.runtime.utils import set_grad_dtype
+from nnscaler.runtime.cpu_offloading import CPUOffloadConfig
 
 from .arg_parser import (
     deserialize_dataclass,
@@ -262,6 +263,9 @@ class OptionalComputeConfig(OptionalReducerConfig):
     constant_folding: Optional[bool] = None
     trace_strategy: Optional[str] = None
     use_end2end: Optional[bool] = None
+    # A separately compiled module can select the same activation store even
+    # when the parent graph has no offload regions. None inherits the parent.
+    cpu_offload: Optional[CPUOffloadConfig] = None
 
     pas_config: Optional[Dict[str, Any]] = None
     user_config: Optional[Dict[str, Any]] = None

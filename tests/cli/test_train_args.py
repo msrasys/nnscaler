@@ -45,6 +45,21 @@ def test_compute_config_merge():
         occ2.resolve(cc)
 
 
+def test_submodule_activation_store_override_and_inheritance():
+    from nnscaler.runtime.cpu_offloading import CPUOffloadConfig
+
+    store = CPUOffloadConfig(max_cpu_bytes=128 * 1024**2)
+    parent = ComputeConfig(1, 1)
+    child = OptionalComputeConfig(cpu_offload=store).resolve(parent)
+    assert child.cpu_offload == store
+    assert parent.cpu_offload is None
+    assert OptionalComputeConfig().resolve(child).cpu_offload == store
+    # Dataclass serialization must survive the same resolver used by the CLI.
+    from dataclasses import asdict
+    restored = ComputeConfig(**asdict(child))
+    assert restored.cpu_offload == store
+
+
 def test_optional_reducer_config_resolve_preserves_base_values():
     cc = ComputeConfig(
         1, 2,

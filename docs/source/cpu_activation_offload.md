@@ -35,6 +35,14 @@ controls executor ownership even when CPU offload is disabled. Eligibility does
 not force a copy: storage still retained by the executor is skipped by default,
 and normal layout, size and budget checks still apply.
 
+A separately compiled module can override the activation store through
+`ModuleParallelizeConfig(compute_config=OptionalComputeConfig(cpu_offload=...))`.
+`None` inherits the parent configuration. This also supports a parent with no
+offload regions: the child supplies its own configuration and policy annotations.
+Modules with the same pool configuration share the process budget; enabling
+another module does not allocate another allowance. Region selection stays in
+each module's policy, and transfer scheduling stays in the common runtime.
+
 ## Transfer and lifetime
 
 A selected region collects saved tensors and submits copies at its boundary on
