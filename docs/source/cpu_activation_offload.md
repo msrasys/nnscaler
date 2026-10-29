@@ -115,7 +115,9 @@ PP/VPP and full-model checks. The October 29 API separation has CPU coverage for
 configuration migration, code generation with offload/lifetime independently
 enabled, outer backward and ownership. The refactor has since passed runtime,
 PP/VPP and Vision GPU correctness checks.
-Performance validation is pending; earlier measurements do not validate the new revision.
+The modular paths also passed full-model 64-step local VL comparisons; see the
+[application benchmark report](https://github.com/msrallm/llm-train/blob/yileiyang/cpu_offloading/docs/activation-offload-results/20261029/FINAL_REPORT.md)
+for the tested configurations and CPU/GPU measurements.
 
 ### Experimental pipeline output release
 
@@ -142,9 +144,10 @@ Normal stream bookkeeping also remains active for runtime tensor fallbacks.
 
 This option defaults to false and requires regenerated code. Runtime tests,
 eight offload/input/output combinations, Vision and real Attention/MoE PP/VPP
-checks pass on GPU, including per-step executor cleanup. Performance validation
-is in progress; it does not promise that all activation storage leaves the GPU
-or that all DMA is hidden.
+checks pass on GPU, including per-step executor cleanup. The local full-model
+comparison found little peak-memory benefit from output references alone;
+region selection and other live owners still matter. This does not promise
+that all activation storage leaves the GPU or that all DMA is hidden.
 
 ## Immutability contract
 
