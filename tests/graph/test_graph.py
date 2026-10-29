@@ -6,6 +6,15 @@ from nnscaler.ir.operator import IRFwOperation
 from nnscaler.graph.graph import IRGraph
 
 
+def test_copy_node_metadata_keeps_module_invocation_ids():
+    from collections import OrderedDict
+    source = IRFwOperation('source', 'source', inputs=[], num_outputs=0)
+    target = IRFwOperation('target', 'target', inputs=[], num_outputs=0)
+    source.module_call_stack = OrderedDict([('layers.0', 3), ('layers.0.reference', 4)])
+    IRGraph.copy_node_meta_info(source, target)
+    assert target.module_call_stack == source.module_call_stack
+
+
 def test_graph_from_logic():
 
     node = IRFwOperation("test", "test",

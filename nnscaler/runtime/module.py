@@ -326,6 +326,51 @@ class CubeModule(torch.nn.Module):
                 non_persistent_buffers[name] = buffer
         return non_persistent_buffers
 
+    @torch.no_grad()
+    def init_aliased_buffers(self, name_map, state_dict=None):
+        """Initialize frozen replicas without adding them to checkpoints.
+
+        ``name_map`` maps original buffer names (from ``fullmap``) to original
+        source names. With a full ``state_dict``, trim each source to the local
+        buffer's slice. Otherwise copy a colocated source attribute with the
+        same layout, after the training model has been restored. Missing or
+        incompatible sources are errors; unrelated buffers are left alone.
+        """
+        buffers = self.get_non_persistent_buffers()
+        sources = defaultdict(list)
+        for attr, meta in self.fullmap.items():
+            sources[meta.orig_name].append((attr, meta))
+        copies = []
+        for attr, meta in self.fullmap.items():
+            if meta.orig_name not in name_map:
+                continue
+            if attr not in buffers:
+                raise ValueError(f'{meta.orig_name} is not a non-persistent buffer')
+            source_name = name_map[meta.orig_name]
+            if meta.val_chunks != 1:
+                raise ValueError(f'Value-partitioned replica is unsupported: {meta.orig_name}')
+            if state_dict is not None:
+                if source_name not in state_dict:
+                    raise RuntimeError(f'Missing replica source: {source_name}')
+                source = state_dict[source_name]
+                if tuple(source.shape) != tuple(meta.shape):
+                    raise ValueError(f'Replica source shape mismatch for {source_name}: '
+                                     f'{tuple(source.shape)} != {tuple(meta.shape)}')
+                source = source[meta.slicers]
+            else:
+                matches = [(a, m) for a, m in sources[source_name]
+                           if m.shape == meta.shape and m.slicers == meta.slicers
+                           and m.val_chunks == meta.val_chunks]
+                if not matches:
+                    raise RuntimeError(f'No colocated replica source with matching layout: '
+                                       f'{source_name} for {meta.orig_name}')
+                source = getattr(self, matches[0][0])
+            if tuple(source.shape) != tuple(buffers[attr].shape):
+                raise ValueError(f'Replica local shape mismatch for {meta.orig_name}')
+            copies.append((buffers[attr], source))
+        for target, source in copies:
+            target.copy_(source)
+
     @property
     def reducers(self):
         return self._reducers
@@ -564,7 +609,13 @@ class CubeModule(torch.nn.Module):
         """
         if not self._non_persistent_buffers_set:
             return
-        np_buffer_model: Dict[int, torch.Tensor] = torch.load(filename)
+        # Frozen replicas can be as large as the trainable model. Page in only
+        # this rank's slices rather than materializing all PP/EP weights on
+        # every rank when resuming.
+        load_options = {'map_location': 'cpu'}
+        if TorchVersion(torch.__version__) >= (2, 1):
+            load_options['mmap'] = True
+        np_buffer_model: Dict[int, torch.Tensor] = torch.load(filename, **load_options)
         with torch.no_grad():
             _logger.info(f'loading non-persistent buffers from {filename}')
             for attr_name in self._non_persistent_buffers_set:
