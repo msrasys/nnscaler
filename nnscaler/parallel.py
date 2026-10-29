@@ -2416,7 +2416,7 @@ def _get_optimizer_state_dict_info(
                 opt_state_dicts[module_prefix][opt_extra_state.rank]['param_groups'] = copy.deepcopy(opt_state_dict['param_groups'])
 
         for k, v in opt_state_dict.items():
-            if k == ParallelModule.EXTRA_STATE_KEY or k == 'state':
+            if k in (ParallelModule.EXTRA_STATE_KEY, _OPTIMIZER_NON_PARALLEL_NAMES_KEY, 'state'):
                 continue
             # no further processing
             # here we assume values from all ranks are the same
@@ -3833,6 +3833,10 @@ def _validate_optimizer_checkpoint_layout(module, optimizer, state_dict, name_ma
         if ([group['params'] for group in saved_groups]
                 != [group['params'] for group in current_groups]):
             raise ValueError('Cannot load optimizer: positional parameter-group layout changed')
+        for saved, current_group in zip(saved_groups, current_groups):
+            if 'children' in saved or 'children' in current_group:
+                if _hybrid_optimizer_group_layout(saved) != _hybrid_optimizer_group_layout(current_group):
+                    raise ValueError('Cannot load optimizer: Hybrid parameter-group layout changed')
         return
 
     # Raw PyTorch optimizer IDs have no parameter identity. A model state_dict
@@ -3874,6 +3878,44 @@ def _copy_optimizer_state_metadata(state_dict, module=None, optimizer=None):
                 # Subsequent raw-optimizer saves must refer to the newly
                 # generated names rather than stale checkpoint tensor IDs.
                 saved['param_names'] = [names[id(param)] for param in current['params']]
+    return result
+
+
+def _hybrid_optimizer_group_layout(group):
+    return (group.get('param_map'), group.get('reverse_param_map'),
+            {index: [child.get('params') for child in children]
+             for index, children in group.get('children', {}).items()})
+
+
+def _finalize_sharded_optimizer_state_dict(optimizer, state_dict):
+    """Record the destination layout after a trusted merged-to-sharded conversion.
+
+    Call only at conversion writers, after trimming by the destination module's
+    metadata. Ordinary sharded loaders must validate the saved identity instead
+    of regenerating it from whichever optimizer is loading the checkpoint.
+    """
+    result = _copy_optimizer_state_metadata(state_dict)
+    current = optimizer.state_dict()
+    if ([group['params'] for group in result['param_groups']]
+            != [group['params'] for group in current['param_groups']]):
+        raise ValueError('Trimmed optimizer does not match the destination parameter layout')
+    for saved, target in zip(result['param_groups'], current['param_groups']):
+        if 'children' in target:
+            if (saved.get('children', {}).keys() != target['children'].keys()
+                    or any(len(saved['children'][index]) != len(children)
+                           for index, children in target['children'].items())):
+                raise ValueError('Cannot redistribute a different Hybrid optimizer group structure')
+            # Keep saved options (learning rate, decay, etc.), while recording
+            # the new local parameter/bucket membership used by Hybrid's loader.
+            for index, children in target['children'].items():
+                for source_child, target_child in zip(saved['children'][index], children):
+                    source_child['params'] = list(target_child['params'])
+            for key in ('param_map', 'reverse_param_map'):
+                saved[key] = copy.deepcopy(target[key])
+    result[ParallelModule.EXTRA_STATE_KEY] = asdict(optimizer._extra_state)
+    result.pop(_OPTIMIZER_NON_PARALLEL_NAMES_KEY, None)
+    if optimizer._non_parallel_param_names:
+        result[_OPTIMIZER_NON_PARALLEL_NAMES_KEY] = list(optimizer._non_parallel_param_names)
     return result
 
 
@@ -4310,6 +4352,8 @@ def trimmed_broadcast_merged_state_dict(
         prefix = module_path + '.' if module_path else ''
         if isinstance(m, ParallelModule):
             m._add_extra_state(ret[0], prefix)
+    if ret[1] is not None:
+        ret = ret[0], _finalize_sharded_optimizer_state_dict(optimizer, ret[1])
     return ret
 
 

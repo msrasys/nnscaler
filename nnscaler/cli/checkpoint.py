@@ -21,7 +21,10 @@ import torch.distributed
 
 import nnscaler
 from nnscaler.cli.trainer import Trainer, TrainerArgs
-from nnscaler.parallel import _trim_module_merged_state_dict, _trim_optimizer_merged_state_dict
+from nnscaler.parallel import (
+    _trim_module_merged_state_dict, _trim_optimizer_merged_state_dict,
+    _finalize_sharded_optimizer_state_dict,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -95,6 +98,8 @@ def _trim_merged_checkpoint(train_args: TrainerArgs, merged_state_dict, rank: in
         trainer.model, trainer.optimizer._extra_state, merged_state_dict['optimizer'],
         device='cpu'
     )
+    sharded_state_dict['optimizer'] = _finalize_sharded_optimizer_state_dict(
+        trainer.optimizer, sharded_state_dict['optimizer'])
     sharded_state_dict['train_args'] = train_args.to_dict()
     sharded_state_dict['train_args'].setdefault('checkpoint', {})['save_type'] = 'sharded'
     # discard rng_states for merged state dict
