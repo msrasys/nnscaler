@@ -279,5 +279,10 @@ It returns one snapshot per initialized shared pool, so multiple compiled module
 cannot cause duplicate accounting. It does not initialize offloading or retain
 runtime resources in the result. A shared pool's counters include all its users,
 including modules outside the queried subtree; these are not per-module totals.
+`nnscaler.runtime.executor.observe_forward_outputs(callback)` provides a scoped,
+read-only view of segment outputs for diagnostics, including outputs that never
+enter `save_for_backward`. The callback receives `(segment_name, outputs)`;
+its return value is ignored. Keep only metadata or weak references when measuring
+lifetime. Nested observers compose, and registration is removed on context exit.
 Moving or sleeping a module with live offloaded activations is rejected.
 Generate fresh code after selecting regions or changing offload configuration.

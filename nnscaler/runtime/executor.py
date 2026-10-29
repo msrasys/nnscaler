@@ -5,7 +5,8 @@ r"""
 Executor for runtime
 """
 import atexit
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
+from contextvars import ContextVar
 
 from dataclasses import dataclass
 from typing import Tuple, Any, Callable, List, Dict, Iterable, Optional, Union, Iterator
@@ -24,6 +25,30 @@ from .pipeline_input import (
 _logger = logging.getLogger(__name__)
 
 _ALLOW_GRAD_DTYPES = (torch.double, torch.float32, torch.float16, torch.bfloat16)
+_forward_output_observers = ContextVar('nnscaler_forward_output_observers', default=())
+
+
+@contextmanager
+def observe_forward_outputs(callback):
+    """Observe segment boundaries without changing their outputs or schedule.
+
+    ``callback(name, outputs)`` must treat outputs as read-only. Keep metadata or
+    weak references when measuring lifetime. Registration is context-local;
+    nested observers compose and are removed on exit, including exceptions.
+    Callback failures propagate to the caller.
+    """
+    if not callable(callback):
+        raise TypeError('A forward output observer must be callable')
+    token = _forward_output_observers.set((*_forward_output_observers.get(), callback))
+    try:
+        yield
+    finally:
+        _forward_output_observers.reset(token)
+
+
+def _observe_forward_outputs(name, outputs):
+    for callback in _forward_output_observers.get():
+        callback(name, outputs)
 
 try:
     from torch.autograd.graph import get_gradient_edge
@@ -356,6 +381,7 @@ class Executor:
         if not requires_grad:
             with torch.no_grad():
                 outputs = subgraph(*input_tensors)
+                _observe_forward_outputs(name, outputs)
             return outputs
 
         # everytime forward a segment, detach the tensor from previous graph
@@ -399,10 +425,11 @@ class Executor:
 
         try:
             outputs = subgraph(*input_dtensors)
+            _observe_forward_outputs(name, outputs)
         except BaseException:
-            if release_inputs:
-                pending = Executor._detach[name]
-                pending[:] = [pairs for pairs in pending if pairs is not saved_pairs]
+            # Roll back only this invocation, including observer failures.
+            pending = Executor._detach[name]
+            pending[:] = [pairs for pairs in pending if pairs is not saved_pairs]
             raise
         return outputs
 
