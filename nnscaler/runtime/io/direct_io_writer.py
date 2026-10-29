@@ -49,6 +49,7 @@ NOTE: The optimal workers and chunk_bytes values depend on the storage device.
 
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import ExitStack
 import mmap
 import os
 
@@ -79,34 +80,35 @@ class DirectIOWriter:
         if workers < 1:
             raise ValueError("workers must be >= 1")
 
-        # ---- Open the file ----
-        # O_EXCL rejects existing files to prevent accidental overwrites.
-        # O_DIRECT bypasses the page cache; all subsequent pwrites must be aligned.
-        self._fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_DIRECT, 0o666)
-        self._chunk_bytes = chunk_bytes
-        self._pool = ThreadPoolExecutor(max_workers=workers)
+        with ExitStack() as cleanup:
+            # O_EXCL prevents overwrites; O_DIRECT requires aligned writes.
+            self._fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_DIRECT, 0o666)
+            cleanup.callback(os.close, self._fd)
+            self._chunk_bytes = chunk_bytes
+            self._pool = cleanup.enter_context(ThreadPoolExecutor(max_workers=workers))
 
-        # ---- Bounce buffer pool ----
-        # Anonymous mmap memory is page-aligned, as required by O_DIRECT.
-        # A regular bytearray does not guarantee alignment and cannot be used.
-        self._buffers = [mmap.mmap(-1, chunk_bytes) for _ in range(2 * workers)]
-        self._free = list(self._buffers)      # Free buffers available for filling.
-        self._inflight = deque()              # (future, buffer) pairs being written.
+            # Anonymous mmap is page-aligned; bytearray does not guarantee alignment.
+            self._buffers = [
+                cleanup.enter_context(mmap.mmap(-1, chunk_bytes))
+                for _ in range(2 * workers)
+            ]
+            self._free = list(self._buffers)  # Free buffers available for filling.
+            self._inflight = deque()          # (future, buffer) pairs being written.
 
-        # ---- Buffer currently being filled ----
-        self._cur = None                     # None until a buffer is acquired.
-        self._cur_used = 0                   # Bytes filled in the current buffer.
-        self._cur_flushed = True             # All current contents written (see flush).
+            self._cur = None                 # None until a buffer is acquired.
+            self._cur_used = 0               # Bytes filled in the current buffer.
+            self._cur_flushed = True         # All current contents written (see flush).
 
-        # ---- Two offsets ----
-        # _logical_offset: Bytes written by the caller; both tell() and the actual
-        #                  file length use this value.
-        # _disk_offset:    File offset of the current buffer, always a multiple of
-        #                  chunk_bytes. Advances by chunk_bytes per full block submitted.
-        self._logical_offset = 0
-        self._disk_offset = 0
+            # _logical_offset: Bytes written by the caller; both tell() and the actual
+            #                  file length use this value.
+            # _disk_offset:    File offset of the current buffer, always a multiple of
+            #                  chunk_bytes. Advances by chunk_bytes per full block submitted.
+            self._logical_offset = 0
+            self._disk_offset = 0
 
-        self.closed = False
+            self.closed = False
+            # Initialization succeeded; close() now owns resource cleanup.
+            cleanup.pop_all()
 
     # ------------------------------------------------------------------
     # Writing
@@ -213,8 +215,9 @@ class DirectIOWriter:
 
     def _wait_oldest(self):
         """Wait for the oldest write and reclaim its buffer, propagating errors."""
-        future, buffer = self._inflight.popleft()
+        future, buffer = self._inflight[0]
         future.result()                 # Re-raise any write error here.
+        self._inflight.popleft()
         self._free.append(buffer)
 
     def _pwrite_all(self, buffer, length, offset):

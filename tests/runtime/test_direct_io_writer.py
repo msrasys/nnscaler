@@ -2,12 +2,15 @@
 #  Licensed under the MIT License.
 
 import errno
+from concurrent.futures import ThreadPoolExecutor
 import mmap
 import os
+from unittest.mock import Mock
 
 import pytest
 import torch
 
+import nnscaler.runtime.io.direct_io_writer as direct_io_writer
 from nnscaler.runtime.io.direct_io_writer import DirectIOWriter
 
 
@@ -106,6 +109,48 @@ def test_existing_file(tmp_path):
     assert path.read_bytes() == b"existing checkpoint"
 
 
+@pytest.mark.parametrize("failure", ["pool", "first_buffer", "second_buffer"])
+def test_initialization_failure_releases_resources(direct_io_path, monkeypatch, failure):
+    real_mmap = mmap.mmap
+    buffers = []
+    shutdown = Mock()
+    close = Mock(wraps=os.close)
+    error = OSError(errno.ENOMEM, "injected initialization failure")
+
+    def create_pool(**kwargs):
+        if failure == "pool":
+            raise error
+        pool = ThreadPoolExecutor(**kwargs)
+        shutdown.side_effect = pool.shutdown
+        monkeypatch.setattr(pool, "shutdown", shutdown)
+        return pool
+
+    def allocate_buffer(*args):
+        if failure == "first_buffer" or buffers:
+            raise error
+        buffer = real_mmap(*args)
+        buffers.append(buffer)
+        return buffer
+
+    monkeypatch.setattr(direct_io_writer, "ThreadPoolExecutor", create_pool)
+    monkeypatch.setattr(mmap, "mmap", allocate_buffer)
+    monkeypatch.setattr(os, "close", close)
+    with pytest.raises(OSError, match="injected initialization failure") as caught:
+        DirectIOWriter(direct_io_path, chunk_bytes=mmap.PAGESIZE, workers=1)
+
+    assert caught.value is error
+    close.assert_called_once()
+    fd = close.call_args[0][0]
+    with pytest.raises(OSError) as caught:
+        os.fstat(fd)
+    assert caught.value.errno == errno.EBADF
+    assert all(buffer.closed for buffer in buffers)
+    if failure == "pool":
+        shutdown.assert_not_called()
+    else:
+        shutdown.assert_called_once_with(wait=True)
+
+
 @pytest.mark.parametrize("size", [123, mmap.PAGESIZE], ids=["tail", "async"])
 def test_write_error_releases_resources(direct_io_path, monkeypatch, size):
     def fail_write(fd, data, offset):
@@ -118,6 +163,10 @@ def test_write_error_releases_resources(direct_io_path, monkeypatch, size):
     with pytest.raises(OSError, match="injected write failure") as error:
         with writer:
             writer.write(b"x" * size)
+            for _ in range(2):
+                with pytest.raises(OSError, match="injected write failure") as flush_error:
+                    writer.flush()
+                assert flush_error.value.errno == errno.EIO
 
     assert error.value.errno == errno.EIO
     assert writer.closed
@@ -126,3 +175,5 @@ def test_write_error_releases_resources(direct_io_path, monkeypatch, size):
         os.fstat(fd)
     assert error.value.errno == errno.EBADF
     writer.close()
+    with pytest.raises(ValueError, match="closed"):
+        writer.flush()
