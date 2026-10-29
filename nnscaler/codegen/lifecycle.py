@@ -100,18 +100,23 @@ class LifeCycle:
         return self.release.get(line_id, [])
 
     def input_references_after_data_use(self, nodes, graph_outputs):
-        """Find inputs whose remaining schedule uses only identify gradients.
+        """Find inputs whose remaining schedule uses only identify gradients."""
+        return self.pipeline_references_after_data_use(
+            nodes, graph_outputs, release_inputs=True, release_outputs=False)[0]
 
-        Keep backward roots, returned values, attributes and any tensor read
-        by a backward segment hook. Adapters and ordinary operations always
-        count as data consumers. The ordinary lifetime remains unchanged: the
-        lightweight input identity is deleted at that original final use.
+    def pipeline_references_after_data_use(self, nodes, graph_outputs, *, release_inputs, release_outputs):
+        """Separate pipeline data reads from input identities/backward edges.
+
+        Returned values, attributes and hidden hook/keyword reads retain data.
+        Adapters and ordinary operations always count as data consumers. The
+        normal lifetime still determines when each reference itself is deleted.
         """
         emission = FuncEmission()
         data_lifetime = {}
         input_targets = set()
         forward_inputs = set()
-        roots = set(IRSegment.get_objects_from_complex(graph_outputs))
+        retained = set(IRSegment.get_objects_from_complex(graph_outputs))
+        backward_roots = set()
 
         def activations(values):
             return (v for v in IRSegment.get_objects_from_complex(values)
@@ -122,16 +127,19 @@ class LifeCycle:
             # Keyword/hook metadata can name data outside the segment's
             # declared argument list. Keep it conservatively: this pass does
             # not establish additional stream dependencies for hidden reads.
-            roots.update(activations(getattr(node, 'kwargs', {})))
+            retained.update(activations(getattr(node, 'kwargs', {})))
             if cell.pre_hook or cell.post_hook:
-                roots.update(activations(cell.hook_meta))
+                retained.update(activations(cell.hook_meta))
             if isinstance(cell, IRSegment) and not node.isfw():
                 fw_inputs, fw_outputs, output_grads, input_grads = emission.get_backward_callsite_io_tensors(node)
                 input_targets.update(activations(fw_inputs))
-                roots.update(activations(fw_outputs))
-                inputs = list(fw_outputs) + list(output_grads)
+                backward_roots.update(activations(fw_outputs))
+                inputs = list(output_grads)
+                if not release_outputs:
+                    inputs.extend(fw_outputs)
                 if cell.pre_hook or cell.post_hook:
                     inputs.extend(fw_inputs)
+                    inputs.extend(fw_outputs)
                 outputs = input_grads
             else:
                 inputs, outputs = node.inputs(), node.outputs()
@@ -141,12 +149,19 @@ class LifeCycle:
             for value in activations((inputs, outputs)):
                 data_lifetime[value] = line
 
-        captures = {}
-        for value in input_targets & forward_inputs - roots:
-            line = data_lifetime.get(value)
-            if value.requires_grad and line is not None and line < self.lifetime[value]:
-                captures.setdefault(line, []).append(value)
-        return {line: sorted(values, key=lambda value: value.tid) for line, values in captures.items()}
+        def capture(candidates):
+            captures = {}
+            for value in candidates - retained:
+                line = data_lifetime.get(value)
+                if value.requires_grad and line is not None and line < self.lifetime[value]:
+                    captures.setdefault(line, []).append(value)
+            return {line: sorted(values, key=lambda value: value.tid) for line, values in captures.items()}
+
+        outputs = capture({value for value in backward_roots if not value.is_loss()}) if release_outputs else {}
+        # Output references also carry an input identity; never discard their edge
+        # by emitting an additional input-only marker for the same variable.
+        inputs = capture(input_targets & forward_inputs - backward_roots) if release_inputs else {}
+        return inputs, outputs
 
     def release_tensors_after_node(self, node: IRCell) -> List[IRSubTensor]:
         """

@@ -48,3 +48,23 @@ def test_tensor_named_by_hook_metadata_keeps_its_data_reference(monkeypatch):
     nodes[0].pre_hook = lambda *args: None
     nodes[0].hook_meta = {'external_data': x}
     assert life.input_references_after_data_use(nodes, outputs) == {}
+
+
+@pytest.mark.parametrize('input_is_root', [False, True])
+def test_output_edges_are_captured_only_after_all_data_reads(monkeypatch, input_is_root):
+    x, life, nodes, outputs = graph(monkeypatch, input_is_root=input_is_root)
+    root = x if input_is_root else nodes[0].outputs()[0]
+    nodes.insert(1, IRAdapter([root], []))
+    life = LifeCycle(nodes, [x], outputs)
+    inputs, roots = life.pipeline_references_after_data_use(
+        nodes, outputs, release_inputs=True, release_outputs=True)
+    assert roots == {1: [root]}
+    assert inputs == ({} if input_is_root else {0: [x]})
+    assert root in life.release_tensors_after_line(len(nodes)-1)
+
+
+@pytest.mark.parametrize('reason', ['hook', 'return_input'])
+def test_output_references_keep_data_read_by_hooks_or_returned_to_caller(monkeypatch, reason):
+    _, life, nodes, outputs = graph(monkeypatch, input_is_root=True, **{reason: True})
+    assert life.pipeline_references_after_data_use(
+        nodes, outputs, release_inputs=True, release_outputs=True) == ({}, {})

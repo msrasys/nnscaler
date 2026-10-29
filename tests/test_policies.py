@@ -524,7 +524,8 @@ def test_codegen_fn_pipeline_cpu_offload(tmp_path):
 @replace_all_device_with('cpu')
 @pytest.mark.parametrize('release_inputs', [False, True])
 @pytest.mark.parametrize('offload', [False, True])
-def test_codegen_fn_pipeline_input_references_are_opt_in(tmp_path, release_inputs, offload):
+@pytest.mark.parametrize('release_outputs', [False, True])
+def test_codegen_fn_pipeline_input_references_are_opt_in(tmp_path, release_inputs, offload, release_outputs):
     import ast
     model = FnPolicyModuleList(ffn_layers=4)
     def policy(graph, cfg):
@@ -537,6 +538,7 @@ def test_codegen_fn_pipeline_input_references_are_opt_in(tmp_path, release_input
         model, {'x': torch.randn(4, 4)}, policy,
         ComputeConfig(2, 2, use_end2end=True,
             release_pipeline_inputs=release_inputs,
+            release_pipeline_outputs=release_outputs,
             cpu_offload={'min_tensor_bytes': 0} if offload else None,
             pas_config={'pipeline_nmicros': 2, 'pipeline_size': 2}),
         gen_savedir=tmp_path, instance_name='input_references', load_module=False,
@@ -548,9 +550,10 @@ def test_codegen_fn_pipeline_input_references_are_opt_in(tmp_path, release_input
     assert any('release_input_tensor(' in source for source in sources) == release_inputs
     assert any('release_inputs=(' in source for source in sources) == release_inputs
     assert any('with self.cpu_offloading_hooks(' in source for source in sources) == offload
+    assert any('release_output_tensor(' in source for source in sources) == release_outputs
 
 
-def _pipeline_cpu_offload_runtime_worker(tempdir, offload, release_inputs):
+def _pipeline_cpu_offload_runtime_worker(tempdir, offload, release_inputs, release_outputs):
     from tests.launch_torchrun import clone_to_cpu_recursively
     init_distributed()
     init_random()
@@ -567,6 +570,7 @@ def _pipeline_cpu_offload_runtime_worker(tempdir, offload, release_inputs):
         policy,
         ComputeConfig(2, 2, use_end2end=True,
             release_pipeline_inputs=release_inputs,
+            release_pipeline_outputs=release_outputs,
             pas_config={
                 'pipeline_nmicros': 2,
                 'pipeline_size': 2,
@@ -609,9 +613,11 @@ def _pipeline_cpu_offload_runtime_worker(tempdir, offload, release_inputs):
 def test_pipeline_cpu_offload_runtime(tmp_path):
     from tests.parallel_module.common import assert_equal
     reference = None
-    for offload, release in ((False, False), (False, True), (True, False), (True, True)):
+    import itertools
+    for offload, release, outputs in itertools.product((False, True), repeat=3):
         result = launch_torchrun(2, _pipeline_cpu_offload_runtime_worker,
-                                str(tmp_path / f'offload_{offload}_release_{release}'), offload, release)
+                                str(tmp_path / f'offload_{offload}_release_{release}_outputs_{outputs}'),
+                                offload, release, outputs)
         if reference is None:
             reference = result
         else:

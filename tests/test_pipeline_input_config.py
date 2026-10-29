@@ -67,3 +67,21 @@ def test_pipeline_release_rejects_non_boolean_values(value):
 def test_default_is_disabled_without_cpu_offload():
     config = ComputeConfig(2, 2)
     assert config.release_pipeline_inputs is False and config.cpu_offload is None
+
+
+@pytest.mark.parametrize('release_inputs', [False, True])
+def test_output_lifetime_has_an_independent_serialized_setting(release_inputs, tmp_path):
+    config = ComputeConfig(2, 2, use_end2end=True, release_pipeline_inputs=release_inputs,
+                           release_pipeline_outputs=True)
+    path = tmp_path / 'outputs.pt'
+    ComputeConfig.safe_dump_to_file(config, path)
+    assert ComputeConfig.safe_equals(config, ComputeConfig.safe_load_from_file(path))
+    assert not ComputeConfig.safe_equals(config, replace(config, release_pipeline_outputs=False))
+    with pytest.raises(ValueError, match='not supported with split backward'):
+        replace(config, use_fbw=True)
+
+
+@pytest.mark.parametrize('value', [1, 'true', None])
+def test_output_release_requires_a_boolean(value):
+    with pytest.raises(ValueError, match='release_pipeline_outputs must be a bool'):
+        ComputeConfig(2, 2, release_pipeline_outputs=value)

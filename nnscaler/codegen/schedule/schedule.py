@@ -43,6 +43,7 @@ class ScheduleCodeGen(FuncEmission):
         *,
         scale_ndevs: Optional[int] = None,
         release_pipeline_inputs: bool = False,
+        release_pipeline_outputs: bool = False,
     ):
         """
         Create a schedule code generator
@@ -54,6 +55,7 @@ class ScheduleCodeGen(FuncEmission):
         """
         self.execplan = execplan
         self.release_pipeline_inputs = release_pipeline_inputs
+        self.release_pipeline_outputs = release_pipeline_outputs
         self.devices: Tuple[int] = tuple(sorted(execplan.graph.device))
         if self.devices != tuple(range(len(self.devices))):
             raise ValueError(f'device must be consecutive')
@@ -97,12 +99,15 @@ class ScheduleCodeGen(FuncEmission):
 
         lifetime = LifeCycle(device_nodes, [], self.execplan.outputs())
         release_inputs = self.release_pipeline_inputs and use_scheduler
-        if release_inputs and CompileFlag.use_fbw:
-            raise ValueError('Pipeline input release is not supported with split backward')
-        input_references = lifetime.input_references_after_data_use(device_nodes, self.execplan.outputs()) if release_inputs else {}
+        release_outputs = self.release_pipeline_outputs and use_scheduler
+        if (release_inputs or release_outputs) and CompileFlag.use_fbw:
+            raise ValueError('Pipeline input/output release is not supported with split backward')
+        input_references, output_references = lifetime.pipeline_references_after_data_use(
+            device_nodes, self.execplan.outputs(), release_inputs=release_inputs, release_outputs=release_outputs
+        ) if release_inputs or release_outputs else ({}, {})
         self._input_release_candidates = {value for values in input_references.values() for value in values}
-        self._input_reference_lines = {value: line for line, values in input_references.items() for value in values}
-        self._node_lines = {id(node): line for line, node in enumerate(device_nodes)}
+        if release_inputs:
+            self._input_release_candidates.update(value for values in output_references.values() for value in values)
 
         args = ['model'] + [self.tensor_name(t) for t in self.execplan.graph.inputs()]
 
@@ -298,6 +303,9 @@ class ScheduleCodeGen(FuncEmission):
                     for tensor in input_references.get(line, ()):
                         name = self.tensor_name(tensor)
                         _append_code(fb, f'{name} = nnscaler.runtime.executor.release_input_tensor({name})')
+                    for tensor in output_references.get(line, ()):
+                        name = self.tensor_name(tensor)
+                        _append_code(fb, f'{name} = nnscaler.runtime.executor.release_output_tensor({name})')
                     # release
                     tensors = lifetime.release_tensors_after_line(line)
                     if len(tensors) > 0 : # not necessarily to have one after each line
@@ -1020,8 +1028,6 @@ class ScheduleCodeGen(FuncEmission):
             input_tensor_name = [
                 self.tensor_name(t) for t in IR.get_objects(gen_inputs)
                 if isinstance(t, IRTensor) and not t.is_attr()
-                and not (not node.isfw() and t in getattr(self, '_input_release_candidates', set())
-                         and self._input_reference_lines[t] < self._node_lines[id(node)])
             ]
             record_stream_codes = []
             for t in input_tensor_name:

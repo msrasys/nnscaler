@@ -105,8 +105,38 @@ can still keep the allocation alive. This does not promise that every pipeline
 input will leave the GPU. The preceding implementation passed CUDA ownership,
 PP/VPP and full-model checks. The October 29 API separation has CPU coverage for
 configuration migration, code generation with offload/lifetime independently
-enabled, outer backward and ownership. GPU and performance validation of this
-refactor is pending; earlier measurements do not validate the new revision.
+enabled, outer backward and ownership. The refactor has since passed runtime,
+PP/VPP and Vision GPU correctness checks.
+Performance validation is pending; earlier measurements do not validate the new revision.
+
+### Experimental pipeline output release
+
+`ComputeConfig(..., release_pipeline_outputs=True)` replaces eligible non-scalar
+backward roots with gradient-edge references after their final scheduled data
+read. It does not change tensor data pointers, shapes or storage. Combining it
+with `release_pipeline_inputs=True` removes both executor input ownership and
+output-root ownership from eligible boundaries, allowing saved-activation
+offload to reclaim storage. Autograd saves and external owners still retain
+values they require.
+
+The lifecycle pass treats sends, ordinary operations and hook metadata as data
+uses. Returned values, scalar losses, leaf roots and roots needed by unknown
+backward hooks stay as tensors. Switching to an incompatible hook after release
+raises an error. Split backward is unsupported. References share weak identity
+tokens to distinguish repeated references from recycled tensor ids, without
+annotating caller tensors or changing serialization.
+
+When an asynchronous P2P send has already registered a legacy backward edge,
+the reference takes ownership of it and cancels the pending placeholder update.
+The send handler retains its own tensor until communication completes. There
+is then one owner of the backward edge and no need to mutate the sent tensor.
+Normal stream bookkeeping also remains active for runtime tensor fallbacks.
+
+This option defaults to false and requires regenerated code. Runtime tests,
+eight offload/input/output combinations, Vision and real Attention/MoE PP/VPP
+checks pass on GPU, including per-step executor cleanup. Performance validation
+is in progress; it does not promise that all activation storage leaves the GPU
+or that all DMA is hidden.
 
 ## Immutability contract
 

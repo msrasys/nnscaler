@@ -5,6 +5,17 @@ import weakref
 import torch
 
 
+class _TensorIdentity:
+    def __init__(self, tensor):
+        self.original = weakref.ref(tensor)
+
+
+# Only live references own identities. The registry never owns a tensor or
+# annotates caller tensors, and a recycled Python id is checked against its weak
+# referent before reuse. Weak values remove entries when the last handle dies.
+_tensor_identities = weakref.WeakValueDictionary()
+
+
 class InputReference:
     """An input's identity after its final scheduled data read.
 
@@ -14,7 +25,33 @@ class InputReference:
     """
     def __init__(self, tensor):
         self.tensor_id = id(tensor)
-        self.original = weakref.ref(tensor)
+        identity = _tensor_identities.get(self.tensor_id)
+        if identity is None or identity.original() is not tensor:
+            identity = _TensorIdentity(tensor)
+            _tensor_identities[self.tensor_id] = identity
+        self.identity = identity
+        self.original = identity.original
+
+    def record_stream(self, stream):
+        """Match tensor stream bookkeeping; this identity owns no GPU storage."""
+        pass
+
+
+class OutputReference(InputReference):
+    """A backward root after its final data read, without owning its payload.
+
+    This is also an input identity if another local segment consumed the same
+    tensor. Autograd continues to own any values its backward actually needs.
+    """
+    def __init__(self, tensor, edge):
+        super().__init__(tensor)
+        self.edge = edge
+
+    @property
+    def backward_identity(self):
+        # Preserve Tensor deduplication while the object is alive, and avoid
+        # confusing its recycled Python id with a later tensor after release.
+        return self.tensor_id if self.original() is not None else self.identity
 
 
 class InputGradSlot:
@@ -103,3 +140,7 @@ def is_grad_target(value):
 
 def supports_input_slots(hook):
     return hook is None or getattr(hook, '_nnscaler_supports_input_grad_slots', False) is True
+
+
+def supports_output_references(hook):
+    return hook is None or getattr(hook, '_nnscaler_supports_output_references', False) is True

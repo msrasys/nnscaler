@@ -225,6 +225,9 @@ class ComputeConfig:
     # None is an initialization sentinel for the deprecated cpu_offload alias;
     # __post_init__ resolves it to a bool (False by default).
     release_pipeline_inputs: Optional[bool] = None
+    # Keep non-scalar pipeline backward roots as gradient edges after their
+    # final data read. Independent of activation offload and input-gradient slots.
+    release_pipeline_outputs: bool = False
 
     def __post_init__(self):
         if isinstance(self.cpu_offload, dict):
@@ -234,6 +237,8 @@ class ComputeConfig:
         release_inputs = self.release_pipeline_inputs
         if release_inputs is not None and not isinstance(release_inputs, bool):
             raise ValueError('release_pipeline_inputs must be a bool')
+        if not isinstance(self.release_pipeline_outputs, bool):
+            raise ValueError('release_pipeline_outputs must be a bool')
         legacy_release = bool(self.cpu_offload and self.cpu_offload.release_pipeline_inputs)
         if legacy_release:
             warnings.warn(
@@ -292,8 +297,8 @@ class ComputeConfig:
             raise ValueError("zero_use_reduce_scatter is only supported when zero_ngroups is 1.")
 
         if self.use_fbw:
-            if self.release_pipeline_inputs:
-                raise ValueError('Pipeline input release is not supported with split backward')
+            if self.release_pipeline_inputs or self.release_pipeline_outputs:
+                raise ValueError('Pipeline input/output release is not supported with split backward')
             if not self.use_end2end:
                 raise ValueError("use_fbw is only supported in end2end mode.")
             if self.inference_only:
@@ -1066,6 +1071,7 @@ def _gencode(
         sgener = ScheduleCodeGen(
             execplan, compute_config.runtime_ngpus,
             release_pipeline_inputs=compute_config.release_pipeline_inputs,
+            release_pipeline_outputs=compute_config.release_pipeline_outputs,
         )
 
     actual_codegen_workers = min(codegen_workers, compute_config.runtime_ngpus)
