@@ -24,6 +24,18 @@ applies the ids from `OpPlan`.  Adapters and multirefs inserted between marked
 operators inherit the group of their neighbour so a group stays contiguous
 after partitioning.
 
+### Combining recompute and offload
+
+An operator may carry both ids.  Code generation then wraps the checkpoint
+call in the offload context: the recompute group saves only its inputs for
+backward and exactly those are offloaded, so the group leaves nothing resident
+on the device.  This is how "recompute what is cheap, offload the rest, keep
+no activation resident" is expressed, e.g. in llm-train
+`--recompute_modules Attention,MoEExpert --offload_modules Block`: attention
+and expert work is recomputed from offloaded inputs, every other saved tensor
+of the Block (residual inputs, norm inputs, router, shared experts, latent
+projections) is offloaded directly.
+
 ## 2. Code generation
 
 `ModuleCodeGen` wraps every offload group of a segment in

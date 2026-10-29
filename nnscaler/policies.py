@@ -388,7 +388,7 @@ class OpPlan:
     """
     op: IRFwOperation
     recompute_id: int = -1   # -1 means no recompute
-    offload_id: int = -1     # -1 means no saved-tensor CPU offload
+    offload_id: int = -1     # -1 means no saved-tensor CPU offload; may be combined with recompute_id
     stage_id: int = -1       # pipeline stage id, -1 means following the previous op's stage
 
     # user defined meta data for hooks
@@ -437,8 +437,9 @@ class OpPlan:
         if self.stage_id < -1:
             raise ValueError("stage_id must be -1 or non-negative")
 
-        if self.recompute_id >= 0 and self.offload_id >= 0:
-            raise ValueError("recompute_id and offload_id cannot both be set for the same operator")
+        # recompute_id and offload_id may both be set: the group is recomputed
+        # and the tensors it still has to save (the checkpoint inputs) are
+        # offloaded, so nothing of it stays resident.
 
         if self.partition is not None and len(self.partitions) > 0:
             raise ValueError("Only one of partition and partitions can be set")

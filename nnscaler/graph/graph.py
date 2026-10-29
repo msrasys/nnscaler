@@ -1100,8 +1100,6 @@ class IRGraph(IRSegment):
 
         else:
             assert len(nodes) > 0, "Cannot recompute empty list of nodes"
-            if any(fnode.offload is not None for fnode in nodes):
-                raise ValueError("Recompute and CPU offload cannot be applied to the same operator")
             segments = [self.segment(node) for node in nodes]
             assert all(segment == segments[0] for segment in segments), \
                 "Cross-segment recompute is not allowed yet"
@@ -1144,8 +1142,6 @@ class IRGraph(IRSegment):
             return self.offload(nodes.nodes())
 
         assert len(nodes) > 0, "Cannot offload empty list of nodes"
-        if any(fnode.recompute is not None for fnode in nodes):
-            raise ValueError("Recompute and CPU offload cannot be applied to the same operator")
         segments = [self.segment(node) for node in nodes]
         assert all(segment == segments[0] for segment in segments), \
             "Cross-segment offload is not allowed"

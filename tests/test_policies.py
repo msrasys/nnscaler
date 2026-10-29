@@ -150,13 +150,15 @@ def test_call_name():
     assert get_called_self_module_name('self.up_proj(x).transpose()') == ''
 
 
-def test_op_plan_rejects_recompute_with_cpu_offload():
+def test_op_plan_allows_recompute_with_cpu_offload():
     from nnscaler.ir.operator import IRFwOperation
     from nnscaler.policies import OpPlan
 
     node = IRFwOperation('test', 'test', inputs=[], num_outputs=0)
-    with pytest.raises(ValueError, match='recompute_id and offload_id cannot both be set'):
-        OpPlan(node, recompute_id=0, offload_id=0)
+    # recompute and offload may be combined: the recomputed group's saved
+    # inputs are offloaded
+    plan = OpPlan(node, recompute_id=1, offload_id=2)
+    assert plan.recompute_id == 1 and plan.offload_id == 2
 
 
 class FnPolicyModule(torch.nn.Module):
@@ -171,24 +173,34 @@ class FnPolicyModule(torch.nn.Module):
         return x
 
 
-def invalid_combined_memory_graph_policy(graph, cfg):
+def recompute_and_offload_graph_policy(graph, cfg):
+    """Recompute the whole FFN and offload what the checkpoint still saves."""
     nodes = get_pas_ops(graph)
-    graph.offload(nodes)
+    for node in nodes:
+        graph.assign(node, 0)
     graph.recompute(nodes)
+    graph.offload(nodes)
     return graph
 
 
 @replace_all_device_with('cpu')
-def test_graph_policy_rejects_recompute_with_cpu_offload(tmp_path):
-    with raises_with_cause(ValueError, match='cannot be applied'):
-        parallelize(
-            FnPolicyModule(),
-            {'x': torch.randn(2, 4)},
-            invalid_combined_memory_graph_policy,
-            ComputeConfig(1, 1),
-            gen_savedir=tmp_path,
-            load_module=False,
-        )
+def test_graph_policy_combines_recompute_with_cpu_offload(tmp_path):
+    parallelize(
+        FnPolicyModule(),
+        {'x': torch.randn(2, 4)},
+        recompute_and_offload_graph_policy,
+        ComputeConfig(1, 1),
+        gen_savedir=tmp_path,
+        load_module=False,
+    )
+    # the checkpoint call must sit inside the offload context so that the
+    # inputs it keeps for backward are the tensors being offloaded
+    assert _gencode_contains(
+        tmp_path,
+        FnPolicyModule,
+        0,
+        r'with self\.cpu_offloading_hooks\(\d+\):\n(?:[^\n]*\n)*?\s+\S+ = ckpt\.checkpoint\(',
+    )
 
 
 def megatron_ffn_policy(graph, cfg):

@@ -1039,21 +1039,26 @@ class ModuleCodeGen(FuncEmission):
             assert len(group) > 0
             rc_gid: Optional[int] = group[0].recompute
             offload_gid: Optional[int] = group[0].offload
-            assert rc_gid is None or offload_gid is None, f"Recompute and offload cannot be enabled at the same time: {group}"
 
             if offload_gid is None and rc_gid is None:
                 codes += self._emit_nodes(group, lifetime, runtime_devid)
-            elif offload_gid is not None:
+            elif rc_gid is None:
                 group_codes = self._emit_nodes(group, lifetime, runtime_devid)
                 with Block(f'with self.cpu_offloading_hooks({offload_gid}):') as offload_block:
                     offload_block.insert_body(group_codes)
                 codes += [''] + offload_block.code + ['']
             else:
-                assert rc_gid is not None
                 # get recompute excution code
                 rc_segment = segment.create_segment(group)
                 rc_codes = self._emit_recompute(group,
                     rc_segment.inputs(), rc_segment.outputs(), lifetime, runtime_devid)
+                if offload_gid is not None:
+                    # Recompute + offload: the checkpoint saves only the group
+                    # inputs for backward; wrapping the call offloads those, so
+                    # the group leaves nothing resident on the device.
+                    with Block(f'with self.cpu_offloading_hooks({offload_gid}):') as offload_block:
+                        offload_block.insert_body(rc_codes)
+                    rc_codes = [''] + offload_block.code + ['']
                 codes += rc_codes
                 # release input tensors after exiting a RC group:
                 last_node = group[-1]
