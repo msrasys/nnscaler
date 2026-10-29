@@ -60,10 +60,10 @@ __all__ = ["MappedTensorDeallocator"]
 def _file_backed_ranges():
     """Return the process's file-backed mappings as sorted (start, end) pairs.
 
-    None where /proc/self/maps is unavailable (non-Linux), meaning the check
-    cannot be done. Read once per register() call rather than per tensor: a
-    state dict holds one storage per tensor, and the file can be hundreds of
-    KiB in a process with many shared libraries.
+    None where /proc/self/maps is unavailable, meaning the check cannot be done
+    and nothing may be registered. Read once per register() call rather than
+    per tensor: a state dict holds one storage per tensor, and the file can be
+    hundreds of KiB in a process with many shared libraries.
     """
     try:
         with open("/proc/self/maps") as f:
@@ -121,7 +121,9 @@ class MappedTensorDeallocator:
             storage = obj.untyped_storage()
             if storage.nbytes() == 0:
                 return                  # Nothing to evict, and data_ptr may be null.
-            if ranges is not None and not _is_file_backed(ranges, storage.data_ptr()):
+            # Fail closed: without the mapping table we cannot prove the storage
+            # is file-backed, and evicting anything else destroys data.
+            if ranges is None or not _is_file_backed(ranges, storage.data_ptr()):
                 return
             self._storages[storage.data_ptr()] = StorageWeakRef(storage)
         elif isinstance(obj, dict):
@@ -137,7 +139,9 @@ class MappedTensorDeallocator:
         Silently ignored when tensor's storage was not registered (see the
         module docstring for why) or on platforms without madvise.
         """
-        if self._libc is None or tensor.numel() == 0:
+        # Same guards as register(): sparse tensors have no untyped_storage().
+        if (self._libc is None or tensor.device.type != "cpu"
+                or tensor.layout != torch.strided or tensor.numel() == 0):
             return
         storage = tensor.untyped_storage()
         source = self._storages.get(storage.data_ptr())

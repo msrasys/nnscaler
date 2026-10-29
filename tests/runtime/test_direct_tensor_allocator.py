@@ -47,12 +47,13 @@ def test_intercepts_large_cpu_factories(allocator):
 def test_passthrough(allocator):
     n = allocator.hugepage_bytes // 4
     with allocator:
-        pinned = torch.zeros(n, pin_memory=True)
         channels_last = torch.empty(1, 4, n // 64, 16, memory_format=torch.channels_last)
         ones = torch.ones(n)                 # not a factory op we intercept
         sparse = torch.zeros(n, layout=torch.sparse_coo)
+        # Pinned memory needs an accelerator runtime, so both are CUDA-gated.
         cuda = torch.zeros(n, device="cuda") if torch.cuda.is_available() else None
-    assert pinned.is_pinned()
+        pinned = torch.zeros(n, pin_memory=True) if torch.cuda.is_available() else None
+    assert pinned is None or pinned.is_pinned()
     assert channels_last.is_contiguous(memory_format=torch.channels_last)
     assert ones.sum() == n
     assert sparse.layout == torch.sparse_coo

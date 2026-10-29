@@ -87,7 +87,16 @@ def test_register_skips_non_evictable(shard):
     # Unregistered tensors are left untouched; evicting them would zero their memory.
     deallocator.evict(anon)
     deallocator.evict(shared)
+    deallocator.evict(mixed["sparse"])        # no untyped_storage(): must not raise
+    deallocator.evict(mixed["cuda"])
     assert anon.sum() == NUMEL and shared.sum() == 1024
+
+
+def test_register_fails_closed_without_maps(shard, monkeypatch):
+    monkeypatch.setattr(mapped_tensor_deallocator, "_file_backed_ranges", lambda: None)
+    deallocator = MappedTensorDeallocator()
+    deallocator.register(shard)
+    assert not deallocator._storages
 
 
 def test_evict_ignores_dead_storage(shard_path):

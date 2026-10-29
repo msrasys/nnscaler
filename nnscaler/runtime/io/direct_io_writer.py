@@ -111,6 +111,11 @@ class DirectIOWriter:
             self._fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_DIRECT, 0o666)
             self._path = path
             self._delete_on_error = delete_on_error
+            # The file was created above; if construction fails the caller has no
+            # writer to clean up, and O_EXCL would reject a retry. Registered
+            # before os.close so LIFO cleanup closes first, then unlinks.
+            if delete_on_error:
+                cleanup.callback(self._unlink)
             cleanup.callback(os.close, self._fd)
             self._chunk_bytes = chunk_bytes
             self._pool = cleanup.enter_context(ThreadPoolExecutor(max_workers=workers))

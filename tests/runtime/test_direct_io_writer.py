@@ -146,6 +146,7 @@ def test_initialization_failure_releases_resources(direct_io_path, monkeypatch, 
         DirectIOWriter(direct_io_path, chunk_bytes=mmap.PAGESIZE, workers=1)
 
     assert caught.value is error
+    assert not direct_io_path.exists()      # created by os.open, removed by the rollback
     close.assert_called_once()
     fd = close.call_args[0][0]
     with pytest.raises(OSError) as caught:
