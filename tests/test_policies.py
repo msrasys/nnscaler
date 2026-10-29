@@ -523,13 +523,21 @@ def test_codegen_fn_pipeline_cpu_offload(tmp_path):
 
 @replace_all_device_with('cpu')
 @pytest.mark.parametrize('release_inputs', [False, True])
-def test_codegen_fn_pipeline_input_references_are_opt_in(tmp_path, release_inputs):
+@pytest.mark.parametrize('offload', [False, True])
+def test_codegen_fn_pipeline_input_references_are_opt_in(tmp_path, release_inputs, offload):
     import ast
     model = FnPolicyModuleList(ffn_layers=4)
+    def policy(graph, cfg):
+        plans = list(pipeline_cpu_offload_prefetch_policy(graph, cfg))
+        if not offload:
+            for plan in plans:
+                plan.offload_id = -1
+        return plans
     parallelize(
-        model, {'x': torch.randn(4, 4)}, pipeline_cpu_offload_prefetch_policy,
+        model, {'x': torch.randn(4, 4)}, policy,
         ComputeConfig(2, 2, use_end2end=True,
-            cpu_offload={'min_tensor_bytes': 0, 'release_pipeline_inputs': release_inputs},
+            release_pipeline_inputs=release_inputs,
+            cpu_offload={'min_tensor_bytes': 0} if offload else None,
             pas_config={'pipeline_nmicros': 2, 'pipeline_size': 2}),
         gen_savedir=tmp_path, instance_name='input_references', load_module=False,
     )
@@ -539,18 +547,26 @@ def test_codegen_fn_pipeline_input_references_are_opt_in(tmp_path, release_input
         ast.parse(source)
     assert any('release_input_tensor(' in source for source in sources) == release_inputs
     assert any('release_inputs=(' in source for source in sources) == release_inputs
+    assert any('with self.cpu_offloading_hooks(' in source for source in sources) == offload
 
 
-def _pipeline_cpu_offload_runtime_worker(tempdir):
-    import nnscaler.runtime.cpu_offloading as cpu_offloading
-
+def _pipeline_cpu_offload_runtime_worker(tempdir, offload, release_inputs):
+    from tests.launch_torchrun import clone_to_cpu_recursively
     init_distributed()
+    init_random()
     model = FnPolicyModuleList(ffn_layers=4)
+    def policy(graph, cfg):
+        plans = list(pipeline_cpu_offload_prefetch_policy(graph, cfg))
+        if not offload:
+            for plan in plans:
+                plan.offload_id = -1
+        return plans
     parallel_model = parallelize(
         model,
         {'x': torch.randn(4, 4)},
-        pipeline_cpu_offload_prefetch_policy,
+        policy,
         ComputeConfig(2, 2, use_end2end=True,
+            release_pipeline_inputs=release_inputs,
             pas_config={
                 'pipeline_nmicros': 2,
                 'pipeline_size': 2,
@@ -568,23 +584,38 @@ def _pipeline_cpu_offload_runtime_worker(tempdir):
         rank,
         r'with self\.cpu_offloading_hooks\((?:tail=True)?\) as _offload:',
         instance_name='cpu_offload_pipeline_runtime',
-    )) == 2
+    )) == (2 if offload else 0)
 
     from dataclasses import replace
-    parallel_model.compute_config = replace(parallel_model.compute_config, cpu_offload={'min_tensor_bytes': 0})
+    parallel_model.compute_config = replace(parallel_model.compute_config,
+        cpu_offload={'min_tensor_bytes': 0, 'max_cpu_bytes': 64 * 1024**2} if offload else None)
+    init_random(42)  # Compilation must not affect samples or dropout randomness.
     samples = [torch.randn(4, 4) for _ in range(2)]
-    parallel_model.train_step(samples)
+    losses = parallel_model.train_step(samples)
     stats = parallel_model.activation_offload_stats()
-    assert stats['offloaded_storages'] > 0
-    assert stats['prefetch_loads'] > 0
-    assert stats['live_cpu_bytes'] == 0
+    assert bool(stats.get('offloaded_storages', 0)) == offload
+    if offload:
+        assert stats['prefetch_loads'] > 0
+        assert stats['live_cpu_bytes'] == 0
     assert all(param.grad is not None for param in parallel_model.parameters())
     assert all(torch.isfinite(param.grad).all() for param in parallel_model.parameters())
+    return clone_to_cpu_recursively({
+        'losses': losses,
+        'gradients': {name: param.grad for name, param in parallel_model.named_parameters()},
+    })
 
 
 @pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.device_count() < 2, reason='lack of gpu devices')
 def test_pipeline_cpu_offload_runtime(tmp_path):
-    launch_torchrun(2, _pipeline_cpu_offload_runtime_worker, str(tmp_path))
+    from tests.parallel_module.common import assert_equal
+    reference = None
+    for offload, release in ((False, False), (False, True), (True, False), (True, True)):
+        result = launch_torchrun(2, _pipeline_cpu_offload_runtime_worker,
+                                str(tmp_path / f'offload_{offload}_release_{release}'), offload, release)
+        if reference is None:
+            reference = result
+        else:
+            assert_equal(result, reference)
 
 
 @replace_all_device_with('cpu')

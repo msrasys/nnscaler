@@ -5,6 +5,7 @@ r"""
 Executor for runtime
 """
 import atexit
+from contextlib import nullcontext
 
 from dataclasses import dataclass
 from typing import Tuple, Any, Callable, List, Dict, Iterable, Optional, Union, Iterator
@@ -247,6 +248,43 @@ class Executor:
                     Executor._released_input_grad_callbacks[key] = (callback, None)
                     release()
         return reference
+
+    @staticmethod
+    def register_input_backward(
+        tensor: torch.Tensor,
+        *,
+        context_factory: Optional[Callable] = None,
+        on_complete: Optional[Callable[[], None]] = None,
+        on_data_release: Optional[Callable[[], None]] = None,
+    ) -> None:
+        """Connect an isolated segment's input gradient to an outer eager graph.
+
+        A non-leaf can retain its autograd edge without owning the output data.
+        When early data release is requested, the caller only supplies cleanup
+        of its external references. Leaves (and older PyTorch without gradient
+        edges) keep the tensor alive. Saved values required by autograd always
+        remain owned by that graph. Register before forward for early release.
+
+        ``context_factory`` is entered only while running the outer backward,
+        for example to apply the caller's gradient synchronization policy.
+        """
+        if not torch.is_tensor(tensor) or not tensor.requires_grad:
+            raise ValueError('input backward connections require a grad-requiring tensor')
+        release_input = on_data_release is not None and not tensor.is_leaf and get_gradient_edge is not None
+        root = get_gradient_edge(tensor) if release_input else tensor
+
+        def resume_backward(grad):
+            nonlocal root
+            with (context_factory() if context_factory is not None else nullcontext()):
+                torch.autograd.backward(root, grad)
+            root = None
+            if on_complete is not None:
+                on_complete()
+
+        Executor.register_input_grad_callback(
+            tensor, resume_backward, release_input=release_input,
+            on_data_release=on_data_release if release_input else None,
+        )
 
     @staticmethod
     def _run_input_grad_callbacks(
@@ -756,6 +794,7 @@ complete_deferred_pseudo_free_tensor = Executor.complete_deferred_pseudo_free_te
 backward_input = Executor.backward_input
 backward_weight = Executor.backward_weight
 register_input_grad_callback = Executor.register_input_grad_callback
+register_input_backward = Executor.register_input_backward
 release_input_tensor = Executor.release_input_tensor
 sync_tensors = Executor.sync_tensors
 

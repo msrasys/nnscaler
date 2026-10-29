@@ -1,6 +1,7 @@
 # Copyright (c) Microsoft Corporation. Licensed under the MIT License.
 import gc
 import weakref
+from contextlib import contextmanager
 
 import pytest
 import torch
@@ -187,6 +188,94 @@ def test_weak_outer_graph_callback_releases_data_before_backward():
     Executor.check_clear()
 
 
+@pytest.mark.parametrize('shape', [(4,), (2, 3), (2, 3, 4)])
+def test_outer_backward_connection_owns_graph_not_output_data(shape):
+    weight = torch.nn.Parameter(torch.randn(shape))
+    feature = weight * 3
+    storage = weakref.ref(feature.untyped_storage())
+    owners = {'value': feature}
+    events = []
+    @contextmanager
+    def context():
+        events.append('enter')
+        yield
+        events.append('exit')
+    def release():
+        events.append('data')
+        owners.clear()
+    enabled = gc.isenabled()
+    gc.disable()
+    try:
+        Executor.register_input_backward(feature, context_factory=context,
+            on_complete=lambda: events.append('complete'), on_data_release=release)
+        output = Executor.fexecute('s', torch.sum, feature, release_inputs=(0,))
+        reference = release_input_tensor(feature)
+        del feature
+        assert storage() is None and not owners and events == ['data']
+        Executor.backward('s', (reference,), (output,), (None,))
+        assert events == ['data', 'enter', 'exit', 'complete']
+        torch.testing.assert_close(weight.grad, torch.full_like(weight, 3), rtol=0, atol=0)
+        Executor.check_clear()
+    finally:
+        if enabled:
+            gc.enable()
+
+
+def test_outer_backward_connection_keeps_autograd_saved_output():
+    weight = torch.nn.Parameter(torch.randn(4))
+    feature = weight.sigmoid()  # Sigmoid backward needs its output value.
+    expected = feature.detach().clone() * (1 - feature.detach().clone())
+    storage = weakref.ref(feature.untyped_storage())
+    Executor.register_input_backward(feature, on_data_release=lambda: None)
+    output = Executor.fexecute('s', torch.sum, feature, release_inputs=(0,))
+    reference = release_input_tensor(feature)
+    del feature
+    assert storage() is not None
+    Executor.backward('s', (reference,), (output,), (None,))
+    torch.testing.assert_close(weight.grad, expected, rtol=0, atol=0)
+    Executor.check_clear()
+
+
+@pytest.mark.parametrize('release_inputs', [(), (0,)])
+@pytest.mark.parametrize('edge_available', [False, True])
+def test_outer_backward_connection_without_early_release(monkeypatch, release_inputs, edge_available):
+    if not edge_available:
+        monkeypatch.setattr('nnscaler.runtime.executor.get_gradient_edge', None)
+    weight = torch.nn.Parameter(torch.randn(4))
+    feature = weight * 3
+    weak_feature = weakref.ref(feature)
+    events = []
+    # Cover ordinary registration, and a requested release with an old Torch
+    # API that must fall back to retaining the tensor through backward.
+    Executor.register_input_backward(
+        feature, on_complete=lambda: events.append('complete'),
+        on_data_release=None if edge_available else lambda: events.append('data'),
+    )
+    output = Executor.fexecute('s', torch.sum, feature, release_inputs=release_inputs)
+    reference = release_input_tensor(feature)
+    del feature
+    assert weak_feature() is not None and not events
+    Executor.backward('s', (reference,), (output,), (None,))
+    assert weak_feature() is None and events == ['complete']
+    torch.testing.assert_close(weight.grad, torch.full_like(weight, 3), rtol=0, atol=0)
+    Executor.check_clear()
+
+
+def test_outer_backward_connection_keeps_leaf_until_completion():
+    leaf = torch.randn(4, requires_grad=True)
+    weak_leaf = weakref.ref(leaf)
+    events = []
+    Executor.register_input_backward(leaf, on_data_release=lambda: events.append('data'),
+                                      on_complete=lambda: events.append('complete'))
+    output = Executor.fexecute('s', torch.sum, leaf, release_inputs=(0,))
+    reference = release_input_tensor(leaf)
+    del leaf
+    assert weak_leaf() is not None and not events
+    Executor.backward('s', (reference,), (output,), (None,))
+    assert events == ['complete'] and weak_leaf() is None
+    Executor.check_clear()
+
+
 def test_weak_callbacks_with_reused_tensor_ids_remain_distinct():
     old = torch.randn(4, requires_grad=True)
     calls = []
@@ -278,7 +367,7 @@ def test_compile_config_rejects_input_release_with_split_backward():
     from nnscaler.parallel import ComputeConfig
     with pytest.raises(ValueError, match='not supported with split backward'):
         ComputeConfig(2, 2, use_end2end=True, use_fbw=True,
-                      cpu_offload={'release_pipeline_inputs': True})
+                      release_pipeline_inputs=True)
 
 
 def test_forward_failure_discards_only_its_own_pending_input_state():

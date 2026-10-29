@@ -20,6 +20,7 @@ import subprocess
 import tempfile
 import threading
 import time
+import warnings
 from collections import OrderedDict, defaultdict
 
 import torch
@@ -220,12 +221,28 @@ class ComputeConfig:
 
     # A dict is accepted to support dataclasses.asdict serialization.
     cpu_offload: Optional[CPUOffloadConfig] = None
+    # Pipeline input lifetime is independent of where saved activations live.
+    # None is an initialization sentinel for the deprecated cpu_offload alias;
+    # __post_init__ resolves it to a bool (False by default).
+    release_pipeline_inputs: Optional[bool] = None
 
     def __post_init__(self):
         if isinstance(self.cpu_offload, dict):
             super().__setattr__('cpu_offload', CPUOffloadConfig(**self.cpu_offload))
         elif self.cpu_offload is not None and not isinstance(self.cpu_offload, CPUOffloadConfig):
             raise TypeError('cpu_offload must be CPUOffloadConfig or a dictionary')
+        release_inputs = self.release_pipeline_inputs
+        if release_inputs is not None and not isinstance(release_inputs, bool):
+            raise ValueError('release_pipeline_inputs must be a bool')
+        legacy_release = bool(self.cpu_offload and self.cpu_offload.release_pipeline_inputs)
+        if legacy_release:
+            warnings.warn(
+                'CPUOffloadConfig.release_pipeline_inputs is deprecated; use '
+                'ComputeConfig.release_pipeline_inputs. An explicit top-level value takes precedence.',
+                DeprecationWarning, stacklevel=2,
+            )
+            super().__setattr__('cpu_offload', replace(self.cpu_offload, release_pipeline_inputs=False))
+        super().__setattr__('release_pipeline_inputs', legacy_release if release_inputs is None else release_inputs)
         if self.plan_ngpus <= 0:
             raise ValueError(f"plan_ngpus {self.plan_ngpus} must be > 0")
         if self.runtime_ngpus is None:
@@ -275,7 +292,7 @@ class ComputeConfig:
             raise ValueError("zero_use_reduce_scatter is only supported when zero_ngroups is 1.")
 
         if self.use_fbw:
-            if self.cpu_offload and self.cpu_offload.release_pipeline_inputs:
+            if self.release_pipeline_inputs:
                 raise ValueError('Pipeline input release is not supported with split backward')
             if not self.use_end2end:
                 raise ValueError("use_fbw is only supported in end2end mode.")
@@ -408,6 +425,8 @@ class ComputeConfig:
         if Path(file).exists():
             try:
                 cfg = torch.load(file, weights_only=False)
+                if isinstance(cfg, cls):
+                    cfg = asdict(cfg)
                 if isinstance(cfg, dict): # in old version, we save the object directly (not save as dict)
                     # this can raise if cfg has extra keys.
                     # which means some fields of ComputeConfig has been removed(we should avoid this).
@@ -1046,7 +1065,7 @@ def _gencode(
     if compute_config.use_end2end:
         sgener = ScheduleCodeGen(
             execplan, compute_config.runtime_ngpus,
-            release_pipeline_inputs=bool(compute_config.cpu_offload and compute_config.cpu_offload.release_pipeline_inputs),
+            release_pipeline_inputs=compute_config.release_pipeline_inputs,
         )
 
     actual_codegen_workers = min(codegen_workers, compute_config.runtime_ngpus)

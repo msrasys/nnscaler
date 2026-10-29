@@ -28,6 +28,13 @@ regions save backward-required intermediates as well. Outputs are saved only
 when a consumer needs them. Partial selection inside one recompute region is
 rejected instead of silently splitting its recomputation semantics.
 
+Region selection, saved-activation storage and pipeline input lifetime are
+independent features. A policy declares eligible regions; `CPUOffloadConfig`
+controls transfer, prefetch and host budgets. `ComputeConfig.release_pipeline_inputs`
+controls executor ownership even when CPU offload is disabled. Eligibility does
+not force a copy: storage still retained by the executor is skipped by default,
+and normal layout, size and budget checks still apply.
+
 ## Transfer and lifetime
 
 A selected region collects saved tensors and submits copies at its boundary on
@@ -47,7 +54,7 @@ autograd nodes, boundary inputs or their gradients.
 
 ### Experimental pipeline input release
 
-`CPUOffloadConfig(release_pipeline_inputs=True)` lets a generated pipeline
+`ComputeConfig(..., release_pipeline_inputs=True)` lets a generated pipeline
 schedule replace selected input variables with weak identity references after
 their final data read. The executor captures dInput in a small autograd boundary
 with an empty anchor instead of retaining a detached input leaf. Saved-tensor
@@ -56,12 +63,33 @@ it. No tensor's data pointer, shape or storage is modified to force reclamation.
 The gradient target owns its data and follows the leaf-gradient layout contract;
 an expanded incoming cotangent is not handed back as a borrowed input gradient.
 
-An outer eager graph can register an input-gradient callback with
-`release_input=True` before forward. That registration holds a weak input
-identity and can invoke `on_data_release` at the generated final-read marker.
-The callback must retain its own required autograd edge; a saved tensor value
-still owned by autograd remains live. Weak registrations use identity objects
-so tensor-id reuse cannot redirect an older callback to a newer tensor.
+An outer eager graph uses the generic executor connector before forward:
+
+```python
+from nnscaler.runtime.executor import register_input_backward
+
+register_input_backward(
+    feature,
+    context_factory=backward_context,  # optional factory, e.g. gradient sync
+    on_data_release=drop_feature_references,
+    on_complete=finish_microbatch,
+)
+```
+
+With early release requested, the connector retains a non-leaf's gradient edge
+and invokes `on_data_release` at the generated final-read marker. Leaf tensors
+and older PyTorch without gradient edges stay alive until backward; their early
+release callback is not invoked. `on_complete` runs after successful backward,
+outside the supplied context. Autograd still owns any saved values it needs.
+The lower-level `register_input_grad_callback(..., release_input=True)` remains
+available for custom gradient handling; that callback must retain its own edge.
+Weak registrations use identity objects so tensor-id reuse cannot redirect an
+older callback to a newer tensor.
+
+The old `CPUOffloadConfig.release_pipeline_inputs=True` setting is a deprecated
+alias. Constructing or loading `ComputeConfig` migrates it to the top-level
+field without mutating the caller's CPU config. An explicitly supplied top-level
+boolean takes precedence. New serialized configs store the canonical value.
 
 This option is disabled by default and requires regenerated code. It applies
 to ordinary pipeline backward, and rejects split input/weight backward. The
@@ -74,11 +102,11 @@ Bridged inputs must remain immutable, and custom operators must support a
 non-leaf input view. Normal alias ownership and CUDA stream lifetimes remain
 intact. Outside references, including a caller's tensor or a Vision callback,
 can still keep the allocation alive. This does not promise that every pipeline
-input will leave the GPU. Runtime/code-generation regressions pass, including a
-16 MiB CUDA ownership check with exact gradients. Real Attention/MoE PP2/VPP4
-checks pass with actual input-reference use on both ranks, including the combined
-save-event/copy-stream/size-gap configuration. Full-model performance measurements
-are still required before recommending this option.
+input will leave the GPU. The preceding implementation passed CUDA ownership,
+PP/VPP and full-model checks. The October 29 API separation has CPU coverage for
+configuration migration, code generation with offload/lifetime independently
+enabled, outer backward and ownership. GPU and performance validation of this
+refactor is pending; earlier measurements do not validate the new revision.
 
 ## Immutability contract
 

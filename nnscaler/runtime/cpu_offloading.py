@@ -49,9 +49,9 @@ class CPUOffloadConfig:
     # Custom asynchronous producers must join the saving stream before save;
     # this option cannot infer producer completion from a tensor's allocation.
     use_save_events: bool = False
-    # Opt-in pipeline input identities/gradient slots, allowing an input's
-    # storage to disappear after its final scheduled data read. Split input /
-    # weight backward is not supported by this option.
+    # Deprecated constructor/serialized-config alias. ComputeConfig migrates
+    # this to its independent release_pipeline_inputs field and clears it here.
+    # The activation store never uses this flag to select regions or transfers.
     release_pipeline_inputs: bool = False
     # Leave headroom for the dataloader, optimizer, compilation and other ranks.
     host_reserve_bytes: int = 32 * 1024**3
