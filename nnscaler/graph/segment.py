@@ -1363,6 +1363,12 @@ class IRSegmentExpander:
         if not ctensors:
             return None
 
+        # Narrow only spatial partitions; partial values must be handled by
+        # intra-segment adapters, not exposed through the segment boundary.
+        # TODO: Consider allow this when we find a real gain in narrowing partial values
+        if any(ct.valmap != (0, 1) for ct in ctensors):
+            return None
+
         full_indmap = tuple((0, s) for s in ftensor.shape)
         if any(ct.indmap == full_indmap for ct in ctensors):
             # Some ops directly consume the full tensor — can't narrow
@@ -1412,6 +1418,12 @@ class IRSegmentExpander:
         # pass through without any internal production, e.g., input of segment.
         # Here we treat Identity as a normal operator, and we don't trace through it to find the actual production pattern.
         if not ptensors:
+            return None
+
+        # Keep value reduction inside the segment, even when moving it outside
+        # could fuse an all-reduce and a spatial split into reduce-scatter.
+        # TODO: Consider allow this when we find a real gain in narrowing partial values
+        if any(pt.valmap != (0, 1) for pt in ptensors):
             return None
 
         dev_partitions: Dict[int, List[IRSubTensor]] = {}
