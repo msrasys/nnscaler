@@ -1,5 +1,89 @@
 # CPU activation offloading
 
+The October 30 store/adapter refactor has CPU regression coverage; its CUDA
+correctness suite and independent transfer probes are queued behind the current
+GPU job. Full-model numbers linked below measure the October 29 implementation.
+
+The [storage architecture](activation_store_design.md) separates host memory,
+CUDA transport, saved-value ownership and graph/autograd adapters. An explicit
+`ActivationStore` also supports values retained for a later forward consumer:
+
+```python
+from nnscaler.runtime.activation_store import ActivationStore
+from nnscaler.runtime.activation_config import CPUOffloadConfig
+
+store = ActivationStore(CPUOffloadConfig(max_cpu_bytes=8 * 1024**3), device='cuda')
+with store.batch() as batch:
+    saved = batch.save(activation)
+del activation                         # drop this owner's original payload
+# Other independent computation can run here.
+saved.prefetch()                        # bounded, nonblocking request
+activation = saved.load()               # joins readiness on the consumer stream
+output = consume(activation)            # ordinary forward, with gradients preserved
+del activation
+saved.evict()                           # drop the store's restored GPU reference
+# A later consumer may prefetch/load again from the immutable CPU copy.
+saved.release()                         # last use of this handle; idempotent
+output.sum().backward()
+store.close()                           # only after all this store's saves are released
+```
+
+`load()` preserves ordinary autograd connectivity when `save()` ran with gradient
+tracking enabled. `no_grad` saves are data-only. `release()` leaves already loaded
+tensors and their gradient edges valid, and rejects future handle access. `evict()`
+does not copy back to CPU: loaded values are immutable, so the existing host copy
+remains authoritative. Aliased handles share one storage record. Re-saving a
+restored view in the same store reuses that record; repeated eviction checks
+versions of still-live older restored views as well.
+
+An external tensor alias or an autograd save by a producer/consumer can still
+retain the allocation. Leaf gradient accumulation also retains its leaf. For an
+automatic NNScaler graph, use the region and lifecycle adapters below; arbitrary
+Python caches must explicitly keep handles in place of tensors. This API is not
+a transparent replacement for all tensors inside traced Python code. Custom
+operators still need the immutable/version-counter contract below.
+
+Plain PyTorch code can put autograd saves into the same store as explicit handles:
+
+```python
+with store.saved_tensors(exclude=(*model.parameters(), *model.buffers())) as saved:
+    activation = model(inputs)
+    handle = store.save(activation)
+del activation
+# The producer's own saved values can now use CPU handles as well.
+saved.prefetch()  # optional, at a caller-selected point before backward
+```
+
+The saved-tensor adapter preserves parameter/buffer views through `exclude` and
+shares an already active `store.batch()` when present. Its data tokens do not
+create gradient anchors; explicit forward handles do. Both adapters share the
+same hook cleanup path, including exceptions and disabled cyclic GC.
+
+`saved.status()` reports logical residency and original-storage ownership;
+`store.residency_reason(tensor)` explains static eligibility. `store.snapshot()`
+reports managed records and the shared pool, without counting one allocation
+twice through aliases. Its logical residency excludes pending CUDA frees and
+allocator cache; use PyTorch allocated/reserved counters for physical peaks.
+Closing one store does not close the process pool used by other stores.
+
+Observation is opt-in and bounded, without patching runtime methods:
+
+```python
+with store.trace(max_events=10000) as trace:
+    # save / prefetch / load / evict / release
+    ...
+metadata = trace.to_dict()  # scalar metadata; includes dropped_events
+```
+
+Run `benchmark/benchmark_activation_store.py --output /tmp/store-probe.json`
+on an exclusively reserved GPU after initializing the CUDA environment. The
+probe compares direct copies, store round trips and equal-work serial/overlapped
+schedules. Tensor size/count, transfer windows and compute duration are explicit
+arguments. Source creation, validation and the diagnostic trace are excluded
+from measured samples. The probe caps payload and CPU memory and rejects an
+existing output file. Compare the same transferred bytes; a residency fallback
+must not be presented as faster transfer bandwidth.
+
 Select saved activations independently of the parallel layout:
 
 ```python
@@ -115,7 +199,7 @@ PP/VPP and full-model checks. The October 29 API separation has CPU coverage for
 configuration migration, code generation with offload/lifetime independently
 enabled, outer backward and ownership. The refactor has since passed runtime,
 PP/VPP and Vision GPU correctness checks.
-The modular paths also passed full-model 64-step local VL comparisons; see the
+The October 29 implementation passed full-model 64-step local VL comparisons; see the
 [application benchmark report](https://github.com/msrallm/llm-train/blob/yileiyang/cpu_offloading/docs/activation-offload-results/20261029/FINAL_REPORT.md)
 for the tested configurations and CPU/GPU measurements.
 

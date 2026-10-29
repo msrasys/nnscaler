@@ -693,7 +693,7 @@ def test_resident_saved_tensor_contract_on_cpu(change):
 
 def test_version_tracker_does_not_retain_activation_storage():
     import weakref
-    from nnscaler.runtime.cpu_offloading import _version_tracker
+    from nnscaler.runtime.activation_store import _version_tracker
     x = torch.ones(32)
     tracker = _version_tracker(x.t())
     storage = weakref.ref(x.untyped_storage())
@@ -927,7 +927,7 @@ def test_parameter_reinterpreted_dtype_view_stays_resident():
 def test_host_headroom_falls_back_without_pinned_allocation(monkeypatch):
     import nnscaler.runtime.cpu_offloading as offload
     module = OffloadModule(host_reserve_bytes=1)
-    monkeypatch.setattr(offload, 'available_host_bytes', lambda: 0)
+    monkeypatch.setattr('nnscaler.runtime.activation_memory.available_host_bytes', lambda: 0)
     x = torch.randn(64, 64, device='cuda', requires_grad=True)
     with module.cpu_offloading_hooks():
         y = x.sin()
@@ -982,7 +982,7 @@ def test_process_budget_survives_sequential_module_instances():
 def test_rounded_pinned_capacity_reuses_larger_requests_only_after_event(monkeypatch):
     import nnscaler.runtime.cpu_offloading as offload
     original_empty = torch.empty
-    monkeypatch.setattr(offload, 'available_host_bytes', lambda: 1024**4)
+    monkeypatch.setattr('nnscaler.runtime.activation_memory.available_host_bytes', lambda: 1024**4)
     monkeypatch.setattr(offload.torch, 'empty',
                         lambda size, **kw: original_empty(size, dtype=torch.uint8))
     small = offload._OffloadPool(CPUOffloadConfig(max_cpu_bytes=200000, host_reserve_bytes=0))

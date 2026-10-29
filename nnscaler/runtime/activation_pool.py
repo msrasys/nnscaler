@@ -4,7 +4,7 @@ from dataclasses import dataclass
 
 import torch
 
-from nnscaler.runtime.cpu_offloading import _OffloadPool, available_host_bytes
+from nnscaler.runtime.activation_memory import _OffloadPool, available_host_bytes
 
 
 @dataclass(eq=False)
