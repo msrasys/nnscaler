@@ -172,7 +172,7 @@ and the all-to-all never run at the same time and the copies drain in the
 compute windows between them.  llm-train wraps DeepEP dispatch/combine and the
 torch all-to-all fallback (`arch/offload_hooks.py`).  Copies can be split with
 `CPU_OFFLOADING_COPY_CHUNK_MB` so the wait at region entry is short;
-`CPU_OFFLOADING_COMM_EXCLUSIVE=0` disables the mechanism, `=2` is a soft
+The windows are off by default; `CPU_OFFLOADING_COMM_EXCLUSIVE=1` enables the strict mechanism, `=2` is a soft
 variant in which the window never waits for copies (copies merely avoid
 starting inside it).  `comm_windows` in the stats counts the regions per step.
 
@@ -211,3 +211,36 @@ large models, while offloading whole blocks of an MoE model can saturate the
 link in the cooldown phase (every step is backward-only there).  Mixing is the
 intended usage: recompute the cheap, large-footprint pieces (RMSNorm, SwiGLU,
 MoE activation), offload the expensive ones (attention, expert FC1 inputs).
+
+## Measurements and when to use the feature
+
+8x B200, YOCO-MoE-15B-A6B-L4, PP2 x EP4, interleaved 1F1B, 8 micro-batches,
+steps 6-20 mean, rank 0:
+
+| configuration | seq | step (s) | peak (GB) |
+| --- | ---: | ---: | ---: |
+| no recompute, no offload | 8k | 4.06 | 162.8 |
+| recompute MoE only (ceiling for attention offload) | 8k | 4.60 | 95.1 |
+| recompute attention + MoE (production) | 8k | 4.96 | 67.3 |
+| attention kernel offload + recompute the rest, copies disabled (A/B) | 8k | 5.08 | 83.2 |
+| attention kernel offload + recompute the rest | 8k | 6.58 | 77.2 |
+| same with strict communication windows | 8k | 7.11 | 77.2 |
+| production | 16k | 8.86 | 99.9 |
+| attention kernel offload + recompute the rest | 16k | 12.58 | 119.5 |
+
+Loss trajectories are identical across configurations.  Framework overhead is
+about 0.1 s/step, copies run at 36-54 GB/s and no reload ever stalls the
+compute stream; the remaining gap is the interaction between PCIe copies and
+the expert-parallel all-to-all described above.  On this hardware and model,
+attention offload cannot beat attention recompute, whose whole cost is 0.36
+s/step at 8k.
+
+Offloading pays off when the recomputed work is expensive relative to the
+bytes it saves *and* the GPUs do not run an NVLink all-to-all in every layer
+at the same time: long sequences on dense or context-parallel models, models
+whose attention is a large fraction of the step, or expert parallelism that
+does not share the GPUs with the copies.  Before committing to it on a new
+configuration, run `CPU_OFFLOADING_FAKE_COPY=1` to measure the ceiling and the
+real run to measure the loss; `offload_stall_s`, `offload_d2h_s` and
+`offload_h2d_s` tell whether the gap is scheduling (fixable with prefetch
+depth) or transport (not).
