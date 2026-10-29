@@ -380,6 +380,7 @@ class Bucket:
         self._group = group
         self._wsz: int = torch.distributed.get_world_size(group=self._group)
         self._async_param_cnt: int = 0  # flag for triggering async communication
+        self._async_seen_param_cnt: Dict[torch.nn.Parameter, int] = {}
         self._async_handle = None  # asynchrounous communication handler
         self._hooks: List[Tuple[Any, RemovableHandle]] = []
         self._params_with_grad: Set[torch.nn.Parameter] = set()
@@ -561,6 +562,21 @@ class Bucket:
         @torch.no_grad()
         def post_grad_hook(param: torch.nn.Parameter, *unused): # pragma: no cover
             # stream = DeviceGroup().get_stream('reducer')
+            if self._async and (self._grad_accumulation_steps or not RuntimeFlag.skip_reducer):
+                # Segment counts are registered once during module initialization.
+                # An extra contribution from one parameter cannot replace a
+                # missing contribution from another in the same bucket. Check
+                # before writing to a buffer that may already be reducing.
+                num_segments = self._reducer._param_num_segments[param]
+                expected = (self._grad_accumulation_steps or 1) * num_segments
+                seen = self._async_seen_param_cnt.get(param, 0) + 1
+                if seen > expected:
+                    raise RuntimeError(
+                        f"Async reducer parameter at bucket offset {self._pofset[param]} "
+                        f"received {seen} gradient contributions, expected {expected}. "
+                        "Check gradient accumulation and the parameter's registered num_segments."
+                    )
+                self._async_seen_param_cnt[param] = seen
             if self._use_none_grad:
                 self._params_with_grad.add(param)
             ofst = self._pofset[param]
@@ -822,6 +838,7 @@ class Bucket:
     def reset(self):
         """Reset status."""
         self._async_param_cnt = 0
+        self._async_seen_param_cnt.clear()
         self._async_handle = None
         self._params_with_grad.clear()
 
@@ -872,6 +889,7 @@ class Bucket:
         state.pop(fields._group, None)
         state.pop(fields._async_handle, None)
         state.pop(fields._async_param_cnt, None)
+        state.pop(fields._async_seen_param_cnt, None)
         state.pop(fields._params_with_grad, None)
         state.pop(fields._zero_subgroup, None)
         state.pop(fields._zero_crossgroup, None)
@@ -894,6 +912,7 @@ class Bucket:
         bucket = object.__new__(cls)
         bucket.__dict__.update(state)
         bucket._reducer = reducer
+        bucket._async_seen_param_cnt = {}
         set_fparam_meta(bucket._param_for_optimizer, bucket._flatten_param_info)
 
         for param in bucket._params:
