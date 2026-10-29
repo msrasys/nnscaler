@@ -172,8 +172,20 @@ and the all-to-all never run at the same time and the copies drain in the
 compute windows between them.  llm-train wraps DeepEP dispatch/combine and the
 torch all-to-all fallback (`arch/offload_hooks.py`).  Copies can be split with
 `CPU_OFFLOADING_COPY_CHUNK_MB` so the wait at region entry is short;
-`CPU_OFFLOADING_COMM_EXCLUSIVE=0` disables the mechanism.  `comm_windows` in
-the stats counts the regions per step.
+`CPU_OFFLOADING_COMM_EXCLUSIVE=0` disables the mechanism, `=2` is a soft
+variant in which the window never waits for copies (copies merely avoid
+starting inside it).  `comm_windows` in the stats counts the regions per step.
+
+Measured on the 8x B200 node with attention-kernel offload (58 GB/step): the
+strict window brings `intranode::dispatch` back to 1.3 ms, but the compute
+stream then spends 5-6 s per 20 s waiting at window entries (576 windows per
+step, one every ~16 ms, versus 5 ms per 200 MB copy), and the step gets slower
+(7.11 s) than with copies overlapping the all-to-all (6.58 s) or than
+attention recompute (4.96 s).  With an all-to-all in every layer there is not
+enough copy-free compute time between windows for 2.75 s of copy-engine work
+per step.  PCIe activation offload therefore does not pay off for this
+MoE/EP configuration; it needs either far fewer bytes, or models without an
+intranode all-to-all in every layer.
 
 ## Sizing against the link
 

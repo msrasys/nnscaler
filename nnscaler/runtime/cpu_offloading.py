@@ -43,8 +43,10 @@ Everything is configurable through environment variables (read once):
                                    3 = real D2H and H2D; in 2/3 the tensors
                                    stay on the GPU (A/B tests for overheads)
 ``CPU_OFFLOADING_COPY_CHUNK_MB``   split copies into chunks of this size (0 = off)
-``CPU_OFFLOADING_COMM_EXCLUSIVE``  0 disables the communication-exclusive windows
-                                   requested through ``comm_exclusive()``
+``CPU_OFFLOADING_COMM_EXCLUSIVE``  communication windows requested through
+                                   ``comm_exclusive()``: 0 off, 1 strict (default),
+                                   2 soft (copies avoid starting inside a window
+                                   but the window never waits for copies)
 ``CPU_OFFLOADING_MAX_INFLIGHT_COPIES`` memcpys queued per direction (default 0 =
                                    unbounded)
 ``CPU_OFFLOADING_TIMING``          0 disables the CUDA-event based timings
@@ -668,7 +670,11 @@ class OffloadManager:
         # copies larger than this are issued in chunks (0 = whole region)
         self.copy_chunk_bytes = load_int_from_env('CPU_OFFLOADING_COPY_CHUNK_MB', 0) << 20
         # communication-exclusive windows (see comm_exclusive)
-        self.comm_exclusive_enabled = load_int_from_env('CPU_OFFLOADING_COMM_EXCLUSIVE', 1) != 0
+        # 0: off. 1: strict (compute waits for in-flight copies before the
+        # window, new copies wait for its end). 2: soft (only the second half:
+        # the window never waits, copies merely avoid starting inside it).
+        self.comm_exclusive_mode = load_int_from_env('CPU_OFFLOADING_COMM_EXCLUSIVE', 1)
+        self.comm_exclusive_enabled = self.comm_exclusive_mode != 0
         self._comm_barrier: Optional[torch.cuda.Event] = None
         self._comm_depth = 0
         # GPU-side timing with CUDA events; cheap, on by default.
@@ -806,10 +812,11 @@ class OffloadManager:
             return
         current = torch.cuda.current_stream()
         with self._copy_lock:
-            for stream in (self.d2h_stream, self.h2d_stream):
-                marker = torch.cuda.Event()
-                marker.record(stream)
-                current.wait_event(marker)
+            if self.comm_exclusive_mode == 1:
+                for stream in (self.d2h_stream, self.h2d_stream):
+                    marker = torch.cuda.Event()
+                    marker.record(stream)
+                    current.wait_event(marker)
             # copies issued from now on wait for the end of the region; record
             # a provisional barrier at the start so nothing slips in between
             barrier = torch.cuda.Event()
