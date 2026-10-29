@@ -1073,6 +1073,46 @@ def test_group_submission_does_not_wait_for_its_own_d2h():
 
 
 @cuda
+def test_transfer_backpressure_occurs_after_forward_submission(monkeypatch):
+    module = OffloadModule(max_inflight_bytes=16384)
+    manager = module._get_activation_offload_manager()
+    x = torch.randn(64, 64, device='cuda', requires_grad=True)
+    submitted = False
+    original = manager.throttle
+    calls = []
+    def throttle(size):
+        assert submitted, 'Transfer admission must not prevent forward submission'
+        calls.append(size)
+        original(size)
+    monkeypatch.setattr(manager, 'throttle', throttle)
+    with module.cpu_offloading_hooks():
+        y = (x + 1).sin().cos()
+        submitted = True
+    assert calls == [0]  # One admission for the complete batch, never per tensor.
+    assert manager.inflight_bytes <= module.compute_config.cpu_offload.max_inflight_bytes + 2*x.numel()*x.element_size()
+    y.sum().backward()
+
+
+@cuda
+def test_a_budget_rejected_batch_does_not_wait_for_unrelated_queued_copies():
+    module = OffloadModule(max_cpu_bytes=16384, max_inflight_bytes=16384)
+    manager = module._get_activation_offload_manager()
+    class Pending:
+        def query(self):
+            return False
+        def synchronize(self):
+            raise AssertionError('No new copies are admitted; existing copies need not block computation')
+    manager.inflight.append((32768, Pending()))
+    manager.inflight_bytes = 32768
+    x = torch.randn(128, 128, device='cuda', requires_grad=True)
+    with module.cpu_offloading_hooks():
+        y = x.sin()
+    y.sum().backward()
+    torch.testing.assert_close(x.grad, x.cos(), rtol=0, atol=0)
+    assert module.activation_offload_stats()['d2h_bytes'] == 0
+
+
+@cuda
 def test_group_commit_waits_for_each_producer_stream():
     module = OffloadModule()
     left_stream, right_stream = torch.cuda.Stream(), torch.cuda.Stream()

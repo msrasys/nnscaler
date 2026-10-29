@@ -254,11 +254,14 @@ headroom without requesting cache eviction. The budget is not a bound on
 the entire process, OS allocation overhead, or PyTorch's separate pinned allocator cache. Leave room for
 model construction, optimizer state, dataloaders and other processes.
 
-`max_inflight_bytes` applies backpressure before the next offload region starts,
-waiting for older events until queued source bytes are at or below the threshold.
-A region then submits its whole batch without host synchronization between copies.
+`max_inflight_bytes` applies backpressure before a new transfer batch is submitted,
+after forward computation has been enqueued and live saves have obtained host
+buffers. Empty or budget-rejected batches do not wait. Older transfer events bring
+queued source bytes at or below the threshold, then the whole batch is submitted
+without host synchronization between copies. Computation can overlap that wait.
 The queue can exceed the threshold by one group, and the current region also has
-its normal compute/staging allocations. Producer streams are captured during save
+its normal compute/staging allocations. These workspaces may overlap the prior
+batch; this threshold is not a bound on total GPU memory. Producer streams are captured during save
 and joined once per stream at group commit. `max_prefetch_bytes` bounds speculative
 GPU copies, not activations already demanded by backward. A storage larger than
 that cap is loaded on demand. `prefetch_groups=0` disables speculative requests.

@@ -512,8 +512,8 @@ class _OffloadGroup:
         self.manager.pool.stats['saved_tensor_event_records'] += 1
 
     def commit(self):
-        # Admit before a region starts, then enqueue its whole batch without
-        # host waits between copies. Wait once for each producing stream.
+        # Select live saves, then let transport admission enqueue one whole
+        # batch without host waits between its copies.
         manager = self.manager
         pending = []
         for record in self.pending:
@@ -525,27 +525,13 @@ class _OffloadGroup:
                 # for this record, so its staging reference must not cause DMA.
                 manager.pool.stats['discarded_save_bytes'] += record.size
                 manager.pool.stats['discarded_save_storages'] += 1
-        # Finish host allocation before starting the batch of DMA submissions.
-        # Cold pinned allocations must not create gaps between its copies.
-        pending = [record for record in pending if record.prepare_offload()]
-        producers = {record.producer_stream.cuda_stream: record.producer_stream
-                     for record in pending}
-        for stream in producers.values():
-            event = (self.producer_events or {}).get(stream.cuda_stream)
-            if event is None:
-                manager.d2h_stream.wait_stream(stream)
-            else:
-                manager.d2h_stream.wait_event(event)
-        # CUDA owns the dependencies once waits are enqueued. Do not keep
-        # producer event objects alive in scope/group cycles until backward;
-        # transfer-completion events on each record remain intact.
-        self.producer_events = None
-        copied = sum(bool(record.offload()) for record in pending)
-        if copied:
-            manager.pool.stats['d2h_committed_groups'] += 1
-            manager.pool.stats['peak_queued_d2h_bytes'] = max(
-                manager.pool.stats['peak_queued_d2h_bytes'], manager.inflight_bytes)
-        self.pending.clear()
+        try:
+            manager.offload_batch(pending, self.producer_events)
+        finally:
+            # CUDA owns enqueued dependencies. Neither events nor staging
+            # references should be retained by a completed/failed group.
+            self.producer_events = None
+            self.pending.clear()
 
     def has_offloaded_records(self):
         return any((record := ref()) is not None and record.d2h_event is not None
@@ -638,8 +624,8 @@ class ActivationOffloadManager:
         self.inflight_bytes = 0
 
     def throttle(self, size):
-        # Called at region admission. A single group may exceed the threshold;
-        # the next group cannot start until older queued bytes fall below it.
+        # Called before admitting a transfer batch. A complete batch may exceed
+        # the threshold; subsequent copies wait, while computation can progress.
         while self.inflight and self.inflight[0][1].query():
             nbytes, _ = self.inflight.popleft()
             self.inflight_bytes -= nbytes
@@ -648,6 +634,31 @@ class ActivationOffloadManager:
             event.synchronize()
             self.inflight_bytes -= nbytes
             self.pool.stats['d2h_throttles'] += 1
+
+    def offload_batch(self, records, producer_events=None):
+        """Admit and enqueue one batch after its forward computation is submitted.
+
+        Finish host allocation before DMA so a batch has no allocation gaps.
+        Empty/budget-rejected batches incur no transfer backpressure. Queue
+        bytes remain bounded by the threshold plus one complete batch; current
+        forward workspaces are separate, as they are for any asynchronous copy.
+        """
+        records = [record for record in records if record.prepare_offload()]
+        if not records:
+            return
+        self.throttle(0)
+        producers = {record.producer_stream.cuda_stream: record.producer_stream for record in records}
+        for stream in producers.values():
+            event = (producer_events or {}).get(stream.cuda_stream)
+            if event is None:
+                self.d2h_stream.wait_stream(stream)
+            else:
+                self.d2h_stream.wait_event(event)
+        copied = sum(bool(record.offload()) for record in records)
+        if copied:
+            self.pool.stats['d2h_committed_groups'] += 1
+            self.pool.stats['peak_queued_d2h_bytes'] = max(
+                self.pool.stats['peak_queued_d2h_bytes'], self.inflight_bytes)
 
     @contextmanager
     def scope(self, key=None, immediate_backward=False, backward_distance=None):
@@ -758,9 +769,6 @@ class CPUOffloadContext:
         self._scope_context = self.manager.scope()
         scope = self._scope_context.__enter__()
         try:
-            if (torch.is_grad_enabled() and not scope.keep_resident
-                    and not (self.tail and scope.immediate_backward)):
-                self.manager.throttle(0)
             self.group = _OffloadGroup(scope)
             self._hooks = saved_tensors_hooks(self._pack, self._unpack)
             self._hooks.__enter__()
