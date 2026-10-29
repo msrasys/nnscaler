@@ -26,6 +26,9 @@ class RetracedModel(nn.Module):
         self.fc1 = nn.Linear(4, 4)
         self.fc2 = nn.Linear(4, 4)
         self.scale = nn.Parameter(torch.tensor(1.0))
+        # With two ZeRO-3 ranks this exercises a partly padded final chunk;
+        # the scalar above also exercises a rank containing only padding.
+        self.output_scale = nn.Parameter(torch.ones(3))
         self.register_buffer('offset', torch.ones(4))
         self.register_buffer('scalar_offset', torch.tensor(0.5))
 
@@ -36,7 +39,7 @@ class RetracedModel(nn.Module):
         if self.extra_op:
             x = x + 0.0
         output = self.fc2(nn.functional.relu(self.fc1(x + self.offset)))
-        output = output * self.scale + self.scalar_offset
+        output = output * self.scale * self.output_scale.mean() + self.scalar_offset
         return nn.functional.mse_loss(output, data['target'])
 
 
@@ -145,6 +148,7 @@ def _checkpoint_restart_worker(savedir, plan_ngpus, use_zero, save_type, phase, 
         optimizer.load_state_dict(merged['optimizer'])
         assert merged['model']['scale'].shape == merged['model']['scalar_offset'].shape == torch.Size([])
         assert optimizer.state[eager.scale]['exp_avg'].shape == torch.Size([])
+        assert optimizer.state[eager.output_scale]['exp_avg'].shape == torch.Size([3])
         if legacy_scalars:
             legacy_dir = savedir / 'legacy'
             legacy_dir.mkdir()

@@ -890,7 +890,8 @@ class CubeModule(torch.nn.Module):
             return all(bucket_state[key].shape == bucket_state[opt_state_keys[0]].shape
                         for key in opt_state_keys)
 
-        def _retrieve_param_opt_state(bucket_states, pstart, pend, pshape, bucket_size, zero_version):
+        def _retrieve_param_opt_state(bucket_states, pstart, pend, pshape, bucket_size, zero_version,
+                                      zero3_ranges=None):
             assert bucket_size % len(bucket_states) == 0
             for other in bucket_states[1:]:
                 if other.keys() != bucket_states[0].keys():
@@ -932,36 +933,65 @@ class CubeModule(torch.nn.Module):
                             opt_states_1d[key][offset:] = bucket_states[end_rank_id][key][:end_offset]
             else:  # zero_version == 3
                 assert zero_version > 1, f'unsupported zero version {zero_version}'
+                param_numel = math.prod(pshape)
+                chunk_size = pend - pstart
+                if zero3_ranges is None:
+                    # Legacy metadata describes one ZeRO subgroup, including
+                    # ranks whose entire chunk is padding. Never wrap those
+                    # ranks around to the beginning of the real parameter.
+                    zero3_ranges = [(rank * chunk_size, min((rank + 1) * chunk_size, param_numel))
+                                    for rank in range(len(bucket_states))]
+                for start, end in zero3_ranges:
+                    if (start < 0 or end != min(start + chunk_size, param_numel)):
+                        raise ValueError(f'Invalid ZeRO-3 optimizer state range {(start, end)} for shape {pshape}')
+                ordered_states = sorted(zip(zero3_ranges, bucket_states), key=lambda item: item[0])
                 for key in opt_state_keys:
-                    fill_start = 0
-                    fill_len = pend - pstart
-                    param_numel = opt_states_1d[key].numel()
-                    for bstate in bucket_states:
-                        if fill_start >= param_numel:
-                            # from current implementation, code never goes here
-                            # because we have used model_idx2opt_idx to filter out unnecessary ranks
-                            # but let's keep the logic here for safety
-                            fill_start = fill_start % param_numel
-                            if fill_start + fill_len > param_numel:
-                                fill_len = param_numel - fill_start
-                            # check consistency for the already filled part
-                            if not cls._safe_tensor_equal(
-                                opt_states_1d[key][fill_start: fill_start + fill_len],
-                                bstate[key][pstart: pstart+fill_len]
-                            ):
-                                raise ValueError(f"Conflict in merging optimizer state for param with shape {pshape}")
-                        else:
-                            if fill_start + fill_len > param_numel:
-                                fill_len = param_numel - fill_start
-                            # remove padding part
-                            opt_states_1d[key][fill_start: fill_start + fill_len] = bstate[key][pstart: pstart+fill_len]
-                        fill_start += fill_len
+                    covered_end = 0
+                    for (start, end), bstate in ordered_states:
+                        if bstate[key].ndim != 1 or not 0 <= pstart <= pend <= bstate[key].numel():
+                            raise ValueError('Invalid ZeRO-3 optimizer state bucket size')
+                        if start >= param_numel:
+                            continue  # this rank holds only padding for this parameter
+                        if start > covered_end:
+                            raise ValueError(f'Incomplete optimizer state for param with shape {pshape}')
+                        overlap_end = min(end, covered_end)
+                        if start < overlap_end and not cls._safe_tensor_equal(
+                            opt_states_1d[key][start:overlap_end],
+                            bstate[key][pstart:pstart + overlap_end - start],
+                        ):
+                            raise ValueError(f'Conflict in merging optimizer state for param with shape {pshape}')
+                        if end > covered_end:
+                            opt_states_1d[key][covered_end:end] = bstate[key][pstart + covered_end - start:pstart + end - start]
+                            covered_end = end
+                    if covered_end != param_numel:
+                        raise ValueError(f'Incomplete optimizer state for param with shape {pshape}')
 
             if 'step' in bucket_states[0]:
                 # make sure all steps are different tensors (with same value)
                 step = bucket_states[0]['step']
                 opt_states['step'] = step.cpu().clone() if isinstance(step, torch.Tensor) else step
             return opt_states
+
+        zero3_layouts = {}
+
+        def _zero3_layout(rank):
+            # Index once per rank, including buffers in neither parameter
+            # positions nor shard identity. This also works before #125's
+            # separate optimizer traversal optimization.
+            if rank not in zero3_layouts:
+                metadata = zero_idx_maps[rank][3] if len(zero_idx_maps[rank]) == 4 else None
+                if metadata is None:
+                    zero3_layouts[rank] = None
+                else:
+                    order, by_shard = [], {}
+                    for name, meta in fullmaps[rank].items():
+                        if meta.is_param:
+                            identity = (meta.orig_name, tuple((s.start, s.stop, s.step) for s in meta.slicers))
+                            order.append(identity)
+                            info = metadata.get(name)
+                            by_shard[identity] = Zero3AttrMeta(**info) if isinstance(info, dict) else info
+                    zero3_layouts[rank] = order, by_shard
+            return zero3_layouts[rank]
 
         def _merge_opt_zero(param_shape, worker_idx, param_idx):
             if len(zero_idx_maps[worker_idx]) == 4:
@@ -992,13 +1022,26 @@ class CubeModule(torch.nn.Module):
                     raise ValueError(f'Inconsistent optimizer state for bucket {opt_idx}: '
                                      f'expected ranks {ranks}')
                 bucket_states = [optim_state_dicts[rank]['state'][opt_idx] for rank in ranks]
+                zero3_ranges = None
+                if zero_version > 1:
+                    layouts = [_zero3_layout(rank) for rank in ranks]
+                    if any(layout is not None for layout in layouts):
+                        source_layout = _zero3_layout(worker_idx)
+                        if source_layout is None or any(layout is None for layout in layouts):
+                            raise ValueError('Incomplete ZeRO-3 optimizer state metadata')
+                        identity = source_layout[0][param_idx]
+                        infos = [layout[1].get(identity) for layout in layouts]
+                        if any(info is None or info.chunk_size != pend - pstart for info in infos):
+                            raise ValueError('Inconsistent ZeRO-3 optimizer state metadata')
+                        zero3_ranges = [(info.start, info.end) for info in infos]
                 return _retrieve_param_opt_state(
                     bucket_states,
                     pstart,
                     pend,
                     param_shape,
                     bucket_size,
-                    zero_version
+                    zero_version,
+                    zero3_ranges,
                 )
 
         # full_index: param IDs in the full optimizer state
