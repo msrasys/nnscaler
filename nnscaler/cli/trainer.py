@@ -625,12 +625,34 @@ class Trainer:
         ram_gb_used = psutil.virtual_memory().used / 1024 / 1024 / 1024
         torch.cuda.reset_peak_memory_stats()
 
-        self.log_metrics({
+        metrics = {
             'cuda_gb_allocated': cuda_gb_allocated,
             'cuda_gb_reserved': cuda_gb_reserved,
             'cuda_gb_free': cuda_gb_free,
             'ram_gb_used': ram_gb_used,
-         }, tag=tag)
+        }
+        metrics.update(self._offload_mem_stats())
+        self.log_metrics(metrics, tag=tag)
+
+    @staticmethod
+    def _offload_mem_stats() -> Dict[str, float]:
+        """Per-step CPU offloading figures; empty when nothing was offloaded.
+
+        Taking the snapshot here is also what drives ``profile_every`` reports.
+        """
+        from nnscaler.runtime.cpu_offload import OffloadManager
+        manager = OffloadManager._instance
+        if manager is None or not manager.active():
+            return {}
+        stats = manager.snapshot(reset=True)
+        return {
+            'offload_gb': stats['offloaded_bytes'] / 1024 / 1024 / 1024,
+            'offload_pinned_gb': stats['pool_allocated_bytes'] / 1024 / 1024 / 1024,
+            'offload_stall_s': stats['stall_ms'] / 1000,
+            'offload_d2h_s': stats['d2h_ms'] / 1000,
+            'offload_h2d_s': stats['h2d_ms'] / 1000,
+            'offload_hook_s': stats['pack_seconds'] + stats['commit_seconds'] + stats['unpack_seconds'],
+        }
 
     def _format_metrics(self, epoch_desc, idx, metrics: Dict[str, Union[float,int]]):
         ndigits = len(str(self.total_train_steps_per_epoch))

@@ -550,6 +550,83 @@ def apply_module_recompute(
     )
 
 
+@dataclass(frozen=True)
+class ModuleOffloadResult:
+    """Result of :func:`apply_module_offload`."""
+
+    offload_groups: tuple[tuple[IRFwOperation, ...], ...]
+    recompute_groups: tuple[tuple[IRFwOperation, ...], ...]
+
+    @property
+    def offload_op_count(self) -> int:
+        return sum(len(g) for g in self.offload_groups)
+
+    @property
+    def recompute_op_count(self) -> int:
+        return sum(len(g) for g in self.recompute_groups)
+
+
+def apply_module_offload(
+    graph: IRGraph,
+    offload_types: type[torch.nn.Module] | Iterable[type[torch.nn.Module]],
+    recompute_types: type[torch.nn.Module] | Iterable[type[torch.nn.Module]] = (),
+) -> ModuleOffloadResult:
+    """Offload the tensors saved by each invocation of ``offload_types``; recompute ``recompute_types``.
+
+    Operators are grouped by containing module type and FQN like
+    :func:`apply_module_recompute`.  An operator inside both an offload and a
+    recompute module gets both ids: the recomputed group's checkpoint inputs are
+    offloaded, so with ``offload_types=(Block,)`` and
+    ``recompute_types=(Attention, MoEExpert)`` nothing of the block stays
+    resident.  A recomputed operator that is not inside any offload module
+    splits the surrounding offload group so every group stays contiguous.
+
+    Call before graph partition or replication.
+    """
+    def _types(spec):
+        spec = (spec,) if isinstance(spec, type) else tuple(spec)
+        for t in spec:
+            if not (isinstance(t, type) and issubclass(t, torch.nn.Module)):
+                raise TypeError("module types must be torch.nn.Module subclasses")
+        return spec
+
+    offload_types = _types(offload_types)
+    recompute_types = _types(recompute_types)
+
+    def _match(node, types):
+        for module_type in types:
+            if module_type in node.module_class_chain:
+                return (module_type, node.get_module_fqn(module_type))
+        return None
+
+    offload_groups: list[list[IRFwOperation]] = []
+    recompute_groups: list[list[IRFwOperation]] = []
+    offload_key = recompute_key = None
+    for node in graph.select(ntype=IRFwOperation):
+        hooked = getattr(node, "pre_hook", None) is not None or getattr(node, "post_hook", None) is not None
+        rc = None if hooked else _match(node, recompute_types)
+        off = _match(node, offload_types)
+        if rc is not None:
+            if rc != recompute_key:
+                recompute_groups.append([])
+            recompute_groups[-1].append(node)
+        recompute_key = rc
+        # an operator outside every offload module ends the current offload
+        # group; the next offloaded operator starts a new, contiguous one
+        if off is not None:
+            if off != offload_key:
+                offload_groups.append([])
+            offload_groups[-1].append(node)
+        offload_key = off
+
+    planned_rc = tuple(tuple(g) for g in recompute_groups if len(g) > 1)
+    for group in planned_rc:
+        graph.recompute(list(group))
+    planned_off = tuple(tuple(g) for g in offload_groups if g)
+    for group in planned_off:
+        graph.offload(list(group))
+    return ModuleOffloadResult(offload_groups=planned_off, recompute_groups=planned_rc)
+
 def get_layer_index(fqn: str) -> int:
     """
     Extract the layer index from full qualified name.

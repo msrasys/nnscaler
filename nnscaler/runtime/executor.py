@@ -175,6 +175,8 @@ class _WeightBackwardState:
     param_groups: Optional[List[Dict[str, Any]]] = None
     output_tensors: Optional[Tuple[torch.Tensor, ...]] = None
     output_tensor_grads: Optional[Tuple[Optional[torch.Tensor], ...]] = None
+    # CPU offloading context of the segment execution; released after the weight pass
+    offload_ctx: Any = None
 
 
 class Executor:
@@ -231,7 +233,11 @@ class Executor:
         """
         input_tensors = Executor.sync_tensors(input_tensors)
 
+        from nnscaler.runtime.cpu_offloading import OffloadManager
+        offload_manager = OffloadManager.get()
+
         if not requires_grad:
+            offload_manager.forward_skipped(name)
             with torch.no_grad():
                 outputs = subgraph(*input_tensors)
             return outputs
@@ -247,9 +253,8 @@ class Executor:
         Executor._detach.setdefault(name, []).append(saved_pairs)
 
         # CPU offloading records which offload groups run inside this segment
-        # execution so their backward can be prefetched in the right order.
-        from nnscaler.runtime.cpu_offloading import OffloadManager
-        offload_manager = OffloadManager.get()
+        # execution so their backward can be prefetched in the right order; the
+        # tracker's per-segment queue mirrors ``Executor._detach[name]``.
         offload_ctx = offload_manager.begin_forward(name)
         try:
             outputs = subgraph(*input_dtensors)
@@ -298,6 +303,17 @@ class Executor:
         output_tensor_grads = Executor.sync_tensors(output_tensor_grads)
 
         saved_pairs = Executor._detach[name].pop(0)
+        from nnscaler.runtime.cpu_offloading import OffloadManager
+        offload_manager = OffloadManager.get()
+        offload_ctx = offload_manager.begin_backward(name)
+        try:
+            return Executor._backward_impl(
+                name, saved_pairs, input_tensors, output_tensors, output_tensor_grads)
+        finally:
+            offload_manager.end_backward(offload_ctx)
+
+    @staticmethod
+    def _backward_impl(name, saved_pairs, input_tensors, output_tensors, output_tensor_grads):
         tensor_ids: List[int] = [pair[0] for pair in saved_pairs]
         dtensors: List[torch.Tensor] = [pair[1] for pair in saved_pairs]
         requested_input_tensors = input_tensors
@@ -359,16 +375,12 @@ class Executor:
                 pseudo_free_output_ids.append(id(tensor))
                 backward_roots.append(edge)
 
-        from nnscaler.runtime.cpu_offloading import OffloadManager
-        offload_manager = OffloadManager.get()
-        offload_ctx = offload_manager.begin_backward(name)
         try:
             torch.autograd.backward(
                 backward_roots,
                 grad_tensors=dedup_output_tensor_grads,
             )
         finally:
-            offload_manager.end_backward(offload_ctx)
             for tensor_id in pseudo_free_output_ids:
                 Executor._pseudo_free_grad_edges.pop(tensor_id, None)
                 Executor._pseudo_free_pending_sends.pop(tensor_id, None)
@@ -426,6 +438,8 @@ class Executor:
         weights = tuple(weights)
 
         saved_pairs = Executor._detach[name].pop(0)
+        from nnscaler.runtime.cpu_offloading import OffloadManager
+        offload_ctx = OffloadManager.get().begin_backward(name)
         tensor_ids: List[int] = [pair[0] for pair in saved_pairs]
         dtensors: List[torch.Tensor] = [pair[1] for pair in saved_pairs]
         for tensor in input_tensors:
@@ -440,7 +454,7 @@ class Executor:
 
         if len(output_tensors) == 0:
             Executor._weight_backward_states.setdefault(name, []).append(
-                _WeightBackwardState(param_groups=[])
+                _WeightBackwardState(param_groups=[], offload_ctx=offload_ctx)
             )
             return None
 
@@ -472,6 +486,7 @@ class Executor:
                 _WeightBackwardState(
                     output_tensors=tuple(dedup_output_tensors),
                     output_tensor_grads=tuple(dedup_output_tensor_grads),
+                    offload_ctx=offload_ctx,
                 )
             )
             return None
@@ -489,7 +504,7 @@ class Executor:
             iter(weights),
         )
         Executor._weight_backward_states.setdefault(name, []).append(
-            _WeightBackwardState(param_groups=param_groups)
+            _WeightBackwardState(param_groups=param_groups, offload_ctx=offload_ctx)
         )
 
         assert all(grad is not None for grad in grads), "RuntimeError: got gradient None"
@@ -512,7 +527,14 @@ class Executor:
         if not states:
             raise RuntimeError(f"No pending weight backward for segment {name}.")
         state = states.pop(0)
+        from nnscaler.runtime.cpu_offloading import OffloadManager
+        try:
+            Executor._backward_weight_impl(state, weights)
+        finally:
+            OffloadManager.get().end_backward(state.offload_ctx)
 
+    @staticmethod
+    def _backward_weight_impl(state: _WeightBackwardState, weights: Tuple[torch.nn.Parameter, ...]) -> None:
         if state.param_groups is not None:
             if weights and state.param_groups:
                 stage_backward_weight(weights, state.param_groups)

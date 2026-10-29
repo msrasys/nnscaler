@@ -1238,9 +1238,6 @@ class ParallelModule(CubeModule):
     ATTR_META_FILE = ATTR_META_FILE_PREFIX + '.pkl'
     ATTR_META_FORMAT_VERSION = 1
 
-    _PREFETCH_LEVEL_ENV_VAR = 'CPU_OFFLOADING_PREFETCH_LEVEL'
-    _PREFETCH_LEVEL_DEFAULT = 2
-
     # the rank of the module, will be assigned in the generated subclasses
     rank: int
     # the world size to run this module, will be assigned in the generated subclasses
@@ -1290,8 +1287,6 @@ class ParallelModule(CubeModule):
         self._backward_prefetched_params: dict[torch.nn.Parameter, int] = {}
         # the params that have been prefetched in forward
         self._forward_prefetched_params: set[torch.nn.Parameter] = set()
-        # load the CPU offloading prefetch level from environment variables
-        self.cpu_offloading_prefetch_level = load_int_from_env(self._PREFETCH_LEVEL_ENV_VAR, self._PREFETCH_LEVEL_DEFAULT)
 
     def __init_subclass__(cls, skip_init=False, **kwargs):
         # special case when we just fake a ParallelModule class
@@ -1605,15 +1600,18 @@ class ParallelModule(CubeModule):
 
     def cpu_offloading_hooks(self, group_id: Optional[int] = None) -> 'CPUOffloadContext':
         """
-        Offload activations saved inside the ``with`` block while preserving
-        ``save_params_hooks`` semantics.
+        Offload the activations autograd saves inside the ``with`` block.
+        Parameters and buffers are referenced, not copied (``save_params_hooks``
+        semantics).  Behaviour is governed by ``nnscaler.runtime.cpu_offload``'s
+        configuration, see ``docs/source/cpu_offloading.md``.
 
         Args:
-            group_id (Optional[int]): static offload group id from planning;
-                only used for bookkeeping/diagnostics.
+            group_id (Optional[int]): offload group id assigned by the policy;
+                identifies the group in profiles.
         """
+        # resolved at call time through the public module so tests can observe contexts
         from nnscaler.runtime.cpu_offloading import CPUOffloadContext
-        return CPUOffloadContext(self, self.cpu_offloading_prefetch_level, group_id=group_id)
+        return CPUOffloadContext(self, group_id=group_id)
 
     @classmethod
     def get_attr_meta_map(cls, rank=None):

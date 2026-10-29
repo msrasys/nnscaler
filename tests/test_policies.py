@@ -34,6 +34,7 @@ class _FakeRecomputeNode:
         self.pre_hook = object() if hooked else None
         self.post_hook = None
         self.recompute = None
+        self.offload = None
 
     def get_module_fqn(self, module_type):
         assert module_type in self.module_class_chain
@@ -55,6 +56,11 @@ class _FakeRecomputeGraph:
             group_id = len(self.recompute_calls)
             for node in nodes:
                 node.recompute = group_id
+
+    def offload(self, nodes):
+        self.offload_calls = getattr(self, 'offload_calls', []) + [nodes]
+        for node in nodes:
+            node.offload = len(self.offload_calls)
 
 
 def test_apply_module_recompute_groups_invocations_and_skips_hooks():
@@ -80,6 +86,33 @@ def test_apply_module_recompute_groups_invocations_and_skips_hooks():
     assert result.planned_group_count == result.applied_group_count == 3
     assert result.planned_op_count == result.applied_op_count == 6
     assert result.skipped_hook_ops == 1
+
+
+def test_apply_module_offload_groups_invocations_and_combines_with_recompute():
+    from nnscaler.policies import apply_module_offload
+
+    nodes = [
+        _FakeRecomputeNode(),
+        _FakeRecomputeNode(RecomputeTarget, "blocks.0"),
+        _FakeRecomputeNode(RecomputeTarget, "blocks.0"),
+        _FakeRecomputeNode(),
+        _FakeRecomputeNode(RecomputeTarget, "blocks.1"),
+    ]
+    graph = _FakeRecomputeGraph(nodes)
+
+    result = apply_module_offload(graph, RecomputeTarget, recompute_types=RecomputeTarget)
+    # one offload group per module invocation
+    assert [len(g) for g in result.offload_groups] == [2, 1]
+    assert [n.offload for n in nodes] == [None, 1, 1, None, 2]
+    assert result.offload_op_count == 3
+    # the same module may also be recomputed: both ids end up on the operators;
+    # a single-operator invocation is not worth a checkpoint
+    assert [len(g) for g in result.recompute_groups] == [2]
+    assert nodes[1].recompute is not None and nodes[1].offload == 1
+    assert nodes[4].recompute is None and nodes[4].offload == 2
+    assert result.recompute_op_count == 2
+    with pytest.raises(TypeError):
+        apply_module_offload(graph, object)
 
 
 def test_apply_module_recompute_reports_when_nothing_applies():
@@ -201,6 +234,65 @@ def test_graph_policy_combines_recompute_with_cpu_offload(tmp_path):
         0,
         r'with self\.cpu_offloading_hooks\(\d+\):\n(?:[^\n]*\n)*?\s+\S+ = ckpt\.checkpoint\(',
     )
+
+
+class GatedAct(torch.nn.Module):
+    def __init__(self, hidden_size, intermediate_size):
+        super().__init__()
+        self.gate_proj = torch.nn.Linear(hidden_size, intermediate_size, bias=False)
+        self.act_fn = torch.nn.Tanh()
+
+    def forward(self, x):
+        return self.act_fn(self.gate_proj(x))
+
+
+class GatedFFN(torch.nn.Module):
+    def __init__(self, hidden_size, intermediate_size):
+        super().__init__()
+        self.gated = GatedAct(hidden_size, intermediate_size)
+        self.up_proj = torch.nn.Linear(hidden_size, intermediate_size, bias=False)
+        self.down_proj = torch.nn.Linear(intermediate_size, hidden_size, bias=False)
+
+    def forward(self, x):
+        return self.down_proj(self.gated(x) * self.up_proj(x))
+
+
+class NestedPolicyModule(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.ffn = GatedFFN(4, 8)
+
+    def forward(self, x):
+        x = x * 2
+        x = self.ffn(x)
+        x = x + 3
+        return x
+
+
+def module_offload_graph_policy(graph, cfg):
+    """Offload the whole FFN; recompute its gated activation (its input is then offloaded)."""
+    from nnscaler.policies import apply_module_offload
+    for node in get_pas_ops(graph):
+        graph.assign(node, 0)
+    result = apply_module_offload(graph, offload_types=GatedFFN, recompute_types=GatedAct)
+    assert result.offload_op_count == 5 and result.recompute_op_count == 2
+    assert all(node.offload is not None for group in result.recompute_groups for node in group)
+    return graph
+
+
+@replace_all_device_with('cpu')
+def test_apply_module_offload_combines_with_recompute(tmp_path):
+    parallelize(
+        NestedPolicyModule(),
+        {'x': torch.randn(2, 4)},
+        module_offload_graph_policy,
+        ComputeConfig(1, 1),
+        gen_savedir=tmp_path,
+        load_module=False,
+    )
+    assert _gencode_contains(
+        tmp_path, NestedPolicyModule, 0,
+        r'with self\.cpu_offloading_hooks\(\d+\):\n(?:[^\n]*\n)*?\s+[\w, ]+ = ckpt\.checkpoint\(')
 
 
 def megatron_ffn_policy(graph, cfg):
@@ -537,6 +629,8 @@ def _pipeline_cpu_offload_runtime_worker(tempdir):
     import nnscaler.runtime.cpu_offloading as cpu_offloading
 
     init_distributed()
+    # the toy model's activations are tiny: offload regardless of size
+    cpu_offloading.configure(min_bytes=0, min_backward_distance=0, numa_membind=False)
     model = FnPolicyModuleList(ffn_layers=4)
     parallel_model = parallelize(
         model,
@@ -567,8 +661,8 @@ def _pipeline_cpu_offload_runtime_worker(tempdir):
     original_context = cpu_offloading.CPUOffloadContext
 
     class RecordingContext(original_context):
-        def __init__(self, module, prefetch_level):
-            super().__init__(module, prefetch_level)
+        def __init__(self, module, group_id=None, manager=None):
+            super().__init__(module, group_id=group_id, manager=manager)
             self.handle_ids = []
             contexts.append(self)
 
@@ -581,7 +675,7 @@ def _pipeline_cpu_offload_runtime_worker(tempdir):
         def _unpack(self, value):
             if (
                 isinstance(value, cpu_offloading._OffloadedTensor)
-                and value.device_tensor is not None
+                and value.transfer.h2d_issued
             ):
                 early_prefetched.add(id(value))
             return super()._unpack(value)
