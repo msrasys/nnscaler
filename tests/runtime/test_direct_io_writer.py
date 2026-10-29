@@ -3,6 +3,8 @@
 
 import errno
 from concurrent.futures import ThreadPoolExecutor
+import gc
+import io
 import mmap
 import os
 from unittest.mock import Mock
@@ -41,7 +43,9 @@ def test_write(direct_io_path, size):
     with DirectIOWriter(direct_io_path, chunk_bytes=mmap.PAGESIZE, workers=2) as writer:
         assert writer.tell() == 0
         assert writer.write(b"") == 0
-        assert os.fstat(writer.fileno()).st_size == 0
+        assert direct_io_path.stat().st_size == 0
+        with pytest.raises(io.UnsupportedOperation):
+            writer.fileno()
         for start in range(0, size, 997):
             piece = memoryview(data)[start:start + 997]
             assert writer.write(piece) == len(piece)
@@ -73,11 +77,14 @@ def test_flush_then_write(direct_io_path):
     assert direct_io_path.read_bytes() == prefix + suffix
 
 
-def test_torch_save(direct_io_path):
+# The legacy format writes storages straight to f.fileno() when available,
+# bypassing the bounce buffer; it must fall back to write() here.
+@pytest.mark.parametrize("zipfile", [True, False], ids=["zip", "legacy"])
+def test_torch_save(direct_io_path, zipfile):
     tensor = torch.arange(128 * 128, dtype=torch.float32).reshape(128, 128)
     state = {"weight": tensor, "shared": tensor, "step": 7}
     with DirectIOWriter(direct_io_path, chunk_bytes=mmap.PAGESIZE, workers=2) as writer:
-        torch.save(state, writer)
+        torch.save(state, writer, _use_new_zipfile_serialization=zipfile)
         assert writer.tell() == direct_io_path.stat().st_size
 
     loaded = torch.load(direct_io_path, weights_only=True)
@@ -151,6 +158,35 @@ def test_initialization_failure_releases_resources(direct_io_path, monkeypatch, 
         shutdown.assert_called_once_with(wait=True)
 
 
+@pytest.mark.parametrize("delete_on_error", [True, False])
+def test_exception_in_with_block(direct_io_path, delete_on_error):
+    with pytest.raises(RuntimeError, match="boom"):
+        with DirectIOWriter(direct_io_path, chunk_bytes=mmap.PAGESIZE, workers=1,
+                            delete_on_error=delete_on_error) as writer:
+            writer.write(b"x" * (mmap.PAGESIZE + 1))
+            raise RuntimeError("boom")
+    assert writer.closed
+    assert direct_io_path.exists() == (not delete_on_error)
+    if not delete_on_error:
+        # Unflushed tail is lost, but completed full blocks remain for inspection.
+        assert direct_io_path.read_bytes() == b"x" * mmap.PAGESIZE
+
+
+def test_del_releases_resources(direct_io_path):
+    writer = DirectIOWriter(direct_io_path, chunk_bytes=mmap.PAGESIZE, workers=1)
+    writer.write(b"x" * 10)
+    buffers = tuple(writer._buffers)
+    fd = writer._fd
+    del writer
+    gc.collect()
+    assert all(buffer.closed for buffer in buffers)
+    with pytest.raises(OSError) as error:
+        os.fstat(fd)
+    assert error.value.errno == errno.EBADF
+    # Finalization does not flush; the partial file is left as-is.
+    assert direct_io_path.read_bytes() == b""
+
+
 @pytest.mark.parametrize("size", [123, mmap.PAGESIZE], ids=["tail", "async"])
 def test_write_error_releases_resources(direct_io_path, monkeypatch, size):
     def fail_write(fd, data, offset):
@@ -158,7 +194,7 @@ def test_write_error_releases_resources(direct_io_path, monkeypatch, size):
 
     writer = DirectIOWriter(direct_io_path, chunk_bytes=mmap.PAGESIZE, workers=1)
     buffers = tuple(writer._buffers)
-    fd = writer.fileno()
+    fd = writer._fd
     monkeypatch.setattr(os, "pwrite", fail_write)
     with pytest.raises(OSError, match="injected write failure") as error:
         with writer:
@@ -170,6 +206,7 @@ def test_write_error_releases_resources(direct_io_path, monkeypatch, size):
 
     assert error.value.errno == errno.EIO
     assert writer.closed
+    assert not direct_io_path.exists()
     assert all(buffer.closed for buffer in buffers)
     with pytest.raises(OSError) as error:
         os.fstat(fd)

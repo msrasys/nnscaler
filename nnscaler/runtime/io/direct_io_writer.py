@@ -1,3 +1,6 @@
+#  Copyright (c) Microsoft Corporation.
+#  Licensed under the MIT License.
+
 """A simple, standalone sequential file writer using O_DIRECT.
 
 Background
@@ -25,10 +28,26 @@ The resulting contents are identical to those produced by regular writes.
 Usage
 -----
     with DirectIOWriter("/data/ckpt.pt", chunk_bytes=64 << 20, workers=2) as f:
-        torch.save(state_dict, f)      # Only requires write()/tell()/flush().
+        torch.save(state_dict, f)      # Only requires write() and flush().
 
-The interface implements a subset of io.RawIOBase: write / tell / flush / close /
-fileno. Instances can be passed directly to torch.save.
+The interface implements a subset of io.RawIOBase: write / tell / flush / close.
+Instances can be passed directly to torch.save.
+
+Limitations
+-----------
+    - Append-only: no read, seek, or truncate. torch.save with skip_data=True
+      needs seek() and is not supported.
+    - fileno() raises io.UnsupportedOperation. The descriptor is opened with
+      O_DIRECT and written only through pwrite, so its file position never
+      advances; callers that write to the raw descriptor (e.g. torch.save with
+      _use_new_zipfile_serialization=False) would corrupt the file or get EINVAL.
+      Raising makes such callers fall back to write().
+    - write() accepts any object exposing a C-contiguous buffer (bytes,
+      bytearray, memoryview, array). Non-contiguous memoryviews are rejected.
+    - Not thread-safe: all methods must be called from one thread.
+    - Always close() the writer or use it as a context manager. A writer that
+      is garbage collected or still open at interpreter exit only releases its
+      resources without flushing; unflushed data is lost.
 
 Performance
 -----------
@@ -50,8 +69,10 @@ NOTE: The optimal workers and chunk_bytes values depend on the storage device.
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack
+import io
 import mmap
 import os
+import weakref
 
 __all__ = ["DirectIOWriter"]
 
@@ -64,16 +85,21 @@ _ALIGN = mmap.PAGESIZE
 class DirectIOWriter:
     """Pack arbitrary byte streams into page-aligned, threaded O_DIRECT writes."""
 
-    def __init__(self, path, *, chunk_bytes=64 << 20, workers=2):
+    def __init__(self, path, *, chunk_bytes=64 << 20, workers=2, delete_on_error=True):
         """
-        path:        Output path. The file must not exist (O_EXCL), preventing
-                     existing checkpoints from being overwritten.
-        chunk_bytes: Bounce buffer size and full-block pwrite length. Must be a
-                     multiple of the page size. Larger buffers reduce system
-                     calls and improve throughput but use more memory.
-        workers:     Number of parallel writer threads. The buffer pool contains
-                     2 * workers buffers, leaving workers buffers for the main
-                     thread to fill while workers threads are writing.
+        path:            Output path. The file must not exist (O_EXCL), preventing
+                         existing checkpoints from being overwritten.
+        chunk_bytes:     Bounce buffer size and full-block pwrite length. Must be a
+                         multiple of the page size. Larger buffers reduce system
+                         calls and improve throughput but use more memory.
+        workers:         Number of parallel writer threads. The buffer pool contains
+                         2 * workers buffers, leaving workers buffers for the main
+                         thread to fill while workers threads are writing.
+        delete_on_error: Remove the output file when the with block exits with an
+                         exception or its final flush fails. An incomplete file is
+                         not a usable checkpoint, and because of O_EXCL it would
+                         also block a retry to the same path. Set False to keep
+                         the partial file for inspection.
         """
         if chunk_bytes < _ALIGN or chunk_bytes % _ALIGN:
             raise ValueError(f"chunk_bytes must be a positive multiple of {_ALIGN}")
@@ -83,6 +109,8 @@ class DirectIOWriter:
         with ExitStack() as cleanup:
             # O_EXCL prevents overwrites; O_DIRECT requires aligned writes.
             self._fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_DIRECT, 0o666)
+            self._path = path
+            self._delete_on_error = delete_on_error
             cleanup.callback(os.close, self._fd)
             self._chunk_bytes = chunk_bytes
             self._pool = cleanup.enter_context(ThreadPoolExecutor(max_workers=workers))
@@ -110,6 +138,14 @@ class DirectIOWriter:
             # Initialization succeeded; close() now owns resource cleanup.
             cleanup.pop_all()
 
+        # Release resources if the caller forgets to close(), like io objects do.
+        # weakref.finalize instead of __del__: it also runs at interpreter exit,
+        # but during atexit while modules are intact, whereas __del__ may run
+        # after module teardown and fail inside ThreadPoolExecutor.shutdown.
+        # Deliberately no flush: finalizing a checkpoint the caller never asked
+        # to complete would be surprising.
+        self._finalizer = weakref.finalize(self, self._release, self._fd, self._pool, self._buffers)
+
     # ------------------------------------------------------------------
     # Writing
     # ------------------------------------------------------------------
@@ -134,11 +170,13 @@ class DirectIOWriter:
         return len(view)
 
     def tell(self):
-        """Return the actual file length. torch.save uses it to track ZIP offsets."""
+        """Return the number of bytes written so far, i.e. the final file length."""
         return self._logical_offset
 
     def fileno(self):
-        return self._fd
+        # See "Limitations" in the module docstring: exposing the O_DIRECT
+        # descriptor lets callers bypass the bounce buffer and corrupt the file.
+        raise io.UnsupportedOperation("fileno")
 
     # ------------------------------------------------------------------
     # Flushing
@@ -183,11 +221,19 @@ class DirectIOWriter:
         return self
 
     def __exit__(self, exc_type, exc, tb):
-        if exc_type is None:
-            self.close()
-        else:
-            # Only clean up: flushing could raise again while handling an error.
-            self._release_resources()
+        failed = exc_type is not None
+        try:
+            if failed:
+                # Only clean up: flushing could raise again while handling an error.
+                self._release_resources()
+            else:
+                self.close()
+        except BaseException:
+            failed = True
+            raise
+        finally:
+            if failed and self._delete_on_error:
+                self._unlink()
 
     # ------------------------------------------------------------------
     # Internal implementation
@@ -232,10 +278,28 @@ class DirectIOWriter:
                 n = os.pwrite(self._fd, view, offset)
                 if n <= 0:
                     raise OSError(f"O_DIRECT write made no progress (offset={offset})")
+                # Direct I/O completes in whole filesystem blocks, so a short
+                # write keeps the remaining address and offset aligned. Assert
+                # it instead of letting the next pwrite fail with EINVAL.
+                assert n % _ALIGN == 0, f"unaligned O_DIRECT short write: {n} bytes"
                 offset += n
                 view = view[n:]
         finally:
             view.release()              # Release exported views before mmap.close().
+
+    @staticmethod
+    def _release(fd, pool, buffers):
+        """Shut down the pool, close the file, and free buffers.
+
+        A staticmethod so weakref.finalize holds no reference to the writer; a
+        bound method would keep it alive forever.
+        """
+        try:
+            pool.shutdown(wait=True, cancel_futures=True)
+        finally:
+            os.close(fd)
+            for buf in buffers:
+                buf.close()
 
     def _release_resources(self):
         """Shut down the pool, close the file, and free buffers exactly once."""
@@ -243,12 +307,16 @@ class DirectIOWriter:
             return
         self.closed = True
         try:
-            self._pool.shutdown(wait=True, cancel_futures=True)
+            self._finalizer()           # Runs _release once; later calls are no-ops.
         finally:
-            os.close(self._fd)
             self._cur = None
             self._inflight.clear()
             self._free.clear()
-            for buf in self._buffers:
-                buf.close()
             self._buffers.clear()
+
+    def _unlink(self):
+        """Remove the incomplete output file; it may already be gone."""
+        try:
+            os.unlink(self._path)
+        except FileNotFoundError:
+            pass
