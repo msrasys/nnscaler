@@ -1,0 +1,15 @@
+{
+  "differences": [
+    [
+      "nnscaler",
+      "nnscaler/runtime/activation_config.py",
+      true
+    ],
+    [
+      "nnscaler",
+      "nnscaler/runtime/activation_memory.py",
+      true
+    ]
+  ],
+  "all_python_ast_equal": true
+}

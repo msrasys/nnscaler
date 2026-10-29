@@ -1,0 +1,11 @@
+{
+  "runtime": "189 passed",
+  "pipeline": "1 test covering 8 combinations passed",
+  "policy": "5 updates; full gradients and updates passed; no throughput claim",
+  "invocation_note": "The initial policy command requested 3 updates; its parser required at least 5. It did not execute training. The corrected 5-update command passed.",
+  "numerical_sources": "frozen v3; only two trailing-blank-line differences from committed runtime, Python AST identical",
+  "independent_probe_status": "queued behind another registered 500-update GPU job",
+  "local_probe_root": "/tmp/activation-store-20261030",
+  "runtime_commit": "40f0f0d3",
+  "application_commit": "bf8ff5b2"
+}

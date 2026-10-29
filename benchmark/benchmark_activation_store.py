@@ -22,6 +22,8 @@ def arguments():
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--tensors', type=int, default=16)
     parser.add_argument('--tensor-mib', type=int, default=16)
+    parser.add_argument('--batch-tensors', type=int, default=None,
+                        help='tensors per transfer batch; default submits the whole payload together')
     parser.add_argument('--iterations', type=int, default=8)
     parser.add_argument('--warmup', type=int, default=3)
     parser.add_argument('--inflight-mib', type=int, default=512)
@@ -31,6 +33,10 @@ def arguments():
     parser.add_argument('--compute-dim', type=int, default=2048)
     parser.add_argument('--allocate-on-compute-stream', action='store_true')
     args = parser.parse_args()
+    if args.batch_tensors is None:
+        args.batch_tensors = args.tensors
+    if not 1 <= args.batch_tensors <= args.tensors:
+        parser.error('batch-tensors must be within [1, tensors]')
     for name in ('tensors', 'tensor_mib', 'iterations', 'warmup', 'inflight_mib',
                  'prefetch_mib', 'cpu_budget_mib', 'compute_repeats', 'compute_dim'):
         if getattr(args, name) < 1:
@@ -101,8 +107,12 @@ def main():
                 value.record_stream(torch.cuda.current_stream())
             del value
         else:
-            with cache.batch() as batch:
-                handles = [batch.save(value) for value in values]
+            handles = []
+            for start_index in range(0, args.tensors, args.batch_tensors):
+                with cache.batch() as batch:
+                    for index in range(start_index, min(args.tensors, start_index + args.batch_tensors)):
+                        handles.append(batch.save(values[index]))
+                        values[index] = None  # Transfer retention responsibility to the handle.
             del values
             if mode == 'overlap_compute':
                 compute()

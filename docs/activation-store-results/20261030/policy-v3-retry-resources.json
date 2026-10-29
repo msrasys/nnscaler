@@ -1,0 +1,36 @@
+{
+  "validation_token": "923bb0b59e214e65bd70dc31d66bf92b",
+  "exclusive_gpu_indices": [
+    "1",
+    "2"
+  ],
+  "gpu_reserve_mib": 16384,
+  "validation_mode": "correctness_only",
+  "sampled_peak_gpu_used_mib": {
+    "GPU-a489a02e-a4cd-63c6-b375-1b70189b5212": 2734,
+    "GPU-a0389fe1-95e8-434f-fa82-b9068760a5fd": 2694
+  },
+  "headroom_basis": "host MemAvailable and cgroup usage minus clean inactive file cache",
+  "validation_time_limit_seconds": 1800,
+  "command_exit": 0,
+  "stop_reason": null,
+  "guard_exception": null,
+  "cleanup_errors": [],
+  "peak_container_bytes": 2112589266944,
+  "peak_task_tree_rss_bytes": 13430075392,
+  "minimum_host_cgroup_headroom_bytes": 2109695770624,
+  "task_tree_rss_limit_bytes": 858993459200,
+  "host_cgroup_reserve_bytes": 274877906944,
+  "minimum_disk_free_bytes": 912373399552,
+  "started_unix_seconds": 1793301421.0027175,
+  "last_gpu_processes": [
+    [
+      "3960163",
+      "GPU-2fdaef43-ccd2-9a83-7db2-7ed19297cb8d"
+    ]
+  ],
+  "phase": "complete",
+  "duration_seconds": 46.937791338190436,
+  "updated_unix_seconds": 1793301467.9405088,
+  "remaining_owned_pids": []
+}

@@ -1,8 +1,9 @@
 # CPU activation offloading
 
-The October 30 store/adapter refactor has CPU regression coverage; its CUDA
-correctness suite and independent transfer probes are queued behind the current
-GPU job. Full-model numbers linked below measure the October 29 implementation.
+The October 30 store/adapter refactor has passed CPU and CUDA correctness checks;
+see the [architecture validation](activation_store_validation_20261030.md).
+Independent transfer probes are queued behind the current GPU job. Full-model
+numbers linked below measure the October 29 implementation.
 
 The [storage architecture](activation_store_design.md) separates host memory,
 CUDA transport, saved-value ownership and graph/autograd adapters. An explicit
