@@ -132,10 +132,10 @@ def test_initialization_failure_releases_resources(direct_io_path, monkeypatch, 
         monkeypatch.setattr(pool, "shutdown", shutdown)
         return pool
 
-    def allocate_buffer(*args):
+    def allocate_buffer(*args, **kwargs):
         if failure == "first_buffer" or buffers:
             raise error
-        buffer = real_mmap(*args)
+        buffer = real_mmap(*args, **kwargs)
         buffers.append(buffer)
         return buffer
 

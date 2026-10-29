@@ -116,8 +116,11 @@ class DirectIOWriter:
             self._pool = cleanup.enter_context(ThreadPoolExecutor(max_workers=workers))
 
             # Anonymous mmap is page-aligned; bytearray does not guarantee alignment.
+            # MAP_PRIVATE: Python defaults to MAP_SHARED, which would share the
+            # buffers with forked children for no reason.
             self._buffers = [
-                cleanup.enter_context(mmap.mmap(-1, chunk_bytes))
+                cleanup.enter_context(mmap.mmap(-1, chunk_bytes,
+                                                flags=mmap.MAP_PRIVATE | mmap.MAP_ANONYMOUS))
                 for _ in range(2 * workers)
             ]
             self._free = list(self._buffers)  # Free buffers available for filling.
