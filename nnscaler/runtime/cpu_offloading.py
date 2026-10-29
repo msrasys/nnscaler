@@ -123,6 +123,22 @@ def mark_activation_resident(tensor: torch.Tensor) -> torch.Tensor:
     return tensor
 
 
+def activation_offload_pool_stats(module: torch.nn.Module) -> list[dict]:
+    """Snapshot each initialized offload pool used by a module tree once.
+
+    Pools are shared across compiled modules. Summing per-module snapshots
+    would count that same memory repeatedly. This query never creates a manager
+    or a pool; returned dictionaries neither own nor expose runtime resources.
+    A shared pool's counters include all its users, even outside this tree.
+    """
+    pools = {}
+    for child in module.modules():
+        manager = getattr(child, '_activation_offload_manager', None)
+        if manager is not None:
+            pools[id(manager.pool)] = manager.pool
+    return [pool.snapshot() for pool in pools.values()]
+
+
 class _OffloadPool:
     """Reusable tensors sized to the host allocator's charged block capacity."""
     def __init__(self, config):

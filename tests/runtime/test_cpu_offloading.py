@@ -70,6 +70,33 @@ def test_compute_config_roundtrip(tmp_path):
     assert ComputeConfig.safe_load_from_file(tmp_path / 'config.pt') == config
 
 
+def test_pool_stats_deduplicate_shared_owners_without_initializing_or_retaining_them():
+    from nnscaler.runtime.cpu_offloading import _OffloadPool, activation_offload_pool_stats
+
+    class Module(ParallelModule, skip_init=True):
+        def __init__(self):
+            torch.nn.Module.__init__(self)
+
+        def _get_activation_offload_manager(self):
+            raise AssertionError('A stats query must not initialize the runtime')
+
+    root = torch.nn.Sequential(Module(), torch.nn.Sequential(Module(), Module()), Module())
+    assert activation_offload_pool_stats(root) == []
+    pools = [_OffloadPool(CPUOffloadConfig()) for _ in range(2)]
+    for pool, transferred in zip(pools, (123, 456)):
+        pool.stats['d2h_bytes'] = transferred
+    root[0]._activation_offload_manager = SimpleNamespace(pool=pools[0])
+    root[1][0]._activation_offload_manager = SimpleNamespace(pool=pools[0])
+    root[1][1]._activation_offload_manager = SimpleNamespace(pool=pools[1])
+    snapshots = activation_offload_pool_stats(root)
+    assert [snapshot['d2h_bytes'] for snapshot in snapshots] == [123, 456]
+    snapshots[0]['d2h_bytes'] = -1
+    assert activation_offload_pool_stats(root)[0]['d2h_bytes'] == 123
+    observed_root = weakref.ref(root)
+    del root
+    assert observed_root() is None  # Snapshots must not extend model lifetimes.
+
+
 cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason='CUDA required')
 
 

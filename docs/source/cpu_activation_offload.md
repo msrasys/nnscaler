@@ -244,5 +244,10 @@ custom context are outside saved-tensor hooks.
 Use `module.activation_offload_stats()` to inspect D2H/H2D bytes, original-storage
 reuse, budget fallback, prefetch activity and live/allocated CPU bytes. Counters
 are cumulative and shared with other modules using the same process pool.
+For a model tree, use `nnscaler.runtime.cpu_offloading.activation_offload_pool_stats(model)`.
+It returns one snapshot per initialized shared pool, so multiple compiled modules
+cannot cause duplicate accounting. It does not initialize offloading or retain
+runtime resources in the result. A shared pool's counters include all its users,
+including modules outside the queried subtree; these are not per-module totals.
 Moving or sleeping a module with live offloaded activations is rejected.
 Generate fresh code after selecting regions or changing offload configuration.
