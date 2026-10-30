@@ -831,11 +831,17 @@ def _duplicate_dataloader_index_ops_per_stage(graph: IRGraph, op_plans: dict) ->
             return out.like()
         return out  # static / constant output: reuse as-is
 
+    # cids of the copies inserted so far; they sit at the front of their stage
+    copied_cids: set[int] = set()
+
     def _stage_start(stage: int) -> int:
-        """Position of the first live forward op of `stage`: copies sunk into the
-        stage are inserted there, so they precede every consumer in that stage."""
+        """Position of the first original (non-copy) forward op of `stage`.
+        New copies are inserted there: after the copies already sunk into the
+        stage, which later copies may reuse through `sinkable_obj_memo`, and
+        before every consumer in that stage."""
         for pos, node in enumerate(graph.nodes()):
-            if isinstance(node, IRFwOperation) and _get_node_stage(node) == stage:
+            if isinstance(node, IRFwOperation) and node.cid not in copied_cids \
+                    and _get_node_stage(node) == stage:
                 return pos
         raise RuntimeError(f"Internal Error: stage {stage} has no forward op")
 
@@ -878,6 +884,7 @@ def _duplicate_dataloader_index_ops_per_stage(graph: IRGraph, op_plans: dict) ->
 
         graph.insert(copy_node, pos)
         op_plans[copy_node] = OpPlan(op=copy_node, stage_id=stage, partition=None)
+        copied_cids.add(copy_node.cid)
         return pos + 1
 
     # try to sink each sinkable node into its consumer stages, creating copies as needed

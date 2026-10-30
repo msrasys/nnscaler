@@ -1154,3 +1154,58 @@ def test_lookup_leading_a_stage(tmp_path):
     assert _gencode_contains(tmp_path, StageLeadingLookupModule, 2, r"builtins.dict.get\(data_\d+, 'b', 1\)")
     for rank in (0, 1, 2):
         assert not _gencode_contains(tmp_path, StageLeadingLookupModule, rank, r'nnscaler.runtime.adapter.move_object')
+
+
+class SharedPrefixLookupModule(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.w0 = torch.nn.Parameter(torch.randn(4, 4))
+        self.w1 = torch.nn.Parameter(torch.randn(4, 4))
+        self.w2 = torch.nn.Parameter(torch.randn(4, 4))
+        self.w3 = torch.nn.Parameter(torch.randn(4, 4))
+
+    def forward(self, data: dict):
+        # two lookups sharing the `data['meta']` prefix, both consumed in the last stage
+        meta = data['meta']
+        scale = meta.get('scale', 1)
+        bias = meta.get('bias', 0)
+        x0 = data['data'] + self.w0
+        x1 = x0 + self.w1
+
+        x2 = x1 + self.w2
+        x3 = x2 + self.w3
+
+        return torch.sum(x3 * scale * bias)
+
+
+@replace_all_device_with('cpu')
+def test_shared_prefix_lookups(tmp_path):
+    m = SharedPrefixLookupModule()
+    m.train()
+    parallelize(
+        m,
+        {'data': {'data': torch.randn(4, 4), 'meta': {'scale': 2, 'bias': 1}}},
+        pas_policy=_shared_output_partition_policy,
+        compute_config= ComputeConfig(
+            2, 4,
+            constant_folding=False,
+            use_end2end=True,
+            pas_config=dict(
+                pipeline_nmicros=2,
+                pipeline_scheduler='1f1b'
+            )
+        ),
+        gen_savedir=tmp_path,
+        load_module=False,
+        reuse='override',
+    )
+    # the shared prefix is copied once into stage 1, and both lookups that reuse
+    # it are emitted after it
+    assert len(_gencode_contains(tmp_path, SharedPrefixLookupModule, 1, r"_operator.getitem\(data_\d+, 'meta'\)")) == 1
+    for key, default in (('scale', 1), ('bias', 0)):
+        assert _gencode_contains(
+            tmp_path, SharedPrefixLookupModule, 1,
+            rf"(getitem_[\d_]+) = _operator.getitem\(data_\d+, 'meta'\)[\s\S]*?builtins.dict.get\(\1, '{key}', {default}\)"
+        ), f'{key} lookup is emitted before its producer'
+    for rank in (0, 1):
+        assert not _gencode_contains(tmp_path, SharedPrefixLookupModule, rank, r'nnscaler.runtime.adapter.move_object')
