@@ -64,15 +64,22 @@ class ActivationTransferEngine:
 
     def submit_batch(self, records, producer_events=None):
         """Submit an admitted batch without allocations or host waits between copies."""
-        producers = {record.producer_stream.cuda_stream: record.producer_stream for record in records}
-        for stream in producers.values():
-            event = (producer_events or {}).get(stream.cuda_stream)
-            if event is None:
-                self.d2h_stream.wait_stream(stream)
-            else:
-                self.d2h_stream.wait_event(event)
+        waited_events, waited_streams = set(), set()
+        copied = 0
         with self._stream_batch(self.d2h_stream, self._d2h_batch):
-            copied = sum(bool(record.offload()) for record in records)
+            for record in records:
+                stream = record.producer_stream
+                event = record.producer_ready_event or (producer_events or {}).get(stream.cuda_stream)
+                # A scope may merge several regions or producing streams. A
+                # ready copy must not wait for an unrelated later producer.
+                if event is not None:
+                    if event not in waited_events:
+                        self.d2h_stream.wait_event(event)
+                        waited_events.add(event)
+                elif stream.cuda_stream not in waited_streams:
+                    self.d2h_stream.wait_stream(stream)
+                    waited_streams.add(stream.cuda_stream)
+                copied += bool(record.offload())
         if copied:
             self.stats['d2h_committed_groups'] += 1
             self.stats['peak_queued_d2h_bytes'] = max(

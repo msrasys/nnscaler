@@ -1,5 +1,10 @@
 # CPU activation offloading
 
+Pipeline scheduling now uses configurable local virtual-stage F/B units. See
+[action-unit scheduling](activation_action_schedule.md) for lookahead distance,
+producer-readiness clipping, retry priority and the scope/group choice. Existing
+generated schedules need regeneration to use the new scheduling ABI.
+
 The October 30 store/adapter refactor has passed CPU and CUDA correctness checks;
 see the [architecture validation](activation_store_validation_20261030.md).
 Independent transfer probes have also completed; see the
@@ -281,17 +286,19 @@ performed to support otherwise invalid mutations.
 
 ## Scheduling
 
-A generated schedule keys each forward scope by `(segment, microbatch)`. Before
-the preceding local compute action, it issues a hint for the actual next
-backward scope. This works with ordinary PP and interleaved VPP; “one action
-before” means a local F/B action, not an optimizer step. Only the entry group is
-prefetched, not the entire stage. Group output autograd prehooks prefetch prior
-groups during backward. Ordinary non-pipeline autograd uses the same group
-hooks. Demand loading remains a correctness fallback for branched graphs,
-insufficient lookahead or an exhausted speculative budget.
+A generated pipeline schedule keys each forward scope by `(segment, microbatch)`
+and records actual local F/B positions. `pipeline_prefetch_steps` controls how
+many local actions before backward to request its saved values; producer
+completion and the speculative byte budget bound the effective lead. Requests
+are retried in backward-deadline order at action boundaries. `transfer_unit=auto`
+uses whole F/B scopes in pipeline and regions otherwise. Scope mode refills one
+backward-unit queue; group mode retains entry/intra-backward group lookahead.
+See [action scheduling](activation_action_schedule.md) for precise units and
+configuration. Demand loading remains the correctness fallback for missing
+lookahead, branched consumers or an exhausted speculative budget.
 
-If a forward is immediately followed by its own backward, its final selected
-group stays resident. If the original storage is still held by a pipeline input,
+If a forward is immediately followed by its own backward, the whole scope stays
+resident in scope mode, or its final selected group in group mode. If the original storage is still held by a pipeline input,
 output or YOCO cache at restore time, it is reused without H2D or a second GPU
 allocation. This does **not** free external owners. The runtime never resizes
 live user storage or overwrites pipeline inputs to force a memory reduction.
@@ -305,8 +312,8 @@ Only live records reserve pinned buffers, before the group's copies are submitte
 many local F/B actions separate its forward and backward. The default 0 preserves
 ordinary selection; 2 additionally keeps immediately-followed-backward scopes
 resident. Scopes without schedule distance metadata retain ordinary offloading.
-`scope_prefetch_groups` (default 1) controls how many backward-entry groups the
-schedule preloads. `prefetch_groups` controls lookahead inside backward; setting
+In group mode, `scope_prefetch_groups` (default 1) controls how many backward-entry
+groups the schedule preloads. `prefetch_groups` controls lookahead inside backward; setting
 it to 0 still disables all speculative loading. Both use the same byte budget.
 Groups whose shared storages are already restored do not consume lookahead
 depth, so repeated checkpoint boundaries cannot hide the next pending transfer.

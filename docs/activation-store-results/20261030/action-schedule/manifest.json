@@ -1,0 +1,24 @@
+{
+  "local_root": "/tmp/activation-schedule-20261030",
+  "runtime_tests": "212 passed",
+  "codegen_tests": "8 passed",
+  "pipeline": "8 combinations passed",
+  "policy_comparisons": [
+    "auto steps 0",
+    "auto steps 1",
+    "auto steps 4",
+    "group steps 4"
+  ],
+  "samples": 16,
+  "warmup": 3,
+  "measured_actions": 8,
+  "payload_MiB_each_direction": 512,
+  "stage_scope_MiB": 128,
+  "source_python_hashes_match": true,
+  "notes": [
+    "Controlled synthetic local F/B replay; not model throughput.",
+    "sync-actions waits the compute stream only, while independent copies continue.",
+    "Read intervals include checksum reductions and CPU submission gaps.",
+    "Allocation peaks include checksum workspaces; boundaries are separate diagnostic observations."
+  ]
+}

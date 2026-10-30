@@ -21,6 +21,7 @@ from nnscaler.codegen.syntax.symtable import SymbolTable
 from nnscaler.codegen.lifecycle import LifeCycle
 from nnscaler.codegen.syntax.blocks import FunctionBlock, Block
 from nnscaler.flags import CompileFlag
+from nnscaler.runtime.activation_schedule import ActivationSchedulePlan
 
 
 _logger = logging.getLogger(__name__)
@@ -90,6 +91,17 @@ class ScheduleCodeGen(FuncEmission):
         # when we use scheduler (i.e. pipeline parallelism)
         # Otherwise, the caller of `_train_step` will set these flags to support gradient accumulation
         use_scheduler = self.execplan.graph.sched is not None
+        compute_nodes = [n for n in device_nodes if isinstance(
+            n.cell if isinstance(n, ExeReuseCell) else n, IRSegment)]
+        action_positions = {id(node): index for index, node in enumerate(compute_nodes)}
+        activation_entries = ()
+        if use_scheduler:
+            actions = []
+            for node in compute_nodes:
+                segment = node.cell if isinstance(node, ExeReuseCell) else node
+                forward = segment if segment.isfw() else segment.mirror
+                actions.append((self._activation_scope_key(node), node.isfw(), self._has_activation_offload(forward)))
+            activation_entries = ActivationSchedulePlan.from_actions(actions).entries()
         send_bundle_ranges = self._collect_send_bundle_ranges(device_nodes, device_map) \
             if use_scheduler else {}
 
@@ -246,10 +258,8 @@ class ScheduleCodeGen(FuncEmission):
                     'fallback_vars_by_mid': {},
                 }
                 pending_async_recvs = {}
-                # A prefetch hint names the actual next local F/B action. VPP
-                # forward order alone cannot identify its microbatch/chunk.
-                compute_nodes = [n for n in device_nodes if isinstance(
-                    n.cell if isinstance(n, ExeReuseCell) else n, IRSegment)]
+                # F/B actions count independently of communication/adapters.
+                # Non-pipeline end-to-end graphs retain the local group hint.
                 next_compute = {id(a): b for a, b in zip(compute_nodes, compute_nodes[1:])}
                 backward_positions = {self._activation_scope_key(n): i
                                       for i, n in enumerate(compute_nodes) if not n.isfw()}
@@ -267,6 +277,11 @@ class ScheduleCodeGen(FuncEmission):
                     unwrap_node = node.cell if isinstance(node, ExeReuseCell) else node
                     bundle_events = send_bundle_ranges.get(line, ())
                     _append_send_bundle_events(fb, bundle_events, before_node=True)
+                    if activation_entries and id(node) in action_positions:
+                        # Independent saved activations may reload while this
+                        # action waits for its own pipeline receives.
+                        _append_code(fb, f'_activation_schedule.before({action_positions[id(node)]})',
+                                     self._get_node_stream(node))
                     wait_codes = self._emit_async_recv_waits(node, pending_async_recvs, produced_tids)
                     if wait_codes:
                         _append_code(fb, wait_codes, self._get_node_stream(node))
@@ -286,7 +301,7 @@ class ScheduleCodeGen(FuncEmission):
                     elif use_scheduler and isinstance(unwrap_node, IRWeightReducer):
                         _append_code(fb, 'nnscaler.flags.RuntimeFlag.skip_reducer = False')
                     following = next_compute.get(id(node))
-                    if following is not None and not following.isfw():
+                    if not use_scheduler and following is not None and not following.isfw():
                         target = following.cell if isinstance(following, ExeReuseCell) else following
                         if self._has_activation_offload(target.mirror):
                             key = self._activation_scope_key(following)
@@ -314,6 +329,11 @@ class ScheduleCodeGen(FuncEmission):
                         if isinstance(out, IRObject):
                             produced_tids.add(out.tid)
                     _append_send_bundle_events(fb, bundle_events, before_node=False)
+                    if activation_entries and id(node) in action_positions:
+                        # Retry only after producers completed and schedule
+                        # data references were released; never before save.
+                        _append_code(fb, f'_activation_schedule.after({action_positions[id(node)]})',
+                                     self._get_node_stream(node))
             # return code
             if CompileFlag.async_comm:
                 _append_code(fb, 'nnscaler.runtime.executor.AsyncCommHandler().drain_sends()')
@@ -322,6 +342,10 @@ class ScheduleCodeGen(FuncEmission):
             _append_code(fb, 'nnscaler.runtime.executor.AsyncCommHandler().drain()')
             code = f'return {outputs}'
             _append_code(fb, code, force_flush=True)
+            if activation_entries:
+                with Block(f'with model.activation_offload_schedule({activation_entries!r}) as _activation_schedule:') as scope:
+                    scope.insert_body(fb.code[1:])
+                fb.code[1:] = scope.code
 
         gencode += fb.code
 
@@ -975,7 +999,12 @@ class ScheduleCodeGen(FuncEmission):
                 if node.isfw():
                     immediate = id(node) in getattr(self, '_immediate_backward_forwards', set())
                     distance = getattr(self, '_activation_backward_distances', {}).get(id(node))
-                    with Block(f'with model.activation_offload_scope({key!r}, immediate_backward={immediate!r}, backward_distance={distance!r}):') as scope_block:
+                    if distance is None:
+                        # A forward-only/inference scope has no scheduled
+                        # backward to remove a keyed registration later.
+                        key = None
+                    pipeline = self.execplan.graph.sched is not None
+                    with Block(f'with model.activation_offload_scope({key!r}, immediate_backward={immediate!r}, backward_distance={distance!r}, pipeline={pipeline!r}):') as scope_block:
                         scope_block.insert_body(codes)
                     codes = scope_block.code
                 else:

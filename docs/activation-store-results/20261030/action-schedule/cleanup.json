@@ -1,0 +1,23 @@
+{
+  "removed": [
+    {
+      "path": "/tmp/activation-schedule-20261030/v3-pipeline-tmp",
+      "file_bytes": 1149110
+    },
+    {
+      "path": "/tmp/activation-schedule-20261030/v4-pipeline-tmp",
+      "file_bytes": 1149110
+    },
+    {
+      "path": "/tmp/activation-schedule-20261030/sources/v1",
+      "file_bytes": 87700554
+    },
+    {
+      "path": "/tmp/activation-schedule-20261030/sources/v2",
+      "file_bytes": 87707147
+    }
+  ],
+  "lease_status": "completed",
+  "remaining_owned_pids": [],
+  "disk_free_bytes": 910667829248
+}

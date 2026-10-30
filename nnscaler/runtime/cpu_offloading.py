@@ -16,11 +16,13 @@ make an invalid program's asynchronous accesses race-free.
 """
 from contextlib import contextmanager
 from contextvars import ContextVar
+from collections import deque
 import weakref
 
 import torch
 from .activation_config import CPUOffloadConfig
 from .activation_autograd import SavedActivationContext, _ModuleTensorRef
+from .activation_schedule import ActivationSchedulePlan, ActivationScheduleCursor
 from .activation_memory import _OffloadPool, _shared_pool, _pools, available_host_bytes, _cgroup_headroom
 from .activation_store import (ActivationStore, ActivationBatch, _ResidentTensorRef, _StorageRecord, _SavedTensor)
 
@@ -89,6 +91,9 @@ class _OffloadGroup(ActivationBatch):
         self._scope = weakref.ref(scope)
         self.manager = scope.manager
         self.keep_resident = scope.keep_resident
+        self.transfer = scope.transfer
+        if self.transfer is not None:
+            self.capture_save_events = self.transfer.batch.capture_save_events
         self.previous = scope.groups[-1] if scope.groups else None
         scope.groups.append(self)
 
@@ -96,8 +101,20 @@ class _OffloadGroup(ActivationBatch):
     def scope(self):
         return self._scope()
 
+    def commit(self):
+        if self.transfer is None:
+            return super().commit()
+        if not self.closed:
+            self.transfer.add(self)
+            self.closed = True
+
     def backward_entry(self, *unused):
         if not self.manager.config.prefetch_groups:
+            return
+        if self.transfer is not None:
+            # Refill the current logical backward unit after demand consumes
+            # prefetch capacity; the queue never rescans already staged values.
+            self.transfer.prefetch()
             return
         self.prefetch()
         group = self.previous
@@ -137,27 +154,128 @@ def mark_retained_scope_tensors(values):
             scope.retained_storages.add((value.device, value.untyped_storage()._cdata))
 
 
-class _ForwardScope:
-    def __init__(self, manager, immediate_backward=False, backward_distance=None):
+class _ScopeTransfer:
+    """One forward's transport batch and its bounded backward restore queue.
+
+    Groups may keep this object for backward hooks. It never owns a scope or
+    group, avoiding an ownership cycle when cyclic GC is disabled.
+    """
+    def __init__(self, manager):
         self.manager = manager
+        self.batch = ActivationBatch(manager)
+        self.pending = deque()
+        self.ready = False
+
+    def add(self, group):
+        self.batch.records.extend(group.records)
+        self.batch.pending.extend(group.pending)
+        if group.producer_events:
+            if self.batch.producer_events is None:
+                self.batch.producer_events = {}
+            self.batch.producer_events.update(group.producer_events)
+        group.pending.clear()
+        group.producer_events = None
+
+    def commit(self):
+        self.batch.commit()
+        seen = set()
+        for ref in reversed(self.batch.records):
+            record = ref()
+            if record is not None and record.uid not in seen:
+                seen.add(record.uid)
+                self.pending.append(ref)
+        self.ready = True
+        self.manager.pool.stats['scope_commits'] += 1
+
+    def abort(self):
+        self.batch.pending.clear()
+        self.batch.producer_events = None
+        self.batch.closed = True
+        self.pending.clear()
+
+    def prefetch(self, *, from_schedule=False):
+        if not self.ready:
+            return False
+        if not self.pending:
+            return True
+        with self.manager.transport.prefetch_batch():
+            while self.pending:
+                record = self.pending[0]()
+                if record is None or record.d2h_event is None:
+                    self.pending.popleft()
+                    continue
+                if record.prefetch(from_schedule=from_schedule):
+                    self.pending.popleft()
+                elif record.size > self.manager.config.max_prefetch_bytes:
+                    # Cannot fit even an empty speculative window. Demand load
+                    # remains correct; do not starve other scopes indefinitely.
+                    self.pending.popleft()
+                    self.manager.pool.stats['scope_prefetch_oversize_bytes'] += record.size
+                else:
+                    return False  # Retry after a consuming action frees capacity.
+        return True
+
+
+class _ForwardScope:
+    def __init__(self, manager, immediate_backward=False, backward_distance=None, pipeline=False):
+        self.manager = manager
+        self.pipeline = pipeline
         self.backward_distance = backward_distance
         self.immediate_backward = immediate_backward
-        self.keep_resident = (backward_distance is not None
+        whole = manager.config.transfer_unit == 'scope' or (
+            manager.config.transfer_unit == 'auto' and pipeline)
+        self.keep_resident = ((backward_distance is not None
                               and backward_distance < manager.config.min_offload_gap)
+                             or (whole and immediate_backward))
+        self.resident_reason = ('immediate_backward_resident_bytes' if whole and immediate_backward
+                                else 'short_scope_resident_bytes')
+        self.transfer = _ScopeTransfer(manager) if whole else None
+        self.complete = False
         self.groups = []
+        self._entry_groups = None
         self.retained_storages = set()
         self.retained_saved = set()
 
     def prefetch(self):
+        if self.transfer is not None:
+            return self.transfer.prefetch(from_schedule=True)
         # Shape-only ops, filtered tensors and checkpoint tails can create
         # empty regions. They must not hide the actual backward entry group.
-        remaining = self.manager.config.scope_prefetch_groups
-        for group in reversed(self.groups):
-            if not remaining:
-                break
-            if group.has_pending_loads():
-                group.prefetch(from_schedule=True)
-                remaining -= 1
+        groups = self._entry_groups
+        if groups is None:
+            groups = []
+            selected_records = set()
+            remaining = self.manager.config.scope_prefetch_groups
+            for group in reversed(self.groups):
+                if not remaining:
+                    break
+                pending = {record.uid for ref in group.records if (record := ref()) is not None
+                           and record.d2h_event is not None and record.device_tensor is None}
+                if pending - selected_records:
+                    groups.append(group)
+                    selected_records.update(pending)
+                    remaining -= 1
+            if self.complete:
+                # Retries refill this backward-entry window. They must not
+                # silently advance it to more groups on every action hint.
+                self._entry_groups = groups
+        blocked = False
+        for group in groups:
+            group.prefetch(from_schedule=True)
+            blocked |= any((record := ref()) is not None
+                           and record.d2h_event is not None and record.device_tensor is None
+                           and record.size <= self.manager.config.max_prefetch_bytes
+                           for ref in group.records)
+        return not blocked
+
+    def finish_forward(self):
+        if self.transfer is not None:
+            self.transfer.commit()
+        self.complete = True
+
+    def abort(self):
+        if self.transfer is not None:
+            self.transfer.abort()
 
 
 class ActivationOffloadManager(ActivationStore):
@@ -167,12 +285,12 @@ class ActivationOffloadManager(ActivationStore):
         self.scopes = {}
 
     @contextmanager
-    def scope(self, key=None, immediate_backward=False, backward_distance=None):
+    def scope(self, key=None, immediate_backward=False, backward_distance=None, pipeline=False):
         current = _scope.get()
         if key is None and current is not None and current.manager is self:
             yield current
             return
-        scope = _ForwardScope(self, immediate_backward, backward_distance)
+        scope = _ForwardScope(self, immediate_backward, backward_distance, pipeline)
         if key is not None:
             if key in self.scopes:
                 raise RuntimeError(f'Duplicate activation forward scope: {key}')
@@ -180,7 +298,9 @@ class ActivationOffloadManager(ActivationStore):
         token = _scope.set(scope)
         try:
             yield scope
+            scope.finish_forward()
         except BaseException:
+            scope.abort()
             self.scopes.pop(key, None)
             raise
         finally:
@@ -190,7 +310,27 @@ class ActivationOffloadManager(ActivationStore):
         scope = self.scopes.get(key)
         if scope is not None and self.config.prefetch_groups:
             self.pool.stats['schedule_prefetch_calls'] += 1
-            scope.prefetch()
+            return scope.prefetch()
+        return True
+
+    @contextmanager
+    def schedule(self, entries):
+        plan = ActivationSchedulePlan(entries)
+        steps = self.config.pipeline_prefetch_steps if self.config.prefetch_groups else 0
+        def request(key, lead):
+            if self.observation.enabled:
+                self.observation.emit('schedule_prefetch', count=lead, reason=repr(key))
+            return self.prefetch(key)
+        cursor = ActivationScheduleCursor(plan, steps, request)
+        try:
+            yield cursor
+        finally:
+            # Completed backwards already removed their scopes. On an error,
+            # also drop metadata for earlier forward actions of this schedule.
+            for use in plan.uses:
+                scope = self.scopes.pop(use.key, None)
+                if scope is not None:
+                    scope.abort()
 
     def finish(self, key):
         self.scopes.pop(key, None)
@@ -263,7 +403,7 @@ class CPUOffloadContext(SavedActivationContext):
             owner = self.manager.module().find_buffer_or_param_owner(tensor) if tensor.layout == torch.strided else None
             if owner is not None:
                 return _ModuleTensorRef(owner, tensor)
-            label = ('short_scope_resident_bytes' if self.group.scope.keep_resident
+            label = (self.group.scope.resident_reason if self.group.scope.keep_resident
                      else 'immediate_backward_resident_bytes')
             self.manager.pool.stats[label] += tensor.numel() * tensor.element_size()
             return self.manager._resident(tensor, label)

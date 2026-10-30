@@ -1610,12 +1610,18 @@ class ParallelModule(CubeModule):
         manager = getattr(self, '_activation_offload_manager', None)
         if manager is None:
             config = getattr(getattr(self, 'compute_config', None), 'cpu_offload', None)
+            if config is not None and config._schedule_version != 1:
+                raise RuntimeError('Activation scheduling requires regenerated code; recompile with a current CPUOffloadConfig')
             manager = ActivationOffloadManager(self, config or CPUOffloadConfig())
             self._activation_offload_manager = manager
         return manager
 
-    def activation_offload_scope(self, key=None, *, immediate_backward=False, backward_distance=None):
-        return self._get_activation_offload_manager().scope(key, immediate_backward, backward_distance)
+    def activation_offload_scope(self, key=None, *, immediate_backward=False, backward_distance=None, pipeline=False):
+        return self._get_activation_offload_manager().scope(key, immediate_backward, backward_distance, pipeline)
+
+    def activation_offload_schedule(self, entries):
+        """Use actual local F/B positions, with runtime-configurable lookahead."""
+        return self._get_activation_offload_manager().schedule(entries)
 
     def prefetch_activation(self, key):
         self._get_activation_offload_manager().prefetch(key)

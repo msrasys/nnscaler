@@ -1,0 +1,798 @@
+{
+  "lead0": {
+    "configuration": {
+      "output": "/tmp/activation-schedule-20261030/v4-lead0.json",
+      "lookahead": 0,
+      "unit": "auto",
+      "tensor_mib": 64,
+      "groups": 2,
+      "entry_groups": 1,
+      "prefetch_mib": 512,
+      "inflight_mib": 512,
+      "compute_repeats": 128,
+      "iterations": 16,
+      "warmup": 3,
+      "sync_actions": true
+    },
+    "plan": [
+      {
+        "key": [
+          "stage0",
+          0
+        ],
+        "forward": 0,
+        "backward": 3,
+        "first_prefetch": null
+      },
+      {
+        "key": [
+          "stage1",
+          0
+        ],
+        "forward": 1,
+        "backward": 5,
+        "first_prefetch": null
+      },
+      {
+        "key": [
+          "stage0",
+          1
+        ],
+        "forward": 2,
+        "backward": 6,
+        "first_prefetch": null
+      },
+      {
+        "key": [
+          "stage1",
+          1
+        ],
+        "forward": 4,
+        "backward": 7,
+        "first_prefetch": null
+      }
+    ],
+    "median_ms": 26.790413,
+    "median_read_interval_ms": 12.54308795928955,
+    "peak_allocated_MiB": 672.13427734375,
+    "peak_reserved_MiB": 962.0,
+    "boundary_peak_allocated_MiB": 32.12890625,
+    "pinned_pool_MiB": 384.0,
+    "counters": {
+      "d2h_bytes": 8589934592,
+      "h2d_bytes": 8589934592,
+      "demand_loads": 64,
+      "prefetch_loads": 64,
+      "prefetch_budget_skips": 0,
+      "d2h_throttles": 0,
+      "scope_commits": 64,
+      "schedule_prefetch_calls": 0
+    }
+  },
+  "lead1": {
+    "configuration": {
+      "output": "/tmp/activation-schedule-20261030/v4-lead1.json",
+      "lookahead": 1,
+      "unit": "auto",
+      "tensor_mib": 64,
+      "groups": 2,
+      "entry_groups": 1,
+      "prefetch_mib": 512,
+      "inflight_mib": 512,
+      "compute_repeats": 128,
+      "iterations": 16,
+      "warmup": 3,
+      "sync_actions": true
+    },
+    "plan": [
+      {
+        "key": [
+          "stage0",
+          0
+        ],
+        "forward": 0,
+        "backward": 3,
+        "first_prefetch": [
+          "before",
+          2
+        ]
+      },
+      {
+        "key": [
+          "stage1",
+          0
+        ],
+        "forward": 1,
+        "backward": 5,
+        "first_prefetch": [
+          "before",
+          4
+        ]
+      },
+      {
+        "key": [
+          "stage0",
+          1
+        ],
+        "forward": 2,
+        "backward": 6,
+        "first_prefetch": [
+          "before",
+          5
+        ]
+      },
+      {
+        "key": [
+          "stage1",
+          1
+        ],
+        "forward": 4,
+        "backward": 7,
+        "first_prefetch": [
+          "before",
+          6
+        ]
+      }
+    ],
+    "median_ms": 19.5899335,
+    "median_read_interval_ms": 5.02662393450737,
+    "peak_allocated_MiB": 800.13330078125,
+    "peak_reserved_MiB": 1082.0,
+    "boundary_peak_allocated_MiB": 160.1279296875,
+    "pinned_pool_MiB": 384.0,
+    "counters": {
+      "d2h_bytes": 8589934592,
+      "h2d_bytes": 8589934592,
+      "demand_loads": 0,
+      "prefetch_loads": 128,
+      "prefetch_budget_skips": 0,
+      "d2h_throttles": 0,
+      "scope_commits": 64,
+      "schedule_prefetch_calls": 64
+    }
+  },
+  "lead2": {
+    "configuration": {
+      "output": "/tmp/activation-schedule-20261030/v4-lead2.json",
+      "lookahead": 2,
+      "unit": "auto",
+      "tensor_mib": 64,
+      "groups": 2,
+      "entry_groups": 1,
+      "prefetch_mib": 512,
+      "inflight_mib": 512,
+      "compute_repeats": 128,
+      "iterations": 16,
+      "warmup": 3,
+      "sync_actions": true
+    },
+    "plan": [
+      {
+        "key": [
+          "stage0",
+          0
+        ],
+        "forward": 0,
+        "backward": 3,
+        "first_prefetch": [
+          "before",
+          1
+        ]
+      },
+      {
+        "key": [
+          "stage1",
+          0
+        ],
+        "forward": 1,
+        "backward": 5,
+        "first_prefetch": [
+          "before",
+          3
+        ]
+      },
+      {
+        "key": [
+          "stage0",
+          1
+        ],
+        "forward": 2,
+        "backward": 6,
+        "first_prefetch": [
+          "before",
+          4
+        ]
+      },
+      {
+        "key": [
+          "stage1",
+          1
+        ],
+        "forward": 4,
+        "backward": 7,
+        "first_prefetch": [
+          "before",
+          5
+        ]
+      }
+    ],
+    "median_ms": 18.138263000000002,
+    "median_read_interval_ms": 3.6218080073595047,
+    "peak_allocated_MiB": 928.13232421875,
+    "peak_reserved_MiB": 1222.0,
+    "boundary_peak_allocated_MiB": 288.126953125,
+    "pinned_pool_MiB": 384.0,
+    "counters": {
+      "d2h_bytes": 8589934592,
+      "h2d_bytes": 8589934592,
+      "demand_loads": 0,
+      "prefetch_loads": 128,
+      "prefetch_budget_skips": 0,
+      "d2h_throttles": 0,
+      "scope_commits": 64,
+      "schedule_prefetch_calls": 64
+    }
+  },
+  "lead4": {
+    "configuration": {
+      "output": "/tmp/activation-schedule-20261030/v4-lead4.json",
+      "lookahead": 4,
+      "unit": "auto",
+      "tensor_mib": 64,
+      "groups": 2,
+      "entry_groups": 1,
+      "prefetch_mib": 512,
+      "inflight_mib": 512,
+      "compute_repeats": 128,
+      "iterations": 16,
+      "warmup": 3,
+      "sync_actions": true
+    },
+    "plan": [
+      {
+        "key": [
+          "stage0",
+          0
+        ],
+        "forward": 0,
+        "backward": 3,
+        "first_prefetch": [
+          "after",
+          0
+        ]
+      },
+      {
+        "key": [
+          "stage1",
+          0
+        ],
+        "forward": 1,
+        "backward": 5,
+        "first_prefetch": [
+          "after",
+          1
+        ]
+      },
+      {
+        "key": [
+          "stage0",
+          1
+        ],
+        "forward": 2,
+        "backward": 6,
+        "first_prefetch": [
+          "after",
+          2
+        ]
+      },
+      {
+        "key": [
+          "stage1",
+          1
+        ],
+        "forward": 4,
+        "backward": 7,
+        "first_prefetch": [
+          "after",
+          4
+        ]
+      }
+    ],
+    "median_ms": 18.0470855,
+    "median_read_interval_ms": 3.550848051905632,
+    "peak_allocated_MiB": 928.13232421875,
+    "peak_reserved_MiB": 1222.0,
+    "boundary_peak_allocated_MiB": 416.1259765625,
+    "pinned_pool_MiB": 384.0,
+    "counters": {
+      "d2h_bytes": 8589934592,
+      "h2d_bytes": 8589934592,
+      "demand_loads": 0,
+      "prefetch_loads": 128,
+      "prefetch_budget_skips": 0,
+      "d2h_throttles": 0,
+      "scope_commits": 64,
+      "schedule_prefetch_calls": 64
+    }
+  },
+  "lead8": {
+    "configuration": {
+      "output": "/tmp/activation-schedule-20261030/v4-lead8.json",
+      "lookahead": 8,
+      "unit": "auto",
+      "tensor_mib": 64,
+      "groups": 2,
+      "entry_groups": 1,
+      "prefetch_mib": 512,
+      "inflight_mib": 512,
+      "compute_repeats": 128,
+      "iterations": 16,
+      "warmup": 3,
+      "sync_actions": true
+    },
+    "plan": [
+      {
+        "key": [
+          "stage0",
+          0
+        ],
+        "forward": 0,
+        "backward": 3,
+        "first_prefetch": [
+          "after",
+          0
+        ]
+      },
+      {
+        "key": [
+          "stage1",
+          0
+        ],
+        "forward": 1,
+        "backward": 5,
+        "first_prefetch": [
+          "after",
+          1
+        ]
+      },
+      {
+        "key": [
+          "stage0",
+          1
+        ],
+        "forward": 2,
+        "backward": 6,
+        "first_prefetch": [
+          "after",
+          2
+        ]
+      },
+      {
+        "key": [
+          "stage1",
+          1
+        ],
+        "forward": 4,
+        "backward": 7,
+        "first_prefetch": [
+          "after",
+          4
+        ]
+      }
+    ],
+    "median_ms": 17.993909,
+    "median_read_interval_ms": 3.521792009472847,
+    "peak_allocated_MiB": 928.13232421875,
+    "peak_reserved_MiB": 1222.0,
+    "boundary_peak_allocated_MiB": 416.1259765625,
+    "pinned_pool_MiB": 384.0,
+    "counters": {
+      "d2h_bytes": 8589934592,
+      "h2d_bytes": 8589934592,
+      "demand_loads": 0,
+      "prefetch_loads": 128,
+      "prefetch_budget_skips": 0,
+      "d2h_throttles": 0,
+      "scope_commits": 64,
+      "schedule_prefetch_calls": 64
+    }
+  },
+  "small-window": {
+    "configuration": {
+      "output": "/tmp/activation-schedule-20261030/v4-small-window.json",
+      "lookahead": 4,
+      "unit": "auto",
+      "tensor_mib": 64,
+      "groups": 2,
+      "entry_groups": 1,
+      "prefetch_mib": 64,
+      "inflight_mib": 512,
+      "compute_repeats": 128,
+      "iterations": 16,
+      "warmup": 3,
+      "sync_actions": true
+    },
+    "plan": [
+      {
+        "key": [
+          "stage0",
+          0
+        ],
+        "forward": 0,
+        "backward": 3,
+        "first_prefetch": [
+          "after",
+          0
+        ]
+      },
+      {
+        "key": [
+          "stage1",
+          0
+        ],
+        "forward": 1,
+        "backward": 5,
+        "first_prefetch": [
+          "after",
+          1
+        ]
+      },
+      {
+        "key": [
+          "stage0",
+          1
+        ],
+        "forward": 2,
+        "backward": 6,
+        "first_prefetch": [
+          "after",
+          2
+        ]
+      },
+      {
+        "key": [
+          "stage1",
+          1
+        ],
+        "forward": 4,
+        "backward": 7,
+        "first_prefetch": [
+          "after",
+          4
+        ]
+      }
+    ],
+    "median_ms": 24.184304,
+    "median_read_interval_ms": 9.402432203292847,
+    "peak_allocated_MiB": 672.13427734375,
+    "peak_reserved_MiB": 962.0,
+    "boundary_peak_allocated_MiB": 96.1279296875,
+    "pinned_pool_MiB": 384.0,
+    "counters": {
+      "d2h_bytes": 8589934592,
+      "h2d_bytes": 8589934592,
+      "demand_loads": 0,
+      "prefetch_loads": 128,
+      "prefetch_budget_skips": 224,
+      "d2h_throttles": 0,
+      "scope_commits": 64,
+      "schedule_prefetch_calls": 224
+    }
+  },
+  "group-unit": {
+    "configuration": {
+      "output": "/tmp/activation-schedule-20261030/v4-group-unit.json",
+      "lookahead": 4,
+      "unit": "group",
+      "tensor_mib": 64,
+      "groups": 2,
+      "entry_groups": 1,
+      "prefetch_mib": 512,
+      "inflight_mib": 512,
+      "compute_repeats": 128,
+      "iterations": 16,
+      "warmup": 3,
+      "sync_actions": true
+    },
+    "plan": [
+      {
+        "key": [
+          "stage0",
+          0
+        ],
+        "forward": 0,
+        "backward": 3,
+        "first_prefetch": [
+          "after",
+          0
+        ]
+      },
+      {
+        "key": [
+          "stage1",
+          0
+        ],
+        "forward": 1,
+        "backward": 5,
+        "first_prefetch": [
+          "after",
+          1
+        ]
+      },
+      {
+        "key": [
+          "stage0",
+          1
+        ],
+        "forward": 2,
+        "backward": 6,
+        "first_prefetch": [
+          "after",
+          2
+        ]
+      },
+      {
+        "key": [
+          "stage1",
+          1
+        ],
+        "forward": 4,
+        "backward": 7,
+        "first_prefetch": [
+          "after",
+          4
+        ]
+      }
+    ],
+    "median_ms": 26.5610525,
+    "median_read_interval_ms": 12.049824178218842,
+    "peak_allocated_MiB": 800.13232421875,
+    "peak_reserved_MiB": 1002.0,
+    "boundary_peak_allocated_MiB": 224.1259765625,
+    "pinned_pool_MiB": 384.0,
+    "counters": {
+      "d2h_bytes": 8589934592,
+      "h2d_bytes": 8589934592,
+      "demand_loads": 0,
+      "prefetch_loads": 128,
+      "prefetch_budget_skips": 0,
+      "d2h_throttles": 0,
+      "scope_commits": 0,
+      "schedule_prefetch_calls": 64
+    }
+  },
+  "group-all": {
+    "configuration": {
+      "output": "/tmp/activation-schedule-20261030/v4-group-all.json",
+      "lookahead": 4,
+      "unit": "group",
+      "tensor_mib": 64,
+      "groups": 2,
+      "entry_groups": 2,
+      "prefetch_mib": 512,
+      "inflight_mib": 512,
+      "compute_repeats": 128,
+      "iterations": 16,
+      "warmup": 3,
+      "sync_actions": true
+    },
+    "plan": [
+      {
+        "key": [
+          "stage0",
+          0
+        ],
+        "forward": 0,
+        "backward": 3,
+        "first_prefetch": [
+          "after",
+          0
+        ]
+      },
+      {
+        "key": [
+          "stage1",
+          0
+        ],
+        "forward": 1,
+        "backward": 5,
+        "first_prefetch": [
+          "after",
+          1
+        ]
+      },
+      {
+        "key": [
+          "stage0",
+          1
+        ],
+        "forward": 2,
+        "backward": 6,
+        "first_prefetch": [
+          "after",
+          2
+        ]
+      },
+      {
+        "key": [
+          "stage1",
+          1
+        ],
+        "forward": 4,
+        "backward": 7,
+        "first_prefetch": [
+          "after",
+          4
+        ]
+      }
+    ],
+    "median_ms": 17.471394500000002,
+    "median_read_interval_ms": 2.8098719865083694,
+    "peak_allocated_MiB": 928.13232421875,
+    "peak_reserved_MiB": 1142.0,
+    "boundary_peak_allocated_MiB": 416.1259765625,
+    "pinned_pool_MiB": 384.0,
+    "counters": {
+      "d2h_bytes": 8589934592,
+      "h2d_bytes": 8589934592,
+      "demand_loads": 0,
+      "prefetch_loads": 128,
+      "prefetch_budget_skips": 0,
+      "d2h_throttles": 0,
+      "scope_commits": 0,
+      "schedule_prefetch_calls": 64
+    }
+  },
+  "async0": {
+    "configuration": {
+      "output": "/tmp/activation-schedule-20261030/v4-async0.json",
+      "lookahead": 0,
+      "unit": "auto",
+      "tensor_mib": 64,
+      "groups": 2,
+      "entry_groups": 1,
+      "prefetch_mib": 512,
+      "inflight_mib": 512,
+      "compute_repeats": 128,
+      "iterations": 16,
+      "warmup": 3,
+      "sync_actions": false
+    },
+    "plan": [
+      {
+        "key": [
+          "stage0",
+          0
+        ],
+        "forward": 0,
+        "backward": 3,
+        "first_prefetch": null
+      },
+      {
+        "key": [
+          "stage1",
+          0
+        ],
+        "forward": 1,
+        "backward": 5,
+        "first_prefetch": null
+      },
+      {
+        "key": [
+          "stage0",
+          1
+        ],
+        "forward": 2,
+        "backward": 6,
+        "first_prefetch": null
+      },
+      {
+        "key": [
+          "stage1",
+          1
+        ],
+        "forward": 4,
+        "backward": 7,
+        "first_prefetch": null
+      }
+    ],
+    "median_ms": 18.472651,
+    "median_read_interval_ms": 4.846640005707741,
+    "peak_allocated_MiB": 672.13427734375,
+    "peak_reserved_MiB": 1282.0,
+    "boundary_peak_allocated_MiB": 32.12890625,
+    "pinned_pool_MiB": 448.0,
+    "counters": {
+      "d2h_bytes": 8589934592,
+      "h2d_bytes": 8589934592,
+      "demand_loads": 64,
+      "prefetch_loads": 64,
+      "prefetch_budget_skips": 0,
+      "d2h_throttles": 0,
+      "scope_commits": 64,
+      "schedule_prefetch_calls": 0
+    }
+  },
+  "async4": {
+    "configuration": {
+      "output": "/tmp/activation-schedule-20261030/v4-async4.json",
+      "lookahead": 4,
+      "unit": "auto",
+      "tensor_mib": 64,
+      "groups": 2,
+      "entry_groups": 1,
+      "prefetch_mib": 512,
+      "inflight_mib": 512,
+      "compute_repeats": 128,
+      "iterations": 16,
+      "warmup": 3,
+      "sync_actions": false
+    },
+    "plan": [
+      {
+        "key": [
+          "stage0",
+          0
+        ],
+        "forward": 0,
+        "backward": 3,
+        "first_prefetch": [
+          "after",
+          0
+        ]
+      },
+      {
+        "key": [
+          "stage1",
+          0
+        ],
+        "forward": 1,
+        "backward": 5,
+        "first_prefetch": [
+          "after",
+          1
+        ]
+      },
+      {
+        "key": [
+          "stage0",
+          1
+        ],
+        "forward": 2,
+        "backward": 6,
+        "first_prefetch": [
+          "after",
+          2
+        ]
+      },
+      {
+        "key": [
+          "stage1",
+          1
+        ],
+        "forward": 4,
+        "backward": 7,
+        "first_prefetch": [
+          "after",
+          4
+        ]
+      }
+    ],
+    "median_ms": 17.987964499999997,
+    "median_read_interval_ms": 4.360351994633675,
+    "peak_allocated_MiB": 928.13232421875,
+    "peak_reserved_MiB": 1342.0,
+    "boundary_peak_allocated_MiB": 416.1259765625,
+    "pinned_pool_MiB": 448.0,
+    "counters": {
+      "d2h_bytes": 8589934592,
+      "h2d_bytes": 8589934592,
+      "demand_loads": 0,
+      "prefetch_loads": 128,
+      "prefetch_budget_skips": 0,
+      "d2h_throttles": 0,
+      "scope_commits": 64,
+      "schedule_prefetch_calls": 64
+    }
+  }
+}

@@ -551,6 +551,26 @@ def test_codegen_fn_pipeline_input_references_are_opt_in(tmp_path, release_input
     assert any('release_inputs=(' in source for source in sources) == release_inputs
     assert any('with self.cpu_offloading_hooks(' in source for source in sources) == offload
     assert any('release_output_tensor(' in source for source in sources) == release_outputs
+    assert any('model.activation_offload_schedule(' in source for source in sources) == offload
+    for source in sources:
+        tree = ast.parse(source)
+        for function in (node for node in ast.walk(tree) if isinstance(node, ast.FunctionDef)
+                         and node.name in ('_train_step', '_infer_step')):
+            calls = [node for node in ast.walk(function) if isinstance(node, ast.Call)
+                     and isinstance(node.func, ast.Attribute)]
+            entries = [ast.literal_eval(node.args[0]) for node in calls
+                       if node.func.attr == 'activation_offload_schedule']
+            before = [ast.literal_eval(node.args[0]) for node in calls
+                      if node.func.attr == 'before' and isinstance(node.func.value, ast.Name)
+                      and node.func.value.id == '_activation_schedule']
+            after = [ast.literal_eval(node.args[0]) for node in calls
+                     if node.func.attr == 'after' and isinstance(node.func.value, ast.Name)
+                     and node.func.value.id == '_activation_schedule']
+            if function.name == '_infer_step' or not offload:
+                assert not entries and not before and not after
+            elif entries:
+                assert len(entries) == 1 and all(f < b for _, f, b in entries[0])
+                assert sorted(before) == sorted(after) == list(range(len(before)))
 
 
 def _pipeline_cpu_offload_runtime_worker(tempdir, offload, release_inputs, release_outputs):
@@ -597,9 +617,13 @@ def _pipeline_cpu_offload_runtime_worker(tempdir, offload, release_inputs, relea
     samples = [torch.randn(4, 4) for _ in range(2)]
     losses = parallel_model.train_step(samples)
     stats = parallel_model.activation_offload_stats()
-    assert bool(stats.get('offloaded_storages', 0)) == offload
+    counts = torch.tensor([stats.get('offloaded_storages', 0), stats.get('prefetch_loads', 0)], device='cuda')
+    torch.distributed.all_reduce(counts)
+    assert bool(counts[0].item()) == offload
     if offload:
-        assert stats['prefetch_loads'] > 0
+        # A rank whose whole forward scope is immediately consumed may keep
+        # that scope resident. Other ranks still exercise actual transfers.
+        assert counts[1].item() > 0
         assert stats['live_cpu_bytes'] == 0
     assert all(param.grad is not None for param in parallel_model.parameters())
     assert all(torch.isfinite(param.grad).all() for param in parallel_model.parameters())

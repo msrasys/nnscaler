@@ -430,9 +430,17 @@ class ComputeConfig:
         if Path(file).exists():
             try:
                 cfg = torch.load(file, weights_only=False)
+                raw_cpu = cfg.cpu_offload if isinstance(cfg, cls) else cfg.get('cpu_offload') if isinstance(cfg, dict) else None
+                legacy_activation_schedule = (raw_cpu is not None and '_schedule_version' not in
+                                              (raw_cpu if isinstance(raw_cpu, dict) else vars(raw_cpu)))
                 if isinstance(cfg, cls):
                     cfg = asdict(cfg)
                 if isinstance(cfg, dict): # in old version, we save the object directly (not save as dict)
+                    if legacy_activation_schedule:
+                        cpu_fields = cfg['cpu_offload']
+                        if not isinstance(cpu_fields, dict):
+                            cpu_fields = asdict(cpu_fields)
+                        cfg['cpu_offload'] = dict(cpu_fields, _schedule_version=0)
                     # this can raise if cfg has extra keys.
                     # which means some fields of ComputeConfig has been removed(we should avoid this).
                     # in this case, we just return None.

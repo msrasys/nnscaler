@@ -33,9 +33,20 @@ class CPUOffloadConfig:
     host_reserve_bytes: int = 32 * 1024**3
     # Keep disproportionate views resident; 0 permits copying their full storage.
     max_storage_to_tensor_ratio: int = 8
+    # auto: whole scheduled virtual-stage F/B scopes, groups otherwise.
+    transfer_unit: str = 'auto'
+    # Local virtual-stage F/B actions before the consuming backward. Zero
+    # disables cross-action lookahead; group/current-backward refill remains.
+    pipeline_prefetch_steps: int = 1
+    # Serialized schedule ABI. Legacy configs load as 0 to invalidate gencode.
+    _schedule_version: int = 1
 
     def __post_init__(self):
         for name, value in vars(self).items():
+            if name == 'transfer_unit':
+                if value not in ('auto', 'scope', 'group'):
+                    raise ValueError('transfer_unit must be auto, scope, or group')
+                continue
             if name in ('reload_on_compute_stream', 'skip_retained_inputs', 'use_save_events', 'release_pipeline_inputs'):
                 if not isinstance(value, bool):
                     raise ValueError(f'{name} must be a bool')
