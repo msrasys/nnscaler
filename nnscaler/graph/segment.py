@@ -905,6 +905,12 @@ class IRSegment(IRCell):
         for idx, output in enumerate(multiref.outputs()):
             if ftensor.grad is None or consumers[idx].mirror is None:
                 output.grad = None
+                # An alias consumed by an operator without backward (detach, IRPyFunc)
+                # never receives a gradient. Staging and identity insertion rebuild
+                # segment interface gradients from `requires_grad`, so keeping True
+                # here would give a forward segment output a gradient with no matching
+                # backward segment input once the alias crosses a stage boundary.
+                ftensors[idx].requires_grad = False
             else:
                 output.grad = ftensors[idx].grad.select(tensor.indmap, (0,1))
         # insert multiref

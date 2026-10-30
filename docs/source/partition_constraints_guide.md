@@ -120,8 +120,11 @@ in the compute graph while keeping every loss-dependent use differentiable:
   loss-dependent stage. Returning the result through `.data` or `.detach()` is not
   enough, because the consuming stage would still declare an input gradient that its
   loss never produces.
-- A shared parameter with auxiliary-only uses in later stages is detached in its
-  earliest consumer stage and sent to those stages as a detached activation.
+- A shared parameter is not detached automatically. By default later stages receive
+  a shared parameter as an activation, so using it only for an auxiliary value in a
+  stage other than its first consumer stage is rejected at compile time: that stage
+  would declare a gradient the loss never produces. Detach it at the use site
+  instead, for example `F.linear(x, self.weight.detach())`.
 
 For example, with `layers[i]` assigned to stage `i`:
 

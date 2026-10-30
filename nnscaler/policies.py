@@ -608,7 +608,10 @@ def _refresh_grads(segment: IRSegment, tensor: IRSubTensor):
 
 def _pp_get_aux_outputs(
     graph: IRGraph, op_plans: dict[IRFwOperation, OpPlan],
-) -> dict[IRSubTensor, tuple[Optional[IRFwOperation], int, int, tuple[IRFwOperation, ...]]]:
+) -> tuple[
+    dict[IRSubTensor, tuple[Optional[IRFwOperation], int, int, tuple[IRFwOperation, ...]]],
+    dict[IRFullTensor, IRFwOperation],
+]:
     """Resolve output and boundary detach sites without editing the original graph.
 
     Args:
@@ -616,7 +619,15 @@ def _pp_get_aux_outputs(
         op_plans: Operator plans with resolved stage IDs.
 
     Returns:
-        A dict mapping each source tensor to
+        ``(sites, aux_param_uses)``.
+
+        ``aux_param_uses`` maps a parameter to one consumer that uses it only for
+        an auxiliary value in a stage other than its first consumer stage. Such a
+        use is harmless while every stage holds the parameter, but breaks once
+        shared-parameter multiref turns it into a per-consumer activation, so the
+        caller rejects it at that decision. See the TODO in the attribute branch.
+
+        ``sites`` is a dict mapping each source tensor to
         ``(producer, stage_id, position, consumers)``:
 
         * producer: The source's forward producer, or None for attributes.
@@ -631,12 +642,11 @@ def _pp_get_aux_outputs(
           An empty tuple means only a graph output needs detaching. A source
           that is also a graph output must have that output replaced as well.
 
-        Returns an empty dict when the loss has no gradient or no detaches
-        are needed.
+        Both are empty when the loss has no gradient.
     """
     loss = graph.output(0)
     if loss.grad is None:
-        return {}  # don't need to update the graph if loss has no gradient (inference mode)
+        return {}, {}  # don't need to update the graph if loss has no gradient (inference mode)
 
     # Graph outputs that still carry a gradient and must be replaced by detached views.
     # Do not return early when this set is empty: it only covers returned values,
@@ -666,6 +676,7 @@ def _pp_get_aux_outputs(
         for position, node in enumerate(graph.nodes()) if node in op_plans
     }
     expanded = {}
+    aux_param_uses: dict[IRFullTensor, IRFwOperation] = {}
     for tensor in graph.full_tensors():
         if tensor.is_grad() or not tensor.requires_grad or tensor.is_loss():
             continue
@@ -683,10 +694,15 @@ def _pp_get_aux_outputs(
 
             producer = None
             detach_stage = min(op_plans[node].stage_id for node in consumers)
-            detached_consumers = [
-                node for node in consumers
-                if node not in live_nodes and op_plans[node].stage_id != detach_stage
-            ]
+            # TODO: auxiliary-only uses of a parameter in a later stage are not cut here.
+            # A handwritten `op(param.detach())` is needed for auxiliary-only uses in later stages.
+            detached_consumers = []
+            for node in consumers:
+                if node in live_nodes or op_plans[node].stage_id == detach_stage:
+                    continue
+                if any(t.grad is not None for t in node.inputs()
+                       if isinstance(t, IRSubTensor) and t.parent == tensor):
+                    aux_param_uses.setdefault(tensor, node)
         else:
             producers = graph.producers(tensor)
             if not producers or not isinstance(producers[0], IRFwOperation):
@@ -702,14 +718,17 @@ def _pp_get_aux_outputs(
         tensor_sub = tensor.tosub()
         if tensor_sub in aux_outputs or detached_consumers:
             expanded[tensor_sub] = (producer, detach_stage, stage_ends[detach_stage], tuple(detached_consumers))
-    return expanded
+    return expanded, aux_param_uses
 
 
 def _pp_detach_aux_outputs(
     graph: IRGraph, op_plans: dict[IRFwOperation, OpPlan]
-) -> None:
+) -> dict[IRFullTensor, IRFwOperation]:
     """
     Insert boundary/output detaches and update affected backward outputs.
+
+    Returns the auxiliary-only parameter uses that shared-parameter multiref would
+    break; see `_pp_get_aux_outputs`.
 
     Only the first output (loss) seeds backward. Other outputs are values
     to return, not additional backward roots.
@@ -758,9 +777,9 @@ def _pp_detach_aux_outputs(
         Stage 1 will fail if we don't detach the cross-stage input used only by the auxiliary branch.
     """
     from nnscaler.graph.function.function import Detach
-    sites = _pp_get_aux_outputs(graph, op_plans)
+    sites, aux_param_uses = _pp_get_aux_outputs(graph, op_plans)
     if not sites:
-        return
+        return aux_param_uses
 
     # Sort the sites by their position in descending order
     # to ensure that insertions do not affect subsequent positions.
@@ -818,6 +837,7 @@ def _pp_detach_aux_outputs(
         # isolate this branch, while the loss path through h and y stays intact.
         _refresh_grads(graph, source)
         _refresh_grads(graph, detach.output(0))
+    return aux_param_uses
 
 
 def _identity_segment_output(graph: IRGraph, tensor: IRSubTensor, segment: IRSegment, all_segments: List[IRSegment]) -> IRFwOperation:
@@ -1191,8 +1211,9 @@ def fn(
 
     # Plan the inserted nodes together with user operators, before any
     # recompute/offload grouping, tensor-split bookkeeping or graph rewrites.
+    aux_param_uses: dict[IRFullTensor, IRFwOperation] = {}
     if nstages > 1:
-        _pp_detach_aux_outputs(graph, op_plans)
+        aux_param_uses = _pp_detach_aux_outputs(graph, op_plans)
 
     recompute_groups: dict[int, list[IRFwOperation]] = {}
     recompute_last_id: int = -1
@@ -1465,7 +1486,25 @@ def fn(
         # 4. (2) and (3): if the param is shared across stages and is replicated in at least one stage.
         #    Note: the case when some is replicated and some is partitioned is handled by (1).
 
+        # TODO: `graph.multiref` creates one alias per consumer, so a stage that uses a
+        # shared parameter several times with the same partition receives one copy per
+        # consumer and returns one gradient per copy.
+        # It is a waste. Should create multiref per (stage, partition) instead of per consumer.
         if len(splits) > 1 or (pp_multiref_replicated_params and len(stage_info) > 1 and find_replicated):
+            if ftensor in aux_param_uses:
+                # Only the first consumer stage keeps the parameter; every other
+                # consumer gets its own alias as an activation and declares a gradient
+                # for it that an auxiliary-only consumer never produces.
+                node = aux_param_uses[ftensor]
+                raise RuntimeError(
+                    f"Parameter {ftensor.name} is used by {node.signature} in pipeline stage "
+                    f"{op_plans[node].stage_id} only for an auxiliary output, but that stage "
+                    "receives it as an activation from stage "
+                    f"{min(stage_info)} and would declare a gradient the loss never produces. "
+                    "Detach it at the use site, e.g. `op(param.detach())`, or set "
+                    "pas_config['pipeline_multiref_replicated_params'] to False when every "
+                    "stage can hold the parameter."
+                )
             _logger.info(f'add multiref for shared param {ftensor}')
             consumers = graph.consumers(ftensor)
             multiref_node = graph.multiref(ftensor, comment='shared param')

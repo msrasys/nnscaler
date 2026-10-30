@@ -123,6 +123,13 @@ class PipelineWithSharedWeight(PipelineWithUnusedStageInputs):
         self.layers[3].weight = self.layers[0].weight
 
 
+class PipelineWithSharedWeightDetached(PipelineWithSharedWeight):
+    # The documented workaround: the aux use detaches the shared weight itself, so
+    # its multiref alias carries no gradient into stage 3.
+    def _auxiliary(self, x):
+        return torch.nn.functional.linear(x, self.aux.weight.detach())
+
+
 class PipelineWithSinAux(PipelineWithUnusedStageInputs):
     def _auxiliary(self, x):
         return x.sin()
@@ -238,6 +245,18 @@ def test_fn_aux_outputs(use_fbw, value_partition):
 
 
 # Only representative combinations are needed; the cases below target different cuts.
+SHARED_WEIGHT_AUX_REASON = (
+    'Auxiliary-only use of a shared weight in a later stage is rejected until '
+    'multiref creates one alias per stage.'
+)
+
+
+def shared_weight_xfail(*values, raises=ChildFailedError):
+    return pytest.param(*values, marks=pytest.mark.xfail(
+        strict=True, raises=raises, reason=SHARED_WEIGHT_AUX_REASON,
+    ))
+
+
 @pytest.mark.skipif(torch.cuda.device_count() < 4, reason='requires 4 GPUs')
 @pytest.mark.parametrize('use_fbw,model_cls,detach_method', [
     # Both output and boundary need detaching.
@@ -249,11 +268,13 @@ def test_fn_aux_outputs(use_fbw, value_partition):
     (False, PipelineWithIndependentAux, 'data'),
     # A late loss consumer must keep its gradient.
     (False, PipelineWithLiveAuxInput, 'data'),
-    # Detach the aux weight use, not the live use in the same stage.
-    (False, PipelineWithSharedWeight, 'data'),
+    # A shared weight used only by aux in a later stage must be detached by hand.
+    shared_weight_xfail(False, PipelineWithSharedWeight, 'data'),
+    (False, PipelineWithSharedWeightDetached, 'data'),
     # Activation and shared-parameter boundary cuts with separate B/W execution.
     (True, PipelineWithUnusedStageInputs, 'implicit'),
-    (True, PipelineWithSharedWeight, 'implicit'),
+    shared_weight_xfail(True, PipelineWithSharedWeight, 'implicit'),
+    (True, PipelineWithSharedWeightDetached, 'implicit'),
     # Preserve internally created gradients and the traced no_grad context.
     (False, PipelineWithGradFactoryAux, 'implicit'),
     (False, PipelineWithNoGradAux, 'implicit'),
@@ -268,7 +289,9 @@ def test_fn_aux_boundary(use_fbw, model_cls, detach_method):
 @pytest.mark.skipif(torch.cuda.device_count() < 4, reason='requires 4 GPUs')
 @pytest.mark.parametrize('use_fbw,memory_mode,model_cls', [
     # Shared parameters must retain their loss gradient in both memory modes.
-    (False, 'recompute', PipelineWithSharedWeight), (True, 'offload', PipelineWithSharedWeight),
+    shared_weight_xfail(False, 'recompute', PipelineWithSharedWeight),
+    shared_weight_xfail(True, 'offload', PipelineWithSharedWeight),
+    (False, 'recompute', PipelineWithSharedWeightDetached), (True, 'offload', PipelineWithSharedWeightDetached),
     # Sin retains conservative True in the IR after its input is detached.
     (False, 'recompute', PipelineWithSinAux), (True, 'offload', PipelineWithSinAux),
 ])
@@ -282,7 +305,8 @@ def test_fn_aux_memory_regions(use_fbw, memory_mode, model_cls):
 # Update both existing backward nodes, including an empty output list for sin.
 @replace_all_device_with('cpu')
 @pytest.mark.parametrize('model_cls', [
-    PipelineWithUnusedStageInputs, PipelineWithSinAux, PipelineWithSharedWeight,
+    PipelineWithUnusedStageInputs, PipelineWithSinAux, PipelineWithSharedWeightDetached,
+    shared_weight_xfail(PipelineWithSharedWeight, raises=RuntimeError),
 ])
 def test_fn_aux_updates_backward_locally(tmp_path, monkeypatch, model_cls):
     insert = policies._pp_detach_aux_outputs
@@ -299,7 +323,7 @@ def test_fn_aux_updates_backward_locally(tmp_path, monkeypatch, model_cls):
         assert source.grad.valmap == (0, 2)
         assert aux.input(0).grad.valmap == (1, 2)
 
-        insert(graph, plans)
+        result = insert(graph, plans)
 
         assert [node.cid for node in graph.select(ntype=IRBpOperation)] == backward_ids
         assert layer.input(0) == source
@@ -316,6 +340,7 @@ def test_fn_aux_updates_backward_locally(tmp_path, monkeypatch, model_cls):
         ]
         assert detaches and all(node.mirror is None for node in detaches)
         checked.append(True)
+        return result
 
     monkeypatch.setattr(policies, '_pp_detach_aux_outputs', checked_insert)
     parallelize(
