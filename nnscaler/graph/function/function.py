@@ -1069,6 +1069,7 @@ def Detach(input, signature = None):
     """
     torch.Tensor.detach(input)
     """
+    signature = 'torch.Tensor.detach'
     annos = ['* -> *']
     return IRDimops(Detach, 'detach', signature, annos, [input])
 

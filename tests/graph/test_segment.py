@@ -52,6 +52,32 @@ def test_create_segment_loss_func():
     assert segment.output(1) == d
 
 
+def test_multiref_no_backward_consumer_alias():
+    # The alias of a consumer without backward never receives a gradient. If it kept
+    # requires_grad=True, staging would rebuild a segment output gradient for it with
+    # no matching backward segment input once the alias crosses a stage boundary.
+    data = _tensor([256, 256], False)
+    w = _tensor([256, 256])
+    out = _tensor([256, 256])
+    linear = F.Linear(data, w)
+    linear.set_output(0, out)
+    loss = _tensor([1])
+    sum = F.Sum(out)
+    sum.set_output(0, loss)
+    detached = _tensor([256, 256], False)
+    detach = F.Detach(w)
+    detach.set_output(0, detached)
+    graph = IRGraph([linear, sum, detach], [data], [loss, detached], 'genmodel')
+    graph.backward(loss)
+    assert detach.mirror is None
+
+    graph.multiref(w.parent)
+    live_alias, dead_alias = linear.input(1), detach.input(0)
+    assert live_alias.parent != w.parent and dead_alias.parent != live_alias.parent
+    assert live_alias.requires_grad and live_alias.grad is not None
+    assert not dead_alias.requires_grad and dead_alias.grad is None
+
+
 def test_create_segment_loss_adapter():
     data = _tensor([256, 256], False)
     w1 = _tensor([256, 256])

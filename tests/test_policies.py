@@ -1586,6 +1586,57 @@ def test_codegen_fn_pipeline2(tmp_path):
     assert True
 
 
+class FnPolicyRepeatedInputModule(torch.nn.Module):
+    def __init__(self, grad_input):
+        super().__init__()
+        self.grad_input = grad_input
+        self.layers = torch.nn.ModuleList([
+            torch.nn.Linear(4, 4, bias=False) for _ in range(4)
+        ])
+
+    def forward(self, x):
+        x = x + 1
+        first = self.layers[0](x)
+        hidden = self.layers[1](first)
+        hidden = self.layers[2](hidden)
+        hidden = self.layers[3](hidden)
+        repeated = first if self.grad_input else x
+        # Both uses cross from stage 0 to stage 3, without any auxiliary outputs.
+        return (hidden + (repeated + repeated)).square().sum()
+
+
+@replace_all_device_with('cpu')
+@pytest.mark.parametrize('grad_input', [False, True])
+@pytest.mark.xfail(
+    strict=True, raises=RuntimeError,
+    reason='staging only replaces the first occurrence of repeated cross-stage inputs',
+)
+def test_codegen_fn_pipeline_repeated_input(tmp_path, grad_input):
+    from nnscaler.policies import OpPlan, OpPartition, get_layer_index
+
+    def policy(graph, cfg):
+        stage_id = 0
+        for node in get_pas_ops(graph):
+            partition = None
+            if torch.nn.Linear in node.module_class_chain:
+                stage_id = get_layer_index(node.fqn)
+                partition = OpPartition(input=0, dim=0)
+            yield OpPlan(node, stage_id=stage_id, partition=partition)
+
+    parallelize(
+        FnPolicyRepeatedInputModule(grad_input),
+        {'x': torch.randn(4, 4)},
+        policy,
+        ComputeConfig(4, 4, use_end2end=True, pas_config={
+            'pipeline_size': 2,
+            'pipeline_nmicros': 4,
+            'pipeline_scheduler': '1f1b_interleaved',
+        }),
+        gen_savedir=tmp_path,
+        load_module=False,
+    )
+
+
 class HookModule(torch.nn.Module):
     def __init__(self):
         super().__init__()
