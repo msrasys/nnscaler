@@ -1035,3 +1035,61 @@ def test_lookup_with_cross_stage_tensor_input(tmp_path):
     )
     assert _gencode_contains(tmp_path, TensorDefaultLookupModule, 1, r"_operator.getitem\(data_\d+, 'meta'\)")
     assert not _gencode_contains(tmp_path, TensorDefaultLookupModule, 0, r"builtins.dict.get")
+
+
+class NonSinkableDefaultLookupModule(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.w0 = torch.nn.Parameter(torch.randn(4, 4))
+        self.w1 = torch.nn.Parameter(torch.randn(4, 4))
+        self.w2 = torch.nn.Parameter(torch.randn(4, 4))
+        self.w3 = torch.nn.Parameter(torch.randn(4, 4))
+        self.register_buffer('default_scale', torch.tensor(3.0))
+
+    def forward(self, data: dict):
+        # lookups whose defaults are not dataloader-derived: a registered buffer,
+        # and a computed tensor nested inside a container default
+        scale = data['meta'].get('scale', self.default_scale)
+        meta = data.get('meta', {'bias': torch.sum(self.w0)})
+        x0 = data['data'] + self.w0
+        x1 = x0 + self.w1
+
+        x2 = x1 + self.w2
+        x3 = x2 + self.w3
+
+        return torch.sum(x3 * scale * meta['bias'])
+
+
+@replace_all_device_with('cpu')
+def test_lookup_with_non_sinkable_default(tmp_path):
+    m = NonSinkableDefaultLookupModule()
+    m.train()
+    parallelize(
+        m,
+        {'data': {'data': torch.randn(4, 4), 'meta': {'scale': 2.0, 'bias': 1.0}}},
+        pas_policy=_shared_output_partition_policy,
+        compute_config= ComputeConfig(
+            2, 4,
+            constant_folding=False,
+            use_end2end=True,
+            pas_config=dict(
+                pipeline_nmicros=2,
+                pipeline_scheduler='1f1b'
+            )
+        ),
+        gen_savedir=tmp_path,
+        load_module=False,
+        reuse='override',
+    )
+    # neither lookup can be recomputed in the consumer stage: both stay in stage 0
+    # and only their results are forwarded
+    assert _gencode_contains(
+        tmp_path, NonSinkableDefaultLookupModule, 0, r"builtins.dict.get\(getitem_[\d_]+, 'scale', self.default_scale_\d+\)"
+    )
+    assert _gencode_contains(
+        tmp_path, NonSinkableDefaultLookupModule, 0, r"builtins.dict.get\(data_\d+, 'meta', \{'bias': sum_[\d_]+\}\)"
+    )
+    assert not _gencode_contains(tmp_path, NonSinkableDefaultLookupModule, 1, r"builtins.dict.get")
+    assert len(_gencode_contains(
+        tmp_path, NonSinkableDefaultLookupModule, 1, r"nnscaler.runtime.adapter.move_object\(\(\), src=0, dst=1\)"
+    )) == 2

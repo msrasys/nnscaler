@@ -796,12 +796,15 @@ def _duplicate_dataloader_index_ops_per_stage(graph: IRGraph, op_plans: dict) ->
             node_sinkable_cache[node.cid] = False
             return False
 
-        for inp in node.inputs():
-            if not isinstance(inp, IRObject):
-                continue
+        for inp in node.iobjs():
             if inp.tid in dataloader_output_tids:
                 continue
             prods = graph.producers(inp.parent)
+            if not prods:
+                # parameters, buffers and other producer-less values are not
+                # available in every stage, so the lookup must stay where it is
+                node_sinkable_cache[node.cid] = False
+                return False
             assert len(prods) == 1, "Internal Error: call this before graph partitioning, each tensor/object should have a single producer"
             if _is_sinkable(prods[0]):
                 continue
