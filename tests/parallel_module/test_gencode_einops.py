@@ -50,7 +50,9 @@ def test_trace_rearrange():
     for obj in gc.get_objects():
         # einops is using functools.cache
         # will leak memory if not properly handle it.
-        assert not isinstance(obj, ConcreteTracer)
+        # Avoid isinstance: it reads __class__ on PyTorch's deprecated reduce_op
+        # singleton in gc.get_objects(), emitting a FutureWarning.
+        assert not issubclass(type(obj), ConcreteTracer)
 
 
 @replace_all_device_with('cpu')

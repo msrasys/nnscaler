@@ -423,15 +423,26 @@ def test_ScaledDotProductAttention():
 
 
 def test_NewTensor():
-    op = F.NewTensor(torch.tensor(1))
+    op = F.NewTensor(1)
     assert op.signature == 'nnscaler.runtime.function.tensor'
     assert repr(op.anno) == ' -> 1^'
     assert op.kwargs['data'] == 1
 
-    op = F.NewTensor(torch.tensor([1,2]))
+    op = F.NewTensor([1,2])
     assert op.signature == 'nnscaler.runtime.function.tensor'
     assert repr(op.anno) == ' -> 2^'
     assert op.kwargs['data'] == [1,2]
+
+    op = F.NewTensor(IRObject(value=[1,2]))
+    assert op.signature == 'nnscaler.runtime.function.tensor'
+    assert repr(op.anno) == ' -> 2^'
+    assert op.kwargs['data'].value == [1,2]
+
+    op = F.NewTensor([1, IRObject(value=2)])
+    assert op.signature == 'nnscaler.runtime.function.tensor'
+    assert repr(op.anno) == ' -> 2^'
+    assert op.kwargs['data'][0] == 1
+    assert op.kwargs['data'][1].value == 2
 
     obj = IRObject(value=np.array([1,2]))
     op = F.NewTensor(obj)

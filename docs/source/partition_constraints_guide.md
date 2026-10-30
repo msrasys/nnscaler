@@ -163,6 +163,19 @@ With the default `reducer_none_grad=False`, reducers materialize zero gradients
 instead, so weight decay still updates such parameters. Set `reducer_none_grad=True`
 and keep used and unused parameters in separate buckets to preserve the eager behavior.
 
+### Pipeline configuration
+
+For a policy that yields `OpPlan` objects, `fn` derives the logical stage count
+from the consecutive `stage_id` values starting at 0, rather than from
+`pas_config.pipeline_nstages`. Set `pas_config.pipeline_size` to choose the
+number of physical pipeline device groups; it defaults to the logical stage
+count. The group assignment and divisibility rules are the same as for
+[`hybrid`](trainer.md#pas-policies). The old `pas_config.pp_size` key is not read.
+
+Multiple logical stages require `use_end2end=True`, `pipeline_nmicros`, and a
+compatible `pipeline_scheduler`. With only one logical stage, `pipeline_size`
+must be 1.
+
 ### Example: Custom Partitioning and Recomputation
 
 This example demonstrates how to:

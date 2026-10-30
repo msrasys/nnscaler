@@ -3,7 +3,8 @@
 
 import functools
 import pickle
-from typing import Callable, List, Set, Dict, Tuple, Optional, TYPE_CHECKING, Any, Union, ClassVar
+from contextlib import closing
+from typing import Callable, List, Set, Dict, Tuple, Optional, TYPE_CHECKING, Any, Union, ClassVar, Generator
 from typing_extensions import Self
 import logging
 import os
@@ -32,7 +33,7 @@ from nnscaler.runtime.function import insert_backward_hook
 
 from nnscaler import __version__ as runtime_version
 from nnscaler.flags import CompileFlag
-from nnscaler.utils import accum_mode, classproperty, unchecked_fields
+from nnscaler.utils import accum_mode, classproperty, get_member_by_name, unchecked_fields
 
 if TYPE_CHECKING:
     from nnscaler.parallel import ComputeConfig
@@ -52,7 +53,7 @@ class AttrMeta:
     orig_name: str
     # shape of the full tensor
     shape: Tuple[int, ...]
-    # list of slicers to index the full tensor
+    # Per-dimension slices; an empty tuple indexes a scalar tensor.
     slicers: Tuple[slice, ...]
     # the number of the partitioned values, usually 1
     # (i.e., no partition on value -> no need to sum up)
@@ -62,6 +63,16 @@ class AttrMeta:
     # shape of the sub tensor
     # it should be the shape of full_tensor[slicers]
     sub_shape: Tuple[int, ...]
+
+    def __post_init__(self):
+        # Older generated modules use Ellipsis; their metadata files use '...'.
+        if not self.shape:
+            self.slicers = ()
+
+    def __setstate__(self, state):
+        # Legacy CubeModule checkpoints pickle AttrMeta instances directly.
+        self.__dict__.update(state)
+        self.__post_init__()
 
     def get_local_numel(self):
         return math.prod(self.sub_shape)
@@ -92,6 +103,20 @@ class Zero3AttrMeta:
     end: int
     # chunk size of the sub tensor, can be bigger than end - start due to padding
     chunk_size: int
+
+    @classmethod
+    def normalize_mapping(
+        cls,
+        metadata: Optional[Dict[str, Union[dict, 'Zero3AttrMeta', None]]],
+    ) -> Optional[Dict[str, 'Zero3AttrMeta']]:
+        if metadata is None:
+            return None
+        # Old checkpoints contain dictionaries and None entries for non-ZeRO3 parameters.
+        return {
+            name: cls(**meta) if isinstance(meta, dict) else meta
+            for name, meta in metadata.items()
+            if meta is not None
+        }
 
 
 def dedup_attrs(rank2attr_area_map: Dict[int, Dict[str, Dict[str, AttrMeta]]]) -> Dict[int, Dict[str, Dict[str, AttrMeta]]]:
@@ -216,8 +241,16 @@ class CubeModule(torch.nn.Module):
         super().__init__()
         self._reducers: List[Reducer] = list()
         # self._fullmap is mapping from the name of local attribute tensor
-        # to its corresponding fulltensor meta
-        # please note there can be multiple entries with same tid
+        # to its corresponding fulltensor meta.
+        # A trainable parameter has at most one entry per full tensor on a rank,
+        # which is enforced by IRAdapterGener.gen_weight. Attributes without gradient
+        # (frozen parameters and buffers) are not checked there, so they may still have
+        # multiple entries with the same tid when consumed with different partitions.
+
+        # Entries are inserted in attribute registration order, so the `is_param` entries
+        # follow the order of `self.parameters()`. Checkpoint merging counts them to recover
+        # the model parameter index (the keys of `ZeroMetadata.model_idx2opt_idx`), which
+        # `_get_zero_metadata` asserts.
         self._fullmap : Dict[str, AttrMeta] = dict()
 
     def get_non_persistent_buffers(self) -> Dict[str, torch.Tensor]:
@@ -428,36 +461,51 @@ class CubeModule(torch.nn.Module):
                 raise RuntimeError(
                     f'remaining graph parameters / buffers cannot find in model files: {list(attr_names)}')
 
-    def load_np_buffer_content(self, filename: str):
-        """Load non-persistent buffer content from file.
-
-        Only loads attributes that are non-persistent buffers
-        (i.e., in self._non_persistent_buffers_set).
-
-        Args:
-            filename (str): file path to the npbuffer.pt file
-        """
+    def _iter_np_buffer_content(self, filename: str) -> Generator[Tuple[str, torch.Tensor], None, None]:
+        """Yield (attribute name, local content) from npbuffer.pt, including value-partition scaling."""
         if not self._non_persistent_buffers_set:
             return
         np_buffer_model: Dict[int, torch.Tensor] = torch.load(filename)
+        for attr_name in self._non_persistent_buffers_set:
+            if attr_name not in self._fullmap:
+                raise RuntimeError(f'non-persistent buffer {attr_name} not found in fullmap.')
+            meta = self._fullmap[attr_name]
+            if meta.tid not in np_buffer_model:
+                raise RuntimeError(f'non-persistent buffer {attr_name} (tid={meta.tid}) not found in {filename}.')
+            content = np_buffer_model[meta.tid][meta.slicers]
+            if meta.val_chunks != 1:
+                content = content / meta.val_chunks
+            yield attr_name, content
+
+    def load_np_buffer_content(self, filename: str):
+        """Copy saved local non-persistent buffer contents into the module."""
         with torch.no_grad():
             _logger.info(f'loading non-persistent buffers from {filename}')
-            for attr_name in self._non_persistent_buffers_set:
-                if attr_name not in self._fullmap:
-                    raise RuntimeError(f'non-persistent buffer {attr_name} not found in fullmap.')
-                meta = self._fullmap[attr_name]
-                if meta.tid not in np_buffer_model:
-                    raise RuntimeError(f'non-persistent buffer {attr_name} (tid={meta.tid}) not found in {filename}.')
+            for attr_name, content in self._iter_np_buffer_content(filename):
+                getattr(self, attr_name).copy_(content)
+
+    def check_np_buffer_content(self, filename: str):
+        """Compare local non-persistent buffers bitwise with saved contents without overwriting them."""
+        with torch.no_grad():
+            _logger.info(f'checking non-persistent buffers from {filename}')
+            for attr_name, content in self._iter_np_buffer_content(filename):
                 attr = getattr(self, attr_name)
-                content = np_buffer_model[meta.tid][meta.slicers]
-                if meta.val_chunks != 1:
-                    content = content / meta.val_chunks
-                attr.copy_(content)
+                if attr.shape != content.shape or attr.dtype != content.dtype or not torch.equal(
+                    attr.detach().cpu().contiguous().reshape(-1).view(torch.uint8),
+                    content.detach().cpu().contiguous().reshape(-1).view(torch.uint8),
+                ):
+                    raise RuntimeError(
+                        f'non-persistent buffer {self._fullmap[attr_name].orig_name} ({attr_name}) differs from {filename}. '
+                        'FULL initialization must match the saved buffers used for resume.'
+                    )
 
     def init_group(self, ranks: List[int]):
         if not all([isinstance(rank, int) for rank in ranks]):
             raise TypeError("Expected ranks to be List[int]")
         DeviceGroup().get_group(ranks)
+
+    def init_groups(self, ranks: List[List[int]]):
+        return DeviceGroup().get_groups(ranks)
 
     def get_checkpoint(self, optimizer: torch.optim.Optimizer = None):
         state_dict = super().state_dict()
@@ -539,7 +587,10 @@ class CubeModule(torch.nn.Module):
         #  value: Dict[ tuple(start, step, stop) , filled chunk]
         #  used to track how many elements have been filled for each zero3 parameter
         zero3_current_filled: Dict[str, Dict[Tuple[Tuple[int, int, int], ...], List[Tuple[int, int]]]] = {}
-        zero3_param_metadatas = [info[-1] for info in zero_idx_maps] if zero_idx_maps is not None else [None] * len(state_dicts)
+        zero3_param_metadatas = [
+            Zero3AttrMeta.normalize_mapping(info[-1])
+            for info in zero_idx_maps
+        ] if zero_idx_maps is not None else [None] * len(state_dicts)
         # gather param/buffer full tensor
         for rank, (model_state_dict, local_fullmap, zero3_param_metadata) in enumerate(zip(state_dicts, fullmaps, zero3_param_metadatas)):
             for local_name, meta in local_fullmap.items():
@@ -574,7 +625,7 @@ class CubeModule(torch.nn.Module):
                             raise ValueError("Invalid tensor as a ZeRO3 parameter, expected a 1D tensor.")
                         curr_filled = zero3_current_filled.setdefault(meta.orig_name, {}).setdefault(state_dict_merge_track_id, [])
                         curr_z3_info = zero3_param_metadata[local_name]
-                        curr_start, curr_end = curr_z3_info['start'], curr_z3_info['end']
+                        curr_start, curr_end = curr_z3_info.start, curr_z3_info.end
                         fill_len = curr_end - curr_start
                         if (curr_start, curr_end) in curr_filled:
                             # already filled, let's check consistency
@@ -608,14 +659,16 @@ class CubeModule(torch.nn.Module):
         `merge_partial_states` will use this list to build the parameter order
         """
         origin_parameter_names: List[str] = []
+        seen_parameter_names: Set[str] = set()
         for local_fullmap in fullmaps:
             for _, meta in local_fullmap.items():
                 if not meta.is_param: continue
                 # shared parameters in CubeModule is already de-duplicated. So in the
                 # local model state, we will not have multiple parameters sharing with same content
                 # but in different names.
-                if meta.orig_name not in origin_parameter_names:
+                if meta.orig_name not in seen_parameter_names:
                     origin_parameter_names.append(meta.orig_name)
+                    seen_parameter_names.add(meta.orig_name)
         return origin_parameter_names
 
     @classmethod
@@ -714,8 +767,20 @@ class CubeModule(torch.nn.Module):
         # of parameters of the full model. So the param IDs in each local optimizer
         # state is a sub-sequence of global parameter ordering.
 
-        # we follow the order of in origin parameter names to find each (partitioned)
+        # we follow the order in origin parameter names to find each (partitioned)
         # parameter in the local model state, and assign the slice to the position.
+        param_entries: Dict[str, List[Tuple[int, int, AttrMeta]]] = {}
+        expected_state_tracks: Dict[str, Set[Tuple[Tuple[Any, Any, Any], ...]]] = {}
+        for worker_idx, fullmap in enumerate(fullmaps[0 : plan_ngpus]):
+            local_index = 0
+            for meta in fullmap.values():
+                if not meta.is_param:
+                    continue
+                param_entries.setdefault(meta.orig_name, []).append((worker_idx, local_index, meta))
+                track_id = tuple((slicer.start, slicer.step, slicer.stop) for slicer in meta.slicers)
+                expected_state_tracks.setdefault(meta.orig_name, set()).add(track_id)
+                local_index += 1
+
         full_optim_state_dict['state'] = {}
         full_states = full_optim_state_dict['state']
 
@@ -837,12 +902,7 @@ class CubeModule(torch.nn.Module):
         # full_index: param IDs in the full optimizer state
         for full_index, param_name in enumerate(origin_parameter_names):
             _logger.info(f'start to handle optimizer state for param {param_name} with full_index {full_index}')
-            expected_state_tracks = {
-                tuple((slicer.start, slicer.step, slicer.stop) for slicer in meta.slicers)
-                for fullmap in fullmaps[0 : plan_ngpus]
-                for meta in fullmap.values()
-                if meta.is_param and meta.orig_name == param_name
-            }
+            expected_param_state_tracks = expected_state_tracks.get(param_name, set())
             # zero_done_track is used to avoid re-merging the same parameter
             # in the optimizer state
             # zero_done_track_id: slicers
@@ -859,80 +919,79 @@ class CubeModule(torch.nn.Module):
             # consequently, the parameter's optimizer state is also sharded.
             # This for loop is for merging the sharded parameter's optimizer state
             # into its original full state (i.e., the non-partitioned one).
-            for work_idx, (optim_state, fullmap) in enumerate(zip(optim_state_dicts[0 : plan_ngpus], fullmaps[0 : plan_ngpus])):
+            for work_idx, local_index, meta in param_entries.get(param_name, []):
+                optim_state = optim_state_dicts[work_idx]
                 if 'state' not in optim_state: continue
                 # adam-like optimizers have optim_state['state']={} before any optimizer.step()
                 if not optim_state['state']: continue
-                # filter out non-param attributes as they don't appear in the optimizer state
-                param_fullmap = [meta for meta in fullmap.values() if meta.is_param]
-                # local index: param IDs in the local optimizer state, we assume
-                # it aligns with the order of local `model.parameters()`
-                for local_index, meta in enumerate(param_fullmap):
-                    if meta.orig_name != param_name: continue
-                    # TODO: support customized param groups, where each parameter has IDs
-                    # specified from its own param_group
-                    track_id = tuple((i.start, i.step, i.stop) for i in meta.slicers)
-                    if zero_idx_maps is None:
-                        if local_index not in optim_state['state']:
+                # TODO: support customized param groups, where each parameter has IDs
+                # specified from its own param_group
+                track_id = tuple((i.start, i.step, i.stop) for i in meta.slicers)
+                if zero_idx_maps is None:
+                    if local_index not in optim_state['state']:
+                        continue
+                    states: Dict[str, torch.Tensor] = optim_state['state'][local_index]
+                else:
+                    if track_id not in zero_done_track:
+                        # As ZeRO is applied, the optimizer state of this parameter (a shard)
+                        # may not be stored locally in its optimizer state.
+                        # _merge_opt_zero is for recovering the optimizer state corresponding to this parameter shard.
+                        states: Dict[str, torch.Tensor] = _merge_opt_zero(meta.sub_shape, work_idx, local_index)
+                        if states is None:
                             continue
-                        states: Dict[str, torch.Tensor] = optim_state['state'][local_index]
                     else:
-                        if track_id not in zero_done_track:
-                            # As ZeRO is applied, the optimizer state of this parameter (a shard)
-                            # may not be stored locally in its optimizer state.
-                            # _merge_opt_zero is for recovering the optimizer state corresponding to this parameter shard.
-                            states: Dict[str, torch.Tensor] = _merge_opt_zero(meta.sub_shape, work_idx, local_index)
-                            if states is None:
-                                continue
-                            zero_done_track.add(track_id)
+                        _logger.debug(f'rank {work_idx}: skip merging duplicated optimizer state for param {full_index} with slicers {meta.slicers}')
+                        continue
+
+                if not states:
+                    continue
+                if zero_idx_maps is not None:
+                    zero_done_track.add(track_id)
+
+                # delay the creation of full_states[full_index]
+                # until we have a valid optimizer state for this parameter
+                # so we don't leave empty dict for parameters without optimizer state
+                full_states.setdefault(full_index, {})
+                for state_name in states.keys():
+                    value = states[state_name]
+                    # special handle for step: scalar tensor type
+                    if state_name == 'step':
+                        if state_name in full_states[full_index]:
+                            if not cls._safe_tensor_equal(full_states[full_index][state_name], value):
+                                raise ValueError(f"Conflict in merging {param_name}.{state_name} from rank {work_idx}")
                         else:
-                            _logger.debug(f'rank {work_idx}: skip merging duplicated optimizer state for param {full_index} with slicers {meta.slicers}')
-                            continue
+                            full_states[full_index][state_name] = value.cpu()
+                        continue
 
-                    # delay the creation of full_states[full_index]
-                    # until we have a valid optimizer state for this parameter
-                    # so we don't leave empty dict for parameters without optimizer state
-                    full_states.setdefault(full_index, {})
-                    for state_name in states.keys():
-                        value = states[state_name]
-                        # special handle for step: scalar tensor type
-                        if state_name == 'step':
-                            if state_name in full_states[full_index]:
-                                if not cls._safe_tensor_equal(full_states[full_index][state_name], value):
-                                    raise ValueError(f"Conflict in merging {param_name}.{state_name} from rank {work_idx}")
-                            else:
-                                full_states[full_index][state_name] = value.cpu()
-                            continue
-
-                        # for non-tensor states
-                        if not isinstance(value, torch.Tensor):
-                            if state_name in full_states[full_index]:
-                                if full_states[full_index][state_name] != value:
-                                    raise ValueError(f"Conflict in merging {param_name}.{state_name} from rank {work_idx}")
-                            else:
-                                full_states[full_index][state_name] = value
-                                _logger.debug(f'non-tensor state {state_name} is merged for {full_index}')
-                        # for tensor states, like 'exp_avg'
+                    # for non-tensor states
+                    if not isinstance(value, torch.Tensor):
+                        if state_name in full_states[full_index]:
+                            if full_states[full_index][state_name] != value:
+                                raise ValueError(f"Conflict in merging {param_name}.{state_name} from rank {work_idx}")
                         else:
-                            # create optimizer state tensor
-                            if state_name not in full_states[full_index]:
-                                full_states[full_index][state_name] = torch.empty(meta.shape, dtype=value.dtype, device='cpu')
+                            full_states[full_index][state_name] = value
+                            _logger.debug(f'non-tensor state {state_name} is merged for {full_index}')
+                    # for tensor states, like 'exp_avg'
+                    else:
+                        # create optimizer state tensor
+                        if state_name not in full_states[full_index]:
+                            full_states[full_index][state_name] = torch.empty(meta.shape, dtype=value.dtype, device='cpu')
 
-                            if track_id in state_merge_track:
-                                if not cls._safe_tensor_equal(full_states[full_index][state_name][meta.slicers], value):
-                                    raise ValueError(f"Conflict in merging {param_name}.{state_name} from rank {work_idx}")
-                            else:
-                                # assign with partial tensor
-                                full_states[full_index][state_name][meta.slicers] = value
+                        if track_id in state_merge_track:
+                            if not cls._safe_tensor_equal(full_states[full_index][state_name][meta.slicers], value):
+                                raise ValueError(f"Conflict in merging {param_name}.{state_name} from rank {work_idx}")
+                        else:
+                            # assign with partial tensor
+                            full_states[full_index][state_name][meta.slicers] = value
 
-                    state_merge_track.add(track_id)
+                state_merge_track.add(track_id)
 
             # make sure all the slices of this parameter are merged,
             # otherwise it is an incomplete optimizer state (some slices of the parameter are missing)
-            if full_index in full_states and state_merge_track != expected_state_tracks:
+            if full_index in full_states and state_merge_track != expected_param_state_tracks:
                 raise ValueError(
                     f'Incomplete optimizer state for parameter {param_name}: '
-                    f'found slices {state_merge_track}, expected {expected_state_tracks}'
+                    f'found slices {state_merge_track}, expected {expected_param_state_tracks}'
                 )
 
         # handle additional state dict keys
@@ -1057,7 +1116,7 @@ class CubeModule(torch.nn.Module):
             raise ValueError(f'nnscaler does not support passing dtype {dtype} to to()')
         if convert_to_format is not None:
             raise ValueError(f'nnscaler does not support passing convert_to_format {convert_to_format} to to()')
-        if non_blocking is not None:
+        if non_blocking:
             warnings.warn(f'nnscaler moves tensors in a blocking approach currently')
 
         # after _parse_to `device` must in type of torch.device
@@ -1078,9 +1137,11 @@ class OriginModuleMetadata:
 
 @dataclass
 class ZeroMetadata:
-    # a mapping from the index of the parameter in the model
-    # to (optimizer_index, the start and end in the bucket, the shape of the parameter)
-    model_idx2opt_idx: Optional[Dict] = None
+    # a mapping from the index of the parameter in the model (`self.parameters()` order) to
+    #   - (optimizer_index, start and end offsets in the bucket, shape of the parameter)
+    #     if the parameter is in a reducer bucket
+    #   - optimizer_index if the parameter is not in any bucket
+    model_idx2opt_idx: Optional[Dict[int, Union[int, Tuple[int, int, int, torch.Size]]]] = None
     # a mapping from optimizer_index to the related bucket information (sub_ranks, bucket_size)
     opt_idx2ranks: Optional[Dict] = None
     # the level of zero optimization
@@ -1088,7 +1149,14 @@ class ZeroMetadata:
     # 1: zero1
     # > 1: zero3
     zero: int = 0
-    zero3_param_metadata: Optional[Dict[str, Dict]] = None
+    zero3_param_metadata: Optional[Dict[str, Zero3AttrMeta]] = None
+
+    def __post_init__(self):
+        self.zero3_param_metadata = Zero3AttrMeta.normalize_mapping(self.zero3_param_metadata)
+
+    def __setstate__(self, state):
+        self.__dict__.update(state)
+        self.__post_init__()
 
 
 @dataclass
@@ -1114,7 +1182,9 @@ class ParallelModuleConfig:
 
 @dataclass
 class ExtraState(ZeroMetadata, OriginModuleMetadata, ParallelModuleConfig):
-    pass
+    def __post_init__(self):
+        ParallelModuleConfig.__post_init__(self)
+        ZeroMetadata.__post_init__(self)
 
 
 class _ModuleTensorRegistry:
@@ -1186,6 +1256,14 @@ class ParallelModule(CubeModule):
     dist_param_map: dict[str, str]
     compute_config: 'ComputeConfig'
     origin_module_metadata: OriginModuleMetadata
+    # function to initialize the module, should return an instance of the original Module
+    # Set by parallelize for FULL, or SHARD without a user __shard__init__.
+    _init_module_fn: ClassVar[Optional[Callable[[], torch.nn.Module]]] = None
+    # optional seeded wrapper yielding user-initialized local tensors with generated attribute names
+    # Set by parallelize for SHARD with a user __shard__init__.
+    _shard_init_fn: ClassVar[
+        Optional[Callable[[Dict[str, AttrMeta]], Generator[Tuple[str, torch.Tensor], None, None]]]
+    ] = None
 
     def __init__(self):
         if self.__class__  == ParallelModule:  # not init via super().__init__()
@@ -1280,14 +1358,16 @@ class ParallelModule(CubeModule):
             else:
                 _logger.warning(_non_persistent_buffers_load_warning)
 
-    def _post_init(self, init_params=True, build_buckets=True):
+    def _post_init(self, init_params=True, build_buckets=True, *, init_module: Optional[torch.nn.Module] = None):
         """
         This is post init function to further initialize the model. Should be called by subclass's __init__().
 
         Args:
             init_params (bool): whether to load model init parameters. Default True.
+                Note we will always try to load non-persistent buffers regardless of the init_params flag.
             build_buckets (bool): whether to build buckets for the model. Default True.
                 If it is False, you must manually call `build_buckets()` later before use this module.
+            init_module: original module instance for independent initialization.
         """
         # Here we check the rank to load the module file name
         # Current we don't check rank when we are not in distributed mode
@@ -1296,18 +1376,39 @@ class ParallelModule(CubeModule):
         # if dist.is_initialized() and self.rank != dist.get_rank():
         #     raise RuntimeError(f"The rank to load this module file name is expected to be {self._rank}, but got {dist.get_rank()}")
 
-        self._non_presistent_buffers_inited = init_params or not self._non_persistent_buffers_set
-        module_file = Path(sys.modules[self.__module__].__file__)
-        if init_params:
-            self.load_attr_content(str(module_file.with_name(f"{FxModuleParser.ATTR_CONTENT_FILE_STEM}")))
-        elif self._non_persistent_buffers_set:
-            # When init_params=False, only load non-persistent buffers from the small npbuffer.pt file.
-            # This avoids loading the large fullmodel.pt files when resuming from checkpoint,
-            # since checkpoint will provide the rest of the parameters/buffers.
-            np_buffer_file = module_file.with_name(FxModuleParser.NON_PERSISTENT_BUFFER_FILE)
-            if np_buffer_file.is_file():
-                self.load_np_buffer_content(str(np_buffer_file))
+        from nnscaler.parallel import ParamInitStrategy
+
+        def _load_np_buffer():
+            if self._non_persistent_buffers_set:
+                np_buffer_file = self.module_dir / FxModuleParser.NON_PERSISTENT_BUFFER_FILE
+                if np_buffer_file.is_file():
+                    self.load_np_buffer_content(str(np_buffer_file))
+                    self._non_presistent_buffers_inited = True
+
+        def _check_np_buffer():
+            if self._non_persistent_buffers_set:
+                np_buffer_file = self.module_dir / FxModuleParser.NON_PERSISTENT_BUFFER_FILE
+                self.check_np_buffer_content(str(np_buffer_file))
+
+        self._non_presistent_buffers_inited = not self._non_persistent_buffers_set
+        strategy = self.compute_config.param_init_strategy
+        if strategy == ParamInitStrategy.FILE:
+            if init_params:
+                self.load_attr_content(str(self.module_dir / FxModuleParser.ATTR_CONTENT_FILE_STEM))
                 self._non_presistent_buffers_inited = True
+            else:
+                _load_np_buffer()
+        elif strategy == ParamInitStrategy.FULL:
+            if init_params:
+                self._init_from_module(init_module, init_params=True)
+                _check_np_buffer()
+                self._non_presistent_buffers_inited = True
+            else:
+                _load_np_buffer()
+        else:
+            assert strategy == ParamInitStrategy.SHARD
+            self._init_from_module(init_module, init_params=init_params)
+            self._non_presistent_buffers_inited = True
 
         self._warn_uninitialized_non_persistent_buffers()
 
@@ -1323,6 +1424,80 @@ class ParallelModule(CubeModule):
 
         if build_buckets:
             self.build_buckets()
+
+    def _init_from_module(self, module: Optional[torch.nn.Module], *, init_params: bool = True) -> None:
+        from nnscaler.runtime.initialization import capture_init_weights
+        from nnscaler.parallel import ParamInitStrategy
+
+        attrs = {
+            attr: meta for attr, meta in self._fullmap.items()
+            if init_params or attr in self._non_persistent_buffers_set
+        }
+        if not attrs:
+            return
+
+        strategy = self.compute_config.param_init_strategy
+        if strategy == ParamInitStrategy.SHARD and module is None:
+            initializer = type(self)._shard_init_fn
+            if initializer is None:
+                initializer = functools.partial(
+                    capture_init_weights, module_fn=type(self)._init_module_fn, module=module,
+                )
+            seen = set()
+            with torch.no_grad(), closing(initializer(dict(attrs))) as values:
+                for item in values:
+                    if not isinstance(item, (tuple, list)) or len(item) != 2:
+                        raise RuntimeError("__shard__init__ must yield (attribute_name, tensor) pairs.")
+                    attr, value = item
+                    if not isinstance(attr, str) or attr not in attrs:
+                        raise RuntimeError(f"Invalid __shard__init__ result: unexpected attributes [{attr!r}].")
+                    if attr in seen:
+                        raise RuntimeError(f"Invalid __shard__init__ result: duplicate attribute {attr!r}.")
+                    meta = attrs[attr]
+                    target = getattr(self, attr)
+                    if (
+                        not isinstance(value, torch.Tensor) or value.is_meta
+                        or value.shape != target.shape or value.dtype != target.dtype
+                    ):
+                        raise RuntimeError(
+                            f"Invalid __shard__init__ tensor for {attr}: "
+                            f"expected shape {tuple(target.shape)} and dtype {target.dtype}."
+                        )
+                    target.copy_(value if meta.val_chunks == 1 else value / meta.val_chunks)
+                    seen.add(attr)
+                    # Do not retain the previous view while requesting the next full producer.
+                    del item, value
+                missing = sorted(set(attrs) - seen)
+                if missing:
+                    raise RuntimeError(f"Invalid __shard__init__ result: missing attributes {missing}.")
+            return
+
+        if module is None:
+            factory = type(self)._init_module_fn
+            if factory is None:
+                raise RuntimeError(
+                    "Independent initialization requires parallelize() with the original "
+                    "module class/module_fn, or an init_module instance."
+                )
+            module = factory()
+
+        with torch.no_grad():
+            for attr, meta in attrs.items():
+                source = get_member_by_name(module, meta.orig_name)
+                if (
+                    not isinstance(source, torch.Tensor)
+                    or tuple(source.shape) != tuple(meta.shape)
+                    or source.dtype != meta.dtype
+                ):
+                    raise RuntimeError(
+                        f"Invalid initialization tensor for {meta.orig_name}: "
+                        f"expected shape {meta.shape} and dtype {meta.dtype}."
+                    )
+                content = source[meta.slicers]
+                if meta.val_chunks != 1:
+                    content = content / meta.val_chunks
+                getattr(self, attr).copy_(content)
+                del content
 
     def build_buckets(self, param_clss: Optional[dict[torch.nn.Parameter, Any]]=None):
         """
@@ -1351,13 +1526,16 @@ class ParallelModule(CubeModule):
                 attr_name = model_params[param]
                 param_attr = self._fullmap[attr_name]
                 zero3_info = reducer.get_z3_info(param)
+                if zero3_info is None:
+                    # not a ZeRO-3 parameter, keep the mapping free of None entries
+                    continue
                 self._zero3_param_metadata[attr_name] = Zero3AttrMeta(
                     attr_name=attr_name,
                     orig_name=param_attr.orig_name,
-                    start = zero3_info.start,
-                    end = zero3_info.end,
+                    start=zero3_info.start,
+                    end=zero3_info.end,
                     chunk_size=zero3_info.numel_with_padding(),
-                ) if zero3_info is not None else None
+                )
 
         self._zero_metadata = self._get_zero_metadata()
         # all parameters and buffers are ready now
@@ -1766,6 +1944,11 @@ class ParallelModule(CubeModule):
         # value: (sub_ranks, bucket_size), If value is None, then the parameter is not in a bucket
         opt_idx2ranks: Dict[int, Optional[Tuple[List[int], int]]] = {}
         model_params_id = [id(param) for param in self.parameters()]
+        # Checkpoint merging recovers the model parameter index by counting `is_param`
+        # entries of the fullmap in order, so that order must match `self.parameters()`.
+        assert [name for name, meta in self._fullmap.items() if meta.is_param] \
+            == [name for name, _ in self.named_parameters()], \
+            "fullmap parameter order must match named_parameters order"
 
         for reducer in self.reducers:
             _, sub_ranks = self._get_zero_subranks(reducer)
@@ -1970,7 +2153,7 @@ class ParallelModule(CubeModule):
             origname_tid_map = {meta.orig_name: meta.tid for meta in attr_meta_map.values()}
             tid_info = defaultdict(list)
             for attr, meta in attr_meta_map.items():
-                tid_info[meta.tid].append((attr, meta.slicers, meta.val_chunks))  # multiple params may share the same tid
+                tid_info[meta.tid].append((attr, meta.slicers, meta.val_chunks))  # frozen params or buffers may share the same tid
 
             for orig_param_name in orig_param_names:
                 if orig_param_name not in origname_tid_map:
@@ -2206,9 +2389,7 @@ class NonParallelModule(ParallelModule, skip_init=True):
             origin_state_dict_names=list(params.keys()),
             origin_shared_param_names=[],  # TODO: shared param support
         )
-        self._zero3_param_metadata: dict[str, Zero3AttrMeta] = {
-            n: None for n in local_name2params.keys()
-        }
+        self._zero3_param_metadata: Dict[str, Zero3AttrMeta] = {}
         self._zero_metadata = self._get_zero_metadata()
 
     def parameters(self, recurse: bool = True):

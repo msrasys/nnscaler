@@ -107,6 +107,158 @@ def test_merge_sparse_optimizer_state():
             ],
         )
 
+    with pytest.raises(ValueError, match='Incomplete optimizer state'):
+        ParallelModule.merge_opt_state_dicts(
+            sharded_fullmaps,
+            [
+                {'state': {0: {}}, 'param_groups': [{'params': [0]}]},
+                {'state': {0: state}, 'param_groups': [{'params': [0]}]},
+            ],
+        )
+
+    merged = ParallelModule.merge_opt_state_dicts(
+        sharded_fullmaps,
+        [
+            {'state': {0: {}}, 'param_groups': [{'params': [0]}]},
+            {'state': {0: {}}, 'param_groups': [{'params': [0]}]},
+        ],
+    )
+    assert merged['state'] == {}
+    assert merged['param_groups'][0]['params'] == [0]
+
+
+def test_merge_sharded_optimizer_states_with_multiple_parameters():
+    fullmaps = []
+    optimizer_state_dicts = []
+    for rank in range(2):
+        fullmaps.append({
+            'buffer': AttrMeta(
+                2,
+                False,
+                'buffer',
+                (1,),
+                (slice(0, 1),),
+                1,
+                torch.float32,
+                (1,),
+            ),
+            **{
+                f'p{param}': AttrMeta(
+                    param,
+                    True,
+                    f'p{param}',
+                    (2,),
+                    (slice(rank, rank + 1),),
+                    1,
+                    torch.float32,
+                    (1,),
+                )
+                for param in range(2)
+            },
+        })
+        optimizer_state_dicts.append({
+            'state': {
+                param: {
+                    'step': torch.tensor(1.0),
+                    'exp_avg': torch.tensor([rank * 10 + param], dtype=torch.float32),
+                    'exp_avg_sq': torch.tensor([rank * 10 + param + 1], dtype=torch.float32),
+                }
+                for param in range(2)
+            },
+            'param_groups': [{'params': [0, 1]}],
+        })
+
+    merged = ParallelModule.merge_opt_state_dicts(fullmaps, optimizer_state_dicts)
+
+    torch.testing.assert_close(merged['state'][0]['exp_avg'], torch.tensor([0.0, 10.0]))
+    torch.testing.assert_close(merged['state'][0]['exp_avg_sq'], torch.tensor([1.0, 11.0]))
+    torch.testing.assert_close(merged['state'][1]['exp_avg'], torch.tensor([1.0, 11.0]))
+    torch.testing.assert_close(merged['state'][1]['exp_avg_sq'], torch.tensor([2.0, 12.0]))
+    assert merged['param_groups'][0]['params'] == [0, 1]
+
+
+def test_merge_optimizer_states_with_rank_specific_parameter_layouts():
+    fullmaps = [
+        {
+            'buffer': AttrMeta(
+                3, False, 'buffer', (1,), (slice(0, 1),), 1, torch.float32, (1,)
+            ),
+            'p0': AttrMeta(
+                0, True, 'p0', (1,), (slice(0, 1),), 1, torch.float32, (1,)
+            ),
+            'shared': AttrMeta(
+                1, True, 'shared', (2,), (slice(0, 1),), 1, torch.float32, (1,)
+            ),
+        },
+        {
+            'p1': AttrMeta(
+                2, True, 'p1', (1,), (slice(0, 1),), 1, torch.float32, (1,)
+            ),
+            'buffer': AttrMeta(
+                3, False, 'buffer', (1,), (slice(0, 1),), 1, torch.float32, (1,)
+            ),
+            'shared': AttrMeta(
+                1, True, 'shared', (2,), (slice(1, 2),), 1, torch.float32, (1,)
+            ),
+        },
+    ]
+    optimizer_state_dicts = [
+        {
+            'state': {
+                0: {'momentum': torch.tensor([10.0])},
+                1: {'momentum': torch.tensor([20.0])},
+            },
+            'param_groups': [{'params': [0, 1]}],
+        },
+        {
+            'state': {
+                0: {'momentum': torch.tensor([30.0])},
+                1: {'momentum': torch.tensor([40.0])},
+            },
+            'param_groups': [{'params': [0, 1]}],
+        },
+    ]
+
+    merged = ParallelModule.merge_opt_state_dicts(fullmaps, optimizer_state_dicts)
+
+    torch.testing.assert_close(merged['state'][0]['momentum'], torch.tensor([10.0]))
+    torch.testing.assert_close(merged['state'][1]['momentum'], torch.tensor([20.0, 40.0]))
+    torch.testing.assert_close(merged['state'][2]['momentum'], torch.tensor([30.0]))
+    assert merged['param_groups'][0]['params'] == [0, 1, 2]
+
+
+def test_merge_replicated_optimizer_states():
+    fullmaps = [
+        {
+            'p0': AttrMeta(
+                rank, True, 'p0', (2,), (slice(0, 2),), 1, torch.float32, (2,)
+            )
+        }
+        for rank in range(2)
+    ]
+    state = {'momentum': torch.tensor([1.0, 2.0])}
+
+    merged = ParallelModule.merge_opt_state_dicts(
+        fullmaps,
+        [
+            {'state': {0: state}, 'param_groups': [{'params': [0]}]},
+            {'state': {0: state}, 'param_groups': [{'params': [0]}]},
+        ],
+    )
+    torch.testing.assert_close(merged['state'][0]['momentum'], state['momentum'])
+
+    with pytest.raises(ValueError, match='Conflict in merging p0.momentum'):
+        ParallelModule.merge_opt_state_dicts(
+            fullmaps,
+            [
+                {'state': {0: state}, 'param_groups': [{'params': [0]}]},
+                {
+                    'state': {0: {'momentum': torch.tensor([1.0, 3.0])}},
+                    'param_groups': [{'params': [0]}],
+                },
+            ],
+        )
+
 
 def _to_cube_model(module, pas, compute_config, cube_savedir, instance_name, dummy_input = None):
     return parallelize(

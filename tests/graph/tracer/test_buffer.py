@@ -9,7 +9,7 @@ from nnscaler import parallelize, ComputeConfig
 from tests.utils import replace_all_device_with
 
 from tests.parallel_module.test_gencode import _gencode_contains, print_gencode
-from .test_ctxt_manager import TestModule
+from .test_ctxt_manager import RotaryEmbeddingModule
 
 
 class BufferModuleNested(torch.nn.Module):
@@ -25,7 +25,7 @@ class BufferModuleNested(torch.nn.Module):
 class BufferModule(torch.nn.Module):
     def __init__(self) -> None:
         super().__init__()
-        self.test_module = TestModule()
+        self.test_module = RotaryEmbeddingModule()
         self.buffer_module = BufferModuleNested()
         self.register_buffer("root_buffer0_u", torch.tensor([1.0]), persistent=False)
         self.register_buffer("root_buffer0_p", torch.tensor(2.0), persistent=True)

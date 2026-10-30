@@ -166,6 +166,41 @@ def allreduce_linear(x: torch.Tensor, weight: torch.Tensor):
     return out
 ```
 
+### Fake Function for a Built-in Operator
+
+Use `update_op` to override metadata for an existing tracer leaf or registered
+operator, for example with a lightweight implementation for tracing:
+
+```python
+def fake_add(x, y, *, alpha=1):
+    return x
+
+nnscaler.update_op(torch.add, fake_fn=fake_add)
+```
+
+`update_op` can also override `op_create_fn`, `code`, `emit_fn`, and
+`input_gen_fn`. Omitted fields keep their current behavior; `None` removes a
+customized override. Removing `op_create_fn` requires an existing tracer leaf
+or system creator to fall back to.
+
+Updates cover discovered PyTorch identity aliases and same-name `torch` /
+`torch.Tensor` methods: updating `torch.add` also updates `torch.Tensor.add`.
+Different functional wrappers, in-place counterparts, and `operator` functions
+are not inferred as aliases. Custom operators and Autograd `Function.apply`
+use a single canonical signature.
+
+Dunder paths are excluded: `Tensor.__add__` and `Tensor.__pow__` are rejected.
+If a dunder attribute is the same object as an ordinary method (for example,
+`Tensor.__abs__ is Tensor.abs`), it is accepted under the ordinary name only.
+
+An existing leaf does not need a dedicated IR creator to use `update_op`.
+Use `register_op` for a new Python operator that would otherwise be traced
+through. Functions reached only through the generic `__torch_function__`
+fallback are not supported; they must first become explicit wrapped leaves.
+
+The fake function is only executed during tracing. The traced graph and
+generated code continue to use the original operator.
+
 ### When You Don't Need `fake_fn`
 
 If your function can run normally during tracing (e.g., it only uses standard PyTorch ops), you don't need `fake_fn` — just omit it:

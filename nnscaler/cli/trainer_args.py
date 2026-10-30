@@ -257,6 +257,8 @@ class OptionalReducerConfig:
 class OptionalComputeConfig(OptionalReducerConfig):
     constant_folding: Optional[bool] = None
     trace_strategy: Optional[str] = None
+    param_init_strategy: Optional[str] = None
+    param_init_seed: Optional[int] = None
 
     pas_config: Optional[Dict[str, Any]] = None
     user_config: Optional[Dict[str, Any]] = None
@@ -883,6 +885,10 @@ class DebugConfig:
     check_gradient_sync_cross_devices: bool = True
     # profiling configuration using torch.profiler.profile
     profile: Optional[ProfileConfig] = None
+    # whether to check parameter initialization correctness
+    # Check stored replicas after bucket construction, including ordinary mixed-model tensors.
+    # File-initialized ParallelModules, compile-only runs and resume are excluded.
+    param_init_check: bool = True
 
 
 @dataclass

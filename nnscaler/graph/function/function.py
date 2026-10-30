@@ -547,14 +547,15 @@ def NewTensor(data, *, dtype=None, device=None,
         size = data.shape
     elif isinstance(data, IRObject):
         size = torch.tensor(data.value).shape
+    elif not isinstance(data, np.ndarray):
+        size = np.array(data).shape
     else:
-        # for non-IRObject instance, we will always convert to list
-        # through torch.tensor, since we cannot guarantee the `data`
-        # instance to be executable for its `repr(data)` string
-        # in gencode
-        val = torch.tensor(data)
-        size = val.shape
-        val = val.tolist()
+        # `repr(data)` is wrong for np.ndarray
+        # (will output something like `array([1,2])`, which is not valid in gencode)
+        # so we convert it to a list using `data.tolist()`
+        val = data.tolist()
+        size = data.shape
+
     size = size if len(size) > 0 else (1,)  # for scalar
 
     kwargs = {'data': val, 'requires_grad': requires_grad,
@@ -2851,6 +2852,7 @@ def ScaledDotProductAttention(query, key, value, attn_mask=None, dropout_p=0.0,
 
     For a common attention, the generated anno is like (a e d^, a b^ d^, a b^ c -> a e c).
     """
+    signature = 'torch.nn.functional.scaled_dot_product_attention'
     if not isinstance(query, IRTensor) or not isinstance(key, IRTensor) or not isinstance(value, IRTensor):
         raise ValueError(f'query: {query}, key: {key}, value: {value} should be IRTensor, something went wrong.')
     gener = iter(string.ascii_lowercase)

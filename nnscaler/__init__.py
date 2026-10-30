@@ -3,6 +3,7 @@
 
 from .version import __version__
 from .parallel import (
+    ParamInitStrategy,
     ParallelModule,
     ComputeConfig,
     ReuseType,
@@ -14,12 +15,13 @@ from .parallel import (
     deduped_state_dict,
     load_deduped_state_dict,
     broadcast_weights,
+    align_state_dict_names,
     load_sharded_state_dict,
     sync_grad_when,
     trimmed_broadcast_merged_state_dict,
     load_merged_state_dict_from_rank,
 )
-from nnscaler.graph.parser.register import register_op
+from nnscaler.graph.parser.register import register_op, update_op
 from nnscaler.runtime.function.function import (
     anchor,
     constant_folding,

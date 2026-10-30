@@ -2,6 +2,7 @@
 #  Licensed under the MIT License.
 
 import importlib
+import inspect
 
 import pytest
 import torch
@@ -48,8 +49,15 @@ def _annotation_inputs():
     return q, k, v, None, None, None
 
 
-def _return_lse_positional_args():
-    return (0.0, None, False, (-1, -1), False, False, True, False, None, True)
+def _return_lse_positional_args(func):
+    parameters = list(inspect.signature(func).parameters.values())[6:]
+    args = []
+    for parameter in parameters:
+        if parameter.name == "return_lse":
+            args.append(True)
+            break
+        args.append(parameter.default)
+    return tuple(args)
 
 
 @pytest.mark.parametrize(
@@ -62,11 +70,19 @@ def _return_lse_positional_args():
 )
 def test_flash_attention_anno_marks_lse_shape_by_keyword_and_position(module_name):
     module = importlib.import_module(module_name)
+    wrapper_name = {
+        "ring_attn_varlen": "wrap_ring_attn_varlen_func",
+        "sliding_window_attn": "wrap_sliding_window_attn_func",
+        "zigzag_allgather_attn_varlen": "wrap_zigzag_allgather_attn_varlen_func",
+    }[module_name.rsplit(".", 1)[-1]]
+    wrapper = getattr(module, wrapper_name)
     inputs = _annotation_inputs()
 
     default_anno = module.flash_attention_anno(*inputs)
     keyword_anno = module.flash_attention_anno(*inputs, return_lse=True)
-    positional_anno = module.flash_attention_anno(*inputs, *_return_lse_positional_args())
+    positional_anno = module.flash_attention_anno(
+        *inputs, *_return_lse_positional_args(wrapper)
+    )
 
     assert default_anno.endswith("-> l num_heads vd^")
     assert keyword_anno.endswith("-> l num_heads vd^, num_heads l")

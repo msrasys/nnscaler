@@ -128,7 +128,8 @@ class InterTransition:
     @staticmethod
     def transitionable(src_rvd: TRVD, dst_rvd: TRVD) -> Optional[Callable]:
         """
-        Check wheter a primitive exists to transform src_rvd to dst_rvd
+        Check whether a primitive exists to transform src_rvd to dst_rvd.
+        Changed factors must be integer multiples or divisors of each other.
 
         @param src_rvd TRVD: source RVD
         @param dst_rvd TRVD: destination RVD
@@ -143,6 +144,14 @@ class InterTransition:
         # only support one dimension change
         # this only happens when the device number changes
         if len(incd) + len(decd) != 1: return trans_fn
+        # Floor-divided chunk counts would silently omit destinations for uneven factors.
+        # For now, we only support exact multiples or divisors here,
+        # and let the general planner (`concurrent.gen_general`) handle the rest cases.
+        # TODO: Handle cases where the factors are not exact multiples or divisors.
+        # we have a draft implementation here: https://github.com/msrasys/nnscaler/pull/100
+        # which will group devices to handle uneven splits.
+        if any(max(d1, d2) % min(d1, d2) != 0 for d1, d2 in zip(src_rvd, dst_rvd)):
+            return None
         if len(incd) == 1:
             incd = incd[0]
             if incd == 0: # incr
@@ -301,8 +310,15 @@ class InterPathFinder:
         assert producer_out_devs is not None, f"Can't find inter-rvd producer out device placement"
 
         # setup consumer primitives and entry device placement
+        candidates = sorted(cdev_space)
+        if candidates and len(candidates[0]) == len(producer_out_devs):
+            peer_map = dict(zip(sorted(producer_out_devs), sorted(candidates[0])))
+            preferred = tuple(peer_map[device] for device in producer_out_devs)
+            if preferred in cdev_space:
+                candidates.remove(preferred)
+            candidates.insert(0, preferred)
         consumer_entry_devs = None
-        for cdevs in cdev_space:
+        for cdevs in candidates:
             clayout = RVDLayout.grid(
                 olayout.ftensor, r=crvds[0][0], v=crvds[0][1],
                 dims=crvds[0][2:], devices=cdevs)

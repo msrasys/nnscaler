@@ -14,7 +14,9 @@ from nnscaler.ir.cten import IRCell, IRTensor
 from nnscaler.ir.tensor import IRFullTensor, IRSubTensor
 from nnscaler.ir.operator import IRBpOperation, IRDataOperation, IRFwOperation
 from nnscaler.ir.adapter import IRWeightReducer, IRAdapter
-from nnscaler.ir.adapter.prim import CollectivePrim
+from nnscaler.ir.adapter.prim import (
+    CollectivePrim, MovePrim, ObjectMovePrim, RDScatterPrim, RDGatherPrim,
+)
 
 from nnscaler.graph.graph import IRSegment
 from nnscaler.graph.parser.register import CustomizedOps
@@ -140,6 +142,8 @@ class ModuleCodeGen(FuncEmission):
 
         # customized op code
         for op_impl in set(CustomizedOps.kOpCodeDef.values()):
+            if not op_impl:
+                continue
             # self.init_code.append('@torch.jit.script')
             self.init_code.append(op_impl)
             self.init_code += ['']
@@ -279,7 +283,17 @@ class ModuleCodeGen(FuncEmission):
         for adapter in adapters:
             for prim in adapter.prims:
                 if isinstance(prim, CollectivePrim):
-                    ranks = np.array(tuple(sorted(prim.kwargs['ranks'])), dtype=int)
+                    groups = [prim.kwargs['ranks']]
+                elif isinstance(prim, (MovePrim, ObjectMovePrim)):
+                    groups = [[prim.kwargs['src'], prim.kwargs['dst']]]
+                elif isinstance(prim, RDScatterPrim):
+                    groups = [[prim.kwargs['src'], dst] for dst in prim.kwargs['dsts']]
+                elif isinstance(prim, RDGatherPrim):
+                    groups = [[src, prim.kwargs['dst']] for src in prim.kwargs['srcs']]
+                else:
+                    continue
+                for ranks in groups:
+                    ranks = np.array(tuple(sorted(ranks)), dtype=int)
                     for i in range(nreplica):
                         shifted_ranks = tuple(ranks + i * len(self.devices))
                         shifted_ranks = tuple(int(rank) for rank in shifted_ranks)
@@ -556,6 +570,7 @@ class ModuleCodeGen(FuncEmission):
                         'init_params=True',
                         'build_buckets=True',
                         '*args',
+                        'init_module=None',
                         f'async_op={CompileFlag.async_reducer}',
                         f'max_bucket_size_bytes={CompileFlag.max_reducer_bucket}',
                         f'zero_use_reduce_scatter={CompileFlag.zero_use_reduce_scatter}',
@@ -566,7 +581,7 @@ class ModuleCodeGen(FuncEmission):
                 ) as ib:
                     ib.insert_body(self.model_init_statements)
                     ib.insert_body('')
-                    ib.insert_body('self._post_init(init_params, build_buckets)')
+                    ib.insert_body('self._post_init(init_params, build_buckets, init_module=init_module)')
             else:
                 with FunctionBlock(func_name='__init__', args=['self']) as ib:
                     ib.insert_body(self.model_init_statements)
@@ -708,23 +723,15 @@ class ModuleCodeGen(FuncEmission):
 
     def emit_comm_groups(self):
         """
-        Creating communication group requires all the devices
-        enter the same call.
+        Collect groups that all runtime devices initialize through init_groups.
 
         The fields storing intermediate codes that are populated by this method:
         - `model_init_statements`
         """
-        sign = 'self.init_group(ranks={ranks})'
-        # create single rank communication group
-        self.model_init_statements.append('# single rank communication groups')
-        with ForBlock(var='rank', iters=f'range({self.runtime_ndevs})') as fb:
-            fb.insert_body(sign.format(ranks='[rank]'))
-        self.model_init_statements.extend(fb.code)
-        # create communication group
+        groups = [[rank] for rank in range(self.runtime_ndevs)]
+        groups.extend(list(ranks) for ranks in self.comm_groups)
         self.model_init_statements.append('# communication groups')
-        for ranks in self.comm_groups:
-            code = sign.format(ranks=list(ranks))
-            self.model_init_statements.append(code)
+        self.model_init_statements.append(f'self.init_groups(ranks={groups})')
         self.model_init_statements.append(' ')
 
     def init_attributes(self, node: IRCell) -> dict[str, dict[str, Any]]:
@@ -773,7 +780,7 @@ class ModuleCodeGen(FuncEmission):
                         slicers = tuple(slice(start, stop) for (start, stop) in itensor.indmap)
                         if itensor.is_scalar_tensor():
                             assert len(slicers) == 1 and slicers[0] == slice(0, 1), f"Unexpected slicers {slicers} for scalar tensor."
-                            slicers = '...'  # Ellipsis slicer for scalar tensor, x[...] is equivalent to x
+                            slicers = ()
                         val_chunks = itensor.valmap[1]
                         attr_name = self.tensor_name(itensor)
                         attr_props = dict(

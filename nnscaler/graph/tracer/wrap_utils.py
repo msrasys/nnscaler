@@ -14,6 +14,7 @@ from typing import Any, Dict, Optional, Type, List, Callable, Union, TYPE_CHECKI
 import math
 import torch
 from torch.fx.proxy import Scope, ScopeContextManager
+from torch.overrides import is_tensor_method_or_property
 
 import nnscaler.graph.tracer as cct
 from . import pytree_utils, orig_func, operator_patcher
@@ -222,11 +223,19 @@ def create_wrapped_leaf_func(func: Callable, *, replace_func: Optional[Callable]
             if tracer is None:
                 return func(*args, **kwargs)
             else:
-                if replace_func is None:
-                    if is_method:
-                        return tracer.create_proxy('call_method', method_name, args, kwargs)
-                    else:
-                        return tracer.create_proxy('call_function', func, args, kwargs)
+                if is_method:
+                    # replace the method call with the replacement function
+                    if replace_func is not None and replace_traced_code:
+                        return tracer.create_proxy('call_function', replace_func, args, kwargs)
+                    return tracer.create_proxy(
+                        'call_method',
+                        replace_func if replace_func is not None else method_name,
+                        args,
+                        kwargs,
+                        node_target=method_name if replace_func is not None else None,
+                    )
+                elif replace_func is None:
+                    return tracer.create_proxy('call_function', func, args, kwargs)
                 else:
                     return tracer.create_proxy(
                         'call_function', replace_func, args, kwargs,
@@ -350,6 +359,9 @@ def create_wrapped_module_getattribute(tracer: 'ConcreteTracer'):
             return tracer.create_proxy('get_attr', tracer.path_of_parameter[id(attr_val)], (), {})
         elif id(attr_val) in tracer.path_of_buffer:
             return tracer.create_proxy('get_attr', tracer.path_of_buffer[id(attr_val)], (), {})
+        elif isinstance(attr_val, torch.Tensor) and attr_val in tracer.tensor_attrs:
+            # Preserve the source attribute name before offload tracing copies the tensor.
+            return tracer.create_proxy('get_attr', tracer.tensor_attrs[attr_val], (), {})
         return attr_val
     return module_getattribute_wrapper
 
@@ -419,6 +431,15 @@ def is_autograd_op(func) -> bool:
     except TypeError:
         # if func is not a class, then it is not an autograd function
         return False
+
+
+def is_default_leaf_function(func: Callable) -> bool:
+    """Whether concrete tracing already treats a callable as a leaf."""
+    return (
+        func in default_autowrap_leaf_function
+        or is_autograd_apply(func)
+        or is_tensor_method_or_property(func)
+    )
 
 
 def create_wrapped_autograd_apply(default_tracer: 'ConcreteTracer'):

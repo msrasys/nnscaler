@@ -17,6 +17,7 @@ from nnscaler.flags import CompileFlag
 import nnscaler.graph.function.dimops
 from nnscaler.graph.function.pyfunc import IRPyFunc
 from nnscaler.graph.parser.mapping import SignFx2Op
+from nnscaler.graph.parser.register import CustomizedOps, _get_torch_op_aliases
 from nnscaler.ir.cten import IR, IRObject
 from nnscaler.parallel import _load_parallel_module_class, parallelize, ComputeConfig, CubeModule, _gen_graph
 from nnscaler.utils import mark_dynamic
@@ -834,7 +835,7 @@ def test_codegen_arange():
         )
         assert m_new is None
         # never fold torch.Tensor.item() to constant
-        assert _gencode_contains(tempdir, ArangeModule, 0, '.*nnscaler.runtime.function.arange\(start=0, end=.*, step=1.*')
+        assert _gencode_contains(tempdir, ArangeModule, 0, r'.*nnscaler.runtime.function.arange\(start=0, end=.*, step=1.*')
 
 
 class MinModule(torch.nn.Module):
@@ -1457,7 +1458,7 @@ def test_codegen_scalar_tensor(tmp_path):
     #     # communication groups
 
     #     self.register_buffer('num_batches_tracked_33', torch.empty((), dtype=torch.int64), persistent=True)
-    #     self.add_full_map('num_batches_tracked_33', 2, False, 'num_batches_tracked', (), ..., 1)
+    #     self.add_full_map('num_batches_tracked_33', 2, False, 'num_batches_tracked', (), (), 1)
 
     #     self.register_parameter('proj_weight_35', torch.nn.Parameter(torch.empty((1024, 1024), dtype=torch.float32)))
     #     self.add_full_map('proj_weight_35', 4, True, 'proj.weight', (1024, 1024), (slice(0, 1024, None), slice(0, 1024, None)), 1)
@@ -1491,7 +1492,7 @@ def test_codegen_scalar_tensor(tmp_path):
     assert _gencode_contains(tmp_path, ScalarTensorModule, 0,
         r"self\.register_buffer\('num_batches_tracked_\d+', torch\.empty\(\(\), dtype=torch\.int64\), persistent=True\)")
     assert _gencode_contains(tmp_path, ScalarTensorModule, 0,
-        r"self\.add_full_map\('num_batches_tracked_\d+', \d+, False, 'num_batches_tracked', \(\), \.\.\., 1\)")
+        r"self\.add_full_map\('num_batches_tracked_\d+', \d+, False, 'num_batches_tracked', \(\), \(\), 1\)")
 
 
 class ImportlibModel(torch.nn.Module):
@@ -2419,3 +2420,193 @@ def test_fake_fn(tmp_path):
     #     add_xy_23 = tests.parallel_module.test_gencode.add_xy(linear_26, linear_1_27)
     #     del linear_26, linear_1_27
     #     return add_xy_23
+
+
+class BuiltinFakeFnModel(torch.nn.Module):
+    def forward(self, x, y):
+        return torch.add(x, y)
+
+
+class BuiltinInplaceFakeEmitModel(torch.nn.Module):
+    def forward(self, x, y):
+        return x.add_(y)
+
+
+class BuiltinTensorAddEmitModel(torch.nn.Module):
+    def forward(self, x, y):
+        return torch.Tensor.add(x, y)
+
+
+class BuiltinBoundAddEmitModel(torch.nn.Module):
+    def forward(self, x, y):
+        return x.add(y)
+
+
+def _remove_updated_torch_add(runtime_fn=torch.add):
+    for alias in _get_torch_op_aliases(runtime_fn):
+        for registry in (
+            CustomizedOps.kOpMap,
+            CustomizedOps.kOpRuntime,
+            CustomizedOps.kOpFakeRuntime,
+            CustomizedOps.kOpCodeDef,
+            CustomizedOps.kOpEmit,
+            CustomizedOps.kOpInputGen,
+        ):
+            registry.pop(alias, None)
+
+
+@replace_all_device_with('cpu')
+def test_update_builtin_fake_fn(tmp_path):
+    calls = []
+
+    def fake_add(x, y):
+        calls.append((x, y))
+        return x
+
+    nnscaler.update_op(torch.add, fake_fn=fake_add)
+    try:
+        parallelize(
+            BuiltinFakeFnModel(),
+            {'x': torch.randn(10, 10), 'y': torch.randn(10, 10)},
+            'dp',
+            ComputeConfig(1, 2),
+            gen_savedir=tmp_path,
+            load_module=False,
+            reuse='override',
+        )
+    finally:
+        _remove_updated_torch_add()
+
+    assert len(calls) == 1
+    assert _gencode_contains(tmp_path, BuiltinFakeFnModel, 0, 'torch.add')
+    assert not _gencode_contains(tmp_path, BuiltinFakeFnModel, 0, 'fake_add')
+
+
+@replace_all_device_with('cpu')
+def test_update_builtin_op_create_fn(tmp_path):
+    def create_sub(*args, signature=None, **kwargs):
+        return SignFx2Op.kOpMap['torch.sub'](*args, signature='torch.sub', **kwargs)
+
+    nnscaler.update_op(torch.add, op_create_fn=create_sub)
+    try:
+        parallelize(
+            BuiltinFakeFnModel(),
+            {'x': torch.randn(10, 10), 'y': torch.randn(10, 10)},
+            'dp',
+            ComputeConfig(1, 2),
+            gen_savedir=tmp_path,
+            load_module=False,
+            reuse='override',
+        )
+    finally:
+        _remove_updated_torch_add()
+
+    assert _gencode_contains(tmp_path, BuiltinFakeFnModel, 0, r'torch\.sub\(')
+
+
+@replace_all_device_with('cpu')
+def test_update_builtin_emit_fn(tmp_path):
+    def emit_sub(node, args, kwargs, runtime_devid, plan_ndevs, runtime_ndevs):
+        operands = list(args) + [f'{key}={value}' for key, value in kwargs.items()]
+        return f"torch.sub({', '.join(operands)})"
+
+    nnscaler.update_op(torch.add, emit_fn=emit_sub)
+    try:
+        parallelize(
+            BuiltinFakeFnModel(),
+            {'x': torch.randn(10, 10), 'y': torch.randn(10, 10)},
+            'dp',
+            ComputeConfig(1, 2),
+            gen_savedir=tmp_path,
+            load_module=False,
+            reuse='override',
+        )
+    finally:
+        _remove_updated_torch_add()
+
+    assert _gencode_contains(tmp_path, BuiltinFakeFnModel, 0, r'torch\.sub\(')
+
+
+@pytest.mark.parametrize(
+    'model_type',
+    [BuiltinFakeFnModel, BuiltinTensorAddEmitModel, BuiltinBoundAddEmitModel],
+)
+@replace_all_device_with('cpu')
+def test_update_tensor_add_emit_fn_alias(tmp_path, model_type):
+    def emit_sub(node, args, kwargs, runtime_devid, plan_ndevs, runtime_ndevs):
+        operands = list(args) + [f'{key}={value}' for key, value in kwargs.items()]
+        return f"torch.sub({', '.join(operands)})"
+
+    nnscaler.update_op(torch.Tensor.add, emit_fn=emit_sub)
+    try:
+        parallelize(
+            model_type(),
+            {'x': torch.randn(10, 10), 'y': torch.randn(10, 10)},
+            'dp',
+            ComputeConfig(1, 2),
+            gen_savedir=tmp_path,
+            load_module=False,
+            reuse='override',
+        )
+    finally:
+        _remove_updated_torch_add()
+
+    assert _gencode_contains(tmp_path, model_type, 0, r'torch\.sub\(')
+
+
+@replace_all_device_with('cpu')
+def test_update_builtin_code(tmp_path):
+    code = 'def updated_add_runtime(x, y):\n    return torch.add(x, y)'
+
+    nnscaler.update_op(torch.add, code=code)
+    try:
+        parallelize(
+            BuiltinFakeFnModel(),
+            {'x': torch.randn(10, 10), 'y': torch.randn(10, 10)},
+            'dp',
+            ComputeConfig(1, 2),
+            gen_savedir=tmp_path,
+            load_module=False,
+            reuse='override',
+        )
+    finally:
+        _remove_updated_torch_add()
+
+    assert _gencode_contains(
+        tmp_path,
+        BuiltinFakeFnModel,
+        0,
+        r'def updated_add_runtime\(x, y\):\n    return torch\.add\(x, y\)',
+    )
+
+
+@replace_all_device_with('cpu')
+def test_update_builtin_inplace_fake_and_emit(tmp_path):
+    def emit_add(node, args, kwargs, runtime_devid, plan_ndevs, runtime_ndevs):
+        operands = list(args) + [f'{key}={value}' for key, value in kwargs.items()]
+        return f"torch.add({', '.join(operands)})"
+
+    dummy_input = {
+        'x': torch.randn(10, 10),
+        'y': torch.randn(10, 10),
+    }
+    original_x = dummy_input['x'].clone()
+    nnscaler.update_op(torch.Tensor.add_, fake_fn=torch.add, emit_fn=emit_add)
+    try:
+        parallelize(
+            BuiltinInplaceFakeEmitModel(),
+            dummy_input,
+            'dp',
+            ComputeConfig(1, 2),
+            gen_savedir=tmp_path,
+            load_module=False,
+            reuse='override',
+        )
+    finally:
+        _remove_updated_torch_add(torch.Tensor.add_)
+
+    torch.testing.assert_close(dummy_input['x'], original_x)
+    assert _gencode_contains(
+        tmp_path, BuiltinInplaceFakeEmitModel, 0, r'torch\.add\(')
+    assert not _gencode_contains(
+        tmp_path, BuiltinInplaceFakeEmitModel, 0, r'torch\.Tensor\.add_\(')

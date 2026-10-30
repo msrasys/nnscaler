@@ -48,8 +48,7 @@ class DTensor:
 
         ret_pg: Optional[torch.distributed.ProcessGroup] = None
         ret_ranks: Optional[list[int]] = None
-        for g in groups:
-            pg = DeviceGroup().get_group(g)
+        for g, pg in zip(groups, DeviceGroup().get_groups(groups)):
             if self.rank in g:
                 ret_pg = pg
                 ret_ranks = g

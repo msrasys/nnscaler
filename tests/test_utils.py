@@ -3,14 +3,281 @@
 
 from collections import OrderedDict
 from dataclasses import dataclass
+import functools
 import sys
+from unittest.mock import patch
 import pytest
 import torch
 
 from nnscaler.utils import (
-    select_many, classproperty, fields, set_member_by_name, unchecked_fields,
+    select_many, classproperty, fields, get_full_qualified_name, load_type, set_member_by_name, unchecked_fields,
     transform_recursively, first, first_or, StepwiseConfig, recursion_limit,
 )
+from tests.utils import replace_all_device_with
+
+
+@pytest.mark.parametrize('fail', [False, True])
+def test_replace_devices_context_rng_and_restore(fail):
+    originals = {
+        'generator': torch.Generator,
+        'device': torch.cuda.device,
+        'current_device': torch.cuda.current_device,
+        'set_device': torch.cuda.set_device,
+        'get_rng_state': torch.cuda.get_rng_state,
+        'set_rng_state': torch.cuda.set_rng_state,
+        'manual_seed': torch.cuda.manual_seed,
+        'manual_seed_all': torch.cuda.manual_seed_all,
+        'empty_strided': torch.empty_strided,
+    }
+    existing_generator = torch.Generator()
+    state = torch.get_rng_state()
+    with patch('torch.cuda._lazy_init', side_effect=AssertionError('real CUDA initialization')):
+        try:
+            with replace_all_device_with('cpu', force=True):
+                with torch.cuda.device(3):
+                    torch.cuda.set_device(2)
+                    assert torch.cuda.current_device() == 0
+                    generator = torch.Generator('cuda:3').manual_seed(17)
+                    assert isinstance(generator, torch.Generator)
+                    assert isinstance(existing_generator, torch.Generator)
+                    assert generator.device == torch.device('cpu')
+                    actual = torch.rand(8, device='cuda', generator=generator)
+                    expected = torch.rand(8, generator=torch.Generator().manual_seed(17))
+                    assert torch.equal(actual, expected)
+                    assert torch.empty_strided((2, 3), (1, 2), device='cuda').device.type == 'cpu'
+                    assert torch.ops.aten.ones.default([2], device=torch.device('cuda')).device.type == 'cpu'
+                    assert torch.ones(2, device='meta').is_meta
+                    with torch.random.fork_rng(devices=[0]):
+                        torch.cuda.manual_seed(19)
+                        first = torch.rand(8)
+                        torch.cuda.manual_seed_all(19)
+                        assert torch.equal(first, torch.rand(8))
+                    assert torch.equal(torch.get_rng_state(), state)
+                outer_generator = torch.Generator
+                with replace_all_device_with('cpu', force=True):
+                    assert torch.Generator('cuda').device.type == 'cpu'
+                assert torch.Generator is outer_generator
+                if fail:
+                    raise ValueError('test restoration')
+        except ValueError as exc:
+            assert fail and str(exc) == 'test restoration'
+    assert torch.Generator is originals['generator']
+    assert torch.empty_strided is originals['empty_strided']
+    for name in ('device', 'current_device', 'set_device', 'get_rng_state',
+                 'set_rng_state', 'manual_seed', 'manual_seed_all'):
+        assert getattr(torch.cuda, name) is originals[name]
+    assert torch.equal(torch.get_rng_state(), state)
+
+
+def test_replace_devices_deferred_capture_and_fallback():
+    from nnscaler.runtime.initialization import DeferredInitialization
+
+    with patch('torch.cuda._lazy_init', side_effect=AssertionError('real CUDA initialization')):
+        with replace_all_device_with('cpu', force=True):
+            with DeferredInitialization(device='cuda') as capture:
+                source = torch.randn(32)
+                total = source.sum().item()
+                indices = (source > 0).nonzero()
+                result = source * (2 if total > 0 else 3)
+            assert source.is_meta and result.is_meta and indices.is_meta
+            actual = capture.materialize(source)
+            assert actual.device.type == 'cpu'
+            assert actual.sum().item() == total
+            assert torch.equal(capture.materialize(indices), (actual > 0).nonzero())
+            assert torch.equal(capture.materialize(result), actual * (2 if total > 0 else 3))
+
+
+def qualified_module_function():
+    pass
+
+
+class QualifiedNameFixture:
+    def member(self):
+        pass
+
+    @staticmethod
+    def static_method():
+        pass
+
+    @classmethod
+    def class_method(cls):
+        pass
+
+    class Nested:
+        def member(self):
+            pass
+
+        @staticmethod
+        def static_method():
+            pass
+
+        @classmethod
+        def class_method(cls):
+            pass
+
+
+def wraps_decorator(fn):
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        return fn(*args, **kwargs)
+
+    return wrapper
+
+
+def wrapped_protocol_decorator(fn):
+    def wrapper(*args, **kwargs):
+        return fn(*args, **kwargs)
+
+    wrapper.__wrapped__ = fn
+    return wrapper
+
+
+def opaque_decorator(fn):
+    def wrapper(*args, **kwargs):
+        return fn(*args, **kwargs)
+
+    return wrapper
+
+
+@wraps_decorator
+def wraps_decorated_function():
+    pass
+
+
+@wrapped_protocol_decorator
+def wrapped_protocol_function():
+    pass
+
+
+class DecoratedQualifiedNameFixture:
+    @wraps_decorator
+    def member(self):
+        pass
+
+    @staticmethod
+    @wraps_decorator
+    def static_method():
+        pass
+
+    @classmethod
+    @wraps_decorator
+    def class_method(cls):
+        pass
+
+
+class QualifiedNameAutogradFunction(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x):
+        return x
+
+
+@torch.jit.script
+def qualified_script_function(x: torch.Tensor):
+    return x
+
+
+@pytest.mark.parametrize(
+    ('fn', 'qualname'),
+    [
+        (qualified_module_function, 'qualified_module_function'),
+        (QualifiedNameFixture.member, 'QualifiedNameFixture.member'),
+        (QualifiedNameFixture().member, 'QualifiedNameFixture.member'),
+        (QualifiedNameFixture.static_method, 'QualifiedNameFixture.static_method'),
+        (QualifiedNameFixture.class_method, 'QualifiedNameFixture.class_method'),
+        (QualifiedNameFixture.Nested.member, 'QualifiedNameFixture.Nested.member'),
+        (QualifiedNameFixture.Nested().member, 'QualifiedNameFixture.Nested.member'),
+        (QualifiedNameFixture.Nested.static_method, 'QualifiedNameFixture.Nested.static_method'),
+        (QualifiedNameFixture.Nested.class_method, 'QualifiedNameFixture.Nested.class_method'),
+    ],
+)
+def test_get_full_qualified_name(fn, qualname):
+    assert get_full_qualified_name(fn) == f'{__name__}.{qualname}'
+
+
+def test_get_full_qualified_name_descriptor_objects():
+    assert get_full_qualified_name(QualifiedNameFixture.__dict__['static_method']) == \
+        f'{__name__}.QualifiedNameFixture.static_method'
+    assert get_full_qualified_name(QualifiedNameFixture.__dict__['class_method']) == \
+        f'{__name__}.QualifiedNameFixture.class_method'
+    assert get_full_qualified_name(str.upper) == 'builtins.str.upper'
+    assert get_full_qualified_name(dict.fromkeys) == 'builtins.dict.fromkeys'
+
+
+@pytest.mark.parametrize(
+    ('fn', 'qualname'),
+    [
+        (wraps_decorated_function, 'wraps_decorated_function'),
+        (wrapped_protocol_function, 'wrapped_protocol_function'),
+        (DecoratedQualifiedNameFixture.member, 'DecoratedQualifiedNameFixture.member'),
+        (DecoratedQualifiedNameFixture().member, 'DecoratedQualifiedNameFixture.member'),
+        (DecoratedQualifiedNameFixture.static_method, 'DecoratedQualifiedNameFixture.static_method'),
+        (DecoratedQualifiedNameFixture.class_method, 'DecoratedQualifiedNameFixture.class_method'),
+    ],
+)
+def test_get_full_qualified_name_decorated(fn, qualname):
+    assert get_full_qualified_name(fn) == f'{__name__}.{qualname}'
+
+
+@pytest.mark.parametrize(
+    ('fn', 'qualified_name'),
+    [
+        (torch.add, 'torch.add'),
+        (torch.Tensor.add, 'torch.Tensor.add'),
+        (torch.Tensor.add_, 'torch.Tensor.add_'),
+        (torch.Tensor.size, 'torch.Tensor.size'),
+        (torch.nn.functional.linear, 'torch.nn.functional.linear'),
+        (torch.nn.functional.relu, 'torch.nn.functional.relu'),
+        (QualifiedNameAutogradFunction, f'{__name__}.QualifiedNameAutogradFunction.apply'),
+        (QualifiedNameAutogradFunction.apply, f'{__name__}.QualifiedNameAutogradFunction.apply'),
+        (qualified_script_function, f'{__name__}.qualified_script_function'),
+    ],
+)
+def test_get_full_qualified_name_torch(fn, qualified_name):
+    assert get_full_qualified_name(fn) == qualified_name
+
+
+@pytest.mark.parametrize(
+    ('fn', 'qualified_name'),
+    [
+        (torch.unique, 'torch.unique'),
+        (torch.nn.functional.max_pool2d, 'torch.nn.functional.max_pool2d'),
+        (torch.linalg.norm, 'torch.linalg.norm'),
+        (torch.fft.fft, 'torch.fft.fft'),
+        (torch.special.gammaln, 'torch.special.gammaln'),
+    ],
+)
+def test_get_full_qualified_name_public_torch_op(fn, qualified_name):
+    signature = get_full_qualified_name(fn)
+
+    assert signature == qualified_name
+    assert load_type(signature) is fn
+
+
+def test_get_full_qualified_name_rejects_local_function():
+    def local_function():
+        pass
+
+    with pytest.raises(ValueError, match='not defined at an importable'):
+        get_full_qualified_name(local_function)
+
+
+@pytest.mark.parametrize('use_apply', [False, True])
+def test_get_full_qualified_name_rejects_local_autograd_function(use_apply):
+    class LocalFunction(torch.autograd.Function):
+        pass
+
+    target = LocalFunction.apply if use_apply else LocalFunction
+    with pytest.raises(ValueError, match='not defined at an importable'):
+        get_full_qualified_name(target)
+
+
+def test_get_full_qualified_name_rejects_opaque_decorator():
+    @opaque_decorator
+    def decorated_function():
+        pass
+
+    with pytest.raises(ValueError, match='not defined at an importable'):
+        get_full_qualified_name(decorated_function)
 
 
 def test_recursion_limit():
@@ -556,5 +823,3 @@ def test_stepwise_steps_per_period_max_total_steps(config, items, max_total_step
         StepwiseConfig.value_at(result, e) for e in range(last_period)
     )
     assert consumed < max_total_steps or last_period == 0
-
-

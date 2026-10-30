@@ -2,9 +2,11 @@
 #  Licensed under the MIT License.
 
 from typing import Any, Dict, Union
+import importlib
 import logging
 from pathlib import Path
 import operator
+import threading
 import warnings
 
 from nnscaler.ir.tensor import IRFullTensor
@@ -12,10 +14,11 @@ from nnscaler.graph.parser.register import CustomizedOps
 from nnscaler.graph import IRGraph
 from nnscaler.flags import CompileFlag
 
-from nnscaler.graph.parser import parse_fx_module
+from nnscaler.graph.parser import AttrSaveLevel, parse_fx_module
 from nnscaler.graph.tracer import concrete_trace
 from nnscaler.graph.tracer.wrap_utils import Location, is_autograd_apply, LeafWrapInfo
 from nnscaler.graph.tracer.torch_fx_patcher import side_effectful_inplace_ops
+from nnscaler.utils import load_type
 
 import nnscaler.runtime.function as cube_rt_function
 
@@ -24,6 +27,35 @@ import torch.fx
 from torch.autograd.graph import saved_tensors_hooks
 
 _logger = logging.getLogger(__name__)
+
+
+def _customized_leaf_functions() -> Dict[Any, LeafWrapInfo]:
+    leaf_functions = {}
+    for signature, runtime_fn in CustomizedOps.kOpRuntime.items():
+        if is_autograd_apply(runtime_fn):
+            continue
+
+        leaf_info = leaf_functions.get(runtime_fn)
+        if leaf_info is None:
+            leaf_info = LeafWrapInfo([], True, None, replace_traced_code=False)
+            leaf_functions[runtime_fn] = leaf_info
+        leaf_info.replacement = CustomizedOps.kOpFakeRuntime.get(signature)
+
+        # find the location of the function in its namespace
+        # Note if a function has multiple aliases
+        # we will add all locations to the extra_locs of the leaf info
+        namespace_name, attr_name = signature.rsplit('.', 1)
+        try:
+            namespace = importlib.import_module(namespace_name)
+        except ModuleNotFoundError:
+            # when namespace is not a module, it might be a class/variable/etc
+            namespace = load_type(namespace_name)
+        if getattr(namespace, attr_name, None) is not runtime_fn:
+            raise RuntimeError(
+                f"Registered operator {signature} no longer resolves to its registered runtime function"
+            )
+        leaf_info.extra_locs.append(Location(namespace, attr_name))
+    return leaf_functions
 
 
 class no_save_tensor_hook(saved_tensors_hooks):
@@ -82,18 +114,10 @@ def to_fx_graph(model: torch.nn.Module, dummy_input) -> torch.fx.GraphModule:
     # get user registered functions, and treat them as leaf functions
     # torch function/operators/builtins/... are automatically handled as leaf functions by concrete trace
     # filter out torch.autograd.Function.apply as concrete trace already treats them as leaf function
-    leaf_functions = {
-        CustomizedOps.kOpRuntime[sign]: LeafWrapInfo(
-            [], True, CustomizedOps.kOpFakeRuntime[sign],
-            replace_traced_code=False,
-        )
-        for sign in CustomizedOps.kOpMap
-        if CustomizedOps.kOpRuntime[sign] and not is_autograd_apply(CustomizedOps.kOpRuntime[sign])
-    }
+    leaf_functions = _customized_leaf_functions()
 
     # importlib functions
     # currently only import_module is handled in the code
-    import importlib
     leaf_functions.update({
         func: LeafWrapInfo([Location(importlib, func.__name__)], False, None)
         for func in [importlib.import_module]
@@ -121,6 +145,20 @@ def to_fx_graph(model: torch.nn.Module, dummy_input) -> torch.fx.GraphModule:
         warnings.filterwarnings("ignore", message=
             ".*does not reference an nn.Module, nn.Parameter, or buffer, which is what 'get_attr' Nodes typically target"
         )
+        current_thread = threading.current_thread()
+        other_threads = [
+            f'{thread.name} (type={type(thread).__module__}.{type(thread).__qualname__}, '
+            f'ident={thread.ident}, daemon={thread.daemon})'
+            for thread in threading.enumerate()
+            if thread is not current_thread and thread.is_alive()
+        ]
+        if other_threads:
+            _logger.warning(
+                'Other live Python threads detected before concrete_trace: %s. '
+                'Tracing temporarily patches process-wide functions; concurrent Python execution '
+                'may interfere with tracing and produce an incorrect graph.',
+                '; '.join(other_threads),
+            )
         traced_model = concrete_trace(
             model,
             dummy_input,
@@ -139,6 +177,8 @@ def to_ir_graph(
     dummy_input: Dict[str, Any],
     attr_savedir: Union[str, Path],
     constant_folding: bool = True,
+    *,
+    save_level: AttrSaveLevel = AttrSaveLevel.ALL,
 ) -> IRGraph:
     """Convert torch.fx.GraphModule based model into IRGraph
 
@@ -149,6 +189,7 @@ def to_ir_graph(
         constant_folding (bool):
             whether to enable constant folding. Default True.
         attr_savedir (Union[str, Path]): directory to save content (attribtes)
+        save_level (AttrSaveLevel): attribute files to save; defaults to ALL.
 
     Returns:
         IRGraph: IRGraph of model
@@ -160,7 +201,7 @@ def to_ir_graph(
             traced_model, dummy_input,
             attr_savedir=attr_savedir,
             constant_folding=constant_folding,
-            save_content=True,
+            save_level=save_level,
         )
     module_name = traced_model.__class__.__name__
 

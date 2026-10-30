@@ -47,6 +47,9 @@ from nnscaler.ir.unique import IDGenerator
 
 from nnscaler.runtime.adapter.reducer import Bucket, Reducer, ParamBucketConfig
 from nnscaler.runtime.device import DeviceGroup
+from nnscaler.runtime.initialization import (
+    create_init_module, create_shard_init_weights,
+)
 from nnscaler.runtime.gnorm import calcuate_gnorm, clip_grads
 from nnscaler.runtime.module import (
     AttrMeta,
@@ -91,6 +94,22 @@ _PREDEFINED_POLICIES_NAME_PREFIX = 'pas_'
 for k, v in policies.__dict__.items():
     if callable(v) and k.startswith(_PREDEFINED_POLICIES_NAME_PREFIX):
         _PREDEFINED_POLICIES[k[len(_PREDEFINED_POLICIES_NAME_PREFIX):]] = v
+
+
+class ParamInitStrategy:
+    """
+    Parameter initialization strategy type
+    Possible values are:
+    'file'     : load parameters from fullmodel.pt
+    'full'     : initialize a full original model and copy its local parameter slices.
+                 Save non-persistent buffers to npbuffer.pt for resume without reconstruction.
+    'shard'    : use the original module's `__shard__init__(attr_meta_map)` method
+                 when defined, otherwise capture construction via `TorchDispatchMode`
+                 and replay required tensors on CPU to produce local slices.
+    """
+    FILE = 'file'
+    FULL = 'full'
+    SHARD = 'shard'
 
 
 @dataclass(frozen=True)
@@ -201,7 +220,17 @@ class ComputeConfig:
     # ```
     user_config: Dict[str, Any] = field(default_factory=dict)
 
+    # Parameter initialization settings
+    param_init_strategy: str = ParamInitStrategy.FILE
+    # the seed used for parameter initialization
+    param_init_seed: int = 1234
+
     def __post_init__(self):
+        strategies = (ParamInitStrategy.FILE, ParamInitStrategy.FULL, ParamInitStrategy.SHARD)
+        if self.param_init_strategy not in strategies:
+            raise ValueError(f"param_init_strategy must be one of {strategies}.")
+        if type(self.param_init_seed) is not int or not 0 <= self.param_init_seed < 2 ** 32:
+            raise ValueError("param_init_seed must be an integer in [0, 2**32).")
         if self.plan_ngpus <= 0:
             raise ValueError(f"plan_ngpus {self.plan_ngpus} must be > 0")
         if self.runtime_ngpus is None:
@@ -325,6 +354,10 @@ class ComputeConfig:
             'inference_only': self.inference_only, # there will be no backward nodes in the graph in inference mode
             'end2end_mode': self.use_end2end,  # end2end_mode can affect the graph generation.
             'trace_strategy': self.trace_strategy,  # different strategy might lead to different graph
+            # we will retrace the graph on fullmodel.pt file requirement change.
+            'param_init': self.param_init_strategy != ParamInitStrategy.FILE,
+            # Constructor randomness can affect graph structure as well as weights.
+            'param_init_seed': self.param_init_seed,
         }
 
     @property
@@ -381,10 +414,9 @@ class ComputeConfig:
         # create all groups
         plan_ngpus = self.plan_ngpus
         runtime_ngpus = self.runtime_ngpus
-        for i in range(plan_ngpus):
-            DeviceGroup().get_group(
-                list(range(i, runtime_ngpus, plan_ngpus))
-            )
+        DeviceGroup().get_groups([
+            list(range(i, runtime_ngpus, plan_ngpus)) for i in range(plan_ngpus)
+        ])
         rank_list = list(range(rank % plan_ngpus, runtime_ngpus, plan_ngpus))
         return rank_list, DeviceGroup().get_group(rank_list)
 
@@ -693,10 +725,11 @@ def _prepare_and_check_reusable(
     old_config: Optional[ComputeConfig] = ComputeConfig.safe_load_from_file(config_file)
     is_config_match = ComputeConfig.safe_equals(old_config, compute_config)
     is_graph_config_match = old_config is not None and old_config.graph_config == compute_config.graph_config
-    trace_meta_files = [
-        outdir / FxModuleParser.ATTR_CONTENT_FILE_0,  # just check the first is good enough
-        outdir / FxModuleParser.ATTR_MAP_FILE,
-    ]
+    trace_meta_files = [outdir / FxModuleParser.ATTR_MAP_FILE]
+    if compute_config.param_init_strategy == ParamInitStrategy.FILE:
+        trace_meta_files.append(outdir / FxModuleParser.ATTR_CONTENT_FILE_0)
+    if compute_config.param_init_strategy != ParamInitStrategy.SHARD:
+        trace_meta_files.append(outdir / FxModuleParser.NON_PERSISTENT_BUFFER_FILE)
 
     def _clean_old_attr_map_files() -> None:
         _clean_files(outdir, f'{ParallelModule.ATTR_META_FILE_PREFIX}[0-9]*.pkl')
@@ -709,7 +742,6 @@ def _prepare_and_check_reusable(
         expected_output_files.append(outdir / _GRAPH_DUMP_FILE)
         expected_output_files.append(outdir / _FORWARD_ARGS_DUMP_FILE)
         expected_output_files.append(outdir / ParallelModule.ORIGIN_MODULE_METADATA_FILE)
-        expected_output_files.append(outdir / FxModuleParser.NON_PERSISTENT_BUFFER_FILE)
         index_file = outdir / FxModuleParser.ATTR_CONTENT_INDEX_FILE
         if index_file.exists():
             expected_output_files.append(index_file)
@@ -769,7 +801,7 @@ def _prepare_and_check_reusable(
                 if _is_any_gencode_loaded(namespace):
                     raise RuntimeError(f'Output directory {outdir} is already loaded. '
                                        f'You can not override a loaded module.')
-                elif is_graph_config_match:
+                elif is_graph_config_match and all(meta_file.exists() for meta_file in trace_meta_files):
                     # reuse the graph dump
                     _clean_files(outdir, '*.py')
                     _clean_old_attr_map_files()
@@ -791,6 +823,8 @@ def _prepare_and_check_reusable(
             _clean_files(outdir, '*.py')
             _clean_old_attr_map_files()
 
+    if not reusable and compute_config.param_init_strategy == ParamInitStrategy.SHARD:
+        _clean_files(outdir, FxModuleParser.NON_PERSISTENT_BUFFER_FILE)
     return outdir, reusable
 
 
@@ -802,6 +836,7 @@ def _gen_graph(
     end2end_mode: bool = False,
     inference_only: bool = False,
     autoset_requires_grad: bool = True,
+    save_level: parser.AttrSaveLevel = parser.AttrSaveLevel.ALL,
 ):
     # reset environment
     IDGenerator().clear()
@@ -825,7 +860,8 @@ def _gen_graph(
 
     # generate ir logic graph
     graph = parser.to_ir_graph(
-        fx_graph, dummy_forward_args, outdir, constant_folding
+        fx_graph, dummy_forward_args, outdir, constant_folding,
+        save_level=save_level,
     )
 
     # generate dummy inputs for logic graph
@@ -974,18 +1010,16 @@ def _gencode(
                     # it should only have 1 `self` parameter
                     if len(inspect.signature(module_or_module_class.__init__).parameters) > 1:
                         raise ValueError("Module class __init__ should be parameter-free.")
-                    module = module_or_module_class()
-                else:
-                    module = module_fn()
-                    if type(module) != module_or_module_class:
-                        raise ValueError(f"module_fn should return a {module_or_module_class} instance.")
+                module = create_init_module(
+                    module_or_module_class, module_fn, module_dtype,
+                    seed=compute_config.param_init_seed,
+                )
             except Exception as e:
                 raise RuntimeError(f"Error when creating module instance.") from e
         else:
             module = module_or_module_class
-
-        if module_dtype is not None:
-            module = module.to(dtype=module_dtype)
+            if module_dtype is not None:
+                module = module.to(dtype=module_dtype)
 
         if any(isinstance(m, CubeModule) for m in module.modules()):
             raise RuntimeError('Parallel modules can not be nested.')
@@ -1004,6 +1038,11 @@ def _gencode(
                 constant_folding=compute_config.constant_folding, end2end_mode=compute_config.use_end2end,
                 inference_only=compute_config.inference_only,
                 autoset_requires_grad=autoset_requires_grad,
+                save_level={
+                    ParamInitStrategy.FILE: parser.AttrSaveLevel.ALL,
+                    ParamInitStrategy.FULL: parser.AttrSaveLevel.MN,
+                    ParamInitStrategy.SHARD: parser.AttrSaveLevel.M,
+                }[compute_config.param_init_strategy],
             )
 
         graph.dump(graph_ckp)
@@ -1262,7 +1301,7 @@ def parallelize(
         gen_savedir (Union[str, Path]): the directory to save generated code
         instance_name (Optional[str]): the instance name of the generated module. If it is None, will use the default name.
         load_module (bool): whether to load the generated module or module class after conversion is done.
-        init_module_params (bool): If true, when we construct the module, all its parameters are initialized with the same value with when we traced.
+        init_module_params (bool): If true, initialize parameters using compute_config.param_init_strategy.
             Otherwise, they will be empty tensor.
             This parameter will be passed to the module constructor,
             so it is only used when module_or_module_class is a module object, and load_module is true.
@@ -1321,6 +1360,21 @@ def parallelize(
 
     is_module_class = inspect.isclass(module_or_module_class)
     module_class = module_or_module_class if is_module_class else module_or_module_class.__class__
+
+    has_shard_initializer = hasattr(module_class, '__shard__init__')
+    if compute_config.param_init_strategy == ParamInitStrategy.SHARD and has_shard_initializer:
+        callback = getattr(module_class, '__shard__init__')
+        descriptor = inspect.getattr_static(module_class, '__shard__init__')
+        if not callable(callback) or not isinstance(descriptor, (staticmethod, classmethod)):
+            raise ValueError(
+                "shard param_init_strategy requires __shard__init__(attr_meta_map) "
+                "to be a callable staticmethod or classmethod on the original module class."
+            )
+        try:
+            inspect.signature(callback).bind({})
+        except TypeError:
+            raise ValueError("__shard__init__ must support a call with one positional attr_meta_map argument.")
+
     reuse = ReuseType(reuse) if isinstance(reuse, str) else reuse
     broadcast_strategy = BroadcastGenFilesStrategy(broadcast_strategy) if isinstance(broadcast_strategy, str) else broadcast_strategy
 
@@ -1426,10 +1480,27 @@ def parallelize(
             gen_savedir=gen_savedir,
             instance_name=instance_name,
         )
+        parallel_module_class._shard_init_fn = None
+        parallel_module_class._init_module_fn = None
+        if compute_config.param_init_strategy == ParamInitStrategy.SHARD and has_shard_initializer:
+            parallel_module_class._shard_init_fn = staticmethod(partial(
+                create_shard_init_weights, module_class, seed=compute_config.param_init_seed,
+            ))
+        elif compute_config.param_init_strategy != ParamInitStrategy.FILE:
+            parallel_module_class._init_module_fn = staticmethod(partial(
+                create_init_module, module_class, module_fn, module_dtype,
+                seed=compute_config.param_init_seed,
+            ))
         if is_module_class:
             return parallel_module_class
         else:
-            parallel_module = parallel_module_class(init_module_params, build_module_buckets)
+            init_kwargs = (
+                {'init_module': module_or_module_class}
+                if compute_config.param_init_strategy != ParamInitStrategy.FILE else {}
+            )
+            if compute_config.param_init_strategy != ParamInitStrategy.FILE and module_dtype is not None:
+                module_or_module_class.to(dtype=module_dtype)
+            parallel_module = parallel_module_class(init_module_params, build_module_buckets, **init_kwargs)
             parallel_module.train(module_or_module_class.training)  # set training state to the same as original module
             return parallel_module
 
@@ -3133,6 +3204,7 @@ def load_deduped_state_dict(
     Returns:
         None
     """
+    module_state_dict = align_state_dict_names(module, module_state_dict)
     device = device or torch.cuda.current_device()
     cur_rank = torch.distributed.get_rank()
 
@@ -3170,13 +3242,15 @@ def load_deduped_state_dict(
                     local_name2ranks[key].append(rank)
 
         # create process groups for broadcasting
+        broadcast_groups = []
         for key, ranks in local_name2ranks.items():
             if len(ranks) <= 1:
                 continue
             # should have sorted.
             ranks.sort()
             logger.debug(f'At rank {cur_rank}, create groups for ranks: {ranks}.')
-            DeviceGroup().get_group(ranks)
+            broadcast_groups.append(ranks)
+        DeviceGroup().get_groups(broadcast_groups)
 
         torch.distributed.barrier()
 
@@ -3405,6 +3479,116 @@ def _broadcast_weights(module: torch.nn.Module, stride_size: int):
 
 
 @torch.no_grad()
+def align_state_dict_names(
+    module: torch.nn.Module,
+    module_state_dict: Dict[str, Any],
+) -> Dict[str, Any]:
+    """
+    Align generated ParallelModule parameter/buffer names in a per-rank checkpoint.
+
+    Match by original name and shard metadata, ignoring generated names and tensor
+    IDs. Return a shallow copy without copying tensors or modifying the input.
+    Module prefixes, original names, partitioning and optimizer parameter order
+    must be unchanged. Missing metadata or ambiguous/incompatible matches raise
+    ValueError. This adapter is for sharded/deduped, not merged, state dicts.
+    """
+    def attr_meta_identity(meta: AttrMeta) -> tuple:
+        key = asdict(meta)
+        # Remove tensor ID from the key as it is not used for identity
+        key.pop('tid', None)
+        # slice is not hashable in old versions of Python
+        key['slicers'] = tuple((s.start, s.stop, s.step) for s in meta.slicers)
+        return tuple(key.values())
+
+    def zero3_attr_meta_identity(meta: Zero3AttrMeta) -> tuple:
+        key = asdict(meta)
+        key.pop('attr_name', None)
+        return tuple(key.values())
+
+    key_map: Dict[str, str] = {}
+    extra_states: Dict[str, Any] = {}
+    for prefix, pm in module.named_modules():
+        if not isinstance(pm, ParallelModule):
+            continue
+        prefix = f'{prefix}.' if prefix else ''
+        extra_key = f'{prefix}{ParallelModule.EXTRA_STATE_KEY}'
+        if extra_key not in module_state_dict:
+            raise ValueError(f"Cannot align checkpoint names: missing {extra_key}")
+        old = ExtraState(**module_state_dict[extra_key])
+        current_state: Dict[str, Any] = {}
+        pm._add_extra_state(current_state, prefix)
+        current = ExtraState(**current_state[extra_key])
+
+        if old.rank != current.rank:
+            raise ValueError(f"Cannot align {extra_key}: checkpoint rank changed")
+
+        for field_name in ('plan_ngpus', 'runtime_ngpus', 'use_zero', 'zero_ngroups'):
+            if getattr(old.compute_config, field_name) != getattr(current.compute_config, field_name):
+                raise ValueError(f"Cannot align {extra_key}: {field_name} changed; load a merged checkpoint instead")
+
+        for field_name in ('origin_param_names', 'origin_state_dict_names', 'origin_shared_param_names'):
+            if getattr(old, field_name) != getattr(current, field_name):
+                raise ValueError(f"Cannot align {extra_key}: original model metadata {field_name} changed; load a merged checkpoint instead")
+
+        candidates: Dict[tuple, str] = {
+            attr_meta_identity(meta): name
+            for name, meta in current.param_area_map.items()
+        }
+        if len(candidates) != len(current.param_area_map):
+            raise ValueError(f"Cannot align {extra_key}: ambiguous shard metadata in module param_area_map")
+
+        # Map old parameter names to new parameter names
+        name_map: Dict[str, str] = {}
+
+        for old_name, meta in old.param_area_map.items():
+            # Consume each match once to keep the old and new shard names in one-to-one correspondence.
+            match = candidates.pop(attr_meta_identity(meta), None)
+            if match is None:
+                raise ValueError(
+                    f"Cannot align {prefix}{old_name}: expected one match for "
+                    f"{meta.orig_name} with the same shard metadata, found {match}"
+                )
+            name_map[old_name] = match
+
+        if candidates:
+            raise ValueError(f"Cannot align {extra_key}: parameter names are missing from shard metadata")
+
+        # Optimizer state uses positional IDs (or bucket offsets), not model keys.
+        if [name_map[name] for name in old.cube_param_names] != current.cube_param_names:
+            raise ValueError(f"Cannot align {extra_key}: optimizer parameter order changed")
+        for field_name in ('zero', 'model_idx2opt_idx', 'opt_idx2ranks'):
+            if getattr(old, field_name) != getattr(current, field_name):
+                raise ValueError(f"Cannot align {extra_key}: optimizer layout {field_name} changed")
+
+        # zero3 config
+        old_zero3 = {
+            name_map[name]: zero3_attr_meta_identity(meta)
+            for name, meta in old.zero3_param_metadata.items()
+        } if old.zero3_param_metadata else {}
+        new_zero3 = {
+            name: zero3_attr_meta_identity(meta)
+            for name, meta in current.zero3_param_metadata.items()
+        } if current.zero3_param_metadata else {}
+        if old_zero3 != new_zero3:
+            raise ValueError(f"Cannot align {extra_key}: ZeRO-3 parameter layout changed")
+
+        key_map.update({f'{prefix}{old_name}': f'{prefix}{new_name}' for old_name, new_name in name_map.items()})
+        extra_states[extra_key] = current_state[extra_key]
+
+    # create a new adapted state dict with the same type of original state dict
+    # And this can also keep the `_metadata` attached to the dict if it exists
+    adapted = copy.copy(module_state_dict)
+    adapted.clear()
+    for key, value in module_state_dict.items():
+        new_key = key_map.get(key, key)
+        if new_key in adapted:
+            raise ValueError(f"Cannot align checkpoint names: key collision at {new_key}")
+        adapted[new_key] = extra_states.get(key, value)
+    logger.info("Aligned %s checkpoint parameter/buffer names", sum(k != v for k, v in key_map.items()))
+    return adapted
+
+
+@torch.no_grad()
 def load_sharded_state_dict(
     module: torch.nn.Module,
     module_state_dict: Dict[str, Any],
@@ -3428,6 +3612,7 @@ def load_sharded_state_dict(
         None
     """
 
+    module_state_dict = align_state_dict_names(module, module_state_dict)
     device = device or torch.cuda.current_device()
     module.to(device)
 

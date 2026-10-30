@@ -673,6 +673,37 @@ An end2end module is a module which satisfies:
   `module.forward` function.
 - the first return value of `module.forward` is the loss (scalar tensor)
 
+#### Weight initialization
+
+To avoid saving and loading `fullmodel.pt.*`, set `param_init_strategy`:
+
+| Value | Runtime initialization |
+| --- | --- |
+| `file` (default) | Load saved parameters and buffers. |
+| `full` | Construct the original model on each rank; resume reads non-persistent buffers from `npbuffer.pt` without reconstructing it. |
+| `shard` | Use the model's `__shard__init__` hook, or automatically capture and replay the required tensors. |
+
+For example:
+
+```yaml
+compute_config:
+  use_end2end: true
+  param_init_strategy: shard
+  param_init_seed: 1234
+debug:
+  param_init_check: true
+```
+
+`param_init_seed` defaults to `1234` and is separate from the training `seed`.
+Set `debug.param_init_check: false` to skip replica checking; see
+[Debug Config](#debug-config) for what the check covers.
+For `full`, first initialization always checks that local non-persistent buffers
+match `npbuffer.pt` bitwise, even when replica checking is disabled.
+
+All strategies still construct a full model during compilation. For memory
+limits, hook signatures, checkpoint resume and cache reuse, see
+[Weight initialization](./parallel_module.md#weight-initialization).
+
 ### Checkpoint Config
 
  ``` python
@@ -779,7 +810,12 @@ Where `ResumeOptions` and `SerializerOptions` are:
 
 Please note
 
-1.  When the parallel plan is changed (i.e you re-trace the model with
+1.  If only generated parameter/buffer names change after re-tracing, sharded
+    and deduped loading automatically aligns names using checkpoint metadata.
+    Original model names, module prefixes, shard layouts and optimizer
+    parameter order/layout must remain unchanged. Incompatible or ambiguous
+    mappings raise an error. Merged checkpoints are unaffected.
+    When the parallel plan is changed (i.e you re-trace the model with
     different configurations), the checkpoints become incompatible, and
     can't be loaded any more. You must firstly merge the checkpoints to
     a merged checkpoint with `Trainer.merge_checkpoint` and then load
@@ -904,6 +940,7 @@ Please note
 @dataclass
 class DebugConfig:
     check_gradient_sync_cross_devices: bool = True
+    param_init_check: bool = True
     profile: Optional[ProfileConfig] = None
 ```
 
@@ -913,6 +950,29 @@ class DebugConfig:
   each ZeRO group; if ZeRO is not enabled, will check the gradient
   across each nnscaler scale unit. This helps to find bugs related to
   gradient updates during training. Default is `True`.
+- `param_init_check` (`bool`, default `True`): Compare hashes of initialized
+  parameters and buffers across ranks, requiring bitwise equality. Runs after
+  optimizer/reducer construction, including ZeRO-3 sharding.
+  Uses XXH3-128 over dtype, shape, and raw tensor bytes on CPU. Contiguous CUDA
+  tensors are copied in chunks using two reusable 8 MiB pinned CPU buffers,
+  overlapping the next copy on the current CUDA stream with CPU hashing of the
+  previous chunk. These buffers are allocated lazily once per check.
+  CPU and non-contiguous tensors retain the synchronous path. Only digests and
+  metadata are exchanged.
+  - **Compared:** identical logical shard replicas in non-file `ParallelModule`
+    instances, plus ordinary module parameters and buffers across ranks.
+    Different submodules are checked separately.
+  - **Not compared:** different or merely overlapping shards, shards without
+    replicas, and file-backed `ParallelModule` instances. With ZeRO-3, only
+    identical retained intervals are compared, excluding padding; discarded
+    values cannot be checked and full parameters are not reconstructed.
+  - **Resume:** compare only non-persistent buffers in `shard` parallel modules
+    and ordinary modules. Skip `file`/`full` parallel modules, parameters, and
+    persistent buffers. Ranks with no eligible tensors still participate in
+    the collective with empty hashes.
+  - **Skipped:** compile-only runs and non-distributed or
+    single-rank runs (without computing tensor hashes). This is a CLI trainer
+    check, not part of direct `parallelize` or generated-module construction.
 - `profile` (`Optional[ProfileConfig]`): Profiling configuration using
   `torch.profiler.profile`. Set to `None` (default) to disable profiling.
   When set, the profiler will wrap the training loop and call `profiler.step()`
@@ -1439,9 +1499,11 @@ of `ComputeConfig` as a dictionary.
       is `1`
 3.  `pp`: pipeline parallelism + data parallelism. It will do model
     parallelism inside a scale unit, and run data parallelism across
-    scale units. It requires the `use_end2end` be true. It has two
-    configurations `pipeline_nmicros` and `pipeline_scheduler`. See
-    `hybrid` policy for more details.
+    scale units. It requires `use_end2end=True` and delegates to `hybrid`.
+    `pipeline_nstages` must be `plan_ngpus` or `"auto"` (which resolves to
+    `plan_ngpus`); this restriction applies only to the built-in `pp` policy.
+    With the default `pipeline_size`, each stage uses one GPU.
+    See `hybrid` below for the shared configurations.
 4.  `data`: tensor parallelism on batch dimension. It has no
     configurations.
 5.  `hybrid`: pipeline parallelism + tensor parallelism + data
@@ -1449,26 +1511,30 @@ of `ComputeConfig` as a dictionary.
     0 dimension) inside a scale unit, and run data parallelism across
     scale units. It requires the `use_end2end` to be true. It has the
     following configurations.
-    - `pipeline_nstages`: the number of stages in the pipeline, or
-      `"auto"` (let autodist to decide). Default is `"auto"`. Optional.
-      - If `pipeline_nstages` is `"auto"` and `pipeline_pivots` is
-        specified, it will use pipeline. (The number of stages will be
-        determined automatically by autodist)
-      - If `pipeline_nstages` is `"auto"` and `pipeline_pivots` is not
-        specified, it will not use pipeline.
-      - If `pipeline_nstages` is a 1, pipeline will not be used.
-        (`pipeline_pivots` must not be set)
-      - If `pipeline_nstages` is a number > 1, pipeline will be used.
-        (`pipeline_pivots` must be set)
+    - `pipeline_nstages`: the number of logical stages. Default is
+      `"auto"`, which resolves to `plan_ngpus`. The policy divides forward
+      operators into this many stages; it does not run AutoDist or read
+      `pipeline_pivots`.
+    - `pipeline_size`: the number of physical pipeline device groups.
+      Defaults to the resolved `pipeline_nstages`. It must be positive and
+      divide both `pipeline_nstages` and `plan_ngpus`. Each group contains
+      `plan_ngpus // pipeline_size` GPUs, and logical stage `i` is assigned
+      to group `i % pipeline_size`. More logical stages than physical groups
+      require a compatible scheduler, such as `1f1b_interleaved`.
+      Use this key in `pas_config`; the former `pp_size` key is no longer read.
     - `pipeline_nmicros`: the number of microbatches in the pipeline.
       Required.
-    - `pipeline_scheduler`: the scheduler name for the pipeline. Current
-      we support four schedulers in training
-      `1f1b`/`1f1b_plus`/`1f1b_interleaved`/`gpipe`/`chimera_direct` (4
-      stages pipeline only), and one scheduler in inference
-      `infer_pipe`. Default is `1f1b`. Optional.
-    - `pp_size`: the pipeline parallelism size. Default is
-      `pipeline_nstages`. Optional.
+    - `pipeline_scheduler`: the scheduler name. Training schedulers are
+      `1f1b`, `1f1b_plus`, `1f1b_interleaved`, `gpipe`, and `chimera_direct`
+      (four logical stages only); inference uses `infer_pipe`. Default is
+      `1f1b`. `1f1b_interleaved` requires the microbatch count to be a
+      multiple of `pipeline_size`.
+
+    For example, `plan_ngpus=8`, `pipeline_nstages=4`, and `pipeline_size=2`
+    create two groups of four GPUs. Stages 0 and 2 use GPUs `[0, 1, 2, 3]`,
+    and stages 1 and 3 use `[4, 5, 6, 7]`. Use `1f1b_interleaved` with, for
+    example, `pipeline_nmicros=4` for this layout.
+
 6.  `autodist`: the recommended policy for most cases. Currently it only
     support Adam-like optimizers. It will automatically choose the best
     partition for you by balancing the memory usage and speed. It has

@@ -166,12 +166,22 @@ class _DeepSeekLinear(torch.nn.Module):
         return _DeepSeekLinearFunction.apply(input_tensor, self.weight)
 
 
+class _UpdatedDeepSeekLinear(_DeepSeekLinear):
+    def forward(self, input_tensor: torch.Tensor) -> torch.Tensor:
+        return torch.nn.functional.linear(input_tensor, self.weight)
+
+
 class _DeepSeekModel(torch.nn.Module):
-    def __init__(self, dim: int = 8, nlayers: int = 4):
+    def __init__(
+        self,
+        dim: int = 8,
+        nlayers: int = 4,
+        linear_type: type[torch.nn.Module] = _DeepSeekLinear,
+    ):
         super().__init__()
         torch.manual_seed(0)
         self.layers = torch.nn.ModuleList(
-            [_DeepSeekLinear(dim) for _ in range(nlayers)]
+            [linear_type(dim) for _ in range(nlayers)]
         )
 
     def forward(self, sample: dict[str, torch.Tensor]) -> torch.Tensor:
@@ -179,6 +189,11 @@ class _DeepSeekModel(torch.nn.Module):
         for layer in self.layers:
             output = torch.tanh(layer(output))
         return torch.nn.functional.mse_loss(output, sample['target'])
+
+
+class _UpdatedDeepSeekModel(_DeepSeekModel):
+    def __init__(self, dim: int = 8, nlayers: int = 4):
+        super().__init__(dim, nlayers, _UpdatedDeepSeekLinear)
 
 
 class _DeepSeekDataset:
@@ -231,10 +246,22 @@ def _deepseek_backward_weight(
     _WeightGradStore.pop(name)
 
 
+def _emit_deepseek_linear(
+    node, args, kwargs, runtime_devid, plan_ndevs, runtime_ndevs,
+) -> str:
+    bias = args[2] if len(args) > 2 else kwargs.get('bias', 'None')
+    if bias != 'None':
+        raise ValueError('_DeepSeekLinearFunction does not support bias')
+    return (
+        'tests.cli.test_customized_fbw_deekseek.'
+        f'_DeepSeekLinearFunction.apply({args[0]}, {args[1]}.T)'
+    )
+
+
 def _trainer_args(work_dir: Path, mode: str) -> TrainerArgs:
     # baseline uses the same opaque model with ordinary FB scheduling;
     # deepseek_async additionally proves the B-entry sync is sufficient.
-    use_fbw = mode != 'baseline'
+    use_fbw = mode not in ('baseline', 'updated_baseline')
     return TrainerArgs(
         instance_name=f'customized_fbw_{mode}',
         compute_config=ComputeConfig(
@@ -252,7 +279,13 @@ def _trainer_args(work_dir: Path, mode: str) -> TrainerArgs:
         gen_reuse='override',
         gen_savedir=work_dir / 'gen',
         pas_policy='hybrid',
-        model=ModelConfig(type=_DeepSeekModel),
+        model=ModelConfig(
+            type=(
+                _UpdatedDeepSeekModel
+                if mode in ('updated_baseline', 'deepseek_updated')
+                else _DeepSeekModel
+            ),
+        ),
         optimizer=OptimizerConfig(type=torch.optim.Adam, args={'lr': 0.01}),
         dataset=DatasetConfig(
             type=_DeepSeekDataset,
@@ -274,13 +307,19 @@ def _trainer_args(work_dir: Path, mode: str) -> TrainerArgs:
     )
 
 
-def _deepseek_worker(root_dir: str, mode: str) -> None:
+def _run_deepseek_mode(root_dir: str, mode: str) -> None:
     work_dir = Path(root_dir) / mode
     _WeightGradStore.clear()
+    use_custom_fbw = mode not in ('baseline', 'updated_baseline')
+    if mode == 'deepseek_updated':
+        nnscaler.update_op(
+            torch.nn.functional.linear,
+            emit_fn=_emit_deepseek_linear,
+        )
     patch = executor.custom_fbw(
         _deepseek_backward_input,
         _deepseek_backward_weight,
-    ) if mode != 'baseline' else nullcontext()
+    ) if use_custom_fbw else nullcontext()
 
     with patch:
         trainer = Trainer(train_args=_trainer_args(work_dir, mode))
@@ -289,7 +328,7 @@ def _deepseek_worker(root_dir: str, mode: str) -> None:
     assert trainer.model.use_scheduler
     assert trainer.model.nmicros_per_scheduler_step == 2
 
-    if mode != 'baseline':
+    if use_custom_fbw:
         # Summing over ranks also proves that deferred work was exercised on
         # every stage collectively, not merely that checkpoints happened to load.
         _WeightGradStore.check_clear()
@@ -310,6 +349,15 @@ def _deepseek_worker(root_dir: str, mode: str) -> None:
     torch.distributed.barrier()
 
 
+def _deepseek_worker(root_dir: str, mode: str) -> None:
+    modes = {
+        'baseline': ('baseline', 'updated_baseline'),
+        'deepseek': ('deepseek', 'deepseek_updated'),
+    }.get(mode, (mode,))
+    for current_mode in modes:
+        _run_deepseek_mode(root_dir, current_mode)
+
+
 @pytest.mark.skipif(
     not torch.cuda.is_available() or torch.cuda.device_count() < 2,
     reason='lack of gpu devices',
@@ -322,9 +370,15 @@ def test_deepseek_customized_fbw(tmp_path):
     baseline = torch.load(tmp_path / 'baseline.pt', weights_only=False)
     deepseek = torch.load(tmp_path / 'deepseek.pt', weights_only=False)
     deepseek_async = torch.load(tmp_path / 'deepseek_async.pt', weights_only=False)
+    updated_baseline = torch.load(
+        tmp_path / 'updated_baseline.pt', weights_only=False)
+    deepseek_updated = torch.load(
+        tmp_path / 'deepseek_updated.pt', weights_only=False)
     # Compare optimizer state as well as parameters: matching final weights alone
     # can hide missing/duplicated gradients over a very short run.
     assert_equal(baseline['model'], deepseek['model'])
     assert_equal(baseline['optimizer'], deepseek['optimizer'])
     assert_equal(baseline['model'], deepseek_async['model'])
     assert_equal(baseline['optimizer'], deepseek_async['optimizer'])
+    assert_equal(updated_baseline['model'], deepseek_updated['model'])
+    assert_equal(updated_baseline['optimizer'], deepseek_updated['optimizer'])

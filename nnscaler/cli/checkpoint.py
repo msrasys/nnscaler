@@ -52,6 +52,12 @@ def _patch_distributed():
             raise ValueError(f"Unknown group: {group}")
         return len(groups[group])
 
+    def get_backend(group=None):
+        if group not in groups:
+            raise ValueError(f"Unknown group: {group}")
+        # Offline groups use the simulated new_group path, not NCCL split.
+        return 'mock'
+
     def new_group(ranks=None, *args, **kwargs):
         world_size = int(os.environ['WORLD_SIZE'])
         if ranks is None or len(ranks) == world_size:
@@ -64,6 +70,7 @@ def _patch_distributed():
 
     torch.distributed.get_rank = get_rank
     torch.distributed.get_world_size = get_world_size
+    torch.distributed.get_backend = get_backend
     torch.distributed.init_process_group = init_process_group
     torch.distributed.destroy_process_group = lambda: None
     torch.distributed.new_group = new_group
@@ -154,6 +161,8 @@ if __name__ == '__main__':
         # never broadcast generated files.
         train_args.broadcast_strategy = 'none'
         train_args.checkpoint.resume_from = None
+        # Offline rank simulation cannot run cross-rank initialization checks.
+        train_args.debug.param_init_check = False
         _distribute_checkpoint(train_args, from_, to_)
     else:
         raise ValueError(f"Unknown command: {argv[0]}")
