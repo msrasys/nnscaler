@@ -1,0 +1,921 @@
+{
+  "v4": {
+    "grouped": {
+      "configuration": {
+        "output": "/tmp/activation-store-20261030/probe-v4-grouped.json",
+        "tensors": 16,
+        "tensor_mib": 16,
+        "batch_tensors": 4,
+        "iterations": 8,
+        "warmup": 3,
+        "inflight_mib": 512,
+        "prefetch_mib": 512,
+        "cpu_budget_mib": 1024,
+        "compute_repeats": 50,
+        "compute_dim": 2048,
+        "allocate_on_compute_stream": false
+      },
+      "bytes_per_direction": 268435456,
+      "results": {
+        "direct_copy": {
+          "median_ms": 9.703489000000001,
+          "mean_ms": 9.70305475,
+          "min_ms": 9.69766,
+          "max_ms": 9.709414,
+          "submit_ms": 0.3252565,
+          "gpu_allocated_MiB": 288.125,
+          "gpu_reserved_MiB": 560.0,
+          "pinned_pool_MiB": 0.0,
+          "counters": {
+            "d2h_bytes": 0,
+            "h2d_bytes": 0,
+            "demand_loads": 0,
+            "d2h_throttles": 0,
+            "budget_fallback_bytes": 0,
+            "prefetch_budget_skips": 0
+          }
+        },
+        "store_roundtrip": {
+          "median_ms": 7.702497,
+          "mean_ms": 7.71591475,
+          "min_ms": 7.697276,
+          "max_ms": 7.795561,
+          "submit_ms": 2.129794,
+          "gpu_allocated_MiB": 288.125,
+          "gpu_reserved_MiB": 822.0,
+          "pinned_pool_MiB": 256.0,
+          "counters": {
+            "d2h_bytes": 2147483648,
+            "h2d_bytes": 2147483648,
+            "demand_loads": 0,
+            "d2h_throttles": 0,
+            "budget_fallback_bytes": 0,
+            "prefetch_budget_skips": 0
+          }
+        },
+        "serial_compute": {
+          "median_ms": 9.102805,
+          "mean_ms": 9.096915125,
+          "min_ms": 9.047905,
+          "max_ms": 9.128522,
+          "submit_ms": 3.19476,
+          "gpu_allocated_MiB": 288.125,
+          "gpu_reserved_MiB": 822.0,
+          "pinned_pool_MiB": 256.0,
+          "counters": {
+            "d2h_bytes": 2147483648,
+            "h2d_bytes": 2147483648,
+            "demand_loads": 0,
+            "d2h_throttles": 0,
+            "budget_fallback_bytes": 0,
+            "prefetch_budget_skips": 0
+          }
+        },
+        "overlap_compute": {
+          "median_ms": 8.026529,
+          "mean_ms": 8.022163375,
+          "min_ms": 7.967704,
+          "max_ms": 8.0525,
+          "submit_ms": 3.197466,
+          "gpu_allocated_MiB": 288.125,
+          "gpu_reserved_MiB": 822.0,
+          "pinned_pool_MiB": 256.0,
+          "counters": {
+            "d2h_bytes": 2147483648,
+            "h2d_bytes": 2147483648,
+            "demand_loads": 0,
+            "d2h_throttles": 0,
+            "budget_fallback_bytes": 0,
+            "prefetch_budget_skips": 0
+          }
+        }
+      }
+    },
+    "limited-d2h": {
+      "configuration": {
+        "output": "/tmp/activation-store-20261030/probe-v4-limited-d2h.json",
+        "tensors": 16,
+        "tensor_mib": 16,
+        "batch_tensors": 4,
+        "iterations": 8,
+        "warmup": 3,
+        "inflight_mib": 32,
+        "prefetch_mib": 512,
+        "cpu_budget_mib": 1024,
+        "compute_repeats": 50,
+        "compute_dim": 2048,
+        "allocate_on_compute_stream": false
+      },
+      "bytes_per_direction": 268435456,
+      "results": {
+        "direct_copy": {
+          "median_ms": 9.705078499999999,
+          "mean_ms": 9.704539875,
+          "min_ms": 9.697377,
+          "max_ms": 9.711458,
+          "submit_ms": 0.32476,
+          "gpu_allocated_MiB": 288.125,
+          "gpu_reserved_MiB": 560.0,
+          "pinned_pool_MiB": 0.0,
+          "counters": {
+            "d2h_bytes": 0,
+            "h2d_bytes": 0,
+            "demand_loads": 0,
+            "d2h_throttles": 0,
+            "budget_fallback_bytes": 0,
+            "prefetch_budget_skips": 0
+          }
+        },
+        "store_roundtrip": {
+          "median_ms": 8.967207,
+          "mean_ms": 8.961191125,
+          "min_ms": 8.923665,
+          "max_ms": 8.975261,
+          "submit_ms": 4.1925539999999994,
+          "gpu_allocated_MiB": 288.125,
+          "gpu_reserved_MiB": 822.0,
+          "pinned_pool_MiB": 256.0,
+          "counters": {
+            "d2h_bytes": 2147483648,
+            "h2d_bytes": 2147483648,
+            "demand_loads": 0,
+            "d2h_throttles": 74,
+            "budget_fallback_bytes": 0,
+            "prefetch_budget_skips": 0
+          }
+        },
+        "serial_compute": {
+          "median_ms": 10.344939499999999,
+          "mean_ms": 10.339981250000001,
+          "min_ms": 10.294803,
+          "max_ms": 10.354302,
+          "submit_ms": 5.260006000000001,
+          "gpu_allocated_MiB": 288.125,
+          "gpu_reserved_MiB": 822.0,
+          "pinned_pool_MiB": 256.0,
+          "counters": {
+            "d2h_bytes": 2147483648,
+            "h2d_bytes": 2147483648,
+            "demand_loads": 0,
+            "d2h_throttles": 76,
+            "budget_fallback_bytes": 0,
+            "prefetch_budget_skips": 0
+          }
+        },
+        "overlap_compute": {
+          "median_ms": 9.300854,
+          "mean_ms": 9.299451125,
+          "min_ms": 9.22681,
+          "max_ms": 9.330247,
+          "submit_ms": 5.253791,
+          "gpu_allocated_MiB": 288.125,
+          "gpu_reserved_MiB": 822.0,
+          "pinned_pool_MiB": 256.0,
+          "counters": {
+            "d2h_bytes": 2147483648,
+            "h2d_bytes": 2147483648,
+            "demand_loads": 0,
+            "d2h_throttles": 73,
+            "budget_fallback_bytes": 0,
+            "prefetch_budget_skips": 0
+          }
+        }
+      }
+    },
+    "limited-prefetch": {
+      "configuration": {
+        "output": "/tmp/activation-store-20261030/probe-v4-limited-prefetch.json",
+        "tensors": 16,
+        "tensor_mib": 16,
+        "batch_tensors": 4,
+        "iterations": 8,
+        "warmup": 3,
+        "inflight_mib": 512,
+        "prefetch_mib": 32,
+        "cpu_budget_mib": 1024,
+        "compute_repeats": 50,
+        "compute_dim": 2048,
+        "allocate_on_compute_stream": false
+      },
+      "bytes_per_direction": 268435456,
+      "results": {
+        "direct_copy": {
+          "median_ms": 9.7018645,
+          "mean_ms": 9.70131775,
+          "min_ms": 9.696116,
+          "max_ms": 9.70595,
+          "submit_ms": 0.3202315,
+          "gpu_allocated_MiB": 288.125,
+          "gpu_reserved_MiB": 560.0,
+          "pinned_pool_MiB": 0.0,
+          "counters": {
+            "d2h_bytes": 0,
+            "h2d_bytes": 0,
+            "demand_loads": 0,
+            "d2h_throttles": 0,
+            "budget_fallback_bytes": 0,
+            "prefetch_budget_skips": 0
+          }
+        },
+        "store_roundtrip": {
+          "median_ms": 7.712186,
+          "mean_ms": 7.70330725,
+          "min_ms": 7.630848,
+          "max_ms": 7.734977,
+          "submit_ms": 2.1038885,
+          "gpu_allocated_MiB": 288.125,
+          "gpu_reserved_MiB": 822.0,
+          "pinned_pool_MiB": 256.0,
+          "counters": {
+            "d2h_bytes": 2147483648,
+            "h2d_bytes": 2147483648,
+            "demand_loads": 112,
+            "d2h_throttles": 0,
+            "budget_fallback_bytes": 0,
+            "prefetch_budget_skips": 112
+          }
+        },
+        "serial_compute": {
+          "median_ms": 9.084268,
+          "mean_ms": 9.090447375,
+          "min_ms": 9.011974,
+          "max_ms": 9.20506,
+          "submit_ms": 3.2076320000000003,
+          "gpu_allocated_MiB": 288.125,
+          "gpu_reserved_MiB": 822.0,
+          "pinned_pool_MiB": 256.0,
+          "counters": {
+            "d2h_bytes": 2147483648,
+            "h2d_bytes": 2147483648,
+            "demand_loads": 112,
+            "d2h_throttles": 0,
+            "budget_fallback_bytes": 0,
+            "prefetch_budget_skips": 112
+          }
+        },
+        "overlap_compute": {
+          "median_ms": 7.9907535,
+          "mean_ms": 7.9884095,
+          "min_ms": 7.933224,
+          "max_ms": 8.014484,
+          "submit_ms": 3.2115505,
+          "gpu_allocated_MiB": 288.125,
+          "gpu_reserved_MiB": 822.0,
+          "pinned_pool_MiB": 256.0,
+          "counters": {
+            "d2h_bytes": 2147483648,
+            "h2d_bytes": 2147483648,
+            "demand_loads": 112,
+            "d2h_throttles": 0,
+            "budget_fallback_bytes": 0,
+            "prefetch_budget_skips": 112
+          }
+        }
+      }
+    },
+    "many": {
+      "configuration": {
+        "output": "/tmp/activation-store-20261030/probe-v4-many.json",
+        "tensors": 128,
+        "tensor_mib": 2,
+        "batch_tensors": 128,
+        "iterations": 8,
+        "warmup": 3,
+        "inflight_mib": 512,
+        "prefetch_mib": 512,
+        "cpu_budget_mib": 1024,
+        "compute_repeats": 50,
+        "compute_dim": 2048,
+        "allocate_on_compute_stream": false
+      },
+      "bytes_per_direction": 268435456,
+      "results": {
+        "direct_copy": {
+          "median_ms": 10.575757,
+          "mean_ms": 10.57758675,
+          "min_ms": 10.572005,
+          "max_ms": 10.588408,
+          "submit_ms": 2.11695,
+          "gpu_allocated_MiB": 288.125,
+          "gpu_reserved_MiB": 560.0,
+          "pinned_pool_MiB": 0.0,
+          "counters": {
+            "d2h_bytes": 0,
+            "h2d_bytes": 0,
+            "demand_loads": 0,
+            "d2h_throttles": 0,
+            "budget_fallback_bytes": 0,
+            "prefetch_budget_skips": 0
+          }
+        },
+        "store_roundtrip": {
+          "median_ms": 15.810121,
+          "mean_ms": 15.744378000000001,
+          "min_ms": 15.262136,
+          "max_ms": 15.872782,
+          "submit_ms": 15.534156,
+          "gpu_allocated_MiB": 288.125,
+          "gpu_reserved_MiB": 822.0,
+          "pinned_pool_MiB": 256.0,
+          "counters": {
+            "d2h_bytes": 2147483648,
+            "h2d_bytes": 2147483648,
+            "demand_loads": 0,
+            "d2h_throttles": 0,
+            "budget_fallback_bytes": 0,
+            "prefetch_budget_skips": 0
+          }
+        },
+        "serial_compute": {
+          "median_ms": 17.190856500000002,
+          "mean_ms": 17.156716,
+          "min_ms": 16.747649,
+          "max_ms": 17.281352,
+          "submit_ms": 16.5934505,
+          "gpu_allocated_MiB": 288.125,
+          "gpu_reserved_MiB": 822.0,
+          "pinned_pool_MiB": 256.0,
+          "counters": {
+            "d2h_bytes": 2147483648,
+            "h2d_bytes": 2147483648,
+            "demand_loads": 0,
+            "d2h_throttles": 0,
+            "budget_fallback_bytes": 0,
+            "prefetch_budget_skips": 0
+          }
+        },
+        "overlap_compute": {
+          "median_ms": 16.852022499999997,
+          "mean_ms": 26.429438125,
+          "min_ms": 16.696218,
+          "max_ms": 93.678236,
+          "submit_ms": 16.831115,
+          "gpu_allocated_MiB": 288.125,
+          "gpu_reserved_MiB": 822.0,
+          "pinned_pool_MiB": 256.0,
+          "counters": {
+            "d2h_bytes": 2147483648,
+            "h2d_bytes": 2147483648,
+            "demand_loads": 0,
+            "d2h_throttles": 0,
+            "budget_fallback_bytes": 0,
+            "prefetch_budget_skips": 0
+          }
+        }
+      }
+    },
+    "medium": {
+      "configuration": {
+        "output": "/tmp/activation-store-20261030/probe-v4-medium.json",
+        "tensors": 16,
+        "tensor_mib": 16,
+        "batch_tensors": 16,
+        "iterations": 8,
+        "warmup": 3,
+        "inflight_mib": 512,
+        "prefetch_mib": 512,
+        "cpu_budget_mib": 1024,
+        "compute_repeats": 50,
+        "compute_dim": 2048,
+        "allocate_on_compute_stream": false
+      },
+      "bytes_per_direction": 268435456,
+      "results": {
+        "direct_copy": {
+          "median_ms": 9.700872,
+          "mean_ms": 9.701464,
+          "min_ms": 9.695863,
+          "max_ms": 9.709821,
+          "submit_ms": 0.3237995,
+          "gpu_allocated_MiB": 288.125,
+          "gpu_reserved_MiB": 560.0,
+          "pinned_pool_MiB": 0.0,
+          "counters": {
+            "d2h_bytes": 0,
+            "h2d_bytes": 0,
+            "demand_loads": 0,
+            "d2h_throttles": 0,
+            "budget_fallback_bytes": 0,
+            "prefetch_budget_skips": 0
+          }
+        },
+        "store_roundtrip": {
+          "median_ms": 7.7451245,
+          "mean_ms": 7.731596125,
+          "min_ms": 7.651336,
+          "max_ms": 7.778251,
+          "submit_ms": 1.9065185,
+          "gpu_allocated_MiB": 288.125,
+          "gpu_reserved_MiB": 822.0,
+          "pinned_pool_MiB": 256.0,
+          "counters": {
+            "d2h_bytes": 2147483648,
+            "h2d_bytes": 2147483648,
+            "demand_loads": 0,
+            "d2h_throttles": 0,
+            "budget_fallback_bytes": 0,
+            "prefetch_budget_skips": 0
+          }
+        },
+        "serial_compute": {
+          "median_ms": 9.1237375,
+          "mean_ms": 9.114774,
+          "min_ms": 9.075507,
+          "max_ms": 9.143357,
+          "submit_ms": 2.936655,
+          "gpu_allocated_MiB": 288.125,
+          "gpu_reserved_MiB": 822.0,
+          "pinned_pool_MiB": 256.0,
+          "counters": {
+            "d2h_bytes": 2147483648,
+            "h2d_bytes": 2147483648,
+            "demand_loads": 0,
+            "d2h_throttles": 0,
+            "budget_fallback_bytes": 0,
+            "prefetch_budget_skips": 0
+          }
+        },
+        "overlap_compute": {
+          "median_ms": 8.1025,
+          "mean_ms": 8.09655425,
+          "min_ms": 8.025081,
+          "max_ms": 8.131749,
+          "submit_ms": 2.938141,
+          "gpu_allocated_MiB": 288.125,
+          "gpu_reserved_MiB": 822.0,
+          "pinned_pool_MiB": 256.0,
+          "counters": {
+            "d2h_bytes": 2147483648,
+            "h2d_bytes": 2147483648,
+            "demand_loads": 0,
+            "d2h_throttles": 0,
+            "budget_fallback_bytes": 0,
+            "prefetch_budget_skips": 0
+          }
+        }
+      }
+    }
+  },
+  "v5": {
+    "grouped": {
+      "configuration": {
+        "output": "/tmp/activation-store-20261030/probe-v5-grouped.json",
+        "tensors": 16,
+        "tensor_mib": 16,
+        "batch_tensors": 4,
+        "iterations": 8,
+        "warmup": 3,
+        "inflight_mib": 512,
+        "prefetch_mib": 512,
+        "cpu_budget_mib": 1024,
+        "compute_repeats": 50,
+        "compute_dim": 2048,
+        "allocate_on_compute_stream": false,
+        "prefetch_mode": "batch"
+      },
+      "bytes_per_direction": 268435456,
+      "results": {
+        "direct_copy": {
+          "median_ms": 9.702926,
+          "mean_ms": 9.7032435,
+          "min_ms": 9.697069,
+          "max_ms": 9.70907,
+          "submit_ms": 0.32706,
+          "gpu_allocated_MiB": 288.125,
+          "gpu_reserved_MiB": 560.0,
+          "pinned_pool_MiB": 0.0,
+          "counters": {
+            "d2h_bytes": 0,
+            "h2d_bytes": 0,
+            "demand_loads": 0,
+            "d2h_throttles": 0,
+            "budget_fallback_bytes": 0,
+            "prefetch_budget_skips": 0
+          }
+        },
+        "store_roundtrip": {
+          "median_ms": 7.565856,
+          "mean_ms": 7.5676515,
+          "min_ms": 7.526739,
+          "max_ms": 7.606751,
+          "submit_ms": 1.784141,
+          "gpu_allocated_MiB": 288.125,
+          "gpu_reserved_MiB": 822.0,
+          "pinned_pool_MiB": 256.0,
+          "counters": {
+            "d2h_bytes": 2147483648,
+            "h2d_bytes": 2147483648,
+            "demand_loads": 0,
+            "d2h_throttles": 0,
+            "budget_fallback_bytes": 0,
+            "prefetch_budget_skips": 0
+          }
+        },
+        "serial_compute": {
+          "median_ms": 8.9598895,
+          "mean_ms": 8.95333825,
+          "min_ms": 8.895092,
+          "max_ms": 8.98772,
+          "submit_ms": 2.820773,
+          "gpu_allocated_MiB": 288.125,
+          "gpu_reserved_MiB": 822.0,
+          "pinned_pool_MiB": 256.0,
+          "counters": {
+            "d2h_bytes": 2147483648,
+            "h2d_bytes": 2147483648,
+            "demand_loads": 0,
+            "d2h_throttles": 0,
+            "budget_fallback_bytes": 0,
+            "prefetch_budget_skips": 0
+          }
+        },
+        "overlap_compute": {
+          "median_ms": 7.943003,
+          "mean_ms": 7.923363625,
+          "min_ms": 7.804807,
+          "max_ms": 7.971328,
+          "submit_ms": 2.83852,
+          "gpu_allocated_MiB": 288.125,
+          "gpu_reserved_MiB": 822.0,
+          "pinned_pool_MiB": 256.0,
+          "counters": {
+            "d2h_bytes": 2147483648,
+            "h2d_bytes": 2147483648,
+            "demand_loads": 0,
+            "d2h_throttles": 0,
+            "budget_fallback_bytes": 0,
+            "prefetch_budget_skips": 0
+          }
+        }
+      }
+    },
+    "limited-d2h": {
+      "configuration": {
+        "output": "/tmp/activation-store-20261030/probe-v5-limited-d2h.json",
+        "tensors": 16,
+        "tensor_mib": 16,
+        "batch_tensors": 4,
+        "iterations": 8,
+        "warmup": 3,
+        "inflight_mib": 32,
+        "prefetch_mib": 512,
+        "cpu_budget_mib": 1024,
+        "compute_repeats": 50,
+        "compute_dim": 2048,
+        "allocate_on_compute_stream": false,
+        "prefetch_mode": "batch"
+      },
+      "bytes_per_direction": 268435456,
+      "results": {
+        "direct_copy": {
+          "median_ms": 9.701049000000001,
+          "mean_ms": 9.7018935,
+          "min_ms": 9.695019,
+          "max_ms": 9.711421,
+          "submit_ms": 0.32497600000000004,
+          "gpu_allocated_MiB": 288.125,
+          "gpu_reserved_MiB": 560.0,
+          "pinned_pool_MiB": 0.0,
+          "counters": {
+            "d2h_bytes": 0,
+            "h2d_bytes": 0,
+            "demand_loads": 0,
+            "d2h_throttles": 0,
+            "budget_fallback_bytes": 0,
+            "prefetch_budget_skips": 0
+          }
+        },
+        "store_roundtrip": {
+          "median_ms": 8.945341500000001,
+          "mean_ms": 8.936105125000001,
+          "min_ms": 8.895799,
+          "max_ms": 8.956409,
+          "submit_ms": 3.9922795,
+          "gpu_allocated_MiB": 288.125,
+          "gpu_reserved_MiB": 822.0,
+          "pinned_pool_MiB": 256.0,
+          "counters": {
+            "d2h_bytes": 2147483648,
+            "h2d_bytes": 2147483648,
+            "demand_loads": 0,
+            "d2h_throttles": 80,
+            "budget_fallback_bytes": 0,
+            "prefetch_budget_skips": 0
+          }
+        },
+        "serial_compute": {
+          "median_ms": 10.3277805,
+          "mean_ms": 10.322578374999999,
+          "min_ms": 10.281608,
+          "max_ms": 10.340842,
+          "submit_ms": 5.040542,
+          "gpu_allocated_MiB": 288.125,
+          "gpu_reserved_MiB": 822.0,
+          "pinned_pool_MiB": 256.0,
+          "counters": {
+            "d2h_bytes": 2147483648,
+            "h2d_bytes": 2147483648,
+            "demand_loads": 0,
+            "d2h_throttles": 80,
+            "budget_fallback_bytes": 0,
+            "prefetch_budget_skips": 0
+          }
+        },
+        "overlap_compute": {
+          "median_ms": 9.2549415,
+          "mean_ms": 9.260176625,
+          "min_ms": 9.222363,
+          "max_ms": 9.30292,
+          "submit_ms": 5.027449,
+          "gpu_allocated_MiB": 288.125,
+          "gpu_reserved_MiB": 822.0,
+          "pinned_pool_MiB": 256.0,
+          "counters": {
+            "d2h_bytes": 2147483648,
+            "h2d_bytes": 2147483648,
+            "demand_loads": 0,
+            "d2h_throttles": 80,
+            "budget_fallback_bytes": 0,
+            "prefetch_budget_skips": 0
+          }
+        }
+      }
+    },
+    "limited-prefetch": {
+      "configuration": {
+        "output": "/tmp/activation-store-20261030/probe-v5-limited-prefetch.json",
+        "tensors": 16,
+        "tensor_mib": 16,
+        "batch_tensors": 4,
+        "iterations": 8,
+        "warmup": 3,
+        "inflight_mib": 512,
+        "prefetch_mib": 32,
+        "cpu_budget_mib": 1024,
+        "compute_repeats": 50,
+        "compute_dim": 2048,
+        "allocate_on_compute_stream": false,
+        "prefetch_mode": "batch"
+      },
+      "bytes_per_direction": 268435456,
+      "results": {
+        "direct_copy": {
+          "median_ms": 9.7038095,
+          "mean_ms": 9.704605,
+          "min_ms": 9.700385,
+          "max_ms": 9.713147,
+          "submit_ms": 0.329106,
+          "gpu_allocated_MiB": 288.125,
+          "gpu_reserved_MiB": 560.0,
+          "pinned_pool_MiB": 0.0,
+          "counters": {
+            "d2h_bytes": 0,
+            "h2d_bytes": 0,
+            "demand_loads": 0,
+            "d2h_throttles": 0,
+            "budget_fallback_bytes": 0,
+            "prefetch_budget_skips": 0
+          }
+        },
+        "store_roundtrip": {
+          "median_ms": 7.651656,
+          "mean_ms": 7.679362875,
+          "min_ms": 7.607995,
+          "max_ms": 7.794186,
+          "submit_ms": 2.0227595,
+          "gpu_allocated_MiB": 288.125,
+          "gpu_reserved_MiB": 822.0,
+          "pinned_pool_MiB": 256.0,
+          "counters": {
+            "d2h_bytes": 2147483648,
+            "h2d_bytes": 2147483648,
+            "demand_loads": 112,
+            "d2h_throttles": 0,
+            "budget_fallback_bytes": 0,
+            "prefetch_budget_skips": 112
+          }
+        },
+        "serial_compute": {
+          "median_ms": 9.0346285,
+          "mean_ms": 9.023669,
+          "min_ms": 8.96579,
+          "max_ms": 9.071032,
+          "submit_ms": 3.103282,
+          "gpu_allocated_MiB": 288.125,
+          "gpu_reserved_MiB": 822.0,
+          "pinned_pool_MiB": 256.0,
+          "counters": {
+            "d2h_bytes": 2147483648,
+            "h2d_bytes": 2147483648,
+            "demand_loads": 112,
+            "d2h_throttles": 0,
+            "budget_fallback_bytes": 0,
+            "prefetch_budget_skips": 112
+          }
+        },
+        "overlap_compute": {
+          "median_ms": 7.9863655,
+          "mean_ms": 7.977189375,
+          "min_ms": 7.900811,
+          "max_ms": 8.010028,
+          "submit_ms": 3.1092065,
+          "gpu_allocated_MiB": 288.125,
+          "gpu_reserved_MiB": 822.0,
+          "pinned_pool_MiB": 256.0,
+          "counters": {
+            "d2h_bytes": 2147483648,
+            "h2d_bytes": 2147483648,
+            "demand_loads": 112,
+            "d2h_throttles": 0,
+            "budget_fallback_bytes": 0,
+            "prefetch_budget_skips": 112
+          }
+        }
+      }
+    },
+    "many": {
+      "configuration": {
+        "output": "/tmp/activation-store-20261030/probe-v5-many.json",
+        "tensors": 128,
+        "tensor_mib": 2,
+        "batch_tensors": 128,
+        "iterations": 8,
+        "warmup": 3,
+        "inflight_mib": 512,
+        "prefetch_mib": 512,
+        "cpu_budget_mib": 1024,
+        "compute_repeats": 50,
+        "compute_dim": 2048,
+        "allocate_on_compute_stream": false,
+        "prefetch_mode": "batch"
+      },
+      "bytes_per_direction": 268435456,
+      "results": {
+        "direct_copy": {
+          "median_ms": 10.58076,
+          "mean_ms": 10.582311875,
+          "min_ms": 10.574236,
+          "max_ms": 10.593878,
+          "submit_ms": 2.1304185,
+          "gpu_allocated_MiB": 288.125,
+          "gpu_reserved_MiB": 560.0,
+          "pinned_pool_MiB": 0.0,
+          "counters": {
+            "d2h_bytes": 0,
+            "h2d_bytes": 0,
+            "demand_loads": 0,
+            "d2h_throttles": 0,
+            "budget_fallback_bytes": 0,
+            "prefetch_budget_skips": 0
+          }
+        },
+        "store_roundtrip": {
+          "median_ms": 13.1457135,
+          "mean_ms": 13.0924025,
+          "min_ms": 12.63088,
+          "max_ms": 13.205291,
+          "submit_ms": 11.0933695,
+          "gpu_allocated_MiB": 288.125,
+          "gpu_reserved_MiB": 822.0,
+          "pinned_pool_MiB": 256.0,
+          "counters": {
+            "d2h_bytes": 2147483648,
+            "h2d_bytes": 2147483648,
+            "demand_loads": 0,
+            "d2h_throttles": 0,
+            "budget_fallback_bytes": 0,
+            "prefetch_budget_skips": 0
+          }
+        },
+        "serial_compute": {
+          "median_ms": 14.574583,
+          "mean_ms": 14.5374785,
+          "min_ms": 14.090935,
+          "max_ms": 14.660167,
+          "submit_ms": 12.156296,
+          "gpu_allocated_MiB": 288.125,
+          "gpu_reserved_MiB": 822.0,
+          "pinned_pool_MiB": 256.0,
+          "counters": {
+            "d2h_bytes": 2147483648,
+            "h2d_bytes": 2147483648,
+            "demand_loads": 0,
+            "d2h_throttles": 0,
+            "budget_fallback_bytes": 0,
+            "prefetch_budget_skips": 0
+          }
+        },
+        "overlap_compute": {
+          "median_ms": 13.638921,
+          "mean_ms": 23.261288375,
+          "min_ms": 13.585967,
+          "max_ms": 90.659245,
+          "submit_ms": 12.426110999999999,
+          "gpu_allocated_MiB": 288.125,
+          "gpu_reserved_MiB": 822.0,
+          "pinned_pool_MiB": 256.0,
+          "counters": {
+            "d2h_bytes": 2147483648,
+            "h2d_bytes": 2147483648,
+            "demand_loads": 0,
+            "d2h_throttles": 0,
+            "budget_fallback_bytes": 0,
+            "prefetch_budget_skips": 0
+          }
+        }
+      }
+    },
+    "medium": {
+      "configuration": {
+        "output": "/tmp/activation-store-20261030/probe-v5-medium.json",
+        "tensors": 16,
+        "tensor_mib": 16,
+        "batch_tensors": 16,
+        "iterations": 8,
+        "warmup": 3,
+        "inflight_mib": 512,
+        "prefetch_mib": 512,
+        "cpu_budget_mib": 1024,
+        "compute_repeats": 50,
+        "compute_dim": 2048,
+        "allocate_on_compute_stream": false,
+        "prefetch_mode": "batch"
+      },
+      "bytes_per_direction": 268435456,
+      "results": {
+        "direct_copy": {
+          "median_ms": 9.701241499999998,
+          "mean_ms": 9.70272075,
+          "min_ms": 9.696947,
+          "max_ms": 9.710371,
+          "submit_ms": 0.326064,
+          "gpu_allocated_MiB": 288.125,
+          "gpu_reserved_MiB": 560.0,
+          "pinned_pool_MiB": 0.0,
+          "counters": {
+            "d2h_bytes": 0,
+            "h2d_bytes": 0,
+            "demand_loads": 0,
+            "d2h_throttles": 0,
+            "budget_fallback_bytes": 0,
+            "prefetch_budget_skips": 0
+          }
+        },
+        "store_roundtrip": {
+          "median_ms": 7.3755845,
+          "mean_ms": 7.385104624999999,
+          "min_ms": 7.323211,
+          "max_ms": 7.463276,
+          "submit_ms": 1.5207085,
+          "gpu_allocated_MiB": 288.125,
+          "gpu_reserved_MiB": 822.0,
+          "pinned_pool_MiB": 256.0,
+          "counters": {
+            "d2h_bytes": 2147483648,
+            "h2d_bytes": 2147483648,
+            "demand_loads": 0,
+            "d2h_throttles": 0,
+            "budget_fallback_bytes": 0,
+            "prefetch_budget_skips": 0
+          }
+        },
+        "serial_compute": {
+          "median_ms": 8.796130999999999,
+          "mean_ms": 8.7903225,
+          "min_ms": 8.704402,
+          "max_ms": 8.854965,
+          "submit_ms": 2.5682715,
+          "gpu_allocated_MiB": 288.125,
+          "gpu_reserved_MiB": 822.0,
+          "pinned_pool_MiB": 256.0,
+          "counters": {
+            "d2h_bytes": 2147483648,
+            "h2d_bytes": 2147483648,
+            "demand_loads": 0,
+            "d2h_throttles": 0,
+            "budget_fallback_bytes": 0,
+            "prefetch_budget_skips": 0
+          }
+        },
+        "overlap_compute": {
+          "median_ms": 7.8891755,
+          "mean_ms": 7.912509,
+          "min_ms": 7.81771,
+          "max_ms": 8.173665,
+          "submit_ms": 2.5582789999999997,
+          "gpu_allocated_MiB": 288.125,
+          "gpu_reserved_MiB": 822.0,
+          "pinned_pool_MiB": 256.0,
+          "counters": {
+            "d2h_bytes": 2147483648,
+            "h2d_bytes": 2147483648,
+            "demand_loads": 0,
+            "d2h_throttles": 0,
+            "budget_fallback_bytes": 0,
+            "prefetch_budget_skips": 0
+          }
+        }
+      }
+    }
+  }
+}

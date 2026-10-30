@@ -388,11 +388,8 @@ class ActivationBatch:
                    and record.device_tensor is None for ref in self.records)
 
     def prefetch(self, *, from_schedule=False):
-        seen = set()
-        for ref in reversed(self.records):
-            if (record := ref()) is not None and id(record) not in seen:
-                seen.add(id(record))
-                record.prefetch(from_schedule=from_schedule)
+        return self.store._prefetch_records(
+            (ref() for ref in reversed(self.records)), from_schedule=from_schedule)
 
 
     def save(self, tensor):
@@ -538,6 +535,33 @@ class ActivationStore:
         """Store autograd saves in this store; exclude parameters/buffers by storage."""
         from .activation_autograd import SavedActivationContext
         return SavedActivationContext(self, exclude=exclude)
+
+    def prefetch_many(self, handles):
+        """Prefetch distinct records in one submission batch.
+
+        Returns the number of admitted/already-restored records, not completed
+        GPU copies. Per-record producer events and the shared byte budget still
+        apply. Validate ownership before submitting any work.
+        """
+        if self.closed:
+            raise RuntimeError('Activation store has been closed')
+        records = []
+        for handle in handles:
+            if not isinstance(handle, ActivationHandle):
+                raise TypeError('prefetch_many expects activation handles')
+            value = handle._checked_value()
+            if isinstance(value, _SavedTensor):
+                if value.record.store is not self:
+                    raise ValueError('Prefetch handles must belong to this activation store')
+                records.append(value.record)
+        return self._prefetch_records(records)
+
+    def _prefetch_records(self, records, *, from_schedule=False):
+        unique = {id(record): record for record in records if record is not None}
+        if not unique:
+            return 0
+        with self.transport.prefetch_batch():
+            return sum(record.prefetch(from_schedule=from_schedule) for record in unique.values())
 
     @contextmanager
     def batch(self):

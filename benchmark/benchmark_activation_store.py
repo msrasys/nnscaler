@@ -32,6 +32,8 @@ def arguments():
     parser.add_argument('--compute-repeats', type=int, default=50)
     parser.add_argument('--compute-dim', type=int, default=2048)
     parser.add_argument('--allocate-on-compute-stream', action='store_true')
+    parser.add_argument('--prefetch-mode', choices=('single', 'batch'), default='batch',
+                        help='compare per-handle calls with the bulk prefetch interface')
     args = parser.parse_args()
     if args.batch_tensors is None:
         args.batch_tensors = args.tensors
@@ -116,8 +118,11 @@ def main():
             del values
             if mode == 'overlap_compute':
                 compute()
-            for handle in handles:
-                handle.prefetch()
+            if args.prefetch_mode == 'batch':
+                cache.prefetch_many(handles)
+            else:
+                for handle in handles:
+                    handle.prefetch()
             if mode == 'overlap_compute':
                 compute()
             restored = [handle.load() for handle in handles]

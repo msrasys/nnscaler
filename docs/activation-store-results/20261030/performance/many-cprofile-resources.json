@@ -1,0 +1,48 @@
+{
+  "validation_token": "2564dbcf188547529b7834235797b604",
+  "exclusive_gpu_indices": [
+    "0",
+    "1",
+    "2",
+    "3",
+    "4",
+    "5",
+    "6",
+    "7"
+  ],
+  "gpu_reserve_mib": 16384,
+  "validation_mode": "exclusive_benchmark",
+  "sampled_peak_gpu_used_mib": {
+    "GPU-2fdaef43-ccd2-9a83-7db2-7ed19297cb8d": 0,
+    "GPU-a489a02e-a4cd-63c6-b375-1b70189b5212": 1682,
+    "GPU-a0389fe1-95e8-434f-fa82-b9068760a5fd": 0,
+    "GPU-5d9fae78-2f9c-99ff-34e5-4f53fcdfb482": 0,
+    "GPU-0f843df3-d66c-e511-7ef0-fc5bec61ac81": 0,
+    "GPU-bd2472aa-9cb6-561b-dc43-5af16289cb61": 0,
+    "GPU-39790b4d-cb35-4637-c1ce-53654a8c7988": 0,
+    "GPU-bdc82bb5-3ae8-c001-7c48-804954013bc1": 0
+  },
+  "headroom_basis": "host MemAvailable and cgroup usage minus clean inactive file cache",
+  "validation_time_limit_seconds": 1800,
+  "command_exit": 0,
+  "stop_reason": null,
+  "guard_exception": null,
+  "cleanup_errors": [],
+  "peak_container_bytes": 2105844244480,
+  "peak_task_tree_rss_bytes": 1723936768,
+  "minimum_host_cgroup_headroom_bytes": 2148186673152,
+  "task_tree_rss_limit_bytes": 858993459200,
+  "host_cgroup_reserve_bytes": 274877906944,
+  "minimum_disk_free_bytes": 911130107904,
+  "started_unix_seconds": 1793326171.197593,
+  "last_gpu_processes": [
+    [
+      "4020981",
+      "GPU-a489a02e-a4cd-63c6-b375-1b70189b5212"
+    ]
+  ],
+  "phase": "complete",
+  "duration_seconds": 11.380787331610918,
+  "updated_unix_seconds": 1793326182.5783803,
+  "remaining_owned_pids": []
+}

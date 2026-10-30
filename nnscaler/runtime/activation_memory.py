@@ -1,6 +1,7 @@
 # Copyright (c) Microsoft Corporation. Licensed under the MIT License.
 """Process-wide pinned activation buffers and host-memory accounting."""
 from collections import Counter
+from bisect import bisect_left, insort
 import os
 from pathlib import Path
 import threading
@@ -62,7 +63,8 @@ class _OffloadPool:
     def __init__(self, config):
         self.config = config
         self.lock = threading.RLock()
-        self.free = []
+        self.free = {}
+        self._free_sizes = []
         self.pending = []
         self.allocated = 0
         self.allocated_pinned = 0
@@ -82,7 +84,11 @@ class _OffloadPool:
         pending = []
         for buffer, event in self.pending:
             if event is None or event.query():
-                self.free.append(buffer)
+                size = buffer.numel()
+                if size not in self.free:
+                    self.free[size] = []
+                    insort(self._free_sizes, size)
+                self.free[size].append(buffer)
             else:
                 pending.append((buffer, event))
         self.pending = pending
@@ -90,10 +96,14 @@ class _OffloadPool:
     def acquire(self, size):
         with self.lock:
             self._reap()
-            candidates = [(b.numel(), i) for i, b in enumerate(self.free) if b.numel() >= size]
-            if candidates:
-                _, index = min(candidates)
-                buffer = self.free.pop(index)
+            index = bisect_left(self._free_sizes, size)
+            if index < len(self._free_sizes):
+                capacity = self._free_sizes[index]
+                bucket = self.free[capacity]
+                buffer = bucket.pop()
+                if not bucket:
+                    del self.free[capacity]
+                    self._free_sizes.pop(index)
                 self.stats['pool_reuses'] += 1
             else:
                 charge = self.allocation_charge(size)
@@ -111,8 +121,9 @@ class _OffloadPool:
                 buffer = torch.empty(charge, dtype=torch.uint8, device='cpu', pin_memory=True)
                 self.allocated += charge
                 self.allocated_pinned += charge
-            self.live += buffer.numel()
-            self.live_pinned += self.allocation_charge(buffer.numel())
+                capacity = charge
+            self.live += capacity
+            self.live_pinned += self.allocation_charge(capacity)
             self.stats['peak_live_cpu_bytes'] = max(self.stats['peak_live_cpu_bytes'], self.live)
             self.stats['peak_live_pinned_bytes'] = max(self.stats['peak_live_pinned_bytes'], self.live_pinned)
             return buffer
@@ -147,6 +158,7 @@ class _OffloadPool:
                     event.synchronize()
             self.pending.clear()
             self.free.clear()
+            self._free_sizes.clear()
             self.allocated = 0
             self.allocated_pinned = 0
 

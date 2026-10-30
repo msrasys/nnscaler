@@ -1,0 +1,17 @@
+{
+  "removed": [
+    {
+      "path": "/tmp/activation-store-20261030/pipeline-v5-tmp",
+      "file_bytes": 1138540
+    }
+  ],
+  "leases": {
+    "store-probes-v4": "completed",
+    "store-suite-v5": "completed",
+    "many-cprofile": "completed",
+    "many-tuning": "completed",
+    "confirmation": "completed"
+  },
+  "remaining_owned_processes": false,
+  "disk_free_bytes": 911316942848
+}

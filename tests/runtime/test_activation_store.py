@@ -335,3 +335,58 @@ def test_host_budget_fallback_and_store_close_keep_other_store_valid():
     torch.testing.assert_close(hb.load(), x + 1)
     hb.release()
     b.close()
+
+
+@cuda
+@pytest.mark.parametrize('compute_allocation', [False, True])
+def test_bulk_prefetch_preserves_aliases_budget_and_caller_stream(compute_allocation):
+    size = 64*64*4
+    cache = store('cuda', max_prefetch_bytes=size, reload_on_compute_stream=compute_allocation)
+    x, y = torch.randn(64, 64, device='cuda'), torch.randn(64, 64, device='cuda')
+    expected_x, expected_y = x.cpu(), y.cpu()
+    with cache.batch():
+        a, alias, b = cache.save(x), cache.save(x.t()), cache.save(y)
+    del x, y
+    consumer = torch.cuda.current_stream()
+    assert cache.prefetch_many([a, alias, b]) == 1
+    assert torch.cuda.current_stream() == consumer
+    torch.testing.assert_close(a.load().cpu(), expected_x)
+    torch.testing.assert_close(alias.load().cpu(), expected_x.t())
+    torch.testing.assert_close(b.load().cpu(), expected_y)
+    assert cache.snapshot()['pool']['h2d_bytes'] == 2*size
+    for handle in (a, alias, b):
+        handle.release()
+    cache.close()
+
+
+@cuda
+def test_bulk_prefetch_validates_ownership_before_any_transfer():
+    a, b = store('cuda'), store('cuda')
+    first, foreign = a.save(torch.randn(64, 64, device='cuda')), b.save(torch.randn(64, 64, device='cuda'))
+    before = a.snapshot()['pool']['h2d_bytes']
+    with pytest.raises(ValueError, match='belong'):
+        a.prefetch_many([first, foreign])
+    assert a.snapshot()['pool']['h2d_bytes'] == before
+    first.release()
+    foreign.release()
+    a.close()
+    b.close()
+
+
+@cuda
+def test_bulk_prefetch_restores_stream_after_a_version_error():
+    cache = store('cuda', reload_on_compute_stream=False)
+    value = torch.ones(64, 64, device='cuda')
+    invalid = cache.save(value)
+    torch.cuda.synchronize()
+    value.add_(1)
+    consumer = torch.cuda.current_stream()
+    with pytest.raises(RuntimeError, match='inplace'):
+        cache.prefetch_many([invalid])
+    assert torch.cuda.current_stream() == consumer
+    invalid.release()
+    valid = cache.save(torch.full((64, 64), 7.0, device='cuda'))
+    assert cache.prefetch_many([valid]) == 1
+    torch.testing.assert_close(valid.load(), torch.full((64, 64), 7.0, device='cuda'))
+    valid.release()
+    cache.close()

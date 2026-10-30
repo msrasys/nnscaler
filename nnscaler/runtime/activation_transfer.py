@@ -1,6 +1,8 @@
 # Copyright (c) Microsoft Corporation. Licensed under the MIT License.
 """CUDA transfer dependencies and bounded submission, independent of autograd."""
 from collections import deque
+from contextlib import contextmanager
+from contextvars import ContextVar
 import time
 
 import torch
@@ -14,6 +16,31 @@ class ActivationTransferEngine:
         self.h2d_stream = torch.cuda.Stream(device=device) if device.type == 'cuda' else None
         self.inflight = deque()
         self.inflight_bytes = 0
+        self._d2h_batch = ContextVar('activation_d2h_batch', default=False)
+        self._h2d_batch = ContextVar('activation_h2d_batch', default=False)
+
+    @contextmanager
+    def _stream_batch(self, stream, active):
+        if active.get():
+            yield
+            return
+        with torch.cuda.stream(stream):
+            token = active.set(True)
+            try:
+                yield
+            finally:
+                active.reset(token)
+
+    @contextmanager
+    def prefetch_batch(self):
+        # Compute-stream allocations must observe the caller's compute stream,
+        # so they retain the per-copy path. Copy-stream allocations can submit
+        # an entire restore batch under one stream context.
+        if self.config.reload_on_compute_stream:
+            yield
+        else:
+            with self._stream_batch(self.h2d_stream, self._h2d_batch):
+                yield
 
     def poll(self):
         """Reap completed copies without waiting for unfinished GPU work."""
@@ -44,7 +71,8 @@ class ActivationTransferEngine:
                 self.d2h_stream.wait_stream(stream)
             else:
                 self.d2h_stream.wait_event(event)
-        copied = sum(bool(record.offload()) for record in records)
+        with self._stream_batch(self.d2h_stream, self._d2h_batch):
+            copied = sum(bool(record.offload()) for record in records)
         if copied:
             self.stats['d2h_committed_groups'] += 1
             self.stats['peak_queued_d2h_bytes'] = max(
@@ -55,11 +83,13 @@ class ActivationTransferEngine:
             return self._to_host(source, destination)
 
     def _to_host(self, source, destination):
-        with torch.cuda.stream(self.d2h_stream):
-            destination.copy_(source, non_blocking=True)
-            source.record_stream(self.d2h_stream)
-            ready = torch.cuda.Event()
-            ready.record(self.d2h_stream)
+        if not self._d2h_batch.get():
+            with self._stream_batch(self.d2h_stream, self._d2h_batch):
+                return self._to_host(source, destination)
+        destination.copy_(source, non_blocking=True)
+        source.record_stream(self.d2h_stream)
+        ready = torch.cuda.Event()
+        ready.record(self.d2h_stream)
         self.inflight.append((source.numel() * source.element_size(), ready))
         self.inflight_bytes += source.numel() * source.element_size()
         return ready
@@ -71,11 +101,18 @@ class ActivationTransferEngine:
     def _to_device(self, source, dependency):
         stream = self.h2d_stream
         destination = None
-        if self.config.reload_on_compute_stream:
+        if self.config.reload_on_compute_stream and not self._h2d_batch.get():
             consumer = torch.cuda.current_stream(self.device)
             destination = torch.empty(source.shape, dtype=source.dtype, device=self.device)
             stream.wait_stream(consumer)
+        if self._h2d_batch.get():
+            return self._restore_on_stream(source, dependency, destination)
         with torch.cuda.stream(stream):
+            return self._restore_on_stream(source, dependency, destination)
+
+    def _restore_on_stream(self, source, dependency, destination):
+        stream = self.h2d_stream
+        with self.observation.range('h2d_copy'):
             stream.wait_event(dependency)
             if destination is None:
                 destination = source.to(self.device, non_blocking=True)

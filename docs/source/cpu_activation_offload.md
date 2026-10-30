@@ -2,8 +2,9 @@
 
 The October 30 store/adapter refactor has passed CPU and CUDA correctness checks;
 see the [architecture validation](activation_store_validation_20261030.md).
-Independent transfer probes are queued behind the current GPU job. Full-model
-numbers linked below measure the October 29 implementation.
+Independent transfer probes have also completed; see the
+[runtime performance validation](activation_store_performance_20261030.md).
+Full-model numbers linked below measure the October 29 implementation.
 
 The [storage architecture](activation_store_design.md) separates host memory,
 CUDA transport, saved-value ownership and graph/autograd adapters. An explicit
@@ -36,6 +37,16 @@ does not copy back to CPU: loaded values are immutable, so the existing host cop
 remains authoritative. Aliased handles share one storage record. Re-saving a
 restored view in the same store reuses that record; repeated eviction checks
 versions of still-live older restored views as well.
+
+For multiple handles, use `store.prefetch_many(handles)`. It validates store
+ownership before submission, deduplicates shared records, and retains the same
+per-record readiness events and shared prefetch-byte limit. Its return value is
+the number of admitted/already-restored records, not completed GPU copies.
+Existing NNScaler group prefetch uses the same bulk path automatically.
+D2H batches enter their copy stream once. H2D batches do the same when
+`reload_on_compute_stream=False`; compute-arena allocation keeps its per-copy
+compute-stream dependency to preserve allocator safety. These choices do not
+remove waits required for correctness or merge mutable activation versions.
 
 An external tensor alias or an autograd save by a producer/consumer can still
 retain the allocation. Leaf gradient accumulation also retains its leaf. For an
@@ -325,7 +336,8 @@ power of two; the pool exposes that already-charged capacity in its reusable
 tensor so slightly larger requests in the same size class can reuse it. Only
 requested activation bytes are transferred. `allocated_cpu_bytes` reports Tensor capacity and
 `allocated_pinned_bytes` reports the charged pinned blocks.
-Reuse chooses the smallest available buffer large enough for a request. A
+Reuse chooses the smallest available buffer large enough for a request, using
+capacity buckets instead of scanning every idle tensor on each acquisition. A
 buffer stays charged while idle; the pool does not evict old size classes to
 allocate new ones. Workloads with very variable shapes can therefore fall back
 to resident storage before all idle bytes are useful.

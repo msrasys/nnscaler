@@ -1,9 +1,10 @@
 # Activation store: architecture and correctness validation
 
 The reusable store and its NNScaler/PyTorch adapters have passed CPU and CUDA
-correctness checks. Independent transport performance probes are prepared and
-queued; there is no new full-model throughput claim and no claim of optimal DMA
-efficiency. The October 29 model numbers describe the earlier implementation.
+correctness checks. Independent transport performance probes have since completed;
+see [the measured results](activation_store_performance_20261030.md). There is no
+new full-model throughput claim or claim of optimal DMA efficiency. The October
+29 model numbers describe the earlier implementation.
 
 ## Implemented contracts
 
@@ -70,9 +71,10 @@ or prefetch budget. They bind to the selected GPU's NUMA CPUs, run only under an
 exclusive GPU reservation, exclude warmup/source construction/validation from
 timing, and verify actual D2H/H2D byte counts and zero residual pool use.
 
-The queued runner is `/tmp/activation-store-20261030/run_probes_v4.py`. It writes
+The baseline runner was `/tmp/activation-store-20261030/run_probes_v4.py`. It writes
 individual results and `probe-summary-v4.json` after every case succeeds. Its
 resource guard preserves 256 GiB host/cgroup headroom, 300 GiB disk free and
 16 GiB GPU free, with a time limit. No model checkpoint or large generated model
-is required. Probe results are pending; CPU event counts and zero demand loads
-alone do not establish that GPU transfer cost is hidden.
+is required. Baseline, optimized and configuration-only probes are now complete;
+CPU event counts and zero demand loads alone do not establish that GPU transfer
+cost is hidden.

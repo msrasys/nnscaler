@@ -1,0 +1,19 @@
+{
+  "local_root": "/tmp/activation-store-20261030",
+  "gpu": "physical GPU1, B200, CPU NUMA node0",
+  "payload_bytes_each_direction": 268435456,
+  "initial_samples": 8,
+  "tuning_samples": 16,
+  "confirmation_samples": 32,
+  "warmup_iterations": 3,
+  "completed": true,
+  "notes": [
+    "All runs held a shared exclusive reservation over all 8 GPUs.",
+    "All copies validated outside measured samples; no CPU-budget fallback and no residual live/pending/prefetch pool bytes.",
+    "Direct-copy reference uses a whole-batch dependency; store can overlap directions per storage. It is not a hardware lower bound.",
+    "No complete-model performance measurements in this suite."
+  ],
+  "cprofile_sha256": "4b4b798522898d034f62964b9fca3099a517c5c7d52ad6939f14427277dea064",
+  "working_runtime_python_files_equal_v5": 175,
+  "extra_stream_error_test_sha256": "7e1b53ab04c617b20c44642f5390bcc10d96b4347911daa722e19f8615302eb2"
+}
