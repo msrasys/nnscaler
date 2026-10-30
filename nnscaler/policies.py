@@ -716,9 +716,11 @@ def _identity_segment_output(graph: IRGraph, tensor: IRSubTensor, segment: IRSeg
     return fwop
 
 
-# signatures of cheap, deterministic, non-differentiable indexing/attribute ops
-# that are safe to recompute (e.g. `data['loss']` -> `_operator.getitem`).
-_SINKABLE_INDEX_SIGNATURES = ('_operator.getitem', )
+# signatures of cheap, deterministic, non-differentiable lookup ops that are safe
+# to recompute per stage (e.g. `data['loss']` -> `_operator.getitem`,
+# `data['meta'].get('scale', 1)` -> `builtins.dict.get`). Recomputing them locally
+# avoids a cross-stage object transfer for every microbatch.
+_SINKABLE_INDEX_SIGNATURES = ('_operator.getitem', 'builtins.dict.get')
 
 
 def _duplicate_dataloader_index_ops_per_stage(graph: IRGraph, op_plans: dict) -> None:
@@ -759,6 +761,12 @@ def _duplicate_dataloader_index_ops_per_stage(graph: IRGraph, op_plans: dict) ->
             dataloader_output_tids.add(out.tid)
     if not dataloader_output_tids:
         return
+    # graph outputs are not consumers, so a sinkable op that only feeds a graph
+    # output looks dead after sinking; it must stay in its own stage to keep
+    # the output defined.
+    graph_output_tids = {
+        out.tid for out in IRCell.get_objects_from_complex(graph.outputs())
+    }
 
     def _get_node_stage(node) -> Optional[int]:
         plan = op_plans.get(node)
@@ -893,7 +901,8 @@ def _duplicate_dataloader_index_ops_per_stage(graph: IRGraph, op_plans: dict) ->
                             consumer.replace(iobj, new_iobj)
 
         # dead sinkable nodes that are not needed in their own stage can be removed
-        if not found_consumer_in_current_stage:
+        is_graph_output = any(out.tid in graph_output_tids for out in node.oobjs())
+        if not found_consumer_in_current_stage and not is_graph_output:
             graph.remove(node)
             op_plans.pop(node, None)
 
