@@ -105,51 +105,60 @@ class OpPlan:
 
 ### Pipeline auxiliary outputs
 
-With an end-to-end pipeline function policy, auxiliary views are inserted on the
-original graph after stage IDs are resolved, before split bookkeeping,
-recompute/offload grouping, shared-parameter multiref, and `graph.staging`.
-A read-only pass resolves auxiliary output and unused cross-stage input detach
-sites. The insertion pass updates consumers, graph outputs, and plans using
-the native `Detach` operator, then re-infers gradient metadata for both the
-source and detached tensors and updates their consumers' existing backward outputs.
-This includes consumers that keep the original input, since their gradient
-value maps can change when auxiliary gradient contributions are removed.
-The no-grad detach operators need no backward nodes; the other backward nodes
-are preserved rather than rebuilt globally.
-Only inserted detach outputs are marked `requires_grad=False`; existing
-forward flags are preserved. Detached outputs and boundaries isolate auxiliary
-branches from the loss, so conservative `True` flags inside those branches do
-not reconnect runtime autograd. Inferring output flags from input flags would
-be unsafe for operators that create grad-enabled tensors internally. An output
-that no longer requires grad at runtime can retain a redundant detach.
-Staging then infers the stage interfaces without auxiliary-output postprocessing.
-New operators inherit the recompute/offload region at their insertion position
-through their `OpPlan`, just like handwritten operators.
-The original activation stays differentiable through
-its last loss-dependent stage; later auxiliary-only consumers receive detached views.
-Shared parameters' auxiliary-only remote uses are detached at the owning stage,
-before multiref can create separate differentiable aliases for those consumers.
-Returned parameters are detached in the same original-graph pass.
-Inserted detaches use `OpPlan(partition='auto')` and the ordinary TP path.
-Dimension partitions can be propagated; value-partitioned inputs are combined
-by the usual adapters before a replicated detach. Producerless parameters
-use the normal replicated fallback, so their storage layout may change.
-No TP-specific detach handling, later backward pruning, adapter/codegen
-compensation, or runtime zero filling is added.
-User-written `.data` and `.detach()` outputs follow the same activation analysis.
+With an end-to-end pipeline function policy, only the first output (the loss) seeds
+backward. Any other output is auxiliary: it is returned to the caller but does not
+contribute to training. Auxiliary outputs are returned as detached tensors
+(`requires_grad=False`), so the caller cannot backpropagate through them.
+Inference-only graphs are left unchanged.
 
-The analysis is conservative for opaque operators: a live output retains all
-declared input gradients. External inputs retain the existing behavior.
-Stages with no differentiable
-outputs remain unsupported.
+Instead of feeding zero gradients to backward, the policy detaches auxiliary values
+in the compute graph while keeping every loss-dependent use differentiable:
 
-Unused parameters in TP reducers retain the normal reducer semantics:
-`reducer_none_grad=False` can materialize zeros. To preserve eager `grad=None`
-and avoid weight decay on unused weights, enable `reducer_none_grad` and keep
-used and unused parameters in separate buckets.
+- A returned activation is replaced by a detached view in the outputs only.
+- An activation that a later stage consumes only for an auxiliary computation crosses
+  that stage boundary as a detached view, and stays differentiable through its last
+  loss-dependent stage. Returning the result through `.data` or `.detach()` is not
+  enough, because the consuming stage would still declare an input gradient that its
+  loss never produces.
+- A shared parameter with auxiliary-only uses in later stages is detached in its
+  earliest consumer stage and sent to those stages as a detached activation.
 
-The runtime requires every declared input gradient to be present. Missing
-gradients raise an error rather than being replaced with zeros.
+For example, with `layers[i]` assigned to stage `i`:
+
+```python
+def forward(self, x):
+    first = self.layers[0](x)       # stage 0
+    hidden = self.layers[1](first)  # stage 1
+    hidden = self.layers[2](hidden) # stage 2
+    loss = hidden.square().sum()    # stage 2
+    aux = self.aux(first)           # stage 2, not used by the loss
+    return loss, aux.data
+```
+
+Stage 2 receives `first` from stage 0, and both `first` and `aux` require grad in the
+traced graph, so stage 2 declares a gradient for `first` as part of its backward
+interface. The loss never produces that gradient, and the training step would fail
+with a missing gradient. The policy therefore detaches `first` after stage 1, where
+its last loss-dependent use (`layers[1]`) ends, and feeds the detached view to
+`self.aux`. The effect is the same as writing `aux = self.aux(first.detach())`.
+BTW, if `aux` is returned without `.data`, the policy would additionally replace it by a detached view (equivalent to `return loss, aux.detach()`).
+
+Inserted detaches follow the partition of their inputs and the recompute/offload
+region at their position. Partitioned auxiliary values are returned as complete tensors.
+
+Limitations:
+
+- Custom (opaque) operators are handled conservatively: if any output reaches the
+  loss, all of their input gradients are kept.
+- Graph inputs (data samples) that require grad are not detached.
+- Returning a parameter that no operator consumes raises an error at compile time,
+  because its pipeline stage cannot be determined.
+- A stage whose outputs are all auxiliary is not supported.
+
+In eager PyTorch, a parameter used only by an auxiliary branch gets `grad=None`.
+With the default `reducer_none_grad=False`, reducers materialize zero gradients
+instead, so weight decay still updates such parameters. Set `reducer_none_grad=True`
+and keep used and unused parameters in separate buckets to preserve the eager behavior.
 
 ### Example: Custom Partitioning and Recomputation
 

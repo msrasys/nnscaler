@@ -634,12 +634,13 @@ def _pp_get_aux_outputs(
         Returns an empty dict when the loss has no gradient or no detaches
         are needed.
     """
-    # Even handwritten `return loss, aux.data` can leave a stage input unused
-    # by backward. Thus an empty output search does not mean no boundary cuts.
     loss = graph.output(0)
     if loss.grad is None:
         return {}  # don't need to update the graph if loss has no gradient (inference mode)
 
+    # Graph outputs that still carry a gradient and must be replaced by detached views.
+    # Do not return early when this set is empty: it only covers returned values,
+    # not stage boundaries.
     aux_outputs = {
         tensor for tensor in graph.oobjs()
         if isinstance(tensor, IRSubTensor) and not tensor.is_loss() and tensor.requires_grad
@@ -648,11 +649,18 @@ def _pp_get_aux_outputs(
     # get all nodes that are live for backward tracking
     live = {loss.grad.parent}  # set of live tensor parents for backward tracking
     live_nodes = set()
+    # A single pass is enough because this runs on the untransformed graph, whose
+    # node list is the execution order: `IRGraph.backward` appends backward ops in
+    # reverse forward order, so every gradient is produced before it is consumed.
     for node in graph.select(ntype=IRBpOperation):
         if any(tensor.parent in live for tensor in node.inputs()):
             live_nodes.add(node.mirror)
             live.update(tensor.parent for tensor in node.outputs())
 
+    # Position of each stage's last forward op in graph.nodes(). Later entries
+    # overwrite earlier ones with the same stage_id, which gives the last op only
+    # because graph.nodes() is the execution order and `fn` has already checked
+    # that the ops of a stage are contiguous.
     stage_ends = {
         op_plans[node].stage_id: position
         for position, node in enumerate(graph.nodes()) if node in op_plans
