@@ -11,7 +11,7 @@ from nnscaler.runtime.cpu_offload import (
     CPUOffloadContext, OffloadConfig, OffloadManager, comm_exclusive, configure,
     hint_forward, offload_report, offload_stats,
 )
-from nnscaler.runtime.cpu_offload.config import COMM_EXCLUSIVE_MODES, FAKE_MODES
+from nnscaler.runtime.cpu_offload.config import COMM_EXCLUSIVE_MODES, DEDUP_SCOPES, FAKE_MODES, PREFETCH_UNITS
 from nnscaler.runtime.cpu_offload.hooks import ModuleTensorRef, OffloadedTensor, covered_bytes
 from nnscaler.runtime.cpu_offload.host_memory import MemPolicy, PinnedPool, gpu_numa_info
 from nnscaler.runtime.cpu_offload.stats import GroupProfile, OffloadStats, SizeHistogram, format_summary
@@ -88,8 +88,13 @@ def test_config_from_env_parses_every_knob():
         'CPU_OFFLOADING_POOL_MAX_GB': '1.5', 'CPU_OFFLOADING_TIMING': '0',
         'CPU_OFFLOADING_DEBUG': '1', 'CPU_OFFLOADING_PROFILE_EVERY': '10',
         'CPU_OFFLOADING_FAKE_COPY': '2',
+        'CPU_OFFLOADING_PREFETCH_UNIT': 'group', 'CPU_OFFLOADING_PREFETCH_BACKWARDS': '3',
+        'CPU_OFFLOADING_COMMIT_MB': '64', 'CPU_OFFLOADING_RELOAD_ON_COPY_STREAM': '0',
+        'CPU_OFFLOADING_DEDUP_SCOPE': 'context', 'CPU_OFFLOADING_POOL_TRIM_STEPS': '20',
     }
     cfg = OffloadConfig.from_env(env)
+    assert cfg.prefetch_unit == 'group' and cfg.prefetch_backwards == 3 and cfg.commit_bytes == 64 << 20
+    assert not cfg.reload_on_copy_stream and cfg.dedup_scope == 'context' and cfg.pool_trim_steps == 20
     assert not cfg.enabled and cfg.min_bytes == 4096 and cfg.min_backward_distance == 3
     assert cfg.prefetch_groups == 4 and cfg.prefetch_bytes == 2 << 20
     assert cfg.max_inflight_copies == 8 and cfg.copy_chunk_bytes == 32 << 20
@@ -110,8 +115,13 @@ def test_config_validation():
         OffloadConfig(prefetch_groups=-1).validate()
     with pytest.raises(ValueError, match='is not valid'):
         OffloadConfig.from_env({'CPU_OFFLOADING_MIN_BYTES': 'lots'})
+    with pytest.raises(ValueError, match='prefetch_unit'):
+        OffloadConfig(prefetch_unit='layer').validate()
+    with pytest.raises(ValueError, match='dedup_scope'):
+        OffloadConfig(dedup_scope='global').validate()
     assert set(FAKE_MODES) == {'off', 'no_copy', 'd2h_only', 'both_keep'}
     assert set(COMM_EXCLUSIVE_MODES) == {'off', 'strict', 'soft'}
+    assert set(PREFETCH_UNITS) == {'backward', 'group'} and set(DEDUP_SCOPES) == {'group', 'context'}
 
 
 def test_configure_overrides_and_rejects_unknown_fields():
@@ -243,10 +253,12 @@ def test_overlapping_views_share_one_region_and_are_rebuilt_with_strides():
     assert torch.equal(context._unpack(a), base[:, :512])
     assert torch.equal(context._unpack(b), base[:, 512:])
     assert torch.equal(context._unpack(c), base.t())
+    assert torch.equal(context._unpack(c2), base.t())
     assert torch.equal(context._unpack(d), other[4:])
     assert context._unpack(e).shape == (0, 1024)
+    # every view consumed: the chunk buffers were handed to autograd
+    assert transfer.unconsumed == 0 and all(c.buffer is None for c in transfer.chunks)
     manager.end_backward(manager.tracker._backward_stack[-1]) if manager.tracker._backward_stack else None
-    assert transfer.device_buffer is None or transfer.unconsumed > 0
 
 
 @cuda_only
@@ -257,8 +269,11 @@ def test_chunked_reload_waits_only_for_the_needed_chunk():
     x = torch.randn(256, 1024, device='cuda', requires_grad=True)
     h, ctx = _segment_forward(host, x, 'seg', manager)
     transfers = [b.transfer for b in ctx.batches]
+    # 1 MiB regions with 256 KiB chunks: a chunk holds at least one region, never two
+    assert all(len(t.chunks) == len(t.regions) > 1 for t in transfers)
+    assert all(c.end > c.start for t in transfers for c in t.chunks)
     _segment_backward(h.float().sum(), 'seg', manager)
-    assert all(len(t._chunk_events) > 1 for t in transfers)
+    assert all(c.buffer is None for t in transfers for c in t.chunks)   # released chunk by chunk
     assert x.grad is not None
 
 
@@ -278,7 +293,7 @@ def test_unpack_before_group_end_commits_on_demand():
 
 @cuda_only
 def test_contexts_are_consumed_fifo_per_segment():
-    host = _Host().cuda(); manager = _manager(prefetch_groups=1)
+    host = _Host().cuda(); manager = _manager(prefetch_groups=1, prefetch_unit='group')
     x0 = torch.randn(64, 256, device='cuda', requires_grad=True)
     x1 = torch.randn(64, 256, device='cuda', requires_grad=True)
     h0, ctx0 = _segment_forward(host, x0, 'seg', manager)
@@ -297,15 +312,22 @@ def test_contexts_are_consumed_fifo_per_segment():
 
 
 @cuda_only
-def test_prefetch_bytes_budget():
-    host = _Host(width=512, depth=4).cuda()
-    manager = _manager(prefetch_groups=0, prefetch_bytes=1)   # 1 byte: exactly one extra group
-    x = torch.randn(64, 512, device='cuda', requires_grad=True)
-    h, ctx = _segment_forward(host, x, 'seg', manager)
-    manager.begin_backward('seg')
-    flags = [b.prefetched for b in ctx.batches]
-    assert flags == [False, False, True, True]
-    h.float().sum().backward(); manager.end_backward(ctx)
+def test_prefetch_bytes_budget_limits_ahead_reloads_only():
+    host = _Host().cuda()
+    manager = _manager(prefetch_bytes=1)          # 1 byte: the demanded execution always loads, nothing ahead
+    x = torch.randn(64, 256, device='cuda', requires_grad=True)
+    h0, ctx0 = _segment_forward(host, x, 'seg', manager)
+    h1, ctx1 = _segment_forward(host, x, 'seg', manager)
+    manager.prefetch_next_backward('seg')
+    popped = manager.begin_backward('seg')
+    assert popped is ctx0 and all(b.prefetched for b in ctx0.batches)
+    assert not any(b.prefetched for b in ctx1.batches)
+    assert offload_stats(reset=False)['reloaded_bytes'] > 0
+    h0.float().sum().backward(); manager.end_backward(popped)
+    ctx = manager.begin_backward('seg')
+    assert all(b.prefetched for b in ctx1.batches)   # demanded now
+    h1.float().sum().backward(); manager.end_backward(ctx)
+    assert offload_stats()['reloaded_bytes'] == 0
 
 
 @cuda_only
@@ -452,13 +474,17 @@ def test_snapshot_and_report_roundtrip():
 
 
 @cuda_only
-def test_gradients_bitwise_identical_with_and_without_offload():
+@pytest.mark.parametrize('knobs', [
+    {}, {'prefetch_unit': 'group'}, {'reload_on_copy_stream': False}, {'commit_bytes': 1},
+    {'copy_chunk_bytes': 4096}, {'dedup_scope': 'context'}, {'prefetch_backwards': 0, 'prefetch_bytes': 1},
+])
+def test_gradients_bitwise_identical_with_and_without_offload(knobs):
     torch.manual_seed(0)
     host = _Host().cuda()
     x = torch.randn(64, 256, device='cuda', requires_grad=True)
 
     def run(offload):
-        manager = _manager() if offload else None
+        manager = _manager(**knobs) if offload else None
         host.zero_grad(); x.grad = None
         if offload:
             h, _ = _segment_forward(host, x, 'seg', manager)
@@ -534,13 +560,31 @@ def test_skipped_forward_drops_its_hint_and_unbalanced_backward_raises():
 
 
 @cuda_only
-def test_announced_next_backward_is_prefetched_once_the_current_one_is_popped():
-    host = _Host().cuda(); manager = _manager(prefetch_groups=1)
+@pytest.mark.parametrize('ahead', [1, 2])
+def test_backward_unit_reloads_announced_executions_ahead(ahead):
+    host = _Host().cuda(); manager = _manager(prefetch_backwards=ahead)
+    x = torch.randn(64, 256, device='cuda', requires_grad=True)
+    runs = [_segment_forward(host, x, 'seg', manager) for _ in range(3)]
+    contexts = [ctx for _, ctx in runs]
+    manager.prefetch_next_backward('seg', 'seg')    # the two backwards after the next one
+    assert not any(b.prefetched for ctx in contexts for b in ctx.batches)
+    popped = manager.begin_backward('seg')
+    assert popped is contexts[0]
+    assert [all(b.prefetched for b in ctx.batches) for ctx in contexts] == [True, True, ahead == 2]
+    for (h, _), ctx in zip(runs, contexts):
+        if ctx is not popped:
+            popped = manager.begin_backward('seg')
+        h.float().sum().backward(); manager.end_backward(popped)
+    assert offload_stats()['pending_contexts'] == 0
+
+
+@cuda_only
+def test_group_unit_announcement_reloads_last_groups_of_the_next_execution():
+    host = _Host().cuda(); manager = _manager(prefetch_groups=1, prefetch_unit='group')
     x = torch.randn(64, 256, device='cuda', requires_grad=True)
     h0, ctx0 = _segment_forward(host, x, 'seg', manager)
     h1, ctx1 = _segment_forward(host, x, 'seg', manager)
-    manager.prefetch_next_backward('seg')        # names the backward *after* the next one
-    assert not ctx1.batches[-1].prefetched       # nothing happens before the current one is popped
+    manager.prefetch_next_backward('seg')
     popped = manager.begin_backward('seg')
     assert popped is ctx0 and ctx0.batches[-1].prefetched and ctx1.batches[-1].prefetched
     assert not ctx1.batches[0].prefetched
@@ -551,7 +595,7 @@ def test_announced_next_backward_is_prefetched_once_the_current_one_is_popped():
 
 @cuda_only
 def test_prefetch_depth_is_exactly_prefetch_groups_ahead():
-    host = _Host(depth=5).cuda(); manager = _manager(prefetch_groups=1)
+    host = _Host(depth=5).cuda(); manager = _manager(prefetch_groups=1, prefetch_unit='group')
     x = torch.randn(64, 256, device='cuda', requires_grad=True)
     h, ctx = _segment_forward(host, x, 'seg', manager)
     manager.begin_backward('seg')
@@ -631,3 +675,120 @@ def test_executor_backward_input_and_weight_release_the_context():
     Executor.backward_weight('seg', host.parameters())
     assert all(p.grad is not None for p in host.parameters())
     assert manager.pool.free_bytes == manager.pool.allocated_bytes  # slabs released after the weight pass
+
+
+# --------------------------------------------------------------------------- transport knobs
+
+@cuda_only
+def test_commit_bytes_flushes_large_groups_early():
+    host = _Host(width=512, depth=2).cuda(); manager = _manager(commit_bytes=64 << 10)
+    x = torch.randn(64, 512, device='cuda', requires_grad=True)
+    h, ctx = _segment_forward(host, x, 'seg', manager)
+    assert all(len(b.transfers) > 1 for b in ctx.batches)
+    assert offload_stats(reset=False)['flushes'] >= len(ctx.batches)
+    _segment_backward(h.float().sum(), 'seg', manager)
+    assert x.grad is not None and offload_stats()['pending_contexts'] == 0
+
+
+@cuda_only
+def test_dedup_scope_context_shares_a_view_saved_by_two_groups():
+    torch.manual_seed(0)
+    host = _Host().cuda()
+    x = torch.randn(64, 256, device='cuda', requires_grad=True)
+
+    def run(manager):
+        host.zero_grad(); x.grad = None
+        ctx = manager.begin_forward('seg') if manager else None
+        h, aux = x, 0.0
+        for i, layer in enumerate(host.layers):
+            if manager:
+                with CPUOffloadContext(host, group_id=i):
+                    h = layer(h)                                  # saves its input
+                    aux = aux + torch.nn.functional.gelu(h).float().sum()   # saves h ...
+            else:
+                h = layer(h)
+                aux = aux + torch.nn.functional.gelu(h).float().sum()
+        # ... and the next group's linear saves the same h again
+        loss = h.float().sum() + aux
+        if manager:
+            manager.end_forward(ctx)
+            _segment_backward(loss, 'seg', manager)
+        else:
+            loss.backward()
+        return x.grad.clone(), [p.grad.clone() for p in host.parameters()]
+
+    ref = run(None)
+    for scope in ('group', 'context'):
+        out = run(_manager(dedup_scope=scope))
+        stats = offload_stats()
+        assert torch.equal(out[0], ref[0]) and all(torch.equal(a, b) for a, b in zip(out[1], ref[1]))
+        if scope == 'context':
+            assert stats['shared_bytes'] == 2 * 64 * 256 * 4      # h of layers 0 and 1
+        else:
+            assert stats['shared_bytes'] == 0
+
+
+@cuda_only
+def test_pool_trim_releases_idle_slabs():
+    pool = PinnedPool()
+    stream = torch.cuda.Stream()
+    a = pool.acquire(1 << 20, stream); b = pool.acquire(4 << 20, stream)
+    pool.release(a, None); pool.release(b, None)
+    assert pool.trim(idle_ticks=0) == 0 and pool.allocated_bytes == pool.free_bytes > 0   # tick 1
+    assert pool.trim(idle_ticks=2) == 0 and pool.allocated_bytes > 0                        # tick 2: idle 2, not > 2
+    released = pool.trim(idle_ticks=2)                                                      # tick 3: idle 3 > 2
+    assert released == pool.slab_size(1 << 20) + pool.slab_size(4 << 20)
+    assert pool.allocated_bytes == 0 and pool.free_bytes == 0 and pool.trimmed == 2
+
+
+# --------------------------------------------------------------------------- stream ordering
+
+def _slow_stream(stream, cycles=400_000_000):
+    """Queue ~0.2 s of GPU work on ``stream`` so copies issued on it after this call land late."""
+    with torch.cuda.stream(stream):
+        torch.cuda._sleep(cycles)
+
+
+@cuda_only
+@pytest.mark.parametrize('unit', ['backward', 'group'])
+def test_consumer_waits_for_a_late_reload(unit):
+    """The reload copy is delayed behind other work on the H2D stream; the consumer must still see the bytes."""
+    torch.manual_seed(0)
+    host = _Host(width=1024, depth=2).cuda()
+    x = torch.randn(512, 1024, device='cuda', requires_grad=True)
+    reference = _run_reference(host, x).float().square().mean()
+    reference.backward(); ref_grad = x.grad.clone(); x.grad = None; host.zero_grad()
+    manager = _manager(prefetch_unit=unit)
+    h, ctx = _segment_forward(host, x, 'seg', manager)
+    torch.cuda.synchronize()
+    _slow_stream(manager.engine.h2d_stream)             # every reload issued from now on lands ~0.2 s late
+    _segment_backward(h.float().square().mean(), 'seg', manager)
+    torch.cuda.synchronize()
+    assert torch.equal(x.grad, ref_grad)
+    assert offload_stats()['stalls'] > 0                 # the consumer did have to wait
+
+
+@cuda_only
+def test_released_reload_buffers_are_not_reused_under_pending_reads():
+    """A reload buffer freed while the consumer still reads it must not be overwritten by the next reload."""
+    host = _Host(width=1024, depth=1).cuda(); manager = _manager()
+    x = torch.randn(1024, 1024, device='cuda', requires_grad=True)
+    ctx = manager.begin_forward('seg')
+    with CPUOffloadContext(host, group_id=0) as context:
+        y = host.layers[0](x)                              # saves x (4 MiB)
+    manager.end_forward(ctx)
+    saved = context.batch.handles[0]
+    popped = manager.begin_backward('seg')
+    view = saved.unpack()                                  # consumer: reload fetched on the current stream
+    _slow_stream(torch.cuda.current_stream())              # ... and read late
+    copy = view.clone()                                    # the late read
+    del view
+    manager.end_backward(popped)                           # buffers released while the read is pending
+    # the next reload goes through the same allocator pool and would overwrite a reused block
+    ctx2 = manager.begin_forward('seg')
+    with CPUOffloadContext(host, group_id=0):
+        z = host.layers[0](x * 2)
+    manager.end_forward(ctx2)
+    _segment_backward(z.float().sum(), 'seg', manager)
+    torch.cuda.synchronize()
+    assert torch.equal(copy, x)

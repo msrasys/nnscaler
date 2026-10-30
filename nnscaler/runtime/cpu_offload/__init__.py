@@ -26,13 +26,13 @@ See ``docs/source/cpu_offloading.md`` for the design and the tuning workflow.
 
 from typing import Any, Dict, Optional
 
-from .config import OffloadConfig, FAKE_MODES, COMM_EXCLUSIVE_MODES
+from .config import OffloadConfig, FAKE_MODES, COMM_EXCLUSIVE_MODES, PREFETCH_UNITS, DEDUP_SCOPES
 from .hooks import CPUOffloadContext, OffloadedTensor, ModuleTensorRef, covered_bytes, element_size
 from .host_memory import PinnedPool, MemPolicy, gpu_numa_info, bind_to_gpu_numa
 from .manager import OffloadManager
 from .stats import OffloadStats, GroupProfile, SizeHistogram, all_rank_max, format_summary
 from .tracker import ExecutionTracker, ExecContext, OffloadBatch
-from .transport import CopyEngine, Transfer, Region, D2H_STREAM_NAME, H2D_STREAM_NAME
+from .transport import CopyEngine, Transfer, Region, Chunk, D2H_STREAM_NAME, H2D_STREAM_NAME
 
 __all__ = [
     'OffloadConfig', 'OffloadManager', 'CPUOffloadContext', 'comm_exclusive',
@@ -67,11 +67,11 @@ def hint_forward(name: str, backward_distance: int) -> None:
         manager.hint_forward(name, backward_distance)
 
 
-def prefetch_next_backward(name: str) -> None:
-    """Generated schedule code: the next backward will be segment ``name``."""
+def prefetch_next_backward(*names: str) -> None:
+    """Generated schedule code: the backwards following the one about to run, in order."""
     manager = _active_manager()
     if manager is not None:
-        manager.prefetch_next_backward(name)
+        manager.prefetch_next_backward(*names)
 
 
 class comm_exclusive:

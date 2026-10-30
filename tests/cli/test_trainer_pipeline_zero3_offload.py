@@ -163,14 +163,22 @@ def test_trainer_pipeline_zero3_cpu_offload(tmp_path):
     # transport knobs that change how bytes move
     base_env = {'CPU_OFFLOADING_MIN_BYTES': '0', 'CPU_OFFLOADING_NUMA_MEMBIND': '0'}
     for run_name, env, policy in (
+        # defaults: whole segment executions reloaded one backward ahead
         ('cpu_offload', {}, 'pipeline_zero3_cpu_offload_policy'),
-        ('cpu_offload_chunked_window', {'CPU_OFFLOADING_MIN_BACKWARD_DISTANCE': '0',
-                                        'CPU_OFFLOADING_COPY_CHUNK_MB': '0.001',
-                                        'CPU_OFFLOADING_MAX_INFLIGHT_COPIES': '1',
-                                        'CPU_OFFLOADING_PREFETCH_GROUPS': '0',
-                                        'CPU_OFFLOADING_PREFETCH_MB': '0.01'},
+        # group-level lookahead with tiny chunks, one transfer in flight and a 10 KB reload budget
+        ('cpu_offload_group_chunked_window', {'CPU_OFFLOADING_MIN_BACKWARD_DISTANCE': '0',
+                                              'CPU_OFFLOADING_PREFETCH_UNIT': 'group',
+                                              'CPU_OFFLOADING_COPY_CHUNK_MB': '0.001',
+                                              'CPU_OFFLOADING_MAX_INFLIGHT_COPIES': '1',
+                                              'CPU_OFFLOADING_PREFETCH_GROUPS': '0',
+                                              'CPU_OFFLOADING_PREFETCH_MB': '0.01'},
          'pipeline_zero3_cpu_offload_policy'),
-        ('recompute_offload', {'CPU_OFFLOADING_MIN_BACKWARD_DISTANCE': '0'},
+        # recompute + offload, two backwards ahead, early flushes and cross-group sharing
+        ('recompute_offload', {'CPU_OFFLOADING_MIN_BACKWARD_DISTANCE': '0',
+                               'CPU_OFFLOADING_PREFETCH_BACKWARDS': '2',
+                               'CPU_OFFLOADING_COMMIT_MB': '0.0005',
+                               'CPU_OFFLOADING_DEDUP_SCOPE': 'context',
+                               'CPU_OFFLOADING_RELOAD_ON_COPY_STREAM': '0'},
          'pipeline_zero3_recompute_offload_policy'),
     ):
         launch_torchrun(
@@ -182,5 +190,8 @@ def test_trainer_pipeline_zero3_cpu_offload(tmp_path):
             {**base_env, **env},
         )
         cpu_offload = torch.load(tmp_path / f'{run_name}.pt', weights_only=False)
-        assert_equal(cpu_offload['model'], baseline['model'])
-        assert_equal(cpu_offload['optimizer'], baseline['optimizer'])
+        try:
+            assert_equal(cpu_offload['model'], baseline['model'])
+            assert_equal(cpu_offload['optimizer'], baseline['optimizer'])
+        except AssertionError as error:
+            raise AssertionError(f'{run_name} ({env}) differs from the baseline: {error}') from None

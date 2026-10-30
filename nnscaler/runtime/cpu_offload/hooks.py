@@ -72,7 +72,7 @@ class OffloadedTensor:
         tensor = bytes_.view(self.dtype).as_strided(self.shape, self.stride)
         if not self.consumed:
             self.consumed = True
-            self.transfer.view_consumed()
+            self.transfer.view_consumed(self)
         return tensor
 
 

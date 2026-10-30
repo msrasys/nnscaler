@@ -232,10 +232,10 @@ class ScheduleCodeGen(FuncEmission):
                     'fallback_vars_by_mid': {},
                 }
                 pending_async_recvs = {}
-                # CPU offloading: tell the runtime which segment's backward
-                # comes next so its saved tensors are prefetched while the
-                # current backward is still computing.
-                next_backward_name: Dict[int, str] = {}
+                # CPU offloading: tell the runtime which segments' backwards
+                # follow each backward so their saved tensors are reloaded
+                # (``prefetch_backwards`` of them) while it is still computing.
+                following_backwards: Dict[int, List[str]] = {}
                 # forward line -> number of segment executions between this
                 # forward and its own backward (same segment, same micro-batch)
                 forward_backward_distance: Dict[int, int] = {}
@@ -247,8 +247,10 @@ class ScheduleCodeGen(FuncEmission):
                         (line, self.node_name((node.cell if isinstance(node, ExeReuseCell) else node).mirror))
                         for line, node in enumerate(device_nodes) if _is_backward_segment(node)
                     ]
-                    for (line, _), (_, nxt_name) in zip(backward_lines, backward_lines[1:]):
-                        next_backward_name[line] = nxt_name
+                    for pos, (line, _) in enumerate(backward_lines):
+                        names = [nxt for _, nxt in backward_lines[pos + 1:pos + 1 + self._OFFLOAD_ANNOUNCE_DEPTH]]
+                        if names:
+                            following_backwards[line] = names
                     segment_lines = [
                         line for line, node in enumerate(device_nodes)
                         if _is_forward_segment(node) or _is_backward_segment(node)
@@ -290,10 +292,10 @@ class ScheduleCodeGen(FuncEmission):
                         )
                     elif use_scheduler and isinstance(unwrap_node, IRWeightReducer):
                         _append_code(fb, 'nnscaler.flags.RuntimeFlag.skip_reducer = False')
-                    if line in next_backward_name:
+                    if line in following_backwards:
                         _append_code(fb,
                             'nnscaler.runtime.cpu_offloading.prefetch_next_backward('
-                            f'{next_backward_name[line]!r})')
+                            f'{", ".join(repr(n) for n in following_backwards[line])})')
                     if line in forward_backward_distance:
                         _append_code(fb,
                             'nnscaler.runtime.cpu_offloading.hint_forward('
@@ -824,6 +826,9 @@ class ScheduleCodeGen(FuncEmission):
             return [f'{fsig}(model, {repr(hook_meta)}, {inputs_str}, {kwargs})']
         else:
             return [f'{fsig}(model, {repr(hook_meta)}, {inputs_str}, {kwargs}, {outputs_str})']
+
+    # how many upcoming backwards each ``prefetch_next_backward`` hint names
+    _OFFLOAD_ANNOUNCE_DEPTH = 8
 
     def _graph_has_offload(self) -> bool:
         """Whether any forward operator of the plan is in a CPU offload group."""

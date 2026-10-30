@@ -138,8 +138,8 @@ class PinnedPool:
     ALIGN = 512
 
     def __init__(self, max_bytes: int = 0, mempolicy: Optional[MemPolicy] = None) -> None:
-        # sorted by size: (nbytes, buf, event-of-last-reader)
-        self._free: List[Tuple[int, torch.Tensor, Optional[torch.cuda.Event]]] = []
+        # sorted by size: (nbytes, buf, event-of-last-reader, tick released)
+        self._free: List[Tuple[int, torch.Tensor, Optional[torch.cuda.Event], int]] = []
         self._sizes: List[int] = []
         self._lock = threading.Lock()
         self.max_bytes = max_bytes
@@ -148,6 +148,8 @@ class PinnedPool:
         self.free_bytes = 0
         self.allocations = 0
         self.waits = 0
+        self.trimmed = 0
+        self._tick = 0             # advanced by :meth:`trim` (once per step)
 
     @classmethod
     def slab_size(cls, nbytes: int) -> int:
@@ -157,7 +159,7 @@ class PinnedPool:
         return (nbytes + quantum - 1) // quantum * quantum
 
     def _take(self, index: int) -> torch.Tensor:
-        size, buf, _ = self._free.pop(index)
+        size, buf, _, _ = self._free.pop(index)
         del self._sizes[index]
         self.free_bytes -= size
         return buf
@@ -190,8 +192,33 @@ class PinnedPool:
         with self._lock:
             index = bisect.bisect_right(self._sizes, size)
             self._sizes.insert(index, size)
-            self._free.insert(index, (size, buf, event))
+            self._free.insert(index, (size, buf, event, self._tick))
             self.free_bytes += size
+
+    def trim(self, idle_ticks: int) -> int:
+        """Advance the clock; free slabs unused for more than ``idle_ticks`` ticks (``0`` = never).
+
+        Returns the bytes released.  Slabs whose last reader has not finished are kept.
+        """
+        released = 0
+        with self._lock:
+            self._tick += 1
+            if not idle_ticks:
+                return 0
+            keep = []
+            for entry in self._free:
+                size, _, event, tick = entry
+                if self._tick - tick > idle_ticks and (event is None or event.query()):
+                    released += size
+                    self.trimmed += 1
+                else:
+                    keep.append(entry)
+            if released:
+                self._free = keep
+                self._sizes = [e[0] for e in keep]
+                self.free_bytes -= released
+                self.allocated_bytes -= released
+        return released
 
     def clear(self) -> None:
         with self._lock:

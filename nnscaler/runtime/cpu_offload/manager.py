@@ -94,8 +94,8 @@ class OffloadManager:
     def hint_forward(self, name: str, backward_distance: int) -> None:
         self.tracker.hint_forward(name, backward_distance)
 
-    def prefetch_next_backward(self, name: str) -> None:
-        self.tracker.prefetch_next_backward(name)
+    def prefetch_next_backward(self, *names: str) -> None:
+        self.tracker.prefetch_next_backward(*names)
 
     def forward_skipped(self, name: str) -> None:
         self.tracker.forward_skipped(name)
@@ -116,20 +116,22 @@ class OffloadManager:
     def debug_group_done(self, group_id: Optional[int], batch: OffloadBatch) -> None:
         if self.config.debug and group_id not in self._debugged_groups:
             self._debugged_groups.add(group_id)
-            transfer = batch.transfer
             _logger.info(
-                f'[cpu_offload] group {group_id}: {len(transfer.handles)} saved tensors, '
-                f'{len(transfer.regions)} regions, {transfer.nbytes / 2**20:.1f} MiB offloaded')
+                f'[cpu_offload] group {group_id}: {batch.tensors} saved tensors, '
+                f'{sum(len(t.regions) for t in batch.transfers)} regions in {len(batch.transfers)} transfer(s), '
+                f'{batch.nbytes / 2**20:.1f} MiB offloaded')
 
     def snapshot(self, reset: bool = True) -> Dict[str, Any]:
         """Counters since the last snapshot (trainers call this once per step)."""
         if self.config.timing:
             backlog = self.timing.collect(self.stats, self.groups)
             self.stats.d2h_backlog_bytes = backlog + self.engine.pending_d2h_bytes()
+        self.stats.pool_trimmed_bytes = self.pool.trim(self.config.pool_trim_steps)
         self.stats.pool_allocated_bytes = self.pool.allocated_bytes
         self.stats.pool_allocations = self.pool.allocations
         self.stats.pool_waits = self.pool.waits - self._pool_waits_seen
         self._pool_waits_seen = self.pool.waits
+        self.stats.reloaded_bytes = self.engine.reloaded_bytes
         self.stats.pending_contexts, self.stats.pending_bytes = self.tracker.pending_summary()
         data = self.stats.as_dict()
         if reset:

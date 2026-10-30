@@ -82,7 +82,9 @@ class OffloadStats:
     deduplicated_bytes: int = 0  # bytes of saved views that overlapped another saved view
     skipped_small_bytes: int = 0
     skipped_late_bytes: int = 0  # saved after a backward inside the group shipped its transfer
-    transfers: int = 0           # offload group executions that moved bytes
+    shared_bytes: int = 0        # served by the previous group's transfer (dedup_scope=context)
+    transfers: int = 0           # transfers that moved bytes (groups, or flushed slices of groups)
+    flushes: int = 0             # early commits caused by commit_bytes
     # reload
     prefetched_regions: int = 0
     prefetched_bytes: int = 0
@@ -104,14 +106,16 @@ class OffloadStats:
     stall_ms: float = 0.0        # compute stream waiting for reloads
     d2h_ms: float = 0.0          # summed D2H copy durations
     h2d_ms: float = 0.0          # summed H2D copy durations
+    pool_trimmed_bytes: int = 0  # pinned slabs released by pool_trim_steps this step
     # gauges sampled at snapshot time (not reset, not summed into profiles)
     d2h_backlog_bytes: int = 0   # bytes whose D2H had not finished when sampled
+    reloaded_bytes: int = 0      # reloaded and not yet consumed (prefetch_bytes gauge)
     pool_allocated_bytes: int = 0
     pool_allocations: int = 0
     pending_contexts: int = 0
     pending_bytes: int = 0
 
-    _NOT_RESET = ('d2h_backlog_bytes', 'pool_allocated_bytes', 'pool_allocations',
+    _NOT_RESET = ('d2h_backlog_bytes', 'reloaded_bytes', 'pool_allocated_bytes', 'pool_allocations',
                   'pending_contexts', 'pending_bytes')
 
     def reset(self) -> None:
@@ -192,7 +196,8 @@ def format_summary(groups: Dict[int, GroupProfile], steps: int, stats_total: Off
         f'[cpu_offload] profile over {steps} step(s): '
         f'{stats_total.offloaded_bytes / steps / 2**30:.2f} GiB/step offloaded in '
         f'{stats_total.transfers / steps:.0f} transfers / {stats_total.offloaded_regions / steps:.0f} regions '
-        f'({stats_total.packed_tensors / steps:.0f} saved tensors), '
+        f'({stats_total.packed_tensors / steps:.0f} saved tensors, '
+        f'{stats_total.deduplicated_bytes / steps / 2**30:.2f} GiB shared), '
         f'D2H {stats_total.d2h_ms / steps / 1000:.2f} s/step '
         f'({_rate(stats_total.offloaded_bytes, stats_total.d2h_ms)} GB/s), '
         f'H2D {stats_total.h2d_ms / steps / 1000:.2f} s/step '

@@ -9,15 +9,18 @@ The order comes from execution contexts, not from guessing:
   executed inside are recorded in forward order and the finished context is
   queued per segment name (FIFO).
 * ``Executor.backward(name)`` pops the oldest pending context of ``name``.
-  Within a context groups are consumed in reverse forward order, so the groups
-  preceding the demanded one are prefetched.
+  Within a context groups are consumed in reverse forward order.
 
 Both facts hold for 1F1B, interleaved 1F1B and gradient accumulation, so no
-warm-up iteration is needed.  Each batch owns one :class:`~.transport.Transfer`
-that is committed when its group ends and prefetched as a unit.  The scheduler code generator refines this with
-two hints: ``hint_forward(name, distance)`` (how far away the own backward is)
-and ``prefetch_next_backward(name)`` (which backward comes next).  Without an
-executor (eager use) batches fall back to a creation-order chain.
+warm-up iteration is needed.  The scheduler code generator adds two hints from
+the static schedule: ``hint_forward(name, distance)`` (how far away the own
+backward is) and ``prefetch_next_backward(*names)`` (the backwards that follow
+the one about to run).  With ``prefetch_unit=backward`` a segment execution is
+reloaded as a whole and ``prefetch_backwards`` announced executions are
+reloaded ahead, within the ``prefetch_bytes`` budget; with
+``prefetch_unit=group`` groups inside the running execution are reloaded
+``prefetch_groups`` ahead of demand.  Without an executor (eager use) batches
+fall back to a creation-order chain.
 """
 
 from __future__ import annotations
@@ -30,13 +33,19 @@ from typing import Deque, Dict, List, Optional, Tuple
 import torch
 
 from .config import OffloadConfig
-from .hooks import OffloadedTensor
+from .hooks import OffloadedTensor, covered_bytes
 from .stats import GroupProfile, OffloadStats
 from .transport import CopyEngine, Transfer
 
 
 class OffloadBatch:
-    """Saved tensors of one execution of one offload group (owns one :class:`Transfer`)."""
+    """Saved tensors of one execution of one offload group.
+
+    Owns one :class:`~.transport.Transfer`, or several when ``commit_bytes``
+    flushes the group early.  With ``dedup_scope=context`` a view already
+    shipped by the previous group of the same segment execution is served from
+    that group's transfer instead of being copied again.
+    """
 
     last_batch: Optional[weakref.ReferenceType['OffloadBatch']] = None
 
@@ -45,47 +54,105 @@ class OffloadBatch:
         self.tracker = tracker
         self.group_id = group_id
         self.context = context
+        self.device = device
         self.index = -1
-        self.transfer: Transfer = tracker.engine.new_transfer(group_id, device)
-        self.transfer.owner = self
+        self.tensors = 0
         self.prefetched = False
         self.released = False
+        self.transfers: List[Transfer] = []
+        self._open()
         self.previous: Optional[weakref.ReferenceType['OffloadBatch']] = (
             OffloadBatch.last_batch if context is None else None)
 
+    def _open(self) -> Transfer:
+        transfer = self.tracker.engine.new_transfer(self.group_id, self.device)
+        transfer.owner = self
+        # sources stay until the next group committed so its saved views can be matched exactly
+        transfer.hold_src = self.tracker.config.dedup_scope == 'context' and self.context is not None
+        self.transfers.append(transfer)
+        return transfer
+
+    @property
+    def transfer(self) -> Transfer:
+        return self.transfers[-1]
+
     @property
     def nbytes(self) -> int:
-        return self.transfer.nbytes
+        return sum(t.nbytes for t in self.transfers)
 
     @property
     def handles(self) -> List[OffloadedTensor]:
-        return self.transfer.handles
+        return [h for t in self.transfers for h in t.handles]
+
+    @property
+    def has_regions(self) -> bool:
+        return any(t.regions for t in self.transfers)
 
     def append(self, tensor: torch.Tensor) -> OffloadedTensor:
         self.tracker.stats.packed_tensors += 1
-        return self.transfer.add(tensor)
+        self.tensors += 1
+        shared = self._shared(tensor)
+        if shared is not None:
+            return shared
+        current = self.transfer
+        commit_bytes = self.tracker.config.commit_bytes
+        if commit_bytes and current.handles and current.pending_bytes >= commit_bytes:
+            current.commit()                     # flush: the copy overlaps the rest of the group
+            self.tracker.stats.flushes += 1
+            current = self._open()
+        return current.add(tensor)
+
+    def _shared(self, tensor: torch.Tensor) -> Optional[OffloadedTensor]:
+        """A handle served by the previous group's transfer, when it already holds these bytes."""
+        if self.tracker.config.dedup_scope != 'context' or self.context is None or self.index <= 0:
+            return None
+        lo, hi = covered_bytes(tensor)
+        if hi == lo:
+            return None
+        ptr = tensor.untyped_storage().data_ptr()
+        for transfer in self.context.batches[self.index - 1].transfers:
+            region = transfer.find_region(ptr, lo, hi)
+            if region is not None:
+                handle = OffloadedTensor(transfer, tensor.dtype, tuple(tensor.shape), tuple(tensor.stride()), lo, hi)
+                transfer.share(handle, region)
+                stats = self.tracker.stats
+                stats.shared_bytes += hi - lo
+                stats.deduplicated_bytes += hi - lo
+                return handle
+        return None
 
     def done(self) -> None:
         """The group ended: commit the transfer (regions laid out, D2H scheduled)."""
         self.transfer.commit()
+        if len(self.transfers) > 1 and not self.transfer.handles:
+            self.transfers.pop()
+        if self.context is not None and self.index > 0:
+            self.context.batches[self.index - 1].release_sources()
         self.tracker.engine.pump()
         profile = self.tracker.groups[self.group_id if self.group_id is not None else -1]
         profile.executions += 1
-        profile.tensors += len(self.transfer.handles)
-        if self.transfer.regions and self.context is None:
+        profile.tensors += self.tensors
+        profile.regions += sum(len(t.regions) for t in self.transfers)
+        if self.has_regions and self.context is None:
             OffloadBatch.last_batch = weakref.ref(self)
+
+    def release_sources(self) -> None:
+        for transfer in self.transfers:
+            transfer.drop_sources()
 
     def prefetch(self) -> None:
         if self.prefetched or self.released:
             return
         self.prefetched = True
-        self.transfer.prefetch()
+        for transfer in reversed(self.transfers):     # last saved = first needed
+            transfer.prefetch()
 
     def release(self) -> None:
         if self.released:
             return
         self.released = True
-        self.transfer.release()
+        for transfer in self.transfers:
+            transfer.release()
 
 
 class ExecContext:
@@ -96,6 +163,7 @@ class ExecContext:
         self.seq = seq
         self.batches: List[OffloadBatch] = []
         self.offload_enabled = True
+        self.prefetched = False
 
     def add(self, batch: OffloadBatch) -> None:
         batch.index = len(self.batches)
@@ -104,6 +172,12 @@ class ExecContext:
     @property
     def nbytes(self) -> int:
         return sum(b.nbytes for b in self.batches)
+
+    def prefetch(self) -> None:
+        """Reload the whole execution, the groups needed first going first."""
+        self.prefetched = True
+        for batch in reversed(self.batches):
+            batch.prefetch()
 
     def release(self) -> None:
         for batch in self.batches:
@@ -132,7 +206,8 @@ class ExecutionTracker:
         self._pending: Dict[str, Deque[ExecContext]] = collections.defaultdict(collections.deque)
         self._backward_stack: List[ExecContext] = []
         self._next_forward_distance: Dict[str, int] = {}
-        self._announced_backward: Optional[str] = None
+        self._announced: List[str] = []       # segment names of the backwards that follow
+        self._announced_done = True
 
     # -- hints from generated code ------------------------------------------
     def hint_forward(self, name: str, backward_distance: int) -> None:
@@ -145,24 +220,22 @@ class ExecutionTracker:
         with self._lock:
             self._next_forward_distance.pop(name, None)
 
-    def prefetch_next_backward(self, name: str) -> None:
-        """The next backward to start is segment ``name``.
+    def prefetch_next_backward(self, *names: str) -> None:
+        """The backwards that follow the one about to run, in order.
 
-        Called inside a running backward, the head of ``name``'s queue is that
-        backward's context and its last groups are reloaded now.  Called before
-        the current backward started (the scheduler emits the hint just before
-        the backward call), the announcement is acted upon in
-        :meth:`begin_backward` once the current context has been popped.
+        Called inside a running backward, the heads of the named queues are
+        those backwards and the first ``prefetch_backwards`` of them are
+        reloaded now.  Called before the current backward started (the scheduler
+        emits the hint just before the backward call), the announcement is acted
+        upon in :meth:`begin_backward` once the current context has been popped.
         """
         self.engine.pump()
         with self._lock:
-            if not self._backward_stack:
-                self._announced_backward = name
-                return
-            queue = self._pending.get(name)
-            ctx = queue[0] if queue else None
-        if ctx is not None and ctx.batches:
-            self._prefetch_from(ctx, len(ctx.batches) - 1, include_self=True)
+            self._announced = list(names)
+            self._announced_done = not names
+            inside = bool(self._backward_stack)
+        if inside:
+            self._prefetch_announced()
 
     # -- executor callbacks ---------------------------------------------------
     def begin_forward(self, name: str) -> ExecContext:
@@ -176,6 +249,8 @@ class ExecutionTracker:
         return ctx
 
     def end_forward(self, ctx: ExecContext) -> None:
+        if ctx.batches:
+            ctx.batches[-1].release_sources()     # no next group will share them
         self.engine.pump()
         with self._lock:
             assert self._forward_stack and self._forward_stack[-1] is ctx, 'unbalanced begin/end_forward'
@@ -197,14 +272,8 @@ class ExecutionTracker:
                     f'CPU offloading: segment {name!r} backward #{expected} got forward #{ctx.seq}; '
                     'the tracker is out of sync with the executor')
             self._backward_stack.append(ctx)
-            announced = self._announced_backward
-            self._announced_backward = None
-            next_queue = self._pending.get(announced) if announced is not None else None
-            next_ctx = next_queue[0] if next_queue else None
-        if ctx.batches:
-            self._prefetch_from(ctx, len(ctx.batches) - 1, include_self=True)
-        if next_ctx is not None and next_ctx.batches:
-            self._prefetch_from(next_ctx, len(next_ctx.batches) - 1, include_self=True)
+        self._reload_demanded(ctx)
+        self._prefetch_announced()
         return ctx
 
     def end_backward(self, ctx: Optional[ExecContext]) -> None:
@@ -238,9 +307,7 @@ class ExecutionTracker:
             return
         self.engine.pump()
         ctx = batch.context
-        if ctx is not None:
-            self._prefetch_from(ctx, batch.index, include_self=True)
-        else:
+        if ctx is None:
             batch.prefetch()
             previous = batch.previous() if batch.previous is not None else None
             count = self.config.prefetch_groups
@@ -248,35 +315,79 @@ class ExecutionTracker:
                 previous.prefetch()
                 count -= 1
                 previous = previous.previous() if previous.previous is not None else None
+            return
+        if self.config.prefetch_unit == 'group':
+            self._prefetch_from(ctx, batch.index, include_self=True)
+        else:
+            batch.prefetch()                       # demanded; normally issued with its context
+        if not self._announced_done:
+            self._prefetch_announced()             # budget may have room now
 
     # -- prefetch policy -----------------------------------------------------
-    def _prefetch_from(self, ctx: ExecContext, index: int, *, include_self: bool) -> None:
-        """Reload ``ctx.batches[index]`` (if ``include_self``) and the groups before it.
+    def _reload_demanded(self, ctx: ExecContext) -> None:
+        """The backward of ``ctx`` starts: its saved tensors are needed now."""
+        if not ctx.batches:
+            return
+        if self.config.prefetch_unit == 'backward':
+            ctx.prefetch()
+        else:
+            self._prefetch_from(ctx, len(ctx.batches) - 1, include_self=True)
 
-        The depth is ``prefetch_groups`` groups beyond ``index``, or when
-        ``prefetch_bytes`` is set, as many groups as fit into that many bytes
-        (at least one).  Groups that saved nothing cost no budget.
+    def _prefetch_announced(self) -> None:
+        """Reload the announced upcoming backwards ahead of demand, within the budget."""
+        with self._lock:
+            names = list(self._announced)
+            if not names:
+                self._announced_done = True
+                return
+            # the i-th announced occurrence of a name is the i-th pending context of that name
+            offsets: Dict[str, int] = collections.defaultdict(int)
+            contexts: List[ExecContext] = []
+            for name in names:
+                queue = self._pending.get(name)
+                position = offsets[name]
+                offsets[name] += 1
+                if queue is not None and position < len(queue):
+                    contexts.append(queue[position])
+        unit = self.config.prefetch_unit
+        ahead = self.config.prefetch_backwards if unit == 'backward' else 1
+        done = True
+        for ctx in contexts[:ahead]:
+            if ctx.prefetched or not ctx.batches:
+                continue
+            if not self.engine.within_reload_budget():
+                done = False
+                break
+            if unit == 'backward':
+                ctx.prefetch()
+            else:
+                self._prefetch_from(ctx, len(ctx.batches) - 1, include_self=True)
+                ctx.prefetched = True
+        with self._lock:
+            self._announced_done = done
+
+    def _prefetch_from(self, ctx: ExecContext, index: int, *, include_self: bool) -> None:
+        """Reload ``ctx.batches[index]`` (if ``include_self``) and ``prefetch_groups`` groups before it.
+
+        Groups that saved nothing cost nothing; the ``prefetch_bytes`` budget
+        stops the lookahead (the demanded group always loads).
         """
         budget_groups = self.config.prefetch_groups
-        budget_bytes = self.config.prefetch_bytes
-        taken_groups = 0
-        taken_bytes = 0
+        taken = 0
         for i in range(index, -1, -1):
             batch = ctx.batches[i]
             if i == index:
                 if include_self:
                     batch.prefetch()
                 continue
-            if not batch.transfer.regions:
+            if not batch.has_regions or batch.prefetched:
+                if batch.prefetched:
+                    taken += 1
                 continue
-            if budget_bytes:
-                if taken_groups and taken_bytes >= budget_bytes:
-                    break
-            elif taken_groups >= budget_groups:
+            if taken >= budget_groups or not self.engine.within_reload_budget():
                 break
             batch.prefetch()
-            taken_groups += 1
-            taken_bytes += batch.nbytes
+            taken += 1
 
     # -- state ----------------------------------------------------------------
     def pending_summary(self) -> Tuple[int, int]:
