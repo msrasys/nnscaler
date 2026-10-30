@@ -113,6 +113,17 @@ def ckpt_path_epoch_restored_worker(tmp_path):
         assert state["global_step"] + model.num_batches_seen == trainer.global_step
         assert model.num_on_load_checkpoint_called == 1
 
+    # validating from a training checkpoint has no optimizer; its saved optimizer state must be dropped
+    model = TestModel()
+    trainer = Trainer(
+        default_root_dir=tmp_path,
+        enable_progress_bar=False,
+        strategy=NnScalerStrategy(compute_config=compute_config, pas_policy='tp', gen_savedir=tmp_path),
+        plugins=[NnScalerPrecision('32-true')]
+    )
+    trainer.validate(model, ckpt_path=checkpoints[-1])
+    assert model.num_on_load_checkpoint_called == 1
+
 
 @pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.device_count() < 2, reason='lack of gpu devices')
 def test_ckpt_path_epoch_restored(tmp_path):

@@ -9,7 +9,7 @@ import logging
 
 import torch
 
-from nnscaler.runtime.serialization import load, save
+from nnscaler.runtime.serialization import load, save, torch_load, torch_save
 
 
 logger = logging.getLogger(__name__)
@@ -129,11 +129,11 @@ def make_hybrid_serialization_runner(
 
 
 def _torch_load(f: str | Path, *, device='cpu') -> Any:
-    return torch.load(f, map_location=device, weights_only=False)
+    return torch_load(f, map_location=device, weights_only=False)
 
 
 def _torch_save(obj: Any, f: str | Path) -> None:
-    torch.save(obj, f)
+    torch_save(obj, f)
 
 
 class Checkpointer:

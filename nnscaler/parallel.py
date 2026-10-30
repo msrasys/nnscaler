@@ -5,7 +5,7 @@ from concurrent.futures import ProcessPoolExecutor
 from enum import Enum
 from functools import partial
 import types
-from typing import Callable, Any, Dict, Iterable, Optional, Tuple, Type, Union, TypeVar, List, Set, Literal
+from typing import Callable, Any, Dict, Iterable, Mapping, Optional, Tuple, Type, Union, TypeVar, List, Set, Literal
 from pathlib import Path
 import inspect
 import sys
@@ -47,6 +47,7 @@ from nnscaler.ir.unique import IDGenerator
 
 from nnscaler.runtime.adapter.reducer import Bucket, Reducer, ParamBucketConfig
 from nnscaler.runtime.device import DeviceGroup
+from nnscaler.runtime.checkpoint import align_state_dict_names, load_from_rank_state_dicts, slice_tensor  # re-exported by nnscaler, except slice_tensor
 from nnscaler.runtime.initialization import (
     create_init_module, create_shard_init_weights,
 )
@@ -1548,9 +1549,15 @@ class OptimizerExtraState:
         non_parallel parameters will become a virtual ParallelModule,
         and its information will also be saved in `parallel_module_locs` and `parallel_module_configs`
 
-        non_parallel_extra_state: the extra state for non-parallel modules
-            (equivalent to the data saved as key `ParallelModule.EXTRA_STATE_KEY` in state dict)
-        non_parallel_param_locs: the parameter locations for non-parallel parameters.
+        non_parallel_extra_state: extra state of the virtual ParallelModule that wraps the
+            trainable non-parallel parameters when ZeRO is applied to them (an `ExtraState`,
+            the same content a ParallelModule stores under `ParallelModule.EXTRA_STATE_KEY`).
+        non_parallel_param_locs: indices of the trainable non-parallel parameters in
+            `module.parameters()` order, i.e. their positions in the merged (non-ZeRO) optimizer state.
+
+        Both are None unless ZeRO is applied to non-parallel parameters, which requires
+        `compute_config.use_zero`, `plan_ngpus != runtime_ngpus`, and at least one non-empty
+        non-parallel parameter. Non-parallel parameters only use ZeRO-1.
     """
     rank: int
     name: str
@@ -1679,7 +1686,9 @@ def hybrid(
     ...
 hybrid.is_hybrid = True  # mark this function as hybrid optimizer factory
 
-
+# Attribute names used for zero information for non-parallel modules
+# None if there are no non-parallel modules or zero is not used for them.
+# It is also the key of `OptimizerExtraState.parallel_module_locs` for non-parallel modules.
 _NON_PARALLEL_MODULE_ATTR_NAME = '_nnscaler_non_parallel_module_'
 _SYNC_GRAD_REQUIRED_ATTR = '_nnscaler_sync_grad_required'
 
@@ -2220,6 +2229,31 @@ def _get_optimizer_state_dict_info(
     Dict[str, Any]
 ]:
     """
+    Split per-rank optimizer state dicts into the pieces needed for merging.
+
+    Args:
+        optimizer_state_dicts: optimizer state dicts of all ranks, each produced by
+            `optimizer.state_dict()` of an optimizer built with `build_optimizer`, so each
+            contains `ParallelModule.EXTRA_STATE_KEY` with an `OptimizerExtraState`.
+
+    Returns:
+        opt_extra_states: `OptimizerExtraState` of every rank, indexed by rank.
+        opt_state_dicts: optimizer states of each parallel module, split by module.
+            key: module prefix as in `OptimizerExtraState.parallel_module_locs`
+                (including `_NON_PARALLEL_MODULE_ATTR_NAME` when ZeRO is applied to
+                non-parallel parameters).
+            value: a list indexed by rank with `optimizer_dedup_group_size` items of that module;
+                only ranks inside the dedup group are filled, the rest stay empty.
+                Each item is `{'state': {...}, 'param_groups': [...]}` where `state` maps the
+                parameter index *within the module* (global index minus `loc.offset`) to its
+                optimizer state, and only parameters with a state are present. `param_groups` is a
+                deep copy of the rank's param_groups kept to satisfy the merge helpers; its
+                `params` list is not meaningful.
+        ret_opt_state_dict: skeleton of the merged optimizer state dict: `{'state': {}}` plus deep
+            copies of all other top-level keys (e.g. `param_groups`) from the input state dicts,
+            assumed identical across ranks. Non-parallel parameters' states are not collected here;
+            callers read them from the input state dicts by index.
+
     An example of optimizer state dict:
     {
         'state': {
@@ -2291,6 +2325,25 @@ def _get_optimizer_state_dict_info(
     return opt_extra_states, opt_state_dicts, ret_opt_state_dict
 
 
+def _get_state_dict_rank(state_dict: Dict[str, Any]) -> int:
+    for k in state_dict:
+        if k.split('.')[-1] == ParallelModule.EXTRA_STATE_KEY:
+            return state_dict[k]['rank']
+    raise ValueError("Invalid state dict: no rank found.")
+
+
+def _sort_state_dicts(state_dicts: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    sorted_state_dicts =[None] * len(state_dicts)
+    for state_dict in state_dicts:
+        rank = _get_state_dict_rank(state_dict)
+        if rank >= len(state_dicts):
+            raise ValueError(f"Invalid rank {rank} in state_dicts with length {len(state_dicts)}.")
+        if sorted_state_dicts[rank] is not None:
+            raise ValueError(f"Duplicate rank {rank} in state_dicts.")
+        sorted_state_dicts[rank] = state_dict
+    return sorted_state_dicts
+
+
 @torch.no_grad()
 def merge_state_dicts(
     module_state_dicts: List[Dict[str, Any]],
@@ -2324,23 +2377,6 @@ def merge_state_dicts(
     """
     if not module_state_dicts:
         raise ValueError("model_state_dicts should not be empty.")
-
-    def _get_state_dict_rank(state_dict: Dict[str, Any]) -> int:
-        for k in state_dict:
-            if k.split('.')[-1] == ParallelModule.EXTRA_STATE_KEY:
-                return state_dict[k]['rank']
-        raise ValueError("Invalid state dict: no rank found.")
-
-    def _sort_state_dicts(state_dicts: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        sorted_state_dicts =[None] * len(state_dicts)
-        for state_dict in state_dicts:
-            rank = _get_state_dict_rank(state_dict)
-            if rank >= len(state_dicts):
-                raise ValueError(f"Invalid rank {rank} in state_dicts with length {len(state_dicts)}.")
-            if sorted_state_dicts[rank] is not None:
-                raise ValueError(f"Duplicate rank {rank} in state_dicts.")
-            sorted_state_dicts[rank] = state_dict
-        return sorted_state_dicts
 
     # sort state dicts by rank
     module_state_dicts = _sort_state_dicts(module_state_dicts)
@@ -2678,6 +2714,8 @@ def _trim_optimizer_merged_state_dict(
     new_optimizer_state_dict['state'] = new_states
     new_optimizer_state_dict['param_groups'] = copy.deepcopy(optimizer_state_dict['param_groups'])
     new_optimizer_state_dict['param_groups'][0]['params'] = list(range(new_cur))
+    # the sharded loader checks the optimizer layout against it, as optimizer.state_dict() carries it
+    new_optimizer_state_dict[ParallelModule.EXTRA_STATE_KEY] = asdict(opt_extra_state)
 
     return new_optimizer_state_dict
 
@@ -2704,17 +2742,21 @@ def _opt_load_merged_state_dict(module: ParallelModule, states: Dict[int, Dict[s
         if not orig_param_dict:
             return {}
 
-        if module.compute_config.use_zero == 1:
-            return _construct_optim_state_zero(module, orig_param_dict)
-        elif module.compute_config.use_zero > 1:
-            return _construct_optim_state_zero3(module, orig_param_dict)
-        else:
-            return _construct_optim_state_nonzero(module, orig_param_dict)
+        return _construct_optim_state(module, orig_param_dict)
+
+
+def _construct_optim_state(module: ParallelModule, orig_param_dict: Mapping[str, Dict[str, Any]]):
+    if module.compute_config.use_zero == 1:
+        return _construct_optim_state_zero(module, orig_param_dict)
+    elif module.compute_config.use_zero > 1:
+        return _construct_optim_state_zero3(module, orig_param_dict)
+    else:
+        return _construct_optim_state_nonzero(module, orig_param_dict)
 
 
 def _construct_optim_state_zero3(
         module: ParallelModule,
-        orig_param_dict: Dict[str, Dict[str, Any]]
+        orig_param_dict: Mapping[str, Dict[str, Any]]
 ):
     # state for each parameter in the parallel module
     new_states = _construct_optim_state_nonzero(module, orig_param_dict)
@@ -2777,7 +2819,7 @@ def _construct_optim_state_zero3(
 
 def _construct_optim_state_zero(
         module: ParallelModule,
-        orig_param_dict: Dict[str, Dict[str, Any]],
+        orig_param_dict: Mapping[str, Dict[str, Any]],
 ):
     """
     Construct the optimizer state for a ParallelModule with ZeRO optimization.
@@ -2789,11 +2831,15 @@ def _construct_optim_state_zero(
     """
     dist_param_map = module.dist_param_map  # name in parallel module (without tid suffix) -> name in origin module
     param_area_map = module.fullmap         # str -> AttrMeta
-    def _get_optimizer_state_of_param(param, param_ids, local_names):
+    def _get_optimizer_state_of_param(param, param_ids, local_names, flat=None):
         # find the parameter's optimizer state and pick the slices induced by tensor parallelism
         param_idx = param_ids.index(id(param))
         local_name = local_names[param_idx]
-        return _extract_new_state(local_name, orig_param_dict, dist_param_map, param_area_map)
+        return _extract_new_state(local_name, orig_param_dict, dist_param_map, param_area_map, flat=flat)
+
+    def _orig_name_of_param(param, param_ids, local_names):
+        local_name = local_names[param_ids.index(id(param))]
+        return dist_param_map['_'.join(local_name.split('_')[:-1])]
 
     # prepare param ids and corresponding local param names
     param_ids, local_names = [], []
@@ -2808,11 +2854,8 @@ def _construct_optim_state_zero(
         for bucket in reducer.buckets:
             # one bucket corresponds to one flattened param
             assert len(opt_param[opt_param_idx].shape) == 1
-            sliced_states = [
-                _get_optimizer_state_of_param(param, param_ids, local_names)
-                for param in bucket.params
-            ]
-            state_presence = [state is not None for state in sliced_states]
+            orig_names = [_orig_name_of_param(param, param_ids, local_names) for param in bucket.params]
+            state_presence = [orig_name in orig_param_dict for orig_name in orig_names]
             if not any(state_presence):
                 opt_param_idx += 1
                 continue
@@ -2823,69 +2866,36 @@ def _construct_optim_state_zero(
             # the flattened param is in the range [bucket_chunk_start, bucket_chunk_end)
             bucket_chunk_start = rank_idx * chunk_size
             bucket_chunk_end = (rank_idx + 1) * chunk_size
+            # keys, dtypes and step are shared by the bucket (its params belong to one optimizer
+            # param group); take them from the first param without reading its data
+            # (a lazy checkpoint reader exposes dtype)
+            first_state = orig_param_dict[orig_names[0]]
+            step = first_state.get('step')
+            opt_state_keys = [key for key in first_state if key != 'step']
+            for orig_name in orig_names[1:]:
+                if set(orig_param_dict[orig_name]) != set(first_state):
+                    raise ValueError(
+                        f"Optimizer state keys of {orig_name} differ from {orig_names[0]} within one reducer bucket.")
+            opt_states = {
+                key: torch.zeros([chunk_size], dtype=first_state[key].dtype, device='cpu', requires_grad=False)
+                for key in opt_state_keys
+            }
             # NOTE: assume the traverse order of params is consistent
             # with them in contiguous buffer.
-            # param_offset: the param's start offset in the contiguous buffer
-            # chunk_offset: the offset of the current rank corresponding chunk
-            step, opt_states, opt_state_keys = None, {}, None
-            for param, sliced_new_val in zip(bucket.params, sliced_states):
+            for param in bucket.params:
+                # param_offset: the param's start offset in the contiguous buffer
                 param_offset = reducer.get_param_info(param).bucket_param_buffer_start
-                # there are padding in the chunk, so `param.numel()` doesn't work here
-                param_numel = bucket.get_aligned_numel(param)
-                # init the chunk's optimizer state
-                if opt_state_keys is None:
-                    opt_state_keys = [key for key in sliced_new_val]
-                    if 'step' in sliced_new_val:
-                        step = sliced_new_val['step']
-                    if 'step' in sliced_new_val:
-                        opt_state_keys.remove('step')
-                    for key in opt_state_keys:
-                        opt_states[key] = torch.zeros([chunk_size], dtype=sliced_new_val[key].dtype,
-                                                        device='cpu', requires_grad=False)
-                # copy the param's slices to the optimizer's chunk
+                # overlap of the param (its padding excluded) with this rank's chunk
+                lo = max(param_offset, bucket_chunk_start)
+                hi = min(param_offset + param.numel(), bucket_chunk_end)
+                if lo >= hi:
+                    continue
+                # read only the overlapping range of the param's flattened shard
+                sliced_new_val = _get_optimizer_state_of_param(
+                    param, param_ids, local_names, flat=(lo - param_offset, hi - param_offset))
+                chunk_offset = lo - bucket_chunk_start
                 for key in opt_state_keys:
-                    sliced_new_val[key] = sliced_new_val[key].view(-1)
-
-                # parameter range: <>
-                # bucket range: []
-                # in the following branches, we check the range including paddings.
-                # but in branch body, we only copy the valid range (without paddings) but update the chunk_offset with paddings.
-                if param_offset < bucket_chunk_start \
-                    and bucket_chunk_start < param_offset + param_numel < bucket_chunk_end:
-                    # case: < [ > ]
-                    copy_size = param_offset + param_numel - bucket_chunk_start
-                    copy_size_without_padding = param_offset + param.numel() - bucket_chunk_start
-                    chunk_offset = 0
-                    if copy_size_without_padding > 0:
-                        for key in opt_state_keys:
-                            opt_states[key][chunk_offset:chunk_offset+copy_size_without_padding] = sliced_new_val[key][-copy_size_without_padding:]
-                elif bucket_chunk_start <= param_offset < bucket_chunk_end \
-                    and bucket_chunk_start <= param_offset + param_numel < bucket_chunk_end:
-                    # case: [ <  > ]
-                    chunk_offset = param_offset - bucket_chunk_start
-                    for key in opt_state_keys:
-                        opt_states[key][chunk_offset:chunk_offset+param.numel()] = sliced_new_val[key][:]
-                elif bucket_chunk_start <= param_offset < bucket_chunk_end \
-                    and param_offset + param_numel >= bucket_chunk_end:
-                    # case: [ < ] >
-                    copy_size = bucket_chunk_end - param_offset
-                    copy_size_without_padding = min(copy_size, param.numel())
-                    chunk_offset = param_offset - bucket_chunk_start
-                    for key in opt_state_keys:
-                        opt_states[key][chunk_offset:chunk_offset+copy_size_without_padding] = sliced_new_val[key][:copy_size_without_padding]
-                elif param_offset < bucket_chunk_start \
-                    and param_offset + param_numel >= bucket_chunk_end:
-                    # case: < [ ] >
-                    copy_size = bucket_chunk_end - bucket_chunk_start
-                    copy_size_without_padding = min(copy_size, param_offset + param.numel() - bucket_chunk_start)
-                    chunk_offset = 0
-                    if copy_size_without_padding > 0:
-                        for key in opt_state_keys:
-                            opt_states[key][chunk_offset:chunk_offset + copy_size_without_padding] \
-                                = sliced_new_val[key][bucket_chunk_start-param_offset:bucket_chunk_start-param_offset + copy_size_without_padding]
-                else:
-                    # case: [] <>, <> []
-                    logger.debug(f'Skipped: parameter range({param_offset},{param_offset + param_numel}) vs. bucket range({bucket_chunk_start},{bucket_chunk_end})')
+                    opt_states[key][chunk_offset:chunk_offset + hi - lo] = sliced_new_val[key]
 
             if step is not None:
                 opt_states['step'] = step
@@ -2907,7 +2917,7 @@ def _construct_optim_state_zero(
 
 def _construct_optim_state_nonzero(
         module: ParallelModule,
-        orig_param_dict: Dict[str, Dict[str, Any]]
+        orig_param_dict: Mapping[str, Dict[str, Any]]
 ):
     dist_param_map = module.dist_param_map  # name in parallel module (without tid suffix) -> name in origin module
     param_area_map = module.fullmap         # str -> AttrMeta
@@ -2936,11 +2946,17 @@ def _construct_optim_state_nonzero(
 
 def _extract_new_state(
         local_name: str,
-        orig_param_dict: Dict[str, Dict[str, Any]],
+        orig_param_dict: Mapping[str, Dict[str, Any]],
         dist_param_map: Dict[str, str],
         param_area_map: Dict[str, AttrMeta],
-        zero3_info: Optional[Zero3AttrMeta] = None
+        zero3_info: Optional[Zero3AttrMeta] = None,
+        flat: Optional[Tuple[int, int]] = None,
     ) -> Optional[Dict[str, torch.Tensor]]:
+    """
+    `flat` restricts the result to a range of the parameter's flattened local shard, so a lazy
+    checkpoint reader assembles only that range. With `zero3_info` the range is its chunk
+    instead, so the two are mutually exclusive.
+    """
     name = '_'.join(local_name.split('_')[:-1]) # remove the integer suffix
     assert name in dist_param_map
     attr_meta = param_area_map[local_name]
@@ -2948,14 +2964,17 @@ def _extract_new_state(
     if orig_name not in orig_param_dict:
         return None
     new_val = orig_param_dict[orig_name]
+    if zero3_info is not None:
+        if flat is not None:
+            raise ValueError("`flat` and `zero3_info` are mutually exclusive.")
+        flat = (zero3_info.start, zero3_info.end)
     sliced_new_val = {}
     for key in new_val:
         if key in ('step',):
             sliced_new_val[key] = new_val[key]
         else:
-            sliced_new_val[key] = new_val[key][attr_meta.slicers] / attr_meta.val_chunks
+            sliced_new_val[key] = slice_tensor(new_val[key], attr_meta.slicers, flat) / attr_meta.val_chunks
             if zero3_info is not None:
-                sliced_new_val[key] = sliced_new_val[key].view(-1)[zero3_info.start:zero3_info.end]
                 if sliced_new_val[key].numel() < zero3_info.chunk_size:
                     # padding if needed
                     sliced_new_val[key] = torch.nn.functional.pad(
@@ -3204,7 +3223,7 @@ def load_deduped_state_dict(
     Returns:
         None
     """
-    module_state_dict = align_state_dict_names(module, module_state_dict)
+    module_state_dict = align_state_dict_names(module, module_state_dict, optimizer, optimizer_state_dict)
     device = device or torch.cuda.current_device()
     cur_rank = torch.distributed.get_rank()
 
@@ -3479,115 +3498,6 @@ def _broadcast_weights(module: torch.nn.Module, stride_size: int):
 
 
 @torch.no_grad()
-def align_state_dict_names(
-    module: torch.nn.Module,
-    module_state_dict: Dict[str, Any],
-) -> Dict[str, Any]:
-    """
-    Align generated ParallelModule parameter/buffer names in a per-rank checkpoint.
-
-    Match by original name and shard metadata, ignoring generated names and tensor
-    IDs. Return a shallow copy without copying tensors or modifying the input.
-    Module prefixes, original names, partitioning and optimizer parameter order
-    must be unchanged. Missing metadata or ambiguous/incompatible matches raise
-    ValueError. This adapter is for sharded/deduped, not merged, state dicts.
-    """
-    def attr_meta_identity(meta: AttrMeta) -> tuple:
-        key = asdict(meta)
-        # Remove tensor ID from the key as it is not used for identity
-        key.pop('tid', None)
-        # slice is not hashable in old versions of Python
-        key['slicers'] = tuple((s.start, s.stop, s.step) for s in meta.slicers)
-        return tuple(key.values())
-
-    def zero3_attr_meta_identity(meta: Zero3AttrMeta) -> tuple:
-        key = asdict(meta)
-        key.pop('attr_name', None)
-        return tuple(key.values())
-
-    key_map: Dict[str, str] = {}
-    extra_states: Dict[str, Any] = {}
-    for prefix, pm in module.named_modules():
-        if not isinstance(pm, ParallelModule):
-            continue
-        prefix = f'{prefix}.' if prefix else ''
-        extra_key = f'{prefix}{ParallelModule.EXTRA_STATE_KEY}'
-        if extra_key not in module_state_dict:
-            raise ValueError(f"Cannot align checkpoint names: missing {extra_key}")
-        old = ExtraState(**module_state_dict[extra_key])
-        current_state: Dict[str, Any] = {}
-        pm._add_extra_state(current_state, prefix)
-        current = ExtraState(**current_state[extra_key])
-
-        if old.rank != current.rank:
-            raise ValueError(f"Cannot align {extra_key}: checkpoint rank changed")
-
-        for field_name in ('plan_ngpus', 'runtime_ngpus', 'use_zero', 'zero_ngroups'):
-            if getattr(old.compute_config, field_name) != getattr(current.compute_config, field_name):
-                raise ValueError(f"Cannot align {extra_key}: {field_name} changed; load a merged checkpoint instead")
-
-        for field_name in ('origin_param_names', 'origin_state_dict_names', 'origin_shared_param_names'):
-            if getattr(old, field_name) != getattr(current, field_name):
-                raise ValueError(f"Cannot align {extra_key}: original model metadata {field_name} changed; load a merged checkpoint instead")
-
-        candidates: Dict[tuple, str] = {
-            attr_meta_identity(meta): name
-            for name, meta in current.param_area_map.items()
-        }
-        if len(candidates) != len(current.param_area_map):
-            raise ValueError(f"Cannot align {extra_key}: ambiguous shard metadata in module param_area_map")
-
-        # Map old parameter names to new parameter names
-        name_map: Dict[str, str] = {}
-
-        for old_name, meta in old.param_area_map.items():
-            # Consume each match once to keep the old and new shard names in one-to-one correspondence.
-            match = candidates.pop(attr_meta_identity(meta), None)
-            if match is None:
-                raise ValueError(
-                    f"Cannot align {prefix}{old_name}: expected one match for "
-                    f"{meta.orig_name} with the same shard metadata, found {match}"
-                )
-            name_map[old_name] = match
-
-        if candidates:
-            raise ValueError(f"Cannot align {extra_key}: parameter names are missing from shard metadata")
-
-        # Optimizer state uses positional IDs (or bucket offsets), not model keys.
-        if [name_map[name] for name in old.cube_param_names] != current.cube_param_names:
-            raise ValueError(f"Cannot align {extra_key}: optimizer parameter order changed")
-        for field_name in ('zero', 'model_idx2opt_idx', 'opt_idx2ranks'):
-            if getattr(old, field_name) != getattr(current, field_name):
-                raise ValueError(f"Cannot align {extra_key}: optimizer layout {field_name} changed")
-
-        # zero3 config
-        old_zero3 = {
-            name_map[name]: zero3_attr_meta_identity(meta)
-            for name, meta in old.zero3_param_metadata.items()
-        } if old.zero3_param_metadata else {}
-        new_zero3 = {
-            name: zero3_attr_meta_identity(meta)
-            for name, meta in current.zero3_param_metadata.items()
-        } if current.zero3_param_metadata else {}
-        if old_zero3 != new_zero3:
-            raise ValueError(f"Cannot align {extra_key}: ZeRO-3 parameter layout changed")
-
-        key_map.update({f'{prefix}{old_name}': f'{prefix}{new_name}' for old_name, new_name in name_map.items()})
-        extra_states[extra_key] = current_state[extra_key]
-
-    # create a new adapted state dict with the same type of original state dict
-    # And this can also keep the `_metadata` attached to the dict if it exists
-    adapted = copy.copy(module_state_dict)
-    adapted.clear()
-    for key, value in module_state_dict.items():
-        new_key = key_map.get(key, key)
-        if new_key in adapted:
-            raise ValueError(f"Cannot align checkpoint names: key collision at {new_key}")
-        adapted[new_key] = extra_states.get(key, value)
-    logger.info("Aligned %s checkpoint parameter/buffer names", sum(k != v for k, v in key_map.items()))
-    return adapted
-
-
 @torch.no_grad()
 def load_sharded_state_dict(
     module: torch.nn.Module,
@@ -3612,7 +3522,7 @@ def load_sharded_state_dict(
         None
     """
 
-    module_state_dict = align_state_dict_names(module, module_state_dict)
+    module_state_dict = align_state_dict_names(module, module_state_dict, optimizer, optimizer_state_dict)
     device = device or torch.cuda.current_device()
     module.to(device)
 
@@ -4006,6 +3916,9 @@ def trimmed_broadcast_merged_state_dict(
                 if will_load_opt_state:
                     logger.info(f'At rank {cur_rank}: Receiving trimmed optimizer state dict from rank {src_rank}')
                     trimmed_opt_state_dict = _receive_trimmed_opt_state_dict(src_rank, group=pg)
+                    # only states and param groups are transferred; restore the extra state like
+                    # _trim_optimizer_merged_state_dict does on the source rank
+                    trimmed_opt_state_dict[ParallelModule.EXTRA_STATE_KEY] = asdict(optimizer._extra_state)
                 else:
                     trimmed_opt_state_dict = None
 
