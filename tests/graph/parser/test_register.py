@@ -22,6 +22,19 @@ def mock_add(x: torch.Tensor, y: torch.Tensor):
 nnscaler.register_op('*, * -> *')(mock_add)
 
 
+@nnscaler.register_op('a b, ? -> a b')
+def optional_reference(x, reference=None):
+    return x if reference is None else x + reference
+
+
+def test_annotated_optional_input_uses_python_default():
+    from nnscaler.graph.parser.register import CustomizedOps
+    from nnscaler.ir.tensor import IRFullTensor
+    x = IRFullTensor((2, 4), dtype=torch.float32).tosub()
+    op = CustomizedOps.map(__name__ + '.optional_reference')(x)
+    assert op.input(1) is None
+
+
 @nnscaler.register_op('*, * -> *')
 def mock_add2(x: torch.Tensor, y: torch.Tensor):
     return x + y

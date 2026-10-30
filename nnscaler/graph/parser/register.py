@@ -257,6 +257,9 @@ def register_op(annotation: Union[str, Callable], name: Optional[str] = None,
             args = inspect.signature(fn)
             arg_names = list(args.parameters.keys())
 
+        arg_defaults = {name: parameter.default for name, parameter in args.parameters.items()
+                        if parameter.default is not inspect.Parameter.empty}
+
         # step 2. get customized op code
         def get_source_code(fn: Callable) -> str:
             if is_autograd_apply(fn):
@@ -298,6 +301,8 @@ def register_op(annotation: Union[str, Callable], name: Optional[str] = None,
                 for idx in range(len(args), ninputs):
                     if arg_names[idx] in kwargs:
                         args.append(kwargs.pop(arg_names[idx]))
+                    elif arg_names[idx] in arg_defaults:
+                        args.append(arg_defaults[arg_names[idx]])
                     else:
                         raise ValueError(f"calling function {signature} should include at least {ninputs} *args")
             tensors = args[:ninputs]
