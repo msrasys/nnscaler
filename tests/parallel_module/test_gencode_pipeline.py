@@ -864,3 +864,348 @@ def test_complex_shared_dict_input_with_intermediate(tmp_path):
     #     sum_1_32 = torch.sum(add_4_43)
     #     del add_4_43
     #     return sum_1_32
+
+
+class SharedDictGetInputModule(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.w0 = torch.nn.Parameter(torch.randn(4, 4))
+        self.w1 = torch.nn.Parameter(torch.randn(4, 4))
+        self.w2 = torch.nn.Parameter(torch.randn(4, 4))
+        self.w3 = torch.nn.Parameter(torch.randn(4, 4))
+
+    def forward(self, data: dict):
+        # `dict.get` with a default on a dataloader-derived dict,
+        # consumed only in the last stage
+        scale = data['meta'].get('scale', 2.0)
+        x0 = data['data'] + self.w0
+        x1 = x0 + self.w1
+
+        x2 = x1 + self.w2
+        x3 = x2 + self.w3
+
+        loss = torch.sum(x3 * scale)
+        return loss
+
+
+@replace_all_device_with('cpu')
+def test_shared_dict_get_input(tmp_path):
+    m = SharedDictGetInputModule()
+    m.train()
+    parallelize(
+        m,
+        {'data': {'data': torch.randn(4, 4), 'meta': {'scale': 2.0}}},
+        pas_policy=_shared_output_partition_policy,
+        compute_config= ComputeConfig(
+            2, 4,
+            constant_folding=False,
+            use_end2end=True,
+            pas_config=dict(
+                pipeline_nmicros=2,
+                pipeline_scheduler='1f1b'
+            )
+        ),
+        gen_savedir=tmp_path,
+        load_module=False,
+        reuse='override',
+    )
+    # rank1 recomputes the whole lookup chain `data['meta'].get('scale', 2.0)`
+    # from its local dataloader, including the dict.get default
+    assert _gencode_contains(
+        tmp_path, SharedDictGetInputModule, 1, r"_operator.getitem\(data_\d+, 'meta'\)"
+    )
+    assert _gencode_contains(
+        tmp_path, SharedDictGetInputModule, 1, r"builtins.dict.get\(getitem_\d+, 'scale', 2.0\)"
+    )
+    # rank0 no longer computes the lookups that only the last stage needs
+    assert not _gencode_contains(
+        tmp_path, SharedDictGetInputModule, 0, r"_operator.getitem\(data_\d+, 'meta'\)"
+    )
+    assert not _gencode_contains(
+        tmp_path, SharedDictGetInputModule, 0, r"builtins.dict.get"
+    )
+    # the lookup result is NOT transmitted between stages via any adapter
+    for rank in (0, 1):
+        assert not _gencode_contains(
+            tmp_path, SharedDictGetInputModule, rank, r'nnscaler.runtime.adapter.move_object'
+        )
+
+
+class LookupAsOutputModule(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.w0 = torch.nn.Parameter(torch.randn(4, 4))
+        self.w1 = torch.nn.Parameter(torch.randn(4, 4))
+        self.w2 = torch.nn.Parameter(torch.randn(4, 4))
+        self.w3 = torch.nn.Parameter(torch.randn(4, 4))
+
+    def forward(self, data: dict):
+        x0 = data['data'] + self.w0
+        x1 = x0 + self.w1
+
+        x2 = x1 + self.w2
+        x3 = x2 + self.w3
+
+        # dataloader lookups returned directly, without any op consuming them
+        return torch.sum(x3), data['id'], data.get('tag', 0)
+
+
+@replace_all_device_with('cpu')
+def test_lookup_as_graph_output(tmp_path):
+    m = LookupAsOutputModule()
+    m.train()
+    parallelize(
+        m,
+        {'data': {'data': torch.randn(4, 4), 'id': 5, 'tag': 1}},
+        pas_policy=_shared_output_partition_policy,
+        compute_config= ComputeConfig(
+            2, 4,
+            constant_folding=False,
+            use_end2end=True,
+            pas_config=dict(
+                pipeline_nmicros=2,
+                pipeline_scheduler='1f1b'
+            )
+        ),
+        gen_savedir=tmp_path,
+        load_module=False,
+        reuse='override',
+    )
+    # the lookups have no consumer, so they must not be removed as dead ops:
+    # every name returned by the step functions must be assigned in each rank's code
+    for rank in (0, 1):
+        returns = _gencode_contains(tmp_path, LookupAsOutputModule, rank, r'^    return \[(.*?)\]', flags=re.M)
+        assert returns
+        for ret in returns:
+            for name in (n.strip() for n in ret.split(',')):
+                assert _gencode_contains(
+                    tmp_path, LookupAsOutputModule, rank, rf'^\s*(?:\w+, )*{name}(?:, \w+)* = ', flags=re.M
+                ), f'rank {rank}: returned {name} is never assigned'
+    # the lookups follow the previous op's stage (the last one), and are kept there
+    assert _gencode_contains(tmp_path, LookupAsOutputModule, 1, r"_operator.getitem\(data_\d+, 'id'\)")
+    assert _gencode_contains(tmp_path, LookupAsOutputModule, 1, r"builtins.dict.get\(data_\d+, 'tag', 0\)")
+
+
+class TensorDefaultLookupModule(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.w0 = torch.nn.Parameter(torch.randn(4, 4))
+        self.w1 = torch.nn.Parameter(torch.randn(4, 4))
+        self.w2 = torch.nn.Parameter(torch.randn(4, 4))
+        self.w3 = torch.nn.Parameter(torch.randn(4, 4))
+
+    def forward(self, data: dict):
+        # a stage-0 tensor becomes the default of a lookup in the last stage;
+        # the lookup op mixes IR inputs with plain python values ('scale')
+        default = torch.sum(self.w0)
+        x0 = data['data'] + self.w0
+        x1 = x0 + self.w1
+
+        x2 = x1 + self.w2
+        x3 = x2 + self.w3
+
+        scale = data['meta'].get('scale', default)
+        return torch.sum(x3 * scale)
+
+
+@replace_all_device_with('cpu')
+def test_lookup_with_cross_stage_tensor_input(tmp_path):
+    m = TensorDefaultLookupModule()
+    m.train()
+    parallelize(
+        m,
+        {'data': {'data': torch.randn(4, 4), 'meta': {'scale': 2.0}}},
+        pas_policy=_shared_output_partition_policy,
+        compute_config= ComputeConfig(
+            2, 4,
+            constant_folding=False,
+            use_end2end=True,
+            pas_config=dict(
+                pipeline_nmicros=2,
+                pipeline_scheduler='1f1b'
+            )
+        ),
+        gen_savedir=tmp_path,
+        load_module=False,
+        reuse='override',
+    )
+    # the tensor default is received from stage 0, the dict lookup itself is local
+    assert _gencode_contains(
+        tmp_path, TensorDefaultLookupModule, 1, r"builtins.dict.get\(getitem_[\d_]+, 'scale', sum_[\d_]+\)"
+    )
+    assert _gencode_contains(tmp_path, TensorDefaultLookupModule, 1, r"_operator.getitem\(data_\d+, 'meta'\)")
+    assert not _gencode_contains(tmp_path, TensorDefaultLookupModule, 0, r"builtins.dict.get")
+
+
+class NonSinkableDefaultLookupModule(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.w0 = torch.nn.Parameter(torch.randn(4, 4))
+        self.w1 = torch.nn.Parameter(torch.randn(4, 4))
+        self.w2 = torch.nn.Parameter(torch.randn(4, 4))
+        self.w3 = torch.nn.Parameter(torch.randn(4, 4))
+        self.register_buffer('default_scale', torch.tensor(3.0))
+
+    def forward(self, data: dict):
+        # lookups whose defaults are not dataloader-derived: a registered buffer,
+        # and a computed tensor nested inside a container default
+        scale = data['meta'].get('scale', self.default_scale)
+        meta = data.get('meta', {'bias': torch.sum(self.w0)})
+        x0 = data['data'] + self.w0
+        x1 = x0 + self.w1
+
+        x2 = x1 + self.w2
+        x3 = x2 + self.w3
+
+        return torch.sum(x3 * scale * meta['bias'])
+
+
+@replace_all_device_with('cpu')
+def test_lookup_with_non_sinkable_default(tmp_path):
+    m = NonSinkableDefaultLookupModule()
+    m.train()
+    parallelize(
+        m,
+        {'data': {'data': torch.randn(4, 4), 'meta': {'scale': 2.0, 'bias': 1.0}}},
+        pas_policy=_shared_output_partition_policy,
+        compute_config= ComputeConfig(
+            2, 4,
+            constant_folding=False,
+            use_end2end=True,
+            pas_config=dict(
+                pipeline_nmicros=2,
+                pipeline_scheduler='1f1b'
+            )
+        ),
+        gen_savedir=tmp_path,
+        load_module=False,
+        reuse='override',
+    )
+    # neither lookup can be recomputed in the consumer stage: both stay in stage 0
+    # and only their results are forwarded
+    assert _gencode_contains(
+        tmp_path, NonSinkableDefaultLookupModule, 0, r"builtins.dict.get\(getitem_[\d_]+, 'scale', self.default_scale_\d+\)"
+    )
+    assert _gencode_contains(
+        tmp_path, NonSinkableDefaultLookupModule, 0, r"builtins.dict.get\(data_\d+, 'meta', \{'bias': sum_[\d_]+\}\)"
+    )
+    assert not _gencode_contains(tmp_path, NonSinkableDefaultLookupModule, 1, r"builtins.dict.get")
+    assert len(_gencode_contains(
+        tmp_path, NonSinkableDefaultLookupModule, 1, r"nnscaler.runtime.adapter.move_object\(\(\), src=0, dst=1\)"
+    )) == 2
+
+
+class StageLeadingLookupModule(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.w0 = torch.nn.Parameter(torch.randn(4, 4))
+        self.w1 = torch.nn.Parameter(torch.randn(4, 4))
+        self.w2 = torch.nn.Parameter(torch.randn(4, 4))
+
+    def forward(self, data: dict):
+        a = data['a']                   # stage 0, consumed in stage 1
+        x0 = data['data'] + self.w0     # stage 0
+        b = data.get('b', 1)            # first op of stage 1, consumed only in stage 2
+        x1 = (x0 + self.w1) * a         # stage 1
+        x2 = (x1 + self.w2) * b         # stage 2
+        return torch.sum(x2)
+
+
+def _stage_leading_lookup_policy(graph, cfg):
+    from nnscaler.policies import OpPlan, get_pas_ops
+
+    for node in get_pas_ops(graph):
+        stage_id = -1
+        if node.signature == 'builtins.dict.get':
+            stage_id = 1
+        elif node.fn == torch.add and node.input(1).is_param():
+            stage_id = {'w0': 0, 'w1': 1, 'w2': 2}[node.input(1).name]
+        yield OpPlan(node, stage_id=stage_id, partition=None)
+
+
+@replace_all_device_with('cpu')
+def test_lookup_leading_a_stage(tmp_path):
+    """
+    The lookup that opens stage 1 is sunk into stage 2 and removed from stage 1,
+    after which another lookup still has to be copied into stage 1.
+    """
+    m = StageLeadingLookupModule()
+    m.train()
+    parallelize(
+        m,
+        {'data': {'data': torch.randn(4, 4), 'a': 2, 'b': 3}},
+        pas_policy=_stage_leading_lookup_policy,
+        compute_config= ComputeConfig(
+            3, 3,
+            constant_folding=False,
+            use_end2end=True,
+            pas_config=dict(
+                pipeline_nmicros=3,
+                pipeline_scheduler='1f1b'
+            )
+        ),
+        gen_savedir=tmp_path,
+        load_module=False,
+        reuse='override',
+    )
+    # stage 1 recomputes data['a'] locally, stage 2 recomputes data.get('b', 1) locally
+    assert _gencode_contains(tmp_path, StageLeadingLookupModule, 1, r"_operator.getitem\(data_\d+, 'a'\)")
+    assert not _gencode_contains(tmp_path, StageLeadingLookupModule, 1, r"builtins.dict.get")
+    assert _gencode_contains(tmp_path, StageLeadingLookupModule, 2, r"builtins.dict.get\(data_\d+, 'b', 1\)")
+    for rank in (0, 1, 2):
+        assert not _gencode_contains(tmp_path, StageLeadingLookupModule, rank, r'nnscaler.runtime.adapter.move_object')
+
+
+class SharedPrefixLookupModule(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.w0 = torch.nn.Parameter(torch.randn(4, 4))
+        self.w1 = torch.nn.Parameter(torch.randn(4, 4))
+        self.w2 = torch.nn.Parameter(torch.randn(4, 4))
+        self.w3 = torch.nn.Parameter(torch.randn(4, 4))
+
+    def forward(self, data: dict):
+        # two lookups sharing the `data['meta']` prefix, both consumed in the last stage
+        meta = data['meta']
+        scale = meta.get('scale', 1)
+        bias = meta.get('bias', 0)
+        x0 = data['data'] + self.w0
+        x1 = x0 + self.w1
+
+        x2 = x1 + self.w2
+        x3 = x2 + self.w3
+
+        return torch.sum(x3 * scale * bias)
+
+
+@replace_all_device_with('cpu')
+def test_shared_prefix_lookups(tmp_path):
+    m = SharedPrefixLookupModule()
+    m.train()
+    parallelize(
+        m,
+        {'data': {'data': torch.randn(4, 4), 'meta': {'scale': 2, 'bias': 1}}},
+        pas_policy=_shared_output_partition_policy,
+        compute_config= ComputeConfig(
+            2, 4,
+            constant_folding=False,
+            use_end2end=True,
+            pas_config=dict(
+                pipeline_nmicros=2,
+                pipeline_scheduler='1f1b'
+            )
+        ),
+        gen_savedir=tmp_path,
+        load_module=False,
+        reuse='override',
+    )
+    # the shared prefix is copied once into stage 1, and both lookups that reuse
+    # it are emitted after it
+    assert len(_gencode_contains(tmp_path, SharedPrefixLookupModule, 1, r"_operator.getitem\(data_\d+, 'meta'\)")) == 1
+    for key, default in (('scale', 1), ('bias', 0)):
+        assert _gencode_contains(
+            tmp_path, SharedPrefixLookupModule, 1,
+            rf"(getitem_[\d_]+) = _operator.getitem\(data_\d+, 'meta'\)[\s\S]*?builtins.dict.get\(\1, '{key}', {default}\)"
+        ), f'{key} lookup is emitted before its producer'
+    for rank in (0, 1):
+        assert not _gencode_contains(tmp_path, SharedPrefixLookupModule, rank, r'nnscaler.runtime.adapter.move_object')

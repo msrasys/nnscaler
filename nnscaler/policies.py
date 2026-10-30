@@ -716,9 +716,11 @@ def _identity_segment_output(graph: IRGraph, tensor: IRSubTensor, segment: IRSeg
     return fwop
 
 
-# signatures of cheap, deterministic, non-differentiable indexing/attribute ops
-# that are safe to recompute (e.g. `data['loss']` -> `_operator.getitem`).
-_SINKABLE_INDEX_SIGNATURES = ('_operator.getitem', )
+# signatures of cheap, deterministic, non-differentiable lookup ops that are safe
+# to recompute per stage (e.g. `data['loss']` -> `_operator.getitem`,
+# `data['meta'].get('scale', 1)` -> `builtins.dict.get`). Recomputing them locally
+# avoids a cross-stage object transfer for every microbatch.
+_SINKABLE_INDEX_SIGNATURES = ('_operator.getitem', 'builtins.dict.get')
 
 
 def _duplicate_dataloader_index_ops_per_stage(graph: IRGraph, op_plans: dict) -> None:
@@ -759,6 +761,12 @@ def _duplicate_dataloader_index_ops_per_stage(graph: IRGraph, op_plans: dict) ->
             dataloader_output_tids.add(out.tid)
     if not dataloader_output_tids:
         return
+    # graph outputs are not consumers, so a sinkable op that only feeds a graph
+    # output looks dead after sinking; it must stay in its own stage to keep
+    # the output defined.
+    graph_output_tids = {
+        out.tid for out in IRCell.get_objects_from_complex(graph.outputs())
+    }
 
     def _get_node_stage(node) -> Optional[int]:
         plan = op_plans.get(node)
@@ -788,12 +796,15 @@ def _duplicate_dataloader_index_ops_per_stage(graph: IRGraph, op_plans: dict) ->
             node_sinkable_cache[node.cid] = False
             return False
 
-        for inp in node.inputs():
-            if not isinstance(inp, IRObject):
-                continue
+        for inp in node.iobjs():
             if inp.tid in dataloader_output_tids:
                 continue
             prods = graph.producers(inp.parent)
+            if not prods:
+                # parameters, buffers and other producer-less values are not
+                # available in every stage, so the lookup must stay where it is
+                node_sinkable_cache[node.cid] = False
+                return False
             assert len(prods) == 1, "Internal Error: call this before graph partitioning, each tensor/object should have a single producer"
             if _is_sinkable(prods[0]):
                 continue
@@ -806,14 +817,9 @@ def _duplicate_dataloader_index_ops_per_stage(graph: IRGraph, op_plans: dict) ->
 
     # cache of sinkable status for each node, keyed by node.cid
     node_sinkable_cache: dict[int, bool] = {}
-    # stage_id -> first forward op in that stage (used as insertion anchor for copies)
-    stage_anchors: dict[int, IRFwOperation] = {}
     sinkable_obj_memo: dict[tuple[IRObject, int], IRObject] = {}
     for node in graph.select(ntype=IRFwOperation):
         stage_id = _get_node_stage(node)
-        if stage_id not in stage_anchors:
-            stage_anchors[stage_id] = node
-
         if _is_sinkable(node):  # also populate node_sinkable_cache
             for out in node.oobjs():
                 sinkable_obj_memo[(out, stage_id)] = out
@@ -825,11 +831,28 @@ def _duplicate_dataloader_index_ops_per_stage(graph: IRGraph, op_plans: dict) ->
             return out.like()
         return out  # static / constant output: reuse as-is
 
-    def _resolve(node: IRFwOperation, stage: int):
+    # cids of the copies inserted so far; they sit at the front of their stage
+    copied_cids: set[int] = set()
+
+    def _stage_start(stage: int) -> int:
+        """Position of the first original (non-copy) forward op of `stage`.
+        New copies are inserted there: after the copies already sunk into the
+        stage, which later copies may reuse through `sinkable_obj_memo`, and
+        before every consumer in that stage."""
+        for pos, node in enumerate(graph.nodes()):
+            if isinstance(node, IRFwOperation) and node.cid not in copied_cids \
+                    and _get_node_stage(node) == stage:
+                return pos
+        raise RuntimeError(f"Internal Error: stage {stage} has no forward op")
+
+    def _resolve(node: IRFwOperation, stage: int, pos: int) -> int:
+        """Copy `node` (and, recursively, its sinkable producers) into `stage`,
+        inserting the copies in dependency order starting at `pos`.
+        Returns the position right after the inserted copies."""
         assert _is_sinkable(node), "Internal Error: only sinkable nodes can be resolved"
 
         if _get_node_stage(node) == stage:
-            return
+            return pos
 
         copy_node = node.replicate()
         copy_node._id = IDGenerator().gen_cell_id()  # a distinct op, not a device replica
@@ -848,7 +871,7 @@ def _duplicate_dataloader_index_ops_per_stage(graph: IRGraph, op_plans: dict) ->
                     assert len(prods) == 1, "Internal Error: call this before graph partitioning, each tensor/object should have a single producer"
                     assert _is_sinkable(prods[0]), "Internal Error: only sinkable nodes can be resolved"
 
-                    _resolve(prods[0], stage)
+                    pos = _resolve(prods[0], stage, pos)
 
                 resolved = sinkable_obj_memo[(inp, stage)]
                 copy_node.replace(inp, resolved)
@@ -859,8 +882,10 @@ def _duplicate_dataloader_index_ops_per_stage(graph: IRGraph, op_plans: dict) ->
             copy_node.replace(out, new_out)
             sinkable_obj_memo[(out, stage)] = new_out
 
-        graph.insert(copy_node, graph.index(stage_anchors[stage]))
+        graph.insert(copy_node, pos)
         op_plans[copy_node] = OpPlan(op=copy_node, stage_id=stage, partition=None)
+        copied_cids.add(copy_node.cid)
+        return pos + 1
 
     # try to sink each sinkable node into its consumer stages, creating copies as needed
     # Note that we iterate in reverse topological order
@@ -883,7 +908,7 @@ def _duplicate_dataloader_index_ops_per_stage(graph: IRGraph, op_plans: dict) ->
 
         for stage, consumers in foreign.items():
             # recursively resolve the node in the consumer stage, creating a copy if needed
-            _resolve(node, stage)
+            _resolve(node, stage, _stage_start(stage))
 
             for consumer in consumers:
                 with graph.update(consumer):
@@ -893,7 +918,8 @@ def _duplicate_dataloader_index_ops_per_stage(graph: IRGraph, op_plans: dict) ->
                             consumer.replace(iobj, new_iobj)
 
         # dead sinkable nodes that are not needed in their own stage can be removed
-        if not found_consumer_in_current_stage:
+        is_graph_output = any(out.tid in graph_output_tids for out in node.oobjs())
+        if not found_consumer_in_current_stage and not is_graph_output:
             graph.remove(node)
             op_plans.pop(node, None)
 
