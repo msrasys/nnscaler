@@ -16,11 +16,11 @@ make an invalid program's asynchronous accesses race-free.
 """
 from contextlib import contextmanager
 from contextvars import ContextVar
-from collections import deque
 import weakref
 
 import torch
 from .activation_config import CPUOffloadConfig
+from .activation_batch import ForwardCommitQueue, ScopeRestoreQueue
 from .activation_autograd import SavedActivationContext, _ModuleTensorRef
 from .activation_schedule import ActivationSchedulePlan, ActivationScheduleCursor
 from .activation_memory import _OffloadPool, _shared_pool, _pools, available_host_bytes, _cgroup_headroom
@@ -92,8 +92,7 @@ class _OffloadGroup(ActivationBatch):
         self.manager = scope.manager
         self.keep_resident = scope.keep_resident
         self.transfer = scope.transfer
-        if self.transfer is not None:
-            self.capture_save_events = self.transfer.batch.capture_save_events
+        self.capture_save_events = scope.commits.capture_save_events
         self.previous = scope.groups[-1] if scope.groups else None
         scope.groups.append(self)
 
@@ -102,11 +101,8 @@ class _OffloadGroup(ActivationBatch):
         return self._scope()
 
     def commit(self):
-        if self.transfer is None:
-            return super().commit()
         if not self.closed:
-            self.transfer.add(self)
-            self.closed = True
+            self.scope.commits.add(self)
 
     def backward_entry(self, *unused):
         if not self.manager.config.prefetch_groups:
@@ -154,82 +150,21 @@ def mark_retained_scope_tensors(values):
             scope.retained_storages.add((value.device, value.untyped_storage()._cdata))
 
 
-class _ScopeTransfer:
-    """One forward's transport batch and its bounded backward restore queue.
-
-    Groups may keep this object for backward hooks. It never owns a scope or
-    group, avoiding an ownership cycle when cyclic GC is disabled.
-    """
-    def __init__(self, manager):
-        self.manager = manager
-        self.batch = ActivationBatch(manager)
-        self.pending = deque()
-        self.ready = False
-
-    def add(self, group):
-        self.batch.records.extend(group.records)
-        self.batch.pending.extend(group.pending)
-        if group.producer_events:
-            if self.batch.producer_events is None:
-                self.batch.producer_events = {}
-            self.batch.producer_events.update(group.producer_events)
-        group.pending.clear()
-        group.producer_events = None
-
-    def commit(self):
-        self.batch.commit()
-        seen = set()
-        for ref in reversed(self.batch.records):
-            record = ref()
-            if record is not None and record.uid not in seen:
-                seen.add(record.uid)
-                self.pending.append(ref)
-        self.ready = True
-        self.manager.pool.stats['scope_commits'] += 1
-
-    def abort(self):
-        self.batch.pending.clear()
-        self.batch.producer_events = None
-        self.batch.closed = True
-        self.pending.clear()
-
-    def prefetch(self, *, from_schedule=False):
-        if not self.ready:
-            return False
-        if not self.pending:
-            return True
-        with self.manager.transport.prefetch_batch():
-            while self.pending:
-                record = self.pending[0]()
-                if record is None or record.d2h_event is None:
-                    self.pending.popleft()
-                    continue
-                if record.prefetch(from_schedule=from_schedule):
-                    self.pending.popleft()
-                elif record.size > self.manager.config.max_prefetch_bytes:
-                    # Cannot fit even an empty speculative window. Demand load
-                    # remains correct; do not starve other scopes indefinitely.
-                    self.pending.popleft()
-                    self.manager.pool.stats['scope_prefetch_oversize_bytes'] += record.size
-                else:
-                    return False  # Retry after a consuming action frees capacity.
-        return True
-
-
 class _ForwardScope:
     def __init__(self, manager, immediate_backward=False, backward_distance=None, pipeline=False):
         self.manager = manager
         self.pipeline = pipeline
         self.backward_distance = backward_distance
         self.immediate_backward = immediate_backward
-        whole = manager.config.transfer_unit == 'scope' or (
-            manager.config.transfer_unit == 'auto' and pipeline)
+        whole = manager.config.restore_unit(pipeline=pipeline) == 'scope'
         self.keep_resident = ((backward_distance is not None
                               and backward_distance < manager.config.min_offload_gap)
                              or (whole and immediate_backward))
         self.resident_reason = ('immediate_backward_resident_bytes' if whole and immediate_backward
                                 else 'short_scope_resident_bytes')
-        self.transfer = _ScopeTransfer(manager) if whole else None
+        self.transfer = ScopeRestoreQueue(manager) if whole else None
+        self.commits = ForwardCommitQueue(manager, unit=manager.config.commit_unit(pipeline=pipeline),
+                                          target_bytes=manager.config.commit_batch_bytes)
         self.complete = False
         self.groups = []
         self._entry_groups = None
@@ -269,11 +204,13 @@ class _ForwardScope:
         return not blocked
 
     def finish_forward(self):
+        self.commits.finish()
         if self.transfer is not None:
-            self.transfer.commit()
+            self.transfer.seal(self.groups)
         self.complete = True
 
     def abort(self):
+        self.commits.abort()
         if self.transfer is not None:
             self.transfer.abort()
 
@@ -396,7 +333,7 @@ class CPUOffloadContext(SavedActivationContext):
         if exc_type is None:
             self.group.commit()
         else:
-            self.group.pending.clear()
+            self.group.abort()
 
     def _pack(self, tensor):
         if self.group.scope.keep_resident or (self.tail and self.group.scope.immediate_backward):

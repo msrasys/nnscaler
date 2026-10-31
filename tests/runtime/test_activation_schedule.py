@@ -106,6 +106,24 @@ def test_legacy_codegen_config_does_not_silently_reuse_one_action_hints(tmp_path
     assert restored.graph_config == current.graph_config  # Raw trace remains reusable.
 
 
+def test_submission_options_roundtrip_without_changing_schedule_abi(tmp_path):
+    current = ComputeConfig(1,1,cpu_offload=CPUOffloadConfig(
+        transfer_unit='scope', forward_commit_unit='group', commit_batch_bytes=1024, copy_chunk_bytes=64))
+    path = tmp_path/'current.pt'
+    torch.save(asdict(current), path)
+    restored = ComputeConfig.safe_load_from_file(path, return_none_on_error=False)
+    assert ComputeConfig.safe_equals(restored,current)
+    assert restored.cpu_offload._schedule_version == 1
+    old = asdict(current)
+    for key in ('forward_commit_unit','commit_batch_bytes','copy_chunk_bytes'):
+        old['cpu_offload'].pop(key)
+    torch.save(old,path)
+    restored = ComputeConfig.safe_load_from_file(path, return_none_on_error=False)
+    assert restored.cpu_offload.commit_unit(pipeline=True) == 'scope'
+    assert restored.cpu_offload.commit_batch_bytes == restored.cpu_offload.copy_chunk_bytes == 0
+    assert restored.cpu_offload._schedule_version == 1
+
+
 def test_schedule_exception_drops_scope_metadata_with_gc_disabled(monkeypatch):
     import gc
     import weakref
@@ -167,6 +185,40 @@ def test_transfer_unit_controls_commit_boundary_and_preserves_gradients(unit, pi
     torch.testing.assert_close(x.grad, expected)
     torch.cuda.synchronize()
     assert manager.pool.snapshot()['live_cpu_bytes'] == 0
+
+
+@cuda
+@pytest.mark.parametrize('restore', ['scope', 'group'])
+@pytest.mark.parametrize('forward', ['scope', 'group'])
+@pytest.mark.parametrize('chunk', [0, 512])
+def test_independent_submission_and_chunking_preserve_real_gradients(restore, forward, chunk):
+    module, manager = module_and_manager(transfer_unit=restore, forward_commit_unit=forward,
+        commit_batch_bytes=4096, copy_chunk_bytes=chunk, reload_on_compute_stream=False,
+        use_save_events=True, scope_prefetch_groups=2)
+    x = torch.randn(64,64,device='cuda',requires_grad=True)
+    reference = ((x+1).sin().t()+2).sin().sum()
+    expected, = torch.autograd.grad(reference, x)
+    with manager.trace(cuda_timing=True) as trace:
+        with manager.scope(A, pipeline=True, backward_distance=4):
+            with CPUOffloadContext(module) as first:
+                a = (x+1).sin()
+            first.watch(a)
+            assert manager.pool.stats['d2h_bytes'] > 0  # Before F closes, including scope restore.
+            with CPUOffloadContext(module) as second:
+                b = (a.t()+2).sin()
+            second.watch(b)
+            del a
+        manager.prefetch(A)
+        b.sum().backward()
+        manager.finish(A)
+        torch.cuda.synchronize()
+    torch.testing.assert_close(x.grad, expected, rtol=0, atol=0)
+    stats = manager.pool.snapshot()
+    assert stats['d2h_bytes'] > 0 and stats['h2d_bytes'] > 0
+    assert stats['peak_d2h_batch_bytes'] <= x.numel()*x.element_size()
+    assert all(stats[k]==0 for k in ('live_cpu_bytes','pending_cpu_bytes','prefetched_gpu_bytes'))
+    waits = trace.to_dict()['cuda_waits']
+    assert waits and all(wait['complete'] and wait['elapsed_ms'] >= 0 for wait in waits)
 
 
 @cuda
@@ -246,7 +298,7 @@ def test_scope_commit_joins_all_producer_streams():
                 value.fill_(index+2)
                 with CPUOffloadContext(module) as group:
                     tokens.append(group._pack(value))
-        assert len(scope.transfer.batch.producer_events) == 2
+        assert len(scope.commits.batch.producer_events) == 2
     manager.d2h_stream.synchronize()
     for index, token in enumerate(tokens):
         host = token.record.host[:token.record.size].view(torch.float32).reshape(64,64)

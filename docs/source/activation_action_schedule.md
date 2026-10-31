@@ -11,7 +11,10 @@ number, optimizer step, or a guessed reverse-forward order.
 
 | Setting | Meaning | Default |
 | --- | --- | --- |
-| `transfer_unit` | `auto`: whole F/B scopes in pipeline, offload regions otherwise; `scope`: whole forward scope; `group`: region boundaries | `auto` |
+| `transfer_unit` | Restore coverage: `auto` uses F/B scopes in pipeline and regions otherwise; `scope` restores a scope, `group` uses region lookahead | `auto` |
+| `forward_commit_unit` | D2H submission: `group` submits at region boundaries; `scope` accumulates regions; `auto` follows `transfer_unit` for compatibility | `auto` |
+| `commit_batch_bytes` | Physical D2H batch target; also enables early scope flush at closed region boundaries; one indivisible storage may exceed it | `0` (disabled) |
+| `copy_chunk_bytes` | Maximum DMA-call size; does not split tensor ownership or bound total GPU allocations | `0` (one copy per storage) |
 | `pipeline_prefetch_steps` | Start up to N local F/B actions before the consuming backward, once its forward scope has closed | `1` |
 | `max_prefetch_bytes` | Shared speculative reload-byte window; independent of lookahead distance | 512 MiB |
 | `max_inflight_bytes` | D2H queue threshold before admitting the next complete transfer batch | 512 MiB |
@@ -23,7 +26,8 @@ refill its current scope, or use ordinary group hooks. Use `prefetch_groups=0`
 for completely demand-driven restores. Group-count settings do not turn whole
 F/B scopes into a group-count window in scope mode.
 
-The application flags are `--offload_transfer_unit` and
+The application exposes `--offload_transfer_unit`, `--offload_forward_commit_unit`,
+`--offload_commit_batch_mb`, `--offload_copy_chunk_mb` and
 `--offload_pipeline_prefetch_steps`, alongside the existing byte-window options.
 
 ## Scheduling and producer readiness
@@ -58,8 +62,14 @@ smaller than N after producer clipping or a budget retry.
 
 ## Transfer ownership and granularity
 
-In scope mode, selected regions contribute their live saved values to one
-forward-scope batch. D2H is committed when F exits. Each record keeps its actual
+With the legacy defaults, scope restore also accumulates a forward-scope batch
+and commits D2H when F exits. Submission and restoration are now independent:
+`transfer_unit=scope, forward_commit_unit=group` starts D2H inside F while keeping
+one scope restore queue and F/B action lookahead. A positive `commit_batch_bytes`
+flushes accumulated scope saves at a closed region once its queued bytes reach
+the target. The store splits submissions in storage order, with an oversized
+storage submitted alone. Discarded saves are pruned and batches rejected by the
+CPU budget do not wait for unrelated DMA. Each record keeps its actual
 producer-ready event; the transport waits before the relevant copy, instead of
 gating earlier ready data on every later producer. Without saved events it uses
 the corresponding producer stream dependency. Checkpoint intermediates are still
@@ -74,7 +84,7 @@ repeatedly scan all previously restored values. A forward immediately followed
 by its own backward keeps the whole scope resident, avoiding a round trip with
 no intervening compute action.
 
-Group mode retains earlier, region-by-region D2H and backward group lookahead.
+Group restore mode retains backward group lookahead.
 Its entry window counts groups introducing distinct pending records; aliases
 must not consume depth twice. Repeated schedule hints refill that same entry
 window rather than silently expanding it to further groups.
@@ -84,6 +94,33 @@ release data and overlap D2H earlier inside a long forward. This is an explicit
 granularity tradeoff, so neither choice is declared universally faster or more
 memory efficient. The D2H threshold permits one whole batch beyond its limit;
 speculative byte accounting is not a total physical GPU-memory limit.
+
+`copy_chunk_bytes` limits individual D2H/H2D calls. One final event fences all
+chunks of the storage, preserving views, versions and host-buffer reuse. The
+destination remains a whole storage: splitting DMA calls alone cannot reduce
+the full allocation needed by one tensor. Reclaiming different storages earlier
+comes from submission/restore scheduling. A failed partial submission drains
+its copy stream before the caller can recycle an unfenced host buffer.
+
+The storage-independent queues live in `activation_batch.py`: `ForwardCommitQueue`
+owns pending sources, `ScopeRestoreQueue` owns weak records, and `ActivationBatch`
+provides explicit flush/commit boundaries. `ActivationTransferEngine` handles
+streams and DMA; the F/B plan has no knowledge of DMA chunks or region types.
+
+## Optional dependency timing
+
+`store.trace(cuda_timing=True)` brackets each restored-value consumer dependency
+with CUDA events on that consumer's stream. The normal path records no timing
+events and queries no event readiness. Timing samples are bounded separately
+from metadata by `max_events`; exports report dropped and pending samples.
+`to_dict()` never synchronizes: pending intervals have `elapsed_ms=None`.
+Samples retain CUDA events but never tensors or saved records.
+
+These intervals include event overhead/host submission gaps and can overlap across consumer streams;
+their sum is not global critical-path cost. The application profiler format 3
+reports the sum/max, pending and dropped counts after its existing end-of-profile
+synchronization. Ordinary training remains uninstrumented. The diagnostic replay
+also exports these intervals separately from its broader backward read ranges.
 
 ## Lifetime and compatibility
 
@@ -102,6 +139,8 @@ Once code is generated, the plan itself does not bake in N. Change a store's
 configuration between completed training iterations to tune distance, unit and
 byte windows; do not change ownership/producer policy during an active scope.
 The ordinary compilation entry point still checks the supplied config for reuse.
+The new submission/chunk fields default to the previous behavior. Schedule ABI 1
+and its action keys are unchanged; missing fields in older configs use these defaults.
 
 ## Validation
 
@@ -116,3 +155,7 @@ always helps.
 
 Correctness, lookahead/byte-window measurements and resource records are in the
 [F/B action validation report](activation_action_validation_20261030.md).
+The independent submission/chunk/timing changes were added afterwards; the
+October 30 performance measurements do not measure those new opt-in modes.
+Their CPU results and pending CUDA checks are listed in the
+[submission validation record](activation_submission_validation_20261031.md).

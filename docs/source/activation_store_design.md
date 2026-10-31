@@ -34,12 +34,19 @@ Saved-tensor hooks use the same storage path without creating gradient anchors.
   buffers, pending completion events and host/cgroup headroom.
 * **Transport:** device streams, producer/consumer dependencies, transfer batches
   and backpressure. It has no module, checkpoint or pipeline knowledge.
+* **Submission and restore queues:** `activation_batch.py` separates source retention
+  until forward submission from weak-reference backward restore order. Physical
+  batch targets and DMA chunk sizes are independent of logical F/B scheduling.
+  Chunking does not split a storage's ownership or reduce its full allocation.
 * **Store and handles:** shared-storage identity, view metadata, version checks,
   saved-value ownership, gradient edges and explicit restore/evict/release.
 * **Adapters:** saved-tensor contexts and pipeline scheduling select regions and
   issue prefetch hints. Existing graph annotations remain the user-facing NNScaler
   integration; application recipes do not implement transfer mechanisms.
-* **Observation:** opt-in metadata-only events and counters. Independent probes
+* **Observation:** opt-in metadata events and counters; optional bounded CUDA-event
+  pairs measure consumer dependency intervals without retaining tensors. Normal
+  execution records no timing events. Export never synchronizes and marks pending
+  samples explicitly. Independent probes
   fix the transferred bytes, tensor count and reuse schedule before comparing
   runtime configurations. Full-model throughput does not establish transport
   efficiency by itself.

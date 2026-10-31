@@ -33,8 +33,18 @@ class CPUOffloadConfig:
     host_reserve_bytes: int = 32 * 1024**3
     # Keep disproportionate views resident; 0 permits copying their full storage.
     max_storage_to_tensor_ratio: int = 8
-    # auto: whole scheduled virtual-stage F/B scopes, groups otherwise.
+    # Restore coverage: auto uses scheduled F/B scopes, groups otherwise.
     transfer_unit: str = 'auto'
+    # Forward submission is independent of restore coverage. auto preserves
+    # the historical transfer_unit choice; group starts D2H inside a forward.
+    forward_commit_unit: str = 'auto'
+    # Target bytes per physical D2H batch. Scope submissions also flush at a
+    # closed region once accumulated bytes reach this target. Zero disables
+    # subdivision/early flush. One indivisible storage may exceed the target.
+    commit_batch_bytes: int = 0
+    # Maximum bytes per DMA call (0: one call per storage). Chunking preserves
+    # whole-storage ownership/aliasing; it does not cap a tensor's allocation.
+    copy_chunk_bytes: int = 0
     # Local virtual-stage F/B actions before the consuming backward. Zero
     # disables cross-action lookahead; group/current-backward refill remains.
     pipeline_prefetch_steps: int = 1
@@ -43,9 +53,9 @@ class CPUOffloadConfig:
 
     def __post_init__(self):
         for name, value in vars(self).items():
-            if name == 'transfer_unit':
+            if name in ('transfer_unit', 'forward_commit_unit'):
                 if value not in ('auto', 'scope', 'group'):
-                    raise ValueError('transfer_unit must be auto, scope, or group')
+                    raise ValueError(f'{name} must be auto, scope, or group')
                 continue
             if name in ('reload_on_compute_stream', 'skip_retained_inputs', 'use_save_events', 'release_pipeline_inputs'):
                 if not isinstance(value, bool):
@@ -53,3 +63,9 @@ class CPUOffloadConfig:
                 continue
             if isinstance(value, bool) or not isinstance(value, int) or value < 0:
                 raise ValueError(f'{name} must be a non-negative integer, got {value!r}')
+
+    def restore_unit(self, *, pipeline):
+        return ('scope' if pipeline else 'group') if self.transfer_unit == 'auto' else self.transfer_unit
+
+    def commit_unit(self, *, pipeline):
+        return self.restore_unit(pipeline=pipeline) if self.forward_commit_unit == 'auto' else self.forward_commit_unit

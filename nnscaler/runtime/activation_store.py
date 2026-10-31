@@ -8,6 +8,7 @@ import time
 import weakref
 import torch
 from .activation_config import CPUOffloadConfig
+from .activation_batch import ActivationBatch, record_batches
 from .activation_autograd import _GradientAnchor, _RestoreGradient
 from .activation_memory import _shared_pool
 from .activation_transfer import ActivationTransferEngine
@@ -237,6 +238,8 @@ class _StorageRecord:
                                                           nbytes=self.size, reason='prefetch_budget')
                         return False
                     self.pool.prefetched += self.size
+                    self.pool.stats['peak_prefetched_gpu_bytes'] = max(
+                        self.pool.stats['peak_prefetched_gpu_bytes'], self.pool.prefetched)
                     self.speculative = True
                 try:
                     self.device_tensor, self.h2d_event = self.store.transport.to_device(
@@ -282,7 +285,7 @@ class _StorageRecord:
             self.prefetch(demanded=True)
             raw = self.device_tensor
             stream = torch.cuda.current_stream(self.device)
-            stream.wait_event(self.h2d_event)
+            self.store.transport.wait_for_restore(stream, self.h2d_event, storage_id=self.uid, nbytes=self.size)
             raw.record_stream(stream)
         observation = getattr(self.store, 'observation', None)
         if observation is not None and observation.enabled:
@@ -327,75 +330,6 @@ class _SavedTensor:
         if observation is not None and observation.enabled:
             observation.emit('release_save', storage_id=self.record.uid, nbytes=self.record.size)
 
-
-
-class ActivationBatch:
-    """One forward submission boundary; batch metadata never owns saved values."""
-    def __init__(self, store):
-        self.store = store
-        self.records = []
-        self.pending = []
-        self.producer_events = None
-        self.closed = False
-        # A configuration change cannot leave a producer event covering only
-        # the earlier saves of a still-open batch.
-        self.capture_save_events = store.config.use_save_events
-
-    def capture_producer_event(self, stream):
-        if self.producer_events is None:
-            self.producer_events = {}
-        event = self.producer_events.get(stream.cuda_stream)
-        if event is None:
-            event = torch.cuda.Event()
-            self.producer_events[stream.cuda_stream] = event
-        # Re-record within this group; commit enqueues waits only after all
-        # saves. The latest snapshot covers every earlier save on this stream.
-        event.record(stream)
-        self.store.pool.stats['saved_tensor_event_records'] += 1
-        return event
-
-    def commit(self):
-        if self.closed:
-            return
-        # Select live saves, then let transport admission enqueue one whole
-        # batch without host waits between its copies.
-        manager = self.store
-        pending = []
-        for record in self.pending:
-            if record.live_saves:
-                pending.append(record)
-            else:
-                # A checkpoint with no saved intermediates can discard its
-                # input saver before leaving the region. No backward will ask
-                # for this record, so its staging reference must not cause DMA.
-                manager.pool.stats['discarded_save_bytes'] += record.size
-                manager.pool.stats['discarded_save_storages'] += 1
-        try:
-            manager.offload_batch(pending, self.producer_events)
-        finally:
-            # CUDA owns enqueued dependencies. Neither events nor staging
-            # references should be retained by a completed/failed group.
-            self.producer_events = None
-            self.pending.clear()
-            self.closed = True
-
-    def has_offloaded_records(self):
-        return any((record := ref()) is not None and record.d2h_event is not None
-                   for ref in self.records)
-
-    def has_pending_loads(self):
-        return any((record := ref()) is not None and record.d2h_event is not None
-                   and record.device_tensor is None for ref in self.records)
-
-    def prefetch(self, *, from_schedule=False):
-        return self.store._prefetch_records(
-            (ref() for ref in reversed(self.records)), from_schedule=from_schedule)
-
-
-    def save(self, tensor):
-        if self.closed or self.store._active_batch.get() is not self:
-            raise RuntimeError('Activation batch is not active')
-        return self.store.save(tensor)
 
 
 class ActivationHandle:
@@ -518,18 +452,22 @@ class ActivationStore:
     def _submit_records(self, records, producer_events=None):
         # Prepare before admission so allocation never gaps a submitted batch.
         started = time.perf_counter_ns() if self.observation.enabled else None
-        records = [record for record in records if record.prepare_offload()]
-        if records:
-            self.throttle(0)
-            self.transport.submit_batch(records, producer_events)
+        count = nbytes = 0
+        for batch in record_batches(records, self.config.commit_batch_bytes):
+            batch = [record for record in batch if record.prepare_offload()]
+            if batch:
+                self.throttle(0)
+                self.transport.submit_batch(batch, producer_events)
+                if started is not None:
+                    count += len(batch)
+                    nbytes += sum(record.size for record in batch)
         if started is not None:
-            self.observation.emit('batch_submit', count=len(records),
-                                  nbytes=sum(record.size for record in records),
+            self.observation.emit('batch_submit', count=count, nbytes=nbytes,
                                   cpu_duration_ns=time.perf_counter_ns() - started)
 
-    def trace(self, *, max_events=10000):
-        """Observe this store across threads without retaining tensors or CUDA events."""
-        return self.observation.trace(max_events)
+    def trace(self, *, max_events=10000, cuda_timing=False):
+        """Observe without retaining tensors; optional timing keeps bounded CUDA events."""
+        return self.observation.trace(max_events, cuda_timing=cuda_timing)
 
     def saved_tensors(self, *, exclude=()):
         """Store autograd saves in this store; exclude parameters/buffers by storage."""
@@ -575,9 +513,7 @@ class ActivationStore:
             yield batch
             batch.commit()
         finally:
-            batch.closed = True
-            batch.pending.clear()
-            batch.producer_events = None
+            batch.abort()
             self._active_batch.reset(token)
 
     def save(self, tensor):

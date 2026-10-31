@@ -65,7 +65,7 @@ class ActivationTransferEngine:
     def submit_batch(self, records, producer_events=None):
         """Submit an admitted batch without allocations or host waits between copies."""
         waited_events, waited_streams = set(), set()
-        copied = 0
+        copied = copied_bytes = 0
         with self._stream_batch(self.d2h_stream, self._d2h_batch):
             for record in records:
                 stream = record.producer_stream
@@ -79,11 +79,16 @@ class ActivationTransferEngine:
                 elif stream.cuda_stream not in waited_streams:
                     self.d2h_stream.wait_stream(stream)
                     waited_streams.add(stream.cuda_stream)
-                copied += bool(record.offload())
+                if record.offload():
+                    copied += 1
+                    copied_bytes += record.size
         if copied:
             self.stats['d2h_committed_groups'] += 1
+            self.stats['peak_d2h_batch_bytes'] = max(self.stats['peak_d2h_batch_bytes'], copied_bytes)
             self.stats['peak_queued_d2h_bytes'] = max(
                 self.stats['peak_queued_d2h_bytes'], self.inflight_bytes)
+            if self.observation.enabled:
+                self.observation.emit('d2h_batch_submit', nbytes=copied_bytes, count=copied)
 
     def to_host(self, source, destination):
         with self.observation.range('d2h'):
@@ -93,10 +98,16 @@ class ActivationTransferEngine:
         if not self._d2h_batch.get():
             with self._stream_batch(self.d2h_stream, self._d2h_batch):
                 return self._to_host(source, destination)
-        destination.copy_(source, non_blocking=True)
         source.record_stream(self.d2h_stream)
-        ready = torch.cuda.Event()
-        ready.record(self.d2h_stream)
+        try:
+            self._copy_into(destination, source, 'd2h')
+            ready = torch.cuda.Event()
+            ready.record(self.d2h_stream)
+        except BaseException:
+            # A later chunk/event can fail after earlier DMA was enqueued.
+            # The caller must not recycle a host buffer without its fence.
+            self.d2h_stream.synchronize()
+            raise
         self.inflight.append((source.numel() * source.element_size(), ready))
         self.inflight_bytes += source.numel() * source.element_size()
         return ready
@@ -104,6 +115,28 @@ class ActivationTransferEngine:
     def to_device(self, source, dependency):
         with self.observation.range('h2d'):
             return self._to_device(source, dependency)
+
+    def _copy_into(self, destination, source, direction):
+        """Split DMA calls without splitting a storage's ownership or readiness."""
+        chunk_bytes = self.config.copy_chunk_bytes
+        if not chunk_bytes or source.numel() * source.element_size() <= chunk_bytes:
+            destination.copy_(source, non_blocking=True)
+            chunks = int(source.numel() > 0)
+        else:
+            # The transport operates on flat storage buffers. Never flatten by
+            # copying: that would silently allocate a second activation.
+            src, dst = source.view(-1), destination.view(-1)
+            elements = max(1, chunk_bytes // source.element_size())
+            chunks = 0
+            for start in range(0, src.numel(), elements):
+                dst[start:start+elements].copy_(src[start:start+elements], non_blocking=True)
+                chunks += 1
+        self.stats[direction + '_copy_chunks'] += chunks
+        if self.observation.enabled:
+            self.observation.emit(direction + '_copy', nbytes=source.numel() * source.element_size(), count=chunks)
+
+    def wait_for_restore(self, stream, ready, *, storage_id, nbytes):
+        self.observation.wait_event(stream, ready, storage_id=storage_id, nbytes=nbytes)
 
     def _to_device(self, source, dependency):
         stream = self.h2d_stream
@@ -119,13 +152,23 @@ class ActivationTransferEngine:
 
     def _restore_on_stream(self, source, dependency, destination):
         stream = self.h2d_stream
-        with self.observation.range('h2d_copy'):
-            stream.wait_event(dependency)
-            if destination is None:
-                destination = source.to(self.device, non_blocking=True)
-            else:
-                destination.copy_(source, non_blocking=True)
-                destination.record_stream(stream)
-            ready = torch.cuda.Event()
-            ready.record(stream)
+        try:
+            with self.observation.range('h2d_copy'):
+                stream.wait_event(dependency)
+                if destination is None and not self.config.copy_chunk_bytes:
+                    destination = source.to(self.device, non_blocking=True)
+                    self.stats['h2d_copy_chunks'] += int(source.numel() > 0)
+                    if self.observation.enabled:
+                        self.observation.emit('h2d_copy', nbytes=source.numel() * source.element_size(),
+                                              count=int(source.numel() > 0))
+                else:
+                    if destination is None:
+                        destination = torch.empty(source.shape, dtype=source.dtype, device=self.device)
+                    destination.record_stream(stream)
+                    self._copy_into(destination, source, 'h2d')
+                ready = torch.cuda.Event()
+                ready.record(stream)
+        except BaseException:
+            stream.synchronize()
+            raise
         return destination, ready

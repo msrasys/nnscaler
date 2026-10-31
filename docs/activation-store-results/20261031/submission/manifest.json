@@ -1,0 +1,53 @@
+{
+  "cuda_execution": false,
+  "environment": {
+    "CUDA_VISIBLE_DEVICES": "",
+    "OMP_NUM_THREADS": "2",
+    "cuda_env_setup": "llm-train/scripts/k8s_env.sh"
+  },
+  "results": {
+    "nnscaler": {
+      "passed": 77,
+      "cuda_skipped": 88
+    },
+    "llm-train": {
+      "passed": 283,
+      "cuda_skipped": 8
+    }
+  },
+  "logs": {
+    "runtime-cpu.log.gz": "a7e562a617c2e574d381668e150200b8b36298ca9accc79cbe41497f0cc30ff5",
+    "application-cpu.log.gz": "103575e5a7b6db5fab14b06b0373d84afec9f4170c945d4299fefbd6d521308d"
+  },
+  "sources": {
+    "nnscaler": {
+      "base_commit": "431674a8830b0839caa5275f544ed354394583f4",
+      "files": {
+        "benchmark/benchmark_activation_schedule.py": "ee5517dabacd36b2ebd5967723bfcf0f7beecd02837bec7ac4d74ab6a9719104",
+        "nnscaler/runtime/activation_config.py": "dedff2861a7e80a9524448ed3b051ddc33efd62cb4408ba070f4162f530e170e",
+        "nnscaler/runtime/activation_observer.py": "e3e16b4c9483a86834562a774660d569fabf1ed1710dcf3261213d62b57273a8",
+        "nnscaler/runtime/activation_store.py": "13cb980656f46eb3416bb5612ea5c9417d9c0e646b85d66262713c5914878d1b",
+        "nnscaler/runtime/activation_transfer.py": "e204219d6747ca74b2b4b15eb24acd61c5ae046f553e8d89f8b345e402b463d9",
+        "nnscaler/runtime/cpu_offloading.py": "e94fdaefc6dc00feac633c1553a4bab868c94345ff75ffd55c4fe31ce5714c21",
+        "tests/runtime/test_activation_schedule.py": "e5ff8dc5e8ba60b60fcb7fadd325c3a98222ea4a6abb0ad9c9ea23f44ec89462",
+        "nnscaler/runtime/activation_batch.py": "d1573aa0734253d3a4a2d1b920d4b568cb90c0a55a376c484a9bae0ab18495b3",
+        "tests/runtime/test_activation_batch.py": "bc025c41caa6689d12f7e8dc549ca3663eef6aa00329f1f7ccc182ed961f0fc3",
+        "tests/runtime/test_activation_transfer.py": "39b30cbd91c3b3453ff5a839c5ddab853e4896126d2485cf93551ebb8e05c3fb"
+      }
+    },
+    "llm-train": {
+      "base_commit": "1e8abb31d59b48b1a2c54080726dea969eacfd5d",
+      "files": {
+        "llm/activation_offload.py": "42cf33df26da9c16f5a4ae825c2186db87dca8b344dda70a4a7553698d995368",
+        "llm/activation_offload_ledger.py": "375b5b5a9daf208f6dea16b893adfa6308b9b310f28a827fd26850b3d6ea8af9",
+        "llm/activation_profile.py": "a2def156e93cd780e0e2d3e9d56995180783d7531c10e601c0058a4491a3b8b7",
+        "llm/config.py": "654ec54f1f6a5bced0fb733ed4314f478c52191e52b653cdf41bda7be51a5667",
+        "llm/tests/test_activation_offload.py": "368d0fec6ba8ac6386d018652c826f747ad5964afcac210f52ca29d9b58350bb",
+        "llm/tests/test_activation_profile.py": "aabb8b3aa863f140bb846cde2827c215be69538ee683db1b7f3a720bf395a8d6",
+        "llm/tests/test_config_args.py": "78bc5ae7531b347fab6617253f6c6de1ac3a7801e0301cffc5219109a6352cbe",
+        "llm/tests/test_training_memory.py": "15914b5b9bbc648063df5d864315f3798d85aaa2c4d2450e195710ffab2d08c3"
+      }
+    }
+  },
+  "note": "Fingerprints identify the modified source tested on CPU; GPU combinations and full-model comparisons are pending."
+}

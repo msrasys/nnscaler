@@ -28,6 +28,9 @@ def main():
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--lookahead', type=int, default=1)
     parser.add_argument('--unit', choices=('auto', 'scope', 'group'), default='auto')
+    parser.add_argument('--forward-unit', choices=('auto', 'scope', 'group'), default='auto')
+    parser.add_argument('--commit-mib', type=int, default=0)
+    parser.add_argument('--copy-chunk-mib', type=int, default=0)
     parser.add_argument('--tensor-mib', type=int, default=64)
     parser.add_argument('--groups', type=int, default=2)
     parser.add_argument('--entry-groups', type=int, default=1,
@@ -44,6 +47,7 @@ def main():
     if (args.lookahead < 0 or args.lookahead > 64 or not 1 <= args.groups <= 16
             or not 1 <= args.tensor_mib or args.tensor_mib*args.groups*len(KEYS) > 1024
             or not 1 <= args.prefetch_mib <= 2048 or not 1 <= args.inflight_mib <= 2048
+            or not 0 <= args.commit_mib <= 2048 or not 0 <= args.copy_chunk_mib <= 1024
             or not 1 <= args.iterations <= 64 or not 1 <= args.warmup <= 8
             or not 1 <= args.entry_groups <= 1024 or not args.groups <= args.compute_repeats <= 1024):
         parser.error('Invalid probe bounds: at most 1 GiB total saved data, 2 GiB windows and 64 iterations')
@@ -55,6 +59,8 @@ def main():
         max_cpu_bytes=2*1024**3, min_tensor_bytes=0, use_save_events=True,
         max_prefetch_bytes=args.prefetch_mib*1024**2, max_inflight_bytes=args.inflight_mib*1024**2,
         reload_on_compute_stream=False, transfer_unit=args.unit, pipeline_prefetch_steps=args.lookahead,
+        forward_commit_unit=args.forward_unit, commit_batch_bytes=args.commit_mib*1024**2,
+        copy_chunk_bytes=args.copy_chunk_mib*1024**2,
         scope_prefetch_groups=args.entry_groups))
     module._get_activation_offload_manager = lambda: manager
     module.find_buffer_or_param_owner = lambda tensor: None
@@ -138,10 +144,10 @@ def main():
     after = manager.pool.snapshot()
     transferred = {k: after.get(k,0)-before.get(k,0) for k in
                    ('d2h_bytes','h2d_bytes','demand_loads','prefetch_loads','prefetch_budget_skips',
-                    'd2h_throttles','scope_commits','schedule_prefetch_calls')}
+                    'd2h_throttles','scope_commits','schedule_prefetch_calls','d2h_copy_chunks','h2d_copy_chunks')}
     expected_bytes = len(KEYS)*args.groups*size*args.iterations
     assert transferred['d2h_bytes'] == transferred['h2d_bytes'] == expected_bytes
-    with manager.trace(max_events=10000) as trace:
+    with manager.trace(max_events=10000, cuda_timing=True) as trace:
         diagnostic = iteration(True)
     output = dict(configuration={k:str(v) if isinstance(v,Path) else v for k,v in vars(args).items()},
                   plan=plan.describe(args.lookahead), samples=samples, counters=transferred,
@@ -150,6 +156,8 @@ def main():
                   median_read_interval_ms=statistics.median(s['backward_read_interval_ms'] for s in samples),
                   notes=['Actions replay the same interleaved local F/B order; they are not real model stages.',
                          'Backward read intervals include reductions and CPU submission gaps, not just H2D wait.',
+                         'Diagnostic cuda_waits bracket consumer dependencies; they include event overhead and may overlap.',
+                         'DMA chunks retain whole-storage ownership; chunk size is not a GPU allocation cap.',
                          'Optional action fences wait only for the current compute stream.',
                          'Checks, trace collection and boundary samples are outside timing samples.'])
     manager.close()
