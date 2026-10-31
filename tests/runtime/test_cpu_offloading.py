@@ -792,3 +792,56 @@ def test_released_reload_buffers_are_not_reused_under_pending_reads():
     _segment_backward(z.float().sum(), 'seg', manager)
     torch.cuda.synchronize()
     assert torch.equal(copy, x)
+
+
+# --------------------------------------------------------------------------- copy modes / prefetch policies / accounting
+
+from nnscaler.runtime.cpu_offload.copy_mode import BothKeep, CopyMode, D2HOnly, NoCopy, copy_mode_for
+from nnscaler.runtime.cpu_offload.prefetch import ExecutionPrefetch, GroupPrefetch, prefetch_policy_for
+
+
+def test_copy_mode_and_prefetch_policy_follow_the_config():
+    assert type(copy_mode_for('off')) is CopyMode and type(copy_mode_for('no_copy')) is NoCopy
+    assert type(copy_mode_for('d2h_only')) is D2HOnly and type(copy_mode_for('both_keep')) is BothKeep
+    assert [m.moves_bytes for m in (CopyMode(), NoCopy(), D2HOnly(), BothKeep())] == [True, False, True, True]
+    assert [m.keeps_sources for m in (CopyMode(), NoCopy(), D2HOnly(), BothKeep())] == [False, True, True, True]
+    with pytest.raises(ValueError):
+        copy_mode_for('sometimes')
+    manager = configure(OffloadConfig(numa_membind=False, fake_mode='both_keep', prefetch_unit='group'))
+    assert type(manager.engine.mode) is BothKeep and type(manager.tracker.policy) is GroupPrefetch
+    manager = configure(OffloadConfig(numa_membind=False))
+    assert type(manager.engine.mode) is CopyMode and type(manager.tracker.policy) is ExecutionPrefetch
+    with pytest.raises(ValueError):
+        prefetch_policy_for(OffloadConfig(prefetch_unit='layer'), manager.engine)
+
+
+@cuda_only
+def test_fake_modes_serve_consumers_from_the_saved_views():
+    host = _Host().cuda()
+    for mode in ('no_copy', 'd2h_only', 'both_keep'):
+        manager = _manager(fake_mode=mode)
+        base = torch.randn(64, 256, device='cuda')
+        ctx = manager.begin_forward('seg')
+        context = CPUOffloadContext(host, group_id=0)
+        with context:
+            handle = context._pack(base)
+        manager.end_forward(ctx)
+        manager.begin_backward('seg')
+        view = context._unpack(handle)
+        # the consumer reads the original storage, not a reload buffer
+        assert view.data_ptr() == base.data_ptr()
+        assert handle.region.src is not None
+        manager.end_backward(manager.tracker._backward_stack[-1])
+
+
+@cuda_only
+def test_group_profile_counts_each_group_once():
+    host = _Host().cuda(); manager = _manager()
+    x = torch.randn(64, 256, device='cuda', requires_grad=True)
+    h, _ = _segment_forward(host, x, 'seg', manager)
+    _segment_backward(h.float().sum(), 'seg', manager)
+    offload_stats()
+    rows = [line.split() for line in offload_report().splitlines()[3:]]
+    # each Linear+GELU group saves two tensors (the two inputs) in two regions, once per step
+    for gid, execs, tensors, regions, *_ in rows:
+        assert (float(execs), float(tensors), float(regions)) == (1.0, 2.0, 2.0), gid

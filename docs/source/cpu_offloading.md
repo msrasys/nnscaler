@@ -18,16 +18,25 @@ nothing of it stays resident.
                            schedule: hint_forward(seg, dist)        v
                                      prefetch_next_backward(seg) tracker.ExecutionTracker  (what / when)
                                                                    | batches, FIFO contexts, prefetch policy
- Executor.fexecute/backward ---------------------------------->    v
+ Executor.fexecute/backward ---------------------------------->    | prefetch.PrefetchPolicy  (when)
+                                                                   | per execution or per group, budget
+                                                                   v
                                                                  transport.Transfer / CopyEngine  (how)
-                                                                   | one slab + one event pair per group,
-                                                                   | D2H/H2D streams, windows, chunking,
-                                                                   | comm-exclusive barriers, fake modes
+                                                                   | one slab + chunked reloads per group,
+                                                                   | D2H/H2D streams, windows, budget gauge
+                                                                   | copy_mode.CopyMode: real or A/B mode
                                                                    v
                                                                  host_memory.PinnedPool      (where)
                                                                    | best-fit slabs, NUMA membind
                                                                  stats / config                (observe / tune)
 ```
+
+Each module owns one decision and nothing else: the tracker knows the
+executor's order and keeps the per-group counts, the policy decides what to
+reload ahead of demand, the transfer moves bytes and reports transport facts,
+the copy mode decides whether bytes really move (the A/B modes replace the
+real steps instead of branching inside the transfer), the pool owns pinned
+memory.
 
 ### 1.1 Planning: `offload_id` and `recompute_id`
 
@@ -98,6 +107,19 @@ parameters/buffers (ZeRO-3 safe) and otherwise registers the view with the
 group's transfer: a dictionary lookup, no CUDA call.  Unpack rebuilds the view
 with `as_strided` on the reloaded bytes.
 
+**Prefetch policy** (`prefetch.py`).  `ExecutionPrefetch` (`prefetch_unit=backward`)
+and `GroupPrefetch` (`group`) implement the two reload strategies described
+above behind one interface (`reload_demanded`, `reload_ahead`, `on_unpack`);
+the tracker resolves the announced segment names to pending contexts and
+hands them over, so a new strategy (for example one that derives the lead
+time from measured bandwidth) touches neither bookkeeping nor transport.
+
+**Copy mode** (`copy_mode.py`).  `CopyMode` is the real transport; `NoCopy`,
+`D2HOnly` and `BothKeep` are the A/B modes behind `fake_mode`.  They override
+the steps that differ (what commit schedules, whether sources are released,
+how a reload is produced, where a consumer reads) so the transfer's state
+machine contains no mode branches.
+
 **Transport** (`transport.py`).  The unit of transport is a *transfer*: all
 tensors one execution of one offload group saved (or a slice of them when
 `commit_bytes` flushes a large group early so its copy overlaps the rest of
@@ -140,7 +162,10 @@ confines all ranks to one socket.
 **Stats** (`stats.py`).  Per-step counters, CUDA-event timings (copy durations,
 compute-stream stall time, D2H backlog), the saved-tensor size histogram,
 per-group profiles and a summary table; `all_rank_max` reduces the timings
-across ranks because the pipeline waits for its slowest rank.  Host time is
+across ranks because the pipeline waits for its slowest rank.  Selection
+counters and the per-group counts have a single writer (the tracker's batch,
+when a group ends); the transport writes only transport facts and the timing
+collector only durations.  Host time is
 split into hook bookkeeping (`pack_seconds`, `commit_seconds`,
 `unpack_seconds`), copy issue (`d2h_issue_seconds`, `h2d_issue_seconds`) and
 pinned allocation (`acquire_seconds`, only while the pool grows), so a slow

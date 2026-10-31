@@ -1,7 +1,7 @@
 #  Copyright (c) Microsoft Corporation.
 #  Licensed under the MIT License.
 
-"""Which offloaded tensors will be needed next, and when to reload them.
+"""Which offloaded tensors belong to which execution, and when their backward comes.
 
 The order comes from execution contexts, not from guessing:
 
@@ -15,12 +15,15 @@ Both facts hold for 1F1B, interleaved 1F1B and gradient accumulation, so no
 warm-up iteration is needed.  The scheduler code generator adds two hints from
 the static schedule: ``hint_forward(name, distance)`` (how far away the own
 backward is) and ``prefetch_next_backward(*names)`` (the backwards that follow
-the one about to run).  With ``prefetch_unit=backward`` a segment execution is
-reloaded as a whole and ``prefetch_backwards`` announced executions are
-reloaded ahead, within the ``prefetch_bytes`` budget; with
-``prefetch_unit=group`` groups inside the running execution are reloaded
-``prefetch_groups`` ahead of demand.  Without an executor (eager use) batches
-fall back to a creation-order chain.
+the one about to run).  The tracker keeps these facts and the sequence
+invariants; what to reload ahead of demand is the :mod:`.prefetch` policy's
+decision.  Without an executor (eager use) batches fall back to a
+creation-order chain.
+
+This module is also the single writer of the per-group profile counts
+(:class:`~.stats.GroupProfile` executions, tensors, regions, bytes) and of the
+selection counters (what was saved, offloaded, shared, skipped); the transport
+reports how bytes moved.
 """
 
 from __future__ import annotations
@@ -34,6 +37,7 @@ import torch
 
 from .config import OffloadConfig
 from .hooks import OffloadedTensor, covered_bytes
+from .prefetch import PrefetchPolicy, prefetch_policy_for
 from .stats import GroupProfile, OffloadStats
 from .transport import CopyEngine, Transfer
 
@@ -56,7 +60,7 @@ class OffloadBatch:
         self.context = context
         self.device = device
         self.index = -1
-        self.tensors = 0
+        self.tensors = 0             # saved views handed to this batch (offloaded or shared)
         self.prefetched = False
         self.released = False
         self.transfers: List[Transfer] = []
@@ -88,6 +92,7 @@ class OffloadBatch:
     def has_regions(self) -> bool:
         return any(t.regions for t in self.transfers)
 
+    # -- collection -----------------------------------------------------------------
     def append(self, tensor: torch.Tensor) -> OffloadedTensor:
         self.tracker.stats.packed_tensors += 1
         self.tensors += 1
@@ -97,7 +102,7 @@ class OffloadBatch:
         current = self.transfer
         commit_bytes = self.tracker.config.commit_bytes
         if commit_bytes and current.handles and current.pending_bytes >= commit_bytes:
-            current.commit()                     # flush: the copy overlaps the rest of the group
+            self._commit(current)                # flush: the copy overlaps the rest of the group
             self.tracker.stats.flushes += 1
             current = self._open()
         return current.add(tensor)
@@ -121,24 +126,37 @@ class OffloadBatch:
                 return handle
         return None
 
+    def _commit(self, transfer: Transfer) -> None:
+        """Commit one transfer and account for what it selected."""
+        transfer.commit()
+        stats = self.tracker.stats
+        stats.deduplicated_bytes += max(transfer.saved_bytes - transfer.nbytes, 0)
+        if transfer.regions:
+            stats.offloaded_bytes += transfer.nbytes
+            stats.offloaded_regions += len(transfer.regions)
+            stats.transfers += 1
+
     def done(self) -> None:
-        """The group ended: commit the transfer (regions laid out, D2H scheduled)."""
-        self.transfer.commit()
+        """The group ended: commit, account the group's profile, release the previous group's hold."""
+        self._commit(self.transfer)
         if len(self.transfers) > 1 and not self.transfer.handles:
             self.transfers.pop()
         if self.context is not None and self.index > 0:
-            self.context.batches[self.index - 1].release_sources()
+            self.context.batches[self.index - 1].release_hold()
         self.tracker.engine.pump()
         profile = self.tracker.groups[self.group_id if self.group_id is not None else -1]
         profile.executions += 1
-        profile.tensors += self.tensors        # regions are counted by Transfer.commit
+        profile.tensors += self.tensors
+        profile.regions += sum(len(t.regions) for t in self.transfers)
+        profile.bytes += self.nbytes
         if self.has_regions and self.context is None:
             OffloadBatch.last_batch = weakref.ref(self)
 
-    def release_sources(self) -> None:
+    def release_hold(self) -> None:
         for transfer in self.transfers:
-            transfer.drop_sources()
+            transfer.release_hold()
 
+    # -- reload / release ----------------------------------------------------------
     def prefetch(self) -> None:
         if self.prefetched or self.released:
             return
@@ -184,7 +202,7 @@ class ExecContext:
 
 
 class ExecutionTracker:
-    """Forward/backward bookkeeping and the prefetch policy.
+    """Forward/backward bookkeeping; reload decisions are delegated to the policy.
 
     The per-segment queue mirrors ``Executor._detach[name]`` exactly: every
     forward with autograd enabled is enqueued (also when it offloaded nothing)
@@ -198,6 +216,7 @@ class ExecutionTracker:
         self.engine = engine
         self.stats = stats
         self.groups = groups
+        self.policy: PrefetchPolicy = prefetch_policy_for(config, engine)
         self._lock = threading.Lock()
         self._forward_stack: List[ExecContext] = []
         self._forward_seq: Dict[str, int] = collections.defaultdict(int)
@@ -223,10 +242,10 @@ class ExecutionTracker:
         """The backwards that follow the one about to run, in order.
 
         Called inside a running backward, the heads of the named queues are
-        those backwards and the first ``prefetch_backwards`` of them are
-        reloaded now.  Called before the current backward started (the scheduler
-        emits the hint just before the backward call), the announcement is acted
-        upon in :meth:`begin_backward` once the current context has been popped.
+        those backwards and the policy may reload them now.  Called before the
+        current backward started (the scheduler emits the hint just before the
+        backward call), the announcement is acted upon in :meth:`begin_backward`
+        once the current context has been popped.
         """
         self.engine.pump()
         with self._lock:
@@ -234,7 +253,7 @@ class ExecutionTracker:
             self._announced_done = not names
             inside = bool(self._backward_stack)
         if inside:
-            self._prefetch_announced()
+            self._reload_announced()
 
     # -- executor callbacks ---------------------------------------------------
     def begin_forward(self, name: str) -> ExecContext:
@@ -249,7 +268,7 @@ class ExecutionTracker:
 
     def end_forward(self, ctx: ExecContext) -> None:
         if ctx.batches:
-            ctx.batches[-1].release_sources()     # no next group will share them
+            ctx.batches[-1].release_hold()        # no next group will share them
         self.engine.pump()
         with self._lock:
             assert self._forward_stack and self._forward_stack[-1] is ctx, 'unbalanced begin/end_forward'
@@ -271,8 +290,9 @@ class ExecutionTracker:
                     f'CPU offloading: segment {name!r} backward #{expected} got forward #{ctx.seq}; '
                     'the tracker is out of sync with the executor')
             self._backward_stack.append(ctx)
-        self._reload_demanded(ctx)
-        self._prefetch_announced()
+        if ctx.batches:
+            self.policy.reload_demanded(ctx)
+        self._reload_announced()
         return ctx
 
     def end_backward(self, ctx: Optional[ExecContext]) -> None:
@@ -305,35 +325,16 @@ class ExecutionTracker:
         if batch is None:
             return
         self.engine.pump()
-        ctx = batch.context
-        if ctx is None:
-            batch.prefetch()
-            previous = batch.previous() if batch.previous is not None else None
-            count = self.config.prefetch_groups
-            while previous is not None and count > 0:
-                previous.prefetch()
-                count -= 1
-                previous = previous.previous() if previous.previous is not None else None
+        if batch.context is None:
+            self.policy.on_eager_unpack(batch)
             return
-        if self.config.prefetch_unit == 'group':
-            self._prefetch_from(ctx, batch.index, include_self=True)
-        else:
-            batch.prefetch()                       # demanded; normally issued with its context
+        self.policy.on_unpack(batch)
         if not self._announced_done:
-            self._prefetch_announced()             # budget may have room now
+            self._reload_announced()           # the budget may have room now
 
-    # -- prefetch policy -----------------------------------------------------
-    def _reload_demanded(self, ctx: ExecContext) -> None:
-        """The backward of ``ctx`` starts: its saved tensors are needed now."""
-        if not ctx.batches:
-            return
-        if self.config.prefetch_unit == 'backward':
-            ctx.prefetch()
-        else:
-            self._prefetch_from(ctx, len(ctx.batches) - 1, include_self=True)
-
-    def _prefetch_announced(self) -> None:
-        """Reload the announced upcoming backwards ahead of demand, within the budget."""
+    # -- announced backwards ----------------------------------------------------
+    def _reload_announced(self) -> None:
+        """Resolve the announced names to pending contexts and let the policy reload ahead."""
         with self._lock:
             names = list(self._announced)
             if not names:
@@ -348,45 +349,9 @@ class ExecutionTracker:
                 offsets[name] += 1
                 if queue is not None and position < len(queue):
                     contexts.append(queue[position])
-        unit = self.config.prefetch_unit
-        ahead = self.config.prefetch_backwards if unit == 'backward' else 1
-        done = True
-        for ctx in contexts[:ahead]:
-            if ctx.prefetched or not ctx.batches:
-                continue
-            if not self.engine.within_reload_budget():
-                done = False
-                break
-            if unit == 'backward':
-                ctx.prefetch()
-            else:
-                self._prefetch_from(ctx, len(ctx.batches) - 1, include_self=True)
-                ctx.prefetched = True
+        done = self.policy.reload_ahead(contexts)
         with self._lock:
             self._announced_done = done
-
-    def _prefetch_from(self, ctx: ExecContext, index: int, *, include_self: bool) -> None:
-        """Reload ``ctx.batches[index]`` (if ``include_self``) and ``prefetch_groups`` groups before it.
-
-        Groups that saved nothing cost nothing; the ``prefetch_bytes`` budget
-        stops the lookahead (the demanded group always loads).
-        """
-        budget_groups = self.config.prefetch_groups
-        taken = 0
-        for i in range(index, -1, -1):
-            batch = ctx.batches[i]
-            if i == index:
-                if include_self:
-                    batch.prefetch()
-                continue
-            if not batch.has_regions or batch.prefetched:
-                if batch.prefetched:
-                    taken += 1
-                continue
-            if taken >= budget_groups or not self.engine.within_reload_budget():
-                break
-            batch.prefetch()
-            taken += 1
 
     # -- state ----------------------------------------------------------------
     def pending_summary(self) -> Tuple[int, int]:

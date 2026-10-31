@@ -39,7 +39,7 @@ class OffloadManager:
         self.timing = TimingCollector()
         self.sizes = SizeHistogram()
         self.pool = PinnedPool(max_bytes=self.config.pool_max_bytes)
-        self.engine = CopyEngine(self.config, self.pool, self.stats, self.timing, self.groups)
+        self.engine = CopyEngine(self.config, self.pool, self.stats, self.timing)
         self.tracker = ExecutionTracker(self.config, self.engine, self.stats, self.groups)
         self._debugged_groups: set = set()
         self._pool_waits_seen = 0

@@ -13,7 +13,11 @@ import torch
 
 @dataclass
 class GroupProfile:
-    """Per offload group (planning id) accumulation, for the summary table."""
+    """Per offload group (planning id) accumulation, for the summary table.
+
+    The counts are written by the tracker's batch when a group ends; the
+    durations by :class:`TimingCollector` when the copy events complete.
+    """
     executions: int = 0
     tensors: int = 0
     regions: int = 0
@@ -73,9 +77,13 @@ def _human(nbytes: int) -> str:
 
 @dataclass
 class OffloadStats:
-    """Counters since the last reset (one training step when the trainer polls)."""
+    """Counters since the last reset (one training step when the trainer polls).
 
-    # selection
+    Selection counters are written by the tracker (what was saved, offloaded,
+    shared or skipped); reload/transport counters and times by the transport.
+    """
+
+    # selection (tracker)
     packed_tensors: int = 0
     offloaded_regions: int = 0   # contiguous byte ranges actually copied
     offloaded_bytes: int = 0
@@ -85,12 +93,12 @@ class OffloadStats:
     shared_bytes: int = 0        # served by the previous group's transfer (dedup_scope=context)
     transfers: int = 0           # transfers that moved bytes (groups, or flushed slices of groups)
     flushes: int = 0             # early commits caused by commit_bytes
-    # reload
+    # reload (transport)
     prefetched_regions: int = 0
     prefetched_bytes: int = 0
     stalls: int = 0              # reloads whose copy was still running when demanded (CPU view)
     forced_h2d: int = 0          # reloads issued on demand because no prefetch covered them
-    # transport
+    # transport policies
     deferred_d2h: int = 0
     deferred_h2d: int = 0
     comm_windows: int = 0

@@ -12,13 +12,14 @@ issued behind a single event that orders them after the producing stream.  The
 reload is one device buffer and one H2D copy per chunk, each with its own
 event, so the first tensors of a group can be consumed before the rest arrived
 and a chunk's device memory is released as soon as its views were consumed.
-Per saved tensor this costs a dictionary lookup at pack time and one event
-query at unpack time.
 
-:class:`CopyEngine` owns the two copy streams and every policy about *how*
+:class:`Transfer` is the state machine; which steps actually move bytes is the
+:class:`~.copy_mode.CopyMode` (real transport or an A/B mode).
+:class:`CopyEngine` owns the two copy streams and the policies about *how*
 bytes move (chunking, bounded in-flight windows, communication-exclusive
-windows, the reload budget, the fake A/B modes).  Neither class knows anything
-about autograd or pipeline schedules.
+windows, the reload budget).  Neither knows anything about autograd or pipeline
+schedules, and neither keeps per-group profiles: they report transport facts
+(bytes moved, copy durations, stalls) only.
 """
 
 from __future__ import annotations
@@ -32,9 +33,10 @@ import torch
 
 from nnscaler.runtime.device import DeviceGroup
 from .config import OffloadConfig
+from .copy_mode import CopyMode, copy_mode_for
 from .hooks import OffloadedTensor, covered_bytes
 from .host_memory import PinnedPool
-from .stats import GroupProfile, OffloadStats, TimingCollector
+from .stats import OffloadStats, TimingCollector
 
 D2H_STREAM_NAME = 'cpu_offload_d2h'
 H2D_STREAM_NAME = 'cpu_offload_h2d'
@@ -97,14 +99,16 @@ class Transfer:
     """Saved tensors of one offload group execution, moved as one unit.
 
     Life cycle: ``add`` while the group runs -> ``commit`` (regions and chunks
-    laid out, D2H scheduled) -> device memory released -> ``prefetch`` /
-    ``issue_h2d`` -> ``fetch`` per saved tensor (consumer waits for the chunk
-    holding it) -> ``release`` with the owning batch (slab back to the pool).
+    laid out, the mode schedules the D2H) -> device memory released ->
+    ``prefetch`` / ``issue_h2d`` -> ``fetch`` per saved tensor (consumer waits
+    for the chunk holding it) -> ``release`` with the owning batch (slab back
+    to the pool).  ``saved_bytes``/``nbytes``/``regions`` are read by the
+    owning batch for the per-group profile.
     """
 
     __slots__ = (
-        'engine', 'owner', 'group_id', 'device', 'handles', 'regions', 'chunks', 'nbytes', 'pending_bytes',
-        '_storages', 'host', 'keep_src', 'hold_src', 'consumer_stream', 'lock',
+        'engine', 'owner', 'group_id', 'device', 'handles', 'regions', 'chunks', 'nbytes', 'saved_bytes',
+        'pending_bytes', '_storages', 'host', 'hold_src', 'consumer_stream', 'lock',
         'ready_event', 'd2h_start', 'd2h_event', 'h2d_start', 'h2d_event',
         'committed', 'd2h_issued', 'h2d_issued', 'released', 'unconsumed', '_h2d_tracked', '_recorded',
     )
@@ -117,12 +121,12 @@ class Transfer:
         self.handles: List[OffloadedTensor] = []
         self.regions: List[Region] = []
         self.chunks: List[Chunk] = []
-        self.nbytes = 0
+        self.nbytes = 0              # slab bytes after layout
+        self.saved_bytes = 0         # bytes of all saved views (before merging overlaps)
         self.pending_bytes = 0       # bytes of saved views registered so far (before commit)
         self._storages: Dict[int, _SavedStorage] = {}
         self.host: Optional[torch.Tensor] = None
-        self.keep_src = engine.config.fake_mode != 'off'
-        self.hold_src = False        # keep sources after the D2H copy (cross-group dedup)
+        self.hold_src = False        # keep sources after the D2H copy (cross-group sharing)
         self.consumer_stream: Optional[torch.cuda.Stream] = None
         self.lock = threading.Lock()
         self.ready_event: Optional[torch.cuda.Event] = None
@@ -136,7 +140,11 @@ class Transfer:
         self.released = False
         self.unconsumed = 0
         self._h2d_tracked = False
-        self._recorded: Dict[int, torch.cuda.Stream] = {}   # chunk index -> stream recorded on
+        self._recorded: Dict[int, torch.cuda.Stream] = {}   # chunk id -> stream recorded on
+
+    @property
+    def mode(self) -> CopyMode:
+        return self.engine.mode
 
     # -- collection -----------------------------------------------------------
     def add(self, tensor: torch.Tensor) -> OffloadedTensor:
@@ -175,17 +183,16 @@ class Transfer:
             region.chunk.unconsumed += 1
 
     def commit(self) -> None:
-        """Lay the saved views out in one slab and schedule the D2H copies."""
+        """Lay the saved views out in one slab; the mode schedules the copies."""
         if self.committed:
             return
         self.committed = True
         offset = 0
-        saved_bytes = 0
         for saved in self._storages.values():
             storage_regions: List[Region] = []
             region: Optional[Region] = None
             for handle in sorted(saved.handles, key=lambda h: h.lo):
-                saved_bytes += handle.hi - handle.lo
+                self.saved_bytes += handle.hi - handle.lo
                 if handle.hi == handle.lo:
                     continue
                 if region is not None and handle.lo <= region.hi:
@@ -203,29 +210,11 @@ class Transfer:
         self.nbytes = offset
         if self.chunks:
             self.chunks[-1].end = offset
-        regions = self.regions
         for handle in self.handles:
             if handle.region is not None:
                 handle.region.chunk.unconsumed += 1
-        stats = self.engine.stats
-        stats.deduplicated_bytes += max(saved_bytes - sum(r.nbytes for r in regions), 0)
-        if not regions:
-            return
-        stats.offloaded_bytes += self.nbytes
-        stats.offloaded_regions += len(regions)
-        stats.transfers += 1
-        profile = self.engine.groups[self.group_id]
-        profile.bytes += self.nbytes
-        profile.regions += len(regions)
-        if self.engine.config.fake_mode == 'no_copy':
-            self.d2h_issued = self.h2d_issued = True
-            self.d2h_event = torch.cuda.Event()
-            self.d2h_event.record(torch.cuda.current_stream())
-            return
-        # one event orders every copy after the kernels that produced the views
-        self.ready_event = torch.cuda.Event()
-        self.ready_event.record(torch.cuda.current_stream())
-        self.engine.schedule_d2h(self)
+        if self.regions:
+            self.mode.commit(self)
 
     def _place(self, region: Region, offset: int) -> int:
         chunk_bytes = self.engine.config.copy_chunk_bytes
@@ -241,6 +230,55 @@ class Transfer:
         end = (offset + region.nbytes + REGION_ALIGN - 1) // REGION_ALIGN * REGION_ALIGN
         chunk.end = end
         return end
+
+    # -- steps the copy mode composes -------------------------------------------
+    def record_ready(self) -> None:
+        """One event on the compute stream orders every copy after the kernels that produced the views."""
+        self.ready_event = torch.cuda.Event()
+        self.ready_event.record(torch.cuda.current_stream())
+
+    def mark_resident(self) -> None:
+        """Nothing moves: the saved views stay and count as copied and reloaded."""
+        self.d2h_issued = self.h2d_issued = True
+        self.d2h_event = torch.cuda.Event()
+        self.d2h_event.record(torch.cuda.current_stream())
+
+    def drop_sources(self) -> None:
+        """Release the device memory of the saved views (the copies hold it via ``record_stream``)."""
+        for region in self.regions:
+            region.src = None
+
+    def alias_reload_to_d2h(self) -> None:
+        """No reload: consumers wait for the D2H copy instead (A/B measurement)."""
+        for chunk in self.chunks:
+            chunk.event = self.d2h_event
+        self.h2d_event = self.d2h_event
+
+    def copy_chunks_to_device(self, h2d: torch.cuda.Stream, consumer: torch.cuda.Stream) -> None:
+        """One device buffer and one copy per chunk, each with its own event (on the H2D stream)."""
+        engine = self.engine
+        host = self.host
+        on_copy_stream = engine.config.reload_on_copy_stream
+        if not on_copy_stream:
+            # buffers come from the consumer's allocator pool: their memory may
+            # still be read by work queued there
+            h2d.wait_stream(consumer)
+        if engine.timed:
+            self.h2d_start = torch.cuda.Event(enable_timing=True)
+            self.h2d_start.record(h2d)
+        for chunk in self.chunks:
+            if on_copy_stream:
+                buffer = torch.empty(chunk.nbytes, dtype=torch.uint8, device=self.device)
+            else:
+                with torch.cuda.stream(consumer):
+                    buffer = torch.empty(chunk.nbytes, dtype=torch.uint8, device=self.device)
+                buffer.record_stream(h2d)
+            buffer.copy_(host[chunk.start:chunk.end], non_blocking=True)
+            chunk.buffer = buffer
+            chunk.event = torch.cuda.Event(enable_timing=engine.timed and chunk is self.chunks[-1])
+            chunk.event.record(h2d)
+        self.h2d_event = self.chunks[-1].event
+        engine.reload_issued(self.nbytes)
 
     # -- D2H -------------------------------------------------------------------
     def issue_d2h(self) -> None:
@@ -266,19 +304,14 @@ class Transfer:
                 region.src.record_stream(d2h)
             self.d2h_event = torch.cuda.Event(enable_timing=engine.timed)
             self.d2h_event.record(d2h)
-        if not (self.keep_src or self.hold_src):
-            self.drop_sources()
+        self.mode.after_d2h(self)
         stats.d2h_issue_seconds += time.perf_counter() - t1
         if engine.timed:
             engine.timing.track_d2h(self, self.group_id)
 
-    def drop_sources(self) -> None:
-        """Release the device memory of the saved views (the copies hold it via ``record_stream``)."""
-        self.hold_src = False
-        if self.keep_src or not self.d2h_issued:
-            return
-        for region in self.regions:
-            region.src = None
+    def release_hold(self) -> None:
+        """The next group committed (or the execution ended): sources kept for sharing may go."""
+        self.mode.release_hold(self)
 
     # -- H2D -------------------------------------------------------------------
     def prefetch(self) -> None:
@@ -300,43 +333,17 @@ class Transfer:
         for chunk in self.chunks:
             chunk.state = None
         self._recorded = {}
-        if engine.config.fake_mode == 'd2h_only':
-            for chunk in self.chunks:
-                chunk.event = self.d2h_event
-            self.h2d_event = self.d2h_event
-            return
         t0 = time.perf_counter()
         h2d = engine.h2d_stream
         consumer = self.consumer_stream or torch.cuda.current_stream()
-        host = self.host
-        on_copy_stream = engine.config.reload_on_copy_stream
         with torch.cuda.stream(h2d):
             h2d.wait_event(self.d2h_event)
-            if not on_copy_stream:
-                # buffers come from the consumer's allocator pool: their memory may
-                # still be read by work queued there
-                h2d.wait_stream(consumer)
             engine.wait_comm_barrier(h2d)
-            if engine.timed:
-                self.h2d_start = torch.cuda.Event(enable_timing=True)
-                self.h2d_start.record(h2d)
-            for chunk in self.chunks:
-                if on_copy_stream:
-                    buffer = torch.empty(chunk.nbytes, dtype=torch.uint8, device=self.device)
-                else:
-                    with torch.cuda.stream(consumer):
-                        buffer = torch.empty(chunk.nbytes, dtype=torch.uint8, device=self.device)
-                    buffer.record_stream(h2d)
-                buffer.copy_(host[chunk.start:chunk.end], non_blocking=True)
-                chunk.buffer = buffer
-                chunk.event = torch.cuda.Event(enable_timing=engine.timed and chunk is self.chunks[-1])
-                chunk.event.record(h2d)
-        self.h2d_event = self.chunks[-1].event
-        engine.reload_issued(self.nbytes)
+            self.mode.reload(self, h2d, consumer)
         stats.h2d_issue_seconds += time.perf_counter() - t0
         stats.prefetched_bytes += self.nbytes
         stats.prefetched_regions += len(self.regions)
-        if engine.timed and not self._h2d_tracked:
+        if engine.timed and self.h2d_start is not None and not self._h2d_tracked:
             self._h2d_tracked = True
             engine.timing.track_h2d(self, self.group_id)
 
@@ -349,7 +356,7 @@ class Transfer:
             raise RuntimeError('offloaded tensor has no bytes (empty view)')
         chunk = region.chunk
         engine = self.engine
-        if not self.keep_src and (chunk.buffer is None or not self.h2d_issued):
+        if not self.h2d_issued or self.mode.missing_reload(chunk):
             if self.h2d_issued:
                 # every view of the chunk was unpacked once and its buffer handed
                 # to autograd; a second unpack (retain_graph) reloads from the slab
@@ -358,7 +365,7 @@ class Transfer:
                 self.h2d_issued = False
             engine.force_h2d(self)
         current = torch.cuda.current_stream()     # one CUDA device per process (checked at pack time)
-        if chunk.event is not None and engine.config.fake_mode != 'no_copy':
+        if chunk.event is not None:
             state = chunk.state
             # a chunk observed complete stays complete, and a stream that already
             # waits on it needs no second wait: most fetches cost no CUDA call.
@@ -379,10 +386,8 @@ class Transfer:
                     else:
                         current.wait_event(chunk.event)
                     chunk.state = current
-        if self.keep_src:
-            base, start = region.src, 0
-        else:
-            base, start = chunk.buffer, region.offset - chunk.start
+        base, start = self.mode.locate(handle)
+        if base is chunk.buffer:
             index = id(chunk)
             recorded = self._recorded.get(index)
             if recorded is None or recorded != current:
@@ -398,8 +403,9 @@ class Transfer:
             done = self.unconsumed == 0
             if chunk is not None:
                 chunk.unconsumed -= 1
-                if chunk.unconsumed == 0 and not self.keep_src and chunk.buffer is not None:
-                    # autograd holds the unpacked views; drop our reference early
+                if chunk.unconsumed == 0 and chunk.buffer is not None:
+                    # autograd holds the unpacked views (or, in the A/B modes,
+                    # never reads the buffer): drop our reference early
                     chunk.buffer = None
                     self.engine.reload_consumed(chunk.nbytes)
         if done and self.owner is not None and self.owner.context is None:
@@ -431,13 +437,13 @@ class CopyEngine:
     """Streams and copy policies shared by all transfers of a device."""
 
     def __init__(self, config: OffloadConfig, pool: PinnedPool, stats: OffloadStats,
-                 timing: TimingCollector, groups: Dict[int, GroupProfile]) -> None:
+                 timing: TimingCollector) -> None:
         self.config = config
         self.pool = pool
         self.stats = stats
         self.timing = timing
-        self.groups = groups
         self.timed = config.timing
+        self.mode: CopyMode = copy_mode_for(config.fake_mode)
         self._d2h_stream: Optional[torch.cuda.Stream] = None
         self._h2d_stream: Optional[torch.cuda.Stream] = None
         self._lock = threading.Lock()
@@ -507,7 +513,7 @@ class CopyEngine:
         held back until it ends; the window never waits for copies).
         """
         mode = self.config.comm_exclusive
-        if mode == 'off' or self.config.fake_mode == 'no_copy':
+        if mode == 'off' or not self.mode.moves_bytes:
             return
         self._comm_depth += 1
         if self._comm_depth > 1:
@@ -525,7 +531,7 @@ class CopyEngine:
         self.stats.comm_windows += 1
 
     def comm_end(self) -> None:
-        if self.config.comm_exclusive == 'off' or self.config.fake_mode == 'no_copy':
+        if self.config.comm_exclusive == 'off' or not self.mode.moves_bytes:
             return
         self._comm_depth -= 1
         if self._comm_depth > 0:

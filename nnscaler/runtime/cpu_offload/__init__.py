@@ -15,11 +15,13 @@ Three layers, only the first of which depends on how a model is parallelized:
    schedule.
 3. **Runtime** (this package): :mod:`.config` knobs, :mod:`.host_memory`
    (NUMA-placed best-fit pinned slab pool), :mod:`.transport` (one transfer per
-   group execution: merged regions, one slab, one event pair per direction;
-   copy streams and policies), :mod:`.tracker` (execution contexts and
-   prefetch order), :mod:`.hooks` (the saved-tensor hooks) and :mod:`.stats`
-   (counters, GPU timings, size histogram, per-group profiles), composed by
-   :class:`.manager.OffloadManager`.
+   group execution: merged regions, one slab, chunked reloads; copy streams,
+   windows and the reload budget), :mod:`.copy_mode` (whether the bytes really
+   move: the real transport and the A/B modes), :mod:`.tracker` (execution
+   contexts, sequence invariants, per-group accounting), :mod:`.prefetch`
+   (when to reload: per execution or per group), :mod:`.hooks` (the
+   saved-tensor hooks) and :mod:`.stats` (counters, GPU timings, size
+   histogram, per-group profiles), composed by :class:`.manager.OffloadManager`.
 
 See ``docs/source/cpu_offloading.md`` for the design and the tuning workflow.
 """
@@ -33,6 +35,8 @@ from .manager import OffloadManager
 from .stats import OffloadStats, GroupProfile, SizeHistogram, all_rank_max, format_summary
 from .tracker import ExecutionTracker, ExecContext, OffloadBatch
 from .transport import CopyEngine, Transfer, Region, Chunk, D2H_STREAM_NAME, H2D_STREAM_NAME
+from .copy_mode import CopyMode, NoCopy, D2HOnly, BothKeep, copy_mode_for
+from .prefetch import PrefetchPolicy, ExecutionPrefetch, GroupPrefetch, prefetch_policy_for
 
 __all__ = [
     'OffloadConfig', 'OffloadManager', 'CPUOffloadContext', 'comm_exclusive',
