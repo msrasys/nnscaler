@@ -231,6 +231,37 @@ The remaining gap on this node is the PCIe/NVLink hub contention above, so
 attention offload cannot beat attention recompute there, whose whole cost is
 0.36 s/step at 8k.
 
+Same node, combined form (`--recompute_modules Attention,MoEExpert
+--offload_modules Block`) with the per-execution reload, steps 6-20 mean:
+
+| configuration | seq | mbs | step (s) | peak (GiB) | tokens/s | moved per step |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| production | 8k | 1 | 4.86 | 67.3 | 53.2k | - |
+| combined form, defaults | 8k | 1 | 8.25 | 50.6 | 31.3k | 102 GiB |
+| combined form, copies disabled (`no_copy`) | 8k | 1 | 5.45 | 67.5 | 47.4k | - |
+| combined form, `prefetch_backwards=2` | 8k | 1 | 8.19 | 53.7 | 31.6k | 102 GiB |
+| combined form, `comm_exclusive=soft` | 8k | 1 | 8.39 | 50.6 | 30.9k | 102 GiB |
+| combined form, `prefetch_backwards=2`, `min_bytes` 8 MiB, `min_backward_distance=2` | 8k | 1 | 7.70 | 53.5 | 33.5k | 99 GiB |
+| production | 8k | 2 | 8.62 | 99.6 | 60.2k | - |
+| combined form, best knobs | 8k | 2 | 14.45 | 72.0 | 36.0k | 198 GiB |
+| production | 16k | 1 | 8.73 | 99.9 | 58.7k | - |
+| combined form, best knobs | 16k | 1 | 14.04 | 72.3 | 36.5k | 198 GiB |
+
+Mechanically everything behaves as designed: no reload stalls (0.001 s/step),
+copies at the link's measured limits (37 GB/s D2H, 50 GB/s H2D), the peak
+stays flat from micro-batch 1 to 2 (50.6 -> 72.0 GiB against 67.3 -> 99.6 for
+production), loss differences against production are the same size as
+production's own run-to-run differences (DeepEP is not deterministic).
+Economically it does not pay on this node: the `no_copy` run puts the
+framework overhead at 0.6 s/step (12%, mostly the saved-tensor hook calls), the
+other 2.8 s/step are the bytes contending with DeepEP in the I/O hub, and the
+memory freed buys nothing because production already fits at micro-batch 2 and
+the peak is dominated by weights and optimizer state (102 GiB moved per step
+lower the peak by 17 GiB).  Offloading activations would start to matter where
+production runs out of memory (sequences of 32k and above on this node), and
+the remaining lever within the feature is to move fewer bytes
+(`min_backward_distance`) or to place copies where the hub is idle.
+
 4x A6000 (PCIe only, no NVLink), YOCO-MoE-A0.4B, PP2 x EP2, interleaved 1F1B,
 8 micro-batches, seq 4096, last of 4-5 steps, rank 0:
 
