@@ -131,8 +131,7 @@ class OffloadBatch:
         self.tracker.engine.pump()
         profile = self.tracker.groups[self.group_id if self.group_id is not None else -1]
         profile.executions += 1
-        profile.tensors += self.tensors
-        profile.regions += sum(len(t.regions) for t in self.transfers)
+        profile.tensors += self.tensors        # regions are counted by Transfer.commit
         if self.has_regions and self.context is None:
             OffloadBatch.last_batch = weakref.ref(self)
 
