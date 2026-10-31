@@ -152,20 +152,16 @@ class ActivationTransferEngine:
 
     def _restore_on_stream(self, source, dependency, destination):
         stream = self.h2d_stream
+        # Allocation failure has not submitted a read of this host buffer.
+        # Propagate it immediately: draining unrelated queued restores can wait
+        # on peers that also stopped at OOM. Only partial DMA needs draining.
+        if destination is None:
+            destination = torch.empty(source.shape, dtype=source.dtype, device=self.device)
+        destination.record_stream(stream)
         try:
             with self.observation.range('h2d_copy'):
                 stream.wait_event(dependency)
-                if destination is None and not self.config.copy_chunk_bytes:
-                    destination = source.to(self.device, non_blocking=True)
-                    self.stats['h2d_copy_chunks'] += int(source.numel() > 0)
-                    if self.observation.enabled:
-                        self.observation.emit('h2d_copy', nbytes=source.numel() * source.element_size(),
-                                              count=int(source.numel() > 0))
-                else:
-                    if destination is None:
-                        destination = torch.empty(source.shape, dtype=source.dtype, device=self.device)
-                    destination.record_stream(stream)
-                    self._copy_into(destination, source, 'h2d')
+                self._copy_into(destination, source, 'h2d')
                 ready = torch.cuda.Event()
                 ready.record(stream)
         except BaseException:

@@ -147,3 +147,18 @@ def test_copy_submission_failure_drains_queued_work_before_buffer_reuse(monkeypa
             engine._restore_on_stream(source, SimpleNamespace(time=0), destination)
     assert torch.equal(destination[:4], source[:4]) and stream.syncs == 1
     assert not engine.inflight and engine.inflight_bytes == 0
+
+
+@pytest.mark.parametrize('chunk', [0,4])
+def test_restore_allocation_failure_does_not_wait_on_unrelated_transfers(monkeypatch,chunk):
+    engine = ActivationTransferEngine(CPUOffloadConfig(copy_chunk_bytes=chunk),
+                                      torch.device('cpu'), Counter(), _Observation())
+    stream = Stream()
+    engine.h2d_stream = stream
+    source = torch.ones(8,dtype=torch.uint8)
+    def fail_allocation(*args,**kwargs):
+        raise torch.OutOfMemoryError('destination allocation failed')
+    monkeypatch.setattr(torch,'empty',fail_allocation)
+    with pytest.raises(torch.OutOfMemoryError,match='destination allocation failed'):
+        engine._restore_on_stream(source,SimpleNamespace(time=100),None)
+    assert stream.syncs == stream.waits == 0

@@ -1,0 +1,13 @@
+{
+  "cuda_execution": false,
+  "passed": 79,
+  "cuda_skipped": 88,
+  "base_commit": "4d06bd0845c5863f7aaf2b36dbf5d220dfcf3a01",
+  "files": {
+    "nnscaler/runtime/activation_transfer.py": "d17f9ddf07be37cfcae9f37330b8b089f5c3fdcecd67e6a389edef856e93c535",
+    "tests/runtime/test_activation_transfer.py": "0e8079e7f2fd5cbe86e73b5fdfe46cac6117a0401b41c8790b93785baafd1e81"
+  },
+  "logs": {
+    "runtime-cpu.log.gz": "9063a3551f1462ddde72ef9f9fb2d35e6aeecd31eef270a7edfaedfa14ad17e1"
+  }
+}

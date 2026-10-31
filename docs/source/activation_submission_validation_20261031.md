@@ -59,3 +59,14 @@ chosen later; this revision contains no model-specific retention exceptions.
 
 Compressed CPU logs and file fingerprints are in
 [the evidence manifest](../activation-store-results/20261031/submission/manifest.json).
+
+## Capacity-test preparation follow-up
+
+Restore destination allocation now precedes dependency submission. An allocation
+failure has not queued a read of the host buffer and propagates without draining
+unrelated restores; a partial DMA failure still drains before buffer reuse.
+Whole-storage and chunked copies share the same allocation/copy boundary.
+Two CPU failure-injection cases cover this distinction; the runtime suite now
+reports **79 passed, 88 CUDA cases skipped**. GPU validation remains pending the
+other session's complete handoff. Evidence is in
+[the follow-up manifest](../activation-store-results/20261031/allocation-failure/manifest.json).
