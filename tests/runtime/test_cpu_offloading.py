@@ -547,7 +547,7 @@ def test_early_checkpoint_learns_dead_saves_and_handles_changed_replay_needs():
     # When the branch starts retaining inputs, ordinary exit commit is the
     # correct fallback, then the next invocation can again submit early.
     for index, replay in enumerate((False, False, True, True)):
-        before = module.activation_offload_stats()['d2h_bytes']
+        before = module.activation_offload_stats().get('d2h_bytes', 0)
         entries.clear()
         x = leaf * 2
         with module.activation_offload_scope(('adaptive-checkpoint', index)):
