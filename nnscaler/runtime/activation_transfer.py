@@ -3,6 +3,7 @@
 from collections import deque
 from contextlib import contextmanager
 from contextvars import ContextVar
+from itertools import groupby
 import time
 
 import torch
@@ -97,6 +98,17 @@ class ActivationTransferEngine:
 
     def submit_batch(self, records, producer_events=None):
         """Submit an admitted batch without allocations or host waits between copies."""
+        def readiness(record):
+            stream = record.producer_stream
+            event = record.producer_ready_event or (producer_events or {}).get(stream.cuda_stream)
+            return ('event', id(event)) if event is not None else ('stream', stream.cuda_stream)
+        # A completion fence must not make earlier ready values depend on a
+        # later producer. Keep producer order, sharing a fence only within one
+        # contiguous readiness group (including explicit multi-stream saves).
+        for _, group in groupby(records, readiness):
+            self._submit_ready_batch(list(group), producer_events)
+
+    def _submit_ready_batch(self, records, producer_events=None):
         waited_events, waited_streams = set(), set()
         copied = copied_bytes = 0
         with self._stream_batch(self.d2h_stream, self._d2h_batch) as completion:

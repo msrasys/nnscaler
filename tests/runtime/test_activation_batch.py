@@ -1,6 +1,6 @@
 """Submission/restore contracts using CPU-controlled transfer completions."""
 from collections import Counter
-from contextlib import nullcontext
+from contextlib import nullcontext, contextmanager
 from dataclasses import asdict
 from types import SimpleNamespace
 import weakref
@@ -148,6 +148,25 @@ def test_restore_queue_deduplicates_views_retries_budget_and_skips_dead_values()
     assert queue.prefetch(from_schedule=True) is True
     assert b.prefetch_calls == [True,True] and a.prefetch_calls == [True]
     assert stats['scope_prefetch_oversize_bytes'] == 9
+
+
+def test_scope_restore_publishes_each_consumer_group_before_the_next():
+    history=[]
+    @contextmanager
+    def batch():
+        history.append('begin')
+        yield
+        history.append('publish')
+    store=SimpleNamespace(config=CPUOffloadConfig(), pool=SimpleNamespace(stats=Counter()),
+                          transport=SimpleNamespace(prefetch_batch=batch))
+    records=[Record(i,4) for i in range(2)]
+    for record in records:
+        record.d2h_event=object()
+        record.prefetch=lambda *,from_schedule,uid=record.uid: history.append(uid) or True
+    queue=ScopeRestoreQueue(store)
+    queue.seal([SimpleNamespace(records=[weakref.ref(record)]) for record in records])
+    assert queue.prefetch(from_schedule=True)
+    assert history==['begin',1,'publish','begin',0,'publish']
 
 
 def test_batch_flush_renews_producer_event_before_later_saves(monkeypatch):

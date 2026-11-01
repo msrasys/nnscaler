@@ -53,7 +53,9 @@ Saved-tensor hooks use the same storage path without creating gradient anchors.
 
 ## Validation boundaries
 
-Transport batches share one immutable completion fence per direction. A fence
+Transport batches share immutable completion fences within a common producer
+readiness group; restore fences retain the original backward consumer groups.
+An early ready value must not wait for a later producer or consumer group. A fence
 is published only after its CUDA event has been recorded: a different autograd
 thread must never wait on an unrecorded event. Pool reaping queries a shared
 fence once per pass, and consecutive loads on the same consumer stream omit

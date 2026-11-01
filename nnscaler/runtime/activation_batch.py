@@ -154,11 +154,14 @@ class ScopeRestoreQueue:
     def seal(self, groups):
         seen = set()
         for group in reversed(groups):
+            pending = deque()
             for ref in reversed(group.records):
                 record = ref()
                 if record is not None and record.uid not in seen:
                     seen.add(record.uid)
-                    self.pending.append(ref)
+                    pending.append(ref)
+            if pending:
+                self.pending.append(pending)
         self.ready = True
         self.store.pool.stats['scope_commits'] += 1
 
@@ -170,16 +173,22 @@ class ScopeRestoreQueue:
             return False
         if not self.pending:
             return True
-        with self.store.transport.prefetch_batch():
-            while self.pending:
-                record = self.pending[0]()
-                if record is None or record.d2h_event is None:
-                    self.pending.popleft()
-                elif record.prefetch(from_schedule=from_schedule):
-                    self.pending.popleft()
-                elif record.size > self.store.config.max_prefetch_bytes:
-                    self.pending.popleft()
-                    self.store.pool.stats['scope_prefetch_oversize_bytes'] += record.size
-                else:
-                    return False
+        while self.pending:
+            group = self.pending[0]
+            # Scope remains the scheduling unit. Publishing each consumer
+            # group's completion before enqueueing the next preserves early
+            # backward progress without waiting for an entire scope's DMA.
+            with self.store.transport.prefetch_batch():
+                while group:
+                    record = group[0]()
+                    if record is None or record.d2h_event is None:
+                        group.popleft()
+                    elif record.prefetch(from_schedule=from_schedule):
+                        group.popleft()
+                    elif record.size > self.store.config.max_prefetch_bytes:
+                        group.popleft()
+                        self.store.pool.stats['scope_prefetch_oversize_bytes'] += record.size
+                    else:
+                        return False
+            self.pending.popleft()
         return True

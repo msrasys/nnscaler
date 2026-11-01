@@ -70,8 +70,10 @@ def test_batch_uses_each_record_producer_and_reports_physical_bytes(monkeypatch)
     with observation.trace(4) as trace:
         engine.submit_batch(records, {1:later})
     assert joined == [first,later]
-    assert engine.stats['peak_d2h_batch_bytes'] == 8
-    assert trace.events[0].action == 'd2h_batch_submit' and trace.events[0].nbytes == 8
+    assert engine.stats['peak_d2h_batch_bytes'] == 4
+    assert engine.stats['d2h_committed_groups'] == 2
+    assert all(event.action == 'd2h_batch_submit' for event in trace.events)
+    assert sum(event.nbytes for event in trace.events) == 8
 
 
 def test_wait_timing_is_opt_in_bounded_and_never_synchronizes(monkeypatch):
