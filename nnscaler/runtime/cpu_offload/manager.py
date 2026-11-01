@@ -114,7 +114,9 @@ class OffloadManager:
                 f'bytes={nbytes} contiguous={tensor.is_contiguous()}')
 
     def debug_group_done(self, group_id: Optional[int], batch: OffloadBatch) -> None:
-        if self.config.debug and group_id not in self._debugged_groups:
+        # one line per group, for its first execution that saved something (a
+        # group may be emitted as several runs, some of which save nothing)
+        if self.config.debug and group_id not in self._debugged_groups and batch.has_regions:
             self._debugged_groups.add(group_id)
             _logger.info(
                 f'[cpu_offload] group {group_id}: {batch.tensors} saved tensors, '

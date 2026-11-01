@@ -234,7 +234,12 @@ before the first step.  Environment: `CPU_OFFLOADING_<NAME>` read on first use.
    peak from 19.6 to 13.0 GiB there.  Start from the whole-block form and
    only move recompute boundaries inward when the recomputed work is
    measurably expensive; `CPU_OFFLOADING_DEBUG=1` lists what each group saves
-   and the size histogram shows where the bytes are.  Raise
+   and the size histogram shows where the bytes are.  The one kernel whose
+   recomputation grows quadratically with the sequence, attention, can be
+   taken out of the recompute group and offloaded instead (llm-train:
+   `--offload_modules Block,Attention.core`); it costs about four times the
+   bytes of the block input alone, so it pays only where attention
+   recomputation dominates (32k and beyond on the B200 node).  Raise
    `min_backward_distance` to skip micro-batches whose backward is near: the
    peak is set by the longest-lived activations, so most of the memory win
    comes from a fraction of the bytes.
