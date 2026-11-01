@@ -10,6 +10,45 @@ from nnscaler.runtime.activation_config import CPUOffloadConfig
 from nnscaler.runtime.activation_schedule import ActivationSchedulePlan, ActivationScheduleCursor
 from nnscaler.runtime.cpu_offloading import ActivationOffloadManager, CPUOffloadContext
 
+
+def test_backward_trigger_never_prefetches_on_a_forward_and_keeps_first_backward_safe():
+    actions=[('a',True,True),('b',True,True),('c',True,True),('a',False,True),
+             ('d',True,True),('b',False,True),('c',False,True),('d',False,True)]
+    plan=ActivationSchedulePlan.from_actions(actions)
+    requests=[]
+    position=-1
+    cursor=ActivationScheduleCursor(plan,3,lambda key,lead: requests.append((position,key,lead)),
+                                    trigger='backward')
+    for position in range(len(actions)):
+        cursor.before(position)
+        cursor.after(position)
+    assert requests==[(3,'a',0),(3,'b',2),(3,'c',3),(5,'d',2)]
+    described={row['key']:row['first_prefetch'] for row in plan.describe(3,trigger='backward')}
+    assert described=={'a':('before',3),'b':('before',3),'c':('before',3),'d':('before',5)}
+
+
+def test_backward_trigger_retries_a_blocked_reader_before_more_distant_scopes():
+    plan=ActivationSchedulePlan([('a',0,3),('b',1,5),('c',2,6)])
+    calls=[]
+    def request(key,lead):
+        calls.append(key)
+        return key!='b' or calls.count('b')>1
+    cursor=ActivationScheduleCursor(plan,3,request,trigger='backward')
+    cursor.before(3)
+    assert calls==['a','b']
+    cursor.after(3)
+    assert calls==['a','b','b','c']
+    cursor.before(4)
+    assert calls==['a','b','b','c']
+
+
+def test_prefetch_trigger_configuration_validation_and_legacy_default():
+    from nnscaler.runtime.activation_config import CPUOffloadConfig
+    assert CPUOffloadConfig().prefetch_trigger=='all'
+    with pytest.raises(ValueError,match='prefetch_trigger'):
+        CPUOffloadConfig(prefetch_trigger='typo')
+    with pytest.raises(ValueError,match='Prefetch trigger'):
+        ActivationScheduleCursor(ActivationSchedulePlan([]),1,lambda *args:True,trigger='typo')
 cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason='CUDA required')
 
 

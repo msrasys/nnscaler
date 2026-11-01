@@ -258,7 +258,7 @@ class ActivationOffloadManager(ActivationStore):
             if self.observation.enabled:
                 self.observation.emit('schedule_prefetch', count=lead, reason=repr(key))
             return self.prefetch(key)
-        cursor = ActivationScheduleCursor(plan, steps, request)
+        cursor = ActivationScheduleCursor(plan, steps, request, trigger=self.config.prefetch_trigger)
         try:
             yield cursor
         finally:

@@ -9,11 +9,6 @@ class CPUOffloadConfig:
     max_cpu_bytes: int = 8 * 1024**3
     min_tensor_bytes: int = 1024**2
     max_inflight_bytes: int = 512 * 1024**2
-    # host: bound submission by waiting on the CPU (legacy behavior).
-    # stream: pace future compute with completed-batch CUDA dependencies while
-    # max_pending_bytes independently bounds physically unfinished D2H sources.
-    backpressure_mode: str = 'host'
-    max_pending_bytes: int = 0
     max_prefetch_bytes: int = 512 * 1024**2
     prefetch_groups: int = 1
     scope_prefetch_groups: int = 1
@@ -55,12 +50,25 @@ class CPUOffloadConfig:
     pipeline_prefetch_steps: int = 1
     # Serialized schedule ABI. Legacy configs load as 0 to invalidate gencode.
     _schedule_version: int = 1
+    # Appended to retain the original positional constructor field order.
+    # host bounds CPU admission; stream separates GPU execution pacing from
+    # the actual unfinished submitted-source limit in max_pending_bytes.
+    backpressure_mode: str = 'host'
+    max_pending_bytes: int = 0
+    # Which pipeline actions may issue cross-scope H2D prefetch requests.
+    # Backward-only avoids launching them during forward CPU rendezvous; the
+    # first backward still loads its own scope correctly when no lead exists.
+    prefetch_trigger: str = 'all'
 
     def __post_init__(self):
         for name, value in vars(self).items():
             if name == 'backpressure_mode':
                 if value not in ('host', 'stream'):
                     raise ValueError('backpressure_mode must be host or stream')
+                continue
+            if name == 'prefetch_trigger':
+                if value not in ('all', 'backward'):
+                    raise ValueError('prefetch_trigger must be all or backward')
                 continue
             if name in ('transfer_unit', 'forward_commit_unit'):
                 if value not in ('auto', 'scope', 'group'):

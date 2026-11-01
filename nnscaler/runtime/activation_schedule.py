@@ -55,27 +55,38 @@ class ActivationSchedulePlan:
         return tuple(use for use in self.uses[first:last]
                      if use.forward < position + int(after))
 
-    def describe(self, steps):
+    def describe(self, steps, *, trigger='all'):
         if isinstance(steps, bool) or not isinstance(steps, int) or steps < 0:
             raise ValueError('Prefetch steps must be a non-negative integer')
+        if trigger not in ('all', 'backward'):
+            raise ValueError('Prefetch trigger must be all or backward')
         rows = []
         for use in self.uses:
             wanted = max(0, use.backward - steps)
-            trigger = None if not steps else (
-                ('before', wanted) if use.forward < wanted else ('after', use.forward))
+            if not steps:
+                first = None
+            elif trigger == 'backward':
+                index = bisect_left(self.positions, max(wanted, use.forward + 1))
+                first = ('before', self.positions[index])
+            else:
+                first = ('before', wanted) if use.forward < wanted else ('after', use.forward)
             rows.append(dict(key=use.key, forward=use.forward, backward=use.backward,
-                             first_prefetch=trigger))
+                             first_prefetch=first))
         return rows
 
 
 class ActivationScheduleCursor:
     """Retry ready scopes within the window; nearer blocked readers take priority."""
-    def __init__(self, plan, steps, request):
-        plan.describe(steps)  # Validate even an empty schedule.
+    def __init__(self, plan, steps, request, *, trigger='all'):
+        plan.describe(steps, trigger=trigger)  # Validate even an empty schedule.
         self.plan, self.steps, self.request = plan, steps, request
+        self.trigger = trigger
+        self._backward_positions = frozenset(plan.positions)
         self.admitted = set()
 
     def _advance(self, position, after):
+        if self.trigger == 'backward' and position not in self._backward_positions:
+            return
         for use in self.plan.candidates(position, self.steps, after=after):
             if use.key in self.admitted:
                 continue
