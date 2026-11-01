@@ -49,8 +49,9 @@ class CPUOffloadConfig:
     # Local virtual-stage F/B actions before the consuming backward. Zero
     # disables cross-action lookahead; group/current-backward refill remains.
     pipeline_prefetch_steps: int = 1
-    # Serialized schedule ABI. Legacy configs load as 0 to invalidate gencode.
-    _schedule_version: int = 1
+    # Generated activation API: 1 added F/B action scheduling; 2 routes
+    # checkpoints through their saved-tensor adapter. Missing legacy ABI is 0.
+    _schedule_version: int = 2
     # Appended to retain the original positional constructor field order.
     # host bounds CPU admission; stream separates GPU execution pacing from
     # the actual unfinished submitted-source limit in max_pending_bytes.

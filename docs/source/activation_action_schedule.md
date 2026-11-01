@@ -162,18 +162,21 @@ removes scope metadata on normal return and exceptions; saved tokens still own
 their data until actual consumers release them. The generic store remains
 responsible for versions, streams, pinned budgets and alias-safe reclamation.
 
-Generated schedules must be regenerated once for this API. Old serialized
-offload configs are marked with schedule version 0, making generated-code reuse
-fail while leaving the raw trace reusable. Direct use of such a legacy compiled
-offload config reports that regeneration is required. Existing config imports
-and non-pipeline group behavior remain supported.
+Generated schedules must be regenerated once for this API. The generated
+activation API is version 2, including the checkpoint submission adapter.
+Version 1 has F/B scheduling but calls checkpoint directly; configurations
+without an ABI field load as version 0. Both older versions invalidate generated
+code while leaving the raw trace reusable. Direct use reports that regeneration
+is required. Existing config imports and non-pipeline group behavior remain
+supported.
 
 Once code is generated, the plan itself does not bake in N. Change a store's
 configuration between completed training iterations to tune distance, unit and
 byte windows; do not change ownership/producer policy during an active scope.
 The ordinary compilation entry point still checks the supplied config for reuse.
-The new submission/chunk fields default to the previous behavior. Schedule ABI 1
-and its action keys are unchanged; missing fields in older configs use these defaults.
+Submission/chunk defaults and F/B action keys are unchanged. Missing optional
+fields still load with their compatibility defaults; the ABI separately
+ensures generated calls support the current runtime adapter.
 
 ## Validation
 

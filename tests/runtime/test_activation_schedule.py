@@ -133,16 +133,23 @@ def test_invalid_scope_schedules_fail_before_execution(entries):
         ActivationSchedulePlan(entries)
 
 
-def test_legacy_codegen_config_does_not_silently_reuse_one_action_hints(tmp_path):
+@pytest.mark.parametrize('version', [None, 1])
+def test_legacy_codegen_config_requires_current_activation_adapter(tmp_path, version):
     current = ComputeConfig(1, 1, cpu_offload=CPUOffloadConfig())
     old = asdict(current)
-    del old['cpu_offload']['_schedule_version']
+    if version is None:
+        del old['cpu_offload']['_schedule_version']
+    else:
+        old['cpu_offload']['_schedule_version'] = version
     path = tmp_path/'old.pt'
     torch.save(old, path)
     restored = ComputeConfig.safe_load_from_file(path, return_none_on_error=False)
-    assert restored.cpu_offload._schedule_version == 0
+    assert restored.cpu_offload._schedule_version == (version or 0)
     assert not ComputeConfig.safe_equals(restored, current)
     assert restored.graph_config == current.graph_config  # Raw trace remains reusable.
+    from nnscaler.runtime.module import ParallelModule
+    with pytest.raises(RuntimeError, match='regenerated code'):
+        ParallelModule._get_activation_offload_manager(SimpleNamespace(compute_config=restored))
 
 
 def test_submission_options_roundtrip_without_changing_schedule_abi(tmp_path):
@@ -152,7 +159,7 @@ def test_submission_options_roundtrip_without_changing_schedule_abi(tmp_path):
     torch.save(asdict(current), path)
     restored = ComputeConfig.safe_load_from_file(path, return_none_on_error=False)
     assert ComputeConfig.safe_equals(restored,current)
-    assert restored.cpu_offload._schedule_version == 1
+    assert restored.cpu_offload._schedule_version == 2
     old = asdict(current)
     for key in ('forward_commit_unit','commit_batch_bytes','copy_chunk_bytes'):
         old['cpu_offload'].pop(key)
@@ -160,7 +167,7 @@ def test_submission_options_roundtrip_without_changing_schedule_abi(tmp_path):
     restored = ComputeConfig.safe_load_from_file(path, return_none_on_error=False)
     assert restored.cpu_offload.commit_unit(pipeline=True) == 'scope'
     assert restored.cpu_offload.commit_batch_bytes == restored.cpu_offload.copy_chunk_bytes == 0
-    assert restored.cpu_offload._schedule_version == 1
+    assert restored.cpu_offload._schedule_version == 2
 
 
 def test_schedule_exception_drops_scope_metadata_with_gc_disabled(monkeypatch):

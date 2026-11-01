@@ -1610,7 +1610,7 @@ class ParallelModule(CubeModule):
         manager = getattr(self, '_activation_offload_manager', None)
         if manager is None:
             config = getattr(getattr(self, 'compute_config', None), 'cpu_offload', None)
-            if config is not None and config._schedule_version != 1:
+            if config is not None and config._schedule_version != CPUOffloadConfig._schedule_version:
                 raise RuntimeError('Activation scheduling requires regenerated code; recompile with a current CPUOffloadConfig')
             manager = ActivationOffloadManager(self, config or CPUOffloadConfig())
             self._activation_offload_manager = manager
