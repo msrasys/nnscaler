@@ -240,6 +240,60 @@ def megatron_ffn_policy_auto(graph, cfg):
             yield OpPlan(node, partition='auto')
 
 
+@replace_all_device_with('cpu')
+def test_plan_transform_observes_resolved_layout_before_activation_grouping(tmp_path):
+    from nnscaler.policies import fn, OpPartition
+    observed = []
+    def transform(plans, cfg):
+        assert all(plan.partition != 'auto' for plan in plans)
+        for plan in plans:
+            if plan.op.fn == torch.tanh:
+                assert plan.partition == OpPartition(input=0, dim=1)
+                plan.recompute_id = 0
+                observed.append(plan.op)
+        return plans
+    def policy(graph, cfg):
+        return fn(graph, cfg, megatron_ffn_policy_auto, plan_transform=transform)
+    parallelize(FnPolicyModule(), {'x': torch.randn(2,4)}, policy, ComputeConfig(2,2),
+                gen_savedir=tmp_path, load_module=False)
+    assert observed
+    assert _gencode_contains(tmp_path, FnPolicyModule, 0, r'ckpt\.checkpoint\(')
+
+
+@replace_all_device_with('cpu')
+@pytest.mark.parametrize('change', ['stage','partition','order','hook'])
+def test_plan_transform_cannot_change_resolved_structure(tmp_path, change):
+    from nnscaler.policies import fn
+    def transform(plans, cfg):
+        if change == 'stage':plans[0].stage_id += 1
+        elif change == 'partition':plans[0].partition = 'auto'
+        elif change == 'hook':plans[0].post_hook = lambda *args: None
+        else:plans.reverse()
+        return plans
+    def policy(graph, cfg):
+        return fn(graph, cfg, megatron_ffn_policy_auto, plan_transform=transform)
+    with raises_with_cause(ValueError, match='activation annotations only'):
+        parallelize(FnPolicyModule(), {'x': torch.randn(2,4)}, policy, ComputeConfig(2,2),
+                    gen_savedir=tmp_path, load_module=False)
+
+
+@replace_all_device_with('cpu')
+def test_plan_transform_does_not_hide_an_invalid_original_plan(tmp_path):
+    from nnscaler.policies import fn, OpPlan
+    called=[]
+    def base(graph,cfg):
+        return [*megatron_ffn_policy_auto(graph,cfg),OpPlan(object(),stage_id=0)]
+    def transform(plans,cfg):
+        called.append(True)
+        return plans
+    def policy(graph,cfg):
+        return fn(graph,cfg,base,plan_transform=transform)
+    with raises_with_cause(ValueError,match='not in the graph'):
+        parallelize(FnPolicyModule(),{'x':torch.randn(2,4)},policy,ComputeConfig(2,2),
+                    gen_savedir=tmp_path,load_module=False)
+    assert not called
+
+
 def cpu_offload_ffn_policy(graph, cfg):
     for plan in megatron_ffn_policy(graph, cfg):
         plan.offload_id = 0

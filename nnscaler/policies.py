@@ -1008,7 +1008,9 @@ def fn(
         policy: Union[
             Callable[[IRGraph, 'ComputeConfig'], IRGraph],
             Callable[[IRGraph, 'ComputeConfig'], Iterable[OpPlan]],
-        ]
+        ],
+        *,
+        plan_transform: Optional[Callable[[list[OpPlan], 'ComputeConfig'], Iterable[OpPlan]]] = None,
 ) -> IRGraph:
     """
     General policy function based on user-defined policy.
@@ -1043,12 +1045,18 @@ def fn(
         cfg: the compute config
         policy: the user-defined policy function. It can either return the final IRGraph,
                 or return an iterable of OpPlan for each operator.
+        plan_transform: optional activation-annotation pass after automatic
+                partition plans have been resolved, before graph staging and
+                partitioning. It must preserve operators, order, placement and
+                hooks; only recompute_id/offload_id may change.
 
     Returns:
         the distributed IRGraph
     """
     result = policy(graph, cfg)
     if isinstance(result, IRGraph):  # traditional policy
+        if plan_transform is not None:
+            raise ValueError('plan_transform requires an OpPlan policy')
         return result
 
     op_plans = {r.op: r for r in result}
@@ -1253,6 +1261,33 @@ def fn(
             else:
                 tensor_splits[ftensor].setdefault(op_plan.stage_id, set()).add(op_partition_map[idx])
 
+    if len(op_plans) != len(fw_nodes):
+        assert len(op_plans) > len(fw_nodes)
+        for op_plan in op_plans.values():
+            if op_plan.op not in fw_nodes:
+                raise ValueError(f"OpPlan contains operator {op_plan.op} not in the graph or not a forward operator")
+
+    if plan_transform is not None:
+        ordered = [op_plans[node] for node in fw_nodes]
+        def structure(plan):
+            return (id(plan.op), plan.stage_id, repr(plan.partition), repr(plan.partitions),
+                    plan.pre_hook, plan.post_hook, repr(plan.hook_meta))
+        before = [structure(plan) for plan in ordered]
+        transformed = list(plan_transform(ordered, cfg))
+        if not all(isinstance(plan, OpPlan) for plan in transformed):
+            raise TypeError('plan_transform must return OpPlans')
+        if [structure(plan) for plan in transformed] != before:
+            raise ValueError('plan_transform may change activation annotations only; '
+                             'operator order, placement and hooks must be preserved')
+        for plan in transformed:
+            if plan.recompute_id < -1 or plan.offload_id < -1:
+                raise ValueError('Invalid activation annotation after plan_transform')
+        op_plans = {plan.op: plan for plan in transformed}
+
+    # Activation groups are formed only after automatic layouts are resolved
+    # and the optional annotation transform has inspected those real layouts.
+    for node in fw_nodes:
+        op_plan = op_plans[node]
         if op_plan.recompute_id != -1:
             if op_plan.recompute_id in recompute_group_stages:
                 if recompute_group_stages[op_plan.recompute_id] != op_plan.stage_id:
@@ -1289,12 +1324,6 @@ def fn(
             pp_stages.append([op_plan.op])
         else:
             raise ValueError("Pipeline stage ids must be continuous integers starting from 0")
-
-    if len(op_plans) != len(fw_nodes):
-        assert len(op_plans) > len(fw_nodes)
-        for op_plan in op_plans.values():
-            if op_plan.op not in fw_nodes:
-                raise ValueError(f"OpPlan contains operator {op_plan.op} not in the graph or not a forward operator")
 
     pp_segs = [graph]
     assert nstages == len(pp_stages), "Internal Error: nstages should be equal to the number of pipeline stages"
