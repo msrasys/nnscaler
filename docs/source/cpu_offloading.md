@@ -220,10 +220,21 @@ before the first step.  Environment: `CPU_OFFLOADING_<NAME>` read on first use.
    at `min_bytes` (the histogram marks the buckets it currently excludes); a
    host-side `hooks` time that is a visible fraction of the step is the same
    signal.
-3. **Reduce bytes before tuning transport.** Offload the tensors that are
-   expensive to recompute (attention kernel outputs, expert inputs), recompute
-   the cheap ones (norms, activations, projections); use `Attention.core`
-   style specs and the combined recompute+offload form.  Raise
+3. **Reduce bytes before tuning transport.**  The bytes a plan offloads are
+   set by the recompute granularity, not by the offload granularity: every
+   operator *between* two recompute groups saves its own copy of the hidden
+   state.  With `--recompute_modules Attention,MoEExpert --offload_modules
+   Block` the norms, residual adds and router between the two groups keep
+   four to five hidden-state copies per layer, and all of them are offloaded
+   (on the A6000 model 26 GiB and 3900 saved tensors per step).  With
+   `--recompute_modules Block --offload_modules Block` the whole block is
+   recomputed and only its input is kept, so the offload shrinks to one tensor
+   per block (3.3 GiB and 340 saved tensors per step, 8x fewer bytes, 12x
+   fewer hook calls), and whole-block recomputation alone already takes the
+   peak from 19.6 to 13.0 GiB there.  Start from the whole-block form and
+   only move recompute boundaries inward when the recomputed work is
+   measurably expensive; `CPU_OFFLOADING_DEBUG=1` lists what each group saves
+   and the size histogram shows where the bytes are.  Raise
    `min_backward_distance` to skip micro-batches whose backward is near: the
    peak is set by the longest-lived activations, so most of the memory win
    comes from a fraction of the bytes.
@@ -272,6 +283,13 @@ Same node, combined form (`--recompute_modules Attention,MoEExpert
 | production | 16k | 1 | 8.73 | 99.9 | 58.7k | - |
 | combined form, best knobs | 16k | 1 | 14.04 | 72.3 | 36.5k | 198 GiB |
 
+The same node with the second data set, searching the limits: production
+runs 8k up to micro-batch 4 (164.6 GiB, 29.2 s) and 16k at micro-batch 1; the
+combined form runs 8k up to micro-batch 6 (146.5 GiB) and 32k at micro-batch 1
+(116.9 GiB).  At 8k/micro-batch 4, where production is at the memory limit,
+the combined form is 5.6% faster (27,051 against 25,609 tokens/s); everywhere
+else it is 36-38% slower.
+
 Mechanically everything behaves as designed: no reload stalls (0.001 s/step),
 copies at the link's measured limits (37 GB/s D2H, 50 GB/s H2D), the peak
 stays flat from micro-batch 1 to 2 (50.6 -> 72.0 GiB against 67.3 -> 99.6 for
@@ -284,8 +302,9 @@ memory freed buys nothing because production already fits at micro-batch 2 and
 the peak is dominated by weights and optimizer state (102 GiB moved per step
 lower the peak by 17 GiB).  Offloading activations would start to matter where
 production runs out of memory (sequences of 32k and above on this node), and
-the remaining lever within the feature is to move fewer bytes
-(`min_backward_distance`) or to place copies where the hub is idle.
+the remaining lever within the feature is to move fewer bytes: the
+whole-block form above cuts them 8x and has not been measured on this node
+yet; `min_backward_distance` trims further.
 
 4x A6000 (PCIe only, no NVLink), YOCO-MoE-A0.4B, PP2 x EP2, interleaved 1F1B,
 8 micro-batches, seq 4096, last of 4-5 steps, rank 0:
@@ -312,6 +331,8 @@ the remaining lever within the feature is to move fewer bytes
 | same, `dedup_scope=context` (nothing to share in this model) | 1 | 10.4 | 14.0 | 6.1k | 27 GB |
 | same, `reload_on_copy_stream=off` | 1 | 10.8 | 14.0 | 5.9k | 27 GB |
 | same, `copy_chunk_bytes` 16 MiB | 1 | 11.4 | 14.0 | 5.6k | 27 GB |
+| recompute whole Blocks, no offload | 1 | 10.8-12.6 | 13.0 | 5.3-5.9k | - |
+| recompute whole Blocks, offload their inputs (`--recompute_modules Block --offload_modules Block`) | 1 | 11.9-12.6 | 12.5 | 5.1-5.4k | 3.3 GB |
 
 Loss trajectories are identical.  Step times of these short runs vary by
 about one second from step to step, so the window, distance and transport
