@@ -88,6 +88,31 @@ def test_another_consumer_waits_for_publication_not_dma_completion():
     assert result == [event] and not event.complete and not event.syncs
 
 
+def test_completion_cache_does_not_regress_after_a_delayed_concurrent_query():
+    entered, release = threading.Event(), threading.Event()
+    class DelayedEvent(Event):
+        def query(self):
+            self.queries += 1
+            if self.queries == 1:
+                entered.set()
+                assert release.wait(2)
+                return False
+            return True
+    event = DelayedEvent()
+    fence = TransferFence(event)
+    fence.publish(Stream())
+    result = []
+    thread = threading.Thread(target=lambda: result.append(fence.query()))
+    thread.start()
+    assert entered.wait(1)
+    try:
+        assert fence.query()
+    finally:
+        release.set()
+        thread.join(2)
+    assert result == [True] and fence.query() and event.queries == 2
+
+
 def test_failed_publication_never_recycles_a_buffer():
     class FailedEvent(Event):
         def record(self, stream):

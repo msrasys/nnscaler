@@ -46,7 +46,10 @@ class TransferFence:
     def query(self):
         # Polling an unpublished or failed transfer must never recycle memory.
         if not self._complete and self._published.is_set() and self._failure is None:
-            self._complete = self.event.query()
+            if self.event.query():
+                # A slow concurrent query may return an older False result
+                # after another reader observed completion. Never regress.
+                self._complete = True
         return self._complete
 
     def synchronize(self):
