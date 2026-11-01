@@ -2,9 +2,37 @@
 """Saved-tensor adapters; activation storage and transport live below this layer."""
 from contextlib import contextmanager, nullcontext
 import sys
+import threading
+import weakref
 
 import torch
 from torch.autograd.graph import saved_tensors_hooks
+
+
+class CheckpointSubmissionPolicy:
+    """Avoid early copies for checkpoints observed to retain no saved inputs.
+
+    This changes submission timing only. A checkpoint that starts saving inputs
+    again falls back to ordinary group commit on that invocation. Code keys are
+    weak and never retain functions, closures, modules or activation tensors.
+    """
+    def __init__(self):
+        self._retains_inputs = weakref.WeakKeyDictionary()
+        self._lock = threading.RLock()
+
+    def early(self, code):
+        if code is None:
+            return True
+        with self._lock:
+            return self._retains_inputs.get(code, True)
+
+    def observe(self, code, records):
+        # No admitted CUDA inputs provides no evidence about replay. This can
+        # happen on a resident pipeline tail or with a smaller input shape.
+        if code is not None and records:
+            retained = any((record := ref()) is not None and record.live_saves for ref in records)
+            with self._lock:
+                self._retains_inputs[code] = retained
 
 
 class _GradientAnchor(torch.autograd.Function):
@@ -131,22 +159,31 @@ class SavedActivationContext:
         Replay uses an empty context and never offloads its intermediates.
         Other submission modes preserve their ordinary region/scope boundary.
 
-        Early submission can copy an input even if the function subsequently
-        needs no replay. Use it for declared checkpoints with meaningful work.
+        A first early submission can copy an input even if the function needs
+        no replay. Later calls of that code defer to group commit until saved
+        inputs are observed again. Dynamic branches remain correct either way.
         """
         from torch.utils.checkpoint import checkpoint
 
         if self._hooks is None:
             raise RuntimeError('Checkpoint requires an active saved activation context')
         kwargs.setdefault('use_reentrant', False)
+        policy = None
         if self.store.config.forward_commit_unit == 'checkpoint':
             if kwargs['use_reentrant'] or 'context_fn' in kwargs:
                 raise ValueError('Early checkpoint offload requires non-reentrant checkpoint '
                                  'without a custom context_fn')
-            kwargs['context_fn'] = self._checkpoint_contexts
+            policy = self.store.checkpoint_submission
+            code = getattr(function, '__code__', None)
+            first = len(self.group.records)
+            if policy.early(code):
+                kwargs['context_fn'] = self._checkpoint_contexts
         # Preserve PyTorch's default context_fn (and debug support) unless
         # early submission was explicitly selected.
-        return checkpoint(function, *args, **kwargs)
+        result = checkpoint(function, *args, **kwargs)
+        if policy is not None:
+            policy.observe(code, self.group.records[first:])
+        return result
 
     def _checkpoint_contexts(self):
         return self._submit_checkpoint_inputs(), nullcontext()

@@ -532,6 +532,40 @@ def test_early_checkpoint_forward_failure_releases_saved_input():
 
 
 @cuda
+def test_early_checkpoint_learns_dead_saves_and_handles_changed_replay_needs():
+    module = OffloadModule(forward_commit_unit='checkpoint')
+    leaf = torch.randn(64, 64, device='cuda', requires_grad=True)
+    replay = False
+    entries = []
+
+    def function(value):
+        entries.append(module.activation_offload_stats()['d2h_bytes'])
+        return value.sin() if replay else value + 1
+
+    size = leaf.untyped_storage().nbytes()
+    # First dead checkpoint can copy early; the second should avoid that copy.
+    # When the branch starts retaining inputs, ordinary exit commit is the
+    # correct fallback, then the next invocation can again submit early.
+    for index, replay in enumerate((False, False, True, True)):
+        before = module.activation_offload_stats()['d2h_bytes']
+        entries.clear()
+        x = leaf * 2
+        with module.activation_offload_scope(('adaptive-checkpoint', index)):
+            with module.cpu_offloading_hooks() as saved:
+                y = saved.checkpoint(function, x)
+            saved.watch(y)
+        assert entries == [before + (size if index in (0, 3) else 0)]
+        expected = 2 * x.detach().cos() if replay else torch.full_like(x, 2)
+        del x
+        grad, = torch.autograd.grad(y.sum(), leaf)
+        torch.testing.assert_close(grad, expected)
+        module.finish_activation_offload(('adaptive-checkpoint', index))
+        after = module.activation_offload_stats()['d2h_bytes']
+        assert after - before == (0 if index == 1 else size)
+        assert module.activation_offload_stats()['live_cpu_bytes'] == 0
+
+
+@cuda
 @pytest.mark.parametrize('count,budget,loaded', [(1, 65536, 1), (3, 65536, 3), (3, 16384, 1)])
 def test_scope_prefetch_depth_obeys_shared_byte_window(count, budget, loaded):
     module = OffloadModule(scope_prefetch_groups=count, max_prefetch_bytes=budget)

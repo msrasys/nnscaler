@@ -9,7 +9,7 @@ import weakref
 import torch
 from .activation_config import CPUOffloadConfig
 from .activation_batch import ActivationBatch, record_batches
-from .activation_autograd import _GradientAnchor, _RestoreGradient
+from .activation_autograd import _GradientAnchor, _RestoreGradient, CheckpointSubmissionPolicy
 from .activation_memory import _shared_pool
 from .activation_transfer import ActivationTransferEngine
 from .activation_observer import _Observation
@@ -419,6 +419,7 @@ class ActivationStore:
         self._active_batch = ContextVar('activation_store_batch', default=None)
         self._handles = weakref.WeakSet()
         self._lock = threading.RLock()
+        self.checkpoint_submission = CheckpointSubmissionPolicy()
         self.closed = False
 
     @property

@@ -11,6 +11,7 @@ import torch
 from nnscaler.runtime.activation_config import CPUOffloadConfig
 from nnscaler.runtime.activation_memory import _pools
 from nnscaler.runtime.activation_store import ActivationStore, _GradientAnchor, _RestoreGradient
+from nnscaler.runtime.activation_autograd import CheckpointSubmissionPolicy
 
 cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason='CUDA required')
 
@@ -65,6 +66,26 @@ def test_early_checkpoint_rejects_incompatible_context_before_running_function(k
         with pytest.raises(ValueError, match='Early checkpoint offload'):
             saved.checkpoint(lambda: pytest.fail('Must validate before executing'), **kwargs)
     manager.close()
+
+
+def test_checkpoint_submission_hints_do_not_retain_code_or_save_metadata():
+    namespace = {}
+    exec(compile('def fn(x):\n    return x\n', '<checkpoint-hint>', 'exec'), namespace)
+    code = namespace.pop('fn').__code__
+    code_ref = weakref.ref(code)
+    policy = CheckpointSubmissionPolicy()
+    assert policy.early(code)
+    policy.observe(code, [])  # No eligible GPU input is not evidence of no replay.
+    assert policy.early(code)
+    policy.observe(code, [lambda: None])
+    assert not policy.early(code)
+    policy.observe(code, [lambda: SimpleNamespace(live_saves=1)])
+    assert policy.early(code)
+    del code
+    gc.collect()
+    assert code_ref() is None
+    assert len(policy._retains_inputs) == 0
+    assert policy.early(None)
 
 
 @pytest.mark.parametrize('layout', ['dense', 'slice', 'expand'])

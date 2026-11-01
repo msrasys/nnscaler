@@ -130,7 +130,12 @@ default context unchanged. The early flush uses existing batch admission and
 producer events; it does not wait for D2H to finish on the CPU unless the hard
 pending-source limit requires it. An input may be copied unnecessarily if the
 checkpoint ultimately requires no replay, which cannot be determined before
-its forward. Keep this mode opt-in and profile regions with meaningful work.
+its forward. The adapter observes whether inputs remain saved after each call.
+For code observed to retain none, subsequent calls use ordinary exit commit;
+if a dynamic branch needs replay again, that invocation still offloads correctly
+on exit and future calls resume early submission. The hint uses weak code keys
+and never retains a function, closure or tensor. Shared input records can cause
+a conservative extra early copy. Keep this mode opt-in and profile real work.
 Early mode owns `context_fn` and rejects reentrant/custom-context checkpoints;
 PyTorch's nondefault-context restrictions on debug mode and `torch.compile`
 also apply. Regenerate existing code to use the checkpoint submission adapter.
