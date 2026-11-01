@@ -111,6 +111,7 @@ class _StorageRecord:
         self.device = tensor.device
         self.producer_stream = torch.cuda.current_stream(tensor.device)
         self.producer_ready_event = None
+        self.deferred_offload = False
         self.size = tensor.untyped_storage().nbytes()
         self.host = host
         self.source = _byte_view(tensor)

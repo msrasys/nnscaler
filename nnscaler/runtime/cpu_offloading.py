@@ -20,7 +20,7 @@ import weakref
 
 import torch
 from .activation_config import CPUOffloadConfig
-from .activation_batch import ForwardCommitQueue, ScopeRestoreQueue
+from .activation_batch import ForwardCommitQueue, ScopeRestoreQueue, DeferredCommitQueue
 from .activation_autograd import SavedActivationContext, _ModuleTensorRef
 from .activation_schedule import ActivationSchedulePlan, ActivationScheduleCursor
 from .activation_memory import _OffloadPool, _shared_pool, _pools, available_host_bytes, _cgroup_headroom
@@ -151,7 +151,7 @@ def mark_retained_scope_tensors(values):
 
 
 class _ForwardScope:
-    def __init__(self, manager, immediate_backward=False, backward_distance=None, pipeline=False):
+    def __init__(self, manager, immediate_backward=False, backward_distance=None, pipeline=False, deferred=None):
         self.manager = manager
         self.pipeline = pipeline
         self.backward_distance = backward_distance
@@ -164,7 +164,9 @@ class _ForwardScope:
                                 else 'short_scope_resident_bytes')
         self.transfer = ScopeRestoreQueue(manager) if whole else None
         self.commits = ForwardCommitQueue(manager, unit=manager.config.commit_unit(pipeline=pipeline),
-                                          target_bytes=manager.config.commit_batch_bytes)
+                                          target_bytes=manager.config.commit_batch_bytes,
+                                          deferred=deferred)
+        self.consuming = False
         self.complete = False
         self.groups = []
         self._entry_groups = None
@@ -174,6 +176,10 @@ class _ForwardScope:
     def prefetch(self):
         if self.transfer is not None:
             return self.transfer.prefetch(from_schedule=True)
+        if not self.consuming and any(
+                (record := ref()) is not None and getattr(record, 'deferred_offload', False)
+                for group in self.groups for ref in group.records):
+            return False
         # Shape-only ops, filtered tensors and checkpoint tails can create
         # empty regions. They must not hide the actual backward entry group.
         groups = self._entry_groups
@@ -220,6 +226,7 @@ class ActivationOffloadManager(ActivationStore):
         super().__init__(config)
         self.module = weakref.ref(module)
         self.scopes = {}
+        self.deferred_commits = None
 
     @contextmanager
     def scope(self, key=None, immediate_backward=False, backward_distance=None, pipeline=False):
@@ -227,7 +234,8 @@ class ActivationOffloadManager(ActivationStore):
         if key is None and current is not None and current.manager is self:
             yield current
             return
-        scope = _ForwardScope(self, immediate_backward, backward_distance, pipeline)
+        scope = _ForwardScope(self, immediate_backward, backward_distance, pipeline,
+                              deferred=self.deferred_commits if pipeline and key is not None else None)
         if key is not None:
             if key in self.scopes:
                 raise RuntimeError(f'Duplicate activation forward scope: {key}')
@@ -236,7 +244,11 @@ class ActivationOffloadManager(ActivationStore):
         try:
             yield scope
             scope.finish_forward()
+            if key is not None and scope.commits.deferred is not None:
+                scope.commits.deferred.enqueue(key, scope.commits)
         except BaseException:
+            if scope.commits.deferred is not None:
+                scope.commits.deferred.cancel(key)
             scope.abort()
             self.scopes.pop(key, None)
             raise
@@ -253,24 +265,54 @@ class ActivationOffloadManager(ActivationStore):
     @contextmanager
     def schedule(self, entries):
         plan = ActivationSchedulePlan(entries)
+        previous_deferred = self.deferred_commits
+        deferred = (DeferredCommitQueue(self) if self.config.d2h_launch_phase == 'backward' else None)
+        self.deferred_commits = deferred
+        backward_keys = {}
+        for use in plan.uses:
+            backward_keys.setdefault(use.backward, []).append(use.key)
+        launched = set()
+        def before_action(position):
+            if position not in backward_keys or position in launched:
+                return
+            protected = set()
+            for key in backward_keys[position]:
+                scope = self.scopes.get(key)
+                if scope is not None:
+                    protected.update(record.uid for group in scope.groups for ref in group.records
+                                     if (record := ref()) is not None and record.live_saves)
+                    scope.consuming = True
+                    if scope.transfer is not None:
+                        scope.transfer.consuming = True
+                deferred.cancel(key)
+            deferred.launch(protected)
+            launched.add(position)
         steps = self.config.pipeline_prefetch_steps if self.config.prefetch_groups else 0
         def request(key, lead):
             if self.observation.enabled:
                 self.observation.emit('schedule_prefetch', count=lead, reason=repr(key))
             return self.prefetch(key)
-        cursor = ActivationScheduleCursor(plan, steps, request, trigger=self.config.prefetch_trigger)
+        cursor = ActivationScheduleCursor(plan, steps, request, trigger=self.config.prefetch_trigger,
+                                          before_action=before_action if deferred is not None else None)
         try:
             yield cursor
         finally:
             # Completed backwards already removed their scopes. On an error,
             # also drop metadata for earlier forward actions of this schedule.
-            for use in plan.uses:
-                scope = self.scopes.pop(use.key, None)
-                if scope is not None:
-                    scope.abort()
+            try:
+                if deferred is not None:
+                    deferred.abort()
+                for use in plan.uses:
+                    scope = self.scopes.pop(use.key, None)
+                    if scope is not None:
+                        scope.abort()
+            finally:
+                self.deferred_commits = previous_deferred
 
     def finish(self, key):
-        self.scopes.pop(key, None)
+        scope = self.scopes.pop(key, None)
+        if scope is not None and scope.commits.deferred is not None:
+            scope.commits.deferred.cancel(key)
 
     def pack(self, tensor, group):
         if tensor.device.type != 'cuda' or tensor.layout != torch.strided:

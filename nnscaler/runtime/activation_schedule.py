@@ -77,10 +77,11 @@ class ActivationSchedulePlan:
 
 class ActivationScheduleCursor:
     """Retry ready scopes within the window; nearer blocked readers take priority."""
-    def __init__(self, plan, steps, request, *, trigger='all'):
+    def __init__(self, plan, steps, request, *, trigger='all', before_action=None):
         plan.describe(steps, trigger=trigger)  # Validate even an empty schedule.
         self.plan, self.steps, self.request = plan, steps, request
         self.trigger = trigger
+        self.before_action = before_action
         self._backward_positions = frozenset(plan.positions)
         self.admitted = set()
 
@@ -96,6 +97,8 @@ class ActivationScheduleCursor:
             self.admitted.add(use.key)
 
     def before(self, position):
+        if self.before_action is not None:
+            self.before_action(position)
         self._advance(position, False)
 
     def after(self, position):

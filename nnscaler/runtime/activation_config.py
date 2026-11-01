@@ -61,6 +61,10 @@ class CPUOffloadConfig:
     # Backward-only avoids launching them during forward CPU rendezvous; the
     # first backward still loads its own scope correctly when no lead exists.
     prefetch_trigger: str = 'all'
+    # Pipeline D2H may use backward compute windows instead of forward exits.
+    # Explicit scope collection and a pending-source budget are required.
+    d2h_launch_phase: str = 'forward'
+    d2h_scopes_per_backward: int = 1
 
     def __post_init__(self):
         for name, value in vars(self).items():
@@ -71,6 +75,10 @@ class CPUOffloadConfig:
             if name == 'prefetch_trigger':
                 if value not in ('all', 'backward'):
                     raise ValueError('prefetch_trigger must be all or backward')
+                continue
+            if name == 'd2h_launch_phase':
+                if value not in ('forward', 'backward'):
+                    raise ValueError('d2h_launch_phase must be forward or backward')
                 continue
             if name in ('transfer_unit', 'forward_commit_unit'):
                 choices = ('auto', 'scope', 'group', 'checkpoint') if name == 'forward_commit_unit' else ('auto', 'scope', 'group')
@@ -86,6 +94,11 @@ class CPUOffloadConfig:
         if self.backpressure_mode == 'stream' and (
                 self.max_pending_bytes == 0 or self.max_pending_bytes < self.max_inflight_bytes):
             raise ValueError('stream backpressure requires max_pending_bytes >= max_inflight_bytes and > 0')
+        if self.d2h_launch_phase == 'backward' and (
+                self.forward_commit_unit != 'scope' or not self.max_pending_bytes
+                or not self.d2h_scopes_per_backward):
+            raise ValueError('backward D2H launch requires scope forward commits, '
+                             'positive max_pending_bytes and d2h_scopes_per_backward')
 
     def restore_unit(self, *, pipeline):
         return ('scope' if pipeline else 'group') if self.transfer_unit == 'auto' else self.transfer_unit

@@ -140,6 +140,33 @@ Early mode owns `context_fn` and rejects reentrant/custom-context checkpoints;
 PyTorch's nondefault-context restrictions on debug mode and `torch.compile`
 also apply. Regenerate existing code to use the checkpoint submission adapter.
 
+### Launching D2H in backward compute windows
+
+`d2h_launch_phase='backward'` queues completed pipeline forward scopes and
+launches up to `d2h_scopes_per_backward` scopes before each eligible local B
+action. It requires `forward_commit_unit='scope'` and positive
+`max_pending_bytes`. H2D lookahead and its byte window remain independent.
+This can avoid forward CPU rendezvous that prevent compute submission while
+transfers are running. It is an opt-in scheduling choice, not a throughput
+guarantee; it retains forward sources longer than immediate submission.
+
+The pending-source budget counts deferred sources plus physically unfinished
+D2H copies. Closed regions are admission points even while collecting a larger
+F scope. Pressure forces earlier submission and, if needed, waits for actual
+completion. One indivisible region/storage can cross the admission threshold.
+Physical batches still use `commit_batch_bytes`; it does not cause ordinary
+forward flushes in this mode. `peak_deferred_d2h_bytes`,
+`d2h_deferred_budget_flushes` and `d2h_backward_commits` expose these decisions.
+
+A current backward's unsubmitted scope stays on GPU. Pending batches sharing
+its saved records also wait for another opportunity, avoiding a late D2H/H2D
+round trip for a currently needed alias. Prefetch retries deferred values
+instead of treating them as permanently resident. Dead checkpoint inputs are
+discarded before charging the queue. Schedule exit and failures release all
+queued ownership, including with Python cyclic GC disabled. Unscheduled or
+non-pipeline forwards use ordinary forward commit; there is no hidden worker
+thread or inference of backward order from layer names.
+
 ## Optional dependency timing
 
 `store.trace(cuda_timing=True)` brackets each restored-value consumer dependency
