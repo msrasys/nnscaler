@@ -28,6 +28,45 @@ def store(device='cpu', **kwargs):
         dict(max_cpu_bytes=64*1024**2, min_tensor_bytes=0, host_reserve_bytes=0), **kwargs)), device=device)
 
 
+@pytest.mark.parametrize('mode', ['group', 'scope', 'checkpoint'])
+def test_saved_context_checkpoint_preserves_rng_and_keyword_arguments(mode):
+    manager = store(forward_commit_unit=mode)
+    x = torch.randn(8, requires_grad=True)
+
+    def function(value, *, scale):
+        return torch.nn.functional.dropout(value.sin(), p=0.25, training=True) * scale
+
+    torch.manual_seed(41)
+    expected = function(x, scale=3)
+    expected_grad, = torch.autograd.grad(expected.sum(), x)
+    torch.manual_seed(41)
+    with manager.saved_tensors() as saved:
+        y = saved.checkpoint(function, x, scale=3)
+    actual_grad, = torch.autograd.grad(y.sum(), x)
+    torch.testing.assert_close(y, expected, atol=0, rtol=0)
+    torch.testing.assert_close(actual_grad, expected_grad, atol=0, rtol=0)
+    manager.close()
+
+
+def test_ordinary_checkpoint_submission_preserves_pytorch_debug_context():
+    manager = store()
+    x = torch.randn(8, requires_grad=True)
+    with manager.saved_tensors() as saved:
+        y = saved.checkpoint(torch.sin, x, debug=True)
+    actual, = torch.autograd.grad(y.sum(), x)
+    torch.testing.assert_close(actual, x.cos())
+    manager.close()
+
+
+@pytest.mark.parametrize('kwargs', [{'use_reentrant': True}, {'context_fn': lambda: None}])
+def test_early_checkpoint_rejects_incompatible_context_before_running_function(kwargs):
+    manager = store(forward_commit_unit='checkpoint')
+    with manager.saved_tensors() as saved:
+        with pytest.raises(ValueError, match='Early checkpoint offload'):
+            saved.checkpoint(lambda: pytest.fail('Must validate before executing'), **kwargs)
+    manager.close()
+
+
 @pytest.mark.parametrize('layout', ['dense', 'slice', 'expand'])
 def test_gradient_anchor_does_not_retain_nonleaf_payload_and_preserves_higher_gradients(layout):
     def transform(value):

@@ -185,7 +185,7 @@ def test_graph_policy_combines_recompute_with_cpu_offload(tmp_path):
     parallelize(FnPolicyModule(), {'x': torch.randn(2, 4)},
                 combined_memory_graph_policy, ComputeConfig(1, 1),
                 gen_savedir=tmp_path, load_module=False)
-    assert _gencode_contains(tmp_path, FnPolicyModule, 0, r'ckpt\.checkpoint\(')
+    assert _gencode_contains(tmp_path, FnPolicyModule, 0, r'_offload\.checkpoint\(')
 
 
 def megatron_ffn_policy(graph, cfg):

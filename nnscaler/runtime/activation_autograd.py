@@ -1,6 +1,6 @@
 # Copyright (c) Microsoft Corporation. Licensed under the MIT License.
 """Saved-tensor adapters; activation storage and transport live below this layer."""
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 import sys
 
 import torch
@@ -121,3 +121,37 @@ class SavedActivationContext:
 
     def prefetch(self):
         self.group.prefetch()
+
+    def checkpoint(self, function, *args, **kwargs):
+        """Checkpoint under this saved-tensor context, optionally submitting early.
+
+        PyTorch saves the boundary inputs before entering the forward context.
+        In checkpoint submission mode, send that batch before the region's
+        compute is launched, so compute can overlap the immutable D2H reads.
+        Replay uses an empty context and never offloads its intermediates.
+        Other submission modes preserve their ordinary region/scope boundary.
+
+        Early submission can copy an input even if the function subsequently
+        needs no replay. Use it for declared checkpoints with meaningful work.
+        """
+        from torch.utils.checkpoint import checkpoint
+
+        if self._hooks is None:
+            raise RuntimeError('Checkpoint requires an active saved activation context')
+        kwargs.setdefault('use_reentrant', False)
+        if self.store.config.forward_commit_unit == 'checkpoint':
+            if kwargs['use_reentrant'] or 'context_fn' in kwargs:
+                raise ValueError('Early checkpoint offload requires non-reentrant checkpoint '
+                                 'without a custom context_fn')
+            kwargs['context_fn'] = self._checkpoint_contexts
+        # Preserve PyTorch's default context_fn (and debug support) unless
+        # early submission was explicitly selected.
+        return checkpoint(function, *args, **kwargs)
+
+    def _checkpoint_contexts(self):
+        return self._submit_checkpoint_inputs(), nullcontext()
+
+    @contextmanager
+    def _submit_checkpoint_inputs(self):
+        self.group.flush()
+        yield

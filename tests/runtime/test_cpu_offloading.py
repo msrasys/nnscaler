@@ -465,6 +465,73 @@ def test_checkpoint_without_saved_intermediates_does_not_copy_dead_input():
 
 
 @cuda
+@pytest.mark.parametrize('commit', ['group', 'scope', 'checkpoint'])
+@pytest.mark.parametrize('save_events', [False, True])
+def test_checkpoint_input_submission_precedes_compute_and_never_replays(commit, save_events):
+    module = OffloadModule(forward_commit_unit=commit, transfer_unit='scope',
+                           use_save_events=save_events, max_prefetch_bytes=1024**2)
+    leaf = torch.randn(64, 64, device='cuda', requires_grad=True)
+    x = leaf * 2
+    expected = 2 * torch.cos(2 * x.detach())
+    entries = []
+
+    def function(a, b):
+        entries.append(module.activation_offload_stats()['d2h_bytes'])
+        return a.sin() * b.t().cos()
+
+    with module.activation_offload_scope('early-checkpoint'):
+        with module.cpu_offloading_hooks() as saved:
+            y = saved.checkpoint(function, x, x.t())
+        saved.watch(y)
+    size = x.untyped_storage().nbytes()
+    assert entries == [size if commit == 'checkpoint' else 0]
+    assert module.activation_offload_stats()['d2h_bytes'] == size  # aliased inputs once
+    del x
+    for retain in (True, False):
+        grad, = torch.autograd.grad(y.sum(), leaf, retain_graph=retain)
+        torch.testing.assert_close(grad, expected)
+    assert len(entries) == 3
+    assert entries[1:] == [size, size]  # no intermediate/replay offload
+    module.finish_activation_offload('early-checkpoint')
+    assert module.activation_offload_stats()['live_cpu_bytes'] == 0
+
+
+@cuda
+def test_early_checkpoint_rejects_input_mutation_after_submission():
+    module = OffloadModule(forward_commit_unit='checkpoint')
+    leaf = torch.randn(64, 64, device='cuda', requires_grad=True)
+    x = leaf * 2
+    with module.activation_offload_scope('mutated-checkpoint'):
+        with module.cpu_offloading_hooks() as saved:
+            y = saved.checkpoint(torch.sin, x)
+        saved.watch(y)
+    assert module.activation_offload_stats()['d2h_bytes'] == x.untyped_storage().nbytes()
+    x.add_(1)
+    with pytest.raises(RuntimeError, match='inplace|modified'):
+        y.sum().backward()
+
+
+@cuda
+def test_early_checkpoint_forward_failure_releases_saved_input():
+    module = OffloadModule(forward_commit_unit='checkpoint')
+    x = torch.randn(64, 64, device='cuda', requires_grad=True)
+
+    def failing(value):
+        assert module.activation_offload_stats()['d2h_bytes'] == value.untyped_storage().nbytes()
+        raise ValueError('forward failed')
+
+    with pytest.raises(ValueError, match='forward failed'):
+        with module.activation_offload_scope('failed-checkpoint'):
+            with module.cpu_offloading_hooks() as saved:
+                saved.checkpoint(failing, x)
+    gc.collect()
+    assert saved._hooks is None and saved._scope_context is None
+    assert module.activation_offload_stats()['live_cpu_bytes'] == 0
+    with pytest.raises(RuntimeError, match='active saved activation context'):
+        saved.checkpoint(torch.sin, x)
+
+
+@cuda
 @pytest.mark.parametrize('count,budget,loaded', [(1, 65536, 1), (3, 65536, 3), (3, 16384, 1)])
 def test_scope_prefetch_depth_obeys_shared_byte_window(count, budget, loaded):
     module = OffloadModule(scope_prefetch_groups=count, max_prefetch_bytes=budget)

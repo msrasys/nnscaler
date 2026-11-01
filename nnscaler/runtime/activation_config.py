@@ -37,6 +37,7 @@ class CPUOffloadConfig:
     transfer_unit: str = 'auto'
     # Forward submission is independent of restore coverage. auto preserves
     # the historical transfer_unit choice; group starts D2H inside a forward.
+    # checkpoint additionally submits checkpoint inputs before its compute.
     forward_commit_unit: str = 'auto'
     # Target bytes per physical D2H batch. Scope submissions also flush at a
     # closed region once accumulated bytes reach this target. Zero disables
@@ -71,8 +72,9 @@ class CPUOffloadConfig:
                     raise ValueError('prefetch_trigger must be all or backward')
                 continue
             if name in ('transfer_unit', 'forward_commit_unit'):
-                if value not in ('auto', 'scope', 'group'):
-                    raise ValueError(f'{name} must be auto, scope, or group')
+                choices = ('auto', 'scope', 'group', 'checkpoint') if name == 'forward_commit_unit' else ('auto', 'scope', 'group')
+                if value not in choices:
+                    raise ValueError(f'{name} must be one of {choices}')
                 continue
             if name in ('reload_on_compute_stream', 'skip_retained_inputs', 'use_save_events', 'release_pipeline_inputs'):
                 if not isinstance(value, bool):
@@ -88,4 +90,6 @@ class CPUOffloadConfig:
         return ('scope' if pipeline else 'group') if self.transfer_unit == 'auto' else self.transfer_unit
 
     def commit_unit(self, *, pipeline):
+        if self.forward_commit_unit == 'checkpoint':
+            return 'group'
         return self.restore_unit(pipeline=pipeline) if self.forward_commit_unit == 'auto' else self.forward_commit_unit

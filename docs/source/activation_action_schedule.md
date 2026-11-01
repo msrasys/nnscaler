@@ -12,7 +12,7 @@ number, optimizer step, or a guessed reverse-forward order.
 | Setting | Meaning | Default |
 | --- | --- | --- |
 | `transfer_unit` | Restore coverage: `auto` uses F/B scopes in pipeline and regions otherwise; `scope` restores a scope, `group` uses region lookahead | `auto` |
-| `forward_commit_unit` | D2H submission: `group` submits at region boundaries; `scope` accumulates regions; `auto` follows `transfer_unit` for compatibility | `auto` |
+| `forward_commit_unit` | D2H submission: `group` submits at region boundaries; `checkpoint` also submits checkpoint inputs before compute; `scope` accumulates regions; `auto` follows `transfer_unit` | `auto` |
 | `commit_batch_bytes` | Physical D2H batch target; also enables early scope flush at closed region boundaries; one indivisible storage may exceed it | `0` (disabled) |
 | `copy_chunk_bytes` | Maximum DMA-call size; does not split tensor ownership or bound total GPU allocations | `0` (one copy per storage) |
 | `pipeline_prefetch_steps` | Start up to N local F/B actions before the consuming backward, once its forward scope has closed | `1` |
@@ -106,6 +106,34 @@ The storage-independent queues live in `activation_batch.py`: `ForwardCommitQueu
 owns pending sources, `ScopeRestoreQueue` owns weak records, and `ActivationBatch`
 provides explicit flush/commit boundaries. `ActivationTransferEngine` handles
 streams and DMA; the F/B plan has no knowledge of DMA chunks or region types.
+
+### Checkpoint input submission
+
+`forward_commit_unit=checkpoint` uses PyTorch's public non-reentrant checkpoint
+`context_fn` hook to flush saved inputs before entering the original forward.
+This gives D2H the checkpoint's own compute as an overlap opportunity. Ordinary
+offload-only regions still commit on exit. Restore coverage, F/B lookahead,
+batch sizes, host limits and the immutable-tensor contract are unchanged.
+The generated adapter supplies an empty replay context, so replay does not
+offload intermediates or resubmit inputs.
+
+The same interface works with an explicit store:
+
+```python
+with store.saved_tensors(exclude=model.parameters()) as saved:
+    y = saved.checkpoint(model, x)  # non-reentrant by default
+```
+
+Configure the store with `CPUOffloadConfig(forward_commit_unit='checkpoint')`.
+With other modes, the wrapper leaves the original commit timing and PyTorch's
+default context unchanged. The early flush uses existing batch admission and
+producer events; it does not wait for D2H to finish on the CPU unless the hard
+pending-source limit requires it. An input may be copied unnecessarily if the
+checkpoint ultimately requires no replay, which cannot be determined before
+its forward. Keep this mode opt-in and profile regions with meaningful work.
+Early mode owns `context_fn` and rejects reentrant/custom-context checkpoints;
+PyTorch's nondefault-context restrictions on debug mode and `torch.compile`
+also apply. Regenerate existing code to use the checkpoint submission adapter.
 
 ## Optional dependency timing
 

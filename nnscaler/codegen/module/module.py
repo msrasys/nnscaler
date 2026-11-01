@@ -1053,7 +1053,8 @@ class ModuleCodeGen(FuncEmission):
             else:
                 # get recompute excution code
                 group_codes = self._emit_recompute(group,
-                    group_segment.inputs(), group_segment.outputs(), lifetime, runtime_devid)
+                    group_segment.inputs(), group_segment.outputs(), lifetime, runtime_devid,
+                    offload=offload_gid is not None)
             if offload_gid is not None:
                 # Outside checkpoint(): capture checkpoint inputs, not replay intermediates.
                 tail_arg = 'tail=True' if group is last_offload_group else ''
@@ -1280,7 +1281,7 @@ class ModuleCodeGen(FuncEmission):
         return node_codes
 
     def _emit_recompute(self, nodes: Tuple[IRCell], inputs: List[IRSubTensor], outputs: List[IRSubTensor],
-                        lifecycle: LifeCycle, runtime_devid: int) -> List[str]:
+                        lifecycle: LifeCycle, runtime_devid: int, *, offload: bool = False) -> List[str]:
         """
         Emit code to define a Python function for Recomputing and invoke it
         e.g. (the lines are split into `List[str]`)
@@ -1334,8 +1335,9 @@ class ModuleCodeGen(FuncEmission):
             fb.insert_body(self._emit_nodes(nodes, lifecycle, runtime_devid))
             fb.insert_body(f'return {output_names_tuple}')
         codes = [''] + fb.code + ['']
+        checkpoint = '_offload.checkpoint' if offload else 'ckpt.checkpoint'
         codes.append(
-            f'{output_names_tuple} = ckpt.checkpoint(recompute, {input_names_tuple}, use_reentrant=False)'
+            f'{output_names_tuple} = {checkpoint}(recompute, {input_names_tuple}, use_reentrant=False)'
         )
 
         return codes
