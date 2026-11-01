@@ -4,7 +4,7 @@ from dataclasses import dataclass
 
 import torch
 
-from nnscaler.runtime.activation_memory import _OffloadPool, available_host_bytes
+from nnscaler.runtime.activation_memory import _OffloadPool, _event_completed, available_host_bytes
 
 
 @dataclass(eq=False)
@@ -32,8 +32,9 @@ class SlabOffloadPool(_OffloadPool):
 
     def _reap(self):
         waiting = []
+        queried = {}
         for buffer, event in self.pending:
-            if event is not None and not event.query():
+            if not _event_completed(event, queried):
                 waiting.append((buffer, event))
                 continue
             slab, offset, length = self.pending_slots.pop(id(buffer))

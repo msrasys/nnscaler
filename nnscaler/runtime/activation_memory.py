@@ -8,6 +8,16 @@ import threading
 import torch
 
 
+def _event_completed(event, queried):
+    """A shared batch completion is queried only once per pool reap pass."""
+    if event is None:
+        return True
+    key = id(event)
+    if key not in queried:
+        queried[key] = event.query()
+    return queried[key]
+
+
 def _cgroup_headroom(path):
     """Estimate allocatable bytes without treating clean inactive cache as live.
 
@@ -82,8 +92,9 @@ class _OffloadPool:
 
     def _reap(self):
         pending = []
+        queried = {}
         for buffer, event in self.pending:
-            if event is None or event.query():
+            if _event_completed(event, queried):
                 size = buffer.numel()
                 if size not in self.free:
                     self.free[size] = []

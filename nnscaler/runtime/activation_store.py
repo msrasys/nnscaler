@@ -610,6 +610,7 @@ class ActivationStore:
                     managed_storages=sum(record.live_saves > 0 for record in records),
                     managed_gpu_storage_bytes=sum(storages.values()),
                     queued_d2h_bytes=self.transport.inflight_bytes, pool=self.pool.snapshot(),
+                    ordered_d2h_bytes=self.transport.ordered_bytes,
                     residency_note='Observed backing storages of managed CUDA records, deduplicated; '
                                    'excludes untracked resident saves, pending frees and allocator cache.')
 
@@ -623,7 +624,6 @@ class ActivationStore:
         for stream in (self.d2h_stream, self.h2d_stream):
             if stream is not None:
                 stream.synchronize()
-        self.transport.inflight.clear()
-        self.transport.inflight_bytes = 0
+        self.transport.clear()
         self.pool.snapshot()  # Reap completions without closing another store's pool.
         self.closed = True

@@ -7,6 +7,8 @@ import time
 
 import torch
 
+from .activation_fence import TransferFence, cuda_event
+
 
 class ActivationTransferEngine:
     def __init__(self, config, device, stats, observation):
@@ -16,18 +18,38 @@ class ActivationTransferEngine:
         self.h2d_stream = torch.cuda.Stream(device=device) if device.type == 'cuda' else None
         self.inflight = deque()
         self.inflight_bytes = 0
+        self._ordered_batches = deque()
+        self.ordered_bytes = 0
         self._d2h_batch = ContextVar('activation_d2h_batch', default=False)
         self._h2d_batch = ContextVar('activation_h2d_batch', default=False)
+        self._last_restore_wait = None
 
     @contextmanager
     def _stream_batch(self, stream, active):
         if active.get():
-            yield
+            yield active.get()
             return
         with torch.cuda.stream(stream):
-            token = active.set(True)
+            fence = TransferFence()
+            token = active.set(fence)
+            direction = 'd2h' if active is self._d2h_batch else 'h2d'
+            def publish():
+                if fence.used:
+                    fence.publish(stream)
+                    self.stats[direction + '_completion_events'] += 1
             try:
-                yield
+                yield fence
+            except BaseException:
+                # A later allocation can fail after earlier complete DMA calls
+                # were enqueued. Publish their fence without draining unrelated
+                # queues; individual partial-copy failures drain at the copy site.
+                try:
+                    publish()
+                except BaseException:
+                    pass  # Preserve the original error; fence is marked failed.
+                raise
+            else:
+                publish()
             finally:
                 active.reset(token)
 
@@ -44,20 +66,31 @@ class ActivationTransferEngine:
 
     def poll(self):
         """Reap completed copies without waiting for unfinished GPU work."""
-        while self.inflight and self.inflight[0][1].query():
+        completed = None
+        while self.inflight:
+            event = self.inflight[0][1]
+            if event is not completed and not event.query():
+                break
             nbytes, _ = self.inflight.popleft()
             self.inflight_bytes -= nbytes
+            completed = event
+        while self._ordered_batches and self._ordered_batches[0][1].query():
+            size, _ = self._ordered_batches.popleft()
+            self.ordered_bytes -= size
 
     def throttle(self, size=0):
         started = time.perf_counter_ns() if self.observation.enabled else None
         waited = 0
         self.poll()
-        while self.inflight and self.inflight_bytes + size > self.config.max_inflight_bytes:
+        limit = (self.config.max_pending_bytes if self.config.backpressure_mode == 'stream'
+                 else self.config.max_inflight_bytes)
+        while self.inflight and self.inflight_bytes + size > limit:
             nbytes, event = self.inflight.popleft()
             event.synchronize()
             self.inflight_bytes -= nbytes
             self.stats['d2h_throttles'] += 1
             waited += 1
+            self.poll()  # Retire the other storages sharing this batch fence.
         if started is not None:
             self.observation.emit('throttle', count=waited,
                                   cpu_duration_ns=time.perf_counter_ns() - started)
@@ -66,7 +99,7 @@ class ActivationTransferEngine:
         """Submit an admitted batch without allocations or host waits between copies."""
         waited_events, waited_streams = set(), set()
         copied = copied_bytes = 0
-        with self._stream_batch(self.d2h_stream, self._d2h_batch):
+        with self._stream_batch(self.d2h_stream, self._d2h_batch) as completion:
             for record in records:
                 stream = record.producer_stream
                 event = record.producer_ready_event or (producer_events or {}).get(stream.cuda_stream)
@@ -74,7 +107,7 @@ class ActivationTransferEngine:
                 # ready copy must not wait for an unrelated later producer.
                 if event is not None:
                     if event not in waited_events:
-                        self.d2h_stream.wait_event(event)
+                        self.d2h_stream.wait_event(cuda_event(event))
                         waited_events.add(event)
                 elif stream.cuda_stream not in waited_streams:
                     self.d2h_stream.wait_stream(stream)
@@ -83,12 +116,41 @@ class ActivationTransferEngine:
                     copied += 1
                     copied_bytes += record.size
         if copied:
+            if self.config.backpressure_mode == 'stream':
+                self._pace_compute(copied_bytes, completion)
             self.stats['d2h_committed_groups'] += 1
             self.stats['peak_d2h_batch_bytes'] = max(self.stats['peak_d2h_batch_bytes'], copied_bytes)
             self.stats['peak_queued_d2h_bytes'] = max(
                 self.stats['peak_queued_d2h_bytes'], self.inflight_bytes)
             if self.observation.enabled:
                 self.observation.emit('d2h_batch_submit', nbytes=copied_bytes, count=copied)
+
+    def _pace_compute(self, nbytes, completion):
+        """Order future compute after older batches without blocking its host.
+
+        This is an execution window, not a physical-memory accounting shortcut:
+        inflight_bytes continues charging every unfinished source until query()
+        reports completion. throttle() enforces the separate hard pending cap.
+        At most one indivisible batch can overshoot either admission threshold.
+        """
+        self._ordered_batches.append((nbytes, completion))
+        self.ordered_bytes += nbytes
+        stream = torch.cuda.current_stream(self.device)
+        while self._ordered_batches and self.ordered_bytes > self.config.max_inflight_bytes:
+            size, ready = self._ordered_batches.popleft()
+            stream.wait_event(cuda_event(ready))
+            self.ordered_bytes -= size
+            self.stats['d2h_stream_waits'] += 1
+            if self.observation.enabled:
+                self.observation.emit('d2h_stream_wait', nbytes=size, count=1)
+
+    def clear(self):
+        """Forget completed bookkeeping after the owner has drained streams."""
+        self.inflight.clear()
+        self.inflight_bytes = 0
+        self._ordered_batches.clear()
+        self.ordered_bytes = 0
+        self._last_restore_wait = None
 
     def to_host(self, source, destination):
         with self.observation.range('d2h'):
@@ -101,8 +163,7 @@ class ActivationTransferEngine:
         source.record_stream(self.d2h_stream)
         try:
             self._copy_into(destination, source, 'd2h')
-            ready = torch.cuda.Event()
-            ready.record(self.d2h_stream)
+            ready = self._completion(self._d2h_batch, self.d2h_stream, 'd2h')
         except BaseException:
             # A later chunk/event can fail after earlier DMA was enqueued.
             # The caller must not recycle a host buffer without its fence.
@@ -110,6 +171,17 @@ class ActivationTransferEngine:
             raise
         self.inflight.append((source.numel() * source.element_size(), ready))
         self.inflight_bytes += source.numel() * source.element_size()
+        return ready
+
+    def _completion(self, active, stream, direction):
+        fence = active.get()
+        if isinstance(fence, TransferFence):
+            fence.used = True
+            return fence
+        # Internal direct-copy calls retain a standalone completion event.
+        ready = torch.cuda.Event()
+        ready.record(stream)
+        self.stats[direction + '_completion_events'] += 1
         return ready
 
     def to_device(self, source, dependency):
@@ -136,7 +208,13 @@ class ActivationTransferEngine:
             self.observation.emit(direction + '_copy', nbytes=source.numel() * source.element_size(), count=chunks)
 
     def wait_for_restore(self, stream, ready, *, storage_id, nbytes):
+        previous = self._last_restore_wait
+        if (isinstance(ready, TransferFence) and previous is not None
+                and previous[0] == stream.cuda_stream and previous[1] is ready):
+            self.stats['restore_waits_elided'] += 1
+            return
         self.observation.wait_event(stream, ready, storage_id=storage_id, nbytes=nbytes)
+        self._last_restore_wait = (stream.cuda_stream, ready)
 
     def _to_device(self, source, dependency):
         stream = self.h2d_stream
@@ -147,7 +225,7 @@ class ActivationTransferEngine:
             stream.wait_stream(consumer)
         if self._h2d_batch.get():
             return self._restore_on_stream(source, dependency, destination)
-        with torch.cuda.stream(stream):
+        with self._stream_batch(stream, self._h2d_batch):
             return self._restore_on_stream(source, dependency, destination)
 
     def _restore_on_stream(self, source, dependency, destination):
@@ -160,10 +238,9 @@ class ActivationTransferEngine:
         destination.record_stream(stream)
         try:
             with self.observation.range('h2d_copy'):
-                stream.wait_event(dependency)
+                stream.wait_event(cuda_event(dependency))
                 self._copy_into(destination, source, 'h2d')
-                ready = torch.cuda.Event()
-                ready.record(stream)
+                ready = self._completion(self._h2d_batch, stream, 'h2d')
         except BaseException:
             stream.synchronize()
             raise

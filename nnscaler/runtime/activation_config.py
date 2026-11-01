@@ -9,6 +9,11 @@ class CPUOffloadConfig:
     max_cpu_bytes: int = 8 * 1024**3
     min_tensor_bytes: int = 1024**2
     max_inflight_bytes: int = 512 * 1024**2
+    # host: bound submission by waiting on the CPU (legacy behavior).
+    # stream: pace future compute with completed-batch CUDA dependencies while
+    # max_pending_bytes independently bounds physically unfinished D2H sources.
+    backpressure_mode: str = 'host'
+    max_pending_bytes: int = 0
     max_prefetch_bytes: int = 512 * 1024**2
     prefetch_groups: int = 1
     scope_prefetch_groups: int = 1
@@ -53,6 +58,10 @@ class CPUOffloadConfig:
 
     def __post_init__(self):
         for name, value in vars(self).items():
+            if name == 'backpressure_mode':
+                if value not in ('host', 'stream'):
+                    raise ValueError('backpressure_mode must be host or stream')
+                continue
             if name in ('transfer_unit', 'forward_commit_unit'):
                 if value not in ('auto', 'scope', 'group'):
                     raise ValueError(f'{name} must be auto, scope, or group')
@@ -63,6 +72,9 @@ class CPUOffloadConfig:
                 continue
             if isinstance(value, bool) or not isinstance(value, int) or value < 0:
                 raise ValueError(f'{name} must be a non-negative integer, got {value!r}')
+        if self.backpressure_mode == 'stream' and (
+                self.max_pending_bytes == 0 or self.max_pending_bytes < self.max_inflight_bytes):
+            raise ValueError('stream backpressure requires max_pending_bytes >= max_inflight_bytes and > 0')
 
     def restore_unit(self, *, pipeline):
         return ('scope' if pipeline else 'group') if self.transfer_unit == 'auto' else self.transfer_unit

@@ -53,6 +53,27 @@ Saved-tensor hooks use the same storage path without creating gradient anchors.
 
 ## Validation boundaries
 
+Transport batches share one immutable completion fence per direction. A fence
+is published only after its CUDA event has been recorded: a different autograd
+thread must never wait on an unrecorded event. Pool reaping queries a shared
+fence once per pass, and consecutive loads on the same consumer stream omit
+redundant waits. Storage identities and version checks remain per saved value.
+
+`backpressure_mode="host"` retains the legacy `max_inflight_bytes` admission
+threshold. `"stream"` uses that threshold for CUDA execution pacing and requires
+an independent, positive `max_pending_bytes` at least as large. CUDA waits retire
+execution credits only; physically unfinished submitted source bytes remain
+charged until their completion is observed. The host still waits at the pending
+threshold to bound memory. Admission may overshoot by one indivisible batch.
+Uncommitted forward saves, other GPU owners and allocator cache are separate
+from these submitted-source counters; use the physical batch target and actual
+GPU memory measurements as well. This is not an unlimited background queue.
+
+The reference ideas were group completion fences and stream-side pacing in
+Megatron Core's `fine_grained_activation_offload.py`. This implementation keeps
+NNScaler's own storage/version and host-budget contracts; it does not resize
+user storages or assume all views can be discarded. No Megatron code was copied.
+
 CPU checks cover configuration, ownership, exceptional exits and gradient-edge
 semantics. CUDA checks must additionally cover views, version violations, delayed
 streams, multiple producer/consumer streams, repeated eviction, shared budgets

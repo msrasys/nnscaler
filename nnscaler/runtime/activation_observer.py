@@ -7,6 +7,8 @@ import threading
 import time
 import torch
 
+from .activation_fence import cuda_event
+
 _store_ids = count()
 _no_range = nullcontext()
 
@@ -105,6 +107,7 @@ class _Observation:
         intervals on other streams. It is not global critical-path cost.
         Normal execution adds no timing events and performs no event queries.
         """
+        ready = cuda_event(ready)
         if not self._timing_traces:
             stream.wait_event(ready)
             return
