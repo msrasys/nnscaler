@@ -76,6 +76,15 @@ Megatron Core's `fine_grained_activation_offload.py`. This implementation keeps
 NNScaler's own storage/version and host-budget contracts; it does not resize
 user storages or assume all views can be discarded. No Megatron code was copied.
 
+Host submission and GPU execution are distinct. The calling thread prepares host
+buffers and submits CUDA copy operations; there is no dedicated CPU copy worker.
+The D2H and H2D streams run transfers asynchronously, and the queues track their
+ownership, readiness and byte budgets. A logical batch shares completion fences
+where dependencies permit; it can still contain several storage copies or DMA
+chunks. It does not concatenate a stage into another GPU staging tensor. GPU-side
+pacing avoids a host wait at the soft limit; the separate hard pending limit can
+still block submission to bound unfinished source allocations.
+
 The optional checkpoint-input submission adapter observes weak references to
 the saved-value tokens created by that invocation. Shared storage can still be
 owned by another region or explicit handle; those owners must not make a
