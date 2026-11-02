@@ -87,6 +87,11 @@ class IRSegment(IRCell):
         super().__init__(name, '', len(inputs), len(outputs))
 
         self._nodes: List[IRCell] = []
+        # Index only direct children. Descendant lookups recurse into their
+        # current indexes, so editing a nested segment cannot stale a parent.
+        self._node_counts: Dict[IRCell, int] = {}
+        self._node_segments: Dict[IRSegment, None] = {}
+        self._lookup_nodes = self._nodes
 
         # full objects
         self._fobjects: Set[IRObject] = set()
@@ -115,6 +120,42 @@ class IRSegment(IRCell):
             self.insert(node, self.nnodes)
 
         self._dispatch_cached: Dict[int, IRSegment] = {}
+
+    def __getstate__(self):
+        # These are derived indexes. Avoid duplicating them in graph dumps,
+        # deepcopy, and the payload sent to every code-generation worker.
+        state = self.__dict__.copy()
+        state.pop('_node_counts', None)
+        state.pop('_node_segments', None)
+        state.pop('_lookup_nodes', None)
+        return state
+
+    def __copy__(self):
+        # A shallow copy shares the node list and therefore must also share
+        # its indexes. A later replacement of that list detaches the indexes.
+        self._ensure_node_lookup()
+        result = type(self).__new__(type(self))
+        result.__dict__.update(self.__dict__)
+        return result
+
+    def _rebuild_node_lookup(self):
+        if (getattr(self, '_lookup_nodes', None) is self._nodes
+                and hasattr(self, '_node_counts')):
+            self._node_counts.clear()
+            self._node_segments.clear()
+        else:
+            self._node_counts = {}
+            self._node_segments = {}
+            self._lookup_nodes = self._nodes
+        for node in self._nodes:
+            self._node_counts[node] = self._node_counts.get(node, 0) + 1
+            if isinstance(node, IRSegment):
+                self._node_segments[node] = None
+
+    def _ensure_node_lookup(self):
+        # Also handles graph dumps produced before the indexes existed.
+        if not hasattr(self, '_node_counts') or self._lookup_nodes is not self._nodes:
+            self._rebuild_node_lookup()
 
     def set_input(self, idx: int, val: Any):
         for t in IRSegment.get_objects_from_complex(val):
@@ -490,6 +531,8 @@ class IRSegment(IRCell):
 
         Note sub-segment will also be reordered.
         """
+        # Bulk segment expansion can replace the node list in place.
+        self._rebuild_node_lookup()
         # clear up
         self._fobjects, self._attributes = set(), set()
         self._producers, self._ptensors = dict(), dict()
@@ -533,8 +576,12 @@ class IRSegment(IRCell):
 
         if len(pos) == 1:
             index = pos[0]
+            self._ensure_node_lookup()
             # insert node
             self._nodes.insert(index, node)
+            self._node_counts[node] = self._node_counts.get(node, 0) + 1
+            if isinstance(node, IRSegment):
+                self._node_segments[node] = None
             if isinstance(node, IRAdapter): return
             # update producer and consumer
             # NOTE: we use `dict.fromkeys` to remove duplicate tensors
@@ -574,8 +621,15 @@ class IRSegment(IRCell):
 
         if len(pos.indices) == 1:
             index = pos[0]
+            self._ensure_node_lookup()
             # remove
             self._nodes.pop(index)
+            count = self._node_counts[node] - 1
+            if count:
+                self._node_counts[node] = count
+            else:
+                del self._node_counts[node]
+                self._node_segments.pop(node, None)
             # update producer and consumer
             if isinstance(node, IRAdapter): return pos
             # consumer
@@ -658,11 +712,11 @@ class IRSegment(IRCell):
 
         @return exsit bool: True if exist otherwise False
         """
-        if node in self._nodes:
+        self._ensure_node_lookup()
+        if node in self._node_counts:
             return True
         if flatten:
-            for segment in self._nodes:
-                if not isinstance(segment, IRSegment): continue
+            for segment in self._node_segments:
                 if segment.exist(node, flatten):
                     return True
         return False
