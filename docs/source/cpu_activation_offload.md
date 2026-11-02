@@ -1,5 +1,9 @@
 # CPU activation offloading
 
+An [equal-work component validation](activation_store_overlap_20261102.md)
+compares overlapped transfers with a compute-only reference and measures the
+batch-size tradeoff under fixed bytes, computation and NUMA placement.
+
 Pipeline scheduling now uses configurable local virtual-stage F/B units. See
 [action-unit scheduling](activation_action_schedule.md) for lookahead distance,
 producer-readiness clipping, retry priority and the scope/group choice. Existing

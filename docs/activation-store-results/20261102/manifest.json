@@ -1,0 +1,80 @@
+{
+  "runtime_commit": "acdca489bfbb6675db0e6e48af24599ad4ad83a1",
+  "benchmark_commit": "27af2685acbcc4d3eda85bf4aa1525313a2cc219",
+  "gpu": 0,
+  "numa_node": 0,
+  "files": [
+    {
+      "file": "transport-n128-mib2-numa0-batch128.json.gz",
+      "source_sha256": "d200e7f0b6ab0bb293a1afd813c8b7156671b327ecc7e70e800ae2053b389770"
+    },
+    {
+      "file": "transport-n128-mib2-numa0-batch128-resources.json.gz",
+      "source_sha256": "2b26783ce8da5b309fb2e5c31019f6f421c6568711ae6c6ad7094fbd0010a23e"
+    },
+    {
+      "file": "transport-n128-mib2-numa0-batch128.log.gz",
+      "source_sha256": "cdf69ebe327a372423fe1d32466863c7b5a0e7bca6495a4e442cfa4b56ac8650"
+    },
+    {
+      "file": "transport-n128-mib2-numa0-batch32.json.gz",
+      "source_sha256": "735e6ef48e75131e524edef9127d3210f02e37c0c1376df8434e4362c3947f86"
+    },
+    {
+      "file": "transport-n128-mib2-numa0-batch32-resources.json.gz",
+      "source_sha256": "3775ac3c2232af2579aa9cffdcbc9a1604252cada8f569f96c018f569cff5a43"
+    },
+    {
+      "file": "transport-n128-mib2-numa0-batch32.log.gz",
+      "source_sha256": "e7a1dd84af48cdd9eb99be4c0cb84a0bdf62d7b83d63175a25df7a330f52f8c6"
+    },
+    {
+      "file": "transport-n16-mib16-numa0-batch16.json.gz",
+      "source_sha256": "0dccb17029b47fc1a9438906374d458ecdc94deba0f540f7234f8c1a5ed3733b"
+    },
+    {
+      "file": "transport-n16-mib16-numa0-batch16-resources.json.gz",
+      "source_sha256": "b540e62ab76290d570c2790cb9488e81bfa49ffa8445224dbff6bd39ecc31186"
+    },
+    {
+      "file": "transport-n16-mib16-numa0-batch16.log.gz",
+      "source_sha256": "adb241f57a9ba5162daa01963c6de1ba7fb64a8e38b769c86b274844433ba39a"
+    },
+    {
+      "file": "transport-n16-mib16-numa0-batch4.json.gz",
+      "source_sha256": "f64bf63525e491e6714055533abbedbac8b5962936e1b6a2cbeefbd3a9a9c6ba"
+    },
+    {
+      "file": "transport-n16-mib16-numa0-batch4-resources.json.gz",
+      "source_sha256": "24587a7d366c6fd19ba99c0cc123bcec1f2f831fd5952c865c39bc6ba255bad3"
+    },
+    {
+      "file": "transport-n16-mib16-numa0-batch4.log.gz",
+      "source_sha256": "bc2c3e1db7281dcd40f2ed3d5b4827ab415d10eb9fdfd50b5c054a18f7b5e7c6"
+    },
+    {
+      "file": "transport-n16-mib64-numa0-batch16.json.gz",
+      "source_sha256": "99e0f53406c6e574218706f3a066bbe47549f8a411a0fcd80cd6c6bd549b542d"
+    },
+    {
+      "file": "transport-n16-mib64-numa0-batch16-resources.json.gz",
+      "source_sha256": "560d0d7efb41b953758cec793ececf7071726ce625d10586fc05ebee07092882"
+    },
+    {
+      "file": "transport-n16-mib64-numa0-batch16.log.gz",
+      "source_sha256": "ab9c521e3f133d780123dda7ee067bab176070498fcb5f201cc67b6b51ffd7b4"
+    },
+    {
+      "file": "transport-n16-mib64-numa0-batch4.json.gz",
+      "source_sha256": "b34d2ddcf8ba3efee2034fbb17c812f4a0b099fabc3dbbbddff6d7932d133723"
+    },
+    {
+      "file": "transport-n16-mib64-numa0-batch4-resources.json.gz",
+      "source_sha256": "399626641ad06e1da4d21664eec92cf1cc827796c833bbf086a3342e59215a3b"
+    },
+    {
+      "file": "transport-n16-mib64-numa0-batch4.log.gz",
+      "source_sha256": "8528b50509845fd4c86a607a13fb234678293192acfb2db9abbc03d2b9f4a09d"
+    }
+  ]
+}
