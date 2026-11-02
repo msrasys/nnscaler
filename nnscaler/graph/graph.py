@@ -25,7 +25,7 @@ from nnscaler.graph.function.function import Identity
 from nnscaler.graph.function.anchor import IRGraphAnchor
 from nnscaler.graph.function.pyfunc import IRPyFunc
 from nnscaler.graph.function.dimops import IRDimops, OpAnno
-from nnscaler.graph.segment import IRSegment, IRSegmentExpander
+from nnscaler.graph.segment import IRSegment, IRSegmentExpander, CellPosition
 
 from nnscaler.algorithm.generics import GenericDistAlgo
 
@@ -786,14 +786,16 @@ class IRGraph(IRSegment):
         assert len(set(fgraphs)) == 1, "cross-segment grouping is not allowed yet."
 
         fgraph: IRSegment = fgraphs[0]
-        findices: Tuple[int] = tuple(fgraph.index(node)[0] for node in nodes)
+        findices: Tuple[int] = tuple(pos[0] for pos in fgraph.multi_index(nodes))
         min_fidx, max_fidx = min(findices), max(findices)
         assert max_fidx - min_fidx + 1 == len(nodes), "nodes should be in consecutive order"
 
         fsegment: IRSegment = fgraph.create_segment(nodes)
-        for node in nodes:
-            idx = fgraph.remove(node)
-        fgraph.insert(fsegment, idx)
+        # remove from the back so the already-known positions stay valid,
+        # avoiding a linear search per node.
+        for fidx, node in sorted(zip(findices, nodes), key=lambda p: p[0], reverse=True):
+            fgraph.remove(node, CellPosition((fidx,)))
+        fgraph.insert(fsegment, min_fidx)
 
         # group for mirror nodes
         bnodes = [node.mirror for node in nodes if node.mirror is not None]
@@ -801,7 +803,7 @@ class IRGraph(IRSegment):
 
         # check consecutive
         bgraph: IRSegment = fgraph.mirror
-        bindices = [bgraph.index(bnode)[0] for bnode in bnodes]
+        bindices = [pos[0] for pos in bgraph.multi_index(bnodes)]
         min_bidx, max_bidx = min(bindices), max(bindices)
         assert max_bidx - min_bidx + 1 == len(bnodes), \
             f"backward nodes are not consecutive. minbidx: {min_bidx}, maxbidx: {max_bidx}"
@@ -815,8 +817,9 @@ class IRGraph(IRSegment):
             fsegment.infer_grad(ftensor)
 
         # create backward segment
-        for bnode in bnodes:
-            bidx = bgraph.remove(bnode)
+        for bidx, bnode in sorted(zip(bindices, bnodes), key=lambda p: p[0], reverse=True):
+            bgraph.remove(bnode, CellPosition((bidx,)))
+        bidx = min_bidx
         bnodes = [fsegment.create_bwop(fnode) for fnode in nodes[::-1] if fnode.mirror is not None]
         # get backward graph inputs
         output_grads = [t.grad for t in fsegment.outputs() if isinstance(t, IRSubTensor) and t.grad is not None]
@@ -984,11 +987,10 @@ class IRGraph(IRSegment):
             fstages.append(fnodes)
             bstages = [bnodes] + bstages
 
+        sid_of: Dict[IRCell, int] = {fnode: sid for sid, fnodes in enumerate(fstages) for fnode in fnodes}
+
         def get_sid(fnode: IRCell) -> Optional[int]:
-            for idx, fnodes in enumerate(fstages):
-                if fnode in fnodes:
-                    return idx
-            return None
+            return sid_of.get(fnode)
 
         def insert_identity(tensor: Union[IRTensor, IRObject], sid: int) -> IRFwOperation:
             fwop = Identity(tensor)
@@ -1016,6 +1018,7 @@ class IRGraph(IRSegment):
                     self.insert(fwop, fidx)
             # update stage op group
             fstages[sid].insert(0, fwop)
+            sid_of[fwop] = sid
             if isinstance(fwop.mirror, IRCell):
                 bstages[sid].append(fwop.mirror)
             return fwop
