@@ -1,6 +1,9 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 
+import gc
+import weakref
+
 import pytest
 import torch
 
@@ -130,3 +133,90 @@ def test_adapter_waits_before_consuming_async_result(requires_grad):
     torch.testing.assert_close(result, completed * 2)
     assert waits == [True]
     AsyncCommHandler().check_clear()
+
+
+@pytest.mark.parametrize('split', [False, True])
+def test_forward_only_reference_inputs_are_not_pinned_until_backward(split):
+    student = torch.randn(4, requires_grad=True)
+    reference = torch.randn(1024)
+    reference_ref = weakref.ref(reference)
+    metadata = {'reference': reference}
+
+    def segment(x, ref, info):
+        with torch.no_grad():
+            target = ref.square().sum() + info['reference'].sum()
+        return x.square() + target
+
+    output = Executor.fexecute('segment', segment, student, reference, metadata)
+    del reference, metadata
+    gc.collect()
+    assert reference_ref() is None
+    if split:
+        actual = Executor.backward_input('segment', [student], [output], [torch.ones_like(output)], [])
+        Executor.backward_weight('segment', [])
+    else:
+        actual = Executor.backward('segment', [student], [output], [torch.ones_like(output)])
+    torch.testing.assert_close(actual, 2 * student)
+    Executor.check_clear()
+
+
+@pytest.mark.parametrize('checkpoint', [False, True])
+def test_autograd_keeps_constant_inputs_needed_for_weight_gradients(checkpoint):
+    import torch.utils.checkpoint as ckpt
+
+    constant = torch.randn(3, 4)
+    expected = constant.clone().sum(0).reshape(4, 1).expand(4, 2)
+    weight = torch.nn.Parameter(torch.randn(4, 2))
+
+    def segment(x):
+        if checkpoint:
+            return ckpt.checkpoint(lambda value: value @ weight, x, use_reentrant=False)
+        return x @ weight
+
+    output = Executor.fexecute('segment', segment, constant)
+    assert Executor._detach['segment'][0][0][1] is None
+    del constant
+    gc.collect()
+    Executor.backward('segment', [], [output], [torch.ones_like(output)])
+    torch.testing.assert_close(weight.grad, expected)
+    Executor.check_clear()
+
+
+def test_grad_enabled_inside_forward_still_has_an_input_gradient():
+    value = torch.randn(4)
+
+    def segment(x):
+        x.requires_grad_()
+        return x.square()
+
+    output = Executor.fexecute('segment', segment, value)
+    result = Executor.backward('segment', [value], [output], [torch.ones_like(output)])
+    torch.testing.assert_close(result, 2 * value)
+    Executor.check_clear()
+
+
+def test_pruned_input_id_cannot_consume_a_later_boundary_callback():
+    later = torch.randn(4, requires_grad=True)
+    received = []
+    Executor.register_input_grad_callback(later, received.append)
+    Executor._run_input_grad_callbacks([(id(later), None)], {})
+    assert id(later) in Executor._input_grad_callbacks
+    assert not received
+    output = Executor.fexecute('later', lambda x: x.square(), later)
+    Executor.backward('later', [later], [output], [torch.ones_like(output)])
+    assert len(received) == 1
+    torch.testing.assert_close(received[0], 2 * later)
+    Executor.check_clear()
+
+
+@pytest.mark.parametrize('split', [False, True])
+def test_enabling_input_grad_after_forward_is_rejected(split):
+    value = torch.randn(4)
+    weight = torch.nn.Parameter(torch.ones(4))
+    output = Executor.fexecute('segment', lambda x: x * weight, value)
+    value.requires_grad_()
+    with pytest.raises(RuntimeError, match='requires_grad.*after forward'):
+        if split:
+            Executor.backward_input('segment', [value], [output], [torch.ones_like(output)], [weight])
+        else:
+            Executor.backward('segment', [value], [output], [torch.ones_like(output)])

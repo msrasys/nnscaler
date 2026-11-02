@@ -167,7 +167,7 @@ class AsyncCommHandler:
         )
 
 
-TensorPairs = List[Tuple[int, torch.Tensor]]
+TensorPairs = List[Tuple[int, Optional[torch.Tensor]]]
 
 
 @dataclass
@@ -215,6 +215,10 @@ class Executor:
         grad_by_dtensor_id: Dict[int, Optional[torch.Tensor]],
     ) -> None:
         for tensor_id, dtensor in saved_pairs:
+            if dtensor is None:
+                # Forward-only inputs can already be gone, and Python may
+                # have reused their object ids for a later callback boundary.
+                continue
             entry = Executor._input_grad_callbacks.pop(tensor_id, None)
             if entry is None:
                 continue
@@ -251,6 +255,18 @@ class Executor:
         Executor._detach.setdefault(name, []).append(saved_pairs)
 
         outputs = subgraph(*input_dtensors)
+        # Autograd/checkpointing own any constants needed by backward. The
+        # executor only needs strong references for input gradients/callbacks.
+        # Keeping every input here pins frozen reference hidden/KV tensors
+        # (and entire metadata dictionaries) until this segment's backward.
+        # Prune after the call so an input enabled for grad inside it is kept;
+        # retain ids for the existing boundary-order checks.
+        saved_pairs[:] = [
+            (tensor_id, tensor if torch.is_tensor(tensor) and (
+                tensor.requires_grad or tensor_id in Executor._input_grad_callbacks
+            ) else None)
+            for tensor_id, tensor in saved_pairs
+        ]
         return outputs
 
     @staticmethod
@@ -306,8 +322,11 @@ class Executor:
             for tid, dtensor in saved_pairs
             if torch.is_tensor(dtensor)
         }
+        pruned_ids = {tid for tid, tensor in saved_pairs if tensor is None}
 
         for t in requested_input_tensors:
+            if torch.is_tensor(t) and t.requires_grad and id(t) in pruned_ids:
+                raise RuntimeError('Segment input requires_grad was enabled after forward')
             if torch.is_tensor(t) and id(t) not in tensor_ids:
                 import traceback
                 _logger.warning(
@@ -412,7 +431,10 @@ class Executor:
         saved_pairs = Executor._detach[name].pop(0)
         tensor_ids: List[int] = [pair[0] for pair in saved_pairs]
         dtensors: List[torch.Tensor] = [pair[1] for pair in saved_pairs]
+        pruned_ids = {tid for tid, tensor in saved_pairs if tensor is None}
         for tensor in input_tensors:
+            if torch.is_tensor(tensor) and tensor.requires_grad and id(tensor) in pruned_ids:
+                raise RuntimeError('Segment input requires_grad was enabled after forward')
             if id(tensor) not in tensor_ids:
                 import traceback
                 _logger.warning(

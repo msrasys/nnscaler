@@ -645,3 +645,19 @@ In Non-PP mode, to support multiple calls of `optimizer.sync_shard_grad()`, `Par
 We also support async gradient reduction via `compute_config.use_async_reducer`. In this case, the gradient reduction will be kicked off once the gradients are ready, and `optimizer.sync_shard_grad()` will wait for the reduction to be done if it is called before the reduction is done.
 
 When we combine async reduction with gradient accumulation, The time of kicking off gradient reduction becomes a problem. The current implementation is reusing `RuntimeFlag.skip_reducer` flag to control when to kick off the reduction. It is not ideal because `RuntimeFlag.skip_reducer` is originally designed for gradient accumulation, and it is not compatible when overlapping is used. So in overlapped scenarios, we must not use async reduction. We will improve it in the future.
+
+### Forward-only pipeline inputs
+
+After a segment forward, the executor keeps strong input references only for
+input gradients and registered gradient callbacks. It retains identity records
+for boundary checks, but no longer pins non-gradient inputs or their metadata
+dictionaries until backward. This allows frozen reference hidden/KV tensors to
+be released after their final forward consumer.
+
+PyTorch autograd and activation checkpointing still own constants required for
+backward, including a non-gradient input needed to compute a weight gradient.
+This does not resize or invalidate tensor storage. Inputs enabled for gradients
+inside the forward are kept; enabling an input's gradient after the forward is
+rejected. Pruned identities cannot consume a later callback if Python reuses an
+object id. Ordinary and split input/weight backward retain their callback and
+gradient behavior.

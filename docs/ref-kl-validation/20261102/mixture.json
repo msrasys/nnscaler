@@ -1,0 +1,17 @@
+[
+  {
+    "name": "reference_debug_text",
+    "source": "/data/tmp/ref-kl-opt-20261103/data/text-files.json",
+    "weight": 0.9,
+    "tag": "web"
+  },
+  {
+    "name": "reference_debug_vl",
+    "source": "/data/tmp/ref-kl-opt-20261103/data/vl-files.json",
+    "weight": 0.1,
+    "tag": "vl_grounded_caption",
+    "modality": "vl",
+    "vl_format": "interleaved_v1",
+    "transform_func": "add_vl_grounding_prompt_template"
+  }
+]
