@@ -90,7 +90,15 @@ def main():
         start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
         start.record()
         wall_start = time.perf_counter_ns()
-        if mode == 'direct_copy':
+        if mode == 'compute_only':
+            # Same independent work and final payload as serial/overlap, with
+            # the activations kept on GPU. This measures the actual no-offload
+            # reference instead of estimating it by subtracting copy timings.
+            compute()
+            compute()
+            restored = values
+            del values
+        elif mode == 'direct_copy':
             d2h.wait_stream(torch.cuda.current_stream())
             with torch.cuda.stream(d2h):
                 for source, host in zip(values, direct_host):
@@ -147,7 +155,7 @@ def main():
         return result
 
     results = {}
-    for mode in ('direct_copy', 'store_roundtrip', 'serial_compute', 'overlap_compute'):
+    for mode in ('compute_only', 'direct_copy', 'store_roundtrip', 'serial_compute', 'overlap_compute'):
         for _ in range(args.warmup):
             iteration(mode)
         before = cache.snapshot()['pool']
@@ -156,13 +164,16 @@ def main():
         transferred = {key: after.get(key, 0) - before.get(key, 0)
                        for key in ('d2h_bytes', 'h2d_bytes', 'demand_loads', 'd2h_throttles',
                                    'budget_fallback_bytes', 'prefetch_budget_skips')}
-        if mode != 'direct_copy':
+        if mode in ('compute_only', 'direct_copy'):
+            assert not any(transferred.values())
+        else:
             assert transferred['d2h_bytes'] == transferred['h2d_bytes'] == payload_bytes * args.iterations
             assert transferred['budget_fallback_bytes'] == 0
         assert after['live_cpu_bytes'] == after['prefetched_gpu_bytes'] == after['pending_cpu_bytes'] == 0
         with cache.trace(max_events=4096) as trace:
             iteration(mode, observe=True)
         results[mode] = dict(samples=measured, counters=transferred, pool=after,
+                            bytes_each_direction_per_iteration=0 if mode == 'compute_only' else payload_bytes,
                             median_wall_ms=statistics.median(v['wall_ms'] for v in measured),
                             median_submit_ms=statistics.median(v['submit_ms'] for v in measured),
                             diagnostic_trace=trace.to_dict())
@@ -172,7 +183,9 @@ def main():
     record = dict(configuration={k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()},
                   torch_version=torch.__version__, gpu=torch.cuda.get_device_name(),
                   bytes_each_direction_per_iteration=payload_bytes, results=results,
-                  notes=['Serial/overlap use the same two compute blocks and transfer bytes.',
+                  notes=['Compute-only/serial/overlap use the same two independent compute blocks and final payload.',
+                         'Compute-only retains activations on GPU; serial/overlap use identical transfer bytes.',
+                         'Top-level transfer-byte count excludes compute-only; each mode also reports its own count.',
                          'Source creation, warmup, validation and diagnostic trace are excluded from samples.',
                          'GPU spans include dependencies/host submission gaps, not just DMA kernel time.',
                          'Direct copy uses a whole-batch dependency; it is not a hardware lower bound.',
