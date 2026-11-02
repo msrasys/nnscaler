@@ -9,14 +9,19 @@ PYTHONPATH=.:$PYTHONPATH torchrun \
 """
 
 from pathlib import Path
+from contextlib import ExitStack
+from copy import deepcopy
+from functools import partial
 import tempfile
 from typing import Dict, TypedDict
+from unittest.mock import patch
 import pytest
 import torch
 from torch import nn
 import torch.distributed
 
 import nnscaler
+from nnscaler.graph.segment import IRSegmentExpander
 from nnscaler.runtime.gnorm import calcuate_gnorm
 from nnscaler.runtime.utils import microbatches
 from nnscaler.runtime.module import ParallelModule
@@ -26,6 +31,7 @@ from ..launch_torchrun import clone_to_cpu_recursively, launch_torchrun
 from ..utils import replace_all_device_with, clear_dir_on_rank0, PYTEST_RUN_ID
 
 from .test_checkpoint import End2EndMLP
+from .test_gencode_pipeline import SharedOutputBoundaryModule, _shared_output_boundary_policy
 
 
 DATA_SIZE = 64
@@ -300,6 +306,124 @@ def test_end2end():
             model.eval()
             loss = model({key: v.cuda() for key, v in data.items()})
             assert torch.allclose(loss.cpu(), infer_result[i].cpu(), atol=1e-6, rtol=1e-6)
+
+
+def _shared_output_boundary_worker(gen_savedir, case):
+    init_distributed()
+    try:
+        init_random()
+        reference = SharedOutputBoundaryModule(case).train()
+        samples = [torch.randn(4, 4) for _ in range(3)]
+        with ExitStack() as stack:
+            output_narrowing = None
+            input_narrowing = None
+            if case in ('full_outputs', 'full_io'):
+                output_narrowing = stack.enter_context(patch.object(
+                    IRSegmentExpander, '_try_narrow_segment_ptensors', return_value=None,
+                ))
+            if case == 'full_io':
+                input_narrowing = stack.enter_context(patch.object(
+                    IRSegmentExpander, '_try_narrow_segment_ctensors', return_value=None,
+                ))
+            model = parallelize(
+                deepcopy(reference),
+                {'data': samples[0]},
+                pas_policy=partial(_shared_output_boundary_policy, case=case),
+                compute_config=ComputeConfig(
+                    4, 4,
+                    constant_folding=False,
+                    use_end2end=True,
+                    pas_config={'pipeline_nmicros': 3, 'pipeline_scheduler': '1f1b'},
+                ),
+                gen_savedir=gen_savedir,
+                reuse='override',
+            ).cuda()
+            if torch.distributed.get_rank() == 0:
+                if output_narrowing is not None:
+                    output_narrowing.assert_called()
+                if input_narrowing is not None:
+                    input_narrowing.assert_called()
+
+        optimizer = build_optimizer(model, torch.optim.SGD, lr=0.0)
+        expected_outputs = []
+        for sample in samples:
+            output = reference(sample)
+            loss = output[0] if isinstance(output, tuple) else output
+            loss.backward()
+            expected_outputs.append(output)
+        outputs = model.train_step(samples)
+        optimizer.step()
+        gradients = {name: parameter.grad for name, parameter in model.named_parameters()}
+        assert all(gradient is not None for gradient in gradients.values())
+        model._add_extra_state(gradients, '')
+        return clone_to_cpu_recursively({
+            'outputs': outputs,
+            'gradients': gradients,
+            'expected_outputs': expected_outputs,
+            'expected_gradients': {
+                name: parameter.grad for name, parameter in reference.named_parameters()
+            },
+        })
+    finally:
+        torch.distributed.destroy_process_group()
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 4, reason='requires 4 GPUs')
+@pytest.mark.parametrize('case', [
+    'compatible', 'final_output', 'incompatible_consumers', 'full_next_stage',
+    'replicated_producer', 'value_producer', 'full_outputs', 'full_io',
+])
+def test_shared_output_pipeline_outputs_and_gradients(tmp_path, case):
+    """Check numerical correctness of shared-output layouts and their fallbacks.
+
+    All cases run a two-stage, TP=2 pipeline on four GPUs with three
+    microbatches. Repeated uses of x0 and a squared loss exercise gradient
+    accumulation across branches and microbatches. Compare every rank's
+    returned outputs and all merged parameter gradients with eager execution;
+    only the loss, not the optional auxiliary output, drives backward.
+
+    compatible:
+        The producer uses dim 1, while local and downstream consumers agree
+        on dim 0. Check forward and backward through the shared all-to-all
+        conversion; "compatible" refers to the consumers, not the producer.
+    final_output:
+        Also return x0 as an auxiliary graph output. Check that every rank
+        receives the full eager value and that exporting it does not alter
+        the gradients contributed by the loss.
+    incompatible_consumers:
+        Add a replicated local ReLU alongside the dim-0 consumer. Check that
+        the full-value fallback preserves both branches' gradient contributions.
+    full_next_stage:
+        Replicate all downstream adds while the local consumer still uses
+        dim 0. Check reconstruction of complete inputs and backward transfer.
+    replicated_producer:
+        Replicate the producer but keep consumers partitioned along dim 0.
+        Check that redistributing a full activation neither duplicates nor
+        drops parameter-gradient contributions.
+    value_producer:
+        Partition matmul along its contraction dimension, producing partial
+        sums rather than index shards. Check their combination for the dim-0
+        consumers and the corresponding parameter gradients.
+    full_outputs:
+        Force output narrowing to return None, leaving input narrowing enabled.
+        Check that fn's partitioned identity remains correct when adapters must
+        reconstruct complete segment outputs.
+    full_io:
+        Force both input and output narrowing to return None. Check the same
+        partitioned operators with full segment boundaries in both directions.
+
+    Communication counts are deliberately checked by the codegen tests, not
+    by this numerical regression.
+    """
+    results = launch_torchrun(4, _shared_output_boundary_worker, tmp_path, case)
+    for result in results.values():
+        torch.testing.assert_close(
+            result['outputs'], result['expected_outputs'], rtol=1e-5, atol=1e-5,
+        )
+    gradients, _ = merge_state_dicts([result['gradients'] for result in results.values()])
+    torch.testing.assert_close(
+        gradients, results[0]['expected_gradients'], rtol=1e-5, atol=1e-5,
+    )
 
 
 class MLPShared(End2EndMLP):
