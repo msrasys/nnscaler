@@ -76,6 +76,14 @@ Megatron Core's `fine_grained_activation_offload.py`. This implementation keeps
 NNScaler's own storage/version and host-budget contracts; it does not resize
 user storages or assume all views can be discarded. No Megatron code was copied.
 
+The optional checkpoint-input submission adapter observes weak references to
+the saved-value tokens created by that invocation. Shared storage can still be
+owned by another region or explicit handle; those owners must not make a
+checkpoint that needs no replay keep submitting unused inputs. The observation
+changes only the next call's submission timing, never which values autograd
+retains. A dynamic branch that starts needing replay remains correct through
+ordinary region-exit submission.
+
 CPU checks cover configuration, ownership, exceptional exits and gradient-edge
 semantics. CUDA checks must additionally cover views, version violations, delayed
 streams, multiple producer/consumer streams, repeated eviction, shared budgets

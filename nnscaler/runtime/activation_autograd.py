@@ -26,11 +26,13 @@ class CheckpointSubmissionPolicy:
         with self._lock:
             return self._retains_inputs.get(code, True)
 
-    def observe(self, code, records):
+    def observe(self, code, saved_inputs):
         # No admitted CUDA inputs provides no evidence about replay. This can
         # happen on a resident pipeline tail or with a smaller input shape.
-        if code is not None and records:
-            retained = any((record := ref()) is not None and record.live_saves for ref in records)
+        if code is not None and saved_inputs:
+            # A different checkpoint or handle can still own the same storage.
+            # Only this invocation's saved-value tokens establish replay needs.
+            retained = any(ref() is not None for ref in saved_inputs)
             with self._lock:
                 self._retains_inputs[code] = retained
 
@@ -175,15 +177,34 @@ class SavedActivationContext:
                                  'without a custom context_fn')
             policy = self.store.checkpoint_submission
             code = getattr(function, '__code__', None)
-            first = len(self.group.records)
             if policy.early(code):
                 kwargs['context_fn'] = self._checkpoint_contexts
         # Preserve PyTorch's default context_fn (and debug support) unless
         # early submission was explicitly selected.
-        result = checkpoint(function, *args, **kwargs)
-        if policy is not None:
-            policy.observe(code, self.group.records[first:])
+        if policy is None:
+            return checkpoint(function, *args, **kwargs)
+        with self._checkpoint_input_tokens() as saved_inputs:
+            result = checkpoint(function, *args, **kwargs)
+        policy.observe(code, saved_inputs)
         return result
+
+    @contextmanager
+    def _checkpoint_input_tokens(self):
+        from .activation_store import _SavedTensor
+
+        saved_inputs = []
+
+        def pack(tensor):
+            value = self._pack(tensor)
+            if isinstance(value, _SavedTensor):
+                saved_inputs.append(weakref.ref(value))
+            return value
+
+        # The checkpoint's internal hooks still own replay intermediates. This
+        # outer adapter only observes eligible boundary saves, without retaining
+        # their tokens, storages or autograd graph. Exclusions remain unchanged.
+        with saved_tensors_hooks(pack, self._unpack):
+            yield saved_inputs
 
     def _checkpoint_contexts(self):
         return self._submit_checkpoint_inputs(), nullcontext()

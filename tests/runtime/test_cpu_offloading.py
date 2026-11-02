@@ -566,6 +566,44 @@ def test_early_checkpoint_learns_dead_saves_and_handles_changed_replay_needs():
 
 
 @cuda
+@pytest.mark.parametrize('disable_gc', [False, True])
+def test_dead_checkpoint_does_not_inherit_replay_from_another_storage_owner(disable_gc):
+    module = OffloadModule(forward_commit_unit='checkpoint')
+
+    def dead_checkpoint(shared, private):
+        return private + shared  # Addition needs neither input for backward.
+
+    was_enabled = gc.isenabled()
+    if disable_gc:
+        gc.disable()
+    try:
+        for iteration in range(3):
+            shared = torch.randn(64, 64, device='cuda', requires_grad=True)
+            private = torch.randn_like(shared, requires_grad=True)
+            size = shared.untyped_storage().nbytes()
+            before = module.activation_offload_stats().get('d2h_bytes', 0)
+            with module.activation_offload_scope(iteration):
+                with module.cpu_offloading_hooks() as saved:
+                    first = saved.checkpoint(torch.sin, shared)
+                saved.watch(first)
+                with module.cpu_offloading_hooks() as saved:
+                    second = saved.checkpoint(dead_checkpoint, shared.t(), private)
+                saved.watch(second)
+            # The first checkpoint still owns shared's record. That must not
+            # keep copying private after the dead checkpoint has been observed.
+            copied = module.activation_offload_stats()['d2h_bytes'] - before
+            assert copied == size * (2 if iteration == 0 else 1)
+            shared_grad, private_grad = torch.autograd.grad((first + second).sum(), (shared, private))
+            torch.testing.assert_close(shared_grad, shared.cos() + 1)
+            torch.testing.assert_close(private_grad, torch.ones_like(private))
+            module.finish_activation_offload(iteration)
+            assert module.activation_offload_stats()['live_cpu_bytes'] == 0
+    finally:
+        if was_enabled:
+            gc.enable()
+
+
+@cuda
 @pytest.mark.parametrize('count,budget,loaded', [(1, 65536, 1), (3, 65536, 3), (3, 16384, 1)])
 def test_scope_prefetch_depth_obeys_shared_byte_window(count, budget, loaded):
     module = OffloadModule(scope_prefetch_groups=count, max_prefetch_bytes=budget)

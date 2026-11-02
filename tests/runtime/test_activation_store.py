@@ -79,13 +79,33 @@ def test_checkpoint_submission_hints_do_not_retain_code_or_save_metadata():
     assert policy.early(code)
     policy.observe(code, [lambda: None])
     assert not policy.early(code)
-    policy.observe(code, [lambda: SimpleNamespace(live_saves=1)])
+    policy.observe(code, [lambda: object()])
     assert policy.early(code)
     del code
     gc.collect()
     assert code_ref() is None
     assert len(policy._retains_inputs) == 0
     assert policy.early(None)
+
+
+def test_checkpoint_submission_observes_saved_tokens_independently_of_shared_storage():
+    class SavedInput:
+        def __init__(self, record):
+            self.record = record
+
+    code = (lambda x: x).__code__
+    policy = CheckpointSubmissionPolicy()
+    record = SimpleNamespace(live_saves=2)
+    first, second = SavedInput(record), SavedInput(record)
+    first_ref, second_ref = weakref.ref(first), weakref.ref(second)
+    policy.observe(code, [first_ref])
+    assert policy.early(code)
+    del first
+    policy.observe(code, [first_ref])
+    assert not policy.early(code)
+    assert second_ref() is second  # Other owners must not affect this decision.
+    policy.observe(code, [second_ref])
+    assert policy.early(code)
 
 
 @pytest.mark.parametrize('layout', ['dense', 'slice', 'expand'])
