@@ -25,6 +25,7 @@ from torch.autograd.graph import saved_tensors_hooks
 from torch.torch_version import TorchVersion
 
 from nnscaler.graph.parser import FxModuleParser
+from nnscaler.graph.parser.frame import NP_BUFFER_INDEX_KEY
 
 from nnscaler.runtime.device import DeviceGroup
 from nnscaler.runtime.dtensor import DTensor
@@ -615,20 +616,40 @@ class CubeModule(torch.nn.Module):
         load_options = {'map_location': 'cpu'}
         if TorchVersion(torch.__version__) >= (2, 1):
             load_options['mmap'] = True
-        np_buffer_model: Dict[int, torch.Tensor] = torch.load(filename, **load_options)
+        np_buffer_model = torch.load(filename, **load_options)
+        indexed = NP_BUFFER_INDEX_KEY in np_buffer_model
+        if indexed:
+            if np_buffer_model[NP_BUFFER_INDEX_KEY] != 1 or not isinstance(np_buffer_model.get('files'), dict):
+                raise RuntimeError(f'Unsupported non-persistent buffer index in {filename}')
+            files = np_buffer_model['files']
+        groups = defaultdict(list)
+        for attr_name in self._non_persistent_buffers_set:
+            if attr_name not in self._fullmap:
+                raise RuntimeError(f'non-persistent buffer {attr_name} not found in fullmap.')
+            meta = self._fullmap[attr_name]
+            if indexed:
+                source = files.get(meta.tid)
+                if not isinstance(source, str) or not source or Path(source).name != source:
+                    raise RuntimeError(f'Invalid or missing attribute shard for buffer {attr_name} in {filename}')
+                groups[source].append(attr_name)
+            else:
+                groups[None].append(attr_name)
         with torch.no_grad():
             _logger.info(f'loading non-persistent buffers from {filename}')
-            for attr_name in self._non_persistent_buffers_set:
-                if attr_name not in self._fullmap:
-                    raise RuntimeError(f'non-persistent buffer {attr_name} not found in fullmap.')
-                meta = self._fullmap[attr_name]
-                if meta.tid not in np_buffer_model:
-                    raise RuntimeError(f'non-persistent buffer {attr_name} (tid={meta.tid}) not found in {filename}.')
-                attr = getattr(self, attr_name)
-                content = np_buffer_model[meta.tid][meta.slicers]
-                if meta.val_chunks != 1:
-                    content = content / meta.val_chunks
-                attr.copy_(content)
+            for source, names in groups.items():
+                contents = (torch.load(Path(filename).with_name(source), **load_options)
+                            if indexed else np_buffer_model)
+                for attr_name in names:
+                    meta = self._fullmap[attr_name]
+                    if meta.tid not in contents:
+                        raise RuntimeError(f'non-persistent buffer {attr_name} (tid={meta.tid}) not found in {filename}.')
+                    attr = getattr(self, attr_name)
+                    content = contents[meta.tid][meta.slicers]
+                    if meta.val_chunks != 1:
+                        content = content / meta.val_chunks
+                    attr.copy_(content)
+                # Bound resident CPU storage on older Torch without mmap too.
+                del contents, content
 
     def init_group(self, ranks: List[int]):
         """Legacy gencode entry; batch its singleton declarations on first use."""

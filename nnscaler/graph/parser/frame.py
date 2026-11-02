@@ -16,6 +16,7 @@ import torch
 
 
 _logger = logging.getLogger(__name__)
+NP_BUFFER_INDEX_KEY = '__nnscaler_npbuffer_index__'
 
 
 def _atomic_torch_save(content: Any, path: Path):
@@ -247,20 +248,43 @@ class Frame:
         _atomic_torch_save(tid_to_chunk, index_path)
         _logger.info('Saved attribute content and index to %s in %.2fs', save_file_stem, time.perf_counter() - started)
 
-    def save_np_buffer_content(self, save_file: str):
+    def save_np_buffer_content(self, save_file: str, *, attr_file_stem=None):
         """
         Save non-persistent buffer content into a separate file.
         Only tensors that are non-persistent buffers (is_buffer() and not is_persistent()) are saved.
 
         Args:
             save_file (str): file path to save non-persistent buffer content.
+            attr_file_stem: when supplied, reuse the already-published attribute
+                shards through an index. The generated package must retain
+                those shards and be loaded by an index-aware runtime.
         """
+        buffers = {
+            t.tid: val
+            for t, (_, val) in self._attr_map.items()
+            if t.is_buffer() and not t.is_persistent()
+        }
+        if attr_file_stem is not None:
+            # save_attr_content has already atomically published these exact
+            # tensors. Frozen reference models make writing a second copy here
+            # very expensive. Keep a versioned, relocatable index instead.
+            stem = Path(attr_file_stem)
+            index = torch.load(Path(f'{stem}.index'), map_location='cpu', weights_only=True)
+            missing = buffers.keys() - index.keys()
+            if missing:
+                raise RuntimeError(f'Non-persistent buffers missing from attribute shards: {sorted(missing)}')
+            files = {tid: f'{stem.name}.{index[tid]}' for tid in buffers}
+            _atomic_torch_save({NP_BUFFER_INDEX_KEY: 1, 'files': files}, Path(save_file))
+            _logger.info('Indexed %d non-persistent buffers in %d existing attribute shards; '
+                         'avoided a duplicate %.2f GiB write', len(files), len(set(files.values())),
+                         sum(v.numel() * v.element_size() for v in buffers.values()) / 1024**3)
+            return
         tid2value = {
             t.tid: val.cpu()
             for t, (_, val) in self._attr_map.items()
             if t.is_buffer() and not t.is_persistent()
         }
-        torch.save(tid2value, save_file)
+        _atomic_torch_save(tid2value, Path(save_file))
 
     def save_attr_map(self, save_file: str = 'dist_param_map.pt'):
         """

@@ -57,6 +57,57 @@ def test_non_persistent_replica_resume_pages_in_local_slice(tmp_path):
     torch.testing.assert_close(model.replica, full[2:])
 
 
+@pytest.mark.parametrize('indexed', [False, True])
+@pytest.mark.parametrize('dtype', [torch.float32, torch.complex64])
+def test_generated_buffer_bundle_is_relocatable_and_loads_only_local_shards(tmp_path, indexed, dtype):
+    from nnscaler.graph.parser.frame import Frame, NP_BUFFER_INDEX_KEY
+    from nnscaler.ir.tensor import IRFullTensor
+
+    original = tmp_path / 'original'
+    original.mkdir()
+    frame = Frame()
+    full = torch.arange(1024 * 256).reshape(1024, 256).to(dtype)
+    if dtype.is_complex:
+        full = full + 2j
+    tensors = []
+    for i in range(3):
+        tensor = IRFullTensor(full.shape, dtype=dtype).as_buffer(persistent=False)
+        tensors.append(tensor)
+        frame.add_attr(tensor, full + i, f'reference.weight{i}')
+    stem = original / 'fullmodel.pt'
+    frame.save_attr_content(stem, params_per_file=full.numel(), max_workers=2)
+    frame.save_np_buffer_content(original / 'npbuffer.pt', attr_file_stem=stem if indexed else None)
+    moved = tmp_path / 'moved'
+    original.rename(moved)
+    filename = moved / 'npbuffer.pt'
+    if indexed:
+        assert filename.stat().st_size < full.numel() * full.element_size() // 10
+        index = torch.load(filename, weights_only=True)
+        assert index[NP_BUFFER_INDEX_KEY] == 1
+
+    model = CubeModule()
+    model.register_buffer('reference', torch.empty(2, 4, dtype=dtype), persistent=False)
+    model.add_full_map('reference', tensors[1].tid, False, 'reference.weight1',
+                       tuple(full.shape), (slice(2, 4), slice(3, 7)), 1)
+    with patch('nnscaler.runtime.module.torch.load', wraps=torch.load) as reader:
+        model.load_np_buffer_content(str(filename))
+    torch.testing.assert_close(model.reference, (full + 1)[2:4, 3:7])
+    paths = [Path(call.args[0]).name for call in reader.call_args_list]
+    assert paths == (['npbuffer.pt', 'fullmodel.pt.1'] if indexed else ['npbuffer.pt'])
+    assert all(call.kwargs['map_location'] == 'cpu' for call in reader.call_args_list)
+    assert 'reference' not in model.state_dict()
+
+
+@pytest.mark.parametrize('version,files', [(2, {}), (1, {}), (1, {1: '../outside.pt'})])
+def test_buffer_index_rejects_unknown_version_or_missing_local_source(tmp_path, version, files):
+    from nnscaler.graph.parser.frame import NP_BUFFER_INDEX_KEY
+
+    filename = tmp_path / 'npbuffer.pt'
+    torch.save({NP_BUFFER_INDEX_KEY: version, 'files': files}, filename)
+    with pytest.raises(RuntimeError):
+        shard().load_np_buffer_content(str(filename))
+
+
 class PairedBlock(torch.nn.Module):
     def __init__(self):
         super().__init__()
@@ -136,6 +187,27 @@ def worker(scheduler):
                 torch.testing.assert_close(getattr(model, name), value, rtol=0, atol=0)
                 assert name not in model.state_dict()
             opt.zero_grad()
+        # A resumed module skips the initial parameter shards, so its frozen
+        # buffers must load through the new npbuffer index (legacy archives
+        # remain covered by the CPU tests). Preserve the original teacher.
+        resumed = type(model)(init_params=False).cuda()
+        resumed.load_state_dict(model.state_dict())
+        resumed_opt = nnscaler.build_optimizer(resumed, torch.optim.SGD, lr=0.01)
+        eager_opt.zero_grad()
+        expected = [eager(sample) for sample in samples]
+        torch.stack(expected).sum().backward()
+        torch.testing.assert_close(resumed.train_step(samples), expected)
+        for name, meta in resumed.fullmap.items():
+            if meta.is_param:
+                torch.testing.assert_close(getattr(resumed, name).grad,
+                                           eager_params[meta.orig_name].grad[meta.slicers])
+        resumed_opt.step()
+        eager_opt.step()
+        for name, meta in resumed.fullmap.items():
+            if meta.is_param:
+                torch.testing.assert_close(getattr(resumed, name), eager_params[meta.orig_name][meta.slicers])
+        for name, value in frozen.items():
+            torch.testing.assert_close(getattr(resumed, name), value, rtol=0, atol=0)
     return True
 
 

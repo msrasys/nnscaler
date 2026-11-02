@@ -155,7 +155,10 @@ class FxModuleParser:
             attr_savedir = Path(self.attr_savedir)
             self.frame.save_attr_content(attr_savedir / self.ATTR_CONTENT_FILE_STEM)
             self.frame.save_attr_map(attr_savedir / self.ATTR_MAP_FILE)
-            self.frame.save_np_buffer_content(attr_savedir / self.NON_PERSISTENT_BUFFER_FILE)
+            self.frame.save_np_buffer_content(
+                attr_savedir / self.NON_PERSISTENT_BUFFER_FILE,
+                attr_file_stem=attr_savedir / self.ATTR_CONTENT_FILE_STEM,
+            )
 
         self.frame.pop_var()
         return inputs, all_ir_nodes, outputs
