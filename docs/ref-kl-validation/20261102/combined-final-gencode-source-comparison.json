@@ -1,0 +1,14 @@
+{
+  "files": 12,
+  "different_or_missing": [
+    "_parallel_modules/__main__/VLLanguagePipelineWrapperModel/ref-kl-local/gencode0.py",
+    "_parallel_modules/__main__/VLLanguagePipelineWrapperModel/ref-kl-local/gencode1.py",
+    "_parallel_modules/__main__/VLLanguagePipelineWrapperModel/ref-kl-local/gencode2.py",
+    "_parallel_modules/__main__/VLLanguagePipelineWrapperModel/ref-kl-local/gencode3.py",
+    "_parallel_modules/__main__/VLLanguagePipelineWrapperModel/ref-kl-local/gencode4.py",
+    "_parallel_modules/__main__/VLLanguagePipelineWrapperModel/ref-kl-local/gencode5.py"
+  ],
+  "normalization": "Only audited LLM/NN checkout prefixes",
+  "different_ast": [],
+  "text_difference_reason": "Language code source comments refer to arch/linear.py line numbers shifted by the memory patch; executable ASTs compared separately."
+}

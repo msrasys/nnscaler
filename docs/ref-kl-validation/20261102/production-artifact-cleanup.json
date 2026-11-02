@@ -1,0 +1,6 @@
+{
+  "regular_files_removed": 111,
+  "symlinks_removed": 222,
+  "regular_bytes_removed": 600071891535,
+  "preserved": "all generated sources, graph metadata, small indexes and logs; retained directories are validation artifacts, not deployable complete packages"
+}

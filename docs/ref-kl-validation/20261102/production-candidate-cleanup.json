@@ -1,0 +1,6 @@
+{
+  "failed_run": "production-candidate",
+  "removed_weight_files": 19,
+  "removed_bytes": 102479756995,
+  "preserved": "logs, phase timings, pstats and small metadata; this was an incomplete package"
+}

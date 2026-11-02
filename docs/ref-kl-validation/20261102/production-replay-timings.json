@@ -1,0 +1,26 @@
+[
+  {
+    "name": "production-replay-baseline",
+    "language_s": 758.529619038105,
+    "vision_s": 48.1974739022553,
+    "language_graph_processing_s": 582.3443099036813,
+    "language_workers_s": 176.18530913442373,
+    "total_gencode_s": 806.7270929403603,
+    "exist_calls": 1044046,
+    "exist_outer_s": 346.13466526567936,
+    "exit_code": 0,
+    "guard_failure": null
+  },
+  {
+    "name": "production-replay-candidate",
+    "language_s": 377.39858619496226,
+    "vision_s": 46.617294412106276,
+    "language_graph_processing_s": 213.54237658157945,
+    "language_workers_s": 163.85620961338282,
+    "total_gencode_s": 424.01588060706854,
+    "exist_calls": 1770824,
+    "exist_outer_s": 0.9269700031727552,
+    "exit_code": 0,
+    "guard_failure": null
+  }
+]

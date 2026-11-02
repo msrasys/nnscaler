@@ -1,0 +1,132 @@
+{
+  "source": "/root/.codex/attachments/8423c89c-0409-4c13-839f-3f92b8d3ec48/已粘贴的文本.txt",
+  "source_config": "64K MBS2 PP3/CP16/EP16,1584 ranks,2026-10-30",
+  "requested_config": "256K MBS1 PP3/CP32/EP32,1536 ranks,current main",
+  "observed_intervals_s": {
+    "inside_language_trace_to_ir_parse": 561,
+    "language_attribute_save": 165.17,
+    "after_attribute_save_to_graph_warning": 497,
+    "after_partition_log_to_schedule_log": 111,
+    "language_codegen_including_workers": 127.93,
+    "vision_codegen": 44.46
+  },
+  "interpretation": "The 497s interval includes unlogged standalone npbuffer torch.save; attribution must use local profiling, not assume all time is IRSegment.exist.",
+  "milestones": [
+    {
+      "line": 713,
+      "message": "2026-10-30 13:14:21 | INFO | nnscaler.graph.parser.converter | constant folding enabled to parse graph"
+    },
+    {
+      "line": 822,
+      "message": "2026-10-30 13:14:24 | INFO | nnscaler.graph.parser.frame | Saving 110 attribute chunks to /mnt/pvc/lidong1/exp/agens/150A9B-2S1-R-cp16/gencode-20261030-2058/_parallel_modules/__main__/VLLanguagePipelineWrapperModel/agens/fullmodel.pt with 8 writer(s)"
+    },
+    {
+      "line": 933,
+      "message": "2026-10-30 13:17:10 | INFO | nnscaler.graph.parser.frame | Saved attribute content and index to /mnt/pvc/lidong1/exp/agens/150A9B-2S1-R-cp16/gencode-20261030-2058/_parallel_modules/__main__/VLLanguagePipelineWrapperModel/agens/fullmodel.pt in 165.17s"
+    },
+    {
+      "line": 934,
+      "message": "2026-10-30 13:25:27 | WARNING | nnscaler.graph.graph | Following returns of nodes are not used by any other nodes."
+    },
+    {
+      "line": 1165,
+      "message": "2026-10-30 13:26:07 | INFO | nnscaler_train | [fixed_policy] VPP mode: nchunks=4 pp_size=3 tp_size=16 nstages=12 blocks=36"
+    },
+    {
+      "line": 2049,
+      "message": "2026-10-30 13:28:14 | INFO | nnscaler.graph.gener.gen | finish reordering producer and consumer"
+    },
+    {
+      "line": 2054,
+      "message": "2026-10-30 13:28:17 | INFO | nnscaler.graph.gener.gen | finish reordering producer and consumer"
+    },
+    {
+      "line": 2061,
+      "message": "2026-10-30 13:28:17 | INFO | nnscaler.graph.gener.gen | finish reordering producer and consumer"
+    },
+    {
+      "line": 2068,
+      "message": "2026-10-30 13:28:20 | INFO | nnscaler.graph.gener.gen | finish reordering producer and consumer"
+    },
+    {
+      "line": 2075,
+      "message": "2026-10-30 13:28:21 | INFO | nnscaler.graph.gener.gen | finish reordering producer and consumer"
+    },
+    {
+      "line": 2082,
+      "message": "2026-10-30 13:28:21 | INFO | nnscaler.graph.gener.gen | finish reordering producer and consumer"
+    },
+    {
+      "line": 2089,
+      "message": "2026-10-30 13:28:22 | INFO | nnscaler.graph.gener.gen | finish reordering producer and consumer"
+    },
+    {
+      "line": 2096,
+      "message": "2026-10-30 13:28:23 | INFO | nnscaler.graph.gener.gen | finish reordering producer and consumer"
+    },
+    {
+      "line": 2103,
+      "message": "2026-10-30 13:28:23 | INFO | nnscaler.graph.gener.gen | finish reordering producer and consumer"
+    },
+    {
+      "line": 2110,
+      "message": "2026-10-30 13:28:24 | INFO | nnscaler.graph.gener.gen | finish reordering producer and consumer"
+    },
+    {
+      "line": 2117,
+      "message": "2026-10-30 13:28:25 | INFO | nnscaler.graph.gener.gen | finish reordering producer and consumer"
+    },
+    {
+      "line": 2124,
+      "message": "2026-10-30 13:28:26 | INFO | nnscaler.graph.gener.gen | finish reordering producer and consumer"
+    },
+    {
+      "line": 2133,
+      "message": "2026-10-30 13:28:27 | INFO | nnscaler.graph.gener.gen | finish reordering producer and consumer"
+    },
+    {
+      "line": 2139,
+      "message": "2026-10-30 13:28:28 | INFO | nnscaler.graph.gener.gen | finish reordering producer and consumer"
+    },
+    {
+      "line": 2303,
+      "message": "2026-10-30 13:29:13 | INFO | nnscaler.parallel | Starting multi-process codegen for 1584 ranks with 32 workers: [0, 50), [50, 100), [100, 150), [150, 200), [200, 250), [250, 300), [300, 350), [350, 400), [400, 450), [450, 500), [500, 550), [550, 600), [600, 650), [650, 700), [700, 750), [750, 800), [800, 849), [849, 898), [898, 947), [947, 996), [996, 1045), [1045, 1094), [1094, 1143), [1143, 1192), [1192, 1241), [1241, 1290), [1290, 1339), [1339, 1388), [1388, 1437), [1437, 1486), [1486, 1535), [1535, 1584)"
+    },
+    {
+      "line": 2304,
+      "message": "2026-10-30 13:29:33 | INFO | nnscaler.parallel | Serialized codegen payload with pickle: 201.92 MiB in 19.83 seconds"
+    },
+    {
+      "line": 2338,
+      "message": "2026-10-30 13:31:21 | INFO | nnscaler.parallel | Multi-process codegen completed 1584 ranks with 32 workers in 127.93 seconds"
+    },
+    {
+      "line": 2460,
+      "message": "2026-10-30 13:31:50 | INFO | nnscaler.graph.parser.frame | Saved attribute content and index to /mnt/pvc/lidong1/exp/agens/150A9B-2S1-R-cp16/gencode-20261030-2058/_parallel_modules/__main__/VisionBackbone/agens/fullmodel.pt in 1.89s"
+    },
+    {
+      "line": 2461,
+      "message": "2026-10-30 13:31:50 | WARNING | nnscaler.graph.graph | Following returns of nodes are not used by any other nodes."
+    },
+    {
+      "line": 3202,
+      "message": "2026-10-30 13:31:53 | INFO | nnscaler.graph.gener.gen | finish reordering producer and consumer"
+    },
+    {
+      "line": 3217,
+      "message": "2026-10-30 13:31:53 | INFO | nnscaler.graph.gener.gen | finish reordering producer and consumer"
+    },
+    {
+      "line": 3231,
+      "message": "2026-10-30 13:31:54 | INFO | nnscaler.parallel | Starting multi-process codegen for 1584 ranks with 32 workers: [0, 50), [50, 100), [100, 150), [150, 200), [200, 250), [250, 300), [300, 350), [350, 400), [400, 450), [450, 500), [500, 550), [550, 600), [600, 650), [650, 700), [700, 750), [750, 800), [800, 849), [849, 898), [898, 947), [947, 996), [996, 1045), [1045, 1094), [1094, 1143), [1143, 1192), [1192, 1241), [1241, 1290), [1290, 1339), [1339, 1388), [1388, 1437), [1437, 1486), [1486, 1535), [1535, 1584)"
+    },
+    {
+      "line": 3232,
+      "message": "2026-10-30 13:31:55 | INFO | nnscaler.parallel | Serialized codegen payload with pickle: 8.82 MiB in 0.28 seconds"
+    },
+    {
+      "line": 3266,
+      "message": "2026-10-30 13:32:39 | INFO | nnscaler.parallel | Multi-process codegen completed 1584 ranks with 32 workers in 44.46 seconds"
+    }
+  ]
+}

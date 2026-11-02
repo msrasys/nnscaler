@@ -411,7 +411,13 @@ def __init__(self, init_params=True, build_buckets=True):
 - `init_params` (`bool`): whether to initialize the module parameters with the values they had at trace time. Set to `False` if you plan to load from a checkpoint instead.
 - `build_buckets` (`bool`): whether to build communication buckets immediately. Set to `False` when you need to call `build_buckets()` manually later (e.g., for hybrid optimizers with `param_clss_fn`).
 
-As noted before, in most cases you still need to set `init_params=True` to make sure non-persistent buffers are initialized if you want to initialize weights by loading a checkpoint.
+With `init_params=False`, generated modules load non-persistent buffers from
+`npbuffer.pt` before checkpoint parameter restoration. New packages store a
+versioned index there, referencing the existing `fullmodel.pt.*` shards rather
+than duplicating frozen buffers. Keep those referenced shards together with
+the index when moving or pruning a package. Only the local buffer slices are
+copied, using CPU mmap on supported PyTorch versions. Legacy standalone
+buffer archives remain supported; indexed packages need the updated runtime.
 
 
 2.`train_step`
@@ -645,3 +651,35 @@ In Non-PP mode, to support multiple calls of `optimizer.sync_shard_grad()`, `Par
 We also support async gradient reduction via `compute_config.use_async_reducer`. In this case, the gradient reduction will be kicked off once the gradients are ready, and `optimizer.sync_shard_grad()` will wait for the reduction to be done if it is called before the reduction is done.
 
 When we combine async reduction with gradient accumulation, The time of kicking off gradient reduction becomes a problem. The current implementation is reusing `RuntimeFlag.skip_reducer` flag to control when to kick off the reduction. It is not ideal because `RuntimeFlag.skip_reducer` is originally designed for gradient accumulation, and it is not compatible when overlapping is used. So in overlapped scenarios, we must not use async reduction. We will improve it in the future.
+
+
+### Large reference graphs: tracing and membership
+
+The CPU-offload tracer reuses an operator's original CPU input after CUDA
+execution when both tensors' version counters and relevant metadata are
+unchanged. In-place mutations, inference tensors without version counters,
+changed gradient flags, types, leafness, strides or storage offsets keep the
+copy-back path. This avoids transferring large unchanged inputs back to the
+host and retaining another copy in the shape-reuse cache. The memo is local
+to one call; it does not reuse tensor values across unrelated operations.
+
+A direct `tensor.method()` call leaves an unused `getattr` node in the FX
+graph until dead-code elimination. Its bound-method metadata used to retain
+the tensor even after its final forward consumer. The tracer now drops that
+metadata for direct calls with no getattr users, restoring it if the method
+itself is subsequently used as a value. Node order and captured contexts are
+preserved. These changes affect tracing only, not the generated kernels.
+
+`IRSegment.exist()` uses indexed direct-child membership and recurses only
+through child segments. The index tracks mutation and duplicate entries,
+and is rebuilt lazily for restored graphs rather than serialized into every
+codegen worker's payload. Descendant edits cannot stale a parent's index.
+
+See [reference KL validation](../ref-kl-validation/20261102/README.md) for
+workload, correctness checks, phase timings and limits of the measurements.
+
+Execution-plan construction also snapshots the already-fixed placement of each
+underlying cell and avoids eager `dispatch()` evaluation on cache hits. This
+keeps forward/backward mirrors and per-device IO unchanged while avoiding
+repeated segment scans for every microbatch and rank. The placement memo is
+local to construction; it does not cache mutable graph placement globally.

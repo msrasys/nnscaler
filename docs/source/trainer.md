@@ -687,9 +687,14 @@ Existing `last` and `best` resume behavior is unchanged.
 Resume startup reuses the normal checkpoint formats and topology validation:
 
 - Generated modules allocate empty parameters directly on the current CUDA
-  device, then load checkpoint values. Their initial `fullmodel.pt.*` files can
-  be omitted for resume; generated code, mappings and non-persistent buffers
-  must still be present. Fresh training still requires initial weights.
+  device, then load checkpoint values. Generated code, mappings and
+  non-persistent buffers must still be present. New `npbuffer.pt` files are
+  versioned indexes into the already-written `fullmodel.pt.*` shards, avoiding
+  a second copy of large frozen reference weights. Keep the referenced shards
+  when resuming or staging a generated package. Unreferenced initial-weight
+  shards can be omitted for resume; fresh training needs all initial weights.
+  Older standalone tensor-valued `npbuffer.pt` archives remain readable.
+  Indexed packages require an index-aware runtime on the training nodes.
 - Merged recovery avoids repeating standard module loads within one restore.
   Custom loading callbacks retain the original passes because they can change
   destination weights. Loading a later checkpoint always loads again.
