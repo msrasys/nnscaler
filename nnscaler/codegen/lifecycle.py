@@ -135,7 +135,7 @@ class LifeCycle:
         Returns:
             releasable (bool): whether the tensor is releasable after executing
         """
-        if obj not in self.lifetime:
+        if not isinstance(obj, IRObject) or obj not in self.lifetime:
             return False
 
         assert node in self.nodes
@@ -154,7 +154,7 @@ class LifeCycle:
         Returns:
             releasable (bool): whether the tensor is releasable after specific line.
         """
-        if obj not in self.lifetime:
+        if not isinstance(obj, IRObject) or obj not in self.lifetime:
             return False
 
         assert obj in self.lifetime

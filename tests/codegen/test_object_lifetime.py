@@ -63,3 +63,5 @@ def test_returned_container_and_model_attributes_are_preserved():
     assert attribute not in lifetime.lifetime
     assert metadata not in lifetime.release_tensors_after_node(node)
     assert not lifetime.releasable_after_node(attribute, node)
+    assert not lifetime.releasable_after_node({'metadata': metadata}, node)
+    assert not lifetime.releasable_after_line([metadata], 0)
