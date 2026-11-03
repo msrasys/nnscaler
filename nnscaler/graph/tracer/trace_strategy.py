@@ -176,6 +176,9 @@ class BaseTraceStrategy:
         """
         return self._run_target(kind, target, args, kwargs)
 
+    def run_cpu_fake(self, target, args, kwargs, *, cacheable=False):
+        return self._run_call_function_on(target, args, kwargs, device='cpu')
+
     def clear_cache(self) -> None:
         """Release execution-only state after each trace, including failures."""
         pass
@@ -307,6 +310,7 @@ class ReuseCacheStrategy(CudaRunCpuOffloadStrategy):
         super().__init__(tracer)
         self.cache: Dict[str, Any] = {}
         self.cache_size = 0
+        self.fake_cache = {}
 
         # some ops don't use gpu, so directly run them on cpu and don't cache them
         # TODO: add functions to optimize the cache memory cost.
@@ -314,7 +318,44 @@ class ReuseCacheStrategy(CudaRunCpuOffloadStrategy):
 
     def clear_cache(self) -> None:
         self.cache.clear()
+        self.fake_cache.clear()
         self.cache_size = 0
+
+    @staticmethod
+    def _fake_output_state(result):
+        # A fake result can be consumed by an in-place operation later in the
+        # trace. Never serve a mutated value/metadata from the cache. Inference
+        # tensors have no version counters, so keep their uncached behavior.
+        if isinstance(result, tuple):
+            children = tuple(ReuseCacheStrategy._fake_output_state(v) for v in result)
+            return children if all(v is not None for v in children) else None
+        if (not isinstance(result, torch.Tensor) or torch.is_inference(result)
+                or result.layout != torch.strided):
+            return None
+        return (result._version, result.requires_grad, result.dtype,
+                tuple(result.shape), tuple(result.stride()), result.storage_offset())
+
+    def run_cpu_fake(self, target, args, kwargs, *, cacheable=False):
+        if not cacheable:
+            return super().run_cpu_fake(target, args, kwargs)
+        args, kwargs = self._place_tensors_to(args, kwargs, device='cpu')
+        key = self.hash_input('cpu_fake', target, args, kwargs)
+        entry = self.fake_cache.get(key)
+        if entry is not None:
+            result, state = entry
+            if self._fake_output_state(result) == state:
+                return result, args, kwargs
+            del self.fake_cache[key]
+        result = target(*args, **kwargs)
+        state = self._fake_output_state(result)
+        inputs = {t.untyped_storage().data_ptr() for t in pytree_utils.tree_leaves((args, kwargs))
+                  if isinstance(t, torch.Tensor)}
+        outputs = [t for t in pytree_utils.tree_leaves(result) if isinstance(t, torch.Tensor)]
+        if state is not None and not any(t.untyped_storage().data_ptr() in inputs for t in outputs):
+            # Saving the old arguments here would replace the next layer's
+            # parameters with an earlier layer's values during proxy updates.
+            self.fake_cache[key] = (result, state)
+        return result, args, kwargs
 
     def force_cpu_run(self, kind, target):
         if kind == 'call_function':

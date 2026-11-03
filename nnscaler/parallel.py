@@ -976,11 +976,16 @@ def _gencode(
                 autoset_requires_grad=autoset_requires_grad,
             )
 
-        graph.dump(graph_ckp)
-        torch.save(forward_args, forward_args_ckp)
-
+        # Attribute serialization is complete and the IR carries metadata,
+        # not live weights. The context-manager alias otherwise retains the
+        # entire temporary model throughout partitioning and rank codegen,
+        # even after deleting `module` below.
+        del wrapped_module
         if is_module_class:
             del module
+
+        graph.dump(graph_ckp)
+        torch.save(forward_args, forward_args_ckp)
     else:
         ret = RegenStatus.CODE
         logger.info(f"Reuse graph dump in {outdir}")
