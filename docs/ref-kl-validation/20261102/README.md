@@ -42,7 +42,7 @@ lower allocation, **not a throughput speedup**. Forward-only reference
 quantization trades repeated quantization for shorter layout lifetimes.
 One paired measurement cannot establish small timing differences as a
 stable regression/improvement. Reserved/NVML memory differs from allocated;
-per-rank values and sampled resource bounds are recorded in the JSONs.
+per-rank values and sampled resource bounds are retained in the local validation archive.
 
 ## Lifecycle
 
@@ -60,13 +60,12 @@ hidden state, so it cannot be discarded before that use.
 `VL_PP_PRESET=ref_kl` in `scripts/vl_pp_debug.sh` exposes the production-aligned
 local defaults. Source `scripts/k8s_env.sh` before running it and supply a
 readable `DATA_PATH` plus the Vision checkpoint. This preset intentionally
-keeps the existing default debug preset unchanged. The exact workload and per-rank comparison results are recorded in
-`summary.json`. Full raw hashes, logs, and the original task-specific harness
-are retained in the pre-review branch history (llm-train `4e37bb7`,
-NNScaler `80ca017`) and locally under
-`/data/tmp/ref-kl-opt-20261103/reports/pr-evidence-archive/`.
-The PR retains a compact report rather than installing environment-specific
-benchmark orchestration as product code.
+keeps the existing default debug preset unchanged. Full raw hashes, per-rank
+measurements, logs and the original task-specific harness are retained locally
+under `/data/tmp/ref-kl-opt-20261103/reports/`, including
+`pr-json-archive/20261103/` and `pr-evidence-archive/`.
+This PR keeps the Markdown workload, result tables and validation explanation.
+Commit authorship was corrected after validation; runtime and test files are unchanged.
 
 The local test matches 8K tokens per CP rank, VPP4, 12 microbatches and major
 kernel settings of the 150B/256K/CP32/EP32/DP16 YAML. It does not reproduce
