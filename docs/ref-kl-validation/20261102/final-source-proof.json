@@ -1,6 +1,0 @@
-{
-  "base": "349449e342e4cd6b5b53bd1a8cebecc8241b4737",
-  "module_patch_sha256": "046183fc6abc8a524ff65cd8bb1c42c0d9d974dfeb555a7280b53f70d428b2fa",
-  "final_training_run": "fast-plan-final-20-content",
-  "production_replay": "production-replay-candidate"
-}

@@ -1,0 +1,166 @@
+{
+  "before": {
+    "run": "cold-baseline-v1",
+    "full_process_s": 2485.9983049333096,
+    "source": {
+      "yaml_sha256": "7bfe9833a2509fb924ce79fe17115fa88ed1b0de9837cb675799aacf5b0ab53e",
+      "llm_commit": "7234c269adcda0b1cd5424570bbd291d5b9bb4f0",
+      "nn_commit": "349449e342e4cd6b5b53bd1a8cebecc8241b4737",
+      "cprofile": false
+    },
+    "modules": [
+      {
+        "module": "language",
+        "total_s": 2341.740373229608,
+        "model_initialization_s": 93.84846860356629,
+        "tracing_s": 759.902933973819,
+        "primary_attribute_save_s": 174.94793402403593,
+        "nonpersistent_buffer_save_s": 504.5782036408782,
+        "graph_processing_s": 621.779733415693,
+        "rank_codegen_s": 181.05417689681053,
+        "other_trace_conversion_s": 5.627598075196147
+      },
+      {
+        "module": "vision",
+        "total_s": 78.81608146242797,
+        "model_initialization_s": 3.038452636450529,
+        "tracing_s": 22.425042813643813,
+        "primary_attribute_save_s": 1.7404568288475275,
+        "nonpersistent_buffer_save_s": 0.009015398100018501,
+        "graph_processing_s": 10.04340230114758,
+        "rank_codegen_s": 41.20614546909928,
+        "other_trace_conversion_s": 0.3530341237783432
+      }
+    ],
+    "resources": {
+      "peak_owned_rss_gib": 2016.9378700256348,
+      "peak_cgroup_anon_gib": 2019.1914825439453,
+      "minimum_raw_cgroup_headroom_gib": 0.011692047119140625,
+      "minimum_working_set_headroom_gib": 349.5689010620117,
+      "minimum_host_available_gib": 910.444637298584,
+      "peak_gpu_gib": 24.6533203125,
+      "minimum_disk_free_gib": 806.778148651123
+    },
+    "outside_modules_s": 65.44185024127364
+  },
+  "after": {
+    "run": "cold-candidate-v2",
+    "full_process_s": 1119.131338443607,
+    "source": {
+      "yaml_sha256": "7bfe9833a2509fb924ce79fe17115fa88ed1b0de9837cb675799aacf5b0ab53e",
+      "llm_commit": "a435a8f03be36286bb919a05760cb629a5341b0d",
+      "nn_commit": "20431f3a84841ea4a12d1161b064a027bce5deaa",
+      "cprofile": false
+    },
+    "modules": [
+      {
+        "module": "language",
+        "total_s": 1000.7683725431561,
+        "model_initialization_s": 91.02988076396286,
+        "tracing_s": 334.6247847210616,
+        "primary_attribute_save_s": 155.3736507371068,
+        "nonpersistent_buffer_save_s": 0.028615208342671394,
+        "graph_processing_s": 239.64621258340776,
+        "rank_codegen_s": 174.39456662349403,
+        "other_trace_conversion_s": 5.669148387387395
+      },
+      {
+        "module": "vision",
+        "total_s": 73.75938306748867,
+        "model_initialization_s": 2.9906057585030794,
+        "tracing_s": 19.44333192333579,
+        "primary_attribute_save_s": 1.883989792317152,
+        "nonpersistent_buffer_save_s": 0.03064371645450592,
+        "graph_processing_s": 7.138423329219222,
+        "rank_codegen_s": 41.93946127593517,
+        "other_trace_conversion_s": 0.33237554505467415
+      }
+    ],
+    "resources": {
+      "peak_owned_rss_gib": 853.6722793579102,
+      "peak_cgroup_anon_gib": 856.1476440429688,
+      "minimum_raw_cgroup_headroom_gib": 270.8811340332031,
+      "minimum_working_set_headroom_gib": 1052.2162742614746,
+      "minimum_host_available_gib": 2079.8148460388184,
+      "peak_gpu_gib": 24.6533203125,
+      "minimum_disk_free_gib": 806.5600242614746
+    },
+    "outside_modules_s": 44.603582832962275
+  },
+  "package_comparison": {
+    "source_files": 3072,
+    "different_sources": [],
+    "modules": [
+      {
+        "module": "_parallel_modules/__main__/VLLanguagePipelineWrapperModel/agens",
+        "ranks": 1536,
+        "metadata_different_ranks": [],
+        "attribute_count": 701,
+        "all_attributes_equal": true,
+        "non_persistent_buffer_count": 348,
+        "all_non_persistent_buffers_equal": true
+      },
+      {
+        "module": "_parallel_modules/__main__/VisionBackbone/agens",
+        "ranks": 1536,
+        "metadata_different_ranks": [],
+        "attribute_count": 169,
+        "all_attributes_equal": true,
+        "non_persistent_buffer_count": 1,
+        "all_non_persistent_buffers_equal": true
+      }
+    ],
+    "elapsed_s": 137.96449163928628,
+    "normalization": "NNScaler/llm-train checkout path prefixes only; PYTHONHASHSEED=0 in both cold compiles; no import/source/IR-ID normalization"
+  },
+  "training": {
+    "llm-fast-only-20": {
+      "peak_allocated_gib": 68.50199699401855,
+      "all_ranks_metrics_exact": true,
+      "full_model_optimizer_hash_updates": [
+        0,
+        1,
+        20
+      ],
+      "reference_frozen": true,
+      "batches_per_rank": 240,
+      "images": 413
+    },
+    "nn-fast-only-20": {
+      "peak_allocated_gib": 68.50199699401855,
+      "all_ranks_metrics_exact": true,
+      "full_model_optimizer_hash_updates": [
+        0,
+        1,
+        20
+      ],
+      "reference_frozen": true,
+      "batches_per_rank": 240,
+      "images": 413
+    },
+    "fast-moe-cache-20": {
+      "peak_allocated_gib": 68.50199699401855,
+      "all_ranks_metrics_exact": true,
+      "full_model_optimizer_hash_updates": [
+        0,
+        1,
+        20
+      ],
+      "reference_frozen": true,
+      "batches_per_rank": 240,
+      "images": 413
+    },
+    "all-final-20": {
+      "peak_allocated_gib": 65.23832035064697,
+      "all_ranks_metrics_exact": true,
+      "full_model_optimizer_hash_updates": [
+        0,
+        1,
+        20
+      ],
+      "reference_frozen": true,
+      "batches_per_rank": 240,
+      "images": 413
+    }
+  }
+}

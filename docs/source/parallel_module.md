@@ -675,7 +675,7 @@ through child segments. The index tracks mutation and duplicate entries,
 and is rebuilt lazily for restored graphs rather than serialized into every
 codegen worker's payload. Descendant edits cannot stale a parent's index.
 
-See [reference KL validation](../ref-kl-validation/20261102/README.md) for
+See [reference KL validation](../ref-kl-codegen-validation/20261103/README.md) for
 workload, correctness checks, phase timings and limits of the measurements.
 
 Execution-plan construction also snapshots the already-fixed placement of each
@@ -683,3 +683,21 @@ underlying cell and avoids eager `dispatch()` evaluation on cache hits. This
 keeps forward/backward mirrors and per-device IO unchanged while avoiding
 repeated segment scans for every microbatch and rank. The placement memo is
 local to construction; it does not cache mutable graph placement globally.
+
+
+Pure CPU substitutes can additionally opt into trace-local output reuse with
+`register_op(..., fake_fn_on_cpu=True, fake_fn_cacheable=True)` under the
+`reuse_cache` strategy. A cacheable substitute depends only on tensor metadata
+and ordinary arguments, and returns fresh tensor outputs without side effects.
+The cache retains outputs while each invocation keeps its current input values;
+this avoids replacing one layer's weights with a previous layer's arguments.
+Output version/metadata changes invalidate entries. Inference results and input
+aliases are not retained, and the cache is cleared at the end of tracing.
+This inherits the existing reuse-cache approximations; mutation-sensitive or
+data-dependent tracing consumers should keep the default uncached behavior.
+
+After a factory-created model has been traced and its attributes serialized,
+its local context-manager alias is released before graph processing. This
+allows the temporary CPU weights to be reclaimed while partitioning and rank
+code generation run. A module instance still owned by the caller retains that
+caller's ownership.

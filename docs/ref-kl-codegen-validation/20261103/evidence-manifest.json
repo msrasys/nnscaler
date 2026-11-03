@@ -1,0 +1,22 @@
+{
+  "cold-v2-package-comparison.json": {
+    "sha256": "fe65e10edd3e2c1fc3aad3082a236347c950b6ee30e2742a55c4819fdb5480c9",
+    "bytes": 717510
+  },
+  "llm-fast-only-20.json": {
+    "sha256": "d1349d3d41baec7459e2451b7e3dd207085db00d5df47ea52252caa9d6f1a31e",
+    "bytes": 7094
+  },
+  "nn-fast-only-20.json": {
+    "sha256": "f88dedc3aa426633585941e0fb24c62c8ae822f2c4486f71c842632dd2d749c2",
+    "bytes": 7092
+  },
+  "fast-moe-cache-20.json": {
+    "sha256": "ad92391b2f93181457579908795016f7093705f9a993732b69dda7e8c023df7e",
+    "bytes": 7101
+  },
+  "all-final-20.json": {
+    "sha256": "3c236136172793140d1abb255e4910e99e522b642898ac144857eb23341307df",
+    "bytes": 7076
+  }
+}

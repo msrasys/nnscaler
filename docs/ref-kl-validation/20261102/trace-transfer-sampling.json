@@ -1,9 +1,0 @@
-{
-  "source": "compile/production-candidate/live-stacks.txt",
-  "sample_duration_s": 30,
-  "samples": 589,
-  "transfer_leaf_samples": 512,
-  "transfer_fraction": 0.8692699490662139,
-  "conclusion": "This interval is dominated by tensor device placement; not a whole-compile attribution.",
-  "original_candidate_during_microtests": "GPU0 compiler continued while short transfer/cache unit tests used idle GPUs6,7; these tests are correctness checks, not throughput comparisons."
-}

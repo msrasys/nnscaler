@@ -1,0 +1,188 @@
+[
+  {
+    "event": "entry",
+    "wall": 1793683142.1210537,
+    "monotonic": 9446091.246844668
+  },
+  {
+    "event": "_gencode:start",
+    "wall": 1793683156.1193273,
+    "monotonic": 9446105.245117625
+  },
+  {
+    "event": "_gen_graph:start",
+    "wall": 1793683247.149208,
+    "monotonic": 9446196.27499839
+  },
+  {
+    "event": "to_fx_graph:start",
+    "wall": 1793683248.730079,
+    "monotonic": 9446197.85586947
+  },
+  {
+    "event": "to_fx_graph:end",
+    "wall": 1793683583.354865,
+    "monotonic": 9446532.480655432,
+    "elapsed_s": 334.6247847210616,
+    "succeeded": true
+  },
+  {
+    "event": "to_ir_graph:start",
+    "wall": 1793683583.3551447,
+    "monotonic": 9446532.480934892
+  },
+  {
+    "event": "save_attr_content:start",
+    "wall": 1793683586.3686233,
+    "monotonic": 9446535.494413564,
+    "logical_bytes": 599193471232
+  },
+  {
+    "event": "save_attr_content:end",
+    "wall": 1793683741.7419376,
+    "monotonic": 9446690.86772807,
+    "elapsed_s": 155.3736507371068,
+    "succeeded": true,
+    "logical_bytes": 599193471232
+  },
+  {
+    "event": "save_np_buffer_content:start",
+    "wall": 1793683741.7535493,
+    "monotonic": 9446690.879339507,
+    "logical_bytes": 299290651648
+  },
+  {
+    "event": "save_np_buffer_content:end",
+    "wall": 1793683741.7816763,
+    "monotonic": 9446690.907466525,
+    "elapsed_s": 0.028615208342671394,
+    "succeeded": true,
+    "logical_bytes": 299290651648
+  },
+  {
+    "event": "to_ir_graph:end",
+    "wall": 1793683742.4899333,
+    "monotonic": 9446691.615723679,
+    "elapsed_s": 159.13478775508702,
+    "succeeded": true
+  },
+  {
+    "event": "_gen_graph:end",
+    "wall": 1793683742.8454084,
+    "monotonic": 9446691.971198896,
+    "elapsed_s": 495.69619905389845,
+    "succeeded": true
+  },
+  {
+    "event": "_gencode_in_subprocesses:start",
+    "wall": 1793683982.4916208,
+    "monotonic": 9446931.61741148
+  },
+  {
+    "event": "_gencode_in_subprocesses:end",
+    "wall": 1793684156.8861852,
+    "monotonic": 9447106.011975441,
+    "elapsed_s": 174.39456662349403,
+    "succeeded": true
+  },
+  {
+    "event": "_gencode:end",
+    "wall": 1793684156.887698,
+    "monotonic": 9447106.013488224,
+    "elapsed_s": 1000.7683725431561,
+    "succeeded": true
+  },
+  {
+    "event": "_gencode:start",
+    "wall": 1793684157.104568,
+    "monotonic": 9447106.230358556
+  },
+  {
+    "event": "_gen_graph:start",
+    "wall": 1793684160.0951738,
+    "monotonic": 9447109.220964314
+  },
+  {
+    "event": "to_fx_graph:start",
+    "wall": 1793684160.0990252,
+    "monotonic": 9447109.224815449
+  },
+  {
+    "event": "to_fx_graph:end",
+    "wall": 1793684179.5423596,
+    "monotonic": 9447128.668149935,
+    "elapsed_s": 19.44333192333579,
+    "succeeded": true
+  },
+  {
+    "event": "to_ir_graph:start",
+    "wall": 1793684179.5424788,
+    "monotonic": 9447128.668269103
+  },
+  {
+    "event": "save_attr_content:start",
+    "wall": 1793684179.7912052,
+    "monotonic": 9447128.91699556,
+    "logical_bytes": 877953024
+  },
+  {
+    "event": "save_attr_content:end",
+    "wall": 1793684181.675116,
+    "monotonic": 9447130.800906308,
+    "elapsed_s": 1.883989792317152,
+    "succeeded": true,
+    "logical_bytes": 877953024
+  },
+  {
+    "event": "save_np_buffer_content:start",
+    "wall": 1793684181.6854975,
+    "monotonic": 9447130.811287992,
+    "logical_bytes": 16384
+  },
+  {
+    "event": "save_np_buffer_content:end",
+    "wall": 1793684181.7160766,
+    "monotonic": 9447130.841866877,
+    "elapsed_s": 0.03064371645450592,
+    "succeeded": true,
+    "logical_bytes": 16384
+  },
+  {
+    "event": "to_ir_graph:end",
+    "wall": 1793684181.7740288,
+    "monotonic": 9447130.899819119,
+    "elapsed_s": 2.231549048796296,
+    "succeeded": true
+  },
+  {
+    "event": "_gen_graph:end",
+    "wall": 1793684181.785512,
+    "monotonic": 9447130.91130234,
+    "elapsed_s": 21.690340977162123,
+    "succeeded": true
+  },
+  {
+    "event": "_gencode_in_subprocesses:start",
+    "wall": 1793684188.9239352,
+    "monotonic": 9447138.049725669
+  },
+  {
+    "event": "_gencode_in_subprocesses:end",
+    "wall": 1793684230.863396,
+    "monotonic": 9447179.989186188,
+    "elapsed_s": 41.93946127593517,
+    "succeeded": true
+  },
+  {
+    "event": "_gencode:end",
+    "wall": 1793684230.8639538,
+    "monotonic": 9447179.989744307,
+    "elapsed_s": 73.75938306748867,
+    "succeeded": true
+  },
+  {
+    "event": "complete",
+    "wall": 1793684230.8646219,
+    "monotonic": 9447179.990412137
+  }
+]
