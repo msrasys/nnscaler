@@ -116,13 +116,14 @@ New indexed npbuffer packages require the updated runtime and their referenced
 Legacy standalone archives remain readable. The actual YAML stages the whole
 package. Do not remove referenced shards from a deployable package.
 
-`summary.json` records exact source revisions, phase/resource measurements,
-workload/source fingerprints and compact correctness results. Detailed raw
-logs, input plans, per-rank audits and tensor hashes are retained under
-`/data/tmp/ref-kl-opt-20261103`; older investigation artifacts are also available
-in the pre-review branch history at NNScaler `6a7817f`. Previous IR-replay
-807→424-second measurements were partial phases and are superseded for
-complete timing by this report.
+Machine-readable source revisions, phase/resource measurements, workload
+fingerprints, per-rank audits and tensor hashes are retained locally under
+`/data/tmp/ref-kl-opt-20261103/reports/`, including
+`pr-json-archive/20261103/`. This PR keeps the Markdown results and methodology.
+The archived records retain the commit IDs used during testing. Commit authorship
+was corrected after validation; runtime and test files are unchanged.
+Previous IR-replay 807→424-second measurements covered partial phases; use the
+complete timing in this report for end-to-end compilation comparisons.
 
 The original full compile succeeded after fixing the measurement guard:
 raw cgroup usage included reclaimable file cache. The guard now records both
