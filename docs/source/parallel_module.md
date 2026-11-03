@@ -842,12 +842,14 @@ nnscaler.load_sharded_state_dict(
 # For deduped checkpoints, use load_deduped_state_dict instead.
 ```
 
-The underlying `nnscaler.align_state_dict_names(model, model_state_dict)`
-adapter can also be called directly. It matches original names and shard metadata, ignoring tensor IDs.
+The underlying `nnscaler.align_state_dict_names(model, model_state_dict, optimizer, optimizer_state_dict)`
+adapter can also be called directly; the optimizer arguments are optional. It matches original
+names and shard metadata, ignoring tensor IDs.
 It returns a shallow copy (tensors are not copied), updates parallel-module
 metadata, and leaves non-parallel-module keys unchanged. It also works when a
 deduped rank holds only metadata. Missing metadata, ambiguous matches, changed
-sharding, or changed optimizer parameter order/layout raise `ValueError`.
+sharding, or changed optimizer parameter layout (including the ZeRO layout of
+non-parallel parameters) raise `ValueError`.
 Module prefixes and original model names must remain unchanged. This is not
 a resharding or optimizer-state migration API; use a merged checkpoint for
 parallel-plan changes.
@@ -887,6 +889,52 @@ def load_merged_state_dict(
 Load the merged state dicts to the module, and optionally the optimizer, to a specified device.
 
 Please note the `device` parameter. If it is None, `torch.cuda.current_device()` will be used. If you want to load the state dict to a specific device, you can set it to the device you want.
+
+
+### `load_from_rank_state_dicts`
+
+```python
+def load_from_rank_state_dicts(
+    module: torch.nn.Module,
+    module_state_dicts: List[Dict[str, Any]],
+    optimizer: Optional[Union[torch.optim.Optimizer, ParallelOptimizer]] = None,
+    optimizer_state_dicts: Optional[List[Dict[str, Any]]] = None,
+    *,
+    device: Union[str, torch.device] = None,
+    strict: bool = True,
+) -> None:
+```
+
+Load directly from the per-rank state dicts of a source checkpoint, without first
+calling `merge_state_dicts`. Source and target TP, PP, ZeRO, world sizes, and optimizer
+bucket layouts may differ. The optimizer must be created by `build_optimizer`;
+only single-group Adam/Muon-like optimizers are supported, as in `merge_state_dicts`.
+
+```python
+checkpoints = [
+    torch.load(path, map_location='cpu', weights_only=False)
+    for path in checkpoint_paths
+]
+nnscaler.load_from_rank_state_dicts(
+    model,
+    [checkpoint['model'] for checkpoint in checkpoints],
+    optimizer,
+    [checkpoint['optimizer'] for checkpoint in checkpoints],
+)
+```
+
+Every process must have access to all source rank state dicts, including their
+nnscaler extra metadata; the state dicts may be deduplicated with `deduped_state_dict`.
+Rank order does not matter. No communication is performed between processes.
+
+Unlike `merge_state_dicts` followed by `load_merged_state_dict`, the full merged
+model and optimizer state dicts are never materialized. Besides the input state dicts,
+the extra memory is roughly one target-local shard at a time plus the target-local
+state dicts. Only the source shards overlapping the target shard are read.
+
+With `strict=True`, all target model parameters and persistent buffers must be
+available. Source keys not needed by the target rank are ignored. Omit the optimizer
+arguments to load only model state. `device=None` selects `torch.cuda.current_device()`.
 
 
 ### `deduped_state_dict`

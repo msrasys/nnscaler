@@ -799,10 +799,13 @@ Where `ResumeOptions` and `SerializerOptions` are:
     `Callable[[Dict[str, Any]], Dict[str, Any]]`. Only applied when
     `checkpoint` is a file.
   - `with_merged` (`Optional[bool]`): Whether to merge the checkpoint
-    files when loading. `True` means will load the merged checkpoint
-    (without saving). `False` means will load the sharded checkpoint
-    files. `None` means will load sharded if world size is unchanged,
-    and merged otherwise. Only used when `checkpoint` is a directory.
+    files when loading. `True` merges all rank files into a full state
+    dict and then trims and broadcasts it. `False` or `None` lets each
+    rank load its own file; when the world size changed or the file's
+    parallel layout no longer matches the model, every rank instead reads
+    all rank files and assembles only
+    its own shard, without merging or broadcasting (`save_memory` and
+    `slow_fs` do not apply then). Only used when `checkpoint` is a directory.
   - `save_memory` (`bool`): If the memory is limited, only load merged
     state dict in GPU 0 of each node and broadcast trimmed state dict to
     other ranks. Although slower, this saves memory. Only used when
