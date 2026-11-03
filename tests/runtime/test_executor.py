@@ -1,6 +1,7 @@
 #  Copyright (c) Microsoft Corporation.
 #  Licensed under the MIT License.
 
+import logging
 import pytest
 import torch
 
@@ -81,6 +82,37 @@ def test_wait_carries_requires_grad_to_callback_result(monkeypatch, completed):
     assert result.requires_grad
     assert torch.equal(result.detach(), torch.arange(4, dtype=torch.float32).repeat(2))
     handler.check_clear()
+
+
+def test_backward_accepts_async_handle(monkeypatch, caplog):
+    handler = executor._AsyncCommHandler()
+    monkeypatch.setattr(executor, '_instance', handler)
+    monkeypatch.setattr(torch.distributed, 'get_rank', lambda: 0)
+    handle = torch.zeros(4)
+    gathered = [torch.empty(4), torch.empty(4)]
+
+    class Work:
+        def is_completed(self):
+            return False
+
+        def wait(self):
+            for part in gathered:
+                part.copy_(torch.arange(4, dtype=torch.float32))
+
+    def adapter():
+        handler.submit(handle, [Work()], lambda tensor: torch.cat(gathered))
+        return handle
+
+    # Generated code keeps the handle and passes it to backward(); the segment
+    # must be able to match it although fexecute consumed the assembled output.
+    output = Executor.aexecute(adapter, requires_grad=True)
+    loss = Executor.fexecute('seg', lambda x: (x * 2).sum(), output, requires_grad=True)
+    with caplog.at_level(logging.WARNING, logger='nnscaler.runtime.executor'):
+        grad = Executor.backward('seg', [output], [loss], [torch.ones(())])
+    assert "doesn't match" not in caplog.text
+    torch.testing.assert_close(grad, torch.full((8,), 2.0))
+    handler.check_clear()
+    Executor.check_clear()
 
 
 def test_split_backward_matches_full_backward():

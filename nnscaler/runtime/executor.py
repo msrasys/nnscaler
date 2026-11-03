@@ -163,20 +163,23 @@ class Executor:
         """
         forward the sub-graph.
         """
-        input_tensors = Executor.sync_tensors(input_tensors)
+        synced_tensors = Executor.sync_tensors(input_tensors)
 
         if not requires_grad:
             with torch.no_grad():
-                outputs = subgraph(*input_tensors)
+                outputs = subgraph(*synced_tensors)
             return outputs
 
         # everytime forward a segment, detach the tensor from previous graph
         mapping: Dict[int, torch.Tensor] = dict()
-        for itensor in input_tensors:
+        for itensor in synced_tensors:
             if torch.is_tensor(itensor) and itensor.requires_grad:
                 mapping[id(itensor)] = itensor.detach().requires_grad_()
-        input_dtensors = tuple(mapping[id(t)] if id(t) in mapping else t for t in input_tensors)
+        input_dtensors = tuple(mapping[id(t)] if id(t) in mapping else t for t in synced_tensors)
 
+        # Key by the objects the caller holds: generated code later passes the
+        # same variables to backward(), and for collectives that assemble their
+        # output in a wait callback those are the handles, not the synced tensors.
         saved_pairs = [(id(itensor), dtensor) for itensor, dtensor in zip(input_tensors, input_dtensors)]
         Executor._detach.setdefault(name, []).append(saved_pairs)
 

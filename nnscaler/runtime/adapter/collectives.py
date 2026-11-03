@@ -33,6 +33,19 @@ def _all_to_all_destinations(ranks, dsts):
     return dsts
 
 
+def _async_handle(tensor: torch.Tensor) -> torch.Tensor:
+    """Placeholder returned by collectives that assemble their output in the wait callback.
+
+    It must be a distinct object from `tensor`: the input may still be consumed
+    elsewhere (aliased adapter inputs), and an executor wait on that consumer
+    would otherwise run this collective's callback and steal its result.
+    `detach()` shares storage, so this costs no copy.
+    The handle mirrors the input's requires_grad like any op output would; `AsyncCommHandler` carries
+    that flag onto the tensor the callback assembles.
+    """
+    return tensor.detach().requires_grad_(tensor.requires_grad)
+
+
 def move(tensor: Optional[torch.Tensor], shape: Tuple[int], dtype: torch.dtype, src: int, dst: int, async_op=False):
     """
     Move a tensor from source device to destination device.
@@ -125,8 +138,8 @@ def all_gather(tensor: torch.Tensor, dim: int,
         return torch.concat(tuple(tensor_list), dim=dim)
 
     if work:
-        AsyncCommHandler().submit(tensor, [work], concat_gathered)
-        otensor = tensor
+        otensor = _async_handle(tensor)
+        AsyncCommHandler().submit(otensor, [work], concat_gathered)
     else:
         otensor = concat_gathered(tensor)
     if not async_op:
@@ -197,8 +210,8 @@ def all_to_all(tensor: torch.Tensor, idim: int, odim: int,
     otensors = [otensors[group_ranks.index(rank)] for rank in ranks]
     if work:
         all2all_callback = lambda t: torch.concat(tuple(otensors), dim=idim)
-        AsyncCommHandler().submit(tensor, [work], all2all_callback)
-        otensor = tensor
+        otensor = _async_handle(tensor)
+        AsyncCommHandler().submit(otensor, [work], all2all_callback)
     else:
         otensor = torch.concat(tuple(otensors), dim=idim)
     if not async_op:
@@ -230,10 +243,8 @@ def all_to_all_single(tensor: torch.Tensor, idim: int, odim: int,
         return torch.cat([chunks[group_ranks.index(rank)] for rank in ranks], dim=idim)
 
     if work:
-        AsyncCommHandler().submit(tensor, [work], all2all_callback)
-        # Return the tensor registered as the async handle. wait(tensor) runs
-        # the callback and returns the output assembled from received.
-        otensor = tensor
+        otensor = _async_handle(tensor)
+        AsyncCommHandler().submit(otensor, [work], all2all_callback)
     else:
         otensor = all2all_callback(tensor)
 

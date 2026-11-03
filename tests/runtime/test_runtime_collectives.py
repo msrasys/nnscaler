@@ -94,6 +94,22 @@ def _all2all_worker(async_op):
     return (clone_to_cpu(tensor), clone_to_cpu(otensor))
 
 
+def _aliased_fanout_worker():
+    # The same tensor object feeds async collectives and another consumer.
+    # Waiting on that consumer's input must not resolve or steal a collective's
+    # result, so callback-based collectives must not use their input as handle.
+    from nnscaler.runtime.executor import Executor, AsyncCommHandler
+    tensor = _get_tensor([128, 256])
+    gathered = nnscaler.runtime.adapter.all_gather(tensor, 0, [0, 1], async_op=True)
+    exchanged = nnscaler.runtime.adapter.all_to_all(tensor, 0, 1, [0, 1], async_op=True)
+    exchanged_single = nnscaler.runtime.adapter.all_to_all_single(tensor, 0, 1, [0, 1], async_op=True)
+    passthrough = Executor.aexecute(lambda t: t, tensor, requires_grad=False)
+    assert passthrough is tensor
+    outputs = [AsyncCommHandler().wait(t) for t in (gathered, exchanged, exchanged_single)]
+    AsyncCommHandler().check_clear()
+    return tuple(clone_to_cpu(t) for t in (tensor, *outputs))
+
+
 def _2gpu_worker():
     _init_distributed(2)
     result = {}
@@ -107,6 +123,7 @@ def _2gpu_worker():
     result['reduce_scatter_async'] = _reduce_scatter_worker(True)
     result['all2all'] = _all2all_worker(False)
     result['all2all_async'] = _all2all_worker(True)
+    result['aliased_fanout'] = _aliased_fanout_worker()
     _move_object_worker()
 
     return result
@@ -145,6 +162,16 @@ def test_2gpu():
         out1 = torch.concat([in0[1], in1[1]], dim=0)
         assert torch.equal(outputs[0][1], out0)
         assert torch.equal(outputs[1][1], out1)
+
+    # check aliased fan-out: every collective still returns its own result
+    outputs = results[0]['aliased_fanout'], results[1]['aliased_fanout']
+    in0 = outputs[0][0].chunk(2, dim=1)
+    in1 = outputs[1][0].chunk(2, dim=1)
+    assert torch.equal(outputs[0][1], torch.concat([outputs[0][0], outputs[1][0]], dim=0))
+    assert torch.equal(outputs[1][1], outputs[0][1])
+    for exchanged in (2, 3):
+        assert torch.equal(outputs[0][exchanged], torch.concat([in0[0], in1[0]], dim=0))
+        assert torch.equal(outputs[1][exchanged], torch.concat([in0[1], in1[1]], dim=0))
 
 
 def _rdscatter_worker(async_op):
