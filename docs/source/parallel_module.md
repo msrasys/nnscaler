@@ -648,16 +648,10 @@ When we combine async reduction with gradient accumulation, The time of kicking 
 
 ### Forward-only pipeline inputs
 
-After a segment forward, the executor keeps strong input references only for
-input gradients and registered gradient callbacks. It retains identity records
-for boundary checks, but no longer pins non-gradient inputs or their metadata
-dictionaries until backward. This allows frozen reference hidden/KV tensors to
-be released after their final forward consumer.
-
-PyTorch autograd and activation checkpointing still own constants required for
-backward, including a non-gradient input needed to compute a weight gradient.
-This does not resize or invalidate tensor storage. Inputs enabled for gradients
-inside the forward are kept; enabling an input's gradient after the forward is
-rejected. Pruned identities cannot consume a later callback if Python reuses an
-object id. Ordinary and split input/weight backward retain their callback and
-gradient behavior.
+After forward, the executor retains input tensors only for gradients or registered
+callbacks; it keeps IDs for boundary checks. Autograd and checkpointing still own
+constants needed by backward. This lets unused reference activations and metadata
+be reclaimed without resizing their storage. Enabling gradients on a pruned input
+after forward is rejected. Ordinary and split backward preserve callback behavior.
+Generated code also releases local metadata containers after their last positional
+or keyword consumer, while preserving returned objects and model attributes.

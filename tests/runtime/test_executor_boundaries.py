@@ -220,3 +220,65 @@ def test_enabling_input_grad_after_forward_is_rejected(split):
             Executor.backward_input('segment', [value], [output], [torch.ones_like(output)], [weight])
         else:
             Executor.backward('segment', [value], [output], [torch.ones_like(output)])
+
+
+@pytest.mark.parametrize('checkpoint', [False, True])
+def test_reference_hidden_released_while_kl_target_survives(checkpoint):
+    """Only the router target, not its producer's hidden state, is needed by KL."""
+    import torch.nn.functional as F
+    import torch.utils.checkpoint as ckpt
+
+    torch.manual_seed(42)
+    student = torch.randn(4, 3, requires_grad=True)
+    reference = torch.randn(4, 5)
+    reference_ref = weakref.ref(reference)
+    router = torch.randn(5, 3)
+    target = (reference @ router).log_softmax(-1)
+    expected_student = student.detach().clone().requires_grad_()
+    expected = F.kl_div(expected_student.log_softmax(-1), target,
+                        reduction='sum', log_target=True)
+    expected.backward()
+
+    def segment(logits, hidden):
+        with torch.no_grad():
+            target_log = (hidden @ router).log_softmax(-1)
+
+        def loss(value, target_log):
+            return F.kl_div(value.log_softmax(-1), target_log,
+                            reduction='sum', log_target=True)
+
+        return (ckpt.checkpoint(loss, logits, target_log, use_reentrant=False)
+                if checkpoint else loss(logits, target_log))
+
+    output = Executor.fexecute('reference_kl', segment, student, reference)
+    del reference
+    assert reference_ref() is None
+    grad = Executor.backward('reference_kl', [student], [output], [torch.ones_like(output)])
+    torch.testing.assert_close(output, expected, rtol=0, atol=0)
+    torch.testing.assert_close(grad, expected_student.grad, rtol=0, atol=0)
+    Executor.check_clear()
+
+
+def test_reference_output_is_kept_only_through_its_next_forward_consumer():
+    student = torch.randn(4, requires_grad=True)
+    reference = torch.randn(4)
+    first_ref = weakref.ref(reference)
+
+    def layer(value, hidden):
+        with torch.no_grad():
+            next_hidden = hidden.sin()
+            target = next_hidden.sum()
+        return value.square() + target, next_hidden
+
+    first, next_reference = Executor.fexecute('layer1', layer, student, reference)
+    next_ref = weakref.ref(next_reference)
+    del reference
+    assert first_ref() is None
+    second, last_reference = Executor.fexecute('layer2', layer, first, next_reference)
+    del next_reference
+    assert next_ref() is None
+    # The outgoing value is still a valid reference input for a later layer.
+    assert torch.isfinite(last_reference).all()
+    grad = Executor.backward('layer2', [first], [second], [torch.ones_like(second)])
+    Executor.backward('layer1', [student], [first], [grad])
+    Executor.check_clear()

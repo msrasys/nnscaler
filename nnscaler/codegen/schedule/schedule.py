@@ -333,7 +333,7 @@ class ScheduleCodeGen(FuncEmission):
                     self._track_async_recv(node, infer_pending_async_recvs)
                     # release
                     tensors = lifetime.release_tensors_after_line(line)
-                    tensors = [t for t in tensors if isinstance(t, IRTensor) and not t.is_grad()]
+                    tensors = [t for t in tensors if not isinstance(t, IRTensor) or not t.is_grad()]
                     if len(tensors) > 0 : # not necessarily to have one after each line
                         _append_code(fb, self.emit_release(tensors))
                     for out in IRSegment.get_objects_from_complex(node.outputs()):
