@@ -35,7 +35,7 @@ steps 6–20; hashing instrumentation occurs outside the timed iteration.
 | Unchanged baseline | 68.5020 | 8.3113 |
 | llm-train forward-only quantization/private-buffer release | 66.5039 | 8.4716 |
 | nnscaler non-gradient boundary input release | 67.2364 | 8.3442 |
-| Both changes | 65.2383 | 8.3540 |
+| Both changes (repeat) | 65.2383 | 8.3089 |
 
 Combined reduction: 3.264 GiB (4.76%). This measurement demonstrates
 lower allocation, **not a throughput speedup**. Forward-only reference
@@ -60,12 +60,13 @@ hidden state, so it cannot be discarded before that use.
 `VL_PP_PRESET=ref_kl` in `scripts/vl_pp_debug.sh` exposes the production-aligned
 local defaults. Source `scripts/k8s_env.sh` before running it and supply a
 readable `DATA_PATH` plus the Vision checkpoint. This preset intentionally
-keeps the existing default debug preset unchanged. The preserved `harness/`
-files are exact validation instrumentation; their original task root was
-`/data/tmp/ref-kl-opt-20261103`. To rerun them elsewhere, copy them under a
-scratch `scripts/`, supply the `data/mixture.json` and source shards, and map
-its source-data path in run_15b.py. JSON plan fields record the exact original
-CLI and deviations. Compressed audits contain hashes/metrics, not data payloads.
+keeps the existing default debug preset unchanged. The exact workload and per-rank comparison results are recorded in
+`summary.json`. Full raw hashes, logs, and the original task-specific harness
+are retained in the pre-review branch history (llm-train `4e37bb7`,
+NNScaler `80ca017`) and locally under
+`/data/tmp/ref-kl-opt-20261103/reports/pr-evidence-archive/`.
+The PR retains a compact report rather than installing environment-specific
+benchmark orchestration as product code.
 
 The local test matches 8K tokens per CP rank, VPP4, 12 microbatches and major
 kernel settings of the 150B/256K/CP32/EP32/DP16 YAML. It does not reproduce
