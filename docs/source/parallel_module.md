@@ -411,9 +411,9 @@ def __init__(self, init_params=True, build_buckets=True):
 - `init_params` (`bool`): whether to initialize the module parameters with the values they had at trace time. Set to `False` if you plan to load from a checkpoint instead.
 - `build_buckets` (`bool`): whether to build communication buckets immediately. Set to `False` when you need to call `build_buckets()` manually later (e.g., for hybrid optimizers with `param_clss_fn`).
 
-With `init_params=False`, non-persistent buffers still load from `npbuffer.pt`.
-This file may index buffers in `fullmodel.pt.*`; retain those referenced shards.
-Indexed packages require the updated runtime; old tensor-valued archives remain readable.
+With `init_params=False`, non-persistent buffers load through `fullmodel.pt.index`.
+Keep the shards containing those buffers even on resume. New packages need the
+updated runtime; older `npbuffer.pt` sidecars remain readable.
 
 
 2.`train_step`

@@ -136,7 +136,7 @@ def test_zero3_shared_weights(tmp_path):
 
 
 def trainer_npbuffer_worker(save_dir):
-    """Test that first training loads full weights, resume loads only npbuffer.pt."""
+    """Test that resume loads only non-persistent buffers before checkpoint weights."""
     save_dir = Path(save_dir)
     config_path = str(Path(__file__).with_name('trainer_args.yaml').resolve())
     gen_savedir = save_dir / 'gen'
@@ -171,9 +171,12 @@ def trainer_npbuffer_worker(save_dir):
         assert 'loading partitioned model from' in logs, \
             "First training should load full weights from fullmodel.pt"
         assert 'loading non-persistent buffers from' not in logs, \
-            "First training should NOT use npbuffer.pt path"
+            "First training should load all attributes together"
 
-    # Step 2: Resume - should load only npbuffer.pt (not full weights)
+    assert not list(gen_savedir.rglob('npbuffer.pt'))
+    assert list(gen_savedir.rglob('fullmodel.pt.index'))
+
+    # Step 2: Resume loads buffer slices through the shared attribute index.
     with catch_log(module_logger, 'INFO') as log_stream:
         trainer2 = Trainer([
             *common_args,
@@ -183,7 +186,7 @@ def trainer_npbuffer_worker(save_dir):
         trainer2.run()
         logs = log_stream.getvalue()
         assert 'loading non-persistent buffers from' in logs, \
-            "Resume should load non-persistent buffers from npbuffer.pt"
+            "Resume should load non-persistent buffers through the attribute index"
         assert 'loading partitioned model from' not in logs, \
             "Resume should NOT load full weights from fullmodel.pt"
 
@@ -193,5 +196,5 @@ def trainer_npbuffer_worker(save_dir):
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason='lack of gpu devices')
 def test_trainer_npbuffer(tmp_path):
-    """Test npbuffer.pt loading optimization for non-persistent buffers during resume."""
+    """Test selective non-persistent buffer loading during checkpoint resume."""
     launch_torchrun(1, trainer_npbuffer_worker, tmp_path)

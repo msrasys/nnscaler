@@ -57,10 +57,10 @@ def test_non_persistent_replica_resume_pages_in_local_slice(tmp_path):
     torch.testing.assert_close(model.replica, full[2:])
 
 
-@pytest.mark.parametrize('indexed', [False, True])
+@pytest.mark.parametrize('package_format', ['attributes', 'legacy', 'legacy_index'])
 @pytest.mark.parametrize('dtype', [torch.float32, torch.complex64])
-def test_generated_buffer_bundle_is_relocatable_and_loads_only_local_shards(tmp_path, indexed, dtype):
-    from nnscaler.graph.parser.frame import Frame, NP_BUFFER_INDEX_KEY
+def test_generated_buffer_bundle_is_relocatable_and_loads_only_local_shards(tmp_path, package_format, dtype):
+    from nnscaler.graph.parser.frame import Frame
     from nnscaler.ir.tensor import IRFullTensor
 
     original = tmp_path / 'original'
@@ -76,36 +76,69 @@ def test_generated_buffer_bundle_is_relocatable_and_loads_only_local_shards(tmp_
         frame.add_attr(tensor, full + i, f'reference.weight{i}')
     stem = original / 'fullmodel.pt'
     frame.save_attr_content(stem, params_per_file=full.numel(), max_workers=2)
-    frame.save_np_buffer_content(original / 'npbuffer.pt', attr_file_stem=stem if indexed else None)
+    if package_format == 'legacy':
+        frame.save_np_buffer_content(original / 'npbuffer.pt')
+        for path in original.glob('fullmodel.pt.*'):
+            path.unlink()  # Old resume packages can contain only the sidecar.
+    else:
+        if package_format == 'legacy_index':
+            torch.save({'__nnscaler_npbuffer_index__': 1,
+                        'files': {t.tid: f'fullmodel.pt.{i}' for i, t in enumerate(tensors)}},
+                       original / 'npbuffer.pt')
+        # Unused shards need not be present when restoring only local buffers.
+        (original / 'fullmodel.pt.0').unlink()
+        (original / 'fullmodel.pt.2').unlink()
     moved = tmp_path / 'moved'
     original.rename(moved)
-    filename = moved / 'npbuffer.pt'
-    if indexed:
-        assert filename.stat().st_size < full.numel() * full.element_size() // 10
-        index = torch.load(filename, weights_only=True)
-        assert index[NP_BUFFER_INDEX_KEY] == 1
 
     model = CubeModule()
     model.register_buffer('reference', torch.empty(2, 4, dtype=dtype), persistent=False)
     model.add_full_map('reference', tensors[1].tid, False, 'reference.weight1',
+                       tuple(full.shape), (slice(2, 4), slice(3, 7)), 2)
+    model.weight = torch.nn.Parameter(torch.full((2, 4), 37., dtype=dtype))
+    model.add_full_map('weight', tensors[0].tid, True, 'weight',
+                       tuple(full.shape), (slice(2, 4), slice(3, 7)), 1)
+    model.register_buffer('persistent', torch.full((2, 4), 41., dtype=dtype))
+    model.add_full_map('persistent', tensors[2].tid, False, 'persistent',
                        tuple(full.shape), (slice(2, 4), slice(3, 7)), 1)
     with patch('nnscaler.runtime.module.torch.load', wraps=torch.load) as reader:
-        model.load_np_buffer_content(str(filename))
-    torch.testing.assert_close(model.reference, (full + 1)[2:4, 3:7])
+        if package_format == 'attributes':
+            assert not (moved / 'npbuffer.pt').exists()
+            model.load_attr_content(str(moved / 'fullmodel.pt'), non_persistent_only=True)
+        else:
+            model.load_np_buffer_content(str(moved / 'npbuffer.pt'))
+    torch.testing.assert_close(model.reference, (full + 1)[2:4, 3:7] / 2)
+    torch.testing.assert_close(model.weight, torch.full_like(model.weight, 37.))
+    torch.testing.assert_close(model.persistent, torch.full_like(model.persistent, 41.))
     paths = [Path(call.args[0]).name for call in reader.call_args_list]
-    assert paths == (['npbuffer.pt', 'fullmodel.pt.1'] if indexed else ['npbuffer.pt'])
-    assert all(call.kwargs['map_location'] == 'cpu' for call in reader.call_args_list)
+    expected = {'attributes': ['fullmodel.pt.index', 'fullmodel.pt.1'],
+                'legacy': ['npbuffer.pt'],
+                'legacy_index': ['npbuffer.pt', 'fullmodel.pt.1']}
+    assert paths == expected[package_format]
+    assert all(call.kwargs['map_location'] == 'cpu' for call in reader.call_args_list
+               if not str(call.args[0]).endswith('.index'))
     assert 'reference' not in model.state_dict()
 
 
 @pytest.mark.parametrize('version,files', [(2, {}), (1, {}), (1, {1: '../outside.pt'})])
-def test_buffer_index_rejects_unknown_version_or_missing_local_source(tmp_path, version, files):
-    from nnscaler.graph.parser.frame import NP_BUFFER_INDEX_KEY
-
+def test_legacy_buffer_index_rejects_unknown_version_or_missing_local_source(tmp_path, version, files):
     filename = tmp_path / 'npbuffer.pt'
-    torch.save({NP_BUFFER_INDEX_KEY: version, 'files': files}, filename)
+    torch.save({'__nnscaler_npbuffer_index__': version, 'files': files}, filename)
     with pytest.raises(RuntimeError):
         shard().load_np_buffer_content(str(filename))
+
+
+def test_buffer_subset_requires_its_tensor_ids_in_fullmodel_index(tmp_path):
+    torch.save({0: 0}, tmp_path / 'fullmodel.pt.index')
+    with pytest.raises(RuntimeError, match='missing tensor IDs'):
+        shard().load_attr_content(str(tmp_path / 'fullmodel.pt'), non_persistent_only=True)
+
+
+def test_buffer_subset_requires_fullmap_metadata(tmp_path):
+    model = shard()
+    del model.fullmap['replica']
+    with pytest.raises(RuntimeError, match='non-persistent buffers not found in fullmap'):
+        model.load_attr_content(str(tmp_path / 'fullmodel.pt'), non_persistent_only=True)
 
 
 class PairedBlock(torch.nn.Module):
@@ -148,12 +181,12 @@ def policy(graph, cfg):
         yield OpPlan(op, stage_id=stage, partition=None)
 
 
-def worker(scheduler):
+def worker(scheduler, package_format):
     nnscaler.init()
     torch.manual_seed(7)
     source = PairedPipeline()
     eager = copy.deepcopy(source).cuda()
-    eager_opt = torch.optim.SGD(eager.parameters(), lr=0.01)
+    eager_opt = torch.optim.SGD(eager.parameters(), lr=0.01, momentum=0.9)
     cfg = nnscaler.ComputeConfig(2, 2, use_end2end=True, constant_folding=False,
                                 pas_config={'pipeline_size': 2, 'pipeline_nmicros': 4,
                                             'pipeline_scheduler': scheduler})
@@ -161,11 +194,12 @@ def worker(scheduler):
     with clear_dir_on_rank0(directory) as tempdir:
         model = nnscaler.parallelize(source, {'x': torch.ones(8, 8)}, policy, cfg,
                                     gen_savedir=tempdir, reuse='override').cuda()
+        assert not list(Path(tempdir).rglob('npbuffer.pt'))
         aliases = {m.orig_name: m.orig_name.replace('.reference.', '.')
                    for m in model.fullmap.values() if '.reference.' in m.orig_name}
         model.init_aliased_buffers(aliases)
         frozen = {name: value.clone() for name, value in model.get_non_persistent_buffers().items()}
-        opt = nnscaler.build_optimizer(model, torch.optim.SGD, lr=0.01)
+        opt = nnscaler.build_optimizer(model, torch.optim.SGD, lr=0.01, momentum=0.9)
         eager_params = dict(eager.named_parameters())
         for step in range(2):
             samples = [torch.arange(64, device='cuda').reshape(8, 8).float() / 64 + micro
@@ -187,12 +221,28 @@ def worker(scheduler):
                 torch.testing.assert_close(getattr(model, name), value, rtol=0, atol=0)
                 assert name not in model.state_dict()
             opt.zero_grad()
-        # A resumed module skips the initial parameter shards, so its frozen
-        # buffers must load through the new npbuffer index (legacy archives
-        # remain covered by the CPU tests). Preserve the original teacher.
+        # Save a real per-rank checkpoint: parameters and optimizer history,
+        # but no frozen reference buffers. Restore those from the generated package.
+        checkpoint_file = Path(tempdir) / f'checkpoint{torch.distributed.get_rank()}.pt'
+        torch.save({'model': model.state_dict(), 'optimizer': opt.state_dict()}, checkpoint_file)
+        if package_format == 'legacy':
+            local_names = {meta.tid: meta.orig_name for name, meta in model.fullmap.items()
+                           if name in model.get_non_persistent_buffers()}
+            names_by_rank = [None] * torch.distributed.get_world_size()
+            torch.distributed.all_gather_object(names_by_rank, local_names)
+            if torch.distributed.get_rank() == 0:
+                package = next(Path(tempdir).rglob('fullmodel.pt.index')).parent
+                source_buffers = dict(source.named_buffers())
+                values = {tid: source_buffers[name].cpu() for names in names_by_rank for tid, name in names.items()}
+                torch.save(values, package / 'npbuffer.pt')
+                for path in package.glob('fullmodel.pt.*'):
+                    path.unlink()
+            torch.distributed.barrier()
         resumed = type(model)(init_params=False).cuda()
-        resumed.load_state_dict(model.state_dict())
-        resumed_opt = nnscaler.build_optimizer(resumed, torch.optim.SGD, lr=0.01)
+        checkpoint = torch.load(checkpoint_file, weights_only=False)
+        resumed.load_state_dict(checkpoint['model'])
+        resumed_opt = nnscaler.build_optimizer(resumed, torch.optim.SGD, lr=0.01, momentum=0.9)
+        resumed_opt.load_state_dict(checkpoint['optimizer'])
         eager_opt.zero_grad()
         expected = [eager(sample) for sample in samples]
         torch.stack(expected).sum().backward()
@@ -213,5 +263,6 @@ def worker(scheduler):
 
 @pytest.mark.skipif(torch.cuda.device_count() < 2, reason='requires 2 GPUs')
 @pytest.mark.parametrize('scheduler', ['1f1b', '1f1b_interleaved'])
-def test_pipeline_frozen_stream_matches_eager(scheduler):
-    assert all(launch_torchrun(2, worker, scheduler).values())
+@pytest.mark.parametrize('package_format', ['attributes', 'legacy'])
+def test_pipeline_frozen_stream_matches_eager(scheduler, package_format):
+    assert all(launch_torchrun(2, worker, scheduler, package_format).values())
