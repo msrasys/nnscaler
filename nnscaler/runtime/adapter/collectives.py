@@ -33,6 +33,26 @@ def _all_to_all_destinations(ranks, dsts):
     return dsts
 
 
+def _async_output(like: torch.Tensor, shape: List[int]) -> torch.Tensor:
+    """Preallocate the output of a collective that assembles its result after the wait.
+
+    The returned buffer is both the async handle and the final output: the wait
+    callback fills it in place instead of producing a new tensor. That keeps the
+    handle a consumer holds valid after any number of waits, which matters when
+    the same output feeds several segments or adapters, and lets `aexecute` mark
+    requires_grad on the tensor the consumers actually read.
+    """
+    return like.new_empty(shape)
+
+
+def _exchanged_shape(tensor: torch.Tensor, idim: int, odim: int, nranks: int) -> List[int]:
+    """Output shape of all_to_all: `odim` is split across ranks, `idim` concatenated."""
+    shape = list(tensor.shape)
+    shape[odim] //= nranks
+    shape[idim] *= nranks
+    return shape
+
+
 def move(tensor: Optional[torch.Tensor], shape: Tuple[int], dtype: torch.dtype, src: int, dst: int, async_op=False):
     """
     Move a tensor from source device to destination device.
@@ -120,15 +140,19 @@ def all_gather(tensor: torch.Tensor, dim: int,
     work = torch.distributed.all_gather(tensor_list, tensor, group=group, async_op=async_op)
     group_ranks = _get_group_ranks(group)
     tensor_list = [tensor_list[group_ranks.index(rank)] for rank in ranks]
+    shape = list(tensor.shape)
+    shape[dim] *= len(ranks)
+    otensor = _async_output(tensor, shape)
 
-    def concat_gathered(_):
-        return torch.concat(tuple(tensor_list), dim=dim)
+    def concat_gathered(out):
+        with torch.no_grad():
+            torch.cat(tuple(tensor_list), dim=dim, out=out)
+        return out
 
     if work:
-        AsyncCommHandler().submit(tensor, [work], concat_gathered)
-        otensor = tensor
+        AsyncCommHandler().submit(otensor, [work], concat_gathered)
     else:
-        otensor = concat_gathered(tensor)
+        concat_gathered(otensor)
     if not async_op:
         CudaTimer().stop(field_name='comm', predefined=True)
     return otensor
@@ -195,12 +219,17 @@ def all_to_all(tensor: torch.Tensor, idim: int, odim: int,
     otensors = [torch.empty_like(t) for t in itensors]
     work = torch.distributed.all_to_all(otensors, itensors, group=group, async_op=async_op)
     otensors = [otensors[group_ranks.index(rank)] for rank in ranks]
+    otensor = _async_output(tensor, _exchanged_shape(tensor, idim, odim, len(ranks)))
+
+    def all2all_callback(out):
+        with torch.no_grad():
+            torch.cat(tuple(otensors), dim=idim, out=out)
+        return out
+
     if work:
-        all2all_callback = lambda t: torch.concat(tuple(otensors), dim=idim)
-        AsyncCommHandler().submit(tensor, [work], all2all_callback)
-        otensor = tensor
+        AsyncCommHandler().submit(otensor, [work], all2all_callback)
     else:
-        otensor = torch.concat(tuple(otensors), dim=idim)
+        all2all_callback(otensor)
     if not async_op:
         CudaTimer().stop(field_name='comm', predefined=True)
     return otensor
@@ -213,6 +242,7 @@ def all_to_all_single(tensor: torch.Tensor, idim: int, odim: int,
     if not async_op:
         CudaTimer().start(field_name='comm', predefined=True)
     dsts = _all_to_all_destinations(ranks, dsts)
+    otensor = _async_output(tensor, _exchanged_shape(tensor, idim, odim, len(ranks)))
     tensor = tensor.transpose(0, odim) if odim != 0 else tensor
     tensor = tensor.contiguous() if not tensor.is_contiguous() else tensor
     group = DeviceGroup().get_group(ranks)
@@ -223,19 +253,18 @@ def all_to_all_single(tensor: torch.Tensor, idim: int, odim: int,
     received = torch.empty_like(tensor)
     work = torch.distributed.all_to_all_single(received, tensor, group=group, async_op=async_op)
 
-    def all2all_callback(_):
+    def all2all_callback(out):
         t = received
         t = t.transpose(0, odim) if odim != 0 else t
         chunks = t.chunk(len(ranks), dim=odim)
-        return torch.cat([chunks[group_ranks.index(rank)] for rank in ranks], dim=idim)
+        with torch.no_grad():
+            torch.cat([chunks[group_ranks.index(rank)] for rank in ranks], dim=idim, out=out)
+        return out
 
     if work:
-        AsyncCommHandler().submit(tensor, [work], all2all_callback)
-        # Return the tensor registered as the async handle. wait(tensor) runs
-        # the callback and returns the output assembled from received.
-        otensor = tensor
+        AsyncCommHandler().submit(otensor, [work], all2all_callback)
     else:
-        otensor = all2all_callback(tensor)
+        all2all_callback(otensor)
 
     if not async_op:
         CudaTimer().stop(field_name='comm', predefined=True)
@@ -343,12 +372,19 @@ def rdgather(itensor: torch.Tensor, shape: Tuple[int], dtype: torch.dtype,
             else:
                 work = torch.distributed.recv(tensor, src, group=group)
 
+        gathered_shape = list(shape)
+        gathered_shape[dim] *= len(srcs)
+        otensor = _async_output(recv_tensors[0], gathered_shape)
+
+        def rdgather_callback(out):
+            with torch.no_grad():
+                torch.cat(tuple(recv_tensors), dim=dim, out=out)
+            return out
+
         if async_op:
-            rdgather_callback = lambda t: torch.cat(tuple(recv_tensors), dim=dim)
-            otensor = recv_tensors[0]
             AsyncCommHandler().submit(otensor, works, rdgather_callback)
         else:
-            otensor = torch.cat(tuple(recv_tensors), dim=dim)
+            rdgather_callback(otensor)
     else:
         assert rank in srcs
         otensor = itensor.contiguous() if not itensor.is_contiguous() else itensor
