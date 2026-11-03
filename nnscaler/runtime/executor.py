@@ -32,7 +32,7 @@ def debug_id(tensors, msg: str, rank: int):
 
 class _AsyncCommHandler:
     def __init__(self) -> None:
-        self._works: Dict[torch.Tensor, Union[torch.Tensor, List[Work]]] = {}
+        self._works: Dict[torch.Tensor, List[Work]] = {}
         self._callbacks: Dict[torch.Tensor, Callable] = {}
         self._send_holds: List[Tuple[torch.Tensor, Work]] = []
 
@@ -43,35 +43,29 @@ class _AsyncCommHandler:
         @param tensor torch.Tensor
         @return tensor torch.Tensor
         """
-        if tensor not in self._works:
-            return tensor
+        works = self._works.pop(tensor, None)
+        if works is not None:
+            self._finish(tensor, works)
+        return tensor
 
-        tensor_or_works = self._works.pop(tensor)
-        if isinstance(tensor_or_works, torch.Tensor):
-            return tensor_or_works
-        return self._finish(tensor, tensor_or_works)
-
-    def _finish(self, tensor: torch.Tensor, works: List[Work]) -> torch.Tensor:
-        """Wait for `works` and return the final tensor registered under `tensor`."""
+    def _finish(self, tensor: torch.Tensor, works: List[Work]):
+        """Wait for `works` and run the callback that completes `tensor` in place."""
         for work in works:
             work.wait()
         callback = self._callbacks.pop(tensor)
-        if callback is None:
-            return tensor
-        result = callback(tensor)
-        # Collectives like all_gather register their input buffer as the handle
-        # and only assemble the real output here. `Executor.aexecute` marked
-        # requires_grad on the handle, so carry it over; otherwise the consuming
-        # segment sees a non-differentiable input and its backward returns no
-        # gradient for it.
-        if torch.is_tensor(result) and tensor.requires_grad and not result.requires_grad \
-                and result.dtype in _ALLOW_GRAD_DTYPES:
-            result.requires_grad_()
-        return result
+        if callback is not None:
+            assembled = callback(tensor)
+            assert assembled is tensor, "async callbacks must assemble the output into the registered tensor"
 
     def submit(self, tensor: torch.Tensor, works: List[Work], callback: Optional[Callable] = None):
         """
-        Submit an async communication
+        Submit an async communication.
+
+        `tensor` is both the handle consumers wait on and the final output. A
+        `callback(tensor)` may assemble the result into it after the works
+        finish, but must not replace it: consumers keep referring to `tensor`,
+        and a second wait on an already resolved tensor is a no-op that must
+        still see the complete data.
         """
         self._works[tensor] = works
         self._callbacks[tensor] = callback
@@ -96,13 +90,10 @@ class _AsyncCommHandler:
     def drain_all_completed(self):
         self.drain_sends_completed()
 
-        for tensor, tensor_or_works in list(self._works.items()):
-            if isinstance(tensor_or_works, torch.Tensor):
-                continue
-
-            if not all(work.is_completed() for work in tensor_or_works):
-                continue
-            self._works[tensor] = self._finish(tensor, tensor_or_works)
+        for tensor, works in list(self._works.items()):
+            if all(work.is_completed() for work in works):
+                del self._works[tensor]
+                self._finish(tensor, works)
 
     def check_clear(self):
         assert len(self._works) == 0 and len(self._callbacks) == 0 and len(self._send_holds) == 0, \
@@ -163,23 +154,20 @@ class Executor:
         """
         forward the sub-graph.
         """
-        synced_tensors = Executor.sync_tensors(input_tensors)
+        input_tensors = Executor.sync_tensors(input_tensors)
 
         if not requires_grad:
             with torch.no_grad():
-                outputs = subgraph(*synced_tensors)
+                outputs = subgraph(*input_tensors)
             return outputs
 
         # everytime forward a segment, detach the tensor from previous graph
         mapping: Dict[int, torch.Tensor] = dict()
-        for itensor in synced_tensors:
+        for itensor in input_tensors:
             if torch.is_tensor(itensor) and itensor.requires_grad:
                 mapping[id(itensor)] = itensor.detach().requires_grad_()
-        input_dtensors = tuple(mapping[id(t)] if id(t) in mapping else t for t in synced_tensors)
+        input_dtensors = tuple(mapping[id(t)] if id(t) in mapping else t for t in input_tensors)
 
-        # Key by the objects the caller holds: generated code later passes the
-        # same variables to backward(), and for collectives that assemble their
-        # output in a wait callback those are the handles, not the synced tensors.
         saved_pairs = [(id(itensor), dtensor) for itensor, dtensor in zip(input_tensors, input_dtensors)]
         Executor._detach.setdefault(name, []).append(saved_pairs)
 

@@ -105,9 +105,14 @@ def _aliased_fanout_worker():
     exchanged_single = nnscaler.runtime.adapter.all_to_all_single(tensor, 0, 1, [0, 1], async_op=True)
     passthrough = Executor.aexecute(lambda t: t, tensor, requires_grad=False)
     assert passthrough is tensor
-    outputs = [AsyncCommHandler().wait(t) for t in (gathered, exchanged, exchanged_single)]
+    # Outputs may be consumed repeatedly, within one call and across calls:
+    # every consumer must see the same, fully assembled tensor.
+    handles = (gathered, exchanged, exchanged_single)
+    outputs = Executor.sync_tensors([gathered, gathered, exchanged, exchanged_single])
+    assert outputs[0] is gathered and outputs[1] is gathered
+    assert all(AsyncCommHandler().wait(t) is t for t in handles)
     AsyncCommHandler().check_clear()
-    return tuple(clone_to_cpu(t) for t in (tensor, *outputs))
+    return tuple(clone_to_cpu(t) for t in (tensor, *handles))
 
 
 def _2gpu_worker():

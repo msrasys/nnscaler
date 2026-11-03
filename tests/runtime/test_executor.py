@@ -40,9 +40,7 @@ def test_adapter_waits_for_async_input(monkeypatch, requires_grad):
             events.append('wait')
             pending.copy_(torch.arange(8, dtype=torch.float32))
 
-    # Exercise the existing callback path too: the actual input has a
-    # different shape from the tensor carrying the communication handle.
-    handler.submit(pending, [Work()], lambda tensor: tensor[:4])
+    handler.submit(pending, [Work()])
 
     def adapter(tensor):
         events.append('consume')
@@ -50,17 +48,14 @@ def test_adapter_waits_for_async_input(monkeypatch, requires_grad):
 
     result = Executor.aexecute(adapter, pending, requires_grad=requires_grad)
     assert events == ['wait', 'consume']
-    torch.testing.assert_close(result, torch.arange(4, dtype=torch.float32) * 2)
+    torch.testing.assert_close(result, torch.arange(8, dtype=torch.float32) * 2)
     assert result.requires_grad == requires_grad
     handler.check_clear()
 
 
-@pytest.mark.parametrize('completed', [False, True])
-def test_wait_carries_requires_grad_to_callback_result(monkeypatch, completed):
-    handler = executor._AsyncCommHandler()
-    monkeypatch.setattr(executor, '_instance', handler)
-    # Like all_gather: the handle is the input buffer, the output is assembled by the callback.
-    handle = torch.zeros(4)
+def _submit_gather_like(handler, completed=False):
+    """Mimic all_gather: the handle is the preallocated output, filled by the callback."""
+    output = torch.empty(8)
     gathered = [torch.empty(4), torch.empty(4)]
 
     class Work:
@@ -71,45 +66,44 @@ def test_wait_carries_requires_grad_to_callback_result(monkeypatch, completed):
             for part in gathered:
                 part.copy_(torch.arange(4, dtype=torch.float32))
 
-    def adapter():
-        handler.submit(handle, [Work()], lambda tensor: torch.cat(gathered))
-        return handle
+    def assemble(out):
+        with torch.no_grad():
+            torch.cat(gathered, out=out)
+        return out
 
-    output = Executor.aexecute(adapter, requires_grad=True)
-    assert output is handle and output.requires_grad
+    def adapter():
+        handler.submit(output, [Work()], assemble)
+        return output
+
+    return Executor.aexecute(adapter, requires_grad=True)
+
+
+@pytest.mark.parametrize('completed', [False, True])
+def test_async_output_consumed_twice_in_one_call(monkeypatch, completed):
+    handler = executor._AsyncCommHandler()
+    monkeypatch.setattr(executor, '_instance', handler)
+    output = _submit_gather_like(handler, completed)
+    assert output.requires_grad
     # `completed` selects the drain path, otherwise the blocking wait path.
-    result, = Executor.sync_tensors([output])
-    assert result.requires_grad
-    assert torch.equal(result.detach(), torch.arange(4, dtype=torch.float32).repeat(2))
+    first, second = Executor.sync_tensors([output, output])
+    assert first is output and second is output
+    torch.testing.assert_close(output.detach(), torch.arange(4, dtype=torch.float32).repeat(2))
     handler.check_clear()
 
 
-def test_backward_accepts_async_handle(monkeypatch, caplog):
+def test_async_output_shared_across_calls(monkeypatch, caplog):
     handler = executor._AsyncCommHandler()
     monkeypatch.setattr(executor, '_instance', handler)
     monkeypatch.setattr(torch.distributed, 'get_rank', lambda: 0)
-    handle = torch.zeros(4)
-    gathered = [torch.empty(4), torch.empty(4)]
-
-    class Work:
-        def is_completed(self):
-            return False
-
-        def wait(self):
-            for part in gathered:
-                part.copy_(torch.arange(4, dtype=torch.float32))
-
-    def adapter():
-        handler.submit(handle, [Work()], lambda tensor: torch.cat(gathered))
-        return handle
-
-    # Generated code keeps the handle and passes it to backward(); the segment
-    # must be able to match it although fexecute consumed the assembled output.
-    output = Executor.aexecute(adapter, requires_grad=True)
+    output = _submit_gather_like(handler)
+    # An adapter consumes the output first; a later segment and its backward
+    # must still see the assembled tensor, not a stale placeholder.
+    assert Executor.aexecute(lambda t: t, output, requires_grad=False) is output
     loss = Executor.fexecute('seg', lambda x: (x * 2).sum(), output, requires_grad=True)
     with caplog.at_level(logging.WARNING, logger='nnscaler.runtime.executor'):
         grad = Executor.backward('seg', [output], [loss], [torch.ones(())])
     assert "doesn't match" not in caplog.text
+    torch.testing.assert_close(loss.detach(), torch.tensor(24.0))
     torch.testing.assert_close(grad, torch.full((8,), 2.0))
     handler.check_clear()
     Executor.check_clear()
