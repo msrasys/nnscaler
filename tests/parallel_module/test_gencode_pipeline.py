@@ -842,16 +842,17 @@ def test_shared_output_pipeline_boundary_codegen(tmp_path, case):
 
     final_output:
         x0 is consumed inside the pipeline and also returned alongside loss
-        as a final graph output. Its output identity must remain replicated;
-        being a sharded internal activation must not make the return partial.
+        as a final graph output. The detach feeding the return follows the
+        dim-0 consumers of its stage, so only shards cross the boundary and
+        the source ranks need no all-gather; the returned value is still
+        completed by the final stage before it is moved out.
     incompatible_consumers:
         A dim-0 add and a replicated ReLU consume x0 in stage 0. Their split
         requirements are {0, 'rn'}, so there is no single compatible layout
-        for the output identity to follow.
+        for the output identity to follow, and source ranks retain an all-gather.
 
-    Both cases assert that source ranks retain an all-gather. These are
-    communication checks; the end-to-end companion test checks returned
-    values and parameter gradients for the same cases.
+    These are communication checks; the end-to-end companion test checks
+    returned values and parameter gradients for the same cases.
     """
     parallelize(
         SharedOutputBoundaryModule(case).train(),
@@ -868,10 +869,24 @@ def test_shared_output_pipeline_boundary_codegen(tmp_path, case):
         reuse='override',
     )
     for rank in (0, 1):
-        assert _gencode_contains(
+        source_allgather = _gencode_contains(
             tmp_path, SharedOutputBoundaryModule, rank,
             r'nnscaler\.runtime\.adapter\.nn\.allgather_split\(',
         )
+        assert bool(source_allgather) == (case == 'incompatible_consumers')
+    if case == 'final_output':
+        for rank in (2, 3):
+            # x0 arrives as a dim-0 shard and is consumed as such: no re-sharding
+            # inside the stage, and the only gather completes the detached return.
+            assert not _gencode_contains(
+                tmp_path, SharedOutputBoundaryModule, rank,
+                r'nnscaler\.runtime\.adapter\.nn\.split_allgather\(',
+            )
+            assert len(_gencode_contains(
+                tmp_path, SharedOutputBoundaryModule, rank,
+                r'(add_\d+) = torch\.Tensor\.detach\(add_\d+\)\n(?:[^\n]*\n){0,2}?'
+                r'\s*add_\d+ = nnscaler\.runtime\.adapter\.all_gather\(\1, dim=0, ranks=\[2, 3\]\)',
+            )) == 1
 
 
 class SharedInputSegmentModule(torch.nn.Module):
