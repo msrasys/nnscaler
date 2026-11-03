@@ -726,12 +726,12 @@ def _pp_get_aux_outputs(
 
 def _pp_detach_aux_outputs(
     graph: IRGraph, op_plans: dict[IRFwOperation, OpPlan]
-) -> dict[IRFullTensor, IRFwOperation]:
+) -> tuple[dict[IRFullTensor, IRFwOperation], list[IRFwOperation]]:
     """
     Insert boundary/output detaches and update affected backward outputs.
 
     Returns the auxiliary-only parameter uses that shared-parameter multiref would
-    break; see `_pp_get_aux_outputs`.
+    break (see `_pp_get_aux_outputs`) and the inserted detach nodes.
 
     Only the first output (loss) seeds backward. Other outputs are values
     to return, not additional backward roots.
@@ -781,8 +781,9 @@ def _pp_detach_aux_outputs(
     """
     from nnscaler.graph.function.function import Detach
     sites, aux_param_uses = _pp_get_aux_outputs(graph, op_plans)
+    detaches: list[IRFwOperation] = []
     if not sites:
-        return aux_param_uses
+        return aux_param_uses, detaches
 
     # Sort the sites by their position in descending order
     # to ensure that insertions do not affect subsequent positions.
@@ -798,7 +799,9 @@ def _pp_detach_aux_outputs(
         # the detach node will follow the OpPlan of the operation at the insertion position.
         plan = op_plans[graph._nodes[position]]
         graph.insert(detach, position + 1)
-        # Infer the detach partition from its input, keeping the memory region.
+        # `fn` first lets the detach follow the layout this stage's other consumers
+        # of the source already need; only without such a layout does 'auto'
+        # infer the detach partition from its input, keeping the memory region.
         # Note if the input is value partitioned,
         # the detach node will introduce an all-reduce communication.
         # But as it is the output of segments and value partitioning can't go through segments
@@ -807,6 +810,7 @@ def _pp_detach_aux_outputs(
             detach, stage_id=stage_id, partition='auto',
             recompute_id=plan.recompute_id, offload_id=plan.offload_id,
         )
+        detaches.append(detach)
         for consumer in consumers:
             with graph.update(consumer):
                 consumer.replace_input(source, detach.output(0))
@@ -840,7 +844,7 @@ def _pp_detach_aux_outputs(
         # isolate this branch, while the loss path through h and y stays intact.
         _refresh_grads(graph, source)
         _refresh_grads(graph, detach.output(0))
-    return aux_param_uses
+    return aux_param_uses, detaches
 
 
 def _identity_segment_output(graph: IRGraph, tensor: IRSubTensor, segment: IRSegment, all_segments: List[IRSegment]) -> IRFwOperation:
@@ -1232,8 +1236,9 @@ def fn(
     # Plan the inserted nodes together with user operators, before any
     # recompute/offload grouping, tensor-split bookkeeping or graph rewrites.
     aux_param_uses: dict[IRFullTensor, IRFwOperation] = {}
+    aux_detaches: list[IRFwOperation] = []
     if nstages > 1:
-        aux_param_uses = _pp_detach_aux_outputs(graph, op_plans)
+        aux_param_uses, aux_detaches = _pp_detach_aux_outputs(graph, op_plans)
 
     recompute_groups: dict[int, list[IRFwOperation]] = {}
     recompute_last_id: int = -1
@@ -1292,6 +1297,18 @@ def fn(
                 op_plan.partition = None
             if op_plan.partition is not None:
                 raise ValueError("Only IRDimops can be partitioned.")
+
+        if node in aux_detaches:
+            # An inserted detach sits after every other op of its stage, so the
+            # layouts this stage's other consumers need for its source are already
+            # in `tensor_splits`. Reusing a unanimous local layout adds no new
+            # layout requirement: no activation multiref, and for a cross-stage
+            # source no full-tensor boundary transfer. Otherwise keep 'auto',
+            # which follows the producer layout.
+            local_splits = tensor_splits.get(node.input(0).parent, {}).get(op_plan.stage_id, set())
+            if len(local_splits) == 1:
+                local_split = list(local_splits)[0]
+                op_plan.partition = OpPartition(input=0, dim=local_split) if isinstance(local_split, int) else None
 
         # list of partitions for the op
         # [] means no partition(replicated)

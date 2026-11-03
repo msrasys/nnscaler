@@ -387,8 +387,9 @@ def test_fn_aux_gradient_metadata(tmp_path, monkeypatch, model_cls, signature, r
     assert checked == [True]
 
 
-# Auto partition follows dimension shards, gathers value shards, and uses a
-# replicated fallback for returned parameters (which have no producer).
+# A detach follows the layout its stage's other consumers already need (hidden
+# and the returned weight). Without one, auto partition follows dimension
+# shards and gathers value shards (aux).
 @replace_all_device_with('cpu')
 @pytest.mark.parametrize('value_partition', [False, True])
 def test_fn_aux_output_partition(tmp_path, monkeypatch, value_partition):
@@ -406,13 +407,17 @@ def test_fn_aux_output_partition(tmp_path, monkeypatch, value_partition):
             assert node.input(0).valmap == node.output(0).valmap
             assert node.input(0).grad is None and node.output(0).grad is None
         aux = [node.output(0) for node in detaches if node.output(0).parent == graph.output(1).parent]
+        hidden = [node.output(0) for node in detaches if node.output(0).parent == graph.output(2).parent]
         parameter = [node.output(0) for node in detaches if node.output(0).parent == graph.output(3).parent]
-        assert len(aux) == len(parameter) == 2
+        assert len(aux) == len(hidden) == len(parameter) == 2
         assert all(tensor.valmap == (0, 1) for tensor in aux)
         assert {tensor.indmap for tensor in aux} == (
             {((0, 2), (0, 4))} if value_partition else {((0, 1), (0, 4)), ((1, 2), (0, 4))}
         )
-        assert all(tensor.shape == (4, 4) and not tensor.splitdims() for tensor in parameter)
+        # layers.1 consumes hidden along dim 0 in the detach stage although its
+        # producer is split along dim 1; layers.0 consumes the weight along dim 0.
+        assert {tensor.indmap for tensor in hidden} == {((0, 1), (0, 4)), ((1, 2), (0, 4))}
+        assert {tensor.indmap for tensor in parameter} == {((0, 2), (0, 4)), ((2, 4), (0, 4))}
         checked.append(True)
         return schedule(cfg, graph, *args)
 
