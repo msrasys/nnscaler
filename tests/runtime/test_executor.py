@@ -24,6 +24,65 @@ def _make_linears(dtype=torch.float64):
     return reference, actual
 
 
+@pytest.mark.parametrize('requires_grad', [False, True])
+def test_adapter_waits_for_async_input(monkeypatch, requires_grad):
+    handler = executor._AsyncCommHandler()
+    monkeypatch.setattr(executor, '_instance', handler)
+    pending = torch.zeros(8)
+    events = []
+
+    class Work:
+        def is_completed(self):
+            return False
+
+        def wait(self):
+            events.append('wait')
+            pending.copy_(torch.arange(8, dtype=torch.float32))
+
+    # Exercise the existing callback path too: the actual input has a
+    # different shape from the tensor carrying the communication handle.
+    handler.submit(pending, [Work()], lambda tensor: tensor[:4])
+
+    def adapter(tensor):
+        events.append('consume')
+        return tensor * 2
+
+    result = Executor.aexecute(adapter, pending, requires_grad=requires_grad)
+    assert events == ['wait', 'consume']
+    torch.testing.assert_close(result, torch.arange(4, dtype=torch.float32) * 2)
+    assert result.requires_grad == requires_grad
+    handler.check_clear()
+
+
+@pytest.mark.parametrize('completed', [False, True])
+def test_wait_carries_requires_grad_to_callback_result(monkeypatch, completed):
+    handler = executor._AsyncCommHandler()
+    monkeypatch.setattr(executor, '_instance', handler)
+    # Like all_gather: the handle is the input buffer, the output is assembled by the callback.
+    handle = torch.zeros(4)
+    gathered = [torch.empty(4), torch.empty(4)]
+
+    class Work:
+        def is_completed(self):
+            return completed
+
+        def wait(self):
+            for part in gathered:
+                part.copy_(torch.arange(4, dtype=torch.float32))
+
+    def adapter():
+        handler.submit(handle, [Work()], lambda tensor: torch.cat(gathered))
+        return handle
+
+    output = Executor.aexecute(adapter, requires_grad=True)
+    assert output is handle and output.requires_grad
+    # `completed` selects the drain path, otherwise the blocking wait path.
+    result, = Executor.sync_tensors([output])
+    assert result.requires_grad
+    assert torch.equal(result.detach(), torch.arange(4, dtype=torch.float32).repeat(2))
+    handler.check_clear()
+
+
 def test_split_backward_matches_full_backward():
     torch.manual_seed(0)
     reference, actual = _make_linears()

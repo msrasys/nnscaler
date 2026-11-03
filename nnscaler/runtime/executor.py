@@ -49,13 +49,25 @@ class _AsyncCommHandler:
         tensor_or_works = self._works.pop(tensor)
         if isinstance(tensor_or_works, torch.Tensor):
             return tensor_or_works
+        return self._finish(tensor, tensor_or_works)
 
-        for work in tensor_or_works:
+    def _finish(self, tensor: torch.Tensor, works: List[Work]) -> torch.Tensor:
+        """Wait for `works` and return the final tensor registered under `tensor`."""
+        for work in works:
             work.wait()
         callback = self._callbacks.pop(tensor)
-        if callback is not None:
-            tensor = callback(tensor)
-        return tensor
+        if callback is None:
+            return tensor
+        result = callback(tensor)
+        # Collectives like all_gather register their input buffer as the handle
+        # and only assemble the real output here. `Executor.aexecute` marked
+        # requires_grad on the handle, so carry it over; otherwise the consuming
+        # segment sees a non-differentiable input and its backward returns no
+        # gradient for it.
+        if torch.is_tensor(result) and tensor.requires_grad and not result.requires_grad \
+                and result.dtype in _ALLOW_GRAD_DTYPES:
+            result.requires_grad_()
+        return result
 
     def submit(self, tensor: torch.Tensor, works: List[Work], callback: Optional[Callable] = None):
         """
@@ -90,12 +102,7 @@ class _AsyncCommHandler:
 
             if not all(work.is_completed() for work in tensor_or_works):
                 continue
-
-            for work in tensor_or_works:
-                work.wait()
-
-            callback = self._callbacks.pop(tensor)
-            self._works[tensor] = tensor if callback is None else callback(tensor)
+            self._works[tensor] = self._finish(tensor, tensor_or_works)
 
     def check_clear(self):
         assert len(self._works) == 0 and len(self._callbacks) == 0 and len(self._send_holds) == 0, \
@@ -181,6 +188,7 @@ class Executor:
         """
         execute adapter
         """
+        input_tensors = Executor.sync_tensors(input_tensors)
         if not requires_grad:
             with torch.no_grad():
                 outputs = subgraph(*input_tensors)
