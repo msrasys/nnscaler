@@ -107,6 +107,7 @@ class CompileFlag:
     # (call these FBW schedules).
     # this flag controls whether to use FBW schedules or FB schedules.
     # Default is False (FB schedules).
+    # This flag is not necessary when you explicitly use FBW-aware schedulers(e.g. zero_bubble)
     use_fbw = _to_bool('USE_FBW')
 
 
