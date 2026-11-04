@@ -99,8 +99,6 @@ class ScheduleCodeGen(FuncEmission):
             "Expected all forward operators have been grouped into IRSegment"
         self._validate_events(device_nodes)
 
-        lifetime = LifeCycle(device_nodes, [], self.execplan.outputs())
-
         args = ['model'] + [self.tensor_name(t) for t in self.execplan.graph.inputs()]
 
         getitem_info = self._collect_getitem_info()
@@ -132,6 +130,13 @@ class ScheduleCodeGen(FuncEmission):
                                 micro_batch_id, (out_name, out.tid)
                             )
                             break
+
+        # Metadata lookups replayed by the emitter also consume their sample
+        # (or the dataloader for random access). They must participate in the
+        # lifetime analysis before any earlier del statements are emitted.
+        sample_uses = self._collect_sample_uses(
+            device_nodes, getitem_info, dataloader_var, sample_reads_by_mid)
+        lifetime = LifeCycle(device_nodes, [], self.execplan.outputs(), extra_inputs=sample_uses)
 
         last_stream = None
         buffered_codes = []
@@ -603,10 +608,31 @@ class ScheduleCodeGen(FuncEmission):
                 info[output_tid] = _SampleAccess(source_tid, tuple(reversed(path)))
         return info
 
+    def _collect_sample_uses(self, nodes, getitem_info, dataloader_var, sample_reads_by_mid):
+        objects = IR.get_objects(self.execplan.graph.inputs())
+        for node in nodes:
+            objects += IR.get_objects((node.inputs(), node.outputs()))
+        by_name = {self.tensor_name(obj): obj for obj in objects}
+        produced = {obj.tid for obj in IR.get_objects(self.execplan.graph.inputs())}
+        state = {'sample_reads_by_mid': sample_reads_by_mid, 'fallback_vars_by_mid': {}}
+        uses = {}
+        for node in nodes:
+            if not node.isfw():
+                continue
+            original = node.cell if isinstance(node, ExeReuseCell) else node
+            mid = node.micro_batch_id if isinstance(node, ExeReuseCell) else None
+            sources = []
+            self._gen_nontensor_getitem_codes(
+                node.inputs(), produced, getitem_info, dataloader_var, state, mid,
+                original_inputs=original.inputs(), source_uses=sources)
+            uses[node] = [by_name[name] for name in dict.fromkeys(sources) if name in by_name]
+            produced.update(obj.tid for obj in IR.get_objects(node.outputs()))
+        return uses
+
     def _gen_nontensor_getitem_codes(
         self, node_inputs, produced_tids, getitem_info,
         dataloader_var=None, fallback_state=None, micro_batch_id=None,
-        original_inputs=None,
+        original_inputs=None, source_uses=None,
     ):
         """Replay missing metadata accesses against this microbatch's sample.
 
@@ -647,9 +673,13 @@ class ScheduleCodeGen(FuncEmission):
                         codes.append(
                             f'{source_var} = {dataloader_var}.get_micro_batch({micro_batch_id})'
                         )
+                        if source_uses is not None:
+                            source_uses.append(dataloader_var)
             if source_var is None:
                 continue
 
+            if source_uses is not None:
+                source_uses.append(source_var)
             expression = source_var
             for function, args in access.lookups:
                 expression = f'{function}({expression}, {", ".join(args)})'

@@ -1,7 +1,7 @@
 #  Copyright (c) Microsoft Corporation.
 #  Licensed under the MIT License.
 
-from typing import Iterable, Dict, List, Any
+from typing import Iterable, Dict, List, Any, Optional
 import itertools
 
 from nnscaler.ir.cten import IRCell, IRTensor, IRObject
@@ -14,10 +14,12 @@ from nnscaler.codegen.emit import FuncEmission
 
 class LifeCycle:
 
-    def __init__(self, nodes: List[IRCell], graph_inputs: List[Any], graph_outputs: List[Any]):
+    def __init__(self, nodes: List[IRCell], graph_inputs: List[Any], graph_outputs: List[Any],
+                 *, extra_inputs: Optional[Dict[IRCell, List[IRObject]]] = None):
 
         graph_inputs = IRSegment.get_objects_from_complex(graph_inputs)
         graph_outputs = IRSegment.get_objects_from_complex(graph_outputs)
+        extra_inputs = extra_inputs or {}
         terminal = {tensor.parent for tensor in graph_outputs if isinstance(tensor, IRSubTensor)}
         func_emission = FuncEmission()
 
@@ -86,7 +88,7 @@ class LifeCycle:
 
             # "fast-forward" all inputs to the current statement, namely after 'i'-th node.
             self.lifetime.update((tin, i) for tin in IRSegment.get_objects_from_complex(
-                (list(inputs), node.kwargs)) if is_activation(tin))
+                (list(inputs), node.kwargs, extra_inputs.get(node, ()))) if is_activation(tin))
 
             for tout in IRSegment.get_objects_from_complex(node.outputs()):
                 if isinstance(tout, IRSubTensor):
