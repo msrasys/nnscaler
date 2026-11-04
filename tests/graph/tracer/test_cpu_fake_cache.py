@@ -5,6 +5,7 @@ import torch
 
 from nnscaler.graph.tracer.trace_strategy import CpuStrategy, ReuseCacheStrategy
 from nnscaler import register_op
+from nnscaler.flags import CompileFlag
 
 
 _fake_calls = []
@@ -124,3 +125,60 @@ def test_clear_cache_releases_fake_outputs():
     assert ref() is not None
     strategy.clear_cache()
     assert ref() is None
+
+
+def test_disable_fake_cache_keeps_regular_cache(monkeypatch):
+    monkeypatch.setattr(CompileFlag, 'cache_cpu_fake_outputs', False)
+    strategy = ReuseCacheStrategy(None)
+    # Execute ordinary calls on CPU so this test does not require CUDA.
+    monkeypatch.setattr(strategy, '_run_cuda_and_offload',
+                        lambda runner, target, args, kwargs: runner(target, args, kwargs, device='cpu'))
+    x = torch.ones(8)
+    first, _, _ = strategy.run_cpu_fake(torch.zeros_like, (x,), {}, cacheable=True)
+    second, _, _ = strategy.run_cpu_fake(torch.zeros_like, (x,), {}, cacheable=True)
+    assert first is not second and not strategy.fake_cache
+    regular, _, _ = strategy.run_call_function(torch.neg, (x,), {})
+    repeated, _, _ = strategy.run_call_function(torch.neg, (x,), {})
+    assert repeated is regular and len(strategy.cache) == 1
+
+
+def test_cache_statistics_deduplicate_views_and_both_caches(caplog):
+    strategy = ReuseCacheStrategy(None)
+    result, _, _ = strategy.run_cpu_fake(torch.zeros_like, (torch.ones(8),), {}, cacheable=True)
+    size = result.untyped_storage().nbytes()
+    assert strategy.cache_memory_stats() == {'regular': 0, 'cpu_fake': size, 'total': size}
+    # These are multiple references/views of the SAME allocation, including
+    # a fake result subsequently retained as an ordinary operation's input.
+    strategy.cache['regular'] = (result[:2], (result,), {'view': result[2:]})
+    assert strategy.cache_memory_stats() == {'regular': size, 'cpu_fake': size, 'total': size}
+    extra = torch.zeros(3)
+    strategy.cache['extra'] = (extra, (), {})
+    assert strategy.cache_size == size + extra.untyped_storage().nbytes()
+    with caplog.at_level('INFO'):
+        strategy.clear_cache()
+    assert 'cpu_fake=' in caplog.text and 'total(unique)=' in caplog.text
+    assert strategy.cache_memory_stats() == {'regular': 0, 'cpu_fake': 0, 'total': 0}
+
+
+def test_cache_statistics_follow_resize_and_invalidation():
+    strategy = ReuseCacheStrategy(None)
+    x = torch.ones(4)
+    first, _, _ = strategy.run_cpu_fake(torch.zeros_like, (x,), {}, cacheable=True)
+    first.resize_(32)
+    assert strategy.cache_size == first.untyped_storage().nbytes()
+    second, _, _ = strategy.run_cpu_fake(torch.zeros_like, (x,), {}, cacheable=True)
+    assert second is not first and second.shape == x.shape
+    assert strategy.cache_size == second.untyped_storage().nbytes()
+
+
+@pytest.mark.parametrize('method', [False, True])
+def test_regular_cache_statistics_include_nested_tensors(monkeypatch, method):
+    strategy = ReuseCacheStrategy(None)
+    monkeypatch.setattr(strategy, '_run_cuda_and_offload',
+                        lambda runner, target, args, kwargs: runner(target, args, kwargs, device='cpu'))
+    x = torch.ones(8)
+    if method:
+        output, _, _ = strategy.run_call_method('clone', (x,), {})
+    else:
+        output, _, _ = strategy.run_call_function(torch.neg, (x,), {})
+    assert strategy.cache_size == x.untyped_storage().nbytes() + output.untyped_storage().nbytes()

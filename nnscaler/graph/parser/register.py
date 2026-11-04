@@ -214,6 +214,8 @@ def register_op(annotation: Union[str, Callable], name: Optional[str] = None,
             Only outputs are reused; every call retains its current input values.
             This inherits reuse_cache's value/alias approximations: do not opt
             in for mutation-sensitive or data-dependent tracing consumers.
+            Set NNSCALER_CACHE_CPU_FAKE_OUTPUTS=0 before importing NNScaler to
+            disable this reuse without disabling the ordinary-op cache.
             Other strategies continue executing the fake normally.
 
     Returns:

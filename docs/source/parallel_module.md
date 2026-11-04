@@ -653,3 +653,7 @@ Pure CPU tracing substitutes can enable `fake_fn_cacheable=True` alongside
 `fake_fn_on_cpu=True` in `register_op`. Under `reuse_cache`, this reuses fake
 outputs while retaining each call's current inputs. See the `register_op`
 docstring for the metadata-only, side-effect-free contract; the default is off.
+Set `NNSCALER_CACHE_CPU_FAKE_OUTPUTS=0` before launch to disable only fake-output
+reuse. Shared placeholders must not be modified in place; copy-on-write is not
+implemented. Trace-end logs report regular/fake cache tensor storage and their
+deduplicated total, excluding Python objects, autograd state and allocator RSS.
