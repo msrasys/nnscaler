@@ -802,10 +802,10 @@ def _pp_detach_aux_outputs(
         # `fn` first lets the detach follow the layout this stage's other consumers
         # of the source already need; only without such a layout does 'auto'
         # infer the detach partition from its input, keeping the memory region.
-        # Note if the input is value partitioned,
-        # the detach node will introduce an all-reduce communication.
-        # But as it is the output of segments and value partitioning can't go through segments
-        # all-reduce will be inserted anyway, so it is not a real problem.
+        # Note if the input is value partitioned, the replicated detach consumes
+        # the full value inside this stage, so the expander keeps the segment
+        # output un-narrowed and an all-reduce is inserted anyway; the detach
+        # adds no extra communication.
         op_plans[detach] = OpPlan(
             detach, stage_id=stage_id, partition='auto',
             recompute_id=plan.recompute_id, offload_id=plan.offload_id,
