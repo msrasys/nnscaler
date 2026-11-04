@@ -1339,6 +1339,10 @@ class IRSegmentExpander:
         This function traces through such pass-through nodes to find the actual compute
         consumption patterns.
 
+        Consumed sub-tensors always carry valmap (0, 1): an operator consumes the full value
+        of its region, and value partitions only arise on producer outputs. Partitions are
+        therefore identified by indmap alone here, unlike _try_narrow_segment_ptensors.
+
         Args:
             segment: the consuming segment
             ftensor: the full tensor consumed by the segment
@@ -1406,7 +1410,16 @@ class IRSegmentExpander:
     def _try_narrow_segment_ptensors(self, ftensor: IRFullTensor) -> Optional[Dict[int,IRSubTensor]]:
         """Check if a segment's production of a full tensor can be narrowed to per-device partitions.
 
-        Similar to _try_narrow_segment_ctensors but for producers (used for backward segment outputs).
+        Counterpart of _try_narrow_segment_ctensors for the segment outputs; the backward
+        segment IO is derived from the grads of the result in get_per_device_inout.
+
+        A partition is identified by indmap and valmap together. Producers split along a
+        reduction dim yield full-shape partial sums that differ only in valmap; they are
+        legitimate per-device partitions (the adapter reduces them while routing to the
+        consumers), so they are narrowed like index partitions. Users of the per-device
+        outputs must therefore tell partitions apart by indmap and valmap, never by shape
+        alone (see ExeReuseCell.dispatch). Per-device inputs never carry a value partition
+        because forward consumers always consume the full value.
         """
         assert self._segment.isfw(), "Only support forward segment"
 
@@ -1435,11 +1448,13 @@ class IRSegmentExpander:
 
         dev_unique: Dict[int, IRSubTensor] = {}
         for dev, pts in dev_partitions.items():
-            unique_indmaps = set(pt.indmap for pt in pts)
-            if len(unique_indmaps) != 1:
+            if len(set((pt.indmap, pt.valmap) for pt in pts)) != 1:
                 return None
             dev_unique[dev] = pts[0]
 
+        # IRSubTensor.overlap requires both indmap and valmap to overlap, so
+        # partial sums of the same region with disjoint valmaps count as
+        # distinct, non-overlapping partitions here.
         partitions = list(dev_unique.values())
         for i, t1 in enumerate(partitions):
             for t2 in partitions[i+1:]:
@@ -1452,10 +1467,12 @@ class IRSegmentExpander:
         # the production would remove the full value from the segment, leaving
         # the internal consumer with an undefined input. Only narrow when every
         # internal consumer is satisfied by the partition produced on its device.
+        # Compare valmap as well: a consumer of the full value is not satisfied by
+        # a partial sum even though both span the same region.
         for ct in self._segment.ctensors(ftensor):
             for devid in ct.device:
-                produced = dev_unique[devid]
-                if ct.indmap != produced.indmap:
+                produced = dev_unique.get(devid)
+                if produced is None or ct.indmap != produced.indmap or ct.valmap != produced.valmap:
                     return None
 
         return dev_unique

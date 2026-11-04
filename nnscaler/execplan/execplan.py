@@ -64,33 +64,35 @@ class ExeReuseCell(IRCell):
                 continue
             outputs.append(t)
 
-        # inputs and outputs of dispatched cell should be aligned with inputs/outputs,
+        # inputs and outputs of dispatched cell should be aligned with inputs/outputs:
+        # IRSegmentExpander._fw_get_per_device_inout emits per-device IO in the
+        # declared IO order, so the positional zip below is sound.
         dispatch_cell = self._cell.dispatch(devid)
-        expanded_inputs = []
         assert len(inputs) == len(dispatch_cell.inputs()), \
             f"inputs length mismatch: {dispatch_cell}\ninputs: {inputs}\ndispatch_cell.inputs(): {dispatch_cell.inputs()}"
         assert len(outputs) == len(dispatch_cell.outputs()), \
             f"outputs length mismatch: {dispatch_cell}\noutputs: {outputs}\ndispatch_cell.outputs(): {dispatch_cell.outputs()}"
 
-        for t, cell_t in zip(inputs, dispatch_cell.inputs()):
-            if isinstance(t, IRSubTensor) and t.shape != cell_t.shape:
-                assert isinstance(cell_t, IRSubTensor), f"Expected IRSubTensor, got {type(cell_t)}"
-                new_t = t.parent.select(cell_t.indmap, cell_t.valmap)
-                if t.grad is not None:
-                    assert isinstance(cell_t.grad, IRSubTensor), f"Expected IRSubTensor, got {type(cell_t.grad)}"
-                    new_t.grad = t.grad.parent.select(cell_t.grad.indmap, cell_t.grad.valmap)
-                t = new_t
-            expanded_inputs.append(t)
-        expanded_outputs = []
-        for t, cell_t in zip(outputs, dispatch_cell.outputs()):
-            if isinstance(t, IRSubTensor) and t.shape != cell_t.shape:
-                assert isinstance(cell_t, IRSubTensor), f"Expected IRSubTensor, got {type(cell_t)}"
-                new_t = t.parent.select(cell_t.indmap, cell_t.valmap)
-                if t.grad is not None:
-                    assert isinstance(cell_t.grad, IRSubTensor), f"Expected IRSubTensor, got {type(cell_t.grad)}"
-                    new_t.grad = t.grad.parent.select(cell_t.grad.indmap, cell_t.grad.valmap)
-                t = new_t
-            expanded_outputs.append(t)
+        # The dispatched cell may narrow a tensor to the partition held by this
+        # device, and the adapters around it are generated against that narrowed
+        # tensor. Compare indmap and valmap rather than shape: a value partition
+        # (the partial sum of a reduction-dim split) keeps the full shape, so a
+        # shape check would keep the full tensor here and the generated code
+        # would hand the adapter a variable that is never assigned.
+        def narrow(t, cell_t):
+            if not isinstance(t, IRSubTensor):
+                return t
+            assert isinstance(cell_t, IRSubTensor), f"Expected IRSubTensor, got {type(cell_t)}"
+            if t.indmap == cell_t.indmap and t.valmap == cell_t.valmap:
+                return t
+            new_t = t.parent.select(cell_t.indmap, cell_t.valmap)
+            if t.grad is not None:
+                assert isinstance(cell_t.grad, IRSubTensor), f"Expected IRSubTensor, got {type(cell_t.grad)}"
+                new_t.grad = t.grad.parent.select(cell_t.grad.indmap, cell_t.grad.valmap)
+            return new_t
+
+        expanded_inputs = [narrow(t, cell_t) for t, cell_t in zip(inputs, dispatch_cell.inputs())]
+        expanded_outputs = [narrow(t, cell_t) for t, cell_t in zip(outputs, dispatch_cell.outputs())]
 
         reuse = ExeReuseCell(dispatch_cell, expanded_inputs, expanded_outputs)
         reuse._id = self._id
