@@ -1175,7 +1175,9 @@ class SharedPrefixLookupModule(torch.nn.Module):
         x2 = x1 + self.w2
         x3 = x2 + self.w3
 
-        return torch.sum(x3 * scale * bias)
+        # the prefix is also consumed directly by a lookup living in the last stage
+        tag = meta.get('tag', 1)
+        return torch.sum(x3 * scale * bias * tag)
 
 
 @replace_all_device_with('cpu')
@@ -1184,7 +1186,7 @@ def test_shared_prefix_lookups(tmp_path):
     m.train()
     parallelize(
         m,
-        {'data': {'data': torch.randn(4, 4), 'meta': {'scale': 2, 'bias': 1}}},
+        {'data': {'data': torch.randn(4, 4), 'meta': {'scale': 2, 'bias': 1, 'tag': 3}}},
         pas_policy=_shared_output_partition_policy,
         compute_config= ComputeConfig(
             2, 4,
@@ -1199,10 +1201,11 @@ def test_shared_prefix_lookups(tmp_path):
         load_module=False,
         reuse='override',
     )
-    # the shared prefix is copied once into stage 1, and both lookups that reuse
-    # it are emitted after it
+    # the shared prefix is copied exactly once into stage 1, shared by the two sunk
+    # lookups and by the lookup that already lives there, and all three are
+    # emitted after it
     assert len(_gencode_contains(tmp_path, SharedPrefixLookupModule, 1, r"_operator.getitem\(data_\d+, 'meta'\)")) == 1
-    for key, default in (('scale', 1), ('bias', 0)):
+    for key, default in (('scale', 1), ('bias', 0), ('tag', 1)):
         assert _gencode_contains(
             tmp_path, SharedPrefixLookupModule, 1,
             rf"(getitem_[\d_]+) = _operator.getitem\(data_\d+, 'meta'\)[\s\S]*?builtins.dict.get\(\1, '{key}', {default}\)"
