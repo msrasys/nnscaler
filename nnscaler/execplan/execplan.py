@@ -270,21 +270,37 @@ class ExecutionPlan:
         self._use_multi_streams = False
         self._cuda_sync_required = False
 
+        # Placement is fixed while constructing the execution plan. Reused
+        # microbatch cells share a segment whose device property scans all of
+        # its operations; collect it once instead of once per microbatch/rank.
+        placements = {}
+
+        def devices(node):
+            cell = node.cell if isinstance(node, ExeReuseCell) else node
+            if cell not in placements:
+                placements[cell] = tuple(cell.device)
+            return placements[cell]
+
         for node in self._topo_seqs:
-            assert len(node.device) > 0, f"Node device not set: {node}"
-            for device in node.device:
+            node_devices = devices(node)
+            assert node_devices, f"Node device not set: {node}"
+            for device in node_devices:
                 self._seq.setdefault(device, []).append(node)
 
         def cached_dispatch(node: IRCell, devid: int,
                             dispatched: Dict[IRCell, IRCell]) -> IRCell:
             """Cached dispatch"""
             if node.isfw() or isinstance(node, IRWeightReducer):
-                return dispatched.setdefault(node, node.dispatch(devid))
+                if node not in dispatched:
+                    dispatched[node] = node.dispatch(devid)
+                return dispatched[node]
             fnode = node.mirror
             assert isinstance(fnode, IRCell), "Expected forward node as mirror"
             assert fnode.isfw()
             # return dispatched[fnode].mirror
-            return dispatched.setdefault(fnode, fnode.dispatch(devid)).mirror
+            if fnode not in dispatched:
+                dispatched[fnode] = fnode.dispatch(devid)
+            return dispatched[fnode].mirror
 
         # dispatch for a node that is executed on multiple devices
         for devid, nodes in self._seq.items():
@@ -292,7 +308,7 @@ class ExecutionPlan:
             for idx in range(len(nodes)):
                 node = nodes[idx]
                 # print(f'handling {node}')
-                if len(node.device) == 1:
+                if len(devices(node)) == 1:
                     # Single-device segments still need dispatch when their
                     # per-device IO has been narrowed by IRSegmentExpander.
                     # Without dispatch, the ExeReuseCell keeps the original

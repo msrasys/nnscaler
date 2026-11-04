@@ -7,6 +7,8 @@ from typing import TYPE_CHECKING, Any, Tuple, Dict, Callable, Type
 import torch
 from torch.fx.node import Target
 
+from nnscaler.flags import CompileFlag
+
 from . import pytree_utils, metadata
 
 if TYPE_CHECKING:
@@ -71,7 +73,7 @@ class BaseTraceStrategy:
         return module
 
     @staticmethod
-    def _place_tensors_to(*args, device: str) -> Tuple[Any]:
+    def _place_tensors_to(*args, device: str, _tensor_memo=None) -> Tuple[Any]:
         # In most cases, device placement operation keeps the source tensor's `requires_grad` attributes.
         # The context `torch.no_grad` enforces requires_grad=False for all tensors that generated in its scope.
         # As a result, behavior of device placement operation is unexpected.
@@ -81,7 +83,7 @@ class BaseTraceStrategy:
         # A result may be an input (identity/in-place ops), and arguments may
         # repeat a tensor. Preserve that identity and transfer each object once.
         # Distinct views remain distinct; sharing a storage alone is not enough.
-        moved = {}
+        moved = {} if _tensor_memo is None else _tensor_memo
 
         def place(tensor):
             key = id(tensor)
@@ -176,6 +178,9 @@ class BaseTraceStrategy:
         """
         return self._run_target(kind, target, args, kwargs)
 
+    def run_cpu_fake(self, target, args, kwargs, *, cacheable=False):
+        return self._run_call_function_on(target, args, kwargs, device='cpu')
+
     def clear_cache(self) -> None:
         """Release execution-only state after each trace, including failures."""
         pass
@@ -228,20 +233,46 @@ class CudaRunCpuOffloadStrategy(BaseTraceStrategy):
     def __init__(self, tracer: 'ConcreteTracer'):
         super().__init__(tracer, 'cpu')
 
+    def _run_cuda_and_offload(self, runner, target, args, kwargs):
+        """Reuse unchanged CPU inputs instead of copying them back from CUDA.
+
+        Only this call's input transfers can be reused. Version counters on
+        both sides detect in-place changes; gradient flags may change without
+        incrementing a version. Inference tensors have no version counter and
+        therefore keep the ordinary copy-back path.
+        """
+        moved = {}
+        args_cuda, kwargs_cuda = self._place_tensors_to(
+            args, kwargs, device='cuda', _tensor_memo=moved)
+        originals = {}
+        for tensor in pytree_utils.tree_leaves((args, kwargs)):
+            if not isinstance(tensor, torch.Tensor) or tensor.device.type != 'cpu':
+                continue
+            copied = moved[id(tensor)]
+            if not torch.is_inference(tensor) and not torch.is_inference(copied):
+                originals[id(copied)] = (tensor, copied, tensor._version, copied._version)
+        result, args_cuda, kwargs_cuda = runner(target, args_cuda, kwargs_cuda, device='cuda')
+        unchanged = {
+            key: original for key, (original, copied, original_version, copied_version) in originals.items()
+            if original._version == original_version and copied._version == copied_version
+            and original.requires_grad == copied.requires_grad
+            and type(original) is type(copied) and original.is_leaf == copied.is_leaf
+            and original.layout == copied.layout == torch.strided
+            and original.stride() == copied.stride()
+            and original.storage_offset() == copied.storage_offset()
+        }
+        return self._place_tensors_to(result, args_cuda, kwargs_cuda, device='cpu', _tensor_memo=unchanged)
+
     def run_call_function(self, target: Target, args: Tuple[Any], kwargs: Dict[str, Any]) -> Tuple[Any, Tuple, Dict]:
         try:
-            result, args_cuda, kwargs_cuda = self._run_call_function_on(target, args, kwargs, device='cuda')
-            result, args_cpu, kwargs_cpu = self._place_tensors_to(result, args_cuda, kwargs_cuda, device='cpu')
-            return result, args_cpu, kwargs_cpu
+            return self._run_cuda_and_offload(self._run_call_function_on, target, args, kwargs)
         except torch.cuda.OutOfMemoryError as e:
             _logger.info(f'tracing {target} on cuda failed, try to trace on cpu, error message is: {str(e)}')
             return self._run_call_function_on(target, args, kwargs, 'cpu')
 
     def run_call_method(self, target: Target, args: Tuple[Any], kwargs: Dict[str, Any]) -> Tuple[Any, Tuple, Dict]:
         try:
-            result, args_cuda, kwargs_cuda = self._run_call_method_on(target, args, kwargs, device='cuda')
-            result, args_cpu, kwargs_cpu = self._place_tensors_to(result, args_cuda, kwargs_cuda, device='cpu')
-            return result, args_cpu, kwargs_cpu
+            return self._run_cuda_and_offload(self._run_call_method_on, target, args, kwargs)
         except torch.cuda.OutOfMemoryError as e:
             _logger.info(f'tracing {target} on cuda failed, try to trace on cpu, error message is: {str(e)}')
             return self._run_call_method_on(target, args, kwargs, device='cpu')
@@ -280,15 +311,94 @@ class ReuseCacheStrategy(CudaRunCpuOffloadStrategy):
     def __init__(self, tracer: 'ConcreteTracer') -> None:
         super().__init__(tracer)
         self.cache: Dict[str, Any] = {}
-        self.cache_size = 0
+        self.fake_cache = {}
+        self.cache_cpu_fake_outputs = CompileFlag.cache_cpu_fake_outputs
 
         # some ops don't use gpu, so directly run them on cpu and don't cache them
         # TODO: add functions to optimize the cache memory cost.
         self.force_cpu_ops = []
 
     def clear_cache(self) -> None:
-        self.cache.clear()
-        self.cache_size = 0
+        try:
+            if (self.cache or self.fake_cache) and _logger.isEnabledFor(logging.INFO):
+                sizes = self.cache_memory_stats()
+                _logger.info(
+                    'Tracing cache tensor storage at trace end: regular=%.3f GiB, cpu_fake=%.3f GiB, '
+                    'total(unique)=%.3f GiB',
+                    sizes['regular'] / 2**30, sizes['cpu_fake'] / 2**30, sizes['total'] / 2**30)
+        finally:
+            self.cache.clear()
+            self.fake_cache.clear()
+
+    @staticmethod
+    def _cached_storage_sizes(values):
+        sizes = {}
+        for tensor in pytree_utils.tree_leaves(values):
+            if (not isinstance(tensor, torch.Tensor) or tensor.layout != torch.strided
+                    or tensor.device.type == 'meta'):
+                continue
+            storage = tensor.untyped_storage()
+            sizes[(storage.device, storage.data_ptr())] = storage.nbytes()
+        return sizes
+
+    def cache_memory_stats(self):
+        """Dense tensor storage bytes, not RSS; total deduplicates both caches.
+
+        Read current storages on demand so views, resizing and invalidation
+        stay accurate without extra work on cache hits or retained owners.
+        """
+        regular = self._cached_storage_sizes(tuple(self.cache.values()))
+        fake = self._cached_storage_sizes(tuple(value[0] for value in self.fake_cache.values()))
+        return {'regular': sum(regular.values()), 'cpu_fake': sum(fake.values()),
+                'total': sum((regular | fake).values())}
+
+    @property
+    def cache_size(self):
+        return self.cache_memory_stats()['total']
+
+    @staticmethod
+    def _fake_output_state(result):
+        # A fake result can be consumed by an in-place operation later in the
+        # trace. Never serve a mutated value/metadata from the cache. Inference
+        # tensors have no version counters, so keep their uncached behavior.
+        if isinstance(result, tuple):
+            children = tuple(ReuseCacheStrategy._fake_output_state(v) for v in result)
+            return children if all(v is not None for v in children) else None
+        if (not isinstance(result, torch.Tensor) or torch.is_inference(result)
+                or result.layout != torch.strided):
+            return None
+        return (result._version, result.requires_grad, result.dtype,
+                tuple(result.shape), tuple(result.stride()), result.storage_offset())
+
+    def run_cpu_fake(self, target, args, kwargs, *, cacheable=False):
+        if (not cacheable or not self.cache_cpu_fake_outputs
+                or torch.is_inference_mode_enabled()):
+            return super().run_cpu_fake(target, args, kwargs)
+        # Shared placeholders require non-mutating consumers. Version checks
+        # invalidate future hits; they cannot undo changes to earlier aliases.
+        # TODO: give each trace node its own logical output and implement
+        # copy-on-write before mutations, including views and their aliases.
+        args, kwargs = self._place_tensors_to(args, kwargs, device='cpu')
+        # TensorMetadata omits offsets, which metadata-only fakes may inspect.
+        offsets = tuple(t.storage_offset() for t in pytree_utils.tree_leaves((args, kwargs))
+                        if isinstance(t, torch.Tensor))
+        key = (self.hash_input('cpu_fake', target, args, kwargs), offsets)
+        entry = self.fake_cache.get(key)
+        if entry is not None:
+            result, state = entry
+            if self._fake_output_state(result) == state:
+                return result, args, kwargs
+            del self.fake_cache[key]
+        result = target(*args, **kwargs)
+        state = self._fake_output_state(result)
+        inputs = {t.untyped_storage().data_ptr() for t in pytree_utils.tree_leaves((args, kwargs))
+                  if isinstance(t, torch.Tensor)}
+        outputs = [t for t in pytree_utils.tree_leaves(result) if isinstance(t, torch.Tensor)]
+        if state is not None and not any(t.untyped_storage().data_ptr() in inputs for t in outputs):
+            # Saving the old arguments here would replace the next layer's
+            # parameters with an earlier layer's values during proxy updates.
+            self.fake_cache[key] = (result, state)
+        return result, args, kwargs
 
     def force_cpu_run(self, kind, target):
         if kind == 'call_function':
@@ -309,10 +419,6 @@ class ReuseCacheStrategy(CudaRunCpuOffloadStrategy):
         # should improve the implementation of the hash_input if we can find a better way to category the inputs that can reuse the output.
         return str((kind, target, args, kwargs, torch.is_grad_enabled()))
 
-    @staticmethod
-    def count_tensor_memory_cost(t: torch.Tensor):
-        return t.dtype.itemsize * t.numel()
-
     def run_call_function(self, target: Target, args: Tuple[Any], kwargs: Dict[str, Any]) -> Tuple[Any, Tuple, Dict]:
         if self.force_cpu_run('call_function', target):
             return self._run_call_function_on(target, args, kwargs, device='cpu')
@@ -323,8 +429,8 @@ class ReuseCacheStrategy(CudaRunCpuOffloadStrategy):
         else:
             result = super().run_call_function(target, args, kwargs)
             self.cache[input_hash] = result
-            self.cache_size += sum([self.count_tensor_memory_cost(t) for t in pytree_utils.tree_flatten(result)[0] if isinstance(t, torch.Tensor)])
-            _logger.debug(f'cache [{input_hash}], current total cache size is: {self.cache_size / 1024 / 1024 / 1024} GB')
+            if _logger.isEnabledFor(logging.DEBUG):
+                _logger.debug('cache [%s], total tensor storage: %.3f GiB', input_hash, self.cache_size / 2**30)
             return result
 
     def run_call_method(self, target: Target, args: Tuple[Any], kwargs: Dict[str, Any]) -> Tuple[Any, Tuple, Dict]:
@@ -337,8 +443,8 @@ class ReuseCacheStrategy(CudaRunCpuOffloadStrategy):
         else:
             result = super().run_call_method(target, args, kwargs)
             self.cache[input_hash] = result
-            self.cache_size += sum([self.count_tensor_memory_cost(t) for t in pytree_utils.tree_flatten(result) if isinstance(t, torch.Tensor)])
-            _logger.debug(f'cache [{input_hash}], current total cache size is: {self.cache_size / 1024 / 1024 / 1024} GB')
+            if _logger.isEnabledFor(logging.DEBUG):
+                _logger.debug('cache [%s], total tensor storage: %.3f GiB', input_hash, self.cache_size / 2**30)
             return result
 
 

@@ -157,7 +157,8 @@ class Trainer:
 
         # When resuming from checkpoint, skip loading the full init weights
         # (fullmodel.pt) since they will be overridden by the checkpoint.
-        # Only non-persistent buffers will be loaded from the small npbuffer.pt file.
+        # Non-persistent buffers still load from the generated attribute index
+        # (or an old npbuffer.pt sidecar); checkpoint parameters are not overwritten.
         is_resuming = self.train_args.checkpoint.get_resume_checkpoint() is not None
         init_params = not is_resuming
         # Trainer owns a CUDA model (see self.model.cuda() below). On resume,

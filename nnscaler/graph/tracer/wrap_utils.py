@@ -68,6 +68,7 @@ class LeafWrapInfo:
     replacement: Union[None, Callable, Type] = None
     replace_traced_code: bool = True
     fake_fn_on_cpu: bool = False
+    fake_fn_cacheable: bool = False
 
 
 default_autowrap_leaf_function: Dict[Any, LeafWrapInfo] = {

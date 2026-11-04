@@ -708,6 +708,7 @@ class IRGraph(IRSegment):
             seq = seq[:ofst] + bnodes + seq[ofst:]
         # update sequence
         self._nodes = seq
+        self._rebuild_node_lookup()
 
     def depends(self, pre_node: IRCell, succ_node: IRCell) -> bool:
         """Check direct data dependency between two nodes.

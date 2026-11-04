@@ -579,7 +579,7 @@ class BroadcastGenFilesStrategy(Enum):
     1. config file: compute config (compute_config.pt)
     2. trace files: graph dump (graph.ckp), forward args dump(forward_args.pkl),
        origin module metadata (origin_module_metadata.pt), init weights file(fullmodel.pt.*),
-       non-persistent buffer file (npbuffer.pt),
+       legacy non-persistent buffer file (npbuffer.pt), if present,
        param name mapping (dist_param_map.pt)
     3. code: generated code files (gencode*.py)
 
@@ -595,10 +595,10 @@ class BroadcastGenFilesStrategy(Enum):
     # please note the init weight files can be huge.
     ALL = 'all'
 
-    # broadcast all new generated files except init weights (fullmodel.pt.*, npbuffer.pt).
+    # broadcast all new generated files except init weights (fullmodel.pt.*, legacy npbuffer.pt).
     # Without weights,
     # you can only construct parallel modules that have no non-persistent buffers with `init_params=False`.
-    # Non-persistent buffers (npbuffer.pt) are also excluded because they are
+    # Non-persistent buffers (including legacy npbuffer.pt) are also excluded because they are
     # part of the model weights. You can then
     # 1. Load the weights from a checkpoint file with `module.load_state_dict` or `load_merged_state_dict`
     # 2. Or you can use `broadcast_weights` to get the weights from the workers in node0.
@@ -741,13 +741,18 @@ def _prepare_and_check_reusable(
         # check if the module is already generated
         expected_output_files = [outdir / _GENCODE_FILE_TEMPLATE.format(rank) for rank in range(compute_config.runtime_ngpus)]
         expected_output_files.extend(trace_meta_files)
-        if (outdir / FxModuleParser.ATTR_CONTENT_INDEX_FILE).exists():
-            expected_output_files.append(outdir / FxModuleParser.ATTR_CONTENT_INDEX_FILE)
+        attr_index = outdir / FxModuleParser.ATTR_CONTENT_INDEX_FILE
+        legacy_buffers = outdir / FxModuleParser.NON_PERSISTENT_BUFFER_FILE
+        # New packages use the attribute index for buffers too. Old packages
+        # can instead carry a standalone buffer sidecar, with or without an index.
+        if attr_index.exists() or not legacy_buffers.exists():
+            expected_output_files.append(attr_index)
         expected_output_files.append(config_file)
         expected_output_files.append(outdir / _GRAPH_DUMP_FILE)
         expected_output_files.append(outdir / _FORWARD_ARGS_DUMP_FILE)
         expected_output_files.append(outdir / ParallelModule.ORIGIN_MODULE_METADATA_FILE)
-        expected_output_files.append(outdir / FxModuleParser.NON_PERSISTENT_BUFFER_FILE)
+        if legacy_buffers.exists():
+            expected_output_files.append(legacy_buffers)
         # A resume-only staged package can omit initial weights, which would
         # be overwritten by the checkpoint. All code, configuration, mapping,
         # graph metadata, and non-persistent buffers are still mandatory.
@@ -976,11 +981,16 @@ def _gencode(
                 autoset_requires_grad=autoset_requires_grad,
             )
 
-        graph.dump(graph_ckp)
-        torch.save(forward_args, forward_args_ckp)
-
+        # Attribute serialization is complete and the IR carries metadata,
+        # not live weights. The context-manager alias otherwise retains the
+        # entire temporary model throughout partitioning and rank codegen,
+        # even after deleting `module` below.
+        del wrapped_module
         if is_module_class:
             del module
+
+        graph.dump(graph_ckp)
+        torch.save(forward_args, forward_args_ckp)
     else:
         ret = RegenStatus.CODE
         logger.info(f"Reuse graph dump in {outdir}")

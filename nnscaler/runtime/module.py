@@ -517,13 +517,24 @@ class CubeModule(torch.nn.Module):
     def get_full_map(self):
         return self._fullmap
 
-    def load_attr_content(self, filename: str):
+    def load_attr_content(self, filename: str, *, non_persistent_only: bool = False):
         """Load module attribute (parameters and buffers) from file
 
         Args:
             filename (str): base file name (without '.0', '.1', etc.)
                 that saved with model parameters
+            non_persistent_only (bool): restore only buffers omitted from
+                checkpoints, without reading or overwriting initial parameters.
         """
+        fullmap = self._fullmap
+        if non_persistent_only:
+            missing = self._non_persistent_buffers_set.difference(fullmap)
+            if missing:
+                raise RuntimeError(f'non-persistent buffers not found in fullmap: {sorted(missing)}')
+            fullmap = {name: meta for name, meta in fullmap.items()
+                       if name in self._non_persistent_buffers_set}
+            if not fullmap:
+                return
         index_filename = filename + '.index'
         has_index = os.path.isfile(index_filename)
         tid_to_chunk = None
@@ -547,7 +558,7 @@ class CubeModule(torch.nn.Module):
                 raise RuntimeError(f'Missing attribute content chunks for {filename}')
 
         with torch.no_grad():
-            required_tids = {meta.tid for meta in self._fullmap.values()}
+            required_tids = {meta.tid for meta in fullmap.values()}
             missing_tids = required_tids.difference(tid_to_chunk) if has_index else set()
             if missing_tids:
                 raise RuntimeError(
@@ -555,21 +566,24 @@ class CubeModule(torch.nn.Module):
                 )
             chunk_to_attrs = defaultdict(list)
             if has_index:
-                for attr_name, meta in self._fullmap.items():
+                for attr_name, meta in fullmap.items():
                     chunk_to_attrs[tid_to_chunk[meta.tid]].append((attr_name, meta))
             else:
-                chunk_to_attrs = {idx: list(self._fullmap.items()) for idx in range(npartitions)}
+                chunk_to_attrs = {idx: list(fullmap.items()) for idx in range(npartitions)}
 
             # Only trusted, locally generated attribute chunks use the subclass-
             # compatible unpickler. The separate integer index stays weights-only.
             load_options = {'weights_only': False}
+            if non_persistent_only:
+                load_options['map_location'] = 'cpu'
             if TorchVersion(torch.__version__) >= (2, 1):
                 # TP/PP ranks only page in the slices of a full tensor they own.
                 load_options['mmap'] = True
             loaded_tids = set()
 
+            content_kind = 'non-persistent buffers' if non_persistent_only else 'partitioned model'
             _logger.info(
-                f'loading partitioned model from {filename}, '
+                f'loading {content_kind} from {index_filename if has_index else filename}, '
                 f'number of model parameter chunks: {npartitions}, chunks required by this rank: {len(chunk_to_attrs)}'
             )
             for file_idx, attrs in sorted(chunk_to_attrs.items()):
@@ -599,7 +613,7 @@ class CubeModule(torch.nn.Module):
                                    f'{sorted(required_tids.difference(loaded_tids))}')
 
     def load_np_buffer_content(self, filename: str):
-        """Load non-persistent buffer content from file.
+        """Load a legacy non-persistent buffer sidecar.
 
         Only loads attributes that are non-persistent buffers
         (i.e., in self._non_persistent_buffers_set).
@@ -615,20 +629,43 @@ class CubeModule(torch.nn.Module):
         load_options = {'map_location': 'cpu'}
         if TorchVersion(torch.__version__) >= (2, 1):
             load_options['mmap'] = True
-        np_buffer_model: Dict[int, torch.Tensor] = torch.load(filename, **load_options)
+        np_buffer_model = torch.load(filename, **load_options)
+        # Read compatibility for earlier indexed sidecars. New packages use
+        # fullmodel.pt.index directly and never write npbuffer.pt.
+        index_key = '__nnscaler_npbuffer_index__'
+        indexed = index_key in np_buffer_model
+        if indexed:
+            if np_buffer_model[index_key] != 1 or not isinstance(np_buffer_model.get('files'), dict):
+                raise RuntimeError(f'Unsupported non-persistent buffer index in {filename}')
+            files = np_buffer_model['files']
+        groups = defaultdict(list)
+        for attr_name in self._non_persistent_buffers_set:
+            if attr_name not in self._fullmap:
+                raise RuntimeError(f'non-persistent buffer {attr_name} not found in fullmap.')
+            meta = self._fullmap[attr_name]
+            if indexed:
+                source = files.get(meta.tid)
+                if not isinstance(source, str) or not source or Path(source).name != source:
+                    raise RuntimeError(f'Invalid or missing attribute shard for buffer {attr_name} in {filename}')
+                groups[source].append(attr_name)
+            else:
+                groups[None].append(attr_name)
         with torch.no_grad():
             _logger.info(f'loading non-persistent buffers from {filename}')
-            for attr_name in self._non_persistent_buffers_set:
-                if attr_name not in self._fullmap:
-                    raise RuntimeError(f'non-persistent buffer {attr_name} not found in fullmap.')
-                meta = self._fullmap[attr_name]
-                if meta.tid not in np_buffer_model:
-                    raise RuntimeError(f'non-persistent buffer {attr_name} (tid={meta.tid}) not found in {filename}.')
-                attr = getattr(self, attr_name)
-                content = np_buffer_model[meta.tid][meta.slicers]
-                if meta.val_chunks != 1:
-                    content = content / meta.val_chunks
-                attr.copy_(content)
+            for source, names in groups.items():
+                contents = (torch.load(Path(filename).with_name(source), **load_options)
+                            if indexed else np_buffer_model)
+                for attr_name in names:
+                    meta = self._fullmap[attr_name]
+                    if meta.tid not in contents:
+                        raise RuntimeError(f'non-persistent buffer {attr_name} (tid={meta.tid}) not found in {filename}.')
+                    attr = getattr(self, attr_name)
+                    content = contents[meta.tid][meta.slicers]
+                    if meta.val_chunks != 1:
+                        content = content / meta.val_chunks
+                    attr.copy_(content)
+                # Bound resident CPU storage on older Torch without mmap too.
+                del contents, content
 
     def init_group(self, ranks: List[int]):
         """Legacy gencode entry; batch its singleton declarations on first use."""
@@ -1546,12 +1583,17 @@ class ParallelModule(CubeModule):
         if init_params:
             self.load_attr_content(str(module_file.with_name(f"{FxModuleParser.ATTR_CONTENT_FILE_STEM}")))
         elif self._non_persistent_buffers_set:
-            # When init_params=False, only load non-persistent buffers from the small npbuffer.pt file.
-            # This avoids loading the large fullmodel.pt files when resuming from checkpoint,
-            # since checkpoint will provide the rest of the parameters/buffers.
+            # Checkpoints omit these buffers. Keep old sidecars readable;
+            # new packages restore only buffer slices through the shared index.
             np_buffer_file = module_file.with_name(FxModuleParser.NON_PERSISTENT_BUFFER_FILE)
             if np_buffer_file.is_file():
                 self.load_np_buffer_content(str(np_buffer_file))
+                self._non_presistent_buffers_inited = True
+            elif module_file.with_name(FxModuleParser.ATTR_CONTENT_INDEX_FILE).is_file():
+                self.load_attr_content(
+                    str(module_file.with_name(FxModuleParser.ATTR_CONTENT_FILE_STEM)),
+                    non_persistent_only=True,
+                )
                 self._non_presistent_buffers_inited = True
 
         self._warn_uninitialized_non_persistent_buffers()
