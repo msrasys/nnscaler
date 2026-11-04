@@ -74,6 +74,33 @@ def test_cpu_fake_reuses_outputs_without_substituting_layer_weights():
     assert frozen is not first and len(calls) == 3
 
 
+@pytest.mark.parametrize('location', ['positional', 'nested_positional', 'nested_keyword'])
+def test_cpu_fake_distinguishes_input_storage_offsets(monkeypatch, location):
+    monkeypatch.setattr(CompileFlag, 'cache_cpu_fake_outputs', True)
+    strategy = ReuseCacheStrategy(None)
+    calls = []
+
+    def fake(value):
+        x = value if location == 'positional' else value['views'][0]
+        calls.append(x.storage_offset())
+        return torch.zeros(x.storage_offset() + 1)
+
+    def run(view):
+        value = view if location == 'positional' else {'views': [view]}
+        args, kwargs = ((), {'value': value}) if location == 'nested_keyword' else ((value,), {})
+        return strategy.run_cpu_fake(fake, args, kwargs, cacheable=True)[0]
+
+    base = torch.arange(8.)
+    first, second = run(base[:4]), run(base[1:5])
+    assert first.shape == (1,)
+    assert second.shape == (2,)
+    # Equal metadata should still reuse outputs across distinct allocations.
+    other = torch.full((8,), 42.)
+    assert run(other[:4]) is first
+    assert run(other[1:5]) is second
+    assert calls == [0, 1]
+
+
 @pytest.mark.parametrize('mutation', ['add_', 'requires_grad_', 'transpose_'])
 def test_mutated_fake_outputs_are_not_served_again(mutation):
     strategy = ReuseCacheStrategy(None)

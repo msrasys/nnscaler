@@ -379,7 +379,10 @@ class ReuseCacheStrategy(CudaRunCpuOffloadStrategy):
         # TODO: give each trace node its own logical output and implement
         # copy-on-write before mutations, including views and their aliases.
         args, kwargs = self._place_tensors_to(args, kwargs, device='cpu')
-        key = self.hash_input('cpu_fake', target, args, kwargs)
+        # TensorMetadata omits offsets, which metadata-only fakes may inspect.
+        offsets = tuple(t.storage_offset() for t in pytree_utils.tree_leaves((args, kwargs))
+                        if isinstance(t, torch.Tensor))
+        key = (self.hash_input('cpu_fake', target, args, kwargs), offsets)
         entry = self.fake_cache.get(key)
         if entry is not None:
             result, state = entry
