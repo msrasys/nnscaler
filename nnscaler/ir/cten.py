@@ -1262,6 +1262,10 @@ class IR:
         """
         tensor_index_in_seg_output = None
         for idx, seg_output in enumerate(tensors):
+            # op inputs may hold plain python values (e.g. the key of
+            # `dict.get(obj, 'key', default)`), which have no parent
+            if not isinstance(seg_output, IRObject):
+                continue
             if seg_output.parent == tensor.parent:
                 tensor_index_in_seg_output = idx
                 break
