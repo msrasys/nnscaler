@@ -3,6 +3,7 @@
 
 from contextlib import contextmanager
 from typing import Dict, Union, List, Optional, Set, Tuple, Any, Callable
+from weakref import WeakValueDictionary
 import numpy as np
 import logging
 
@@ -73,6 +74,27 @@ class CellPosition:
         return repr(self.indices)
 
 
+class _NodeLookup:
+    """One lookup per live node list, including lists shared by restored copies."""
+
+    _instances = WeakValueDictionary()
+
+    def __init__(self, nodes: List[IRCell]):
+        self.nodes = nodes
+        self.counts: Optional[Dict[IRCell, int]] = None
+        self.segments: Dict['IRSegment', None] = {}
+
+    @classmethod
+    def for_nodes(cls, nodes):
+        # The owner keeps nodes alive, so its list identity cannot be reused.
+        # Weak values avoid retaining graph nodes after the segments are gone.
+        lookup = cls._instances.get(id(nodes))
+        if lookup is None:
+            lookup = cls(nodes)
+            cls._instances[id(nodes)] = lookup
+        return lookup
+
+
 class IRSegment(IRCell):
     """
     A distributed sub-graph representing a piece of workload in parent IRGraph
@@ -89,9 +111,7 @@ class IRSegment(IRCell):
         self._nodes: List[IRCell] = []
         # Index only direct children. Descendant lookups recurse into their
         # current indexes, so editing a nested segment cannot stale a parent.
-        self._node_counts: Dict[IRCell, int] = {}
-        self._node_segments: Dict[IRSegment, None] = {}
-        self._lookup_nodes = self._nodes
+        self._node_lookup = _NodeLookup.for_nodes(self._nodes)
 
         # full objects
         self._fobjects: Set[IRObject] = set()
@@ -125,9 +145,7 @@ class IRSegment(IRCell):
         # These are derived indexes. Avoid duplicating them in graph dumps,
         # deepcopy, and the payload sent to every code-generation worker.
         state = self.__dict__.copy()
-        state.pop('_node_counts', None)
-        state.pop('_node_segments', None)
-        state.pop('_lookup_nodes', None)
+        state.pop('_node_lookup', None)
         return state
 
     def __copy__(self):
@@ -139,22 +157,21 @@ class IRSegment(IRCell):
         return result
 
     def _rebuild_node_lookup(self):
-        if (getattr(self, '_lookup_nodes', None) is self._nodes
-                and hasattr(self, '_node_counts')):
-            self._node_counts.clear()
-            self._node_segments.clear()
-        else:
-            self._node_counts = {}
-            self._node_segments = {}
-            self._lookup_nodes = self._nodes
+        self._node_lookup = lookup = _NodeLookup.for_nodes(self._nodes)
+        counts, segments = {}, {}
         for node in self._nodes:
-            self._node_counts[node] = self._node_counts.get(node, 0) + 1
+            counts[node] = counts.get(node, 0) + 1
             if isinstance(node, IRSegment):
-                self._node_segments[node] = None
+                segments[node] = None
+        lookup.counts, lookup.segments = counts, segments
 
     def _ensure_node_lookup(self):
-        # Also handles graph dumps produced before the indexes existed.
-        if not hasattr(self, '_node_counts') or self._lookup_nodes is not self._nodes:
+        # Old and new dumps omit derived indexes. Reassociate shared lists
+        # before rebuilding so restored shallow copies cannot diverge.
+        lookup = getattr(self, '_node_lookup', None)
+        if lookup is None or lookup.nodes is not self._nodes:
+            self._node_lookup = lookup = _NodeLookup.for_nodes(self._nodes)
+        if lookup.counts is None:
             self._rebuild_node_lookup()
 
     def set_input(self, idx: int, val: Any):
@@ -579,9 +596,10 @@ class IRSegment(IRCell):
             self._ensure_node_lookup()
             # insert node
             self._nodes.insert(index, node)
-            self._node_counts[node] = self._node_counts.get(node, 0) + 1
+            counts = self._node_lookup.counts
+            counts[node] = counts.get(node, 0) + 1
             if isinstance(node, IRSegment):
-                self._node_segments[node] = None
+                self._node_lookup.segments[node] = None
             if isinstance(node, IRAdapter): return
             # update producer and consumer
             # NOTE: we use `dict.fromkeys` to remove duplicate tensors
@@ -624,12 +642,13 @@ class IRSegment(IRCell):
             self._ensure_node_lookup()
             # remove
             self._nodes.pop(index)
-            count = self._node_counts[node] - 1
+            counts = self._node_lookup.counts
+            count = counts[node] - 1
             if count:
-                self._node_counts[node] = count
+                counts[node] = count
             else:
-                del self._node_counts[node]
-                self._node_segments.pop(node, None)
+                del counts[node]
+                self._node_lookup.segments.pop(node, None)
             # update producer and consumer
             if isinstance(node, IRAdapter): return pos
             # consumer
@@ -713,10 +732,10 @@ class IRSegment(IRCell):
         @return exsit bool: True if exist otherwise False
         """
         self._ensure_node_lookup()
-        if node in self._node_counts:
+        if node in self._node_lookup.counts:
             return True
         if flatten:
-            for segment in self._node_segments:
+            for segment in self._node_lookup.segments:
                 if segment.exist(node, flatten):
                     return True
         return False

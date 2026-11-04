@@ -117,6 +117,32 @@ def test_aliases_and_inference_results_remain_uncached():
     assert not strategy.fake_cache
 
 
+@pytest.mark.parametrize('tuple_output', [False, True])
+def test_inference_mode_bypasses_a_warm_no_grad_cache(monkeypatch, tuple_output):
+    monkeypatch.setattr(CompileFlag, 'cache_cpu_fake_outputs', True)
+    strategy = ReuseCacheStrategy(None)
+    x, calls = torch.ones(8), []
+
+    def fake(value):
+        calls.append(1)
+        result = torch.zeros_like(value)
+        return (result, torch.zeros_like(value)) if tuple_output else result
+
+    with torch.no_grad():
+        cached, _, _ = strategy.run_cpu_fake(fake, (x,), {}, cacheable=True)
+    with torch.inference_mode():
+        for _ in range(2):
+            result, _, _ = strategy.run_cpu_fake(fake, (x,), {}, cacheable=True)
+            outputs = result if tuple_output else (result,)
+            assert all(torch.is_inference(value) for value in outputs)
+            with pytest.raises(RuntimeError, match='version counter'):
+                _ = outputs[0]._version
+    with torch.no_grad():
+        reused, _, _ = strategy.run_cpu_fake(fake, (x,), {}, cacheable=True)
+    assert reused is cached
+    assert len(calls) == 3  # Inference calls bypass, but do not evict, the normal cache.
+
+
 def test_clear_cache_releases_fake_outputs():
     strategy = ReuseCacheStrategy(None)
     result, _, _ = strategy.run_cpu_fake(torch.zeros_like, (torch.ones(8),), {}, cacheable=True)

@@ -371,7 +371,8 @@ class ReuseCacheStrategy(CudaRunCpuOffloadStrategy):
                 tuple(result.shape), tuple(result.stride()), result.storage_offset())
 
     def run_cpu_fake(self, target, args, kwargs, *, cacheable=False):
-        if not cacheable or not self.cache_cpu_fake_outputs:
+        if (not cacheable or not self.cache_cpu_fake_outputs
+                or torch.is_inference_mode_enabled()):
             return super().run_cpu_fake(target, args, kwargs)
         # Shared placeholders require non-mutating consumers. Version checks
         # invalidate future hits; they cannot undo changes to earlier aliases.
