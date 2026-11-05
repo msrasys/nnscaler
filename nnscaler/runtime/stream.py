@@ -31,15 +31,17 @@ def drain_stream_holds(*, wait=False):
 
 @contextmanager
 def input_stream_lifetime(inputs, enabled):
-    """Protect resolved inputs, including tensors inside runtime containers.
+    """Protect inputs and yield opaque owners that a later backward may need.
 
     Builtin containers are traversed once by identity, including cycles. Custom
     owners may implement ``record_stream(stream)``; otherwise keep the owner
-    until an event after the call completes. Do not inspect arbitrary Python
-    attributes or consume iterators. Stream ordering remains the scheduler's job.
+    until an event after the call completes. A caller retaining dependencies for
+    backward must carry the yielded owners through its final backward call too.
+    Do not inspect arbitrary Python attributes or consume iterators. Stream
+    ordering remains the scheduler's job.
     """
     if not enabled or not torch.cuda.is_initialized():
-        yield
+        yield ()
         return
 
     drain_stream_holds()
@@ -71,7 +73,7 @@ def input_stream_lifetime(inputs, enabled):
                     # Includes custom containers/namedtuples, dataclasses and
                     # extension objects whose tensor ownership is opaque.
                     opaque.append(value)
-        yield
+        yield opaque
     finally:
         if opaque:
             event = torch.cuda.Event()

@@ -39,7 +39,7 @@ def _all_to_all_destinations(ranks, dsts):
     return dsts
 
 
-def _async_result(tensor, work, callback):
+def _async_result(tensor, work, callback, *, callback_inputs=()):
     # A producer may also feed a local branch. Only the result gets a pending
     # identity; a view retains input storage and its grad edge without a copy.
     result = tensor.view_as(tensor)
@@ -47,7 +47,11 @@ def _async_result(tensor, work, callback):
     def complete(_):
         # AsyncCommHandler keys work by id. Keep this exact Tensor alive until
         # completion even if its caller drops the result, preventing id reuse.
-        return callback(result)
+        # These receive buffers may only be reachable through the callback;
+        # they must survive the CUDA assembly work queued by that callback.
+        from nnscaler.runtime.stream import input_stream_lifetime
+        with input_stream_lifetime(callback_inputs, True):
+            return callback(result)
 
     AsyncCommHandler().submit(result, [work], complete)
     return result
@@ -188,7 +192,7 @@ def all_gather(tensor: torch.Tensor, dim: int,
         return torch.concat(tuple(tensor_list[index] for index in gather_order), dim=dim)
 
     if work:
-        otensor = _async_result(tensor, work, concat_gathered)
+        otensor = _async_result(tensor, work, concat_gathered, callback_inputs=tensor_list)
     else:
         otensor = concat_gathered(tensor)
     if not async_op:
@@ -260,7 +264,7 @@ def all_to_all(tensor: torch.Tensor, idim: int, odim: int,
     otensors = [otensors[group_ranks.index(rank)] for rank in ranks]
     if work:
         all2all_callback = lambda t: torch.concat(tuple(otensors), dim=idim)
-        otensor = _async_result(tensor, work, all2all_callback)
+        otensor = _async_result(tensor, work, all2all_callback, callback_inputs=otensors)
     else:
         otensor = torch.concat(tuple(otensors), dim=idim)
     if not async_op:
@@ -294,7 +298,7 @@ def all_to_all_single(tensor: torch.Tensor, idim: int, odim: int,
     if work:
         # Keep the pending result distinct from the producer, without copying
         # its payload. wait(otensor) assembles the real output from received.
-        otensor = _async_result(tensor, work, all2all_callback)
+        otensor = _async_result(tensor, work, all2all_callback, callback_inputs=(received,))
     else:
         otensor = all2all_callback(tensor)
 
@@ -425,7 +429,10 @@ def rdgather(itensor: torch.Tensor, shape: Tuple[int], dtype: torch.dtype,
                         tensor, group=group, group_src=group_src)
 
         if async_op:
-            rdgather_callback = lambda t: torch.cat(tuple(recv_tensors), dim=dim)
+            def rdgather_callback(_):
+                from nnscaler.runtime.stream import input_stream_lifetime
+                with input_stream_lifetime(recv_tensors, True):
+                    return torch.cat(tuple(recv_tensors), dim=dim)
             otensor = recv_tensors[0]
             AsyncCommHandler().submit(otensor, works, rdgather_callback)
         else:

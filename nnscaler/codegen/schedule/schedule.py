@@ -714,7 +714,8 @@ class ScheduleCodeGen(FuncEmission):
             self, hook, hook_meta,
             inputs_str: str,
             is_pre: bool,
-            outputs_str: str = None
+            outputs_str: str = None,
+            track_stream: bool = False,
         ) -> List[str]:
         """Generate hook call code for a segment.
 
@@ -732,9 +733,16 @@ class ScheduleCodeGen(FuncEmission):
         fsig = f'{module_path}.{hook.__name__}'
         kwargs = '{}' # always pass empty kwargs for now, can be extended in the future if needed
         if is_pre:
-            return [f'{fsig}(model, {repr(hook_meta)}, {inputs_str}, {kwargs})']
+            code = f'{fsig}(model, {repr(hook_meta)}, {inputs_str}, {kwargs})'
         else:
-            return [f'{fsig}(model, {repr(hook_meta)}, {inputs_str}, {kwargs}, {outputs_str})']
+            code = f'{fsig}(model, {repr(hook_meta)}, {inputs_str}, {kwargs}, {outputs_str})'
+        if track_stream:
+            # Hooks enqueue CUDA work too, after/before the executor's own
+            # lifetime scope. Include opaque inputs and returned containers.
+            owners = inputs_str if is_pre else f'({inputs_str}, {outputs_str})'
+            return [f'with nnscaler.runtime.stream.input_stream_lifetime({owners}, True):',
+                    '    ' + code]
+        return [code]
 
     def emit_detach(self, tensor: IRTensor) -> str:
         """
@@ -774,7 +782,8 @@ class ScheduleCodeGen(FuncEmission):
             if node.isfw():
                 codes = []
                 if pre_hook:
-                    codes += self._emit_segment_hook_code(pre_hook, hook_meta, inputs, is_pre=True)
+                    codes += self._emit_segment_hook_code(
+                        pre_hook, hook_meta, inputs, is_pre=True, track_stream=track_stream)
                 codes += [fsign.format(
                     outputs = outputs,
                     name = f"'{name}'",
@@ -786,7 +795,8 @@ class ScheduleCodeGen(FuncEmission):
                 if post_hook:
                     codes = codes + self._emit_segment_hook_code(
                         post_hook, hook_meta, inputs, is_pre=False,
-                        outputs_str=outputs if len(node_outputs) <= 1 else f'({outputs})'
+                        outputs_str=outputs if len(node_outputs) <= 1 else f'({outputs})',
+                        track_stream=track_stream,
                     )
             else:
                 # get gradient computation arguments
@@ -839,9 +849,12 @@ class ScheduleCodeGen(FuncEmission):
                 bwd_input_str = f'({input_tensors_str}, {output_tensors_str}, {output_grads_str})'
                 bwd_output_str = input_grads_str if len(input_grads) <= 1 else f'({input_grads_str})'
                 if pre_hook:
-                    codes = self._emit_segment_hook_code(pre_hook, hook_meta, bwd_input_str, is_pre=True) + codes
+                    codes = self._emit_segment_hook_code(
+                        pre_hook, hook_meta, bwd_input_str, is_pre=True, track_stream=track_stream) + codes
                 if post_hook:
-                    codes = codes + self._emit_segment_hook_code(post_hook, hook_meta, bwd_input_str, is_pre=False, outputs_str=bwd_output_str)
+                    codes += self._emit_segment_hook_code(
+                        post_hook, hook_meta, bwd_input_str, is_pre=False,
+                        outputs_str=bwd_output_str, track_stream=track_stream)
 
                 """
                 In the end2end mode, although the graph's output may contain tensors that requires grad,

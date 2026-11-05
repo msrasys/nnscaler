@@ -247,7 +247,8 @@ def test_async_replacement_is_recorded_on_the_actual_consumer(monkeypatch, adapt
             output = Executor.fexecute('replacement', function, placeholder,
                                        requires_grad=False, track_stream=True)
     consumer.synchronize()
-    assert calls == [(replacement.data_ptr(), consumer.cuda_stream)]
+    assert calls == [(placeholder.data_ptr(), consumer.cuda_stream),
+                     (replacement.data_ptr(), consumer.cuda_stream)]
     torch.testing.assert_close(output, torch.full_like(output, 3))
 
 
