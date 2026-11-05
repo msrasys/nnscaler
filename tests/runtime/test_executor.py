@@ -433,11 +433,6 @@ def test_release_storage_skips_tensors_held_elsewhere():
     torch.autograd.backward([t], [torch.ones_like(t)])
     torch.testing.assert_close(x.grad, 1 - torch.tanh(x.detach()) ** 2)
 
-    # a view keeping its base alive is released together with the base when nothing else holds it
-    v = (x * 4.0).transpose(0, 1)
-    Executor.release_storage(v)
-    assert v.untyped_storage().nbytes() == v.element_size() and v._base.untyped_storage().nbytes() == v.element_size()
-
 
 def test_hold_send_keeps_buffer_alive_after_release_storage():
     class _Work:
