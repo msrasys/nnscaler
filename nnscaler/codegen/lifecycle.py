@@ -1,7 +1,7 @@
 #  Copyright (c) Microsoft Corporation.
 #  Licensed under the MIT License.
 
-from typing import Iterable, Dict, List, Any, Optional
+from typing import Iterable, Dict, List, Any, Optional, Sequence
 import itertools
 
 from nnscaler.ir.cten import IRCell, IRTensor, IRObject
@@ -15,7 +15,7 @@ from nnscaler.codegen.emit import FuncEmission
 class LifeCycle:
 
     def __init__(self, nodes: List[IRCell], graph_inputs: List[Any], graph_outputs: List[Any],
-                 *, extra_inputs: Optional[Dict[IRCell, List[IRObject]]] = None):
+                 *, extra_inputs: Optional[Dict[IRCell, Sequence[IRObject]]] = None):
 
         graph_inputs = IRSegment.get_objects_from_complex(graph_inputs)
         graph_outputs = IRSegment.get_objects_from_complex(graph_outputs)

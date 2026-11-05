@@ -13,10 +13,13 @@ from torch.utils.checkpoint import checkpoint
 
 import nnscaler
 from nnscaler.codegen.lifecycle import LifeCycle
-from nnscaler.codegen.schedule.schedule import ScheduleCodeGen, _SampleAccess
+from nnscaler.codegen.schedule.schedule import ScheduleCodeGen
+from nnscaler.graph import IRGraph
+from nnscaler.graph.function.pyfunc import IRPyFunc
 from nnscaler.graph.segment import IRSegment
 from nnscaler.graph.schedule.schedplan import StreamContext
 from nnscaler.ir.cten import IRObject
+from nnscaler.ir.operator import IRDataOperation
 from nnscaler.ir.tensor import IRFullTensor
 from nnscaler.runtime.executor import AsyncCommHandler, Executor
 from nnscaler.runtime import stream as lifetime
@@ -77,13 +80,18 @@ def test_stream_tracking_consumes_replayed_metadata_after_it_is_defined():
     import operator
 
     sample, metadata = IRObject('sample'), IRObject('metadata')
+    loader = IRObject('dataloader')
     output = IRFullTensor((1,), name='output', dtype=torch.float32).tosub()
     node = IRSegment([], [sample, metadata], [output])
     emitter = ScheduleCodeGen.__new__(ScheduleCodeGen)
-    emitter.execplan = SimpleNamespace(use_multi_streams=True)
+    lookup = IRPyFunc('_operator.getitem', [sample, 'meta'], [metadata])
+    emitter.execplan = SimpleNamespace(
+        use_multi_streams=True,
+        graph=IRGraph([IRDataOperation(loader, (sample,)), lookup], [sample], [], 'stream_metadata'),
+    )
+    planned = emitter._plan_sample_reads([node])[node]
     code = emitter.emit_node(
-        node, produced_tids={sample.tid},
-        getitem_info={metadata.tid: _SampleAccess(sample.tid, (('_operator.getitem', ("'meta'",)),))},
+        node, produced_tids={sample.tid}, sample_reads=planned,
     )
     observed = []
 

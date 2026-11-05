@@ -40,6 +40,13 @@ class _SampleAccess(NamedTuple):
     lookups: Tuple[Tuple[str, Tuple[str, ...]], ...]
 
 
+class _SampleReadPlan(NamedTuple):
+    """One node's replay prefix and the exact objects it reads and defines."""
+    codes: Tuple[str, ...]
+    inputs: Tuple[IRObject, ...]
+    outputs: Tuple[IRObject, ...]
+
+
 class ScheduleCodeGen(FuncEmission):
 
     def __init__(
@@ -101,42 +108,11 @@ class ScheduleCodeGen(FuncEmission):
 
         args = ['model'] + [self.tensor_name(t) for t in self.execplan.graph.inputs()]
 
-        getitem_info = self._collect_getitem_info()
-
-        dataloader_var = None
-        for t in self.execplan.graph.inputs():
-            name = self.tensor_name(t)
-            if name.startswith('dataloader_'):
-                dataloader_var = name
-                break
-
-        # Segment inputs can include non-tensor sample objects whose producing
-        # getitem op lives outside the local VPP schedule. Track the sample
-        # object produced by each micro-batch dataloader read so fallbacks can
-        # reuse it after it exists, or use random access without advancing the
-        # dataloader cursor.
-        sample_reads_by_mid = {}
-        for node in device_nodes:
-            unwrap = node.cell if isinstance(node, ExeReuseCell) else node
-            if isinstance(unwrap, IRDataOperation):
-                micro_batch_id = node.micro_batch_id if isinstance(node, ExeReuseCell) else None
-                if micro_batch_id is None:
-                    continue
-                for out in node.outputs():
-                    if isinstance(out, IRObject):
-                        out_name = self.tensor_name(out)
-                        if not isinstance(out, IRTensor):
-                            sample_reads_by_mid.setdefault(
-                                micro_batch_id, (out_name, out.tid)
-                            )
-                            break
-
-        # Metadata lookups replayed by the emitter also consume their sample
-        # (or the dataloader for random access). They must participate in the
-        # lifetime analysis before any earlier del statements are emitted.
-        sample_uses = self._collect_sample_uses(
-            device_nodes, getitem_info, dataloader_var, sample_reads_by_mid)
-        lifetime = LifeCycle(device_nodes, [], self.execplan.outputs(), extra_inputs=sample_uses)
+        # Plan replay once. Lifetime analysis and both emitted schedules consume
+        # the same dependencies/code, including synthetic random-access samples.
+        sample_reads = self._plan_sample_reads(device_nodes)
+        lifetime = LifeCycle(device_nodes, [], self.execplan.outputs(),
+                             extra_inputs={node: plan.inputs for node, plan in sample_reads.items()})
 
         last_stream = None
         buffered_codes = []
@@ -238,10 +214,6 @@ class ScheduleCodeGen(FuncEmission):
                     if isinstance(inp, IRObject):
                         produced_tids.add(inp.tid)
 
-                fallback_state = {
-                    'sample_reads_by_mid': sample_reads_by_mid,
-                    'fallback_vars_by_mid': {},
-                }
                 pending_async_recvs = {}
                 for line, node in enumerate(device_nodes):
                     unwrap_node = node.cell if isinstance(node, ExeReuseCell) else node
@@ -268,9 +240,7 @@ class ScheduleCodeGen(FuncEmission):
                     codes = self.emit_node(
                         node,
                         produced_tids=produced_tids,
-                        getitem_info=getitem_info,
-                        dataloader_var=dataloader_var,
-                        fallback_state=fallback_state,
+                        sample_reads=sample_reads.get(node),
                     )
                     _append_code(fb, codes, self._get_node_stream(node))
                     self._track_async_recv(node, pending_async_recvs)
@@ -310,10 +280,6 @@ class ScheduleCodeGen(FuncEmission):
                 for inp in IRSegment.get_objects_from_complex(self.execplan.graph.inputs()):
                     if isinstance(inp, IRObject):
                         infer_produced_tids.add(inp.tid)
-                infer_fallback_state = {
-                    'sample_reads_by_mid': sample_reads_by_mid,
-                    'fallback_vars_by_mid': {},
-                }
                 infer_pending_async_recvs = {}
                 for line, node in enumerate(device_nodes):
                     if not node.isfw(): continue  # skip backward segments and adapters
@@ -330,9 +296,7 @@ class ScheduleCodeGen(FuncEmission):
                         node,
                         force_no_grad=True,
                         produced_tids=infer_produced_tids,
-                        getitem_info=getitem_info,
-                        dataloader_var=dataloader_var,
-                        fallback_state=infer_fallback_state,
+                        sample_reads=sample_reads.get(node),
                     )
                     _append_code(fb, codes, self._get_node_stream(node))
                     self._track_async_recv(node, infer_pending_async_recvs)
@@ -608,84 +572,69 @@ class ScheduleCodeGen(FuncEmission):
                 info[output_tid] = _SampleAccess(source_tid, tuple(reversed(path)))
         return info
 
-    def _collect_sample_uses(self, nodes, getitem_info, dataloader_var, sample_reads_by_mid):
-        objects = IR.get_objects(self.execplan.graph.inputs())
+    def _plan_sample_reads(self, nodes) -> Dict[IRCell, _SampleReadPlan]:
+        """Resolve metadata replay before emission, retaining object dependencies.
+
+        Prefer an available input, then this microbatch's scheduled sample, and
+        finally random access. The latter must not advance the dataloader cursor.
+        Training and inference share these forward-only replay decisions.
+        """
+        accesses = self._collect_getitem_info()
+        graph_inputs = IR.get_objects(self.execplan.graph.inputs())
+        dataloader = next((obj for obj in graph_inputs
+                           if self.tensor_name(obj).startswith('dataloader_')), None)
+        scheduled_samples = {}
         for node in nodes:
-            objects += IR.get_objects((node.inputs(), node.outputs()))
-        by_name = {self.tensor_name(obj): obj for obj in objects}
-        produced = {obj.tid for obj in IR.get_objects(self.execplan.graph.inputs())}
-        state = {'sample_reads_by_mid': sample_reads_by_mid, 'fallback_vars_by_mid': {}}
-        uses = {}
+            if isinstance(node, ExeReuseCell) and isinstance(node.cell, IRDataOperation):
+                sample = next((obj for obj in node.outputs()
+                               if isinstance(obj, IRObject) and not isinstance(obj, IRTensor)), None)
+                if sample is not None and node.micro_batch_id is not None:
+                    scheduled_samples.setdefault(node.micro_batch_id, sample)
+
+        produced = {obj.tid for obj in graph_inputs}
+        fallback_samples, plans = {}, {}
         for node in nodes:
             if not node.isfw():
                 continue
-            original = node.cell if isinstance(node, ExeReuseCell) else node
+            original = self._unwrap_node(node)
             mid = node.micro_batch_id if isinstance(node, ExeReuseCell) else None
-            sources = []
-            self._gen_nontensor_getitem_codes(
-                node.inputs(), produced, getitem_info, dataloader_var, state, mid,
-                original_inputs=original.inputs(), source_uses=sources)
-            uses[node] = [by_name[name] for name in dict.fromkeys(sources) if name in by_name]
+            pairs = list(zip(original.inputs(), node.inputs()))
+            available = {old.tid: actual for old, actual in pairs
+                         if isinstance(old, IRObject) and isinstance(actual, IRObject)
+                         and actual.tid in produced}
+            codes, inputs, outputs = [], [], []
+            for old, obj in pairs:
+                if not isinstance(obj, IRObject) or isinstance(obj, IRTensor) or obj.tid in produced:
+                    continue
+                access = accesses.get(old.tid)
+                if access is None:
+                    continue
+                source = available.get(access.sample_tid)
+                if source is None and dataloader is not None and mid is not None:
+                    sample = scheduled_samples.get(mid)
+                    if sample is not None and sample.tid in produced:
+                        source = sample
+                    else:
+                        source = fallback_samples.get(mid)
+                        if source is None:
+                            source = fallback_samples[mid] = IRObject(f'_samples_{mid}')
+                            codes.append(f'{self.tensor_name(source)} = '
+                                         f'{self.tensor_name(dataloader)}.get_micro_batch({mid})')
+                            inputs.append(dataloader)
+                            outputs.append(source)
+                if source is None:
+                    continue
+                inputs.append(source)
+                expression = self.tensor_name(source)
+                for function, args in access.lookups:
+                    expression = f'{function}({expression}, {", ".join(args)})'
+                codes.append(f'{self.tensor_name(obj)} = {expression}')
+                outputs.append(obj)
+                produced.add(obj.tid)
+            if codes:
+                plans[node] = _SampleReadPlan(tuple(codes), tuple(dict.fromkeys(inputs)), tuple(outputs))
             produced.update(obj.tid for obj in IR.get_objects(node.outputs()))
-        return uses
-
-    def _gen_nontensor_getitem_codes(
-        self, node_inputs, produced_tids, getitem_info,
-        dataloader_var=None, fallback_state=None, micro_batch_id=None,
-        original_inputs=None, source_uses=None,
-    ):
-        """Replay missing metadata accesses against this microbatch's sample.
-
-        ExeReuseCell pairs original inputs with their microbatch instances.
-        Prefer an already-produced input, then a scheduled sample read, and
-        finally random access. Random access must not advance the dataloader.
-        """
-        if produced_tids is None or not getitem_info:
-            return []
-
-        codes = []
-        originals = original_inputs if original_inputs is not None else node_inputs
-        input_pairs = list(zip(originals, node_inputs))
-        available = {
-            original.tid: self.tensor_name(actual)
-            for original, actual in input_pairs
-            if isinstance(original, IRObject) and isinstance(actual, IRObject)
-            and actual.tid in produced_tids
-        }
-        for original, obj in input_pairs:
-            if not isinstance(obj, IRObject) or isinstance(obj, IRTensor) or obj.tid in produced_tids:
-                continue
-            access = getitem_info.get(original.tid)
-            if access is None:
-                continue
-
-            source_var = available.get(access.sample_tid)
-            if (source_var is None and dataloader_var and micro_batch_id is not None
-                    and fallback_state is not None):
-                sample = fallback_state['sample_reads_by_mid'].get(micro_batch_id)
-                if sample is not None and sample[1] in produced_tids:
-                    source_var = sample[0]
-                else:
-                    source_var = fallback_state['fallback_vars_by_mid'].get(micro_batch_id)
-                    if source_var is None:
-                        source_var = f'_samples_{micro_batch_id}'
-                        fallback_state['fallback_vars_by_mid'][micro_batch_id] = source_var
-                        codes.append(
-                            f'{source_var} = {dataloader_var}.get_micro_batch({micro_batch_id})'
-                        )
-                        if source_uses is not None:
-                            source_uses.append(dataloader_var)
-            if source_var is None:
-                continue
-
-            if source_uses is not None:
-                source_uses.append(source_var)
-            expression = source_var
-            for function, args in access.lookups:
-                expression = f'{function}({expression}, {", ".join(args)})'
-            codes.append(f'{self.tensor_name(obj)} = {expression}')
-            produced_tids.add(obj.tid)
-        return codes
+        return plans
 
 
     def _find_dead_samples_segments(self, device_nodes) -> set:
@@ -794,8 +743,7 @@ class ScheduleCodeGen(FuncEmission):
         return f'{self.tensor_name(tensor)} = {self.tensor_name(tensor)}.detach()'
 
     def emit_node(self, node: IRCell, force_no_grad: bool = False,
-                  produced_tids: set = None, getitem_info: dict = None,
-                  dataloader_var: str = None, fallback_state: dict = None) -> List[str]:
+                  produced_tids: set = None, sample_reads: Optional[_SampleReadPlan] = None) -> List[str]:
         """
         Emit node / subgraph code
         """
@@ -815,12 +763,9 @@ class ScheduleCodeGen(FuncEmission):
         # replay and any asynchronous communication callbacks.
         track_stream = bool(stream_context and stream_context.stream) or self.execplan.use_multi_streams
         stream_kwarg = ', track_stream=True' if track_stream else ''
-        micro_batch_id = node.micro_batch_id if isinstance(node, ExeReuseCell) else None
-        prefix_codes = self._gen_nontensor_getitem_codes(
-            node_inputs, produced_tids, getitem_info,
-            dataloader_var, fallback_state, micro_batch_id,
-            original_inputs=unwrap_node.inputs(),
-        ) if node.isfw() else []
+        prefix_codes = list(sample_reads.codes) if sample_reads else []
+        if sample_reads and produced_tids is not None:
+            produced_tids.update(obj.tid for obj in sample_reads.outputs)
 
         if isinstance(unwrap_node, IRSegment):
             # segment hooks
