@@ -21,7 +21,7 @@ _logger = logging.getLogger(__name__)
 
 _ALLOW_GRAD_DTYPES = (torch.double, torch.float32, torch.float16, torch.bfloat16)
 # Number of holders of a tensor's TensorImpl. Exposed since torch 2.4.0; on the
-# older versions this package still supports (>=2.0) it is None and
+# older versions it is None and
 # `release_storage` is a no-op, i.e. no storage is freed but nothing breaks.
 _use_count = getattr(torch.Tensor, '_use_count', None)
 
@@ -344,18 +344,8 @@ class Executor:
             )
             return None
 
-        # PyTorch's helper detaches stage outputs in-place. A view cannot be
-        # detached in-place, so use a differentiable clone for that case, except
-        # for a view already emptied by `release_storage`: cloning its stride-0
-        # placeholder would allocate the full buffer again, and the backend skips
-        # the in-place detach for views.
-        stage_outputs = [
-            tensor.clone() if tensor._is_view() and tensor.untyped_storage().nbytes() > tensor.element_size()
-            else tensor
-            for tensor in dedup_output_tensors
-        ]
         grads, param_groups = stage_backward_input(
-            stage_outputs,
+            dedup_output_tensors,
             dedup_output_tensor_grads,
             input_tensors,
             iter(weights),
