@@ -13,6 +13,7 @@ import logging
 from torch.distributed import Work
 
 from ._patch_torch import stage_backward_input, stage_backward_weight
+from .stream import input_stream_lifetime, drain_stream_holds
 
 
 _logger = logging.getLogger(__name__)
@@ -148,8 +149,10 @@ class AsyncCommHandler:
                 work.wait()
             self._works.pop(tid, None)
             self._callbacks.pop(tid, None)
+        drain_stream_holds(wait=True)
 
     def clear(self):
+        drain_stream_holds(wait=True)
         AsyncCommHandler.instance = AsyncCommHandler.__AsyncCommHandler()
 
     def check_clear(self):
@@ -229,7 +232,8 @@ class Executor:
             callback(grad.detach())
 
     @staticmethod
-    def fexecute(name: str, subgraph: Callable, *input_tensors: Tuple[Any], requires_grad=True):
+    def fexecute(name: str, subgraph: Callable, *input_tensors: Tuple[Any],
+                 requires_grad=True, track_stream=False):
         """
         forward the sub-graph.
         """
@@ -237,7 +241,7 @@ class Executor:
         input_tensors = Executor.sync_tensors(input_tensors)
 
         if not requires_grad:
-            with torch.no_grad():
+            with torch.no_grad(), input_stream_lifetime(input_tensors, track_stream):
                 outputs = subgraph(*input_tensors)
             return outputs
 
@@ -254,7 +258,8 @@ class Executor:
         saved_pairs = [(id(itensor), dtensor) for itensor, dtensor in zip(original_inputs, input_dtensors)]
         Executor._detach.setdefault(name, []).append(saved_pairs)
 
-        outputs = subgraph(*input_dtensors)
+        with input_stream_lifetime(input_dtensors, track_stream):
+            outputs = subgraph(*input_dtensors)
         # Autograd/checkpointing own any constants needed by backward. The
         # executor only needs strong references for input gradients/callbacks.
         # Keeping every input here pins frozen reference hidden/KV tensors
@@ -270,16 +275,18 @@ class Executor:
         return outputs
 
     @staticmethod
-    def aexecute(subgraph: Callable, *input_tensors: Tuple[Any], requires_grad=True):
+    def aexecute(subgraph: Callable, *input_tensors: Tuple[Any],
+                 requires_grad=True, track_stream=False):
         """
         execute adapter
         """
         input_tensors = Executor.sync_tensors(input_tensors)
         if not requires_grad:
-            with torch.no_grad():
+            with torch.no_grad(), input_stream_lifetime(input_tensors, track_stream):
                 outputs = subgraph(*input_tensors)
         else:
-            outputs = subgraph(*input_tensors)
+            with input_stream_lifetime(input_tensors, track_stream):
+                outputs = subgraph(*input_tensors)
             if isinstance(outputs, tuple):
                 outputs = (t.requires_grad_() if torch.is_tensor(t) and t.dtype in _ALLOW_GRAD_DTYPES else t for t in outputs)
             elif torch.is_tensor(outputs) and outputs.dtype in _ALLOW_GRAD_DTYPES:
@@ -290,7 +297,7 @@ class Executor:
     def backward(name: str,
                  input_tensors: List[torch.Tensor],
                  output_tensors: List[torch.Tensor],
-                 output_tensor_grads: List[torch.Tensor]) -> Tuple[torch.Tensor]:
+                 output_tensor_grads: List[torch.Tensor], *, track_stream=False) -> Tuple[torch.Tensor]:
         """
         Backward Procedure.
 
@@ -376,10 +383,13 @@ class Executor:
                 backward_roots.append(edge)
 
         try:
-            torch.autograd.backward(
-                backward_roots,
-                grad_tensors=dedup_output_tensor_grads,
-            )
+            with input_stream_lifetime(
+                (input_tensors, dedup_output_tensors, dedup_output_tensor_grads), track_stream,
+            ):
+                torch.autograd.backward(
+                    backward_roots,
+                    grad_tensors=dedup_output_tensor_grads,
+                )
         finally:
             for tensor_id in pseudo_free_output_ids:
                 Executor._pseudo_free_grad_edges.pop(tensor_id, None)
@@ -418,6 +428,7 @@ class Executor:
         output_tensors: List[torch.Tensor],
         output_tensor_grads: List[Optional[torch.Tensor]],
         weights: Iterable[torch.nn.Parameter],
+        *, track_stream=False,
     ) -> Any:
         """Compute input gradients and defer weight gradients.
 
@@ -491,12 +502,15 @@ class Executor:
         # The split helper installs one gradient hook per input. Repeated
         # arguments share a leaf and must not install that hook repeatedly.
         unique_inputs = list({id(tensor): tensor for tensor in input_tensors}.values())
-        unique_grads, param_groups = stage_backward_input(
-            stage_outputs,
-            dedup_output_tensor_grads,
-            unique_inputs,
-            iter(weights),
-        )
+        with input_stream_lifetime(
+            (unique_inputs, dedup_output_tensors, stage_outputs, dedup_output_tensor_grads), track_stream,
+        ):
+            unique_grads, param_groups = stage_backward_input(
+                stage_outputs,
+                dedup_output_tensor_grads,
+                unique_inputs,
+                iter(weights),
+            )
         grad_by_id = {id(tensor): grad for tensor, grad in zip(unique_inputs, unique_grads)}
         grads = tuple(grad_by_id[id(tensor)] for tensor in input_tensors)
         Executor._weight_backward_states.setdefault(name, []).append(
@@ -520,6 +534,7 @@ class Executor:
     def backward_weight(
         name: str,
         weights: Iterable[torch.nn.Parameter],
+        *, track_stream=False,
     ) -> None:
         """Compute weight gradients deferred by ``backward_input``."""
         weights = tuple(weights)
@@ -541,10 +556,13 @@ class Executor:
             # into the reducer's buffer). `inputs=weights` would fire the hooks
             # too, but it is unnecessary here and only `torch.autograd.grad` /
             # manual `weight.grad = dw` would bypass AccumulateGrad.
-            torch.autograd.backward(
-                state.output_tensors,
-                grad_tensors=state.output_tensor_grads,
-            )
+            with input_stream_lifetime(
+                (state.output_tensors, state.output_tensor_grads), track_stream,
+            ):
+                torch.autograd.backward(
+                    state.output_tensors,
+                    grad_tensors=state.output_tensor_grads,
+                )
 
     @staticmethod
     def _accumulate_retained_input_grads(input_tensors, grad_by_input_id):
@@ -673,6 +691,7 @@ class Executor:
     
     @staticmethod
     def clear():
+        drain_stream_holds(wait=True)
         Executor._detach = dict()
         Executor._pseudo_free_grad_edges = dict()
         Executor._pseudo_free_pending_sends = dict()

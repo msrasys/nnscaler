@@ -15,7 +15,8 @@ from nnscaler.ir.tensor import IRFullTensor
 
 
 @pytest.mark.parametrize(('terminal', 'produced'), [(False, False), (True, False), (True, True)])
-def test_only_unseeded_terminal_gradients_use_inline_zeros(terminal, produced):
+@pytest.mark.parametrize('multi_streams', [False, True])
+def test_only_unseeded_terminal_gradients_use_inline_zeros(terminal, produced, multi_streams):
     def tensor(name):
         result = IRFullTensor((2,), name=name, requires_grad=True, dtype=torch.float32).tosub()
         result.grad = result.parent.grad.tosub()
@@ -34,8 +35,9 @@ def test_only_unseeded_terminal_gradients_use_inline_zeros(terminal, produced):
     inline_zero = terminal and not produced
     assert (output.grad in lifetime.lifetime) != inline_zero
     codegen = ScheduleCodeGen.__new__(ScheduleCodeGen)
-    codegen.execplan = SimpleNamespace(outputs=lambda: outputs)
+    codegen.execplan = SimpleNamespace(outputs=lambda: outputs, use_multi_streams=multi_streams)
     code = '\n'.join(codegen.emit_node(backward, produced_tids={obj.tid for obj in inputs}))
     assert ('torch.zeros_like(' in code) == inline_zero
+    assert ('track_stream=True' in code) == multi_streams
     if not inline_zero:
         assert codegen.tensor_name(output.grad) in code

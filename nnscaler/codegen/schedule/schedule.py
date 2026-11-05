@@ -26,11 +26,11 @@ from nnscaler.flags import CompileFlag
 _logger = logging.getLogger(__name__)
 
 
-fsign = '{outputs} = nnscaler.runtime.executor.fexecute({name}, {model}, *{inputs}, requires_grad={req_grad})'
-asign = '{outputs} = nnscaler.runtime.executor.aexecute({model}, *{inputs}, requires_grad={req_grad})'
-bsign = '{input_grads} = nnscaler.runtime.executor.backward({name}, {input_tensors}, {output_tensors}, {output_grads})'
-bi_sign = '{input_grads} = nnscaler.runtime.executor.backward_input({name}, {input_tensors}, {output_tensors}, {output_grads}, {weights})'
-bw_sign = 'nnscaler.runtime.executor.backward_weight({name}, {weights})'
+fsign = '{outputs} = nnscaler.runtime.executor.fexecute({name}, {model}, *{inputs}, requires_grad={req_grad}{stream_kwarg})'
+asign = '{outputs} = nnscaler.runtime.executor.aexecute({model}, *{inputs}, requires_grad={req_grad}{stream_kwarg})'
+bsign = '{input_grads} = nnscaler.runtime.executor.backward({name}, {input_tensors}, {output_tensors}, {output_grads}{stream_kwarg})'
+bi_sign = '{input_grads} = nnscaler.runtime.executor.backward_input({name}, {input_tensors}, {output_tensors}, {output_grads}, {weights}{stream_kwarg})'
+bw_sign = 'nnscaler.runtime.executor.backward_weight({name}, {weights}{stream_kwarg})'
 ssign = '{inputs} = nnscaler.runtime.executor.sync_tensors({inputs})'
 
 
@@ -800,8 +800,6 @@ class ScheduleCodeGen(FuncEmission):
         Emit node / subgraph code
         """
         node_inputs, node_outputs = node.inputs(), node.outputs()
-        # the real inputs in gencode
-        gen_inputs = node_inputs
         req_grad = any(t.requires_grad for t in node.outputs() if isinstance(t, IRTensor))
         req_grad = False if force_no_grad else req_grad
 
@@ -812,6 +810,11 @@ class ScheduleCodeGen(FuncEmission):
         unwrap_node = node.cell if isinstance(node, ExeReuseCell) else node
         name = self.node_name(unwrap_node)
         stream_context = self._get_node_stream_context(node)
+        # A default-stream consumer can also receive data from a named stream.
+        # Record actual resolved inputs inside the executor, after metadata
+        # replay and any asynchronous communication callbacks.
+        track_stream = bool(stream_context and stream_context.stream) or self.execplan.use_multi_streams
+        stream_kwarg = ', track_stream=True' if track_stream else ''
         micro_batch_id = node.micro_batch_id if isinstance(node, ExeReuseCell) else None
         prefix_codes = self._gen_nontensor_getitem_codes(
             node_inputs, produced_tids, getitem_info,
@@ -832,7 +835,8 @@ class ScheduleCodeGen(FuncEmission):
                     name = f"'{name}'",
                     model = f'model.{name}',
                     inputs = inputs,
-                    req_grad = req_grad
+                    req_grad = req_grad,
+                    stream_kwarg = stream_kwarg,
                 )]
                 if post_hook:
                     codes = codes + self._emit_segment_hook_code(
@@ -843,7 +847,6 @@ class ScheduleCodeGen(FuncEmission):
                 # get gradient computation arguments
                 input_tensors, output_tensors, output_grads, input_grads = \
                         self.get_backward_callsite_io_tensors(node)
-                gen_inputs = (input_tensors, output_tensors, output_grads)
                 # special handle for loss
                 for idx, tensor in enumerate(output_grads):
                     if isinstance(tensor, IRSubTensor) and tensor.is_loss():
@@ -859,7 +862,6 @@ class ScheduleCodeGen(FuncEmission):
                             # including paths arriving from an earlier stage.
                             output_grads[idx] = IRValue(f'torch.zeros_like({self.tensor_name(output)})')
 
-                gen_inputs = (input_tensors, output_tensors, output_grads)
                 input_grads_str = self.return_name(input_grads)
                 input_tensors_str = self.tuple_name(input_tensors, skip_attr=True, prefix_attr='model.')
                 output_tensors_str = self.tuple_name(output_tensors, skip_attr=True, prefix_attr='model.')
@@ -871,11 +873,13 @@ class ScheduleCodeGen(FuncEmission):
                         input_tensors = input_tensors_str,
                         output_tensors = output_tensors_str,
                         output_grads = output_grads_str,
-                        weights = 'model.parameters()'
+                        weights = 'model.parameters()',
+                        stream_kwarg = stream_kwarg,
                     )]
                     codes.append(bw_sign.format(
                         name = f"'{self.node_name(unwrap_node.mirror)}'", # always use name of fw segment
-                        weights = 'model.parameters()'
+                        weights = 'model.parameters()',
+                        stream_kwarg = stream_kwarg,
                     ))
                 else:
                     codes = [bsign.format(
@@ -883,7 +887,8 @@ class ScheduleCodeGen(FuncEmission):
                         input_grads = input_grads_str,
                         input_tensors = input_tensors_str,
                         output_tensors = output_tensors_str,
-                        output_grads = output_grads_str
+                        output_grads = output_grads_str,
+                        stream_kwarg = stream_kwarg,
                     )]
 
                 bwd_input_str = f'({input_tensors_str}, {output_tensors_str}, {output_grads_str})'
@@ -927,7 +932,8 @@ class ScheduleCodeGen(FuncEmission):
                 outputs = outputs,
                 model = f'model.{name}',
                 inputs = inputs,
-                req_grad = req_grad
+                req_grad = req_grad,
+                stream_kwarg = stream_kwarg,
             )]
 
         elif isinstance(unwrap_node, IRWeightReducer):
@@ -935,32 +941,14 @@ class ScheduleCodeGen(FuncEmission):
                 outputs = outputs,
                 model=f'model.{name}',
                 inputs='()',
-                req_grad=req_grad
+                req_grad=req_grad,
+                stream_kwarg=stream_kwarg,
             )]
 
         else:
             raise RuntimeError(f"Unspported node type: {type(unwrap_node)}")
 
         codes = prefix_codes + codes
-
-        if stream_context and stream_context.stream:
-            # register all input tensors to the current stream
-            # to avoid cross-stream premature deallocation issue
-            # see `Tensor.record_stream` in PyTorch for more details
-
-            # NOTE: The dataloader output is not considered here. Two reasons:
-            # 1) Dataloader output is wrapped in an IRObject, and internal IRTensors cannot be accessed here easily.
-            # 2) Dataloader output is used as input of the first forward segment immediately after data loading
-            # 3) Dataloader output is never del'ed. (its lifetime is not managed here due to #1)
-            input_tensor_name = [
-                self.tensor_name(t) for t in IR.get_objects(gen_inputs)
-                if isinstance(t, IRTensor) and not t.is_attr()
-            ]
-            record_stream_codes = []
-            for t in input_tensor_name:
-                record_stream_codes.append(f'{t}.record_stream(torch.cuda.current_stream())')
-
-            codes = record_stream_codes + codes
 
         if CompileFlag.line_timer:
             type_str = type(unwrap_node).__name__

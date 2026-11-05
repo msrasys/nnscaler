@@ -655,3 +655,8 @@ be reclaimed without resizing their storage. Enabling gradients on a pruned inpu
 after forward is rejected. Ordinary and split backward preserve callback behavior.
 Generated code also releases local metadata containers after their last positional
 or keyword consumer, while preserving returned objects and model attributes.
+Multi-stream schedules protect resolved inputs on every consuming stream,
+including the default stream and tensors nested in builtin containers. Custom
+owners may implement `record_stream(stream)`; otherwise they are held until a
+CUDA event after the call completes. Single-stream schedules skip this traversal.
+Regenerate multi-stream plans to enable this protection.
