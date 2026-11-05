@@ -270,9 +270,11 @@ def stage_backward_input(
                 else:
                     inp.grad += dinput
 
-        # drop output side graph state we no longer need
+        # drop output side graph state we no longer need. Views cannot be detached
+        # in place; their graph is dropped when the caller releases the tensor.
         for t in stage_outputs_or_loss:
-            t.detach_()
+            if not t._is_view():
+                t.detach_()
 
         return dinputs, param_groups
     except Exception as e:
