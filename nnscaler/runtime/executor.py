@@ -21,18 +21,43 @@ from ._patch_torch import stage_backward_input, stage_backward_weight
 _logger = logging.getLogger(__name__)
 
 _ALLOW_GRAD_DTYPES = (torch.double, torch.float32, torch.float16, torch.bfloat16)
-# Number of holders of a tensor's TensorImpl. Exposed since torch 2.4.0; on the
-# older versions it is None and
+# Number of holders of a tensor's TensorImpl, exposed since torch 2.4.0. On the
+# older versions this package still supports (>= 2.0) it is None and
 # `release_storage` is a no-op, i.e. no storage is freed but nothing breaks.
-_use_count = getattr(torch.Tensor, '_use_count', None)
-# Python references `release_storage` sees for a tensor whose only Python holder is
-# the caller's local variable: that local, the `tensors` tuple, the loop variable
-# and the `sys.getrefcount` argument.
-_SOLE_OWNER_REFS = 4
-# Same for a view's base that outlives its last Python name only because its
-# TensorImpl preserves the Python object: that owning reference, the `base` local
-# and the `sys.getrefcount` argument.
-_SOLE_OWNER_BASE_REFS = 3
+_use_count = torch.Tensor._use_count if torch.__version__ >= (2, 4, 0) else None
+
+
+def _sole_owner_refcounts() -> Tuple[int, int]:
+    """
+    Python references `release_storage` sees for a stage output held only by its
+    `_train_step` local, and for that output's view base, which outlives its last
+    Python name because its TensorImpl preserves the Python object. Measured on a
+    probe shaped like the generated step rather than hardcoded, since the exact
+    numbers are CPython details (e.g. 3.14 stops counting borrowed stack references).
+    """
+    def _fexecute(data):
+        # the output is a view over an internal result, the shape ZeRO-3's backward
+        # hook produces; the base loses its only Python name when the segment returns
+        return (data * 2.0).view(2)
+
+    def _send(tensor):
+        # a sync send keeps no reference; an async one holds a `detach()` alias,
+        # which is another Python object and does not count either
+        pass
+
+    def _release_storage(*tensors):
+        # the loop of `Executor.release_storage`, measuring instead of releasing
+        for t in tensors:
+            base = t._base
+            return sys.getrefcount(t), sys.getrefcount(base)
+
+    # the generated step
+    x = _fexecute(torch.ones(2))
+    _send(x)
+    return _release_storage(x)
+
+
+_SOLE_OWNER_REFS, _SOLE_OWNER_BASE_REFS = _sole_owner_refcounts()
 # Set by `_check_release_storage` at import; False disables `release_storage`.
 _release_storage_enabled = _use_count is not None
 
@@ -511,26 +536,35 @@ release_storage = Executor.release_storage
 
 def _check_release_storage() -> bool:
     """
-    Verify `_SOLE_OWNER_REFS`/`_SOLE_OWNER_BASE_REFS` on this interpreter: a view
-    over an internal base must be released together with the base, and a tensor
-    with a second Python name must be left alone. Refcount details are CPython
-    specific, so on a mismatch the feature is disabled instead of guessing.
+    Verify `_SOLE_OWNER_REFS`/`_SOLE_OWNER_BASE_REFS` end to end on this
+    interpreter: a view over an internal base must be released together with the
+    base, and a tensor with a second Python name must be left alone. On a
+    mismatch, or if the probes raise (e.g. a torch build rejecting `.data` on a
+    view), the feature is disabled instead of failing the import.
     """
     if _use_count is None:
         return False
-    leaf = torch.ones(2, requires_grad=True)
 
     def segment(x):
         return (x * 2.0).view(2)
 
-    view = segment(leaf)
-    release_storage(view)
-    released = (view.untyped_storage().nbytes() == view.element_size()
-                and view._base.untyped_storage().nbytes() == view.element_size())
-    shared = leaf * 2.0
-    other_name = shared
-    release_storage(shared)
-    kept = shared.untyped_storage().nbytes() == 2 * shared.element_size()
+    try:
+        # the probes need grad_fn even if this module is first imported under
+        # no_grad or inference_mode; enable_grad alone does not leave inference mode
+        with torch.inference_mode(False), torch.enable_grad():
+            leaf = torch.ones(2, requires_grad=True)
+            view = segment(leaf)
+            release_storage(view)
+            released = (view.untyped_storage().nbytes() == view.element_size()
+                        and view._base.untyped_storage().nbytes() == view.element_size())
+            shared = leaf * 2.0
+            other_name = shared  # another Python name for the same tensor
+            # can't release
+            release_storage(shared)
+            kept = shared.untyped_storage().nbytes() == 2 * shared.element_size()
+    except Exception:
+        _logger.warning('release_storage self-check raised', exc_info=True)
+        return False
     return released and kept
 
 
