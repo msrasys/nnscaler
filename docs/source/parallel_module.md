@@ -648,22 +648,6 @@ We also support async gradient reduction via `compute_config.use_async_reducer`.
 
 When we combine async reduction with gradient accumulation, The time of kicking off gradient reduction becomes a problem. The current implementation is reusing `RuntimeFlag.skip_reducer` flag to control when to kick off the reduction. It is not ideal because `RuntimeFlag.skip_reducer` is originally designed for gradient accumulation, and it is not compatible when overlapping is used. So in overlapped scenarios, we must not use async reduction. We will improve it in the future.
 
-### Forward-only pipeline inputs
-
-After forward, the executor retains input tensors only for gradients or registered
-callbacks; it keeps IDs for boundary checks. Autograd and checkpointing still own
-constants needed by backward. This lets unused reference activations and metadata
-be reclaimed without resizing their storage. Enabling gradients on a pruned input
-after forward is rejected. Ordinary and split backward preserve callback behavior.
-Generated code also releases local metadata containers after their last positional
-or keyword consumer, while preserving returned objects and model attributes.
-Multi-stream schedules protect resolved inputs on every consuming stream,
-including the default stream and tensors nested in builtin containers. Custom
-owners may implement `record_stream(stream)`; otherwise they are held until a
-CUDA event after the call completes. Single-stream schedules skip this traversal.
-Regenerate multi-stream plans to enable this protection.
-
-### CPU fake output caching
 
 Pure CPU tracing substitutes can enable `fake_fn_cacheable=True` alongside
 `fake_fn_on_cpu=True` in `register_op`. Under `reuse_cache`, this reuses fake
