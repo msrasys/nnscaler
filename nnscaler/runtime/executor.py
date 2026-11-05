@@ -51,10 +51,12 @@ def _sole_owner_refcounts() -> Tuple[int, int]:
             base = t._base
             return sys.getrefcount(t), sys.getrefcount(base)
 
-    # the generated step
-    x = _fexecute(torch.ones(2))
-    _send(x)
-    return _release_storage(x)
+    # the generated step; under inference mode (if this module is first imported
+    # inside one) the probe would be an inference tensor whose view has no `_base`
+    with torch.inference_mode(False):
+        x = _fexecute(torch.ones(2))
+        _send(x)
+        return _release_storage(x)
 
 
 _SOLE_OWNER_REFS, _SOLE_OWNER_BASE_REFS = _sole_owner_refcounts()
