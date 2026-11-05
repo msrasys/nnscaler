@@ -52,13 +52,6 @@ def move(tensor: Optional[torch.Tensor], shape: Tuple[int], dtype: torch.dtype, 
             AsyncCommHandler().hold_send(tensor, work)
         else:
             torch.distributed.send(tensor, dst, group=group)
-            # `send` only orders the current stream after the NCCL stream. The buffer
-            # may be released right after this call (`Executor.release_storage`) and
-            # then reused by its allocation stream, which under multi-stream
-            # scheduling is not the current stream; record the use so the caching
-            # allocator waits for it.
-            if tensor.is_cuda:
-                tensor.record_stream(torch.cuda.current_stream())
     else:
         assert rank == dst
         tensor = torch.empty(shape, dtype=dtype,
