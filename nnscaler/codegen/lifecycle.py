@@ -34,9 +34,16 @@ class LifeCycle:
         # of a later backward call; keyed by that last forward line. Their storage
         # can be dropped there while the tensor object (and autograd graph) is kept.
         self.release_storage: Dict[int, List[IRSubTensor]] = {}
+        # Only the schedule codegen has segment nodes and emits the release; skip the
+        # bookkeeping for module codegen, whose nodes are plain operators.
+        track_release = CompileFlag.pipeline_deallocate_outputs and any(
+            isinstance(node, (IRSegment, ExeReuseCell)) for node in nodes)
         # the last line id of forward activations
         fw_lifetime: Dict[IRObject, int] = {}
         releasable: List[IRSubTensor] = []
+        # segment output -> whether it may own its runtime object, shared by the
+        # per-micro-batch ExeReuseCells of that segment
+        releasable_outputs: Dict[IRSubTensor, bool] = {}
         # tensors consumed by a forward node that may keep or alias them locally,
         # i.e. anything but an adapter without local outputs (a pure send).
         kept_locally = set()
@@ -51,6 +58,7 @@ class LifeCycle:
 
             outputs : Iterable[IRObject]
             inputs : Iterable[IRObject]
+            cell = node.cell if isinstance(node, ExeReuseCell) else node
 
             if isinstance(node, (IRSegment, ExeReuseCell)):
                 # this is only for scheduler to track the lifetime of tensors
@@ -61,17 +69,19 @@ class LifeCycle:
                 if node.isfw():
                     outputs = node.outputs()
                     inputs = node.inputs()
-                    cell = node.cell if isinstance(node, ExeReuseCell) else node
-                    if CompileFlag.pipeline_deallocate_outputs and isinstance(cell, IRSegment):
+                    if track_release and isinstance(cell, IRSegment):
                         # ExeReuseCell outputs are per-micro-batch copies of the segment
                         # outputs with the same nesting, so flattening both aligns them.
                         tensors = IRSegment.get_objects_from_complex(outputs)
                         cell_tensors = IRSegment.get_objects_from_complex(cell.outputs())
                         assert len(tensors) == len(cell_tensors), f'output mismatch: {node} vs {cell}'
-                        releasable.extend(
-                            t for t, cell_t in zip(tensors, cell_tensors)
-                            if is_activation(t) and self._is_releasable_output(cell, cell_t)
-                        )
+                        for t, cell_t in zip(tensors, cell_tensors):
+                            if not is_activation(t):
+                                continue
+                            if cell_t not in releasable_outputs:
+                                releasable_outputs[cell_t] = self._is_releasable_output(cell, cell_t)
+                            if releasable_outputs[cell_t]:
+                                releasable.append(t)
                 # backward segment
                 else:
                     # in `_train_step`, we will explicitly call backward to generate gradients.
@@ -96,9 +106,8 @@ class LifeCycle:
             # "fast-forward" all inputs to the current statement, namely after 'i'-th node.
             self.lifetime.update((tin, i) for tin in IRSegment.get_objects_from_complex(inputs) if is_activation(tin))
 
-            if CompileFlag.pipeline_deallocate_outputs and node.isfw():
+            if track_release and node.isfw():
                 fw_lifetime.update((t, i) for t in IRSegment.get_objects_from_complex(list(inputs) + list(outputs)) if is_activation(t))
-                cell = node.cell if isinstance(node, ExeReuseCell) else node
                 # A pure send is a generated adapter without local outputs. A custom
                 # differentiable adapter runs user autograd code that may save its input.
                 # TODO: adapters with local outputs could also qualify when every prim
@@ -120,7 +129,7 @@ class LifeCycle:
         for tensor, line_id in self.lifetime.items():
             self.release.setdefault(line_id, []).append(tensor)
 
-        if CompileFlag.pipeline_deallocate_outputs:
+        if track_release:
             for tensor in releasable:
                 if tensor in graph_outputs or tensor in kept_locally:
                     continue
