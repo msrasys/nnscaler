@@ -502,6 +502,13 @@ class Executor:
             Users can only register one backward pre_hook. If there was a hook
             registered before, it will be overwritten.
 
+            With pipeline output deallocation (`ComputeConfig.pipeline_deallocate_outputs`)
+            an output tensor other than the loss may already have had its storage
+            released by `Executor.release_storage` and only keeps its shape, dtype and
+            grad_fn. The hook may replace or scale such entries but must not read their
+            values. The loss is a graph output and is never released, which is all the
+            built-in loss-scaling hook touches.
+
         Args:
             hook (Callable or None): the backward hook to be registered. The hook takes
                 input_tensors (List[torch.Tensor]),

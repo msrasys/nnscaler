@@ -331,6 +331,12 @@ def test_custom_fbw_grad_coverage_accepts_split_gradients():
         executor.backward_weight('segment', (weight,))
 
 
+release_storage_test = pytest.mark.skipif(
+    not executor._release_storage_enabled,
+    reason='release_storage is a no-op on this torch/interpreter (needs torch >= 2.4 and a passing self-check)')
+
+
+@release_storage_test
 @pytest.mark.parametrize('use_fbw', [False, True])
 def test_release_storage_keeps_backward_roots(use_fbw):
     if use_fbw and not _patch_torch.FBW_SUPPORTED:
@@ -370,6 +376,7 @@ def test_release_storage_keeps_backward_roots(use_fbw):
         Executor.backward('linear', [actual_input], [released], [output_grad[:2]])
 
 
+@release_storage_test
 def test_release_storage_unwraps_zero3_backward_hook_views():
     from nnscaler.runtime.function import insert_backward_hook
     torch.manual_seed(0)
@@ -412,6 +419,7 @@ def test_release_storage_unwraps_zero3_backward_hook_views():
     del kept
 
 
+@release_storage_test
 def test_release_storage_skips_tensors_held_elsewhere():
     x = torch.randn(4, 3, requires_grad=True)
     nbytes = 4 * 3 * x.element_size()
@@ -459,6 +467,7 @@ def test_release_storage_skips_tensors_held_elsewhere():
     assert base.untyped_storage().nbytes() == nbytes and view.untyped_storage().nbytes() == nbytes
 
 
+@release_storage_test
 def test_hold_send_keeps_buffer_alive_after_release_storage():
     class _Work:
         def is_completed(self):
@@ -477,3 +486,14 @@ def test_hold_send_keeps_buffer_alive_after_release_storage():
     assert held.data_ptr() == data_ptr and held.untyped_storage().nbytes() == nbytes
     handler.drain_sends()
     handler.check_clear()
+
+
+def test_release_storage_disabled_is_a_no_op(monkeypatch):
+    # torch < 2.4 or a failed interpreter self-check: storage is kept and backward unchanged
+    monkeypatch.setattr(executor, '_release_storage_enabled', False)
+    x = torch.randn(4, 3, requires_grad=True)
+    out = x * 2.0
+    Executor.release_storage(out)
+    assert out.untyped_storage().nbytes() == 4 * 3 * out.element_size()
+    torch.autograd.backward([out], [torch.ones_like(out)])
+    torch.testing.assert_close(x.grad, torch.full_like(x, 2.0))
