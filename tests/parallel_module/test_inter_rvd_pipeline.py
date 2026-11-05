@@ -48,3 +48,16 @@ def test_fn_inter_stage_gencode_prefers_matching_peers(tmp_path):
             tmp_path, InterStageMLP, rank,
             r'nnscaler\.runtime\.adapter\.move\([^\n]*\bsrc=([0-3]), dst=(\d+)\b')
         assert set(peers) == {(str(rank % 4), str(rank % 4 + 4))}
+
+    # Every chunk output that leaves the device has its storage released right
+    # after the send: ranks 0-3 hold chunks 0 and 2, ranks 4-7 hold chunk 1 and
+    # the loss chunk, whose output is a graph output and is never released.
+    for rank in range(8):
+        sent_then_released = _gencode_contains(
+            tmp_path, InterStageMLP, rank,
+            r'aexecute\(model\.adapter\d+, \*\((\w+), \), requires_grad=False\)\n\s*'
+            r'nnscaler\.runtime\.executor\.release_storage\(\1\)')
+        released = _gencode_contains(tmp_path, InterStageMLP, rank, r'release_storage\((\w+)\)')
+        assert released == sent_then_released
+        assert len(released) == (8 if rank < 4 else 4)
+        assert not any(name.startswith('sum') for name in released)

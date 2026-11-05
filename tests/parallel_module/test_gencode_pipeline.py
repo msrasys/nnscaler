@@ -931,6 +931,16 @@ def test_shared_output_pipeline_boundary_codegen(tmp_path, case):
         )
         assert bool(source_allgather) == (case == 'incompatible_consumers')
     if case == 'final_output':
+        for rank in (0, 1):
+            # Both outputs are sent, but x0 is the identity over a locally consumed
+            # multiref branch, so only the fresh second output is released.
+            outputs = _gencode_contains(
+                tmp_path, SharedOutputBoundaryModule, rank,
+                r'(\w+), (\w+) = nnscaler\.runtime\.executor\.fexecute\('
+                r"'segment\d+', model\.segment\d+, \*\(data_\d+, \), requires_grad=True\)")
+            assert len(outputs) == 3
+            released = _gencode_contains(tmp_path, SharedOutputBoundaryModule, rank, r'release_storage\((\w+)\)')
+            assert released == [names[1] for names in outputs]
         for rank in (2, 3):
             # x0 arrives as a dim-0 shard and is consumed as such: no re-sharding
             # inside the stage, and the only gather completes the detached return.
