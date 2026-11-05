@@ -421,8 +421,13 @@ class Executor:
                 continue
             base = t._base
             if base is None:
+                # non-view tensor, release its storage directly
+                # as it doesn't have other holders(use_count == 1)
                 targets = (t,)
             elif _use_count(base) == 2:  # the base's Python object plus this view
+                # view tensor, release it together with its base
+                # as the base is only held by this view
+                # the 2 use count is `t` and `t._base`
                 targets = (t, base)
             else:
                 continue
