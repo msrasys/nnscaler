@@ -69,7 +69,12 @@ class LifeCycle:
                 if node.isfw():
                     outputs = node.outputs()
                     inputs = node.inputs()
-                    if track_release and isinstance(cell, IRSegment):
+                    # Backward segment hooks receive the forward outputs as part of
+                    # their inputs and may read their values, which no holder count
+                    # can foresee; keep such outputs intact.
+                    bw_hooked = (isinstance(cell, IRSegment) and cell.mirror is not None
+                                 and (cell.mirror.pre_hook is not None or cell.mirror.post_hook is not None))
+                    if track_release and isinstance(cell, IRSegment) and not bw_hooked:
                         # ExeReuseCell outputs are per-micro-batch copies of the segment
                         # outputs with the same nesting, so flattening both aligns them.
                         tensors = IRSegment.get_objects_from_complex(outputs)
