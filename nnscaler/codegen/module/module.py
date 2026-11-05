@@ -1039,6 +1039,9 @@ class ModuleCodeGen(FuncEmission):
             more_itertools.split_when(nodes, lambda prev, curr: prev.recompute != curr.recompute))
 
         codes: List[str] = []
+        unused_inputs = lifetime.release_tensors_after_line(-1)
+        if unused_inputs:
+            codes.append(self.emit_release(unused_inputs))
         for rc_group in rc_groups:
             assert len(rc_group) > 0
             gid: Optional[int] = rc_group[0].recompute

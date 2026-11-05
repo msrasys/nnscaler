@@ -35,7 +35,9 @@ class LifeCycle:
             isinstance(t, IRObject) and not t.is_attr()
             and (not isinstance(t, IRTensor) or isinstance(t, IRSubTensor)))
 
-        self.lifetime.update((tsin, 0) for tsin in graph_inputs if is_activation(tsin))
+        # Inputs exist before the first statement. Unused inputs belong to the
+        # enclosing function, not a recompute function starting at line zero.
+        self.lifetime.update((tsin, -1) for tsin in graph_inputs if is_activation(tsin))
 
         produced_tids: set = set()
         for tsin in graph_inputs:
