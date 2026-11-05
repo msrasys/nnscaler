@@ -381,10 +381,12 @@ def test_release_storage_unwraps_zero3_backward_hook_views():
 
     fired = []
     def segment(x):
-        # ZeRO-3 codegen wraps the output once per parameter input
-        out = actual(x)
-        out = insert_backward_hook(out, lambda: fired.append('weight'))
-        return insert_backward_hook(out, lambda: fired.append('bias'))
+        # ZeRO-3 codegen wraps the output once per parameter input and runs the
+        # segment under `save_params_hooks`, whose pack returns activations as is
+        with torch.autograd.graph.saved_tensors_hooks(lambda t: t, lambda t: t):
+            out = actual(x)
+            out = insert_backward_hook(out, lambda: fired.append('weight'))
+            return insert_backward_hook(out, lambda: fired.append('bias'))
 
     actual_input = input_data.clone().requires_grad_()
     output = Executor.fexecute('linear', segment, actual_input)
@@ -432,6 +434,29 @@ def test_release_storage_skips_tensors_held_elsewhere():
     assert t.untyped_storage().nbytes() == t.element_size()
     torch.autograd.backward([t], [torch.ones_like(t)])
     torch.testing.assert_close(x.grad, 1 - torch.tanh(x.detach()) ** 2)
+
+    # under saved_tensors_hooks that return the tensor itself (ZeRO-3 save_params_hooks,
+    # CPU offloading) the saved output is a Python reference to this very object
+    x.grad = None
+    with torch.autograd.graph.saved_tensors_hooks(lambda a: a, lambda a: a):
+        hooked = torch.tanh(x)
+    Executor.release_storage(hooked)
+    assert hooked.untyped_storage().nbytes() == nbytes
+    torch.autograd.backward([hooked], [torch.ones_like(hooked)])
+    torch.testing.assert_close(x.grad, 1 - torch.tanh(x.detach()) ** 2)
+
+    # a second Python name for the same object (e.g. a sibling segment output) keeps it
+    first = x * 5.0
+    second = first
+    Executor.release_storage(first)
+    assert first.untyped_storage().nbytes() == nbytes
+    del second
+
+    # a view whose base is still named elsewhere leaves both alone
+    base = x * 6.0
+    view = base.view(3, 4)
+    Executor.release_storage(view)
+    assert base.untyped_storage().nbytes() == nbytes and view.untyped_storage().nbytes() == nbytes
 
 
 def test_hold_send_keeps_buffer_alive_after_release_storage():

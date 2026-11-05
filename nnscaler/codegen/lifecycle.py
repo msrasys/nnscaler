@@ -134,10 +134,12 @@ class LifeCycle:
         multiref/IdentityPrim exist to fan a tensor out to several consumers, so
         their outputs are the same Python object as a sibling that may still be
         consumed later in forward; dropping one would drop the other, and the
-        runtime cannot tell two names for one object apart. Other producers may
-        also return their input (in-place ops, no-op `contiguous`/`to`), but then
-        any remaining holder of that object shows up in its impl use count, which
-        `Executor.release_storage` checks before swapping the data.
+        the sibling may even be a graph output. Other producers may also return
+        their input (in-place ops, no-op `contiguous`/`to`) or a view of it, but
+        then any remaining holder of that object shows up as an extra Python
+        reference or in its impl use count, which `Executor.release_storage`
+        checks before swapping the data; the ops above are excluded here only
+        because they are fan-outs by design and never worth the runtime check.
         """
         producers = segment.producers(output.parent)
         if len(producers) != 1:

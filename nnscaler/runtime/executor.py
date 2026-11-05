@@ -5,6 +5,7 @@ r"""
 Executor for runtime
 """
 import atexit
+import sys
 
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -24,6 +25,16 @@ _ALLOW_GRAD_DTYPES = (torch.double, torch.float32, torch.float16, torch.bfloat16
 # older versions it is None and
 # `release_storage` is a no-op, i.e. no storage is freed but nothing breaks.
 _use_count = getattr(torch.Tensor, '_use_count', None)
+# Python references `release_storage` sees for a tensor whose only Python holder is
+# the caller's local variable: that local, the `tensors` tuple, the loop variable
+# and the `sys.getrefcount` argument.
+_SOLE_OWNER_REFS = 4
+# Same for a view's base that outlives its last Python name only because its
+# TensorImpl preserves the Python object: that owning reference, the `base` local
+# and the `sys.getrefcount` argument.
+_SOLE_OWNER_BASE_REFS = 3
+# Set by `_check_release_storage` at import; False disables `release_storage`.
+_release_storage_enabled = _use_count is not None
 
 
 def debug_id(tensors, msg: str, rank: int):
@@ -399,35 +410,43 @@ class Executor:
         works unchanged, while the real buffer is released.
 
         Swapping `.data` rewrites the TensorImpl in place, so it is only safe when
-        nothing else holds that impl. Autograd saves a node's *output* (e.g. tanh's
-        result) as a detached shallow copy that merely shares the storage, because
-        holding the original would form the cycle Node -> SavedVariable ->
-        Variable.grad_fn -> Node that refcounting never frees; such copies are not
-        affected (and keep the buffer alive, so nothing is gained). A node's
-        *input* has no such cycle and is saved as the original impl, as is the base
-        of a view. `_use_count` sees both, so a tensor is released only when it is
-        held by nothing but its own Python object; a view is released together
-        with its root base when that base is held by nothing but this view. This
-        covers outputs that alias an internal tensor (ops returning their input,
-        ZeRO-3's `insert_backward_hook` views) without knowing the op. A plain
-        attribute like `ctx.out = out` is not visible to this check.
+        nothing else can observe that impl. Holders show up in one of two counts:
+
+        * `_use_count`: C++ handles to the impl. Autograd saves a node's *input*
+          (and the base of a view) as the original impl, but a node's *output*
+          (e.g. tanh's result) as a detached shallow copy that merely shares the
+          storage, because holding the original would form the cycle
+          Node -> SavedVariable -> Variable.grad_fn -> Node that refcounting never
+          frees. Such copies are not affected by the swap (and keep the buffer
+          alive, so nothing is gained for them).
+        * `sys.getrefcount`: Python references to the tensor object. Another name
+          for the same object in the generated step (an op that returned its input,
+          a sibling output), a `ctx.out = out` attribute, and any tensor saved under
+          `saved_tensors_hooks` (ZeRO-3's `save_params_hooks`, CPU offloading) are
+          held this way: a pack hook receives the tensor's own Python object and
+          returning it stores a Python reference, not an impl handle, so the first
+          count stays 1 for them.
+
+        A tensor is released only when both counts show no holder but the caller's
+        local; a view is released together with its root base when that base is
+        held by nothing but its own (impl-preserved) Python object and this view.
+        This covers outputs aliasing an internal tensor (ZeRO-3's
+        `insert_backward_hook` views) without knowing the op. The expected counts
+        are verified on the running interpreter at import, see
+        `_check_release_storage`.
         """
-        if _use_count is None:
+        if not _release_storage_enabled:
             return
         for t in tensors:
             if not (torch.is_tensor(t) and t.grad_fn is not None and t.layout == torch.strided):
                 continue
-            if _use_count(t) != 1:
+            if _use_count(t) != 1 or sys.getrefcount(t) != _SOLE_OWNER_REFS:
                 continue
             base = t._base
             if base is None:
-                # non-view tensor, release its storage directly
-                # as it doesn't have other holders(use_count == 1)
                 targets = (t,)
-            elif _use_count(base) == 2:  # the base's Python object plus this view
-                # view tensor, release it together with its base
-                # as the base is only held by this view
-                # the 2 use count is `t` and `t._base`
+            elif _use_count(base) == 2 and sys.getrefcount(base) == _SOLE_OWNER_BASE_REFS:
+                # the impl is held by the base's own Python object and this view only
                 targets = (t, base)
             else:
                 continue
@@ -488,6 +507,36 @@ backward_input = Executor.backward_input
 backward_weight = Executor.backward_weight
 sync_tensors = Executor.sync_tensors
 release_storage = Executor.release_storage
+
+
+def _check_release_storage() -> bool:
+    """
+    Verify `_SOLE_OWNER_REFS`/`_SOLE_OWNER_BASE_REFS` on this interpreter: a view
+    over an internal base must be released together with the base, and a tensor
+    with a second Python name must be left alone. Refcount details are CPython
+    specific, so on a mismatch the feature is disabled instead of guessing.
+    """
+    if _use_count is None:
+        return False
+    leaf = torch.ones(2, requires_grad=True)
+
+    def segment(x):
+        return (x * 2.0).view(2)
+
+    view = segment(leaf)
+    release_storage(view)
+    released = (view.untyped_storage().nbytes() == view.element_size()
+                and view._base.untyped_storage().nbytes() == view.element_size())
+    shared = leaf * 2.0
+    other_name = shared
+    release_storage(shared)
+    kept = shared.untyped_storage().nbytes() == 2 * shared.element_size()
+    return released and kept
+
+
+_release_storage_enabled = _check_release_storage()
+if _use_count is not None and not _release_storage_enabled:
+    _logger.warning('release_storage self-check failed on this interpreter; stage outputs are not deallocated.')
 
 
 @contextmanager
