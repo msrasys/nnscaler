@@ -284,10 +284,25 @@ class ConcreteAttrProxy(ConcreteProxy):
 
     @property
     def node(self):
+        # A method may first be called normally and later passed as a value.
+        # Restore its concrete metadata before that getattr node gains a user.
+        if self._node.meta.get('tensor_meta') is None and callable(self.value):
+            self._node.meta['tensor_meta'] = self.value
         return self._node
 
     def __call__(self, *args, **kwargs):
-        return self.tracer.create_proxy('call_method', self.attr, (self.root,) + args, kwargs)
+        result = self.tracer.create_proxy('call_method', self.attr, (self.root,) + args, kwargs)
+        # A direct x.method() call uses x, not the preceding getattr node.
+        # Keeping the concrete bound method in that unused node's metadata
+        # pins x until post-trace DCE, even after its last real consumer. This
+        # can retain terabytes of long-context trace activations. Leave the
+        # node/context intact, and restore metadata above if the method itself
+        # is subsequently used as a value.
+        with wrap_utils.do_temp_call_origin():
+            if (not self._node.users and callable(self.value)
+                    and orig_func.isinstance(orig_func.getattr(self.value, '__self__', None), torch.Tensor)):
+                self._node.meta['tensor_meta'] = None
+        return result
 
 
 @compatibility(is_backward_compatible=True)

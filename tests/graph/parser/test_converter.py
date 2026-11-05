@@ -44,6 +44,8 @@ def test_to_graph():
     assert any(node.op == 'call_function' and node.target == torch.nn.functional.linear for node in nodes)
 
     with tempfile.TemporaryDirectory() as tempdir:
+        # A fresh trace must remove a stale sidecar from an older package.
+        torch.save({}, Path(tempdir) / FxModuleParser.NON_PERSISTENT_BUFFER_FILE)
         ir_graph = to_ir_graph(fx_graph, dummy_input, attr_savedir=tempdir, constant_folding=False)
         assert ir_graph is not None
         assert (Path(tempdir) / FxModuleParser.ATTR_MAP_FILE).exists()
@@ -146,8 +148,8 @@ def test_record_metadata():
 
 
 @replace_all_device_with('cpu')
-def test_npbuffer_saved():
-    """Test that npbuffer.pt is saved during tracing and contains only non-persistent buffer data."""
+def test_non_persistent_buffers_use_attribute_index():
+    """Buffer values share the attribute shards; no sidecar is generated."""
     class ModuleWithNPBuffer(torch.nn.Module):
         def __init__(self):
             super().__init__()
@@ -167,15 +169,13 @@ def test_npbuffer_saved():
         assert ir_graph is not None
         assert (Path(tempdir) / FxModuleParser.ATTR_MAP_FILE).exists()
         assert (Path(tempdir) / FxModuleParser.ATTR_CONTENT_FILE_0).exists()
-        assert (Path(tempdir) / FxModuleParser.NON_PERSISTENT_BUFFER_FILE).exists()
-
-        # Verify npbuffer.pt content
-        npbuffer_data = torch.load(Path(tempdir) / FxModuleParser.NON_PERSISTENT_BUFFER_FILE)
-        # Should contain exactly 1 tensor (np_buf), not the persistent buffer or linear params
-        assert len(npbuffer_data) == 1
-        # The value should be the non-persistent buffer value (ones)
-        tid = list(npbuffer_data.keys())[0]
-        assert torch.equal(npbuffer_data[tid], torch.ones(2, 5))
+        assert not (Path(tempdir) / FxModuleParser.NON_PERSISTENT_BUFFER_FILE).exists()
+        index = torch.load(Path(tempdir) / FxModuleParser.ATTR_CONTENT_INDEX_FILE, weights_only=True)
+        buffers = [t for t in ir_graph.attributes() if t.is_buffer() and not t.is_persistent()]
+        assert len(buffers) == 1
+        tid = buffers[0].tid
+        data = torch.load(Path(tempdir) / f'fullmodel.pt.{index[tid]}', weights_only=True)
+        assert torch.equal(data[tid], torch.ones(2, 5))
 
     # Test module without non-persistent buffers
     class ModuleWithoutNPBuffer(torch.nn.Module):
@@ -192,6 +192,5 @@ def test_npbuffer_saved():
 
     with tempfile.TemporaryDirectory() as tempdir:
         ir_graph2 = to_ir_graph(fx_graph2, dummy_input, attr_savedir=tempdir, constant_folding=False)
-        assert (Path(tempdir) / FxModuleParser.NON_PERSISTENT_BUFFER_FILE).exists()
-        npbuffer_data2 = torch.load(Path(tempdir) / FxModuleParser.NON_PERSISTENT_BUFFER_FILE)
-        assert len(npbuffer_data2) == 0  # no non-persistent buffers
+        assert not (Path(tempdir) / FxModuleParser.NON_PERSISTENT_BUFFER_FILE).exists()
+        assert (Path(tempdir) / FxModuleParser.ATTR_CONTENT_INDEX_FILE).exists()

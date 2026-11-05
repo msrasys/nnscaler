@@ -411,7 +411,9 @@ def __init__(self, init_params=True, build_buckets=True):
 - `init_params` (`bool`): whether to initialize the module parameters with the values they had at trace time. Set to `False` if you plan to load from a checkpoint instead.
 - `build_buckets` (`bool`): whether to build communication buckets immediately. Set to `False` when you need to call `build_buckets()` manually later (e.g., for hybrid optimizers with `param_clss_fn`).
 
-As noted before, in most cases you still need to set `init_params=True` to make sure non-persistent buffers are initialized if you want to initialize weights by loading a checkpoint.
+With `init_params=False`, non-persistent buffers load through `fullmodel.pt.index`.
+Keep the shards containing those buffers even on resume. New packages need the
+updated runtime; older `npbuffer.pt` sidecars remain readable.
 
 
 2.`train_step`
@@ -660,3 +662,14 @@ including the default stream and tensors nested in builtin containers. Custom
 owners may implement `record_stream(stream)`; otherwise they are held until a
 CUDA event after the call completes. Single-stream schedules skip this traversal.
 Regenerate multi-stream plans to enable this protection.
+
+### CPU fake output caching
+
+Pure CPU tracing substitutes can enable `fake_fn_cacheable=True` alongside
+`fake_fn_on_cpu=True` in `register_op`. Under `reuse_cache`, this reuses fake
+outputs while retaining each call's current inputs. See the `register_op`
+docstring for the metadata-only, side-effect-free contract; the default is off.
+Set `NNSCALER_CACHE_CPU_FAKE_OUTPUTS=0` before launch to disable only fake-output
+reuse. Shared placeholders must not be modified in place; copy-on-write is not
+implemented. Trace-end logs report regular/fake cache tensor storage and their
+deduplicated total, excluding Python objects, autograd state and allocator RSS.

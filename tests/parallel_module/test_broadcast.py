@@ -87,7 +87,7 @@ def _gpu_worker(tmp_path):
     if node_rank == 0:
         p(tempdir, 'no_weights', '_3')
     else:
-        with pytest.raises(RuntimeError, match='Cannot find file.*'):
+        with pytest.raises(RuntimeError, match='Cannot find file|Missing attribute content chunks'):
             p(tempdir, 'no_weights', '_3')
 
     # case 4: broadcast except weights, every rank can succeed if don't lood init params

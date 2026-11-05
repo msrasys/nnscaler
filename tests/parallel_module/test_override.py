@@ -215,6 +215,8 @@ def test_reuse_without_attr_content_index(tmp_path, reuse):
         tmp_path.rglob(FxModuleParser.ATTR_CONTENT_INDEX_FILE)).parent
     index_file = module_path / FxModuleParser.ATTR_CONTENT_INDEX_FILE
     index_file.unlink()
+    # Old unindexed packages carried a (possibly empty) buffer sidecar.
+    torch.save({}, module_path / FxModuleParser.NON_PERSISTENT_BUFFER_FILE)
     code_mtime = (module_path / 'gencode0.py').stat().st_mtime_ns
 
     _to_cube_model(

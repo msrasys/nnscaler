@@ -161,64 +161,40 @@ def test_checkpoint_buffer_broadcast():
 
 
 def _gpu_worker_npbuffer():
-    """Test that npbuffer.pt is saved during tracing and loaded when init_params=False."""
+    """New packages restore buffer values from the common attribute index."""
     init_distributed()
     compute_config = ComputeConfig(1, 1, use_zero=False)
     with clear_dir_on_rank0(Path(tempfile.gettempdir()) / f'cube_test_npbuffer_{PYTEST_RUN_ID}') as tempdir:
-        # Test 1: Verify npbuffer.pt is created during tracing
         net1 = _to_cube_model(Net1(), compute_config, tempdir, 'net1-npb', (128, 64))
-        # Navigate to the actual module directory
         import sys
-        gen_module = sys.modules[net1.__class__.__module__]
-        gen_dir = Path(gen_module.__file__).parent
-        npbuffer_file = gen_dir / FxModuleParser.NON_PERSISTENT_BUFFER_FILE
-        assert npbuffer_file.exists(), f"npbuffer.pt should be created during tracing at {npbuffer_file}"
+        gen_dir = Path(sys.modules[net1.__class__.__module__].__file__).parent
+        assert not (gen_dir / FxModuleParser.NON_PERSISTENT_BUFFER_FILE).exists()
+        assert (gen_dir / FxModuleParser.ATTR_CONTENT_INDEX_FILE).exists()
+        assert (gen_dir / FxModuleParser.ATTR_CONTENT_FILE_0).exists()
 
-        # Verify the npbuffer.pt contains only non-persistent buffer tids
-        npbuffer_data = torch.load(npbuffer_file)
-        assert len(npbuffer_data) > 0, "npbuffer.pt should contain non-persistent buffer data for Net1"
-
-        # Verify fullmodel.pt.0 also exists and is larger
-        fullmodel_file = gen_dir / FxModuleParser.ATTR_CONTENT_FILE_0
-        assert fullmodel_file.exists()
-
-        # Test 2: init_params=False should load npbuffer.pt and set non-persistent buffers
         from nnscaler.runtime.module import _logger
         with catch_log(_logger) as log_stream:
-            net1_no_init = _to_cube_model(Net1(), compute_config, tempdir, 'net1-npb', (128, 64), init_module_params=False)
-            # Non-persistent buffers should be initialized from npbuffer.pt
-            assert net1_no_init.non_presistent_buffers_inited, \
-                "Non-persistent buffers should be marked as initialized when loaded from npbuffer.pt"
-
-            # The buffer value should be correct (ones)
+            net1_no_init = _to_cube_model(Net1(), compute_config, tempdir, 'net1-npb',
+                                         (128, 64), init_module_params=False)
+            assert net1_no_init.non_presistent_buffers_inited
             buffer_val = list(net1_no_init._buffers.values())[0]
-            assert torch.equal(buffer_val, torch.ones(128, 64)), \
-                "Non-persistent buffer should be loaded correctly from npbuffer.pt"
-
+            assert torch.equal(buffer_val, torch.ones(128, 64))
             logs = log_stream.getvalue()
-            assert 'Non-persistent buffers cannot be initialized with' not in logs, \
-                "Should not warn about uninitialized non-persistent buffers"
-
-        # Test 3: Net3 has persistent buffer - init_params=False should also work
-        # (no non-persistent buffers to load from npbuffer.pt)
-        with catch_log(_logger) as log_stream:
-            net3 = _to_cube_model(Net3(), compute_config, tempdir, 'net3-npb', (128, 64), init_module_params=False)
-            # Net3 has no non-persistent buffers, so it should be marked as initialized
-            assert net3.non_presistent_buffers_inited, \
-                "Module without non-persistent buffers should be marked as initialized"
-            logs = log_stream.getvalue()
+            assert 'loading non-persistent buffers from' in logs
+            assert 'loading partitioned model from' not in logs
             assert 'Non-persistent buffers cannot be initialized with' not in logs
 
-        # Test 4: Verify npbuffer.pt is also created for Net3 (empty dict)
-        gen_module3 = sys.modules[net3.__class__.__module__]
-        gen_dir3 = Path(gen_module3.__file__).parent
-        npbuffer_file3 = gen_dir3 / FxModuleParser.NON_PERSISTENT_BUFFER_FILE
-        assert npbuffer_file3.exists(), "npbuffer.pt should be created even for modules without non-persistent buffers"
-        npbuffer_data3 = torch.load(npbuffer_file3)
-        assert len(npbuffer_data3) == 0, "npbuffer.pt should be empty for modules without non-persistent buffers"
+        with catch_log(_logger) as log_stream:
+            net3 = _to_cube_model(Net3(), compute_config, tempdir, 'net3-npb',
+                                 (128, 64), init_module_params=False)
+            assert net3.non_presistent_buffers_inited
+            assert 'loading non-persistent buffers from' not in log_stream.getvalue()
+        gen_dir3 = Path(sys.modules[net3.__class__.__module__].__file__).parent
+        assert not (gen_dir3 / FxModuleParser.NON_PERSISTENT_BUFFER_FILE).exists()
+        assert (gen_dir3 / FxModuleParser.ATTR_CONTENT_INDEX_FILE).exists()
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason='lack of gpu devices')
 def test_npbuffer():
-    """Test npbuffer.pt saving and loading for non-persistent buffers."""
+    """Test the attribute-index initialization path for non-persistent buffers."""
     launch_torchrun(1, _gpu_worker_npbuffer)

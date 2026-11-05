@@ -32,6 +32,8 @@ class CustomizedOps:
     kOpFakeRuntime: Dict[str, Optional[Callable]] = {}
     # signature -> whether the fake may run on CPU during CPU/offload tracing
     kOpFakeRuntimeCPU: Dict[str, bool] = {}
+    # signature -> pure metadata-only CPU fake eligible for trace-local reuse
+    kOpFakeRuntimeCacheable: Dict[str, bool] = {}
     # signature -> runtime function implementation code
     kOpCodeDef: Dict[str, str] = {}
     # signature -> special emit function, will not store if emit_fn is None
@@ -70,6 +72,7 @@ class CustomizedOps:
         input_gen_fn: Callable[[IRFwOperation], List[torch.Tensor]] = None,
         fake_fn: Optional[Callable] = None,
         fake_fn_on_cpu: bool = False,
+        fake_fn_cacheable: bool = False,
     ) -> None:
         """Register an operator
 
@@ -91,6 +94,8 @@ class CustomizedOps:
                 that cannot run during tracing (e.g., distributed communication ops).
             fake_fn_on_cpu (bool): allow fake_fn to use existing CPU tensors in
                 CPU/offload tracing. Defaults to the strategy's device placement.
+            fake_fn_cacheable (bool): metadata-only fake eligible for trace-local
+                output reuse; see register_op for the purity contract.
         Returns:
             None
         """
@@ -102,6 +107,7 @@ class CustomizedOps:
         CustomizedOps.kOpRuntime[signature] = runtime_fn
         CustomizedOps.kOpFakeRuntime[signature] = fake_fn
         CustomizedOps.kOpFakeRuntimeCPU[signature] = fake_fn_on_cpu
+        CustomizedOps.kOpFakeRuntimeCacheable[signature] = fake_fn_cacheable
         CustomizedOps.kOpCodeDef[signature] = code
         if emit_fn is not None:
             CustomizedOps.kOpEmit[signature] = emit_fn
@@ -117,6 +123,7 @@ def register_op(annotation: Union[str, Callable], name: Optional[str] = None,
                 input_gen_fn: Callable[[IRFwOperation], List[torch.Tensor]] = None,
                 fake_fn: Optional[Callable] = None,
                 fake_fn_on_cpu: bool = False,
+                fake_fn_cacheable: bool = False,
     ) -> Callable:
     """
     Register a function with IRDimops annotations.
@@ -199,6 +206,18 @@ def register_op(annotation: Union[str, Callable], name: Optional[str] = None,
             must support CPU inputs. Pure CUDA/meta tracing keeps its device
             placement. Defaults to False, preserving the strategy's behavior.
 
+        fake_fn_cacheable (bool): opt into trace-local output reuse under the
+            reuse_cache strategy. Requires fake_fn_on_cpu. The fake must be
+            pure and depend only on tensor metadata and non-tensor arguments,
+            never tensor contents, RNG or external state. It must return fresh
+            tensors (or tuples of tensors), without mutating or aliasing inputs.
+            Only outputs are reused; every call retains its current input values.
+            This inherits reuse_cache's value/alias approximations: do not opt
+            in for mutation-sensitive or data-dependent tracing consumers.
+            Set NNSCALER_CACHE_CPU_FAKE_OUTPUTS=0 before importing NNScaler to
+            disable this reuse without disabling the ordinary-op cache.
+            Other strategies continue executing the fake normally.
+
     Returns:
         fn (Callable): the runtime function
     """
@@ -211,6 +230,8 @@ def register_op(annotation: Union[str, Callable], name: Optional[str] = None,
 
         if fake_fn is not None and not callable(fake_fn):
             raise TypeError("Expected a fake function")
+        if fake_fn_cacheable and not fake_fn_on_cpu:
+            raise ValueError('fake_fn_cacheable requires fake_fn_on_cpu')
         if fake_fn_on_cpu and fake_fn is None:
             raise ValueError('fake_fn_on_cpu requires fake_fn')
 
@@ -328,6 +349,7 @@ def register_op(annotation: Union[str, Callable], name: Optional[str] = None,
             input_gen_fn=input_gen_fn,
             fake_fn=fake_fn,
             fake_fn_on_cpu=fake_fn_on_cpu,
+            fake_fn_cacheable=fake_fn_cacheable,
         )
         return fn
 

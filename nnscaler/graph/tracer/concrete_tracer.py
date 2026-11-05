@@ -266,8 +266,9 @@ class ConcreteTracer(TracerBase):
                         and self.strategy.main_device == 'cpu'):
                     # Module.cpu() does not move unregistered tensor attributes.
                     # Place all fake inputs on CPU without a CUDA round trip.
-                    return self.strategy._run_call_function_on(
-                        target, args_unwrapped, kwargs_unwrapped, device='cpu',
+                    return self.strategy.run_cpu_fake(
+                        target, args_unwrapped, kwargs_unwrapped,
+                        cacheable=wrap_info.fake_fn_cacheable,
                     )
                 return self.strategy.run_target(kind, target, args_unwrapped, kwargs_unwrapped)
 
