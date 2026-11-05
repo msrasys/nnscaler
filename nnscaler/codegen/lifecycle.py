@@ -4,8 +4,12 @@
 from typing import Iterable, Dict, List, Any
 import itertools
 
+from nnscaler.flags import CompileFlag
 from nnscaler.ir.cten import IRCell, IRTensor, IRObject
 from nnscaler.ir.tensor import IRSubTensor
+from nnscaler.ir.operator import IRFwOperation
+from nnscaler.ir.adapter import IRAdapter
+from nnscaler.ir.adapter.prim import IdentityPrim
 from nnscaler.graph.segment import IRSegment
 from nnscaler.execplan.execplan import ExeReuseCell
 
@@ -25,6 +29,17 @@ class LifeCycle:
         self.lifetime: Dict[IRObject, int] = {}
         # the tensors can be released given the finish of line id
         self.release: Dict[int, List[IRObject]] = {}
+        # forward segment outputs whose data has left the device after their last
+        # forward use (all consumers are sends) but which stay alive only as roots
+        # of a later backward call; keyed by that last forward line. Their storage
+        # can be dropped there while the tensor object (and autograd graph) is kept.
+        self.release_storage: Dict[int, List[IRSubTensor]] = {}
+        # the last line id of forward activations
+        fw_lifetime: Dict[IRObject, int] = {}
+        releasable: List[IRSubTensor] = []
+        # tensors consumed by a forward node that may keep or alias them locally,
+        # i.e. anything but an adapter without local outputs (a pure send).
+        kept_locally = set()
 
         # FIXME: consider the case of IRObject in the kwargs of IRFwOperation
         # is_activation = lambda t: isinstance(t, IRObject) and not t.is_attr()
@@ -42,10 +57,21 @@ class LifeCycle:
                 # for module code generation, no IRSegment/ExeReuseCell will be used.
                 # so will not go into this branch.
 
-                # forward segment
+                # forward segment/adapter/dataloader
                 if node.isfw():
                     outputs = node.outputs()
                     inputs = node.inputs()
+                    cell = node.cell if isinstance(node, ExeReuseCell) else node
+                    if CompileFlag.pipeline_deallocate_outputs and isinstance(cell, IRSegment):
+                        # ExeReuseCell outputs are per-micro-batch copies of the segment
+                        # outputs with the same nesting, so flattening both aligns them.
+                        tensors = IRSegment.get_objects_from_complex(outputs)
+                        cell_tensors = IRSegment.get_objects_from_complex(cell.outputs())
+                        assert len(tensors) == len(cell_tensors), f'output mismatch: {node} vs {cell}'
+                        releasable.extend(
+                            t for t, cell_t in zip(tensors, cell_tensors)
+                            if is_activation(t) and self._is_releasable_output(cell, cell_t)
+                        )
                 # backward segment
                 else:
                     # in `_train_step`, we will explicitly call backward to generate gradients.
@@ -70,6 +96,20 @@ class LifeCycle:
             # "fast-forward" all inputs to the current statement, namely after 'i'-th node.
             self.lifetime.update((tin, i) for tin in IRSegment.get_objects_from_complex(inputs) if is_activation(tin))
 
+            if CompileFlag.pipeline_deallocate_outputs and node.isfw():
+                fw_lifetime.update((t, i) for t in IRSegment.get_objects_from_complex(list(inputs) + list(outputs)) if is_activation(t))
+                cell = node.cell if isinstance(node, ExeReuseCell) else node
+                # A pure send is a generated adapter without local outputs. A custom
+                # differentiable adapter runs user autograd code that may save its input.
+                # TODO: adapters with local outputs could also qualify when every prim
+                # allocates a fresh output (all_gather, all_to_all, reduce_scatter, ...),
+                # i.e. no IdentityPrim and not differentiable. Chunk only yields a view,
+                # so releasing its input frees nothing. Kept conservative for now.
+                is_send = (isinstance(cell, IRAdapter) and len(outputs) == 0
+                           and not (cell.differentiable and cell.custom))
+                if not is_send:
+                    kept_locally.update(t for t in IRSegment.get_objects_from_complex(inputs) if is_activation(t))
+
 
         # Here (i+1) is always greater than 'len(nodes)'
         # Generally we don't manually release those tensors since the enclosing function is about to
@@ -79,6 +119,40 @@ class LifeCycle:
 
         for tensor, line_id in self.lifetime.items():
             self.release.setdefault(line_id, []).append(tensor)
+
+        if CompileFlag.pipeline_deallocate_outputs:
+            for tensor in releasable:
+                if tensor in graph_outputs or tensor in kept_locally:
+                    continue
+                if fw_lifetime[tensor] < self.lifetime[tensor]:
+                    self.release_storage.setdefault(fw_lifetime[tensor], []).append(tensor)
+
+    @staticmethod
+    def _is_releasable_output(segment: IRSegment, output: IRSubTensor) -> bool:
+        """
+        Whether a forward segment output may own its runtime object. identity/
+        multiref/IdentityPrim exist to fan a tensor out to several consumers, so
+        their outputs are the same Python object as a sibling that may still be
+        consumed later in forward; dropping one would drop the other, and the
+        runtime cannot tell two names for one object apart. Other producers may
+        also return their input (in-place ops, no-op `contiguous`/`to`), but then
+        any remaining holder of that object shows up in its impl use count, which
+        `Executor.release_storage` checks before swapping the data.
+        """
+        producers = segment.producers(output.parent)
+        if len(producers) != 1:
+            return False
+        producer = producers[0]
+        if isinstance(producer, IRAdapter):
+            return not any(isinstance(prim, IdentityPrim) for prim in producer.prims)
+        return isinstance(producer, IRFwOperation) and producer.name not in ('identity', 'multiref')
+
+    def release_storage_after_line(self, line_id: int) -> List[IRSubTensor]:
+        """
+        Get the forward outputs whose storage can be dropped after `line_id`
+        while keeping the tensors as backward roots.
+        """
+        return self.release_storage.get(line_id, [])
 
     def release_tensors_after_line(self, line_id: int) -> List[IRSubTensor]:
         """

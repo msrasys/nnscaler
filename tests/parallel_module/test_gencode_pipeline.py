@@ -84,6 +84,21 @@ def test_gencode_correct_dataloader_order(tmp_path):
     rank0_dataloader_ops = _gencode_contains(tmp_path, PPModule1, 0, r'.*next\(\*\(dataloader\_.*')
     rank1_dataloader_ops = _gencode_contains(tmp_path, PPModule1, 1, r'.*next\(\*\(dataloader\_.*')
     assert rank0_dataloader_ops == rank1_dataloader_ops
+
+    # A stage output whose only forward consumer is the send to the next stage
+    # has its storage released right after that send, while it stays a backward root.
+    # Graph outputs (the loss on rank 1) and received tensors are never released.
+    sent_then_released = _gencode_contains(
+        tmp_path, PPModule1, 0,
+        r'aexecute\(model\.adapter\d+, \*\((\w+), \), requires_grad=False\)\n\s*'
+        r'nnscaler\.runtime\.executor\.release_storage\(\1\)',
+    )
+    stage_outputs = _gencode_contains(
+        tmp_path, PPModule1, 0, r'(\w+) = nnscaler\.runtime\.executor\.fexecute\(.*requires_grad=True\)')
+    assert len(stage_outputs) == 2 and sent_then_released == stage_outputs
+    assert all(
+        _gencode_contains(tmp_path, PPModule1, 0, rf'backward\(.*\({name}, \)') for name in stage_outputs)
+    assert not _gencode_contains(tmp_path, PPModule1, 1, r'release_storage\(')
     # code looks like:
     # rank1:
     # def _train_step(model, dataloader_33):
@@ -109,6 +124,34 @@ def test_gencode_correct_dataloader_order(tmp_path):
     #     sum_1_24 = nnscaler.runtime.executor.aexecute(model.adapter56, *(sum_1_24, ), requires_grad=True)
     #     sum_1_65 = nnscaler.runtime.executor.aexecute(model.adapter56, *(sum_1_65, ), requires_grad=True)
     #     return [sum_1_24, {'data': data_23}], [sum_1_65, {'data': data_48}]
+
+
+@replace_all_device_with('cpu')
+def test_gencode_pipeline_deallocate_outputs_disabled(tmp_path):
+    m = PPModule1(return_type=3)
+    m.train()
+    parallelize(
+        m,
+        {'data': torch.randn(64, 1024)},
+        pas_policy=lambda graph, cfg: pp_pas(graph, cfg, nlayers_per_stage=2),
+        compute_config= ComputeConfig(
+            2, 2,
+            constant_folding=False,
+            use_end2end=True,
+            pipeline_deallocate_outputs=False,
+            pas_config=dict(
+                pipeline_nmicros=2,
+                pipeline_nstages=2,
+                pipeline_scheduler='1f1b'
+            )
+        ),
+        gen_savedir=tmp_path,
+        load_module=False,
+        reuse='override',
+        max_workers=2,
+    )
+    for rank in (0, 1):
+        assert not _gencode_contains(tmp_path, PPModule1, rank, r'release_storage\(')
 
 
 @replace_all_device_with('cpu')
@@ -498,6 +541,19 @@ def test_split_segment_with_shared_output(tmp_path):
     assert not _gencode_contains(
         tmp_path, SharedOutputSegmentModule, 0, r'nnscaler.runtime.adapter.nn.allgather_split'
     )
+
+    # Stage 0 sends both outputs. `add_148` comes from the output identity over a
+    # multiref branch that is still used locally (same runtime object), so only
+    # the freshly computed `add_1_72` has its storage released after its send.
+    alias_out, fresh_out = _gencode_contains(
+        tmp_path, SharedOutputSegmentModule, 0, r'\n        return (\w+), (\w+)\n')[0]
+    assert _gencode_contains(
+        tmp_path, SharedOutputSegmentModule, 0, rf'{alias_out} = nnscaler\.runtime\.function\.identity\(')
+    for name in (alias_out, fresh_out):
+        assert _gencode_contains(
+            tmp_path, SharedOutputSegmentModule, 0, rf'aexecute\(model\.adapter\d+, \*\({name}, \), requires_grad=False\)')
+    assert _gencode_contains(tmp_path, SharedOutputSegmentModule, 0, rf'release_storage\({fresh_out}\)')
+    assert not _gencode_contains(tmp_path, SharedOutputSegmentModule, 0, rf'release_storage\({alias_out}\)')
 
     # after narrowing, no allgather_split should be present
     # def segment39(self, data_32):

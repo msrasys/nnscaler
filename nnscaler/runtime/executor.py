@@ -20,6 +20,10 @@ from ._patch_torch import stage_backward_input, stage_backward_weight
 _logger = logging.getLogger(__name__)
 
 _ALLOW_GRAD_DTYPES = (torch.double, torch.float32, torch.float16, torch.bfloat16)
+# Number of holders of a tensor's TensorImpl. Exposed since torch 2.4.0; on the
+# older versions this package still supports (>=2.0) it is None and
+# `release_storage` is a no-op, i.e. no storage is freed but nothing breaks.
+_use_count = getattr(torch.Tensor, '_use_count', None)
 
 
 def debug_id(tensors, msg: str, rank: int):
@@ -65,7 +69,10 @@ class _AsyncCommHandler:
         self._callbacks[tensor] = callback
 
     def hold_send(self, tensor: torch.Tensor, work: Work):
-        self._send_holds.append((tensor, work))
+        # Hold an alias instead of the tensor itself: `Executor.release_storage`
+        # may swap the sender's output to a placeholder right after the send is
+        # issued, and the alias keeps the real buffer alive until the work completes.
+        self._send_holds.append((tensor.detach(), work))
 
     def drain_sends_completed(self):
         running: list[tuple[torch.Tensor, Work]] = []
@@ -338,9 +345,13 @@ class Executor:
             return None
 
         # PyTorch's helper detaches stage outputs in-place. A view cannot be
-        # detached in-place, so use a differentiable clone for that case.
+        # detached in-place, so use a differentiable clone for that case, except
+        # for a view already emptied by `release_storage`: cloning its stride-0
+        # placeholder would allocate the full buffer again, and the backend skips
+        # the in-place detach for views.
         stage_outputs = [
-            tensor.clone() if tensor._is_view() else tensor
+            tensor.clone() if tensor._is_view() and tensor.untyped_storage().nbytes() > tensor.element_size()
+            else tensor
             for tensor in dedup_output_tensors
         ]
         grads, param_groups = stage_backward_input(
@@ -387,6 +398,46 @@ class Executor:
                 state.output_tensors,
                 grad_tensors=state.output_tensor_grads,
             )
+
+    @staticmethod
+    def release_storage(*tensors: torch.Tensor):
+        """
+        Free the storage of forward outputs that are only kept as roots for a
+        later `Executor.backward`, e.g. a pipeline stage output after it was sent.
+        The data is swapped for a stride-0 view of one element: the tensor keeps
+        its shape, dtype and grad_fn, so backward (and its grad shape check)
+        works unchanged, while the real buffer is released.
+
+        Swapping `.data` rewrites the TensorImpl in place, so it is only safe when
+        nothing else holds that impl. Autograd saves a node's *output* (e.g. tanh's
+        result) as a detached shallow copy that merely shares the storage, because
+        holding the original would form the cycle Node -> SavedVariable ->
+        Variable.grad_fn -> Node that refcounting never frees; such copies are not
+        affected (and keep the buffer alive, so nothing is gained). A node's
+        *input* has no such cycle and is saved as the original impl, as is the base
+        of a view. `_use_count` sees both, so a tensor is released only when it is
+        held by nothing but its own Python object; a view is released together
+        with its root base when that base is held by nothing but this view. This
+        covers outputs that alias an internal tensor (ops returning their input,
+        ZeRO-3's `insert_backward_hook` views) without knowing the op. A plain
+        attribute like `ctx.out = out` is not visible to this check.
+        """
+        if _use_count is None:
+            return
+        for t in tensors:
+            if not (torch.is_tensor(t) and t.grad_fn is not None and t.layout == torch.strided):
+                continue
+            if _use_count(t) != 1:
+                continue
+            base = t._base
+            if base is None:
+                targets = (t,)
+            elif _use_count(base) == 2:  # the base's Python object plus this view
+                targets = (t, base)
+            else:
+                continue
+            for x in targets:
+                x.data = torch.empty((), dtype=x.dtype, device=x.device).expand(x.shape)
 
     @staticmethod
     def sync_tensors(tensors: List[Any]) -> List[Any]:
@@ -441,6 +492,7 @@ backward = Executor.backward
 backward_input = Executor.backward_input
 backward_weight = Executor.backward_weight
 sync_tensors = Executor.sync_tensors
+release_storage = Executor.release_storage
 
 
 @contextmanager
