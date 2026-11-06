@@ -155,8 +155,10 @@ class AsyncCommHandler:
         drain_stream_holds(wait=True)
 
     def clear(self):
-        drain_stream_holds(wait=True)
-        AsyncCommHandler.instance = AsyncCommHandler.__AsyncCommHandler()
+        try:
+            drain_stream_holds(wait=True)
+        finally:
+            AsyncCommHandler.instance = AsyncCommHandler.__AsyncCommHandler()
 
     def check_clear(self):
         assert (
@@ -239,10 +241,30 @@ class Executor:
             callback(grad.detach())
 
     @staticmethod
+    def _pop_forward_inputs(name, requested):
+        saved_pairs = Executor._detach[name].pop(0)
+        opaque_inputs = Executor._backward_owners[name].pop(0)
+        pruned_ids = {tid for tid, tensor in saved_pairs if tensor is None}
+        for tensor in requested:
+            if torch.is_tensor(tensor) and tensor.requires_grad and id(tensor) in pruned_ids:
+                raise RuntimeError('Segment input requires_grad was enabled after forward')
+        return saved_pairs, opaque_inputs
+
+    @staticmethod
+    def _apply_backward_pre_hook(inputs, outputs, grads, track_stream):
+        if Executor._backward_pre_hook is None:
+            return inputs, outputs, grads
+        # The hook may read an old tensor then replace it with a new one.
+        # Protect the old storage before the hook submits CUDA work.
+        with input_stream_lifetime((inputs, outputs, grads), track_stream):
+            return Executor._backward_pre_hook(inputs, outputs, grads)
+
+    @staticmethod
     def fexecute(name: str, subgraph: Callable, *input_tensors: Tuple[Any],
-                 requires_grad=True, track_stream=False):
+                 requires_grad=True, track_stream=True):
         """
-        forward the sub-graph.
+        Forward the sub-graph. Tracking defaults on for direct callers;
+        generated single-stream plans explicitly pass ``track_stream=False``.
         """
         original_inputs = input_tensors
         input_tensors = Executor.sync_tensors(input_tensors)
@@ -286,7 +308,7 @@ class Executor:
 
     @staticmethod
     def aexecute(subgraph: Callable, *input_tensors: Tuple[Any],
-                 requires_grad=True, track_stream=False):
+                 requires_grad=True, track_stream=True):
         """
         execute adapter
         """
@@ -307,7 +329,7 @@ class Executor:
     def backward(name: str,
                  input_tensors: List[torch.Tensor],
                  output_tensors: List[torch.Tensor],
-                 output_tensor_grads: List[torch.Tensor], *, track_stream=False) -> Tuple[torch.Tensor]:
+                 output_tensor_grads: List[torch.Tensor], *, track_stream=True) -> Tuple[torch.Tensor]:
         """
         Backward Procedure.
 
@@ -327,8 +349,7 @@ class Executor:
         """
         output_tensor_grads = Executor.sync_tensors(output_tensor_grads)
 
-        saved_pairs = Executor._detach[name].pop(0)
-        opaque_inputs = Executor._backward_owners[name].pop(0)
+        saved_pairs, opaque_inputs = Executor._pop_forward_inputs(name, input_tensors)
         tensor_ids: List[int] = [pair[0] for pair in saved_pairs]
         dtensors: List[torch.Tensor] = [pair[1] for pair in saved_pairs]
         requested_input_tensors = input_tensors
@@ -340,11 +361,7 @@ class Executor:
             for tid, dtensor in saved_pairs
             if torch.is_tensor(dtensor)
         }
-        pruned_ids = {tid for tid, tensor in saved_pairs if tensor is None}
-
         for t in requested_input_tensors:
-            if torch.is_tensor(t) and t.requires_grad and id(t) in pruned_ids:
-                raise RuntimeError('Segment input requires_grad was enabled after forward')
             if torch.is_tensor(t) and id(t) not in tensor_ids:
                 import traceback
                 _logger.warning(
@@ -375,13 +392,11 @@ class Executor:
                 dedup_output_tensor_grads.append(g)
 
         # apply hook before backward
-        if Executor._backward_pre_hook is not None:
-            input_tensors, dedup_output_tensors, dedup_output_tensor_grads = \
-                Executor._backward_pre_hook(
-                    input_tensors,
-                    dedup_output_tensors,
-                    dedup_output_tensor_grads
-                )
+        input_tensors, dedup_output_tensors, dedup_output_tensor_grads = \
+            Executor._apply_backward_pre_hook(
+                input_tensors, dedup_output_tensors, dedup_output_tensor_grads,
+                track_stream or bool(opaque_inputs),
+            )
 
         pseudo_free_output_ids = []
         backward_roots = []
@@ -438,7 +453,7 @@ class Executor:
         output_tensors: List[torch.Tensor],
         output_tensor_grads: List[Optional[torch.Tensor]],
         weights: Iterable[torch.nn.Parameter],
-        *, track_stream=False,
+        *, track_stream=True,
     ) -> Any:
         """Compute input gradients and defer weight gradients.
 
@@ -449,14 +464,10 @@ class Executor:
         weights = tuple(weights)
         requested_input_tensors = input_tensors
 
-        saved_pairs = Executor._detach[name].pop(0)
-        opaque_inputs = Executor._backward_owners[name].pop(0)
+        saved_pairs, opaque_inputs = Executor._pop_forward_inputs(name, input_tensors)
         tensor_ids: List[int] = [pair[0] for pair in saved_pairs]
         dtensors: List[torch.Tensor] = [pair[1] for pair in saved_pairs]
-        pruned_ids = {tid for tid, tensor in saved_pairs if tensor is None}
         for tensor in input_tensors:
-            if torch.is_tensor(tensor) and tensor.requires_grad and id(tensor) in pruned_ids:
-                raise RuntimeError('Segment input requires_grad was enabled after forward')
             if id(tensor) not in tensor_ids:
                 import traceback
                 _logger.warning(
@@ -487,13 +498,11 @@ class Executor:
                 dedup_output_tensors.append(tensor)
                 dedup_output_tensor_grads.append(grad)
 
-        if Executor._backward_pre_hook is not None:
-            input_tensors, dedup_output_tensors, dedup_output_tensor_grads = \
-                Executor._backward_pre_hook(
-                    input_tensors,
-                    dedup_output_tensors,
-                    dedup_output_tensor_grads,
-                )
+        input_tensors, dedup_output_tensors, dedup_output_tensor_grads = \
+            Executor._apply_backward_pre_hook(
+                input_tensors, dedup_output_tensors, dedup_output_tensor_grads,
+                track_stream or bool(opaque_inputs),
+            )
 
         if not input_tensors:
             Executor._weight_backward_states.setdefault(name, []).append(
@@ -547,7 +556,7 @@ class Executor:
     def backward_weight(
         name: str,
         weights: Iterable[torch.nn.Parameter],
-        *, track_stream=False,
+        *, track_stream=True,
     ) -> None:
         """Compute weight gradients deferred by ``backward_input``."""
         weights = tuple(weights)
@@ -700,14 +709,16 @@ class Executor:
     
     @staticmethod
     def clear():
-        drain_stream_holds(wait=True)
-        Executor._detach = dict()
-        Executor._backward_owners = dict()
-        Executor._pseudo_free_grad_edges = dict()
-        Executor._pseudo_free_pending_sends = dict()
-        Executor._weight_backward_states = dict()
-        Executor._backward_pre_hook = None
-        Executor._input_grad_callbacks = dict()
+        try:
+            drain_stream_holds(wait=True)
+        finally:
+            Executor._detach = dict()
+            Executor._backward_owners = dict()
+            Executor._pseudo_free_grad_edges = dict()
+            Executor._pseudo_free_pending_sends = dict()
+            Executor._weight_backward_states = dict()
+            Executor._backward_pre_hook = None
+            Executor._input_grad_callbacks = dict()
 
     @staticmethod
     def check_clear():

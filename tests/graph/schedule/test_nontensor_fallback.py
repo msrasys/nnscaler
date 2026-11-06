@@ -15,7 +15,7 @@ from nnscaler.graph import IRGraph
 from nnscaler.graph.segment import IRSegment
 from nnscaler.graph.function.pyfunc import IRPyFunc
 from nnscaler.ir.cten import IRObject
-from nnscaler.ir.operator import IRDataOperation
+from nnscaler.ir.operator import IRDataOperation, IRFwOperation
 from nnscaler.runtime.utils import MicroBatchDataLoader
 
 
@@ -145,3 +145,91 @@ def test_random_sample_plan_reuses_then_releases_the_same_owner():
         released = lifetime.release_tensors_after_node(node)
         exec(emitter.emit_release(released), namespace)
         assert (runtime_loader.reference() is not None) == (index == 0)
+
+
+@pytest.mark.parametrize('scheduled', [False, True])
+def test_replay_does_not_substitute_the_first_data_output(scheduled):
+    loader = IRObject('dataloader')
+    first, second = IRObject('first'), IRObject('second')
+    read = IRDataOperation(loader, (first, second))
+    lookup = IRPyFunc('_operator.getitem', [second, 'value'], [IRObject('value')])
+    stage = IRSegment([], [lookup.output(0)], [])
+    consumer = ExeReuseCell(stage, stage.inputs(), [], micro_batch_id=0)
+    emitter = ScheduleCodeGen.__new__(ScheduleCodeGen)
+    emitter.execplan = SimpleNamespace(graph=IRGraph([read, lookup], [loader], [], 'roots'))
+    nodes = [consumer]
+    if not scheduled:
+        with pytest.raises(ValueError, match='dat[a-z]+ root is ambiguous'):
+            emitter._plan_sample_reads(nodes)
+        return
+    nodes.insert(0, ExeReuseCell(read, [loader], [first, second], micro_batch_id=0))
+    plan = emitter._plan_sample_reads(nodes)[consumer]
+    namespace = {'_operator': operator, emitter.tensor_name(first): {'value': 3},
+                 emitter.tensor_name(second): {'value': 7}}
+    exec('\n'.join(plan.codes), namespace)
+    assert namespace[emitter.tensor_name(lookup.output(0))] == 7
+
+
+@pytest.mark.parametrize('other_delete', [False, True])
+def test_dead_sample_delete_does_not_keep_the_dataloader_read(other_delete):
+    code = '\n'.join([
+        'def run(dataloader_1):',
+        '    samples_5 = next(*(dataloader_1, ))',
+        '    other = 4',
+        '    del samples_5' + (', other' if other_delete else ''),
+        '    return 7',
+    ])
+    code = ScheduleCodeGen._remove_dead_dataloader_reads(code)
+    namespace = {}
+    exec(code, namespace)
+    source = iter([1, 2])
+    assert namespace['run'](source) == 7
+    assert next(source) == 1
+
+
+def test_dead_segment_keeps_its_argument_without_reading_a_sample():
+    code = '\n'.join([
+        'def run(dataloader_1):',
+        '    samples_5 = next(*(dataloader_1, ))',
+        "    result = fexecute('segment2', samples_5)",
+        '    del samples_5',
+        '    return result',
+    ])
+    code = ScheduleCodeGen._remove_dead_dataloader_reads(code, {'segment2'})
+    calls = []
+
+    def execute(name, unused):
+        calls.append((name, unused))
+        return 7
+
+    namespace = {'fexecute': execute}
+    exec(code, namespace)
+    assert namespace['run'](iter(())) == 7
+    assert calls == [('segment2', None)]
+
+
+def test_sample_with_a_real_consumer_is_not_pruned():
+    code = '\n'.join([
+        'def run(dataloader_1):',
+        '    samples_5 = next(*(dataloader_1, ))',
+        "    result = samples_5['value']",
+        '    del samples_5',
+        '    return result',
+    ])
+    namespace = {}
+    exec(ScheduleCodeGen._remove_dead_dataloader_reads(code), namespace)
+    source = iter([{'value': 7}, {'value': 9}])
+    assert namespace['run'](source) == 7
+    assert next(source)['value'] == 9
+
+
+@pytest.mark.parametrize('use', ['return', 'keyword'])
+def test_returned_or_keyword_sample_is_not_a_dead_segment_input(use):
+    sample = IRObject('samples')
+    if use == 'return':
+        segment = IRSegment([], [sample], [sample])
+    else:
+        operation = IRFwOperation('consume', 'consume', [], 0, metadata={'sample': sample})
+        segment = IRSegment([operation], [sample], [])
+    emitter = ScheduleCodeGen.__new__(ScheduleCodeGen)
+    assert not emitter._find_dead_samples_segments([segment])

@@ -2,6 +2,7 @@
 # Licensed under the MIT License.
 
 import ast
+import weakref
 
 import pytest
 import torch
@@ -58,3 +59,45 @@ def test_unused_outer_input_stays_out_of_recompute_scope(whole_group, unused_ten
                   if isinstance(node, ast.FunctionDef) and node.name == 'recompute')
     name = emitter.tensor_name(unused)
     assert all(not isinstance(node, ast.Name) or node.id != name for node in ast.walk(nested))
+
+
+@pytest.mark.parametrize('metadata', [False, True])
+def test_final_recompute_consumer_releases_the_outer_input(metadata):
+    def tensor(name):
+        return IRFullTensor((4,), name=name, dtype=torch.float64).tosub()
+
+    x, a, b, result = [tensor(name) for name in ('x', 'a', 'b', 'result')]
+    extra = IRObject('extra') if metadata else tensor('extra')
+    nodes = []
+    for signature, inputs, output, group in [('torch.sin', [x], a, 0),
+                                             ('consume', [a, extra], b, 0),
+                                             ('later', [b], result, None)]:
+        node = IRFwOperation(signature, signature, inputs, 1)
+        node.set_output(0, output)
+        node.device, node.recompute = (0,), group
+        nodes.append(node)
+    segment = IRSegment(nodes, [x, extra], [result])
+    emitter = ModuleCodeGen.__new__(ModuleCodeGen)
+    FuncEmission.__init__(emitter)
+    emitter.plan_ndevs = emitter.runtime_ndevs = 1
+    lines = emitter.emit_segment(segment, 0)
+    payload = torch.ones(4, dtype=torch.float64)
+    reference = weakref.ref(payload)
+    arguments = [{'tensor': payload} if metadata else payload]
+    del payload
+
+    def later(value):
+        assert reference() is None
+        return value.cos()
+
+    namespace = dict(torch=torch, ckpt=ckpt, later=later,
+                     consume=lambda value, extra: value + (extra['tensor'] if metadata else extra))
+    source = '\n'.join([
+        'def run(' + ', '.join(emitter.tensor_name(v) for v in segment.inputs()) + '):',
+        *['    ' + line for line in lines],
+        '    return ' + emitter.tensor_name(result),
+    ])
+    exec(source, namespace)
+    with torch.no_grad():
+        actual = namespace['run'](torch.ones(4, dtype=torch.float64), arguments.pop())
+    torch.testing.assert_close(actual, (torch.ones_like(actual).sin() + 1).cos())

@@ -1057,7 +1057,9 @@ class ModuleCodeGen(FuncEmission):
                 last_node = rc_group[-1]
                 line = lifetime.get_line(last_node)
                 if last_node != nodes[-1]: # skip if it is the last node
-                    inputs_to_rel = [t for t in rc_segment.inputs() if lifetime.releasable_after_line(t, line)]
+                    # The checkpoint call has consumed the group's final node
+                    # too; its last-use inputs may now leave the outer scope.
+                    inputs_to_rel = [t for t in rc_segment.inputs() if lifetime.releasable_after_line(t, line + 1)]
                     if len(inputs_to_rel) > 0:
                         del_stmt = self.emit_release(inputs_to_rel)
                         codes.append(del_stmt)

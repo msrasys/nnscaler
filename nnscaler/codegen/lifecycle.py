@@ -143,7 +143,6 @@ class LifeCycle:
             return False
 
         assert node in self.nodes
-        assert obj in self.lifetime
         line_id = self.nodes[node]
         return self.lifetime[obj] < line_id
 
@@ -161,7 +160,6 @@ class LifeCycle:
         if not isinstance(obj, IRObject) or obj not in self.lifetime:
             return False
 
-        assert obj in self.lifetime
         return self.lifetime[obj] < line
 
     def get_line(self, node: IRCell) -> int:

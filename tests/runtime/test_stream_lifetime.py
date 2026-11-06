@@ -1,7 +1,7 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 
-from collections import namedtuple
+from collections import OrderedDict, namedtuple
 from dataclasses import dataclass
 from types import SimpleNamespace
 import gc
@@ -73,7 +73,7 @@ def emitted_forward(inference, default_consumer, multi_streams=True):
 
 def test_default_consumer_in_multi_stream_plan_enables_runtime_tracking():
     assert 'track_stream=True' in emitted_forward(False, True)[2]
-    assert 'track_stream=' not in emitted_forward(False, True, False)[2]
+    assert 'track_stream=False' in emitted_forward(False, True, False)[2]
 
 
 def test_stream_tracking_consumes_replayed_metadata_after_it_is_defined():
@@ -138,7 +138,7 @@ class SlotsOwner:
 @pytest.mark.skipif(not torch.cuda.is_available(), reason='requires CUDA')
 @pytest.mark.parametrize('inference', [False, True])
 @pytest.mark.parametrize('default_consumer', [False, True])
-@pytest.mark.parametrize('container', ['nested', 'namedtuple', 'opaque', 'protocol', 'dict_subclass', 'slots'])
+@pytest.mark.parametrize('container', ['nested', 'namedtuple', 'opaque', 'protocol', 'dict_subclass', 'ordered_attributes', 'slots'])
 def test_generated_forward_releases_container_without_reusing_pending_storage(
     inference, default_consumer, container,
 ):
@@ -172,6 +172,9 @@ def test_generated_forward_releases_container_without_reusing_pending_storage(
             metadata = OpaqueOwner(value)
         elif container == 'dict_subclass':
             metadata = DictOwner(value)
+        elif container == 'ordered_attributes':
+            metadata = OrderedDict()
+            metadata.payload = value
         elif container == 'slots':
             metadata = SlotsOwner(value)
         else:

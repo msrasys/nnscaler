@@ -487,9 +487,12 @@ class ScheduleCodeGen(FuncEmission):
             adapter_name = self.node_name(adapter)
             tensor_name = self.tensor_name(pending_out)
             req_grad = isinstance(pending_out, IRTensor) and pending_out.requires_grad
+            context = self._get_node_stream_context(node)
+            track_stream = self.execplan.use_multi_streams or bool(context and context.stream)
             codes.append(
                 f'{tensor_name} = nnscaler.runtime.executor.aexecute('
-                f'model.{adapter_name}_wait, *({tensor_name}, ), requires_grad={req_grad})'
+                f'model.{adapter_name}_wait, *({tensor_name}, ), requires_grad={req_grad}, '
+                f'track_stream={track_stream})'
             )
         return codes
 
@@ -583,13 +586,20 @@ class ScheduleCodeGen(FuncEmission):
         graph_inputs = IR.get_objects(self.execplan.graph.inputs())
         dataloader = next((obj for obj in graph_inputs
                            if self.tensor_name(obj).startswith('dataloader_')), None)
+        data_ops = [node for node in self.execplan.graph.nodes(flatten=True)
+                    if isinstance(node, IRDataOperation)]
+        # get_micro_batch(mid) returns the single sample from this loader. It
+        # cannot stand in for an arbitrary output of another data operation.
+        loader_ops = [node for node in data_ops if dataloader is not None
+                      and node.input(0).tid == dataloader.tid]
+        fallback_tid = (loader_ops[0].output(0).tid
+                        if len(loader_ops) == 1 and len(loader_ops[0].outputs()) == 1 else None)
         scheduled_samples = {}
         for node in nodes:
             if isinstance(node, ExeReuseCell) and isinstance(node.cell, IRDataOperation):
-                sample = next((obj for obj in node.outputs()
-                               if isinstance(obj, IRObject) and not isinstance(obj, IRTensor)), None)
-                if sample is not None and node.micro_batch_id is not None:
-                    scheduled_samples.setdefault(node.micro_batch_id, sample)
+                for original, sample in zip(node.cell.outputs(), node.outputs()):
+                    if isinstance(sample, IRObject) and not isinstance(sample, IRTensor):
+                        scheduled_samples[original.tid, node.micro_batch_id] = sample
 
         produced = {obj.tid for obj in graph_inputs}
         fallback_samples, plans = {}, {}
@@ -611,10 +621,14 @@ class ScheduleCodeGen(FuncEmission):
                     continue
                 source = available.get(access.sample_tid)
                 if source is None and dataloader is not None and mid is not None:
-                    sample = scheduled_samples.get(mid)
+                    sample = scheduled_samples.get((access.sample_tid, mid))
                     if sample is not None and sample.tid in produced:
                         source = sample
                     else:
+                        if access.sample_tid != fallback_tid:
+                            raise ValueError(
+                                f'Cannot replay sample {access.sample_tid} for microbatch {mid}: '
+                                'no matching sample is available and the dataloader root is ambiguous')
                         source = fallback_samples.get(mid)
                         if source is None:
                             source = fallback_samples[mid] = IRObject(f'_samples_{mid}')
@@ -652,9 +666,9 @@ class ScheduleCodeGen(FuncEmission):
                         samples_tids.add(inp.tid)
             if not samples_tids:
                 continue
-            used = False
+            used = any(obj.tid in samples_tids for obj in IR.get_objects(unwrap_node.outputs()))
             for internal_node in unwrap_node.nodes(flatten=True):
-                for inp in internal_node.inputs():
+                for inp in IR.get_objects((internal_node.inputs(), internal_node.kwargs)):
                     if isinstance(inp, IRObject) and inp.tid in samples_tids:
                         used = True
                         break
@@ -692,6 +706,8 @@ class ScheduleCodeGen(FuncEmission):
                     continue
                 if not pattern.search(line):
                     continue
+                if line.lstrip().startswith('del '):
+                    continue
                 fexecute_match = _re.search(r"fexecute\('(segment\d+)'", line)
                 if fexecute_match and fexecute_match.group(1) in dead_samples_segments:
                     continue
@@ -707,8 +723,25 @@ class ScheduleCodeGen(FuncEmission):
         for i, var in next_assignments:
             if var in dead_vars:
                 dead_lines.add(i)
-        lines = [line for i, line in enumerate(lines) if i not in dead_lines]
-        return '\n'.join(lines)
+        kept = []
+        for i, line in enumerate(lines):
+            if i in dead_lines:
+                continue
+            call = _re.search(r"fexecute\('(segment\d+)'", line)
+            if call and call.group(1) in dead_samples_segments:
+                # Preserve the segment's positional signature without reading
+                # a sample it never consumes (or leaving an undefined name).
+                for name in dead_vars:
+                    line = _re.sub(r'\b' + _re.escape(name) + r'\b', 'None', line)
+            if line.lstrip().startswith('del '):
+                indent = line[:len(line) - len(line.lstrip())]
+                names = [name.strip() for name in line.lstrip()[4:].split(',')]
+                names = [name for name in names if name not in dead_vars]
+                if not names:
+                    continue
+                line = indent + 'del ' + ', '.join(names)
+            kept.append(line)
+        return '\n'.join(kept)
 
     def _emit_segment_hook_code(
             self, hook, hook_meta,
@@ -770,7 +803,9 @@ class ScheduleCodeGen(FuncEmission):
         # Record actual resolved inputs inside the executor, after metadata
         # replay and any asynchronous communication callbacks.
         track_stream = bool(stream_context and stream_context.stream) or self.execplan.use_multi_streams
-        stream_kwarg = ', track_stream=True' if track_stream else ''
+        # Omitted flags in direct/older callers default to safe tracking.
+        # Only an explicitly single-stream plan may skip it.
+        stream_kwarg = f', track_stream={track_stream}'
         prefix_codes = list(sample_reads.codes) if sample_reads else []
         if sample_reads and produced_tids is not None:
             produced_tids.update(obj.tid for obj in sample_reads.outputs)

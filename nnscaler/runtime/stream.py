@@ -4,6 +4,8 @@
 """Keep scheduled inputs alive until their consuming CUDA stream is done."""
 
 from contextlib import contextmanager
+from collections import OrderedDict
+from enum import Enum
 from threading import Lock
 
 import torch
@@ -57,14 +59,34 @@ def input_stream_lifetime(inputs, enabled):
             if isinstance(value, torch.Tensor):
                 if value.is_cuda:
                     if value.layout == torch.strided and not value.is_nested:
-                        value.record_stream(stream)
+                        try:
+                            value.record_stream(stream)
+                        except NotImplementedError:
+                            # DTensor and other wrapper subclasses may not expose
+                            # record_stream. Retain their underlying storage via
+                            # the owner instead of leaving it unprotected.
+                            opaque.append(value)
                     else:
                         opaque.append(value)
-            elif type(value) is dict:
+            elif type(value) in (dict, OrderedDict):
                 pending.extend(value.keys())
                 pending.extend(value.values())
-            elif type(value) in (list, tuple, set, frozenset):
+                if type(value) is OrderedDict:
+                    pending.extend(vars(value).values())
+            elif type(value) in (list, tuple, set, frozenset, torch.Size):
                 pending.extend(value)
+            elif isinstance(value, tuple) and hasattr(type(value), '_fields') and not hasattr(value, '__dict__'):
+                # Namedtuple fields are visible; arbitrary subclass attributes
+                # still need the opaque-owner fallback below.
+                pending.extend(value)
+            elif type(value) is slice:
+                pending.extend((value.start, value.stop, value.step))
+            elif type(value) is range:
+                pass
+            elif isinstance(value, Enum):
+                # Enum values can themselves contain tensors. Skip the class
+                # link, but traverse member values and custom member fields.
+                pending.extend(item for name, item in vars(value).items() if name != '__objclass__')
             elif type(value) not in _SCALARS:
                 record = getattr(value, 'record_stream', None)
                 if callable(record):
