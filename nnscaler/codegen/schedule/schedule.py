@@ -590,10 +590,15 @@ class ScheduleCodeGen(FuncEmission):
                     if isinstance(node, IRDataOperation)]
         # get_micro_batch(mid) returns the single sample from this loader. It
         # cannot stand in for an arbitrary output of another data operation.
-        loader_ops = [node for node in data_ops if dataloader is not None
-                      and node.input(0).tid == dataloader.tid]
-        fallback_tid = (loader_ops[0].output(0).tid
-                        if len(loader_ops) == 1 and len(loader_ops[0].outputs()) == 1 else None)
+        # Replication preserves loader/output IDs. Count logical outputs, not
+        # device copies; retain the full tuple to reject multi-output loaders.
+        loader_outputs = {
+            tuple(output.tid for output in node.outputs())
+            for node in data_ops if dataloader is not None
+            and node.input(0).tid == dataloader.tid
+        }
+        sole_outputs = next(iter(loader_outputs)) if len(loader_outputs) == 1 else ()
+        fallback_tid = sole_outputs[0] if len(sole_outputs) == 1 else None
         scheduled_samples = {}
         for node in nodes:
             if isinstance(node, ExeReuseCell) and isinstance(node.cell, IRDataOperation):

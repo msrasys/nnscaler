@@ -19,7 +19,7 @@ from nnscaler.ir.operator import IRDataOperation, IRFwOperation
 from nnscaler.runtime.utils import MicroBatchDataLoader
 
 
-def _fallback_code(lookups, *, root_input=False, root_produced=False, same_names=False):
+def _fallback_code(lookups, *, root_input=False, root_produced=False, same_names=False, replicas=1):
     loader = IRObject('dataloader')
     sample = IRObject('data')
     nodes = [IRDataOperation(loader, (sample,))]
@@ -31,6 +31,8 @@ def _fallback_code(lookups, *, root_input=False, root_produced=False, same_names
         nodes.append(node)
         value = node.output(0)
     graph = IRGraph(nodes, [loader], [value], 'metadata')
+    if replicas > 1:
+        graph.replicate(nodes[0], replicas)
     originals = [sample, value] if root_input else [value]
     codegen = ScheduleCodeGen.__new__(ScheduleCodeGen)
     codegen.execplan = SimpleNamespace(graph=graph)
@@ -114,6 +116,48 @@ def test_fallback_preserves_getitem_key_error():
         exec(code, namespace)
 
 
+@pytest.mark.parametrize('replicas', [2, 4])
+@pytest.mark.parametrize('scheduled', [False, True])
+def test_replicated_data_read_uses_the_same_microbatch(replicas, scheduled):
+    code, result, root, loader_name = _fallback_code(
+        [('getitem', 'context'), ('get', 'scale', 7)],
+        root_input=True, root_produced=scheduled, replicas=replicas,
+    )
+    first, second = {'context': {'scale': -1}}, {'context': {}}
+    loader = MicroBatchDataLoader([first, second])
+    namespace = {'_operator': operator, root: second, loader_name: loader}
+    exec(code, namespace)
+    assert namespace[result] == 7
+    assert next(loader) is first  # Neither reuse nor random access advances it.
+    assert ('get_micro_batch' in code) != scheduled
+
+
+@pytest.mark.parametrize('same_loader', [False, True])
+def test_replicas_do_not_hide_distinct_loader_outputs(same_loader):
+    loader, other_loader = IRObject('dataloader'), IRObject('dataloader_other')
+    sample, other_sample = IRObject('sample'), IRObject('other_sample')
+    read = IRDataOperation(loader, (sample,))
+    other = IRDataOperation(loader if same_loader else other_loader, (other_sample,))
+    lookup = IRPyFunc('_operator.getitem', [sample, 'value'], [IRObject('value')])
+    graph = IRGraph([read, other, lookup], [loader, other_loader], [], 'roots')
+    graph.replicate(read, 2)
+    graph.replicate(other, 2)
+    stage = IRSegment([], [lookup.output(0)], [])
+    consumer = ExeReuseCell(stage, stage.inputs(), [], micro_batch_id=1)
+    emitter = ScheduleCodeGen.__new__(ScheduleCodeGen)
+    emitter.execplan = SimpleNamespace(graph=graph)
+    if same_loader:
+        with pytest.raises(ValueError, match='dat[a-z]+ root is ambiguous'):
+            emitter._plan_sample_reads([consumer])
+    else:
+        plan = emitter._plan_sample_reads([consumer])[consumer]
+        source = MicroBatchDataLoader([{'value': -1}, {'value': 7}])
+        namespace = {'_operator': operator, emitter.tensor_name(loader): source}
+        exec('\n'.join(plan.codes), namespace)
+        assert namespace[emitter.tensor_name(lookup.output(0))] == 7
+        assert next(source)['value'] == -1
+
+
 def test_random_sample_plan_reuses_then_releases_the_same_owner():
     loader, sample = IRObject('dataloader'), IRObject('sample')
     reads = [IRDataOperation(loader, (sample,))]
@@ -148,7 +192,8 @@ def test_random_sample_plan_reuses_then_releases_the_same_owner():
 
 
 @pytest.mark.parametrize('scheduled', [False, True])
-def test_replay_does_not_substitute_the_first_data_output(scheduled):
+@pytest.mark.parametrize('replicas', [1, 2])
+def test_replay_does_not_substitute_the_first_data_output(scheduled, replicas):
     loader = IRObject('dataloader')
     first, second = IRObject('first'), IRObject('second')
     read = IRDataOperation(loader, (first, second))
@@ -156,7 +201,10 @@ def test_replay_does_not_substitute_the_first_data_output(scheduled):
     stage = IRSegment([], [lookup.output(0)], [])
     consumer = ExeReuseCell(stage, stage.inputs(), [], micro_batch_id=0)
     emitter = ScheduleCodeGen.__new__(ScheduleCodeGen)
-    emitter.execplan = SimpleNamespace(graph=IRGraph([read, lookup], [loader], [], 'roots'))
+    graph = IRGraph([read, lookup], [loader], [], 'roots')
+    if replicas > 1:
+        graph.replicate(read, replicas)
+    emitter.execplan = SimpleNamespace(graph=graph)
     nodes = [consumer]
     if not scheduled:
         with pytest.raises(ValueError, match='dat[a-z]+ root is ambiguous'):
