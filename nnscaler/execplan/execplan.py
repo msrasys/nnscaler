@@ -85,7 +85,6 @@ class ExeReuseCell(IRCell):
             # due to the existence of Segment Expander.
             if isinstance(t, IRSubTensor) and t.shape != cell_t.shape:
                 assert isinstance(cell_t, IRSubTensor), f"Expected IRSubTensor, got {type(cell_t)}"
-                assert t.valmap == cell_t.valmap  # current expander disables this case
                 new_t = t.parent.select(cell_t.indmap, cell_t.valmap)
                 if t.grad is not None:
                     assert isinstance(cell_t.grad, IRSubTensor), f"Expected IRSubTensor, got {type(cell_t.grad)}"
@@ -98,7 +97,6 @@ class ExeReuseCell(IRCell):
             # due to the existence of Segment Expander.
             if isinstance(t, IRSubTensor) and t.shape != cell_t.shape:
                 assert isinstance(cell_t, IRSubTensor), f"Expected IRSubTensor, got {type(cell_t)}"
-                assert t.valmap == cell_t.valmap  # current expander disables this case
                 new_t = t.parent.select(cell_t.indmap, cell_t.valmap)
                 if t.grad is not None:
                     assert isinstance(cell_t.grad, IRSubTensor), f"Expected IRSubTensor, got {type(cell_t.grad)}"

@@ -42,9 +42,35 @@ def test_reuse_dispatch_spatial_partition(monkeypatch, requires_grad, spatial_pa
     monkeypatch.setattr(cell, 'dispatch', lambda device: dispatched_cell)
 
     reuse = ExeReuseCell(cell, [reused_tensors[0]], [reused_tensors[1]])
+    if requires_grad:
+        # Pair a backward mirror whose IO are the gradients: dispatching the forward
+        # reuse cell dispatches the mirror too, and the mirror's outputs are the
+        # (possibly partial) input gradients of the narrowed forward cell.
+        def make_mirror(fw, in_tensor, out_tensor, device):
+            bw = IRCell('bw', 'bw', 1, 1)
+            bw.set_input(0, out_tensor.grad)
+            bw.set_output(0, in_tensor.grad)
+            bw.device = device
+            IRCell.make_pair(fw, bw)
+            return bw
+        mirror = make_mirror(cell, *original_tensors, (0, 1))
+        dispatched_mirror = make_mirror(dispatched_cell, *dispatched_tensors, 0)
+        monkeypatch.setattr(mirror, 'dispatch', lambda device: dispatched_mirror)
+        IRCell.make_pair(reuse, ExeReuseCell(mirror, [reused_tensors[1].grad], [reused_tensors[0].grad]))
+
     actual = reuse.dispatch(0)
     assert actual.cell is dispatched_cell
     assert actual is reuse.dispatch(0)
+    if requires_grad:
+        assert actual.mirror.cell is dispatched_mirror
+        for tensor, template, source in zip(
+            (actual.mirror.input(0), actual.mirror.output(0)),
+            (dispatched_tensors[1].grad, dispatched_tensors[0].grad),
+            (reused_tensors[1].grad, reused_tensors[0].grad),
+        ):
+            assert tensor.parent is source.parent
+            assert tensor.indmap == template.indmap
+            assert tensor.valmap == template.valmap
     for tensor, template, source in zip(
         (actual.input(0), actual.output(0)), dispatched_tensors, reused_tensors
     ):
