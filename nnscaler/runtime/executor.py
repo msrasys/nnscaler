@@ -433,8 +433,13 @@ class Executor:
         Free the storage of forward outputs that are only kept as roots for a
         later `Executor.backward`, e.g. a pipeline stage output after it was sent.
         The data is swapped for a stride-0 view of one NaN element: the tensor
-        keeps its shape, dtype and grad_fn, so backward (and its grad shape check)
-        works unchanged, while the real buffer is released.
+        keeps its shape and grad_fn, so backward (and its grad shape check) works
+        unchanged, while the real buffer is released. Real floating outputs get a
+        float8 placeholder on purpose: autograd validates gradients against the
+        metadata recorded when the graph was built, so backward through the root is
+        unaffected, while hardly any kernel accepts float8 and it never promotes,
+        so anything that still reads the tensor (a forward consumer, or an alias
+        saved for backward) fails at that op instead of computing with garbage.
 
         Swapping `.data` rewrites the TensorImpl in place, so it is only safe when
         nothing else can observe that impl. Holders show up in one of two counts:
@@ -478,10 +483,12 @@ class Executor:
             else:
                 continue
             for x in targets:
-                # NaN rather than uninitialized memory: anything that still reads
-                # the released tensor poisons its result instead of silently using
-                # garbage, and raises under torch.autograd.detect_anomaly()
-                x.data = torch.full((), float('nan'), dtype=x.dtype, device=x.device).expand(x.shape)
+                # float8 so that a stray reader fails loudly (see the docstring);
+                # complex roots must keep their dtype for the backward grad check,
+                # and NaN keeps the misuse visible where the dtype trick cannot apply
+                # (complex, or an output that is float8 already)
+                dtype = torch.float8_e4m3fn if x.dtype.is_floating_point else x.dtype
+                x.data = torch.full((), float('nan'), dtype=dtype, device=x.device).expand(x.shape)
 
     @staticmethod
     def sync_tensors(tensors: List[Any]) -> List[Any]:
@@ -507,9 +514,9 @@ class Executor:
 
             With pipeline output deallocation (`ComputeConfig.pipeline_deallocate_outputs`)
             an output tensor other than the loss may already have had its storage
-            released by `Executor.release_storage` and only keeps its shape, dtype and
-            grad_fn. The hook may replace or scale such entries but must not read their
-            values. The loss is a graph output and is never released, which is all the
+            released by `Executor.release_storage` and only keeps its shape and
+            grad_fn (its dtype is then float8). The hook may replace or scale such
+            entries but must not read their values. The loss is a graph output and is never released, which is all the
             built-in loss-scaling hook touches.
 
         Args:

@@ -352,11 +352,13 @@ def test_release_storage_keeps_backward_roots(use_fbw):
     actual_input = input_data.clone().requires_grad_()
     output = Executor.fexecute('linear', actual, actual_input)
     Executor.release_storage(output, actual.weight)
-    # metadata and autograd graph survive, only the buffer is gone; the
-    # placeholder is NaN so a stray reader cannot silently use it
+    # shape and autograd graph survive, only the buffer is gone; the placeholder
+    # is float8 NaN so a stray reader fails at its op instead of using garbage
     assert output.shape == (4, 16) and output.grad_fn is not None
     assert output.untyped_storage().nbytes() == output.element_size()
-    assert torch.isnan(output).all()
+    assert output.dtype == torch.float8_e4m3fn and torch.isnan(output).all()
+    with pytest.raises((RuntimeError, NotImplementedError)):
+        output * 2.0
     # leaves are left alone
     assert actual.weight.untyped_storage().nbytes() == 16 * 8 * actual.weight.element_size()
 
