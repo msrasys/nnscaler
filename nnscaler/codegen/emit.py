@@ -521,7 +521,7 @@ class FuncEmission(CodeEmission):
         codes.append(f'{reducer_name}.sync_grads()')
         return codes
 
-    def emit_release(self, tensors: Iterable[IRTensor]) -> str:
+    def emit_release(self, tensors: Iterable[IRObject]) -> str:
         tnames : Generator = (self.tensor_name(t) for t in tensors)
         return 'del ' + ', '.join(tnames)
 

@@ -13,6 +13,7 @@ import logging
 from torch.distributed import Work
 
 from ._patch_torch import stage_backward_input, stage_backward_weight
+from .stream import input_stream_lifetime, drain_stream_holds
 
 
 _logger = logging.getLogger(__name__)
@@ -62,7 +63,10 @@ class AsyncCommHandler:
             work.wait()
         callback = self._callbacks.pop(id(tensor))
         if callback is not None:
-            tensor = callback(tensor)
+            # A callback may enqueue a copy/cat that still reads the placeholder
+            # after returning its replacement. Protect both sides of resolution.
+            with input_stream_lifetime((tensor,), True):
+                tensor = callback(tensor)
         return tensor
 
     def submit(self, tensor: torch.Tensor, works: List[Work], callback: Optional[Callable] = None):
@@ -148,9 +152,13 @@ class AsyncCommHandler:
                 work.wait()
             self._works.pop(tid, None)
             self._callbacks.pop(tid, None)
+        drain_stream_holds(wait=True)
 
     def clear(self):
-        AsyncCommHandler.instance = AsyncCommHandler.__AsyncCommHandler()
+        try:
+            drain_stream_holds(wait=True)
+        finally:
+            AsyncCommHandler.instance = AsyncCommHandler.__AsyncCommHandler()
 
     def check_clear(self):
         assert (
@@ -167,7 +175,7 @@ class AsyncCommHandler:
         )
 
 
-TensorPairs = List[Tuple[int, torch.Tensor]]
+TensorPairs = List[Tuple[int, Optional[torch.Tensor]]]
 
 
 @dataclass
@@ -175,6 +183,7 @@ class _WeightBackwardState:
     param_groups: Optional[List[Dict[str, Any]]] = None
     output_tensors: Optional[Tuple[torch.Tensor, ...]] = None
     output_tensor_grads: Optional[Tuple[Optional[torch.Tensor], ...]] = None
+    opaque_inputs: Tuple[Any, ...] = ()
 
 
 class Executor:
@@ -185,6 +194,9 @@ class Executor:
     # Each graph has its name, and multiple call for the graph will append
     # (instant id -> detached) input tensor pairs for backward reference.
     _detach: Dict[str, List[TensorPairs]] = dict()
+    # Opaque owners may hide CUDA tensors, so retain them conservatively.
+    # Ordinary tensors use record_stream; single-stream forwards append ().
+    _backward_owners: Dict[str, List[Tuple[Any, ...]]] = dict()
     _pseudo_free_grad_edges: Dict[int, Any] = dict()
     _pseudo_free_pending_sends: Dict[int, int] = dict()
     _pseudo_free_unavailable_warned = False
@@ -215,6 +227,10 @@ class Executor:
         grad_by_dtensor_id: Dict[int, Optional[torch.Tensor]],
     ) -> None:
         for tensor_id, dtensor in saved_pairs:
+            if dtensor is None:
+                # Forward-only inputs can already be gone, and Python may
+                # have reused their object ids for a later callback boundary.
+                continue
             entry = Executor._input_grad_callbacks.pop(tensor_id, None)
             if entry is None:
                 continue
@@ -225,15 +241,36 @@ class Executor:
             callback(grad.detach())
 
     @staticmethod
-    def fexecute(name: str, subgraph: Callable, *input_tensors: Tuple[Any], requires_grad=True):
+    def _pop_forward_inputs(name, requested):
+        saved_pairs = Executor._detach[name].pop(0)
+        opaque_inputs = Executor._backward_owners[name].pop(0)
+        pruned_ids = {tid for tid, tensor in saved_pairs if tensor is None}
+        for tensor in requested:
+            if torch.is_tensor(tensor) and tensor.requires_grad and id(tensor) in pruned_ids:
+                raise RuntimeError('Segment input requires_grad was enabled after forward')
+        return saved_pairs, opaque_inputs
+
+    @staticmethod
+    def _apply_backward_pre_hook(inputs, outputs, grads, track_stream):
+        if Executor._backward_pre_hook is None:
+            return inputs, outputs, grads
+        # The hook may read an old tensor then replace it with a new one.
+        # Protect the old storage before the hook submits CUDA work.
+        with input_stream_lifetime((inputs, outputs, grads), track_stream):
+            return Executor._backward_pre_hook(inputs, outputs, grads)
+
+    @staticmethod
+    def fexecute(name: str, subgraph: Callable, *input_tensors: Tuple[Any],
+                 requires_grad=True, track_stream=True):
         """
-        forward the sub-graph.
+        Forward the sub-graph. Tracking defaults on for direct callers;
+        generated single-stream plans explicitly pass ``track_stream=False``.
         """
         original_inputs = input_tensors
         input_tensors = Executor.sync_tensors(input_tensors)
 
         if not requires_grad:
-            with torch.no_grad():
+            with torch.no_grad(), input_stream_lifetime(input_tensors, track_stream):
                 outputs = subgraph(*input_tensors)
             return outputs
 
@@ -250,20 +287,38 @@ class Executor:
         saved_pairs = [(id(itensor), dtensor) for itensor, dtensor in zip(original_inputs, input_dtensors)]
         Executor._detach.setdefault(name, []).append(saved_pairs)
 
-        outputs = subgraph(*input_dtensors)
+        with input_stream_lifetime(input_dtensors, track_stream) as opaque:
+            Executor._backward_owners.setdefault(name, []).append(tuple(opaque))
+            outputs = subgraph(*input_dtensors)
+        # Autograd/checkpointing own any constants needed by backward. The
+        # executor keeps input-gradient/callback boundaries here. Opaque owners
+        # are held separately until backward GPU completion, since autograd's
+        # Python references alone do not protect cross-stream storage reuse.
+        # Keeping every input here pins frozen reference hidden/KV tensors
+        # (and entire metadata dictionaries) until this segment's backward.
+        # Prune after the call so an input enabled for grad inside it is kept;
+        # retain ids for the existing boundary-order checks.
+        saved_pairs[:] = [
+            (tensor_id, tensor if torch.is_tensor(tensor) and (
+                tensor.requires_grad or tensor_id in Executor._input_grad_callbacks
+            ) else None)
+            for tensor_id, tensor in saved_pairs
+        ]
         return outputs
 
     @staticmethod
-    def aexecute(subgraph: Callable, *input_tensors: Tuple[Any], requires_grad=True):
+    def aexecute(subgraph: Callable, *input_tensors: Tuple[Any],
+                 requires_grad=True, track_stream=True):
         """
         execute adapter
         """
         input_tensors = Executor.sync_tensors(input_tensors)
         if not requires_grad:
-            with torch.no_grad():
+            with torch.no_grad(), input_stream_lifetime(input_tensors, track_stream):
                 outputs = subgraph(*input_tensors)
         else:
-            outputs = subgraph(*input_tensors)
+            with input_stream_lifetime(input_tensors, track_stream):
+                outputs = subgraph(*input_tensors)
             if isinstance(outputs, tuple):
                 outputs = (t.requires_grad_() if torch.is_tensor(t) and t.dtype in _ALLOW_GRAD_DTYPES else t for t in outputs)
             elif torch.is_tensor(outputs) and outputs.dtype in _ALLOW_GRAD_DTYPES:
@@ -274,7 +329,7 @@ class Executor:
     def backward(name: str,
                  input_tensors: List[torch.Tensor],
                  output_tensors: List[torch.Tensor],
-                 output_tensor_grads: List[torch.Tensor]) -> Tuple[torch.Tensor]:
+                 output_tensor_grads: List[torch.Tensor], *, track_stream=True) -> Tuple[torch.Tensor]:
         """
         Backward Procedure.
 
@@ -294,7 +349,7 @@ class Executor:
         """
         output_tensor_grads = Executor.sync_tensors(output_tensor_grads)
 
-        saved_pairs = Executor._detach[name].pop(0)
+        saved_pairs, opaque_inputs = Executor._pop_forward_inputs(name, input_tensors)
         tensor_ids: List[int] = [pair[0] for pair in saved_pairs]
         dtensors: List[torch.Tensor] = [pair[1] for pair in saved_pairs]
         requested_input_tensors = input_tensors
@@ -306,7 +361,6 @@ class Executor:
             for tid, dtensor in saved_pairs
             if torch.is_tensor(dtensor)
         }
-
         for t in requested_input_tensors:
             if torch.is_tensor(t) and id(t) not in tensor_ids:
                 import traceback
@@ -338,13 +392,11 @@ class Executor:
                 dedup_output_tensor_grads.append(g)
 
         # apply hook before backward
-        if Executor._backward_pre_hook is not None:
-            input_tensors, dedup_output_tensors, dedup_output_tensor_grads = \
-                Executor._backward_pre_hook(
-                    input_tensors,
-                    dedup_output_tensors,
-                    dedup_output_tensor_grads
-                )
+        input_tensors, dedup_output_tensors, dedup_output_tensor_grads = \
+            Executor._apply_backward_pre_hook(
+                input_tensors, dedup_output_tensors, dedup_output_tensor_grads,
+                track_stream or bool(opaque_inputs),
+            )
 
         pseudo_free_output_ids = []
         backward_roots = []
@@ -356,41 +408,43 @@ class Executor:
                 pseudo_free_output_ids.append(id(tensor))
                 backward_roots.append(edge)
 
-        try:
-            torch.autograd.backward(
-                backward_roots,
-                grad_tensors=dedup_output_tensor_grads,
+        with input_stream_lifetime(
+            (opaque_inputs, input_tensors, dedup_output_tensors, dedup_output_tensor_grads),
+            track_stream or bool(opaque_inputs),
+        ):
+            try:
+                torch.autograd.backward(
+                    backward_roots,
+                    grad_tensors=dedup_output_tensor_grads,
+                )
+            finally:
+                for tensor_id in pseudo_free_output_ids:
+                    Executor._pseudo_free_grad_edges.pop(tensor_id, None)
+                    Executor._pseudo_free_pending_sends.pop(tensor_id, None)
+            grads = tuple(t.grad for t in input_tensors)
+            assert all(grad is not None for grad in grads), "RuntimeError: got gradient None"
+
+            # ``fexecute`` deliberately detaches segment inputs. Preserve the
+            # retain_grad contract, and include callbacks in the protected scope.
+            grad_by_input_id = {
+                tid: dtensor.grad
+                for tid, dtensor in saved_pairs
+                if torch.is_tensor(dtensor) and dtensor.requires_grad
+            }
+            Executor._accumulate_retained_input_grads(requested_input_tensors, grad_by_input_id)
+
+            Executor._run_input_grad_callbacks(
+                saved_pairs,
+                {
+                    id(dtensor): dtensor.grad
+                    for dtensor in dtensors
+                    if torch.is_tensor(dtensor)
+                },
             )
-        finally:
-            for tensor_id in pseudo_free_output_ids:
-                Executor._pseudo_free_grad_edges.pop(tensor_id, None)
-                Executor._pseudo_free_pending_sends.pop(tensor_id, None)
-        grads = tuple(t.grad for t in input_tensors)
-        assert all(grad is not None for grad in grads), "RuntimeError: got gradient None"
 
-        # ``fexecute`` deliberately detaches segment inputs.  Preserve the
-        # normal PyTorch ``retain_grad`` contract for callers that need a
-        # gradient to cross from an end-to-end generated subgraph back into an
-        # outer eager graph.
-        grad_by_input_id = {
-            tid: dtensor.grad
-            for tid, dtensor in saved_pairs
-            if torch.is_tensor(dtensor) and dtensor.requires_grad
-        }
-        Executor._accumulate_retained_input_grads(requested_input_tensors, grad_by_input_id)
-
-        Executor._run_input_grad_callbacks(
-            saved_pairs,
-            {
-                id(dtensor): dtensor.grad
-                for dtensor in dtensors
-                if torch.is_tensor(dtensor)
-            },
-        )
-
-        if    len(grads) == 0: return None
-        elif  len(grads) == 1: return grads[0]
-        else: return grads
+            if    len(grads) == 0: return None
+            elif  len(grads) == 1: return grads[0]
+            else: return grads
 
     @staticmethod
     def backward_input(
@@ -399,6 +453,7 @@ class Executor:
         output_tensors: List[torch.Tensor],
         output_tensor_grads: List[Optional[torch.Tensor]],
         weights: Iterable[torch.nn.Parameter],
+        *, track_stream=True,
     ) -> Any:
         """Compute input gradients and defer weight gradients.
 
@@ -409,7 +464,7 @@ class Executor:
         weights = tuple(weights)
         requested_input_tensors = input_tensors
 
-        saved_pairs = Executor._detach[name].pop(0)
+        saved_pairs, opaque_inputs = Executor._pop_forward_inputs(name, input_tensors)
         tensor_ids: List[int] = [pair[0] for pair in saved_pairs]
         dtensors: List[torch.Tensor] = [pair[1] for pair in saved_pairs]
         for tensor in input_tensors:
@@ -424,7 +479,7 @@ class Executor:
 
         if len(output_tensors) == 0:
             Executor._weight_backward_states.setdefault(name, []).append(
-                _WeightBackwardState(param_groups=[])
+                _WeightBackwardState(param_groups=[], opaque_inputs=opaque_inputs)
             )
             return None
 
@@ -443,19 +498,18 @@ class Executor:
                 dedup_output_tensors.append(tensor)
                 dedup_output_tensor_grads.append(grad)
 
-        if Executor._backward_pre_hook is not None:
-            input_tensors, dedup_output_tensors, dedup_output_tensor_grads = \
-                Executor._backward_pre_hook(
-                    input_tensors,
-                    dedup_output_tensors,
-                    dedup_output_tensor_grads,
-                )
+        input_tensors, dedup_output_tensors, dedup_output_tensor_grads = \
+            Executor._apply_backward_pre_hook(
+                input_tensors, dedup_output_tensors, dedup_output_tensor_grads,
+                track_stream or bool(opaque_inputs),
+            )
 
         if not input_tensors:
             Executor._weight_backward_states.setdefault(name, []).append(
                 _WeightBackwardState(
                     output_tensors=tuple(dedup_output_tensors),
                     output_tensor_grads=tuple(dedup_output_tensor_grads),
+                    opaque_inputs=opaque_inputs,
                 )
             )
             return None
@@ -469,35 +523,40 @@ class Executor:
         # The split helper installs one gradient hook per input. Repeated
         # arguments share a leaf and must not install that hook repeatedly.
         unique_inputs = list({id(tensor): tensor for tensor in input_tensors}.values())
-        unique_grads, param_groups = stage_backward_input(
-            stage_outputs,
-            dedup_output_tensor_grads,
-            unique_inputs,
-            iter(weights),
-        )
-        grad_by_id = {id(tensor): grad for tensor, grad in zip(unique_inputs, unique_grads)}
-        grads = tuple(grad_by_id[id(tensor)] for tensor in input_tensors)
-        Executor._weight_backward_states.setdefault(name, []).append(
-            _WeightBackwardState(param_groups=param_groups)
-        )
+        with input_stream_lifetime(
+            (opaque_inputs, unique_inputs, dedup_output_tensors, stage_outputs, dedup_output_tensor_grads),
+            track_stream or bool(opaque_inputs),
+        ):
+            unique_grads, param_groups = stage_backward_input(
+                stage_outputs,
+                dedup_output_tensor_grads,
+                unique_inputs,
+                iter(weights),
+            )
+            grad_by_id = {id(tensor): grad for tensor, grad in zip(unique_inputs, unique_grads)}
+            grads = tuple(grad_by_id[id(tensor)] for tensor in input_tensors)
+            Executor._weight_backward_states.setdefault(name, []).append(
+                _WeightBackwardState(param_groups=param_groups, opaque_inputs=opaque_inputs)
+            )
 
-        assert all(grad is not None for grad in grads), "RuntimeError: got gradient None"
-        Executor._accumulate_retained_input_grads(
-            requested_input_tensors,
-            {tid: grad_by_id.get(id(tensor)) for tid, tensor in saved_pairs},
-        )
-        Executor._run_input_grad_callbacks(
-            saved_pairs,
-            {id(tensor): grad for tensor, grad in zip(input_tensors, grads)},
-        )
-        if len(grads) == 0: return None
-        elif len(grads) == 1: return grads[0]
-        else: return grads
+            assert all(grad is not None for grad in grads), "RuntimeError: got gradient None"
+            Executor._accumulate_retained_input_grads(
+                requested_input_tensors,
+                {tid: grad_by_id.get(id(tensor)) for tid, tensor in saved_pairs},
+            )
+            Executor._run_input_grad_callbacks(
+                saved_pairs,
+                {id(tensor): grad for tensor, grad in zip(input_tensors, grads)},
+            )
+            if len(grads) == 0: return None
+            elif len(grads) == 1: return grads[0]
+            else: return grads
 
     @staticmethod
     def backward_weight(
         name: str,
         weights: Iterable[torch.nn.Parameter],
+        *, track_stream=True,
     ) -> None:
         """Compute weight gradients deferred by ``backward_input``."""
         weights = tuple(weights)
@@ -506,23 +565,22 @@ class Executor:
             raise RuntimeError(f"No pending weight backward for segment {name}.")
         state = states.pop(0)
 
-        if state.param_groups is not None:
-            if weights and state.param_groups:
-                stage_backward_weight(weights, state.param_groups)
-            return
+        with input_stream_lifetime(
+            (state.opaque_inputs, weights, state.output_tensors, state.output_tensor_grads),
+            track_stream or bool(state.opaque_inputs),
+        ):
+            if state.param_groups is not None:
+                if weights and state.param_groups:
+                    stage_backward_weight(weights, state.param_groups)
+                return
 
-        if weights:
-            # This branch is only taken when the segment has no grad-requiring
-            # inputs, so a plain backward reaches only the weight leaves and does
-            # not recompute input gradients. Running through each weight's
-            # AccumulateGrad node makes reducer hooks fire (they move `param.grad`
-            # into the reducer's buffer). `inputs=weights` would fire the hooks
-            # too, but it is unnecessary here and only `torch.autograd.grad` /
-            # manual `weight.grad = dw` would bypass AccumulateGrad.
-            torch.autograd.backward(
-                state.output_tensors,
-                grad_tensors=state.output_tensor_grads,
-            )
+            if weights:
+                # With no grad-requiring inputs, backward reaches only weight
+                # leaves. AccumulateGrad still fires the reducer hooks.
+                torch.autograd.backward(
+                    state.output_tensors,
+                    grad_tensors=state.output_tensor_grads,
+                )
 
     @staticmethod
     def _accumulate_retained_input_grads(input_tensors, grad_by_input_id):
@@ -651,15 +709,21 @@ class Executor:
     
     @staticmethod
     def clear():
-        Executor._detach = dict()
-        Executor._pseudo_free_grad_edges = dict()
-        Executor._pseudo_free_pending_sends = dict()
-        Executor._weight_backward_states = dict()
-        Executor._backward_pre_hook = None
-        Executor._input_grad_callbacks = dict()
+        try:
+            drain_stream_holds(wait=True)
+        finally:
+            Executor._detach = dict()
+            Executor._backward_owners = dict()
+            Executor._pseudo_free_grad_edges = dict()
+            Executor._pseudo_free_pending_sends = dict()
+            Executor._weight_backward_states = dict()
+            Executor._backward_pre_hook = None
+            Executor._input_grad_callbacks = dict()
 
     @staticmethod
     def check_clear():
+        for name, owners in Executor._backward_owners.items():
+            assert not owners, f'Opaque inputs still need backward: {name}, remaining: {len(owners)}'
         for name, npairs in Executor._detach.items():
             assert len(npairs) == 0, \
                 f"Fine remaining segment needs backward: {name}, remaining times: {len(npairs)}"

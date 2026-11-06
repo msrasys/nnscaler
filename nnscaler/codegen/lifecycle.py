@@ -1,7 +1,7 @@
 #  Copyright (c) Microsoft Corporation.
 #  Licensed under the MIT License.
 
-from typing import Iterable, Dict, List, Any
+from typing import Iterable, Dict, List, Any, Optional, Sequence
 import itertools
 
 from nnscaler.ir.cten import IRCell, IRTensor, IRObject
@@ -14,10 +14,12 @@ from nnscaler.codegen.emit import FuncEmission
 
 class LifeCycle:
 
-    def __init__(self, nodes: List[IRCell], graph_inputs: List[Any], graph_outputs: List[Any]):
+    def __init__(self, nodes: List[IRCell], graph_inputs: List[Any], graph_outputs: List[Any],
+                 *, extra_inputs: Optional[Dict[IRCell, Sequence[IRObject]]] = None):
 
         graph_inputs = IRSegment.get_objects_from_complex(graph_inputs)
         graph_outputs = IRSegment.get_objects_from_complex(graph_outputs)
+        extra_inputs = extra_inputs or {}
         terminal = {tensor.parent for tensor in graph_outputs if isinstance(tensor, IRSubTensor)}
         func_emission = FuncEmission()
 
@@ -27,11 +29,15 @@ class LifeCycle:
         # the tensors can be released given the finish of line id
         self.release: Dict[int, List[IRObject]] = {}
 
-        # FIXME: consider the case of IRObject in the kwargs of IRFwOperation
-        # is_activation = lambda t: isinstance(t, IRObject) and not t.is_attr()
-        is_activation = lambda t: isinstance(t, IRSubTensor) and not t.is_attr()
+        # Runtime containers can own tensors too (e.g. MoE dispatch metadata).
+        # Drop their local reference at the last consumer, just like tensors.
+        is_activation = lambda t: (
+            isinstance(t, IRObject) and not t.is_attr()
+            and (not isinstance(t, IRTensor) or isinstance(t, IRSubTensor)))
 
-        self.lifetime.update((tsin, 0) for tsin in graph_inputs if is_activation(tsin))
+        # Inputs exist before the first statement. Unused inputs belong to the
+        # enclosing function, not a recompute function starting at line zero.
+        self.lifetime.update((tsin, -1) for tsin in graph_inputs if is_activation(tsin))
 
         produced_tids: set = set()
         for tsin in graph_inputs:
@@ -83,7 +89,8 @@ class LifeCycle:
             self.lifetime.update((tout, i) for tout in IRSegment.get_objects_from_complex(outputs) if is_activation(tout))
 
             # "fast-forward" all inputs to the current statement, namely after 'i'-th node.
-            self.lifetime.update((tin, i) for tin in IRSegment.get_objects_from_complex(inputs) if is_activation(tin))
+            self.lifetime.update((tin, i) for tin in IRSegment.get_objects_from_complex(
+                (list(inputs), node.kwargs, extra_inputs.get(node, ()))) if is_activation(tin))
 
             for tout in IRSegment.get_objects_from_complex(node.outputs()):
                 if isinstance(tout, IRSubTensor):
@@ -99,9 +106,9 @@ class LifeCycle:
         for tensor, line_id in self.lifetime.items():
             self.release.setdefault(line_id, []).append(tensor)
 
-    def release_tensors_after_line(self, line_id: int) -> List[IRSubTensor]:
+    def release_tensors_after_line(self, line_id: int) -> List[IRObject]:
         """
-        Get the releasable IRSubTensors after finish of executing of `line_id`.
+        Get releasable tensor/container references after executing `line_id`.
 
         @param line_id int
 
@@ -109,9 +116,9 @@ class LifeCycle:
         """
         return self.release.get(line_id, [])
 
-    def release_tensors_after_node(self, node: IRCell) -> List[IRSubTensor]:
+    def release_tensors_after_node(self, node: IRCell) -> List[IRObject]:
         """
-        Get the releasable IRSubTensors after finish of executing of the node.
+        Get releasable tensor/container references after executing the node.
 
         @param line_id int
 
@@ -124,8 +131,7 @@ class LifeCycle:
     def releasable_after_node(self, obj: IRObject, node: IRCell) -> bool:
         """
         Check if the tensor is releasable after executing the node.
-        Please note that if it is not a IRSubTensor(is IRObject),
-            we will never manually release it.
+        Attributes and objects outside this local scope are not released.
 
         Args:
             tensor (IRObject): the tensor to be checked
@@ -133,19 +139,17 @@ class LifeCycle:
         Returns:
             releasable (bool): whether the tensor is releasable after executing
         """
-        if not isinstance(obj, IRSubTensor):
+        if not isinstance(obj, IRObject) or obj not in self.lifetime:
             return False
 
         assert node in self.nodes
-        assert obj in self.lifetime
         line_id = self.nodes[node]
         return self.lifetime[obj] < line_id
 
     def releasable_after_line(self, obj: IRObject, line: int) -> bool:
         """
         Check if the tensor is releasable after executing the node.
-        Please note that if it is not a IRSubTensor(is IRObject),
-            we will never manually release it.
+        Attributes and objects outside this local scope are not released.
 
         Args:
             tensor (IRObject): the tensor to be checked
@@ -153,10 +157,9 @@ class LifeCycle:
         Returns:
             releasable (bool): whether the tensor is releasable after specific line.
         """
-        if not isinstance(obj, IRSubTensor):
+        if not isinstance(obj, IRObject) or obj not in self.lifetime:
             return False
 
-        assert obj in self.lifetime
         return self.lifetime[obj] < line
 
     def get_line(self, node: IRCell) -> int:

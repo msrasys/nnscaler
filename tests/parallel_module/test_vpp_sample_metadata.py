@@ -3,8 +3,10 @@
 
 import ast
 import copy
+import operator
 import tempfile
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -76,6 +78,52 @@ def metadata_config():
                          pas_config={'pipeline_nmicros': 2})
 
 
+def run_metadata_schedule(schedule):
+    """Execute emitted variable accesses/deletions without GPU communication."""
+    class Model:
+        def __getattr__(self, name):
+            return lambda *args, **kwargs: None
+
+    class Samples:
+        def __init__(self):
+            self.values = [{'context': {'scale': -1}}, {'context': {}}]
+            self.reads = 0
+
+        def __next__(self):
+            value = self.values[self.reads]
+            self.reads += 1
+            return value
+
+        def get_micro_batch(self, index):
+            return self.values[index]
+
+    scales = []
+
+    def forward(name, function, *inputs, **kwargs):
+        scales.extend(value for value in inputs if isinstance(value, int))
+        return torch.zeros(1)
+
+    namespace = {
+        '_operator': operator,
+        'torch': torch,
+        'nnscaler': SimpleNamespace(
+            flags=SimpleNamespace(RuntimeFlag=SimpleNamespace()),
+            runtime=SimpleNamespace(executor=SimpleNamespace(
+                fexecute=forward,
+                aexecute=lambda *args, **kwargs: torch.zeros(1),
+                backward=lambda *args, **kwargs: torch.zeros(1),
+                AsyncCommHandler=Model,
+            )),
+        ),
+    }
+    module = ast.Module(body=[schedule], type_ignores=[])
+    exec(compile(module, '<generated-schedule>', 'exec'), namespace)
+    samples = Samples()
+    namespace[schedule.name](Model(), samples)
+    assert samples.reads == 2
+    assert scales == [-1, 7]
+
+
 @replace_all_device_with('cpu')
 @pytest.mark.parametrize('metadata_stage', [2, 3])
 def test_vpp_sample_metadata_codegen(tmp_path, metadata_stage):
@@ -91,6 +139,7 @@ def test_vpp_sample_metadata_codegen(tmp_path, metadata_stage):
     for function_name in ('_train_step', '_infer_step'):
         schedule = next(node for node in tree.body
                         if isinstance(node, ast.FunctionDef) and node.name == function_name)
+        run_metadata_schedule(schedule)
         calls = [node for node in schedule.body
                  if isinstance(node, ast.Assign) and isinstance(node.value, ast.Call)]
         reads = [node for node in calls if ast.unparse(node.value.func) == 'next']

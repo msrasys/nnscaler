@@ -3,18 +3,23 @@
 
 import operator
 from types import SimpleNamespace
+import weakref
 
 import pytest
+import torch
 
+from nnscaler.codegen.lifecycle import LifeCycle
 from nnscaler.codegen.schedule.schedule import ScheduleCodeGen
+from nnscaler.execplan.execplan import ExeReuseCell
 from nnscaler.graph import IRGraph
+from nnscaler.graph.segment import IRSegment
 from nnscaler.graph.function.pyfunc import IRPyFunc
 from nnscaler.ir.cten import IRObject
-from nnscaler.ir.operator import IRDataOperation
+from nnscaler.ir.operator import IRDataOperation, IRFwOperation
 from nnscaler.runtime.utils import MicroBatchDataLoader
 
 
-def _fallback_code(lookups, *, root_input=False, root_produced=False, same_names=False):
+def _fallback_code(lookups, *, root_input=False, root_produced=False, same_names=False, replicas=1):
     loader = IRObject('dataloader')
     sample = IRObject('data')
     nodes = [IRDataOperation(loader, (sample,))]
@@ -26,17 +31,19 @@ def _fallback_code(lookups, *, root_input=False, root_produced=False, same_names
         nodes.append(node)
         value = node.output(0)
     graph = IRGraph(nodes, [loader], [value], 'metadata')
+    if replicas > 1:
+        graph.replicate(nodes[0], replicas)
     originals = [sample, value] if root_input else [value]
-    actuals = list(originals)
     codegen = ScheduleCodeGen.__new__(ScheduleCodeGen)
-    produced = {actuals[0].tid} if root_produced else set()
     codegen.execplan = SimpleNamespace(graph=graph)
-    codes = codegen._gen_nontensor_getitem_codes(
-        actuals, produced, codegen._collect_getitem_info(),
-        'dataloader', {'sample_reads_by_mid': {}, 'fallback_vars_by_mid': {}},
-        micro_batch_id=1,
-    )
-    return '\n'.join(codes), codegen.tensor_name(actuals[-1]), codegen.tensor_name(actuals[0])
+    stage = IRSegment([], originals, [])
+    consumer = ExeReuseCell(stage, originals, [], micro_batch_id=1)
+    sequence = [consumer]
+    if root_produced:
+        sequence.insert(0, ExeReuseCell(nodes[0], [loader], [sample], micro_batch_id=1))
+    plan = codegen._plan_sample_reads(sequence)[consumer]
+    return ('\n'.join(plan.codes), codegen.tensor_name(originals[-1]),
+            codegen.tensor_name(originals[0]), codegen.tensor_name(loader))
 
 
 @pytest.mark.parametrize(('lookups', 'sample', 'expected'), [
@@ -46,10 +53,10 @@ def _fallback_code(lookups, *, root_input=False, root_produced=False, same_names
     ([('getitem', 'context'), ('get', 'scale', 7)], {'context': {'scale': 3}}, 3),
 ])
 def test_fallback_preserves_dict_get_and_microbatch(lookups, sample, expected):
-    code, result, _ = _fallback_code(lookups)
+    code, result, _, loader_name = _fallback_code(lookups)
     first = {'context': {'scale': -1}}
     loader = MicroBatchDataLoader([first, sample])
-    namespace = {'_operator': operator, 'dataloader': loader}
+    namespace = {'_operator': operator, loader_name: loader}
 
     exec(code, namespace)
 
@@ -58,13 +65,13 @@ def test_fallback_preserves_dict_get_and_microbatch(lookups, sample, expected):
 
 
 def test_fallback_does_not_use_unproduced_sample_input():
-    code, result, _ = _fallback_code(
+    code, result, _, loader_name = _fallback_code(
         [('getitem', 'context'), ('getitem', 'scale')], root_input=True,
     )
     loader = MicroBatchDataLoader([
         {'context': {'scale': -1}}, {'context': {'scale': 5}},
     ])
-    namespace = {'_operator': operator, 'dataloader': loader}
+    namespace = {'_operator': operator, loader_name: loader}
 
     exec(code, namespace)
 
@@ -72,7 +79,7 @@ def test_fallback_does_not_use_unproduced_sample_input():
 
 
 def test_fallback_reuses_produced_sample_input():
-    code, result, root = _fallback_code(
+    code, result, root, _ = _fallback_code(
         [('getitem', 'context'), ('getitem', 'scale')],
         root_input=True, root_produced=True,
     )
@@ -85,12 +92,12 @@ def test_fallback_reuses_produced_sample_input():
 
 
 def test_fallback_distinguishes_ir_objects_with_the_same_name():
-    code, result, _ = _fallback_code(
+    code, result, _, loader_name = _fallback_code(
         [('getitem', 'context'), ('get', 'scale', 7)], same_names=True,
     )
     namespace = {
         '_operator': operator,
-        'dataloader': MicroBatchDataLoader([{}, {'context': {'scale': 5}}]),
+        loader_name: MicroBatchDataLoader([{}, {'context': {'scale': 5}}]),
     }
 
     exec(code, namespace)
@@ -99,11 +106,178 @@ def test_fallback_distinguishes_ir_objects_with_the_same_name():
 
 
 def test_fallback_preserves_getitem_key_error():
-    code, _, _ = _fallback_code([('getitem', 'context'), ('getitem', 'scale')])
+    code, _, _, loader_name = _fallback_code([('getitem', 'context'), ('getitem', 'scale')])
     namespace = {
         '_operator': operator,
-        'dataloader': MicroBatchDataLoader([{}, {'context': {}}]),
+        loader_name: MicroBatchDataLoader([{}, {'context': {}}]),
     }
 
     with pytest.raises(KeyError, match='scale'):
         exec(code, namespace)
+
+
+@pytest.mark.parametrize('replicas', [2, 4])
+@pytest.mark.parametrize('scheduled', [False, True])
+def test_replicated_data_read_uses_the_same_microbatch(replicas, scheduled):
+    code, result, root, loader_name = _fallback_code(
+        [('getitem', 'context'), ('get', 'scale', 7)],
+        root_input=True, root_produced=scheduled, replicas=replicas,
+    )
+    first, second = {'context': {'scale': -1}}, {'context': {}}
+    loader = MicroBatchDataLoader([first, second])
+    namespace = {'_operator': operator, root: second, loader_name: loader}
+    exec(code, namespace)
+    assert namespace[result] == 7
+    assert next(loader) is first  # Neither reuse nor random access advances it.
+    assert ('get_micro_batch' in code) != scheduled
+
+
+@pytest.mark.parametrize('same_loader', [False, True])
+def test_replicas_do_not_hide_distinct_loader_outputs(same_loader):
+    loader, other_loader = IRObject('dataloader'), IRObject('dataloader_other')
+    sample, other_sample = IRObject('sample'), IRObject('other_sample')
+    read = IRDataOperation(loader, (sample,))
+    other = IRDataOperation(loader if same_loader else other_loader, (other_sample,))
+    lookup = IRPyFunc('_operator.getitem', [sample, 'value'], [IRObject('value')])
+    graph = IRGraph([read, other, lookup], [loader, other_loader], [], 'roots')
+    graph.replicate(read, 2)
+    graph.replicate(other, 2)
+    stage = IRSegment([], [lookup.output(0)], [])
+    consumer = ExeReuseCell(stage, stage.inputs(), [], micro_batch_id=1)
+    emitter = ScheduleCodeGen.__new__(ScheduleCodeGen)
+    emitter.execplan = SimpleNamespace(graph=graph)
+    if same_loader:
+        with pytest.raises(ValueError, match='dat[a-z]+ root is ambiguous'):
+            emitter._plan_sample_reads([consumer])
+    else:
+        plan = emitter._plan_sample_reads([consumer])[consumer]
+        source = MicroBatchDataLoader([{'value': -1}, {'value': 7}])
+        namespace = {'_operator': operator, emitter.tensor_name(loader): source}
+        exec('\n'.join(plan.codes), namespace)
+        assert namespace[emitter.tensor_name(lookup.output(0))] == 7
+        assert next(source)['value'] == -1
+
+
+def test_random_sample_plan_reuses_then_releases_the_same_owner():
+    loader, sample = IRObject('dataloader'), IRObject('sample')
+    reads = [IRDataOperation(loader, (sample,))]
+    consumers = []
+    for key in ('first', 'second'):
+        lookup = IRPyFunc('_operator.getitem', [sample, key], [IRObject(key)])
+        reads.append(lookup)
+        stage = IRSegment([], [lookup.output(0)], [])
+        consumers.append(ExeReuseCell(stage, stage.inputs(), [], micro_batch_id=1))
+    emitter = ScheduleCodeGen.__new__(ScheduleCodeGen)
+    emitter.execplan = SimpleNamespace(graph=IRGraph(reads, [loader], [], 'sample_replay'))
+    plans = emitter._plan_sample_reads(consumers)
+    first, second = [plans[node] for node in consumers]
+    assert first.outputs[0] in second.inputs
+    assert sum('get_micro_batch' in code for plan in plans.values() for code in plan.codes) == 1
+    lifetime = LifeCycle(consumers, [], [], extra_inputs={node: plan.inputs for node, plan in plans.items()})
+
+    class Loader:
+        def get_micro_batch(self, mid):
+            assert mid == 1
+            tensor = torch.ones(8)
+            self.reference = weakref.ref(tensor)
+            return {'first': 3, 'second': 5, 'unused_tensor': tensor}
+
+    runtime_loader = Loader()
+    namespace = {'_operator': operator, emitter.tensor_name(loader): runtime_loader}
+    for index, node in enumerate(consumers):
+        exec('\n'.join(plans[node].codes), namespace)
+        released = lifetime.release_tensors_after_node(node)
+        exec(emitter.emit_release(released), namespace)
+        assert (runtime_loader.reference() is not None) == (index == 0)
+
+
+@pytest.mark.parametrize('scheduled', [False, True])
+@pytest.mark.parametrize('replicas', [1, 2])
+def test_replay_does_not_substitute_the_first_data_output(scheduled, replicas):
+    loader = IRObject('dataloader')
+    first, second = IRObject('first'), IRObject('second')
+    read = IRDataOperation(loader, (first, second))
+    lookup = IRPyFunc('_operator.getitem', [second, 'value'], [IRObject('value')])
+    stage = IRSegment([], [lookup.output(0)], [])
+    consumer = ExeReuseCell(stage, stage.inputs(), [], micro_batch_id=0)
+    emitter = ScheduleCodeGen.__new__(ScheduleCodeGen)
+    graph = IRGraph([read, lookup], [loader], [], 'roots')
+    if replicas > 1:
+        graph.replicate(read, replicas)
+    emitter.execplan = SimpleNamespace(graph=graph)
+    nodes = [consumer]
+    if not scheduled:
+        with pytest.raises(ValueError, match='dat[a-z]+ root is ambiguous'):
+            emitter._plan_sample_reads(nodes)
+        return
+    nodes.insert(0, ExeReuseCell(read, [loader], [first, second], micro_batch_id=0))
+    plan = emitter._plan_sample_reads(nodes)[consumer]
+    namespace = {'_operator': operator, emitter.tensor_name(first): {'value': 3},
+                 emitter.tensor_name(second): {'value': 7}}
+    exec('\n'.join(plan.codes), namespace)
+    assert namespace[emitter.tensor_name(lookup.output(0))] == 7
+
+
+@pytest.mark.parametrize('other_delete', [False, True])
+def test_dead_sample_delete_does_not_keep_the_dataloader_read(other_delete):
+    code = '\n'.join([
+        'def run(dataloader_1):',
+        '    samples_5 = next(*(dataloader_1, ))',
+        '    other = 4',
+        '    del samples_5' + (', other' if other_delete else ''),
+        '    return 7',
+    ])
+    code = ScheduleCodeGen._remove_dead_dataloader_reads(code)
+    namespace = {}
+    exec(code, namespace)
+    source = iter([1, 2])
+    assert namespace['run'](source) == 7
+    assert next(source) == 1
+
+
+def test_dead_segment_keeps_its_argument_without_reading_a_sample():
+    code = '\n'.join([
+        'def run(dataloader_1):',
+        '    samples_5 = next(*(dataloader_1, ))',
+        "    result = fexecute('segment2', samples_5)",
+        '    del samples_5',
+        '    return result',
+    ])
+    code = ScheduleCodeGen._remove_dead_dataloader_reads(code, {'segment2'})
+    calls = []
+
+    def execute(name, unused):
+        calls.append((name, unused))
+        return 7
+
+    namespace = {'fexecute': execute}
+    exec(code, namespace)
+    assert namespace['run'](iter(())) == 7
+    assert calls == [('segment2', None)]
+
+
+def test_sample_with_a_real_consumer_is_not_pruned():
+    code = '\n'.join([
+        'def run(dataloader_1):',
+        '    samples_5 = next(*(dataloader_1, ))',
+        "    result = samples_5['value']",
+        '    del samples_5',
+        '    return result',
+    ])
+    namespace = {}
+    exec(ScheduleCodeGen._remove_dead_dataloader_reads(code), namespace)
+    source = iter([{'value': 7}, {'value': 9}])
+    assert namespace['run'](source) == 7
+    assert next(source)['value'] == 9
+
+
+@pytest.mark.parametrize('use', ['return', 'keyword'])
+def test_returned_or_keyword_sample_is_not_a_dead_segment_input(use):
+    sample = IRObject('samples')
+    if use == 'return':
+        segment = IRSegment([], [sample], [sample])
+    else:
+        operation = IRFwOperation('consume', 'consume', [], 0, metadata={'sample': sample})
+        segment = IRSegment([operation], [sample], [])
+    emitter = ScheduleCodeGen.__new__(ScheduleCodeGen)
+    assert not emitter._find_dead_samples_segments([segment])
