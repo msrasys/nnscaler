@@ -923,21 +923,14 @@ def _compile_overlapping_stages(tmp_path, stage_devices, private_last=False):
     return graphs[0]
 
 
-# The three tests below are known limitations documented in
-# IRAdapterGener.gen_weight ("Known limitations with arbitrary custom policies").
-# Device groups are inferred per rank from all weight consumers, so partially
-# overlapping or unequal stage device sets get a wrong replica count. Each test
-# asserts the correct behavior and is a strict xfail until gen_weight handles it.
-_OVERLAP_XFAIL = pytest.mark.xfail(
-    strict=True, reason='reducer replica inference does not handle overlapping stage device groups')
-
-
+# Custom policies may place stages on overlapping or unequal device sets.
+# gen_weight derives the replica count of a shared no-grad-reduce weight from how
+# many devices replicate each segment's contribution and rejects unequal counts.
 @replace_all_device_with('cpu')
-@_OVERLAP_XFAIL
 def test_overlapping_stages_partial_overlap_replicas(tmp_path):
     # s0/s1 on (0, 1), s2 on (1, 2): rank 0 = g0+g1, rank 1 = g0+g1+g2, rank 2 = g2.
-    # Every contribution appears exactly twice, so the SUM over (0, 1, 2) must be
-    # divided by 2. Today each rank is its own device group and nreplicas is 1.
+    # Every contribution appears exactly twice, so the SUM over (0, 1, 2) is
+    # divided by 2 even though the inferred device groups are all singletons.
     graph = _compile_overlapping_stages(tmp_path, ((0, 1), (0, 1), (1, 2)))
     reducers = graph.select(ntype=IRWeightReducer)
     assert len(reducers) == 1
@@ -946,22 +939,19 @@ def test_overlapping_stages_partial_overlap_replicas(tmp_path):
 
 
 @replace_all_device_with('cpu')
-@_OVERLAP_XFAIL
 def test_overlapping_stages_unequal_multiplicity_rejected(tmp_path):
     # s0/s1 on (0, 1), s2 on (0,): rank 0 = g0+g1+g2, rank 1 = g0+g1. g0/g1 appear
     # twice but g2 once, so no single replica divisor is correct and the placement
-    # must be rejected. Today it compiles with nreplicas=1 and yields 2*g0+2*g1+g2.
-    with raises_with_cause(RuntimeError):
+    # is rejected.
+    with raises_with_cause(RuntimeError, match='replicated an unequal number of times'):
         _compile_overlapping_stages(tmp_path, ((0, 1), (0, 1), (0,)))
 
 
 @replace_all_device_with('cpu')
-@_OVERLAP_XFAIL
 def test_overlapping_stages_private_param_keeps_shared_group(tmp_path):
     # s0/s1 use `weight` on (0, 1); s2 uses the unrelated `private` on (0,).
-    # `weight` has g0+g1 on both ranks and should be averaged with nreplicas=2.
-    # Today the private consumer splits (0, 1) into singleton device groups, so
-    # `weight` is treated as pipeline-shared and reduced with nreplicas=1.
+    # `weight` has g0+g1 on both ranks and is averaged with nreplicas=2 even
+    # though the private consumer splits (0, 1) into singleton device groups.
     graph = _compile_overlapping_stages(tmp_path, ((0, 1), (0, 1), (0,)), private_last=True)
     reducers = graph.select(ntype=IRWeightReducer)
     assert len(reducers) == 1

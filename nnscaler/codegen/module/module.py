@@ -490,11 +490,6 @@ class ModuleCodeGen(FuncEmission):
         # key: parameter tensor, value: (segment index, node index)
         param_first_used_pos: Dict[IRFullTensor, Tuple[int, int]] = {}
         param_num_segments: Dict[IRFullTensor, int] = {}
-        # Without end2end the user runs one `loss.backward()` over the whole forward,
-        # so the graph must be a single segment. The per-segment gradient hook count
-        # below relies on every backward segment being its own backward call.
-        if not end2end_mode and len(fsegments) > 1:
-            raise RuntimeError("The graph has more than one segment, which requires end2end mode.")
         for i, n in enumerate(sequence):
             if isinstance(n, IRSegment) and n.isfw():
                 for k, v in self._get_param_first_used_pos(n).items():
