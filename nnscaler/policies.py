@@ -1165,12 +1165,6 @@ def fn(
         or get the full name of the parameter by `tensor.name`, etc.
     9. insert anchors in code with `nnscaler.anchor` to help locate the operator (intrusive way).
 
-    cfg.pas_config['pipeline_multiref_replicated_params'] controls shared replicated
-    parameters across stages. True inserts multiref; False skips it.
-    None (the default) decides per parameter: skip multiref when the sharing stages
-    use the same layout and physical device group, otherwise insert it.
-    Mixed layouts always require multiref regardless of this option.
-
     A good way to locate the operator will be like:
     1. Locate the module first by module_class_chain (`target_module in node.module_class_chain`)
     2. If the module are used multiple times (e.g., in ModuleList),
@@ -1179,6 +1173,12 @@ def fn(
        we can further locate the operator by
        `node.name`,`node.call_expr`, `node.fn`, `node.inputs()` (especially the `is_param`/`name` of input)
        or other properties.
+
+    cfg.pas_config['pipeline_multiref_replicated_params'] controls shared replicated
+    parameters across stages. True inserts multiref; False skips it.
+    None (the default) decides per parameter: skip multiref when the sharing stages
+    use the same layout and physical device group, otherwise insert it.
+    Mixed layouts always require multiref regardless of this option.
 
     Args:
         graph: the input IRGraph

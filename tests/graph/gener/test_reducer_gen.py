@@ -9,6 +9,7 @@ import nnscaler
 from nnscaler.graph.gener.gen import IRAdapterGener
 from nnscaler.graph import IRGraph
 from nnscaler.graph.segment import IRSegment
+from nnscaler.graph.schedule.schedplan import SchedulePlan
 from nnscaler.graph.parser.converter import convert_model
 from nnscaler.ir.operator import IRFwOperation, IRDataOperation
 from nnscaler.ir.tensor import IRFullTensor
@@ -848,7 +849,7 @@ def test_pp_shared_grad_coverage(tmp_path, first_tp_size):
 
     # A duplicated full contribution cannot be summed with partial contributions.
     expected = (
-        raises_with_cause(ValueError, match='Overlapping ValueMaps')
+        raises_with_cause(RuntimeError, match='Incomplete reduced gradients')
         if first_tp_size == 2 else nullcontext()
     )
     ngpus = first_tp_size + 2
@@ -863,3 +864,106 @@ def test_pp_shared_grad_coverage(tmp_path, first_tp_size):
         assert len(reducers) == 1
         assert reducers[0].device == (0, 1, 2)
         assert reducers[0].nreplicas == 1
+
+
+class OverlappingStageModule(torch.nn.Module):
+    """``weight`` feeds three single-op stages; ``private`` replaces it in the last one."""
+
+    def __init__(self, private_last=False):
+        super().__init__()
+        self.weight = torch.nn.Parameter(torch.ones(128))
+        self.private = torch.nn.Parameter(torch.ones(128)) if private_last else None
+
+    def forward(self, x):
+        x = no_grad_mul(x, self.weight)  # s0
+        x = no_grad_mul(x, self.weight)  # s1
+        w = self.weight if self.private is None else self.private
+        return no_grad_mul(x, w).sum()   # s2
+
+
+def _overlapping_stage_policy(stage_devices, graphs):
+    """One stage per op; stage i runs on stage_devices[i], which may overlap."""
+    def policy(graph, cfg):
+        nodes = graph.select(ntype=IRFwOperation)
+        graph.staging(nodes[:3])
+        stages = [s for s in graph.select(ntype=IRSegment, flatten=False) if s.isfw()]
+        for stage, ranks in zip(stages, stage_devices):
+            for node in stage.nodes():
+                if len(ranks) == 1:
+                    graph.assign(node, ranks[0])
+                    continue
+                parts = graph.replicate(node, len(ranks)) if node.name == 'identity' else \
+                    graph.partition(node, node.algorithm('dim'), idx=0, dim=0, num=len(ranks))
+                for rank, part in zip(ranks, parts):
+                    graph.assign(part, rank)
+        for node in graph.select(ntype=IRDataOperation):
+            for rank, part in enumerate(graph.replicate(node, cfg.plan_ngpus)):
+                graph.assign(part, rank)
+        # Overlapping stages must not run concurrently on one device.
+        schedule = SchedulePlan(graph, 1)
+        for step, seg in enumerate(stages + [s.mirror for s in reversed(stages)]):
+            schedule.add_segment(seg, 0, step)
+        schedule.finish()
+        graph.bind_schedule(schedule)
+        graphs.append(graph)
+        return graph
+    return policy
+
+
+def _compile_overlapping_stages(tmp_path, stage_devices, private_last=False):
+    """Compile OverlappingStageModule with the given stage placement and return its graph."""
+    graphs = []
+    ngpus = max(rank for ranks in stage_devices for rank in ranks) + 1
+    parallelize(
+        OverlappingStageModule(private_last), {'x': torch.ones(128, 128)},
+        _overlapping_stage_policy(stage_devices, graphs),
+        ComputeConfig(ngpus, ngpus, use_end2end=True),
+        gen_savedir=tmp_path, load_module=False, reuse='override',
+    )
+    return graphs[0]
+
+
+# The three tests below are known limitations documented in
+# IRAdapterGener.gen_weight ("Known limitations with arbitrary custom policies").
+# Device groups are inferred per rank from all weight consumers, so partially
+# overlapping or unequal stage device sets get a wrong replica count. Each test
+# asserts the correct behavior and is a strict xfail until gen_weight handles it.
+_OVERLAP_XFAIL = pytest.mark.xfail(
+    strict=True, reason='reducer replica inference does not handle overlapping stage device groups')
+
+
+@replace_all_device_with('cpu')
+@_OVERLAP_XFAIL
+def test_overlapping_stages_partial_overlap_replicas(tmp_path):
+    # s0/s1 on (0, 1), s2 on (1, 2): rank 0 = g0+g1, rank 1 = g0+g1+g2, rank 2 = g2.
+    # Every contribution appears exactly twice, so the SUM over (0, 1, 2) must be
+    # divided by 2. Today each rank is its own device group and nreplicas is 1.
+    graph = _compile_overlapping_stages(tmp_path, ((0, 1), (0, 1), (1, 2)))
+    reducers = graph.select(ntype=IRWeightReducer)
+    assert len(reducers) == 1
+    assert reducers[0].device == (0, 1, 2)
+    assert reducers[0].nreplicas == 2
+
+
+@replace_all_device_with('cpu')
+@_OVERLAP_XFAIL
+def test_overlapping_stages_unequal_multiplicity_rejected(tmp_path):
+    # s0/s1 on (0, 1), s2 on (0,): rank 0 = g0+g1+g2, rank 1 = g0+g1. g0/g1 appear
+    # twice but g2 once, so no single replica divisor is correct and the placement
+    # must be rejected. Today it compiles with nreplicas=1 and yields 2*g0+2*g1+g2.
+    with raises_with_cause(RuntimeError):
+        _compile_overlapping_stages(tmp_path, ((0, 1), (0, 1), (0,)))
+
+
+@replace_all_device_with('cpu')
+@_OVERLAP_XFAIL
+def test_overlapping_stages_private_param_keeps_shared_group(tmp_path):
+    # s0/s1 use `weight` on (0, 1); s2 uses the unrelated `private` on (0,).
+    # `weight` has g0+g1 on both ranks and should be averaged with nreplicas=2.
+    # Today the private consumer splits (0, 1) into singleton device groups, so
+    # `weight` is treated as pipeline-shared and reduced with nreplicas=1.
+    graph = _compile_overlapping_stages(tmp_path, ((0, 1), (0, 1), (0,)), private_last=True)
+    reducers = graph.select(ntype=IRWeightReducer)
+    assert len(reducers) == 1
+    assert reducers[0].device == (0, 1)
+    assert reducers[0].nreplicas == 2
