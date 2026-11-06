@@ -961,6 +961,8 @@ def test_codegen_fn_pipeline_segment_hooks(tmp_path):
         tmp_path, FnPolicyModuleList, 0,
         r"tests\.test_policies\.segment_mirror_post_hook\(model, 'stage0_mirror', \(\(\), \(dropout_.*, \), \(gdropout_.*, \)\), {}, _\)"
     )) == 2
+    # the backward hooks receive the forward outputs, so those are not deallocated after the send
+    assert not _gencode_contains(tmp_path, FnPolicyModuleList, 0, r'release_storage\(')
 
     # rank0 generated code should look like:
 

@@ -329,3 +329,175 @@ def test_custom_fbw_grad_coverage_accepts_split_gradients():
             'segment', [stage_input], [output], [output_grad], (weight,)
         )
         executor.backward_weight('segment', (weight,))
+
+
+release_storage_test = pytest.mark.skipif(
+    not executor._release_storage_enabled,
+    reason='release_storage is a no-op on this torch/interpreter (needs torch >= 2.4 and a passing self-check)')
+
+
+@release_storage_test
+@pytest.mark.parametrize('use_fbw', [False, True])
+def test_release_storage_keeps_backward_roots(use_fbw):
+    if use_fbw and not _patch_torch.FBW_SUPPORTED:
+        pytest.skip('FBW is not supported by this torch version')
+    torch.manual_seed(0)
+    reference, actual = _make_linears()
+    input_data = torch.randn(4, 8, dtype=torch.float64)
+    output_grad = torch.randn(4, 16, dtype=torch.float64)
+
+    reference_input = input_data.clone().requires_grad_()
+    reference(reference_input).backward(output_grad)
+
+    actual_input = input_data.clone().requires_grad_()
+    output = Executor.fexecute('linear', actual, actual_input)
+    Executor.release_storage(output, actual.weight)
+    # shape and autograd graph survive, only the buffer is gone; the placeholder
+    # is float8 NaN so a stray reader fails at its op instead of using garbage
+    assert output.shape == (4, 16) and output.grad_fn is not None
+    assert output.untyped_storage().nbytes() == output.element_size()
+    assert output.dtype == torch.float8_e4m3fn and torch.isnan(output).all()
+    with pytest.raises((RuntimeError, NotImplementedError)):
+        output * 2.0
+    # leaves are left alone
+    assert actual.weight.untyped_storage().nbytes() == 16 * 8 * actual.weight.element_size()
+
+    if use_fbw:
+        input_grad = Executor.backward_input(
+            'linear', [actual_input], [output], [output_grad], actual.parameters()
+        )
+        Executor.backward_weight('linear', actual.parameters())
+    else:
+        input_grad = Executor.backward('linear', [actual_input], [output], [output_grad])
+    Executor.check_clear()
+    torch.testing.assert_close(input_grad, reference_input.grad)
+    torch.testing.assert_close(actual.weight.grad, reference.weight.grad)
+    torch.testing.assert_close(actual.bias.grad, reference.bias.grad)
+    # the grad shape check still works against the released root
+    released = Executor.fexecute('linear', actual, actual_input)
+    Executor.release_storage(released)
+    with pytest.raises(RuntimeError, match='shape'):
+        Executor.backward('linear', [actual_input], [released], [output_grad[:2]])
+
+
+@release_storage_test
+def test_release_storage_unwraps_zero3_backward_hook_views():
+    from nnscaler.runtime.function import insert_backward_hook
+    torch.manual_seed(0)
+    reference, actual = _make_linears()
+    input_data = torch.randn(4, 8, dtype=torch.float64)
+    output_grad = torch.randn(4, 16, dtype=torch.float64)
+    reference_input = input_data.clone().requires_grad_()
+    reference(reference_input).backward(output_grad)
+
+    fired = []
+    def segment(x):
+        # ZeRO-3 codegen wraps the output once per parameter input and runs the
+        # segment under `save_params_hooks`, whose pack returns activations as is
+        with torch.autograd.graph.saved_tensors_hooks(lambda t: t, lambda t: t):
+            out = actual(x)
+            out = insert_backward_hook(out, lambda: fired.append('weight'))
+            return insert_backward_hook(out, lambda: fired.append('bias'))
+
+    actual_input = input_data.clone().requires_grad_()
+    output = Executor.fexecute('linear', segment, actual_input)
+    assert output._base is not None
+    Executor.release_storage(output)
+    # both the hook view and the fresh op output behind it are released
+    assert output.untyped_storage().nbytes() == output.element_size()
+    assert output._base.untyped_storage().nbytes() == output.element_size()
+    assert output.shape == output._base.shape == (4, 16)
+
+    input_grad = Executor.backward('linear', [actual_input], [output], [output_grad])
+    torch.testing.assert_close(input_grad, reference_input.grad)
+    torch.testing.assert_close(actual.weight.grad, reference.weight.grad)
+    assert fired == ['bias', 'weight']
+
+    # a hooked view whose root base is still saved as another op's input is left alone
+    base = actual_input * 2.0
+    kept = base * base   # saves `base` as an input
+    hooked_view = insert_backward_hook(base.reshape(base.shape), lambda: None)
+    Executor.release_storage(hooked_view)
+    assert base.untyped_storage().nbytes() == 4 * 8 * base.element_size()
+    assert hooked_view.untyped_storage().nbytes() == 4 * 8 * base.element_size()
+    del kept
+
+
+@release_storage_test
+def test_release_storage_skips_tensors_held_elsewhere():
+    x = torch.randn(4, 3, requires_grad=True)
+    nbytes = 4 * 3 * x.element_size()
+
+    # an output that another op saved as its input (same TensorImpl) must survive;
+    # e.g. a no-op `contiguous()` returns this very object as the stage output
+    y = x * 2.0
+    z = y * y             # saves y
+    out = y.contiguous()  # same object
+    assert out is y
+    Executor.release_storage(out)
+    assert y.untyped_storage().nbytes() == nbytes
+    torch.autograd.backward([z], [torch.ones_like(z)])
+    torch.testing.assert_close(x.grad, 8 * x.detach())
+
+    # an output saved only by its own producer (shallow copy) is released and still differentiable
+    x.grad = None
+    t = torch.tanh(x)
+    Executor.release_storage(t)
+    assert t.untyped_storage().nbytes() == t.element_size()
+    torch.autograd.backward([t], [torch.ones_like(t)])
+    torch.testing.assert_close(x.grad, 1 - torch.tanh(x.detach()) ** 2)
+
+    # under saved_tensors_hooks that return the tensor itself (ZeRO-3 save_params_hooks,
+    # CPU offloading) the saved output is a Python reference to this very object
+    x.grad = None
+    with torch.autograd.graph.saved_tensors_hooks(lambda a: a, lambda a: a):
+        hooked = torch.tanh(x)
+    Executor.release_storage(hooked)
+    assert hooked.untyped_storage().nbytes() == nbytes
+    torch.autograd.backward([hooked], [torch.ones_like(hooked)])
+    torch.testing.assert_close(x.grad, 1 - torch.tanh(x.detach()) ** 2)
+
+    # a second Python name for the same object (e.g. a sibling segment output) keeps it
+    first = x * 5.0
+    second = first
+    Executor.release_storage(first)
+    assert first.untyped_storage().nbytes() == nbytes
+    del second
+
+    # a view whose base is still named elsewhere leaves both alone
+    base = x * 6.0
+    view = base.view(3, 4)
+    Executor.release_storage(view)
+    assert base.untyped_storage().nbytes() == nbytes and view.untyped_storage().nbytes() == nbytes
+
+
+@release_storage_test
+def test_hold_send_keeps_buffer_alive_after_release_storage():
+    class _Work:
+        def is_completed(self):
+            return False
+        def wait(self):
+            pass
+
+    handler = executor.AsyncCommHandler()
+    output = torch.randn(4, 8, requires_grad=True) * 2.0
+    data_ptr, nbytes = output.data_ptr(), output.untyped_storage().nbytes()
+    handler.hold_send(output, _Work())
+    Executor.release_storage(output)
+    # the sender's tensor is emptied, but the held alias still owns the real buffer
+    assert output.untyped_storage().nbytes() == output.element_size()
+    held = handler._send_holds[0][0]
+    assert held.data_ptr() == data_ptr and held.untyped_storage().nbytes() == nbytes
+    handler.drain_sends()
+    handler.check_clear()
+
+
+def test_release_storage_disabled_is_a_no_op(monkeypatch):
+    # torch < 2.4 or a failed interpreter self-check: storage is kept and backward unchanged
+    monkeypatch.setattr(executor, '_release_storage_enabled', False)
+    x = torch.randn(4, 3, requires_grad=True)
+    out = x * 2.0
+    Executor.release_storage(out)
+    assert out.untyped_storage().nbytes() == 4 * 3 * out.element_size()
+    torch.autograd.backward([out], [torch.ones_like(out)])
+    torch.testing.assert_close(x.grad, torch.full_like(x, 2.0))

@@ -20,6 +20,7 @@ from nnscaler.ir.operator import IRBpOperation, IRFwOperation
 from nnscaler.policies import OpPartition, OpPlan, get_layer_index, get_pas_ops
 from nnscaler.runtime.function import identity
 from tests.launch_torchrun import launch_torchrun
+from tests.parallel_module.test_gencode import _gencode_contains
 from tests.utils import PYTEST_RUN_ID, clear_dir_on_rank0, raises_with_cause, replace_all_device_with
 
 
@@ -303,6 +304,34 @@ def test_fn_aux_memory_regions(use_fbw, memory_mode, model_cls):
 
 # Removing an aux gradient also changes the live consumer's value map.
 # Update both existing backward nodes, including an empty output list for sin.
+@replace_all_device_with('cpu')
+def test_fn_aux_output_release(tmp_path):
+    """Only the boundary activation is deallocated after its send; graph outputs
+    (aux, the returned weight) stay intact even though they also leave the stage."""
+    parallelize(
+        PipelineWithAuxOutput(), {'x': torch.ones(4, 4)}, two_stage_policy,
+        ComputeConfig(4, 4, use_end2end=True, pas_config={
+            'pipeline_size': 2, 'pipeline_nmicros': 2, 'pipeline_scheduler': '1f1b',
+        }),
+        gen_savedir=tmp_path, load_module=False, reuse='override',
+    )
+    for rank in (0, 1):
+        outputs = _gencode_contains(
+            tmp_path, PipelineWithAuxOutput, rank,
+            r'(\w+), (\w+), (\w+) = nnscaler\.runtime\.executor\.fexecute\('
+            r"'segment\d+', model\.segment\d+, \*\(\w+, \), requires_grad=True\)")
+        assert len(outputs) == 2
+        hidden = [names[0] for names in outputs]
+        sent_then_released = _gencode_contains(
+            tmp_path, PipelineWithAuxOutput, rank,
+            r'aexecute\(model\.adapter\d+, \*\((\w+), \), requires_grad=False\)\n\s*'
+            r'nnscaler\.runtime\.executor\.release_storage\(\1\)')
+        released = _gencode_contains(tmp_path, PipelineWithAuxOutput, rank, r'release_storage\((\w+)\)')
+        assert released == sent_then_released == hidden
+    for rank in (2, 3):
+        assert not _gencode_contains(tmp_path, PipelineWithAuxOutput, rank, r'release_storage\(')
+
+
 @replace_all_device_with('cpu')
 @pytest.mark.parametrize('model_cls', [
     PipelineWithUnusedStageInputs, PipelineWithSinAux, PipelineWithSharedWeightDetached,

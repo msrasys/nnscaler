@@ -392,6 +392,10 @@ class FuncEmission(CodeEmission):
         tnames : Generator = (self.tensor_name(t) for t in tensors)
         return 'del ' + ', '.join(tnames)
 
+    def emit_release_storage(self, tensors: Iterable[IRTensor]) -> str:
+        tnames : Generator = (self.tensor_name(t) for t in tensors)
+        return f'nnscaler.runtime.executor.release_storage({", ".join(tnames)})'
+
     def get_backward_callsite_io_tensors(
         self, bwop: IRCell
     ) -> Tuple[List[IRSubTensor], List[IRSubTensor], List[IRSubTensor], List[IRSubTensor]]:
