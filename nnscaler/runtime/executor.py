@@ -432,8 +432,8 @@ class Executor:
         """
         Free the storage of forward outputs that are only kept as roots for a
         later `Executor.backward`, e.g. a pipeline stage output after it was sent.
-        The data is swapped for a stride-0 view of one element: the tensor keeps
-        its shape, dtype and grad_fn, so backward (and its grad shape check)
+        The data is swapped for a stride-0 view of one NaN element: the tensor
+        keeps its shape, dtype and grad_fn, so backward (and its grad shape check)
         works unchanged, while the real buffer is released.
 
         Swapping `.data` rewrites the TensorImpl in place, so it is only safe when
@@ -478,7 +478,10 @@ class Executor:
             else:
                 continue
             for x in targets:
-                x.data = torch.empty((), dtype=x.dtype, device=x.device).expand(x.shape)
+                # NaN rather than uninitialized memory: anything that still reads
+                # the released tensor poisons its result instead of silently using
+                # garbage, and raises under torch.autograd.detect_anomaly()
+                x.data = torch.full((), float('nan'), dtype=x.dtype, device=x.device).expand(x.shape)
 
     @staticmethod
     def sync_tensors(tensors: List[Any]) -> List[Any]:
