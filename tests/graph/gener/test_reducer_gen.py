@@ -2,14 +2,16 @@
 #  Licensed under the MIT License.
 
 import pytest
+from contextlib import nullcontext
 from pathlib import Path
 
 import nnscaler
 from nnscaler.graph.gener.gen import IRAdapterGener
 from nnscaler.graph import IRGraph
 from nnscaler.graph.segment import IRSegment
+from nnscaler.graph.schedule.schedplan import SchedulePlan
 from nnscaler.graph.parser.converter import convert_model
-from nnscaler.ir.operator import IRFwOperation
+from nnscaler.ir.operator import IRFwOperation, IRDataOperation
 from nnscaler.ir.tensor import IRFullTensor
 from nnscaler.ir.adapter import IRWeightReducer
 from nnscaler.flags import CompileFlag
@@ -20,7 +22,7 @@ import torch
 import tempfile
 import importlib
 
-from ...utils import replace_all_device_with
+from ...utils import replace_all_device_with, raises_with_cause
 
 
 def make_param(shape, dtype) -> IRFullTensor:
@@ -729,3 +731,229 @@ def test_intra_scale_unit_reducers():
             assert reducer0.params[0].shape == torch.Size([128, 128])
             assert len(reducer1.params) == 1
             assert reducer1.params[0].shape == torch.Size([64, 128])
+
+
+@replace_all_device_with('cpu')
+@pytest.mark.parametrize('model_cls,split_at', [
+    (SimpleModule2ConsumersSP, 1),
+    (SimpleModule2ConsumersSP3, 1),
+    (SimpleModule2ConsumersSP3, 2),
+    (SimpleModuleNoReduce, 1),
+])
+@pytest.mark.parametrize('partition_input', [None, 0, 1])
+@pytest.mark.parametrize('reduce_replicated_params', [False, True])
+def test_colocated_segments_weight_reducers(
+    monkeypatch, model_cls, split_at, partition_input, reduce_replicated_params
+):
+    monkeypatch.setattr(CompileFlag, 'reducer_replicated_params', reduce_replicated_params)
+    graph = build_graph(model_cls)
+    nodes = graph.select(ntype=IRFwOperation)
+    shared_weight = nodes[0].input(1).parent
+    other_weights = {
+        weight for weight in graph.attributes() if weight.is_param() and weight.grad is not None
+    } - {shared_weight}
+    shared_consumers = graph.consumers(shared_weight)
+    graph.group(nodes[:split_at])
+    graph.group(nodes[split_at:])
+
+    for node in nodes:
+        if node in shared_consumers and partition_input is not None:
+            parts = graph.partition(node, node.algorithm('dim'), idx=partition_input, dim=0, num=2)
+        else:
+            parts = graph.replicate(node, 2)
+        for device, part in enumerate(parts):
+            graph.assign(part, device)
+
+    IRAdapterGener.gen_weight(graph)
+    actual = {}
+    for reducer in graph.select(ntype=IRWeightReducer):
+        assert reducer.device == (0, 1)
+        for param in reducer.inputs():
+            assert param.parent not in actual
+            actual[param.parent] = reducer.nreplicas
+
+    expected = {weight: 2 for weight in other_weights} if reduce_replicated_params else {}
+    if partition_input == 0 and model_cls is not SimpleModuleNoReduce:
+        expected[shared_weight] = 1
+    elif partition_input != 1 and reduce_replicated_params:
+        expected[shared_weight] = 2
+    assert actual == expected
+
+
+class ThreeConsumerNoReduce(SimpleModule2ConsumersSP3):
+    def forward(self, x):
+        x = no_grad_mul(x, self.param1)
+        x = no_grad_add(x, self.param1)
+        x = no_grad_mul(x, self.param1)
+        return x.sum()
+
+
+@replace_all_device_with('cpu')
+@pytest.mark.parametrize('model_cls,nreplicas', [
+    (SimpleModule2ConsumersSP3, 1),
+    (ThreeConsumerNoReduce, 2),
+])
+def test_shared_weight_grad_scopes_across_device_groups(model_cls, nreplicas):
+    graph = build_graph(model_cls)
+    nodes = graph.select(ntype=IRFwOperation)
+    for node in nodes:
+        graph.group([node])
+    for stage, node in enumerate(nodes):
+        parts = graph.partition(node, node.algorithm('dim'), idx=0, dim=0, num=2)
+        for device, part in enumerate(parts):
+            graph.assign(part, (stage % 2) * 2 + device)
+
+    IRAdapterGener.gen_weight(graph)
+    reducers = graph.select(ntype=IRWeightReducer)
+    assert len(reducers) == 1
+    assert reducers[0].device == (0, 1, 2, 3)
+    assert reducers[0].nreplicas == nreplicas
+
+
+class MixedGradModeModule(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.weight = torch.nn.Parameter(torch.ones(128))
+
+    def forward(self, x):
+        x = no_grad_mul(x, self.weight)
+        return (x + self.weight).sum()
+
+
+@replace_all_device_with('cpu')
+@pytest.mark.parametrize('first_tp_size', [1, 2])
+def test_pp_shared_grad_coverage(tmp_path, first_tp_size):
+    graphs = []
+
+    def policy(graph, cfg):
+        nodes = graph.select(ntype=IRFwOperation)
+        graph.staging([nodes[0], nodes[1]])
+        stages = [stage for stage in graph.select(ntype=IRSegment, flatten=False) if stage.isfw()]
+        offset = 0
+        for stage, size in zip(stages, (first_tp_size, 2)):
+            for node in stage.nodes():
+                if size == 1:
+                    graph.assign(node, offset)
+                else:
+                    parts = graph.replicate(node, size) if node.name == 'identity' else \
+                        graph.partition(node, node.algorithm('dim'), idx=0, dim=0, num=size)
+                    for device, part in enumerate(parts):
+                        graph.assign(part, offset + device)
+            offset += size
+        for node in graph.select(ntype=IRDataOperation):
+            for device, part in enumerate(graph.replicate(node, cfg.plan_ngpus)):
+                graph.assign(part, device)
+        cfg.apply_pipeline_scheduler(graph, len(stages), 4, '1f1b')
+        graphs.append(graph)
+        return graph
+
+    # A duplicated full contribution cannot be summed with partial contributions.
+    expected = (
+        raises_with_cause(RuntimeError, match='Incomplete reduced gradients')
+        if first_tp_size == 2 else nullcontext()
+    )
+    ngpus = first_tp_size + 2
+    with expected:
+        parallelize(
+            MixedGradModeModule(), {'x': torch.ones(128, 128)}, policy,
+            ComputeConfig(ngpus, ngpus, use_end2end=True), gen_savedir=tmp_path,
+            load_module=False, reuse='override',
+        )
+    if first_tp_size == 1:
+        reducers = graphs[0].select(ntype=IRWeightReducer)
+        assert len(reducers) == 1
+        assert reducers[0].device == (0, 1, 2)
+        assert reducers[0].nreplicas == 1
+
+
+class OverlappingStageModule(torch.nn.Module):
+    """``weight`` feeds three single-op stages; ``private`` replaces it in the last one."""
+
+    def __init__(self, private_last=False):
+        super().__init__()
+        self.weight = torch.nn.Parameter(torch.ones(128))
+        self.private = torch.nn.Parameter(torch.ones(128)) if private_last else None
+
+    def forward(self, x):
+        x = no_grad_mul(x, self.weight)  # s0
+        x = no_grad_mul(x, self.weight)  # s1
+        w = self.weight if self.private is None else self.private
+        return no_grad_mul(x, w).sum()   # s2
+
+
+def _overlapping_stage_policy(stage_devices, graphs):
+    """One stage per op; stage i runs on stage_devices[i], which may overlap."""
+    def policy(graph, cfg):
+        nodes = graph.select(ntype=IRFwOperation)
+        graph.staging(nodes[:3])
+        stages = [s for s in graph.select(ntype=IRSegment, flatten=False) if s.isfw()]
+        for stage, ranks in zip(stages, stage_devices):
+            for node in stage.nodes():
+                if len(ranks) == 1:
+                    graph.assign(node, ranks[0])
+                    continue
+                parts = graph.replicate(node, len(ranks)) if node.name == 'identity' else \
+                    graph.partition(node, node.algorithm('dim'), idx=0, dim=0, num=len(ranks))
+                for rank, part in zip(ranks, parts):
+                    graph.assign(part, rank)
+        for node in graph.select(ntype=IRDataOperation):
+            for rank, part in enumerate(graph.replicate(node, cfg.plan_ngpus)):
+                graph.assign(part, rank)
+        # Overlapping stages must not run concurrently on one device.
+        schedule = SchedulePlan(graph, 1)
+        for step, seg in enumerate(stages + [s.mirror for s in reversed(stages)]):
+            schedule.add_segment(seg, 0, step)
+        schedule.finish()
+        graph.bind_schedule(schedule)
+        graphs.append(graph)
+        return graph
+    return policy
+
+
+def _compile_overlapping_stages(tmp_path, stage_devices, private_last=False):
+    """Compile OverlappingStageModule with the given stage placement and return its graph."""
+    graphs = []
+    ngpus = max(rank for ranks in stage_devices for rank in ranks) + 1
+    parallelize(
+        OverlappingStageModule(private_last), {'x': torch.ones(128, 128)},
+        _overlapping_stage_policy(stage_devices, graphs),
+        ComputeConfig(ngpus, ngpus, use_end2end=True),
+        gen_savedir=tmp_path, load_module=False, reuse='override',
+    )
+    return graphs[0]
+
+
+# Custom policies may place stages on overlapping or unequal device sets.
+# gen_weight derives the replica count of a shared no-grad-reduce weight from how
+# many devices replicate each segment's contribution and rejects unequal counts.
+@replace_all_device_with('cpu')
+def test_overlapping_stages_partial_overlap_replicas(tmp_path):
+    # s0/s1 on (0, 1), s2 on (1, 2): rank 0 = g0+g1, rank 1 = g0+g1+g2, rank 2 = g2.
+    # Every contribution appears exactly twice, so the SUM over (0, 1, 2) is
+    # divided by 2 even though the inferred device groups are all singletons.
+    graph = _compile_overlapping_stages(tmp_path, ((0, 1), (0, 1), (1, 2)))
+    reducers = graph.select(ntype=IRWeightReducer)
+    assert len(reducers) == 1
+    assert reducers[0].device == (0, 1, 2)
+    assert reducers[0].nreplicas == 2
+
+
+@replace_all_device_with('cpu')
+def test_overlapping_stages_unequal_multiplicity_rejected(tmp_path):
+    # s0/s1 on (0, 1), s2 on (0,): rank 0 = g0+g1+g2, rank 1 = g0+g1. g0/g1 appear
+    # twice but g2 once, so no single replica divisor is correct and the placement
+    # is rejected.
+    with raises_with_cause(RuntimeError, match='replicated an unequal number of times'):
+        _compile_overlapping_stages(tmp_path, ((0, 1), (0, 1), (0,)))
+
+
+@replace_all_device_with('cpu')
+def test_overlapping_stages_private_param_keeps_shared_group(tmp_path):
+    # s0/s1 use `weight` on (0, 1); s2 uses the unrelated `private` on (0,).
+    # `weight` has g0+g1 on both ranks and is averaged with nreplicas=2 even
+    # though the private consumer splits (0, 1) into singleton device groups.
+    graph = _compile_overlapping_stages(tmp_path, ((0, 1), (0, 1), (0,)), private_last=True)
+    reducers = graph.select(ntype=IRWeightReducer)
+    assert len(reducers) == 1
+    assert reducers[0].device == (0, 1)
+    assert reducers[0].nreplicas == 2

@@ -23,7 +23,15 @@ class ExeReuseCell(IRCell):
     """
 
     def __init__(self, cell: IRCell,
-                 inputs: List[IRSubTensor], outputs: List[IRCell]):
+                 inputs: List[IRSubTensor], outputs: List[IRSubTensor]):
+        """
+        Args:
+            cell: The original IRCell to be reused.
+            inputs: A list of IRSubTensor objects representing the new inputs for the reused cell.
+                Each ExeReuseCell will have different id for different micro-batches.
+            outputs: A list of IRSubTensor objects representing the new outputs for the reused cell.
+                Each ExeReuseCell will have different id for different micro-batches.
+        """
         assert len(inputs) == len(cell.inputs())
         assert len(outputs) == len(cell.outputs()), (
             f"output length mismatch: {cell}\n"
@@ -73,6 +81,8 @@ class ExeReuseCell(IRCell):
             f"outputs length mismatch: {dispatch_cell}\noutputs: {outputs}\ndispatch_cell.outputs(): {dispatch_cell.outputs()}"
 
         for t, cell_t in zip(inputs, dispatch_cell.inputs()):
+            # dispatched segment may have different shape than the original tensor
+            # due to the existence of Segment Expander.
             if isinstance(t, IRSubTensor) and t.shape != cell_t.shape:
                 assert isinstance(cell_t, IRSubTensor), f"Expected IRSubTensor, got {type(cell_t)}"
                 new_t = t.parent.select(cell_t.indmap, cell_t.valmap)
@@ -83,6 +93,8 @@ class ExeReuseCell(IRCell):
             expanded_inputs.append(t)
         expanded_outputs = []
         for t, cell_t in zip(outputs, dispatch_cell.outputs()):
+            # dispatched segment may have different shape than the original tensor
+            # due to the existence of Segment Expander.
             if isinstance(t, IRSubTensor) and t.shape != cell_t.shape:
                 assert isinstance(cell_t, IRSubTensor), f"Expected IRSubTensor, got {type(cell_t)}"
                 new_t = t.parent.select(cell_t.indmap, cell_t.valmap)
