@@ -73,7 +73,7 @@ class BaseTraceStrategy:
         return module
 
     @staticmethod
-    def _place_tensors_to(*args, device: str, _tensor_memo=None) -> Tuple[Any]:
+    def _place_tensors_to(*args, device: str) -> Tuple[Any]:
         # In most cases, device placement operation keeps the source tensor's `requires_grad` attributes.
         # The context `torch.no_grad` enforces requires_grad=False for all tensors that generated in its scope.
         # As a result, behavior of device placement operation is unexpected.
@@ -83,7 +83,7 @@ class BaseTraceStrategy:
         # A result may be an input (identity/in-place ops), and arguments may
         # repeat a tensor. Preserve that identity and transfer each object once.
         # Distinct views remain distinct; sharing a storage alone is not enough.
-        moved = {} if _tensor_memo is None else _tensor_memo
+        moved = {}
 
         def place(tensor):
             key = id(tensor)
@@ -234,34 +234,13 @@ class CudaRunCpuOffloadStrategy(BaseTraceStrategy):
         super().__init__(tracer, 'cpu')
 
     def _run_cuda_and_offload(self, runner, target, args, kwargs):
-        """Reuse unchanged CPU inputs instead of copying them back from CUDA.
+        """Copy results and executed inputs back from CUDA.
 
-        Only this call's input transfers can be reused. Version counters on
-        both sides detect in-place changes; gradient flags may change without
-        incrementing a version. Inference tensors have no version counter and
-        therefore keep the ordinary copy-back path.
+        Triton and custom kernels can mutate inputs without incrementing their
+        version counters, so the original CPU tensors cannot be reused safely.
         """
-        moved = {}
-        args_cuda, kwargs_cuda = self._place_tensors_to(
-            args, kwargs, device='cuda', _tensor_memo=moved)
-        originals = {}
-        for tensor in pytree_utils.tree_leaves((args, kwargs)):
-            if not isinstance(tensor, torch.Tensor) or tensor.device.type != 'cpu':
-                continue
-            copied = moved[id(tensor)]
-            if not torch.is_inference(tensor) and not torch.is_inference(copied):
-                originals[id(copied)] = (tensor, copied, tensor._version, copied._version)
-        result, args_cuda, kwargs_cuda = runner(target, args_cuda, kwargs_cuda, device='cuda')
-        unchanged = {
-            key: original for key, (original, copied, original_version, copied_version) in originals.items()
-            if original._version == original_version and copied._version == copied_version
-            and original.requires_grad == copied.requires_grad
-            and type(original) is type(copied) and original.is_leaf == copied.is_leaf
-            and original.layout == copied.layout == torch.strided
-            and original.stride() == copied.stride()
-            and original.storage_offset() == copied.storage_offset()
-        }
-        return self._place_tensors_to(result, args_cuda, kwargs_cuda, device='cpu', _tensor_memo=unchanged)
+        result, args_cuda, kwargs_cuda = runner(target, args, kwargs, device='cuda')
+        return self._place_tensors_to(result, args_cuda, kwargs_cuda, device='cpu')
 
     def run_call_function(self, target: Target, args: Tuple[Any], kwargs: Dict[str, Any]) -> Tuple[Any, Tuple, Dict]:
         try:
