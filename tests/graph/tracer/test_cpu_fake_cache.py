@@ -3,7 +3,7 @@ import weakref
 import pytest
 import torch
 
-from nnscaler.graph.tracer.trace_strategy import CpuStrategy, ReuseCacheStrategy
+from nnscaler.graph.tracer.trace_strategy import CpuStrategy, CudaRunCpuOffloadStrategy, ReuseCacheStrategy
 from nnscaler import register_op
 from nnscaler.flags import CompileFlag
 
@@ -184,8 +184,8 @@ def test_disable_fake_cache_keeps_regular_cache(monkeypatch):
     monkeypatch.setattr(CompileFlag, 'cache_cpu_fake_outputs', False)
     strategy = ReuseCacheStrategy(None)
     # Execute ordinary calls on CPU so this test does not require CUDA.
-    monkeypatch.setattr(strategy, '_run_cuda_and_offload',
-                        lambda runner, target, args, kwargs: runner(target, args, kwargs, device='cpu'))
+    monkeypatch.setattr(CudaRunCpuOffloadStrategy, 'run_call_function',
+                        lambda self, target, args, kwargs: self._run_call_function_on(target, args, kwargs, device='cpu'))
     x = torch.ones(8)
     first, _, _ = strategy.run_cpu_fake(torch.zeros_like, (x,), {}, cacheable=True)
     second, _, _ = strategy.run_cpu_fake(torch.zeros_like, (x,), {}, cacheable=True)
@@ -227,8 +227,10 @@ def test_cache_statistics_follow_resize_and_invalidation():
 @pytest.mark.parametrize('method', [False, True])
 def test_regular_cache_statistics_include_nested_tensors(monkeypatch, method):
     strategy = ReuseCacheStrategy(None)
-    monkeypatch.setattr(strategy, '_run_cuda_and_offload',
-                        lambda runner, target, args, kwargs: runner(target, args, kwargs, device='cpu'))
+    kind = 'method' if method else 'function'
+    runner = getattr(strategy, f'_run_call_{kind}_on')
+    monkeypatch.setattr(CudaRunCpuOffloadStrategy, f'run_call_{kind}',
+                        lambda self, target, args, kwargs: runner(target, args, kwargs, device='cpu'))
     x = torch.ones(8)
     if method:
         output, _, _ = strategy.run_call_method('clone', (x,), {})

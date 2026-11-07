@@ -233,25 +233,20 @@ class CudaRunCpuOffloadStrategy(BaseTraceStrategy):
     def __init__(self, tracer: 'ConcreteTracer'):
         super().__init__(tracer, 'cpu')
 
-    def _run_cuda_and_offload(self, runner, target, args, kwargs):
-        """Copy results and executed inputs back from CUDA.
-
-        Triton and custom kernels can mutate inputs without incrementing their
-        version counters, so the original CPU tensors cannot be reused safely.
-        """
-        result, args_cuda, kwargs_cuda = runner(target, args, kwargs, device='cuda')
-        return self._place_tensors_to(result, args_cuda, kwargs_cuda, device='cpu')
-
     def run_call_function(self, target: Target, args: Tuple[Any], kwargs: Dict[str, Any]) -> Tuple[Any, Tuple, Dict]:
         try:
-            return self._run_cuda_and_offload(self._run_call_function_on, target, args, kwargs)
+            result, args_cuda, kwargs_cuda = self._run_call_function_on(target, args, kwargs, device='cuda')
+            result, args_cpu, kwargs_cpu = self._place_tensors_to(result, args_cuda, kwargs_cuda, device='cpu')
+            return result, args_cpu, kwargs_cpu
         except torch.cuda.OutOfMemoryError as e:
             _logger.info(f'tracing {target} on cuda failed, try to trace on cpu, error message is: {str(e)}')
             return self._run_call_function_on(target, args, kwargs, 'cpu')
 
     def run_call_method(self, target: Target, args: Tuple[Any], kwargs: Dict[str, Any]) -> Tuple[Any, Tuple, Dict]:
         try:
-            return self._run_cuda_and_offload(self._run_call_method_on, target, args, kwargs)
+            result, args_cuda, kwargs_cuda = self._run_call_method_on(target, args, kwargs, device='cuda')
+            result, args_cpu, kwargs_cpu = self._place_tensors_to(result, args_cuda, kwargs_cuda, device='cpu')
+            return result, args_cpu, kwargs_cpu
         except torch.cuda.OutOfMemoryError as e:
             _logger.info(f'tracing {target} on cuda failed, try to trace on cpu, error message is: {str(e)}')
             return self._run_call_method_on(target, args, kwargs, device='cpu')
