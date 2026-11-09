@@ -264,8 +264,7 @@ def compile(model: Union[torch.nn.Module, SemanticModel], *args,
             scale_ndevs = None
             if scale:
                 scale_ndevs = resource.ngpus if isinstance(scale, bool) else scale
-            # CubeModule has no scale unit index, so its code is generated per rank
-            mgener = ModuleCodeGen(execplan, scale_ndevs=scale_ndevs, share_scale_unit_code=False)
+            mgener = ModuleCodeGen(execplan, scale_ndevs=scale_ndevs)
             sgener = ScheduleCodeGen(execplan, scale_ndevs=scale_ndevs)
             for local_rank in range(local_world_size):
                 rank = DeviceGroup().node_rank * local_world_size + local_rank

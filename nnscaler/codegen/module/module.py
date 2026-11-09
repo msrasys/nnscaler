@@ -98,7 +98,7 @@ class ModuleCodeGen(FuncEmission):
         runtime_ndevs: Optional[int] = None,
         *,
         scale_ndevs: Optional[int] = None,
-        share_scale_unit_code: bool = True,
+        share_scale_unit_code: bool = False,
     ) -> None:
         """
         Create Module code generator
@@ -114,8 +114,8 @@ class ModuleCodeGen(FuncEmission):
                 It is rejected when the graph uses a customized `emit_fn` with the legacy signature,
                 because such a function hard-codes runtime ranks; use
                 `IRGraph.legacy_emit_signatures()` to check beforehand. Only parallel modules
-                support it: `CubeModule` has no scale unit index, so `nnscaler.compiler.compile`
-                passes False.
+                support it (`CubeModule` has no scale unit index), so it is off by default and
+                `parallelize` turns it on.
         """
         super().__init__()
         self.execplan: ExecutionPlan = execplan
