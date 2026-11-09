@@ -7,7 +7,7 @@ Register cutomized function
 
 from dataclasses import dataclass
 from typing import Callable, Dict, Iterable, List, Optional, Tuple, Union
-from functools import lru_cache, partial
+from functools import partial
 import inspect
 import logging
 
@@ -101,14 +101,14 @@ EmitFn = Union[
 ]
 
 
-@lru_cache(maxsize=None)
 def accepts_emit_context(emit_fn: Callable) -> bool:
     """
     Whether `emit_fn` uses the `EmitContext` signature `(node, args, kwargs, ctx)`
     rather than the legacy `(node, args, kwargs, runtime_devid, plan_ndevs, runtime_ndevs)`.
 
-    A callable that can be called with 4 positional arguments is EmitContext style,
-    otherwise one that can be called with 6 is legacy. Anything else is rejected.
+    A callable that accepts 4 positional arguments is EmitContext style (including one that
+    also accepts 6, e.g. with `*args` or defaulted parameters); otherwise one that accepts 6
+    is legacy. Anything accepting neither is rejected.
     """
     if not callable(emit_fn):
         raise TypeError("Expected an emit function")
@@ -117,12 +117,17 @@ def accepts_emit_context(emit_fn: Callable) -> bool:
     except (TypeError, ValueError):  # no signature available (e.g. some builtins): assume new signature
         return True
 
-    for nargs, is_context_style in ((4, True), (6, False)):
+    def binds(nargs: int) -> bool:
         try:
             sig.bind(*([None] * nargs))
-            return is_context_style
+            return True
         except TypeError:
-            continue
+            return False
+
+    if binds(4):
+        return True
+    if binds(6):
+        return False
     raise TypeError(
         f"emit_fn {emit_fn} must accept (node, args, kwargs, ctx: EmitContext) "
         f"or the legacy (node, args, kwargs, runtime_devid, plan_ndevs, runtime_ndevs)"

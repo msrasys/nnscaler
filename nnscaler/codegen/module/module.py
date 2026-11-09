@@ -113,8 +113,9 @@ class ModuleCodeGen(FuncEmission):
                 time, and `gen()` is called with plan devices only.
                 It is rejected when the graph uses a customized `emit_fn` with the legacy signature,
                 because such a function hard-codes runtime ranks; use
-                `IRGraph.legacy_emit_signatures()` to check beforehand. Only parallel modules support it: `CubeModule` has no scale
-                unit index, so `nnscaler.compiler.compile` passes False.
+                `IRGraph.legacy_emit_signatures()` to check beforehand. Only parallel modules
+                support it: `CubeModule` has no scale unit index, so `nnscaler.compiler.compile`
+                passes False.
         """
         super().__init__()
         self.execplan: ExecutionPlan = execplan

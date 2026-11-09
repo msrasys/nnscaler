@@ -1244,7 +1244,12 @@ def _load_parallel_module_class(
             # So every rank gets a distinct module in sys.modules,
             # even if they share the same file.
             sys.modules[module_name] = gen_imported
-            spec.loader.exec_module(gen_imported)
+            try:
+                spec.loader.exec_module(gen_imported)
+            except BaseException:
+                # like the import machinery, don't leave a half-initialized module behind
+                sys.modules.pop(module_name, None)
+                raise
 
     parallel_module_class = gen_imported.GenModel
     parallel_module_class.rank = rank
@@ -3102,6 +3107,13 @@ def _broadcast_gen_files(
     # get file list
     if curr_rank != 0:
         files = sent_obj[0]
+        # Code files of an earlier generation that are not regenerated this time (e.g. the
+        # per-rank files replaced by a shared layout) stay on the other nodes, where nothing
+        # cleans the directory, and `_load_parallel_module_class` would pick them up.
+        if any(f.endswith('.py') for f in files):
+            for stale in outdir.glob(f'{_GENCODE_FILE_PREFIX}[0-9]*.py'):
+                if stale.name not in files:
+                    stale.unlink(missing_ok=True)
 
     logger.info(f'File list broadcasted ({len(files)} in total).')
 
