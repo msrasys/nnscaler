@@ -307,6 +307,23 @@ class IRGraph(IRSegment):
         self.reset_inputs(1)
         self.set_input(0, ir_root_obj)
 
+    def legacy_emit_signatures(self) -> List[str]:
+        """
+        Signatures of the operators in this graph whose registered `emit_fn` has the legacy
+        signature `(node, args, kwargs, runtime_devid, plan_ndevs, runtime_ndevs)`.
+
+        Such operators hard-code runtime ranks in the generated code, so the code of a graph
+        using one cannot be shared across scale units (see `ModuleCodeGen`).
+        """
+        # local import: `nnscaler.graph.parser.register` imports `nnscaler.graph.function`
+        from nnscaler.graph.parser.register import CustomizedOps, accepts_emit_context
+        signatures = []
+        for node in self.select(ntype=IRFwOperation, flatten=True):
+            emit_fn = CustomizedOps.kOpEmit.get(node.signature)
+            if emit_fn is not None and not accepts_emit_context(emit_fn) and node.signature not in signatures:
+                signatures.append(node.signature)
+        return signatures
+
     def no_backward(self):
         """
         Set all tensors with requires_grad=False to simulate no backward scenario (inference only).

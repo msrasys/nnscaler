@@ -26,7 +26,7 @@ from torch.nn.modules.batchnorm import _BatchNorm
 from torch.nn.modules.instancenorm import _InstanceNorm
 from torch.nn.modules._functions import SyncBatchNorm as sync_batch_norm
 
-from nnscaler.graph.parser.register import register_op
+from nnscaler.graph.parser.register import register_op, EmitContext
 from nnscaler.ir.operator import IRFwOperation
 from nnscaler.ir.cten import IRObject, IRTensor, IR
 from nnscaler.runtime.device import DeviceGroup
@@ -213,17 +213,11 @@ def emit_batchnorm2d(
     node: IRFwOperation,
     args: List[str],
     kwargs: Dict[str, str],
-    runtime_devid: int,
-    plan_ndevs: int,
-    runtime_ndevs: int,
+    ctx: EmitContext,
 ) -> str:
     """Special rule to generate batchnorm2d node"""
 
     signature = node.signature
-
-    # Compute scale unit device ids
-    offset = (runtime_devid // plan_ndevs) * plan_ndevs
-    scale_unit_dev_ids = [local_rank + offset for local_rank in range(plan_ndevs)]
 
     kw_pairs = list()
     for key, val in kwargs.items():
@@ -242,19 +236,20 @@ def emit_batchnorm2d(
     if len(partition_dims) == 1 and partition_dims[0] == 0:  # partition on batch dim
         # if batch dim is partitioned, it means batchnorm is partitioned in batch dim both
         # within scaleunit and across scaleunits
-        kw_pairs.append(f"process_group={tuple(range(runtime_ndevs))}")
+        kw_pairs.append(f"process_group={tuple(range(ctx.runtime_ngpus))}")
     else:
         # the synchronization should occur across scaleunits
         assert len(partition_dims) == 0 or partition_dims[0] != 0
-        if runtime_ndevs == len(scale_unit_dev_ids):
+        if ctx.runtime_ngpus == ctx.plan_ngpus:
             kw_pairs.append("process_group=None")
         else:
-            start_id = runtime_devid % len(scale_unit_dev_ids)
+            # the group of the same plan device over all scale units does not depend
+            # on the scale unit index, so it is a literal even for shared code
             process_group = tuple(
-                range(start_id, runtime_ndevs, len(scale_unit_dev_ids))
+                range(ctx.plan_devid, ctx.runtime_ngpus, ctx.plan_ngpus)
             )
             kw_pairs.append(f"process_group={process_group}")
-            assert len(process_group) == runtime_ndevs // len(scale_unit_dev_ids)
+            assert len(process_group) == ctx.runtime_ngpus // ctx.plan_ngpus
 
     args_str = ", ".join(args)
     kwargs_str = ", ".join(kw_pairs)

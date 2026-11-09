@@ -128,7 +128,8 @@ def test_trainer_compile_worker(tmp_path):
     ])
     trainer.run()
 
-    assert set([f.name for f in gen_savedir.glob('**/*.py')]) == set(['gencode0.py', 'gencode1.py', 'gencode2.py', 'gencode3.py'])
+    # one file per plan device, shared by both scale units
+    assert set([f.name for f in gen_savedir.glob('**/*.py')]) == set(['gencode0.py', 'gencode1.py'])
     shutil.rmtree(gen_savedir)
 
     # mixed compile only
@@ -149,7 +150,7 @@ def test_trainer_compile_worker(tmp_path):
     ])
     trainer.run()
 
-    assert set([f.name for f in gen_savedir.glob('**/*.py')]) == set(['gencode0.py', 'gencode1.py', 'gencode2.py', 'gencode3.py'])
+    assert set([f.name for f in gen_savedir.glob('**/*.py')]) == set(['gencode0.py', 'gencode1.py'])
     shutil.rmtree(gen_savedir)
 
 
@@ -1340,7 +1341,8 @@ def test_trainer_dynamic_worker(tmp_path):
 
     def check_match(code_dir: Path, should_exist: bool):
         gencode_files = list(code_dir.glob('**/*.py'))
-        assert set(f.name for f in gencode_files) == set(['gencode0.py', 'gencode1.py', 'gencode2.py', 'gencode3.py'])
+        # one file per plan device, shared by both scale units
+        assert set(f.name for f in gencode_files) == set(['gencode0.py', 'gencode1.py'])
         for gencode_file in gencode_files:
             filecontent = gencode_file.read_text()
             matches = re.findall(r'B, T, C = x\.size\(\)', filecontent)

@@ -151,6 +151,43 @@ def test_autograd_register():
         for sub_node in sub_nodes:
             assert sub_node.kwargs['h'] == 2
 
+def test_emit_context():
+    from nnscaler.graph.parser.register import EmitContext, accepts_emit_context
+
+    # concrete scale unit index: literals
+    ctx = EmitContext(plan_devid=1, plan_ngpus=4, runtime_ngpus=8, scale_unit_index=1)
+    assert not ctx.is_shared
+    assert ctx.rank_offset_expr == '4'
+    assert ctx.rank_expr == '5'
+    assert ctx.ranks([0, 1]) == '[4, 5]'
+    assert ctx.scale_unit_ranks == '[4, 5, 6, 7]'
+
+    # shared code: runtime expressions
+    ctx = EmitContext(plan_devid=1, plan_ngpus=4, runtime_ngpus=8)
+    assert ctx.is_shared
+    assert ctx.rank_offset_expr == 'self.scale_unit_index * 4'
+    assert ctx.rank_expr == '(self.scale_unit_index * 4 + 1)'
+    assert ctx.ranks(range(2)) == '[r + self.scale_unit_index * 4 for r in [0, 1]]'
+    assert ctx.scale_unit_ranks == '[r + self.scale_unit_index * 4 for r in [0, 1, 2, 3]]'
+
+    def legacy(node, args, kwargs, runtime_devid, plan_ndevs, runtime_ndevs): ...
+    def ctx_style(node, args, kwargs, ctx): ...
+    def var_args(node, args, kwargs, *rest): ...
+    def legacy_extra(node, args, kwargs, runtime_devid, plan_ndevs, runtime_ndevs, extra=1): ...
+    def bad(node, args, kwargs): ...
+    class Rule:
+        def emit(self, node, args, kwargs, ctx): ...
+    assert not accepts_emit_context(legacy)
+    assert not accepts_emit_context(legacy_extra)
+    assert accepts_emit_context(ctx_style)
+    assert accepts_emit_context(var_args)  # callable with 4 arguments: EmitContext style
+    assert accepts_emit_context(Rule().emit)
+    with pytest.raises(TypeError, match='must accept'):
+        accepts_emit_context(bad)
+    with pytest.raises(TypeError, match='must accept'):
+        nnscaler.register_op('*, * -> *', emit_fn=bad)(lambda x, y: x + y)
+
+
 def customized_add(x, y):
     return x + y
 

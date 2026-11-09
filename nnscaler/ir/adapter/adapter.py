@@ -66,6 +66,15 @@ class IRAdapter(IRCell):
     def differentiable(self, val: bool):
         self._differentiable = val
 
+    @property
+    def is_custom_autograd(self) -> bool:
+        """
+        return if the adapter is emitted as a generated `torch.autograd.Function`:
+        a differentiable adapter whose forward/backward primitives are not fused into
+        one differentiable primitive (see `DiffFusion`).
+        """
+        return self._differentiable and self.custom
+
     def isfw(self) -> bool:
         return self._forward
 

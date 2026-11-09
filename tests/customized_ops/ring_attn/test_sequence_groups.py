@@ -24,6 +24,7 @@ from nnscaler.customized_ops.ring_attention.sliding_window_attn import (
 from nnscaler.customized_ops.ring_attention.varlen_utils import (
     select_sequence_group_cu_seqlens,
 )
+from nnscaler.graph.parser.register import EmitContext
 from nnscaler.runtime.device import DeviceGroup
 from tests.launch_torchrun import launch_torchrun
 
@@ -140,12 +141,30 @@ def test_emit_ring_uses_requested_sequence_subgroup(
         _FakeNode(),
         args=['q', 'k', 'v'],
         kwargs={'sequence_parallel_size': '2', 'sequence_group_count': '2'},
-        runtime_devid=runtime_devid,
-        plan_ndevs=4,
-        runtime_ndevs=8,
+        ctx=EmitContext(
+            plan_devid=runtime_devid % 4, plan_ngpus=4, runtime_ngpus=8,
+            scale_unit_index=runtime_devid // 4,
+        ),
     )
 
     assert f'process_group={expected_group}' in code
+
+
+@pytest.mark.parametrize('emit', [emit_varlen_ring, emit_sliding_window_ring])
+@pytest.mark.parametrize(
+    ('plan_devid', 'expected_group'),
+    [(0, '[0, 1]'), (1, '[0, 1]'), (2, '[2, 3]'), (3, '[2, 3]')],
+)
+def test_emit_ring_shared_scale_unit_code(emit, plan_devid, expected_group):
+    """Without a concrete scale unit index, the group is shifted at runtime."""
+    code = emit(
+        _FakeNode(),
+        args=['q', 'k', 'v'],
+        kwargs={'sequence_parallel_size': '2', 'sequence_group_count': '2'},
+        ctx=EmitContext(plan_devid=plan_devid, plan_ngpus=4, runtime_ngpus=8),
+    )
+
+    assert f'process_group=[r + self.scale_unit_index * 4 for r in {expected_group}]' in code
 
 
 @pytest.mark.parametrize('emit', [emit_varlen_ring, emit_sliding_window_ring])
@@ -154,9 +173,7 @@ def test_emit_ring_treats_explicit_none_as_default_group_size(emit):
         _FakeNode(),
         args=['q', 'k', 'v'],
         kwargs={'sequence_parallel_size': 'None'},
-        runtime_devid=0,
-        plan_ndevs=4,
-        runtime_ndevs=4,
+        ctx=EmitContext(plan_devid=0, plan_ngpus=4, runtime_ngpus=4, scale_unit_index=0),
     )
 
     assert 'process_group=[0, 1, 2, 3]' in code
@@ -169,7 +186,7 @@ def test_emit_ring_rejects_mismatched_metadata_group_count(emit, count):
         emit(
             _FakeNode(), args=['q', 'k', 'v'],
             kwargs={'sequence_parallel_size': '2', 'sequence_group_count': count},
-            runtime_devid=0, plan_ndevs=4, runtime_ndevs=4,
+            ctx=EmitContext(plan_devid=0, plan_ngpus=4, runtime_ngpus=4, scale_unit_index=0),
         )
 
 
