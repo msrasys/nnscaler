@@ -873,6 +873,73 @@ Please Note:
     When loading state dicts from file, use `torch.load(..., map_location='...')` to unify devices.
 
 
+### Memory-efficient checkpoint merging
+
+`merge_state_dicts` returns materialized dictionaries and therefore retains all
+merged tensors. When the destination is a checkpoint file instead, use
+`nnscaler.runtime.checkpoint.CheckpointMerger`:
+
+```python
+from nnscaler import merge_state_dicts
+from nnscaler.runtime.checkpoint import CheckpointMerger
+
+merger = CheckpointMerger(ram_budget_bytes=20 * 1024**3)
+shards = [merger.load(path) for path in checkpoint_files]
+
+def merge():
+    model, optimizer = merge_state_dicts(
+        [s['model'] for s in shards],
+        [s['optimizer'] for s in shards],
+    )
+    return {'model': model, 'optimizer': optimizer}
+
+stats = merger.merge(merge, 'merged.pt')
+print(stats.peak_bytes, stats.live_bytes)  # reconstruction peak, 0 after success
+```
+
+The callback runs the **same merge algorithm and validation** as an eager merge.
+Copies are recorded with immutable source versions and materialized one storage
+at a time by the synchronous PyTorch writer. Shared storage, tensor views, dtype,
+optimizer parameter ordering and scalar state are preserved. No deferred tensors
+escape the API, and output loads with ordinary `torch.load`.
+
+Use `merger.load` separately for each payload of a custom split checkpoint.
+The callback controls the output object (model-only, optimizer-only, a tuple, or
+an application-specific dictionary); application metadata and multi-file publication
+remain the caller's responsibility. Loading and arbitrary tensor computations must
+happen **outside** the callback. Inputs must remain unmodified until it completes.
+Each `merge` call publishes one file atomically and accumulates its statistics.
+
+This opt-in path requires PyTorch >= 2.1, CPU strided tensors, and ZIP-format
+PyTorch inputs. Unsupported operations fail explicitly. Existing eager APIs still
+support their original environments/formats. The implementation uses PyTorch's
+own serialization protocol, with a storage-writer adapter; compatibility tests
+must accompany PyTorch upgrades.
+
+`ram_budget_bytes=0` disables the reconstruction limit. The limit includes the
+current storage and its dependencies, **not** mmap inputs, Python metadata, or
+writer buffers. It is not a process-wide memory bound. Linux releases consumed
+input pages; on other platforms mmap page reclamation is left to the OS.
+There is no intermediate full checkpoint or tensor spill file.
+
+For a CPU fixture with 4 ranks, TP=2, ZeRO-1, a 128 MiB FP32 weight, and three
+optimizer tensors (512 MiB total merged tensor data), three alternating runs on
+PyTorch 2.8.0 with two CPU threads produced these medians:
+
+| Metric | Eager (`all`) | Storage-at-a-time (`tensor`) |
+| --- | ---: | ---: |
+| Process peak RSS (Linux `VmHWM`) | 2066 MiB | 868 MiB |
+| Merge and synchronous save | 0.937 s | 0.948 s |
+
+All three output pairs were compared in full. Reconstruction itself peaked at
+192 MiB (one 128 MiB storage plus a 64 MiB ZeRO dependency) and returned to zero.
+This fixture reduced process peak RSS by 58%; the small timing difference is not
+a throughput guarantee. Results depend on tensor sizes, duplicate validation,
+allocator behavior, and storage. CPU regression tests assert both the exact
+reconstruction bound and an independent-process RSS reduction; GPU tests also
+exercise TP, pipeline, nested modules, and ZeRO checkpoint restoration.
+
+
 ### `load_merged_state_dict`
 ```python
 def load_merged_state_dict(

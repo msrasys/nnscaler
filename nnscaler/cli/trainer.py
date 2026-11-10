@@ -406,6 +406,14 @@ class Trainer:
                 # we pop optimizer state to save cpu memory
                 state_dict.pop('optimizer', None)
             state_dicts.append(state_dict)
+        return cls._merge_checkpoint_states(checkpoint_files, state_dicts, model_only=model_only)
+
+    @classmethod
+    def _merge_checkpoint_states(
+        cls, checkpoint_files: List[str], state_dicts: List[Dict[str, Any]], *, model_only: bool = False,
+    ) -> Dict[str, Any]:
+        if not state_dicts:
+            raise ValueError("checkpoint_files should not be empty.")
         for i in range(1, len(state_dicts)):
             # NOTE: train_args can be different in different ranks
             # for example, profiling related args can be different,
@@ -480,7 +488,38 @@ class Trainer:
         checkpointer: Optional[Checkpointer] = None,
         serializer: Optional[str] = None,
         serializer_args: Optional[dict[str, Any]] = None,
+        merge_policy: str = 'all',
+        ram_budget_bytes: int = 0,
     ):
+        """Merge rank checkpoints, optionally reconstructing one storage at a time.
+
+        ``merge_policy='tensor'`` uses CPU mmap inputs and writes a standard
+        PyTorch ZIP checkpoint atomically. It requires PyTorch >= 2.1 and does not
+        support custom checkpointers/serializers or safetensors. The optional RAM
+        budget covers reconstructed tensors, not total process RSS. Default
+        ``'all'`` retains the existing eager behavior.
+        """
+        if merge_policy not in ('all', 'tensor'):
+            raise ValueError(f"Unknown merge_policy: {merge_policy}")
+        if ram_budget_bytes and merge_policy != 'tensor':
+            raise ValueError("ram_budget_bytes requires merge_policy='tensor'")
+        if merge_policy == 'tensor':
+            if checkpointer is not None or serializer is not None or serializer_args is not None:
+                raise ValueError("Tensor merge does not support custom checkpointers or serializers")
+            if any(Path(f).suffix == '.safetensors' for f in [*checkpoint_files, output_file]):
+                raise ValueError("Tensor merge requires PyTorch ZIP checkpoints, not safetensors")
+            from nnscaler.runtime.checkpoint import CheckpointMerger
+
+            merger = CheckpointMerger(ram_budget_bytes=ram_budget_bytes)
+            state_dicts = [merger.load(f) for f in checkpoint_files]
+            if model_only:
+                for state_dict in state_dicts:
+                    state_dict.pop('optimizer', None)
+            merger.merge(
+                lambda: cls._merge_checkpoint_states(checkpoint_files, state_dicts, model_only=model_only),
+                output_file,
+            )
+            return
         if checkpointer is not None:
             if serializer is not None or serializer_args is not None:
                 raise ValueError("serializer and serializer_args should not be specified when checkpointer is given")

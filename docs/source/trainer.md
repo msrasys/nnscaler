@@ -828,6 +828,37 @@ Please note
     where `checkpoint_files` is a list of checkpoint files to merge, and
     `output_file` is the output file path.
 
+    For large PyTorch checkpoints, opt into storage-at-a-time reconstruction:
+
+    ```python
+    Trainer.merge_checkpoint(
+        checkpoint_files, output_file,
+        merge_policy='tensor',
+        ram_budget_bytes=20 * 1024**3,  # optional; 0 means no reconstruction limit
+    )
+    ```
+
+    The default `merge_policy='all'` is unchanged. The `tensor` policy loads inputs
+    with CPU mmap and reconstructs, writes, and releases one output storage at a
+    time, including optimizer states. It preserves the existing TP/ZeRO merge
+    validation, shared parameters, and training metadata. The output is an ordinary
+    PyTorch checkpoint; no new loader or checkpoint format is required.
+    `model_only=True` is also supported.
+
+    This policy requires PyTorch >= 2.1 and ZIP-format PyTorch checkpoints.
+    Custom checkpointers/serializers and safetensors are rejected explicitly.
+    For application-specific layouts (such as separate model/optimizer payloads),
+    use [`CheckpointMerger`](parallel_module.md#memory-efficient-checkpoint-merging).
+    Only trusted checkpoints should be loaded, as with the existing merger.
+
+    The budget covers **reconstructed tensors**, not total RSS or a cgroup limit:
+    input mappings, Python metadata, and serialization buffers are additional.
+    One output storage and its temporary dependencies must fit, including during
+    duplicate validation. On Linux, consumed mmap input pages are released.
+    Insufficient budget or unsupported operations raise an error without silently
+    falling back to eager merging or disk spilling. Merge/write/fsync failures
+    leave an existing destination unchanged and clean up temporary output.
+
 2.  When a checkpoint is saved, we will run validation on the validation
     dataset and save the validation loss to the checkpoint file. The
     validation run will ignore the `val_every_n_train_steps` and

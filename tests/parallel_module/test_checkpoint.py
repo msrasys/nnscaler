@@ -503,7 +503,7 @@ def assert_model_state_dict_equal(state_dict1: dict, state_dict2: dict):
         assert torch.equal(state_dict1[index].cpu(), state_dict2[index].cpu())
 
 
-def _train(model: torch.nn.Module, num_replicas, rank, start, end, ckpt_dir, inference_module: torch.nn.Module = None, check_merge_log=False):
+def _train(model: torch.nn.Module, num_replicas, rank, start, end, ckpt_dir, inference_module: torch.nn.Module = None, check_merge_log=False, tensor_merge=False):
     ckpt_file_template = 'ckpt_{rank}_{start}.pth'
     ckpt_merged_file_template = 'ckpt_merged_{start}.pth'
     temp_inferenece_ckpt_file_template = 'inference-{rank}.pth'
@@ -659,6 +659,23 @@ def _train(model: torch.nn.Module, num_replicas, rank, start, end, ckpt_dir, inf
             'model': merged_model_state_dicts,
             'optimizer': merged_optimizer_state_dict
         }, ckpt_merged_file)
+        if tensor_merge:
+            from nnscaler.runtime.checkpoint import CheckpointMerger
+
+            merger = CheckpointMerger()
+            mapped = [merger.load(path) for path in ckpt_files]
+
+            def merge():
+                module, optimizer = merge_state_dicts(
+                    [state['model'] for state in mapped], [state['optimizer'] for state in mapped],
+                )
+                return {'model': module, 'optimizer': optimizer}
+
+            merger.merge(merge, ckpt_merged_file)
+            actual = torch.load(ckpt_merged_file, weights_only=False)
+            assert_equal(actual['model'], merged_model_state_dicts)
+            assert_equal(actual['optimizer'], merged_optimizer_state_dict)
+            assert merger.stats.live_bytes == 0
         from nnscaler.runtime.serialization import convert, load
         from contextlib import ExitStack
         ckpt_st_file_template = 'ckpt_{rank}_{start}.safetensors'
@@ -682,7 +699,7 @@ def _train(model: torch.nn.Module, num_replicas, rank, start, end, ckpt_dir, inf
     return results
 
 
-def _gpu_worker(module_type, use_zero, pas, plan_ngpus, runtime_ngpus, per_resume_update_count, resume_count, check_module=None):
+def _gpu_worker(module_type, use_zero, pas, plan_ngpus, runtime_ngpus, per_resume_update_count, resume_count, check_module=None, tensor_merge=False):
     init_distributed()
     compiled_results = []
     with clear_dir_on_rank0(Path(tempfile.gettempdir()) / f'cube_test_ckpt_{PYTEST_RUN_ID}') as tempdir:
@@ -706,9 +723,44 @@ def _gpu_worker(module_type, use_zero, pas, plan_ngpus, runtime_ngpus, per_resum
                 runtime_ngpus // plan_ngpus,
                 torch.distributed.get_rank() // plan_ngpus,
                 start, end, tempdir,
-                inference_module=compiled_inference_module
+                inference_module=compiled_inference_module,
+                tensor_merge=tensor_merge,
             ))
         return compiled_results
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.device_count() < 4
+    or tuple(int(v) for v in torch.__version__.split('.')[:2]) < (2, 1),
+    reason='requires four GPUs and PyTorch >= 2.1',
+)
+@pytest.mark.parametrize('module_type', ['sub', 'whole', 'pipeline'])
+@pytest.mark.parametrize('use_zero', [0, 1])
+def test_tensor_checkpoint_resume(module_type, use_zero):
+    # The second iteration loads the streamed file into model AND optimizer and
+    # compares them with the original sharded checkpoint on every rank.
+    launch_torchrun(4, _gpu_worker, module_type, use_zero, 'tp', 2, 4, 4, 2, None, True)
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.device_count() < 4
+    or tuple(int(v) for v in torch.__version__.split('.')[:2]) < (2, 1),
+    reason='requires four GPUs and PyTorch >= 2.1',
+)
+def test_tensor_checkpoint_pipeline_zero3(tmp_path):
+    from nnscaler.cli.trainer import Trainer
+    from tests.cli.test_trainer_pipeline_zero3_offload import _trainer_worker
+
+    launch_torchrun(
+        4, _trainer_worker, tmp_path, 'baseline',
+        'tests.cli.test_trainer_pipeline_zero3_offload.pipeline_zero3_policy', None,
+    )
+    files = list((tmp_path / 'baseline' / 'checkpoints' / 'last').glob('*.ckpt'))
+    Trainer.merge_checkpoint(files, tmp_path / 'tensor.pt', merge_policy='tensor')
+    assert_equal(
+        torch.load(tmp_path / 'tensor.pt', weights_only=False),
+        torch.load(tmp_path / 'baseline.pt', weights_only=False),
+    )
 
 
 @pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.device_count() < 4, reason='lack of gpu devices')
