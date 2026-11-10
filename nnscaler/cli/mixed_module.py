@@ -3,7 +3,7 @@
 
 import types
 import torch
-from typing import Any, Optional
+from typing import Any, Optional, Protocol, Union
 from dataclasses import asdict, replace
 import inspect
 import copy
@@ -11,6 +11,7 @@ import logging
 from functools import partial
 
 import nnscaler
+from nnscaler.parallel import _mark_sync_grad_required
 from nnscaler.runtime.adapter.reducer import Reducer
 from nnscaler.runtime.gnorm import ParamsInfo
 from nnscaler.utils import fields
@@ -246,7 +247,32 @@ class ModuleParallelizeConfigAdapter(PrecisionMixin, PolicyMixin):
         return pmodel_class
 
 
-def mixin_module(model: torch.nn.Module, optimizer: torch.optim.Optimizer):
+class MixinModule(Protocol):
+    """A root module that drives its own optimizer step.
+
+    Implementers are ``torch.nn.Module`` subclasses; the protocol only adds the
+    step interface.  ``mixin_module`` installs a default ``train_step``/``infer_step``
+    that run ``forward`` once per sample.  A root may implement this protocol
+    instead to customize the training and inference steps.
+
+    ``train_step`` is required; ``infer_step`` is optional.
+    Both follow the ``ParallelModule`` signatures.  Before ``train_step`` runs,
+    the gradient accumulation steps of every reducer are set to ``len(samples)``.
+    """
+
+    def train_step(self, samples: list[Any], is_dummy_batch: Optional[list[bool]] = None) -> list[Any]:
+        ...
+
+    def infer_step(self, samples: list[Any]) -> list[Any]:
+        ...
+
+
+def mixin_module(model: Union[torch.nn.Module, MixinModule], optimizer: torch.optim.Optimizer) -> MixinModule:
+    """Give a partially parallelized root module the ``ParallelModule`` step interface.
+
+    Methods the model already provides (see :class:`MixinModule`) are kept.
+    A ``ParallelModule`` root already satisfies the protocol and is returned as is.
+    """
     if isinstance(model, nnscaler.ParallelModule):
         return model
 
@@ -319,9 +345,23 @@ def mixin_module(model: torch.nn.Module, optimizer: torch.optim.Optimizer):
 
         return params_info
 
+    # MixinModule.train_step, when the model provides one
+    user_train_step = getattr(model, 'train_step', None)
+
+    def custom_train_step(self, samples, is_dummy_batch=None):
+        # Every micro-batch, dummy ones included, runs a backward in a custom
+        # step, so the reducers expect one contribution per sample.
+        set_grad_accumulation_steps(model, len(samples))
+        # A wrapper driving a nested end2end submodule may never run the root
+        # forward, so the forward hook that arms ``optimizer.sync_shard_grad()``
+        # does not fire.  Mark the root here so the trainer's sync still runs
+        # the reducers of every parallel submodule.
+        _mark_sync_grad_required(model)
+        return user_train_step(samples, is_dummy_batch)
+
     model.set_grad_accumulation_steps = types.MethodType(set_grad_accumulation_steps, model)
-    if not callable(getattr(model, 'train_step', None)):
-        model.train_step = types.MethodType(train_step, model)
+    model.train_step = types.MethodType(
+        custom_train_step if callable(user_train_step) else train_step, model)
     if not callable(getattr(model, 'infer_step', None)):
         model.infer_step = types.MethodType(infer_step, model)
     model.parameters_for_calc_gnorm = types.MethodType(parameters_for_calc_gnorm, model)

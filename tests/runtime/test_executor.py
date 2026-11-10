@@ -331,8 +331,17 @@ def test_custom_fbw_grad_coverage_accepts_split_gradients():
         executor.backward_weight('segment', (weight,))
 
 
+def _segment_backward(use_fbw, name, inputs, outputs, grads):
+    if not use_fbw:
+        return Executor.backward(name, inputs, outputs, grads)
+    result = Executor.backward_input(name, inputs, outputs, grads, [])
+    Executor.backward_weight(name, [])
+    return result
+
+
+@pytest.mark.parametrize('use_fbw', [False, True])
 @pytest.mark.parametrize('repeats', [1, 2, 3])
-def test_backward_retains_repeated_boundary_input_once(repeats):
+def test_backward_retains_repeated_boundary_input_once(repeats, use_fbw):
     leaf = torch.randn(4, 3, dtype=torch.float64, requires_grad=True)
     outer_input = leaf * 2
     outer_input.retain_grad()
@@ -347,8 +356,8 @@ def test_backward_retains_repeated_boundary_input_once(repeats):
         expected = sum(range(1, repeats + 1)) * reference.cos()
         segment(*([reference] * repeats)).sum().backward()
         output = Executor.fexecute('segment', segment, *([outer_input] * repeats))
-        grads = Executor.backward(
-            'segment', [outer_input] * repeats, [output], [torch.ones_like(output)],
+        grads = _segment_backward(
+            use_fbw, 'segment', [outer_input] * repeats, [output], [torch.ones_like(output)],
         )
         for grad in (grads,) if repeats == 1 else grads:
             torch.testing.assert_close(grad, expected)
@@ -357,7 +366,8 @@ def test_backward_retains_repeated_boundary_input_once(repeats):
     Executor.check_clear()
 
 
-def test_backward_preserves_retained_outer_input_grad():
+@pytest.mark.parametrize('use_fbw', [False, True])
+def test_backward_preserves_retained_outer_input_grad(use_fbw):
     Executor.clear()
     try:
         leaf = torch.randn(4, 3, requires_grad=True)
@@ -366,8 +376,8 @@ def test_backward_preserves_retained_outer_input_grad():
 
         output = Executor.fexecute('segment', torch.sin, outer_input)
         expected = torch.cos(outer_input)
-        actual = Executor.backward(
-            'segment', (outer_input,), (output,), (torch.ones_like(output),),
+        actual = _segment_backward(
+            use_fbw, 'segment', (outer_input,), (output,), (torch.ones_like(output),),
         )
 
         assert torch.equal(actual, expected)

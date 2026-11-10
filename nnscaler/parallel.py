@@ -1684,7 +1684,13 @@ _NON_PARALLEL_MODULE_ATTR_NAME = '_nnscaler_non_parallel_module_'
 _SYNC_GRAD_REQUIRED_ATTR = '_nnscaler_sync_grad_required'
 
 
-def _mark_sync_grad_required(module: torch.nn.Module, inputs, output) -> None:
+def _mark_sync_grad_required(module: torch.nn.Module, *_) -> None:
+    """Record that ``module`` ran a training step and its grads await sync.
+
+    Used as a forward hook on a mixed root module, and called directly by
+    ``mixin_module`` for a root whose custom ``train_step`` never runs the
+    root forward.
+    """
     if module.training:
         setattr(module, _SYNC_GRAD_REQUIRED_ATTR, True)
 
@@ -1779,16 +1785,6 @@ def build_optimizer(
     """
     if isinstance(module, CubeModule) and not isinstance(module, ParallelModule):
         raise RuntimeError("Old style CubeModule is not supported")
-
-    # End-to-end submodules need an outer wrapper that delegates train_step and
-    # handles gradients crossing the submodule boundary explicitly.
-    nested_end2end = [
-        m for m in module.modules()
-        if m is not module and isinstance(m, ParallelModule)
-        and m.compute_config.use_end2end
-    ]
-    if nested_end2end and not getattr(module, 'supports_nested_end2end', False):
-        raise RuntimeError("End2End module cannot be nested in another module")
 
     is_hybrid = getattr(optimizer_fn, 'is_hybrid', False)
     if is_hybrid and param_clss_fn is None:

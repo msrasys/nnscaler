@@ -248,15 +248,12 @@ class OptionalReducerConfig:
         resolved_values = asdict(compute_config)
         resolved_values.update(kwargs)
         resolved_values.update(replace_values)
-        # Submodules are non-end-to-end by default.  A wrapper may opt a
-        # submodule into end-to-end execution when that submodule itself owns
-        # the complete train graph (for example, an LLM pipeline nested beside
-        # a separately parallelized vision tower).
-        use_end2end = getattr(self, 'use_end2end', None)
-        resolved_values[fields(ComputeConfig).use_end2end] = (
-            False if use_end2end is None else use_end2end
-        )
-        resolved_values[fields(ComputeConfig).use_fbw] = False
+        # Submodules are non-end-to-end unless they opt in: a wrapper may nest
+        # an end-to-end submodule that owns the complete train graph (for
+        # example an LLM pipeline beside a separately parallelized vision tower).
+        # FBW follows the same rule; ComputeConfig rejects it without end2end.
+        for key in (fields(ComputeConfig).use_end2end, fields(ComputeConfig).use_fbw):
+            resolved_values[key] = replace_values.get(key, False)
         return ComputeConfig(**resolved_values)
 
 
@@ -267,6 +264,7 @@ class OptionalComputeConfig(OptionalReducerConfig):
     param_init_strategy: Optional[str] = None
     param_init_seed: Optional[int] = None
     use_end2end: Optional[bool] = None
+    use_fbw: Optional[bool] = None
 
     pas_config: Optional[Dict[str, Any]] = None
     user_config: Optional[Dict[str, Any]] = None
