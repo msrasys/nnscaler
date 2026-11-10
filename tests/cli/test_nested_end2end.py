@@ -195,7 +195,8 @@ def record_train_loss(trainer: Trainer, aggregated_outputs, loss):
     _train_losses.append(float(loss))
 
 
-def nested_end2end_worker(run_dir, nested: bool, use_fbw: bool = False, vision_dp: bool = False):
+def nested_end2end_worker(run_dir, nested: bool, use_fbw: bool = False, vision_dp: bool = False,
+                          multi_stream: bool = False):
     _train_losses.clear()
     run_dir = Path(run_dir)
     config_path = str(Path(__file__).with_name('trainer_args_nested_end2end.yaml').resolve())
@@ -217,6 +218,11 @@ def nested_end2end_worker(run_dir, nested: bool, use_fbw: bool = False, vision_d
         ]
     if nested:
         args += ['--model.parallel_modules.1.compute_config.use_fbw', str(use_fbw)]
+        if multi_stream:
+            # the nested pipeline runs on named streams; its train_step must fence
+            # itself against the wrapper's eager vision forward and gradient use
+            args += ['--model.parallel_modules.1.compute_config.pas_config.pipeline_scheduler',
+                     'tests.test_policies.sched_1f1b_multi_stream']
     else:
         args += [
             '--model.type', 'tests.cli.test_nested_end2end.VLModel',
@@ -225,6 +231,8 @@ def nested_end2end_worker(run_dir, nested: bool, use_fbw: bool = False, vision_d
         ]
     trainer = Trainer(args)
     trainer.run()
+    if multi_stream:
+        assert trainer.model.language.cuda_sync_required
     if vision_dp:
         # Adam hides a wrong gradient scale, so check the reducer directly: the
         # replicated vision weights are summed over all ranks without division.
@@ -250,6 +258,8 @@ def test_nested_end2end_matches_mixed_baseline(tmp_path):
         baseline_losses = launch_torchrun(4, nested_end2end_worker, baseline_dir, False, False, vision_dp)
         baseline = torch.load(baseline_dir / 'merged.pt', weights_only=False)
         baselines[layout] = baseline
+        if not vision_dp:
+            baseline_losses_tp = baseline_losses
 
         for use_fbw in (False, True):
             run_dir = tmp_path / f'nested_{layout}_fbw{int(use_fbw)}'
@@ -267,3 +277,10 @@ def test_nested_end2end_matches_mixed_baseline(tmp_path):
 
     # The two vision layouts compute the same model; their baselines must agree too.
     assert_close(baselines['dp']['model'], baselines['tp']['model'], atol=1e-5, rtol=1e-5)
+
+    run_dir = tmp_path / 'nested_tp_multi_stream'
+    losses = launch_torchrun(4, nested_end2end_worker, run_dir, True, False, False, True)
+    nested = torch.load(run_dir / 'merged.pt', weights_only=False)
+    for rank in range(4):
+        assert losses[rank] == pytest.approx(baseline_losses_tp[rank], abs=1e-5)
+    assert_close(nested['model'], baselines['tp']['model'], atol=1e-5, rtol=1e-5)
