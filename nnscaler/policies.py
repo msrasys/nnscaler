@@ -434,6 +434,8 @@ class OpPlan:
     # op's inputs will be passed to the hook.
     # The signature will be like
     # def pre_hook(module: ParallelModule, meta: Any, inputs: Tuple[Any, ...], kwargs: Dict[str, Any]) -> None:
+    # A hooked dataloader lookup is never recomputed in other pipeline stages
+    # (see `_duplicate_dataloader_index_ops_per_stage`), so the hook runs once.
     pre_hook: Optional[Callable[['ParallelModule', Any, tuple[Any, ...], dict[str, Any]], None]] = None
 
     # function to be called after the op is executed
@@ -441,6 +443,8 @@ class OpPlan:
     # op's inputs and outputs will be passed to the hook.
     # the signature will be like
     # def post_hook(module: ParallelModule, meta: Any, inputs: Tuple[Any, ...], kwargs: Dict[str, Any], output: Any) -> None:
+    # A hooked dataloader lookup is never recomputed in other pipeline stages
+    # (see `_duplicate_dataloader_index_ops_per_stage`), so the hook runs once.
     post_hook: Optional[Callable[['ParallelModule', Any, tuple[Any, ...], dict[str, Any], Any], None]] = None
 
     # OpPartition: user specified partition plan
@@ -577,7 +581,11 @@ def _get_new_node_outputs_splits(node: IRFwOperation, stage: IRSegment, op_plans
             op_partition_map = op_partition_maps.get(consumer, {})
             stage_id = op_plans[consumer].stage_id
 
-            if not op_partition_map:
+            if not op_partition_map or tensor_idx is None:
+                # `tensor_idx is None`: the tensor sits inside a container input
+                # (e.g. the dict default of `dict.get`), which only non-differentiable
+                # IRPyFunc ops have; no gradient flows back through it, so the op's
+                # own partition map cannot say anything about it: replicated, no reduce.
                 tensor_split = 'rn'
             else:
                 assert tensor_idx in op_partition_map, "Internal Error: tensor_idx should be in op_partition_map"
@@ -732,8 +740,8 @@ def _duplicate_dataloader_index_ops_per_stage(graph: IRGraph, op_plans: dict) ->
 
     Motivation:
     The dataloader operation is replicated to all devices (see the end of ``fn``),
-    hence its raw output is available in every pipeline stage. An indexing op
-    (``getitem`` / ``getattr``) on that output is non-differentiable and cheap, so
+    hence its raw output is available in every pipeline stage. A lookup op
+    (``getitem`` / ``dict.get``) on that output is non-differentiable and cheap, so
     recomputing it per stage is strictly better than transferring its result.
 
     Consider::
@@ -749,6 +757,14 @@ def _duplicate_dataloader_index_ops_per_stage(graph: IRGraph, op_plans: dict) ->
     The original op is kept in its own stage (that stage may still need it). If the
     original becomes dead (no remaining consumer and not a graph output), it is
     removed.
+
+    Ops that are not sinkable stay in their assigned stage and their results are
+    forwarded through adapters as before: lookups whose inputs are not all
+    dataloader-derived (parameters, buffers, activations, also when nested in a
+    container default), lookups whose output requires grad, and lookups with a
+    ``pre_hook`` or ``post_hook``. A hook is bound to the op in its assigned stage
+    and must run exactly once per microbatch; a copy in another stage would either
+    drop it or run it once more per consuming stage.
 
     This must be called before ``graph.staging`` (i.e. before any partition), while
     all forward ops still live at the top level of the graph and stage ids are known
@@ -793,6 +809,13 @@ def _duplicate_dataloader_index_ops_per_stage(graph: IRGraph, op_plans: dict) ->
         # index op output must not require grad (duplicating a grad producer
         # would create multiple gradient sources for the same value)
         if any(isinstance(oobj, IRSubTensor) and oobj.requires_grad for oobj in node.oobjs()):
+            node_sinkable_cache[node.cid] = False
+            return False
+
+        # hooks are bound to this op in its assigned stage; a copy in another
+        # stage would either drop them or run them once more per stage
+        plan = op_plans.get(node)
+        if plan is not None and (plan.pre_hook is not None or plan.post_hook is not None):
             node_sinkable_cache[node.cid] = False
             return False
 

@@ -1212,3 +1212,58 @@ def test_shared_prefix_lookups(tmp_path):
         ), f'{key} lookup is emitted before its producer'
     for rank in (0, 1):
         assert not _gencode_contains(tmp_path, SharedPrefixLookupModule, rank, r'nnscaler.runtime.adapter.move_object')
+
+
+def _lookup_pre_hook(module, meta, inputs, kwargs):
+    pass
+
+
+def _lookup_post_hook(module, meta, inputs, kwargs, output):
+    pass
+
+
+def _hooked_lookup_policy(graph, cfg):
+    from nnscaler.policies import OpPlan, get_pas_ops
+
+    for node in get_pas_ops(graph):
+        stage_id = -1
+        if node.fn == torch.add and node.input(1).is_param():
+            stage_id = {'w0': 0, 'w1': 0, 'w2': 1, 'w3': 1}[node.input(1).name]
+        if node.signature == 'builtins.dict.get':
+            yield OpPlan(node, stage_id=stage_id, partition=None, hook_meta={'name': 'scale'},
+                         pre_hook=_lookup_pre_hook, post_hook=_lookup_post_hook)
+        else:
+            yield OpPlan(node, stage_id=stage_id, partition=None)
+
+
+@replace_all_device_with('cpu')
+def test_hooked_lookup_stays_in_its_stage(tmp_path):
+    m = SharedDictGetInputModule()
+    m.train()
+    parallelize(
+        m,
+        {'data': {'data': torch.randn(4, 4), 'meta': {'scale': 2.0}}},
+        pas_policy=_hooked_lookup_policy,
+        compute_config= ComputeConfig(
+            2, 2,
+            constant_folding=False,
+            use_end2end=True,
+            pas_config=dict(
+                pipeline_nmicros=2,
+                pipeline_scheduler='1f1b'
+            )
+        ),
+        gen_savedir=tmp_path,
+        load_module=False,
+        reuse='override',
+    )
+    # the hooked lookup is not recomputed in stage 1: it runs once in stage 0,
+    # wrapped by its hooks, and only its result is forwarded
+    assert _gencode_contains(
+        tmp_path, SharedDictGetInputModule, 0,
+        r"_lookup_pre_hook\(self, \{'name': 'scale'\}, \(getitem_[\d_]+, 'scale', 2.0\), dict\(\)\)[\s\S]*?"
+        r"get_[\d_]+ = builtins.dict.get\(getitem_[\d_]+, 'scale', 2.0\)[\s\S]*?"
+        r"_lookup_post_hook\(self, \{'name': 'scale'\}, \(getitem_[\d_]+, 'scale', 2.0\), dict\(\), get_[\d_]+\)"
+    )
+    assert not _gencode_contains(tmp_path, SharedDictGetInputModule, 1, r"builtins.dict.get")
+    assert _gencode_contains(tmp_path, SharedDictGetInputModule, 1, r"nnscaler.runtime.adapter.move_object\(\(\), src=0, dst=1\)")
