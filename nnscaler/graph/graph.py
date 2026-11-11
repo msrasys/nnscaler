@@ -847,9 +847,9 @@ class IRGraph(IRSegment):
         """
         assert all(isinstance(node, IRFwOperation) for node in nodes), \
             f"Find node is not IRFwOperation or IRDataOperation: {node}"
-        assert all(node in self._nodes for node in nodes), \
+        assert all(node in self._node_set for node in nodes), \
             f"Exist node is not in graph nodes"
-        starts = list(self._nodes.index(node) for node in nodes)
+        starts = [pos[0] for pos in self.multi_index(nodes)]
         assert len(starts) > 0
 
         # multiref (created by graph.multiref) will be moved to the next stage (if possible) for optimization
@@ -940,9 +940,9 @@ class IRGraph(IRSegment):
         """
         for node in nodes:
             assert isinstance(node, IRFwOperation), f"Expected node to be IRFwOperation, but got {node}"
-        assert all(node in self._nodes for node in nodes), \
+        assert all(node in self._node_set for node in nodes), \
             f"Exist node is not in graph nodes"
-        starts = list(self._nodes.index(node) for node in nodes)
+        starts = [pos[0] for pos in self.multi_index(nodes)]
         assert len(starts) > 0
 
         # multiref (created by graph.auto_multiref) will be moved to the next stage (if possible) for optimization
@@ -1234,6 +1234,13 @@ class IRGraph(IRSegment):
                 t.cell = segment
 
         reset_node(graph)
+        # Dumps written before IRSegment kept membership indexes have no
+        # `_node_set` / `_sub_segments`, so reusing such a graph.ckp would fail on
+        # the first `exist`/`index` call. Rebuild every index derived from `_nodes`
+        # (recursively over sub-segments); a dump is written by a single version,
+        # so checking the root is enough.
+        if not hasattr(graph, '_node_set'):
+            graph._reorder_producer_consumer()
         return graph
 
     @staticmethod

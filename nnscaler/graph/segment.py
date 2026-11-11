@@ -89,8 +89,9 @@ class IRSegment(IRCell):
         self._nodes: List[IRCell] = []
         # Identity-based membership indexes of `_nodes`.
         # Like `_producers`/`_consumers`, they are derived from `_nodes`:
-        # `insert`/`remove` update them incrementally, and any code that rewrites
-        # `_nodes` directly must call `_reorder_producer_consumer()` afterwards.
+        # `insert`/`remove` update them incrementally, and any code that changes
+        # the membership of `_nodes` directly must call `_reorder_producer_consumer()`
+        # afterwards (a pure reordering such as `IRGraph.sequential` keeps them valid).
         self._node_set: Set[IRCell] = set()
         self._sub_segments: Set[IRSegment] = set()
 
@@ -549,6 +550,10 @@ class IRSegment(IRCell):
         if len(pos) == 1:
             index = pos[0]
             # insert node
+            # a node must appear once per segment, otherwise `index`/`remove`
+            # are ambiguous and the membership indexes would go stale on removal
+            if node in self._node_set:
+                raise ValueError(f"{node} is already in the segment")
             self._nodes.insert(index, node)
             self._node_set.add(node)
             if isinstance(node, IRSegment):

@@ -27,7 +27,7 @@ can be
     3) gradient of parameters
 """
 
-from typing import List, Optional, Set, Union, Tuple, NewType, Dict, Any
+from typing import List, Optional, Set, Union, Tuple, Dict, Any
 import torch
 
 from nnscaler.ir.cten import IRTensor, ValueTrack
