@@ -152,6 +152,34 @@ class Executor:
     _backward_pre_hook: Optional[Callable] = None
 
     @staticmethod
+    def _retained_inputs(input_tensors: Iterable[Any]) -> Dict[int, torch.Tensor]:
+        """Caller tensors that asked to keep their gradient, keyed by id.
+
+        ``fexecute`` detaches segment inputs, so autograd never reaches the
+        caller's tensors.  Honor ``retain_grad()`` on them for callers that
+        continue the backward in an outer eager graph (a nested end2end module).
+        """
+        return {
+            id(t): t for t in input_tensors
+            if torch.is_tensor(t) and t.retains_grad
+        }
+
+    @staticmethod
+    def _restore_retained_grads(
+        retained_inputs: Dict[int, torch.Tensor],
+        saved_pairs: TensorPairs,
+        grad_by_dtensor: Dict[int, torch.Tensor],
+    ) -> None:
+        # An input passed several times maps to one detached tensor whose grad
+        # is already the sum over all uses; dict() collapses the repeats so the
+        # gradient is copied once.  Accumulate across segments like retain_grad.
+        for tid, dtensor in dict(saved_pairs).items():
+            tensor = retained_inputs.get(tid)
+            if tensor is not None:
+                grad = grad_by_dtensor[id(dtensor)]
+                tensor.grad = grad if tensor.grad is None else tensor.grad + grad
+
+    @staticmethod
     def fexecute(name: str, subgraph: Callable, *input_tensors: Tuple[Any], requires_grad=True):
         """
         forward the sub-graph.
@@ -231,6 +259,7 @@ class Executor:
 
         if len(output_tensors) == 0: return None
 
+        retained_inputs = Executor._retained_inputs(input_tensors)
         input_tensors = []
         for t in dtensors:
             if torch.is_tensor(t) and t.requires_grad:
@@ -263,6 +292,10 @@ class Executor:
         )
         grads = tuple(t.grad for t in input_tensors)
         assert all(grad is not None for grad in grads), "RuntimeError: got gradient None"
+
+        Executor._restore_retained_grads(
+            retained_inputs, saved_pairs, {id(t): t.grad for t in input_tensors},
+        )
 
         if    len(grads) == 0: return None
         elif  len(grads) == 1: return grads[0]
@@ -305,6 +338,7 @@ class Executor:
             )
             return None
 
+        retained_inputs = Executor._retained_inputs(input_tensors)
         input_tensors = [
             tensor for tensor in dtensors
             if torch.is_tensor(tensor) and tensor.requires_grad
@@ -343,17 +377,23 @@ class Executor:
             tensor.clone() if tensor._is_view() else tensor
             for tensor in dedup_output_tensors
         ]
-        grads, param_groups = stage_backward_input(
+        # stage_backward_input miscomputes gradients when an input is listed more
+        # than once; deduplicate and return one gradient per occurrence instead.
+        unique_inputs = list({id(tensor): tensor for tensor in input_tensors}.values())
+        unique_grads, param_groups = stage_backward_input(
             stage_outputs,
             dedup_output_tensor_grads,
-            input_tensors,
+            unique_inputs,
             iter(weights),
         )
         Executor._weight_backward_states.setdefault(name, []).append(
             _WeightBackwardState(param_groups=param_groups)
         )
 
-        assert all(grad is not None for grad in grads), "RuntimeError: got gradient None"
+        assert all(grad is not None for grad in unique_grads), "RuntimeError: got gradient None"
+        grad_by_dtensor = dict(zip(map(id, unique_inputs), unique_grads))
+        grads = tuple(grad_by_dtensor[id(tensor)] for tensor in input_tensors)
+        Executor._restore_retained_grads(retained_inputs, saved_pairs, grad_by_dtensor)
         if len(grads) == 0: return None
         elif len(grads) == 1: return grads[0]
         else: return grads

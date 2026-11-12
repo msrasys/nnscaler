@@ -248,8 +248,12 @@ class OptionalReducerConfig:
         resolved_values = asdict(compute_config)
         resolved_values.update(kwargs)
         resolved_values.update(replace_values)
-        resolved_values[fields(ComputeConfig).use_end2end] = False
-        resolved_values[fields(ComputeConfig).use_fbw] = False
+        # Submodules are non-end-to-end unless they opt in: a wrapper may nest
+        # an end-to-end submodule that owns the complete train graph (for
+        # example an LLM pipeline beside a separately parallelized vision tower).
+        # FBW follows the same rule; ComputeConfig rejects it without end2end.
+        for key in (fields(ComputeConfig).use_end2end, fields(ComputeConfig).use_fbw):
+            resolved_values[key] = replace_values.get(key, False)
         return ComputeConfig(**resolved_values)
 
 
@@ -259,6 +263,8 @@ class OptionalComputeConfig(OptionalReducerConfig):
     trace_strategy: Optional[str] = None
     param_init_strategy: Optional[str] = None
     param_init_seed: Optional[int] = None
+    use_end2end: Optional[bool] = None
+    use_fbw: Optional[bool] = None
 
     pas_config: Optional[Dict[str, Any]] = None
     user_config: Optional[Dict[str, Any]] = None
@@ -268,7 +274,9 @@ class OptionalComputeConfig(OptionalReducerConfig):
 class ModuleParallelizeConfig:
     # The type to be parallelized
     # Please note if you specify this
-    # pipeline parallelism will be disabled, and you must ensure ComputeConfig.use_end2end is False
+    # Pipeline parallelism is disabled by default. Set
+    # ``compute_config.use_end2end=True`` only when this submodule owns a
+    # complete end-to-end train graph.
     type: str = None
     # the module args to be used for creating the module
     # If run_mode is 'compile' and `args` is not None

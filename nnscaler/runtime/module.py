@@ -3,7 +3,7 @@
 
 import functools
 import pickle
-from contextlib import closing
+from contextlib import closing, contextmanager
 from typing import Callable, List, Set, Dict, Tuple, Optional, TYPE_CHECKING, Any, Union, ClassVar, Generator
 from typing_extensions import Self
 import logging
@@ -1733,6 +1733,23 @@ class ParallelModule(CubeModule):
             for reducer in self._reducers:
                 reducer.sync_grads()
 
+    @contextmanager
+    def _cuda_sync_fence(self):
+        """Fence a generated multi-stream step against the caller's stream.
+
+        The generated code orders work between its own named streams but not
+        against the caller's current stream: inputs produced before the step
+        (eager activations feeding a nested module) and results read after it
+        (outputs, retained boundary gradients) would otherwise race.
+        """
+        if getattr(self, 'cuda_sync_required', False):
+            torch.cuda.synchronize()
+        try:
+            yield
+        finally:
+            if getattr(self, 'cuda_sync_required', False):
+                torch.cuda.synchronize()
+
     def _train_step(self, dataloader) -> Union[List[Any], Any]:
         """
         This function is assigned automatically when loading end2end module class
@@ -1844,14 +1861,15 @@ class ParallelModule(CubeModule):
             if len(samples) not in valid_nmicros:
                 raise ValueError(f"Expected one of {valid_nmicros} samples, but got {sample_count}")
             # only one step, so begin/end are both True
-            with accum_mode(begin=True, end=True):
+            with self._cuda_sync_fence(), accum_mode(begin=True, end=True):
                 return self._train_step(dataloader)
         else:
             outputs = []
-            for idx in range(sample_count):
-                with accum_mode(begin=(idx==0), end=(idx==sample_count-1)):
-                    output = self._train_step(dataloader)
-                outputs.append(output)
+            with self._cuda_sync_fence():
+                for idx in range(sample_count):
+                    with accum_mode(begin=(idx==0), end=(idx==sample_count-1)):
+                        output = self._train_step(dataloader)
+                    outputs.append(output)
             return outputs
 
     def infer_step(self, samples: List[Any]) -> List[Any]:
@@ -1878,12 +1896,14 @@ class ParallelModule(CubeModule):
                 valid_nmicros = (valid_nmicros,)
             if len(samples) not in valid_nmicros:
                 raise ValueError(f"Expected one of {valid_nmicros} samples, but got {sample_count}")
-            return self._infer_step(dataloader)
+            with self._cuda_sync_fence():
+                return self._infer_step(dataloader)
         else:
             outputs = []
-            for _ in range(sample_count):
-                output = self._infer_step(dataloader)
-                outputs.append(output)
+            with self._cuda_sync_fence():
+                for _ in range(sample_count):
+                    output = self._infer_step(dataloader)
+                    outputs.append(output)
             return outputs
 
     def clip_gnorm(self, max_norm: Optional[float] = None) -> Tuple[torch.Tensor, List[torch.Tensor]]:
