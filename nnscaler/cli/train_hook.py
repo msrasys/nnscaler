@@ -193,7 +193,11 @@ class TrainHook:
         your chance to restore this.
 
         Args:
-            checkpoint: the checkpoint loaded
+            checkpoint: the checkpoint loaded. Its `model` and `optimizer` entries follow
+                `checkpoint['train_args']['checkpoint']['save_type']`:
+                merged: a full state dict,
+                sharded / deduped: this rank's state dict,
+                reshard: lists of all ranks' state dicts(resumed from rank files whose layout changed).
         """
 
     def after_load_checkpoint(self, trainer: 'Trainer', checkpoint: Dict[str, Any]) -> None:

@@ -22,7 +22,7 @@ import xxhash
 from tqdm import tqdm
 
 import nnscaler
-from nnscaler.parallel import ParamInitStrategy
+from nnscaler.parallel import ParamInitStrategy, align_state_dict_names
 from nnscaler.runtime.device import DeviceGroup
 from nnscaler.utils import broadcast_mixed_data, is_running_distributed, StepwiseConfig
 from nnscaler.runtime.module import ParallelModule
@@ -397,7 +397,15 @@ class Trainer:
         *,
         model_only: bool = False,
         checkpointer: Optional[Checkpointer] = None,
+        collect_only: bool = False,
     ):
+        """
+        Combine the per-rank checkpoint files into one state dict.
+
+        With `collect_only=True` the model and optimizer state dicts are kept as per-rank
+        lists for `nnscaler.load_from_rank_state_dicts` (`save_type` 'reshard'); only the
+        non-tensor entries are combined.
+        """
         checkpointer = checkpointer or Checkpointer()
         state_dicts = []
         for f in checkpoint_files:
@@ -415,14 +423,18 @@ class Trainer:
             if state_dicts[i].get('lr_scheduler', None) != state_dicts[0].get('lr_scheduler', None):
                 raise ValueError(f"lr_scheduler state in {checkpoint_files[i]} is different from {checkpoint_files[0]}")
 
-        module_state_dict, opt_state_dict = nnscaler.merge_state_dicts(
-            [s['model'] for s in state_dicts],
-            [s['optimizer'] for s in state_dicts] if not model_only else None,
-        )
+        if collect_only:
+            module_state_dict = [s['model'] for s in state_dicts]
+            opt_state_dict = [s['optimizer'] for s in state_dicts] if not model_only else None
+        else:
+            module_state_dict, opt_state_dict = nnscaler.merge_state_dicts(
+                [s['model'] for s in state_dicts],
+                [s['optimizer'] for s in state_dicts] if not model_only else None,
+            )
         if model_only:
             return {'model': module_state_dict}
         train_args = copy.deepcopy(state_dicts[0]['train_args'])
-        train_args['checkpoint']['save_type'] = 'merged'
+        train_args['checkpoint']['save_type'] = 'reshard' if collect_only else 'merged'
 
         global_keys = {
             'model', 'optimizer', 'train_args',
@@ -449,6 +461,31 @@ class Trainer:
             **extra_keys,
         }
         return merged_state_dict
+
+    def _align_rank_file(
+        self, module_state_dict: Dict[str, Any], optimizer_state_dict: Optional[Dict[str, Any]],
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Return this rank's model state dict with names aligned to the current model when it can
+        be loaded directly, else None. Loadable means the checkpoint holds exactly the model's
+        ParallelModules and `align_state_dict_names` accepts the model and optimizer state dicts
+        (generated names and tensor IDs may differ). The aligned dict makes the alignment inside
+        `load_sharded_state_dict` / `load_deduped_state_dict` an identity mapping.
+        """
+        suffix = ParallelModule.EXTRA_STATE_KEY
+        saved = {key[:-len(suffix)] for key in module_state_dict if key.endswith(suffix)}
+        current = {
+            f'{prefix}.' if prefix else ''
+            for prefix, m in self.model.named_modules(remove_duplicate=False) if isinstance(m, ParallelModule)
+        }
+        if saved != current:
+            logger.warning(f"Parallel modules in the checkpoint {sorted(saved)} differ from the model's {sorted(current)}.")
+            return None
+        try:
+            return align_state_dict_names(self.model, module_state_dict, self.optimizer, optimizer_state_dict)
+        except ValueError as e:
+            logger.warning(f"This rank's checkpoint file cannot be loaded directly: {e}")
+            return None
 
     def _broadcast_merged_state_dict(
         self,
@@ -609,11 +646,7 @@ class Trainer:
             rank_ckpt_files = {int(f.stem): f for f in ckpt_files if f.stem.isdigit()}
             if set(rank_ckpt_files.keys()) != set(range(len(rank_ckpt_files))):
                 raise ValueError(f"Checkpoint files in {resume_from} are not complete: {rank_ckpt_files.keys()}")
-            if len(rank_ckpt_files) != self.world_size \
-                and self.train_args.checkpoint.resume_from.with_merged is False:
-                raise ValueError(f"World size is different with original one: {len(rank_ckpt_files)} != {self.world_size}")
-
-            if len(rank_ckpt_files) != self.world_size or self.train_args.checkpoint.resume_from.with_merged:
+            if self.train_args.checkpoint.resume_from.with_merged:
                 # merge the checkpoint files from all ranks and broadcast to all ranks
                 torch.distributed.barrier()
                 # normally each node's local rank 0 reads and merges the checkpoint files.
@@ -629,12 +662,29 @@ class Trainer:
                 trimmed_broadcast_required = save_memory
                 state_dict = _broadcast_before_trimmed_broadcast(state_dict, True)
             else:
-                state_dict = self.checkpointer.load_for_rank(resume_from, self.rank)
-                if state_dict['train_args']['compute_config'] != asdict(self.train_args.compute_config):
-                    logger.warning(
-                        f"compute_config is changed, and loading checkpoint may fail. "
-                        f"If it fails, please try with merged checkpoint."
-                    )
+                # each rank loads its own file; fall back to assembling its shard from all files
+                # when the files no longer match this run's layout
+                state_dict = None
+                if len(rank_ckpt_files) != self.world_size:
+                    logger.warning(f"World size changed from {len(rank_ckpt_files)} to {self.world_size}.")
+                else:
+                    # `_align_rank_file` checks everything that makes the file loadable (parallel
+                    # layout, ZeRO buckets, parameter order); other compute_config changes are fine.
+                    state_dict = self.checkpointer.load_for_rank(resume_from, self.rank)
+                    state_dict['model'] = self._align_rank_file(state_dict['model'], state_dict.get('optimizer'))
+                    if state_dict['model'] is None:
+                        state_dict = None
+                # A layout change may affect only some ranks (e.g. one pipeline stage), but the
+                # sharded loaders synchronize all ranks, so every rank must take the same path.
+                reshard = [None] * self.world_size
+                torch.distributed.all_gather_object(reshard, state_dict is None)
+                if any(reshard):
+                    state_dict = None
+                if state_dict is None:
+                    logger.info(f"Loading from all rank files in {resume_from}; each rank assembles its own shard.")
+                    state_dict = self._merge_checkpoint(
+                        list(rank_ckpt_files.values()), checkpointer=self.checkpointer, collect_only=True)
+                    load_from_merged = True
 
         if trimmed_broadcast_required:
             logger.info("Broadcasting trimmed checkpoint to all ranks.")
@@ -680,6 +730,11 @@ class Trainer:
             )
         elif ckpt_save_type == 'deduped':
             nnscaler.load_deduped_state_dict(
+                self.model, state_dict['model'],
+                self.optimizer, state_dict['optimizer'],
+            )
+        elif ckpt_save_type == 'reshard':  # per-rank state dicts of all ranks
+            nnscaler.load_from_rank_state_dicts(
                 self.model, state_dict['model'],
                 self.optimizer, state_dict['optimizer'],
             )
