@@ -249,7 +249,8 @@ class IRSegment(IRCell):
     def multi_index(self, nodes: List[IRCell]) -> List[CellPosition]:
         """
         Get multiple node indices, traversing the graph only once
-        to save time.
+        to save time. A node listed several times gets the same position
+        at each of its slots.
 
         Args:
             nodes (List[IRCell]): nodes to be indexed
@@ -269,17 +270,17 @@ class IRSegment(IRCell):
                 if node in lookup:
                     indices[lookup[node]] = CellPosition(tuple(path + [idx]))
                     visited += 1
-                if visited == len(nodes):
+                if visited == len(lookup):
                     return
                 if isinstance(node, IRSegment):
                     dfs(node, path + [idx])
         dfs(self, [])
-        if visited != len(nodes):
-            unvisited = []
-            for idx, node in zip(indices, nodes):
-                if idx is None:
-                    unvisited.append(node)
+        if visited != len(lookup):
+            unvisited = [node for node, i in lookup.items() if indices[i] is None]
             raise RuntimeError(f"Some of the queried nodes: {unvisited} not in the graph")
+        # duplicated nodes take the position found for their first occurrence
+        for i, node in enumerate(nodes):
+            indices[i] = indices[lookup[node]]
         return indices
 
     def segment(self, node: IRCell) -> IRCell:
