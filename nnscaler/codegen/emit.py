@@ -16,6 +16,7 @@ from nnscaler.ir.adapter.prim import CommPrim
 from nnscaler.graph.segment import IRSegment
 
 from nnscaler.codegen.frontend_mapping import Sign2EmitRule
+from nnscaler.graph.parser.register import EmitContext, accepts_emit_context
 
 from nnscaler.flags import CompileFlag
 
@@ -199,7 +200,8 @@ class FuncEmission(CodeEmission):
         outputs = self.return_name(node.outputs())
         return [f'{outputs} = next({self.tensor_name(node.input(0))})']
 
-    def emit_fnode(self, node: IRFwOperation, runtime_devid: int, plan_ndevs: int, runtime_ndevs: int, prefix_attr: str = None) -> List[str]:
+    def emit_fnode(self, node: IRFwOperation, runtime_devid: int, plan_ndevs: int, runtime_ndevs: int,
+                   prefix_attr: str = None, *, share_scale_unit_code: bool = False) -> List[str]:
         """Emit forward node code
 
         The result will look like (the lines are split into `List[str]`)
@@ -217,6 +219,10 @@ class FuncEmission(CodeEmission):
             plan_ndevs (int): the number of devices in the scale unit
             runtime_ndevs (int): the number of devices at the runtime, which is a multiple of `plan_ndevs`
             prefix_attr (str): prefix to the tensor name
+            share_scale_unit_code (bool): whether the generated code is shared by all scale units.
+                If True, `runtime_devid` is the device id inside the scale unit, and the emit rule
+                gets an `EmitContext` without a concrete scale unit index. Legacy emit rules
+                (taking runtime_devid, plan_ndevs, runtime_ndevs) cannot be used in this mode.
 
         Returns:
             List[str]: the lines of the statements of the final Python code
@@ -236,7 +242,22 @@ class FuncEmission(CodeEmission):
         kwargs = self.kwargs_dict(**node.kwargs)
 
         emit_rule = self._emit_rules.map(signature)
-        body = emit_rule(node, inputs, kwargs, runtime_devid, plan_ndevs, runtime_ndevs)
+        if accepts_emit_context(emit_rule):
+            ctx = EmitContext(
+                plan_devid=runtime_devid % plan_ndevs,
+                plan_ngpus=plan_ndevs,
+                runtime_ngpus=runtime_ndevs,
+                scale_unit_index=None if share_scale_unit_code else runtime_devid // plan_ndevs,
+            )
+            body = emit_rule(node, inputs, kwargs, ctx)
+        elif share_scale_unit_code:
+            raise RuntimeError(
+                f"The emit function of {signature} uses the legacy signature "
+                f"(node, args, kwargs, runtime_devid, plan_ndevs, runtime_ndevs), "
+                f"which cannot generate code shared by all scale units."
+            )
+        else:
+            body = emit_rule(node, inputs, kwargs, runtime_devid, plan_ndevs, runtime_ndevs)
 
         def _to_tuple_str(names: List[str]) -> str:
             if len(names) == 1:
@@ -324,7 +345,7 @@ class FuncEmission(CodeEmission):
         return codes
 
     def emit_adapter(self, node: IRAdapter, prefix_attr: Optional[str] = None,
-                     async_op: bool = False) -> List[str]:
+                     async_op: bool = False, autograd_extra_args: Optional[List[str]] = None) -> List[str]:
         """
         Emit the statment of the adapter call
 
@@ -336,10 +357,16 @@ class FuncEmission(CodeEmission):
             node (IRAdapter)
             prefix_attr (str | None): prefix to the tensor name
             async_op (bool): whether to enable async communication
+            autograd_extra_args (List[str] | None): extra leading arguments of the `.apply(...)` call
+                of an autograd adapter (see `AutogradAdapterCodeGen.gen`).
         """
         codes = []
         assert len(node.device) == 1, f"Expected adapter to be dispatched:\n{node.extra_repr()}"
-        prims = [node] if node.differentiable and node.custom else [prim for prim in node.prims]
+        # an autograd adapter (a custom differentiable one, whose `signature` has been set to
+        # `AdapterXX.apply` of its generated `torch.autograd.Function`) is emitted as that single
+        # call; any other adapter is emitted as the sequence of its primitives.
+        is_autograd_adapter = node.is_custom_autograd
+        prims = [node] if is_autograd_adapter else [prim for prim in node.prims]
 
         if async_op:
             # note async_op can only be applied when primitives satisfy:
@@ -363,6 +390,8 @@ class FuncEmission(CodeEmission):
                 itensors = self.tensor_name(prim.inputs()[0], prefix_attr=prefix_attr)
             else:
                 itensors = self.tuple_name(prim.inputs(), prefix_attr=prefix_attr)
+            if is_autograd_adapter and autograd_extra_args:
+                itensors = ', '.join(autograd_extra_args + [itensors])
             prim_kwargs = dict(prim.kwargs)
             if async_op and isinstance(prim, CommPrim):
                 prim_kwargs['async_op'] = True

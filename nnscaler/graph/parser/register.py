@@ -5,7 +5,8 @@
 Register cutomized function
 """
 
-from typing import Callable, Dict, List, Optional, Tuple, Union
+from dataclasses import dataclass
+from typing import Callable, Dict, Iterable, List, Optional, Tuple, Union
 from functools import partial
 import inspect
 import logging
@@ -25,6 +26,114 @@ from nnscaler.utils import _PUBLIC_TORCH_NAMESPACES, get_full_qualified_name, lo
 _logger = logging.getLogger(__name__)
 
 
+@dataclass(frozen=True)
+class EmitContext:
+    """
+    Rank information passed to an `emit_fn` during code generation.
+
+    When `runtime_ngpus > plan_ngpus`, the plan is replicated over scale units
+    (`runtime_ngpus // plan_ngpus` of them). Code generated for a rank in one
+    scale unit differs from the same position in another unit only by a rank
+    offset, so nnScaler can emit a single file per plan device and shift ranks
+    at runtime. In that case the scale unit index is unknown at codegen time:
+    `scale_unit_index` is None and `emit_fn` must produce code that computes
+    runtime ranks from the expression `scale_unit_index_expr` instead of
+    hard-coding them. `ranks()` and `scale_unit_ranks` build such expressions
+    and return plain literals when the scale unit index is known, so one
+    `emit_fn` serves both cases.
+    """
+    # position of the device inside its scale unit: runtime_devid % plan_ngpus
+    plan_devid: int
+    # number of devices in one scale unit (plan_ngpus)
+    plan_ngpus: int
+    # number of devices at runtime, a multiple of plan_ngpus
+    runtime_ngpus: int
+    # runtime_devid // plan_ngpus, or None when the generated code is shared
+    # by all scale units and must read the index at runtime.
+    scale_unit_index: Optional[int] = None
+    # Python expression evaluating to the scale unit index at runtime.
+    # Only used when `scale_unit_index` is None.
+    scale_unit_index_expr: str = 'self.scale_unit_index'
+
+    @property
+    def is_shared(self) -> bool:
+        """Whether the generated code is shared by all scale units."""
+        return self.scale_unit_index is None
+
+    @property
+    def rank_offset_expr(self) -> str:
+        """Expression of the rank of the first device in this scale unit."""
+        if self.scale_unit_index is not None:
+            return repr(self.scale_unit_index * self.plan_ngpus)
+        return f'{self.scale_unit_index_expr} * {self.plan_ngpus}'
+
+    @property
+    def rank_expr(self) -> str:
+        """Expression of the runtime rank of the current device."""
+        if self.scale_unit_index is not None:
+            return repr(self.scale_unit_index * self.plan_ngpus + self.plan_devid)
+        return f'({self.rank_offset_expr} + {self.plan_devid})'
+
+    def ranks(self, plan_ranks: Iterable[int]) -> str:
+        """
+        Expression of the runtime ranks of devices `plan_ranks` (positions inside
+        the scale unit) in the current scale unit, e.g. a process group.
+        """
+        plan_ranks = [int(r) for r in plan_ranks]
+        if self.scale_unit_index is not None:
+            return repr([r + self.scale_unit_index * self.plan_ngpus for r in plan_ranks])
+        return f'[r + {self.rank_offset_expr} for r in {plan_ranks!r}]'
+
+    @property
+    def scale_unit_ranks(self) -> str:
+        """Expression of the runtime ranks of all devices in the current scale unit."""
+        return self.ranks(range(self.plan_ngpus))
+
+
+# `emit_fn` signatures accepted by `register_op` / `update_op`:
+# - EmitContext style: (node, args, kwargs, ctx: EmitContext) -> str
+# - legacy style: (node, args, kwargs, runtime_devid, plan_ndevs, runtime_ndevs) -> str
+#   Legacy emit functions hard-code runtime ranks, so a graph using one is
+#   generated once per runtime rank instead of once per plan device.
+EmitFn = Union[
+    Callable[[IRFwOperation, List[str], Dict[str, str], 'EmitContext'], str],
+    Callable[[IRFwOperation, List[str], Dict[str, str], int, int, int], str],
+]
+
+
+def accepts_emit_context(emit_fn: Callable) -> bool:
+    """
+    Whether `emit_fn` uses the `EmitContext` signature `(node, args, kwargs, ctx)`
+    rather than the legacy `(node, args, kwargs, runtime_devid, plan_ndevs, runtime_ndevs)`.
+
+    A callable that accepts 4 positional arguments is EmitContext style (including one that
+    also accepts 6, e.g. with `*args` or defaulted parameters); otherwise one that accepts 6
+    is legacy. Anything accepting neither is rejected.
+    """
+    if not callable(emit_fn):
+        raise TypeError("Expected an emit function")
+    try:
+        sig = inspect.signature(emit_fn)
+    except (TypeError, ValueError):  # no signature available (e.g. some builtins): assume new signature
+        return True
+
+    def binds(nargs: int) -> bool:
+        try:
+            sig.bind(*([None] * nargs))
+            return True
+        except TypeError:
+            return False
+
+    if binds(4):
+        return True
+    if binds(6):
+        return False
+    raise TypeError(
+        f"emit_fn {emit_fn} must accept (node, args, kwargs, ctx: EmitContext) "
+        f"or the legacy (node, args, kwargs, runtime_devid, plan_ndevs, runtime_ndevs)"
+    )
+
+
 class CustomizedOps:
     """Customized op registry."""
 
@@ -38,9 +147,9 @@ class CustomizedOps:
     # signature -> runtime function implementation code
     kOpCodeDef: Dict[str, str] = {}
     # signature -> special emit function, will not store if emit_fn is None
-    # It accepts the node, repred args, repred kwargs, runtime_devid, plan_ndevs, runtime_ndevs
-    # as input and returns the generated code.
-    kOpEmit: Dict[str, Callable[[IRFwOperation, List[str], Dict[str, str], int, int, int], str]] = {}
+    # It accepts the node, repred args, repred kwargs and an EmitContext (or the legacy
+    # runtime_devid, plan_ndevs, runtime_ndevs) as input and returns the generated code.
+    kOpEmit: Dict[str, EmitFn] = {}
     # signature -> input generator function
     # It accepts the IRFwOperation as input and returns the list of input tensors, which is used
     # during operator profiling.
@@ -68,7 +177,7 @@ class CustomizedOps:
     def register(
         signature: str, op_create_fn: Callable, code: str, runtime_fn: Callable,
         *,
-        emit_fn: Callable[[IRFwOperation, List[str], Dict[str, str], int, int, int], str] = None,
+        emit_fn: Optional[EmitFn] = None,
         input_gen_fn: Callable[[IRFwOperation], List[torch.Tensor]] = None,
         fake_fn: Optional[Callable] = None
     ) -> None:
@@ -80,8 +189,9 @@ class CustomizedOps:
             code (str): runtime function implementation code
             runtime_fn (Callable): runtime function
             emit_fn (Callable): special emit function for codegen, will use default emit function if emit_fn is None.
-                                It accepts the node, repred args, repred kwargs, runtime_devid, plan_ndevs, runtime_ndevs
-                                as input and returns the generated code.
+                                It accepts the node, repred args, repred kwargs and an `EmitContext` as input and
+                                returns the generated code. The legacy signature taking runtime_devid, plan_ndevs,
+                                runtime_ndevs is still accepted. See `EmitContext`.
             input_gen_fn (Callable): input generator function for profiler, will use default input generator function
                                      if input_gen_fn is None. kwargs are same as that in the input node.
             fake_fn (Callable): a lightweight substitute for runtime_fn during tracing.
@@ -97,6 +207,8 @@ class CustomizedOps:
         if any(signature.startswith(builtin) for builtin in builtins):
             raise RuntimeError(f"Cannot register operators with signature starting from any of {builtins}")
         assert signature not in CustomizedOps.kOpMap, f"function {signature} is already registered"
+        if emit_fn is not None:
+            accepts_emit_context(emit_fn)  # validate the signature before touching the registries
         CustomizedOps.kOpMap[signature] = op_create_fn
         CustomizedOps.kOpRuntime[signature] = runtime_fn
         CustomizedOps.kOpFakeRuntime[signature] = fake_fn
@@ -110,7 +222,7 @@ class CustomizedOps:
 def register_op(annotation: Union[str, Callable], name: Optional[str] = None,
                 code_impl_pattern: str = 'import',
                 *,
-                emit_fn: Callable[[IRFwOperation, List[str], Dict[str, str], int, int, int], str] = None,
+                emit_fn: Optional[EmitFn] = None,
                 transform_rules: Tuple[TransformRule] = None,
                 input_gen_fn: Callable[[IRFwOperation], List[torch.Tensor]] = None,
                 fake_fn: Optional[Callable] = None,
@@ -169,9 +281,11 @@ def register_op(annotation: Union[str, Callable], name: Optional[str] = None,
             can only be 'import' or 'source'. If 'import', will generate code with
             import statement. If 'source', will take the source code directly.
             Default: 'import'.
-        emit_fn (Callable): special emit function for codegen, it accepts the node, repred args, repred kwargs, runtime_devid,
-            plan_ndevs, runtime_ndevs as input and returns the generated code. Check examples/customized_ops/ring_attention/zigzag_attn.py
-            for more details.
+        emit_fn (Callable): special emit function for codegen, it accepts the node, repred args, repred kwargs and an
+            `EmitContext` as input and returns the generated code. Use `EmitContext.ranks()` / `scale_unit_ranks` to
+            emit process groups so the generated code can be shared across scale units.
+            The legacy signature `(node, args, kwargs, runtime_devid, plan_ndevs, runtime_ndevs)` is still accepted,
+            but it forces one generated file per runtime rank.
             Default: None.
         transform_rules (Tuple[TransformRule]): a tuple of special TransformRules which will be used when partitioning the node.
             Default: None.
@@ -393,7 +507,7 @@ def update_op(
     *,
     op_create_fn: Optional[Callable] = no_change,
     code: Optional[str] = no_change,
-    emit_fn: Callable[[IRFwOperation, List[str], Dict[str, str], int, int, int], str] = no_change,
+    emit_fn: Optional[EmitFn] = no_change,
     input_gen_fn: Callable[[IRFwOperation], List[torch.Tensor]] = no_change,
     fake_fn: Optional[Callable] = no_change,
 ) -> Callable:
@@ -454,8 +568,8 @@ def update_op(
         raise TypeError("Expected an op creation function")
     if code is not no_change and code is not None and not isinstance(code, str):
         raise TypeError("Expected code to be a string")
-    if emit_fn is not no_change and emit_fn is not None and not callable(emit_fn):
-        raise TypeError("Expected an emit function")
+    if emit_fn is not no_change and emit_fn is not None:
+        accepts_emit_context(emit_fn)  # validate the signature
     if input_gen_fn is not no_change and input_gen_fn is not None and not callable(input_gen_fn):
         raise TypeError("Expected an input generator function")
     if fake_fn is not no_change and fake_fn is not None and is_autograd_apply(runtime_fn):

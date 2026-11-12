@@ -77,6 +77,7 @@ def test_all_to_all_keeps_independent_layouts_through_dispatch_and_scaling(primi
     generator.devices = (0, 1, 2, 3)
     generator.runtime_ndevs = 8
     generator.enable_dp = True
+    generator.share_scale_unit_code = False  # shift ranks per rank instead of at runtime
     scaled = generator.scale(adapter, 4).prims[0]
     assert scaled.kwargs['ranks'] == [6, 4, 7, 5]
     assert tuple(scaled.kwargs['dsts']) == (5, 7, 4, 6)
@@ -143,6 +144,7 @@ def test_split_allgather_fusion_preserves_backward_volume():
     generator.devices = (0, 1, 2, 3)
     generator.runtime_ndevs = 8
     generator.enable_dp = True
+    generator.share_scale_unit_code = False  # shift ranks per rank instead of at runtime
     for rank in ranks:
         # ExecutionPlan dispatches adapters before DiffFusion runs.
         local = forward.dispatch(rank)

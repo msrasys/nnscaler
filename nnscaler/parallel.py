@@ -10,6 +10,7 @@ from pathlib import Path
 import inspect
 import sys
 import importlib
+import importlib.util
 import multiprocessing
 from dataclasses import dataclass, asdict, field, replace
 from contextlib import contextmanager
@@ -736,8 +737,14 @@ def _prepare_and_check_reusable(
 
     if reuse == ReuseType.MATCH or reuse == ReuseType.MOO:
         # check if the module is already generated
-        expected_output_files = [outdir / _GENCODE_FILE_TEMPLATE.format(rank) for rank in range(compute_config.runtime_ngpus)]
-        expected_output_files.extend(trace_meta_files)
+        # The code is complete either as one file per runtime rank, or as one file per plan device
+        # shared by all scale units (see `_gencode`).
+        existing_gencode_files = set(outdir.glob(f'{_GENCODE_FILE_PREFIX}[0-9]*.py'))
+        is_gencode_complete = existing_gencode_files in (
+            {outdir / _GENCODE_FILE_TEMPLATE.format(rank) for rank in range(compute_config.runtime_ngpus)},
+            {outdir / _GENCODE_FILE_TEMPLATE.format(rank) for rank in range(compute_config.plan_ngpus)},
+        )
+        expected_output_files = list(trace_meta_files)
         expected_output_files.append(config_file)
         expected_output_files.append(outdir / _GRAPH_DUMP_FILE)
         expected_output_files.append(outdir / _FORWARD_ARGS_DUMP_FILE)
@@ -775,8 +782,9 @@ def _prepare_and_check_reusable(
 
         if existing_output_files:
             if is_config_match \
+                and is_gencode_complete \
                 and all([output_file.exists() for output_file in expected_output_files]) \
-                and len(existing_output_files) == len(expected_output_files) \
+                and len(existing_output_files) == len(expected_output_files) + len(existing_gencode_files) \
                 and _has_attr_map_file():
                 reusable = True  # everything is matched.
             elif is_config_match \
@@ -1107,7 +1115,22 @@ def _gencode(
     # code generation
     assert len(repr_execplan.graph.device) == compute_config.plan_ngpus, f"{repr_execplan.graph.device}"
 
-    mgener = ModuleCodeGen(repr_execplan, compute_config.runtime_ngpus)
+    # Ranks at the same position of different scale units run the same code up to a rank
+    # offset, so one file is generated per plan device and shared by all scale units
+    # (`_load_parallel_module_class` maps a rank to its file), unless the graph uses a
+    # legacy `emit_fn` that hard-codes runtime ranks.
+    legacy_signatures = graph.legacy_emit_signatures()
+    share_scale_unit_code = not legacy_signatures
+    if legacy_signatures:
+        logger.warning(
+            f"Operators {legacy_signatures} are registered with an emit_fn of the legacy signature "
+            f"(node, args, kwargs, runtime_devid, plan_ndevs, runtime_ndevs), which hard-codes runtime ranks. "
+            f"Module code will be generated for each of the {compute_config.runtime_ngpus} ranks instead of "
+            f"being shared across scale units. Switch the emit_fn to (node, args, kwargs, ctx: EmitContext) "
+            f"to speed up code generation."
+        )
+    mgener = ModuleCodeGen(repr_execplan, compute_config.runtime_ngpus, share_scale_unit_code=share_scale_unit_code)
+    gen_ngpus = compute_config.plan_ngpus if share_scale_unit_code else compute_config.runtime_ngpus
     sgener = None
     attr_merged_meta_map = {}
     if compute_config.use_end2end:
@@ -1131,9 +1154,9 @@ def _gencode(
     codegen_args = (mgener, sgener, compute_config, forward_args, compile_flags)
     rank_args = [
         (rank, str(outdir / _GENCODE_FILE_TEMPLATE.format(rank)))
-        for rank in range(compute_config.runtime_ngpus)
+        for rank in range(gen_ngpus)
     ]
-    if max_workers == 1 or compute_config.runtime_ngpus == 1:
+    if max_workers == 1 or gen_ngpus == 1:
         rank_results = [_gen_rank_code(*codegen_args, *rank_arg) for rank_arg in rank_args]
     else:
         # pickle doesn't work for graph/codegen objects, so use dill for worker payloads.
@@ -1159,7 +1182,7 @@ def _gencode(
 
     attr_merged_meta_map.update(rank_results)
 
-    for rank in range(compute_config.plan_ngpus, compute_config.runtime_ngpus):
+    for rank in range(compute_config.plan_ngpus, gen_ngpus):
         assert attr_merged_meta_map[rank] == attr_merged_meta_map[rank % compute_config.plan_ngpus], \
             f"Rank {rank} and rank {rank % compute_config.plan_ngpus} " \
             f"should have the same attribute map, " \
@@ -1177,6 +1200,7 @@ def _load_parallel_module_class(
     gen_savedir: Union[str, Path] = './.nnscaler',
     instance_name: Optional[str] = None,
     rank: Optional[int] = None,
+    compute_config: Optional[ComputeConfig] = None,
 ) -> Type[ParallelModule]:
     """
     Load the generated parallel module class, with train_step and infer_step assigned as member function..
@@ -1191,15 +1215,44 @@ def _load_parallel_module_class(
         rank (Optional[int]): the rank of the module. If it is None, will get the rank from torch.distributed.get_rank().
             This option is only useful for debugging or writing pre/post-processing tools.
             when you need to load the generated module in a non-torchrun environment.
+        compute_config (Optional[ComputeConfig]): the compute config the module was generated with.
+            If it is None, will load it from the generated directory.
     Returns:
         Type[ParallelModule]: the generated module class
     """
     rank = torch.distributed.get_rank() if rank is None else rank
-    namespace, _ = _prepare_namespace(gen_savedir, module_class, instance_name)
-    gen_imported = importlib.import_module(
-        f'{namespace}.{Path(_GENCODE_FILE_TEMPLATE.format(rank)).stem}'
-    )
+    namespace, outdir = _prepare_namespace(gen_savedir, module_class, instance_name)
+    module_name = f'{namespace}.{Path(_GENCODE_FILE_TEMPLATE.format(rank)).stem}'
+    if (outdir / _GENCODE_FILE_TEMPLATE.format(rank)).exists():
+        gen_imported = importlib.import_module(module_name)
+    else:
+        # The code is shared by all scale units: rank `r` runs the file of plan device
+        # `r % plan_ngpus`. It is loaded under the rank's own module name so that every
+        # rank gets a distinct class (several ranks may be loaded in one process, e.g. in tests).
+        gen_imported = sys.modules.get(module_name)
+        if gen_imported is None:
+            if compute_config is None:
+                compute_config = ComputeConfig.safe_load_from_file(
+                    outdir / ParallelModule.COMPUTE_CONFIG_FILE, return_none_on_error=False
+                )
+            shared_file = outdir / _GENCODE_FILE_TEMPLATE.format(rank % compute_config.plan_ngpus)
+            if not shared_file.is_file():
+                raise FileNotFoundError(f"Generated code for rank {rank} is not found in {outdir}")
+            spec = importlib.util.spec_from_file_location(module_name, shared_file)
+            gen_imported = importlib.util.module_from_spec(spec)
+            # Mock the module name in sys.modules
+            # So every rank gets a distinct module in sys.modules,
+            # even if they share the same file.
+            sys.modules[module_name] = gen_imported
+            try:
+                spec.loader.exec_module(gen_imported)
+            except BaseException:
+                # like the import machinery, don't leave a half-initialized module behind
+                sys.modules.pop(module_name, None)
+                raise
+
     parallel_module_class = gen_imported.GenModel
+    parallel_module_class.rank = rank
     # rewrite class name and module name
     parallel_module_class.__name__ = module_class.__name__
     parallel_module_class.__qualname__ = module_class.__qualname__
@@ -1479,6 +1532,7 @@ def parallelize(
             module_class,
             gen_savedir=gen_savedir,
             instance_name=instance_name,
+            compute_config=compute_config,
         )
         parallel_module_class._shard_init_fn = None
         parallel_module_class._init_module_fn = None
@@ -3053,6 +3107,13 @@ def _broadcast_gen_files(
     # get file list
     if curr_rank != 0:
         files = sent_obj[0]
+        # Code files of an earlier generation that are not regenerated this time (e.g. the
+        # per-rank files replaced by a shared layout) stay on the other nodes, where nothing
+        # cleans the directory, and `_load_parallel_module_class` would pick them up.
+        if any(f.endswith('.py') for f in files):
+            for stale in outdir.glob(f'{_GENCODE_FILE_PREFIX}[0-9]*.py'):
+                if stale.name not in files:
+                    stale.unlink(missing_ok=True)
 
     logger.info(f'File list broadcasted ({len(files)} in total).')
 

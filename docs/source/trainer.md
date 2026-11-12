@@ -179,8 +179,13 @@ For non-dataclass arguments, `__type` and `__value_type` will not be processed e
     parallelized version. The parallelized sub modules must be unique by
     type.
 
-    Note: When parallel_modules is not empty, pipeline parallelism is
-    not supported as the model is not end-to-end parallelized any more.
+    Note: Sub modules are parallelized as non-end2end modules by default,
+    so pipeline parallelism is not available for them. A sub module that owns
+    a complete training graph can opt in with `compute_config.use_end2end`
+    (and `use_fbw`); the root module must then define its own `train_step`
+    that calls the sub module's `train_step` and continues the backward from
+    the sub module's inputs, whose gradients are kept when `retain_grad()`
+    was called on them.
 
   ``` python
   @dataclass(frozen=True)
@@ -192,6 +197,8 @@ For non-dataclass arguments, `__type` and `__value_type` will not be processed e
       zero_use_reduce_scatter: Optional[bool] = None
       use_async_reducer: Optional[bool] = None
       reducer_bucket_cap_mb: Optional[float] = None
+      use_end2end: Optional[bool] = None
+      use_fbw: Optional[bool] = None
 
       pas_config: Optional[Dict[str, Any]] = None
       user_config: Optional[Dict[str, Any]] = None

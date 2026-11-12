@@ -8,7 +8,7 @@ from torch import Tensor
 import torch.distributed as dist
 import warnings
 
-from nnscaler.graph.parser.register import register_op
+from nnscaler.graph.parser.register import register_op, EmitContext
 from nnscaler.graph.function.dimops import IRDimops
 from nnscaler.ir import IRTensor
 from nnscaler.runtime.device import DeviceGroup
@@ -352,13 +352,10 @@ def wrap_ring_attn_varlen_func(
     return (out, softmax_lse) if return_lse else out
 
 
-def emit_ring(node: IRDimops, args: List[str], kwargs: Dict[str, str], runtime_devid: int, plan_ndevs: int, runtime_ndevs: int) -> str:
+def emit_ring(node: IRDimops, args: List[str], kwargs: Dict[str, str], ctx: EmitContext) -> str:
     """Special rule to generate ring_attn node"""
 
     signature = node.signature
-
-    offset = (runtime_devid // plan_ndevs) * plan_ndevs
-    remainder = runtime_devid % plan_ndevs
 
     kw_pairs = list()
     for key, val in kwargs.items():
@@ -390,13 +387,9 @@ def emit_ring(node: IRDimops, args: List[str], kwargs: Dict[str, str], runtime_d
                     f'sequence_group_count must equal partition_degree // sequence_parallel_size, '
                     f'got sequence_group_count={group_count}, partition_degree={num}, '
                     f'sequence_parallel_size={group_size}')
-            partition_start = remainder // num * num
-            group_start = partition_start + (remainder % num) // group_size * group_size
-            scale_unit_dev_ids = [
-                local_rank + offset
-                for local_rank in range(group_start, group_start + group_size)
-            ]
-            kw_pairs.append(f"process_group={scale_unit_dev_ids}")
+            partition_start = ctx.plan_devid // num * num
+            group_start = partition_start + (ctx.plan_devid % num) // group_size * group_size
+            kw_pairs.append(f"process_group={ctx.ranks(range(group_start, group_start + group_size))}")
         elif partition_dims[0][0] == 1:
             # partition the head dim, use local flash_attn_func
             kw_pairs.append("process_group=None")

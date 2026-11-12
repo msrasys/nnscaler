@@ -8,7 +8,7 @@ import torch.distributed as dist
 from torch import Tensor
 
 from nnscaler.graph.function.dimops import IRDimops
-from nnscaler.graph.parser.register import register_op
+from nnscaler.graph.parser.register import register_op, EmitContext
 from nnscaler.runtime.device import DeviceGroup
 
 from .varlen_utils import shuffle_varlen, unshuffle_varlen
@@ -56,14 +56,9 @@ def emit_ring(
     node: IRDimops,
     args: List[str],
     kwargs: Dict[str, str],
-    runtime_devid: int,
-    plan_ndevs: int,
-    runtime_ndevs: int,
+    ctx: EmitContext,
 ) -> str:
     signature = node.signature
-
-    offset = (runtime_devid // plan_ndevs) * plan_ndevs
-    remainder = runtime_devid % plan_ndevs
 
     kw_pairs = []
     for key, val in kwargs.items():
@@ -78,11 +73,8 @@ def emit_ring(
     else:
         if partition_dims[0][0] == 0:
             num = partition_dims[0][1]
-            scale_unit_dev_ids = [
-                local_rank + offset
-                for local_rank in range(remainder // num * num, (remainder // num + 1) * num)
-            ]
-            kw_pairs.append(f"process_group={scale_unit_dev_ids}")
+            start = ctx.plan_devid // num * num
+            kw_pairs.append(f"process_group={ctx.ranks(range(start, start + num))}")
         elif partition_dims[0][0] == 1:
             kw_pairs.append("process_group=None")
         else:
