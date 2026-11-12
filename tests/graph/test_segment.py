@@ -29,7 +29,9 @@ def _tensor(shape, requires_grad=True):
 
 @pytest.mark.parametrize('spatial_partition', [False, True])
 @pytest.mark.parametrize('value_partition', [False, True])
-def test_segment_narrowing_rejects_value_partitions(spatial_partition, value_partition):
+def test_segment_narrowing_value_partitions(spatial_partition, value_partition):
+    """Producer-side narrowing keeps value partitions as per-device partial sums;
+    consumer-side narrowing never sees one and refuses it."""
     source = _tensor([8], False)
     output = _tensor([8], False)
     nodes = []
@@ -44,11 +46,10 @@ def test_segment_narrowing_rejects_value_partitions(spatial_partition, value_par
     producer = IRSegment(nodes, [source], [output])
     producer_expander = IRSegmentExpander(producer, set(), set())
     narrowed_output = producer_expander._try_narrow_segment_ptensors(output.parent)
-    if value_partition:
-        assert narrowed_output is None
-    else:
-        assert narrowed_output is not None
-        assert all(t.valmap == (0, 1) for t in narrowed_output.values())
+    assert narrowed_output is not None
+    for device, tensor in narrowed_output.items():
+        assert tensor.valmap == ((device, 2) if value_partition else (0, 1))
+        assert tensor.indmap == nodes[device].output(0).indmap
 
     # Use a compute consumer rather than the identity pass-through special case.
     consumers = []
