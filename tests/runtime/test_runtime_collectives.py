@@ -94,6 +94,27 @@ def _all2all_worker(async_op):
     return (clone_to_cpu(tensor), clone_to_cpu(otensor))
 
 
+def _aliased_fanout_worker():
+    # The same tensor object feeds async collectives and another consumer.
+    # Waiting on that consumer's input must not resolve or steal a collective's
+    # result, so callback-based collectives must not use their input as handle.
+    from nnscaler.runtime.executor import Executor, AsyncCommHandler
+    tensor = _get_tensor([128, 256])
+    gathered = nnscaler.runtime.adapter.all_gather(tensor, 0, [0, 1], async_op=True)
+    exchanged = nnscaler.runtime.adapter.all_to_all(tensor, 0, 1, [0, 1], async_op=True)
+    exchanged_single = nnscaler.runtime.adapter.all_to_all_single(tensor, 0, 1, [0, 1], async_op=True)
+    passthrough = Executor.aexecute(lambda t: t, tensor, requires_grad=False)
+    assert passthrough is tensor
+    # Outputs may be consumed repeatedly, within one call and across calls:
+    # every consumer must see the same, fully assembled tensor.
+    handles = (gathered, exchanged, exchanged_single)
+    outputs = Executor.sync_tensors([gathered, gathered, exchanged, exchanged_single])
+    assert outputs[0] is gathered and outputs[1] is gathered
+    assert all(AsyncCommHandler().wait(t) is t for t in handles)
+    AsyncCommHandler().check_clear()
+    return tuple(clone_to_cpu(t) for t in (tensor, *handles))
+
+
 def _2gpu_worker():
     _init_distributed(2)
     result = {}
@@ -107,6 +128,7 @@ def _2gpu_worker():
     result['reduce_scatter_async'] = _reduce_scatter_worker(True)
     result['all2all'] = _all2all_worker(False)
     result['all2all_async'] = _all2all_worker(True)
+    result['aliased_fanout'] = _aliased_fanout_worker()
     _move_object_worker()
 
     return result
@@ -145,6 +167,16 @@ def test_2gpu():
         out1 = torch.concat([in0[1], in1[1]], dim=0)
         assert torch.equal(outputs[0][1], out0)
         assert torch.equal(outputs[1][1], out1)
+
+    # check aliased fan-out: every collective still returns its own result
+    outputs = results[0]['aliased_fanout'], results[1]['aliased_fanout']
+    in0 = outputs[0][0].chunk(2, dim=1)
+    in1 = outputs[1][0].chunk(2, dim=1)
+    assert torch.equal(outputs[0][1], torch.concat([outputs[0][0], outputs[1][0]], dim=0))
+    assert torch.equal(outputs[1][1], outputs[0][1])
+    for exchanged in (2, 3):
+        assert torch.equal(outputs[0][exchanged], torch.concat([in0[0], in1[0]], dim=0))
+        assert torch.equal(outputs[1][exchanged], torch.concat([in0[1], in1[1]], dim=0))
 
 
 def _rdscatter_worker(async_op):
@@ -190,6 +222,32 @@ def _broadcast_worker(async_op):
     return (clone_to_cpu(tensor), clone_to_cpu(otensor))
 
 
+def _rvscatter_worker(async_op):
+    shape = [128, 256]
+    tensor = _get_tensor(shape)
+    otensor = nnscaler.runtime.adapter.rvscatter(
+        tensor, shape, torch.float32, src=0, dsts=(1, 2), async_op=async_op)
+
+    if async_op:
+        otensor = nnscaler.runtime.executor.AsyncCommHandler().wait(otensor)
+        nnscaler.runtime.executor.AsyncCommHandler().drain_sends()
+
+    return (clone_to_cpu(tensor), clone_to_cpu(otensor))
+
+
+def _rvgather_worker(async_op):
+    shape = [128, 256]
+    tensor = _get_tensor(shape)
+    otensor = nnscaler.runtime.adapter.rvgather(
+        tensor, shape, torch.float32, srcs=(1, 2), dst=0, async_op=async_op)
+
+    if async_op:
+        otensor = nnscaler.runtime.executor.AsyncCommHandler().wait(otensor)
+        nnscaler.runtime.executor.AsyncCommHandler().drain_sends()
+
+    return (clone_to_cpu(tensor), clone_to_cpu(otensor))
+
+
 def _broadcast_object_worker():
     obj = {'hello': 'world', 'count': 1}
     robj = nnscaler.runtime.adapter.broadcast_object(
@@ -204,6 +262,10 @@ def _3gpu_worker():
     result['rdscatter_async'] = _rdscatter_worker(True)
     result['rdgather'] = _rdgather_worker(False)
     result['rdgather_async'] = _rdgather_worker(True)
+    result['rvscatter'] = _rvscatter_worker(False)
+    result['rvscatter_async'] = _rvscatter_worker(True)
+    result['rvgather'] = _rvgather_worker(False)
+    result['rvgather_async'] = _rvgather_worker(True)
     result['broadcast'] = _broadcast_worker(False)
     result['broadcast_async'] = _broadcast_worker(True)
     _broadcast_object_worker()
@@ -225,6 +287,17 @@ def test_3gpu():
         outputs = results[0][f'rdgather{op}'], results[1][f'rdgather{op}'], results[2][f'rdgather{op}']
         result = torch.cat((outputs[1][0], outputs[2][0]), dim=0)
         assert torch.equal(outputs[0][1], result)
+
+        # check rvscatter
+        outputs = results[0][f'rvscatter{op}'], results[1][f'rvscatter{op}'], results[2][f'rvscatter{op}']
+        expected = outputs[0][0] / 2
+        assert torch.equal(outputs[1][1], expected)
+        assert torch.equal(outputs[2][1], expected)
+
+        # check rvgather
+        outputs = results[0][f'rvgather{op}'], results[1][f'rvgather{op}'], results[2][f'rvgather{op}']
+        expected = outputs[1][0] + outputs[2][0]
+        assert torch.equal(outputs[0][1], expected)
 
         # check broadcast
         outputs = results[0][f'broadcast{op}'], results[1][f'broadcast{op}'], results[2][f'broadcast{op}']

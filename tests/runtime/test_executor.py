@@ -1,6 +1,7 @@
 #  Copyright (c) Microsoft Corporation.
 #  Licensed under the MIT License.
 
+import logging
 import pytest
 import torch
 
@@ -22,6 +23,90 @@ def _make_linears(dtype=torch.float64):
     actual = torch.nn.Linear(8, 16, dtype=dtype)
     actual.load_state_dict(reference.state_dict())
     return reference, actual
+
+
+@pytest.mark.parametrize('requires_grad', [False, True])
+def test_adapter_waits_for_async_input(monkeypatch, requires_grad):
+    handler = executor._AsyncCommHandler()
+    monkeypatch.setattr(executor, '_instance', handler)
+    pending = torch.zeros(8)
+    events = []
+
+    class Work:
+        def is_completed(self):
+            return False
+
+        def wait(self):
+            events.append('wait')
+            pending.copy_(torch.arange(8, dtype=torch.float32))
+
+    handler.submit(pending, [Work()])
+
+    def adapter(tensor):
+        events.append('consume')
+        return tensor * 2
+
+    result = Executor.aexecute(adapter, pending, requires_grad=requires_grad)
+    assert events == ['wait', 'consume']
+    torch.testing.assert_close(result, torch.arange(8, dtype=torch.float32) * 2)
+    assert result.requires_grad == requires_grad
+    handler.check_clear()
+
+
+def _submit_gather_like(handler, completed=False):
+    """Mimic all_gather: the handle is the preallocated output, filled by the callback."""
+    output = torch.empty(8)
+    gathered = [torch.empty(4), torch.empty(4)]
+
+    class Work:
+        def is_completed(self):
+            return completed
+
+        def wait(self):
+            for part in gathered:
+                part.copy_(torch.arange(4, dtype=torch.float32))
+
+    def assemble(out):
+        with torch.no_grad():
+            torch.cat(gathered, out=out)
+        return out
+
+    def adapter():
+        handler.submit(output, [Work()], assemble)
+        return output
+
+    return Executor.aexecute(adapter, requires_grad=True)
+
+
+@pytest.mark.parametrize('completed', [False, True])
+def test_async_output_consumed_twice_in_one_call(monkeypatch, completed):
+    handler = executor._AsyncCommHandler()
+    monkeypatch.setattr(executor, '_instance', handler)
+    output = _submit_gather_like(handler, completed)
+    assert output.requires_grad
+    # `completed` selects the drain path, otherwise the blocking wait path.
+    first, second = Executor.sync_tensors([output, output])
+    assert first is output and second is output
+    torch.testing.assert_close(output.detach(), torch.arange(4, dtype=torch.float32).repeat(2))
+    handler.check_clear()
+
+
+def test_async_output_shared_across_calls(monkeypatch, caplog):
+    handler = executor._AsyncCommHandler()
+    monkeypatch.setattr(executor, '_instance', handler)
+    monkeypatch.setattr(torch.distributed, 'get_rank', lambda: 0)
+    output = _submit_gather_like(handler)
+    # An adapter consumes the output first; a later segment and its backward
+    # must still see the assembled tensor, not a stale placeholder.
+    assert Executor.aexecute(lambda t: t, output, requires_grad=False) is output
+    loss = Executor.fexecute('seg', lambda x: (x * 2).sum(), output, requires_grad=True)
+    with caplog.at_level(logging.WARNING, logger='nnscaler.runtime.executor'):
+        grad = Executor.backward('seg', [output], [loss], [torch.ones(())])
+    assert "doesn't match" not in caplog.text
+    torch.testing.assert_close(loss.detach(), torch.tensor(24.0))
+    torch.testing.assert_close(grad, torch.full((8,), 2.0))
+    handler.check_clear()
+    Executor.check_clear()
 
 
 def test_split_backward_matches_full_backward():

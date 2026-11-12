@@ -341,24 +341,20 @@ class FuncEmission(CodeEmission):
         assert len(node.device) == 1, f"Expected adapter to be dispatched:\n{node.extra_repr()}"
         prims = [node] if node.differentiable and node.custom else [prim for prim in node.prims]
 
-        if async_op:
-            # note async_op can only be applied when primitives satisfy:
-            #   1) non-collective primitives perform before collective primitives.
-            #   2) collectives running on same nccl stream (i.e., same device group)
-            non_colls = [p for p in prims if not isinstance(p, CommPrim)]
-            colls = [p for p in prims if isinstance(p, CommPrim)]
-            # check condition 1)
-            if len(non_colls) > 1:
-                if max(prims.index(p) for p in non_colls) + 1 != len(non_colls):
-                    async_op = False
-                    _logger.warning("Non-collective primitives are not performed before collective primitives, async_op is disabled.")
-            # check condition 2)
-            devices = [set(p.device) for p in colls]
-            if len(colls) > 1 and not all(devs == devices[0] for devs in devices[1:]):
-                async_op = False
-                _logger.warning("Collective primitives are not running on the same device group, async_op is disabled.")
-
+        # Outputs of asynchronous communication still carry pending work, keyed
+        # by the returned tensor object. Any consumer inside this adapter must
+        # wait first: a local transform such as chunk would otherwise read the
+        # buffer before the data arrives and return a new tensor that no longer
+        # maps to the registered handle, so later waits would be silent no-ops.
+        pending = set()
         for prim in prims:
+            if async_op:
+                for inp in prim.inputs():
+                    if inp.tid not in pending:
+                        continue
+                    name = self.tensor_name(inp, prefix_attr=prefix_attr)
+                    codes.append(f'{name} = nnscaler.runtime.executor.AsyncCommHandler().wait({name})')
+                    pending.remove(inp.tid)
             if len(prim.inputs()) == 1:
                 itensors = self.tensor_name(prim.inputs()[0], prefix_attr=prefix_attr)
             else:
@@ -366,6 +362,7 @@ class FuncEmission(CodeEmission):
             prim_kwargs = dict(prim.kwargs)
             if async_op and isinstance(prim, CommPrim):
                 prim_kwargs['async_op'] = True
+                pending.update(out.tid for out in prim.outputs() if isinstance(out, IRTensor))
             kwargs = self.kwargs_name(**prim_kwargs)
             outputs = self.return_name(prim.outputs())
             if CompileFlag.line_timer:
