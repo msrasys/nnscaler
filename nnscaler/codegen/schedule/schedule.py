@@ -296,6 +296,9 @@ class ScheduleCodeGen(FuncEmission):
                     tensors = lifetime.release_tensors_after_line(line)
                     if len(tensors) > 0 : # not necessarily to have one after each line
                         _append_code(fb, self.emit_release(tensors))
+                    tensors = lifetime.release_storage_after_line(line)
+                    if len(tensors) > 0:
+                        _append_code(fb, self.emit_release_storage(tensors))
 
                 if prev_backward_node is not None:
                     _append_skip_flag(prev_backward_node)

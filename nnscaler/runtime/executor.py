@@ -5,6 +5,7 @@ r"""
 Executor for runtime
 """
 import atexit
+import sys
 
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -20,6 +21,47 @@ from ._patch_torch import stage_backward_input, stage_backward_weight
 _logger = logging.getLogger(__name__)
 
 _ALLOW_GRAD_DTYPES = (torch.double, torch.float32, torch.float16, torch.bfloat16)
+# Number of holders of a tensor's TensorImpl, exposed since torch 2.4.0. On the
+# older versions this package still supports (>= 2.0) it is None and
+# `release_storage` is a no-op, i.e. no storage is freed but nothing breaks.
+_use_count = torch.Tensor._use_count if torch.__version__ >= (2, 4, 0) else None
+
+
+def _sole_owner_refcounts() -> Tuple[int, int]:
+    """
+    Python references `release_storage` sees for a stage output held only by its
+    `_train_step` local, and for that output's view base, which outlives its last
+    Python name because its TensorImpl preserves the Python object. Measured on a
+    probe shaped like the generated step rather than hardcoded, since the exact
+    numbers are CPython details (e.g. 3.14 stops counting borrowed stack references).
+    """
+    def _fexecute(data):
+        # the output is a view over an internal result, the shape ZeRO-3's backward
+        # hook produces; the base loses its only Python name when the segment returns
+        return (data * 2.0).view(2)
+
+    def _send(tensor):
+        # a sync send keeps no reference; an async one holds a `detach()` alias,
+        # which is another Python object and does not count either
+        pass
+
+    def _release_storage(*tensors):
+        # the loop of `Executor.release_storage`, measuring instead of releasing
+        for t in tensors:
+            base = t._base
+            return sys.getrefcount(t), sys.getrefcount(base)
+
+    # the generated step; under inference mode (if this module is first imported
+    # inside one) the probe would be an inference tensor whose view has no `_base`
+    with torch.inference_mode(False):
+        x = _fexecute(torch.ones(2))
+        _send(x)
+        return _release_storage(x)
+
+
+_SOLE_OWNER_REFS, _SOLE_OWNER_BASE_REFS = _sole_owner_refcounts()
+# Set by `_check_release_storage` at import; False disables `release_storage`.
+_release_storage_enabled = _use_count is not None
 
 
 def debug_id(tensors, msg: str, rank: int):
@@ -65,7 +107,10 @@ class _AsyncCommHandler:
         self._callbacks[tensor] = callback
 
     def hold_send(self, tensor: torch.Tensor, work: Work):
-        self._send_holds.append((tensor, work))
+        # Hold an alias instead of the tensor itself: `Executor.release_storage`
+        # may swap the sender's output to a placeholder right after the send is
+        # issued, and the alias keeps the real buffer alive until the work completes.
+        self._send_holds.append((tensor.detach(), work))
 
     def drain_sends_completed(self):
         running: list[tuple[torch.Tensor, Work]] = []
@@ -337,14 +382,8 @@ class Executor:
             )
             return None
 
-        # PyTorch's helper detaches stage outputs in-place. A view cannot be
-        # detached in-place, so use a differentiable clone for that case.
-        stage_outputs = [
-            tensor.clone() if tensor._is_view() else tensor
-            for tensor in dedup_output_tensors
-        ]
         grads, param_groups = stage_backward_input(
-            stage_outputs,
+            dedup_output_tensors,
             dedup_output_tensor_grads,
             input_tensors,
             iter(weights),
@@ -389,6 +428,69 @@ class Executor:
             )
 
     @staticmethod
+    def release_storage(*tensors: torch.Tensor):
+        """
+        Free the storage of forward outputs that are only kept as roots for a
+        later `Executor.backward`, e.g. a pipeline stage output after it was sent.
+        The data is swapped for a stride-0 view of one NaN element: the tensor
+        keeps its shape and grad_fn, so backward (and its grad shape check) works
+        unchanged, while the real buffer is released. Real floating outputs get a
+        float8 placeholder on purpose: autograd validates gradients against the
+        metadata recorded when the graph was built, so backward through the root is
+        unaffected, while hardly any kernel accepts float8 and it never promotes,
+        so anything that still reads the tensor (a forward consumer, or an alias
+        saved for backward) fails at that op instead of computing with garbage.
+
+        Swapping `.data` rewrites the TensorImpl in place, so it is only safe when
+        nothing else can observe that impl. Holders show up in one of two counts:
+
+        * `_use_count`: C++ handles to the impl. Autograd saves a node's *input*
+          (and the base of a view) as the original impl, but a node's *output*
+          (e.g. tanh's result) as a detached shallow copy that merely shares the
+          storage, because holding the original would form the cycle
+          Node -> SavedVariable -> Variable.grad_fn -> Node that refcounting never
+          frees. Such copies are not affected by the swap (and keep the buffer
+          alive, so nothing is gained for them).
+        * `sys.getrefcount`: Python references to the tensor object. Another name
+          for the same object in the generated step (an op that returned its input,
+          a sibling output), a `ctx.out = out` attribute, and any tensor saved under
+          `saved_tensors_hooks` (ZeRO-3's `save_params_hooks`, CPU offloading) are
+          held this way: a pack hook receives the tensor's own Python object and
+          returning it stores a Python reference, not an impl handle, so the first
+          count stays 1 for them.
+
+        A tensor is released only when both counts show no holder but the caller's
+        local; a view is released together with its root base when that base is
+        held by nothing but its own (impl-preserved) Python object and this view.
+        This covers outputs aliasing an internal tensor (ZeRO-3's
+        `insert_backward_hook` views) without knowing the op. The expected counts
+        are verified on the running interpreter at import, see
+        `_check_release_storage`.
+        """
+        if not _release_storage_enabled:
+            return
+        for t in tensors:
+            if not (torch.is_tensor(t) and t.grad_fn is not None and t.layout == torch.strided):
+                continue
+            if _use_count(t) != 1 or sys.getrefcount(t) != _SOLE_OWNER_REFS:
+                continue
+            base = t._base
+            if base is None:
+                targets = (t,)
+            elif _use_count(base) == 2 and sys.getrefcount(base) == _SOLE_OWNER_BASE_REFS:
+                # the impl is held by the base's own Python object and this view only
+                targets = (t, base)
+            else:
+                continue
+            for x in targets:
+                # float8 so that a stray reader fails loudly (see the docstring);
+                # complex roots must keep their dtype for the backward grad check,
+                # and NaN keeps the misuse visible where the dtype trick cannot apply
+                # (complex, or an output that is float8 already)
+                dtype = torch.float8_e4m3fn if x.dtype.is_floating_point else x.dtype
+                x.data = torch.full((), float('nan'), dtype=dtype, device=x.device).expand(x.shape)
+
+    @staticmethod
     def sync_tensors(tensors: List[Any]) -> List[Any]:
         """
         Wait until the finish of synchornized tensors
@@ -409,6 +511,13 @@ class Executor:
         Notes:
             Users can only register one backward pre_hook. If there was a hook
             registered before, it will be overwritten.
+
+            With pipeline output deallocation (`ComputeConfig.pipeline_deallocate_outputs`)
+            an output tensor other than the loss may already have had its storage
+            released by `Executor.release_storage` and only keeps its shape and
+            grad_fn (its dtype is then float8). The hook may replace or scale such
+            entries but must not read their values. The loss is a graph output and is never released, which is all the
+            built-in loss-scaling hook touches.
 
         Args:
             hook (Callable or None): the backward hook to be registered. The hook takes
@@ -441,6 +550,46 @@ backward = Executor.backward
 backward_input = Executor.backward_input
 backward_weight = Executor.backward_weight
 sync_tensors = Executor.sync_tensors
+release_storage = Executor.release_storage
+
+
+def _check_release_storage() -> bool:
+    """
+    Verify `_SOLE_OWNER_REFS`/`_SOLE_OWNER_BASE_REFS` end to end on this
+    interpreter: a view over an internal base must be released together with the
+    base, and a tensor with a second Python name must be left alone. On a
+    mismatch, or if the probes raise (e.g. a torch build rejecting `.data` on a
+    view), the feature is disabled instead of failing the import.
+    """
+    if _use_count is None:
+        return False
+
+    def segment(x):
+        return (x * 2.0).view(2)
+
+    try:
+        # the probes need grad_fn even if this module is first imported under
+        # no_grad or inference_mode; enable_grad alone does not leave inference mode
+        with torch.inference_mode(False), torch.enable_grad():
+            leaf = torch.ones(2, requires_grad=True)
+            view = segment(leaf)
+            release_storage(view)
+            released = (view.untyped_storage().nbytes() == view.element_size()
+                        and view._base.untyped_storage().nbytes() == view.element_size())
+            shared = leaf * 2.0
+            other_name = shared  # another Python name for the same tensor
+            # can't release
+            release_storage(shared)
+            kept = shared.untyped_storage().nbytes() == 2 * shared.element_size()
+    except Exception:
+        _logger.warning('release_storage self-check raised', exc_info=True)
+        return False
+    return released and kept
+
+
+_release_storage_enabled = _check_release_storage()
+if _use_count is not None and not _release_storage_enabled:
+    _logger.warning('release_storage self-check failed on this interpreter; stage outputs are not deallocated.')
 
 
 @contextmanager

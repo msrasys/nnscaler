@@ -25,7 +25,14 @@ class IRAdapter(IRCell):
         self._outputs = outputs
 
         self._prims: List[IRAdapterPrim] = []
+        # Whether forward and backward are handled by this adapter as one autograd
+        # unit instead of a separate mirrored backward adapter. Set when producers
+        # and consumers share the same devices (e.g. intra-segment TP comms) or when
+        # fusion pairs the fw/bw prims into a built-in differentiable prim.
         self._differentiable = False
+        # Only meaningful with `differentiable`: True means no built-in differentiable
+        # prim covers this adapter, so codegen emits a dedicated autograd.Function
+        # for it. Fusion clears it when it swaps in such a prim.
         self.custom = True
 
         device = set()
