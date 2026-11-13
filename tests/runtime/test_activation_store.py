@@ -276,8 +276,9 @@ def test_saved_tensor_adapter_offloads_producer_saves_and_reconnects_forward_cac
 
 @cuda
 @pytest.mark.parametrize('copy_stream', [False, True])
-def test_forward_cache_evict_restore_preserves_gradients_and_frees_original(copy_stream):
-    cache = store('cuda', reload_on_compute_stream=not copy_stream)
+@pytest.mark.parametrize('backend', ['dma', 'sm'])
+def test_forward_cache_evict_restore_preserves_gradients_and_frees_original(copy_stream, backend):
+    cache = store('cuda', reload_on_compute_stream=not copy_stream, h2d_backend=backend)
     leaf = torch.randn(256, 256, device='cuda', requires_grad=True)
     source = leaf.sin()
     storage = weakref.ref(source.untyped_storage())
@@ -308,8 +309,9 @@ def test_forward_cache_evict_restore_preserves_gradients_and_frees_original(copy
 
 
 @cuda
-def test_evicted_borrow_mutation_and_resaved_views_share_one_record():
-    cache = store('cuda')
+@pytest.mark.parametrize('backend', ['dma', 'sm'])
+def test_evicted_borrow_mutation_and_resaved_views_share_one_record(backend):
+    cache = store('cuda', h2d_backend=backend)
     source = torch.arange(64*64, device='cuda', dtype=torch.float32).reshape(64, 64)
     expected = source.clone()
     handle = cache.save(source)
@@ -419,9 +421,11 @@ def test_host_budget_fallback_and_store_close_keep_other_store_valid():
 
 @cuda
 @pytest.mark.parametrize('compute_allocation', [False, True])
-def test_bulk_prefetch_preserves_aliases_budget_and_caller_stream(compute_allocation):
+@pytest.mark.parametrize('backend', ['dma', 'sm'])
+def test_bulk_prefetch_preserves_aliases_budget_and_caller_stream(compute_allocation, backend):
     size = 64*64*4
-    cache = store('cuda', max_prefetch_bytes=size, reload_on_compute_stream=compute_allocation)
+    cache = store('cuda', max_prefetch_bytes=size, reload_on_compute_stream=compute_allocation,
+                  h2d_backend=backend)
     x, y = torch.randn(64, 64, device='cuda'), torch.randn(64, 64, device='cuda')
     expected_x, expected_y = x.cpu(), y.cpu()
     with cache.batch():

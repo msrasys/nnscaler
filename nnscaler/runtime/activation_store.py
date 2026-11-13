@@ -434,6 +434,8 @@ class ActivationStore:
         if (config.max_cpu_bytes != self.pool.config.max_cpu_bytes
                 or config.pool_slab_bytes != self.pool.config.pool_slab_bytes):
             raise ValueError('Cannot change a live process pool budget or allocator')
+        if config.h2d_backend != self.transport.config.h2d_backend:
+            raise ValueError('Cannot change a live store transfer backend; create a new store before training')
         self.transport.config = config
 
     # Compatibility accessors for existing runtime diagnostic integrations.

@@ -43,7 +43,7 @@ class CPUOffloadConfig:
     # closed region once accumulated bytes reach this target. Zero disables
     # subdivision/early flush. One indivisible storage may exceed the target.
     commit_batch_bytes: int = 0
-    # Maximum bytes per DMA call (0: one call per storage). Chunking preserves
+    # Maximum bytes per transfer call/kernel (0: one call per storage). Chunking preserves
     # whole-storage ownership/aliasing; it does not cap a tensor's allocation.
     copy_chunk_bytes: int = 0
     # Local virtual-stage F/B actions before the consuming backward. Zero
@@ -65,9 +65,16 @@ class CPUOffloadConfig:
     # Explicit scope collection and a pending-source budget are required.
     d2h_launch_phase: str = 'forward'
     d2h_scopes_per_backward: int = 1
+    # Optional CUDA restore implementation; D2H retains the DMA path.
+    h2d_backend: str = 'dma'
+    h2d_sm_blocks: int = 16
 
     def __post_init__(self):
         for name, value in vars(self).items():
+            if name == 'h2d_backend':
+                if value not in ('dma', 'sm'):
+                    raise ValueError('h2d_backend must be dma or sm')
+                continue
             if name == 'backpressure_mode':
                 if value not in ('host', 'stream'):
                     raise ValueError('backpressure_mode must be host or stream')
@@ -94,6 +101,8 @@ class CPUOffloadConfig:
         if self.backpressure_mode == 'stream' and (
                 self.max_pending_bytes == 0 or self.max_pending_bytes < self.max_inflight_bytes):
             raise ValueError('stream backpressure requires max_pending_bytes >= max_inflight_bytes and > 0')
+        if self.h2d_sm_blocks == 0:
+            raise ValueError('h2d_sm_blocks must be positive')
         if self.d2h_launch_phase == 'backward' and (
                 self.forward_commit_unit != 'scope' or not self.max_pending_bytes
                 or not self.d2h_scopes_per_backward):

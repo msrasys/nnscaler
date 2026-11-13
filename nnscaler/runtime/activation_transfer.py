@@ -24,6 +24,11 @@ class ActivationTransferEngine:
         self._d2h_batch = ContextVar('activation_d2h_batch', default=False)
         self._h2d_batch = ContextVar('activation_h2d_batch', default=False)
         self._last_restore_wait = None
+        self._sm_copy = None
+        if config.h2d_backend == 'sm' and device.type == 'cuda':
+            from .activation_sm_copy import copy_h2d, prepare_sm_h2d
+            prepare_sm_h2d()
+            self._sm_copy = copy_h2d
 
     @contextmanager
     def _stream_batch(self, stream, active):
@@ -201,10 +206,18 @@ class ActivationTransferEngine:
             return self._to_device(source, dependency)
 
     def _copy_into(self, destination, source, direction):
-        """Split DMA calls without splitting a storage's ownership or readiness."""
+        """Split transfer submissions without splitting storage ownership or readiness."""
         chunk_bytes = self.config.copy_chunk_bytes
+        use_sm = direction == 'h2d' and self.config.h2d_backend == 'sm'
+        def copy(dst, src):
+            if use_sm:
+                if self._sm_copy is None:
+                    raise RuntimeError('SM activation restore requires a CUDA transfer engine')
+                self._sm_copy(dst, src, self.config.h2d_sm_blocks)
+            else:
+                dst.copy_(src, non_blocking=True)
         if not chunk_bytes or source.numel() * source.element_size() <= chunk_bytes:
-            destination.copy_(source, non_blocking=True)
+            copy(destination, source)
             chunks = int(source.numel() > 0)
         else:
             # The transport operates on flat storage buffers. Never flatten by
@@ -213,9 +226,11 @@ class ActivationTransferEngine:
             elements = max(1, chunk_bytes // source.element_size())
             chunks = 0
             for start in range(0, src.numel(), elements):
-                dst[start:start+elements].copy_(src[start:start+elements], non_blocking=True)
+                copy(dst[start:start+elements], src[start:start+elements])
                 chunks += 1
         self.stats[direction + '_copy_chunks'] += chunks
+        if use_sm:
+            self.stats['h2d_sm_copy_chunks'] += chunks
         if self.observation.enabled:
             self.observation.emit(direction + '_copy', nbytes=source.numel() * source.element_size(), count=chunks)
 

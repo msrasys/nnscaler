@@ -408,3 +408,27 @@ its return value is ignored. Keep only metadata or weak references when measurin
 lifetime. Nested observers compose, and registration is removed on context exit.
 Moving or sleeping a module with live offloaded activations is rejected.
 Generate fresh code after selecting regions or changing offload configuration.
+
+### Optional SM restore transport
+
+`CPUOffloadConfig(h2d_backend='sm', h2d_sm_blocks=16)` selects a CUDA kernel
+that reads PyTorch-managed pinned CPU storage and writes the restored GPU byte
+buffer. The default is `dma`; D2H always keeps the existing DMA path. Block count
+is a grid limit, not a physical SM reservation, and `copy_chunk_bytes` also limits
+individual SM-copy submissions. There are no model/shape-based selections.
+
+This path can reduce H2D interference with system-scope communication fences,
+but consumes SM resources and may copy more slowly. It is an opt-in transport,
+not a promise of end-to-end speedup or D2H isolation. Use profiling and matched
+training comparisons before selecting it.
+
+CUDA and a working CUDA/C++ toolchain are required on first use; the extension
+is loaded lazily and cached by PyTorch. For distributed applications call
+`nnscaler.runtime.activation_sm_copy.prepare_sm_h2d()` on each worker before
+entering communication. Do not initialize a compiler inside CUDA graph capture.
+A live store's backend cannot be changed; create a new store before training.
+
+The native copy records the pinned source and GPU destination with PyTorch's
+allocators and updates the destination version counter. Original producer and
+consumer events, immutable-source checks, alias handling, transfer budgets and
+pool ownership remain in the existing store/engine.
