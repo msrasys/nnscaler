@@ -284,7 +284,7 @@ def test_saved_tensor_adapter_offloads_producer_saves_and_reconnects_forward_cac
 
 @cuda
 @pytest.mark.parametrize('copy_stream', [False, True])
-@pytest.mark.parametrize('save_backend,restore_backend', [('dma', 'dma'), ('dma', 'sm'), ('sm', 'dma'), ('sm', 'sm')])
+@pytest.mark.parametrize('save_backend,restore_backend', [(a, b) for a in ('dma', 'dma_native', 'sm') for b in ('dma', 'dma_native', 'sm')])
 def test_forward_cache_evict_restore_preserves_gradients_and_frees_original(copy_stream, save_backend, restore_backend):
     cache = store('cuda', reload_on_compute_stream=not copy_stream, h2d_backend=restore_backend, d2h_backend=save_backend)
     leaf = torch.randn(256, 256, device='cuda', requires_grad=True)
@@ -314,12 +314,14 @@ def test_forward_cache_evict_restore_preserves_gradients_and_frees_original(copy
     assert stats['h2d_bytes'] == 3*stats['d2h_bytes']
     assert bool(stats.get('d2h_sm_copy_chunks', 0)) == (save_backend == 'sm')
     assert bool(stats.get('h2d_sm_copy_chunks', 0)) == (restore_backend == 'sm')
+    assert bool(stats.get('d2h_native_dma_batches', 0)) == (save_backend == 'dma_native')
+    assert bool(stats.get('h2d_native_dma_batches', 0)) == (restore_backend == 'dma_native')
     assert stats['live_cpu_bytes'] == stats['prefetched_gpu_bytes'] == 0
     cache.close()
 
 
 @cuda
-@pytest.mark.parametrize('save_backend,restore_backend', [('dma', 'dma'), ('dma', 'sm'), ('sm', 'dma'), ('sm', 'sm')])
+@pytest.mark.parametrize('save_backend,restore_backend', [(a, b) for a in ('dma', 'dma_native', 'sm') for b in ('dma', 'dma_native', 'sm')])
 def test_evicted_borrow_mutation_and_resaved_views_share_one_record(save_backend, restore_backend):
     cache = store('cuda', h2d_backend=restore_backend, d2h_backend=save_backend)
     source = torch.arange(64*64, device='cuda', dtype=torch.float32).reshape(64, 64)
@@ -431,7 +433,7 @@ def test_host_budget_fallback_and_store_close_keep_other_store_valid():
 
 @cuda
 @pytest.mark.parametrize('compute_allocation', [False, True])
-@pytest.mark.parametrize('save_backend,restore_backend', [('dma', 'dma'), ('dma', 'sm'), ('sm', 'dma'), ('sm', 'sm')])
+@pytest.mark.parametrize('save_backend,restore_backend', [(a, b) for a in ('dma', 'dma_native', 'sm') for b in ('dma', 'dma_native', 'sm')])
 def test_bulk_prefetch_preserves_aliases_budget_and_caller_stream(compute_allocation, save_backend, restore_backend):
     size = 64*64*4
     cache = store('cuda', max_prefetch_bytes=size, reload_on_compute_stream=compute_allocation,

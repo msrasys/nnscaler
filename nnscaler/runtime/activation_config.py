@@ -74,8 +74,8 @@ class CPUOffloadConfig:
     def __post_init__(self):
         for name, value in vars(self).items():
             if name in ('h2d_backend', 'd2h_backend'):
-                if value not in ('dma', 'sm'):
-                    raise ValueError(f'{name} must be dma or sm')
+                if value not in ('dma', 'dma_native', 'sm'):
+                    raise ValueError(f'{name} must be dma, dma_native or sm')
                 continue
             if name == 'backpressure_mode':
                 if value not in ('host', 'stream'):

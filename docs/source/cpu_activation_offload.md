@@ -438,3 +438,27 @@ destination version counter. Consumers must observe the transfer-completion
 event before using the destination, including CPU readers after D2H. Original
 producer/consumer events, immutable-source checks, alias handling, transfer
 budgets and pool ownership remain in the existing store/engine.
+
+
+### Native ordered DMA submission
+
+`CPUOffloadConfig(d2h_backend='dma_native', h2d_backend='dma_native',
+copy_chunk_bytes=1024**2)` submits each storage's copies in one C++ call.
+Each quantum remains a separate ordered `cudaMemcpyAsync` command. This is
+useful when long DMA commands delay concurrent work; it does not remove any
+producer, consumer, or communication fences. Smaller quanta increase command
+count and may reduce transfer bandwidth, so compare full training as well as
+communication microbenchmarks. The default backend remains `dma`.
+
+This path uses copy engines, not SM copy kernels, and avoids Python tensor
+slicing/dispatch for every small command. Both allocations are registered with
+their PyTorch allocators before the first copy. Partial submission errors use
+the existing transfer engine's failure/drain path. The destination version is
+updated once per submitted storage. Storage ownership, byte budgets, source
+immutability and readiness are unchanged. Counters expose the actual command
+count (`*_copy_chunks`) and native submissions (`*_native_dma_batches`).
+
+Native DMA and SM transports share the optional CUDA extension and prewarming
+entry point `nnscaler.runtime.activation_cuda_copy.prepare_cuda_copy()`.
+Existing `activation_sm_copy` imports remain compatible. The same CUDA/C++
+toolchain and managed-pinned-allocation requirements apply.

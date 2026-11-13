@@ -25,9 +25,11 @@ class ActivationTransferEngine:
         self._h2d_batch = ContextVar('activation_h2d_batch', default=False)
         self._last_restore_wait = None
         self._sm_copies = {}
-        if device.type == 'cuda' and 'sm' in (config.h2d_backend, config.d2h_backend):
-            from .activation_sm_copy import copy_d2h, copy_h2d, prepare_sm_copy
-            prepare_sm_copy()
+        self._native_dma_copy = None
+        if device.type == 'cuda' and any(v != 'dma' for v in (config.h2d_backend, config.d2h_backend)):
+            from .activation_cuda_copy import copy_d2h, copy_h2d, copy_dma, prepare_cuda_copy
+            prepare_cuda_copy()
+            self._native_dma_copy = copy_dma
             self._sm_copies = {'h2d': copy_h2d, 'd2h': copy_d2h}
 
     @contextmanager
@@ -208,7 +210,8 @@ class ActivationTransferEngine:
     def _copy_into(self, destination, source, direction):
         """Split transfer submissions without splitting storage ownership or readiness."""
         chunk_bytes = self.config.copy_chunk_bytes
-        use_sm = getattr(self.config, direction + '_backend') == 'sm'
+        backend = getattr(self.config, direction + '_backend')
+        use_sm = backend == 'sm'
         def copy(dst, src):
             if use_sm:
                 if direction not in self._sm_copies:
@@ -216,7 +219,12 @@ class ActivationTransferEngine:
                 self._sm_copies[direction](dst, src, getattr(self.config, direction + '_sm_blocks'))
             else:
                 dst.copy_(src, non_blocking=True)
-        if not chunk_bytes or source.numel() * source.element_size() <= chunk_bytes:
+        if backend == 'dma_native':
+            if self._native_dma_copy is None:
+                raise RuntimeError('Native DMA requires a CUDA transfer engine')
+            chunks = self._native_dma_copy(destination, source, chunk_bytes)
+            self.stats[direction + '_native_dma_batches'] += int(chunks > 0)
+        elif not chunk_bytes or source.numel() * source.element_size() <= chunk_bytes:
             copy(destination, source)
             chunks = int(source.numel() > 0)
         else:

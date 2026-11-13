@@ -41,11 +41,18 @@ cuda = pytest.mark.skipif(not torch.cuda.is_available() or torch.version.hip is 
 
 
 @cuda
+@pytest.mark.parametrize('backend', ['sm', 'dma_native'])
 @pytest.mark.parametrize('direction', ['h2d', 'd2h'])
 @pytest.mark.parametrize('size,offset', [(0, 0), (1, 0), (33, 5), (4097, 3), (2**20, 0), (131447, 0)])
-def test_sm_copy_offsets_tail_version_and_new_values(size, offset, direction):
+def test_sm_copy_offsets_tail_version_and_new_values(size, offset, direction, backend):
     from nnscaler.runtime.activation_sm_copy import copy_d2h, copy_h2d
     copy = copy_h2d if direction == 'h2d' else copy_d2h
+    if backend == 'dma_native':
+        from nnscaler.runtime.activation_cuda_copy import copy_dma
+        def copy(dst, src, blocks):
+            # Exercise partial final packets without issuing tiny copies for large inputs.
+            quantum = 7 if size < 5000 else 16381
+            assert copy_dma(dst, src, quantum) == (size + quantum - 1) // quantum
     host = torch.full((size + offset + 7,), 251, dtype=torch.uint8, pin_memory=True)
     backing = torch.full((size + offset + 7,), 251, device='cuda', dtype=torch.uint8)
     src, dst = host[offset:offset+size], backing[offset:offset+size]
@@ -136,3 +143,89 @@ def test_sm_d2h_rejects_unpinned_or_nonbyte_destinations():
         copy_d2h(torch.empty(32, dtype=torch.uint8), src, 4)
     with pytest.raises(RuntimeError, match='uint8'):
         copy_d2h(torch.empty(32, dtype=torch.float32, pin_memory=True), src, 4)
+
+
+@pytest.mark.parametrize('direction', ['h2d', 'd2h'])
+def test_native_dma_selection_submits_whole_storage_once(direction):
+    engine = ActivationTransferEngine(CPUOffloadConfig(**{direction + '_backend': 'dma_native'}, copy_chunk_bytes=7),
+                                      torch.device('cpu'), Counter(), _Observation())
+    src = torch.arange(37, dtype=torch.uint8)
+    dst = torch.empty_like(src)
+    calls = []
+    def copy(destination, source, chunk):
+        assert source is src and destination is dst
+        calls.append(chunk)
+        destination.copy_(source)
+        return 6
+    engine._native_dma_copy = copy
+    engine._copy_into(dst, src, direction)
+    assert calls == [7] and torch.equal(dst, src)
+    assert engine.stats[direction + '_copy_chunks'] == 6
+    assert engine.stats[direction + '_native_dma_batches'] == 1
+
+
+@cuda
+@pytest.mark.parametrize('direction', ['h2d', 'd2h'])
+def test_native_dma_keeps_async_allocations_alive(direction):
+    from nnscaler.runtime.activation_cuda_copy import copy_dma, prepare_cuda_copy
+    prepare_cuda_copy()
+    host = torch.full((4096,), 31, dtype=torch.uint8, pin_memory=True)
+    gpu = torch.full((4096,), 31, dtype=torch.uint8, device='cuda')
+    src, dst = (host, gpu) if direction == 'h2d' else (gpu, host)
+    dst.zero_()
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        torch.cuda._sleep(40_000_000)
+        assert copy_dma(dst, src, 31) == 133
+    del src
+    if direction == 'h2d':
+        del host
+        churn = [torch.full((4096,), 99, dtype=torch.uint8, pin_memory=True) for _ in range(64)]
+    else:
+        del gpu
+        churn = [torch.full((4096,), 99, dtype=torch.uint8, device='cuda') for _ in range(64)]
+    stream.synchronize()
+    assert torch.all(dst == 31)
+    assert len(churn) == 64
+
+
+@cuda
+def test_native_dma_rejects_bad_requests_before_submission():
+    from nnscaler.runtime.activation_cuda_copy import copy_dma
+    gpu = torch.empty(32, dtype=torch.uint8, device='cuda')
+    host = torch.empty(32, dtype=torch.uint8, pin_memory=True)
+    with pytest.raises(RuntimeError, match='non-negative'):
+        copy_dma(gpu, host, -1)
+    with pytest.raises(RuntimeError, match='pinned'):
+        copy_dma(gpu, torch.empty(32, dtype=torch.uint8), 1)
+    with pytest.raises(RuntimeError, match='sizes'):
+        copy_dma(gpu, host[:4], 1)
+    with pytest.raises(RuntimeError, match='contiguous'):
+        copy_dma(gpu[:16], host[::2], 1)
+
+
+@cuda
+@pytest.mark.parametrize('direction', ['h2d', 'd2h'])
+def test_native_dma_keeps_deleted_destination_from_reuse(direction):
+    from nnscaler.runtime.activation_cuda_copy import copy_dma, prepare_cuda_copy
+    prepare_cuda_copy()
+    host = torch.full((4096,), 31, dtype=torch.uint8, pin_memory=True)
+    gpu = torch.full((4096,), 31, dtype=torch.uint8, device='cuda')
+    src, dst = (host, gpu) if direction == 'h2d' else (gpu, host)
+    pointer = dst.data_ptr()
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        torch.cuda._sleep(40_000_000)
+        copy_dma(dst, src, 31)
+    del dst
+    if direction == 'h2d':
+        del gpu
+        churn = [torch.full((4096,), 99, dtype=torch.uint8, device='cuda') for _ in range(64)]
+    else:
+        del host
+        churn = [torch.full((4096,), 99, dtype=torch.uint8, pin_memory=True) for _ in range(64)]
+    assert all(x.data_ptr() != pointer for x in churn)
+    stream.synchronize()
+    assert all(torch.all(x == 99) for x in churn)
