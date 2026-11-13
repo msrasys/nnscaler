@@ -65,15 +65,17 @@ class CPUOffloadConfig:
     # Explicit scope collection and a pending-source budget are required.
     d2h_launch_phase: str = 'forward'
     d2h_scopes_per_backward: int = 1
-    # Optional CUDA restore implementation; D2H retains the DMA path.
+    # Optional CUDA transfer implementations, selected independently by direction.
     h2d_backend: str = 'dma'
     h2d_sm_blocks: int = 16
+    d2h_backend: str = 'dma'
+    d2h_sm_blocks: int = 4
 
     def __post_init__(self):
         for name, value in vars(self).items():
-            if name == 'h2d_backend':
+            if name in ('h2d_backend', 'd2h_backend'):
                 if value not in ('dma', 'sm'):
-                    raise ValueError('h2d_backend must be dma or sm')
+                    raise ValueError(f'{name} must be dma or sm')
                 continue
             if name == 'backpressure_mode':
                 if value not in ('host', 'stream'):
@@ -101,8 +103,9 @@ class CPUOffloadConfig:
         if self.backpressure_mode == 'stream' and (
                 self.max_pending_bytes == 0 or self.max_pending_bytes < self.max_inflight_bytes):
             raise ValueError('stream backpressure requires max_pending_bytes >= max_inflight_bytes and > 0')
-        if self.h2d_sm_blocks == 0:
-            raise ValueError('h2d_sm_blocks must be positive')
+        for name in ('h2d_sm_blocks', 'd2h_sm_blocks'):
+            if getattr(self, name) == 0:
+                raise ValueError(f'{name} must be positive')
         if self.d2h_launch_phase == 'backward' and (
                 self.forward_commit_unit != 'scope' or not self.max_pending_bytes
                 or not self.d2h_scopes_per_backward):
