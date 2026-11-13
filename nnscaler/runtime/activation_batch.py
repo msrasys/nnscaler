@@ -264,12 +264,13 @@ class ScopeRestoreQueue:
             return False
         if not self.pending:
             return True
-        while self.pending:
-            group = self.pending[0]
-            # Scope remains the scheduling unit. Publishing each consumer
-            # group's completion before enqueueing the next preserves early
-            # backward progress without waiting for an entire scope's DMA.
-            with self.store.transport.prefetch_batch():
+        # A scope request submits its admitted prefix together. Budget pressure
+        # closes that batch before returning; the next request resumes exactly
+        # where it stopped. Group transfer mode remains available for finer
+        # completion granularity instead of changing the native backend.
+        with self.store.transport.prefetch_batch():
+            while self.pending:
+                group = self.pending[0]
                 while group:
                     record = group[0]()
                     if record is not None and getattr(record, 'deferred_offload', False) and not self.consuming:
@@ -283,5 +284,5 @@ class ScopeRestoreQueue:
                         self.store.pool.stats['scope_prefetch_oversize_bytes'] += record.size
                     else:
                         return False
-            self.pending.popleft()
+                self.pending.popleft()
         return True

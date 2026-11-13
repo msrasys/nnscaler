@@ -150,7 +150,7 @@ def test_restore_queue_deduplicates_views_retries_budget_and_skips_dead_values()
     assert stats['scope_prefetch_oversize_bytes'] == 9
 
 
-def test_scope_restore_publishes_each_consumer_group_before_the_next():
+def test_scope_restore_submits_consumer_groups_together_in_backward_order():
     history=[]
     @contextmanager
     def batch():
@@ -166,7 +166,7 @@ def test_scope_restore_publishes_each_consumer_group_before_the_next():
     queue=ScopeRestoreQueue(store)
     queue.seal([SimpleNamespace(records=[weakref.ref(record)]) for record in records])
     assert queue.prefetch(from_schedule=True)
-    assert history==['begin',1,'publish','begin',0,'publish']
+    assert history==['begin',1,0,'publish']
 
 
 def test_batch_flush_renews_producer_event_before_later_saves(monkeypatch):

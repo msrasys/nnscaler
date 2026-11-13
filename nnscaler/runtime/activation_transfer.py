@@ -1,7 +1,7 @@
 # Copyright (c) Microsoft Corporation. Licensed under the MIT License.
 """CUDA transfer dependencies and bounded submission, independent of autograd."""
 from collections import deque
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from contextvars import ContextVar
 from itertools import groupby
 import time
@@ -26,9 +26,12 @@ class ActivationTransferEngine:
         self._last_restore_wait = None
         self._sm_copies = {}
         self._native_dma_copy = None
+        self._native_dma_submit = None
+        self._native_batches = {direction: ContextVar('activation_native_' + direction, default=None)
+                                for direction in ('d2h', 'h2d')}
         if device.type == 'cuda' and any(v != 'dma' for v in (config.h2d_backend, config.d2h_backend)):
             from .activation_cuda_copy import copy_d2h, copy_h2d, copy_dma, prepare_cuda_copy
-            prepare_cuda_copy()
+            self._native_dma_submit = prepare_cuda_copy().copy_dma_batch
             self._native_dma_copy = copy_dma
             self._sm_copies = {'h2d': copy_h2d, 'd2h': copy_d2h}
 
@@ -37,12 +40,43 @@ class ActivationTransferEngine:
         if active.get():
             yield active.get()
             return
-        with torch.cuda.stream(stream):
+        direction = 'd2h' if active is self._d2h_batch else 'h2d'
+        native = getattr(self.config, direction + '_backend') == 'dma_native'
+        compute_allocations = direction == 'h2d' and self.config.reload_on_compute_stream
+        # Native descriptors can be collected while allocations remain on the
+        # compute stream. One dependency at submission protects all of them.
+        with nullcontext() if native and compute_allocations else torch.cuda.stream(stream):
             fence = TransferFence()
             token = active.set(fence)
-            direction = 'd2h' if active is self._d2h_batch else 'h2d'
+            batch_token = None
+            batch = None
+            if native:
+                from .activation_cuda_copy import NativeDMABatch
+                batch = NativeDMABatch(self._native_dma_submit, self.config.copy_chunk_bytes)
+                batch_token = self._native_batches[direction].set(batch)
             def publish():
                 if fence.used:
+                    if batch is not None:
+                        try:
+                            if compute_allocations:
+                                stream.wait_stream(torch.cuda.current_stream(self.device))
+                            started = time.perf_counter_ns() if self.observation.enabled else None
+                            with torch.cuda.stream(stream), self.observation.range(direction + '_native_submit'):
+                                chunks = batch.submit()
+                            self.stats[direction + '_native_dma_batches'] += 1
+                            self.stats[direction + '_copy_chunks'] += chunks
+                            self.stats[direction + '_native_dma_descriptors'] += len(batch.sources)
+                            if started is not None:
+                                self.observation.emit(direction + '_copy', count=chunks,
+                                    nbytes=sum(source.numel() for source in batch.sources),
+                                    cpu_duration_ns=time.perf_counter_ns() - started)
+                        except BaseException as error:
+                            # Submission may have failed after some DMA was
+                            # queued. Drain only our stream before releasing
+                            # descriptors; never publish partial data as valid.
+                            fence.fail(error)
+                            stream.synchronize()
+                            raise
                     fence.publish(stream)
                     self.stats[direction + '_completion_events'] += 1
             try:
@@ -59,14 +93,15 @@ class ActivationTransferEngine:
             else:
                 publish()
             finally:
+                if batch_token is not None:
+                    self._native_batches[direction].reset(batch_token)
                 active.reset(token)
 
     @contextmanager
     def prefetch_batch(self):
-        # Compute-stream allocations must observe the caller's compute stream,
-        # so they retain the per-copy path. Copy-stream allocations can submit
-        # an entire restore batch under one stream context.
-        if self.config.reload_on_compute_stream:
+        # Native descriptors batch compute-stream allocations as well. Other
+        # backends keep their per-copy stream switching in that allocation mode.
+        if self.config.reload_on_compute_stream and self.config.h2d_backend != 'dma_native':
             yield
         else:
             with self._stream_batch(self.h2d_stream, self._h2d_batch):
@@ -179,9 +214,13 @@ class ActivationTransferEngine:
         if not self._d2h_batch.get():
             with self._stream_batch(self.d2h_stream, self._d2h_batch):
                 return self._to_host(source, destination)
-        source.record_stream(self.d2h_stream)
         try:
-            self._copy_into(destination, source, 'd2h')
+            batch = self._native_batches['d2h'].get()
+            if batch is not None:
+                batch.append(destination, source)
+            else:
+                source.record_stream(self.d2h_stream)
+                self._copy_into(destination, source, 'd2h')
             ready = self._completion(self._d2h_batch, self.d2h_stream, 'd2h')
         except BaseException:
             # A later chunk/event can fail after earlier DMA was enqueued.
@@ -254,7 +293,8 @@ class ActivationTransferEngine:
     def _to_device(self, source, dependency):
         stream = self.h2d_stream
         destination = None
-        if self.config.reload_on_compute_stream and not self._h2d_batch.get():
+        if (self.config.reload_on_compute_stream and not self._h2d_batch.get()
+                and self.config.h2d_backend != 'dma_native'):
             consumer = torch.cuda.current_stream(self.device)
             destination = torch.empty(source.shape, dtype=source.dtype, device=self.device)
             stream.wait_stream(consumer)
@@ -270,11 +310,15 @@ class ActivationTransferEngine:
         # on peers that also stopped at OOM. Only partial DMA needs draining.
         if destination is None:
             destination = torch.empty(source.shape, dtype=source.dtype, device=self.device)
-        destination.record_stream(stream)
         try:
             with self.observation.range('h2d_copy'):
-                stream.wait_event(cuda_event(dependency))
-                self._copy_into(destination, source, 'h2d')
+                batch = self._native_batches['h2d'].get()
+                if batch is not None:
+                    batch.append(destination, source, dependency)
+                else:
+                    destination.record_stream(stream)
+                    stream.wait_event(cuda_event(dependency))
+                    self._copy_into(destination, source, 'h2d')
                 ready = self._completion(self._h2d_batch, stream, 'h2d')
         except BaseException:
             stream.synchronize()

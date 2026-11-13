@@ -229,3 +229,40 @@ def test_native_dma_keeps_deleted_destination_from_reuse(direction):
     assert all(x.data_ptr() != pointer for x in churn)
     stream.synchronize()
     assert all(torch.all(x == 99) for x in churn)
+
+
+@cuda
+def test_native_batch_validates_later_descriptor_before_any_copy():
+    from nnscaler.runtime.activation_cuda_copy import prepare_cuda_copy
+    module = prepare_cuda_copy()
+    src = torch.ones(4096, dtype=torch.uint8, device='cuda')
+    host = torch.zeros(4096, dtype=torch.uint8, pin_memory=True)
+    with pytest.raises(RuntimeError, match='sizes'):
+        module.copy_dma_batch([host, host[:3]], [src, src], [0, 0], 1024)
+    torch.cuda.synchronize()
+    assert not host.any()
+
+
+@cuda
+def test_native_restore_batch_preserves_distinct_producer_dependencies():
+    from nnscaler.runtime.activation_cuda_copy import NativeDMABatch, prepare_cuda_copy
+    submit = prepare_cuda_copy().copy_dma_batch
+    producer, consumer = torch.cuda.Stream(), torch.cuda.Stream()
+    hosts = [torch.empty(4096, dtype=torch.uint8, pin_memory=True) for _ in range(2)]
+    sources = [torch.full((4096,), n, dtype=torch.uint8, device='cuda') for n in (17, 31)]
+    destinations = [torch.empty_like(src) for src in sources]
+    dependencies = [torch.cuda.Event() for _ in hosts]
+    producer.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(producer):
+        for host, src, event in zip(hosts, sources, dependencies):
+            torch.cuda._sleep(10_000_000)
+            host.copy_(src, non_blocking=True)
+            event.record()
+    batch = NativeDMABatch(submit, 31)
+    for dst, host, event in zip(destinations, hosts, dependencies):
+        batch.append(dst, host, event)
+    with torch.cuda.stream(consumer):
+        assert batch.submit() == 266
+    del batch, hosts, sources, dependencies
+    consumer.synchronize()
+    assert torch.all(destinations[0] == 17) and torch.all(destinations[1] == 31)

@@ -570,6 +570,11 @@ class ActivationStore:
             return 'below_minimum_size'
         if self.config.max_storage_to_tensor_ratio and size > self.config.max_storage_to_tensor_ratio * tensor_size:
             return 'disproportionate_storage'
+        # A storage that can never fit need not enter dedup/version-tracker
+        # and transfer queues. Dynamic pool pressure is still decided at
+        # commit; a later release can make those otherwise eligible saves fit.
+        if self.pool.allocation_charge(size) > self.config.max_cpu_bytes:
+            return 'exceeds_host_budget'
         return None
 
     def _capture(self, tensor, batch, *, admitted=False):
@@ -598,6 +603,8 @@ class ActivationStore:
             return _SavedTensor(tensor, record)
 
     def _resident(self, tensor, reason):
+        if reason == 'exceeds_host_budget':
+            self.pool.stats['budget_fallback_bytes'] += tensor.untyped_storage().nbytes()
         if self.observation.enabled:
             self.observation.emit('resident', nbytes=tensor.numel() * tensor.element_size(), reason=reason)
         return _ResidentTensorRef(tensor, reason)

@@ -241,12 +241,14 @@ def test_stream_pacing_does_not_uncharge_unfinished_gpu_sources(monkeypatch):
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason='CUDA required')
 @pytest.mark.parametrize('backpressure', ['host', 'stream'])
-def test_cuda_public_store_batches_share_fences_and_preserve_values(backpressure):
+@pytest.mark.parametrize('backend,compute_allocations', [('dma', False), ('dma_native', False), ('dma_native', True)])
+def test_cuda_public_store_batches_share_fences_and_preserve_values(backpressure, backend, compute_allocations):
     from nnscaler.runtime.activation_memory import _pools
     from nnscaler.runtime.activation_store import ActivationStore
     _pools.clear()
     config = CPUOffloadConfig(max_cpu_bytes=1024**2, host_reserve_bytes=0,
-                             min_tensor_bytes=0, reload_on_compute_stream=False,
+                             min_tensor_bytes=0, reload_on_compute_stream=compute_allocations,
+                             d2h_backend=backend, h2d_backend=backend, copy_chunk_bytes=17,
                              max_inflight_bytes=128, max_pending_bytes=4096,
                              backpressure_mode=backpressure)
     store = ActivationStore(config, device='cuda')
@@ -261,5 +263,45 @@ def test_cuda_public_store_batches_share_fences_and_preserve_values(backpressure
     store.close()
     assert store.pool.stats['d2h_completion_events'] == 1
     assert store.pool.stats['h2d_completion_events'] == 1
+    if backend == 'dma_native':
+        for direction in ('h2d', 'd2h'):
+            assert store.pool.stats[direction + '_native_dma_batches'] == 1
+            assert store.pool.stats[direction + '_native_dma_descriptors'] == 2
     assert store.pool.snapshot()['live_cpu_bytes'] == 0
     _pools.clear()
+
+
+def test_native_batch_submission_failure_does_not_publish_partial_data(monkeypatch):
+    value = engine(monkeypatch)
+    value.config = replace(value.config, d2h_backend='dma_native')
+    def fail(destinations, sources, waits, chunk):
+        destinations[0].copy_(sources[0])  # A runtime failure after the first copy.
+        raise RuntimeError('partial DMA')
+    value._native_dma_submit = fail
+    with pytest.raises(RuntimeError, match='partial DMA'):
+        with value._stream_batch(value.d2h_stream, value._d2h_batch):
+            fence = value.to_host(torch.ones(7, dtype=torch.uint8), torch.empty(7, dtype=torch.uint8))
+            value.to_host(torch.ones(11, dtype=torch.uint8), torch.empty(11, dtype=torch.uint8))
+    assert value.d2h_stream.syncs == 1
+    assert fence.event.records == 0 and not fence.query()
+    with pytest.raises(RuntimeError, match='partial DMA'):
+        fence.cuda_event()
+
+
+def test_native_batch_body_error_submits_valid_descriptors_and_keeps_original_error(monkeypatch):
+    value = engine(monkeypatch)
+    value.config = replace(value.config, d2h_backend='dma_native')
+    calls = []
+    def copy(destinations, sources, waits, chunk):
+        calls.append(len(sources))
+        for dst, src in zip(destinations, sources):
+            dst.copy_(src)
+        return len(sources)
+    value._native_dma_submit = copy
+    src, dst = torch.ones(7, dtype=torch.uint8), torch.empty(7, dtype=torch.uint8)
+    with pytest.raises(ValueError, match='later allocation'):
+        with value._stream_batch(value.d2h_stream, value._d2h_batch):
+            fence = value.to_host(src, dst)
+            raise ValueError('later allocation')
+    assert calls == [1] and torch.equal(src, dst)
+    assert fence.event.records == 1 and not value.d2h_stream.syncs

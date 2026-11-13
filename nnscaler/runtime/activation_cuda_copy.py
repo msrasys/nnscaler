@@ -58,3 +58,34 @@ def copy_dma(destination, source, chunk_bytes):
     chunks = prepare_cuda_copy().copy_dma(destination, source, chunk_bytes)
     torch.autograd.graph.increment_version(destination)
     return chunks
+
+
+class NativeDMABatch:
+    """Collect byte-copy descriptors; issue ordered DMA in one native entry.
+
+    The caller owns stream selection, allocation readiness and completion.
+    References here retain both payloads and producer events until submission.
+    Reserving the destination version when enqueued lets the store safely
+    register a restored value before the batch closes.
+    """
+    def __init__(self, submit, chunk_bytes):
+        self.submit_native = submit
+        self.chunk_bytes = chunk_bytes
+        self.destinations, self.sources, self.dependencies = [], [], []
+
+    def append(self, destination, source, dependency=None):
+        torch.autograd.graph.increment_version(destination)
+        self.destinations.append(destination)
+        self.sources.append(source)
+        self.dependencies.append(dependency)
+
+    def submit(self):
+        from .activation_fence import cuda_event
+
+        if not self.sources:
+            return 0
+        # cuda_event() first enforces publication: CUDA otherwise silently
+        # treats a wait on an unrecorded event as already satisfied.
+        waits = [cuda_event(event).cuda_event if event is not None else 0
+                 for event in self.dependencies]
+        return self.submit_native(self.destinations, self.sources, waits, self.chunk_bytes)

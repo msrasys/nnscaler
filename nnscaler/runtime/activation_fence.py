@@ -43,6 +43,11 @@ class TransferFence:
             raise RuntimeError('Activation transfer event publication failed: ' + self._failure)
         return self.event
 
+    def fail(self, error):
+        """Wake consumers after failed submission without exposing invalid data."""
+        self._failure = str(error)
+        self._published.set()
+
     def query(self):
         # Polling an unpublished or failed transfer must never recycle memory.
         if not self._complete and self._published.is_set() and self._failure is None:

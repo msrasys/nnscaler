@@ -423,12 +423,29 @@ def test_host_budget_fallback_and_store_close_keep_other_store_valid():
     x = torch.randn(128, device='cuda')
     ha, hb = a.save(x), b.save(x + 1)
     assert ha.status()['state'] == 'resident'
+    assert not a.records and not b.records
+    assert ha._value.reason == hb._value.reason == 'exceeds_host_budget'
     torch.testing.assert_close(ha.load(), x)
     ha.release()
     a.close()
     torch.testing.assert_close(hb.load(), x + 1)
     hb.release()
     b.close()
+
+
+@cuda
+def test_impossible_budget_skips_transfer_records_but_still_checks_mutation():
+    cache = store('cuda', max_cpu_bytes=128)
+    x = torch.ones(33, device='cuda')  # Rounded pinned allocation needs 256 bytes.
+    with cache.batch() as batch:
+        handle = batch.save(x)
+        assert not batch.pending and not batch.records
+    assert handle._value.reason == 'exceeds_host_budget'
+    x.add_(1)
+    with pytest.raises(RuntimeError, match='inplace'):
+        handle.load()
+    handle.release()
+    cache.close()
 
 
 @cuda

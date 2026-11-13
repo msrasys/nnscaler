@@ -606,6 +606,10 @@ def test_codegen_fn_pipeline_input_references_are_opt_in(tmp_path, release_input
     assert any('with self.cpu_offloading_hooks(' in source for source in sources) == offload
     assert any('release_output_tensor(' in source for source in sources) == release_outputs
     assert any('model.activation_offload_schedule(' in source for source in sources) == offload
+    assert any('activation_offload_scope(' in source for source in sources) == offload
+    if not offload:
+        assert all('prefetch_activation(' not in source and 'finish_activation_offload(' not in source
+                   and '_get_activation_offload_manager(' not in source for source in sources)
     for source in sources:
         tree = ast.parse(source)
         for function in (node for node in ast.walk(tree) if isinstance(node, ast.FunctionDef)
