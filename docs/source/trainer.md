@@ -1320,7 +1320,8 @@ We can categorize the fields into 4 categories:
       runtime when this assumption is broken.
 
     - `trace_strategy`: how to execute the functions during trace, given
-      as `name` or `name:option`; only `meta` takes an option for now. Five
+      as `name` or `name:option`; no strategy takes an option yet
+      (`meta:no` is accepted as a spelling of `meta`). Five
       strategies are supported:
 
       1.  `cpu`: Execute all functions on cpu device, model weights and
@@ -1335,14 +1336,10 @@ We can categorize the fields into 4 categories:
           a supplied model instance must carry real weights.
           Operations that read tensor
           values (`.item()`, `bool(tensor)`, `nonzero`, ...) cannot run
-          on meta. `meta` (same as `meta:no`) raises an error for them.
-          `meta:cpu` or `meta:cuda` instead replays the traced operators
-          they depend on with the dummy inputs on that device (a warning
-          names the operator and the number of replayed nodes), so the
-          branch and shapes follow the dummy inputs as with `cpu`.
-          To avoid the replay or force a shape, give the operator a stand-in result
-          with `trace_fake(fn, fake, *args)` at the call site, or a stand-in
-          function with `update_op(..., fake_fn=...)` / `register_op(..., fake_fn=...)`
+          on meta and raise an error naming the operator. Give such a call
+          a stand-in result with `trace_fake(fn, fake, *args)` at the call
+          site, or a stand-in function with `update_op(..., fake_fn=...)` /
+          `register_op(..., fake_fn=...)`
           (see [Register Custom Operators](register_custom_op.md)).
           For more information about meta device type, please view
           <https://pytorch.org/docs/stable/meta.html>.

@@ -219,10 +219,9 @@ def my_matmul(x: torch.Tensor, w: torch.Tensor):
 `fake_fn` replaces the execution of every call of a registered operator. `nnscaler.trace_fake` does the
 same for a single call site of any operator the tracer records as a node: while tracing, the operator is
 not executed and the given fake stands in for its result. It is meant for operators that read tensor
-values (`torch.nonzero`, `.item()`, `torch.where(mask)`, a `bool()` condition): under `trace_strategy='meta'`
-they raise an error, or with `meta:cpu` / `meta:cuda` are resolved by replaying the traced operators they
-depend on, and when the same call sits in a loop or in every layer, for example the per-expert
-`torch.where(expert_mask[i])` of a Mixture-of-Experts router, the replays add up.
+values (`torch.nonzero`, `.item()`, `torch.where(mask)`, a `bool()` condition), which cannot run under
+`trace_strategy='meta'` and raise an error naming the operator; for example the per-expert
+`torch.where(expert_mask[i])` of a Mixture-of-Experts router.
 
 ```python
 import nnscaler
@@ -237,9 +236,8 @@ idx, top_x = nnscaler.trace_fake(
 
 - The graph still records `torch.where` with the original arguments; the generated code calls the real
   operator and `trace_fake` never appears in it.
-- The fake is the trace value under every strategy, exactly like `fake_fn`. A meta-trace replay also
-  returns it for this node instead of executing anything before it. Outside of tracing the operator runs
-  and the fake is ignored.
+- The fake is the trace value under every strategy, exactly like `fake_fn`. Outside of tracing the
+  operator runs and the fake is ignored.
 - The fake must carry data: cpu or cuda tensors, Python values for `.item()` / `.tolist()`, or tuples of
   them for multi-output operators. Tensor methods are passed unbound, `trace_fake(torch.Tensor.item, 3, x)`;
   conditions as `trace_fake(bool, True, mask.any())`. In-place operators are not supported.

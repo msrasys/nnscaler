@@ -43,7 +43,7 @@ from .function_patcher import FunctionPatcher
 from .metadata import EmptyResult, extract_metadata
 from .operator_patcher import OperatorPatcherContext
 from .torch_fx_patcher import TorchFXPatcher, ExtraSEFPatcher, side_effectful_inplace_ops
-from .trace_strategy import create_trace_strategy, FAKE_META
+from .trace_strategy import create_trace_strategy
 
 # pyright: reportGeneralTypeIssues=false
 _logger = logging.getLogger(__name__)
@@ -75,8 +75,8 @@ class ConcreteTracer(TracerBase):
                     `cuda': Execute all functions on cuda, model weights and intermediate results are on cuda.
                         This strategy is recommended if the model can inference on single gpu.
                     'meta': Execute all functions on meta, model weights are on cpu and intermediate results are on meta.
-                        Operators that read tensor values cannot run on meta; the optional suffix selects what happens:
-                        'meta' (same as 'meta:no') raises for them; 'meta:cpu' or 'meta:cuda' replays their inputs on that device.
+                        Operators that read tensor values cannot run on meta and raise; give them a stand-in result
+                        with `trace_fake` or a registered `fake_fn`.
                     'cuda_run_cpu_offload': Try to execute all functions on cuda, and retry to execute the function on cpu as backup if meet OOM error,
                         model weights and intermediate results are on cpu. This strategy is recommanded for most case if the model is too large to inference on single gpu.
                     'reuse_cache': Similar to `cuda_run_cpu_offload` strategy, additional add a buffer to cache all the intermediate results with different function signatures on cpu,
@@ -300,10 +300,6 @@ class ConcreteTracer(TracerBase):
             assert isinstance(kwargs_, dict)
 
         node = self.create_node(kind, node_target or target, args_, kwargs_, name, type_expr, node_result)
-        self.strategy.record_node_outputs(node, node_result, args_run, kwargs_run)
-        if fake_result is not EmptyResult:
-            # see `trace_fake`: the value a meta-trace replay returns for this node instead of executing it
-            node.meta[FAKE_META] = fake_result
 
         if self.record_frames and kind != 'placeholder':
             with wrap_utils.do_temp_call_origin():
@@ -1012,8 +1008,8 @@ def concrete_trace(root : Union[torch.nn.Module, Callable[..., Any]],
                 `cuda': Execute all functions on cuda, model weights and intermediate results are on cuda.
                     This strategy is recommended if the model can inference on single gpu.
                 'meta': Execute all functions on meta, model weights are on cpu and intermediate results are on meta.
-                    Operators that read tensor values cannot run on meta; the optional suffix selects what happens:
-                    'meta' (same as 'meta:no') raises for them; 'meta:cpu' or 'meta:cuda' replays their inputs on that device.
+                    Operators that read tensor values cannot run on meta and raise; give them a stand-in result
+                    with `trace_fake` or a registered `fake_fn`.
                 'cuda_run_cpu_offload': Try to execute all functions on cuda, and retry to execute the function on cpu as backup if meet OOM error,
                     model weights and intermediate results are on cpu. This strategy is recommanded for most case if the model is too large to inference on single gpu.
                 'reuse_cache': Similar to `cuda_run_cpu_offload` strategy, additional add a buffer to cache all the intermediate results with different function signatures on cpu,

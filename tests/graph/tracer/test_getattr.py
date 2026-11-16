@@ -1,7 +1,6 @@
 #  Copyright (c) Microsoft Corporation.
 #  Licensed under the MIT License.
 
-import logging
 
 import pytest
 import torch
@@ -86,6 +85,11 @@ def test_cuda_device_arguments_run_on_strategy_device(monkeypatch, strategy):
     assert value.device.type == strategy
 
 
+class NonzeroModel(torch.nn.Module):
+    def forward(self, x):
+        return x[torch.nonzero(x > 0).flatten()].sum()
+
+
 class ItemModel(torch.nn.Module):
     def forward(self, x):
         return x * x.sum().item()
@@ -98,201 +102,32 @@ class BranchOnValueModel(torch.nn.Module):
         return x.sum()
 
 
-class NonzeroModel(torch.nn.Module):
-    def forward(self, x):
-        return x[x > 0].sum()
-
-
-class ToListModel(torch.nn.Module):
-    def forward(self, x):
-        return x * len(x.tolist())
-
-
-class InplaceInConeModel(torch.nn.Module):
-    def forward(self, x):
-        keep = x > 0
-        keep[0] = False                 # setitem on the mask
-        alias = keep.view(-1)
-        alias.logical_not_()            # in-place through an alias: `keep` is mutated too
-        return x[keep.nonzero().flatten()].sum()
-
-
-class KeywordInplaceModel(torch.nn.Module):
-    def forward(self, x):
-        h = x.clone()
-        torch.nn.functional.relu(h, inplace=True)   # mutates `h`; the returned value is unused
-        return x[(h == 0).nonzero().flatten()].sum()  # `h == 0` references the clone node
-
-
-class InputSetitemModel(torch.nn.Module):
-    def forward(self, x):
-        x[0] = 0.0                                   # setitem on the dummy input itself
-        return x[(x == 0).nonzero().flatten()].sum()
-
-
-class DataDependentInplaceModel(torch.nn.Module):
-    def forward(self, x):
-        h = x.clone()
-        h[(x > 0).nonzero().flatten()] = 0.0         # in-place write at data-dependent positions
-        return x[(h == 0).nonzero().flatten()].sum()
-
-
-class FunctionInplaceModel(torch.nn.Module):
-    def forward(self, x):
-        h = x.clone()
-        torch.relu_(h)                               # function form of an in-place op; result unused
-        return x[(h == 0).nonzero().flatten()].sum()
-
-
-class Double(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx, x):
-        return x * 2
-
-    @staticmethod
-    def backward(ctx, g):
-        return g * 2
-
-
-class KeepPositive(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx, x):
-        return x[x > 0]                              # data dependent inside an autograd function
-
-    @staticmethod
-    def backward(ctx, g):
-        return None
-
-
-class NestedAutogradModel(torch.nn.Module):
-    def forward(self, x):
-        return KeepPositive.apply(Double.apply(x)).sum()
-
-
-class DirectSetitemModel(torch.nn.Module):
-    def forward(self, x):
-        x[0] = 0.0
-        return torch.nonzero(x)                      # consumes the setitem result directly
-
-
-class DetachInplaceModel(torch.nn.Module):
-    def forward(self, x):
-        h = x.clone()
-        h.detach().mul_(0.0)                         # mutation through an alias that is not a view (`_base` is None)
-        return x[(h == 0).nonzero().flatten()].sum()
-
-
-class MultiOutputInplaceModel(torch.nn.Module):
-    def forward(self, x):
-        values, indices = torch.empty(4, device=x.device), torch.empty(4, dtype=torch.long, device=x.device)
-        torch.sort(x, out=(values, indices))         # `out=` with several tensors: all of them are mutated
-        return x[(indices == 3).nonzero().flatten()].sum()
-
-
-class IteratorStateModel(torch.nn.Module):
-    def forward(self, x):
-        total = x.sum() * 0
-        for i in (x > 0).nonzero().flatten():      # `iter` / `next` nodes; `next` advances the iterator
-            total = total + x[int(i)]                # `int(i)` replays `next`, which needs the earlier `next`s
-        return total
-
-
-class UnrelatedInplaceModel(torch.nn.Module):
-    def forward(self, x):
-        other = x.clone()
-        other.add_(1)                                # mutates storage the replay never reads
-        idx = (x > 0).nonzero().flatten()           # replays `x > 0` only: not clone, add_
-        return x[idx].sum() + other.sum()
-
-
-class BufferInplaceModel(torch.nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.register_buffer('b', torch.tensor([1.0, -1.0, 2.0, 0.5]))
-
-    def forward(self, x):
-        self.b.mul_(0.0)                             # mutation through one access of the buffer ...
-        return x.sum() + torch.nonzero(self.b).shape[0]   # ... must be seen by the next access
-
-
-class ParameterInConeModel(torch.nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.weight = torch.nn.Parameter(torch.tensor([1.0, -1.0, 2.0, 0.5]))
-
-    def forward(self, x):
-        return x[(self.weight > 0).nonzero().flatten()].sum()
-
-
-class RandomInConeModel(torch.nn.Module):
-    def forward(self, x):
-        r = torch.rand_like(x.new_empty(64))   # random values produced on the strategy device
-        count = (r > 0.5).nonzero().shape[0]   # replayed once ...
-        total = int((r > 0.5).sum().item())    # ... and again: both replays must see the same r
-        return x * (count - total)
-
-
-def _trace_signature(model, inputs):
-    graph = to_fx_graph(model, inputs)
-    def meta(n):
-        value = n.meta.get('tensor_meta')
-        if hasattr(value, 'shape'):
-            return tuple(value.shape)
-        # python scalars are stored as they are; other objects (an iterator) only by type, their identity differs per trace
-        return value if isinstance(value, (int, float, bool, str, type(None))) else type(value).__name__
-    return [(n.op, str(n.target), str(n.args), meta(n)) for n in graph.graph.nodes]
-
-
-@pytest.mark.parametrize('strategy', [
-    'meta:cpu',
-    pytest.param('meta:cuda', marks=pytest.mark.skipif(not torch.cuda.is_available(), reason='requires CUDA')),
-])
-@pytest.mark.parametrize('model_class', [
-    ItemModel, BranchOnValueModel, NonzeroModel, ToListModel, InplaceInConeModel, KeywordInplaceModel,
-    InputSetitemModel, DataDependentInplaceModel, DirectSetitemModel, BufferInplaceModel, ParameterInConeModel,
-    FunctionInplaceModel, NestedAutogradModel, UnrelatedInplaceModel, DetachInplaceModel, IteratorStateModel,
-    MultiOutputInplaceModel])
-def test_meta_strategy_replays_data_dependent_ops(monkeypatch, model_class, strategy):
-    """Data-dependent operators replay their traced inputs on the fallback device, so meta traces the same graph as cpu."""
-    inputs = {'x': torch.tensor([0.5, 0.0, -1.0, 2.0])}
-    monkeypatch.setattr(CompileFlag, 'trace_strategy', 'cpu')
-    expected = _trace_signature(model_class(), inputs)
-    monkeypatch.setattr(CompileFlag, 'trace_strategy', strategy)
-    assert _trace_signature(model_class(), inputs) == expected
-
-
-def test_replay_skips_unobserved_inplace_ops(monkeypatch, caplog):
-    monkeypatch.setattr(CompileFlag, 'trace_strategy', 'meta:cpu')
-    with caplog.at_level(logging.WARNING, logger='nnscaler.graph.tracer.trace_strategy'):
-        to_fx_graph(UnrelatedInplaceModel(), {'x': torch.tensor([0.5, 0.0, -1.0, 2.0])})
-    assert 'replayed 2 traced nodes' in caplog.text                        # x, gt: not clone, add_
-
-
 @pytest.mark.parametrize('strategy', ['meta', 'meta:no'])
-def test_meta_without_replay_option_raises(monkeypatch, strategy):
+@pytest.mark.parametrize('model_class, operator', [(NonzeroModel, 'nonzero'), (ItemModel, 'item'), (BranchOnValueModel, 'bool')])
+def test_meta_raises_on_data_dependent_ops(monkeypatch, strategy, model_class, operator):
+    """Operators that read tensor values cannot run on meta; the error names the operator and the remedies."""
     monkeypatch.setattr(CompileFlag, 'trace_strategy', strategy)
-    with pytest.raises(RuntimeError, match="cannot execute") as exc_info:
-        to_fx_graph(NonzeroModel(), {'x': torch.rand(4)})
-    assert "'meta:cpu' or 'meta:cuda'" in str(exc_info.value) and 'fake_fn' in str(exc_info.value)
+    with pytest.raises(RuntimeError, match=f"cannot execute `{operator}`") as exc_info:
+        to_fx_graph(model_class(), {'x': torch.tensor([0.5, 0.0, -1.0, 2.0])})
+    assert 'trace_fake' in str(exc_info.value) and 'fake_fn' in str(exc_info.value)
+    assert exc_info.value.__cause__ is not None
 
 
 def test_trace_strategy_option_validation():
     from nnscaler.parallel import ComputeConfig
-    with pytest.raises(ValueError, match="accepts the options"):
-        ConcreteTracer('meta:gpu')
+    with pytest.raises(ValueError, match="takes no option"):
+        ConcreteTracer('meta:cpu')
     with pytest.raises(ValueError, match="takes no ':option'"):
         ConcreteTracer('cpu:fast')
     with pytest.raises(ValueError, match="unknown trace strategy"):
         ConcreteTracer('tpu')
-    with pytest.raises(ValueError, match="accepts the options"):
-        ComputeConfig(1, 1, trace_strategy='meta:gpu', param_init_strategy='shard')
+    with pytest.raises(ValueError, match="takes no option"):
+        ComputeConfig(1, 1, trace_strategy='meta:cuda', param_init_strategy='shard')
     with pytest.raises(ValueError, match="requires param_init_strategy='shard'"):
         ComputeConfig(1, 1, trace_strategy='meta')
     config = ComputeConfig(1, 1, trace_strategy='meta:no', param_init_strategy='shard')
     assert (config.trace_strategy_name, config.trace_strategy_option) == ('meta', 'no')
     assert (ComputeConfig(1, 1).trace_strategy_name, ComputeConfig(1, 1).trace_strategy_option) == ('cuda_run_cpu_offload', '')
-    # the config is also loaded by processes without CUDA; only tracing needs the device
-    assert ComputeConfig(1, 1, trace_strategy='meta:cuda', param_init_strategy='shard').trace_strategy == 'meta:cuda'
 
 
 class DictKeyModel(torch.nn.Module):
@@ -300,62 +135,11 @@ class DictKeyModel(torch.nn.Module):
         return data['cuda'] + data.get('cuda', 0)   # container keys that happen to spell device names
 
 
-class ReturnsParameterModel(torch.nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.w = torch.nn.Parameter(torch.tensor([1.0, -1.0, 2.0]))
-        self.register_buffer('b', torch.tensor([1.0, 2.0, 3.0]))
-
-    def forward(self, x):
-        w = self.w.to(x.dtype)                        # returns the parameter object itself
-        self.b.mul_(0.0)
-        return x.sum() + w.sum() + torch.nonzero(self.b).shape[0]
-
-
-def test_meta_trace_does_not_pin_graph_nodes_on_module_tensors(monkeypatch):
-    """The same instance can be traced again: parameters never carry a node of a previous graph."""
-    monkeypatch.setattr(CompileFlag, 'trace_strategy', 'meta:cpu')
-    model = ReturnsParameterModel()
-    inputs = {'x': torch.rand(3)}
-    first = _trace_signature(model, inputs)
-    for tensor in list(model.parameters()) + list(model.buffers()):
-        assert not hasattr(tensor, '_nnscaler_meta_origin')
-    assert _trace_signature(model, inputs) == first
-
-
 @pytest.mark.parametrize('strategy', ['cpu', 'meta'])
 def test_device_mapping_leaves_container_keys_alone(monkeypatch, strategy):
     monkeypatch.setattr(CompileFlag, 'trace_strategy', strategy)
     # traces without KeyError: the keys are not rewritten when the lookups execute
     to_fx_graph(DictKeyModel(), {'data': {'cuda': torch.ones(2), 'cpu': torch.ones(2)}})
-
-
-def test_meta_strategy_replays_random_values_consistently(monkeypatch):
-    monkeypatch.setattr(CompileFlag, 'trace_strategy', 'meta:cpu')
-    inputs = {'x': torch.rand(4)}
-    cpu_state = torch.get_rng_state()
-    cuda_state = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else []
-    graph = to_fx_graph(RandomInConeModel(), inputs)
-    mul = next(n for n in graph.graph.nodes if n.op == 'call_function' and n.target.__name__ == 'mul')
-    assert mul.args[1].meta['tensor_meta'] == 0   # count - total, both read from the same replayed `r`
-    # the replay's seeding must not leak into the caller's generators
-    assert torch.equal(torch.get_rng_state(), cpu_state)
-    assert all(torch.equal(a, b) for a, b in zip(torch.cuda.get_rng_state_all() if torch.cuda.is_available() else [], cuda_state))
-
-
-class CpuFactoryRandomModel(torch.nn.Module):
-    def forward(self, x):
-        r = torch.rand(64)                            # no device: runs on cpu even under the meta strategy
-        count = torch.nonzero(r > 0.5).shape[0]       # consumes the placed copy of `r` directly ...
-        total = int((r > 0.5).sum().item())           # ... and through a node: both see the same replayed `r`
-        return x * (count - total)
-
-
-def test_meta_strategy_replays_cpu_factory_outputs_consistently(monkeypatch):
-    monkeypatch.setattr(CompileFlag, 'trace_strategy', 'meta:cpu')
-    graph = to_fx_graph(CpuFactoryRandomModel(), {'x': torch.rand(4)})
-    mul = next(n for n in graph.graph.nodes if n.op == 'call_function' and n.target.__name__ == 'mul')
-    assert mul.args[1].meta['tensor_meta'] == 0
 
 
 def test_patcher_contexts_nest_in_the_supported_order():
@@ -380,28 +164,8 @@ def test_patcher_contexts_nest_in_the_supported_order():
     assert builtins.range is original
 
 
-class ParameterItemModel(torch.nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.weight = torch.nn.Parameter(torch.ones(4))
-
-    def forward(self, x):
-        return x * self.weight.sum().item()
-
-
-def test_meta_strategy_reports_unreplayable_values(monkeypatch):
-    """A meta parameter without captured construction has no values to replay; the error says what to do."""
-    monkeypatch.setattr(CompileFlag, 'trace_strategy', 'meta:cpu')
-    model = ParameterItemModel().to_empty(device='meta')
-    with pytest.raises(RuntimeError, match="cannot execute `item`") as exc_info:
-        to_fx_graph(model, {'x': torch.rand(4)})
-    message = str(exc_info.value)
-    assert 'Replaying' in message and 'fake_fn' in message
-    assert exc_info.value.__cause__ is not None
-
-
 class TraceFakeModel(torch.nn.Module):
-    """Every data-dependent read is given a call-site fake; nothing is executed or replayed for them."""
+    """Every data-dependent read is given a call-site fake; none of them is executed."""
     def forward(self, x):
         positive = x > 0
         idx = nnscaler.trace_fake(torch.nonzero, torch.zeros(3, 1, dtype=torch.long), positive)
@@ -413,24 +177,15 @@ class TraceFakeModel(torch.nn.Module):
         return x[idx.flatten()].sum() + rows.shape[0] + count
 
 
-class ReplayUsesFakeModel(torch.nn.Module):
-    """A later replay stops at the faked node and takes its value."""
-    def forward(self, x):
-        idx = nnscaler.trace_fake(torch.nonzero, torch.zeros(3, 1, dtype=torch.long), x > 0)
-        return x * int((idx > 0).sum().item())      # .item() replays: `nonzero` returns the fake, `x > 0` is not run
-
-
 def _nodes(graph, name):
     return [n for n in graph.graph.nodes if (n.target if isinstance(n.target, str) else getattr(n.target, '__name__', '')) == name]
 
 
 @pytest.mark.parametrize('strategy', ['cpu', 'meta', 'meta:no'])
-def test_trace_fake_replaces_execution(monkeypatch, caplog, strategy):
+def test_trace_fake_replaces_execution(monkeypatch, strategy):
     """Like `fake_fn`, the fake is the trace value under every strategy; the graph records the real operator."""
     monkeypatch.setattr(CompileFlag, 'trace_strategy', strategy)
-    with caplog.at_level(logging.WARNING, logger='nnscaler.graph.tracer.trace_strategy'):
-        graph = to_fx_graph(TraceFakeModel(), {'x': torch.tensor([0.5, 0.0, -1.0, 2.0])})
-    assert 'needs tensor data' not in caplog.text
+    graph = to_fx_graph(TraceFakeModel(), {'x': torch.tensor([0.5, 0.0, -1.0, 2.0])})
     nonzero, = _nodes(graph, 'nonzero')
     assert nonzero.op == 'call_function' and nonzero.target is torch.nonzero
     assert tuple(nonzero.meta['tensor_meta'].shape) == (3, 1)              # the fake's shape, not the data's (2, 1)
@@ -446,15 +201,6 @@ def test_trace_fake_replaces_execution(monkeypatch, caplog, strategy):
 def test_trace_fake_runs_fn_outside_tracing():
     x = torch.tensor([0.5, 0.0, -1.0, 2.0])
     assert torch.equal(nnscaler.trace_fake(torch.nonzero, torch.zeros(3, 1, dtype=torch.long), x > 0), torch.nonzero(x > 0))
-
-
-def test_trace_fake_feeds_later_replays(monkeypatch, caplog):
-    monkeypatch.setattr(CompileFlag, 'trace_strategy', 'meta:cpu')
-    with caplog.at_level(logging.WARNING, logger='nnscaler.graph.tracer.trace_strategy'):
-        graph = to_fx_graph(ReplayUsesFakeModel(), {'x': torch.tensor([0.5, 0.0, -1.0, 2.0])})
-    assert 'replayed 3 traced nodes' in caplog.text                        # nonzero (fake), gt_1, sum: not x, gt
-    int_node, = _nodes(graph, 'int')
-    assert int_node.meta['tensor_meta'] == 0                                 # the fake is all zeros; real data gives 1
 
 
 def test_trace_fake_rejects_meta_fake(monkeypatch):

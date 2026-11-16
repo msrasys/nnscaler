@@ -233,43 +233,6 @@ def test_meta_module_shard_init(tmp_path):
     assert not list(tmp_path.rglob('npbuffer.pt'))
 
 
-_EXTERNAL_TABLE = torch.arange(4.0)   # created outside any constructor capture
-
-
-class DataDependentInitModule(LocalInitModule):
-    def __init__(self):
-        super().__init__()
-        # a tensor that already exists stays real under DeferredInitialization: the module mixes meta and cpu
-        self.register_buffer('table', _EXTERNAL_TABLE)
-
-    def forward(self, x):
-        # reads a buffer value: with a captured constructor the replay materializes `transposed`
-        count = int((self.transposed > 10).sum().item())
-        return self.linear(x).sum() * count + self.scalar + self.table.sum()
-
-
-
-
-@patch('torch.cuda.is_available', lambda: False)
-@replace_all_device_with('cpu', force=True)
-def test_meta_module_replays_parameters_from_capture(tmp_path, caplog):
-    config = ComputeConfig(1, 1, param_init_strategy='shard', trace_strategy='meta:cpu')
-    with mock_cube_env(0, 1), mock_dist(0, 1), patch('torch.distributed.barrier'), \
-            patch('torch.distributed.broadcast_object_list'), \
-            caplog.at_level(logging.WARNING, logger='nnscaler.graph.tracer.trace_strategy'):
-        generated = parallelize(
-            DataDependentInitModule, {'x': torch.ones(2, 4)}, 'dp', config,
-            gen_savedir=tmp_path, build_module_buckets=False,
-        )
-        model = generated(build_buckets=False)
-    # `.item()` on the captured buffer was replayed from the materialized value, not rejected
-    assert "`item` needs tensor data" in caplog.text
-    expected = DataDependentInitModule()
-    for name, meta in model.fullmap.items():
-        if meta.orig_name in ('transposed', 'table'):
-            assert torch.equal(getattr(model, name), getattr(expected, meta.orig_name)[meta.slicers])
-
-
 @patch('torch.cuda.is_available', lambda: False)
 @replace_all_device_with('cpu', force=True)
 @pytest.mark.parametrize('param_init_strategy, trace_strategy', [('shard', 'meta'), ('shard', 'cpu')])

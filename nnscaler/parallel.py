@@ -38,7 +38,7 @@ from nnscaler.graph.function.wrapnn import convert_to_wrapnn, wrapnn
 from nnscaler.graph.gener.gen import IRAdapterGener
 from nnscaler.graph.parser import FxModuleParser
 from nnscaler.graph.tracer.trace_strategy import (
-    has_meta_tensors, place_real_tensors_to_cpu, attach_meta_materializer, parse_trace_strategy,
+    has_meta_tensors, place_real_tensors_to_cpu, parse_trace_strategy,
 )
 from nnscaler.graph.schedule.predefined import PredefinedSched
 from nnscaler.graph.schedule.schedplan import SchedulePlan
@@ -125,9 +125,8 @@ class ComputeConfig:
     # whether to fold constant when generating code
     constant_folding: bool = False
 
-    # how to execute the functions during trace: 'name' or 'name:option'.
-    # Only 'meta' takes an option: 'meta:cpu' / 'meta:cuda' replay the inputs of data-dependent
-    # operators on that device; 'meta' and 'meta:no' raise for them.
+    # how to execute the functions during trace: 'name' or 'name:option' (no strategy takes an option yet;
+    # 'meta:no' is accepted as a spelling of 'meta').
     # 'meta' requires param_init_strategy='shard': the model is not materialized at compile time.
     trace_strategy: str = 'cuda_run_cpu_offload'
 
@@ -301,12 +300,12 @@ class ComputeConfig:
 
     @property
     def trace_strategy_name(self) -> str:
-        """The strategy part of ``trace_strategy`` (``'meta'`` for ``'meta:cpu'``)."""
+        """The strategy part of ``trace_strategy`` (``'meta'`` for ``'meta:no'``)."""
         return self.trace_strategy.partition(':')[0]
 
     @property
     def trace_strategy_option(self) -> str:
-        """The option part of ``trace_strategy`` (``'cpu'`` for ``'meta:cpu'``, ``''`` when absent)."""
+        """The option part of ``trace_strategy`` (``'no'`` for ``'meta:no'``, ``''`` when absent)."""
         return self.trace_strategy.partition(':')[2]
 
     def apply_pipeline_scheduler(
@@ -1042,13 +1041,11 @@ def _gencode(
                     # so the concrete values are not needed here. The capture replays the few constructor
                     # operations that need real data on cpu, the device the tracing stage constructs on,
                     # so compilation works without a GPU.
-                    with DeferredInitialization(device='cpu') as capture:
+                    with DeferredInitialization(device='cpu'):
                         module = create_init_module(
                             module_or_module_class, module_fn, module_dtype,
                             seed=compute_config.param_init_seed,
                         )
-                    # data-dependent operators in forward may replay and need parameter values
-                    attach_meta_materializer(module, capture.materialize)
                 else:
                     module = create_init_module(
                         module_or_module_class, module_fn, module_dtype,
@@ -1066,8 +1063,7 @@ def _gencode(
 
         if has_meta_tensors(module):
             if not is_module_class:
-                # a supplied instance is the weight source at runtime and may be read by the replay of
-                # data-dependent operators; a meta instance has no values for either
+                # a supplied instance is the weight source at runtime; a meta instance has no values
                 raise ValueError(
                     "A module instance on the meta device has no weight values. Pass the module class "
                     "(or module_fn) so it is constructed under capture, or an instance with real weights."
