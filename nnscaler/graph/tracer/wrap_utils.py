@@ -185,6 +185,20 @@ default_autowrap_leaf_class: Dict[Type, LeafWrapInfo] = {
 wrapped_cls_to_orig_cls: Dict[Type, Type] = {}
 
 
+def unwrap(obj: Any) -> Any:
+    """
+    The original function or class behind a tracer wrapper; ``obj`` itself when it is not wrapped.
+
+    A class wrapper (`create_wrapped_leaf_class`, `map`, `range`, ...) keeps its original in `_fx_wrapped_ori_clz`,
+    a function wrapper (`create_wrapped_leaf_func`) in `_fx_wrapped_ori_fn`.
+    Not `inspect.unwrap`: it would also strip decorators the original itself carries,
+    returning an object different from the one registered as a leaf.
+    """
+    orig = orig_func.getattr(obj, '_fx_wrapped_ori_clz', None) \
+        or orig_func.getattr(obj, '_fx_wrapped_ori_fn', None)
+    return obj if orig is None else orig
+
+
 def create_wrapped_leaf_func(func: Callable, *, replace_func: Optional[Callable]=None, default_tracer: Optional['ConcreteTracer']=None,
                              is_method: bool=False, method_name: Optional[str]=None, replace_traced_code: bool = True):
     """
@@ -242,6 +256,9 @@ def create_wrapped_leaf_func(func: Callable, *, replace_func: Optional[Callable]
                         node_target=replace_func if replace_traced_code else func
                     )
 
+    # The original behind this wrapper, see `unwrap`. An attribute rather than `__wrapped__`:
+    # `functools.wraps` also sets `__wrapped__` on decorators the original may already carry.
+    func_wrapper._fx_wrapped_ori_fn = func
     return func_wrapper
 
 

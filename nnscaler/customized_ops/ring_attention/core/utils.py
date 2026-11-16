@@ -95,6 +95,36 @@ def get_arg_by_name(func, name, default, *args, **kwargs):
     return bound.arguments.get(name, default)
 
 
+def fake_attention_fn(wrapper):
+    """
+    Build the tracing ``fake_fn`` of an attention wrapper.
+
+    The wrappers launch FlashAttention kernels and, when ``max_seqlen`` is not given, read
+    ``cu_seqlens`` values; neither works on meta tensors (``trace_strategy='meta'``) or
+    without the kernels installed. The fake only reproduces the output metadata:
+    ``[..., query_heads, value_dim]`` in q's dtype, plus a float32 ``[query_heads, total_q]``
+    softmax log-sum-exp when ``return_lse`` is set. The real wrappers return both from an
+    ``autograd.Function``, so both require grad whenever q, k or v does; zero-valued terms of
+    q, k and v give the fake the same dependencies without allocating differentiable leaves.
+    Arguments are bound against the wrapper's own signature, so positional and keyword calls
+    resolve ``return_lse`` identically.
+    """
+    signature = inspect.signature(wrapper)
+
+    def fake(*args, **kwargs):
+        arguments = signature.bind(*args, **kwargs).arguments
+        q, k, v = arguments['q'], arguments['k'], arguments['v']
+        zero = (q.sum() + k.sum() + v.sum()) * 0
+        output = zero.to(q.dtype).expand(*q.shape[:-1], v.shape[-1]).clone()
+        if not arguments.get('return_lse', False):
+            return output
+        lse = zero.float().expand(q.shape[-2], q.shape[0]).clone()
+        return output, lse
+
+    fake.__name__ = fake.__qualname__ = f'fake_{wrapper.__name__}'
+    return fake
+
+
 def call_flash_attn_cute_varlen_func(func, *args, return_lse=False, **kwargs):
     """Call flash_attn.cute varlen attention with version-compatible LSE handling.
 

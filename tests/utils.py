@@ -150,8 +150,17 @@ def replace_all_device_with(device='cpu', force=False):
     def patch_tensor_constructor(fn):
         orig_func = getattr(fn, '__cube_orig_func__', fn)  # to support nested patching
         def wrapper(*args, **kwargs):
+            """
+            The main reason for this device-redirection is: `meta` device has higher priority than any devices
+            So if meta is requested here, we will preserve it and not override with the target device.
+            """
             # Meta kernels can call Python factories internally; keep those allocations symbolic.
-            if kwargs.get("device") is None or torch.device(kwargs["device"]).type != 'meta':
+            requested = kwargs.get("device")
+            if requested is None:
+                # `new_*` / `*_like` default to the source tensor's device: a meta source stays meta
+                if not (args and isinstance(args[0], torch.Tensor) and args[0].is_meta):
+                    kwargs["device"] = device
+            elif torch.device(requested).type != 'meta':
                 kwargs["device"] = device
             return orig_func(*args, **kwargs)
         wrapper.__name__ = orig_func.__name__
@@ -194,10 +203,14 @@ def replace_all_device_with(device='cpu', force=False):
     def patched_to(self, *args, **kwargs):
         if device == 'meta':
             return self
+        # explicit meta requests stay meta, as in the dispatch-level replacement above
         if len(args) > 0 and isinstance(args[0], (torch.device, str)):
+            if torch.device(args[0]).type == 'meta':
+                return orig_to(self, *args, **kwargs)
             return orig_to(self, device, *args[1:], **kwargs)
         if 'device' in kwargs:
-            kwargs['device'] = device
+            if torch.device(kwargs['device']).type != 'meta':
+                kwargs['device'] = device
             return orig_to(self, *args, **kwargs)
         return orig_to(self, *args, **kwargs)
 

@@ -1274,7 +1274,7 @@ class ComputeConfig:
     runtime_ngpus: Optional[int] = None
 
     constant_folding: bool = False
-    trace_strategy: Literal['cpu', 'cuda', 'meta', 'cuda_run_cpu_offload', 'reuse_cache'] = 'cuda_run_cpu_offload'
+    trace_strategy: str = 'cuda_run_cpu_offload'
 
     use_zero: int = 0
     zero_ngroups: int = 1
@@ -1319,7 +1319,8 @@ We can categorize the fields into 4 categories:
       correspond to a same computation graph. Errors may be raised at
       runtime when this assumption is broken.
 
-    - `trace_strategy`: how to execute the functions during trace. Five
+    - `trace_strategy`: how to execute the functions during trace, given
+      as `name` or `name:option`; only `meta` takes an option for now. Five
       strategies are supported:
 
       1.  `cpu`: Execute all functions on cpu device, model weights and
@@ -1328,8 +1329,22 @@ We can categorize the fields into 4 categories:
           and intermediate results are on cuda device. This strategy is
           recommended if the model can inference on single gpu.
       3.  `meta`: Execute all functions on meta device, model weights
-          are on cpu and intermediate results are on meta device. For
-          more information about meta device type, please view
+          are on cpu and intermediate results are on meta device. Requires
+          `param_init_strategy='shard'`: a module class is then constructed
+          symbolically and traced on meta without materializing weights;
+          a supplied model instance must carry real weights.
+          Operations that read tensor
+          values (`.item()`, `bool(tensor)`, `nonzero`, ...) cannot run
+          on meta. `meta` (same as `meta:no`) raises an error for them.
+          `meta:cpu` or `meta:cuda` instead replays the traced operators
+          they depend on with the dummy inputs on that device (a warning
+          names the operator and the number of replayed nodes), so the
+          branch and shapes follow the dummy inputs as with `cpu`.
+          To avoid the replay or force a shape, give the operator a stand-in result
+          with `trace_fake(fn, fake, *args)` at the call site, or a stand-in
+          function with `update_op(..., fake_fn=...)` / `register_op(..., fake_fn=...)`
+          (see [Register Custom Operators](register_custom_op.md)).
+          For more information about meta device type, please view
           <https://pytorch.org/docs/stable/meta.html>.
       4.  `cuda_run_cpu_offload`: Try to execute all functions on cuda,
           and retry to execute the function on cpu as backup if OOM is

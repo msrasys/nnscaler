@@ -9,7 +9,7 @@ import torch.distributed
 from nnscaler.graph.parser.register import register_op
 from nnscaler.ir.operator import IRFwOperation
 from .core.zigzag_attn_implementation import ZigZagRingFlashAttnFunc
-from .core.utils import gen_head_anno
+from .core.utils import gen_head_anno, fake_attention_fn
 from flash_attn import flash_attn_func
 
 import torch.distributed as dist
@@ -115,4 +115,4 @@ def flash_attention_anno(query_states, key_states, value_states, *args, **kwargs
     return f'b l {q_anno} hd^, b l {kv_anno} hd^, b l {kv_anno} vd^ -> b l {q_anno} vd^'
 
 
-register_op(flash_attention_anno, emit_fn=emit_zigzag)(wrap_zigzag_attn_func)
+register_op(flash_attention_anno, emit_fn=emit_zigzag, fake_fn=fake_attention_fn(wrap_zigzag_attn_func))(wrap_zigzag_attn_func)

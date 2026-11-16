@@ -7,7 +7,7 @@ from torch import Tensor
 from nnscaler.graph.parser.register import register_op
 from nnscaler.ir.operator import IRFwOperation
 from .core.ring_attn_implementation import RingFlashAttnFunc
-from .core.utils import gen_head_anno 
+from .core.utils import gen_head_anno, fake_attention_fn
 from flash_attn import flash_attn_func
 
 from nnscaler.runtime.device import DeviceGroup
@@ -111,4 +111,4 @@ def flash_attention_anno(query_states, key_states, value_states, *args, **kwargs
     return f'b l {q_anno} hd^, b l {kv_anno} hd^, b l {kv_anno} vd^ -> b l {q_anno} vd^'
 
 
-register_op(flash_attention_anno, emit_fn=emit_ring)(wrap_ring_attn_func)
+register_op(flash_attention_anno, emit_fn=emit_ring, fake_fn=fake_attention_fn(wrap_ring_attn_func))(wrap_ring_attn_func)
