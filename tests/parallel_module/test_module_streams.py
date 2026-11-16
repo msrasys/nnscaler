@@ -93,6 +93,32 @@ def test_environment_rules_are_frozen_into_cache_config(monkeypatch):
     assert not ComputeConfig(1, 1).module_streams
 
 
+@replace_all_device_with('cpu', force=True)
+def test_async_copy_operators_without_module_streams(tmp_path, monkeypatch):
+    baseline = ComputeConfig(1, 1)
+    monkeypatch.setenv('NNSCALER_ASYNC_COPY_OPS', '["torch.sin"]')
+    enabled = ComputeConfig(1, 1)
+    assert enabled.async_copy_ops == ('torch.sin',)
+    assert baseline.graph_config == enabled.graph_config
+    assert not ComputeConfig.safe_equals(baseline, enabled)
+    model = ForkModel()
+    reference = copy.deepcopy(model)
+    parallelize(model, {'x': torch.randn(4, 8)}, 'dp', enabled,
+                gen_savedir=tmp_path, instance_name='async_only', load_module=False)
+    code = next(tmp_path.rglob('gencode0.py')).read_text()
+    assert code.count('with nnscaler.runtime.stream.AsyncTensorCopies():') == 1
+    assert 'with nnscaler.runtime.stream.ModuleStreams()' not in code
+    cls = _load_parallel_module_class(ForkModel, gen_savedir=tmp_path, instance_name='async_only', rank=0)
+    generated = new_empty(cls, device='cpu', init_params=True)
+    x = torch.randn(4, 8, requires_grad=True)
+    ref_x = x.detach().clone().requires_grad_()
+    actual, expected = generated(x), reference(ref_x)
+    torch.testing.assert_close(actual, expected)
+    actual.sum().backward()
+    expected.sum().backward()
+    torch.testing.assert_close(x.grad, ref_x.grad)
+
+
 def test_stream_codegen_version_invalidates_old_packages():
     current = ComputeConfig(1, 1, module_streams=(RULE,))
     old_rule = copy.deepcopy(RULE)
@@ -237,7 +263,8 @@ def test_repeated_invocations_preserve_outputs_and_gradients(tmp_path, monkeypat
 
 
 @pytest.mark.parametrize('kwargs', [dict(stream='default'), dict(split_before='down'),
-                                    dict(module=''), dict(resume_before='torch.cos')])
+                                    dict(module=''), dict(resume_before='torch.cos'),
+                                    dict(recompute_only=True, launch_before='torch.sin')])
 def test_invalid_rules(kwargs):
     with pytest.raises(ValueError):
         ModuleStreamRule(**(dict(module='side') | kwargs))
@@ -362,3 +389,13 @@ def test_recompute_only_rule_keeps_forward_on_caller(tmp_path):
     expected.sum().backward()
     for name, parameter in generated.named_parameters():
         torch.testing.assert_close(parameter.grad, reference.get_parameter(generated.fullmap[name].orig_name).grad)
+
+
+@replace_all_device_with('cpu', force=True)
+def test_recompute_stream_rejects_part_of_a_checkpoint(tmp_path):
+    rule = ModuleStreamRule('side.up', recompute_only=True)
+    with pytest.raises(RuntimeError, match='Code generation failed') as error:
+        parallelize(ForkModel(), {'x': torch.randn(4, 8)}, recompute_side_policy,
+                    ComputeConfig(1, 1, module_streams=(rule,)),
+                    gen_savedir=tmp_path, load_module=False)
+    assert 'whole checkpoint region' in str(error.value.__cause__)

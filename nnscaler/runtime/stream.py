@@ -51,6 +51,24 @@ def parameter_uses_module_stream(param):
     return entry is not None and entry[0]() is param
 
 
+def hold_owners_through_backward(owners, streams):
+    """Keep opaque storage through the graph task and its queued CUDA work."""
+    owners, streams = tuple(owners), tuple(streams)
+    if not owners:
+        return
+
+    def after_backward():
+        holds = []
+        for stream in streams:
+            event = torch.cuda.Event()
+            event.record(stream)
+            holds.append((event, owners))
+        with _holds_lock:
+            _pending_holds.extend(holds)
+
+    torch.autograd.Variable._execution_engine.queue_callback(after_backward)
+
+
 @contextmanager
 def parameter_gradient_stream(param):
     entry = _parameter_stream_names.get(id(param))
@@ -217,15 +235,7 @@ class ModuleStreams:
             owners, streams = tuple(self.owners), tuple(self.streams)
 
             def on_gradient(gradient):
-                def after_backward():
-                    holds = []
-                    for stream in streams:
-                        event = torch.cuda.Event()
-                        event.record(stream)
-                        holds.append((event, owners))
-                    with _holds_lock:
-                        _pending_holds.extend(holds)
-                torch.autograd.Variable._execution_engine.queue_callback(after_backward)
+                hold_owners_through_backward(owners, streams)
                 return gradient
 
             pending, seen = [outputs], set()

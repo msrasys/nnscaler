@@ -67,6 +67,19 @@ Two additional options address host submission stalls:
 Host submission and CPU metadata snapshots require eager execution of the
 generated functions; they reject CUDA graph capture.
 
+Metadata snapshots can also be enabled independently of module placement, using
+`ComputeConfig.async_copy_ops` or the equivalent environment variable:
+
+```bash
+export NNSCALER_ASYNC_COPY_OPS='["*.nnscaler_moe_dispatch"]'
+```
+
+These operator-signature globs wrap only the selected calls in `AsyncTensorCopies`,
+with the same size, dtype and lifetime rules as `async_anchor_copies`. This is
+useful when the host can submit subsequent work while an asynchronous operator
+finishes, even without an independent forward module. The setting is serialized
+for generated-code reuse and does not change the traced graph.
+
 A `recompute_only=True` rule leaves forward execution in place and runs an
 existing non-reentrant checkpoint's recomputation on the named stream:
 

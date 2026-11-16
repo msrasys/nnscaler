@@ -46,6 +46,7 @@ def main():
         emit(event='setup', configured_steps=trainer.max_train_steps,
              stop_steps=args.steps, profile_step=args.profile_step,
              module_streams=os.environ.get('NNSCALER_MODULE_STREAMS', '[]'),
+             async_copy_ops=os.environ.get('NNSCALER_ASYNC_COPY_OPS', '[]'),
              deepep_config=os.environ.get('NNSCALER_DEEPEP_CONFIG'),
              torch=torch.__version__, entrypoint=str(args.entrypoint.resolve()))
         trainer.max_train_steps = args.steps

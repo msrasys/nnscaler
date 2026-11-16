@@ -10,6 +10,7 @@ import torch
 import numpy as np
 import inspect
 import pickle
+from fnmatch import fnmatchcase
 
 from nnscaler.ir.cten import IRCell, IRTensor
 from nnscaler.ir.tensor import IRFullTensor, IRSubTensor
@@ -1119,7 +1120,8 @@ class ModuleCodeGen(FuncEmission):
         for region in regions.values():
             if region.ready_before is not None:
                 captures.setdefault(region.ready_before, []).append(region.key)
-                if region.async_anchor_copies:
+                if region.async_anchor_copies and not any(
+                        fnmatchcase(region.ready_before.signature, pattern) for pattern in CompileFlag.async_copy_ops):
                     async_copy_nodes.add(region.ready_before)
         # Checkpoints remain whole. Wait before entering a checkpoint if any of
         # its internal operators consume a side-stream result.
@@ -1286,6 +1288,10 @@ class ModuleCodeGen(FuncEmission):
                     node.kwargs['clone_level'] = 1
 
                 code = self.emit_fnode(node, runtime_devid=runtime_devid, plan_ndevs=self.plan_ndevs, runtime_ndevs=self.runtime_ndevs, prefix_attr='self.')
+                if any(fnmatchcase(node.signature, pattern) for pattern in CompileFlag.async_copy_ops):
+                    with Block('with nnscaler.runtime.stream.AsyncTensorCopies():') as copy_scope:
+                        copy_scope.insert_body(code)
+                    code = copy_scope.code
 
                 if not param_inputs or CompileFlag.use_zero <= 1:
                     node_code += code

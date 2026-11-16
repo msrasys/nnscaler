@@ -1,3 +1,6 @@
+import gc
+import weakref
+
 import pytest
 import torch
 from torch.utils.checkpoint import checkpoint
@@ -59,3 +62,53 @@ def test_recompute_overlaps_pending_gradient_and_preserves_gradients():
         x.grad = weight.grad = ref_x.grad = ref_weight.grad = None
     assert len(calls) == 3 and calls[0] != calls[1] == calls[2]
     drain_stream_holds(wait=True)
+
+
+def test_opaque_checkpoint_input_survives_queued_backward():
+    backward_done = torch.cuda.Event()
+    class Owner:
+        def __init__(self):
+            self.tensor = torch.full((1 << 20,), 3., device='cuda')
+
+    class UseOwner(torch.autograd.Function):
+        @staticmethod
+        def forward(ctx, x, owner):
+            ctx.owner = owner
+            ctx.save_for_backward(x)
+            return x * owner.tensor
+
+        @staticmethod
+        def backward(ctx, grad):
+            x, = ctx.saved_tensors  # Trigger the checkpoint recomputation.
+            _get_module_stream(x.device, 'owner_recompute').synchronize()
+            torch.cuda._sleep(1_000_000_000)
+            result = grad * ctx.owner.tensor
+            backward_done.record()
+            ctx.owner = None
+            return result, None
+
+    owner = Owner()
+    reference = weakref.ref(owner)
+    consumer = torch.cuda.Stream()
+    consumer.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(consumer):
+        x = torch.ones_like(owner.tensor, requires_grad=True)
+        # Load the broadcast multiply kernel before introducing the delay.
+        warm = torch.ones((), device='cuda').expand_as(x) * owner.tensor
+        consumer.synchronize()
+        del warm
+        y = checkpoint(UseOwner.apply, x, owner, use_reentrant=False,
+                       context_fn=lambda: contexts('owner_recompute', (x, owner)))
+        drain_stream_holds(wait=True)
+        del owner
+        y.sum().backward()
+        del y
+    gc.collect()
+    drain_stream_holds()
+    assert not backward_done.query()
+    assert reference() is not None
+    torch.cuda.synchronize()
+    torch.testing.assert_close(x.grad, torch.full_like(x, 3.))
+    drain_stream_holds(wait=True)
+    gc.collect()
+    assert reference() is None

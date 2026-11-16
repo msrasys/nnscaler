@@ -70,6 +70,16 @@ def module_stream_rules_from_env():
     return normalize_module_stream_rules(json.loads(os.environ.get('NNSCALER_MODULE_STREAMS', '[]')))
 
 
+def normalize_async_copy_ops(patterns):
+    if not isinstance(patterns, (list, tuple)) or any(not isinstance(p, str) or not p for p in patterns):
+        raise ValueError('async_copy_ops must be a list of nonempty operator signature patterns')
+    return tuple(patterns)
+
+
+def async_copy_ops_from_env():
+    return normalize_async_copy_ops(json.loads(os.environ.get('NNSCALER_ASYNC_COPY_OPS', '[]')))
+
+
 def normalize_module_stream_rules(rules):
     if not isinstance(rules, (list, tuple)):
         raise ValueError('module_streams must be a list of module stream rules')

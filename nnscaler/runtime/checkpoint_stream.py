@@ -13,7 +13,7 @@ from threading import local
 
 import torch
 
-from .stream import _get_module_stream, input_stream_lifetime
+from .stream import _get_module_stream, input_stream_lifetime, hold_owners_through_backward
 
 
 def _tensors(value):
@@ -66,7 +66,8 @@ class _Recompute:
         stack = ExitStack()
         try:
             stack.enter_context(torch.cuda.stream(stream))
-            stack.enter_context(input_stream_lifetime(self.state.inputs, True))
+            owners = stack.enter_context(input_stream_lifetime(self.state.inputs, True))
+            hold_owners_through_backward(owners, (caller, stream))
             stack.enter_context(torch.autograd.graph.saved_tensors_hooks(pack, original_unpack))
         except BaseException:
             stack.close()
