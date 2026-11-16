@@ -175,6 +175,36 @@ class DirectSetitemModel(torch.nn.Module):
         return torch.nonzero(x)                      # consumes the setitem result directly
 
 
+class DetachInplaceModel(torch.nn.Module):
+    def forward(self, x):
+        h = x.clone()
+        h.detach().mul_(0.0)                         # mutation through an alias that is not a view (`_base` is None)
+        return x[(h == 0).nonzero().flatten()].sum()
+
+
+class MultiOutputInplaceModel(torch.nn.Module):
+    def forward(self, x):
+        values, indices = torch.empty(4, device=x.device), torch.empty(4, dtype=torch.long, device=x.device)
+        torch.sort(x, out=(values, indices))         # `out=` with several tensors: all of them are mutated
+        return x[(indices == 3).nonzero().flatten()].sum()
+
+
+class IteratorStateModel(torch.nn.Module):
+    def forward(self, x):
+        total = x.sum() * 0
+        for i in (x > 0).nonzero().flatten():      # `iter` / `next` nodes; `next` advances the iterator
+            total = total + x[int(i)]                # `int(i)` replays `next`, which needs the earlier `next`s
+        return total
+
+
+class UnrelatedInplaceModel(torch.nn.Module):
+    def forward(self, x):
+        other = x.clone()
+        other.add_(1)                                # mutates storage the replay never reads
+        idx = (x > 0).nonzero().flatten()           # replays `x > 0` only: not clone, add_
+        return x[idx].sum() + other.sum()
+
+
 class BufferInplaceModel(torch.nn.Module):
     def __init__(self):
         super().__init__()
@@ -206,7 +236,10 @@ def _trace_signature(model, inputs):
     graph = to_fx_graph(model, inputs)
     def meta(n):
         value = n.meta.get('tensor_meta')
-        return tuple(value.shape) if hasattr(value, 'shape') else value   # python values are stored as they are
+        if hasattr(value, 'shape'):
+            return tuple(value.shape)
+        # python scalars are stored as they are; other objects (an iterator) only by type, their identity differs per trace
+        return value if isinstance(value, (int, float, bool, str, type(None))) else type(value).__name__
     return [(n.op, str(n.target), str(n.args), meta(n)) for n in graph.graph.nodes]
 
 
@@ -217,7 +250,8 @@ def _trace_signature(model, inputs):
 @pytest.mark.parametrize('model_class', [
     ItemModel, BranchOnValueModel, NonzeroModel, ToListModel, InplaceInConeModel, KeywordInplaceModel,
     InputSetitemModel, DataDependentInplaceModel, DirectSetitemModel, BufferInplaceModel, ParameterInConeModel,
-    FunctionInplaceModel, NestedAutogradModel])
+    FunctionInplaceModel, NestedAutogradModel, UnrelatedInplaceModel, DetachInplaceModel, IteratorStateModel,
+    MultiOutputInplaceModel])
 def test_meta_strategy_replays_data_dependent_ops(monkeypatch, model_class, strategy):
     """Data-dependent operators replay their traced inputs on the fallback device, so meta traces the same graph as cpu."""
     inputs = {'x': torch.tensor([0.5, 0.0, -1.0, 2.0])}
@@ -225,6 +259,13 @@ def test_meta_strategy_replays_data_dependent_ops(monkeypatch, model_class, stra
     expected = _trace_signature(model_class(), inputs)
     monkeypatch.setattr(CompileFlag, 'trace_strategy', strategy)
     assert _trace_signature(model_class(), inputs) == expected
+
+
+def test_replay_skips_unobserved_inplace_ops(monkeypatch, caplog):
+    monkeypatch.setattr(CompileFlag, 'trace_strategy', 'meta:cpu')
+    with caplog.at_level(logging.WARNING, logger='nnscaler.graph.tracer.trace_strategy'):
+        to_fx_graph(UnrelatedInplaceModel(), {'x': torch.tensor([0.5, 0.0, -1.0, 2.0])})
+    assert 'replayed 2 traced nodes' in caplog.text                        # x, gt: not clone, add_
 
 
 @pytest.mark.parametrize('strategy', ['meta', 'meta:no'])

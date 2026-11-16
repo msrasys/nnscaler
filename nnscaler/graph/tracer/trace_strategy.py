@@ -71,8 +71,11 @@ _ORIGIN_ATTR = '_nnscaler_meta_origin'
 # and on the meta parameters of a model captured by DeferredInitialization, as a callable materializing them.
 # A tensor that is already meta is returned as is by `_place_tensors_to` and never gets one.
 _SOURCE_ATTR = '_nnscaler_meta_source'
-# node.meta key set on nodes that mutate one of their inputs (detected by output identity, see record_node_outputs)
+# node.meta key set on nodes that mutate one of their inputs (see record_node_outputs).
+# The value is a tuple of the keys (`_object_key`) of the mutated tensor storages or Python objects.
 _INPLACE_META = 'nnscaler_inplace'
+# node.meta key: the keys of every object a node's inputs alias, so replay knows which mutations it observes.
+_READS_META = 'nnscaler_reads'
 # node.meta key holding the fake result given to `trace_fake`; a replay returns it instead of executing the node
 FAKE_META = 'nnscaler_trace_fake'
 
@@ -93,6 +96,17 @@ def _tensor_leaves_with_path(value: Any, path: Tuple[Any, ...] = ()) -> Iterator
     elif isinstance(value, dict):
         for key, item in value.items():
             yield from _tensor_leaves_with_path(item, path + (key,))
+
+
+def _objects_in(value: Any) -> Iterator[Any]:
+    """``value`` and, for list/tuple/dict containers, every object nested in it (the containers included)."""
+    yield value
+    if isinstance(value, (list, tuple)):
+        for item in value:
+            yield from _objects_in(item)
+    elif isinstance(value, dict):
+        for item in value.values():
+            yield from _objects_in(item)
 
 
 def _index_path(value: Any, path: Tuple[Any, ...]) -> Any:
@@ -256,8 +270,8 @@ class BaseTraceStrategy:
         args, kwargs = cls._map_devices_to(args, kwargs, device, first_arg_device=is_tensor and target == 'to')
         return getattr(self_obj, target)(*args, **kwargs)
 
-    def record_node_outputs(self, node: Node, value: Any, inputs: Any) -> None:
-        """Called by the tracer after a node is created, with its concrete result and the executed (args, kwargs)."""
+    def record_node_outputs(self, node: Node, value: Any, args: Tuple[Any, ...], kwargs: Dict[str, Any]) -> None:
+        """Called by the tracer after a node is created, with its concrete result and the executed args/kwargs."""
 
     def concretize(self, tensor: torch.Tensor, *, name: str, cause: BaseException) -> torch.Tensor:
         """Return a tensor with real data for ``tensor``; only the meta strategy produces meta values."""
@@ -424,6 +438,22 @@ class MetaStrategy(BaseTraceStrategy):
         # Replays seed each node from the trace's initial seed and the node's position,
         # so a random tensor gets the same values in every replay that recomputes it.
         self._seed = torch.initial_seed()
+        # real tensor id -> (real tensor, its meta copy). Purpose: `_place_tensors_to` returns the same meta
+        # copy every time the same real tensor is placed, so all operators reading it see one storage.
+        # Replay tells mutation from read by storage identity (`_object_key`): with a fresh copy per operator,
+        # `b.mul_(0)` would mutate one storage and a later `torch.nonzero(b)` read another, and the mutation
+        # would not be replayed. It also sets `_SOURCE_ATTR` / `_ORIGIN_ATTR` once per tensor.
+        # The real tensor is held so its id cannot be reused by another object; the table lives as long as
+        # this strategy, i.e. one trace. Real tensors reach an operator in four ways:
+        #   - the dummy inputs behind the placeholders;
+        #   - parameters, buffers and plain tensor attributes that are not meta: a module instance given to
+        #     `parallelize`, or a tensor that existed before the DeferredInitialization capture
+        #     (a module-level constant table, a tensor from a `module_fn` closure);
+        #   - cpu results of factory calls without a device (`torch.rand(4)`, `torch.arange(n)`), which run on
+        #     cpu like at runtime since only an explicit device is mapped (see `_map_devices_to`);
+        #   - the result given to `trace_fake`.
+        # Replay never adds to it: its values stay local to `_replay` and return to meta via `empty_strided`.
+        self._meta_copies: Dict[int, Tuple[torch.Tensor, torch.Tensor]] = {}
 
     def place_model(self, model: torch.nn.Module) -> torch.nn.Module:
         # Meta tensors stay on meta: they come from a model built on meta or captured by DeferredInitialization,
@@ -437,48 +467,83 @@ class MetaStrategy(BaseTraceStrategy):
         return place_real_tensors_to_cpu(model)
 
     def _place_tensors_to(self, *args, device: str) -> Tuple[Any]:
+        # every caller of this strategy executes on meta; `device` only exists for the base-class signature
+        assert device == 'meta', f'the meta strategy places tensors on meta only, got {device!r}'
+
         def place(x: torch.Tensor) -> torch.Tensor:
-            moved = x.to(device).requires_grad_(x.requires_grad)
-            if device == 'meta' and moved is not x:
+            if x.is_meta:
+                return x
+            entry = self._meta_copies.get(id(x))
+            if entry is None:
+                moved = x.to('meta').requires_grad_(x.requires_grad)
                 # x is the real tensor the meta copy was made from
-                # (if not, `moved` will be the same as `x`)
                 setattr(moved, _SOURCE_ATTR, x)
                 origin = getattr(x, _ORIGIN_ATTR, None)
                 if origin is not None:
                     # A cpu-resident traced value (e.g. `torch.rand(4)` without device) keeps resolving
                     # through its node, so all consumers see the same replayed value.
                     setattr(moved, _ORIGIN_ATTR, origin)
-            return moved
+                entry = self._meta_copies[id(x)] = (x, moved)
+            return entry[1]
 
         return pytree_utils.tree_map_only(torch.Tensor, place, args)
 
-    def record_node_outputs(self, node: Node, value: Any, inputs: Any) -> None:
-        """
-        Two main things are done here:
-        1. Detect if the node mutates their inputs in-place.
-        2. Record the new tensors produced by the node.
+    # Methods that mutate a container receiver (`parts.append(x)` on a traced list); their result does not alias it.
+    _MUTATING_METHODS = frozenset((
+        'append', 'extend', 'insert', 'pop', 'remove', 'clear', 'sort', 'reverse',
+        'update', 'setdefault', 'popitem', 'add', 'discard'))
 
-        Both will be used in replay.
+    @staticmethod
+    def _object_key(obj: Any) -> int:
+        """
+        Identity of what a node reads or mutates through ``obj``.
+        For a tensor it is its storage: every alias (view, `detach()`, `.data`) shares it, so a mutation
+        through one alias is attributed to the storage all of them read. Meta tensors carry no data but do
+        have a storage object, and `_place_tensors_to` gives a real tensor one meta copy for the whole trace,
+        so two reads of the same parameter or buffer share it too.
+        Any other object (an iterator consumed by `next`, a list) is identified by itself.
+        """
+        return obj.untyped_storage()._cdata if isinstance(obj, torch.Tensor) else id(obj)
+
+    def record_node_outputs(self, node: Node, value: Any, args: Tuple[Any, ...], kwargs: Dict[str, Any]) -> None:
+        """
+        Three things are done here, all for replay:
+        1. Record the new tensors produced by the node (their origin).
+        2. Detect if the node mutates one of its inputs in-place, and which storage.
+        3. Record which storages the node reads.
         """
         # Placeholders and attributes resolve through the tracer, not through a node.
         if node.op in ('placeholder', 'get_attr', 'output'):
             return
-        # A node that mutates an input (`add_`, `F.relu(inplace=True)`, `out=`, setitem) must be replayed
-        # even when nothing depends on its output, since other nodes alias the object.
-        # Returning an input alone is not enough (`x.contiguous()` or `x.to(x.dtype)` also do)
-        # and would replay the whole prefix.
-        inplace = node.target in side_effectful_inplace_ops
-        input_ids = {id(t) for _, t in _tensor_leaves_with_path(inputs)}
+        input_ids = {id(t) for _, t in _tensor_leaves_with_path((args, kwargs))}
         for path, tensor in _tensor_leaves_with_path(value):
-            if id(tensor) in input_ids:
-                # Its origin or leaf source stays the place it first appeared, even through an in-place op:
-                # replay resolves the value from there, and the mutation is reproduced by running the node
-                # (marked below) in graph order on that same replayed object, as all its readers alias it.
-                inplace = inplace or self._has_mutating_signature(node)
-            elif not hasattr(tensor, _ORIGIN_ATTR):
+            # An output that is an input keeps its origin or leaf source, even through an in-place op:
+            # replay resolves the value from there, and the mutation is reproduced by running the node
+            # (marked below) in graph order on that same replayed object, as all its readers alias it.
+            if id(tensor) not in input_ids and not hasattr(tensor, _ORIGIN_ATTR):
                 setattr(tensor, _ORIGIN_ATTR, (node, path))
-        if inplace:
-            node.meta[_INPLACE_META] = True
+        # A node that mutates an input must be replayed when a later node reads the mutated object,
+        # even if nothing depends on its output. Which objects it mutates follows from the node's form.
+        mutated: Tuple[Any, ...] = ()
+        if (node.target in side_effectful_inplace_ops
+                or wrap_utils.unwrap(node.target) is builtins.next
+                or (node.op == 'call_method' and node.target in self._MUTATING_METHODS
+                    and not isinstance(args[0], torch.Tensor))):
+            # Case 1: the operator mutates its first operand by definition, tensor or not:
+            # `x += y`, `lst += [v]`, `x[i] = v`, `lst[i] = v` (side_effectful_inplace_ops);
+            # `next(it)` advancing the iterator of a `for` over a traced tensor;
+            # a container method such as `lst.append(v)`.
+            # The result says nothing here: setitem is recorded with the container as result, `append` returns None.
+            mutated = (args[0],)
+        elif self._has_mutating_signature(node):
+            # Case 2: an in-place tensor operator (`add_`, `F.relu(inplace=True)`, `out=`) returns the tensors
+            # it wrote, i.e. some of its inputs; `out=(values, indices)` returns several of them.
+            # Both signs are required: `x.contiguous()` returns its input but has no mutating signature,
+            # and a `_`-suffixed name alone does not prove the result aliases an input.
+            mutated = tuple(t for _, t in _tensor_leaves_with_path(value) if id(t) in input_ids)
+        if mutated:
+            node.meta[_INPLACE_META] = tuple(set(map(self._object_key, mutated)))
+        node.meta[_READS_META] = tuple({self._object_key(o) for o in (*_objects_in(args), *_objects_in(kwargs))})
 
     def run_target(self, kind: str, target: Target, args: Tuple[Any, ...], kwargs: Dict[str, Any],
                    fake: Any = EmptyResult) -> Tuple[Any, Tuple, Dict]:
@@ -560,29 +625,57 @@ class MetaStrategy(BaseTraceStrategy):
         return ((name.endswith('_') and not name.endswith('__'))
                 or 'out' in node.kwargs or bool(node.kwargs.get('inplace', False)))
 
+    def _needed_nodes(self, nodes: List[Node], tensors: List[torch.Tensor]) -> set:
+        """The nodes a replay must execute to obtain ``tensors``; see `_replay`."""
+        position = {node: i for i, node in enumerate(nodes)}
+        inplace = [(node, node.meta[_INPLACE_META]) for node in nodes if _INPLACE_META in node.meta]   # node, mutated keys
+        # object key -> position of the latest needed node reading it;
+        # the operator being resolved comes after every node.
+        # Only the latest reader matters:
+        # an in-place node must run iff some needed node reads the object it mutates after it.
+        latest_reads: Dict[Any, int] = {}
+
+        def record_latest_reads(keys, at: int) -> None:
+            """A needed node at position ``at`` reads the objects ``keys``."""
+            for key in keys:
+                if latest_reads.get(key, -1) < at:
+                    latest_reads[key] = at
+
+        record_latest_reads(map(self._object_key, tensors), len(nodes))
+        needed = set()
+        pending: list[Node] = [getattr(t, _ORIGIN_ATTR)[0] for t in tensors if getattr(t, _ORIGIN_ATTR, None) is not None]
+        while True:
+            # collect node with input dependencies
+            while pending:
+                node = pending.pop()
+                if node in needed:
+                    continue
+                needed.add(node)
+                if FAKE_META in node.meta:   # a faked node is a leaf of the replay
+                    continue
+                pending.extend(node.all_input_nodes)
+                record_latest_reads(node.meta.get(_READS_META, ()), position[node])
+
+            # collect in-place nodes that are needed
+            pending = [node for node, keys in inplace
+                       if node not in needed and any(latest_reads.get(key, -1) > position[node] for key in keys)]
+            if not pending:
+                break
+
+        return needed
+
     def _replay(self, tensors: List[torch.Tensor], name: str) -> List[torch.Tensor]:
         """
         Concrete cpu values of meta ``tensors``.
 
         The traced graph is executed in order from the dummy inputs and parameters.
-        Nodes that are not ancestors of ``tensors`` are skipped unless they have side effects:
-        an in-place node mutates an object other nodes alias, so it and its ancestors always run.
-        Executing in graph order on the cached objects reproduces that aliasing without special cases.
-
-        TODO: fx edges do not record mutation, so every in-place node is included.
-        Only those mutating an object (same origin or leaf source) that a needed node reads
-        later in graph order are actually required.
+        Nodes that are not ancestors of ``tensors`` are skipped, except in-place nodes whose mutation a
+        needed node observes: fx edges do not record mutation, so a node is needed when it mutates a storage
+        (`_object_key`) that a needed node reads later in graph order; its ancestors are then needed too,
+        up to a fixpoint. Executing in graph order on the cached objects reproduces the aliasing itself.
         """
         nodes = list(self.tracer.graph.nodes)
-        needed = set()
-        pending = [node for node in nodes if node.meta.get(_INPLACE_META, False)]
-        pending += [getattr(t, _ORIGIN_ATTR)[0] for t in tensors if getattr(t, _ORIGIN_ATTR, None) is not None]
-        while pending:
-            node = pending.pop()
-            if node not in needed:
-                needed.add(node)
-                if FAKE_META not in node.meta:   # a faked node is a leaf of the replay
-                    pending.extend(node.all_input_nodes)
+        needed = self._needed_nodes(nodes, tensors)
 
         # node -> replayed result, and real tensor -> its single replay copy.
         # Every get_attr node and every placed copy of the same parameter resolve to that one copy,

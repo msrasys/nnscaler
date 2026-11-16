@@ -300,7 +300,7 @@ class ConcreteTracer(TracerBase):
             assert isinstance(kwargs_, dict)
 
         node = self.create_node(kind, node_target or target, args_, kwargs_, name, type_expr, node_result)
-        self.strategy.record_node_outputs(node, node_result, (args_run, kwargs_run))
+        self.strategy.record_node_outputs(node, node_result, args_run, kwargs_run)
         if fake_result is not EmptyResult:
             # see `trace_fake`: the value a meta-trace replay returns for this node instead of executing it
             node.meta[FAKE_META] = fake_result
