@@ -175,6 +175,7 @@ class ModuleCodeGen(FuncEmission):
         self.model_init_statements: List[str] = list()
         # module method bodies for forward computations, e.g. Segments, Adapters.
         self.model_methods_bodies: List[List[str]] = list()
+        self.module_parameter_uses = {}
         # module member name
         self.symbols = SymbolTable()
         # ref module to check shared variables
@@ -613,6 +614,9 @@ class ModuleCodeGen(FuncEmission):
             elif isinstance(node, IRFwOperation):
                 raise RuntimeError(f"Unexcepted global-level op call: {node}")
             elif isinstance(node, IRAdapter):
+                for param in node.iobjs():
+                    if isinstance(param, IRTensor) and param.is_param():
+                        self.module_parameter_uses.setdefault(self.tensor_name(param), set()).add(None)
                 from nnscaler.ir.adapter.prim import MovePrim, CommPrim, ChunkPrim, VChunkPrim
                 has_p2p = any(isinstance(prim, MovePrim) for prim in node.prims)
                 has_other_comm = any(
@@ -675,6 +679,9 @@ class ModuleCodeGen(FuncEmission):
             cb.insert_body(f'nmicros_per_scheduler_step = {graph_sched.nmicros if graph_sched is not None else 1}')
             cb.insert_body(f'use_multi_streams = {self.execplan.use_multi_streams}')
             cb.insert_body(f'cuda_sync_required = {self.execplan.cuda_sync_required}')
+            parameter_streams = {name: next(iter(streams)) for name, streams in self.module_parameter_uses.items()
+                                 if len(streams) == 1 and None not in streams}
+            cb.insert_body(f'module_parameter_streams = {parameter_streams!r}')
 
             if as_parallel_module:
                 cb.insert_body(f'rank = {device}')  # save rank in class level
@@ -1039,14 +1046,15 @@ class ModuleCodeGen(FuncEmission):
             return self._emit_module_streams(segment, runtime_devid)
         return self._emit_segment_nodes(segment, list(segment.nodes()), runtime_devid)
 
-    def _emit_segment_nodes(self, segment, nodes, runtime_devid, lifetime=None):
+    def _emit_segment_nodes(self, segment, nodes, runtime_devid, lifetime=None, *, release_unused=True):
         """Emit ordinary nodes/checkpoints with a caller-provided lifetime plan."""
         lifetime = lifetime or LifeCycle(nodes, segment.inputs(), segment.outputs())
         rc_groups: List[List[IRCell]] = list(
             more_itertools.split_when(nodes, lambda prev, curr: prev.recompute != curr.recompute))
 
         codes: List[str] = []
-        unused_inputs = lifetime.release_tensors_after_line(-1) if nodes and lifetime.get_line(nodes[0]) == 0 else []
+        unused_inputs = (lifetime.release_tensors_after_line(-1)
+                         if release_unused and nodes and lifetime.get_line(nodes[0]) == 0 else [])
         if unused_inputs:
             codes.append(self.emit_release(unused_inputs))
         for rc_group in rc_groups:
@@ -1076,11 +1084,26 @@ class ModuleCodeGen(FuncEmission):
     def _emit_module_streams(self, segment, runtime_devid):
         nodes, regions, joins = plan_module_streams(
             segment.nodes(), segment.oobjs(), CompileFlag.module_streams)
+        node_streams = {node: region.stream for region in regions.values() for node in region.nodes}
+        for node in nodes:
+            for param in node.iobjs():
+                if isinstance(param, IRTensor) and param.is_param():
+                    self.module_parameter_uses.setdefault(self.tensor_name(param), set()).add(node_streams.get(node))
         if not regions:
             return self._emit_segment_nodes(segment, nodes, runtime_devid)
+        # Schedule emission shares this execution plan. Its executor calls must
+        # retain opaque inputs through backward when intra-segment streams exist.
+        self.execplan.use_multi_streams = True
         lifetime = LifeCycle(nodes, segment.inputs(), segment.outputs())
         starts = {region.nodes[0]: region for region in regions.values()}
         owners = {node: region for region in regions.values() for node in region.nodes}
+        captures = {}
+        async_copy_nodes = set()
+        for region in regions.values():
+            if region.ready_before is not None:
+                captures.setdefault(region.ready_before, []).append(region.key)
+                if region.async_anchor_copies:
+                    async_copy_nodes.add(region.ready_before)
         # Checkpoints remain whole. Wait before entering a checkpoint if any of
         # its internal operators consume a side-stream result.
         rc_start = {}
@@ -1096,26 +1119,80 @@ class ModuleCodeGen(FuncEmission):
             return '(' + ', '.join(self.tensor_name(t, prefix_attr='self.') for t in objects) + (',' if objects else '') + ')'
 
         body, pending = [], []
+        unused = lifetime.release_tensors_after_line(-1)
+        if unused:
+            body.append(self.emit_release(unused))
+        async_outputs = {obj: region for region in regions.values() if region.host_concurrency
+                         for obj in region.outputs}
+        unresolved = {}
 
         def flush():
             if pending:
-                body.extend(self._emit_segment_nodes(segment, pending, runtime_devid, lifetime))
+                body.extend(self._emit_segment_nodes(segment, pending, runtime_devid, lifetime, release_unused=False))
                 pending.clear()
 
+        def resolve(key):
+            region = unresolved.pop(key)
+            target = f'{names(region.outputs)} = ' if region.outputs else ''
+            body.append(f'{target}_module_streams.resolve({key!r})')
+
         for node in nodes:
+            # Side regions are emitted as whole functions. Resolve their inputs
+            # at submission, and resolve caller inputs at their first use.
+            if node in owners and node not in starts:
+                continue
+            inputs = starts[node].inputs if node in starts else node.iobjs()
+            needed = list(dict.fromkeys([
+                *[key for key in waits.get(node, ()) if key in unresolved],
+                *[async_outputs[obj].key for obj in inputs
+                  if obj in async_outputs and async_outputs[obj].key in unresolved],
+            ]))
+            if needed:
+                flush()
+                for key in needed:
+                    resolve(key)
+            if node in captures:
+                flush()
+                body.extend(f'_module_streams.capture({key!r})' for key in captures[node])
             if node in waits:
                 flush()
                 body.extend(f'_module_streams.join({key!r})' for key in waits[node])
             if node in starts:
                 flush()
                 region = starts[node]
-                with Block(f'with _module_streams.fork({region.key!r}, {region.stream!r}, {names(region.inputs)}):') as block:
-                    block.insert_body(self._emit_segment_nodes(segment, region.nodes, runtime_devid, lifetime))
+                if region.host_concurrency:
+                    inputs = [obj for obj in region.inputs if not obj.is_attr()]
+                    function = f'_{region.key}'
+                    with FunctionBlock(function, [self.tensor_name(obj) for obj in inputs], False) as block:
+                        block.insert_body(self._emit_segment_nodes(
+                            segment, region.nodes, runtime_devid, lifetime, release_unused=False))
+                        block.insert_body(f'return {names(region.outputs)}')
+                    body.extend(block.code)
+                    body.append(f'_module_streams.submit({region.key!r}, {region.stream!r}, '
+                                f'{function}, {names(inputs)}, {names(region.inputs)})')
+                    unresolved[region.key] = region
+                    # The queued task owns these inputs until submission ends.
+                    last = lifetime.get_line(region.nodes[-1]) + 1
+                    expired = [obj for obj in inputs if lifetime.releasable_after_line(obj, last)]
+                    if expired:
+                        body.append(self.emit_release(expired))
+                else:
+                    with Block(f'with _module_streams.fork({region.key!r}, {region.stream!r}, {names(region.inputs)}):') as block:
+                        block.insert_body(self._emit_segment_nodes(
+                            segment, region.nodes, runtime_devid, lifetime, release_unused=False))
+                    body.extend(block.code)
+                    body.append(f'_module_streams.publish({names(region.outputs)})')
+            elif node in async_copy_nodes:
+                flush()
+                with Block('with nnscaler.runtime.stream.AsyncTensorCopies():') as block:
+                    block.insert_body(self._emit_segment_nodes(
+                        segment, [node], runtime_devid, lifetime, release_unused=False))
                 body.extend(block.code)
-                body.append(f'_module_streams.publish({names(region.outputs)})')
             elif node not in owners:
                 pending.append(node)
         flush()
+        for key in list(unresolved):
+            resolve(key)
         with Block('with nnscaler.runtime.stream.ModuleStreams() as _module_streams:') as block:
             block.insert_body(body)
         _logger.info('Emitted %d module stream regions for segment %s', len(regions), segment.cid)
@@ -1405,6 +1482,7 @@ class ModuleCodeGen(FuncEmission):
         self.model_init_statements: List[str] = list()
         # module forward code
         self.model_methods_bodies: List[List[str]] = list()
+        self.module_parameter_uses = {}
         # module member name
         self.symbols = SymbolTable()
         # batch size

@@ -7,10 +7,12 @@ from dataclasses import dataclass, replace
 import math
 import logging
 import weakref
+from threading import Lock
 import torch
 from torch.utils.hooks import RemovableHandle
 
 from nnscaler.runtime.device import DeviceGroup
+from nnscaler.runtime.stream import has_module_streams, parameter_gradient_stream
 from nnscaler.runtime.utils import split_array_min_max, set_fparam_meta, get_grad_dtype, set_grad_dtype
 from nnscaler.profiler.timer import CudaTimer
 from nnscaler.flags import RuntimeFlag
@@ -22,6 +24,7 @@ if TYPE_CHECKING:
 
 
 _logger = logging.getLogger(__name__)
+_gradient_submission_lock = Lock()
 
 
 _REDUCER_BUCKET_REFS: Dict[
@@ -391,6 +394,7 @@ class Bucket:
         # function returns None; it consumes this marker and performs the
         # normal reducer completion lifecycle exactly once.
         self._manual_grad_pending: Set[torch.nn.Parameter] = set()
+        self._gradient_write_streams = {}
         self._hooks: List[Tuple[Any, RemovableHandle]] = []
 
         self._async: bool = async_op
@@ -571,6 +575,11 @@ class Bucket:
             rank = torch.distributed.get_rank()
             manually_accumulated = param in self._manual_grad_pending
             self._manual_grad_pending.discard(param)
+            if manually_accumulated:
+                # Returning None for a manually accumulated parameter gives
+                # autograd no gradient tensor on which to infer a stream wait.
+                with _gradient_submission_lock:
+                    self._wait_gradient_writes(param)
             # TODO: need to handle sparse gradients in torch.nn.Embedding
             if param.grad is None:
                 if not manually_accumulated:
@@ -602,7 +611,8 @@ class Bucket:
                 self._contiguous_grads[ofst:ofst+z3_info.numel()]\
                     .add_(output[0:z3_info.end-z3_info.start])
             else:
-                self._contiguous_grads[ofst:ofst+param.numel()].add_(param.grad.data.view(-1))
+                self._add_gradient(param, self._contiguous_grads[ofst:ofst+param.numel()],
+                                   param.grad.data.view(-1))
 
             param.grad = None
 
@@ -629,7 +639,8 @@ class Bucket:
                 param_tmp = param.expand_as(param)
                 param.data = old_param_data
             else:
-                param_tmp = param.expand_as(param)
+                with parameter_gradient_stream(param):
+                    param_tmp = param.expand_as(param)
 
             # gets its AccumulateGrad object
             grad_acc = param_tmp.grad_fn.next_functions[0][0]
@@ -638,6 +649,33 @@ class Bucket:
             self._hooks.append((grad_acc, hook))
 
         torch.cuda.empty_cache()
+
+    def _wait_gradient_writes(self, param):
+        previous = getattr(self, '_gradient_write_streams', {}).get(param)
+        if previous is not None and param.device.type == 'cuda':
+            current = torch.cuda.current_stream(param.device)
+            if current != previous:
+                current.wait_stream(previous)
+
+    def _wait_all_gradient_writes(self):
+        streams = set(getattr(self, '_gradient_write_streams', {}).values())
+        if streams:
+            current = torch.cuda.current_stream(self._contiguous_grads.device)
+            for stream in streams:
+                if current != stream:
+                    current.wait_stream(stream)
+
+    def _add_gradient(self, param, destination, gradient):
+        if param.device.type != 'cuda' or not has_module_streams():
+            destination.add_(gradient)
+            return
+        # Manual slice accumulation bypasses AccumulateGrad's serialization.
+        # Order writes to the same parameter, while unrelated parameter slices
+        # in a shared bucket remain free to execute concurrently.
+        with _gradient_submission_lock:
+            self._wait_gradient_writes(param)
+            destination.add_(gradient)
+            self._gradient_write_streams[param] = torch.cuda.current_stream(param.device)
 
     @torch.no_grad()
     def accumulate_grad(
@@ -673,7 +711,7 @@ class Bucket:
         self._validate_async_contribution(param)
         ofst = self._pofset[param]
         if not self._z3:
-            self._contiguous_grads[ofst + offset:ofst + end].add_(grad)
+            self._add_gradient(param, self._contiguous_grads[ofst + offset:ofst + end], grad)
             return
 
         # ZeRO-3 normally reduce-scatters a complete ``param.grad`` in the
@@ -758,6 +796,7 @@ class Bucket:
         self._apply_post_hooks()
 
     def _sync_contiguous_grads(self):
+        self._wait_all_gradient_writes()
         CudaTimer().start('comm', predefined=True)
         # apply pre-hooks
         self._apply_pre_hooks()
@@ -808,6 +847,7 @@ class Bucket:
     def _launch_async_reduce(self):
         if self._async_handle is not None:
             raise RuntimeError("Async reducer tried to launch gradient synchronization more than once.")
+        self._wait_all_gradient_writes()
         # apply pre hooks
         self._apply_pre_hooks()
         # communication
@@ -913,6 +953,7 @@ class Bucket:
         self._async_handle = None
         self._async_seen_param_cnt = {p: 0 for p in self._params}
         self._manual_grad_pending.clear()
+        self._gradient_write_streams.clear()
 
     def sleep(self):
         """
@@ -937,6 +978,7 @@ class Bucket:
         # https://github.com/pytorch/pytorch/blob/38a492d40d7ebb2856cb120df337c6cdac244528/torch/csrc/autograd/variable.cpp#L473
         # To make the resuming process safe, re-register them here.
         self._hooks = []
+        self._gradient_write_streams = {}
         for param in self._params:
             _register_reducer_bucket(param, self)
         self.register_hooks()
@@ -977,6 +1019,7 @@ class Bucket:
         state.pop(fields._pre_hooks, None)
         state.pop(fields._post_hooks, None)
         state.pop(fields._manual_grad_pending, None)
+        state.pop(fields._gradient_write_streams, None)
 
         # remove reducer reference
         state.pop(fields._reducer, None)
@@ -992,6 +1035,7 @@ class Bucket:
         bucket.__dict__.update(state)
         bucket._reducer = reducer
         bucket._manual_grad_pending = set()
+        bucket._gradient_write_streams = {}
         set_fparam_meta(bucket._param_for_optimizer, bucket._flatten_param_info)
 
         for param in bucket._params:

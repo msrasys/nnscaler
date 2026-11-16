@@ -7,8 +7,11 @@ from contextlib import contextmanager
 from collections import OrderedDict
 from enum import Enum
 from threading import Lock
+from concurrent.futures import ThreadPoolExecutor
+import weakref
 
 import torch
+from torch.utils._python_dispatch import TorchDispatchMode
 
 
 _pending_holds = []
@@ -16,6 +19,77 @@ _holds_lock = Lock()
 _SCALARS = (type(None), bool, int, float, complex, str, bytes, torch.dtype, torch.device)
 _module_streams = {}
 _module_streams_lock = Lock()
+_module_workers = {}
+_parameter_stream_names = {}
+
+
+def has_module_streams():
+    """Whether this process has used opt-in intra-module streams."""
+    return bool(_module_streams)
+
+
+def _get_module_stream(device, name):
+    with _module_streams_lock:
+        key = (device, name)
+        if key not in _module_streams:
+            _module_streams[key] = torch.cuda.Stream(device=device)
+        return _module_streams[key]
+
+
+def register_parameter_stream(param, name):
+    """Set compiler-proven stream affinity without mutating parameter objects."""
+    identity = id(param)
+    def remove(reference):
+        entry = _parameter_stream_names.get(identity)
+        if entry is not None and entry[0] is reference:
+            _parameter_stream_names.pop(identity, None)
+    _parameter_stream_names[identity] = (weakref.ref(param, remove), name)
+
+
+@contextmanager
+def parameter_gradient_stream(param):
+    entry = _parameter_stream_names.get(id(param))
+    if param.device.type != 'cuda' or entry is None or entry[0]() is not param:
+        yield
+    else:
+        # Creating AccumulateGrad on the forward stream avoids a return to the
+        # default stream for every parameter. Never reset an existing graph.
+        with torch.cuda.stream(_get_module_stream(param.device, entry[1])):
+            yield
+
+
+class AsyncTensorCopies(TorchDispatchMode):
+    """Make small CPU metadata copies inside an async anchor nonblocking.
+
+    Snapshot pageable sources into pinned storage before enqueuing the copy.
+    PyTorch's pinned allocator keeps that storage alive until CUDA consumes it.
+    Large transfers and differentiable CPU tensors keep their original behavior.
+    """
+
+    def __init__(self, max_bytes=4096):
+        super().__init__()
+        if type(max_bytes) is not int or max_bytes <= 0:
+            raise ValueError('max_bytes must be a positive integer')
+        self.max_bytes = max_bytes
+
+    def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+        kwargs = kwargs or {}
+        if func is torch.ops.aten._to_copy.default:
+            source = args[0]
+            destination = kwargs.get('device')
+            if (source.device.type == 'cpu' and destination is not None
+                    and torch.device(destination).type == 'cuda'
+                    and source.layout == torch.strided and not source.requires_grad
+                    and source.numel() * source.element_size() <= self.max_bytes
+                    and not kwargs.get('non_blocking', False)):
+                if torch.cuda.is_current_stream_capturing():
+                    raise RuntimeError('Async metadata snapshots do not support CUDA graph capture')
+                # Clone even pinned inputs: the original synchronous API lets
+                # callers mutate them as soon as to() returns.
+                staged = torch.empty_like(source, device='cpu', pin_memory=True)
+                staged.copy_(source)
+                return func(staged, *args[1:], **(kwargs | {'non_blocking': True}))
+        return func(*args, **kwargs)
 
 
 class ModuleStreams:
@@ -30,19 +104,71 @@ class ModuleStreams:
     def __enter__(self):
         self.caller = torch.cuda.current_stream()
         self.events = {}
+        self.ready = {}
         self.joined = set()
         self.owners = []
+        self.futures = {}
+        self.streams = {self.caller}
         return self
+
+    def capture(self, key):
+        """Snapshot caller readiness before an asynchronous anchor is launched."""
+        event = torch.cuda.Event()
+        event.record(self.caller)
+        self.ready[key] = event
+
+    def submit(self, key, name, function, args, tracked_inputs):
+        """Submit a pure region without waiting for its Python/CUDA launches.
+
+        A single worker per named stream preserves submission order. Snapshot
+        readiness on the caller now; waiting on its stream later in the worker
+        would accidentally include the very communication we want to overlap.
+        """
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError('Host-concurrent module submission does not support CUDA graph capture')
+        if key in self.futures or key in self.events:
+            raise ValueError(f'Duplicate module stream region: {key}')
+        if key not in self.ready:
+            self.capture(key)
+        grad_enabled = torch.is_grad_enabled()
+        inference = torch.is_inference_mode_enabled()
+        if torch.__version__ >= (2, 4, 0):
+            autocast_enabled = torch.is_autocast_enabled('cuda')
+            autocast_dtype = torch.get_autocast_dtype('cuda')
+        else:
+            autocast_enabled = torch.is_autocast_enabled()
+            autocast_dtype = torch.get_autocast_gpu_dtype()
+        autocast_cache = torch.is_autocast_cache_enabled()
+
+        def run():
+            with torch.cuda.device(self.caller.device), torch.inference_mode(inference), \
+                    torch.set_grad_enabled(grad_enabled), torch.autocast(
+                        'cuda', enabled=autocast_enabled, dtype=autocast_dtype, cache_enabled=autocast_cache):
+                with self.fork(key, name, tracked_inputs):
+                    return function(*args)
+
+        with _module_streams_lock:
+            cache_key = (self.caller.device, name)
+            if cache_key not in _module_workers:
+                _module_workers[cache_key] = ThreadPoolExecutor(max_workers=1, thread_name_prefix='nnscaler-module')
+            worker = _module_workers[cache_key]
+        self.futures[key] = worker.submit(run)
+
+    def resolve(self, key):
+        """Wait for host submission, then expose tensors to caller-stream users."""
+        result = self.futures.pop(key).result()
+        self.publish(result)
+        return result
 
     @contextmanager
     def fork(self, key, name, inputs):
         device = self.caller.device
-        with _module_streams_lock:
-            cache_key = (device, name)
-            if cache_key not in _module_streams:
-                _module_streams[cache_key] = torch.cuda.Stream(device=device)
-            stream = _module_streams[cache_key]
-        stream.wait_stream(self.caller)
+        stream = _get_module_stream(device, name)
+        self.streams.add(stream)
+        if key in self.ready:
+            stream.wait_event(self.ready[key])
+        else:
+            stream.wait_stream(self.caller)
         with torch.cuda.stream(stream), input_stream_lifetime(inputs, True) as owners:
             self.owners.extend(owners)
             try:
@@ -57,6 +183,37 @@ class ModuleStreams:
         # protects storage when a later caller-stream consumer outlives Python.
         with input_stream_lifetime(outputs, True) as owners:
             self.owners.extend(owners)
+        if self.owners:
+            # An opaque owner saved by a custom backward can lose its final
+            # Python reference before the queued backward kernels finish. Keep
+            # it through the graph task, then through completion on our streams.
+            # Hooks live on output graph nodes, not persistent parameters.
+            owners, streams = tuple(self.owners), tuple(self.streams)
+
+            def on_gradient(gradient):
+                def after_backward():
+                    holds = []
+                    for stream in streams:
+                        event = torch.cuda.Event()
+                        event.record(stream)
+                        holds.append((event, owners))
+                    with _holds_lock:
+                        _pending_holds.extend(holds)
+                torch.autograd.Variable._execution_engine.queue_callback(after_backward)
+                return gradient
+
+            pending, seen = [outputs], set()
+            while pending:
+                value = pending.pop()
+                if id(value) in seen:
+                    continue
+                seen.add(id(value))
+                if isinstance(value, torch.Tensor) and value.requires_grad:
+                    value.register_hook(on_gradient)
+                elif type(value) in (dict, OrderedDict):
+                    pending.extend(value.values())
+                elif isinstance(value, (list, tuple)):
+                    pending.extend(value)
 
     def join(self, key):
         if key not in self.joined:
@@ -64,12 +221,21 @@ class ModuleStreams:
             self.joined.add(key)
 
     def __exit__(self, exc_type, exc_value, traceback):
-        # Also covers unused outputs and exceptions. Never synchronize the CPU.
+        # Drain outstanding host submissions even when an unrelated node fails.
+        error = None
+        for key in list(self.futures):
+            try:
+                self.resolve(key)
+            except BaseException as failure:
+                error = error or failure
+        # CUDA completion uses events, never a device/stream synchronize.
         for key in self.events:
             self.join(key)
         with input_stream_lifetime(self.owners, True):
             pass
         self.owners.clear()
+        if error is not None and exc_type is None:
+            raise error
 
 
 def drain_stream_holds(*, wait=False):

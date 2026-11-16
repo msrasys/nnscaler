@@ -38,6 +38,35 @@ selected module; the suffix starts before `resume_before`. Omit both split field
 to launch the whole branch. Without a launch anchor, a branch stays in its
 original position and can overlap subsequent independent modules.
 
+For asynchronous operators which enqueue a wait on the caller stream, use
+`launch_after`/`resume_after` instead of the corresponding `before` fields.
+NNScaler records input readiness *before* the anchor, then submits the side
+branch after the anchor's Python call returns. The side stream waits for the
+saved event, avoiding the communication wait that the anchor just inserted on
+the caller. Inputs must already be available before that anchor, or produced
+earlier on the same side stream. This can prevent a short branch from finishing
+before communication is even submitted, and changes the backward enqueue order
+as PyTorch reverses the graph. Profile both launch placements for the workload.
+
+Two additional options address host submission stalls:
+
+- `host_concurrency=True` submits the selected branch on a host worker dedicated
+  to its device/stream. The caller continues immediately and resolves the task
+  at the first consumer. Grad mode, inference mode and CUDA autocast are copied
+  to the worker. Selected operators must be thread-safe as well as pure; custom
+  caches must respect stream dependencies. Python state mutation, arbitrary
+  thread-local modes and RNG-bearing custom operators are outside this contract.
+- `async_anchor_copies=True`, together with `launch_after`, converts synchronous
+  CPU-to-CUDA metadata copies of at most 4096 bytes inside the anchor into pinned
+  asynchronous transfers. Sources are snapshotted before returning, preserving
+  synchronous-copy semantics even if the caller mutates the original CPU tensor.
+  Differentiable CPU tensors and larger transfers retain their original behavior.
+  This prevents small metadata copies from waiting for previously enqueued
+  communication on the caller stream. No model-specific operator is patched.
+
+Host submission and CPU metadata snapshots require eager execution of the
+generated functions; they reject CUDA graph capture.
+
 The compiler checks tensor and object dependencies before moving computation.
 Local layout adapters inserted inside the selected branch move with it, even
 though those synthesized nodes do not carry the original module path.
@@ -51,9 +80,16 @@ custom operators, and unrepresented alias mutations are not safe to reorder.
 Each fork waits on the caller's submitted work. The caller waits on a region's
 completion event only at the first consumer, and drains remaining events when
 leaving the segment. Storage is recorded on consuming streams; opaque owners
-are retained through completion. These operations do not synchronize the host.
+are retained through completion. Stream dependency waits do not synchronize the
+host; host tasks are resolved when their outputs are needed.
 Streams are cached per device and name; completion events are per invocation,
 so pipeline microbatches cannot overwrite another invocation's dependency.
+Parameters used exclusively on one named stream have their reducer gradient
+accumulators created on that stream. Parameters also used by other streams keep
+their ordinary placement. Reducers order cross-stream writes, including custom
+operators which accumulate gradients manually and return `None`, and wait for
+all contributing streams before launching a bucket collective. Opaque owners
+are retained through backward GPU completion via output gradient hooks.
 
 For MoE, launching shared-expert up/gate projections before dispatch and its
 down projection before combine can cover communication with independent GEMMs.

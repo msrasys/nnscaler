@@ -9,7 +9,7 @@ pipeline stages, collectives and checkpoint boundaries retain their order.
 """
 
 from collections import defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from fnmatch import fnmatchcase
 import json
 import os
@@ -28,19 +28,34 @@ class ModuleStreamRule:
     launch_before: str | None = None
     split_before: str | None = None
     resume_before: str | None = None
+    launch_after: str | None = None
+    resume_after: str | None = None
+    host_concurrency: bool = False
+    async_anchor_copies: bool = False
+    # Persist the generated-code ABI, including in pickled configurations.
+    # A default factory leaves old pickles detectably missing the field.
+    _codegen_version: int = field(default_factory=lambda: 3, init=False, repr=False)
 
     def __post_init__(self):
+        if type(self.host_concurrency) is not bool:
+            raise ValueError('host_concurrency must be a boolean')
+        if type(self.async_anchor_copies) is not bool:
+            raise ValueError('async_anchor_copies must be a boolean')
+        if self.async_anchor_copies and not self.launch_after:
+            raise ValueError('async_anchor_copies requires launch_after')
         for name in ('module', 'stream'):
             if not isinstance(getattr(self, name), str) or not getattr(self, name):
                 raise ValueError(f'{name} must be a nonempty string')
-        for name in ('launch_before', 'split_before', 'resume_before'):
+        for name in ('launch_before', 'split_before', 'resume_before', 'launch_after', 'resume_after'):
             value = getattr(self, name)
             if value is not None and (not isinstance(value, str) or not value):
                 raise ValueError(f'{name} must be a nonempty string or None')
         if self.stream == 'default':
             raise ValueError('Module streams must use a distinct, named stream')
-        if (self.split_before is None) != (self.resume_before is None):
-            raise ValueError('split_before and resume_before must be specified together')
+        if self.launch_before and self.launch_after or self.resume_before and self.resume_after:
+            raise ValueError('Use either before or after for each launch anchor')
+        if (self.split_before is None) != (self.resume_before is None and self.resume_after is None):
+            raise ValueError('split_before and a resume anchor must be specified together')
 
 
 def module_stream_rules_from_env():
@@ -51,7 +66,13 @@ def module_stream_rules_from_env():
 def normalize_module_stream_rules(rules):
     if not isinstance(rules, (list, tuple)):
         raise ValueError('module_streams must be a list of module stream rules')
-    return tuple(rule if isinstance(rule, ModuleStreamRule) else ModuleStreamRule(**rule) for rule in rules)
+    def normalize(rule):
+        if isinstance(rule, ModuleStreamRule):
+            return rule
+        values = dict(rule)
+        values.pop('_codegen_version', None)  # asdict/YAML round trips use the current compiler
+        return ModuleStreamRule(**values)
+    return tuple(normalize(rule) for rule in rules)
 
 
 @dataclass
@@ -61,6 +82,9 @@ class ModuleStreamRegion:
     nodes: list
     inputs: tuple
     outputs: tuple
+    ready_before: object = None
+    host_concurrency: bool = False
+    async_anchor_copies: bool = False
 
 
 def _unsafe(node):
@@ -149,8 +173,11 @@ def plan_module_streams(nodes, outputs, rules):
                 chunks = [branch[:split], branch[split:]]
 
             parent, call = scopes[invocation]
-            for chunk, anchor in zip(chunks, (rule.launch_before, rule.resume_before)):
+            anchors = ((rule.launch_before or rule.launch_after, bool(rule.launch_after)),
+                       (rule.resume_before or rule.resume_after, bool(rule.resume_after)))
+            for chunk, (anchor, after) in zip(chunks, anchors):
                 destination = positions[chunk[0]]
+                ready_before = None
                 if anchor:
                     candidates = [n for n in nodes if n not in branch
                                   and fnmatchcase(n.signature, anchor)
@@ -158,7 +185,8 @@ def plan_module_streams(nodes, outputs, rules):
                                   and (call is None or (n.module_call_stack or {}).get(parent) == call)]
                     if len(candidates) != 1:
                         raise ValueError(f'{path}: expected one launch anchor {anchor!r}, found {len(candidates)}')
-                    destination = positions[candidates[0]]
+                    destination = positions[candidates[0]] + int(after)
+                    ready_before = candidates[0] if after else None
                 # Already-available synthesized inputs need not move with the
                 # module. Preserve their original position and other users.
                 chunk = [n for n in chunk if n in original_branch or positions[n] >= destination]
@@ -178,16 +206,19 @@ def plan_module_streams(nodes, outputs, rules):
                 gids = {n.recompute for n in chunk if n.recompute is not None}
                 if any(n.recompute in gids and n not in chunk_set for n in nodes):
                     raise ValueError(f'{path}: module stream split crosses a recompute region')
-                if (destination > 0 and nodes[destination].recompute is not None
+                if (0 < destination < len(nodes) and nodes[destination].recompute is not None
                         and nodes[destination].recompute == nodes[destination - 1].recompute):
                     raise ValueError(f'{path}: launch anchor is inside a recompute region')
+                if ready_before is not None and ready_before.recompute is not None:
+                    raise ValueError(f'{path}: after-launch anchor cannot be inside a recompute region')
                 inputs = tuple(dict.fromkeys(obj for n in chunk for obj in n.iobjs()
                                              if producers.get(obj) not in chunk_set))
                 region_outputs = tuple(dict.fromkeys(obj for n in chunk for obj in n.oobjs()
                                                      if obj in graph_outputs or any(
                                                          c not in chunk_set for c in consumers[obj])))
                 key = f'module_stream_{len(regions)}'
-                region = ModuleStreamRegion(key, rule.stream, chunk, inputs, region_outputs)
+                region = ModuleStreamRegion(key, rule.stream, chunk, inputs, region_outputs,
+                                            ready_before, rule.host_concurrency, rule.async_anchor_copies)
                 regions[key] = region
                 placements[destination].append(region)
                 selected.update(chunk)
@@ -208,6 +239,21 @@ def plan_module_streams(nodes, outputs, rules):
     # A stream join is needed at the first consumer outside each region. Later
     # consumers are ordered by the caller stream; same-stream regions need none.
     owners = {n: r for r in regions.values() for n in r.nodes}
+    for region in regions.values():
+        if region.ready_before is None:
+            continue
+        if region.ready_before in owners:
+            raise ValueError('After-launch anchors must remain on the caller stream')
+        for obj in region.inputs:
+            producer = producers.get(obj)
+            if producer is None:
+                continue
+            owner = owners.get(producer)
+            if owner is not None and owner.stream == region.stream:
+                continue  # same-stream FIFO provides the dependency
+            if owner is not None or new_positions[producer] >= new_positions[region.ready_before]:
+                raise ValueError('After-launch module inputs must be ready before its anchor '
+                                 'or produced earlier on the same module stream')
     joins = defaultdict(list)
     for region in regions.values():
         for node in ordered:
