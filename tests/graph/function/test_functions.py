@@ -321,13 +321,13 @@ def test_GetItem():
 
     # obj is IRObject
     op = F.GetItem(IRObject(value=[3, 4, 5], is_constant=False), IRObject(value=0, is_constant=False), signature='operator.getitem')
-    assert op.outputs()[0].value == 3 and op.outputs()[0].is_constant == True
+    assert op.outputs()[0].value == 3 and op.outputs()[0].is_constant == False
     op = F.GetItem(IRObject(value=[3, 4, 5], is_constant=False), IRObject(value=slice(0, 2, 1), is_constant=False), signature='operator.getitem')
-    assert op.outputs()[0].value == [3, 4] and op.outputs()[0].is_constant == True
+    assert op.outputs()[0].value == [3, 4] and op.outputs()[0].is_constant == False
     op = F.GetItem(IRObject(value=[3, 4, 5], is_constant=False), 0, signature='operator.getitem')
-    assert op.outputs()[0].value == 3 and op.outputs()[0].is_constant == True
+    assert op.outputs()[0].value == 3 and op.outputs()[0].is_constant == False
     op = F.GetItem(IRObject(value=[3, 4, 5], is_constant=False), slice(0, 2, 1), signature='operator.getitem')
-    assert op.outputs()[0].value == [3, 4] and op.outputs()[0].is_constant == True
+    assert op.outputs()[0].value == [3, 4] and op.outputs()[0].is_constant == False
 
     # obj is not a IRObject, index is a IRObject
     op = F.GetItem([1, 2, 3], IRObject(value=0, is_constant=False), signature='operator.getitem')

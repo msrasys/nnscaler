@@ -291,6 +291,26 @@ class ConcreteAttrProxy(ConcreteProxy):
         return self._node
 
     def __call__(self, *args, **kwargs):
+        if self.attr == 'update' and orig_func.type(self.root.value) is orig_func.dict:
+            # dict.update returns None. A standalone call_method node would be
+            # dropped by FX DCE, and the parser would keep only the dictionary's
+            # pre-update metadata (e.g. losing dynamically added attention keys).
+            # Lower it to existing setitem operations, whose writes are retained
+            # and rewritten into SSA by the converter. Preserve update's return
+            # value and keyword-over-positional precedence.
+            if len(args) > 1:
+                raise TypeError(f'update expected at most 1 argument, got {len(args)}')
+            if args:
+                source = args[0]
+                if hasattr(source, 'keys'):
+                    for key in source.keys():
+                        self.root[key] = source[key]
+                else:
+                    for key, value in source:
+                        self.root[key] = value
+            for key, value in kwargs.items():
+                self.root[key] = value
+            return None
         result = self.tracer.create_proxy('call_method', self.attr, (self.root,) + args, kwargs)
         # A direct x.method() call uses x, not the preceding getattr node.
         # Keeping the concrete bound method in that unused node's metadata

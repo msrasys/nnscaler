@@ -2609,8 +2609,13 @@ def GetItem(a: Any, b: Any, signature = None) -> Union[Any, IRPyFunc]:
             out = obj.value[unwrap_index]
         else:
             val = obj.value[unwrap_index]
-            is_constant = not (isinstance(val, IRObject) and not val.is_constant)
-            out = IRObject(name='getitem', value=val, is_constant=is_constant)
+            is_constant = (obj.is_constant and not ir_object_contains_dynamic(index)
+                           and not (isinstance(val, IRObject) and not val.is_constant))
+            # IR.new wraps tensor-free nested containers in IRObject. Avoid
+            # wrapping that object a second time: subsequent indexing/keys
+            # must inspect the container value while retaining its dynamic flag.
+            out = IRObject(name='getitem', value=val.value if isinstance(val, IRObject) else val,
+                           is_constant=is_constant)
         return IRPyFunc(signature, [obj, index], [out])
     # obj is not a IRObject, index is a IRObject
     if any_ir_object_satisfy(index, lambda a: isinstance(a, IRObject)):
