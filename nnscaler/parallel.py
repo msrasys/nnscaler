@@ -43,6 +43,9 @@ from nnscaler.graph.gener.gen import IRAdapterGener
 from nnscaler.graph.parser import FxModuleParser
 from nnscaler.graph.schedule.predefined import PredefinedSched
 from nnscaler.graph.schedule.schedplan import SchedulePlan
+from nnscaler.graph.schedule.module_streams import (
+    ModuleStreamRule, module_stream_rules_from_env, normalize_module_stream_rules,
+)
 
 from nnscaler.ir.cten import IRObject, IRTensor, IR
 from nnscaler.ir.operator import IRBpOperation, IRDataOperation
@@ -170,6 +173,10 @@ class ComputeConfig:
     # This option only works for pipeline.
     use_async_comm: bool = False
 
+    # Independent module branches executed on named CUDA streams. Environment
+    # defaults are resolved here and serialized, so code reuse is configuration safe.
+    module_streams: Tuple[ModuleStreamRule, ...] = field(default_factory=module_stream_rules_from_env)
+
     # whether to use async reducer
     # if True, the gradient all-reduce will be async,
     # This only works when the `use_end2end` is `True` for now.
@@ -218,6 +225,9 @@ class ComputeConfig:
     user_config: Dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self):
+        super().__setattr__('module_streams', normalize_module_stream_rules(self.module_streams))
+        if self.module_streams and self.use_zero > 1:
+            raise ValueError('module_streams currently supports ZeRO 0/1 only')
         if self.plan_ngpus <= 0:
             raise ValueError(f"plan_ngpus {self.plan_ngpus} must be > 0")
         if self.runtime_ngpus is None:
@@ -454,6 +464,7 @@ def _compile_flags(compute_config: ComputeConfig):
         zero_param_level_sharding=compute_config.zero_param_level_sharding,
         reducer_replicated_params=compute_config.reducer_replicated_params,
         use_fbw=compute_config.use_fbw,
+        module_streams=compute_config.module_streams,
     )
 
 

@@ -14,6 +14,62 @@ import torch
 _pending_holds = []
 _holds_lock = Lock()
 _SCALARS = (type(None), bool, int, float, complex, str, bytes, torch.dtype, torch.device)
+_module_streams = {}
+_module_streams_lock = Lock()
+
+
+class ModuleStreams:
+    """Event-scoped module execution used by generated segment code.
+
+    Forks wait only for work submitted before their launch. Joins wait for the
+    particular region's completion event, not subsequent work on its stream.
+    Autograd records the forward streams and schedules backward on those same
+    streams, including its cross-stream dependency synchronization.
+    """
+
+    def __enter__(self):
+        self.caller = torch.cuda.current_stream()
+        self.events = {}
+        self.joined = set()
+        self.owners = []
+        return self
+
+    @contextmanager
+    def fork(self, key, name, inputs):
+        device = self.caller.device
+        with _module_streams_lock:
+            cache_key = (device, name)
+            if cache_key not in _module_streams:
+                _module_streams[cache_key] = torch.cuda.Stream(device=device)
+            stream = _module_streams[cache_key]
+        stream.wait_stream(self.caller)
+        with torch.cuda.stream(stream), input_stream_lifetime(inputs, True) as owners:
+            self.owners.extend(owners)
+            try:
+                yield
+            finally:
+                event = torch.cuda.Event()
+                event.record(stream)
+                self.events[key] = event
+
+    def publish(self, outputs):
+        # record_stream does not read the data or wait for its producer. It
+        # protects storage when a later caller-stream consumer outlives Python.
+        with input_stream_lifetime(outputs, True) as owners:
+            self.owners.extend(owners)
+
+    def join(self, key):
+        if key not in self.joined:
+            self.caller.wait_event(self.events[key])
+            self.joined.add(key)
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        # Also covers unused outputs and exceptions. Never synchronize the CPU.
+        for key in self.events:
+            self.join(key)
+        with input_stream_lifetime(self.owners, True):
+            pass
+        self.owners.clear()
 
 
 def drain_stream_holds(*, wait=False):

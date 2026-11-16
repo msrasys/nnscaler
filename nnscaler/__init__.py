@@ -21,6 +21,7 @@ from .parallel import (
     load_merged_state_dict_from_rank,
 )
 from nnscaler.graph.parser.register import register_op
+from nnscaler.graph.schedule.module_streams import ModuleStreamRule
 from nnscaler.runtime.function.function import (
     anchor,
     constant_folding,

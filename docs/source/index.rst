@@ -122,6 +122,7 @@ For any questions or inquiries, please contact us at nnscaler@service.microsoft.
    :caption: Advanced Usages
 
    parallel_module
+   module_streams
    dimops
    verify_op
 

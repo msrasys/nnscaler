@@ -32,6 +32,7 @@ from nnscaler.codegen.syntax.blocks import ClassBlock, ForBlock, FunctionBlock, 
 from nnscaler.codegen.emit import FuncEmission
 from nnscaler.codegen.module.autograd import AutogradAdapterCodeGen
 from nnscaler.codegen.lifecycle import LifeCycle
+from nnscaler.graph.schedule.module_streams import plan_module_streams
 
 from nnscaler.flags import CompileFlag
 from nnscaler.utils import fields
@@ -140,6 +141,7 @@ class ModuleCodeGen(FuncEmission):
             'import nnscaler', 'import nnscaler.flags',
             'import nnscaler.runtime.function',
             'import nnscaler.runtime.device',
+            'import nnscaler.runtime.stream',
             'import _operator', 'from numpy import inf', 'import builtins', '',
             f'runtime_version = {runtime_version!r}', '', ''
         ]
@@ -1033,13 +1035,18 @@ class ModuleCodeGen(FuncEmission):
         The fields storing intermediate codes that are populated by this method:
         - NONE
         """
-        nodes : List[IRCell] = segment.nodes()
-        lifetime = LifeCycle(nodes, segment.inputs(), segment.outputs())
+        if CompileFlag.module_streams:
+            return self._emit_module_streams(segment, runtime_devid)
+        return self._emit_segment_nodes(segment, list(segment.nodes()), runtime_devid)
+
+    def _emit_segment_nodes(self, segment, nodes, runtime_devid, lifetime=None):
+        """Emit ordinary nodes/checkpoints with a caller-provided lifetime plan."""
+        lifetime = lifetime or LifeCycle(nodes, segment.inputs(), segment.outputs())
         rc_groups: List[List[IRCell]] = list(
             more_itertools.split_when(nodes, lambda prev, curr: prev.recompute != curr.recompute))
 
         codes: List[str] = []
-        unused_inputs = lifetime.release_tensors_after_line(-1)
+        unused_inputs = lifetime.release_tensors_after_line(-1) if nodes and lifetime.get_line(nodes[0]) == 0 else []
         if unused_inputs:
             codes.append(self.emit_release(unused_inputs))
         for rc_group in rc_groups:
@@ -1056,7 +1063,7 @@ class ModuleCodeGen(FuncEmission):
                 # release input tensors after exiting a RC group:
                 last_node = rc_group[-1]
                 line = lifetime.get_line(last_node)
-                if last_node != nodes[-1]: # skip if it is the last node
+                if lifetime.get_line(last_node) != len(lifetime.nodes) - 1:
                     # The checkpoint call has consumed the group's final node
                     # too; its last-use inputs may now leave the outer scope.
                     inputs_to_rel = [t for t in rc_segment.inputs() if lifetime.releasable_after_line(t, line + 1)]
@@ -1065,6 +1072,54 @@ class ModuleCodeGen(FuncEmission):
                         codes.append(del_stmt)
 
         return codes
+
+    def _emit_module_streams(self, segment, runtime_devid):
+        nodes, regions, joins = plan_module_streams(
+            segment.nodes(), segment.oobjs(), CompileFlag.module_streams)
+        if not regions:
+            return self._emit_segment_nodes(segment, nodes, runtime_devid)
+        lifetime = LifeCycle(nodes, segment.inputs(), segment.outputs())
+        starts = {region.nodes[0]: region for region in regions.values()}
+        owners = {node: region for region in regions.values() for node in region.nodes}
+        # Checkpoints remain whole. Wait before entering a checkpoint if any of
+        # its internal operators consume a side-stream result.
+        rc_start = {}
+        for node in nodes:
+            if node.recompute is not None:
+                rc_start.setdefault(node.recompute, node)
+        waits = {}
+        for node, keys in joins.items():
+            target = rc_start.get(node.recompute, node)
+            waits.setdefault(target, []).extend(keys)
+
+        def names(objects):
+            return '(' + ', '.join(self.tensor_name(t, prefix_attr='self.') for t in objects) + (',' if objects else '') + ')'
+
+        body, pending = [], []
+
+        def flush():
+            if pending:
+                body.extend(self._emit_segment_nodes(segment, pending, runtime_devid, lifetime))
+                pending.clear()
+
+        for node in nodes:
+            if node in waits:
+                flush()
+                body.extend(f'_module_streams.join({key!r})' for key in waits[node])
+            if node in starts:
+                flush()
+                region = starts[node]
+                with Block(f'with _module_streams.fork({region.key!r}, {region.stream!r}, {names(region.inputs)}):') as block:
+                    block.insert_body(self._emit_segment_nodes(segment, region.nodes, runtime_devid, lifetime))
+                body.extend(block.code)
+                body.append(f'_module_streams.publish({names(region.outputs)})')
+            elif node not in owners:
+                pending.append(node)
+        flush()
+        with Block('with nnscaler.runtime.stream.ModuleStreams() as _module_streams:') as block:
+            block.insert_body(body)
+        _logger.info('Emitted %d module stream regions for segment %s', len(regions), segment.cid)
+        return block.code
 
     def _emit_nodes(self, nodes: List[IRCell], lifecycle: LifeCycle, runtime_devid: int) -> List[str]:
         """
