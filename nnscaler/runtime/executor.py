@@ -87,14 +87,6 @@ class _AsyncCommHandler:
             work.wait()
         self._send_holds.clear()
 
-    def drain_all_completed(self):
-        self.drain_sends_completed()
-
-        for tensor, works in list(self._works.items()):
-            if all(work.is_completed() for work in works):
-                del self._works[tensor]
-                self._finish(tensor, works)
-
     def check_clear(self):
         assert len(self._works) == 0 and len(self._callbacks) == 0 and len(self._send_holds) == 0, \
             f"AsyncCommHandler not cleared: works={len(self._works)}, callbacks={len(self._callbacks)}, send_holds={len(self._send_holds)}"
@@ -392,7 +384,9 @@ class Executor:
         """
         Wait until the finish of synchornized tensors
         """
-        AsyncCommHandler().drain_all_completed()
+        # Only wait on this consumer's tensors; completed send buffers have no
+        # stream dependency and can be released eagerly.
+        AsyncCommHandler().drain_sends_completed()
         return [AsyncCommHandler().wait(t) if torch.is_tensor(t) else t for t in tensors]
 
 

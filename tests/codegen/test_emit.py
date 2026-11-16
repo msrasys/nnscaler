@@ -90,9 +90,6 @@ def test_async_receive_waits_at_first_consumer(monkeypatch, with_chunk):
     monkeypatch.setattr(nnscaler.runtime.executor, '_instance', handler)
 
     class Work:
-        def is_completed(self):
-            return False
-
         def wait(self):
             events.append('wait')
             pending.copy_(torch.arange(8, dtype=torch.float32))

@@ -33,9 +33,6 @@ def test_adapter_waits_for_async_input(monkeypatch, requires_grad):
     events = []
 
     class Work:
-        def is_completed(self):
-            return False
-
         def wait(self):
             events.append('wait')
             pending.copy_(torch.arange(8, dtype=torch.float32))
@@ -53,15 +50,12 @@ def test_adapter_waits_for_async_input(monkeypatch, requires_grad):
     handler.check_clear()
 
 
-def _submit_gather_like(handler, completed=False):
+def _submit_gather_like(handler):
     """Mimic all_gather: the handle is the preallocated output, filled by the callback."""
     output = torch.empty(8)
     gathered = [torch.empty(4), torch.empty(4)]
 
     class Work:
-        def is_completed(self):
-            return completed
-
         def wait(self):
             for part in gathered:
                 part.copy_(torch.arange(4, dtype=torch.float32))
@@ -78,13 +72,11 @@ def _submit_gather_like(handler, completed=False):
     return Executor.aexecute(adapter, requires_grad=True)
 
 
-@pytest.mark.parametrize('completed', [False, True])
-def test_async_output_consumed_twice_in_one_call(monkeypatch, completed):
+def test_async_output_consumed_twice_in_one_call(monkeypatch):
     handler = executor._AsyncCommHandler()
     monkeypatch.setattr(executor, '_instance', handler)
-    output = _submit_gather_like(handler, completed)
+    output = _submit_gather_like(handler)
     assert output.requires_grad
-    # `completed` selects the drain path, otherwise the blocking wait path.
     first, second = Executor.sync_tensors([output, output])
     assert first is output and second is output
     torch.testing.assert_close(output.detach(), torch.arange(4, dtype=torch.float32).repeat(2))
