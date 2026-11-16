@@ -3,32 +3,15 @@
 
 """Tracing fakes of the ring-attention wrappers: metadata only, no FlashAttention kernel."""
 
-import sys
-import types
 from typing import Optional, Tuple
 
 import pytest
 import torch
 
-try:
-    import flash_attn  # noqa: F401
-except ImportError:
-    # The wrapper modules import flash_attn at module level. The fakes never call it, so a stub
-    # whose kernels raise is enough to import them and proves tracing takes the fake path.
-    def _no_kernel(*args, **kwargs):
-        raise AssertionError('FlashAttention kernel called during tracing')
-
-    _stub = types.ModuleType('flash_attn')
-    _stub.__path__ = []
-    _interface = types.ModuleType('flash_attn.flash_attn_interface')
-    for _name in ('flash_attn_func', 'flash_attn_varlen_func', 'flash_attn_with_kvcache'):
-        setattr(_stub, _name, _no_kernel)
-    for _name in ('_flash_attn_forward', '_flash_attn_backward',
-                  '_flash_attn_varlen_forward', '_flash_attn_varlen_backward'):
-        setattr(_interface, _name, _no_kernel)
-    _stub.flash_attn_interface = _interface
-    sys.modules['flash_attn'] = _stub
-    sys.modules['flash_attn.flash_attn_interface'] = _interface
+# The ring attention package imports flash_attn at module level, and importing it registers the wrappers
+# as operators for the whole process. Without flash_attn that registration could not be re-imported by
+# the codegen worker processes of later tests, so the whole file is skipped, like the sibling tests.
+pytest.importorskip('flash_attn')
 
 from nnscaler.flags import CompileFlag
 from nnscaler.graph.parser.converter import to_fx_graph
