@@ -121,8 +121,29 @@ corrected 12-step probe completed, but its short-window time was 4.463 s versus
 4.370 s for the matched tuning-only control. It is not a validated performance
 feature and has not been committed to either repository.
 
+Further probes used a separate input stream, independent intranode DeepEP
+buffers with handle-to-buffer ownership, schedule-aware forward/backward stream
+assignment, and transfer placement following producers/consumers. The two-buffer
+transport test passed exact results across cached dispatch/combine and deliberately
+changed caller streams. Actual traces confirmed two active communication queues.
+Nevertheless, matched short-window times (steps 6–11) remained worse:
+
+| Probe | Mean step (s) |
+| --- | ---: |
+| Tuning-only control | 4.369649 |
+| Independent input stream, shared communication buffer | 4.445104 |
+| Two communication buffers, 32-SM communication | 4.556345 |
+| Schedule-aware assignment, two buffers, 64 SMs, async metadata | 4.450410 |
+| Additionally aligned transfer streams | 4.584429 |
+
+All compared batches match by hash. These real-model probes passed scalar
+training diagnostics; they are not full parameter-gradient equivalence audits.
+The last probe still exposed 2.2–4.9% of the profiled step to communication.
+These experiments were therefore left outside the shipped framework. They do
+not provide evidence of full communication hiding.
+
 Local evidence lives in `/home/yileiyang/agens/stream-overlap-20261116`: per-rank
 metrics and batch hashes, compressed traces, launch manifests, resource logs,
 and generated-source archives. Runs enforce disk/memory/time bounds and clean
-owned orphan workers after failure. Completed redundant gencode is removed;
-one shared compilation cache remains for ongoing comparisons.
+owned orphan workers after failure. Generated sources and experiment helpers are archived. Large generated weight
+and graph caches are removed after the completed comparisons; no GPU jobs remain.
