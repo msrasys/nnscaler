@@ -46,6 +46,7 @@ def main():
         emit(event='setup', configured_steps=trainer.max_train_steps,
              stop_steps=args.steps, profile_step=args.profile_step,
              module_streams=os.environ.get('NNSCALER_MODULE_STREAMS', '[]'),
+             deepep_config=os.environ.get('NNSCALER_DEEPEP_CONFIG'),
              torch=torch.__version__, entrypoint=str(args.entrypoint.resolve()))
         trainer.max_train_steps = args.steps
         # Both the inner step loop and the outer epoch loop have stop bounds.

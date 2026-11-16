@@ -32,7 +32,7 @@ from nnscaler.codegen.syntax.blocks import ClassBlock, ForBlock, FunctionBlock, 
 from nnscaler.codegen.emit import FuncEmission
 from nnscaler.codegen.module.autograd import AutogradAdapterCodeGen
 from nnscaler.codegen.lifecycle import LifeCycle
-from nnscaler.graph.schedule.module_streams import plan_module_streams
+from nnscaler.graph.schedule.module_streams import plan_module_streams, checkpoint_stream
 
 from nnscaler.flags import CompileFlag
 from nnscaler.utils import fields
@@ -142,6 +142,7 @@ class ModuleCodeGen(FuncEmission):
             'import nnscaler.runtime.function',
             'import nnscaler.runtime.device',
             'import nnscaler.runtime.stream',
+            'import nnscaler.runtime.checkpoint_stream',
             'import _operator', 'from numpy import inf', 'import builtins', '',
             f'runtime_version = {runtime_version!r}', '', ''
         ]
@@ -176,6 +177,7 @@ class ModuleCodeGen(FuncEmission):
         # module method bodies for forward computations, e.g. Segments, Adapters.
         self.model_methods_bodies: List[List[str]] = list()
         self.module_parameter_uses = {}
+        self.module_parameter_origins = {}
         # module member name
         self.symbols = SymbolTable()
         # ref module to check shared variables
@@ -682,6 +684,9 @@ class ModuleCodeGen(FuncEmission):
             parameter_streams = {name: next(iter(streams)) for name, streams in self.module_parameter_uses.items()
                                  if len(streams) == 1 and None not in streams}
             cb.insert_body(f'module_parameter_streams = {parameter_streams!r}')
+            tracked_parameters = sorted(name for name, streams in self.module_parameter_uses.items()
+                                        if any(stream is not None for stream in streams))
+            cb.insert_body(f'module_stream_parameters = {tracked_parameters!r}')
 
             if as_parallel_module:
                 cb.insert_body(f'rank = {device}')  # save rank in class level
@@ -1086,9 +1091,21 @@ class ModuleCodeGen(FuncEmission):
             segment.nodes(), segment.oobjs(), CompileFlag.module_streams)
         node_streams = {node: region.stream for region in regions.values() for node in region.nodes}
         for node in nodes:
-            for param in node.iobjs():
-                if isinstance(param, IRTensor) and param.is_param():
-                    self.module_parameter_uses.setdefault(self.tensor_name(param), set()).add(node_streams.get(node))
+            origins = set()
+            for value in node.iobjs():
+                if isinstance(value, IRTensor) and value.is_param():
+                    origins.add(self.tensor_name(value))
+                origins.update(self.module_parameter_origins.get(value, ()))
+            is_multiref = node.name == 'multiref' and node.kwargs.get('clone_level', 0) == 0
+            if not is_multiref:
+                for name in origins:
+                    self.module_parameter_uses.setdefault(name, set()).add(node_streams.get(node))
+            if (is_multiref or isinstance(node, IRAdapter)
+                    or node.signature.rsplit('.', 1)[-1] in (
+                        'view', 'view_as', 'reshape', 'detach', 'contiguous', 'to',
+                        'float', 'half', 'bfloat16', 'identity', 'transpose', 'permute', 't')):
+                for output in node.oobjs():
+                    self.module_parameter_origins[output] = origins
         if not regions:
             return self._emit_segment_nodes(segment, nodes, runtime_devid)
         # Schedule emission shares this execution plan. Its executor calls must
@@ -1134,7 +1151,8 @@ class ModuleCodeGen(FuncEmission):
         def resolve(key):
             region = unresolved.pop(key)
             target = f'{names(region.outputs)} = ' if region.outputs else ''
-            body.append(f'{target}_module_streams.resolve({key!r})')
+            indices = tuple(i for i, obj in enumerate(region.outputs) if obj in region.caller_outputs)
+            body.append(f'{target}_module_streams.resolve({key!r}, caller_indices={indices!r})')
 
         for node in nodes:
             # Side regions are emitted as whole functions. Resolve their inputs
@@ -1181,7 +1199,12 @@ class ModuleCodeGen(FuncEmission):
                         block.insert_body(self._emit_segment_nodes(
                             segment, region.nodes, runtime_devid, lifetime, release_unused=False))
                     body.extend(block.code)
-                    body.append(f'_module_streams.publish({names(region.outputs)})')
+                    caller = region.caller_outputs
+                    producer = tuple(obj for obj in region.outputs if obj not in caller)
+                    if caller:
+                        body.append(f'_module_streams.publish({names(caller)})')
+                    if producer:
+                        body.append(f'_module_streams.publish({names(producer)}, stream={region.stream!r})')
             elif node in async_copy_nodes:
                 flush()
                 with Block('with nnscaler.runtime.stream.AsyncTensorCopies():') as block:
@@ -1453,9 +1476,16 @@ class ModuleCodeGen(FuncEmission):
             fb.insert_body(self._emit_nodes(nodes, lifecycle, runtime_devid))
             fb.insert_body(f'return {output_names_tuple}')
         codes = [''] + fb.code + ['']
-        codes.append(
-            f'{output_names_tuple} = ckpt.checkpoint(recompute, {input_names_tuple}, use_reentrant=False)'
-        )
+        stream = checkpoint_stream(nodes, CompileFlag.module_streams)
+        context = ''
+        if stream is not None:
+            self.execplan.use_multi_streams = True
+            dependencies = list(dict.fromkeys([*inputs, *[obj for node in nodes for obj in node.iobjs() if obj.is_attr()]]))
+            dependencies = self.tuple_name(dependencies, prefix_attr='self.')
+            context = (f', context_fn=lambda: nnscaler.runtime.checkpoint_stream.contexts('
+                       f'{stream!r}, {dependencies})')
+        codes.append(f'{output_names_tuple} = ckpt.checkpoint(recompute, {input_names_tuple}, '
+                     f'use_reentrant=False{context})')
 
         return codes
 
@@ -1483,6 +1513,7 @@ class ModuleCodeGen(FuncEmission):
         # module forward code
         self.model_methods_bodies: List[List[str]] = list()
         self.module_parameter_uses = {}
+        self.module_parameter_origins = {}
         # module member name
         self.symbols = SymbolTable()
         # batch size

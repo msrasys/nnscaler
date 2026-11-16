@@ -32,11 +32,18 @@ class ModuleStreamRule:
     resume_after: str | None = None
     host_concurrency: bool = False
     async_anchor_copies: bool = False
+    recompute_only: bool = False
     # Persist the generated-code ABI, including in pickled configurations.
     # A default factory leaves old pickles detectably missing the field.
-    _codegen_version: int = field(default_factory=lambda: 3, init=False, repr=False)
+    _codegen_version: int = field(default_factory=lambda: 6, init=False, repr=False)
 
     def __post_init__(self):
+        if type(self.recompute_only) is not bool:
+            raise ValueError('recompute_only must be a boolean')
+        if self.recompute_only and (self.launch_before or self.launch_after or self.split_before
+                                    or self.resume_before or self.resume_after
+                                    or self.host_concurrency or self.async_anchor_copies):
+            raise ValueError('Recompute-only rules cannot also move forward computation')
         if type(self.host_concurrency) is not bool:
             raise ValueError('host_concurrency must be a boolean')
         if type(self.async_anchor_copies) is not bool:
@@ -85,6 +92,7 @@ class ModuleStreamRegion:
     ready_before: object = None
     host_concurrency: bool = False
     async_anchor_copies: bool = False
+    caller_outputs: tuple = ()
 
 
 def _unsafe(node):
@@ -125,6 +133,8 @@ def plan_module_streams(nodes, outputs, rules):
     regions, placements, selected = {}, defaultdict(list), set()
 
     for rule in normalize_module_stream_rules(rules):
+        if rule.recompute_only:
+            continue
         invocations = defaultdict(list)
         scopes = {}
         for node in nodes:
@@ -240,6 +250,9 @@ def plan_module_streams(nodes, outputs, rules):
     # consumers are ordered by the caller stream; same-stream regions need none.
     owners = {n: r for r in regions.values() for n in r.nodes}
     for region in regions.values():
+        region.caller_outputs = tuple(obj for obj in region.outputs if obj in graph_outputs
+                                      or any(node not in owners for node in consumers[obj]))
+    for region in regions.values():
         if region.ready_before is None:
             continue
         if region.ready_before in owners:
@@ -266,3 +279,23 @@ def plan_module_streams(nodes, outputs, rules):
                     joins[target].append(region.key)
                     break
     return ordered, regions, dict(joins)
+
+
+def checkpoint_stream(nodes, rules):
+    """Select a whole checkpoint; never silently move part of a larger region."""
+    result = None
+    named = [node for node in nodes if node.module_stack is not None]
+    for rule in normalize_module_stream_rules(rules):
+        if not rule.recompute_only:
+            continue
+        matches = [any(fnmatchcase(path, rule.module) for path in node.module_stack) for node in named]
+        if not any(matches):
+            continue
+        if not all(matches):
+            raise ValueError('A recompute stream rule must cover the whole checkpoint region')
+        if any(_unsafe(node) and not _local_adapter(node) for node in nodes):
+            raise ValueError('Recompute streams require pure operations and local adapters')
+        if result is not None and result != rule.stream:
+            raise ValueError('Conflicting recompute streams for one checkpoint')
+        result = rule.stream
+    return result

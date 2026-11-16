@@ -12,7 +12,7 @@ import torch
 from torch.utils.hooks import RemovableHandle
 
 from nnscaler.runtime.device import DeviceGroup
-from nnscaler.runtime.stream import has_module_streams, parameter_gradient_stream
+from nnscaler.runtime.stream import parameter_uses_module_stream, parameter_gradient_stream
 from nnscaler.runtime.utils import split_array_min_max, set_fparam_meta, get_grad_dtype, set_grad_dtype
 from nnscaler.profiler.timer import CudaTimer
 from nnscaler.flags import RuntimeFlag
@@ -395,6 +395,7 @@ class Bucket:
         # normal reducer completion lifecycle exactly once.
         self._manual_grad_pending: Set[torch.nn.Parameter] = set()
         self._gradient_write_streams = {}
+        self._gradient_base_stream = None
         self._hooks: List[Tuple[Any, RemovableHandle]] = []
 
         self._async: bool = async_op
@@ -567,6 +568,9 @@ class Bucket:
         This should only be called once during the construction of bucket.
         """
 
+        if self._params and self._params[0].device.type == 'cuda':
+            self._gradient_base_stream = torch.cuda.current_stream(self._params[0].device)
+
         @torch.no_grad()
         def post_grad_hook(param: torch.nn.Parameter, *unused): # pragma: no cover
             # stream = DeviceGroup().get_stream('reducer')
@@ -660,13 +664,15 @@ class Bucket:
     def _wait_all_gradient_writes(self):
         streams = set(getattr(self, '_gradient_write_streams', {}).values())
         if streams:
+            if self._gradient_base_stream is not None:
+                streams.add(self._gradient_base_stream)
             current = torch.cuda.current_stream(self._contiguous_grads.device)
             for stream in streams:
                 if current != stream:
                     current.wait_stream(stream)
 
     def _add_gradient(self, param, destination, gradient):
-        if param.device.type != 'cuda' or not has_module_streams():
+        if param.device.type != 'cuda' or not parameter_uses_module_stream(param):
             destination.add_(gradient)
             return
         # Manual slice accumulation bypasses AccumulateGrad's serialization.
@@ -1020,6 +1026,7 @@ class Bucket:
         state.pop(fields._post_hooks, None)
         state.pop(fields._manual_grad_pending, None)
         state.pop(fields._gradient_write_streams, None)
+        state.pop(fields._gradient_base_stream, None)
 
         # remove reducer reference
         state.pop(fields._reducer, None)
@@ -1036,6 +1043,7 @@ class Bucket:
         bucket._reducer = reducer
         bucket._manual_grad_pending = set()
         bucket._gradient_write_streams = {}
+        bucket._gradient_base_stream = None
         set_fparam_meta(bucket._param_for_optimizer, bucket._flatten_param_info)
 
         for param in bucket._params:

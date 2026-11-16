@@ -6,7 +6,7 @@ import torch.distributed as dist
 
 import nnscaler
 from nnscaler.runtime.adapter.reducer import Reducer, accumulate_reducer_grad, mark_reducer_grad_ready
-from nnscaler.runtime.stream import ModuleStreams
+from nnscaler.runtime.stream import ModuleStreams, register_parameter_stream
 
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason='requires CUDA')
@@ -19,6 +19,7 @@ def test_manual_gradient_waits_before_reduction(tmp_path, two_streams, asynchron
     try:
         nnscaler.init()
         parameter = torch.nn.Parameter(torch.ones(1 << 18, device='cuda'))
+        register_parameter_stream(parameter, None)  # mixed caller/side-stream use
         reducer = Reducer([0], async_op=asynchronous)
         reducer.add_param(parameter)
         reducer.build_buckets()

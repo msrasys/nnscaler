@@ -187,7 +187,7 @@ class SerialStreams:
     def fork(self, *args):
         yield
 
-    def publish(self, *args):
+    def publish(self, *args, **kwargs):
         pass
 
     def capture(self, *args):
@@ -196,7 +196,7 @@ class SerialStreams:
     def submit(self, key, name, function, args, tracked_inputs):
         self.results[key] = function(*args)
 
-    def resolve(self, key):
+    def resolve(self, key, caller_indices=None):
         return self.results.pop(key)
 
     def join(self, *args):
@@ -340,3 +340,25 @@ def test_async_copy_context_is_scoped_to_anchors(tmp_path, monkeypatch):
     torch.testing.assert_close(generated(x), reference(x))
     code = next(tmp_path.rglob('gencode0.py')).read_text()
     assert code.count('with nnscaler.runtime.stream.AsyncTensorCopies():') == 2
+
+
+@replace_all_device_with('cpu', force=True)
+def test_recompute_only_rule_keeps_forward_on_caller(tmp_path):
+    model = ForkModel()
+    reference = copy.deepcopy(model)
+    rule = ModuleStreamRule('side', stream='expert_recompute', recompute_only=True)
+    parallelize(model, {'x': torch.randn(4, 8)}, recompute_side_policy,
+                ComputeConfig(1, 1, module_streams=(rule,)), gen_savedir=tmp_path,
+                instance_name='recompute_only', load_module=False)
+    code = next(tmp_path.rglob('gencode0.py')).read_text()
+    assert 'checkpoint_stream.contexts(' in code
+    assert '_module_streams.fork(' not in code
+    cls = _load_parallel_module_class(ForkModel, gen_savedir=tmp_path, instance_name='recompute_only', rank=0)
+    generated = new_empty(cls, device='cpu', init_params=True)
+    x = torch.randn(4, 8, requires_grad=True)
+    actual, expected = generated(x), reference(x)
+    torch.testing.assert_close(actual, expected)
+    actual.sum().backward()
+    expected.sum().backward()
+    for name, parameter in generated.named_parameters():
+        torch.testing.assert_close(parameter.grad, reference.get_parameter(generated.fullmap[name].orig_name).grad)

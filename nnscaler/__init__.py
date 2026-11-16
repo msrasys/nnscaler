@@ -56,6 +56,8 @@ def init():
     """
     from nnscaler import runtime
     runtime.device.init_device()
+    from nnscaler.runtime.deepep import configure_from_env
+    configure_from_env()
     _ = runtime.resource.EnvResource()
 
 

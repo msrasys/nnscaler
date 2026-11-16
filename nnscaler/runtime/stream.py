@@ -3,7 +3,7 @@
 
 """Keep scheduled inputs alive until their consuming CUDA stream is done."""
 
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from collections import OrderedDict
 from enum import Enum
 from threading import Lock
@@ -11,7 +11,7 @@ from concurrent.futures import ThreadPoolExecutor
 import weakref
 
 import torch
-from torch.utils._python_dispatch import TorchDispatchMode
+from torch.overrides import TorchFunctionMode
 
 
 _pending_holds = []
@@ -46,10 +46,15 @@ def register_parameter_stream(param, name):
     _parameter_stream_names[identity] = (weakref.ref(param, remove), name)
 
 
+def parameter_uses_module_stream(param):
+    entry = _parameter_stream_names.get(id(param))
+    return entry is not None and entry[0]() is param
+
+
 @contextmanager
 def parameter_gradient_stream(param):
     entry = _parameter_stream_names.get(id(param))
-    if param.device.type != 'cuda' or entry is None or entry[0]() is not param:
+    if param.device.type != 'cuda' or entry is None or entry[0]() is not param or entry[1] is None:
         yield
     else:
         # Creating AccumulateGrad on the forward stream avoids a return to the
@@ -58,7 +63,7 @@ def parameter_gradient_stream(param):
             yield
 
 
-class AsyncTensorCopies(TorchDispatchMode):
+class AsyncTensorCopies(TorchFunctionMode):
     """Make small CPU metadata copies inside an async anchor nonblocking.
 
     Snapshot pageable sources into pinned storage before enqueuing the copy.
@@ -72,11 +77,19 @@ class AsyncTensorCopies(TorchDispatchMode):
             raise ValueError('max_bytes must be a positive integer')
         self.max_bytes = max_bytes
 
-    def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+    def __torch_function__(self, func, types, args=(), kwargs=None):
         kwargs = kwargs or {}
-        if func is torch.ops.aten._to_copy.default:
+        # Intercept the Python copy boundary, not every ATen allocation inside
+        # a C++ communication call. That distinction matters for launch latency.
+        if func in (torch.Tensor.to, torch.Tensor.cuda) and 1 <= len(args) <= 2:
             source = args[0]
-            destination = kwargs.get('device')
+            destination = kwargs.get('device', args[1] if len(args) == 2 else None)
+            if isinstance(destination, torch.Tensor):
+                destination = destination.device
+            elif destination is None and func is torch.Tensor.cuda:
+                destination = torch.device('cuda')
+            if not isinstance(destination, (str, int, torch.device)):
+                return func(*args, **kwargs)
             if (source.device.type == 'cpu' and destination is not None
                     and torch.device(destination).type == 'cuda'
                     and source.layout == torch.strided and not source.requires_grad
@@ -108,6 +121,7 @@ class ModuleStreams:
         self.joined = set()
         self.owners = []
         self.futures = {}
+        self.future_streams = {}
         self.streams = {self.caller}
         return self
 
@@ -153,11 +167,21 @@ class ModuleStreams:
                 _module_workers[cache_key] = ThreadPoolExecutor(max_workers=1, thread_name_prefix='nnscaler-module')
             worker = _module_workers[cache_key]
         self.futures[key] = worker.submit(run)
+        self.future_streams[key] = name
 
-    def resolve(self, key):
+    def resolve(self, key, caller_indices=None):
         """Wait for host submission, then expose tensors to caller-stream users."""
         result = self.futures.pop(key).result()
-        self.publish(result)
+        name = self.future_streams.pop(key)
+        if caller_indices is None:
+            self.publish(result)
+        else:
+            caller = tuple(value for i, value in enumerate(result) if i in caller_indices)
+            producer = tuple(value for i, value in enumerate(result) if i not in caller_indices)
+            if caller:
+                self.publish(caller)
+            if producer:
+                self.publish(producer, stream=name)
         return result
 
     @contextmanager
@@ -178,10 +202,12 @@ class ModuleStreams:
                 event.record(stream)
                 self.events[key] = event
 
-    def publish(self, outputs):
+    def publish(self, outputs, *, stream=None):
         # record_stream does not read the data or wait for its producer. It
         # protects storage when a later caller-stream consumer outlives Python.
-        with input_stream_lifetime(outputs, True) as owners:
+        context = (torch.cuda.stream(_get_module_stream(self.caller.device, stream))
+                   if stream is not None else nullcontext())
+        with context, input_stream_lifetime(outputs, True) as owners:
             self.owners.extend(owners)
         if self.owners:
             # An opaque owner saved by a custom backward can lose its final

@@ -67,6 +67,22 @@ Two additional options address host submission stalls:
 Host submission and CPU metadata snapshots require eager execution of the
 generated functions; they reject CUDA graph capture.
 
+A `recompute_only=True` rule leaves forward execution in place and runs an
+existing non-reentrant checkpoint's recomputation on the named stream:
+
+```bash
+export NNSCALER_MODULE_STREAMS='[{"module":"*.expert","stream":"expert_recompute","recompute_only":true}]'
+```
+
+Recomputation uses saved forward inputs, so it can start while an incoming
+gradient is still being communicated. It waits for the original forward's
+completion event; the original backward stream joins it before consuming saved
+tensors. The rule must cover a complete checkpoint and cannot specify forward
+launch/split options. It does not enable checkpointing itself. Current support
+requires PyTorch's saved-tensor hook inspection API, eager execution, one CUDA
+device per checkpoint, and pure selected operators. It composes the active
+checkpoint hooks and preserves checkpoint early stopping and repeated backward.
+
 The compiler checks tensor and object dependencies before moving computation.
 Local layout adapters inserted inside the selected branch move with it, even
 though those synthesized nodes do not carry the original module path.
@@ -126,3 +142,18 @@ and reports both total and uncovered communication as interval unions. Inspect
 `communication_kernel_names` to verify that the regex covers the installed
 DeepEP implementation; `--communication-regex` can override it. Profiled timing
 includes instrumentation overhead and should not be used as the final speedup.
+
+Optional DeepEP default tuning is available through `NNSCALER_DEEPEP_CONFIG`,
+applied by `nnscaler.init()` before buffers are initialized. For example:
+
+```bash
+export NNSCALER_DEEPEP_CONFIG='{"2":{"dispatch":[96,128,512,6,128],"combine":[96,64,512,6,128]}}'
+```
+
+Each five-integer configuration is `(SMs, NVL send chunk, NVL receive capacity,
+RDMA send chunk, RDMA receive capacity)`, matching `deep_ep.Config`. Overrides
+currently support intranode EP2/4/8 and only change library defaults; explicit
+application configs retain precedence. Dispatch/combine SM counts and NVL
+capacities must match. These numbers must be tuned for the actual shape and
+hardware: optimizing isolated communication may leave too few SMs for overlap.
+Report tuning-only and tuning-plus-overlap controls separately.
