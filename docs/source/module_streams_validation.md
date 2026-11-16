@@ -1,100 +1,128 @@
-# Module stream validation (work in progress)
+# Module stream validation
 
-The framework feature passes CUDA and real MoE correctness checks. The requested
-full hiding of DeepEP communication has **not** been demonstrated. Measurements
-below distinguish communication tuning from stream scheduling.
+The generic CUDA-stream feature is implemented and correctness-tested. **The
+requested full hiding of DeepEP communication has not been achieved.** The best
+completed clean comparison reduces step time by 4.60%; most of that improvement
+comes from communication tuning. Additional pipeline experiments are not part
+of the shipped implementation.
 
-## Workload and measurement
+## Workload and protocol
 
-The unchanged llm-train `main` model runs on six NVIDIA B200 GPUs connected by
-NV18: YOCO-MoE-15B-A6B-L4, PP3/EP2, 12 virtual stages, 8K sequences, 12
-microbatches, MXFP8, frozen Vision, Attention/MoEExpert recomputation, and Muon.
-This validation uses real VL batches and randomly initialized language weights;
-it is not a resumed production 150B checkpoint. llm-train changes only its bash
-launcher. The original 303000-update learning-rate horizon is preserved.
+Six NV18-connected NVIDIA B200 GPUs run the unchanged llm-train `main` model:
+YOCO-MoE-15B-A6B-L4, PP3/EP2, 12 virtual stages, 8K sequences, 12 microbatches,
+MXFP8, frozen Vision, Attention/MoEExpert checkpointing, and Muon. Batches are
+real VL data. Language weights start from random initialization; this is not a
+resumed production 150B checkpoint. llm-train changes only its bash launcher.
+The original 303000-update learning-rate horizon is preserved.
 
-Each comparison completes 40 optimizer steps. Batches are hashed outside the
-timed window and match on all six ranks for all 40 steps. The observer measures
-through synchronized optimizer completion; the value for each step is the maximum
-across ranks. The steady window is steps 21–40, excluding the profiled step 28.
-Clean unprofiled repeats are still required before a final speedup claim.
+The five clean controls use nnscaler `ce0ab3ab` and llm-train `4f3873a0`, with
+clean source trees recorded in each launch manifest. All first 40 input batches
+match by hash on every rank. Each step is measured through synchronized
+optimizer completion, taking the maximum rank time. The measurement window is
+steps 21–40. Runs C, D and E profile only step 41, **after** the timing window;
+their step-41 input hashes also match on all ranks.
 
-| Configuration | Mean step (s) | Median (s) | Mean reduction |
-| --- | ---: | ---: | ---: |
-| Original DeepEP defaults, no module rules | 4.620034 | 4.607293 | — |
-| Tuned DeepEP, no module rules | 4.440619 | 4.425621 | 3.88% |
-| Tuned DeepEP + earlier shared split/after/async metadata | 4.538832 | 4.531060 | 1.76% |
-| Tuned DeepEP + checkpoint recomputation stream | 4.410359 | 4.408788 | 4.54% |
-| Tuned DeepEP + current shared split and recomputation | 4.463996 | 4.460448 | 3.38% |
+| Run | Configuration | Mean step (s) |
+| --- | --- | ---: |
+| A | Original DeepEP defaults; no stream rules | 4.551903 |
+| B | Tuned DeepEP + expert recomputation stream | 4.364083 |
+| C | Repeat original baseline | 4.596024 |
+| D | Tuned DeepEP; no stream rules | 4.384227 |
+| E | Repeat tuned DeepEP + recomputation stream | 4.363007 |
 
-The earlier shared-stream row predates the latest reduction in parameter tracking and
-output-publication overhead. It is retained as a control, not a result for the
-new implementation. Recompute-only is currently faster than the combined
-configuration; additional resource and metadata-copy controls are in progress.
-Tuned defaults use dispatch `(96,128,512,6,128)` and combine
-`(96,64,512,6,128)`, in `deep_ep.Config` argument order. Installed DeepEP is
-`1.2.1+567632d`. An isolated EP2 transport sweep validated all 81 tested
-configurations; its best pair was 0.266 ms versus 1.397 ms for the original
-configuration. That isolated improvement is not the training speedup.
+The two baselines average **4.573963 s**, and the two candidates average
+**4.363545 s**: a **4.60%** step-time reduction. Tuning alone gives 4.15% relative
+to the same baseline average. The candidate is only 0.47% faster than the single
+tuning-only control. That incremental difference is smaller than the 0.97%
+difference between the baseline repeats; it should not be presented as a
+precisely isolated causal effect of stream scheduling.
 
-## DeepEP timing
+The candidate configuration is:
 
-Per-device interval unions from the same profiled optimizer step 28:
+```bash
+export NNSCALER_MODULE_STREAMS='[{"module":"*.expert","stream":"expert_recompute","recompute_only":true}]'
+export NNSCALER_DEEPEP_CONFIG='{"2":{"dispatch":[96,128,512,6,128],"combine":[96,64,512,6,128]}}'
+```
 
-| Rank | Baseline DeepEP (ms) | Baseline fraction | Tuned-only exposed fraction | Earlier shared-stream exposed fraction |
-| --- | ---: | ---: | ---: | ---: |
-| 0 | 507.89 | 10.28% | 4.79% | 3.48% |
-| 1 | 478.42 | 9.70% | 2.43% | 2.02% |
-| 2 | 482.47 | 9.79% | 2.63% | 2.59% |
-| 3 | 575.15 | 11.67% | 4.70% | 2.53% |
-| 4 | 439.40 | 9.04% | 2.94% | 2.11% |
-| 5 | 343.95 | 7.06% | 1.48% | 1.18% |
+DeepEP is `1.2.1+567632d`. An isolated EP2 transport sweep validated all 81 tested
+configurations. Its best dispatch/combine pair took 0.266 ms versus 1.397 ms for
+the original defaults. That isolated improvement is not the training speedup.
 
-Baseline and tuned-only communication have no concurrent useful compute. The
-earlier shared-stream configuration overlaps 15–27% of its remaining DeepEP
-kernel time. These fractions are per rank and cannot be added. Instrumented
-steps include profiler overhead. Kernel concurrency alone does not establish a
-critical-path improvement; shared SM and bandwidth contention can slow kernels.
+## Communication remaining
 
-## Correctness and resource use
+Matched step-41 traces from the frozen-code runs give per-device interval unions:
 
-- Initial CUDA stream runtime/lifetime suite: 74 tests passed. Subsequent combined
-  regressions: 110 passed, including repeated invocations, before/after placement,
-  host submission, reducer affinity, manual gradients, opaque owners and async
-  metadata snapshots.
-- Checkpoint/runtime/codegen subset: 41 CUDA-enabled tests passed. It verifies
-  recomputation can finish while the incoming gradient stream is still pending,
-  unchanged gradients, checkpoint early stopping, and repeated backward.
-- Actual EP2 MoE dimensions: 4096 embedding, 1024 latent, 6656 expert FFN,
-  32 experts, top-8, shared width 1664, MXFP8 and expert recomputation.
-  Recompute-only scheduling gives bitwise-identical outputs and all gradients.
-  Combining it with shared splitting gives identical outputs and parameter
-  gradients; BF16 input-gradient relative L2 error is 8.708e-4.
-- Host submission previously exceeded the input-gradient test's 0.003 relative
-  bound (0.003794). A diagnostic fixed-order FP32 fan-in makes every output and
-  gradient bitwise identical for all variants; production still uses its original
-  BF16 fan-in. This control identifies accumulation order and does not relax the
-  original test bound or establish long-run training equivalence.
-- Over 40 steps, maximum logged loss differences versus baseline are 0.001402
-  for tuning alone and 0.001514 for the earlier shared-stream run; maximum
-  gradient-norm differences are 0.004532 and 0.005072 respectively.
-- Completed controls peak at approximately 412 GiB process-tree RSS. Checkpoint
-  stream runs peak around 119–122 thousand MiB GPU usage on the largest rank,
-  compared with 106–107 thousand MiB for the earlier controls. Runs monitor free disk,
-  host/cgroup memory and GPU allocation, with explicit stop thresholds.
+| Rank | Baseline DeepEP (ms) | Baseline fraction | Tuning-only exposed fraction | Recompute exposed fraction | Recompute communication overlap |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 0 | 656.65 | 13.35% | 4.34% | 3.50% | 12.60% |
+| 1 | 481.59 | 9.81% | 2.84% | 2.94% | 10.13% |
+| 2 | 515.86 | 10.52% | 3.51% | 3.20% | 6.14% |
+| 3 | 528.26 | 10.77% | 3.52% | 3.30% | 16.04% |
+| 4 | 434.38 | 8.98% | 3.68% | 2.65% | 7.17% |
+| 5 | 350.91 | 7.25% | 1.52% | 1.57% | 5.71% |
 
-The shared expert contributes only 22–24% as much kernel time as the original
-DeepEP communication in the component trace. Its prefix can finish before
-communication launches, and synchronous metadata copies can delay the caller.
-Readiness snapshots, asynchronous copies, and independent checkpoint
-recomputation address these distinct limits, but the end-to-end target remains
-unmet in the completed controls above.
+Baseline and tuning-only communication have no concurrent useful compute.
+Recompute still leaves approximately 1.6–3.5% of the profiled step exposed to
+DeepEP. Fractions are per rank and cannot be summed. The trace denominator
+includes profiler overhead; communication kernels also include peer-readiness
+waits. Neither their duration nor overlap fraction alone predicts recoverable
+critical-path latency. Some recomputation instead finishes during pipeline
+receive waits, before the next dispatch starts.
+
+## Correctness and memory
+
+- The latest combined CUDA-enabled suite passes 116 tests. A strengthened
+  checkpoint-owner regression and repeated-backward test additionally pass,
+  verifying storage survives queued backward work after recomputation completes.
+- Actual EP2 MoE dimensions are 4096 embedding, 1024 latent, 6656 expert FFN,
+  32 experts, top-8 and shared width 1664, with MXFP8 and expert recomputation.
+  Recompute-only, independent asynchronous metadata copies, and their combination
+  produce bitwise-identical outputs, input gradients and parameter gradients.
+- Shared splitting plus recomputation has identical outputs and parameter
+  gradients; BF16 input-gradient relative L2 error is 8.708e-4. Host submission
+  previously exceeded the input-gradient test's 0.003 bound (0.003794). A
+  diagnostic fixed-order FP32 fan-in makes all variants bitwise identical;
+  production retains its original BF16 fan-in. The original bound was not relaxed.
+- Across the clean measurement window, candidate B/E maximum loss differences
+  from A are 0.000671/0.001276, and gradient-norm differences are
+  0.002629/0.002848. Baseline C itself differs from A by up to 0.001484 in loss
+  and 0.004798 in gradient norm. These short runs do not establish long-term
+  training equivalence.
+- Process-tree RSS peaks around 412 GiB. Maximum device usage rises from about
+  102 GiB in baseline runs to about 118 GiB with recomputation streams. The
+  PyTorch live-allocation peak is nearly unchanged; reserved memory and device
+  usage increase. This extra memory matters for configurations near capacity.
 
 The original main-model compile also reproduced an existing `dict.update`
 tracing failure in attention kwargs. NNScaler now retains those updates and
 dynamic nested lookups; 65 relevant CPU tests passed. No llm-train model source
 was changed.
 
-Local evidence is stored under
-`/home/yileiyang/agens/stream-overlap-20261116`: per-rank metrics and batch hashes,
-compressed traces, communication summaries, launch arguments and resource logs.
+## Other experiments
+
+Earlier 40-step runs with profiling inside the measurement window, excluding the
+profiled step, gave 4.620 s for baseline, 4.441 s for tuning only, 4.539 s for the
+earlier shared-stream implementation, and 4.464 s for current shared streams
+plus recomputation. Independent async metadata copies plus recomputation gave
+4.439 s. These exploratory values are not mixed with the clean protocol above.
+
+The shared expert provides only 22–24% as much kernel time as the original
+DeepEP communication in the component trace. Shared splitting overlaps some
+communication but its scheduling and resource costs offset the gain for this
+shape. An external DeepGEMM resource probe (shared GEMMs 84 SMs, recompute 116,
+DeepEP 64) gave 4.481 s and was not integrated into the framework.
+
+An external two-stream pipeline prototype is investigating independent
+microbatches. Four-stage/two-rank tests match losses, all optimizer gradients and
+weights across four updates, including a deliberately delayed stateful CUDA
+loss. The real model required explicit serialization of its stateful MoE loss;
+simply changing microbatch streams raced on cumulative expert counts. The
+corrected 12-step probe completed, but its short-window time was 4.463 s versus
+4.370 s for the matched tuning-only control. It is not a validated performance
+feature and has not been committed to either repository.
+
+Local evidence lives in `/home/yileiyang/agens/stream-overlap-20261116`: per-rank
+metrics and batch hashes, compressed traces, launch manifests, resource logs,
+and generated-source archives. Runs enforce disk/memory/time bounds and clean
+owned orphan workers after failure. Completed redundant gencode is removed;
+one shared compilation cache remains for ongoing comparisons.
