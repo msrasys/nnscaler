@@ -39,6 +39,8 @@ to launch the whole branch. Without a launch anchor, a branch stays in its
 original position and can overlap subsequent independent modules.
 
 The compiler checks tensor and object dependencies before moving computation.
+Local layout adapters inserted inside the selected branch move with it, even
+though those synthesized nodes do not carry the original module path.
 It preserves complete recompute regions and rejects splits through their
 boundaries, ambiguous anchors and known mutations/random operations. Rules are
 local to each pipeline segment and never move operations between stages. ZeRO
@@ -67,3 +69,24 @@ streams. Report the baseline dispatch/combine fraction, communication with no
 concurrent useful computation, and the achieved step-time reduction. Concurrent
 kernels can contend for SMs and bandwidth; timeline overlap alone does not
 establish that all communication latency has been hidden.
+
+`examples/module_streams/profile_train.py` wraps an existing Trainer entrypoint,
+records per-rank step metrics and optionally exports one compressed CUDA trace.
+It sets the local stopping bound after constructing the original LR scheduler.
+Run the same inputs/configuration with and without scheduling, and use separate
+observer output directories. For example, from the training entrypoint directory:
+
+```bash
+torchrun --nproc_per_node=8 /path/to/nnscaler/examples/module_streams/profile_train.py \
+  --steps 24 --profile-step 8 --output /path/to/results/profile \
+  nnscaler_train.py [original training arguments ...]
+python -m nnscaler.profiler.stream_overlap /path/to/results/profile/*.trace.json.gz \
+  --output /path/to/results/communication.json
+```
+
+Repeat with `--profile-step 0` for unprofiled timing. The analyzer uses annotated
+step spans as the denominator, excludes NCCL/NVSHMEM kernels from useful compute,
+and reports both total and uncovered communication as interval unions. Inspect
+`communication_kernel_names` to verify that the regex covers the installed
+DeepEP implementation; `--communication-regex` can override it. Profiled timing
+includes instrumentation overhead and should not be used as the final speedup.

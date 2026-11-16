@@ -15,6 +15,10 @@ import json
 import os
 
 from nnscaler.ir.operator import IRFwOperation
+from nnscaler.ir.adapter import IRAdapter
+from nnscaler.ir.adapter.prim import (
+    IdentityPrim, SelectPrim, MergeDimPrim, SumPrim, ChunkPrim, VChunkPrim, SplitAllGatherPrim,
+)
 
 
 @dataclass(frozen=True)
@@ -68,6 +72,14 @@ def _unsafe(node):
                         'randn', 'rand_like', 'randn_like', 'bernoulli', 'multinomial'))
 
 
+def _local_adapter(node):
+    # A SplitAllGather executes only a local slice in forward. Its backward
+    # collective follows autograd's stream semantics, like any original op.
+    return isinstance(node, IRAdapter) and all(type(prim) in (
+        IdentityPrim, SelectPrim, MergeDimPrim, SumPrim, ChunkPrim, VChunkPrim, SplitAllGatherPrim,
+    ) for prim in node.prims)
+
+
 def plan_module_streams(nodes, outputs, rules):
     """Return reordered nodes, side regions and consumer joins; never mutate IR.
 
@@ -105,10 +117,28 @@ def plan_module_streams(nodes, outputs, rules):
 
         for invocation, branch in invocations.items():
             path, _ = invocation
+            original_branch = set(branch)
             if any(n in selected for n in branch):
                 raise ValueError(f'Overlapping module stream rules for {path}')
             if any(_unsafe(n) for n in branch):
                 raise ValueError(f'Module stream rule for {path} includes a mutation or unsupported operation')
+            # Materialization inserts local layout adapters with no module
+            # stack. Include those used exclusively by this branch; otherwise
+            # a reshape can move while its slice remains at the old location.
+            branch_set = set(branch)
+            changed = True
+            while changed:
+                changed = False
+                for node in nodes:
+                    if node in branch_set or node in selected:
+                        continue
+                    if not (_local_adapter(node) or node.name == 'multiref'):
+                        continue
+                    users = {c for obj in node.oobjs() for c in consumers[obj]}
+                    if users and users <= branch_set and not any(obj in graph_outputs for obj in node.oobjs()):
+                        branch_set.add(node)
+                        changed = True
+            branch = sorted(branch_set, key=positions.__getitem__)
             chunks = [branch]
             if rule.split_before is not None:
                 split = next((i for i, n in enumerate(branch) if any(
@@ -129,14 +159,21 @@ def plan_module_streams(nodes, outputs, rules):
                     if len(candidates) != 1:
                         raise ValueError(f'{path}: expected one launch anchor {anchor!r}, found {len(candidates)}')
                     destination = positions[candidates[0]]
+                # Already-available synthesized inputs need not move with the
+                # module. Preserve their original position and other users.
+                chunk = [n for n in chunk if n in original_branch or positions[n] >= destination]
                 if destination > positions[chunk[0]]:
                     raise ValueError(f'{path}: module stream launch must not move computation later')
-                if any(_unsafe(n) for n in nodes[destination:positions[chunk[0]]]
-                       if n.signature.rsplit('.', 1)[-1] != 'multiref'
-                       and not n.signature.startswith('nnscaler.runtime.adapter')):
-                    # Most IR adapters are not ordinary operations. Cross-stream
-                    # movement across those cannot preserve collective ordering.
-                    raise ValueError(f'{path}: cannot move a module across a mutation or unsupported operation')
+                barriers = [n for n in nodes[destination:positions[chunk[0]]]
+                            if not isinstance(n, IRAdapter)
+                            and n.signature.rsplit('.', 1)[-1] != 'multiref' and _unsafe(n)]
+                if barriers:
+                    raise ValueError(f'{path}: cannot move a module across a mutation or unsupported operation: '
+                                     f'{[(type(n).__name__, n.signature) for n in barriers]}')
+                # Main-stream adapters retain their original ordering. Moving
+                # an independent pure branch past them is safe; dependencies on
+                # their outputs are checked below. Adapters in the moved branch
+                # itself remain unsupported.
                 chunk_set = set(chunk)
                 gids = {n.recompute for n in chunk if n.recompute is not None}
                 if any(n.recompute in gids and n not in chunk_set for n in nodes):
@@ -166,7 +203,7 @@ def plan_module_streams(nodes, outputs, rules):
         for obj in node.iobjs():
             producer = producers.get(obj)
             if producer is not None and producer != node and new_positions[producer] >= new_positions[node]:
-                raise ValueError(f'Module stream launch violates dependency {producer.signature} -> {node.signature}')
+                raise ValueError(f'Module stream launch violates dependency {producer.signature} -> {node.signature}: {producer}')
 
     # A stream join is needed at the first consumer outside each region. Later
     # consumers are ordered by the caller stream; same-stream regions need none.
