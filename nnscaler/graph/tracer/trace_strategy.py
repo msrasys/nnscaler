@@ -103,16 +103,9 @@ class BaseTraceStrategy:
     # identify the name of the strategy
     _name: str
 
-    def __init__(self, tracer: 'ConcreteTracer', main_device: str, option: str = '') -> None:
-        self.check_option(option)
+    def __init__(self, tracer: 'ConcreteTracer', main_device: str) -> None:
         self.tracer = tracer
         self.main_device = main_device
-
-    @classmethod
-    def check_option(cls, option: str) -> None:
-        """Validate the ``:option`` suffix of a ``trace_strategy`` string; most strategies take none."""
-        if option:
-            raise ValueError(f"trace strategy '{cls._name}' takes no ':option', got '{cls._name}:{option}'")
 
     @property
     def name(self):
@@ -210,10 +203,6 @@ class BaseTraceStrategy:
 
         args, kwargs = cls._map_devices_to(args, kwargs, device, first_arg_device=is_tensor and target == 'to')
         return getattr(self_obj, target)(*args, **kwargs)
-
-    def concretize(self, tensor: torch.Tensor, *, name: str, cause: BaseException) -> torch.Tensor:
-        """Return a tensor with real data for ``tensor``; only the meta strategy produces meta values."""
-        raise cause
 
     def run_placeholder(self, target: Target, args: Tuple[Any, ...], kwargs: Dict[str, Any]) -> Tuple[Any, Tuple, Dict]:
         return self.tracer.placeholder_dict[target], args, kwargs
@@ -319,8 +308,8 @@ class CpuStrategy(BaseTraceStrategy):
     """
     _name = 'cpu'
 
-    def __init__(self, tracer: 'ConcreteTracer', option: str = ''):
-        super().__init__(tracer, 'cpu', option)
+    def __init__(self, tracer: 'ConcreteTracer'):
+        super().__init__(tracer, 'cpu')
 
 
 class CudaStrategy(BaseTraceStrategy):
@@ -329,8 +318,8 @@ class CudaStrategy(BaseTraceStrategy):
     """
     _name = 'cuda'
 
-    def __init__(self, tracer: 'ConcreteTracer', option: str = ''):
-        super().__init__(tracer, 'cuda', option)
+    def __init__(self, tracer: 'ConcreteTracer'):
+        super().__init__(tracer, 'cuda')
 
 
 class MetaStrategy(BaseTraceStrategy):
@@ -352,15 +341,8 @@ class MetaStrategy(BaseTraceStrategy):
     def _is_mapped_device(cls, value: Any) -> bool:
         return isinstance(value, (int, str, torch.device)) and not isinstance(value, bool)
 
-    @classmethod
-    def check_option(cls, option: str) -> None:
-        # 'no' spells out the only behavior for data-dependent operators: no replay, they raise
-        if option not in ('', 'no'):
-            raise ValueError(
-                f"trace strategy 'meta' takes no option (data-dependent operators are not replayed), got 'meta:{option}'")
-
-    def __init__(self, tracer: 'ConcreteTracer', option: str = ''):
-        super().__init__(tracer, 'meta', option)
+    def __init__(self, tracer: 'ConcreteTracer'):
+        super().__init__(tracer, 'meta')
 
     def place_model(self, model: torch.nn.Module) -> torch.nn.Module:
         # Meta tensors stay on meta: they come from a model built on meta or captured by DeferredInitialization,
@@ -389,9 +371,6 @@ class MetaStrategy(BaseTraceStrategy):
                 raise
             raise RuntimeError(meta_guidance(_target_name(target))) from exc
 
-    def concretize(self, tensor: torch.Tensor, *, name: str, cause: BaseException) -> torch.Tensor:
-        raise RuntimeError(meta_guidance(name)) from cause
-
 
 class CudaRunCpuOffloadStrategy(BaseTraceStrategy):
     """
@@ -402,8 +381,8 @@ class CudaRunCpuOffloadStrategy(BaseTraceStrategy):
     """
     _name = 'cuda_run_cpu_offload'
 
-    def __init__(self, tracer: 'ConcreteTracer', option: str = ''):
-        super().__init__(tracer, 'cpu', option)
+    def __init__(self, tracer: 'ConcreteTracer'):
+        super().__init__(tracer, 'cpu')
 
     def run_call_function(self, target: Target, args: Tuple[Any], kwargs: Dict[str, Any]) -> Tuple[Any, Tuple, Dict]:
         try:
@@ -454,8 +433,8 @@ class ReuseCacheStrategy(CudaRunCpuOffloadStrategy):
     """
     _name = 'reuse_cache'
 
-    def __init__(self, tracer: 'ConcreteTracer', option: str = '') -> None:
-        super().__init__(tracer, option)
+    def __init__(self, tracer: 'ConcreteTracer') -> None:
+        super().__init__(tracer)
         self.cache: Dict[str, Any] = {}
         self.cache_size = 0
 
@@ -529,19 +508,14 @@ TRACE_STRATEGY: Dict[str, Type[BaseTraceStrategy]] = {
 }
 
 
-def parse_trace_strategy(spec: str) -> Tuple[Type[BaseTraceStrategy], str]:
-    """Split and validate ``'name[:option]'``; only ``meta`` takes an option (``cpu``, ``cuda`` or ``no``)."""
-    name, _, option = spec.partition(':')
+def trace_strategy_class(name: str) -> Type[BaseTraceStrategy]:
     if name not in TRACE_STRATEGY:
         raise ValueError(f"unknown trace strategy '{name}', expected one of {sorted(TRACE_STRATEGY)}")
-    cls = TRACE_STRATEGY[name]
-    cls.check_option(option)
-    return cls, option
+    return TRACE_STRATEGY[name]
 
 
-def create_trace_strategy(spec: str, tracer: 'ConcreteTracer') -> BaseTraceStrategy:
-    cls, option = parse_trace_strategy(spec)
-    return cls(tracer, option)
+def create_trace_strategy(name: str, tracer: 'ConcreteTracer') -> BaseTraceStrategy:
+    return trace_strategy_class(name)(tracer)
 
 
 def trace_fake(fn: Callable, fake: Any, *args, **kwargs) -> Any:
@@ -596,8 +570,8 @@ def trace_fake(fn: Callable, fake: Any, *args, **kwargs) -> Any:
         for leaf in pytree_utils.tree_flatten(fake)[0]:
             if isinstance(leaf, torch.Tensor) and leaf.is_meta:
                 raise ValueError('trace_fake: the fake must carry data (a cpu or cuda tensor), got a meta tensor')
-        # A private copy: a fake built in forward (`torch.zeros(...)`) is itself a traced value
-        # with an origin and possibly autograd history, which must not leak into the result of `fn`.
+        # A private copy: a fake built in forward (`torch.zeros(...)`) is itself a traced value,
+        # possibly with autograd history, which must not leak into the result of `fn`.
         fake = pytree_utils.tree_map_only(torch.Tensor, lambda t: t.detach().clone().requires_grad_(t.requires_grad), fake)
 
     if is_tensor_method_or_property(fn):

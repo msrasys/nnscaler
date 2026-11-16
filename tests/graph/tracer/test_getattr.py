@@ -102,32 +102,25 @@ class BranchOnValueModel(torch.nn.Module):
         return x.sum()
 
 
-@pytest.mark.parametrize('strategy', ['meta', 'meta:no'])
 @pytest.mark.parametrize('model_class, operator', [(NonzeroModel, 'nonzero'), (ItemModel, 'item'), (BranchOnValueModel, 'bool')])
-def test_meta_raises_on_data_dependent_ops(monkeypatch, strategy, model_class, operator):
+def test_meta_raises_on_data_dependent_ops(monkeypatch, model_class, operator):
     """Operators that read tensor values cannot run on meta; the error names the operator and the remedies."""
-    monkeypatch.setattr(CompileFlag, 'trace_strategy', strategy)
+    monkeypatch.setattr(CompileFlag, 'trace_strategy', 'meta')
     with pytest.raises(RuntimeError, match=f"cannot execute `{operator}`") as exc_info:
         to_fx_graph(model_class(), {'x': torch.tensor([0.5, 0.0, -1.0, 2.0])})
     assert 'trace_fake' in str(exc_info.value) and 'fake_fn' in str(exc_info.value)
     assert exc_info.value.__cause__ is not None
 
 
-def test_trace_strategy_option_validation():
+def test_trace_strategy_validation():
     from nnscaler.parallel import ComputeConfig
-    with pytest.raises(ValueError, match="takes no option"):
-        ConcreteTracer('meta:cpu')
-    with pytest.raises(ValueError, match="takes no ':option'"):
-        ConcreteTracer('cpu:fast')
     with pytest.raises(ValueError, match="unknown trace strategy"):
         ConcreteTracer('tpu')
-    with pytest.raises(ValueError, match="takes no option"):
-        ComputeConfig(1, 1, trace_strategy='meta:cuda', param_init_strategy='shard')
+    with pytest.raises(ValueError, match="unknown trace strategy"):
+        ComputeConfig(1, 1, trace_strategy='meta:cpu', param_init_strategy='shard')
     with pytest.raises(ValueError, match="requires param_init_strategy='shard'"):
         ComputeConfig(1, 1, trace_strategy='meta')
-    config = ComputeConfig(1, 1, trace_strategy='meta:no', param_init_strategy='shard')
-    assert (config.trace_strategy_name, config.trace_strategy_option) == ('meta', 'no')
-    assert (ComputeConfig(1, 1).trace_strategy_name, ComputeConfig(1, 1).trace_strategy_option) == ('cuda_run_cpu_offload', '')
+    ComputeConfig(1, 1, trace_strategy='meta', param_init_strategy='shard')
 
 
 class DictKeyModel(torch.nn.Module):
@@ -181,7 +174,7 @@ def _nodes(graph, name):
     return [n for n in graph.graph.nodes if (n.target if isinstance(n.target, str) else getattr(n.target, '__name__', '')) == name]
 
 
-@pytest.mark.parametrize('strategy', ['cpu', 'meta', 'meta:no'])
+@pytest.mark.parametrize('strategy', ['cpu', 'meta'])
 def test_trace_fake_replaces_execution(monkeypatch, strategy):
     """Like `fake_fn`, the fake is the trace value under every strategy; the graph records the real operator."""
     monkeypatch.setattr(CompileFlag, 'trace_strategy', strategy)

@@ -144,27 +144,27 @@ class ConcreteProxy(Proxy):
         if insts[cur].opcode in self.jump_opcodes or (
             insts[cur].opcode in self.jump_before_opcodes and insts[cur + 1].opcode in self.jump_opcodes):
             # in executing branch condition
-            return self._concrete(orig_func.bool, 'bool')
+            return self._call_or_meta_error(orig_func.bool, 'bool')
         elif insts[cur].opname == 'CONTAINS_OP':
             # in executing 'in'
-            return self._concrete(orig_func.bool, 'bool')
+            return self._call_or_meta_error(orig_func.bool, 'bool')
         elif insts[cur].opname == 'BINARY_SUBSCR':
             # in executing slice or index, my_list[index] or my_dict[key]
-            return self._concrete(orig_func.bool, 'bool')
+            return self._call_or_meta_error(orig_func.bool, 'bool')
         elif insts[cur].opcode == self.op_call_ex:
             # in executing func(..., *proxy)
-            return self._concrete(orig_func.bool, 'bool')
+            return self._call_or_meta_error(orig_func.bool, 'bool')
         elif insts[cur].opcode == self.op_not:
             # We cannot return a proxy because 'UNARY_NOT' op will check the type.
             _logger.warning('please use the function patcher, or use "x = operator.not_(y)" instead of "x = not y",'
                             'otherwise the traced graph may be wrong')
-            return self._concrete(orig_func.bool, 'bool')
+            return self._call_or_meta_error(orig_func.bool, 'bool')
         else:
             return self.tracer.create_proxy('call_function', orig_func.bool, (self,), {})
 
     def __index__(self) -> Union[int, ConcreteProxy]:
         # should only be in list/tuple getitem
-        return self._concrete(orig_func.index, 'index')
+        return self._call_or_meta_error(orig_func.index, 'index')
 
     def __hash__(self) -> Union[int, ConcreteProxy]:
         # should only be in dict getitem
@@ -172,19 +172,19 @@ class ConcreteProxy(Proxy):
 
     def __contains__(self, item) -> bool:
         # should only be in iterable
-        return self._concrete(lambda value: value.__contains__(item), 'contains')
+        return self._call_or_meta_error(lambda value: value.__contains__(item), 'contains')
 
-    def _concrete(self, fn: Callable[[Any], Any], name: str) -> Any:
+    def _call_or_meta_error(self, fn: Callable[[Any], Any], name: str) -> Any:
         """
-        Read a Python value out of ``self.value`` (branch conditions, indices, ``in``).
-        These bypass the trace strategy, so a meta value is checked here for the data it lacks.
+        ``fn(self.value)`` for the Python protocols that need a plain value (``bool``, ``__index__``, ``in``).
+        These bypass the trace strategy, so a meta value failing for lack of data gets the same guidance here.
         """
         try:
             return fn(self.value)
         except (RuntimeError, NotImplementedError, TypeError) as exc:
             if (orig_func.isinstance(self.value, torch.Tensor) and self.value.is_meta
                     and trace_strategy.is_meta_data_dependency(exc)):
-                return fn(self.tracer.strategy.concretize(self.value, name=name, cause=exc))
+                raise RuntimeError(trace_strategy.meta_guidance(name)) from exc
             raise
 
     def __enter__(self):

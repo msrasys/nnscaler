@@ -1319,9 +1319,7 @@ We can categorize the fields into 4 categories:
       correspond to a same computation graph. Errors may be raised at
       runtime when this assumption is broken.
 
-    - `trace_strategy`: how to execute the functions during trace, given
-      as `name` or `name:option`; no strategy takes an option yet
-      (`meta:no` is accepted as a spelling of `meta`). Five
+    - `trace_strategy`: how to execute the functions during trace. Five
       strategies are supported:
 
       1.  `cpu`: Execute all functions on cpu device, model weights and
@@ -1329,11 +1327,11 @@ We can categorize the fields into 4 categories:
       2.  `cuda`: Execute all functions on cuda device, model weights
           and intermediate results are on cuda device. This strategy is
           recommended if the model can inference on single gpu.
-      3.  `meta`: Execute all functions on meta device, model weights
-          are on cpu and intermediate results are on meta device. Requires
-          `param_init_strategy='shard'`: a module class is then constructed
-          symbolically and traced on meta without materializing weights;
-          a supplied model instance must carry real weights.
+      3.  `meta`: Execute all functions on meta device; intermediate
+          results are on meta device. Requires `param_init_strategy='shard'`:
+          a module class is then constructed symbolically and traced on meta
+          without materializing weights; a supplied model instance must carry
+          real weights, which stay on cpu.
           Operations that read tensor
           values (`.item()`, `bool(tensor)`, `nonzero`, ...) cannot run
           on meta and raise an error naming the operator. Give such a call

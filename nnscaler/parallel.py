@@ -38,7 +38,7 @@ from nnscaler.graph.function.wrapnn import convert_to_wrapnn, wrapnn
 from nnscaler.graph.gener.gen import IRAdapterGener
 from nnscaler.graph.parser import FxModuleParser
 from nnscaler.graph.tracer.trace_strategy import (
-    has_meta_tensors, place_real_tensors_to_cpu, parse_trace_strategy,
+    has_meta_tensors, place_real_tensors_to_cpu, trace_strategy_class,
 )
 from nnscaler.graph.schedule.predefined import PredefinedSched
 from nnscaler.graph.schedule.schedplan import SchedulePlan
@@ -125,8 +125,7 @@ class ComputeConfig:
     # whether to fold constant when generating code
     constant_folding: bool = False
 
-    # how to execute the functions during trace: 'name' or 'name:option' (no strategy takes an option yet;
-    # 'meta:no' is accepted as a spelling of 'meta').
+    # how to execute the functions during trace.
     # 'meta' requires param_init_strategy='shard': the model is not materialized at compile time.
     trace_strategy: str = 'cuda_run_cpu_offload'
 
@@ -236,8 +235,8 @@ class ComputeConfig:
         strategies = (ParamInitStrategy.FILE, ParamInitStrategy.FULL, ParamInitStrategy.SHARD)
         if self.param_init_strategy not in strategies:
             raise ValueError(f"param_init_strategy must be one of {strategies}.")
-        parse_trace_strategy(self.trace_strategy)
-        if self.trace_strategy_name == 'meta' and self.param_init_strategy != ParamInitStrategy.SHARD:
+        trace_strategy_class(self.trace_strategy)
+        if self.trace_strategy == 'meta' and self.param_init_strategy != ParamInitStrategy.SHARD:
             raise ValueError(
                 "trace_strategy='meta' requires param_init_strategy='shard': the model is not materialized "
                 "at compile time, so there are no weights to save for 'file' or 'full'."
@@ -297,16 +296,6 @@ class ComputeConfig:
                 raise ValueError("use_fbw is only supported in end2end mode.")
             if self.inference_only:
                 raise ValueError("use_fbw is not supported in inference mode.")
-
-    @property
-    def trace_strategy_name(self) -> str:
-        """The strategy part of ``trace_strategy`` (``'meta'`` for ``'meta:no'``)."""
-        return self.trace_strategy.partition(':')[0]
-
-    @property
-    def trace_strategy_option(self) -> str:
-        """The option part of ``trace_strategy`` (``'no'`` for ``'meta:no'``, ``''`` when absent)."""
-        return self.trace_strategy.partition(':')[2]
 
     def apply_pipeline_scheduler(
             self,
@@ -1034,7 +1023,7 @@ def _gencode(
                     # it should only have 1 `self` parameter
                     if len(inspect.signature(module_or_module_class.__init__).parameters) > 1:
                         raise ValueError("Module class __init__ should be parameter-free.")
-                if compute_config.trace_strategy_name == 'meta':
+                if compute_config.trace_strategy == 'meta':
                     # Capture the construction instead of running it: parameters and buffers come out
                     # as meta tensors, so tracing never materializes the full model. Shard initialization
                     # (required by the meta strategy) replays the same construction per rank at runtime,
@@ -1070,7 +1059,7 @@ def _gencode(
                 )
             # only the meta trace strategy can execute a meta module (and it implies shard initialization,
             # the only one that needs no weight values at compile time, see ComputeConfig)
-            if compute_config.trace_strategy_name != 'meta':
+            if compute_config.trace_strategy != 'meta':
                 raise ValueError(
                     f"A module on the meta device requires trace_strategy='meta', got {compute_config.trace_strategy!r}."
                 )
