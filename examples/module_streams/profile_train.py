@@ -20,6 +20,7 @@ import torch.distributed as dist
 
 from nnscaler.cli.trainer import Trainer
 from nnscaler import module_kernel_graph_stats
+from nnscaler.utils import load_type
 
 
 def main():
@@ -27,12 +28,14 @@ def main():
     parser.add_argument('--steps', type=int, default=24)
     parser.add_argument('--profile-step', type=int, default=0)
     parser.add_argument('--output', type=Path, required=True)
+    parser.add_argument('--profiler-factory', default='torch.profiler.profile')
     parser.add_argument('entrypoint', type=Path)
     parser.add_argument('training_args', nargs=argparse.REMAINDER)
     args = parser.parse_args()
     if not 0 <= args.profile_step <= args.steps or args.steps <= 0:
         parser.error('steps must be positive and profile-step must be in [0, steps]')
     args.output.mkdir(parents=True, exist_ok=True)
+    profiler_factory = load_type(args.profiler_factory)
     rank = int(os.environ.get('RANK', 0))
     output = (args.output / f'rank{rank}.jsonl').open('x')
 
@@ -66,11 +69,12 @@ def main():
             torch.cuda.synchronize()
             dist.barrier()
             if step == args.profile_step:
-                profiler = torch.profiler.profile(
+                profiler = profiler_factory(
                     activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA],
                     record_shapes=False, profile_memory=False, with_stack=False)
                 profiler.start()
-                marker = torch.profiler.record_function(f'stream_overlap/step/{step}')
+                scope = getattr(profiler, 'record_function', torch.profiler.record_function)
+                marker = scope(f'stream_overlap/step/{step}')
                 marker.__enter__()
             started = time.perf_counter()
 
