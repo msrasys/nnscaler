@@ -234,6 +234,10 @@ idx, top_x = nnscaler.trace_fake(
     expert_mask[expert_idx])
 ```
 
+- The fake must have the **same shapes, dtypes and `requires_grad` flags** as the real result, for every
+  output of a multi-output operator: it is what the rest of the trace, and so the generated program, is
+  shaped by. A fake with the wrong shape, dtype or `requires_grad` is not detected during tracing and
+  surfaces as a runtime mismatch.
 - The graph still records `torch.where` with the original arguments; the generated code calls the real
   operator and `trace_fake` never appears in it.
 - The fake is the trace value under every strategy, exactly like `fake_fn`. Outside of tracing the
