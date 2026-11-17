@@ -128,11 +128,26 @@ class DictKeyModel(torch.nn.Module):
         return data['cuda'] + data.get('cuda', 0)   # container keys that happen to spell device names
 
 
+class DeviceObjectKeyModel(torch.nn.Module):
+    def forward(self, x, table):
+        return x + table[torch.device('cuda')]       # a `torch.device` used as a dictionary key
+
+
+class DeviceFieldModel(torch.nn.Module):
+    def forward(self, x, cfg):
+        cfg.update(device='cuda')                     # a `device` field of a dictionary, not a device parameter
+        return x * (2 if cfg['device'] == 'cuda' else 3)
+
+
 @pytest.mark.parametrize('strategy', ['cpu', 'meta'])
 def test_device_mapping_leaves_container_keys_alone(monkeypatch, strategy):
     monkeypatch.setattr(CompileFlag, 'trace_strategy', strategy)
     # traces without KeyError: the keys are not rewritten when the lookups execute
     to_fx_graph(DictKeyModel(), {'data': {'cuda': torch.ones(2), 'cpu': torch.ones(2)}})
+    to_fx_graph(DeviceObjectKeyModel(), {'x': torch.ones(2), 'table': {torch.device('cuda'): torch.ones(2)}})
+    graph = to_fx_graph(DeviceFieldModel(), {'x': torch.ones(2), 'cfg': {'device': 'cpu'}})
+    mul, = [n for n in graph.graph.nodes if getattr(n.target, '__name__', '') == 'mul']
+    assert mul.args[1] == 2                            # the field kept 'cuda', so the trace took the same branch as runtime
 
 
 def test_patcher_contexts_nest_in_the_supported_order():
@@ -189,6 +204,59 @@ def test_trace_fake_replaces_execution(monkeypatch, strategy):
     assert item.op == 'call_method' and item.meta['tensor_meta'] == 3        # the fake; real data gives 2
     assert _nodes(graph, 'mul')                                              # the faked `bool` chose the branch
     assert not any(getattr(n.target, '__name__', '') == 'trace_fake' for n in graph.graph.nodes)
+
+
+def count_positive_rows(x):
+    # a registered operator whose body reads values; under meta it has to be given a fake as a whole
+    rows = nnscaler.trace_fake(torch.nonzero, torch.zeros(2, 1, dtype=torch.long), x > 0)
+    count_positive_rows.seen.append(type(rows).__name__)
+    return x * rows.shape[0]
+
+
+count_positive_rows.seen = []
+nnscaler.register_op('n -> n')(count_positive_rows)
+
+
+class FakeInsideLeafModel(torch.nn.Module):
+    def forward(self, x):
+        return count_positive_rows(x).sum()
+
+
+def test_trace_fake_inside_a_leaf_body_runs_fn(monkeypatch):
+    """The body of a registered operator is one node: a `trace_fake` inside it records nothing and runs `fn`."""
+    count_positive_rows.seen.clear()
+    monkeypatch.setattr(CompileFlag, 'trace_strategy', 'cpu')
+    graph = to_fx_graph(FakeInsideLeafModel(), {'x': torch.tensor([0.5, 0.0, -1.0, 2.0])})
+    assert [n.target.__name__ for n in graph.graph.nodes if n.op == 'call_function'] == ['count_positive_rows']
+    assert count_positive_rows.seen == ['Tensor']                                   # a real result, not a proxy
+    monkeypatch.setattr(CompileFlag, 'trace_strategy', 'meta')
+    with pytest.raises(RuntimeError, match="cannot execute `count_positive_rows`"):  # the leaf itself needs a fake_fn
+        to_fx_graph(FakeInsideLeafModel(), {'x': torch.tensor([0.5, 0.0, -1.0, 2.0])})
+
+
+class KeepPositive(torch.autograd.Function):
+    """Reads values in forward, so under meta the whole apply needs a fake."""
+    @staticmethod
+    def forward(ctx, x):
+        return x[x > 0]
+
+    @staticmethod
+    def backward(ctx, grad):
+        return grad
+
+
+class FakedAutogradModel(torch.nn.Module):
+    def forward(self, x):
+        return nnscaler.trace_fake(KeepPositive.apply, torch.zeros(3), x).sum()
+
+
+@pytest.mark.parametrize('strategy', ['cpu', 'meta'])
+def test_trace_fake_accepts_autograd_apply(monkeypatch, strategy):
+    monkeypatch.setattr(CompileFlag, 'trace_strategy', strategy)
+    graph = to_fx_graph(FakedAutogradModel(), {'x': torch.tensor([0.5, 0.0, -1.0, 2.0])})
+    apply, = [n for n in graph.graph.nodes if getattr(n.target, '__name__', '') == 'apply']
+    assert apply.target.__self__ is KeepPositive
+    assert tuple(apply.meta['tensor_meta'].shape) == (3,)                            # the fake's shape; the data gives (2,)
 
 
 def test_trace_fake_runs_fn_outside_tracing():

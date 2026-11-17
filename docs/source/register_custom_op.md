@@ -246,9 +246,13 @@ idx, top_x = nnscaler.trace_fake(
   `nnscaler.trace_fake(torch.nonzero, lambda mask: torch.zeros(mask.numel(), 1, dtype=torch.long), mask)`.
   It sees the arguments as the trace does (meta tensors under the meta strategy), so it may use shapes and
   dtypes but not values, and must allocate on cpu.
-- `fn` must be an operator the tracer records as a node: a torch function, a tensor method, a builtin or a
-  registered operator. A plain Python helper is rejected, since it would become one opaque node instead of
-  being traced into; put `trace_fake` on the data-dependent operator inside the helper.
+- `fn` must be an operator the tracer records as a node: a torch function, a tensor method, a builtin, a
+  registered operator or the `apply` of an `autograd.Function` (`trace_fake(MyFn.apply, fake, x)`). A plain
+  Python helper is rejected, since it would become one opaque node instead of being traced into; put
+  `trace_fake` on the data-dependent operator inside the helper.
+- The body of a registered operator or of an `autograd.Function` is not traced, so a `trace_fake` inside
+  it simply runs the operator. Give the whole operator its stand-in instead: `fake_fn` for a registered
+  operator, `trace_fake(MyFn.apply, ...)` for an autograd function.
 
 Prefer `update_op(fn, fake_fn=...)` when every call of `fn` can share one stand-in, and
 `register_op(..., fake_fn=...)` when a whole helper function should become one operator.

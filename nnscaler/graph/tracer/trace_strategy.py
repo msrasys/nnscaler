@@ -164,24 +164,16 @@ class BaseTraceStrategy:
         # even though the strategy runs everything on `device`.
         # Only the copy that is executed is mapped; the original args are what gets recorded in the graph,
         # so the device constants stay as written there.
-        # A `torch.device` object is a device wherever it appears.
-        # A string or int is one only where its position says so:
-        # the `device=` keyword, and the first positional argument of `Tensor.to` (`first_arg_device`);
-        # anywhere else it is data (`d['cuda']`, `getattr(x, 'cuda')`, `x.view(0)`).
-        # Rebuilding the containers would break in-place container ops (e.g. `list.append` on the executed copy),
-        # so they are returned untouched unless they hold a mapped device.
+        # Only device parameters are mapped: the `device=` keyword of a torch call, and the first positional
+        # argument of `Tensor.to` (`first_arg_device`). A device anywhere else is data, whatever its type:
+        # `table[torch.device('cuda')]` is a dictionary key, `cfg.update(device='cuda')` a dictionary field.
         def to_device(x):
-            if not cls._is_mapped_device(x):
-                return x
             return torch.device(device) if isinstance(x, torch.device) else device
 
-        if any(isinstance(leaf, torch.device) and cls._is_mapped_device(leaf)
-               for leaf in pytree_utils.tree_flatten((args, kwargs))[0]):
-            args, kwargs = pytree_utils.tree_map_only(torch.device, to_device, (args, kwargs))
         if 'device' in kwargs and cls._is_mapped_device(kwargs['device']):
-            kwargs = {**kwargs, 'device': device}
+            kwargs = {**kwargs, 'device': to_device(kwargs['device'])}
         if first_arg_device and args and cls._is_mapped_device(args[0]):
-            args = (device, *args[1:])
+            args = (to_device(args[0]), *args[1:])
         return args, kwargs
 
     @classmethod
@@ -193,15 +185,16 @@ class BaseTraceStrategy:
     @classmethod
     def _call_method(cls, self_obj: Any, target: str, args: Tuple[Any, ...], kwargs: Dict[str, Any], device: str) -> Any:
         """Call ``self_obj.target(*args, **kwargs)`` for execution on ``device``."""
-        is_tensor = isinstance(self_obj, torch.Tensor)
-        if is_tensor and target in cls._DEVICE_METHODS:
+        if not isinstance(self_obj, torch.Tensor):
+            # only tensor methods take a device; for any other receiver the arguments are data
+            return getattr(self_obj, target)(*args, **kwargs)
+        if target in cls._DEVICE_METHODS:
             # `.cuda()` is the method form of device='cuda' (see `_map_devices_to`).
             # The graph keeps the call, but executing it would allocate on a real GPU,
             # so it moves to the execution device instead.
             kwargs = {key: value for key, value in kwargs.items() if key in ('non_blocking', 'memory_format')}
             return self_obj.to(device, **kwargs)
-
-        args, kwargs = cls._map_devices_to(args, kwargs, device, first_arg_device=is_tensor and target == 'to')
+        args, kwargs = cls._map_devices_to(args, kwargs, device, first_arg_device=target == 'to')
         return getattr(self_obj, target)(*args, **kwargs)
 
     def run_placeholder(self, target: Target, args: Tuple[Any, ...], kwargs: Dict[str, Any]) -> Tuple[Any, Tuple, Dict]:
@@ -537,22 +530,33 @@ def trace_fake(fn: Callable, fake: Any, *args, **kwargs) -> Any:
     Tensor methods are given unbound, e.g. ``trace_fake(torch.Tensor.item, 3, x)``;
     ``bool`` conditions as ``trace_fake(bool, True, x > 0)``.
     ``fn`` must be an operator the tracer records as a node
-    (torch function, tensor method, builtin or registered operator), not a plain Python function;
-    in-place operators are not supported.
+    (torch function, tensor method, builtin, registered operator or an ``autograd.Function``'s ``apply``),
+    not a plain Python function; in-place operators are not supported.
+    Inside the body of such an operator nothing is traced, so a ``trace_fake`` there runs ``fn``;
+    give the operator as a whole its fake instead.
     """
-    # Set for the whole forward run of a trace (traces do not nest), so it is the "tracing now" signal.
+    # `ctx_tracer` is set for the whole forward run of a trace (traces do not nest), so it is the "tracing now" signal.
+    # `TEMP_CALL_ORIGIN` is set while the tracer runs the body of a leaf (a registered operator, an `autograd.Function`):
+    # that body is one node and nothing inside it is recorded, so like every other wrapper `trace_fake` runs `fn` there;
+    # the leaf as a whole takes the fake (`fake_fn`, or `trace_fake` on its `apply`).
     tracer = OperatorPatcherContext.ctx_tracer
-    if tracer is None:
+    if tracer is None or wrap_utils.TEMP_CALL_ORIGIN:
         return fn(*args, **kwargs)
     # torch functions, tensor methods and builtins are patched while tracing: record the original
     fn = wrap_utils.unwrap(fn)
-    if not (fn in tracer.autowrap_leaf_function or fn in tracer.autowrap_leaf_class or is_tensor_method_or_property(fn)):
+    if wrap_utils.is_autograd_apply(fn):
+        # `Fn.apply` is the patched apply bound to `Fn`;
+        # the node records the original apply bound to `Fn`, as `create_wrapped_autograd_apply` does.
+        fn = tracer.autograd_functions_mapping.setdefault(
+            fn.__self__, torch._C._FunctionBase.__dict__['apply'].__get__(None, fn.__self__))
+    elif not (fn in tracer.autowrap_leaf_function or fn in tracer.autowrap_leaf_class or is_tensor_method_or_property(fn)):
         # A plain python function would become one opaque IRPyFunc node
         # that cannot be partitioned and that the generated code must import by name;
         # the tracer would normally trace into it.
         raise ValueError(
             f"trace_fake: `{_target_name(fn)}` is not an operator the tracer records as a node (a torch function, "
-            "tensor method, builtin or registered operator). Apply trace_fake to the data-dependent operator inside it.")
+            "tensor method, builtin, registered operator or `autograd.Function.apply`). "
+            "Apply trace_fake to the data-dependent operator inside it.")
 
     with wrap_utils.do_temp_call_origin():
         from .concrete_proxy import ConcreteProxy
