@@ -56,6 +56,34 @@ because locally constructed kwargs dictionaries were conservatively rejected;
 the compiler now proves local dictionary ownership instead of changing the
 model or allowing external mutations.
 
+Subsequent measurements on NNScaler `ba2b81ad` with the same llm-train commit
+replay the identical baseline at 4.485056 s/step (0.095% difference); all 12
+generated Python files and all 80 steps' numerical metrics match the first
+control. Adding attention recomputation gives 4.406099 s/step, **1.76%** gain.
+Moving whole shared computation before forward combine with dW gives
+4.437408 s/step, 1.06%. Combining all side work on one stream loses the gain
+(4.478034 s/step, 0.16%). Separate dW+attention and a whole-shared combination
+hit the 170 GiB guard and are not complete performance measurements.
+
+The attention trace contains exactly the baseline GEMM counts, no extra
+recomputation, and no recompute overlap with forward DeepEP. Mean DeepEP time
+including layout grows from 273.66 to 361.07 ms while 144.20 ms overlaps compute;
+exposure falls to 216.86 ms. Whole shared+dW overlaps 221.13 of 392.02 ms and
+leaves 170.89 ms exposed. Every dW callback launches/publishes once, with exactly
+two expert dW GEMMs: backward combine is 109.95 ms, only 1.15 ms exposed, versus
+53.14 ms in the control. Expert dW GEMM time grows from 272.69 to 308.74 ms/GPU.
+Thus overlapping kernels alone does not establish equivalent end-to-end gains;
+communication expansion and compute contention/arrival delays require attention.
+
+The next opt-in implementation adds independent `backward_on` placement/priority
+and reuses a dead private MoE backward workspace for gW13. The latter preserves
+the required zero-initialized accumulation; the installed DeepGEMM K-grouped API
+requires `C`. CPU checks pass (85 framework, 32 backend), as do 118 CUDA-enabled
+framework tests. Real EP2 tests with both changes retain bitwise outputs/parameter
+gradients and the same 0.000854 input-gradient error; workspace reuse occurs in
+both tested backwards on each rank. Full-model performance of these latest
+changes remains pending; they are not yet selected as defaults.
+
 ## Workload and measurement
 
 The workload matches the offload session: YOCO-MoE-15B-A6B-L4, PP3/EP2 on six

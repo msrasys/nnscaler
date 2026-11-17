@@ -1281,7 +1281,8 @@ class ModuleCodeGen(FuncEmission):
                 continue
             if node in eager_backward_points:
                 flush()
-                dependencies = [obj for region in eager_backward_points[node]
+                anchored = eager_backward_points[node]
+                dependencies = [obj for region in anchored
                                 for obj in region.outputs if obj.requires_grad]
                 if dependencies:
                     value = next((obj for obj in node.iobjs()
@@ -1289,12 +1290,25 @@ class ModuleCodeGen(FuncEmission):
                     if value is None:
                         raise ValueError(f'Backward overlap anchor {node.signature} has no differentiable input')
                     name = self.tensor_name(value)
-                    keys = tuple(r.key for r in eager_backward_points[node])
-                    body.append(f'{name} = _module_streams.after_backward({name}, {names(dependencies)}, {keys!r})')
+                    keys = tuple(r.key for r in anchored)
+                    retained = [f'_{r.key}_backward_outputs' for r in anchored if r.retain_backward_outputs]
+                    dependency_names = names(dependencies)
+                    if retained:
+                        parts = []
+                        for region in anchored:
+                            if region.retain_backward_outputs:
+                                parts.append(f'*_{region.key}_backward_outputs')
+                            else:
+                                parts.extend(self.tensor_name(obj, prefix_attr='self.')
+                                             for obj in region.outputs if obj.requires_grad)
+                        dependency_names = '(' + ', '.join(parts) + ',)'
+                    body.append(f'{name} = _module_streams.after_backward({name}, {dependency_names}, {keys!r})')
                     with Block(f'with _module_streams.backward_point({keys!r}){readiness_scope(node)}:') as block:
                         block.insert_body(self._emit_segment_nodes(
                             segment, [node], runtime_devid, lifetime, release_unused=False))
                     body.extend(block.code)
+                    if retained:
+                        body.append('del ' + ', '.join(retained))
                     continue
             if node in starts:
                 flush()
@@ -1331,6 +1345,9 @@ class ModuleCodeGen(FuncEmission):
                         body.append(self.emit_release(expired))
                 else:
                     preserve = ', preserve_accumulators=True' if region.overlap_backward else ''
+                    if region.retain_backward_outputs:
+                        body.append(f'_{region.key}_backward_boundaries = '
+                                    f'nnscaler.runtime.deferred.backward_boundaries({names(region.inputs)})')
                     with Block(f'with _module_streams.fork({region.key!r}, {region.stream!r}, {names(region.inputs)}{preserve}):') as block:
                         block.insert_body(self._emit_segment_nodes(
                             segment, region.nodes, runtime_devid, lifetime, release_unused=False))
@@ -1341,6 +1358,15 @@ class ModuleCodeGen(FuncEmission):
                         body.append(f'_module_streams.publish({names(caller)})')
                     if producer:
                         body.append(f'_module_streams.publish({names(producer)}, stream={region.stream!r})')
+                    if region.retain_backward_outputs:
+                        # The ordinary data consumer can release its local
+                        # variable before the later backward anchor. Retain
+                        # only the graph edges needed for its None controls.
+                        dependencies = tuple(obj for obj in region.outputs if obj.requires_grad)
+                        body.append(f'nnscaler.runtime.deferred.prioritize_backward('
+                                    f'{names(dependencies)}, _{region.key}_backward_boundaries)')
+                        body.append(f'del _{region.key}_backward_boundaries')
+                        body.append(f'_{region.key}_backward_outputs = {names(dependencies)}')
             elif node in ready_at or node in weight_anchors:
                 flush()
                 with Block(f'with {readiness_scope(node)[2:]}:') as block:

@@ -7,6 +7,38 @@ import torch
 from nnscaler.runtime.deferred import DeferredRegion, LaunchPoint, after_backward, notify_async_launch
 
 
+def test_backward_priority_preserves_input_graph_boundaries_and_math():
+    from nnscaler.runtime.deferred import backward_boundaries, prioritize_backward
+    x = torch.randn(8, requires_grad=True)
+    rx = x.detach().clone().requires_grad_()
+    common = x.sin()
+    metadata = {'nested': [common]}
+    metadata['cycle'] = metadata
+    boundaries = backward_boundaries(metadata)
+    selected, other = common.tanh().square(), common.cos()
+    input_sequence = common.grad_fn._sequence_nr()
+    other_sequence = other.grad_fn._sequence_nr()
+    leaf = common.grad_fn.next_functions[0][0]
+    leaf_sequence = leaf._sequence_nr()
+    prioritize_backward((selected,), boundaries)
+    priority = selected.grad_fn._sequence_nr()
+    prioritize_backward((selected,), boundaries)
+    assert selected.grad_fn._sequence_nr() == priority > other_sequence
+    assert common.grad_fn._sequence_nr() == input_sequence
+    assert other.grad_fn._sequence_nr() == other_sequence
+    assert leaf._sequence_nr() == leaf_sequence
+    (selected + other).sum().backward()
+    (rx.sin().tanh().square() + rx.sin().cos()).sum().backward()
+    torch.testing.assert_close(x.grad, rx.grad)
+
+
+def test_backward_priority_rejects_opaque_input_graphs():
+    from types import SimpleNamespace
+    from nnscaler.runtime.deferred import backward_boundaries
+    with pytest.raises(TypeError, match='graph boundaries'):
+        backward_boundaries(SimpleNamespace(value=torch.ones(1, requires_grad=True)))
+
+
 def test_nested_backward_regions_share_one_input_event(monkeypatch):
     from nnscaler.runtime.deferred import BackwardLaunchPoint, capture_async_backward
     events = []

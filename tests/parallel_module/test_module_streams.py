@@ -5,7 +5,7 @@ import ast
 import json
 import copy
 import functools
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from contextlib import contextmanager
 
 import pytest
@@ -294,7 +294,10 @@ def test_repeated_invocations_preserve_outputs_and_gradients(tmp_path, monkeypat
 
 @pytest.mark.parametrize('kwargs', [dict(stream='default'), dict(split_before='down'),
                                     dict(module=''), dict(resume_before='torch.cos'),
-                                    dict(recompute_only=True, launch_before='torch.sin')])
+                                    dict(recompute_only=True, launch_before='torch.sin'),
+                                    dict(backward_on='torch.cos'),
+                                    dict(launch_on='torch.sin', overlap_backward=True, backward_on='torch.cos'),
+                                    dict(launch_before='torch.sin', overlap_backward=True, backward_on='')])
 def test_invalid_rules(kwargs):
     with pytest.raises(ValueError):
         ModuleStreamRule(**(dict(module='side') | kwargs))
@@ -653,18 +656,21 @@ class CPUDeferredStreams(SerialStreams):
 
 def _anchor_rule(launch, tied=False):
     native = launch.startswith('input_ready')
-    point = 'on' if native else launch
+    independent = launch == 'independent_backward'
+    point = 'before' if independent else ('on' if native else launch)
     options = {f'launch_{point}': '*.dispatch_anchor'}
     if not tied:
         options.update(split_before='down', **{f'resume_{point}':
                        '*.dispatch_anchor' if launch.endswith('_same') else '*.combine_anchor'})
+    if independent:
+        options['backward_on'] = '*.dispatch_anchor' if tied else '*.combine_anchor'
     return ModuleStreamRule('side', overlap_backward=True,
                             launch_phase='input_ready' if native else 'submitted', **options)
 
 
 @replace_all_device_with('cpu', force=True)
 @pytest.mark.parametrize('workers', [1, 2])
-@pytest.mark.parametrize('launch', ['on', 'before', 'input_ready', 'input_ready_same'])
+@pytest.mark.parametrize('launch', ['on', 'before', 'input_ready', 'input_ready_same', 'independent_backward'])
 def test_deferred_codegen_preserves_math_and_orders_both_backward_regions(tmp_path, monkeypatch, workers, launch):
     monkeypatch.setattr('nnscaler.runtime.stream.ModuleStreams', CPUDeferredStreams)
     model = AnchorModel()
@@ -690,11 +696,26 @@ def test_deferred_codegen_preserves_math_and_orders_both_backward_regions(tmp_pa
         _anchor_backward_order.clear()
         actual.square().sum().backward()
         assert _anchor_backward_order.index('combine') < _anchor_backward_order.index('down')
-        assert _anchor_backward_order.index('dispatch') < _anchor_backward_order.index('up')
+        if launch == 'independent_backward':
+            assert _anchor_backward_order.index('combine') < _anchor_backward_order.index('up') < _anchor_backward_order.index('dispatch')
+        else:
+            assert _anchor_backward_order.index('dispatch') < _anchor_backward_order.index('up')
         expected.square().sum().backward()
         torch.testing.assert_close(x.grad, ref_x.grad)
         for name, parameter in generated.named_parameters():
             torch.testing.assert_close(parameter.grad, reference.get_parameter(generated.fullmap[name].orig_name).grad)
+
+
+@replace_all_device_with('cpu', force=True)
+@pytest.mark.parametrize('anchor,reason', [('*.dispatch_anchor', 'follow all selected forward chunks'),
+                                         ('*.missing_anchor', 'expected one backward anchor'),
+                                         ('*anchor', 'expected one backward anchor')])
+def test_independent_backward_rejects_unavailable_or_ambiguous_anchor(tmp_path, anchor, reason):
+    rule = replace(_anchor_rule('independent_backward'), backward_on=anchor)
+    with pytest.raises(RuntimeError, match='Code generation failed') as error:
+        parallelize(AnchorModel(), {'x': torch.randn(4, 8, requires_grad=True)}, 'dp',
+                    ComputeConfig(1, 1, module_streams=(rule,)), gen_savedir=tmp_path, load_module=False)
+    assert reason in str(error.value.__cause__)
 
 
 class TiedAnchorModel(torch.nn.Module):
@@ -709,16 +730,19 @@ class TiedAnchorModel(torch.nn.Module):
 
 
 @replace_all_device_with('cpu', force=True)
-def test_deferred_tied_parameters_and_multiple_live_forwards(tmp_path, monkeypatch):
+@pytest.mark.parametrize('independent', [False, True])
+def test_deferred_tied_parameters_and_multiple_live_forwards(tmp_path, monkeypatch, independent):
     monkeypatch.setattr('nnscaler.runtime.stream.ModuleStreams', CPUDeferredStreams)
     model = TiedAnchorModel()
     reference = copy.deepcopy(model)
-    rule = ModuleStreamRule('side', launch_on='*.dispatch_anchor', overlap_backward=True)
+    rule = (_anchor_rule('independent_backward', tied=True) if independent else
+            ModuleStreamRule('side', launch_on='*.dispatch_anchor', overlap_backward=True))
+    instance = f'tied_deferred_{independent}'
     parallelize(model, {'x': torch.randn(4, 8, requires_grad=True)}, 'dp',
                 ComputeConfig(1, 1, module_streams=(rule,)), gen_savedir=tmp_path,
-                instance_name='tied_deferred', load_module=False)
+                instance_name=instance, load_module=False)
     cls = _load_parallel_module_class(TiedAnchorModel, gen_savedir=tmp_path,
-                                      instance_name='tied_deferred', rank=0)
+                                      instance_name=instance, rank=0)
     generated = new_empty(cls, device='cpu', init_params=True)
     values = [torch.randn(4, 8, requires_grad=True) for _ in range(3)]
     references = [x.detach().clone().requires_grad_() for x in values]
@@ -736,7 +760,7 @@ def test_deferred_tied_parameters_and_multiple_live_forwards(tmp_path, monkeypat
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason='requires CUDA')
 @pytest.mark.parametrize('tied', [False, True])
-@pytest.mark.parametrize('launch', ['on', 'before', 'input_ready'])
+@pytest.mark.parametrize('launch', ['on', 'before', 'input_ready', 'independent_backward'])
 def test_generated_deferred_module_cuda_gradients(tmp_path, tied, launch):
     import torch.distributed as dist
     import nnscaler

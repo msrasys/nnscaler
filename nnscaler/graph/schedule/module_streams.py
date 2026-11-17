@@ -41,9 +41,10 @@ class ModuleStreamRule:
     kernel_graphs: bool = False
     recompute_ready_on: str | None = None
     weight_backward_on: str | None = None
+    backward_on: str | None = None
     # Persist the generated-code ABI, including in pickled configurations.
     # A default factory leaves old pickles detectably missing the field.
-    _codegen_version: int = field(default_factory=lambda: 13, init=False, repr=False)
+    _codegen_version: int = field(default_factory=lambda: 14, init=False, repr=False)
 
     def __post_init__(self):
         if self.weight_backward_on is not None:
@@ -51,7 +52,7 @@ class ModuleStreamRule:
                 raise ValueError('weight_backward_on must be a nonempty signature pattern')
             if (self.recompute_only or self.launch_before or self.launch_after or self.launch_on
                     or self.split_before or self.resume_before or self.resume_after or self.resume_on
-                    or self.host_concurrency or self.async_anchor_copies or self.overlap_backward
+                    or self.host_concurrency or self.async_anchor_copies or self.overlap_backward or self.backward_on
                     or self.kernel_graphs or self.launch_phase != 'submitted'):
                 raise ValueError('Weight backward rules cannot also move forward computation')
         if self.recompute_ready_on is not None and not self.recompute_only:
@@ -82,7 +83,7 @@ class ModuleStreamRule:
             if not isinstance(getattr(self, name), str) or not getattr(self, name):
                 raise ValueError(f'{name} must be a nonempty string')
         for name in ('launch_before', 'split_before', 'resume_before', 'launch_after', 'resume_after',
-                     'launch_on', 'resume_on', 'recompute_ready_on'):
+                     'launch_on', 'resume_on', 'recompute_ready_on', 'backward_on'):
             value = getattr(self, name)
             if value is not None and (not isinstance(value, str) or not value):
                 raise ValueError(f'{name} must be a nonempty string or None')
@@ -102,6 +103,9 @@ class ModuleStreamRule:
                 or (self.split_before and not (self.resume_on or self.resume_before))
                 or self.host_concurrency):
             raise ValueError('Backward overlap requires synchronous host submission before or at each anchor')
+        if self.backward_on is not None and (not self.overlap_backward or not self.launch_before
+                or (self.split_before and not self.resume_before) or self.host_concurrency):
+            raise ValueError('backward_on requires eager launch_before/resume_before with overlap_backward')
 
 
 def module_stream_rules_from_env():
@@ -147,6 +151,7 @@ class ModuleStreamRegion:
     backward_anchor: object = None
     native: bool = False
     kernel_graphs: bool = False
+    retain_backward_outputs: bool = False
 
 
 def _unsafe(node):
@@ -238,6 +243,17 @@ def plan_module_streams(nodes, outputs, rules):
                 chunks = [branch[:split], branch[split:]]
 
             parent, call = scopes[invocation]
+            backward_override = None
+            if rule.backward_on is not None:
+                candidates = [n for n in nodes if n not in branch
+                              and fnmatchcase(n.signature, rule.backward_on)
+                              and (not parent or parent in (n.module_stack or {}))
+                              and (call is None or (n.module_call_stack or {}).get(parent) == call)]
+                if len(candidates) != 1:
+                    raise ValueError(f'{path}: expected one backward anchor {rule.backward_on!r}, found {len(candidates)}')
+                backward_override = candidates[0]
+                if backward_override.recompute is not None:
+                    raise ValueError(f'{path}: backward anchor must remain outside checkpoints')
             anchors = ((rule.launch_before or rule.launch_after or rule.launch_on,
                         bool(rule.launch_after or rule.launch_on), bool(rule.launch_on)),
                        (rule.resume_before or rule.resume_after or rule.resume_on,
@@ -247,7 +263,7 @@ def plan_module_streams(nodes, outputs, rules):
                 deferred = deferred and not native
                 destination = positions[chunk[0]]
                 ready_before = None
-                backward_anchor = None
+                backward_anchor = backward_override
                 if anchor:
                     candidates = [n for n in nodes if n not in branch
                                   and fnmatchcase(n.signature, anchor)
@@ -257,7 +273,8 @@ def plan_module_streams(nodes, outputs, rules):
                         raise ValueError(f'{path}: expected one launch anchor {anchor!r}, found {len(candidates)}')
                     destination = positions[candidates[0]] + int(after)
                     ready_before = candidates[0] if after else None
-                    backward_anchor = candidates[0] if rule.overlap_backward else None
+                    if backward_override is None:
+                        backward_anchor = candidates[0] if rule.overlap_backward else None
                 # Already-available synthesized inputs need not move with the
                 # module. Preserve their original position and other users.
                 chunk = [n for n in chunk if n in original_branch or positions[n] >= destination]
@@ -299,7 +316,8 @@ def plan_module_streams(nodes, outputs, rules):
                                             ready_before, rule.host_concurrency, rule.async_anchor_copies,
                                             deferred=deferred, overlap_backward=rule.overlap_backward,
                                             backward_anchor=backward_anchor, native=native,
-                                            kernel_graphs=rule.kernel_graphs)
+                                            kernel_graphs=rule.kernel_graphs,
+                                            retain_backward_outputs=backward_override is not None)
                 regions[key] = region
                 placements[destination].append(region)
                 selected.update(chunk)
@@ -325,6 +343,14 @@ def plan_module_streams(nodes, outputs, rules):
     # consumers are ordered by the caller stream; same-stream regions need none.
     owners = {n: r for r in regions.values() for n in r.nodes}
     for region in regions.values():
+        if region.retain_backward_outputs:
+            if region.backward_anchor in owners:
+                raise ValueError('Explicit backward anchors must remain on the caller stream')
+            if any(other.ready_before is region.backward_anchor and (other.deferred or other.native)
+                   for other in regions.values()):
+                raise ValueError('Explicit backward anchors cannot also be deferred launch points')
+            if any(new_positions[n] >= new_positions[region.backward_anchor] for n in region.nodes):
+                raise ValueError('Explicit backward anchor must follow all selected forward chunks')
         region.caller_outputs = tuple(obj for obj in region.outputs if obj in graph_outputs
                                       or any(node not in owners for node in consumers[obj]))
     for region in regions.values():

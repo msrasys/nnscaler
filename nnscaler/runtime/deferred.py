@@ -12,11 +12,70 @@ No communication backend or model names are part of this protocol.
 from threading import local
 import types
 import weakref
+from collections import OrderedDict
 
 import torch
 
 
 _active = local()
+
+
+def _backward_tensors(values):
+    pending, seen, result = [values], set(), []
+    while pending:
+        value = pending.pop()
+        if id(value) in seen:
+            continue
+        seen.add(id(value))
+        if isinstance(value, torch.Tensor):
+            result.append(value)
+        elif type(value) in (dict, OrderedDict):
+            pending.extend(value.keys())
+            pending.extend(value.values())
+            if type(value) is OrderedDict:
+                pending.extend(vars(value).values())
+        elif type(value) in (tuple, list, torch.Size):
+            pending.extend(value)
+        elif isinstance(value, tuple) and hasattr(type(value), '_fields') and not hasattr(value, '__dict__'):
+            pending.extend(value)
+        elif value is not None and not isinstance(value, (bool, int, float, complex, str, bytes,
+                                                           torch.dtype, torch.device)):
+            raise TypeError('backward_on requires tensor/builtin-container graph boundaries')
+    return result
+
+
+def backward_boundaries(inputs):
+    """Snapshot graph boundaries before codegen releases local input names."""
+    return {value.grad_fn for value in _backward_tensors(inputs) if value.grad_fn is not None}
+
+
+def prioritize_backward(outputs, boundaries):
+    """Prioritize a local autograd subgraph without moving any dependency.
+
+    An early forward prefix otherwise retains a lower ready-queue priority
+    than intervening work, even after a later anchor releases its controls.
+    Reserve a high sequence-number band, preserving order within that band.
+    Input graph nodes and leaf accumulators keep their original priorities.
+    No backward is started here and no work is queued for another GraphTask.
+    """
+    if not torch.is_grad_enabled():
+        return
+    pending = [value.grad_fn for value in _backward_tensors(outputs) if value.grad_fn is not None]
+    seen = set()
+    priority_band = 1 << 60
+    while pending:
+        node = pending.pop()
+        if node is None or node in seen or node in boundaries:
+            continue
+        seen.add(node)
+        if not hasattr(node, '_sequence_nr') or not hasattr(node, '_set_sequence_nr'):
+            raise RuntimeError('backward_on requires PyTorch autograd node priority support')
+        sequence = node._sequence_nr()
+        # AccumulateGrad has UINT64_MAX priority; already promoted nodes are
+        # idempotent. Dependencies still determine when a node becomes ready.
+        if sequence < priority_band:
+            node._set_sequence_nr(priority_band + sequence)
+        pending.extend(parent for parent, _ in node.next_functions)
 
 
 class BackwardLaunchPoint:

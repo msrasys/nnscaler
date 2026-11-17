@@ -40,6 +40,32 @@ original position and can overlap subsequent independent modules.
 
 ## Local input/weight backward overlap
 
+Forward splitting and backward readiness can be selected independently:
+
+```python
+ModuleStreamRule(
+    module='*.shared', stream='shared_expert',
+    launch_before='*.nnscaler_moe_dispatch', split_before='down_proj',
+    resume_before='*.nnscaler_moe_combine', overlap_backward=True,
+    backward_on='*.nnscaler_moe_combine',
+)
+```
+
+`backward_on` keeps the eager forward placement, but gates the selected backward
+subgraph at the named backend's input-ready event. It also raises that subgraph's
+autograd ready-queue priority: an early forward prefix would otherwise remain
+behind intervening expert work even when its gradient is ready. Input graph
+boundaries and leaf accumulators keep their original priorities, and dependencies
+still control readiness. No additional backward GraphTask or microbatch is queued.
+
+The explicit backward anchor must follow all selected forward chunks, remain on
+the caller stream outside checkpoints, and expose the existing readiness protocol.
+It cannot also be a deferred/native forward launch point. The option requires
+PyTorch's autograd node priority API, checked at runtime, and tensor/builtin
+container graph boundaries. It changes sequence numbers used by autograd
+profiling; use the backend NVTX ranges to attribute these schedules. Generated
+code ABI 14 preserves the required input boundaries and output control references.
+
 `weight_backward_on` delays a cooperative module's parameter-gradient kernels
 until an upstream backend has submitted its backward communication:
 
