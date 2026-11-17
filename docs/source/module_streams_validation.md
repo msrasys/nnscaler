@@ -5,6 +5,25 @@ current comparison uses one fixed no-overlap baseline and changes stream
 scheduling and its backend submission adapters. Communication tuning gains from
 earlier experiments are excluded.
 
+## 2026-11-18: local dInput/dWeight implementation
+
+The optional `weight_backward_on` feature separates expert dInput and dWeight
+inside the existing backward action. It follows the local communication window
+in the `yileiyang/dw_split` references (NNScaler `4344a22a`, llm-train `7f49702b`),
+while retaining ordinary autograd parameter edges instead of importing the FBW
+pipeline scheduler or a device-wide pending-weight queue. It does not introduce
+cross-microbatch work. The previous performance numbers below are **not**
+measurements of this new feature.
+
+Current validation is CPU-only: 66 compiler/runtime tests pass, with 15 CUDA
+tests skipped, and 27 backend/MoE kernel-double tests pass. Checks include
+repeated module invocations, ordinary reducer completion counts with mixed
+native gradients, BF16 parameters with FP32 gradients, retained backward,
+parameter updates, checkpoint reuse, AMP and failure cleanup. Actual CUDA
+kernels, memory overhead and 15B PP3/EP2 performance are pending the offload
+session's GPU release. A separate attention-recomputation configuration is
+prepared using the existing `*.self_attn` checkpoints; it is also unmeasured.
+
 ## Workload and measurement
 
 The workload matches the offload session: YOCO-MoE-15B-A6B-L4, PP3/EP2 on six

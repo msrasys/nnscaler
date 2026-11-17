@@ -145,8 +145,15 @@ class ModuleStreams:
         self.native_results = {}
         self.region_streams = {}
         self.backward_points = {}
+        self.weight_regions = {}
         self.streams = {self.caller}
         return self
+
+    def weight_region(self, key, name, parameters):
+        from .weight_backward import WeightBackwardRegion
+        region = WeightBackwardRegion(name, parameters)
+        self.weight_regions[key] = region
+        return region
 
     def prepare(self, key, name, function, parent, inputs, attributes, output_specs):
         """Prepare tensor/autograd edges; enqueue their work at an async anchor."""
@@ -369,6 +376,12 @@ class ModuleStreams:
         with input_stream_lifetime(self.owners, True):
             pass
         self.owners.clear()
+        for region in self.weight_regions.values():
+            try:
+                region.close_forward(failed=exc_type is not None or error is not None or bool(unlaunched))
+            except BaseException as failure:
+                error = error or failure
+        self.weight_regions.clear()
         if error is not None and exc_type is None:
             raise error
         if unlaunched and exc_type is None:

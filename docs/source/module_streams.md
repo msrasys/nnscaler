@@ -38,6 +38,55 @@ selected module; the suffix starts before `resume_before`. Omit both split field
 to launch the whole branch. Without a launch anchor, a branch stays in its
 original position and can overlap subsequent independent modules.
 
+## Local input/weight backward overlap
+
+`weight_backward_on` delays a cooperative module's parameter-gradient kernels
+until an upstream backend has submitted its backward communication:
+
+```python
+ModuleStreamRule(
+    module='*.expert', stream='expert_wgrad',
+    weight_backward_on='*.nnscaler_moe_dispatch',
+)
+```
+
+This borrows the dInput/dWeight separation used by zero-bubble scheduling, but
+does not change the PP schedule or mix microbatches. A region belongs to one
+module invocation and one autograd GraphTask. Its dWeight finishes within that
+backward; it is not queued for a later microbatch. The anchor must precede the
+module, outside checkpoints, with a differentiable data path into the module.
+The rule can be combined with a separate `recompute_only` rule for that module.
+
+The backend wrapper calls `nnscaler.prepare_weight_backward(parameters)` before
+its autograd Function. When a binding is returned, it passes
+`binding.parameters` to the Function and retains the binding in its context.
+Backward computes dInput, registers
+`binding.defer(callback, inputs)`, and returns `None` for the bound weight
+gradients. The callback returns those gradients in the original parameter
+order. Tensor inputs retained by the callback should be detached references;
+do not resize storage shared with other consumers. The caller lists all inputs
+whose storage the callback reads so the runtime can record their CUDA stream.
+Callbacks perform pure gradient computation; they do not issue collectives or
+publish reducer contributions themselves. Register them from the module's
+ordinary backward, not from a nested autograd GraphTask.
+
+The asynchronous anchor uses `prepare_async_input` before Function.apply and
+captures `capture_async_backward()` in forward. Its backward calls
+`record_ready()` before communication, then `submitted()` after communication
+submission and before inserting the result wait. Both waits must still be
+inserted on exception paths. Without `submitted()`, parameter backward provides
+a later launch fallback. The ordinary autograd parameter edges, gradient dtype,
+accumulation hooks and reducer contribution counts are retained; no manual
+reducer-buffer publication is required. Parameter edges are created immediately
+before their anchor to avoid retaining an entire stage's weight gradients.
+
+Support is first-order, single-device, ZeRO 0/1, with non-reentrant checkpoints.
+Concurrent backward calls on the same forward invocation are unsupported;
+separate live forward invocations keep separate task state.
+Missing backend binding/readiness fails explicitly. As of the initial
+implementation, CPU compiler/autograd and MoE kernel-double tests pass; CUDA
+correctness, actual memory use and PP3/EP2 performance still require validation.
+
 ## Explicit asynchronous launch points
 
 For cooperative backends, `launch_phase='input_ready'` with

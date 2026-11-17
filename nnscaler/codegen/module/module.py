@@ -35,6 +35,7 @@ from nnscaler.codegen.module.autograd import AutogradAdapterCodeGen
 from nnscaler.codegen.lifecycle import LifeCycle
 from nnscaler.graph.schedule.module_streams import plan_module_streams, checkpoint_stream
 from nnscaler.graph.schedule.checkpoint_readiness import plan_checkpoint_readiness
+from nnscaler.graph.schedule.weight_backward import plan_weight_backward
 
 from nnscaler.flags import CompileFlag
 from nnscaler.utils import fields
@@ -1092,8 +1093,23 @@ class ModuleCodeGen(FuncEmission):
         return codes
 
     def _emit_module_streams(self, segment, runtime_devid):
+        previous = getattr(self, '_weight_regions_by_node', {})
+        try:
+            return self._emit_module_streams_impl(segment, runtime_devid)
+        finally:
+            self._weight_regions_by_node = previous
+
+    def _emit_module_streams_impl(self, segment, runtime_devid):
         nodes, regions, joins = plan_module_streams(
             segment.nodes(), segment.oobjs(), CompileFlag.module_streams)
+        weight_plans = plan_weight_backward(nodes, CompileFlag.module_streams)
+        self._weight_regions_by_node = {node: plan.key for plan in weight_plans for node in plan.nodes}
+        weight_anchors = {}
+        for plan in weight_plans:
+            if any(plan.anchor in region.nodes or any(node in region.nodes for node in plan.nodes)
+                   for region in regions.values()):
+                raise ValueError('Weight backward rules cannot also move their module/anchor forward')
+            weight_anchors.setdefault(plan.anchor, []).append(plan.key)
         checkpoint_anchors = plan_checkpoint_readiness(nodes, segment.oobjs(), CompileFlag.module_streams)
         readiness_names = {gid: f'_checkpoint_ready_{index}' for index, gid in enumerate(checkpoint_anchors)}
         ready_at = {}
@@ -1119,7 +1135,7 @@ class ModuleCodeGen(FuncEmission):
                         'float', 'half', 'bfloat16', 'identity', 'transpose', 'permute', 't')):
                 for output in node.oobjs():
                     self.module_parameter_origins[output] = origins
-        if not regions and not checkpoint_anchors:
+        if not regions and not checkpoint_anchors and not weight_plans:
             return self._emit_segment_nodes(segment, nodes, runtime_devid)
         # Schedule emission shares this execution plan. Its executor calls must
         # retain opaque inputs through backward when intra-segment streams exist.
@@ -1173,7 +1189,8 @@ class ModuleCodeGen(FuncEmission):
                 pending.clear()
 
         def readiness_scope(node):
-            return ''.join(f', {name}' for name in ready_at.get(node, ()))
+            return (''.join(f', {name}' for name in ready_at.get(node, ()))
+                    + ''.join(f', {name}.anchor()' for name in weight_anchors.get(node, ())))
 
         def resolve(key):
             region = unresolved.pop(key)
@@ -1196,6 +1213,15 @@ class ModuleCodeGen(FuncEmission):
                 flush()
                 for key in needed:
                     resolve(key)
+            if node in weight_anchors:
+                flush()
+                # Create the parameter autograd nodes immediately before this
+                # invocation's anchor, keeping their backward priority ahead
+                # of upstream work instead of retaining a stage of dWeights.
+                for plan in weight_plans:
+                    if plan.anchor is node:
+                        body.append(f'{plan.key} = _module_streams.weight_region('
+                                    f'{plan.key!r}, {plan.stream!r}, {names(plan.parameters)})')
             if node in captures:
                 flush()
                 body.extend(f'_module_streams.capture({key!r})' for key in captures[node])
@@ -1315,9 +1341,9 @@ class ModuleCodeGen(FuncEmission):
                         body.append(f'_module_streams.publish({names(caller)})')
                     if producer:
                         body.append(f'_module_streams.publish({names(producer)}, stream={region.stream!r})')
-            elif node in ready_at:
+            elif node in ready_at or node in weight_anchors:
                 flush()
-                with Block(f'with {", ".join(ready_at[node])}:') as block:
+                with Block(f'with {readiness_scope(node)[2:]}:') as block:
                     block.insert_body(self._emit_segment_nodes(
                         segment, [node], runtime_devid, lifetime, release_unused=False))
                 body.extend(block.code)
@@ -1406,6 +1432,11 @@ class ModuleCodeGen(FuncEmission):
                     with Block('with nnscaler.runtime.stream.AsyncTensorCopies():') as copy_scope:
                         copy_scope.insert_body(code)
                     code = copy_scope.code
+                weight_region = getattr(self, '_weight_regions_by_node', {}).get(node)
+                if weight_region is not None:
+                    with Block(f'with {weight_region}.compute():') as weight_scope:
+                        weight_scope.insert_body(code)
+                    code = weight_scope.code
 
                 if not param_inputs or CompileFlag.use_zero <= 1:
                     node_code += code

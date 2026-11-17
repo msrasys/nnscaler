@@ -48,6 +48,10 @@ class BackwardLaunchPoint:
             for target in self.streams if stream is None else (stream,):
                 target.wait_event(self.ready)
 
+    def submitted(self):
+        """Notify after backward work is queued, before waiting for its result."""
+        pass
+
 
 class _BackwardLaunchPoints:
     """One backend event can gate independent side regions and checkpoints."""
@@ -56,10 +60,18 @@ class _BackwardLaunchPoints:
         self.points = tuple(points)
 
     def record_ready(self):
+        if all(getattr(point, 'cuda', True) is False for point in self.points):
+            for point in self.points:
+                point.record_ready()
+            return
         ready = torch.cuda.Event()
         ready.record()
         for point in self.points:
             point.ready = ready
+
+    def submitted(self):
+        for point in self.points:
+            point.submitted()
 
 
 def capture_async_backward():
@@ -161,7 +173,9 @@ def prepare_async_input(value):
     backward controls to this actual backend input. Otherwise return it as-is.
     """
     point = getattr(_active, 'point', None)
-    return point.prepare_input(value) if isinstance(point, NativeLaunchPoint) else value
+    value = point.prepare_input(value) if isinstance(point, NativeLaunchPoint) else value
+    from .weight_backward import prepare_weight_anchor
+    return prepare_weight_anchor(value)
 
 
 def native_async_launch_pending():

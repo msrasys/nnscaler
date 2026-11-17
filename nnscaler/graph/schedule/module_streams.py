@@ -39,11 +39,20 @@ class ModuleStreamRule:
     launch_phase: str = 'submitted'
     kernel_graphs: bool = False
     recompute_ready_on: str | None = None
+    weight_backward_on: str | None = None
     # Persist the generated-code ABI, including in pickled configurations.
     # A default factory leaves old pickles detectably missing the field.
-    _codegen_version: int = field(default_factory=lambda: 12, init=False, repr=False)
+    _codegen_version: int = field(default_factory=lambda: 13, init=False, repr=False)
 
     def __post_init__(self):
+        if self.weight_backward_on is not None:
+            if not isinstance(self.weight_backward_on, str) or not self.weight_backward_on:
+                raise ValueError('weight_backward_on must be a nonempty signature pattern')
+            if (self.recompute_only or self.launch_before or self.launch_after or self.launch_on
+                    or self.split_before or self.resume_before or self.resume_after or self.resume_on
+                    or self.host_concurrency or self.async_anchor_copies or self.overlap_backward
+                    or self.kernel_graphs or self.launch_phase != 'submitted'):
+                raise ValueError('Weight backward rules cannot also move forward computation')
         if self.recompute_ready_on is not None and not self.recompute_only:
             raise ValueError('recompute_ready_on requires a recompute_only rule')
         if type(self.kernel_graphs) is not bool:
@@ -178,7 +187,7 @@ def plan_module_streams(nodes, outputs, rules):
     regions, placements, selected = {}, defaultdict(list), set()
 
     for rule in normalize_module_stream_rules(rules):
-        if rule.recompute_only:
+        if rule.recompute_only or rule.weight_backward_on:
             continue
         invocations = defaultdict(list)
         scopes = {}
