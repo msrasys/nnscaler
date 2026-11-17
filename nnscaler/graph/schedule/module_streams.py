@@ -38,7 +38,7 @@ class ModuleStreamRule:
     overlap_backward: bool = False
     # Persist the generated-code ABI, including in pickled configurations.
     # A default factory leaves old pickles detectably missing the field.
-    _codegen_version: int = field(default_factory=lambda: 8, init=False, repr=False)
+    _codegen_version: int = field(default_factory=lambda: 9, init=False, repr=False)
 
     def __post_init__(self):
         if type(self.recompute_only) is not bool:

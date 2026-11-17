@@ -19,6 +19,46 @@ import torch
 _active = local()
 
 
+class BackwardLaunchPoint:
+    """Align side backward with the GPU inputs of an asynchronous operation."""
+
+    def __init__(self, streams):
+        self.streams = tuple(set(streams))
+        self.captured = False
+        self.ready = None
+
+    def __enter__(self):
+        self.previous = getattr(_active, 'backward', None)
+        _active.backward = self
+        return self
+
+    def __exit__(self, *exc):
+        _active.backward = self.previous
+
+    def record_ready(self):
+        # Record before the backend inserts its result wait. The host can run
+        # far ahead of this event; submission order alone cannot align kernels.
+        self.ready = torch.cuda.Event()
+        self.ready.record()
+
+    def wait(self):
+        if self.captured and self.ready is None:
+            raise RuntimeError('The async backward did not record its input readiness')
+        if self.ready is not None:
+            for stream in self.streams:
+                stream.wait_event(self.ready)
+
+
+def capture_async_backward():
+    """Capture during backend forward; record_ready() before backward submission."""
+    point = getattr(_active, 'backward', None)
+    if point is not None:
+        if point.captured:
+            raise RuntimeError('An async backward launch point must identify one backend operation')
+        point.captured = True
+    return point
+
+
 class LaunchPoint:
     """Run callbacks once at an operation's explicit asynchronous launch point."""
 
@@ -86,8 +126,9 @@ class _AttributeView:
 
 class _BackwardOrder(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, value, *dependencies):
+    def forward(ctx, value, point, *dependencies):
         ctx.count = len(dependencies)
+        ctx.point = point
         ctx.set_materialize_grads(False)
         return value
 
@@ -95,10 +136,12 @@ class _BackwardOrder(torch.autograd.Function):
     def backward(ctx, gradient):
         # None completes the autograd dependency without producing a CUDA
         # tensor/event on the communication consumer's blocked stream.
-        return (gradient,) + (None,) * ctx.count
+        if ctx.point is not None:
+            ctx.point.wait()
+        return (gradient, None) + (None,) * ctx.count
 
 
-def after_backward(value, dependencies):
+def after_backward(value, dependencies, point=None):
     """Let dependency backward nodes become ready after value's downstream work.
 
     Place this identity on an async anchor's input. Its backward runs after
@@ -110,7 +153,7 @@ def after_backward(value, dependencies):
         return value
     if not value.requires_grad:
         raise ValueError('A backward anchor must already have a differentiable input')
-    return _BackwardOrder.apply(value, *dependencies)
+    return _BackwardOrder.apply(value, point, *dependencies)
 
 
 class DeferredRegion:

@@ -149,6 +149,7 @@ def test_deferred_backward_runs_while_anchor_gradient_is_pending(deferred):
     side = _get_module_stream(x.device, 'launch_test')
     comm = torch.cuda.Stream()
     finished = torch.cuda.Event()
+    input_ready = torch.cuda.Event()
     check = False
 
     class Matmul(torch.autograd.Function):
@@ -165,6 +166,7 @@ def test_deferred_backward_runs_while_anchor_gradient_is_pending(deferred):
                 done = torch.cuda.Event()
                 done.record()
                 done.synchronize()
+                assert input_ready.query(), 'side backward ran before the communication inputs were ready'
                 assert not finished.query(), 'side backward inherited the communication wait'
             return dx, dw
 
@@ -180,12 +182,18 @@ def test_deferred_backward_runs_while_anchor_gradient_is_pending(deferred):
     class Anchor(torch.autograd.Function):
         @staticmethod
         def forward(ctx, value):
+            from nnscaler import capture_async_backward
+            ctx.point = capture_async_backward()
             notify_async_launch()
             return value * 3
 
         @staticmethod
         def backward(ctx, grad):
             caller = torch.cuda.current_stream()
+            # Model CPU submission running far ahead of the actual GPU input.
+            torch.cuda._sleep(1_000_000_000)
+            input_ready.record()
+            ctx.point.record_ready()
             comm.wait_stream(caller)
             with torch.cuda.stream(comm):
                 torch.cuda._sleep(1_000_000_000)
@@ -206,12 +214,13 @@ def test_deferred_backward_runs_while_anchor_gradient_is_pending(deferred):
         else:
             with streams.fork('region', 'launch_test', (x, weight), preserve_accumulators=True):
                 y, = compute(Parent(), x)
-        controlled = after_backward(x, (y,))
+        controlled = streams.after_backward(x, (y,), ('region',))
         if deferred:
             with streams.launch_point(('region',)):
                 routed = Anchor.apply(controlled)
         else:
-            routed = Anchor.apply(controlled)
+            with streams.backward_point(('region',)):
+                routed = Anchor.apply(controlled)
         streams.publish((y,))
         streams.join('region')
         output = routed + y

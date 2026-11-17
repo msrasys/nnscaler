@@ -219,6 +219,14 @@ class SerialStreams:
     def capture(self, *args):
         pass
 
+    def after_backward(self, value, dependencies, keys):
+        from nnscaler.runtime.deferred import after_backward
+        return after_backward(value, dependencies)
+
+    @contextmanager
+    def backward_point(self, keys):
+        yield
+
     def submit(self, key, name, function, args, tracked_inputs):
         self.results[key] = function(*args)
 

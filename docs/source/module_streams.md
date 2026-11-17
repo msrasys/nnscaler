@@ -71,6 +71,15 @@ For a split shared expert, this pairs its suffix backward with the combine
 operator's backward dispatch, and its prefix backward with the dispatch
 operator's backward combine.
 
+Backends can align this work with the actual GPU input readiness by saving
+`nnscaler.capture_async_backward()` on their autograd context in forward.
+In backward, call the returned point's `record_ready()` after preparing the
+communication inputs and before enqueuing communication or its result wait.
+The control node makes each side stream wait for that input event. This matters
+when CPU submission runs many milliseconds ahead of GPU execution: merely
+ordering host calls can let the side computation finish before communication
+starts. Captured points must record readiness; a missing record raises an error.
+
 The implementation separates three responsibilities:
 
 - The compiler selects modules, validates tensor dependencies and inserts the

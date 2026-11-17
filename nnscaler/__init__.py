@@ -22,7 +22,7 @@ from .parallel import (
 )
 from nnscaler.graph.parser.register import register_op
 from nnscaler.graph.schedule.module_streams import ModuleStreamRule
-from nnscaler.runtime.deferred import notify_async_launch
+from nnscaler.runtime.deferred import notify_async_launch, capture_async_backward
 from nnscaler.runtime.function.function import (
     anchor,
     constant_folding,

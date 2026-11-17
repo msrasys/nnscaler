@@ -141,6 +141,8 @@ class ModuleStreams:
         self.futures = {}
         self.future_streams = {}
         self.deferred = {}
+        self.region_streams = {}
+        self.backward_points = {}
         self.streams = {self.caller}
         return self
 
@@ -153,6 +155,7 @@ class ModuleStreams:
             self.capture(key)
         state = DeferredRegion(function, parent, attributes.keys(), output_specs)
         stream = _get_module_stream(self.caller.device, name)
+        self.region_streams[key] = stream
         self.streams.add(stream)
         # Preparing a branch earlier must not accidentally create a shared
         # input's AccumulateGrad on the side stream. A later main-path gradient
@@ -166,6 +169,16 @@ class ModuleStreams:
         self.deferred[key] = (name, state, (*inputs, *attributes.values()))
         return outputs
 
+    def after_backward(self, value, dependencies, keys):
+        from .deferred import BackwardLaunchPoint, after_backward
+        point = BackwardLaunchPoint(self.region_streams[key] for key in keys)
+        self.backward_points[tuple(keys)] = point
+        return after_backward(value, dependencies, point)
+
+    def backward_point(self, keys):
+        return self.backward_points.get(tuple(keys), nullcontext())
+
+    @contextmanager
     def launch_point(self, keys):
         from .deferred import LaunchPoint
 
@@ -174,7 +187,8 @@ class ModuleStreams:
             with self.fork(key, name, inputs):
                 state.launch()
 
-        return LaunchPoint(tuple(lambda key=key: launch(key) for key in keys))
+        with self.backward_point(keys), LaunchPoint(tuple(lambda key=key: launch(key) for key in keys)):
+            yield
 
     def capture(self, key):
         """Snapshot caller readiness before an asynchronous anchor is launched."""
@@ -244,6 +258,7 @@ class ModuleStreams:
                              if preserve_accumulators and torch.is_grad_enabled()
                              and isinstance(value, torch.Tensor) and value.is_leaf and value.requires_grad]
         stream = _get_module_stream(device, name)
+        self.region_streams[key] = stream
         self.streams.add(stream)
         if key in self.ready:
             stream.wait_event(self.ready[key])

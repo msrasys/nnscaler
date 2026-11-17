@@ -1213,7 +1213,8 @@ class ModuleCodeGen(FuncEmission):
                     if value is None:
                         raise ValueError(f'Backward overlap anchor {node.signature} has no differentiable input')
                     name = self.tensor_name(value)
-                    body.append(f'{name} = nnscaler.runtime.deferred.after_backward({name}, {names(dependencies)})')
+                    body.append(f'{name} = _module_streams.after_backward({name}, {names(dependencies)}, '
+                                f'{tuple(r.key for r in anchored)!r})')
                 with Block(f'with _module_streams.launch_point({tuple(r.key for r in anchored)!r}):') as block:
                     block.insert_body(self._emit_segment_nodes(
                         segment, [node], runtime_devid, lifetime, release_unused=False))
@@ -1229,7 +1230,13 @@ class ModuleCodeGen(FuncEmission):
                     if value is None:
                         raise ValueError(f'Backward overlap anchor {node.signature} has no differentiable input')
                     name = self.tensor_name(value)
-                    body.append(f'{name} = nnscaler.runtime.deferred.after_backward({name}, {names(dependencies)})')
+                    keys = tuple(r.key for r in eager_backward_points[node])
+                    body.append(f'{name} = _module_streams.after_backward({name}, {names(dependencies)}, {keys!r})')
+                    with Block(f'with _module_streams.backward_point({keys!r}):') as block:
+                        block.insert_body(self._emit_segment_nodes(
+                            segment, [node], runtime_devid, lifetime, release_unused=False))
+                    body.extend(block.code)
+                    continue
             if node in starts:
                 flush()
                 region = starts[node]
