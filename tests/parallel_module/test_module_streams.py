@@ -11,7 +11,7 @@ from contextlib import contextmanager
 import pytest
 import torch
 
-from nnscaler import ComputeConfig, ModuleStreamRule, parallelize
+from nnscaler import ComputeConfig, ModuleStreamRule, parallelize, register_op
 from nnscaler.parallel import _load_parallel_module_class
 from ..utils import replace_all_device_with, new_empty
 
@@ -419,6 +419,62 @@ def test_recompute_only_rule_keeps_forward_on_caller(tmp_path):
     expected.sum().backward()
     for name, parameter in generated.named_parameters():
         torch.testing.assert_close(parameter.grad, reference.get_parameter(generated.fullmap[name].orig_name).grad)
+
+
+@register_op('n h, ? -> n h')
+def apply_checkpoint_kwargs(x, options):
+    return x * options['scale'] + options['bias']
+
+
+class KwargsCheckpointBranch(Branch):
+    def forward(self, x, metadata):
+        options = {'enabled': True}
+        options.update(scale=metadata.get('scale'), bias=metadata.get('bias'))
+        options['training'] = self.training
+        return apply_checkpoint_kwargs(self.down(self.up(x).relu()), options)
+
+
+class KwargsCheckpointModel(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.side = KwargsCheckpointBranch()
+
+    def forward(self, x, metadata):
+        return self.side(x, metadata)
+
+
+@replace_all_device_with('cpu', force=True)
+def test_recompute_stream_with_dynamic_local_kwargs(tmp_path):
+    model = KwargsCheckpointModel()
+    reference = copy.deepcopy(model)
+    rule = ModuleStreamRule('side', stream='kwargs_recompute', recompute_only=True)
+    sample = {'x': torch.randn(4, 8), 'metadata': {'scale': 1.25, 'bias': .5}}
+    parallelize(model, sample, recompute_side_policy,
+                ComputeConfig(1, 1, constant_folding=True, module_streams=(rule,)),
+                gen_savedir=tmp_path, instance_name='local_kwargs', load_module=False)
+    code = next(tmp_path.rglob('gencode0.py')).read_text()
+    assert 'checkpoint_stream.contexts(' in code
+    # Fresh traces may fold updates into a literal; the planner tests also
+    # cover retained setitem chains from existing graph checkpoints.
+    cls = _load_parallel_module_class(KwargsCheckpointModel, gen_savedir=tmp_path,
+                                      instance_name='local_kwargs', rank=0)
+    generated = new_empty(cls, device='cpu', init_params=True)
+    for metadata in ({'scale': 1.25, 'bias': .5}, {'scale': 2.5, 'bias': -.75}):
+        original_metadata = metadata.copy()
+        # new_empty has no reducer buckets; clear its ordinary leaf gradients.
+        for parameter in generated.parameters():
+            parameter.grad = None
+        reference.zero_grad()
+        x = torch.randn(4, 8, requires_grad=True)
+        rx = x.detach().clone().requires_grad_()
+        actual, expected = generated(x, metadata), reference(rx, metadata)
+        actual.square().sum().backward()
+        expected.square().sum().backward()
+        torch.testing.assert_close(actual, expected)
+        torch.testing.assert_close(x.grad, rx.grad)
+        assert metadata == original_metadata
+        for name, parameter in generated.named_parameters():
+            torch.testing.assert_close(parameter.grad, reference.get_parameter(generated.fullmap[name].orig_name).grad)
 
 
 @replace_all_device_with('cpu', force=True)

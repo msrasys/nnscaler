@@ -15,6 +15,7 @@ import json
 import os
 
 from nnscaler.ir.operator import IRFwOperation
+from nnscaler.ir.cten import IRObject
 from nnscaler.ir.adapter import IRAdapter
 from nnscaler.ir.adapter.prim import (
     IdentityPrim, SelectPrim, MergeDimPrim, SumPrim, ChunkPrim, VChunkPrim, SplitAllGatherPrim,
@@ -367,9 +368,38 @@ def checkpoint_stream(nodes, rules):
             continue
         if not all(matches):
             raise ValueError('A recompute stream rule must cover the whole checkpoint region')
-        if any(_unsafe(node) and not _local_adapter(node) for node in nodes):
-            raise ValueError('Recompute streams require pure operations and local adapters')
+        local_updates = _local_dict_updates(nodes)
+        unsafe = [node for node in nodes
+                  if _unsafe(node) and not _local_adapter(node) and node not in local_updates]
+        if unsafe:
+            signatures = ', '.join(dict.fromkeys(node.signature for node in unsafe))
+            raise ValueError(f'Recompute streams require pure operations and local adapters: {signatures}')
         if result is not None and result != rule.stream:
             raise ValueError('Conflicting recompute streams for one checkpoint')
         result = rule.stream
     return result
+
+
+def _local_dict_updates(nodes):
+    """Recognize kwargs built afresh inside a complete checkpoint invocation.
+
+    A literal dict is emitted as a new Python dict on every execution. The
+    runtime setitem returns that same dict, so a chain of direct updates also
+    stays local. Neither constant IRObjects nor dictionaries reached through
+    getitem establish ownership: those may alias caller state. Tensor writes,
+    nested dictionary writes and arbitrary user-defined keys remain rejected.
+    This proof is deliberately limited to recomputation, which keeps the
+    original forward order and recreates the whole checkpoint's local state.
+    """
+    owned, updates = set(), set()
+    for node in nodes:
+        if (node.signature != 'nnscaler.runtime.function.setitem'
+                or len(node.inputs()) != 3 or len(node.outputs()) != 1):
+            continue
+        target, key, _ = node.inputs()
+        if type(key) not in (str, int):
+            continue
+        if type(target) is dict or (isinstance(target, IRObject) and target in owned):
+            updates.add(node)
+            owned.add(node.output(0))
+    return updates

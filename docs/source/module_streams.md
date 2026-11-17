@@ -276,6 +276,11 @@ requires PyTorch's saved-tensor hook inspection API, eager execution, one CUDA
 device per checkpoint, and pure selected operators. It composes the active
 checkpoint hooks and preserves checkpoint early stopping and repeated backward.
 
+Checkpoint-local kwargs dictionaries are supported: the compiler proves that
+the dictionary is created from a literal inside the region, and follows direct
+updates of that same object. External dictionary mutations, nested aliases and
+tensor writes remain rejected. This does not relax forward branch reordering.
+
 The compiler checks tensor and object dependencies before moving computation.
 Local layout adapters inserted inside the selected branch move with it, even
 though those synthesized nodes do not carry the original module path.

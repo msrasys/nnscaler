@@ -15,14 +15,46 @@ pipeline scheduler or a device-wide pending-weight queue. It does not introduce
 cross-microbatch work. The previous performance numbers below are **not**
 measurements of this new feature.
 
-Current validation is CPU-only: 66 compiler/runtime tests pass, with 15 CUDA
-tests skipped, and 27 backend/MoE kernel-double tests pass. Checks include
+CPU validation includes 66 compiler/runtime and 27 backend/MoE kernel-double
+tests. Checks include
 repeated module invocations, ordinary reducer completion counts with mixed
 native gradients, BF16 parameters with FP32 gradients, retained backward,
-parameter updates, checkpoint reuse, AMP and failure cleanup. Actual CUDA
-kernels, memory overhead and 15B PP3/EP2 performance are pending the offload
-session's GPU release. A separate attention-recomputation configuration is
-prepared using the existing `*.self_attn` checkpoints; it is also unmeasured.
+parameter updates, checkpoint reuse, AMP and failure cleanup. After the offload
+session released the GPUs, 98 CUDA-enabled framework tests passed. Real EP2
+MXFP8 MoE tests use 16K global tokens, recomputation, per-token clipping 20000,
+and a 3% weight update. Both dW variants produce bitwise-equal outputs and
+parameter gradients; input-gradient relative L2 error is 0.000854, below the
+unchanged 0.003 threshold.
+
+The new performance protocol uses 80 steps, the actual rank-0 training metrics
+over steps 60–79, no profiler injection, and no per-step observer synchronization.
+Global deterministic algorithms and the fixed cuBLAS workspace remain enabled;
+uninitialized-memory filling is disabled. These measurements cannot be compared
+directly with the older fill-enabled, synchronized-observer numbers below.
+NNScaler `fd6c303d` and llm-train `36bdb024` give:
+
+| Configuration | Training s/step | TFLOPS/GPU | Step-time reduction |
+| --- | ---: | ---: | ---: |
+| No overlap | 4.489316 | 533.80 | — |
+| Existing shared split + expert recomputation | 4.461282 | 537.16 | 0.62% |
+| Additionally split expert dX/dW | 4.426563 | 541.37 | 1.40% |
+
+All six ranks match initial tensors/RNG, selected full-input checkpoints and
+per-step work. All 80 steps' loss, gradient norm and auxiliary losses are
+identical between the last two configurations. Peak sampled GPU use rises from
+134.10 GiB to 154.77 GiB when adding dW; these are driver-use samples, not active
+tensor allocations. The gain is real in this run but small; full hiding is not
+established.
+
+A separate baseline trace has 265.17 ms/GPU of exposed dispatch plus combine,
+5.47% of its annotated step, with zero unattributed DeepEP kernels. Forward
+dispatch/combine contribute 76.27/36.90 ms and backward dispatch/combine
+98.86/53.14 ms; layout is separately 8.49 ms. No computation overlaps baseline
+communication. Treatment traces and remaining attention/shared-placement
+experiments are pending. The first attention attempt stopped during compilation
+because locally constructed kwargs dictionaries were conservatively rejected;
+the compiler now proves local dictionary ownership instead of changing the
+model or allowing external mutations.
 
 ## Workload and measurement
 
