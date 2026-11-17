@@ -30,11 +30,37 @@ The current Nsight protocol results are:
 | --- | ---: | ---: |
 | No module overlap | 5.216390 s | — |
 | Shared prefix/suffix + backward input readiness + expert recomputation stream | 5.130144 s | 1.65% |
+| Additionally gate recomputation on backward input readiness | 5.189694 s | 0.51% |
+| Limit side-stream DeepGEMM to 128 SMs | 5.161739 s | 1.05% |
 
 These are short-run results, not evidence of long-term training equivalence.
-A final comparison without profiler injection is still required. The optional
-native launch and backend kernel-graph paths are correctness-tested, but are
-not faster than the table's best treatment in the completed full-model runs.
+The optional native launch and backend kernel-graph paths are correctness-tested,
+but are not faster than the table's best treatment in the completed full-model runs.
+
+## Timing without profiler injection
+
+The matched 40-step runs use nnscaler `389c9925` and llm-train `49aaa81a`, with
+no Nsight process injection and no active Torch profiler (`--profile-step 0`).
+The same steps 21–40, six-rank maximum, transport settings, initial state and
+input hash checks are retained.
+
+| Configuration | Mean step | Standard deviation |
+| --- | ---: | ---: |
+| No module overlap | 5.191783 s | 0.059037 s |
+| Default `run_stream_overlap.sh overlap` | 5.104408 s | 0.052740 s |
+
+The measured reduction is **1.68%**, or 87.37 ms per step. This confirms the
+earlier 1.65% result; it remains below the full-communication-hiding target.
+Maximum loss and gradient-norm differences in the timing window are 0.000911
+and 0.004484 respectively. The launcher selects eager shared prefix/suffix
+execution with backward input readiness, ordinary early expert recomputation,
+and independent asynchronous metadata copies. It does not select kernel graphs,
+recomputation gating, padded dispatch or a modified DeepGEMM SM budget.
+
+A final owner-event polling experiment passed 32 lifetime/gradient/runtime
+checks but measured 5.120583 s with the same overlap rules and inputs, versus
+5.104408 s above. That runtime change was archived and reverted as well; the
+delivered executable code matches the selected measured configuration.
 
 ## Exposed communication
 
@@ -93,9 +119,9 @@ existing 0.003 check. Retaining those gradients in FP32 reduced the discrepancy
 to approximately 5.9e-6. This prototype was archived rather than selected as
 the default; its threshold was not relaxed.
 
-## Backend submission under investigation
+## Backend submission experiments
 
-llm-train's opt-in `NNSCALER_DEEPEP_PADDED_DISPATCH=1` submits DeepEP payloads
+An experimental `NNSCALER_DEEPEP_PADDED_DISPATCH=1` path submitted DeepEP payloads
 without first waiting on the CPU for receive counts. It freezes a safe receive
 capacity using the sum of all ranks' initial input lengths, permits shorter
 inputs, and rejects growth. DeepEP marks padded rows with -1; exact expert
@@ -105,8 +131,9 @@ expert computation and routing are preserved, with no token truncation.
 The padded path passed actual EP2 MoE correctness and a direct transport test
 covering unequal rank lengths, shrinking inputs, partially invalid routes,
 all-invalid routes, and both forward/backward communication. Its full PP3/EP2
-mean step was 5.257910 s, 0.80% slower than the fixed baseline; it is not the
-selected configuration. This path still reads exact counts back after
+mean step was 5.257910 s, 0.80% slower than the fixed baseline. The backend change
+was reverted from the delivered llm-train tree; the experiment remains in commit
+`a0a59b42` and local reports. This path still reads exact counts back after
 submission; it is not a fully static-shape MoE implementation.
 
 The approach is motivated by Kimi K3 section 5.2.1: static shapes remove
@@ -114,7 +141,7 @@ per-layer host synchronization, and shared-expert GEMMs run on a separate
 stream. This implementation continues to use DeepEP and does not implement
 MoonEP's redundant-expert load balancing.
 
-The next scheduling change gates expert recomputation on the downstream
+The optional `recompute_ready_on` rule gates expert recomputation on the downstream
 backend's backward input readiness. In the previous trace, its first GEMM
 typically started about 4 ms before backward dispatch. The generic
 `recompute_ready_on` rule has passed the 77-case CUDA-enabled compiler/runtime
@@ -122,12 +149,18 @@ suite, including a delayed-input test that proves recomputation starts after
 inputs are ready and before the pending gradient completes. Actual EP2 MoE
 with recomputation and updated weights also passes: output and parameter
 gradients are bitwise equal, with input-gradient relative L2 about 8.5e-4.
-Full-model performance validation is in progress.
+In the full model, backward dispatch exposure fell to 8–23 ms per rank, but
+step time improved only 0.51%: delaying the recomputation also lost some useful
+prefetch overlap. It is supported but not enabled by the default launcher.
+The 128-SM DeepGEMM probe preserved outputs and parameter gradients bitwise,
+but its 1.05% step improvement was also below the selected treatment; its
+process-local backend patch was not integrated into NNScaler.
 
 ## Resources and evidence
 
-The best completed treatment peaks at about 128 GiB device usage and 512 GiB
-process-tree RSS. Kernel-graph caches are bounded to four graphs and 512 MiB of
+In the unprofiled pair, maximum device usage rises from about 101 GiB to 126 GiB;
+summed process-tree RSS peaks at about 431 GiB in both runs. Nsight runs reached
+about 512 GiB RSS. Kernel-graph caches are bounded to four graphs and 512 MiB of
 logical input/output storage per device; graph scratch allocations are extra.
 Nsight plus kernel graphs caused failures in full-model attempts, so those
 traces were rejected. A specific cause has not been established.
@@ -137,5 +170,14 @@ source archives and guard logs are under
 `/home/yileiyang/agens/stream-overlap-20261117`. Completed correctness gencode
 weights are removed after source archival; the reusable full-model cache is
 retained during iteration. The guard enforces RAM/disk/time limits and cleans
-only owned orphan workers. GPU priority was explicitly assigned to this overlap
-validation by the user; release it when GPU validation finishes.
+only owned orphan workers. All GPU validation processes have exited, and the
+GPU reservation was released at 18:44 on 2026-11-17 (Asia/Shanghai). About 16 GiB
+of completed correctness gencode was removed during this continuation; one
+30 GiB full-model cache remains for reproduction, with over 570 GiB disk free.
+
+Both repositories use branch `yileiyang/stream_overlap`. The llm-train launcher
+accepts only `baseline` and `overlap`; run it from `llm/` with the original
+training command. Point `NNSCALER_ROOT` at this NNScaler checkout, or install
+this branch, so the launch uses the new compiler/runtime. The machine-readable
+summary is `/home/yileiyang/agens/stream-overlap-20261117/final-report.json`.
+It explicitly records `full_communication_hiding_achieved: false`.
