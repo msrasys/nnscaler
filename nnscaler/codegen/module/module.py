@@ -1121,11 +1121,12 @@ class ModuleCodeGen(FuncEmission):
         eager_backward_points = {}
         async_copy_nodes = set()
         for region in regions.values():
-            if region.overlap_backward and not region.deferred:
+            if region.overlap_backward and not (region.deferred or region.native):
                 eager_backward_points.setdefault(region.backward_anchor, []).append(region)
             if region.ready_before is not None:
-                captures.setdefault(region.ready_before, []).append(region.key)
-                if region.deferred:
+                if not region.native:
+                    captures.setdefault(region.ready_before, []).append(region.key)
+                if region.deferred or region.native:
                     launch_points.setdefault(region.ready_before, []).append(region)
                 if region.async_anchor_copies and not any(
                         fnmatchcase(region.ready_before.signature, pattern) for pattern in CompileFlag.async_copy_ops):
@@ -1187,6 +1188,11 @@ class ModuleCodeGen(FuncEmission):
             if node in launch_points:
                 flush()
                 anchored = launch_points[node]
+                native = any(region.native for region in anchored)
+                if native and not all(region.native for region in anchored):
+                    raise ValueError('One anchor cannot mix submitted and input_ready launch phases')
+                native_outputs = {obj: (region.key, index) for region in anchored
+                                  for index, obj in enumerate(region.outputs)} if native else {}
                 for region in anchored:
                     inputs = [obj for obj in region.inputs if not obj.is_attr()]
                     attributes = [obj for obj in region.inputs if obj.is_attr()]
@@ -1202,12 +1208,20 @@ class ModuleCodeGen(FuncEmission):
                     specs = '(' + ', '.join(
                         f'({tuple(obj.shape)!r}, {obj.dtype!r}, {obj.requires_grad!r})'
                         for obj in region.outputs) + ',)'
-                    body.append(f'{names(region.outputs)} = _module_streams.prepare('
-                                f'{region.key!r}, {region.stream!r}, {function}, self, '
-                                f'{names(inputs)}, {attr_map}, {specs})')
+                    if region.native:
+                        arguments = [f'_module_streams.native_value({native_outputs[obj][0]!r}, {native_outputs[obj][1]})'
+                                     if obj in native_outputs else self.tensor_name(obj) for obj in inputs]
+                        arguments = '(' + ', '.join(arguments) + (',' if arguments else '') + ')'
+                        body.append(f'_module_streams.schedule_native('
+                                    f'{region.key!r}, {region.stream!r}, {function}, self, '
+                                    f'lambda: {arguments}, {attr_map})')
+                    else:
+                        body.append(f'{names(region.outputs)} = _module_streams.prepare('
+                                    f'{region.key!r}, {region.stream!r}, {function}, self, '
+                                    f'{names(inputs)}, {attr_map}, {specs})')
                 dependencies = [obj for region in anchored if region.overlap_backward
                                 for obj in region.outputs if obj.requires_grad]
-                if dependencies:
+                if dependencies and not native:
                     value = next((obj for obj in node.iobjs()
                                   if isinstance(obj, IRTensor) and obj.requires_grad and not obj.is_attr()), None)
                     if value is None:
@@ -1215,7 +1229,9 @@ class ModuleCodeGen(FuncEmission):
                     name = self.tensor_name(value)
                     body.append(f'{name} = _module_streams.after_backward({name}, {names(dependencies)}, '
                                 f'{tuple(r.key for r in anchored)!r})')
-                with Block(f'with _module_streams.launch_point({tuple(r.key for r in anchored)!r}):') as block:
+                options = (f', native=True, backward_keys={tuple(r.key for r in anchored if r.overlap_backward)!r}'
+                           if native else '')
+                with Block(f'with _module_streams.launch_point({tuple(r.key for r in anchored)!r}{options}):') as block:
                     block.insert_body(self._emit_segment_nodes(
                         segment, [node], runtime_devid, lifetime, release_unused=False))
                 body.extend(block.code)
@@ -1240,7 +1256,9 @@ class ModuleCodeGen(FuncEmission):
             if node in starts:
                 flush()
                 region = starts[node]
-                if region.deferred:
+                if region.deferred or region.native:
+                    if region.native:
+                        body.append(f'{names(region.outputs)} = _module_streams.native_result({region.key!r})')
                     caller = region.caller_outputs
                     producer = tuple(obj for obj in region.outputs if obj not in caller)
                     if caller:

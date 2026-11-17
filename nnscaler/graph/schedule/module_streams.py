@@ -36,11 +36,17 @@ class ModuleStreamRule:
     launch_on: str | None = None
     resume_on: str | None = None
     overlap_backward: bool = False
+    launch_phase: str = 'submitted'
     # Persist the generated-code ABI, including in pickled configurations.
     # A default factory leaves old pickles detectably missing the field.
-    _codegen_version: int = field(default_factory=lambda: 9, init=False, repr=False)
+    _codegen_version: int = field(default_factory=lambda: 10, init=False, repr=False)
 
     def __post_init__(self):
+        if self.launch_phase not in ('submitted', 'input_ready'):
+            raise ValueError('launch_phase must be submitted or input_ready')
+        if self.launch_phase == 'input_ready' and (not self.launch_on
+                or (self.split_before and not self.resume_on)):
+            raise ValueError('input_ready requires launch_on/resume_on backend boundaries')
         if type(self.recompute_only) is not bool:
             raise ValueError('recompute_only must be a boolean')
         if self.recompute_only and (self.launch_before or self.launch_after or self.split_before
@@ -120,6 +126,7 @@ class ModuleStreamRegion:
     deferred: bool = False
     overlap_backward: bool = False
     backward_anchor: object = None
+    native: bool = False
 
 
 def _unsafe(node):
@@ -216,6 +223,8 @@ def plan_module_streams(nodes, outputs, rules):
                        (rule.resume_before or rule.resume_after or rule.resume_on,
                         bool(rule.resume_after or rule.resume_on), bool(rule.resume_on)))
             for chunk, (anchor, after, deferred) in zip(chunks, anchors):
+                native = deferred and rule.launch_phase == 'input_ready'
+                deferred = deferred and not native
                 destination = positions[chunk[0]]
                 ready_before = None
                 backward_anchor = None
@@ -232,7 +241,7 @@ def plan_module_streams(nodes, outputs, rules):
                 # Already-available synthesized inputs need not move with the
                 # module. Preserve their original position and other users.
                 chunk = [n for n in chunk if n in original_branch or positions[n] >= destination]
-                if destination > positions[chunk[0]] and not deferred:
+                if destination > positions[chunk[0]] and not (deferred or native):
                     raise ValueError(f'{path}: module stream launch must not move computation later')
                 begin, end = sorted((destination, positions[chunk[0]]))
                 barriers = [n for n in nodes[begin:end] if n not in branch_set
@@ -259,7 +268,7 @@ def plan_module_streams(nodes, outputs, rules):
                 region_outputs = tuple(dict.fromkeys(obj for n in chunk for obj in n.oobjs()
                                                      if obj in graph_outputs or any(
                                                          c not in chunk_set for c in consumers[obj])))
-                if deferred:
+                if deferred or native:
                     from nnscaler.ir.cten import IRTensor
                     if not region_outputs or any(not isinstance(obj, IRTensor) for obj in (*inputs, *region_outputs)):
                         raise ValueError('Deferred module regions require tensor inputs, attributes and outputs')
@@ -269,7 +278,7 @@ def plan_module_streams(nodes, outputs, rules):
                 region = ModuleStreamRegion(key, rule.stream, chunk, inputs, region_outputs,
                                             ready_before, rule.host_concurrency, rule.async_anchor_copies,
                                             deferred=deferred, overlap_backward=rule.overlap_backward,
-                                            backward_anchor=backward_anchor)
+                                            backward_anchor=backward_anchor, native=native)
                 regions[key] = region
                 placements[destination].append(region)
                 selected.update(chunk)

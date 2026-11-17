@@ -40,6 +40,26 @@ original position and can overlap subsequent independent modules.
 
 ## Explicit asynchronous launch points
 
+For cooperative backends, `launch_phase='input_ready'` with
+`launch_on`/`resume_on` builds the ordinary side graph at the actual backend
+input boundary. The adapter calls `nnscaler.prepare_async_input(value)` after
+preparing inputs and immediately before its `autograd.Function.apply`, and uses
+the returned tensor as that input. This records input readiness on the caller,
+launches side work waiting for that event, and binds backward control edges.
+It avoids deferred tensor copies and nested VJPs while preserving ordinary
+autograd behavior. Dependencies between native regions at the same launch point
+are resolved in order on the same side stream. Missing backend preparation
+raises an error.
+
+```python
+ModuleStreamRule(
+    module='*.shared', stream='shared_expert',
+    launch_on='*.nnscaler_moe_dispatch', split_before='down_proj',
+    resume_on='*.nnscaler_moe_combine', launch_phase='input_ready',
+    overlap_backward=True,
+)
+```
+
 `overlap_backward=True` also works with `launch_before`/`resume_before`.
 That path submits the ordinary autograd graph on the side stream, then adds
 the backward control edge before calling the anchor. It avoids deferred output

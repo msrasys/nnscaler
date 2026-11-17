@@ -138,7 +138,7 @@ def test_deferred_preserves_explicit_gradient_dtype():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason='requires CUDA')
-@pytest.mark.parametrize('deferred', [True, False])
+@pytest.mark.parametrize('deferred', [True, False, 'native'])
 def test_deferred_backward_runs_while_anchor_gradient_is_pending(deferred):
     from nnscaler.runtime.stream import ModuleStreams, _get_module_stream, drain_stream_holds
     torch.manual_seed(8)
@@ -208,19 +208,26 @@ def test_deferred_backward_runs_while_anchor_gradient_is_pending(deferred):
         return (Matmul.apply(value, module.w),)
 
     with ModuleStreams() as streams:
-        if deferred:
+        if deferred == 'native':
+            from nnscaler import prepare_async_input
+            streams.schedule_native('region', 'launch_test', compute, Parent(), (x,), {'w': weight})
+            with streams.launch_point(('region',), native=True, backward_keys=('region',)):
+                routed = Anchor.apply(prepare_async_input(x))
+            y, = streams.native_result('region')
+        elif deferred:
             y, = streams.prepare('region', 'launch_test', compute, Parent(), (x,), {'w': weight},
                                  (((64, 64), x.dtype, True),))
         else:
             with streams.fork('region', 'launch_test', (x, weight), preserve_accumulators=True):
                 y, = compute(Parent(), x)
-        controlled = streams.after_backward(x, (y,), ('region',))
-        if deferred:
-            with streams.launch_point(('region',)):
-                routed = Anchor.apply(controlled)
-        else:
-            with streams.backward_point(('region',)):
-                routed = Anchor.apply(controlled)
+        if deferred != 'native':
+            controlled = streams.after_backward(x, (y,), ('region',))
+            if deferred:
+                with streams.launch_point(('region',)):
+                    routed = Anchor.apply(controlled)
+            else:
+                with streams.backward_point(('region',)):
+                    routed = Anchor.apply(controlled)
         streams.publish((y,))
         streams.join('region')
         output = routed + y
@@ -244,3 +251,47 @@ def test_two_deferred_regions_can_launch_in_dependency_order_at_one_point():
     b.sum().backward()
     torch.testing.assert_close(x.grad, 2 * x.detach() * x.detach().square().cos())
     assert first.cleared and second.cleared
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason='requires CUDA')
+def test_native_forward_waits_for_inputs_but_not_communication():
+    from nnscaler import prepare_async_input
+    from nnscaler.runtime.stream import ModuleStreams, _get_module_stream
+    x = torch.randn(1024, device='cuda', requires_grad=True)
+    side = _get_module_stream(x.device, 'native_forward')
+    comm = torch.cuda.Stream()
+    input_ready, side_done, finished = (torch.cuda.Event() for _ in range(3))
+    side.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(side):
+        warm = x.square()
+    other = x * 3
+    torch.cuda.synchronize()
+    del warm, other
+
+    def compute(parent, value):
+        y = value.square()
+        side_done.record()
+        return (y,)
+
+    caller = torch.cuda.current_stream()
+    with ModuleStreams() as streams:
+        streams.schedule_native('region', 'native_forward', compute, None, (x,), {})
+        torch.cuda._sleep(1_000_000_000)
+        input_ready.record()
+        with streams.launch_point(('region',), native=True):
+            value = prepare_async_input(x)
+            comm.wait_stream(caller)
+            with torch.cuda.stream(comm):
+                torch.cuda._sleep(1_000_000_000)
+                finished.record()
+            caller.wait_event(finished)
+            routed = value * 3
+        y, = streams.native_result('region')
+        side_done.synchronize()
+        assert input_ready.query(), 'side work ran before backend preparation completed'
+        assert not finished.query(), 'side work serialized behind communication'
+        streams.publish((y,))
+        streams.join('region')
+        output = routed + y
+    output.sum().backward()
+    torch.testing.assert_close(x.grad, 3 + 2 * x.detach())

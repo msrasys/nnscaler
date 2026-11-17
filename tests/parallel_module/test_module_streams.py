@@ -437,26 +437,32 @@ _anchor_backward_order = []
 class DispatchAnchor(torch.autograd.Function):
     @staticmethod
     def forward(ctx, value):
-        from nnscaler import notify_async_launch
+        from nnscaler import notify_async_launch, capture_async_backward
+        ctx.point = capture_async_backward()
         notify_async_launch()
         return value * 2
 
     @staticmethod
     def backward(ctx, grad):
         _anchor_backward_order.append('dispatch')
+        if ctx.point is not None:
+            ctx.point.record_ready()
         return grad * 2
 
 
 class CombineAnchor(torch.autograd.Function):
     @staticmethod
     def forward(ctx, value):
-        from nnscaler import notify_async_launch
+        from nnscaler import notify_async_launch, capture_async_backward
+        ctx.point = capture_async_backward()
         notify_async_launch()
         return value * 3
 
     @staticmethod
     def backward(ctx, grad):
         _anchor_backward_order.append('combine')
+        if ctx.point is not None:
+            ctx.point.record_ready()
         return grad * 3
 
 
@@ -465,12 +471,14 @@ from nnscaler import register_op
 
 @register_op('a b -> a b')
 def dispatch_anchor(x):
-    return DispatchAnchor.apply(x)
+    from nnscaler import prepare_async_input
+    return DispatchAnchor.apply(prepare_async_input(x))
 
 
 @register_op('a b -> a b')
 def combine_anchor(x):
-    return CombineAnchor.apply(x)
+    from nnscaler import prepare_async_input
+    return CombineAnchor.apply(prepare_async_input(x))
 
 
 class AnchorModel(ForkModel):
@@ -484,6 +492,8 @@ class AnchorModel(ForkModel):
 class CPUDeferredStreams(SerialStreams):
     def __enter__(self):
         self.states = {}
+        self.native = {}
+        self.native_results = {}
         return self
 
     def capture(self, key):
@@ -495,9 +505,30 @@ class CPUDeferredStreams(SerialStreams):
         self.states[key] = state
         return state.prepare(inputs, tuple(attrs.values()))
 
-    def launch_point(self, keys):
-        from nnscaler.runtime.deferred import LaunchPoint
-        return LaunchPoint(tuple(self.states[key].launch for key in keys))
+    def schedule_native(self, key, stream, function, parent, inputs, attrs):
+        self.native[key] = (function, parent, inputs)
+
+    def native_result(self, key):
+        return self.native_results.pop(key)
+
+    def native_value(self, key, index):
+        return self.native_results[key][index]
+
+    @contextmanager
+    def launch_point(self, keys, *, native=False, backward_keys=()):
+        from nnscaler.runtime.deferred import LaunchPoint, NativeLaunchPoint
+        if native:
+            def launch(key):
+                function, parent, inputs = self.native.pop(key)
+                inputs = inputs() if callable(inputs) else inputs
+                self.native_results[key] = function(parent, *inputs)
+            dependencies = lambda: tuple(value for key in backward_keys for value in self.native_results[key])
+            point = NativeLaunchPoint(tuple(lambda key=key: launch(key) for key in keys),
+                                      lambda ready: None, dependencies)
+        else:
+            point = LaunchPoint(tuple(self.states[key].launch for key in keys))
+        with point:
+            yield
 
     def publish(self, outputs, **kwargs):
         pass
@@ -511,15 +542,25 @@ class CPUDeferredStreams(SerialStreams):
             assert all(state.launched for state in self.states.values())
 
 
+def _anchor_rule(launch, tied=False):
+    native = launch.startswith('input_ready')
+    point = 'on' if native else launch
+    options = {f'launch_{point}': '*.dispatch_anchor'}
+    if not tied:
+        options.update(split_before='down', **{f'resume_{point}':
+                       '*.dispatch_anchor' if launch.endswith('_same') else '*.combine_anchor'})
+    return ModuleStreamRule('side', overlap_backward=True,
+                            launch_phase='input_ready' if native else 'submitted', **options)
+
+
 @replace_all_device_with('cpu', force=True)
 @pytest.mark.parametrize('workers', [1, 2])
-@pytest.mark.parametrize('launch', ['on', 'before'])
+@pytest.mark.parametrize('launch', ['on', 'before', 'input_ready', 'input_ready_same'])
 def test_deferred_codegen_preserves_math_and_orders_both_backward_regions(tmp_path, monkeypatch, workers, launch):
     monkeypatch.setattr('nnscaler.runtime.stream.ModuleStreams', CPUDeferredStreams)
     model = AnchorModel()
     reference = copy.deepcopy(model)
-    rule = ModuleStreamRule('side', split_before='down', overlap_backward=True,
-                            **{f'launch_{launch}': '*.dispatch_anchor', f'resume_{launch}': '*.combine_anchor'})
+    rule = _anchor_rule(launch)
     parallelize(model, {'x': torch.randn(4, 8, requires_grad=True)}, 'dp',
                 ComputeConfig(1, 1, module_streams=(rule,)), gen_savedir=tmp_path,
                 instance_name=f'launch_points_{launch}_{workers}', load_module=False, codegen_workers=workers)
@@ -586,7 +627,7 @@ def test_deferred_tied_parameters_and_multiple_live_forwards(tmp_path, monkeypat
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason='requires CUDA')
 @pytest.mark.parametrize('tied', [False, True])
-@pytest.mark.parametrize('launch', ['on', 'before'])
+@pytest.mark.parametrize('launch', ['on', 'before', 'input_ready'])
 def test_generated_deferred_module_cuda_gradients(tmp_path, tied, launch):
     import torch.distributed as dist
     import nnscaler
@@ -595,9 +636,7 @@ def test_generated_deferred_module_cuda_gradients(tmp_path, tied, launch):
         nnscaler.init()
         model = (TiedAnchorModel() if tied else AnchorModel()).cuda()
         reference = copy.deepcopy(model)
-        rule = ModuleStreamRule('side', overlap_backward=True,
-                                **{f'launch_{launch}': '*.dispatch_anchor'},
-                                **({} if tied else {'split_before': 'down', f'resume_{launch}': '*.combine_anchor'}))
+        rule = _anchor_rule(launch, tied)
         generated = parallelize(model, {'x': torch.randn(4, 8, device='cuda', requires_grad=True)}, 'dp',
                                 ComputeConfig(1, 1, module_streams=(rule,)), gen_savedir=tmp_path,
                                 instance_name=f'cuda_{launch}_{tied}')

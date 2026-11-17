@@ -110,6 +110,42 @@ def notify_async_launch():
     return point.notify() if point is not None else False
 
 
+class NativeLaunchPoint(LaunchPoint):
+    """Build an ordinary side graph at the backend's prepared-input boundary."""
+
+    def __init__(self, callbacks, ready_callback, dependencies, backward_point=None):
+        super().__init__(callbacks)
+        self.ready_callback = ready_callback
+        self.dependencies = dependencies
+        self.backward_point = backward_point
+
+    def prepare_input(self, value):
+        if self.notified:
+            raise RuntimeError('A native launch point must prepare exactly one backend input')
+        ready = None
+        if value.device.type == 'cuda':
+            ready = torch.cuda.Event()
+            ready.record()
+        self.ready_callback(ready)
+        super().notify()
+        return after_backward(value, self.dependencies(), self.backward_point)
+
+    def notify(self):
+        if not self.notified:
+            raise RuntimeError('The async backend must call prepare_async_input before its autograd function')
+        return False
+
+
+def prepare_async_input(value):
+    """Backend hook after input preparation, immediately before Function.apply.
+
+    A native launch point submits independent graphs here and attaches their
+    backward controls to this actual backend input. Otherwise return it as-is.
+    """
+    point = getattr(_active, 'point', None)
+    return point.prepare_input(value) if isinstance(point, NativeLaunchPoint) else value
+
+
 class _AttributeView:
     def __init__(self, parent, attributes):
         self.parent = parent

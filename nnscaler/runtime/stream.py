@@ -141,6 +141,8 @@ class ModuleStreams:
         self.futures = {}
         self.future_streams = {}
         self.deferred = {}
+        self.native = {}
+        self.native_results = {}
         self.region_streams = {}
         self.backward_points = {}
         self.streams = {self.caller}
@@ -179,8 +181,31 @@ class ModuleStreams:
         return self.backward_points.get(tuple(keys), nullcontext())
 
     @contextmanager
-    def launch_point(self, keys):
-        from .deferred import LaunchPoint
+    def launch_point(self, keys, *, native=False, backward_keys=()):
+        from .deferred import LaunchPoint, NativeLaunchPoint, BackwardLaunchPoint
+
+        if native:
+            def launch_native(key):
+                name, function, parent, inputs, attributes = self.native.pop(key)
+                inputs = inputs() if callable(inputs) else inputs
+                tracked = (*inputs, *attributes)
+                with self.fork(key, name, tracked, preserve_accumulators=bool(backward_keys)):
+                    self.native_results[key] = function(parent, *inputs)
+
+            def ready(event):
+                for key in keys:
+                    self.ready[key] = event
+
+            def dependencies():
+                return tuple(value for key in backward_keys for value in self.native_results[key]
+                             if isinstance(value, torch.Tensor) and value.requires_grad)
+
+            point = (BackwardLaunchPoint(self.region_streams[key] for key in backward_keys)
+                     if backward_keys else None)
+            callbacks = tuple(lambda key=key: launch_native(key) for key in keys)
+            with point or nullcontext(), NativeLaunchPoint(callbacks, ready, dependencies, point):
+                yield
+            return
 
         def launch(key):
             name, state, inputs = self.deferred.pop(key)
@@ -189,6 +214,18 @@ class ModuleStreams:
 
         with self.backward_point(keys), LaunchPoint(tuple(lambda key=key: launch(key) for key in keys)):
             yield
+
+    def schedule_native(self, key, name, function, parent, inputs, attributes):
+        if key in self.native or key in self.events or key in self.deferred:
+            raise ValueError(f'Duplicate module stream region: {key}')
+        self.native[key] = (name, function, parent, inputs, tuple(attributes.values()))
+        self.region_streams[key] = _get_module_stream(self.caller.device, name)
+
+    def native_result(self, key):
+        return self.native_results.pop(key)
+
+    def native_value(self, key, index):
+        return self.native_results[key][index]
 
     def capture(self, key):
         """Snapshot caller readiness before an asynchronous anchor is launched."""
@@ -321,10 +358,12 @@ class ModuleStreams:
         # CUDA completion uses events, never a device/stream synchronize.
         for key in self.events:
             self.join(key)
-        unlaunched = tuple(self.deferred)
+        unlaunched = (*self.deferred, *self.native)
         for _, state, _ in self.deferred.values():
             state.clear()
         self.deferred.clear()
+        self.native.clear()
+        self.native_results.clear()
         with input_stream_lifetime(self.owners, True):
             pass
         self.owners.clear()
