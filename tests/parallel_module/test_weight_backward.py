@@ -122,3 +122,41 @@ def test_repeated_module_invocations_keep_separate_weight_regions(tmp_path, monk
     for name, parameter in generated.named_parameters():
         torch.testing.assert_close(parameter.grad, reference.get_parameter(generated.fullmap[name].orig_name).grad)
     assert next(tmp_path.rglob('gencode0.py')).read_text().count('.weight_region(') == 2
+
+
+@nnscaler.register_op('a b -> a b')
+def combine_anchor(x):
+    return Anchor.apply(nnscaler.prepare_async_input(x), [])
+
+
+class SharedModel(Model):
+    def __init__(self):
+        super().__init__()
+        self.shared = torch.nn.Linear(4, 6, bias=False)
+
+    def forward(self, x):
+        return combine_anchor(self.expert(weight_anchor(x))) + self.shared(x)
+
+
+@replace_all_device_with('cpu', force=True)
+def test_weight_split_composes_with_whole_shared_branch_at_combine(tmp_path, monkeypatch):
+    monkeypatch.setattr('nnscaler.runtime.stream.ModuleStreams', Streams)
+    model = SharedModel()
+    reference = copy.deepcopy(model)
+    rules = (ModuleStreamRule('shared', launch_before='*.combine_anchor', overlap_backward=True),
+             ModuleStreamRule('expert', stream='weights', weight_backward_on='*.weight_anchor'))
+    nnscaler.parallelize(model, {'x': torch.randn(8, 4, requires_grad=True)}, policy,
+                         ComputeConfig(1, 1, module_streams=rules), gen_savedir=tmp_path,
+                         instance_name='weights_shared_combine', load_module=False)
+    cls = _load_parallel_module_class(SharedModel, gen_savedir=tmp_path,
+                                     instance_name='weights_shared_combine', rank=0)
+    generated = new_empty(cls, device='cpu', init_params=True)
+    x = torch.randn(8, 4, requires_grad=True)
+    rx = x.detach().clone().requires_grad_()
+    actual, expected = generated(x), reference(rx)
+    actual.square().sum().backward()
+    expected.square().sum().backward()
+    torch.testing.assert_close(actual, expected)
+    torch.testing.assert_close(x.grad, rx.grad)
+    for name, parameter in generated.named_parameters():
+        torch.testing.assert_close(parameter.grad, reference.get_parameter(generated.fullmap[name].orig_name).grad)
