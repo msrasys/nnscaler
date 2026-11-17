@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING, Any, Tuple, Dict, Callable, Type
 
 import torch
 from torch.fx.node import Target
-from torch.overrides import is_tensor_method_or_property
+from torch.overrides import TorchFunctionMode, is_tensor_method_or_property
 
 from . import pytree_utils, metadata, wrap_utils
 from .metadata import EmptyResult
@@ -68,6 +68,44 @@ def has_meta_tensors(module: torch.nn.Module) -> bool:
 def place_real_tensors_to_cpu(module: torch.nn.Module) -> torch.nn.Module:
     """``module.cpu()`` that leaves meta tensors alone (they have no data to move)."""
     return module._apply(lambda t: t if t.is_meta else t.cpu())
+
+
+class _DeviceRedirect(TorchFunctionMode):
+    """
+    Runs the torch calls made while a node executes with their device parameters replaced by ``device``.
+
+    `ConcreteAttrProxy` pins `<tensor>.device` to cuda so the generated code targets GPUs,
+    and user code may also hard-code `device='cuda'`.
+    Executing with that device would allocate on a real GPU, and fail on a machine without one,
+    even though the strategy runs everything on `device`.
+    Only the executed call is redirected; the node records the original arguments,
+    so the device constants stay as written in the generated code.
+
+    Intercepting at the torch API is what makes a device parameter recognizable:
+    the `device=` keyword of a torch function or tensor method, the first positional argument of `Tensor.to`,
+    and the device methods (`x.cuda()`).
+    Any other place a device value flows through is data and is left alone:
+    a dictionary key or field, or the `device=` keyword of a registered operator,
+    whose body's own torch calls are redirected in turn.
+    """
+
+    def __init__(self, device: str, is_mapped_device: Callable[[Any], bool], device_methods: Tuple[Callable, ...]):
+        super().__init__()
+        self.device = device
+        self.is_mapped_device = is_mapped_device
+        self.device_methods = device_methods
+
+    def __torch_function__(self, func, types, args=(), kwargs=None):
+        kwargs = dict(kwargs) if kwargs else {}
+        if func in self.device_methods:
+            # `x.cuda(device, non_blocking, memory_format)`: the device is the method itself
+            kwargs = {key: value for key, value in kwargs.items() if key in ('non_blocking', 'memory_format')}
+            return torch.Tensor.to(args[0], self.device, **kwargs)
+        if func is torch.Tensor.to and len(args) > 1 and self.is_mapped_device(args[1]):
+            args = (args[0], self.device, *args[2:])
+        if self.is_mapped_device(kwargs.get('device')):
+            kwargs['device'] = self.device
+        return func(*args, **kwargs)
 
 
 class BaseTraceStrategy:
@@ -134,8 +172,8 @@ class BaseTraceStrategy:
             raise ValueError(f'unsupported device type: {device}')
         return pytree_utils.tree_map_only(torch.Tensor, lambda x: x.to(device).requires_grad_(x.requires_grad), args)
 
-    # Tensor methods that are the method form of a device argument (`x.cuda()`); see `_map_devices_to`.
-    _DEVICE_METHODS = ('cuda',)
+    # The method forms of a device argument (`x.cuda()`); see `_DeviceRedirect`.
+    _DEVICE_METHODS = (torch.Tensor.cuda,)
 
     @classmethod
     def _is_mapped_device(cls, value: Any) -> bool:
@@ -156,46 +194,8 @@ class BaseTraceStrategy:
         return isinstance(value, torch.device) and value.type == 'cuda'
 
     @classmethod
-    def _map_devices_to(cls, args: Tuple[Any, ...], kwargs: Dict[str, Any], device: str,
-                        first_arg_device: bool = False) -> Tuple[Tuple, Dict]:
-        # `ConcreteAttrProxy` pins `<tensor>.device` to cuda so the generated code targets GPUs,
-        # and user code may also hard-code `device='cuda'`.
-        # Executing with that device would allocate on a real GPU, and fail on a machine without one,
-        # even though the strategy runs everything on `device`.
-        # Only the copy that is executed is mapped; the original args are what gets recorded in the graph,
-        # so the device constants stay as written there.
-        # Only device parameters are mapped: the `device=` keyword of a torch call, and the first positional
-        # argument of `Tensor.to` (`first_arg_device`). A device anywhere else is data, whatever its type:
-        # `table[torch.device('cuda')]` is a dictionary key, `cfg.update(device='cuda')` a dictionary field.
-        def to_device(x):
-            return torch.device(device) if isinstance(x, torch.device) else device
-
-        if 'device' in kwargs and cls._is_mapped_device(kwargs['device']):
-            kwargs = {**kwargs, 'device': to_device(kwargs['device'])}
-        if first_arg_device and args and cls._is_mapped_device(args[0]):
-            args = (to_device(args[0]), *args[1:])
-        return args, kwargs
-
-    @classmethod
-    def _call_function(cls, target: Callable, args: Tuple[Any, ...], kwargs: Dict[str, Any], device: str) -> Any:
-        """Call ``target(*args, **kwargs)`` for execution on ``device``."""
-        args, kwargs = cls._map_devices_to(args, kwargs, device)
-        return target(*args, **kwargs)
-
-    @classmethod
-    def _call_method(cls, self_obj: Any, target: str, args: Tuple[Any, ...], kwargs: Dict[str, Any], device: str) -> Any:
-        """Call ``self_obj.target(*args, **kwargs)`` for execution on ``device``."""
-        if not isinstance(self_obj, torch.Tensor):
-            # only tensor methods take a device; for any other receiver the arguments are data
-            return getattr(self_obj, target)(*args, **kwargs)
-        if target in cls._DEVICE_METHODS:
-            # `.cuda()` is the method form of device='cuda' (see `_map_devices_to`).
-            # The graph keeps the call, but executing it would allocate on a real GPU,
-            # so it moves to the execution device instead.
-            kwargs = {key: value for key, value in kwargs.items() if key in ('non_blocking', 'memory_format')}
-            return self_obj.to(device, **kwargs)
-        args, kwargs = cls._map_devices_to(args, kwargs, device, first_arg_device=target == 'to')
-        return getattr(self_obj, target)(*args, **kwargs)
+    def _redirect_devices(cls, device: str) -> '_DeviceRedirect':
+        return _DeviceRedirect(device, cls._is_mapped_device, cls._DEVICE_METHODS)
 
     def run_placeholder(self, target: Target, args: Tuple[Any, ...], kwargs: Dict[str, Any]) -> Tuple[Any, Tuple, Dict]:
         return self.tracer.placeholder_dict[target], args, kwargs
@@ -211,20 +211,23 @@ class BaseTraceStrategy:
         if not isinstance(target, Callable):
             raise ValueError(f'the target of "call_function" should be a callable function, but get target {target}')
         args, kwargs = self._place_tensors_to(args, kwargs, device=device)
-        return self._call_function(target, args, kwargs, device), args, kwargs
+        with self._redirect_devices(device):
+            return target(*args, **kwargs), args, kwargs
 
     def _run_call_method_on(self, target: Target, args: Tuple[Any, ...], kwargs: Dict[str, Any], device: str) -> Tuple[Any, Tuple, Dict]:
         if not isinstance(target, str):
             raise ValueError(f'the target of "call_method" should be a string, a bound method name of the first argument, but get target {target}')
         args, kwargs = self._place_tensors_to(args, kwargs, device=device)
         self_obj, *args_tail = args
-        return self._call_method(self_obj, target, tuple(args_tail), kwargs, device), args, kwargs
+        with self._redirect_devices(device):
+            return getattr(self_obj, target)(*args_tail, **kwargs), args, kwargs
 
     def _run_call_module_on(self, target: Target, args: Tuple[Any, ...], kwargs: Dict[str, Any], device: str) -> Tuple[Any, Tuple, Dict]:
         if not isinstance(target, str):
             raise ValueError(f'the target of "call_module" should be a string, a name of the nn module, but get target {target}')
         args, kwargs = self._place_tensors_to(args, kwargs, device=device)
-        return self._call_function(self.tracer.fetch_attr(target), args, kwargs, device), args, kwargs
+        with self._redirect_devices(device):
+            return self.tracer.fetch_attr(target)(*args, **kwargs), args, kwargs
 
     def run_call_function(self, target: Target, args: Tuple[Any, ...], kwargs: Dict[str, Any]) -> Tuple[Any, Tuple, Dict]:
         return self._run_call_function_on(target, args, kwargs, device=self.main_device)
@@ -328,7 +331,7 @@ class MetaStrategy(BaseTraceStrategy):
     # On meta there is nothing to move and nothing can be copied out of it (`x.cpu()` raises),
     # so every device argument executes as the strategy device, cuda or not;
     # the graph still records what the user wrote.
-    _DEVICE_METHODS = ('cuda', 'cpu')
+    _DEVICE_METHODS = (torch.Tensor.cuda, torch.Tensor.cpu)
 
     @classmethod
     def _is_mapped_device(cls, value: Any) -> bool:
@@ -542,13 +545,12 @@ def trace_fake(fn: Callable, fake: Any, *args, **kwargs) -> Any:
     tracer = OperatorPatcherContext.ctx_tracer
     if tracer is None or wrap_utils.TEMP_CALL_ORIGIN:
         return fn(*args, **kwargs)
+
     # torch functions, tensor methods and builtins are patched while tracing: record the original
     fn = wrap_utils.unwrap(fn)
     if wrap_utils.is_autograd_apply(fn):
-        # `Fn.apply` is the patched apply bound to `Fn`;
-        # the node records the original apply bound to `Fn`, as `create_wrapped_autograd_apply` does.
-        fn = tracer.autograd_functions_mapping.setdefault(
-            fn.__self__, torch._C._FunctionBase.__dict__['apply'].__get__(None, fn.__self__))
+        # `Fn.apply` is the patched apply bound to `Fn`; the node records the same target the patched apply would
+        fn = wrap_utils.autograd_apply_target(tracer, fn.__self__)
     elif not (fn in tracer.autowrap_leaf_function or fn in tracer.autowrap_leaf_class or is_tensor_method_or_property(fn)):
         # A plain python function would become one opaque IRPyFunc node
         # that cannot be partitioned and that the generated code must import by name;

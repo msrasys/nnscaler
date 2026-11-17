@@ -459,15 +459,26 @@ def is_default_leaf_function(func: Callable) -> bool:
     )
 
 
+def autograd_apply_target(tracer: 'ConcreteTracer', clz: Type[torch.autograd.Function]) -> Callable:
+    """
+    The callable recorded as the node target for ``clz.apply``, one object per class.
+
+    Rebinding the original apply creates a new object each time, so the tracer caches it per class;
+    a class registered as a leaf already holds its leaf wrapper there (see `get_wrapped_leaves`).
+    """
+    if clz not in tracer.autograd_functions_mapping:
+        tracer.autograd_functions_mapping[clz] = torch._C._FunctionBase.__dict__['apply'].__get__(None, clz)
+    return tracer.autograd_functions_mapping[clz]
+
+
 def create_wrapped_autograd_apply(default_tracer: 'ConcreteTracer'):
     @classmethod
     @functools.wraps(orig_func.torch_agfunc_apply)
     def agfunc_apply_wrapper(clz, *args, **kwargs):
-        if clz not in default_tracer.autograd_functions_mapping:
-            default_tracer.autograd_functions_mapping[clz] = torch._C._FunctionBase.__dict__['apply'].__get__(None, clz)
+        target = autograd_apply_target(default_tracer, clz)
         global TEMP_CALL_ORIGIN
         if TEMP_CALL_ORIGIN:
-            return default_tracer.autograd_functions_mapping[clz](*args, **kwargs)
+            return target(*args, **kwargs)
         with do_temp_call_origin():
             tracers = set()
 
@@ -483,10 +494,10 @@ def create_wrapped_autograd_apply(default_tracer: 'ConcreteTracer'):
 
             tracer = None if len(tracers) == 0 else tracers.pop()
         if tracer is None:
-            return default_tracer.autograd_functions_mapping[clz](*args, **kwargs)
+            return target(*args, **kwargs)
         else:
             assert tracer == default_tracer
-            return default_tracer.create_proxy('call_function', default_tracer.autograd_functions_mapping[clz], args, kwargs)
+            return default_tracer.create_proxy('call_function', target, args, kwargs)
     return agfunc_apply_wrapper
 
 

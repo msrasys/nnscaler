@@ -139,15 +139,39 @@ class DeviceFieldModel(torch.nn.Module):
         return x * (2 if cfg['device'] == 'cuda' else 3)
 
 
+class DictCtorModel(torch.nn.Module):
+    def forward(self, x):
+        cfg = dict(x=x, device='cuda')                # `dict` is a traced builtin; its `device=` keyword is data
+        return cfg['x'] * (2 if cfg['device'] == 'cuda' else 3)
+
+
+def ones_on(x, device='cuda'):
+    # a registered operator: its own `device` keyword is data, the torch call inside it is redirected
+    return x + torch.ones(x.shape, device=device) * (2 if device == 'cuda' else 3)
+
+
+nnscaler.register_op('n -> n')(ones_on)
+
+
+class RegisteredDeviceKwModel(torch.nn.Module):
+    def forward(self, x):
+        return ones_on(x, device='cuda')
+
+
 @pytest.mark.parametrize('strategy', ['cpu', 'meta'])
 def test_device_mapping_leaves_container_keys_alone(monkeypatch, strategy):
     monkeypatch.setattr(CompileFlag, 'trace_strategy', strategy)
     # traces without KeyError: the keys are not rewritten when the lookups execute
     to_fx_graph(DictKeyModel(), {'data': {'cuda': torch.ones(2), 'cpu': torch.ones(2)}})
     to_fx_graph(DeviceObjectKeyModel(), {'x': torch.ones(2), 'table': {torch.device('cuda'): torch.ones(2)}})
-    graph = to_fx_graph(DeviceFieldModel(), {'x': torch.ones(2), 'cfg': {'device': 'cpu'}})
-    mul, = [n for n in graph.graph.nodes if getattr(n.target, '__name__', '') == 'mul']
-    assert mul.args[1] == 2                            # the field kept 'cuda', so the trace took the same branch as runtime
+    for model, inputs in [(DeviceFieldModel(), {'x': torch.ones(2), 'cfg': {'device': 'cpu'}}),
+                          (DictCtorModel(), {'x': torch.ones(2)})]:
+        graph = to_fx_graph(model, inputs)
+        mul, = [n for n in graph.graph.nodes if getattr(n.target, '__name__', '') == 'mul']
+        assert mul.args[1] == 2                        # the field kept 'cuda', so the trace took the same branch as runtime
+    graph = to_fx_graph(RegisteredDeviceKwModel(), {'x': torch.ones(2)})
+    op, = [n for n in graph.graph.nodes if getattr(n.target, '__name__', '') == 'ones_on']
+    assert op.kwargs == {'device': 'cuda'}             # the operator's keyword is recorded and passed through as written
 
 
 def test_patcher_contexts_nest_in_the_supported_order():

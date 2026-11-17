@@ -208,10 +208,9 @@ def replace_all_device_with(device='cpu', force=False):
             if torch.device(args[0]).type == 'meta':
                 return orig_to(self, *args, **kwargs)
             return orig_to(self, device, *args[1:], **kwargs)
-        if 'device' in kwargs:
-            if torch.device(kwargs['device']).type != 'meta':
-                kwargs['device'] = device
-            return orig_to(self, *args, **kwargs)
+        # `device=None` is a dtype-only conversion, not a device request
+        if kwargs.get('device') is not None and torch.device(kwargs['device']).type != 'meta':
+            kwargs['device'] = device
         return orig_to(self, *args, **kwargs)
 
     def patched_cuda(self, *args, **kwargs):
