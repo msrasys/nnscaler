@@ -416,7 +416,17 @@ class ComputeConfig:
                     # this can raise if cfg has extra keys.
                     # which means some fields of ComputeConfig has been removed(we should avoid this).
                     # in this case, we just return None.
-                    return cls(**cfg)
+                    # Loading a saved config must preserve the compiler ABI
+                    # that actually produced its code. Normal construction
+                    # intentionally normalizes user/YAML rules to today's ABI.
+                    cfg.setdefault('module_streams', ())
+                    cfg.setdefault('async_copy_ops', ())
+                    result = cls(**cfg)
+                    for saved, rule in zip(cfg['module_streams'], result.module_streams):
+                        version = (saved.get('_codegen_version') if isinstance(saved, dict)
+                                   else getattr(saved, '_codegen_version', None))
+                        object.__setattr__(rule, '_codegen_version', version)
+                    return result
                 return cfg
             except Exception as e:
                 if not return_none_on_error:

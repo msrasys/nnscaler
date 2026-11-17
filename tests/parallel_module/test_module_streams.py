@@ -129,6 +129,28 @@ def test_stream_codegen_version_invalidates_old_packages():
     assert ComputeConfig(1, 1, module_streams=(asdict(RULE),)) == current
 
 
+def test_saved_stream_codegen_version_survives_normalization(tmp_path, monkeypatch):
+    current = ComputeConfig(1, 1, module_streams=(RULE,))
+    old = copy.deepcopy(current)
+    object.__setattr__(old.module_streams[0], '_codegen_version', 0)
+    path = tmp_path / 'compute_config.pt'
+    ComputeConfig.safe_dump_to_file(old, path)
+    loaded = ComputeConfig.safe_load_from_file(path, return_none_on_error=False)
+    assert loaded.module_streams[0]._codegen_version == 0
+    assert not ComputeConfig.safe_equals(loaded, current)
+    payload = torch.load(path, weights_only=False)
+    payload['module_streams'][0].pop('_codegen_version')
+    torch.save(payload, path)
+    assert not ComputeConfig.safe_equals(ComputeConfig.safe_load_from_file(path), current)
+    payload.pop('module_streams')
+    payload.pop('async_copy_ops')
+    torch.save(payload, path)
+    monkeypatch.setenv('NNSCALER_MODULE_STREAMS', json.dumps([dict(module='side')]))
+    monkeypatch.setenv('NNSCALER_ASYNC_COPY_OPS', '["*.dispatch"]')
+    legacy = ComputeConfig.safe_load_from_file(path, return_none_on_error=False)
+    assert not legacy.module_streams and not legacy.async_copy_ops
+
+
 @replace_all_device_with('cpu', force=True)
 @pytest.mark.parametrize('workers', [1, 2])
 def test_codegen_splits_branch_and_joins_at_consumer(tmp_path, workers):
