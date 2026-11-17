@@ -1214,7 +1214,7 @@ class ModuleCodeGen(FuncEmission):
                         arguments = '(' + ', '.join(arguments) + (',' if arguments else '') + ')'
                         body.append(f'_module_streams.schedule_native('
                                     f'{region.key!r}, {region.stream!r}, {function}, self, '
-                                    f'lambda: {arguments}, {attr_map})')
+                                    f'lambda: {arguments}, {attr_map}, kernel_graphs={region.kernel_graphs!r})')
                     else:
                         body.append(f'{names(region.outputs)} = _module_streams.prepare('
                                     f'{region.key!r}, {region.stream!r}, {function}, self, '

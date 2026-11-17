@@ -58,6 +58,29 @@ result wait afterwards, including when a callback fails. This keeps Python side
 graph construction from delaying communication submission. DeepEP uses this
 two-phase form; its communication algorithm and backward remain the same.
 
+`kernel_graphs=True` additionally enables cooperative backend kernel-graph
+helpers inside an `input_ready` region. A backend calls
+`nnscaler.run_module_kernel_graph(function, tensor_inputs, **immutable_kwargs)`
+from its own no-grad autograd forward. All changing tensor state, including
+quantized weights, must be explicit inputs. The existing autograd function
+continues to compute gradients. Replays copy current inputs and clone outputs,
+so updates and multiple outstanding forwards cannot reuse stale values.
+
+Cache misses execute eagerly and retain detached input snapshots. NNScaler's
+Trainer calls `prepare_module_kernel_graphs()` after a complete optimizer step;
+standalone loops must call it at that same safe boundary. Capture may synchronize
+CUDA and must never run inside an in-flight pipeline/communication region.
+Steady execution only replays graphs. The cache is bounded to four graphs and
+512 MiB of logical input/output storage per device; excess shapes execute eagerly.
+Backend scratch memory is additional and should be measured in GPU memory stats.
+`module_kernel_graph_stats()` reports captures, replays and capacity fallbacks.
+`clear_module_kernel_graphs()` releases the cache at a completed-step boundary.
+Only pure dense tensor kernels are supported: no RNG, host reads, mutations or
+observable aliases. Backend configuration outside the captured arguments must
+remain fixed or the cache must be cleared. The llm-train MX linear adapter opts
+in to this helper; enabling the rule does not automatically capture arbitrary
+operators which have no such adapter.
+
 ```python
 ModuleStreamRule(
     module='*.shared', stream='shared_expert',

@@ -186,10 +186,11 @@ class ModuleStreams:
 
         if native:
             def launch_native(key):
-                name, function, parent, inputs, attributes = self.native.pop(key)
+                name, function, parent, inputs, attributes, kernel_graphs = self.native.pop(key)
                 inputs = inputs() if callable(inputs) else inputs
                 tracked = (*inputs, *attributes)
-                with self.fork(key, name, tracked, preserve_accumulators=bool(backward_keys)):
+                with self.fork(key, name, tracked, preserve_accumulators=bool(backward_keys),
+                               kernel_graphs=kernel_graphs):
                     self.native_results[key] = function(parent, *inputs)
 
             def ready(event):
@@ -215,10 +216,10 @@ class ModuleStreams:
         with self.backward_point(keys), LaunchPoint(tuple(lambda key=key: launch(key) for key in keys)):
             yield
 
-    def schedule_native(self, key, name, function, parent, inputs, attributes):
+    def schedule_native(self, key, name, function, parent, inputs, attributes, *, kernel_graphs=False):
         if key in self.native or key in self.events or key in self.deferred:
             raise ValueError(f'Duplicate module stream region: {key}')
-        self.native[key] = (name, function, parent, inputs, tuple(attributes.values()))
+        self.native[key] = (name, function, parent, inputs, tuple(attributes.values()), kernel_graphs)
         self.region_streams[key] = _get_module_stream(self.caller.device, name)
 
     def native_result(self, key):
@@ -287,7 +288,7 @@ class ModuleStreams:
         return result
 
     @contextmanager
-    def fork(self, key, name, inputs, *, preserve_accumulators=False):
+    def fork(self, key, name, inputs, *, preserve_accumulators=False, kernel_graphs=False):
         device = self.caller.device
         # Backward control edges must not move a shared input's AccumulateGrad
         # onto this stream and import the anchor's pending result wait.
@@ -301,7 +302,8 @@ class ModuleStreams:
             stream.wait_event(self.ready[key])
         else:
             stream.wait_stream(self.caller)
-        with torch.cuda.stream(stream), input_stream_lifetime(inputs, True) as owners:
+        from .kernel_graph import kernel_graph_scope
+        with torch.cuda.stream(stream), kernel_graph_scope(kernel_graphs), input_stream_lifetime(inputs, True) as owners:
             self.owners.extend(owners)
             try:
                 yield

@@ -25,6 +25,10 @@ from nnscaler.graph.schedule.module_streams import ModuleStreamRule
 from nnscaler.runtime.deferred import (
     notify_async_launch, capture_async_backward, prepare_async_input, native_async_launch_pending,
 )
+from nnscaler.runtime.kernel_graph import (
+    run_module_kernel_graph, prepare_module_kernel_graphs, clear_module_kernel_graphs,
+    module_kernel_graph_stats,
+)
 from nnscaler.runtime.function.function import (
     anchor,
     constant_folding,

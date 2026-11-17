@@ -1181,6 +1181,12 @@ class Trainer:
 
             self.hook.on_step_end(self, epoch, idx, step_metrics, aggregated_outputs)
 
+            # Capturing can synchronize CUDA. Finish the complete pipeline step
+            # and its hooks first, outside every in-flight asynchronous anchor.
+            graph_count = nnscaler.prepare_module_kernel_graphs()
+            if graph_count:
+                logger.info('Prepared %d module kernel CUDA graphs', graph_count)
+
             # step the profiler before validation and checkpointing
             self.profiler.step()
 

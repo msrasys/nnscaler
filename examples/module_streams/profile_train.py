@@ -19,6 +19,7 @@ import torch
 import torch.distributed as dist
 
 from nnscaler.cli.trainer import Trainer
+from nnscaler import module_kernel_graph_stats
 
 
 def main():
@@ -80,7 +81,8 @@ def main():
             step = trainer.train_status.finished_train_steps
             emit(event='step', step=step, elapsed_s=elapsed, profiled=profiler is not None,
                  peak_allocated_bytes=torch.cuda.max_memory_allocated(),
-                 peak_reserved_bytes=torch.cuda.max_memory_reserved())
+                 peak_reserved_bytes=torch.cuda.max_memory_reserved(),
+                 kernel_graphs=module_kernel_graph_stats())
             if profiler is not None:
                 marker.__exit__(None, None, None)
                 profiler.stop()

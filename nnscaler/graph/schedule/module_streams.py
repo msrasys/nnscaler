@@ -37,11 +37,16 @@ class ModuleStreamRule:
     resume_on: str | None = None
     overlap_backward: bool = False
     launch_phase: str = 'submitted'
+    kernel_graphs: bool = False
     # Persist the generated-code ABI, including in pickled configurations.
     # A default factory leaves old pickles detectably missing the field.
-    _codegen_version: int = field(default_factory=lambda: 10, init=False, repr=False)
+    _codegen_version: int = field(default_factory=lambda: 11, init=False, repr=False)
 
     def __post_init__(self):
+        if type(self.kernel_graphs) is not bool:
+            raise ValueError('kernel_graphs must be a boolean')
+        if self.kernel_graphs and self.launch_phase != 'input_ready':
+            raise ValueError('kernel_graphs requires an input_ready backend launch point')
         if self.launch_phase not in ('submitted', 'input_ready'):
             raise ValueError('launch_phase must be submitted or input_ready')
         if self.launch_phase == 'input_ready' and (not self.launch_on
@@ -127,6 +132,7 @@ class ModuleStreamRegion:
     overlap_backward: bool = False
     backward_anchor: object = None
     native: bool = False
+    kernel_graphs: bool = False
 
 
 def _unsafe(node):
@@ -278,7 +284,8 @@ def plan_module_streams(nodes, outputs, rules):
                 region = ModuleStreamRegion(key, rule.stream, chunk, inputs, region_outputs,
                                             ready_before, rule.host_concurrency, rule.async_anchor_copies,
                                             deferred=deferred, overlap_backward=rule.overlap_backward,
-                                            backward_anchor=backward_anchor, native=native)
+                                            backward_anchor=backward_anchor, native=native,
+                                            kernel_graphs=rule.kernel_graphs)
                 regions[key] = region
                 placements[destination].append(region)
                 selected.update(chunk)

@@ -505,7 +505,7 @@ class CPUDeferredStreams(SerialStreams):
         self.states[key] = state
         return state.prepare(inputs, tuple(attrs.values()))
 
-    def schedule_native(self, key, stream, function, parent, inputs, attrs):
+    def schedule_native(self, key, stream, function, parent, inputs, attrs, *, kernel_graphs=False):
         self.native[key] = (function, parent, inputs)
 
     def native_result(self, key):
