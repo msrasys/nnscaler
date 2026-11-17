@@ -7,6 +7,22 @@ import torch
 from nnscaler.runtime.deferred import DeferredRegion, LaunchPoint, after_backward, notify_async_launch
 
 
+def test_native_boundary_preserves_normal_autograd_and_pending_state():
+    from nnscaler import native_async_launch_pending, prepare_async_input
+    from nnscaler.runtime.deferred import NativeLaunchPoint
+    x = torch.randn(4, requires_grad=True)
+    side, readiness = [], []
+    assert not native_async_launch_pending()
+    with NativeLaunchPoint((lambda: side.append(x.square()),), readiness.append, lambda: side):
+        assert native_async_launch_pending()
+        value = prepare_async_input(x)
+        assert not native_async_launch_pending()
+        routed = value * 3
+    assert not native_async_launch_pending() and readiness == [None]
+    (routed + side[0]).sum().backward()
+    torch.testing.assert_close(x.grad, 3 + 2 * x.detach())
+
+
 def test_launch_point_restores_grad_inside_custom_forward():
     x = torch.tensor([2.], requires_grad=True)
     result = []

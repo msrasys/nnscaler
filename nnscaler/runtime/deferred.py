@@ -146,6 +146,12 @@ def prepare_async_input(value):
     return point.prepare_input(value) if isinstance(point, NativeLaunchPoint) else value
 
 
+def native_async_launch_pending():
+    """Whether a backend can submit work before binding its native side graph."""
+    point = getattr(_active, 'point', None)
+    return isinstance(point, NativeLaunchPoint) and not point.notified
+
+
 class _AttributeView:
     def __init__(self, parent, attributes):
         self.parent = parent

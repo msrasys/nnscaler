@@ -51,6 +51,13 @@ autograd behavior. Dependencies between native regions at the same launch point
 are resolved in order on the same side stream. Missing backend preparation
 raises an error.
 
+A backend can use `nnscaler.native_async_launch_pending()` to submit its raw
+asynchronous work first, under `torch.no_grad()`, then call `prepare_async_input`
+and attach its autograd function to the already submitted result. Insert the
+result wait afterwards, including when a callback fails. This keeps Python side
+graph construction from delaying communication submission. DeepEP uses this
+two-phase form; its communication algorithm and backward remain the same.
+
 ```python
 ModuleStreamRule(
     module='*.shared', stream='shared_expert',
