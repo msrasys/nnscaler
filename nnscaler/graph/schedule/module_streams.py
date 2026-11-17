@@ -274,6 +274,10 @@ def plan_module_streams(nodes, outputs, rules):
             ordered.extend(region.nodes)
         if node not in selected:
             ordered.append(node)
+    # An explicit launch point may be the segment's final operation. Keep
+    # regions delayed to that boundary in the plan and its tensor lifetimes.
+    for region in placements[len(nodes)]:
+        ordered.extend(region.nodes)
     new_positions = {node: i for i, node in enumerate(ordered)}
     for node in ordered:
         for obj in node.iobjs():
