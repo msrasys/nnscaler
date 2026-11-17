@@ -38,6 +38,54 @@ selected module; the suffix starts before `resume_before`. Omit both split field
 to launch the whole branch. Without a launch anchor, a branch stays in its
 original position and can overlap subsequent independent modules.
 
+## Explicit asynchronous launch points
+
+`launch_on` and `resume_on` prepare a tensor region before an anchor, then
+submit its GPU computation when the anchor calls `nnscaler.notify_async_launch()`.
+The backend should signal immediately after submitting asynchronous device work,
+before waiting for its result. A missing signal is an error. This avoids placing
+the side computation after an anchor's blocking metadata copies.
+
+```python
+ModuleStreamRule(
+    module='*.shared', stream='shared_expert',
+    launch_on='*.nnscaler_moe_dispatch',
+    split_before='down_proj', resume_on='*.nnscaler_moe_combine',
+    overlap_backward=True,
+)
+```
+
+With `overlap_backward=True`, the compiler also adds autograd control edges to
+the anchor inputs. The side region's backward becomes ready after the anchor's
+backward has submitted its work. Control edges return `None` gradients, so they
+do not enqueue arithmetic or inherit the communication result's CUDA wait.
+For a split shared expert, this pairs its suffix backward with the combine
+operator's backward dispatch, and its prefix backward with the dispatch
+operator's backward combine.
+
+The implementation separates three responsibilities:
+
+- The compiler selects modules, validates tensor dependencies and inserts the
+  forward launch points and backward control edges.
+- The runtime prepares the autograd edges, restores grad/autocast state inside
+  custom-function forward calls, and runs an isolated functional inner graph.
+  Input and parameter gradients return through the ordinary outer autograd graph.
+- Backend adapters expose launch timing only. They keep their communication
+  algorithm, arguments and result waits. There are no MoE-specific names in the
+  generic scheduling/runtime implementation.
+
+Deferred regions currently require dense tensor inputs/attributes and fresh,
+non-aliasing tensor outputs, ordinary returned autograd gradients, and no nested
+checkpoint region. Manual parameter-gradient writes, inference mode, CUDA graph
+capture and higher-order gradients are not supported by this opt-in path.
+Output copies preserve the inner graph's saved values; a saved lifetime token
+releases them when backward finishes or an unused graph dies. `retain_graph`
+and original tensor hooks retain their normal first-order semantics.
+
+The launch-point path is undergoing CUDA validation. CPU tests verify generated
+code, outputs, input/parameter gradients, retained graphs and backward ordering;
+these checks alone do not establish device concurrency or a performance gain.
+
 For asynchronous operators which enqueue a wait on the caller stream, use
 `launch_after`/`resume_after` instead of the corresponding `before` fields.
 NNScaler records input readiness *before* the anchor, then submits the side
@@ -155,6 +203,12 @@ and reports both total and uncovered communication as interval unions. Inspect
 `communication_kernel_names` to verify that the regex covers the installed
 DeepEP implementation; `--communication-regex` can override it. Profiled timing
 includes instrumentation overhead and should not be used as the final speedup.
+
+The report also separates `dispatch`, `combine`, and `layout`, and attributes
+communication to forward/backward CPU launch scopes via trace correlation IDs.
+GPU-only traces keep an `unknown` phase. `--compute-regex` additionally reports
+overlap with a chosen subset of compute kernels, for example shared-expert GEMMs.
+Per-operation or phase unions must not be added when their intervals overlap.
 
 Optional DeepEP default tuning is available through `NNSCALER_DEEPEP_CONFIG`,
 applied by `nnscaler.init()` before buffers are initialized. For example:

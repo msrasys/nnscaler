@@ -399,3 +399,186 @@ def test_recompute_stream_rejects_part_of_a_checkpoint(tmp_path):
                     ComputeConfig(1, 1, module_streams=(rule,)),
                     gen_savedir=tmp_path, load_module=False)
     assert 'whole checkpoint region' in str(error.value.__cause__)
+
+
+_anchor_backward_order = []
+
+
+class DispatchAnchor(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, value):
+        from nnscaler import notify_async_launch
+        notify_async_launch()
+        return value * 2
+
+    @staticmethod
+    def backward(ctx, grad):
+        _anchor_backward_order.append('dispatch')
+        return grad * 2
+
+
+class CombineAnchor(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, value):
+        from nnscaler import notify_async_launch
+        notify_async_launch()
+        return value * 3
+
+    @staticmethod
+    def backward(ctx, grad):
+        _anchor_backward_order.append('combine')
+        return grad * 3
+
+
+from nnscaler import register_op
+
+
+@register_op('a b -> a b')
+def dispatch_anchor(x):
+    return DispatchAnchor.apply(x)
+
+
+@register_op('a b -> a b')
+def combine_anchor(x):
+    return CombineAnchor.apply(x)
+
+
+class AnchorModel(ForkModel):
+    def forward(self, x):
+        y = dispatch_anchor(x)
+        y = torch.tanh(y)
+        y = combine_anchor(y)
+        return y + self.side(x)
+
+
+class CPUDeferredStreams:
+    def __enter__(self):
+        self.states = {}
+        return self
+
+    def capture(self, key):
+        pass
+
+    def prepare(self, key, stream, function, parent, inputs, attrs, specs):
+        from nnscaler.runtime.deferred import DeferredRegion
+        state = DeferredRegion(function, parent, attrs.keys(), specs)
+        self.states[key] = state
+        return state.prepare(inputs, tuple(attrs.values()))
+
+    def launch_point(self, keys):
+        from nnscaler.runtime.deferred import LaunchPoint
+        return LaunchPoint(tuple(self.states[key].launch for key in keys))
+
+    def publish(self, outputs, **kwargs):
+        pass
+
+    def join(self, key):
+        assert self.states[key].launched
+
+    def __exit__(self, *exc):
+        if exc[0] is None:
+            assert all(state.launched for state in self.states.values())
+
+
+@replace_all_device_with('cpu', force=True)
+@pytest.mark.parametrize('workers', [1, 2])
+def test_deferred_codegen_preserves_math_and_orders_both_backward_regions(tmp_path, monkeypatch, workers):
+    monkeypatch.setattr('nnscaler.runtime.stream.ModuleStreams', CPUDeferredStreams)
+    model = AnchorModel()
+    reference = copy.deepcopy(model)
+    rule = ModuleStreamRule('side', launch_on='*.dispatch_anchor', split_before='down',
+                            resume_on='*.combine_anchor', overlap_backward=True)
+    parallelize(model, {'x': torch.randn(4, 8, requires_grad=True)}, 'dp',
+                ComputeConfig(1, 1, module_streams=(rule,)), gen_savedir=tmp_path,
+                instance_name=f'launch_points_{workers}', load_module=False, codegen_workers=workers)
+    cls = _load_parallel_module_class(AnchorModel, gen_savedir=tmp_path,
+                                      instance_name=f'launch_points_{workers}', rank=0)
+    generated = new_empty(cls, device='cpu', init_params=True)
+    for name, parameter in generated.named_parameters():
+        original = generated.fullmap[name].orig_name
+        if original.endswith('up.weight'):
+            parameter.register_hook(lambda grad: _anchor_backward_order.append('up'))
+        if original.endswith('down.weight'):
+            parameter.register_hook(lambda grad: _anchor_backward_order.append('down'))
+    for _ in range(2):
+        x = torch.randn(4, 8, requires_grad=True)
+        ref_x = x.detach().clone().requires_grad_()
+        actual, expected = generated(x), reference(ref_x)
+        torch.testing.assert_close(actual, expected)
+        _anchor_backward_order.clear()
+        actual.square().sum().backward()
+        assert _anchor_backward_order.index('combine') < _anchor_backward_order.index('down')
+        assert _anchor_backward_order.index('dispatch') < _anchor_backward_order.index('up')
+        expected.square().sum().backward()
+        torch.testing.assert_close(x.grad, ref_x.grad)
+        for name, parameter in generated.named_parameters():
+            torch.testing.assert_close(parameter.grad, reference.get_parameter(generated.fullmap[name].orig_name).grad)
+
+
+class TiedAnchorModel(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.main = torch.nn.Linear(8, 8, bias=False)
+        self.side = torch.nn.Linear(8, 8, bias=False)
+        self.side.weight = self.main.weight
+
+    def forward(self, x):
+        return dispatch_anchor(self.main(x)) + self.side(x)
+
+
+@replace_all_device_with('cpu', force=True)
+def test_deferred_tied_parameters_and_multiple_live_forwards(tmp_path, monkeypatch):
+    monkeypatch.setattr('nnscaler.runtime.stream.ModuleStreams', CPUDeferredStreams)
+    model = TiedAnchorModel()
+    reference = copy.deepcopy(model)
+    rule = ModuleStreamRule('side', launch_on='*.dispatch_anchor', overlap_backward=True)
+    parallelize(model, {'x': torch.randn(4, 8, requires_grad=True)}, 'dp',
+                ComputeConfig(1, 1, module_streams=(rule,)), gen_savedir=tmp_path,
+                instance_name='tied_deferred', load_module=False)
+    cls = _load_parallel_module_class(TiedAnchorModel, gen_savedir=tmp_path,
+                                      instance_name='tied_deferred', rank=0)
+    generated = new_empty(cls, device='cpu', init_params=True)
+    values = [torch.randn(4, 8, requires_grad=True) for _ in range(3)]
+    references = [x.detach().clone().requires_grad_() for x in values]
+    actual = [generated(x) for x in values]
+    expected = [reference(x) for x in references]
+    for a, b in zip(actual, expected):
+        torch.testing.assert_close(a, b)
+    sum(x.square().sum() for x in actual).backward()
+    sum(x.square().sum() for x in expected).backward()
+    for a, b in zip(values, references):
+        torch.testing.assert_close(a.grad, b.grad)
+    for name, parameter in generated.named_parameters():
+        torch.testing.assert_close(parameter.grad, reference.get_parameter(generated.fullmap[name].orig_name).grad)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason='requires CUDA')
+@pytest.mark.parametrize('tied', [False, True])
+def test_generated_deferred_module_cuda_gradients(tmp_path, tied):
+    import torch.distributed as dist
+    import nnscaler
+    dist.init_process_group('nccl', init_method=f'file://{tmp_path}/process_group', rank=0, world_size=1)
+    try:
+        nnscaler.init()
+        model = (TiedAnchorModel() if tied else AnchorModel()).cuda()
+        reference = copy.deepcopy(model)
+        rule = ModuleStreamRule('side', launch_on='*.dispatch_anchor', overlap_backward=True,
+                                **({} if tied else dict(split_before='down', resume_on='*.combine_anchor')))
+        generated = parallelize(model, {'x': torch.randn(4, 8, device='cuda', requires_grad=True)}, 'dp',
+                                ComputeConfig(1, 1, module_streams=(rule,)), gen_savedir=tmp_path)
+        for _ in range(2):
+            generated.zero_grad()
+            reference.zero_grad()
+            x = torch.randn(4, 8, device='cuda', requires_grad=True)
+            ref_x = x.detach().clone().requires_grad_()
+            actual, expected = generated(x), reference(ref_x)
+            actual.square().sum().backward()
+            expected.square().sum().backward()
+            generated.sync_grad()
+            torch.testing.assert_close(actual, expected)
+            torch.testing.assert_close(x.grad, ref_x.grad)
+            for name, parameter in generated.named_parameters():
+                torch.testing.assert_close(parameter.grad, reference.get_parameter(generated.fullmap[name].orig_name).grad)
+    finally:
+        nnscaler.uninit()
+        if dist.is_initialized():dist.destroy_process_group()

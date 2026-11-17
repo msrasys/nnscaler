@@ -143,6 +143,7 @@ class ModuleCodeGen(FuncEmission):
             'import nnscaler.runtime.function',
             'import nnscaler.runtime.device',
             'import nnscaler.runtime.stream',
+            'import nnscaler.runtime.deferred',
             'import nnscaler.runtime.checkpoint_stream',
             'import _operator', 'from numpy import inf', 'import builtins', '',
             f'runtime_version = {runtime_version!r}', '', ''
@@ -1116,10 +1117,13 @@ class ModuleCodeGen(FuncEmission):
         starts = {region.nodes[0]: region for region in regions.values()}
         owners = {node: region for region in regions.values() for node in region.nodes}
         captures = {}
+        launch_points = {}
         async_copy_nodes = set()
         for region in regions.values():
             if region.ready_before is not None:
                 captures.setdefault(region.ready_before, []).append(region.key)
+                if region.deferred:
+                    launch_points.setdefault(region.ready_before, []).append(region)
                 if region.async_anchor_copies and not any(
                         fnmatchcase(region.ready_before.signature, pattern) for pattern in CompileFlag.async_copy_ops):
                     async_copy_nodes.add(region.ready_before)
@@ -1177,10 +1181,57 @@ class ModuleCodeGen(FuncEmission):
             if node in waits:
                 flush()
                 body.extend(f'_module_streams.join({key!r})' for key in waits[node])
+            if node in launch_points:
+                flush()
+                anchored = launch_points[node]
+                for region in anchored:
+                    inputs = [obj for obj in region.inputs if not obj.is_attr()]
+                    attributes = [obj for obj in region.inputs if obj.is_attr()]
+                    function = f'_{region.key}'
+                    with FunctionBlock(function, ['self', *[self.tensor_name(obj) for obj in inputs]], False) as block:
+                        block.insert_body(self._emit_segment_nodes(
+                            segment, region.nodes, runtime_devid, lifetime, release_unused=False))
+                        block.insert_body(f'return {names(region.outputs)}')
+                    body.extend(block.code)
+                    attr_map = '{' + ', '.join(
+                        f'{self.tensor_name(obj)!r}: {self.tensor_name(obj, prefix_attr="self.")}'
+                        for obj in attributes) + '}'
+                    specs = '(' + ', '.join(
+                        f'({tuple(obj.shape)!r}, {obj.dtype!r}, {obj.requires_grad!r})'
+                        for obj in region.outputs) + ',)'
+                    body.append(f'{names(region.outputs)} = _module_streams.prepare('
+                                f'{region.key!r}, {region.stream!r}, {function}, self, '
+                                f'{names(inputs)}, {attr_map}, {specs})')
+                dependencies = [obj for region in anchored if region.overlap_backward
+                                for obj in region.outputs if obj.requires_grad]
+                if dependencies:
+                    value = next((obj for obj in node.iobjs()
+                                  if isinstance(obj, IRTensor) and obj.requires_grad and not obj.is_attr()), None)
+                    if value is None:
+                        raise ValueError(f'Backward overlap anchor {node.signature} has no differentiable input')
+                    name = self.tensor_name(value)
+                    body.append(f'{name} = nnscaler.runtime.deferred.after_backward({name}, {names(dependencies)})')
+                with Block(f'with _module_streams.launch_point({tuple(r.key for r in anchored)!r}):') as block:
+                    block.insert_body(self._emit_segment_nodes(
+                        segment, [node], runtime_devid, lifetime, release_unused=False))
+                body.extend(block.code)
+                continue
             if node in starts:
                 flush()
                 region = starts[node]
-                if region.host_concurrency:
+                if region.deferred:
+                    caller = region.caller_outputs
+                    producer = tuple(obj for obj in region.outputs if obj not in caller)
+                    if caller:
+                        body.append(f'_module_streams.publish({names(caller)})')
+                    if producer:
+                        body.append(f'_module_streams.publish({names(producer)}, stream={region.stream!r})')
+                    last = lifetime.get_line(region.nodes[-1]) + 1
+                    expired = [obj for obj in region.inputs if not obj.is_attr()
+                               and lifetime.releasable_after_line(obj, last)]
+                    if expired:
+                        body.append(self.emit_release(expired))
+                elif region.host_concurrency:
                     inputs = [obj for obj in region.inputs if not obj.is_attr()]
                     function = f'_{region.key}'
                     with FunctionBlock(function, [self.tensor_name(obj) for obj in inputs], False) as block:

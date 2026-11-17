@@ -140,8 +140,41 @@ class ModuleStreams:
         self.owners = []
         self.futures = {}
         self.future_streams = {}
+        self.deferred = {}
         self.streams = {self.caller}
         return self
+
+    def prepare(self, key, name, function, parent, inputs, attributes, output_specs):
+        """Prepare tensor/autograd edges; enqueue their work at an async anchor."""
+        from .deferred import DeferredRegion
+        if key in self.deferred or key in self.events or key in self.futures:
+            raise ValueError(f'Duplicate module stream region: {key}')
+        if key not in self.ready:
+            self.capture(key)
+        state = DeferredRegion(function, parent, attributes.keys(), output_specs)
+        stream = _get_module_stream(self.caller.device, name)
+        self.streams.add(stream)
+        # Preparing a branch earlier must not accidentally create a shared
+        # input's AccumulateGrad on the side stream. A later main-path gradient
+        # could then enqueue its communication wait onto that same side stream.
+        # Existing compiler/reducer affinities are retained by expand_as().
+        accumulator_holds = [value.expand_as(value) for value in (*inputs, *attributes.values())
+                             if torch.is_grad_enabled() and value.is_leaf and value.requires_grad]
+        with torch.cuda.stream(stream):
+            outputs = state.prepare(inputs, tuple(attributes.values()))
+        del accumulator_holds
+        self.deferred[key] = (name, state, (*inputs, *attributes.values()))
+        return outputs
+
+    def launch_point(self, keys):
+        from .deferred import LaunchPoint
+
+        def launch(key):
+            name, state, inputs = self.deferred.pop(key)
+            with self.fork(key, name, inputs):
+                state.launch()
+
+        return LaunchPoint(tuple(lambda key=key: launch(key) for key in keys))
 
     def capture(self, key):
         """Snapshot caller readiness before an asynchronous anchor is launched."""
@@ -267,11 +300,17 @@ class ModuleStreams:
         # CUDA completion uses events, never a device/stream synchronize.
         for key in self.events:
             self.join(key)
+        unlaunched = tuple(self.deferred)
+        for _, state, _ in self.deferred.values():
+            state.clear()
+        self.deferred.clear()
         with input_stream_lifetime(self.owners, True):
             pass
         self.owners.clear()
         if error is not None and exc_type is None:
             raise error
+        if unlaunched and exc_type is None:
+            raise RuntimeError(f'Deferred module regions were not launched: {unlaunched}')
 
 
 def drain_stream_holds(*, wait=False):

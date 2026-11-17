@@ -33,16 +33,20 @@ class ModuleStreamRule:
     host_concurrency: bool = False
     async_anchor_copies: bool = False
     recompute_only: bool = False
+    launch_on: str | None = None
+    resume_on: str | None = None
+    overlap_backward: bool = False
     # Persist the generated-code ABI, including in pickled configurations.
     # A default factory leaves old pickles detectably missing the field.
-    _codegen_version: int = field(default_factory=lambda: 6, init=False, repr=False)
+    _codegen_version: int = field(default_factory=lambda: 7, init=False, repr=False)
 
     def __post_init__(self):
         if type(self.recompute_only) is not bool:
             raise ValueError('recompute_only must be a boolean')
         if self.recompute_only and (self.launch_before or self.launch_after or self.split_before
                                     or self.resume_before or self.resume_after
-                                    or self.host_concurrency or self.async_anchor_copies):
+                                    or self.host_concurrency or self.async_anchor_copies
+                                    or self.launch_on or self.resume_on or self.overlap_backward):
             raise ValueError('Recompute-only rules cannot also move forward computation')
         if type(self.host_concurrency) is not bool:
             raise ValueError('host_concurrency must be a boolean')
@@ -53,16 +57,24 @@ class ModuleStreamRule:
         for name in ('module', 'stream'):
             if not isinstance(getattr(self, name), str) or not getattr(self, name):
                 raise ValueError(f'{name} must be a nonempty string')
-        for name in ('launch_before', 'split_before', 'resume_before', 'launch_after', 'resume_after'):
+        for name in ('launch_before', 'split_before', 'resume_before', 'launch_after', 'resume_after', 'launch_on', 'resume_on'):
             value = getattr(self, name)
             if value is not None and (not isinstance(value, str) or not value):
                 raise ValueError(f'{name} must be a nonempty string or None')
         if self.stream == 'default':
             raise ValueError('Module streams must use a distinct, named stream')
-        if self.launch_before and self.launch_after or self.resume_before and self.resume_after:
+        if (sum(bool(x) for x in (self.launch_before, self.launch_after, self.launch_on)) > 1
+                or sum(bool(x) for x in (self.resume_before, self.resume_after, self.resume_on)) > 1):
             raise ValueError('Use either before or after for each launch anchor')
-        if (self.split_before is None) != (self.resume_before is None and self.resume_after is None):
+        if (self.split_before is None) != (self.resume_before is None and self.resume_after is None and self.resume_on is None):
             raise ValueError('split_before and a resume anchor must be specified together')
+        if type(self.overlap_backward) is not bool:
+            raise ValueError('overlap_backward must be a boolean')
+        if self.launch_on or self.resume_on:
+            if self.host_concurrency or self.async_anchor_copies:
+                raise ValueError('Explicit launch points cannot use host concurrency or implicit async copies')
+        if self.overlap_backward and (not self.launch_on or (self.split_before and not self.resume_on)):
+            raise ValueError('Backward overlap requires explicit launch_on/resume_on points')
 
 
 def module_stream_rules_from_env():
@@ -103,6 +115,8 @@ class ModuleStreamRegion:
     host_concurrency: bool = False
     async_anchor_copies: bool = False
     caller_outputs: tuple = ()
+    deferred: bool = False
+    overlap_backward: bool = False
 
 
 def _unsafe(node):
@@ -193,9 +207,11 @@ def plan_module_streams(nodes, outputs, rules):
                 chunks = [branch[:split], branch[split:]]
 
             parent, call = scopes[invocation]
-            anchors = ((rule.launch_before or rule.launch_after, bool(rule.launch_after)),
-                       (rule.resume_before or rule.resume_after, bool(rule.resume_after)))
-            for chunk, (anchor, after) in zip(chunks, anchors):
+            anchors = ((rule.launch_before or rule.launch_after or rule.launch_on,
+                        bool(rule.launch_after or rule.launch_on), bool(rule.launch_on)),
+                       (rule.resume_before or rule.resume_after or rule.resume_on,
+                        bool(rule.resume_after or rule.resume_on), bool(rule.resume_on)))
+            for chunk, (anchor, after, deferred) in zip(chunks, anchors):
                 destination = positions[chunk[0]]
                 ready_before = None
                 if anchor:
@@ -236,9 +252,16 @@ def plan_module_streams(nodes, outputs, rules):
                 region_outputs = tuple(dict.fromkeys(obj for n in chunk for obj in n.oobjs()
                                                      if obj in graph_outputs or any(
                                                          c not in chunk_set for c in consumers[obj])))
+                if deferred:
+                    from nnscaler.ir.cten import IRTensor
+                    if not region_outputs or any(not isinstance(obj, IRTensor) for obj in (*inputs, *region_outputs)):
+                        raise ValueError('Deferred module regions require tensor inputs, attributes and outputs')
+                    if gids:
+                        raise ValueError('Deferred module regions cannot contain checkpoint regions')
                 key = f'module_stream_{len(regions)}'
                 region = ModuleStreamRegion(key, rule.stream, chunk, inputs, region_outputs,
-                                            ready_before, rule.host_concurrency, rule.async_anchor_copies)
+                                            ready_before, rule.host_concurrency, rule.async_anchor_copies,
+                                            deferred=deferred, overlap_backward=rule.overlap_backward)
                 regions[key] = region
                 placements[destination].append(region)
                 selected.update(chunk)

@@ -1,5 +1,26 @@
 # Module stream validation
 
+## Current continuation: one fixed baseline and explicit launch points
+
+The new `launch_on`/`resume_on` path is being validated. Its baseline is the
+offload session's 15B PP3/EP2 command with overlap disabled; the treatment changes
+only module overlap. Both use the same 20-SM DeepEP configuration with 96-token
+dispatch/combine chunks, receive capacity 256, and 4x CUDA launch queues. Global
+and FA4 deterministic validation settings are also identical. Initial parameters,
+buffers, RNG and input batches are hashed before comparing runs.
+
+The new protocol prepares side-region autograd edges before communication, then
+launches its computation at an explicit notification after communication is
+submitted and before its result wait. `None`-gradient control edges similarly
+order backward submission without inheriting the communication wait. Generic
+compiler/runtime code has no MoE-specific names; llm-train exposes two backend
+notification points. CPU tests cover generated code, tied parameters, multiple
+live forwards, retention and hooks. CUDA validation is pending release of the
+GPUs by the offload chat. No new performance result is claimed yet.
+
+The remaining sections report the **previous implementation**, not this new
+baseline/treatment. Their transport-tuning comparisons are historical diagnostics.
+
 The generic CUDA-stream feature is implemented and correctness-tested. **The
 requested full hiding of DeepEP communication has not been achieved.** The best
 completed clean comparison reduces step time by 4.60%; most of that improvement
