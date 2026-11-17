@@ -41,22 +41,40 @@ class BackwardLaunchPoint:
         self.ready = torch.cuda.Event()
         self.ready.record()
 
-    def wait(self):
+    def wait(self, stream=None):
         if self.captured and self.ready is None:
             raise RuntimeError('The async backward did not record its input readiness')
         if self.ready is not None:
-            for stream in self.streams:
-                stream.wait_event(self.ready)
+            for target in self.streams if stream is None else (stream,):
+                target.wait_event(self.ready)
+
+
+class _BackwardLaunchPoints:
+    """One backend event can gate independent side regions and checkpoints."""
+
+    def __init__(self, points):
+        self.points = tuple(points)
+
+    def record_ready(self):
+        ready = torch.cuda.Event()
+        ready.record()
+        for point in self.points:
+            point.ready = ready
 
 
 def capture_async_backward():
     """Capture during backend forward; record_ready() before backward submission."""
     point = getattr(_active, 'backward', None)
-    if point is not None:
+    points = []
+    while point is not None:
         if point.captured:
             raise RuntimeError('An async backward launch point must identify one backend operation')
         point.captured = True
-    return point
+        points.append(point)
+        point = point.previous
+    if not points:
+        return None
+    return points[0] if len(points) == 1 else _BackwardLaunchPoints(points)
 
 
 class LaunchPoint:

@@ -1,5 +1,6 @@
 import gc
 import weakref
+from contextlib import nullcontext
 
 import pytest
 import torch
@@ -12,7 +13,9 @@ from nnscaler.runtime.stream import _get_module_stream, drain_stream_holds
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason='requires CUDA')
 
 
-def test_recompute_overlaps_pending_gradient_and_preserves_gradients():
+@pytest.mark.parametrize('gate_inputs', [False, True])
+def test_recompute_overlaps_pending_gradient_and_preserves_gradients(gate_inputs):
+    from nnscaler.runtime.deferred import BackwardLaunchPoint, capture_async_backward
     torch.manual_seed(7)
     x = torch.randn(16, 16, device='cuda', requires_grad=True)
     weight = torch.randn(16, 16, device='cuda', requires_grad=True)
@@ -26,6 +29,8 @@ def test_recompute_overlaps_pending_gradient_and_preserves_gradients():
     del warm
     torch.cuda.synchronize()
     blocked_done = torch.cuda.Event()
+    input_ready = torch.cuda.Event()
+    point = BackwardLaunchPoint(()) if gate_inputs else None
     calls = []
 
     def function(value):
@@ -35,24 +40,32 @@ def test_recompute_overlaps_pending_gradient_and_preserves_gradients():
             finished = torch.cuda.Event()
             finished.record()
             finished.synchronize()
+            if gate_inputs:
+                assert input_ready.query(), 'recompute ran before the backend inputs were ready'
             assert not blocked_done.query(), 'recompute waited for the incoming gradient'
         return hidden.sin() @ weight.t()
 
     class GradientWait(torch.autograd.Function):
         @staticmethod
         def forward(ctx, value):
+            ctx.point = capture_async_backward()
             return value.clone()
 
         @staticmethod
         def backward(ctx, gradient):
+            if ctx.point is not None:
+                torch.cuda._sleep(500_000_000)
+                input_ready.record()
+                ctx.point.record_ready()
             torch.cuda._sleep(500_000_000)
             blocked_done.record()
             return gradient
 
     y = checkpoint(function, x, use_reentrant=False,
-                   context_fn=lambda: contexts('checkpoint_test', (x, weight)))
+                   context_fn=lambda: contexts('checkpoint_test', (x, weight), backward_ready=point))
     expected = (ref_x @ ref_weight).sin() @ ref_weight.t()
-    output = GradientWait.apply(y)
+    with point or nullcontext():
+        output = GradientWait.apply(y)
     for iteration in range(2):
         output.sum().backward(retain_graph=iteration == 0)
         expected.sum().backward(retain_graph=iteration == 0)

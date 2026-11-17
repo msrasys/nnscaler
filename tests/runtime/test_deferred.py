@@ -7,6 +7,26 @@ import torch
 from nnscaler.runtime.deferred import DeferredRegion, LaunchPoint, after_backward, notify_async_launch
 
 
+def test_nested_backward_regions_share_one_input_event(monkeypatch):
+    from nnscaler.runtime.deferred import BackwardLaunchPoint, capture_async_backward
+    events = []
+
+    class Event:
+        def record(self):
+            events.append(self)
+
+    monkeypatch.setattr(torch.cuda, 'Event', Event)
+    outer, inner = BackwardLaunchPoint(()), BackwardLaunchPoint(())
+    with outer, inner:
+        captured = capture_async_backward()
+    assert outer.captured and inner.captured
+    captured.record_ready()
+    assert outer.ready is inner.ready is events[0]
+    captured.record_ready()
+    assert outer.ready is inner.ready is events[1]
+    assert capture_async_backward() is None
+
+
 def test_native_boundary_preserves_normal_autograd_and_pending_state():
     from nnscaler import native_async_launch_pending, prepare_async_input
     from nnscaler.runtime.deferred import NativeLaunchPoint

@@ -54,6 +54,10 @@ class _Recompute:
         caller = torch.cuda.current_stream(self.state.device)
         stream = _get_module_stream(caller.device, self.state.name)
         stream.wait_event(self.state.ready)
+        if self.state.backward_ready is not None:
+            if not self.state.backward_ready.captured:
+                raise RuntimeError('The recompute readiness backend did not capture its launch point')
+            self.state.backward_ready.wait(stream)
         original_pack, original_unpack = hooks
 
         def pack(tensor):
@@ -87,13 +91,14 @@ class _Recompute:
 
 
 class _State:
-    def __init__(self, name, inputs, device):
+    def __init__(self, name, inputs, device, backward_ready):
         self.name, self.inputs, self.device = name, inputs, device
         self.ready = None
         self.forward_stream = None
+        self.backward_ready = backward_ready
 
 
-def contexts(name, inputs):
+def contexts(name, inputs, *, backward_ready=None):
     devices = {tensor.device for tensor in _tensors(inputs) if tensor.device.type == 'cuda'}
     if not devices:
         return nullcontext(), nullcontext()
@@ -103,5 +108,5 @@ def contexts(name, inputs):
     with torch.cuda.device(device):
         if torch.cuda.is_current_stream_capturing():
             raise RuntimeError('Checkpoint stream contexts do not support CUDA graph capture')
-    state = _State(name, inputs, device)
+    state = _State(name, inputs, device, backward_ready)
     return _Forward(state), _Recompute(state)

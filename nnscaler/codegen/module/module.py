@@ -34,6 +34,7 @@ from nnscaler.codegen.emit import FuncEmission
 from nnscaler.codegen.module.autograd import AutogradAdapterCodeGen
 from nnscaler.codegen.lifecycle import LifeCycle
 from nnscaler.graph.schedule.module_streams import plan_module_streams, checkpoint_stream
+from nnscaler.graph.schedule.checkpoint_readiness import plan_checkpoint_readiness
 
 from nnscaler.flags import CompileFlag
 from nnscaler.utils import fields
@@ -1053,7 +1054,8 @@ class ModuleCodeGen(FuncEmission):
             return self._emit_module_streams(segment, runtime_devid)
         return self._emit_segment_nodes(segment, list(segment.nodes()), runtime_devid)
 
-    def _emit_segment_nodes(self, segment, nodes, runtime_devid, lifetime=None, *, release_unused=True):
+    def _emit_segment_nodes(self, segment, nodes, runtime_devid, lifetime=None, *, release_unused=True,
+                            checkpoint_readiness=None):
         """Emit ordinary nodes/checkpoints with a caller-provided lifetime plan."""
         lifetime = lifetime or LifeCycle(nodes, segment.inputs(), segment.outputs())
         rc_groups: List[List[IRCell]] = list(
@@ -1073,7 +1075,8 @@ class ModuleCodeGen(FuncEmission):
                 # get recompute excution code
                 rc_segment = segment.create_segment(rc_group)
                 rc_codes = self._emit_recompute(rc_group,
-                    rc_segment.inputs(), rc_segment.outputs(), lifetime, runtime_devid)
+                    rc_segment.inputs(), rc_segment.outputs(), lifetime, runtime_devid,
+                    backward_ready=(checkpoint_readiness or {}).get(gid))
                 codes += rc_codes
                 # release input tensors after exiting a RC group:
                 last_node = rc_group[-1]
@@ -1091,6 +1094,14 @@ class ModuleCodeGen(FuncEmission):
     def _emit_module_streams(self, segment, runtime_devid):
         nodes, regions, joins = plan_module_streams(
             segment.nodes(), segment.oobjs(), CompileFlag.module_streams)
+        checkpoint_anchors = plan_checkpoint_readiness(nodes, segment.oobjs(), CompileFlag.module_streams)
+        readiness_names = {gid: f'_checkpoint_ready_{index}' for index, gid in enumerate(checkpoint_anchors)}
+        ready_at = {}
+        for gid, anchor in checkpoint_anchors.items():
+            if any(anchor in region.nodes or any(node.recompute == gid for node in region.nodes)
+                   for region in regions.values()):
+                raise ValueError('Recompute readiness cannot also move its checkpoint or backend forward')
+            ready_at.setdefault(anchor, []).append(readiness_names[gid])
         node_streams = {node: region.stream for region in regions.values() for node in region.nodes}
         for node in nodes:
             origins = set()
@@ -1108,7 +1119,7 @@ class ModuleCodeGen(FuncEmission):
                         'float', 'half', 'bfloat16', 'identity', 'transpose', 'permute', 't')):
                 for output in node.oobjs():
                     self.module_parameter_origins[output] = origins
-        if not regions:
+        if not regions and not checkpoint_anchors:
             return self._emit_segment_nodes(segment, nodes, runtime_devid)
         # Schedule emission shares this execution plan. Its executor calls must
         # retain opaque inputs through backward when intra-segment streams exist.
@@ -1145,7 +1156,9 @@ class ModuleCodeGen(FuncEmission):
         def names(objects):
             return '(' + ', '.join(self.tensor_name(t, prefix_attr='self.') for t in objects) + (',' if objects else '') + ')'
 
-        body, pending = [], []
+        body = [f'{name} = nnscaler.runtime.deferred.BackwardLaunchPoint(())'
+                for name in readiness_names.values()]
+        pending = []
         unused = lifetime.release_tensors_after_line(-1)
         if unused:
             body.append(self.emit_release(unused))
@@ -1155,8 +1168,12 @@ class ModuleCodeGen(FuncEmission):
 
         def flush():
             if pending:
-                body.extend(self._emit_segment_nodes(segment, pending, runtime_devid, lifetime, release_unused=False))
+                body.extend(self._emit_segment_nodes(segment, pending, runtime_devid, lifetime, release_unused=False,
+                                                      checkpoint_readiness=readiness_names))
                 pending.clear()
+
+        def readiness_scope(node):
+            return ''.join(f', {name}' for name in ready_at.get(node, ()))
 
         def resolve(key):
             region = unresolved.pop(key)
@@ -1231,7 +1248,7 @@ class ModuleCodeGen(FuncEmission):
                                 f'{tuple(r.key for r in anchored)!r})')
                 options = (f', native=True, backward_keys={tuple(r.key for r in anchored if r.overlap_backward)!r}'
                            if native else '')
-                with Block(f'with _module_streams.launch_point({tuple(r.key for r in anchored)!r}{options}):') as block:
+                with Block(f'with _module_streams.launch_point({tuple(r.key for r in anchored)!r}{options}){readiness_scope(node)}:') as block:
                     block.insert_body(self._emit_segment_nodes(
                         segment, [node], runtime_devid, lifetime, release_unused=False))
                 body.extend(block.code)
@@ -1248,7 +1265,7 @@ class ModuleCodeGen(FuncEmission):
                     name = self.tensor_name(value)
                     keys = tuple(r.key for r in eager_backward_points[node])
                     body.append(f'{name} = _module_streams.after_backward({name}, {names(dependencies)}, {keys!r})')
-                    with Block(f'with _module_streams.backward_point({keys!r}):') as block:
+                    with Block(f'with _module_streams.backward_point({keys!r}){readiness_scope(node)}:') as block:
                         block.insert_body(self._emit_segment_nodes(
                             segment, [node], runtime_devid, lifetime, release_unused=False))
                     body.extend(block.code)
@@ -1298,6 +1315,12 @@ class ModuleCodeGen(FuncEmission):
                         body.append(f'_module_streams.publish({names(caller)})')
                     if producer:
                         body.append(f'_module_streams.publish({names(producer)}, stream={region.stream!r})')
+            elif node in ready_at:
+                flush()
+                with Block(f'with {", ".join(ready_at[node])}:') as block:
+                    block.insert_body(self._emit_segment_nodes(
+                        segment, [node], runtime_devid, lifetime, release_unused=False))
+                body.extend(block.code)
             elif node in async_copy_nodes:
                 flush()
                 with Block('with nnscaler.runtime.stream.AsyncTensorCopies():') as block:
@@ -1519,7 +1542,7 @@ class ModuleCodeGen(FuncEmission):
         return node_codes
 
     def _emit_recompute(self, nodes: Tuple[IRCell], inputs: List[IRSubTensor], outputs: List[IRSubTensor],
-                        lifecycle: LifeCycle, runtime_devid: int) -> List[str]:
+                        lifecycle: LifeCycle, runtime_devid: int, *, backward_ready=None) -> List[str]:
         """
         Emit code to define a Python function for Recomputing and invoke it
         e.g. (the lines are split into `List[str]`)
@@ -1580,7 +1603,8 @@ class ModuleCodeGen(FuncEmission):
             dependencies = list(dict.fromkeys([*inputs, *[obj for node in nodes for obj in node.iobjs() if obj.is_attr()]]))
             dependencies = self.tuple_name(dependencies, prefix_attr='self.')
             context = (f', context_fn=lambda: nnscaler.runtime.checkpoint_stream.contexts('
-                       f'{stream!r}, {dependencies})')
+                       f'{stream!r}, {dependencies}'
+                       f'{", backward_ready=" + backward_ready if backward_ready else ""})')
         codes.append(f'{output_names_tuple} = ckpt.checkpoint(recompute, {input_names_tuple}, '
                      f'use_reentrant=False{context})')
 

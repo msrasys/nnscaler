@@ -202,6 +202,22 @@ existing non-reentrant checkpoint's recomputation on the named stream:
 export NNSCALER_MODULE_STREAMS='[{"module":"*.expert","stream":"expert_recompute","recompute_only":true}]'
 ```
 
+Optionally set `recompute_ready_on='*.async_backend'` to align recomputation
+with the GPU input readiness of that downstream backend's backward. The backend
+captures `nnscaler.capture_async_backward()` in forward and calls its
+`record_ready()` immediately before backward communication. Recomputation then
+waits for that input event, alongside the original forward-completion event;
+it does not wait for communication completion. This prevents a host that runs
+ahead of GPU execution from launching recomputation too early to overlap it.
+
+The selected backend must be the checkpoint's sole direct differentiable
+consumer, in the same enclosing module invocation. Splits, other consumers and
+checkpointed anchors are rejected. The backend must expose the readiness
+protocol; a missing capture or event raises an error. This rule composes with
+shared-branch backward controls at the same backend, using one readiness event.
+It changes only when the existing checkpoint recomputes, and does not create
+additional recomputation or change the forward order.
+
 Recomputation uses saved forward inputs, so it can start while an incoming
 gradient is still being communicated. It waits for the original forward's
 completion event; the original backward stream joins it before consuming saved

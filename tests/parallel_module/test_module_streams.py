@@ -489,6 +489,59 @@ class AnchorModel(ForkModel):
         return y + self.side(x)
 
 
+class ReadyCheckpointModel(ForkModel):
+    def __init__(self):
+        super().__init__()
+        self.other = Branch()
+
+    def forward(self, x):
+        return combine_anchor(self.side(x)) + self.other(x)
+
+
+class AmbiguousCheckpointModel(ForkModel):
+    def forward(self, x):
+        value = self.side(x)
+        return combine_anchor(value) + value
+
+
+@replace_all_device_with('cpu', force=True)
+@pytest.mark.parametrize('workers', [1, 2])
+def test_checkpoint_readiness_codegen_and_gradients(tmp_path, monkeypatch, workers):
+    monkeypatch.setattr('nnscaler.runtime.stream.ModuleStreams', CPUDeferredStreams)
+    monkeypatch.setattr('nnscaler.runtime.deferred.BackwardLaunchPoint.record_ready', lambda self: None)
+    model = ReadyCheckpointModel()
+    reference = copy.deepcopy(model)
+    rules = (ModuleStreamRule('side', recompute_only=True, recompute_ready_on='*.combine_anchor'),
+             ModuleStreamRule('other', launch_on='*.combine_anchor', launch_phase='input_ready', overlap_backward=True))
+    instance = f'checkpoint_ready_{workers}'
+    parallelize(model, {'x': torch.randn(4, 8)}, recompute_side_policy,
+                ComputeConfig(1, 1, module_streams=rules), gen_savedir=tmp_path,
+                instance_name=instance, load_module=False, codegen_workers=workers)
+    code = next(tmp_path.rglob('gencode0.py')).read_text()
+    assert 'backward_ready=_checkpoint_ready_0' in code
+    assert 'backward_keys=' in code and '), _checkpoint_ready_0:' in code
+    cls = _load_parallel_module_class(ReadyCheckpointModel, gen_savedir=tmp_path, instance_name=instance, rank=0)
+    generated = new_empty(cls, device='cpu', init_params=True)
+    x = torch.randn(4, 8, requires_grad=True)
+    ref_x = x.detach().clone().requires_grad_()
+    actual, expected = generated(x), reference(ref_x)
+    actual.square().sum().backward()
+    expected.square().sum().backward()
+    torch.testing.assert_close(actual, expected)
+    torch.testing.assert_close(x.grad, ref_x.grad)
+    for name, parameter in generated.named_parameters():
+        torch.testing.assert_close(parameter.grad, reference.get_parameter(generated.fullmap[name].orig_name).grad)
+
+
+@replace_all_device_with('cpu', force=True)
+def test_checkpoint_readiness_rejects_another_gradient_consumer(tmp_path):
+    rule = ModuleStreamRule('side', recompute_only=True, recompute_ready_on='*.combine_anchor')
+    with pytest.raises(RuntimeError, match='Code generation failed') as failure:
+        parallelize(AmbiguousCheckpointModel(), {'x': torch.randn(4, 8)}, recompute_side_policy,
+                    ComputeConfig(1, 1, module_streams=(rule,)), gen_savedir=tmp_path, load_module=False)
+    assert 'sole direct gradient consumer' in str(failure.value.__cause__)
+
+
 class CPUDeferredStreams(SerialStreams):
     def __enter__(self):
         self.states = {}

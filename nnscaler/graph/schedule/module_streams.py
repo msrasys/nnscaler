@@ -38,11 +38,14 @@ class ModuleStreamRule:
     overlap_backward: bool = False
     launch_phase: str = 'submitted'
     kernel_graphs: bool = False
+    recompute_ready_on: str | None = None
     # Persist the generated-code ABI, including in pickled configurations.
     # A default factory leaves old pickles detectably missing the field.
-    _codegen_version: int = field(default_factory=lambda: 11, init=False, repr=False)
+    _codegen_version: int = field(default_factory=lambda: 12, init=False, repr=False)
 
     def __post_init__(self):
+        if self.recompute_ready_on is not None and not self.recompute_only:
+            raise ValueError('recompute_ready_on requires a recompute_only rule')
         if type(self.kernel_graphs) is not bool:
             raise ValueError('kernel_graphs must be a boolean')
         if self.kernel_graphs and self.launch_phase != 'input_ready':
@@ -68,7 +71,8 @@ class ModuleStreamRule:
         for name in ('module', 'stream'):
             if not isinstance(getattr(self, name), str) or not getattr(self, name):
                 raise ValueError(f'{name} must be a nonempty string')
-        for name in ('launch_before', 'split_before', 'resume_before', 'launch_after', 'resume_after', 'launch_on', 'resume_on'):
+        for name in ('launch_before', 'split_before', 'resume_before', 'launch_after', 'resume_after',
+                     'launch_on', 'resume_on', 'recompute_ready_on'):
             value = getattr(self, name)
             if value is not None and (not isinstance(value, str) or not value):
                 raise ValueError(f'{name} must be a nonempty string or None')
