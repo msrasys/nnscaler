@@ -38,7 +38,7 @@ class ModuleStreamRule:
     overlap_backward: bool = False
     # Persist the generated-code ABI, including in pickled configurations.
     # A default factory leaves old pickles detectably missing the field.
-    _codegen_version: int = field(default_factory=lambda: 7, init=False, repr=False)
+    _codegen_version: int = field(default_factory=lambda: 8, init=False, repr=False)
 
     def __post_init__(self):
         if type(self.recompute_only) is not bool:
@@ -73,8 +73,10 @@ class ModuleStreamRule:
         if self.launch_on or self.resume_on:
             if self.host_concurrency or self.async_anchor_copies:
                 raise ValueError('Explicit launch points cannot use host concurrency or implicit async copies')
-        if self.overlap_backward and (not self.launch_on or (self.split_before and not self.resume_on)):
-            raise ValueError('Backward overlap requires explicit launch_on/resume_on points')
+        if self.overlap_backward and (not (self.launch_on or self.launch_before)
+                or (self.split_before and not (self.resume_on or self.resume_before))
+                or self.host_concurrency):
+            raise ValueError('Backward overlap requires synchronous host submission before or at each anchor')
 
 
 def module_stream_rules_from_env():
@@ -117,6 +119,7 @@ class ModuleStreamRegion:
     caller_outputs: tuple = ()
     deferred: bool = False
     overlap_backward: bool = False
+    backward_anchor: object = None
 
 
 def _unsafe(node):
@@ -215,6 +218,7 @@ def plan_module_streams(nodes, outputs, rules):
             for chunk, (anchor, after, deferred) in zip(chunks, anchors):
                 destination = positions[chunk[0]]
                 ready_before = None
+                backward_anchor = None
                 if anchor:
                     candidates = [n for n in nodes if n not in branch
                                   and fnmatchcase(n.signature, anchor)
@@ -224,6 +228,7 @@ def plan_module_streams(nodes, outputs, rules):
                         raise ValueError(f'{path}: expected one launch anchor {anchor!r}, found {len(candidates)}')
                     destination = positions[candidates[0]] + int(after)
                     ready_before = candidates[0] if after else None
+                    backward_anchor = candidates[0] if rule.overlap_backward else None
                 # Already-available synthesized inputs need not move with the
                 # module. Preserve their original position and other users.
                 chunk = [n for n in chunk if n in original_branch or positions[n] >= destination]
@@ -263,7 +268,8 @@ def plan_module_streams(nodes, outputs, rules):
                 key = f'module_stream_{len(regions)}'
                 region = ModuleStreamRegion(key, rule.stream, chunk, inputs, region_outputs,
                                             ready_before, rule.host_concurrency, rule.async_anchor_copies,
-                                            deferred=deferred, overlap_backward=rule.overlap_backward)
+                                            deferred=deferred, overlap_backward=rule.overlap_backward,
+                                            backward_anchor=backward_anchor)
                 regions[key] = region
                 placements[destination].append(region)
                 selected.update(chunk)

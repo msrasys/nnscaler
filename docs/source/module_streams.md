@@ -40,6 +40,14 @@ original position and can overlap subsequent independent modules.
 
 ## Explicit asynchronous launch points
 
+`overlap_backward=True` also works with `launch_before`/`resume_before`.
+That path submits the ordinary autograd graph on the side stream, then adds
+the backward control edge before calling the anchor. It avoids deferred output
+copies and a nested gradient engine, and can overlap an anchor's host metadata
+wait. Inputs keep their original gradient-accumulator stream placement. It
+requires synchronous host submission; `host_concurrency` and after-call anchors
+cannot supply the side outputs before the control edge is created.
+
 `launch_on` and `resume_on` prepare a tensor region before an anchor, then
 submit its GPU computation when the anchor calls `nnscaler.notify_async_launch()`.
 The backend should signal immediately after submitting asynchronous device work,

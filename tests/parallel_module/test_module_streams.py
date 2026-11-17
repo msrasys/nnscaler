@@ -210,7 +210,7 @@ class SerialStreams:
         return self
 
     @contextmanager
-    def fork(self, *args):
+    def fork(self, *args, **kwargs):
         yield
 
     def publish(self, *args, **kwargs):
@@ -451,7 +451,7 @@ class AnchorModel(ForkModel):
         return y + self.side(x)
 
 
-class CPUDeferredStreams:
+class CPUDeferredStreams(SerialStreams):
     def __enter__(self):
         self.states = {}
         return self
@@ -473,7 +473,8 @@ class CPUDeferredStreams:
         pass
 
     def join(self, key):
-        assert self.states[key].launched
+        if key in self.states:
+            assert self.states[key].launched
 
     def __exit__(self, *exc):
         if exc[0] is None:
@@ -482,17 +483,18 @@ class CPUDeferredStreams:
 
 @replace_all_device_with('cpu', force=True)
 @pytest.mark.parametrize('workers', [1, 2])
-def test_deferred_codegen_preserves_math_and_orders_both_backward_regions(tmp_path, monkeypatch, workers):
+@pytest.mark.parametrize('launch', ['on', 'before'])
+def test_deferred_codegen_preserves_math_and_orders_both_backward_regions(tmp_path, monkeypatch, workers, launch):
     monkeypatch.setattr('nnscaler.runtime.stream.ModuleStreams', CPUDeferredStreams)
     model = AnchorModel()
     reference = copy.deepcopy(model)
-    rule = ModuleStreamRule('side', launch_on='*.dispatch_anchor', split_before='down',
-                            resume_on='*.combine_anchor', overlap_backward=True)
+    rule = ModuleStreamRule('side', split_before='down', overlap_backward=True,
+                            **{f'launch_{launch}': '*.dispatch_anchor', f'resume_{launch}': '*.combine_anchor'})
     parallelize(model, {'x': torch.randn(4, 8, requires_grad=True)}, 'dp',
                 ComputeConfig(1, 1, module_streams=(rule,)), gen_savedir=tmp_path,
-                instance_name=f'launch_points_{workers}', load_module=False, codegen_workers=workers)
+                instance_name=f'launch_points_{launch}_{workers}', load_module=False, codegen_workers=workers)
     cls = _load_parallel_module_class(AnchorModel, gen_savedir=tmp_path,
-                                      instance_name=f'launch_points_{workers}', rank=0)
+                                      instance_name=f'launch_points_{launch}_{workers}', rank=0)
     generated = new_empty(cls, device='cpu', init_params=True)
     for name, parameter in generated.named_parameters():
         original = generated.fullmap[name].orig_name
@@ -554,7 +556,8 @@ def test_deferred_tied_parameters_and_multiple_live_forwards(tmp_path, monkeypat
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason='requires CUDA')
 @pytest.mark.parametrize('tied', [False, True])
-def test_generated_deferred_module_cuda_gradients(tmp_path, tied):
+@pytest.mark.parametrize('launch', ['on', 'before'])
+def test_generated_deferred_module_cuda_gradients(tmp_path, tied, launch):
     import torch.distributed as dist
     import nnscaler
     dist.init_process_group('nccl', init_method=f'file://{tmp_path}/process_group', rank=0, world_size=1)
@@ -562,10 +565,12 @@ def test_generated_deferred_module_cuda_gradients(tmp_path, tied):
         nnscaler.init()
         model = (TiedAnchorModel() if tied else AnchorModel()).cuda()
         reference = copy.deepcopy(model)
-        rule = ModuleStreamRule('side', launch_on='*.dispatch_anchor', overlap_backward=True,
-                                **({} if tied else dict(split_before='down', resume_on='*.combine_anchor')))
+        rule = ModuleStreamRule('side', overlap_backward=True,
+                                **{f'launch_{launch}': '*.dispatch_anchor'},
+                                **({} if tied else {'split_before': 'down', f'resume_{launch}': '*.combine_anchor'}))
         generated = parallelize(model, {'x': torch.randn(4, 8, device='cuda', requires_grad=True)}, 'dp',
-                                ComputeConfig(1, 1, module_streams=(rule,)), gen_savedir=tmp_path)
+                                ComputeConfig(1, 1, module_streams=(rule,)), gen_savedir=tmp_path,
+                                instance_name=f'cuda_{launch}_{tied}')
         for _ in range(2):
             generated.zero_grad()
             # ParallelModule.zero_grad clears reducer buffers. A one-rank

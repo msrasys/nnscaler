@@ -138,7 +138,8 @@ def test_deferred_preserves_explicit_gradient_dtype():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason='requires CUDA')
-def test_deferred_backward_runs_while_anchor_gradient_is_pending():
+@pytest.mark.parametrize('deferred', [True, False])
+def test_deferred_backward_runs_while_anchor_gradient_is_pending(deferred):
     from nnscaler.runtime.stream import ModuleStreams, _get_module_stream, drain_stream_holds
     torch.manual_seed(8)
     x = torch.randn(64, 64, device='cuda', requires_grad=True)
@@ -199,10 +200,17 @@ def test_deferred_backward_runs_while_anchor_gradient_is_pending():
         return (Matmul.apply(value, module.w),)
 
     with ModuleStreams() as streams:
-        y, = streams.prepare('region', 'launch_test', compute, Parent(), (x,), {'w': weight},
-                             (((64, 64), x.dtype, True),))
+        if deferred:
+            y, = streams.prepare('region', 'launch_test', compute, Parent(), (x,), {'w': weight},
+                                 (((64, 64), x.dtype, True),))
+        else:
+            with streams.fork('region', 'launch_test', (x, weight), preserve_accumulators=True):
+                y, = compute(Parent(), x)
         controlled = after_backward(x, (y,))
-        with streams.launch_point(('region',)):
+        if deferred:
+            with streams.launch_point(('region',)):
+                routed = Anchor.apply(controlled)
+        else:
             routed = Anchor.apply(controlled)
         streams.publish((y,))
         streams.join('region')

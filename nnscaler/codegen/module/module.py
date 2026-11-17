@@ -1118,8 +1118,11 @@ class ModuleCodeGen(FuncEmission):
         owners = {node: region for region in regions.values() for node in region.nodes}
         captures = {}
         launch_points = {}
+        eager_backward_points = {}
         async_copy_nodes = set()
         for region in regions.values():
+            if region.overlap_backward and not region.deferred:
+                eager_backward_points.setdefault(region.backward_anchor, []).append(region)
             if region.ready_before is not None:
                 captures.setdefault(region.ready_before, []).append(region.key)
                 if region.deferred:
@@ -1216,6 +1219,17 @@ class ModuleCodeGen(FuncEmission):
                         segment, [node], runtime_devid, lifetime, release_unused=False))
                 body.extend(block.code)
                 continue
+            if node in eager_backward_points:
+                flush()
+                dependencies = [obj for region in eager_backward_points[node]
+                                for obj in region.outputs if obj.requires_grad]
+                if dependencies:
+                    value = next((obj for obj in node.iobjs()
+                                  if isinstance(obj, IRTensor) and obj.requires_grad and not obj.is_attr()), None)
+                    if value is None:
+                        raise ValueError(f'Backward overlap anchor {node.signature} has no differentiable input')
+                    name = self.tensor_name(value)
+                    body.append(f'{name} = nnscaler.runtime.deferred.after_backward({name}, {names(dependencies)})')
             if node in starts:
                 flush()
                 region = starts[node]
@@ -1248,7 +1262,8 @@ class ModuleCodeGen(FuncEmission):
                     if expired:
                         body.append(self.emit_release(expired))
                 else:
-                    with Block(f'with _module_streams.fork({region.key!r}, {region.stream!r}, {names(region.inputs)}):') as block:
+                    preserve = ', preserve_accumulators=True' if region.overlap_backward else ''
+                    with Block(f'with _module_streams.fork({region.key!r}, {region.stream!r}, {names(region.inputs)}{preserve}):') as block:
                         block.insert_body(self._emit_segment_nodes(
                             segment, region.nodes, runtime_devid, lifetime, release_unused=False))
                     body.extend(block.code)

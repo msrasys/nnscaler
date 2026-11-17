@@ -236,8 +236,13 @@ class ModuleStreams:
         return result
 
     @contextmanager
-    def fork(self, key, name, inputs):
+    def fork(self, key, name, inputs, *, preserve_accumulators=False):
         device = self.caller.device
+        # Backward control edges must not move a shared input's AccumulateGrad
+        # onto this stream and import the anchor's pending result wait.
+        accumulator_holds = [value.expand_as(value) for value in inputs
+                             if preserve_accumulators and torch.is_grad_enabled()
+                             and isinstance(value, torch.Tensor) and value.is_leaf and value.requires_grad]
         stream = _get_module_stream(device, name)
         self.streams.add(stream)
         if key in self.ready:
@@ -252,6 +257,7 @@ class ModuleStreams:
                 event = torch.cuda.Event()
                 event.record(stream)
                 self.events[key] = event
+        del accumulator_holds
 
     def publish(self, outputs, *, stream=None):
         # record_stream does not read the data or wait for its producer. It
