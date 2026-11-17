@@ -120,9 +120,10 @@ class ModuleStreamRegion:
 
 
 def _unsafe(node):
+    if not isinstance(node, IRFwOperation):
+        return True
     name = node.signature.rsplit('.', 1)[-1]
-    return (not isinstance(node, IRFwOperation)
-            or node.kwargs.get('inplace', False)
+    return (node.kwargs.get('inplace', False)
             or (name.endswith('_') and not name.startswith('__'))
             or name in ('__setitem__', 'setitem', 'dropout', 'batch_norm', 'rand',
                         'randn', 'rand_like', 'randn_like', 'bernoulli', 'multinomial'))
@@ -226,9 +227,10 @@ def plan_module_streams(nodes, outputs, rules):
                 # Already-available synthesized inputs need not move with the
                 # module. Preserve their original position and other users.
                 chunk = [n for n in chunk if n in original_branch or positions[n] >= destination]
-                if destination > positions[chunk[0]]:
+                if destination > positions[chunk[0]] and not deferred:
                     raise ValueError(f'{path}: module stream launch must not move computation later')
-                barriers = [n for n in nodes[destination:positions[chunk[0]]]
+                begin, end = sorted((destination, positions[chunk[0]]))
+                barriers = [n for n in nodes[begin:end] if n not in branch_set
                             if not isinstance(n, IRAdapter)
                             and n.signature.rsplit('.', 1)[-1] != 'multiref' and _unsafe(n)]
                 if barriers:

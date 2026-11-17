@@ -582,3 +582,33 @@ def test_generated_deferred_module_cuda_gradients(tmp_path, tied):
     finally:
         nnscaler.uninit()
         if dist.is_initialized():dist.destroy_process_group()
+
+
+class EarlyBranchAnchorModel(ForkModel):
+    def forward(self, x):
+        shared = self.side(x)
+        routed = dispatch_anchor(x)
+        return shared + routed
+
+
+@replace_all_device_with('cpu', force=True)
+def test_explicit_launch_point_can_delay_an_early_independent_module(tmp_path, monkeypatch):
+    monkeypatch.setattr('nnscaler.runtime.stream.ModuleStreams', CPUDeferredStreams)
+    model = EarlyBranchAnchorModel()
+    reference = copy.deepcopy(model)
+    rule = ModuleStreamRule('side', launch_on='*.dispatch_anchor', overlap_backward=True)
+    parallelize(model, {'x': torch.randn(4, 8, requires_grad=True)}, 'dp',
+                ComputeConfig(1, 1, module_streams=(rule,)), gen_savedir=tmp_path,
+                instance_name='early_deferred', load_module=False)
+    cls = _load_parallel_module_class(EarlyBranchAnchorModel, gen_savedir=tmp_path,
+                                      instance_name='early_deferred', rank=0)
+    generated = new_empty(cls, device='cpu', init_params=True)
+    x = torch.randn(4, 8, requires_grad=True)
+    ref_x = x.detach().clone().requires_grad_()
+    actual, expected = generated(x), reference(ref_x)
+    torch.testing.assert_close(actual, expected)
+    actual.sum().backward()
+    expected.sum().backward()
+    torch.testing.assert_close(x.grad, ref_x.grad)
+    for name, parameter in generated.named_parameters():
+        torch.testing.assert_close(parameter.grad, reference.get_parameter(generated.fullmap[name].orig_name).grad)
