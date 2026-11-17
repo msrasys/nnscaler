@@ -568,6 +568,11 @@ def test_generated_deferred_module_cuda_gradients(tmp_path, tied):
                                 ComputeConfig(1, 1, module_streams=(rule,)), gen_savedir=tmp_path)
         for _ in range(2):
             generated.zero_grad()
+            # ParallelModule.zero_grad clears reducer buffers. A one-rank
+            # module has ordinary parameters without a reducer; an optimizer
+            # would clear those separately at the next training step.
+            for parameter in generated.parameters():
+                parameter.grad = None
             reference.zero_grad()
             x = torch.randn(4, 8, device='cuda', requires_grad=True)
             ref_x = x.detach().clone().requires_grad_()
