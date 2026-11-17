@@ -269,6 +269,42 @@ class KeepPositive(torch.autograd.Function):
         return grad
 
 
+class ClampPositive(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x):
+        return x.clamp(min=0)
+
+    @staticmethod
+    def backward(ctx, grad):
+        return grad
+
+
+nnscaler.register_op('n -> n')(ClampPositive)
+clamp_positive = ClampPositive.apply   # an alias in the forward's globals, which `autowrap_check` patches
+
+
+class DirectApplyModel(torch.nn.Module):
+    def forward(self, x):
+        return ClampPositive.apply(x).sum()
+
+
+class FakedAliasedApplyModel(torch.nn.Module):
+    def forward(self, x):
+        return nnscaler.trace_fake(ClampPositive.apply, torch.zeros(4), x).sum()
+
+
+@pytest.mark.parametrize('model_cls', [DirectApplyModel, FakedAliasedApplyModel])
+def test_aliased_autograd_apply_resolves_to_its_class(tmp_path, monkeypatch, model_cls):
+    """With an alias of `Fn.apply` in scope, the node target is still the apply bound to `Fn`, so the registered operator is found."""
+    from nnscaler.graph.parser.converter import to_ir_graph
+    monkeypatch.setattr(CompileFlag, 'trace_strategy', 'cpu')
+    graph = to_fx_graph(model_cls(), {'x': torch.randn(4)})
+    apply, = [n for n in graph.graph.nodes if getattr(n.target, '__name__', '') == 'apply']
+    assert apply.target.__self__ is ClampPositive
+    ir = to_ir_graph(graph, {'x': torch.randn(4)}, tmp_path)
+    assert [n.signature for n in ir.nodes() if n.signature.endswith('.apply')] == [f'{__name__}.ClampPositive.apply']
+
+
 class FakedAutogradModel(torch.nn.Module):
     def forward(self, x):
         return nnscaler.trace_fake(KeepPositive.apply, torch.zeros(3), x).sum()

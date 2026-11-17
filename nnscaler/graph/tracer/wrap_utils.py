@@ -461,10 +461,11 @@ def is_default_leaf_function(func: Callable) -> bool:
 
 def autograd_apply_target(tracer: 'ConcreteTracer', clz: Type[torch.autograd.Function]) -> Callable:
     """
-    The callable recorded as the node target for ``clz.apply``, one object per class.
+    The callable recorded as the node target for ``clz.apply``: the original apply bound to ``clz``.
 
-    Rebinding the original apply creates a new object each time, so the tracer caches it per class;
-    a class registered as a leaf already holds its leaf wrapper there (see `get_wrapped_leaves`).
+    Rebinding the original apply creates a new object each time, so the tracer caches it per class.
+    The parser resolves the node by the bound class (`target.__self__`),
+    so a leaf wrapper of the apply must never be stored here.
     """
     if clz not in tracer.autograd_functions_mapping:
         tracer.autograd_functions_mapping[clz] = torch._C._FunctionBase.__dict__['apply'].__get__(None, clz)
@@ -706,6 +707,6 @@ def autowrap_check(tracer: 'ConcreteTracer', frame_dict : Dict[str, Any]):
                 if value in tracer.wrapped_leaf:
                     tracer.patcher.patch(frame_dict, name, tracer.wrapped_leaf[value][1])
                 if is_autograd_apply(value):
-                    if value.__self__ not in tracer.autograd_functions_mapping:
-                        tracer.autograd_functions_mapping[value.__self__] = create_wrapped_leaf_func(value)
-                    tracer.patcher.patch(frame_dict, name, tracer.autograd_functions_mapping[value.__self__])
+                    # An alias of `Fn.apply` (`apply_fn = Fn.apply`) bypasses the patched `Function.apply`,
+                    # so the name itself is patched with a leaf wrapper that records the node target of `Fn`.
+                    tracer.patcher.patch(frame_dict, name, create_wrapped_leaf_func(autograd_apply_target(tracer, value.__self__)))

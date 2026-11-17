@@ -515,9 +515,7 @@ class ConcreteTracer(TracerBase):
             if wrap_utils.is_autograd_apply(func):
                 # torch.autograd.function
                 assert wrap_info.replacement == None, '<subclass of torch.autograd.Function>.apply should set to_func to None!'
-                if func.__self__ not in self.autograd_functions_mapping:
-                    self.autograd_functions_mapping[func.__self__] = wrap_utils.create_wrapped_leaf_func(func)
-                wrapped = self.autograd_functions_mapping[func.__self__]
+                wrapped = wrap_utils.create_wrapped_leaf_func(wrap_utils.autograd_apply_target(self, func.__self__))
             elif isinstance(func, torch._C.ScriptFunction):
                 # if it is a script function,
                 # here will wrap the origin function location and forward the script function to the origin one.
