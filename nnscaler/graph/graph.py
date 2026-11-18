@@ -10,10 +10,11 @@ IRGraph:
     will be inserted at scheduling time.
 """
 
-from typing import Union, Tuple, List, Optional, Dict, Any, TYPE_CHECKING
+from typing import BinaryIO, Union, Tuple, List, Optional, Dict, Any, TYPE_CHECKING
 import logging
 import copy
 import hashlib
+import io
 
 from nnscaler.ir.cten import IRTensor, IRCell, IRObject, IR
 from nnscaler.ir.unique import IDGenerator
@@ -1234,7 +1235,7 @@ class IRGraph(IRSegment):
             IRGraph: the built graph
         """
         with open(filename, 'rb') as f:
-            return IRGraph.loads(f.read())
+            return IRGraph._load(f)
 
     @staticmethod
     def loads(data: bytes) -> 'IRGraph':
@@ -1248,7 +1249,11 @@ class IRGraph(IRSegment):
         Returns:
             IRGraph: the built graph
         """
-        (id_state, graph), cells_restored = IR._loads(data)
+        return IRGraph._load(io.BytesIO(data))
+
+    @staticmethod
+    def _load(file: BinaryIO) -> 'IRGraph':
+        (id_state, graph), cells_restored = IR._load(file)
         if not cells_restored:
             # dumped by an older version, which drops all cells
             return IRGraph.from_dill(id_state, graph)

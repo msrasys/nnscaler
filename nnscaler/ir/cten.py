@@ -20,10 +20,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from functools import lru_cache
-from typing import ClassVar, Iterable, List, Set, Tuple, Type, Union, Optional, Any, Dict, Callable
+from typing import BinaryIO, ClassVar, Iterable, List, Set, Tuple, Type, Union, Optional, Any, Dict, Callable
 from collections import OrderedDict
 import copy
 import io
+import threading
 import dill
 import torch
 
@@ -33,6 +34,11 @@ from nnscaler.utils import _DICT_ITEMS_TYPE, _DICT_VALUES_TYPE, load_type, get_d
 
 
 NestedVarOrStatic = Union[Any, 'IRObject', List['IRObject'], 'IRTensor']
+
+# Held for the whole `IR.no_cell_pickle_context`, which patches the class-wide `IRObject.__getstate__`:
+# contexts in different threads would record each other's objects and could restore in the wrong order.
+# Reentrant so a context can nest in the same thread, where patches are restored in stack order.
+_NO_CELL_PICKLE_LOCK = threading.RLock()
 
 
 class IRCell:
@@ -1206,6 +1212,9 @@ class IR:
     def no_cell_pickle_context():
         """
         Drop `IRObject._cell` while pickling, recording each dropped (object, cell) pair in `dropped_cells`.
+
+        The patch is class-wide: while it is active, an IR object that another thread pickles
+        or deep-copies outside this context also loses its `_cell`.
         """
         class PicklingContextNoCell:
             _missing = object()
@@ -1221,16 +1230,21 @@ class IR:
                     if obj._cell is not None:
                         dropped_cells.append((obj, obj._cell))
                     return IRObject.getstate_for_dump(obj)
-                # the class attribute only: `IRObject.__getstate__` falls back to `object.__getstate__`
+                _NO_CELL_PICKLE_LOCK.acquire()
+                # Only the class's own attribute is saved:
+                # without one, pickle falls back to its default (`object.__getstate__` on Python 3.11+).
                 self._saved_getstate = IRObject.__dict__.get('__getstate__', self._missing)
                 IRObject.__getstate__ = getstate
                 return self
 
             def __exit__(self, exc_type, exc_value, traceback):
-                if self._saved_getstate is self._missing:
-                    del IRObject.__getstate__
-                else:
-                    IRObject.__getstate__ = self._saved_getstate
+                try:
+                    if self._saved_getstate is self._missing:
+                        del IRObject.__getstate__
+                    else:
+                        IRObject.__getstate__ = self._saved_getstate
+                finally:
+                    _NO_CELL_PICKLE_LOCK.release()
         return PicklingContextNoCell()
 
     @staticmethod
@@ -1238,13 +1252,14 @@ class IR:
         """
         Pickle ``obj``, which contains IR objects, with dill, keeping every `IRObject.cell`.
 
-        Pickled directly, `_cell` would make dill recurse along object -> cell -> object chains
-        as long as the graph, so it is dropped while ``obj`` is pickled (`no_cell_pickle_context`).
+        Pickled directly, `_cell` would make dill recurse along chains of object -> cell -> object,
+        which are as long as the graph.
+        So it is dropped while ``obj`` is pickled (`no_cell_pickle_context`).
         The dropped (object, cell) pairs are pickled afterwards as flat lists by the same pickler,
         whose memo makes them refer to the instances already pickled.
-        A pair can bring in a cell that ``obj`` does not reach otherwise (e.g. a `DummyInputOuput`
-        that gives the tensors of an adapter their device), and so further pairs:
-        pairs are pickled until none is left, then a `None` marks the end.
+        A pair can bring in a cell that ``obj`` does not reach otherwise,
+        e.g. the `DummyInputOuput` that gives the tensors of an adapter their device,
+        and so further pairs: pairs are pickled until none is left, then a `None` marks the end.
         """
         buffer = io.BytesIO()
         with IR.no_cell_pickle_context() as context:
@@ -1255,10 +1270,9 @@ class IR:
                 pairs = context.dropped_cells[dumped:]
                 dumped = len(context.dropped_cells)
                 pickler.dump(pairs)
-            # mark the end of dropped cells with None
-            # so we can always have two unpickler.load() calls:
-            # one for the object, one for the dropped cells
-            # see `IR.loads`
+            # `None` ends the pair batches.
+            # It also tells this format from an old-format dump, a single pickle,
+            # whose second load hits the end of the data instead (see `IR._load`).
             pickler.dump(None)
         return buffer.getvalue()
 
@@ -1270,21 +1284,22 @@ class IR:
         Raises:
             ValueError: if ``data`` carries no cells, i.e. it was not written by `IR.dumps`.
         """
-        obj, cells_restored = IR._loads(data)
+        obj, cells_restored = IR._load(io.BytesIO(data))
         if not cells_restored:
             raise ValueError("The data carries no IRObject cells: it was not written by `IR.dumps`.")
         return obj
 
     @staticmethod
-    def _loads(data: bytes) -> Tuple[Any, bool]:
+    def _load(file: BinaryIO) -> Tuple[Any, bool]:
         """
-        `IR.loads` that also accepts data written by a plain `dill.dumps` under `no_cell_pickle_context`
+        `IR.loads` from a binary stream, unpickling directly from it,
+        that also accepts data written by a plain `dill.dumps` under `no_cell_pickle_context`
         (graph dumps of older versions), which carries no cells.
 
         Returns:
             Tuple[Any, bool]: the unpickled object, and whether its cells were restored.
         """
-        unpickler = dill.Unpickler(io.BytesIO(data))
+        unpickler = dill.Unpickler(file)
         obj = unpickler.load()
         try:
             pairs = unpickler.load()
