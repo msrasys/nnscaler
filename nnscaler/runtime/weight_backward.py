@@ -15,7 +15,7 @@ import weakref
 import torch
 from torch.autograd.function import once_differentiable
 from .deferred import BackwardLaunchPoint, after_backward
-from .stream import (_get_module_stream, input_stream_lifetime, hold_owners_through_backward,
+from .stream import (_get_module_stream, input_stream_lifetime,
                      parameter_gradient_stream, parameter_uses_module_stream)
 
 _active = local()
@@ -72,20 +72,9 @@ class WeightBackwardBinding:
     parameters: tuple
     indices: tuple
 
-    def defer(self, callback, inputs, *, retain_inputs=False):
-        """Return one gradient (or None) per parameter from first-order work.
-
-        ``retain_inputs`` opts into batched storage ownership. Declared input
-        storage must remain stable; returned gradients must be allocated on
-        the callback stream or alias declared inputs. Storage resizing needs
-        the default allocator-based stream protection instead.
-        """
-        if type(retain_inputs) is not bool:
-            raise TypeError('retain_inputs must be a boolean')
-        if retain_inputs:
-            self.region.defer(self.indices, callback, inputs, retain_inputs=True)
-        else:
-            self.region.defer(self.indices, callback, inputs)
+    def defer(self, callback, inputs):
+        """Callback returns one gradient (or None) per bound parameter."""
+        self.region.defer(self.indices, callback, inputs)
 
 
 class WeightBackwardRegion:
@@ -180,9 +169,7 @@ class WeightBackwardRegion:
         if self.enabled and not self.bound and not failed:
             raise RuntimeError('Selected module did not bind the weight backward backend protocol')
 
-    def defer(self, indices, callback, inputs, *, retain_inputs=False):
-        if type(retain_inputs) is not bool:
-            raise TypeError('retain_inputs must be a boolean')
+    def defer(self, indices, callback, inputs):
         task_id = torch._C._current_graph_task_id()
         if task_id < 0:
             raise RuntimeError('Weight work can only be deferred inside autograd backward')
@@ -206,7 +193,7 @@ class WeightBackwardRegion:
             raise RuntimeError('Weight work registered after its anchor was submitted')
         autocast = (torch.is_autocast_enabled(self.device.type),
                     torch.get_autocast_dtype(self.device.type), torch.is_autocast_cache_enabled())
-        task.callbacks.append((indices, callback, inputs, autocast, retain_inputs))
+        task.callbacks.append((indices, callback, inputs, autocast))
 
     @torch.no_grad()
     def launch(self):
@@ -218,22 +205,13 @@ class WeightBackwardRegion:
         failed = True
         try:
             with torch.cuda.stream(self.stream) if self.stream is not None else nullcontext():
-                for indices, callback, inputs, (amp, dtype, cache), retain_inputs in task.callbacks:
+                for indices, callback, inputs, (amp, dtype, cache) in task.callbacks:
                     current_amp = (torch.is_autocast_enabled(self.device.type),
                                    torch.get_autocast_dtype(self.device.type), torch.is_autocast_cache_enabled())
                     amp_context = (torch.autocast(self.device.type, enabled=amp, dtype=dtype, cache_enabled=cache)
                                    if (amp, dtype, cache) != current_amp else nullcontext())
-                    with amp_context, input_stream_lifetime(
-                            inputs, self.stream is not None, retain_tensors=retain_inputs) as owners:
+                    with amp_context, input_stream_lifetime(inputs, self.stream is not None):
                         gradients = tuple(callback())
-                        # A returned gradient can alias an input allocation
-                        # (e.g. a reused workspace). Its consumers run after the
-                        # callback's completion event. Record their consumers
-                        # without retaining every gradient until graph end.
-                        if retain_inputs and self.stream is not None:
-                            with input_stream_lifetime(gradients, True) as gradient_owners:
-                                if gradient_owners:
-                                    hold_owners_through_backward(gradient_owners, (self.stream,))
                     if len(gradients) != len(indices):
                         raise RuntimeError('Deferred weight callback returned an incorrect gradient count')
                     task.results.extend((index, grad) for index, grad in zip(indices, gradients)

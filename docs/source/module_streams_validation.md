@@ -1,295 +1,169 @@
 # Module stream validation
 
-Full hiding of DeepEP communication has **not yet been demonstrated**. The
-current comparison uses one fixed no-overlap baseline and changes stream
-scheduling and its backend submission adapters. Communication tuning gains from
-earlier experiments are excluded.
+Full hiding of DeepEP communication has **not** been demonstrated. The 15B
+preset keeps shared-expert splitting and expert/attention recomputation streams.
+Deferred dWeight remains opt-in: correcting its publication removes a measured
+regression, but adding it to that preset has not shown a reliable incremental gain.
 
-## 2026-11-18: local dInput/dWeight implementation
+## Workload and protocol
 
-The optional `weight_backward_on` feature separates expert dInput and dWeight
-inside the existing backward action. It follows the local communication window
-in the `yileiyang/dw_split` references (NNScaler `4344a22a`, llm-train `7f49702b`),
-while retaining ordinary autograd parameter edges instead of importing the FBW
-pipeline scheduler or a device-wide pending-weight queue. It does not introduce
-cross-microbatch work. The previous performance numbers below are **not**
-measurements of this new feature.
+YOCO-MoE-15B-A6B-L4, PP3/EP2/CP1 on six B200 GPUs, 12 virtual stages, 8K,
+batch size 1, update frequency 12, universal loop 3, MTP1, MXFP8, frozen Vision,
+Attention/MoEExpert recomputation, Muon and per-token clipping 20000. This matches
+the local offload workload. No new cross-microbatch work or FBW pipeline schedule
+is introduced. Both DeepEP directions use `[20,96,256,6,128]`; CUDA launch queues
+are 4x. Global/FA4 deterministic modes and the fixed cuBLAS workspace are held
+constant; uninitialized-memory filling is disabled.
 
-CPU validation includes 66 compiler/runtime and 27 backend/MoE kernel-double
-tests. Checks include
-repeated module invocations, ordinary reducer completion counts with mixed
-native gradients, BF16 parameters with FP32 gradients, retained backward,
-parameter updates, checkpoint reuse, AMP and failure cleanup. After the offload
-session released the GPUs, 98 CUDA-enabled framework tests passed. Real EP2
-MXFP8 MoE tests use 16K global tokens, recomputation, per-token clipping 20000,
-and a 3% weight update. Both dW variants produce bitwise-equal outputs and
-parameter gradients; input-gradient relative L2 error is 0.000854, below the
-unchanged 0.003 threshold.
+Timing uses the actual unprofiled rank-0 `train_wall` over steps 60–79 of 80,
+without per-step observer synchronization. Initial tensors/RNG, full-input
+checkpoints at steps 1/3/36/80, and work per step are checked on all six ranks.
+The original 303000-update learning-rate horizon is preserved. These runs use
+real VL batches with randomly initialized language weights, not a resumed model.
 
-The new performance protocol uses 80 steps, the actual rank-0 training metrics
-over steps 60–79, no profiler injection, and no per-step observer synchronization.
-Global deterministic algorithms and the fixed cuBLAS workspace remain enabled;
-uninitialized-memory filling is disabled. These measurements cannot be compared
-directly with the older fill-enabled, synchronized-observer numbers below.
-NNScaler `fd6c303d` and llm-train `36bdb024` give:
+The first cold-generation native run has small numerical differences from warm
+controls despite identical initialization/inputs and equivalent generated code.
+A warm native trace reproduces the previous warm native and standalone dW
+numerical values. Both causal early/fixed pairs below have **identical 80-step
+loss, gradient norm and auxiliary-loss metrics on all six ranks**. The overlap
+reference and its dW variants also match each other. Do not describe every
+native-versus-overlap run as bitwise identical.
 
-| Configuration | Training s/step | TFLOPS/GPU | Step-time reduction |
-| --- | ---: | ---: | ---: |
-| No overlap | 4.489316 | 533.80 | — |
-| Existing shared split + expert recomputation | 4.461282 | 537.16 | 0.62% |
-| Additionally split expert dX/dW | 4.426563 | 541.37 | 1.40% |
+## End-to-end results
 
-All six ranks match initial tensors/RNG, selected full-input checkpoints and
-per-step work. All 80 steps' loss, gradient norm and auxiliary losses are
-identical between the last two configurations. Peak sampled GPU use rises from
-134.10 GiB to 154.77 GiB when adding dW; these are driver-use samples, not active
-tensor allocations. The gain is real in this run but small; full hiding is not
-established.
+The primary matrix uses NNScaler `eb6d2699`, llm-train `273c966f`, one cache and
+one no-overlap configuration. The early-publication case is an explicitly
+recorded runtime counterfactual on the same source, restoring main-stream
+publication and accumulation. Standalone comparisons hold async metadata copies
+off; the existing-overlap comparisons hold them on.
 
-A separate baseline trace has 265.17 ms/GPU of exposed dispatch plus combine,
-5.47% of its annotated step, with zero unattributed DeepEP kernels. Forward
-dispatch/combine contribute 76.27/36.90 ms and backward dispatch/combine
-98.86/53.14 ms; layout is separately 8.49 ms. No computation overlaps baseline
-communication. Treatment traces and remaining attention/shared-placement
-experiments are pending. The first attention attempt stopped during compilation
-because locally constructed kwargs dictionaries were conservatively rejected;
-the compiler now proves local dictionary ownership instead of changing the
-model or allowing external mutations.
+| Configuration | s/step | Peak sampled driver GiB |
+| --- | ---: | ---: |
+| No overlap | 4.484517 | 101.77 |
+| Standalone dW, early publication | 4.511782 | 136.61 |
+| Standalone dW, corrected publication | 4.480526 | 128.01 |
+| Shared split + expert/attention recomputation | 4.415605 | 151.08 |
+| Existing overlap + dW, early publication | 4.440813 | 167.29 |
+| Existing overlap + dW, corrected publication | 4.411816 | 156.83 |
 
-Subsequent measurements on NNScaler `ba2b81ad` with the same llm-train commit
-replay the identical baseline at 4.485056 s/step (0.095% difference); all 12
-generated Python files and all 80 steps' numerical metrics match the first
-control. Adding attention recomputation gives 4.406099 s/step, **1.76%** gain.
-Moving whole shared computation before forward combine with dW gives
-4.437408 s/step, 1.06%. Combining all side work on one stream loses the gain
-(4.478034 s/step, 0.16%). Separate dW+attention and a whole-shared combination
-hit the 170 GiB guard and are not complete performance measurements.
+The correction recovers **31.255 ms** standalone and **28.997 ms** when combined
+with existing overlap, respectively 0.69% and 0.65% of the early versions' step
+times. Paired-step SEMs are 2.043 and 2.055 ms. Relative to the existing overlap
+reference, corrected dW saves only **3.788 ms (0.086%)**, with paired-step SEM
+1.967 ms. That is insufficient to select it as the preset default. The existing
+preset improves this native control by 1.54%; an earlier matched batch measured
+1.90%. These are measured batches, not a fixed performance guarantee.
 
-The attention trace contains exactly the baseline GEMM counts, no extra
-recomputation, and no recompute overlap with forward DeepEP. Mean DeepEP time
-including layout grows from 273.66 to 361.07 ms while 144.20 ms overlaps compute;
-exposure falls to 216.86 ms. Whole shared+dW overlaps 221.13 of 392.02 ms and
-leaves 170.89 ms exposed. Every dW callback launches/publishes once, with exactly
-two expert dW GEMMs: backward combine is 109.95 ms, only 1.15 ms exposed, versus
-53.14 ms in the control. Expert dW GEMM time grows from 272.69 to 308.74 ms/GPU.
-Thus overlapping kernels alone does not establish equivalent end-to-end gains;
-communication expansion and compute contention/arrival delays require attention.
+## Communication exposure
 
-The next opt-in implementation adds independent `backward_on` placement/priority
-and reuses a dead private MoE backward workspace for gW13. The latter preserves
-the required zero-initialized accumulation; the installed DeepGEMM K-grouped API
-requires `C`. CPU checks pass (85 framework, 32 backend), as do 118 CUDA-enabled
-framework tests. Real EP2 tests with both changes retain bitwise outputs/parameter
-gradients and the same 0.000854 input-gradient error; workspace reuse occurs in
-both tested backwards on each rank.
+Separate Nsight CUDA/NVTX runs capture matched step 41. The values below are
+mean **ms per GPU per step**, not sums across GPUs. The no-overlap dispatch plus
+combine exposure is 266.284 ms, 5.48% of its 4860.140 ms instrumented scope.
+Layout preparation is an additional 8.487 ms and is excluded from this table.
 
-## Final matched validation of the latest implementation
-
-NNScaler `2c809b38` and llm-train `df090274` use the same workload, strict
-numerical mode, lean observer and steps 60–79 described above:
-
-| Configuration | Training s/step | TFLOPS/GPU | Step-time reduction | Peak driver GiB |
+| Exposed interval | No overlap | Existing overlap | Early dW | Corrected dW |
 | --- | ---: | ---: | ---: | ---: |
-| No module overlap | 4.486419 | 534.14 | — | 103.31 |
-| Shared split + expert recomputation + dW workspace reuse | 4.435623 | 540.27 | 1.13% | 151.15 |
-| Shared split + expert/attention recomputation | 4.401036 | 544.51 | **1.90%** | **150.06** |
-| Both recomputations + dW workspace reuse | 4.401540 | 544.45 | 1.89% | 166.56 |
-| Independent shared backward anchor + dW | 4.449367 | 538.59 | 0.83% | 152.42 |
-| Independent anchor + both recomputations + dW | 4.419406 | 542.25 | 1.49% | 167.82 |
+| Forward dispatch | 80.651 | 80.977 | 85.411 | 82.095 |
+| Backward dispatch | 98.297 | 68.045 | 71.107 | 68.467 |
+| Dispatch total | 178.949 | 149.021 | 156.518 | 150.561 |
+| Forward combine | 36.294 | 24.748 | 25.778 | 24.779 |
+| Backward combine | 51.041 | 13.781 | 0.213 | 0.091 |
+| All dispatch + combine | 266.284 | 187.550 | 182.509 | 175.432 |
 
-All six ranks match initialization, selected full-input checkpoints and per-step
-work. The overlap variants' 80-step loss, gradient norm and auxiliary losses
-match each other. The attention-only and combined step-time difference is just
-0.504 ms, with a paired-step SEM of 2.374 ms; the combined configuration costs
-16.5 GiB more sampled driver memory. The llm-train 15B PP3/EP2 preset therefore
-selects attention recomputation, retaining dW and independent backward placement
-as optional features. An external dW-only 128-SM probe passed correctness but
-measured 4.439568 s/step, without further gain; it was not integrated.
+“Backward dispatch” means the reverse transport of forward combine. The backward
+of the **forward-dispatch operator** is combine instead; that operator's forward
+plus backward is 80.651 + 51.041 = **131.693 ms** in this control. The prior turn's
+capture measured 175.129 ms dispatch and 265.170 ms total dispatch/combine; use
+one matched capture batch for comparisons rather than mixing these numbers.
 
-The final combined trace has 389.08 ms/GPU of dispatch+combine, 178.41 ms with
-concurrent computation, and **210.67 ms still exposed**. Backward combine alone
-is 103.35 ms with only **0.15 ms exposed**. Relative to attention recomputation,
-the remaining backward-combine exposure disappears, but forward/backward
-dispatch exposure increases; total exposure is essentially unchanged. All GEMM
-signature counts still match the control, each dW callback publishes once, and
-no recomputation overlaps forward DeepEP in these captures. Workspace reuse
-occurs in 636 of 864 callbacks (73.6%); smaller buffers use the normal allocation.
-These are interval diagnostics from separate profiled steps, not sums of
-independent wall-time costs. The full-communication-hiding target remains unmet.
+All communication kernels are attributed. GEMM signature counts match the
+control, every dW callback launches and publishes once, and no extra
+recomputation or forward/recompute communication overlap appears in these traces.
+Kernel intervals include resource competition and peer-arrival waits. Exposure
+is a timeline diagnostic, not an additive prediction of wall-time gain.
 
-## Workload and measurement
+## Confirmed dependency problem and remaining cost
 
-The workload matches the offload session: YOCO-MoE-15B-A6B-L4, PP3/EP2 on six
-B200 GPUs, 12 virtual stages, 8K sequences, batch size 1, update frequency 12,
-MXFP8, frozen Vision, Attention/MoEExpert recomputation, Muon, universal loop 3,
-and seed 2609271808. It uses real VL batches and randomly initialized language
-weights. The original 303000-update learning-rate horizon is preserved.
+The old parameter-gradient view node ran on main. Its gradient publication
+joined W before independent upstream input backward could proceed. The correction
+creates publication on W and gives compiler-proven exclusive parameter
+accumulators/reducers W affinity, preserving existing hooks and ordinary
+GraphTask completion. Mixed/native consumers retain their original affinity.
 
-Both modes use DeepEP configuration `[20,96,256,6,128]` for dispatch and combine,
-4x CUDA launch queues, and identical global/FA4 deterministic settings. Here
-96 is the token chunk size; the communication kernels use 20 SMs. Initial
-parameters, buffers, RNG state and every input batch are hashed and compared.
+A delayed-W CUDA regression fails before the correction and passes afterward.
+The full-model trace confirms 156 premature W-to-main waits on each of ranks
+0–3 and 120 on ranks 4–5. After correction, every rank has 48 normal GraphTask-end
+waits, **zero explicit early joins**, and W publication/accumulation. No work is
+moved into another microbatch.
 
-Timing measures synchronized optimizer completion, taking the maximum across
-all six ranks. Steps 21–40 form the timing window; only step 41 is profiled.
-Nsight CUDA/NVTX traces attribute communication kernels to forward/backward
-backend calls with zero unattributed DeepEP kernels. Torch-profiler and Nsight
-runs are kept separate because their process instrumentation differs.
+Resource contention remains. Expert dW GEMM duration is 284.840 ms with existing
+overlap, 314.294 ms with early dW and 315.934 ms after the correction. Only
+13.781 ms of backward combine was still exposed in the existing reference.
+Each dW GEMM launches 148 blocks, with 230188 bytes of dynamic shared memory per
+block. DeepEP uses 20 blocks of 768 threads; combine needs 98304 + 1024 shared
+bytes and dispatch needs 196608 + 1024. These cannot coexist with those dW blocks
+on one SM. Actual dW-GEMM/main-GEMM intersection is only 0.37–1.36 ms per GPU in
+the corrected capture. Creating streams does not partition SM resources.
 
-The current Nsight protocol results are:
+CUDA event-query host time is 115.935/157.137/163.852/167.152 ms for the four
+captures. Explicit NNScaler owner polling contributes only about 3.4–3.8 ms in
+the overlap cases. It is incorrect to attribute all event queries to that queue;
+allocator tracking is also involved.
 
-| Configuration | Mean step | Reduction |
+## Additional experiments
+
+A later matched reference with the ordinary input policy measured 4.419665 s.
+Its generated source is byte-identical to the earlier corrected dW case. The
+following interventions retain initialization, input checkpoints, work and
+numerical metrics. Cross-commit comparisons have an explicit audit showing the
+default execution path unchanged.
+
+| Intervention | s/step | Change from 4.419665 s |
 | --- | ---: | ---: |
-| No module overlap | 5.216390 s | — |
-| Shared prefix/suffix + backward input readiness + expert recomputation stream | 5.130144 s | 1.65% |
-| Additionally gate recomputation on backward input readiness | 5.189694 s | 0.51% |
-| Limit side-stream DeepGEMM to 128 SMs | 5.161739 s | 1.05% |
+| dW on caller compute stream, after communication submission | 4.441055 | +21.390 ms |
+| dW-only 128-SM limit, with corrected publication | 4.423510 | +3.845 ms |
 
-These are short-run results, not evidence of long-term training equivalence.
-The optional native launch and backend kernel-graph paths are correctness-tested,
-but are not faster than the table's best treatment in the completed full-model runs.
+The 128-SM micro test improved by about 0.22 ms, but full-model timing did not.
+Its effective setting and restoration are audited; it is not selected.
+Deferring only W2 while keeping W13 inline measured **4.432126 s**, 20.309 ms
+slower than the corrected full-dW reference, with higher memory. It is rejected.
 
-## Timing without profiler injection
+Two storage-retention policies were also tested. Keeping aliased gradients until
+GraphTask completion exceeded the 170 GiB guard at step 9 (171.63 GiB). Keeping
+only callback inputs until a completion event still exceeded it at step 7
+(170.89 GiB). Neither is a complete performance measurement. Those optional
+runtime/backend changes were removed from the final implementation; the
+standard allocator-based lifetime protection is retained.
 
-The matched 40-step runs use nnscaler `389c9925` and llm-train `49aaa81a`, with
-no Nsight process injection and no active Torch profiler (`--profile-step 0`).
-The same steps 21–40, six-rank maximum, transport settings, initial state and
-input hash checks are retained.
+The legacy `dw_split` references (NNScaler `4344a22a`, llm-train `7f49702b`) also
+wait `wgrad_done` before returning communication backward. Their default native
+weight-group limit is 8.39M elements, below this model's 327.16M local expert
+parameters. This can prevent large tasks from entering the intended window
+unless overridden. It does **not** establish which settings the historical run
+used; the full legacy FBW scheduler was not imported or benchmarked here.
 
-| Configuration | Mean step | Standard deviation |
-| --- | ---: | ---: |
-| No module overlap | 5.191783 s | 0.059037 s |
-| Default `run_stream_overlap.sh overlap` | 5.104408 s | 0.052740 s |
+## Correctness and artifacts
 
-The measured reduction is **1.68%**, or 87.37 ms per step. This confirms the
-earlier 1.65% result; it remains below the full-communication-hiding target.
-Maximum loss and gradient-norm differences in the timing window are 0.000911
-and 0.004484 respectively. The launcher selects eager shared prefix/suffix
-execution with backward input readiness, ordinary early expert recomputation,
-and independent asynchronous metadata copies. It does not select kernel graphs,
-recomputation gating, padded dispatch or a modified DeepGEMM SM budget.
+The final tree passes **188 CUDA/framework tests** and **9 CPU MoE-backend
+tests**, followed by a guarded real EP2 native/dW comparison with bitwise-equal
+outputs, input gradients and parameter gradients on both ranks.
 
-A final owner-event polling experiment passed 32 lifetime/gradient/runtime
-checks but measured 5.120583 s with the same overlap rules and inputs, versus
-5.104408 s above. That runtime change was archived and reverted as well; the
-delivered executable code matches the selected measured configuration.
+Validation covers gradient-stream affinity, real reducer hooks, multiple live
+forwards, retained backward, pruned parameter paths, mixed consumers, FP32
+parameter gradients, autocast and exception cleanup. A delayed-accumulation CUDA
+regression stresses an aliased gradient from an independent producer stream;
+removing its lifetime protection corrupts the gradient under allocator reuse.
+This guards against removing necessary stream protection to improve a benchmark.
 
-## Exposed communication
+Real EP2 MXFP8 checks use 16K global tokens, recomputation and per-token clipping
+20000. The guarded native/named-stream/caller/SM-budget checks preserve outputs,
+dX and parameter gradients bitwise. Early micro scripts were missing a main
+guard and could be re-entered by compiler spawn workers; those micro timings are
+excluded and the guarded checks were rerun. Full-model training uses a separate
+entrypoint and did not have that failure.
 
-Per-device interval unions from the matched final-step traces are below.
-“Exposed” means no useful computation overlaps that communication interval;
-NCCL and other communication kernels do not count as useful computation.
-
-| Rank | Baseline exposed (ms) | Treatment concurrent (ms) | Treatment exposed (ms) |
-| --- | ---: | ---: | ---: |
-| 0 | 330.13 | 137.52 | 199.03 |
-| 1 | 266.60 | 139.60 | 178.05 |
-| 2 | 257.60 | 175.74 | 173.15 |
-| 3 | 342.82 | 145.52 | 347.28 |
-| 4 | 221.08 | 118.26 | 196.03 |
-| 5 | 225.08 | 109.70 | 115.67 |
-
-Baseline rank 3 has 91.97 ms forward dispatch, 44.65 ms forward combine,
-128.30 ms backward dispatch, 69.01 ms backward combine, and 8.89 ms layout.
-Dispatch/combine alone occupy 333.93 ms, or 6.08% of its 5492.32 ms profiled
-step. Including layout gives 342.82 ms / 6.24%. Fractions cannot be added across
-ranks. Kernel durations include peer-readiness waits, and the profiled denominator
-includes instrumentation overhead; the end-to-end A/B remains the acceptance
-metric.
-
-The treatment makes real communication/computation overlap, but rank 3's
-communication duration increases to 492.80 ms. Its remaining forward dispatch
-exposure is 165.89 ms. Consequently, the concurrent duration alone overstates
-the end-to-end benefit. The results do not establish an optimization limit.
-
-## Correctness and implementation checks
-
-The generic NNScaler compiler/runtime uses module rules and backend launch
-boundaries without MoE-specific names. Generated-source audits check both the
-saved code-generation ABI and actual readiness/launch constructs. Loading an old
-saved configuration preserves its ABI rather than silently assigning today's
-version; one earlier stale-cache run was rejected and excluded.
-
-Completed checks include generated forward/input-gradient/parameter-gradient
-comparisons, parameter sharing, multiple live forwards, retained backward,
-checkpoint tensor ownership, reducers, and explicit CUDA readiness tests.
-Those readiness tests delay the incoming gradient and demonstrate that side
-work starts after its inputs are ready and before communication completes.
-Host ordering alone was insufficient: CPU submission could lead GPU execution
-by more than 20 ms.
-
-Actual EP2 MoE checks use embedding 4096, latent width 1024, routed width 6656,
-32 experts, top-8 routing, shared width 1664, and 8192 local tokens. With
-recomputation and a 3% weight update, native/shared overlap preserves outputs
-and all parameter gradients bitwise; BF16 input-gradient relative L2 difference
-is about 8.5e-4 from accumulation ordering. MXFP4 and MXFP8 backend kernel-graph
-checks also passed, including weight refresh and multiple live graphs.
-
-An experimental token-half split produced identical outputs but approximately
-0.00339 relative L2 error in BF16 shared weight gradients, exceeding the
-existing 0.003 check. Retaining those gradients in FP32 reduced the discrepancy
-to approximately 5.9e-6. This prototype was archived rather than selected as
-the default; its threshold was not relaxed.
-
-## Backend submission experiments
-
-An experimental `NNSCALER_DEEPEP_PADDED_DISPATCH=1` path submitted DeepEP payloads
-without first waiting on the CPU for receive counts. It freezes a safe receive
-capacity using the sum of all ranks' initial input lengths, permits shorter
-inputs, and rejects growth. DeepEP marks padded rows with -1; exact expert
-counts are reconstructed after the shared graph has been submitted. Dynamic
-expert computation and routing are preserved, with no token truncation.
-
-The padded path passed actual EP2 MoE correctness and a direct transport test
-covering unequal rank lengths, shrinking inputs, partially invalid routes,
-all-invalid routes, and both forward/backward communication. Its full PP3/EP2
-mean step was 5.257910 s, 0.80% slower than the fixed baseline. The backend change
-was reverted from the delivered llm-train tree; the experiment remains in commit
-`a0a59b42` and local reports. This path still reads exact counts back after
-submission; it is not a fully static-shape MoE implementation.
-
-The approach is motivated by Kimi K3 section 5.2.1: static shapes remove
-per-layer host synchronization, and shared-expert GEMMs run on a separate
-stream. This implementation continues to use DeepEP and does not implement
-MoonEP's redundant-expert load balancing.
-
-The optional `recompute_ready_on` rule gates expert recomputation on the downstream
-backend's backward input readiness. In the previous trace, its first GEMM
-typically started about 4 ms before backward dispatch. The generic
-`recompute_ready_on` rule has passed the 77-case CUDA-enabled compiler/runtime
-suite, including a delayed-input test that proves recomputation starts after
-inputs are ready and before the pending gradient completes. Actual EP2 MoE
-with recomputation and updated weights also passes: output and parameter
-gradients are bitwise equal, with input-gradient relative L2 about 8.5e-4.
-In the full model, backward dispatch exposure fell to 8–23 ms per rank, but
-step time improved only 0.51%: delaying the recomputation also lost some useful
-prefetch overlap. It is supported but not enabled by the default launcher.
-The 128-SM DeepGEMM probe preserved outputs and parameter gradients bitwise,
-but its 1.05% step improvement was also below the selected treatment; its
-process-local backend patch was not integrated into NNScaler.
-
-## Resources and evidence
-
-In the unprofiled pair, maximum device usage rises from about 101 GiB to 126 GiB;
-summed process-tree RSS peaks at about 431 GiB in both runs. Nsight runs reached
-about 512 GiB RSS. Kernel-graph caches are bounded to four graphs and 512 MiB of
-logical input/output storage per device; graph scratch allocations are extra.
-Nsight plus kernel graphs caused failures in full-model attempts, so those
-traces were rejected. A specific cause has not been established.
-
-Local reports, launch specifications, input/state hashes, traces, generated
-source archives and guard logs are under
-`/home/yileiyang/agens/stream-overlap-20261117`. Completed correctness gencode
-weights are removed after source archival; the reusable full-model cache is
-retained during iteration. The guard enforces RAM/disk/time limits and cleans
-only owned orphan workers. All GPU validation processes have exited, and the
-GPU reservation was released at 18:44 on 2026-11-17 (Asia/Shanghai). About 16 GiB
-of completed correctness gencode was removed during this continuation; one
-30 GiB full-model cache remains for reproduction, with over 570 GiB disk free.
-
-Both repositories use branch `yileiyang/stream_overlap`. The llm-train launcher
-accepts only `baseline` and `overlap`; run it from `llm/` with the original
-training command. Point `NNSCALER_ROOT` at this NNScaler checkout, or install
-this branch, so the launch uses the new compiler/runtime. The machine-readable
-summary is `/home/yileiyang/agens/stream-overlap-20261117/final-report.json`.
-It explicitly records `full_communication_hiding_achieved: false`.
+Detailed logs, per-rank audits, traces, generated-source archives and experiment
+scripts are under `/home/yileiyang/agens/stream-overlap-dw-refine-20261118`.
+The production preset is `llm-train/scripts/run_stream_overlap_15b_pp3ep2.sh`.
+The remaining forward dispatch exposure and lack of reliable incremental dW gain
+are open optimization work; these measurements do not establish an upper limit.
