@@ -249,6 +249,31 @@ def test_codegen_fn_cpu_offload_zero3(tmp_path):
     )
 
 
+def recompute_ffn_policy(graph, cfg):
+    for plan in megatron_ffn_policy(graph, cfg):
+        plan.recompute_id = 0
+        yield plan
+
+
+@replace_all_device_with('cpu')
+def test_codegen_fn_recompute_with_workers(tmp_path):
+    """
+    Codegen workers unpickle the execution plan, and grouping a recompute region
+    (`IRSegment.create_segment`) reads the devices of adapter tensors, which come from their cells.
+    """
+    parallelize(
+        FnPolicyModule(),
+        {'x': torch.randn(2, 4)},
+        recompute_ffn_policy,
+        ComputeConfig(2, 2),
+        gen_savedir=tmp_path,
+        load_module=False,
+        max_workers=2,
+    )
+    for rank in range(2):
+        assert len(_gencode_contains(tmp_path, FnPolicyModule, rank, r'ckpt\.checkpoint\(')) == 1
+
+
 def _cpu_offload_runtime_worker(tempdir):
     init_distributed()
     model = FnPolicyModule()

@@ -98,11 +98,9 @@ def _profile_nodes(nodes: List[IRFwOperation], db: ProfileDataBase, partition_de
 
 
 def _profile_graph(dilled_info: str, dev_id: int, partition_degree: int, re_profile: bool, comp_profile_path: str, result: multiprocessing.Queue):
-    import dill
     torch.cuda.set_device(dev_id)
 
-    id_state, dilled_graph = dill.loads(dilled_info)
-    graph = IRGraph.from_dill(id_state, dilled_graph)
+    graph = IRGraph.loads(dilled_info)
     db = ProfileDataBase()
     db.load_ops(comp_profile_path)
     node_to_profile = _filter_nodes(graph, db)

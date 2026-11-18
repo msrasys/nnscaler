@@ -23,6 +23,8 @@ from functools import lru_cache
 from typing import ClassVar, Iterable, List, Set, Tuple, Type, Union, Optional, Any, Dict, Callable
 from collections import OrderedDict
 import copy
+import io
+import dill
 import torch
 
 from nnscaler.ir.unique import IDGenerator
@@ -1199,6 +1201,101 @@ class IR:
         Check if the value is an IRObject
         """
         return isinstance(val, IRObject) and (include_ir_tensor or not isinstance(val, IRTensor))
+
+    @staticmethod
+    def no_cell_pickle_context():
+        """
+        Drop `IRObject._cell` while pickling, recording each dropped (object, cell) pair in `dropped_cells`.
+        """
+        class PicklingContextNoCell:
+            _missing = object()
+
+            def __init__(self):
+                # (object, cell) pairs whose `_cell` was dropped, in pickling order
+                self.dropped_cells: List[Tuple[IRObject, IRCell]] = []
+                self._saved_getstate = self._missing
+
+            def __enter__(self):
+                dropped_cells = self.dropped_cells
+                def getstate(obj: IRObject):
+                    if obj._cell is not None:
+                        dropped_cells.append((obj, obj._cell))
+                    return IRObject.getstate_for_dump(obj)
+                # the class attribute only: `IRObject.__getstate__` falls back to `object.__getstate__`
+                self._saved_getstate = IRObject.__dict__.get('__getstate__', self._missing)
+                IRObject.__getstate__ = getstate
+                return self
+
+            def __exit__(self, exc_type, exc_value, traceback):
+                if self._saved_getstate is self._missing:
+                    del IRObject.__getstate__
+                else:
+                    IRObject.__getstate__ = self._saved_getstate
+        return PicklingContextNoCell()
+
+    @staticmethod
+    def dumps(obj: Any) -> bytes:
+        """
+        Pickle ``obj``, which contains IR objects, with dill, keeping every `IRObject.cell`.
+
+        Pickled directly, `_cell` would make dill recurse along object -> cell -> object chains
+        as long as the graph, so it is dropped while ``obj`` is pickled (`no_cell_pickle_context`).
+        The dropped (object, cell) pairs are pickled afterwards as flat lists by the same pickler,
+        whose memo makes them refer to the instances already pickled.
+        A pair can bring in a cell that ``obj`` does not reach otherwise (e.g. a `DummyInputOuput`
+        that gives the tensors of an adapter their device), and so further pairs:
+        pairs are pickled until none is left, then a `None` marks the end.
+        """
+        buffer = io.BytesIO()
+        with IR.no_cell_pickle_context() as context:
+            # the protocol `dill.dumps` would use
+            pickler = dill.Pickler(buffer, dill.settings['protocol'])
+            pickler.dump(obj)
+            dumped = 0
+            while dumped < len(context.dropped_cells):
+                pairs = context.dropped_cells[dumped:]
+                dumped = len(context.dropped_cells)
+                pickler.dump(pairs)
+            # mark the end of dropped cells with None
+            # so we can also have two unpickler.load() calls:
+            # one for the object, one for the dropped cells
+            # see `IR.loads`
+            pickler.dump(None)
+        return buffer.getvalue()
+
+    @staticmethod
+    def loads(data: bytes) -> Any:
+        """
+        Unpickle data written by `IR.dumps`, re-attaching every `IRObject.cell`.
+
+        Raises:
+            ValueError: if ``data`` carries no cells, i.e. it was not written by `IR.dumps`.
+        """
+        obj, cells_restored = IR._loads(data)
+        if not cells_restored:
+            raise ValueError("The data carries no IRObject cells: it was not written by `IR.dumps`.")
+        return obj
+
+    @staticmethod
+    def _loads(data: bytes) -> Tuple[Any, bool]:
+        """
+        `IR.loads` that also accepts data written by a plain `dill.dumps` under `no_cell_pickle_context`
+        (graph dumps of older versions), which carries no cells.
+
+        Returns:
+            Tuple[Any, bool]: the unpickled object, and whether its cells were restored.
+        """
+        unpickler = dill.Unpickler(io.BytesIO(data))
+        obj = unpickler.load()
+        try:
+            pairs = unpickler.load()
+        except EOFError:
+            return obj, False
+        while pairs is not None:
+            for ir_obj, cell in pairs:
+                ir_obj.cell = cell
+            pairs = unpickler.load()
+        return obj, True
 
     @classmethod
     def set_object_device(cls, val: Any, device: Union[int, List[int]]) -> Any:
