@@ -386,6 +386,15 @@ expert schedule in [Kimi K3, Figure 11 and Section 5.2.1](https://github.com/Moo
 Kimi's MoonEP additionally uses balanced static shapes; module scheduling alone
 does not remove DeepEP's receive-count host synchronization.
 
+For a separately gated shared expert, move the gate with the shared branch.
+In llm-train, put a `*.shared_gate` rule before the `*.shared` rule, use the same
+stream and first launch anchor, and enable backward overlap on both. If setting
+`backward_on`, give both rules that same boundary. This preserves the reference
+gradient merge order at their common input for this MoE topology. Moving only
+the FFN changes that order; rounding differences at a BF16 input can be amplified
+by upstream FP8 quantization even when forward outputs match. Verify the input
+and all parameter gradients when configuring a new branch topology.
+
 Performance must be measured with both unprofiled training wall time and GPU
 timelines. Sum interval unions per GPU instead of summing kernel durations across
 streams. Report the baseline dispatch/combine fraction, communication with no
