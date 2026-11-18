@@ -28,9 +28,6 @@ class _StorageOwner:
 
     def __init__(self, tensor):
         self.storage = tensor.untyped_storage()
-        self.device = tensor.device
-        self.start = self.storage.data_ptr()
-        self.end = self.start + self.storage.nbytes()
 
 
 def _storage_owner(value):
@@ -40,34 +37,6 @@ def _storage_owner(value):
         return _StorageOwner(value)
     except (NotImplementedError, RuntimeError):
         return None  # Wrapper tensors may not expose their storage.
-
-
-def hold_aliased_inputs_through_backward(inputs, gradients, stream):
-    """Keep returned input views through later gradient consumers.
-
-    Retain storage instead of the gradient tensor: an extra TensorImpl owner
-    would force AccumulateGrad to clone an otherwise stealable dense gradient.
-    Fresh gradients allocated by the callback on its own stream need no hold.
-    Unknown storage uses the conservative owner fallback.
-    """
-    known = [owner for owner in inputs if isinstance(owner, _StorageOwner)]
-    unknown = [owner for owner in inputs if not isinstance(owner, _StorageOwner)]
-    retained = []
-    for gradient in gradients:
-        if gradient is None:
-            continue
-        storage = _storage_owner(gradient)
-        if storage is None:
-            retained.extend((*inputs, gradient))
-        elif unknown:
-            retained.extend((*inputs, storage))
-        else:
-            aliases = [owner for owner in known if owner.device == storage.device
-                       and owner.start < storage.end and storage.start < owner.end]
-            if aliases:
-                retained.extend((*aliases, storage))
-    if retained:
-        hold_owners_through_backward(tuple({id(owner): owner for owner in retained}.values()), (stream,))
 
 
 def has_module_streams():

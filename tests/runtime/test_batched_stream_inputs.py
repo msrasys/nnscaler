@@ -86,22 +86,18 @@ def test_returned_gradient_views_keep_separate_record_stream_protection(runtime)
     module.drain_stream_holds(wait=True)
 
 
-def test_alias_holds_storage_without_keeping_gradient_tensor(runtime, monkeypatch):
+def test_alias_protection_does_not_keep_gradient_tensor(runtime):
     module, records, events = runtime
-    held = []
-    monkeypatch.setattr(module, 'hold_owners_through_backward',
-                        lambda owners, streams: held.extend(owners))
     tensor = torch.ones(8)
     with module.input_stream_lifetime((tensor,), True, retain_tensors=True) as owners:
         gradient = tensor.view_as(tensor)
         reference = weakref.ref(gradient)
-        module.hold_aliased_inputs_through_backward(owners, (gradient,), 'consumer')
-        assert held and all(isinstance(owner, module._StorageOwner) for owner in held)
+        identity = id(gradient)
+        with module.input_stream_lifetime((gradient,), True):
+            pass
         del gradient
         assert reference() is None
-        held.clear()
-        module.hold_aliased_inputs_through_backward(owners, (torch.ones(8),), 'consumer')
-        assert not held  # Fresh output storage can follow ordinary stream order.
+        assert records == [identity]
     module.drain_stream_holds(wait=True)
 
 

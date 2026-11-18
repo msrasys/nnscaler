@@ -15,7 +15,7 @@ import weakref
 import torch
 from torch.autograd.function import once_differentiable
 from .deferred import BackwardLaunchPoint, after_backward
-from .stream import (_get_module_stream, input_stream_lifetime, hold_aliased_inputs_through_backward,
+from .stream import (_get_module_stream, input_stream_lifetime, hold_owners_through_backward,
                      parameter_gradient_stream, parameter_uses_module_stream)
 
 _active = local()
@@ -228,10 +228,12 @@ class WeightBackwardRegion:
                         gradients = tuple(callback())
                         # A returned gradient can alias an input allocation
                         # (e.g. a reused workspace). Its consumers run after the
-                        # callback's completion event. Storage-only holds avoid
-                        # both an allocator stream tag and an extra grad clone.
+                        # callback's completion event. Record their consumers
+                        # without retaining every gradient until graph end.
                         if retain_inputs and self.stream is not None:
-                            hold_aliased_inputs_through_backward(owners, gradients, self.stream)
+                            with input_stream_lifetime(gradients, True) as gradient_owners:
+                                if gradient_owners:
+                                    hold_owners_through_backward(gradient_owners, (self.stream,))
                     if len(gradients) != len(indices):
                         raise RuntimeError('Deferred weight callback returned an incorrect gradient count')
                     task.results.extend((index, grad) for index, grad in zip(indices, gradients)

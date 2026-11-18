@@ -122,9 +122,11 @@ be allocated on the callback stream, or alias declared inputs. The default
 allocator-based protection remains available for other backends.
 
 The opt-in path retains input storage until the callback completion event.
-Storage aliased by returned gradients is kept through GPU completion of the
-GraphTask, including accumulation and reducer hooks. Holding storage rather than
-gradient tensor objects avoids forcing extra AccumulateGrad copies. Forward and
+Returned gradients keep allocator stream protection through accumulation and
+reducer hooks, including gradients that reuse an input's storage. Holding
+gradient storage until the entire GraphTask completes would delay reuse and
+increase memory. Input snapshots retain storage rather than tensor objects, so
+they do not pin autograd graphs or force extra AccumulateGrad copies. Forward and
 checkpoint inputs retain their original protection.
 Completed owners are reclaimed in stream order, before a new module forward and
 at scheduled drains. Direct runtime users can call
