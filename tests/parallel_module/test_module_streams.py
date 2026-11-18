@@ -627,7 +627,7 @@ class CPUDeferredStreams(SerialStreams):
         return self.native_results[key][index]
 
     @contextmanager
-    def launch_point(self, keys, *, native=False, backward_keys=()):
+    def launch_point(self, keys, *, native=False, backward_keys=(), callbacks=()):
         from nnscaler.runtime.deferred import LaunchPoint, NativeLaunchPoint
         if native:
             def launch(key):
@@ -635,10 +635,10 @@ class CPUDeferredStreams(SerialStreams):
                 inputs = inputs() if callable(inputs) else inputs
                 self.native_results[key] = function(parent, *inputs)
             dependencies = lambda: tuple(value for key in backward_keys for value in self.native_results[key])
-            point = NativeLaunchPoint(tuple(lambda key=key: launch(key) for key in keys),
+            point = NativeLaunchPoint(tuple(lambda key=key: launch(key) for key in keys) + tuple(callbacks),
                                       lambda ready: None, dependencies)
         else:
-            point = LaunchPoint(tuple(self.states[key].launch for key in keys))
+            point = LaunchPoint(tuple(self.states[key].launch for key in keys) + tuple(callbacks))
         with point:
             yield
 

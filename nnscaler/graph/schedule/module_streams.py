@@ -40,13 +40,27 @@ class ModuleStreamRule:
     launch_phase: str = 'submitted'
     kernel_graphs: bool = False
     recompute_ready_on: str | None = None
+    recompute_prefetch_on: str | None = None
+    recompute_prefetch_phase: str = 'forward'
+    recompute_prefetch_bytes: int = 1024 ** 3
     weight_backward_on: str | None = None
     backward_on: str | None = None
     # Persist the generated-code ABI, including in pickled configurations.
     # A default factory leaves old pickles detectably missing the field.
-    _codegen_version: int = field(default_factory=lambda: 15, init=False, repr=False)
+    _codegen_version: int = field(default_factory=lambda: 16, init=False, repr=False)
 
     def __post_init__(self):
+        if self.recompute_prefetch_on is not None:
+            if not self.recompute_only or self.recompute_ready_on:
+                raise ValueError('Recompute prefetch requires a recompute-only rule without a separate readiness anchor')
+            if not isinstance(self.recompute_prefetch_on, str) or not self.recompute_prefetch_on:
+                raise ValueError('recompute_prefetch_on must be a nonempty signature pattern')
+        elif self.recompute_prefetch_phase != 'forward' or self.recompute_prefetch_bytes != 1024 ** 3:
+            raise ValueError('Prefetch phase/budget require recompute_prefetch_on')
+        if self.recompute_prefetch_phase not in ('forward', 'backward'):
+            raise ValueError('Prefetch phase must be forward or backward')
+        if type(self.recompute_prefetch_bytes) is not int or self.recompute_prefetch_bytes <= 0:
+            raise ValueError('Prefetch budget must be a positive number of bytes')
         if self.weight_backward_on is not None:
             if not isinstance(self.weight_backward_on, str) or not self.weight_backward_on:
                 raise ValueError('weight_backward_on must be a nonempty signature pattern')

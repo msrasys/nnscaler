@@ -316,6 +316,44 @@ the dictionary is created from a literal inside the region, and follows direct
 updates of that same object. External dictionary mutations, nested aliases and
 tensor writes remain rejected. This does not relax forward branch reordering.
 
+To move existing recomputation to an earlier communication window, use
+`recompute_prefetch_on` with `recompute_prefetch_phase='forward'` or `'backward'`:
+
+```python
+ModuleStreamRule(
+    '*.self_attn', stream='attention_recompute', recompute_only=True,
+    recompute_prefetch_on='*.nnscaler_moe_dispatch',
+    recompute_prefetch_phase='forward', recompute_prefetch_bytes=4 * 1024**3,
+)
+```
+
+The compiler selects one later, dependent asynchronous operation in the same
+enclosing module invocation. Forward prefetch uses the backend's input-ready
+launch point; backward prefetch uses its captured backward submission point.
+The checkpoint replays on the named stream and retains its saved tensors for
+the original backward to consume. A successful prefetch replaces that
+backward's lazy replay, so it does not add another recomputation. In particular,
+this can supply independent computation during forward communication even when
+the shared branch is too short. It does not change the checkpoint's outputs.
+
+The byte limit is a shared per-device budget for saved activation storage,
+excluding existing input and parameter storage. All prefetch rules must use the
+same limit. A region that cannot reserve its estimated storage falls back to
+ordinary lazy recomputation. Temporary replay workspace is additional. Forward
+prefetch extends activation residency until backward; increasing the budget can
+therefore increase peak memory. Replay work is joined before leaving its pipeline
+segment, and never borrowed from another microbatch. The first backward consumer
+waits for replay completion, with allocator tracking on consuming streams.
+
+Prefetch requires a complete, contiguous, pure checkpoint and PyTorch's installed
+non-reentrant checkpoint hook contract. It preserves saved RNG/autocast state and
+supports repeated first-order backward calls. Nested checkpoints, concurrent
+backward of the same forward, higher-order differentiation, GraphExecGroup and
+CUDA graph capture are unsupported. It cannot be combined with
+`recompute_ready_on` or forward movement of the checkpoint/anchor. Its benefit
+depends on available communication time, memory budget and resource contention;
+measure full training steps with and without the rule.
+
 The compiler checks tensor and object dependencies before moving computation.
 Local layout adapters inserted inside the selected branch move with it, even
 though those synthesized nodes do not carry the original module path.

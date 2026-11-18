@@ -35,6 +35,7 @@ from nnscaler.codegen.module.autograd import AutogradAdapterCodeGen
 from nnscaler.codegen.lifecycle import LifeCycle
 from nnscaler.graph.schedule.module_streams import plan_module_streams, checkpoint_stream
 from nnscaler.graph.schedule.checkpoint_readiness import plan_checkpoint_readiness
+from nnscaler.graph.schedule.checkpoint_prefetch import plan_checkpoint_prefetch
 from nnscaler.graph.schedule.weight_backward import plan_weight_backward
 
 from nnscaler.flags import CompileFlag
@@ -147,6 +148,7 @@ class ModuleCodeGen(FuncEmission):
             'import nnscaler.runtime.stream',
             'import nnscaler.runtime.deferred',
             'import nnscaler.runtime.checkpoint_stream',
+            'import nnscaler.runtime.checkpoint_prefetch',
             'import _operator', 'from numpy import inf', 'import builtins', '',
             f'runtime_version = {runtime_version!r}', '', ''
         ]
@@ -1094,10 +1096,12 @@ class ModuleCodeGen(FuncEmission):
 
     def _emit_module_streams(self, segment, runtime_devid):
         previous = getattr(self, '_weight_regions_by_node', {})
+        previous_prefetch = getattr(self, '_checkpoint_prefetch_names', {})
         try:
             return self._emit_module_streams_impl(segment, runtime_devid)
         finally:
             self._weight_regions_by_node = previous
+            self._checkpoint_prefetch_names = previous_prefetch
 
     def _emit_module_streams_impl(self, segment, runtime_devid):
         nodes, regions, joins = plan_module_streams(
@@ -1111,6 +1115,15 @@ class ModuleCodeGen(FuncEmission):
                 raise ValueError('Weight backward rules cannot also move their module/anchor forward')
             weight_anchors.setdefault(plan.anchor, []).append(plan.key)
         checkpoint_anchors = plan_checkpoint_readiness(nodes, segment.oobjs(), CompileFlag.module_streams)
+        prefetch_plans = plan_checkpoint_prefetch(nodes, CompileFlag.module_streams)
+        self._checkpoint_prefetch_names = {plan.gid: plan.key for plan in prefetch_plans}
+        prefetch_forward, prefetch_backward = {}, {}
+        for plan in prefetch_plans:
+            if any(plan.anchor in region.nodes or any(node.recompute == plan.gid for node in region.nodes)
+                   for region in regions.values()):
+                raise ValueError('Checkpoint prefetch cannot also move its checkpoint or anchor forward')
+            target = prefetch_forward if plan.rule.recompute_prefetch_phase == 'forward' else prefetch_backward
+            target.setdefault(plan.anchor, []).append(plan.key)
         readiness_names = {gid: f'_checkpoint_ready_{index}' for index, gid in enumerate(checkpoint_anchors)}
         ready_at = {}
         for gid, anchor in checkpoint_anchors.items():
@@ -1137,7 +1150,7 @@ class ModuleCodeGen(FuncEmission):
                         'float', 'half', 'bfloat16', 'identity', 'transpose', 'permute', 't')):
                 for output in node.oobjs():
                     self.module_parameter_origins[output] = origins
-        if not regions and not checkpoint_anchors and not weight_plans:
+        if not regions and not checkpoint_anchors and not weight_plans and not prefetch_plans:
             return self._emit_segment_nodes(segment, nodes, runtime_devid)
         # Schedule emission shares this execution plan. Its executor calls must
         # retain opaque inputs through backward when intra-segment streams exist.
@@ -1176,6 +1189,9 @@ class ModuleCodeGen(FuncEmission):
 
         body = [f'{name} = nnscaler.runtime.deferred.BackwardLaunchPoint(())'
                 for name in readiness_names.values()]
+        body.extend(f'{plan.key} = _module_streams.checkpoint_prefetch('
+                    f'{plan.rule.stream!r}, {plan.rule.recompute_prefetch_bytes})'
+                    for plan in prefetch_plans)
         pending = []
         unused = lifetime.release_tensors_after_line(-1)
         if unused:
@@ -1191,8 +1207,13 @@ class ModuleCodeGen(FuncEmission):
                 pending.clear()
 
         def readiness_scope(node):
-            return (''.join(f', {name}' for name in ready_at.get(node, ()))
-                    + ''.join(f', {name}.anchor()' for name in weight_anchors.get(node, ())))
+            scope = (''.join(f', {name}' for name in ready_at.get(node, ()))
+                     + ''.join(f', {name}.anchor()' for name in weight_anchors.get(node, ()))
+                     + ''.join(f', {name}' for name in prefetch_backward.get(node, ())))
+            if node in prefetch_forward and node not in launch_points:
+                points = '(' + ', '.join(prefetch_forward[node]) + ',)'
+                scope += f', _module_streams.prefetch_launch_point({points})'
+            return scope
 
         def resolve(key):
             region = unresolved.pop(key)
@@ -1276,6 +1297,9 @@ class ModuleCodeGen(FuncEmission):
                                 f'{tuple(r.key for r in anchored)!r})')
                 options = (f', native=True, backward_keys={tuple(r.key for r in anchored if r.overlap_backward)!r}'
                            if native else '')
+                if node in prefetch_forward:
+                    callbacks = '(' + ', '.join(f'{name}.prefetch' for name in prefetch_forward[node]) + ',)'
+                    options += f', callbacks={callbacks}'
                 with Block(f'with _module_streams.launch_point({tuple(r.key for r in anchored)!r}{options}){readiness_scope(node)}:') as block:
                     block.insert_body(self._emit_segment_nodes(
                         segment, [node], runtime_devid, lifetime, release_unused=False))
@@ -1369,7 +1393,7 @@ class ModuleCodeGen(FuncEmission):
                                     f'{names(dependencies)}, _{region.key}_backward_boundaries)')
                         body.append(f'del _{region.key}_backward_boundaries')
                         body.append(f'_{region.key}_backward_outputs = {names(dependencies)}')
-            elif node in ready_at or node in weight_anchors:
+            elif node in ready_at or node in weight_anchors or node in prefetch_forward or node in prefetch_backward:
                 flush()
                 with Block(f'with {readiness_scope(node)[2:]}:') as block:
                     block.insert_body(self._emit_segment_nodes(
@@ -1661,9 +1685,13 @@ class ModuleCodeGen(FuncEmission):
             self.execplan.use_multi_streams = True
             dependencies = list(dict.fromkeys([*inputs, *[obj for node in nodes for obj in node.iobjs() if obj.is_attr()]]))
             dependencies = self.tuple_name(dependencies, prefix_attr='self.')
-            context = (f', context_fn=lambda: nnscaler.runtime.checkpoint_stream.contexts('
-                       f'{stream!r}, {dependencies}'
-                       f'{", backward_ready=" + backward_ready if backward_ready else ""})')
+            prefetch = getattr(self, '_checkpoint_prefetch_names', {}).get(nodes[0].recompute)
+            if prefetch is not None:
+                context = f', context_fn=lambda: {prefetch}.contexts({dependencies})'
+            else:
+                context = (f', context_fn=lambda: nnscaler.runtime.checkpoint_stream.contexts('
+                           f'{stream!r}, {dependencies}'
+                           f'{", backward_ready=" + backward_ready if backward_ready else ""})')
         codes.append(f'{output_names_tuple} = ckpt.checkpoint(recompute, {input_names_tuple}, '
                      f'use_reentrant=False{context})')
 

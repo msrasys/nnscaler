@@ -146,6 +146,7 @@ class ModuleStreams:
         self.region_streams = {}
         self.backward_points = {}
         self.weight_regions = {}
+        self.prefetch_points = []
         self.streams = {self.caller}
         return self
 
@@ -154,6 +155,19 @@ class ModuleStreams:
         region = WeightBackwardRegion(name, parameters)
         self.weight_regions[key] = region
         return region
+
+    def checkpoint_prefetch(self, name, budget_bytes):
+        from .checkpoint_prefetch import Prefetch
+        point = Prefetch(name, budget_bytes)
+        self.prefetch_points.append(point)
+        return point
+
+    @contextmanager
+    def prefetch_launch_point(self, points):
+        from .deferred import NativeLaunchPoint
+        with NativeLaunchPoint(tuple(point.prefetch for point in points),
+                               lambda ready: None, lambda: ()):
+            yield
 
     def prepare(self, key, name, function, parent, inputs, attributes, output_specs):
         """Prepare tensor/autograd edges; enqueue their work at an async anchor."""
@@ -188,8 +202,9 @@ class ModuleStreams:
         return self.backward_points.get(tuple(keys), nullcontext())
 
     @contextmanager
-    def launch_point(self, keys, *, native=False, backward_keys=()):
+    def launch_point(self, keys, *, native=False, backward_keys=(), callbacks=()):
         from .deferred import LaunchPoint, NativeLaunchPoint, BackwardLaunchPoint
+        extra_callbacks = tuple(callbacks)
 
         if native:
             def launch_native(key):
@@ -210,7 +225,7 @@ class ModuleStreams:
 
             point = (BackwardLaunchPoint(self.region_streams[key] for key in backward_keys)
                      if backward_keys else None)
-            callbacks = tuple(lambda key=key: launch_native(key) for key in keys)
+            callbacks = tuple(lambda key=key: launch_native(key) for key in keys) + extra_callbacks
             with point or nullcontext(), NativeLaunchPoint(callbacks, ready, dependencies, point):
                 yield
             return
@@ -220,7 +235,7 @@ class ModuleStreams:
             with self.fork(key, name, inputs):
                 state.launch()
 
-        with self.backward_point(keys), LaunchPoint(tuple(lambda key=key: launch(key) for key in keys)):
+        with self.backward_point(keys), LaunchPoint(tuple(lambda key=key: launch(key) for key in keys) + extra_callbacks):
             yield
 
     def schedule_native(self, key, name, function, parent, inputs, attributes, *, kernel_graphs=False):
@@ -367,6 +382,12 @@ class ModuleStreams:
         # CUDA completion uses events, never a device/stream synchronize.
         for key in self.events:
             self.join(key)
+        # A forward prefetch stays within this invocation's GPU work. Its
+        # cached activations can outlive forward, but its compute cannot spill
+        # into the next microbatch's forward after this caller-stream join.
+        for point in self.prefetch_points:
+            point.finish_forward()
+        self.prefetch_points.clear()
         unlaunched = (*self.deferred, *self.native)
         for _, state, _ in self.deferred.values():
             state.clear()
