@@ -89,7 +89,8 @@ def test_prefetch_runs_during_communication_and_keeps_gradients(when):
     torch.testing.assert_close(w.grad, rw.grad, rtol=0, atol=0)
 
 
-def test_abandoned_forward_prefetch_reclaims_budget_after_cuda_completion():
+@pytest.mark.parametrize('keep_point', [False, True])
+def test_abandoned_forward_prefetch_reclaims_budget_after_cuda_completion(keep_point):
     x = torch.ones(1024, device='cuda', requires_grad=True)
     budget = Budget(16 << 20)
     point = Prefetch('abandoned_prefetch', budget)
@@ -100,7 +101,9 @@ def test_abandoned_forward_prefetch_reclaims_budget_after_cuda_completion():
                    context_fn=lambda: point.contexts((x,)))
     assert point.prefetch()
     point.finish_forward()
-    del y, point
+    del y
+    if not keep_point:
+        del point
     gc.collect()
     budget.poll(wait=True)
     drain_stream_holds(wait=True)

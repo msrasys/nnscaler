@@ -112,6 +112,38 @@ def test_input_version_failure_releases_reservation():
     assert point.budget.used == 0
 
 
+@pytest.mark.parametrize('when', ['forward', 'backward'])
+def test_input_mutation_after_prefetch_still_rejects_stale_values(when):
+    point = Prefetch('test', Budget(1024))
+    x = torch.randn(4, requires_grad=True)
+    y = checkpoint(lambda v: v.sin().square(), x, use_reentrant=False,
+                   context_fn=lambda: point.contexts((x,)))
+    class MutatingAnchor(torch.autograd.Function):
+        @staticmethod
+        def forward(ctx, value):
+            ctx.point = nnscaler.capture_async_backward()
+            return value.clone()
+
+        @staticmethod
+        def backward(ctx, grad):
+            ctx.point.record_ready()
+            ctx.point.submitted()
+            with torch.no_grad():
+                x.add_(1)
+            return grad
+
+    if when == 'forward':
+        assert point.prefetch()
+        with torch.no_grad():
+            x.add_(1)
+    else:
+        with point:
+            y = MutatingAnchor.apply(y)
+    with pytest.raises(RuntimeError, match='modified by an inplace operation'):
+        y.sum().backward()
+    assert point.budget.used == 0 and not point.gids
+
+
 def test_changed_storage_capacity_cannot_bypass_budget():
     point = Prefetch('test', Budget(1024))
     x = torch.randn(4, requires_grad=True)
@@ -199,6 +231,17 @@ def test_discarded_forward_does_not_depend_on_cyclic_gc_for_budget_release():
     assert point.prefetch() and budget.used
     del y, point
     assert budget.used == 0
+
+
+def test_abandoned_frame_releases_budget_while_launch_point_stays_alive():
+    point = Prefetch('discarded', Budget(1024))
+    x = torch.randn(4, requires_grad=True)
+    y = checkpoint(lambda v: v.sin().square(), x, use_reentrant=False,
+                   context_fn=lambda: point.contexts((x,)))
+    assert point.prefetch() and point.budget.used
+    del y
+    assert point.frame_ref() is None
+    assert point.budget.used == 0
 
 
 def test_missing_backend_capture_is_rejected():

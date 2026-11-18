@@ -87,9 +87,13 @@ class Budget:
 class Lease:
     def __init__(self, budget, size):
         self.budget, self.size, self.event = budget, size, None
+        self.finalizer = None
 
     def release(self, event=None):
         with self.budget.lock:
+            if self.finalizer is not None:
+                self.finalizer.detach()
+                self.finalizer = None
             if not self.size:
                 return
             event = event or self.event
@@ -114,6 +118,8 @@ class Prefetch(BackwardLaunchPoint):
         self.forward_done = self.done = self.lease = None
         self.replaying = False
         self.gids = set()
+        self.validated_gids = set()
+        self.active_leases = {}
         self.joined = set()
         self.opaque = []
         self.stats = dict(launched=0, budget_skips=0, reused=0)
@@ -201,6 +207,25 @@ class Prefetch(BackwardLaunchPoint):
                 raise RuntimeError('Checkpoint prefetch supports first-order gradients only')
             if self.gids and gid not in self.gids:
                 raise RuntimeError('Concurrent backward of one prefetched checkpoint is unsupported')
+            if (self.prefetched or gid in self.gids) and gid not in self.validated_gids:
+                try:
+                    # Ordinary checkpoint replay checks these versions at its
+                    # first backward unpack. Prefetch ran earlier, so retain
+                    # that check when its cache is actually consumed.
+                    frame.input_saver.grad_fn.saved_tensors
+                except BaseException:
+                    key = self.token if self.prefetched else gid
+                    self.clear(frame, key)
+                    if self.prefetched:
+                        lease, self.lease = self.lease, None
+                        self.prefetched = False
+                    else:
+                        lease = self.active_leases.pop(gid, None)
+                        self.gids.discard(gid)
+                    if lease is not None:
+                        lease.release(self.done)
+                    raise
+                self.validated_gids.add(gid)
             if self.prefetched:
                 self.adopt(gid)
             if gid in self.gids:
@@ -291,6 +316,10 @@ class Prefetch(BackwardLaunchPoint):
         if lease is None:
             self.stats['budget_skips'] += 1
             return False
+        # The cache belongs to the checkpoint frame, even when a caller keeps
+        # the launch point itself for inspection after abandoning the graph.
+        lease.finalizer = weakref.finalize(frame, lease.release)
+        lease.finalizer.atexit = False
         self.lease = lease
         self.replaying = True
         self.done = None
@@ -363,12 +392,21 @@ class Prefetch(BackwardLaunchPoint):
         self.stats['reused'] += 1
         lease = self.lease
         self.lease = None
+        # Once backward adopts the cache, GPU consumers can outlive the
+        # checkpoint frame. Only GraphTask completion may release this lease.
+        if lease.finalizer is not None:
+            lease.finalizer.detach()
+            lease.finalizer = None
+        self.active_leases[gid] = lease
         if self.cuda:
             hold_owners_through_backward(self.opaque, (torch.cuda.current_stream(self.device),
                                                        _get_module_stream(self.device, self.name)))
         self.opaque.clear()
 
         def cleanup():
+            lease = self.active_leases.pop(gid, None)
+            if lease is None:
+                return
             frame = self.frame_ref()
             if frame is not None:
                 self.clear(frame, gid)
@@ -380,6 +418,7 @@ class Prefetch(BackwardLaunchPoint):
                 event.record(caller)
             lease.release(event)
             self.gids.discard(gid)
+            self.validated_gids.discard(gid)
             self.joined = {key for key in self.joined if key[0] != gid}
 
         torch.autograd.Variable._execution_engine.queue_callback(cleanup)
