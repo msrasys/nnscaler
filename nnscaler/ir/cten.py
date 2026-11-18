@@ -35,8 +35,11 @@ from nnscaler.utils import _DICT_ITEMS_TYPE, _DICT_VALUES_TYPE, load_type, get_d
 
 NestedVarOrStatic = Union[Any, 'IRObject', List['IRObject'], 'IRTensor']
 
-# Held for the whole `IR.no_cell_pickle_context`, which patches the class-wide `IRObject.__getstate__`:
-# contexts in different threads would record each other's objects and could restore in the wrong order.
+# Held for the whole `IR.no_cell_pickle_context`, which patches the class-wide `IRObject.__getstate__`,
+# so that contexts entered from several threads restore the patch in order instead of leaving it installed.
+# This is only a safeguard: the project does not support reading or writing graph-related objects
+# from several threads, and a pickle or deepcopy of an IR object on another thread during a dump
+# still drops its `_cell`.
 # Reentrant so a context can nest in the same thread, where patches are restored in stack order.
 _NO_CELL_PICKLE_LOCK = threading.RLock()
 

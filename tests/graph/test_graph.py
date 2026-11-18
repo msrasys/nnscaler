@@ -100,26 +100,23 @@ def test_graph_dump_keeps_cells(tmp_path):
 
 def test_dumps_from_threads_keep_their_cells():
     """`IR.dumps` patches a class-wide `__getstate__`: dumps from several threads must not mix up their cells."""
-    import threading
+    from concurrent.futures import ThreadPoolExecutor
     from nnscaler.ir.cten import IR, IRObject
 
-    failures = []
+    def make_nodes(device):
+        nodes = []
+        for _ in range(10):
+            node = IRFwOperation('test', 'test', inputs=[IRFullTensor([2]).tosub()], num_outputs=0)
+            node.device = device
+            nodes.append(node)
+        return nodes
 
     def dump_and_load(device):
         for _ in range(50):
-            nodes = []
-            for _ in range(10):
-                node = IRFwOperation('test', 'test', inputs=[IRFullTensor([2]).tosub()], num_outputs=0)
-                node.device = device
-                nodes.append(node)
-            for node in IR.loads(IR.dumps(nodes)):
-                if node.input(0).cell is not node or node.input(0).device != (device,):
-                    failures.append(device)
+            for node in IR.loads(IR.dumps(make_nodes(device))):
+                assert node.input(0).cell is node and node.input(0).device == (device,)
 
-    threads = [threading.Thread(target=dump_and_load, args=(device,)) for device in range(4)]
-    for thread in threads:
-        thread.start()
-    for thread in threads:
-        thread.join()
-    assert not failures
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        for future in [executor.submit(dump_and_load, device) for device in range(4)]:
+            future.result()                                # re-raises a worker's assertion or error
     assert '__getstate__' not in IRObject.__dict__
