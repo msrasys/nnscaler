@@ -169,6 +169,8 @@ class ModuleStreams:
         self.deferred = {}
         self.native = {}
         self.native_results = {}
+        self.prequeued = {}
+        self.gates = []
         self.region_streams = {}
         self.backward_points = {}
         self.weight_regions = {}
@@ -245,13 +247,19 @@ class ModuleStreams:
         return self.backward_points.get(tuple(keys), nullcontext())
 
     @contextmanager
-    def launch_point(self, keys, *, native=False, backward_keys=(), callbacks=()):
-        from .deferred import LaunchPoint, NativeLaunchPoint, BackwardLaunchPoint
+    def launch_point(self, keys, *, native=False, backward_keys=(), callbacks=(), prequeued=False):
+        from .deferred import LaunchPoint, NativeLaunchPoint, PrequeuedLaunchPoint, BackwardLaunchPoint
         extra_callbacks = tuple(callbacks)
 
         if native:
             def launch_native(key):
                 name, function, parent, inputs, attributes, kernel_graphs = self.native.pop(key)
+                gate = self.prequeued.pop(key, None)
+                if gate is not None:
+                    if self.ready.get(key) is not None:
+                        self.caller.wait_event(self.ready[key])
+                    gate.open(self.caller)
+                    return
                 inputs = inputs() if callable(inputs) else inputs
                 tracked = (*inputs, *attributes)
                 with self.fork(key, name, tracked, preserve_accumulators=bool(backward_keys),
@@ -269,7 +277,8 @@ class ModuleStreams:
             point = (BackwardLaunchPoint(self.region_streams[key] for key in backward_keys)
                      if backward_keys else None)
             callbacks = tuple(lambda key=key: launch_native(key) for key in keys) + extra_callbacks
-            with point or nullcontext(), NativeLaunchPoint(callbacks, ready, dependencies, point):
+            launch_type = PrequeuedLaunchPoint if prequeued else NativeLaunchPoint
+            with point or nullcontext(), launch_type(callbacks, ready, dependencies, point):
                 yield
             return
 
@@ -281,11 +290,28 @@ class ModuleStreams:
         with self.backward_point(keys), LaunchPoint(tuple(lambda key=key: launch(key) for key in keys) + extra_callbacks):
             yield
 
-    def schedule_native(self, key, name, function, parent, inputs, attributes, *, kernel_graphs=False):
+    def schedule_native(self, key, name, function, parent, inputs, attributes, *, kernel_graphs=False, prequeue=False, preserve_accumulators=False):
         if key in self.native or key in self.events or key in self.deferred:
             raise ValueError(f'Duplicate module stream region: {key}')
         self.native[key] = (name, function, parent, inputs, tuple(attributes.values()), kernel_graphs)
         self.region_streams[key] = _get_module_stream(self.caller.device, name)
+        if prequeue:
+            from .cuda_gate import Gate
+            if torch.cuda.is_current_stream_capturing():
+                raise RuntimeError('Prequeued modules require eager CUDA execution')
+            gate = Gate(self.caller.device)
+            self.gates.append(gate)
+            self.prequeued[key] = gate
+            values = inputs() if callable(inputs) else inputs
+            try:
+                with self.fork(key, name, (*values, *attributes.values()),
+                               preserve_accumulators=preserve_accumulators,
+                               kernel_graphs=kernel_graphs):
+                    gate.wait(torch.cuda.current_stream(self.caller.device))
+                    self.native_results[key] = function(parent, *values)
+            except BaseException:
+                gate.open()
+                raise
 
     def native_result(self, key):
         return self.native_results.pop(key)
@@ -422,6 +448,11 @@ class ModuleStreams:
                 self.resolve(key)
             except BaseException as failure:
                 error = error or failure
+        # A backend failure must never leave a prequeued graph blocked behind
+        # an unopened gate. Open from the host before installing result joins.
+        for gate in self.gates:
+            if not gate.queued:
+                gate.open()
         # CUDA completion uses events, never a device/stream synchronize.
         for key in self.events:
             self.join(key)
@@ -437,6 +468,10 @@ class ModuleStreams:
         self.deferred.clear()
         self.native.clear()
         self.native_results.clear()
+        self.prequeued.clear()
+        for gate in self.gates:
+            gate.finish()
+        self.gates.clear()
         with input_stream_lifetime(self.owners, True):
             pass
         self.owners.clear()

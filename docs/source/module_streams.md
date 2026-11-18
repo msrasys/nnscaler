@@ -142,6 +142,24 @@ result wait afterwards, including when a callback fails. This keeps Python side
 graph construction from delaying communication submission. DeepEP uses this
 two-phase form; its communication algorithm and backward remain the same.
 
+`launch_phase='prequeued'` builds the ordinary side graph before entering the
+anchor and queues its CUDA work behind a host-releasable gate. The backend must
+call `prepare_async_input` to bind backward dependencies, then
+`notify_async_launch()` after submitting communication and before waiting for
+its result. Preparing the input does not release the gate. This separates host
+graph construction from the communication window while retaining real tensor
+outputs and ordinary autograd edges. The input-ready event still governs data
+dependencies, and scope exit joins all side work within the same microbatch.
+
+Use `launch_on` (and `resume_on` for a split region). Dependent regions at the
+same anchor must use the same stream and are built in dependency order. A
+single anchor cannot mix `submitted`, `input_ready`, and `prequeued` regions.
+Prequeued execution requires eager CUDA and the gate helper described below;
+`kernel_graphs` is supported only with `input_ready`. On exceptions, scope
+cleanup opens pending gates before joining their streams. Gate watchdog fallback
+preserves progress but can lose the intended overlap, so measure end-to-end
+performance as well as correctness before choosing this phase.
+
 `kernel_graphs=True` additionally enables cooperative backend kernel-graph
 helpers inside an `input_ready` region. A backend calls
 `nnscaler.run_module_kernel_graph(function, tensor_inputs, **immutable_kwargs)`
@@ -489,7 +507,7 @@ forward invocation, CUDA graph capture, and data-dependent prefix allocation
 are unsupported. The selected group must have explicit read-only attributes;
 stateful module access and a cut inside an operator context manager are rejected.
 Whole-replay and staged-replay rules cannot share one anchor, nor can a staged
-rule use the same anchor as a native `input_ready` module callback. Submitted
+rule use the same anchor as an `input_ready` or `prequeued` module callback. Submitted
 module callbacks can share the anchor.
 
 CUDA pre-enqueue uses driver stream memory operations and a native host

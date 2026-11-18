@@ -1276,7 +1276,10 @@ class ModuleCodeGen(FuncEmission):
                 anchored = launch_points[node]
                 native = any(region.native for region in anchored)
                 if native and not all(region.native for region in anchored):
-                    raise ValueError('One anchor cannot mix submitted and input_ready launch phases')
+                    raise ValueError('One anchor cannot mix submitted and native launch phases')
+                prequeued = any(region.prequeued for region in anchored)
+                if prequeued and not all(region.prequeued for region in anchored):
+                    raise ValueError('One anchor cannot mix input_ready and prequeued launch phases')
                 native_outputs = {obj: (region.key, index) for region in anchored
                                   for index, obj in enumerate(region.outputs)} if native else {}
                 for region in anchored:
@@ -1300,7 +1303,8 @@ class ModuleCodeGen(FuncEmission):
                         arguments = '(' + ', '.join(arguments) + (',' if arguments else '') + ')'
                         body.append(f'_module_streams.schedule_native('
                                     f'{region.key!r}, {region.stream!r}, {function}, self, '
-                                    f'lambda: {arguments}, {attr_map}, kernel_graphs={region.kernel_graphs!r})')
+                                    f'lambda: {arguments}, {attr_map}, kernel_graphs={region.kernel_graphs!r}'
+                                    f'{", prequeue=True, preserve_accumulators=" + repr(region.overlap_backward) if region.prequeued else ""})')
                     else:
                         body.append(f'{names(region.outputs)} = _module_streams.prepare('
                                     f'{region.key!r}, {region.stream!r}, {function}, self, '
@@ -1317,6 +1321,8 @@ class ModuleCodeGen(FuncEmission):
                                 f'{tuple(r.key for r in anchored)!r})')
                 options = (f', native=True, backward_keys={tuple(r.key for r in anchored if r.overlap_backward)!r}'
                            if native else '')
+                if prequeued:
+                    options += ', prequeued=True'
                 if node in prefetch_forward:
                     callbacks = '(' + ', '.join(f'{name}.prefetch' for name in prefetch_forward[node]) + ',)'
                     options += f', callbacks={callbacks}'

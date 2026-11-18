@@ -226,6 +226,31 @@ class NativeLaunchPoint(LaunchPoint):
         return False
 
 
+
+class PrequeuedLaunchPoint(NativeLaunchPoint):
+    """Bind an already-built side graph, releasing it after backend submission."""
+
+    def __init__(self, callbacks, ready_callback, dependencies, backward_point=None):
+        super().__init__(callbacks, ready_callback, dependencies, backward_point)
+        self.prepared = False
+
+    def prepare_input(self, value):
+        if self.prepared or self.notified:
+            raise RuntimeError('A prequeued launch point must prepare exactly one backend input')
+        self.prepared = True
+        ready = None
+        if value.device.type == 'cuda':
+            ready = torch.cuda.Event()
+            ready.record()
+        self.ready_callback(ready)
+        return after_backward(value, self.dependencies(), self.backward_point)
+
+    def notify(self):
+        if not self.prepared:
+            raise RuntimeError('The async backend must prepare its input before releasing prequeued work')
+        return LaunchPoint.notify(self)
+
+
 def prepare_async_input(value):
     """Backend hook after input preparation, immediately before Function.apply.
 

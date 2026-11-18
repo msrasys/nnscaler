@@ -190,3 +190,21 @@ The integrated runtime additionally keys cache bounds only on prefix inputs.
 Full-model performance of that refinement remains to be measured. The result
 above does not establish complete communication hiding; optimization and
 full-model profiling are ongoing.
+
+### Prequeued module execution (2026-11-18)
+
+`launch_phase='prequeued'` separates ordinary side-graph construction from its
+CUDA release at backend submission. Compiler tests cover unsplit and split
+regions, dependent chunks sharing an anchor, separate anchors, and one/two
+code-generation workers. Runtime CUDA tests check actual release timing,
+bitwise output/input/weight gradients, and exception cleanup. The matching
+DeepEP adapter tests cover dispatch/combine, prepared results, padded dispatch,
+and callback failures (33 CPU tests).
+
+The real 15B EP2 block preserves every output and gradient bitwise. Moving
+shared forward/backward to dispatch-forward/combine-backward and attention
+replay to the opposite pair did not improve block time: 44.54 ms versus
+43.23 ms for the previous staged schedule (44.78 ms with no overlap). The new
+phase is opt-in; this configuration is not a recommended performance preset.
+Its trace shows attention tail submission misses the backward dispatch window.
+Earlier tail submission and full-model performance remain under investigation.

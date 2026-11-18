@@ -48,7 +48,7 @@ class ModuleStreamRule:
     backward_on: str | None = None
     # Persist the generated-code ABI, including in pickled configurations.
     # A default factory leaves old pickles detectably missing the field.
-    _codegen_version: int = field(default_factory=lambda: 17, init=False, repr=False)
+    _codegen_version: int = field(default_factory=lambda: 18, init=False, repr=False)
 
     def __post_init__(self):
         if self.recompute_prefetch_prefix is not None:
@@ -85,11 +85,11 @@ class ModuleStreamRule:
             raise ValueError('kernel_graphs must be a boolean')
         if self.kernel_graphs and self.launch_phase != 'input_ready':
             raise ValueError('kernel_graphs requires an input_ready backend launch point')
-        if self.launch_phase not in ('submitted', 'input_ready'):
-            raise ValueError('launch_phase must be submitted or input_ready')
-        if self.launch_phase == 'input_ready' and (not self.launch_on
+        if self.launch_phase not in ('submitted', 'input_ready', 'prequeued'):
+            raise ValueError('launch_phase must be submitted, input_ready, or prequeued')
+        if self.launch_phase in ('input_ready', 'prequeued') and (not self.launch_on
                 or (self.split_before and not self.resume_on)):
-            raise ValueError('input_ready requires launch_on/resume_on backend boundaries')
+            raise ValueError('input_ready/prequeued require launch_on/resume_on backend boundaries')
         if type(self.recompute_only) is not bool:
             raise ValueError('recompute_only must be a boolean')
         if self.recompute_only and (self.launch_before or self.launch_after or self.split_before
@@ -176,6 +176,7 @@ class ModuleStreamRegion:
     native: bool = False
     kernel_graphs: bool = False
     retain_backward_outputs: bool = False
+    prequeued: bool = False
 
 
 def _unsafe(node):
@@ -283,7 +284,7 @@ def plan_module_streams(nodes, outputs, rules):
                        (rule.resume_before or rule.resume_after or rule.resume_on,
                         bool(rule.resume_after or rule.resume_on), bool(rule.resume_on)))
             for chunk, (anchor, after, deferred) in zip(chunks, anchors):
-                native = deferred and rule.launch_phase == 'input_ready'
+                native = deferred and rule.launch_phase in ('input_ready', 'prequeued')
                 deferred = deferred and not native
                 destination = positions[chunk[0]]
                 ready_before = None
@@ -341,7 +342,8 @@ def plan_module_streams(nodes, outputs, rules):
                                             deferred=deferred, overlap_backward=rule.overlap_backward,
                                             backward_anchor=backward_anchor, native=native,
                                             kernel_graphs=rule.kernel_graphs,
-                                            retain_backward_outputs=backward_override is not None)
+                                            retain_backward_outputs=backward_override is not None,
+                                            prequeued=rule.launch_phase == 'prequeued')
                 regions[key] = region
                 placements[destination].append(region)
                 selected.update(chunk)
