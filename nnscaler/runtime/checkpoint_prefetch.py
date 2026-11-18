@@ -120,6 +120,11 @@ class Prefetch(BackwardLaunchPoint):
         self.supported = True
         self.lock = Lock()
 
+    def __exit__(self, exc_type, exc_value, traceback):
+        super().__exit__(exc_type, exc_value, traceback)
+        if exc_type is None and not self.captured:
+            raise RuntimeError('The checkpoint prefetch backend did not capture its launch point')
+
     def contexts(self, inputs):
         if self.frame_ref is not None:
             raise RuntimeError('A checkpoint prefetch point belongs to one forward invocation')
@@ -333,6 +338,8 @@ class Prefetch(BackwardLaunchPoint):
         return True
 
     def submitted(self):
+        if not self.captured or self.ready is None:
+            raise RuntimeError('The checkpoint prefetch backend did not record its input readiness')
         self.prefetch()
 
     def adopt(self, gid):

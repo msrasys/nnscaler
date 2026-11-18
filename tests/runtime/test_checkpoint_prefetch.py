@@ -199,3 +199,34 @@ def test_discarded_forward_does_not_depend_on_cyclic_gc_for_budget_release():
     assert point.prefetch() and budget.used
     del y, point
     assert budget.used == 0
+
+
+def test_missing_backend_capture_is_rejected():
+    point = Prefetch('missing_capture', Budget(1024))
+    with pytest.raises(RuntimeError, match='did not capture'):
+        with point:
+            pass
+
+
+def test_missing_backward_readiness_is_rejected_before_replay():
+    point = Prefetch('missing_ready', Budget(1024))
+    x = torch.randn(4, requires_grad=True)
+    y = checkpoint(lambda v: v.sin().square(), x, use_reentrant=False,
+                   context_fn=lambda: point.contexts((x,)))
+
+    class BrokenAnchor(torch.autograd.Function):
+        @staticmethod
+        def forward(ctx, value):
+            ctx.point = nnscaler.capture_async_backward()
+            return value.clone()
+
+        @staticmethod
+        def backward(ctx, grad):
+            ctx.point.submitted()
+            return grad
+
+    with point:
+        result = BrokenAnchor.apply(y)
+    with pytest.raises(RuntimeError, match='input readiness'):
+        result.sum().backward()
+    assert point.budget.used == 0 and point.stats['launched'] == 0
