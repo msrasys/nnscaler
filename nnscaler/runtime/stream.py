@@ -182,17 +182,34 @@ class ModuleStreams:
         self.weight_regions[key] = region
         return region
 
-    def checkpoint_prefetch(self, name, budget_bytes):
-        from .checkpoint_prefetch import Prefetch
-        point = Prefetch(name, budget_bytes)
+    def checkpoint_prefetch(self, name, budget_bytes, *, staged=False):
+        if staged:
+            from .staged_checkpoint import StagedCheckpoint
+            point = StagedCheckpoint(name, budget_bytes)
+        else:
+            from .checkpoint_prefetch import Prefetch
+            point = Prefetch(name, budget_bytes)
         self.prefetch_points.append(point)
         return point
 
     @contextmanager
-    def prefetch_launch_point(self, points):
-        from .deferred import NativeLaunchPoint
+    def prefetch_launch_point(self, points, *, submitted=False):
+        from .deferred import NativeLaunchPoint, LaunchPoint
+        if submitted:
+            with LaunchPoint(tuple(point.prefetch for point in points)):
+                yield
+            return
         with NativeLaunchPoint(tuple(point.prefetch for point in points),
                                lambda ready: None, lambda: ()):
+            yield
+
+    @contextmanager
+    def staged_backward_point(self, points):
+        from .staged_checkpoint import ReplayReady
+        point = ReplayReady(any(getattr(p, 'cuda', False) for p in points))
+        for state in points:
+            state.backward_point = point
+        with point:
             yield
 
     def prepare(self, key, name, function, parent, inputs, attributes, output_specs):

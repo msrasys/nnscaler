@@ -443,3 +443,62 @@ application configs retain precedence. Dispatch/combine SM counts and NVL
 capacities must match. These numbers must be tuned for the actual shape and
 hardware: optimizing isolated communication may leave too few SMs for overlap.
 Report tuning-only and tuning-plus-overlap controls separately.
+
+## Staging a checkpoint replay
+
+`recompute_prefetch_prefix` splits **replay**, leaving the original forward
+checkpoint whole. This is useful when one independent communication boundary
+has forward and backward work to hide:
+
+```python
+ModuleStreamRule(
+    "*.attention",
+    stream="attention_replay",
+    recompute_only=True,
+    recompute_prefetch_on="*.dispatch",
+    recompute_prefetch_prefix=("*.project_qkv", "*.project_query"),
+    recompute_prefetch_bytes=8 * 1024**3,
+)
+```
+
+The first matching top-level operator assignment ends the prefix. NNScaler
+makes parameters explicit inputs to generated replay functions. It pre-enqueues
+that prefix on the named stream and releases it after the asynchronous backend
+submits its forward work. During backward, it rebuilds the remaining graph
+after the same backend records **input readiness**, before consuming the
+incoming gradient. A backend must implement both `notify_async_launch()` and
+`capture_async_backward()` / `record_ready()`. The compiler preserves normal
+forward dependency joins and waits for the prefix before leaving the segment;
+no work is borrowed from another microbatch.
+
+A cold prefix runs during backward to learn its retained storage footprint.
+Subsequent invocations with the same prefix input metadata reserve from the
+shared per-device budget before pre-enqueueing. The key includes only arguments
+read by the prefix: changing tail-only metadata does not force another cold
+replay. Storage identities account for aliases, and cache use still checks
+original input versions. Budget exhaustion falls back to ordinary backward
+replay. The budget limits retained prefix storage, not temporary kernel
+workspace or the rest of the model. Prefix allocation must be shape-stable;
+growth beyond its learned bound raises an error.
+
+The original function runs under `no_grad`, as in reentrant checkpointing.
+Both replay stages restore RNG and autocast state. Parameter gradient dtypes
+are preserved, including BF16 parameters with FP32 gradients. This mode is
+first-order and eager only. Nested checkpoints, concurrent backwards of one
+forward invocation, CUDA graph capture, and data-dependent prefix allocation
+are unsupported. The selected group must have explicit read-only attributes;
+stateful module access and a cut inside an operator context manager are rejected.
+Whole-replay and staged-replay rules cannot share one anchor, nor can a staged
+rule use the same anchor as a native `input_ready` module callback. Submitted
+module callbacks can share the anchor.
+
+CUDA pre-enqueue uses driver stream memory operations and a native host
+watchdog. The helper is built lazily into the PyTorch extension cache and
+requires CUDA toolkit headers and a C++ compiler. A completed caller can release
+the gate from the host; otherwise a stream-ordered write preserves readiness.
+The watchdog can release a stalled gate without the GIL or a runnable CUDA
+queue. A watchdog fallback preserves computation but may lose overlap and
+should be counted during performance validation. Async allocator dependency
+reuse is temporarily constrained while a gate is pending and restored at the
+segment boundary. Abandoned forwards and failures release their gates and
+retain storage through the GPU completion event.

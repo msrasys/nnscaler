@@ -1097,11 +1097,13 @@ class ModuleCodeGen(FuncEmission):
     def _emit_module_streams(self, segment, runtime_devid):
         previous = getattr(self, '_weight_regions_by_node', {})
         previous_prefetch = getattr(self, '_checkpoint_prefetch_names', {})
+        previous_prefixes = getattr(self, '_checkpoint_prefetch_prefixes', {})
         try:
             return self._emit_module_streams_impl(segment, runtime_devid)
         finally:
             self._weight_regions_by_node = previous
             self._checkpoint_prefetch_names = previous_prefetch
+            self._checkpoint_prefetch_prefixes = previous_prefixes
 
     def _emit_module_streams_impl(self, segment, runtime_devid):
         nodes, regions, joins = plan_module_streams(
@@ -1117,6 +1119,19 @@ class ModuleCodeGen(FuncEmission):
         checkpoint_anchors = plan_checkpoint_readiness(nodes, segment.oobjs(), CompileFlag.module_streams)
         prefetch_plans = plan_checkpoint_prefetch(nodes, CompileFlag.module_streams)
         self._checkpoint_prefetch_names = {plan.gid: plan.key for plan in prefetch_plans}
+        self._checkpoint_prefetch_prefixes = {plan.gid: plan.rule.recompute_prefetch_prefix
+                                             for plan in prefetch_plans if plan.rule.recompute_prefetch_prefix}
+        staged_forward = {}
+        modes_at_anchor = {}
+        for plan in prefetch_plans:
+            staged = plan.rule.recompute_prefetch_prefix is not None
+            modes_at_anchor.setdefault(plan.anchor, set()).add(staged)
+            if staged:
+                if any(region.ready_before is plan.anchor and region.native for region in regions.values()):
+                    raise ValueError('Staged replay requires a post-submission anchor, not native input-ready callbacks')
+                staged_forward.setdefault(plan.anchor, []).append(plan.key)
+        if any(len(modes) > 1 for modes in modes_at_anchor.values()):
+            raise ValueError('Whole and staged replay cannot share one prefetch anchor')
         prefetch_forward, prefetch_backward = {}, {}
         for plan in prefetch_plans:
             if any(plan.anchor in region.nodes or any(node.recompute == plan.gid for node in region.nodes)
@@ -1190,7 +1205,8 @@ class ModuleCodeGen(FuncEmission):
         body = [f'{name} = nnscaler.runtime.deferred.BackwardLaunchPoint(())'
                 for name in readiness_names.values()]
         body.extend(f'{plan.key} = _module_streams.checkpoint_prefetch('
-                    f'{plan.rule.stream!r}, {plan.rule.recompute_prefetch_bytes})'
+                    f'{plan.rule.stream!r}, {plan.rule.recompute_prefetch_bytes}'
+                    f'{", staged=True" if plan.rule.recompute_prefetch_prefix else ""})'
                     for plan in prefetch_plans)
         pending = []
         unused = lifetime.release_tensors_after_line(-1)
@@ -1210,9 +1226,13 @@ class ModuleCodeGen(FuncEmission):
             scope = (''.join(f', {name}' for name in ready_at.get(node, ()))
                      + ''.join(f', {name}.anchor()' for name in weight_anchors.get(node, ()))
                      + ''.join(f', {name}' for name in prefetch_backward.get(node, ())))
+            if node in staged_forward:
+                points = '(' + ', '.join(staged_forward[node]) + ',)'
+                scope += f', _module_streams.staged_backward_point({points})'
             if node in prefetch_forward and node not in launch_points:
                 points = '(' + ', '.join(prefetch_forward[node]) + ',)'
-                scope += f', _module_streams.prefetch_launch_point({points})'
+                submitted = ', submitted=True' if node in staged_forward else ''
+                scope += f', _module_streams.prefetch_launch_point({points}{submitted})'
             return scope
 
         def resolve(key):
@@ -1694,6 +1714,13 @@ class ModuleCodeGen(FuncEmission):
                            f'{", backward_ready=" + backward_ready if backward_ready else ""})')
         codes.append(f'{output_names_tuple} = ckpt.checkpoint(recompute, {input_names_tuple}, '
                      f'use_reentrant=False{context})')
+        patterns = getattr(self, '_checkpoint_prefetch_prefixes', {}).get(nodes[0].recompute)
+        if patterns:
+            from .staged_checkpoint import emit_staged_checkpoint
+            attributes = list(dict.fromkeys(obj for node in nodes for obj in node.iobjs() if obj.is_attr()))
+            return emit_staged_checkpoint(
+                codes, prefetch, [self.tensor_name(t, prefix_attr='self.') for t in attributes], patterns,
+                [bool(getattr(t, 'requires_grad', False)) for t in outputs])
 
         return codes
 

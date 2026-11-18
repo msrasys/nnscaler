@@ -167,3 +167,26 @@ scripts are under `/home/yileiyang/agens/stream-overlap-dw-refine-20261118`.
 The production preset is `llm-train/scripts/run_stream_overlap_15b_pp3ep2.sh`.
 The remaining forward dispatch exposure and lack of reliable incremental dW gain
 are open optimization work; these measurements do not establish an upper limit.
+
+### Staged replay integration (2026-11-18)
+
+The runtime and compiler now support `recompute_prefetch_prefix` without
+model-specific scheduling code. CPU validation covers prefix/tail gradients
+and RNG, metadata changes, mutation detection, storage budgets, abandoned
+forwards (including a retained launch point), concurrent-backward rejection,
+non-differentiable outputs, explicit training-state snapshots, and composition
+with submitted module callbacks. Existing checkpoint-prefetch tests remain
+applicable. CUDA tests cover input-readiness alignment, exact gradients,
+abandonment, failure cleanup, and host release of a ready gate.
+
+A real 15B attention/MoE block with EP2, BF16 parameters and FP32 gradients
+passed bitwise output/dX/all-parameter-gradient comparison after integration.
+The staged-replay prototype also completed a matched 15B PP3/EP2 run at batch
+size 2, sequence length 8192, accumulation 6: 4.066909 s/step without overlap
+and 3.971843 s/step with overlap over steps 60–79 (2.34% reduction). Both used
+the same experimental compact DeepEP backend and native allocator; this is
+not a comparison against an artificially slower allocator or transport.
+The integrated runtime additionally keys cache bounds only on prefix inputs.
+Full-model performance of that refinement remains to be measured. The result
+above does not establish complete communication hiding; optimization and
+full-model profiling are ongoing.
