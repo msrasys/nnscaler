@@ -123,6 +123,32 @@ class AsyncTensorCopies(TorchFunctionMode):
         return func(*args, **kwargs)
 
 
+@contextmanager
+def side_compute_context():
+    """Keep transport copy interception out of independent launch callbacks.
+
+    Preserve unrelated user modes, including their order, without re-entering
+    their context managers. The outer transport resumes with its original modes.
+    """
+    from torch.overrides import _get_current_function_mode_stack, _pop_mode, _push_mode
+    modes = _get_current_function_mode_stack()
+    if not any(type(mode) is AsyncTensorCopies for mode in modes):
+        yield
+        return
+    retained = [mode for mode in modes if type(mode) is not AsyncTensorCopies]
+    for _ in modes:
+        _pop_mode()
+    for mode in retained:
+        _push_mode(mode)
+    try:
+        yield
+    finally:
+        for _ in retained:
+            _pop_mode()
+        for mode in modes:
+            _push_mode(mode)
+
+
 class ModuleStreams:
     """Event-scoped module execution used by generated segment code.
 

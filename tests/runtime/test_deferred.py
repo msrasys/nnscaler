@@ -7,6 +7,50 @@ import torch
 from nnscaler.runtime.deferred import DeferredRegion, LaunchPoint, after_backward, notify_async_launch
 
 
+@pytest.mark.parametrize('user_inside', [False, True])
+@pytest.mark.parametrize('native', [False, True])
+@pytest.mark.parametrize('fail', [False, True])
+def test_launch_callback_suspends_only_transport_copy_mode(user_inside, native, fail):
+    from contextlib import ExitStack
+    from torch.overrides import TorchFunctionMode, _get_current_function_mode_stack
+    from nnscaler.runtime.stream import AsyncTensorCopies
+    from nnscaler.runtime.deferred import NativeLaunchPoint, prepare_async_input
+
+    class UserMode(TorchFunctionMode):
+        calls = 0
+
+        def __torch_function__(self, func, types, args=(), kwargs=None):
+            self.calls += 1
+            return func(*args, **(kwargs or {}))
+
+    user, copy_mode = UserMode(), AsyncTensorCopies()
+    x = torch.ones(4, requires_grad=True)
+
+    def callback():
+        assert _get_current_function_mode_stack() == [user]
+        assert torch.is_grad_enabled()
+        x.square()
+        if fail:
+            raise RuntimeError('callback failure')
+
+    def run():
+        point = NativeLaunchPoint((callback,), lambda ready: None, lambda: ()) if native else LaunchPoint((callback,))
+        with point:
+            prepare_async_input(x) if native else notify_async_launch()
+
+    with ExitStack() as stack:
+        for mode in ([copy_mode, user] if user_inside else [user, copy_mode]):
+            stack.enter_context(mode)
+        original = _get_current_function_mode_stack()
+        if fail:
+            with pytest.raises(RuntimeError, match='callback failure'):
+                run()
+        else:
+            run()
+        assert _get_current_function_mode_stack() == original
+        assert user.calls > 0
+
+
 def test_backward_priority_preserves_input_graph_boundaries_and_math():
     from nnscaler.runtime.deferred import backward_boundaries, prioritize_backward
     x = torch.randn(8, requires_grad=True)

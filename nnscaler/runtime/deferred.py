@@ -176,7 +176,8 @@ class LaunchPoint:
         callbacks, self.callbacks = self.callbacks, ()
         # Autograd.Function.forward disables grad mode. Side regions must use
         # the caller's mode so their graphs remain independent and differentiable.
-        with torch.inference_mode(self.inference), torch.set_grad_enabled(self.grad), \
+        from .stream import side_compute_context
+        with side_compute_context(), torch.inference_mode(self.inference), torch.set_grad_enabled(self.grad), \
                 torch.autocast('cuda', enabled=self.autocast, dtype=self.dtype, cache_enabled=self.cache):
             for callback in callbacks:
                 callback()
