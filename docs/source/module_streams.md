@@ -91,7 +91,7 @@ Backward computes dInput, registers
 gradients. The callback returns those gradients in the original parameter
 order. Tensor inputs retained by the callback should be detached references;
 do not resize storage shared with other consumers. The caller lists all inputs
-whose storage the callback reads so the runtime can record their CUDA stream.
+whose storage the callback reads so the runtime can protect their CUDA lifetime.
 Callbacks perform pure gradient computation; they do not issue collectives or
 publish reducer contributions themselves. Register them from the module's
 ordinary backward, not from a nested autograd GraphTask.
@@ -114,6 +114,23 @@ dependency at the end of the GraphTask instead. Mixed/native parameter consumers
 retain their original accumulator affinity, and pruned parameter paths still
 join outstanding work in GraphTask cleanup. No work is moved into another
 microbatch.
+
+Backends with stable input storage can opt into
+`binding.defer(callback, inputs, retain_inputs=True)`. They must not resize the
+underlying input storage while queued work can still use it. New gradients must
+be allocated on the callback stream, or alias declared inputs. The default
+allocator-based protection remains available for other backends.
+
+The opt-in path retains input storage until the callback completion event.
+Storage aliased by returned gradients is kept through GPU completion of the
+GraphTask, including accumulation and reducer hooks. Holding storage rather than
+gradient tensor objects avoids forcing extra AccumulateGrad copies. Forward and
+checkpoint inputs retain their original protection.
+Completed owners are reclaimed in stream order, before a new module forward and
+at scheduled drains. Direct runtime users can call
+`nnscaler.runtime.stream.drain_stream_holds(wait=True)` at explicit completion or
+cleanup boundaries. The ownership queue does not defer computation to another
+GraphTask or microbatch.
 
 Support is first-order, single-device, ZeRO 0/1, with non-reentrant checkpoints.
 Concurrent backward calls on the same forward invocation are unsupported;

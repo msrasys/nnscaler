@@ -4,7 +4,7 @@
 """Keep scheduled inputs alive until their consuming CUDA stream is done."""
 
 from contextlib import contextmanager, nullcontext
-from collections import OrderedDict
+from collections import OrderedDict, deque
 from enum import Enum
 from threading import Lock
 from concurrent.futures import ThreadPoolExecutor
@@ -14,13 +14,60 @@ import torch
 from torch.overrides import TorchFunctionMode
 
 
-_pending_holds = []
+_pending_holds = {}
 _holds_lock = Lock()
 _SCALARS = (type(None), bool, int, float, complex, str, bytes, torch.dtype, torch.device)
 _module_streams = {}
 _module_streams_lock = Lock()
 _module_workers = {}
 _parameter_stream_names = {}
+
+
+class _StorageOwner:
+    """Keep allocation ownership without retaining a gradient TensorImpl."""
+
+    def __init__(self, tensor):
+        self.storage = tensor.untyped_storage()
+        self.device = tensor.device
+        self.start = self.storage.data_ptr()
+        self.end = self.start + self.storage.nbytes()
+
+
+def _storage_owner(value):
+    if not isinstance(value, torch.Tensor) or value.layout != torch.strided or value.is_nested:
+        return None
+    try:
+        return _StorageOwner(value)
+    except (NotImplementedError, RuntimeError):
+        return None  # Wrapper tensors may not expose their storage.
+
+
+def hold_aliased_inputs_through_backward(inputs, gradients, stream):
+    """Keep returned input views through later gradient consumers.
+
+    Retain storage instead of the gradient tensor: an extra TensorImpl owner
+    would force AccumulateGrad to clone an otherwise stealable dense gradient.
+    Fresh gradients allocated by the callback on its own stream need no hold.
+    Unknown storage uses the conservative owner fallback.
+    """
+    known = [owner for owner in inputs if isinstance(owner, _StorageOwner)]
+    unknown = [owner for owner in inputs if not isinstance(owner, _StorageOwner)]
+    retained = []
+    for gradient in gradients:
+        if gradient is None:
+            continue
+        storage = _storage_owner(gradient)
+        if storage is None:
+            retained.extend((*inputs, gradient))
+        elif unknown:
+            retained.extend((*inputs, storage))
+        else:
+            aliases = [owner for owner in known if owner.device == storage.device
+                       and owner.start < storage.end and storage.start < owner.end]
+            if aliases:
+                retained.extend((*aliases, storage))
+    if retained:
+        hold_owners_through_backward(tuple({id(owner): owner for owner in retained}.values()), (stream,))
 
 
 def has_module_streams():
@@ -58,13 +105,8 @@ def hold_owners_through_backward(owners, streams):
         return
 
     def after_backward():
-        holds = []
         for stream in streams:
-            event = torch.cuda.Event()
-            event.record(stream)
-            holds.append((event, owners))
-        with _holds_lock:
-            _pending_holds.extend(holds)
+            _hold_stream_owners(owners, stream)
 
     torch.autograd.Variable._execution_engine.queue_callback(after_backward)
 
@@ -133,6 +175,9 @@ class ModuleStreams:
     """
 
     def __enter__(self):
+        # Reclaim completed backward inputs before this forward allocates
+        # its activations, including for callers without a pipeline executor.
+        drain_stream_holds()
         self.caller = torch.cuda.current_stream()
         self.events = {}
         self.ready = {}
@@ -388,23 +433,42 @@ class ModuleStreams:
             raise RuntimeError(f'Deferred module regions were not launched: {unlaunched}')
 
 
+def _hold_stream_owners(owners, stream):
+    event = torch.cuda.Event()
+    event.record(stream)
+    with _holds_lock:
+        _pending_holds.setdefault(stream, deque()).append((event, owners))
+
+
 def drain_stream_holds(*, wait=False):
-    """Reclaim opaque input owners; wait only at an explicit schedule drain."""
+    """Reclaim completed owners in stream order, with at most one pending query
+    per stream. A later event on the same stream cannot release work while an
+    earlier event is pending. Concurrent submissions are retained separately.
+    """
     with _holds_lock:
-        holds = _pending_holds[:]
+        holds = dict(_pending_holds)
         _pending_holds.clear()
-    pending = []
-    for event, owners in holds:
-        if wait:
-            event.synchronize()
-        elif not event.query():
-            pending.append((event, owners))
-    with _holds_lock:
-        _pending_holds.extend(pending)
+    try:
+        for stream, queue in holds.items():
+            while queue:
+                event, owners = queue[0]
+                if wait:
+                    event.synchronize()
+                elif not event.query():
+                    break
+                queue.popleft()
+    finally:
+        # Preserve ownership on query/synchronize failure too. Put older work
+        # before any entries recorded while these events were being polled.
+        with _holds_lock:
+            for stream, queue in holds.items():
+                if queue:
+                    queue.extend(_pending_holds.get(stream, ()))
+                    _pending_holds[stream] = queue
 
 
 @contextmanager
-def input_stream_lifetime(inputs, enabled):
+def input_stream_lifetime(inputs, enabled, *, retain_tensors=False):
     """Protect inputs and yield opaque owners that a later backward may need.
 
     Builtin containers are traversed once by identity, including cycles. Custom
@@ -413,6 +477,12 @@ def input_stream_lifetime(inputs, enabled):
     backward must carry the yielded owners through its final backward call too.
     Do not inspect arbitrary Python attributes or consume iterators. Stream
     ordering remains the scheduler's job.
+
+    ``retain_tensors`` snapshots first-order input storage under one completion
+    event instead of recording every allocation on this stream. Underlying
+    storage must not be resized while the submitted work can still use it.
+    Never use it around forward code that saves inputs for later backward.
+    Returned views need protection through their eventual consumers too.
     """
     if not enabled or not torch.cuda.is_initialized():
         yield ()
@@ -430,7 +500,12 @@ def input_stream_lifetime(inputs, enabled):
             seen.add(identity)
             if isinstance(value, torch.Tensor):
                 if value.is_cuda:
-                    if value.layout == torch.strided and not value.is_nested:
+                    if retain_tensors:
+                        # First-order callback inputs need protection only
+                        # through this submitted scope, unlike forward saves.
+                        owner = _storage_owner(value)
+                        opaque.append(value if owner is None else owner)
+                    elif value.layout == torch.strided and not value.is_nested:
                         try:
                             value.record_stream(stream)
                         except NotImplementedError:
@@ -470,7 +545,4 @@ def input_stream_lifetime(inputs, enabled):
         yield opaque
     finally:
         if opaque:
-            event = torch.cuda.Event()
-            event.record(stream)
-            with _holds_lock:
-                _pending_holds.append((event, opaque))
+            _hold_stream_owners(opaque, stream)
