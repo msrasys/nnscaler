@@ -182,14 +182,25 @@ abandonment, failure cleanup, and host release of a ready gate.
 A real 15B attention/MoE block with EP2, BF16 parameters and FP32 gradients
 passed bitwise output/dX/all-parameter-gradient comparison after integration.
 The staged-replay prototype also completed a matched 15B PP3/EP2 run at batch
-size 2, sequence length 8192, accumulation 6: 4.066909 s/step without overlap
-and 3.971843 s/step with overlap over steps 60–79 (2.34% reduction). Both used
+size 2, sequence length 8192, accumulation 6. Over steps 60–79, complete iteration
+time was 4.230742 s without overlap and 4.137791 s with overlap (2.20% reduction).
+The training-body `train_wall` metric was 4.066909 s versus 3.971843 s (2.34%);
+it excludes between-step overhead and is not the primary end-to-end metric. Both used
 the same experimental compact DeepEP backend and native allocator; this is
 not a comparison against an artificially slower allocator or transport.
 The integrated runtime additionally keys cache bounds only on prefix inputs.
-Full-model performance of that refinement remains to be measured. The result
-above does not establish complete communication hiding; optimization and
-full-model profiling are ongoing.
+The result above does not establish complete communication hiding; optimization
+and full-model profiling are ongoing.
+
+The integrated runtime also completed a matched 80-step pair with the optional
+8-warp compact transport: complete iteration 4.186883 s without overlap versus
+4.110043 s with overlap (1.84% reduction), using steps 60–79. Training-body time
+was 4.022076 s versus 3.947277 s (1.86%). Source commits, backend-library hashes,
+initial state/RNG, full-input checkpoints and workload all match. Every first-step
+parameter gradient was checked; maximum relative L2 error is 6.55e-8. Both runs
+reference the same verified gradient binary: the new control's complete gradient
+digest is byte-identical to that reference. This avoids another 67 GiB copy and
+does not relax numerical checks. These gains remain below the task's target.
 
 ### Prequeued module execution (2026-11-18)
 
