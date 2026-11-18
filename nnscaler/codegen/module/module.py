@@ -1119,6 +1119,7 @@ class ModuleCodeGen(FuncEmission):
                 raise ValueError('Recompute readiness cannot also move its checkpoint or backend forward')
             ready_at.setdefault(anchor, []).append(readiness_names[gid])
         node_streams = {node: region.stream for region in regions.values() for node in region.nodes}
+        weight_node_streams = {node: plan.stream for plan in weight_plans for node in plan.nodes}
         for node in nodes:
             origins = set()
             for value in node.iobjs():
@@ -1128,7 +1129,8 @@ class ModuleCodeGen(FuncEmission):
             is_multiref = node.name == 'multiref' and node.kwargs.get('clone_level', 0) == 0
             if not is_multiref:
                 for name in origins:
-                    self.module_parameter_uses.setdefault(name, set()).add(node_streams.get(node))
+                    self.module_parameter_uses.setdefault(name, set()).add(
+                        weight_node_streams.get(node, node_streams.get(node)))
             if (is_multiref or isinstance(node, IRAdapter)
                     or node.signature.rsplit('.', 1)[-1] in (
                         'view', 'view_as', 'reshape', 'detach', 'contiguous', 'to',

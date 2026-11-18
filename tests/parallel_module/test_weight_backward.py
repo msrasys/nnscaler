@@ -90,6 +90,8 @@ def test_generated_weight_split_preserves_outputs_gradients(tmp_path, monkeypatc
         torch.testing.assert_close(parameter.grad, reference.get_parameter(generated.fullmap[name].orig_name).grad)
     source = next(tmp_path.rglob('gencode0.py')).read_text()
     assert '.anchor():' in source and '.compute():' in source and '.weight_region(' in source
+    assert cls.module_parameter_streams
+    assert set(cls.module_parameter_streams.values()) == {'weights'}
 
 
 class RepeatedModel(torch.nn.Module):
@@ -99,6 +101,35 @@ class RepeatedModel(torch.nn.Module):
 
     def forward(self, x):
         return self.block(x) + self.block(x * 3)
+
+
+class MixedWeightModel(Model):
+    def forward(self, x):
+        return super().forward(x) + x @ self.expert.weight
+
+
+@replace_all_device_with('cpu', force=True)
+def test_native_weight_consumer_keeps_mixed_gradient_affinity(tmp_path, monkeypatch):
+    monkeypatch.setattr('nnscaler.runtime.stream.ModuleStreams', Streams)
+    model = MixedWeightModel()
+    reference = copy.deepcopy(model)
+    rule = ModuleStreamRule('expert', stream='weights', weight_backward_on='*.weight_anchor')
+    nnscaler.parallelize(model, {'x': torch.randn(8, 4, requires_grad=True)}, 'dp',
+                         ComputeConfig(1, 1, module_streams=(rule,)), gen_savedir=tmp_path,
+                         instance_name='mixed_weights', load_module=False)
+    cls = _load_parallel_module_class(MixedWeightModel, gen_savedir=tmp_path,
+                                     instance_name='mixed_weights', rank=0)
+    assert cls.module_parameter_streams == {}
+    assert cls.module_stream_parameters
+    generated = new_empty(cls, device='cpu', init_params=True)
+    x = torch.randn(8, 4, requires_grad=True)
+    rx = x.detach().clone().requires_grad_()
+    actual, expected = generated(x), reference(rx)
+    actual.square().sum().backward()
+    expected.square().sum().backward()
+    torch.testing.assert_close(x.grad, rx.grad)
+    for name, parameter in generated.named_parameters():
+        torch.testing.assert_close(parameter.grad, reference.get_parameter(generated.fullmap[name].orig_name).grad)
 
 
 @replace_all_device_with('cpu', force=True)

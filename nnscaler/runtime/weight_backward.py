@@ -15,7 +15,8 @@ import weakref
 import torch
 from torch.autograd.function import once_differentiable
 from .deferred import BackwardLaunchPoint, after_backward
-from .stream import _get_module_stream, input_stream_lifetime
+from .stream import (_get_module_stream, input_stream_lifetime,
+                     parameter_gradient_stream, parameter_uses_module_stream)
 
 _active = local()
 
@@ -95,7 +96,24 @@ class WeightBackwardRegion:
         self.point = _WeightPoint(self)
         self.tasks = {}
         self.bound = self.prepared = False
-        self.aliases = _ParameterGrads.apply(self, *self.originals) if self.enabled else self.originals
+        if self.enabled and self.stream is not None:
+            # Parameter publication must run on the weight stream too. A
+            # main-stream autograd node would enqueue a W wait ahead of the
+            # unrelated upstream dInput path, undoing the split.
+            holds = []
+            for parameter in self.originals:
+                # Respect compiler-proven mixed/native parameter affinity and
+                # preserve any accumulator that already owns reducer hooks.
+                context = (parameter_gradient_stream(parameter)
+                           if parameter_uses_module_stream(parameter)
+                           else torch.cuda.stream(self.stream))
+                with context:
+                    holds.append(parameter.expand_as(parameter))
+            with torch.cuda.stream(self.stream):
+                self.aliases = _ParameterGrads.apply(self, *self.originals)
+            del holds
+        else:
+            self.aliases = _ParameterGrads.apply(self, *self.originals) if self.enabled else self.originals
 
     @contextmanager
     def compute(self):
@@ -211,6 +229,8 @@ class WeightBackwardRegion:
     def _join(self, task):
         if task.done is not None:
             caller = torch.cuda.current_stream(self.device)
+            if caller == self.stream:
+                return  # Stream order already covers W and its publication.
             caller.wait_event(task.done)
             for _, gradient in task.results:
                 gradient.record_stream(caller)

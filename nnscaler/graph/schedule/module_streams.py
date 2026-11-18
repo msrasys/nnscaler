@@ -44,7 +44,7 @@ class ModuleStreamRule:
     backward_on: str | None = None
     # Persist the generated-code ABI, including in pickled configurations.
     # A default factory leaves old pickles detectably missing the field.
-    _codegen_version: int = field(default_factory=lambda: 14, init=False, repr=False)
+    _codegen_version: int = field(default_factory=lambda: 15, init=False, repr=False)
 
     def __post_init__(self):
         if self.weight_backward_on is not None:

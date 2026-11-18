@@ -106,6 +106,15 @@ accumulation hooks and reducer contribution counts are retained; no manual
 reducer-buffer publication is required. Parameter edges are created immediately
 before their anchor to avoid retaining an entire stage's weight gradients.
 
+Generated-code ABI 15 keeps both the parameter-gradient view node and
+compiler-proven exclusive parameter accumulators on the weight stream. Joining
+that work on the caller stream at each parameter publication would unnecessarily
+stall upstream input backward. Ordinary autograd completes the caller-stream
+dependency at the end of the GraphTask instead. Mixed/native parameter consumers
+retain their original accumulator affinity, and pruned parameter paths still
+join outstanding work in GraphTask cleanup. No work is moved into another
+microbatch.
+
 Support is first-order, single-device, ZeRO 0/1, with non-reentrant checkpoints.
 Concurrent backward calls on the same forward invocation are unsupported;
 separate live forward invocations keep separate task state.

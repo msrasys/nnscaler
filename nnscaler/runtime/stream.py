@@ -75,8 +75,8 @@ def parameter_gradient_stream(param):
     if param.device.type != 'cuda' or entry is None or entry[0]() is not param or entry[1] is None:
         yield
     else:
-        # Creating AccumulateGrad on the forward stream avoids a return to the
-        # default stream for every parameter. Never reset an existing graph.
+        # Use the compiler-proven gradient stream, including deferred dW.
+        # Never reset an existing graph or an accumulator's registered hooks.
         with torch.cuda.stream(_get_module_stream(param.device, entry[1])):
             yield
 

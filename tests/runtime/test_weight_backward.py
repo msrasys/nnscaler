@@ -210,6 +210,88 @@ def test_weight_gemm_waits_for_inputs_but_overlaps_pending_communication():
     assert not region.tasks
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason='requires CUDA')
+def test_upstream_input_backward_does_not_wait_for_weight_publication():
+    """A parameter-gradient join must not stall unrelated upstream dInput."""
+    from nnscaler.runtime.stream import _get_module_stream
+    device = torch.device('cuda', torch.cuda.current_device())
+    x = torch.randn(64, 64, device=device, requires_grad=True)
+    w = torch.nn.Parameter(torch.randn(64, 64, device=device))
+    rx, rw = x.detach().clone().requires_grad_(), w.detach().clone().requires_grad_()
+    side = _get_module_stream(device, 'upstream_weight_test')
+    side.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(side):
+        warm = x.detach().t() @ x.detach()
+    torch.cuda.synchronize()
+    del warm
+    weight_done = torch.cuda.Event()
+    observed = []
+
+    class Upstream(torch.autograd.Function):
+        @staticmethod
+        def forward(ctx, value):
+            return value * 3
+
+        @staticmethod
+        def backward(ctx, dy):
+            dx = dy * 3
+            ready = torch.cuda.Event()
+            ready.record()
+            ready.synchronize()
+            observed.append(not weight_done.query())
+            return dx
+
+    upstream = Upstream.apply(x)
+    region = WeightBackwardRegion('upstream_weight_test', (w,))
+    original = region.defer
+
+    def defer(indices, callback, inputs):
+        def delayed_weight():
+            torch.cuda._sleep(1_000_000_000)
+            result = callback()
+            weight_done.record()
+            return result
+        original(indices, delayed_weight, inputs)
+
+    region.defer = defer
+    with region.anchor():
+        routed = Anchor.apply(prepare_async_input(upstream), [])
+    with region.compute():
+        binding = prepare_weight_backward((w,))
+        out = Linear.apply(routed, binding.parameters[0], binding, [])
+    region.close_forward()
+    out.sum().backward()
+    ((rx * 6) @ rw).sum().backward()
+    torch.cuda.synchronize()
+    torch.testing.assert_close(x.grad, rx.grad)
+    torch.testing.assert_close(w.grad, rw.grad)
+    assert not region.tasks
+    assert observed == [True], 'upstream dInput was serialized behind deferred dWeight'
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason='requires CUDA')
+def test_returned_parameter_gradients_are_ready_on_backward_caller_stream():
+    x = torch.randn(32, 32, device='cuda', requires_grad=True)
+    w = torch.nn.Parameter(torch.randn(32, 32, device='cuda'))
+    output, region = run(x, w, [])
+    original = region.defer
+
+    def defer(indices, callback, inputs):
+        def delayed_weight():
+            torch.cuda._sleep(300_000_000)
+            return callback()
+        original(indices, delayed_weight, inputs)
+
+    region.defer = defer
+    gradient, = torch.autograd.grad(output.sum(), (w,))
+    # This copy must be ordered after W even though it runs on the caller's
+    # stream, and autograd.grad does not execute AccumulateGrad.
+    observed = gradient.clone()
+    expected = (x.detach() * 2).t() @ torch.ones_like(output)
+    torch.testing.assert_close(observed, expected)
+    assert not region.tasks and w.grad is None
+
+
 def test_parameter_updates_with_old_outputs_alive_use_fresh_weights():
     x = torch.randn(8, 4, requires_grad=True)
     w = torch.nn.Parameter(torch.randn(4, 6))
