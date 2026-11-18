@@ -1248,8 +1248,7 @@ class IR:
         """
         buffer = io.BytesIO()
         with IR.no_cell_pickle_context() as context:
-            # the protocol `dill.dumps` would use
-            pickler = dill.Pickler(buffer, dill.settings['protocol'])
+            pickler = dill.Pickler(buffer)
             pickler.dump(obj)
             dumped = 0
             while dumped < len(context.dropped_cells):
@@ -1257,7 +1256,7 @@ class IR:
                 dumped = len(context.dropped_cells)
                 pickler.dump(pairs)
             # mark the end of dropped cells with None
-            # so we can also have two unpickler.load() calls:
+            # so we can always have two unpickler.load() calls:
             # one for the object, one for the dropped cells
             # see `IR.loads`
             pickler.dump(None)
