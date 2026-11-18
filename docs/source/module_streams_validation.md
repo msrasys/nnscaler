@@ -81,8 +81,41 @@ the required zero-initialized accumulation; the installed DeepGEMM K-grouped API
 requires `C`. CPU checks pass (85 framework, 32 backend), as do 118 CUDA-enabled
 framework tests. Real EP2 tests with both changes retain bitwise outputs/parameter
 gradients and the same 0.000854 input-gradient error; workspace reuse occurs in
-both tested backwards on each rank. Full-model performance of these latest
-changes remains pending; they are not yet selected as defaults.
+both tested backwards on each rank.
+
+## Final matched validation of the latest implementation
+
+NNScaler `2c809b38` and llm-train `df090274` use the same workload, strict
+numerical mode, lean observer and steps 60–79 described above:
+
+| Configuration | Training s/step | TFLOPS/GPU | Step-time reduction | Peak driver GiB |
+| --- | ---: | ---: | ---: | ---: |
+| No module overlap | 4.486419 | 534.14 | — | 103.31 |
+| Shared split + expert recomputation + dW workspace reuse | 4.435623 | 540.27 | 1.13% | 151.15 |
+| Shared split + expert/attention recomputation | 4.401036 | 544.51 | **1.90%** | **150.06** |
+| Both recomputations + dW workspace reuse | 4.401540 | 544.45 | 1.89% | 166.56 |
+| Independent shared backward anchor + dW | 4.449367 | 538.59 | 0.83% | 152.42 |
+| Independent anchor + both recomputations + dW | 4.419406 | 542.25 | 1.49% | 167.82 |
+
+All six ranks match initialization, selected full-input checkpoints and per-step
+work. The overlap variants' 80-step loss, gradient norm and auxiliary losses
+match each other. The attention-only and combined step-time difference is just
+0.504 ms, with a paired-step SEM of 2.374 ms; the combined configuration costs
+16.5 GiB more sampled driver memory. The llm-train 15B PP3/EP2 preset therefore
+selects attention recomputation, retaining dW and independent backward placement
+as optional features. An external dW-only 128-SM probe passed correctness but
+measured 4.439568 s/step, without further gain; it was not integrated.
+
+The final combined trace has 389.08 ms/GPU of dispatch+combine, 178.41 ms with
+concurrent computation, and **210.67 ms still exposed**. Backward combine alone
+is 103.35 ms with only **0.15 ms exposed**. Relative to attention recomputation,
+the remaining backward-combine exposure disappears, but forward/backward
+dispatch exposure increases; total exposure is essentially unchanged. All GEMM
+signature counts still match the control, each dW callback publishes once, and
+no recomputation overlaps forward DeepEP in these captures. Workspace reuse
+occurs in 636 of 864 callbacks (73.6%); smaller buffers use the normal allocation.
+These are interval diagnostics from separate profiled steps, not sums of
+independent wall-time costs. The full-communication-hiding target remains unmet.
 
 ## Workload and measurement
 
