@@ -108,3 +108,26 @@ def test_abandoned_forward_prefetch_reclaims_budget_after_cuda_completion(keep_p
     budget.poll(wait=True)
     drain_stream_holds(wait=True)
     assert budget.used == 0
+
+
+def test_adopted_budget_waits_for_backward_gpu_completion():
+    x = torch.randn(1024, device='cuda', requires_grad=True)
+    budget = Budget(16 << 20)
+    point = Prefetch('consumer_lifetime', budget)
+    y = checkpoint(lambda v: v.sin().square(), x, use_reentrant=False,
+                   context_fn=lambda: point.contexts((x,)))
+    assert point.prefetch()
+    point.finish_forward()
+
+    def delayed_consumer(grad):
+        torch.cuda._sleep(800_000_000)
+        return grad
+
+    x.register_hook(delayed_consumer)
+    y.sum().backward()
+    budget.poll()
+    assert budget.used > 0, 'GraphTask completion alone released in-flight GPU storage'
+    torch.cuda.synchronize()
+    budget.poll()
+    drain_stream_holds(wait=True)
+    assert budget.used == 0
