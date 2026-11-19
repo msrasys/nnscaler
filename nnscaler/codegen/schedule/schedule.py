@@ -268,11 +268,12 @@ class ScheduleCodeGen(FuncEmission):
                 def _adapter_syncs_with_weight(adapter: IRCell, weight_node: IRCell) -> bool:
                     """Whether moving `adapter` ahead of `weight_node` would drop an explicit dependency.
 
-                    `wait_streams` is not such a dependency: the adapter only needs the I outputs,
-                    and waiting on the stream before W is the same ordering as in single-stream code.
-                    Only events express a W-to-adapter dependency: the adapter waits on an event W
-                    records, or the adapter records an event on W's stream so a later waiter of that
-                    event would no longer cover W.
+                    A plain `wait_streams` is not such a dependency: the adapter only needs the I
+                    outputs, and waiting on the stream before W is the same ordering as in
+                    single-stream code. Only events carry a W-to-adapter dependency: the adapter
+                    waits on an event W records, or the adapter records an event after W's work
+                    (same stream as W, or waiting on W's stream), so a later waiter of that event
+                    would no longer cover W.
                     """
                     actx = self._get_node_stream_context(execplan, adapter)
                     wctx = self._get_node_stream_context(execplan, weight_node)
@@ -281,8 +282,10 @@ class ScheduleCodeGen(FuncEmission):
                     if actx.wait_events and wctx and wctx.record_events:
                         if set(actx.wait_events) & set(wctx.record_events):
                             return True
-                    if actx.record_events and actx.stream == (wctx.stream if wctx else None):
-                        return True
+                    if actx.record_events:
+                        wstream = wctx.stream if wctx else None
+                        if actx.stream == wstream or wstream in (actx.wait_streams or ()):
+                            return True
                     return False
 
                 def _flush_pending_weight():

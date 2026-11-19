@@ -598,6 +598,10 @@ class SchedulePlan(PlanBase):
             if not isinstance(block.content, IRSegment):
                 continue
             if block.content.isfw():
+                # A stage without grad-requiring ops has no backward segment
+                # (see `IRGraph.group`); it is forward-only and has nothing to pair.
+                if block.content.mirror is None:
+                    continue
                 key = (block.mid, block.content)
             else:
                 key = (block.mid, block.content.mirror)

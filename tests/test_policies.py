@@ -940,6 +940,64 @@ def sched_explicit_fbw_with_weight_events(
     return schedule
 
 
+def sched_explicit_fbw_with_recording_adapters(
+    graph: IRGraph,
+    num_microbatches: int,
+    num_stages: int,
+) -> SchedulePlan:
+    """W runs on `comp`; result broadcast adapters wait `comp` and record `done`.
+
+    The adapter itself does not need W, but its recorded event covers W through
+    the stream wait, so a later waiter of `done` relies on W being finished.
+    """
+    schedule = _build_explicit_fbw(
+        graph,
+        num_microbatches,
+        num_stages,
+        weight_stream_context=StreamContext(stream='comp'),
+    )
+    schedule.stream_config = StreamConfig(
+        result_broadcast=StreamContext(stream='comm', wait_streams=['comp'], record_events=['done']),
+    )
+    schedule.finish()
+    return schedule
+
+
+def forward_only_first_stage_policy(graph, cfg):
+    """Stage 0 holds only the parameter-free ops before the first FFN.
+
+    Its input does not require grad, so staging creates no backward segment for it.
+    """
+    from nnscaler.policies import OpPlan, get_layer_index
+    seen_ffn = False
+    for node in get_pas_ops(graph):
+        if FFNDropout in node.module_class_chain:
+            seen_ffn = True
+            yield OpPlan(node, stage_id=1 + get_layer_index(node.fqn))
+        else:
+            yield OpPlan(node, stage_id=2 if seen_ffn else 0)
+
+
+def sched_fb_skip_forward_only(graph: IRGraph, num_microbatches: int, num_stages: int) -> SchedulePlan:
+    """Sequential F then B schedule that runs only F for segments without a backward."""
+    forward_segments = [
+        segment
+        for segment in graph.select(ntype=IRSegment, flatten=False)
+        if segment.isfw()
+    ]
+    schedule = SchedulePlan(graph, num_microbatches)
+    for mid in range(num_microbatches):
+        for stage, segment in enumerate(forward_segments):
+            schedule.add_segment(segment, mid, mid + stage)
+    backward_start = num_microbatches + num_stages - 1
+    for mid in range(num_microbatches):
+        for stage, segment in enumerate(reversed(forward_segments)):
+            if segment.mirror is not None:
+                schedule.add_segment(segment.mirror, mid, backward_start + mid + stage)
+    schedule.finish()
+    return schedule
+
+
 def sched_1f1b_multi_stream(graph: IRGraph, num_microbatches: int, num_stages: int) -> SchedulePlan:
     if num_microbatches <= 0:
         raise ValueError(f"expected num_microbatches > 0, but got {num_microbatches} ")
@@ -1168,6 +1226,59 @@ def test_codegen_keeps_event_adapters_after_weight(tmp_path):
         waits = [m.start() for m in re.finditer(r"get_event\('w_done'\)\.wait\(\)", train_step)]
         assert len(records) == 2 and len(waits) == 2
         assert min(waits) > max(records)
+
+
+@replace_all_device_with('cpu')
+def test_codegen_keeps_recording_adapters_after_weight(tmp_path):
+    # An adapter that waits on W's stream and records an event carries W to
+    # later waiters of that event, so it must not be hoisted ahead of W.
+    parallelize(
+        FnPolicyModuleList(),
+        {'x': torch.randn(4, 4)},
+        megatron_ffn_policy_list,
+        ComputeConfig(4, 8, use_end2end=True, use_async_comm=True, pas_config={
+            'pipeline_nmicros': 2,
+            'pipeline_size': 2,
+            'pipeline_scheduler': sched_explicit_fbw_with_recording_adapters,
+        }),
+        gen_savedir=tmp_path,
+        load_module=False,
+    )
+    for rank in range(8):
+        train_step, = _gencode_contains(
+            tmp_path,
+            FnPolicyModuleList,
+            rank,
+            r'def _train_step\([^)]*\):\n([\s\S]*?)\ndef _infer_step',
+        )
+        records = [m.start() for m in re.finditer(r"get_event\('done'\)\.record\(\)", train_step)]
+        weights = [m.start() for m in re.finditer(r'executor\.backward_weight\(', train_step)]
+        assert len(records) == 2 and len(weights) == 2
+        assert min(records) > max(weights)
+
+
+@replace_all_device_with('cpu')
+def test_codegen_allows_forward_only_stage(tmp_path):
+    # A training plan may contain a stage without a backward segment; the
+    # pairing and FIFO checks must skip it instead of rejecting the plan.
+    parallelize(
+        FnPolicyModuleList(),
+        {'x': torch.randn(4, 4)},
+        forward_only_first_stage_policy,
+        ComputeConfig(3, 3, use_end2end=True, pas_config={
+            'pipeline_nmicros': 2,
+            'pipeline_size': 3,
+            'pipeline_scheduler': sched_fb_skip_forward_only,
+        }),
+        gen_savedir=tmp_path,
+        load_module=False,
+    )
+    assert len(_gencode_contains(
+        tmp_path, FnPolicyModuleList, 0, r'nnscaler\.runtime\.executor\.fexecute\(',
+    )) == 2
+    assert len(_gencode_contains(
+        tmp_path, FnPolicyModuleList, 0, r'nnscaler\.runtime\.executor\.backward\(',
+    )) == 0
 
 
 @replace_all_device_with('cpu')
