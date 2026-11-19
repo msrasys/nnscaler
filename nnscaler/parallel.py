@@ -38,7 +38,7 @@ from nnscaler.graph.function.wrapnn import convert_to_wrapnn, wrapnn
 from nnscaler.graph.gener.gen import IRAdapterGener
 from nnscaler.graph.parser import FxModuleParser
 from nnscaler.graph.schedule.predefined import PredefinedSched
-from nnscaler.graph.schedule.schedplan import SchedulePlan
+from nnscaler.graph.schedule.schedplan import ScheduleAction, SchedulePlan
 
 from nnscaler.ir.cten import IRObject, IRTensor, IR
 from nnscaler.ir.operator import IRBpOperation, IRDataOperation
@@ -88,6 +88,17 @@ _PREDEFINE_SCHED_NAME_PREFIX = 'sched_'
 for k, v in PredefinedSched.__dict__.items():
     if isinstance(v, staticmethod) and k.startswith(_PREDEFINE_SCHED_NAME_PREFIX):
         _PREDEFINE_SCHEDS[k[len(_PREDEFINE_SCHED_NAME_PREFIX):]] = getattr(PredefinedSched, k)  # be compatible with python 3.8
+
+# ZeRO-3 gathers a parameter with backward hooks on the activations right before the op's backward
+# and evicts it again as soon as the input gradient of that op has been produced.
+# Both hooks fire while the input backward runs, so a deferred weight backward
+# only sees the local shard of the parameter and cannot accumulate the full dW.
+# Reject every FBW form (the use_fbw flag and explicit I/W schedule actions) until
+# the weight backward can re-gather parameters by itself.
+_ZERO3_FBW_UNSUPPORTED = (
+    "FBW schedules (use_fbw or explicit input/weight backward actions) "
+    "are not supported with ZeRO-3: parameters are evicted during the input backward."
+)
 
 _PREDEFINED_POLICIES: Dict[str, Callable[[IRGraph, 'ComputeConfig'], IRGraph]] = {}
 _PREDEFINED_POLICIES_NAME_PREFIX = 'pas_'
@@ -158,7 +169,8 @@ class ComputeConfig:
     # whether to use FBW schedules or FB schedules. Default is False (FB schedules).
     # only effective when `use_end2end` is True and `inference_only` is False.
     # Only useful for pipeline training with multi-stream scheduling or `use_async_common` is True.
-    # This flag is not necessary when you explicitly use FBW-aware schedulers(e.g. zero_bubble)
+    # This flag is not necessary when you explicitly use FBW-aware schedulers (e.g. zero_bubble).
+    # Not supported together with ZeRO-3.
     use_fbw: bool = False
     # whether to use async communication for cross-stage collective operations.
     # This option only works for pipeline.
@@ -290,6 +302,8 @@ class ComputeConfig:
                 raise ValueError("use_fbw is only supported in end2end mode.")
             if self.inference_only:
                 raise ValueError("use_fbw is not supported in inference mode.")
+            if self.use_zero > 1:
+                raise ValueError(_ZERO3_FBW_UNSUPPORTED)
 
     def apply_pipeline_scheduler(
             self,
@@ -336,13 +350,21 @@ class ComputeConfig:
             pipeline_nmicros = pipeline_nmicros[0]
 
         if isinstance(pipeline_nmicros, int):
-            graph.bind_schedule(sched(graph, pipeline_nmicros, pipeline_nstages))
+            scheds = sched(graph, pipeline_nmicros, pipeline_nstages)
+            plans = [scheds]
         else:
             scheds = {}
             for num_micro in pipeline_nmicros:
                 scheds[num_micro] = sched(graph, num_micro, pipeline_nstages)
-            graph.bind_schedule(scheds)
+            plans = list(scheds.values())
 
+        if self.use_zero > 1:
+            split_actions = (ScheduleAction.BACKWARD_INPUT, ScheduleAction.BACKWARD_WEIGHT)
+            for plan in plans:
+                if any(block.action in split_actions for block in plan.all_blocks()):
+                    raise ValueError(_ZERO3_FBW_UNSUPPORTED)
+
+        graph.bind_schedule(scheds)
         return graph.sched
 
     @property

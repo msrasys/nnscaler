@@ -261,10 +261,9 @@ class ScheduleCodeGen(FuncEmission):
                 pending_weight_codes = []
                 pending_weight_release_codes = []
 
-                # W/adapter order is not supported with ZeRO-3
-                # when backward_weight computation is happening,
-                # the parameters have already been evicted, which leads to incorrect gradient computation if the adapter is placed after the weight.
-                allow_adapter_before_weight = CompileFlag.use_zero <= 1 and CompileFlag.async_comm
+                # Adapters are moved ahead of a pending W only for asynchronous communication,
+                # where the issued transfer can overlap the weight backward.
+                allow_adapter_before_weight = CompileFlag.async_comm
 
                 def _flush_pending_weight():
                     nonlocal pending_weight_node
