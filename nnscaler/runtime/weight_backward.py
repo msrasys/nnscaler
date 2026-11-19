@@ -91,6 +91,20 @@ class WeightBackwardBinding:
         """Callback returns one gradient (or None) per bound parameter."""
         self.region.defer(self.indices, callback, inputs)
 
+    def accumulate(self, callback, inputs):
+        """Add gradients into supplied buffers when the region supports it.
+
+        ``callback(outputs)`` returns one gradient per bound parameter. With
+        an accumulator, each bound output must be updated additively and
+        returned unchanged. Ordinary deferred regions pass ``None`` instead,
+        retaining their existing allocation and launch behavior.
+        """
+        accumulate = getattr(self.region, 'accumulate', None)
+        if accumulate is None:
+            self.defer(lambda: callback(None), inputs)
+        else:
+            accumulate(self.indices, callback, inputs)
+
 
 class WeightBackwardRegion:
     def __init__(self, name, parameters, *, independent=False):

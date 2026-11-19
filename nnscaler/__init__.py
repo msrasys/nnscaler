@@ -23,6 +23,7 @@ from .parallel import (
 from nnscaler.graph.parser.register import register_op
 from nnscaler.graph.schedule.module_streams import ModuleStreamRule
 from nnscaler.runtime.weight_backward import prepare_weight_backward
+from nnscaler.runtime.weight_accumulator import WeightGradientAccumulator
 from nnscaler.runtime.deferred import (
     notify_async_launch, capture_async_backward, prepare_async_input, native_async_launch_pending,
 )

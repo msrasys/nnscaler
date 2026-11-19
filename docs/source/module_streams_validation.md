@@ -268,3 +268,17 @@ The focused CPU suites pass 79 tests. Two CUDA validations run a two-rank,
 four-stage interleaved pipeline with four microbatches and three optimizer steps.
 Loss, all local parameter gradients, and updated weights match eager execution.
 One validation has an internal-stream operator only on the first stage.
+
+### Fragment weight-gradient accumulation (2026-11-19)
+
+`WeightGradientAccumulator` provides one additive output buffer per parameter
+and GraphTask. Focused CPU regressions cover repeated/retained backward, pruned
+parameter edges, live forwards, legacy callbacks, reducer contribution counts,
+frozen backend inputs, and failures without partial gradient publication.
+Four CUDA tests validate FP32 gradients for FP32/BF16 parameters, checkpoint
+replay, distinct producer streams, and dInput advancing before long dWeight
+work completes. The corresponding BF16/MXFP8 MoE backend tests also pass with
+and without checkpointing and with weight-gradient clipping enabled.
+
+These establish the generic runtime and backend contracts. Full training gains
+for a model using fragment accumulation still require matched end-to-end runs.

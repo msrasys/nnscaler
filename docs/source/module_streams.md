@@ -84,6 +84,41 @@ module selection. The generated-code ABI is 21.
 
 ## Local input/weight backward overlap
 
+`WeightGradientAccumulator` combines multiple cooperative backward contributions
+into one gradient buffer per parameter and autograd GraphTask:
+
+```python
+from nnscaler import WeightGradientAccumulator
+
+with WeightGradientAccumulator('expert_weights', (w13, w2)):
+    first = cooperative_backend(first_input, w13, w2)
+    second = cooperative_backend(second_input, w13, w2)
+```
+
+The backend binds parameters using `prepare_weight_backward` before its autograd
+`Function.apply`. From backward it can call
+`binding.accumulate(callback, inputs)`. The callback receives a tuple of output
+buffers, adds its dW contribution in place, and returns those same buffers.
+Their shapes and gradient dtypes come from the original parameters; configure
+FP32 `grad_dtype` before forward when the backend produces FP32 gradients for
+BF16 parameters. Unbound/frozen parameters receive `None` in that tuple.
+
+For compatibility with ordinary `WeightBackwardRegion` scheduling, callbacks
+must also accept `None` instead of the output tuple, allocate their usual
+gradients, and return them. Existing `binding.defer` callbacks work with an
+accumulator as well, using an additional copy into its buffers.
+
+Each contribution runs on the named weight stream after its input-readiness
+event. Unlike `weight_backward_on`, this accumulator launches ready work
+immediately and does not have a communication anchor. The input gradient remains
+on the ordinary autograd path. Parameter/reducer edges publish only after all
+contributions have registered, with one publication per GraphTask. Buffers belong
+to one forward invocation; retained backwards get fresh buffers, and pruned
+parameter edges discard their temporary results. No cross-microbatch queue is
+used. Higher-order gradients, CUDA graph capture, and concurrent backwards of
+one invocation are unsupported. Backend saved-tensor and stream-ordering
+responsibilities still apply.
+
 Forward splitting and backward readiness can be selected independently:
 
 ```python
