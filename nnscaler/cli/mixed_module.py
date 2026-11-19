@@ -349,8 +349,11 @@ def mixin_module(model: Union[torch.nn.Module, MixinModule], optimizer: torch.op
     user_train_step = getattr(model, 'train_step', None)
 
     def custom_train_step(self, samples, is_dummy_batch=None):
-        # Every micro-batch, dummy ones included, runs a backward in a custom
-        # step, so the reducers expect one contribution per sample.
+        # Contract: custom steps must produce the expected backward contributions
+        # for every micro-batch, including zero-gradient dummy micro-batches.
+        # TODO: Allow explicit per-reducer accumulation counts for custom steps
+        # that skip dummy batches or combine multiple samples into one backward.
+        # With async reducers, fewer contributions leave synchronization unstarted.
         set_grad_accumulation_steps(model, len(samples))
         # A wrapper driving a nested end2end submodule may never run the root
         # forward, so the forward hook that arms ``optimizer.sync_shard_grad()``

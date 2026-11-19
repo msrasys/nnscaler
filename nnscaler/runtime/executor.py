@@ -173,6 +173,10 @@ class Executor:
         # An input passed several times maps to one detached tensor whose grad
         # is already the sum over all uses; dict() collapses the repeats so the
         # gradient is copied once.  Accumulate across segments like retain_grad.
+        # TODO: Preserve the caller-to-resolved input mapping when an async
+        # communication callback returns a different Tensor. This write-back
+        # currently requires matching Tensor identities across forward/backward;
+        # shape-changing callbacks also need an explicit gradient layout mapping.
         for tid, dtensor in dict(saved_pairs).items():
             tensor = retained_inputs.get(tid)
             if tensor is not None:
