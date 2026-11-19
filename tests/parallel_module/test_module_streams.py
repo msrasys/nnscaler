@@ -832,3 +832,179 @@ def test_explicit_launch_point_can_delay_an_early_independent_module(tmp_path, m
     torch.testing.assert_close(x.grad, ref_x.grad)
     for name, parameter in generated.named_parameters():
         torch.testing.assert_close(parameter.grad, reference.get_parameter(generated.fullmap[name].orig_name).grad)
+
+
+@register_op('a b -> a b')
+def auxiliary_statistics(x):
+    return x.square()
+
+
+class OperatorBranchBlock(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.router = torch.nn.Linear(8, 8)
+
+    def forward(self, x):
+        route = self.router(x)
+        y = combine_anchor(torch.tanh(dispatch_anchor(route)))
+        return y + auxiliary_statistics(route)
+
+
+class RepeatedOperatorBranch(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.block = OperatorBranchBlock()
+
+    def forward(self, x):
+        return self.block(self.block(x))
+
+
+OPERATOR_RULE = ModuleStreamRule(
+    'block', operators='*.auxiliary_statistics', launch_before='*.dispatch_anchor',
+    overlap_backward=True, backward_on='*.combine_anchor')
+
+
+def test_operator_selector_normalizes_and_invalidates_cache():
+    assert OPERATOR_RULE.operators == ('*.auxiliary_statistics',)
+    assert replace(OPERATOR_RULE, operators=['*.auxiliary_statistics']) == OPERATOR_RULE
+    current = ComputeConfig(1, 1, module_streams=(OPERATOR_RULE,))
+    whole = ComputeConfig(1, 1, module_streams=(replace(OPERATOR_RULE, operators=None),))
+    assert current.graph_config == whole.graph_config
+    assert not ComputeConfig.safe_equals(current, whole)
+    assert ComputeConfig(1, 1, module_streams=(asdict(OPERATOR_RULE),)) == current
+
+
+@pytest.mark.parametrize('options', [
+    dict(operators=[]), dict(operators=''), dict(operators=['']), dict(operators=[1]),
+    dict(operators=1), dict(operators=('*.x',), recompute_only=True),
+    dict(operators=('*.x',), weight_backward_on='*.anchor'),
+    dict(operators=('*.x',), split_before='child', resume_before='*.anchor'),
+])
+def test_operator_selector_rejects_invalid_combinations(options):
+    with pytest.raises(ValueError):
+        ModuleStreamRule('block', **options)
+
+
+@replace_all_device_with('cpu', force=True)
+@pytest.mark.parametrize('workers', [1, 2])
+def test_operator_selector_scopes_repeated_invocations(tmp_path, monkeypatch, workers):
+    monkeypatch.setattr('nnscaler.runtime.stream.ModuleStreams', CPUDeferredStreams)
+    model = RepeatedOperatorBranch()
+    reference = copy.deepcopy(model)
+    instance = f'operator_selection_{workers}'
+    parallelize(model, {'x': torch.randn(4, 8)}, 'dp',
+                ComputeConfig(1, 1, module_streams=(OPERATOR_RULE,)),
+                gen_savedir=tmp_path, instance_name=instance, load_module=False, codegen_workers=workers)
+    code = next(tmp_path.rglob('gencode0.py')).read_text()
+    # Each call moves only its own auxiliary op, after its producer and before
+    # its own dispatch. Parent-scope resolution would see two ambiguous anchors.
+    for region in range(2):
+        fork = code.index(f".fork('module_stream_{region}'")
+        assert code.rfind('torch.nn.functional.linear(', 0, fork) >= 0
+        assert fork < code.index('auxiliary_statistics(', fork) < code.index('dispatch_anchor(', fork)
+    cls = _load_parallel_module_class(RepeatedOperatorBranch, gen_savedir=tmp_path,
+                                      instance_name=instance, rank=0)
+    generated = new_empty(cls, device='cpu', init_params=True)
+    x = torch.randn(4, 8, requires_grad=True)
+    ref_x = x.detach().clone().requires_grad_()
+    actual, expected = generated(x), reference(ref_x)
+    actual.sum().backward()
+    expected.sum().backward()
+    torch.testing.assert_close(actual, expected)
+    torch.testing.assert_close(x.grad, ref_x.grad)
+    for name, parameter in generated.named_parameters():
+        torch.testing.assert_close(parameter.grad, reference.get_parameter(generated.fullmap[name].orig_name).grad)
+
+
+@replace_all_device_with('cpu', force=True)
+@pytest.mark.parametrize('failure', ['dependency', 'checkpoint'])
+def test_operator_selection_retains_dependency_and_checkpoint_checks(tmp_path, failure):
+    from nnscaler.policies import pas_dp
+    def checkpoint_block(graph, config):
+        graph.recompute([node for node in graph.nodes() if 'block' in (node.module_stack or {})])
+        return pas_dp(graph, config)
+    rule = (replace(OPERATOR_RULE, operators='torch.tanh') if failure == 'dependency'
+            else replace(OPERATOR_RULE, backward_on=None))
+    with pytest.raises(RuntimeError, match='Code generation failed') as error:
+        parallelize(RepeatedOperatorBranch(), {'x': torch.randn(4, 8)},
+                    'dp' if failure == 'dependency' else checkpoint_block,
+                    ComputeConfig(1, 1, module_streams=(rule,)),
+                    gen_savedir=tmp_path, load_module=False)
+    message = 'violates dependency' if failure == 'dependency' else 'crosses a recompute region'
+    assert message in str(error.value.__cause__)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason='requires CUDA')
+def test_operator_selector_cuda_repeated_invocations(tmp_path):
+    import torch.distributed as dist
+    import nnscaler
+    dist.init_process_group('nccl', init_method=f'file://{tmp_path}/process_group', rank=0, world_size=1)
+    try:
+        nnscaler.init()
+        model = RepeatedOperatorBranch().cuda()
+        reference = copy.deepcopy(model)
+        generated = parallelize(model, {'x': torch.randn(4, 8, device='cuda')}, 'dp',
+                                ComputeConfig(1, 1, module_streams=(OPERATOR_RULE,)),
+                                gen_savedir=tmp_path, instance_name='cuda_operator_selection')
+        # Multiple live forwards must retain separate invocation controls.
+        inputs = [torch.randn(4, 8, device='cuda', requires_grad=True) for _ in range(2)]
+        refs = [x.detach().clone().requires_grad_() for x in inputs]
+        actual = [generated(x) for x in inputs]
+        expected = [reference(x) for x in refs]
+        for result, ref in zip(actual, expected):
+            torch.testing.assert_close(result, ref)
+            result.square().sum().backward()
+            ref.square().sum().backward()
+        generated.sync_grad()
+        for x, ref in zip(inputs, refs):
+            torch.testing.assert_close(x.grad, ref.grad)
+        for name, parameter in generated.named_parameters():
+            torch.testing.assert_close(parameter.grad, reference.get_parameter(generated.fullmap[name].orig_name).grad)
+    finally:
+        nnscaler.uninit()
+        if dist.is_initialized():
+            dist.destroy_process_group()
+
+
+@register_op('a b, a b -> a b')
+def masked_auxiliary_statistics(x, mask):
+    return x.square() * mask
+
+
+class ContainerOperatorBlock(OperatorBranchBlock):
+    def forward(self, x, metadata):
+        route = self.router(x)
+        y = combine_anchor(torch.tanh(dispatch_anchor(route)))
+        return y + masked_auxiliary_statistics(route, metadata['mask'])
+
+
+class ContainerOperatorBranch(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.block = ContainerOperatorBlock()
+
+    def forward(self, x, mask):
+        return self.block(x, dict(mask=mask))
+
+
+@replace_all_device_with('cpu', force=True)
+def test_operator_selector_includes_builtin_metadata_reads(tmp_path, monkeypatch):
+    monkeypatch.setattr('nnscaler.runtime.stream.ModuleStreams', CPUDeferredStreams)
+    model = ContainerOperatorBranch()
+    reference = copy.deepcopy(model)
+    x = torch.randn(4, 8, requires_grad=True)
+    mask = torch.randint(0, 2, (4, 8))
+    rule = replace(OPERATOR_RULE, operators='*.masked_auxiliary_statistics')
+    parallelize(model, {'x': x.detach(), 'mask': mask}, 'dp',
+                ComputeConfig(1, 1, module_streams=(rule,)),
+                gen_savedir=tmp_path, load_module=False)
+    cls = _load_parallel_module_class(ContainerOperatorBranch, gen_savedir=tmp_path, rank=0)
+    generated = new_empty(cls, device='cpu', init_params=True)
+    ref_x = x.detach().clone().requires_grad_()
+    actual, expected = generated(x, mask), reference(ref_x, mask)
+    actual.sum().backward()
+    expected.sum().backward()
+    torch.testing.assert_close(actual, expected)
+    torch.testing.assert_close(x.grad, ref_x.grad)
+    for name, parameter in generated.named_parameters():
+        torch.testing.assert_close(parameter.grad, reference.get_parameter(generated.fullmap[name].orig_name).grad)

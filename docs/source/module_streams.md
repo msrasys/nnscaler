@@ -38,6 +38,29 @@ selected module; the suffix starts before `resume_before`. Omit both split field
 to launch the whole branch. Without a launch anchor, a branch stays in its
 original position and can overlap subsequent independent modules.
 
+Use `operators` to select a pure operator branch inside a module without
+wrapping it in another model module:
+
+```python
+ModuleStreamRule(
+    module='*.layers.*', operators=['*.auxiliary_statistics'],
+    stream='auxiliary', launch_before='*.dispatch',
+    overlap_backward=True, backward_on='*.combine',
+)
+```
+
+The optional selector accepts one signature glob or a nonempty list of globs.
+Only matching operators and their exclusively used local layout adapters and
+constant-key reads from builtin metadata containers move.
+Anchors are resolved **inside the selected module invocation**, so separate
+layers and repeated calls keep separate launch points. Inputs must be available
+at the launch point; a matching operator cannot move ahead of its producers,
+cross mutations, or split a checkpoint. Selection does not infer a dependency
+closure of other compute operators. `operators` cannot be combined with module
+splitting, `recompute_only`, or `weight_backward_on`; those rules continue to
+select whole module regions. Custom operators must be pure, just as for whole
+module selection. The generated-code ABI is 21.
+
 ## Local input/weight backward overlap
 
 Forward splitting and backward readiness can be selected independently:

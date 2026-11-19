@@ -241,3 +241,17 @@ No additional performance gain is established: the existing staged schedule was
 caller-stream tail prototype was 43.252 ms. Adding caller-stream expert replay
 also did not improve that block comparison. These variants remain opt-in and
 are not recommended presets or evidence of complete communication hiding.
+
+### Operator selection (2026-11-19)
+
+`operators` selects a pure branch within a module invocation. Tests cover
+repeated invocations, one/two code-generation workers, builtin metadata reads,
+dependency/checkpoint rejection, cache invalidation, and multiple live CUDA
+forwards. Focused suites pass 65 CPU tests and 13 CUDA tests.
+
+The real 15B EP2 block preserves its output, auxiliary statistics, input gradient,
+and all parameter gradients bitwise after moving MoE auxiliary statistics.
+That placement did not improve performance: 43.87 ms on a separate stream and
+43.96 ms on the attention replay stream, versus 43.25 ms for the existing
+schedule and 44.22 ms without overlap. This is a validated selection feature,
+not a recommended performance preset or an end-to-end gain claim.

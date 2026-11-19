@@ -48,11 +48,20 @@ class ModuleStreamRule:
     weight_backward_independent: bool = False
     backward_on: str | None = None
     recompute_prefetch_release: str | None = None
+    operators: str | tuple[str, ...] | None = None
     # Persist the generated-code ABI, including in pickled configurations.
     # A default factory leaves old pickles detectably missing the field.
-    _codegen_version: int = field(default_factory=lambda: 20, init=False, repr=False)
+    _codegen_version: int = field(default_factory=lambda: 21, init=False, repr=False)
 
     def __post_init__(self):
+        if self.operators is not None:
+            patterns = (self.operators,) if isinstance(self.operators, str) else self.operators
+            if (not isinstance(patterns, (tuple, list)) or not patterns
+                    or any(not isinstance(p, str) or not p for p in patterns)):
+                raise ValueError('operators requires nonempty operator signature patterns')
+            object.__setattr__(self, 'operators', tuple(patterns))
+            if self.recompute_only or self.weight_backward_on or self.split_before:
+                raise ValueError('Operator selection cannot split modules or select recompute/weight backward regions')
         if self.recompute_prefetch_release is not None:
             if (not isinstance(self.recompute_prefetch_release, str)
                     or self.recompute_prefetch_release not in ('submitted', 'before_operator')):
@@ -209,11 +218,29 @@ def _local_adapter(node):
     ) for prim in node.prims)
 
 
+def _local_container_read(node):
+    """A constant-key projection from traced builtin metadata, without kernels.
+
+    Only exclusively used reads join an operator branch. The usual mutation
+    barriers still apply; custom containers/keys and tensor indexing are not
+    inferred as movable dependencies.
+    """
+    if node.signature != '_operator.getitem' or len(node.inputs()) != 2:
+        return False
+    container, key = node.inputs()
+    if not isinstance(container, IRObject) or not container.is_constant:
+        return False
+    value = container.value
+    return ((type(value) is dict and type(key) in (str, int))
+            or (type(value) in (list, tuple) and type(key) is int))
+
+
 def plan_module_streams(nodes, outputs, rules):
     """Return reordered nodes, side regions and consumer joins; never mutate IR.
 
     A launch anchor is an operator signature glob in the selected module's
-    enclosing invocation. ``split_before`` is a relative child-module glob.
+    enclosing invocation, or in the selected invocation itself when filtering
+    by ``operators``. ``split_before`` is a relative child-module glob.
     Known mutations/random operators and invalid data dependencies fail closed.
     The caller explicitly opts in to reordering pure custom operators.
     """
@@ -235,6 +262,9 @@ def plan_module_streams(nodes, outputs, rules):
         invocations = defaultdict(list)
         scopes = {}
         for node in nodes:
+            if rule.operators is not None and not any(fnmatchcase(node.signature, pattern)
+                                                     for pattern in rule.operators):
+                continue
             stack = list((node.module_stack or {}).keys())
             matches = [path for path in stack if fnmatchcase(path, rule.module)]
             if not matches:
@@ -243,7 +273,11 @@ def plan_module_streams(nodes, outputs, rules):
             calls = node.module_call_stack or {}
             key = (path, calls.get(path))
             invocations[key].append(node)
-            parent = stack[stack.index(path) - 1] if stack.index(path) else ''
+            # Operator branches have no dedicated child module. Their anchor
+            # belongs to this invocation, not to an enclosing loop containing
+            # other invocations with the same operator signatures.
+            parent = path if rule.operators is not None else (stack[stack.index(path) - 1]
+                                                            if stack.index(path) else '')
             scopes[key] = (parent, calls.get(parent))
 
         for invocation, branch in invocations.items():
@@ -263,7 +297,8 @@ def plan_module_streams(nodes, outputs, rules):
                 for node in nodes:
                     if node in branch_set or node in selected:
                         continue
-                    if not (_local_adapter(node) or node.name == 'multiref'):
+                    if not (_local_adapter(node) or node.name == 'multiref'
+                            or (rule.operators is not None and _local_container_read(node))):
                         continue
                     users = {c for obj in node.oobjs() for c in consumers[obj]}
                     if users and users <= branch_set and not any(obj in graph_outputs for obj in node.oobjs()):
