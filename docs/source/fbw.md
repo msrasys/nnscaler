@@ -18,7 +18,9 @@ A conventional autograd traversal computes two kinds of gradients together:
 
 One microbatch therefore changes from `F -> backward` to `F -> B -> W`. The scheduler prioritizes B and places W into a later gap. This changes execution order, but it must not change final parameter gradients, reducer behavior, or optimizer state.
 
-Enable the default FBW implementation through `ComputeConfig`:
+There are two ways to obtain B/W pairs. Both are supported only for end-to-end training, not inference, and neither is supported with ZeRO-3 (see Section 5.5).
+
+**`use_fbw=True`** keeps the pipeline schedule unchanged and splits every full backward action at code generation time:
 
 ```python
 from nnscaler.parallel import ComputeConfig
@@ -31,7 +33,13 @@ compute_config = ComputeConfig(
 )
 ```
 
-FBW is supported only for end-to-end training, not inference. The pipeline scheduler determines the actual order, and the matching W is not necessarily called immediately after a B.
+The generated code calls `backward_input` and then `backward_weight` for the same microbatch. W stays next to its B; only the communication adapters that follow the backward may be emitted between them (see below).
+
+**Explicit schedule actions** let a scheduler decide where W runs. A `SchedulePlan` block added with `action=ScheduleAction.BACKWARD_INPUT` or `action=ScheduleAction.BACKWARD_WEIGHT` is emitted as `backward_input` or `backward_weight` regardless of `use_fbw`. In schedule actions and printouts, this document's B is called `BACKWARD_INPUT` (`I`), W is `BACKWARD_WEIGHT` (`W`), and an unsplit backward is `BACKWARD` (`B`). The predefined `zero_bubble` scheduler is built this way and uses ready W actions to fill pipeline bubbles.
+
+The two ways can be combined. A plan may mix unsplit backward actions with B/W actions, for example to split only some microbatches, and `use_fbw=True` then additionally splits the remaining unsplit backward actions. The executor pairs B and W through per-segment FIFOs, so a plan must keep each segment's W order equal to its B order, and its backward order equal to its forward order. `SchedulePlan.finish()` rejects plans that violate this; with `use_fbw=True`, every unsplit backward action counts as a B followed by a W in that check.
+
+Communication adapters are not part of the schedule description and cannot be placed by a scheduler. The system puts each adapter in the step of the block that produces its data (a B or unsplit backward action, never W) and puts output-broadcast adapters at the end. With `use_async_comm=True`, code generation additionally emits adapters that would otherwise follow a pending W ahead of it, so the transfer overlaps the dW computation. `stream_config` only selects the streams adapters run on.
 
 ## 2. The Scheduler/Executor Boundary
 
@@ -51,7 +59,7 @@ This defines the scheduling contract:
 | Entry point | Responsibility |
 | --- | --- |
 | `backward_input` | Consume one microbatch's output gradients, return its stage input gradients as early as possible, and retain enough state to compute dW later |
-| `backward_weight` | Consume the oldest pending B state for the same segment, then compute and accumulate dW |
+| `backward_weight` | Consume the oldest pending state that `backward_input` published for the same segment, whether that call came from a split full backward or an explicit I action, then compute and accumulate dW |
 
 `name` identifies a segment. Several microbatches for one segment can be waiting for W simultaneously, so state must be stored in a **per-segment FIFO**. Every B must pair with exactly one W. Even a B with no work must publish an empty state for its matching W to consume.
 
@@ -146,6 +154,12 @@ Boundary discovery, `GradientEdge`, Node pre-hooks, and engine behavior are tied
 - whether per-edge behavior for Python custom Functions has changed;
 - whether reducer hooks, asynchronous communication, and multi-output nodes remain correct.
 
+### 5.5 No ZeRO-3 Support
+
+ZeRO-3 gathers each parameter with a backward hook right before its op runs backward and evicts it again once that op's input gradient exists.
+Both hooks fire during B, so a deferred W would only see the local shard and could not accumulate the full dW.
+Both ways of obtaining B/W pairs, `use_fbw=True` and explicit I/W actions such as `zero_bubble`, are therefore rejected when `use_zero` is 3.
+
 ## 6. Replacing the Default Implementation with `custom_fbw`
 
 Generated code resolves `nnscaler.runtime.executor.backward_input` and `backward_weight` dynamically when it runs. The `custom_fbw` context manager can therefore replace both symbols temporarily without changing scheduler code generation:
@@ -200,7 +214,7 @@ A custom implementation must satisfy at least these invariants:
 7. Discard unpublished partial state after an exception, and provide clear/check operations that detect unmatched B or W calls.
 8. Compare both model parameters and optimizer state against a baseline. Parameter equality after a short run can hide missing or duplicate gradients.
 
-`custom_fbw` only replaces and restores the runtime entry points. It does not maintain this state for the implementation and does not change the schedule produced by `use_fbw=True`.
+`custom_fbw` only replaces and restores the runtime entry points. It does not maintain this state for the implementation and does not change the schedule, whether the B/W pairs come from `use_fbw=True` or from explicit I/W actions.
 
 ## 7. DeepSeek DualPipe Style: Explicit dW Callbacks
 
