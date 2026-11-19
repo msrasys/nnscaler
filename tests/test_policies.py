@@ -817,6 +817,7 @@ def _build_explicit_fbw(
     num_microbatches: int,
     num_stages: int,
     backward_mids: Optional[Iterable[int]] = None,
+    weight_stream_context: Optional[StreamContext] = None,
 ) -> SchedulePlan:
     """Build a simple schedule with explicitly separated I and W actions.
 
@@ -878,6 +879,8 @@ def _build_explicit_fbw(
         backward_mids: Optional iterable defining the microbatches and order for
             explicit I/W actions. Defaults to all microbatches in ascending
             order.
+        weight_stream_context: Optional stream context attached to every W
+            action, for example to record an event after W.
 
     Returns:
         An unfinished :class:`SchedulePlan` ready for a test-specific mutation
@@ -920,6 +923,7 @@ def _build_explicit_fbw(
                 segment.mirror,
                 mid,
                 weight_start + order,
+                stream_context=weight_stream_context,
                 action=ScheduleAction.BACKWARD_WEIGHT,
             )
     return schedule
@@ -1015,6 +1019,25 @@ def sched_explicit_fbw_mixed_non_fifo_weight(
             1,
             action=ScheduleAction.BACKWARD,
         )
+    schedule.finish()
+    return schedule
+
+
+def sched_explicit_fbw_with_weight_events(
+    graph: IRGraph,
+    num_microbatches: int,
+    num_stages: int,
+) -> SchedulePlan:
+    """Every W records `w_done`; result broadcast adapters wait for it."""
+    schedule = _build_explicit_fbw(
+        graph,
+        num_microbatches,
+        num_stages,
+        weight_stream_context=StreamContext(record_events=['w_done']),
+    )
+    schedule.stream_config = StreamConfig(
+        result_broadcast=StreamContext(wait_events=['w_done']),
+    )
     schedule.finish()
     return schedule
 
@@ -1202,6 +1225,91 @@ def test_codegen_rejects_zero3_fbw(tmp_path, pipeline_scheduler, use_fbw):
             gen_savedir=tmp_path,
             load_module=False,
         )
+
+
+@replace_all_device_with('cpu')
+def test_codegen_rejects_zero3_directly_bound_schedule(tmp_path):
+    # A traditional policy may bind the plan itself instead of going through
+    # `apply_pipeline_scheduler`; the rejection must still apply.
+    from tests.graph.schedule.test_interleaved_1f1b import Model, policy_zero_bubble
+    with raises_with_cause(ValueError, match='not supported with ZeRO-3'):
+        parallelize(
+            Model(),
+            {'x': torch.randn(2, 32)},
+            policy_zero_bubble,
+            ComputeConfig(2, 2, use_end2end=True, use_zero=3, pas_config=dict(n_micro_batches=4)),
+            gen_savedir=tmp_path,
+            load_module=False,
+        )
+
+
+@replace_all_device_with('cpu')
+def test_codegen_keeps_event_adapters_after_weight(tmp_path):
+    # Async adapter hoisting must not move a `wait_events` adapter ahead of the
+    # W whose stream context records that event.
+    parallelize(
+        FnPolicyModuleList(),
+        {'x': torch.randn(4, 4)},
+        megatron_ffn_policy_list,
+        ComputeConfig(4, 8, use_end2end=True, use_async_comm=True, pas_config={
+            'pipeline_nmicros': 2,
+            'pipeline_size': 2,
+            'pipeline_scheduler': sched_explicit_fbw_with_weight_events,
+        }),
+        gen_savedir=tmp_path,
+        load_module=False,
+    )
+    for rank in range(8):
+        train_step, = _gencode_contains(
+            tmp_path,
+            FnPolicyModuleList,
+            rank,
+            r'def _train_step\([^)]*\):\n([\s\S]*?)\ndef _infer_step',
+        )
+        records = [m.start() for m in re.finditer(r"get_event\('w_done'\)\.record\(\)", train_step)]
+        waits = [m.start() for m in re.finditer(r"get_event\('w_done'\)\.wait\(\)", train_step)]
+        assert len(records) == 2 and len(waits) == 2
+        assert min(waits) > max(records)
+
+
+@replace_all_device_with('cpu')
+def test_codegen_multi_stream_fbw_hoists_adapters(tmp_path):
+    # `wait_streams` on adapters and segments is the standard multi-stream
+    # pattern and must not stop adapters from being emitted ahead of W.
+    parallelize(
+        FnPolicyModuleList(),
+        {'x': torch.randn(4, 4)},
+        megatron_ffn_policy_list,
+        ComputeConfig(4, 8, use_end2end=True, use_fbw=True, use_async_comm=True, pas_config={
+            'pipeline_nmicros': 2,
+            'pipeline_size': 2,
+            'pipeline_scheduler': sched_1f1b_multi_stream,
+        }),
+        gen_savedir=tmp_path,
+        load_module=False,
+    )
+    train_step, = _gencode_contains(
+        tmp_path,
+        FnPolicyModuleList,
+        0,
+        r'def _train_step\([^)]*\):\n([\s\S]*?)\ndef _infer_step',
+    )
+    input_positions = [m.start() for m in re.finditer(r'executor\.backward_input\(', train_step)]
+    weight_positions = [m.start() for m in re.finditer(r'executor\.backward_weight\(', train_step)]
+    recv_positions = [
+        m.start()
+        for m in re.finditer(
+            r'\w+ = nnscaler\.runtime\.executor\.aexecute\('
+            r'model\.adapter\d+, \*\(\), requires_grad=False\)',
+            train_step,
+        )
+    ]
+    assert len(input_positions) == len(weight_positions) == 2
+    assert any(
+        input_pos < recv_pos < weight_pos
+        for input_pos, weight_pos in zip(input_positions, weight_positions)
+        for recv_pos in recv_positions
+    )
 
 
 @replace_all_device_with('cpu')

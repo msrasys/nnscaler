@@ -100,6 +100,23 @@ _ZERO3_FBW_UNSUPPORTED = (
     "are not supported with ZeRO-3: parameters are evicted during the input backward."
 )
 
+
+def _check_zero3_schedule(graph: IRGraph, compute_config: 'ComputeConfig') -> None:
+    """Reject bound schedules with explicit I/W actions under ZeRO-3.
+
+    A policy may bind a plan by constructing `SchedulePlan(graph, ...)` itself,
+    so this runs on whatever the policy returned rather than only on
+    `apply_pipeline_scheduler`.
+    """
+    if compute_config.use_zero <= 1 or graph.sched is None:
+        return
+    plans = graph.sched.values() if isinstance(graph.sched, dict) else [graph.sched]
+    split_actions = (ScheduleAction.BACKWARD_INPUT, ScheduleAction.BACKWARD_WEIGHT)
+    for plan in plans:
+        if any(block.action in split_actions for block in plan.all_blocks()):
+            raise ValueError(_ZERO3_FBW_UNSUPPORTED)
+
+
 _PREDEFINED_POLICIES: Dict[str, Callable[[IRGraph, 'ComputeConfig'], IRGraph]] = {}
 _PREDEFINED_POLICIES_NAME_PREFIX = 'pas_'
 for k, v in policies.__dict__.items():
@@ -350,21 +367,13 @@ class ComputeConfig:
             pipeline_nmicros = pipeline_nmicros[0]
 
         if isinstance(pipeline_nmicros, int):
-            scheds = sched(graph, pipeline_nmicros, pipeline_nstages)
-            plans = [scheds]
+            graph.bind_schedule(sched(graph, pipeline_nmicros, pipeline_nstages))
         else:
             scheds = {}
             for num_micro in pipeline_nmicros:
                 scheds[num_micro] = sched(graph, num_micro, pipeline_nstages)
-            plans = list(scheds.values())
+            graph.bind_schedule(scheds)
 
-        if self.use_zero > 1:
-            split_actions = (ScheduleAction.BACKWARD_INPUT, ScheduleAction.BACKWARD_WEIGHT)
-            for plan in plans:
-                if any(block.action in split_actions for block in plan.all_blocks()):
-                    raise ValueError(_ZERO3_FBW_UNSUPPORTED)
-
-        graph.bind_schedule(scheds)
         return graph.sched
 
     @property
@@ -1088,6 +1097,7 @@ def _gencode(
     graph = pas_policy(graph, compute_config)
     if not isinstance(graph, IRGraph):
         raise RuntimeError("Expected policy return IRGraph")
+    _check_zero3_schedule(graph, compute_config)
 
     # check assignment
     for node in graph.nodes(flatten=True):

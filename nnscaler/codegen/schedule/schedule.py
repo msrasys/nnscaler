@@ -265,6 +265,26 @@ class ScheduleCodeGen(FuncEmission):
                 # where the issued transfer can overlap the weight backward.
                 allow_adapter_before_weight = CompileFlag.async_comm
 
+                def _adapter_syncs_with_weight(adapter: IRCell, weight_node: IRCell) -> bool:
+                    """Whether moving `adapter` ahead of `weight_node` would drop an explicit dependency.
+
+                    `wait_streams` is not such a dependency: the adapter only needs the I outputs,
+                    and waiting on the stream before W is the same ordering as in single-stream code.
+                    Only events express a W-to-adapter dependency: the adapter waits on an event W
+                    records, or the adapter records an event on W's stream so a later waiter of that
+                    event would no longer cover W.
+                    """
+                    actx = self._get_node_stream_context(execplan, adapter)
+                    wctx = self._get_node_stream_context(execplan, weight_node)
+                    if not actx:
+                        return False
+                    if actx.wait_events and wctx and wctx.record_events:
+                        if set(actx.wait_events) & set(wctx.record_events):
+                            return True
+                    if actx.record_events and actx.stream == (wctx.stream if wctx else None):
+                        return True
+                    return False
+
                 def _flush_pending_weight():
                     nonlocal pending_weight_node
                     if pending_weight_node is None:
@@ -331,19 +351,15 @@ class ScheduleCodeGen(FuncEmission):
                         release_codes = []
                     else:
                         if pending_weight_node is not None:
-                            # TODO:
-                            # Standard pipeline adapters only consume gradients
-                            # produced by I and do not require W to finish. A
-                            # custom schedule could theoretically encode a
-                            # W-to-adapter dependency with wait_events or
-                            # wait_streams; moving that adapter would invert the
-                            # intended order because event validation runs on the
-                            # original execution plan. Current schedulers do not
-                            # generate such a dependency.
+                            # Standard pipeline adapters only consume gradients produced by I
+                            # and do not require W to finish. Events can still encode a
+                            # W-to-adapter dependency, and `_validate_events` checks the
+                            # original order, so such adapters keep their place.
                             if (
                                 allow_adapter_before_weight
                                 and _is_adapter(node)
                                 and _depends_totally_on(node, pending_weight_node)
+                                and not _adapter_syncs_with_weight(node, pending_weight_node)
                             ):
                                 # if the next node is an adapter that depends on the last backward,
                                 # we need to emit the adapter before the last backward_weight codes
