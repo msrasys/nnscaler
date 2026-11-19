@@ -45,12 +45,17 @@ class ModuleStreamRule:
     recompute_prefetch_bytes: int = 1024 ** 3
     recompute_prefetch_prefix: str | tuple[str, ...] | None = None
     weight_backward_on: str | None = None
+    weight_backward_independent: bool = False
     backward_on: str | None = None
     # Persist the generated-code ABI, including in pickled configurations.
     # A default factory leaves old pickles detectably missing the field.
-    _codegen_version: int = field(default_factory=lambda: 18, init=False, repr=False)
+    _codegen_version: int = field(default_factory=lambda: 19, init=False, repr=False)
 
     def __post_init__(self):
+        if type(self.weight_backward_independent) is not bool:
+            raise ValueError('weight_backward_independent must be a boolean')
+        if self.weight_backward_independent and not self.weight_backward_on:
+            raise ValueError('weight_backward_independent requires weight_backward_on')
         if self.recompute_prefetch_prefix is not None:
             if not self.recompute_prefetch_on or self.recompute_prefetch_phase != 'forward':
                 raise ValueError('A staged replay prefix requires a forward prefetch anchor')

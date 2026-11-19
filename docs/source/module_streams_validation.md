@@ -219,3 +219,25 @@ replay to the opposite pair did not improve block time: 44.54 ms versus
 phase is opt-in; this configuration is not a recommended performance preset.
 Its trace shows attention tail submission misses the backward dispatch window.
 Earlier tail submission and full-model performance remain under investigation.
+
+### Independent branch weight backward (2026-11-18)
+
+`weight_backward_independent=True` supports a whole eager streamed branch whose
+activation does not depend on the weight anchor. A storage-free output token
+orders callback registration before that anchor's backward; per-callback events
+protect inputs produced on the branch stream. Existing data-dependent rules keep
+their original validation and execution path.
+
+Validation includes 82 relevant CPU compiler regressions, true two-worker/two-rank
+code generation, 18 CUDA-enabled weight-runtime tests, and four real CUDA linear
+backend cases. The new timing test verifies that dW starts during communication
+and that upstream dX reaches its consumer before long dW finishes. BF16/MXFP8,
+per-head/QKV outputs, clipping, FP32 parameter gradients, frozen weights and
+weight updates preserve outputs and gradients bitwise against the ordinary path.
+
+The 15B EP2 block also preserves output/dX/all parameter gradients bitwise.
+No additional performance gain is established: the existing staged schedule was
+43.215 ms; shared dW with side-stream attention tail was 43.337 ms, and a
+caller-stream tail prototype was 43.252 ms. Adding caller-stream expert replay
+also did not improve that block comparison. These variants remain opt-in and
+are not recommended presets or evidence of complete communication hiding.

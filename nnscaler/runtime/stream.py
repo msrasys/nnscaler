@@ -178,9 +178,9 @@ class ModuleStreams:
         self.streams = {self.caller}
         return self
 
-    def weight_region(self, key, name, parameters):
+    def weight_region(self, key, name, parameters, *, independent=False):
         from .weight_backward import WeightBackwardRegion
-        region = WeightBackwardRegion(name, parameters)
+        region = WeightBackwardRegion(name, parameters, independent=independent)
         self.weight_regions[key] = region
         return region
 

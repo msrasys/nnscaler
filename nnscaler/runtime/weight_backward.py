@@ -27,6 +27,21 @@ class _Task:
     results: list = field(default_factory=list)
     launched: bool = False
     done: object = None
+    ready_events: dict = field(default_factory=dict)
+
+
+class _RegistrationToken(torch.autograd.Function):
+    """Retain an autograd dependency without retaining the anchor's storage."""
+
+    @staticmethod
+    def forward(ctx, value):
+        ctx.set_materialize_grads(False)
+        return torch.empty(0, dtype=value.dtype, device=value.device)
+
+    @staticmethod
+    @once_differentiable
+    def backward(ctx, gradient):
+        return None
 
 
 class _WeightPoint(BackwardLaunchPoint):
@@ -78,7 +93,7 @@ class WeightBackwardBinding:
 
 
 class WeightBackwardRegion:
-    def __init__(self, name, parameters):
+    def __init__(self, name, parameters, *, independent=False):
         self.originals = tuple(parameters)
         if not self.originals or any(not p.requires_grad for p in self.originals):
             raise ValueError('Weight backward regions require trainable tensor parameters')
@@ -96,6 +111,9 @@ class WeightBackwardRegion:
         self.point = _WeightPoint(self)
         self.tasks = {}
         self.bound = self.prepared = False
+        self.independent = independent
+        self.registration_token = None
+        self.inputs_ordered = False
         if self.enabled and self.stream is not None:
             # Parameter publication must run on the weight stream too. A
             # main-stream autograd node would enqueue a W wait ahead of the
@@ -146,6 +164,44 @@ class WeightBackwardRegion:
         self.prepared = True
         return after_backward(value, self.aliases, self.point)
 
+    def capture_output(self, value):
+        if not self.enabled:
+            return
+        if not self.independent or self.registration_token is not None or self.inputs_ordered:
+            raise RuntimeError('Independent weight registration must capture one anchor output')
+        if value.device != self.device or not value.requires_grad:
+            raise ValueError('Weight registration requires a differentiable output on the parameter device')
+        self.registration_token = _RegistrationToken.apply(value)
+
+    def order_inputs(self, values):
+        """Make anchor backward wait for this branch to register its dWeights.
+
+        Called on the branch's forward stream. Only None travels toward the
+        anchor, so this control cannot import the anchor's pending GPU wait.
+        Each callback separately records its real input readiness in defer().
+        """
+        if not self.enabled:
+            return values
+        if not self.independent or self.registration_token is None or self.inputs_ordered:
+            raise RuntimeError('Independent weight inputs require an unused anchor registration token')
+        if not torch.is_grad_enabled():
+            raise RuntimeError('Independent weight registration requires eager autograd')
+        from torch.utils import _pytree
+        flat, spec = _pytree.tree_flatten(values)
+        cache = {}
+        for index, value in enumerate(flat):
+            if torch.is_tensor(value) and value.requires_grad:
+                if value.device != self.device:
+                    raise ValueError('Independent weight inputs must share the parameter device')
+                if id(value) not in cache:
+                    cache[id(value)] = after_backward(value, (self.registration_token,))
+                flat[index] = cache[id(value)]
+        if not cache:
+            raise ValueError('Independent weight registration needs differentiable activation inputs')
+        self.inputs_ordered = True
+        self.registration_token = None
+        return _pytree.tree_unflatten(flat, spec)
+
     def bind(self, parameters):
         if not self.enabled:
             return None
@@ -166,6 +222,9 @@ class WeightBackwardRegion:
         # Break region -> aliases -> autograd context -> region cycles even
         # when automatic Python GC is disabled during training.
         self.aliases = ()
+        self.registration_token = None
+        if self.enabled and self.independent and not self.inputs_ordered and not failed:
+            raise RuntimeError('Independent weight region did not order its activation inputs')
         if self.enabled and not self.bound and not failed:
             raise RuntimeError('Selected module did not bind the weight backward backend protocol')
 
@@ -193,6 +252,10 @@ class WeightBackwardRegion:
             raise RuntimeError('Weight work registered after its anchor was submitted')
         autocast = (torch.is_autocast_enabled(self.device.type),
                     torch.get_autocast_dtype(self.device.type), torch.is_autocast_cache_enabled())
+        if self.independent and self.stream is not None:
+            ready = torch.cuda.Event()
+            ready.record(torch.cuda.current_stream(self.device))
+            task.ready_events[len(task.callbacks)] = ready
         task.callbacks.append((indices, callback, inputs, autocast))
 
     @torch.no_grad()
@@ -205,7 +268,10 @@ class WeightBackwardRegion:
         failed = True
         try:
             with torch.cuda.stream(self.stream) if self.stream is not None else nullcontext():
-                for indices, callback, inputs, (amp, dtype, cache) in task.callbacks:
+                for ordinal, (indices, callback, inputs, (amp, dtype, cache)) in enumerate(task.callbacks):
+                    ready = task.ready_events.get(ordinal)
+                    if ready is not None:
+                        self.stream.wait_event(ready)
                     current_amp = (torch.is_autocast_enabled(self.device.type),
                                    torch.get_autocast_dtype(self.device.type), torch.is_autocast_cache_enabled())
                     amp_context = (torch.autocast(self.device.type, enabled=amp, dtype=dtype, cache_enabled=cache)
@@ -222,6 +288,7 @@ class WeightBackwardRegion:
                 task.done = torch.cuda.Event()
                 task.done.record(self.stream)
             task.callbacks.clear()
+            task.ready_events.clear()
             if failed:
                 self._join(task)
                 self.tasks.pop(torch._C._current_graph_task_id(), None)

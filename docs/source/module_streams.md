@@ -83,6 +83,41 @@ backward; it is not queued for a later microbatch. The anchor must precede the
 module, outside checkpoints, with a differentiable data path into the module.
 The rule can be combined with a separate `recompute_only` rule for that module.
 
+An independent branch can defer its dWeight to an earlier forward anchor by
+setting `weight_backward_independent=True` on a separate weight rule:
+
+```python
+ModuleStreamRule(
+    module='*.shared_gate', stream='shared_expert',
+    launch_before='*.nnscaler_moe_combine', overlap_backward=True,
+)
+ModuleStreamRule(
+    module='*.shared', stream='shared_expert',
+    launch_before='*.nnscaler_moe_combine', overlap_backward=True,
+)
+ModuleStreamRule(
+    module='*.shared', stream='shared_weight',
+    weight_backward_on='*.nnscaler_moe_dispatch',
+    weight_backward_independent=True,
+)
+```
+
+This requires one whole, eager module-stream region for the selected module,
+after the weight anchor in forward order. Checkpointed, split, deferred,
+prequeued, and host-concurrent forward regions are rejected. Each parameter
+operation must have a differentiable activation path from the module inputs.
+The backend must implement the same weight binding/defer protocol below.
+
+The compiler captures a zero-sized dependency token from the anchor output and
+orders the branch inputs through it. This guarantees that the branch registers
+its weight callbacks before the anchor's backward submission, independently of
+autograd ready-queue priority. Only `None` gradients traverse the control edge;
+it retains no anchor-output storage and introduces no wait for communication
+completion. Each callback records its own input-ready event because those inputs
+may have been produced on a different stream from the anchor. Input gradients
+continue normally, and parameter gradients keep their ordinary reducer edges.
+All work finishes within the current microbatch's backward.
+
 The backend wrapper calls `nnscaler.prepare_weight_backward(parameters)` before
 its autograd Function. When a binding is returned, it passes
 `binding.parameters` to the Function and retains the binding in its context.

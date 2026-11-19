@@ -1096,12 +1096,14 @@ class ModuleCodeGen(FuncEmission):
 
     def _emit_module_streams(self, segment, runtime_devid):
         previous = getattr(self, '_weight_regions_by_node', {})
+        previous_controls = getattr(self, '_weight_control_outputs_by_node', {})
         previous_prefetch = getattr(self, '_checkpoint_prefetch_names', {})
         previous_prefixes = getattr(self, '_checkpoint_prefetch_prefixes', {})
         try:
             return self._emit_module_streams_impl(segment, runtime_devid)
         finally:
             self._weight_regions_by_node = previous
+            self._weight_control_outputs_by_node = previous_controls
             self._checkpoint_prefetch_names = previous_prefetch
             self._checkpoint_prefetch_prefixes = previous_prefixes
 
@@ -1110,10 +1112,22 @@ class ModuleCodeGen(FuncEmission):
             segment.nodes(), segment.oobjs(), CompileFlag.module_streams)
         weight_plans = plan_weight_backward(nodes, CompileFlag.module_streams)
         self._weight_regions_by_node = {node: plan.key for plan in weight_plans for node in plan.nodes}
+        self._weight_control_outputs_by_node = {}
         weight_anchors = {}
+        independent_regions = {}
         for plan in weight_plans:
-            if any(plan.anchor in region.nodes or any(node in region.nodes for node in plan.nodes)
-                   for region in regions.values()):
+            if any(plan.anchor in region.nodes for region in regions.values()):
+                raise ValueError('Weight backward rules cannot also move their anchor forward')
+            matching = [region for region in regions.values()
+                        if any(node in region.nodes for node in plan.nodes)]
+            if plan.independent:
+                if (len(matching) != 1 or set(matching[0].nodes) != set(plan.nodes)
+                        or matching[0].native or matching[0].deferred or matching[0].host_concurrency):
+                    raise ValueError('Independent weight backward requires one whole eager module stream region')
+                region = matching[0]
+                independent_regions[region.key] = plan
+                self._weight_control_outputs_by_node.setdefault(plan.anchor, []).append(plan)
+            elif matching:
                 raise ValueError('Weight backward rules cannot also move their module/anchor forward')
             weight_anchors.setdefault(plan.anchor, []).append(plan.key)
         checkpoint_anchors = plan_checkpoint_readiness(nodes, segment.oobjs(), CompileFlag.module_streams)
@@ -1264,7 +1278,8 @@ class ModuleCodeGen(FuncEmission):
                 for plan in weight_plans:
                     if plan.anchor is node:
                         body.append(f'{plan.key} = _module_streams.weight_region('
-                                    f'{plan.key!r}, {plan.stream!r}, {names(plan.parameters)})')
+                                    f'{plan.key!r}, {plan.stream!r}, {names(plan.parameters)}'
+                                    f'{", independent=True" if plan.independent else ""})')
             if node in captures:
                 flush()
                 body.extend(f'_module_streams.capture({key!r})' for key in captures[node])
@@ -1397,12 +1412,27 @@ class ModuleCodeGen(FuncEmission):
                         body.append(self.emit_release(expired))
                 else:
                     preserve = ', preserve_accumulators=True' if region.overlap_backward else ''
+                    independent = independent_regions.get(region.key)
+                    if independent is not None:
+                        # Isolate input aliases in a helper's local namespace;
+                        # other branches must continue using the original values.
+                        inputs = [obj for obj in region.inputs if not obj.is_attr()]
+                        function = f'_{region.key}_ordered_weights'
+                        with FunctionBlock(function, [self.tensor_name(obj) for obj in inputs], False) as block:
+                            block.insert_body(f'{names(inputs)} = {independent.key}.order_inputs({names(inputs)})')
+                            block.insert_body(self._emit_segment_nodes(
+                                segment, region.nodes, runtime_devid, lifetime, release_unused=False))
+                            block.insert_body(f'return {names(region.outputs)}')
+                        body.extend(block.code)
                     if region.retain_backward_outputs:
                         body.append(f'_{region.key}_backward_boundaries = '
                                     f'nnscaler.runtime.deferred.backward_boundaries({names(region.inputs)})')
                     with Block(f'with _module_streams.fork({region.key!r}, {region.stream!r}, {names(region.inputs)}{preserve}):') as block:
-                        block.insert_body(self._emit_segment_nodes(
-                            segment, region.nodes, runtime_devid, lifetime, release_unused=False))
+                        if independent is not None:
+                            block.insert_body(f'{names(region.outputs)} = {function}{names(inputs)}')
+                        else:
+                            block.insert_body(self._emit_segment_nodes(
+                                segment, region.nodes, runtime_devid, lifetime, release_unused=False))
                     body.extend(block.code)
                     caller = region.caller_outputs
                     producer = tuple(obj for obj in region.outputs if obj not in caller)
@@ -1564,6 +1594,8 @@ class ModuleCodeGen(FuncEmission):
                 node_code += code
             else:
                 raise RuntimeError(f"unexpected type {type(node)} in IRSegment")
+            for plan in getattr(self, '_weight_control_outputs_by_node', {}).get(node, ()):
+                node_code.append(f'{plan.key}.capture_output({self.tensor_name(plan.control_output)})')
             # release
             tensors_to_del = lifecycle.release_tensors_after_node(node)
             if len(tensors_to_del) > 0:

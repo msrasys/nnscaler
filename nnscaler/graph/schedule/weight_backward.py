@@ -17,6 +17,8 @@ class WeightBackwardPlan:
     anchor: object
     nodes: tuple
     parameters: tuple
+    independent: bool = False
+    control_output: object = None
 
 
 def plan_weight_backward(nodes, rules):
@@ -62,9 +64,34 @@ def plan_weight_backward(nodes, rules):
                     if producer is not None and producer not in ancestors:
                         ancestors.add(producer)
                         pending.append(producer)
-            if anchor not in ancestors:
+            independent = rule.weight_backward_independent
+            control_output = None
+            if independent:
+                if any(node.recompute is not None for node in group):
+                    raise ValueError(f'{path}: independent weight backward requires an eager module')
+                control_output = next((value for value in anchor.oobjs()
+                                       if isinstance(value, IRTensor) and value.requires_grad), None)
+                if control_output is None:
+                    raise ValueError(f'{path}: independent weight backward requires a differentiable anchor output')
+                # Every parameter-consuming operation must lie downstream of
+                # a differentiable activation at this module's boundary. The
+                # runtime puts registration controls on those inputs.
+                group_set = set(group)
+                reachable = {value for node in group for value in node.iobjs()
+                             if isinstance(value, IRTensor) and value.requires_grad and not value.is_attr()
+                             and producers.get(value) not in group_set}
+                for node in group:
+                    active = any(value in reachable for value in node.iobjs())
+                    if any(isinstance(value, IRTensor) and value.is_param() and value.requires_grad
+                           for value in node.iobjs()) and not active:
+                        raise ValueError(f'{path}: independent weight backward needs differentiable activation paths')
+                    if active:
+                        reachable.update(value for value in node.oobjs()
+                                         if isinstance(value, IRTensor) and value.requires_grad)
+            elif anchor not in ancestors:
                 raise ValueError(f'{path}: module must have a differentiable data dependency on its anchor')
             key = f'_weight_backward_{len(plans)}'
-            plans.append(WeightBackwardPlan(key, rule.stream, anchor, tuple(group), parameters))
+            plans.append(WeightBackwardPlan(key, rule.stream, anchor, tuple(group), parameters,
+                                            independent=independent, control_output=control_output))
             selected.update(group)
     return plans
