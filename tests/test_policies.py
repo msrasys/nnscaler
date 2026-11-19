@@ -46,145 +46,79 @@ class ReusedRecomputeModel(nn.Module):
 
 @replace_all_device_with('cpu')
 @pytest.mark.parametrize('direct_forward', [False, True])
-def test_apply_module_recompute_separates_adjacent_reused_module_calls(tmp_path, direct_forward):
+def test_group_nodes_by_modules_separates_adjacent_reused_module_calls(tmp_path, direct_forward):
     from nnscaler.graph.parser.converter import to_fx_graph, to_ir_graph
-    from nnscaler.policies import apply_module_recompute
+    from nnscaler.policies import group_nodes_by_modules
 
     inputs = {'x': torch.randn(2, 4, requires_grad=True)}
     traced = to_fx_graph(ReusedRecomputeModel(direct_forward), inputs)
     graph = to_ir_graph(traced, inputs, attr_savedir=tmp_path, constant_folding=False)
-    graph.backward(graph.output(0))
-    result = apply_module_recompute(graph, ReusedRecomputeBlock)
+    groups = group_nodes_by_modules(graph, ReusedRecomputeBlock)
 
-    assert [len(group) for group in result.planned_groups] == [2, 2]
-    assert result.applied_group_count == 2
-
-
-class HookRecomputeBlock(nn.Module):
-    def forward(self, x):
-        return x.sin().cos().tanh().sin().cos()
-
-
-class HookRecomputeModel(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.block = HookRecomputeBlock()
-
-    def forward(self, x):
-        return self.block(x).sum()
+    assert [[node.name for node in group] for group in groups] == [['sin', 'cos'], ['sin', 'cos']]
 
 
 @replace_all_device_with('cpu')
-@pytest.mark.parametrize('hook_kind', ['pre_hook', 'post_hook'])
-@pytest.mark.parametrize('pass_plans', [False, True])
-def test_apply_module_recompute_excludes_planned_hooks_from_codegen(tmp_path, hook_kind, pass_plans):
+@pytest.mark.parametrize('memory_mode', ['recompute', 'offload'])
+def test_group_nodes_by_modules_in_fn_policy(tmp_path, memory_mode):
     import ast
-    from nnscaler.policies import OpPlan, apply_module_recompute
+    from nnscaler.policies import OpPlan, group_nodes_by_modules
 
     def policy(graph, cfg):
-        plans = [OpPlan(op) for op in get_pas_ops(graph)]
-        hooked = next(plan for plan in plans if plan.op.fn == torch.tanh)
-        setattr(hooked, hook_kind, hello)
-        result = apply_module_recompute(
-            graph, HookRecomputeBlock, op_plans=plans if pass_plans else None,
-        )
-        if pass_plans:
-            assert result.skipped_hook_ops == 1
-            assert result.planned_group_count == 2
-            assert hooked.op.recompute is None
-        return plans
-
-    if not pass_plans:
-        with pytest.raises(RuntimeError, match='Code generation failed') as exc:
-            parallelize(
-                HookRecomputeModel(), {'x': torch.randn(2, 4, requires_grad=True)}, policy,
-                ComputeConfig(1, 1), gen_savedir=tmp_path, load_module=False,
-            )
-        assert isinstance(exc.value.__cause__, ValueError)
-        assert 'pass op_plans' in str(exc.value.__cause__)
-        return
+        plans = {op: OpPlan(op) for op in get_pas_ops(graph)}
+        for group_id, group in enumerate(group_nodes_by_modules(graph, ReusedRecomputeBlock)):
+            for node in group:
+                setattr(plans[node], f'{memory_mode}_id', group_id)
+        return plans.values()
 
     parallelize(
-        HookRecomputeModel(), {'x': torch.randn(2, 4, requires_grad=True)}, policy,
+        ReusedRecomputeModel(), {'x': torch.randn(2, 4, requires_grad=True)}, policy,
         ComputeConfig(1, 1), gen_savedir=tmp_path, load_module=False,
     )
     generated = next(tmp_path.rglob('gencode0.py')).read_text()
-    recomputes = [node for node in ast.walk(ast.parse(generated))
-                  if isinstance(node, ast.FunctionDef) and node.name.startswith('recompute')]
-    assert len(recomputes) == 2
-    assert all('tests.test_policies.hello' not in ast.unparse(node) for node in recomputes)
-    assert generated.count('tests.test_policies.hello(') == 1
+    if memory_mode == 'recompute':
+        recomputes = [node for node in ast.walk(ast.parse(generated))
+                      if isinstance(node, ast.FunctionDef) and node.name.startswith('recompute')]
+        assert len(recomputes) == 2
+    else:
+        assert generated.count('with self.cpu_offloading_hooks():') == 2
 
 
-class _FakeRecomputeNode:
-    def __init__(self, module_type=None, fqn="", *, hooked=False):
+class _FakeGroupNode:
+    def __init__(self, module_type=None, fqn=""):
         self.module_class_chain = [] if module_type is None else [module_type]
+        self.module_call_stack = None  # graph traced without invocation ids
         self._fqn = fqn
-        self.pre_hook = object() if hooked else None
-        self.post_hook = None
-        self.recompute = None
 
     def get_module_fqn(self, module_type):
         assert module_type in self.module_class_chain
         return self._fqn
 
 
-class _FakeRecomputeGraph:
-    def __init__(self, nodes, *, applies_recompute=True):
+class _FakeGroupGraph:
+    def __init__(self, nodes):
         self.nodes = nodes
-        self.applies_recompute = applies_recompute
-        self.recompute_calls = []
 
     def select(self, ntype=None):
         return self.nodes
 
-    def recompute(self, nodes):
-        self.recompute_calls.append(nodes)
-        if self.applies_recompute:
-            group_id = len(self.recompute_calls)
-            for node in nodes:
-                node.recompute = group_id
 
-
-def test_apply_module_recompute_groups_invocations_and_skips_hooks():
-    from nnscaler.policies import apply_module_recompute
+def test_group_nodes_by_modules_group_boundaries():
+    from nnscaler.policies import group_nodes_by_modules
 
     nodes = [
-        _FakeRecomputeNode(),
-        _FakeRecomputeNode(RecomputeTarget, "blocks.0"),
-        _FakeRecomputeNode(RecomputeTarget, "blocks.0"),
-        _FakeRecomputeNode(),
-        _FakeRecomputeNode(RecomputeTarget, "blocks.0"),
-        _FakeRecomputeNode(RecomputeTarget, "blocks.0"),
-        _FakeRecomputeNode(RecomputeTarget, "blocks.1", hooked=True),
-        _FakeRecomputeNode(RecomputeTarget, "blocks.1"),
-        _FakeRecomputeNode(RecomputeTarget, "blocks.1"),
-        _FakeRecomputeNode(RecomputeTarget, "blocks.2"),
+        _FakeGroupNode(),
+        _FakeGroupNode(RecomputeTarget, "blocks.0"),
+        _FakeGroupNode(RecomputeTarget, "blocks.0"),
+        _FakeGroupNode(),                              # ends the group
+        _FakeGroupNode(RecomputeTarget, "blocks.0"),
+        _FakeGroupNode(RecomputeTarget, "blocks.1"),   # FQN change
+        _FakeGroupNode(RecomputeTarget, "blocks.1"),
     ]
-    graph = _FakeRecomputeGraph(nodes)
+    groups = group_nodes_by_modules(_FakeGroupGraph(nodes), [RecomputeTarget])
 
-    result = apply_module_recompute(graph, RecomputeTarget)
+    assert groups == [nodes[1:3], nodes[4:5], nodes[5:7]]
 
-    assert [len(group) for group in result.planned_groups] == [2, 2, 2]
-    assert result.planned_group_count == result.applied_group_count == 3
-    assert result.planned_op_count == result.applied_op_count == 6
-    assert result.skipped_hook_ops == 1
-
-
-def test_apply_module_recompute_reports_when_nothing_applies():
-    from nnscaler.policies import apply_module_recompute
-
-    nodes = [
-        _FakeRecomputeNode(RecomputeTarget, "blocks.0"),
-        _FakeRecomputeNode(RecomputeTarget, "blocks.0"),
-    ]
-    graph = _FakeRecomputeGraph(nodes, applies_recompute=False)
-
-    result = apply_module_recompute(graph, [RecomputeTarget])
-
-    assert result.planned_group_count == 1
-    assert result.planned_op_count == 2
-    assert result.applied_group_count == result.applied_op_count == 0
 
 class MLP(nn.Module):
     def __init__(self, dim: int = DIM, nlayers: int = LAYERS):
