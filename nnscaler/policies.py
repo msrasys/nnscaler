@@ -1282,6 +1282,8 @@ def fn(
     5. use `node.module_call_stack` to get the traced invocation id of each module in `node.module_stack`.
         It distinguishes repeated calls to the same module instance (e.g., a shared block called in a loop),
         which have identical `module_stack`.
+        To get the operators of each module call directly (e.g., for module-based recompute or offload),
+        use `group_nodes_by_modules`.
     6. use `node.call_expr` to get the call expression string. And you can user `ast.parse` to parse it.
     7. use `get_layer_index` to get the layer index in a torch.nn.ModuleList.
     8. use `get_called_self_module_name` to get the called self module name from the call expression.
