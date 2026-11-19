@@ -1,9 +1,51 @@
 # Module stream validation
 
-Full hiding of DeepEP communication has **not** been demonstrated. The 15B
-preset keeps shared-expert splitting and expert/attention recomputation streams.
-Deferred dWeight remains opt-in: correcting its publication removes a measured
-regression, but adding it to that preset has not shown a reliable incremental gain.
+## Production routed-expert acceptance (2026-11-19)
+
+The committed `ModuleStreams`, backward dependencies, cooperative
+`WeightGradientAccumulator` and checkpoint-consumer readiness feature now support
+near-total DeepEP overlap in a real 15B PP3/EP2 run. The model backend divides
+local/remote expert work into W13 and SwiGLU/W2 phases, schedules their reverse
+phases and weight accumulation, and keeps MoE replay on the expert compute
+stream. All work belongs to the current microbatch; the PP schedule is unchanged.
+
+With six B200 GPUs, batch size 6, sequence 8192, accumulation 3 and
+Attention/MoE plus CE recomputation, the final unprofiled complete-iteration mean
+is **6.937011 → 6.680913 s**, saving **256.10 ms (3.69%)**, or **3.83% more
+throughput**. Both modes use NNScaler `3716eca7`, llm-train `fc4a7bc7` and the
+same isolated backend binary. The enabled mode includes optional same-node EP2
+peer-copy transport; this result measures that combination, not scheduling alone.
+
+The 60–79/80-step timing window, initial tensors/RNG, input checkpoints, work,
+source, backend and observer audits match. All generated expert/replay calls and
+forward/backward/weight callbacks have the expected counts. Complete first-step
+nonexpert gradients are bitwise equal; expert W13/W2 gradients have maximum
+relative L2 error 1.32e-5 from the fragmented FP32 reduction. Later training is
+not bitwise identical. Peak sampled GPU use is 156.01 versus 166.51 GiB.
+
+Separate matched step-22 captures use the same generated code and first-gradient
+SHA as the full runs. Exposed backend intervals, including layout/preparation,
+DMA and replay, fall **283.67 → 8.22 ms/GPU/step (97.10%)**. Useful compute covers
+97.83% of the enabled backend intervals, with at least 95.17% coverage in every
+forward/backward/recompute dispatch/combine category. All communication kernels
+are attributed. Native transport exposure excluding layout is 3.63% of the
+instrumented step, or 4.02% including backend preparation; the full iteration
+gain is comparable. Timeline exposure is diagnostic, not an additive speedup
+estimate.
+
+The [model integration and complete measurement protocol](https://github.com/msrallm/llm-train/blob/yileiyang/stream_overlap/docs/stream-overlap.md)
+and its `stream-overlap-results.json` include individual iteration timings,
+configuration, limitations and artifact identities. This validation uses real VL
+batches, randomly initialized language weights and frozen pretrained vision.
+It does not establish long-training accuracy or performance beyond same-node EP2.
+
+## Historical shared-expert and standalone dW experiment
+
+The earlier small-batch experiment below did not demonstrate full hiding.
+Correcting deferred-dWeight publication removed a regression, but adding it to
+shared-expert overlap did not produce a reliable incremental gain. These
+measurements explain the subsequent routed-expert/peer-copy implementation;
+they are not the current acceptance result.
 
 ## Workload and protocol
 
@@ -280,8 +322,9 @@ replay, distinct producer streams, and dInput advancing before long dWeight
 work completes. The corresponding BF16/MXFP8 MoE backend tests also pass with
 and without checkpointing and with weight-gradient clipping enabled.
 
-These establish the generic runtime and backend contracts. Full training gains
-for a model using fragment accumulation still require matched end-to-end runs.
+These establish the generic runtime and backend contracts. The production
+routed-expert comparison at the top of this page now supplies the matched
+end-to-end measurement for a model using fragment accumulation.
 
 ### Checkpoint saved tensors with multiple consumers (2026-11-19)
 
