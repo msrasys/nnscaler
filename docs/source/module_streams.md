@@ -436,8 +436,10 @@ additional recomputation or change the forward order.
 
 Recomputation uses saved forward inputs, so it can start while an incoming
 gradient is still being communicated. It waits for the original forward's
-completion event; the original backward stream joins it before consuming saved
-tensors. The rule must cover a complete checkpoint and cannot specify forward
+completion event. Each backward stream consuming a reconstructed saved tensor
+joins the replay, with one readiness wait per consumer stream and backward task.
+This also protects consumers of internally streamed operators when a different
+stream triggered recomputation. The rule must cover a complete checkpoint and cannot specify forward
 launch/split options. It does not enable checkpointing itself. Current support
 requires PyTorch's saved-tensor hook inspection API, eager execution, one CUDA
 device per checkpoint, and pure selected operators. It composes the active

@@ -3,9 +3,9 @@
 
 """Run checkpoint recomputation without waiting for the incoming gradient.
 
-The original forward's completion event protects saved inputs. Recomputed
-tensors are recorded on the original backward stream as they are packed, and
-that stream joins recomputation before the checkpoint supplies them to backward.
+The original forward's completion event protects saved inputs. Every backward
+stream consuming a reconstructed saved tensor joins the replay and protects the
+tensor's storage, including consumers other than the one that triggered replay.
 """
 
 from contextlib import ExitStack, nullcontext
@@ -30,13 +30,34 @@ def _tensors(value):
 class _Forward:
     def __init__(self, state):
         self.state = state
+        self.hooks = None
 
     def __enter__(self):
         self.state.forward_stream = torch.cuda.current_stream(self.state.device)
+        top = getattr(torch._C._autograd, '_top_saved_tensors_default_hooks', None)
+        hooks = top(False) if top is not None else None
+        if hooks is None:
+            raise RuntimeError('Checkpoint stream context must run inside a non-reentrant checkpoint')
+        original_pack, original_unpack = hooks
+        state = self.state  # Do not retain this context in its own hook closure.
+
+        def unpack(packed):
+            gid = torch._C._current_graph_task_id()
+            tensor = original_unpack(packed)
+            if tensor.device.type == 'cuda':
+                state.consume(tensor, gid)
+            return tensor
+
+        self.hooks = torch.autograd.graph.saved_tensors_hooks(original_pack, unpack)
+        return self.hooks.__enter__()
 
     def __exit__(self, *exc):
-        self.state.ready = torch.cuda.Event()
-        self.state.ready.record(self.state.forward_stream)
+        try:
+            return self.hooks.__exit__(*exc)
+        finally:
+            self.hooks = None
+            self.state.ready = torch.cuda.Event()
+            self.state.ready.record(self.state.forward_stream)
 
 
 class _Recompute:
@@ -88,6 +109,7 @@ class _Recompute:
             done = torch.cuda.Event()
             done.record(stream)
             caller.wait_event(done)
+            self.state.replayed(torch._C._current_graph_task_id(), done, caller)
 
 
 class _State:
@@ -96,6 +118,31 @@ class _State:
         self.ready = None
         self.forward_stream = None
         self.backward_ready = backward_ready
+        self.replays = {}
+        self.cleanup_tasks = set()
+
+    def replayed(self, gid, done, caller):
+        self.replays[gid] = (done, caller, {caller.cuda_stream})
+        if gid >= 0 and gid not in self.cleanup_tasks:
+            self.cleanup_tasks.add(gid)
+
+            def cleanup():
+                self.replays.pop(gid, None)
+                self.cleanup_tasks.discard(gid)
+
+            torch.autograd.Variable._execution_engine.queue_callback(cleanup)
+
+    def consume(self, tensor, gid):
+        done, first, joined = self.replays[gid]
+        caller = torch.cuda.current_stream(tensor.device)
+        if caller.cuda_stream not in joined:
+            caller.wait_event(done)
+            joined.add(caller.cuda_stream)
+        if caller != first:
+            # Packing already protects the triggering stream. A different
+            # consumer also needs allocator protection after its Python
+            # backward returns while its CUDA reads are still queued.
+            tensor.record_stream(caller)
 
 
 def contexts(name, inputs, *, backward_ready=None):

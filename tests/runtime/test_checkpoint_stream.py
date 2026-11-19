@@ -13,6 +13,64 @@ from nnscaler.runtime.stream import _get_module_stream, drain_stream_holds
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason='requires CUDA')
 
 
+@pytest.mark.parametrize('reverse_consumers', [False, True])
+def test_replayed_saved_tensors_are_ready_on_each_consumer_stream(reverse_consumers):
+    class SavedValueVJP(torch.autograd.Function):
+        @staticmethod
+        def forward(ctx, value):
+            ctx.save_for_backward(value)
+            return value.view_as(value)
+
+        @staticmethod
+        def backward(ctx, gradient):
+            value, = ctx.saved_tensors
+            return gradient * value
+
+    consumers = [torch.cuda.Stream(), torch.cuda.Stream()]
+    if reverse_consumers:
+        consumers.reverse()
+    x = torch.ones(4096, device='cuda', requires_grad=True)
+    replay = _get_module_stream(x.device, 'multiple_checkpoint_consumers')
+
+    def views(value):
+        with torch.cuda.stream(consumers[0]):
+            first = SavedValueVJP.apply(value)
+        with torch.cuda.stream(consumers[1]):
+            second = SavedValueVJP.apply(value)
+        return first, second
+
+    # A cold consumer-side cudaMalloc synchronizes the device and can conceal
+    # this race. Warm the backward kernels and both stream allocator pools.
+    warm_x = x.detach().clone().requires_grad_()
+    a, b = views(warm_x * 2 + 1)
+    (a + b).sum().backward()
+    with torch.cuda.stream(replay):
+        torch.cuda._sleep(1)
+        garbage = [torch.full_like(x, -19.) for _ in range(4)]
+    torch.cuda.synchronize()
+    del a, b, warm_x, garbage
+    calls = 0
+
+    def function(value):
+        nonlocal calls
+        calls += 1
+        if calls > 1:
+            torch.cuda._sleep(200_000_000)
+        return views(value * 2 + 1)
+
+    a, b = checkpoint(function, x, use_reentrant=False,
+                      context_fn=lambda: contexts('multiple_checkpoint_consumers', (x,)))
+    loss = (a + b).sum()
+    for iteration in range(2):
+        loss.backward(retain_graph=iteration == 0)
+        torch.cuda.synchronize()
+        # This custom VJP uses the saved value: 2 consumers * (2*x+1) * 2.
+        torch.testing.assert_close(x.grad, torch.full_like(x, 12.), rtol=0, atol=0)
+        x.grad = None
+    assert calls == 3
+    drain_stream_holds(wait=True)
+
+
 @pytest.mark.parametrize('gate_inputs', [False, True])
 def test_recompute_overlaps_pending_gradient_and_preserves_gradients(gate_inputs):
     from nnscaler.runtime.deferred import BackwardLaunchPoint, capture_async_backward

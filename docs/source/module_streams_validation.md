@@ -282,3 +282,19 @@ and without checkpointing and with weight-gradient clipping enabled.
 
 These establish the generic runtime and backend contracts. Full training gains
 for a model using fragment accumulation still require matched end-to-end runs.
+
+### Checkpoint saved tensors with multiple consumers (2026-11-19)
+
+A checkpoint containing backward nodes on several CUDA streams previously
+joined replay only on the stream that first requested a saved tensor. Another
+consumer could read the reconstructed storage before its producer completed.
+A warmed CUDA reproduction reads roughly 102 ms early and returns a gradient
+of -32 instead of 12. Cold allocations can synchronize the device and conceal
+this race.
+
+The saved-tensor unpack hook now orders each consuming stream after replay and
+protects its storage lifetime. Readiness is tracked per backward task and
+released at task completion. The same reproduction produces exactly 12 after
+the fix. All five CUDA checkpoint-stream tests pass, including either consumer
+triggering replay, retained backward, gradient-readiness alignment, and opaque
+input lifetime protection. This is a correctness fix, not a performance claim.
