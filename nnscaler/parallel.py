@@ -46,6 +46,7 @@ from nnscaler.graph.schedule.schedplan import SchedulePlan
 from nnscaler.graph.schedule.module_streams import (
     ModuleStreamRule, module_stream_rules_from_env, normalize_module_stream_rules,
     async_copy_ops_from_env, normalize_async_copy_ops,
+    multi_stream_ops_from_env, normalize_multi_stream_ops,
 )
 
 from nnscaler.ir.cten import IRObject, IRTensor, IR
@@ -179,6 +180,9 @@ class ComputeConfig:
     module_streams: Tuple[ModuleStreamRule, ...] = field(default_factory=module_stream_rules_from_env)
     # Optional bounded CPU metadata copies without moving a module branch.
     async_copy_ops: Tuple[str, ...] = field(default_factory=async_copy_ops_from_env)
+    # Custom operators with internal side streams need scheduled input lifetime
+    # tracking even when no module is moved by the compiler.
+    multi_stream_ops: Tuple[str, ...] = field(default_factory=multi_stream_ops_from_env)
 
     # whether to use async reducer
     # if True, the gradient all-reduce will be async,
@@ -230,8 +234,11 @@ class ComputeConfig:
     def __post_init__(self):
         super().__setattr__('module_streams', normalize_module_stream_rules(self.module_streams))
         super().__setattr__('async_copy_ops', normalize_async_copy_ops(self.async_copy_ops))
+        super().__setattr__('multi_stream_ops', normalize_multi_stream_ops(self.multi_stream_ops))
         if self.module_streams and self.use_zero > 1:
             raise ValueError('module_streams currently supports ZeRO 0/1 only')
+        if self.multi_stream_ops and self.use_zero > 1:
+            raise ValueError('multi_stream_ops currently supports ZeRO 0/1 only')
         if self.plan_ngpus <= 0:
             raise ValueError(f"plan_ngpus {self.plan_ngpus} must be > 0")
         if self.runtime_ngpus is None:
@@ -421,6 +428,7 @@ class ComputeConfig:
                     # intentionally normalizes user/YAML rules to today's ABI.
                     cfg.setdefault('module_streams', ())
                     cfg.setdefault('async_copy_ops', ())
+                    cfg.setdefault('multi_stream_ops', ())
                     result = cls(**cfg)
                     for saved, rule in zip(cfg['module_streams'], result.module_streams):
                         version = (saved.get('_codegen_version') if isinstance(saved, dict)
@@ -480,6 +488,7 @@ def _compile_flags(compute_config: ComputeConfig):
         use_fbw=compute_config.use_fbw,
         module_streams=compute_config.module_streams,
         async_copy_ops=compute_config.async_copy_ops,
+        multi_stream_ops=compute_config.multi_stream_ops,
     )
 
 

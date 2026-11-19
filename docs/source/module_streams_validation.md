@@ -255,3 +255,16 @@ That placement did not improve performance: 43.87 ms on a separate stream and
 43.96 ms on the attention replay stream, versus 43.25 ms for the existing
 schedule and 44.22 ms without overlap. This is a validated selection feature,
 not a recommended performance preset or an end-to-end gain claim.
+
+### Operators with internal streams (2026-11-19)
+
+`multi_stream_ops` declares operators whose implementations already manage
+side streams. It enables scheduled lifetime tracking before per-rank emission,
+so independent code-generation workers agree even when only one pipeline rank
+contains a matching operator. CPU coverage includes matched/unmatched patterns,
+checkpoints, one/two workers, cache invalidation, and legacy configuration loading.
+
+The focused CPU suites pass 79 tests. Two CUDA validations run a two-rank,
+four-stage interleaved pipeline with four microbatches and three optimizer steps.
+Loss, all local parameter gradients, and updated weights match eager execution.
+One validation has an internal-stream operator only on the first stage.

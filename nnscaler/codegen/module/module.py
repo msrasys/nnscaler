@@ -112,6 +112,12 @@ class ModuleCodeGen(FuncEmission):
         """
         super().__init__()
         self.execplan: ExecutionPlan = execplan
+        if any(fnmatchcase(node.signature, pattern)
+               for node in execplan.graph.select(ntype=IRFwOperation)
+               for pattern in CompileFlag.multi_stream_ops):
+            # Decide before rank-specific emission and worker serialization so
+            # every scheduled executor preserves side-stream input lifetimes.
+            self.execplan.use_multi_streams = True
         self.devices: Tuple[int] = tuple(sorted(execplan.graph.device))
         if self.devices != tuple(range(len(self.devices))):
             raise ValueError(f'device must be consecutive')

@@ -1008,3 +1008,65 @@ def test_operator_selector_includes_builtin_metadata_reads(tmp_path, monkeypatch
     torch.testing.assert_close(x.grad, ref_x.grad)
     for name, parameter in generated.named_parameters():
         torch.testing.assert_close(parameter.grad, reference.get_parameter(generated.fullmap[name].orig_name).grad)
+
+
+class InternalStreamOperatorModel(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.linear = torch.nn.Linear(8, 8)
+
+    def forward(self, data):
+        return auxiliary_statistics(self.linear(data)).sum()
+
+
+def test_internal_stream_declarations_are_frozen_and_cache_safe(tmp_path, monkeypatch):
+    baseline = ComputeConfig(1, 1)
+    monkeypatch.setenv('NNSCALER_MULTI_STREAM_OPS', '["*.auxiliary_statistics"]')
+    enabled = ComputeConfig(1, 1)
+    assert enabled.multi_stream_ops == ('*.auxiliary_statistics',)
+    assert enabled.graph_config == baseline.graph_config
+    assert not ComputeConfig.safe_equals(enabled, baseline)
+    path = tmp_path / 'compute_config.pt'
+    ComputeConfig.safe_dump_to_file(enabled, path)
+    assert ComputeConfig.safe_load_from_file(path) == enabled
+    payload = asdict(baseline)
+    payload.pop('multi_stream_ops')
+    torch.save(payload, path)
+    # Current environment must not retroactively label an old generated plan.
+    assert ComputeConfig.safe_load_from_file(path) == baseline
+    monkeypatch.delenv('NNSCALER_MULTI_STREAM_OPS')
+    assert not ComputeConfig(1, 1).multi_stream_ops
+
+
+@pytest.mark.parametrize('patterns', ['torch.sin', [None], [''], 1])
+def test_internal_stream_declarations_reject_invalid_patterns(patterns):
+    with pytest.raises(ValueError, match='multi_stream_ops'):
+        ComputeConfig(1, 1, multi_stream_ops=patterns)
+
+
+def test_internal_stream_declarations_reject_zero3():
+    with pytest.raises(ValueError, match='multi_stream_ops currently supports ZeRO 0/1'):
+        ComputeConfig(1, 1, use_zero=2, multi_stream_ops=('*.auxiliary_statistics',))
+
+
+@replace_all_device_with('cpu', force=True)
+@pytest.mark.parametrize('workers', [1, 2])
+@pytest.mark.parametrize('checkpointed', [False, True])
+@pytest.mark.parametrize('matched', [False, True])
+def test_internal_stream_operator_scheduled_lifetimes(tmp_path, workers, checkpointed, matched):
+    from nnscaler.policies import pas_dp
+    from nnscaler.ir.operator import IRFwOperation
+    def policy(graph, config):
+        if checkpointed:
+            graph.recompute(graph.select(ntype=IRFwOperation))
+        return pas_dp(graph, config)
+    patterns = ('*.auxiliary_statistics' if matched else '*.not_present',)
+    parallelize(InternalStreamOperatorModel(), {'data': torch.randn(4, 8)}, policy,
+                ComputeConfig(1, 2, use_end2end=True, multi_stream_ops=patterns),
+                gen_savedir=tmp_path, load_module=False, codegen_workers=workers,
+                instance_name=f'internal_stream_{workers}_{checkpointed}_{matched}')
+    for path in tmp_path.rglob('gencode*.py'):
+        code = path.read_text()
+        assert f'use_multi_streams = {matched}' in code
+        assert f'track_stream={matched}' in code
+        assert 'with nnscaler.runtime.stream.ModuleStreams()' not in code

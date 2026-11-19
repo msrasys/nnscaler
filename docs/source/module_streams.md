@@ -30,6 +30,27 @@ code reuse, while allowing reuse of the unmodified traced graph.
 export NNSCALER_MODULE_STREAMS='[{"module":"*.shared","stream":"shared_expert","launch_before":"*.nnscaler_moe_dispatch","split_before":"down_proj","resume_before":"*.nnscaler_moe_combine"}]'
 ```
 
+A registered operator that manages its own CUDA streams can declare that use
+without moving its enclosing module:
+
+```python
+ComputeConfig(2, 2, multi_stream_ops=('my_backend.streamed_operator',))
+```
+
+The corresponding environment variable is
+`NNSCALER_MULTI_STREAM_OPS='["my_backend.streamed_operator"]'`. Signature globs
+are supported. Matching an operator enables scheduled input and opaque-owner
+lifetime tracking throughout the execution plan, including checkpoints and
+parallel code-generation workers. This configuration is serialized and changes
+invalidate generated-code reuse; existing traced graphs can still be reused.
+Loading an older package does not inherit declarations from today's environment.
+
+This declaration does not schedule kernels or establish CUDA dependencies. The
+operator must order its inputs, outputs, backward work, and private allocations
+correctly, and complete its forward work before another microbatch consumes the
+caller stream. Cooperative parameter-gradient backends must also preserve
+reducer and accumulator stream affinity. ZeRO 0/1 are supported.
+
 `module` matches qualified module paths (including all descendant operators).
 `launch_before` matches an operator signature in the enclosing module invocation.
 Repeated invocations of the same module, such as a universal transformer loop,
