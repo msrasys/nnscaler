@@ -6,9 +6,63 @@ import torch
 
 from nnscaler.runtime.cuda_gate import Gate, counts
 from nnscaler.runtime.staged_checkpoint import StagedCheckpoint, ReplayReady
-from nnscaler.runtime.stream import drain_stream_holds
+from nnscaler.runtime.stream import ModuleStreams, drain_stream_holds
+from nnscaler.runtime.deferred import notify_async_launch
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason='requires CUDA')
+
+
+def test_early_release_covers_backend_host_count_wait():
+    torch.cuda._sleep(1)
+    communication = torch.cuda.Stream()
+    x = torch.randn(256, 64, device='cuda', requires_grad=True)
+    w = torch.nn.Parameter(torch.randn(64, 64, device='cuda'))
+    stamps = {}
+
+    def prefix(x, w):
+        if torch.is_grad_enabled():
+            stamp = torch.cuda.Event(enable_timing=True)
+            stamp.record()
+            stamps['prefix'] = stamp
+        return {'y': x @ w}
+
+    def tail(data):
+        return data['y'].sin()
+
+    def whole(x, w):
+        return tail(prefix(x, w))
+
+    expected = torch.autograd.grad(whole(x, w).sum(), (x, w))
+    warm = StagedCheckpoint('early_count_wait', 1 << 20)
+    warm.set_stages(prefix, tail)
+    torch.autograd.grad(warm.checkpoint(whole, x, w).sum(), (x, w))
+    for early in (False, True):
+        with ModuleStreams() as scope:
+            state = scope.checkpoint_prefetch('early_count_wait', 1 << 20, staged=True)
+            state.set_stages(prefix, tail)
+            y = state.checkpoint(whole, x, w)
+            if early:
+                # The compiler emits this release before the anchor's scope.
+                state.prefetch()
+            with scope.prefetch_launch_point((state,), submitted=True):
+                communication.wait_stream(torch.cuda.current_stream())
+                with torch.cuda.stream(communication):
+                    torch.cuda._sleep(40_000_000)
+                    counts_done = torch.cuda.Event(enable_timing=True)
+                    counts_done.record()
+                # Dynamic counts block the host before payload submission.
+                counts_done.synchronize()
+                notify_async_launch()
+        actual = torch.autograd.grad(y.sum(), (x, w))
+        torch.cuda.synchronize()
+        for value, reference in zip(actual, expected):
+            torch.testing.assert_close(value, reference, rtol=0, atol=0)
+        assert (stamps['prefix'].elapsed_time(counts_done) > 0) == early
+        assert state.stats['launched'] == state.stats['reused'] == 1
+        assert not state.gate.fallback()
+        state.budget.poll()
+        assert state.budget.used == 0
+    drain_stream_holds(wait=True)
 
 
 def test_exact_gradients_and_replay_waits_for_anchor_inputs_not_result():

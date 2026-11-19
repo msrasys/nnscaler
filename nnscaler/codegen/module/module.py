@@ -1146,13 +1146,15 @@ class ModuleCodeGen(FuncEmission):
                 staged_forward.setdefault(plan.anchor, []).append(plan.key)
         if any(len(modes) > 1 for modes in modes_at_anchor.values()):
             raise ValueError('Whole and staged replay cannot share one prefetch anchor')
-        prefetch_forward, prefetch_backward = {}, {}
+        prefetch_forward, prefetch_backward, prefetch_before = {}, {}, {}
         for plan in prefetch_plans:
             if any(plan.anchor in region.nodes or any(node.recompute == plan.gid for node in region.nodes)
                    for region in regions.values()):
                 raise ValueError('Checkpoint prefetch cannot also move its checkpoint or anchor forward')
             target = prefetch_forward if plan.rule.recompute_prefetch_phase == 'forward' else prefetch_backward
             target.setdefault(plan.anchor, []).append(plan.key)
+            if plan.rule.recompute_prefetch_release == 'before_operator':
+                prefetch_before.setdefault(plan.anchor, []).append(plan.key)
         readiness_names = {gid: f'_checkpoint_ready_{index}' for index, gid in enumerate(checkpoint_anchors)}
         ready_at = {}
         for gid, anchor in checkpoint_anchors.items():
@@ -1286,6 +1288,13 @@ class ModuleCodeGen(FuncEmission):
             if node in waits:
                 flush()
                 body.extend(f'_module_streams.join({key!r})' for key in waits[node])
+            if node in prefetch_before:
+                flush()
+                # The prefix graph is already queued behind its gate. Release
+                # it before backend entry so receive-count/layout host waits
+                # can overlap it too. Original-forward readiness is retained
+                # by the replay stream; later submission callbacks are idempotent.
+                body.extend(f'{key}.prefetch()' for key in prefetch_before[node])
             if node in launch_points:
                 flush()
                 anchored = launch_points[node]

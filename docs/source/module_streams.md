@@ -524,6 +524,15 @@ incoming gradient. A backend must implement both `notify_async_launch()` and
 forward dependency joins and waits for the prefix before leaving the segment;
 no work is borrowed from another microbatch.
 
+Set `recompute_prefetch_release="before_operator"` to release the already queued
+prefix immediately before entering the selected operator. This can cover a
+backend's layout or receive-count host wait before payload submission. The
+replay stream still waits for the original forward's input readiness, and the
+normal submission callback remains valid. This option requires a staged prefix;
+`None` retains the existing behavior and `"submitted"` explicitly selects the
+staged default. Earlier release can change kernel contention, so measure its
+effect on complete training iterations.
+
 A cold prefix runs during backward to learn its retained storage footprint.
 Subsequent invocations with the same prefix input metadata reserve from the
 shared per-device budget before pre-enqueueing. The key includes only arguments

@@ -59,23 +59,32 @@ class CPUStreams(CPUDeferredStreams):
 @replace_all_device_with('cpu', force=True)
 @pytest.mark.parametrize('workers', [1, 2])
 @pytest.mark.parametrize('side', [False, True])
-def test_compiled_stages_only_replay_and_compose_with_submitted_module(tmp_path, monkeypatch, workers, side):
+@pytest.mark.parametrize('release', [None, 'before_operator'])
+def test_compiled_stages_only_replay_and_compose_with_submitted_module(tmp_path, monkeypatch, workers, side, release):
     monkeypatch.setattr('nnscaler.runtime.stream.ModuleStreams', CPUStreams)
     model = Model()
     reference = copy.deepcopy(model)
     rules = [ModuleStreamRule('attention', stream='staged', recompute_only=True,
-             recompute_prefetch_on='*.prefetch_anchor', recompute_prefetch_prefix='*.projection')]
+             recompute_prefetch_on='*.prefetch_anchor', recompute_prefetch_prefix='*.projection',
+             recompute_prefetch_release=release)]
     if side:
         rules.append(ModuleStreamRule('side', stream='side', launch_on='*.prefetch_anchor', overlap_backward=True))
-    name = f'staged_{workers}_{side}'
+    name = f'staged_{workers}_{side}_{release or "default"}'
     nnscaler.parallelize(model, {'x': torch.randn(4, 4, requires_grad=True)}, policy,
         ComputeConfig(1, 1, module_streams=rules), gen_savedir=tmp_path,
         instance_name=name, load_module=False, codegen_workers=workers)
     source = next(tmp_path.rglob('gencode0.py')).read_text()
     assert source.count('.set_stages(') == 1
     assert source.count('ckpt.checkpoint(') == 1  # Unselected group keeps its normal checkpoint.
+    if release == 'before_operator':
+        assert source.index('_checkpoint_prefetch_0.prefetch()') < source.index('.prefetch_anchor(')
+    else:
+        assert '_checkpoint_prefetch_0.prefetch()' not in source
     cls = _load_parallel_module_class(Model, gen_savedir=tmp_path, instance_name=name, rank=0)
     generated = new_empty(cls, device='cpu', init_params=True)
+    for attr, parameter in generated.named_parameters():
+        torch.testing.assert_close(parameter, reference.get_parameter(generated.fullmap[attr].orig_name),
+                                   rtol=0, atol=0)
     for _ in range(2):
         x = torch.randn(4, 4, requires_grad=True)
         rx = x.detach().clone().requires_grad_()
@@ -95,6 +104,37 @@ def test_invalid_prefix(prefix):
     with pytest.raises(ValueError):
         ModuleStreamRule('attention', recompute_only=True,
                          recompute_prefetch_on='*.anchor', recompute_prefetch_prefix=prefix)
+
+
+@pytest.mark.parametrize('release', ['', 'input_ready', [], True, 4])
+def test_invalid_prefetch_release(release):
+    with pytest.raises(ValueError, match='recompute_prefetch_release'):
+        ModuleStreamRule('attention', recompute_only=True, recompute_prefetch_on='*.anchor',
+                         recompute_prefetch_prefix='*.projection', recompute_prefetch_release=release)
+
+
+def test_prefetch_release_requires_prequeued_prefix():
+    for release in ('before_operator', 'submitted'):
+        with pytest.raises(ValueError, match='staged replay prefix'):
+            ModuleStreamRule('attention', recompute_only=True,
+                             recompute_prefetch_on='*.anchor', recompute_prefetch_release=release)
+
+
+@replace_all_device_with('cpu', force=True)
+def test_early_prefetch_codegen_in_multiple_workers(tmp_path):
+    rule = ModuleStreamRule('attention', stream='staged', recompute_only=True,
+                           recompute_prefetch_on='*.prefetch_anchor',
+                           recompute_prefetch_prefix='*.projection',
+                           recompute_prefetch_release='before_operator')
+    nnscaler.parallelize(Model(), {'x': torch.randn(4, 4, requires_grad=True)}, policy,
+                         ComputeConfig(1, 2, module_streams=[rule]), gen_savedir=tmp_path,
+                         instance_name='early_prefetch_workers', load_module=False,
+                         codegen_workers=2)
+    sources = list(tmp_path.rglob('gencode*.py'))
+    assert len(sources) == 2
+    for path in sources:
+        source = path.read_text()
+        assert source.index('_checkpoint_prefetch_0.prefetch()') < source.index('.prefetch_anchor(')
 
 
 def test_prefix_requires_forward_anchor():

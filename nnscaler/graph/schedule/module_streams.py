@@ -47,11 +47,18 @@ class ModuleStreamRule:
     weight_backward_on: str | None = None
     weight_backward_independent: bool = False
     backward_on: str | None = None
+    recompute_prefetch_release: str | None = None
     # Persist the generated-code ABI, including in pickled configurations.
     # A default factory leaves old pickles detectably missing the field.
-    _codegen_version: int = field(default_factory=lambda: 19, init=False, repr=False)
+    _codegen_version: int = field(default_factory=lambda: 20, init=False, repr=False)
 
     def __post_init__(self):
+        if self.recompute_prefetch_release is not None:
+            if (not isinstance(self.recompute_prefetch_release, str)
+                    or self.recompute_prefetch_release not in ('submitted', 'before_operator')):
+                raise ValueError('recompute_prefetch_release must be submitted or before_operator')
+            if self.recompute_prefetch_prefix is None:
+                raise ValueError('recompute_prefetch_release requires a staged replay prefix')
         if type(self.weight_backward_independent) is not bool:
             raise ValueError('weight_backward_independent must be a boolean')
         if self.weight_backward_independent and not self.weight_backward_on:
