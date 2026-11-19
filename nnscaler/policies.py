@@ -496,8 +496,9 @@ def group_nodes_by_modules(
 
     Each group holds the consecutive operators of one call to a module of `module_types`,
     so a module instance called several times in a row gives one group per call.
-    Calls are told apart by matched module type, FQN and traced invocation id
-    (`node.module_call_stack`).
+    An operator belongs to the outermost matching module in its `module_stack`,
+    so nested matches (e.g. both a layer and its attention are given) never split the outer call.
+    Calls are told apart by module FQN and traced invocation id (`node.module_call_stack`).
     Graphs traced before invocation ids existed fall back to grouping consecutive operators by FQN.
     An operator outside `module_types` ends the current group.
 
@@ -531,17 +532,19 @@ def group_nodes_by_modules(
     groups: list[list[IRFwOperation]] = []
     current_key = None
     for node in graph.select(ntype=IRFwOperation):
-        matched_type = next(
-            (module_type for module_type in module_types if module_type in node.module_class_chain),
+        # module_stack is ordered from the outermost module inwards.
+        fqn = next(
+            (fqn for fqn, mod_cls in (node.module_stack or {}).items() if mod_cls in module_types),
             None,
         )
-        if matched_type is None:
+        if fqn is None:
             current_key = None
             continue
-        fqn = node.get_module_fqn(matched_type)
         calls = node.module_call_stack or {}
-        # (module type, FQN, invocation id) identifies one module call.
-        key = (matched_type, fqn, calls.get(fqn))
+        # (FQN, invocation id) identifies one module call.
+        # An invocation id is unique within a trace, so it alone is enough when present;
+        # FQN is kept for graphs traced without ids, whose ids are all None.
+        key = (fqn, calls.get(fqn))
         if key != current_key:
             groups.append([])
             current_key = key

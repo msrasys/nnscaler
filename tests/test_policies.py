@@ -85,14 +85,10 @@ def test_group_nodes_by_modules_in_fn_policy(tmp_path, memory_mode):
 
 
 class _FakeGroupNode:
-    def __init__(self, module_type=None, fqn=""):
-        self.module_class_chain = [] if module_type is None else [module_type]
+    def __init__(self, *stack):
+        # stack: (fqn, module type) pairs, outermost first
+        self.module_stack = dict(stack)
         self.module_call_stack = None  # graph traced without invocation ids
-        self._fqn = fqn
-
-    def get_module_fqn(self, module_type):
-        assert module_type in self.module_class_chain
-        return self._fqn
 
 
 class _FakeGroupGraph:
@@ -103,21 +99,29 @@ class _FakeGroupGraph:
         return self.nodes
 
 
+class GroupInnerTarget(nn.Module):
+    pass
+
+
 def test_group_nodes_by_modules_group_boundaries():
     from nnscaler.policies import group_nodes_by_modules
 
+    block0, block1 = ("blocks.0", RecomputeTarget), ("blocks.1", RecomputeTarget)
+    inner = ("blocks.1.inner", GroupInnerTarget)
     nodes = [
         _FakeGroupNode(),
-        _FakeGroupNode(RecomputeTarget, "blocks.0"),
-        _FakeGroupNode(RecomputeTarget, "blocks.0"),
-        _FakeGroupNode(),                              # ends the group
-        _FakeGroupNode(RecomputeTarget, "blocks.0"),
-        _FakeGroupNode(RecomputeTarget, "blocks.1"),   # FQN change
-        _FakeGroupNode(RecomputeTarget, "blocks.1"),
+        _FakeGroupNode(block0),
+        _FakeGroupNode(block0),
+        _FakeGroupNode(),                    # ends the group
+        _FakeGroupNode(block0),
+        _FakeGroupNode(block1),              # FQN change
+        _FakeGroupNode(block1, inner),       # nested match stays in the outer call
+        _FakeGroupNode(block1),
+        _FakeGroupNode(inner),               # only the inner type matches
     ]
-    groups = group_nodes_by_modules(_FakeGroupGraph(nodes), [RecomputeTarget])
+    groups = group_nodes_by_modules(_FakeGroupGraph(nodes), [GroupInnerTarget, RecomputeTarget])
 
-    assert groups == [nodes[1:3], nodes[4:5], nodes[5:7]]
+    assert groups == [nodes[1:3], nodes[4:5], nodes[5:8], nodes[8:9]]
 
 
 class MLP(nn.Module):
