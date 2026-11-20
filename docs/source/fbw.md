@@ -198,7 +198,8 @@ A custom implementation must satisfy at least these invariants:
 5. Handle `None` output gradients, duplicate outputs, no outputs, no grad-requiring stage inputs, and multi-output nodes correctly.
 6. Route dW through parameter `AccumulateGrad` nodes so that reducer hooks fire.
 7. Discard unpublished partial state after an exception, and provide clear/check operations that detect unmatched B or W calls.
-8. Compare both model parameters and optimizer state against a baseline. Parameter equality after a short run can hide missing or duplicate gradients.
+8. Return the input gradients whenever the segment has output tensors, even if the schedule discards them. Unless the implementation calls `Executor.backward_input` or `Executor.backward` for the segment, as the DeepSeek example does, `custom_fbw` writes them to inputs that called `retain_grad()` and passes them to callbacks registered with `Executor.register_input_grad_callback`, as the default implementation does; it raises if they are missing for such inputs.
+9. Compare both model parameters and optimizer state against a baseline. Parameter equality after a short run can hide missing or duplicate gradients.
 
 `custom_fbw` only replaces and restores the runtime entry points. It does not maintain this state for the implementation and does not change the schedule produced by `use_fbw=True`.
 

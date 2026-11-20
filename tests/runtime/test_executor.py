@@ -321,6 +321,10 @@ def test_backward_without_output_roots_preserves_state_pairing(use_fbw, ninputs)
         'no_roots', lambda *args: tuple((value * weight).data for value in args),
         *inputs,
     )
+    # A segment without gradient roots reports "no gradient" to registered callbacks.
+    callback_grads = []
+    for tensor in inputs:
+        Executor.register_input_grad_callback(tensor, callback_grads.append)
     if use_fbw:
         grads = Executor.backward_input('no_roots', inputs, [], [], [weight])
         assert len(Executor._weight_backward_states['no_roots']) == 1
@@ -331,7 +335,172 @@ def test_backward_without_output_roots_preserves_state_pairing(use_fbw, ninputs)
     assert grads is None
     assert weight.grad is None
     assert all(tensor.grad is None for tensor in inputs)
+    assert callback_grads == [None] * ninputs
     Executor.check_clear()
+
+
+@pytest.mark.parametrize('mode', ['full', 'split', 'custom_fbw'])
+def test_input_grad_callback_accumulates_consumer_segments(mode):
+    weight = torch.nn.Parameter(torch.tensor(2., dtype=torch.float64))
+    outer_input = weight * 3
+    outer_input.retain_grad()
+    callback_grads = []
+
+    def resume_outer_backward(grad):
+        callback_grads.append(grad)
+        torch.autograd.backward(outer_input, grad)
+
+    Executor.register_input_grad_callback(outer_input, resume_outer_backward)
+    first = Executor.fexecute('first', lambda tensor: tensor * 5, outer_input)
+    # A consumer without gradient roots adds nothing to the others' sum.
+    Executor.fexecute('rootless', lambda tensor: (tensor * 11).data, outer_input)
+    second = Executor.fexecute('second', lambda tensor: tensor * 7, outer_input)
+    # custom_fbw wraps a replacement that dispatches through Executor itself;
+    # the pending entry must not be accumulated a second time by the wrapper.
+    for name, outputs in (('second', [second]), ('rootless', []), ('first', [first])):
+        output_grads = [torch.ones_like(output) for output in outputs]
+        if mode == 'full':
+            Executor.backward(name, [outer_input], outputs, output_grads)
+        else:
+            with executor.custom_fbw(Executor.backward_input, Executor.backward_weight) \
+                    if mode == 'custom_fbw' else torch.enable_grad():
+                executor.backward_input(name, [outer_input], outputs, output_grads, [])
+                executor.backward_weight(name, [])
+        # Only the last pending consumer fires the callback.
+        assert len(callback_grads) == (name == 'first')
+
+    torch.testing.assert_close(callback_grads[0], torch.tensor(12., dtype=torch.float64))
+    torch.testing.assert_close(weight.grad, torch.tensor(36., dtype=torch.float64))
+    # The callback's outer backward retains the grad; Executor must not add a second copy.
+    torch.testing.assert_close(outer_input.grad, torch.tensor(12., dtype=torch.float64))
+    Executor.check_clear()
+
+
+@pytest.mark.parametrize('bypass_executor', [False, True])
+@pytest.mark.parametrize('callback', [False, True])
+@pytest.mark.parametrize('check_coverage', [False, True])
+def test_custom_fbw_handles_boundary_grads(check_coverage, callback, bypass_executor):
+    leaf = torch.randn(2, 3, dtype=torch.float64, requires_grad=True)
+    boundary = leaf * 2
+    boundary.retain_grad()
+    weight = torch.nn.Parameter(torch.randn(3, 4, dtype=torch.float64))
+    reference_weight = weight.detach().clone().requires_grad_()
+    reference_input = boundary.detach().clone().requires_grad_()
+    (reference_input @ reference_weight).sum().backward()
+    output = Executor.fexecute('segment', lambda tensor: tensor @ weight, boundary)
+    callbacks = []
+    pending = {}
+
+    def custom_input(name, inputs, outputs, grads, weights):
+        pairs = Executor._detach[name].pop(0)
+        detached_inputs = [tensor for _, tensor in pairs if tensor.requires_grad]
+        result = torch.autograd.grad(outputs, detached_inputs, grads, retain_graph=True)
+        pending[name] = (outputs, grads)
+        return result[0] if len(result) == 1 else result
+
+    def custom_weight(name, weights):
+        outputs, grads = pending.pop(name)
+        torch.autograd.backward(outputs, grads, inputs=weights)
+
+    def resume(grad):
+        callbacks.append(grad)
+        boundary.backward(grad)
+
+    # A replacement that consumes _detach itself needs the wrapper to write the
+    # retained grad, or dispatch the callback, which then writes it once.
+    # One that calls Executor must not get them a second time from the wrapper.
+    with executor.custom_fbw(
+        custom_input if bypass_executor else Executor.backward_input,
+        custom_weight if bypass_executor else Executor.backward_weight,
+        check_grad_coverage=check_coverage,
+    ):
+        # Registration happens inside the context, as in a generated schedule.
+        if callback:
+            Executor.register_input_grad_callback(boundary, resume)
+        grad = executor.backward_input(
+            'segment', [boundary], [output], [torch.ones_like(output)], [weight],
+        )
+        assert len(callbacks) == callback
+        assert weight.grad is None
+        executor.backward_weight('segment', [weight])
+    torch.testing.assert_close(grad, reference_input.grad)
+    torch.testing.assert_close(boundary.grad, reference_input.grad)
+    if callback:
+        torch.testing.assert_close(leaf.grad, reference_input.grad * 2)
+    else:
+        assert leaf.grad is None
+    torch.testing.assert_close(weight.grad, reference_weight.grad)
+    Executor.check_clear()
+
+
+def test_input_grad_callback_rejects_consumer_after_delivery():
+    shared = torch.randn(3, requires_grad=True) * 1
+    callback_grads = []
+
+    def run_micro_batch():
+        output = Executor.fexecute('segment', lambda tensor: tensor * 5, shared)
+        Executor.backward('segment', [shared], [output], [torch.ones_like(output)])
+
+    Executor.register_input_grad_callback(shared, callback_grads.append)
+    run_micro_batch()
+    assert len(callback_grads) == 1
+    # Feeding the same tensor to a later micro-batch would lose that gradient.
+    with pytest.raises(RuntimeError, match='callback already fired'):
+        Executor.fexecute('segment', lambda tensor: tensor * 5, shared)
+
+    # Registering again starts a new round.
+    Executor.register_input_grad_callback(shared, callback_grads.append)
+    run_micro_batch()
+    assert len(callback_grads) == 2
+
+    # A released tensor is forgotten, so a new tensor reusing its id is not rejected.
+    del shared
+    assert not Executor._delivered_input_grads
+    Executor.check_clear()
+
+def test_custom_fbw_survives_reentrant_backward_in_callback():
+    first = torch.tensor([3.0], requires_grad=True) * 1
+    first.retain_grad()
+    second = torch.tensor([4.0], requires_grad=True) * 1
+    first_output = Executor.fexecute('first', lambda tensor: tensor * 5, first)
+    second_output = Executor.fexecute('second', lambda tensor: tensor * 7, second)
+
+    def run_second_segment(grad):
+        # The callback runs another segment's backward through Executor.
+        Executor.backward('second', [second], [second_output], [torch.ones(1)])
+
+    with executor.custom_fbw(Executor.backward_input, Executor.backward_weight):
+        Executor.register_input_grad_callback(first, run_second_segment)
+        executor.backward_input('first', [first], [first_output], [torch.ones(1)], [])
+        executor.backward_weight('first', [])
+    # The wrapper must still see the first segment as handled by Executor,
+    # rather than write the retained grad the callback owns.
+    assert first.grad is None
+    Executor.check_clear()
+
+def test_check_input_grad_callbacks_fired_rejects_pending_callback():
+    # E.g. registered on a rank whose pipeline stage never consumes the tensor.
+    tensor = torch.randn(2, requires_grad=True) * 1
+    Executor.register_input_grad_callback(tensor, lambda grad: None)
+    with pytest.raises(RuntimeError, match='did not fire'):
+        Executor.check_input_grad_callbacks_fired()
+    # The pending callback is dropped so that the outer graph is released.
+    Executor.check_clear()
+
+
+def test_custom_fbw_rejects_missing_input_grad_for_callback():
+    boundary = torch.randn(3, requires_grad=True) * 1
+    output = Executor.fexecute('segment', lambda tensor: tensor * 5, boundary)
+    Executor.register_input_grad_callback(boundary, lambda grad: None)
+
+    def custom_input(name, inputs, outputs, grads, weights):
+        # Drops the input gradient although the segment has gradient roots.
+        Executor._detach[name].pop(0)
+        return None
+
+    with executor.custom_fbw(custom_input, lambda name, weights: None):
+        with pytest.raises(RuntimeError, match='returned no gradient for a retained or callback input'):
+            executor.backward_input('segment', [boundary], [output], [torch.ones_like(output)], [])
 
 
 def test_custom_fbw_restores_module_symbols():
@@ -352,12 +521,13 @@ def test_custom_fbw_restores_module_symbols():
 
     with pytest.raises(RuntimeError, match='expected'):
         with executor.custom_fbw(outer_input, outer_weight):
-            assert executor.backward_input is outer_input
+            outer_wrapper = executor.backward_input
+            assert outer_wrapper.__wrapped__ is outer_input
             assert executor.backward_weight is outer_weight
             with executor.custom_fbw(inner_input, inner_weight):
-                assert executor.backward_input is inner_input
+                assert executor.backward_input.__wrapped__ is inner_input
                 assert executor.backward_weight is inner_weight
-            assert executor.backward_input is outer_input
+            assert executor.backward_input is outer_wrapper
             assert executor.backward_weight is outer_weight
             raise RuntimeError('expected')
 
