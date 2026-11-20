@@ -365,3 +365,45 @@ def test_collectives_respect_explicit_rank_order(async_op, ranks, dsts):
             ], dim=idim)
             assert torch.equal(exchanges[index * 2], expected)
             assert torch.equal(exchanges[index * 2 + 1], expected)
+
+
+def _consumer_stream_worker(same_stream):
+    from nnscaler.runtime.executor import AsyncCommHandler, Executor
+    _init_distributed(2)
+    # Fill empty floating-point buffers with NaN so that a stale read is visible.
+    torch.use_deterministic_algorithms(True)
+    rank = torch.distributed.get_rank()
+    tensor = torch.full((128, 256), rank + 1.0)
+    unrelated_input = torch.ones(1)
+    observed = torch.empty((256, 256))
+    # Lazy CUDA kernel loading can synchronize the device and hide the race.
+    torch.cat([tensor, tensor], dim=0, out=observed)
+    gathered = nnscaler.runtime.adapter.all_gather(tensor, 0, [0, 1], async_op=True)
+    # Complete NCCL without running the concatenation callback.
+    torch.cuda.synchronize()
+    adapter_stream = torch.cuda.Stream()
+    consumer_stream = adapter_stream if same_stream else torch.cuda.Stream()
+    with torch.cuda.stream(adapter_stream):
+        # An unrelated adapter must not run the callback on its stream;
+        # if it did, the delay would leave the assembly queued behind it.
+        torch.cuda._sleep(2_000_000_000)
+        Executor.aexecute(lambda t: t, unrelated_input, requires_grad=False)
+    with torch.cuda.stream(consumer_stream):
+        resolved, = Executor.sync_tensors([gathered])
+        # Snapshot on the consumer stream before any device-wide synchronization.
+        observed.copy_(resolved)
+    consumer_stream.synchronize()
+    AsyncCommHandler().check_clear()
+    return clone_to_cpu(observed)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.device_count() < 2, reason='lack of gpu devices')
+@pytest.mark.parametrize('same_stream', [True, False], ids=['same-stream', 'cross-stream'])
+def test_async_wait_orders_consumer_stream(same_stream):
+    results = launch_torchrun(2, _consumer_stream_worker, same_stream)
+    expected = torch.cat([torch.full((128, 256), rank + 1.0) for rank in range(2)])
+    for rank, actual in results.items():
+        torch.testing.assert_close(
+            actual, expected, rtol=0, atol=0,
+            msg=lambda msg: f'async all_gather consumed incorrect data on rank {rank}: {msg}',
+        )
