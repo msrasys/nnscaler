@@ -87,6 +87,13 @@ class IRSegment(IRCell):
         super().__init__(name, '', len(inputs), len(outputs))
 
         self._nodes: List[IRCell] = []
+        # Identity-based membership indexes of `_nodes`.
+        # Like `_producers`/`_consumers`, they are derived from `_nodes`:
+        # `insert`/`remove` update them incrementally, and any code that changes
+        # the membership of `_nodes` directly must call `_reorder_producer_consumer()`
+        # afterwards (a pure reordering such as `IRGraph.sequential` keeps them valid).
+        self._node_set: Set[IRCell] = set()
+        self._sub_segments: Set[IRSegment] = set()
 
         # full objects
         self._fobjects: Set[IRObject] = set()
@@ -231,19 +238,19 @@ class IRSegment(IRCell):
         @return index int: the index
         """
         assert isinstance(node, IRCell)
-        if node in self._nodes:
+        if node in self._node_set:
             return CellPosition((self._nodes.index(node),))
-        for idx, segment in enumerate(self._nodes):
-            if isinstance(segment, IRSegment):
-                if segment.exist(node):
-                    index = segment.index(node)
-                    return CellPosition((idx,) + index.indices)
+        for segment in self._sub_segments:
+            if segment.exist(node):
+                index = segment.index(node)
+                return CellPosition((self._nodes.index(segment),) + index.indices)
         raise KeyError(f"The queried node: {node} not in the graph")
 
     def multi_index(self, nodes: List[IRCell]) -> List[CellPosition]:
         """
         Get multiple node indices, traversing the graph only once
-        to save time.
+        to save time. A node listed several times gets the same position
+        at each of its slots.
 
         Args:
             nodes (List[IRCell]): nodes to be indexed
@@ -253,23 +260,27 @@ class IRSegment(IRCell):
         """
         visited = 0
         indices = [None] * len(nodes)
+        # node -> first position in `nodes`, same as `nodes.index(node)`
+        lookup: Dict[IRCell, int] = {}
+        for i, node in enumerate(nodes):
+            lookup.setdefault(node, i)
         def dfs(seg: IRSegment, path: List[int]):
             nonlocal visited, indices
             for idx, node in enumerate(seg._nodes):
-                if node in nodes:
-                    indices[nodes.index(node)] = CellPosition(tuple(path + [idx]))
+                if node in lookup:
+                    indices[lookup[node]] = CellPosition(tuple(path + [idx]))
                     visited += 1
-                if visited == len(nodes):
+                if visited == len(lookup):
                     return
                 if isinstance(node, IRSegment):
                     dfs(node, path + [idx])
         dfs(self, [])
-        if visited != len(nodes):
-            unvisited = []
-            for idx, node in zip(indices, nodes):
-                if idx is None:
-                    unvisited.append(node)
+        if visited != len(lookup):
+            unvisited = [node for node, i in lookup.items() if indices[i] is None]
             raise RuntimeError(f"Some of the queried nodes: {unvisited} not in the graph")
+        # duplicated nodes take the position found for their first occurrence
+        for i, node in enumerate(nodes):
+            indices[i] = indices[lookup[node]]
         return indices
 
     def segment(self, node: IRCell) -> IRCell:
@@ -281,11 +292,12 @@ class IRSegment(IRCell):
         @return segment IRSegment
         """
         assert isinstance(node, IRCell), f"Expected IRCell, but got {node}"
-        index = self.index(node)
-        if len(index) == 1:
+        if node in self._node_set:
             return self
-        else:
-            return self.node(CellPosition(index.indices[:-1]))
+        for segment in self._sub_segments:
+            if segment.exist(node):
+                return segment.segment(node)
+        raise KeyError(f"The queried node: {node} not in the graph")
 
     def producers(self, ftensor: IRFullTensor) -> Tuple[IRCell]:
         """
@@ -485,12 +497,17 @@ class IRSegment(IRCell):
 
     def _reorder_producer_consumer(self):
         """
-        Re-order producers and consumers for each full tensor to match
-        with the ordering of nodes.
+        Rebuild every index derived from `_nodes`: the node membership indexes,
+        and the producers / consumers of each full tensor in node order.
+
+        Call this after `_nodes` has been rewritten directly (bypassing
+        `insert`/`remove`), e.g. after `_nodes[:] = ...` in segment expansion.
 
         Note sub-segment will also be reordered.
         """
         # clear up
+        self._node_set = set(self._nodes)
+        self._sub_segments = {n for n in self._nodes if isinstance(n, IRSegment)}
         self._fobjects, self._attributes = set(), set()
         self._producers, self._ptensors = dict(), dict()
         self._consumers, self._ctensors = dict(), dict()
@@ -534,7 +551,14 @@ class IRSegment(IRCell):
         if len(pos) == 1:
             index = pos[0]
             # insert node
+            # a node must appear once per segment, otherwise `index`/`remove`
+            # are ambiguous and the membership indexes would go stale on removal
+            if node in self._node_set:
+                raise ValueError(f"{node} is already in the segment")
             self._nodes.insert(index, node)
+            self._node_set.add(node)
+            if isinstance(node, IRSegment):
+                self._sub_segments.add(node)
             if isinstance(node, IRAdapter): return
             # update producer and consumer
             # NOTE: we use `dict.fromkeys` to remove duplicate tensors
@@ -576,6 +600,9 @@ class IRSegment(IRCell):
             index = pos[0]
             # remove
             self._nodes.pop(index)
+            self._node_set.discard(node)
+            if isinstance(node, IRSegment):
+                self._sub_segments.discard(node)
             # update producer and consumer
             if isinstance(node, IRAdapter): return pos
             # consumer
@@ -658,13 +685,10 @@ class IRSegment(IRCell):
 
         @return exsit bool: True if exist otherwise False
         """
-        if node in self._nodes:
+        if node in self._node_set:
             return True
         if flatten:
-            for segment in self._nodes:
-                if not isinstance(segment, IRSegment): continue
-                if segment.exist(node, flatten):
-                    return True
+            return any(segment.exist(node, flatten) for segment in self._sub_segments)
         return False
 
     def select(self, name: Optional[str] = None, ntype: Optional[IRCell] = None, flatten: bool = True) -> List[IRCell]:
@@ -1579,8 +1603,9 @@ class IRSegmentExpander:
             else:
                 return None
 
+        isfw = segment.isfw()
         for node in nodes:
-            if (segment.isfw()
+            if (isfw
                 and node.fn == _identity_fn
                 and isinstance(node.input(0), IRSubTensor)
                 and (per_device_input := _find_per_device_partitioned_input(
@@ -1601,7 +1626,7 @@ class IRSegmentExpander:
                 replaced_nodes[node] = new_node
                 replaced_nodes[node.mirror] = new_bwnode
                 yield new_node
-            elif not segment.isfw() and node in replaced_nodes:
+            elif not isfw and node in replaced_nodes:
                 # for backward segment, if the mirror node in forward segment is fixed,
                 # we also need to fix it
                 yield replaced_nodes[node]
