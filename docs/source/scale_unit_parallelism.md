@@ -1182,7 +1182,8 @@ generate rank-specific modules without loading or running them on GPUs. It then 
 - selected custom-operator input and weight shapes captured from the transformed graph;
 - expert-weight slices on each rank;
 - reducer ranks emitted in generated code;
-- the number of generated `gencodeN.py` files;
+- the number of generated `gencodeN.py` files (one per plan device; ranks of the other scale
+  units load the file of the same plan device and shift communication ranks at runtime);
 - sampler mappings for all scale-unit ranks.
 
 `tests/cli/test_cp_ep.py::test_cp4_ep2_runtime8_static` demonstrates this workflow.

@@ -28,7 +28,7 @@ from nnscaler.execplan.execplan import ExeReuseCell
 from nnscaler.codegen.syntax.symtable import SymbolTable
 from nnscaler.codegen.syntax.blocks import ClassBlock, ForBlock, FunctionBlock, Block
 
-from nnscaler.codegen.emit import FuncEmission
+from nnscaler.codegen.emit import FuncEmission, IRValue
 from nnscaler.codegen.module.autograd import AutogradAdapterCodeGen
 from nnscaler.codegen.lifecycle import LifeCycle
 
@@ -88,12 +88,17 @@ class ModuleCodeGen(FuncEmission):
         ```
     """
 
+    # name of the argument carrying the scale unit index into generated
+    # `torch.autograd.Function` adapters, which have no `self`.
+    AUTOGRAD_SCALE_UNIT_INDEX_ARG = 'scale_unit_index'
+
     def __init__(
         self,
         execplan: ExecutionPlan,
         runtime_ndevs: Optional[int] = None,
         *,
-        scale_ndevs: Optional[int] = None
+        scale_ndevs: Optional[int] = None,
+        share_scale_unit_code: bool = False,
     ) -> None:
         """
         Create Module code generator
@@ -102,6 +107,15 @@ class ModuleCodeGen(FuncEmission):
             execplan (ExecutionPlan): execution plan
             runtime_ndevs (Optional[int]): the number of devices in runtime
             scale_ndevs (Optional[int]): Deprecated. Use `runtime_ndevs` instead
+            share_scale_unit_code (bool): generate the parallel module code once per plan device
+                and share it across scale units: ranks of communication groups are shifted at
+                runtime by `self.scale_unit_index`, the class leaves `rank` to be assigned at load
+                time, and `gen()` is called with plan devices only.
+                It is rejected when the graph uses a customized `emit_fn` with the legacy signature,
+                because such a function hard-codes runtime ranks; use
+                `IRGraph.legacy_emit_signatures()` to check beforehand. Only parallel modules
+                support it (`CubeModule` has no scale unit index), so it is off by default and
+                `parallelize` turns it on.
         """
         super().__init__()
         self.execplan: ExecutionPlan = execplan
@@ -124,6 +138,7 @@ class ModuleCodeGen(FuncEmission):
         if self.runtime_ndevs % len(self.devices) != 0:
             raise ValueError(f'runtime_ndevs must be a multiple of {len(self.devices)}')
         self.enable_dp = self.runtime_ndevs > len(self.devices)
+        self.share_scale_unit_code: bool = share_scale_unit_code
 
         self.init_code: List[str] = [
             '########## Generated Model Code ###########',
@@ -177,6 +192,20 @@ class ModuleCodeGen(FuncEmission):
         # communication groups
         self.comm_groups: List[Tuple[int]] = self.get_comm_groups()
         self.add_scale_reducers()
+
+        if self.share_scale_unit_code:
+            legacy_signatures = self.execplan.graph.legacy_emit_signatures()
+            if legacy_signatures:
+                raise ValueError(
+                    f"Code cannot be shared across scale units: operators {legacy_signatures} are "
+                    f"registered with an emit_fn of the legacy signature "
+                    f"(node, args, kwargs, runtime_devid, plan_ndevs, runtime_ndevs), which hard-codes runtime ranks."
+                )
+
+    @property
+    def _autograd_extra_args(self) -> Optional[List[str]]:
+        """Leading arguments of custom autograd adapter calls (see `scale`)."""
+        return ['self.scale_unit_index'] if self.share_scale_unit_code else None
 
     def add_scale_reducers(self):
         """
@@ -303,10 +332,37 @@ class ModuleCodeGen(FuncEmission):
         return comm_groups
 
     def scale(self, node: IRCell, device: int) -> IRCell:
+        """
+        Turn a plan-level node into the node executed by runtime device `device`.
+
+        The plan is replicated over scale units, so the communication ranks of an adapter
+        are the plan ranks shifted by the offset of the scale unit. With `share_scale_unit_code`,
+        `device` is a plan device and the shift is emitted as an expression of the scale unit
+        index evaluated at runtime, so that one file serves all scale units.
+        """
         if not self.enable_dp:
             return node
-        shift = (device // len(self.devices)) * len(self.devices)
+        plan_ndevs = len(self.devices)
+        shift = None if self.share_scale_unit_code else (device // plan_ndevs) * plan_ndevs
         if isinstance(node, IRAdapter):
+            # custom differentiable adapters are emitted as `torch.autograd.Function` classes
+            # without `self`, so they get the scale unit index as a forward argument instead.
+            index_expr = (
+                self.AUTOGRAD_SCALE_UNIT_INDEX_ARG if node.is_custom_autograd
+                else 'self.scale_unit_index'
+            )
+            offset_expr = f'{index_expr} * {plan_ndevs}'
+
+            def shift_rank(rank: int):
+                if shift is not None:
+                    return rank + shift
+                return IRValue(f'{int(rank)} + {offset_expr}')
+
+            def shift_ranks(ranks: List[int]):
+                if shift is not None:
+                    return [rank + shift for rank in ranks]
+                return IRValue(f'[r + {offset_expr} for r in {[int(rank) for rank in ranks]!r}]')
+
             adapter = copy.copy(node)
             adapter._id = node.cid
             adapter.kwargs.update(node.kwargs)
@@ -314,19 +370,15 @@ class ModuleCodeGen(FuncEmission):
             for prim in adapter.prims:
                 p = copy.copy(prim)
                 p.kwargs = dict(**prim.kwargs)
-                if 'ranks' in prim.kwargs:
-                    p.kwargs['ranks'] = [rank + shift for rank in prim.kwargs['ranks']]
-                if 'src' in prim.kwargs:
-                    p.kwargs['src'] = prim.kwargs['src'] + shift
-                if 'srcs' in prim.kwargs:
-                    p.kwargs['srcs'] = [src + shift for src in prim.kwargs['srcs']]
-                if 'dst' in prim.kwargs:
-                    p.kwargs['dst'] = prim.kwargs['dst'] + shift
-                if 'dsts' in prim.kwargs:
-                    p.kwargs['dsts'] = [dst + shift for dst in prim.kwargs['dsts']]
+                for key in ('ranks', 'srcs', 'dsts'):
+                    if key in prim.kwargs:
+                        p.kwargs[key] = shift_ranks(prim.kwargs[key])
+                for key in ('src', 'dst'):
+                    if key in prim.kwargs:
+                        p.kwargs[key] = shift_rank(prim.kwargs[key])
                 prims.append(p)
             adapter.prims = prims
-            if node.isfw() and node.differentiable and node.custom:
+            if node.isfw() and node.is_custom_autograd:
                 badapter = self.scale(node.mirror, device)
                 IRCell.make_pair(adapter, badapter)
             return adapter
@@ -458,6 +510,14 @@ class ModuleCodeGen(FuncEmission):
         node_args: List[List[str]] = list()
         gen_nodes: List[IRCell] = list()
 
+        if self.share_scale_unit_code and not as_parallel_module:
+            raise ValueError("Only parallel modules can share code across scale units, "
+                             "construct ModuleCodeGen with share_scale_unit_code=False for CubeModule")
+        if self.share_scale_unit_code and device >= len(self.devices):
+            raise ValueError(
+                f"Shared scale unit code is generated for plan devices only, "
+                f"but got device {device} >= {len(self.devices)}"
+            )
         device_map = device % len(self.devices)
         sequence = self.execplan.seq(device_map)
         unrolled_seqs = []
@@ -476,8 +536,11 @@ class ModuleCodeGen(FuncEmission):
         autograd_adapter_gen = AutogradAdapterCodeGen()
         for seg in fsegments:
             for adapter in seg.select(ntype=IRAdapter):
-                if adapter.differentiable and adapter.custom:
-                    gencode += autograd_adapter_gen.gen(adapter) + ['', '']
+                if adapter.is_custom_autograd:
+                    gencode += autograd_adapter_gen.gen(
+                        adapter,
+                        [self.AUTOGRAD_SCALE_UNIT_INDEX_ARG] if self.share_scale_unit_code else [],
+                    ) + ['', '']
                     adapter.signature = autograd_adapter_gen.name(adapter) + '.apply'
 
         # initialize communication groups
@@ -507,7 +570,10 @@ class ModuleCodeGen(FuncEmission):
             elif isinstance(node, IRFwOperation):
                 raise RuntimeError(f"Unexcepted global-level op call: {node}")
             elif isinstance(node, IRAdapter):
-                codes = self.emit_adapter(node, prefix_attr='self.', async_op=CompileFlag.async_comm)
+                codes = self.emit_adapter(
+                    node, prefix_attr='self.', async_op=CompileFlag.async_comm,
+                    autograd_extra_args=self._autograd_extra_args,
+                )
             elif isinstance(node, IRWeightReducer):
                 self.init_reducer(node, device, param_first_used_pos, param_num_segments, as_parallel_module)
                 codes = self.emit_reducer(node)
@@ -563,7 +629,12 @@ class ModuleCodeGen(FuncEmission):
             cb.insert_body(f'cuda_sync_required = {self.execplan.cuda_sync_required}')
 
             if as_parallel_module:
-                cb.insert_body(f'rank = {device}')  # save rank in class level
+                if self.share_scale_unit_code:
+                    # the loader (`nnscaler.parallel._load_parallel_module_class`) assigns the
+                    # rank, because this file serves every rank `r` with `r % plan_ngpus == device`
+                    cb.insert_body(f'rank = None  # shared by ranks {device} + k * {len(self.devices)}, assigned when loaded')
+                else:
+                    cb.insert_body(f'rank = {device}')  # save rank in class level
                 cb.insert_body(f'world_size = {self.runtime_ndevs}')  # save world size in class level
                 # async_op, max_bucket_size_bytes and zero_use_reduce_scatter
                 # parameters are for testing purpose
@@ -1018,7 +1089,10 @@ class ModuleCodeGen(FuncEmission):
                                     f'we set clone_level=1 to avoid in-place modification issue.')
                     node.kwargs['clone_level'] = 1
 
-                code = self.emit_fnode(node, runtime_devid=runtime_devid, plan_ndevs=len(self.devices), runtime_ndevs=self.runtime_ndevs, prefix_attr='self.')
+                code = self.emit_fnode(
+                    node, runtime_devid=runtime_devid, plan_ndevs=len(self.devices), runtime_ndevs=self.runtime_ndevs,
+                    prefix_attr='self.', share_scale_unit_code=self.share_scale_unit_code,
+                )
 
                 if not param_inputs or CompileFlag.use_zero <= 1:
                     node_code += code
@@ -1064,7 +1138,8 @@ class ModuleCodeGen(FuncEmission):
             elif isinstance(node, IRAdapter):
                 # for adapters inside an IRSegment, we don't apply async communication to it
                 # as it is mostly in critical path.
-                code = self.emit_adapter(node, async_op=False)
+                code = self.emit_adapter(
+                    node, async_op=False, autograd_extra_args=self._autograd_extra_args)
                 node_code += code
             else:
                 raise RuntimeError(f"unexpected type {type(node)} in IRSegment")

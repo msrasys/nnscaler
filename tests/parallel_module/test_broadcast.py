@@ -123,9 +123,10 @@ def _gpu_worker(tmp_path):
     m = p(tempdir, 'all', '_6', load_module=False, reuse='graph')
     if node_rank != 0:
         # only python files are broadcasted
-        assert set(f.name for f in Path(outdir6).glob('**/*') if f.is_file()) == set(
-            [f'gencode{i}.py' for i in range(world_size)] + ['compute_config.pt']
-        )
+        # (plan_ngpus is 1, so one code file is shared by all ranks)
+        assert set(f.name for f in Path(outdir6).glob('**/*') if f.is_file()) == {
+            'gencode0.py', 'compute_config.pt'
+        }
 
     torch.distributed.barrier()
 

@@ -223,9 +223,11 @@ def get_gencode(cubesave_dir, module_class, index=0):
     from nnscaler.parallel import _PARALLEL_MODULE_NAMESPACE, _get_full_qualified_name, _DEFAULT_INSTANCE_NAME
     from pathlib import Path
 
+    from tests.parallel_module.test_gencode import _gencode_file
+
     namespace = f'{_PARALLEL_MODULE_NAMESPACE}.{_get_full_qualified_name(module_class)}.{_DEFAULT_INSTANCE_NAME}'
     outdir: Path = cubesave_dir / Path(namespace.replace('.', '/').strip('/'))
-    filecontent = (outdir /f'gencode{index}.py').read_text()
+    filecontent = _gencode_file(outdir, index).read_text()
     return filecontent
 
 

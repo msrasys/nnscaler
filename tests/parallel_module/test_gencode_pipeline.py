@@ -8,6 +8,16 @@ from nnscaler import parallelize, ComputeConfig
 from tests.parallel_module.test_gencode import replace_all_device_with, _gencode_contains, print_gencode
 
 
+# The 4-device plan is shared by both scale units, so generated communication ranks are
+# plan ranks shifted by the scale unit offset at runtime (ranks >= 4 read the shared file).
+def _su_rank(plan_rank: int) -> str:
+    return rf'{plan_rank} \+ self\.scale_unit_index \* 4'
+
+
+def _su_ranks(plan_ranks) -> str:
+    return r'\[r \+ self\.scale_unit_index \* 4 for r in ' + re.escape(repr(list(plan_ranks))) + r'\]'
+
+
 class PPModule1(torch.nn.Module):
     def __init__(self, dim: int = 1024, nlayers: int = 4, *, return_type: int = 0):
         super().__init__()
@@ -139,11 +149,11 @@ def test_gencode_irobject_output(tmp_path, return_type):
         src_rank = 3
     else:
         src_rank = 2
-    for rank in range(4):
-        assert _gencode_contains(tmp_path, PPModule1, rank, rf'nnscaler.runtime.adapter.broadcast_object\(.*, src={src_rank}, ranks=\[0, 1, 2, 3\]\)')
-
-    for rank in range(4, 8):
-        assert _gencode_contains(tmp_path, PPModule1, rank, rf'nnscaler.runtime.adapter.broadcast_object\(.*, src={src_rank + 4}, ranks=\[4, 5, 6, 7\]\)')
+    for rank in range(8):
+        assert _gencode_contains(
+            tmp_path, PPModule1, rank,
+            rf'nnscaler.runtime.adapter.broadcast_object\(.*, src={_su_rank(src_rank)}, ranks={_su_ranks(range(4))}\)',
+        )
 
 
 class PPModule2(torch.nn.Module):
@@ -187,11 +197,12 @@ def test_gencode_shared_irobject(tmp_path):
         reuse='override',
     )
 
-    for rank in range(3):
-        assert _gencode_contains(tmp_path, PPModule2, rank, rf'nnscaler.runtime.adapter.move_object\(.*, src={rank}, dst={rank + 1}\)')
-
-    for rank in range(4, 7):
-        assert _gencode_contains(tmp_path, PPModule2, rank, rf'nnscaler.runtime.adapter.move_object\(.*, src={rank}, dst={rank + 1}\)')
+    for rank in (0, 1, 2, 4, 5, 6):
+        plan_rank = rank % 4
+        assert _gencode_contains(
+            tmp_path, PPModule2, rank,
+            rf'nnscaler.runtime.adapter.move_object\(.*, src={_su_rank(plan_rank)}, dst={_su_rank(plan_rank + 1)}\)',
+        )
 
 
 class PPModule3(PPModule2):
@@ -226,13 +237,17 @@ def test_gencode_shared_irobject_loss_data(tmp_path):
         load_module=False,
         reuse='override',
     )
-    for rank in range(3):
-        assert _gencode_contains(tmp_path, PPModule3, rank, rf'sum_.* = nnscaler.runtime.adapter.broadcast\(\(\), shape=\(\), dtype=torch.float32, src=3, ranks=\[0, 1, 2, 3\]\)')
-    assert _gencode_contains(tmp_path, PPModule3, 3, rf'sum_.* = nnscaler.runtime.adapter.broadcast\(sum_.*, shape=\(\), dtype=torch.float32, src=3, ranks=\[0, 1, 2, 3\]\)')
-
-    for rank in range(4, 7):
-        assert _gencode_contains(tmp_path, PPModule3, rank, rf'sum_.* = nnscaler.runtime.adapter.broadcast\(\(\), shape=\(\), dtype=torch.float32, src=7, ranks=\[4, 5, 6, 7\]\)')
-    assert _gencode_contains(tmp_path, PPModule3, 7, rf'sum_.* = nnscaler.runtime.adapter.broadcast\(sum_.*, shape=\(\), dtype=torch.float32, src=7, ranks=\[4, 5, 6, 7\]\)')
+    group = rf'src={_su_rank(3)}, ranks={_su_ranks(range(4))}'
+    for rank in (0, 1, 2, 4, 5, 6):
+        assert _gencode_contains(
+            tmp_path, PPModule3, rank,
+            rf'sum_.* = nnscaler.runtime.adapter.broadcast\(\(\), shape=\(\), dtype=torch.float32, {group}\)',
+        )
+    for rank in (3, 7):
+        assert _gencode_contains(
+            tmp_path, PPModule3, rank,
+            rf'sum_.* = nnscaler.runtime.adapter.broadcast\(sum_.*, shape=\(\), dtype=torch.float32, {group}\)',
+        )
 
 
 class SplitSegmentModule(torch.nn.Module):
@@ -291,7 +306,8 @@ def test_gencode_split_segment(tmp_path):
     )
 
     assert _gencode_contains(
-        tmp_path, SplitSegmentModule, 2, r'nnscaler.runtime.adapter.nn.allreduce_identity\(sum_.*, ranks=\[2, 3\]\)'
+        tmp_path, SplitSegmentModule, 2,
+        rf'nnscaler.runtime.adapter.nn.allreduce_identity\(sum_.*, ranks={_su_ranks([2, 3])}\)',
     )
     assert not _gencode_contains(
         tmp_path, SplitSegmentModule, 2, r'nnscaler.runtime.adapter.chunk'
@@ -300,7 +316,8 @@ def test_gencode_split_segment(tmp_path):
         tmp_path, SplitSegmentModule, 2, r'nnscaler.runtime.adapter.nn.split_allgather'
     )
     assert _gencode_contains(
-        tmp_path, SplitSegmentModule, 6, r'nnscaler.runtime.adapter.nn.allreduce_identity\(sum_.*, ranks=\[6, 7\]\)'
+        tmp_path, SplitSegmentModule, 6,
+        rf'nnscaler.runtime.adapter.nn.allreduce_identity\(sum_.*, ranks={_su_ranks([2, 3])}\)',
     )
 
 

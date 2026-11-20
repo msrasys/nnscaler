@@ -9,7 +9,7 @@ from typing import Callable, Dict, List, Optional, Tuple
 from nnscaler import ir
 from nnscaler.ir.cten import IRTensor
 from nnscaler.ir.operator import IRFwOperation
-from nnscaler.graph.parser.register import CustomizedOps
+from nnscaler.graph.parser.register import CustomizedOps, EmitContext
 
 from nnscaler.graph.parser.parser import SELF_GETATTR_SIG
 
@@ -35,14 +35,15 @@ class Sign2EmitRule:
             signature (str): signature of the operator
 
         Returns:
-            Callable: emit rule that takes the node, args (List[str]) and kwargs (Dict[str, str]) as input
+            Callable: emit rule that takes the node, args (List[str]), kwargs (Dict[str, str]) and
+                an EmitContext (or, for legacy customized rules, runtime_devid, plan_ndevs, runtime_ndevs) as input
         """
         if signature in self._customized_op_emit:
             return self._customized_op_emit[signature]
         else:
             return self._sign2rule.get(signature, self.emit_common)
 
-    def emit_common(self, node: IRFwOperation, args: List[str], kwargs: Dict[str, str], runtime_devid: int, plan_ndevs: int, runtime_ndevs: int) -> str:
+    def emit_common(self, node: IRFwOperation, args: List[str], kwargs: Dict[str, str], ctx: EmitContext) -> str:
         """Default rule to join all args and kwargs"""
 
         signature = node.signature
@@ -55,7 +56,7 @@ class Sign2EmitRule:
         args = ", ".join(list(args) + kw_pairs)
         return f"{signature}({args})"
 
-    def emit_slice(self, node: IRFwOperation, arg_vars: List[str], kw_pairs: Dict[str, str], runtime_devid: int, plan_ndevs: int, runtime_ndevs: int) -> str:
+    def emit_slice(self, node: IRFwOperation, arg_vars: List[str], kw_pairs: Dict[str, str], ctx: EmitContext) -> str:
         """Special rule for generating slice node
 
         The op is:
@@ -84,7 +85,7 @@ class Sign2EmitRule:
 
         return f"{in_tensor_var}[{', '.join(subscript_components)}]"
 
-    def emit_self_getattr(self, node, arg_vars: List[str], kw_pairs: Dict[str, str], runtime_devid: int, plan_ndevs: int, runtime_ndevs: int) -> str:
+    def emit_self_getattr(self, node, arg_vars: List[str], kw_pairs: Dict[str, str], ctx: EmitContext) -> str:
         """Special rule for generating setattr node
         """
         assert len(node.inputs()) == 1, f"self_getattr should have 1 input, but got {len(node.inputs())}"
@@ -93,9 +94,8 @@ class Sign2EmitRule:
         # because we don't want to use it `repr` form
         return f'self.{node.input(0)}'
 
-    def emit_ifexpr(self, node, arg_vars: List[str], kw_pairs: Dict[str, str], runtime_devid: int, plan_ndevs: int, runtime_ndevs: int) -> str:
+    def emit_ifexpr(self, node, arg_vars: List[str], kw_pairs: Dict[str, str], ctx: EmitContext) -> str:
         """Special rule for generating setattr node
         """
         assert len(node.inputs()) == 3, f"ifexpr should have 3 inputs, but got {len(node.inputs())}"
         return f'{arg_vars[1]} if {arg_vars[0]} else {arg_vars[2]}'
-

@@ -6,7 +6,7 @@ import torch
 from torch import Tensor
 import torch.distributed
 
-from nnscaler.graph.parser.register import register_op
+from nnscaler.graph.parser.register import register_op, EmitContext
 from nnscaler.ir.operator import IRFwOperation
 from .core.zigzag_attn_implementation import ZigZagRingFlashAttnFunc
 from .core.utils import gen_head_anno
@@ -73,13 +73,10 @@ def wrap_zigzag_attn_func(q: Tensor, k: Tensor, v: Tensor,
 
     return output
 
-def emit_zigzag(node: IRFwOperation, args: List[str], kwargs: Dict[str, str], runtime_devid: int, plan_ndevs: int, runtime_ndevs: int) -> str:
+def emit_zigzag(node: IRFwOperation, args: List[str], kwargs: Dict[str, str], ctx: EmitContext) -> str:
     """Special rule to generate zigzag_attn node"""
 
     signature = node.signature
-
-    offset = (runtime_devid // plan_ndevs) * plan_ndevs
-    scale_unit_dev_ids = [local_rank + offset for local_rank in range(plan_ndevs)]
 
     kw_pairs = list()
     for key, val in kwargs.items():
@@ -99,7 +96,7 @@ def emit_zigzag(node: IRFwOperation, args: List[str], kwargs: Dict[str, str], ru
             kw_pairs.append("process_group=None")
         elif partition_dims[0] == 1: # partition on sequence dim
             # the synchronization should occur across scaleunits
-            kw_pairs.append(f"process_group={scale_unit_dev_ids}")
+            kw_pairs.append(f"process_group={ctx.scale_unit_ranks}")
         elif partition_dims[0] == 2:
             # partition on num_head dim
             kw_pairs.append("process_group=None")
