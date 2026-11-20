@@ -10,11 +10,11 @@ IRGraph:
     will be inserted at scheduling time.
 """
 
-from typing import Union, Tuple, List, Optional, Dict, Any, TYPE_CHECKING
+from typing import BinaryIO, Union, Tuple, List, Optional, Dict, Any, TYPE_CHECKING
 import logging
 import copy
-import dill
 import hashlib
+import io
 
 from nnscaler.ir.cten import IRTensor, IRCell, IRObject, IR
 from nnscaler.ir.unique import IDGenerator
@@ -1170,22 +1170,11 @@ class IRGraph(IRSegment):
 
     # =================== Helpers ====================
 
-    @staticmethod
-    def no_cell_pickle_context():
-        class PicklingContextNoCell:
-            def __enter__(self):
-                IRObject.__getstate__ = IRObject.getstate_for_dump
-            def __exit__(self, exc_type, exc_value, traceback):
-                IRObject.__getstate__ = lambda self: self.__dict__.copy()
-        return PicklingContextNoCell()
-
-    def dumps(self) -> str:
+    def dumps(self) -> bytes:
         """
         Dump the graph into binary by dill
         """
-        with self.no_cell_pickle_context():
-            save = (IDGenerator().get_states(), self)
-            return dill.dumps(save)
+        return IR.dumps((IDGenerator().get_states(), self))
 
     def dump(self, filename: str) -> None:
         """
@@ -1246,9 +1235,30 @@ class IRGraph(IRSegment):
             IRGraph: the built graph
         """
         with open(filename, 'rb') as f:
-            id_state, graph = dill.load(f)
+            return IRGraph._load(f)
 
-        return IRGraph.from_dill(id_state, graph)
+    @staticmethod
+    def loads(data: bytes) -> 'IRGraph':
+        """
+        Load the graph from the binary written by `dumps`.
+        Note IDGenerator will also be reset to match with graph status
+
+        Args:
+            data (bytes): the dumped graph
+
+        Returns:
+            IRGraph: the built graph
+        """
+        return IRGraph._load(io.BytesIO(data))
+
+    @staticmethod
+    def _load(file: BinaryIO) -> 'IRGraph':
+        (id_state, graph), cells_restored = IR._load(file)
+        if not cells_restored:
+            # dumped by an older version, which drops all cells
+            return IRGraph.from_dill(id_state, graph)
+        IDGenerator().load_states(id_state)
+        return graph
 
     def checksum(self, strict: bool = True) -> str:
         """Get the MD5 checksum of the graph.
