@@ -13,7 +13,7 @@ from nnscaler.graph.parser.register import register_op
 from nnscaler.ir import IRTensor
 from nnscaler.runtime.device import DeviceGroup
 
-from .core.utils import call_flash_attn_cute_varlen_func, gen_head_anno, get_arg_by_name
+from .core.utils import call_flash_attn_cute_varlen_func, gen_head_anno, get_arg_by_name, fake_attention_fn
 from .core.zigzag_allgather_attn_varlen_implementation import (
     zigzag_allgather_attn_varlen_func,
 )
@@ -196,4 +196,4 @@ def input_gen_fn(node: IRDimops):
     return tuple(inputs)
 
 
-register_op(flash_attention_anno, emit_fn=emit_ring, input_gen_fn=input_gen_fn)(wrap_zigzag_allgather_attn_varlen_func)
+register_op(flash_attention_anno, emit_fn=emit_ring, input_gen_fn=input_gen_fn, fake_fn=fake_attention_fn(wrap_zigzag_allgather_attn_varlen_func))(wrap_zigzag_allgather_attn_varlen_func)

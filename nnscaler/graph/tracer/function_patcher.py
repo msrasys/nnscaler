@@ -100,7 +100,8 @@ class FunctionPatcher(_Patcher):
 
     @contextmanager
     def revert(self):
-        if self.in_global_context:
+        # reentrant: inside an active revert() the patches are already off
+        if self.in_global_context and self.patch_mode:
             self._change_patch_mode_to(False)
             for patch in orig_func.reversed(self.patches_made):
                 # unpatch in reverse order to handle duplicates correctly
@@ -116,6 +117,26 @@ class FunctionPatcher(_Patcher):
                 yield
             finally:
                 pass
+
+    @contextmanager
+    def revert_namespace(self, ns: Any):
+        """
+        Temporarily restore only the patches made on namespace ``ns`` (e.g. ``builtins``), keeping
+        every other patch and the patch mode untouched; much cheaper than ``revert()``.
+        A no-op inside an active ``revert()``. Do not nest ``revert()`` inside: its exit re-applies
+        every patch, including those of ``ns``.
+        """
+        if not self.patch_mode:
+            yield
+            return
+        patches = [patch for patch in self.patches_made if patch.frame_dict is ns]
+        for patch in orig_func.reversed(patches):
+            patch.revert()
+        try:
+            yield
+        finally:
+            for patch in patches:
+                patch.patch()
 
     def _change_patch_mode_to(self, to_mode: bool):
         if self.patch_mode != (not to_mode):

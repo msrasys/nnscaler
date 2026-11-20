@@ -37,6 +37,9 @@ from nnscaler.graph.function.pyfunc import IRPyFunc
 from nnscaler.graph.function.wrapnn import convert_to_wrapnn, wrapnn
 from nnscaler.graph.gener.gen import IRAdapterGener
 from nnscaler.graph.parser import FxModuleParser
+from nnscaler.graph.tracer.trace_strategy import (
+    has_meta_tensors, place_real_tensors_to_cpu, trace_strategy_class,
+)
 from nnscaler.graph.schedule.predefined import PredefinedSched
 from nnscaler.graph.schedule.schedplan import SchedulePlan
 
@@ -48,7 +51,7 @@ from nnscaler.ir.unique import IDGenerator
 from nnscaler.runtime.adapter.reducer import Bucket, Reducer, ParamBucketConfig
 from nnscaler.runtime.device import DeviceGroup
 from nnscaler.runtime.initialization import (
-    create_init_module, create_shard_init_weights,
+    create_init_module, create_shard_init_weights, DeferredInitialization,
 )
 from nnscaler.runtime.gnorm import calcuate_gnorm, clip_grads
 from nnscaler.runtime.module import (
@@ -106,6 +109,8 @@ class ParamInitStrategy:
     'shard'    : use the original module's `__shard__init__(attr_meta_map)` method
                  when defined, otherwise capture construction via `TorchDispatchMode`
                  and replay required tensors on CPU to produce local slices.
+                 The only strategy that accepts a module constructed on the meta device
+                 (traced with trace_strategy='meta').
     """
     FILE = 'file'
     FULL = 'full'
@@ -120,7 +125,8 @@ class ComputeConfig:
     # whether to fold constant when generating code
     constant_folding: bool = False
 
-    # how to execute the functions during trace
+    # how to execute the functions during trace.
+    # 'meta' requires param_init_strategy='shard': the model is not materialized at compile time.
     trace_strategy: str = 'cuda_run_cpu_offload'
 
     # Only support 0/1/3 for now
@@ -229,6 +235,12 @@ class ComputeConfig:
         strategies = (ParamInitStrategy.FILE, ParamInitStrategy.FULL, ParamInitStrategy.SHARD)
         if self.param_init_strategy not in strategies:
             raise ValueError(f"param_init_strategy must be one of {strategies}.")
+        trace_strategy_class(self.trace_strategy)
+        if self.trace_strategy == 'meta' and self.param_init_strategy != ParamInitStrategy.SHARD:
+            raise ValueError(
+                "trace_strategy='meta' requires param_init_strategy='shard': the model is not materialized "
+                "at compile time, so there are no weights to save for 'file' or 'full'."
+            )
         if type(self.param_init_seed) is not int or not 0 <= self.param_init_seed < 2 ** 32:
             raise ValueError("param_init_seed must be an integer in [0, 2**32).")
         if self.plan_ngpus <= 0:
@@ -842,7 +854,8 @@ def _gen_graph(
     IDGenerator().clear()
     disable_global_graph()
 
-    module.cpu()
+    # only move real parameters to CPU, meta parameters remain as they are
+    place_real_tensors_to_cpu(module)
     forward_args_default = _get_arg_default_values(module.forward)
     for v in forward_args_default.values():
         if v is not inspect.Parameter.empty and not isinstance(v, (int, str, float, bool, type(None))):
@@ -1010,10 +1023,23 @@ def _gencode(
                     # it should only have 1 `self` parameter
                     if len(inspect.signature(module_or_module_class.__init__).parameters) > 1:
                         raise ValueError("Module class __init__ should be parameter-free.")
-                module = create_init_module(
-                    module_or_module_class, module_fn, module_dtype,
-                    seed=compute_config.param_init_seed,
-                )
+                if compute_config.trace_strategy == 'meta':
+                    # Capture the construction instead of running it: parameters and buffers come out
+                    # as meta tensors, so tracing never materializes the full model. Shard initialization
+                    # (required by the meta strategy) replays the same construction per rank at runtime,
+                    # so the concrete values are not needed here. The capture replays the few constructor
+                    # operations that need real data on cpu, the device the tracing stage constructs on,
+                    # so compilation works without a GPU.
+                    with DeferredInitialization(device='cpu'):
+                        module = create_init_module(
+                            module_or_module_class, module_fn, module_dtype,
+                            seed=compute_config.param_init_seed,
+                        )
+                else:
+                    module = create_init_module(
+                        module_or_module_class, module_fn, module_dtype,
+                        seed=compute_config.param_init_seed,
+                    )
             except Exception as e:
                 raise RuntimeError(f"Error when creating module instance.") from e
         else:
@@ -1023,6 +1049,20 @@ def _gencode(
 
         if any(isinstance(m, CubeModule) for m in module.modules()):
             raise RuntimeError('Parallel modules can not be nested.')
+
+        if has_meta_tensors(module):
+            if not is_module_class:
+                # a supplied instance is the weight source at runtime; a meta instance has no values
+                raise ValueError(
+                    "A module instance on the meta device has no weight values. Pass the module class "
+                    "(or module_fn) so it is constructed under capture, or an instance with real weights."
+                )
+            # only the meta trace strategy can execute a meta module (and it implies shard initialization,
+            # the only one that needs no weight values at compile time, see ComputeConfig)
+            if compute_config.trace_strategy != 'meta':
+                raise ValueError(
+                    f"A module on the meta device requires trace_strategy='meta', got {compute_config.trace_strategy!r}."
+                )
 
         # save origin module metadata
         meta_info = OriginModuleMetadata(

@@ -22,6 +22,7 @@ from .parallel import (
     load_merged_state_dict_from_rank,
 )
 from nnscaler.graph.parser.register import register_op, update_op
+from nnscaler.graph.tracer.trace_strategy import trace_fake
 from nnscaler.runtime.function.function import (
     anchor,
     constant_folding,

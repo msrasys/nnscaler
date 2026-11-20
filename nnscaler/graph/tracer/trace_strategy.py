@@ -1,19 +1,111 @@
 #  Copyright (c) Microsoft Corporation.
 #  Licensed under the MIT License.
 
+import builtins
 import time
 from typing import TYPE_CHECKING, Any, Tuple, Dict, Callable, Type
 
 import torch
 from torch.fx.node import Target
+from torch.overrides import TorchFunctionMode, is_tensor_method_or_property
 
-from . import pytree_utils, metadata
+from . import pytree_utils, metadata, wrap_utils
+from .metadata import EmptyResult
+from .operator_patcher import OperatorPatcherContext
 
 if TYPE_CHECKING:
     from .concrete_tracer import ConcreteTracer
 
 import logging
 _logger = logging.getLogger(__name__)
+
+
+# Lower-cased fragments of the PyTorch errors raised when an operator needs tensor data
+# (or a meta kernel) that meta tensors do not have, e.g.
+#   "Tensor.item() cannot be called on meta tensors"            (.item(), bool(), int(), `in`)
+#   "Cannot copy out of meta tensor; no data!"                   (.tolist(), .cpu(), .numpy() paths)
+#   "can't convert meta device type tensor to numpy"
+#   "... raises unimplemented by default, as a correct data-independent implementation does not exist" (nonzero, masks)
+#   "aten::_unique2: attempted to run this operator with Meta tensors, but there was no fake impl or Meta kernel"
+#   "Could not run 'aten::...' with arguments from the 'Meta' backend"
+_META_DATA_DEPENDENT_FRAGMENTS = ('meta tensor', 'meta device', 'data-independent implementation', "'meta' backend")
+
+
+def is_meta_data_dependency(exc: BaseException) -> bool:
+    """Whether ``exc`` means an operator needs tensor data (or a meta kernel) that meta tensors do not carry."""
+    if not isinstance(exc, (RuntimeError, NotImplementedError, TypeError)):
+        return False
+    message = str(exc).lower()
+    return any(fragment in message for fragment in _META_DATA_DEPENDENT_FRAGMENTS)
+
+
+def _target_name(target: Any) -> str:
+    if isinstance(target, str):
+        return target
+    # `__name__` over `__qualname__`: torch functions report `_VariableFunctionsClass.nonzero` otherwise
+    return getattr(target, '__name__', None) or getattr(target, '__qualname__', None) or repr(target)
+
+
+def meta_guidance(name: str) -> str:
+    return (
+        f"trace_strategy='meta' cannot execute `{name}`: it reads tensor values (or has no meta kernel), "
+        "and meta tensors carry no data. nnScaler traces a static graph, so either trace with a strategy that "
+        "runs on real data ('cpu', 'cuda', 'cuda_run_cpu_offload'), or give the operator a stand-in result: "
+        "nnscaler.trace_fake(fn, fake, *args, **kwargs) at the call site, nnscaler.update_op(fn, fake_fn=...) "
+        "for a torch function, or nnscaler.register_op(..., fake_fn=...) for the enclosing user function."
+    )
+
+
+def has_meta_tensors(module: torch.nn.Module) -> bool:
+    """
+    Whether ``module`` holds meta parameters or buffers, i.e. it was built on meta or captured by
+    DeferredInitialization. Tensors created outside the capture (module-level constants, tensors passed
+    to the constructor) stay real, so a captured module can mix both; it is still traced in place.
+    """
+    return any(t.is_meta for t in list(module.parameters()) + list(module.buffers()))
+
+
+def place_real_tensors_to_cpu(module: torch.nn.Module) -> torch.nn.Module:
+    """``module.cpu()`` that leaves meta tensors alone (they have no data to move)."""
+    return module._apply(lambda t: t if t.is_meta else t.cpu())
+
+
+class _DeviceRedirect(TorchFunctionMode):
+    """
+    Runs the torch calls made while a node executes with their device parameters replaced by ``device``.
+
+    `ConcreteAttrProxy` pins `<tensor>.device` to cuda so the generated code targets GPUs,
+    and user code may also hard-code `device='cuda'`.
+    Executing with that device would allocate on a real GPU, and fail on a machine without one,
+    even though the strategy runs everything on `device`.
+    Only the executed call is redirected; the node records the original arguments,
+    so the device constants stay as written in the generated code.
+
+    Intercepting at the torch API is what makes a device parameter recognizable:
+    the `device=` keyword of a torch function or tensor method, the first positional argument of `Tensor.to`,
+    and the device methods (`x.cuda()`).
+    Any other place a device value flows through is data and is left alone:
+    a dictionary key or field, or the `device=` keyword of a registered operator,
+    whose body's own torch calls are redirected in turn.
+    """
+
+    def __init__(self, device: str, is_mapped_device: Callable[[Any], bool], device_methods: Tuple[Callable, ...]):
+        super().__init__()
+        self.device = device
+        self.is_mapped_device = is_mapped_device
+        self.device_methods = device_methods
+
+    def __torch_function__(self, func, types, args=(), kwargs=None):
+        kwargs = dict(kwargs) if kwargs else {}
+        if func in self.device_methods:
+            # `x.cuda(device, non_blocking, memory_format)`: the device is the method itself
+            kwargs = {key: value for key, value in kwargs.items() if key in ('non_blocking', 'memory_format')}
+            return torch.Tensor.to(args[0], self.device, **kwargs)
+        if func is torch.Tensor.to and len(args) > 1 and self.is_mapped_device(args[1]):
+            args = (args[0], self.device, *args[2:])
+        if self.is_mapped_device(kwargs.get('device')):
+            kwargs['device'] = self.device
+        return func(*args, **kwargs)
 
 
 class BaseTraceStrategy:
@@ -32,11 +124,11 @@ class BaseTraceStrategy:
 
     - call_function:
       The target of `call_function` is a callable function, executed by target(*args, **kwargs).
-    
+
     - call_method:
       The target of `call_method` is a string of the bound method name, the method is bound to the first element of `args`.
       Executed by getattr(args[0], target)(*args[1:], **kwargs).
-    
+
     - call_module:
       The target of `call_module` is a string which means the sub-module path of the root module. For example, 'layer1.linear'.
       Executed by fetch_attr(root, target)(*args, **kwargs).
@@ -45,7 +137,7 @@ class BaseTraceStrategy:
       The target of `output` node is not matter, usually is string 'output'. Only used to identify the output of the graph.
       So here we assume the `args` is an one element tuple and `kwargs` is empty, we directly take the first argument as output result.
     """
-    
+
     # identify the name of the strategy
     _name: str
 
@@ -80,6 +172,31 @@ class BaseTraceStrategy:
             raise ValueError(f'unsupported device type: {device}')
         return pytree_utils.tree_map_only(torch.Tensor, lambda x: x.to(device).requires_grad_(x.requires_grad), args)
 
+    # The method forms of a device argument (`x.cuda()`); see `_DeviceRedirect`.
+    _DEVICE_METHODS = (torch.Tensor.cuda,)
+
+    @classmethod
+    def _is_mapped_device(cls, value: Any) -> bool:
+        """
+        Whether a value in a device position must be replaced by the execution device.
+        The value is a `torch.device`, a string, or an int, which is a cuda index there (`device=0`, `x.to(0)`).
+
+        Only cuda is replaced: it stands for "the runtime device".
+        An explicit 'cpu' is the user's choice, kept in the generated code and so also honored during the trace.
+        """
+        if isinstance(value, bool):
+            # a bool is an int, but `x.to(False)` is `x.to(torch.bool)`, not a device index
+            return False
+        if isinstance(value, int):
+            return True
+        if isinstance(value, str):
+            value = torch.device(value)
+        return isinstance(value, torch.device) and value.type == 'cuda'
+
+    @classmethod
+    def _redirect_devices(cls, device: str) -> '_DeviceRedirect':
+        return _DeviceRedirect(device, cls._is_mapped_device, cls._DEVICE_METHODS)
+
     def run_placeholder(self, target: Target, args: Tuple[Any, ...], kwargs: Dict[str, Any]) -> Tuple[Any, Tuple, Dict]:
         return self.tracer.placeholder_dict[target], args, kwargs
 
@@ -94,22 +211,23 @@ class BaseTraceStrategy:
         if not isinstance(target, Callable):
             raise ValueError(f'the target of "call_function" should be a callable function, but get target {target}')
         args, kwargs = self._place_tensors_to(args, kwargs, device=device)
-        return target(*args, **kwargs), args, kwargs
+        with self._redirect_devices(device):
+            return target(*args, **kwargs), args, kwargs
 
     def _run_call_method_on(self, target: Target, args: Tuple[Any, ...], kwargs: Dict[str, Any], device: str) -> Tuple[Any, Tuple, Dict]:
         if not isinstance(target, str):
             raise ValueError(f'the target of "call_method" should be a string, a bound method name of the first argument, but get target {target}')
         args, kwargs = self._place_tensors_to(args, kwargs, device=device)
         self_obj, *args_tail = args
-        func = getattr(self_obj, target)
-        return func(*args_tail, **kwargs), args, kwargs
+        with self._redirect_devices(device):
+            return getattr(self_obj, target)(*args_tail, **kwargs), args, kwargs
 
     def _run_call_module_on(self, target: Target, args: Tuple[Any, ...], kwargs: Dict[str, Any], device: str) -> Tuple[Any, Tuple, Dict]:
         if not isinstance(target, str):
             raise ValueError(f'the target of "call_module" should be a string, a name of the nn module, but get target {target}')
         args, kwargs = self._place_tensors_to(args, kwargs, device=device)
-        mod = self.tracer.fetch_attr(target)
-        return mod(*args, **kwargs), args, kwargs
+        with self._redirect_devices(device):
+            return self.tracer.fetch_attr(target)(*args, **kwargs), args, kwargs
 
     def run_call_function(self, target: Target, args: Tuple[Any, ...], kwargs: Dict[str, Any]) -> Tuple[Any, Tuple, Dict]:
         return self._run_call_function_on(target, args, kwargs, device=self.main_device)
@@ -156,19 +274,33 @@ class BaseTraceStrategy:
         """
         return self._place_tensors_to(args, kwargs, device=self.main_device)
 
-    def run_target(self, kind: str, target: Target, args: Tuple[Any, ...], kwargs: Dict[str, Any]) -> Tuple[Any, Tuple, Dict]:
+    def run_fake(self, args: Tuple[Any, ...], kwargs: Dict[str, Any], fake: Any) -> Tuple[Any, Tuple, Dict]:
+        """
+        The result of a `trace_fake` call: ``fake`` placed where this strategy keeps results,
+        with the inputs placed as for an executed operator. The operator itself does not run.
+        """
+        args, kwargs = self._place_tensors_to(args, kwargs, device=self.main_device)
+        value, = self._place_tensors_to(fake, device=self.main_device)
+        return value, args, kwargs
+
+    def run_target(self, kind: str, target: Target, args: Tuple[Any, ...], kwargs: Dict[str, Any],
+                   fake: Any = EmptyResult) -> Tuple[Any, Tuple, Dict]:
         """
         Concrete execute the target and return the result.
 
         Args:
             kind (str) : one of "placeholder", "call_function", "call_method", "call_module", "get_attr", "output".
+            fake: the result given to `trace_fake`; when present it is used instead of executing the target,
+                like the ``fake_fn`` of a registered operator.
         """
+        if fake is not EmptyResult:
+            return self.run_fake(args, kwargs, fake)
         return self._run_target(kind, target, args, kwargs)
 
 
 class CpuStrategy(BaseTraceStrategy):
     """
-    Pure cpu strategy, model is placed on cpu, run target is on cpu, intermediate results are on cpu. 
+    Pure cpu strategy, model is placed on cpu, run target is on cpu, intermediate results are on cpu.
     """
     _name = 'cpu'
 
@@ -178,7 +310,7 @@ class CpuStrategy(BaseTraceStrategy):
 
 class CudaStrategy(BaseTraceStrategy):
     """
-    Pure cuda strategy, model is placed on cuda, run target is on cuda, intermediate results are on cuda. 
+    Pure cuda strategy, model is placed on cuda, run target is on cuda, intermediate results are on cuda.
     """
     _name = 'cuda'
 
@@ -188,17 +320,52 @@ class CudaStrategy(BaseTraceStrategy):
 
 class MetaStrategy(BaseTraceStrategy):
     """
-    Meta strategy, run target is on meta, intermediate results are on meta, but note model is placed on cpu for current version.
+    Meta strategy, run target is on meta, intermediate results are on meta.
+    A model that is already entirely on meta is traced there; any other model is placed on cpu.
+
+    Operators that read tensor values (``.item()``, ``nonzero``, branch conditions, ...) cannot run on meta
+    and raise an error naming the operator; `trace_fake` or the ``fake_fn`` of a registered operator gives
+    such a call a stand-in result.
     """
     _name = 'meta'
+    # On meta there is nothing to move and nothing can be copied out of it (`x.cpu()` raises),
+    # so every device argument executes as the strategy device, cuda or not;
+    # the graph still records what the user wrote.
+    _DEVICE_METHODS = (torch.Tensor.cuda, torch.Tensor.cpu)
+
+    @classmethod
+    def _is_mapped_device(cls, value: Any) -> bool:
+        return isinstance(value, (int, str, torch.device)) and not isinstance(value, bool)
 
     def __init__(self, tracer: 'ConcreteTracer'):
         super().__init__(tracer, 'meta')
 
     def place_model(self, model: torch.nn.Module) -> torch.nn.Module:
-        # TODO: save the original model paramenters/buffers data to somewhere, the concrate value will lose after place the model to meta
-        # return self._place_module_to_meta(model)
-        return self._place_module_to(model, device='cpu')
+        # Meta tensors stay on meta: they come from a model built on meta or captured by DeferredInitialization,
+        # and shard initialization re-creates the model at runtime, so nothing is lost.
+        # Real tensors are kept on cpu rather than moved to meta because their values are still needed:
+        # a cpu instance passed to `parallelize` is the source the runtime copies the shard values from.
+        # Execution does not need them on meta: `_place_tensors_to` makes a meta copy per operator.
+        return place_real_tensors_to_cpu(model)
+
+    def run_target(self, kind: str, target: Target, args: Tuple[Any, ...], kwargs: Dict[str, Any],
+                   fake: Any = EmptyResult) -> Tuple[Any, Tuple, Dict]:
+        if fake is not EmptyResult:
+            return super().run_target(kind, target, args, kwargs, fake)
+        # Meta kernels are Python code (torch._meta_registrations, torch._decomp, torch._prims_common)
+        # that compares dtypes against the builtin `float`/`int`/`bool` and asserts via `torch._check`.
+        # With the tracer's builtins wrappers installed they fail even for `a + b`
+        # ("Expected builtin numeric types, found clz_wrapper_clz").
+        # CPU/CUDA kernels run in C++ and never see the wrappers.
+        # Only builtins are restored: a full `patcher.revert()` would undo and re-apply every torch wrapper
+        # for every node.
+        try:
+            with self.tracer.patcher.revert_namespace(builtins):
+                return super().run_target(kind, target, args, kwargs)
+        except (RuntimeError, NotImplementedError, TypeError) as exc:
+            if not is_meta_data_dependency(exc):
+                raise
+            raise RuntimeError(meta_guidance(_target_name(target))) from exc
 
 
 class CudaRunCpuOffloadStrategy(BaseTraceStrategy):
@@ -335,3 +502,85 @@ TRACE_STRATEGY: Dict[str, Type[BaseTraceStrategy]] = {
     CudaRunCpuOffloadStrategy._name: CudaRunCpuOffloadStrategy,
     ReuseCacheStrategy._name: ReuseCacheStrategy,
 }
+
+
+def trace_strategy_class(name: str) -> Type[BaseTraceStrategy]:
+    if name not in TRACE_STRATEGY:
+        raise ValueError(f"unknown trace strategy '{name}', expected one of {sorted(TRACE_STRATEGY)}")
+    return TRACE_STRATEGY[name]
+
+
+def create_trace_strategy(name: str, tracer: 'ConcreteTracer') -> BaseTraceStrategy:
+    return trace_strategy_class(name)(tracer)
+
+
+def trace_fake(fn: Callable, fake: Any, *args, **kwargs) -> Any:
+    """
+    ``fn(*args, **kwargs)`` recorded in the graph, with ``fake`` as its value during the trace.
+
+    The same contract as the ``fake_fn`` of a registered operator, for one call site:
+    while tracing, ``fn`` is not executed and ``fake`` stands in for its result.
+    The graph still records ``fn`` with the original arguments, so the generated code calls the real operator.
+    Outside of tracing ``fn`` runs and ``fake`` is ignored.
+    Use it for operators that read tensor values (``torch.nonzero``, ``.item()``, ``torch.where(mask)``),
+    which cannot run under ``trace_strategy='meta'``.
+
+    ``fake`` must have the shapes, dtypes and ``requires_grad`` of the real result and carry data:
+    cpu/cuda tensors, Python values (for ``.item()``, ``.tolist()``) or tuples of them (``torch.where``).
+    A callable ``fake`` is called with the same arguments as ``fn`` to produce that value;
+    it sees the arguments as the trace does, so under the meta strategy it may use their shapes and dtypes
+    but not their values, and it must allocate on cpu.
+    Tensor methods are given unbound, e.g. ``trace_fake(torch.Tensor.item, 3, x)``;
+    ``bool`` conditions as ``trace_fake(bool, True, x > 0)``.
+    ``fn`` must be an operator the tracer records as a node
+    (torch function, tensor method, builtin, registered operator or an ``autograd.Function``'s ``apply``),
+    not a plain Python function; in-place operators are not supported.
+    Inside the body of such an operator nothing is traced, so a ``trace_fake`` there runs ``fn``;
+    give the operator as a whole its fake instead.
+    """
+    # `ctx_tracer` is set for the whole forward run of a trace (traces do not nest), so it is the "tracing now" signal.
+    # `TEMP_CALL_ORIGIN` is set while the tracer runs the body of a leaf (a registered operator, an `autograd.Function`):
+    # that body is one node and nothing inside it is recorded, so like every other wrapper `trace_fake` runs `fn` there;
+    # the leaf as a whole takes the fake (`fake_fn`, or `trace_fake` on its `apply`).
+    tracer = OperatorPatcherContext.ctx_tracer
+    if tracer is None or wrap_utils.TEMP_CALL_ORIGIN:
+        return fn(*args, **kwargs)
+
+    # torch functions, tensor methods and builtins are patched while tracing: record the original
+    fn = wrap_utils.unwrap(fn)
+    if wrap_utils.is_autograd_apply(fn):
+        # `Fn.apply` is the patched apply bound to `Fn`; the node records the same target the patched apply would
+        fn = wrap_utils.autograd_apply_target(tracer, fn.__self__)
+    elif not (fn in tracer.autowrap_leaf_function or fn in tracer.autowrap_leaf_class or is_tensor_method_or_property(fn)):
+        # A plain python function would become one opaque IRPyFunc node
+        # that cannot be partitioned and that the generated code must import by name;
+        # the tracer would normally trace into it.
+        raise ValueError(
+            f"trace_fake: `{_target_name(fn)}` is not an operator the tracer records as a node (a torch function, "
+            "tensor method, builtin, registered operator or `autograd.Function.apply`). "
+            "Apply trace_fake to the data-dependent operator inside it.")
+
+    with wrap_utils.do_temp_call_origin():
+        from .concrete_proxy import ConcreteProxy
+
+        def unwrap(tree):
+            return pytree_utils.tree_map_only(ConcreteProxy, lambda p: unwrap(p.value), tree)
+
+        fake = unwrap(fake)   # first: a proxy is callable, the tensor it wraps is not
+        if callable(fake):
+            # Computed from the arguments as the trace sees them:
+            # shapes and dtypes are available, values only when the strategy runs on real data.
+            plain_args, plain_kwargs = unwrap((args, kwargs))
+            fake = unwrap(fake(*plain_args, **plain_kwargs))
+
+        for leaf in pytree_utils.tree_flatten(fake)[0]:
+            if isinstance(leaf, torch.Tensor) and leaf.is_meta:
+                raise ValueError('trace_fake: the fake must carry data (a cpu or cuda tensor), got a meta tensor')
+        # A private copy: a fake built in forward (`torch.zeros(...)`) is itself a traced value,
+        # possibly with autograd history, which must not leak into the result of `fn`.
+        fake = pytree_utils.tree_map_only(torch.Tensor, lambda t: t.detach().clone().requires_grad_(t.requires_grad), fake)
+
+    if is_tensor_method_or_property(fn):
+        # be consistent with ConcreteAttrProxy.__call__
+        return tracer.create_proxy('call_method', fn.__name__, args, kwargs, fake_result=fake)
+    return tracer.create_proxy('call_function', fn, args, kwargs, fake_result=fake)

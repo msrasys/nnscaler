@@ -107,8 +107,14 @@ reconstructing it, reseeding it, or calling `__shard__init__`. The same applies 
 `GeneratedModel(init_module=original_model)`. Hook validation and binding in
 `parallelize` are unchanged.
 
-**All strategies still construct a full real model during compilation.**
-These options change runtime initialization, not tracing.
+**Compilation constructs a full model unless `trace_strategy='meta'` is used,
+which requires `shard`.** In that combination, `parallelize(ModuleClass, ...)`
+captures the constructor with `DeferredInitialization` instead of running it, so
+parameters and buffers are meta tensors and tracing never materializes the model.
+The constructor must satisfy the [capture limitations](#automatic-capture). A supplied
+model instance must carry real weights: it is the weight source at runtime, so an
+instance already on the meta device is rejected; pass the class or `module_fn` instead.
+`file` and `full` need real weights or buffers and are not available with `meta`.
 
 ### Automatic capture
 

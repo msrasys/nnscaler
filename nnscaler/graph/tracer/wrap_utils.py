@@ -185,6 +185,20 @@ default_autowrap_leaf_class: Dict[Type, LeafWrapInfo] = {
 wrapped_cls_to_orig_cls: Dict[Type, Type] = {}
 
 
+def unwrap(obj: Any) -> Any:
+    """
+    The original function or class behind a tracer wrapper; ``obj`` itself when it is not wrapped.
+
+    A class wrapper (`create_wrapped_leaf_class`, `map`, `range`, ...) keeps its original in `_fx_wrapped_ori_clz`,
+    a function wrapper (`create_wrapped_leaf_func`) in `_fx_wrapped_ori_fn`.
+    Not `inspect.unwrap`: it would also strip decorators the original itself carries,
+    returning an object different from the one registered as a leaf.
+    """
+    orig = orig_func.getattr(obj, '_fx_wrapped_ori_clz', None) \
+        or orig_func.getattr(obj, '_fx_wrapped_ori_fn', None)
+    return obj if orig is None else orig
+
+
 def create_wrapped_leaf_func(func: Callable, *, replace_func: Optional[Callable]=None, default_tracer: Optional['ConcreteTracer']=None,
                              is_method: bool=False, method_name: Optional[str]=None, replace_traced_code: bool = True):
     """
@@ -242,6 +256,9 @@ def create_wrapped_leaf_func(func: Callable, *, replace_func: Optional[Callable]
                         node_target=replace_func if replace_traced_code else func
                     )
 
+    # The original behind this wrapper, see `unwrap`. An attribute rather than `__wrapped__`:
+    # `functools.wraps` also sets `__wrapped__` on decorators the original may already carry.
+    func_wrapper._fx_wrapped_ori_fn = func
     return func_wrapper
 
 
@@ -448,15 +465,27 @@ def is_default_leaf_function(func: Callable) -> bool:
     )
 
 
+def autograd_apply_target(tracer: 'ConcreteTracer', clz: Type[torch.autograd.Function]) -> Callable:
+    """
+    The callable recorded as the node target for ``clz.apply``: the original apply bound to ``clz``.
+
+    Rebinding the original apply creates a new object each time, so the tracer caches it per class.
+    The parser resolves the node by the bound class (`target.__self__`),
+    so a leaf wrapper of the apply must never be stored here.
+    """
+    if clz not in tracer.autograd_functions_mapping:
+        tracer.autograd_functions_mapping[clz] = torch._C._FunctionBase.__dict__['apply'].__get__(None, clz)
+    return tracer.autograd_functions_mapping[clz]
+
+
 def create_wrapped_autograd_apply(default_tracer: 'ConcreteTracer'):
     @classmethod
     @functools.wraps(orig_func.torch_agfunc_apply)
     def agfunc_apply_wrapper(clz, *args, **kwargs):
-        if clz not in default_tracer.autograd_functions_mapping:
-            default_tracer.autograd_functions_mapping[clz] = torch._C._FunctionBase.__dict__['apply'].__get__(None, clz)
+        target = autograd_apply_target(default_tracer, clz)
         global TEMP_CALL_ORIGIN
         if TEMP_CALL_ORIGIN:
-            return default_tracer.autograd_functions_mapping[clz](*args, **kwargs)
+            return target(*args, **kwargs)
         with do_temp_call_origin():
             tracers = set()
 
@@ -472,10 +501,10 @@ def create_wrapped_autograd_apply(default_tracer: 'ConcreteTracer'):
 
             tracer = None if len(tracers) == 0 else tracers.pop()
         if tracer is None:
-            return default_tracer.autograd_functions_mapping[clz](*args, **kwargs)
+            return target(*args, **kwargs)
         else:
             assert tracer == default_tracer
-            return default_tracer.create_proxy('call_function', default_tracer.autograd_functions_mapping[clz], args, kwargs)
+            return default_tracer.create_proxy('call_function', target, args, kwargs)
     return agfunc_apply_wrapper
 
 
@@ -684,6 +713,6 @@ def autowrap_check(tracer: 'ConcreteTracer', frame_dict : Dict[str, Any]):
                 if value in tracer.wrapped_leaf:
                     tracer.patcher.patch(frame_dict, name, tracer.wrapped_leaf[value][1])
                 if is_autograd_apply(value):
-                    if value.__self__ not in tracer.autograd_functions_mapping:
-                        tracer.autograd_functions_mapping[value.__self__] = create_wrapped_leaf_func(value)
-                    tracer.patcher.patch(frame_dict, name, tracer.autograd_functions_mapping[value.__self__])
+                    # An alias of `Fn.apply` (`apply_fn = Fn.apply`) bypasses the patched `Function.apply`,
+                    # so the name itself is patched with a leaf wrapper that records the node target of `Fn`.
+                    tracer.patcher.patch(frame_dict, name, create_wrapped_leaf_func(autograd_apply_target(tracer, value.__self__)))

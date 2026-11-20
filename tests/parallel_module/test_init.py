@@ -10,6 +10,8 @@ import torch
 
 import nnscaler
 from nnscaler.parallel import _load_parallel_module_class, parallelize, ComputeConfig, ParamInitStrategy
+from nnscaler.utils import get_member_by_name
+from nnscaler.graph.tracer.trace_strategy import MetaStrategy
 
 from ..launch_torchrun import launch_torchrun
 from .common import CubeLinear, init_distributed, init_random
@@ -196,6 +198,54 @@ def test_param_init_callback_attachment(tmp_path, strategy, module_class, source
                 assert torch.equal(getattr(model_or_class, name), tensors[meta.orig_name][meta.slicers])
         assert not list(tmp_path.rglob('fullmodel.pt*'))
         assert bool(list(tmp_path.rglob('npbuffer.pt'))) == (strategy == 'full')
+
+
+@patch('torch.cuda.is_available', lambda: False)
+@replace_all_device_with('cpu', force=True)
+def test_meta_module_shard_init(tmp_path):
+    """With shard + trace_strategy='meta', the class is captured and compilation never materializes the model."""
+    config = ComputeConfig(1, 1, param_init_strategy='shard', trace_strategy='meta')
+    traced_devices = []
+    orig_place_model = MetaStrategy.place_model
+
+    def record_place_model(self, model):
+        traced_devices.extend(t.device for t in list(model.parameters()) + list(model.buffers()))
+        return orig_place_model(self, model)
+
+    with mock_cube_env(0, 1), mock_dist(0, 1), patch('torch.distributed.barrier'), \
+            patch('torch.distributed.broadcast_object_list'), \
+            patch.object(MetaStrategy, 'place_model', record_place_model):
+        generated = parallelize(
+            LocalInitModule, {'x': torch.ones(2, 4)}, 'dp', config,
+            gen_savedir=tmp_path, build_module_buckets=False,
+        )
+        model = generated(build_buckets=False)
+    # the traced module (captured constructor) only holds meta tensors
+    assert traced_devices and all(device.type == 'meta' for device in traced_devices)
+    reference = LocalInitModule()
+    for name, meta in model.fullmap.items():
+        actual = getattr(model, name)
+        assert not actual.is_meta and torch.isfinite(actual).all()
+        if meta.orig_name in ('scalar', 'transposed'):
+            assert torch.equal(actual, get_member_by_name(reference, meta.orig_name)[meta.slicers])
+    assert not list(tmp_path.rglob('fullmodel.pt*'))
+    assert not list(tmp_path.rglob('npbuffer.pt'))
+
+
+@patch('torch.cuda.is_available', lambda: False)
+@replace_all_device_with('cpu', force=True)
+@pytest.mark.parametrize('param_init_strategy, trace_strategy', [('shard', 'meta'), ('shard', 'cpu')])
+def test_meta_instance_is_rejected(tmp_path, param_init_strategy, trace_strategy):
+    """A meta module only comes from a captured class; a supplied meta instance has no weight values."""
+    # `to_empty` keeps meta allocations under the test device replacement, unlike a `torch.device('meta')` context
+    source = LocalInitModule().to_empty(device='meta')
+    config = ComputeConfig(1, 1, param_init_strategy=param_init_strategy, trace_strategy=trace_strategy)
+    with mock_cube_env(0, 1), mock_dist(0, 1), patch('torch.distributed.barrier'), \
+            patch('torch.distributed.broadcast_object_list'), \
+            pytest.raises(RuntimeError, match='Code generation failed') as exc_info:
+        parallelize(source, {'x': torch.ones(2, 4)}, 'dp', config, gen_savedir=tmp_path, load_module=False)
+    assert isinstance(exc_info.value.__cause__, ValueError)
+    assert 'module class' in str(exc_info.value.__cause__)
 
 
 @patch('torch.cuda.is_available', lambda: False)
