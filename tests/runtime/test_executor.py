@@ -321,6 +321,10 @@ def test_backward_without_output_roots_preserves_state_pairing(use_fbw, ninputs)
         'no_roots', lambda *args: tuple((value * weight).data for value in args),
         *inputs,
     )
+    # A segment without gradient roots still owes registered callbacks a zero gradient.
+    callback_grads = []
+    for tensor in inputs:
+        Executor.register_input_grad_callback(tensor, callback_grads.append)
     if use_fbw:
         grads = Executor.backward_input('no_roots', inputs, [], [], [weight])
         assert len(Executor._weight_backward_states['no_roots']) == 1
@@ -331,6 +335,43 @@ def test_backward_without_output_roots_preserves_state_pairing(use_fbw, ninputs)
     assert grads is None
     assert weight.grad is None
     assert all(tensor.grad is None for tensor in inputs)
+    assert len(callback_grads) == ninputs
+    for tensor, grad in zip(inputs, callback_grads):
+        assert torch.equal(grad, torch.zeros_like(tensor))
+    Executor.check_clear()
+
+
+@pytest.mark.parametrize('mode', ['full', 'split', 'custom_fbw'])
+def test_input_grad_callback_accumulates_consumer_segments(mode):
+    weight = torch.nn.Parameter(torch.tensor(2., dtype=torch.float64))
+    outer_input = weight * 3
+    outer_input.retain_grad()
+    callback_grads = []
+
+    def resume_outer_backward(grad):
+        callback_grads.append(grad)
+        torch.autograd.backward(outer_input, grad)
+
+    Executor.register_input_grad_callback(outer_input, resume_outer_backward)
+    first = Executor.fexecute('first', lambda tensor: tensor * 5, outer_input)
+    second = Executor.fexecute('second', lambda tensor: tensor * 7, outer_input)
+    # custom_fbw wraps a replacement that dispatches through Executor itself;
+    # the pending entry must not be accumulated a second time by the wrapper.
+    for name, output in (('second', second), ('first', first)):
+        if mode == 'full':
+            Executor.backward(name, [outer_input], [output], [torch.ones_like(output)])
+        else:
+            with executor.custom_fbw(Executor.backward_input, Executor.backward_weight) \
+                    if mode == 'custom_fbw' else torch.enable_grad():
+                executor.backward_input(name, [outer_input], [output], [torch.ones_like(output)], [])
+                executor.backward_weight(name, [])
+        # Only the last pending consumer fires the callback.
+        assert len(callback_grads) == (name == 'first')
+
+    torch.testing.assert_close(callback_grads[0], torch.tensor(12., dtype=torch.float64))
+    torch.testing.assert_close(weight.grad, torch.tensor(36., dtype=torch.float64))
+    # The callback's outer backward retains the grad; Executor must not add a second copy.
+    torch.testing.assert_close(outer_input.grad, torch.tensor(12., dtype=torch.float64))
     Executor.check_clear()
 
 

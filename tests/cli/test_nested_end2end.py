@@ -8,10 +8,12 @@ parallelized as an ordinary (non end-to-end) module, either tensor parallel
 or data parallel over the scale unit, and a "language" model compiled as an
 end-to-end pipeline.  The wrapper's own
 ``train_step`` feeds vision features into the pipeline, reads back the
-boundary gradient that ``Executor.backward`` retains on the first stage,
+boundary gradient that ``Executor.backward`` retains on the first stage
+(or hands to a registered input-gradient callback),
 shares it with the other stage ranks and resumes the vision backward.
 """
 
+from functools import partial
 from pathlib import Path
 
 import pytest
@@ -29,6 +31,7 @@ from nnscaler.cli.trainer import Trainer
 from nnscaler.cli.trainer_args import TrainerArgs
 from nnscaler.policies import OpPlan, get_pas_ops
 from nnscaler.runtime.device import DeviceGroup
+from nnscaler.runtime.executor import Executor
 from tests.launch_torchrun import launch_torchrun
 from tests.parallel_module.common import assert_close
 from tests.utils import init_random
@@ -148,8 +151,21 @@ class VLModel(nn.Module):
         return self.language(_language_data(data), self.vision(data['pixels']))
 
 
+def _store_boundary_grad(feature, grad):
+    feature.boundary_grad = grad
+
+
 class NestedEnd2EndVLModel(VLModel):
     """The language model is an end-to-end pipeline; this wrapper drives it."""
+
+    def __init__(self, *args, input_grad_callback: bool = False, **kwargs):
+        super().__init__(*args, **kwargs)
+        # Receive the boundary gradient through an Executor callback instead of retain_grad.
+        self.input_grad_callback = input_grad_callback
+
+    def _first_stage(self):
+        ranks = dp_scale_unit_ranks(self.language.compute_config.plan_ngpus)
+        return ranks[0], DeviceGroup().get_group(list(ranks))
 
     def _pipeline_batches(self, samples):
         batches, features = [], []
@@ -157,18 +173,26 @@ class NestedEnd2EndVLModel(VLModel):
             feature = self.vision(sample['pixels'])
             if feature.requires_grad:
                 # Executor.backward writes the pipeline input gradient back here.
+                # With a callback registered, it must leave it to the callback.
                 feature.retain_grad()
+                # Only the first stage consumes ``feature``, so only its rank registers.
+                if self.input_grad_callback and dist.get_rank() == self._first_stage()[0]:
+                    Executor.register_input_grad_callback(
+                        feature, partial(_store_boundary_grad, feature))
             batches.append((_language_data(sample), feature))
             features.append(feature)
         return batches, features
 
     def _boundary_grad(self, feature):
         """Only the first pipeline stage consumes ``feature``; share its gradient."""
-        ranks = dp_scale_unit_ranks(self.language.compute_config.plan_ngpus)
-        src, group = ranks[0], DeviceGroup().get_group(list(ranks))
+        src, group = self._first_stage()
         if dist.get_rank() == src:
-            assert feature.grad is not None, 'pipeline did not retain the boundary gradient'
-            grad = feature.grad
+            if self.input_grad_callback:
+                assert feature.grad is None, 'retained grad duplicates the callback gradient'
+                grad = feature.boundary_grad
+            else:
+                assert feature.grad is not None, 'pipeline did not retain the boundary gradient'
+                grad = feature.grad
         else:
             grad = torch.zeros_like(feature)
         dist.broadcast(grad, src=src, group=group)
@@ -177,6 +201,8 @@ class NestedEnd2EndVLModel(VLModel):
     def train_step(self, samples, is_dummy_batch=None):
         batches, features = self._pipeline_batches(samples)
         outputs = self.language.train_step(batches, is_dummy_batch)
+        # The generated schedule must hand every registered feature back.
+        assert not Executor._input_grad_callbacks
         for feature in features:
             grad = self._boundary_grad(feature)
             feature.grad = None
@@ -196,7 +222,7 @@ def record_train_loss(trainer: Trainer, aggregated_outputs, loss):
 
 
 def nested_end2end_worker(run_dir, nested: bool, use_fbw: bool = False, vision_dp: bool = False,
-                          multi_stream: bool = False):
+                          multi_stream: bool = False, input_grad_callback: bool = False):
     _train_losses.clear()
     run_dir = Path(run_dir)
     config_path = str(Path(__file__).with_name('trainer_args_nested_end2end.yaml').resolve())
@@ -218,6 +244,8 @@ def nested_end2end_worker(run_dir, nested: bool, use_fbw: bool = False, vision_d
         ]
     if nested:
         args += ['--model.parallel_modules.1.compute_config.use_fbw', str(use_fbw)]
+        if input_grad_callback:
+            args += ['--model.args.input_grad_callback', 'true']
         if multi_stream:
             # the nested pipeline runs on named streams; its train_step must fence
             # itself against the wrapper's eager vision forward and gradient use
@@ -284,3 +312,11 @@ def test_nested_end2end_matches_mixed_baseline(tmp_path):
     for rank in range(4):
         assert losses[rank] == pytest.approx(baseline_losses_tp[rank], abs=1e-5)
     assert_close(nested['model'], baselines['tp']['model'], atol=1e-5, rtol=1e-5)
+
+    for use_fbw in (False, True):
+        run_dir = tmp_path / f'nested_tp_callback_fbw{int(use_fbw)}'
+        losses = launch_torchrun(4, nested_end2end_worker, run_dir, True, use_fbw, False, False, True)
+        nested = torch.load(run_dir / 'merged.pt', weights_only=False)
+        for rank in range(4):
+            assert losses[rank] == pytest.approx(baseline_losses_tp[rank], abs=1e-5)
+        assert_close(nested['model'], baselines['tp']['model'], atol=1e-5, rtol=1e-5)
