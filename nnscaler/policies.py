@@ -488,6 +488,70 @@ class OpPlan:
             self.partitions = []
 
 
+def group_nodes_by_modules(
+    graph: IRGraph,
+    module_types: Union[type[torch.nn.Module], Iterable[type[torch.nn.Module]]],
+) -> list[list[IRFwOperation]]:
+    """Group forward operators by each invocation of the given module types.
+
+    Each group holds the consecutive operators of one call to a module of `module_types`,
+    so a module instance called several times in a row gives one group per call.
+    An operator belongs to the outermost matching module in its `module_stack`,
+    so nested matches (e.g. both a layer and its attention are given) never split the outer call.
+    Calls are told apart by module FQN and traced invocation id (`node.module_call_stack`).
+    Graphs traced before invocation ids existed fall back to grouping consecutive operators by FQN.
+    An operator outside `module_types` ends the current group.
+
+    A typical use in an `fn` policy is module-based recompute or CPU offload:
+
+        def policy(graph, cfg):
+            plans = {op: OpPlan(op) for op in get_pas_ops(graph)}
+            for group_id, group in enumerate(group_nodes_by_modules(graph, TransformerLayer)):
+                for node in group:
+                    plans[node].recompute_id = group_id  # or offload_id
+            return plans.values()
+
+    The groups only follow module boundaries.
+    Constraints of the recompute/offload group itself still apply,
+    e.g. all operators of a group must be in the same pipeline stage,
+    and an operator with a hook should not be recomputed, otherwise its hook runs twice.
+
+    Returns:
+        the groups, in graph order.
+    """
+    if isinstance(module_types, type):
+        module_types = (module_types,)
+    else:
+        module_types = tuple(module_types)
+    if not all(
+        isinstance(module_type, type) and issubclass(module_type, torch.nn.Module)
+        for module_type in module_types
+    ):
+        raise TypeError("module_types must contain torch.nn.Module classes")
+
+    groups: list[list[IRFwOperation]] = []
+    current_key = None
+    for node in graph.select(ntype=IRFwOperation):
+        # module_stack is ordered from the outermost module inwards.
+        fqn = next(
+            (fqn for fqn, mod_cls in (node.module_stack or {}).items() if mod_cls in module_types),
+            None,
+        )
+        if fqn is None:
+            current_key = None
+            continue
+        calls = node.module_call_stack or {}
+        # (FQN, invocation id) identifies one module call.
+        # An invocation id is unique within a trace, so it alone is enough when present;
+        # FQN is kept for graphs traced without ids, whose ids are all None.
+        key = (fqn, calls.get(fqn))
+        if key != current_key:
+            groups.append([])
+            current_key = key
+        groups[-1].append(node)
+    return groups
+
+
 def get_layer_index(fqn: str) -> int:
     """
     Extract the layer index from full qualified name.
@@ -1215,13 +1279,18 @@ def fn(
     2. use `node.fn` to get the operator function.
     3. use `node.module_stack` to get the module stack info.
     4. use `node.module_class_chain` to get the module class chain.
-    5. use `node.call_expr` to get the call expression string. And you can user `ast.parse` to parse it.
-    6. use `get_layer_index` to get the layer index in a torch.nn.ModuleList.
-    7. use `get_called_self_module_name` to get the called self module name from the call expression.
-    8. use `node.inputs()` the get the input tensors of the operator.
+    5. use `node.module_call_stack` to get the traced invocation id of each module in `node.module_stack`.
+        It distinguishes repeated calls to the same module instance (e.g., a shared block called in a loop),
+        which have identical `module_stack`.
+        To get the operators of each module call directly (e.g., for module-based recompute or offload),
+        use `group_nodes_by_modules`.
+    6. use `node.call_expr` to get the call expression string. And you can user `ast.parse` to parse it.
+    7. use `get_layer_index` to get the layer index in a torch.nn.ModuleList.
+    8. use `get_called_self_module_name` to get the called self module name from the call expression.
+    9. use `node.inputs()` the get the input tensors of the operator.
         We can further check whether the input tensor is a parameter by `tensor.is_param`,
         or get the full name of the parameter by `tensor.name`, etc.
-    9. insert anchors in code with `nnscaler.anchor` to help locate the operator (intrusive way).
+    10. insert anchors in code with `nnscaler.anchor` to help locate the operator (intrusive way).
 
     A good way to locate the operator will be like:
     1. Locate the module first by module_class_chain (`target_module in node.module_class_chain`)

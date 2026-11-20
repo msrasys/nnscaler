@@ -22,6 +22,108 @@ MBS = 2
 DIM = 16
 LAYERS = 16
 
+
+class RecomputeTarget(nn.Module):
+    pass
+
+
+class ReusedRecomputeBlock(nn.Module):
+    def forward(self, x):
+        return x.sin().cos()
+
+
+class ReusedRecomputeModel(nn.Module):
+    def __init__(self, direct_forward=False):
+        super().__init__()
+        self.block = ReusedRecomputeBlock()
+        self.direct_forward = direct_forward
+
+    def forward(self, x):
+        for _ in range(2):
+            x = self.block.forward(x) if self.direct_forward else self.block(x)
+        return x.sum()
+
+
+@replace_all_device_with('cpu')
+@pytest.mark.parametrize('direct_forward', [False, True])
+def test_group_nodes_by_modules_separates_adjacent_reused_module_calls(tmp_path, direct_forward):
+    from nnscaler.graph.parser.converter import to_fx_graph, to_ir_graph
+    from nnscaler.policies import group_nodes_by_modules
+
+    inputs = {'x': torch.randn(2, 4, requires_grad=True)}
+    traced = to_fx_graph(ReusedRecomputeModel(direct_forward), inputs)
+    graph = to_ir_graph(traced, inputs, attr_savedir=tmp_path, constant_folding=False)
+    groups = group_nodes_by_modules(graph, ReusedRecomputeBlock)
+
+    assert [[node.name for node in group] for group in groups] == [['sin', 'cos'], ['sin', 'cos']]
+
+
+@replace_all_device_with('cpu')
+@pytest.mark.parametrize('memory_mode', ['recompute', 'offload'])
+def test_group_nodes_by_modules_in_fn_policy(tmp_path, memory_mode):
+    import ast
+    from nnscaler.policies import OpPlan, group_nodes_by_modules
+
+    def policy(graph, cfg):
+        plans = {op: OpPlan(op) for op in get_pas_ops(graph)}
+        for group_id, group in enumerate(group_nodes_by_modules(graph, ReusedRecomputeBlock)):
+            for node in group:
+                setattr(plans[node], f'{memory_mode}_id', group_id)
+        return plans.values()
+
+    parallelize(
+        ReusedRecomputeModel(), {'x': torch.randn(2, 4, requires_grad=True)}, policy,
+        ComputeConfig(1, 1), gen_savedir=tmp_path, load_module=False,
+    )
+    generated = next(tmp_path.rglob('gencode0.py')).read_text()
+    if memory_mode == 'recompute':
+        recomputes = [node for node in ast.walk(ast.parse(generated))
+                      if isinstance(node, ast.FunctionDef) and node.name.startswith('recompute')]
+        assert len(recomputes) == 2
+    else:
+        assert generated.count('with self.cpu_offloading_hooks():') == 2
+
+
+class _FakeGroupNode:
+    def __init__(self, *stack):
+        # stack: (fqn, module type) pairs, outermost first
+        self.module_stack = dict(stack)
+        self.module_call_stack = None  # graph traced without invocation ids
+
+
+class _FakeGroupGraph:
+    def __init__(self, nodes):
+        self.nodes = nodes
+
+    def select(self, ntype=None):
+        return self.nodes
+
+
+class GroupInnerTarget(nn.Module):
+    pass
+
+
+def test_group_nodes_by_modules_group_boundaries():
+    from nnscaler.policies import group_nodes_by_modules
+
+    block0, block1 = ("blocks.0", RecomputeTarget), ("blocks.1", RecomputeTarget)
+    inner = ("blocks.1.inner", GroupInnerTarget)
+    nodes = [
+        _FakeGroupNode(),
+        _FakeGroupNode(block0),
+        _FakeGroupNode(block0),
+        _FakeGroupNode(),                    # ends the group
+        _FakeGroupNode(block0),
+        _FakeGroupNode(block1),              # FQN change
+        _FakeGroupNode(block1, inner),       # nested match stays in the outer call
+        _FakeGroupNode(block1),
+        _FakeGroupNode(inner),               # only the inner type matches
+    ]
+    groups = group_nodes_by_modules(_FakeGroupGraph(nodes), [GroupInnerTarget, RecomputeTarget])
+
+    assert groups == [nodes[1:3], nodes[4:5], nodes[5:8], nodes[8:9]]
+
+
 class MLP(nn.Module):
     def __init__(self, dim: int = DIM, nlayers: int = LAYERS):
         init_random()
