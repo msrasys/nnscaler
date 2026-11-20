@@ -1247,19 +1247,7 @@ class Trainer:
 
             self.hook.on_train_step_start(self, batches[:num_batches])
 
-            # wrap train_step with `torch.cuda.synchronize`
-            # to support multiple cuda streams in train_step.
-            # We never need this for mixed model nor non-pipeline models.
-            cuda_sync_required = isinstance(self.model, nnscaler.ParallelModule) \
-                  and getattr(self.model, 'cuda_sync_required', False)
-
-            if cuda_sync_required:
-                torch.cuda.synchronize()
-
             losses = self.model.train_step(batches, is_dummy_batch)
-
-            if cuda_sync_required:
-                torch.cuda.synchronize()
 
             self.hook.on_train_step_end(self, losses[:num_batches])
 
