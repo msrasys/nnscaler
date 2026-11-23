@@ -689,3 +689,28 @@ def test_release_storage_backward_pre_hook_contract(hook, deallocate, use_fbw):
         Executor.check_clear()
     finally:
         Executor.clear()
+
+
+@pytest.mark.parametrize('use_fbw', [False, True])
+@pytest.mark.parametrize('dropped', ['inputs', 'outputs', 'grads'])
+def test_backward_pre_hook_must_keep_counts(dropped, use_fbw):
+    if use_fbw and not _patch_torch.FBW_SUPPORTED:
+        pytest.skip('FBW is not supported by this torch version')
+
+    def backward_pre_hook(inputs, outputs, grads):
+        lists = {'inputs': inputs, 'outputs': outputs, 'grads': grads}
+        lists[dropped] = lists[dropped][:-1]
+        return lists['inputs'], lists['outputs'], lists['grads']
+
+    Executor.clear()
+    try:
+        x = torch.ones(4, requires_grad=True)
+        output = Executor.fexecute('stage', lambda t: t * 2.0, x)
+        Executor.register_backward_pre_hook(backward_pre_hook)
+        with pytest.raises(RuntimeError, match='keep the number'):
+            if use_fbw:
+                Executor.backward_input('stage', [x], [output], [torch.ones(4)], [])
+            else:
+                Executor.backward('stage', [x], [output], [torch.ones(4)])
+    finally:
+        Executor.clear()

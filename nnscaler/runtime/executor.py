@@ -523,7 +523,13 @@ class Executor:
     @staticmethod
     def _apply_backward_pre_hook(input_tensors, output_tensors, output_tensor_grads):
         """
-        Run the registered backward pre-hook and check that it kept every released output.
+        Run the registered backward pre-hook and check what it returns.
+
+        The hook must keep the number of inputs, outputs and grads:
+        outputs and grads pair up as backward roots, and the generated code unpacks one
+        gradient per input, so a changed count would fail later with a confusing error
+        or drop a gradient silently.
+        It must also return every released output as the same object.
 
         A tensor the hook builds on top of a released output (even a view) records
         the float8 placeholder dtype in its new autograd node,
@@ -536,10 +542,17 @@ class Executor:
             return input_tensors, output_tensors, output_tensor_grads
         new_inputs, new_outputs, new_grads = Executor._backward_pre_hook(
             input_tensors, output_tensors, output_tensor_grads)
+        counts = [(len(input_tensors), len(new_inputs)), (len(output_tensors), len(new_outputs)),
+                  (len(output_tensor_grads), len(new_grads))]
+        if any(before != after for before, after in counts):
+            raise RuntimeError(
+                f'The backward pre-hook must keep the number of inputs, outputs and grads, '
+                f'got {[before for before, _ in counts]} -> {[after for _, after in counts]}.'
+            )
         for idx, old in enumerate(output_tensors):
             if not getattr(old, _RELEASED_TAG, False):
                 continue
-            if idx >= len(new_outputs) or new_outputs[idx] is not old:
+            if new_outputs[idx] is not old:
                 raise RuntimeError(
                     f'The backward pre-hook replaced output {idx}, whose storage was released after it '
                     f'was sent to the next pipeline stage. A hook must return released outputs unchanged '
@@ -571,6 +584,9 @@ class Executor:
         Notes:
             Users can only register one backward pre_hook. If there was a hook
             registered before, it will be overwritten.
+
+            The hook must return as many inputs, outputs and grads as it received,
+            otherwise backward raises a RuntimeError.
 
             With pipeline output deallocation (`ComputeConfig.pipeline_deallocate_outputs`),
             an output tensor other than the loss may already have had its storage
