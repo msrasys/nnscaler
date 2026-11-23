@@ -45,7 +45,6 @@ from nnscaler.graph.schedule.predefined import PredefinedSched
 from nnscaler.graph.schedule.schedplan import SchedulePlan
 from nnscaler.graph.schedule.module_streams import (
     ModuleStreamRule, module_stream_rules_from_env, normalize_module_stream_rules,
-    async_copy_ops_from_env, normalize_async_copy_ops,
     multi_stream_ops_from_env, normalize_multi_stream_ops,
 )
 
@@ -178,8 +177,6 @@ class ComputeConfig:
     # Independent module branches executed on named CUDA streams. Environment
     # defaults are resolved here and serialized, so code reuse is configuration safe.
     module_streams: Tuple[ModuleStreamRule, ...] = field(default_factory=module_stream_rules_from_env)
-    # Optional bounded CPU metadata copies without moving a module branch.
-    async_copy_ops: Tuple[str, ...] = field(default_factory=async_copy_ops_from_env)
     # Custom operators with internal side streams need scheduled input lifetime
     # tracking even when no module is moved by the compiler.
     multi_stream_ops: Tuple[str, ...] = field(default_factory=multi_stream_ops_from_env)
@@ -233,7 +230,6 @@ class ComputeConfig:
 
     def __post_init__(self):
         super().__setattr__('module_streams', normalize_module_stream_rules(self.module_streams))
-        super().__setattr__('async_copy_ops', normalize_async_copy_ops(self.async_copy_ops))
         super().__setattr__('multi_stream_ops', normalize_multi_stream_ops(self.multi_stream_ops))
         if self.module_streams and self.use_zero > 1:
             raise ValueError('module_streams currently supports ZeRO 0/1 only')
@@ -427,7 +423,6 @@ class ComputeConfig:
                     # that actually produced its code. Normal construction
                     # intentionally normalizes user/YAML rules to today's ABI.
                     cfg.setdefault('module_streams', ())
-                    cfg.setdefault('async_copy_ops', ())
                     cfg.setdefault('multi_stream_ops', ())
                     result = cls(**cfg)
                     for saved, rule in zip(cfg['module_streams'], result.module_streams):
@@ -487,7 +482,6 @@ def _compile_flags(compute_config: ComputeConfig):
         reducer_replicated_params=compute_config.reducer_replicated_params,
         use_fbw=compute_config.use_fbw,
         module_streams=compute_config.module_streams,
-        async_copy_ops=compute_config.async_copy_ops,
         multi_stream_ops=compute_config.multi_stream_ops,
     )
 

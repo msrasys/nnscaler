@@ -73,7 +73,7 @@ def test_replayed_saved_tensors_are_ready_on_each_consumer_stream(reverse_consum
 
 @pytest.mark.parametrize('gate_inputs', [False, True])
 def test_recompute_overlaps_pending_gradient_and_preserves_gradients(gate_inputs):
-    from nnscaler.runtime.deferred import BackwardLaunchPoint, capture_async_backward
+    from nnscaler.runtime.backward import BackwardLaunchPoint, capture_async_backward
     torch.manual_seed(7)
     x = torch.randn(16, 16, device='cuda', requires_grad=True)
     weight = torch.randn(16, 16, device='cuda', requires_grad=True)

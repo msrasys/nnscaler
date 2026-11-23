@@ -22,15 +22,9 @@ from .parallel import (
 )
 from nnscaler.graph.parser.register import register_op
 from nnscaler.graph.schedule.module_streams import ModuleStreamRule
-from nnscaler.runtime.weight_backward import prepare_weight_backward
-from nnscaler.runtime.weight_accumulator import WeightGradientAccumulator
-from nnscaler.runtime.deferred import (
-    notify_async_launch, capture_async_backward, prepare_async_input, native_async_launch_pending,
-)
-from nnscaler.runtime.kernel_graph import (
-    run_module_kernel_graph, prepare_module_kernel_graphs, clear_module_kernel_graphs,
-    module_kernel_graph_stats,
-)
+from nnscaler.runtime.weight_accumulator import WeightGradientAccumulator, prepare_weight_backward
+from nnscaler.runtime.stream import ModuleStreams
+from nnscaler.runtime.backward import BackwardLaunchPoint, BackwardValue, after_backward, capture_async_backward
 from nnscaler.runtime.function.function import (
     anchor,
     constant_folding,
@@ -65,8 +59,6 @@ def init():
     """
     from nnscaler import runtime
     runtime.device.init_device()
-    from nnscaler.runtime.deepep import configure_from_env
-    configure_from_env()
     _ = runtime.resource.EnvResource()
 
 

@@ -33,10 +33,8 @@ from nnscaler.codegen.syntax.blocks import ClassBlock, ForBlock, FunctionBlock, 
 from nnscaler.codegen.emit import FuncEmission
 from nnscaler.codegen.module.autograd import AutogradAdapterCodeGen
 from nnscaler.codegen.lifecycle import LifeCycle
-from nnscaler.graph.schedule.module_streams import plan_module_streams, checkpoint_stream
-from nnscaler.graph.schedule.checkpoint_readiness import plan_checkpoint_readiness
-from nnscaler.graph.schedule.checkpoint_prefetch import plan_checkpoint_prefetch
-from nnscaler.graph.schedule.weight_backward import plan_weight_backward
+from nnscaler.graph.schedule.module_streams import checkpoint_stream
+from nnscaler.codegen.module.stream import emit_module_streams
 
 from nnscaler.flags import CompileFlag
 from nnscaler.utils import fields
@@ -152,9 +150,8 @@ class ModuleCodeGen(FuncEmission):
             'import nnscaler.runtime.function',
             'import nnscaler.runtime.device',
             'import nnscaler.runtime.stream',
-            'import nnscaler.runtime.deferred',
+            'import nnscaler.runtime.backward',
             'import nnscaler.runtime.checkpoint_stream',
-            'import nnscaler.runtime.checkpoint_prefetch',
             'import _operator', 'from numpy import inf', 'import builtins', '',
             f'runtime_version = {runtime_version!r}', '', ''
         ]
@@ -1060,7 +1057,7 @@ class ModuleCodeGen(FuncEmission):
         - NONE
         """
         if CompileFlag.module_streams:
-            return self._emit_module_streams(segment, runtime_devid)
+            return emit_module_streams(self, segment, runtime_devid)
         return self._emit_segment_nodes(segment, list(segment.nodes()), runtime_devid)
 
     def _emit_segment_nodes(self, segment, nodes, runtime_devid, lifetime=None, *, release_unused=True,
@@ -1099,392 +1096,6 @@ class ModuleCodeGen(FuncEmission):
                         codes.append(del_stmt)
 
         return codes
-
-    def _emit_module_streams(self, segment, runtime_devid):
-        previous = getattr(self, '_weight_regions_by_node', {})
-        previous_controls = getattr(self, '_weight_control_outputs_by_node', {})
-        previous_prefetch = getattr(self, '_checkpoint_prefetch_names', {})
-        previous_prefixes = getattr(self, '_checkpoint_prefetch_prefixes', {})
-        try:
-            return self._emit_module_streams_impl(segment, runtime_devid)
-        finally:
-            self._weight_regions_by_node = previous
-            self._weight_control_outputs_by_node = previous_controls
-            self._checkpoint_prefetch_names = previous_prefetch
-            self._checkpoint_prefetch_prefixes = previous_prefixes
-
-    def _emit_module_streams_impl(self, segment, runtime_devid):
-        nodes, regions, joins = plan_module_streams(
-            segment.nodes(), segment.oobjs(), CompileFlag.module_streams)
-        weight_plans = plan_weight_backward(nodes, CompileFlag.module_streams)
-        self._weight_regions_by_node = {node: plan.key for plan in weight_plans for node in plan.nodes}
-        self._weight_control_outputs_by_node = {}
-        weight_anchors = {}
-        independent_regions = {}
-        for plan in weight_plans:
-            if any(plan.anchor in region.nodes for region in regions.values()):
-                raise ValueError('Weight backward rules cannot also move their anchor forward')
-            matching = [region for region in regions.values()
-                        if any(node in region.nodes for node in plan.nodes)]
-            if plan.independent:
-                if (len(matching) != 1 or set(matching[0].nodes) != set(plan.nodes)
-                        or matching[0].native or matching[0].deferred or matching[0].host_concurrency):
-                    raise ValueError('Independent weight backward requires one whole eager module stream region')
-                region = matching[0]
-                independent_regions[region.key] = plan
-                self._weight_control_outputs_by_node.setdefault(plan.anchor, []).append(plan)
-            elif matching:
-                raise ValueError('Weight backward rules cannot also move their module/anchor forward')
-            weight_anchors.setdefault(plan.anchor, []).append(plan.key)
-        checkpoint_anchors = plan_checkpoint_readiness(nodes, segment.oobjs(), CompileFlag.module_streams)
-        prefetch_plans = plan_checkpoint_prefetch(nodes, CompileFlag.module_streams)
-        self._checkpoint_prefetch_names = {plan.gid: plan.key for plan in prefetch_plans}
-        self._checkpoint_prefetch_prefixes = {plan.gid: plan.rule.recompute_prefetch_prefix
-                                             for plan in prefetch_plans if plan.rule.recompute_prefetch_prefix}
-        staged_forward = {}
-        modes_at_anchor = {}
-        for plan in prefetch_plans:
-            staged = plan.rule.recompute_prefetch_prefix is not None
-            modes_at_anchor.setdefault(plan.anchor, set()).add(staged)
-            if staged:
-                if any(region.ready_before is plan.anchor and region.native for region in regions.values()):
-                    raise ValueError('Staged replay requires a post-submission anchor, not native input-ready callbacks')
-                staged_forward.setdefault(plan.anchor, []).append(plan.key)
-        if any(len(modes) > 1 for modes in modes_at_anchor.values()):
-            raise ValueError('Whole and staged replay cannot share one prefetch anchor')
-        prefetch_forward, prefetch_backward, prefetch_before = {}, {}, {}
-        for plan in prefetch_plans:
-            if any(plan.anchor in region.nodes or any(node.recompute == plan.gid for node in region.nodes)
-                   for region in regions.values()):
-                raise ValueError('Checkpoint prefetch cannot also move its checkpoint or anchor forward')
-            target = prefetch_forward if plan.rule.recompute_prefetch_phase == 'forward' else prefetch_backward
-            target.setdefault(plan.anchor, []).append(plan.key)
-            if plan.rule.recompute_prefetch_release == 'before_operator':
-                prefetch_before.setdefault(plan.anchor, []).append(plan.key)
-        readiness_names = {gid: f'_checkpoint_ready_{index}' for index, gid in enumerate(checkpoint_anchors)}
-        ready_at = {}
-        for gid, anchor in checkpoint_anchors.items():
-            if any(anchor in region.nodes or any(node.recompute == gid for node in region.nodes)
-                   for region in regions.values()):
-                raise ValueError('Recompute readiness cannot also move its checkpoint or backend forward')
-            ready_at.setdefault(anchor, []).append(readiness_names[gid])
-        node_streams = {node: region.stream for region in regions.values() for node in region.nodes}
-        weight_node_streams = {node: plan.stream for plan in weight_plans for node in plan.nodes}
-        for node in nodes:
-            origins = set()
-            for value in node.iobjs():
-                if isinstance(value, IRTensor) and value.is_param():
-                    origins.add(self.tensor_name(value))
-                origins.update(self.module_parameter_origins.get(value, ()))
-            is_multiref = node.name == 'multiref' and node.kwargs.get('clone_level', 0) == 0
-            if not is_multiref:
-                for name in origins:
-                    self.module_parameter_uses.setdefault(name, set()).add(
-                        weight_node_streams.get(node, node_streams.get(node)))
-            if (is_multiref or isinstance(node, IRAdapter)
-                    or node.signature.rsplit('.', 1)[-1] in (
-                        'view', 'view_as', 'reshape', 'detach', 'contiguous', 'to',
-                        'float', 'half', 'bfloat16', 'identity', 'transpose', 'permute', 't')):
-                for output in node.oobjs():
-                    self.module_parameter_origins[output] = origins
-        if not regions and not checkpoint_anchors and not weight_plans and not prefetch_plans:
-            return self._emit_segment_nodes(segment, nodes, runtime_devid)
-        # Schedule emission shares this execution plan. Its executor calls must
-        # retain opaque inputs through backward when intra-segment streams exist.
-        self.execplan.use_multi_streams = True
-        lifetime = LifeCycle(nodes, segment.inputs(), segment.outputs())
-        starts = {region.nodes[0]: region for region in regions.values()}
-        owners = {node: region for region in regions.values() for node in region.nodes}
-        captures = {}
-        launch_points = {}
-        eager_backward_points = {}
-        async_copy_nodes = set()
-        for region in regions.values():
-            if region.overlap_backward and not (region.deferred or region.native):
-                eager_backward_points.setdefault(region.backward_anchor, []).append(region)
-            if region.ready_before is not None:
-                if not region.native:
-                    captures.setdefault(region.ready_before, []).append(region.key)
-                if region.deferred or region.native:
-                    launch_points.setdefault(region.ready_before, []).append(region)
-                if region.async_anchor_copies and not any(
-                        fnmatchcase(region.ready_before.signature, pattern) for pattern in CompileFlag.async_copy_ops):
-                    async_copy_nodes.add(region.ready_before)
-        # Checkpoints remain whole. Wait before entering a checkpoint if any of
-        # its internal operators consume a side-stream result.
-        rc_start = {}
-        for node in nodes:
-            if node.recompute is not None:
-                rc_start.setdefault(node.recompute, node)
-        waits = {}
-        for node, keys in joins.items():
-            target = rc_start.get(node.recompute, node)
-            waits.setdefault(target, []).extend(keys)
-
-        def names(objects):
-            return '(' + ', '.join(self.tensor_name(t, prefix_attr='self.') for t in objects) + (',' if objects else '') + ')'
-
-        body = [f'{name} = nnscaler.runtime.deferred.BackwardLaunchPoint(())'
-                for name in readiness_names.values()]
-        body.extend(f'{plan.key} = _module_streams.checkpoint_prefetch('
-                    f'{plan.rule.stream!r}, {plan.rule.recompute_prefetch_bytes}'
-                    f'{", staged=True" if plan.rule.recompute_prefetch_prefix else ""})'
-                    for plan in prefetch_plans)
-        pending = []
-        unused = lifetime.release_tensors_after_line(-1)
-        if unused:
-            body.append(self.emit_release(unused))
-        async_outputs = {obj: region for region in regions.values() if region.host_concurrency
-                         for obj in region.outputs}
-        unresolved = {}
-
-        def flush():
-            if pending:
-                body.extend(self._emit_segment_nodes(segment, pending, runtime_devid, lifetime, release_unused=False,
-                                                      checkpoint_readiness=readiness_names))
-                pending.clear()
-
-        def readiness_scope(node):
-            scope = (''.join(f', {name}' for name in ready_at.get(node, ()))
-                     + ''.join(f', {name}.anchor()' for name in weight_anchors.get(node, ()))
-                     + ''.join(f', {name}' for name in prefetch_backward.get(node, ())))
-            if node in staged_forward:
-                points = '(' + ', '.join(staged_forward[node]) + ',)'
-                scope += f', _module_streams.staged_backward_point({points})'
-            if node in prefetch_forward and node not in launch_points:
-                points = '(' + ', '.join(prefetch_forward[node]) + ',)'
-                submitted = ', submitted=True' if node in staged_forward else ''
-                scope += f', _module_streams.prefetch_launch_point({points}{submitted})'
-            return scope
-
-        def resolve(key):
-            region = unresolved.pop(key)
-            target = f'{names(region.outputs)} = ' if region.outputs else ''
-            indices = tuple(i for i, obj in enumerate(region.outputs) if obj in region.caller_outputs)
-            body.append(f'{target}_module_streams.resolve({key!r}, caller_indices={indices!r})')
-
-        for node in nodes:
-            # Side regions are emitted as whole functions. Resolve their inputs
-            # at submission, and resolve caller inputs at their first use.
-            if node in owners and node not in starts:
-                continue
-            inputs = starts[node].inputs if node in starts else node.iobjs()
-            needed = list(dict.fromkeys([
-                *[key for key in waits.get(node, ()) if key in unresolved],
-                *[async_outputs[obj].key for obj in inputs
-                  if obj in async_outputs and async_outputs[obj].key in unresolved],
-            ]))
-            if needed:
-                flush()
-                for key in needed:
-                    resolve(key)
-            if node in weight_anchors:
-                flush()
-                # Create the parameter autograd nodes immediately before this
-                # invocation's anchor, keeping their backward priority ahead
-                # of upstream work instead of retaining a stage of dWeights.
-                for plan in weight_plans:
-                    if plan.anchor is node:
-                        body.append(f'{plan.key} = _module_streams.weight_region('
-                                    f'{plan.key!r}, {plan.stream!r}, {names(plan.parameters)}'
-                                    f'{", independent=True" if plan.independent else ""})')
-            if node in captures:
-                flush()
-                body.extend(f'_module_streams.capture({key!r})' for key in captures[node])
-            if node in waits:
-                flush()
-                body.extend(f'_module_streams.join({key!r})' for key in waits[node])
-            if node in prefetch_before:
-                flush()
-                # The prefix graph is already queued behind its gate. Release
-                # it before backend entry so receive-count/layout host waits
-                # can overlap it too. Original-forward readiness is retained
-                # by the replay stream; later submission callbacks are idempotent.
-                body.extend(f'{key}.prefetch()' for key in prefetch_before[node])
-            if node in launch_points:
-                flush()
-                anchored = launch_points[node]
-                native = any(region.native for region in anchored)
-                if native and not all(region.native for region in anchored):
-                    raise ValueError('One anchor cannot mix submitted and native launch phases')
-                prequeued = any(region.prequeued for region in anchored)
-                if prequeued and not all(region.prequeued for region in anchored):
-                    raise ValueError('One anchor cannot mix input_ready and prequeued launch phases')
-                native_outputs = {obj: (region.key, index) for region in anchored
-                                  for index, obj in enumerate(region.outputs)} if native else {}
-                for region in anchored:
-                    inputs = [obj for obj in region.inputs if not obj.is_attr()]
-                    attributes = [obj for obj in region.inputs if obj.is_attr()]
-                    function = f'_{region.key}'
-                    with FunctionBlock(function, ['self', *[self.tensor_name(obj) for obj in inputs]], False) as block:
-                        block.insert_body(self._emit_segment_nodes(
-                            segment, region.nodes, runtime_devid, lifetime, release_unused=False))
-                        block.insert_body(f'return {names(region.outputs)}')
-                    body.extend(block.code)
-                    attr_map = '{' + ', '.join(
-                        f'{self.tensor_name(obj)!r}: {self.tensor_name(obj, prefix_attr="self.")}'
-                        for obj in attributes) + '}'
-                    specs = '(' + ', '.join(
-                        f'({tuple(obj.shape)!r}, {obj.dtype!r}, {obj.requires_grad!r})'
-                        for obj in region.outputs) + ',)'
-                    if region.native:
-                        arguments = [f'_module_streams.native_value({native_outputs[obj][0]!r}, {native_outputs[obj][1]})'
-                                     if obj in native_outputs else self.tensor_name(obj) for obj in inputs]
-                        arguments = '(' + ', '.join(arguments) + (',' if arguments else '') + ')'
-                        body.append(f'_module_streams.schedule_native('
-                                    f'{region.key!r}, {region.stream!r}, {function}, self, '
-                                    f'lambda: {arguments}, {attr_map}, kernel_graphs={region.kernel_graphs!r}'
-                                    f'{", prequeue=True, preserve_accumulators=" + repr(region.overlap_backward) if region.prequeued else ""})')
-                    else:
-                        body.append(f'{names(region.outputs)} = _module_streams.prepare('
-                                    f'{region.key!r}, {region.stream!r}, {function}, self, '
-                                    f'{names(inputs)}, {attr_map}, {specs})')
-                dependencies = [obj for region in anchored if region.overlap_backward
-                                for obj in region.outputs if obj.requires_grad]
-                if dependencies and not native:
-                    value = next((obj for obj in node.iobjs()
-                                  if isinstance(obj, IRTensor) and obj.requires_grad and not obj.is_attr()), None)
-                    if value is None:
-                        raise ValueError(f'Backward overlap anchor {node.signature} has no differentiable input')
-                    name = self.tensor_name(value)
-                    body.append(f'{name} = _module_streams.after_backward({name}, {names(dependencies)}, '
-                                f'{tuple(r.key for r in anchored)!r})')
-                options = (f', native=True, backward_keys={tuple(r.key for r in anchored if r.overlap_backward)!r}'
-                           if native else '')
-                if prequeued:
-                    options += ', prequeued=True'
-                if node in prefetch_forward:
-                    callbacks = '(' + ', '.join(f'{name}.prefetch' for name in prefetch_forward[node]) + ',)'
-                    options += f', callbacks={callbacks}'
-                with Block(f'with _module_streams.launch_point({tuple(r.key for r in anchored)!r}{options}){readiness_scope(node)}:') as block:
-                    block.insert_body(self._emit_segment_nodes(
-                        segment, [node], runtime_devid, lifetime, release_unused=False))
-                body.extend(block.code)
-                continue
-            if node in eager_backward_points:
-                flush()
-                anchored = eager_backward_points[node]
-                dependencies = [obj for region in anchored
-                                for obj in region.outputs if obj.requires_grad]
-                if dependencies:
-                    value = next((obj for obj in node.iobjs()
-                                  if isinstance(obj, IRTensor) and obj.requires_grad and not obj.is_attr()), None)
-                    if value is None:
-                        raise ValueError(f'Backward overlap anchor {node.signature} has no differentiable input')
-                    name = self.tensor_name(value)
-                    keys = tuple(r.key for r in anchored)
-                    retained = [f'_{r.key}_backward_outputs' for r in anchored if r.retain_backward_outputs]
-                    dependency_names = names(dependencies)
-                    if retained:
-                        parts = []
-                        for region in anchored:
-                            if region.retain_backward_outputs:
-                                parts.append(f'*_{region.key}_backward_outputs')
-                            else:
-                                parts.extend(self.tensor_name(obj, prefix_attr='self.')
-                                             for obj in region.outputs if obj.requires_grad)
-                        dependency_names = '(' + ', '.join(parts) + ',)'
-                    body.append(f'{name} = _module_streams.after_backward({name}, {dependency_names}, {keys!r})')
-                    with Block(f'with _module_streams.backward_point({keys!r}){readiness_scope(node)}:') as block:
-                        block.insert_body(self._emit_segment_nodes(
-                            segment, [node], runtime_devid, lifetime, release_unused=False))
-                    body.extend(block.code)
-                    if retained:
-                        body.append('del ' + ', '.join(retained))
-                    continue
-            if node in starts:
-                flush()
-                region = starts[node]
-                if region.deferred or region.native:
-                    if region.native:
-                        body.append(f'{names(region.outputs)} = _module_streams.native_result({region.key!r})')
-                    caller = region.caller_outputs
-                    producer = tuple(obj for obj in region.outputs if obj not in caller)
-                    if caller:
-                        body.append(f'_module_streams.publish({names(caller)})')
-                    if producer:
-                        body.append(f'_module_streams.publish({names(producer)}, stream={region.stream!r})')
-                    last = lifetime.get_line(region.nodes[-1]) + 1
-                    expired = [obj for obj in region.inputs if not obj.is_attr()
-                               and lifetime.releasable_after_line(obj, last)]
-                    if expired:
-                        body.append(self.emit_release(expired))
-                elif region.host_concurrency:
-                    inputs = [obj for obj in region.inputs if not obj.is_attr()]
-                    function = f'_{region.key}'
-                    with FunctionBlock(function, [self.tensor_name(obj) for obj in inputs], False) as block:
-                        block.insert_body(self._emit_segment_nodes(
-                            segment, region.nodes, runtime_devid, lifetime, release_unused=False))
-                        block.insert_body(f'return {names(region.outputs)}')
-                    body.extend(block.code)
-                    body.append(f'_module_streams.submit({region.key!r}, {region.stream!r}, '
-                                f'{function}, {names(inputs)}, {names(region.inputs)})')
-                    unresolved[region.key] = region
-                    # The queued task owns these inputs until submission ends.
-                    last = lifetime.get_line(region.nodes[-1]) + 1
-                    expired = [obj for obj in inputs if lifetime.releasable_after_line(obj, last)]
-                    if expired:
-                        body.append(self.emit_release(expired))
-                else:
-                    preserve = ', preserve_accumulators=True' if region.overlap_backward else ''
-                    independent = independent_regions.get(region.key)
-                    if independent is not None:
-                        # Isolate input aliases in a helper's local namespace;
-                        # other branches must continue using the original values.
-                        inputs = [obj for obj in region.inputs if not obj.is_attr()]
-                        function = f'_{region.key}_ordered_weights'
-                        with FunctionBlock(function, [self.tensor_name(obj) for obj in inputs], False) as block:
-                            block.insert_body(f'{names(inputs)} = {independent.key}.order_inputs({names(inputs)})')
-                            block.insert_body(self._emit_segment_nodes(
-                                segment, region.nodes, runtime_devid, lifetime, release_unused=False))
-                            block.insert_body(f'return {names(region.outputs)}')
-                        body.extend(block.code)
-                    if region.retain_backward_outputs:
-                        body.append(f'_{region.key}_backward_boundaries = '
-                                    f'nnscaler.runtime.deferred.backward_boundaries({names(region.inputs)})')
-                    with Block(f'with _module_streams.fork({region.key!r}, {region.stream!r}, {names(region.inputs)}{preserve}):') as block:
-                        if independent is not None:
-                            block.insert_body(f'{names(region.outputs)} = {function}{names(inputs)}')
-                        else:
-                            block.insert_body(self._emit_segment_nodes(
-                                segment, region.nodes, runtime_devid, lifetime, release_unused=False))
-                    body.extend(block.code)
-                    caller = region.caller_outputs
-                    producer = tuple(obj for obj in region.outputs if obj not in caller)
-                    if caller:
-                        body.append(f'_module_streams.publish({names(caller)})')
-                    if producer:
-                        body.append(f'_module_streams.publish({names(producer)}, stream={region.stream!r})')
-                    if region.retain_backward_outputs:
-                        # The ordinary data consumer can release its local
-                        # variable before the later backward anchor. Retain
-                        # only the graph edges needed for its None controls.
-                        dependencies = tuple(obj for obj in region.outputs if obj.requires_grad)
-                        body.append(f'nnscaler.runtime.deferred.prioritize_backward('
-                                    f'{names(dependencies)}, _{region.key}_backward_boundaries)')
-                        body.append(f'del _{region.key}_backward_boundaries')
-                        body.append(f'_{region.key}_backward_outputs = {names(dependencies)}')
-            elif node in ready_at or node in weight_anchors or node in prefetch_forward or node in prefetch_backward:
-                flush()
-                with Block(f'with {readiness_scope(node)[2:]}:') as block:
-                    block.insert_body(self._emit_segment_nodes(
-                        segment, [node], runtime_devid, lifetime, release_unused=False))
-                body.extend(block.code)
-            elif node in async_copy_nodes:
-                flush()
-                with Block('with nnscaler.runtime.stream.AsyncTensorCopies():') as block:
-                    block.insert_body(self._emit_segment_nodes(
-                        segment, [node], runtime_devid, lifetime, release_unused=False))
-                body.extend(block.code)
-            elif node not in owners:
-                pending.append(node)
-        flush()
-        for key in list(unresolved):
-            resolve(key)
-        with Block('with nnscaler.runtime.stream.ModuleStreams() as _module_streams:') as block:
-            block.insert_body(body)
-        _logger.info('Emitted %d module stream regions for segment %s', len(regions), segment.cid)
-        return block.code
 
     def _emit_nodes(self, nodes: List[IRCell], lifecycle: LifeCycle, runtime_devid: int) -> List[str]:
         """
@@ -1551,16 +1162,6 @@ class ModuleCodeGen(FuncEmission):
                     node.kwargs['clone_level'] = 1
 
                 code = self.emit_fnode(node, runtime_devid=runtime_devid, plan_ndevs=self.plan_ndevs, runtime_ndevs=self.runtime_ndevs, prefix_attr='self.')
-                if any(fnmatchcase(node.signature, pattern) for pattern in CompileFlag.async_copy_ops):
-                    with Block('with nnscaler.runtime.stream.AsyncTensorCopies():') as copy_scope:
-                        copy_scope.insert_body(code)
-                    code = copy_scope.code
-                weight_region = getattr(self, '_weight_regions_by_node', {}).get(node)
-                if weight_region is not None:
-                    with Block(f'with {weight_region}.compute():') as weight_scope:
-                        weight_scope.insert_body(code)
-                    code = weight_scope.code
-
                 if not param_inputs or CompileFlag.use_zero <= 1:
                     node_code += code
                 else:
@@ -1609,8 +1210,6 @@ class ModuleCodeGen(FuncEmission):
                 node_code += code
             else:
                 raise RuntimeError(f"unexpected type {type(node)} in IRSegment")
-            for plan in getattr(self, '_weight_control_outputs_by_node', {}).get(node, ()):
-                node_code.append(f'{plan.key}.capture_output({self.tensor_name(plan.control_output)})')
             # release
             tensors_to_del = lifecycle.release_tensors_after_node(node)
             if len(tensors_to_del) > 0:
@@ -1758,23 +1357,11 @@ class ModuleCodeGen(FuncEmission):
             self.execplan.use_multi_streams = True
             dependencies = list(dict.fromkeys([*inputs, *[obj for node in nodes for obj in node.iobjs() if obj.is_attr()]]))
             dependencies = self.tuple_name(dependencies, prefix_attr='self.')
-            prefetch = getattr(self, '_checkpoint_prefetch_names', {}).get(nodes[0].recompute)
-            if prefetch is not None:
-                context = f', context_fn=lambda: {prefetch}.contexts({dependencies})'
-            else:
-                context = (f', context_fn=lambda: nnscaler.runtime.checkpoint_stream.contexts('
-                           f'{stream!r}, {dependencies}'
-                           f'{", backward_ready=" + backward_ready if backward_ready else ""})')
+            context = (f', context_fn=lambda: nnscaler.runtime.checkpoint_stream.contexts('
+                       f'{stream!r}, {dependencies}'
+                       f'{", backward_ready=" + backward_ready if backward_ready else ""})')
         codes.append(f'{output_names_tuple} = ckpt.checkpoint(recompute, {input_names_tuple}, '
                      f'use_reentrant=False{context})')
-        patterns = getattr(self, '_checkpoint_prefetch_prefixes', {}).get(nodes[0].recompute)
-        if patterns:
-            from .staged_checkpoint import emit_staged_checkpoint
-            attributes = list(dict.fromkeys(obj for node in nodes for obj in node.iobjs() if obj.is_attr()))
-            return emit_staged_checkpoint(
-                codes, prefetch, [self.tensor_name(t, prefix_attr='self.') for t in attributes], patterns,
-                [bool(getattr(t, 'requires_grad', False)) for t in outputs])
-
         return codes
 
     def _get_param_first_used_pos(self, segment: IRSegment) -> Dict[IRFullTensor, int]:

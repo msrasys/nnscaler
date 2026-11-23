@@ -1,22 +1,52 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 
-"""Accumulate cooperative dWeights without one full gradient per fragment.
+"""Stream-local gradient accumulation, scoped to one forward and autograd task."""
 
-Buffers belong to one forward invocation and autograd GraphTask. Contributions
-run on the named weight stream after their real inputs become ready. Ordinary
-parameter edges publish the result after all contributors finish registering.
-No work is retained for another microbatch or optimizer step.
-"""
-
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field
+from threading import local
 
 import torch
+from torch.autograd.function import once_differentiable
 
-from .stream import input_stream_lifetime
+from .stream import (
+    _get_module_stream,
+    input_stream_lifetime,
+    parameter_gradient_stream,
+    parameter_uses_module_stream,
+)
 from .utils import get_grad_dtype
-from .weight_backward import WeightBackwardRegion
+
+_active = local()
+
+
+class _ParameterGrads(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, region, *parameters):
+        ctx.region = region
+        ctx.set_materialize_grads(False)
+        return tuple(parameter.view_as(parameter) for parameter in parameters)
+
+    @staticmethod
+    @once_differentiable
+    def backward(ctx, *gradients):
+        return (None, *ctx.region.gradients(gradients))
+
+
+@dataclass
+class WeightBackwardBinding:
+    region: object
+    parameters: tuple
+    indices: tuple
+
+    def defer(self, callback, inputs):
+        """Callback returns one gradient (or None) per bound parameter."""
+        self.region.defer(self.indices, callback, inputs)
+
+    def accumulate(self, callback, inputs):
+        """Add one contribution to each supplied parameter-gradient buffer."""
+        self.region.accumulate(self.indices, callback, inputs)
 
 
 @dataclass
@@ -25,7 +55,7 @@ class _AccumulationTask:
     done: object = None
 
 
-class WeightGradientAccumulator(WeightBackwardRegion):
+class WeightGradientAccumulator:
     """Combine fragment dWeights on a stream, preserving autograd publication.
 
     Use as a context manager around cooperative backend calls. The backend
@@ -45,14 +75,85 @@ class WeightGradientAccumulator(WeightBackwardRegion):
         if not isinstance(stream, str) or not stream or stream == 'default':
             raise ValueError('Weight accumulation requires a distinct named stream')
         parameters = tuple(parameters)
-        if any(type(p) not in (torch.Tensor, torch.nn.Parameter)
-               or p.layout != torch.strided or p.is_nested for p in parameters):
+        if any(
+            type(p) not in (torch.Tensor, torch.nn.Parameter) or p.layout != torch.strided or p.is_nested
+            for p in parameters
+        ):
             raise ValueError('Weight accumulation requires ordinary dense parameters')
-        super().__init__(stream, parameters)
+        self.originals = tuple(parameters)
+        if not self.originals or any(not p.requires_grad for p in self.originals):
+            raise ValueError('Weight backward regions require trainable tensor parameters')
+        devices = {p.device for p in self.originals}
+        if len(devices) != 1:
+            raise ValueError('Weight backward regions require one device')
+        self.device = next(iter(devices))
+        if self.device.type not in ('cpu', 'cuda'):
+            raise ValueError('Weight backward supports CPU validation and CUDA execution')
+        self.enabled = torch.is_grad_enabled()
+        if self.enabled and self.device.type == 'cuda' and torch.cuda.is_current_stream_capturing():
+            raise RuntimeError('Weight backward regions require eager execution')
+        self.stream = _get_module_stream(self.device, stream) if self.enabled and self.device.type == 'cuda' else None
+        self.tasks = {}
+        if self.enabled and self.stream is not None:
+            # Parameter publication must run on the weight stream too. A
+            # main-stream autograd node would enqueue a W wait ahead of the
+            # unrelated upstream dInput path, undoing the split.
+            holds = []
+            for parameter in self.originals:
+                # Respect compiler-proven mixed/native parameter affinity and
+                # preserve any accumulator that already owns reducer hooks.
+                context = (
+                    parameter_gradient_stream(parameter)
+                    if parameter_uses_module_stream(parameter)
+                    else torch.cuda.stream(self.stream)
+                )
+                with context:
+                    holds.append(parameter.expand_as(parameter))
+            with torch.cuda.stream(self.stream):
+                self.aliases = _ParameterGrads.apply(self, *self.originals)
+            del holds
+        else:
+            self.aliases = _ParameterGrads.apply(self, *self.originals) if self.enabled else self.originals
         self.bound_indices = set()
         self.failed = False
         self.forward_closed = False
         self._scope = None
+
+    @contextmanager
+    def compute(self):
+        previous = getattr(_active, 'compute', None)
+        _active.compute = self
+        try:
+            yield
+        finally:
+            _active.compute = previous
+
+    def bind(self, parameters):
+        if self.forward_closed and torch._C._current_graph_task_id() < 0:
+            raise RuntimeError('A closed weight accumulator cannot bind another forward')
+        if not self.enabled:
+            return None
+        if not torch.is_grad_enabled():
+            raise RuntimeError('Bind weight backward before Function.apply; use non-reentrant checkpointing')
+        indices, values = [], []
+        recomputing = torch._C._current_graph_task_id() >= 0
+        for parameter in parameters:
+            index = next(
+                (i for i, original in enumerate(self.originals) if original is parameter),
+                None,
+            )
+            if index is None and parameter.requires_grad:
+                raise ValueError('Backend weight does not match the compiled weight region parameters')
+            indices.append(index)
+            values.append(parameter if index is None or recomputing else self.aliases[index])
+        self.bound_indices.update(i for i in indices if i is not None)
+        return WeightBackwardBinding(self, tuple(values), tuple(indices))
+
+    def close_forward(self, failed=False):
+        self.aliases = ()  # Break the autograd cycle when automatic GC is disabled.
+        self.forward_closed = True
+        if self.enabled and not failed and len(self.bound_indices) != len(self.originals):
+            raise RuntimeError('Every accumulator parameter must be bound by a cooperative backend')
 
     def __enter__(self):
         if self._scope is not None or self.forward_closed:
@@ -67,25 +168,6 @@ class WeightGradientAccumulator(WeightBackwardRegion):
         finally:
             self._scope = None
             self.close_forward(failed=exc[0] is not None)
-
-    def bind(self, parameters):
-        if self.forward_closed and torch._C._current_graph_task_id() < 0:
-            raise RuntimeError('A closed weight accumulator cannot bind another forward')
-        binding = super().bind(parameters)
-        if binding is not None:
-            self.bound_indices.update(i for i in binding.indices if i is not None)
-        return binding
-
-    def anchor(self):
-        self.close_forward(failed=True)
-        raise RuntimeError('Ready weight accumulation does not use a communication anchor')
-
-    def close_forward(self, failed=False):
-        incomplete = self.enabled and not failed and len(self.bound_indices) != len(self.originals)
-        super().close_forward(failed=failed or incomplete)
-        self.forward_closed = True
-        if incomplete:
-            raise RuntimeError('Every accumulator parameter must be bound by a cooperative backend')
 
     def _task(self):
         gid = torch._C._current_graph_task_id()
@@ -113,8 +195,10 @@ class WeightGradientAccumulator(WeightBackwardRegion):
             ready = torch.cuda.Event()
             ready.record(torch.cuda.current_stream(self.device))
         try:
-            with torch.cuda.stream(self.stream) if self.stream is not None else nullcontext(), \
-                    input_stream_lifetime(inputs, self.stream is not None):
+            with (
+                torch.cuda.stream(self.stream) if self.stream is not None else nullcontext(),
+                input_stream_lifetime(inputs, self.stream is not None),
+            ):
                 for index in indices:
                     if index is not None and index not in task.buffers:
                         parameter = self.originals[index]
@@ -124,8 +208,10 @@ class WeightGradientAccumulator(WeightBackwardRegion):
                 if ready is not None:
                     self.stream.wait_event(ready)
                 outputs = tuple(task.buffers.get(index) for index in indices)
-                layouts = tuple((value.data_ptr(), value.stride(), value.storage_offset())
-                                if value is not None else None for value in outputs)
+                layouts = tuple(
+                    ((value.data_ptr(), value.stride(), value.storage_offset()) if value is not None else None)
+                    for value in outputs
+                )
                 returned = tuple(callback(outputs))
                 if len(returned) != len(indices):
                     raise RuntimeError('Accumulation callback returned an incorrect gradient count')
@@ -133,10 +219,14 @@ class WeightGradientAccumulator(WeightBackwardRegion):
                     if index is None:
                         continue
                     parameter = self.originals[index]
-                    if (value is not expected
-                            or (value.data_ptr(), value.stride(), value.storage_offset()) != layout
-                            or value.shape != parameter.shape or value.device != parameter.device
-                            or value.dtype != get_grad_dtype(parameter) or value.requires_grad):
+                    if (
+                        value is not expected
+                        or (value.data_ptr(), value.stride(), value.storage_offset()) != layout
+                        or value.shape != parameter.shape
+                        or value.device != parameter.device
+                        or value.dtype != get_grad_dtype(parameter)
+                        or value.requires_grad
+                    ):
                         raise RuntimeError('Accumulation callback must preserve its supplied gradient buffers')
         except BaseException:
             self.failed = True
@@ -157,11 +247,11 @@ class WeightGradientAccumulator(WeightBackwardRegion):
             for index, output, gradient in zip(indices, outputs, gradients):
                 if index is None:
                     continue
-                if (gradient is None or gradient.shape != output.shape
-                        or gradient.device != output.device):
+                if gradient is None or gradient.shape != output.shape or gradient.device != output.device:
                     raise RuntimeError('Deferred weight callback must return each bound gradient')
                 output.add_(gradient)
             return outputs
+
         self.accumulate(indices, add, inputs)
 
     def _join_accumulation(self, task):
@@ -182,3 +272,9 @@ class WeightGradientAccumulator(WeightBackwardRegion):
         for index, value in task.buffers.items():
             result[index] = value if result[index] is None else result[index] + value
         return tuple(result)
+
+
+def prepare_weight_backward(parameters):
+    """Bind cooperative backend parameters inside an accumulation scope."""
+    region = getattr(_active, 'compute', None)
+    return region.bind(parameters) if region is not None else None

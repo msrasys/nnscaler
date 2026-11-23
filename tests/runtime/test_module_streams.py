@@ -4,55 +4,14 @@
 import copy
 import gc
 import weakref
-from threading import Event
 
 import pytest
 import torch
 from torch.utils.checkpoint import checkpoint
 
-from nnscaler.runtime.stream import ModuleStreams, AsyncTensorCopies, drain_stream_holds
-
+from nnscaler.runtime.stream import ModuleStreams, drain_stream_holds
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason='requires CUDA')
-
-
-@pytest.mark.parametrize('pinned', [False, True])
-def test_small_copy_does_not_wait_and_snapshots_source(pinned):
-    source = torch.arange(16, dtype=torch.int64, pin_memory=pinned)
-    expected = source.clone()
-    anchor_done = torch.cuda.Event()
-    torch.cuda._sleep(500_000_000)
-    anchor_done.record()
-    with AsyncTensorCopies():
-        result = source.to('cuda')
-    assert not anchor_done.query(), 'metadata copy waited for the caller stream'
-    source.fill_(-1)
-    torch.testing.assert_close(result.cpu(), expected)
-
-
-@pytest.mark.parametrize('grad_enabled', [False, True])
-def test_host_submission_is_concurrent_and_preserves_grad_mode(grad_enabled):
-    started, release = Event(), Event()
-    x = torch.randn(32, device='cuda', requires_grad=True)
-
-    def branch(value):
-        started.set()
-        assert release.wait(5), 'caller did not continue while branch was submitted'
-        return (value.square(),)
-
-    with torch.set_grad_enabled(grad_enabled), ModuleStreams() as streams:
-        streams.submit('region', 'test_host', branch, (x,), (x,))
-        try:
-            assert started.wait(5)
-        finally:
-            release.set()
-        (y,) = streams.resolve('region')
-        streams.join('region')
-        assert y.requires_grad == grad_enabled
-    torch.testing.assert_close(y, x.square())
-    if grad_enabled:
-        y.sum().backward()
-        torch.testing.assert_close(x.grad, 2 * x)
 
 
 def test_after_launch_does_not_wait_for_anchor_completion():
@@ -118,18 +77,18 @@ def test_module_stream_storage_survives_allocator_pressure():
     del warm
     torch.cuda.synchronize()
     for _ in range(4):
-        x = torch.full((size,), 3., device='cuda')
+        x = torch.full((size,), 3.0, device='cuda')
         with ModuleStreams() as streams:
             with streams.fork('delayed', 'test_lifetime', (x,)):
                 torch.cuda._sleep(20_000_000)
                 y = x.square()
             streams.publish((y,))
             del x
-            garbage = [torch.full((size,), -17., device='cuda') for _ in range(16)]
+            garbage = [torch.full((size,), -17.0, device='cuda') for _ in range(16)]
             streams.join('delayed')
             result = y + 1
             del y
-        torch.testing.assert_close(result, torch.full_like(result, 10.))
+        torch.testing.assert_close(result, torch.full_like(result, 10.0))
         del garbage, result
     drain_stream_holds(wait=True)
 
@@ -137,7 +96,7 @@ def test_module_stream_storage_survives_allocator_pressure():
 def test_opaque_input_owner_survives_backward_on_another_stream():
     class Owner:
         def __init__(self):
-            self.tensor = torch.full((1 << 20,), 3., device='cuda')
+            self.tensor = torch.full((1 << 20,), 3.0, device='cuda')
 
     class UseOwner(torch.autograd.Function):
         @staticmethod
@@ -169,9 +128,9 @@ def test_opaque_input_owner_survives_backward_on_another_stream():
         del y
     gc.collect()
     assert reference() is not None
-    garbage = [torch.full((1 << 20,), -11., device='cuda') for _ in range(8)]
+    garbage = [torch.full((1 << 20,), -11.0, device='cuda') for _ in range(8)]
     torch.cuda.synchronize()
-    torch.testing.assert_close(x.grad, torch.full_like(x, 3.))
+    torch.testing.assert_close(x.grad, torch.full_like(x, 3.0))
     drain_stream_holds(wait=True)
     gc.collect()
     assert reference() is None

@@ -8,7 +8,6 @@ import nnscaler
 from nnscaler.runtime.adapter.reducer import Reducer, accumulate_reducer_grad, mark_reducer_grad_ready
 from nnscaler.runtime.stream import ModuleStreams, register_parameter_stream
 
-
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason='requires CUDA')
 
 
@@ -40,27 +39,28 @@ def test_manual_gradient_waits_before_reduction(tmp_path, two_streams, asynchron
 
         with ModuleStreams() as streams:
             with streams.fork('first', 'manual_first', (parameter,)):
-                first = Manual.apply(parameter, 2.)
+                first = Manual.apply(parameter, 2.0)
             streams.publish((first,))
             if two_streams:
                 with streams.fork('second', 'manual_second', (parameter,)):
-                    second = Manual.apply(parameter, 3.)
+                    second = Manual.apply(parameter, 3.0)
                 streams.publish((second,))
                 streams.join('second')
             streams.join('first')
             output = first + second if two_streams else first
         output.sum().backward()
         reducer.sync_grads()
-        torch.testing.assert_close(parameter.grad, torch.full_like(parameter, 5. if two_streams else 2.))
+        torch.testing.assert_close(parameter.grad, torch.full_like(parameter, 5.0 if two_streams else 2.0))
     finally:
         nnscaler.uninit()
         if dist.is_initialized():
             dist.destroy_process_group()
 
 
-def test_deferred_weight_reducer_does_not_stall_upstream_input_backward(tmp_path):
-    from nnscaler.runtime.weight_backward import WeightBackwardRegion
-    from .test_weight_backward import Anchor, Linear
+def test_accumulated_weight_reducer_does_not_stall_upstream_input_backward(tmp_path):
+    from nnscaler import WeightGradientAccumulator
+    from .test_weight_accumulator import fragment
+
     dist.init_process_group('nccl', init_method=f'file://{tmp_path}/process_group', rank=0, world_size=1)
     try:
         nnscaler.init()
@@ -90,31 +90,29 @@ def test_deferred_weight_reducer_does_not_stall_upstream_input_backward(tmp_path
                 return dx
 
         upstream = Upstream.apply(x)
-        region = WeightBackwardRegion('reducer_weight_test', (w,))
+        region = WeightGradientAccumulator('reducer_weight_test', (w,))
+        region.stream.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(region.stream):
             warm = x.detach().t() @ x.detach()
         torch.cuda.synchronize()
         del warm
-        original = region.defer
+        original = region.accumulate
 
-        def defer(indices, callback, inputs):
-            def delayed_weight():
+        def accumulate(indices, callback, inputs):
+            def delayed_weight(outputs):
                 torch.cuda._sleep(1_000_000_000)
-                result = callback()
+                result = callback(outputs)
                 done.record()
                 return result
+
             original(indices, delayed_weight, inputs)
 
-        region.defer = defer
-        with region.anchor():
-            routed = Anchor.apply(nnscaler.prepare_async_input(upstream), [])
-        with region.compute():
-            binding = nnscaler.prepare_weight_backward((w,))
-            output = Linear.apply(routed, binding.parameters[0], binding, [])
-        region.close_forward()
+        region.accumulate = accumulate
+        with region:
+            output = fragment(upstream, w, [])
         output.sum().backward()
         reducer.sync_grads()
-        ((rx * 6) @ rw).sum().backward()
+        ((rx * 3) @ rw).sum().backward()
         torch.testing.assert_close(w.grad, rw.grad)
         torch.testing.assert_close(x.grad, rx.grad)
         assert observed == [True]

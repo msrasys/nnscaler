@@ -48,15 +48,23 @@ class FragmentLinear(torch.autograd.Function):
 
 def fragment(x, weight, records, kind='direct', delay=0):
     binding = prepare_weight_backward((weight,))
-    return FragmentLinear.apply(x, weight if binding is None else binding.parameters[0],
-                                binding, records, kind, delay)
+    return FragmentLinear.apply(
+        x,
+        weight if binding is None else binding.parameters[0],
+        binding,
+        records,
+        kind,
+        delay,
+    )
 
 
 def run(xs, weight, records, *, recompute=False, kind='direct', delay=0):
     region = WeightGradientAccumulator('accumulator_test', (weight,))
+
     def compute(x):
         with region.compute():
             return fragment(x, weight, records, kind, delay)
+
     with region:
         outputs = [checkpoint(compute, x, use_reentrant=False) if recompute else compute(x) for x in xs]
     return outputs, region
@@ -83,7 +91,7 @@ def test_fragment_gradients_publish_once_and_support_repeated_backward(kind, rec
             torch.testing.assert_close(x.grad, ref.grad)
         assert not region.tasks
         if kind == 'direct':
-            assert len(set(records[3*iteration:3*(iteration+1)])) == 1
+            assert len(set(records[3 * iteration : 3 * (iteration + 1)])) == 1
     assert len(hooks) == 2
 
 
@@ -91,7 +99,7 @@ def test_pruned_parameter_edges_do_not_accumulate_and_release_the_region():
     x = torch.randn(4, 4, requires_grad=True)
     weight = torch.nn.Parameter(torch.randn(4, 6))
     actual, region = run([x], weight, [])
-    dx, = torch.autograd.grad(actual[0].sum(), (x,))
+    (dx,) = torch.autograd.grad(actual[0].sum(), (x,))
     torch.testing.assert_close(dx, torch.ones_like(actual[0]) @ weight.t())
     assert weight.grad is None and not region.tasks
     reference = weakref.ref(region)
@@ -112,8 +120,10 @@ def test_live_forwards_have_separate_buffers():
     assert all(not region.tasks for _, region in calls)
 
 
-@pytest.mark.parametrize('kind,match', [('failure', 'backend failure'),
-                                       ('replace', 'preserve'), ('shape', 'preserve')])
+@pytest.mark.parametrize(
+    'kind,match',
+    [('failure', 'backend failure'), ('replace', 'preserve'), ('shape', 'preserve')],
+)
 def test_failed_callbacks_do_not_publish_partial_buffers(kind, match):
     x = torch.randn(4, 4, requires_grad=True)
     weight = torch.nn.Parameter(torch.randn(4, 6))
@@ -133,10 +143,6 @@ def test_forward_scope_rejects_reuse_and_unbound_parameters():
     with pytest.raises(RuntimeError, match='must be bound'):
         with WeightGradientAccumulator('unused', (weight,)):
             pass
-    fresh = WeightGradientAccumulator('no_anchor', (weight,))
-    with pytest.raises(RuntimeError, match='does not use a communication anchor'):
-        fresh.anchor()
-    assert not fresh.aliases
 
 
 def test_higher_order_backward_fails_explicitly():
@@ -148,28 +154,11 @@ def test_higher_order_backward_fails_explicitly():
     assert not region.tasks
 
 
-def test_accumulating_backend_keeps_ordinary_deferred_region_protocol():
-    from nnscaler import prepare_async_input
-    from nnscaler.runtime.weight_backward import WeightBackwardRegion
-    from .test_weight_backward import Anchor
-    x = torch.randn(4, 4, requires_grad=True)
-    weight = torch.nn.Parameter(torch.randn(4, 6))
-    order, records = [], []
-    region = WeightBackwardRegion('ordinary_weights', (weight,))
-    with region.anchor():
-        value = Anchor.apply(prepare_async_input(x), order)
-    with region.compute():
-        y = fragment(value, weight, records)
-    region.close_forward()
-    y.sum().backward()
-    torch.testing.assert_close(weight.grad, (2*x.detach()).t() @ torch.ones_like(y))
-    assert order == ['submit'] and len(records) == 1 and not region.tasks
-
-
 def test_reducer_counts_one_contribution_for_multiple_fragments():
     from unittest.mock import Mock
     from nnscaler.runtime.adapter.reducer import Reducer
     from ..utils import mock_reducer_env
+
     with mock_reducer_env(0, 2):
         weight = torch.nn.Parameter(torch.randn(4, 6))
         ref_weight = torch.nn.Parameter(weight.detach().clone())
@@ -183,10 +172,10 @@ def test_reducer_counts_one_contribution_for_multiple_fragments():
             x = torch.randn(8, 4, requires_grad=True)
             rx = x.detach().clone().requires_grad_()
             outputs, region = run([x[:3], x[3:]], weight, [])
-            (sum(y.square().sum() for y in outputs) + weight.square().sum() * .3).backward()
-            ((rx @ ref_weight).square().sum() + ref_weight.square().sum() * .3).backward()
+            (sum(y.square().sum() for y in outputs) + weight.square().sum() * 0.3).backward()
+            ((rx @ ref_weight).square().sum() + ref_weight.square().sum() * 0.3).backward()
             offset = bucket._pofset[weight]
-            actual = bucket._contiguous_grads[offset:offset+weight.numel()].view_as(weight)
+            actual = bucket._contiguous_grads[offset : offset + weight.numel()].view_as(weight)
             torch.testing.assert_close(actual, ref_weight.grad)
             torch.testing.assert_close(x.grad, rx.grad)
             assert bucket._async_seen_param_cnt[weight] == step + 1
@@ -215,10 +204,12 @@ def test_frozen_backend_parameter_has_no_accumulation_buffer():
         @staticmethod
         def backward(ctx, dy):
             x, live, frozen = ctx.saved_tensors
+
             def weight(outputs):
                 assert outputs[1] is None
                 outputs[0].addmm_(x.t(), dy)
                 return outputs
+
             ctx.binding.accumulate(weight, (x, dy))
             return dy @ (live + frozen).t(), None, None, None
 
@@ -248,8 +239,7 @@ def test_cuda_accumulation_preserves_fp32_parameter_gradients(dtype):
     records = []
     ys, region = run(xs, weight, records, recompute=True)
     sum(y.float().sum() for y in ys).backward()
-    expected = sum(x.detach().float().t() @ torch.ones_like(y, dtype=torch.float32)
-                   for x, y in zip(xs, ys))
+    expected = sum(x.detach().float().t() @ torch.ones_like(y, dtype=torch.float32) for x, y in zip(xs, ys))
     torch.testing.assert_close(weight.grad, expected)
     assert weight.grad.dtype == torch.float32 and len(set(records)) == 1 and not region.tasks
 
@@ -270,7 +260,7 @@ def test_cuda_input_backward_can_advance_before_weight_work_finishes():
     weight.register_post_accumulate_grad_hook(lambda param: dw_ready.record())
     outputs[0].sum().backward()
     torch.cuda.synchronize()
-    assert dx_ready.elapsed_time(dw_ready) > 1., 'dInput was blocked behind dWeight'
+    assert dx_ready.elapsed_time(dw_ready) > 1.0, 'dInput was blocked behind dWeight'
     assert not region.tasks
 
 
@@ -292,7 +282,6 @@ def test_cuda_contributors_on_distinct_producer_streams():
             caller.wait_stream(producer)
             outputs[-1].record_stream(caller)
     sum(output.sum() for output in outputs).backward()
-    expected = sum(value.detach().sin().t() @ torch.ones_like(output)
-                   for value, output in zip(originals, outputs))
+    expected = sum(value.detach().sin().t() @ torch.ones_like(output) for value, output in zip(originals, outputs))
     torch.testing.assert_close(weight.grad, expected)
     assert len(set(records)) == 1 and not region.tasks

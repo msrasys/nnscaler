@@ -1,0 +1,24 @@
+--- a/csrc/kernels/intranode.cu
++++ b/csrc/kernels/intranode.cu
+@@ -614,5 +614,5 @@
+         && hidden_int4 % 2 == 0
+-        && hidden_int4 / 2 * static_cast<int>(sizeof(int4)) + static_cast<int>(sizeof(uint64_t)) <= 4096) {
+-        constexpr int kNumThreads = 128;
+-        constexpr int kNumTMABytesPerWarp = 4096;
++        && hidden_int4 / 2 * static_cast<int>(sizeof(int4)) + static_cast<int>(sizeof(uint64_t)) <= 2048) {
++        constexpr int kNumThreads = 256;
++        constexpr int kNumTMABytesPerWarp = 2048;
+ #ifndef DISABLE_SM90_FEATURES
+@@ -966,3 +966,4 @@
+                 // Reduce data with pipeline
+-                constexpr int kNumStages = 8;
++                constexpr int kNumStages = kNumTMABytesPerWarp / (32 * sizeof(int4));
++                EP_STATIC_ASSERT(kNumStages >= 1 && kNumStages <= 8, "Invalid TMA stage count");
+                 EP_STATIC_ASSERT(kNumStages * 32 * sizeof(int4) <= kNumTMABytesPerWarp, "Invalid count");
+@@ -1117,4 +1118,4 @@
+     if (num_ranks == 2 && compact_option_enabled("DEEP_EP_COMPACT_EP2")) {
+-        constexpr int kNumThreads = 128;
+-        constexpr int kNumTMABytesPerWarp = 4096;
++        constexpr int kNumThreads = 256;
++        constexpr int kNumTMABytesPerWarp = 2048;
+ #ifndef DISABLE_SM90_FEATURES

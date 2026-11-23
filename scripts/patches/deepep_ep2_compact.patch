@@ -1,0 +1,69 @@
+--- a/csrc/kernels/intranode.cu
++++ b/csrc/kernels/intranode.cu
+@@ -1,3 +1,5 @@
++#include <cstdlib>
++#include <cstring>
+ #include "buffer.cuh"
+ #include "configs.cuh"
+ #include "exception.cuh"
+@@ -7,6 +9,11 @@
+ namespace deep_ep {
+ 
+ namespace intranode {
++
++static bool compact_option_enabled(const char* name) {
++    const char* value = std::getenv(name);
++    return value != nullptr && std::strcmp(value, "1") == 0;
++}
+ 
+ template <int kNumRanks>
+ __global__ void notify_dispatch(const int* num_tokens_per_rank,
+@@ -602,6 +609,24 @@
+     }                                                                    \
+     break
+ 
++    // Experimental EP2 footprint permits communication/GEMM co-residency.
++    if (num_ranks == 2 && compact_option_enabled("DEEP_EP_COMPACT_EP2")
++        && hidden_int4 % 2 == 0
++        && hidden_int4 / 2 * static_cast<int>(sizeof(int4)) + static_cast<int>(sizeof(uint64_t)) <= 4096) {
++        constexpr int kNumThreads = 128;
++        constexpr int kNumTMABytesPerWarp = 4096;
++#ifndef DISABLE_SM90_FEATURES
++        constexpr int smem_size = kNumTMABytesPerWarp * (kNumThreads / 32);
++#endif
++        SETUP_LAUNCH_CONFIG(num_sms, kNumThreads, stream);
++#ifndef DISABLE_SM90_FEATURES
++        if (compact_option_enabled("DEEP_EP_COMPACT_NO_CLUSTER"))
++            attr[1].val.clusterDim.x = 1;
++#endif
++        switch (num_ranks) { case 2: DISPATCH_LAUNCH_CASE(2); default: break; }
++        return;
++    }
++
+     // Even-numbered blocks for sending, odd-numbered blocks for receiving.
+     EP_HOST_ASSERT(num_sms % 2 == 0);
+     SETUP_LAUNCH_CONFIG(num_sms, kNumThreads, stream);
+@@ -1089,6 +1114,23 @@
+     SWITCH_RANKS_WITH_DTYPE(dtype, COMBINE_LAUNCH_CASE); \
+     break
+ 
++    if (num_ranks == 2 && compact_option_enabled("DEEP_EP_COMPACT_EP2")) {
++        constexpr int kNumThreads = 128;
++        constexpr int kNumTMABytesPerWarp = 4096;
++#ifndef DISABLE_SM90_FEATURES
++        constexpr int smem_size = kNumTMABytesPerWarp * (kNumThreads / 32);
++#endif
++        SETUP_LAUNCH_CONFIG(num_sms, kNumThreads, stream);
++#ifndef DISABLE_SM90_FEATURES
++        if (compact_option_enabled("DEEP_EP_COMPACT_NO_CLUSTER"))
++            attr[1].val.clusterDim.x = 1;
++#endif
++#define COMPACT_COMBINE_DTYPE_CASE(dtype) COMBINE_LAUNCH_CASE(dtype, 2)
++        SWITCH_TYPES(COMPACT_COMBINE_DTYPE_CASE);
++#undef COMPACT_COMBINE_DTYPE_CASE
++        return;
++    }
++
+     // Even-numbered blocks for sending, odd-numbered blocks for receiving
+     EP_HOST_ASSERT(num_sms % 2 == 0);
+     EP_HOST_ASSERT(kNumThreads >= num_ranks * 32);

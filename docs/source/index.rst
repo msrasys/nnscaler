@@ -123,7 +123,6 @@ For any questions or inquiries, please contact us at nnscaler@service.microsoft.
 
    parallel_module
    module_streams
-   module_streams_validation
    dimops
    verify_op
 
